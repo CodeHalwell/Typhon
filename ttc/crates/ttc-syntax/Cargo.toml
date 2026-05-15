@@ -1,0 +1,10 @@
+[package]
+name = "ttc-syntax"
+version.workspace = true
+edition.workspace = true
+description = "Typhon parser and AST — extends ruff_python_parser with Typhon-specific tokens"
+
+[dependencies]
+rustpython-parser = { workspace = true }
+rustpython-ast = { workspace = true }
+thiserror = { workspace = true }

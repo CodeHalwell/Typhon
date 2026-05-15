@@ -1,0 +1,5 @@
+[package]
+name = "ttc-db"
+version.workspace = true
+edition.workspace = true
+description = "Salsa incremental database for the Typhon compiler (Phase 1+)"

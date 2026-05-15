@@ -1,0 +1,124 @@
+//! Typhon-specific tokens that extend the Python token set.
+//!
+//! Phase 0 introduces `val` and `var` as first-class keywords.
+//! These are recognised here and stripped (pre-processed) before the
+//! underlying Python parser sees them, so the existing Python parser can
+//! handle the remainder of the grammar unchanged.
+
+/// A Typhon keyword that is not part of standard Python.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TyphonKeyword {
+    /// `val` — declares an immutable binding (like Rust's `let` or Kotlin's `val`).
+    Val,
+    /// `var` — declares a mutable binding.
+    Var,
+}
+
+impl TyphonKeyword {
+    /// Return the source spelling of this keyword.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Val => "val",
+            Self::Var => "var",
+        }
+    }
+
+    /// Try to parse a keyword from a source slice.
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "val" => Some(Self::Val),
+            "var" => Some(Self::Var),
+            _ => None,
+        }
+    }
+}
+
+/// A single token produced by the Typhon lexer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TyphonToken<'src> {
+    /// A Typhon-specific keyword (`val` / `var`).
+    Keyword(TyphonKeyword),
+    /// Any other text fragment (passed through unchanged to the Python parser).
+    Text(&'src str),
+}
+
+/// Lex a Typhon source string into a sequence of [`TyphonToken`]s.
+///
+/// This is a *word-boundary* lexer: it splits the source on whitespace
+/// boundaries, recognises `val` and `var`, and returns everything else as
+/// [`TyphonToken::Text`] slices pointing into the original string.
+pub fn lex(source: &str) -> Vec<TyphonToken<'_>> {
+    let mut tokens = Vec::new();
+    let mut start = 0;
+
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+
+    while start < len {
+        // Skip to the next word-start (non-whitespace, non-special).
+        // We scan for potential identifiers: [a-zA-Z_][a-zA-Z0-9_]*
+        // Emit any non-identifier bytes as Text fragments directly.
+        let ch = bytes[start] as char;
+        if ch.is_ascii_alphabetic() || ch == '_' {
+            // Scan to end of identifier.
+            let mut end = start + 1;
+            while end < len && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                end += 1;
+            }
+            let word = &source[start..end];
+            if let Some(kw) = TyphonKeyword::from_str(word) {
+                tokens.push(TyphonToken::Keyword(kw));
+            } else {
+                tokens.push(TyphonToken::Text(word));
+            }
+            start = end;
+        } else {
+            // Emit single non-identifier character as Text.
+            // Coalesce consecutive non-identifier characters into one slice.
+            let mut end = start + 1;
+            while end < len {
+                let c = bytes[end] as char;
+                if c.is_ascii_alphabetic() || c == '_' {
+                    break;
+                }
+                end += 1;
+            }
+            tokens.push(TyphonToken::Text(&source[start..end]));
+            start = end;
+        }
+    }
+
+    tokens
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognises_val_and_var() {
+        let src = "val x: int = 1";
+        let tokens = lex(src);
+        assert_eq!(tokens[0], TyphonToken::Keyword(TyphonKeyword::Val));
+    }
+
+    #[test]
+    fn does_not_match_partial_keyword() {
+        // "value" should NOT be tokenised as `val` + `ue`.
+        let src = "value = 1";
+        let tokens = lex(src);
+        assert!(
+            tokens
+                .iter()
+                .all(|t| !matches!(t, TyphonToken::Keyword(_))),
+            "partial keyword match should not occur"
+        );
+    }
+
+    #[test]
+    fn var_keyword() {
+        let src = "var count: int = 0";
+        let tokens = lex(src);
+        assert_eq!(tokens[0], TyphonToken::Keyword(TyphonKeyword::Var));
+    }
+}

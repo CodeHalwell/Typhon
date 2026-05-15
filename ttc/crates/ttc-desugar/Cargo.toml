@@ -1,0 +1,5 @@
+[package]
+name = "ttc-desugar"
+version.workspace = true
+edition.workspace = true
+description = "Typhon AST → Python AST lowering (Phase 2+)"

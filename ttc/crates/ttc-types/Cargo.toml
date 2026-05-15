@@ -1,0 +1,5 @@
+[package]
+name = "ttc-types"
+version.workspace = true
+edition.workspace = true
+description = "Structural and nominal type checker for Typhon (Phase 1+)"
