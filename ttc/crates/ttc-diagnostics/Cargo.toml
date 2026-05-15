@@ -1,0 +1,9 @@
+[package]
+name = "ttc-diagnostics"
+version.workspace = true
+edition.workspace = true
+description = "miette-based diagnostic rendering for the Typhon compiler"
+
+[dependencies]
+miette = { workspace = true }
+thiserror = { workspace = true }

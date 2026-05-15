@@ -1,0 +1,5 @@
+[package]
+name = "ttc-analyse"
+version.workspace = true
+edition.workspace = true
+description = "Purity, async, comptime, and optimisation analysis for Typhon (Phase 2+)"

@@ -1,0 +1,5 @@
+[package]
+name = "ttc-resolve"
+version.workspace = true
+edition.workspace = true
+description = "Name resolution and scope construction for Typhon (Phase 1+)"
