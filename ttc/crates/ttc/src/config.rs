@@ -97,24 +97,62 @@ pub struct EnvConfig {
 
 impl TyphonConfig {
     /// Load `typhon.toml` from the given directory (or any ancestor).
-    pub fn load(start: &Path) -> Option<(PathBuf, Self)> {
+    ///
+    /// Returns:
+    /// - `Ok(Some((path, config)))` when a config file is found and parsed.
+    /// - `Ok(None)` when no `typhon.toml` is found in the directory tree.
+    /// - `Err(e)` when a `typhon.toml` is found but cannot be read or parsed.
+    pub fn load(start: &Path) -> Result<Option<(PathBuf, Self)>, crate::config::ConfigError> {
         let mut dir = start.to_path_buf();
         loop {
             let candidate = dir.join("typhon.toml");
             if candidate.exists() {
-                let text = std::fs::read_to_string(&candidate).ok()?;
-                let config: Self = toml::from_str(&text).ok()?;
-                return Some((candidate, config));
+                let text = std::fs::read_to_string(&candidate)
+                    .map_err(|e| crate::config::ConfigError::Io {
+                        path: candidate.display().to_string(),
+                        cause: e.to_string(),
+                    })?;
+                let config: Self = toml::from_str(&text)
+                    .map_err(|e| crate::config::ConfigError::Parse {
+                        path: candidate.display().to_string(),
+                        cause: e.to_string(),
+                    })?;
+                return Ok(Some((candidate, config)));
             }
             if !dir.pop() {
                 break;
             }
         }
-        None
+        Ok(None)
     }
 
     /// Serialize this config back to TOML.
-    pub fn to_toml_string(&self) -> String {
-        toml::to_string_pretty(self).unwrap_or_default()
+    ///
+    /// Returns an error if serialization fails (should be unreachable in
+    /// practice, but returning `Result` avoids silent data loss).
+    pub fn to_toml_string(&self) -> Result<String, toml::ser::Error> {
+        toml::to_string_pretty(self)
     }
 }
+
+/// Errors that can occur when loading a `typhon.toml` file.
+#[derive(Debug)]
+pub enum ConfigError {
+    Io { path: String, cause: String },
+    Parse { path: String, cause: String },
+}
+
+impl std::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConfigError::Io { path, cause } => {
+                write!(f, "cannot read '{}': {}", path, cause)
+            }
+            ConfigError::Parse { path, cause } => {
+                write!(f, "invalid typhon.toml '{}': {}", path, cause)
+            }
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}

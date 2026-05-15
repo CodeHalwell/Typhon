@@ -8,7 +8,7 @@ use miette::{Diagnostic, NamedSource, SourceOffset, SourceSpan};
 use thiserror::Error;
 
 /// A Typhon compiler error with source-location information.
-#[derive(Debug, Error, Diagnostic)]
+#[derive(Debug, Clone, Error, Diagnostic)]
 pub enum TtcError {
     /// The source file could not be read.
     #[error("could not read file '{path}': {cause}")]

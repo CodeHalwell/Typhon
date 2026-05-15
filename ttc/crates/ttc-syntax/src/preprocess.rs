@@ -4,16 +4,18 @@
 //! `val x: T = expr` becomes `x: T = expr`
 //! `var x: T = expr` becomes `x: T = expr`
 //!
-//! The returned [`PreprocessResult`] records the byte offsets of every removed
-//! keyword so that the post-processor can restore them.
+//! The returned [`PreprocessResult`] records the 0-based line index of every
+//! removed keyword so that the post-processor can restore them exactly.
 
 use crate::lexer::TyphonKeyword;
 
-/// One stripped keyword and the position (byte offset in the *original* source)
-/// where it appeared.
+/// One stripped keyword and the 0-based line index in the source where it
+/// appeared.
 #[derive(Debug, Clone)]
 pub struct StrippedKeyword {
-    pub offset: usize,
+    /// 0-based line index in both the original source and the preprocessed
+    /// source (stripping a keyword never changes the line count).
+    pub line_index: usize,
     pub keyword: TyphonKeyword,
 }
 
@@ -35,7 +37,7 @@ pub struct PreprocessResult {
 pub fn preprocess(source: &str) -> PreprocessResult {
     let mut python_source = String::with_capacity(source.len());
     let mut stripped = Vec::new();
-    let mut offset: usize = 0;
+    let mut line_index: usize = 0;
 
     for line in source.split_inclusive('\n') {
         // Find leading whitespace.
@@ -56,9 +58,9 @@ pub fn preprocess(source: &str) -> PreprocessResult {
                 let indent = &line[..indent_len];
                 python_source.push_str(indent);
 
-                // Record the keyword; its offset is at the end of the indent.
+                // Record the keyword at its 0-based line index.
                 stripped.push(StrippedKeyword {
-                    offset: offset + indent_len,
+                    line_index,
                     keyword: *kw,
                 });
 
@@ -75,7 +77,7 @@ pub fn preprocess(source: &str) -> PreprocessResult {
             python_source.push_str(line);
         }
 
-        offset += line.len();
+        line_index += 1;
     }
 
     PreprocessResult {
@@ -89,37 +91,21 @@ pub fn preprocess(source: &str) -> PreprocessResult {
 /// `normalised` is the Python source after whitespace normalisation.
 /// `stripped` is the metadata returned by [`preprocess`].
 ///
-/// Strategy: each `StrippedKeyword` records the byte offset in the
-/// **pre-processed** source where the keyword was removed.  The normalised
-/// source is produced from the pre-processed source with only whitespace
-/// changes, so the line containing each stripped keyword is the same line
-/// in both strings.  We find the matching line by offset and prepend the
-/// keyword + space, preserving leading indentation.
+/// Because each [`StrippedKeyword`] stores the 0-based line index from the
+/// original source, and stripping keywords never alters the line count, the
+/// same index addresses the correct line in `normalised`.
 pub fn postprocess(normalised: &str, stripped: &[StrippedKeyword]) -> String {
     if stripped.is_empty() {
         return normalised.to_owned();
     }
 
-    // For each stripped keyword we know its byte offset in the pre-processed
-    // source.  Because the normalised source is derived from the pre-processed
-    // source by only removing/adding whitespace at line ends and translating
-    // tabs, the keyword is on the same logical *line* index.
-    let mut insertions: Vec<(usize, TyphonKeyword)> = stripped
-        .iter()
-        .map(|sk| {
-            // Count newlines before offset to get 0-based line index.
-            let line_idx = normalised[..sk.offset.min(normalised.len())]
-                .chars()
-                .filter(|&c| c == '\n')
-                .count();
-            (line_idx, sk.keyword)
-        })
-        .collect();
-
-    // Sort in reverse line order so insertions don't shift later indices.
+    // Build insertion list, sorted in reverse order so that later lines are
+    // handled first (avoids index shifting problems if we ever join + split).
+    let mut insertions: Vec<(usize, TyphonKeyword)> =
+        stripped.iter().map(|sk| (sk.line_index, sk.keyword)).collect();
     insertions.sort_by(|a, b| b.0.cmp(&a.0));
 
-    // Work with owned Strings to avoid memory leaks.
+    // Work with owned Strings to avoid lifetime issues.
     let mut lines: Vec<String> = normalised.lines().map(|l| l.to_owned()).collect();
     let has_trailing_newline = normalised.ends_with('\n');
 
@@ -152,6 +138,7 @@ mod tests {
         assert_eq!(result.python_source, "x: int = 1\n");
         assert_eq!(result.stripped.len(), 1);
         assert!(matches!(result.stripped[0].keyword, TyphonKeyword::Val));
+        assert_eq!(result.stripped[0].line_index, 0);
     }
 
     #[test]
@@ -160,6 +147,7 @@ mod tests {
         assert_eq!(result.python_source, "count: int = 0\n");
         assert_eq!(result.stripped.len(), 1);
         assert!(matches!(result.stripped[0].keyword, TyphonKeyword::Var));
+        assert_eq!(result.stripped[0].line_index, 0);
     }
 
     #[test]
@@ -167,6 +155,17 @@ mod tests {
         let result = preprocess("    val x: int = 1\n");
         assert_eq!(result.python_source, "    x: int = 1\n");
         assert_eq!(result.stripped.len(), 1);
+        assert_eq!(result.stripped[0].line_index, 0);
+    }
+
+    #[test]
+    fn strips_multiple_keywords_correct_line_indices() {
+        let src = "val a: int = 1\nx: int = 2\nvar b: int = 3\n";
+        let result = preprocess(src);
+        assert_eq!(result.python_source, "a: int = 1\nx: int = 2\nb: int = 3\n");
+        assert_eq!(result.stripped.len(), 2);
+        assert_eq!(result.stripped[0].line_index, 0); // "val a" is on line 0
+        assert_eq!(result.stripped[1].line_index, 2); // "var b" is on line 2
     }
 
     #[test]

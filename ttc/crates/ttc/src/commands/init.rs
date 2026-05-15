@@ -61,10 +61,20 @@ pub fn run(args: InitArgs) -> Result<()> {
         strictness: StrictnessConfig::default(),
         env: EnvConfig::default(),
     };
-    std::fs::write(&config_path, config.to_toml_string())
+    let toml_str = config
+        .to_toml_string()
+        .map_err(|e| miette!("cannot serialise typhon.toml: {}", e))?;
+    std::fs::write(&config_path, toml_str)
         .map_err(|e| miette!("cannot write typhon.toml: {}", e))?;
 
-    // Write a starter main.tt.
+    // Write a starter main.tt — refuse to overwrite if it already exists.
+    let main_tt_path = src_dir.join("main.tt");
+    if main_tt_path.exists() {
+        return Err(miette!(
+            "src/main.tt already exists in {}; use --force to overwrite",
+            dir.display()
+        ));
+    }
     let main_tt = format!(
         r#"# {name} — entry point
 #
@@ -77,7 +87,7 @@ def main() -> None:
 "#,
         name = name
     );
-    std::fs::write(src_dir.join("main.tt"), main_tt)
+    std::fs::write(&main_tt_path, main_tt)
         .map_err(|e| miette!("cannot write src/main.tt: {}", e))?;
 
     println!("Initialised Typhon project `{}` in {}", name, dir.display());

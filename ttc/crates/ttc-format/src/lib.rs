@@ -39,9 +39,12 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TtcError>
     let prep = preprocess(source);
 
     // Step 2: parse — validate syntax, discard AST.
+    // Use `prep.python_source` as the diagnostic source text so that the
+    // reported byte offset (which comes from parsing the preprocessed source)
+    // aligns correctly with the displayed code.
     parse_module(&prep.python_source, path).map_err(|e| {
         let offset = usize::from(e.offset);
-        TtcError::parse(path, source, e.to_string(), offset)
+        TtcError::parse(path, &prep.python_source, e.to_string(), offset)
     })?;
 
     // Step 3: normalise whitespace on the pre-processed source.
