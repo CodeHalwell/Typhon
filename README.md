@@ -1,12 +1,35 @@
 # Typhon
 
-A statically-typed superset of Python that compiles to clean, readable CPython 3.13+ code with no runtime dependency on the toolchain.
+A statically-typed, stricter superset of Python that compiles to clean, readable CPython 3.13+ code with no runtime dependency on the toolchain.
 
-## Overview
+> Every `.tt` file emits valid, idiomatic `.py`. Not all `.py` is valid Typhon.
 
-Every `.tt` file emits valid, idiomatic `.py`. Not all `.py` is valid Typhon. The compiler and language server live in a single Rust binary called `ttc`.
+The compiler and language server live in a single Rust binary called `ttc`.
 
-## Quick Start
+## Why
+
+- **Static safety** — non-nullable by default, no implicit `Any`, explicit error handling via `Result[T, E]`.
+- **Modern ergonomics** — `val`/`var`, interfaces, sealed unions with exhaustive matching, guards, pipes, comptime, lazy loading.
+- **Clean output** — emits idiomatic Python; deploy like any other Python project, no Typhon runtime to install.
+- **First-class tooling** — one binary builds, checks, formats, and runs as an LSP with sub-100 ms incremental feedback.
+
+## Documentation
+
+The canonical design doc is **[the long-term plan](docs/long-term-plan.md)** — goals, architecture, language design, roadmap, and risks in one place.
+
+Focused references:
+
+| | |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | Compiler pipeline, crate layout, toolchain choices |
+| [docs/language.md](docs/language.md) | Type system, error handling, async, `val`/`var`, comptime |
+| [docs/cli.md](docs/cli.md) | The `ttc` binary and its subcommands |
+| [docs/configuration.md](docs/configuration.md) | `typhon.toml` reference |
+| [docs/roadmap.md](docs/roadmap.md) | Phased delivery plan |
+| [docs/risks.md](docs/risks.md) | Risks and mitigations |
+| [docs/prior-art.md](docs/prior-art.md) | TypeScript, rust-analyzer, ty, Pyrefly, oxc, Ruff |
+
+## Quick start
 
 ```bash
 # Build the compiler
@@ -21,7 +44,7 @@ cargo build --release
 ./target/release/ttc check src/
 ```
 
-## The `ttc` Binary
+## The `ttc` binary
 
 | Command | Purpose |
 |---------|---------|
@@ -33,32 +56,23 @@ cargo build --release
 | `ttc trace` | Map a Python traceback back to Typhon source via `.py.map` files |
 | `ttc profile` | Instrument emitted code for hot-function detection (opt-in) |
 
-## Language Features (Roadmap)
+See [docs/cli.md](docs/cli.md) for the full reference.
 
-### Phase 0 — Foundation ✅
-- Cargo workspace skeleton with `crates/` and `vendor/` directories
-- `val`/`var` keyword tokens (immutable and mutable bindings)
-- `ttc fmt` — parses and validates `.tt` source, normalises whitespace
-- `ttc check` — validates syntax and emits miette diagnostics
-- `ttc init` — scaffolds new projects with `typhon.toml`
+## Project status
 
-### Phase 1 — Core types (months 3–5)
-- Salsa incremental database
-- Name resolution, scope construction, `val`/`var` enforcement
-- Non-nullable types by default, flow narrowing
+**Phase 0 — Foundation** is in progress:
 
-### Phase 2 — Class and value features (months 6–8)
-- `@dataclass(slots=True)` emission; `model` keyword for Pydantic
-- Sealed unions and exhaustive `match`
-- `Result[T, E]` and the `?` operator
+- ✅ Cargo workspace skeleton with `crates/` and `vendor/` directories
+- ✅ `val`/`var` keyword tokens (immutable and mutable bindings)
+- ✅ `ttc fmt` — parses and validates `.tt` source, normalises whitespace
+- ✅ `ttc check` — validates syntax and emits miette diagnostics
+- ✅ `ttc init` — scaffolds new projects with `typhon.toml`
 
-### Phase 3 — Structural typing (months 9–12)
-- Generics with angle-bracket syntax
-- `interface` declarations and structural subtyping
-- Pipe operator, guards, extension methods
-- `.dtt` stub files and `unsafe` blocks
+See [docs/roadmap.md](docs/roadmap.md) for the phased plan through Phase 3 (month twelve) and beyond.
 
-## Configuration (`typhon.toml`)
+## Configuration
+
+`typhon.toml` at the project root drives every subcommand:
 
 ```toml
 [project]
@@ -69,25 +83,27 @@ out = "build"
 
 [python]
 target = "3.13"
-free_threaded = false
+free-threaded = false
 
 [emit]
-class_default = "dataclass"  # or "pydantic"
+class-default = "dataclass"  # or "pydantic"
 format = true
 
 [strictness]
-no_implicit_any = true
-unused_import = "error"
-exhaustive_match = "error"
+no-implicit-any = true
+unused-import = "error"
+exhaustive-match = "error"
 ```
 
-## Workspace Layout
+Full reference: [docs/configuration.md](docs/configuration.md).
+
+## Workspace layout
 
 ```
 ttc/
 ├── Cargo.toml                  (workspace root)
 ├── crates/
-│   ├── ttc-syntax/             Typhon lexer/parser (extends rustpython-parser)
+│   ├── ttc-syntax/             Typhon lexer/parser
 │   ├── ttc-db/                 Salsa database (Phase 1+)
 │   ├── ttc-resolve/            Name resolution (Phase 1+)
 │   ├── ttc-types/              Type checker (Phase 1+)
@@ -100,3 +116,5 @@ ttc/
 │   └── ttc/                    CLI binary
 └── vendor/                     Vendored crates (ruff fork, Phase 1)
 ```
+
+See [docs/architecture.md](docs/architecture.md) for the pipeline and crate-by-crate breakdown.
