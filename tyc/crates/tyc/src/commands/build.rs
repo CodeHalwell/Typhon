@@ -18,7 +18,9 @@ use tyc_desugar::desugar_module;
 use tyc_diagnostics::Diagnostics;
 use tyc_emit::emit;
 use tyc_format::format_source;
-use tyc_syntax::preprocess::{expand_pipes, expand_question_ops, expand_with_chains, preprocess};
+use tyc_syntax::preprocess::{
+    expand_lazy_imports, expand_pipes, expand_question_ops, expand_with_chains, preprocess,
+};
 
 use crate::commands::util::{apply_strictness, collect_ty_files};
 use crate::config::TyphonConfig;
@@ -154,7 +156,9 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // After this the Python parser only sees standard Python plus the
         // `val`/`var`/`model`/`impl`/`comptime` keywords stripped by
         // `preprocess`.
-        let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(source)));
+        let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(
+            &expand_lazy_imports(source),
+        )));
         let prep = preprocess(&expanded);
 
         let module = parse(
@@ -323,3 +327,87 @@ class Err(Generic[_E]):
 
 type Result[T, E] = Ok[T] | Err[E]
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Scaffold a minimal project under `dir` and return the src and build paths.
+    fn scaffold(
+        dir: &std::path::Path,
+        src_content: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let src_dir = dir.join("src");
+        let out_dir = dir.join("build");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(
+            dir.join("typhon.toml"),
+            "[project]\nname = \"test\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+             [python]\ntarget = \"3.13\"\n[emit]\nformat = false\n[strictness]\n[env]\n",
+        )
+        .unwrap();
+        std::fs::write(src_dir.join("main.ty"), src_content).unwrap();
+        (src_dir, out_dir)
+    }
+
+    #[test]
+    fn build_produces_py_file_from_simple_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, out_dir) = scaffold(tmp.path(), "val greeting: str = \"hello\"\n");
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        })
+        .unwrap();
+        assert!(
+            out_dir.join("main.py").exists(),
+            "main.py should be emitted"
+        );
+    }
+
+    #[test]
+    fn build_out_flag_overrides_config_out_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        scaffold(tmp.path(), "val x: int = 42\n");
+        let custom_out = tmp.path().join("custom_out");
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: Some(custom_out.clone()),
+            no_format: true,
+        })
+        .unwrap();
+        assert!(
+            custom_out.join("main.py").exists(),
+            "output should go to custom_out/"
+        );
+    }
+
+    #[test]
+    fn build_fails_on_type_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        scaffold(tmp.path(), "val x: int = \"wrong type\"\n");
+        let result = run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        });
+        assert!(result.is_err(), "build should fail on type mismatch");
+    }
+
+    #[test]
+    fn build_emits_typhon_runtime_when_result_used() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, out_dir) = scaffold(tmp.path(), "def f() -> Ok[int]:\n    return Ok(1)\n");
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        })
+        .unwrap();
+        assert!(
+            out_dir.join("typhon_runtime.py").exists(),
+            "typhon_runtime.py should be emitted when Ok/Err are used"
+        );
+    }
+}

@@ -2,6 +2,7 @@
 name = "tyc"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Typhon compiler and language server — single binary"
 
 [[bin]]
@@ -27,3 +28,6 @@ tyc-types       = { workspace = true }
 tyc-analyse     = { workspace = true }
 tyc-desugar     = { workspace = true }
 tyc-lsp         = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

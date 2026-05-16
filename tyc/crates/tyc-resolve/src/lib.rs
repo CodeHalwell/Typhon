@@ -526,13 +526,17 @@ fn declare_target(r: &mut Resolver, scope: ScopeId, target: &Expr<TextRange>, de
             // alone would only appear when the inner keyword was omitted.
             // `model` and `impl` are not value binding keywords — treat all
             // three like bare assignments (inherit or default).
-            Some(TyphonKeyword::Model | TyphonKeyword::Comptime | TyphonKeyword::Impl) | None => {
-                existing_mut.unwrap_or(if default_val {
-                    Mutability::Val
-                } else {
-                    Mutability::Var
-                })
-            }
+            Some(
+                TyphonKeyword::Model
+                | TyphonKeyword::Comptime
+                | TyphonKeyword::Impl
+                | TyphonKeyword::Lazy,
+            )
+            | None => existing_mut.unwrap_or(if default_val {
+                Mutability::Val
+            } else {
+                Mutability::Var
+            }),
         };
         let span = (
             n.range.start().to_usize(),

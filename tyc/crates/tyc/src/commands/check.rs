@@ -98,3 +98,54 @@ pub fn run(args: CheckArgs) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_ty(dir: &std::path::Path, name: &str, content: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn check_passes_valid_ty_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_ty(tmp.path(), "ok.ty", "val x: int = 1\n");
+        let args = CheckArgs {
+            paths: vec![tmp.path().to_path_buf()],
+        };
+        run(args).unwrap();
+    }
+
+    #[test]
+    fn check_reports_type_mismatch_as_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_ty(tmp.path(), "bad.ty", "val x: int = \"hello\"\n");
+        let args = CheckArgs {
+            paths: vec![tmp.path().to_path_buf()],
+        };
+        assert!(run(args).is_err(), "type mismatch should be an error");
+    }
+
+    #[test]
+    fn check_passes_nullable_annotation() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_ty(tmp.path(), "nullable.ty", "val x: str? = None\n");
+        let args = CheckArgs {
+            paths: vec![tmp.path().to_path_buf()],
+        };
+        run(args).unwrap();
+    }
+
+    #[test]
+    fn check_reports_val_reassignment_as_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_ty(tmp.path(), "immut.ty", "val x: int = 1\nx = 2\n");
+        let args = CheckArgs {
+            paths: vec![tmp.path().to_path_buf()],
+        };
+        assert!(run(args).is_err(), "val reassignment should be an error");
+    }
+}

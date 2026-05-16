@@ -2,6 +2,7 @@
 name = "tyc-format"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "tyc fmt — Typhon-aware source formatter"
 
 [dependencies]
