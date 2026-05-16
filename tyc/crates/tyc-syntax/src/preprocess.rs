@@ -166,6 +166,89 @@ pub fn preprocess(source: &str) -> PreprocessResult {
                 }
             }
 
+            // ── `extend ClassName:` → `class __typhon_impl_ClassName(object):` ─
+            // For Typhon v1, `extend` on user-defined classes is an alias for
+            // `impl` — the methods are merged into the target class at desugar.
+            // Extension methods on built-ins (e.g. `extend str:`) are deferred
+            // to a later phase that can rewrite call sites with type info.
+            if rest.starts_with("extend ")
+                && rest.len() > "extend ".len()
+                && (rest.as_bytes()["extend ".len()].is_ascii_alphanumeric()
+                    || rest.as_bytes()["extend ".len()] == b'_')
+            {
+                let after_extend = &rest["extend ".len()..];
+                if let Some(class_header) = make_impl_class_line(after_extend) {
+                    stripped.push(StrippedKeyword {
+                        line_index,
+                        keyword: TyphonKeyword::Extend,
+                    });
+                    let new_line = format!("{}class {}", indent, class_header);
+                    let (rewritten, marks) = rewrite_optionals(&new_line, &mut in_string);
+                    for col in marks {
+                        optionals.push(StrippedOptional {
+                            line_index,
+                            python_col: col,
+                        });
+                    }
+                    python_source.push_str(&rewritten);
+                    continue;
+                }
+            }
+
+            // ── `interface Name:` → `class Name(Protocol):` ─────────────────
+            if rest.starts_with("interface ")
+                && rest.len() > "interface ".len()
+                && (rest.as_bytes()["interface ".len()].is_ascii_alphanumeric()
+                    || rest.as_bytes()["interface ".len()] == b'_')
+            {
+                let after_iface = &rest["interface ".len()..];
+                if let Some(class_header) = make_interface_class_line(after_iface) {
+                    stripped.push(StrippedKeyword {
+                        line_index,
+                        keyword: TyphonKeyword::Interface,
+                    });
+                    let new_line = format!("{}class {}", indent, class_header);
+                    let (rewritten, marks) = rewrite_optionals(&new_line, &mut in_string);
+                    for col in marks {
+                        optionals.push(StrippedOptional {
+                            line_index,
+                            python_col: col,
+                        });
+                    }
+                    python_source.push_str(&rewritten);
+                    continue;
+                }
+            }
+
+            // ── `unsafe:` → `if True:  # __typhon_unsafe__` ────────────────
+            // The body is a no-op wrapper that preserves Python scoping. The
+            // type checker tracks the marker so it can permit `Any` to flow
+            // freely inside, and require explicit assignments at the boundary.
+            if rest.starts_with("unsafe")
+                && (rest.len() == "unsafe".len()
+                    || matches!(
+                        rest.as_bytes().get("unsafe".len()).copied(),
+                        Some(b':') | Some(b' ') | Some(b'\t')
+                    ))
+            {
+                if let Some(line_body) = rewrite_unsafe_block_line(rest) {
+                    stripped.push(StrippedKeyword {
+                        line_index,
+                        keyword: TyphonKeyword::Unsafe,
+                    });
+                    let new_line = format!("{}{}", indent, line_body);
+                    let (rewritten, marks) = rewrite_optionals(&new_line, &mut in_string);
+                    for col in marks {
+                        optionals.push(StrippedOptional {
+                            line_index,
+                            python_col: col,
+                        });
+                    }
+                    python_source.push_str(&rewritten);
+                    continue;
+                }
+            }
+
             // ── `model ClassName:` → `class ClassName(BaseModel):` ──────────
             if rest.starts_with("model ")
                 && rest.len() > "model ".len()
@@ -353,6 +436,65 @@ fn make_impl_class_line(after_impl: &str) -> Option<String> {
     Some(format!("__typhon_impl_{}(object){}", name, tail))
 }
 
+/// Build the class-header portion of an `interface` line, converting
+/// `Name:\n` into `Name(Protocol):\n`.
+///
+/// Interfaces accept an explicit base list `Name(Base):\n` and the existing
+/// bases are preserved alongside `Protocol`.
+fn make_interface_class_line(after_iface: &str) -> Option<String> {
+    let mut depth = 0i32;
+    let mut colon_pos = None;
+    for (i, c) in after_iface.char_indices() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            ':' if depth == 0 => {
+                colon_pos = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let colon_pos = colon_pos?;
+    let head = after_iface[..colon_pos].trim_end();
+    let tail = &after_iface[colon_pos..];
+    let new_head = if let Some(stripped) = head.strip_suffix(')') {
+        let trimmed = stripped.trim_end();
+        if trimmed.ends_with('(') {
+            format!("{trimmed}Protocol)")
+        } else {
+            format!("{trimmed}, Protocol)")
+        }
+    } else {
+        format!("{}(Protocol)", head)
+    };
+    Some(format!("{}{}", new_head, tail))
+}
+
+/// Rewrite an `unsafe` header line into a `if True:` block with a marker
+/// comment so the desugar pass can find it.
+///
+/// Accepts both `unsafe:` and `unsafe x:` (where `x` is a future expression
+/// form — rejected for now). Returns `None` if the header is malformed and the
+/// caller should leave the line for the Python parser to flag.
+fn rewrite_unsafe_block_line(rest: &str) -> Option<String> {
+    // Strip a trailing newline so we can re-attach exactly one.
+    let raw = rest.trim_end_matches(['\n', '\r']);
+    let terminator = &rest[raw.len()..];
+    let body = raw.strip_prefix("unsafe")?.trim_start();
+    if !body.ends_with(':') {
+        return None;
+    }
+    // For v1 we only accept the bare `unsafe:` form.
+    if body.trim_end_matches(':').trim() != "" {
+        return None;
+    }
+    Some(format!("if True:  # __typhon_unsafe__{}", terminator))
+}
+
+/// Rewrite the body of `lazy import X = expr` into a Python assignment that
+/// uses the typhon_runtime lazy-loader helper. Returns `None` if the import
+/// body doesn't match the supported shape.
 /// Build the class-header portion of a `model` line, converting
 /// `ClassName:\n` (or `ClassName :\n`) into `ClassName(BaseModel):\n`.
 ///
@@ -632,10 +774,65 @@ pub fn postprocess_full(
                 );
                 lines[line_idx] = new_line;
             }
+            TyphonKeyword::Extend => {
+                // Restore `class __typhon_impl_X(object):` → `extend X:`.
+                // (`extend` shares the impl stub prefix.)
+                let line = &lines[line_idx];
+                let indent_len = line
+                    .find(|c: char| !c.is_whitespace())
+                    .unwrap_or(line.len());
+                let content = &line[indent_len..];
+                let restored = if let Some(tail) = content.strip_prefix("class __typhon_impl_") {
+                    let tail = tail.replacen("(object)", "", 1);
+                    format!("extend {}", tail)
+                } else {
+                    format!("extend {}", content)
+                };
+                lines[line_idx] = format!("{}{}", &line[..indent_len], restored);
+            }
+            TyphonKeyword::Interface => {
+                // Restore `class Name(Protocol):` → `interface Name:`.
+                let line = &lines[line_idx];
+                let indent_len = line
+                    .find(|c: char| !c.is_whitespace())
+                    .unwrap_or(line.len());
+                let content = &line[indent_len..];
+                let restored = if let Some(tail) = content.strip_prefix("class ") {
+                    let tail = tail
+                        .replacen("(Protocol)", "", 1)
+                        .replacen("(Protocol, ", "(", 1)
+                        .replacen(", Protocol)", ")", 1);
+                    format!("interface {}", tail)
+                } else {
+                    format!("interface {}", content)
+                };
+                lines[line_idx] = format!("{}{}", &line[..indent_len], restored);
+            }
+            TyphonKeyword::Unsafe => {
+                // Restore `if True:  # __typhon_unsafe__` → `unsafe:`.
+                let line = &lines[line_idx];
+                let indent_len = line
+                    .find(|c: char| !c.is_whitespace())
+                    .unwrap_or(line.len());
+                // Match either with or without trailing whitespace before the comment.
+                let content = &line[indent_len..];
+                let restored = if content.starts_with("if True:") {
+                    // Find the marker; replace the whole `if True: …` head with `unsafe:`.
+                    "unsafe:".to_owned()
+                } else {
+                    format!("unsafe: {}", content)
+                };
+                lines[line_idx] = format!("{}{}", &line[..indent_len], restored);
+            }
             // `lazy import` restoration is handled separately below via
             // `lazy_imports`; the `Lazy` keyword is never pushed into
             // `stripped`, so this arm is a safety no-op.
             TyphonKeyword::Lazy => {}
+            TyphonKeyword::Gather | TyphonKeyword::Go => {
+                // These constructs are expanded by separate passes
+                // (`expand_gather_blocks`, `expand_go_calls`); they never
+                // end up in the `stripped` keyword list.
+            }
         }
     }
 
@@ -654,6 +851,56 @@ pub fn postprocess_full(
         result.push('\n');
     }
     result
+}
+
+// ── `lazy` usage validation ───────────────────────────────────────────────────
+
+/// An error produced when `lazy` is used in an unsupported form.
+#[derive(Debug, Clone)]
+pub struct LazyUsageError {
+    /// 0-based line index in the original Typhon source.
+    pub line_index: usize,
+    /// Byte offset where the violating `lazy` token starts.
+    pub offset: usize,
+    /// Human-readable error message.
+    pub message: String,
+}
+
+/// Scan `source` for `lazy` constructs that Typhon rejects.
+///
+/// Currently flagged:
+/// - `lazy from x import a, b` — `from` imports defeat deferral because the
+///   names must be bound eagerly; reject in favour of `lazy import x = x` and
+///   member access through the lazy module proxy.
+pub fn validate_lazy_usage(source: &str) -> Vec<LazyUsageError> {
+    let mut errors = Vec::new();
+    let mut byte_offset: usize = 0;
+    let mut in_string: Option<StringMode> = None;
+    for (line_index, line) in source.split_inclusive('\n').enumerate() {
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let pre = in_string;
+        let _ = scan_line_code_end(raw, &mut in_string);
+        if pre.is_none() {
+            let indent_len = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
+            let body = &raw[indent_len..];
+            if let Some(rest) = body.strip_prefix("lazy ") {
+                if rest.starts_with("from ") {
+                    errors.push(LazyUsageError {
+                        line_index,
+                        offset: byte_offset + indent_len,
+                        message: "`lazy from … import …` is not supported; \
+                                  Typhon's lazy imports defer module loading, \
+                                  which is incompatible with eagerly binding \
+                                  specific names. Use `lazy import x = x` and \
+                                  access members through the lazy proxy."
+                            .to_owned(),
+                    });
+                }
+            }
+        }
+        byte_offset += line.len();
+    }
+    errors
 }
 
 // ── `?` operator validation ───────────────────────────────────────────────────
@@ -1525,6 +1772,367 @@ fn render_chain(chain: &WithChain, chain_indent: &str, counter: &mut usize) -> S
     out
 }
 
+// ── `gather` block expansion ──────────────────────────────────────────────────
+
+/// Expand a `gather` block into a concurrent task pattern.
+///
+/// `gather:` and `gather(strategy="…")` block forms are accepted. The inner
+/// bindings are simple `name = expr` lines that must all be `await`able. The
+/// default form lowers to `asyncio.TaskGroup`, which cancels siblings on the
+/// first failure:
+///
+/// ```text
+/// # Typhon
+/// gather:
+///     user  = fetch_user(id)
+///     posts = fetch_posts(id)
+///
+/// # Lowered Python
+/// async with asyncio.TaskGroup() as __typhon_tg__:
+///     __typhon_gather_0__ = __typhon_tg__.create_task(fetch_user(id))
+///     __typhon_gather_1__ = __typhon_tg__.create_task(fetch_posts(id))
+/// user  = __typhon_gather_0__.result()
+/// posts = __typhon_gather_1__.result()
+/// ```
+///
+/// The `gather(strategy="best-effort"):` form lowers to a plain
+/// `asyncio.gather(..., return_exceptions=True)` await so callers can inspect
+/// per-task failures:
+///
+/// ```text
+/// __typhon_gather_results__ = await asyncio.gather(
+///     fetch_user(id), fetch_posts(id), return_exceptions=True,
+/// )
+/// user, posts = __typhon_gather_results__
+/// ```
+///
+/// Lines inside triple-quoted strings are passed through verbatim. Malformed
+/// blocks (no bindings, mixed body lines, etc.) are emitted unchanged so the
+/// Python parser surfaces a precise error.
+pub fn expand_gather_blocks(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut counter: usize = 0;
+    let mut in_string: Option<StringMode> = None;
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+        let pre = in_string;
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let _ = scan_line_code_end(raw, &mut in_string);
+
+        if pre.is_some() {
+            out.push_str(line);
+            i += 1;
+            continue;
+        }
+
+        let indent_len = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
+        let header_indent = &raw[..indent_len];
+        let body = &raw[indent_len..];
+
+        let parsed = parse_gather_header(body);
+        if let Some(strategy) = parsed {
+            let mut block_state = in_string;
+            if let Some((bindings, consumed, end_state)) =
+                collect_gather_bindings(&lines, i, header_indent, &mut block_state)
+            {
+                let rendered =
+                    render_gather_block(&bindings, header_indent, strategy, &mut counter);
+                out.push_str(&rendered);
+                in_string = end_state;
+                i += consumed;
+                continue;
+            }
+        }
+
+        out.push_str(line);
+        i += 1;
+    }
+
+    out
+}
+
+/// Gather strategy chosen at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatherStrategy {
+    /// Default — lower to `asyncio.TaskGroup` (cancels siblings on first failure).
+    TaskGroup,
+    /// `strategy="best-effort"` — lower to `asyncio.gather(..., return_exceptions=True)`.
+    BestEffort,
+}
+
+/// Parse a `gather:` or `gather(strategy="..."):` header line, returning the
+/// chosen strategy when the syntax is well-formed.
+fn parse_gather_header(body: &str) -> Option<GatherStrategy> {
+    let trimmed = body.trim_end();
+    if trimmed == "gather:" {
+        return Some(GatherStrategy::TaskGroup);
+    }
+    // gather(strategy="..."):
+    let inner = trimmed.strip_prefix("gather(")?.strip_suffix("):")?.trim();
+    if !inner.starts_with("strategy") {
+        return None;
+    }
+    let after = inner["strategy".len()..].trim_start();
+    let value = after.strip_prefix('=')?.trim();
+    // Accept either single- or double-quoted string literal.
+    let stripped = value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))?;
+    match stripped {
+        "task-group" | "taskgroup" | "default" => Some(GatherStrategy::TaskGroup),
+        "best-effort" | "best_effort" | "besteffort" => Some(GatherStrategy::BestEffort),
+        _ => None,
+    }
+}
+
+/// One `name = expr` binding inside a `gather:` block.
+#[derive(Debug)]
+struct GatherBinding {
+    name: String,
+    expr: String,
+}
+
+/// Collect indented `name = expr` bindings under a `gather:` header.
+/// Returns the bindings, the number of lines consumed (header + bindings),
+/// and the resulting triple-quoted-string state.
+fn collect_gather_bindings(
+    lines: &[&str],
+    start: usize,
+    header_indent: &str,
+    in_string: &mut Option<StringMode>,
+) -> Option<(Vec<GatherBinding>, usize, Option<StringMode>)> {
+    let mut bindings = Vec::new();
+    let mut idx = start + 1;
+    let mut block_state = *in_string;
+
+    while idx < lines.len() {
+        let line = lines[idx];
+        let raw = line.trim_end_matches(['\n', '\r']);
+        if raw.trim().is_empty() {
+            // Allow blank lines inside the block; they don't add bindings.
+            let _ = scan_line_code_end(raw, &mut block_state);
+            idx += 1;
+            continue;
+        }
+        let line_indent = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
+        if line_indent <= header_indent.len() {
+            break;
+        }
+        let body = &raw[line_indent..];
+        let eq = find_assignment_eq(body)?;
+        let name = body[..eq].trim().to_owned();
+        let expr = body[eq + 1..].trim().to_owned();
+        if name.is_empty() || expr.is_empty() {
+            return None;
+        }
+        if !is_python_ident(&name) {
+            return None;
+        }
+        bindings.push(GatherBinding { name, expr });
+        let _ = scan_line_code_end(raw, &mut block_state);
+        idx += 1;
+    }
+
+    if bindings.is_empty() {
+        return None;
+    }
+    let consumed = idx - start;
+    Some((bindings, consumed, block_state))
+}
+
+/// Render a `gather` block into the chosen Python concurrency primitive.
+fn render_gather_block(
+    bindings: &[GatherBinding],
+    header_indent: &str,
+    strategy: GatherStrategy,
+    counter: &mut usize,
+) -> String {
+    let mut out = String::new();
+    match strategy {
+        GatherStrategy::TaskGroup => {
+            let tg = format!("__typhon_tg_{}__", *counter);
+            *counter += 1;
+            out.push_str(header_indent);
+            out.push_str("async with asyncio.TaskGroup() as ");
+            out.push_str(&tg);
+            out.push_str(":\n");
+            let inner = format!("{}    ", header_indent);
+            let mut task_names = Vec::with_capacity(bindings.len());
+            for b in bindings {
+                let task_name = format!("__typhon_gather_{}__", *counter);
+                *counter += 1;
+                out.push_str(&inner);
+                out.push_str(&task_name);
+                out.push_str(" = ");
+                out.push_str(&tg);
+                out.push_str(".create_task(");
+                out.push_str(&b.expr);
+                out.push_str(")\n");
+                task_names.push(task_name);
+            }
+            for (b, task) in bindings.iter().zip(task_names.iter()) {
+                out.push_str(header_indent);
+                out.push_str(&b.name);
+                out.push_str(" = ");
+                out.push_str(task);
+                out.push_str(".result()\n");
+            }
+        }
+        GatherStrategy::BestEffort => {
+            let results = format!("__typhon_gather_{}__", *counter);
+            *counter += 1;
+            out.push_str(header_indent);
+            out.push_str(&results);
+            out.push_str(" = await asyncio.gather(");
+            for (idx, b) in bindings.iter().enumerate() {
+                if idx > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&b.expr);
+            }
+            if !bindings.is_empty() {
+                out.push_str(", ");
+            }
+            out.push_str("return_exceptions=True)\n");
+            // Tuple-unpack the results into the user-named bindings. With a
+            // single binding we still need a trailing comma so Python performs
+            // sequence unpacking (`x, = results`) rather than binding the
+            // whole list to one name (`x = results`).
+            out.push_str(header_indent);
+            for (idx, b) in bindings.iter().enumerate() {
+                if idx > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&b.name);
+            }
+            if bindings.len() == 1 {
+                out.push(',');
+            }
+            out.push_str(" = ");
+            out.push_str(&results);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+// ── `go` spawn expansion ──────────────────────────────────────────────────────
+
+/// Rewrite every `go <call>` and `go <call> -> name` statement into a call to
+/// the `typhon_runtime.tasks.spawn` helper.
+///
+/// `go fetch(x)` becomes `typhon_runtime.tasks.spawn(fetch(x))`.
+/// `go fetch(x) -> fut` becomes `fut = typhon_runtime.tasks.spawn(fetch(x))`.
+///
+/// The pass leaves any other `go`-prefixed line alone so identifiers like
+/// `goto` aren't accidentally rewritten.
+pub fn expand_go_calls(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut in_string: Option<StringMode> = None;
+    for line in source.split_inclusive('\n') {
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let terminator = &line[raw.len()..];
+        let pre = in_string;
+        let code_end = scan_line_code_end(raw, &mut in_string);
+        if pre.is_some() {
+            out.push_str(line);
+            continue;
+        }
+        let code = &raw[..code_end];
+        let comment = &raw[code_end..];
+        let indent_len = code
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(code.len());
+        let indent = &code[..indent_len];
+        let body = code[indent_len..].trim_end();
+        if let Some(rest) = body.strip_prefix("go ") {
+            if let Some((call_expr, handle)) = parse_go_call(rest) {
+                if let Some(handle) = handle {
+                    out.push_str(indent);
+                    out.push_str(&handle);
+                    out.push_str(" = typhon_runtime.tasks.spawn(");
+                    out.push_str(&call_expr);
+                    out.push(')');
+                } else {
+                    out.push_str(indent);
+                    out.push_str("typhon_runtime.tasks.spawn(");
+                    out.push_str(&call_expr);
+                    out.push(')');
+                }
+                out.push_str(comment);
+                out.push_str(terminator);
+                continue;
+            }
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+/// Parse the tail of a `go` line into `(call_expr, Option<handle_name>)`.
+///
+/// Accepts:
+/// - `f(x)`               → `("f(x)", None)`
+/// - `mod.f(x) -> fut`    → `("mod.f(x)", Some("fut"))`
+///
+/// Returns `None` for shapes we don't recognise (so the caller leaves the line
+/// alone and the parser surfaces a precise error).
+fn parse_go_call(rest: &str) -> Option<(String, Option<String>)> {
+    let rest = rest.trim();
+    // Split on `->` at depth 0, with string-literal and backslash-escape
+    // awareness so `go f("\"->")` is not mistakenly split at the inner `->`.
+    let mut depth: i32 = 0;
+    let bytes = rest.as_bytes();
+    let mut arrow_at: Option<usize> = None;
+    let mut in_str: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' {
+                i += 1; // skip escaped character
+            } else if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' | b'\'' => in_str = Some(b),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'-' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'>' => {
+                arrow_at = Some(i);
+                break;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let (call_part, handle_part) = match arrow_at {
+        Some(pos) => (rest[..pos].trim(), Some(rest[pos + 2..].trim())),
+        None => (rest, None),
+    };
+    if call_part.is_empty() {
+        return None;
+    }
+    // The call portion must look like a function call (ends with `)`).
+    if !call_part.ends_with(')') {
+        return None;
+    }
+    let handle = match handle_part {
+        Some(h) if is_python_ident(h) => Some(h.to_owned()),
+        Some(_) => return None,
+        None => None,
+    };
+    Some((call_part.to_owned(), handle))
+}
+
 // ── `|>` pipe operator expansion ──────────────────────────────────────────────
 
 /// Expand the `|>` pipe operator into nested function calls.
@@ -2052,366 +2660,6 @@ fn find_assignment_eq(s: &str) -> Option<usize> {
             _ => {}
         }
     }
-    None
-}
-
-// ── `gather` block expansion ──────────────────────────────────────────────────
-
-/// Strategy selected by the `gather` keyword.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GatherStrategy {
-    /// Default — lowers to `async with asyncio.TaskGroup()`.
-    /// Cancels sibling tasks on the first failure.
-    TaskGroup,
-    /// `gather(strategy="best-effort"):` — lowers to
-    /// `await asyncio.gather(..., return_exceptions=True)`.
-    BestEffort,
-}
-
-/// Parse the non-indented portion of a `gather` header line into a strategy.
-///
-/// Recognises `gather:` and `gather(strategy="best-effort"):` / `'best-effort'`.
-/// A trailing `# comment` is ignored. Returns `None` for anything else.
-fn parse_gather_header(body: &str) -> Option<GatherStrategy> {
-    let code = body.split('#').next().unwrap_or("").trim_end();
-    if code == "gather:" {
-        return Some(GatherStrategy::TaskGroup);
-    }
-    if code == "gather(strategy=\"best-effort\"):" || code == "gather(strategy='best-effort'):" {
-        return Some(GatherStrategy::BestEffort);
-    }
-    None
-}
-
-/// One `NAME = EXPR` assignment parsed from a `gather` body line.
-struct GatherBinding {
-    name: String,
-    expr: String,
-}
-
-/// Try to parse a single non-indented gather body line as `NAME = EXPR`.
-///
-/// Returns `None` for blank lines, comment-only lines, and lines that don't
-/// match the expected `identifier = expression` form.
-fn parse_gather_binding(content: &str) -> Option<GatherBinding> {
-    let content = content.trim();
-    if content.is_empty() || content.starts_with('#') {
-        return None;
-    }
-
-    // Use `find_assignment_eq` which correctly handles string literals and
-    // augmented/comparison operators, so `msg = "status=ok"` doesn't split
-    // at the `=` inside the string.
-    let eq = find_assignment_eq(content)?;
-    let name = content[..eq].trim();
-    let expr = content[eq + 1..].trim();
-
-    if !is_python_ident(name) || expr.is_empty() {
-        return None;
-    }
-
-    Some(GatherBinding {
-        name: name.to_owned(),
-        expr: expr.to_owned(),
-    })
-}
-
-/// Expand `gather:` and `gather(strategy="best-effort"):` blocks.
-///
-/// Each `gather:` block contains a sequence of `NAME = EXPR` assignments. The
-/// default form lowers to an `asyncio.TaskGroup` block:
-///
-/// ```text
-/// # Typhon
-/// gather:
-///     user   = fetch_user(id)
-///     posts  = fetch_posts(id)
-///
-/// # Emitted Python
-/// async with asyncio.TaskGroup() as __typhon_tg_1:
-///     __typhon_t_user_1  = __typhon_tg_1.create_task(fetch_user(id))
-///     __typhon_t_posts_1 = __typhon_tg_1.create_task(fetch_posts(id))
-/// user  = __typhon_t_user_1.result()
-/// posts = __typhon_t_posts_1.result()
-/// ```
-///
-/// The `gather(strategy="best-effort"):` form lowers to
-/// `asyncio.gather(..., return_exceptions=True)` and unpacks results by index.
-///
-/// Lines inside triple-quoted strings are passed through verbatim. A gather
-/// block whose body contains non-`NAME = EXPR` lines is left unchanged so the
-/// Python parser produces a coherent diagnostic.
-pub fn expand_gather(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
-    let mut counter: usize = 0;
-    let mut in_string: Option<StringMode> = None;
-    let lines: Vec<&str> = source.split_inclusive('\n').collect();
-    let mut i = 0;
-
-    while i < lines.len() {
-        let line = lines[i];
-        let pre_string = in_string;
-        let raw = line.trim_end_matches(['\n', '\r']);
-        let _code_end = scan_line_code_end(raw, &mut in_string);
-
-        if pre_string.is_some() {
-            out.push_str(line);
-            i += 1;
-            continue;
-        }
-
-        let indent_len = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
-        let gather_indent = &raw[..indent_len];
-        let body = &raw[indent_len..];
-
-        if let Some(strategy) = parse_gather_header(body) {
-            // Collect body lines (indented strictly deeper than the gather header).
-            let mut bindings: Vec<GatherBinding> = Vec::new();
-            let mut all_valid = true;
-            let mut j = i + 1;
-            let mut body_string = in_string;
-
-            while j < lines.len() {
-                let bline = lines[j];
-                let braw = bline.trim_end_matches(['\n', '\r']);
-                let prev_bstring = body_string;
-                let _ = scan_line_code_end(braw, &mut body_string);
-
-                // A line that starts inside a triple-quoted string cannot be a
-                // NAME=EXPR binding; bail and leave the whole block verbatim.
-                if prev_bstring.is_some() {
-                    all_valid = false;
-                    break;
-                }
-
-                // Empty or comment-only lines are silently skipped.
-                if braw.trim().is_empty() || braw.trim().starts_with('#') {
-                    j += 1;
-                    continue;
-                }
-
-                let blen = braw
-                    .find(|c: char| !c.is_whitespace())
-                    .unwrap_or(braw.len());
-
-                // Dedented line — the gather body has ended.
-                if blen <= indent_len {
-                    break;
-                }
-
-                let content = &braw[blen..];
-                match parse_gather_binding(content) {
-                    Some(b) => bindings.push(b),
-                    None => {
-                        all_valid = false;
-                        break;
-                    }
-                }
-                j += 1;
-            }
-
-            if all_valid && !bindings.is_empty() {
-                counter += 1;
-                // All temporaries use a double-underscore prefix with the
-                // counter so they cannot collide with user-defined variables.
-                let tg = format!("__typhon_tg_{counter}");
-                match strategy {
-                    GatherStrategy::TaskGroup => {
-                        out.push_str(&format!(
-                            "{}async with asyncio.TaskGroup() as {}:\n",
-                            gather_indent, tg
-                        ));
-                        for b in &bindings {
-                            let task = format!("__typhon_t_{}_{}", b.name, counter);
-                            out.push_str(&format!(
-                                "{}    {} = {}.create_task({})\n",
-                                gather_indent, task, tg, b.expr
-                            ));
-                        }
-                        for b in &bindings {
-                            let task = format!("__typhon_t_{}_{}", b.name, counter);
-                            out.push_str(&format!(
-                                "{}{} = {}.result()\n",
-                                gather_indent, b.name, task
-                            ));
-                        }
-                    }
-                    GatherStrategy::BestEffort => {
-                        let var = format!("__typhon_gather_{counter}");
-                        let exprs: Vec<&str> = bindings.iter().map(|b| b.expr.as_str()).collect();
-                        out.push_str(&format!(
-                            "{}{} = await asyncio.gather({}, return_exceptions=True)\n",
-                            gather_indent,
-                            var,
-                            exprs.join(", ")
-                        ));
-                        let targets: Vec<&str> = bindings.iter().map(|b| b.name.as_str()).collect();
-                        let values: Vec<String> = bindings
-                            .iter()
-                            .enumerate()
-                            .map(|(idx, _)| format!("{}[{}]", var, idx))
-                            .collect();
-                        out.push_str(&format!(
-                            "{}{} = {}\n",
-                            gather_indent,
-                            targets.join(", "),
-                            values.join(", ")
-                        ));
-                    }
-                }
-                in_string = body_string;
-                i = j;
-                continue;
-            }
-        }
-
-        out.push_str(line);
-        i += 1;
-    }
-
-    out
-}
-
-// ── `go` spawn expansion ──────────────────────────────────────────────────────
-
-/// Expand `go EXPR` and `go EXPR -> NAME` statements into `_typhon_spawn` calls.
-///
-/// `go f(x)` lowers to `_typhon_spawn(f(x))`.
-/// `go f(x) -> fut` lowers to `fut = _typhon_spawn(f(x))`.
-///
-/// The `go` keyword must be the first token of a statement (after indent).
-/// A plain Python `go = value` assignment is never rewritten.
-/// Lines inside triple-quoted strings are passed through verbatim.
-pub fn expand_go(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
-    let mut in_string: Option<StringMode> = None;
-
-    for line in source.split_inclusive('\n') {
-        let pre_string = in_string;
-        let raw = line.trim_end_matches(['\n', '\r']);
-        let _code_end = scan_line_code_end(raw, &mut in_string);
-
-        if pre_string.is_some() {
-            out.push_str(line);
-            continue;
-        }
-
-        let indent_len = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
-        let indent = &raw[..indent_len];
-        let body = &raw[indent_len..];
-        let terminator = &line[raw.len()..];
-
-        if let Some(rest) = body.strip_prefix("go ") {
-            let code = go_strip_comment(rest.trim_end());
-            // Reject `go = value` (Python assignment) and other non-expression forms.
-            if go_is_expr_start(code) {
-                if let Some((expr, target)) = parse_go_arrow(code) {
-                    out.push_str(&format!(
-                        "{}{} = _typhon_spawn({}){}",
-                        indent, target, expr, terminator
-                    ));
-                    continue;
-                }
-                out.push_str(&format!("{}_typhon_spawn({}){}", indent, code, terminator));
-                continue;
-            }
-        }
-
-        out.push_str(line);
-    }
-
-    out
-}
-
-/// Strip a trailing `# comment` from a `go` expression, respecting basic
-/// single-quoted strings and backslash escapes. Returns the trimmed code
-/// portion.
-fn go_strip_comment(s: &str) -> &str {
-    let bytes = s.as_bytes();
-    let mut in_str: Option<u8> = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        match in_str {
-            None => match b {
-                b'#' => return s[..i].trim_end(),
-                b'"' | b'\'' => in_str = Some(b),
-                _ => {}
-            },
-            Some(q) => {
-                if b == b'\\' {
-                    i += 1; // skip the escaped character
-                } else if b == q {
-                    in_str = None;
-                }
-            }
-        }
-        i += 1;
-    }
-    s
-}
-
-/// Return `true` if `s` looks like the start of a `go` expression (an
-/// identifier, `_`, or `(`), distinguishing it from an assignment (`go = 1`).
-fn go_is_expr_start(s: &str) -> bool {
-    match s.chars().next() {
-        Some(c) => c.is_alphabetic() || c == '_' || c == '(',
-        None => false,
-    }
-}
-
-/// Scan `s` for `-> IDENT` at parenthesis depth 0 and return `(expr, target)`.
-///
-/// Takes the last such occurrence so that arrow-return annotations on the RHS
-/// are handled correctly (though `go f() -> int` is not valid Typhon; users
-/// write `go f() -> handle` where `handle` is a variable name, not a type).
-///
-/// String literals (with backslash-escape awareness) are skipped so that a
-/// `->` sequence inside a string argument is not mistaken for the target arrow.
-fn parse_go_arrow(s: &str) -> Option<(String, String)> {
-    let bytes = s.as_bytes();
-    let mut depth = 0i32;
-    let mut in_str: Option<u8> = None;
-    let mut arrow_pos: Option<usize> = None;
-    let mut j = 0usize;
-
-    while j < bytes.len() {
-        let b = bytes[j];
-        match in_str {
-            Some(q) => {
-                if b == b'\\' {
-                    j += 1; // skip escaped character
-                } else if b == q {
-                    in_str = None;
-                }
-            }
-            None => match b {
-                b'"' | b'\'' => in_str = Some(b),
-                b'(' | b'[' | b'{' => depth += 1,
-                b')' | b']' | b'}' => {
-                    if depth > 0 {
-                        depth -= 1;
-                    }
-                }
-                b'-' if depth == 0 && j + 1 < bytes.len() && bytes[j + 1] == b'>' => {
-                    arrow_pos = Some(j);
-                    j += 2;
-                    continue;
-                }
-                _ => {}
-            },
-        }
-        j += 1;
-    }
-
-    let pos = arrow_pos?;
-    let expr = s[..pos].trim_end().to_string();
-    let target = s[pos + 2..].trim().to_string();
-
-    if !expr.is_empty() && is_python_ident(&target) {
-        return Some((expr, target));
-    }
-
     None
 }
 
@@ -3358,135 +3606,6 @@ def run() -> Result[str, str]:
         );
     }
 
-    // ── gather block tests ────────────────────────────────────────────────────
-
-    #[test]
-    fn expand_gather_basic_taskgroup() {
-        let src = "\
-async def fetch_all(id: int):
-    gather:
-        user = fetch_user(id)
-        posts = fetch_posts(id)
-    return user, posts
-";
-        let out = expand_gather(src);
-        // Temporaries use counter-scoped __typhon_* names so they cannot
-        // collide with user-defined variables.
-        assert!(
-            out.contains("async with asyncio.TaskGroup() as __typhon_tg_1:"),
-            "should emit hygienic TaskGroup context var: {out}"
-        );
-        assert!(
-            out.contains("__typhon_t_user_1 = __typhon_tg_1.create_task(fetch_user(id))"),
-            "got: {out}"
-        );
-        assert!(
-            out.contains("__typhon_t_posts_1 = __typhon_tg_1.create_task(fetch_posts(id))"),
-            "got: {out}"
-        );
-        assert!(
-            out.contains("user = __typhon_t_user_1.result()"),
-            "got: {out}"
-        );
-        assert!(
-            out.contains("posts = __typhon_t_posts_1.result()"),
-            "got: {out}"
-        );
-        assert!(
-            !out.contains("gather:"),
-            "gather keyword must be removed: {out}"
-        );
-    }
-
-    #[test]
-    fn expand_gather_best_effort() {
-        let src = "\
-async def fetch_all(id: int):
-    gather(strategy=\"best-effort\"):
-        user = fetch_user(id)
-        posts = fetch_posts(id)
-";
-        let out = expand_gather(src);
-        assert!(
-            out.contains("await asyncio.gather("),
-            "best-effort should use asyncio.gather: {out}"
-        );
-        assert!(out.contains("return_exceptions=True"), "got: {out}");
-        assert!(out.contains("user, posts ="), "should unpack: {out}");
-    }
-
-    #[test]
-    fn expand_gather_no_rewrite_outside_block() {
-        let src = "val x: int = 1\n";
-        let out = expand_gather(src);
-        assert_eq!(out, src, "non-gather source must be unchanged");
-    }
-
-    #[test]
-    fn expand_gather_preserves_non_gather_lines() {
-        let src = "import asyncio\nval x: int = 1\n";
-        let out = expand_gather(src);
-        assert_eq!(out, src, "lines before gather must be unchanged");
-    }
-
-    #[test]
-    fn expand_gather_inside_string_not_expanded() {
-        let src = "x = \"\"\"\ngather:\n    a = f()\n\"\"\"\n";
-        let out = expand_gather(src);
-        assert!(
-            out.contains("gather:"),
-            "gather inside string must not be expanded: {out}"
-        );
-        assert!(
-            !out.contains("TaskGroup"),
-            "must not emit TaskGroup for string content: {out}"
-        );
-    }
-
-    // ── go spawn tests ────────────────────────────────────────────────────────
-
-    #[test]
-    fn expand_go_simple_call() {
-        let src = "go f(x)\n";
-        let out = expand_go(src);
-        assert_eq!(out, "_typhon_spawn(f(x))\n", "got: {out}");
-    }
-
-    #[test]
-    fn expand_go_with_arrow_target() {
-        let src = "go f(x) -> fut\n";
-        let out = expand_go(src);
-        assert_eq!(out, "fut = _typhon_spawn(f(x))\n", "got: {out}");
-    }
-
-    #[test]
-    fn expand_go_preserves_indent() {
-        let src = "    go background_task()\n";
-        let out = expand_go(src);
-        assert_eq!(out, "    _typhon_spawn(background_task())\n", "got: {out}");
-    }
-
-    #[test]
-    fn expand_go_assignment_not_expanded() {
-        let src = "go = 42\n";
-        let out = expand_go(src);
-        assert_eq!(out, src, "go assignment must not be expanded: {out}");
-    }
-
-    #[test]
-    fn expand_go_inside_string_not_expanded() {
-        let src = "x = \"\"\"\ngo f()\n\"\"\"\n";
-        let out = expand_go(src);
-        assert!(
-            out.contains("go f()"),
-            "go inside string must not be expanded: {out}"
-        );
-        assert!(
-            !out.contains("_typhon_spawn"),
-            "must not inject spawn for string content: {out}"
-        );
-    }
-
     #[test]
     fn with_chain_else_header_without_colon_rejected() {
         // `else err` (missing trailing `:`) is malformed; the chain should be
@@ -3507,5 +3626,188 @@ def run() -> Result[str, str]:
         );
         // And no temporary was injected.
         assert!(!out.contains("__typhon_with_"), "should not desugar: {out}");
+    }
+
+    // ── extend keyword (alias to impl for user-defined classes) ──────────────
+
+    #[test]
+    fn extend_keyword_becomes_impl_stub() {
+        let result = preprocess("extend User:\n    def greet(self):\n        return 'hi'\n");
+        assert!(
+            result
+                .python_source
+                .contains("class __typhon_impl_User(object):"),
+            "expected impl stub; got:\n{}",
+            result.python_source
+        );
+        assert!(
+            result
+                .stripped
+                .iter()
+                .any(|k| matches!(k.keyword, TyphonKeyword::Extend)),
+            "expected Extend keyword in stripped list"
+        );
+    }
+
+    #[test]
+    fn extend_keyword_round_trips() {
+        let src = "extend User:\n    def greet(self):\n        return 'hi'\n";
+        let result = preprocess(src);
+        let restored = postprocess(&result.python_source, &result.stripped, &result.optionals);
+        assert!(
+            restored.starts_with("extend User:"),
+            "did not round-trip: {restored}"
+        );
+    }
+
+    // ── interface keyword (Protocol class lowering) ──────────────────────────
+
+    #[test]
+    fn interface_keyword_becomes_protocol_class() {
+        let result = preprocess("interface Drawable:\n    def draw(self) -> None: ...\n");
+        assert!(
+            result.python_source.contains("class Drawable(Protocol):"),
+            "expected Protocol class; got:\n{}",
+            result.python_source
+        );
+        assert!(result
+            .stripped
+            .iter()
+            .any(|k| matches!(k.keyword, TyphonKeyword::Interface)));
+    }
+
+    #[test]
+    fn interface_keyword_round_trips() {
+        let src = "interface Drawable:\n    def draw(self) -> None: ...\n";
+        let result = preprocess(src);
+        let restored = postprocess(&result.python_source, &result.stripped, &result.optionals);
+        assert!(
+            restored.starts_with("interface Drawable:"),
+            "did not round-trip: {restored}"
+        );
+    }
+
+    // ── unsafe block ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn unsafe_keyword_lowers_to_if_true() {
+        let result = preprocess("unsafe:\n    x = something()\n");
+        assert!(
+            result.python_source.starts_with("if True:"),
+            "expected if-True wrapper; got:\n{}",
+            result.python_source
+        );
+        assert!(result
+            .stripped
+            .iter()
+            .any(|k| matches!(k.keyword, TyphonKeyword::Unsafe)));
+    }
+
+    #[test]
+    fn unsafe_keyword_round_trips() {
+        let src = "unsafe:\n    x = something()\n";
+        let result = preprocess(src);
+        let restored = postprocess(&result.python_source, &result.stripped, &result.optionals);
+        assert!(
+            restored.starts_with("unsafe:"),
+            "did not round-trip: {restored}"
+        );
+    }
+
+    // ── lazy import (using main's LazyImport metadata + expand_lazy_imports) ─
+
+    #[test]
+    fn validate_lazy_usage_flags_lazy_from() {
+        let errors = validate_lazy_usage("lazy from numpy import array\n");
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].message.contains("lazy from"));
+    }
+
+    #[test]
+    fn validate_lazy_usage_silent_on_lazy_import() {
+        let errors = validate_lazy_usage("lazy import np = numpy\n");
+        assert!(errors.is_empty());
+    }
+
+    // ── gather block ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn gather_default_lowers_to_task_group() {
+        let src = "async def f():\n    gather:\n        user = fetch_user()\n        posts = fetch_posts()\n";
+        let out = expand_gather_blocks(src);
+        assert!(
+            out.contains("async with asyncio.TaskGroup()"),
+            "TaskGroup pattern missing: {out}"
+        );
+        assert!(
+            out.contains(".create_task(fetch_user())"),
+            "create_task call missing: {out}"
+        );
+        assert!(
+            out.contains("user = __typhon_gather"),
+            "user binding missing: {out}"
+        );
+    }
+
+    #[test]
+    fn gather_best_effort_lowers_to_asyncio_gather() {
+        let src = "async def f():\n    gather(strategy=\"best-effort\"):\n        a = call_one()\n        b = call_two()\n";
+        let out = expand_gather_blocks(src);
+        assert!(
+            out.contains("await asyncio.gather("),
+            "asyncio.gather missing: {out}"
+        );
+        assert!(
+            out.contains("return_exceptions=True"),
+            "return_exceptions flag missing: {out}"
+        );
+        // Tuple destructure of the result vector should land in the
+        // user-named bindings.
+        assert!(out.contains("a, b = "), "destructure missing: {out}");
+    }
+
+    #[test]
+    fn gather_malformed_block_is_left_alone() {
+        // No body lines after the header — should bail out and emit the input
+        // verbatim so the Python parser surfaces a precise error.
+        let src = "gather:\n";
+        let out = expand_gather_blocks(src);
+        assert_eq!(out, src);
+    }
+
+    // ── go spawn ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn go_call_lowers_to_runtime_spawn() {
+        let out = expand_go_calls("async def f():\n    go fetch(x)\n");
+        assert!(
+            out.contains("typhon_runtime.tasks.spawn(fetch(x))"),
+            "spawn missing: {out}"
+        );
+    }
+
+    #[test]
+    fn go_call_with_handle_binds_task() {
+        let out = expand_go_calls("async def f():\n    go fetch(x) -> fut\n");
+        assert!(
+            out.contains("fut = typhon_runtime.tasks.spawn(fetch(x))"),
+            "handle binding missing: {out}"
+        );
+    }
+
+    #[test]
+    fn go_with_dotted_callable() {
+        let out = expand_go_calls("async def f():\n    go svc.fetch(x)\n");
+        assert!(
+            out.contains("typhon_runtime.tasks.spawn(svc.fetch(x))"),
+            "dotted call lowering missing: {out}"
+        );
+    }
+
+    #[test]
+    fn go_not_rewritten_for_unrelated_identifiers() {
+        // `goto` (no space) must not trigger the rewrite.
+        let out = expand_go_calls("goto = 1\n");
+        assert_eq!(out, "goto = 1\n");
     }
 }

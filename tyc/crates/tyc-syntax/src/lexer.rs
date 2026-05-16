@@ -3,7 +3,9 @@
 //! Phase 0 introduces `val` and `var` as first-class keywords.
 //! Phase 2 adds `model` (Pydantic class emission) and `comptime` (build-time
 //! constant evaluation).
-//! Phase 3 adds `lazy` (deferred module loading via `lazy import X = module`).
+//! Phase 3 adds `impl`, `extend`, `interface`, `unsafe`, `gather`, `go`, and
+//! `lazy` for extension methods, structural typing, dynamism boundaries,
+//! concurrency primitives, and deferred module loading.
 //! These are recognised here and stripped (pre-processed) before the
 //! underlying Python parser sees them, so the existing Python parser can
 //! handle the remainder of the grammar unchanged.
@@ -24,6 +26,22 @@ pub enum TyphonKeyword {
     /// The preprocessor rewrites `impl ClassName:` to `class __typhon_impl_ClassName(object):`,
     /// and the desugar pass merges the methods back into the target class.
     Impl,
+    /// `extend` — like `impl`, but for adding methods to a type.
+    /// For user-defined classes it is treated identically to `impl`.
+    Extend,
+    /// `interface` — declares a structural protocol. The preprocessor rewrites
+    /// `interface Name:` to `class Name(Protocol):`.
+    Interface,
+    /// `unsafe` — opens a lexical region in which `Any` types may flow freely.
+    /// The preprocessor rewrites `unsafe:` to `if True:  # __typhon_unsafe__` so
+    /// scoping survives the Python round-trip.
+    Unsafe,
+    /// `gather` — runs the inner bindings concurrently. Defaults to
+    /// `asyncio.TaskGroup`; `gather(strategy="best-effort"):` lowers to
+    /// `asyncio.gather(..., return_exceptions=True)`.
+    Gather,
+    /// `go` — spawns a background task via `typhon_runtime.tasks.spawn(...)`.
+    Go,
     /// `lazy` — prefix for `lazy import X = module`; the module is loaded on
     /// first attribute access rather than at import time.
     Lazy,
@@ -38,6 +56,11 @@ impl TyphonKeyword {
             Self::Model => "model",
             Self::Comptime => "comptime",
             Self::Impl => "impl",
+            Self::Extend => "extend",
+            Self::Interface => "interface",
+            Self::Unsafe => "unsafe",
+            Self::Gather => "gather",
+            Self::Go => "go",
             Self::Lazy => "lazy",
         }
     }
@@ -50,6 +73,11 @@ impl TyphonKeyword {
             "model" => Some(Self::Model),
             "comptime" => Some(Self::Comptime),
             "impl" => Some(Self::Impl),
+            "extend" => Some(Self::Extend),
+            "interface" => Some(Self::Interface),
+            "unsafe" => Some(Self::Unsafe),
+            "gather" => Some(Self::Gather),
+            "go" => Some(Self::Go),
             "lazy" => Some(Self::Lazy),
             _ => None,
         }

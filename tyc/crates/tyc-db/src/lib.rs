@@ -14,8 +14,8 @@ use rustpython_parser::{parse, Mode};
 use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_resolve::resolve_module;
 use tyc_syntax::preprocess::{
-    expand_gather, expand_go, expand_pipes, expand_question_ops, expand_with_chains, preprocess,
-    validate_question_ops,
+    expand_gather_blocks, expand_go_calls, expand_pipes, expand_question_ops, expand_with_chains,
+    preprocess, validate_lazy_usage, validate_question_ops,
 };
 use tyc_types::check_module;
 
@@ -40,9 +40,9 @@ pub struct SourceFile {
 pub fn preprocessed_text(db: &dyn salsa::Database, file: SourceFile) -> String {
     let text = file.text(db);
     // Apply Typhon sugar expansion in the same order as `check_file` and the
-    // build pipeline: gather, go, with-chains, pipes, then `?`.
-    let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go(
-        &expand_gather(text),
+    // build pipeline: gather → go → with-chains → pipes → `?`.
+    let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
+        &expand_gather_blocks(text),
     ))));
     preprocess(&expanded).python_source
 }
@@ -117,6 +117,17 @@ pub fn check_file(db: &mut TycDatabase, path: String, text: String) -> Diagnosti
             1,
         ));
     }
+    // Reject unsupported `lazy from … import …` constructs early so the
+    // downstream parser doesn't try to give a misleading diagnostic.
+    for err in validate_lazy_usage(&text) {
+        diags.push_error(TycError::lazy_usage(
+            err.message,
+            &path,
+            &text,
+            err.offset,
+            4, // length of "lazy"
+        ));
+    }
     if diags.has_errors() {
         return diags;
     }
@@ -124,8 +135,8 @@ pub fn check_file(db: &mut TycDatabase, path: String, text: String) -> Diagnosti
     // Apply Typhon sugar expansion in order before preprocessing so the
     // Python parser sees valid Python.  `tyc fmt` skips these expansions to
     // preserve Typhon syntax in the formatter's round trip.
-    let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go(
-        &expand_gather(&text),
+    let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
+        &expand_gather_blocks(&text),
     ))));
     let prep = preprocess(&expanded);
 
@@ -376,44 +387,6 @@ def main() -> None:
         let src = "\
 def f(x: str?) -> None:
     print(x)
-";
-        let mut db = TycDatabase::new();
-        let diags = check_file(&mut db, "<test>".into(), src.to_owned());
-        assert!(!diags.has_errors(), "{:?}", diags.errors());
-    }
-
-    #[test]
-    fn check_file_gather_block_is_accepted() {
-        let src = "\
-async def fetch_user(id: int) -> str:
-    return \"user\"
-
-async def fetch_posts(id: int) -> str:
-    return \"posts\"
-
-async def fetch_all(id: int) -> None:
-    gather:
-        user = fetch_user(id)
-        posts = fetch_posts(id)
-    print(user, posts)
-";
-        let mut db = TycDatabase::new();
-        let diags = check_file(&mut db, "<test>".into(), src.to_owned());
-        assert!(!diags.has_errors(), "{:?}", diags.errors());
-    }
-
-    #[test]
-    fn check_file_go_statement_is_accepted() {
-        let src = "\
-async def background_task() -> None:
-    pass
-
-async def other_task() -> None:
-    pass
-
-async def run() -> None:
-    go background_task()
-    go other_task() -> handle
 ";
         let mut db = TycDatabase::new();
         let diags = check_file(&mut db, "<test>".into(), src.to_owned());

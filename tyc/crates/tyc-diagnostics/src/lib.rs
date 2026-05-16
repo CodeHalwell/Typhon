@@ -166,6 +166,67 @@ pub enum TycError {
         #[label("imported here but never used")]
         span: SourceSpan,
     },
+
+    /// A `lazy` construct was used in an unsupported form.
+    #[error("{message}")]
+    #[diagnostic(
+        code(tyc::lazy_usage),
+        help("`lazy` supports `lazy import name = module` and `lazy val NAME: T = expr` only")
+    )]
+    LazyUsage {
+        message: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("unsupported lazy form here")]
+        span: SourceSpan,
+    },
+
+    /// A function decorated `@pure` violates one of the six purity conditions.
+    #[error("`@pure` function '{name}' is not pure: {reason}")]
+    #[diagnostic(
+        code(tyc::impure_pure_fn),
+        help("pure functions must be sync, take hashable args, perform no I/O, no entropy/clocks, no mutable module state, and not raise — return Result[T, E] for failure")
+    )]
+    ImpurePureFn {
+        name: String,
+        reason: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("declared `@pure` here")]
+        span: SourceSpan,
+    },
+
+    /// `isinstance(x, Interface)` was used without an opt-in.
+    #[error("`isinstance(x, {interface})` is rejected: structural interfaces only validate attribute presence at runtime")]
+    #[diagnostic(
+        code(tyc::interface_isinstance),
+        help("opt in by decorating the interface with `@runtime_checkable` (attribute-only check) or rely on static structural typing instead")
+    )]
+    InterfaceIsinstance {
+        interface: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("runtime check against interface")]
+        span: SourceSpan,
+    },
+
+    /// A value of type `T` doesn't structurally conform to an `interface Iface`.
+    #[error("`{actual}` does not structurally conform to interface `{interface}`: missing or incompatible member(s) {missing}")]
+    #[diagnostic(
+        code(tyc::interface_not_conforming),
+        help(
+            "add the missing member(s) to `{actual}` with matching parameter types and return type"
+        )
+    )]
+    InterfaceNotConforming {
+        interface: String,
+        actual: String,
+        missing: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("not a `{interface}`")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -336,6 +397,72 @@ impl TycError {
     ) -> Self {
         Self::UnusedImport {
             name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::LazyUsage`] diagnostic.
+    pub fn lazy_usage(
+        message: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::LazyUsage {
+            message: message.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::ImpurePureFn`] diagnostic.
+    pub fn impure_pure_fn(
+        name: impl Into<String>,
+        reason: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::ImpurePureFn {
+            name: name.into(),
+            reason: reason.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::InterfaceIsinstance`] diagnostic.
+    pub fn interface_isinstance(
+        interface: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::InterfaceIsinstance {
+            interface: interface.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::InterfaceNotConforming`] diagnostic.
+    pub fn interface_not_conforming(
+        interface: impl Into<String>,
+        actual: impl Into<String>,
+        missing: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::InterfaceNotConforming {
+            interface: interface.into(),
+            actual: actual.into(),
+            missing: missing.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

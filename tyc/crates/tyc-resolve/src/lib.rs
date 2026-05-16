@@ -504,6 +504,23 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt<TextRange>])
                     );
                 }
             }
+            // PEP 695 type alias — `type Vector[T] = list[T]`. The alias name
+            // becomes a value-class binding in the enclosing scope.
+            Stmt::TypeAlias(ta) => {
+                if let Expr::Name(n) = ta.name.as_ref() {
+                    let span = (
+                        n.range.start().to_usize(),
+                        n.range.start().to_usize() + n.id.as_str().len(),
+                    );
+                    r.declare(
+                        scope,
+                        n.id.as_str(),
+                        BindingKind::Class,
+                        Mutability::Val,
+                        span,
+                    );
+                }
+            }
             _ => {}
         }
     }
@@ -524,12 +541,17 @@ fn declare_target(r: &mut Resolver, scope: ScopeId, target: &Expr<TextRange>, de
             Some(TyphonKeyword::Var) => Mutability::Var,
             // `comptime val` records the inner `val` keyword, so Comptime
             // alone would only appear when the inner keyword was omitted.
-            // `model` and `impl` are not value binding keywords — treat all
-            // three like bare assignments (inherit or default).
+            // None of the other keywords are value binding keywords — treat
+            // them like bare assignments (inherit or default).
             Some(
                 TyphonKeyword::Model
                 | TyphonKeyword::Comptime
                 | TyphonKeyword::Impl
+                | TyphonKeyword::Extend
+                | TyphonKeyword::Interface
+                | TyphonKeyword::Unsafe
+                | TyphonKeyword::Gather
+                | TyphonKeyword::Go
                 | TyphonKeyword::Lazy,
             )
             | None => existing_mut.unwrap_or(if default_val {
@@ -555,13 +577,23 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
             for d in &f.decorator_list {
                 walk_expr(r, scope, d);
             }
-            // Parameter and return annotations live in the enclosing scope
-            // (PEP 563 style); record references to every type they mention.
-            walk_argument_annotations(r, scope, &f.args);
-            if let Some(ret) = &f.returns {
-                walk_expr(r, scope, ret);
-            }
             let fn_scope = r.push_scope(ScopeKind::Function, scope);
+            // PEP 695 type parameters (`def f[T](x: T) -> T`) bind into the
+            // function scope so the parameter and return-type annotations can
+            // resolve them.
+            declare_type_params(r, fn_scope, &f.type_params);
+            // Annotations on parameters/return type may reference the type
+            // params, so resolve them in the function scope rather than the
+            // enclosing one when type params are present.
+            let ann_scope = if f.type_params.is_empty() {
+                scope
+            } else {
+                fn_scope
+            };
+            walk_argument_annotations(r, ann_scope, &f.args);
+            if let Some(ret) = &f.returns {
+                walk_expr(r, ann_scope, ret);
+            }
             // Parameters become bindings in the new scope.
             declare_arguments(r, fn_scope, &f.args);
             // Pre-collect declarations within the function body so forward
@@ -575,11 +607,17 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
             for d in &f.decorator_list {
                 walk_expr(r, scope, d);
             }
-            walk_argument_annotations(r, scope, &f.args);
-            if let Some(ret) = &f.returns {
-                walk_expr(r, scope, ret);
-            }
             let fn_scope = r.push_scope(ScopeKind::Function, scope);
+            declare_type_params(r, fn_scope, &f.type_params);
+            let ann_scope = if f.type_params.is_empty() {
+                scope
+            } else {
+                fn_scope
+            };
+            walk_argument_annotations(r, ann_scope, &f.args);
+            if let Some(ret) = &f.returns {
+                walk_expr(r, ann_scope, ret);
+            }
             declare_arguments(r, fn_scope, &f.args);
             collect_top_level(r, fn_scope, &f.body);
             for s in &f.body {
@@ -590,10 +628,17 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
             for d in &c.decorator_list {
                 walk_expr(r, scope, d);
             }
-            for base in &c.bases {
-                walk_expr(r, scope, base);
-            }
             let cls_scope = r.push_scope(ScopeKind::Class, scope);
+            declare_type_params(r, cls_scope, &c.type_params);
+            // Base classes that reference type params need the class scope.
+            let base_scope = if c.type_params.is_empty() {
+                scope
+            } else {
+                cls_scope
+            };
+            for base in &c.bases {
+                walk_expr(r, base_scope, base);
+            }
             collect_top_level(r, cls_scope, &c.body);
             let is_impl_stub = c.name.as_str().starts_with("__typhon_impl_");
             for s in &c.body {
@@ -603,6 +648,16 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
                     walk_stmt(r, cls_scope, s);
                 }
             }
+        }
+        // `type Vector[T: float] = list[T]` — PEP 695 type alias statement.
+        Stmt::TypeAlias(ta) => {
+            // The type params and the value live in a synthetic alias scope so
+            // the alias body can reference `T`. The alias name itself binds
+            // into the enclosing scope and is already pre-declared by
+            // `collect_top_level`.
+            let alias_scope = r.push_scope(ScopeKind::Function, scope);
+            declare_type_params(r, alias_scope, &ta.type_params);
+            walk_expr(r, alias_scope, &ta.value);
         }
         Stmt::Assign(a) => {
             walk_expr(r, scope, &a.value);
@@ -719,6 +774,28 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
                 }
             }
             for s in &w.body {
+                walk_stmt(r, scope, s);
+            }
+        }
+        Stmt::AsyncFor(f) => {
+            walk_expr(r, scope, &f.iter);
+            if let Expr::Name(n) = f.target.as_ref() {
+                let span = (
+                    n.range.start().to_usize(),
+                    n.range.start().to_usize() + n.id.as_str().len(),
+                );
+                r.declare(
+                    scope,
+                    n.id.as_str(),
+                    BindingKind::Loop,
+                    Mutability::Var,
+                    span,
+                );
+            }
+            for s in &f.body {
+                walk_stmt(r, scope, s);
+            }
+            for s in &f.orelse {
                 walk_stmt(r, scope, s);
             }
         }
@@ -868,6 +945,34 @@ fn walk_impl_method(r: &mut Resolver, cls_scope: ScopeId, stmt: &Stmt<TextRange>
             }
         }
         other => walk_stmt(r, cls_scope, other),
+    }
+}
+
+/// Declare every PEP 695 type parameter (e.g. `T`, `U: Number`, `*Ts`,
+/// `**P`) into `scope` so that annotations on parameters / bases / return
+/// types resolve them as known names rather than reporting "unknown name".
+///
+/// Bounds (`T: Number`) are resolved in the enclosing scope where the bound
+/// itself was written; we don't model variance / constraints in v1.
+fn declare_type_params(
+    r: &mut Resolver,
+    scope: ScopeId,
+    type_params: &[rustpython_ast::TypeParam<TextRange>],
+) {
+    for tp in type_params {
+        let (name, range, bound) = match tp {
+            rustpython_ast::TypeParam::TypeVar(t) => (t.name.as_str(), t.range, t.bound.as_deref()),
+            rustpython_ast::TypeParam::ParamSpec(p) => (p.name.as_str(), p.range, None),
+            rustpython_ast::TypeParam::TypeVarTuple(t) => (t.name.as_str(), t.range, None),
+        };
+        if let Some(b) = bound {
+            walk_expr(r, scope, b);
+        }
+        let span = (
+            range.start().to_usize(),
+            range.start().to_usize() + name.len(),
+        );
+        r.declare(scope, name, BindingKind::Value, Mutability::Val, span);
     }
 }
 
@@ -1253,10 +1358,20 @@ fn builtin_names() -> std::collections::HashSet<&'static str> {
         "env",
         // Pydantic BaseModel — injected by the `model` keyword preprocessor.
         "BaseModel",
-        // `asyncio` — stdlib module injected by `gather:` block expansion.
+        // Pydantic ConfigDict — used by the `model` desugar injection.
+        "ConfigDict",
+        // Generated by the Phase 3 `gather` and `go` lowerings; the desugar
+        // pass inserts `import asyncio` / `import typhon_runtime` itself, but
+        // the resolver still sees references before that injection runs.
         "asyncio",
-        // `_typhon_spawn` — runtime helper injected by `go` statement expansion.
-        "_typhon_spawn",
+        "typhon_runtime",
+        // Decorators that may appear without an import in user code.
+        "pure",
+        "memo",
+        "runtime_checkable",
+        "functools",
+        "dataclass",
+        "dataclasses",
     ];
     names.iter().copied().collect()
 }
