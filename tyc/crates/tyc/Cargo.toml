@@ -27,3 +27,6 @@ tyc-types       = { workspace = true }
 tyc-analyse     = { workspace = true }
 tyc-desugar     = { workspace = true }
 tyc-lsp         = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

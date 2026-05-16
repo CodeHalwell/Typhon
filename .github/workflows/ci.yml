@@ -45,3 +45,33 @@ jobs:
 
       - name: Tests
         run: cargo test --workspace
+
+  security:
+    name: Security audit
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tyc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('tyc/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-audit-
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked --quiet
+
+      - name: Dependency audit (advisories + licences + bans)
+        run: cargo deny check

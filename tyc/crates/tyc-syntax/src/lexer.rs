@@ -3,6 +3,7 @@
 //! Phase 0 introduces `val` and `var` as first-class keywords.
 //! Phase 2 adds `model` (Pydantic class emission) and `comptime` (build-time
 //! constant evaluation).
+//! Phase 3 adds `lazy` (deferred module loading via `lazy import X = module`).
 //! These are recognised here and stripped (pre-processed) before the
 //! underlying Python parser sees them, so the existing Python parser can
 //! handle the remainder of the grammar unchanged.
@@ -23,6 +24,9 @@ pub enum TyphonKeyword {
     /// The preprocessor rewrites `impl ClassName:` to `class __typhon_impl_ClassName(object):`,
     /// and the desugar pass merges the methods back into the target class.
     Impl,
+    /// `lazy` — prefix for `lazy import X = module`; the module is loaded on
+    /// first attribute access rather than at import time.
+    Lazy,
 }
 
 impl TyphonKeyword {
@@ -34,6 +38,7 @@ impl TyphonKeyword {
             Self::Model => "model",
             Self::Comptime => "comptime",
             Self::Impl => "impl",
+            Self::Lazy => "lazy",
         }
     }
 
@@ -45,6 +50,7 @@ impl TyphonKeyword {
             "model" => Some(Self::Model),
             "comptime" => Some(Self::Comptime),
             "impl" => Some(Self::Impl),
+            "lazy" => Some(Self::Lazy),
             _ => None,
         }
     }

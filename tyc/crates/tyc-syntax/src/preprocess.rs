@@ -52,6 +52,22 @@ pub struct StrippedOptional {
     pub python_col: usize,
 }
 
+/// A `lazy import` declaration — `lazy import ALIAS = MODULE`.
+///
+/// At check/format time the preprocessor converts this to `import MODULE as
+/// ALIAS` so the rest of the pipeline sees a standard Python import.  At build
+/// time [`expand_lazy_imports`] replaces it with a thread-safe, on-first-use
+/// loader before the main preprocess pass runs.
+#[derive(Debug, Clone)]
+pub struct LazyImport {
+    /// 0-based line index in both the original and preprocessed source.
+    pub line_index: usize,
+    /// The local alias (`np` in `lazy import np = numpy`).
+    pub alias: String,
+    /// The module being imported (`numpy` in `lazy import np = numpy`).
+    pub module: String,
+}
+
 /// A `comptime` binding whose RHS must be evaluated at build time.
 #[derive(Debug, Clone)]
 pub struct ComptimeBinding {
@@ -75,6 +91,10 @@ pub struct PreprocessResult {
     /// Bindings that were declared `comptime` and whose RHS the build command
     /// must evaluate and inline.
     pub comptime_bindings: Vec<ComptimeBinding>,
+    /// Lazy import declarations, in source order.  Each entry records the
+    /// alias and module so [`postprocess`] can restore the original
+    /// `lazy import ALIAS = MODULE` syntax.
+    pub lazy_imports: Vec<LazyImport>,
 }
 
 /// Strip Typhon-specific syntax from `source` and return the Python-
@@ -84,6 +104,7 @@ pub fn preprocess(source: &str) -> PreprocessResult {
     let mut stripped = Vec::new();
     let mut optionals = Vec::new();
     let mut comptime_bindings = Vec::new();
+    let mut lazy_imports = Vec::new();
     // String state carried across lines (triple-quoted strings may span them).
     let mut in_string: Option<StringMode> = None;
 
@@ -95,6 +116,30 @@ pub fn preprocess(source: &str) -> PreprocessResult {
                 .unwrap_or(line.len());
             let indent = &line[..indent_len];
             let rest = &line[indent_len..];
+
+            // ── `lazy import ALIAS = MODULE` → `import MODULE as ALIAS` ─────
+            // Only recognised at module level (indent_len == 0) so that
+            // indented `lazy` expressions (rare but valid Python identifiers)
+            // are not mistakenly rewritten.
+            if indent_len == 0 {
+                if let Some(after_raw) = rest.strip_prefix("lazy import ") {
+                    let after = after_raw.trim_end_matches(['\n', '\r']);
+                    if let Some((alias, module)) = parse_lazy_import(after) {
+                        lazy_imports.push(LazyImport {
+                            line_index,
+                            alias: alias.clone(),
+                            module: module.clone(),
+                        });
+                        // Emit a standard Python import so downstream passes see a
+                        // valid import statement.
+                        let new_line = format!("import {} as {}\n", module, alias);
+                        python_source.push_str(&new_line);
+                        continue;
+                    }
+                    // Unrecognised `lazy import` form — fall through to produce a
+                    // parse error from the Python parser.
+                }
+            }
 
             // ── `impl ClassName:` → `class __typhon_impl_ClassName(object):` ─
             if rest.starts_with("impl ")
@@ -234,7 +279,29 @@ pub fn preprocess(source: &str) -> PreprocessResult {
         stripped,
         optionals,
         comptime_bindings,
+        lazy_imports,
     }
+}
+
+/// Parse the tail of a `lazy import` line: `ALIAS = MODULE`.
+///
+/// Returns `(alias, module)` on success, `None` if the syntax is malformed.
+fn parse_lazy_import(tail: &str) -> Option<(String, String)> {
+    let eq = tail.find('=')?;
+    let alias = tail[..eq].trim().to_owned();
+    let module = tail[eq + 1..].trim().to_owned();
+    // Both alias and module must be non-empty identifiers (allowing dots in
+    // module names like `numpy.random`).
+    if alias.is_empty()
+        || module.is_empty()
+        || !alias.chars().all(|c| c.is_alphanumeric() || c == '_')
+        || !module
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+    {
+        return None;
+    }
+    Some((alias, module))
 }
 
 /// Build the class-header portion of an `impl` line, converting
@@ -436,8 +503,8 @@ fn rewrite_optionals(line: &str, in_string: &mut Option<StringMode>) -> (String,
     (out, marks)
 }
 
-/// Restore stripped keywords and `?` sugar into a normalised Python source
-/// string.
+/// Restore stripped keywords, `?` sugar, and `lazy import` declarations into
+/// a normalised Python source string.
 ///
 /// `normalised` is the Python source after whitespace normalisation.
 pub fn postprocess(
@@ -445,7 +512,17 @@ pub fn postprocess(
     stripped: &[StrippedKeyword],
     optionals: &[StrippedOptional],
 ) -> String {
-    if stripped.is_empty() && optionals.is_empty() {
+    postprocess_full(normalised, stripped, optionals, &[])
+}
+
+/// Like [`postprocess`] but also restores `lazy import` lines.
+pub fn postprocess_full(
+    normalised: &str,
+    stripped: &[StrippedKeyword],
+    optionals: &[StrippedOptional],
+    lazy_imports: &[LazyImport],
+) -> String {
+    if stripped.is_empty() && optionals.is_empty() && lazy_imports.is_empty() {
         return normalised.to_owned();
     }
 
@@ -541,7 +618,21 @@ pub fn postprocess(
                 );
                 lines[line_idx] = new_line;
             }
+            // `lazy import` restoration is handled separately below via
+            // `lazy_imports`; the `Lazy` keyword is never pushed into
+            // `stripped`, so this arm is a safety no-op.
+            TyphonKeyword::Lazy => {}
         }
+    }
+
+    // Restore `lazy import ALIAS = MODULE` lines.  The preprocessor emitted
+    // `import MODULE as ALIAS` in their place; replace that with the original
+    // Typhon syntax.
+    for li in lazy_imports {
+        if li.line_index >= lines.len() {
+            continue;
+        }
+        lines[li.line_index] = format!("lazy import {} = {}", li.alias, li.module);
     }
 
     let mut result = lines.join("\n");
@@ -777,6 +868,113 @@ fn extract_return_type_text(def_line: &str) -> Option<String> {
 }
 
 // ── `?` operator expansion ────────────────────────────────────────────────────
+
+/// Expand `lazy import ALIAS = MODULE` declarations into thread-safe,
+/// on-first-access loader code.
+///
+/// Each `lazy import` line at module level (indent = 0) is replaced by a
+/// class-based proxy that imports the module on the first attribute access:
+///
+/// ```text
+/// # Input (Typhon)
+/// lazy import np = numpy
+///
+/// # Output (valid Python)
+/// import threading as __typhon_thread_
+/// class __TyphonLazy_np_:
+///     __slots__ = ('_m', '_lock')
+///     def __init__(self):
+///         object.__setattr__(self, '_m', None)
+///         object.__setattr__(self, '_lock', __typhon_thread_.Lock())
+///     def __getattr__(self, name):
+///         m = object.__getattribute__(self, '_m')
+///         if m is None:
+///             lock = object.__getattribute__(self, '_lock')
+///             with lock:
+///                 m = object.__getattribute__(self, '_m')
+///                 if m is None:
+///                     import numpy as _mod
+///                     object.__setattr__(self, '_m', _mod)
+///                     m = _mod
+///         return getattr(m, name)
+///     def __repr__(self):
+///         m = object.__getattribute__(self, '_m')
+///         return repr(m) if m is not None else '<lazy module numpy>'
+/// np = __TyphonLazy_np_()
+/// ```
+///
+/// `lazy from x import a, b` is not supported and is left unchanged so that
+/// the Python parser produces a diagnostic at the offending line.
+///
+/// This function is called **before** [`preprocess`] in the build pipeline.
+/// It is deliberately *not* called by `tyc fmt` or the check pipeline (which
+/// use [`preprocess`]'s simpler `import MODULE as ALIAS` conversion instead).
+pub fn expand_lazy_imports(source: &str) -> String {
+    let mut result = String::with_capacity(source.len() + 256);
+    let mut needs_thread_import = false;
+    // Pre-scan to check whether any lazy imports exist so we can prepend the
+    // threading import once at the top.
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        if let Some(after) = trimmed.strip_prefix("lazy import ") {
+            if parse_lazy_import(after.trim()).is_some() {
+                needs_thread_import = true;
+                break;
+            }
+        }
+    }
+
+    if needs_thread_import {
+        result.push_str("import threading as __typhon_thread_\n");
+    }
+
+    for line in source.split_inclusive('\n') {
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let trimmed = raw.trim_start();
+        let indent_len = raw.len() - trimmed.len();
+
+        // Only expand at module level (indent_len == 0).
+        if indent_len == 0 {
+            if let Some(after) = trimmed.strip_prefix("lazy import ") {
+                if let Some((alias, module)) = parse_lazy_import(after.trim()) {
+                    emit_lazy_proxy(&mut result, &alias, &module);
+                    continue;
+                }
+            }
+        }
+
+        result.push_str(line);
+    }
+
+    result
+}
+
+/// Emit the proxy class for a single `lazy import ALIAS = MODULE`.
+fn emit_lazy_proxy(out: &mut String, alias: &str, module: &str) {
+    let class = format!("__TyphonLazy_{alias}_");
+    out.push_str(&format!("class {class}:\n"));
+    out.push_str("    __slots__ = ('_m', '_lock')\n");
+    out.push_str("    def __init__(self):\n");
+    out.push_str("        object.__setattr__(self, '_m', None)\n");
+    out.push_str("        object.__setattr__(self, '_lock', __typhon_thread_.Lock())\n");
+    out.push_str("    def __getattr__(self, name):\n");
+    out.push_str("        m = object.__getattribute__(self, '_m')\n");
+    out.push_str("        if m is None:\n");
+    out.push_str("            lock = object.__getattribute__(self, '_lock')\n");
+    out.push_str("            with lock:\n");
+    out.push_str("                m = object.__getattribute__(self, '_m')\n");
+    out.push_str("                if m is None:\n");
+    out.push_str(&format!("                    import {module} as _mod\n"));
+    out.push_str("                    object.__setattr__(self, '_m', _mod)\n");
+    out.push_str("                    m = _mod\n");
+    out.push_str("        return getattr(m, name)\n");
+    out.push_str("    def __repr__(self):\n");
+    out.push_str("        m = object.__getattribute__(self, '_m')\n");
+    out.push_str(&format!(
+        "        return repr(m) if m is not None else '<lazy module {module}>'\n"
+    ));
+    out.push_str(&format!("{alias} = {class}()\n"));
+}
 
 /// Expand the `?` error-propagation operator into equivalent Python guard code.
 ///
@@ -2638,6 +2836,102 @@ def run() -> Result[str, str]:
         assert!(
             out.contains("\n  return Ok(x)"),
             "two-space indent not preserved: {out}"
+        );
+    }
+
+    // ── lazy import tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn preprocess_lazy_import_converts_to_standard_import() {
+        let src = "lazy import np = numpy\n";
+        let result = preprocess(src);
+        assert!(
+            result.python_source.contains("import numpy as np"),
+            "preprocess should emit `import numpy as np`, got: {}",
+            result.python_source
+        );
+        assert_eq!(result.lazy_imports.len(), 1);
+        assert_eq!(result.lazy_imports[0].alias, "np");
+        assert_eq!(result.lazy_imports[0].module, "numpy");
+    }
+
+    #[test]
+    fn preprocess_lazy_import_dotted_module() {
+        let src = "lazy import npr = numpy.random\n";
+        let result = preprocess(src);
+        assert!(
+            result.python_source.contains("import numpy.random as npr"),
+            "got: {}",
+            result.python_source
+        );
+        assert_eq!(result.lazy_imports[0].module, "numpy.random");
+    }
+
+    #[test]
+    fn expand_lazy_imports_emits_proxy_class() {
+        let src = "lazy import np = numpy\n\nx = np.array([1])\n";
+        let out = expand_lazy_imports(src);
+        assert!(
+            out.contains("class __TyphonLazy_np_"),
+            "should emit proxy class, got:\n{out}"
+        );
+        assert!(out.contains("np = __TyphonLazy_np_()"), "got:\n{out}");
+        assert!(
+            out.contains("import numpy as _mod"),
+            "should import numpy on first use, got:\n{out}"
+        );
+        assert!(
+            out.contains("import threading as __typhon_thread_"),
+            "should include threading import, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn expand_lazy_imports_threading_import_emitted_once_for_multiple_lazy_imports() {
+        let src = "lazy import np = numpy\nlazy import pd = pandas\n";
+        let out = expand_lazy_imports(src);
+        let count = out.matches("import threading").count();
+        assert_eq!(
+            count, 1,
+            "threading import should appear exactly once, got:\n{out}"
+        );
+        assert!(
+            out.contains("class __TyphonLazy_np_"),
+            "np proxy missing, got:\n{out}"
+        );
+        assert!(
+            out.contains("class __TyphonLazy_pd_"),
+            "pd proxy missing, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn expand_lazy_imports_passes_through_non_lazy_lines() {
+        let src = "import os\nval x: int = 1\n";
+        let out = expand_lazy_imports(src);
+        assert!(
+            out.contains("import os"),
+            "non-lazy imports must pass through"
+        );
+        assert!(
+            out.contains("val x: int = 1"),
+            "non-lazy lines must pass through"
+        );
+        assert!(
+            !out.contains("threading"),
+            "no lazy import should not add threading"
+        );
+    }
+
+    #[test]
+    fn preprocess_lazy_import_not_recognised_with_indentation() {
+        // `lazy import` inside a function body is not Typhon syntax and must
+        // not be rewritten; the Python parser will handle it as-is.
+        let src = "def f():\n    lazy = 1\n";
+        let result = preprocess(src);
+        assert!(
+            result.lazy_imports.is_empty(),
+            "indented lazy should not be recorded"
         );
     }
 

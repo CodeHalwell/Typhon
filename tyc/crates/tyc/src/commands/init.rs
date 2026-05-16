@@ -92,3 +92,75 @@ def main() -> None:
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_creates_project_structure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = InitArgs {
+            name: Some("myapp".into()),
+            dir: tmp.path().to_path_buf(),
+        };
+        run(args).unwrap();
+        assert!(
+            tmp.path().join("typhon.toml").exists(),
+            "typhon.toml missing"
+        );
+        assert!(tmp.path().join("src").is_dir(), "src/ dir missing");
+        assert!(
+            tmp.path().join("src/main.ty").exists(),
+            "src/main.ty missing"
+        );
+        assert!(tmp.path().join("tests").is_dir(), "tests/ dir missing");
+    }
+
+    #[test]
+    fn init_writes_project_name_into_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = InitArgs {
+            name: Some("coolproject".into()),
+            dir: tmp.path().to_path_buf(),
+        };
+        run(args).unwrap();
+        let toml = std::fs::read_to_string(tmp.path().join("typhon.toml")).unwrap();
+        assert!(
+            toml.contains("coolproject"),
+            "project name not in typhon.toml"
+        );
+    }
+
+    #[test]
+    fn init_rejects_existing_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        // First init succeeds.
+        run(InitArgs {
+            name: Some("proj".into()),
+            dir: tmp.path().to_path_buf(),
+        })
+        .unwrap();
+        // Second init on the same dir must fail.
+        let result = run(InitArgs {
+            name: Some("proj".into()),
+            dir: tmp.path().to_path_buf(),
+        });
+        assert!(
+            result.is_err(),
+            "expected error when typhon.toml already exists"
+        );
+    }
+
+    #[test]
+    fn init_uses_dir_name_when_no_name_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let args = InitArgs {
+            name: None,
+            dir: tmp.path().to_path_buf(),
+        };
+        // Should succeed (infers name from temp dir name).
+        run(args).unwrap();
+        assert!(tmp.path().join("typhon.toml").exists());
+    }
+}
