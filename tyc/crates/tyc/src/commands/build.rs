@@ -1,19 +1,23 @@
 //! `tyc build` — full compilation pipeline.
 //!
-//! Runs: pre-process → parse → type-check → desugar → emit.
+//! Runs: expand `?` operators → pre-process → parse → type-check →
+//!       evaluate comptime → substitute literals → desugar → emit.
 //! Writes `.py` files into the output directory, mirroring the source tree.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use clap::Args;
 use miette::{miette, Result};
+use rustpython_ast::{text_size::TextRange, Constant, Expr, ExprConstant, Mod, Stmt};
 use rustpython_parser::{parse, Mode};
 
+use tyc_analyse::{evaluate_comptime, ComptimeValue};
 use tyc_db::{check_file, TycDatabase};
 use tyc_desugar::desugar_module;
 use tyc_emit::emit;
 use tyc_format::format_source;
-use tyc_syntax::preprocess::preprocess;
+use tyc_syntax::preprocess::{expand_question_ops, preprocess};
 
 use crate::commands::util::collect_ty_files;
 use crate::config::TyphonConfig;
@@ -88,40 +92,21 @@ pub fn run(args: BuildArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Read every source file and preprocess upfront.
-    // Preprocessing is cheap and must run first so that comptime errors
-    // (missing required env vars) are reported before the type-checker runs.
-    let sources: Vec<(PathBuf, String, _)> = ty_files
+    // Read every source file once; both phases reuse this buffer.
+    let sources: Vec<(PathBuf, String)> = ty_files
         .into_iter()
         .map(|path| {
             let text = std::fs::read_to_string(&path)
                 .map_err(|e| miette!("cannot read '{}': {e}", path.display()))?;
-            let prep = preprocess(&text);
-            Ok((path, text, prep))
+            Ok((path, text))
         })
         .collect::<Result<_>>()?;
-
-    // Fail fast on comptime evaluation errors (missing required env vars) before
-    // the type-checker runs — the fallback `None` value would produce misleading
-    // type errors otherwise.
-    let mut comptime_error_count = 0usize;
-    for (path, _, prep) in &sources {
-        for msg in &prep.comptime_errors {
-            eprintln!("error[comptime]: {} (in '{}')", msg, path.display());
-            comptime_error_count += 1;
-        }
-    }
-    if comptime_error_count > 0 {
-        return Err(miette!(
-            "{comptime_error_count} comptime error(s) — set the required environment variables"
-        ));
-    }
 
     // Phase 1: type-check all files first and fail fast on errors.
     let mut db = TycDatabase::new();
     let mut error_count = 0usize;
 
-    for (path, source, _prep) in &sources {
+    for (path, source) in &sources {
         let diags = check_file(&mut db, path.display().to_string(), source.clone());
         if diags.has_errors() {
             for err in diags.errors() {
@@ -137,14 +122,35 @@ pub fn run(args: BuildArgs) -> Result<()> {
         ));
     }
 
-    // Phase 2: desugar and emit using the already-preprocessed output.
+    // Phase 2: desugar and emit using the already-loaded source text.
     let mut emitted = 0usize;
     let mut needs_runtime = false;
 
-    for (path, _source, prep) in &sources {
+    for (path, source) in &sources {
+        // Expand `?` operator before the regular preprocessor so that the
+        // Python parser never sees the Typhon-specific `?` syntax.
+        let expanded = expand_question_ops(source);
+        let prep = preprocess(&expanded);
 
         let module = parse(&prep.python_source, Mode::Module, &path.display().to_string())
             .map_err(|e| miette!("parse error in '{}': {e}", path.display()))?;
+
+        // Evaluate all `comptime` bindings and substitute their literals into
+        // the AST before desugaring.
+        let (comptime_values, comptime_diags) =
+            evaluate_comptime(&module, &prep.comptime_bindings);
+        if comptime_diags.has_errors() {
+            for err in comptime_diags.errors() {
+                eprintln!("{:?}", miette::Report::new_boxed(Box::new(err.clone())));
+            }
+            return Err(miette!(
+                "{} comptime error(s) in '{}'",
+                comptime_diags.error_count(),
+                path.display()
+            ));
+        }
+
+        let module = substitute_comptime_literals(module, &comptime_values);
 
         let desugar_output = desugar_module(&module);
         if desugar_output.needs_typhon_runtime {
@@ -192,6 +198,72 @@ pub fn run(args: BuildArgs) -> Result<()> {
 
     println!("built {} file(s) → '{}'", emitted, out_dir.display());
     Ok(())
+}
+
+// ── Comptime literal substitution ─────────────────────────────────────────────
+
+/// Replace the RHS of every top-level annotated assignment whose name appears
+/// in `values` with the evaluated compile-time constant.
+///
+/// This transforms e.g.:
+/// ```python
+/// PORT: int = int(env("PORT", "8080"))
+/// ```
+/// into:
+/// ```python
+/// PORT: int = 8080
+/// ```
+fn substitute_comptime_literals(
+    module: Mod<TextRange>,
+    values: &HashMap<String, ComptimeValue>,
+) -> Mod<TextRange> {
+    if values.is_empty() {
+        return module;
+    }
+    let Mod::Module(mut m) = module else {
+        return module;
+    };
+    m.body = m
+        .body
+        .into_iter()
+        .map(|stmt| substitute_stmt(stmt, values))
+        .collect();
+    Mod::Module(m)
+}
+
+fn substitute_stmt(
+    stmt: Stmt<TextRange>,
+    values: &HashMap<String, ComptimeValue>,
+) -> Stmt<TextRange> {
+    if let Stmt::AnnAssign(mut ann) = stmt {
+        if let Expr::Name(ref n) = *ann.target {
+            if let Some(cv) = values.get(n.id.as_str()) {
+                ann.value = Some(Box::new(comptime_value_to_expr(cv)));
+                return Stmt::AnnAssign(ann);
+            }
+        }
+        Stmt::AnnAssign(ann)
+    } else {
+        stmt
+    }
+}
+
+/// Convert a [`ComptimeValue`] to its Python AST constant expression
+/// by round-tripping through the Python parser.
+fn comptime_value_to_expr(value: &ComptimeValue) -> Expr<TextRange> {
+    let literal = value.to_python_literal();
+    match parse(&literal, Mode::Expression, "<comptime>") {
+        Ok(Mod::Expression(e)) => *e.body,
+        _ => {
+            // Fallback: emit as a string-quoted constant.  Should never happen
+            // for the value types we produce.
+            Expr::Constant(ExprConstant {
+                range: TextRange::default(),
+                value: Constant::Str(literal),
+                kind: None,
+            })
+        }
+    }
 }
 
 /// Generated `typhon_runtime.py` — the minimal runtime helper for `Result`.

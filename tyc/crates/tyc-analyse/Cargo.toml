@@ -3,3 +3,9 @@ name = "tyc-analyse"
 version.workspace = true
 edition.workspace = true
 description = "Purity, async, comptime, and optimisation analysis for Typhon (Phase 2+)"
+
+[dependencies]
+rustpython-ast    = { workspace = true }
+rustpython-parser = { workspace = true }
+tyc-syntax        = { workspace = true }
+tyc-diagnostics   = { workspace = true }

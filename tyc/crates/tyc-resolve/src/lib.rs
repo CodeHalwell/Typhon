@@ -449,11 +449,17 @@ fn declare_target(
         let mutability = match kw {
             Some(TyphonKeyword::Val) => Mutability::Val,
             Some(TyphonKeyword::Var) => Mutability::Var,
-            None => existing_mut.unwrap_or(if default_val {
-                Mutability::Val
-            } else {
-                Mutability::Var
-            }),
+            // `comptime val` records the inner `val` keyword, so Comptime
+            // alone would only appear when the inner keyword was omitted.
+            // `model` is not a value binding keyword — treat both like bare
+            // assignments (inherit or default).
+            Some(TyphonKeyword::Model | TyphonKeyword::Comptime) | None => {
+                existing_mut.unwrap_or(if default_val {
+                    Mutability::Val
+                } else {
+                    Mutability::Var
+                })
+            }
         };
         let span = (
             n.range.start().to_usize(),
@@ -913,8 +919,10 @@ fn builtin_names() -> std::collections::HashSet<&'static str> {
         "Coroutine", "Generator", "AsyncIterator", "AsyncIterable",
         // Typhon Result type constructors (from typhon_runtime).
         "Ok", "Err", "Result",
-        // Typhon-internal preprocessing sentinels (not user-visible).
-        "__TyphonModel__",
+        // Typhon comptime built-in function.
+        "env",
+        // Pydantic BaseModel — injected by the `model` keyword preprocessor.
+        "BaseModel",
     ];
     names.iter().copied().collect()
 }
