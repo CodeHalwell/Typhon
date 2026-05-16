@@ -19,25 +19,152 @@
 //! `with`-chains, and other Typhon-specific constructs.
 
 use rustpython_ast::{
-    text_size::TextRange, Constant, ExprCall, ExprConstant, ExprContext, ExprName, Identifier,
-    Mod, ModModule, Stmt, StmtImport,
+    text_size::TextRange, Alias, Constant, Expr, ExprCall, ExprConstant, ExprContext, ExprName,
+    Identifier, Mod, ModModule, Stmt, StmtImport, StmtImportFrom,
 };
 
 // ── public API ───────────────────────────────────────────────────────────────
 
+/// Output of the module desugaring pass.
+pub struct DesugarOutput {
+    /// The desugared Python-compatible AST.
+    pub module: Mod<TextRange>,
+    /// Whether the emitted module will import from `typhon_runtime`. When
+    /// true, the build command must write `typhon_runtime.py` alongside the
+    /// other output files so the generated import can resolve at runtime.
+    pub needs_typhon_runtime: bool,
+}
+
 /// Desugar a Typhon module AST into a plain Python AST.
 ///
-/// Currently performs one transformation: every `class` definition that does
-/// not already carry a `@dataclass` or `@dataclasses.dataclass` decorator gets
-/// `@dataclasses.dataclass(slots=True)` prepended to its decorator list, and
-/// `import dataclasses` is injected after any leading docstring / future
-/// imports when at least one class was transformed. The transformation is
-/// recursive — nested classes inside functions or other classes are processed.
-pub fn desugar_module(module: &Mod<TextRange>) -> Mod<TextRange> {
+/// Performs two transformations:
+///
+/// 1. **Class desugaring** — every `class` definition that does not already
+///    carry a `@dataclass` / `@dataclasses.dataclass` decorator gets
+///    `@dataclasses.dataclass(slots=True)` prepended, and `import dataclasses`
+///    is injected when needed. The transformation is recursive.
+///
+/// 2. **Result import injection** — if the module references `Ok`, `Err`, or
+///    `Result` anywhere, `from typhon_runtime import Ok, Err, Result` is
+///    injected after any leading docstring and future-imports so the generated
+///    Python can use those names.
+pub fn desugar_module(module: &Mod<TextRange>) -> DesugarOutput {
     match module {
-        Mod::Module(m) => Mod::Module(desugar_mod_module(m)),
-        other => other.clone(),
+        Mod::Module(m) => {
+            let desugared_mod = desugar_mod_module(m);
+
+            let has_result_usage = stmts_use_result_names(&m.body);
+            let has_existing_runtime_import = has_typhon_runtime_import(&m.body);
+            let needs_typhon_runtime = has_result_usage || has_existing_runtime_import;
+            let inject_import = has_result_usage && !has_existing_runtime_import;
+
+            let final_body = if inject_import {
+                let insert_at = import_insert_pos(&desugared_mod.body);
+                let mut body = desugared_mod.body;
+                body.insert(insert_at, make_typhon_runtime_import());
+                body
+            } else {
+                desugared_mod.body
+            };
+
+            DesugarOutput {
+                module: Mod::Module(ModModule {
+                    range: desugared_mod.range,
+                    body: final_body,
+                    type_ignores: desugared_mod.type_ignores,
+                }),
+                needs_typhon_runtime,
+            }
+        }
+        other => DesugarOutput {
+            module: other.clone(),
+            needs_typhon_runtime: false,
+        },
     }
+}
+
+// ── Result detection ─────────────────────────────────────────────────────────
+
+/// Return `true` if any statement in `stmts` (or its nested bodies) references
+/// the identifiers `Ok`, `Err`, or `Result`.
+fn stmts_use_result_names(stmts: &[Stmt<TextRange>]) -> bool {
+    stmts.iter().any(stmt_uses_result_names)
+}
+
+fn stmt_uses_result_names(stmt: &Stmt<TextRange>) -> bool {
+    match stmt {
+        Stmt::FunctionDef(f) => {
+            f.returns.as_ref().map_or(false, |r| expr_uses_result_names(r))
+                || stmts_use_result_names(&f.body)
+        }
+        Stmt::AsyncFunctionDef(f) => {
+            f.returns.as_ref().map_or(false, |r| expr_uses_result_names(r))
+                || stmts_use_result_names(&f.body)
+        }
+        Stmt::ClassDef(c) => stmts_use_result_names(&c.body),
+        Stmt::AnnAssign(a) => {
+            expr_uses_result_names(&a.annotation)
+                || a.value.as_ref().map_or(false, |v| expr_uses_result_names(v))
+        }
+        Stmt::Assign(a) => expr_uses_result_names(&a.value),
+        Stmt::Return(r) => r.value.as_ref().map_or(false, |v| expr_uses_result_names(v)),
+        Stmt::Expr(e) => expr_uses_result_names(&e.value),
+        Stmt::If(i) => {
+            stmts_use_result_names(&i.body) || stmts_use_result_names(&i.orelse)
+        }
+        _ => false,
+    }
+}
+
+fn expr_uses_result_names(expr: &Expr<TextRange>) -> bool {
+    match expr {
+        Expr::Name(n) => matches!(n.id.as_str(), "Ok" | "Err" | "Result"),
+        Expr::Call(c) => {
+            expr_uses_result_names(&c.func)
+                || c.args.iter().any(|a| expr_uses_result_names(a))
+        }
+        Expr::Subscript(s) => {
+            expr_uses_result_names(&s.value) || expr_uses_result_names(&s.slice)
+        }
+        Expr::BinOp(b) => expr_uses_result_names(&b.left) || expr_uses_result_names(&b.right),
+        Expr::Tuple(t) => t.elts.iter().any(|e| expr_uses_result_names(e)),
+        Expr::Attribute(a) => expr_uses_result_names(&a.value),
+        _ => false,
+    }
+}
+
+/// Return `true` if `body` already contains `from typhon_runtime import ...`.
+fn has_typhon_runtime_import(body: &[Stmt<TextRange>]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::ImportFrom(imp) => imp.module.as_deref() == Some("typhon_runtime"),
+        _ => false,
+    })
+}
+
+/// Build `from typhon_runtime import Ok, Err, Result`.
+fn make_typhon_runtime_import() -> Stmt<TextRange> {
+    Stmt::ImportFrom(StmtImportFrom {
+        range: TextRange::default(),
+        module: Some(Identifier::new("typhon_runtime")),
+        names: vec![
+            Alias {
+                range: TextRange::default(),
+                name: Identifier::new("Ok"),
+                asname: None,
+            },
+            Alias {
+                range: TextRange::default(),
+                name: Identifier::new("Err"),
+                asname: None,
+            },
+            Alias {
+                range: TextRange::default(),
+                name: Identifier::new("Result"),
+                asname: None,
+            },
+        ],
+        level: None,
+    })
 }
 
 // ── module-level desugaring ──────────────────────────────────────────────────
@@ -242,8 +369,8 @@ mod tests {
 
     fn parse_and_desugar(src: &str) -> String {
         let m = parse(src, Mode::Module, "<test>").expect("parse failed");
-        let desugared = desugar_module(&m);
-        emit(&desugared)
+        let output = desugar_module(&m);
+        emit(&output.module)
     }
 
     #[test]
@@ -328,5 +455,84 @@ mod tests {
         let import_pos = out.find("import dataclasses").expect("dataclasses import missing");
         assert!(doc_pos < future_pos, "output:\n{out}");
         assert!(future_pos < import_pos, "output:\n{out}");
+    }
+
+    // ── Result import injection ───────────────────────────────────────────────
+
+    #[test]
+    fn ok_call_injects_typhon_runtime_import() {
+        let src = "def f() -> None:\n    x = Ok(1)\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("from typhon_runtime import"),
+            "expected typhon_runtime import; output:\n{out}"
+        );
+        assert!(out.contains("Ok"), "output:\n{out}");
+    }
+
+    #[test]
+    fn err_call_injects_typhon_runtime_import() {
+        let src = "def f() -> None:\n    x = Err(\"boom\")\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("from typhon_runtime import"),
+            "expected typhon_runtime import; output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn result_annotation_injects_typhon_runtime_import() {
+        let src = "def f() -> Result[int, str]:\n    return Ok(1)\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("from typhon_runtime import"),
+            "expected typhon_runtime import; output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn no_result_usage_no_import_injection() {
+        let src = "x: int = 1\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            !out.contains("typhon_runtime"),
+            "unexpected typhon_runtime import; output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn existing_typhon_runtime_import_not_duplicated() {
+        let src = "from typhon_runtime import Ok, Err, Result\n\ndef f() -> None:\n    x = Ok(1)\n";
+        let out = parse_and_desugar(src);
+        assert_eq!(
+            out.matches("from typhon_runtime import").count(),
+            1,
+            "should not duplicate existing import; output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn needs_typhon_runtime_flag_set_when_result_used() {
+        let src = "def f() -> None:\n    x = Ok(1)\n";
+        let m = parse(src, Mode::Module, "<test>").expect("parse failed");
+        let output = desugar_module(&m);
+        assert!(output.needs_typhon_runtime, "flag should be true when Ok is used");
+    }
+
+    #[test]
+    fn needs_typhon_runtime_flag_clear_when_result_not_used() {
+        let src = "x: int = 1\n";
+        let m = parse(src, Mode::Module, "<test>").expect("parse failed");
+        let output = desugar_module(&m);
+        assert!(!output.needs_typhon_runtime, "flag should be false when Result not used");
+    }
+
+    #[test]
+    fn runtime_import_inserted_after_docstring() {
+        let src = "\"\"\"Module doc.\"\"\"\ndef f() -> None:\n    x = Ok(1)\n";
+        let out = parse_and_desugar(src);
+        let doc_pos = out.find("Module doc").expect("docstring missing");
+        let import_pos = out.find("from typhon_runtime").expect("runtime import missing");
+        assert!(doc_pos < import_pos, "runtime import must follow docstring\noutput:\n{out}");
     }
 }

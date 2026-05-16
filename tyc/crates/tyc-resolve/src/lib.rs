@@ -911,6 +911,8 @@ fn builtin_names() -> std::collections::HashSet<&'static str> {
         "Tuple", "FrozenSet", "Type", "TypeVar", "Generic", "Protocol",
         "Self", "ClassVar", "Final", "Literal", "NoReturn", "Awaitable",
         "Coroutine", "Generator", "AsyncIterator", "AsyncIterable",
+        // Typhon Result type constructors (from typhon_runtime).
+        "Ok", "Err", "Result",
     ];
     names.iter().copied().collect()
 }

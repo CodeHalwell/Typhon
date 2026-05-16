@@ -779,7 +779,19 @@ impl Emitter {
             Expr::Subscript(s) => {
                 self.emit_expr(&s.value);
                 self.write("[");
-                self.emit_expr(&s.slice);
+                // A tuple slice emits without outer parens: `X[A, B]` not `X[(A, B)]`.
+                if let Expr::Tuple(t) = s.slice.as_ref() {
+                    let mut first = true;
+                    for elem in &t.elts {
+                        if !first {
+                            self.write(", ");
+                        }
+                        self.emit_expr(elem);
+                        first = false;
+                    }
+                } else {
+                    self.emit_expr(&s.slice);
+                }
                 self.write("]");
             }
 

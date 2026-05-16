@@ -135,7 +135,11 @@ impl Type {
             }
             Type::Generic(name, args) => {
                 let a: Vec<String> = args.iter().map(|t| t.display()).collect();
-                format!("{}[{}]", name, a.join(", "))
+                if name == "Result" && args.len() == 2 {
+                    format!("Result[{}, {}]", a[0], a[1])
+                } else {
+                    format!("{}[{}]", name, a.join(", "))
+                }
             }
             Type::Union(xs) => {
                 let s: Vec<String> = xs.iter().map(|t| t.display()).collect();
@@ -169,6 +173,14 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
         (Type::Union(variants), other) => variants.iter().any(|v| assignable(v, other)),
         (other, Type::Union(variants)) => variants.iter().all(|v| assignable(other, v)),
         (Type::Generic(an, aa), Type::Generic(bn, bb)) => {
+            // Result[T, E] accepts Ok[T] (success) or Err[E] (failure) as values.
+            if an == "Result" && aa.len() == 2 {
+                return match (bn.as_str(), bb.len()) {
+                    ("Ok", 1) => assignable(&aa[0], &bb[0]),
+                    ("Err", 1) => assignable(&aa[1], &bb[0]),
+                    _ => false,
+                };
+            }
             an == bn && aa.len() == bb.len() && aa.iter().zip(bb).all(|(x, y)| assignable(x, y))
         }
         (a, b) => a == b,
@@ -217,6 +229,17 @@ pub fn type_from_annotation(expr: &Expr<TextRange>, classes: &[String]) -> Type 
                     return Type::union_of(args);
                 }
                 return type_from_annotation(&s.slice, classes);
+            }
+            // Result[T, E] — two-parameter sealed sum type (Ok[T] | Err[E]).
+            if head == "Result" {
+                if let Expr::Tuple(t) = s.slice.as_ref() {
+                    if t.elts.len() == 2 {
+                        let ok_type = type_from_annotation(&t.elts[0], classes);
+                        let err_type = type_from_annotation(&t.elts[1], classes);
+                        return Type::Generic("Result".into(), vec![ok_type, err_type]);
+                    }
+                }
+                return Type::Generic("Result".into(), vec![Type::Unknown, Type::Unknown]);
             }
             // list[int], dict[str, int], tuple[int, str, ...]
             let args: Vec<Type> = match s.slice.as_ref() {
@@ -944,6 +967,20 @@ fn infer_expr(c: &mut Checker, expr: &Expr<TextRange>) -> Type {
             }
         }
         Expr::Call(call) => {
+            // Ok(value) and Err(error) are Result constructors: infer their
+            // types as Generic("Ok", [T]) / Generic("Err", [E]) so that the
+            // Result assignability rule in `assignable` can fire.
+            if let Expr::Name(fn_name) = call.func.as_ref() {
+                let ctor = fn_name.id.as_str();
+                if (ctor == "Ok" || ctor == "Err")
+                    && call.args.len() == 1
+                    && call.keywords.is_empty()
+                {
+                    let arg_type = infer_expr(c, &call.args[0]);
+                    return Type::Generic(ctor.to_owned(), vec![arg_type]);
+                }
+            }
+
             let func_type = infer_expr(c, &call.func);
             let call_span = (
                 call.range.start().to_usize(),
@@ -1587,5 +1624,74 @@ val x: Shape? = Circle()
 ";
         let d = check(src);
         assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    // ── Result[T, E] type tests ───────────────────────────────────────────────
+
+    #[test]
+    fn ok_assignable_to_result() {
+        let src = "\
+val r: Result[int, str] = Ok(42)
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn err_assignable_to_result() {
+        let src = "\
+val r: Result[int, str] = Err(\"oops\")
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn plain_int_not_assignable_to_result() {
+        let src = "\
+val r: Result[int, str] = 42
+";
+        let d = check(src);
+        assert!(d.has_errors(), "expected type-mismatch error");
+    }
+
+    #[test]
+    fn result_return_type_ok() {
+        let src = "\
+def find(id: int) -> Result[int, str]:
+    return Ok(id)
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn result_return_type_err() {
+        let src = "\
+def find(id: int) -> Result[int, str]:
+    return Err(\"not found\")
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn result_wrong_ok_type_rejected() {
+        // Ok("text") should not fit Result[int, str]: Ok expects an int value.
+        let src = "\
+val r: Result[int, str] = Ok(\"text\")
+";
+        let d = check(src);
+        assert!(d.has_errors(), "expected type-mismatch: Ok[str] not assignable to Result[int, str]");
+    }
+
+    #[test]
+    fn result_wrong_err_type_rejected() {
+        // Err(99) should not fit Result[int, str]: Err expects a str value.
+        let src = "\
+val r: Result[int, str] = Err(99)
+";
+        let d = check(src);
+        assert!(d.has_errors(), "expected type-mismatch: Err[int] not assignable to Result[int, str]");
     }
 }
