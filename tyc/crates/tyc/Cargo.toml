@@ -2,6 +2,7 @@
 name = "tyc"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Typhon compiler and language server — single binary"
 
 [[bin]]

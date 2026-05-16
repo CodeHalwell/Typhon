@@ -287,21 +287,35 @@ pub fn preprocess(source: &str) -> PreprocessResult {
 ///
 /// Returns `(alias, module)` on success, `None` if the syntax is malformed.
 fn parse_lazy_import(tail: &str) -> Option<(String, String)> {
-    let eq = tail.find('=')?;
-    let alias = tail[..eq].trim().to_owned();
-    let module = tail[eq + 1..].trim().to_owned();
-    // Both alias and module must be non-empty identifiers (allowing dots in
-    // module names like `numpy.random`).
-    if alias.is_empty()
-        || module.is_empty()
-        || !alias.chars().all(|c| c.is_alphanumeric() || c == '_')
-        || !module
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
-    {
+    // Strip a trailing `# comment` so that `lazy import np = numpy  # noqa`
+    // is handled correctly rather than failing the identifier check.
+    let code = tail.split('#').next().unwrap_or("").trim();
+    let eq = code.find('=')?;
+    let alias = code[..eq].trim().to_owned();
+    let module = code[eq + 1..].trim().to_owned();
+    if !is_python_ident(&alias) || !is_dotted_python_ident(&module) {
         return None;
     }
     Some((alias, module))
+}
+
+/// True iff `s` is a valid Python identifier (starts with alpha or `_`,
+/// followed by alphanumerics or `_`).
+fn is_python_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// True iff `s` is a dotted Python module path (each component is a valid
+/// Python identifier, e.g. `numpy` or `numpy.random`).
+fn is_dotted_python_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.split('.')
+            .all(|part| !part.is_empty() && is_python_ident(part))
 }
 
 /// Build the class-header portion of an `impl` line, converting
@@ -880,12 +894,12 @@ fn extract_return_type_text(def_line: &str) -> Option<String> {
 /// lazy import np = numpy
 ///
 /// # Output (valid Python)
-/// import threading as __typhon_thread_
 /// class __TyphonLazy_np_:
 ///     __slots__ = ('_m', '_lock')
 ///     def __init__(self):
+///         import threading as _t   # local import avoids __future__ conflicts
 ///         object.__setattr__(self, '_m', None)
-///         object.__setattr__(self, '_lock', __typhon_thread_.Lock())
+///         object.__setattr__(self, '_lock', _t.Lock())
 ///     def __getattr__(self, name):
 ///         m = object.__getattribute__(self, '_m')
 ///         if m is None:
@@ -911,32 +925,29 @@ fn extract_return_type_text(def_line: &str) -> Option<String> {
 /// use [`preprocess`]'s simpler `import MODULE as ALIAS` conversion instead).
 pub fn expand_lazy_imports(source: &str) -> String {
     let mut result = String::with_capacity(source.len() + 256);
-    let mut needs_thread_import = false;
-    // Pre-scan to check whether any lazy imports exist so we can prepend the
-    // threading import once at the top.
-    for line in source.lines() {
-        let trimmed = line.trim_start();
-        if let Some(after) = trimmed.strip_prefix("lazy import ") {
-            if parse_lazy_import(after.trim()).is_some() {
-                needs_thread_import = true;
-                break;
-            }
-        }
-    }
-
-    if needs_thread_import {
-        result.push_str("import threading as __typhon_thread_\n");
-    }
+    // Track triple-quoted string state so that a `lazy import` that appears
+    // inside a docstring or multiline string is never mistakenly rewritten.
+    let mut in_string: Option<StringMode> = None;
 
     for line in source.split_inclusive('\n') {
+        let pre_string = in_string;
         let raw = line.trim_end_matches(['\n', '\r']);
+        let _code_end = scan_line_code_end(raw, &mut in_string);
+
+        // Lines that begin inside a triple-quoted string are pure string
+        // content — emit verbatim.
+        if pre_string.is_some() {
+            result.push_str(line);
+            continue;
+        }
+
         let trimmed = raw.trim_start();
         let indent_len = raw.len() - trimmed.len();
 
         // Only expand at module level (indent_len == 0).
         if indent_len == 0 {
             if let Some(after) = trimmed.strip_prefix("lazy import ") {
-                if let Some((alias, module)) = parse_lazy_import(after.trim()) {
+                if let Some((alias, module)) = parse_lazy_import(after) {
                     emit_lazy_proxy(&mut result, &alias, &module);
                     continue;
                 }
@@ -950,13 +961,21 @@ pub fn expand_lazy_imports(source: &str) -> String {
 }
 
 /// Emit the proxy class for a single `lazy import ALIAS = MODULE`.
+///
+/// The `threading` import is placed inside `__init__` rather than at module
+/// level so that it cannot conflict with `from __future__ import ...` or
+/// encoding cookies that must appear at the start of the file.
 fn emit_lazy_proxy(out: &mut String, alias: &str, module: &str) {
     let class = format!("__TyphonLazy_{alias}_");
     out.push_str(&format!("class {class}:\n"));
     out.push_str("    __slots__ = ('_m', '_lock')\n");
     out.push_str("    def __init__(self):\n");
+    // Import threading locally so the proxy carries no module-level side
+    // effects and remains safe even when the source file has a __future__
+    // prologue or a custom encoding cookie.
+    out.push_str("        import threading as _t\n");
     out.push_str("        object.__setattr__(self, '_m', None)\n");
-    out.push_str("        object.__setattr__(self, '_lock', __typhon_thread_.Lock())\n");
+    out.push_str("        object.__setattr__(self, '_lock', _t.Lock())\n");
     out.push_str("    def __getattr__(self, name):\n");
     out.push_str("        m = object.__getattribute__(self, '_m')\n");
     out.push_str("        if m is None:\n");
@@ -968,6 +987,9 @@ fn emit_lazy_proxy(out: &mut String, alias: &str, module: &str) {
     out.push_str("                    object.__setattr__(self, '_m', _mod)\n");
     out.push_str("                    m = _mod\n");
     out.push_str("        return getattr(m, name)\n");
+    out.push_str("    def __dir__(self):\n");
+    out.push_str("        m = object.__getattribute__(self, '_m')\n");
+    out.push_str("        return dir(m) if m is not None else []\n");
     out.push_str("    def __repr__(self):\n");
     out.push_str("        m = object.__getattribute__(self, '_m')\n");
     out.push_str(&format!(
@@ -2880,20 +2902,35 @@ def run() -> Result[str, str]:
             out.contains("import numpy as _mod"),
             "should import numpy on first use, got:\n{out}"
         );
+        // threading is now imported inside __init__, not at module level
         assert!(
-            out.contains("import threading as __typhon_thread_"),
-            "should include threading import, got:\n{out}"
+            out.contains("import threading as _t"),
+            "should include local threading import in __init__, got:\n{out}"
         );
     }
 
     #[test]
-    fn expand_lazy_imports_threading_import_emitted_once_for_multiple_lazy_imports() {
+    fn expand_lazy_imports_proxy_has_dir_and_repr() {
+        let src = "lazy import np = numpy\n";
+        let out = expand_lazy_imports(src);
+        assert!(
+            out.contains("def __dir__"),
+            "proxy should implement __dir__, got:\n{out}"
+        );
+        assert!(
+            out.contains("def __repr__"),
+            "proxy should implement __repr__, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn expand_lazy_imports_no_module_level_threading_for_multiple_lazy_imports() {
         let src = "lazy import np = numpy\nlazy import pd = pandas\n";
         let out = expand_lazy_imports(src);
-        let count = out.matches("import threading").count();
-        assert_eq!(
-            count, 1,
-            "threading import should appear exactly once, got:\n{out}"
+        // threading must NOT appear at module level — only inside __init__
+        assert!(
+            !out.starts_with("import threading"),
+            "threading must not be at module level, got:\n{out}"
         );
         assert!(
             out.contains("class __TyphonLazy_np_"),
@@ -2902,6 +2939,32 @@ def run() -> Result[str, str]:
         assert!(
             out.contains("class __TyphonLazy_pd_"),
             "pd proxy missing, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn expand_lazy_imports_safe_inside_triple_quoted_string() {
+        // A `lazy import` that appears literally inside a docstring must NOT
+        // be rewritten — it is string content, not a statement.
+        let src = "x = \"\"\"\nlazy import np = numpy\n\"\"\"\n";
+        let out = expand_lazy_imports(src);
+        assert!(
+            !out.contains("__TyphonLazy_"),
+            "lazy import inside string must not be expanded, got:\n{out}"
+        );
+        assert!(
+            out.contains("lazy import np = numpy"),
+            "original text must be preserved"
+        );
+    }
+
+    #[test]
+    fn expand_lazy_imports_trailing_comment_handled() {
+        let src = "lazy import np = numpy  # noqa\n";
+        let out = expand_lazy_imports(src);
+        assert!(
+            out.contains("class __TyphonLazy_np_"),
+            "trailing comment should not prevent expansion, got:\n{out}"
         );
     }
 

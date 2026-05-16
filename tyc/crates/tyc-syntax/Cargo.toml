@@ -2,6 +2,7 @@
 name = "tyc-syntax"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Typhon lexer and parser — extends rustpython-parser with Typhon-specific tokens (val, var)"
 
 [dependencies]
