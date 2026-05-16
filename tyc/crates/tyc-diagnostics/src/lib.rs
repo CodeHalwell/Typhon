@@ -703,7 +703,7 @@ mod tests {
 
     #[test]
     fn immutable_assign_contains_name() {
-        let e = TycError::immutable_assign("x", "a.ty", "val x: int = 1\nx = 2", 4, 1, 16, 1);
+        let e = TycError::immutable_assign("x", "a.ty", "val x: int = 1\nx = 2", 4, 1, 15, 1);
         assert!(matches!(e, TycError::ImmutableAssign { .. }));
         assert!(e.to_string().contains("x"));
     }

@@ -32,7 +32,8 @@ fn scaffold(dir: &Path, src_content: &str) {
 fn init_creates_project_structure() {
     let tmp = tempfile::tempdir().unwrap();
     let status = tyc()
-        .args(["init", "myapp", "--dir", tmp.path().to_str().unwrap()])
+        .args(["init", "myapp", "--dir"])
+        .arg(tmp.path())
         .status()
         .unwrap();
     assert!(status.success(), "tyc init should succeed");
@@ -51,7 +52,8 @@ fn init_creates_project_structure() {
 fn init_embeds_project_name_in_toml() {
     let tmp = tempfile::tempdir().unwrap();
     tyc()
-        .args(["init", "coolproject", "--dir", tmp.path().to_str().unwrap()])
+        .args(["init", "coolproject", "--dir"])
+        .arg(tmp.path())
         .status()
         .unwrap();
     let toml = std::fs::read_to_string(tmp.path().join("typhon.toml")).unwrap();
@@ -66,12 +68,14 @@ fn init_rejects_existing_toml() {
     let tmp = tempfile::tempdir().unwrap();
     // First init must succeed.
     tyc()
-        .args(["init", "proj", "--dir", tmp.path().to_str().unwrap()])
+        .args(["init", "proj", "--dir"])
+        .arg(tmp.path())
         .status()
         .unwrap();
     // Second init on the same dir must fail.
     let status = tyc()
-        .args(["init", "proj", "--dir", tmp.path().to_str().unwrap()])
+        .args(["init", "proj", "--dir"])
+        .arg(tmp.path())
         .status()
         .unwrap();
     assert!(
@@ -86,10 +90,7 @@ fn init_rejects_existing_toml() {
 fn check_passes_on_valid_source() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("ok.ty"), "val x: int = 42\n").unwrap();
-    let status = tyc()
-        .args(["check", tmp.path().to_str().unwrap()])
-        .status()
-        .unwrap();
+    let status = tyc().arg("check").arg(tmp.path()).status().unwrap();
     assert!(status.success(), "tyc check should pass on valid source");
 }
 
@@ -97,10 +98,7 @@ fn check_passes_on_valid_source() {
 fn check_fails_on_type_error() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("bad.ty"), "val x: int = \"hello\"\n").unwrap();
-    let status = tyc()
-        .args(["check", tmp.path().to_str().unwrap()])
-        .status()
-        .unwrap();
+    let status = tyc().arg("check").arg(tmp.path()).status().unwrap();
     assert!(
         !status.success(),
         "tyc check should fail on a type mismatch"
@@ -111,10 +109,7 @@ fn check_fails_on_type_error() {
 fn check_passes_nullable_annotation() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("nullable.ty"), "val x: str? = None\n").unwrap();
-    let status = tyc()
-        .args(["check", tmp.path().to_str().unwrap()])
-        .status()
-        .unwrap();
+    let status = tyc().arg("check").arg(tmp.path()).status().unwrap();
     assert!(
         status.success(),
         "tyc check should accept T? (nullable) annotations"
@@ -128,7 +123,8 @@ fn fmt_check_passes_on_already_formatted_file() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("x.ty"), "val x: int = 1\n").unwrap();
     let status = tyc()
-        .args(["fmt", "--check", tmp.path().to_str().unwrap()])
+        .args(["fmt", "--check"])
+        .arg(tmp.path())
         .status()
         .unwrap();
     assert!(
@@ -142,7 +138,8 @@ fn fmt_check_fails_on_unformatted_file() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("y.ty"), "def f():\n\tpass\n").unwrap();
     let status = tyc()
-        .args(["fmt", "--check", tmp.path().to_str().unwrap()])
+        .args(["fmt", "--check"])
+        .arg(tmp.path())
         .status()
         .unwrap();
     assert!(
@@ -156,10 +153,7 @@ fn fmt_rewrites_tab_indentation_in_place() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("z.ty");
     std::fs::write(&path, "def f():\n\tpass\n").unwrap();
-    let status = tyc()
-        .args(["fmt", path.to_str().unwrap()])
-        .status()
-        .unwrap();
+    let status = tyc().arg("fmt").arg(&path).status().unwrap();
     assert!(status.success(), "tyc fmt should succeed");
     let content = std::fs::read_to_string(&path).unwrap();
     assert!(
@@ -174,10 +168,7 @@ fn fmt_rewrites_tab_indentation_in_place() {
 fn build_produces_py_file_from_simple_source() {
     let tmp = tempfile::tempdir().unwrap();
     scaffold(tmp.path(), "val greeting: str = \"hello\"\n");
-    let status = tyc()
-        .args(["build", tmp.path().to_str().unwrap()])
-        .status()
-        .unwrap();
+    let status = tyc().arg("build").arg(tmp.path()).status().unwrap();
     assert!(status.success(), "tyc build should succeed");
     assert!(
         tmp.path().join("build").join("main.py").exists(),
@@ -189,10 +180,7 @@ fn build_produces_py_file_from_simple_source() {
 fn build_fails_on_type_error() {
     let tmp = tempfile::tempdir().unwrap();
     scaffold(tmp.path(), "val x: int = \"wrong type\"\n");
-    let status = tyc()
-        .args(["build", tmp.path().to_str().unwrap()])
-        .status()
-        .unwrap();
+    let status = tyc().arg("build").arg(tmp.path()).status().unwrap();
     assert!(
         !status.success(),
         "tyc build should fail when there is a type mismatch"
@@ -203,10 +191,7 @@ fn build_fails_on_type_error() {
 fn build_emits_dataclass_decorator_for_class() {
     let tmp = tempfile::tempdir().unwrap();
     scaffold(tmp.path(), "class Point:\n    x: int\n    y: int\n");
-    let status = tyc()
-        .args(["build", tmp.path().to_str().unwrap()])
-        .status()
-        .unwrap();
+    let status = tyc().arg("build").arg(tmp.path()).status().unwrap();
     assert!(status.success(), "build should succeed for a plain class");
     let out = std::fs::read_to_string(tmp.path().join("build").join("main.py")).unwrap();
     assert!(
@@ -219,10 +204,7 @@ fn build_emits_dataclass_decorator_for_class() {
 fn build_emits_typhon_runtime_when_result_used() {
     let tmp = tempfile::tempdir().unwrap();
     scaffold(tmp.path(), "def f() -> Ok[int]:\n    return Ok(1)\n");
-    tyc()
-        .args(["build", tmp.path().to_str().unwrap()])
-        .status()
-        .unwrap();
+    tyc().arg("build").arg(tmp.path()).status().unwrap();
     let runtime_pkg = tmp.path().join("build").join("typhon_runtime");
     assert!(
         runtime_pkg.join("__init__.py").exists(),
@@ -242,51 +224,65 @@ fn build_emits_typhon_runtime_when_result_used() {
 
 /// Full pipeline smoke test: init → write Phase 3 source → check → build → verify output.
 ///
-/// This validates that the most important Phase 3 features (interface, sealed union,
-/// `@pure`, pipe operator) survive the full compilation pipeline without errors.
+/// Exercises: `interface` (→ `Protocol`), sealed union type alias, `@pure`
+/// function, and class desugaring — the four key Phase 3 features.
 #[test]
 fn full_pipeline_phase3_features() {
     let tmp = tempfile::tempdir().unwrap();
 
     // Scaffold the project via `tyc init`.
     let status = tyc()
-        .args(["init", "demo", "--dir", tmp.path().to_str().unwrap()])
+        .args(["init", "demo", "--dir"])
+        .arg(tmp.path())
         .status()
         .unwrap();
     assert!(status.success(), "tyc init failed");
 
-    // Replace the generated main.ty with a Phase 3 feature showcase.
+    // Replace the generated main.ty with a Phase 3 feature showcase:
+    //   - `interface` declaration (→ Protocol class)
+    //   - two concrete classes conforming to the interface
+    //   - sealed union type alias (`type AnyGreeter = ...`)
+    //   - `@pure` function
     let src = r#"
-class Config:
-    host: str
-    port: int
+interface Greeter:
+    def greet(self) -> str:
+        ...
+
+class EnglishGreeter:
+    def greet(self) -> str:
+        return "Hello"
+
+class SpanishGreeter:
+    def greet(self) -> str:
+        return "Hola"
+
+type AnyGreeter = EnglishGreeter | SpanishGreeter
 
 @pure
 def double(x: int) -> int:
     return x * 2
 
+val g: Greeter = EnglishGreeter()
 val result: int = double(21)
 "#;
     std::fs::write(tmp.path().join("src").join("main.ty"), src).unwrap();
 
     // `tyc check` must pass.
-    let status = tyc()
-        .args(["check", tmp.path().to_str().unwrap()])
-        .status()
-        .unwrap();
+    let status = tyc().arg("check").arg(tmp.path()).status().unwrap();
     assert!(status.success(), "tyc check failed on Phase 3 fixture");
 
     // `tyc build` must succeed and produce main.py.
-    let status = tyc()
-        .args(["build", tmp.path().to_str().unwrap()])
-        .status()
-        .unwrap();
+    let status = tyc().arg("build").arg(tmp.path()).status().unwrap();
     assert!(status.success(), "tyc build failed on Phase 3 fixture");
 
     let py = std::fs::read_to_string(tmp.path().join("build").join("main.py")).unwrap();
     assert!(
+        py.contains("Protocol"),
+        "interface should be emitted as a Protocol class"
+    );
+    assert!(
         py.contains("@dataclasses.dataclass"),
-        "Config class should be emitted as a dataclass"
+        "concrete classes should be emitted as dataclasses"
     );
     assert!(
         py.contains("double"),
