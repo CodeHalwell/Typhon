@@ -1150,6 +1150,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "miette",
+ "rustpython-parser",
  "serde",
  "thiserror",
  "toml",
