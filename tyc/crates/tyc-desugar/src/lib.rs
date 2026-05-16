@@ -37,14 +37,19 @@ pub struct DesugarOutput {
 
 /// Desugar a Typhon module AST into a plain Python AST.
 ///
-/// Performs two transformations:
+/// Performs three transformations:
 ///
-/// 1. **Class desugaring** — every `class` definition that does not already
-///    carry a `@dataclass` / `@dataclasses.dataclass` decorator gets
-///    `@dataclasses.dataclass(slots=True)` prepended, and `import dataclasses`
-///    is injected when needed. The transformation is recursive.
+/// 1. **Dataclass desugaring** — every `class` definition that does not already
+///    carry a `@dataclass` / `@dataclasses.dataclass` decorator *and* does not
+///    inherit from `BaseModel` gets `@dataclasses.dataclass(slots=True)`
+///    prepended, and `import dataclasses` is injected when needed. Recursive.
 ///
-/// 2. **Result import injection** — if the module references `Ok`, `Err`, or
+/// 2. **Pydantic model desugaring** — every `class` that *does* inherit from
+///    `BaseModel` (produced by the `model` keyword preprocessor) is left
+///    without the dataclass decorator, and `from pydantic import BaseModel` is
+///    injected after any leading docstring / future-imports.
+///
+/// 3. **Result import injection** — if the module references `Ok`, `Err`, or
 ///    `Result` anywhere, `from typhon_runtime import Ok, Err, Result` is
 ///    injected after any leading docstring and future-imports so the generated
 ///    Python can use those names.
@@ -66,21 +71,29 @@ pub fn desugar_module(module: &Mod<TextRange>) -> DesugarOutput {
             // (e.g. just `Ok`) would leave `Err`/`Result` undefined, so we
             // still inject. A bare `import typhon_runtime` doesn't bring
             // `Ok`/`Err`/`Result` into scope, so we also still inject.
-            let inject_import = has_result_usage && !import_covers_all;
+            let inject_result_import = has_result_usage && !import_covers_all;
 
-            let final_body = if inject_import {
-                let insert_at = import_insert_pos(&desugared_mod.body);
-                let mut body = desugared_mod.body;
+            // Inject `from pydantic import BaseModel` when any class inherits
+            // from BaseModel (produced by the `model` keyword preprocessor).
+            let needs_pydantic = stmts_use_basemodel(&desugared_mod.body);
+            let inject_pydantic = needs_pydantic && !has_pydantic_import(&desugared_mod.body);
+
+            let mut body = desugared_mod.body;
+            let insert_at = import_insert_pos(&body);
+
+            // Insert imports in reverse order so later `insert_at` calls don't
+            // shift indices of earlier insertions.
+            if inject_result_import {
                 body.insert(insert_at, make_typhon_runtime_import());
-                body
-            } else {
-                desugared_mod.body
-            };
+            }
+            if inject_pydantic {
+                body.insert(insert_at, make_pydantic_basemodel_import());
+            }
 
             DesugarOutput {
                 module: Mod::Module(ModModule {
                     range: desugared_mod.range,
-                    body: final_body,
+                    body,
                     type_ignores: desugared_mod.type_ignores,
                 }),
                 needs_typhon_runtime,
@@ -453,7 +466,11 @@ fn desugar_stmts(stmts: &[Stmt<TextRange>]) -> (Vec<Stmt<TextRange>>, bool) {
 fn desugar_stmt(stmt: &Stmt<TextRange>) -> (Stmt<TextRange>, bool) {
     match stmt {
         Stmt::ClassDef(c) => {
-            let needs_decorator = !has_dataclass_decorator(&c.decorator_list);
+            let is_pydantic = class_inherits_basemodel(c);
+            // Skip the dataclass decorator for Pydantic model classes; they
+            // already carry the right base class from preprocessing.
+            let needs_decorator =
+                !is_pydantic && !has_dataclass_decorator(&c.decorator_list);
             let (new_body, body_transformed) = desugar_stmts(&c.body);
             let mut new_class = c.clone();
             new_class.body = new_body;
@@ -528,6 +545,51 @@ fn make_dataclasses_import() -> Stmt<TextRange> {
             name: Identifier::new("dataclasses"),
             asname: None,
         }],
+    })
+}
+
+/// Return `true` if any statement in `stmts` (recursively) uses `BaseModel`
+/// as a base class — i.e. the module was produced from `model` keywords.
+fn stmts_use_basemodel(stmts: &[Stmt<TextRange>]) -> bool {
+    stmts.iter().any(|stmt| match stmt {
+        Stmt::ClassDef(c) => {
+            class_inherits_basemodel(c) || stmts_use_basemodel(&c.body)
+        }
+        Stmt::FunctionDef(f) => stmts_use_basemodel(&f.body),
+        Stmt::AsyncFunctionDef(f) => stmts_use_basemodel(&f.body),
+        _ => false,
+    })
+}
+
+/// Return `true` if `c` inherits directly from `BaseModel`.
+fn class_inherits_basemodel(c: &rustpython_ast::StmtClassDef<TextRange>) -> bool {
+    c.bases.iter().any(|base| {
+        matches!(base, rustpython_ast::Expr::Name(n) if n.id.as_str() == "BaseModel")
+    })
+}
+
+/// Return `true` if the module already has `from pydantic import BaseModel`.
+fn has_pydantic_import(body: &[Stmt<TextRange>]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::ImportFrom(imp) => {
+            imp.module.as_deref() == Some("pydantic")
+                && imp.names.iter().any(|a| a.name.as_str() == "BaseModel")
+        }
+        _ => false,
+    })
+}
+
+/// Build `from pydantic import BaseModel`.
+fn make_pydantic_basemodel_import() -> Stmt<TextRange> {
+    Stmt::ImportFrom(StmtImportFrom {
+        range: TextRange::default(),
+        module: Some(Identifier::new("pydantic")),
+        names: vec![Alias {
+            range: TextRange::default(),
+            name: Identifier::new("BaseModel"),
+            asname: None,
+        }],
+        level: None,
     })
 }
 
@@ -907,5 +969,55 @@ mod tests {
             1,
             "star-import covers all names; should not duplicate; output:\n{out}"
         );
+    }
+
+    // ── Pydantic model desugaring ─────────────────────────────────────────────
+
+    #[test]
+    fn basemodel_class_gets_pydantic_import() {
+        // Simulates what the preprocessor produces from `model ApiUser:`.
+        let src = "class ApiUser(BaseModel):\n    id: int\n    email: str\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("from pydantic import BaseModel"),
+            "output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn basemodel_class_does_not_get_dataclass_decorator() {
+        let src = "class ApiUser(BaseModel):\n    id: int\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            !out.contains("@dataclasses.dataclass"),
+            "BaseModel classes must not get the dataclass decorator\noutput:\n{out}"
+        );
+        assert!(
+            !out.contains("import dataclasses"),
+            "no dataclasses import for BaseModel classes\noutput:\n{out}"
+        );
+    }
+
+    #[test]
+    fn existing_pydantic_import_not_duplicated() {
+        let src =
+            "from pydantic import BaseModel\n\nclass User(BaseModel):\n    id: int\n";
+        let out = parse_and_desugar(src);
+        assert_eq!(
+            out.matches("from pydantic import BaseModel").count(),
+            1,
+            "must not duplicate existing pydantic import\noutput:\n{out}"
+        );
+    }
+
+    #[test]
+    fn plain_class_and_model_class_in_same_module() {
+        let src =
+            "class Point:\n    x: int\n\nclass User(BaseModel):\n    id: int\n";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("@dataclasses.dataclass(slots=True)"), "Point needs dataclass\noutput:\n{out}");
+        assert!(out.contains("from pydantic import BaseModel"), "User needs pydantic\noutput:\n{out}");
+        assert!(!out.contains("@dataclasses.dataclass") || out.matches("@dataclasses.dataclass").count() == 1,
+            "User must NOT get dataclass decorator\noutput:\n{out}");
     }
 }

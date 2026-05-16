@@ -13,7 +13,7 @@
 use rustpython_parser::{parse, Mode};
 use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_resolve::resolve_module;
-use tyc_syntax::preprocess::preprocess;
+use tyc_syntax::preprocess::{expand_question_ops, preprocess};
 use tyc_types::check_module;
 
 /// A source file held by the database — identified by path, with mutable
@@ -95,7 +95,10 @@ pub fn check_file(db: &mut TycDatabase, path: String, text: String) -> Diagnosti
     let _ = SourceFile::new(db, path.clone(), text.clone());
     let mut diags = Diagnostics::new();
 
-    let prep = preprocess(&text);
+    // Expand `?` operator before preprocessing so the Python parser sees
+    // valid Python.  `tyc fmt` skips this expansion to preserve Typhon syntax.
+    let expanded = expand_question_ops(&text);
+    let prep = preprocess(&expanded);
 
     let module = match parse(&prep.python_source, Mode::Module, &path) {
         Ok(m) => m,

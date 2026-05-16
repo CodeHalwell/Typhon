@@ -1,6 +1,8 @@
 //! Typhon-specific tokens that extend the Python token set.
 //!
 //! Phase 0 introduces `val` and `var` as first-class keywords.
+//! Phase 2 adds `model` (Pydantic class emission) and `comptime` (build-time
+//! constant evaluation).
 //! These are recognised here and stripped (pre-processed) before the
 //! underlying Python parser sees them, so the existing Python parser can
 //! handle the remainder of the grammar unchanged.
@@ -12,6 +14,11 @@ pub enum TyphonKeyword {
     Val,
     /// `var` — declares a mutable binding.
     Var,
+    /// `model` — declares a Pydantic `BaseModel` class instead of a dataclass.
+    Model,
+    /// `comptime` — marks a binding whose RHS is evaluated at build time and
+    /// inlined as a literal in the emitted Python.
+    Comptime,
 }
 
 impl TyphonKeyword {
@@ -20,6 +27,8 @@ impl TyphonKeyword {
         match self {
             Self::Val => "val",
             Self::Var => "var",
+            Self::Model => "model",
+            Self::Comptime => "comptime",
         }
     }
 
@@ -28,6 +37,8 @@ impl TyphonKeyword {
         match s {
             "val" => Some(Self::Val),
             "var" => Some(Self::Var),
+            "model" => Some(Self::Model),
+            "comptime" => Some(Self::Comptime),
             _ => None,
         }
     }

@@ -1150,6 +1150,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "miette",
+ "rustpython-ast",
  "rustpython-parser",
  "serde",
  "thiserror",
@@ -1169,6 +1170,12 @@ dependencies = [
 [[package]]
 name = "tyc-analyse"
 version = "0.1.0"
+dependencies = [
+ "rustpython-ast",
+ "rustpython-parser",
+ "tyc-diagnostics",
+ "tyc-syntax",
+]
 
 [[package]]
 name = "tyc-db"

@@ -181,6 +181,15 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
             }
             an == bn && aa.len() == bb.len() && aa.iter().zip(bb).all(|(x, y)| assignable(x, y))
         }
+        // Bare (unparameterized) `Ok` or `Err` is assignable to `Result[T, E]`
+        // without parameter checking. This arises when the `?` operator expands
+        // into `if isinstance(x, Err): return x`, and the isinstance-narrowing
+        // reduces `x` from `Result[T, E]` to bare `Class("Err")`.
+        (Type::Generic(an, _), Type::Class(cn))
+            if an == "Result" && (cn == "Ok" || cn == "Err") =>
+        {
+            true
+        }
         (a, b) => a == b,
     }
 }
@@ -453,6 +462,12 @@ pub fn check_module(
         c.env.enter();
         // Seed module scope with collected classes/functions and resolver bindings.
         seed_env_from_scope(&mut c, 0);
+        // Seed Typhon built-in names that are not declared in the source:
+        // - `env` is a comptime-only function (returns str).
+        // - `BaseModel` is injected by the preprocessor for `model` classes.
+        // - `Ok`/`Err` may be used before the `from typhon_runtime import`
+        //   injection happens (the desugar pass adds it later).
+        seed_typhon_builtins(&mut c);
         for stmt in &m.body {
             check_stmt(&mut c, stmt);
         }
@@ -460,6 +475,51 @@ pub fn check_module(
     }
 
     c.diagnostics
+}
+
+/// Declare Typhon-specific built-in names that are not present in the
+/// user's source but are introduced by preprocessing or the runtime.
+fn seed_typhon_builtins(c: &mut Checker) {
+    // `env` — comptime function that reads an environment variable.
+    let env_fn = Type::Function {
+        params: vec![Type::Str, Type::Str],
+        ret: Box::new(Type::Str),
+    };
+    c.env.declare(TypeBinding {
+        name: "env".into(),
+        declared: env_fn.clone(),
+        narrowed: env_fn,
+        span: (0, 0),
+    });
+    // `BaseModel` — Pydantic base class injected by the `model` preprocessor.
+    c.env.declare(TypeBinding {
+        name: "BaseModel".into(),
+        declared: Type::Class("BaseModel".into()),
+        narrowed: Type::Class("BaseModel".into()),
+        span: (0, 0),
+    });
+    // `Ok` and `Err` — Result constructors from typhon_runtime.  Seeded here
+    // so the type checker can resolve them when `from typhon_runtime import …`
+    // hasn't been injected yet (it is injected at desugar time, not check time).
+    c.env.declare(TypeBinding {
+        name: "Ok".into(),
+        declared: Type::Class("Ok".into()),
+        narrowed: Type::Class("Ok".into()),
+        span: (0, 0),
+    });
+    c.env.declare(TypeBinding {
+        name: "Err".into(),
+        declared: Type::Class("Err".into()),
+        narrowed: Type::Class("Err".into()),
+        span: (0, 0),
+    });
+    // `Result` — the sealed union type, also from typhon_runtime.
+    c.env.declare(TypeBinding {
+        name: "Result".into(),
+        declared: Type::Class("Result".into()),
+        narrowed: Type::Class("Result".into()),
+        span: (0, 0),
+    });
 }
 
 fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt<TextRange>]) {
