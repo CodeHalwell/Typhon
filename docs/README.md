@@ -22,4 +22,4 @@ The sub-docs below are extracted from the long-term plan for easier navigation. 
 
 ## Status
 
-**Phases 0–2 are complete.** Phase 3 (Structural typing and advanced features) is in progress. See [roadmap.md](roadmap.md) for the full schedule and the project [README](../README.md) for build instructions.
+**Phases 0–3 are substantially complete.** See [roadmap.md](roadmap.md) for the full feature list and the project [README](../README.md) for build instructions.
