@@ -45,13 +45,24 @@ pub fn collect_ty_files(root: &Path) -> Result<Vec<PathBuf>> {
         return Err(miette!("path does not exist: {}", root.display()));
     }
     let mut acc = Vec::new();
-    collect_into(root, &mut acc)?;
+    collect_with_ext(root, "ty", &mut acc)?;
     Ok(acc)
 }
 
-fn collect_into(root: &Path, acc: &mut Vec<PathBuf>) -> Result<()> {
+/// Recursively collect all `.dty` stub files under `root` in sorted order.
+/// Same contract as [`collect_ty_files`] but matches the `.dty` extension.
+pub fn collect_dty_files(root: &Path) -> Result<Vec<PathBuf>> {
+    if !root.exists() {
+        return Ok(Vec::new()); // optional — no stubs is fine
+    }
+    let mut acc = Vec::new();
+    collect_with_ext(root, "dty", &mut acc)?;
+    Ok(acc)
+}
+
+fn collect_with_ext(root: &Path, ext: &str, acc: &mut Vec<PathBuf>) -> Result<()> {
     if root.is_file() {
-        if root.extension().map(|e| e == "ty").unwrap_or(false) {
+        if root.extension().map(|e| e == ext).unwrap_or(false) {
             acc.push(root.to_path_buf());
         }
         return Ok(());
@@ -65,7 +76,7 @@ fn collect_into(root: &Path, acc: &mut Vec<PathBuf>) -> Result<()> {
             .map_err(|e| miette!("cannot read directory entry in {}: {}", root.display(), e))?;
         paths.sort();
         for path in paths {
-            collect_into(&path, acc)?;
+            collect_with_ext(&path, ext, acc)?;
         }
     }
     Ok(())

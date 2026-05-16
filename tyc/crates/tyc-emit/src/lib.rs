@@ -6,8 +6,10 @@
 //! vendored `ruff_python_codegen` + `ruff_python_formatter` pipeline.
 
 mod printer;
+mod stub;
 
 pub use printer::Emitter;
+pub use stub::emit_stub;
 
 use rustpython_ast::Mod;
 

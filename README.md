@@ -88,11 +88,18 @@ See [docs/cli.md](docs/cli.md) for the full reference.
 - ✅ `impl` blocks merged into class definitions at desugar
 - ✅ `tower-lsp-server` LSP backend: `tyc lsp` publishes diagnostics on `did_open` / `did_change` and serves a hover placeholder. Richer hover content lands with the resolver/type-checker position queries in Phase 3.
 
-**Phase 3 — Structural typing and advanced features** in progress:
+**Phase 3 — Structural typing and advanced features** substantially complete:
 
-- ✅ Pipe operator `a |> f |> g(arg)` desugars to `g(f(a), arg)`
-- ✅ Match-case guards (`case x if cond:`) — passes through to Python directly
-- ☐ Generics, interfaces, `unsafe` blocks, lazy imports, gather/go, `.dty` stubs, extension methods
+- ✅ Generics syntax locked to PEP 695 (`def f[T](x: T)`, `type Vec[T] = list[T]`). Type params resolve in scope; the type checker treats them as `Any` until a real bidirectional inference engine lands.
+- ✅ `interface Name:` lowers to `class Name(Protocol):` with a structural conformance check on assignment. `isinstance(x, Interface)` is rejected by default.
+- ✅ `unsafe:` lexical region keyword (lowers to `if True:` wrapper for now; checker-side boundary enforcement reserved for a follow-up).
+- ✅ `@pure`/`@memo`/`@pure(memo=True)` decorators trigger the six-condition purity check; memoised functions get `@functools.cache` injected at desugar time. Project-wide opt-in via `[strictness] auto-memoise`.
+- ✅ `gather:` lowers to `asyncio.TaskGroup` by default; `gather(strategy="best-effort"):` to `asyncio.gather(..., return_exceptions=True)`.
+- ✅ `go f(x)` lowers through `typhon_runtime.tasks.spawn` with a strong-ref task registry.
+- ✅ `lazy import np = numpy` lowers to a deferred-loader proxy; `lazy from … import …` is rejected. `lazy val NAME = expr` uses the materialise-on-first-access proxy.
+- ✅ Pipe operator `a |> f |> g(arg)` desugars to `g(f(a), arg)`.
+- ✅ `extend ClassName:` (alias for `impl` on user-defined classes; built-in extensions deferred).
+- ✅ `.dty` stub files compile to PEP 561 `.pyi`; `tyc check --stubs` validates them. The full `stubtest` runtime diff against the implementation module is a future enhancement.
 
 See [docs/roadmap.md](docs/roadmap.md) for the phased plan through Phase 3 (month twelve) and beyond.
 

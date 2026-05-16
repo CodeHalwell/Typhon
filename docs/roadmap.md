@@ -29,20 +29,54 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 - ✅ Comptime constants with `env()` lookup. Build fails on missing required env.
 - ✅ `tower-lsp-server` backend: `tyc lsp` runs on stdio, publishes diagnostics via the check pipeline on `did_open` / `did_change`, and serves a placeholder hover response. The richer hover (symbol type, doc string, definition link) lands once the resolver exposes a `(file, position)` query.
 
-## Phase 3 — Structural typing and advanced features (months 9–12)
+## Phase 3 — Structural typing and advanced features ✅ complete (subset)
 
-- **Generics syntax decision locked** (angle brackets vs PEP 695). See *Open questions* in [long-term-plan.md](long-term-plan.md). Implementation follows the decision.
-- Generics: bidirectional inference, type erasure at emit.
-- Interface declarations and structural subtyping with memoised relation cache. `is`/`isinstance` against an interface is rejected unless explicitly opted into — `@runtime_checkable` only validates attribute presence, not signatures.
-- `unsafe` block semantics: lexical regions with an `Unsafe[T]` boundary marker the checker enforces at every region boundary.
-- Pure-function detection bound to the six-condition rule (sync, hashable args, no I/O, no entropy/clocks, no mutable module state, no exceptions). `@functools.cache` / `lru_cache` emission **only** under explicit opt-in (`@memo`, `@pure(memo=True)`, or `[strictness] auto-memoise = true`).
-- `gather` block lowered to `asyncio.TaskGroup` by default (cancels siblings on first failure). `gather(strategy="best-effort"):` for `asyncio.gather(..., return_exceptions=True)`.
-- `go` lowered through `typhon_runtime.tasks.spawn` with a strong-ref registry — never to a bare `asyncio.create_task`.
-- Lazy imports — `lazy import np = numpy` only; `lazy from x import a, b` is rejected because it defeats deferral. Module-level `lazy val` uses a sentinel + lock helper, instance-level uses `cached_property`.
-- ✅ Pipe operator `a |> f |> g(arg)` lowered to `g(f(a), arg)` left-associatively in the preprocessor. Guards in `match` cases pass through to Python directly (no extra desugaring needed). Extension methods still pending.
-- `.dty` stub files **and** `.pyi` interop emission; `tyc check --stubs` ports mypy's `stubtest` for drift detection. `unsafe` blocks for untyped library interop.
+- ✅ **Generics syntax decision locked** (PEP 695). The parser accepts
+  `def f[T](x: T)` and `type Vector[T] = ...` directly via `rustpython-parser`;
+  the resolver declares type params into the function/class scope and the
+  emitter round-trips the `[T]` syntax. Type inference treats `T` as `Any`
+  until a proper bidirectional inference engine lands.
+- ✅ **Interface declarations** (`interface Name:` → `class Name(Protocol):`)
+  with structural conformance check on assignment: a class is assignable to
+  an interface only when its member shape covers every required member.
+  `isinstance(x, Interface)` is rejected unless the interface opts in via
+  `@runtime_checkable`. Recursion / signature-compatibility refinement is
+  deferred to Phase 4+.
+- ✅ **`unsafe`** block keyword — lowers to `if True:` so scoping survives
+  the Python round-trip. The boundary marker on the checker side is reserved
+  (`Checker::unsafe_depth`) but not yet enforced.
+- ✅ **Pure-function detection** with the six-condition rule (sync, no `raise`,
+  no `try`, no I/O builtins, no entropy/clocks, no writes to module-level
+  `var` state). `@pure`, `@memo`, and `@pure(memo=True)` decorators trigger
+  the check; violations are hard errors. Memoised functions get
+  `@functools.cache` injected at desugar time; `@pure`/`@memo` markers are
+  stripped because they are not real Python names.
+  `[strictness] auto-memoise = true` opts every passable function in.
+- ✅ **`gather`** block lowers to `asyncio.TaskGroup` by default (cancels
+  siblings on first failure). `gather(strategy="best-effort"):` lowers to
+  `asyncio.gather(..., return_exceptions=True)`. `import asyncio` is
+  injected by the desugar pass when the lowered code references it.
+- ✅ **`go`** lowered through `typhon_runtime.tasks.spawn(...)` with a
+  strong-ref task registry (never a bare `asyncio.create_task`).
+  `go f(x) -> fut` binds the task handle.
+- ✅ **Lazy imports** — `lazy import np = numpy` lowers to a runtime helper
+  that defers loading via `importlib.util.LazyLoader`. `lazy from x import …`
+  is rejected. `lazy val NAME: T = expr` lowers to a `lazy_val(lambda: expr)`
+  proxy that materialises on first attribute access. The instance-level
+  `cached_property` form is deferred (use Python's stdlib decorator directly).
+- ✅ **Pipe operator** `a |> f |> g(arg)` lowered to `g(f(a), arg)` left-
+  associatively. Guards in `match` cases pass through to Python directly.
+- ✅ **`extend`** keyword for adding methods to user-defined classes — an
+  alias for `impl` in v1; extension on built-in types is deferred until a
+  type-aware call-site rewriter lands.
+- ✅ **`.dty` stub files** with `.pyi` interop emission — every `.dty` next to
+  the project is compiled to a PEP 561 `.pyi` (function/method bodies become
+  `...`, plain `Assign` is dropped, annotated fields are kept). `tyc check
+  --stubs` validates that every `.dty` parses, resolves, and type-checks;
+  the full mypy-`stubtest` runtime diff is deferred.
 
-At the end of Phase 3 — roughly month twelve — Typhon is useful for a real backend or CLI project. Everything beyond is polish and ambition.
+At the end of Phase 3, Typhon is useful for a real backend or CLI project.
+Everything beyond is polish and ambition.
 
 ## Phase 4+ — Beyond v1
 

@@ -16,14 +16,14 @@ use tyc_analyse::{analyse_purity, evaluate_comptime, purity_diagnostics, Comptim
 use tyc_db::{check_file, TycDatabase};
 use tyc_desugar::{desugar_module_with, DesugarOptions};
 use tyc_diagnostics::Diagnostics;
-use tyc_emit::emit;
+use tyc_emit::{emit, emit_stub};
 use tyc_format::format_source;
 use tyc_syntax::preprocess::{
     expand_gather_blocks, expand_go_calls, expand_pipes, expand_question_ops, expand_with_chains,
     preprocess,
 };
 
-use crate::commands::util::{apply_strictness, collect_ty_files};
+use crate::commands::util::{apply_strictness, collect_dty_files, collect_ty_files};
 use crate::config::TyphonConfig;
 
 /// Arguments for `tyc build`.
@@ -244,6 +244,47 @@ pub fn run(args: BuildArgs) -> Result<()> {
             .map_err(|e| miette!("cannot write '{}': {e}", out_file.display()))?;
 
         emitted += 1;
+    }
+
+    // Phase 3 stub emission: every `.dty` next to the project is compiled to a
+    // PEP-561 `.pyi` so mypy / pyright / Pyrefly / ty can consume Typhon
+    // authored libraries without an interop tax.  The `.dty` itself stays as
+    // the authoritative document.
+    let dty_files = collect_dty_files(&src_dir)?;
+    let mut stubs_emitted = 0usize;
+    for path in dty_files {
+        let source = std::fs::read_to_string(&path)
+            .map_err(|e| miette!("cannot read '{}': {e}", path.display()))?;
+        // .dty files use the same syntax as .ty but typically contain only
+        // declarations.  Run the preprocessor so `val`/`var`/`model` stripping
+        // works, then desugar to plain Python so the printer can emit it.
+        let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
+            &expand_gather_blocks(&source),
+        ))));
+        let prep = preprocess(&expanded);
+        let module = parse(
+            &prep.python_source,
+            Mode::Module,
+            &path.display().to_string(),
+        )
+        .map_err(|e| miette!("parse error in '{}': {e}", path.display()))?;
+        let desugar = desugar_module_with(&module, DesugarOptions::default());
+        let stub_text = emit_stub(&desugar.module);
+
+        let rel = path
+            .strip_prefix(&src_dir)
+            .map_err(|_| miette!("'{}' is outside the source directory", path.display()))?;
+        let out_file = out_dir.join(rel).with_extension("pyi");
+        if let Some(parent) = out_file.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| miette!("cannot create '{}': {e}", parent.display()))?;
+        }
+        std::fs::write(&out_file, &stub_text)
+            .map_err(|e| miette!("cannot write '{}': {e}", out_file.display()))?;
+        stubs_emitted += 1;
+    }
+    if stubs_emitted > 0 {
+        println!("emitted {} stub(s) (.pyi)", stubs_emitted);
     }
 
     // Emit the typhon_runtime helper alongside the Python output when any
