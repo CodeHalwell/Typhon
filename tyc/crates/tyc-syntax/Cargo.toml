@@ -9,3 +9,10 @@ description = "Typhon lexer and parser — extends rustpython-parser with Typhon
 rustpython-parser = { workspace = true }
 rustpython-ast = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "parse_preprocess"
+harness = false

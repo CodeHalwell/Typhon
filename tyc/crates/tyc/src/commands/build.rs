@@ -624,4 +624,212 @@ mod tests {
             "typhon_runtime/lazy.py should be emitted alongside the package"
         );
     }
+
+    // ── Advanced-feature acceptance fixtures ──────────────────────────────────
+
+    #[test]
+    fn build_gather_block_lowers_to_asyncio_task_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = "\
+async def fetch_user(id: int) -> str:
+    return \"alice\"
+
+async def fetch_posts(id: int) -> int:
+    return 42
+
+async def load(id: int) -> None:
+    gather:
+        user = fetch_user(id)
+        posts = fetch_posts(id)
+";
+        let (_, out_dir) = scaffold(tmp.path(), src);
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        })
+        .unwrap();
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        assert!(
+            py.contains("TaskGroup"),
+            "gather: should lower to asyncio.TaskGroup; got:\n{py}"
+        );
+        assert!(
+            py.contains("create_task"),
+            "gather: should emit create_task calls; got:\n{py}"
+        );
+    }
+
+    #[test]
+    fn build_pipe_operator_desugars_to_nested_calls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = "\
+def double(x: int) -> int:
+    return x * 2
+
+def inc(x: int) -> int:
+    return x + 1
+
+val result: int = 3 |> double |> inc
+";
+        let (_, out_dir) = scaffold(tmp.path(), src);
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        })
+        .unwrap();
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        // After desugaring `3 |> double |> inc` → `inc(double(3))` the pipe
+        // operator itself must not appear in the emitted Python.
+        assert!(
+            !py.contains("|>"),
+            "pipe operator must be desugared away; got:\n{py}"
+        );
+        assert!(
+            py.contains("double") && py.contains("inc"),
+            "desugared function names must appear in output; got:\n{py}"
+        );
+    }
+
+    #[test]
+    fn build_lazy_import_expands_to_proxy() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Use `np` after the lazy import so the unused-import check passes.
+        let src = "lazy import np = numpy\nval arr: object = np.array([1, 2, 3])\n";
+        let (_, out_dir) = scaffold(tmp.path(), src);
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        })
+        .unwrap();
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        // The lazy import must be expanded to a proxy; the raw `lazy import`
+        // syntax must not appear in the emitted Python.
+        assert!(
+            !py.contains("lazy import"),
+            "lazy import must be expanded; got:\n{py}"
+        );
+        assert!(
+            py.contains("numpy"),
+            "module name must appear in emitted proxy; got:\n{py}"
+        );
+    }
+
+    #[test]
+    fn build_sealed_union_exhaustive_match_passes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = "\
+class Circle:
+    radius: float
+
+class Square:
+    side: float
+
+type Shape = Circle | Square
+
+def area(s: Shape) -> float:
+    match s:
+        case Circle(radius=r):
+            return 3.14 * r * r
+        case Square(side=side):
+            return side * side
+";
+        let (_, out_dir) = scaffold(tmp.path(), src);
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        })
+        .unwrap();
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        assert!(
+            py.contains("match"),
+            "match statement should appear in emitted Python; got:\n{py}"
+        );
+    }
+
+    #[test]
+    fn build_sealed_union_non_exhaustive_match_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = "\
+class Circle:
+    radius: float
+
+class Square:
+    side: float
+
+type Shape = Circle | Square
+
+def area(s: Shape) -> float:
+    match s:
+        case Circle(radius=r):
+            return 3.14 * r * r
+";
+        scaffold(tmp.path(), src);
+        let result = run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        });
+        assert!(
+            result.is_err(),
+            "non-exhaustive match on sealed union should fail the build"
+        );
+    }
+
+    #[test]
+    fn build_pure_memo_function_emits_functools_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = "\
+@memo
+def fib(n: int) -> int:
+    if n <= 1:
+        return n
+    return fib(n - 1) + fib(n - 2)
+";
+        let (_, out_dir) = scaffold(tmp.path(), src);
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        })
+        .unwrap();
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        assert!(
+            py.contains("functools"),
+            "@memo should inject functools.cache; got:\n{py}"
+        );
+        assert!(
+            py.contains("cache"),
+            "@memo should inject @functools.cache decorator; got:\n{py}"
+        );
+    }
+
+    #[test]
+    fn build_interface_conformance_error_on_missing_member() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `Dog` does not implement `speak`, so assigning it to `Animal` must
+        // fail the structural conformance check.
+        let src = "\
+interface Animal:
+    def speak(self) -> str: ...
+
+class Dog:
+    name: str
+
+val pet: Animal = Dog(name=\"Rex\")
+";
+        scaffold(tmp.path(), src);
+        let result = run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        });
+        assert!(
+            result.is_err(),
+            "assigning a non-conforming type to an interface variable should fail"
+        );
+    }
 }
