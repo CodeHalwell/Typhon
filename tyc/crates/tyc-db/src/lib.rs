@@ -12,6 +12,7 @@
 
 use rustpython_parser::{parse, Mode};
 use tyc_diagnostics::{Diagnostics, TycError};
+use tyc_emit::emit;
 use tyc_resolve::resolve_module;
 use tyc_syntax::preprocess::preprocess;
 use tyc_types::check_module;
@@ -120,6 +121,50 @@ pub fn check_file(db: &mut TycDatabase, path: String, text: String) -> Diagnosti
     diags
 }
 
+/// End-to-end build pipeline for a single file.
+///
+/// Runs preprocess → parse → resolve → type-check → emit. Returns the
+/// collected diagnostics and, if there were no errors, the emitted Python
+/// source string. Returns `None` for the source on any parse, resolve, or
+/// type-check error so callers never write partial output.
+pub fn build_file(
+    db: &mut TycDatabase,
+    path: String,
+    text: String,
+) -> (Diagnostics, Option<String>) {
+    let _ = SourceFile::new(db, path.clone(), text.clone());
+    let mut diags = Diagnostics::new();
+
+    let prep = preprocess(&text);
+
+    let module = match parse(&prep.python_source, Mode::Module, &path) {
+        Ok(m) => m,
+        Err(e) => {
+            diags.push_error(TycError::parse(
+                path,
+                prep.python_source,
+                e.to_string(),
+                usize::from(e.offset),
+            ));
+            return (diags, None);
+        }
+    };
+
+    let (resolved, resolve_diags) =
+        resolve_module(path.clone(), &prep.python_source, &prep.stripped, &module);
+    diags.extend(resolve_diags);
+
+    let type_diags = check_module(path, &prep.python_source, &resolved, &module);
+    diags.extend(type_diags);
+
+    if diags.has_errors() {
+        return (diags, None);
+    }
+
+    let python_src = emit(&module);
+    (diags, Some(python_src))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +240,40 @@ def main() -> None:
             "val x: int = 1\nx = 2\n".to_owned(),
         );
         assert!(diags.has_errors());
+    }
+
+    #[test]
+    fn build_file_emits_python_for_valid_source() {
+        let mut db = TycDatabase::new();
+        let src = "val greeting: str = \"Hello from Typhon!\"\n\ndef main() -> None:\n    print(greeting)\n";
+        let (diags, emitted) = build_file(&mut db, "<test>".to_owned(), src.to_owned());
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        let py = emitted.expect("build_file should emit Python for a valid source file");
+        assert!(py.contains("greeting"), "emitted Python should contain the binding name");
+        assert!(py.contains("def main"), "emitted Python should contain the function definition");
+    }
+
+    #[test]
+    fn build_file_returns_none_on_type_error() {
+        let mut db = TycDatabase::new();
+        let (diags, emitted) = build_file(
+            &mut db,
+            "<test>".to_owned(),
+            "val x: int = \"wrong type\"\n".to_owned(),
+        );
+        assert!(diags.has_errors());
+        assert!(emitted.is_none(), "build_file must not emit Python when there are errors");
+    }
+
+    #[test]
+    fn build_file_returns_none_on_parse_error() {
+        let mut db = TycDatabase::new();
+        let (diags, emitted) = build_file(
+            &mut db,
+            "<test>".to_owned(),
+            "def (broken:\n".to_owned(),
+        );
+        assert!(diags.has_errors());
+        assert!(emitted.is_none());
     }
 }

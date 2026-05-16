@@ -12,3 +12,4 @@ tyc-resolve = { workspace = true }
 tyc-types = { workspace = true }
 rustpython-parser = { workspace = true }
 rustpython-ast = { workspace = true }
+tyc-emit = { workspace = true }

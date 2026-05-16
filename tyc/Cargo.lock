@@ -1177,6 +1177,7 @@ dependencies = [
  "rustpython-parser",
  "salsa",
  "tyc-diagnostics",
+ "tyc-emit",
  "tyc-resolve",
  "tyc-syntax",
  "tyc-types",
