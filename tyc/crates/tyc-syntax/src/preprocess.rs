@@ -1998,13 +1998,19 @@ fn render_gather_block(
                 out.push_str(", ");
             }
             out.push_str("return_exceptions=True)\n");
-            // Tuple-unpack the results into the user-named bindings.
+            // Tuple-unpack the results into the user-named bindings. With a
+            // single binding we still need a trailing comma so Python performs
+            // sequence unpacking (`x, = results`) rather than binding the
+            // whole list to one name (`x = results`).
             out.push_str(header_indent);
             for (idx, b) in bindings.iter().enumerate() {
                 if idx > 0 {
                     out.push_str(", ");
                 }
                 out.push_str(&b.name);
+            }
+            if bindings.len() == 1 {
+                out.push(',');
             }
             out.push_str(" = ");
             out.push_str(&results);

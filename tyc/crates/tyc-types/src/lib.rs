@@ -383,9 +383,10 @@ struct Checker<'a> {
     /// Populated from `type Foo = A | B | C` statements in the first pass.
     sealed_unions: HashMap<String, Vec<String>>,
     /// Interfaces (Typhon `interface Name:` → `class Name(Protocol):`).
-    /// Maps the interface name to its required member names.  In v1 we check
-    /// member presence only; full signature compatibility is deferred.
-    interfaces: HashMap<String, InterfaceShape>,
+    /// Maps the interface name to its required member shape and whether it
+    /// opted in to runtime checking via `@runtime_checkable`. In v1 we
+    /// check member presence only; full signature compatibility is deferred.
+    interfaces: HashMap<String, InterfaceDecl>,
     /// All classes declared in the module along with their declared member
     /// names.  Used for structural conformance against an interface.
     class_shapes: HashMap<String, InterfaceShape>,
@@ -401,6 +402,17 @@ struct Checker<'a> {
     /// field — Phase 3+ will wire it.
     #[allow(dead_code)]
     unsafe_depth: u32,
+}
+
+/// Declared interface (`interface Name:` → `class Name(Protocol):`). Bundles
+/// the required member shape with the `@runtime_checkable` opt-in.
+#[derive(Debug, Clone, Default)]
+struct InterfaceDecl {
+    shape: InterfaceShape,
+    /// `true` when the interface is decorated `@runtime_checkable`; in that
+    /// case `isinstance(x, Iface)` is allowed (the user has acknowledged it
+    /// only validates attribute presence).
+    runtime_checkable: bool,
 }
 
 /// Member shape recorded for an interface or class — methods are recorded as
@@ -492,13 +504,13 @@ impl<'a> Checker<'a> {
         let Some(cls) = self.class_shapes.get(cls_name) else {
             return false;
         };
-        for (m, expected_arity) in &iface.methods {
+        for (m, expected_arity) in &iface.shape.methods {
             match cls.methods.get(m) {
                 Some(actual_arity) if actual_arity == expected_arity => {}
                 _ => return false,
             }
         }
-        for f in iface.fields.keys() {
+        for f in iface.shape.fields.keys() {
             if !cls.fields.contains_key(f) && !cls.methods.contains_key(f) {
                 return false;
             }
@@ -516,7 +528,7 @@ impl<'a> Checker<'a> {
         };
         let cls = self.class_shapes.get(cls_name);
         let mut missing = Vec::new();
-        for (m, expected_arity) in &iface.methods {
+        for (m, expected_arity) in &iface.shape.methods {
             match cls.and_then(|c| c.methods.get(m)) {
                 Some(actual_arity) if actual_arity == expected_arity => {}
                 Some(actual_arity) => missing.push(format!(
@@ -525,7 +537,7 @@ impl<'a> Checker<'a> {
                 None => missing.push(m.clone()),
             }
         }
-        for f in iface.fields.keys() {
+        for f in iface.shape.fields.keys() {
             let has_field = cls.is_some_and(|c| c.fields.contains_key(f));
             let has_method = cls.is_some_and(|c| c.methods.contains_key(f));
             if !has_field && !has_method {
@@ -535,7 +547,7 @@ impl<'a> Checker<'a> {
         missing.sort();
         if missing.is_empty() {
             // Fallback — list every required member for context.
-            iface.member_names().join(", ")
+            iface.shape.member_names().join(", ")
         } else {
             missing.join(", ")
         }
@@ -713,21 +725,15 @@ fn seed_typhon_builtins(c: &mut Checker) {
 }
 
 fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt<TextRange>]) {
-    // First pass: collect class names and sealed union declarations so that
-    // type_from_annotation can resolve them and match exhaustiveness can be
-    // checked.
+    // First pass: collect every class and type-alias *name* into `c.classes`
+    // so the subsequent shape and signature passes can resolve nominal
+    // references like `field: OtherClass`. Doing the shape collection in
+    // the same pass would see an empty class list and treat every nominal
+    // type as `Unknown`.
     for stmt in body {
         match stmt {
             Stmt::ClassDef(cd) => {
-                let name = cd.name.as_str().to_owned();
-                c.classes.push(name.clone());
-                // Record each class's member shape (methods + annotated fields)
-                // so we can do structural conformance against interfaces.
-                let shape = collect_class_shape(cd);
-                if class_inherits_protocol(cd) {
-                    c.interfaces.insert(name.clone(), shape.clone());
-                }
-                c.class_shapes.insert(name, shape);
+                c.classes.push(cd.name.as_str().to_owned());
             }
             Stmt::TypeAlias(ta) => {
                 if let Expr::Name(n) = ta.name.as_ref() {
@@ -741,8 +747,28 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt<TextRange>]) {
             _ => {}
         }
     }
-    // Now record function signatures.
     let classes = c.classes.clone();
+    // Second pass: now that every class name is known, collect each class's
+    // member shape so interface conformance can resolve nominal types in
+    // field annotations.
+    for stmt in body {
+        if let Stmt::ClassDef(cd) = stmt {
+            let name = cd.name.as_str().to_owned();
+            let shape = collect_class_shape(cd, &classes);
+            if class_inherits_protocol(cd) {
+                let runtime_checkable = has_runtime_checkable_decorator(&cd.decorator_list);
+                c.interfaces.insert(
+                    name.clone(),
+                    InterfaceDecl {
+                        shape: shape.clone(),
+                        runtime_checkable,
+                    },
+                );
+            }
+            c.class_shapes.insert(name, shape);
+        }
+    }
+    // Third pass: record function signatures (also needs the full class list).
     for stmt in body {
         match stmt {
             Stmt::FunctionDef(f) => {
@@ -769,12 +795,32 @@ fn class_inherits_protocol(c: &rustpython_ast::StmtClassDef<TextRange>) -> bool 
         .any(|b| matches!(b, Expr::Name(n) if n.id.as_str() == "Protocol"))
 }
 
+/// `true` if `decorators` includes `@runtime_checkable` (bare or
+/// `typing.runtime_checkable`). When set, `isinstance(x, Interface)` is
+/// permitted — the protocol opted in to the attribute-presence check.
+fn has_runtime_checkable_decorator(decorators: &[Expr<TextRange>]) -> bool {
+    decorators.iter().any(|d| {
+        let name = match d {
+            Expr::Name(n) => Some(n.id.as_str()),
+            Expr::Attribute(a) => Some(a.attr.as_str()),
+            _ => None,
+        };
+        name == Some("runtime_checkable")
+    })
+}
+
 /// Walk a class body and record its methods and annotated fields into an
 /// [`InterfaceShape`]. The receiver parameter (first positional, conventionally
 /// `self` or `cls`) is excluded from the arity count.
-fn collect_class_shape(cd: &rustpython_ast::StmtClassDef<TextRange>) -> InterfaceShape {
+///
+/// `classes` is the module-level class list, threaded through so nominal
+/// references in field annotations (`field: OtherClass`) resolve correctly
+/// rather than landing as `Type::Unknown`.
+fn collect_class_shape(
+    cd: &rustpython_ast::StmtClassDef<TextRange>,
+    classes: &[String],
+) -> InterfaceShape {
     let mut shape = InterfaceShape::default();
-    let classes: Vec<String> = Vec::new();
     for stmt in &cd.body {
         match stmt {
             Stmt::FunctionDef(f) => {
@@ -787,7 +833,7 @@ fn collect_class_shape(cd: &rustpython_ast::StmtClassDef<TextRange>) -> Interfac
             }
             Stmt::AnnAssign(a) => {
                 if let Expr::Name(n) = a.target.as_ref() {
-                    let ty = type_from_annotation(&a.annotation, &classes);
+                    let ty = type_from_annotation(&a.annotation, classes);
                     shape.fields.insert(n.id.as_str().to_owned(), ty);
                 }
             }
@@ -1308,15 +1354,19 @@ fn infer_expr(c: &mut Checker, expr: &Expr<TextRange>) -> Type {
                 // isinstance(x, Interface) is rejected unless the interface
                 // explicitly opts in via @runtime_checkable. Runtime Protocol
                 // isinstance only checks attribute *presence*, not signature,
-                // so we reject the static use by default.
+                // so we reject the static use by default. Interfaces decorated
+                // `@runtime_checkable` are exempt — the user acknowledged the
+                // weaker guarantee.
                 if fn_name.id.as_str() == "isinstance" && call.args.len() == 2 {
                     if let Expr::Name(t) = &call.args[1] {
-                        if c.interfaces.contains_key(t.id.as_str()) {
-                            let span = (
-                                t.range.start().to_usize(),
-                                t.range.start().to_usize() + t.id.as_str().len(),
-                            );
-                            c.interface_isinstance(t.id.as_str(), span);
+                        if let Some(iface) = c.interfaces.get(t.id.as_str()) {
+                            if !iface.runtime_checkable {
+                                let span = (
+                                    t.range.start().to_usize(),
+                                    t.range.start().to_usize() + t.id.as_str().len(),
+                                );
+                                c.interface_isinstance(t.id.as_str(), span);
+                            }
                         }
                     }
                 }
@@ -2160,6 +2210,32 @@ val ok: bool = isinstance(c, Circle)
 ";
         let d = check(src);
         assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn isinstance_against_runtime_checkable_interface_allowed() {
+        // @runtime_checkable opts in to attribute-presence isinstance — the
+        // user accepts the weaker guarantee. The checker should NOT reject
+        // this form.
+        let src = "\
+@runtime_checkable
+interface Drawable:
+    def draw(self) -> None:
+        ...
+
+class Circle:
+    def draw(self) -> None:
+        pass
+
+val c = Circle()
+val ok: bool = isinstance(c, Drawable)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "@runtime_checkable interface must permit isinstance: {:?}",
+            d.errors()
+        );
     }
 
     // ── PEP 695 type parameters (Phase 3) ────────────────────────────────────

@@ -517,15 +517,20 @@ pub struct PurityFinding {
 pub fn analyse_purity(module: &Mod<TextRange>, auto_memoise: bool) -> Vec<PurityFinding> {
     let mut out = Vec::new();
     if let Mod::Module(m) = module {
-        // Pre-collect module-level binding names that are NOT `val` (i.e. they
-        // are reassignable). Pure functions are not allowed to mutate them.
-        // The preprocess pass has already stripped `val`/`var`, so by the time
-        // the AST lands here we conservatively treat every module-level name
-        // assigned via `Assign` (not `AnnAssign`) as potentially mutable.
-        let module_mutable_names = collect_module_mutable_names(&m.body);
+        // Phase 1: collect a module-scope view that purity decisions depend
+        // on. We need three things:
+        //   - The set of module-level names introduced by *any* assignment
+        //     (including `AnnAssign`). Pure functions are forbidden from
+        //     mutating these through attribute or subscript writes.
+        //   - The set of class names declared at module level — they double
+        //     as legitimate constructors and so are pure-callable.
+        //   - The set of user-defined functions declared at module level,
+        //     keyed by name, along with whether each is itself declared pure
+        //     (so we can enforce transitive purity through call graphs).
+        let module = ModuleScope::collect(&m.body, auto_memoise);
         analyse_stmts(
             &m.body,
-            &module_mutable_names,
+            &module,
             auto_memoise,
             &mut out,
             /*async_context=*/ false,
@@ -534,42 +539,96 @@ pub fn analyse_purity(module: &Mod<TextRange>, auto_memoise: bool) -> Vec<Purity
     out
 }
 
-fn collect_module_mutable_names(body: &[Stmt<TextRange>]) -> Vec<String> {
-    let mut out = Vec::new();
-    for stmt in body {
-        if let Stmt::Assign(a) = stmt {
-            for t in &a.targets {
-                if let Expr::Name(n) = t {
-                    out.push(n.id.as_str().to_owned());
+/// Snapshot of the module surface that purity decisions need to consult.
+#[derive(Debug, Default)]
+struct ModuleScope {
+    /// Names bound at module level by any assignment form. A pure function
+    /// is allowed to *read* these but not to mutate them via attribute or
+    /// subscript writes (`MODULE_LIST.append(x)` / `MODULE_DICT[k] = v`).
+    module_names: Vec<String>,
+    /// Class names declared at module level. Class names are treated as
+    /// pure callables (the default `@dataclass(slots=True)` emission has
+    /// no side effects).
+    class_names: Vec<String>,
+    /// User-defined function name → whether the function is itself declared
+    /// pure (`@pure` / `@memo` / `@pure(memo=True)` / auto-memoise). When
+    /// a `@pure` function calls another module-defined function, the callee
+    /// must also be in this map with `true` to satisfy transitive purity.
+    user_functions: HashMap<String, bool>,
+}
+
+impl ModuleScope {
+    fn collect(body: &[Stmt<TextRange>], auto_memoise: bool) -> Self {
+        let mut s = Self::default();
+        for stmt in body {
+            match stmt {
+                Stmt::Assign(a) => {
+                    for t in &a.targets {
+                        if let Expr::Name(n) = t {
+                            s.module_names.push(n.id.as_str().to_owned());
+                        }
+                    }
                 }
+                Stmt::AnnAssign(a) => {
+                    if let Expr::Name(n) = a.target.as_ref() {
+                        s.module_names.push(n.id.as_str().to_owned());
+                    }
+                }
+                Stmt::ClassDef(c) => {
+                    s.class_names.push(c.name.as_str().to_owned());
+                }
+                Stmt::FunctionDef(f) => {
+                    let (declared, _) = decorator_intent(&f.decorator_list, auto_memoise);
+                    s.user_functions
+                        .insert(f.name.as_str().to_owned(), declared);
+                }
+                Stmt::AsyncFunctionDef(f) => {
+                    let (declared, _) = decorator_intent(&f.decorator_list, auto_memoise);
+                    s.user_functions
+                        .insert(f.name.as_str().to_owned(), declared);
+                }
+                _ => {}
             }
         }
+        s
     }
-    out
 }
 
 fn analyse_stmts(
     body: &[Stmt<TextRange>],
-    module_mutable: &[String],
+    module: &ModuleScope,
     auto_memoise: bool,
     out: &mut Vec<PurityFinding>,
     _async_context: bool,
 ) {
+    // Only the OUTER call (the recursion entry from `analyse_purity`)
+    // visits top-level functions, which is the only scope the desugarer
+    // can rewrite by name. Recursing into function/class bodies would
+    // collect nested `@memo def f` findings that, if they shared a name
+    // with a top-level `def f`, would cause the desugarer to inject
+    // `@functools.cache` on the wrong function. Restrict the analyser to
+    // top-level scope until we thread span-based identifiers through to
+    // the desugarer.
     for stmt in body {
         match stmt {
             Stmt::FunctionDef(f) => {
                 let (declared, memo) = decorator_intent(&f.decorator_list, auto_memoise);
-                if declared {
+                // Run the purity check whenever the user opted in OR the
+                // project asked for automatic caching. Auto-memoise never
+                // produces an error (see `purity_diagnostics`); it just
+                // gates cache-decorator injection on the function silently
+                // passing.
+                if declared || memo {
                     let violation = check_purity(
                         f.name.as_str(),
                         &f.args,
                         &f.body,
                         /*is_async=*/ false,
-                        module_mutable,
+                        module,
                     );
                     out.push(PurityFinding {
                         name: f.name.as_str().to_owned(),
-                        declared_pure: true,
+                        declared_pure: declared,
                         memoise: memo,
                         violation,
                         span: (
@@ -578,21 +637,20 @@ fn analyse_stmts(
                         ),
                     });
                 }
-                analyse_stmts(&f.body, module_mutable, auto_memoise, out, false);
             }
             Stmt::AsyncFunctionDef(f) => {
                 let (declared, memo) = decorator_intent(&f.decorator_list, auto_memoise);
-                if declared {
+                if declared || memo {
                     let violation = check_purity(
                         f.name.as_str(),
                         &f.args,
                         &f.body,
                         /*is_async=*/ true,
-                        module_mutable,
+                        module,
                     );
                     out.push(PurityFinding {
                         name: f.name.as_str().to_owned(),
-                        declared_pure: true,
+                        declared_pure: declared,
                         memoise: memo,
                         violation,
                         span: (
@@ -601,10 +659,6 @@ fn analyse_stmts(
                         ),
                     });
                 }
-                analyse_stmts(&f.body, module_mutable, auto_memoise, out, true);
-            }
-            Stmt::ClassDef(c) => {
-                analyse_stmts(&c.body, module_mutable, auto_memoise, out, false);
             }
             _ => {}
         }
@@ -612,12 +666,17 @@ fn analyse_stmts(
 }
 
 /// Inspect a decorator list. Returns `(declared_pure, memoise)`:
-///   - `declared_pure` is `true` if any of `@pure`, `@pure(...)`, or `@memo`
-///     appears, or if `auto_memoise` is enabled.
+///   - `declared_pure` is `true` if `@pure`, `@pure(...)`, or `@memo` appears
+///     — i.e. the user explicitly opted in to having the analyser enforce
+///     purity. `auto_memoise` does **not** flip this flag; it only opts the
+///     project into automatic caching of already-passable functions, not
+///     into hard purity errors for ordinary impure code.
 ///   - `memoise` is `true` if the user asked for caching: `@memo`,
-///     `@pure(memo=True)`, or `auto_memoise`.
+///     `@pure(memo=True)`, or `auto_memoise`. The desugarer only injects
+///     `@functools.cache` when the function ALSO passes the purity check;
+///     `auto_memoise` is therefore a silent best-effort, never a hard error.
 fn decorator_intent(decorators: &[Expr<TextRange>], auto_memoise: bool) -> (bool, bool) {
-    let mut declared = auto_memoise;
+    let mut declared = false;
     let mut memoise = auto_memoise;
     for d in decorators {
         match d {
@@ -655,30 +714,81 @@ fn decorator_intent(decorators: &[Expr<TextRange>], auto_memoise: bool) -> (bool
 
 fn check_purity(
     name: &str,
-    _args: &rustpython_ast::Arguments<TextRange>,
+    args: &rustpython_ast::Arguments<TextRange>,
     body: &[Stmt<TextRange>],
     is_async: bool,
-    module_mutable: &[String],
+    module: &ModuleScope,
 ) -> Option<String> {
     let _ = name;
     // 1. Synchronous.
     if is_async {
         return Some("function is async — pure functions must be synchronous".into());
     }
+    // 2. Hashable parameter types — memoisation backs every cache hit with a
+    //    dict keyed on `args`. Reject obviously unhashable annotations so the
+    //    cache decorator the desugarer injects never crashes at runtime.
+    if let Some(reason) = unhashable_param_reason(args) {
+        return Some(reason);
+    }
+    // The remaining four conditions are checked by walking the body.
     let mut ctx = PurityCtx {
         violation: None,
-        module_mutable,
+        module,
     };
     walk_stmts_purity(body, &mut ctx);
     ctx.violation
 }
 
-struct PurityCtx<'a> {
-    violation: Option<String>,
-    module_mutable: &'a [String],
+/// If `args` declares a parameter whose annotation is a known-unhashable
+/// container type (`list`, `dict`, `set`, `bytearray`), return a reason
+/// string. Annotations the analyser doesn't understand are treated as
+/// hashable by default — we err on the side of accepting code rather than
+/// blocking valid use of opaque types.
+fn unhashable_param_reason(args: &rustpython_ast::Arguments<TextRange>) -> Option<String> {
+    let report = |name: &str, ty: &str| -> Option<String> {
+        Some(format!(
+            "parameter '{}' has unhashable type `{}` — pure functions need hashable args so memoised caches can key on them",
+            name, ty
+        ))
+    };
+    for arg in args
+        .posonlyargs
+        .iter()
+        .chain(args.args.iter())
+        .chain(args.kwonlyargs.iter())
+    {
+        if let Some(ann) = &arg.def.annotation {
+            if let Some(t) = annotation_unhashable_name(ann) {
+                return report(arg.def.arg.as_str(), &t);
+            }
+        }
+    }
+    None
 }
 
-impl<'a> PurityCtx<'a> {
+fn annotation_unhashable_name(ann: &Expr<TextRange>) -> Option<String> {
+    // Both `list` and `list[int]` are unhashable. Look at the head identifier.
+    let head = match ann {
+        Expr::Name(n) => n.id.as_str().to_owned(),
+        Expr::Subscript(s) => match s.value.as_ref() {
+            Expr::Name(n) => n.id.as_str().to_owned(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    matches!(
+        head.as_str(),
+        "list" | "List" | "dict" | "Dict" | "set" | "Set" | "bytearray"
+    )
+    .then_some(head)
+}
+
+struct PurityCtx<'a> {
+    violation: Option<String>,
+    module: &'a ModuleScope,
+}
+
+impl PurityCtx<'_> {
     fn fail(&mut self, reason: impl Into<String>) {
         if self.violation.is_none() {
             self.violation = Some(reason.into());
@@ -700,6 +810,10 @@ fn walk_stmt_purity(stmt: &Stmt<TextRange>, ctx: &mut PurityCtx) {
         Stmt::Raise(_) => {
             ctx.fail("pure functions must not raise — return Result[T, E] to express failure")
         }
+        // `global` would let a function alias a module name and write to it
+        // without going through an attribute. Forbid it outright. With `global`
+        // gone, every bare-name assignment inside a pure body is local by
+        // Python's own scoping rules — so we no longer flag those.
         Stmt::Global(_) => ctx.fail("pure functions must not declare `global`"),
         Stmt::Nonlocal(_) => ctx.fail("pure functions must not declare `nonlocal`"),
         Stmt::Try(t) => {
@@ -711,32 +825,26 @@ fn walk_stmt_purity(stmt: &Stmt<TextRange>, ctx: &mut PurityCtx) {
         }
         Stmt::Assign(a) => {
             for t in &a.targets {
-                if let Expr::Name(n) = t {
-                    if ctx.module_mutable.iter().any(|m| m == n.id.as_str()) {
-                        ctx.fail(format!(
-                            "pure functions must not write to module-level `var` state ('{}')",
-                            n.id.as_str()
-                        ));
-                    }
-                }
+                check_mutation_target(t, ctx);
             }
             walk_expr_purity(&a.value, ctx);
         }
         Stmt::AnnAssign(a) => {
+            check_mutation_target(&a.target, ctx);
             if let Some(v) = &a.value {
                 walk_expr_purity(v, ctx);
             }
         }
         Stmt::AugAssign(a) => {
-            if let Expr::Name(n) = a.target.as_ref() {
-                if ctx.module_mutable.iter().any(|m| m == n.id.as_str()) {
-                    ctx.fail(format!(
-                        "pure functions must not write to module-level `var` state ('{}')",
-                        n.id.as_str()
-                    ));
-                }
-            }
+            // `x += 1` on a bare local name is fine. `MODULE_LIST += [x]` or
+            // `obj.attr += 1` mutate referenced state — flag those.
+            check_mutation_target(&a.target, ctx);
             walk_expr_purity(&a.value, ctx);
+        }
+        Stmt::Delete(d) => {
+            for t in &d.targets {
+                check_mutation_target(t, ctx);
+            }
         }
         Stmt::Return(r) => {
             if let Some(v) = &r.value {
@@ -789,6 +897,17 @@ fn walk_expr_purity(expr: &Expr<TextRange>, ctx: &mut PurityCtx) {
                 ctx.fail(reason);
                 return;
             }
+            // Transitive purity: a `@pure` function that calls another
+            // module-defined function may only do so when the callee is
+            // itself declared pure. Builtin callables and module-level class
+            // constructors are allowed by the known-pure allow-list.
+            if let Expr::Name(n) = c.func.as_ref() {
+                let callee = n.id.as_str();
+                if let Some(reason) = check_callee_purity(callee, ctx.module) {
+                    ctx.fail(reason);
+                    return;
+                }
+            }
             walk_expr_purity(&c.func, ctx);
             for a in &c.args {
                 walk_expr_purity(a, ctx);
@@ -835,6 +954,117 @@ fn walk_expr_purity(expr: &Expr<TextRange>, ctx: &mut PurityCtx) {
         }
         _ => {}
     }
+}
+
+/// Check whether an assignment / aug-assign / delete target mutates state
+/// the pure function isn't allowed to touch. Bare-name targets are local
+/// variables (Python scoping makes them so once `global` is forbidden) and
+/// are fine; attribute and subscript targets whose root is a module-level
+/// binding are not.
+fn check_mutation_target(target: &Expr<TextRange>, ctx: &mut PurityCtx) {
+    match target {
+        Expr::Name(_) => {
+            // Local. `Stmt::Global` is already a hard error, so any bare name
+            // here is guaranteed to be a function-local binding by Python's
+            // own scoping rules.
+        }
+        Expr::Attribute(_) | Expr::Subscript(_) => {
+            if let Some(root) = mutation_root_name(target) {
+                if ctx.module.module_names.iter().any(|m| m == &root) {
+                    ctx.fail(format!(
+                        "pure functions must not mutate module-level state \
+                         (`{}.…` or `{}[…]` would write to a binding declared at module scope)",
+                        root, root
+                    ));
+                }
+            }
+        }
+        Expr::Tuple(t) => {
+            for elt in &t.elts {
+                check_mutation_target(elt, ctx);
+            }
+        }
+        Expr::List(l) => {
+            for elt in &l.elts {
+                check_mutation_target(elt, ctx);
+            }
+        }
+        Expr::Starred(s) => check_mutation_target(&s.value, ctx),
+        _ => {}
+    }
+}
+
+/// Follow an attribute / subscript chain back to its base `Name`. Returns
+/// `None` if the chain doesn't bottom out at a single identifier (e.g.
+/// `f().attr = 1` — the receiver is a call expression, not a module name).
+fn mutation_root_name(target: &Expr<TextRange>) -> Option<String> {
+    match target {
+        Expr::Name(n) => Some(n.id.as_str().to_owned()),
+        Expr::Attribute(a) => mutation_root_name(&a.value),
+        Expr::Subscript(s) => mutation_root_name(&s.value),
+        _ => None,
+    }
+}
+
+/// Decide whether a call to bare identifier `name` is permitted inside a
+/// pure function body. Returns `None` if the call is fine, or a reason
+/// string when it isn't.
+///
+/// Allowed callees:
+/// - Pure builtins (`len`, `abs`, `int`, …) and Typhon constructors
+///   (`Ok`, `Err`).
+/// - Module-level user functions marked `@pure` / `@memo`.
+/// - Module-level class names (their constructors run no side effects in
+///   the default dataclass emission).
+///
+/// Anything else — including impure user functions and unknown identifiers
+/// — is rejected so a `@pure` annotation can't paper over an impure callee.
+fn check_callee_purity(name: &str, module: &ModuleScope) -> Option<String> {
+    if is_pure_builtin(name) {
+        return None;
+    }
+    if module.class_names.iter().any(|c| c == name) {
+        return None;
+    }
+    match module.user_functions.get(name) {
+        Some(true) => None,
+        Some(false) => Some(format!(
+            "pure functions must not call impure helper `{name}` — \
+             mark `{name}` with `@pure` (or `@memo`) for transitive purity"
+        )),
+        None => {
+            // Unknown identifier: either an imported function (we can't know
+            // its purity without per-import metadata) or a name shadowed by a
+            // parameter / local binding. Be conservative — reject anything
+            // we can't prove pure rather than risk a false negative.
+            Some(format!(
+                "pure functions may only call pure-builtin helpers or other \
+                 `@pure` / `@memo` functions; `{name}` is neither"
+            ))
+        }
+    }
+}
+
+/// Conservative allow-list of CPython builtins whose contract is pure (no
+/// I/O, no clocks, no entropy, no mutation of arguments). Constructors of
+/// hashable / immutable types and basic transformations are included; any
+/// callable that materialises a mutable container (`list`, `dict`, `set`,
+/// `bytearray`) is intentionally excluded because constructing one inside a
+/// pure function leaks identity through the cache.
+fn is_pure_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        // Transformations / queries on immutable args.
+        "abs" | "all" | "any" | "ascii" | "bin" | "bool" | "callable"
+        | "chr" | "complex" | "divmod" | "enumerate" | "filter"
+        | "float" | "format" | "frozenset" | "hasattr" | "hash" | "hex"
+        | "id" | "int" | "isinstance" | "issubclass" | "iter" | "len"
+        | "map" | "max" | "min" | "next" | "oct" | "ord" | "pow"
+        | "range" | "repr" | "reversed" | "round" | "sorted" | "str"
+        | "sum" | "tuple" | "type" | "vars" | "zip" | "bytes" | "object"
+        // Typhon `Result` constructors emitted by the desugar pass.
+        | "Ok" | "Err" | "Result"
+    )
 }
 
 /// If `func` references a forbidden callable (I/O, entropy, clock), return a
@@ -895,12 +1125,18 @@ fn dotted_path(expr: &Expr<TextRange>) -> Option<String> {
     }
 }
 
-/// Render the `PurityFinding` list into diagnostics: every `@pure` function
-/// whose purity check failed becomes an error.  Returns the unmodified list
-/// so callers can also use it to drive cache-decorator emission.
+/// Render the `PurityFinding` list into diagnostics. Only explicit `@pure` /
+/// `@memo` opt-ins produce hard errors when they fail the purity check —
+/// auto-memoise findings stay silent (they only feed cache-decorator
+/// injection on the functions that happen to pass). Returns the diagnostics
+/// list; callers can still consult the findings vector unmodified to drive
+/// memoise targets.
 pub fn purity_diagnostics(findings: &[PurityFinding], path: &str, source: &str) -> Diagnostics {
     let mut diags = Diagnostics::new();
     for f in findings {
+        if !f.declared_pure {
+            continue;
+        }
         if let Some(reason) = &f.violation {
             diags.push_error(TycError::impure_pure_fn(
                 f.name.clone(),
@@ -1002,11 +1238,142 @@ mod purity_tests {
     }
 
     #[test]
-    fn auto_memoise_treats_every_fn_as_pure() {
-        let module = parse("def add(a, b): return a + b\n", Mode::Module, "<test>").unwrap();
+    fn auto_memoise_does_not_force_purity_diagnostics() {
+        // An impure helper without an explicit `@pure` decorator should not
+        // become a hard build error just because the project opted in to
+        // `[strictness] auto-memoise = true`. The auto-memoise flag is a
+        // silent best-effort: a finding is recorded (so the memoise pass
+        // knows to SKIP this one) but the diagnostic stage drops it.
+        let src = "def fetch(url: str) -> str:\n    return open(url).read()\n";
+        let module = parse(src, Mode::Module, "<test>").unwrap();
         let findings = analyse_purity(&module, /*auto_memoise=*/ true);
         assert_eq!(findings.len(), 1);
-        assert!(findings[0].declared_pure);
+        // Not declared pure → never a hard error.
+        assert!(!findings[0].declared_pure);
+        // The purity check still ran and found the I/O call so the desugarer
+        // knows not to inject `@functools.cache`.
+        assert!(findings[0].violation.is_some());
+        // And the diagnostic stage drops it because declared_pure is false.
+        let diags = purity_diagnostics(&findings, "<test>", src);
+        assert!(
+            !diags.has_errors(),
+            "auto-memoise must not surface hard errors: {:?}",
+            diags.errors()
+        );
+    }
+
+    #[test]
+    fn auto_memoise_caches_passable_function() {
+        // Counterpart to the above — a passable function should produce a
+        // finding with `memoise = true && violation = None`, which the
+        // build pipeline turns into a `@functools.cache` injection.
+        let src = "def add(a: int, b: int) -> int:\n    return a + b\n";
+        let module = parse(src, Mode::Module, "<test>").unwrap();
+        let findings = analyse_purity(&module, /*auto_memoise=*/ true);
+        assert_eq!(findings.len(), 1);
+        assert!(!findings[0].declared_pure);
         assert!(findings[0].memoise);
+        assert!(findings[0].violation.is_none());
+    }
+
+    // ── Phase 3 review-feedback regressions ────────────────────────────────
+
+    #[test]
+    fn pure_local_assignment_allowed() {
+        // Bare-name assignment inside a pure body is local by Python scoping
+        // (because `global` is already forbidden), so it must not be flagged
+        // even when the same name is also bound at module scope.
+        let findings = analyse(
+            "PORT = 8080\n\n@pure\ndef add(a: int, b: int) -> int:\n    PORT = a + b\n    return PORT\n",
+        );
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0].violation.is_none(),
+            "local rebinding of a name that happens to exist at module scope is not a side effect: {:?}",
+            findings[0].violation
+        );
+    }
+
+    #[test]
+    fn pure_attribute_mutation_on_module_state_rejected() {
+        // Mutating a module-level binding through `.attr` or `[idx]` IS a
+        // side effect, even though bare-name assignments are local.
+        let findings = analyse(
+            "CACHE = {}\n\n@pure\ndef remember(k: int, v: int) -> int:\n    CACHE[k] = v\n    return v\n",
+        );
+        assert_eq!(findings.len(), 1);
+        let reason = findings[0]
+            .violation
+            .as_ref()
+            .expect("expected mutation violation");
+        assert!(reason.contains("module-level state"), "got: {reason}");
+    }
+
+    #[test]
+    fn pure_transitive_call_to_pure_helper_allowed() {
+        let findings = analyse(
+            "@pure\ndef double(x: int) -> int:\n    return x + x\n\n@pure\ndef quad(x: int) -> int:\n    return double(double(x))\n",
+        );
+        assert_eq!(findings.len(), 2);
+        for f in &findings {
+            assert!(f.violation.is_none(), "{:?}", f.violation);
+        }
+    }
+
+    #[test]
+    fn pure_transitive_call_to_impure_helper_rejected() {
+        let findings = analyse(
+            "def shout(s: str) -> str:\n    print(s)\n    return s\n\n@pure\ndef greet(name: str) -> str:\n    return shout(name)\n",
+        );
+        let greet = findings
+            .iter()
+            .find(|f| f.name == "greet")
+            .expect("greet should be analysed");
+        let reason = greet
+            .violation
+            .as_ref()
+            .expect("expected transitive impurity");
+        assert!(reason.contains("shout"), "got: {reason}");
+    }
+
+    #[test]
+    fn pure_call_to_unknown_callable_rejected() {
+        // Unknown identifiers (likely imported) can't be proven pure, so
+        // reject them conservatively.
+        let findings = analyse("@pure\ndef wrap(x: int) -> int:\n    return mystery(x)\n");
+        let reason = findings[0]
+            .violation
+            .as_ref()
+            .expect("expected unknown-callee rejection");
+        assert!(reason.contains("mystery"), "got: {reason}");
+    }
+
+    #[test]
+    fn pure_call_to_class_constructor_allowed() {
+        let findings = analyse(
+            "class Box:\n    value: int\n\n@pure\ndef wrap(x: int) -> Box:\n    return Box(x)\n",
+        );
+        let wrap = findings
+            .iter()
+            .find(|f| f.name == "wrap")
+            .expect("wrap should be analysed");
+        assert!(
+            wrap.violation.is_none(),
+            "class constructors are pure-callable: {:?}",
+            wrap.violation
+        );
+    }
+
+    #[test]
+    fn memo_with_unhashable_param_rejected() {
+        // `@memo` (or `@pure(memo=True)`) backs the cache with a dict keyed
+        // on the args; a `list[int]` parameter would crash at runtime with
+        // `TypeError: unhashable type`. Reject the annotation up front.
+        let findings = analyse("@memo\ndef sum_all(xs: list[int]) -> int:\n    return 0\n");
+        let reason = findings[0]
+            .violation
+            .as_ref()
+            .expect("expected hashability violation");
+        assert!(reason.contains("unhashable"), "got: {reason}");
     }
 }

@@ -96,7 +96,7 @@ See [docs/cli.md](docs/cli.md) for the full reference.
 - ✅ `@pure`/`@memo`/`@pure(memo=True)` decorators trigger the six-condition purity check; memoised functions get `@functools.cache` injected at desugar time. Project-wide opt-in via `[strictness] auto-memoise`.
 - ✅ `gather:` lowers to `asyncio.TaskGroup` by default; `gather(strategy="best-effort"):` to `asyncio.gather(..., return_exceptions=True)`.
 - ✅ `go f(x)` lowers through `typhon_runtime.tasks.spawn` with a strong-ref task registry.
-- ✅ `lazy import np = numpy` lowers to a deferred-loader proxy; `lazy from … import …` is rejected. `lazy val NAME = expr` uses the materialise-on-first-access proxy.
+- ✅ `lazy import np = numpy` lowers to a thread-safe inline proxy class; `lazy from … import …` is rejected. Module-level `lazy val` is deferred (the syntax pipeline does not yet recognise it).
 - ✅ Pipe operator `a |> f |> g(arg)` desugars to `g(f(a), arg)`.
 - ✅ `extend ClassName:` (alias for `impl` on user-defined classes; built-in extensions deferred).
 - ✅ `.dty` stub files compile to PEP 561 `.pyi`; `tyc check --stubs` validates them. The full `stubtest` runtime diff against the implementation module is a future enhancement.

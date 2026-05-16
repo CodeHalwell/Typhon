@@ -59,11 +59,12 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 - ✅ **`go`** lowered through `typhon_runtime.tasks.spawn(...)` with a
   strong-ref task registry (never a bare `asyncio.create_task`).
   `go f(x) -> fut` binds the task handle.
-- ✅ **Lazy imports** — `lazy import np = numpy` lowers to a runtime helper
-  that defers loading via `importlib.util.LazyLoader`. `lazy from x import …`
-  is rejected. `lazy val NAME: T = expr` lowers to a `lazy_val(lambda: expr)`
-  proxy that materialises on first attribute access. The instance-level
-  `cached_property` form is deferred (use Python's stdlib decorator directly).
+- ✅ **Lazy imports** — `lazy import np = numpy` lowers to a thread-safe
+  proxy class generated inline by `expand_lazy_imports` (double-checked
+  locking, no runtime helper dependency). `lazy from x import …` is rejected
+  because it defeats deferral. Module-level `lazy val NAME: T = expr` and
+  instance-level `cached_property` are deferred — the syntax pipeline does
+  not yet recognise them.
 - ✅ **Pipe operator** `a |> f |> g(arg)` lowered to `g(f(a), arg)` left-
   associatively. Guards in `match` cases pass through to Python directly.
 - ✅ **`extend`** keyword for adding methods to user-defined classes — an

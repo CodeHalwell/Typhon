@@ -483,22 +483,38 @@ fn make_protocol_import() -> Stmt<TextRange> {
     })
 }
 
-/// Return `true` if `body` already has `import asyncio` (possibly with `as`).
+/// `true` when `body` binds the bare module name `asyncio`. The `gather`
+/// lowering emits `asyncio.TaskGroup` / `asyncio.gather` against that exact
+/// name; an `import asyncio as aio` doesn't satisfy the reference.
 fn has_asyncio_import(body: &[Stmt<TextRange>]) -> bool {
     body.iter().any(|stmt| match stmt {
-        Stmt::Import(i) => i.names.iter().any(|a| a.name.as_str() == "asyncio"),
+        Stmt::Import(i) => i.names.iter().any(|a| {
+            a.name.as_str() == "asyncio"
+                && matches!(
+                    a.asname.as_ref().map(|n| n.as_str()),
+                    None | Some("asyncio")
+                )
+        }),
         _ => false,
     })
 }
 
-/// Return `true` if `body` already imports `Protocol` from `typing`.
+/// `true` when `body` binds the bare name `Protocol` (the `interface` lowering
+/// emits `class Foo(Protocol):` against the unaliased name).
+/// `from typing import Protocol as P` doesn't satisfy this; `from typing
+/// import *` does.
 fn has_protocol_import(body: &[Stmt<TextRange>]) -> bool {
     body.iter().any(|stmt| match stmt {
         Stmt::ImportFrom(i) => {
             i.module.as_deref() == Some("typing")
-                && i.names
-                    .iter()
-                    .any(|a| matches!(a.name.as_str(), "Protocol" | "*"))
+                && i.names.iter().any(|a| match a.name.as_str() {
+                    "Protocol" => matches!(
+                        a.asname.as_ref().map(|n| n.as_str()),
+                        None | Some("Protocol")
+                    ),
+                    "*" => true,
+                    _ => false,
+                })
         }
         _ => false,
     })
@@ -767,10 +783,18 @@ fn desugar_mod_module_with(
     }
 }
 
-/// Strip Typhon-internal `@pure` / `@memo` decorators (they aren't real Python
-/// names) and prepend `@functools.cache` to every function whose name appears
-/// in `memoise`. Returns the modified body and whether any cache decorator
-/// was inserted.
+/// Strip Typhon-internal `@pure` / `@memo` decorators wherever they appear
+/// (top-level functions, async functions, class methods, nested functions)
+/// and prepend `@functools.cache` to every TOP-LEVEL function whose name
+/// appears in `memoise`. Returns the modified body and whether any cache
+/// decorator was inserted.
+///
+/// Memoise injection is intentionally restricted to top-level functions:
+/// the purity analyser only collects top-level findings (so a nested `@memo
+/// def f` doesn't accidentally trigger injection on an unrelated top-level
+/// `def f`). Stripping of `@pure` / `@memo` markers, by contrast, recurses
+/// everywhere — otherwise those Typhon-only names would leak into the
+/// emitted Python and raise `NameError` at import time.
 fn inject_memoise_decorators(
     body: Vec<Stmt<TextRange>>,
     memoise: &[String],
@@ -781,6 +805,7 @@ fn inject_memoise_decorators(
         .map(|stmt| match stmt {
             Stmt::FunctionDef(mut f) => {
                 f.decorator_list = strip_purity_decorators(f.decorator_list);
+                f.body = strip_purity_decorators_in_body(f.body);
                 if memoise.iter().any(|n| n == f.name.as_str())
                     && !has_cache_decorator(&f.decorator_list)
                 {
@@ -791,6 +816,7 @@ fn inject_memoise_decorators(
             }
             Stmt::AsyncFunctionDef(mut f) => {
                 f.decorator_list = strip_purity_decorators(f.decorator_list);
+                f.body = strip_purity_decorators_in_body(f.body);
                 if memoise.iter().any(|n| n == f.name.as_str())
                     && !has_cache_decorator(&f.decorator_list)
                 {
@@ -799,10 +825,40 @@ fn inject_memoise_decorators(
                 }
                 Stmt::AsyncFunctionDef(f)
             }
+            Stmt::ClassDef(mut c) => {
+                c.body = strip_purity_decorators_in_body(c.body);
+                Stmt::ClassDef(c)
+            }
             other => other,
         })
         .collect();
     (new_body, added)
+}
+
+/// Recursively strip `@pure` / `@memo` markers from every function defined
+/// inside `body` (and any nested function/class bodies). Used to clean up
+/// Typhon-only decorators that the top-level pass doesn't see directly —
+/// class methods and nested functions.
+fn strip_purity_decorators_in_body(body: Vec<Stmt<TextRange>>) -> Vec<Stmt<TextRange>> {
+    body.into_iter()
+        .map(|stmt| match stmt {
+            Stmt::FunctionDef(mut f) => {
+                f.decorator_list = strip_purity_decorators(f.decorator_list);
+                f.body = strip_purity_decorators_in_body(f.body);
+                Stmt::FunctionDef(f)
+            }
+            Stmt::AsyncFunctionDef(mut f) => {
+                f.decorator_list = strip_purity_decorators(f.decorator_list);
+                f.body = strip_purity_decorators_in_body(f.body);
+                Stmt::AsyncFunctionDef(f)
+            }
+            Stmt::ClassDef(mut c) => {
+                c.body = strip_purity_decorators_in_body(c.body);
+                Stmt::ClassDef(c)
+            }
+            other => other,
+        })
+        .collect()
 }
 
 /// Drop `@pure`, `@pure(...)`, and `@memo` decorators from a function — they
@@ -855,10 +911,22 @@ fn has_cache_decorator(decorators: &[rustpython_ast::Expr<TextRange>]) -> bool {
     })
 }
 
+/// `true` when `body` binds the bare module name `functools` (so the
+/// `@functools.cache` decorator the desugarer injects can resolve it).
+///
+/// Aliased imports (`import functools as ft`) and from-imports
+/// (`from functools import cache`) intentionally do NOT count: neither
+/// binds the name `functools` itself, so the injected reference would
+/// raise `NameError` at import time.
 fn has_functools_import(body: &[Stmt<TextRange>]) -> bool {
     body.iter().any(|stmt| match stmt {
-        Stmt::Import(i) => i.names.iter().any(|a| a.name.as_str() == "functools"),
-        Stmt::ImportFrom(i) => i.module.as_deref() == Some("functools"),
+        Stmt::Import(i) => i.names.iter().any(|a| {
+            a.name.as_str() == "functools"
+                && matches!(
+                    a.asname.as_ref().map(|n| n.as_str()),
+                    None | Some("functools")
+                )
+        }),
         _ => false,
     })
 }
