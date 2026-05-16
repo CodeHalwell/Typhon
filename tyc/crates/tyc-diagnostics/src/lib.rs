@@ -540,3 +540,238 @@ impl Diagnostics {
         (self.errors, self.warnings)
     }
 }
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── TycError constructor correctness ─────────────────────────────────────
+
+    #[test]
+    fn io_error_contains_path_and_cause() {
+        let e = TycError::io("foo.ty", &std::io::Error::other("disk full"));
+        let msg = e.to_string();
+        assert!(msg.contains("foo.ty"), "path should appear in message");
+        assert!(msg.contains("disk full"), "cause should appear in message");
+        assert!(matches!(e, TycError::Io { .. }));
+    }
+
+    #[test]
+    fn generic_error_round_trips_message() {
+        let e = TycError::generic("something went wrong");
+        assert_eq!(e.to_string(), "something went wrong");
+        assert!(matches!(e, TycError::Generic { .. }));
+    }
+
+    #[test]
+    fn parse_error_is_correct_variant() {
+        let e = TycError::parse("a.ty", "val x = 1", "unexpected token", 4);
+        assert!(matches!(e, TycError::Parse { .. }));
+        let msg = e.to_string();
+        assert!(msg.contains("a.ty"));
+    }
+
+    #[test]
+    fn unknown_name_contains_name() {
+        let e = TycError::unknown_name("foo", "a.ty", "foo", 0, 3);
+        assert!(matches!(e, TycError::UnknownName { .. }));
+        assert!(e.to_string().contains("foo"));
+    }
+
+    #[test]
+    fn type_mismatch_contains_expected_and_actual() {
+        let e = TycError::type_mismatch("int", "str", "a.ty", "val x: int = \"hi\"", 0, 5);
+        assert!(matches!(e, TycError::TypeMismatch { .. }));
+        let msg = e.to_string();
+        assert!(msg.contains("int"), "expected type should appear");
+        assert!(msg.contains("str"), "actual type should appear");
+    }
+
+    #[test]
+    fn nullable_use_contains_expected_type() {
+        let e = TycError::nullable_use("x", "str", "a.ty", "val x: str? = None", 0, 1);
+        assert!(matches!(e, TycError::NullableUse { .. }));
+        // The diagnostic message embeds `expected`; the variable name appears
+        // only in the source-span label rendered by miette, not in to_string().
+        assert!(e.to_string().contains("str"));
+    }
+
+    #[test]
+    fn wrong_arg_count_contains_name_and_counts() {
+        let e = TycError::wrong_arg_count("f", 2, 3, "a.ty", "f(1, 2, 3)", 0, 9);
+        assert!(matches!(e, TycError::WrongArgCount { .. }));
+        let msg = e.to_string();
+        assert!(msg.contains("f"));
+        assert!(msg.contains('2'), "expected count should appear");
+        assert!(msg.contains('3'), "actual count should appear");
+    }
+
+    #[test]
+    fn not_callable_contains_type() {
+        let e = TycError::not_callable("int", "a.ty", "1()", 0, 3);
+        assert!(matches!(e, TycError::NotCallable { .. }));
+        assert!(e.to_string().contains("int"));
+    }
+
+    #[test]
+    fn non_exhaustive_match_contains_union_and_missing() {
+        let e = TycError::non_exhaustive_match("Shape", "Circle", "a.ty", "match s:", 0, 7);
+        assert!(matches!(e, TycError::NonExhaustiveMatch { .. }));
+        let msg = e.to_string();
+        assert!(msg.contains("Shape"));
+        assert!(msg.contains("Circle"));
+    }
+
+    #[test]
+    fn comptime_contains_name_and_message() {
+        let e = TycError::comptime("PORT", "env var missing");
+        assert!(matches!(e, TycError::Comptime { .. }));
+        let msg = e.to_string();
+        assert!(msg.contains("PORT"));
+        assert!(msg.contains("env var missing"));
+    }
+
+    #[test]
+    fn invalid_question_op_is_correct_variant() {
+        let e = TycError::invalid_question_op("bad use", "a.ty", "x?", 0, 2);
+        assert!(matches!(e, TycError::InvalidQuestionOp { .. }));
+        assert!(e.to_string().contains("bad use"));
+    }
+
+    #[test]
+    fn unused_import_contains_name() {
+        let e = TycError::unused_import("os", "a.ty", "import os", 0, 9);
+        assert!(matches!(e, TycError::UnusedImport { .. }));
+        assert!(e.to_string().contains("os"));
+    }
+
+    #[test]
+    fn lazy_usage_contains_message() {
+        let e = TycError::lazy_usage("unsupported form", "a.ty", "lazy from x import y", 0, 20);
+        assert!(matches!(e, TycError::LazyUsage { .. }));
+        assert!(e.to_string().contains("unsupported form"));
+    }
+
+    #[test]
+    fn impure_pure_fn_contains_name_and_reason() {
+        let e = TycError::impure_pure_fn(
+            "compute",
+            "calls I/O",
+            "a.ty",
+            "@pure\ndef compute(): pass",
+            0,
+            5,
+        );
+        assert!(matches!(e, TycError::ImpurePureFn { .. }));
+        let msg = e.to_string();
+        assert!(msg.contains("compute"));
+        assert!(msg.contains("calls I/O"));
+    }
+
+    #[test]
+    fn interface_isinstance_contains_interface_name() {
+        let e = TycError::interface_isinstance(
+            "Serialisable",
+            "a.ty",
+            "isinstance(x, Serialisable)",
+            0,
+            26,
+        );
+        assert!(matches!(e, TycError::InterfaceIsinstance { .. }));
+        assert!(e.to_string().contains("Serialisable"));
+    }
+
+    #[test]
+    fn interface_not_conforming_contains_key_fields() {
+        let e = TycError::interface_not_conforming(
+            "Writer",
+            "MyClass",
+            "write",
+            "a.ty",
+            "x: Writer = MyClass()",
+            0,
+            20,
+        );
+        assert!(matches!(e, TycError::InterfaceNotConforming { .. }));
+        let msg = e.to_string();
+        assert!(msg.contains("Writer"));
+        assert!(msg.contains("MyClass"));
+        assert!(msg.contains("write"));
+    }
+
+    #[test]
+    fn immutable_assign_contains_name() {
+        let e = TycError::immutable_assign("x", "a.ty", "val x: int = 1\nx = 2", 4, 1, 16, 1);
+        assert!(matches!(e, TycError::ImmutableAssign { .. }));
+        assert!(e.to_string().contains("x"));
+    }
+
+    // ── Diagnostics collection API ────────────────────────────────────────────
+
+    #[test]
+    fn new_diagnostics_is_empty() {
+        let d = Diagnostics::new();
+        assert!(!d.has_errors());
+        assert_eq!(d.error_count(), 0);
+        assert_eq!(d.warning_count(), 0);
+    }
+
+    #[test]
+    fn push_error_increments_error_count() {
+        let mut d = Diagnostics::new();
+        d.push_error(TycError::generic("e1"));
+        assert!(d.has_errors());
+        assert_eq!(d.error_count(), 1);
+        assert_eq!(d.warning_count(), 0);
+    }
+
+    #[test]
+    fn push_warning_increments_warning_count_not_error_count() {
+        let mut d = Diagnostics::new();
+        d.push_warning(TycError::generic("w1"));
+        assert!(!d.has_errors());
+        assert_eq!(d.error_count(), 0);
+        assert_eq!(d.warning_count(), 1);
+    }
+
+    #[test]
+    fn extend_merges_both_error_and_warning_lists() {
+        let mut a = Diagnostics::new();
+        a.push_error(TycError::generic("e1"));
+        a.push_warning(TycError::generic("w1"));
+
+        let mut b = Diagnostics::new();
+        b.push_error(TycError::generic("e2"));
+        b.push_warning(TycError::generic("w2"));
+
+        a.extend(b);
+        assert_eq!(a.error_count(), 2);
+        assert_eq!(a.warning_count(), 2);
+    }
+
+    #[test]
+    fn into_parts_separates_errors_and_warnings() {
+        let mut d = Diagnostics::new();
+        d.push_error(TycError::generic("err"));
+        d.push_warning(TycError::generic("warn"));
+
+        let (errors, warnings) = d.into_parts();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(warnings.len(), 1);
+        assert!(errors[0].to_string().contains("err"));
+        assert!(warnings[0].to_string().contains("warn"));
+    }
+
+    #[test]
+    fn errors_and_warnings_slices_are_consistent_with_counts() {
+        let mut d = Diagnostics::new();
+        d.push_error(TycError::generic("e1"));
+        d.push_error(TycError::generic("e2"));
+        d.push_warning(TycError::generic("w1"));
+
+        assert_eq!(d.errors().len(), d.error_count());
+        assert_eq!(d.warnings().len(), d.warning_count());
+    }
+}
