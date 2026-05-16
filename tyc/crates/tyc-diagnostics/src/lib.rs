@@ -774,4 +774,40 @@ mod tests {
         assert_eq!(d.errors().len(), d.error_count());
         assert_eq!(d.warnings().len(), d.warning_count());
     }
+
+    // ── Diagnostic codes are stable ───────────────────────────────────────────
+
+    #[test]
+    fn error_codes_are_stable() {
+        use miette::Diagnostic;
+
+        let cases: &[(&str, TycError)] = &[
+            ("tyc::generic", TycError::generic("x")),
+            ("tyc::io", TycError::io("p", &std::io::Error::other("e"))),
+            (
+                "tyc::type_mismatch",
+                TycError::type_mismatch("int", "str", "f.ty", "x", 0, 1),
+            ),
+            (
+                "tyc::unknown_name",
+                TycError::unknown_name("x", "f.ty", "x", 0, 1),
+            ),
+            (
+                "tyc::arg_count",
+                TycError::wrong_arg_count("f", 1, 2, "f.ty", "f(1,2)", 0, 1),
+            ),
+            ("tyc::comptime", TycError::comptime("X", "bad")),
+        ];
+
+        for (expected_code, err) in cases {
+            let code = err
+                .code()
+                .expect("diagnostic should have a code")
+                .to_string();
+            assert_eq!(
+                &code, expected_code,
+                "code mismatch for {expected_code}: got {code}"
+            );
+        }
+    }
 }

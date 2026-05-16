@@ -13,3 +13,10 @@ tyc-resolve = { workspace = true }
 tyc-types = { workspace = true }
 rustpython-parser = { workspace = true }
 rustpython-ast = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "incremental_check"
+harness = false
