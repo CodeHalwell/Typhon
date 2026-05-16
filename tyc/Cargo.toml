@@ -40,6 +40,10 @@ toml = "0.8"
 # Incremental computation (Phase 1+)
 salsa = "0.26"
 
+# Language Server (Phase 2+)
+tower-lsp-server = "0.23"
+tokio = { version = "1", features = ["full"] }
+
 # Internal crates
 tyc-syntax      = { path = "crates/tyc-syntax" }
 tyc-diagnostics = { path = "crates/tyc-diagnostics" }

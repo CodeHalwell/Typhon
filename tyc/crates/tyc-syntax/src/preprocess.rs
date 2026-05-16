@@ -908,6 +908,799 @@ pub fn expand_question_ops(source: &str) -> String {
     result
 }
 
+// ── `with`-chain expansion ────────────────────────────────────────────────────
+
+/// Expand a `with`-chain into a flat sequence of guarded `Result` unwraps.
+///
+/// Source form:
+///
+/// ```text
+/// with user   = db.find_user(id)?,
+///      perms  = check_perms(user)?,
+///      report = build_report(user, perms)?:
+///     return Ok(report)
+/// else err:
+///     log.warn(err)
+///     return Err(err)
+/// ```
+///
+/// Each binding evaluates its RHS, returns the value when `Ok`, and runs the
+/// `else` block (with `err` bound to the unwrapped error value) on the first
+/// `Err`. When no `else` clause is provided the chain falls back to the
+/// default propagation form — `return <tmp>` — matching the `?` operator.
+///
+/// This rewrite runs **before** [`expand_question_ops`] and [`expand_pipes`]
+/// so that the rest of the pipeline sees only plain Python.
+///
+/// # Limitations
+///
+/// - The `with`-chain must sit at the top of its line and not be nested
+///   inside another expression.
+/// - Bindings continue on subsequent lines only; nesting another control
+///   structure between bindings is not supported.
+/// - The `else` body must be indented strictly deeper than the `with`
+///   header. A bare `else:` (no binding name) defaults the error variable
+///   name to `_err`.
+pub fn expand_with_chains(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut counter: usize = 0;
+    let mut in_string: Option<StringMode> = None;
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+        let pre_string = in_string;
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let _code_end = scan_line_code_end(raw, &mut in_string);
+
+        // Lines that start inside a triple-quoted string are pure content.
+        if pre_string.is_some() {
+            out.push_str(line);
+            i += 1;
+            continue;
+        }
+
+        // Look for a `with`-chain opener on this line.
+        let indent_len = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
+        let chain_indent = &raw[..indent_len];
+        let body = &raw[indent_len..];
+
+        if let Some(rest) = body.strip_prefix("with ") {
+            if let Some((first_binding, first_term)) = parse_with_binding(rest) {
+                // Re-scan the binding line's string state so the continuation
+                // scanner picks up unfinished triple-quoted strings correctly.
+                let mut state_for_chain = pre_string;
+                let _ = scan_line_code_end(raw, &mut state_for_chain);
+
+                if let Some((chain, consumed, end_state)) = collect_chain(
+                    &lines,
+                    i,
+                    chain_indent,
+                    first_binding,
+                    first_term,
+                    state_for_chain,
+                ) {
+                    let rendered = render_chain(&chain, chain_indent, &mut counter);
+                    out.push_str(&rendered);
+                    in_string = end_state;
+                    i += consumed;
+                    continue;
+                }
+            }
+        }
+
+        out.push_str(line);
+        i += 1;
+    }
+
+    out
+}
+
+/// One unwrap step inside a `with`-chain.
+#[derive(Debug)]
+struct WithBinding {
+    /// The variable name on the left-hand side of `=`.
+    target: String,
+    /// The Result-typed expression on the right (without the trailing `?`).
+    expr: String,
+}
+
+#[derive(Debug)]
+struct WithChain {
+    bindings: Vec<WithBinding>,
+    /// Body lines that run after every binding has unwrapped to its `Ok` value.
+    /// Each entry is a verbatim line including its trailing newline.
+    body: Vec<String>,
+    /// The error-binding identifier supplied in `else <name>:`, or `None` for
+    /// a default-propagating chain. A bare `else:` records `Some("_err")`.
+    err_var: Option<String>,
+    /// Body lines for the else branch, with the chain's base indentation
+    /// removed (so each line starts at indent zero relative to the chain).
+    else_body: Vec<String>,
+}
+
+/// Parse one `name = expr?(,|:)` segment from the tail of a binding line.
+///
+/// Returns the binding plus the terminator character (`,` or `:`).
+fn parse_with_binding(s: &str) -> Option<(WithBinding, char)> {
+    let s = s.trim_end();
+    let term = if s.ends_with("?,") {
+        ','
+    } else if s.ends_with("?:") {
+        ':'
+    } else {
+        return None;
+    };
+    let head = &s[..s.len() - 2];
+    // Split on the first `=` at depth 0.
+    let eq = find_assignment_eq(head)?;
+    let target = head[..eq].trim();
+    let expr = head[eq + 1..].trim();
+    if target.is_empty() || expr.is_empty() {
+        return None;
+    }
+    Some((
+        WithBinding {
+            target: target.to_owned(),
+            expr: expr.to_owned(),
+        },
+        term,
+    ))
+}
+
+/// Collect a `with`-chain that starts at `lines[start]`. Returns the chain,
+/// the number of consumed lines, and the resulting triple-quoted-string state.
+///
+/// Returns `None` (and consumes no lines) if the construct is malformed —
+/// the caller will then emit the source unchanged so the underlying parser
+/// can surface the syntax error with full context.
+fn collect_chain(
+    lines: &[&str],
+    start: usize,
+    chain_indent: &str,
+    first_binding: WithBinding,
+    first_term: char,
+    initial_string_state: Option<StringMode>,
+) -> Option<(WithChain, usize, Option<StringMode>)> {
+    let mut bindings = vec![first_binding];
+    let mut idx = start + 1;
+    let mut term = first_term;
+    let mut in_string = initial_string_state;
+
+    // Collect continuation binding lines while the previous terminator was `,`.
+    while term == ',' && idx < lines.len() {
+        let line = lines[idx];
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let _ = scan_line_code_end(raw, &mut in_string);
+
+        let indent_len = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
+        let line_indent = &raw[..indent_len];
+        // Continuation lines must be indented strictly past the `with`.
+        if line_indent.len() <= chain_indent.len() {
+            return None;
+        }
+        let body = &raw[indent_len..];
+        let (binding, t) = parse_with_binding(body)?;
+        bindings.push(binding);
+        term = t;
+        idx += 1;
+    }
+    // The terminating `:` must have been seen by now.
+    if term != ':' {
+        return None;
+    }
+
+    // The success body: every line whose indent exceeds the chain's. Strip the
+    // chain indent from each line so the caller can re-indent uniformly.
+    let mut body = Vec::new();
+    while idx < lines.len() {
+        let line = lines[idx];
+        let raw = line.trim_end_matches(['\n', '\r']);
+        if raw.trim().is_empty() {
+            // Pass blank lines through verbatim.
+            let _ = scan_line_code_end(raw, &mut in_string);
+            body.push(line.to_string());
+            idx += 1;
+            continue;
+        }
+        let indent_len = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
+        if indent_len <= chain_indent.len() {
+            break;
+        }
+        let _ = scan_line_code_end(raw, &mut in_string);
+        body.push(line.to_string());
+        idx += 1;
+    }
+    if body.is_empty() {
+        return None;
+    }
+
+    // Optional `else <name>:` continuation at the chain indent. The header
+    // must end with `:`; a malformed `else err` (no colon) is *not* silently
+    // accepted — the whole chain is rejected and emitted verbatim so the
+    // underlying Python parser surfaces a syntax error pointing at the
+    // mistake.
+    let mut err_var = None;
+    let mut else_body = Vec::new();
+    if idx < lines.len() {
+        let line = lines[idx];
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let indent_len = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
+        let header = raw[indent_len..].trim_end();
+        let is_else_header =
+            indent_len == chain_indent.len() && (header == "else:" || header.starts_with("else "));
+        if is_else_header {
+            // Require a trailing colon on the header. `else err` (no colon)
+            // is rejected so the user sees a Python-level syntax error.
+            if !header.ends_with(':') {
+                return None;
+            }
+            err_var = Some(if header == "else:" {
+                "_err".to_owned()
+            } else {
+                parse_else_var(header)?
+            });
+            let _ = scan_line_code_end(raw, &mut in_string);
+            idx += 1;
+            while idx < lines.len() {
+                let l = lines[idx];
+                let r = l.trim_end_matches(['\n', '\r']);
+                if r.trim().is_empty() {
+                    let _ = scan_line_code_end(r, &mut in_string);
+                    else_body.push(l.to_string());
+                    idx += 1;
+                    continue;
+                }
+                let ind = r.find(|c: char| !c.is_whitespace()).unwrap_or(r.len());
+                if ind <= chain_indent.len() {
+                    break;
+                }
+                let _ = scan_line_code_end(r, &mut in_string);
+                else_body.push(l.to_string());
+                idx += 1;
+            }
+            if else_body.is_empty() {
+                return None;
+            }
+        }
+    }
+
+    let consumed = idx - start;
+    Some((
+        WithChain {
+            bindings,
+            body,
+            err_var,
+            else_body,
+        },
+        consumed,
+        in_string,
+    ))
+}
+
+fn parse_else_var(header: &str) -> Option<String> {
+    let rest = header.strip_prefix("else")?.trim_start();
+    if let Some(name) = rest.strip_suffix(':') {
+        let name = name.trim();
+        if name.is_empty() {
+            return None;
+        }
+        if !name
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic() || c == '_')
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        Some(name.to_owned())
+    } else {
+        None
+    }
+}
+
+/// Render a `with`-chain back into Python. The output is a flat sequence of
+/// guarded `if isinstance(tmp, Err): ...` checks followed by the success body.
+///
+/// The success body lines originated one indent level inside the `with`
+/// header; after flattening they become siblings of the unwrap statements and
+/// must shed exactly that level. Else-body lines stay inside the new `if`
+/// block, so their indent relative to the chain is preserved by emitting
+/// them verbatim. The unit-indent is detected from the source itself (the
+/// first non-blank body line) rather than assumed to be four spaces, so
+/// tab-indented or two-space code round-trips correctly.
+fn render_chain(chain: &WithChain, chain_indent: &str, counter: &mut usize) -> String {
+    let mut out = String::new();
+
+    // Detect the body's own indent unit (the leading whitespace beyond the
+    // chain indent on the first non-blank body line). Fall back to four
+    // spaces only when the body is entirely blank, which is unreachable in
+    // valid Python but defensive against the corner case.
+    let unit_indent: String = chain
+        .body
+        .iter()
+        .find_map(|line| {
+            let trimmed = line.trim_end_matches(['\n', '\r']);
+            if trimmed.trim().is_empty() {
+                return None;
+            }
+            let leading_len = trimmed
+                .find(|c: char| !c.is_whitespace())
+                .unwrap_or(trimmed.len());
+            let leading = &trimmed[..leading_len];
+            leading
+                .strip_prefix(chain_indent)
+                .map(|extra| extra.to_owned())
+        })
+        .unwrap_or_else(|| "    ".to_owned());
+    let inner_indent = format!("{}{}", chain_indent, unit_indent);
+
+    for binding in &chain.bindings {
+        let tmp = format!("__typhon_with_{}__", *counter);
+        *counter += 1;
+
+        out.push_str(chain_indent);
+        out.push_str(&tmp);
+        out.push_str(" = ");
+        out.push_str(&binding.expr);
+        out.push('\n');
+
+        out.push_str(chain_indent);
+        out.push_str("if isinstance(");
+        out.push_str(&tmp);
+        out.push_str(", Err):\n");
+
+        match (&chain.err_var, !chain.else_body.is_empty()) {
+            (Some(name), true) => {
+                // Bind `err = tmp.error` at one indent past the guard,
+                // using the detected unit indent.
+                out.push_str(&inner_indent);
+                out.push_str(name);
+                out.push_str(" = ");
+                out.push_str(&tmp);
+                out.push_str(".error\n");
+                // Else-body lines come in with their original indent (one
+                // level inside the `else err:` header, which sat at the
+                // chain indent). That matches the new `if` body's indent
+                // exactly, so emit verbatim.
+                for line in &chain.else_body {
+                    out.push_str(line);
+                }
+            }
+            _ => {
+                out.push_str(&inner_indent);
+                out.push_str("return ");
+                out.push_str(&tmp);
+                out.push('\n');
+            }
+        }
+
+        out.push_str(chain_indent);
+        out.push_str(&binding.target);
+        out.push_str(" = ");
+        out.push_str(&tmp);
+        out.push_str(".value\n");
+    }
+
+    // Success body: strip the unit-indent the `with` header imposed on each
+    // line so the statements become siblings of the unwraps.
+    for line in &chain.body {
+        if line.trim().is_empty() {
+            out.push_str(line);
+        } else if let Some(stripped) = line.strip_prefix(inner_indent.as_str()) {
+            out.push_str(chain_indent);
+            out.push_str(stripped);
+        } else {
+            // Indent didn't match — fall back to emitting verbatim so the
+            // user sees a precise Python indentation error rather than a
+            // silently mangled body.
+            out.push_str(line);
+        }
+    }
+
+    out
+}
+
+// ── `|>` pipe operator expansion ──────────────────────────────────────────────
+
+/// Expand the `|>` pipe operator into nested function calls.
+///
+/// `x |> f` rewrites to `f(x)`. `x |> f(a, b)` rewrites to `f(x, a, b)`.
+/// Chained pipes `x |> f |> g` rewrite left-to-right as `g(f(x))`. The
+/// transformation runs on the textual source line-by-line before the regular
+/// preprocessor.
+///
+/// Pipes are only rewritten when:
+///
+/// - They appear outside any string literal or comment.
+/// - They appear at parenthesis depth 0 within the line (pipes inside a
+///   parenthesised sub-expression must be broken out into their own binding).
+/// - The right-hand side is a callable name (`f`, `mod.f`) optionally
+///   followed by a parenthesised argument list.
+///
+/// Lines that begin inside a triple-quoted string are passed through
+/// verbatim. A line that contains no top-level `|>` is unchanged.
+pub fn expand_pipes(source: &str) -> String {
+    let mut result = String::with_capacity(source.len());
+    let mut in_string: Option<StringMode> = None;
+
+    for line in source.split_inclusive('\n') {
+        let pre_string = in_string;
+        let raw = line.trim_end_matches(['\n', '\r']);
+        // Preserve the original line terminator (LF, CRLF, or bare-EOF) so
+        // mixed-newline files round-trip unchanged.
+        let terminator = &line[raw.len()..];
+        let code_end = scan_line_code_end(raw, &mut in_string);
+
+        if pre_string.is_some() {
+            result.push_str(line);
+            continue;
+        }
+
+        let code = &raw[..code_end];
+        let pipes = find_top_level_pipes(code);
+        if pipes.is_empty() {
+            result.push_str(line);
+            continue;
+        }
+
+        let rewritten = match rewrite_pipe_line(code, &pipes) {
+            Some(s) => s,
+            None => {
+                // Bail out — pass the line through unchanged so the regular
+                // parser produces a coherent diagnostic at the `|>` token.
+                result.push_str(line);
+                continue;
+            }
+        };
+
+        result.push_str(&rewritten);
+        // Preserve any trailing comment, then re-attach the original
+        // newline bytes (which may be `\r\n` on Windows-authored files).
+        result.push_str(&raw[code_end..]);
+        result.push_str(terminator);
+    }
+
+    result
+}
+
+/// Locate every `|>` token in `code` that sits at parenthesis depth 0 and
+/// outside any string literal (single-, double-, or triple-quoted).
+/// Returns the byte offset of the `|` character in each occurrence.
+fn find_top_level_pipes(code: &str) -> Vec<usize> {
+    let mut positions = Vec::new();
+    let bytes = code.as_bytes();
+    scan_inline_code(code, |i, depth, _in_string| {
+        if depth == 0
+            && bytes[i] == b'|'
+            && i + 1 < bytes.len()
+            && bytes[i + 1] == b'>'
+            // Reject `||>` and `|>=` shapes (neither is valid Python today,
+            // but be defensive).
+            && (i == 0 || bytes[i - 1] != b'|')
+            && (i + 2 >= bytes.len() || bytes[i + 2] != b'=')
+        {
+            positions.push(i);
+            // Tell the scanner to skip the `>` so we don't re-enter this
+            // branch on the next byte.
+            return Some(2);
+        }
+        None
+    });
+    positions
+}
+
+/// Walk `code` byte-by-byte, tracking parenthesis depth and string state
+/// (including triple-quoted forms). Calls `step(i, depth, in_string)` for
+/// every byte position outside a string literal, and inside strings only
+/// to allow `step` to inspect the state. `step` may return `Some(skip)` to
+/// advance the cursor by `skip` extra bytes (used by token-aware callers
+/// like `find_top_level_pipes` once they've matched a multi-byte operator).
+///
+/// The scanner is byte-level and ASCII-safe: it only inspects bytes that
+/// are themselves ASCII (quotes, brackets, the backslash escape, and the
+/// matching closing quote), and otherwise transparently advances by one
+/// byte. UTF-8 continuation bytes never match any of these so multi-byte
+/// characters are passed through correctly.
+fn scan_inline_code<F>(code: &str, mut step: F)
+where
+    F: FnMut(usize, i32, Option<StringMode>) -> Option<usize>,
+{
+    let bytes = code.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_string: Option<StringMode> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(extra) = step(i, depth, in_string) {
+            i += extra;
+            continue;
+        }
+        let c = bytes[i];
+        match in_string {
+            Some(StringMode::Single) | Some(StringMode::Double) => {
+                // Single-line strings: honour backslash escapes, look for
+                // the matching closing quote.
+                let close = match in_string {
+                    Some(StringMode::Single) => b'\'',
+                    _ => b'"',
+                };
+                if c == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if c == close {
+                    in_string = None;
+                }
+                i += 1;
+            }
+            Some(StringMode::TripleSingle) | Some(StringMode::TripleDouble) => {
+                let triple: &[u8] = match in_string {
+                    Some(StringMode::TripleSingle) => b"'''",
+                    _ => b"\"\"\"",
+                };
+                if i + 3 <= bytes.len() && &bytes[i..i + 3] == triple {
+                    in_string = None;
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+            }
+            None => match c {
+                b'\'' | b'"' => {
+                    let triple: &[u8] = if c == b'"' { b"\"\"\"" } else { b"'''" };
+                    if i + 3 <= bytes.len() && &bytes[i..i + 3] == triple {
+                        in_string = Some(if c == b'"' {
+                            StringMode::TripleDouble
+                        } else {
+                            StringMode::TripleSingle
+                        });
+                        i += 3;
+                    } else {
+                        in_string = Some(if c == b'"' {
+                            StringMode::Double
+                        } else {
+                            StringMode::Single
+                        });
+                        i += 1;
+                    }
+                }
+                b'(' | b'[' | b'{' => {
+                    depth += 1;
+                    i += 1;
+                }
+                b')' | b']' | b'}' => {
+                    depth -= 1;
+                    i += 1;
+                }
+                _ => {
+                    i += 1;
+                }
+            },
+        }
+    }
+}
+
+/// Rewrite a single line `code` containing top-level pipe operators (at the
+/// byte positions in `pipes`) into the equivalent nested-call form.
+///
+/// Returns `None` if any pipe right-hand-side does not match the supported
+/// callable shape — the caller is expected to pass the line through unchanged.
+fn rewrite_pipe_line(code: &str, pipes: &[usize]) -> Option<String> {
+    // Split into segments delimited by `|>`. Leading/trailing whitespace on
+    // each segment is preserved on the first segment (for indent) but trimmed
+    // on intermediate ones.
+    let mut segments: Vec<&str> = Vec::with_capacity(pipes.len() + 1);
+    let mut last = 0;
+    for &pos in pipes {
+        segments.push(&code[last..pos]);
+        last = pos + 2;
+    }
+    segments.push(&code[last..]);
+
+    let first = segments[0];
+    let indent_end = first
+        .find(|c: char| !c.is_whitespace())
+        .unwrap_or(first.len());
+    let indent = &first[..indent_end];
+    let first_body = first[indent_end..].trim_end();
+
+    // Identify any assignment / return prefix on the first segment so the
+    // chain only consumes the right-hand expression.
+    let (prefix, lhs_expr) = split_pipe_prefix(first_body);
+    let lhs_expr = lhs_expr.trim();
+    if lhs_expr.is_empty() {
+        return None;
+    }
+
+    let mut acc = lhs_expr.to_string();
+    for seg in &segments[1..] {
+        let rhs = seg.trim();
+        acc = apply_pipe_call(&acc, rhs)?;
+    }
+
+    Some(format!("{}{}{}", indent, prefix, acc))
+}
+
+/// Strip an optional `return ` or `LHS [op]= ` prefix from the head of a
+/// pipe chain so the chain only consumes the right-hand expression.
+///
+/// Supports both bare and augmented assignment (`+=`, `-=`, `*=`, `/=`,
+/// `%=`, `**=`, `//=`, `<<=`, `>>=`, `&=`, `|=`, `^=`, `@=`). The walrus
+/// `:=` is an *expression* operator, not a statement-level assignment, so
+/// it is treated as part of the chain LHS rather than a prefix.
+fn split_pipe_prefix(s: &str) -> (&str, &str) {
+    // `return ` or `return\t`.
+    if let Some(rest) = s.strip_prefix("return ") {
+        return (&s[..s.len() - rest.len()], rest);
+    }
+    if let Some(rest) = s.strip_prefix("return\t") {
+        return (&s[..s.len() - rest.len()], rest);
+    }
+    // `yield ` (single-arg pipe yield is unusual but legal).
+    if let Some(rest) = s.strip_prefix("yield ") {
+        return (&s[..s.len() - rest.len()], rest);
+    }
+    // Otherwise look for an assignment-statement operator at depth 0.
+    if let Some(eq_end) = find_statement_assignment_end(s) {
+        let after = &s[eq_end..];
+        let trim_start = after.len() - after.trim_start().len();
+        return (&s[..eq_end + trim_start], &after[trim_start..]);
+    }
+    ("", s)
+}
+
+/// Locate the byte offset immediately after a statement-level assignment
+/// operator at parenthesis depth 0, outside any string literal. Recognises
+/// the bare `=` and every augmented form (`+=`, `-=`, `*=`, `/=`, `%=`,
+/// `**=`, `//=`, `<<=`, `>>=`, `&=`, `|=`, `^=`, `@=`). Returns `None` for
+/// the comparison operators (`==`, `!=`, `<=`, `>=`) and for the walrus
+/// `:=` so callers don't mistake them for assignments.
+fn find_statement_assignment_end(s: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut in_str: Option<char> = None;
+    let mut prev_char: Option<char> = None;
+    let mut prev_prev_char: Option<char> = None;
+    let bytes = s.as_bytes();
+    for (i, c) in s.char_indices() {
+        if let Some(q) = in_str {
+            if c == q {
+                in_str = None;
+            }
+            prev_prev_char = prev_char;
+            prev_char = Some(c);
+            continue;
+        }
+        match c {
+            '\'' | '"' => in_str = Some(c),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            '=' if depth == 0 => {
+                let next = bytes.get(i + 1).copied();
+                if next == Some(b'=') {
+                    // `==` — comparison, skip.
+                } else if prev_char == Some(':') || prev_char == Some('=') {
+                    // `:=` (walrus, not a statement-level assignment) or a
+                    // trailing `=` inside a longer `==`-style sequence.
+                } else if prev_char == Some('!') {
+                    // `!=` — comparison.
+                } else if prev_char == Some('<') {
+                    if prev_prev_char == Some('<') {
+                        // `<<=` — augmented assignment.
+                        return Some(i + 1);
+                    }
+                    // `<=` — comparison.
+                } else if prev_char == Some('>') {
+                    if prev_prev_char == Some('>') {
+                        // `>>=` — augmented assignment.
+                        return Some(i + 1);
+                    }
+                    // `>=` — comparison.
+                } else {
+                    // Bare `=` or augmented (`+=`, `-=`, `*=`, `**=`, `/=`,
+                    // `//=`, `%=`, `&=`, `|=`, `^=`, `@=`). All of these are
+                    // valid statement-level assignments.
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        prev_prev_char = prev_char;
+        prev_char = Some(c);
+    }
+    None
+}
+
+/// Combine an accumulated LHS expression with the next pipe segment.
+///
+/// - `acc |> name`            → `name(acc)`
+/// - `acc |> name(args)`      → `name(acc, args)`  (or `name(acc)` when empty)
+/// - `acc |> module.name(..)` → `module.name(acc, ..)`
+///
+/// Returns `None` for shapes the rewriter does not understand (e.g. lambda or
+/// non-call expressions on the RHS).
+fn apply_pipe_call(acc: &str, rhs: &str) -> Option<String> {
+    let rhs = rhs.trim();
+    if rhs.is_empty() {
+        return None;
+    }
+
+    // Find the first `(` at depth 0 in the RHS (or `None` for bare callable).
+    // Uses the shared scanner so triple-quoted strings are handled correctly.
+    let bytes = rhs.as_bytes();
+    let mut paren_at: Option<usize> = None;
+    scan_inline_code(rhs, |i, depth, in_string| {
+        if in_string.is_none() && depth == 0 && bytes[i] == b'(' {
+            paren_at = Some(i);
+            // Signal "stop scanning" by skipping to end.
+            return Some(bytes.len() - i);
+        }
+        None
+    });
+
+    match paren_at {
+        None => {
+            // Bare callable. Validate it looks like an identifier or dotted
+            // chain so we don't generate nonsense.
+            if !is_dotted_callable(rhs) {
+                return None;
+            }
+            Some(format!("{}({})", rhs, acc))
+        }
+        Some(open) => {
+            let func = rhs[..open].trim_end();
+            if !is_dotted_callable(func) {
+                return None;
+            }
+            // Validate the RHS is exactly `func(...)` — i.e. parens span to
+            // end of segment. This avoids accidentally rewriting expressions
+            // like `f(x) + 1`.
+            if !rhs.ends_with(')') {
+                return None;
+            }
+            // Inner args (with no surrounding parens).
+            let inner = rhs[open + 1..rhs.len() - 1].trim();
+            if inner.is_empty() {
+                Some(format!("{}({})", func, acc))
+            } else {
+                Some(format!("{}({}, {})", func, acc, inner))
+            }
+        }
+    }
+}
+
+/// True if `s` looks like a (possibly dotted) callable identifier suitable as
+/// the head of a pipe RHS. Used as a guard so we don't rewrite arbitrary
+/// expressions that happen to follow `|>` (e.g. `x |> (a + b)`).
+fn is_dotted_callable(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let mut started_segment = false;
+    for c in s.chars() {
+        if c == '.' {
+            if !started_segment {
+                return false;
+            }
+            started_segment = false;
+            continue;
+        }
+        if started_segment {
+            if !(c.is_ascii_alphanumeric() || c == '_') {
+                return false;
+            }
+        } else if !(c.is_ascii_alphabetic() || c == '_') {
+            return false;
+        } else {
+            started_segment = true;
+        }
+    }
+    started_segment
+}
+
 /// Scan `line` while updating `in_string` for string-literal state.
 /// Returns the byte index where the "code" portion ends — the start of a
 /// line comment (`#`) or `line.len()` if there is no comment.
@@ -985,7 +1778,10 @@ fn scan_line_code_end(line: &str, in_string: &mut Option<StringMode>) -> usize {
 }
 
 /// Find the position of the `=` assignment operator in `s`, ignoring `=`
-/// characters inside parentheses/brackets/strings and `==` comparisons.
+/// characters inside parentheses/brackets/strings, comparison operators
+/// (`==`, `!=`, `<=`, `>=`), augmented assignments (`+=`, `-=`, `*=`, `/=`,
+/// `%=`, `&=`, `|=`, `^=`, `**=`, `//=`, `<<=`, `>>=`, `@=`), and the walrus
+/// operator (`:=`).
 fn find_assignment_eq(s: &str) -> Option<usize> {
     let mut depth = 0i32;
     let mut in_str: Option<char> = None;
@@ -1003,10 +1799,33 @@ fn find_assignment_eq(s: &str) -> Option<usize> {
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth -= 1,
             '=' if depth == 0 => {
-                // Reject `==`, `!=`, `<=`, `>=`.
                 let prev = if i > 0 { s[..i].chars().last() } else { None };
                 let next = s[i + 1..].chars().next();
-                if !matches!(prev, Some('!' | '<' | '>' | '=')) && !matches!(next, Some('=')) {
+                // Reject `==`, `!=`, `<=`, `>=` (comparison; `prev == =` also
+                // covers `===` chains although Python rejects those), and
+                // augmented/walrus operators where `=` is preceded by one of
+                // `+ - * / % & | ^ : @`. (`**=`, `//=`, `<<=`, `>>=` are
+                // caught because their last char before `=` is one of those
+                // single-char operators already.)
+                let is_compound = matches!(
+                    prev,
+                    Some(
+                        '!' | '<'
+                            | '>'
+                            | '='
+                            | '+'
+                            | '-'
+                            | '*'
+                            | '/'
+                            | '%'
+                            | '&'
+                            | '|'
+                            | '^'
+                            | ':'
+                            | '@'
+                    )
+                );
+                if !is_compound && !matches!(next, Some('=')) {
                     return Some(i);
                 }
             }
@@ -1506,5 +2325,341 @@ mod tests {
         let errs = validate_question_ops(src);
         assert_eq!(errs.len(), 1);
         assert_eq!(errs[0].offset, 14, "offset should point at the `?`");
+    }
+
+    // ── pipe operator expansion ─────────────────────────────────────────────
+
+    #[test]
+    fn pipe_bare_callable_wraps_lhs() {
+        let out = expand_pipes("y = x |> f\n");
+        assert_eq!(out, "y = f(x)\n");
+    }
+
+    #[test]
+    fn pipe_callable_with_args_prepends_lhs() {
+        let out = expand_pipes("y = x |> f(a, b)\n");
+        assert_eq!(out, "y = f(x, a, b)\n");
+    }
+
+    #[test]
+    fn pipe_callable_empty_args_just_passes_lhs() {
+        let out = expand_pipes("y = x |> f()\n");
+        assert_eq!(out, "y = f(x)\n");
+    }
+
+    #[test]
+    fn pipe_chains_left_to_right() {
+        let out = expand_pipes("z = x |> f |> g\n");
+        assert_eq!(out, "z = g(f(x))\n");
+    }
+
+    #[test]
+    fn pipe_chain_with_mixed_callables() {
+        let out = expand_pipes("z = x |> f(1) |> g\n");
+        assert_eq!(out, "z = g(f(x, 1))\n");
+    }
+
+    #[test]
+    fn pipe_return_statement() {
+        let out = expand_pipes("return data |> transform |> filter\n");
+        assert_eq!(out, "return filter(transform(data))\n");
+    }
+
+    #[test]
+    fn pipe_expression_statement() {
+        let out = expand_pipes("data |> sink\n");
+        assert_eq!(out, "sink(data)\n");
+    }
+
+    #[test]
+    fn pipe_with_dotted_callable() {
+        let out = expand_pipes("y = x |> mod.helper(2)\n");
+        assert_eq!(out, "y = mod.helper(x, 2)\n");
+    }
+
+    #[test]
+    fn pipe_preserves_typhon_keyword_prefix() {
+        // The `val` keyword survives the rewrite because `expand_pipes` only
+        // touches the right-hand side of the assignment.
+        let out = expand_pipes("val y = x |> f\n");
+        assert_eq!(out, "val y = f(x)\n");
+    }
+
+    #[test]
+    fn pipe_preserves_type_annotation() {
+        let out = expand_pipes("y: int = x |> f\n");
+        assert_eq!(out, "y: int = f(x)\n");
+    }
+
+    #[test]
+    fn pipe_inside_string_is_left_alone() {
+        let src = "msg = \"a |> b not a pipe\"\n";
+        let out = expand_pipes(src);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn pipe_inside_comment_is_left_alone() {
+        let src = "y = f(x)  # consider x |> f\n";
+        let out = expand_pipes(src);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn pipe_preserves_indent() {
+        let out = expand_pipes("    return x |> f\n");
+        assert_eq!(
+            out,
+            "    return filter_unused\n".replace("filter_unused", "f(x)")
+        );
+    }
+
+    #[test]
+    fn pipe_with_nested_call_in_rhs_args() {
+        let out = expand_pipes("y = x |> f(g(1, 2), 3)\n");
+        assert_eq!(out, "y = f(x, g(1, 2), 3)\n");
+    }
+
+    #[test]
+    fn pipe_inside_parens_is_left_alone() {
+        // At parenthesis depth > 0, the rewriter declines to act. The Python
+        // parser will surface a clear error for the unsupported form.
+        let src = "y = sum([a |> f for a in xs])\n";
+        let out = expand_pipes(src);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn pipe_non_callable_rhs_passes_through() {
+        // `(a + b)` is not a dotted callable; the rewriter leaves the line
+        // alone so the user gets a proper syntax error rather than nonsense.
+        let src = "y = x |> (a + b)\n";
+        let out = expand_pipes(src);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn pipe_no_op_when_no_pipe_present() {
+        let src = "y = f(x)\n";
+        let out = expand_pipes(src);
+        assert_eq!(out, src);
+    }
+
+    // ── with-chain expansion ─────────────────────────────────────────────────
+
+    #[test]
+    fn with_chain_single_binding_with_else() {
+        let src = "\
+def run() -> Result[str, str]:
+    with x = f()?:
+        return Ok(x)
+    else err:
+        return Err(err)
+";
+        let out = expand_with_chains(src);
+        assert!(out.contains("__typhon_with_0__ = f()"), "out:\n{out}");
+        assert!(
+            out.contains("if isinstance(__typhon_with_0__, Err):"),
+            "out:\n{out}"
+        );
+        assert!(out.contains("err = __typhon_with_0__.error"), "out:\n{out}");
+        assert!(out.contains("return Err(err)"), "out:\n{out}");
+        assert!(out.contains("x = __typhon_with_0__.value"), "out:\n{out}");
+        assert!(out.contains("return Ok(x)"), "out:\n{out}");
+    }
+
+    #[test]
+    fn with_chain_multi_binding_threads_temporaries() {
+        let src = "\
+def run() -> Result[str, str]:
+    with a = f()?,
+         b = g(a)?:
+        return Ok(b)
+    else err:
+        return Err(err)
+";
+        let out = expand_with_chains(src);
+        assert!(out.contains("__typhon_with_0__ = f()"), "out:\n{out}");
+        assert!(out.contains("a = __typhon_with_0__.value"), "out:\n{out}");
+        assert!(out.contains("__typhon_with_1__ = g(a)"), "out:\n{out}");
+        assert!(out.contains("b = __typhon_with_1__.value"), "out:\n{out}");
+    }
+
+    #[test]
+    fn with_chain_without_else_falls_back_to_propagation() {
+        let src = "\
+def run() -> Result[str, str]:
+    with x = f()?:
+        return Ok(x)
+";
+        let out = expand_with_chains(src);
+        assert!(
+            out.contains("return __typhon_with_0__"),
+            "no `else` should propagate the raw Err: {out}"
+        );
+        assert!(
+            !out.contains("__typhon_with_0__.error"),
+            "unexpected error binding: {out}"
+        );
+    }
+
+    #[test]
+    fn with_chain_bare_else_defaults_err_var() {
+        // `else:` without a binding name still allows custom error handling;
+        // the desugarer uses the reserved `_err` identifier so the body can
+        // reference it.
+        let src = "\
+def run() -> Result[str, str]:
+    with x = f()?:
+        return Ok(x)
+    else:
+        return Err(\"oops\")
+";
+        let out = expand_with_chains(src);
+        assert!(
+            out.contains("_err = __typhon_with_0__.error"),
+            "out:\n{out}"
+        );
+        assert!(out.contains("return Err(\"oops\")"), "out:\n{out}");
+    }
+
+    #[test]
+    fn with_chain_preserves_following_statements() {
+        // Anything outside the chain's indentation block must be passed
+        // through verbatim so unrelated code is unaffected.
+        let src = "\
+def run() -> Result[str, str]:
+    with x = f()?:
+        return Ok(x)
+    else err:
+        return Err(err)
+
+def other() -> int:
+    return 1
+";
+        let out = expand_with_chains(src);
+        assert!(out.contains("def other() -> int:"), "out:\n{out}");
+        assert!(out.contains("    return 1"), "out:\n{out}");
+    }
+
+    #[test]
+    fn pipe_handles_walrus_without_corruption() {
+        // The walrus operator `:=` contains `=` and must not be mistaken for
+        // an assignment when splitting the chain prefix.
+        let src = "y = (z := x) |> f\n";
+        let out = expand_pipes(src);
+        // No pipe inside parens; the top-level pipe is the only one at depth 0.
+        assert_eq!(out, "y = f((z := x))\n");
+    }
+
+    #[test]
+    fn pipe_inside_triple_quoted_string_left_alone() {
+        // A `|>` inside a triple-quoted string must not be treated as a pipe
+        // — the apostrophe inside the contents previously confused the
+        // single-char string tracker. Ensure the line round-trips unchanged.
+        let src = "msg = \"\"\"don't use a |> b here\"\"\"\n";
+        let out = expand_pipes(src);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn pipe_after_closing_triple_quote_is_recognised() {
+        // A real `|>` *after* a closing `"""` should still be rewritten.
+        let src = "y = \"\"\"x\"\"\" |> str.strip\n";
+        let out = expand_pipes(src);
+        assert_eq!(out, "y = str.strip(\"\"\"x\"\"\")\n");
+    }
+
+    #[test]
+    fn pipe_preserves_crlf_line_endings() {
+        // Windows-authored files use `\r\n`; the rewriter must not silently
+        // convert them to `\n`.
+        let src = "y = x |> f\r\n";
+        let out = expand_pipes(src);
+        assert_eq!(out, "y = f(x)\r\n");
+    }
+
+    #[test]
+    fn find_assignment_eq_rejects_augmented_ops() {
+        // `+=`, `*=`, `:=`, `//=`, `**=`, `<<=`, `>>=`, `@=` are not
+        // bare assignments — `find_assignment_eq` should return None so the
+        // pipe-prefix splitter treats the whole line as a non-assignment.
+        assert!(find_assignment_eq("x += 1").is_none());
+        assert!(find_assignment_eq("x -= 1").is_none());
+        assert!(find_assignment_eq("x *= 2").is_none());
+        assert!(find_assignment_eq("x /= 2").is_none());
+        assert!(find_assignment_eq("x %= 2").is_none());
+        assert!(find_assignment_eq("x **= 2").is_none());
+        assert!(find_assignment_eq("x //= 2").is_none());
+        assert!(find_assignment_eq("x <<= 2").is_none());
+        assert!(find_assignment_eq("x >>= 2").is_none());
+        assert!(find_assignment_eq("x &= 2").is_none());
+        assert!(find_assignment_eq("x |= 2").is_none());
+        assert!(find_assignment_eq("x ^= 2").is_none());
+        assert!(find_assignment_eq("x := 2").is_none());
+        assert!(find_assignment_eq("x @= m").is_none());
+        // But a plain `=` is still found.
+        assert_eq!(find_assignment_eq("x = 1"), Some(2));
+    }
+
+    #[test]
+    fn pipe_with_augmented_assignment_prefix() {
+        // `x += a |> f` must split into "prefix = `x += `, chain = `a |> f`"
+        // and emit `x += f(a)` — not `x + = ...` (broken Python) and not
+        // `f(x += a)` (wraps the assignment).
+        assert_eq!(expand_pipes("x += a |> f\n"), "x += f(a)\n");
+        assert_eq!(expand_pipes("x *= a |> f\n"), "x *= f(a)\n");
+        assert_eq!(expand_pipes("x //= a |> f\n"), "x //= f(a)\n");
+        assert_eq!(expand_pipes("x <<= a |> f\n"), "x <<= f(a)\n");
+    }
+
+    #[test]
+    fn pipe_walrus_in_lhs_not_treated_as_prefix() {
+        // `:=` is an expression operator, not a statement assignment, so
+        // it must remain part of the chain LHS rather than being split off.
+        let out = expand_pipes("y = (z := x) |> f\n");
+        assert_eq!(out, "y = f((z := x))\n");
+    }
+
+    #[test]
+    fn with_chain_indent_detection_uses_two_space_body() {
+        // With a two-space body indent, the renderer must strip exactly two
+        // spaces (not four) so the success body lines up at the chain indent.
+        let src = "\
+def run() -> Result[str, str]:
+  with x = f()?:
+    return Ok(x)
+  else err:
+    return Err(err)
+";
+        let out = expand_with_chains(src);
+        // The success-body `return Ok(x)` was at 4 spaces (2 outer + 2 inner);
+        // after flattening it should sit at 2 spaces.
+        assert!(
+            out.contains("\n  return Ok(x)"),
+            "two-space indent not preserved: {out}"
+        );
+    }
+
+    #[test]
+    fn with_chain_else_header_without_colon_rejected() {
+        // `else err` (missing trailing `:`) is malformed; the chain should be
+        // emitted verbatim so the user sees a Python syntax error rather than
+        // a silent rewrite that defaults to `_err`.
+        let src = "\
+def run() -> Result[str, str]:
+    with x = f()?:
+        return Ok(x)
+    else err
+        return Err(err)
+";
+        let out = expand_with_chains(src);
+        // No rewrite occurred — the `with` keyword survives in the output.
+        assert!(
+            out.contains("with x = f()?:"),
+            "malformed chain should have been left verbatim: {out}"
+        );
+        // And no temporary was injected.
+        assert!(!out.contains("__typhon_with_"), "should not desugar: {out}");
     }
 }

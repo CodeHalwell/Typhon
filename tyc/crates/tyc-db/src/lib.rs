@@ -13,7 +13,9 @@
 use rustpython_parser::{parse, Mode};
 use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_resolve::resolve_module;
-use tyc_syntax::preprocess::{expand_question_ops, preprocess, validate_question_ops};
+use tyc_syntax::preprocess::{
+    expand_pipes, expand_question_ops, expand_with_chains, preprocess, validate_question_ops,
+};
 use tyc_types::check_module;
 
 /// A source file held by the database — identified by path, with mutable
@@ -36,9 +38,9 @@ pub struct SourceFile {
 #[salsa::tracked]
 pub fn preprocessed_text(db: &dyn salsa::Database, file: SourceFile) -> String {
     let text = file.text(db);
-    // Expand `?` operators before the Python parser sees the source, matching
-    // the order used in check_file and the build pipeline.
-    let expanded = expand_question_ops(text);
+    // Apply Typhon sugar expansion in the same order as `check_file` and the
+    // build pipeline: `with`-chains, then pipes, then `?`.
+    let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(text)));
     preprocess(&expanded).python_source
 }
 
@@ -116,9 +118,10 @@ pub fn check_file(db: &mut TycDatabase, path: String, text: String) -> Diagnosti
         return diags;
     }
 
-    // Expand `?` operator before preprocessing so the Python parser sees
-    // valid Python.  `tyc fmt` skips this expansion to preserve Typhon syntax.
-    let expanded = expand_question_ops(&text);
+    // Apply Typhon sugar expansion in order before preprocessing so the
+    // Python parser sees valid Python.  `tyc fmt` skips these expansions to
+    // preserve Typhon syntax in the formatter's round trip.
+    let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&text)));
     let prep = preprocess(&expanded);
 
     let module = match parse(&prep.python_source, Mode::Module, &path) {
