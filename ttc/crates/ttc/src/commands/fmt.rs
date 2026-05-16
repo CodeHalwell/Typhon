@@ -97,7 +97,8 @@ where
         for path in paths {
             collect_tt_files(&path, f)?;
         }
+        return Ok(());
     }
 
-    Ok(())
+    Err(miette!("path does not exist: {}", root.display()))
 }

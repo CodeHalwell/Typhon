@@ -259,8 +259,13 @@ impl Emitter {
                 self.emit_expr(&f.iter);
                 self.writeln(":");
                 self.enter_block();
-                for stmt in &f.body {
-                    self.emit_stmt(stmt);
+                if f.body.is_empty() {
+                    self.fill("pass");
+                    self.newline();
+                } else {
+                    for stmt in &f.body {
+                        self.emit_stmt(stmt);
+                    }
                 }
                 self.leave_block();
                 if !f.orelse.is_empty() {
@@ -281,10 +286,24 @@ impl Emitter {
                 self.emit_expr(&f.iter);
                 self.writeln(":");
                 self.enter_block();
-                for stmt in &f.body {
-                    self.emit_stmt(stmt);
+                if f.body.is_empty() {
+                    self.fill("pass");
+                    self.newline();
+                } else {
+                    for stmt in &f.body {
+                        self.emit_stmt(stmt);
+                    }
                 }
                 self.leave_block();
+                if !f.orelse.is_empty() {
+                    self.fill("else:");
+                    self.newline();
+                    self.enter_block();
+                    for stmt in &f.orelse {
+                        self.emit_stmt(stmt);
+                    }
+                    self.leave_block();
+                }
             }
 
             Stmt::While(w) => {
@@ -292,8 +311,13 @@ impl Emitter {
                 self.emit_expr(&w.test);
                 self.writeln(":");
                 self.enter_block();
-                for stmt in &w.body {
-                    self.emit_stmt(stmt);
+                if w.body.is_empty() {
+                    self.fill("pass");
+                    self.newline();
+                } else {
+                    for stmt in &w.body {
+                        self.emit_stmt(stmt);
+                    }
                 }
                 self.leave_block();
                 if !w.orelse.is_empty() {
@@ -312,36 +336,17 @@ impl Emitter {
                 self.emit_expr(&i.test);
                 self.writeln(":");
                 self.enter_block();
-                for stmt in &i.body {
-                    self.emit_stmt(stmt);
+                if i.body.is_empty() {
+                    self.fill("pass");
+                    self.newline();
+                } else {
+                    for stmt in &i.body {
+                        self.emit_stmt(stmt);
+                    }
                 }
                 self.leave_block();
                 // Emit elif/else clauses from the orelse list.
-                if i.orelse.len() == 1 {
-                    if let Stmt::If(elif) = &i.orelse[0] {
-                        self.fill("elif ");
-                        self.emit_expr(&elif.test);
-                        self.writeln(":");
-                        self.enter_block();
-                        for s in &elif.body {
-                            self.emit_stmt(s);
-                        }
-                        self.leave_block();
-                        for s in &elif.orelse {
-                            self.emit_stmt(s);
-                        }
-                        return;
-                    }
-                }
-                if !i.orelse.is_empty() {
-                    self.fill("else:");
-                    self.newline();
-                    self.enter_block();
-                    for stmt in &i.orelse {
-                        self.emit_stmt(stmt);
-                    }
-                    self.leave_block();
-                }
+                self.emit_elif_or_else(&i.orelse);
             }
 
             Stmt::With(w) => {
@@ -354,8 +359,13 @@ impl Emitter {
                 }
                 self.writeln(":");
                 self.enter_block();
-                for stmt in &w.body {
-                    self.emit_stmt(stmt);
+                if w.body.is_empty() {
+                    self.fill("pass");
+                    self.newline();
+                } else {
+                    for stmt in &w.body {
+                        self.emit_stmt(stmt);
+                    }
                 }
                 self.leave_block();
             }
@@ -370,8 +380,13 @@ impl Emitter {
                 }
                 self.writeln(":");
                 self.enter_block();
-                for stmt in &w.body {
-                    self.emit_stmt(stmt);
+                if w.body.is_empty() {
+                    self.fill("pass");
+                    self.newline();
+                } else {
+                    for stmt in &w.body {
+                        self.emit_stmt(stmt);
+                    }
                 }
                 self.leave_block();
             }
@@ -381,8 +396,13 @@ impl Emitter {
                 self.emit_expr(&m.subject);
                 self.writeln(":");
                 self.enter_block();
-                for case in &m.cases {
-                    self.emit_match_case(case);
+                if m.cases.is_empty() {
+                    self.fill("pass");
+                    self.newline();
+                } else {
+                    for case in &m.cases {
+                        self.emit_match_case(case);
+                    }
                 }
                 self.leave_block();
             }
@@ -404,8 +424,13 @@ impl Emitter {
                 self.fill("try:");
                 self.newline();
                 self.enter_block();
-                for stmt in &t.body {
-                    self.emit_stmt(stmt);
+                if t.body.is_empty() {
+                    self.fill("pass");
+                    self.newline();
+                } else {
+                    for stmt in &t.body {
+                        self.emit_stmt(stmt);
+                    }
                 }
                 self.leave_block();
                 for handler in &t.handlers {
@@ -435,8 +460,13 @@ impl Emitter {
                 self.fill("try:");
                 self.newline();
                 self.enter_block();
-                for stmt in &t.body {
-                    self.emit_stmt(stmt);
+                if t.body.is_empty() {
+                    self.fill("pass");
+                    self.newline();
+                } else {
+                    for stmt in &t.body {
+                        self.emit_stmt(stmt);
+                    }
                 }
                 self.leave_block();
                 for handler in &t.handlers {
@@ -577,11 +607,40 @@ impl Emitter {
             }
 
             Expr::BinOp(b) => {
-                self.emit_expr(&b.left);
+                let prec = bin_op_precedence(&b.op);
+                let left_prec = expr_precedence(&b.left);
+                let right_prec = expr_precedence(&b.right);
+                // Left child needs parens if it has strictly lower precedence,
+                // or if op is right-associative (**) and left has same precedence.
+                let left_needs_parens = if matches!(b.op, Operator::Pow) {
+                    left_prec <= prec
+                } else {
+                    left_prec < prec
+                };
+                // Right child needs parens if it has strictly lower precedence,
+                // or if op is left-associative and right has same precedence.
+                let right_needs_parens = if matches!(b.op, Operator::Pow) {
+                    right_prec < prec
+                } else {
+                    right_prec <= prec
+                };
+                if left_needs_parens {
+                    self.write("(");
+                    self.emit_expr(&b.left);
+                    self.write(")");
+                } else {
+                    self.emit_expr(&b.left);
+                }
                 self.write(" ");
                 self.write(op_symbol(&b.op));
                 self.write(" ");
-                self.emit_expr(&b.right);
+                if right_needs_parens {
+                    self.write("(");
+                    self.emit_expr(&b.right);
+                    self.write(")");
+                } else {
+                    self.emit_expr(&b.right);
+                }
             }
 
             Expr::UnaryOp(u) => {
@@ -806,7 +865,10 @@ impl Emitter {
             }
 
             Expr::Tuple(t) => {
-                if t.elts.len() == 1 {
+                self.write("(");
+                if t.elts.is_empty() {
+                    // empty tuple: ()
+                } else if t.elts.len() == 1 {
                     self.emit_expr(&t.elts[0]);
                     self.write(",");
                 } else {
@@ -819,6 +881,7 @@ impl Emitter {
                         first = false;
                     }
                 }
+                self.write(")");
             }
 
             Expr::Slice(s) => {
@@ -846,7 +909,7 @@ impl Emitter {
             Constant::Bool(b) => self.write(if *b { "True" } else { "False" }),
             Constant::Str(s) => {
                 self.write("\"");
-                let escaped = s.as_str().replace('\\', "\\\\").replace('"', "\\\"");
+                let escaped = escape_python_string(s.as_str());
                 self.write(&escaped);
                 self.write("\"");
             }
@@ -1022,8 +1085,13 @@ impl Emitter {
                 }
                 self.writeln(":");
                 self.enter_block();
-                for stmt in &h.body {
-                    self.emit_stmt(stmt);
+                if h.body.is_empty() {
+                    self.fill("pass");
+                    self.newline();
+                } else {
+                    for stmt in &h.body {
+                        self.emit_stmt(stmt);
+                    }
                 }
                 self.leave_block();
             }
@@ -1039,8 +1107,13 @@ impl Emitter {
         }
         self.writeln(":");
         self.enter_block();
-        for stmt in &case.body {
-            self.emit_stmt(stmt);
+        if case.body.is_empty() {
+            self.fill("pass");
+            self.newline();
+        } else {
+            for stmt in &case.body {
+                self.emit_stmt(stmt);
+            }
         }
         self.leave_block();
     }
@@ -1135,6 +1208,38 @@ impl Emitter {
             }
         }
     }
+    /// Recursively emit `elif`/`else` chains from the `orelse` list of an
+    /// `if` or `elif` node.
+    fn emit_elif_or_else(&mut self, orelse: &[Stmt<TextRange>]) {
+        if orelse.len() == 1 {
+            if let Stmt::If(elif) = &orelse[0] {
+                self.fill("elif ");
+                self.emit_expr(&elif.test);
+                self.writeln(":");
+                self.enter_block();
+                if elif.body.is_empty() {
+                    self.fill("pass");
+                    self.newline();
+                } else {
+                    for s in &elif.body {
+                        self.emit_stmt(s);
+                    }
+                }
+                self.leave_block();
+                self.emit_elif_or_else(&elif.orelse);
+                return;
+            }
+        }
+        if !orelse.is_empty() {
+            self.fill("else:");
+            self.newline();
+            self.enter_block();
+            for stmt in orelse {
+                self.emit_stmt(stmt);
+            }
+            self.leave_block();
+        }
+    }
 }
 
 impl Default for Emitter {
@@ -1159,6 +1264,67 @@ fn op_symbol(op: &Operator) -> &'static str {
         Operator::BitAnd => "&",
         Operator::FloorDiv => "//",
     }
+}
+
+/// Return the precedence of a binary operator (higher = tighter binding).
+fn bin_op_precedence(op: &Operator) -> u8 {
+    match op {
+        Operator::Pow => 12,
+        Operator::Mult
+        | Operator::MatMult
+        | Operator::Div
+        | Operator::Mod
+        | Operator::FloorDiv => 11,
+        Operator::Add | Operator::Sub => 10,
+        Operator::LShift | Operator::RShift => 9,
+        Operator::BitAnd => 8,
+        Operator::BitXor => 7,
+        Operator::BitOr => 6,
+    }
+}
+
+/// Return the precedence of an expression (higher = tighter binding).
+///
+/// Atoms and most complex expressions are assigned `u8::MAX` since they are
+/// already self-delimiting (names, calls, subscripts, literals, etc.).
+/// Only expression types that can appear as a child of a BinOp without
+/// parentheses and whose precedence matters are given explicit values.
+fn expr_precedence(expr: &Expr<TextRange>) -> u8 {
+    match expr {
+        Expr::Lambda(_) => 1,
+        Expr::IfExp(_) => 2,
+        Expr::BoolOp(b) => match b.op {
+            BoolOp::Or => 3,
+            BoolOp::And => 4,
+        },
+        // Comparisons have lower precedence than arithmetic.
+        Expr::Compare(_) => 5,
+        Expr::BinOp(b) => bin_op_precedence(&b.op),
+        // Unary operators bind tighter than binary arithmetic.
+        Expr::UnaryOp(_) => 13,
+        // Everything else (atoms, calls, subscripts, etc.) is self-delimiting.
+        _ => u8::MAX,
+    }
+}
+
+/// Escape a Python string value for use inside double-quoted string literals.
+fn escape_python_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x00'..='\x1f' | '\x7f' => {
+                // Other ASCII control characters.
+                out.push_str(&format!("\\x{:02x}", ch as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1192,5 +1358,71 @@ mod tests {
         let out = round_trip(src);
         assert!(out.contains("import os"), "got: {}", out);
         assert!(out.contains("from pathlib import Path"), "got: {}", out);
+    }
+
+    #[test]
+    fn elif_chain_preserved() {
+        let src = "if a:\n    x = 1\nelif b:\n    x = 2\nelif c:\n    x = 3\nelse:\n    x = 4\n";
+        let out = round_trip(src);
+        assert!(out.contains("elif b:"), "missing elif b, got: {}", out);
+        assert!(out.contains("elif c:"), "missing elif c, got: {}", out);
+        assert!(out.contains("else:"), "missing else, got: {}", out);
+    }
+
+    #[test]
+    fn async_for_else_emitted() {
+        let src = "async def f():\n    async for x in it:\n        pass\n    else:\n        pass\n";
+        let out = round_trip(src);
+        assert!(out.contains("else:"), "async for else block dropped, got: {}", out);
+    }
+
+    #[test]
+    fn binary_precedence_parens() {
+        // (a + b) * c — the addition is the left child of *, needs parens.
+        let src = "x = (a + b) * c\n";
+        let out = round_trip(src);
+        assert!(
+            out.contains("(a + b) * c"),
+            "missing parens for precedence, got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn tuple_empty() {
+        let src = "x = ()\n";
+        let out = round_trip(src);
+        assert!(out.contains("()"), "empty tuple wrong, got: {}", out);
+    }
+
+    #[test]
+    fn tuple_single_element() {
+        let src = "x = (1,)\n";
+        let out = round_trip(src);
+        assert!(out.contains("(1,)"), "1-tuple wrong, got: {}", out);
+    }
+
+    #[test]
+    fn tuple_multi_element() {
+        let src = "x = (1, 2, 3)\n";
+        let out = round_trip(src);
+        assert!(out.contains("(1, 2, 3)"), "tuple wrong, got: {}", out);
+    }
+
+    #[test]
+    fn string_escaping_newline() {
+        // A string containing a literal newline must be escaped.
+        let src = "x = \"hello\\nworld\"\n";
+        let out = round_trip(src);
+        // The emitted string should not contain a raw newline inside the quotes.
+        let inner = out
+            .trim()
+            .trim_start_matches("x = ")
+            .trim_matches('"');
+        assert!(
+            !inner.contains('\n'),
+            "raw newline in emitted string, got: {:?}",
+            out
+        );
     }
 }

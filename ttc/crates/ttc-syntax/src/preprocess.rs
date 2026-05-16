@@ -31,50 +31,82 @@ pub struct PreprocessResult {
 /// Strip Typhon-specific keywords from `source` and return the Python-
 /// compatible string together with restoration metadata.
 ///
-/// Strategy: process the source line by line.  For each line, if the
-/// non-whitespace prefix is `val ` or `var `, strip the keyword and the
-/// single space that follows it, keeping any leading indentation intact.
+/// Strategy: process the source line by line, tracking whether we are inside
+/// a multi-line string or a single-line comment so that `val`/`var` inside
+/// those contexts are left untouched.
 pub fn preprocess(source: &str) -> PreprocessResult {
     let mut python_source = String::with_capacity(source.len());
     let mut stripped = Vec::new();
     let mut line_index: usize = 0;
 
+    // Track multi-line string state: `Some(delim)` when inside a triple-quoted
+    // string, where `delim` is either `"\"\"\"" ` or `"'''"`.
+    let mut in_multiline_string: Option<&'static str> = None;
+
     for line in source.split_inclusive('\n') {
+        // If we are currently inside a multi-line string, scan the line for
+        // the closing delimiter.  We do not attempt to strip keywords from
+        // inside multi-line strings.
+        if let Some(delim) = in_multiline_string {
+            python_source.push_str(line);
+            if line.contains(delim) {
+                in_multiline_string = None;
+            }
+            line_index += 1;
+            continue;
+        }
+
+        // Check whether this line opens a multi-line string.  We scan the
+        // line content to detect triple-quote openers that are not closed on
+        // the same line.  This is intentionally conservative: it handles the
+        // common cases without a full lexer.
+        let opens_multiline = detect_unclosed_triple_quote(line);
+
         // Find leading whitespace.
         let indent_len = line
             .find(|c: char| !c.is_whitespace())
             .unwrap_or(line.len());
         let rest = &line[indent_len..];
 
+        // Lines that are entirely within a comment cannot be declarations.
+        let is_comment = rest.starts_with('#');
+
         let mut found = false;
-        for kw in &[TyphonKeyword::Val, TyphonKeyword::Var] {
-            let prefix = kw.as_str(); // "val" or "var"
-            // Check that the line starts with the keyword followed by a space.
-            if rest.starts_with(prefix)
-                && rest.len() > prefix.len()
-                && rest.as_bytes()[prefix.len()] == b' '
-            {
-                // Emit the leading indentation unchanged.
-                let indent = &line[..indent_len];
-                python_source.push_str(indent);
+        if !is_comment && opens_multiline.is_none() {
+            for kw in &[TyphonKeyword::Val, TyphonKeyword::Var] {
+                let prefix = kw.as_str(); // "val" or "var"
+                // Check that the line starts with the keyword followed by a space.
+                if rest.starts_with(prefix)
+                    && rest.len() > prefix.len()
+                    && rest.as_bytes()[prefix.len()] == b' '
+                {
+                    // Emit the leading indentation unchanged.
+                    let indent = &line[..indent_len];
+                    python_source.push_str(indent);
 
-                // Record the keyword at its 0-based line index.
-                stripped.push(StrippedKeyword {
-                    line_index,
-                    keyword: *kw,
-                });
+                    // Record the keyword at its 0-based line index.
+                    stripped.push(StrippedKeyword {
+                        line_index,
+                        keyword: *kw,
+                    });
 
-                // Skip keyword + one space; emit the rest of the line.
-                let after_kw = &rest[prefix.len() + 1..];
-                python_source.push_str(after_kw);
+                    // Skip keyword + one space; emit the rest of the line.
+                    let after_kw = &rest[prefix.len() + 1..];
+                    python_source.push_str(after_kw);
 
-                found = true;
-                break;
+                    found = true;
+                    break;
+                }
             }
         }
 
         if !found {
             python_source.push_str(line);
+        }
+
+        // Update multi-line string state after processing the line.
+        if let Some(delim) = opens_multiline {
+            in_multiline_string = Some(delim);
         }
 
         line_index += 1;
@@ -84,6 +116,50 @@ pub fn preprocess(source: &str) -> PreprocessResult {
         python_source,
         stripped,
     }
+}
+
+/// Detect whether `line` opens a triple-quoted string that is not closed on
+/// the same line.  Returns `Some(delimiter)` if so, `None` otherwise.
+///
+/// This is a simple heuristic: it finds the first triple-quote sequence
+/// (`"""` or `'''`) in the line (outside a `#` comment) and checks whether a
+/// matching closing sequence appears later on the same line.
+fn detect_unclosed_triple_quote(line: &str) -> Option<&'static str> {
+    let line_bytes = line.as_bytes();
+    let len = line_bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        let ch = line_bytes[i] as char;
+        // Stop at a comment character (outside a string we haven't entered yet).
+        if ch == '#' {
+            break;
+        }
+        // Look for triple-quote openers.
+        for &delim in &[r#"""""#, "'''"] {
+            if line[i..].starts_with(delim) {
+                // Found an opener.  Search for a matching closer after it.
+                let after_open = i + delim.len();
+                if let Some(close_pos) = line[after_open..].find(delim) {
+                    // Closed on the same line — skip past the closer and continue.
+                    i = after_open + close_pos + delim.len();
+                } else {
+                    // Not closed — the multi-line string continues.
+                    let delim_str: &'static str = if delim.starts_with('"') {
+                        "\"\"\""
+                    } else {
+                        "'''"
+                    };
+                    return Some(delim_str);
+                }
+                // Don't increment `i` again — the outer loop will handle it.
+                continue;
+            }
+        }
+        i += 1;
+    }
+
+    None
 }
 
 /// Restore stripped keywords into a normalised Python source string.
@@ -171,6 +247,24 @@ mod tests {
     #[test]
     fn plain_python_unchanged() {
         let src = "x: int = 1\n";
+        let result = preprocess(src);
+        assert_eq!(result.python_source, src);
+        assert!(result.stripped.is_empty());
+    }
+
+    #[test]
+    fn val_in_comment_not_stripped() {
+        // A line that is a comment should not have val/var stripped.
+        let src = "# val x: int = 1\n";
+        let result = preprocess(src);
+        assert_eq!(result.python_source, src);
+        assert!(result.stripped.is_empty());
+    }
+
+    #[test]
+    fn val_in_multiline_string_not_stripped() {
+        // val/var inside a triple-quoted string must not be stripped.
+        let src = "x = \"\"\"\nval y: int = 1\n\"\"\"\n";
         let result = preprocess(src);
         assert_eq!(result.python_source, src);
         assert!(result.stripped.is_empty());

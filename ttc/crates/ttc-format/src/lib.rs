@@ -64,14 +64,23 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TtcError>
 
 /// Normalise whitespace in a Python-compatible source string.
 ///
-/// - Expands tabs to 4 spaces.
+/// - Expands leading-indentation tabs to 4 spaces (tabs inside string
+///   literals or after non-whitespace are left intact to avoid corrupting
+///   string contents).
 /// - Strips trailing whitespace from each line.
 /// - Ensures the file ends with exactly one `\n`.
 fn normalise_whitespace(source: &str) -> String {
-    let expanded = source.replace('\t', "    ");
-    let mut result = String::with_capacity(expanded.len());
-    for line in expanded.lines() {
-        result.push_str(line.trim_end());
+    let mut result = String::with_capacity(source.len());
+    for line in source.lines() {
+        // Expand tabs only in the leading whitespace portion.
+        let indent_end = line
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(line.len());
+        let leading = &line[..indent_end];
+        let rest = line[indent_end..].trim_end();
+        let expanded_leading = leading.replace('\t', "    ");
+        result.push_str(&expanded_leading);
+        result.push_str(rest);
         result.push('\n');
     }
     // If source was empty do not add a spurious newline.
@@ -156,5 +165,31 @@ mod tests {
     fn format_error_on_invalid_syntax() {
         let result = format_source("def (broken:", "<test>");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn format_expands_leading_tabs_only() {
+        // A tab at the start of a line (indentation) should be expanded.
+        // Use a function body so the indented line is valid Python.
+        let src = "def f():\n\tx: int = 1\n";
+        let result = format_source(src, "<test>").unwrap();
+        assert!(
+            result.output.contains("    x"),
+            "leading tab should expand to spaces, got: {:?}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn format_preserves_tab_in_string() {
+        // A tab inside a string literal must not be replaced.
+        let src = "x = \"hello\\tworld\"\n";
+        let result = format_source(src, "<test>").unwrap();
+        // The output should still contain the \t escape (as two chars: backslash + t).
+        assert!(
+            result.output.contains("\\t"),
+            "tab escape in string should be preserved, got: {:?}",
+            result.output
+        );
     }
 }
