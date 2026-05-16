@@ -4,6 +4,9 @@
 //! `src` directory, runs the full preprocess → parse → resolve → type-check
 //! → emit pipeline on each, and writes the resulting `.py` files to the
 //! configured `out` directory (mirroring the source tree structure).
+//!
+//! Output files are only written once all source files have been checked
+//! with no errors, so a failing build never leaves stale or partial artifacts.
 
 use std::path::PathBuf;
 
@@ -13,6 +16,7 @@ use miette::{miette, Result};
 use tyc_db::{build_file, TycDatabase};
 use tyc_diagnostics::{Diagnostics, TycError};
 
+use crate::commands::util::collect_ty_files;
 use crate::config::TyphonConfig;
 
 /// Header prepended to every emitted `.py` file.
@@ -29,7 +33,7 @@ pub struct BuildArgs {
     #[arg(long, short = 'o', value_name = "DIR")]
     pub out: Option<PathBuf>,
 
-    /// Skip formatting the emitted Python.
+    /// Skip ruff post-formatting of emitted Python (reserved; formatting is Phase 2).
     #[arg(long)]
     pub no_format: bool,
 }
@@ -73,22 +77,25 @@ pub fn run(args: BuildArgs) -> Result<()> {
         ));
     }
 
-    std::fs::create_dir_all(&out_dir)
-        .map_err(|e| miette!("cannot create output directory {}: {}", out_dir.display(), e))?;
+    let paths = collect_ty_files(&src_dir)?;
 
+    if paths.is_empty() {
+        eprintln!("tyc build: no .ty files found in {}", src_dir.display());
+        return Ok(());
+    }
+
+    // Phase 1: run the full pipeline over every source file, collecting
+    // diagnostics and buffering outputs. Nothing is written to disk yet.
     let mut all_diags = Diagnostics::new();
-    let mut file_count = 0usize;
-    let mut emit_count = 0usize;
+    let mut pending: Vec<(PathBuf, String)> = Vec::new();
     let mut db = TycDatabase::new();
 
-    collect_ty_files(&src_dir, &mut |path| {
-        file_count += 1;
-
+    for path in &paths {
         let source = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) => {
                 all_diags.push_error(TycError::io(path.display().to_string(), &e));
-                return;
+                continue;
             }
         };
 
@@ -97,29 +104,17 @@ pub fn run(args: BuildArgs) -> Result<()> {
         all_diags.extend(file_diags);
 
         if let Some(python_src) = emitted {
-            // src/foo/bar.ty  →  out/foo/bar.py
             let rel = path.strip_prefix(&src_dir).unwrap_or(path.as_path());
             let out_path = out_dir.join(rel).with_extension("py");
-
-            if let Some(parent) = out_path.parent() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    all_diags.push_error(TycError::io(parent.display().to_string(), &e));
-                    return;
-                }
-            }
-
-            let mut content = String::with_capacity(GENERATED_HEADER.len() + python_src.len());
+            let mut content =
+                String::with_capacity(GENERATED_HEADER.len() + python_src.len());
             content.push_str(GENERATED_HEADER);
             content.push_str(&python_src);
-
-            match std::fs::write(&out_path, content.as_bytes()) {
-                Ok(()) => emit_count += 1,
-                Err(e) => all_diags
-                    .push_error(TycError::io(out_path.display().to_string(), &e)),
-            }
+            pending.push((out_path, content));
         }
-    })?;
+    }
 
+    // Phase 2: report errors and stop without touching the output tree.
     if all_diags.has_errors() {
         for err in all_diags.errors() {
             eprintln!("{:?}", miette::Report::new_boxed(Box::new(err.clone())));
@@ -127,44 +122,34 @@ pub fn run(args: BuildArgs) -> Result<()> {
         return Err(miette!(
             "{} error(s) in {} file(s)",
             all_diags.error_count(),
-            file_count
+            paths.len()
         ));
     }
 
-    if file_count == 0 {
-        eprintln!("tyc build: no .ty files found in {}", src_dir.display());
-    } else {
-        println!(
-            "built {} file(s) → {}",
-            emit_count,
-            out_dir.display()
-        );
-    }
+    // Phase 3: all clean — create the output directory and write files.
+    std::fs::create_dir_all(&out_dir)
+        .map_err(|e| miette!("cannot create output directory {}: {}", out_dir.display(), e))?;
 
-    Ok(())
-}
-
-fn collect_ty_files<F>(root: &PathBuf, f: &mut F) -> Result<()>
-where
-    F: FnMut(&PathBuf),
-{
-    if root.is_file() {
-        if root.extension().map(|e| e == "ty").unwrap_or(false) {
-            f(root);
+    let mut emit_count = 0usize;
+    for (out_path, content) in &pending {
+        if let Some(parent) = out_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!(
+                    "{:?}",
+                    miette!("cannot create {}: {}", parent.display(), e)
+                );
+                continue;
+            }
         }
-        return Ok(());
-    }
-    if root.is_dir() {
-        let entries = std::fs::read_dir(root)
-            .map_err(|e| miette!("cannot read directory {}: {}", root.display(), e))?;
-        let mut paths: Vec<PathBuf> = entries
-            .map(|res| res.map(|e| e.path()))
-            .collect::<std::io::Result<Vec<_>>>()
-            .map_err(|e| miette!("cannot read directory entry in {}: {}", root.display(), e))?;
-        paths.sort();
-        for path in paths {
-            collect_ty_files(&path, f)?;
+        match std::fs::write(out_path, content.as_bytes()) {
+            Ok(()) => emit_count += 1,
+            Err(e) => eprintln!(
+                "{:?}",
+                miette!("cannot write {}: {}", out_path.display(), e)
+            ),
         }
     }
+
+    println!("built {} file(s) → {}", emit_count, out_dir.display());
     Ok(())
 }
