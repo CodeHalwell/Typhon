@@ -34,6 +34,7 @@ pub struct FormatResult {
 /// Format the Typhon source in `source`, returning the formatted string.
 ///
 /// `path` is used only for diagnostic messages.
+#[allow(clippy::result_large_err)]
 pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError> {
     // Step 1: pre-process — strip Typhon keywords.
     let prep = preprocess(source);
@@ -100,9 +101,10 @@ fn normalise_whitespace(source: &str) -> String {
 /// Format the `.ty` file at `path` in place.
 ///
 /// Returns `true` if the file was changed.
+#[allow(clippy::result_large_err)]
 pub fn format_file(path: &Path) -> Result<bool, TycError> {
-    let source = std::fs::read_to_string(path)
-        .map_err(|e| TycError::io(path.display().to_string(), &e))?;
+    let source =
+        std::fs::read_to_string(path).map_err(|e| TycError::io(path.display().to_string(), &e))?;
 
     let path_str = path.display().to_string();
     let result = format_source(&source, &path_str)?;

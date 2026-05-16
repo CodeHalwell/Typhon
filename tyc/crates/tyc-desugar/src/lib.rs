@@ -22,7 +22,8 @@ use std::collections::{HashMap, HashSet};
 
 use rustpython_ast::{
     text_size::TextRange, Alias, Arg, ArgWithDefault, Constant, Expr, ExprCall, ExprConstant,
-    ExprContext, ExprName, Identifier, Mod, ModModule, Stmt, StmtImport, StmtImportFrom,
+    ExprContext, ExprName, Identifier, Mod, ModModule, Stmt, StmtAssign, StmtImport,
+    StmtImportFrom,
 };
 
 // ── public API ───────────────────────────────────────────────────────────────
@@ -119,13 +120,17 @@ fn stmts_use_result_names(stmts: &[Stmt<TextRange>]) -> bool {
 fn stmt_uses_result_names(stmt: &Stmt<TextRange>) -> bool {
     match stmt {
         Stmt::FunctionDef(f) => {
-            f.returns.as_ref().map_or(false, |r| expr_uses_result_names(r))
+            f.returns
+                .as_ref()
+                .is_some_and(|r| expr_uses_result_names(r))
                 || arguments_use_result_names(&f.args)
                 || f.decorator_list.iter().any(expr_uses_result_names)
                 || stmts_use_result_names(&f.body)
         }
         Stmt::AsyncFunctionDef(f) => {
-            f.returns.as_ref().map_or(false, |r| expr_uses_result_names(r))
+            f.returns
+                .as_ref()
+                .is_some_and(|r| expr_uses_result_names(r))
                 || arguments_use_result_names(&f.args)
                 || f.decorator_list.iter().any(expr_uses_result_names)
                 || stmts_use_result_names(&f.body)
@@ -138,17 +143,14 @@ fn stmt_uses_result_names(stmt: &Stmt<TextRange>) -> bool {
         }
         Stmt::AnnAssign(a) => {
             expr_uses_result_names(&a.annotation)
-                || a.value.as_ref().map_or(false, |v| expr_uses_result_names(v))
+                || a.value.as_ref().is_some_and(|v| expr_uses_result_names(v))
                 || expr_uses_result_names(&a.target)
         }
         Stmt::Assign(a) => {
-            expr_uses_result_names(&a.value)
-                || a.targets.iter().any(expr_uses_result_names)
+            expr_uses_result_names(&a.value) || a.targets.iter().any(expr_uses_result_names)
         }
-        Stmt::AugAssign(a) => {
-            expr_uses_result_names(&a.target) || expr_uses_result_names(&a.value)
-        }
-        Stmt::Return(r) => r.value.as_ref().map_or(false, |v| expr_uses_result_names(v)),
+        Stmt::AugAssign(a) => expr_uses_result_names(&a.target) || expr_uses_result_names(&a.value),
+        Stmt::Return(r) => r.value.as_ref().is_some_and(|v| expr_uses_result_names(v)),
         Stmt::Expr(e) => expr_uses_result_names(&e.value),
         Stmt::If(i) => {
             expr_uses_result_names(&i.test)
@@ -173,12 +175,10 @@ fn stmt_uses_result_names(stmt: &Stmt<TextRange>) -> bool {
                 || stmts_use_result_names(&f.orelse)
         }
         Stmt::With(w) => {
-            w.items.iter().any(with_item_uses_result_names)
-                || stmts_use_result_names(&w.body)
+            w.items.iter().any(with_item_uses_result_names) || stmts_use_result_names(&w.body)
         }
         Stmt::AsyncWith(w) => {
-            w.items.iter().any(with_item_uses_result_names)
-                || stmts_use_result_names(&w.body)
+            w.items.iter().any(with_item_uses_result_names) || stmts_use_result_names(&w.body)
         }
         Stmt::Try(t) => {
             stmts_use_result_names(&t.body)
@@ -197,22 +197,20 @@ fn stmt_uses_result_names(stmt: &Stmt<TextRange>) -> bool {
                 || m.cases.iter().any(|case| {
                     case.guard
                         .as_ref()
-                        .map_or(false, |g| expr_uses_result_names(g))
+                        .is_some_and(|g| expr_uses_result_names(g))
                         || stmts_use_result_names(&case.body)
                 })
         }
         Stmt::Raise(r) => {
-            r.exc.as_ref().map_or(false, |e| expr_uses_result_names(e))
-                || r.cause.as_ref().map_or(false, |c| expr_uses_result_names(c))
+            r.exc.as_ref().is_some_and(|e| expr_uses_result_names(e))
+                || r.cause.as_ref().is_some_and(|c| expr_uses_result_names(c))
         }
         Stmt::Assert(a) => {
             expr_uses_result_names(&a.test)
-                || a.msg.as_ref().map_or(false, |m| expr_uses_result_names(m))
+                || a.msg.as_ref().is_some_and(|m| expr_uses_result_names(m))
         }
         Stmt::Delete(d) => d.targets.iter().any(expr_uses_result_names),
-        Stmt::TypeAlias(t) => {
-            expr_uses_result_names(&t.name) || expr_uses_result_names(&t.value)
-        }
+        Stmt::TypeAlias(t) => expr_uses_result_names(&t.name) || expr_uses_result_names(&t.value),
         _ => false,
     }
 }
@@ -221,17 +219,20 @@ fn arguments_use_result_names(args: &rustpython_ast::Arguments<TextRange>) -> bo
     let plain_arg_uses = |arg: &rustpython_ast::Arg<TextRange>| {
         arg.annotation
             .as_ref()
-            .map_or(false, |a| expr_uses_result_names(a))
+            .is_some_and(|a| expr_uses_result_names(a))
     };
     let with_default_uses = |arg: &rustpython_ast::ArgWithDefault<TextRange>| {
         plain_arg_uses(&arg.def)
-            || arg.default.as_ref().map_or(false, |d| expr_uses_result_names(d))
+            || arg
+                .default
+                .as_ref()
+                .is_some_and(|d| expr_uses_result_names(d))
     };
     args.posonlyargs.iter().any(with_default_uses)
         || args.args.iter().any(with_default_uses)
         || args.kwonlyargs.iter().any(with_default_uses)
-        || args.vararg.as_ref().map_or(false, |a| plain_arg_uses(a))
-        || args.kwarg.as_ref().map_or(false, |a| plain_arg_uses(a))
+        || args.vararg.as_ref().is_some_and(|a| plain_arg_uses(a))
+        || args.kwarg.as_ref().is_some_and(|a| plain_arg_uses(a))
 }
 
 fn with_item_uses_result_names(item: &rustpython_ast::WithItem<TextRange>) -> bool {
@@ -239,17 +240,12 @@ fn with_item_uses_result_names(item: &rustpython_ast::WithItem<TextRange>) -> bo
         || item
             .optional_vars
             .as_ref()
-            .map_or(false, |v| expr_uses_result_names(v))
+            .is_some_and(|v| expr_uses_result_names(v))
 }
 
-fn except_handler_uses_result_names(
-    handler: &rustpython_ast::ExceptHandler<TextRange>,
-) -> bool {
+fn except_handler_uses_result_names(handler: &rustpython_ast::ExceptHandler<TextRange>) -> bool {
     let rustpython_ast::ExceptHandler::ExceptHandler(h) = handler;
-    h.type_
-        .as_ref()
-        .map_or(false, |t| expr_uses_result_names(t))
-        || stmts_use_result_names(&h.body)
+    h.type_.as_ref().is_some_and(|t| expr_uses_result_names(t)) || stmts_use_result_names(&h.body)
 }
 
 fn expr_uses_result_names(expr: &Expr<TextRange>) -> bool {
@@ -260,18 +256,13 @@ fn expr_uses_result_names(expr: &Expr<TextRange>) -> bool {
                 || c.args.iter().any(expr_uses_result_names)
                 || c.keywords.iter().any(|k| expr_uses_result_names(&k.value))
         }
-        Expr::Subscript(s) => {
-            expr_uses_result_names(&s.value) || expr_uses_result_names(&s.slice)
-        }
+        Expr::Subscript(s) => expr_uses_result_names(&s.value) || expr_uses_result_names(&s.slice),
         Expr::BinOp(b) => expr_uses_result_names(&b.left) || expr_uses_result_names(&b.right),
         Expr::BoolOp(b) => b.values.iter().any(expr_uses_result_names),
         Expr::UnaryOp(u) => expr_uses_result_names(&u.operand),
-        Expr::NamedExpr(n) => {
-            expr_uses_result_names(&n.target) || expr_uses_result_names(&n.value)
-        }
+        Expr::NamedExpr(n) => expr_uses_result_names(&n.target) || expr_uses_result_names(&n.value),
         Expr::Compare(c) => {
-            expr_uses_result_names(&c.left)
-                || c.comparators.iter().any(expr_uses_result_names)
+            expr_uses_result_names(&c.left) || c.comparators.iter().any(expr_uses_result_names)
         }
         Expr::Lambda(l) => expr_uses_result_names(&l.body),
         Expr::IfExp(i) => {
@@ -285,7 +276,7 @@ fn expr_uses_result_names(expr: &Expr<TextRange>) -> bool {
         Expr::Dict(d) => {
             d.keys
                 .iter()
-                .any(|k| k.as_ref().map_or(false, expr_uses_result_names))
+                .any(|k| k.as_ref().is_some_and(expr_uses_result_names))
                 || d.values.iter().any(expr_uses_result_names)
         }
         Expr::ListComp(c) => {
@@ -306,13 +297,13 @@ fn expr_uses_result_names(expr: &Expr<TextRange>) -> bool {
                 || d.generators.iter().any(comprehension_uses_result_names)
         }
         Expr::Await(a) => expr_uses_result_names(&a.value),
-        Expr::Yield(y) => y.value.as_ref().map_or(false, |v| expr_uses_result_names(v)),
+        Expr::Yield(y) => y.value.as_ref().is_some_and(|v| expr_uses_result_names(v)),
         Expr::YieldFrom(y) => expr_uses_result_names(&y.value),
         Expr::Starred(s) => expr_uses_result_names(&s.value),
         Expr::Slice(s) => {
-            s.lower.as_ref().map_or(false, |e| expr_uses_result_names(e))
-                || s.upper.as_ref().map_or(false, |e| expr_uses_result_names(e))
-                || s.step.as_ref().map_or(false, |e| expr_uses_result_names(e))
+            s.lower.as_ref().is_some_and(|e| expr_uses_result_names(e))
+                || s.upper.as_ref().is_some_and(|e| expr_uses_result_names(e))
+                || s.step.as_ref().is_some_and(|e| expr_uses_result_names(e))
         }
         Expr::FormattedValue(f) => expr_uses_result_names(&f.value),
         Expr::JoinedStr(j) => j.values.iter().any(expr_uses_result_names),
@@ -322,9 +313,7 @@ fn expr_uses_result_names(expr: &Expr<TextRange>) -> bool {
     }
 }
 
-fn comprehension_uses_result_names(
-    gen: &rustpython_ast::Comprehension<TextRange>,
-) -> bool {
+fn comprehension_uses_result_names(gen: &rustpython_ast::Comprehension<TextRange>) -> bool {
     expr_uses_result_names(&gen.target)
         || expr_uses_result_names(&gen.iter)
         || gen.ifs.iter().any(expr_uses_result_names)
@@ -337,7 +326,10 @@ fn comprehension_uses_result_names(
 /// calling `typhon_runtime.Ok(...)` via the bare-import / qualified style).
 fn has_any_typhon_runtime_import(body: &[Stmt<TextRange>]) -> bool {
     body.iter().any(|stmt| match stmt {
-        Stmt::Import(imp) => imp.names.iter().any(|a| a.name.as_str() == "typhon_runtime"),
+        Stmt::Import(imp) => imp
+            .names
+            .iter()
+            .any(|a| a.name.as_str() == "typhon_runtime"),
         Stmt::ImportFrom(imp) => imp.module.as_deref() == Some("typhon_runtime"),
         _ => false,
     })
@@ -480,13 +472,30 @@ fn desugar_stmt(stmt: &Stmt<TextRange>) -> (Stmt<TextRange>, bool) {
             // already carry the right base class from preprocessing.
             let needs_decorator =
                 !is_pydantic && !is_impl_stub && !has_dataclass_decorator(&c.decorator_list);
+            // Pydantic `model` classes must have `model_config = ConfigDict(extra="forbid")`
+            // as their first body statement unless the user already defined it.
+            let needs_model_config =
+                is_pydantic && !is_impl_stub && !has_model_config_stmt(&c.body);
             let (new_body, body_transformed) = desugar_stmts(&c.body);
             let mut new_class = c.clone();
             new_class.body = new_body;
             if needs_decorator {
-                new_class.decorator_list.insert(0, make_dataclasses_dot_dataclass_call());
+                new_class
+                    .decorator_list
+                    .insert(0, make_dataclasses_dot_dataclass_call());
             }
-            (Stmt::ClassDef(new_class), needs_decorator || body_transformed)
+            if needs_model_config {
+                new_class.body.insert(0, make_model_config_stmt());
+            }
+            // Only propagate `true` when a dataclass decorator was added (or
+            // was added deeper in the body) — that's the signal used by
+            // `desugar_mod_module` to decide whether to inject `import dataclasses`.
+            // `needs_model_config` is a pydantic-only change and must not trigger
+            // the dataclasses import.
+            (
+                Stmt::ClassDef(new_class),
+                needs_decorator || body_transformed,
+            )
         }
         Stmt::FunctionDef(f) => {
             let (new_body, transformed) = desugar_stmts(&f.body);
@@ -586,9 +595,9 @@ fn stmts_use_basemodel(stmts: &[Stmt<TextRange>]) -> bool {
 
 /// Return `true` if `c` inherits directly from `BaseModel`.
 fn class_inherits_basemodel(c: &rustpython_ast::StmtClassDef<TextRange>) -> bool {
-    c.bases.iter().any(|base| {
-        matches!(base, rustpython_ast::Expr::Name(n) if n.id.as_str() == "BaseModel")
-    })
+    c.bases
+        .iter()
+        .any(|base| matches!(base, rustpython_ast::Expr::Name(n) if n.id.as_str() == "BaseModel"))
 }
 
 /// Return `true` if the module already has `from pydantic import BaseModel`
@@ -611,17 +620,73 @@ fn has_pydantic_import(body: &[Stmt<TextRange>]) -> bool {
     })
 }
 
-/// Build `from pydantic import BaseModel`.
+/// Build `from pydantic import BaseModel, ConfigDict`.
 fn make_pydantic_basemodel_import() -> Stmt<TextRange> {
     Stmt::ImportFrom(StmtImportFrom {
         range: TextRange::default(),
         module: Some(Identifier::new("pydantic")),
-        names: vec![Alias {
-            range: TextRange::default(),
-            name: Identifier::new("BaseModel"),
-            asname: None,
-        }],
+        names: vec![
+            Alias {
+                range: TextRange::default(),
+                name: Identifier::new("BaseModel"),
+                asname: None,
+            },
+            Alias {
+                range: TextRange::default(),
+                name: Identifier::new("ConfigDict"),
+                asname: None,
+            },
+        ],
         level: None,
+    })
+}
+
+/// Return `true` if `body` already contains a `model_config = ...` statement.
+fn has_model_config_stmt(body: &[Stmt<TextRange>]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::Assign(a) => a
+            .targets
+            .iter()
+            .any(|t| matches!(t, Expr::Name(n) if n.id.as_str() == "model_config")),
+        Stmt::AnnAssign(a) => {
+            matches!(a.target.as_ref(), Expr::Name(n) if n.id.as_str() == "model_config")
+        }
+        _ => false,
+    })
+}
+
+/// Build `model_config = ConfigDict(extra="forbid")`.
+fn make_model_config_stmt() -> Stmt<TextRange> {
+    use rustpython_ast::Keyword;
+
+    let config_dict_call = Expr::Call(ExprCall {
+        range: TextRange::default(),
+        func: Box::new(Expr::Name(ExprName {
+            range: TextRange::default(),
+            id: Identifier::new("ConfigDict"),
+            ctx: ExprContext::Load,
+        })),
+        args: vec![],
+        keywords: vec![Keyword {
+            range: TextRange::default(),
+            arg: Some(Identifier::new("extra")),
+            value: Expr::Constant(ExprConstant {
+                range: TextRange::default(),
+                value: Constant::Str("forbid".to_string()),
+                kind: None,
+            }),
+        }],
+    });
+
+    Stmt::Assign(StmtAssign {
+        range: TextRange::default(),
+        targets: vec![Expr::Name(ExprName {
+            range: TextRange::default(),
+            id: Identifier::new("model_config"),
+            ctx: ExprContext::Store,
+        })],
+        value: Box::new(config_dict_call),
+        type_comment: None,
     })
 }
 
@@ -632,7 +697,7 @@ fn make_pydantic_basemodel_import() -> Stmt<TextRange> {
 /// - `@dataclasses.dataclass`
 /// - `@dataclasses.dataclass(...)`
 fn has_dataclass_decorator(decorators: &[rustpython_ast::Expr<TextRange>]) -> bool {
-    decorators.iter().any(|d| is_dataclass_expr(d))
+    decorators.iter().any(is_dataclass_expr)
 }
 
 fn is_dataclass_expr(expr: &rustpython_ast::Expr<TextRange>) -> bool {
@@ -707,8 +772,7 @@ fn merge_impl_blocks(body: Vec<Stmt<TextRange>>) -> (Vec<Stmt<TextRange>>, bool)
     let mut impl_methods_map: HashMap<String, Vec<Stmt<TextRange>>> = HashMap::new();
     for (impl_idx, target_name) in &impl_indices {
         if let Stmt::ClassDef(c) = &body[*impl_idx] {
-            let methods: Vec<Stmt<TextRange>> =
-                c.body.iter().map(insert_self_param).collect();
+            let methods: Vec<Stmt<TextRange>> = c.body.iter().map(insert_self_param).collect();
             impl_methods_map
                 .entry(target_name.clone())
                 .or_default()
@@ -792,10 +856,7 @@ fn insert_self_param(stmt: &Stmt<TextRange>) -> Stmt<TextRange> {
         Some("self")
     }
 
-    fn inject(
-        args: &mut rustpython_ast::Arguments<TextRange>,
-        receiver: &'static str,
-    ) {
+    fn inject(args: &mut rustpython_ast::Arguments<TextRange>, receiver: &'static str) {
         if first_param_name(args) == Some(receiver) {
             return; // already present — do not duplicate
         }
@@ -844,7 +905,10 @@ mod tests {
     fn plain_class_gets_dataclass_decorator() {
         let src = "class Point:\n    x: int\n    y: int\n";
         let out = parse_and_desugar(src);
-        assert!(out.contains("@dataclasses.dataclass(slots=True)"), "output:\n{out}");
+        assert!(
+            out.contains("@dataclasses.dataclass(slots=True)"),
+            "output:\n{out}"
+        );
         assert!(out.contains("import dataclasses"), "output:\n{out}");
     }
 
@@ -861,14 +925,23 @@ mod tests {
         let out = parse_and_desugar(src);
         assert!(!out.contains("slots=True"), "output:\n{out}");
         // No second import injected.
-        assert_eq!(out.matches("import dataclasses").count(), 1, "output:\n{out}");
+        assert_eq!(
+            out.matches("import dataclasses").count(),
+            1,
+            "output:\n{out}"
+        );
     }
 
     #[test]
     fn class_with_qualified_dataclass_call_not_duplicated() {
-        let src = "import dataclasses\n\n@dataclasses.dataclass(slots=True)\nclass Point:\n    x: int\n";
+        let src =
+            "import dataclasses\n\n@dataclasses.dataclass(slots=True)\nclass Point:\n    x: int\n";
         let out = parse_and_desugar(src);
-        assert_eq!(out.matches("@dataclasses.dataclass").count(), 1, "output:\n{out}");
+        assert_eq!(
+            out.matches("@dataclasses.dataclass").count(),
+            1,
+            "output:\n{out}"
+        );
     }
 
     #[test]
@@ -882,15 +955,26 @@ mod tests {
     fn multiple_classes_one_import() {
         let src = "class A:\n    x: int\n\nclass B:\n    y: str\n";
         let out = parse_and_desugar(src);
-        assert_eq!(out.matches("import dataclasses").count(), 1, "output:\n{out}");
-        assert_eq!(out.matches("@dataclasses.dataclass(slots=True)").count(), 2, "output:\n{out}");
+        assert_eq!(
+            out.matches("import dataclasses").count(),
+            1,
+            "output:\n{out}"
+        );
+        assert_eq!(
+            out.matches("@dataclasses.dataclass(slots=True)").count(),
+            2,
+            "output:\n{out}"
+        );
     }
 
     #[test]
     fn class_inside_function_is_desugared() {
         let src = "def make_point():\n    class Point:\n        x: int\n    return Point\n";
         let out = parse_and_desugar(src);
-        assert!(out.contains("@dataclasses.dataclass(slots=True)"), "output:\n{out}");
+        assert!(
+            out.contains("@dataclasses.dataclass(slots=True)"),
+            "output:\n{out}"
+        );
         assert!(out.contains("import dataclasses"), "output:\n{out}");
     }
 
@@ -898,7 +982,11 @@ mod tests {
     fn nested_class_inside_class_is_desugared() {
         let src = "class Outer:\n    x: int\n    class Inner:\n        y: int\n";
         let out = parse_and_desugar(src);
-        assert_eq!(out.matches("@dataclasses.dataclass(slots=True)").count(), 2, "output:\n{out}");
+        assert_eq!(
+            out.matches("@dataclasses.dataclass(slots=True)").count(),
+            2,
+            "output:\n{out}"
+        );
     }
 
     #[test]
@@ -906,7 +994,9 @@ mod tests {
         let src = "from __future__ import annotations\n\nclass Point:\n    x: int\n";
         let out = parse_and_desugar(src);
         let future_pos = out.find("from __future__").expect("future import missing");
-        let import_pos = out.find("import dataclasses").expect("dataclasses import missing");
+        let import_pos = out
+            .find("import dataclasses")
+            .expect("dataclasses import missing");
         assert!(
             future_pos < import_pos,
             "from __future__ must precede import dataclasses\noutput:\n{out}"
@@ -919,7 +1009,9 @@ mod tests {
         let out = parse_and_desugar(src);
         let doc_pos = out.find("Module docstring").expect("docstring missing");
         let future_pos = out.find("from __future__").expect("future import missing");
-        let import_pos = out.find("import dataclasses").expect("dataclasses import missing");
+        let import_pos = out
+            .find("import dataclasses")
+            .expect("dataclasses import missing");
         assert!(doc_pos < future_pos, "output:\n{out}");
         assert!(future_pos < import_pos, "output:\n{out}");
     }
@@ -983,7 +1075,10 @@ mod tests {
         let src = "def f() -> None:\n    x = Ok(1)\n";
         let m = parse(src, Mode::Module, "<test>").expect("parse failed");
         let output = desugar_module(&m);
-        assert!(output.needs_typhon_runtime, "flag should be true when Ok is used");
+        assert!(
+            output.needs_typhon_runtime,
+            "flag should be true when Ok is used"
+        );
     }
 
     #[test]
@@ -991,7 +1086,10 @@ mod tests {
         let src = "x: int = 1\n";
         let m = parse(src, Mode::Module, "<test>").expect("parse failed");
         let output = desugar_module(&m);
-        assert!(!output.needs_typhon_runtime, "flag should be false when Result not used");
+        assert!(
+            !output.needs_typhon_runtime,
+            "flag should be false when Result not used"
+        );
     }
 
     #[test]
@@ -999,8 +1097,13 @@ mod tests {
         let src = "\"\"\"Module doc.\"\"\"\ndef f() -> None:\n    x = Ok(1)\n";
         let out = parse_and_desugar(src);
         let doc_pos = out.find("Module doc").expect("docstring missing");
-        let import_pos = out.find("from typhon_runtime").expect("runtime import missing");
-        assert!(doc_pos < import_pos, "runtime import must follow docstring\noutput:\n{out}");
+        let import_pos = out
+            .find("from typhon_runtime")
+            .expect("runtime import missing");
+        assert!(
+            doc_pos < import_pos,
+            "runtime import must follow docstring\noutput:\n{out}"
+        );
     }
 
     // ── Result detection: extended statement coverage ────────────────────────
@@ -1119,7 +1222,8 @@ mod tests {
     fn partial_from_import_still_injects_full_import() {
         // User imported only `Ok` — the emitted module also uses `Result`,
         // so injection must still run to bring `Err`/`Result` into scope.
-        let src = "from typhon_runtime import Ok\n\ndef f() -> Result[int, str]:\n    return Ok(1)\n";
+        let src =
+            "from typhon_runtime import Ok\n\ndef f() -> Result[int, str]:\n    return Ok(1)\n";
         let out = parse_and_desugar(src);
         assert!(
             out.contains("from typhon_runtime import Ok, Err, Result"),
@@ -1160,8 +1264,14 @@ mod tests {
         // Simulates what the preprocessor produces from `impl User:`.
         let src = "class User:\n    name: str\n\nclass __typhon_impl_User(object):\n    def greet():\n        return 'Hello'\n";
         let out = parse_and_desugar(src);
-        assert!(out.contains("def greet(self):"), "self must be injected; output:\n{out}");
-        assert!(!out.contains("__typhon_impl_"), "impl stub must be removed; output:\n{out}");
+        assert!(
+            out.contains("def greet(self):"),
+            "self must be injected; output:\n{out}"
+        );
+        assert!(
+            !out.contains("__typhon_impl_"),
+            "impl stub must be removed; output:\n{out}"
+        );
     }
 
     #[test]
@@ -1180,7 +1290,11 @@ mod tests {
     fn impl_block_multiple_methods_all_get_self() {
         let src = "class Point:\n    x: int\n    y: int\n\nclass __typhon_impl_Point(object):\n    def translate():\n        pass\n    def scale():\n        pass\n";
         let out = parse_and_desugar(src);
-        assert_eq!(out.matches("def translate(self):").count(), 1, "output:\n{out}");
+        assert_eq!(
+            out.matches("def translate(self):").count(),
+            1,
+            "output:\n{out}"
+        );
         assert_eq!(out.matches("def scale(self):").count(), 1, "output:\n{out}");
     }
 
@@ -1197,15 +1311,24 @@ mod tests {
     fn impl_block_async_method_gets_self() {
         let src = "class Fetcher:\n    url: str\n\nclass __typhon_impl_Fetcher(object):\n    async def fetch():\n        pass\n";
         let out = parse_and_desugar(src);
-        assert!(out.contains("async def fetch(self):"), "async method must get self; output:\n{out}");
-        assert!(!out.contains("__typhon_impl_"), "impl stub must be removed; output:\n{out}");
+        assert!(
+            out.contains("async def fetch(self):"),
+            "async method must get self; output:\n{out}"
+        );
+        assert!(
+            !out.contains("__typhon_impl_"),
+            "impl stub must be removed; output:\n{out}"
+        );
     }
 
     #[test]
     fn impl_block_staticmethod_no_self_injected() {
         let src = "class Util:\n    x: int\n\nclass __typhon_impl_Util(object):\n    @staticmethod\n    def helper():\n        pass\n";
         let out = parse_and_desugar(src);
-        assert!(out.contains("def helper():"), "staticmethod must not get self; output:\n{out}");
+        assert!(
+            out.contains("def helper():"),
+            "staticmethod must not get self; output:\n{out}"
+        );
         assert!(!out.contains("def helper(self)"), "output:\n{out}");
     }
 
@@ -1213,7 +1336,10 @@ mod tests {
     fn impl_block_classmethod_gets_cls() {
         let src = "class Repo:\n    name: str\n\nclass __typhon_impl_Repo(object):\n    @classmethod\n    def create():\n        return cls()\n";
         let out = parse_and_desugar(src);
-        assert!(out.contains("def create(cls):"), "classmethod must get cls; output:\n{out}");
+        assert!(
+            out.contains("def create(cls):"),
+            "classmethod must get cls; output:\n{out}"
+        );
         assert!(!out.contains("def create(self)"), "output:\n{out}");
     }
 
@@ -1257,8 +1383,7 @@ mod tests {
 
     #[test]
     fn existing_pydantic_import_not_duplicated() {
-        let src =
-            "from pydantic import BaseModel\n\nclass User(BaseModel):\n    id: int\n";
+        let src = "from pydantic import BaseModel\n\nclass User(BaseModel):\n    id: int\n";
         let out = parse_and_desugar(src);
         assert_eq!(
             out.matches("from pydantic import BaseModel").count(),
@@ -1269,12 +1394,75 @@ mod tests {
 
     #[test]
     fn plain_class_and_model_class_in_same_module() {
-        let src =
-            "class Point:\n    x: int\n\nclass User(BaseModel):\n    id: int\n";
+        let src = "class Point:\n    x: int\n\nclass User(BaseModel):\n    id: int\n";
         let out = parse_and_desugar(src);
-        assert!(out.contains("@dataclasses.dataclass(slots=True)"), "Point needs dataclass\noutput:\n{out}");
-        assert!(out.contains("from pydantic import BaseModel"), "User needs pydantic\noutput:\n{out}");
-        assert!(!out.contains("@dataclasses.dataclass") || out.matches("@dataclasses.dataclass").count() == 1,
-            "User must NOT get dataclass decorator\noutput:\n{out}");
+        assert!(
+            out.contains("@dataclasses.dataclass(slots=True)"),
+            "Point needs dataclass\noutput:\n{out}"
+        );
+        assert!(
+            out.contains("from pydantic import BaseModel"),
+            "User needs pydantic\noutput:\n{out}"
+        );
+        assert!(
+            !out.contains("@dataclasses.dataclass")
+                || out.matches("@dataclasses.dataclass").count() == 1,
+            "User must NOT get dataclass decorator\noutput:\n{out}"
+        );
+    }
+
+    // ── Pydantic ConfigDict(extra="forbid") injection ─────────────────────────
+
+    #[test]
+    fn model_class_gets_model_config_forbid() {
+        let src = "class ApiUser(BaseModel):\n    id: int\n    email: str\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("model_config = ConfigDict(extra=\"forbid\")"),
+            "BaseModel class must get model_config = ConfigDict(extra=\"forbid\")\noutput:\n{out}"
+        );
+    }
+
+    #[test]
+    fn model_class_import_includes_config_dict() {
+        let src = "class ApiUser(BaseModel):\n    id: int\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("ConfigDict"),
+            "injected pydantic import must include ConfigDict\noutput:\n{out}"
+        );
+        assert!(
+            out.contains("from pydantic import"),
+            "pydantic import must be present\noutput:\n{out}"
+        );
+    }
+
+    #[test]
+    fn model_class_existing_model_config_not_duplicated() {
+        let src = "class ApiUser(BaseModel):\n    model_config = ConfigDict(extra=\"allow\")\n    id: int\n";
+        let out = parse_and_desugar(src);
+        assert_eq!(
+            out.matches("model_config").count(),
+            1,
+            "existing model_config must not be duplicated\noutput:\n{out}"
+        );
+        assert!(
+            out.contains("extra=\"allow\""),
+            "user-defined model_config must be preserved\noutput:\n{out}"
+        );
+    }
+
+    #[test]
+    fn model_config_is_first_body_statement() {
+        let src = "class ApiUser(BaseModel):\n    id: int\n    name: str\n";
+        let out = parse_and_desugar(src);
+        let model_config_pos = out
+            .find("model_config")
+            .expect("model_config must be present");
+        let id_pos = out.find("id: int").expect("id field must be present");
+        assert!(
+            model_config_pos < id_pos,
+            "model_config must precede field declarations\noutput:\n{out}"
+        );
     }
 }

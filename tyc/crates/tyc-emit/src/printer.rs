@@ -5,8 +5,8 @@
 //! input (whitespace and comment differences are acceptable in Phase 0).
 
 use rustpython_ast::{
-    text_size::TextRange, Alias, ArgWithDefault, BoolOp, CmpOp, Comprehension, ExceptHandler,
-    Expr, Keyword, MatchCase, Mod, Operator, Pattern, Stmt, UnaryOp, WithItem,
+    text_size::TextRange, Alias, ArgWithDefault, BoolOp, CmpOp, Comprehension, ExceptHandler, Expr,
+    Keyword, MatchCase, Mod, Operator, Pattern, Stmt, UnaryOp, WithItem,
 };
 
 /// Internal state for the Python pretty-printer.
@@ -1235,11 +1235,9 @@ fn op_symbol(op: &Operator) -> &'static str {
 fn bin_op_precedence(op: &Operator) -> u8 {
     match op {
         Operator::Pow => 14,
-        Operator::Mult
-        | Operator::MatMult
-        | Operator::Div
-        | Operator::Mod
-        | Operator::FloorDiv => 12,
+        Operator::Mult | Operator::MatMult | Operator::Div | Operator::Mod | Operator::FloorDiv => {
+            12
+        }
         Operator::Add | Operator::Sub => 11,
         Operator::LShift | Operator::RShift => 10,
         Operator::BitAnd => 9,

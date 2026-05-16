@@ -128,8 +128,8 @@ pub fn preprocess(source: &str) -> PreprocessResult {
                     || rest.as_bytes()["model ".len()] == b'_')
             {
                 let after_model = &rest["model ".len()..]; // e.g. "User:\n"
-                // Find the `:` that opens the class body (last `:` not inside
-                // parentheses/brackets on this line).
+                                                           // Find the `:` that opens the class body (last `:` not inside
+                                                           // parentheses/brackets on this line).
                 if let Some(class_body) = make_model_class_line(after_model) {
                     stripped.push(StrippedKeyword {
                         line_index,
@@ -158,13 +158,9 @@ pub fn preprocess(source: &str) -> PreprocessResult {
                 let after_comptime = &rest["comptime ".len()..];
                 // Extract the inner keyword (val/var) if present.
                 let (inner_kw, payload) =
-                    if after_comptime.starts_with("val ")
-                        && after_comptime.len() > 4
-                    {
+                    if after_comptime.starts_with("val ") && after_comptime.len() > 4 {
                         (Some(TyphonKeyword::Val), &after_comptime["val ".len()..])
-                    } else if after_comptime.starts_with("var ")
-                        && after_comptime.len() > 4
-                    {
+                    } else if after_comptime.starts_with("var ") && after_comptime.len() > 4 {
                         (Some(TyphonKeyword::Var), &after_comptime["var ".len()..])
                     } else {
                         (None, after_comptime)
@@ -172,7 +168,7 @@ pub fn preprocess(source: &str) -> PreprocessResult {
 
                 // Extract the binding name (first identifier before `:` or `=`).
                 let binding_name = payload
-                    .split(|c: char| c == ':' || c == '=')
+                    .split([':', '='])
                     .next()
                     .unwrap_or("")
                     .trim()
@@ -298,10 +294,10 @@ fn make_model_class_line(after_model: &str) -> Option<String> {
     let colon_pos = colon_pos?;
     let name = after_model[..colon_pos].trim_end();
     let tail = &after_model[colon_pos..]; // ":\n" or ":"
-    // If `name` already ends with `)` it has existing bases — merge BaseModel
-    // into the list.  Otherwise wrap with `(BaseModel)`.
-    let new_name = if name.ends_with(')') {
-        format!("{}, BaseModel)", &name[..name.len() - 1])
+                                          // If `name` already ends with `)` it has existing bases — merge BaseModel
+                                          // into the list.  Otherwise wrap with `(BaseModel)`.
+    let new_name = if let Some(stripped) = name.strip_suffix(')') {
+        format!("{stripped}, BaseModel)")
     } else {
         format!("{}(BaseModel)", name)
     };
@@ -329,10 +325,7 @@ enum StringMode {
 /// Known limitation: `?` inside an f-string expression (e.g. `f"{x?}"`) is
 /// treated as string content and not rewritten — supporting it requires a
 /// nested expression scanner, which is deferred.
-fn rewrite_optionals(
-    line: &str,
-    in_string: &mut Option<StringMode>,
-) -> (String, Vec<usize>) {
+fn rewrite_optionals(line: &str, in_string: &mut Option<StringMode>) -> (String, Vec<usize>) {
     let mut out = String::with_capacity(line.len());
     let mut marks = Vec::new();
     let mut last_char: Option<char> = None;
@@ -426,7 +419,10 @@ fn rewrite_optionals(
     }
 
     // Single/double-quoted strings cannot span a newline.
-    if matches!(*in_string, Some(StringMode::Single) | Some(StringMode::Double)) {
+    if matches!(
+        *in_string,
+        Some(StringMode::Single) | Some(StringMode::Double)
+    ) {
         *in_string = None;
     }
 
@@ -454,7 +450,10 @@ pub fn postprocess(
     let mut per_line: std::collections::HashMap<usize, Vec<usize>> =
         std::collections::HashMap::new();
     for opt in optionals {
-        per_line.entry(opt.line_index).or_default().push(opt.python_col);
+        per_line
+            .entry(opt.line_index)
+            .or_default()
+            .push(opt.python_col);
     }
     for (line_idx, mut cols) in per_line {
         if line_idx >= lines.len() {
@@ -475,8 +474,10 @@ pub fn postprocess(
 
     // Restore Typhon keywords, processing from the last line to the first so
     // that line indices stay valid.
-    let mut insertions: Vec<(usize, TyphonKeyword)> =
-        stripped.iter().map(|sk| (sk.line_index, sk.keyword)).collect();
+    let mut insertions: Vec<(usize, TyphonKeyword)> = stripped
+        .iter()
+        .map(|sk| (sk.line_index, sk.keyword))
+        .collect();
     // Sort descending by line_index; for identical line_index values preserve
     // original order (stable sort) so that `val` is restored before `comptime`
     // on the same line, allowing `comptime` to be prepended on top.
@@ -582,7 +583,7 @@ pub fn validate_question_ops(source: &str) -> Vec<QuestionOpError> {
     let mut byte_offset: usize = 0;
 
     for (line_index, line) in source.split_inclusive('\n').enumerate() {
-        let raw = line.trim_end_matches(|c: char| c == '\n' || c == '\r');
+        let raw = line.trim_end_matches(['\n', '\r']);
 
         let pre_string = in_string;
         let code_end = scan_line_code_end(raw, &mut in_string);
@@ -639,8 +640,7 @@ pub fn validate_question_ops(source: &str) -> Vec<QuestionOpError> {
         // Detect `)?` — the `?` error-propagation operator.  The same pattern
         // `expand_question_ops` uses: last code char is `?`, char before is `)`.
         // This check runs for ALL lines, including `)…` continuation lines.
-        if code.ends_with('?') {
-            let before_q = &code[..code.len() - 1];
+        if let Some(before_q) = code.strip_suffix('?') {
             if before_q.ends_with(')') {
                 // Byte offset of the `?` in the original source.
                 let q_offset = byte_offset + code.len() - 1;
@@ -812,7 +812,7 @@ pub fn expand_question_ops(source: &str) -> String {
     let mut in_string: Option<StringMode> = None;
 
     for line in source.split_inclusive('\n') {
-        let raw = line.trim_end_matches(|c: char| c == '\n' || c == '\r');
+        let raw = line.trim_end_matches(['\n', '\r']);
 
         // Record string state at the start of this line.
         let pre_string = in_string;
@@ -982,9 +982,9 @@ fn scan_line_code_end(line: &str, in_string: &mut Option<StringMode>) -> usize {
 fn find_assignment_eq(s: &str) -> Option<usize> {
     let mut depth = 0i32;
     let mut in_str: Option<char> = None;
-    let mut chars = s.char_indices().peekable();
+    let chars = s.char_indices().peekable();
 
-    while let Some((i, c)) = chars.next() {
+    for (i, c) in chars {
         if let Some(q) = in_str {
             if c == q {
                 in_str = None;
@@ -999,9 +999,7 @@ fn find_assignment_eq(s: &str) -> Option<usize> {
                 // Reject `==`, `!=`, `<=`, `>=`.
                 let prev = if i > 0 { s[..i].chars().last() } else { None };
                 let next = s[i + 1..].chars().next();
-                if !matches!(prev, Some('!' | '<' | '>' | '='))
-                    && !matches!(next, Some('='))
-                {
+                if !matches!(prev, Some('!' | '<' | '>' | '=')) && !matches!(next, Some('=')) {
                     return Some(i);
                 }
             }
@@ -1113,7 +1111,10 @@ mod tests {
             "output: {}",
             result.python_source
         );
-        assert!(result.stripped.iter().any(|k| matches!(k.keyword, TyphonKeyword::Model)));
+        assert!(result
+            .stripped
+            .iter()
+            .any(|k| matches!(k.keyword, TyphonKeyword::Model)));
     }
 
     #[test]
@@ -1128,7 +1129,11 @@ mod tests {
     fn indented_model_class_preserved() {
         let src = "    model Inner:\n        x: int\n";
         let result = preprocess(src);
-        assert!(result.python_source.contains("class Inner(BaseModel):"), "output: {}", result.python_source);
+        assert!(
+            result.python_source.contains("class Inner(BaseModel):"),
+            "output: {}",
+            result.python_source
+        );
     }
 
     // ── comptime keyword ────────────────────────────────────────────────────
@@ -1144,7 +1149,10 @@ mod tests {
     #[test]
     fn comptime_var_stripped_correctly() {
         let result = preprocess("comptime var DB_URL: str = \"postgres://localhost\"\n");
-        assert_eq!(result.python_source, "DB_URL: str = \"postgres://localhost\"\n");
+        assert_eq!(
+            result.python_source,
+            "DB_URL: str = \"postgres://localhost\"\n"
+        );
         assert_eq!(result.comptime_bindings[0].name, "DB_URL");
     }
 
@@ -1163,7 +1171,10 @@ mod tests {
         let src = "val x = f()?\n";
         let out = expand_question_ops(src);
         assert!(out.contains("__typhon_q_0__ = f()"), "out: {out}");
-        assert!(out.contains("if isinstance(__typhon_q_0__, Err):"), "out: {out}");
+        assert!(
+            out.contains("if isinstance(__typhon_q_0__, Err):"),
+            "out: {out}"
+        );
         assert!(out.contains("return __typhon_q_0__"), "out: {out}");
         assert!(out.contains("val x = __typhon_q_0__.value"), "out: {out}");
     }
@@ -1173,7 +1184,10 @@ mod tests {
         let src = "save(record)?\n";
         let out = expand_question_ops(src);
         assert!(out.contains("__typhon_q_0__ = save(record)"), "out: {out}");
-        assert!(out.contains("if isinstance(__typhon_q_0__, Err):"), "out: {out}");
+        assert!(
+            out.contains("if isinstance(__typhon_q_0__, Err):"),
+            "out: {out}"
+        );
         // No binding assignment for a bare expression.
         assert!(!out.contains(".value"), "out: {out}");
     }
@@ -1193,14 +1207,20 @@ mod tests {
         let out = expand_question_ops(src);
         assert!(out.contains("    __typhon_q_0__ = compute()"), "out: {out}");
         assert!(out.contains("    if isinstance"), "out: {out}");
-        assert!(out.contains("    val y = __typhon_q_0__.value"), "out: {out}");
+        assert!(
+            out.contains("    val y = __typhon_q_0__.value"),
+            "out: {out}"
+        );
     }
 
     #[test]
     fn question_op_preserves_lhs_with_type_annotation() {
         let src = "val result: int = compute()?\n";
         let out = expand_question_ops(src);
-        assert!(out.contains("val result: int = __typhon_q_0__.value"), "out: {out}");
+        assert!(
+            out.contains("val result: int = __typhon_q_0__.value"),
+            "out: {out}"
+        );
     }
 
     #[test]
@@ -1216,7 +1236,10 @@ mod tests {
         // Trailing comment after `)` must not be seen as `)?`.
         let src = "x = f() # returns f()?\n";
         let out = expand_question_ops(src);
-        assert_eq!(out, src, "trailing comment with ')?' must not trigger expansion");
+        assert_eq!(
+            out, src,
+            "trailing comment with ')?' must not trigger expansion"
+        );
     }
 
     #[test]
@@ -1232,7 +1255,9 @@ mod tests {
         // `model User(Timestamped):` → `class User(Timestamped, BaseModel):`
         let result = preprocess("model User(Timestamped):\n    id: int\n");
         assert!(
-            result.python_source.contains("class User(Timestamped, BaseModel):"),
+            result
+                .python_source
+                .contains("class User(Timestamped, BaseModel):"),
             "got: {}",
             result.python_source
         );
@@ -1255,11 +1280,16 @@ mod tests {
     fn impl_keyword_becomes_typhon_impl_class() {
         let result = preprocess("impl User:\n    def greet():\n        pass\n");
         assert!(
-            result.python_source.contains("class __typhon_impl_User(object):"),
+            result
+                .python_source
+                .contains("class __typhon_impl_User(object):"),
             "output: {}",
             result.python_source
         );
-        assert!(result.stripped.iter().any(|k| matches!(k.keyword, TyphonKeyword::Impl)));
+        assert!(result
+            .stripped
+            .iter()
+            .any(|k| matches!(k.keyword, TyphonKeyword::Impl)));
     }
 
     #[test]
@@ -1275,7 +1305,9 @@ mod tests {
         let src = "    impl Inner:\n        def method():\n            pass\n";
         let result = preprocess(src);
         assert!(
-            result.python_source.contains("class __typhon_impl_Inner(object):"),
+            result
+                .python_source
+                .contains("class __typhon_impl_Inner(object):"),
             "output: {}",
             result.python_source
         );
@@ -1285,7 +1317,9 @@ mod tests {
     fn impl_underscore_name() {
         let result = preprocess("impl _Private:\n    def method():\n        pass\n");
         assert!(
-            result.python_source.contains("class __typhon_impl__Private(object):"),
+            result
+                .python_source
+                .contains("class __typhon_impl__Private(object):"),
             "output: {}",
             result.python_source
         );
@@ -1310,7 +1344,11 @@ mod tests {
     fn question_op_valid_in_result_function() {
         let src = "def parse(s: str) -> Result[int, str]:\n    val n = int(s)?\n    return Ok(n)\n";
         let errs = validate_question_ops(src);
-        assert!(errs.is_empty(), "expected no errors, got: {:?}", errs.iter().map(|e| &e.message).collect::<Vec<_>>());
+        assert!(
+            errs.is_empty(),
+            "expected no errors, got: {:?}",
+            errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1318,7 +1356,11 @@ mod tests {
         let src = "val x = parse()?\n";
         let errs = validate_question_ops(src);
         assert_eq!(errs.len(), 1);
-        assert!(errs[0].message.contains("module level"), "got: {}", errs[0].message);
+        assert!(
+            errs[0].message.contains("module level"),
+            "got: {}",
+            errs[0].message
+        );
         assert_eq!(errs[0].line_index, 0);
     }
 
@@ -1326,7 +1368,12 @@ mod tests {
     fn question_op_in_none_returning_function_is_error() {
         let src = "def process() -> None:\n    val x = load()?\n";
         let errs = validate_question_ops(src);
-        assert_eq!(errs.len(), 1, "expected one error, got: {:?}", errs.iter().map(|e| &e.message).collect::<Vec<_>>());
+        assert_eq!(
+            errs.len(),
+            1,
+            "expected one error, got: {:?}",
+            errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
         assert!(errs[0].message.contains("None"), "got: {}", errs[0].message);
     }
 
@@ -1335,14 +1382,22 @@ mod tests {
         let src = "def compute() -> int:\n    val x = fetch()?\n    return x\n";
         let errs = validate_question_ops(src);
         assert_eq!(errs.len(), 1);
-        assert!(errs[0].message.contains("`int`"), "got: {}", errs[0].message);
+        assert!(
+            errs[0].message.contains("`int`"),
+            "got: {}",
+            errs[0].message
+        );
     }
 
     #[test]
     fn question_op_in_nested_result_function_is_valid() {
         let src = "def outer() -> None:\n    def inner() -> Result[int, str]:\n        val x = load()?\n        return Ok(x)\n";
         let errs = validate_question_ops(src);
-        assert!(errs.is_empty(), "expected no errors, got: {:?}", errs.iter().map(|e| &e.message).collect::<Vec<_>>());
+        assert!(
+            errs.is_empty(),
+            "expected no errors, got: {:?}",
+            errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1352,8 +1407,11 @@ mod tests {
         // type from the signature-closer and correctly accepts the `?` use.
         let src = "def process(\n    x: int,\n) -> Result[int, str]:\n    val y = load()?\n";
         let errs = validate_question_ops(src);
-        assert!(errs.is_empty(), "multi-line sig with Result return must not error: {:?}",
-            errs.iter().map(|e| &e.message).collect::<Vec<_>>());
+        assert!(
+            errs.is_empty(),
+            "multi-line sig with Result return must not error: {:?}",
+            errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1427,7 +1485,11 @@ mod tests {
         let src = "def f() -> MyResult:\n    val x = load()?\n";
         let errs = validate_question_ops(src);
         assert_eq!(errs.len(), 1, "MyResult must not pass as Result context");
-        assert!(errs[0].message.contains("MyResult"), "got: {}", errs[0].message);
+        assert!(
+            errs[0].message.contains("MyResult"),
+            "got: {}",
+            errs[0].message
+        );
     }
 
     #[test]
