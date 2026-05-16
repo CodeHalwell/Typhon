@@ -96,6 +96,31 @@ pub fn preprocess(source: &str) -> PreprocessResult {
             let indent = &line[..indent_len];
             let rest = &line[indent_len..];
 
+            // ── `impl ClassName:` → `class __typhon_impl_ClassName(object):` ─
+            if rest.starts_with("impl ")
+                && rest.len() > "impl ".len()
+                && (rest.as_bytes()["impl ".len()].is_ascii_alphanumeric()
+                    || rest.as_bytes()["impl ".len()] == b'_')
+            {
+                let after_impl = &rest["impl ".len()..];
+                if let Some(class_header) = make_impl_class_line(after_impl) {
+                    stripped.push(StrippedKeyword {
+                        line_index,
+                        keyword: TyphonKeyword::Impl,
+                    });
+                    let new_line = format!("{}class {}", indent, class_header);
+                    let (rewritten, marks) = rewrite_optionals(&new_line, &mut in_string);
+                    for col in marks {
+                        optionals.push(StrippedOptional {
+                            line_index,
+                            python_col: col,
+                        });
+                    }
+                    python_source.push_str(&rewritten);
+                    continue;
+                }
+            }
+
             // ── `model ClassName:` → `class ClassName(BaseModel):` ──────────
             if rest.starts_with("model ")
                 && rest.len() > "model ".len()
@@ -214,6 +239,41 @@ pub fn preprocess(source: &str) -> PreprocessResult {
         optionals,
         comptime_bindings,
     }
+}
+
+/// Build the class-header portion of an `impl` line, converting
+/// `ClassName:\n` into `__typhon_impl_ClassName(object):\n`.
+///
+/// `impl` blocks do not accept base-class lists; any `(...)` suffix on the
+/// class name is stripped rather than forwarded, preventing a Python syntax
+/// error from a doubly-parenthesised expression like
+/// `class __typhon_impl_User(Base)(object):`.
+///
+/// Returns `None` when the line doesn't look like a class header (no `:`).
+fn make_impl_class_line(after_impl: &str) -> Option<String> {
+    let mut depth = 0i32;
+    let mut colon_pos = None;
+    for (i, c) in after_impl.char_indices() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            ':' if depth == 0 => {
+                colon_pos = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let colon_pos = colon_pos?;
+    let raw = after_impl[..colon_pos].trim_end();
+    // Strip any base-class list — `impl` blocks don't support inheritance.
+    let name = if let Some(paren) = raw.find('(') {
+        raw[..paren].trim_end()
+    } else {
+        raw
+    };
+    let tail = &after_impl[colon_pos..]; // ":\n" or ":"
+    Some(format!("__typhon_impl_{}(object){}", name, tail))
 }
 
 /// Build the class-header portion of a `model` line, converting
@@ -426,6 +486,21 @@ pub fn postprocess(
             continue;
         }
         match kw {
+            TyphonKeyword::Impl => {
+                // Restore `class __typhon_impl_X(object):` → `impl X:`.
+                let line = &lines[line_idx];
+                let indent_len = line
+                    .find(|c: char| !c.is_whitespace())
+                    .unwrap_or(line.len());
+                let content = &line[indent_len..];
+                let restored = if let Some(tail) = content.strip_prefix("class __typhon_impl_") {
+                    let tail = tail.replacen("(object)", "", 1);
+                    format!("impl {}", tail)
+                } else {
+                    format!("impl {}", content)
+                };
+                lines[line_idx] = format!("{}{}", &line[..indent_len], restored);
+            }
             TyphonKeyword::Model => {
                 // Restore `class X(BaseModel):` → `model X:`.
                 let line = &lines[line_idx];
@@ -1170,6 +1245,48 @@ mod tests {
         assert!(
             result.python_source.contains("class _Internal(BaseModel):"),
             "got: {}",
+            result.python_source
+        );
+    }
+
+    // ── impl keyword ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn impl_keyword_becomes_typhon_impl_class() {
+        let result = preprocess("impl User:\n    def greet():\n        pass\n");
+        assert!(
+            result.python_source.contains("class __typhon_impl_User(object):"),
+            "output: {}",
+            result.python_source
+        );
+        assert!(result.stripped.iter().any(|k| matches!(k.keyword, TyphonKeyword::Impl)));
+    }
+
+    #[test]
+    fn impl_keyword_round_trips_via_postprocess() {
+        let src = "impl User:\n    def greet():\n        pass\n";
+        let prep = preprocess(src);
+        let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn indented_impl_preserved() {
+        let src = "    impl Inner:\n        def method():\n            pass\n";
+        let result = preprocess(src);
+        assert!(
+            result.python_source.contains("class __typhon_impl_Inner(object):"),
+            "output: {}",
+            result.python_source
+        );
+    }
+
+    #[test]
+    fn impl_underscore_name() {
+        let result = preprocess("impl _Private:\n    def method():\n        pass\n");
+        assert!(
+            result.python_source.contains("class __typhon_impl__Private(object):"),
+            "output: {}",
             result.python_source
         );
     }

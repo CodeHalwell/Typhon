@@ -13,7 +13,8 @@ use miette::{miette, Result};
 use tyc_db::{check_file, TycDatabase};
 use tyc_diagnostics::{Diagnostics, TycError};
 
-use crate::commands::util::collect_ty_files;
+use crate::commands::util::{apply_strictness, collect_ty_files};
+use crate::config::TyphonConfig;
 
 /// Arguments for `tyc check`.
 #[derive(Args, Debug)]
@@ -24,6 +25,28 @@ pub struct CheckArgs {
 }
 
 pub fn run(args: CheckArgs) -> Result<()> {
+    // Load strictness config from `typhon.toml`, anchoring the search to the
+    // first checked path (or CWD when none is provided) so that
+    // `tyc check path/to/project` uses that project's config, not the caller's.
+    let config_start = args
+        .paths
+        .first()
+        .map(|p| {
+            if p.is_file() {
+                p.parent()
+                    .map(|d| d.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("."))
+            } else {
+                p.clone()
+            }
+        })
+        .unwrap_or_else(|| PathBuf::from("."));
+    let config = match TyphonConfig::load(&config_start) {
+        Ok(Some((_, cfg))) => cfg,
+        Ok(None) => TyphonConfig::default(),
+        Err(e) => return Err(miette!("{e}")),
+    };
+
     let mut diags = Diagnostics::new();
     let mut file_count = 0usize;
     let mut db = TycDatabase::new();
@@ -45,6 +68,14 @@ pub fn run(args: CheckArgs) -> Result<()> {
         }
     }
 
+    // Apply strictness rules (e.g. promote unused-import warnings to errors).
+    let diags = apply_strictness(diags, &config);
+
+    // Emit warnings regardless of whether there are errors.
+    for warn in diags.warnings() {
+        eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn.clone())));
+    }
+
     if diags.has_errors() {
         for err in diags.errors() {
             eprintln!("{:?}", miette::Report::new_boxed(Box::new(err.clone())));
@@ -56,6 +87,14 @@ pub fn run(args: CheckArgs) -> Result<()> {
         ));
     }
 
-    println!("checked {} file(s) — no errors", file_count);
+    if diags.warning_count() > 0 {
+        println!(
+            "checked {} file(s) — {} warning(s)",
+            file_count,
+            diags.warning_count()
+        );
+    } else {
+        println!("checked {} file(s) — no errors", file_count);
+    }
     Ok(())
 }

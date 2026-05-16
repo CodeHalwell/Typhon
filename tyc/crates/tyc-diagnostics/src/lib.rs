@@ -412,4 +412,10 @@ impl Diagnostics {
     pub fn warning_count(&self) -> usize {
         self.warnings.len()
     }
+
+    /// Consume the `Diagnostics` and return `(errors, warnings)` as owned vectors,
+    /// allowing callers to move diagnostics without cloning.
+    pub fn into_parts(self) -> (Vec<TycError>, Vec<TycError>) {
+        (self.errors, self.warnings)
+    }
 }
