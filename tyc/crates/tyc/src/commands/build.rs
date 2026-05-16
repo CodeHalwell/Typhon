@@ -458,8 +458,14 @@ async def fetch_all(id: int) -> None:
             py.contains("asyncio.TaskGroup"),
             "gather: should lower to TaskGroup, got:\n{py}"
         );
-        assert!(py.contains("_tg.create_task(fetch_user(id))"), "got:\n{py}");
-        assert!(py.contains("user = _t_user.result()"), "got:\n{py}");
+        assert!(
+            py.contains("__typhon_tg_1.create_task(fetch_user(id))"),
+            "got:\n{py}"
+        );
+        assert!(
+            py.contains("user = __typhon_t_user_1.result()"),
+            "got:\n{py}"
+        );
     }
 
     #[test]

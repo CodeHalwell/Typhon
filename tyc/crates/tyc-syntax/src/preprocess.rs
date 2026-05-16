@@ -2099,35 +2099,10 @@ fn parse_gather_binding(content: &str) -> Option<GatherBinding> {
         return None;
     }
 
-    // Find the first `=` at paren depth 0 that is not part of `==`, `!=`,
-    // `<=`, or `>=`.
-    let bytes = content.as_bytes();
-    let mut depth = 0i32;
-    let mut i = 0usize;
-    let mut eq_pos: Option<usize> = None;
-
-    while i < bytes.len() {
-        match bytes[i] {
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => {
-                if depth > 0 {
-                    depth -= 1;
-                }
-            }
-            b'=' if depth == 0 => {
-                let prev_op = i > 0 && matches!(bytes[i - 1], b'!' | b'<' | b'>' | b'=');
-                let next_eq = i + 1 < bytes.len() && bytes[i + 1] == b'=';
-                if !prev_op && !next_eq {
-                    eq_pos = Some(i);
-                    break;
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-
-    let eq = eq_pos?;
+    // Use `find_assignment_eq` which correctly handles string literals and
+    // augmented/comparison operators, so `msg = "status=ok"` doesn't split
+    // at the `=` inside the string.
+    let eq = find_assignment_eq(content)?;
     let name = content[..eq].trim();
     let expr = content[eq + 1..].trim();
 
@@ -2153,11 +2128,11 @@ fn parse_gather_binding(content: &str) -> Option<GatherBinding> {
 ///     posts  = fetch_posts(id)
 ///
 /// # Emitted Python
-/// async with asyncio.TaskGroup() as _tg:
-///     _t_user  = _tg.create_task(fetch_user(id))
-///     _t_posts = _tg.create_task(fetch_posts(id))
-/// user  = _t_user.result()
-/// posts = _t_posts.result()
+/// async with asyncio.TaskGroup() as __typhon_tg_1:
+///     __typhon_t_user_1  = __typhon_tg_1.create_task(fetch_user(id))
+///     __typhon_t_posts_1 = __typhon_tg_1.create_task(fetch_posts(id))
+/// user  = __typhon_t_user_1.result()
+/// posts = __typhon_t_posts_1.result()
 /// ```
 ///
 /// The `gather(strategy="best-effort"):` form lowers to
@@ -2237,27 +2212,32 @@ pub fn expand_gather(source: &str) -> String {
 
             if all_valid && !bindings.is_empty() {
                 counter += 1;
+                // All temporaries use a double-underscore prefix with the
+                // counter so they cannot collide with user-defined variables.
+                let tg = format!("__typhon_tg_{counter}");
                 match strategy {
                     GatherStrategy::TaskGroup => {
                         out.push_str(&format!(
-                            "{}async with asyncio.TaskGroup() as _tg:\n",
-                            gather_indent
+                            "{}async with asyncio.TaskGroup() as {}:\n",
+                            gather_indent, tg
                         ));
                         for b in &bindings {
+                            let task = format!("__typhon_t_{}_{}", b.name, counter);
                             out.push_str(&format!(
-                                "{}    _t_{} = _tg.create_task({})\n",
-                                gather_indent, b.name, b.expr
+                                "{}    {} = {}.create_task({})\n",
+                                gather_indent, task, tg, b.expr
                             ));
                         }
                         for b in &bindings {
+                            let task = format!("__typhon_t_{}_{}", b.name, counter);
                             out.push_str(&format!(
-                                "{}{} = _t_{}.result()\n",
-                                gather_indent, b.name, b.name
+                                "{}{} = {}.result()\n",
+                                gather_indent, b.name, task
                             ));
                         }
                     }
                     GatherStrategy::BestEffort => {
-                        let var = format!("_gather_{counter}");
+                        let var = format!("__typhon_gather_{counter}");
                         let exprs: Vec<&str> = bindings.iter().map(|b| b.expr.as_str()).collect();
                         out.push_str(&format!(
                             "{}{} = await asyncio.gather({}, return_exceptions=True)\n",
@@ -2344,19 +2324,29 @@ pub fn expand_go(source: &str) -> String {
 }
 
 /// Strip a trailing `# comment` from a `go` expression, respecting basic
-/// single-quoted strings. Returns the trimmed code portion.
+/// single-quoted strings and backslash escapes. Returns the trimmed code
+/// portion.
 fn go_strip_comment(s: &str) -> &str {
+    let bytes = s.as_bytes();
     let mut in_str: Option<u8> = None;
-    for (i, b) in s.bytes().enumerate() {
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
         match in_str {
             None => match b {
                 b'#' => return s[..i].trim_end(),
                 b'"' | b'\'' => in_str = Some(b),
                 _ => {}
             },
-            Some(q) if b == q => in_str = None,
-            _ => {}
+            Some(q) => {
+                if b == b'\\' {
+                    i += 1; // skip the escaped character
+                } else if b == q {
+                    in_str = None;
+                }
+            }
         }
+        i += 1;
     }
     s
 }
@@ -2375,26 +2365,41 @@ fn go_is_expr_start(s: &str) -> bool {
 /// Takes the last such occurrence so that arrow-return annotations on the RHS
 /// are handled correctly (though `go f() -> int` is not valid Typhon; users
 /// write `go f() -> handle` where `handle` is a variable name, not a type).
+///
+/// String literals (with backslash-escape awareness) are skipped so that a
+/// `->` sequence inside a string argument is not mistaken for the target arrow.
 fn parse_go_arrow(s: &str) -> Option<(String, String)> {
     let bytes = s.as_bytes();
     let mut depth = 0i32;
+    let mut in_str: Option<u8> = None;
     let mut arrow_pos: Option<usize> = None;
     let mut j = 0usize;
 
     while j < bytes.len() {
-        match bytes[j] {
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => {
-                if depth > 0 {
-                    depth -= 1;
+        let b = bytes[j];
+        match in_str {
+            Some(q) => {
+                if b == b'\\' {
+                    j += 1; // skip escaped character
+                } else if b == q {
+                    in_str = None;
                 }
             }
-            b'-' if depth == 0 && j + 1 < bytes.len() && bytes[j + 1] == b'>' => {
-                arrow_pos = Some(j);
-                j += 2;
-                continue;
-            }
-            _ => {}
+            None => match b {
+                b'"' | b'\'' => in_str = Some(b),
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => {
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                }
+                b'-' if depth == 0 && j + 1 < bytes.len() && bytes[j + 1] == b'>' => {
+                    arrow_pos = Some(j);
+                    j += 2;
+                    continue;
+                }
+                _ => {}
+            },
         }
         j += 1;
     }
@@ -3365,20 +3370,28 @@ async def fetch_all(id: int):
     return user, posts
 ";
         let out = expand_gather(src);
+        // Temporaries use counter-scoped __typhon_* names so they cannot
+        // collide with user-defined variables.
         assert!(
-            out.contains("async with asyncio.TaskGroup() as _tg:"),
-            "should emit TaskGroup: {out}"
+            out.contains("async with asyncio.TaskGroup() as __typhon_tg_1:"),
+            "should emit hygienic TaskGroup context var: {out}"
         );
         assert!(
-            out.contains("_t_user = _tg.create_task(fetch_user(id))"),
+            out.contains("__typhon_t_user_1 = __typhon_tg_1.create_task(fetch_user(id))"),
             "got: {out}"
         );
         assert!(
-            out.contains("_t_posts = _tg.create_task(fetch_posts(id))"),
+            out.contains("__typhon_t_posts_1 = __typhon_tg_1.create_task(fetch_posts(id))"),
             "got: {out}"
         );
-        assert!(out.contains("user = _t_user.result()"), "got: {out}");
-        assert!(out.contains("posts = _t_posts.result()"), "got: {out}");
+        assert!(
+            out.contains("user = __typhon_t_user_1.result()"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("posts = __typhon_t_posts_1.result()"),
+            "got: {out}"
+        );
         assert!(
             !out.contains("gather:"),
             "gather keyword must be removed: {out}"

@@ -421,10 +421,16 @@ fn make_typhon_runtime_import() -> Stmt<TextRange> {
 
 // ── asyncio import helpers ───────────────────────────────────────────────────
 
-/// Return `true` if `body` already contains `import asyncio`.
+/// Return `true` if `body` already contains `import asyncio` (with no alias).
+///
+/// `import asyncio as aio` does not bind the bare name `asyncio`, so it does
+/// not count — the generated `asyncio.TaskGroup()` call would fail at runtime.
 fn has_asyncio_import(body: &[Stmt<TextRange>]) -> bool {
     body.iter().any(|stmt| match stmt {
-        Stmt::Import(imp) => imp.names.iter().any(|a| a.name.as_str() == "asyncio"),
+        Stmt::Import(imp) => imp
+            .names
+            .iter()
+            .any(|a| a.name.as_str() == "asyncio" && a.asname.is_none()),
         _ => false,
     })
 }
@@ -443,13 +449,18 @@ fn make_asyncio_import() -> Stmt<TextRange> {
 
 // ── _typhon_spawn import helpers ─────────────────────────────────────────────
 
-/// Return `true` if `body` already imports `_typhon_spawn` from `typhon_runtime`.
+/// Return `true` if `body` already imports `_typhon_spawn` from `typhon_runtime`
+/// under the bare name (no alias).
+///
+/// `from typhon_runtime import _typhon_spawn as spawn` binds `spawn`, not
+/// `_typhon_spawn`, so it does not satisfy the generated call sites.
 fn has_typhon_spawn_import(body: &[Stmt<TextRange>]) -> bool {
     body.iter().any(|stmt| match stmt {
-        Stmt::ImportFrom(imp) if imp.module.as_deref() == Some("typhon_runtime") => imp
-            .names
-            .iter()
-            .any(|a| a.name.as_str() == "_typhon_spawn" || a.name.as_str() == "*"),
+        Stmt::ImportFrom(imp) if imp.module.as_deref() == Some("typhon_runtime") => {
+            imp.names.iter().any(|a| {
+                a.name.as_str() == "*" || (a.name.as_str() == "_typhon_spawn" && a.asname.is_none())
+            })
+        }
         _ => false,
     })
 }
@@ -480,14 +491,23 @@ fn stmts_use_name(stmts: &[Stmt<TextRange>], name: &str) -> bool {
 fn stmt_uses_name(stmt: &Stmt<TextRange>, name: &str) -> bool {
     match stmt {
         Stmt::FunctionDef(f) => {
-            f.returns.as_ref().is_some_and(|r| expr_uses_name(r, name))
+            f.decorator_list.iter().any(|d| expr_uses_name(d, name))
+                || f.returns.as_ref().is_some_and(|r| expr_uses_name(r, name))
+                || args_use_name(&f.args, name)
                 || stmts_use_name(&f.body, name)
         }
         Stmt::AsyncFunctionDef(f) => {
-            f.returns.as_ref().is_some_and(|r| expr_uses_name(r, name))
+            f.decorator_list.iter().any(|d| expr_uses_name(d, name))
+                || f.returns.as_ref().is_some_and(|r| expr_uses_name(r, name))
+                || args_use_name(&f.args, name)
                 || stmts_use_name(&f.body, name)
         }
-        Stmt::ClassDef(c) => stmts_use_name(&c.body, name),
+        Stmt::ClassDef(c) => {
+            c.decorator_list.iter().any(|d| expr_uses_name(d, name))
+                || c.bases.iter().any(|b| expr_uses_name(b, name))
+                || c.keywords.iter().any(|k| expr_uses_name(&k.value, name))
+                || stmts_use_name(&c.body, name)
+        }
         Stmt::AnnAssign(a) => {
             expr_uses_name(&a.annotation, name)
                 || a.value.as_ref().is_some_and(|v| expr_uses_name(v, name))
@@ -510,12 +530,14 @@ fn stmt_uses_name(stmt: &Stmt<TextRange>, name: &str) -> bool {
                 || stmts_use_name(&w.orelse, name)
         }
         Stmt::For(f) => {
-            expr_uses_name(&f.iter, name)
+            expr_uses_name(&f.target, name)
+                || expr_uses_name(&f.iter, name)
                 || stmts_use_name(&f.body, name)
                 || stmts_use_name(&f.orelse, name)
         }
         Stmt::AsyncFor(f) => {
-            expr_uses_name(&f.iter, name)
+            expr_uses_name(&f.target, name)
+                || expr_uses_name(&f.iter, name)
                 || stmts_use_name(&f.body, name)
                 || stmts_use_name(&f.orelse, name)
         }
@@ -541,8 +563,44 @@ fn stmt_uses_name(stmt: &Stmt<TextRange>, name: &str) -> bool {
                 || stmts_use_name(&t.orelse, name)
                 || stmts_use_name(&t.finalbody, name)
         }
+        Stmt::Raise(r) => {
+            r.exc.as_ref().is_some_and(|e| expr_uses_name(e, name))
+                || r.cause.as_ref().is_some_and(|c| expr_uses_name(c, name))
+        }
+        Stmt::Assert(a) => {
+            expr_uses_name(&a.test, name) || a.msg.as_ref().is_some_and(|m| expr_uses_name(m, name))
+        }
+        Stmt::Delete(d) => d.targets.iter().any(|t| expr_uses_name(t, name)),
+        Stmt::Match(m) => {
+            expr_uses_name(&m.subject, name)
+                || m.cases.iter().any(|case| {
+                    case.guard.as_ref().is_some_and(|g| expr_uses_name(g, name))
+                        || stmts_use_name(&case.body, name)
+                })
+        }
+        Stmt::TypeAlias(t) => expr_uses_name(&t.name, name) || expr_uses_name(&t.value, name),
         _ => false,
     }
+}
+
+fn args_use_name(args: &rustpython_ast::Arguments<TextRange>, name: &str) -> bool {
+    let plain_arg_uses = |arg: &rustpython_ast::Arg<TextRange>| {
+        arg.annotation
+            .as_ref()
+            .is_some_and(|a| expr_uses_name(a, name))
+    };
+    let with_default_uses = |arg: &rustpython_ast::ArgWithDefault<TextRange>| {
+        plain_arg_uses(&arg.def)
+            || arg
+                .default
+                .as_ref()
+                .is_some_and(|d| expr_uses_name(d, name))
+    };
+    args.posonlyargs.iter().any(with_default_uses)
+        || args.args.iter().any(with_default_uses)
+        || args.kwonlyargs.iter().any(with_default_uses)
+        || args.vararg.as_ref().is_some_and(|a| plain_arg_uses(a))
+        || args.kwarg.as_ref().is_some_and(|a| plain_arg_uses(a))
 }
 
 fn expr_uses_name(expr: &Expr<TextRange>, name: &str) -> bool {
