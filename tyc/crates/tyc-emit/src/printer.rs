@@ -15,8 +15,7 @@ pub struct Emitter {
     indent: usize,
     /// When true, inject `@dataclass(slots=True)` before bare class defs.
     inject_dataclass: bool,
-    /// When true, make bare class defs extend `BaseModel` (Phase 2+).
-    #[allow(dead_code)]
+    /// When true, add `BaseModel` as the base class on bare class defs.
     inject_pydantic: bool,
 }
 
@@ -180,7 +179,15 @@ impl Emitter {
                 }
                 self.fill("class ");
                 self.write(c.name.as_str());
-                if !c.bases.is_empty() || !c.keywords.is_empty() {
+                // When emitting for pydantic, add BaseModel as the base class
+                // if the class doesn't already extend it.
+                let inject_base_model = self.inject_pydantic
+                    && c.bases.is_empty()
+                    && c.keywords.is_empty()
+                    && !self.has_base_model_base(&c.bases);
+                if inject_base_model {
+                    self.write("(BaseModel)");
+                } else if !c.bases.is_empty() || !c.keywords.is_empty() {
                     self.write("(");
                     let mut first = true;
                     for base in &c.bases {
@@ -1167,14 +1174,25 @@ impl Default for Emitter {
 }
 
 impl Emitter {
-    /// Returns true if `decorators` already contains `@dataclass` (any form).
-    fn has_dataclass_decorator(&self, decorators: &[Expr<TextRange>]) -> bool {
-        decorators.iter().any(|d| match d {
+    /// Returns true if `expr` refers to any form of the `dataclass` symbol:
+    /// bare name, dotted access (`dataclasses.dataclass`), or call.
+    fn is_dataclass_expr(expr: &Expr<TextRange>) -> bool {
+        match expr {
             Expr::Name(n) => n.id.as_str() == "dataclass",
-            Expr::Call(call) => {
-                matches!(call.func.as_ref(), Expr::Name(n) if n.id.as_str() == "dataclass")
-            }
             Expr::Attribute(a) => a.attr.as_str() == "dataclass",
+            Expr::Call(c) => Self::is_dataclass_expr(&c.func),
+            _ => false,
+        }
+    }
+
+    fn has_dataclass_decorator(&self, decorators: &[Expr<TextRange>]) -> bool {
+        decorators.iter().any(|d| Self::is_dataclass_expr(d))
+    }
+
+    fn has_base_model_base(&self, bases: &[Expr<TextRange>]) -> bool {
+        bases.iter().any(|b| match b {
+            Expr::Name(n) => n.id.as_str() == "BaseModel",
+            Expr::Attribute(a) => a.attr.as_str() == "BaseModel",
             _ => false,
         })
     }

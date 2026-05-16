@@ -94,11 +94,14 @@ pub struct BuildOutput {
 /// On success returns the emitted Python source. On type errors returns
 /// `None` for the source (diagnostics still populated).
 pub fn build_file(
-    _db: &mut TycDatabase,
+    db: &mut TycDatabase,
     path: String,
     text: String,
     class_default: ClassDefault,
 ) -> BuildOutput {
+    // Register the source text as a Salsa input for consistency with
+    // check_file, so tracked queries like preprocessed_text can benefit.
+    let _ = SourceFile::new(db, path.clone(), text.clone());
     let prep = preprocess(&text);
 
     let module = match parse(&prep.python_source, Mode::Module, &path) {

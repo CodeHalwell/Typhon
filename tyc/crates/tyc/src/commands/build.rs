@@ -61,11 +61,16 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 } else {
                     project_dir.clone()
                 };
+                // Default output is `<project_dir>/build`, not `<parent>/build`.
                 let out = args.out.clone().unwrap_or_else(|| {
-                    project_dir
-                        .parent()
-                        .unwrap_or(&project_dir)
-                        .join("build")
+                    if project_dir.is_file() {
+                        project_dir
+                            .parent()
+                            .unwrap_or(&project_dir)
+                            .join("build")
+                    } else {
+                        project_dir.join("build")
+                    }
                 });
                 (src, out, ClassDefault::default())
             }
@@ -120,7 +125,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
             for err in output.diagnostics.errors() {
                 eprintln!(
                     "{:?}",
-                    miette::Report::new_boxed(Box::new(err.clone()))
+                    miette::Report::new(err.clone())
                 );
             }
             error_count += output.diagnostics.error_count();
@@ -179,11 +184,15 @@ where
         return Ok(());
     }
     if root.is_dir() {
-        let entries = std::fs::read_dir(root)
+        let read_dir = std::fs::read_dir(root)
             .map_err(|e| miette!("cannot read directory {}: {}", root.display(), e))?;
-        let mut paths: Vec<PathBuf> = entries
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .collect();
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for entry in read_dir {
+            let entry = entry.map_err(|e| {
+                miette!("error reading entry in {}: {}", root.display(), e)
+            })?;
+            paths.push(entry.path());
+        }
         paths.sort();
         for path in paths {
             collect_ty_files(&path, f)?;
