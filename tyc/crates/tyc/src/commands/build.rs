@@ -12,6 +12,7 @@ use rustpython_parser::{parse, Mode};
 use tyc_db::{check_file, TycDatabase};
 use tyc_desugar::desugar_module;
 use tyc_emit::emit;
+use tyc_format::format_source;
 use tyc_syntax::preprocess::preprocess;
 
 use crate::config::TyphonConfig;
@@ -24,6 +25,7 @@ pub struct BuildArgs {
     pub path: PathBuf,
 
     /// Write output to this directory instead of the configured `out` dir.
+    /// Relative paths are resolved against the project root.
     #[arg(long, short = 'o', value_name = "DIR")]
     pub out: Option<PathBuf>,
 
@@ -37,18 +39,39 @@ pub fn run(args: BuildArgs) -> Result<()> {
         miette!("cannot resolve path '{}': {}", args.path.display(), e)
     })?;
 
-    // Load typhon.toml (or use defaults if none found).
-    let config = match TyphonConfig::load(&project_root) {
-        Ok(Some((_, cfg))) => cfg,
+    // Load typhon.toml, anchoring src/out to the directory that contains it
+    // so that `tyc build` works correctly when invoked from a subdirectory.
+    let (config_dir, config) = match TyphonConfig::load(&project_root) {
+        Ok(Some((toml_path, cfg))) => {
+            let dir = toml_path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| project_root.clone());
+            (dir, cfg)
+        }
         Ok(None) => {
             eprintln!("warning: no typhon.toml found; using defaults");
-            TyphonConfig::default()
+            (project_root.clone(), TyphonConfig::default())
         }
         Err(e) => return Err(miette!("{e}")),
     };
 
-    let src_dir = project_root.join(&config.project.src);
-    let out_dir = args.out.unwrap_or_else(|| project_root.join(&config.project.out));
+    let src_dir = config_dir.join(&config.project.src);
+
+    // Resolve --out relative to project_root so `tyc build path/to/proj -o build`
+    // writes to `path/to/proj/build` rather than the caller's cwd.
+    let out_dir = match args.out {
+        Some(out) => {
+            if out.is_absolute() {
+                out
+            } else {
+                project_root.join(out)
+            }
+        }
+        None => config_dir.join(&config.project.out),
+    };
+
+    let do_format = config.emit.format && !args.no_format;
 
     if !src_dir.exists() {
         return Err(miette!(
@@ -105,7 +128,17 @@ pub fn run(args: BuildArgs) -> Result<()> {
             .map_err(|e| miette!("parse error in '{}': {e}", path.display()))?;
 
         let desugared = desugar_module(&module);
-        let python_src = emit(&desugared);
+        let mut python_src = emit(&desugared);
+
+        // Optionally normalise whitespace in the emitted Python (tabs → spaces,
+        // trailing whitespace, final newline).  Full ruff-style reformatting
+        // will replace this when the ruff vendor fork lands in Phase 3.
+        if do_format {
+            let path_str = path.display().to_string();
+            if let Ok(result) = format_source(&python_src, &path_str) {
+                python_src = result.output;
+            }
+        }
 
         let rel = path.strip_prefix(&src_dir).map_err(|_| {
             miette!("'{}' is outside the source directory", path.display())
