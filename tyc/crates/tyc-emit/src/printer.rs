@@ -99,6 +99,7 @@ impl Emitter {
                 }
                 self.fill("def ");
                 self.write(f.name.as_str());
+                self.emit_type_params(&f.type_params);
                 self.write("(");
                 self.emit_arguments(&f.args);
                 self.write(")");
@@ -128,6 +129,7 @@ impl Emitter {
                 }
                 self.fill("async def ");
                 self.write(f.name.as_str());
+                self.emit_type_params(&f.type_params);
                 self.write("(");
                 self.emit_arguments(&f.args);
                 self.write(")");
@@ -157,6 +159,7 @@ impl Emitter {
                 }
                 self.fill("class ");
                 self.write(c.name.as_str());
+                self.emit_type_params(&c.type_params);
                 if !c.bases.is_empty() || !c.keywords.is_empty() {
                     self.write("(");
                     let mut first = true;
@@ -517,11 +520,46 @@ impl Emitter {
             Stmt::TypeAlias(t) => {
                 self.fill("type ");
                 self.emit_expr(&t.name);
+                self.emit_type_params(&t.type_params);
                 self.write(" = ");
                 self.emit_expr(&t.value);
                 self.newline();
             }
         }
+    }
+
+    /// Emit a PEP 695 type-parameter list (`[T]`, `[T: Number]`, `[*Ts, **P]`).
+    /// No output when the list is empty.
+    fn emit_type_params(&mut self, params: &[rustpython_ast::TypeParam<TextRange>]) {
+        if params.is_empty() {
+            return;
+        }
+        self.write("[");
+        let mut first = true;
+        for tp in params {
+            if !first {
+                self.write(", ");
+            }
+            first = false;
+            match tp {
+                rustpython_ast::TypeParam::TypeVar(t) => {
+                    self.write(t.name.as_str());
+                    if let Some(bound) = &t.bound {
+                        self.write(": ");
+                        self.emit_expr(bound);
+                    }
+                }
+                rustpython_ast::TypeParam::ParamSpec(p) => {
+                    self.write("**");
+                    self.write(p.name.as_str());
+                }
+                rustpython_ast::TypeParam::TypeVarTuple(t) => {
+                    self.write("*");
+                    self.write(t.name.as_str());
+                }
+            }
+        }
+        self.write("]");
     }
 
     // ── expressions ────────────────────────────────────────────────────────

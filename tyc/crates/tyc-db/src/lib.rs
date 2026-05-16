@@ -14,7 +14,8 @@ use rustpython_parser::{parse, Mode};
 use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_resolve::resolve_module;
 use tyc_syntax::preprocess::{
-    expand_pipes, expand_question_ops, expand_with_chains, preprocess, validate_question_ops,
+    expand_gather_blocks, expand_go_calls, expand_pipes, expand_question_ops, expand_with_chains,
+    preprocess, validate_lazy_usage, validate_question_ops,
 };
 use tyc_types::check_module;
 
@@ -39,8 +40,10 @@ pub struct SourceFile {
 pub fn preprocessed_text(db: &dyn salsa::Database, file: SourceFile) -> String {
     let text = file.text(db);
     // Apply Typhon sugar expansion in the same order as `check_file` and the
-    // build pipeline: `with`-chains, then pipes, then `?`.
-    let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(text)));
+    // build pipeline: gather → go → with-chains → pipes → `?`.
+    let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
+        &expand_gather_blocks(text),
+    ))));
     preprocess(&expanded).python_source
 }
 
@@ -114,6 +117,17 @@ pub fn check_file(db: &mut TycDatabase, path: String, text: String) -> Diagnosti
             1,
         ));
     }
+    // Reject unsupported `lazy from … import …` constructs early so the
+    // downstream parser doesn't try to give a misleading diagnostic.
+    for err in validate_lazy_usage(&text) {
+        diags.push_error(TycError::lazy_usage(
+            err.message,
+            &path,
+            &text,
+            err.offset,
+            4, // length of "lazy"
+        ));
+    }
     if diags.has_errors() {
         return diags;
     }
@@ -121,7 +135,9 @@ pub fn check_file(db: &mut TycDatabase, path: String, text: String) -> Diagnosti
     // Apply Typhon sugar expansion in order before preprocessing so the
     // Python parser sees valid Python.  `tyc fmt` skips these expansions to
     // preserve Typhon syntax in the formatter's round trip.
-    let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&text)));
+    let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
+        &expand_gather_blocks(&text),
+    ))));
     let prep = preprocess(&expanded);
 
     let module = match parse(&prep.python_source, Mode::Module, &path) {

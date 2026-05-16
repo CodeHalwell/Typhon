@@ -206,6 +206,17 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
 /// `classes` is the set of class names declared in the enclosing module so
 /// we can resolve nominal references.
 pub fn type_from_annotation(expr: &Expr<TextRange>, classes: &[String]) -> Type {
+    type_from_annotation_with_params(expr, classes, &[])
+}
+
+/// Same as [`type_from_annotation`] but treats every name in `type_params`
+/// as `Type::Any` so that PEP 695 generic functions don't trip the
+/// assignability check before we have a real inference engine.
+pub fn type_from_annotation_with_params(
+    expr: &Expr<TextRange>,
+    classes: &[String],
+    type_params: &[String],
+) -> Type {
     match expr {
         Expr::Name(n) => match n.id.as_str() {
             "int" => Type::Int,
@@ -215,13 +226,16 @@ pub fn type_from_annotation(expr: &Expr<TextRange>, classes: &[String]) -> Type 
             "bytes" => Type::Bytes,
             "None" => Type::None,
             "Any" => Type::Any,
+            // A type parameter (PEP 695) — treat as a top type until we
+            // have proper inference.
+            other if type_params.iter().any(|p| p == other) => Type::Any,
             other if classes.iter().any(|c| c == other) => Type::Class(other.to_owned()),
             // Unknown but treat as nominal class (may be imported).
             other => Type::Class(other.to_owned()),
         },
         Expr::BinOp(b) if matches!(b.op, rustpython_ast::Operator::BitOr) => {
-            let left = type_from_annotation(&b.left, classes);
-            let right = type_from_annotation(&b.right, classes);
+            let left = type_from_annotation_with_params(&b.left, classes, type_params);
+            let right = type_from_annotation_with_params(&b.right, classes, type_params);
             Type::union_of(vec![left, right])
         }
         Expr::Subscript(s) => {
@@ -234,7 +248,11 @@ pub fn type_from_annotation(expr: &Expr<TextRange>, classes: &[String]) -> Type 
             };
             // Optional[T] → T | None
             if head == "Optional" {
-                return Type::optional(type_from_annotation(&s.slice, classes));
+                return Type::optional(type_from_annotation_with_params(
+                    &s.slice,
+                    classes,
+                    type_params,
+                ));
             }
             // Union[A, B, ...] / typing.Union[...]
             if head == "Union" {
@@ -242,18 +260,20 @@ pub fn type_from_annotation(expr: &Expr<TextRange>, classes: &[String]) -> Type 
                     let args: Vec<Type> = t
                         .elts
                         .iter()
-                        .map(|e| type_from_annotation(e, classes))
+                        .map(|e| type_from_annotation_with_params(e, classes, type_params))
                         .collect();
                     return Type::union_of(args);
                 }
-                return type_from_annotation(&s.slice, classes);
+                return type_from_annotation_with_params(&s.slice, classes, type_params);
             }
             // Result[T, E] — two-parameter sealed sum type (Ok[T] | Err[E]).
             if head == "Result" {
                 if let Expr::Tuple(t) = s.slice.as_ref() {
                     if t.elts.len() == 2 {
-                        let ok_type = type_from_annotation(&t.elts[0], classes);
-                        let err_type = type_from_annotation(&t.elts[1], classes);
+                        let ok_type =
+                            type_from_annotation_with_params(&t.elts[0], classes, type_params);
+                        let err_type =
+                            type_from_annotation_with_params(&t.elts[1], classes, type_params);
                         return Type::Generic("Result".into(), vec![ok_type, err_type]);
                     }
                 }
@@ -264,15 +284,33 @@ pub fn type_from_annotation(expr: &Expr<TextRange>, classes: &[String]) -> Type 
                 Expr::Tuple(t) => t
                     .elts
                     .iter()
-                    .map(|e| type_from_annotation(e, classes))
+                    .map(|e| type_from_annotation_with_params(e, classes, type_params))
                     .collect(),
-                other => vec![type_from_annotation(other, classes)],
+                other => vec![type_from_annotation_with_params(
+                    other,
+                    classes,
+                    type_params,
+                )],
             };
             Type::Generic(head, args)
         }
         Expr::Constant(c) if matches!(c.value, Constant::None) => Type::None,
         _ => Type::Unknown,
     }
+}
+
+/// Collect the names of PEP 695 type parameters into a flat list.
+pub fn collect_type_param_names(
+    type_params: &[rustpython_ast::TypeParam<TextRange>],
+) -> Vec<String> {
+    type_params
+        .iter()
+        .map(|tp| match tp {
+            rustpython_ast::TypeParam::TypeVar(t) => t.name.as_str().to_owned(),
+            rustpython_ast::TypeParam::ParamSpec(p) => p.name.as_str().to_owned(),
+            rustpython_ast::TypeParam::TypeVarTuple(t) => t.name.as_str().to_owned(),
+        })
+        .collect()
 }
 
 /// One entry in the per-scope type environment.
@@ -560,12 +598,14 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt<TextRange>]) {
     for stmt in body {
         match stmt {
             Stmt::FunctionDef(f) => {
-                let sig = function_signature(&classes, f.args.as_ref(), f.returns.as_deref());
+                let tps = collect_type_param_names(&f.type_params);
+                let sig = function_signature(&classes, f.args.as_ref(), f.returns.as_deref(), &tps);
                 c.function_signatures
                     .insert(f.name.as_str().to_owned(), sig);
             }
             Stmt::AsyncFunctionDef(f) => {
-                let sig = function_signature(&classes, f.args.as_ref(), f.returns.as_deref());
+                let tps = collect_type_param_names(&f.type_params);
+                let sig = function_signature(&classes, f.args.as_ref(), f.returns.as_deref(), &tps);
                 c.function_signatures
                     .insert(f.name.as_str().to_owned(), sig);
             }
@@ -578,6 +618,7 @@ fn function_signature(
     classes: &[String],
     args: &rustpython_ast::Arguments<TextRange>,
     returns: Option<&Expr<TextRange>>,
+    type_params: &[String],
 ) -> Type {
     let mut params = Vec::new();
     let all = args
@@ -587,13 +628,13 @@ fn function_signature(
         .chain(args.kwonlyargs.iter());
     for arg in all {
         let t = match &arg.def.annotation {
-            Some(ann) => type_from_annotation(ann, classes),
+            Some(ann) => type_from_annotation_with_params(ann, classes, type_params),
             None => Type::Unknown,
         };
         params.push(t);
     }
     let ret = match returns {
-        Some(r) => type_from_annotation(r, classes),
+        Some(r) => type_from_annotation_with_params(r, classes, type_params),
         None => Type::Unknown,
     };
     Type::Function {
@@ -688,10 +729,26 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt<TextRange>) {
             }
         }
         Stmt::FunctionDef(f) => {
-            check_function(c, f.name.as_str(), &f.args, &f.body, f.returns.as_deref())
+            let tps = collect_type_param_names(&f.type_params);
+            check_function(
+                c,
+                f.name.as_str(),
+                &f.args,
+                &f.body,
+                f.returns.as_deref(),
+                &tps,
+            )
         }
         Stmt::AsyncFunctionDef(f) => {
-            check_function(c, f.name.as_str(), &f.args, &f.body, f.returns.as_deref())
+            let tps = collect_type_param_names(&f.type_params);
+            check_function(
+                c,
+                f.name.as_str(),
+                &f.args,
+                &f.body,
+                f.returns.as_deref(),
+                &tps,
+            )
         }
         Stmt::ClassDef(cd) => {
             c.env.enter();
@@ -817,18 +874,20 @@ fn check_function(
     args: &rustpython_ast::Arguments<TextRange>,
     body: &[Stmt<TextRange>],
     returns: Option<&Expr<TextRange>>,
+    type_params: &[String],
 ) {
     let _ = name;
     let classes = c.classes.clone();
     let ret_type = match returns {
-        Some(r) => type_from_annotation(r, &classes),
+        Some(r) => type_from_annotation_with_params(r, &classes, type_params),
         None => Type::Unknown,
     };
 
     let saved_return = c.current_return.replace(ret_type);
     c.env.enter();
 
-    // Declare parameters with their annotation types.
+    // Declare parameters with their annotation types. Type parameters resolve
+    // to `Any` until a real inference engine lands.
     let all = args
         .posonlyargs
         .iter()
@@ -836,7 +895,7 @@ fn check_function(
         .chain(args.kwonlyargs.iter());
     for arg in all {
         let t = match &arg.def.annotation {
-            Some(ann) => type_from_annotation(ann, &classes),
+            Some(ann) => type_from_annotation_with_params(ann, &classes, type_params),
             None => Type::Unknown,
         };
         let span = (
