@@ -1,26 +1,36 @@
 //! Typhon AST → Python AST lowering (Phase 2+).
 //!
-//! Phase 2 implements class desugaring: plain Typhon `class` definitions are
-//! rewritten to `@dataclasses.dataclass(slots=True)` Python classes, and the
-//! required `import dataclasses` statement is injected when needed.
+//! Implements three transformations over the Python-compatible AST produced
+//! after preprocessing:
 //!
-//! Using the qualified `dataclasses.dataclass` form avoids name-shadowing
-//! hygiene issues that arise with a bare `dataclass` name imported into the
-//! module namespace.
+//! 1. **Class desugaring** — every plain `class` definition without a
+//!    `@dataclass` decorator gets `@dataclasses.dataclass(slots=True)` prepended
+//!    and `import dataclasses` is injected when needed.
 //!
-//! The import is inserted after any leading module docstring and
-//! `from __future__ import` statements so the emitted file is always valid
-//! Python.
+//! 2. **Pydantic model desugaring** — classes that the preprocessor tagged with
+//!    `__TyphonModel__` as a base (from `model X:` syntax) are rewritten to
+//!    `class X(BaseModel):` and `from pydantic import BaseModel` is injected.
 //!
-//! The transformation is applied recursively across the full statement tree, so
-//! classes defined inside functions or other classes are also desugared.
+//! 3. **Result import injection** — if the module references `Ok`, `Err`, or
+//!    `Result` anywhere, `from typhon_runtime import Ok, Err, Result` is injected
+//!    after any leading docstring and future-imports.
 //!
-//! Future phases will add desugaring for sealed unions, the `?` operator,
-//! `with`-chains, and other Typhon-specific constructs.
+//! 4. **`?` try-operator expansion** — `call().__typhon_try__()` expressions
+//!    (produced by the preprocessor from `call()?` syntax) are expanded into the
+//!    early-return pattern:
+//!    ```python
+//!    __typhon_tmp_N = call()
+//!    if isinstance(__typhon_tmp_N, Err):
+//!        return __typhon_tmp_N
+//!    x = __typhon_tmp_N.value          # only for assignments
+//!    ```
+//!    The transformation also sets `needs_typhon_runtime` so the build emits
+//!    `typhon_runtime.py` alongside the output.
 
 use rustpython_ast::{
-    text_size::TextRange, Alias, Constant, Expr, ExprCall, ExprConstant, ExprContext, ExprName,
-    Identifier, Mod, ModModule, Stmt, StmtImport, StmtImportFrom,
+    text_size::TextRange, Alias, Constant, Expr, ExprAttribute, ExprCall, ExprConstant,
+    ExprContext, ExprName, Identifier, Mod, ModModule, Stmt, StmtAssign, StmtIf, StmtImport,
+    StmtImportFrom, StmtReturn,
 };
 
 // ── public API ───────────────────────────────────────────────────────────────
@@ -33,40 +43,32 @@ pub struct DesugarOutput {
     /// true, the build command must write `typhon_runtime.py` alongside the
     /// other output files so the generated import can resolve at runtime.
     pub needs_typhon_runtime: bool,
+    /// Whether the emitted module imports from `pydantic`. When true, the
+    /// consuming project must have `pydantic` installed (it is not bundled).
+    pub needs_pydantic: bool,
 }
 
 /// Desugar a Typhon module AST into a plain Python AST.
-///
-/// Performs two transformations:
-///
-/// 1. **Class desugaring** — every `class` definition that does not already
-///    carry a `@dataclass` / `@dataclasses.dataclass` decorator gets
-///    `@dataclasses.dataclass(slots=True)` prepended, and `import dataclasses`
-///    is injected when needed. The transformation is recursive.
-///
-/// 2. **Result import injection** — if the module references `Ok`, `Err`, or
-///    `Result` anywhere, `from typhon_runtime import Ok, Err, Result` is
-///    injected after any leading docstring and future-imports so the generated
-///    Python can use those names.
 pub fn desugar_module(module: &Mod<TextRange>) -> DesugarOutput {
     match module {
         Mod::Module(m) => {
-            let desugared_mod = desugar_mod_module(m);
+            let (desugared_mod, desugar_stats) = desugar_mod_module(m);
 
             let has_result_usage = stmts_use_result_names(&m.body);
             let has_any_runtime_import = has_any_typhon_runtime_import(&m.body);
             let import_covers_all = typhon_runtime_import_covers_all(&m.body);
+
             // The build must write `typhon_runtime.py` whenever the emitted
-            // module will reference it — either because we detected an Ok/
-            // Err/Result name, or because the user already imported the
-            // runtime explicitly (bare or `from ... import`).
-            let needs_typhon_runtime = has_result_usage || has_any_runtime_import;
-            // Only skip injection when an existing `from typhon_runtime
-            // import …` already covers all three names. A partial import
-            // (e.g. just `Ok`) would leave `Err`/`Result` undefined, so we
-            // still inject. A bare `import typhon_runtime` doesn't bring
-            // `Ok`/`Err`/`Result` into scope, so we also still inject.
-            let inject_import = has_result_usage && !import_covers_all;
+            // module references Ok/Err/Result (directly or via existing import)
+            // or whenever `?` try-operators were expanded (which generates
+            // isinstance(_, Err) checks).
+            let needs_typhon_runtime =
+                has_result_usage || has_any_runtime_import || desugar_stats.any_try_operator;
+
+            // Inject the full three-name import only when names are used and
+            // no complete import already covers them.
+            let inject_import =
+                (has_result_usage || desugar_stats.any_try_operator) && !import_covers_all;
 
             let final_body = if inject_import {
                 let insert_at = import_insert_pos(&desugared_mod.body);
@@ -84,12 +86,35 @@ pub fn desugar_module(module: &Mod<TextRange>) -> DesugarOutput {
                     type_ignores: desugared_mod.type_ignores,
                 }),
                 needs_typhon_runtime,
+                needs_pydantic: desugar_stats.any_pydantic_model,
             }
         }
         other => DesugarOutput {
             module: other.clone(),
             needs_typhon_runtime: false,
+            needs_pydantic: false,
         },
+    }
+}
+
+// ── internal statistics ───────────────────────────────────────────────────────
+
+/// Accumulated flags from a single desugaring pass over a list of statements.
+#[derive(Default)]
+struct DesugarStats {
+    /// At least one plain class was given `@dataclasses.dataclass`.
+    any_class_dataclassed: bool,
+    /// At least one `model X:` class was rewritten to `class X(BaseModel):`.
+    any_pydantic_model: bool,
+    /// At least one `.__typhon_try__()` call was expanded.
+    any_try_operator: bool,
+}
+
+impl DesugarStats {
+    fn merge(&mut self, other: DesugarStats) {
+        self.any_class_dataclassed |= other.any_class_dataclassed;
+        self.any_pydantic_model |= other.any_pydantic_model;
+        self.any_try_operator |= other.any_try_operator;
     }
 }
 
@@ -302,7 +327,6 @@ fn expr_uses_result_names(expr: &Expr<TextRange>) -> bool {
         Expr::FormattedValue(f) => expr_uses_result_names(&f.value),
         Expr::JoinedStr(j) => j.values.iter().any(expr_uses_result_names),
         Expr::Attribute(a) => expr_uses_result_names(&a.value),
-        // Leaf nodes that cannot contain Result names: constants, etc.
         _ => false,
     }
 }
@@ -317,9 +341,6 @@ fn comprehension_uses_result_names(
 
 /// Return `true` if `body` contains any reference to the `typhon_runtime`
 /// module — either `import typhon_runtime` or `from typhon_runtime import …`.
-/// When true, the build must still write the runtime helper file even if
-/// no Ok/Err/Result names appear directly in expressions (the user may be
-/// calling `typhon_runtime.Ok(...)` via the bare-import / qualified style).
 fn has_any_typhon_runtime_import(body: &[Stmt<TextRange>]) -> bool {
     body.iter().any(|stmt| match stmt {
         Stmt::Import(imp) => imp.names.iter().any(|a| a.name.as_str() == "typhon_runtime"),
@@ -329,9 +350,7 @@ fn has_any_typhon_runtime_import(body: &[Stmt<TextRange>]) -> bool {
 }
 
 /// Return `true` if an existing `from typhon_runtime import …` already brings
-/// all three runtime names (`Ok`, `Err`, `Result`) into scope. Used to skip
-/// injection only when the user-provided import is complete; partial imports
-/// (e.g. just `Ok`) still need injection so the missing names resolve.
+/// all three runtime names (`Ok`, `Err`, `Result`) into scope.
 fn typhon_runtime_import_covers_all(body: &[Stmt<TextRange>]) -> bool {
     body.iter().any(|stmt| match stmt {
         Stmt::ImportFrom(imp) if imp.module.as_deref() == Some("typhon_runtime") => {
@@ -381,10 +400,12 @@ fn make_typhon_runtime_import() -> Stmt<TextRange> {
 
 // ── module-level desugaring ──────────────────────────────────────────────────
 
-fn desugar_mod_module(m: &ModModule<TextRange>) -> ModModule<TextRange> {
-    let (new_body, transformed_classes) = desugar_stmts(&m.body);
+fn desugar_mod_module(m: &ModModule<TextRange>) -> (ModModule<TextRange>, DesugarStats) {
+    let mut counter = 0usize;
+    let (new_body, stats) = desugar_stmts(&m.body, &mut counter);
 
-    let final_body = if transformed_classes && !has_dataclasses_import(&m.body) {
+    // Inject `import dataclasses` when plain classes were desugared.
+    let body_after_dc = if stats.any_class_dataclassed && !has_dataclasses_import(&m.body) {
         let insert_at = import_insert_pos(&new_body);
         let mut body = new_body;
         body.insert(insert_at, make_dataclasses_import());
@@ -393,11 +414,24 @@ fn desugar_mod_module(m: &ModModule<TextRange>) -> ModModule<TextRange> {
         new_body
     };
 
-    ModModule {
-        range: m.range,
-        body: final_body,
-        type_ignores: m.type_ignores.clone(),
-    }
+    // Inject `from pydantic import BaseModel` when `model` classes were desugared.
+    let final_body = if stats.any_pydantic_model && !has_pydantic_import(&m.body) {
+        let insert_at = import_insert_pos(&body_after_dc);
+        let mut body = body_after_dc;
+        body.insert(insert_at, make_pydantic_import());
+        body
+    } else {
+        body_after_dc
+    };
+
+    (
+        ModModule {
+            range: m.range,
+            body: final_body,
+            type_ignores: m.type_ignores.clone(),
+        },
+        stats,
+    )
 }
 
 /// Return the index at which a new top-level import should be inserted,
@@ -430,85 +464,349 @@ fn import_insert_pos(body: &[Stmt<TextRange>]) -> usize {
 
 // ── recursive statement desugaring ──────────────────────────────────────────
 
-/// Desugar a list of statements, returning the transformed list and whether
-/// any class was modified at any nesting depth.
-fn desugar_stmts(stmts: &[Stmt<TextRange>]) -> (Vec<Stmt<TextRange>>, bool) {
-    let mut any_transformed = false;
+/// Desugar a list of statements, flat-mapping each statement to zero or more
+/// statements (needed for the `?` try-operator which expands 1 → 3 stmts).
+fn desugar_stmts(
+    stmts: &[Stmt<TextRange>],
+    counter: &mut usize,
+) -> (Vec<Stmt<TextRange>>, DesugarStats) {
+    let mut stats = DesugarStats::default();
     let new_stmts = stmts
         .iter()
-        .map(|stmt| {
-            let (new_stmt, transformed) = desugar_stmt(stmt);
-            if transformed {
-                any_transformed = true;
-            }
-            new_stmt
+        .flat_map(|stmt| {
+            let (expanded, stmt_stats) = expand_stmt(stmt, counter);
+            stats.merge(stmt_stats);
+            expanded
         })
         .collect();
-    (new_stmts, any_transformed)
+    (new_stmts, stats)
 }
 
-/// Desugar a single statement, recursing into any nested statement lists.
-/// Returns the (possibly modified) statement and whether any class was
-/// transformed at this level or deeper.
-fn desugar_stmt(stmt: &Stmt<TextRange>) -> (Stmt<TextRange>, bool) {
+/// Expand one statement to a (possibly longer) list of statements.
+///
+/// The `?` try-operator can expand a single assignment into three statements.
+/// All other statements map 1-to-1 via `desugar_single_stmt`.
+fn expand_stmt(
+    stmt: &Stmt<TextRange>,
+    counter: &mut usize,
+) -> (Vec<Stmt<TextRange>>, DesugarStats) {
+    // Check for `?` try-operator patterns first.
+    if let Some((expanded, try_stats)) = try_expand_try_operator(stmt, counter) {
+        return (expanded, try_stats);
+    }
+    // Regular desugaring.
+    let (new_stmt, stmt_stats) = desugar_single_stmt(stmt, counter);
+    (vec![new_stmt], stmt_stats)
+}
+
+/// Desugar a single statement that does not require expansion.
+/// Recurses into nested statement lists for functions, classes, and control
+/// flow so that classes and `?` operators anywhere in the tree are handled.
+fn desugar_single_stmt(
+    stmt: &Stmt<TextRange>,
+    counter: &mut usize,
+) -> (Stmt<TextRange>, DesugarStats) {
     match stmt {
         Stmt::ClassDef(c) => {
-            let needs_decorator = !has_dataclass_decorator(&c.decorator_list);
-            let (new_body, body_transformed) = desugar_stmts(&c.body);
-            let mut new_class = c.clone();
-            new_class.body = new_body;
-            if needs_decorator {
-                new_class.decorator_list.insert(0, make_dataclasses_dot_dataclass_call());
+            if is_pydantic_model_class(c) {
+                // `model X:` → `class X(BaseModel):`
+                let (new_body, mut body_stats) = desugar_stmts(&c.body, counter);
+                let mut new_class = c.clone();
+                new_class.body = new_body;
+                // Remove __TyphonModel__ sentinel, prepend BaseModel.
+                new_class.bases = c
+                    .bases
+                    .iter()
+                    .filter(|b| !is_typhon_model_sentinel(b))
+                    .cloned()
+                    .collect();
+                new_class.bases.insert(0, make_base_model_name());
+                body_stats.any_pydantic_model = true;
+                (Stmt::ClassDef(new_class), body_stats)
+            } else {
+                // Plain class → add @dataclasses.dataclass(slots=True).
+                let needs_decorator = !has_dataclass_decorator(&c.decorator_list);
+                let (new_body, mut body_stats) = desugar_stmts(&c.body, counter);
+                let mut new_class = c.clone();
+                new_class.body = new_body;
+                if needs_decorator {
+                    new_class
+                        .decorator_list
+                        .insert(0, make_dataclasses_dot_dataclass_call());
+                    body_stats.any_class_dataclassed = true;
+                }
+                (Stmt::ClassDef(new_class), body_stats)
             }
-            (Stmt::ClassDef(new_class), needs_decorator || body_transformed)
         }
         Stmt::FunctionDef(f) => {
-            let (new_body, transformed) = desugar_stmts(&f.body);
+            let (new_body, stats) = desugar_stmts(&f.body, counter);
             let mut new_f = f.clone();
             new_f.body = new_body;
-            (Stmt::FunctionDef(new_f), transformed)
+            (Stmt::FunctionDef(new_f), stats)
         }
         Stmt::AsyncFunctionDef(f) => {
-            let (new_body, transformed) = desugar_stmts(&f.body);
+            let (new_body, stats) = desugar_stmts(&f.body, counter);
             let mut new_f = f.clone();
             new_f.body = new_body;
-            (Stmt::AsyncFunctionDef(new_f), transformed)
+            (Stmt::AsyncFunctionDef(new_f), stats)
         }
-        other => (other.clone(), false),
+        Stmt::If(i) => {
+            let (new_body, body_stats) = desugar_stmts(&i.body, counter);
+            let (new_orelse, orelse_stats) = desugar_stmts(&i.orelse, counter);
+            let mut new_if = i.clone();
+            new_if.body = new_body;
+            new_if.orelse = new_orelse;
+            let mut stats = body_stats;
+            stats.merge(orelse_stats);
+            (Stmt::If(new_if), stats)
+        }
+        Stmt::While(w) => {
+            let (new_body, body_stats) = desugar_stmts(&w.body, counter);
+            let (new_orelse, orelse_stats) = desugar_stmts(&w.orelse, counter);
+            let mut new_while = w.clone();
+            new_while.body = new_body;
+            new_while.orelse = new_orelse;
+            let mut stats = body_stats;
+            stats.merge(orelse_stats);
+            (Stmt::While(new_while), stats)
+        }
+        Stmt::For(f) => {
+            let (new_body, body_stats) = desugar_stmts(&f.body, counter);
+            let (new_orelse, orelse_stats) = desugar_stmts(&f.orelse, counter);
+            let mut new_for = f.clone();
+            new_for.body = new_body;
+            new_for.orelse = new_orelse;
+            let mut stats = body_stats;
+            stats.merge(orelse_stats);
+            (Stmt::For(new_for), stats)
+        }
+        other => (other.clone(), DesugarStats::default()),
     }
 }
 
-// ── AST helpers ──────────────────────────────────────────────────────────────
+// ── `?` try-operator expansion ────────────────────────────────────────────────
+
+/// If `stmt` contains a `.__typhon_try__()` call in a supported position,
+/// expand it into the early-return pattern and return the replacement
+/// statements. Returns `None` for statements without the try-operator.
+///
+/// Supported positions:
+/// - `x = expr.__typhon_try__()` (simple assignment, single target)
+/// - `return expr.__typhon_try__()`
+/// - `expr.__typhon_try__()` (bare expression statement — discards Ok value)
+fn try_expand_try_operator(
+    stmt: &Stmt<TextRange>,
+    counter: &mut usize,
+) -> Option<(Vec<Stmt<TextRange>>, DesugarStats)> {
+    let try_stats = || {
+        let mut s = DesugarStats::default();
+        s.any_try_operator = true;
+        s
+    };
+
+    match stmt {
+        Stmt::Assign(a) if a.targets.len() == 1 => {
+            extract_try_inner(&a.value).map(|inner| {
+                let tmp = format!("__typhon_tmp_{}", counter);
+                *counter += 1;
+                let stmts = vec![
+                    make_tmp_assign(&tmp, inner),
+                    make_err_check_return(&tmp),
+                    make_value_assign(&a.targets[0], &tmp),
+                ];
+                (stmts, try_stats())
+            })
+        }
+        Stmt::Return(r) => r.value.as_ref().and_then(|v| {
+            extract_try_inner(v).map(|inner| {
+                let tmp = format!("__typhon_tmp_{}", counter);
+                *counter += 1;
+                let stmts = vec![
+                    make_tmp_assign(&tmp, inner),
+                    make_err_check_return(&tmp),
+                    make_return_ok_value(&tmp),
+                ];
+                (stmts, try_stats())
+            })
+        }),
+        Stmt::Expr(e) => {
+            extract_try_inner(&e.value).map(|inner| {
+                let tmp = format!("__typhon_tmp_{}", counter);
+                *counter += 1;
+                // Bare try — ok value is discarded; only the Err check matters.
+                let stmts = vec![
+                    make_tmp_assign(&tmp, inner),
+                    make_err_check_return(&tmp),
+                ];
+                (stmts, try_stats())
+            })
+        }
+        _ => None,
+    }
+}
+
+/// If `expr` is `something.__typhon_try__()` with no arguments, return
+/// `something`. Otherwise return `None`.
+fn extract_try_inner(expr: &Expr<TextRange>) -> Option<&Expr<TextRange>> {
+    if let Expr::Call(c) = expr {
+        if c.args.is_empty() && c.keywords.is_empty() {
+            if let Expr::Attribute(a) = c.func.as_ref() {
+                if a.attr.as_str() == "__typhon_try__" {
+                    return Some(&a.value);
+                }
+            }
+        }
+    }
+    None
+}
+
+// ── AST construction helpers ──────────────────────────────────────────────────
+
+/// Build a `Name` expression with `Load` context.
+fn make_name_load(name: &str) -> Expr<TextRange> {
+    Expr::Name(ExprName {
+        range: TextRange::default(),
+        id: Identifier::new(name),
+        ctx: ExprContext::Load,
+    })
+}
+
+/// Build `tmp = value` (simple assignment).
+fn make_tmp_assign(tmp: &str, value: &Expr<TextRange>) -> Stmt<TextRange> {
+    Stmt::Assign(StmtAssign {
+        range: TextRange::default(),
+        targets: vec![Expr::Name(ExprName {
+            range: TextRange::default(),
+            id: Identifier::new(tmp),
+            ctx: ExprContext::Store,
+        })],
+        value: Box::new(value.clone()),
+        type_comment: None,
+    })
+}
+
+/// Build `if isinstance(tmp, Err): return tmp`.
+fn make_err_check_return(tmp: &str) -> Stmt<TextRange> {
+    let isinstance_call = Expr::Call(ExprCall {
+        range: TextRange::default(),
+        func: Box::new(make_name_load("isinstance")),
+        args: vec![make_name_load(tmp), make_name_load("Err")],
+        keywords: vec![],
+    });
+    Stmt::If(StmtIf {
+        range: TextRange::default(),
+        test: Box::new(isinstance_call),
+        body: vec![Stmt::Return(StmtReturn {
+            range: TextRange::default(),
+            value: Some(Box::new(make_name_load(tmp))),
+        })],
+        orelse: vec![],
+    })
+}
+
+/// Build `target = tmp.value` (unwrap the Ok payload into the original LHS).
+fn make_value_assign(target: &Expr<TextRange>, tmp: &str) -> Stmt<TextRange> {
+    let value_attr = Expr::Attribute(ExprAttribute {
+        range: TextRange::default(),
+        value: Box::new(make_name_load(tmp)),
+        attr: Identifier::new("value"),
+        ctx: ExprContext::Load,
+    });
+    Stmt::Assign(StmtAssign {
+        range: TextRange::default(),
+        targets: vec![target.clone()],
+        value: Box::new(value_attr),
+        type_comment: None,
+    })
+}
+
+/// Build `return tmp.value` (for `return expr?` context).
+fn make_return_ok_value(tmp: &str) -> Stmt<TextRange> {
+    let value_attr = Expr::Attribute(ExprAttribute {
+        range: TextRange::default(),
+        value: Box::new(make_name_load(tmp)),
+        attr: Identifier::new("value"),
+        ctx: ExprContext::Load,
+    });
+    Stmt::Return(StmtReturn {
+        range: TextRange::default(),
+        value: Some(Box::new(value_attr)),
+    })
+}
+
+// ── pydantic model helpers ────────────────────────────────────────────────────
+
+/// Return `true` if `c` has `__TyphonModel__` as one of its base classes.
+fn is_pydantic_model_class(c: &rustpython_ast::StmtClassDef<TextRange>) -> bool {
+    c.bases.iter().any(is_typhon_model_sentinel)
+}
+
+/// Return `true` if `expr` is the `__TyphonModel__` sentinel name.
+fn is_typhon_model_sentinel(expr: &Expr<TextRange>) -> bool {
+    matches!(expr, Expr::Name(n) if n.id.as_str() == "__TyphonModel__")
+}
+
+/// Build the `BaseModel` name expression (for use as a class base).
+fn make_base_model_name() -> Expr<TextRange> {
+    Expr::Name(ExprName {
+        range: TextRange::default(),
+        id: Identifier::new("BaseModel"),
+        ctx: ExprContext::Load,
+    })
+}
+
+/// Build `from pydantic import BaseModel`.
+fn make_pydantic_import() -> Stmt<TextRange> {
+    Stmt::ImportFrom(StmtImportFrom {
+        range: TextRange::default(),
+        module: Some(Identifier::new("pydantic")),
+        names: vec![Alias {
+            range: TextRange::default(),
+            name: Identifier::new("BaseModel"),
+            asname: None,
+        }],
+        level: None,
+    })
+}
+
+/// Return `true` if the body already contains `from pydantic import BaseModel`.
+fn has_pydantic_import(body: &[Stmt<TextRange>]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::ImportFrom(imp) => {
+            imp.module.as_deref() == Some("pydantic")
+                && imp.names.iter().any(|a| a.name.as_str() == "BaseModel")
+        }
+        _ => false,
+    })
+}
+
+// ── dataclass helpers ─────────────────────────────────────────────────────────
 
 /// Build the expression `dataclasses.dataclass(slots=True)`.
-///
-/// Using the qualified form avoids shadowing: even if the user has a local
-/// binding named `dataclass`, `dataclasses.dataclass` still resolves to the
-/// standard-library function.
-fn make_dataclasses_dot_dataclass_call() -> rustpython_ast::Expr<TextRange> {
-    use rustpython_ast::{ExprAttribute, Keyword};
+fn make_dataclasses_dot_dataclass_call() -> Expr<TextRange> {
+    use rustpython_ast::Keyword;
 
-    let dataclasses_name = rustpython_ast::Expr::Name(ExprName {
+    let dataclasses_name = Expr::Name(ExprName {
         range: TextRange::default(),
         id: Identifier::new("dataclasses"),
         ctx: ExprContext::Load,
     });
 
-    let dataclass_attr = rustpython_ast::Expr::Attribute(ExprAttribute {
+    let dataclass_attr = Expr::Attribute(ExprAttribute {
         range: TextRange::default(),
         value: Box::new(dataclasses_name),
         attr: Identifier::new("dataclass"),
         ctx: ExprContext::Load,
     });
 
-    rustpython_ast::Expr::Call(ExprCall {
+    Expr::Call(ExprCall {
         range: TextRange::default(),
         func: Box::new(dataclass_attr),
         args: vec![],
         keywords: vec![Keyword {
             range: TextRange::default(),
             arg: Some(Identifier::new("slots")),
-            value: rustpython_ast::Expr::Constant(ExprConstant {
+            value: Expr::Constant(ExprConstant {
                 range: TextRange::default(),
                 value: Constant::Bool(true),
                 kind: None,
@@ -519,8 +817,6 @@ fn make_dataclasses_dot_dataclass_call() -> rustpython_ast::Expr<TextRange> {
 
 /// Build the statement `import dataclasses`.
 fn make_dataclasses_import() -> Stmt<TextRange> {
-    use rustpython_ast::Alias;
-
     Stmt::Import(StmtImport {
         range: TextRange::default(),
         names: vec![Alias {
@@ -532,34 +828,27 @@ fn make_dataclasses_import() -> Stmt<TextRange> {
 }
 
 /// Return `true` if the decorator list already contains any recognized form of
-/// the dataclass decorator:
-/// - `@dataclass`          (bare name, from-import style)
-/// - `@dataclass(...)`     (call, from-import style)
-/// - `@dataclasses.dataclass`
-/// - `@dataclasses.dataclass(...)`
-fn has_dataclass_decorator(decorators: &[rustpython_ast::Expr<TextRange>]) -> bool {
+/// the dataclass decorator.
+fn has_dataclass_decorator(decorators: &[Expr<TextRange>]) -> bool {
     decorators.iter().any(|d| is_dataclass_expr(d))
 }
 
-fn is_dataclass_expr(expr: &rustpython_ast::Expr<TextRange>) -> bool {
+fn is_dataclass_expr(expr: &Expr<TextRange>) -> bool {
     match expr {
-        // @dataclass
-        rustpython_ast::Expr::Name(n) => n.id.as_str() == "dataclass",
-        // @dataclasses.dataclass
-        rustpython_ast::Expr::Attribute(a) => {
+        Expr::Name(n) => n.id.as_str() == "dataclass",
+        Expr::Attribute(a) => {
             a.attr.as_str() == "dataclass"
                 && matches!(a.value.as_ref(),
-                    rustpython_ast::Expr::Name(n) if n.id.as_str() == "dataclasses"
+                    Expr::Name(n) if n.id.as_str() == "dataclasses"
                 )
         }
-        // @dataclass(...) or @dataclasses.dataclass(...)
-        rustpython_ast::Expr::Call(c) => is_dataclass_expr(c.func.as_ref()),
+        Expr::Call(c) => is_dataclass_expr(c.func.as_ref()),
         _ => false,
     }
 }
 
 /// Return `true` if the body already contains `import dataclasses` or
-/// `from dataclasses import dataclass` (either form means the import is covered).
+/// `from dataclasses import dataclass`.
 fn has_dataclasses_import(body: &[Stmt<TextRange>]) -> bool {
     body.iter().any(|stmt| match stmt {
         Stmt::Import(imp) => imp.names.iter().any(|a| a.name.as_str() == "dataclasses"),
@@ -605,7 +894,6 @@ mod tests {
         let src = "import dataclasses\n\n@dataclasses.dataclass\nclass Point:\n    x: int\n";
         let out = parse_and_desugar(src);
         assert!(!out.contains("slots=True"), "output:\n{out}");
-        // No second import injected.
         assert_eq!(out.matches("import dataclasses").count(), 1, "output:\n{out}");
     }
 
@@ -669,6 +957,63 @@ mod tests {
         assert!(future_pos < import_pos, "output:\n{out}");
     }
 
+    // ── pydantic model tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn pydantic_model_sentinel_becomes_base_model() {
+        // The preprocessor converts `model User:` → `class User(__TyphonModel__):`
+        // Desugar must replace the sentinel with BaseModel.
+        let src = "class User(__TyphonModel__):\n    id: int\n    name: str\n";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("class User(BaseModel):"), "output:\n{out}");
+        assert!(out.contains("from pydantic import BaseModel"), "output:\n{out}");
+    }
+
+    #[test]
+    fn pydantic_model_does_not_get_dataclass_decorator() {
+        let src = "class ApiUser(__TyphonModel__):\n    id: int\n";
+        let out = parse_and_desugar(src);
+        assert!(!out.contains("dataclass"), "output:\n{out}");
+        assert!(!out.contains("__TyphonModel__"), "sentinel leaked; output:\n{out}");
+    }
+
+    #[test]
+    fn pydantic_import_not_duplicated() {
+        let src =
+            "from pydantic import BaseModel\n\nclass User(__TyphonModel__):\n    id: int\n";
+        let out = parse_and_desugar(src);
+        assert_eq!(
+            out.matches("from pydantic import BaseModel").count(),
+            1,
+            "output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn needs_pydantic_flag_set() {
+        let src = "class User(__TyphonModel__):\n    id: int\n";
+        let m = parse(src, Mode::Module, "<test>").expect("parse failed");
+        let output = desugar_module(&m);
+        assert!(output.needs_pydantic, "needs_pydantic should be true");
+    }
+
+    #[test]
+    fn needs_pydantic_flag_clear_for_plain_class() {
+        let src = "class Point:\n    x: int\n";
+        let m = parse(src, Mode::Module, "<test>").expect("parse failed");
+        let output = desugar_module(&m);
+        assert!(!output.needs_pydantic);
+    }
+
+    #[test]
+    fn model_with_extra_base_preserves_it() {
+        // `model X(Mixin, __TyphonModel__):` → `class X(BaseModel, Mixin):`
+        // (Mixin is preserved; __TyphonModel__ is removed; BaseModel prepended)
+        let src = "class Widget(Mixin, __TyphonModel__):\n    x: int\n";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("class Widget(BaseModel, Mixin):"), "output:\n{out}");
+    }
+
     // ── Result import injection ───────────────────────────────────────────────
 
     #[test]
@@ -714,7 +1059,8 @@ mod tests {
 
     #[test]
     fn existing_typhon_runtime_import_not_duplicated() {
-        let src = "from typhon_runtime import Ok, Err, Result\n\ndef f() -> None:\n    x = Ok(1)\n";
+        let src =
+            "from typhon_runtime import Ok, Err, Result\n\ndef f() -> None:\n    x = Ok(1)\n";
         let out = parse_and_desugar(src);
         assert_eq!(
             out.matches("from typhon_runtime import").count(),
@@ -780,7 +1126,8 @@ mod tests {
 
     #[test]
     fn ok_inside_match_case_detected() {
-        let src = "match x:\n    case 1:\n        r = Ok(1)\n    case _:\n        r = Err('no')\n";
+        let src =
+            "match x:\n    case 1:\n        r = Ok(1)\n    case _:\n        r = Err('no')\n";
         let out = parse_and_desugar(src);
         assert!(out.contains("from typhon_runtime import"), "output:\n{out}");
     }
@@ -845,7 +1192,6 @@ mod tests {
 
     #[test]
     fn ok_inside_keyword_arg_detected() {
-        // The previous detection missed `keywords`; now it must catch this.
         let src = "make(value=Ok(1))\n";
         let out = parse_and_desugar(src);
         assert!(out.contains("from typhon_runtime import"), "output:\n{out}");
@@ -862,9 +1208,8 @@ mod tests {
 
     #[test]
     fn partial_from_import_still_injects_full_import() {
-        // User imported only `Ok` — the emitted module also uses `Result`,
-        // so injection must still run to bring `Err`/`Result` into scope.
-        let src = "from typhon_runtime import Ok\n\ndef f() -> Result[int, str]:\n    return Ok(1)\n";
+        let src =
+            "from typhon_runtime import Ok\n\ndef f() -> Result[int, str]:\n    return Ok(1)\n";
         let out = parse_and_desugar(src);
         assert!(
             out.contains("from typhon_runtime import Ok, Err, Result"),
@@ -874,8 +1219,8 @@ mod tests {
 
     #[test]
     fn full_from_import_suppresses_injection() {
-        // Existing import covers all three names — no need to inject ours.
-        let src = "from typhon_runtime import Ok, Err, Result\n\ndef f() -> None:\n    x = Ok(1)\n";
+        let src =
+            "from typhon_runtime import Ok, Err, Result\n\ndef f() -> None:\n    x = Ok(1)\n";
         let out = parse_and_desugar(src);
         assert_eq!(
             out.matches("from typhon_runtime import").count(),
@@ -886,9 +1231,6 @@ mod tests {
 
     #[test]
     fn bare_import_typhon_runtime_sets_needs_flag() {
-        // `import typhon_runtime` plus qualified `typhon_runtime.Ok(...)` does
-        // not bring Ok/Err/Result into scope, but the build still needs to
-        // emit the runtime file.
         let src = "import typhon_runtime\nx = typhon_runtime.Ok(1)\n";
         let m = parse(src, Mode::Module, "<test>").expect("parse failed");
         let output = desugar_module(&m);
@@ -907,5 +1249,53 @@ mod tests {
             1,
             "star-import covers all names; should not duplicate; output:\n{out}"
         );
+    }
+
+    // ── `?` try-operator tests ────────────────────────────────────────────────
+
+    #[test]
+    fn try_operator_in_assign_expands() {
+        // `x = find(1).__typhon_try__()` should expand to the three-statement pattern.
+        let src = "def f() -> None:\n    x = find(1).__typhon_try__()\n";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("isinstance"), "output:\n{out}");
+        assert!(out.contains("Err"), "output:\n{out}");
+        assert!(out.contains(".value"), "output:\n{out}");
+        assert!(!out.contains("__typhon_try__"), "sentinel leaked; output:\n{out}");
+    }
+
+    #[test]
+    fn try_operator_sets_needs_typhon_runtime() {
+        let src = "def f() -> None:\n    x = find(1).__typhon_try__()\n";
+        let m = parse(src, Mode::Module, "<test>").expect("parse failed");
+        let output = desugar_module(&m);
+        assert!(output.needs_typhon_runtime, "output needs typhon_runtime for Err check");
+    }
+
+    #[test]
+    fn try_operator_injects_typhon_runtime_import() {
+        let src = "def f() -> None:\n    x = find(1).__typhon_try__()\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("from typhon_runtime import"),
+            "expected runtime import for Err; output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn try_operator_in_return_expands() {
+        let src = "def f() -> None:\n    return find(1).__typhon_try__()\n";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("isinstance"), "output:\n{out}");
+        assert!(out.contains(".value"), "output:\n{out}");
+    }
+
+    #[test]
+    fn try_operator_as_bare_expr_expands() {
+        // Bare `expr?` — ok value discarded, only early-return on Err.
+        let src = "def f() -> None:\n    find(1).__typhon_try__()\n";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("isinstance"), "output:\n{out}");
+        assert!(!out.contains("__typhon_try__"), "sentinel leaked; output:\n{out}");
     }
 }

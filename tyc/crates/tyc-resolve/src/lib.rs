@@ -913,6 +913,8 @@ fn builtin_names() -> std::collections::HashSet<&'static str> {
         "Coroutine", "Generator", "AsyncIterator", "AsyncIterable",
         // Typhon Result type constructors (from typhon_runtime).
         "Ok", "Err", "Result",
+        // Typhon-internal preprocessing sentinels (not user-visible).
+        "__TyphonModel__",
     ];
     names.iter().copied().collect()
 }

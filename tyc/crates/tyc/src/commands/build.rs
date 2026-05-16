@@ -88,21 +88,40 @@ pub fn run(args: BuildArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Read every source file once; both phases reuse this buffer.
-    let sources: Vec<(PathBuf, String)> = ty_files
+    // Read every source file and preprocess upfront.
+    // Preprocessing is cheap and must run first so that comptime errors
+    // (missing required env vars) are reported before the type-checker runs.
+    let sources: Vec<(PathBuf, String, _)> = ty_files
         .into_iter()
         .map(|path| {
             let text = std::fs::read_to_string(&path)
                 .map_err(|e| miette!("cannot read '{}': {e}", path.display()))?;
-            Ok((path, text))
+            let prep = preprocess(&text);
+            Ok((path, text, prep))
         })
         .collect::<Result<_>>()?;
+
+    // Fail fast on comptime evaluation errors (missing required env vars) before
+    // the type-checker runs — the fallback `None` value would produce misleading
+    // type errors otherwise.
+    let mut comptime_error_count = 0usize;
+    for (path, _, prep) in &sources {
+        for msg in &prep.comptime_errors {
+            eprintln!("error[comptime]: {} (in '{}')", msg, path.display());
+            comptime_error_count += 1;
+        }
+    }
+    if comptime_error_count > 0 {
+        return Err(miette!(
+            "{comptime_error_count} comptime error(s) — set the required environment variables"
+        ));
+    }
 
     // Phase 1: type-check all files first and fail fast on errors.
     let mut db = TycDatabase::new();
     let mut error_count = 0usize;
 
-    for (path, source) in &sources {
+    for (path, source, _prep) in &sources {
         let diags = check_file(&mut db, path.display().to_string(), source.clone());
         if diags.has_errors() {
             for err in diags.errors() {
@@ -118,12 +137,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
         ));
     }
 
-    // Phase 2: desugar and emit using the already-loaded source text.
+    // Phase 2: desugar and emit using the already-preprocessed output.
     let mut emitted = 0usize;
     let mut needs_runtime = false;
 
-    for (path, source) in &sources {
-        let prep = preprocess(source);
+    for (path, _source, prep) in &sources {
 
         let module = parse(&prep.python_source, Mode::Module, &path.display().to_string())
             .map_err(|e| miette!("parse error in '{}': {e}", path.display()))?;
