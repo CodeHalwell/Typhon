@@ -686,9 +686,10 @@ val result: int = 3 |> double |> inc
             !py.contains("|>"),
             "pipe operator must be desugared away; got:\n{py}"
         );
+        // Verify the nested call structure: `inc(double(...))` must appear.
         assert!(
-            py.contains("double") && py.contains("inc"),
-            "desugared function names must appear in output; got:\n{py}"
+            py.contains("inc(double("),
+            "pipe must desugar to inc(double(...)); got:\n{py}"
         );
     }
 
@@ -705,15 +706,18 @@ val result: int = 3 |> double |> inc
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
-        // The lazy import must be expanded to a proxy; the raw `lazy import`
+        // The lazy import must be expanded to a proxy class; the raw `lazy import`
         // syntax must not appear in the emitted Python.
         assert!(
             !py.contains("lazy import"),
             "lazy import must be expanded; got:\n{py}"
         );
+        // `expand_lazy_imports` generates `class __TyphonLazy_{alias}_` as the
+        // proxy class name — assert on this specific marker so the test would
+        // catch a regression to a plain `import numpy as np` instead.
         assert!(
-            py.contains("numpy"),
-            "module name must appear in emitted proxy; got:\n{py}"
+            py.contains("__TyphonLazy_np_"),
+            "lazy import must emit the __TyphonLazy_np_ proxy class; got:\n{py}"
         );
     }
 
@@ -773,9 +777,11 @@ def area(s: Shape) -> float:
             out: None,
             no_format: true,
         });
+        // Verify the failure is specifically a type-checking error, not a
+        // configuration or I/O error, by checking the returned error message.
         assert!(
-            result.is_err(),
-            "non-exhaustive match on sealed union should fail the build"
+            result.is_err_and(|e| e.to_string().contains("fix type errors")),
+            "non-exhaustive match on sealed union should fail with a type error"
         );
     }
 
@@ -827,9 +833,43 @@ val pet: Animal = Dog(name=\"Rex\")
             out: None,
             no_format: true,
         });
+        // Verify the failure is specifically a type-checking error (structural
+        // conformance failure), not a configuration or I/O error.
         assert!(
-            result.is_err(),
-            "assigning a non-conforming type to an interface variable should fail"
+            result.is_err_and(|e| e.to_string().contains("fix type errors")),
+            "assigning a non-conforming type to an interface variable should fail with a type error"
+        );
+    }
+
+    #[test]
+    fn build_interface_conformance_passes_for_conforming_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `Dog` has `speak` in its class body, so it structurally conforms to
+        // `Animal`. Note: methods added via a separate `impl Dog:` block are
+        // merged only at desugar time, after the type checker runs, so the
+        // conformance check requires the method to appear in the class body.
+        let src = "\
+interface Animal:
+    def speak(self) -> str: ...
+
+class Dog:
+    name: str
+    def speak(self) -> str:
+        return \"woof\"
+
+val pet: Animal = Dog(name=\"Rex\")
+";
+        let (_, out_dir) = scaffold(tmp.path(), src);
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        })
+        .unwrap();
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        assert!(
+            py.contains("speak"),
+            "speak method should appear in emitted Python; got:\n{py}"
         );
     }
 }
