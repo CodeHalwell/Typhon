@@ -19,6 +19,10 @@ pub enum TyphonKeyword {
     /// `comptime` — marks a binding whose RHS is evaluated at build time and
     /// inlined as a literal in the emitted Python.
     Comptime,
+    /// `impl` — attaches a method block to a previously-declared class, Rust-style.
+    /// The preprocessor rewrites `impl ClassName:` to `class __typhon_impl_ClassName(object):`,
+    /// and the desugar pass merges the methods back into the target class.
+    Impl,
 }
 
 impl TyphonKeyword {
@@ -29,6 +33,7 @@ impl TyphonKeyword {
             Self::Var => "var",
             Self::Model => "model",
             Self::Comptime => "comptime",
+            Self::Impl => "impl",
         }
     }
 
@@ -39,6 +44,7 @@ impl TyphonKeyword {
             "var" => Some(Self::Var),
             "model" => Some(Self::Model),
             "comptime" => Some(Self::Comptime),
+            "impl" => Some(Self::Impl),
             _ => None,
         }
     }

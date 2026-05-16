@@ -14,12 +14,13 @@ use rustpython_parser::{parse, Mode};
 
 use tyc_analyse::{evaluate_comptime, ComptimeValue};
 use tyc_db::{check_file, TycDatabase};
+use tyc_diagnostics::Diagnostics;
 use tyc_desugar::desugar_module;
 use tyc_emit::emit;
 use tyc_format::format_source;
 use tyc_syntax::preprocess::{expand_question_ops, preprocess};
 
-use crate::commands::util::collect_ty_files;
+use crate::commands::util::{apply_strictness, collect_ty_files};
 use crate::config::TyphonConfig;
 
 /// Arguments for `tyc build`.
@@ -78,6 +79,17 @@ pub fn run(args: BuildArgs) -> Result<()> {
 
     let do_format = config.emit.format && !args.no_format;
 
+    // Fail fast if any required env vars are missing (declared in [env] required).
+    for var in &config.env.required {
+        if std::env::var(var).is_err() {
+            return Err(miette!(
+                "required environment variable '{}' is not set \
+                 (declared in [env] required in typhon.toml)",
+                var
+            ));
+        }
+    }
+
     if !src_dir.exists() {
         return Err(miette!(
             "source directory '{}' does not exist",
@@ -104,21 +116,28 @@ pub fn run(args: BuildArgs) -> Result<()> {
 
     // Phase 1: type-check all files first and fail fast on errors.
     let mut db = TycDatabase::new();
-    let mut error_count = 0usize;
+    let mut all_phase1_diags = Diagnostics::new();
 
     for (path, source) in &sources {
-        let diags = check_file(&mut db, path.display().to_string(), source.clone());
-        if diags.has_errors() {
-            for err in diags.errors() {
-                eprintln!("{:?}", miette::Report::new_boxed(Box::new(err.clone())));
-            }
-            error_count += diags.error_count();
-        }
+        let file_diags = check_file(&mut db, path.display().to_string(), source.clone());
+        all_phase1_diags.extend(file_diags);
     }
 
-    if error_count > 0 {
+    // Apply strictness rules (e.g. promote unused-import warnings to errors).
+    let all_phase1_diags = apply_strictness(all_phase1_diags, &config);
+
+    // Emit warnings even when there are no errors so they are always visible.
+    for warn in all_phase1_diags.warnings() {
+        eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn.clone())));
+    }
+
+    if all_phase1_diags.has_errors() {
+        for err in all_phase1_diags.errors() {
+            eprintln!("{:?}", miette::Report::new_boxed(Box::new(err.clone())));
+        }
         return Err(miette!(
-            "{error_count} error(s) — fix type errors before building"
+            "{} error(s) — fix type errors before building",
+            all_phase1_diags.error_count()
         ));
     }
 

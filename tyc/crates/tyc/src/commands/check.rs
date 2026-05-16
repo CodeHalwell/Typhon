@@ -13,7 +13,8 @@ use miette::{miette, Result};
 use tyc_db::{check_file, TycDatabase};
 use tyc_diagnostics::{Diagnostics, TycError};
 
-use crate::commands::util::collect_ty_files;
+use crate::commands::util::{apply_strictness, collect_ty_files};
+use crate::config::TyphonConfig;
 
 /// Arguments for `tyc check`.
 #[derive(Args, Debug)]
@@ -24,6 +25,14 @@ pub struct CheckArgs {
 }
 
 pub fn run(args: CheckArgs) -> Result<()> {
+    // Load strictness config from `typhon.toml` (search from CWD upward).
+    // Missing config is fine — defaults are used; a malformed one is an error.
+    let config = match TyphonConfig::load(std::path::Path::new(".")) {
+        Ok(Some((_, cfg))) => cfg,
+        Ok(None) => TyphonConfig::default(),
+        Err(e) => return Err(miette!("{e}")),
+    };
+
     let mut diags = Diagnostics::new();
     let mut file_count = 0usize;
     let mut db = TycDatabase::new();
@@ -45,6 +54,14 @@ pub fn run(args: CheckArgs) -> Result<()> {
         }
     }
 
+    // Apply strictness rules (e.g. promote unused-import warnings to errors).
+    let diags = apply_strictness(diags, &config);
+
+    // Emit warnings regardless of whether there are errors.
+    for warn in diags.warnings() {
+        eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn.clone())));
+    }
+
     if diags.has_errors() {
         for err in diags.errors() {
             eprintln!("{:?}", miette::Report::new_boxed(Box::new(err.clone())));
@@ -56,6 +73,14 @@ pub fn run(args: CheckArgs) -> Result<()> {
         ));
     }
 
-    println!("checked {} file(s) — no errors", file_count);
+    if diags.warning_count() > 0 {
+        println!(
+            "checked {} file(s) — {} warning(s)",
+            file_count,
+            diags.warning_count()
+        );
+    } else {
+        println!("checked {} file(s) — no errors", file_count);
+    }
     Ok(())
 }

@@ -18,9 +18,11 @@
 //! Future phases will add desugaring for sealed unions, the `?` operator,
 //! `with`-chains, and other Typhon-specific constructs.
 
+use std::collections::{HashMap, HashSet};
+
 use rustpython_ast::{
-    text_size::TextRange, Alias, Constant, Expr, ExprCall, ExprConstant, ExprContext, ExprName,
-    Identifier, Mod, ModModule, Stmt, StmtImport, StmtImportFrom,
+    text_size::TextRange, Alias, Arg, ArgWithDefault, Constant, Expr, ExprCall, ExprConstant,
+    ExprContext, ExprName, Identifier, Mod, ModModule, Stmt, StmtImport, StmtImportFrom,
 };
 
 // ── public API ───────────────────────────────────────────────────────────────
@@ -397,13 +399,16 @@ fn make_typhon_runtime_import() -> Stmt<TextRange> {
 fn desugar_mod_module(m: &ModModule<TextRange>) -> ModModule<TextRange> {
     let (new_body, transformed_classes) = desugar_stmts(&m.body);
 
+    // Merge `impl` pseudo-classes into their target classes and remove the stubs.
+    let (merged_body, _) = merge_impl_blocks(new_body);
+
     let final_body = if transformed_classes && !has_dataclasses_import(&m.body) {
-        let insert_at = import_insert_pos(&new_body);
-        let mut body = new_body;
+        let insert_at = import_insert_pos(&merged_body);
+        let mut body = merged_body;
         body.insert(insert_at, make_dataclasses_import());
         body
     } else {
-        new_body
+        merged_body
     };
 
     ModModule {
@@ -467,10 +472,14 @@ fn desugar_stmt(stmt: &Stmt<TextRange>) -> (Stmt<TextRange>, bool) {
     match stmt {
         Stmt::ClassDef(c) => {
             let is_pydantic = class_inherits_basemodel(c);
+            // `impl` pseudo-classes (`__typhon_impl_*`) are temporary stubs
+            // that will be merged into their target class by `merge_impl_blocks`;
+            // they must not receive a dataclass decorator.
+            let is_impl_stub = c.name.as_str().starts_with("__typhon_impl_");
             // Skip the dataclass decorator for Pydantic model classes; they
             // already carry the right base class from preprocessing.
             let needs_decorator =
-                !is_pydantic && !has_dataclass_decorator(&c.decorator_list);
+                !is_pydantic && !is_impl_stub && !has_dataclass_decorator(&c.decorator_list);
             let (new_body, body_transformed) = desugar_stmts(&c.body);
             let mut new_class = c.clone();
             new_class.body = new_body;
@@ -654,6 +663,113 @@ fn has_dataclasses_import(body: &[Stmt<TextRange>]) -> bool {
         }
         _ => false,
     })
+}
+
+// ── impl block merging ───────────────────────────────────────────────────────
+
+/// Name prefix the preprocessor gives every `impl` pseudo-class.
+const IMPL_PREFIX: &str = "__typhon_impl_";
+
+/// Merge Typhon `impl` pseudo-classes into their target classes.
+///
+/// The preprocessor rewrites `impl ClassName:` to `class __typhon_impl_ClassName(object):`.
+/// This function:
+/// 1. Finds all such pseudo-classes in `body`.
+/// 2. Injects `self` as the first parameter of every method defined inside them.
+/// 3. Appends those methods to the corresponding target class body.
+/// 4. Removes the pseudo-classes from the statement list.
+///
+/// Returns the modified statement list and `true` when at least one impl block
+/// was found.  Missing target classes are silently skipped (the type checker
+/// surfaces a better diagnostic for that case).
+fn merge_impl_blocks(body: Vec<Stmt<TextRange>>) -> (Vec<Stmt<TextRange>>, bool) {
+    // Phase 1: identify impl pseudo-class indices and their target names.
+    let impl_indices: Vec<(usize, String)> = body
+        .iter()
+        .enumerate()
+        .filter_map(|(i, stmt)| {
+            if let Stmt::ClassDef(c) = stmt {
+                if let Some(target) = c.name.as_str().strip_prefix(IMPL_PREFIX) {
+                    return Some((i, target.to_owned()));
+                }
+            }
+            None
+        })
+        .collect();
+
+    if impl_indices.is_empty() {
+        return (body, false);
+    }
+
+    // Phase 2: collect methods (with `self` injected) into a map keyed by
+    // target class name.  Multiple impl blocks for the same class accumulate.
+    let impl_index_set: HashSet<usize> = impl_indices.iter().map(|(i, _)| *i).collect();
+    let mut impl_methods_map: HashMap<String, Vec<Stmt<TextRange>>> = HashMap::new();
+    for (impl_idx, target_name) in &impl_indices {
+        if let Stmt::ClassDef(c) = &body[*impl_idx] {
+            let methods: Vec<Stmt<TextRange>> =
+                c.body.iter().map(insert_self_param).collect();
+            impl_methods_map
+                .entry(target_name.clone())
+                .or_default()
+                .extend(methods);
+        }
+    }
+
+    // Phase 3: rebuild the body, merging methods into target classes and
+    // dropping the impl pseudo-classes.
+    let new_body: Vec<Stmt<TextRange>> = body
+        .into_iter()
+        .enumerate()
+        .filter(|(i, _)| !impl_index_set.contains(i))
+        .map(|(_, stmt)| {
+            if let Stmt::ClassDef(mut c) = stmt {
+                let name = c.name.as_str().to_owned();
+                if let Some(methods) = impl_methods_map.remove(&name) {
+                    c.body.extend(methods);
+                }
+                Stmt::ClassDef(c)
+            } else {
+                stmt
+            }
+        })
+        .collect();
+
+    (new_body, true)
+}
+
+/// Inject `self` as the first positional parameter of a function definition.
+///
+/// Only modifies `Stmt::FunctionDef`; all other statement kinds pass through
+/// unchanged.  If `self` is already the first parameter (e.g. the user wrote
+/// it explicitly), no second `self` is added.
+fn insert_self_param(stmt: &Stmt<TextRange>) -> Stmt<TextRange> {
+    match stmt {
+        Stmt::FunctionDef(f) => {
+            let mut new_f = f.clone();
+            let already_has_self = new_f
+                .args
+                .args
+                .first()
+                .map(|a| a.def.arg.as_str() == "self")
+                .unwrap_or(false);
+            if !already_has_self {
+                let self_arg = ArgWithDefault {
+                    range: Default::default(),
+                    def: Arg {
+                        range: TextRange::default(),
+                        arg: Identifier::new("self"),
+                        annotation: None,
+                        type_comment: None,
+                    },
+                    default: None,
+                };
+                new_f.args.args.insert(0, self_arg);
+            }
+            Stmt::FunctionDef(new_f)
+        }
+        other => other.clone(),
+    }
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -981,6 +1097,46 @@ mod tests {
             output.needs_typhon_runtime,
             "bare `import typhon_runtime` must set needs_typhon_runtime"
         );
+    }
+
+    // ── impl block desugaring ─────────────────────────────────────────────────
+
+    #[test]
+    fn impl_block_methods_merged_into_target_class() {
+        // Simulates what the preprocessor produces from `impl User:`.
+        let src = "class User:\n    name: str\n\nclass __typhon_impl_User(object):\n    def greet():\n        return 'Hello'\n";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("def greet(self):"), "self must be injected; output:\n{out}");
+        assert!(!out.contains("__typhon_impl_"), "impl stub must be removed; output:\n{out}");
+    }
+
+    #[test]
+    fn impl_block_stub_not_decorated_as_dataclass() {
+        let src = "class User:\n    name: str\n\nclass __typhon_impl_User(object):\n    def greet():\n        pass\n";
+        let out = parse_and_desugar(src);
+        // Exactly one @dataclasses.dataclass — on User, not on the impl stub.
+        assert_eq!(
+            out.matches("@dataclasses.dataclass").count(),
+            1,
+            "only the target class must be decorated; output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn impl_block_multiple_methods_all_get_self() {
+        let src = "class Point:\n    x: int\n    y: int\n\nclass __typhon_impl_Point(object):\n    def translate():\n        pass\n    def scale():\n        pass\n";
+        let out = parse_and_desugar(src);
+        assert_eq!(out.matches("def translate(self):").count(), 1, "output:\n{out}");
+        assert_eq!(out.matches("def scale(self):").count(), 1, "output:\n{out}");
+    }
+
+    #[test]
+    fn impl_block_existing_self_not_duplicated() {
+        // If the method already has `self` as first param, do not add a second one.
+        let src = "class User:\n    name: str\n\nclass __typhon_impl_User(object):\n    def greet(self):\n        pass\n";
+        let out = parse_and_desugar(src);
+        // `def greet(self):` must appear exactly once, not `def greet(self, self):`.
+        assert_eq!(out.matches("def greet(self):").count(), 1, "output:\n{out}");
     }
 
     #[test]

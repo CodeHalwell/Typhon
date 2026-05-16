@@ -3,6 +3,35 @@
 use std::path::{Path, PathBuf};
 
 use miette::{miette, Result};
+use tyc_diagnostics::{Diagnostics, TycError};
+
+use crate::config::TyphonConfig;
+
+/// Re-classify warnings as errors according to the `[strictness]` config section.
+///
+/// Currently handles `unused-import`:
+/// - `"warn"` (default): `UnusedImport` diagnostics remain warnings.
+/// - `"error"`: `UnusedImport` diagnostics are promoted to errors.
+///
+/// All other warnings are passed through unchanged.
+pub fn apply_strictness(diags: Diagnostics, config: &TyphonConfig) -> Diagnostics {
+    let promote_unused_import = config.strictness.unused_import == "error";
+    if !promote_unused_import {
+        return diags;
+    }
+    let mut new_diags = Diagnostics::new();
+    for err in diags.errors().iter().cloned() {
+        new_diags.push_error(err);
+    }
+    for warn in diags.warnings().iter().cloned() {
+        if matches!(warn, TycError::UnusedImport { .. }) {
+            new_diags.push_error(warn);
+        } else {
+            new_diags.push_warning(warn);
+        }
+    }
+    new_diags
+}
 
 /// Recursively collect all `.ty` files under `root` in sorted order.
 ///

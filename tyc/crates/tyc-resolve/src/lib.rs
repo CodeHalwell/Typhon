@@ -499,9 +499,9 @@ fn declare_target(
             Some(TyphonKeyword::Var) => Mutability::Var,
             // `comptime val` records the inner `val` keyword, so Comptime
             // alone would only appear when the inner keyword was omitted.
-            // `model` is not a value binding keyword — treat both like bare
-            // assignments (inherit or default).
-            Some(TyphonKeyword::Model | TyphonKeyword::Comptime) | None => {
+            // `model` and `impl` are not value binding keywords — treat all
+            // three like bare assignments (inherit or default).
+            Some(TyphonKeyword::Model | TyphonKeyword::Comptime | TyphonKeyword::Impl) | None => {
                 existing_mut.unwrap_or(if default_val {
                     Mutability::Val
                 } else {
@@ -971,6 +971,10 @@ fn builtin_names() -> std::collections::HashSet<&'static str> {
         "env",
         // Pydantic BaseModel — injected by the `model` keyword preprocessor.
         "BaseModel",
+        // `self` is implicitly injected as the first parameter of every method
+        // in an `impl` block by the desugar pass. Recognising it here prevents
+        // false "unknown name: self" errors in method bodies.
+        "self",
     ];
     names.iter().copied().collect()
 }
@@ -1030,6 +1034,14 @@ mod tests {
     fn builtin_print_is_in_scope() {
         let (_m, d) = resolve("def f() -> None:\n    print(1)\n");
         assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn self_in_impl_method_body_not_flagged() {
+        // `self` is injected by the desugar pass; the resolver must not flag
+        // it as an unknown name when it appears in a method body.
+        let (_m, d) = resolve("def greet():\n    return self.name\n");
+        assert!(!d.has_errors(), "self must not be unknown: {:?}", d.errors());
     }
 
     #[test]
