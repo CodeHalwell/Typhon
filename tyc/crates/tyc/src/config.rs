@@ -107,13 +107,14 @@ impl TyphonConfig {
         loop {
             let candidate = dir.join("typhon.toml");
             if candidate.exists() {
-                let text = std::fs::read_to_string(&candidate)
-                    .map_err(|e| crate::config::ConfigError::Io {
+                let text = std::fs::read_to_string(&candidate).map_err(|e| {
+                    crate::config::ConfigError::Io {
                         path: candidate.display().to_string(),
                         cause: e.to_string(),
-                    })?;
-                let config: Self = toml::from_str(&text)
-                    .map_err(|e| crate::config::ConfigError::Parse {
+                    }
+                })?;
+                let config: Self =
+                    toml::from_str(&text).map_err(|e| crate::config::ConfigError::Parse {
                         path: candidate.display().to_string(),
                         cause: e.to_string(),
                     })?;

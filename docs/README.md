@@ -22,4 +22,4 @@ The sub-docs below are extracted from the long-term plan for easier navigation. 
 
 ## Status
 
-Phase 0 (Foundation) is in progress. See [roadmap.md](roadmap.md) for the full schedule and the project [README](../README.md) for build instructions.
+**Phase 0 (Foundation) is substantially complete** (Ruff parser fork deferred; `rustpython-parser` used as fallback) **and Phase 1 (Core types) is complete.** Phase 2 (Class and value features) is next. See [roadmap.md](roadmap.md) for the full schedule and the project [README](../README.md) for build instructions.

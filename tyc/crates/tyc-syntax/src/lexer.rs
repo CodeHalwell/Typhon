@@ -38,7 +38,7 @@ impl TyphonKeyword {
     }
 
     /// Try to parse a keyword from a source slice.
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn keyword_of(s: &str) -> Option<Self> {
         match s {
             "val" => Some(Self::Val),
             "var" => Some(Self::Var),
@@ -83,7 +83,7 @@ pub fn lex(source: &str) -> Vec<TyphonToken<'_>> {
                 end += 1;
             }
             let word = &source[start..end];
-            if let Some(kw) = TyphonKeyword::from_str(word) {
+            if let Some(kw) = TyphonKeyword::keyword_of(word) {
                 tokens.push(TyphonToken::Keyword(kw));
             } else {
                 tokens.push(TyphonToken::Text(word));
@@ -125,9 +125,7 @@ mod tests {
         let src = "value = 1";
         let tokens = lex(src);
         assert!(
-            tokens
-                .iter()
-                .all(|t| !matches!(t, TyphonToken::Keyword(_))),
+            tokens.iter().all(|t| !matches!(t, TyphonToken::Keyword(_))),
             "partial keyword match should not occur"
         );
     }

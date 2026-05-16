@@ -356,14 +356,8 @@ impl TycError {
         Self::ImmutableAssign {
             name: name.into(),
             src: NamedSource::new(path, source),
-            declaration: SourceSpan::new(
-                SourceOffset::from(declaration_offset),
-                declaration_len,
-            ),
-            assignment: SourceSpan::new(
-                SourceOffset::from(assignment_offset),
-                assignment_len,
-            ),
+            declaration: SourceSpan::new(SourceOffset::from(declaration_offset), declaration_len),
+            assignment: SourceSpan::new(SourceOffset::from(assignment_offset), assignment_len),
         }
     }
 }

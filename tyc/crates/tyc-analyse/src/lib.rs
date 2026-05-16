@@ -97,10 +97,7 @@ pub fn evaluate_comptime(
             None => {
                 diags.push_error(TycError::comptime(
                     binding.name.clone(),
-                    format!(
-                        "comptime binding '{}' has no initialiser",
-                        binding.name
-                    ),
+                    format!("comptime binding '{}' has no initialiser", binding.name),
                 ));
             }
             Some(expr) => match eval_expr(expr) {
@@ -167,16 +164,13 @@ fn eval_constant(c: &Constant) -> Result<ComptimeValue, String> {
     }
 }
 
-fn eval_call(
-    call: &rustpython_ast::ExprCall<TextRange>,
-) -> Result<ComptimeValue, String> {
+fn eval_call(call: &rustpython_ast::ExprCall<TextRange>) -> Result<ComptimeValue, String> {
     let func_name = match call.func.as_ref() {
         Expr::Name(n) => n.id.as_str(),
-        _ => {
-            return Err(
-                "only simple function calls (env, int, str, float) are valid in comptime expressions".into(),
-            )
-        }
+        _ => return Err(
+            "only simple function calls (env, int, str, float) are valid in comptime expressions"
+                .into(),
+        ),
     };
 
     match func_name {
@@ -230,9 +224,7 @@ fn eval_call(
     }
 }
 
-fn eval_env_call(
-    call: &rustpython_ast::ExprCall<TextRange>,
-) -> Result<ComptimeValue, String> {
+fn eval_env_call(call: &rustpython_ast::ExprCall<TextRange>) -> Result<ComptimeValue, String> {
     if call.args.is_empty() || call.args.len() > 2 {
         return Err("env() requires one or two positional arguments: env(\"NAME\") or env(\"NAME\", \"default\")".into());
     }
@@ -273,9 +265,7 @@ fn eval_binop(
             .checked_add(*b)
             .map(ComptimeValue::Int)
             .ok_or_else(|| "integer overflow in comptime addition".to_string()),
-        (Add, ComptimeValue::Float(a), ComptimeValue::Float(b)) => {
-            Ok(ComptimeValue::Float(a + b))
-        }
+        (Add, ComptimeValue::Float(a), ComptimeValue::Float(b)) => Ok(ComptimeValue::Float(a + b)),
         (Add, ComptimeValue::Int(a), ComptimeValue::Float(b)) => {
             Ok(ComptimeValue::Float(*a as f64 + b))
         }
@@ -290,9 +280,7 @@ fn eval_binop(
             .checked_sub(*b)
             .map(ComptimeValue::Int)
             .ok_or_else(|| "integer overflow in comptime subtraction".to_string()),
-        (Sub, ComptimeValue::Float(a), ComptimeValue::Float(b)) => {
-            Ok(ComptimeValue::Float(a - b))
-        }
+        (Sub, ComptimeValue::Float(a), ComptimeValue::Float(b)) => Ok(ComptimeValue::Float(a - b)),
         (Sub, ComptimeValue::Int(a), ComptimeValue::Float(b)) => {
             Ok(ComptimeValue::Float(*a as f64 - b))
         }
@@ -304,9 +292,7 @@ fn eval_binop(
             .checked_mul(*b)
             .map(ComptimeValue::Int)
             .ok_or_else(|| "integer overflow in comptime multiplication".to_string()),
-        (Mult, ComptimeValue::Float(a), ComptimeValue::Float(b)) => {
-            Ok(ComptimeValue::Float(a * b))
-        }
+        (Mult, ComptimeValue::Float(a), ComptimeValue::Float(b)) => Ok(ComptimeValue::Float(a * b)),
         (Mult, ComptimeValue::Int(a), ComptimeValue::Float(b)) => {
             Ok(ComptimeValue::Float(*a as f64 * b))
         }
@@ -442,9 +428,8 @@ mod tests {
     #[test]
     fn env_with_default_uses_env_when_set() {
         std::env::set_var("__TYPHON_TEST_SET_DEFAULT__", "4321");
-        let (values, diags) = eval(
-            "comptime val PORT: int = int(env(\"__TYPHON_TEST_SET_DEFAULT__\", \"9000\"))\n",
-        );
+        let (values, diags) =
+            eval("comptime val PORT: int = int(env(\"__TYPHON_TEST_SET_DEFAULT__\", \"9000\"))\n");
         std::env::remove_var("__TYPHON_TEST_SET_DEFAULT__");
         assert!(!diags.has_errors());
         assert!(matches!(values.get("PORT"), Some(ComptimeValue::Int(4321))));
@@ -453,9 +438,8 @@ mod tests {
     #[test]
     fn missing_required_env_is_an_error() {
         std::env::remove_var("__TYPHON_REQUIRED_TEST_UNIQUE__");
-        let (_, diags) = eval(
-            "comptime val DB_URL: str = env(\"__TYPHON_REQUIRED_TEST_UNIQUE__\")\n",
-        );
+        let (_, diags) =
+            eval("comptime val DB_URL: str = env(\"__TYPHON_REQUIRED_TEST_UNIQUE__\")\n");
         assert!(diags.has_errors(), "missing env var must be a build error");
     }
 
