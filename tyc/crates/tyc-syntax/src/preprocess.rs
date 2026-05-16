@@ -54,18 +54,17 @@ pub fn preprocess(source: &str) -> PreprocessResult {
     let mut python_source = String::with_capacity(source.len());
     let mut stripped = Vec::new();
     let mut optionals = Vec::new();
+    // String state carried across lines (triple-quoted strings may span them).
+    let mut in_string: Option<StringMode> = None;
 
     for (line_index, line) in source.split_inclusive('\n').enumerate() {
-        // --- val / var stripping at start of line ---
-        let indent_len = line
-            .find(|c: char| !c.is_whitespace())
-            .unwrap_or(line.len());
-        let rest = &line[indent_len..];
-
-        let (line_after_keyword, indent_len_after_keyword) = {
-            let mut consumed_keyword = false;
-            let mut out_indent = indent_len;
-            let mut out_line = line.to_owned();
+        // val/var stripping only applies outside of string content.
+        let line_after_keyword = if in_string.is_none() {
+            let indent_len = line
+                .find(|c: char| !c.is_whitespace())
+                .unwrap_or(line.len());
+            let rest = &line[indent_len..];
+            let mut stripped_line = None;
             for kw in &[TyphonKeyword::Val, TyphonKeyword::Var] {
                 let prefix = kw.as_str();
                 if rest.starts_with(prefix)
@@ -78,20 +77,16 @@ pub fn preprocess(source: &str) -> PreprocessResult {
                     });
                     let indent = &line[..indent_len];
                     let after_kw = &rest[prefix.len() + 1..];
-                    out_line = format!("{}{}", indent, after_kw);
-                    out_indent = indent_len;
-                    consumed_keyword = true;
+                    stripped_line = Some(format!("{}{}", indent, after_kw));
                     break;
                 }
             }
-            let _ = consumed_keyword;
-            (out_line, out_indent)
+            stripped_line.unwrap_or_else(|| line.to_owned())
+        } else {
+            line.to_owned()
         };
 
-        let _ = indent_len_after_keyword;
-
-        // --- `?` → ` | None` substitution (string- and comment-aware) ---
-        let (rewritten, marks) = rewrite_optionals(&line_after_keyword);
+        let (rewritten, marks) = rewrite_optionals(&line_after_keyword, &mut in_string);
         for col in marks {
             optionals.push(StrippedOptional {
                 line_index,
@@ -108,74 +103,126 @@ pub fn preprocess(source: &str) -> PreprocessResult {
     }
 }
 
+/// Active string-literal mode while scanning. `Single` and `Double` cannot
+/// span a newline (per Python's grammar) and are reset at end-of-line;
+/// triple-quoted forms persist across lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StringMode {
+    Single,
+    Double,
+    TripleSingle,
+    TripleDouble,
+}
+
 /// Replace every `?` outside string literals and comments with ` | None`.
 ///
 /// Returns the rewritten line and a list of 0-based byte columns in the
-/// rewritten string where each `| None` insertion *starts* (i.e. the
-/// character right after the type token).
-fn rewrite_optionals(line: &str) -> (String, Vec<usize>) {
+/// rewritten string where each ` | None` insertion *starts* (i.e. the
+/// character right after the type token). The `in_string` argument tracks
+/// triple-quoted string state across lines.
+///
+/// Known limitation: `?` inside an f-string expression (e.g. `f"{x?}"`) is
+/// treated as string content and not rewritten — supporting it requires a
+/// nested expression scanner, which is deferred.
+fn rewrite_optionals(
+    line: &str,
+    in_string: &mut Option<StringMode>,
+) -> (String, Vec<usize>) {
     let mut out = String::with_capacity(line.len());
     let mut marks = Vec::new();
+    let mut last_char: Option<char> = None;
+    let mut chars = line.char_indices().peekable();
 
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    let mut in_string: Option<u8> = None; // active quote character
-
-    while i < bytes.len() {
-        let b = bytes[i];
-
-        // Comment — copy rest of line as-is.
-        if in_string.is_none() && b == b'#' {
-            out.push_str(&line[i..]);
+    while let Some((i, c)) = chars.next() {
+        // Comment outside any string — copy the remainder verbatim.
+        if in_string.is_none() && c == '#' {
+            out.push(c);
+            for (_, c2) in chars.by_ref() {
+                out.push(c2);
+            }
             break;
         }
 
-        // Track string state.
-        if let Some(quote) = in_string {
-            out.push(b as char);
-            if b == b'\\' && i + 1 < bytes.len() {
-                // Copy the escaped byte literally.
-                out.push(bytes[i + 1] as char);
-                i += 2;
-                continue;
+        // Inside a string literal — copy chars, look for the close.
+        if let Some(mode) = *in_string {
+            out.push(c);
+            // Backslash escape in single/double-quoted strings (but not raw —
+            // we don't try to distinguish, since copying the next char
+            // through is harmless either way).
+            if matches!(mode, StringMode::Single | StringMode::Double) && c == '\\' {
+                if let Some((_, esc)) = chars.next() {
+                    out.push(esc);
+                    last_char = Some(esc);
+                    continue;
+                }
             }
-            if b == quote {
-                in_string = None;
+            match mode {
+                StringMode::Single if c == '\'' => *in_string = None,
+                StringMode::Double if c == '"' => *in_string = None,
+                StringMode::TripleSingle if c == '\'' && line[i..].starts_with("'''") => {
+                    out.push(chars.next().unwrap().1);
+                    out.push(chars.next().unwrap().1);
+                    *in_string = None;
+                }
+                StringMode::TripleDouble if c == '"' && line[i..].starts_with("\"\"\"") => {
+                    out.push(chars.next().unwrap().1);
+                    out.push(chars.next().unwrap().1);
+                    *in_string = None;
+                }
+                _ => {}
             }
-            i += 1;
+            last_char = Some(c);
             continue;
         }
 
-        if b == b'"' || b == b'\'' {
-            in_string = Some(b);
-            out.push(b as char);
-            i += 1;
-            continue;
-        }
-
-        if b == b'?' {
-            // Skip a stray `?` that is not preceded by something that could
-            // be the tail of a type expression. In Phase 1 we accept `?`
-            // after an identifier character or `]` only.
-            let prev_char = out.chars().last();
-            let is_type_tail = matches!(prev_char, Some(c) if c.is_alphanumeric() || c == '_' || c == ']');
-            if is_type_tail {
-                let mark = out.len();
-                out.push_str(" | None");
-                marks.push(mark);
-                i += 1;
-                continue;
+        // Outside any string — detect a string opening.
+        if c == '"' || c == '\'' {
+            let triple = (c == '"' && line[i..].starts_with("\"\"\""))
+                || (c == '\'' && line[i..].starts_with("'''"));
+            out.push(c);
+            if triple {
+                out.push(chars.next().unwrap().1);
+                out.push(chars.next().unwrap().1);
+                *in_string = Some(if c == '"' {
+                    StringMode::TripleDouble
+                } else {
+                    StringMode::TripleSingle
+                });
             } else {
-                // Pass it through unchanged; the parser will report a syntax
-                // error so the user sees a clear diagnostic.
-                out.push('?');
-                i += 1;
-                continue;
+                *in_string = Some(if c == '"' {
+                    StringMode::Double
+                } else {
+                    StringMode::Single
+                });
             }
+            last_char = Some(c);
+            continue;
         }
 
-        out.push(b as char);
-        i += 1;
+        if c == '?' {
+            let is_type_tail = matches!(
+                last_char,
+                Some(ch) if ch.is_alphanumeric() || ch == '_' || ch == ']'
+            );
+            if is_type_tail {
+                marks.push(out.len());
+                out.push_str(" | None");
+                last_char = Some('e'); // last char of " | None"
+                continue;
+            }
+            // Pass through unchanged; parser will surface a syntax error.
+            out.push('?');
+            last_char = Some('?');
+            continue;
+        }
+
+        out.push(c);
+        last_char = Some(c);
+    }
+
+    // Single/double-quoted strings cannot span a newline.
+    if matches!(*in_string, Some(StringMode::Single) | Some(StringMode::Double)) {
+        *in_string = None;
     }
 
     (out, marks)
@@ -292,6 +339,24 @@ mod tests {
         let result = preprocess("val s: str = \"is this ok?\"\n");
         assert_eq!(result.python_source, "s: str = \"is this ok?\"\n");
         assert!(result.optionals.is_empty());
+    }
+
+    #[test]
+    fn does_not_rewrite_question_mark_in_triple_quoted_string() {
+        let src = "val s: str = \"\"\"line one\nline two with ?\nline three\"\"\"\n";
+        let result = preprocess(src);
+        // The ? inside the triple-quoted block must be preserved as-is.
+        assert!(result.python_source.contains("line two with ?"));
+        assert!(result.optionals.is_empty());
+    }
+
+    #[test]
+    fn handles_non_ascii_source_without_corruption() {
+        // Em-dash and accented characters must survive char-aware iteration.
+        let src = "# café — entry point\nval name: str? = None\n";
+        let result = preprocess(src);
+        assert!(result.python_source.contains("café — entry point"));
+        assert!(result.python_source.contains("name: str | None"));
     }
 
     #[test]

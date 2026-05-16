@@ -71,7 +71,7 @@ pub fn run(args: InitArgs) -> Result<()> {
     let main_ty_path = src_dir.join("main.ty");
     if main_ty_path.exists() {
         return Err(miette!(
-            "src/main.ty already exists in {}; use --force to overwrite",
+            "src/main.ty already exists in {}; remove it first to re-scaffold",
             dir.display()
         ));
     }

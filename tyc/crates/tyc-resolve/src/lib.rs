@@ -139,8 +139,9 @@ struct Resolver<'a> {
     /// `stripped[i]` records that line `i` had a leading `val`/`var`. The
     /// list is in source order; we consume entries as we hit assignments.
     stripped: &'a [StrippedKeyword],
-    /// Cursor into `stripped`.
-    stripped_cursor: usize,
+    /// Byte offset of the first character on each line, computed once so
+    /// that `line_of_offset` is O(log N) per call instead of O(N).
+    line_starts: Vec<usize>,
     scopes: Vec<Scope>,
     references: Vec<Reference>,
     diagnostics: Diagnostics,
@@ -154,11 +155,17 @@ impl<'a> Resolver<'a> {
             parent: None,
             bindings: Vec::new(),
         };
+        let mut line_starts = vec![0usize];
+        for (idx, b) in source.bytes().enumerate() {
+            if b == b'\n' {
+                line_starts.push(idx + 1);
+            }
+        }
         Self {
             path,
             source,
             stripped,
-            stripped_cursor: 0,
+            line_starts,
             scopes: vec![module],
             references: Vec::new(),
             diagnostics: Diagnostics::new(),
@@ -177,19 +184,11 @@ impl<'a> Resolver<'a> {
     }
 
     /// Map a byte offset in the preprocessed source to a 0-based line index.
+    /// O(log N) via binary search over precomputed line starts.
     fn line_of_offset(&self, offset: usize) -> usize {
-        let mut line = 0usize;
-        let mut count = 0usize;
-        for c in self.source.bytes() {
-            if count >= offset {
-                break;
-            }
-            if c == b'\n' {
-                line += 1;
-            }
-            count += 1;
-        }
-        line
+        self.line_starts
+            .partition_point(|&start| start <= offset)
+            .saturating_sub(1)
     }
 
     /// Was the assignment statement on `line_idx` introduced with `val` or
@@ -214,10 +213,19 @@ impl<'a> Resolver<'a> {
         mutability: Mutability,
         span: (usize, usize),
     ) {
-        // val reassignment check: if there's already a binding with the same
-        // name and Mutability::Val in this scope, error.
         if let Some(existing) = self.lookup_local(scope, name) {
-            if existing.mutability == Mutability::Val && kind == BindingKind::Value {
+            // Re-entry at exactly the same span is just the same statement
+            // being visited twice (e.g. pre-collect followed by walk_stmt);
+            // silently no-op.
+            if existing.span == span {
+                return;
+            }
+            // Otherwise this is a re-declaration. Forbid it whenever either
+            // side is `val`, regardless of binding kind: rebinding a `val`
+            // via `def`, `class`, a for-loop target, or another assignment
+            // all violate immutability.
+            let _ = kind;
+            if existing.mutability == Mutability::Val || mutability == Mutability::Val {
                 let decl_span = existing.span;
                 self.diagnostics.push_error(TycError::immutable_assign(
                     name,
@@ -230,10 +238,7 @@ impl<'a> Resolver<'a> {
                 ));
                 return;
             }
-            // Otherwise this is a rebinding of a var/function/class/etc.
-            // Leave the original binding in place but record neither error
-            // nor a duplicate entry; the type checker will use the first
-            // declaration as the canonical site.
+            // Non-val rebinding: silently keep the first declaration.
             return;
         }
 
@@ -289,7 +294,6 @@ pub fn resolve_module(
     module: &Mod,
 ) -> (ResolvedModule, Diagnostics) {
     let mut r = Resolver::new(path.into(), source, stripped);
-    let _ = r.stripped_cursor;
 
     if let Mod::Module(m) = module {
         // First pass: collect top-level declarations so forward references
@@ -311,42 +315,105 @@ pub fn resolve_module(
     (resolved, r.diagnostics)
 }
 
-/// First pass: pre-declare function, class, and import names so forward
-/// references inside expressions resolve. Value bindings (`Assign` /
-/// `AnnAssign`) are introduced at the point of their first occurrence in
-/// the second walk, not here, so reassignment detection works correctly.
+/// Search for `name` as a whole-word ASCII identifier in `source` starting
+/// from `stmt_start`, after the keyword `keyword_prefix` (e.g. `"def "` or
+/// `"class "`). Returns `(offset, end)` of the identifier, or a length-only
+/// span at `stmt_start` if the pattern can't be found (shouldn't happen
+/// for well-formed AST nodes).
+fn find_def_name_span(
+    source: &str,
+    stmt_start: usize,
+    keyword_prefix: &str,
+    name: &str,
+) -> (usize, usize) {
+    if stmt_start >= source.len() {
+        return (stmt_start, stmt_start + name.len());
+    }
+    let haystack = &source[stmt_start..];
+    if let Some(rel) = haystack.find(keyword_prefix) {
+        let mut cursor = stmt_start + rel + keyword_prefix.len();
+        let bytes = source.as_bytes();
+        while cursor < bytes.len() && (bytes[cursor] == b' ' || bytes[cursor] == b'\t') {
+            cursor += 1;
+        }
+        if source[cursor..].starts_with(name) {
+            return (cursor, cursor + name.len());
+        }
+    }
+    (stmt_start, stmt_start + name.len())
+}
+
+/// Pre-declare names that should be visible across the whole body. Runs in
+/// two sub-passes so that `val` values are registered *before* function /
+/// class / import names — this lets the val-immutability check fire when a
+/// later `def x` or `class x` collides with an earlier `val x`.
 fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt<TextRange>]) {
+    // Sub-pass 1: value bindings (so val-protection sees them first).
+    let default_val = r.scopes[scope].kind == ScopeKind::Module;
+    for stmt in body {
+        match stmt {
+            Stmt::Assign(a) => {
+                for t in &a.targets {
+                    declare_target(r, scope, t, default_val);
+                }
+            }
+            Stmt::AnnAssign(a) => {
+                declare_target(r, scope, &a.target, default_val);
+            }
+            _ => {}
+        }
+    }
+
+    // Sub-pass 2: functions, classes, imports.
     for stmt in body {
         match stmt {
             Stmt::FunctionDef(f) => {
-                let span = (
+                let span = find_def_name_span(
+                    r.source,
                     f.range.start().to_usize(),
-                    f.range.start().to_usize() + f.name.as_str().len(),
+                    "def ",
+                    f.name.as_str(),
                 );
                 r.declare(scope, f.name.as_str(), BindingKind::Function, Mutability::Var, span);
             }
             Stmt::AsyncFunctionDef(f) => {
-                let span = (
+                let span = find_def_name_span(
+                    r.source,
                     f.range.start().to_usize(),
-                    f.range.start().to_usize() + f.name.as_str().len(),
+                    "def ",
+                    f.name.as_str(),
                 );
                 r.declare(scope, f.name.as_str(), BindingKind::Function, Mutability::Var, span);
             }
             Stmt::ClassDef(c) => {
-                let span = (
+                let span = find_def_name_span(
+                    r.source,
                     c.range.start().to_usize(),
-                    c.range.start().to_usize() + c.name.as_str().len(),
+                    "class ",
+                    c.name.as_str(),
                 );
                 r.declare(scope, c.name.as_str(), BindingKind::Class, Mutability::Var, span);
             }
             Stmt::Import(i) => {
                 for alias in &i.names {
-                    let name = alias.asname.as_ref().unwrap_or(&alias.name);
+                    // `import pkg.sub` binds the top-level name `pkg` in
+                    // Python; only the explicit `as` form binds the dotted
+                    // path under a new name.
+                    let bound_name = match &alias.asname {
+                        Some(as_name) => as_name.as_str().to_owned(),
+                        None => alias
+                            .name
+                            .as_str()
+                            .split('.')
+                            .next()
+                            .unwrap_or(alias.name.as_str())
+                            .to_owned(),
+                    };
                     let span = (
                         alias.range.start().to_usize(),
-                        alias.range.start().to_usize() + name.as_str().len(),
+                        alias.range.start().to_usize() + bound_name.len(),
                     );
-                    r.declare(scope, name.as_str(), BindingKind::Import, Mutability::Var, span);
+                    r.declare(scope, &bound_name, BindingKind::Import, Mutability::Var, span);
                 }
             }
             Stmt::ImportFrom(i) => {
@@ -373,16 +440,20 @@ fn declare_target(
     if let Expr::Name(n) = target {
         let line = r.line_of_offset(n.range.start().to_usize());
         let kw = r.keyword_for_line(line);
+        // When no explicit `val`/`var` keyword is present, treat a bare
+        // assignment as a rebinding of any existing binding (taking its
+        // mutability) rather than a fresh declaration. Only the *first*
+        // bareword assignment in a module scope defaults to `val`; later
+        // bare assignments inherit the existing binding's mutability.
+        let existing_mut = r.lookup_local(scope, n.id.as_str()).map(|b| b.mutability);
         let mutability = match kw {
             Some(TyphonKeyword::Val) => Mutability::Val,
             Some(TyphonKeyword::Var) => Mutability::Var,
-            None => {
-                if default_val {
-                    Mutability::Val
-                } else {
-                    Mutability::Var
-                }
-            }
+            None => existing_mut.unwrap_or(if default_val {
+                Mutability::Val
+            } else {
+                Mutability::Var
+            }),
         };
         let span = (
             n.range.start().to_usize(),
@@ -401,8 +472,9 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
             for d in &f.decorator_list {
                 walk_expr(r, scope, d);
             }
-            // Annotations on the function signature live in the enclosing
-            // scope (PEP 563 style).
+            // Parameter and return annotations live in the enclosing scope
+            // (PEP 563 style); record references to every type they mention.
+            walk_argument_annotations(r, scope, &f.args);
             if let Some(ret) = &f.returns {
                 walk_expr(r, scope, ret);
             }
@@ -420,6 +492,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
             for d in &f.decorator_list {
                 walk_expr(r, scope, d);
             }
+            walk_argument_annotations(r, scope, &f.args);
             if let Some(ret) = &f.returns {
                 walk_expr(r, scope, ret);
             }
@@ -578,6 +651,36 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
             }
         }
         _ => {}
+    }
+}
+
+/// Walk every annotation expression on the parameters of a function, so
+/// names used in those annotations are recorded as references and bound
+/// against the enclosing scope.
+fn walk_argument_annotations(
+    r: &mut Resolver,
+    scope: ScopeId,
+    args: &rustpython_ast::Arguments<TextRange>,
+) {
+    let all = args
+        .posonlyargs
+        .iter()
+        .chain(args.args.iter())
+        .chain(args.kwonlyargs.iter());
+    for arg in all {
+        if let Some(ann) = &arg.def.annotation {
+            walk_expr(r, scope, ann);
+        }
+    }
+    if let Some(va) = &args.vararg {
+        if let Some(ann) = &va.annotation {
+            walk_expr(r, scope, ann);
+        }
+    }
+    if let Some(kw) = &args.kwarg {
+        if let Some(ann) = &kw.annotation {
+            walk_expr(r, scope, ann);
+        }
     }
 }
 
@@ -886,5 +989,36 @@ mod tests {
             .find(|s| s.kind == ScopeKind::Function)
             .unwrap();
         assert!(fn_scope.lookup_local("x").is_some());
+    }
+
+    #[test]
+    fn dotted_import_binds_top_level_package() {
+        let (m, d) = resolve("import os.path\nval n: int = len(os.path.sep)\n");
+        assert!(!d.has_errors(), "{:?}", d.errors());
+        // Python binds `os`, not `os.path`.
+        assert!(m.module_scope().lookup_local("os").is_some());
+        assert!(m.module_scope().lookup_local("os.path").is_none());
+    }
+
+    #[test]
+    fn def_collision_with_val_errors() {
+        let (_m, d) = resolve("val x: int = 1\ndef x() -> None:\n    pass\n");
+        assert!(d.has_errors(), "expected val/def collision");
+    }
+
+    #[test]
+    fn for_loop_target_cannot_rebind_val() {
+        let src = "val items: list = []\nfor items in [[1]]:\n    pass\n";
+        let (_m, d) = resolve(src);
+        assert!(d.has_errors(), "expected for-loop rebinding to error");
+    }
+
+    #[test]
+    fn parameter_annotation_references_resolved() {
+        // A missing annotation type should now surface as an unknown name.
+        let (_m, d) = resolve("def f(x: NoSuchType) -> None:\n    pass\n");
+        assert!(d.has_errors(), "expected unknown type in parameter annotation");
+        let msg = format!("{}", d.errors()[0]);
+        assert!(msg.contains("NoSuchType"), "got {}", msg);
     }
 }

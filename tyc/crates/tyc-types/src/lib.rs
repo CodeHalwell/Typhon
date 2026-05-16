@@ -199,8 +199,11 @@ pub fn type_from_annotation(expr: &Expr<TextRange>, classes: &[String]) -> Type 
             Type::union_of(vec![left, right])
         }
         Expr::Subscript(s) => {
+            // Accept either a bare name (`Optional[T]`) or an attribute
+            // (`typing.Optional[T]`, `typing.Union[A, B]`).
             let head = match s.value.as_ref() {
                 Expr::Name(n) => n.id.as_str().to_owned(),
+                Expr::Attribute(a) => a.attr.as_str().to_owned(),
                 _ => return Type::Unknown,
             };
             // Optional[T] → T | None
@@ -841,7 +844,16 @@ fn infer_expr(c: &mut Checker, expr: &Expr<TextRange>) -> Type {
         }
         Expr::BoolOp(_) => Type::Bool,
         Expr::Compare(_) => Type::Bool,
-        Expr::UnaryOp(u) => infer_expr(c, &u.operand),
+        Expr::UnaryOp(u) => {
+            let operand = infer_expr(c, &u.operand);
+            match u.op {
+                // Boolean negation always produces a bool, regardless of
+                // operand type (Python: `not x` returns a bool).
+                rustpython_ast::UnaryOp::Not => Type::Bool,
+                // Bitwise / arithmetic unary ops preserve the operand type.
+                _ => operand,
+            }
+        }
         Expr::Call(call) => {
             let func_type = infer_expr(c, &call.func);
             let call_span = (
@@ -1064,6 +1076,41 @@ class Point:
     y: int
 
 val p: Point = Point()
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn not_returns_bool_regardless_of_operand() {
+        // `not x` on a non-bool operand still has type bool.
+        let d = check("val flag: bool = not 1\n");
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn typing_optional_attribute_resolves() {
+        let src = "\
+import typing
+
+def f(x: typing.Optional[int]) -> int:
+    if x is not None:
+        return x
+    return 0
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn typing_union_attribute_resolves() {
+        let src = "\
+import typing
+
+def f(x: typing.Union[int, str]) -> int:
+    if isinstance(x, int):
+        return x
+    return 0
 ";
         let d = check(src);
         assert!(!d.has_errors(), "{:?}", d.errors());

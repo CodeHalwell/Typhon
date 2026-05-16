@@ -60,9 +60,9 @@ See [docs/cli.md](docs/cli.md) for the full reference.
 
 ## Project status
 
-**Phase 0 — Foundation** complete:
+**Phase 0 — Foundation** substantially complete (Ruff parser fork deferred — currently using `rustpython-parser` 0.4 as the fallback):
 
-- ✅ Cargo workspace skeleton with `crates/` and `vendor/` directories
+- ✅ Cargo workspace skeleton with `crates/` directories
 - ✅ `val`/`var` keyword tokens (immutable and mutable bindings)
 - ✅ `tyc fmt` — parses and validates `.ty` source, normalises whitespace
 - ✅ `tyc check` — validates syntax and emits miette diagnostics

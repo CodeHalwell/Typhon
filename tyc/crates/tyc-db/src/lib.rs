@@ -87,12 +87,15 @@ impl TycDatabase {
 /// implement `salsa::Update`; they will be moved under salsa in later
 /// phases.
 pub fn check_file(db: &mut TycDatabase, path: String, text: String) -> Diagnostics {
-    let file = SourceFile::new(db, path.clone(), text.clone());
+    // Currently the resolver and type-checker need the full PreprocessResult
+    // (including `stripped` and `optionals` metadata), which doesn't yet
+    // implement `salsa::Update` — so we run preprocess directly here. The
+    // `preprocessed_text` salsa query above remains the cached entry point
+    // for callers that only need the Python-compatible source string.
+    let _ = SourceFile::new(db, path.clone(), text.clone());
     let mut diags = Diagnostics::new();
 
     let prep = preprocess(&text);
-    // Touch the salsa-cached query to keep the dependency edge real.
-    let _ = preprocessed_text(db, file);
 
     let module = match parse(&prep.python_source, Mode::Module, &path) {
         Ok(m) => m,
