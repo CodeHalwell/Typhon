@@ -11,7 +11,9 @@
 //! tracked queries as their output types acquire `salsa::Update`.
 
 use rustpython_parser::{parse, Mode};
+use tyc_desugar::{analyse_module, ClassDefault};
 use tyc_diagnostics::{Diagnostics, TycError};
+use tyc_emit::{emit_compiled, EmitOptions};
 use tyc_resolve::resolve_module;
 use tyc_syntax::preprocess::preprocess;
 use tyc_types::check_module;
@@ -76,6 +78,71 @@ impl salsa::Database for TycDatabase {}
 impl TycDatabase {
     pub fn new() -> Self {
         Self::default()
+    }
+}
+
+/// Output of the full build pipeline for a single file.
+pub struct BuildOutput {
+    pub diagnostics: Diagnostics,
+    /// The emitted Python source, or `None` if there were type errors.
+    pub python_source: Option<String>,
+}
+
+/// Full build pipeline for a single `.ty` file.
+///
+/// Runs preprocess → parse → resolve → type-check → desugar → emit.
+/// On success returns the emitted Python source. On type errors returns
+/// `None` for the source (diagnostics still populated).
+pub fn build_file(
+    _db: &mut TycDatabase,
+    path: String,
+    text: String,
+    class_default: ClassDefault,
+) -> BuildOutput {
+    let prep = preprocess(&text);
+
+    let module = match parse(&prep.python_source, Mode::Module, &path) {
+        Ok(m) => m,
+        Err(e) => {
+            let mut diags = Diagnostics::new();
+            diags.push_error(TycError::parse(
+                path,
+                prep.python_source,
+                e.to_string(),
+                usize::from(e.offset),
+            ));
+            return BuildOutput {
+                diagnostics: diags,
+                python_source: None,
+            };
+        }
+    };
+
+    let (resolved, resolve_diags) =
+        resolve_module(path.clone(), &prep.python_source, &prep.stripped, &module);
+    let type_diags = check_module(path, &prep.python_source, &resolved, &module);
+
+    let mut diags = Diagnostics::new();
+    diags.extend(resolve_diags);
+    diags.extend(type_diags);
+
+    if diags.has_errors() {
+        return BuildOutput {
+            diagnostics: diags,
+            python_source: None,
+        };
+    }
+
+    let desugar_info = analyse_module(&module, class_default);
+    let options = EmitOptions {
+        inject_dataclass: desugar_info.needs_dataclass_import,
+        inject_pydantic: desugar_info.needs_pydantic_import,
+    };
+    let python = emit_compiled(&module, &options);
+
+    BuildOutput {
+        diagnostics: diags,
+        python_source: Some(python),
     }
 }
 

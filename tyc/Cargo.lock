@@ -1176,7 +1176,9 @@ dependencies = [
  "rustpython-ast",
  "rustpython-parser",
  "salsa",
+ "tyc-desugar",
  "tyc-diagnostics",
+ "tyc-emit",
  "tyc-resolve",
  "tyc-syntax",
  "tyc-types",
@@ -1185,6 +1187,10 @@ dependencies = [
 [[package]]
 name = "tyc-desugar"
 version = "0.1.0"
+dependencies = [
+ "rustpython-ast",
+ "rustpython-parser",
+]
 
 [[package]]
 name = "tyc-diagnostics"

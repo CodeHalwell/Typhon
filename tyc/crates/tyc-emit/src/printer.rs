@@ -13,6 +13,11 @@ use rustpython_ast::{
 pub struct Emitter {
     output: String,
     indent: usize,
+    /// When true, inject `@dataclass(slots=True)` before bare class defs.
+    inject_dataclass: bool,
+    /// When true, make bare class defs extend `BaseModel` (Phase 2+).
+    #[allow(dead_code)]
+    inject_pydantic: bool,
 }
 
 const INDENT_WIDTH: usize = 4;
@@ -22,6 +27,18 @@ impl Emitter {
         Self {
             output: String::new(),
             indent: 0,
+            inject_dataclass: false,
+            inject_pydantic: false,
+        }
+    }
+
+    /// Create an emitter configured for compiled Typhon output.
+    pub fn new_compiled(options: &crate::EmitOptions) -> Self {
+        Self {
+            output: String::new(),
+            indent: 0,
+            inject_dataclass: options.inject_dataclass,
+            inject_pydantic: options.inject_pydantic,
         }
     }
 
@@ -150,9 +167,15 @@ impl Emitter {
 
             Stmt::ClassDef(c) => {
                 self.newline();
+                // Emit existing decorators first.
                 for decorator in &c.decorator_list {
                     self.fill("@");
                     self.emit_expr(decorator);
+                    self.newline();
+                }
+                // Inject @dataclass(slots=True) if the class is not already decorated.
+                if self.inject_dataclass && !self.has_dataclass_decorator(&c.decorator_list) {
+                    self.fill("@dataclass(slots=True)");
                     self.newline();
                 }
                 self.fill("class ");
@@ -1140,6 +1163,20 @@ impl Emitter {
 impl Default for Emitter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Emitter {
+    /// Returns true if `decorators` already contains `@dataclass` (any form).
+    fn has_dataclass_decorator(&self, decorators: &[Expr<TextRange>]) -> bool {
+        decorators.iter().any(|d| match d {
+            Expr::Name(n) => n.id.as_str() == "dataclass",
+            Expr::Call(call) => {
+                matches!(call.func.as_ref(), Expr::Name(n) if n.id.as_str() == "dataclass")
+            }
+            Expr::Attribute(a) => a.attr.as_str() == "dataclass",
+            _ => false,
+        })
     }
 }
 

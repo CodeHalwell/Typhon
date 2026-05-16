@@ -3,3 +3,9 @@ name = "tyc-desugar"
 version.workspace = true
 edition.workspace = true
 description = "Typhon AST → Python AST lowering (Phase 2+)"
+
+[dependencies]
+rustpython-ast = { workspace = true }
+
+[dev-dependencies]
+rustpython-parser = { workspace = true }
