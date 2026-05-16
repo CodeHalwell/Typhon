@@ -2083,26 +2083,29 @@ pub fn expand_go_calls(source: &str) -> String {
 /// alone and the parser surfaces a precise error).
 fn parse_go_call(rest: &str) -> Option<(String, Option<String>)> {
     let rest = rest.trim();
-    // Split on `->` at depth 0.
+    // Split on `->` at depth 0, with string-literal and backslash-escape
+    // awareness so `go f("\"->")` is not mistakenly split at the inner `->`.
     let mut depth: i32 = 0;
     let bytes = rest.as_bytes();
     let mut arrow_at: Option<usize> = None;
-    let mut in_str: Option<char> = None;
+    let mut in_str: Option<u8> = None;
     let mut i = 0;
     while i < bytes.len() {
-        let c = bytes[i] as char;
+        let b = bytes[i];
         if let Some(q) = in_str {
-            if c == q {
+            if b == b'\\' {
+                i += 1; // skip escaped character
+            } else if b == q {
                 in_str = None;
             }
             i += 1;
             continue;
         }
-        match c {
-            '"' | '\'' => in_str = Some(c),
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth -= 1,
-            '-' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'>' => {
+        match b {
+            b'"' | b'\'' => in_str = Some(b),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'-' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'>' => {
                 arrow_at = Some(i);
                 break;
             }
