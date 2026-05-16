@@ -138,6 +138,34 @@ pub enum TycError {
     #[error("{message}")]
     #[diagnostic(code(tyc::generic))]
     Generic { message: String },
+
+    /// The `?` error-propagation operator was used outside a `Result`-returning function.
+    #[error("{message}")]
+    #[diagnostic(
+        code(tyc::invalid_question_op),
+        help("the `?` operator is only valid inside a function returning `Result[T, E]`")
+    )]
+    InvalidQuestionOp {
+        message: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("invalid use of `?` here")]
+        span: SourceSpan,
+    },
+
+    /// An imported name is never used in the module.
+    #[error("imported name '{name}' is never used")]
+    #[diagnostic(
+        code(tyc::unused_import),
+        help("remove the import, or prefix it with `_` if it is intentionally unused")
+    )]
+    UnusedImport {
+        name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("imported here but never used")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -280,6 +308,36 @@ impl TycError {
         Self::Comptime {
             name: name.into(),
             message: message.into(),
+        }
+    }
+
+    /// Construct a [`TycError::InvalidQuestionOp`] diagnostic.
+    pub fn invalid_question_op(
+        message: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::InvalidQuestionOp {
+            message: message.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::UnusedImport`] diagnostic.
+    pub fn unused_import(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::UnusedImport {
+            name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
         }
     }
 

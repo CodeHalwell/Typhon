@@ -468,6 +468,232 @@ pub fn postprocess(
     result
 }
 
+// ── `?` operator validation ───────────────────────────────────────────────────
+
+/// An error produced when the `?` operator is used in an invalid context.
+#[derive(Debug, Clone)]
+pub struct QuestionOpError {
+    /// 0-based line index in the original Typhon source.
+    pub line_index: usize,
+    /// Byte offset of the `?` character in the original source.
+    pub offset: usize,
+    /// Human-readable error message.
+    pub message: String,
+}
+
+/// Validate that every `?` error-propagation operator (`expr)?`) in `source`
+/// appears inside a function whose return-type annotation is `Result[T, E]`.
+///
+/// Returns a list of errors for each `)?` found at module level or inside a
+/// function whose return-type annotation is known and does not begin with the
+/// `Result` identifier.
+///
+/// Multi-line signatures where `->` appears on the `) -> RetType:` closing
+/// line (rather than the `def` line itself) are handled: the validator detects
+/// the `) -> RetType:` pattern and records the return type.  Signatures where
+/// `->` appears on neither the `def` line nor the closing `)` line are treated
+/// as having an unknown return type and the `?` check is skipped for them to
+/// avoid false positives.
+///
+/// Call this on the **original Typhon source** before [`expand_question_ops`].
+pub fn validate_question_ops(source: &str) -> Vec<QuestionOpError> {
+    let mut errors = Vec::new();
+    // Stack of (def_indent_len, return_type_text):
+    //   def_indent_len   — indentation column of the `def` keyword itself.
+    //   return_type_text — Some(text) when `->` was found; None means unknown.
+    let mut fn_stack: Vec<(usize, Option<String>)> = Vec::new();
+    let mut in_string: Option<StringMode> = None;
+    // Running byte offset of the start of the current line in `source`.
+    let mut byte_offset: usize = 0;
+
+    for (line_index, line) in source.split_inclusive('\n').enumerate() {
+        let raw = line.trim_end_matches(|c: char| c == '\n' || c == '\r');
+
+        let pre_string = in_string;
+        let code_end = scan_line_code_end(raw, &mut in_string);
+
+        // Lines inside a triple-quoted string are pure string content — skip.
+        if pre_string.is_some() {
+            byte_offset += line.len();
+            continue;
+        }
+
+        let code = raw[..code_end].trim_end();
+
+        // Blank and comment-only lines don't affect scope tracking.
+        if code.trim().is_empty() {
+            byte_offset += line.len();
+            continue;
+        }
+
+        let indent_len = code.find(|c: char| !c.is_whitespace()).unwrap_or(0);
+        let trimmed = &code[indent_len..];
+
+        // A line that begins with `)` is the continuation/close of a multi-line
+        // expression — most commonly `) -> RetType:` closing a multi-line
+        // parameter list.  Suppress scope-pop for these lines; if `->` is
+        // present, update the most-recent function's return type.  Unlike the
+        // previous approach, we do NOT skip the `?` detection below so that
+        // `)?` on the same line as a closing paren is still validated.
+        if trimmed.starts_with(')') {
+            if trimmed.contains("->") {
+                if let Some(entry) = fn_stack.last_mut() {
+                    if entry.1.is_none() {
+                        entry.1 = extract_return_type_text(code);
+                    }
+                }
+            }
+        } else {
+            // Pop functions we've exited: a non-blank line at indent ≤ fn_indent
+            // means we have left that function's body.
+            while let Some(&(fn_indent, _)) = fn_stack.last() {
+                if indent_len <= fn_indent {
+                    fn_stack.pop();
+                } else {
+                    break;
+                }
+            }
+
+            // Detect a function definition and push its return type onto the stack.
+            if trimmed.starts_with("def ") || trimmed.starts_with("async def ") {
+                let ret_type = extract_return_type_text(code);
+                fn_stack.push((indent_len, ret_type));
+            }
+        }
+
+        // Detect `)?` — the `?` error-propagation operator.  The same pattern
+        // `expand_question_ops` uses: last code char is `?`, char before is `)`.
+        // This check runs for ALL lines, including `)…` continuation lines.
+        if code.ends_with('?') {
+            let before_q = &code[..code.len() - 1];
+            if before_q.ends_with(')') {
+                // Byte offset of the `?` in the original source.
+                let q_offset = byte_offset + code.len() - 1;
+                match fn_stack.last() {
+                    None => {
+                        errors.push(QuestionOpError {
+                            line_index,
+                            offset: q_offset,
+                            message: "`?` operator used at module level; \
+                                     it is only valid inside a function returning `Result[T, E]`"
+                                .to_owned(),
+                        });
+                    }
+                    Some((_, Some(ret))) if !is_result_type(ret) => {
+                        errors.push(QuestionOpError {
+                            line_index,
+                            offset: q_offset,
+                            message: format!(
+                                "`?` operator used in a function returning `{ret}`; \
+                                 it is only valid in functions returning `Result[T, E]`"
+                            ),
+                        });
+                    }
+                    // Return type is Result-family (valid) or unknown (skip FP).
+                    Some(_) => {}
+                }
+            }
+        }
+
+        byte_offset += line.len();
+    }
+
+    errors
+}
+
+/// Return `true` when `ret` is the `Result` identifier (bare or subscripted).
+///
+/// Checks for a whole-word match so that `MyResult` / `NotAResult` are not
+/// accepted.  The canonical Typhon form is `Result[T, E]`.
+fn is_result_type(ret: &str) -> bool {
+    let ret = ret.trim();
+    if !ret.starts_with("Result") {
+        return false;
+    }
+    // The character after "Result" (if any) must not be an identifier char.
+    matches!(
+        ret.as_bytes().get("Result".len()),
+        None | Some(b'[') | Some(b' ') | Some(b'\t')
+    )
+}
+
+/// Extract the return-type annotation text from a single `def` line.
+///
+/// Returns `Some(text)` when `->` appears outside string literals,
+/// parentheses, and brackets on this line and the header-closing `:` is also
+/// on the same line; `None` otherwise (multi-line signatures, missing
+/// annotation, etc.).
+///
+/// String literal tracking prevents `->` or `:` inside a default-value string
+/// (e.g. `def f(x: str = "->") -> Result:`) from confusing the parser.
+fn extract_return_type_text(def_line: &str) -> Option<String> {
+    let bytes = def_line.as_bytes();
+    let mut depth = 0i32;
+    let mut in_str: Option<u8> = None; // Some(b'"') or Some(b'\'')
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        // Inside a single-/double-quoted string: look for the closing quote,
+        // handling backslash escapes.  (Triple-quoted strings are unlikely in
+        // a `def` parameter list and are not handled here.)
+        if let Some(q) = in_str {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' | b'\'' => in_str = Some(b),
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = (depth - 1).max(0),
+            b'-' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b'>' => {
+                let after_arrow = def_line[i + 2..].trim_start();
+                // Scan the return-type text for the colon that closes the
+                // function header, respecting nested brackets and strings.
+                let mut depth2 = 0i32;
+                let mut in_str2: Option<u8> = None;
+                let mut colon_pos = None;
+                let abytes = after_arrow.as_bytes();
+                let mut j = 0;
+                while j < abytes.len() {
+                    let c = abytes[j];
+                    if let Some(q) = in_str2 {
+                        if c == b'\\' {
+                            j += 2;
+                            continue;
+                        }
+                        if c == q {
+                            in_str2 = None;
+                        }
+                        j += 1;
+                        continue;
+                    }
+                    match c {
+                        b'"' | b'\'' => in_str2 = Some(c),
+                        b'(' | b'[' => depth2 += 1,
+                        b')' | b']' => depth2 -= 1,
+                        b':' if depth2 == 0 => {
+                            colon_pos = Some(j);
+                            break;
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                return colon_pos.map(|pos| after_arrow[..pos].trim().to_owned());
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 // ── `?` operator expansion ────────────────────────────────────────────────────
 
 /// Expand the `?` error-propagation operator into equivalent Python guard code.
@@ -959,5 +1185,140 @@ mod tests {
             "indented comptime should not be recorded: {:?}",
             result.comptime_bindings
         );
+    }
+
+    // ── validate_question_ops ────────────────────────────────────────────────
+
+    #[test]
+    fn question_op_valid_in_result_function() {
+        let src = "def parse(s: str) -> Result[int, str]:\n    val n = int(s)?\n    return Ok(n)\n";
+        let errs = validate_question_ops(src);
+        assert!(errs.is_empty(), "expected no errors, got: {:?}", errs.iter().map(|e| &e.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn question_op_at_module_level_is_error() {
+        let src = "val x = parse()?\n";
+        let errs = validate_question_ops(src);
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].message.contains("module level"), "got: {}", errs[0].message);
+        assert_eq!(errs[0].line_index, 0);
+    }
+
+    #[test]
+    fn question_op_in_none_returning_function_is_error() {
+        let src = "def process() -> None:\n    val x = load()?\n";
+        let errs = validate_question_ops(src);
+        assert_eq!(errs.len(), 1, "expected one error, got: {:?}", errs.iter().map(|e| &e.message).collect::<Vec<_>>());
+        assert!(errs[0].message.contains("None"), "got: {}", errs[0].message);
+    }
+
+    #[test]
+    fn question_op_in_int_returning_function_is_error() {
+        let src = "def compute() -> int:\n    val x = fetch()?\n    return x\n";
+        let errs = validate_question_ops(src);
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].message.contains("`int`"), "got: {}", errs[0].message);
+    }
+
+    #[test]
+    fn question_op_in_nested_result_function_is_valid() {
+        let src = "def outer() -> None:\n    def inner() -> Result[int, str]:\n        val x = load()?\n        return Ok(x)\n";
+        let errs = validate_question_ops(src);
+        assert!(errs.is_empty(), "expected no errors, got: {:?}", errs.iter().map(|e| &e.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn question_op_in_multiline_sig_skips_validation() {
+        // Multi-line signature: `->` appears on the `) -> RetType:` closing
+        // line rather than the `def` line.  The validator picks up the return
+        // type from the signature-closer and correctly accepts the `?` use.
+        let src = "def process(\n    x: int,\n) -> Result[int, str]:\n    val y = load()?\n";
+        let errs = validate_question_ops(src);
+        assert!(errs.is_empty(), "multi-line sig with Result return must not error: {:?}",
+            errs.iter().map(|e| &e.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn question_op_nullable_sugar_not_flagged() {
+        // `str?` ends with `?` but the char before is `r`, not `)`, so it is
+        // type-sugar, not the propagation operator.
+        let src = "val x: str? = None\n";
+        let errs = validate_question_ops(src);
+        assert!(errs.is_empty(), "nullable sugar must not be flagged");
+    }
+
+    #[test]
+    fn extract_return_type_finds_result() {
+        assert_eq!(
+            extract_return_type_text("def f() -> Result[int, str]:"),
+            Some("Result[int, str]".to_owned())
+        );
+    }
+
+    #[test]
+    fn extract_return_type_finds_none() {
+        assert_eq!(
+            extract_return_type_text("def f() -> None:"),
+            Some("None".to_owned())
+        );
+    }
+
+    #[test]
+    fn extract_return_type_multiline_sig() {
+        // `->` not present on this line — returns None.
+        assert_eq!(extract_return_type_text("def f("), None);
+    }
+
+    #[test]
+    fn extract_return_type_ignores_arrow_in_string() {
+        // `->` inside a default-value string must not fool the scanner.
+        assert_eq!(
+            extract_return_type_text("def f(x: str = \"->\") -> Result[int, str]:"),
+            Some("Result[int, str]".to_owned())
+        );
+    }
+
+    #[test]
+    fn extract_return_type_ignores_colon_in_string() {
+        assert_eq!(
+            extract_return_type_text("def f(x: str = \"a:b\") -> None:"),
+            Some("None".to_owned())
+        );
+    }
+
+    #[test]
+    fn is_result_type_accepts_bare_result() {
+        assert!(is_result_type("Result"));
+    }
+
+    #[test]
+    fn is_result_type_accepts_subscripted_result() {
+        assert!(is_result_type("Result[int, str]"));
+    }
+
+    #[test]
+    fn is_result_type_rejects_substring() {
+        assert!(!is_result_type("MyResult"));
+        assert!(!is_result_type("ResultWrapper[int]"));
+        assert!(!is_result_type("NotAResult"));
+    }
+
+    #[test]
+    fn question_op_my_result_type_is_invalid_context() {
+        // `MyResult` must not be accepted as a valid Result context.
+        let src = "def f() -> MyResult:\n    val x = load()?\n";
+        let errs = validate_question_ops(src);
+        assert_eq!(errs.len(), 1, "MyResult must not pass as Result context");
+        assert!(errs[0].message.contains("MyResult"), "got: {}", errs[0].message);
+    }
+
+    #[test]
+    fn question_op_error_carries_byte_offset() {
+        // "val x = load()?" — v(0)a(1)l(2) (3)x(4) (5)=(6) (7)l(8)o(9)a(10)d(11)((12))(13)?(14)
+        let src = "val x = load()?\n";
+        let errs = validate_question_ops(src);
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0].offset, 14, "offset should point at the `?`");
     }
 }

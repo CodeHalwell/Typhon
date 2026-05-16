@@ -284,6 +284,53 @@ impl<'a> Resolver<'a> {
             }
         }
     }
+
+    fn report_unused_imports(&mut self) {
+        // Resolve each reference to the specific binding it refers to (by
+        // walking the scope chain, exactly like report_unknown_names does).
+        // This correctly handles name shadowing: a local `os` parameter does
+        // not mark a module-level `import os` as used.
+        let mut used_bindings: std::collections::HashSet<(usize, usize)> =
+            std::collections::HashSet::new();
+
+        for r in &self.references {
+            let mut current = Some(r.scope);
+            while let Some(id) = current {
+                let scope = &self.scopes[id];
+                if let Some(idx) = scope.bindings.iter().position(|b| b.name == r.name) {
+                    used_bindings.insert((id, idx));
+                    break;
+                }
+                current = scope.parent;
+            }
+        }
+
+        for (scope_id, scope) in self.scopes.iter().enumerate() {
+            for (binding_idx, binding) in scope.bindings.iter().enumerate() {
+                if binding.kind != BindingKind::Import {
+                    continue;
+                }
+                // Wildcard imports (`from foo import *`) cannot be checked.
+                if binding.name == "*" {
+                    continue;
+                }
+                // `_`-prefixed names are conventionally "intentionally unused".
+                if binding.name.starts_with('_') {
+                    continue;
+                }
+                if !used_bindings.contains(&(scope_id, binding_idx)) {
+                    let length = binding.span_length().max(1);
+                    self.diagnostics.push_warning(TycError::unused_import(
+                        binding.name.clone(),
+                        &self.path,
+                        self.source,
+                        binding.span.0,
+                        length,
+                    ));
+                }
+            }
+        }
+    }
 }
 
 /// Resolve a parsed module and return scopes + diagnostics.
@@ -307,6 +354,7 @@ pub fn resolve_module(
     }
 
     r.report_unknown_names();
+    r.report_unused_imports();
 
     let resolved = ResolvedModule {
         scopes: std::mem::take(&mut r.scopes),
@@ -1032,5 +1080,82 @@ mod tests {
         assert!(d.has_errors(), "expected unknown type in parameter annotation");
         let msg = format!("{}", d.errors()[0]);
         assert!(msg.contains("NoSuchType"), "got {}", msg);
+    }
+
+    // ── unused import detection ──────────────────────────────────────────────
+
+    #[test]
+    fn unused_import_is_a_warning() {
+        let (_m, d) = resolve("import os\n");
+        assert!(!d.has_errors(), "unused import should not be an error");
+        assert_eq!(d.warning_count(), 1, "expected exactly one warning");
+        let msg = format!("{}", d.warnings()[0]);
+        assert!(msg.contains("os"), "warning should name the import, got: {msg}");
+    }
+
+    #[test]
+    fn used_import_has_no_warning() {
+        let (_m, d) = resolve("import os\nval n: int = len(os.sep)\n");
+        assert!(!d.has_errors(), "{:?}", d.errors());
+        assert_eq!(d.warning_count(), 0, "used import must not warn");
+    }
+
+    #[test]
+    fn unused_from_import_warns() {
+        let (_m, d) = resolve("from os import path\n");
+        assert_eq!(d.warning_count(), 1);
+        let msg = format!("{}", d.warnings()[0]);
+        assert!(msg.contains("path"), "got: {msg}");
+    }
+
+    #[test]
+    fn used_from_import_no_warning() {
+        let (_m, d) = resolve("from os import path\nval s: str = path.sep\n");
+        assert!(!d.has_errors(), "{:?}", d.errors());
+        assert_eq!(d.warning_count(), 0);
+    }
+
+    #[test]
+    fn import_as_alias_unused_warns() {
+        let (_m, d) = resolve("import os.path as osp\n");
+        assert_eq!(d.warning_count(), 1);
+        let msg = format!("{}", d.warnings()[0]);
+        assert!(msg.contains("osp"), "got: {msg}");
+    }
+
+    #[test]
+    fn import_as_alias_used_no_warning() {
+        let (_m, d) = resolve("import os.path as osp\nval s: str = osp.sep\n");
+        assert!(!d.has_errors(), "{:?}", d.errors());
+        assert_eq!(d.warning_count(), 0);
+    }
+
+    #[test]
+    fn multiple_imports_only_unused_warns() {
+        let src = "import os\nimport sys\nval p: str = sys.version\n";
+        let (_m, d) = resolve(src);
+        assert_eq!(d.warning_count(), 1, "only `os` should warn");
+        let msg = format!("{}", d.warnings()[0]);
+        assert!(msg.contains("os"), "got: {msg}");
+    }
+
+    #[test]
+    fn import_shadowed_by_parameter_still_warns() {
+        // The `os` reference inside `f` resolves to the parameter, not the
+        // import.  The import at module scope is never the resolved target of
+        // any reference, so it must still warn as unused.
+        let src = "import os\ndef f(os: str) -> None:\n    print(os)\n";
+        let (_m, d) = resolve(src);
+        assert_eq!(d.warning_count(), 1, "shadowed import must still warn");
+        let msg = format!("{}", d.warnings()[0]);
+        assert!(msg.contains("os"), "got: {msg}");
+    }
+
+    #[test]
+    fn underscore_prefixed_import_not_warned() {
+        // `_unused` is the conventional marker for intentionally-unused names.
+        let src = "import os as _unused\nval x: int = 1\n";
+        let (_m, d) = resolve(src);
+        assert_eq!(d.warning_count(), 0, "_-prefixed import must not warn");
     }
 }
