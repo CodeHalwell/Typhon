@@ -540,3 +540,188 @@ impl Diagnostics {
         (self.errors, self.warnings)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Diagnostics collection ────────────────────────────────────────────────
+
+    #[test]
+    fn diagnostics_starts_empty() {
+        let d = Diagnostics::new();
+        assert!(!d.has_errors());
+        assert_eq!(d.error_count(), 0);
+        assert_eq!(d.warning_count(), 0);
+    }
+
+    #[test]
+    fn push_error_increments_error_count() {
+        let mut d = Diagnostics::new();
+        d.push_error(TycError::generic("boom"));
+        assert!(d.has_errors());
+        assert_eq!(d.error_count(), 1);
+        assert_eq!(d.warning_count(), 0);
+    }
+
+    #[test]
+    fn push_warning_increments_warning_count_only() {
+        let mut d = Diagnostics::new();
+        d.push_warning(TycError::generic("heads up"));
+        assert!(!d.has_errors());
+        assert_eq!(d.error_count(), 0);
+        assert_eq!(d.warning_count(), 1);
+    }
+
+    #[test]
+    fn extend_merges_errors_and_warnings() {
+        let mut a = Diagnostics::new();
+        a.push_error(TycError::generic("err-a"));
+
+        let mut b = Diagnostics::new();
+        b.push_warning(TycError::generic("warn-b"));
+
+        a.extend(b);
+        assert_eq!(a.error_count(), 1);
+        assert_eq!(a.warning_count(), 1);
+    }
+
+    #[test]
+    fn into_parts_moves_both_vecs() {
+        let mut d = Diagnostics::new();
+        d.push_error(TycError::generic("e"));
+        d.push_warning(TycError::generic("w"));
+        let (errs, warns) = d.into_parts();
+        assert_eq!(errs.len(), 1);
+        assert_eq!(warns.len(), 1);
+    }
+
+    // ── TycError message text ─────────────────────────────────────────────────
+
+    #[test]
+    fn generic_error_message_is_preserved() {
+        let e = TycError::generic("something went wrong");
+        assert_eq!(e.to_string(), "something went wrong");
+    }
+
+    #[test]
+    fn io_error_message_contains_path_and_cause() {
+        let e = TycError::io("src/main.ty", &std::io::Error::other("permission denied"));
+        let msg = e.to_string();
+        assert!(
+            msg.contains("src/main.ty"),
+            "path missing from IO error: {msg}"
+        );
+        assert!(
+            msg.contains("permission denied"),
+            "cause missing from IO error: {msg}"
+        );
+    }
+
+    #[test]
+    fn type_mismatch_message_contains_both_types() {
+        let e = TycError::type_mismatch("int", "str", "f.ty", "val x: int = \"hi\"", 13, 4);
+        let msg = e.to_string();
+        assert!(msg.contains("int"), "expected type missing: {msg}");
+        assert!(msg.contains("str"), "actual type missing: {msg}");
+    }
+
+    #[test]
+    fn unknown_name_message_contains_name() {
+        let e = TycError::unknown_name("foo", "f.ty", "foo()", 0, 3);
+        assert!(e.to_string().contains("foo"));
+    }
+
+    #[test]
+    fn wrong_arg_count_message_contains_expected_and_actual() {
+        let e = TycError::wrong_arg_count("greet", 1, 3, "f.ty", "greet(1,2,3)", 0, 5);
+        let msg = e.to_string();
+        assert!(msg.contains('1'), "expected count missing: {msg}");
+        assert!(msg.contains('3'), "actual count missing: {msg}");
+        assert!(msg.contains("greet"), "function name missing: {msg}");
+    }
+
+    #[test]
+    fn non_exhaustive_match_message_contains_union_and_missing() {
+        let e = TycError::non_exhaustive_match("Shape", "Circle", "f.ty", "match s:", 0, 7);
+        let msg = e.to_string();
+        assert!(msg.contains("Shape"), "union name missing: {msg}");
+        assert!(msg.contains("Circle"), "missing variant missing: {msg}");
+    }
+
+    #[test]
+    fn comptime_error_message_contains_name_and_message() {
+        let e = TycError::comptime("PORT", "env var not set");
+        let msg = e.to_string();
+        assert!(msg.contains("PORT"), "binding name missing: {msg}");
+        assert!(msg.contains("env var not set"), "reason missing: {msg}");
+    }
+
+    #[test]
+    fn impure_pure_fn_message_contains_name_and_reason() {
+        let e = TycError::impure_pure_fn(
+            "compute",
+            "calls print()",
+            "f.ty",
+            "@pure\ndef compute(): pass",
+            0,
+            5,
+        );
+        let msg = e.to_string();
+        assert!(msg.contains("compute"), "function name missing: {msg}");
+        assert!(msg.contains("calls print()"), "reason missing: {msg}");
+    }
+
+    #[test]
+    fn interface_not_conforming_message_contains_all_parts() {
+        let e = TycError::interface_not_conforming(
+            "Drawable",
+            "Circle",
+            "draw",
+            "f.ty",
+            "val c: Drawable = Circle()",
+            17,
+            8,
+        );
+        let msg = e.to_string();
+        assert!(msg.contains("Drawable"), "interface missing: {msg}");
+        assert!(msg.contains("Circle"), "actual type missing: {msg}");
+        assert!(msg.contains("draw"), "missing member missing: {msg}");
+    }
+
+    // ── Diagnostic codes are stable ───────────────────────────────────────────
+
+    #[test]
+    fn error_codes_are_stable() {
+        use miette::Diagnostic;
+
+        let cases: &[(&str, TycError)] = &[
+            ("tyc::generic", TycError::generic("x")),
+            ("tyc::io", TycError::io("p", &std::io::Error::other("e"))),
+            (
+                "tyc::type_mismatch",
+                TycError::type_mismatch("int", "str", "f.ty", "x", 0, 1),
+            ),
+            (
+                "tyc::unknown_name",
+                TycError::unknown_name("x", "f.ty", "x", 0, 1),
+            ),
+            (
+                "tyc::arg_count",
+                TycError::wrong_arg_count("f", 1, 2, "f.ty", "f(1,2)", 0, 1),
+            ),
+            ("tyc::comptime", TycError::comptime("X", "bad")),
+        ];
+
+        for (expected_code, err) in cases {
+            let code = err
+                .code()
+                .expect("diagnostic should have a code")
+                .to_string();
+            assert_eq!(
+                &code, expected_code,
+                "code mismatch for {expected_code}: got {code}"
+            );
+        }
+    }
+}
