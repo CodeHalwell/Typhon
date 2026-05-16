@@ -118,7 +118,12 @@ A plain `T` forbids `None`; `T?` is the optional form. Internally `T?` is repres
 
 Angle-bracket syntax (`def f<T>(x: T) -> T`) instead of PEP 484 TypeVars. Inference is bidirectional: constraints flow from arguments to type parameters, falling back to explicit annotation when ambiguous. Generics are type-erased at emit time; runtime relies on Python's duck typing and (where present) Pydantic validation.
 
-**Open question — PEP 695 bracket syntax.** Python 3.12 introduced `def f[T](x: T) -> T` (PEP 695), and the typing spec also supports `type Vector[T: float] = ...`. Adopting PEP 695 in source would parse cheaper, lower cheaper, and reduce the divergence between the Ruff parser fork and upstream. Angle brackets keep aesthetic kinship with TypeScript and Rust but cost a deeper grammar fork. A decision is required **before Phase 3 generics work begins**; see *Open questions* near the end of this document.
+**Generics syntax — locked: PEP 695 brackets.** Typhon adopts Python 3.12's PEP 695
+syntax (`def f[T](x: T) -> T`, `type Vector[T: float] = ...`). The decision was
+forced by two factors: `rustpython-parser` already accepts PEP 695, so the
+grammar work is zero; and we have no parser fork to absorb the cost of angle
+brackets. Aesthetic kinship with TS/Rust loses to the practical reality that
+divergence from CPython grammar is the dominant cost on a one-person project.
 
 #### Interfaces (structural)
 
@@ -486,19 +491,19 @@ At the end of Phase 3 — roughly month twelve — Typhon is useful for a real b
 
 These are decisions deferred but consequential enough to record. Each must be resolved before the relevant phase begins.
 
-### Generics syntax — angle brackets vs PEP 695 (decide before Phase 3)
+### Generics syntax — resolved: PEP 695 brackets
 
-Current spec uses `def f<T>(x: T)`. PEP 695 ships `def f[T](x: T)` natively in Python 3.12+, with `type Vector[T: float] = ...` for aliases. The trade-off:
+Locked at Phase 3 entry. PEP 695 (`def f[T](x: T)`, `type Vector[T: float] = ...`)
+wins on every load-bearing dimension for a one-person project:
 
-| | Angle brackets `<T>` | PEP 695 brackets `[T]` |
+| | Angle brackets `<T>` | PEP 695 brackets `[T]` (chosen) |
 |---|---|---|
-| Parser fork cost | Higher: ambiguous with comparison operators, needs lookahead | Lower: aligns with Python's own grammar |
-| Lowering cost | Heavier rewrite into `[T]` / `TypeVar` shapes | Near-zero — emit the same brackets |
-| Aesthetics | TypeScript / Rust kinship | Python-native |
-| Long-term divergence from CPython grammar | Grows with every Python release | Stays close |
-| User learning curve | Familiar to TS/Rust users | Familiar to Python users |
+| Parser fork cost | Higher: ambiguous with comparison operators, needs lookahead | Zero: `rustpython-parser` already accepts it |
+| Lowering cost | Heavier rewrite into `[T]` / `TypeVar` shapes | Pass-through — same syntax Python emits |
+| Long-term divergence from CPython | Grows with every Python release | Stays in lockstep |
 
-The pragmatic choice is PEP 695. The aesthetic choice is angle brackets. A decision is required before structural-typing work begins because both the parser and the emitter touch generics; switching afterward is expensive.
+We retain the angle-bracket aesthetic only as a possible future surface-only
+sugar, not as the canonical form.
 
 ### `unsafe` granularity — block, expression, or both
 

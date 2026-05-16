@@ -76,6 +76,10 @@ pub struct StrictnessConfig {
     pub no_implicit_any: bool,
     pub unused_import: String,
     pub exhaustive_match: String,
+    /// When true, every function that passes the six-condition purity check
+    /// is treated as if the user had written `@memo` — the desugarer emits a
+    /// `@functools.cache` decorator. Off by default; opt in per-project.
+    pub auto_memoise: bool,
 }
 
 impl Default for StrictnessConfig {
@@ -84,6 +88,7 @@ impl Default for StrictnessConfig {
             no_implicit_any: true,
             unused_import: "error".into(),
             exhaustive_match: "error".into(),
+            auto_memoise: false,
         }
     }
 }

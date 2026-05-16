@@ -38,6 +38,15 @@ pub struct DesugarOutput {
     pub needs_typhon_runtime: bool,
 }
 
+/// Options that customise the desugar pass for a single module.
+#[derive(Debug, Default, Clone)]
+pub struct DesugarOptions {
+    /// Names of top-level functions to wrap in `@functools.cache`. Populated
+    /// from the purity analyser when the user opts into `@memo` /
+    /// `@pure(memo=True)` / `[strictness] auto-memoise = true`.
+    pub memoise_functions: Vec<String>,
+}
+
 /// Desugar a Typhon module AST into a plain Python AST.
 ///
 /// Performs three transformations:
@@ -57,18 +66,33 @@ pub struct DesugarOutput {
 ///    injected after any leading docstring and future-imports so the generated
 ///    Python can use those names.
 pub fn desugar_module(module: &Mod<TextRange>) -> DesugarOutput {
+    desugar_module_with(module, DesugarOptions::default())
+}
+
+/// Same as [`desugar_module`] but accepts caller-supplied [`DesugarOptions`].
+///
+/// Used by `tyc build` to thread purity-analysis results (which top-level
+/// functions opted into `@memo` and therefore need an injected
+/// `@functools.cache` decorator) through to the desugar pass.
+pub fn desugar_module_with(module: &Mod<TextRange>, options: DesugarOptions) -> DesugarOutput {
     match module {
         Mod::Module(m) => {
-            let desugared_mod = desugar_mod_module(m);
+            let desugared_mod = desugar_mod_module_with(m, &options);
 
             let has_result_usage = stmts_use_result_names(&m.body);
             let has_any_runtime_import = has_any_typhon_runtime_import(&m.body);
             let import_covers_all = typhon_runtime_import_covers_all(&m.body);
+            // Detect `typhon_runtime.tasks.spawn(...)` (lowered `go`) and
+            // `typhon_runtime.lazy.lazy_import(...)` / `typhon_runtime.lazy.lazy_val(...)`
+            // (lowered `lazy import` / `lazy val`) calls so we know to import
+            // the runtime as a module and emit the helper file.
+            let has_runtime_qualified = expr_tree_uses_runtime_attribute(&desugared_mod.body);
             // The build must write `typhon_runtime.py` whenever the emitted
             // module will reference it — either because we detected an Ok/
-            // Err/Result name, or because the user already imported the
-            // runtime explicitly (bare or `from ... import`).
-            let needs_typhon_runtime = has_result_usage || has_any_runtime_import;
+            // Err/Result name, because the user explicitly imported it, or
+            // because a `go`/`lazy` lowering produced a qualified reference.
+            let needs_typhon_runtime =
+                has_result_usage || has_any_runtime_import || has_runtime_qualified;
             // Only skip injection when an existing `from typhon_runtime
             // import …` already covers all three names. A partial import
             // (e.g. just `Ok`) would leave `Err`/`Result` undefined, so we
@@ -85,11 +109,36 @@ pub fn desugar_module(module: &Mod<TextRange>) -> DesugarOutput {
             let inject_basemodel = needs_pydantic && !has_pydantic_import(&desugared_mod.body);
             let inject_config_dict = needs_pydantic && !has_config_dict_import(&desugared_mod.body);
 
+            // `interface Name:` lowers to `class Name(Protocol):` — ensure
+            // `from typing import Protocol` is in scope.
+            let needs_protocol = stmts_use_protocol_base(&desugared_mod.body);
+            let inject_protocol = needs_protocol && !has_protocol_import(&desugared_mod.body);
+
+            // `gather:` lowers to `asyncio.TaskGroup` and best-effort to
+            // `asyncio.gather(...)` — ensure `import asyncio` is in scope.
+            let needs_asyncio = stmts_use_asyncio_qualified(&desugared_mod.body);
+            let inject_asyncio = needs_asyncio && !has_asyncio_import(&desugared_mod.body);
+
+            // `go` and `lazy` lower to `typhon_runtime.tasks.spawn(...)` /
+            // `typhon_runtime.lazy.…` — ensure a bare `import typhon_runtime`
+            // is in scope when the user hasn't already arranged one.
+            let inject_runtime_module =
+                has_runtime_qualified && !has_bare_typhon_runtime_import(&desugared_mod.body);
+
             let mut body = desugared_mod.body;
             let insert_at = import_insert_pos(&body);
 
             // Insert imports in reverse order so later `insert_at` calls don't
             // shift indices of earlier insertions.
+            if inject_runtime_module {
+                body.insert(insert_at, make_bare_typhon_runtime_import());
+            }
+            if inject_asyncio {
+                body.insert(insert_at, make_asyncio_import());
+            }
+            if inject_protocol {
+                body.insert(insert_at, make_protocol_import());
+            }
             if inject_result_import {
                 body.insert(insert_at, make_typhon_runtime_import());
             }
@@ -396,28 +445,516 @@ fn make_typhon_runtime_import() -> Stmt<TextRange> {
     })
 }
 
+/// Build `import typhon_runtime`.
+fn make_bare_typhon_runtime_import() -> Stmt<TextRange> {
+    Stmt::Import(StmtImport {
+        range: TextRange::default(),
+        names: vec![Alias {
+            range: TextRange::default(),
+            name: Identifier::new("typhon_runtime"),
+            asname: None,
+        }],
+    })
+}
+
+/// Build `import asyncio`.
+fn make_asyncio_import() -> Stmt<TextRange> {
+    Stmt::Import(StmtImport {
+        range: TextRange::default(),
+        names: vec![Alias {
+            range: TextRange::default(),
+            name: Identifier::new("asyncio"),
+            asname: None,
+        }],
+    })
+}
+
+/// Build `from typing import Protocol`.
+fn make_protocol_import() -> Stmt<TextRange> {
+    Stmt::ImportFrom(StmtImportFrom {
+        range: TextRange::default(),
+        module: Some(Identifier::new("typing")),
+        names: vec![Alias {
+            range: TextRange::default(),
+            name: Identifier::new("Protocol"),
+            asname: None,
+        }],
+        level: None,
+    })
+}
+
+/// `true` when `body` binds the bare module name `asyncio`. The `gather`
+/// lowering emits `asyncio.TaskGroup` / `asyncio.gather` against that exact
+/// name; an `import asyncio as aio` doesn't satisfy the reference.
+fn has_asyncio_import(body: &[Stmt<TextRange>]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::Import(i) => i.names.iter().any(|a| {
+            a.name.as_str() == "asyncio"
+                && matches!(
+                    a.asname.as_ref().map(|n| n.as_str()),
+                    None | Some("asyncio")
+                )
+        }),
+        _ => false,
+    })
+}
+
+/// `true` when `body` binds the bare name `Protocol` (the `interface` lowering
+/// emits `class Foo(Protocol):` against the unaliased name).
+/// `from typing import Protocol as P` doesn't satisfy this; `from typing
+/// import *` does.
+fn has_protocol_import(body: &[Stmt<TextRange>]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::ImportFrom(i) => {
+            i.module.as_deref() == Some("typing")
+                && i.names.iter().any(|a| match a.name.as_str() {
+                    "Protocol" => matches!(
+                        a.asname.as_ref().map(|n| n.as_str()),
+                        None | Some("Protocol")
+                    ),
+                    "*" => true,
+                    _ => false,
+                })
+        }
+        _ => false,
+    })
+}
+
+/// Return `true` if `body` already has a bare `import typhon_runtime`. The
+/// lowered `go` / `lazy` expressions need the module bound under that exact
+/// name; an `import typhon_runtime as tr` doesn't satisfy that.
+fn has_bare_typhon_runtime_import(body: &[Stmt<TextRange>]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::Import(i) => i.names.iter().any(|a| {
+            a.name.as_str() == "typhon_runtime"
+                && matches!(
+                    a.asname.as_ref().map(|n| n.as_str()),
+                    None | Some("typhon_runtime")
+                )
+        }),
+        _ => false,
+    })
+}
+
+/// Walk every expression in `stmts` and return `true` if any `typhon_runtime.<…>`
+/// attribute access appears (e.g. `typhon_runtime.tasks.spawn(...)`).
+fn expr_tree_uses_runtime_attribute(stmts: &[Stmt<TextRange>]) -> bool {
+    stmts.iter().any(stmt_uses_runtime_attribute)
+}
+
+fn stmt_uses_runtime_attribute(stmt: &Stmt<TextRange>) -> bool {
+    match stmt {
+        Stmt::Expr(e) => expr_uses_runtime_attribute(&e.value),
+        Stmt::Assign(a) => {
+            expr_uses_runtime_attribute(&a.value)
+                || a.targets.iter().any(expr_uses_runtime_attribute)
+        }
+        Stmt::AnnAssign(a) => {
+            a.value
+                .as_ref()
+                .is_some_and(|v| expr_uses_runtime_attribute(v))
+                || expr_uses_runtime_attribute(&a.target)
+        }
+        Stmt::AugAssign(a) => {
+            expr_uses_runtime_attribute(&a.target) || expr_uses_runtime_attribute(&a.value)
+        }
+        Stmt::Return(r) => r
+            .value
+            .as_ref()
+            .is_some_and(|v| expr_uses_runtime_attribute(v)),
+        Stmt::FunctionDef(f) => expr_tree_uses_runtime_attribute(&f.body),
+        Stmt::AsyncFunctionDef(f) => expr_tree_uses_runtime_attribute(&f.body),
+        Stmt::ClassDef(c) => expr_tree_uses_runtime_attribute(&c.body),
+        Stmt::If(i) => {
+            expr_uses_runtime_attribute(&i.test)
+                || expr_tree_uses_runtime_attribute(&i.body)
+                || expr_tree_uses_runtime_attribute(&i.orelse)
+        }
+        Stmt::While(w) => {
+            expr_uses_runtime_attribute(&w.test)
+                || expr_tree_uses_runtime_attribute(&w.body)
+                || expr_tree_uses_runtime_attribute(&w.orelse)
+        }
+        Stmt::For(f) => {
+            expr_uses_runtime_attribute(&f.iter)
+                || expr_tree_uses_runtime_attribute(&f.body)
+                || expr_tree_uses_runtime_attribute(&f.orelse)
+        }
+        Stmt::AsyncFor(f) => {
+            expr_uses_runtime_attribute(&f.iter)
+                || expr_tree_uses_runtime_attribute(&f.body)
+                || expr_tree_uses_runtime_attribute(&f.orelse)
+        }
+        Stmt::With(w) => expr_tree_uses_runtime_attribute(&w.body),
+        Stmt::AsyncWith(w) => expr_tree_uses_runtime_attribute(&w.body),
+        Stmt::Try(t) => {
+            expr_tree_uses_runtime_attribute(&t.body)
+                || expr_tree_uses_runtime_attribute(&t.orelse)
+                || expr_tree_uses_runtime_attribute(&t.finalbody)
+        }
+        Stmt::Match(m) => {
+            expr_uses_runtime_attribute(&m.subject)
+                || m.cases
+                    .iter()
+                    .any(|case| expr_tree_uses_runtime_attribute(&case.body))
+        }
+        _ => false,
+    }
+}
+
+fn expr_uses_runtime_attribute(expr: &Expr<TextRange>) -> bool {
+    match expr {
+        Expr::Attribute(a) => {
+            // Root attribute chain: `typhon_runtime.<x>.<y>...`
+            if let Expr::Name(n) = a.value.as_ref() {
+                if n.id.as_str() == "typhon_runtime" {
+                    return true;
+                }
+            }
+            expr_uses_runtime_attribute(&a.value)
+        }
+        Expr::Call(c) => {
+            expr_uses_runtime_attribute(&c.func)
+                || c.args.iter().any(expr_uses_runtime_attribute)
+                || c.keywords
+                    .iter()
+                    .any(|k| expr_uses_runtime_attribute(&k.value))
+        }
+        Expr::Await(a) => expr_uses_runtime_attribute(&a.value),
+        Expr::BinOp(b) => {
+            expr_uses_runtime_attribute(&b.left) || expr_uses_runtime_attribute(&b.right)
+        }
+        Expr::UnaryOp(u) => expr_uses_runtime_attribute(&u.operand),
+        Expr::IfExp(i) => {
+            expr_uses_runtime_attribute(&i.test)
+                || expr_uses_runtime_attribute(&i.body)
+                || expr_uses_runtime_attribute(&i.orelse)
+        }
+        Expr::Tuple(t) => t.elts.iter().any(expr_uses_runtime_attribute),
+        Expr::List(l) => l.elts.iter().any(expr_uses_runtime_attribute),
+        Expr::Lambda(l) => expr_uses_runtime_attribute(&l.body),
+        _ => false,
+    }
+}
+
+/// Return `true` if any class in `body` inherits from `Protocol` (Typhon's
+/// `interface` lowering).
+fn stmts_use_protocol_base(body: &[Stmt<TextRange>]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::ClassDef(c) => {
+            c.bases
+                .iter()
+                .any(|b| matches!(b, Expr::Name(n) if n.id.as_str() == "Protocol"))
+                || stmts_use_protocol_base(&c.body)
+        }
+        Stmt::FunctionDef(f) => stmts_use_protocol_base(&f.body),
+        Stmt::AsyncFunctionDef(f) => stmts_use_protocol_base(&f.body),
+        Stmt::If(s) => stmts_use_protocol_base(&s.body) || stmts_use_protocol_base(&s.orelse),
+        _ => false,
+    })
+}
+
+/// Return `true` if any expression in `body` references the `asyncio` module
+/// by qualified attribute access (`asyncio.TaskGroup`, `asyncio.gather`, …).
+fn stmts_use_asyncio_qualified(body: &[Stmt<TextRange>]) -> bool {
+    body.iter().any(stmt_uses_asyncio_qualified)
+}
+
+fn stmt_uses_asyncio_qualified(stmt: &Stmt<TextRange>) -> bool {
+    match stmt {
+        Stmt::Expr(e) => expr_uses_asyncio_qualified(&e.value),
+        Stmt::Assign(a) => {
+            expr_uses_asyncio_qualified(&a.value)
+                || a.targets.iter().any(expr_uses_asyncio_qualified)
+        }
+        Stmt::AnnAssign(a) => a
+            .value
+            .as_ref()
+            .is_some_and(|v| expr_uses_asyncio_qualified(v)),
+        Stmt::AugAssign(a) => {
+            expr_uses_asyncio_qualified(&a.target) || expr_uses_asyncio_qualified(&a.value)
+        }
+        Stmt::Return(r) => r
+            .value
+            .as_ref()
+            .is_some_and(|v| expr_uses_asyncio_qualified(v)),
+        Stmt::With(w) => {
+            w.items
+                .iter()
+                .any(|i| expr_uses_asyncio_qualified(&i.context_expr))
+                || stmts_use_asyncio_qualified(&w.body)
+        }
+        Stmt::AsyncWith(w) => {
+            w.items
+                .iter()
+                .any(|i| expr_uses_asyncio_qualified(&i.context_expr))
+                || stmts_use_asyncio_qualified(&w.body)
+        }
+        Stmt::FunctionDef(f) => stmts_use_asyncio_qualified(&f.body),
+        Stmt::AsyncFunctionDef(f) => stmts_use_asyncio_qualified(&f.body),
+        Stmt::ClassDef(c) => stmts_use_asyncio_qualified(&c.body),
+        Stmt::If(i) => {
+            expr_uses_asyncio_qualified(&i.test)
+                || stmts_use_asyncio_qualified(&i.body)
+                || stmts_use_asyncio_qualified(&i.orelse)
+        }
+        Stmt::While(w) => {
+            stmts_use_asyncio_qualified(&w.body) || stmts_use_asyncio_qualified(&w.orelse)
+        }
+        Stmt::For(f) => {
+            expr_uses_asyncio_qualified(&f.iter)
+                || stmts_use_asyncio_qualified(&f.body)
+                || stmts_use_asyncio_qualified(&f.orelse)
+        }
+        Stmt::AsyncFor(f) => {
+            expr_uses_asyncio_qualified(&f.iter)
+                || stmts_use_asyncio_qualified(&f.body)
+                || stmts_use_asyncio_qualified(&f.orelse)
+        }
+        Stmt::Try(t) => {
+            stmts_use_asyncio_qualified(&t.body)
+                || stmts_use_asyncio_qualified(&t.orelse)
+                || stmts_use_asyncio_qualified(&t.finalbody)
+        }
+        _ => false,
+    }
+}
+
+fn expr_uses_asyncio_qualified(expr: &Expr<TextRange>) -> bool {
+    match expr {
+        Expr::Attribute(a) => {
+            if let Expr::Name(n) = a.value.as_ref() {
+                if n.id.as_str() == "asyncio" {
+                    return true;
+                }
+            }
+            expr_uses_asyncio_qualified(&a.value)
+        }
+        Expr::Call(c) => {
+            expr_uses_asyncio_qualified(&c.func)
+                || c.args.iter().any(expr_uses_asyncio_qualified)
+                || c.keywords
+                    .iter()
+                    .any(|k| expr_uses_asyncio_qualified(&k.value))
+        }
+        Expr::Await(a) => expr_uses_asyncio_qualified(&a.value),
+        Expr::BinOp(b) => {
+            expr_uses_asyncio_qualified(&b.left) || expr_uses_asyncio_qualified(&b.right)
+        }
+        Expr::UnaryOp(u) => expr_uses_asyncio_qualified(&u.operand),
+        Expr::Tuple(t) => t.elts.iter().any(expr_uses_asyncio_qualified),
+        _ => false,
+    }
+}
+
 // ── module-level desugaring ──────────────────────────────────────────────────
 
-fn desugar_mod_module(m: &ModModule<TextRange>) -> ModModule<TextRange> {
+fn desugar_mod_module_with(
+    m: &ModModule<TextRange>,
+    options: &DesugarOptions,
+) -> ModModule<TextRange> {
     let (new_body, transformed_classes) = desugar_stmts(&m.body);
 
     // Merge `impl` pseudo-classes into their target classes and remove the stubs.
     let (merged_body, _) = merge_impl_blocks(new_body);
 
-    let final_body = if transformed_classes && !has_dataclasses_import(&m.body) {
-        let insert_at = import_insert_pos(&merged_body);
-        let mut body = merged_body;
-        body.insert(insert_at, make_dataclasses_import());
-        body
-    } else {
-        merged_body
-    };
+    // Inject `@functools.cache` on every top-level function name the purity
+    // analyser flagged as opted-into memoisation.  Returns whether any cache
+    // decorator was added so we can also inject `import functools` once.
+    let (with_caches, added_cache) =
+        inject_memoise_decorators(merged_body, &options.memoise_functions);
+
+    let needs_dataclasses = transformed_classes && !has_dataclasses_import(&m.body);
+    let needs_functools = added_cache && !has_functools_import(&with_caches);
+
+    let mut final_body = with_caches;
+    let insert_at = import_insert_pos(&final_body);
+    if needs_functools {
+        final_body.insert(insert_at, make_functools_import());
+    }
+    if needs_dataclasses {
+        final_body.insert(insert_at, make_dataclasses_import());
+    }
 
     ModModule {
         range: m.range,
         body: final_body,
         type_ignores: m.type_ignores.clone(),
     }
+}
+
+/// Strip Typhon-internal `@pure` / `@memo` decorators wherever they appear
+/// (top-level functions, async functions, class methods, nested functions)
+/// and prepend `@functools.cache` to every TOP-LEVEL function whose name
+/// appears in `memoise`. Returns the modified body and whether any cache
+/// decorator was inserted.
+///
+/// Memoise injection is intentionally restricted to top-level functions:
+/// the purity analyser only collects top-level findings (so a nested `@memo
+/// def f` doesn't accidentally trigger injection on an unrelated top-level
+/// `def f`). Stripping of `@pure` / `@memo` markers, by contrast, recurses
+/// everywhere — otherwise those Typhon-only names would leak into the
+/// emitted Python and raise `NameError` at import time.
+fn inject_memoise_decorators(
+    body: Vec<Stmt<TextRange>>,
+    memoise: &[String],
+) -> (Vec<Stmt<TextRange>>, bool) {
+    let mut added = false;
+    let new_body: Vec<Stmt<TextRange>> = body
+        .into_iter()
+        .map(|stmt| match stmt {
+            Stmt::FunctionDef(mut f) => {
+                f.decorator_list = strip_purity_decorators(f.decorator_list);
+                f.body = strip_purity_decorators_in_body(f.body);
+                if memoise.iter().any(|n| n == f.name.as_str())
+                    && !has_cache_decorator(&f.decorator_list)
+                {
+                    f.decorator_list.insert(0, make_functools_dot_cache_call());
+                    added = true;
+                }
+                Stmt::FunctionDef(f)
+            }
+            Stmt::AsyncFunctionDef(mut f) => {
+                f.decorator_list = strip_purity_decorators(f.decorator_list);
+                f.body = strip_purity_decorators_in_body(f.body);
+                if memoise.iter().any(|n| n == f.name.as_str())
+                    && !has_cache_decorator(&f.decorator_list)
+                {
+                    f.decorator_list.insert(0, make_functools_dot_cache_call());
+                    added = true;
+                }
+                Stmt::AsyncFunctionDef(f)
+            }
+            Stmt::ClassDef(mut c) => {
+                c.body = strip_purity_decorators_in_body(c.body);
+                Stmt::ClassDef(c)
+            }
+            other => other,
+        })
+        .collect();
+    (new_body, added)
+}
+
+/// Recursively strip `@pure` / `@memo` markers from every function defined
+/// inside `body` (and any nested function/class bodies). Used to clean up
+/// Typhon-only decorators that the top-level pass doesn't see directly —
+/// class methods and nested functions.
+fn strip_purity_decorators_in_body(body: Vec<Stmt<TextRange>>) -> Vec<Stmt<TextRange>> {
+    body.into_iter()
+        .map(|stmt| match stmt {
+            Stmt::FunctionDef(mut f) => {
+                f.decorator_list = strip_purity_decorators(f.decorator_list);
+                f.body = strip_purity_decorators_in_body(f.body);
+                Stmt::FunctionDef(f)
+            }
+            Stmt::AsyncFunctionDef(mut f) => {
+                f.decorator_list = strip_purity_decorators(f.decorator_list);
+                f.body = strip_purity_decorators_in_body(f.body);
+                Stmt::AsyncFunctionDef(f)
+            }
+            Stmt::ClassDef(mut c) => {
+                c.body = strip_purity_decorators_in_body(c.body);
+                Stmt::ClassDef(c)
+            }
+            other => other,
+        })
+        .collect()
+}
+
+/// Drop `@pure`, `@pure(...)`, and `@memo` decorators from a function — they
+/// are Typhon-only metadata, not actual Python runtime decorators.
+fn strip_purity_decorators(
+    decorators: Vec<rustpython_ast::Expr<TextRange>>,
+) -> Vec<rustpython_ast::Expr<TextRange>> {
+    decorators
+        .into_iter()
+        .filter(|d| !is_purity_marker(d))
+        .collect()
+}
+
+fn is_purity_marker(d: &rustpython_ast::Expr<TextRange>) -> bool {
+    match d {
+        Expr::Name(n) => matches!(n.id.as_str(), "pure" | "memo"),
+        Expr::Call(c) => is_purity_marker(&c.func),
+        _ => false,
+    }
+}
+
+fn has_cache_decorator(decorators: &[rustpython_ast::Expr<TextRange>]) -> bool {
+    decorators.iter().any(|d| {
+        let path = match d {
+            Expr::Name(n) => Some(n.id.as_str().to_owned()),
+            Expr::Attribute(a) => {
+                if let Expr::Name(n) = a.value.as_ref() {
+                    Some(format!("{}.{}", n.id.as_str(), a.attr.as_str()))
+                } else {
+                    None
+                }
+            }
+            Expr::Call(c) => match c.func.as_ref() {
+                Expr::Name(n) => Some(n.id.as_str().to_owned()),
+                Expr::Attribute(a) => {
+                    if let Expr::Name(n) = a.value.as_ref() {
+                        Some(format!("{}.{}", n.id.as_str(), a.attr.as_str()))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        matches!(
+            path.as_deref(),
+            Some("cache" | "lru_cache" | "functools.cache" | "functools.lru_cache")
+        )
+    })
+}
+
+/// `true` when `body` binds the bare module name `functools` (so the
+/// `@functools.cache` decorator the desugarer injects can resolve it).
+///
+/// Aliased imports (`import functools as ft`) and from-imports
+/// (`from functools import cache`) intentionally do NOT count: neither
+/// binds the name `functools` itself, so the injected reference would
+/// raise `NameError` at import time.
+fn has_functools_import(body: &[Stmt<TextRange>]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::Import(i) => i.names.iter().any(|a| {
+            a.name.as_str() == "functools"
+                && matches!(
+                    a.asname.as_ref().map(|n| n.as_str()),
+                    None | Some("functools")
+                )
+        }),
+        _ => false,
+    })
+}
+
+fn make_functools_import() -> Stmt<TextRange> {
+    Stmt::Import(StmtImport {
+        range: TextRange::default(),
+        names: vec![Alias {
+            range: TextRange::default(),
+            name: Identifier::new("functools"),
+            asname: None,
+        }],
+    })
+}
+
+fn make_functools_dot_cache_call() -> rustpython_ast::Expr<TextRange> {
+    use rustpython_ast::ExprAttribute;
+    let functools_name = rustpython_ast::Expr::Name(ExprName {
+        range: TextRange::default(),
+        id: Identifier::new("functools"),
+        ctx: ExprContext::Load,
+    });
+    rustpython_ast::Expr::Attribute(ExprAttribute {
+        range: TextRange::default(),
+        value: Box::new(functools_name),
+        attr: Identifier::new("cache"),
+        ctx: ExprContext::Load,
+    })
 }
 
 /// Return the index at which a new top-level import should be inserted,
@@ -478,10 +1015,22 @@ fn desugar_stmt(stmt: &Stmt<TextRange>) -> (Stmt<TextRange>, bool) {
             // that will be merged into their target class by `merge_impl_blocks`;
             // they must not receive a dataclass decorator.
             let is_impl_stub = c.name.as_str().starts_with("__typhon_impl_");
-            // Skip the dataclass decorator for Pydantic model classes; they
-            // already carry the right base class from preprocessing.
-            let needs_decorator =
-                !is_pydantic && !is_impl_stub && !has_dataclass_decorator(&c.decorator_list);
+            // `lazy import` lowers to a `__TyphonLazy_*` proxy class with its
+            // own `__slots__` and `__init__`; decorating it as a dataclass
+            // would rewrite those and break the proxy.
+            let is_lazy_proxy = c.name.as_str().starts_with("__TyphonLazy_");
+            // `interface` lowers to `class X(Protocol):` — Protocols are not
+            // dataclasses (the runtime Protocol behaviour conflicts with
+            // dataclass field collection).
+            let is_protocol = class_inherits_protocol(c);
+            // Skip the dataclass decorator for Pydantic model classes,
+            // Protocol classes, and lazy proxies; they already carry the
+            // right shape.
+            let needs_decorator = !is_pydantic
+                && !is_protocol
+                && !is_impl_stub
+                && !is_lazy_proxy
+                && !has_dataclass_decorator(&c.decorator_list);
             // Pydantic `model` classes must have `model_config = ConfigDict(extra="forbid")`
             // as their first body statement unless the user already defined it.
             let needs_model_config =
@@ -621,6 +1170,13 @@ fn class_inherits_basemodel(c: &rustpython_ast::StmtClassDef<TextRange>) -> bool
     c.bases
         .iter()
         .any(|base| matches!(base, rustpython_ast::Expr::Name(n) if n.id.as_str() == "BaseModel"))
+}
+
+/// Return `true` if `c` inherits directly from `Protocol`.
+fn class_inherits_protocol(c: &rustpython_ast::StmtClassDef<TextRange>) -> bool {
+    c.bases
+        .iter()
+        .any(|base| matches!(base, rustpython_ast::Expr::Name(n) if n.id.as_str() == "Protocol"))
 }
 
 /// Return `true` if the module already has `from pydantic import BaseModel`
