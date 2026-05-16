@@ -13,7 +13,7 @@
 use rustpython_parser::{parse, Mode};
 use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_resolve::resolve_module;
-use tyc_syntax::preprocess::{expand_question_ops, preprocess};
+use tyc_syntax::preprocess::{expand_question_ops, preprocess, validate_question_ops};
 use tyc_types::check_module;
 
 /// A source file held by the database — identified by path, with mutable
@@ -97,6 +97,12 @@ pub fn check_file(db: &mut TycDatabase, path: String, text: String) -> Diagnosti
     // for callers that only need the Python-compatible source string.
     let _ = SourceFile::new(db, path.clone(), text.clone());
     let mut diags = Diagnostics::new();
+
+    // Validate `?` operator context before expanding it.  This runs on the
+    // original Typhon source so it can reason about indentation-based scopes.
+    for err in validate_question_ops(&text) {
+        diags.push_error(TycError::invalid_question_op(err.message));
+    }
 
     // Expand `?` operator before preprocessing so the Python parser sees
     // valid Python.  `tyc fmt` skips this expansion to preserve Typhon syntax.
@@ -201,5 +207,142 @@ def main() -> None:
             "val x: int = 1\nx = 2\n".to_owned(),
         );
         assert!(diags.has_errors());
+    }
+
+    // ── ? operator context enforcement ──────────────────────────────────────
+
+    #[test]
+    fn check_file_question_op_valid_in_result_fn() {
+        let src = "\
+def parse(s: str) -> Result[int, str]:
+    val n = int(s)?
+    return Ok(n)
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file(&mut db, "<test>".into(), src.to_owned());
+        assert!(
+            !diags.errors().iter().any(|e| format!("{e}").contains("module level")
+                || format!("{e}").contains("returning `")),
+            "valid ? usage should not produce context errors: {:?}", diags.errors()
+        );
+    }
+
+    #[test]
+    fn check_file_question_op_at_module_level_is_error() {
+        let src = "val x = load()?\n";
+        let mut db = TycDatabase::new();
+        let diags = check_file(&mut db, "<test>".into(), src.to_owned());
+        assert!(diags.has_errors());
+        let has_qop_error = diags
+            .errors()
+            .iter()
+            .any(|e| format!("{e}").contains("module level"));
+        assert!(has_qop_error, "expected module-level ? error, got: {:?}", diags.errors());
+    }
+
+    #[test]
+    fn check_file_question_op_in_none_fn_is_error() {
+        let src = "def run() -> None:\n    val x = fetch()?\n";
+        let mut db = TycDatabase::new();
+        let diags = check_file(&mut db, "<test>".into(), src.to_owned());
+        assert!(diags.has_errors());
+        let has_qop_error = diags
+            .errors()
+            .iter()
+            .any(|e| format!("{e}").contains("None"));
+        assert!(has_qop_error, "expected return-type ? error, got: {:?}", diags.errors());
+    }
+
+    // ── unused import warnings ───────────────────────────────────────────────
+
+    #[test]
+    fn check_file_unused_import_produces_warning() {
+        let src = "import os\nval x: int = 1\n";
+        let mut db = TycDatabase::new();
+        let diags = check_file(&mut db, "<test>".into(), src.to_owned());
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(
+            diags.warning_count() > 0,
+            "expected unused-import warning for `os`"
+        );
+    }
+
+    #[test]
+    fn check_file_used_import_no_warning() {
+        let src = "import os\nval sep: str = os.sep\n";
+        let mut db = TycDatabase::new();
+        let diags = check_file(&mut db, "<test>".into(), src.to_owned());
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert_eq!(diags.warning_count(), 0, "used import must not warn");
+    }
+
+    // ── integration: class and model programs ────────────────────────────────
+
+    #[test]
+    fn check_file_plain_class_type_checks() {
+        let src = "\
+class Point:
+    x: int
+    y: int
+
+val p: Point = Point()
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file(&mut db, "<test>".into(), src.to_owned());
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn check_file_model_class_type_checks() {
+        let src = "\
+model User:
+    id: int
+    name: str
+
+val u: User = User()
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file(&mut db, "<test>".into(), src.to_owned());
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn check_file_result_ok_err_in_scope() {
+        let src = "\
+def divide(a: int, b: int) -> Result[int, str]:
+    if b == 0:
+        return Err(\"division by zero\")
+    return Ok(a // b)
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file(&mut db, "<test>".into(), src.to_owned());
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn check_file_comptime_binding_recognised() {
+        let src = "\
+comptime val PORT: int = 8080
+
+def main() -> None:
+    print(PORT)
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file(&mut db, "<test>".into(), src.to_owned());
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn check_file_nullable_annotation_accepted() {
+        // Verify that `T?` nullable sugar in a parameter annotation doesn't
+        // cause spurious parse or resolve errors — the preprocessor rewrites
+        // `str?` to `str | None` before the Python parser sees it.
+        let src = "\
+def f(x: str?) -> None:
+    print(x)
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file(&mut db, "<test>".into(), src.to_owned());
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
     }
 }

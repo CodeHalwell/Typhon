@@ -468,6 +468,159 @@ pub fn postprocess(
     result
 }
 
+// ── `?` operator validation ───────────────────────────────────────────────────
+
+/// An error produced when the `?` operator is used in an invalid context.
+#[derive(Debug, Clone)]
+pub struct QuestionOpError {
+    /// 0-based line index in the original Typhon source.
+    pub line_index: usize,
+    /// Human-readable error message.
+    pub message: String,
+}
+
+/// Validate that every `?` error-propagation operator (`expr)?`) in `source`
+/// appears inside a function whose return-type annotation contains `"Result"`.
+///
+/// Returns a list of errors for each `)?` found at module level or inside a
+/// function whose single-line return-type annotation does not mention `Result`.
+/// Functions with multi-line signatures (where `->` does not appear on the
+/// `def` line itself) are skipped to avoid false positives.
+///
+/// Call this on the **original Typhon source** before [`expand_question_ops`].
+pub fn validate_question_ops(source: &str) -> Vec<QuestionOpError> {
+    let mut errors = Vec::new();
+    // Stack of (def_indent_len, return_type_text):
+    //   def_indent_len   — indentation column of the `def` keyword itself.
+    //   return_type_text — Some(text) when `->` was found on the def line;
+    //                      None for multi-line signatures (skip to avoid FP).
+    let mut fn_stack: Vec<(usize, Option<String>)> = Vec::new();
+    let mut in_string: Option<StringMode> = None;
+
+    for (line_index, line) in source.split_inclusive('\n').enumerate() {
+        let raw = line.trim_end_matches(|c: char| c == '\n' || c == '\r');
+
+        let pre_string = in_string;
+        let code_end = scan_line_code_end(raw, &mut in_string);
+
+        // Lines inside a triple-quoted string are pure string content — skip.
+        if pre_string.is_some() {
+            continue;
+        }
+
+        let code = raw[..code_end].trim_end();
+
+        // Blank and comment-only lines don't affect scope tracking.
+        if code.trim().is_empty() {
+            continue;
+        }
+
+        let indent_len = code.find(|c: char| !c.is_whitespace()).unwrap_or(0);
+        let trimmed = &code[indent_len..];
+
+        // A line that begins with `)` is the continuation/close of a multi-line
+        // expression — most commonly the closing of a multi-line function
+        // parameter list (e.g. `) -> Result[int, str]:`).  Suppress scope-pop
+        // and `?` detection for this line to avoid misidentifying the closing
+        // paren as "leaving the function body".  If `->` is present, update
+        // the most-recent function's return-type so we can validate `?` inside.
+        if trimmed.starts_with(')') {
+            if trimmed.contains("->") {
+                if let Some(entry) = fn_stack.last_mut() {
+                    if entry.1.is_none() {
+                        entry.1 = extract_return_type_text(code);
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Pop functions we've exited: a non-blank line at indent ≤ fn_indent
+        // means we have left that function's body.
+        while let Some(&(fn_indent, _)) = fn_stack.last() {
+            if indent_len <= fn_indent {
+                fn_stack.pop();
+            } else {
+                break;
+            }
+        }
+
+        // Detect a function definition and push its return type onto the stack.
+        if trimmed.starts_with("def ") || trimmed.starts_with("async def ") {
+            let ret_type = extract_return_type_text(code);
+            fn_stack.push((indent_len, ret_type));
+        }
+
+        // Detect `)?` — the `?` error-propagation operator.  The same pattern
+        // `expand_question_ops` uses: last code char is `?`, char before is `)`.
+        if code.ends_with('?') {
+            let before_q = &code[..code.len() - 1];
+            if before_q.ends_with(')') {
+                match fn_stack.last() {
+                    None => {
+                        errors.push(QuestionOpError {
+                            line_index,
+                            message: "`?` operator used at module level; \
+                                     it is only valid inside a function returning `Result[T, E]`"
+                                .to_owned(),
+                        });
+                    }
+                    Some((_, Some(ret))) if !ret.contains("Result") => {
+                        errors.push(QuestionOpError {
+                            line_index,
+                            message: format!(
+                                "`?` operator used in a function returning `{ret}`; \
+                                 it is only valid in functions returning `Result[T, E]`"
+                            ),
+                        });
+                    }
+                    // Return type contains "Result" (valid) or is unknown (skip FP).
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+
+    errors
+}
+
+/// Extract the return-type annotation text from a single `def` line.
+///
+/// Returns `Some(text)` when `->` appears outside parentheses/brackets on
+/// this line and the header-closing `:` is also on the same line; `None`
+/// otherwise (multi-line signatures, missing annotation, etc.).
+fn extract_return_type_text(def_line: &str) -> Option<String> {
+    let bytes = def_line.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = (depth - 1).max(0),
+            b'-' if depth == 0 && bytes[i + 1] == b'>' => {
+                let after_arrow = def_line[i + 2..].trim_start();
+                let mut depth2 = 0i32;
+                let mut colon_pos = None;
+                for (j, c) in after_arrow.char_indices() {
+                    match c {
+                        '(' | '[' => depth2 += 1,
+                        ')' | ']' => depth2 -= 1,
+                        ':' if depth2 == 0 => {
+                            colon_pos = Some(j);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                return colon_pos.map(|pos| after_arrow[..pos].trim().to_owned());
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 // ── `?` operator expansion ────────────────────────────────────────────────────
 
 /// Expand the `?` error-propagation operator into equivalent Python guard code.
@@ -959,5 +1112,88 @@ mod tests {
             "indented comptime should not be recorded: {:?}",
             result.comptime_bindings
         );
+    }
+
+    // ── validate_question_ops ────────────────────────────────────────────────
+
+    #[test]
+    fn question_op_valid_in_result_function() {
+        let src = "def parse(s: str) -> Result[int, str]:\n    val n = int(s)?\n    return Ok(n)\n";
+        let errs = validate_question_ops(src);
+        assert!(errs.is_empty(), "expected no errors, got: {:?}", errs.iter().map(|e| &e.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn question_op_at_module_level_is_error() {
+        let src = "val x = parse()?\n";
+        let errs = validate_question_ops(src);
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].message.contains("module level"), "got: {}", errs[0].message);
+        assert_eq!(errs[0].line_index, 0);
+    }
+
+    #[test]
+    fn question_op_in_none_returning_function_is_error() {
+        let src = "def process() -> None:\n    val x = load()?\n";
+        let errs = validate_question_ops(src);
+        assert_eq!(errs.len(), 1, "expected one error, got: {:?}", errs.iter().map(|e| &e.message).collect::<Vec<_>>());
+        assert!(errs[0].message.contains("None"), "got: {}", errs[0].message);
+    }
+
+    #[test]
+    fn question_op_in_int_returning_function_is_error() {
+        let src = "def compute() -> int:\n    val x = fetch()?\n    return x\n";
+        let errs = validate_question_ops(src);
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].message.contains("`int`"), "got: {}", errs[0].message);
+    }
+
+    #[test]
+    fn question_op_in_nested_result_function_is_valid() {
+        let src = "def outer() -> None:\n    def inner() -> Result[int, str]:\n        val x = load()?\n        return Ok(x)\n";
+        let errs = validate_question_ops(src);
+        assert!(errs.is_empty(), "expected no errors, got: {:?}", errs.iter().map(|e| &e.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn question_op_in_multiline_sig_skips_validation() {
+        // Multi-line signature: `->` appears on the `) -> RetType:` closing
+        // line rather than the `def` line.  The validator picks up the return
+        // type from the signature-closer and correctly accepts the `?` use.
+        let src = "def process(\n    x: int,\n) -> Result[int, str]:\n    val y = load()?\n";
+        let errs = validate_question_ops(src);
+        assert!(errs.is_empty(), "multi-line sig with Result return must not error: {:?}",
+            errs.iter().map(|e| &e.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn question_op_nullable_sugar_not_flagged() {
+        // `str?` ends with `?` but the char before is `r`, not `)`, so it is
+        // type-sugar, not the propagation operator.
+        let src = "val x: str? = None\n";
+        let errs = validate_question_ops(src);
+        assert!(errs.is_empty(), "nullable sugar must not be flagged");
+    }
+
+    #[test]
+    fn extract_return_type_finds_result() {
+        assert_eq!(
+            extract_return_type_text("def f() -> Result[int, str]:"),
+            Some("Result[int, str]".to_owned())
+        );
+    }
+
+    #[test]
+    fn extract_return_type_finds_none() {
+        assert_eq!(
+            extract_return_type_text("def f() -> None:"),
+            Some("None".to_owned())
+        );
+    }
+
+    #[test]
+    fn extract_return_type_multiline_sig() {
+        // `->` not present on this line — returns None.
+        assert_eq!(extract_return_type_text("def f("), None);
     }
 }
