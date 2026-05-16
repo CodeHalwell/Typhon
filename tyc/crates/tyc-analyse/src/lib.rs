@@ -268,9 +268,11 @@ fn eval_binop(
 ) -> Result<ComptimeValue, String> {
     use rustpython_ast::Operator::*;
     match (op, &lhs, &rhs) {
-        (Add, ComptimeValue::Int(a), ComptimeValue::Int(b)) => {
-            Ok(ComptimeValue::Int(a.wrapping_add(*b)))
-        }
+        // ── Add ──────────────────────────────────────────────────────────────
+        (Add, ComptimeValue::Int(a), ComptimeValue::Int(b)) => a
+            .checked_add(*b)
+            .map(ComptimeValue::Int)
+            .ok_or_else(|| "integer overflow in comptime addition".to_string()),
         (Add, ComptimeValue::Float(a), ComptimeValue::Float(b)) => {
             Ok(ComptimeValue::Float(a + b))
         }
@@ -283,11 +285,62 @@ fn eval_binop(
         (Add, ComptimeValue::Str(a), ComptimeValue::Str(b)) => {
             Ok(ComptimeValue::Str(format!("{}{}", a, b)))
         }
-        (Sub, ComptimeValue::Int(a), ComptimeValue::Int(b)) => {
-            Ok(ComptimeValue::Int(a.wrapping_sub(*b)))
+        // ── Sub ──────────────────────────────────────────────────────────────
+        (Sub, ComptimeValue::Int(a), ComptimeValue::Int(b)) => a
+            .checked_sub(*b)
+            .map(ComptimeValue::Int)
+            .ok_or_else(|| "integer overflow in comptime subtraction".to_string()),
+        (Sub, ComptimeValue::Float(a), ComptimeValue::Float(b)) => {
+            Ok(ComptimeValue::Float(a - b))
         }
-        (Mult, ComptimeValue::Int(a), ComptimeValue::Int(b)) => {
-            Ok(ComptimeValue::Int(a.wrapping_mul(*b)))
+        (Sub, ComptimeValue::Int(a), ComptimeValue::Float(b)) => {
+            Ok(ComptimeValue::Float(*a as f64 - b))
+        }
+        (Sub, ComptimeValue::Float(a), ComptimeValue::Int(b)) => {
+            Ok(ComptimeValue::Float(a - *b as f64))
+        }
+        // ── Mult ─────────────────────────────────────────────────────────────
+        (Mult, ComptimeValue::Int(a), ComptimeValue::Int(b)) => a
+            .checked_mul(*b)
+            .map(ComptimeValue::Int)
+            .ok_or_else(|| "integer overflow in comptime multiplication".to_string()),
+        (Mult, ComptimeValue::Float(a), ComptimeValue::Float(b)) => {
+            Ok(ComptimeValue::Float(a * b))
+        }
+        (Mult, ComptimeValue::Int(a), ComptimeValue::Float(b)) => {
+            Ok(ComptimeValue::Float(*a as f64 * b))
+        }
+        (Mult, ComptimeValue::Float(a), ComptimeValue::Int(b)) => {
+            Ok(ComptimeValue::Float(a * *b as f64))
+        }
+        // ── Div (always produces float, matching Python `/` semantics) ────────
+        (Div, ComptimeValue::Int(a), ComptimeValue::Int(b)) => {
+            if *b == 0 {
+                Err("division by zero in comptime division".to_string())
+            } else {
+                Ok(ComptimeValue::Float(*a as f64 / *b as f64))
+            }
+        }
+        (Div, ComptimeValue::Float(a), ComptimeValue::Float(b)) => {
+            if *b == 0.0 {
+                Err("division by zero in comptime division".to_string())
+            } else {
+                Ok(ComptimeValue::Float(a / b))
+            }
+        }
+        (Div, ComptimeValue::Int(a), ComptimeValue::Float(b)) => {
+            if *b == 0.0 {
+                Err("division by zero in comptime division".to_string())
+            } else {
+                Ok(ComptimeValue::Float(*a as f64 / b))
+            }
+        }
+        (Div, ComptimeValue::Float(a), ComptimeValue::Int(b)) => {
+            if *b == 0 {
+                Err("division by zero in comptime division".to_string())
+            } else {
+                Ok(ComptimeValue::Float(a / *b as f64))
+            }
         }
         _ => Err(format!(
             "operator is not supported between these comptime value types: {:?} {:?} {:?}",

@@ -49,9 +49,12 @@ pub enum Type {
     /// A user-defined class.
     Class(String),
     /// A function with parameter types and a return type.
+    /// When `variadic` is true, the function accepts any number of arguments
+    /// beyond its declared `params` (used for built-ins like `env`).
     Function {
         params: Vec<Type>,
         ret: Box<Type>,
+        variadic: bool,
     },
     /// `Container[Args...]` — e.g. `list[int]`, `dict[str, int]`.
     Generic(String, Vec<Type>),
@@ -129,7 +132,7 @@ impl Type {
             Type::Bytes => "bytes".into(),
             Type::None => "None".into(),
             Type::Class(n) => n.clone(),
-            Type::Function { params, ret } => {
+            Type::Function { params, ret, .. } => {
                 let p: Vec<String> = params.iter().map(|t| t.display()).collect();
                 format!("({}) -> {}", p.join(", "), ret.display())
             }
@@ -480,10 +483,12 @@ pub fn check_module(
 /// Declare Typhon-specific built-in names that are not present in the
 /// user's source but are introduced by preprocessing or the runtime.
 fn seed_typhon_builtins(c: &mut Checker) {
-    // `env` — comptime function that reads an environment variable.
+    // `env` — comptime function: env("NAME") or env("NAME", "default").
+    // Declared variadic so the type checker accepts both 1- and 2-arg forms.
     let env_fn = Type::Function {
-        params: vec![Type::Str, Type::Str],
+        params: vec![Type::Str],
         ret: Box::new(Type::Str),
+        variadic: true,
     };
     c.env.declare(TypeBinding {
         name: "env".into(),
@@ -587,6 +592,7 @@ fn function_signature(
     Type::Function {
         params,
         ret: Box::new(ret),
+        variadic: false,
     }
 }
 
@@ -1061,9 +1067,15 @@ fn infer_expr(c: &mut Checker, expr: &Expr<TextRange>) -> Type {
             }
 
             match func_type {
-                Type::Function { params, ret } => {
+                Type::Function { params, ret, variadic } => {
                     // Argument count check (positional only — conservative).
-                    if call.args.len() != params.len() {
+                    // Variadic functions accept any number of args >= params.len().
+                    let count_ok = if variadic {
+                        call.args.len() >= params.len()
+                    } else {
+                        call.args.len() == params.len()
+                    };
+                    if !count_ok {
                         let name = match call.func.as_ref() {
                             Expr::Name(n) => n.id.as_str().to_owned(),
                             _ => "<call>".to_owned(),

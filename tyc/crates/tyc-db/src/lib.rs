@@ -36,7 +36,10 @@ pub struct SourceFile {
 #[salsa::tracked]
 pub fn preprocessed_text<'db>(db: &'db dyn salsa::Database, file: SourceFile) -> String {
     let text = file.text(db);
-    preprocess(text).python_source
+    // Expand `?` operators before the Python parser sees the source, matching
+    // the order used in check_file and the build pipeline.
+    let expanded = expand_question_ops(text);
+    preprocess(&expanded).python_source
 }
 
 /// Tracked query: the names declared at the top level of the module.

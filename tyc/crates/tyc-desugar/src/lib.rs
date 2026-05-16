@@ -552,11 +552,25 @@ fn make_dataclasses_import() -> Stmt<TextRange> {
 /// as a base class — i.e. the module was produced from `model` keywords.
 fn stmts_use_basemodel(stmts: &[Stmt<TextRange>]) -> bool {
     stmts.iter().any(|stmt| match stmt {
-        Stmt::ClassDef(c) => {
-            class_inherits_basemodel(c) || stmts_use_basemodel(&c.body)
-        }
+        Stmt::ClassDef(c) => class_inherits_basemodel(c) || stmts_use_basemodel(&c.body),
         Stmt::FunctionDef(f) => stmts_use_basemodel(&f.body),
         Stmt::AsyncFunctionDef(f) => stmts_use_basemodel(&f.body),
+        Stmt::If(s) => stmts_use_basemodel(&s.body) || stmts_use_basemodel(&s.orelse),
+        Stmt::For(s) => stmts_use_basemodel(&s.body) || stmts_use_basemodel(&s.orelse),
+        Stmt::AsyncFor(s) => stmts_use_basemodel(&s.body) || stmts_use_basemodel(&s.orelse),
+        Stmt::While(s) => stmts_use_basemodel(&s.body) || stmts_use_basemodel(&s.orelse),
+        Stmt::With(s) => stmts_use_basemodel(&s.body),
+        Stmt::AsyncWith(s) => stmts_use_basemodel(&s.body),
+        Stmt::Try(s) => {
+            stmts_use_basemodel(&s.body)
+                || s.handlers.iter().any(|h| match h {
+                    rustpython_ast::ExceptHandler::ExceptHandler(eh) => {
+                        stmts_use_basemodel(&eh.body)
+                    }
+                })
+                || stmts_use_basemodel(&s.orelse)
+                || stmts_use_basemodel(&s.finalbody)
+        }
         _ => false,
     })
 }
@@ -568,12 +582,21 @@ fn class_inherits_basemodel(c: &rustpython_ast::StmtClassDef<TextRange>) -> bool
     })
 }
 
-/// Return `true` if the module already has `from pydantic import BaseModel`.
+/// Return `true` if the module already has `from pydantic import BaseModel`
+/// where the name is bound as `BaseModel` (not aliased to something else).
 fn has_pydantic_import(body: &[Stmt<TextRange>]) -> bool {
     body.iter().any(|stmt| match stmt {
         Stmt::ImportFrom(imp) => {
             imp.module.as_deref() == Some("pydantic")
-                && imp.names.iter().any(|a| a.name.as_str() == "BaseModel")
+                && imp.names.iter().any(|a| {
+                    a.name.as_str() == "BaseModel"
+                        // Only suppress injection when the bound name is
+                        // actually `BaseModel`, not an alias like `BM`.
+                        && matches!(
+                            a.asname.as_ref().map(|n| n.as_str()),
+                            None | Some("BaseModel")
+                        )
+                })
         }
         _ => false,
     })

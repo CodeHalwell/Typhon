@@ -99,7 +99,8 @@ pub fn preprocess(source: &str) -> PreprocessResult {
             // ── `model ClassName:` → `class ClassName(BaseModel):` ──────────
             if rest.starts_with("model ")
                 && rest.len() > "model ".len()
-                && rest.as_bytes()["model ".len()].is_ascii_alphanumeric()
+                && (rest.as_bytes()["model ".len()].is_ascii_alphanumeric()
+                    || rest.as_bytes()["model ".len()] == b'_')
             {
                 let after_model = &rest["model ".len()..]; // e.g. "User:\n"
                 // Find the `:` that opens the class body (last `:` not inside
@@ -124,8 +125,11 @@ pub fn preprocess(source: &str) -> PreprocessResult {
             }
 
             // ── `comptime val/var name…` → strip both prefixes ──────────────
+            // `comptime` is a module-level concept; bindings inside functions
+            // or classes cannot be evaluated at build time. Only record
+            // top-level (indent_len == 0) comptime declarations.
             let mut stripped_line: Option<String> = None;
-            if rest.starts_with("comptime ") {
+            if indent_len == 0 && rest.starts_with("comptime ") {
                 let after_comptime = &rest["comptime ".len()..];
                 // Extract the inner keyword (val/var) if present.
                 let (inner_kw, payload) =
@@ -234,7 +238,14 @@ fn make_model_class_line(after_model: &str) -> Option<String> {
     let colon_pos = colon_pos?;
     let name = after_model[..colon_pos].trim_end();
     let tail = &after_model[colon_pos..]; // ":\n" or ":"
-    Some(format!("{}(BaseModel){}", name, tail))
+    // If `name` already ends with `)` it has existing bases — merge BaseModel
+    // into the list.  Otherwise wrap with `(BaseModel)`.
+    let new_name = if name.ends_with(')') {
+        format!("{}, BaseModel)", &name[..name.len() - 1])
+    } else {
+        format!("{}(BaseModel)", name)
+    };
+    Some(format!("{}{}", new_name, tail))
 }
 
 /// Active string-literal mode while scanning. `Single` and `Double` cannot
@@ -461,8 +472,8 @@ pub fn postprocess(
 
 /// Expand the `?` error-propagation operator into equivalent Python guard code.
 ///
-/// A line ending with `)?` (the `?` following a closing parenthesis) is
-/// treated as the propagation operator. It is expanded in-place into the
+/// A line ending with `)?` in the code portion (before any comment) is treated
+/// as the propagation operator. It is expanded in-place into the
 /// three-statement guard form:
 ///
 /// ```text
@@ -479,11 +490,15 @@ pub fn postprocess(
 /// If there is no assignment target (bare `f()?`), the final assignment is
 /// omitted and only the call + guard are emitted.
 ///
+/// Lines inside triple-quoted strings and comment text are not expanded.
+/// Trailing comments (`f()? # note`) are stripped before the check so the
+/// comment does not interfere with operator detection.
+///
 /// This function is called **before** [`preprocess`] in the build and check
 /// pipelines. It is deliberately *not* called by `tyc fmt` so that the
 /// source formatter preserves the `?` syntax unchanged.
 ///
-/// # Limitations (first implementation)
+/// # Limitations
 ///
 /// - Only handles `?` that directly follows `)`.  A `?` after `]` or an
 ///   identifier is treated as nullable-type sugar (`T?`) by the regular
@@ -493,14 +508,30 @@ pub fn postprocess(
 pub fn expand_question_ops(source: &str) -> String {
     let mut result = String::with_capacity(source.len() + 64);
     let mut counter = 0usize;
+    let mut in_string: Option<StringMode> = None;
 
     for line in source.split_inclusive('\n') {
-        // Trim trailing newline/CR for analysis, but remember the original
-        // line ending so we can append it to generated lines.
-        let trimmed = line.trim_end_matches(|c: char| c == '\n' || c == '\r');
+        let raw = line.trim_end_matches(|c: char| c == '\n' || c == '\r');
 
-        // A `?` operator must be the very last non-whitespace character.
-        let content = trimmed.trim_end();
+        // Record string state at the start of this line.
+        let pre_string = in_string;
+
+        // Scan the line to update string state and find the code end position
+        // (where a comment begins, or line.len() if no comment).
+        let code_end = scan_line_code_end(raw, &mut in_string);
+
+        // Lines that start inside a triple-quoted string are pure string
+        // content — emit verbatim.  (Single-line strings can't span lines.)
+        if pre_string.is_some() {
+            result.push_str(line);
+            continue;
+        }
+
+        // The effective code (before any comment), trimmed of trailing whitespace.
+        let content = raw[..code_end].trim_end();
+
+        // A `?` operator must be the very last non-whitespace character in the
+        // code portion.
         if !content.ends_with('?') || content.is_empty() {
             result.push_str(line);
             continue;
@@ -510,19 +541,16 @@ pub fn expand_question_ops(source: &str) -> String {
         // operator.  `T?` (nullable sugar) follows an alphanumeric/`_`/`]` char
         // and is left alone.
         let before_q = &content[..content.len() - 1];
-        let last_char = before_q.chars().last();
-        if !matches!(last_char, Some(')')) {
+        if !matches!(before_q.chars().last(), Some(')')) {
             result.push_str(line);
             continue;
         }
 
         // Compute indentation to reproduce the correct nesting.
-        let indent_len = line
-            .find(|c: char| !c.is_whitespace())
-            .unwrap_or(0);
-        let indent = &line[..indent_len];
+        let indent_len = content.find(|c: char| !c.is_whitespace()).unwrap_or(0);
+        let indent = &content[..indent_len];
 
-        // `expr_part` is the line content without the trailing `?`.
+        // `expr_part` is the code content without the trailing `?`.
         let expr_part = &content[indent_len..content.len() - 1]; // e.g. "val x = f()"
 
         // Split into optional assignment LHS and the RHS expression.
@@ -570,6 +598,82 @@ pub fn expand_question_ops(source: &str) -> String {
     }
 
     result
+}
+
+/// Scan `line` while updating `in_string` for string-literal state.
+/// Returns the byte index where the "code" portion ends — the start of a
+/// line comment (`#`) or `line.len()` if there is no comment.
+///
+/// Single- and double-quoted strings that do not close by the end of the
+/// physical line are reset to `None` (Python syntax error territory anyway).
+fn scan_line_code_end(line: &str, in_string: &mut Option<StringMode>) -> usize {
+    let mut chars = line.char_indices().peekable();
+
+    while let Some((i, c)) = chars.next() {
+        if let Some(mode) = *in_string {
+            match mode {
+                // Single-line strings: handle backslash escapes and closing quote.
+                StringMode::Single | StringMode::Double => {
+                    if c == '\\' {
+                        chars.next(); // skip escaped character
+                        continue;
+                    }
+                    match mode {
+                        StringMode::Single if c == '\'' => *in_string = None,
+                        StringMode::Double if c == '"' => *in_string = None,
+                        _ => {}
+                    }
+                }
+                // Triple-quoted strings: look for the three-char closing sequence.
+                StringMode::TripleSingle | StringMode::TripleDouble => {
+                    let (q, triple) = if matches!(mode, StringMode::TripleSingle) {
+                        ('\'', "'''")
+                    } else {
+                        ('"', "\"\"\"")
+                    };
+                    if c == q && line[i..].starts_with(triple) {
+                        chars.next();
+                        chars.next();
+                        *in_string = None;
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Outside any string.
+        if c == '#' {
+            return i; // rest of line is a comment
+        }
+
+        if c == '"' || c == '\'' {
+            let triple = (c == '"' && line[i..].starts_with("\"\"\""))
+                || (c == '\'' && line[i..].starts_with("'''"));
+            if triple {
+                chars.next();
+                chars.next();
+                *in_string = Some(if c == '"' {
+                    StringMode::TripleDouble
+                } else {
+                    StringMode::TripleSingle
+                });
+            } else {
+                *in_string = Some(if c == '"' {
+                    StringMode::Double
+                } else {
+                    StringMode::Single
+                });
+            }
+        }
+    }
+
+    // A single/double-quoted string that didn't close before end-of-line is
+    // a Python syntax error — reset so subsequent lines parse correctly.
+    if matches!(*in_string, Some(StringMode::Single | StringMode::Double)) {
+        *in_string = None;
+    }
+
+    line.len()
 }
 
 /// Find the position of the `=` assignment operator in `s`, ignoring `=`
@@ -796,5 +900,64 @@ mod tests {
         let src = "val result: int = compute()?\n";
         let out = expand_question_ops(src);
         assert!(out.contains("val result: int = __typhon_q_0__.value"), "out: {out}");
+    }
+
+    #[test]
+    fn question_op_ignores_comment_line() {
+        // A comment that mentions `)?` must not trigger expansion.
+        let src = "# should we call f()?\nx: int = 1\n";
+        let out = expand_question_ops(src);
+        assert_eq!(out, src, "comment line must be copied verbatim");
+    }
+
+    #[test]
+    fn question_op_ignores_trailing_comment() {
+        // Trailing comment after `)` must not be seen as `)?`.
+        let src = "x = f() # returns f()?\n";
+        let out = expand_question_ops(src);
+        assert_eq!(out, src, "trailing comment with ')?' must not trigger expansion");
+    }
+
+    #[test]
+    fn question_op_ignores_triple_string_content() {
+        // `)?` inside a triple-quoted string must not be expanded.
+        let src = "msg = \"\"\"\ncall f()?\n\"\"\"\n";
+        let out = expand_question_ops(src);
+        assert_eq!(out, src, "triple-string content must not be expanded");
+    }
+
+    #[test]
+    fn model_keyword_with_existing_base_merges_basemodel() {
+        // `model User(Timestamped):` → `class User(Timestamped, BaseModel):`
+        let result = preprocess("model User(Timestamped):\n    id: int\n");
+        assert!(
+            result.python_source.contains("class User(Timestamped, BaseModel):"),
+            "got: {}",
+            result.python_source
+        );
+    }
+
+    #[test]
+    fn model_keyword_underscore_name() {
+        // `model _Internal:` should be rewritten (underscore-starting names are valid).
+        let result = preprocess("model _Internal:\n    x: int\n");
+        assert!(
+            result.python_source.contains("class _Internal(BaseModel):"),
+            "got: {}",
+            result.python_source
+        );
+    }
+
+    #[test]
+    fn comptime_inside_function_not_recorded() {
+        // `comptime val` inside a function should NOT be recorded as a comptime
+        // binding (it would fail evaluation anyway since it's not top-level).
+        let src = "def f():\n    comptime val X: int = 1\n";
+        let result = preprocess(src);
+        assert!(
+            result.comptime_bindings.is_empty(),
+            "indented comptime should not be recorded: {:?}",
+            result.comptime_bindings
+        );
     }
 }
