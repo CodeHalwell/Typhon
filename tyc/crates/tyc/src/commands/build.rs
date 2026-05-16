@@ -263,7 +263,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // declarations.  Run the preprocessor so `val`/`var`/`model` stripping
         // works, then desugar to plain Python so the printer can emit it.
         let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
-            &expand_gather_blocks(&source),
+            &expand_gather_blocks(&expand_lazy_imports(&source)),
         ))));
         let prep = preprocess(&expanded);
         let module = parse(
@@ -690,6 +690,61 @@ val result: int = 3 |> double |> inc
         assert!(
             py.contains("inc(double("),
             "pipe must desugar to inc(double(...)); got:\n{py}"
+        );
+    }
+
+    #[test]
+    fn build_lazy_val_module_level_lowers_to_lazy_val_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = "lazy val CONFIG: int = 42\nval first: int = CONFIG\n";
+        let (_, out_dir) = scaffold(tmp.path(), src);
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        })
+        .unwrap();
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        assert!(
+            !py.contains("lazy val"),
+            "lazy val must be expanded; got:\n{py}"
+        );
+        // The emitter normalises lambdas to `lambda :`; either spacing is
+        // acceptable.
+        assert!(
+            py.contains("__typhon_lazy_val(lambda: 42)")
+                || py.contains("__typhon_lazy_val(lambda : 42)"),
+            "module-level lazy val should lower to lazy_val(lambda: …); got:\n{py}"
+        );
+        assert!(
+            py.contains("from typhon_runtime.lazy import lazy_val"),
+            "module-level lazy val should inject the runtime import; got:\n{py}"
+        );
+    }
+
+    #[test]
+    fn build_lazy_val_inside_class_lowers_to_cached_property() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = "\
+class Foo:
+    name: str
+    lazy val greeting: str = \"hi\"
+";
+        let (_, out_dir) = scaffold(tmp.path(), src);
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        })
+        .unwrap();
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        assert!(
+            py.contains("cached_property"),
+            "class-body lazy val should emit cached_property; got:\n{py}"
+        );
+        assert!(
+            py.contains("def greeting(self) -> str:"),
+            "class-body lazy val should produce a method signature; got:\n{py}"
         );
     }
 

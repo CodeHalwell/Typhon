@@ -323,6 +323,32 @@ pub fn preprocess(source: &str) -> PreprocessResult {
                 }
             }
 
+            // ── `lazy val name…` / `lazy var name…` → strip both keywords ─
+            //
+            // Pushing `Val` (or `Var`) first and `Lazy` second means the
+            // postprocess restoration prepends them in stack order so the
+            // final line is `lazy val NAME …`.  This entry is independent of
+            // `lazy import`, which is handled by the parallel
+            // `lazy_imports` mechanism.
+            if stripped_line.is_none() {
+                for inner_kw in &[TyphonKeyword::Val, TyphonKeyword::Var] {
+                    let prefix = format!("lazy {} ", inner_kw.as_str());
+                    if rest.starts_with(&prefix) && rest.len() > prefix.len() {
+                        stripped.push(StrippedKeyword {
+                            line_index,
+                            keyword: *inner_kw,
+                        });
+                        stripped.push(StrippedKeyword {
+                            line_index,
+                            keyword: TyphonKeyword::Lazy,
+                        });
+                        let after_kw = &rest[prefix.len()..];
+                        stripped_line = Some(format!("{}{}", indent, after_kw));
+                        break;
+                    }
+                }
+            }
+
             // ── `val name…` / `var name…` → strip keyword ──────────────────
             if stripped_line.is_none() {
                 for kw in &[TyphonKeyword::Val, TyphonKeyword::Var] {
@@ -824,10 +850,22 @@ pub fn postprocess_full(
                 };
                 lines[line_idx] = format!("{}{}", &line[..indent_len], restored);
             }
-            // `lazy import` restoration is handled separately below via
-            // `lazy_imports`; the `Lazy` keyword is never pushed into
-            // `stripped`, so this arm is a safety no-op.
-            TyphonKeyword::Lazy => {}
+            // `lazy import` restoration is handled separately below via the
+            // `lazy_imports` vector.  `lazy val` round-trips through the
+            // `stripped` mechanism: the inner `val`/`var` is restored first,
+            // and this arm prepends the `lazy ` prefix on top.
+            TyphonKeyword::Lazy => {
+                let line = &lines[line_idx];
+                let indent_len = line
+                    .find(|c: char| !c.is_whitespace())
+                    .unwrap_or(line.len());
+                let new_line = format!(
+                    "{}lazy {}",
+                    &line[..indent_len],
+                    &line[indent_len..]
+                );
+                lines[line_idx] = new_line;
+            }
             TyphonKeyword::Gather | TyphonKeyword::Go => {
                 // These constructs are expanded by separate passes
                 // (`expand_gather_blocks`, `expand_go_calls`); they never
@@ -1175,6 +1213,16 @@ pub fn expand_lazy_imports(source: &str) -> String {
     // Track triple-quoted string state so that a `lazy import` that appears
     // inside a docstring or multiline string is never mistakenly rewritten.
     let mut in_string: Option<StringMode> = None;
+    // Stack of enclosing `class:` / `def:` block indents so we can decide
+    // whether a `lazy val` is module-level (→ `lazy_val(lambda: …)`) or
+    // class-body (→ `@cached_property`).  Each entry is `(indent_of_header,
+    // is_class_body)`.
+    let mut block_stack: Vec<(usize, bool)> = Vec::new();
+    // Track whether we have already injected the runtime imports so we don't
+    // emit duplicates.
+    let mut needs_lazy_val_import = false;
+    let mut needs_cached_property_import = false;
+    let mut emitted_lines: Vec<String> = Vec::new();
 
     for line in source.split_inclusive('\n') {
         let pre_string = in_string;
@@ -1184,27 +1232,290 @@ pub fn expand_lazy_imports(source: &str) -> String {
         // Lines that begin inside a triple-quoted string are pure string
         // content — emit verbatim.
         if pre_string.is_some() {
-            result.push_str(line);
+            emitted_lines.push(line.to_owned());
             continue;
         }
 
         let trimmed = raw.trim_start();
         let indent_len = raw.len() - trimmed.len();
 
-        // Only expand at module level (indent_len == 0).
+        // Pop block stack entries whose header indent is deeper than (or
+        // equal to) the current code indent — unless the line is blank.
+        if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            while let Some(&(top_indent, _)) = block_stack.last() {
+                if indent_len <= top_indent {
+                    block_stack.pop();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Push a new entry when we enter a `class …:` or `def …:` block.
+        // The body of the block sits at a deeper indent than `indent_len`,
+        // so subsequent lines compare against `indent_len`.
+        if let Some(rest) = trimmed.strip_prefix("class ") {
+            if rest.contains(':') {
+                block_stack.push((indent_len, true));
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("async def ") {
+            if rest.contains(':') {
+                block_stack.push((indent_len, false));
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("def ") {
+            if rest.contains(':') {
+                block_stack.push((indent_len, false));
+            }
+        }
+
+        // ── `lazy import ALIAS = MODULE` ───────────────────────────────────
         if indent_len == 0 {
             if let Some(after) = trimmed.strip_prefix("lazy import ") {
                 if let Some((alias, module)) = parse_lazy_import(after) {
-                    emit_lazy_proxy(&mut result, &alias, &module);
+                    let mut proxy = String::new();
+                    emit_lazy_proxy(&mut proxy, &alias, &module);
+                    emitted_lines.push(proxy);
                     continue;
                 }
             }
         }
 
+        // ── `lazy val NAME: T = expr` ──────────────────────────────────────
+        if let Some(after) = trimmed.strip_prefix("lazy val ") {
+            // Are we directly inside a class body?
+            let inside_class = block_stack
+                .last()
+                .map(|&(header_indent, is_class)| is_class && indent_len > header_indent)
+                .unwrap_or(false);
+            let inside_function = block_stack
+                .iter()
+                .rev()
+                .find(|&&(header_indent, _)| indent_len > header_indent)
+                .map(|&(_, is_class)| !is_class)
+                .unwrap_or(false);
+
+            if let Some(binding) = parse_lazy_val_binding(after) {
+                let indent = &raw[..indent_len];
+                if inside_function && !inside_class {
+                    // Function-local lazy val is not supported — leave the
+                    // line so the parser flags it. A linter pass can later
+                    // produce a nicer diagnostic.
+                    emitted_lines.push(line.to_owned());
+                    continue;
+                }
+                if inside_class {
+                    // Lower to:
+                    //   @cached_property
+                    //   def NAME(self) -> T:
+                    //       return expr
+                    needs_cached_property_import = true;
+                    let body = render_cached_property(indent, &binding);
+                    emitted_lines.push(body);
+                    continue;
+                }
+                if indent_len == 0 {
+                    // Module-level: lower to
+                    //   NAME: T = __typhon_lazy_val(lambda: expr)
+                    needs_lazy_val_import = true;
+                    let typed = if let Some(ty) = &binding.annotation {
+                        format!("{}: {}", binding.name, ty)
+                    } else {
+                        binding.name.clone()
+                    };
+                    emitted_lines.push(format!(
+                        "{}{} = __typhon_lazy_val(lambda: {})\n",
+                        indent, typed, binding.expr
+                    ));
+                    continue;
+                }
+            }
+        }
+
+        emitted_lines.push(line.to_owned());
+    }
+
+    // Prepend any injected imports.  They go after the `from __future__`
+    // imports, which by Python rules must remain at the top; for simplicity
+    // we scan and insert after the last `from __future__ import …` line.
+    let mut header = String::new();
+    if needs_lazy_val_import {
+        header.push_str(
+            "from typhon_runtime.lazy import lazy_val as __typhon_lazy_val\n",
+        );
+    }
+    if needs_cached_property_import {
+        header.push_str("from functools import cached_property as __typhon_cached_property\n");
+    }
+
+    if header.is_empty() {
+        for line in &emitted_lines {
+            result.push_str(line);
+        }
+        return result;
+    }
+
+    // Find the insertion point: after any leading `from __future__ import …`
+    // statements (these must remain at the top of the file).
+    let mut insert_at = 0usize;
+    for (i, line) in emitted_lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("from __future__ import")
+            || trimmed.is_empty()
+            || trimmed.starts_with('#')
+        {
+            insert_at = i + 1;
+            continue;
+        }
+        break;
+    }
+    for line in &emitted_lines[..insert_at] {
+        result.push_str(line);
+    }
+    result.push_str(&header);
+    for line in &emitted_lines[insert_at..] {
         result.push_str(line);
     }
 
     result
+}
+
+/// Parsed `lazy val NAME [: T] = expr` body.
+#[derive(Debug)]
+struct LazyValBinding {
+    name: String,
+    annotation: Option<String>,
+    expr: String,
+}
+
+/// Parse the tail of a `lazy val ` line (everything after the keyword).  The
+/// expected shapes are `NAME = expr` or `NAME: TYPE = expr`.
+fn parse_lazy_val_binding(tail: &str) -> Option<LazyValBinding> {
+    let tail = tail.trim_end_matches(['\n', '\r']);
+    // Strip a trailing comment so `lazy val x = 1  # note` works.
+    let code = strip_trailing_comment(tail);
+    let eq = find_top_level_assign_eq(&code)?;
+    let head = code[..eq].trim();
+    let expr = code[eq + 1..].trim().to_owned();
+    if expr.is_empty() {
+        return None;
+    }
+    let (name, annotation) = if let Some(colon) = head.find(':') {
+        let name = head[..colon].trim().to_owned();
+        let ann = head[colon + 1..].trim().to_owned();
+        (name, Some(ann))
+    } else {
+        (head.to_owned(), None)
+    };
+    if !is_python_ident(&name) {
+        return None;
+    }
+    Some(LazyValBinding {
+        name,
+        annotation,
+        expr,
+    })
+}
+
+/// Find the `=` that opens the RHS of an assignment, skipping `=` inside
+/// brackets or string literals.  Returns `None` for compound operators like
+/// `==`, `!=`, `<=`, `>=`, `+=`, etc.
+fn find_top_level_assign_eq(s: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut in_string: Option<StringMode> = None;
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if let Some(mode) = in_string {
+            match mode {
+                StringMode::Single if c == '\'' => in_string = None,
+                StringMode::Double if c == '"' => in_string = None,
+                StringMode::Single | StringMode::Double if c == '\\' => {
+                    i += 2;
+                    continue;
+                }
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '\'' => in_string = Some(StringMode::Single),
+            '"' => in_string = Some(StringMode::Double),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            '=' if depth == 0 => {
+                // Skip compound operators: `==`, `<=`, `>=`, `!=`, `+=`, `-=`,
+                // `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `>>=`, `<<=`, `:=`.
+                let prev = if i == 0 { b' ' } else { bytes[i - 1] };
+                let next = if i + 1 < bytes.len() { bytes[i + 1] } else { b' ' };
+                if next == b'=' {
+                    i += 2;
+                    continue;
+                }
+                if matches!(
+                    prev,
+                    b'=' | b'<' | b'>' | b'!' | b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|'
+                        | b'^' | b':'
+                ) {
+                    i += 1;
+                    continue;
+                }
+                return Some(i);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Strip a trailing `# comment` from a single line, respecting string
+/// literals.  Returns the comment-free prefix as an owned string.
+fn strip_trailing_comment(line: &str) -> String {
+    let mut in_string: Option<StringMode> = None;
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if let Some(mode) = in_string {
+            match mode {
+                StringMode::Single if c == '\'' => in_string = None,
+                StringMode::Double if c == '"' => in_string = None,
+                StringMode::Single | StringMode::Double if c == '\\' => {
+                    i += 2;
+                    continue;
+                }
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '\'' => in_string = Some(StringMode::Single),
+            '"' => in_string = Some(StringMode::Double),
+            '#' => return line[..i].to_owned(),
+            _ => {}
+        }
+        i += 1;
+    }
+    line.to_owned()
+}
+
+/// Emit a `@cached_property`-decorated method for a class-body `lazy val`.
+fn render_cached_property(indent: &str, binding: &LazyValBinding) -> String {
+    let ret = binding
+        .annotation
+        .as_deref()
+        .map(|t| format!(" -> {}", t))
+        .unwrap_or_default();
+    format!(
+        "{indent}@__typhon_cached_property\n{indent}def {name}(self){ret}:\n{indent}    return {expr}\n",
+        indent = indent,
+        name = binding.name,
+        ret = ret,
+        expr = binding.expr,
+    )
 }
 
 /// Emit the proxy class for a single `lazy import ALIAS = MODULE`.
@@ -3603,6 +3914,114 @@ def run() -> Result[str, str]:
         assert!(
             result.lazy_imports.is_empty(),
             "indented lazy should not be recorded"
+        );
+    }
+
+    #[test]
+    fn expand_lazy_val_module_level_lowers_to_lazy_val_call() {
+        let src = "lazy val CONFIG: dict = load_config()\n";
+        let out = expand_lazy_imports(src);
+        assert!(
+            out.contains("from typhon_runtime.lazy import lazy_val as __typhon_lazy_val"),
+            "module-level lazy val should inject the runtime import; got:\n{out}"
+        );
+        assert!(
+            out.contains("CONFIG: dict = __typhon_lazy_val(lambda: load_config())"),
+            "module-level lazy val should lower to lazy_val(lambda: …); got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn expand_lazy_val_module_level_without_annotation() {
+        let src = "lazy val PORT = 8080\n";
+        let out = expand_lazy_imports(src);
+        assert!(
+            out.contains("PORT = __typhon_lazy_val(lambda: 8080)"),
+            "lazy val without annotation should lower without colon: {out}"
+        );
+    }
+
+    #[test]
+    fn expand_lazy_val_inside_class_lowers_to_cached_property() {
+        let src = "class Foo:\n    lazy val expensive: int = compute()\n";
+        let out = expand_lazy_imports(src);
+        assert!(
+            out.contains("from functools import cached_property as __typhon_cached_property"),
+            "class-body lazy val should inject cached_property import; got:\n{out}"
+        );
+        assert!(
+            out.contains("@__typhon_cached_property"),
+            "class-body lazy val should emit the @cached_property decorator; got:\n{out}"
+        );
+        assert!(
+            out.contains("def expensive(self) -> int:"),
+            "class-body lazy val should emit a method signature; got:\n{out}"
+        );
+        assert!(
+            out.contains("return compute()"),
+            "class-body lazy val body should return the expr; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn expand_lazy_val_inserts_imports_after_future() {
+        let src = "from __future__ import annotations\nlazy val X = 1\n";
+        let out = expand_lazy_imports(src);
+        // The __future__ line must remain first; the injected import must
+        // appear after it.
+        let future_pos = out.find("from __future__").expect("future import preserved");
+        let runtime_pos = out
+            .find("from typhon_runtime.lazy")
+            .expect("runtime import injected");
+        assert!(
+            future_pos < runtime_pos,
+            "__future__ must precede injected import; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn expand_lazy_val_passes_through_inside_function() {
+        // Function-local lazy val is not supported in v1; the line must not
+        // be rewritten (the parser will flag it as a syntax error).
+        let src = "def f():\n    lazy val x: int = 1\n    return x\n";
+        let out = expand_lazy_imports(src);
+        assert!(
+            out.contains("lazy val x: int = 1"),
+            "function-local lazy val should be passed through verbatim; got:\n{out}"
+        );
+        assert!(
+            !out.contains("__typhon_lazy_val"),
+            "function-local lazy val must not be lowered; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn preprocess_strips_lazy_val_for_round_trip() {
+        let result = preprocess("lazy val CONFIG: int = 1\n");
+        // Both `lazy` and `val` are removed from the Python-facing source so
+        // the parser sees plain `CONFIG: int = 1`; the formatter restores
+        // them via the stripped-keyword list.
+        assert_eq!(result.python_source, "CONFIG: int = 1\n");
+        let kinds: Vec<TyphonKeyword> =
+            result.stripped.iter().map(|sk| sk.keyword).collect();
+        assert!(
+            kinds.contains(&TyphonKeyword::Val) && kinds.contains(&TyphonKeyword::Lazy),
+            "stripped list should contain both Val and Lazy; got {:?}",
+            kinds
+        );
+        // Round-trip: postprocess must rebuild the original `lazy val` form.
+        let restored = postprocess(&result.python_source, &result.stripped, &result.optionals);
+        assert_eq!(restored, "lazy val CONFIG: int = 1\n");
+    }
+
+    #[test]
+    fn expand_lazy_val_parser_skips_compound_assignment() {
+        // `==` inside the expression must not be confused with the binding `=`.
+        let src = "lazy val FLAG = a == b\n";
+        let out = expand_lazy_imports(src);
+        assert!(
+            out.contains("__typhon_lazy_val(lambda: a == b)"),
+            "RHS containing `==` must be captured intact; got:\n{out}"
         );
     }
 
