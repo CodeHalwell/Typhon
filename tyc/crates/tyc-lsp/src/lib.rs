@@ -8,7 +8,7 @@
 
 use std::sync::Mutex;
 
-use miette::{Diagnostic as MietteDiagnostic, LabeledSpan, Severity};
+use miette::{Diagnostic as MietteDiagnostic, LabeledSpan};
 use tower_lsp_server::ls_types::{
     Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, Hover, HoverContents, HoverParams, HoverProviderCapability,
@@ -203,14 +203,10 @@ fn byte_to_position(source: &str, target: usize) -> Position {
         }
         byte += ch.len_utf8();
     }
-    Position { line, character: column }
-}
-
-// Suppress the unused-severity warning when miette's Severity helper is not
-// reachable; the import is kept because future variants may report Warning.
-#[allow(dead_code)]
-fn _severity_marker() -> Severity {
-    Severity::Error
+    Position {
+        line,
+        character: column,
+    }
 }
 
 #[cfg(test)]
@@ -221,13 +217,37 @@ mod tests {
     fn byte_to_position_ascii() {
         let src = "abc\ndef\nghij";
         // Beginning.
-        assert_eq!(byte_to_position(src, 0), Position { line: 0, character: 0 });
+        assert_eq!(
+            byte_to_position(src, 0),
+            Position {
+                line: 0,
+                character: 0
+            }
+        );
         // Middle of first line.
-        assert_eq!(byte_to_position(src, 2), Position { line: 0, character: 2 });
+        assert_eq!(
+            byte_to_position(src, 2),
+            Position {
+                line: 0,
+                character: 2
+            }
+        );
         // Start of second line (after first `\n`).
-        assert_eq!(byte_to_position(src, 4), Position { line: 1, character: 0 });
+        assert_eq!(
+            byte_to_position(src, 4),
+            Position {
+                line: 1,
+                character: 0
+            }
+        );
         // Inside third line.
-        assert_eq!(byte_to_position(src, 9), Position { line: 2, character: 1 });
+        assert_eq!(
+            byte_to_position(src, 9),
+            Position {
+                line: 2,
+                character: 1
+            }
+        );
     }
 
     #[test]
@@ -235,7 +255,13 @@ mod tests {
         // 'é' is 2 bytes in UTF-8 but 1 code unit in UTF-16.
         let src = "café\n";
         // Position of '\n' (byte 5) is column 4 (one UTF-16 unit per char).
-        assert_eq!(byte_to_position(src, 5), Position { line: 0, character: 4 });
+        assert_eq!(
+            byte_to_position(src, 5),
+            Position {
+                line: 0,
+                character: 4
+            }
+        );
     }
 
     #[test]
@@ -243,7 +269,10 @@ mod tests {
         let src = "x = 1";
         assert_eq!(
             byte_to_position(src, 100),
-            Position { line: 0, character: 5 }
+            Position {
+                line: 0,
+                character: 5
+            }
         );
     }
 }

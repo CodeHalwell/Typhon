@@ -951,7 +951,7 @@ pub fn expand_with_chains(source: &str) -> String {
     while i < lines.len() {
         let line = lines[i];
         let pre_string = in_string;
-        let raw = line.trim_end_matches(|c: char| c == '\n' || c == '\r');
+        let raw = line.trim_end_matches(['\n', '\r']);
         let _code_end = scan_line_code_end(raw, &mut in_string);
 
         // Lines that start inside a triple-quoted string are pure content.
@@ -1071,7 +1071,7 @@ fn collect_chain(
     // Collect continuation binding lines while the previous terminator was `,`.
     while term == ',' && idx < lines.len() {
         let line = lines[idx];
-        let raw = line.trim_end_matches(|c: char| c == '\n' || c == '\r');
+        let raw = line.trim_end_matches(['\n', '\r']);
         let _ = scan_line_code_end(raw, &mut in_string);
 
         let indent_len = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
@@ -1096,7 +1096,7 @@ fn collect_chain(
     let mut body = Vec::new();
     while idx < lines.len() {
         let line = lines[idx];
-        let raw = line.trim_end_matches(|c: char| c == '\n' || c == '\r');
+        let raw = line.trim_end_matches(['\n', '\r']);
         if raw.trim().is_empty() {
             // Pass blank lines through verbatim.
             let _ = scan_line_code_end(raw, &mut in_string);
@@ -1121,18 +1121,16 @@ fn collect_chain(
     let mut else_body = Vec::new();
     if idx < lines.len() {
         let line = lines[idx];
-        let raw = line.trim_end_matches(|c: char| c == '\n' || c == '\r');
+        let raw = line.trim_end_matches(['\n', '\r']);
         let indent_len = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
         let header = raw[indent_len..].trim_end();
-        if indent_len == chain_indent.len()
-            && (header == "else:" || header.starts_with("else "))
-        {
+        if indent_len == chain_indent.len() && (header == "else:" || header.starts_with("else ")) {
             err_var = Some(parse_else_var(header).unwrap_or_else(|| "_err".to_owned()));
             let _ = scan_line_code_end(raw, &mut in_string);
             idx += 1;
             while idx < lines.len() {
                 let l = lines[idx];
-                let r = l.trim_end_matches(|c: char| c == '\n' || c == '\r');
+                let r = l.trim_end_matches(['\n', '\r']);
                 if r.trim().is_empty() {
                     let _ = scan_line_code_end(r, &mut in_string);
                     else_body.push(l.to_string());
@@ -1173,7 +1171,12 @@ fn parse_else_var(header: &str) -> Option<String> {
         if name.is_empty() {
             return None;
         }
-        if !name.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false) {
+        if !name
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphabetic() || c == '_')
+            .unwrap_or(false)
+        {
             return None;
         }
         if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
@@ -1288,7 +1291,7 @@ pub fn expand_pipes(source: &str) -> String {
 
     for line in source.split_inclusive('\n') {
         let pre_string = in_string;
-        let raw = line.trim_end_matches(|c: char| c == '\n' || c == '\r');
+        let raw = line.trim_end_matches(['\n', '\r']);
         let code_end = scan_line_code_end(raw, &mut in_string);
 
         if pre_string.is_some() {
@@ -1388,7 +1391,9 @@ fn rewrite_pipe_line(code: &str, pipes: &[usize]) -> Option<String> {
     segments.push(&code[last..]);
 
     let first = segments[0];
-    let indent_end = first.find(|c: char| !c.is_whitespace()).unwrap_or(first.len());
+    let indent_end = first
+        .find(|c: char| !c.is_whitespace())
+        .unwrap_or(first.len());
     let indent = &first[..indent_end];
     let first_body = first[indent_end..].trim_end();
 
@@ -2219,7 +2224,10 @@ mod tests {
     #[test]
     fn pipe_preserves_indent() {
         let out = expand_pipes("    return x |> f\n");
-        assert_eq!(out, "    return filter_unused\n".replace("filter_unused", "f(x)"));
+        assert_eq!(
+            out,
+            "    return filter_unused\n".replace("filter_unused", "f(x)")
+        );
     }
 
     #[test]
@@ -2266,7 +2274,10 @@ def run() -> Result[str, str]:
 ";
         let out = expand_with_chains(src);
         assert!(out.contains("__typhon_with_0__ = f()"), "out:\n{out}");
-        assert!(out.contains("if isinstance(__typhon_with_0__, Err):"), "out:\n{out}");
+        assert!(
+            out.contains("if isinstance(__typhon_with_0__, Err):"),
+            "out:\n{out}"
+        );
         assert!(out.contains("err = __typhon_with_0__.error"), "out:\n{out}");
         assert!(out.contains("return Err(err)"), "out:\n{out}");
         assert!(out.contains("x = __typhon_with_0__.value"), "out:\n{out}");
@@ -2302,7 +2313,10 @@ def run() -> Result[str, str]:
             out.contains("return __typhon_with_0__"),
             "no `else` should propagate the raw Err: {out}"
         );
-        assert!(!out.contains("__typhon_with_0__.error"), "unexpected error binding: {out}");
+        assert!(
+            !out.contains("__typhon_with_0__.error"),
+            "unexpected error binding: {out}"
+        );
     }
 
     #[test]
@@ -2318,7 +2332,10 @@ def run() -> Result[str, str]:
         return Err(\"oops\")
 ";
         let out = expand_with_chains(src);
-        assert!(out.contains("_err = __typhon_with_0__.error"), "out:\n{out}");
+        assert!(
+            out.contains("_err = __typhon_with_0__.error"),
+            "out:\n{out}"
+        );
         assert!(out.contains("return Err(\"oops\")"), "out:\n{out}");
     }
 

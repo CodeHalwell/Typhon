@@ -47,9 +47,8 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
     // a throw-away copy of the source purely for validation; the normalised
     // output below is still derived from `prep.python_source` so the Typhon
     // sugar is preserved when the file is rewritten.
-    let validation_input = expand_question_ops(&expand_pipes(&expand_with_chains(
-        &prep.python_source,
-    )));
+    let validation_input =
+        expand_question_ops(&expand_pipes(&expand_with_chains(&prep.python_source)));
     parse_module(&validation_input, path).map_err(|e| {
         let offset = usize::from(e.offset);
         TycError::parse(path, &validation_input, e.to_string(), offset)
@@ -240,8 +239,16 @@ def run() -> Result[int, str]:
         return Err(err)
 ";
         let result = format_source(src, "<test>").unwrap();
-        assert!(result.output.contains("with x = f()?:"), "got:\n{}", result.output);
-        assert!(result.output.contains("else err:"), "got:\n{}", result.output);
+        assert!(
+            result.output.contains("with x = f()?:"),
+            "got:\n{}",
+            result.output
+        );
+        assert!(
+            result.output.contains("else err:"),
+            "got:\n{}",
+            result.output
+        );
     }
 
     #[test]
