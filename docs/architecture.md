@@ -10,25 +10,25 @@ The `tyc` binary is a multi-stage compiler with an embedded LSP, structured as a
 .ty source files
         │
         ▼
-[tt-parser]    →  Typhon AST (Python AST + Typhon nodes)
+[tyc-syntax]   →  Typhon AST (Python AST + Typhon nodes)
         │
         ▼
-[tt-resolve]   →  symbol tables, scopes, val/var classification
+[tyc-resolve]  →  symbol tables, scopes, val/var classification
         │
         ▼
-[tt-checker]   →  typed AST, structural subtyping, sealed unions
+[tyc-types]    →  typed AST, structural subtyping, sealed unions
         │
         ▼
-[tt-analyser]  →  purity, async/concurrency, comptime, optimisation hints
+[tyc-analyse]  →  purity, async/concurrency, comptime, optimisation hints
         │
         ▼
-[tt-desugar]   →  plain Python AST
+[tyc-desugar]  →  plain Python AST
         │
         ▼
-[tt-emitter]   →  .py source via ruff_python_codegen + ruff_python_formatter
+[tyc-emit]     →  .py source via ruff_python_codegen + ruff_python_formatter
         │
         ▼
-[tt-lsp]       →  reuses the above stages incrementally via Salsa
+[tyc-lsp]      →  reuses the above stages incrementally via Salsa
 ```
 
 ## Workspace layout

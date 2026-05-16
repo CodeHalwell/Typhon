@@ -64,19 +64,35 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
 
 /// Normalise whitespace in a Python-compatible source string.
 ///
-/// - Expands tabs to 4 spaces.
-/// - Strips trailing whitespace from each line.
+/// - Expands tabs found in leading indentation to 4 spaces. Tabs after the
+///   first non-whitespace character (e.g. inside string literals) are left
+///   alone so their contents aren't corrupted.
+/// - Strips trailing whitespace from each line, including reducing
+///   whitespace-only lines to blank lines.
 /// - Ensures the file ends with exactly one `\n`.
 fn normalise_whitespace(source: &str) -> String {
-    let expanded = source.replace('\t', "    ");
-    let mut result = String::with_capacity(expanded.len());
-    for line in expanded.lines() {
-        result.push_str(line.trim_end());
-        result.push('\n');
-    }
-    // If source was empty do not add a spurious newline.
     if source.is_empty() {
         return String::new();
+    }
+    let mut result = String::with_capacity(source.len());
+    for raw_line in source.lines() {
+        // Trim trailing whitespace first so whitespace-only lines collapse
+        // to empty before we look for the indent boundary.
+        let line = raw_line.trim_end();
+        let indent_end = line
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(line.len());
+        let leading = &line[..indent_end];
+        let rest = &line[indent_end..];
+        for ch in leading.chars() {
+            if ch == '\t' {
+                result.push_str("    ");
+            } else {
+                result.push(ch);
+            }
+        }
+        result.push_str(rest);
+        result.push('\n');
     }
     result
 }
@@ -156,5 +172,44 @@ mod tests {
     fn format_error_on_invalid_syntax() {
         let result = format_source("def (broken:", "<test>");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn format_expands_leading_tabs() {
+        let src = "def f():\n\tx: int = 1\n";
+        let result = format_source(src, "<test>").unwrap();
+        assert!(
+            result.output.contains("    x: int = 1"),
+            "leading tab should expand to spaces, got: {:?}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn format_trims_whitespace_only_lines() {
+        // A blank line containing only spaces must be reduced to an empty
+        // line, matching the pre-refactor behaviour. (The leading-indent-only
+        // tab-expansion path could otherwise leave the original whitespace
+        // verbatim on whitespace-only lines.)
+        let src = "x: int = 1\n   \nval y: int = 2\n";
+        let result = format_source(src, "<test>").unwrap();
+        assert!(
+            result.output.contains("\n\nval y"),
+            "whitespace-only line must collapse to empty, got: {:?}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn format_preserves_tab_escape_in_string() {
+        // `\t` inside a string literal is a two-character escape (backslash +
+        // 't') in the source; it must survive normalisation intact.
+        let src = "x = \"hello\\tworld\"\n";
+        let result = format_source(src, "<test>").unwrap();
+        assert!(
+            result.output.contains("\\t"),
+            "string \\t escape must be preserved, got: {:?}",
+            result.output
+        );
     }
 }

@@ -35,7 +35,7 @@ impl Default for ProjectConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, rename_all = "kebab-case")]
 pub struct PythonConfig {
     /// Target Python version, e.g. `"3.13"`.
     pub target: String,
@@ -53,7 +53,7 @@ impl Default for PythonConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, rename_all = "kebab-case")]
 pub struct EmitConfig {
     /// Default class emission target: `"dataclass"` (default) or `"pydantic"`.
     pub class_default: String,
@@ -71,7 +71,7 @@ impl Default for EmitConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, rename_all = "kebab-case")]
 pub struct StrictnessConfig {
     pub no_implicit_any: bool,
     pub unused_import: String,

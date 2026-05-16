@@ -3,9 +3,11 @@
 use std::path::PathBuf;
 
 use clap::Args;
-use miette::{miette, Result};
+use miette::{miette, Report, Result};
 
 use tyc_format::format_file;
+
+use crate::commands::util::collect_ty_files;
 
 /// Arguments for `tyc fmt`.
 #[derive(Args, Debug)]
@@ -28,29 +30,30 @@ pub fn run(args: FmtArgs) -> Result<()> {
     let mut total = 0usize;
 
     for root in &args.paths {
-        collect_ty_files(root, &mut |path| {
+        for path in collect_ty_files(root)? {
             total += 1;
 
             if args.check {
-                // In check mode, read the file and test whether it would change.
-                let source = std::fs::read_to_string(path)
-                    .map_err(|e| tyc_diagnostics::TycError::io(path.display().to_string(), &e))?;
-                let result =
-                    tyc_format::format_source(&source, &path.display().to_string())?;
+                let source = std::fs::read_to_string(&path).map_err(|e| {
+                    Report::new(tyc_diagnostics::TycError::io(
+                        path.display().to_string(),
+                        &e,
+                    ))
+                })?;
+                let result = tyc_format::format_source(&source, &path.display().to_string())
+                    .map_err(Report::new)?;
                 if result.changed {
                     changed += 1;
                     eprintln!("would reformat: {}", path.display());
                 }
-                Ok(())
             } else {
-                let did_change = format_file(path)?;
+                let did_change = format_file(&path).map_err(Report::new)?;
                 if did_change {
                     changed += 1;
                     println!("reformatted: {}", path.display());
                 }
-                Ok(())
             }
-        })?;
+        }
     }
 
     if args.check && changed > 0 {
@@ -70,33 +73,6 @@ pub fn run(args: FmtArgs) -> Result<()> {
             if changed == 1 { "" } else { "s" },
             total - changed,
         );
-    }
-
-    Ok(())
-}
-
-/// Recursively collect `.ty` files under `root` and call `f` for each.
-fn collect_ty_files<F>(root: &PathBuf, f: &mut F) -> Result<()>
-where
-    F: FnMut(&PathBuf) -> std::result::Result<(), tyc_diagnostics::TycError>,
-{
-    if root.is_file() {
-        if root.extension().map(|e| e == "ty").unwrap_or(false) {
-            f(root).map_err(miette::Report::new)?;
-        }
-        return Ok(());
-    }
-
-    if root.is_dir() {
-        let entries = std::fs::read_dir(root)
-            .map_err(|e| miette!("cannot read directory {}: {}", root.display(), e))?;
-        let mut paths: Vec<PathBuf> = entries
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .collect();
-        paths.sort();
-        for path in paths {
-            collect_ty_files(&path, f)?;
-        }
     }
 
     Ok(())

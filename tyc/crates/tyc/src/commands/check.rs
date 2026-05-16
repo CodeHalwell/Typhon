@@ -13,6 +13,8 @@ use miette::{miette, Result};
 use tyc_db::{check_file, TycDatabase};
 use tyc_diagnostics::{Diagnostics, TycError};
 
+use crate::commands::util::collect_ty_files;
+
 /// Arguments for `tyc check`.
 #[derive(Args, Debug)]
 pub struct CheckArgs {
@@ -27,20 +29,20 @@ pub fn run(args: CheckArgs) -> Result<()> {
     let mut db = TycDatabase::new();
 
     for root in &args.paths {
-        collect_ty_files(root, &mut |path| {
+        for path in collect_ty_files(root)? {
             file_count += 1;
 
-            let source = match std::fs::read_to_string(path) {
+            let source = match std::fs::read_to_string(&path) {
                 Ok(s) => s,
                 Err(e) => {
                     diags.push_error(TycError::io(path.display().to_string(), &e));
-                    return;
+                    continue;
                 }
             };
 
             let file_diags = check_file(&mut db, path.display().to_string(), source);
             diags.extend(file_diags);
-        })?;
+        }
     }
 
     if diags.has_errors() {
@@ -55,29 +57,5 @@ pub fn run(args: CheckArgs) -> Result<()> {
     }
 
     println!("checked {} file(s) — no errors", file_count);
-    Ok(())
-}
-
-fn collect_ty_files<F>(root: &PathBuf, f: &mut F) -> Result<()>
-where
-    F: FnMut(&PathBuf),
-{
-    if root.is_file() {
-        if root.extension().map(|e| e == "ty").unwrap_or(false) {
-            f(root);
-        }
-        return Ok(());
-    }
-    if root.is_dir() {
-        let entries = std::fs::read_dir(root)
-            .map_err(|e| miette!("cannot read directory {}: {}", root.display(), e))?;
-        let mut paths: Vec<PathBuf> = entries
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .collect();
-        paths.sort();
-        for path in paths {
-            collect_ty_files(&path, f)?;
-        }
-    }
     Ok(())
 }
