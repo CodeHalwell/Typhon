@@ -19,12 +19,16 @@ free-threaded = false       # opt-in; requires 3.13t/3.14t
 
 [emit]
 class-default = "dataclass" # or "pydantic"
+model-extra = "forbid"      # "forbid" | "allow" | "ignore" — passes to Pydantic ConfigDict
 format = true               # post-process through ruff format
+pyi-stubs = true            # emit .pyi alongside .py for interop with mypy / pyright / Pyrefly / ty
 
 [strictness]
 no-implicit-any = true
 unused-import = "error"
 exhaustive-match = "error"
+auto-memoise = false        # opt-in: insert @functools.cache on inferred-pure functions
+stub-check = "error"        # tyc check --stubs severity; compares .pyi against runtime modules
 
 [env]
 required = ["DATABASE_URL"]  # comptime env() lookups must resolve at build time
@@ -53,7 +57,9 @@ required = ["DATABASE_URL"]  # comptime env() lookups must resolve at build time
 | Key | Type | Description |
 |-----|------|-------------|
 | `class-default` | `"dataclass"` \| `"pydantic"` | Default emit target for `class` declarations. Overridable per-class via the `model` keyword. |
+| `model-extra` | `"forbid"` \| `"allow"` \| `"ignore"` | Value passed to Pydantic's `ConfigDict(extra=...)` for `model` emissions. Default `"forbid"` — Typhon does not inherit Pydantic's stock `"ignore"` because silently dropping input contradicts the safety pitch. |
 | `format` | bool | Post-process emitted `.py` through `ruff format`. |
+| `pyi-stubs` | bool | Emit a PEP 561 `.pyi` next to every `.py`. Default `true`. Disable for projects that vendor stubs separately. |
 
 ### `[strictness]`
 
@@ -62,6 +68,8 @@ required = ["DATABASE_URL"]  # comptime env() lookups must resolve at build time
 | `no-implicit-any` | bool | Treat implicit `Any` as a hard error outside `unsafe` blocks. |
 | `unused-import` | `"error"` \| `"warn"` \| `"off"` | Severity for unused imports. |
 | `exhaustive-match` | `"error"` \| `"warn"` \| `"off"` | Severity for non-exhaustive `match` over sealed unions. |
+| `auto-memoise` | bool | Whether to apply `@functools.cache` to functions the analyser infers as pure. Default `false`. Caches are *never* inserted silently: even when enabled, the analyser requires all six purity conditions (see [language.md](language.md)). |
+| `stub-check` | `"error"` \| `"warn"` \| `"off"` | Severity for drift between a `.dty` source and the runtime module it describes. Surfaced by `tyc check --stubs`. |
 
 ### `[env]`
 

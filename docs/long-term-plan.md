@@ -118,9 +118,13 @@ A plain `T` forbids `None`; `T?` is the optional form. Internally `T?` is repres
 
 Angle-bracket syntax (`def f<T>(x: T) -> T`) instead of PEP 484 TypeVars. Inference is bidirectional: constraints flow from arguments to type parameters, falling back to explicit annotation when ambiguous. Generics are type-erased at emit time; runtime relies on Python's duck typing and (where present) Pydantic validation.
 
+**Open question — PEP 695 bracket syntax.** Python 3.12 introduced `def f[T](x: T) -> T` (PEP 695), and the typing spec also supports `type Vector[T: float] = ...`. Adopting PEP 695 in source would parse cheaper, lower cheaper, and reduce the divergence between the Ruff parser fork and upstream. Angle brackets keep aesthetic kinship with TypeScript and Rust but cost a deeper grammar fork. A decision is required **before Phase 3 generics work begins**; see *Open questions* near the end of this document.
+
 #### Interfaces (structural)
 
 `interface` declarations are structural contracts, like Python's `typing.Protocol`. The checker verifies that a candidate type provides every required member with compatible signatures, with memoised "assumed subtype" sets to handle recursion. Interfaces emit as `typing.Protocol` subclasses.
+
+PEP 544's `@runtime_checkable` only validates **attribute presence**, not signatures or types. A bare `isinstance(x, MyInterface)` therefore gives a much weaker guarantee than the static check. Typhon does not silently lower `is`-tests against an interface to `isinstance`; a runtime check against an interface either requires an explicit opt-in keyword or fails to compile. Static structural conformance remains the primary mechanism.
 
 #### Sealed unions
 
@@ -129,6 +133,14 @@ Angle-bracket syntax (`def f<T>(x: T) -> T`) instead of PEP 484 TypeVars. Infere
 #### No implicit `Any`
 
 `Any` is a top type, but its inference is a compile error outside an explicit `unsafe` block. Untyped library calls must be wrapped in `unsafe` or shimmed with a `.dty` stub. This is strictly stricter than TypeScript's `noImplicitAny`.
+
+**`unsafe` semantics.** `unsafe` is a **lexical region**, not a per-value annotation. Inside `unsafe { ... }` (or an `unsafe:` block), the checker:
+
+1. Permits expressions whose inferred type would otherwise be `Any` to bind freely.
+2. Tracks values originating from `unsafe` with a hidden `Unsafe[T]` marker that is invisible to user syntax but visible in diagnostics.
+3. Refuses to let `Unsafe[T]` flow into a non-`unsafe` context where a concrete `T` is required — the value must be re-asserted via an explicit cast, narrowing, or assignment to an annotated `val`/`var`.
+
+This means "no `Any`" is enforced at every region boundary even when a region internally tolerates dynamism. Stub files (`.dty`) and explicit `unsafe` blocks are the only two ways dynamic typing enters a Typhon program.
 
 ### Classes and `impl` blocks
 
@@ -160,12 +172,16 @@ model ApiUser:
     email: str
 
 # Emitted Python (model keyword: Pydantic)
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 class ApiUser(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     id: int
     email: str
 ```
+
+**`extra='forbid'` is the default.** Pydantic's stock default is `extra='ignore'`, which silently drops unexpected input. That contradicts Typhon's safety pitch, so `model` emission injects `extra='forbid'` by default. Users who want a permissive boundary opt in explicitly via `[emit] model-extra = "allow" | "ignore"` in `typhon.toml`, or per-class through a future modifier. `frozen=True` and similar configs remain opt-in; note that Pydantic immutability is *faux* — it blocks reassignment of fields but does not freeze nested mutable values. See `val` and `var` below for what Typhon does and does not guarantee about immutability.
 
 ### Error handling
 
@@ -211,13 +227,17 @@ gather:
     posts  = fetch_posts(id)
     notifs = fetch_notifications(id)
 
-# Emitted Python
-user, posts, notifs = await asyncio.gather(
-    fetch_user(id),
-    fetch_posts(id),
-    fetch_notifications(id),
-)
+# Emitted Python (default: TaskGroup — cancels siblings on first failure)
+async with asyncio.TaskGroup() as _tg:
+    _t_user   = _tg.create_task(fetch_user(id))
+    _t_posts  = _tg.create_task(fetch_posts(id))
+    _t_notifs = _tg.create_task(fetch_notifications(id))
+user   = _t_user.result()
+posts  = _t_posts.result()
+notifs = _t_notifs.result()
 ```
+
+**Why `TaskGroup`, not `asyncio.gather`.** `asyncio.gather(...)` propagates the first exception to the caller but continues running the other awaitables in the background — a footgun when the siblings have side effects or hold resources. `asyncio.TaskGroup` (3.11+) cancels siblings on first failure, which matches Typhon's safety-first posture. The `gather` keyword therefore lowers to `TaskGroup` by default. A `gather(strategy="best-effort"):` form lowers to `asyncio.gather(..., return_exceptions=True)` for users who genuinely want partial-success semantics.
 
 #### Free-threaded Python
 
@@ -225,15 +245,49 @@ Python 3.13 ships an experimental free-threaded build; 3.14 (Phase II) makes it 
 
 #### `go` spawn
 
-`go f(x)` is sugar for `asyncio.create_task(f(x))` in async contexts and `concurrent.futures.ThreadPoolExecutor.submit` on free-threaded builds for CPU-bound functions. The form `go f(x) -> fut` binds the task handle.
+`go f(x)` schedules `f(x)` in the background: an `asyncio.Task` in async contexts, a `ThreadPoolExecutor.submit` future on free-threaded builds for CPU-bound functions. The form `go f(x) -> fut` binds the task handle.
+
+**`go` does not lower to a bare `asyncio.create_task`.** Python's event loop holds only weak references to scheduled tasks, so a fire-and-forget `create_task(...)` whose handle is not retained can be garbage-collected mid-flight. `go` therefore lowers via a small helper in `typhon_runtime`:
+
+```python
+# typhon_runtime/tasks.py
+_BACKGROUND: set[asyncio.Task] = set()
+
+def spawn(coro):
+    task = asyncio.create_task(coro)
+    _BACKGROUND.add(task)
+    task.add_done_callback(_BACKGROUND.discard)
+    return task
+```
+
+`go f(x)` desugars to `typhon_runtime.tasks.spawn(f(x))`. The registry holds strong references for the task's lifetime and releases them on completion. The same pattern applies to thread-pool `go` on free-threaded builds, with a `Future` registry instead.
 
 ### `val` and `var`
 
-`val` is immutable, `var` is mutable. The checker rejects reassignment to a `val` after its declaration. `var` is preserved as-is but parallelisation passes refuse to touch any binding captured as `var` by a spawned task without explicit synchronisation. Top-level module bindings default to `val` unless declared `var`.
+`val` and `var` govern **binding immutability**, not deep value immutability. A `val u: User` cannot be reassigned, but if `User` exposes a mutable field, that field can still be written through. This matches Rust's `let` versus `let mut` and TypeScript's `const`; it does not match Clojure's deep immutability.
+
+- `val` is immutable as a binding. Reassignment is a compile error.
+- `var` is mutable. Parallelisation passes refuse to touch any binding captured as `var` by a spawned task without explicit synchronisation.
+- Top-level module bindings default to `val` unless declared `var`.
+
+Deep immutability for class instances is an emit-time concern, not a binding one: pass `frozen=True` to the underlying `@dataclass` or Pydantic config (Pydantic's flavour blocks reassignment of fields but does not recursively freeze nested values). A future `freeze` modifier may layer stronger deep-immutability semantics on top, but `val` itself stays scoped to bindings.
 
 ### Lazy loading
 
 `lazy import np = numpy` desugars to a `typhon_runtime.lazy_import_proxy` that defers module loading until first attribute access, built on `importlib.util.LazyLoader`. `lazy val` module-level bindings desugar to a cached getter. `lazy[list[T]]` return types emit generator functions instead of materialised lists.
+
+### Stubs and Python interop
+
+Typhon authors `.dty` stubs — Typhon-flavoured signatures for untyped third-party libraries. `.dty` is the source of truth, but it is **not** the interop format: every `.dty` is compiled to a standard PEP 561 `.pyi` stub during `tyc build` and written alongside the emitted `.py` (or into the package's stub directory when targeting a library build).
+
+Why both:
+
+- **`.dty`** keeps Typhon's stricter dialect: `T?`, `Result[T, E]`, sealed unions, interfaces, `unsafe` boundaries.
+- **`.pyi`** is what mypy, pyright, Pyrefly, ty, and IDEs already understand. Emitting `.pyi` means Typhon users do not pay an interop tax to consume Typhon-authored libraries from plain Python code.
+
+The emitter lowers Typhon-only forms back to typing-spec equivalents (`T?` → `T | None`, sealed unions → `Union[...]` with `Literal` tags where present, `Result[T, E]` → the runtime-helper classes referenced by their generated import path). Round-tripping is lossy in one direction by design: a `.pyi` consumed by Typhon does not automatically gain Typhon's stricter guarantees, and the checker treats incoming `.pyi` declarations as if they originated in an `unsafe` boundary unless an authored `.dty` overrides them.
+
+Drift between `.dty` and the runtime module it describes is caught by an in-tree port of mypy's `stubtest`: `tyc check --stubs` compares the compiled `.pyi` against the runtime symbols of the implementation module and reports missing names, signature drift, and constructor arity mismatches.
 
 ### Compile-time evaluation (`comptime`)
 
@@ -264,6 +318,21 @@ DB_URL: str = "postgresql://..."
 #### Extension methods
 
 `extend str: def to_slug() -> str: ...` emits a free function `str_to_slug(self: str) -> str` and rewrites call sites `"hello".to_slug()` as `str_to_slug("hello")` at emit time. No monkey-patching of built-ins. The checker resolves method lookup against in-scope `extend` blocks.
+
+### Purity inference and memoisation
+
+A function is **inferable as pure** only if every one of the following holds:
+
+1. Synchronous. Coroutines, generators, and async generators are excluded — their results depend on scheduling and consumption order.
+2. All parameter types are hashable (primitives, frozen dataclasses, tuples of hashable types, sealed-union variants whose payloads are themselves hashable). Unhashable arguments would break dictionary-based caches.
+3. No I/O calls in the transitive call graph: no `open`, no `socket`, no `subprocess`, no logger writes, no `print`, no DB drivers. The checker maintains a small allow-list and treats `unsafe`/stubbed calls as impure unless the stub itself is annotated `@pure`.
+4. No reads from non-deterministic clocks or entropy sources (`time.time`, `time.monotonic`, `random.*`, `secrets.*`, `uuid.uuid4`, `os.urandom`).
+5. No reads from or writes to mutable module-level state. Reads from `comptime val` bindings are fine; reads from a `var` module binding are not.
+6. No exceptions raised through the function in the inferred return paths — pure functions return `Result[T, E]` if they need to express failure.
+
+When all six hold, the analyser may emit `@functools.cache` (unbounded) or `@functools.lru_cache(maxsize=N)` (bounded) at the user's preference, defaulting to `lru_cache(maxsize=1024)`. Caches are emitted only at the user's opt-in: a `@memo` attribute, a `[strictness] auto-memoise = true` toggle, or an explicit `@pure(memo=True)` annotation. The checker does not silently insert caches; if it could, it would also be silently extending the lifetime of every cached argument and return value.
+
+Marking a function `@pure` manually that fails any of the six conditions is a hard error, not a warning.
 
 ## Type checker depth and approach
 
@@ -355,7 +424,7 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ### Phase 2 — Class and value features (months 6–8)
 
-- Class emission as `@dataclass(slots=True)`; the `model` keyword for Pydantic.
+- Class emission as `@dataclass(slots=True)`; the `model` keyword for Pydantic with `extra='forbid'` injected by default.
 - Sealed unions and exhaustive `match`. (This is high-value and mechanically simple — front-load it.)
 - `Result[T, E]` type and the `?` operator; `with`-chains.
 - Comptime constants with `env()` lookup. Build fails on missing required env.
@@ -363,13 +432,16 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ### Phase 3 — Structural typing and advanced features (months 9–12)
 
-- Generics (angle-bracket syntax, bidirectional inference, type erasure at emit).
-- Interface declarations and structural subtyping with memoised relation cache.
-- Pure-function detection (conservative syntactic check) and `@functools.cache` emission.
-- Explicit `gather` block for `asyncio.gather`.
-- Lazy imports and `lazy val`.
+- **Generics syntax decision locked** (angle brackets vs PEP 695 — see *Open questions*). Implementation follows.
+- Generics: bidirectional inference, type erasure at emit.
+- Interface declarations and structural subtyping with memoised relation cache. `is`/`isinstance` against an interface is rejected unless explicitly opted into.
+- `unsafe` block semantics: lexical regions with an `Unsafe[T]` boundary marker (see No-implicit-`Any`).
+- Pure-function detection bound to the six-condition rule (sync, hashable args, no I/O, no entropy/clocks, no mutable module state, no exceptions). `@functools.cache` / `lru_cache` emission only with an explicit opt-in.
+- `gather` block, lowered to `asyncio.TaskGroup` by default. `gather(strategy="best-effort"):` for the `asyncio.gather(..., return_exceptions=True)` shape.
+- `go` lowered through `typhon_runtime.tasks.spawn` with a strong-ref registry.
+- Lazy imports (`lazy import np = numpy` only — `lazy from x import a, b` is rejected because it defeats deferral) and `lazy val` (cached getter for module-level, `cached_property` for instance-level on effectively immutable objects).
 - Pipe operator, guards, extension methods.
-- `.dty` stub files and `unsafe` blocks for untyped library interop.
+- `.dty` stub files, `.pyi` interop emission, and `tyc check --stubs` (stubtest port).
 
 At the end of Phase 3 — roughly month twelve — Typhon is useful for a real backend or CLI project. Everything beyond is polish and ambition.
 
@@ -394,6 +466,12 @@ At the end of Phase 3 — roughly month twelve — Typhon is useful for a real b
 | Pydantic coupling alienates users | Medium | Default emit is `@dataclass`, not `BaseModel`. Pydantic is opt-in via `model`. |
 | Pre-emptive runtime helpers force a Typhon package on users | Medium | Emit `typhon_runtime/` as generated source the build owns; no PyPI package required. |
 | Solo developer burnout on a multi-year project | High | Cut scope aggressively. The minimum-viable Typhon is non-null types + sealed unions + `Result` + dataclass emit. That alone is publishable. |
+| Generics syntax choice locks parser fork shape | High | Decide angle brackets vs PEP 695 before Phase 3 begins; the cost grows with every checker change after that point. |
+| `go` tasks GC'd mid-flight (weak refs in event loop) | Medium | Lower `go` through `typhon_runtime.tasks.spawn`, never to a bare `asyncio.create_task`. Strong-ref registry with done-callback cleanup. |
+| `asyncio.gather` exception semantics surprise users | Medium | Default `gather` block lowers to `TaskGroup` (cancels siblings on first failure). Reserve `gather(strategy="best-effort")` for the legacy `gather(...)` behaviour. |
+| Pydantic's default `extra='ignore'` silently drops input | Medium | `model` emission injects `extra='forbid'` by default. Permissive modes are opt-in via `typhon.toml`. |
+| `.pyi` interop drift from `.dty` source | Medium | `tyc check --stubs` runs an in-tree `stubtest` port against runtime modules; CI gates on it. |
+| Auto-memoisation extends object lifetimes invisibly | Medium | Never silently insert `@functools.cache`. Require `@memo`, `@pure(memo=True)`, or an explicit project-wide opt-in; six purity conditions must hold. |
 
 ## Prior art worth studying
 
@@ -403,6 +481,40 @@ At the end of Phase 3 — roughly month twelve — Typhon is useful for a real b
 - **oxc**: Rust-based JavaScript toolchain. Workspace layout (`oxc_parser`, `oxc_semantic`, `oxc_linter`, `oxc_formatter`, `oxlint` binary) is the template for `tyc`.
 - **Mojo**: cautionary tale. Pitched as a "Python superset," then walked back. Lesson: be honest about what subset of Python `.ty` accepts and emit a clean error for the rest.
 - **Cython, Coconut, Hy**: older Python supersets. Useful for emission patterns; none built on modern Rust tooling.
+
+## Open questions
+
+These are decisions deferred but consequential enough to record. Each must be resolved before the relevant phase begins.
+
+### Generics syntax — angle brackets vs PEP 695 (decide before Phase 3)
+
+Current spec uses `def f<T>(x: T)`. PEP 695 ships `def f[T](x: T)` natively in Python 3.12+, with `type Vector[T: float] = ...` for aliases. The trade-off:
+
+| | Angle brackets `<T>` | PEP 695 brackets `[T]` |
+|---|---|---|
+| Parser fork cost | Higher: ambiguous with comparison operators, needs lookahead | Lower: aligns with Python's own grammar |
+| Lowering cost | Heavier rewrite into `[T]` / `TypeVar` shapes | Near-zero — emit the same brackets |
+| Aesthetics | TypeScript / Rust kinship | Python-native |
+| Long-term divergence from CPython grammar | Grows with every Python release | Stays close |
+| User learning curve | Familiar to TS/Rust users | Familiar to Python users |
+
+The pragmatic choice is PEP 695. The aesthetic choice is angle brackets. A decision is required before structural-typing work begins because both the parser and the emitter touch generics; switching afterward is expensive.
+
+### `unsafe` granularity — block, expression, or both
+
+The spec defines `unsafe` as a lexical block. A per-expression `unsafe expr` form would let users sprinkle dynamism more narrowly, at the cost of a noisier surface. Stick with blocks for v1; revisit if real codebases show a pattern of `unsafe { single_call() }`.
+
+### `Result[T, E]` versus exceptions at the Typhon/Python boundary
+
+Inside Typhon, `Result` is the preferred error channel. At the boundary with Python, two policies are possible: (a) Python exceptions raised by called code propagate through Typhon as exceptions, and the user catches with `try/except`; (b) the boundary catches all exceptions and lifts them into `Result[T, Exception]`. Option (a) wins for stack-trace clarity and Python-ecosystem fidelity; option (b) wins for purity of the error model. Default to (a), keep (b) as an explicit `unsafe.lift` form.
+
+### Pydantic default — boundary types only, or every model
+
+`model` is opt-in via keyword. The question is whether Typhon's standard library and stub set should *prefer* `model` for boundary types (HTTP, DB rows, CLI args) by convention, or stay agnostic. Recommendation: ship example projects and stubs that use `model` only where validation matters; do not encode this as a checker rule.
+
+### Async public APIs when internals infer async
+
+If Phase 4+ ever introduces async inference, public API stability requires that an inferred-async function does not silently change colour on Python consumers. Likely answer: inference applies to file-internal functions only; exported functions are always explicit. Record formally when async inference work begins.
 
 ## Naming
 

@@ -23,7 +23,7 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Phase 2 — Class and value features (months 6–8)
 
-- Class emission as `@dataclass(slots=True)`; the `model` keyword for Pydantic.
+- Class emission as `@dataclass(slots=True)`; the `model` keyword for Pydantic, with `extra='forbid'` injected by default (override via `[emit] model-extra`).
 - Sealed unions and exhaustive `match`. (High-value and mechanically simple — front-load it.)
 - `Result[T, E]` type and the `?` operator; `with`-chains.
 - Comptime constants with `env()` lookup. Build fails on missing required env.
@@ -31,13 +31,16 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Phase 3 — Structural typing and advanced features (months 9–12)
 
-- Generics (angle-bracket syntax, bidirectional inference, type erasure at emit).
-- Interface declarations and structural subtyping with memoised relation cache.
-- Pure-function detection (conservative syntactic check) and `@functools.cache` emission.
-- Explicit `gather` block for `asyncio.gather`.
-- Lazy imports and `lazy val`.
+- **Generics syntax decision locked** (angle brackets vs PEP 695). See *Open questions* in [long-term-plan.md](long-term-plan.md). Implementation follows the decision.
+- Generics: bidirectional inference, type erasure at emit.
+- Interface declarations and structural subtyping with memoised relation cache. `is`/`isinstance` against an interface is rejected unless explicitly opted into — `@runtime_checkable` only validates attribute presence, not signatures.
+- `unsafe` block semantics: lexical regions with an `Unsafe[T]` boundary marker the checker enforces at every region boundary.
+- Pure-function detection bound to the six-condition rule (sync, hashable args, no I/O, no entropy/clocks, no mutable module state, no exceptions). `@functools.cache` / `lru_cache` emission **only** under explicit opt-in (`@memo`, `@pure(memo=True)`, or `[strictness] auto-memoise = true`).
+- `gather` block lowered to `asyncio.TaskGroup` by default (cancels siblings on first failure). `gather(strategy="best-effort"):` for `asyncio.gather(..., return_exceptions=True)`.
+- `go` lowered through `typhon_runtime.tasks.spawn` with a strong-ref registry — never to a bare `asyncio.create_task`.
+- Lazy imports — `lazy import np = numpy` only; `lazy from x import a, b` is rejected because it defeats deferral. Module-level `lazy val` uses a sentinel + lock helper, instance-level uses `cached_property`.
 - Pipe operator, guards, extension methods.
-- `.dty` stub files and `unsafe` blocks for untyped library interop.
+- `.dty` stub files **and** `.pyi` interop emission; `tyc check --stubs` ports mypy's `stubtest` for drift detection. `unsafe` blocks for untyped library interop.
 
 At the end of Phase 3 — roughly month twelve — Typhon is useful for a real backend or CLI project. Everything beyond is polish and ambition.
 
