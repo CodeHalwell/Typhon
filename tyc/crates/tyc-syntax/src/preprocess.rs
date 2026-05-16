@@ -297,7 +297,14 @@ fn make_model_class_line(after_model: &str) -> Option<String> {
                                           // If `name` already ends with `)` it has existing bases — merge BaseModel
                                           // into the list.  Otherwise wrap with `(BaseModel)`.
     let new_name = if let Some(stripped) = name.strip_suffix(')') {
-        format!("{stripped}, BaseModel)")
+        // If the class had an empty base list `()`, stripped ends with `(`
+        // and we must not emit the separating `, `.
+        let trimmed = stripped.trim_end();
+        if trimmed.ends_with('(') {
+            format!("{trimmed}BaseModel)")
+        } else {
+            format!("{trimmed}, BaseModel)")
+        }
     } else {
         format!("{}(BaseModel)", name)
     };
@@ -982,7 +989,7 @@ fn scan_line_code_end(line: &str, in_string: &mut Option<StringMode>) -> usize {
 fn find_assignment_eq(s: &str) -> Option<usize> {
     let mut depth = 0i32;
     let mut in_str: Option<char> = None;
-    let chars = s.char_indices().peekable();
+    let chars = s.char_indices();
 
     for (i, c) in chars {
         if let Some(q) = in_str {

@@ -76,10 +76,14 @@ pub fn desugar_module(module: &Mod<TextRange>) -> DesugarOutput {
             // `Ok`/`Err`/`Result` into scope, so we also still inject.
             let inject_result_import = has_result_usage && !import_covers_all;
 
-            // Inject `from pydantic import BaseModel` when any class inherits
-            // from BaseModel (produced by the `model` keyword preprocessor).
+            // Inject pydantic imports for any class that inherits from BaseModel
+            // (produced by the `model` keyword preprocessor).  Track BaseModel and
+            // ConfigDict independently: a module that already has
+            // `from pydantic import BaseModel` still needs `ConfigDict` imported
+            // because the desugarer injects `model_config = ConfigDict(extra="forbid")`.
             let needs_pydantic = stmts_use_basemodel(&desugared_mod.body);
-            let inject_pydantic = needs_pydantic && !has_pydantic_import(&desugared_mod.body);
+            let inject_basemodel = needs_pydantic && !has_pydantic_import(&desugared_mod.body);
+            let inject_config_dict = needs_pydantic && !has_config_dict_import(&desugared_mod.body);
 
             let mut body = desugared_mod.body;
             let insert_at = import_insert_pos(&body);
@@ -89,8 +93,14 @@ pub fn desugar_module(module: &Mod<TextRange>) -> DesugarOutput {
             if inject_result_import {
                 body.insert(insert_at, make_typhon_runtime_import());
             }
-            if inject_pydantic {
-                body.insert(insert_at, make_pydantic_basemodel_import());
+            // Emit the fewest imports possible: combine into one statement when
+            // both are needed, otherwise emit just the missing one.
+            if inject_basemodel && inject_config_dict {
+                body.insert(insert_at, make_pydantic_basemodel_import()); // includes both
+            } else if inject_basemodel {
+                body.insert(insert_at, make_pydantic_basemodel_only_import());
+            } else if inject_config_dict {
+                body.insert(insert_at, make_config_dict_only_import());
             }
 
             DesugarOutput {
@@ -485,7 +495,20 @@ fn desugar_stmt(stmt: &Stmt<TextRange>) -> (Stmt<TextRange>, bool) {
                     .insert(0, make_dataclasses_dot_dataclass_call());
             }
             if needs_model_config {
-                new_class.body.insert(0, make_model_config_stmt());
+                // Insert after a leading class docstring so that `__doc__` is
+                // preserved.  Python requires the docstring to be the first
+                // statement in the class body.
+                let insert_at = if let Some(Stmt::Expr(e)) = new_class.body.first() {
+                    if matches!(&*e.value, Expr::Constant(c) if matches!(c.value, Constant::Str(_)))
+                    {
+                        1
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+                new_class.body.insert(insert_at, make_model_config_stmt());
             }
             // Only propagate `true` when a dataclass decorator was added (or
             // was added deeper in the body) — that's the signal used by
@@ -638,6 +661,53 @@ fn make_pydantic_basemodel_import() -> Stmt<TextRange> {
             },
         ],
         level: None,
+    })
+}
+
+/// Build `from pydantic import BaseModel` (without ConfigDict).
+///
+/// Used when only BaseModel is missing — ConfigDict is already imported.
+fn make_pydantic_basemodel_only_import() -> Stmt<TextRange> {
+    Stmt::ImportFrom(StmtImportFrom {
+        range: TextRange::default(),
+        module: Some(Identifier::new("pydantic")),
+        names: vec![Alias {
+            range: TextRange::default(),
+            name: Identifier::new("BaseModel"),
+            asname: None,
+        }],
+        level: None,
+    })
+}
+
+/// Build `from pydantic import ConfigDict` (without BaseModel).
+///
+/// Used when a module already imports `BaseModel` explicitly but does not yet
+/// import `ConfigDict`, which is needed for the injected `model_config` statement.
+fn make_config_dict_only_import() -> Stmt<TextRange> {
+    Stmt::ImportFrom(StmtImportFrom {
+        range: TextRange::default(),
+        module: Some(Identifier::new("pydantic")),
+        names: vec![Alias {
+            range: TextRange::default(),
+            name: Identifier::new("ConfigDict"),
+            asname: None,
+        }],
+        level: None,
+    })
+}
+
+/// Return `true` if `body` already imports `ConfigDict` from `pydantic`.
+fn has_config_dict_import(body: &[Stmt<TextRange>]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::ImportFrom(imp) => {
+            imp.module.as_deref() == Some("pydantic")
+                && imp
+                    .names
+                    .iter()
+                    .any(|a| matches!(a.name.as_str(), "ConfigDict" | "*"))
+        }
+        _ => false,
     })
 }
 
@@ -1463,6 +1533,47 @@ mod tests {
         assert!(
             model_config_pos < id_pos,
             "model_config must precede field declarations\noutput:\n{out}"
+        );
+    }
+
+    #[test]
+    fn model_config_injected_after_class_docstring() {
+        // The docstring must remain the first statement; model_config follows it.
+        let src = "class ApiUser(BaseModel):\n    \"\"\"An API user.\"\"\"\n    id: int\n";
+        let out = parse_and_desugar(src);
+        let doc_pos = out.find("An API user").expect("docstring missing");
+        let config_pos = out.find("model_config").expect("model_config missing");
+        assert!(
+            doc_pos < config_pos,
+            "docstring must precede model_config\noutput:\n{out}"
+        );
+    }
+
+    #[test]
+    fn config_dict_injected_when_basemodel_already_imported() {
+        // Regression: if the user already has `from pydantic import BaseModel`,
+        // the desugarer must still ensure `ConfigDict` is in scope.
+        let src = "from pydantic import BaseModel\n\nclass ApiUser(BaseModel):\n    id: int\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("ConfigDict"),
+            "ConfigDict must be imported even when BaseModel is already present\noutput:\n{out}"
+        );
+        assert!(
+            out.contains("model_config = ConfigDict(extra=\"forbid\")"),
+            "model_config must still be injected\noutput:\n{out}"
+        );
+    }
+
+    #[test]
+    fn config_dict_not_duplicated_when_already_imported() {
+        let src = "from pydantic import BaseModel, ConfigDict\n\nclass ApiUser(BaseModel):\n    id: int\n";
+        let out = parse_and_desugar(src);
+        assert_eq!(
+            out.matches("ConfigDict").count(),
+            // "ConfigDict" appears in the import and in the model_config assignment
+            2,
+            "ConfigDict must not be imported a second time\noutput:\n{out}"
         );
     }
 }
