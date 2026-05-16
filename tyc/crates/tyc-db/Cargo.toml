@@ -2,6 +2,7 @@
 name = "tyc-db"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Salsa incremental database for the Typhon compiler"
 
 [dependencies]

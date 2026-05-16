@@ -21,7 +21,7 @@ use tyc_syntax::{
     parser::parse_module,
     preprocess::{
         expand_gather_blocks, expand_go_calls, expand_pipes, expand_question_ops,
-        expand_with_chains, postprocess, preprocess,
+        expand_with_chains, postprocess_full, preprocess,
     },
 };
 
@@ -66,8 +66,13 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
     //   • Expand tabs to 4 spaces.
     let normalised = normalise_whitespace(&prep.python_source);
 
-    // Step 4: post-process — restore val/var keywords and `?` sugar.
-    let output = postprocess(&normalised, &prep.stripped, &prep.optionals);
+    // Step 4: post-process — restore val/var keywords, `?` sugar, and lazy imports.
+    let output = postprocess_full(
+        &normalised,
+        &prep.stripped,
+        &prep.optionals,
+        &prep.lazy_imports,
+    );
 
     let changed = output != source;
     Ok(FormatResult { output, changed })
@@ -251,6 +256,17 @@ def run() -> Result[int, str]:
         assert!(
             result.output.contains("else err:"),
             "got:\n{}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn format_accepts_lazy_import() {
+        let src = "lazy import np = numpy\n\nx = np.array([1, 2, 3])\n";
+        let result = format_source(src, "<test>").unwrap();
+        assert!(
+            result.output.contains("lazy import np = numpy"),
+            "lazy import must be preserved by formatter, got:\n{}",
             result.output
         );
     }

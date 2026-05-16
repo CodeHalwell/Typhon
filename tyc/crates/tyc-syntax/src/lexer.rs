@@ -4,8 +4,8 @@
 //! Phase 2 adds `model` (Pydantic class emission) and `comptime` (build-time
 //! constant evaluation).
 //! Phase 3 adds `impl`, `extend`, `interface`, `unsafe`, `gather`, `go`, and
-//! `lazy` for extension methods, structural typing, dynamism boundaries, and
-//! concurrency primitives.
+//! `lazy` for extension methods, structural typing, dynamism boundaries,
+//! concurrency primitives, and deferred module loading.
 //! These are recognised here and stripped (pre-processed) before the
 //! underlying Python parser sees them, so the existing Python parser can
 //! handle the remainder of the grammar unchanged.
@@ -42,7 +42,8 @@ pub enum TyphonKeyword {
     Gather,
     /// `go` — spawns a background task via `typhon_runtime.tasks.spawn(...)`.
     Go,
-    /// `lazy` — defers an `import` or a `val` binding until first use.
+    /// `lazy` — prefix for `lazy import X = module`; the module is loaded on
+    /// first attribute access rather than at import time.
     Lazy,
 }
 

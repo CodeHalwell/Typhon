@@ -19,8 +19,8 @@ use tyc_diagnostics::Diagnostics;
 use tyc_emit::{emit, emit_stub};
 use tyc_format::format_source;
 use tyc_syntax::preprocess::{
-    expand_gather_blocks, expand_go_calls, expand_pipes, expand_question_ops, expand_with_chains,
-    preprocess,
+    expand_gather_blocks, expand_go_calls, expand_lazy_imports, expand_pipes, expand_question_ops,
+    expand_with_chains, preprocess,
 };
 
 use crate::commands::util::{apply_strictness, collect_dty_files, collect_ty_files};
@@ -159,8 +159,12 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // After this the Python parser only sees standard Python plus the
         // Typhon line-prefix keywords (`val`/`var`/`model`/`impl`/`extend`/
         // `interface`/`unsafe`/`comptime`/`lazy`) stripped by `preprocess`.
+        //
+        // Note `expand_lazy_imports` runs first so that `lazy import` lines
+        // become a full inline proxy class before the other sugar passes see
+        // them.
         let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
-            &expand_gather_blocks(source),
+            &expand_gather_blocks(&expand_lazy_imports(source)),
         ))));
         let prep = preprocess(&expanded);
 
@@ -525,3 +529,99 @@ def lazy_val(factory: Callable[[], _T]) -> _T:
     # Cast for the type checker; behaviour-wise the proxy forwards everything.
     return _LazyValue(factory)  # type: ignore[return-value]
 ";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Scaffold a minimal project under `dir` and return the src and build paths.
+    fn scaffold(
+        dir: &std::path::Path,
+        src_content: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let src_dir = dir.join("src");
+        let out_dir = dir.join("build");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(
+            dir.join("typhon.toml"),
+            "[project]\nname = \"test\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+             [python]\ntarget = \"3.13\"\n[emit]\nformat = false\n[strictness]\n[env]\n",
+        )
+        .unwrap();
+        std::fs::write(src_dir.join("main.ty"), src_content).unwrap();
+        (src_dir, out_dir)
+    }
+
+    #[test]
+    fn build_produces_py_file_from_simple_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, out_dir) = scaffold(tmp.path(), "val greeting: str = \"hello\"\n");
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        })
+        .unwrap();
+        assert!(
+            out_dir.join("main.py").exists(),
+            "main.py should be emitted"
+        );
+    }
+
+    #[test]
+    fn build_out_flag_overrides_config_out_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        scaffold(tmp.path(), "val x: int = 42\n");
+        let custom_out = tmp.path().join("custom_out");
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: Some(custom_out.clone()),
+            no_format: true,
+        })
+        .unwrap();
+        assert!(
+            custom_out.join("main.py").exists(),
+            "output should go to custom_out/"
+        );
+    }
+
+    #[test]
+    fn build_fails_on_type_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        scaffold(tmp.path(), "val x: int = \"wrong type\"\n");
+        let result = run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        });
+        assert!(result.is_err(), "build should fail on type mismatch");
+    }
+
+    #[test]
+    fn build_emits_typhon_runtime_when_result_used() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, out_dir) = scaffold(tmp.path(), "def f() -> Ok[int]:\n    return Ok(1)\n");
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        })
+        .unwrap();
+        // Phase 3 made `typhon_runtime` a package (with submodules `tasks`
+        // and `lazy`) rather than a single file. The `__init__.py` is the
+        // entry point that still re-exports `Ok` / `Err` / `Result`.
+        let pkg = out_dir.join("typhon_runtime");
+        assert!(
+            pkg.join("__init__.py").exists(),
+            "typhon_runtime/__init__.py should be emitted when Ok/Err are used"
+        );
+        assert!(
+            pkg.join("tasks.py").exists(),
+            "typhon_runtime/tasks.py should be emitted alongside the package"
+        );
+        assert!(
+            pkg.join("lazy.py").exists(),
+            "typhon_runtime/lazy.py should be emitted alongside the package"
+        );
+    }
+}

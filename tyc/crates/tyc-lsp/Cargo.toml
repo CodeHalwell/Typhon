@@ -2,6 +2,7 @@
 name = "tyc-lsp"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Language Server Protocol backend for Typhon (Phase 2+)"
 
 [dependencies]

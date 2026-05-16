@@ -2,6 +2,7 @@
 name = "tyc-types"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Nominal and structural type checker for Typhon"
 
 [dependencies]

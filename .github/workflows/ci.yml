@@ -45,3 +45,15 @@ jobs:
 
       - name: Tests
         run: cargo test --workspace
+
+  security:
+    name: Security audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependency audit (advisories + licences + bans)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: tyc/Cargo.toml

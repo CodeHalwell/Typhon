@@ -947,15 +947,21 @@ fn desugar_stmt(stmt: &Stmt<TextRange>) -> (Stmt<TextRange>, bool) {
             // that will be merged into their target class by `merge_impl_blocks`;
             // they must not receive a dataclass decorator.
             let is_impl_stub = c.name.as_str().starts_with("__typhon_impl_");
+            // `lazy import` lowers to a `__TyphonLazy_*` proxy class with its
+            // own `__slots__` and `__init__`; decorating it as a dataclass
+            // would rewrite those and break the proxy.
+            let is_lazy_proxy = c.name.as_str().starts_with("__TyphonLazy_");
             // `interface` lowers to `class X(Protocol):` — Protocols are not
             // dataclasses (the runtime Protocol behaviour conflicts with
             // dataclass field collection).
             let is_protocol = class_inherits_protocol(c);
-            // Skip the dataclass decorator for Pydantic model classes and
-            // Protocol classes; they already carry the right base class.
+            // Skip the dataclass decorator for Pydantic model classes,
+            // Protocol classes, and lazy proxies; they already carry the
+            // right shape.
             let needs_decorator = !is_pydantic
                 && !is_protocol
                 && !is_impl_stub
+                && !is_lazy_proxy
                 && !has_dataclass_decorator(&c.decorator_list);
             // Pydantic `model` classes must have `model_config = ConfigDict(extra="forbid")`
             // as their first body statement unless the user already defined it.

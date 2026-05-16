@@ -77,3 +77,64 @@ pub fn run(args: FmtArgs) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_ty(dir: &std::path::Path, name: &str, content: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn fmt_passes_on_already_formatted_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_ty(tmp.path(), "a.ty", "val x: int = 1\n");
+        let args = FmtArgs {
+            paths: vec![tmp.path().to_path_buf()],
+            check: false,
+        };
+        run(args).unwrap();
+    }
+
+    #[test]
+    fn fmt_normalises_tab_indentation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_ty(tmp.path(), "b.ty", "def f():\n\tpass\n");
+        let args = FmtArgs {
+            paths: vec![path.clone()],
+            check: false,
+        };
+        run(args).unwrap();
+        let result = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            result.contains("    pass"),
+            "tabs should be replaced by spaces"
+        );
+    }
+
+    #[test]
+    fn fmt_check_mode_detects_unformatted_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_ty(tmp.path(), "c.ty", "def f():\n\tpass\n");
+        let args = FmtArgs {
+            paths: vec![tmp.path().to_path_buf()],
+            check: true,
+        };
+        // check mode should report an error because the file would be changed
+        assert!(run(args).is_err());
+    }
+
+    #[test]
+    fn fmt_check_mode_passes_on_already_formatted_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_ty(tmp.path(), "d.ty", "val x: int = 1\n");
+        let args = FmtArgs {
+            paths: vec![tmp.path().to_path_buf()],
+            check: true,
+        };
+        run(args).unwrap();
+    }
+}
