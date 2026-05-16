@@ -14,9 +14,9 @@ Typhon stands on a lot of shoulders. These are the languages and tools to study 
 
 - **rust-analyzer** — cleanest example of a Salsa-based incremental compiler with an LSP. Crate layering directly transferable.
 - **ty and Pyrefly** — Rust-based Python type checkers (Astral and Meta respectively). Both shipped in 2025; both architectural references for Typhon's checker. `ty` may be embedded as a library to handle standard typing-spec checking.
-- **oxc** — Rust-based JavaScript toolchain. Workspace layout (`oxc_parser`, `oxc_semantic`, `oxc_linter`, `oxc_formatter`, `oxlint` binary) is the template for `ttc`.
+- **oxc** — Rust-based JavaScript toolchain. Workspace layout (`oxc_parser`, `oxc_semantic`, `oxc_linter`, `oxc_formatter`, `oxlint` binary) is the template for `tyc`.
 - **Ruff** — Astral's Python linter/formatter. Source of `ruff_python_parser`, `ruff_python_ast`, `ruff_python_codegen`, `ruff_python_formatter`, all vendored.
 
 ## Naming
 
-The project ships as **Typhon**. The name keeps phonetic kinship with Python without sounding like a portmanteau, and the mythology lines up (Typhon is the serpent-monster of Hesiod, sometimes treated as the father of Python). The binary is `ttc`, the file extension is `.ty`, the stub extension is `.dty`, the config file is `typhon.toml`.
+The project ships as **Typhon**. The name keeps phonetic kinship with Python without sounding like a portmanteau, and the mythology lines up (Typhon is the serpent-monster of Hesiod, sometimes treated as the father of Python). The binary is `tyc`, the file extension is `.ty`, the stub extension is `.dty`, the config file is `typhon.toml`.

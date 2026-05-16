@@ -143,7 +143,7 @@ When `typhon.toml` sets `free-threaded = true`, the analyser emits `ThreadPoolEx
 
 ## Compile-time evaluation (`comptime`)
 
-`comptime` bindings are evaluated by `ttc` at compile time in a sandboxed interpreter that supports pure arithmetic, string operations, environment-variable lookup via `env(name, default?)`, simple container construction, and calls to other `comptime` functions. Results are inlined as literals.
+`comptime` bindings are evaluated by `tyc` at compile time in a sandboxed interpreter that supports pure arithmetic, string operations, environment-variable lookup via `env(name, default?)`, simple container construction, and calls to other `comptime` functions. Results are inlined as literals.
 
 Build-time env validation alone is worth shipping.
 

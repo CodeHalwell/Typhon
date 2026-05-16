@@ -4,7 +4,7 @@
 
 ## Executive summary
 
-Typhon is a statically-typed, stricter superset of Python that compiles to clean, readable CPython 3.13+ code with no runtime dependency on the toolchain. Every `.ty` file emits valid, idiomatic `.py`; not all `.py` is valid Typhon. The compiler and language server live in a single Rust binary called `ttc`.
+Typhon is a statically-typed, stricter superset of Python that compiles to clean, readable CPython 3.13+ code with no runtime dependency on the toolchain. Every `.ty` file emits valid, idiomatic `.py`; not all `.py` is valid Typhon. The compiler and language server live in a single Rust binary called `tyc`.
 
 The architecture is a classical multi-stage transpiler: parser, type checker, analyser, desugarer, emitter, plus an embedded LSP. It piggy-backs on the modern Rust-Python ecosystem (Ruff for parsing and codegen, Salsa for incremental computation, ty and Pyrefly as architectural references, Pydantic v2 as an opt-in emit target, free-threaded Python 3.13t/3.14t for the parallelism story).
 
@@ -17,7 +17,7 @@ The risk in the project is not technological. Every individual stage has a matur
 - **Static safety**: non-nullable by default, no implicit `Any`, explicit error handling via `Result[T, E]`.
 - **Modern ergonomics**: `val`/`var`, interfaces, sealed unions with exhaustive matching, guards, pipes, comptime, lazy loading.
 - **Clean compilation** to standard Python with no runtime dependency on Typhon-specific machinery.
-- **First-class tooling**: a single `ttc` binary that builds, checks, formats, and runs as an LSP, with sub-100 ms incremental feedback in the editor.
+- **First-class tooling**: a single `tyc` binary that builds, checks, formats, and runs as an LSP, with sub-100 ms incremental feedback in the editor.
 - **Honest interop** with existing Python via `.dty` stubs and explicit `unsafe` regions.
 
 ### Non-goals
@@ -29,7 +29,7 @@ The risk in the project is not technological. Every individual stage has a matur
 
 ## Architecture
 
-The `ttc` binary is a multi-stage compiler with an embedded LSP, structured as a Cargo workspace of small crates that mirror the pipeline stages. Each stage produces a typed Rust value that the next stage consumes; analysis results are stored as Salsa queries so the LSP can reuse them incrementally.
+The `tyc` binary is a multi-stage compiler with an embedded LSP, structured as a Cargo workspace of small crates that mirror the pipeline stages. Each stage produces a typed Rust value that the next stage consumes; analysis results are stored as Salsa queries so the LSP can reuse them incrementally.
 
 ### Pipeline
 
@@ -61,20 +61,20 @@ The `ttc` binary is a multi-stage compiler with an embedded LSP, structured as a
 ### Workspace layout
 
 ```
-ttc/
+tyc/
 ├── Cargo.toml                  (workspace root)
 ├── crates/
-│   ├── ttc-syntax/             forked ruff_python_ast + parser, Typhon nodes
-│   ├── ttc-db/                 Salsa database, input/tracked queries
-│   ├── ttc-resolve/            name resolution, imports, val/var
-│   ├── ttc-types/              structural + nominal type checker
-│   ├── ttc-analyse/            purity, async-gather, comptime, DCE
-│   ├── ttc-desugar/            Typhon AST → Python AST lowering
-│   ├── ttc-emit/               Python codegen via vendored ruff_python_codegen
-│   ├── ttc-format/             post-process emitter output through ruff format
-│   ├── ttc-diagnostics/        miette-based diagnostic rendering
-│   ├── ttc-lsp/                tower-lsp-server Backend over ttc-db
-│   └── ttc/                    thin CLI binary, clap subcommands
+│   ├── tyc-syntax/             forked ruff_python_ast + parser, Typhon nodes
+│   ├── tyc-db/                 Salsa database, input/tracked queries
+│   ├── tyc-resolve/            name resolution, imports, val/var
+│   ├── tyc-types/              structural + nominal type checker
+│   ├── tyc-analyse/            purity, async-gather, comptime, DCE
+│   ├── tyc-desugar/            Typhon AST → Python AST lowering
+│   ├── tyc-emit/               Python codegen via vendored ruff_python_codegen
+│   ├── tyc-format/             post-process emitter output through ruff format
+│   ├── tyc-diagnostics/        miette-based diagnostic rendering
+│   ├── tyc-lsp/                tower-lsp-server Backend over tyc-db
+│   └── tyc/                    thin CLI binary, clap subcommands
 └── vendor/
     ├── ruff_python_ast/        forked from Ruff monorepo
     ├── ruff_python_parser/     forked and extended with Typhon tokens
@@ -237,7 +237,7 @@ Python 3.13 ships an experimental free-threaded build; 3.14 (Phase II) makes it 
 
 ### Compile-time evaluation (`comptime`)
 
-A `comptime` binding or expression is evaluated by `ttc` at compile time inside a sandboxed interpreter that supports pure arithmetic, string operations, environment-variable lookup via `env(name, default?)`, simple container construction, and calls to other `comptime` functions. The result is inlined as a literal in the emitted Python. Anything outside the allowed set is a compile error.
+A `comptime` binding or expression is evaluated by `tyc` at compile time inside a sandboxed interpreter that supports pure arithmetic, string operations, environment-variable lookup via `env(name, default?)`, simple container construction, and calls to other `comptime` functions. The result is inlined as a literal in the emitted Python. Anything outside the allowed set is a compile error.
 
 This is the highest-leverage feature in the spec. Build-time env validation alone is worth shipping. Push it earlier in the roadmap than instinct suggests.
 
@@ -287,9 +287,9 @@ Express each analysis as a Salsa query: `parse(file)`, `resolve(module)`, `infer
 
 ## Code emission
 
-The pipeline is: Typhon AST → desugar to plain Python AST (using the same `ruff_python_ast` node types as the parser produces) → `ruff_python_codegen` for source generation → `ruff_python_formatter` for Black-style reflow. The emitted file carries a generated-header comment (`# generated by ttc — do not edit`).
+The pipeline is: Typhon AST → desugar to plain Python AST (using the same `ruff_python_ast` node types as the parser produces) → `ruff_python_codegen` for source generation → `ruff_python_formatter` for Black-style reflow. The emitted file carries a generated-header comment (`# generated by tyc — do not edit`).
 
-Source maps mapping `.py` line and column back to `.ty` are written as a sidecar `.py.map` file, similar to TypeScript. The LSP uses these for go-to-definition across the boundary, and a planned `ttc trace` command can map a Python traceback back to Typhon source.
+Source maps mapping `.py` line and column back to `.ty` are written as a sidecar `.py.map` file, similar to TypeScript. The LSP uses these for go-to-definition across the boundary, and a planned `tyc trace` command can map a Python traceback back to Typhon source.
 
 There is deliberately no Typhon-specific runtime package the user must install. The handful of helpers needed (`Result`/`Ok`/`Err`, `lazy_import`, `str_to_slug`-style extension shims) are emitted inline into each project as a generated `typhon_runtime/` module the build owns. This keeps deployment exactly like deploying any other Python project.
 
@@ -299,13 +299,13 @@ Single binary, `clap` subcommands:
 
 | Command | Purpose |
 |---------|---------|
-| `ttc build` | Full pipeline: parse, check, analyse, desugar, emit, format. |
-| `ttc check` | Up to analyser, no emit. Used by CI. |
-| `ttc fmt` | Format `.ty` source. Wraps `ruff format` applied to a Typhon-aware pretty-printer. |
-| `ttc lsp` | Run as a Language Server. |
-| `ttc init` | Scaffold a new project: `typhon.toml`, `src/`, `tests/`. |
-| `ttc trace` | Map a Python traceback back to Typhon source via `.py.map` files. |
-| `ttc profile` | Instrument emitted code for hot-function detection (advanced, opt-in). |
+| `tyc build` | Full pipeline: parse, check, analyse, desugar, emit, format. |
+| `tyc check` | Up to analyser, no emit. Used by CI. |
+| `tyc fmt` | Format `.ty` source. Wraps `ruff format` applied to a Typhon-aware pretty-printer. |
+| `tyc lsp` | Run as a Language Server. |
+| `tyc init` | Scaffold a new project: `typhon.toml`, `src/`, `tests/`. |
+| `tyc trace` | Map a Python traceback back to Typhon source via `.py.map` files. |
+| `tyc profile` | Instrument emitted code for hot-function detection (advanced, opt-in). |
 
 ### `typhon.toml`
 
@@ -342,7 +342,7 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 - Fork `ruff_python_parser` and `ruff_python_ast` into `vendor/`.
 - Add one or two custom tokens (`val`, `var`) to confirm the fork-extend workflow.
 - Round-trip Python through the fork via `ruff_python_codegen`: parse → emit, verify byte-identical (modulo whitespace) on a corpus of real Python files.
-- `clap`-based `ttc` shell with `ttc fmt` working as the simplest end-to-end command.
+- `clap`-based `tyc` shell with `tyc fmt` working as the simplest end-to-end command.
 - `miette` + `thiserror` diagnostic infrastructure.
 
 ### Phase 1 — Core types (months 3–5)
@@ -351,7 +351,7 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 - Name resolution and scope construction; `val`/`var` enforcement (no types yet).
 - Nominal types: function signatures, assignment compatibility, primitive types, classes.
 - Non-nullable by default with flow narrowing on guards and `isinstance` checks.
-- `ttc check` produces useful "unknown name" and "type mismatch" diagnostics via `miette`.
+- `tyc check` produces useful "unknown name" and "type mismatch" diagnostics via `miette`.
 
 ### Phase 2 — Class and value features (months 6–8)
 
@@ -378,7 +378,7 @@ At the end of Phase 3 — roughly month twelve — Typhon is useful for a real b
 - Automatic `asyncio.gather` inference (the conservative version that fires only on `@pure` straight-line code).
 - Loop parallelisation for pure comprehensions on free-threaded Python.
 - Richer comptime: `comptime` functions, types as values.
-- PGO via `ttc profile`.
+- PGO via `tyc profile`.
 - LSP completions and code actions; go-to-definition across `.ty` and `.py` boundaries via source maps.
 - Migration tooling from typed `.py` to `.ty` (`Optional[T]` → `T?`, dataclasses → Typhon classes, etc.).
 
@@ -400,13 +400,13 @@ At the end of Phase 3 — roughly month twelve — Typhon is useful for a real b
 - **TypeScript**: closest analogue. Scanner → parser → binder → checker → emitter. The `checker.ts` file is the canonical reference for structural subtyping at scale.
 - **rust-analyzer**: the cleanest example of a Salsa-based incremental compiler with an LSP. Crate layering directly transferable.
 - **ty and Pyrefly**: Rust-based Python type checkers (Astral and Meta respectively). Both shipped in 2025; both architectural references for Typhon's checker.
-- **oxc**: Rust-based JavaScript toolchain. Workspace layout (`oxc_parser`, `oxc_semantic`, `oxc_linter`, `oxc_formatter`, `oxlint` binary) is the template for `ttc`.
+- **oxc**: Rust-based JavaScript toolchain. Workspace layout (`oxc_parser`, `oxc_semantic`, `oxc_linter`, `oxc_formatter`, `oxlint` binary) is the template for `tyc`.
 - **Mojo**: cautionary tale. Pitched as a "Python superset," then walked back. Lesson: be honest about what subset of Python `.ty` accepts and emit a clean error for the rest.
 - **Cython, Coconut, Hy**: older Python supersets. Useful for emission patterns; none built on modern Rust tooling.
 
 ## Naming
 
-The project ships as **Typhon**. The name keeps phonetic kinship with Python without sounding like a portmanteau, and the mythology lines up (Typhon is the serpent-monster of Hesiod, sometimes treated as the father of Python). The binary is `ttc`, the file extension is `.ty`, the stub extension is `.dty`, the config file is `typhon.toml`.
+The project ships as **Typhon**. The name keeps phonetic kinship with Python without sounding like a portmanteau, and the mythology lines up (Typhon is the serpent-monster of Hesiod, sometimes treated as the father of Python). The binary is `tyc`, the file extension is `.ty`, the stub extension is `.dty`, the config file is `typhon.toml`.
 
 Quick check before committing: search PyPI for any active "typhon" packages (a couple of dormant ones exist) and confirm none clash with documentation or import names.
 
@@ -417,7 +417,7 @@ Concrete next steps, in order:
 1. Set up the Cargo workspace skeleton with `crates/` and `vendor/` directories.
 2. Get parse → emit round-tripping a real Python file (e.g. one of Django's management commands) without losing anything.
 3. Add `val` and `var` as new keyword tokens. Confirm the fork-extend workflow is sustainable.
-4. Wire up `clap` with `ttc fmt` as the first working command.
+4. Wire up `clap` with `tyc fmt` as the first working command.
 5. Add `miette` for diagnostics. Now any future error has somewhere good-looking to go.
 
 That is roughly two months of work. Everything in this plan unfolds from those six steps.

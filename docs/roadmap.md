@@ -9,7 +9,7 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 - Fork `ruff_python_parser` and `ruff_python_ast` into `vendor/`.
 - Add one or two custom tokens (`val`, `var`) to confirm the fork-extend workflow.
 - Round-trip Python through the fork via `ruff_python_codegen`: parse → emit, verify byte-identical (modulo whitespace) on a corpus of real Python files.
-- `clap`-based `ttc` shell with `ttc fmt` working as the simplest end-to-end command.
+- `clap`-based `tyc` shell with `tyc fmt` working as the simplest end-to-end command.
 - `miette` + `thiserror` diagnostic infrastructure.
 
 ## Phase 1 — Core types (months 3–5) ✅ complete
@@ -19,7 +19,7 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 - `val` / `var` enforcement: reassigning a `val` is a hard error; top-level bindings default to `val`.
 - Nominal types: function signatures, assignment compatibility, primitive types, classes, generic containers.
 - Non-nullable by default with flow narrowing on `is None`, `is not None`, and `isinstance(x, T)` checks. `T?` is sugar for `T | None`.
-- `ttc check` emits useful "unknown name", "type mismatch", "nullable use", and "wrong argument count" diagnostics via `miette`.
+- `tyc check` emits useful "unknown name", "type mismatch", "nullable use", and "wrong argument count" diagnostics via `miette`.
 
 ## Phase 2 — Class and value features (months 6–8)
 
@@ -46,7 +46,7 @@ At the end of Phase 3 — roughly month twelve — Typhon is useful for a real b
 - Automatic `asyncio.gather` inference (conservative, `@pure` straight-line code only).
 - Loop parallelisation for pure comprehensions on free-threaded Python.
 - Richer comptime: `comptime` functions, types as values.
-- PGO via `ttc profile`.
+- PGO via `tyc profile`.
 - LSP completions and code actions; go-to-definition across `.ty` and `.py` boundaries via source maps.
 - Migration tooling from typed `.py` to `.ty` (`Optional[T]` → `T?`, dataclasses → Typhon classes, etc.).
 
@@ -61,7 +61,7 @@ In order:
 1. Set up the Cargo workspace skeleton with `crates/` and `vendor/` directories.
 2. Get parse → emit round-tripping a real Python file (e.g. one of Django's management commands) without losing anything.
 3. Add `val` and `var` as new keyword tokens. Confirm the fork-extend workflow is sustainable.
-4. Wire up `clap` with `ttc fmt` as the first working command.
+4. Wire up `clap` with `tyc fmt` as the first working command.
 5. Add `miette` for diagnostics. Now any future error has somewhere good-looking to go.
 
 Roughly two months of work. Everything in the plan unfolds from those steps.

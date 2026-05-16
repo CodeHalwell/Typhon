@@ -1,0 +1,14 @@
+[package]
+name = "tyc-db"
+version.workspace = true
+edition.workspace = true
+description = "Salsa incremental database for the Typhon compiler"
+
+[dependencies]
+salsa = { workspace = true }
+tyc-syntax = { workspace = true }
+tyc-diagnostics = { workspace = true }
+tyc-resolve = { workspace = true }
+tyc-types = { workspace = true }
+rustpython-parser = { workspace = true }
+rustpython-ast = { workspace = true }

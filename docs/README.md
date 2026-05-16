@@ -14,7 +14,7 @@ The sub-docs below are extracted from the long-term plan for easier navigation. 
 |-----|--------|
 | [architecture.md](architecture.md) | Compiler pipeline, crate layout, toolchain choices |
 | [language.md](language.md) | Type system, error handling, async, `val`/`var`, comptime, readability features |
-| [cli.md](cli.md) | The `ttc` binary and its subcommands |
+| [cli.md](cli.md) | The `tyc` binary and its subcommands |
 | [configuration.md](configuration.md) | `typhon.toml` reference |
 | [roadmap.md](roadmap.md) | Phased delivery plan |
 | [risks.md](risks.md) | Risks and mitigations |

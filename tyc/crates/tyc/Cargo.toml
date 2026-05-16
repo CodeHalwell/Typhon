@@ -1,0 +1,27 @@
+[package]
+name = "tyc"
+version.workspace = true
+edition.workspace = true
+description = "Typhon compiler and language server — single binary"
+
+[[bin]]
+name = "tyc"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+miette = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+
+tyc-syntax      = { workspace = true }
+tyc-diagnostics = { workspace = true }
+tyc-emit        = { workspace = true }
+tyc-format      = { workspace = true }
+tyc-db          = { workspace = true }
+tyc-resolve     = { workspace = true }
+tyc-types       = { workspace = true }
+tyc-analyse     = { workspace = true }
+tyc-desugar     = { workspace = true }
+tyc-lsp         = { workspace = true }

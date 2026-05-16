@@ -1,0 +1,12 @@
+[package]
+name = "tyc-emit"
+version.workspace = true
+edition.workspace = true
+description = "Python code emitter — lowers a plain Python AST to .py source text"
+
+[dependencies]
+rustpython-ast = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+rustpython-parser = { workspace = true }

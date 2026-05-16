@@ -1,0 +1,13 @@
+[package]
+name = "tyc-resolve"
+version.workspace = true
+edition.workspace = true
+description = "Name resolution and scope construction for Typhon"
+
+[dependencies]
+rustpython-ast = { workspace = true }
+tyc-syntax = { workspace = true }
+tyc-diagnostics = { workspace = true }
+
+[dev-dependencies]
+rustpython-parser = { workspace = true }

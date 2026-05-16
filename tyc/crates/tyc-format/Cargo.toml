@@ -1,0 +1,10 @@
+[package]
+name = "tyc-format"
+version.workspace = true
+edition.workspace = true
+description = "tyc fmt — Typhon-aware source formatter"
+
+[dependencies]
+tyc-syntax = { workspace = true }
+tyc-diagnostics = { workspace = true }
+thiserror = { workspace = true }
