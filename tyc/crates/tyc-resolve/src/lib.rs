@@ -422,7 +422,13 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt<TextRange>])
                     "def ",
                     f.name.as_str(),
                 );
-                r.declare(scope, f.name.as_str(), BindingKind::Function, Mutability::Var, span);
+                r.declare(
+                    scope,
+                    f.name.as_str(),
+                    BindingKind::Function,
+                    Mutability::Var,
+                    span,
+                );
             }
             Stmt::AsyncFunctionDef(f) => {
                 let span = find_def_name_span(
@@ -431,7 +437,13 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt<TextRange>])
                     "def ",
                     f.name.as_str(),
                 );
-                r.declare(scope, f.name.as_str(), BindingKind::Function, Mutability::Var, span);
+                r.declare(
+                    scope,
+                    f.name.as_str(),
+                    BindingKind::Function,
+                    Mutability::Var,
+                    span,
+                );
             }
             Stmt::ClassDef(c) => {
                 let span = find_def_name_span(
@@ -440,7 +452,13 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt<TextRange>])
                     "class ",
                     c.name.as_str(),
                 );
-                r.declare(scope, c.name.as_str(), BindingKind::Class, Mutability::Var, span);
+                r.declare(
+                    scope,
+                    c.name.as_str(),
+                    BindingKind::Class,
+                    Mutability::Var,
+                    span,
+                );
             }
             Stmt::Import(i) => {
                 for alias in &i.names {
@@ -461,7 +479,13 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt<TextRange>])
                         alias.range.start().to_usize(),
                         alias.range.start().to_usize() + bound_name.len(),
                     );
-                    r.declare(scope, &bound_name, BindingKind::Import, Mutability::Var, span);
+                    r.declare(
+                        scope,
+                        &bound_name,
+                        BindingKind::Import,
+                        Mutability::Var,
+                        span,
+                    );
                 }
             }
             Stmt::ImportFrom(i) => {
@@ -471,7 +495,13 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt<TextRange>])
                         alias.range.start().to_usize(),
                         alias.range.start().to_usize() + name.as_str().len(),
                     );
-                    r.declare(scope, name.as_str(), BindingKind::Import, Mutability::Var, span);
+                    r.declare(
+                        scope,
+                        name.as_str(),
+                        BindingKind::Import,
+                        Mutability::Var,
+                        span,
+                    );
                 }
             }
             _ => {}
@@ -479,12 +509,7 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt<TextRange>])
     }
 }
 
-fn declare_target(
-    r: &mut Resolver,
-    scope: ScopeId,
-    target: &Expr<TextRange>,
-    default_val: bool,
-) {
+fn declare_target(r: &mut Resolver, scope: ScopeId, target: &Expr<TextRange>, default_val: bool) {
     if let Expr::Name(n) = target {
         let line = r.line_of_offset(n.range.start().to_usize());
         let kw = r.keyword_for_line(line);
@@ -632,7 +657,13 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
                     n.range.start().to_usize(),
                     n.range.start().to_usize() + n.id.as_str().len(),
                 );
-                r.declare(scope, n.id.as_str(), BindingKind::Loop, Mutability::Var, span);
+                r.declare(
+                    scope,
+                    n.id.as_str(),
+                    BindingKind::Loop,
+                    Mutability::Var,
+                    span,
+                );
             }
             for s in &f.body {
                 walk_stmt(r, scope, s);
@@ -650,7 +681,13 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
                             n.range.start().to_usize(),
                             n.range.start().to_usize() + n.id.as_str().len(),
                         );
-                        r.declare(scope, n.id.as_str(), BindingKind::Loop, Mutability::Var, span);
+                        r.declare(
+                            scope,
+                            n.id.as_str(),
+                            BindingKind::Loop,
+                            Mutability::Var,
+                            span,
+                        );
                     }
                 }
             }
@@ -672,7 +709,13 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
                         h.range.start().to_usize(),
                         h.range.start().to_usize() + name.as_str().len(),
                     );
-                    r.declare(scope, name.as_str(), BindingKind::Loop, Mutability::Var, span);
+                    r.declare(
+                        scope,
+                        name.as_str(),
+                        BindingKind::Loop,
+                        Mutability::Var,
+                        span,
+                    );
                 }
                 for s in &h.body {
                     walk_stmt(r, scope, s);
@@ -762,7 +805,13 @@ fn walk_impl_method(r: &mut Resolver, cls_scope: ScopeId, stmt: &Stmt<TextRange>
             }
             let fn_scope = r.push_scope(ScopeKind::Function, cls_scope);
             // Pre-declare the implicit `self` the desugar pass will inject.
-            r.declare(fn_scope, "self", BindingKind::Parameter, Mutability::Var, (0, 0));
+            r.declare(
+                fn_scope,
+                "self",
+                BindingKind::Parameter,
+                Mutability::Var,
+                (0, 0),
+            );
             declare_arguments(r, fn_scope, &f.args);
             collect_top_level(r, fn_scope, &f.body);
             for s in &f.body {
@@ -778,7 +827,13 @@ fn walk_impl_method(r: &mut Resolver, cls_scope: ScopeId, stmt: &Stmt<TextRange>
                 walk_expr(r, cls_scope, ret);
             }
             let fn_scope = r.push_scope(ScopeKind::Function, cls_scope);
-            r.declare(fn_scope, "self", BindingKind::Parameter, Mutability::Var, (0, 0));
+            r.declare(
+                fn_scope,
+                "self",
+                BindingKind::Parameter,
+                Mutability::Var,
+                (0, 0),
+            );
             declare_arguments(r, fn_scope, &f.args);
             collect_top_level(r, fn_scope, &f.body);
             for s in &f.body {
@@ -817,14 +872,26 @@ fn declare_arguments(
             va.range.start().to_usize(),
             va.range.start().to_usize() + va.arg.as_str().len(),
         );
-        r.declare(scope, va.arg.as_str(), BindingKind::Parameter, Mutability::Var, span);
+        r.declare(
+            scope,
+            va.arg.as_str(),
+            BindingKind::Parameter,
+            Mutability::Var,
+            span,
+        );
     }
     if let Some(kw) = &args.kwarg {
         let span = (
             kw.range.start().to_usize(),
             kw.range.start().to_usize() + kw.arg.as_str().len(),
         );
-        r.declare(scope, kw.arg.as_str(), BindingKind::Parameter, Mutability::Var, span);
+        r.declare(
+            scope,
+            kw.arg.as_str(),
+            BindingKind::Parameter,
+            Mutability::Var,
+            span,
+        );
     }
 }
 
@@ -932,7 +999,13 @@ fn walk_expr(r: &mut Resolver, scope: ScopeId, expr: &Expr<TextRange>) {
                         n.range.start().to_usize(),
                         n.range.start().to_usize() + n.id.as_str().len(),
                     );
-                    r.declare(scope2, n.id.as_str(), BindingKind::Loop, Mutability::Var, span);
+                    r.declare(
+                        scope2,
+                        n.id.as_str(),
+                        BindingKind::Loop,
+                        Mutability::Var,
+                        span,
+                    );
                 }
                 for cond in &gen.ifs {
                     walk_expr(r, scope2, cond);
@@ -949,7 +1022,13 @@ fn walk_expr(r: &mut Resolver, scope: ScopeId, expr: &Expr<TextRange>) {
                     name.range.start().to_usize(),
                     name.range.start().to_usize() + name.id.as_str().len(),
                 );
-                r.declare(scope, name.id.as_str(), BindingKind::Value, Mutability::Var, span);
+                r.declare(
+                    scope,
+                    name.id.as_str(),
+                    BindingKind::Value,
+                    Mutability::Var,
+                    span,
+                );
             }
         }
     }
@@ -969,7 +1048,13 @@ fn walk_comp(
                 n.range.start().to_usize(),
                 n.range.start().to_usize() + n.id.as_str().len(),
             );
-            r.declare(scope2, n.id.as_str(), BindingKind::Loop, Mutability::Var, span);
+            r.declare(
+                scope2,
+                n.id.as_str(),
+                BindingKind::Loop,
+                Mutability::Var,
+                span,
+            );
         }
         for cond in &gen.ifs {
             walk_expr(r, scope2, cond);
@@ -984,40 +1069,159 @@ fn walk_comp(
 fn builtin_names() -> std::collections::HashSet<&'static str> {
     let names: &[&'static str] = &[
         // Built-in functions
-        "print", "len", "range", "abs", "min", "max", "sum", "any", "all",
-        "sorted", "reversed", "enumerate", "zip", "map", "filter", "isinstance",
-        "issubclass", "hasattr", "getattr", "setattr", "delattr", "iter", "next",
-        "repr", "id", "hash", "type", "vars", "dir", "callable", "input",
-        "open", "exit", "quit", "breakpoint", "format", "ord", "chr", "hex",
-        "oct", "bin", "round", "pow", "divmod", "globals", "locals", "eval",
-        "exec", "compile", "object", "super", "property", "classmethod",
-        "staticmethod", "frozenset",
+        "print",
+        "len",
+        "range",
+        "abs",
+        "min",
+        "max",
+        "sum",
+        "any",
+        "all",
+        "sorted",
+        "reversed",
+        "enumerate",
+        "zip",
+        "map",
+        "filter",
+        "isinstance",
+        "issubclass",
+        "hasattr",
+        "getattr",
+        "setattr",
+        "delattr",
+        "iter",
+        "next",
+        "repr",
+        "id",
+        "hash",
+        "type",
+        "vars",
+        "dir",
+        "callable",
+        "input",
+        "open",
+        "exit",
+        "quit",
+        "breakpoint",
+        "format",
+        "ord",
+        "chr",
+        "hex",
+        "oct",
+        "bin",
+        "round",
+        "pow",
+        "divmod",
+        "globals",
+        "locals",
+        "eval",
+        "exec",
+        "compile",
+        "object",
+        "super",
+        "property",
+        "classmethod",
+        "staticmethod",
+        "frozenset",
         // Built-in types
-        "int", "str", "bool", "float", "complex", "bytes", "bytearray", "memoryview",
-        "list", "tuple", "set", "dict", "type",
+        "int",
+        "str",
+        "bool",
+        "float",
+        "complex",
+        "bytes",
+        "bytearray",
+        "memoryview",
+        "list",
+        "tuple",
+        "set",
+        "dict",
+        "type",
         // Constants
-        "True", "False", "None", "Ellipsis", "NotImplemented",
-        "__name__", "__file__", "__doc__", "__builtins__", "__package__",
-        "__loader__", "__spec__", "__debug__",
+        "True",
+        "False",
+        "None",
+        "Ellipsis",
+        "NotImplemented",
+        "__name__",
+        "__file__",
+        "__doc__",
+        "__builtins__",
+        "__package__",
+        "__loader__",
+        "__spec__",
+        "__debug__",
         // Common exceptions
-        "Exception", "BaseException", "ValueError", "TypeError", "KeyError",
-        "IndexError", "AttributeError", "RuntimeError", "StopIteration",
-        "StopAsyncIteration", "GeneratorExit", "FileNotFoundError",
-        "FileExistsError", "PermissionError", "NotImplementedError",
-        "ZeroDivisionError", "OverflowError", "ArithmeticError",
-        "OSError", "IOError", "ImportError", "ModuleNotFoundError",
-        "LookupError", "NameError", "UnicodeError", "UnicodeDecodeError",
-        "UnicodeEncodeError", "AssertionError", "SyntaxError",
-        "IndentationError", "TabError", "SystemError", "SystemExit",
-        "KeyboardInterrupt", "MemoryError", "RecursionError",
+        "Exception",
+        "BaseException",
+        "ValueError",
+        "TypeError",
+        "KeyError",
+        "IndexError",
+        "AttributeError",
+        "RuntimeError",
+        "StopIteration",
+        "StopAsyncIteration",
+        "GeneratorExit",
+        "FileNotFoundError",
+        "FileExistsError",
+        "PermissionError",
+        "NotImplementedError",
+        "ZeroDivisionError",
+        "OverflowError",
+        "ArithmeticError",
+        "OSError",
+        "IOError",
+        "ImportError",
+        "ModuleNotFoundError",
+        "LookupError",
+        "NameError",
+        "UnicodeError",
+        "UnicodeDecodeError",
+        "UnicodeEncodeError",
+        "AssertionError",
+        "SyntaxError",
+        "IndentationError",
+        "TabError",
+        "SystemError",
+        "SystemExit",
+        "KeyboardInterrupt",
+        "MemoryError",
+        "RecursionError",
         // Phase-1 typing names commonly used in annotations
-        "Optional", "Union", "Any", "Callable", "Iterable", "Iterator",
-        "Sequence", "Mapping", "MutableMapping", "List", "Dict", "Set",
-        "Tuple", "FrozenSet", "Type", "TypeVar", "Generic", "Protocol",
-        "Self", "ClassVar", "Final", "Literal", "NoReturn", "Awaitable",
-        "Coroutine", "Generator", "AsyncIterator", "AsyncIterable",
+        "Optional",
+        "Union",
+        "Any",
+        "Callable",
+        "Iterable",
+        "Iterator",
+        "Sequence",
+        "Mapping",
+        "MutableMapping",
+        "List",
+        "Dict",
+        "Set",
+        "Tuple",
+        "FrozenSet",
+        "Type",
+        "TypeVar",
+        "Generic",
+        "Protocol",
+        "Self",
+        "ClassVar",
+        "Final",
+        "Literal",
+        "NoReturn",
+        "Awaitable",
+        "Coroutine",
+        "Generator",
+        "AsyncIterator",
+        "AsyncIterable",
         // Typhon Result type constructors (from typhon_runtime).
-        "Ok", "Err", "Result",
+        "Ok",
+        "Err",
+        "Result",
         // Typhon comptime built-in function.
         "env",
         // Pydantic BaseModel — injected by the `model` keyword preprocessor.
@@ -1035,7 +1239,12 @@ mod tests {
     fn resolve(src: &str) -> (ResolvedModule, Diagnostics) {
         let prep = preprocess(src);
         let module = parse(&prep.python_source, Mode::Module, "<test>").unwrap();
-        resolve_module("<test>".to_owned(), &prep.python_source, &prep.stripped, &module)
+        resolve_module(
+            "<test>".to_owned(),
+            &prep.python_source,
+            &prep.stripped,
+            &module,
+        )
     }
 
     #[test]
@@ -1060,7 +1269,11 @@ mod tests {
         let (_m, d) = resolve("val x: int = 1\nx = 2\n");
         assert!(d.has_errors());
         let msg = format!("{}", d.errors()[0]);
-        assert!(msg.contains("cannot assign to immutable binding 'x'"), "got {}", msg);
+        assert!(
+            msg.contains("cannot assign to immutable binding 'x'"),
+            "got {}",
+            msg
+        );
     }
 
     #[test]
@@ -1091,7 +1304,11 @@ mod tests {
         let (_m, d) = resolve(
             "class __typhon_impl_User(object):\n    def greet():\n        return self.name\n",
         );
-        assert!(!d.has_errors(), "self inside impl method must not be unknown: {:?}", d.errors());
+        assert!(
+            !d.has_errors(),
+            "self inside impl method must not be unknown: {:?}",
+            d.errors()
+        );
     }
 
     #[test]
@@ -1151,7 +1368,10 @@ mod tests {
     fn parameter_annotation_references_resolved() {
         // A missing annotation type should now surface as an unknown name.
         let (_m, d) = resolve("def f(x: NoSuchType) -> None:\n    pass\n");
-        assert!(d.has_errors(), "expected unknown type in parameter annotation");
+        assert!(
+            d.has_errors(),
+            "expected unknown type in parameter annotation"
+        );
         let msg = format!("{}", d.errors()[0]);
         assert!(msg.contains("NoSuchType"), "got {}", msg);
     }
@@ -1164,7 +1384,10 @@ mod tests {
         assert!(!d.has_errors(), "unused import should not be an error");
         assert_eq!(d.warning_count(), 1, "expected exactly one warning");
         let msg = format!("{}", d.warnings()[0]);
-        assert!(msg.contains("os"), "warning should name the import, got: {msg}");
+        assert!(
+            msg.contains("os"),
+            "warning should name the import, got: {msg}"
+        );
     }
 
     #[test]

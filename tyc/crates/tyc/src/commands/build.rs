@@ -14,8 +14,8 @@ use rustpython_parser::{parse, Mode};
 
 use tyc_analyse::{evaluate_comptime, ComptimeValue};
 use tyc_db::{check_file, TycDatabase};
-use tyc_diagnostics::Diagnostics;
 use tyc_desugar::desugar_module;
+use tyc_diagnostics::Diagnostics;
 use tyc_emit::emit;
 use tyc_format::format_source;
 use tyc_syntax::preprocess::{expand_question_ops, preprocess};
@@ -41,9 +41,10 @@ pub struct BuildArgs {
 }
 
 pub fn run(args: BuildArgs) -> Result<()> {
-    let project_root = args.path.canonicalize().map_err(|e| {
-        miette!("cannot resolve path '{}': {}", args.path.display(), e)
-    })?;
+    let project_root = args
+        .path
+        .canonicalize()
+        .map_err(|e| miette!("cannot resolve path '{}': {}", args.path.display(), e))?;
 
     // Load typhon.toml, anchoring src/out to the directory that contains it
     // so that `tyc build` works correctly when invoked from a subdirectory.
@@ -151,13 +152,16 @@ pub fn run(args: BuildArgs) -> Result<()> {
         let expanded = expand_question_ops(source);
         let prep = preprocess(&expanded);
 
-        let module = parse(&prep.python_source, Mode::Module, &path.display().to_string())
-            .map_err(|e| miette!("parse error in '{}': {e}", path.display()))?;
+        let module = parse(
+            &prep.python_source,
+            Mode::Module,
+            &path.display().to_string(),
+        )
+        .map_err(|e| miette!("parse error in '{}': {e}", path.display()))?;
 
         // Evaluate all `comptime` bindings and substitute their literals into
         // the AST before desugaring.
-        let (comptime_values, comptime_diags) =
-            evaluate_comptime(&module, &prep.comptime_bindings);
+        let (comptime_values, comptime_diags) = evaluate_comptime(&module, &prep.comptime_bindings);
         if comptime_diags.has_errors() {
             for err in comptime_diags.errors() {
                 eprintln!("{:?}", miette::Report::new_boxed(Box::new(err.clone())));
@@ -187,9 +191,9 @@ pub fn run(args: BuildArgs) -> Result<()> {
             }
         }
 
-        let rel = path.strip_prefix(&src_dir).map_err(|_| {
-            miette!("'{}' is outside the source directory", path.display())
-        })?;
+        let rel = path
+            .strip_prefix(&src_dir)
+            .map_err(|_| miette!("'{}' is outside the source directory", path.display()))?;
         let out_file = out_dir.join(rel).with_extension("py");
 
         if let Some(parent) = out_file.parent() {

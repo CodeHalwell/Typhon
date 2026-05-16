@@ -115,7 +115,11 @@ impl Type {
         match self {
             Type::None => Type::Unknown,
             Type::Union(xs) => {
-                let kept: Vec<Type> = xs.iter().filter(|t| !matches!(t, Type::None)).cloned().collect();
+                let kept: Vec<Type> = xs
+                    .iter()
+                    .filter(|t| !matches!(t, Type::None))
+                    .cloned()
+                    .collect();
                 Type::union_of(kept)
             }
             other => other.clone(),
@@ -235,7 +239,11 @@ pub fn type_from_annotation(expr: &Expr<TextRange>, classes: &[String]) -> Type 
             // Union[A, B, ...] / typing.Union[...]
             if head == "Union" {
                 if let Expr::Tuple(t) = s.slice.as_ref() {
-                    let args: Vec<Type> = t.elts.iter().map(|e| type_from_annotation(e, classes)).collect();
+                    let args: Vec<Type> = t
+                        .elts
+                        .iter()
+                        .map(|e| type_from_annotation(e, classes))
+                        .collect();
                     return Type::union_of(args);
                 }
                 return type_from_annotation(&s.slice, classes);
@@ -253,7 +261,11 @@ pub fn type_from_annotation(expr: &Expr<TextRange>, classes: &[String]) -> Type 
             }
             // list[int], dict[str, int], tuple[int, str, ...]
             let args: Vec<Type> = match s.slice.as_ref() {
-                Expr::Tuple(t) => t.elts.iter().map(|e| type_from_annotation(e, classes)).collect(),
+                Expr::Tuple(t) => t
+                    .elts
+                    .iter()
+                    .map(|e| type_from_annotation(e, classes))
+                    .collect(),
                 other => vec![type_from_annotation(other, classes)],
             };
             Type::Generic(head, args)
@@ -430,12 +442,7 @@ impl<'a> Checker<'a> {
         ));
     }
 
-    fn non_exhaustive_match(
-        &mut self,
-        union_name: &str,
-        missing: &str,
-        span: (usize, usize),
-    ) {
+    fn non_exhaustive_match(&mut self, union_name: &str, missing: &str, span: (usize, usize)) {
         let length = span.1.saturating_sub(span.0).max(1);
         self.diagnostics.push_error(TycError::non_exhaustive_match(
             union_name,
@@ -680,8 +687,12 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt<TextRange>) {
                 }
             }
         }
-        Stmt::FunctionDef(f) => check_function(c, f.name.as_str(), &f.args, &f.body, f.returns.as_deref()),
-        Stmt::AsyncFunctionDef(f) => check_function(c, f.name.as_str(), &f.args, &f.body, f.returns.as_deref()),
+        Stmt::FunctionDef(f) => {
+            check_function(c, f.name.as_str(), &f.args, &f.body, f.returns.as_deref())
+        }
+        Stmt::AsyncFunctionDef(f) => {
+            check_function(c, f.name.as_str(), &f.args, &f.body, f.returns.as_deref())
+        }
         Stmt::ClassDef(cd) => {
             c.env.enter();
             for s in &cd.body {
@@ -701,11 +712,10 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt<TextRange>) {
                 }
             } else if ret.value.is_none() {
                 if let Some(expected) = c.current_return.clone() {
-                    if !matches!(expected, Type::Unknown) && !c.is_assignable(&expected, &Type::None) {
-                        let span = (
-                            ret.range.start().to_usize(),
-                            ret.range.end().to_usize(),
-                        );
+                    if !matches!(expected, Type::Unknown)
+                        && !c.is_assignable(&expected, &Type::None)
+                    {
+                        let span = (ret.range.start().to_usize(), ret.range.end().to_usize());
                         c.mismatch(&expected, &Type::None, span);
                     }
                 }
@@ -908,7 +918,11 @@ fn collect_narrowings_inner(
                                 // x is None  → name becomes None
                                 // x is not None → name becomes declared without None
                                 let positive_match = is_op; // is None
-                                let want_none = if negate { !positive_match } else { positive_match };
+                                let want_none = if negate {
+                                    !positive_match
+                                } else {
+                                    positive_match
+                                };
                                 let replacement = if want_none {
                                     Type::None
                                 } else {
@@ -1010,9 +1024,7 @@ fn infer_expr(c: &mut Checker, expr: &Expr<TextRange>) -> Type {
             match (&l.strip_none(), &r.strip_none()) {
                 (Type::Int, Type::Int) => Type::Int,
                 (Type::Float, _) | (_, Type::Float) => Type::Float,
-                (Type::Str, Type::Str)
-                    if matches!(b.op, rustpython_ast::Operator::Add) =>
-                {
+                (Type::Str, Type::Str) if matches!(b.op, rustpython_ast::Operator::Add) => {
                     Type::Str
                 }
                 _ => Type::Unknown,
@@ -1046,10 +1058,7 @@ fn infer_expr(c: &mut Checker, expr: &Expr<TextRange>) -> Type {
             }
 
             let func_type = infer_expr(c, &call.func);
-            let call_span = (
-                call.range.start().to_usize(),
-                call.range.end().to_usize(),
-            );
+            let call_span = (call.range.start().to_usize(), call.range.end().to_usize());
 
             // Argument access check on the receiver (for things like x.foo()
             // where x could be None).
@@ -1067,7 +1076,11 @@ fn infer_expr(c: &mut Checker, expr: &Expr<TextRange>) -> Type {
             }
 
             match func_type {
-                Type::Function { params, ret, variadic } => {
+                Type::Function {
+                    params,
+                    ret,
+                    variadic,
+                } => {
                     // Argument count check (positional only — conservative).
                     // Variadic functions accept any number of args >= params.len().
                     let count_ok = if variadic {
@@ -1089,10 +1102,8 @@ fn infer_expr(c: &mut Checker, expr: &Expr<TextRange>) -> Type {
                         }
                         let actual = infer_expr(c, arg);
                         if !c.is_assignable(&params[i], &actual) {
-                            let span = (
-                                arg.range().start().to_usize(),
-                                arg.range().end().to_usize(),
-                            );
+                            let span =
+                                (arg.range().start().to_usize(), arg.range().end().to_usize());
                             c.mismatch(&params[i], &actual, span);
                         }
                         // Specifically reject possibly-None args bound to a
@@ -1339,8 +1350,12 @@ mod tests {
     fn check(src: &str) -> Diagnostics {
         let prep = preprocess(src);
         let module = parse(&prep.python_source, Mode::Module, "<test>").unwrap();
-        let (resolved, _) =
-            resolve_module("<test>".to_owned(), &prep.python_source, &prep.stripped, &module);
+        let (resolved, _) = resolve_module(
+            "<test>".to_owned(),
+            &prep.python_source,
+            &prep.stripped,
+            &module,
+        );
         check_module("<test>", &prep.python_source, &resolved, &module)
     }
 
@@ -1648,9 +1663,15 @@ match s:
         pass
 ";
         let d = check(src);
-        assert!(d.has_errors(), "guarded arm must not satisfy exhaustiveness");
+        assert!(
+            d.has_errors(),
+            "guarded arm must not satisfy exhaustiveness"
+        );
         let msg = format!("{}", d.errors()[0]);
-        assert!(msg.contains("Circle"), "error should name Circle, got: {msg}");
+        assert!(
+            msg.contains("Circle"),
+            "error should name Circle, got: {msg}"
+        );
     }
 
     #[test]
@@ -1752,7 +1773,10 @@ def find(id: int) -> Result[int, str]:
 val r: Result[int, str] = Ok(\"text\")
 ";
         let d = check(src);
-        assert!(d.has_errors(), "expected type-mismatch: Ok[str] not assignable to Result[int, str]");
+        assert!(
+            d.has_errors(),
+            "expected type-mismatch: Ok[str] not assignable to Result[int, str]"
+        );
     }
 
     #[test]
@@ -1762,7 +1786,10 @@ val r: Result[int, str] = Ok(\"text\")
 val r: Result[int, str] = Err(99)
 ";
         let d = check(src);
-        assert!(d.has_errors(), "expected type-mismatch: Err[int] not assignable to Result[int, str]");
+        assert!(
+            d.has_errors(),
+            "expected type-mismatch: Err[int] not assignable to Result[int, str]"
+        );
     }
 
     #[test]

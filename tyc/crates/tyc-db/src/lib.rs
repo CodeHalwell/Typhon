@@ -34,7 +34,7 @@ pub struct SourceFile {
 /// doesn't change the file's text content (e.g. saving with no edits)
 /// avoids re-running the preprocess pass.
 #[salsa::tracked]
-pub fn preprocessed_text<'db>(db: &'db dyn salsa::Database, file: SourceFile) -> String {
+pub fn preprocessed_text(db: &dyn salsa::Database, file: SourceFile) -> String {
     let text = file.text(db);
     // Expand `?` operators before the Python parser sees the source, matching
     // the order used in check_file and the build pipeline.
@@ -50,7 +50,7 @@ pub fn preprocessed_text<'db>(db: &'db dyn salsa::Database, file: SourceFile) ->
 /// `salsa::Update`-friendly, so this is the slice of the resolve step
 /// that's salsa-cacheable today.
 #[salsa::tracked]
-pub fn module_decl_names<'db>(db: &'db dyn salsa::Database, file: SourceFile) -> Vec<String> {
+pub fn module_decl_names(db: &dyn salsa::Database, file: SourceFile) -> Vec<String> {
     let source = preprocessed_text(db, file);
     let path = file.path(db).clone();
     let module = match parse(&source, Mode::Module, &path) {
@@ -150,8 +150,8 @@ mod tests {
 
     #[test]
     fn preprocessed_text_query_caches() {
-        let mut db = TycDatabase::new();
-        let file = SourceFile::new(&mut db, "<test>".to_owned(), "val x: int = 1\n".to_owned());
+        let db = TycDatabase::new();
+        let file = SourceFile::new(&db, "<test>".to_owned(), "val x: int = 1\n".to_owned());
         let p1 = preprocessed_text(&db, file);
         let p2 = preprocessed_text(&db, file);
         assert_eq!(p1, "x: int = 1\n");
@@ -160,9 +160,9 @@ mod tests {
 
     #[test]
     fn module_decl_names_query() {
-        let mut db = TycDatabase::new();
+        let db = TycDatabase::new();
         let file = SourceFile::new(
-            &mut db,
+            &db,
             "<test>".to_owned(),
             "val x: int = 1\nvar y: int = 2\ndef f() -> None:\n    pass\n".to_owned(),
         );
@@ -182,7 +182,11 @@ mod tests {
     #[test]
     fn check_file_reports_type_mismatch() {
         let mut db = TycDatabase::new();
-        let diags = check_file(&mut db, "<test>".to_owned(), "val x: int = \"hi\"\n".to_owned());
+        let diags = check_file(
+            &mut db,
+            "<test>".to_owned(),
+            "val x: int = \"hi\"\n".to_owned(),
+        );
         assert!(diags.has_errors());
     }
 
@@ -233,9 +237,13 @@ def parse(s: str) -> Result[int, str]:
         let mut db = TycDatabase::new();
         let diags = check_file(&mut db, "<test>".into(), src.to_owned());
         assert!(
-            !diags.errors().iter().any(|e| format!("{e}").contains("module level")
-                || format!("{e}").contains("returning `")),
-            "valid ? usage should not produce context errors: {:?}", diags.errors()
+            !diags
+                .errors()
+                .iter()
+                .any(|e| format!("{e}").contains("module level")
+                    || format!("{e}").contains("returning `")),
+            "valid ? usage should not produce context errors: {:?}",
+            diags.errors()
         );
     }
 
@@ -249,7 +257,11 @@ def parse(s: str) -> Result[int, str]:
             .errors()
             .iter()
             .any(|e| format!("{e}").contains("module level"));
-        assert!(has_qop_error, "expected module-level ? error, got: {:?}", diags.errors());
+        assert!(
+            has_qop_error,
+            "expected module-level ? error, got: {:?}",
+            diags.errors()
+        );
     }
 
     #[test]
@@ -262,7 +274,11 @@ def parse(s: str) -> Result[int, str]:
             .errors()
             .iter()
             .any(|e| format!("{e}").contains("None"));
-        assert!(has_qop_error, "expected return-type ? error, got: {:?}", diags.errors());
+        assert!(
+            has_qop_error,
+            "expected return-type ? error, got: {:?}",
+            diags.errors()
+        );
     }
 
     // ── unused import warnings ───────────────────────────────────────────────

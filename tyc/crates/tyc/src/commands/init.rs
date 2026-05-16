@@ -34,19 +34,14 @@ pub fn run(args: InitArgs) -> Result<()> {
     // Refuse to overwrite an existing typhon.toml.
     let config_path = dir.join("typhon.toml");
     if config_path.exists() {
-        return Err(miette!(
-            "typhon.toml already exists in {}",
-            dir.display()
-        ));
+        return Err(miette!("typhon.toml already exists in {}", dir.display()));
     }
 
     // Create directory structure.
     let src_dir = dir.join("src");
     let tests_dir = dir.join("tests");
-    std::fs::create_dir_all(&src_dir)
-        .map_err(|e| miette!("cannot create src/: {}", e))?;
-    std::fs::create_dir_all(&tests_dir)
-        .map_err(|e| miette!("cannot create tests/: {}", e))?;
+    std::fs::create_dir_all(&src_dir).map_err(|e| miette!("cannot create src/: {}", e))?;
+    std::fs::create_dir_all(&tests_dir).map_err(|e| miette!("cannot create tests/: {}", e))?;
 
     // Write typhon.toml.
     let config = TyphonConfig {
