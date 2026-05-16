@@ -54,9 +54,19 @@ pub fn desugar_module(module: &Mod<TextRange>) -> DesugarOutput {
             let desugared_mod = desugar_mod_module(m);
 
             let has_result_usage = stmts_use_result_names(&m.body);
-            let has_existing_runtime_import = has_typhon_runtime_import(&m.body);
-            let needs_typhon_runtime = has_result_usage || has_existing_runtime_import;
-            let inject_import = has_result_usage && !has_existing_runtime_import;
+            let has_any_runtime_import = has_any_typhon_runtime_import(&m.body);
+            let import_covers_all = typhon_runtime_import_covers_all(&m.body);
+            // The build must write `typhon_runtime.py` whenever the emitted
+            // module will reference it — either because we detected an Ok/
+            // Err/Result name, or because the user already imported the
+            // runtime explicitly (bare or `from ... import`).
+            let needs_typhon_runtime = has_result_usage || has_any_runtime_import;
+            // Only skip injection when an existing `from typhon_runtime
+            // import …` already covers all three names. A partial import
+            // (e.g. just `Ok`) would leave `Err`/`Result` undefined, so we
+            // still inject. A bare `import typhon_runtime` doesn't bring
+            // `Ok`/`Err`/`Result` into scope, so we also still inject.
+            let inject_import = has_result_usage && !import_covers_all;
 
             let final_body = if inject_import {
                 let insert_at = import_insert_pos(&desugared_mod.body);
@@ -95,25 +105,136 @@ fn stmt_uses_result_names(stmt: &Stmt<TextRange>) -> bool {
     match stmt {
         Stmt::FunctionDef(f) => {
             f.returns.as_ref().map_or(false, |r| expr_uses_result_names(r))
+                || arguments_use_result_names(&f.args)
+                || f.decorator_list.iter().any(expr_uses_result_names)
                 || stmts_use_result_names(&f.body)
         }
         Stmt::AsyncFunctionDef(f) => {
             f.returns.as_ref().map_or(false, |r| expr_uses_result_names(r))
+                || arguments_use_result_names(&f.args)
+                || f.decorator_list.iter().any(expr_uses_result_names)
                 || stmts_use_result_names(&f.body)
         }
-        Stmt::ClassDef(c) => stmts_use_result_names(&c.body),
+        Stmt::ClassDef(c) => {
+            c.decorator_list.iter().any(expr_uses_result_names)
+                || c.bases.iter().any(expr_uses_result_names)
+                || c.keywords.iter().any(|k| expr_uses_result_names(&k.value))
+                || stmts_use_result_names(&c.body)
+        }
         Stmt::AnnAssign(a) => {
             expr_uses_result_names(&a.annotation)
                 || a.value.as_ref().map_or(false, |v| expr_uses_result_names(v))
+                || expr_uses_result_names(&a.target)
         }
-        Stmt::Assign(a) => expr_uses_result_names(&a.value),
+        Stmt::Assign(a) => {
+            expr_uses_result_names(&a.value)
+                || a.targets.iter().any(expr_uses_result_names)
+        }
+        Stmt::AugAssign(a) => {
+            expr_uses_result_names(&a.target) || expr_uses_result_names(&a.value)
+        }
         Stmt::Return(r) => r.value.as_ref().map_or(false, |v| expr_uses_result_names(v)),
         Stmt::Expr(e) => expr_uses_result_names(&e.value),
         Stmt::If(i) => {
-            stmts_use_result_names(&i.body) || stmts_use_result_names(&i.orelse)
+            expr_uses_result_names(&i.test)
+                || stmts_use_result_names(&i.body)
+                || stmts_use_result_names(&i.orelse)
+        }
+        Stmt::While(w) => {
+            expr_uses_result_names(&w.test)
+                || stmts_use_result_names(&w.body)
+                || stmts_use_result_names(&w.orelse)
+        }
+        Stmt::For(f) => {
+            expr_uses_result_names(&f.target)
+                || expr_uses_result_names(&f.iter)
+                || stmts_use_result_names(&f.body)
+                || stmts_use_result_names(&f.orelse)
+        }
+        Stmt::AsyncFor(f) => {
+            expr_uses_result_names(&f.target)
+                || expr_uses_result_names(&f.iter)
+                || stmts_use_result_names(&f.body)
+                || stmts_use_result_names(&f.orelse)
+        }
+        Stmt::With(w) => {
+            w.items.iter().any(with_item_uses_result_names)
+                || stmts_use_result_names(&w.body)
+        }
+        Stmt::AsyncWith(w) => {
+            w.items.iter().any(with_item_uses_result_names)
+                || stmts_use_result_names(&w.body)
+        }
+        Stmt::Try(t) => {
+            stmts_use_result_names(&t.body)
+                || t.handlers.iter().any(except_handler_uses_result_names)
+                || stmts_use_result_names(&t.orelse)
+                || stmts_use_result_names(&t.finalbody)
+        }
+        Stmt::TryStar(t) => {
+            stmts_use_result_names(&t.body)
+                || t.handlers.iter().any(except_handler_uses_result_names)
+                || stmts_use_result_names(&t.orelse)
+                || stmts_use_result_names(&t.finalbody)
+        }
+        Stmt::Match(m) => {
+            expr_uses_result_names(&m.subject)
+                || m.cases.iter().any(|case| {
+                    case.guard
+                        .as_ref()
+                        .map_or(false, |g| expr_uses_result_names(g))
+                        || stmts_use_result_names(&case.body)
+                })
+        }
+        Stmt::Raise(r) => {
+            r.exc.as_ref().map_or(false, |e| expr_uses_result_names(e))
+                || r.cause.as_ref().map_or(false, |c| expr_uses_result_names(c))
+        }
+        Stmt::Assert(a) => {
+            expr_uses_result_names(&a.test)
+                || a.msg.as_ref().map_or(false, |m| expr_uses_result_names(m))
+        }
+        Stmt::Delete(d) => d.targets.iter().any(expr_uses_result_names),
+        Stmt::TypeAlias(t) => {
+            expr_uses_result_names(&t.name) || expr_uses_result_names(&t.value)
         }
         _ => false,
     }
+}
+
+fn arguments_use_result_names(args: &rustpython_ast::Arguments<TextRange>) -> bool {
+    let plain_arg_uses = |arg: &rustpython_ast::Arg<TextRange>| {
+        arg.annotation
+            .as_ref()
+            .map_or(false, |a| expr_uses_result_names(a))
+    };
+    let with_default_uses = |arg: &rustpython_ast::ArgWithDefault<TextRange>| {
+        plain_arg_uses(&arg.def)
+            || arg.default.as_ref().map_or(false, |d| expr_uses_result_names(d))
+    };
+    args.posonlyargs.iter().any(with_default_uses)
+        || args.args.iter().any(with_default_uses)
+        || args.kwonlyargs.iter().any(with_default_uses)
+        || args.vararg.as_ref().map_or(false, |a| plain_arg_uses(a))
+        || args.kwarg.as_ref().map_or(false, |a| plain_arg_uses(a))
+}
+
+fn with_item_uses_result_names(item: &rustpython_ast::WithItem<TextRange>) -> bool {
+    expr_uses_result_names(&item.context_expr)
+        || item
+            .optional_vars
+            .as_ref()
+            .map_or(false, |v| expr_uses_result_names(v))
+}
+
+fn except_handler_uses_result_names(
+    handler: &rustpython_ast::ExceptHandler<TextRange>,
+) -> bool {
+    let rustpython_ast::ExceptHandler::ExceptHandler(h) = handler;
+    h.type_
+        .as_ref()
+        .map_or(false, |t| expr_uses_result_names(t))
+        || stmts_use_result_names(&h.body)
 }
 
 fn expr_uses_result_names(expr: &Expr<TextRange>) -> bool {
@@ -121,22 +242,113 @@ fn expr_uses_result_names(expr: &Expr<TextRange>) -> bool {
         Expr::Name(n) => matches!(n.id.as_str(), "Ok" | "Err" | "Result"),
         Expr::Call(c) => {
             expr_uses_result_names(&c.func)
-                || c.args.iter().any(|a| expr_uses_result_names(a))
+                || c.args.iter().any(expr_uses_result_names)
+                || c.keywords.iter().any(|k| expr_uses_result_names(&k.value))
         }
         Expr::Subscript(s) => {
             expr_uses_result_names(&s.value) || expr_uses_result_names(&s.slice)
         }
         Expr::BinOp(b) => expr_uses_result_names(&b.left) || expr_uses_result_names(&b.right),
-        Expr::Tuple(t) => t.elts.iter().any(|e| expr_uses_result_names(e)),
+        Expr::BoolOp(b) => b.values.iter().any(expr_uses_result_names),
+        Expr::UnaryOp(u) => expr_uses_result_names(&u.operand),
+        Expr::NamedExpr(n) => {
+            expr_uses_result_names(&n.target) || expr_uses_result_names(&n.value)
+        }
+        Expr::Compare(c) => {
+            expr_uses_result_names(&c.left)
+                || c.comparators.iter().any(expr_uses_result_names)
+        }
+        Expr::Lambda(l) => expr_uses_result_names(&l.body),
+        Expr::IfExp(i) => {
+            expr_uses_result_names(&i.test)
+                || expr_uses_result_names(&i.body)
+                || expr_uses_result_names(&i.orelse)
+        }
+        Expr::Tuple(t) => t.elts.iter().any(expr_uses_result_names),
+        Expr::List(l) => l.elts.iter().any(expr_uses_result_names),
+        Expr::Set(s) => s.elts.iter().any(expr_uses_result_names),
+        Expr::Dict(d) => {
+            d.keys
+                .iter()
+                .any(|k| k.as_ref().map_or(false, expr_uses_result_names))
+                || d.values.iter().any(expr_uses_result_names)
+        }
+        Expr::ListComp(c) => {
+            expr_uses_result_names(&c.elt)
+                || c.generators.iter().any(comprehension_uses_result_names)
+        }
+        Expr::SetComp(c) => {
+            expr_uses_result_names(&c.elt)
+                || c.generators.iter().any(comprehension_uses_result_names)
+        }
+        Expr::GeneratorExp(g) => {
+            expr_uses_result_names(&g.elt)
+                || g.generators.iter().any(comprehension_uses_result_names)
+        }
+        Expr::DictComp(d) => {
+            expr_uses_result_names(&d.key)
+                || expr_uses_result_names(&d.value)
+                || d.generators.iter().any(comprehension_uses_result_names)
+        }
+        Expr::Await(a) => expr_uses_result_names(&a.value),
+        Expr::Yield(y) => y.value.as_ref().map_or(false, |v| expr_uses_result_names(v)),
+        Expr::YieldFrom(y) => expr_uses_result_names(&y.value),
+        Expr::Starred(s) => expr_uses_result_names(&s.value),
+        Expr::Slice(s) => {
+            s.lower.as_ref().map_or(false, |e| expr_uses_result_names(e))
+                || s.upper.as_ref().map_or(false, |e| expr_uses_result_names(e))
+                || s.step.as_ref().map_or(false, |e| expr_uses_result_names(e))
+        }
+        Expr::FormattedValue(f) => expr_uses_result_names(&f.value),
+        Expr::JoinedStr(j) => j.values.iter().any(expr_uses_result_names),
         Expr::Attribute(a) => expr_uses_result_names(&a.value),
+        // Leaf nodes that cannot contain Result names: constants, etc.
         _ => false,
     }
 }
 
-/// Return `true` if `body` already contains `from typhon_runtime import ...`.
-fn has_typhon_runtime_import(body: &[Stmt<TextRange>]) -> bool {
+fn comprehension_uses_result_names(
+    gen: &rustpython_ast::Comprehension<TextRange>,
+) -> bool {
+    expr_uses_result_names(&gen.target)
+        || expr_uses_result_names(&gen.iter)
+        || gen.ifs.iter().any(expr_uses_result_names)
+}
+
+/// Return `true` if `body` contains any reference to the `typhon_runtime`
+/// module — either `import typhon_runtime` or `from typhon_runtime import …`.
+/// When true, the build must still write the runtime helper file even if
+/// no Ok/Err/Result names appear directly in expressions (the user may be
+/// calling `typhon_runtime.Ok(...)` via the bare-import / qualified style).
+fn has_any_typhon_runtime_import(body: &[Stmt<TextRange>]) -> bool {
     body.iter().any(|stmt| match stmt {
+        Stmt::Import(imp) => imp.names.iter().any(|a| a.name.as_str() == "typhon_runtime"),
         Stmt::ImportFrom(imp) => imp.module.as_deref() == Some("typhon_runtime"),
+        _ => false,
+    })
+}
+
+/// Return `true` if an existing `from typhon_runtime import …` already brings
+/// all three runtime names (`Ok`, `Err`, `Result`) into scope. Used to skip
+/// injection only when the user-provided import is complete; partial imports
+/// (e.g. just `Ok`) still need injection so the missing names resolve.
+fn typhon_runtime_import_covers_all(body: &[Stmt<TextRange>]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::ImportFrom(imp) if imp.module.as_deref() == Some("typhon_runtime") => {
+            let mut ok = false;
+            let mut err = false;
+            let mut result = false;
+            for alias in &imp.names {
+                match alias.name.as_str() {
+                    "Ok" => ok = true,
+                    "Err" => err = true,
+                    "Result" => result = true,
+                    "*" => return true,
+                    _ => {}
+                }
+            }
+            ok && err && result
+        }
         _ => false,
     })
 }
@@ -534,5 +746,166 @@ mod tests {
         let doc_pos = out.find("Module doc").expect("docstring missing");
         let import_pos = out.find("from typhon_runtime").expect("runtime import missing");
         assert!(doc_pos < import_pos, "runtime import must follow docstring\noutput:\n{out}");
+    }
+
+    // ── Result detection: extended statement coverage ────────────────────────
+
+    #[test]
+    fn ok_inside_while_loop_detected() {
+        let src = "while True:\n    x = Ok(1)\n";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("from typhon_runtime import"), "output:\n{out}");
+    }
+
+    #[test]
+    fn ok_inside_for_loop_detected() {
+        let src = "for i in range(3):\n    x = Ok(i)\n";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("from typhon_runtime import"), "output:\n{out}");
+    }
+
+    #[test]
+    fn ok_inside_with_block_detected() {
+        let src = "with open('x') as f:\n    r = Ok(f.read())\n";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("from typhon_runtime import"), "output:\n{out}");
+    }
+
+    #[test]
+    fn ok_inside_try_block_detected() {
+        let src = "try:\n    r = Ok(1)\nexcept Exception:\n    pass\n";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("from typhon_runtime import"), "output:\n{out}");
+    }
+
+    #[test]
+    fn ok_inside_match_case_detected() {
+        let src = "match x:\n    case 1:\n        r = Ok(1)\n    case _:\n        r = Err('no')\n";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("from typhon_runtime import"), "output:\n{out}");
+    }
+
+    #[test]
+    fn result_in_type_alias_detected() {
+        let src = "type MyResult = Result[int, str]\n";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("from typhon_runtime import"), "output:\n{out}");
+    }
+
+    #[test]
+    fn result_in_param_annotation_detected() {
+        let src = "def f(r: Result[int, str]) -> None:\n    pass\n";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("from typhon_runtime import"), "output:\n{out}");
+    }
+
+    #[test]
+    fn result_in_if_test_detected() {
+        let src = "if isinstance(x, Result):\n    pass\n";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("from typhon_runtime import"), "output:\n{out}");
+    }
+
+    // ── Result detection: extended expression coverage ───────────────────────
+
+    #[test]
+    fn ok_inside_list_literal_detected() {
+        let src = "x = [Ok(1), Err('no')]\n";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("from typhon_runtime import"), "output:\n{out}");
+    }
+
+    #[test]
+    fn ok_inside_dict_literal_detected() {
+        let src = "x = {'a': Ok(1)}\n";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("from typhon_runtime import"), "output:\n{out}");
+    }
+
+    #[test]
+    fn ok_inside_ifexp_detected() {
+        let src = "x = Ok(1) if cond else Err('no')\n";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("from typhon_runtime import"), "output:\n{out}");
+    }
+
+    #[test]
+    fn ok_inside_lambda_detected() {
+        let src = "f = lambda x: Ok(x)\n";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("from typhon_runtime import"), "output:\n{out}");
+    }
+
+    #[test]
+    fn ok_inside_listcomp_detected() {
+        let src = "xs = [Ok(i) for i in range(3)]\n";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("from typhon_runtime import"), "output:\n{out}");
+    }
+
+    #[test]
+    fn ok_inside_keyword_arg_detected() {
+        // The previous detection missed `keywords`; now it must catch this.
+        let src = "make(value=Ok(1))\n";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("from typhon_runtime import"), "output:\n{out}");
+    }
+
+    #[test]
+    fn ok_inside_fstring_detected() {
+        let src = "msg = f'{Ok(1)}'\n";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("from typhon_runtime import"), "output:\n{out}");
+    }
+
+    // ── Import detection edge cases ──────────────────────────────────────────
+
+    #[test]
+    fn partial_from_import_still_injects_full_import() {
+        // User imported only `Ok` — the emitted module also uses `Result`,
+        // so injection must still run to bring `Err`/`Result` into scope.
+        let src = "from typhon_runtime import Ok\n\ndef f() -> Result[int, str]:\n    return Ok(1)\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("from typhon_runtime import Ok, Err, Result"),
+            "expected full injection alongside the partial existing import; output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn full_from_import_suppresses_injection() {
+        // Existing import covers all three names — no need to inject ours.
+        let src = "from typhon_runtime import Ok, Err, Result\n\ndef f() -> None:\n    x = Ok(1)\n";
+        let out = parse_and_desugar(src);
+        assert_eq!(
+            out.matches("from typhon_runtime import").count(),
+            1,
+            "should not duplicate the existing complete import; output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn bare_import_typhon_runtime_sets_needs_flag() {
+        // `import typhon_runtime` plus qualified `typhon_runtime.Ok(...)` does
+        // not bring Ok/Err/Result into scope, but the build still needs to
+        // emit the runtime file.
+        let src = "import typhon_runtime\nx = typhon_runtime.Ok(1)\n";
+        let m = parse(src, Mode::Module, "<test>").expect("parse failed");
+        let output = desugar_module(&m);
+        assert!(
+            output.needs_typhon_runtime,
+            "bare `import typhon_runtime` must set needs_typhon_runtime"
+        );
+    }
+
+    #[test]
+    fn star_from_typhon_runtime_suppresses_injection() {
+        let src = "from typhon_runtime import *\n\ndef f() -> None:\n    x = Ok(1)\n";
+        let out = parse_and_desugar(src);
+        assert_eq!(
+            out.matches("from typhon_runtime import").count(),
+            1,
+            "star-import covers all names; should not duplicate; output:\n{out}"
+        );
     }
 }

@@ -779,15 +779,27 @@ impl Emitter {
             Expr::Subscript(s) => {
                 self.emit_expr(&s.value);
                 self.write("[");
-                // A tuple slice emits without outer parens: `X[A, B]` not `X[(A, B)]`.
+                // A tuple slice usually emits without outer parens — `X[A, B]`
+                // not `X[(A, B)]` — but a one-element tuple must keep its
+                // trailing comma so `x[1,]` (tuple-key lookup) is not silently
+                // rewritten to `x[1]` (integer-key lookup).
                 if let Expr::Tuple(t) = s.slice.as_ref() {
-                    let mut first = true;
-                    for elem in &t.elts {
-                        if !first {
-                            self.write(", ");
+                    match t.elts.len() {
+                        0 => self.write("()"),
+                        1 => {
+                            self.emit_expr(&t.elts[0]);
+                            self.write(",");
                         }
-                        self.emit_expr(elem);
-                        first = false;
+                        _ => {
+                            let mut first = true;
+                            for elem in &t.elts {
+                                if !first {
+                                    self.write(", ");
+                                }
+                                self.emit_expr(elem);
+                                first = false;
+                            }
+                        }
                     }
                 } else {
                     self.emit_expr(&s.slice);
@@ -1367,6 +1379,36 @@ mod tests {
         let src = "x = (1, 2, 3)\n";
         let out = round_trip(src);
         assert!(out.contains("(1, 2, 3)"), "tuple wrong: {}", out);
+    }
+
+    #[test]
+    fn subscript_multi_arg_no_outer_parens() {
+        // `Result[int, str]` must NOT emit as `Result[(int, str)]`.
+        let src = "x: Result[int, str] = z\n";
+        let out = round_trip(src);
+        assert!(
+            out.contains("Result[int, str]"),
+            "expected `Result[int, str]`, got: {}",
+            out
+        );
+        assert!(
+            !out.contains("Result[(int, str)]"),
+            "tuple slice should not be parenthesised: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn subscript_one_tuple_key_keeps_comma() {
+        // `x[1,]` is a tuple-keyed lookup and must NOT be silently rewritten
+        // to `x[1]` (integer-keyed lookup) by the subscript tuple-unwrap.
+        let src = "y = x[1,]\n";
+        let out = round_trip(src);
+        assert!(
+            out.contains("x[1,]"),
+            "single-element tuple slice must keep trailing comma: {}",
+            out
+        );
     }
 
     #[test]

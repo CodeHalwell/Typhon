@@ -135,11 +135,7 @@ impl Type {
             }
             Type::Generic(name, args) => {
                 let a: Vec<String> = args.iter().map(|t| t.display()).collect();
-                if name == "Result" && args.len() == 2 {
-                    format!("Result[{}, {}]", a[0], a[1])
-                } else {
-                    format!("{}[{}]", name, a.join(", "))
-                }
+                format!("{}[{}]", name, a.join(", "))
             }
             Type::Union(xs) => {
                 let s: Vec<String> = xs.iter().map(|t| t.display()).collect();
@@ -174,12 +170,14 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
         (other, Type::Union(variants)) => variants.iter().all(|v| assignable(other, v)),
         (Type::Generic(an, aa), Type::Generic(bn, bb)) => {
             // Result[T, E] accepts Ok[T] (success) or Err[E] (failure) as values.
+            // Only return when a constructor matches; otherwise fall through to
+            // the structural generic check so Result[T,E] = Result[T,E] works.
             if an == "Result" && aa.len() == 2 {
-                return match (bn.as_str(), bb.len()) {
-                    ("Ok", 1) => assignable(&aa[0], &bb[0]),
-                    ("Err", 1) => assignable(&aa[1], &bb[0]),
-                    _ => false,
-                };
+                match (bn.as_str(), bb.len()) {
+                    ("Ok", 1) => return assignable(&aa[0], &bb[0]),
+                    ("Err", 1) => return assignable(&aa[1], &bb[0]),
+                    _ => {}
+                }
             }
             an == bn && aa.len() == bb.len() && aa.iter().zip(bb).all(|(x, y)| assignable(x, y))
         }
@@ -1693,5 +1691,22 @@ val r: Result[int, str] = Err(99)
 ";
         let d = check(src);
         assert!(d.has_errors(), "expected type-mismatch: Err[int] not assignable to Result[int, str]");
+    }
+
+    #[test]
+    fn result_assignable_to_same_result() {
+        // Regression: Result[T, E] → Result[T, E] must type-check. The old
+        // logic returned false in the `_` arm of the constructor match,
+        // breaking the structural Generic-Generic fallback.
+        let src = "\
+def first() -> Result[int, str]:
+    return Ok(1)
+
+def forward() -> Result[int, str]:
+    val r: Result[int, str] = first()
+    return r
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
     }
 }
