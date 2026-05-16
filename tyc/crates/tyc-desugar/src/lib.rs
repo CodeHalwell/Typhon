@@ -738,35 +738,89 @@ fn merge_impl_blocks(body: Vec<Stmt<TextRange>>) -> (Vec<Stmt<TextRange>>, bool)
     (new_body, true)
 }
 
-/// Inject `self` as the first positional parameter of a function definition.
+/// Inject an implicit receiver parameter into a method from an `impl` block.
 ///
-/// Only modifies `Stmt::FunctionDef`; all other statement kinds pass through
-/// unchanged.  If `self` is already the first parameter (e.g. the user wrote
-/// it explicitly), no second `self` is added.
+/// Handles both `Stmt::FunctionDef` and `Stmt::AsyncFunctionDef`; all other
+/// statement kinds pass through unchanged.
+///
+/// Rules:
+/// - `@staticmethod`: no parameter is injected (static methods have no receiver).
+/// - `@classmethod`: `cls` is injected as the first parameter.
+/// - All other methods: `self` is injected as the first parameter.
+///
+/// The parameter is inserted into `posonlyargs` when the method already has
+/// positional-only arguments (preserving correct parameter order around `/`),
+/// or into `args` otherwise.  If the receiver name is already present as the
+/// first parameter, it is not duplicated.
 fn insert_self_param(stmt: &Stmt<TextRange>) -> Stmt<TextRange> {
+    fn make_receiver_arg(name: &'static str) -> ArgWithDefault<TextRange> {
+        ArgWithDefault {
+            range: Default::default(),
+            def: Arg {
+                range: TextRange::default(),
+                arg: Identifier::new(name),
+                annotation: None,
+                type_comment: None,
+            },
+            default: None,
+        }
+    }
+
+    fn first_param_name(args: &rustpython_ast::Arguments<TextRange>) -> Option<&str> {
+        args.posonlyargs
+            .first()
+            .or_else(|| args.args.first())
+            .map(|a| a.def.arg.as_str())
+    }
+
+    fn decorator_name(d: &Expr<TextRange>) -> Option<&str> {
+        match d {
+            Expr::Name(n) => Some(n.id.as_str()),
+            Expr::Call(c) => decorator_name(&c.func),
+            _ => None,
+        }
+    }
+
+    fn receiver_for(decorators: &[Expr<TextRange>]) -> Option<&'static str> {
+        for d in decorators {
+            match decorator_name(d) {
+                Some("staticmethod") => return None, // no receiver
+                Some("classmethod") => return Some("cls"),
+                _ => {}
+            }
+        }
+        Some("self")
+    }
+
+    fn inject(
+        args: &mut rustpython_ast::Arguments<TextRange>,
+        receiver: &'static str,
+    ) {
+        if first_param_name(args) == Some(receiver) {
+            return; // already present — do not duplicate
+        }
+        let param = make_receiver_arg(receiver);
+        if args.posonlyargs.is_empty() {
+            args.args.insert(0, param);
+        } else {
+            args.posonlyargs.insert(0, param);
+        }
+    }
+
     match stmt {
         Stmt::FunctionDef(f) => {
             let mut new_f = f.clone();
-            let already_has_self = new_f
-                .args
-                .args
-                .first()
-                .map(|a| a.def.arg.as_str() == "self")
-                .unwrap_or(false);
-            if !already_has_self {
-                let self_arg = ArgWithDefault {
-                    range: Default::default(),
-                    def: Arg {
-                        range: TextRange::default(),
-                        arg: Identifier::new("self"),
-                        annotation: None,
-                        type_comment: None,
-                    },
-                    default: None,
-                };
-                new_f.args.args.insert(0, self_arg);
+            if let Some(receiver) = receiver_for(&new_f.decorator_list) {
+                inject(&mut new_f.args, receiver);
             }
             Stmt::FunctionDef(new_f)
+        }
+        Stmt::AsyncFunctionDef(f) => {
+            let mut new_f = f.clone();
+            if let Some(receiver) = receiver_for(&new_f.decorator_list) {
+                inject(&mut new_f.args, receiver);
+            }
+            Stmt::AsyncFunctionDef(new_f)
         }
         other => other.clone(),
     }
@@ -1137,6 +1191,30 @@ mod tests {
         let out = parse_and_desugar(src);
         // `def greet(self):` must appear exactly once, not `def greet(self, self):`.
         assert_eq!(out.matches("def greet(self):").count(), 1, "output:\n{out}");
+    }
+
+    #[test]
+    fn impl_block_async_method_gets_self() {
+        let src = "class Fetcher:\n    url: str\n\nclass __typhon_impl_Fetcher(object):\n    async def fetch():\n        pass\n";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("async def fetch(self):"), "async method must get self; output:\n{out}");
+        assert!(!out.contains("__typhon_impl_"), "impl stub must be removed; output:\n{out}");
+    }
+
+    #[test]
+    fn impl_block_staticmethod_no_self_injected() {
+        let src = "class Util:\n    x: int\n\nclass __typhon_impl_Util(object):\n    @staticmethod\n    def helper():\n        pass\n";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("def helper():"), "staticmethod must not get self; output:\n{out}");
+        assert!(!out.contains("def helper(self)"), "output:\n{out}");
+    }
+
+    #[test]
+    fn impl_block_classmethod_gets_cls() {
+        let src = "class Repo:\n    name: str\n\nclass __typhon_impl_Repo(object):\n    @classmethod\n    def create():\n        return cls()\n";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("def create(cls):"), "classmethod must get cls; output:\n{out}");
+        assert!(!out.contains("def create(self)"), "output:\n{out}");
     }
 
     #[test]

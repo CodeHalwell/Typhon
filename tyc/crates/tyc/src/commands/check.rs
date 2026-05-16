@@ -25,9 +25,23 @@ pub struct CheckArgs {
 }
 
 pub fn run(args: CheckArgs) -> Result<()> {
-    // Load strictness config from `typhon.toml` (search from CWD upward).
-    // Missing config is fine — defaults are used; a malformed one is an error.
-    let config = match TyphonConfig::load(std::path::Path::new(".")) {
+    // Load strictness config from `typhon.toml`, anchoring the search to the
+    // first checked path (or CWD when none is provided) so that
+    // `tyc check path/to/project` uses that project's config, not the caller's.
+    let config_start = args
+        .paths
+        .first()
+        .map(|p| {
+            if p.is_file() {
+                p.parent()
+                    .map(|d| d.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("."))
+            } else {
+                p.clone()
+            }
+        })
+        .unwrap_or_else(|| PathBuf::from("."));
+    let config = match TyphonConfig::load(&config_start) {
         Ok(Some((_, cfg))) => cfg,
         Ok(None) => TyphonConfig::default(),
         Err(e) => return Err(miette!("{e}")),

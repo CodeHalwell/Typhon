@@ -244,6 +244,11 @@ pub fn preprocess(source: &str) -> PreprocessResult {
 /// Build the class-header portion of an `impl` line, converting
 /// `ClassName:\n` into `__typhon_impl_ClassName(object):\n`.
 ///
+/// `impl` blocks do not accept base-class lists; any `(...)` suffix on the
+/// class name is stripped rather than forwarded, preventing a Python syntax
+/// error from a doubly-parenthesised expression like
+/// `class __typhon_impl_User(Base)(object):`.
+///
 /// Returns `None` when the line doesn't look like a class header (no `:`).
 fn make_impl_class_line(after_impl: &str) -> Option<String> {
     let mut depth = 0i32;
@@ -260,7 +265,13 @@ fn make_impl_class_line(after_impl: &str) -> Option<String> {
         }
     }
     let colon_pos = colon_pos?;
-    let name = after_impl[..colon_pos].trim_end();
+    let raw = after_impl[..colon_pos].trim_end();
+    // Strip any base-class list — `impl` blocks don't support inheritance.
+    let name = if let Some(paren) = raw.find('(') {
+        raw[..paren].trim_end()
+    } else {
+        raw
+    };
     let tail = &after_impl[colon_pos..]; // ":\n" or ":"
     Some(format!("__typhon_impl_{}(object){}", name, tail))
 }

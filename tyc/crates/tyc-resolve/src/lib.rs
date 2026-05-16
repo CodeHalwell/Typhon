@@ -566,8 +566,13 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
             }
             let cls_scope = r.push_scope(ScopeKind::Class, scope);
             collect_top_level(r, cls_scope, &c.body);
+            let is_impl_stub = c.name.as_str().starts_with("__typhon_impl_");
             for s in &c.body {
-                walk_stmt(r, cls_scope, s);
+                if is_impl_stub {
+                    walk_impl_method(r, cls_scope, s);
+                } else {
+                    walk_stmt(r, cls_scope, s);
+                }
             }
         }
         Stmt::Assign(a) => {
@@ -735,6 +740,52 @@ fn walk_argument_annotations(
         if let Some(ann) = &kw.annotation {
             walk_expr(r, scope, ann);
         }
+    }
+}
+
+/// Walk a single statement from an `impl` pseudo-class body.
+///
+/// Identical to [`walk_stmt`] for `FunctionDef` and `AsyncFunctionDef`, but
+/// additionally pre-declares a synthetic `self` binding in each method's
+/// scope.  The desugar pass injects `self` as the actual first parameter
+/// later; this declaration prevents false "unknown name: self" errors during
+/// resolution.  All other statement kinds fall through to [`walk_stmt`].
+fn walk_impl_method(r: &mut Resolver, cls_scope: ScopeId, stmt: &Stmt<TextRange>) {
+    match stmt {
+        Stmt::FunctionDef(f) => {
+            for d in &f.decorator_list {
+                walk_expr(r, cls_scope, d);
+            }
+            walk_argument_annotations(r, cls_scope, &f.args);
+            if let Some(ret) = &f.returns {
+                walk_expr(r, cls_scope, ret);
+            }
+            let fn_scope = r.push_scope(ScopeKind::Function, cls_scope);
+            // Pre-declare the implicit `self` the desugar pass will inject.
+            r.declare(fn_scope, "self", BindingKind::Parameter, Mutability::Var, (0, 0));
+            declare_arguments(r, fn_scope, &f.args);
+            collect_top_level(r, fn_scope, &f.body);
+            for s in &f.body {
+                walk_stmt(r, fn_scope, s);
+            }
+        }
+        Stmt::AsyncFunctionDef(f) => {
+            for d in &f.decorator_list {
+                walk_expr(r, cls_scope, d);
+            }
+            walk_argument_annotations(r, cls_scope, &f.args);
+            if let Some(ret) = &f.returns {
+                walk_expr(r, cls_scope, ret);
+            }
+            let fn_scope = r.push_scope(ScopeKind::Function, cls_scope);
+            r.declare(fn_scope, "self", BindingKind::Parameter, Mutability::Var, (0, 0));
+            declare_arguments(r, fn_scope, &f.args);
+            collect_top_level(r, fn_scope, &f.body);
+            for s in &f.body {
+                walk_stmt(r, fn_scope, s);
+            }
+        }
+        other => walk_stmt(r, cls_scope, other),
     }
 }
 
@@ -971,10 +1022,6 @@ fn builtin_names() -> std::collections::HashSet<&'static str> {
         "env",
         // Pydantic BaseModel — injected by the `model` keyword preprocessor.
         "BaseModel",
-        // `self` is implicitly injected as the first parameter of every method
-        // in an `impl` block by the desugar pass. Recognising it here prevents
-        // false "unknown name: self" errors in method bodies.
-        "self",
     ];
     names.iter().copied().collect()
 }
@@ -1038,10 +1085,25 @@ mod tests {
 
     #[test]
     fn self_in_impl_method_body_not_flagged() {
-        // `self` is injected by the desugar pass; the resolver must not flag
-        // it as an unknown name when it appears in a method body.
-        let (_m, d) = resolve("def greet():\n    return self.name\n");
-        assert!(!d.has_errors(), "self must not be unknown: {:?}", d.errors());
+        // Simulates what the preprocessor produces from `impl User: def greet():`.
+        // `self` is injected by the desugar pass; the resolver must not flag it
+        // as unknown when it appears inside an impl pseudo-class method body.
+        let (_m, d) = resolve(
+            "class __typhon_impl_User(object):\n    def greet():\n        return self.name\n",
+        );
+        assert!(!d.has_errors(), "self inside impl method must not be unknown: {:?}", d.errors());
+    }
+
+    #[test]
+    fn self_outside_impl_method_is_unknown() {
+        // `self` used in a plain module-level function must still be flagged.
+        let (_m, d) = resolve("def f():\n    return self\n");
+        assert!(d.has_errors(), "self outside impl must be an unknown name");
+        assert!(
+            d.errors().iter().any(|e| format!("{e}").contains("'self'")),
+            "error must mention 'self'; errors: {:?}",
+            d.errors()
+        );
     }
 
     #[test]

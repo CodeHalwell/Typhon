@@ -10,20 +10,22 @@ use crate::config::TyphonConfig;
 /// Re-classify warnings as errors according to the `[strictness]` config section.
 ///
 /// Currently handles `unused-import`:
-/// - `"warn"` (default): `UnusedImport` diagnostics remain warnings.
-/// - `"error"`: `UnusedImport` diagnostics are promoted to errors.
+/// - `"warn"`: `UnusedImport` diagnostics remain warnings.
+/// - `"error"` (default): `UnusedImport` diagnostics are promoted to errors.
 ///
-/// All other warnings are passed through unchanged.
+/// All other warnings are passed through unchanged.  The function consumes the
+/// input `Diagnostics` to avoid cloning individual diagnostics.
 pub fn apply_strictness(diags: Diagnostics, config: &TyphonConfig) -> Diagnostics {
     let promote_unused_import = config.strictness.unused_import == "error";
     if !promote_unused_import {
         return diags;
     }
+    let (errors, warnings) = diags.into_parts();
     let mut new_diags = Diagnostics::new();
-    for err in diags.errors().iter().cloned() {
+    for err in errors {
         new_diags.push_error(err);
     }
-    for warn in diags.warnings().iter().cloned() {
+    for warn in warnings {
         if matches!(warn, TycError::UnusedImport { .. }) {
             new_diags.push_error(warn);
         } else {
