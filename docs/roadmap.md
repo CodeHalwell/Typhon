@@ -21,13 +21,13 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 - Non-nullable by default with flow narrowing on `is None`, `is not None`, and `isinstance(x, T)` checks. `T?` is sugar for `T | None`.
 - `tyc check` emits useful "unknown name", "type mismatch", "nullable use", and "wrong argument count" diagnostics via `miette`.
 
-## Phase 2 — Class and value features (months 6–8)
+## Phase 2 — Class and value features (months 6–8) — substantially complete
 
-- Class emission as `@dataclass(slots=True)`; the `model` keyword for Pydantic, with `extra='forbid'` injected by default (override via `[emit] model-extra`).
-- Sealed unions and exhaustive `match`. (High-value and mechanically simple — front-load it.)
-- `Result[T, E]` type and the `?` operator; `with`-chains.
-- Comptime constants with `env()` lookup. Build fails on missing required env.
-- `tower-lsp-server` backend: diagnostics and hover working in VS Code.
+- ✅ Class emission as `@dataclass(slots=True)`; the `model` keyword for Pydantic, with `extra='forbid'` injected by default (override via `[emit] model-extra`).
+- ✅ Sealed unions and exhaustive `match`. (High-value and mechanically simple — front-loaded.)
+- ✅ `Result[T, E]` type, the `?` operator, and `with`-chains (multi-line `with name = expr?, …:` sequencing with an optional `else err:` block).
+- ✅ Comptime constants with `env()` lookup. Build fails on missing required env.
+- ☐ `tower-lsp-server` backend: diagnostics and hover working in VS Code. The crate is currently a 4-line stub; the `tyc lsp` subcommand prints a "not yet implemented" notice.
 
 ## Phase 3 — Structural typing and advanced features (months 9–12)
 
@@ -39,7 +39,7 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 - `gather` block lowered to `asyncio.TaskGroup` by default (cancels siblings on first failure). `gather(strategy="best-effort"):` for `asyncio.gather(..., return_exceptions=True)`.
 - `go` lowered through `typhon_runtime.tasks.spawn` with a strong-ref registry — never to a bare `asyncio.create_task`.
 - Lazy imports — `lazy import np = numpy` only; `lazy from x import a, b` is rejected because it defeats deferral. Module-level `lazy val` uses a sentinel + lock helper, instance-level uses `cached_property`.
-- Pipe operator, guards, extension methods.
+- ✅ Pipe operator `a |> f |> g(arg)` lowered to `g(f(a), arg)` left-associatively in the preprocessor. Guards in `match` cases pass through to Python directly (no extra desugaring needed). Extension methods still pending.
 - `.dty` stub files **and** `.pyi` interop emission; `tyc check --stubs` ports mypy's `stubtest` for drift detection. `unsafe` blocks for untyped library interop.
 
 At the end of Phase 3 — roughly month twelve — Typhon is useful for a real backend or CLI project. Everything beyond is polish and ambition.

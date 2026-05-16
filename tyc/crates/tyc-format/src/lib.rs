@@ -19,7 +19,7 @@ use std::path::Path;
 use tyc_diagnostics::TycError;
 use tyc_syntax::{
     parser::parse_module,
-    preprocess::{postprocess, preprocess},
+    preprocess::{expand_pipes, expand_question_ops, expand_with_chains, postprocess, preprocess},
 };
 
 /// The outcome of formatting a single file.
@@ -39,12 +39,19 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
     let prep = preprocess(source);
 
     // Step 2: parse — validate syntax, discard AST.
-    // Use `prep.python_source` as the diagnostic source text so that the
-    // reported byte offset (which comes from parsing the preprocessed source)
-    // aligns correctly with the displayed code.
-    parse_module(&prep.python_source, path).map_err(|e| {
+    //
+    // The formatter does not want to rewrite the user's `?`, `|>`, or
+    // `with`-chain syntax (that's `tyc build`'s job), but the underlying
+    // Python parser cannot accept those constructs directly. Expand them in
+    // a throw-away copy of the source purely for validation; the normalised
+    // output below is still derived from `prep.python_source` so the Typhon
+    // sugar is preserved when the file is rewritten.
+    let validation_input = expand_question_ops(&expand_pipes(&expand_with_chains(
+        &prep.python_source,
+    )));
+    parse_module(&validation_input, path).map_err(|e| {
         let offset = usize::from(e.offset);
-        TycError::parse(path, &prep.python_source, e.to_string(), offset)
+        TycError::parse(path, &validation_input, e.to_string(), offset)
     })?;
 
     // Step 3: normalise whitespace on the pre-processed source.
@@ -198,6 +205,41 @@ mod tests {
             "whitespace-only line must collapse to empty, got: {:?}",
             result.output
         );
+    }
+
+    #[test]
+    fn format_accepts_question_operator() {
+        // `tyc fmt` must not reject Typhon-only syntax that the underlying
+        // Python parser would otherwise refuse. The source is preserved verbatim.
+        let src = "\
+def run() -> Result[int, str]:
+    val x = load()?
+    return Ok(x)
+";
+        let result = format_source(src, "<test>").unwrap();
+        assert!(result.output.contains("load()?"), "got:\n{}", result.output);
+        assert!(result.output.contains("val x"), "got:\n{}", result.output);
+    }
+
+    #[test]
+    fn format_accepts_pipe_operator() {
+        let src = "y = x |> f |> g\n";
+        let result = format_source(src, "<test>").unwrap();
+        assert!(result.output.contains("|>"), "got:\n{}", result.output);
+    }
+
+    #[test]
+    fn format_accepts_with_chain() {
+        let src = "\
+def run() -> Result[int, str]:
+    with x = f()?:
+        return Ok(x)
+    else err:
+        return Err(err)
+";
+        let result = format_source(src, "<test>").unwrap();
+        assert!(result.output.contains("with x = f()?:"), "got:\n{}", result.output);
+        assert!(result.output.contains("else err:"), "got:\n{}", result.output);
     }
 
     #[test]

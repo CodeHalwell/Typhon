@@ -18,7 +18,7 @@ use tyc_diagnostics::Diagnostics;
 use tyc_desugar::desugar_module;
 use tyc_emit::emit;
 use tyc_format::format_source;
-use tyc_syntax::preprocess::{expand_question_ops, preprocess};
+use tyc_syntax::preprocess::{expand_pipes, expand_question_ops, expand_with_chains, preprocess};
 
 use crate::commands::util::{apply_strictness, collect_ty_files};
 use crate::config::TyphonConfig;
@@ -146,9 +146,14 @@ pub fn run(args: BuildArgs) -> Result<()> {
     let mut needs_runtime = false;
 
     for (path, source) in &sources {
-        // Expand `?` operator before the regular preprocessor so that the
-        // Python parser never sees the Typhon-specific `?` syntax.
-        let expanded = expand_question_ops(source);
+        // Expand Typhon syntactic sugar in order:
+        //   1. `with`-chains lower to a flat sequence of guarded unwraps,
+        //   2. pipe operators rewrite `a |> f(b)` to `f(a, b)`,
+        //   3. the `?` operator unwraps any remaining `Result`-typed calls.
+        // After this the Python parser only sees standard Python plus the
+        // `val`/`var`/`model`/`impl`/`comptime` keywords stripped by
+        // `preprocess`.
+        let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(source)));
         let prep = preprocess(&expanded);
 
         let module = parse(&prep.python_source, Mode::Module, &path.display().to_string())
