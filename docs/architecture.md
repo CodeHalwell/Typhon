@@ -7,7 +7,7 @@ The `ttc` binary is a multi-stage compiler with an embedded LSP, structured as a
 ## Pipeline
 
 ```
-.tt source files
+.ty source files
         │
         ▼
 [tt-parser]    →  Typhon AST (Python AST + Typhon nodes)
@@ -95,6 +95,6 @@ Express each analysis as a Salsa query: `parse(file)`, `resolve(module)`, `infer
 
 Pipeline: Typhon AST → desugar to plain Python AST → `ruff_python_codegen` → `ruff_python_formatter`. Emitted files carry a generated-header comment.
 
-Source maps mapping `.py` line/column back to `.tt` are written as a sidecar `.py.map` file. The LSP uses these for go-to-definition across the boundary; `ttc trace` maps Python tracebacks back to Typhon source.
+Source maps mapping `.py` line/column back to `.ty` are written as a sidecar `.py.map` file. The LSP uses these for go-to-definition across the boundary; `ttc trace` maps Python tracebacks back to Typhon source.
 
 There is deliberately **no Typhon-specific runtime package** the user must install. The handful of helpers needed (`Result`/`Ok`/`Err`, `lazy_import`, `str_to_slug`-style extension shims) are emitted inline into each project as a generated `typhon_runtime/` module the build owns.

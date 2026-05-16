@@ -1,6 +1,6 @@
 //! `ttc fmt` — Typhon source formatter.
 //!
-//! Pipeline for a single `.tt` file:
+//! Pipeline for a single `.ty` file:
 //!
 //! 1. Pre-process: strip `val`/`var` keywords so the Python parser can handle
 //!    the remainder of the grammar.
@@ -55,8 +55,8 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TtcError>
     //   • Expand tabs to 4 spaces.
     let normalised = normalise_whitespace(&prep.python_source);
 
-    // Step 4: post-process — restore val/var keywords.
-    let output = postprocess(&normalised, &prep.stripped);
+    // Step 4: post-process — restore val/var keywords and `?` sugar.
+    let output = postprocess(&normalised, &prep.stripped, &prep.optionals);
 
     let changed = output != source;
     Ok(FormatResult { output, changed })
@@ -81,7 +81,7 @@ fn normalise_whitespace(source: &str) -> String {
     result
 }
 
-/// Format the `.tt` file at `path` in place.
+/// Format the `.ty` file at `path` in place.
 ///
 /// Returns `true` if the file was changed.
 pub fn format_file(path: &Path) -> Result<bool, TtcError> {

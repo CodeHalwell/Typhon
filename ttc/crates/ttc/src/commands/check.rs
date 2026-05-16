@@ -1,17 +1,22 @@
-//! `ttc check` — parse and type-check without emitting code.
+//! `ttc check` — parse, resolve, and type-check without emitting code.
+//!
+//! Runs the full Phase-1 pipeline: pre-process → parse → resolve
+//! (scopes + `val`/`var` enforcement + unknown-name diagnostics) → type
+//! check (nominal types, non-null narrowing, argument-count and
+//! argument-type checks). Diagnostics are rendered via miette.
 
 use std::path::PathBuf;
 
 use clap::Args;
 use miette::{miette, Result};
 
+use ttc_db::{check_file, TtcDatabase};
 use ttc_diagnostics::{Diagnostics, TtcError};
-use ttc_syntax::{parser::parse_module, preprocess::preprocess};
 
 /// Arguments for `ttc check`.
 #[derive(Args, Debug)]
 pub struct CheckArgs {
-    /// `.tt` files or directories to check.
+    /// `.ty` files or directories to check.
     #[arg(value_name = "PATH", default_value = ".")]
     pub paths: Vec<PathBuf>,
 }
@@ -19,9 +24,10 @@ pub struct CheckArgs {
 pub fn run(args: CheckArgs) -> Result<()> {
     let mut diags = Diagnostics::new();
     let mut file_count = 0usize;
+    let mut db = TtcDatabase::new();
 
     for root in &args.paths {
-        collect_tt_files(root, &mut |path| {
+        collect_ty_files(root, &mut |path| {
             file_count += 1;
 
             let source = match std::fs::read_to_string(path) {
@@ -32,18 +38,8 @@ pub fn run(args: CheckArgs) -> Result<()> {
                 }
             };
 
-            let prep = preprocess(&source);
-
-            // The parse error offset is relative to `prep.python_source`, so
-            // use that as the diagnostic source text to keep spans aligned.
-            if let Err(e) = parse_module(&prep.python_source, &path.display().to_string()) {
-                diags.push_error(TtcError::parse(
-                    path.display().to_string(),
-                    &prep.python_source,
-                    e.to_string(),
-                    usize::from(e.offset),
-                ));
-            }
+            let file_diags = check_file(&mut db, path.display().to_string(), source);
+            diags.extend(file_diags);
         })?;
     }
 
@@ -62,12 +58,12 @@ pub fn run(args: CheckArgs) -> Result<()> {
     Ok(())
 }
 
-fn collect_tt_files<F>(root: &PathBuf, f: &mut F) -> Result<()>
+fn collect_ty_files<F>(root: &PathBuf, f: &mut F) -> Result<()>
 where
     F: FnMut(&PathBuf),
 {
     if root.is_file() {
-        if root.extension().map(|e| e == "tt").unwrap_or(false) {
+        if root.extension().map(|e| e == "ty").unwrap_or(false) {
             f(root);
         }
         return Ok(());
@@ -80,7 +76,7 @@ where
             .collect();
         paths.sort();
         for path in paths {
-            collect_tt_files(&path, f)?;
+            collect_ty_files(&path, f)?;
         }
     }
     Ok(())

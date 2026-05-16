@@ -10,7 +10,7 @@ Typhon ships a single binary, `ttc`, that handles every stage of the workflow. S
 |---------|---------|
 | `ttc build` | Full pipeline: parse, check, analyse, desugar, emit, format. |
 | `ttc check` | Up to analyser, no emit. Used by CI. |
-| `ttc fmt` | Format `.tt` source. Wraps `ruff format` applied to a Typhon-aware pretty-printer. |
+| `ttc fmt` | Format `.ty` source. Wraps `ruff format` applied to a Typhon-aware pretty-printer. |
 | `ttc lsp` | Run as a Language Server. |
 | `ttc init` | Scaffold a new project: `typhon.toml`, `src/`, `tests/`. |
 | `ttc trace` | Map a Python traceback back to Typhon source via `.py.map` files. |

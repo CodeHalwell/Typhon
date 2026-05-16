@@ -33,7 +33,7 @@ pub enum Commands {
     /// Parse and type-check only — no code emission. For use in CI.
     Check(commands::check::CheckArgs),
 
-    /// Format `.tt` source files in place.
+    /// Format `.ty` source files in place.
     Fmt(commands::fmt::FmtArgs),
 
     /// Run as a Language Server (LSP) on stdio.

@@ -1,4 +1,4 @@
-//! `ttc fmt` — format `.tt` source files.
+//! `ttc fmt` — format `.ty` source files.
 
 use std::path::PathBuf;
 
@@ -10,9 +10,9 @@ use ttc_format::format_file;
 /// Arguments for `ttc fmt`.
 #[derive(Args, Debug)]
 pub struct FmtArgs {
-    /// `.tt` files or directories to format.
+    /// `.ty` files or directories to format.
     ///
-    /// When a directory is given, all `.tt` files within it are formatted
+    /// When a directory is given, all `.ty` files within it are formatted
     /// recursively.  Defaults to the current directory (`.`).
     #[arg(value_name = "PATH", default_value = ".")]
     pub paths: Vec<PathBuf>,
@@ -28,7 +28,7 @@ pub fn run(args: FmtArgs) -> Result<()> {
     let mut total = 0usize;
 
     for root in &args.paths {
-        collect_tt_files(root, &mut |path| {
+        collect_ty_files(root, &mut |path| {
             total += 1;
 
             if args.check {
@@ -62,7 +62,7 @@ pub fn run(args: FmtArgs) -> Result<()> {
     }
 
     if total == 0 {
-        eprintln!("ttc fmt: no .tt files found");
+        eprintln!("ttc fmt: no .ty files found");
     } else if !args.check {
         println!(
             "{} file{} reformatted, {} unchanged",
@@ -75,13 +75,13 @@ pub fn run(args: FmtArgs) -> Result<()> {
     Ok(())
 }
 
-/// Recursively collect `.tt` files under `root` and call `f` for each.
-fn collect_tt_files<F>(root: &PathBuf, f: &mut F) -> Result<()>
+/// Recursively collect `.ty` files under `root` and call `f` for each.
+fn collect_ty_files<F>(root: &PathBuf, f: &mut F) -> Result<()>
 where
     F: FnMut(&PathBuf) -> std::result::Result<(), ttc_diagnostics::TtcError>,
 {
     if root.is_file() {
-        if root.extension().map(|e| e == "tt").unwrap_or(false) {
+        if root.extension().map(|e| e == "ty").unwrap_or(false) {
             f(root).map_err(miette::Report::new)?;
         }
         return Ok(());
@@ -95,7 +95,7 @@ where
             .collect();
         paths.sort();
         for path in paths {
-            collect_tt_files(&path, f)?;
+            collect_ty_files(&path, f)?;
         }
     }
 

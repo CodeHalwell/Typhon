@@ -2,4 +2,12 @@
 name = "ttc-resolve"
 version.workspace = true
 edition.workspace = true
-description = "Name resolution and scope construction for Typhon (Phase 1+)"
+description = "Name resolution and scope construction for Typhon"
+
+[dependencies]
+rustpython-ast = { workspace = true }
+ttc-syntax = { workspace = true }
+ttc-diagnostics = { workspace = true }
+
+[dev-dependencies]
+rustpython-parser = { workspace = true }

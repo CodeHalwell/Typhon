@@ -2,4 +2,13 @@
 name = "ttc-types"
 version.workspace = true
 edition.workspace = true
-description = "Structural and nominal type checker for Typhon (Phase 1+)"
+description = "Nominal and structural type checker for Typhon"
+
+[dependencies]
+rustpython-ast = { workspace = true }
+ttc-syntax = { workspace = true }
+ttc-resolve = { workspace = true }
+ttc-diagnostics = { workspace = true }
+
+[dev-dependencies]
+rustpython-parser = { workspace = true }

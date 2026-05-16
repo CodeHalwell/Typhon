@@ -37,6 +37,9 @@ rustpython-ast = "0.4"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
+# Incremental computation (Phase 1+)
+salsa = "0.26"
+
 # Internal crates
 ttc-syntax      = { path = "crates/ttc-syntax" }
 ttc-diagnostics = { path = "crates/ttc-diagnostics" }

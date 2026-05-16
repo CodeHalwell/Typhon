@@ -2,4 +2,13 @@
 name = "ttc-db"
 version.workspace = true
 edition.workspace = true
-description = "Salsa incremental database for the Typhon compiler (Phase 1+)"
+description = "Salsa incremental database for the Typhon compiler"
+
+[dependencies]
+salsa = { workspace = true }
+ttc-syntax = { workspace = true }
+ttc-diagnostics = { workspace = true }
+ttc-resolve = { workspace = true }
+ttc-types = { workspace = true }
+rustpython-parser = { workspace = true }
+rustpython-ast = { workspace = true }

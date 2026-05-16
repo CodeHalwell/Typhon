@@ -7,7 +7,7 @@ Typhon stands on a lot of shoulders. These are the languages and tools to study 
 ## Languages
 
 - **TypeScript** — closest analogue. Scanner → parser → binder → checker → emitter. The `checker.ts` file is the canonical reference for structural subtyping at scale. The "superset that emits the host language" framing is directly borrowed.
-- **Mojo** — cautionary tale. Pitched as a "Python superset," then walked back. **Lesson:** be honest about what subset of Python `.tt` accepts and emit a clean error for the rest.
+- **Mojo** — cautionary tale. Pitched as a "Python superset," then walked back. **Lesson:** be honest about what subset of Python `.ty` accepts and emit a clean error for the rest.
 - **Cython, Coconut, Hy** — older Python supersets. Useful for emission patterns; none built on modern Rust tooling.
 
 ## Tools
@@ -19,4 +19,4 @@ Typhon stands on a lot of shoulders. These are the languages and tools to study 
 
 ## Naming
 
-The project ships as **Typhon**. The name keeps phonetic kinship with Python without sounding like a portmanteau, and the mythology lines up (Typhon is the serpent-monster of Hesiod, sometimes treated as the father of Python). The binary is `ttc`, the file extension is `.tt`, the stub extension is `.dtt`, the config file is `typhon.toml`.
+The project ships as **Typhon**. The name keeps phonetic kinship with Python without sounding like a portmanteau, and the mythology lines up (Typhon is the serpent-monster of Hesiod, sometimes treated as the father of Python). The binary is `ttc`, the file extension is `.ty`, the stub extension is `.dty`, the config file is `typhon.toml`.

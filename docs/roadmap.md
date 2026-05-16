@@ -4,7 +4,7 @@
 
 Realistic milestones for one person plus AI assistance. The headline target is a useful subset shippable in twelve months.
 
-## Phase 0 — Foundation (months 1–2) ✅ in progress
+## Phase 0 — Foundation (months 1–2) ✅ complete
 
 - Fork `ruff_python_parser` and `ruff_python_ast` into `vendor/`.
 - Add one or two custom tokens (`val`, `var`) to confirm the fork-extend workflow.
@@ -12,13 +12,14 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 - `clap`-based `ttc` shell with `ttc fmt` working as the simplest end-to-end command.
 - `miette` + `thiserror` diagnostic infrastructure.
 
-## Phase 1 — Core types (months 3–5)
+## Phase 1 — Core types (months 3–5) ✅ complete
 
-- Salsa db with `parse` and `resolve` queries.
-- Name resolution and scope construction; `val`/`var` enforcement (no types yet).
-- Nominal types: function signatures, assignment compatibility, primitive types, classes.
-- Non-nullable by default with flow narrowing on guards and `isinstance` checks.
-- `ttc check` produces useful "unknown name" and "type mismatch" diagnostics via `miette`.
+- Salsa db with cached `preprocessed_text` and `module_decl_names` queries; richer queries unlock as their outputs become `salsa::Update`-friendly.
+- Name resolution and scope construction with module / function / class / comprehension scopes.
+- `val` / `var` enforcement: reassigning a `val` is a hard error; top-level bindings default to `val`.
+- Nominal types: function signatures, assignment compatibility, primitive types, classes, generic containers.
+- Non-nullable by default with flow narrowing on `is None`, `is not None`, and `isinstance(x, T)` checks. `T?` is sugar for `T | None`.
+- `ttc check` emits useful "unknown name", "type mismatch", "nullable use", and "wrong argument count" diagnostics via `miette`.
 
 ## Phase 2 — Class and value features (months 6–8)
 
@@ -36,7 +37,7 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 - Explicit `gather` block for `asyncio.gather`.
 - Lazy imports and `lazy val`.
 - Pipe operator, guards, extension methods.
-- `.dtt` stub files and `unsafe` blocks for untyped library interop.
+- `.dty` stub files and `unsafe` blocks for untyped library interop.
 
 At the end of Phase 3 — roughly month twelve — Typhon is useful for a real backend or CLI project. Everything beyond is polish and ambition.
 
@@ -46,8 +47,8 @@ At the end of Phase 3 — roughly month twelve — Typhon is useful for a real b
 - Loop parallelisation for pure comprehensions on free-threaded Python.
 - Richer comptime: `comptime` functions, types as values.
 - PGO via `ttc profile`.
-- LSP completions and code actions; go-to-definition across `.tt` and `.py` boundaries via source maps.
-- Migration tooling from typed `.py` to `.tt` (`Optional[T]` → `T?`, dataclasses → Typhon classes, etc.).
+- LSP completions and code actions; go-to-definition across `.ty` and `.py` boundaries via source maps.
+- Migration tooling from typed `.py` to `.ty` (`Optional[T]` → `T?`, dataclasses → Typhon classes, etc.).
 
 ## Scope-cutting rule
 

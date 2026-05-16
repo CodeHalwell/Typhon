@@ -28,7 +28,7 @@ declares a finite, sealed sum type. `match` on a sealed union must cover every v
 
 ### No implicit `Any`
 
-`Any` is a top type, but its inference is a compile error outside an explicit `unsafe` block. Untyped library calls must be wrapped in `unsafe` or shimmed with a `.dtt` stub. Strictly stricter than TypeScript's `noImplicitAny`.
+`Any` is a top type, but its inference is a compile error outside an explicit `unsafe` block. Untyped library calls must be wrapped in `unsafe` or shimmed with a `.dty` stub. Strictly stricter than TypeScript's `noImplicitAny`.
 
 ## Classes and `impl` blocks
 

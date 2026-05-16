@@ -2,7 +2,7 @@
 
 A statically-typed, stricter superset of Python that compiles to clean, readable CPython 3.13+ code with no runtime dependency on the toolchain.
 
-> Every `.tt` file emits valid, idiomatic `.py`. Not all `.py` is valid Typhon.
+> Every `.ty` file emits valid, idiomatic `.py`. Not all `.py` is valid Typhon.
 
 The compiler and language server live in a single Rust binary called `ttc`.
 
@@ -50,7 +50,7 @@ cargo build --release
 |---------|---------|
 | `ttc build` | Full pipeline: parse, check, analyse, desugar, emit, format |
 | `ttc check` | Parse and type-check only — no emission. For CI use |
-| `ttc fmt` | Format `.tt` source files in place |
+| `ttc fmt` | Format `.ty` source files in place |
 | `ttc lsp` | Run as a Language Server on stdio |
 | `ttc init` | Scaffold a new project: `typhon.toml`, `src/`, `tests/` |
 | `ttc trace` | Map a Python traceback back to Typhon source via `.py.map` files |
@@ -60,13 +60,22 @@ See [docs/cli.md](docs/cli.md) for the full reference.
 
 ## Project status
 
-**Phase 0 — Foundation** is in progress:
+**Phase 0 — Foundation** complete:
 
 - ✅ Cargo workspace skeleton with `crates/` and `vendor/` directories
 - ✅ `val`/`var` keyword tokens (immutable and mutable bindings)
-- ✅ `ttc fmt` — parses and validates `.tt` source, normalises whitespace
+- ✅ `ttc fmt` — parses and validates `.ty` source, normalises whitespace
 - ✅ `ttc check` — validates syntax and emits miette diagnostics
 - ✅ `ttc init` — scaffolds new projects with `typhon.toml`
+
+**Phase 1 — Core types** complete:
+
+- ✅ Salsa db with `preprocessed_text` and `module_decl_names` queries
+- ✅ Name resolution and scope construction; `val`/`var` enforcement
+- ✅ Nominal types: function signatures, assignment compatibility, primitives, classes
+- ✅ Non-nullable by default with flow narrowing on `is None` / `is not None` / `isinstance`
+- ✅ `T?` syntax sugar for `T | None` in annotations
+- ✅ `ttc check` emits "unknown name", "type mismatch", and "nullable use" diagnostics via miette
 
 See [docs/roadmap.md](docs/roadmap.md) for the phased plan through Phase 3 (month twelve) and beyond.
 
@@ -104,9 +113,9 @@ ttc/
 ├── Cargo.toml                  (workspace root)
 ├── crates/
 │   ├── ttc-syntax/             Typhon lexer/parser
-│   ├── ttc-db/                 Salsa database (Phase 1+)
-│   ├── ttc-resolve/            Name resolution (Phase 1+)
-│   ├── ttc-types/              Type checker (Phase 1+)
+│   ├── ttc-db/                 Salsa incremental database
+│   ├── ttc-resolve/            Name resolution and scope construction
+│   ├── ttc-types/              Nominal type checker with non-null narrowing
 │   ├── ttc-analyse/            Purity, async, comptime (Phase 2+)
 │   ├── ttc-desugar/            Typhon AST → Python AST (Phase 2+)
 │   ├── ttc-emit/               Python codegen
