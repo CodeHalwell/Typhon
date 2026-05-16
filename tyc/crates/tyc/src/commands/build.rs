@@ -102,7 +102,10 @@ pub fn run(args: BuildArgs) -> Result<()> {
             let out_path = out_dir.join(rel).with_extension("py");
 
             if let Some(parent) = out_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    all_diags.push_error(TycError::io(parent.display().to_string(), &e));
+                    return;
+                }
             }
 
             let mut content = String::with_capacity(GENERATED_HEADER.len() + python_src.len());
@@ -155,8 +158,9 @@ where
         let entries = std::fs::read_dir(root)
             .map_err(|e| miette!("cannot read directory {}: {}", root.display(), e))?;
         let mut paths: Vec<PathBuf> = entries
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .collect();
+            .map(|res| res.map(|e| e.path()))
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(|e| miette!("cannot read directory entry in {}: {}", root.display(), e))?;
         paths.sort();
         for path in paths {
             collect_ty_files(&path, f)?;
