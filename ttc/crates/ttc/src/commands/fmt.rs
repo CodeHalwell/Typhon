@@ -13,7 +13,7 @@ pub struct FmtArgs {
     /// `.tt` files or directories to format.
     ///
     /// When a directory is given, all `.tt` files within it are formatted
-    /// recursively.  Defaults to the `src` directory of the current project.
+    /// recursively.  Defaults to the current directory (`.`).
     #[arg(value_name = "PATH", default_value = ".")]
     pub paths: Vec<PathBuf>,
 
@@ -82,7 +82,7 @@ where
 {
     if root.is_file() {
         if root.extension().map(|e| e == "tt").unwrap_or(false) {
-            f(root).map_err(|e| miette!("{}", e))?;
+            f(root).map_err(miette::Report::new)?;
         }
         return Ok(());
     }

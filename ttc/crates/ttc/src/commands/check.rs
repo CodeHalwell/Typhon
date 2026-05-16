@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use clap::Args;
 use miette::{miette, Result};
 
-use ttc_diagnostics::TtcError;
+use ttc_diagnostics::{Diagnostics, TtcError};
 use ttc_syntax::{parser::parse_module, preprocess::preprocess};
 
 /// Arguments for `ttc check`.
@@ -17,43 +17,58 @@ pub struct CheckArgs {
 }
 
 pub fn run(args: CheckArgs) -> Result<()> {
-    let mut error_count = 0usize;
+    let mut diags = Diagnostics::new();
     let mut file_count = 0usize;
 
     for root in &args.paths {
         collect_tt_files(root, &mut |path| {
             file_count += 1;
-            let source = std::fs::read_to_string(path)
-                .map_err(|e| TtcError::io(path.display().to_string(), &e))?;
+
+            let source = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(e) => {
+                    diags.push_error(TtcError::io(path.display().to_string(), &e));
+                    return;
+                }
+            };
+
             let prep = preprocess(&source);
-            parse_module(&prep.python_source, &path.display().to_string())
-                .map(|_| ())
-                .map_err(|e| {
-                    TtcError::parse(
-                        path.display().to_string(),
-                        &source,
-                        e.to_string(),
-                        usize::from(e.offset),
-                    )
-                })
+
+            // The parse error offset is relative to `prep.python_source`, so
+            // use that as the diagnostic source text to keep spans aligned.
+            if let Err(e) = parse_module(&prep.python_source, &path.display().to_string()) {
+                diags.push_error(TtcError::parse(
+                    path.display().to_string(),
+                    &prep.python_source,
+                    e.to_string(),
+                    usize::from(e.offset),
+                ));
+            }
         })?;
     }
 
-    if error_count > 0 {
-        Err(miette!("{} error(s) found", error_count))
-    } else {
-        println!("checked {} file(s) — no errors", file_count);
-        Ok(())
+    if diags.has_errors() {
+        for err in diags.errors() {
+            eprintln!("{:?}", miette::Report::new_boxed(Box::new(err.clone())));
+        }
+        return Err(miette!(
+            "{} error(s) in {} file(s)",
+            diags.error_count(),
+            file_count
+        ));
     }
+
+    println!("checked {} file(s) — no errors", file_count);
+    Ok(())
 }
 
 fn collect_tt_files<F>(root: &PathBuf, f: &mut F) -> Result<()>
 where
-    F: FnMut(&PathBuf) -> std::result::Result<(), TtcError>,
+    F: FnMut(&PathBuf),
 {
     if root.is_file() {
         if root.extension().map(|e| e == "tt").unwrap_or(false) {
-            f(root).map_err(|e| miette!("{}", e))?;
+            f(root);
         }
         return Ok(());
     }

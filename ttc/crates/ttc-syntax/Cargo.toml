@@ -2,7 +2,7 @@
 name = "ttc-syntax"
 version.workspace = true
 edition.workspace = true
-description = "Typhon parser and AST — extends ruff_python_parser with Typhon-specific tokens"
+description = "Typhon lexer and parser — extends rustpython-parser with Typhon-specific tokens (val, var)"
 
 [dependencies]
 rustpython-parser = { workspace = true }

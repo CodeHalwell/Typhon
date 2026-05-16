@@ -409,7 +409,7 @@ impl Emitter {
                 }
                 self.leave_block();
                 for handler in &t.handlers {
-                    self.emit_except_handler(handler);
+                    self.emit_except_handler(handler, false);
                 }
                 if !t.orelse.is_empty() {
                     self.fill("else:");
@@ -440,7 +440,7 @@ impl Emitter {
                 }
                 self.leave_block();
                 for handler in &t.handlers {
-                    self.emit_except_handler(handler);
+                    self.emit_except_handler(handler, true);
                 }
                 if !t.orelse.is_empty() {
                     self.fill("else:");
@@ -1004,10 +1004,14 @@ impl Emitter {
         }
     }
 
-    fn emit_except_handler(&mut self, handler: &ExceptHandler<TextRange>) {
+    fn emit_except_handler(&mut self, handler: &ExceptHandler<TextRange>, star: bool) {
         match handler {
             ExceptHandler::ExceptHandler(h) => {
-                self.fill("except");
+                if star {
+                    self.fill("except*");
+                } else {
+                    self.fill("except");
+                }
                 if let Some(typ) = &h.type_ {
                     self.write(" ");
                     self.emit_expr(typ);
