@@ -126,6 +126,14 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A `comptime` binding could not be evaluated at build time.
+    #[error("comptime evaluation failed for '{name}': {message}")]
+    #[diagnostic(
+        code(tyc::comptime),
+        help("comptime expressions support: literals, env(\"NAME\"), env(\"NAME\", \"default\"), int(), str(), float(), and basic arithmetic")
+    )]
+    Comptime { name: String, message: String },
+
     /// Generic error with a human-readable message (used during early phases).
     #[error("{message}")]
     #[diagnostic(code(tyc::generic))]
@@ -264,6 +272,14 @@ impl TycError {
             missing: missing.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::Comptime`] diagnostic.
+    pub fn comptime(name: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::Comptime {
+            name: name.into(),
+            message: message.into(),
         }
     }
 
