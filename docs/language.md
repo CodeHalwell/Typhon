@@ -28,7 +28,7 @@ declares a finite, sealed sum type. `match` on a sealed union must cover every v
 
 ### No implicit `Any`
 
-`Any` is a top type, but its inference is a compile error outside an explicit `unsafe` block. Untyped library calls must be wrapped in `unsafe` or shimmed with a `.dtt` stub. Strictly stricter than TypeScript's `noImplicitAny`.
+`Any` is a top type, but its inference is a compile error outside an explicit `unsafe` block. Untyped library calls must be wrapped in `unsafe` or shimmed with a `.dty` stub. Strictly stricter than TypeScript's `noImplicitAny`.
 
 ## Classes and `impl` blocks
 
@@ -143,7 +143,7 @@ When `typhon.toml` sets `free-threaded = true`, the analyser emits `ThreadPoolEx
 
 ## Compile-time evaluation (`comptime`)
 
-`comptime` bindings are evaluated by `ttc` at compile time in a sandboxed interpreter that supports pure arithmetic, string operations, environment-variable lookup via `env(name, default?)`, simple container construction, and calls to other `comptime` functions. Results are inlined as literals.
+`comptime` bindings are evaluated by `tyc` at compile time in a sandboxed interpreter that supports pure arithmetic, string operations, environment-variable lookup via `env(name, default?)`, simple container construction, and calls to other `comptime` functions. Results are inlined as literals.
 
 Build-time env validation alone is worth shipping.
 

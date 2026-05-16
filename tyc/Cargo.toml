@@ -1,0 +1,53 @@
+[workspace]
+members = [
+    "crates/tyc",
+    "crates/tyc-syntax",
+    "crates/tyc-diagnostics",
+    "crates/tyc-emit",
+    "crates/tyc-format",
+    "crates/tyc-db",
+    "crates/tyc-resolve",
+    "crates/tyc-types",
+    "crates/tyc-analyse",
+    "crates/tyc-desugar",
+    "crates/tyc-lsp",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Typhon Contributors"]
+license = "MIT"
+repository = "https://github.com/CodeHalwell/Typhon"
+
+[workspace.dependencies]
+# CLI
+clap = { version = "4.6", features = ["derive", "wrap_help"] }
+
+# Diagnostics
+miette = { version = "7", features = ["fancy"] }
+thiserror = "2"
+
+# Parser (fallback: rustpython-parser from crates.io)
+rustpython-parser = "0.4"
+rustpython-ast = "0.4"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Incremental computation (Phase 1+)
+salsa = "0.26"
+
+# Internal crates
+tyc-syntax      = { path = "crates/tyc-syntax" }
+tyc-diagnostics = { path = "crates/tyc-diagnostics" }
+tyc-emit        = { path = "crates/tyc-emit" }
+tyc-format      = { path = "crates/tyc-format" }
+tyc-db          = { path = "crates/tyc-db" }
+tyc-resolve     = { path = "crates/tyc-resolve" }
+tyc-types       = { path = "crates/tyc-types" }
+tyc-analyse     = { path = "crates/tyc-analyse" }
+tyc-desugar     = { path = "crates/tyc-desugar" }
+tyc-lsp         = { path = "crates/tyc-lsp" }

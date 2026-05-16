@@ -2,12 +2,12 @@
 
 > Excerpted from the [long-term plan](long-term-plan.md). The plan is the source of truth.
 
-The `ttc` binary is a multi-stage compiler with an embedded LSP, structured as a Cargo workspace of small crates that mirror the pipeline stages. Each stage produces a typed Rust value that the next stage consumes; analysis results are stored as Salsa queries so the LSP can reuse them incrementally.
+The `tyc` binary is a multi-stage compiler with an embedded LSP, structured as a Cargo workspace of small crates that mirror the pipeline stages. Each stage produces a typed Rust value that the next stage consumes; analysis results are stored as Salsa queries so the LSP can reuse them incrementally.
 
 ## Pipeline
 
 ```
-.tt source files
+.ty source files
         │
         ▼
 [tt-parser]    →  Typhon AST (Python AST + Typhon nodes)
@@ -34,20 +34,20 @@ The `ttc` binary is a multi-stage compiler with an embedded LSP, structured as a
 ## Workspace layout
 
 ```
-ttc/
+tyc/
 ├── Cargo.toml                  (workspace root)
 ├── crates/
-│   ├── ttc-syntax/             forked ruff_python_ast + parser, Typhon nodes
-│   ├── ttc-db/                 Salsa database, input/tracked queries
-│   ├── ttc-resolve/            name resolution, imports, val/var
-│   ├── ttc-types/              structural + nominal type checker
-│   ├── ttc-analyse/            purity, async-gather, comptime, DCE
-│   ├── ttc-desugar/            Typhon AST → Python AST lowering
-│   ├── ttc-emit/               Python codegen via vendored ruff_python_codegen
-│   ├── ttc-format/             post-process emitter output through ruff format
-│   ├── ttc-diagnostics/        miette-based diagnostic rendering
-│   ├── ttc-lsp/                tower-lsp-server Backend over ttc-db
-│   └── ttc/                    thin CLI binary, clap subcommands
+│   ├── tyc-syntax/             forked ruff_python_ast + parser, Typhon nodes
+│   ├── tyc-db/                 Salsa database, input/tracked queries
+│   ├── tyc-resolve/            name resolution, imports, val/var
+│   ├── tyc-types/              structural + nominal type checker
+│   ├── tyc-analyse/            purity, async-gather, comptime, DCE
+│   ├── tyc-desugar/            Typhon AST → Python AST lowering
+│   ├── tyc-emit/               Python codegen via vendored ruff_python_codegen
+│   ├── tyc-format/             post-process emitter output through ruff format
+│   ├── tyc-diagnostics/        miette-based diagnostic rendering
+│   ├── tyc-lsp/                tower-lsp-server Backend over tyc-db
+│   └── tyc/                    thin CLI binary, clap subcommands
 └── vendor/
     ├── ruff_python_ast/        forked from Ruff monorepo
     ├── ruff_python_parser/     forked and extended with Typhon tokens
@@ -95,6 +95,6 @@ Express each analysis as a Salsa query: `parse(file)`, `resolve(module)`, `infer
 
 Pipeline: Typhon AST → desugar to plain Python AST → `ruff_python_codegen` → `ruff_python_formatter`. Emitted files carry a generated-header comment.
 
-Source maps mapping `.py` line/column back to `.tt` are written as a sidecar `.py.map` file. The LSP uses these for go-to-definition across the boundary; `ttc trace` maps Python tracebacks back to Typhon source.
+Source maps mapping `.py` line/column back to `.ty` are written as a sidecar `.py.map` file. The LSP uses these for go-to-definition across the boundary; `tyc trace` maps Python tracebacks back to Typhon source.
 
 There is deliberately **no Typhon-specific runtime package** the user must install. The handful of helpers needed (`Result`/`Ok`/`Err`, `lazy_import`, `str_to_slug`-style extension shims) are emitted inline into each project as a generated `typhon_runtime/` module the build owns.

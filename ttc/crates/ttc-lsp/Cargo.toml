@@ -1,5 +1,0 @@
-[package]
-name = "ttc-lsp"
-version.workspace = true
-edition.workspace = true
-description = "Language Server Protocol backend for Typhon (Phase 2+)"

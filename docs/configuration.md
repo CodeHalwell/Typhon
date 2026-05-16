@@ -2,7 +2,7 @@
 
 > Excerpted from the [long-term plan](long-term-plan.md). The plan is the source of truth.
 
-Each Typhon project has a `typhon.toml` at its root, written by `ttc init` and read by every subcommand. Standard `pip`/`uv` workflows handle dependencies — Typhon does not ship a package manager.
+Each Typhon project has a `typhon.toml` at its root, written by `tyc init` and read by every subcommand. Standard `pip`/`uv` workflows handle dependencies — Typhon does not ship a package manager.
 
 ## Full example
 
