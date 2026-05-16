@@ -100,8 +100,20 @@ pub fn check_file(db: &mut TycDatabase, path: String, text: String) -> Diagnosti
 
     // Validate `?` operator context before expanding it.  This runs on the
     // original Typhon source so it can reason about indentation-based scopes.
+    // Return early on any errors: invalid `?` usage causes `expand_question_ops`
+    // to inject `return` at top level, which would produce a cascading parse
+    // error that obscures the real problem.
     for err in validate_question_ops(&text) {
-        diags.push_error(TycError::invalid_question_op(err.message));
+        diags.push_error(TycError::invalid_question_op(
+            err.message,
+            &path,
+            &text,
+            err.offset,
+            1,
+        ));
+    }
+    if diags.has_errors() {
+        return diags;
     }
 
     // Expand `?` operator before preprocessing so the Python parser sees

@@ -286,12 +286,27 @@ impl<'a> Resolver<'a> {
     }
 
     fn report_unused_imports(&mut self) {
-        // Build the set of all referenced names across all scopes.
-        let used: std::collections::HashSet<&str> =
-            self.references.iter().map(|r| r.name.as_str()).collect();
+        // Resolve each reference to the specific binding it refers to (by
+        // walking the scope chain, exactly like report_unknown_names does).
+        // This correctly handles name shadowing: a local `os` parameter does
+        // not mark a module-level `import os` as used.
+        let mut used_bindings: std::collections::HashSet<(usize, usize)> =
+            std::collections::HashSet::new();
 
-        for scope in &self.scopes {
-            for binding in &scope.bindings {
+        for r in &self.references {
+            let mut current = Some(r.scope);
+            while let Some(id) = current {
+                let scope = &self.scopes[id];
+                if let Some(idx) = scope.bindings.iter().position(|b| b.name == r.name) {
+                    used_bindings.insert((id, idx));
+                    break;
+                }
+                current = scope.parent;
+            }
+        }
+
+        for (scope_id, scope) in self.scopes.iter().enumerate() {
+            for (binding_idx, binding) in scope.bindings.iter().enumerate() {
                 if binding.kind != BindingKind::Import {
                     continue;
                 }
@@ -299,7 +314,11 @@ impl<'a> Resolver<'a> {
                 if binding.name == "*" {
                     continue;
                 }
-                if !used.contains(binding.name.as_str()) {
+                // `_`-prefixed names are conventionally "intentionally unused".
+                if binding.name.starts_with('_') {
+                    continue;
+                }
+                if !used_bindings.contains(&(scope_id, binding_idx)) {
                     let length = binding.span_length().max(1);
                     self.diagnostics.push_warning(TycError::unused_import(
                         binding.name.clone(),
@@ -1118,5 +1137,25 @@ mod tests {
         assert_eq!(d.warning_count(), 1, "only `os` should warn");
         let msg = format!("{}", d.warnings()[0]);
         assert!(msg.contains("os"), "got: {msg}");
+    }
+
+    #[test]
+    fn import_shadowed_by_parameter_still_warns() {
+        // The `os` reference inside `f` resolves to the parameter, not the
+        // import.  The import at module scope is never the resolved target of
+        // any reference, so it must still warn as unused.
+        let src = "import os\ndef f(os: str) -> None:\n    print(os)\n";
+        let (_m, d) = resolve(src);
+        assert_eq!(d.warning_count(), 1, "shadowed import must still warn");
+        let msg = format!("{}", d.warnings()[0]);
+        assert!(msg.contains("os"), "got: {msg}");
+    }
+
+    #[test]
+    fn underscore_prefixed_import_not_warned() {
+        // `_unused` is the conventional marker for intentionally-unused names.
+        let src = "import os as _unused\nval x: int = 1\n";
+        let (_m, d) = resolve(src);
+        assert_eq!(d.warning_count(), 0, "_-prefixed import must not warn");
     }
 }
