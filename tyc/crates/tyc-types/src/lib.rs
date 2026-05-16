@@ -20,10 +20,10 @@
 //! useful diagnostics on a meaningful subset of programs, not full
 //! coverage.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rustpython_ast::text_size::TextRange;
-use rustpython_ast::{Constant, Expr, Mod, Ranged, Stmt};
+use rustpython_ast::{Constant, Expr, MatchCase, Mod, Operator, Pattern, Ranged, Stmt};
 use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_resolve::{Binding, BindingKind, ResolvedModule, ScopeId};
 
@@ -296,6 +296,9 @@ struct Checker<'a> {
     classes: Vec<String>,
     /// For each declared function name, its inferred signature type.
     function_signatures: HashMap<String, Type>,
+    /// Sealed union declarations: name → ordered list of variant class names.
+    /// Populated from `type Foo = A | B | C` statements in the first pass.
+    sealed_unions: HashMap<String, Vec<String>>,
     env: TypeEnv,
     diagnostics: Diagnostics,
     /// Return type of the function whose body we are currently checking
@@ -311,10 +314,30 @@ impl<'a> Checker<'a> {
             resolved,
             classes: Vec::new(),
             function_signatures: HashMap::new(),
+            sealed_unions: HashMap::new(),
             env: TypeEnv::default(),
             diagnostics: Diagnostics::new(),
             current_return: None,
         }
+    }
+
+    /// Assignment compatibility check that accounts for sealed-union subtyping.
+    ///
+    /// A class that is a declared variant of a sealed union is assignable to
+    /// the union's name.  All other rules delegate to the module-level
+    /// [`assignable`] function.
+    fn is_assignable(&self, expected: &Type, actual: &Type) -> bool {
+        if assignable(expected, actual) {
+            return true;
+        }
+        // Variant → sealed union coercion: Circle is assignable to Shape when
+        // `type Shape = Circle | Rectangle | ...` has been declared.
+        if let (Type::Class(exp_name), Type::Class(act_name)) = (expected, actual) {
+            if let Some(variants) = self.sealed_unions.get(exp_name.as_str()) {
+                return variants.iter().any(|v| v == act_name);
+            }
+        }
+        false
     }
 
     fn mismatch(&mut self, expected: &Type, actual: &Type, span: (usize, usize)) {
@@ -364,6 +387,23 @@ impl<'a> Checker<'a> {
             length,
         ));
     }
+
+    fn non_exhaustive_match(
+        &mut self,
+        union_name: &str,
+        missing: &str,
+        span: (usize, usize),
+    ) {
+        let length = span.1.saturating_sub(span.0).max(1);
+        self.diagnostics.push_error(TycError::non_exhaustive_match(
+            union_name,
+            missing,
+            &self.path,
+            self.source,
+            span.0,
+            length,
+        ));
+    }
 }
 
 /// Run the type checker on `module` and return diagnostics.
@@ -393,10 +433,24 @@ pub fn check_module(
 }
 
 fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt<TextRange>]) {
-    // First find all class names so type_from_annotation can resolve them.
+    // First pass: collect class names and sealed union declarations so that
+    // type_from_annotation can resolve them and match exhaustiveness can be
+    // checked.
     for stmt in body {
-        if let Stmt::ClassDef(cd) = stmt {
-            c.classes.push(cd.name.as_str().to_owned());
+        match stmt {
+            Stmt::ClassDef(cd) => {
+                c.classes.push(cd.name.as_str().to_owned());
+            }
+            Stmt::TypeAlias(ta) => {
+                if let Expr::Name(n) = ta.name.as_ref() {
+                    let union_name = n.id.as_str().to_owned();
+                    if let Some(variants) = extract_sealed_union_variants(&ta.value) {
+                        c.classes.push(union_name.clone());
+                        c.sealed_unions.insert(union_name, variants);
+                    }
+                }
+            }
+            _ => {}
         }
     }
     // Now record function signatures.
@@ -477,7 +531,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt<TextRange>) {
             let ann_type = type_from_annotation(&a.annotation, &c.classes);
             if let Some(value) = &a.value {
                 let value_type = infer_expr(c, value);
-                if !assignable(&ann_type, &value_type) {
+                if !c.is_assignable(&ann_type, &value_type) {
                     let span = (
                         value.range().start().to_usize(),
                         value.range().end().to_usize(),
@@ -510,7 +564,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt<TextRange>) {
                     if let Some(b) = existing {
                         // Reassignment: the static type stays as declared;
                         // check the new value fits.
-                        if !assignable(&b.declared, &value_type) {
+                        if !c.is_assignable(&b.declared, &value_type) {
                             let vspan = (
                                 a.value.range().start().to_usize(),
                                 a.value.range().end().to_usize(),
@@ -542,7 +596,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt<TextRange>) {
         Stmt::Return(ret) => {
             if let (Some(ret_expr), Some(expected)) = (&ret.value, c.current_return.clone()) {
                 let value_type = infer_expr(c, ret_expr);
-                if !matches!(expected, Type::Unknown) && !assignable(&expected, &value_type) {
+                if !matches!(expected, Type::Unknown) && !c.is_assignable(&expected, &value_type) {
                     let span = (
                         ret_expr.range().start().to_usize(),
                         ret_expr.range().end().to_usize(),
@@ -551,7 +605,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt<TextRange>) {
                 }
             } else if ret.value.is_none() {
                 if let Some(expected) = c.current_return.clone() {
-                    if !matches!(expected, Type::Unknown) && !assignable(&expected, &Type::None) {
+                    if !matches!(expected, Type::Unknown) && !c.is_assignable(&expected, &Type::None) {
                         let span = (
                             ret.range.start().to_usize(),
                             ret.range.end().to_usize(),
@@ -619,6 +673,30 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt<TextRange>) {
             }
             for s in &t.finalbody {
                 check_stmt(c, s);
+            }
+        }
+        Stmt::Match(m) => {
+            let subject_type = infer_expr(c, &m.subject);
+            for case in &m.cases {
+                if let Some(guard) = &case.guard {
+                    let _ = infer_expr(c, guard);
+                }
+                c.env.enter();
+                bind_pattern_names(c, &case.pattern);
+                for s in &case.body {
+                    check_stmt(c, s);
+                }
+                c.env.leave();
+            }
+            // Exhaustiveness check: only applies to sealed unions.
+            if let Type::Class(ref union_name) = subject_type {
+                if let Some(variants) = c.sealed_unions.get(union_name.as_str()).cloned() {
+                    let subject_span = (
+                        m.subject.range().start().to_usize(),
+                        m.subject.range().end().to_usize(),
+                    );
+                    check_match_exhaustiveness(c, &m.cases, union_name, &variants, subject_span);
+                }
             }
         }
         _ => {}
@@ -892,7 +970,7 @@ fn infer_expr(c: &mut Checker, expr: &Expr<TextRange>) -> Type {
                             break;
                         }
                         let actual = infer_expr(c, arg);
-                        if !assignable(&params[i], &actual) {
+                        if !c.is_assignable(&params[i], &actual) {
                             let span = (
                                 arg.range().start().to_usize(),
                                 arg.range().end().to_usize(),
@@ -952,6 +1030,176 @@ fn infer_expr(c: &mut Checker, expr: &Expr<TextRange>) -> Type {
         Expr::Dict(_) => Type::Generic("dict".into(), vec![Type::Unknown, Type::Unknown]),
         Expr::Set(_) => Type::Generic("set".into(), vec![Type::Unknown]),
         _ => Type::Unknown,
+    }
+}
+
+// ── sealed union helpers ──────────────────────────────────────────────────────
+
+/// Extract the list of variant class names from a `type Foo = A | B | C`
+/// value expression.  Returns `None` if the expression is not a pure union of
+/// bare names (meaning it is not a sealed union declaration we can track).
+fn extract_sealed_union_variants(expr: &Expr<TextRange>) -> Option<Vec<String>> {
+    match expr {
+        Expr::BinOp(b) if matches!(b.op, Operator::BitOr) => {
+            let mut names = Vec::new();
+            collect_union_names_from_expr(&b.left, &mut names)?;
+            collect_union_names_from_expr(&b.right, &mut names)?;
+            if names.len() >= 2 {
+                Some(names)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Recursively flatten a `A | B | C` expression tree into a list of names.
+/// Returns `None` if any node is not a bare name or a BitOr.
+fn collect_union_names_from_expr(expr: &Expr<TextRange>, names: &mut Vec<String>) -> Option<()> {
+    match expr {
+        Expr::Name(n) => {
+            names.push(n.id.as_str().to_owned());
+            Some(())
+        }
+        Expr::BinOp(b) if matches!(b.op, Operator::BitOr) => {
+            collect_union_names_from_expr(&b.left, names)?;
+            collect_union_names_from_expr(&b.right, names)?;
+            Some(())
+        }
+        _ => None,
+    }
+}
+
+// ── match exhaustiveness ──────────────────────────────────────────────────────
+
+/// Check that a `match` statement on a sealed union covers all variants or
+/// has a wildcard arm.  Emits a [`TycError::NonExhaustiveMatch`] if not.
+fn check_match_exhaustiveness(
+    c: &mut Checker,
+    cases: &[MatchCase<TextRange>],
+    union_name: &str,
+    variants: &[String],
+    subject_span: (usize, usize),
+) {
+    let mut covered: HashSet<String> = HashSet::new();
+    let mut has_wildcard = false;
+
+    for case in cases {
+        if is_wildcard_pattern(&case.pattern) {
+            has_wildcard = true;
+            break;
+        }
+        collect_matched_class_names(&case.pattern, &mut covered);
+    }
+
+    if has_wildcard {
+        return;
+    }
+
+    let missing: Vec<&str> = variants
+        .iter()
+        .filter(|v| !covered.contains(v.as_str()))
+        .map(String::as_str)
+        .collect();
+
+    if !missing.is_empty() {
+        let missing_str = missing.join(", ");
+        c.non_exhaustive_match(union_name, &missing_str, subject_span);
+    }
+}
+
+/// Return `true` if this pattern unconditionally matches any value (wildcard).
+///
+/// Both `case _:` and `case x:` (bare name capture) are wildcards.
+fn is_wildcard_pattern(pattern: &Pattern<TextRange>) -> bool {
+    match pattern {
+        // `case _:` → MatchAs { pattern: None, name: None }
+        // `case x:` → MatchAs { pattern: None, name: Some("x") }
+        // Both are wildcards: they always match.
+        Pattern::MatchAs(a) => a.pattern.is_none(),
+        Pattern::MatchOr(o) => o.patterns.iter().any(is_wildcard_pattern),
+        _ => false,
+    }
+}
+
+/// Collect the class names matched by `PatternMatchClass` nodes in a pattern.
+fn collect_matched_class_names(pattern: &Pattern<TextRange>, covered: &mut HashSet<String>) {
+    match pattern {
+        Pattern::MatchClass(mc) => {
+            if let Expr::Name(n) = mc.cls.as_ref() {
+                covered.insert(n.id.as_str().to_owned());
+            }
+        }
+        Pattern::MatchOr(o) => {
+            for p in &o.patterns {
+                collect_matched_class_names(p, covered);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Declare pattern-bound names in the current scope as `Type::Unknown`, so
+/// that references to them inside the case body do not produce spurious
+/// "unknown name" errors.
+fn bind_pattern_names(c: &mut Checker, pattern: &Pattern<TextRange>) {
+    match pattern {
+        Pattern::MatchAs(a) => {
+            if let Some(name) = &a.name {
+                c.env.declare(TypeBinding {
+                    name: name.as_str().to_owned(),
+                    declared: Type::Unknown,
+                    narrowed: Type::Unknown,
+                    span: (0, 0),
+                });
+            }
+            if let Some(inner) = &a.pattern {
+                bind_pattern_names(c, inner);
+            }
+        }
+        Pattern::MatchStar(s) => {
+            if let Some(name) = &s.name {
+                c.env.declare(TypeBinding {
+                    name: name.as_str().to_owned(),
+                    declared: Type::Unknown,
+                    narrowed: Type::Unknown,
+                    span: (0, 0),
+                });
+            }
+        }
+        Pattern::MatchMapping(m) => {
+            if let Some(rest) = &m.rest {
+                c.env.declare(TypeBinding {
+                    name: rest.as_str().to_owned(),
+                    declared: Type::Unknown,
+                    narrowed: Type::Unknown,
+                    span: (0, 0),
+                });
+            }
+            for p in &m.patterns {
+                bind_pattern_names(c, p);
+            }
+        }
+        Pattern::MatchClass(mc) => {
+            for p in &mc.patterns {
+                bind_pattern_names(c, p);
+            }
+            for p in &mc.kwd_patterns {
+                bind_pattern_names(c, p);
+            }
+        }
+        Pattern::MatchOr(o) => {
+            if let Some(first) = o.patterns.first() {
+                bind_pattern_names(c, first);
+            }
+        }
+        Pattern::MatchSequence(seq) => {
+            for p in &seq.patterns {
+                bind_pattern_names(c, p);
+            }
+        }
+        Pattern::MatchValue(_) | Pattern::MatchSingleton(_) => {}
     }
 }
 
@@ -1111,6 +1359,142 @@ def f(x: typing.Union[int, str]) -> int:
     if isinstance(x, int):
         return x
     return 0
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    // ── sealed union tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn variant_assignable_to_sealed_union() {
+        let src = "\
+class Circle:
+    radius: int
+
+class Rectangle:
+    width: int
+
+type Shape = Circle | Rectangle
+
+val s: Shape = Circle()
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn exhaustive_match_passes() {
+        let src = "\
+class Circle:
+    radius: int
+
+class Rectangle:
+    width: int
+
+type Shape = Circle | Rectangle
+
+val s: Shape = Circle()
+
+match s:
+    case Circle():
+        pass
+    case Rectangle():
+        pass
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn non_exhaustive_match_errors() {
+        let src = "\
+class Circle:
+    radius: int
+
+class Rectangle:
+    width: int
+
+class Triangle:
+    base: int
+
+type Shape = Circle | Rectangle | Triangle
+
+val s: Shape = Circle()
+
+match s:
+    case Circle():
+        pass
+    case Rectangle():
+        pass
+";
+        let d = check(src);
+        assert!(d.has_errors(), "expected non-exhaustive-match error");
+        let msg = format!("{}", d.errors()[0]);
+        assert!(
+            msg.contains("Triangle"),
+            "error should name missing variant Triangle, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn wildcard_arm_satisfies_exhaustiveness() {
+        let src = "\
+class Circle:
+    radius: int
+
+class Rectangle:
+    width: int
+
+class Triangle:
+    base: int
+
+type Shape = Circle | Rectangle | Triangle
+
+val s: Shape = Circle()
+
+match s:
+    case Circle():
+        pass
+    case _:
+        pass
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn named_capture_arm_satisfies_exhaustiveness() {
+        let src = "\
+class Circle:
+    radius: int
+
+class Rectangle:
+    width: int
+
+type Shape = Circle | Rectangle
+
+val s: Shape = Circle()
+
+match s:
+    case Circle():
+        pass
+    case other:
+        pass
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn non_sealed_match_not_checked() {
+        // A `match` on a plain int is not subject to exhaustiveness rules.
+        let src = "\
+val x: int = 1
+
+match x:
+    case 1:
+        pass
 ";
         let d = check(src);
         assert!(!d.has_errors(), "{:?}", d.errors());

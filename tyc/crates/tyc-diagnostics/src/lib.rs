@@ -111,6 +111,21 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A `match` on a sealed union does not cover all variants and has no wildcard arm.
+    #[error("non-exhaustive `match` on sealed union `{union_name}`: missing variant(s) {missing}")]
+    #[diagnostic(
+        code(tyc::non_exhaustive_match),
+        help("add `case {missing}():` arm(s), or add a `case _:` wildcard arm")
+    )]
+    NonExhaustiveMatch {
+        union_name: String,
+        missing: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("match is not exhaustive")]
+        span: SourceSpan,
+    },
+
     /// Generic error with a human-readable message (used during early phases).
     #[error("{message}")]
     #[diagnostic(code(tyc::generic))]
@@ -236,6 +251,23 @@ impl TycError {
     }
 
     /// Construct an [`TycError::ImmutableAssign`] diagnostic.
+    /// Construct a [`TycError::NonExhaustiveMatch`] diagnostic.
+    pub fn non_exhaustive_match(
+        union_name: impl Into<String>,
+        missing: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::NonExhaustiveMatch {
+            union_name: union_name.into(),
+            missing: missing.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
     pub fn immutable_assign(
         name: impl Into<String>,
         path: impl Into<String>,
