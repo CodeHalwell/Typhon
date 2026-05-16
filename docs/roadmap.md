@@ -21,13 +21,13 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 - Non-nullable by default with flow narrowing on `is None`, `is not None`, and `isinstance(x, T)` checks. `T?` is sugar for `T | None`.
 - `tyc check` emits useful "unknown name", "type mismatch", "nullable use", and "wrong argument count" diagnostics via `miette`.
 
-## Phase 2 — Class and value features (months 6–8) — substantially complete
+## Phase 2 — Class and value features (months 6–8) ✅ complete
 
 - ✅ Class emission as `@dataclass(slots=True)`; the `model` keyword for Pydantic, with `extra='forbid'` injected by default (override via `[emit] model-extra`).
 - ✅ Sealed unions and exhaustive `match`. (High-value and mechanically simple — front-loaded.)
 - ✅ `Result[T, E]` type, the `?` operator, and `with`-chains (multi-line `with name = expr?, …:` sequencing with an optional `else err:` block).
 - ✅ Comptime constants with `env()` lookup. Build fails on missing required env.
-- ☐ `tower-lsp-server` backend: diagnostics and hover working in VS Code. The crate is currently a 4-line stub; the `tyc lsp` subcommand prints a "not yet implemented" notice.
+- ✅ `tower-lsp-server` backend: `tyc lsp` runs on stdio, publishes diagnostics via the check pipeline on `did_open` / `did_change`, and serves a placeholder hover response. The richer hover (symbol type, doc string, definition link) lands once the resolver exposes a `(file, position)` query.
 
 ## Phase 3 — Structural typing and advanced features (months 9–12)
 

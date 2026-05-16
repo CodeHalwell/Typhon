@@ -77,7 +77,7 @@ See [docs/cli.md](docs/cli.md) for the full reference.
 - ✅ `T?` syntax sugar for `T | None` in annotations
 - ✅ `tyc check` emits "unknown name", "type mismatch", and "nullable use" diagnostics via miette
 
-**Phase 2 — Class and value features** substantially complete:
+**Phase 2 — Class and value features** complete:
 
 - ✅ Class emission as `@dataclass(slots=True)`; `model` keyword emits Pydantic with `extra='forbid'` by default
 - ✅ Sealed unions and exhaustive `match`
@@ -86,7 +86,7 @@ See [docs/cli.md](docs/cli.md) for the full reference.
 - ✅ `with`-chain Result sequencing with optional `else err:` block
 - ✅ `comptime val/var` with `env()` lookup; required env vars declared in `[env]`
 - ✅ `impl` blocks merged into class definitions at desugar
-- ☐ `tower-lsp-server` backend with diagnostics and hover (`tyc lsp` is currently a stub)
+- ✅ `tower-lsp-server` LSP backend: `tyc lsp` publishes diagnostics on `did_open` / `did_change` and serves a hover placeholder. Richer hover content lands with the resolver/type-checker position queries in Phase 3.
 
 **Phase 3 — Structural typing and advanced features** in progress:
 
