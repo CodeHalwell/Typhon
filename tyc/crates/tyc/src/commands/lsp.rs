@@ -10,15 +10,15 @@ use miette::Result;
 /// Arguments for `tyc lsp`.
 #[derive(Args, Debug)]
 pub struct LspArgs {
-    /// Log level for the LSP server (`error`, `warn`, `info`, `debug`).
-    ///
-    /// Accepted today for editor compatibility; the backend uses the
-    /// `client.log_message` channel for status messages regardless.
+    /// Severity threshold for status messages the LSP forwards to the editor
+    /// via the `window/logMessage` channel. One of `error`, `warn`, `info`,
+    /// `debug`. Defaults to `info`.
     #[arg(long, default_value = "info")]
     pub log_level: String,
 }
 
-pub fn run(_args: LspArgs) -> Result<()> {
-    tyc_lsp::run_stdio();
+pub fn run(args: LspArgs) -> Result<()> {
+    let level = tyc_lsp::LogLevel::parse(&args.log_level);
+    tyc_lsp::run_stdio(level);
     Ok(())
 }

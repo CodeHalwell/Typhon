@@ -1116,7 +1116,11 @@ fn collect_chain(
         return None;
     }
 
-    // Optional `else <name>:` continuation at the chain indent.
+    // Optional `else <name>:` continuation at the chain indent. The header
+    // must end with `:`; a malformed `else err` (no colon) is *not* silently
+    // accepted — the whole chain is rejected and emitted verbatim so the
+    // underlying Python parser surfaces a syntax error pointing at the
+    // mistake.
     let mut err_var = None;
     let mut else_body = Vec::new();
     if idx < lines.len() {
@@ -1124,8 +1128,19 @@ fn collect_chain(
         let raw = line.trim_end_matches(['\n', '\r']);
         let indent_len = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
         let header = raw[indent_len..].trim_end();
-        if indent_len == chain_indent.len() && (header == "else:" || header.starts_with("else ")) {
-            err_var = Some(parse_else_var(header).unwrap_or_else(|| "_err".to_owned()));
+        let is_else_header =
+            indent_len == chain_indent.len() && (header == "else:" || header.starts_with("else "));
+        if is_else_header {
+            // Require a trailing colon on the header. `else err` (no colon)
+            // is rejected so the user sees a Python-level syntax error.
+            if !header.ends_with(':') {
+                return None;
+            }
+            err_var = Some(if header == "else:" {
+                "_err".to_owned()
+            } else {
+                parse_else_var(header)?
+            });
             let _ = scan_line_code_end(raw, &mut in_string);
             idx += 1;
             while idx < lines.len() {
@@ -1194,10 +1209,35 @@ fn parse_else_var(header: &str) -> Option<String> {
 /// The success body lines originated one indent level inside the `with`
 /// header; after flattening they become siblings of the unwrap statements and
 /// must shed exactly that level. Else-body lines stay inside the new `if`
-/// block, so their original indent (one level inside `else err:`) is already
-/// correct.
+/// block, so their indent relative to the chain is preserved by emitting
+/// them verbatim. The unit-indent is detected from the source itself (the
+/// first non-blank body line) rather than assumed to be four spaces, so
+/// tab-indented or two-space code round-trips correctly.
 fn render_chain(chain: &WithChain, chain_indent: &str, counter: &mut usize) -> String {
     let mut out = String::new();
+
+    // Detect the body's own indent unit (the leading whitespace beyond the
+    // chain indent on the first non-blank body line). Fall back to four
+    // spaces only when the body is entirely blank, which is unreachable in
+    // valid Python but defensive against the corner case.
+    let unit_indent: String = chain
+        .body
+        .iter()
+        .find_map(|line| {
+            let trimmed = line.trim_end_matches(['\n', '\r']);
+            if trimmed.trim().is_empty() {
+                return None;
+            }
+            let leading_len = trimmed
+                .find(|c: char| !c.is_whitespace())
+                .unwrap_or(trimmed.len());
+            let leading = &trimmed[..leading_len];
+            leading
+                .strip_prefix(chain_indent)
+                .map(|extra| extra.to_owned())
+        })
+        .unwrap_or_else(|| "    ".to_owned());
+    let inner_indent = format!("{}{}", chain_indent, unit_indent);
 
     for binding in &chain.bindings {
         let tmp = format!("__typhon_with_{}__", *counter);
@@ -1216,9 +1256,9 @@ fn render_chain(chain: &WithChain, chain_indent: &str, counter: &mut usize) -> S
 
         match (&chain.err_var, !chain.else_body.is_empty()) {
             (Some(name), true) => {
-                // Bind `err = tmp.error` at one indent past the guard.
-                out.push_str(chain_indent);
-                out.push_str("    ");
+                // Bind `err = tmp.error` at one indent past the guard,
+                // using the detected unit indent.
+                out.push_str(&inner_indent);
                 out.push_str(name);
                 out.push_str(" = ");
                 out.push_str(&tmp);
@@ -1232,8 +1272,8 @@ fn render_chain(chain: &WithChain, chain_indent: &str, counter: &mut usize) -> S
                 }
             }
             _ => {
-                out.push_str(chain_indent);
-                out.push_str("    return ");
+                out.push_str(&inner_indent);
+                out.push_str("return ");
                 out.push_str(&tmp);
                 out.push('\n');
             }
@@ -1246,13 +1286,12 @@ fn render_chain(chain: &WithChain, chain_indent: &str, counter: &mut usize) -> S
         out.push_str(".value\n");
     }
 
-    // Success body: strip the one indent level that the `with` header was
-    // imposing on each line so the statements become siblings of the unwraps.
-    let body_strip = format!("{}    ", chain_indent);
+    // Success body: strip the unit-indent the `with` header imposed on each
+    // line so the statements become siblings of the unwraps.
     for line in &chain.body {
         if line.trim().is_empty() {
             out.push_str(line);
-        } else if let Some(stripped) = line.strip_prefix(body_strip.as_str()) {
+        } else if let Some(stripped) = line.strip_prefix(inner_indent.as_str()) {
             out.push_str(chain_indent);
             out.push_str(stripped);
         } else {
@@ -1292,6 +1331,9 @@ pub fn expand_pipes(source: &str) -> String {
     for line in source.split_inclusive('\n') {
         let pre_string = in_string;
         let raw = line.trim_end_matches(['\n', '\r']);
+        // Preserve the original line terminator (LF, CRLF, or bare-EOF) so
+        // mixed-newline files round-trip unchanged.
+        let terminator = &line[raw.len()..];
         let code_end = scan_line_code_end(raw, &mut in_string);
 
         if pre_string.is_some() {
@@ -1317,60 +1359,129 @@ pub fn expand_pipes(source: &str) -> String {
         };
 
         result.push_str(&rewritten);
-        // Preserve any trailing comment.
+        // Preserve any trailing comment, then re-attach the original
+        // newline bytes (which may be `\r\n` on Windows-authored files).
         result.push_str(&raw[code_end..]);
-        if line.ends_with('\n') {
-            result.push('\n');
-        }
+        result.push_str(terminator);
     }
 
     result
 }
 
 /// Locate every `|>` token in `code` that sits at parenthesis depth 0 and
-/// outside any string literal. Returns the byte offset of the `|` character
-/// in each occurrence.
+/// outside any string literal (single-, double-, or triple-quoted).
+/// Returns the byte offset of the `|` character in each occurrence.
 fn find_top_level_pipes(code: &str) -> Vec<usize> {
     let mut positions = Vec::new();
-    let mut depth: i32 = 0;
-    let mut in_str: Option<char> = None;
     let bytes = code.as_bytes();
+    scan_inline_code(code, |i, depth, _in_string| {
+        if depth == 0
+            && bytes[i] == b'|'
+            && i + 1 < bytes.len()
+            && bytes[i + 1] == b'>'
+            // Reject `||>` and `|>=` shapes (neither is valid Python today,
+            // but be defensive).
+            && (i == 0 || bytes[i - 1] != b'|')
+            && (i + 2 >= bytes.len() || bytes[i + 2] != b'=')
+        {
+            positions.push(i);
+            // Tell the scanner to skip the `>` so we don't re-enter this
+            // branch on the next byte.
+            return Some(2);
+        }
+        None
+    });
+    positions
+}
+
+/// Walk `code` byte-by-byte, tracking parenthesis depth and string state
+/// (including triple-quoted forms). Calls `step(i, depth, in_string)` for
+/// every byte position outside a string literal, and inside strings only
+/// to allow `step` to inspect the state. `step` may return `Some(skip)` to
+/// advance the cursor by `skip` extra bytes (used by token-aware callers
+/// like `find_top_level_pipes` once they've matched a multi-byte operator).
+///
+/// The scanner is byte-level and ASCII-safe: it only inspects bytes that
+/// are themselves ASCII (quotes, brackets, the backslash escape, and the
+/// matching closing quote), and otherwise transparently advances by one
+/// byte. UTF-8 continuation bytes never match any of these so multi-byte
+/// characters are passed through correctly.
+fn scan_inline_code<F>(code: &str, mut step: F)
+where
+    F: FnMut(usize, i32, Option<StringMode>) -> Option<usize>,
+{
+    let bytes = code.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_string: Option<StringMode> = None;
     let mut i = 0;
     while i < bytes.len() {
-        let c = bytes[i];
-        if let Some(q) = in_str {
-            // Honour backslash escapes inside single-line strings only.
-            if c == b'\\' && i + 1 < bytes.len() {
-                i += 2;
-                continue;
-            }
-            if c == q as u8 {
-                in_str = None;
-            }
-            i += 1;
+        if let Some(extra) = step(i, depth, in_string) {
+            i += extra;
             continue;
         }
-        match c {
-            b'\'' | b'"' => in_str = Some(c as char),
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => depth -= 1,
-            b'|' if depth == 0
-                && i + 1 < bytes.len()
-                && bytes[i + 1] == b'>'
-                // Reject `||>` and `|>=` shapes (neither is valid Python today,
-                // but be defensive).
-                && (i == 0 || bytes[i - 1] != b'|')
-                && (i + 2 >= bytes.len() || bytes[i + 2] != b'=') =>
-            {
-                positions.push(i);
-                i += 2;
-                continue;
+        let c = bytes[i];
+        match in_string {
+            Some(StringMode::Single) | Some(StringMode::Double) => {
+                // Single-line strings: honour backslash escapes, look for
+                // the matching closing quote.
+                let close = match in_string {
+                    Some(StringMode::Single) => b'\'',
+                    _ => b'"',
+                };
+                if c == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if c == close {
+                    in_string = None;
+                }
+                i += 1;
             }
-            _ => {}
+            Some(StringMode::TripleSingle) | Some(StringMode::TripleDouble) => {
+                let triple: &[u8] = match in_string {
+                    Some(StringMode::TripleSingle) => b"'''",
+                    _ => b"\"\"\"",
+                };
+                if i + 3 <= bytes.len() && &bytes[i..i + 3] == triple {
+                    in_string = None;
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+            }
+            None => match c {
+                b'\'' | b'"' => {
+                    let triple: &[u8] = if c == b'"' { b"\"\"\"" } else { b"'''" };
+                    if i + 3 <= bytes.len() && &bytes[i..i + 3] == triple {
+                        in_string = Some(if c == b'"' {
+                            StringMode::TripleDouble
+                        } else {
+                            StringMode::TripleSingle
+                        });
+                        i += 3;
+                    } else {
+                        in_string = Some(if c == b'"' {
+                            StringMode::Double
+                        } else {
+                            StringMode::Single
+                        });
+                        i += 1;
+                    }
+                }
+                b'(' | b'[' | b'{' => {
+                    depth += 1;
+                    i += 1;
+                }
+                b')' | b']' | b'}' => {
+                    depth -= 1;
+                    i += 1;
+                }
+                _ => {
+                    i += 1;
+                }
+            },
         }
-        i += 1;
     }
-    positions
 }
 
 /// Rewrite a single line `code` containing top-level pipe operators (at the
@@ -1414,8 +1525,13 @@ fn rewrite_pipe_line(code: &str, pipes: &[usize]) -> Option<String> {
     Some(format!("{}{}{}", indent, prefix, acc))
 }
 
-/// Strip an optional `return ` or `LHS = ` prefix from the head of a pipe
-/// chain so the chain only consumes the right-hand expression.
+/// Strip an optional `return ` or `LHS [op]= ` prefix from the head of a
+/// pipe chain so the chain only consumes the right-hand expression.
+///
+/// Supports both bare and augmented assignment (`+=`, `-=`, `*=`, `/=`,
+/// `%=`, `**=`, `//=`, `<<=`, `>>=`, `&=`, `|=`, `^=`, `@=`). The walrus
+/// `:=` is an *expression* operator, not a statement-level assignment, so
+/// it is treated as part of the chain LHS rather than a prefix.
 fn split_pipe_prefix(s: &str) -> (&str, &str) {
     // `return ` or `return\t`.
     if let Some(rest) = s.strip_prefix("return ") {
@@ -1428,13 +1544,74 @@ fn split_pipe_prefix(s: &str) -> (&str, &str) {
     if let Some(rest) = s.strip_prefix("yield ") {
         return (&s[..s.len() - rest.len()], rest);
     }
-    // Otherwise look for the first depth-0 `=` (assignment) that is not `==`.
-    if let Some(eq) = find_assignment_eq(s) {
-        let after = &s[eq + 1..];
+    // Otherwise look for an assignment-statement operator at depth 0.
+    if let Some(eq_end) = find_statement_assignment_end(s) {
+        let after = &s[eq_end..];
         let trim_start = after.len() - after.trim_start().len();
-        return (&s[..eq + 1 + trim_start], &after[trim_start..]);
+        return (&s[..eq_end + trim_start], &after[trim_start..]);
     }
     ("", s)
+}
+
+/// Locate the byte offset immediately after a statement-level assignment
+/// operator at parenthesis depth 0, outside any string literal. Recognises
+/// the bare `=` and every augmented form (`+=`, `-=`, `*=`, `/=`, `%=`,
+/// `**=`, `//=`, `<<=`, `>>=`, `&=`, `|=`, `^=`, `@=`). Returns `None` for
+/// the comparison operators (`==`, `!=`, `<=`, `>=`) and for the walrus
+/// `:=` so callers don't mistake them for assignments.
+fn find_statement_assignment_end(s: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut in_str: Option<char> = None;
+    let mut prev_char: Option<char> = None;
+    let mut prev_prev_char: Option<char> = None;
+    let bytes = s.as_bytes();
+    for (i, c) in s.char_indices() {
+        if let Some(q) = in_str {
+            if c == q {
+                in_str = None;
+            }
+            prev_prev_char = prev_char;
+            prev_char = Some(c);
+            continue;
+        }
+        match c {
+            '\'' | '"' => in_str = Some(c),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            '=' if depth == 0 => {
+                let next = bytes.get(i + 1).copied();
+                if next == Some(b'=') {
+                    // `==` — comparison, skip.
+                } else if prev_char == Some(':') || prev_char == Some('=') {
+                    // `:=` (walrus, not a statement-level assignment) or a
+                    // trailing `=` inside a longer `==`-style sequence.
+                } else if prev_char == Some('!') {
+                    // `!=` — comparison.
+                } else if prev_char == Some('<') {
+                    if prev_prev_char == Some('<') {
+                        // `<<=` — augmented assignment.
+                        return Some(i + 1);
+                    }
+                    // `<=` — comparison.
+                } else if prev_char == Some('>') {
+                    if prev_prev_char == Some('>') {
+                        // `>>=` — augmented assignment.
+                        return Some(i + 1);
+                    }
+                    // `>=` — comparison.
+                } else {
+                    // Bare `=` or augmented (`+=`, `-=`, `*=`, `**=`, `/=`,
+                    // `//=`, `%=`, `&=`, `|=`, `^=`, `@=`). All of these are
+                    // valid statement-level assignments.
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        prev_prev_char = prev_char;
+        prev_char = Some(c);
+    }
+    None
 }
 
 /// Combine an accumulated LHS expression with the next pipe segment.
@@ -1452,36 +1629,17 @@ fn apply_pipe_call(acc: &str, rhs: &str) -> Option<String> {
     }
 
     // Find the first `(` at depth 0 in the RHS (or `None` for bare callable).
+    // Uses the shared scanner so triple-quoted strings are handled correctly.
     let bytes = rhs.as_bytes();
-    let mut depth: i32 = 0;
-    let mut in_str: Option<char> = None;
     let mut paren_at: Option<usize> = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if let Some(q) = in_str {
-            if c == b'\\' && i + 1 < bytes.len() {
-                i += 2;
-                continue;
-            }
-            if c == q as u8 {
-                in_str = None;
-            }
-            i += 1;
-            continue;
+    scan_inline_code(rhs, |i, depth, in_string| {
+        if in_string.is_none() && depth == 0 && bytes[i] == b'(' {
+            paren_at = Some(i);
+            // Signal "stop scanning" by skipping to end.
+            return Some(bytes.len() - i);
         }
-        match c {
-            b'\'' | b'"' => in_str = Some(c as char),
-            b'(' if depth == 0 => {
-                paren_at = Some(i);
-                break;
-            }
-            b'[' | b'{' => depth += 1,
-            b']' | b'}' => depth -= 1,
-            _ => {}
-        }
-        i += 1;
-    }
+        None
+    });
 
     match paren_at {
         None => {
@@ -1620,7 +1778,10 @@ fn scan_line_code_end(line: &str, in_string: &mut Option<StringMode>) -> usize {
 }
 
 /// Find the position of the `=` assignment operator in `s`, ignoring `=`
-/// characters inside parentheses/brackets/strings and `==` comparisons.
+/// characters inside parentheses/brackets/strings, comparison operators
+/// (`==`, `!=`, `<=`, `>=`), augmented assignments (`+=`, `-=`, `*=`, `/=`,
+/// `%=`, `&=`, `|=`, `^=`, `**=`, `//=`, `<<=`, `>>=`, `@=`), and the walrus
+/// operator (`:=`).
 fn find_assignment_eq(s: &str) -> Option<usize> {
     let mut depth = 0i32;
     let mut in_str: Option<char> = None;
@@ -1638,10 +1799,33 @@ fn find_assignment_eq(s: &str) -> Option<usize> {
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth -= 1,
             '=' if depth == 0 => {
-                // Reject `==`, `!=`, `<=`, `>=`.
                 let prev = if i > 0 { s[..i].chars().last() } else { None };
                 let next = s[i + 1..].chars().next();
-                if !matches!(prev, Some('!' | '<' | '>' | '=')) && !matches!(next, Some('=')) {
+                // Reject `==`, `!=`, `<=`, `>=` (comparison; `prev == =` also
+                // covers `===` chains although Python rejects those), and
+                // augmented/walrus operators where `=` is preceded by one of
+                // `+ - * / % & | ^ : @`. (`**=`, `//=`, `<<=`, `>>=` are
+                // caught because their last char before `=` is one of those
+                // single-char operators already.)
+                let is_compound = matches!(
+                    prev,
+                    Some(
+                        '!' | '<'
+                            | '>'
+                            | '='
+                            | '+'
+                            | '-'
+                            | '*'
+                            | '/'
+                            | '%'
+                            | '&'
+                            | '|'
+                            | '^'
+                            | ':'
+                            | '@'
+                    )
+                );
+                if !is_compound && !matches!(next, Some('=')) {
                     return Some(i);
                 }
             }
@@ -2366,5 +2550,116 @@ def other() -> int:
         let out = expand_pipes(src);
         // No pipe inside parens; the top-level pipe is the only one at depth 0.
         assert_eq!(out, "y = f((z := x))\n");
+    }
+
+    #[test]
+    fn pipe_inside_triple_quoted_string_left_alone() {
+        // A `|>` inside a triple-quoted string must not be treated as a pipe
+        // — the apostrophe inside the contents previously confused the
+        // single-char string tracker. Ensure the line round-trips unchanged.
+        let src = "msg = \"\"\"don't use a |> b here\"\"\"\n";
+        let out = expand_pipes(src);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn pipe_after_closing_triple_quote_is_recognised() {
+        // A real `|>` *after* a closing `"""` should still be rewritten.
+        let src = "y = \"\"\"x\"\"\" |> str.strip\n";
+        let out = expand_pipes(src);
+        assert_eq!(out, "y = str.strip(\"\"\"x\"\"\")\n");
+    }
+
+    #[test]
+    fn pipe_preserves_crlf_line_endings() {
+        // Windows-authored files use `\r\n`; the rewriter must not silently
+        // convert them to `\n`.
+        let src = "y = x |> f\r\n";
+        let out = expand_pipes(src);
+        assert_eq!(out, "y = f(x)\r\n");
+    }
+
+    #[test]
+    fn find_assignment_eq_rejects_augmented_ops() {
+        // `+=`, `*=`, `:=`, `//=`, `**=`, `<<=`, `>>=`, `@=` are not
+        // bare assignments — `find_assignment_eq` should return None so the
+        // pipe-prefix splitter treats the whole line as a non-assignment.
+        assert!(find_assignment_eq("x += 1").is_none());
+        assert!(find_assignment_eq("x -= 1").is_none());
+        assert!(find_assignment_eq("x *= 2").is_none());
+        assert!(find_assignment_eq("x /= 2").is_none());
+        assert!(find_assignment_eq("x %= 2").is_none());
+        assert!(find_assignment_eq("x **= 2").is_none());
+        assert!(find_assignment_eq("x //= 2").is_none());
+        assert!(find_assignment_eq("x <<= 2").is_none());
+        assert!(find_assignment_eq("x >>= 2").is_none());
+        assert!(find_assignment_eq("x &= 2").is_none());
+        assert!(find_assignment_eq("x |= 2").is_none());
+        assert!(find_assignment_eq("x ^= 2").is_none());
+        assert!(find_assignment_eq("x := 2").is_none());
+        assert!(find_assignment_eq("x @= m").is_none());
+        // But a plain `=` is still found.
+        assert_eq!(find_assignment_eq("x = 1"), Some(2));
+    }
+
+    #[test]
+    fn pipe_with_augmented_assignment_prefix() {
+        // `x += a |> f` must split into "prefix = `x += `, chain = `a |> f`"
+        // and emit `x += f(a)` — not `x + = ...` (broken Python) and not
+        // `f(x += a)` (wraps the assignment).
+        assert_eq!(expand_pipes("x += a |> f\n"), "x += f(a)\n");
+        assert_eq!(expand_pipes("x *= a |> f\n"), "x *= f(a)\n");
+        assert_eq!(expand_pipes("x //= a |> f\n"), "x //= f(a)\n");
+        assert_eq!(expand_pipes("x <<= a |> f\n"), "x <<= f(a)\n");
+    }
+
+    #[test]
+    fn pipe_walrus_in_lhs_not_treated_as_prefix() {
+        // `:=` is an expression operator, not a statement assignment, so
+        // it must remain part of the chain LHS rather than being split off.
+        let out = expand_pipes("y = (z := x) |> f\n");
+        assert_eq!(out, "y = f((z := x))\n");
+    }
+
+    #[test]
+    fn with_chain_indent_detection_uses_two_space_body() {
+        // With a two-space body indent, the renderer must strip exactly two
+        // spaces (not four) so the success body lines up at the chain indent.
+        let src = "\
+def run() -> Result[str, str]:
+  with x = f()?:
+    return Ok(x)
+  else err:
+    return Err(err)
+";
+        let out = expand_with_chains(src);
+        // The success-body `return Ok(x)` was at 4 spaces (2 outer + 2 inner);
+        // after flattening it should sit at 2 spaces.
+        assert!(
+            out.contains("\n  return Ok(x)"),
+            "two-space indent not preserved: {out}"
+        );
+    }
+
+    #[test]
+    fn with_chain_else_header_without_colon_rejected() {
+        // `else err` (missing trailing `:`) is malformed; the chain should be
+        // emitted verbatim so the user sees a Python syntax error rather than
+        // a silent rewrite that defaults to `_err`.
+        let src = "\
+def run() -> Result[str, str]:
+    with x = f()?:
+        return Ok(x)
+    else err
+        return Err(err)
+";
+        let out = expand_with_chains(src);
+        // No rewrite occurred — the `with` keyword survives in the output.
+        assert!(
+            out.contains("with x = f()?:"),
+            "malformed chain should have been left verbatim: {out}"
+        );
+        // And no temporary was injected.
+        assert!(!out.contains("__typhon_with_"), "should not desugar: {out}");
     }
 }
