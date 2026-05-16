@@ -1150,6 +1150,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "miette",
+ "rustpython-parser",
  "serde",
  "thiserror",
  "toml",
@@ -1185,6 +1186,11 @@ dependencies = [
 [[package]]
 name = "tyc-desugar"
 version = "0.1.0"
+dependencies = [
+ "rustpython-ast",
+ "rustpython-parser",
+ "tyc-emit",
+]
 
 [[package]]
 name = "tyc-diagnostics"
