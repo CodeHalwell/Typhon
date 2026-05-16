@@ -67,19 +67,23 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
 /// - Expands tabs found in leading indentation to 4 spaces. Tabs after the
 ///   first non-whitespace character (e.g. inside string literals) are left
 ///   alone so their contents aren't corrupted.
-/// - Strips trailing whitespace from each line.
+/// - Strips trailing whitespace from each line, including reducing
+///   whitespace-only lines to blank lines.
 /// - Ensures the file ends with exactly one `\n`.
 fn normalise_whitespace(source: &str) -> String {
     if source.is_empty() {
         return String::new();
     }
     let mut result = String::with_capacity(source.len());
-    for line in source.lines() {
+    for raw_line in source.lines() {
+        // Trim trailing whitespace first so whitespace-only lines collapse
+        // to empty before we look for the indent boundary.
+        let line = raw_line.trim_end();
         let indent_end = line
             .find(|c: char| !c.is_whitespace())
             .unwrap_or(line.len());
         let leading = &line[..indent_end];
-        let rest = line[indent_end..].trim_end();
+        let rest = &line[indent_end..];
         for ch in leading.chars() {
             if ch == '\t' {
                 result.push_str("    ");
@@ -177,6 +181,21 @@ mod tests {
         assert!(
             result.output.contains("    x: int = 1"),
             "leading tab should expand to spaces, got: {:?}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn format_trims_whitespace_only_lines() {
+        // A blank line containing only spaces must be reduced to an empty
+        // line, matching the pre-refactor behaviour. (The leading-indent-only
+        // tab-expansion path could otherwise leave the original whitespace
+        // verbatim on whitespace-only lines.)
+        let src = "x: int = 1\n   \nval y: int = 2\n";
+        let result = format_source(src, "<test>").unwrap();
+        assert!(
+            result.output.contains("\n\nval y"),
+            "whitespace-only line must collapse to empty, got: {:?}",
             result.output
         );
     }

@@ -1203,19 +1203,24 @@ fn op_symbol(op: &Operator) -> &'static str {
 }
 
 /// Precedence of a Python binary operator. Higher values bind tighter.
+///
+/// Note: `**` sits at 14 (above the 13 we give arithmetic unary operators)
+/// so that an arithmetic-unary left operand of `**` is wrapped in parens.
+/// Python parses `-x ** 2` as `-(x ** 2)`, so the AST shape
+/// `BinOp(Pow, UnaryOp(USub, x), 2)` must round-trip as `(-x) ** 2`.
 fn bin_op_precedence(op: &Operator) -> u8 {
     match op {
-        Operator::Pow => 12,
+        Operator::Pow => 14,
         Operator::Mult
         | Operator::MatMult
         | Operator::Div
         | Operator::Mod
-        | Operator::FloorDiv => 11,
-        Operator::Add | Operator::Sub => 10,
-        Operator::LShift | Operator::RShift => 9,
-        Operator::BitAnd => 8,
-        Operator::BitXor => 7,
-        Operator::BitOr => 6,
+        | Operator::FloorDiv => 12,
+        Operator::Add | Operator::Sub => 11,
+        Operator::LShift | Operator::RShift => 10,
+        Operator::BitAnd => 9,
+        Operator::BitXor => 8,
+        Operator::BitOr => 7,
     }
 }
 
@@ -1225,6 +1230,10 @@ fn bin_op_precedence(op: &Operator) -> u8 {
 /// self-delimiting and get the maximum precedence so no parens are ever
 /// inserted around them. Only expression forms that could be ambiguous as a
 /// `BinOp` child are assigned explicit precedences.
+///
+/// `not` has very low precedence in Python (between `and` and comparisons),
+/// so it is distinguished from the arithmetic unary operators which sit
+/// just below `**`.
 fn expr_precedence(expr: &Expr<TextRange>) -> u8 {
     match expr {
         Expr::Lambda(_) => 1,
@@ -1233,9 +1242,12 @@ fn expr_precedence(expr: &Expr<TextRange>) -> u8 {
             BoolOp::Or => 3,
             BoolOp::And => 4,
         },
-        Expr::Compare(_) => 5,
+        Expr::UnaryOp(u) => match u.op {
+            UnaryOp::Not => 5,
+            UnaryOp::UAdd | UnaryOp::USub | UnaryOp::Invert => 13,
+        },
+        Expr::Compare(_) => 6,
         Expr::BinOp(b) => bin_op_precedence(&b.op),
-        Expr::UnaryOp(_) => 13,
         _ => u8::MAX,
     }
 }
@@ -1343,6 +1355,33 @@ mod tests {
         let src = "x = (1, 2, 3)\n";
         let out = round_trip(src);
         assert!(out.contains("(1, 2, 3)"), "tuple wrong: {}", out);
+    }
+
+    #[test]
+    fn unary_minus_left_of_pow_parenthesised() {
+        // Python parses `-x ** 2` as `-(x ** 2)`, so the AST shape
+        // `(-x) ** 2` must round-trip with explicit parens.
+        let src = "y = (-x) ** 2\n";
+        let out = round_trip(src);
+        assert!(
+            out.contains("(-x) ** 2"),
+            "unary minus left of ** must be parenthesised, got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn not_inside_arithmetic_parenthesised() {
+        // `not` has very low precedence; it must be parenthesised when
+        // used as a child of an arithmetic BinOp so the result is valid
+        // Python.
+        let src = "z = a + (not b)\n";
+        let out = round_trip(src);
+        assert!(
+            out.contains("a + (not b)"),
+            "`not` as BinOp child must be parenthesised, got: {}",
+            out
+        );
     }
 
     #[test]
