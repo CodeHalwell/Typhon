@@ -92,7 +92,10 @@ See [docs/cli.md](docs/cli.md) for the full reference.
 
 - ✅ Pipe operator `a |> f |> g(arg)` desugars to `g(f(a), arg)`
 - ✅ Match-case guards (`case x if cond:`) — passes through to Python directly
-- ☐ Generics, interfaces, `unsafe` blocks, lazy imports, gather/go, `.dty` stubs, extension methods
+- ✅ Lazy imports (`lazy import np = numpy`) — check-time and build-time proxy expansion
+- ✅ `gather` block lowered to `asyncio.TaskGroup` (or `asyncio.gather` with `strategy="best-effort"`)
+- ✅ `go EXPR` / `go EXPR -> fut` lowered to `_typhon_spawn` strong-ref task registry
+- ☐ Generics, interfaces, `unsafe` blocks, `.dty` stubs, extension methods
 
 See [docs/roadmap.md](docs/roadmap.md) for the phased plan through Phase 3 (month twelve) and beyond.
 

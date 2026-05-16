@@ -699,6 +699,29 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
                 walk_stmt(r, scope, s);
             }
         }
+        Stmt::AsyncWith(w) => {
+            for item in &w.items {
+                walk_expr(r, scope, &item.context_expr);
+                if let Some(var) = &item.optional_vars {
+                    if let Expr::Name(n) = var.as_ref() {
+                        let span = (
+                            n.range.start().to_usize(),
+                            n.range.start().to_usize() + n.id.as_str().len(),
+                        );
+                        r.declare(
+                            scope,
+                            n.id.as_str(),
+                            BindingKind::Loop,
+                            Mutability::Var,
+                            span,
+                        );
+                    }
+                }
+            }
+            for s in &w.body {
+                walk_stmt(r, scope, s);
+            }
+        }
         Stmt::Try(t) => {
             for s in &t.body {
                 walk_stmt(r, scope, s);
@@ -1230,6 +1253,10 @@ fn builtin_names() -> std::collections::HashSet<&'static str> {
         "env",
         // Pydantic BaseModel — injected by the `model` keyword preprocessor.
         "BaseModel",
+        // `asyncio` — stdlib module injected by `gather:` block expansion.
+        "asyncio",
+        // `_typhon_spawn` — runtime helper injected by `go` statement expansion.
+        "_typhon_spawn",
     ];
     names.iter().copied().collect()
 }

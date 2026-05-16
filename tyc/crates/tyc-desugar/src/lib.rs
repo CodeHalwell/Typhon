@@ -56,6 +56,14 @@ pub struct DesugarOutput {
 ///    `Result` anywhere, `from typhon_runtime import Ok, Err, Result` is
 ///    injected after any leading docstring and future-imports so the generated
 ///    Python can use those names.
+///
+/// 4. **asyncio import injection** — if the module references `asyncio`
+///    (produced by `gather:` block expansion), `import asyncio` is injected
+///    when not already present.
+///
+/// 5. **_typhon_spawn import injection** — if the module references
+///    `_typhon_spawn` (produced by `go` statement expansion),
+///    `from typhon_runtime import _typhon_spawn` is injected.
 pub fn desugar_module(module: &Mod<TextRange>) -> DesugarOutput {
     match module {
         Mod::Module(m) => {
@@ -68,13 +76,22 @@ pub fn desugar_module(module: &Mod<TextRange>) -> DesugarOutput {
             // module will reference it — either because we detected an Ok/
             // Err/Result name, or because the user already imported the
             // runtime explicitly (bare or `from ... import`).
-            let needs_typhon_runtime = has_result_usage || has_any_runtime_import;
+            let has_spawn_usage = stmts_use_name(&m.body, "_typhon_spawn");
+            let has_spawn_import = has_typhon_spawn_import(&m.body);
+            let inject_spawn_import = has_spawn_usage && !has_spawn_import;
+            let needs_typhon_runtime =
+                has_result_usage || has_any_runtime_import || has_spawn_usage;
             // Only skip injection when an existing `from typhon_runtime
             // import …` already covers all three names. A partial import
             // (e.g. just `Ok`) would leave `Err`/`Result` undefined, so we
             // still inject. A bare `import typhon_runtime` doesn't bring
             // `Ok`/`Err`/`Result` into scope, so we also still inject.
             let inject_result_import = has_result_usage && !import_covers_all;
+
+            // Inject `import asyncio` when `asyncio` is used (produced by
+            // `gather:` expansion) and not already imported.
+            let has_asyncio_usage = stmts_use_name(&m.body, "asyncio");
+            let inject_asyncio = has_asyncio_usage && !has_asyncio_import(&m.body);
 
             // Inject pydantic imports for any class that inherits from BaseModel
             // (produced by the `model` keyword preprocessor).  Track BaseModel and
@@ -90,8 +107,14 @@ pub fn desugar_module(module: &Mod<TextRange>) -> DesugarOutput {
 
             // Insert imports in reverse order so later `insert_at` calls don't
             // shift indices of earlier insertions.
+            if inject_spawn_import {
+                body.insert(insert_at, make_typhon_spawn_import());
+            }
             if inject_result_import {
                 body.insert(insert_at, make_typhon_runtime_import());
+            }
+            if inject_asyncio {
+                body.insert(insert_at, make_asyncio_import());
             }
             // Emit the fewest imports possible: combine into one statement when
             // both are needed, otherwise emit just the missing one.
@@ -394,6 +417,165 @@ fn make_typhon_runtime_import() -> Stmt<TextRange> {
         ],
         level: None,
     })
+}
+
+// ── asyncio import helpers ───────────────────────────────────────────────────
+
+/// Return `true` if `body` already contains `import asyncio`.
+fn has_asyncio_import(body: &[Stmt<TextRange>]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::Import(imp) => imp.names.iter().any(|a| a.name.as_str() == "asyncio"),
+        _ => false,
+    })
+}
+
+/// Build `import asyncio`.
+fn make_asyncio_import() -> Stmt<TextRange> {
+    Stmt::Import(StmtImport {
+        range: TextRange::default(),
+        names: vec![Alias {
+            range: TextRange::default(),
+            name: Identifier::new("asyncio"),
+            asname: None,
+        }],
+    })
+}
+
+// ── _typhon_spawn import helpers ─────────────────────────────────────────────
+
+/// Return `true` if `body` already imports `_typhon_spawn` from `typhon_runtime`.
+fn has_typhon_spawn_import(body: &[Stmt<TextRange>]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::ImportFrom(imp) if imp.module.as_deref() == Some("typhon_runtime") => imp
+            .names
+            .iter()
+            .any(|a| a.name.as_str() == "_typhon_spawn" || a.name.as_str() == "*"),
+        _ => false,
+    })
+}
+
+/// Build `from typhon_runtime import _typhon_spawn`.
+fn make_typhon_spawn_import() -> Stmt<TextRange> {
+    Stmt::ImportFrom(StmtImportFrom {
+        range: TextRange::default(),
+        module: Some(Identifier::new("typhon_runtime")),
+        names: vec![Alias {
+            range: TextRange::default(),
+            name: Identifier::new("_typhon_spawn"),
+            asname: None,
+        }],
+        level: None,
+    })
+}
+
+// ── generic name-usage scanner ───────────────────────────────────────────────
+
+/// Return `true` if any statement in `stmts` (recursively) contains an
+/// `Expr::Name` with the given identifier.  Used to detect injected names like
+/// `asyncio` and `_typhon_spawn` introduced by the preprocessing expansions.
+fn stmts_use_name(stmts: &[Stmt<TextRange>], name: &str) -> bool {
+    stmts.iter().any(|s| stmt_uses_name(s, name))
+}
+
+fn stmt_uses_name(stmt: &Stmt<TextRange>, name: &str) -> bool {
+    match stmt {
+        Stmt::FunctionDef(f) => {
+            f.returns.as_ref().is_some_and(|r| expr_uses_name(r, name))
+                || stmts_use_name(&f.body, name)
+        }
+        Stmt::AsyncFunctionDef(f) => {
+            f.returns.as_ref().is_some_and(|r| expr_uses_name(r, name))
+                || stmts_use_name(&f.body, name)
+        }
+        Stmt::ClassDef(c) => stmts_use_name(&c.body, name),
+        Stmt::AnnAssign(a) => {
+            expr_uses_name(&a.annotation, name)
+                || a.value.as_ref().is_some_and(|v| expr_uses_name(v, name))
+                || expr_uses_name(&a.target, name)
+        }
+        Stmt::Assign(a) => {
+            expr_uses_name(&a.value, name) || a.targets.iter().any(|t| expr_uses_name(t, name))
+        }
+        Stmt::AugAssign(a) => expr_uses_name(&a.target, name) || expr_uses_name(&a.value, name),
+        Stmt::Return(r) => r.value.as_ref().is_some_and(|v| expr_uses_name(v, name)),
+        Stmt::Expr(e) => expr_uses_name(&e.value, name),
+        Stmt::If(i) => {
+            expr_uses_name(&i.test, name)
+                || stmts_use_name(&i.body, name)
+                || stmts_use_name(&i.orelse, name)
+        }
+        Stmt::While(w) => {
+            expr_uses_name(&w.test, name)
+                || stmts_use_name(&w.body, name)
+                || stmts_use_name(&w.orelse, name)
+        }
+        Stmt::For(f) => {
+            expr_uses_name(&f.iter, name)
+                || stmts_use_name(&f.body, name)
+                || stmts_use_name(&f.orelse, name)
+        }
+        Stmt::AsyncFor(f) => {
+            expr_uses_name(&f.iter, name)
+                || stmts_use_name(&f.body, name)
+                || stmts_use_name(&f.orelse, name)
+        }
+        Stmt::With(w) => {
+            w.items
+                .iter()
+                .any(|item| expr_uses_name(&item.context_expr, name))
+                || stmts_use_name(&w.body, name)
+        }
+        Stmt::AsyncWith(w) => {
+            w.items
+                .iter()
+                .any(|item| expr_uses_name(&item.context_expr, name))
+                || stmts_use_name(&w.body, name)
+        }
+        Stmt::Try(t) => {
+            stmts_use_name(&t.body, name)
+                || stmts_use_name(&t.orelse, name)
+                || stmts_use_name(&t.finalbody, name)
+        }
+        Stmt::TryStar(t) => {
+            stmts_use_name(&t.body, name)
+                || stmts_use_name(&t.orelse, name)
+                || stmts_use_name(&t.finalbody, name)
+        }
+        _ => false,
+    }
+}
+
+fn expr_uses_name(expr: &Expr<TextRange>, name: &str) -> bool {
+    match expr {
+        Expr::Name(n) => n.id.as_str() == name,
+        Expr::Attribute(a) => expr_uses_name(&a.value, name),
+        Expr::Call(c) => {
+            expr_uses_name(&c.func, name)
+                || c.args.iter().any(|a| expr_uses_name(a, name))
+                || c.keywords.iter().any(|k| expr_uses_name(&k.value, name))
+        }
+        Expr::BoolOp(b) => b.values.iter().any(|v| expr_uses_name(v, name)),
+        Expr::BinOp(b) => expr_uses_name(&b.left, name) || expr_uses_name(&b.right, name),
+        Expr::UnaryOp(u) => expr_uses_name(&u.operand, name),
+        Expr::Compare(c) => {
+            expr_uses_name(&c.left, name) || c.comparators.iter().any(|v| expr_uses_name(v, name))
+        }
+        Expr::IfExp(i) => {
+            expr_uses_name(&i.test, name)
+                || expr_uses_name(&i.body, name)
+                || expr_uses_name(&i.orelse, name)
+        }
+        Expr::Subscript(s) => expr_uses_name(&s.value, name) || expr_uses_name(&s.slice, name),
+        Expr::Tuple(t) => t.elts.iter().any(|e| expr_uses_name(e, name)),
+        Expr::List(l) => l.elts.iter().any(|e| expr_uses_name(e, name)),
+        Expr::Set(s) => s.elts.iter().any(|e| expr_uses_name(e, name)),
+        Expr::Dict(d) => {
+            d.keys.iter().flatten().any(|k| expr_uses_name(k, name))
+                || d.values.iter().any(|v| expr_uses_name(v, name))
+        }
+        Expr::Await(a) => expr_uses_name(&a.value, name),
+        _ => false,
+    }
 }
 
 // ── module-level desugaring ──────────────────────────────────────────────────
