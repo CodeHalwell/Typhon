@@ -65,15 +65,22 @@ pub fn run(args: BuildArgs) -> Result<()> {
         return Ok(());
     }
 
+    // Read every source file once; both phases reuse this buffer.
+    let sources: Vec<(PathBuf, String)> = ty_files
+        .into_iter()
+        .map(|path| {
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| miette!("cannot read '{}': {e}", path.display()))?;
+            Ok((path, text))
+        })
+        .collect::<Result<_>>()?;
+
     // Phase 1: type-check all files first and fail fast on errors.
     let mut db = TycDatabase::new();
     let mut error_count = 0usize;
 
-    for path in &ty_files {
-        let source = std::fs::read_to_string(path)
-            .map_err(|e| miette!("cannot read '{}': {e}", path.display()))?;
-
-        let diags = check_file(&mut db, path.display().to_string(), source);
+    for (path, source) in &sources {
+        let diags = check_file(&mut db, path.display().to_string(), source.clone());
         if diags.has_errors() {
             for err in diags.errors() {
                 eprintln!("{:?}", miette::Report::new_boxed(Box::new(err.clone())));
@@ -88,14 +95,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
         ));
     }
 
-    // Phase 2: desugar and emit.
+    // Phase 2: desugar and emit using the already-loaded source text.
     let mut emitted = 0usize;
 
-    for path in &ty_files {
-        let source = std::fs::read_to_string(path)
-            .map_err(|e| miette!("cannot read '{}': {e}", path.display()))?;
-
-        let prep = preprocess(&source);
+    for (path, source) in &sources {
+        let prep = preprocess(source);
 
         let module = parse(&prep.python_source, Mode::Module, &path.display().to_string())
             .map_err(|e| miette!("parse error in '{}': {e}", path.display()))?;
@@ -119,11 +123,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         emitted += 1;
     }
 
-    println!(
-        "built {} file(s) → '{}'",
-        emitted,
-        out_dir.display()
-    );
+    println!("built {} file(s) → '{}'", emitted, out_dir.display());
     Ok(())
 }
 
@@ -137,9 +137,14 @@ fn collect_ty_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     if root.is_dir() {
         let entries = std::fs::read_dir(root)
             .map_err(|e| miette!("cannot read directory '{}': {e}", root.display()))?;
-        let mut paths: Vec<PathBuf> = entries
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .collect();
+        let mut paths = Vec::new();
+        for entry in entries {
+            paths.push(
+                entry
+                    .map_err(|e| miette!("cannot read entry in '{}': {e}", root.display()))?
+                    .path(),
+            );
+        }
         paths.sort();
         for path in paths {
             collect_ty_files(&path, out)?;

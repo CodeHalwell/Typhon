@@ -4,6 +4,9 @@
 //! rewritten to `@dataclass(slots=True)` Python classes, and the required
 //! `from dataclasses import dataclass` import is injected when needed.
 //!
+//! The transformation is applied recursively across the full statement tree, so
+//! classes defined inside functions or other classes are also desugared.
+//!
 //! Future phases will add desugaring for sealed unions, the `?` operator,
 //! `with`-chains, and other Typhon-specific constructs.
 
@@ -18,6 +21,8 @@ use rustpython_ast::{
 /// not already carry a `@dataclass` decorator gets `@dataclass(slots=True)`
 /// prepended to its decorator list, and `from dataclasses import dataclass` is
 /// injected at the top of the module when at least one class was transformed.
+/// The transformation is recursive — nested classes inside functions or other
+/// classes are processed too.
 pub fn desugar_module(module: &Mod<TextRange>) -> Mod<TextRange> {
     match module {
         Mod::Module(m) => Mod::Module(desugar_mod_module(m)),
@@ -26,21 +31,7 @@ pub fn desugar_module(module: &Mod<TextRange>) -> Mod<TextRange> {
 }
 
 fn desugar_mod_module(m: &ModModule<TextRange>) -> ModModule<TextRange> {
-    let mut transformed_classes = false;
-
-    let new_body: Vec<Stmt<TextRange>> = m
-        .body
-        .iter()
-        .map(|stmt| match stmt {
-            Stmt::ClassDef(c) if !has_dataclass_decorator(&c.decorator_list) => {
-                transformed_classes = true;
-                let mut new_class = c.clone();
-                new_class.decorator_list.insert(0, make_dataclass_call());
-                Stmt::ClassDef(new_class)
-            }
-            other => other.clone(),
-        })
-        .collect();
+    let (new_body, transformed_classes) = desugar_stmts(&m.body);
 
     let final_body = if transformed_classes && !has_dataclass_import(&m.body) {
         let mut body = vec![make_dataclass_import()];
@@ -54,6 +45,54 @@ fn desugar_mod_module(m: &ModModule<TextRange>) -> ModModule<TextRange> {
         range: m.range,
         body: final_body,
         type_ignores: m.type_ignores.clone(),
+    }
+}
+
+/// Desugar a list of statements, returning the transformed list and whether
+/// any class was modified at any nesting depth.
+fn desugar_stmts(stmts: &[Stmt<TextRange>]) -> (Vec<Stmt<TextRange>>, bool) {
+    let mut any_transformed = false;
+    let new_stmts = stmts
+        .iter()
+        .map(|stmt| {
+            let (new_stmt, transformed) = desugar_stmt(stmt);
+            if transformed {
+                any_transformed = true;
+            }
+            new_stmt
+        })
+        .collect();
+    (new_stmts, any_transformed)
+}
+
+/// Desugar a single statement, recursing into any nested statement lists.
+/// Returns the (possibly modified) statement and whether any class was
+/// transformed at this level or deeper.
+fn desugar_stmt(stmt: &Stmt<TextRange>) -> (Stmt<TextRange>, bool) {
+    match stmt {
+        Stmt::ClassDef(c) => {
+            let needs_decorator = !has_dataclass_decorator(&c.decorator_list);
+            let (new_body, body_transformed) = desugar_stmts(&c.body);
+            let mut new_class = c.clone();
+            new_class.body = new_body;
+            if needs_decorator {
+                new_class.decorator_list.insert(0, make_dataclass_call());
+            }
+            (Stmt::ClassDef(new_class), needs_decorator || body_transformed)
+        }
+        Stmt::FunctionDef(f) => {
+            let (new_body, transformed) = desugar_stmts(&f.body);
+            let mut new_f = f.clone();
+            new_f.body = new_body;
+            (Stmt::FunctionDef(new_f), transformed)
+        }
+        Stmt::AsyncFunctionDef(f) => {
+            let (new_body, transformed) = desugar_stmts(&f.body);
+            let mut new_f = f.clone();
+            new_f.body = new_body;
+            (Stmt::AsyncFunctionDef(new_f), transformed)
+        }
+        other => (other.clone(), false),
     }
 }
 
@@ -143,9 +182,7 @@ mod tests {
     fn class_with_existing_dataclass_not_duplicated() {
         let src = "from dataclasses import dataclass\n\n@dataclass\nclass Point:\n    x: int\n";
         let out = parse_and_desugar(src);
-        // Original @dataclass preserved, no @dataclass(slots=True) added
         assert!(!out.contains("slots=True"), "output:\n{out}");
-        // Import not duplicated
         assert_eq!(out.matches("from dataclasses import dataclass").count(), 1, "output:\n{out}");
     }
 
@@ -161,6 +198,21 @@ mod tests {
         let src = "class A:\n    x: int\n\nclass B:\n    y: str\n";
         let out = parse_and_desugar(src);
         assert_eq!(out.matches("from dataclasses import dataclass").count(), 1, "output:\n{out}");
+        assert_eq!(out.matches("@dataclass(slots=True)").count(), 2, "output:\n{out}");
+    }
+
+    #[test]
+    fn class_inside_function_is_desugared() {
+        let src = "def make_point():\n    class Point:\n        x: int\n    return Point\n";
+        let out = parse_and_desugar(src);
+        assert!(out.contains("@dataclass(slots=True)"), "output:\n{out}");
+        assert!(out.contains("from dataclasses import dataclass"), "output:\n{out}");
+    }
+
+    #[test]
+    fn nested_class_inside_class_is_desugared() {
+        let src = "class Outer:\n    x: int\n    class Inner:\n        y: int\n";
+        let out = parse_and_desugar(src);
         assert_eq!(out.matches("@dataclass(slots=True)").count(), 2, "output:\n{out}");
     }
 }
