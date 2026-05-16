@@ -115,7 +115,7 @@ pub enum TycError {
     #[error("non-exhaustive `match` on sealed union `{union_name}`: missing variant(s) {missing}")]
     #[diagnostic(
         code(tyc::non_exhaustive_match),
-        help("add `case {missing}():` arm(s), or add a `case _:` wildcard arm")
+        help("add a `case <Variant>():` arm for each missing variant, or add a `case _:` wildcard arm")
     )]
     NonExhaustiveMatch {
         union_name: String,
@@ -250,7 +250,6 @@ impl TycError {
         }
     }
 
-    /// Construct an [`TycError::ImmutableAssign`] diagnostic.
     /// Construct a [`TycError::NonExhaustiveMatch`] diagnostic.
     pub fn non_exhaustive_match(
         union_name: impl Into<String>,
@@ -268,6 +267,7 @@ impl TycError {
         }
     }
 
+    /// Construct an [`TycError::ImmutableAssign`] diagnostic.
     pub fn immutable_assign(
         name: impl Into<String>,
         path: impl Into<String>,

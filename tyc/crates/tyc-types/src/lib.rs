@@ -323,19 +323,28 @@ impl<'a> Checker<'a> {
 
     /// Assignment compatibility check that accounts for sealed-union subtyping.
     ///
-    /// A class that is a declared variant of a sealed union is assignable to
-    /// the union's name.  All other rules delegate to the module-level
-    /// [`assignable`] function.
+    /// Extends the module-level [`assignable`] function with two additional rules:
+    ///
+    /// 1. **Variant → sealed union**: `Circle` is assignable to `Shape` when
+    ///    `type Shape = Circle | Rectangle | ...` is declared.
+    /// 2. **Union interception**: when `expected` is a `Union`, retry each variant
+    ///    with `is_assignable` so that sealed-union knowledge is available inside
+    ///    composite types like `Shape | None` or `list[Shape]`.
     fn is_assignable(&self, expected: &Type, actual: &Type) -> bool {
         if assignable(expected, actual) {
             return true;
         }
-        // Variant → sealed union coercion: Circle is assignable to Shape when
-        // `type Shape = Circle | Rectangle | ...` has been declared.
+        // Variant → sealed union coercion.
         if let (Type::Class(exp_name), Type::Class(act_name)) = (expected, actual) {
             if let Some(variants) = self.sealed_unions.get(exp_name.as_str()) {
                 return variants.iter().any(|v| v == act_name);
             }
+        }
+        // For Union expected types (e.g. `Shape | None`), `assignable` recurses
+        // using only the base rules. Re-check each variant here so sealed-union
+        // knowledge is available in the recursive call.
+        if let Type::Union(variants) = expected {
+            return variants.iter().any(|v| self.is_assignable(v, actual));
         }
         false
     }
@@ -678,11 +687,13 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt<TextRange>) {
         Stmt::Match(m) => {
             let subject_type = infer_expr(c, &m.subject);
             for case in &m.cases {
+                // Enter scope and bind pattern names FIRST so guard expressions
+                // (e.g. `case Circle(radius=r) if r > 0:`) can reference them.
+                c.env.enter();
+                bind_pattern_names(c, &case.pattern);
                 if let Some(guard) = &case.guard {
                     let _ = infer_expr(c, guard);
                 }
-                c.env.enter();
-                bind_pattern_names(c, &case.pattern);
                 for s in &case.body {
                     check_stmt(c, s);
                 }
@@ -1038,36 +1049,26 @@ fn infer_expr(c: &mut Checker, expr: &Expr<TextRange>) -> Type {
 /// Extract the list of variant class names from a `type Foo = A | B | C`
 /// value expression.  Returns `None` if the expression is not a pure union of
 /// bare names (meaning it is not a sealed union declaration we can track).
+///
+/// Uses an explicit stack rather than recursion to avoid stack overflow on
+/// deeply nested union expressions (e.g. `A | B | C | ... | Z`).
 fn extract_sealed_union_variants(expr: &Expr<TextRange>) -> Option<Vec<String>> {
-    match expr {
-        Expr::BinOp(b) if matches!(b.op, Operator::BitOr) => {
-            let mut names = Vec::new();
-            collect_union_names_from_expr(&b.left, &mut names)?;
-            collect_union_names_from_expr(&b.right, &mut names)?;
-            if names.len() >= 2 {
-                Some(names)
-            } else {
-                None
+    let mut names = Vec::new();
+    let mut stack = vec![expr];
+    while let Some(current) = stack.pop() {
+        match current {
+            Expr::Name(n) => names.push(n.id.as_str().to_owned()),
+            Expr::BinOp(b) if matches!(b.op, Operator::BitOr) => {
+                stack.push(&b.left);
+                stack.push(&b.right);
             }
+            _ => return None,
         }
-        _ => None,
     }
-}
-
-/// Recursively flatten a `A | B | C` expression tree into a list of names.
-/// Returns `None` if any node is not a bare name or a BitOr.
-fn collect_union_names_from_expr(expr: &Expr<TextRange>, names: &mut Vec<String>) -> Option<()> {
-    match expr {
-        Expr::Name(n) => {
-            names.push(n.id.as_str().to_owned());
-            Some(())
-        }
-        Expr::BinOp(b) if matches!(b.op, Operator::BitOr) => {
-            collect_union_names_from_expr(&b.left, names)?;
-            collect_union_names_from_expr(&b.right, names)?;
-            Some(())
-        }
-        _ => None,
+    if names.len() >= 2 {
+        Some(names)
+    } else {
+        None
     }
 }
 
@@ -1086,6 +1087,12 @@ fn check_match_exhaustiveness(
     let mut has_wildcard = false;
 
     for case in cases {
+        // A guarded arm is conditional: `case Circle() if cond:` does not
+        // cover `Circle` when `cond` is false.  Skip guarded arms for both
+        // wildcard detection and variant coverage.
+        if case.guard.is_some() {
+            continue;
+        }
         if is_wildcard_pattern(&case.pattern) {
             has_wildcard = true;
             break;
@@ -1111,24 +1118,35 @@ fn check_match_exhaustiveness(
 
 /// Return `true` if this pattern unconditionally matches any value (wildcard).
 ///
-/// Both `case _:` and `case x:` (bare name capture) are wildcards.
+/// - `case _:` → `MatchAs { pattern: None, name: None }` — wildcard.
+/// - `case x:` → `MatchAs { pattern: None, name: Some("x") }` — wildcard capture.
+/// - `case <wild> as x:` → `MatchAs { pattern: Some(<wild>), ... }` — wildcard iff
+///   the inner pattern is also a wildcard (recursive check).
 fn is_wildcard_pattern(pattern: &Pattern<TextRange>) -> bool {
     match pattern {
-        // `case _:` → MatchAs { pattern: None, name: None }
-        // `case x:` → MatchAs { pattern: None, name: Some("x") }
-        // Both are wildcards: they always match.
-        Pattern::MatchAs(a) => a.pattern.is_none(),
+        Pattern::MatchAs(a) => match &a.pattern {
+            None => true,
+            Some(inner) => is_wildcard_pattern(inner),
+        },
         Pattern::MatchOr(o) => o.patterns.iter().any(is_wildcard_pattern),
         _ => false,
     }
 }
 
-/// Collect the class names matched by `PatternMatchClass` nodes in a pattern.
+/// Collect the class names matched by `PatternMatchClass` nodes in a pattern,
+/// recursing through wrapper forms (`MatchAs`, `MatchOr`) so that patterns
+/// like `case Circle() as c:` count as covering the `Circle` variant.
 fn collect_matched_class_names(pattern: &Pattern<TextRange>, covered: &mut HashSet<String>) {
     match pattern {
         Pattern::MatchClass(mc) => {
             if let Expr::Name(n) = mc.cls.as_ref() {
                 covered.insert(n.id.as_str().to_owned());
+            }
+        }
+        // `case Circle() as c:` — unwrap the alias and count the inner class.
+        Pattern::MatchAs(a) => {
+            if let Some(inner) = &a.pattern {
+                collect_matched_class_names(inner, covered);
             }
         }
         Pattern::MatchOr(o) => {
@@ -1142,7 +1160,8 @@ fn collect_matched_class_names(pattern: &Pattern<TextRange>, covered: &mut HashS
 
 /// Declare pattern-bound names in the current scope as `Type::Unknown`, so
 /// that references to them inside the case body do not produce spurious
-/// "unknown name" errors.
+/// "unknown name" errors.  Spans are set to the enclosing pattern's range so
+/// that any future narrowing diagnostics point at the right source location.
 fn bind_pattern_names(c: &mut Checker, pattern: &Pattern<TextRange>) {
     match pattern {
         Pattern::MatchAs(a) => {
@@ -1151,7 +1170,7 @@ fn bind_pattern_names(c: &mut Checker, pattern: &Pattern<TextRange>) {
                     name: name.as_str().to_owned(),
                     declared: Type::Unknown,
                     narrowed: Type::Unknown,
-                    span: (0, 0),
+                    span: (a.range.start().to_usize(), a.range.end().to_usize()),
                 });
             }
             if let Some(inner) = &a.pattern {
@@ -1164,7 +1183,7 @@ fn bind_pattern_names(c: &mut Checker, pattern: &Pattern<TextRange>) {
                     name: name.as_str().to_owned(),
                     declared: Type::Unknown,
                     narrowed: Type::Unknown,
-                    span: (0, 0),
+                    span: (s.range.start().to_usize(), s.range.end().to_usize()),
                 });
             }
         }
@@ -1174,7 +1193,7 @@ fn bind_pattern_names(c: &mut Checker, pattern: &Pattern<TextRange>) {
                     name: rest.as_str().to_owned(),
                     declared: Type::Unknown,
                     narrowed: Type::Unknown,
-                    span: (0, 0),
+                    span: (m.range.start().to_usize(), m.range.end().to_usize()),
                 });
             }
             for p in &m.patterns {
@@ -1495,6 +1514,76 @@ val x: int = 1
 match x:
     case 1:
         pass
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn guarded_arm_does_not_satisfy_exhaustiveness() {
+        // `case Circle() if cond:` can miss when cond is false — it must not
+        // count as full coverage of Circle.
+        let src = "\
+class Circle:
+    radius: int
+
+class Rectangle:
+    width: int
+
+type Shape = Circle | Rectangle
+
+val s: Shape = Circle()
+
+match s:
+    case Circle() if True:
+        pass
+    case Rectangle():
+        pass
+";
+        let d = check(src);
+        assert!(d.has_errors(), "guarded arm must not satisfy exhaustiveness");
+        let msg = format!("{}", d.errors()[0]);
+        assert!(msg.contains("Circle"), "error should name Circle, got: {msg}");
+    }
+
+    #[test]
+    fn as_pattern_satisfies_exhaustiveness() {
+        // `case Circle() as c:` must count as covering Circle.
+        let src = "\
+class Circle:
+    radius: int
+
+class Rectangle:
+    width: int
+
+type Shape = Circle | Rectangle
+
+val s: Shape = Circle()
+
+match s:
+    case Circle() as c:
+        pass
+    case Rectangle():
+        pass
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn variant_assignable_to_nullable_sealed_union() {
+        // `val x: Shape? = Circle()` must be accepted: Circle is a variant of
+        // Shape, and Shape? == Shape | None.
+        let src = "\
+class Circle:
+    radius: int
+
+class Rectangle:
+    width: int
+
+type Shape = Circle | Rectangle
+
+val x: Shape? = Circle()
 ";
         let d = check(src);
         assert!(!d.has_errors(), "{:?}", d.errors());
