@@ -3,7 +3,7 @@
 //! Runs: pre-process → parse → type-check → desugar → emit.
 //! Writes `.py` files into the output directory, mirroring the source tree.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use clap::Args;
 use miette::{miette, Result};
@@ -15,6 +15,7 @@ use tyc_emit::emit;
 use tyc_format::format_source;
 use tyc_syntax::preprocess::preprocess;
 
+use crate::commands::util::collect_ty_files;
 use crate::config::TyphonConfig;
 
 /// Arguments for `tyc build`.
@@ -80,8 +81,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         ));
     }
 
-    let mut ty_files: Vec<PathBuf> = Vec::new();
-    collect_ty_files(&src_dir, &mut ty_files)?;
+    let ty_files = collect_ty_files(&src_dir)?;
 
     if ty_files.is_empty() {
         println!("no .ty files found in '{}'", src_dir.display());
@@ -157,31 +157,5 @@ pub fn run(args: BuildArgs) -> Result<()> {
     }
 
     println!("built {} file(s) → '{}'", emitted, out_dir.display());
-    Ok(())
-}
-
-fn collect_ty_files(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    if root.is_file() {
-        if root.extension().map(|e| e == "ty").unwrap_or(false) {
-            out.push(root.to_path_buf());
-        }
-        return Ok(());
-    }
-    if root.is_dir() {
-        let entries = std::fs::read_dir(root)
-            .map_err(|e| miette!("cannot read directory '{}': {e}", root.display()))?;
-        let mut paths = Vec::new();
-        for entry in entries {
-            paths.push(
-                entry
-                    .map_err(|e| miette!("cannot read entry in '{}': {e}", root.display()))?
-                    .path(),
-            );
-        }
-        paths.sort();
-        for path in paths {
-            collect_ty_files(&path, out)?;
-        }
-    }
     Ok(())
 }

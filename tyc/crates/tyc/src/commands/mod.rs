@@ -7,3 +7,4 @@ pub mod init;
 pub mod lsp;
 pub mod profile;
 pub mod trace;
+pub mod util;
