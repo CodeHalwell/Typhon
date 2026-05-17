@@ -60,8 +60,7 @@ pub fn rewrite_traceback(text: &str, map_dir: Option<&Path>) -> String {
 
 /// Try to rewrite one frame line; return it unchanged when no rewrite applies.
 fn try_rewrite_frame(line: &str, map_dir: Option<&Path>) -> String {
-    // Python tracebacks use any amount of leading whitespace before `File "`.
-    let trimmed = line.trim_start_matches(' ');
+    let trimmed = line.trim_start();
     let leading_spaces = line.len() - trimmed.len();
 
     let Some(rest) = trimmed.strip_prefix("File \"") else {
@@ -110,80 +109,37 @@ enum LineStrategy {
     Table,
 }
 
-/// Parse a `.py.map` JSON blob (minimal, no external JSON dependency).
+/// Parse a `.py.map` JSON blob.
 ///
 /// V1 format: `{"version":1,"source":"rel/path.ty","line_strategy":"identity"}`
 /// V2 format: adds `,"lines":[1,1,2,3,3,...]`
 fn parse_map(body: &str) -> Option<SourceMap> {
-    let source = extract_string_field(body, "source")?;
-    let strategy_str = extract_string_field(body, "line_strategy")
-        .unwrap_or_else(|| "identity".to_owned());
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let obj = v.as_object()?;
+    let source = obj.get("source")?.as_str()?.to_owned();
+    let strategy_str = obj
+        .get("line_strategy")
+        .and_then(|v| v.as_str())
+        .unwrap_or("identity");
     let strategy = if strategy_str == "table" {
         LineStrategy::Table
     } else {
         LineStrategy::Identity
     };
-    let lines = extract_u32_array(body, "lines");
+    let lines = obj
+        .get("lines")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_u64().map(|n| n as u32))
+                .collect()
+        })
+        .unwrap_or_default();
     Some(SourceMap {
         source,
         strategy,
         lines,
     })
-}
-
-/// Pull a JSON string-typed field from a flat JSON object without a full
-/// parser.  Works for the simple `{"key":"value"}` and
-/// `{"key":"val\"ue"}` cases the source-map format uses.
-fn extract_string_field(body: &str, field: &str) -> Option<String> {
-    let key = format!("\"{field}\"");
-    let pos = body.find(&key)?;
-    let after = body[pos + key.len()..].trim_start();
-    let after = after.strip_prefix(':')?;
-    let after = after.trim_start();
-    let after = after.strip_prefix('"')?;
-
-    let mut value = String::new();
-    let mut chars = after.chars();
-    loop {
-        match chars.next()? {
-            '"' => break,
-            '\\' => match chars.next()? {
-                '"' => value.push('"'),
-                '\\' => value.push('\\'),
-                'n' => value.push('\n'),
-                '/' => value.push('/'),
-                c => {
-                    value.push('\\');
-                    value.push(c);
-                }
-            },
-            c => value.push(c),
-        }
-    }
-    Some(value)
-}
-
-/// Extract a JSON `"field":[N, M, ...]` integer array.
-fn extract_u32_array(body: &str, field: &str) -> Vec<u32> {
-    let key = format!("\"{field}\"");
-    let Some(pos) = body.find(&key) else {
-        return Vec::new();
-    };
-    let after = body[pos + key.len()..].trim_start();
-    let Some(after) = after.strip_prefix(':') else {
-        return Vec::new();
-    };
-    let after = after.trim_start();
-    let Some(array) = after.strip_prefix('[') else {
-        return Vec::new();
-    };
-    let Some(end) = array.find(']') else {
-        return Vec::new();
-    };
-    array[..end]
-        .split(',')
-        .filter_map(|s| s.trim().parse::<u32>().ok())
-        .collect()
 }
 
 // ── file lookup ───────────────────────────────────────────────────────────────
@@ -216,9 +172,10 @@ fn load_map_for(py_path: &str, map_dir: Option<&Path>) -> Option<String> {
 
 /// Resolve the Typhon source path for a given `.py` path and map `source`.
 ///
-/// Walks up from the `.py` file's directory to find `typhon.toml`, then
-/// constructs `<project_root>/<src_dir>/<source>`.  Falls back to returning
-/// `source` as-is when the project root cannot be determined.
+/// Walks up from the `.py` file's directory to find `typhon.toml` using the
+/// existing [`crate::config::TyphonConfig::load`] loader, then constructs
+/// `<project_root>/<src_dir>/<source>`.  Falls back to returning `source`
+/// as-is when the project root cannot be determined.
 fn resolve_ty_path(py_path: &str, source: &str) -> String {
     let py = Path::new(py_path);
     let start_dir = if py.is_absolute() {
@@ -229,17 +186,11 @@ fn resolve_ty_path(py_path: &str, source: &str) -> String {
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
     };
 
-    if let Some(mut dir) = start_dir {
-        for _ in 0..8 {
-            let toml_path = dir.join("typhon.toml");
-            if toml_path.exists() {
-                let src_dir = read_src_from_toml(&toml_path).unwrap_or_else(|| "src".to_owned());
-                let ty = dir.join(&src_dir).join(source);
+    if let Some(dir) = start_dir {
+        if let Ok(Some((toml_path, config))) = crate::config::TyphonConfig::load(&dir) {
+            if let Some(root) = toml_path.parent() {
+                let ty = root.join(&config.project.src).join(source);
                 return ty.to_string_lossy().into_owned();
-            }
-            match dir.parent() {
-                Some(p) => dir = p.to_path_buf(),
-                None => break,
             }
         }
     }
@@ -248,22 +199,11 @@ fn resolve_ty_path(py_path: &str, source: &str) -> String {
     source.to_owned()
 }
 
-/// Extract the `src = "..."` value from a `typhon.toml` without a full
-/// TOML parse.  Defaults to `"src"` on any failure.
-fn read_src_from_toml(toml_path: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(toml_path).ok()?;
-    let marker = "src = \"";
-    let pos = content.find(marker)?;
-    let after = &content[pos + marker.len()..];
-    let end = after.find('"')?;
-    Some(after[..end].to_owned())
-}
-
 // ── line mapping ──────────────────────────────────────────────────────────────
 
 /// Rewrite the `", line N, in func"` suffix using the map's line strategy.
 fn apply_line_map(map: &SourceMap, after_path: &str) -> String {
-    let Some((py_line, rest_offset)) = parse_line_suffix(after_path) else {
+    let Some((py_line, num_offset, digit_len)) = parse_line_suffix(after_path) else {
         return after_path.to_owned();
     };
 
@@ -279,15 +219,17 @@ fn apply_line_map(map: &SourceMap, after_path: &str) -> String {
         return after_path.to_owned();
     }
 
-    // Splice the new line number into the original suffix string.
-    let before_num = &after_path[..rest_offset];
-    let after_num = &after_path[rest_offset + py_line.to_string().len()..];
+    // Splice the new line number into the original suffix string using the
+    // exact span from parsing so the replacement is consistent with how the
+    // number was read (avoids any leading-zero / formatting divergence).
+    let before_num = &after_path[..num_offset];
+    let after_num = &after_path[num_offset + digit_len..];
     format!("{before_num}{ty_line}{after_num}")
 }
 
 /// Parse the line number from `, line N[, in func]` and return
-/// `(line_number, byte_offset_of_number_start_within_after_path)`.
-fn parse_line_suffix(s: &str) -> Option<(u32, usize)> {
+/// `(line_number, byte_offset_of_number_start, digit_byte_length)`.
+fn parse_line_suffix(s: &str) -> Option<(u32, usize, usize)> {
     // s = `, line 42, in func`
     let s_stripped = s.strip_prefix(',')?;
     let s_stripped = s_stripped.trim_start();
@@ -298,7 +240,7 @@ fn parse_line_suffix(s: &str) -> Option<(u32, usize)> {
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(s_stripped.len());
     let num: u32 = s_stripped[..digit_end].parse().ok()?;
-    Some((num, num_offset))
+    Some((num, num_offset, digit_end))
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -320,7 +262,8 @@ mod tests {
 
     #[test]
     fn parse_map_v2_table() {
-        let body = r#"{"version":2,"source":"sub/main.ty","line_strategy":"table","lines":[1,1,2,3,3,4]}"#;
+        let body =
+            r#"{"version":2,"source":"sub/main.ty","line_strategy":"table","lines":[1,1,2,3,3,4]}"#;
         let map = parse_map(body).expect("should parse");
         assert_eq!(map.source, "sub/main.ty");
         assert_eq!(map.strategy, LineStrategy::Table);
@@ -344,13 +287,13 @@ mod tests {
 
     #[test]
     fn parse_line_suffix_basic() {
-        let (num, _) = parse_line_suffix(", line 42, in greet").unwrap();
+        let (num, _, _) = parse_line_suffix(", line 42, in greet").unwrap();
         assert_eq!(num, 42);
     }
 
     #[test]
     fn parse_line_suffix_no_context() {
-        let (num, _) = parse_line_suffix(", line 7").unwrap();
+        let (num, _, _) = parse_line_suffix(", line 7").unwrap();
         assert_eq!(num, 7);
     }
 
@@ -426,10 +369,7 @@ mod tests {
         )
         .unwrap();
 
-        let text = format!(
-            "  File \"{}\", line 5, in greet\n",
-            py_path.display()
-        );
+        let text = format!("  File \"{}\", line 5, in greet\n", py_path.display());
         let result = rewrite_traceback(&text, None);
 
         assert!(
@@ -459,10 +399,7 @@ mod tests {
         )
         .unwrap();
 
-        let text = format!(
-            "  File \"{}\", line 3, in parse\n",
-            py_path.display()
-        );
+        let text = format!("  File \"{}\", line 3, in parse\n", py_path.display());
         let result = rewrite_traceback(&text, None);
         assert!(
             result.contains("line 2"),

@@ -261,12 +261,12 @@ fn trace_rewrites_frame_with_map_file() {
     // directly to ty lines 1 and 2 (no leading blank line that a function
     // definition would insert).
     let tmp = tempfile::tempdir().unwrap();
-    scaffold(
-        tmp.path(),
-        "x: int = 1\ny: str = \"hello\"\n",
-    );
+    scaffold(tmp.path(), "x: int = 1\ny: str = \"hello\"\n");
     let build_status = tyc().arg("build").arg(tmp.path()).status().unwrap();
-    assert!(build_status.success(), "build should succeed before trace test");
+    assert!(
+        build_status.success(),
+        "build should succeed before trace test"
+    );
 
     let py_path = tmp.path().join("build").join("main.py");
     let map_path = tmp.path().join("build").join("main.py.map");

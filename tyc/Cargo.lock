@@ -1772,6 +1772,7 @@ dependencies = [
  "rustpython-ast",
  "rustpython-parser",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "toml",

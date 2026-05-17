@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use miette::{Diagnostic as MietteDiagnostic, LabeledSpan};
 use rustpython_parser::{parse, Mode};
+use salsa::Setter;
 use tokio::sync::Mutex;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
@@ -23,7 +24,6 @@ use tower_lsp_server::ls_types::{
     TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
 };
 use tower_lsp_server::{jsonrpc, Client, LanguageServer, LspService, Server};
-use salsa::Setter;
 use tyc_db::{check_source_file, preprocessed_text, SourceFile, TycDatabase};
 use tyc_diagnostics::TycError;
 use tyc_resolve::{BindingKind, Mutability, ResolvedModule, SymbolAtOffset};
@@ -91,9 +91,8 @@ impl Backend {
     /// the runtime thread lets other LSP requests (hover, shutdown) make
     /// progress concurrently.
     async fn check_and_publish(&self, uri: Uri, text: String, version: Option<i32>) {
-        let path = uri.as_str().to_owned();
-        let db = Arc::clone(&self.db);
         let uri_str = uri.as_str().to_owned();
+        let db = Arc::clone(&self.db);
 
         // Upsert the SourceFile in the Salsa database.
         //
@@ -114,7 +113,7 @@ impl Backend {
                 sf.set_text(&mut *db_guard).to(text.clone());
                 sf
             } else {
-                SourceFile::new(&*db_guard, path.clone(), text.clone())
+                SourceFile::new(&*db_guard, uri_str.clone(), text.clone())
             }
         };
 
@@ -128,6 +127,7 @@ impl Backend {
         let result = tokio::task::spawn_blocking(move || {
             // Hold the mutex only for the duration of the salsa call.
             let mut db = db.blocking_lock();
+            #[allow(clippy::explicit_auto_deref)]
             let diags = check_source_file(&mut *db, source_file);
             // Retrieve the preprocessed source for diagnostic position
             // mapping.  After `check_source_file` runs the full pipeline the
@@ -362,8 +362,7 @@ impl Backend {
 /// same approach is used by the `module_decl_names` salsa query.
 fn resolve_in_preprocessed(preprocessed: &str) -> Option<ResolvedModule> {
     let module = parse(preprocessed, Mode::Module, "<lsp>").ok()?;
-    let (resolved, _) =
-        tyc_resolve::resolve_module("<lsp>", preprocessed, &[], &module);
+    let (resolved, _) = tyc_resolve::resolve_module("<lsp>", preprocessed, &[], &module);
     Some(resolved)
 }
 
@@ -991,14 +990,18 @@ mod tests {
         // After preprocessing, `val x` becomes `x: int = 1`.  The resolver
         // should see `x` as a binding at offset 0.
         let preprocessed = "x: int = 1\n";
-        let resolved = resolve_in_preprocessed(preprocessed).expect("parse and resolve should succeed");
+        let resolved =
+            resolve_in_preprocessed(preprocessed).expect("parse and resolve should succeed");
         let names: Vec<String> = resolved
             .module_scope()
             .bindings
             .iter()
             .map(|b| b.name.clone())
             .collect();
-        assert!(names.contains(&"x".to_owned()), "x should be resolved; got {names:?}");
+        assert!(
+            names.contains(&"x".to_owned()),
+            "x should be resolved; got {names:?}"
+        );
     }
 
     #[test]

@@ -185,8 +185,12 @@ fn check_impl(path: &str, text: &str) -> Diagnostics {
         }
     };
 
-    let (resolved, resolve_diags) =
-        resolve_module(path.to_owned(), &prep.python_source, &prep.stripped, &module);
+    let (resolved, resolve_diags) = resolve_module(
+        path.to_owned(),
+        &prep.python_source,
+        &prep.stripped,
+        &module,
+    );
     diags.extend(resolve_diags);
 
     let type_diags = check_module_with(
@@ -255,10 +259,14 @@ mod tests {
         let first = preprocessed_text(&db, sf);
         assert_eq!(first, "x: int = 1\n");
         // Update the file text — Salsa should invalidate the cached result.
-        sf.set_text(&mut db).to("val y: str = \"hello\"\n".to_owned());
+        sf.set_text(&mut db)
+            .to("val y: str = \"hello\"\n".to_owned());
         let second = preprocessed_text(&db, sf);
         assert_eq!(second, "y: str = \"hello\"\n");
-        assert_ne!(first, second, "cached result must be invalidated after set_text");
+        assert_ne!(
+            first, second,
+            "cached result must be invalidated after set_text"
+        );
     }
 
     #[test]
@@ -270,9 +278,13 @@ mod tests {
         let diags1 = check_source_file(&mut db, sf);
         assert!(!diags1.has_errors(), "first check should pass");
         // Update text to introduce a type mismatch.
-        sf.set_text(&mut db).to("val x: int = \"oops\"\n".to_owned());
+        sf.set_text(&mut db)
+            .to("val x: int = \"oops\"\n".to_owned());
         let diags2 = check_source_file(&mut db, sf);
-        assert!(diags2.has_errors(), "second check should fail after set_text");
+        assert!(
+            diags2.has_errors(),
+            "second check should fail after set_text"
+        );
     }
 
     #[test]
