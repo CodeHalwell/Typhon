@@ -50,38 +50,35 @@ Smoke tests at `vendor/ruff_python_parser/tests/typhon_mutability.rs` and
 
 ## Migration status — consumer crates
 
-Typhon ships two parser back-ends today; the migration from one to the
-other is happening incrementally:
+The migration to the vendored Ruff parser/AST is **complete**.
 
 | Stage | State |
 |---|---|
 | Vendor real source for ast/parser/trivia/source_file/text_size | ✅ done |
 | Add `let` / `mut` soft keywords + `Mutability` field             | ✅ done |
-| Expose ruff parser as `tyc_syntax::ruff::parse_module`           | ✅ done |
-| Port `tyc-syntax::preprocess` to stop stripping `let` / `mut`    | ⏳ pending (Step 8) |
-| Port `tyc-resolve` to ruff AST                                   | ⏳ pending |
-| Port `tyc-types` to ruff AST                                     | ⏳ pending |
-| Port `tyc-analyse` to ruff AST                                   | ⏳ pending |
-| Port `tyc-desugar` to ruff AST                                   | ⏳ pending |
-| Port `tyc-emit` to ruff AST                                      | ⏳ pending |
-| Port `tyc-db`, `tyc-format`, `tyc-lsp`, `tyc` CLI                | ⏳ pending |
-| Drop `rustpython-parser` / `rustpython-ast` dependencies         | ⏳ pending (Step 9) |
+| Expose ruff parser as `tyc_syntax::parse_module`                 | ✅ done |
+| Port `tyc-syntax::preprocess` to stop stripping `let` / `mut`    | ✅ done (Step 8) |
+| Port `tyc-resolve` to ruff AST                                   | ✅ done |
+| Port `tyc-types` to ruff AST                                     | ✅ done |
+| Port `tyc-analyse` to ruff AST                                   | ✅ done |
+| Port `tyc-desugar` to ruff AST                                   | ✅ done |
+| Port `tyc-emit` to ruff AST                                      | ✅ done |
+| Port `tyc-db`, `tyc-format`, `tyc-lsp`, `tyc` CLI                | ✅ done |
+| Drop `rustpython-parser` / `rustpython-ast` dependencies         | ✅ done (Step 9) |
 
-The two back-ends produce different AST types — the rustpython side
-uses `rustpython_ast::*`, the ruff side uses `ruff_python_ast::*` — so
-each consumer crate must be ported atomically. Once a crate is on the
-ruff back-end, it imports `tyc_syntax::ruff::ast` instead of
-`tyc_syntax::ast`. The legacy `tyc_syntax::ast` re-export of
-`rustpython_ast` stays in place until every consumer has migrated.
+Every consumer crate now uses `ruff_python_ast` (re-exported as
+`tyc_syntax::ast`) and parses through the vendored Ruff parser via
+`tyc_syntax::parse_module`. The transitional `tyc_syntax::parser` module
+has been removed; there is no rustpython code path left in the workspace.
 
-Approximate effort, refined from the original estimate after vendoring:
-
-| Phase | Effort |
-|---|---|
-| Vendor source + Typhon extensions (Steps 1–6)                          | ✅ done |
-| Per-crate consumer swap (Step 7, ~25 files, 23 k LOC of consumer code) | 2–3 working days |
-| Preprocessor cleanup + drop rustpython (Steps 8–9)                     | 0.5 day |
-| Final validation (Step 10)                                             | 0.5 day |
+The let/mut keywords round-trip through the AST directly via
+`StmtAssign.mutability` / `StmtAnnAssign.mutability`, and the resolver
+reads mutability from those AST fields rather than the
+`StrippedKeyword` side-channel. `StrippedKeyword` itself is kept for
+the remaining Typhon-only line-prefix keywords that the parser still
+doesn't know about (`model`, `impl`, `extend`, `interface`, `unsafe`,
+`comptime`, `lazy`, `gather`, `go`) so the formatter can restore
+them on output.
 
 The hard part of the consumer swap is the AST shape diff. Significant
 differences from `rustpython_ast`:
