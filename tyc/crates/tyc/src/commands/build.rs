@@ -13,8 +13,8 @@ use rustpython_ast::{text_size::TextRange, Constant, Expr, ExprConstant, Mod, St
 use rustpython_parser::{parse, Mode};
 
 use tyc_analyse::{
-    analyse_purity, collect_module_async_fn_names, evaluate_comptime, purity_diagnostics,
-    rewrite_auto_gather, ComptimeValue,
+    analyse_purity, collect_module_async_fn_names, evaluate_comptime, load_profile_samples,
+    pgo_memoise_targets, purity_diagnostics, rewrite_auto_gather, ComptimeValue, ProfileSample,
 };
 use tyc_db::{check_file, TycDatabase};
 use tyc_desugar::{desugar_module_with, DesugarOptions};
@@ -148,6 +148,18 @@ pub fn run(args: BuildArgs) -> Result<()> {
         ));
     }
 
+    // Phase 4 profile-guided optimisation: when `[strictness] pgo-memoise =
+    // true`, load `typhon-profile.json` from the project root once and feed
+    // it into each module's memoise-target computation. A missing file
+    // yields an empty map (PGO is best-effort), so projects that have not
+    // yet run `tyc profile` simply fall through to the explicit-decorator
+    // path.
+    let profile_samples: HashMap<String, ProfileSample> = if config.strictness.pgo_memoise {
+        load_profile_samples(&config_dir.join("typhon-profile.json"))
+    } else {
+        HashMap::new()
+    };
+
     // Phase 2: desugar and emit using the already-loaded source text.
     let mut emitted = 0usize;
     let mut needs_runtime = false;
@@ -210,11 +222,33 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 path.display()
             ));
         }
-        let memoise_targets: Vec<String> = purity_findings
+        let mut memoise_targets: Vec<String> = purity_findings
             .iter()
             .filter(|f| f.violation.is_none() && f.memoise)
             .map(|f| f.name.clone())
             .collect();
+
+        // Phase 4 PGO: add every pure function whose observed call count
+        // (from the loaded profile) meets the threshold. Names already in
+        // `memoise_targets` are skipped so the desugarer doesn't emit two
+        // cache decorators on the same definition.
+        if !profile_samples.is_empty() {
+            let pgo_candidates: Vec<String> = purity_findings
+                .iter()
+                .filter(|f| f.violation.is_none())
+                .map(|f| f.name.clone())
+                .collect();
+            let promoted = pgo_memoise_targets(
+                &profile_samples,
+                &pgo_candidates,
+                config.strictness.pgo_min_calls,
+            );
+            for name in promoted {
+                if !memoise_targets.contains(&name) {
+                    memoise_targets.push(name);
+                }
+            }
+        }
 
         // Phase 4 auto-gather inference: when `[strictness] auto-gather = true`,
         // fold runs of independent same-module awaits into `asyncio.TaskGroup`
@@ -605,6 +639,47 @@ mod tests {
         (src_dir, out_dir)
     }
 
+    /// Same as `scaffold`, but with `pgo-memoise = true` and a synthetic
+    /// `typhon-profile.json` written at the project root so the Phase-4
+    /// PGO path runs end-to-end.
+    ///
+    /// `profile_entries` is a list of `(qualname, calls)` rows. The function
+    /// writes a minimal JSON object matching the schema `tyc profile`
+    /// emits.
+    fn scaffold_pgo(
+        dir: &std::path::Path,
+        src_content: &str,
+        profile_entries: &[(&str, u64)],
+        min_calls: u64,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let src_dir = dir.join("src");
+        let out_dir = dir.join("build");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let toml = format!(
+            "[project]\nname = \"test\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+             [python]\ntarget = \"3.13\"\n[emit]\nformat = false\n\
+             [strictness]\npgo-memoise = true\npgo-min-calls = {min_calls}\n[env]\n"
+        );
+        std::fs::write(dir.join("typhon.toml"), toml).unwrap();
+        std::fs::write(src_dir.join("main.ty"), src_content).unwrap();
+
+        // Build the profile JSON by hand to keep this test independent of
+        // the runtime helper's serialisation.
+        let mut profile = String::from("{");
+        for (i, (name, calls)) in profile_entries.iter().enumerate() {
+            if i > 0 {
+                profile.push(',');
+            }
+            profile.push_str(&format!(
+                "\"{name}\": {{\"calls\": {calls}, \"total_seconds\": 0.001}}"
+            ));
+        }
+        profile.push('}');
+        std::fs::write(dir.join("typhon-profile.json"), profile).unwrap();
+
+        (src_dir, out_dir)
+    }
+
     /// Same as `scaffold`, but with `auto-gather = true` set under `[strictness]`
     /// so the Phase-4 auto-gather pass runs end-to-end.
     fn scaffold_auto_gather(
@@ -966,6 +1041,99 @@ val pet: Animal = Dog(name=\"Rex\")
         assert!(
             result.is_err_and(|e| e.to_string().contains("fix type errors")),
             "assigning a non-conforming type to an interface variable should fail with a type error"
+        );
+    }
+
+    // ── Phase 4: profile-guided memoise end-to-end ──────────────────────────
+
+    #[test]
+    fn build_pgo_promotes_hot_pure_function_to_cache() {
+        // `@pure` function that the profile reports as hot — PGO should add
+        // it to the memoise list and the desugarer must emit
+        // `@functools.cache`.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = "\
+@pure
+def hot(n: int) -> int:
+    return n + 1
+";
+        let (_, out_dir) = scaffold_pgo(tmp.path(), src, &[("main.hot", 5_000)], 100);
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        })
+        .unwrap();
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        assert!(
+            py.contains("functools"),
+            "hot @pure function should be cached by PGO; got:\n{py}"
+        );
+        assert!(
+            py.contains("cache"),
+            "PGO should inject @functools.cache; got:\n{py}"
+        );
+    }
+
+    #[test]
+    fn build_pgo_leaves_cold_function_uncached() {
+        // The profile says `cold` was called once. With min-calls=100 PGO
+        // must NOT promote it, so the emitted Python should have no
+        // `functools.cache` decorator.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = "\
+@pure
+def cold(n: int) -> int:
+    return n + 1
+";
+        let (_, out_dir) = scaffold_pgo(tmp.path(), src, &[("main.cold", 1)], 100);
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        })
+        .unwrap();
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        assert!(
+            !py.contains("@functools.cache"),
+            "cold @pure function must NOT be cached by PGO; got:\n{py}"
+        );
+    }
+
+    #[test]
+    fn build_pgo_flag_off_ignores_profile_file() {
+        // Same source + profile as the hot-function test, but the project
+        // config does not enable PGO. The profile must be ignored.
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        let out_dir = tmp.path().join("build");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname = \"t\"\nversion = \"0.1\"\nsrc = \"src\"\nout = \"build\"\n\
+             [python]\ntarget = \"3.13\"\n[emit]\nformat = false\n[strictness]\n[env]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src_dir.join("main.ty"),
+            "@pure\ndef hot(n: int) -> int:\n    return n + 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("typhon-profile.json"),
+            "{\"main.hot\": {\"calls\": 5000, \"total_seconds\": 0.5}}",
+        )
+        .unwrap();
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        })
+        .unwrap();
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        assert!(
+            !py.contains("@functools.cache"),
+            "PGO off => profile must be ignored; got:\n{py}"
         );
     }
 

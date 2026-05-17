@@ -88,6 +88,18 @@ pub struct StrictnessConfig {
     /// per-project to apply the rewrite globally. (Phase 4 auto-gather
     /// inference; explicit `gather:` blocks are unaffected.)
     pub auto_gather: bool,
+    /// When true, `tyc build` consults `typhon-profile.json` (produced by a
+    /// prior `tyc profile` run) and promotes every pure function whose call
+    /// count meets [`StrictnessConfig::pgo_min_calls`] to `@functools.cache`,
+    /// even if the user did not write `@memo`. Off by default. (Phase 4
+    /// profile-guided optimisation; complements `auto-memoise` which acts
+    /// on every pure function regardless of profile data.)
+    pub pgo_memoise: bool,
+    /// Minimum observed call count for a function to be promoted by
+    /// [`StrictnessConfig::pgo_memoise`]. Defaults to 100 — high enough
+    /// that one-off entry points stay un-cached, low enough that an
+    /// inner-loop helper qualifies after a single representative run.
+    pub pgo_min_calls: u64,
 }
 
 impl Default for StrictnessConfig {
@@ -98,6 +110,8 @@ impl Default for StrictnessConfig {
             exhaustive_match: "error".into(),
             auto_memoise: false,
             auto_gather: false,
+            pgo_memoise: false,
+            pgo_min_calls: 100,
         }
     }
 }

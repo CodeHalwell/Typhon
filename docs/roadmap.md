@@ -92,7 +92,13 @@ Everything beyond is polish and ambition.
   `import asyncio` if missing.
 - Loop parallelisation for pure comprehensions on free-threaded Python.
 - Richer comptime: `comptime` functions, types as values.
-- PGO via `tyc profile`.
+- ✅ **PGO via `tyc profile`**. When `[strictness] pgo-memoise = true`,
+  `tyc build` loads `typhon-profile.json` from the project root and
+  promotes every `@pure` function whose observed call count meets
+  `pgo-min-calls` (default 100) to `@functools.cache`, even when the
+  user did not write `@memo`. Complements `auto-memoise` (which caches
+  every pure function regardless of profile data). Missing profile
+  file is not an error — PGO is best-effort.
 - ✅ **LSP completions and code actions**. `textDocument/completion`
   returns visible bindings (walking the cursor's enclosing scope chain),
   Typhon keywords (`val`, `var`, `gather`, `go`, `lazy`, …), and a

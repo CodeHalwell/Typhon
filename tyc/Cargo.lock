@@ -1782,6 +1782,7 @@ version = "0.1.0"
 dependencies = [
  "rustpython-ast",
  "rustpython-parser",
+ "tempfile",
  "tyc-diagnostics",
  "tyc-emit",
  "tyc-syntax",
