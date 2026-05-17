@@ -229,12 +229,74 @@ fn trace_exits_zero_with_no_input() {
 }
 
 #[test]
-fn trace_reports_not_yet_implemented() {
-    let out = tyc().arg("trace").output().unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
+fn trace_passes_through_non_frame_lines() {
+    // A traceback with no `.py` file references should be printed unchanged.
+    let dir = tempfile::tempdir().unwrap();
+    let tb_path = dir.path().join("tb.txt");
+    std::fs::write(
+        &tb_path,
+        "Traceback (most recent call last):\nValueError: oops\n",
+    )
+    .unwrap();
+    let out = tyc().arg("trace").arg(&tb_path).output().unwrap();
+    assert!(out.status.success(), "tyc trace should succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stderr.contains("not yet implemented"),
-        "tyc trace should report that source-map tracing is not yet implemented; got: {stderr}"
+        stdout.contains("Traceback"),
+        "header line should be preserved; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("ValueError"),
+        "exception line should be preserved; got: {stdout}"
+    );
+}
+
+#[test]
+fn trace_rewrites_frame_with_map_file() {
+    // Build a real project so `tyc build` emits a `.py.map` sidecar, then
+    // feed a synthetic traceback pointing at the emitted `.py` to
+    // `tyc trace` and verify the path is rewritten to the `.ty` source.
+    //
+    // Use two annotated-assignment statements so Python lines 1 and 2 map
+    // directly to ty lines 1 and 2 (no leading blank line that a function
+    // definition would insert).
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "x: int = 1\ny: str = \"hello\"\n",
+    );
+    let build_status = tyc().arg("build").arg(tmp.path()).status().unwrap();
+    assert!(build_status.success(), "build should succeed before trace test");
+
+    let py_path = tmp.path().join("build").join("main.py");
+    let map_path = tmp.path().join("build").join("main.py.map");
+    assert!(py_path.exists(), "main.py should exist after build");
+    assert!(map_path.exists(), "main.py.map should exist after build");
+
+    // Write a synthetic traceback referencing line 2 of the built .py file.
+    // The v2 source map maps Python line 2 → ty line 2, so the line number
+    // is preserved in the rewritten output.
+    let tb = format!(
+        "Traceback (most recent call last):\n  File \"{}\", line 2, in <module>\n    y: str = \"hello\"\n",
+        py_path.display()
+    );
+    let tb_path = tmp.path().join("tb.txt");
+    std::fs::write(&tb_path, &tb).unwrap();
+
+    let out = tyc().arg("trace").arg(&tb_path).output().unwrap();
+    assert!(out.status.success(), "tyc trace should succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("main.ty"),
+        "trace should rewrite .py path to .ty; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("line 2"),
+        "line number should be preserved; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("main.py\""),
+        ".py path should be replaced; got: {stdout}"
     );
 }
 
