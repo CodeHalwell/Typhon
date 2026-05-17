@@ -22,8 +22,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rustpython_ast::text_size::TextRange;
-use rustpython_ast::{Constant, Expr, MatchCase, Mod, Operator, Pattern, Ranged, Stmt};
+use ruff_python_ast::{Expr, MatchCase, ModModule, Number, Operator, Pattern, Stmt};
+use ruff_text_size::{Ranged, TextRange};
 use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_resolve::{Binding, BindingKind, ResolvedModule, ScopeId};
 
@@ -214,7 +214,7 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
 ///
 /// `classes` is the set of class names declared in the enclosing module so
 /// we can resolve nominal references.
-pub fn type_from_annotation(expr: &Expr<TextRange>, classes: &[String]) -> Type {
+pub fn type_from_annotation(expr: &Expr, classes: &[String]) -> Type {
     type_from_annotation_with_params(expr, classes, &[])
 }
 
@@ -222,7 +222,7 @@ pub fn type_from_annotation(expr: &Expr<TextRange>, classes: &[String]) -> Type 
 /// as `Type::Any` so that PEP 695 generic functions don't trip the
 /// assignability check before we have a real inference engine.
 pub fn type_from_annotation_with_params(
-    expr: &Expr<TextRange>,
+    expr: &Expr,
     classes: &[String],
     type_params: &[String],
 ) -> Type {
@@ -245,7 +245,7 @@ pub fn type_from_annotation_with_params(
             // Unknown but treat as nominal class (may be imported).
             other => Type::Class(other.to_owned()),
         },
-        Expr::BinOp(b) if matches!(b.op, rustpython_ast::Operator::BitOr) => {
+        Expr::BinOp(b) if matches!(b.op, Operator::BitOr) => {
             let left = type_from_annotation_with_params(&b.left, classes, type_params);
             let right = type_from_annotation_with_params(&b.right, classes, type_params);
             Type::union_of(vec![left, right])
@@ -306,7 +306,7 @@ pub fn type_from_annotation_with_params(
             };
             Type::Generic(head, args)
         }
-        Expr::Constant(c) if matches!(c.value, Constant::None) => Type::None,
+        Expr::NoneLiteral(_) => Type::None,
         _ => Type::Unknown,
     }
 }
@@ -458,14 +458,14 @@ pub fn typevars_in(ty: &Type) -> Vec<String> {
 
 /// Collect the names of PEP 695 type parameters into a flat list.
 pub fn collect_type_param_names(
-    type_params: &[rustpython_ast::TypeParam<TextRange>],
+    type_params: &[ruff_python_ast::TypeParam],
 ) -> Vec<String> {
     type_params
         .iter()
         .map(|tp| match tp {
-            rustpython_ast::TypeParam::TypeVar(t) => t.name.as_str().to_owned(),
-            rustpython_ast::TypeParam::ParamSpec(p) => p.name.as_str().to_owned(),
-            rustpython_ast::TypeParam::TypeVarTuple(t) => t.name.as_str().to_owned(),
+            ruff_python_ast::TypeParam::TypeVar(t) => t.name.as_str().to_owned(),
+            ruff_python_ast::TypeParam::ParamSpec(p) => p.name.as_str().to_owned(),
+            ruff_python_ast::TypeParam::TypeVarTuple(t) => t.name.as_str().to_owned(),
         })
         .collect()
 }
@@ -838,7 +838,7 @@ pub fn check_module(
     path: impl Into<String>,
     source: &str,
     resolved: &ResolvedModule,
-    module: &Mod,
+    module: &ModModule,
 ) -> Diagnostics {
     check_module_with(path, source, resolved, module, &[])
 }
@@ -853,31 +853,29 @@ pub fn check_module_with(
     path: impl Into<String>,
     source: &str,
     resolved: &ResolvedModule,
-    module: &Mod,
+    module: &ModModule,
     unsafe_lines: &[usize],
 ) -> Diagnostics {
     let mut c = Checker::new(path.into(), source, resolved);
     c.unsafe_line_starts = unsafe_byte_starts(source, unsafe_lines);
 
-    if let Mod::Module(m) = module {
-        // First pass: collect class names + function signatures so forward
-        // references work.
-        collect_classes_and_functions(&mut c, &m.body);
+    // First pass: collect class names + function signatures so forward
+    // references work.
+    collect_classes_and_functions(&mut c, &module.body);
 
-        c.env.enter();
-        // Seed module scope with collected classes/functions and resolver bindings.
-        seed_env_from_scope(&mut c, 0);
-        // Seed Typhon built-in names that are not declared in the source:
-        // - `env` is a comptime-only function (returns str).
-        // - `BaseModel` is injected by the preprocessor for `model` classes.
-        // - `Ok`/`Err` may be used before the `from typhon_runtime import`
-        //   injection happens (the desugar pass adds it later).
-        seed_typhon_builtins(&mut c);
-        for stmt in &m.body {
-            check_stmt(&mut c, stmt);
-        }
-        c.env.leave();
+    c.env.enter();
+    // Seed module scope with collected classes/functions and resolver bindings.
+    seed_env_from_scope(&mut c, 0);
+    // Seed Typhon built-in names that are not declared in the source:
+    // - `env` is a comptime-only function (returns str).
+    // - `BaseModel` is injected by the preprocessor for `model` classes.
+    // - `Ok`/`Err` may be used before the `from typhon_runtime import`
+    //   injection happens (the desugar pass adds it later).
+    seed_typhon_builtins(&mut c);
+    for stmt in &module.body {
+        check_stmt(&mut c, stmt);
     }
+    c.env.leave();
 
     c.diagnostics
 }
@@ -960,7 +958,7 @@ fn seed_typhon_builtins(c: &mut Checker) {
     });
 }
 
-fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt<TextRange>]) {
+fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
     // First pass: collect every class and type-alias *name* into `c.classes`
     // so the subsequent shape and signature passes can resolve nominal
     // references like `field: OtherClass`. Doing the shape collection in
@@ -1005,28 +1003,32 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt<TextRange>]) {
         }
     }
     // Third pass: record function signatures (also needs the full class list).
+    // Ruff folds `async def` into `Stmt::FunctionDef` with `is_async = true`,
+    // so a single arm covers both sync and async forms.
     for stmt in body {
-        match stmt {
-            Stmt::FunctionDef(f) => {
-                let tps = collect_type_param_names(&f.type_params);
-                let sig = function_signature(&classes, f.args.as_ref(), f.returns.as_deref(), &tps);
-                c.function_signatures
-                    .insert(f.name.as_str().to_owned(), sig);
-            }
-            Stmt::AsyncFunctionDef(f) => {
-                let tps = collect_type_param_names(&f.type_params);
-                let sig = function_signature(&classes, f.args.as_ref(), f.returns.as_deref(), &tps);
-                c.function_signatures
-                    .insert(f.name.as_str().to_owned(), sig);
-            }
-            _ => {}
+        if let Stmt::FunctionDef(f) = stmt {
+            let tps = type_param_names_from(f.type_params.as_deref());
+            let sig =
+                function_signature(&classes, f.parameters.as_ref(), f.returns.as_deref(), &tps);
+            c.function_signatures
+                .insert(f.name.as_str().to_owned(), sig);
         }
     }
 }
 
+/// Extract the names of PEP 695 type parameters from the `Option<Box<TypeParams>>`
+/// field on `StmtFunctionDef`/`StmtClassDef`. Returns an empty `Vec` when the
+/// function/class has no `[T, U, ...]` clause.
+fn type_param_names_from(type_params: Option<&ruff_python_ast::TypeParams>) -> Vec<String> {
+    match type_params {
+        Some(tps) => collect_type_param_names(&tps.type_params),
+        None => Vec::new(),
+    }
+}
+
 /// `true` if `c` lists `Protocol` in its bases.
-fn class_inherits_protocol(c: &rustpython_ast::StmtClassDef<TextRange>) -> bool {
-    c.bases
+fn class_inherits_protocol(c: &ruff_python_ast::StmtClassDef) -> bool {
+    c.bases()
         .iter()
         .any(|b| matches!(b, Expr::Name(n) if n.id.as_str() == "Protocol"))
 }
@@ -1034,9 +1036,9 @@ fn class_inherits_protocol(c: &rustpython_ast::StmtClassDef<TextRange>) -> bool 
 /// `true` if `decorators` includes `@runtime_checkable` (bare or
 /// `typing.runtime_checkable`). When set, `isinstance(x, Interface)` is
 /// permitted — the protocol opted in to the attribute-presence check.
-fn has_runtime_checkable_decorator(decorators: &[Expr<TextRange>]) -> bool {
+fn has_runtime_checkable_decorator(decorators: &[ruff_python_ast::Decorator]) -> bool {
     decorators.iter().any(|d| {
-        let name = match d {
+        let name = match &d.expression {
             Expr::Name(n) => Some(n.id.as_str()),
             Expr::Attribute(a) => Some(a.attr.as_str()),
             _ => None,
@@ -1053,18 +1055,15 @@ fn has_runtime_checkable_decorator(decorators: &[Expr<TextRange>]) -> bool {
 /// references in field annotations (`field: OtherClass`) resolve correctly
 /// rather than landing as `Type::Unknown`.
 fn collect_class_shape(
-    cd: &rustpython_ast::StmtClassDef<TextRange>,
+    cd: &ruff_python_ast::StmtClassDef,
     classes: &[String],
 ) -> InterfaceShape {
     let mut shape = InterfaceShape::default();
     for stmt in &cd.body {
         match stmt {
+            // Ruff folds `async def` into `Stmt::FunctionDef` with `is_async = true`.
             Stmt::FunctionDef(f) => {
-                let arity = method_arity_excluding_receiver(f.args.as_ref());
-                shape.methods.insert(f.name.as_str().to_owned(), arity);
-            }
-            Stmt::AsyncFunctionDef(f) => {
-                let arity = method_arity_excluding_receiver(f.args.as_ref());
+                let arity = method_arity_excluding_receiver(f.parameters.as_ref());
                 shape.methods.insert(f.name.as_str().to_owned(), arity);
             }
             Stmt::AnnAssign(a) => {
@@ -1079,8 +1078,8 @@ fn collect_class_shape(
     shape
 }
 
-fn method_arity_excluding_receiver(args: &rustpython_ast::Arguments<TextRange>) -> usize {
-    let total = args.posonlyargs.len() + args.args.len() + args.kwonlyargs.len();
+fn method_arity_excluding_receiver(params: &ruff_python_ast::Parameters) -> usize {
+    let total = params.posonlyargs.len() + params.args.len() + params.kwonlyargs.len();
     // Conservatively assume one receiver (`self`/`cls`) when at least one
     // positional argument is present; static methods are uncommon enough that
     // this approximation is acceptable for v1's "member presence" check.
@@ -1089,18 +1088,18 @@ fn method_arity_excluding_receiver(args: &rustpython_ast::Arguments<TextRange>) 
 
 fn function_signature(
     classes: &[String],
-    args: &rustpython_ast::Arguments<TextRange>,
-    returns: Option<&Expr<TextRange>>,
+    parameters: &ruff_python_ast::Parameters,
+    returns: Option<&Expr>,
     type_params: &[String],
 ) -> Type {
     let mut params = Vec::new();
-    let all = args
+    let all = parameters
         .posonlyargs
         .iter()
-        .chain(args.args.iter())
-        .chain(args.kwonlyargs.iter());
-    for arg in all {
-        let t = match &arg.def.annotation {
+        .chain(parameters.args.iter())
+        .chain(parameters.kwonlyargs.iter());
+    for pwd in all {
+        let t = match &pwd.parameter.annotation {
             Some(ann) => type_from_annotation_with_params(ann, classes, type_params),
             None => Type::Unknown,
         };
@@ -1142,7 +1141,7 @@ fn seed_env_from_scope(c: &mut Checker, scope: ScopeId) {
     }
 }
 
-fn check_stmt(c: &mut Checker, stmt: &Stmt<TextRange>) {
+fn check_stmt(c: &mut Checker, stmt: &Stmt) {
     match stmt {
         Stmt::AnnAssign(a) => {
             let ann_type = type_from_annotation(&a.annotation, &c.classes);
@@ -1202,22 +1201,11 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt<TextRange>) {
             }
         }
         Stmt::FunctionDef(f) => {
-            let tps = collect_type_param_names(&f.type_params);
+            let tps = type_param_names_from(f.type_params.as_deref());
             check_function(
                 c,
                 f.name.as_str(),
-                &f.args,
-                &f.body,
-                f.returns.as_deref(),
-                &tps,
-            )
-        }
-        Stmt::AsyncFunctionDef(f) => {
-            let tps = collect_type_param_names(&f.type_params);
-            check_function(
-                c,
-                f.name.as_str(),
-                &f.args,
+                &f.parameters,
                 &f.body,
                 f.returns.as_deref(),
                 &tps,
@@ -1299,7 +1287,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt<TextRange>) {
                 check_stmt(c, s);
             }
             for h in &t.handlers {
-                let rustpython_ast::ExceptHandler::ExceptHandler(h) = h;
+                let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
                 for s in &h.body {
                     check_stmt(c, s);
                 }
@@ -1344,9 +1332,9 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt<TextRange>) {
 fn check_function(
     c: &mut Checker,
     name: &str,
-    args: &rustpython_ast::Arguments<TextRange>,
-    body: &[Stmt<TextRange>],
-    returns: Option<&Expr<TextRange>>,
+    parameters: &ruff_python_ast::Parameters,
+    body: &[Stmt],
+    returns: Option<&Expr>,
     type_params: &[String],
 ) {
     let _ = name;
@@ -1361,22 +1349,23 @@ fn check_function(
 
     // Declare parameters with their annotation types. Type parameters resolve
     // to `Any` until a real inference engine lands.
-    let all = args
+    let all = parameters
         .posonlyargs
         .iter()
-        .chain(args.args.iter())
-        .chain(args.kwonlyargs.iter());
-    for arg in all {
-        let t = match &arg.def.annotation {
+        .chain(parameters.args.iter())
+        .chain(parameters.kwonlyargs.iter());
+    for pwd in all {
+        let t = match &pwd.parameter.annotation {
             Some(ann) => type_from_annotation_with_params(ann, &classes, type_params),
             None => Type::Unknown,
         };
+        let param_name = pwd.parameter.name.as_str();
         let span = (
-            arg.def.range.start().to_usize(),
-            arg.def.range.start().to_usize() + arg.def.arg.as_str().len(),
+            pwd.parameter.range.start().to_usize(),
+            pwd.parameter.range.start().to_usize() + param_name.len(),
         );
         c.env.declare(TypeBinding {
-            name: arg.def.arg.as_str().to_owned(),
+            name: param_name.to_owned(),
             declared: t.clone(),
             narrowed: t,
             span,
@@ -1391,7 +1380,7 @@ fn check_function(
     c.current_return = saved_return;
 }
 
-fn check_if(c: &mut Checker, i: &rustpython_ast::StmtIf<TextRange>) {
+fn check_if(c: &mut Checker, i: &ruff_python_ast::StmtIf) {
     // Recognise the `if True:` form that the preprocessor emits for an
     // `unsafe:` block.  Inside the body, type-check diagnostics are
     // suppressed; the `else` branch is empty in practice (the preprocessor
@@ -1415,14 +1404,50 @@ fn check_if(c: &mut Checker, i: &rustpython_ast::StmtIf<TextRange>) {
     }
     c.env.restore(snap_pre);
 
-    // Apply opposite narrowing for the else branch.
+    // Apply opposite narrowing for the elif/else cascade. Ruff flattens
+    // `if/elif/else` into `elif_else_clauses` — walk them as a virtual
+    // chain so each elif gets positive narrowing of its own test on top of
+    // the cumulative negation of every earlier test.
     let neg = collect_narrowings(c, &i.test, /*negate=*/ true);
     let snap_pre = c.env.snapshot();
     apply_narrowings(c, &neg);
-    for s in &i.orelse {
-        check_stmt(c, s);
-    }
+    check_elif_else_clauses(c, &i.elif_else_clauses);
     c.env.restore(snap_pre);
+}
+
+/// Recursively check the `elif`/`else` cascade of a [`StmtIf`].  Each
+/// clause's `test` is `None` for `else`, `Some(_)` for `elif`.  An `elif`
+/// behaves like a nested `if` whose true branch narrows positively and whose
+/// false branch (the remaining clauses) narrows negatively.
+fn check_elif_else_clauses(c: &mut Checker, clauses: &[ruff_python_ast::ElifElseClause]) {
+    let Some((first, rest)) = clauses.split_first() else {
+        return;
+    };
+    match &first.test {
+        Some(test) => {
+            // elif: nested-if semantics on top of the already-negated outer test.
+            let _ = infer_expr(c, test);
+            let pos = collect_narrowings(c, test, /*negate=*/ false);
+            let snap = c.env.snapshot();
+            apply_narrowings(c, &pos);
+            for s in &first.body {
+                check_stmt(c, s);
+            }
+            c.env.restore(snap);
+
+            let neg = collect_narrowings(c, test, /*negate=*/ true);
+            let snap = c.env.snapshot();
+            apply_narrowings(c, &neg);
+            check_elif_else_clauses(c, rest);
+            c.env.restore(snap);
+        }
+        None => {
+            // else: just check the body in the current narrowed env.
+            for s in &first.body {
+                check_stmt(c, s);
+            }
+        }
+    }
 }
 
 /// A narrowing instruction: replace the narrowed type of `name` with

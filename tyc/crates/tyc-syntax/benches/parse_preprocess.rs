@@ -2,9 +2,9 @@
 //!
 //! These measure the latency of the two hottest paths in incremental compilation:
 //!
-//! 1. `preprocess` — strips `val`/`var`/`model`/etc. line-prefix keywords and
+//! 1. `preprocess` — strips `model`/`impl`/`extend`/etc. line-prefix keywords and
 //!    expands `T?` nullable shorthand so the Python parser sees plain Python.
-//! 2. `parse` — the `rustpython-parser` full parse of the preprocessed source.
+//! 2. `parse` — the vendored Ruff parser run on the preprocessed source.
 //!
 //! Run with:
 //!   cargo bench -p tyc-syntax
@@ -12,17 +12,16 @@
 //! The goal is sub-100 ms on a representative module. Regressions above 20 %
 //! of the baseline should trigger a review before merging.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use rustpython_parser::{parse, Mode};
-use tyc_syntax::preprocess::preprocess;
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use tyc_syntax::{parse_module, preprocess::preprocess};
 
 /// A small but representative Typhon module that exercises the common
-/// preprocessing paths: `val`/`var` bindings, `T?` nullable annotations,
+/// preprocessing paths: `let`/`mut` bindings, `T?` nullable annotations,
 /// function definitions, and class declarations.
 const SMALL_MODULE: &str = r#"
-val host: str = "localhost"
-var port: int = 8080
-val db_url: str? = None
+let host: str = "localhost"
+mut port: int = 8080
+let db_url: str? = None
 
 class Config:
     host: str
@@ -41,8 +40,8 @@ def greet(name: str?) -> str:
 /// A larger module (~100 lines) with more language features to stress-test
 /// the preprocessor regex passes.
 const MEDIUM_MODULE: &str = r#"
-val APP_NAME: str = "typhon-demo"
-var request_count: int = 0
+let APP_NAME: str = "typhon-demo"
+mut request_count: int = 0
 
 class User:
     id: int
@@ -83,8 +82,8 @@ def process(users: list[User]) -> list[str]:
         results.append(user.name)
     return results
 
-val DEFAULT_HOST: str = "0.0.0.0"
-var current_port: int = 9000
+let DEFAULT_HOST: str = "0.0.0.0"
+mut current_port: int = 9000
 
 def build_url(host: str, port: int, path: str?) -> str:
     base: str = "http://" + host + ":" + str(port)
@@ -121,9 +120,9 @@ def err_response(message: str) -> ApiResponse:
 /// declaration and deeply nested function signatures to expose non-linear
 /// performance regressions that shorter modules cannot trigger.
 const LARGE_MODULE: &str = r#"
-val app_name: str = "typhon-bench"
-var request_id: int = 0
-val base_url: str = "https://example.com"
+let app_name: str = "typhon-bench"
+mut request_id: int = 0
+let base_url: str = "https://example.com"
 
 class User:
     id: int
@@ -342,7 +341,7 @@ fn bench_parse(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new(label, "module"), src, |b, src| {
             // black_box both the input and result so the compiler cannot elide
             // the parse work in tight loops.
-            b.iter(|| black_box(parse(black_box(src), Mode::Module, "<bench>")));
+            b.iter(|| black_box(parse_module(black_box(src))));
         });
     }
 
@@ -362,7 +361,7 @@ fn bench_preprocess_then_parse(c: &mut Criterion) {
                 let prep = preprocess(black_box(src));
                 // black_box the result to prevent the compiler from eliding
                 // the parse work in tight loops.
-                black_box(parse(prep.python_source.as_str(), Mode::Module, "<bench>"))
+                black_box(parse_module(prep.python_source.as_str()))
             });
         });
     }

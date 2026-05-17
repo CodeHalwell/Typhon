@@ -6,8 +6,9 @@ license.workspace = true
 description = "Python code emitter — lowers a plain Python AST to .py source text"
 
 [dependencies]
-rustpython-ast = { workspace = true }
+ruff_python_ast = { workspace = true }
+ruff_text_size = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-rustpython-parser = { workspace = true }
+tyc-syntax = { workspace = true }

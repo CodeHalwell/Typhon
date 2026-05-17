@@ -1,7 +1,7 @@
 //! Python code emitter.
 //!
-//! Converts a `rustpython_ast::Mod` back into Python source text.  In
-//! Phase 0 this is a hand-written pretty-printer that covers the Python
+//! Converts a `ruff_python_ast::ModModule` back into Python source text.
+//! In Phase 0 this is a hand-written pretty-printer that covers the Python
 //! subset needed for round-trip testing.  Later phases will switch to a
 //! vendored `ruff_python_codegen` + `ruff_python_formatter` pipeline.
 
@@ -11,18 +11,18 @@ mod stubtest;
 
 pub use printer::Emitter;
 pub use stub::emit_stub;
-pub use stubtest::{compare_modules, StubTestFinding, StubTestKind};
+pub use stubtest::{StubTestFinding, StubTestKind, compare_modules};
 
-use rustpython_ast::Mod;
+use ruff_python_ast::ModModule;
 
-/// Emit a [`Mod`] AST node as Python source text.
-pub fn emit(module: &Mod) -> String {
+/// Emit a [`ModModule`] AST node as Python source text.
+pub fn emit(module: &ModModule) -> String {
     let mut emitter = Emitter::new();
     emitter.emit_mod(module);
     emitter.finish()
 }
 
-/// Emit a [`Mod`] AST node and return a `(source, line_offsets)` pair.
+/// Emit a [`ModModule`] AST node and return a `(source, line_offsets)` pair.
 ///
 /// `line_offsets[i]` is the byte offset in the preprocessed Typhon source
 /// that was active when output line `i` (0-indexed) was emitted.  Callers
@@ -32,7 +32,7 @@ pub fn emit(module: &Mod) -> String {
 /// Synthesised statements (e.g. `import dataclasses` injected by the
 /// desugar pass) carry a zero-length `TextRange`; they inherit the offset
 /// of the nearest preceding real statement.
-pub fn emit_with_line_offsets(module: &Mod) -> (String, Vec<usize>) {
+pub fn emit_with_line_offsets(module: &ModModule) -> (String, Vec<usize>) {
     let mut emitter = Emitter::new();
     emitter.emit_mod(module);
     let offsets = emitter.line_offsets.clone();

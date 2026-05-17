@@ -10,12 +10,15 @@
 //! Later phases will migrate more passes (resolve, type-check) into
 //! tracked queries as their output types acquire `salsa::Update`.
 
-use rustpython_parser::{parse, Mode};
 use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_resolve::resolve_module;
-use tyc_syntax::preprocess::{
-    expand_gather_blocks, expand_go_calls, expand_pipes, expand_question_ops, expand_with_chains,
-    preprocess, validate_extend_usage, validate_lazy_usage, validate_question_ops,
+use tyc_syntax::{
+    parse_module,
+    preprocess::{
+        expand_gather_blocks, expand_go_calls, expand_pipes, expand_question_ops,
+        expand_with_chains, preprocess, validate_extend_usage, validate_lazy_usage,
+        validate_question_ops,
+    },
 };
 use tyc_types::check_module_with;
 
@@ -58,10 +61,11 @@ pub fn preprocessed_text(db: &dyn salsa::Database, file: SourceFile) -> String {
 pub fn module_decl_names(db: &dyn salsa::Database, file: SourceFile) -> Vec<String> {
     let source = preprocessed_text(db, file);
     let path = file.path(db).clone();
-    let module = match parse(&source, Mode::Module, &path) {
-        Ok(m) => m,
+    let parsed = match parse_module(&source) {
+        Ok(p) => p,
         Err(_) => return Vec::new(),
     };
+    let module = parsed.into_syntax();
     let (resolved, _) = resolve_module(path, &source, &[], &module);
     resolved
         .module_scope()
@@ -172,14 +176,14 @@ fn check_impl(path: &str, text: &str) -> Diagnostics {
     ))));
     let prep = preprocess(&expanded);
 
-    let module = match parse(&prep.python_source, Mode::Module, path) {
-        Ok(m) => m,
+    let module = match parse_module(&prep.python_source) {
+        Ok(p) => p.into_syntax(),
         Err(e) => {
             diags.push_error(TycError::parse(
                 path.to_owned(),
                 prep.python_source,
                 e.to_string(),
-                usize::from(e.offset),
+                usize::from(e.location.start()),
             ));
             return diags;
         }

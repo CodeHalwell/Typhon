@@ -10,7 +10,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use miette::{Diagnostic as MietteDiagnostic, LabeledSpan};
-use rustpython_parser::{parse, Mode};
 use salsa::Setter;
 use tokio::sync::Mutex;
 use tower_lsp_server::ls_types::{
@@ -361,8 +360,14 @@ impl Backend {
 /// `val`-reassignment checks are not needed for position queries, and the
 /// same approach is used by the `module_decl_names` salsa query.
 fn resolve_in_preprocessed(preprocessed: &str) -> Option<ResolvedModule> {
-    let module = parse(preprocessed, Mode::Module, "<lsp>").ok()?;
-    let (resolved, _) = tyc_resolve::resolve_module("<lsp>", preprocessed, &[], &module);
+    let parsed = tyc_syntax::parse_module(preprocessed).ok()?;
+    let module = parsed.into_syntax();
+    let (resolved, _) = tyc_resolve::resolve_module(
+        "<lsp>".to_owned(),
+        preprocessed,
+        &[],
+        &module,
+    );
     Some(resolved)
 }
 
@@ -1014,9 +1019,15 @@ mod tests {
 
     fn parse_resolved(src: &str) -> (ResolvedModule, String) {
         let prep = tyc_syntax::preprocess::preprocess(src);
-        let module = rustpython_parser::parse(&prep.python_source, Mode::Module, "<test>").unwrap();
-        let (resolved, _) =
-            tyc_resolve::resolve_module("<test>", &prep.python_source, &prep.stripped, &module);
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, _) = tyc_resolve::resolve_module(
+            "<test>".to_owned(),
+            &prep.python_source,
+            &prep.stripped,
+            &module,
+        );
         (resolved, prep.python_source)
     }
 

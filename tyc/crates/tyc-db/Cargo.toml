@@ -11,8 +11,6 @@ tyc-syntax = { workspace = true }
 tyc-diagnostics = { workspace = true }
 tyc-resolve = { workspace = true }
 tyc-types = { workspace = true }
-rustpython-parser = { workspace = true }
-rustpython-ast = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
