@@ -13,3 +13,9 @@ ruff_text_size = { workspace = true }
 
 itertools = "0.14.0"
 unicode-ident = "1.0.12"
+
+[lints.clippy]
+all = { level = "allow", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+nursery = { level = "allow", priority = -1 }
+

@@ -1484,6 +1484,7 @@ pub struct TypeParamTypeVarTuple<'a> {
 pub struct StmtAssign<'a> {
     targets: Vec<ComparableExpr<'a>>,
     value: ComparableExpr<'a>,
+    mutability: Option<ast::Mutability>,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -1499,6 +1500,7 @@ pub struct StmtAnnAssign<'a> {
     annotation: ComparableExpr<'a>,
     value: Option<ComparableExpr<'a>>,
     simple: bool,
+    mutability: Option<ast::Mutability>,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -1689,10 +1691,11 @@ impl<'a> From<&'a ast::Stmt> for ComparableStmt<'a> {
                 value,
                 range: _,
                 node_index: _,
-                mutability: _,
+                mutability,
             }) => Self::Assign(StmtAssign {
                 targets: targets.iter().map(Into::into).collect(),
                 value: value.into(),
+                mutability: *mutability,
             }),
             ast::Stmt::AugAssign(ast::StmtAugAssign {
                 target,
@@ -1712,12 +1715,13 @@ impl<'a> From<&'a ast::Stmt> for ComparableStmt<'a> {
                 simple,
                 range: _,
                 node_index: _,
-                mutability: _,
+                mutability,
             }) => Self::AnnAssign(StmtAnnAssign {
                 target: target.into(),
                 annotation: annotation.into(),
                 value: value.as_ref().map(Into::into),
                 simple: *simple,
+                mutability: *mutability,
             }),
             ast::Stmt::For(ast::StmtFor {
                 is_async,

@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use clap::Args;
-use miette::{Result, miette};
+use miette::{miette, Result};
 
 use crate::commands::build::{self, BuildArgs};
 
@@ -55,8 +55,20 @@ pub fn run(args: TyArgs) -> Result<()> {
     }
 
     // Resolve / create the directory `ty check` will scan.
+    //
+    // A relative `--out` is anchored to the project path (matching
+    // `tyc build`'s behaviour) — otherwise the build and the subsequent
+    // `ty check` would disagree about where the artefacts live when `tyc ty`
+    // is invoked from a different working directory than the project.
     let (out_dir, _tempdir_guard) = match (&args.out, args.no_build) {
-        (Some(dir), _) => (dir.clone(), None),
+        (Some(dir), _) => {
+            let resolved = if dir.is_absolute() {
+                dir.clone()
+            } else {
+                args.path.join(dir)
+            };
+            (resolved, None)
+        }
         (None, false) => {
             let td = tempfile::tempdir()
                 .map_err(|e| miette!("failed to create temp output directory: {e}"))?;
@@ -74,7 +86,13 @@ pub fn run(args: TyArgs) -> Result<()> {
         })?;
     }
 
+    // Anchor the subprocess at the project root so `ty` discovers any
+    // `pyproject.toml` / `ty.toml` / virtualenv from the project, not from
+    // whatever directory the user happened to invoke `tyc ty` from. The
+    // output directory is passed as an absolute path so this doesn't
+    // double-anchor it.
     let mut cmd = Command::new(&args.ty_bin);
+    cmd.current_dir(&args.path);
     cmd.arg("check").arg(&out_dir);
     for extra in &args.ty_args {
         cmd.arg(extra);
@@ -115,6 +133,40 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{:?}", result.unwrap_err());
         assert!(msg.contains("--no-build requires --out"));
+    }
+
+    #[test]
+    fn relative_out_is_resolved_against_project_path() {
+        // Regression for a path-mismatch bug: a relative `--out` must be
+        // anchored to the project path so the build and the subsequent
+        // `ty check` invocation agree on where the artefacts live, even when
+        // `tyc ty` is invoked from a different working directory.
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(src_dir.join("main.ty"), "val x: int = 1\n").unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname = \"test\"\n",
+        )
+        .unwrap();
+
+        let result = run(TyArgs {
+            path: tmp.path().to_path_buf(),
+            out: Some(PathBuf::from("build")),
+            ty_bin: "ty-definitely-does-not-exist-12345".into(),
+            no_build: false,
+            ty_args: vec![],
+        });
+        assert!(result.is_err(), "missing ty binary should error");
+
+        // The build should have written into <tmp>/build, not ./build.
+        let expected = tmp.path().join("build");
+        assert!(
+            expected.exists(),
+            "build output should be at {} after `tyc ty --out build`",
+            expected.display(),
+        );
     }
 
     #[test]

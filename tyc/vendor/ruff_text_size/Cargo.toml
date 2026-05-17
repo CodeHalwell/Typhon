@@ -27,3 +27,8 @@ get-size = ["dep:get-size2"]
 name = "serde"
 path = "tests/serde.rs"
 required-features = ["serde"]
+
+[lints.clippy]
+all = { level = "allow", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+nursery = { level = "allow", priority = -1 }

@@ -11,9 +11,21 @@ publish = false
 test = false
 doctest = false
 
+[dev-dependencies]
+# `insta` is referenced by upstream's inline `#[cfg(test)]` snapshot blocks
+# in `src/string.rs`. The tests aren't run (lib has `test = false`) but
+# `cargo clippy --all-targets` still type-checks them, so the dependency
+# must resolve.
+insta = "1"
+
 [[test]]
 name = "typhon_mutability"
 path = "tests/typhon_mutability.rs"
+
+[lints.clippy]
+all = { level = "allow", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+nursery = { level = "allow", priority = -1 }
 
 [dependencies]
 ruff_python_ast = { workspace = true, features = ["get-size"] }

@@ -17,3 +17,8 @@ serde = { version = "1.0.197", features = ["derive"], optional = true }
 [features]
 get-size = ["dep:get-size2", "ruff_text_size/get-size"]
 serde = ["dep:serde", "ruff_text_size/serde"]
+
+[lints.clippy]
+all = { level = "allow", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+nursery = { level = "allow", priority = -1 }

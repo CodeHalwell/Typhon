@@ -40,3 +40,8 @@ get-size = ["dep:get-size2", "ruff_text_size/get-size"]
 
 [lints.rust]
 unexpected_cfgs = { level = "allow", check-cfg = ['cfg(feature, values("cache", "salsa"))'] }
+
+[lints.clippy]
+all = { level = "allow", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+nursery = { level = "allow", priority = -1 }
