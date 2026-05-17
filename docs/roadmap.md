@@ -6,7 +6,13 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Phase 0 — Foundation (months 1–2) — substantially complete
 
-- ☐ Fork `ruff_python_parser` and `ruff_python_ast` into `vendor/`. *Deferred — currently using `rustpython-parser` 0.4 from crates.io as the Phase-0 fallback. The fork lands in a follow-up.*
+- ☐ Fork `ruff_python_parser` and `ruff_python_ast` into `vendor/`. *Scaffolded
+  — the workspace now declares empty `vendor/ruff_python_ast` and
+  `vendor/ruff_python_parser` member crates with the dependency edge
+  wired up; production Typhon still routes through `rustpython-parser`
+  0.4 from crates.io. The real source plus the `val`/`var` lexer
+  additions land when the migration described in `tyc/vendor/README.md`
+  runs.*
 - ✅ Add one or two custom tokens (`val`, `var`) to confirm the fork-extend workflow.
 - ☐ Round-trip Python through the fork via `ruff_python_codegen`: parse → emit, verify byte-identical (modulo whitespace) on a corpus of real Python files. *Hand-written `tyc-emit` printer covers the Python subset used in Phase 0/1 round-trip tests; corpus verification deferred until the ruff fork lands.*
 - ✅ `clap`-based `tyc` shell with `tyc fmt` working as the simplest end-to-end command.

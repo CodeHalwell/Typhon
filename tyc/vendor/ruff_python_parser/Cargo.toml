@@ -1,0 +1,16 @@
+[package]
+name = "ruff_python_parser"
+version = "0.0.0-typhon-scaffold"
+edition.workspace = true
+license.workspace = true
+description = "Vendored copy of ruff_python_parser (SCAFFOLD — empty stub)"
+publish = false
+
+# Part of the Phase-0-follow-up Ruff vendor effort.  See
+# vendor/README.md for the migration plan.  Empty stub today;
+# real source lands when the migration runs.  The `ruff_python_ast`
+# dependency edge is wired up so swapping in real source touches
+# only this crate, not the workspace topology.
+
+[dependencies]
+ruff_python_ast = { path = "../ruff_python_ast" }

@@ -11,6 +11,11 @@ members = [
     "crates/tyc-analyse",
     "crates/tyc-desugar",
     "crates/tyc-lsp",
+    # Vendored Ruff parser/AST — scaffolding for the Phase 0 follow-up.
+    # The crates compile as empty stubs today; the real source lands when
+    # the migration described in `vendor/README.md` runs.
+    "vendor/ruff_python_ast",
+    "vendor/ruff_python_parser",
 ]
 resolver = "2"
 
