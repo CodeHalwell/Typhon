@@ -13,7 +13,7 @@ The `tyc` binary is a multi-stage compiler with an embedded LSP, structured as a
 [tyc-syntax]   →  Typhon AST (Python AST + Typhon nodes)
         │
         ▼
-[tyc-resolve]  →  symbol tables, scopes, val/var classification
+[tyc-resolve]  →  symbol tables, scopes, let/mut classification
         │
         ▼
 [tyc-types]    →  typed AST, structural subtyping, sealed unions
@@ -39,7 +39,7 @@ tyc/
 ├── crates/
 │   ├── tyc-syntax/             forked ruff_python_ast + parser, Typhon nodes
 │   ├── tyc-db/                 Salsa database, input/tracked queries
-│   ├── tyc-resolve/            name resolution, imports, val/var
+│   ├── tyc-resolve/            name resolution, imports, let/mut
 │   ├── tyc-types/              structural + nominal type checker
 │   ├── tyc-analyse/            purity, async-gather, comptime, DCE
 │   ├── tyc-desugar/            Typhon AST → Python AST lowering
@@ -79,7 +79,7 @@ Python's significant-whitespace lexing is non-trivial. Hand-writing a full Pytho
 
 ### Hybrid strategy
 
-1. Run Typhon-specific checks on the Typhon AST: non-nullability, sealed-union exhaustiveness, `Result`/`?` propagation, `val`/`var`, no-implicit-`Any`, extension-method resolution.
+1. Run Typhon-specific checks on the Typhon AST: non-nullability, sealed-union exhaustiveness, `Result`/`?` propagation, `let`/`mut`, no-implicit-`Any`, extension-method resolution.
 2. Desugar to Python AST with rich type annotations preserved.
 3. Optionally run `ty` (as a library) over the desugared AST to catch standard Python typing violations.
 

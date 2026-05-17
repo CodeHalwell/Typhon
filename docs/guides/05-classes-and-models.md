@@ -16,8 +16,8 @@ Three fields. Two have explicit defaults (or implicit ones — `email: str?` def
 The constructor is generated for you:
 
 ```python
-val u: User = User(id=1, name="Alice", email="alice@example.com")
-val anon: User = User(id=2)               # name defaults to "anon", email to None
+let u: User = User(id=1, name="Alice", email="alice@example.com")
+let anon: User = User(id=2)               # name defaults to "anon", email to None
 ```
 
 **Compiles to:**
@@ -55,7 +55,7 @@ impl User:
 Calls look normal:
 
 ```python
-val u: User = User(id=1, name="Alice", email="alice@example.com")
+let u: User = User(id=1, name="Alice", email="alice@example.com")
 print(u.display())            # Alice <alice@example.com>
 print(u.is_admin())           # False
 ```
@@ -94,14 +94,14 @@ class Point:
     x: float
     y: float
 
-val p: Point = Point(x=1.0, y=2.0)
+let p: Point = Point(x=1.0, y=2.0)
 p.x = 5.0    # ✅ allowed
 
 class FrozenPoint frozen:
     x: float
     y: float
 
-val q: FrozenPoint = FrozenPoint(x=1.0, y=2.0)
+let q: FrozenPoint = FrozenPoint(x=1.0, y=2.0)
 q.x = 5.0    # ❌ dataclasses.FrozenInstanceError at runtime; tyc::frozen_assign at compile time
 ```
 
@@ -283,11 +283,11 @@ class FrozenPoint frozen:
     x: float
     y: float
 
-val p: FrozenPoint = FrozenPoint(x=1.0, y=2.0)
+let p: FrozenPoint = FrozenPoint(x=1.0, y=2.0)
 p.x = 3.0     # ❌ tyc::frozen_assign
 ```
 
-Construct a fresh instance instead: `val q: FrozenPoint = FrozenPoint(x=3.0, y=p.y)`.
+Construct a fresh instance instead: `let q: FrozenPoint = FrozenPoint(x=3.0, y=p.y)`.
 
 ## What you've learned
 

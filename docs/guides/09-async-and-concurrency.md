@@ -14,14 +14,14 @@ async def fetch(url: str) -> str:
     ...
 
 def main() -> None:
-    val body: str = fetch("https://example.com")    # ❌ coroutine, not str
+    let body: str = fetch("https://example.com")    # ❌ coroutine, not str
 ```
 
 ```
 error[tyc::missing_await]: cannot use a coroutine where `str` is required
  ┌─ src/main.ty:5:21
  │
-5 │     val body: str = fetch("https://example.com")
+5 │     let body: str = fetch("https://example.com")
  │                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ did you mean `await`?
                        and is `main` declared `async`?
 ```
@@ -37,14 +37,14 @@ async def fetch(url: str) -> str:
     return f"body of {url}"
 
 async def main() -> None:
-    val body: str = await fetch("https://example.com")
+    let body: str = await fetch("https://example.com")
     print(body)
 
 if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-Everything else from the language — `val`/`var`, `Result`, narrowing — works inside `async def` unchanged.
+Everything else from the language — `let`/`mut`, `Result`, narrowing — works inside `async def` unchanged.
 
 ## `gather:` — run independent awaits in parallel
 
@@ -53,9 +53,9 @@ A common shape: several independent network calls, each behind an `await`. Seque
 ```python
 # Sequential — 300ms if each call takes 100ms
 async def load_dashboard(user_id: int) -> Dashboard:
-    val user: User = await fetch_user(user_id)
-    val posts: list[Post] = await fetch_posts(user_id)
-    val notifs: list[Notif] = await fetch_notifs(user_id)
+    let user: User = await fetch_user(user_id)
+    let posts: list[Post] = await fetch_posts(user_id)
+    let notifs: list[Notif] = await fetch_notifs(user_id)
     return Dashboard(user=user, posts=posts, notifs=notifs)
 ```
 
@@ -119,7 +119,7 @@ Sometimes you want to spawn work *without* awaiting it: a background email, a me
 
 ```python
 async def signup(email: str) -> User:
-    val user: User = await create_user(email)
+    let user: User = await create_user(email)
     go send_welcome_email(user)         # fire and forget
     return user
 ```
@@ -132,7 +132,7 @@ If you want to join later, bind the task:
 
 ```python
 async def signup(email: str) -> User:
-    val user: User = await create_user(email)
+    let user: User = await create_user(email)
     go send_welcome_email(user) -> email_task
     # ... later ...
     await email_task
@@ -169,9 +169,9 @@ A common shape that *isn't* a fit for `gather`:
 
 ```python
 async def process(urls: list[str]) -> list[str]:
-    var results: list[str] = []
+    mut results: list[str] = []
     for url in urls:
-        val body: str = await fetch(url)
+        let body: str = await fetch(url)
         results.append(body)
     return results
 ```
@@ -212,18 +212,18 @@ class Dashboard:
     notifs: list[Notif]
 
 async def load_dashboard(user_id: int) -> Result[Dashboard, LoadError]:
-    val started: float = asyncio.get_event_loop().time()
+    let started: float = asyncio.get_event_loop().time()
 
     gather:
         user_r   = fetch_user(user_id)
         posts_r  = fetch_posts(user_id)
         notifs_r = fetch_notifs(user_id)
 
-    val user: User = user_r?
-    val posts: list[Post] = posts_r?
-    val notifs: list[Notif] = notifs_r?
+    let user: User = user_r?
+    let posts: list[Post] = posts_r?
+    let notifs: list[Notif] = notifs_r?
 
-    val elapsed_ms: int = int((asyncio.get_event_loop().time() - started) * 1000)
+    let elapsed_ms: int = int((asyncio.get_event_loop().time() - started) * 1000)
     go record_load(user_id, elapsed_ms)
 
     return Ok(Dashboard(user=user, posts=posts, notifs=notifs))
@@ -242,7 +242,7 @@ Walk through:
 
 ```python
 async def main() -> None:
-    val body: str = fetch("...")    # ❌ missing await
+    let body: str = fetch("...")    # ❌ missing await
 ```
 
 `tyc check` flags this. Add `await`.

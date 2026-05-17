@@ -19,7 +19,7 @@ Python's exceptions don't appear in type signatures. A function annotated `def f
 def parse_port(raw: str) -> Result[int, str]:
     if not raw.isdigit():
         return Err(f"not a number: {raw}")
-    val n: int = int(raw)
+    let n: int = int(raw)
     if n < 1 or n > 65535:
         return Err(f"port out of range: {n}")
     return Ok(n)
@@ -48,7 +48,7 @@ Manual `match` everywhere is noisy. The `?` suffix is sugar for "unwrap the `Ok`
 
 ```python
 def parse_address(host: str, port_str: str) -> Result[tuple[str, int], str]:
-    val port: int = parse_port(port_str)?
+    let port: int = parse_port(port_str)?
     return Ok((host, port))
 ```
 
@@ -58,7 +58,7 @@ If `parse_port` returns `Err(msg)`, the `?` short-circuits and `parse_address` r
 
 ```python
 def bad() -> int:
-    val n: int = parse_port("8080")?    # ❌ tyc::result_propagate_outside_result
+    let n: int = parse_port("8080")?    # ❌ tyc::result_propagate_outside_result
     return n
 ```
 
@@ -67,7 +67,7 @@ error[tyc::result_propagate_outside_result]: `?` can only short-circuit inside a
                                               returning a compatible `Result`
  ┌─ src/main.ty:2:13
  │
-2 │     val n: int = parse_port("8080")?
+2 │     let n: int = parse_port("8080")?
  │                  ^^^^^^^^^^^^^^^^^^^^ enclosing function returns `int`, not `Result`
 ```
 
@@ -79,7 +79,7 @@ The "compatible" check is structural: the error types must match (or unify, for 
 
 ```python
 # Typhon
-val port: int = parse_port(port_str)?
+let port: int = parse_port(port_str)?
 
 # Emitted Python
 _tmp_0 = parse_port(port_str)
@@ -231,7 +231,7 @@ def load(path: str) -> Result[dict[str, str], ConfigError]:
         return Err(InvalidJson(detail=str(e)))
 
 def get_port(cfg: dict[str, str]) -> Result[int, ConfigError]:
-    val raw: str? = cfg.get("port")
+    let raw: str? = cfg.get("port")
     guard r = raw else:
         return Err(MissingKey(key="port"))
     if not r.isdigit():
@@ -269,7 +269,7 @@ The whole error-handling story shows up here:
 
 ```python
 def main() -> None:
-    val port: int = parse_port("8080")?    # ❌ main returns None
+    let port: int = parse_port("8080")?    # ❌ main returns None
 ```
 
 Fix: change the signature, or `match` explicitly.
@@ -280,7 +280,7 @@ Fix: change the signature, or `match` explicitly.
 def parse_port(raw: str) -> Result[int, str]: ...
 
 def boot(raw: str) -> Result[int, ConfigError]:
-    val port: int = parse_port(raw)?       # ❌ str is not assignable to ConfigError
+    let port: int = parse_port(raw)?       # ❌ str is not assignable to ConfigError
     return Ok(port)
 ```
 

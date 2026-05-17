@@ -31,14 +31,14 @@ def classify(score: int) -> str:
 
 ```python
 def countdown(n: int) -> None:
-    var i: int = n
+    mut i: int = n
     while i > 0:
         print(i)
         i = i - 1
     print("liftoff")
 ```
 
-The loop variable is `var` because we reassign it. The checker would catch a `val` here.
+The loop variable is `mut` because we reassign it. The checker would catch a `let` here.
 
 ## `for`
 
@@ -46,7 +46,7 @@ The loop variable is `var` because we reassign it. The checker would catch a `va
 
 ```python
 def sum_all(xs: list[int]) -> int:
-    var total: int = 0
+    mut total: int = 0
     for x in xs:
         total = total + x
     return total
@@ -55,7 +55,7 @@ def sum_all(xs: list[int]) -> int:
 For index-and-value pairs, use `enumerate`. For two parallel lists, use `zip`. The element type is inferred from the iterable:
 
 ```python
-val names: list[str] = ["a", "b", "c"]
+let names: list[str] = ["a", "b", "c"]
 for i, name in enumerate(names):
     print(f"{i}: {name}")
 ```
@@ -82,7 +82,7 @@ Inside the `else:` block you must return, raise, or otherwise leave the enclosin
 ```python
 if weight is None:
     return 0.0
-val w: float = weight
+let w: float = weight
 return w * 1.25
 ```
 
@@ -121,24 +121,24 @@ For *sealed unions*, the wildcard (`_`) becomes optional — the checker enforce
 Mutable, ordered. The element type is required:
 
 ```python
-val primes: list[int] = [2, 3, 5, 7, 11]
+let primes: list[int] = [2, 3, 5, 7, 11]
 
-var bag: list[str] = []
+mut bag: list[str] = []
 bag.append("hello")
 ```
 
 A heterogeneous literal is rejected unless the annotation is a union:
 
 ```python
-val mixed: list[int] = [1, "two"]            # ❌ str not assignable to int
-val mixed: list[int | str] = [1, "two"]      # ✅
+let mixed: list[int] = [1, "two"]            # ❌ str not assignable to int
+let mixed: list[int | str] = [1, "two"]      # ✅
 ```
 
 ### `dict[K, V]`
 
 ```python
-val counts: dict[str, int] = {"apples": 3, "pears": 1}
-val n: int? = counts.get("apples")    # `.get` returns V | None
+let counts: dict[str, int] = {"apples": 3, "pears": 1}
+let n: int? = counts.get("apples")    # `.get` returns V | None
 ```
 
 `dict.get(key)` returns `V?` — there's no implicit `None`-stripping. Either check it, narrow it, or use `dict[key]` (which raises `KeyError` and is typed `V`).
@@ -146,8 +146,8 @@ val n: int? = counts.get("apples")    # `.get` returns V | None
 ### `set[T]`
 
 ```python
-val seen: set[int] = {1, 2, 3}
-val also_seen: set[int] = set()
+let seen: set[int] = {1, 2, 3}
+let also_seen: set[int] = set()
 ```
 
 ### `tuple[...]`
@@ -155,8 +155,8 @@ val also_seen: set[int] = set()
 Fixed-arity tuples spell the type of every slot:
 
 ```python
-val point: tuple[float, float] = (1.0, 2.0)
-val rgb: tuple[int, int, int] = (255, 128, 0)
+let point: tuple[float, float] = (1.0, 2.0)
+let rgb: tuple[int, int, int] = (255, 128, 0)
 ```
 
 Variable-length homogeneous tuples use `tuple[T, ...]`:
@@ -172,10 +172,10 @@ def average(*nums: float) -> float:
 List, set, and dict comprehensions are unchanged:
 
 ```python
-val nums: list[int] = [1, 2, 3, 4, 5]
-val squares: list[int] = [n * n for n in nums]
-val evens: set[int] = {n for n in nums if n % 2 == 0}
-val by_value: dict[int, int] = {n: n * n for n in nums}
+let nums: list[int] = [1, 2, 3, 4, 5]
+let squares: list[int] = [n * n for n in nums]
+let evens: set[int] = {n for n in nums if n % 2 == 0}
+let by_value: dict[int, int] = {n: n * n for n in nums}
 ```
 
 Generator expressions exist; their type is `Iterator[T]`.
@@ -213,31 +213,31 @@ You'll typically wrap untyped or third-party calls in a tiny `try` and lift thei
 **Missing element type on a collection:**
 
 ```python
-val xs: list = [1, 2, 3]      # ❌ bare `list` is an implicit Any element type
+let xs: list = [1, 2, 3]      # ❌ bare `list` is an implicit Any element type
 ```
 
-Fix: `val xs: list[int] = [1, 2, 3]`.
+Fix: `let xs: list[int] = [1, 2, 3]`.
 
 **Treating `dict.get(...)` as non-nullable:**
 
 ```python
-val counts: dict[str, int] = {"a": 1}
-val n: int = counts.get("missing")    # ❌ get() returns int | None
+let counts: dict[str, int] = {"a": 1}
+let n: int = counts.get("missing")    # ❌ get() returns int | None
 ```
 
-Fix: `val n: int? = counts.get("missing")`, then narrow.
+Fix: `let n: int? = counts.get("missing")`, then narrow.
 
-**Reassigning a `val` loop accumulator:**
+**Reassigning a `let` loop accumulator:**
 
 ```python
 def sum_all(xs: list[int]) -> int:
-    val total: int = 0
+    let total: int = 0
     for x in xs:
-        total = total + x     # ❌ total is `val`
+        total = total + x     # ❌ total is `let`
     return total
 ```
 
-Fix: `var total: int = 0`.
+Fix: `mut total: int = 0`.
 
 ## What you've learned
 

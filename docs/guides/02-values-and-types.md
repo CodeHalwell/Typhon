@@ -2,36 +2,36 @@
 
 Two ideas do most of the safety work in Typhon: **bindings are immutable by default**, and **types cannot hold `None` unless you say so**. Everything in this guide flows from those two rules.
 
-## `val` and `var`
+## `let` and `mut`
 
 A local binding picks one of two keywords:
 
 ```python
 def demo() -> None:
-    val pi: float = 3.14159
-    var counter: int = 0
+    let pi: float = 3.14159
+    mut counter: int = 0
 
-    counter = counter + 1    # ✅ var is reassignable
-    # pi = 3.14              # ❌ compile error: `pi` is a `val`
+    counter = counter + 1    # ✅ mut is reassignable
+    # pi = 3.14              # ❌ compile error: `pi` is a `let`
 ```
 
-- **`val`** — immutable binding. Reassignment is a compile error.
-- **`var`** — mutable binding. Required for any name you intend to rebind.
+- **`let`** — immutable binding. Reassignment is a compile error.
+- **`mut`** — mutable binding. Required for any name you intend to rebind.
 
-This is *binding* immutability, like Rust's `let` vs `let mut` or TypeScript's `const` vs `let`. A `val` cannot point at a new object, but the object it points at can still have mutable fields. For deep immutability, freeze the underlying dataclass (see [guide 5](05-classes-and-models.md)).
+This is *binding* immutability, like Rust's `let` vs `let mut` or TypeScript's `const` vs `let`. A `let` cannot point at a new object, but the object it points at can still have mutable fields. For deep immutability, freeze the underlying dataclass (see [guide 5](05-classes-and-models.md)).
 
-### Why both? Why default to `val`?
+### Why both? Why default to `let`?
 
-Mutability is a hazard you want to opt into, not out of. `val` is the cheaper-to-read choice for the reader: they don't have to scan the rest of the function looking for reassignments. Reach for `var` only when you actually need it (loop counters, accumulators, builders).
+Mutability is a hazard you want to opt into, not out of. `let` is the cheaper-to-read choice for the reader: they don't have to scan the rest of the function looking for reassignments. Reach for `mut` only when you actually need it (loop counters, accumulators, builders).
 
-### Module-level bindings default to `val`
+### Module-level bindings default to `let`
 
 ```python
-PI: float = 3.14159           # implicitly `val`
-var feature_flag: bool = False  # explicitly mutable
+PI: float = 3.14159           # implicitly `let`
+mut feature_flag: bool = False  # explicitly mutable
 ```
 
-Inside a function, the kind is always explicit. At module top level, it's `val` unless declared otherwise.
+Inside a function, the kind is always explicit. At module top level, it's `let` unless declared otherwise.
 
 ## Primitives
 
@@ -48,17 +48,17 @@ The familiar Python primitives, with stricter rules:
 
 ```python
 def types() -> None:
-    val n: int = 10
-    val ratio: float = n / 3       # int → float, allowed
-    val msg: str = f"n={n}"
-    val flag: bool = n > 0
+    let n: int = 10
+    let ratio: float = n / 3       # int → float, allowed
+    let msg: str = f"n={n}"
+    let flag: bool = n > 0
 ```
 
 ### `int` and `float` are distinct
 
 ```python
-val x: int = 3.14    # ❌ type mismatch: expected int, found float
-val y: float = 3     # ✅ int is assignable to float (widening)
+let x: int = 3.14    # ❌ type mismatch: expected int, found float
+let y: float = 3     # ✅ int is assignable to float (widening)
 ```
 
 Floats do not silently truncate to ints. Use `int(x)` or `round(x)` explicitly.
@@ -77,7 +77,7 @@ def greet(name: str) -> None:
     print(f"Hello, {name}")
 
 def main() -> None:
-    val found: str? = find_user(42)
+    let found: str? = find_user(42)
     # greet(found)              # ❌ `str?` is not assignable to `str`
 ```
 
@@ -97,7 +97,7 @@ Once you check, the type narrows. Inside the `if` branch, `found` is `str`, not 
 
 ```python
 def main() -> None:
-    val found: str? = find_user(42)
+    let found: str? = find_user(42)
     if found is not None:
         greet(found)             # ✅ narrowed to str
     else:
@@ -108,7 +108,7 @@ def main() -> None:
 
 ```python
 def main() -> None:
-    val found: str? = find_user(42)
+    let found: str? = find_user(42)
     if found is None:
         return
     greet(found)                 # ✅ everything after the guard sees `str`
@@ -150,14 +150,14 @@ Typhon refuses to infer `Any` outside an `unsafe` block. This is stricter than T
 import some_untyped_lib
 
 def main() -> None:
-    val data = some_untyped_lib.fetch()    # ❌ infers Any
+    let data = some_untyped_lib.fetch()    # ❌ infers Any
 ```
 
 ```
 error[tyc::implicit_any]: cannot infer a type for `data`
  ┌─ src/main.ty:4:9
  │
-4 │     val data = some_untyped_lib.fetch()
+4 │     let data = some_untyped_lib.fetch()
  │         ^^^^ the right-hand side has type `Any`; annotate or wrap in `unsafe`
 ```
 
@@ -165,11 +165,11 @@ Two fixes — pick the one that fits:
 
 ```python
 # Option A: assert the type with an annotation
-val data: dict[str, int] = some_untyped_lib.fetch()
+let data: dict[str, int] = some_untyped_lib.fetch()
 
 # Option B: wrap in `unsafe` (acknowledges the dynamic boundary)
 unsafe:
-    val data = some_untyped_lib.fetch()
+    let data = some_untyped_lib.fetch()
 ```
 
 `unsafe` is the right tool when you genuinely don't know the type — e.g. exploring a new dependency. For production code, an annotation or a `.dty` stub (guide 10) is cleaner.
@@ -188,8 +188,8 @@ def parse_port(raw: str?) -> int? :
 
 def main() -> None:
     import os
-    val port: int? = parse_port(os.environ.get("PORT"))
-    var host: str = "localhost"
+    let port: int? = parse_port(os.environ.get("PORT"))
+    mut host: str = "localhost"
 
     if port is None:
         print(f"using default port on {host}")
@@ -203,11 +203,11 @@ Walk through what's happening:
 2. `guard raw = raw` shadows `raw` with the narrowed `str` inside the function body.
 3. `os.environ.get(...)` returns `str | None` — Python sees this and the types line up.
 4. The `if port is None` check narrows `port` to `int` in the `else` branch, so the f-string is safe.
-5. `host` is `var` because... well, in this example it isn't reassigned, so we could have used `val`. The compiler won't complain about over-mutability, but readers will.
+5. `host` is `mut` because... well, in this example it isn't reassigned, so we could have used `let`. The compiler won't complain about over-mutability, but readers will.
 
 ## What you've learned
 
-- **`val`** is for bindings you don't intend to rebind; **`var`** opts into mutability.
+- **`let`** is for bindings you don't intend to rebind; **`mut`** opts into mutability.
 - **`T`** never holds `None`; **`T?`** does, and the checker tracks it.
 - **Flow narrowing** lets you use `T?` values safely once you've checked them — `if`, `is None`, `isinstance`, `guard`.
 - **No implicit `Any`** — either annotate or wrap in `unsafe`.

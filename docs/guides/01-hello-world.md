@@ -110,7 +110,7 @@ Take a name from `argv` and greet it:
 import sys
 
 def main() -> None:
-    val name: str = sys.argv[1] if len(sys.argv) > 1 else "world"
+    let name: str = sys.argv[1] if len(sys.argv) > 1 else "world"
     print(f"Hello, {name}")
 
 if __name__ == "__main__":
@@ -119,7 +119,7 @@ if __name__ == "__main__":
 
 New things:
 
-- **`val name: str = ...`** — an immutable local binding with an explicit type. Use `var` if you want to reassign it later. (Guide 2 goes deep on this.)
+- **`let name: str = ...`** — an immutable local binding with an explicit type. Use `mut` if you want to reassign it later. (Guide 2 goes deep on this.)
 - **Top-level imports** — `import sys` is unchanged from Python. Typhon adds `lazy import` for deferred loading (guide 10), but plain `import` still works.
 
 Compile and run:
@@ -149,23 +149,23 @@ error[tyc::missing_return_type]: function `main` is missing a return type
 
 Fix: write `def main() -> None:`.
 
-**Using `=` for a binding without `val` or `var`:**
+**Using `=` for a binding without `let` or `mut`:**
 
 ```python
 def main() -> None:
-    name = "Alice"    # ❌ missing val/var
+    name = "Alice"    # ❌ missing let/mut
     print(name)
 ```
 
 ```
-error[tyc::missing_binding_kind]: local bindings must be declared with `val` or `var`
+error[tyc::missing_binding_kind]: local bindings must be declared with `let` or `mut`
  ┌─ src/main.ty:2:5
  │
 2 │     name = "Alice"
- │     ^^^^ add `val` (immutable) or `var` (mutable) here
+ │     ^^^^ add `let` (immutable) or `mut` (mutable) here
 ```
 
-Fix: `val name: str = "Alice"` or `var name: str = "Alice"`. (Top-level module bindings default to `val` automatically; locals are explicit.)
+Fix: `let name: str = "Alice"` or `mut name: str = "Alice"`. (Top-level module bindings default to `let` automatically; locals are explicit.)
 
 ## What you've learned
 
@@ -174,4 +174,4 @@ Fix: `val name: str = "Alice"` or `var name: str = "Alice"`. (Top-level module b
 - The three commands you'll use daily: `tyc check`, `tyc build`, `tyc fmt`.
 - That Typhon emits clean Python with no runtime dependency.
 
-Next: [Values and types](02-values-and-types.md) — `val` vs `var`, the type system, and what "non-nullable by default" means in practice.
+Next: [Values and types](02-values-and-types.md) — `let` vs `mut`, the type system, and what "non-nullable by default" means in practice.
