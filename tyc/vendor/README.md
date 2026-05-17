@@ -80,6 +80,28 @@ doesn't know about (`model`, `impl`, `extend`, `interface`, `unsafe`,
 `comptime`, `lazy`, `gather`, `go`) so the formatter can restore
 them on output.
 
+## Deferred follow-ups
+
+Two stretch items called out in the original plan were deliberately
+deferred — they're independent of the back-end swap and can land on
+separate branches:
+
+1. **Vendor `ruff_python_codegen`** to replace the hand-written
+   `tyc-emit/src/printer.rs` (~1550 LOC). The tricky part is
+   preserving the source-map / line-offset tracking the current
+   printer emits via `Emitter::line_offsets`; upstream codegen
+   doesn't expose that hook, so we'd need a thin Typhon shim that
+   wraps `Generator::stmt` / `Generator::expr` and records the
+   `range()` of each node as it's printed. The `let` / `mut`
+   prefix emission (already implemented in the hand-written
+   printer) would move into that shim.
+2. **Restore upstream Ruff's `insta` snapshot tests** by
+   vendoring the `crates/ruff_python_parser/resources/test/*`
+   fixtures and flipping `test = true` on the vendored libraries.
+   The Typhon `Mutability` extension doesn't appear in any of the
+   upstream fixtures so they should pass unchanged; the win is
+   confidence when bumping the `UPSTREAM` SHA.
+
 The hard part of the consumer swap is the AST shape diff. Significant
 differences from `rustpython_ast`:
 
