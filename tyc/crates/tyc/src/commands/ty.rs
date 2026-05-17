@@ -10,11 +10,14 @@
 //! `uv tool install ty` and `tyc ty` finds it on `$PATH`. A different binary
 //! can be selected with `--ty-bin`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc::{channel, Receiver};
+use std::time::{Duration, Instant};
 
 use clap::Args;
 use miette::{miette, Result};
+use notify::{Event, EventKind, RecursiveMode, Watcher};
 
 use crate::commands::build::{self, BuildArgs};
 
@@ -45,6 +48,13 @@ pub struct TyArgs {
     /// Extra arguments forwarded to `ty check` verbatim.
     #[arg(last = true)]
     pub ty_args: Vec<String>,
+
+    /// Watch the project source directory and re-run `tyc ty` whenever a
+    /// `.ty` or `.dty` file changes. The initial build + check runs
+    /// immediately; subsequent runs are debounced so a burst of editor
+    /// "save" events triggers a single re-run. Press Ctrl+C to stop.
+    #[arg(long)]
+    pub watch: bool,
 }
 
 pub fn run(args: TyArgs) -> Result<()> {
@@ -52,6 +62,15 @@ pub fn run(args: TyArgs) -> Result<()> {
         return Err(miette!(
             "--no-build requires --out so the output directory is known"
         ));
+    }
+    if args.watch && args.no_build {
+        return Err(miette!(
+            "--watch cannot be combined with --no-build (nothing to rebuild on change)"
+        ));
+    }
+
+    if args.watch {
+        return run_watch(args);
     }
 
     // Resolve / create the directory `ty check` will scan.
@@ -117,6 +136,121 @@ pub fn run(args: TyArgs) -> Result<()> {
     Ok(())
 }
 
+/// Debounce window: a burst of filesystem events (a typical editor save
+/// touches several files in quick succession) are coalesced into a single
+/// rebuild so we don't kick off N redundant ty checks.
+const WATCH_DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// Run-once-then-watch loop for `tyc ty --watch`.
+///
+/// Watches the project's `src/` directory recursively for `.ty` / `.dty`
+/// changes and re-runs the full `tyc ty` pipeline each time. Errors from
+/// any single iteration are printed but don't tear down the watcher —
+/// the user fixes their code and the next save triggers another run.
+fn run_watch(args: TyArgs) -> Result<()> {
+    let src_dir = args.path.join("src");
+    if !src_dir.exists() {
+        return Err(miette!(
+            "watch target '{}' does not exist; expected a `src/` directory in the project",
+            src_dir.display()
+        ));
+    }
+
+    // Channel-backed watcher: the OS-specific backend posts events here,
+    // the main thread debounces and re-runs.
+    let (tx, rx) = channel();
+    let mut watcher = notify::recommended_watcher(move |res| {
+        if let Ok(event) = res {
+            let _ = tx.send(event);
+        }
+    })
+    .map_err(|e| miette!("failed to install file watcher: {e}"))?;
+    watcher
+        .watch(&src_dir, RecursiveMode::Recursive)
+        .map_err(|e| miette!("failed to watch '{}': {e}", src_dir.display()))?;
+
+    eprintln!(
+        "tyc ty --watch: watching {} (Ctrl+C to stop)",
+        src_dir.display()
+    );
+
+    // Initial run so the user sees the current state immediately.
+    if let Err(e) = run_once(&args) {
+        eprintln!("error: {:?}", e);
+    }
+
+    while let Ok(first) = rx.recv() {
+        if !event_is_relevant(&first) {
+            // Drain any other irrelevant events that arrived in the
+            // meantime so we don't process them on the next iteration.
+            drain_events(&rx, WATCH_DEBOUNCE);
+            continue;
+        }
+        // Debounce: keep absorbing events until WATCH_DEBOUNCE has elapsed
+        // since the last one. Editor saves often emit Create + Modify +
+        // Remove in rapid succession.
+        let deadline = Instant::now() + WATCH_DEBOUNCE;
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            match rx.recv_timeout(remaining) {
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+
+        eprintln!("tyc ty --watch: change detected, re-running…");
+        if let Err(e) = run_once(&args) {
+            eprintln!("error: {:?}", e);
+        }
+    }
+    Ok(())
+}
+
+/// One pass of the build + `ty check` pipeline. Cloned-arg variant of the
+/// non-watch path so the watch loop can call it repeatedly.
+fn run_once(args: &TyArgs) -> Result<()> {
+    let cloned = TyArgs {
+        path: args.path.clone(),
+        out: args.out.clone(),
+        ty_bin: args.ty_bin.clone(),
+        no_build: false,
+        ty_args: args.ty_args.clone(),
+        watch: false,
+    };
+    run(cloned)
+}
+
+/// `true` when a filesystem event touches a Typhon source file. We
+/// deliberately ignore changes to the output directory (otherwise the
+/// build itself would trigger an immediate re-build loop) and any
+/// non-source extensions.
+fn event_is_relevant(ev: &Event) -> bool {
+    if !matches!(
+        ev.kind,
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+    ) {
+        return false;
+    }
+    ev.paths.iter().any(|p| has_typhon_extension(p))
+}
+
+fn has_typhon_extension(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|s| s.to_str()),
+        Some("ty") | Some("dty")
+    )
+}
+
+/// Drain any events queued up within `window` so the next blocking
+/// `rx.recv()` starts from a clean state.
+fn drain_events(rx: &Receiver<Event>, window: Duration) {
+    let deadline = Instant::now() + window;
+    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+        if rx.recv_timeout(remaining).is_err() {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +263,7 @@ mod tests {
             ty_bin: "ty".into(),
             no_build: true,
             ty_args: vec![],
+            watch: false,
         });
         assert!(result.is_err());
         let msg = format!("{:?}", result.unwrap_err());
@@ -157,6 +292,7 @@ mod tests {
             ty_bin: "ty-definitely-does-not-exist-12345".into(),
             no_build: false,
             ty_args: vec![],
+            watch: false,
         });
         assert!(result.is_err(), "missing ty binary should error");
 
@@ -190,6 +326,7 @@ mod tests {
             ty_bin: "ty-definitely-does-not-exist-12345".into(),
             no_build: false,
             ty_args: vec![],
+            watch: false,
         });
         assert!(result.is_err(), "missing binary should error");
         let msg = format!("{:?}", result.unwrap_err());
@@ -197,5 +334,50 @@ mod tests {
             msg.contains("not found on PATH") && msg.contains("pip install ty"),
             "error should hint at install: {msg}",
         );
+    }
+
+    #[test]
+    fn watch_with_no_build_errors() {
+        // `--watch` is incompatible with `--no-build`: the whole point of
+        // watching is to rebuild on change.
+        let result = run(TyArgs {
+            path: PathBuf::from("."),
+            out: Some(PathBuf::from("build")),
+            ty_bin: "ty".into(),
+            no_build: true,
+            ty_args: vec![],
+            watch: true,
+        });
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(msg.contains("--watch cannot be combined with --no-build"));
+    }
+
+    #[test]
+    fn watch_without_src_dir_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Don't create src/ — watch should reject this with a useful message.
+        let result = run(TyArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            ty_bin: "ty".into(),
+            no_build: false,
+            ty_args: vec![],
+            watch: true,
+        });
+        assert!(result.is_err());
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            msg.contains("does not exist") && msg.contains("src/"),
+            "error should explain the missing src/ directory: {msg}"
+        );
+    }
+
+    #[test]
+    fn has_typhon_extension_recognises_ty_and_dty() {
+        assert!(has_typhon_extension(Path::new("a.ty")));
+        assert!(has_typhon_extension(Path::new("a.dty")));
+        assert!(!has_typhon_extension(Path::new("a.py")));
+        assert!(!has_typhon_extension(Path::new("a")));
     }
 }
