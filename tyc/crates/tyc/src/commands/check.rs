@@ -97,8 +97,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
                         continue;
                     }
                 };
-                let file_diags =
-                    check_file(&mut db, path.display().to_string(), source.clone());
+                let file_diags = check_file(&mut db, path.display().to_string(), source.clone());
                 diags.extend(file_diags);
 
                 // Find the implementation module by stem.  Prefer a sibling
@@ -192,14 +191,14 @@ pub fn run(args: CheckArgs) -> Result<()> {
 /// resulting Python AST.  Used by the stub diff so that Typhon-specific
 /// syntax (`val`, `var`, `model`, `interface`, `extend`, sugar passes)
 /// is normalised before comparing.
-fn parse_for_diff(source: &str) -> Result<rustpython_ast::Mod<rustpython_ast::text_size::TextRange>>
-{
+fn parse_for_diff(
+    source: &str,
+) -> Result<rustpython_ast::Mod<rustpython_ast::text_size::TextRange>> {
     let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
         &expand_gather_blocks(&expand_lazy_imports(source)),
     ))));
     let prep = preprocess(&expanded);
-    parse(&prep.python_source, Mode::Module, "<stubtest>")
-        .map_err(|e| miette!("parse error: {e}"))
+    parse(&prep.python_source, Mode::Module, "<stubtest>").map_err(|e| miette!("parse error: {e}"))
 }
 
 fn diff_stub_against_impl(
@@ -287,7 +286,11 @@ mod tests {
     fn check_stubs_fails_when_function_missing_in_impl() {
         let tmp = tempfile::tempdir().unwrap();
         write_ty(tmp.path(), "lib.dty", "def hello(name: str) -> str: ...\n");
-        write_ty(tmp.path(), "lib.ty", "def goodbye(name: str) -> str:\n    return name\n");
+        write_ty(
+            tmp.path(),
+            "lib.ty",
+            "def goodbye(name: str) -> str:\n    return name\n",
+        );
         let args = CheckArgs {
             paths: vec![tmp.path().to_path_buf()],
             stubs: true,

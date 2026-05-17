@@ -113,10 +113,11 @@ fn walk_py_files(
     root: &std::path::Path,
     f: &mut dyn FnMut(&std::path::Path) -> Result<()>,
 ) -> Result<()> {
-    for entry in std::fs::read_dir(root)
-        .map_err(|e| miette!("cannot list '{}': {e}", root.display()))?
+    for entry in
+        std::fs::read_dir(root).map_err(|e| miette!("cannot list '{}': {e}", root.display()))?
     {
-        let entry = entry.map_err(|e| miette!("cannot read entry under '{}': {e}", root.display()))?;
+        let entry =
+            entry.map_err(|e| miette!("cannot read entry under '{}': {e}", root.display()))?;
         let path = entry.path();
         if path.is_dir() {
             walk_py_files(&path, f)?;
@@ -284,6 +285,9 @@ mod tests {
         let out = instrument_module(src);
         let future_pos = out.find("from __future__").unwrap();
         let header_pos = out.find("import typhon_profile").unwrap();
-        assert!(future_pos < header_pos, "__future__ must precede the injected header; got:\n{out}");
+        assert!(
+            future_pos < header_pos,
+            "__future__ must precede the injected header; got:\n{out}"
+        );
     }
 }

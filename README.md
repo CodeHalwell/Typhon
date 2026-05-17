@@ -55,6 +55,7 @@ cargo build --release
 | `tyc init` | Scaffold a new project: `typhon.toml`, `src/`, `tests/` |
 | `tyc trace` | Map a Python traceback back to Typhon source via `.py.map` files (v1: filename rewrite, line offsets are 1:1) |
 | `tyc profile` | Build then instrument every top-level function with call-count + wall-clock sampling; writes `typhon-profile.json` on interpreter exit |
+| `tyc migrate` | Convert typed Python (`.py`) into Typhon (`.ty`): `Optional[T]`/`T \| None` → `T?`, module-level annotated assigns gain `val`/`var`, `@dataclass` decorators and `from dataclasses import dataclass` are dropped |
 
 See [docs/cli.md](docs/cli.md) for the full reference.
 
@@ -90,7 +91,7 @@ See [docs/cli.md](docs/cli.md) for the full reference.
 
 **Phase 3 — Structural typing and advanced features** substantially complete:
 
-- ✅ Generics syntax locked to PEP 695 (`def f[T](x: T)`, `type Vec[T] = list[T]`). Type params resolve in scope; the type checker treats them as `Any` until a real bidirectional inference engine lands.
+- ✅ Generics syntax locked to PEP 695 (`def f[T](x: T)`, `type Vec[T] = list[T]`). Type params resolve in scope and are preserved as `Type::TypeVar(name)` through signatures. Call-site bidirectional inference binds typevars from actual arguments (recursively, e.g. `list[T]` against `list[int]` infers `T=int`; conflicting bindings widen to a union) and substitutes them in the return type. Multi-arg constraint solving and bounded type vars are still partial.
 - ✅ `interface Name:` lowers to `class Name(Protocol):` with a structural conformance check on assignment. `isinstance(x, Interface)` is rejected by default.
 - ✅ `unsafe:` lexical region: lowers to `if True:` for scope preservation, and the type checker tracks `unsafe_depth` to suppress diagnostics inside the block so users can interface with untyped Python without fighting the checker. Boundary checks at assignment sites outside the block apply normally.
 - ✅ `@pure`/`@memo`/`@pure(memo=True)` decorators trigger the six-condition purity check; memoised functions get `@functools.cache` injected at desugar time. Project-wide opt-in via `[strictness] auto-memoise`.

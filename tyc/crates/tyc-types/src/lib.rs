@@ -66,6 +66,11 @@ pub enum Type {
     Any,
     /// Unresolved type (annotation we don't yet understand).
     Unknown,
+    /// A PEP 695 type parameter that has not been bound yet.  Behaves like
+    /// `Any` in assignability checks (permissive in both directions) until
+    /// the call-site inference pass substitutes it with a concrete type.
+    /// The string is the type-parameter name as declared in the source.
+    TypeVar(String),
 }
 
 impl Type {
@@ -149,6 +154,7 @@ impl Type {
                 s.join(" | ")
             }
             Type::Any => "Any".into(),
+            Type::TypeVar(name) => name.clone(),
             Type::Unknown => "?".into(),
         }
     }
@@ -171,6 +177,9 @@ impl Type {
 pub fn assignable(expected: &Type, actual: &Type) -> bool {
     match (expected, actual) {
         (Type::Any, _) | (_, Type::Any) => true,
+        // Unbound PEP 695 type parameters behave like `Any` until call-site
+        // inference (`bind_typevars_and_substitute`) refines them.
+        (Type::TypeVar(_), _) | (_, Type::TypeVar(_)) => true,
         (Type::Unknown, _) | (_, Type::Unknown) => true,
         (Type::Float, Type::Int) => true,
         (Type::Union(variants), other) => variants.iter().any(|v| assignable(v, other)),
@@ -226,9 +235,12 @@ pub fn type_from_annotation_with_params(
             "bytes" => Type::Bytes,
             "None" => Type::None,
             "Any" => Type::Any,
-            // A type parameter (PEP 695) — treat as a top type until we
-            // have proper inference.
-            other if type_params.iter().any(|p| p == other) => Type::Any,
+            // A type parameter (PEP 695) — preserved as `Type::TypeVar` so
+            // call-site inference can substitute it with the concrete
+            // argument type.  Assignability still treats it as `Any` until
+            // substitution happens, so existing tests that compose generic
+            // signatures continue to type-check.
+            other if type_params.iter().any(|p| p == other) => Type::TypeVar(other.to_owned()),
             other if classes.iter().any(|c| c == other) => Type::Class(other.to_owned()),
             // Unknown but treat as nominal class (may be imported).
             other => Type::Class(other.to_owned()),
@@ -297,6 +309,151 @@ pub fn type_from_annotation_with_params(
         Expr::Constant(c) if matches!(c.value, Constant::None) => Type::None,
         _ => Type::Unknown,
     }
+}
+
+/// Walk `ty` and collect every `(name, position)` pair where a typevar
+/// appears.  The resulting structure feeds [`bind_typevars`] which walks
+/// the same positions of an actual argument type to read off bindings.
+fn collect_typevar_positions(ty: &Type) -> Vec<String> {
+    let mut out = Vec::new();
+    walk_typevars(ty, &mut out);
+    out
+}
+
+fn walk_typevars(ty: &Type, out: &mut Vec<String>) {
+    match ty {
+        Type::TypeVar(name) => {
+            if !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
+        Type::Union(xs) | Type::Generic(_, xs) => {
+            for x in xs {
+                walk_typevars(x, out);
+            }
+        }
+        Type::Function { params, ret, .. } => {
+            for p in params {
+                walk_typevars(p, out);
+            }
+            walk_typevars(ret, out);
+        }
+        _ => {}
+    }
+}
+
+/// Try to bind a `Type::TypeVar` to a concrete actual type by walking
+/// `formal` and `actual` in lockstep.  Recursive: `list[T]` against
+/// `list[int]` binds `T → int`.  Any binding conflict resolves by union
+/// (so calling `f[T](a: T, b: T)` with `(int, str)` infers `T = int|str`).
+fn bind_typevars(
+    formal: &Type,
+    actual: &Type,
+    bindings: &mut std::collections::HashMap<String, Type>,
+) {
+    match (formal, actual) {
+        (Type::TypeVar(name), other) => {
+            if let Some(existing) = bindings.get(name).cloned() {
+                if existing != *other {
+                    bindings.insert(name.clone(), Type::union_of(vec![existing, other.clone()]));
+                }
+            } else {
+                bindings.insert(name.clone(), other.clone());
+            }
+        }
+        (Type::Generic(fh, fa), Type::Generic(ah, aa)) if fh == ah && fa.len() == aa.len() => {
+            for (f, a) in fa.iter().zip(aa) {
+                bind_typevars(f, a, bindings);
+            }
+        }
+        (
+            Type::Function {
+                params: fp,
+                ret: fr,
+                ..
+            },
+            Type::Function {
+                params: ap,
+                ret: ar,
+                ..
+            },
+        ) if fp.len() == ap.len() => {
+            for (f, a) in fp.iter().zip(ap) {
+                bind_typevars(f, a, bindings);
+            }
+            bind_typevars(fr, ar, bindings);
+        }
+        _ => {}
+    }
+}
+
+/// Substitute every `TypeVar` in `ty` whose name appears in `bindings`
+/// with the bound type, recursively.  Unbound type vars are left as
+/// `TypeVar` so the caller can still see them in `Display` output.
+fn substitute_typevars(ty: &Type, bindings: &std::collections::HashMap<String, Type>) -> Type {
+    match ty {
+        Type::TypeVar(name) => bindings.get(name).cloned().unwrap_or_else(|| ty.clone()),
+        Type::Union(xs) => Type::union_of(
+            xs.iter()
+                .map(|x| substitute_typevars(x, bindings))
+                .collect(),
+        ),
+        Type::Generic(h, args) => Type::Generic(
+            h.clone(),
+            args.iter()
+                .map(|x| substitute_typevars(x, bindings))
+                .collect(),
+        ),
+        Type::Function {
+            params,
+            ret,
+            variadic,
+        } => Type::Function {
+            params: params
+                .iter()
+                .map(|p| substitute_typevars(p, bindings))
+                .collect(),
+            ret: Box::new(substitute_typevars(ret, bindings)),
+            variadic: *variadic,
+        },
+        other => other.clone(),
+    }
+}
+
+/// Top-level entry point for call-site PEP 695 inference.  Given the
+/// formal parameter types and actual argument types, infer the binding
+/// for every TypeVar mentioned in the formals, then substitute those
+/// bindings in `return_type`.  The result is the call's inferred return.
+pub fn bind_typevars_and_substitute(
+    formal_params: &[Type],
+    actual_args: &[Type],
+    return_type: &Type,
+) -> Type {
+    // Skip work when no formal mentions a TypeVar.
+    let has_typevar = formal_params
+        .iter()
+        .chain(std::iter::once(return_type))
+        .any(|t| {
+            let mut tmp = Vec::new();
+            walk_typevars(t, &mut tmp);
+            !tmp.is_empty()
+        });
+    if !has_typevar {
+        return return_type.clone();
+    }
+    let mut bindings: std::collections::HashMap<String, Type> = std::collections::HashMap::new();
+    for (formal, actual) in formal_params.iter().zip(actual_args.iter()) {
+        bind_typevars(formal, actual, &mut bindings);
+    }
+    substitute_typevars(return_type, &bindings)
+}
+
+/// Used by tests in lower layers (resolver, db) that want to enumerate
+/// known typevar names in a type expression without depending on the
+/// internal walker directly.
+#[doc(hidden)]
+pub fn typevars_in(ty: &Type) -> Vec<String> {
+    collect_typevar_positions(ty)
 }
 
 /// Collect the names of PEP 695 type parameters into a flat list.
@@ -745,7 +902,10 @@ fn unsafe_byte_starts(source: &str, unsafe_lines: &[usize]) -> Vec<u32> {
             // Skip leading whitespace so the start matches the `if True:`
             // token's range.start exactly.
             let rest = &source[offset..];
-            let lead = rest.bytes().take_while(|&b| b == b' ' || b == b'\t').count();
+            let lead = rest
+                .bytes()
+                .take_while(|&b| b == b' ' || b == b'\t')
+                .count();
             starts.push((offset + lead) as u32);
         }
     }
@@ -1499,6 +1659,7 @@ fn infer_expr(c: &mut Checker, expr: &Expr<TextRange>) -> Type {
                         c.wrong_args(&name, params.len(), call.args.len(), call_span);
                     }
                     // Argument type checks (per-pair, ignoring excess).
+                    let mut actuals: Vec<Type> = Vec::with_capacity(params.len());
                     for (i, arg) in call.args.iter().enumerate() {
                         if i >= params.len() {
                             break;
@@ -1520,8 +1681,13 @@ fn infer_expr(c: &mut Checker, expr: &Expr<TextRange>) -> Type {
                                 c.nullable_use(n.id.as_str(), &params[i], span);
                             }
                         }
+                        actuals.push(actual);
                     }
-                    *ret
+                    // PEP 695 inference: bind every TypeVar mentioned in
+                    // the formals from the actuals, then substitute in the
+                    // declared return type so callers see a concrete
+                    // result instead of `Any`.
+                    bind_typevars_and_substitute(&params, &actuals, &ret)
                 }
                 Type::Class(name) => Type::Class(name),
                 Type::Unknown | Type::Any => {
@@ -2351,5 +2517,66 @@ val n: int = first(xs)
 ";
         let d = check(src);
         assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn bind_typevars_substitutes_simple_return() {
+        // Direct unit test of the substitution helper: given `f[T](T) -> T`,
+        // applying actual `int` to formal `T` should make the return `int`.
+        let formals = vec![Type::TypeVar("T".to_owned())];
+        let actuals = vec![Type::Int];
+        let ret = Type::TypeVar("T".to_owned());
+        let inferred = bind_typevars_and_substitute(&formals, &actuals, &ret);
+        assert_eq!(inferred, Type::Int);
+    }
+
+    #[test]
+    fn bind_typevars_substitutes_inside_generic() {
+        // `f[T](list[T]) -> T` with actual `list[str]` should infer `T = str`.
+        let formals = vec![Type::Generic(
+            "list".to_owned(),
+            vec![Type::TypeVar("T".to_owned())],
+        )];
+        let actuals = vec![Type::Generic("list".to_owned(), vec![Type::Str])];
+        let ret = Type::TypeVar("T".to_owned());
+        let inferred = bind_typevars_and_substitute(&formals, &actuals, &ret);
+        assert_eq!(inferred, Type::Str);
+    }
+
+    #[test]
+    fn bind_typevars_conflicting_args_widens_to_union() {
+        // Calling `f[T](T, T)` with `(int, str)` should bind `T = int | str`.
+        let formals = vec![Type::TypeVar("T".to_owned()), Type::TypeVar("T".to_owned())];
+        let actuals = vec![Type::Int, Type::Str];
+        let ret = Type::TypeVar("T".to_owned());
+        let inferred = bind_typevars_and_substitute(&formals, &actuals, &ret);
+        // Union variants are unordered semantically; check membership.
+        match inferred {
+            Type::Union(variants) => {
+                assert!(variants.contains(&Type::Int));
+                assert!(variants.contains(&Type::Str));
+            }
+            other => panic!("expected union, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pep695_inferred_return_flows_to_concrete_assignment() {
+        // After inference, calling `first[T](list[T]) -> T` with `list[int]`
+        // yields a return type of `int`, so assigning to a `str`-typed
+        // binding must now be rejected.  Before inference this passed
+        // because `T` was Any in the return position.
+        let src = "\
+def first[T](items: list[T]) -> T:
+    return items[0]
+
+val xs: list[int] = [1, 2, 3]
+val n: str = first(xs)
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "with PEP 695 inference, first(list[int]) returns int and must not assign to str"
+        );
     }
 }

@@ -867,11 +867,7 @@ pub fn postprocess_full(
                 let indent_len = line
                     .find(|c: char| !c.is_whitespace())
                     .unwrap_or(line.len());
-                let new_line = format!(
-                    "{}lazy {}",
-                    &line[..indent_len],
-                    &line[indent_len..]
-                );
+                let new_line = format!("{}lazy {}", &line[..indent_len], &line[indent_len..]);
                 lines[line_idx] = new_line;
             }
             TyphonKeyword::Gather | TyphonKeyword::Go => {
@@ -970,8 +966,21 @@ pub struct ExtendUsageError {
 /// pseudo-class that would drop methods on the floor.  Phase 4 plans an
 /// alternative form via a call-site rewriter — see the roadmap.
 const BUILTIN_TYPES_REJECTED_BY_EXTEND: &[&str] = &[
-    "bool", "bytearray", "bytes", "complex", "dict", "float", "frozenset",
-    "int", "list", "object", "range", "set", "str", "tuple", "type",
+    "bool",
+    "bytearray",
+    "bytes",
+    "complex",
+    "dict",
+    "float",
+    "frozenset",
+    "int",
+    "list",
+    "object",
+    "range",
+    "set",
+    "str",
+    "tuple",
+    "type",
 ];
 
 /// Scan `source` for `extend BUILTIN:` declarations.  These are explicitly
@@ -991,11 +1000,7 @@ pub fn validate_extend_usage(source: &str) -> Vec<ExtendUsageError> {
             if let Some(rest) = body.strip_prefix("extend ") {
                 // Strip a trailing `:` (and optional base-class list) so
                 // `extend str:` and `extend str(Foo):` both extract `str`.
-                let head = rest
-                    .split([':', '('])
-                    .next()
-                    .unwrap_or("")
-                    .trim();
+                let head = rest.split([':', '(']).next().unwrap_or("").trim();
                 if BUILTIN_TYPES_REJECTED_BY_EXTEND.contains(&head) {
                     errors.push(ExtendUsageError {
                         line_index,
@@ -1413,9 +1418,7 @@ pub fn expand_lazy_imports(source: &str) -> String {
     // we scan and insert after the last `from __future__ import …` line.
     let mut header = String::new();
     if needs_lazy_val_import {
-        header.push_str(
-            "from typhon_runtime.lazy import lazy_val as __typhon_lazy_val\n",
-        );
+        header.push_str("from typhon_runtime.lazy import lazy_val as __typhon_lazy_val\n");
     }
     if needs_cached_property_import {
         header.push_str("from functools import cached_property as __typhon_cached_property\n");
@@ -1522,15 +1525,29 @@ fn find_top_level_assign_eq(s: &str) -> Option<usize> {
                 // Skip compound operators: `==`, `<=`, `>=`, `!=`, `+=`, `-=`,
                 // `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `>>=`, `<<=`, `:=`.
                 let prev = if i == 0 { b' ' } else { bytes[i - 1] };
-                let next = if i + 1 < bytes.len() { bytes[i + 1] } else { b' ' };
+                let next = if i + 1 < bytes.len() {
+                    bytes[i + 1]
+                } else {
+                    b' '
+                };
                 if next == b'=' {
                     i += 2;
                     continue;
                 }
                 if matches!(
                     prev,
-                    b'=' | b'<' | b'>' | b'!' | b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|'
-                        | b'^' | b':'
+                    b'=' | b'<'
+                        | b'>'
+                        | b'!'
+                        | b'+'
+                        | b'-'
+                        | b'*'
+                        | b'/'
+                        | b'%'
+                        | b'&'
+                        | b'|'
+                        | b'^'
+                        | b':'
                 ) {
                     i += 1;
                     continue;
@@ -4043,7 +4060,9 @@ def run() -> Result[str, str]:
         let out = expand_lazy_imports(src);
         // The __future__ line must remain first; the injected import must
         // appear after it.
-        let future_pos = out.find("from __future__").expect("future import preserved");
+        let future_pos = out
+            .find("from __future__")
+            .expect("future import preserved");
         let runtime_pos = out
             .find("from typhon_runtime.lazy")
             .expect("runtime import injected");
@@ -4076,8 +4095,7 @@ def run() -> Result[str, str]:
         // the parser sees plain `CONFIG: int = 1`; the formatter restores
         // them via the stripped-keyword list.
         assert_eq!(result.python_source, "CONFIG: int = 1\n");
-        let kinds: Vec<TyphonKeyword> =
-            result.stripped.iter().map(|sk| sk.keyword).collect();
+        let kinds: Vec<TyphonKeyword> = result.stripped.iter().map(|sk| sk.keyword).collect();
         assert!(
             kinds.contains(&TyphonKeyword::Val) && kinds.contains(&TyphonKeyword::Lazy),
             "stripped list should contain both Val and Lazy; got {:?}",

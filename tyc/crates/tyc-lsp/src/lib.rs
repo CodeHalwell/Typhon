@@ -201,9 +201,7 @@ impl LanguageServer for Backend {
             let mut docs = self.documents.lock().await;
             docs.remove(uri.as_str());
         }
-        self.client
-            .publish_diagnostics(uri, Vec::new(), None)
-            .await;
+        self.client.publish_diagnostics(uri, Vec::new(), None).await;
     }
 
     async fn hover(&self, params: HoverParams) -> jsonrpc::Result<Option<Hover>> {

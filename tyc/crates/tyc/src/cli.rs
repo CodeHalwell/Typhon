@@ -47,6 +47,10 @@ pub enum Commands {
 
     /// Instrument emitted code for hot-function detection (opt-in).
     Profile(commands::profile::ProfileArgs),
+
+    /// Convert typed Python (`.py`) into Typhon (`.ty`) using a set of
+    /// conservative textual rewrites.
+    Migrate(commands::migrate::MigrateArgs),
 }
 
 /// Entry point called from `main`.
@@ -61,5 +65,6 @@ pub fn run() -> Result<()> {
         Commands::Init(args) => commands::init::run(args),
         Commands::Trace(args) => commands::trace::run(args),
         Commands::Profile(args) => commands::profile::run(args),
+        Commands::Migrate(args) => commands::migrate::run(args),
     }
 }

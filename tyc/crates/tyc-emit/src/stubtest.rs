@@ -111,7 +111,8 @@ fn collect_top_level_stmt(stmt: &Stmt<TextRange>, api: &mut ModuleApi) {
                 .insert(f.name.as_str().to_owned(), async_function_shape(f));
         }
         Stmt::ClassDef(c) => {
-            api.classes.insert(c.name.as_str().to_owned(), class_shape(c));
+            api.classes
+                .insert(c.name.as_str().to_owned(), class_shape(c));
         }
         _ => {}
     }
@@ -178,9 +179,7 @@ fn diff_apis(stub: &ModuleApi, implementation: &ModuleApi) -> Vec<StubTestFindin
     for (name, stub_fn) in &stub.functions {
         match implementation.functions.get(name) {
             None => findings.push(StubTestFinding {
-                message: format!(
-                    "stub declares function `{name}` but the implementation does not"
-                ),
+                message: format!("stub declares function `{name}` but the implementation does not"),
                 kind: StubTestKind::MissingInImpl,
             }),
             Some(impl_fn) if impl_fn != stub_fn => {
@@ -216,9 +215,7 @@ fn diff_apis(stub: &ModuleApi, implementation: &ModuleApi) -> Vec<StubTestFindin
     for (name, stub_class) in &stub.classes {
         match implementation.classes.get(name) {
             None => findings.push(StubTestFinding {
-                message: format!(
-                    "stub declares class `{name}` but the implementation does not"
-                ),
+                message: format!("stub declares class `{name}` but the implementation does not"),
                 kind: StubTestKind::MissingInImpl,
             }),
             Some(impl_class) => diff_classes(name, stub_class, impl_class, &mut findings),
@@ -339,8 +336,7 @@ mod tests {
         assert!(
             findings
                 .iter()
-                .any(|f| f.kind == StubTestKind::MissingInImpl
-                    && f.message.contains("add")),
+                .any(|f| f.kind == StubTestKind::MissingInImpl && f.message.contains("add")),
             "expected MissingInImpl for `add`, got: {findings:?}"
         );
     }
@@ -355,8 +351,7 @@ mod tests {
         assert!(
             findings
                 .iter()
-                .any(|f| f.kind == StubTestKind::MissingInStub
-                    && f.message.contains("secret")),
+                .any(|f| f.kind == StubTestKind::MissingInStub && f.message.contains("secret")),
             "expected MissingInStub for `secret`, got: {findings:?}"
         );
     }
@@ -364,8 +359,7 @@ mod tests {
     #[test]
     fn private_impl_function_not_flagged() {
         let stub = parse_mod("def public() -> int: ...\n");
-        let imp =
-            parse_mod("def public() -> int: return 0\ndef _private() -> int: return 0\n");
+        let imp = parse_mod("def public() -> int: return 0\ndef _private() -> int: return 0\n");
         let findings = compare_modules(&stub, &imp);
         assert!(
             findings.is_empty(),
