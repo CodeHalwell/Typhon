@@ -2188,6 +2188,8 @@ name = "tyc-syntax"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "ruff_python_ast",
+ "ruff_python_parser",
  "rustpython-ast",
  "rustpython-parser",
  "thiserror",

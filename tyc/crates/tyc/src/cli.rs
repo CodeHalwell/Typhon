@@ -51,6 +51,13 @@ pub enum Commands {
     /// Convert typed Python (`.py`) into Typhon (`.ty`) using a set of
     /// conservative textual rewrites.
     Migrate(commands::migrate::MigrateArgs),
+
+    /// Run Astral's `ty` against the emitted Python.
+    ///
+    /// Builds the project (into a temp directory by default) and invokes
+    /// `ty check <out-dir>` as a subprocess. Requires `ty` to be installed
+    /// separately (`pip install ty` or `uv tool install ty`).
+    Ty(commands::ty::TyArgs),
 }
 
 /// Entry point called from `main`.
@@ -66,5 +73,6 @@ pub fn run() -> Result<()> {
         Commands::Trace(args) => commands::trace::run(args),
         Commands::Profile(args) => commands::profile::run(args),
         Commands::Migrate(args) => commands::migrate::run(args),
+        Commands::Ty(args) => commands::ty::run(args),
     }
 }
