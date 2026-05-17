@@ -1783,6 +1783,7 @@ dependencies = [
  "rustpython-ast",
  "rustpython-parser",
  "tyc-diagnostics",
+ "tyc-emit",
  "tyc-syntax",
 ]
 

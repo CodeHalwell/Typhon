@@ -80,6 +80,14 @@ pub struct StrictnessConfig {
     /// is treated as if the user had written `@memo` — the desugarer emits a
     /// `@functools.cache` decorator. Off by default; opt in per-project.
     pub auto_memoise: bool,
+    /// When true, runs of two-or-more consecutive independent `await` calls
+    /// inside an `async def` are rewritten into an `asyncio.TaskGroup` block
+    /// so they execute concurrently. Independence is determined by static
+    /// data-flow on bound names; runs are only folded when every callee is
+    /// an `async def` declared in the same module. Off by default — flip on
+    /// per-project to apply the rewrite globally. (Phase 4 auto-gather
+    /// inference; explicit `gather:` blocks are unaffected.)
+    pub auto_gather: bool,
 }
 
 impl Default for StrictnessConfig {
@@ -89,6 +97,7 @@ impl Default for StrictnessConfig {
             unused_import: "error".into(),
             exhaustive_match: "error".into(),
             auto_memoise: false,
+            auto_gather: false,
         }
     }
 }

@@ -12,7 +12,10 @@ use miette::{miette, Result};
 use rustpython_ast::{text_size::TextRange, Constant, Expr, ExprConstant, Mod, Stmt};
 use rustpython_parser::{parse, Mode};
 
-use tyc_analyse::{analyse_purity, evaluate_comptime, purity_diagnostics, ComptimeValue};
+use tyc_analyse::{
+    analyse_purity, collect_module_async_fn_names, evaluate_comptime, purity_diagnostics,
+    rewrite_auto_gather, ComptimeValue,
+};
 use tyc_db::{check_file, TycDatabase};
 use tyc_desugar::{desugar_module_with, DesugarOptions};
 use tyc_diagnostics::Diagnostics;
@@ -212,6 +215,19 @@ pub fn run(args: BuildArgs) -> Result<()> {
             .filter(|f| f.violation.is_none() && f.memoise)
             .map(|f| f.name.clone())
             .collect();
+
+        // Phase 4 auto-gather inference: when `[strictness] auto-gather = true`,
+        // fold runs of independent same-module awaits into `asyncio.TaskGroup`
+        // blocks. The desugar pass downstream notices the qualified
+        // `asyncio.TaskGroup` reference and injects `import asyncio` if it
+        // isn't already in scope, so no extra wiring is needed here.
+        let module = if config.strictness.auto_gather {
+            let eligible = collect_module_async_fn_names(&module);
+            let (rewritten, _stats) = rewrite_auto_gather(module, &eligible);
+            rewritten
+        } else {
+            module
+        };
 
         let desugar_output = desugar_module_with(
             &module,
@@ -589,6 +605,26 @@ mod tests {
         (src_dir, out_dir)
     }
 
+    /// Same as `scaffold`, but with `auto-gather = true` set under `[strictness]`
+    /// so the Phase-4 auto-gather pass runs end-to-end.
+    fn scaffold_auto_gather(
+        dir: &std::path::Path,
+        src_content: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let src_dir = dir.join("src");
+        let out_dir = dir.join("build");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(
+            dir.join("typhon.toml"),
+            "[project]\nname = \"test\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+             [python]\ntarget = \"3.13\"\n[emit]\nformat = false\n\
+             [strictness]\nauto-gather = true\n[env]\n",
+        )
+        .unwrap();
+        std::fs::write(src_dir.join("main.ty"), src_content).unwrap();
+        (src_dir, out_dir)
+    }
+
     #[test]
     fn build_produces_py_file_from_simple_source() {
         let tmp = tempfile::tempdir().unwrap();
@@ -930,6 +966,110 @@ val pet: Animal = Dog(name=\"Rex\")
         assert!(
             result.is_err_and(|e| e.to_string().contains("fix type errors")),
             "assigning a non-conforming type to an interface variable should fail with a type error"
+        );
+    }
+
+    // ── Phase 4: auto-gather inference end-to-end ───────────────────────────
+
+    #[test]
+    fn build_auto_gather_flag_off_keeps_sequential_awaits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = "\
+async def fetch_a() -> int:
+    return 1
+async def fetch_b() -> int:
+    return 2
+
+async def load() -> int:
+    a = await fetch_a()
+    b = await fetch_b()
+    return a + b
+";
+        let (_, out_dir) = scaffold(tmp.path(), src);
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        })
+        .unwrap();
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        assert!(
+            !py.contains("TaskGroup"),
+            "auto-gather is off — should NOT emit TaskGroup; got:\n{py}"
+        );
+        assert!(
+            py.contains("a = await fetch_a"),
+            "sequential await should be preserved; got:\n{py}"
+        );
+    }
+
+    #[test]
+    fn build_auto_gather_flag_on_folds_independent_awaits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = "\
+async def fetch_a() -> int:
+    return 1
+async def fetch_b() -> int:
+    return 2
+
+async def load() -> int:
+    a = await fetch_a()
+    b = await fetch_b()
+    return a + b
+";
+        let (_, out_dir) = scaffold_auto_gather(tmp.path(), src);
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        })
+        .unwrap();
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        assert!(
+            py.contains("asyncio.TaskGroup"),
+            "auto-gather is on — should emit asyncio.TaskGroup; got:\n{py}"
+        );
+        assert!(
+            py.contains("import asyncio"),
+            "should inject `import asyncio` for the rewritten block; got:\n{py}"
+        );
+        assert!(
+            !py.contains("a = await fetch_a"),
+            "original sequential await should be folded away; got:\n{py}"
+        );
+    }
+
+    #[test]
+    fn build_auto_gather_respects_data_dependencies() {
+        // Second await consumes the first's binding, so the run must NOT
+        // be folded even with auto-gather enabled.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = "\
+async def fetch_a() -> int:
+    return 1
+async def fetch_b(x: int) -> int:
+    return x
+
+async def load() -> int:
+    a = await fetch_a()
+    b = await fetch_b(a)
+    return a + b
+";
+        let (_, out_dir) = scaffold_auto_gather(tmp.path(), src);
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        })
+        .unwrap();
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        assert!(
+            !py.contains("TaskGroup"),
+            "dependent awaits must NOT be gathered; got:\n{py}"
+        );
+        assert!(
+            py.contains("a = await fetch_a") && py.contains("b = await fetch_b(a)"),
+            "sequential awaits must be preserved verbatim; got:\n{py}"
         );
     }
 

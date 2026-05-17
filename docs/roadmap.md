@@ -84,7 +84,12 @@ Everything beyond is polish and ambition.
 
 ## Phase 4+ — Beyond v1
 
-- Automatic `asyncio.gather` inference (conservative, `@pure` straight-line code only).
+- ✅ **Automatic `asyncio.gather` inference** (conservative). Runs of two or
+  more independent `name = await callee(...)` statements inside an
+  `async def` are folded into an `asyncio.TaskGroup` block when the callee
+  is a same-module `async def` and the awaits are statically independent.
+  Opt-in via `[strictness] auto-gather = true`. The desugar pass injects
+  `import asyncio` if missing.
 - Loop parallelisation for pure comprehensions on free-threaded Python.
 - Richer comptime: `comptime` functions, types as values.
 - PGO via `tyc profile`.

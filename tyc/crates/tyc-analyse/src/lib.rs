@@ -40,6 +40,9 @@ use rustpython_ast::{text_size::TextRange, Constant, Expr, Mod, Stmt};
 use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_syntax::preprocess::ComptimeBinding;
 
+pub mod auto_gather;
+pub use auto_gather::{collect_module_async_fn_names, rewrite_auto_gather, AutoGatherStats};
+
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /// A value that was determined at build time by evaluating a `comptime`
