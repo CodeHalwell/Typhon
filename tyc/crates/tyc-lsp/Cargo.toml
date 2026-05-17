@@ -6,6 +6,7 @@ license.workspace = true
 description = "Language Server Protocol backend for Typhon (Phase 2+)"
 
 [dependencies]
+salsa = { workspace = true }
 tower-lsp-server = { workspace = true }
 tokio = { workspace = true }
 tyc-db = { workspace = true }

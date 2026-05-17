@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use miette::{Diagnostic as MietteDiagnostic, LabeledSpan};
 use rustpython_parser::{parse, Mode};
+use salsa::Setter;
 use tokio::sync::Mutex;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
@@ -23,28 +24,29 @@ use tower_lsp_server::ls_types::{
     TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
 };
 use tower_lsp_server::{jsonrpc, Client, LanguageServer, LspService, Server};
-use tyc_db::{check_file, TycDatabase};
+use tyc_db::{check_source_file, preprocessed_text, SourceFile, TycDatabase};
 use tyc_diagnostics::TycError;
 use tyc_resolve::{BindingKind, Mutability, ResolvedModule, SymbolAtOffset};
-use tyc_syntax::preprocess::{
-    expand_gather_blocks, expand_go_calls, expand_lazy_imports, expand_pipes, expand_question_ops,
-    expand_with_chains, preprocess,
-};
 
 /// The Typhon LSP backend. Holds a single shared salsa database and the
 /// `Client` handle used to send notifications back to the editor.
 ///
 /// The database is wrapped in [`Arc<tokio::sync::Mutex<_>>`] so the
-/// `check_file` call can run on a blocking executor thread without
+/// `check_source_file` call can run on a blocking executor thread without
 /// pinning the async runtime — concurrent `hover` and `shutdown`
 /// requests stay responsive while a file is being checked.
 pub struct Backend {
     client: Client,
     db: Arc<Mutex<TycDatabase>>,
     log_level: LogLevel,
-    /// Per-document buffers cached so hover and go-to-definition can answer
-    /// without re-fetching the text from the editor.  Keyed by URI string.
-    documents: Arc<Mutex<HashMap<String, String>>>,
+    /// Per-document Salsa handles and raw text, keyed by URI string.
+    ///
+    /// The [`SourceFile`] handle is the Salsa input for this document; on
+    /// `did_change` it is updated via `set_text` so Salsa propagates
+    /// invalidations incrementally rather than creating a fresh entity.
+    /// The raw `String` is kept alongside it so hover/definition can read
+    /// the original Typhon source without acquiring the db lock.
+    documents: Arc<Mutex<HashMap<String, (SourceFile, String)>>>,
 }
 
 impl std::fmt::Debug for Backend {
@@ -89,37 +91,50 @@ impl Backend {
     /// the runtime thread lets other LSP requests (hover, shutdown) make
     /// progress concurrently.
     async fn check_and_publish(&self, uri: Uri, text: String, version: Option<i32>) {
-        let path = uri.as_str().to_owned();
+        let uri_str = uri.as_str().to_owned();
         let db = Arc::clone(&self.db);
-        let text_for_check = text.clone();
-        let path_for_check = path.clone();
 
-        // Cache the buffer so hover / go-to-definition can resolve without
-        // an additional round trip.
+        // Upsert the SourceFile in the Salsa database.
+        //
+        // On `did_open` we create a fresh entity; on `did_change` we call
+        // `set_text` on the existing handle so Salsa can propagate the
+        // invalidation incrementally: queries that depend on this file's text
+        // are re-evaluated on the next access, but queries for *other* files
+        // stay cached.  We hold the db lock only for this short operation so
+        // hover/completion requests can still acquire it while the heavy
+        // `check_source_file` runs on the blocking thread.
+        let source_file: SourceFile = {
+            let existing = {
+                let docs = self.documents.lock().await;
+                docs.get(&uri_str).map(|(sf, _)| *sf)
+            };
+            let mut db_guard = self.db.lock().await;
+            if let Some(sf) = existing {
+                sf.set_text(&mut *db_guard).to(text.clone());
+                sf
+            } else {
+                SourceFile::new(&*db_guard, uri_str.clone(), text.clone())
+            }
+        };
+
+        // Cache the (handle, raw text) pair so hover/definition handlers can
+        // resolve without locking the db for text access.
         {
             let mut docs = self.documents.lock().await;
-            docs.insert(uri.as_str().to_owned(), text.clone());
+            docs.insert(uri_str, (source_file, text.clone()));
         }
 
         let result = tokio::task::spawn_blocking(move || {
-            // Compute the source string the diagnostics will reference for
-            // their byte offsets. After preprocessing (`val`/`var` stripping,
-            // `?`/`|>`/`with`-chain expansion) the byte layout changes — most
-            // diagnostics from the resolver and type-checker are anchored to
-            // the *preprocessed* source, not the editor buffer. We therefore
-            // run the same expansion pipeline locally and publish ranges
-            // relative to that text. The exception is the `?`-operator
-            // validator, which reports against the original Typhon source;
-            // those diagnostics are handled via their explicit byte offsets
-            // when emitted by `check_file` and continue to map cleanly.
-            let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&text_for_check)));
-            let prep = preprocess(&expanded);
-            let diags = {
-                // Hold the mutex only for the duration of the salsa call.
-                let mut db = db.blocking_lock();
-                check_file(&mut db, path_for_check, text_for_check)
-            };
-            (diags, prep.python_source)
+            // Hold the mutex only for the duration of the salsa call.
+            let mut db = db.blocking_lock();
+            #[allow(clippy::explicit_auto_deref)]
+            let diags = check_source_file(&mut *db, source_file);
+            // Retrieve the preprocessed source for diagnostic position
+            // mapping.  After `check_source_file` runs the full pipeline the
+            // Salsa `preprocessed_text` query is populated; hover/definition
+            // handlers that call it afterward benefit from the cache.
+            let mapping_source = preprocessed_text(&*db, source_file);
+            (diags, mapping_source)
         })
         .await;
 
@@ -218,13 +233,19 @@ impl LanguageServer for Backend {
     async fn hover(&self, params: HoverParams) -> jsonrpc::Result<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        let Some(text) = self.document_text(&uri).await else {
+        let Some(sf) = self.source_file_for(&uri).await else {
             return Ok(None);
         };
-        let Some(resolved) = self.resolve_in_text(&text) else {
+        // Retrieve the preprocessed source from the Salsa cache.  After
+        // `check_source_file` runs during did_open/did_change this is a
+        // cache hit; subsequent hovers on an unchanged file skip preprocessing.
+        let preprocessed = {
+            let db = self.db.lock().await;
+            preprocessed_text(&*db, sf)
+        };
+        let Some(resolved) = resolve_in_preprocessed(&preprocessed) else {
             return Ok(None);
         };
-        let preprocessed = self.preprocessed_text(&text);
         let offset = position_to_byte(&preprocessed, position);
         let Some(symbol) = resolved.symbol_at_offset(offset) else {
             return Ok(None);
@@ -247,13 +268,16 @@ impl LanguageServer for Backend {
     ) -> jsonrpc::Result<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
-        let Some(text) = self.document_text(&uri).await else {
+        let Some(sf) = self.source_file_for(&uri).await else {
             return Ok(None);
         };
-        let Some(resolved) = self.resolve_in_text(&text) else {
+        let preprocessed = {
+            let db = self.db.lock().await;
+            preprocessed_text(&*db, sf)
+        };
+        let Some(resolved) = resolve_in_preprocessed(&preprocessed) else {
             return Ok(None);
         };
-        let preprocessed = self.preprocessed_text(&text);
         let items = compute_completion_items(&resolved, &preprocessed, position);
         Ok(Some(CompletionResponse::Array(items)))
     }
@@ -263,6 +287,8 @@ impl LanguageServer for Backend {
         params: CodeActionParams,
     ) -> jsonrpc::Result<Option<CodeActionResponse>> {
         let uri = params.text_document.uri;
+        // code_action only needs raw text (no preprocessing); read it from
+        // the documents cache without touching the db.
         let Some(text) = self.document_text(&uri).await else {
             return Ok(None);
         };
@@ -280,13 +306,16 @@ impl LanguageServer for Backend {
     ) -> jsonrpc::Result<Option<GotoDefinitionResponse>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        let Some(text) = self.document_text(&uri).await else {
+        let Some(sf) = self.source_file_for(&uri).await else {
             return Ok(None);
         };
-        let Some(resolved) = self.resolve_in_text(&text) else {
+        let preprocessed = {
+            let db = self.db.lock().await;
+            preprocessed_text(&*db, sf)
+        };
+        let Some(resolved) = resolve_in_preprocessed(&preprocessed) else {
             return Ok(None);
         };
-        let preprocessed = self.preprocessed_text(&text);
         let offset = position_to_byte(&preprocessed, position);
         let Some(symbol) = resolved.symbol_at_offset(offset) else {
             return Ok(None);
@@ -307,35 +336,34 @@ impl LanguageServer for Backend {
 }
 
 impl Backend {
-    /// Look up the most recent text we received for `uri`.  Returns `None`
-    /// when the editor has not yet opened the file or it was closed.
+    /// Look up the most recent raw Typhon source text for `uri`.  Returns
+    /// `None` when the editor has not yet opened the file or it was closed.
+    /// Does not acquire the db lock — text is stored alongside the SourceFile
+    /// handle in the documents map.
     async fn document_text(&self, uri: &Uri) -> Option<String> {
         let docs = self.documents.lock().await;
-        docs.get(uri.as_str()).cloned()
+        docs.get(uri.as_str()).map(|(_, text)| text.clone())
     }
 
-    /// Return the Python-compatible source produced by running the same
-    /// expansion + preprocess pipeline that `check_file` uses.  Both
-    /// hover offsets and resolver bindings reference this text.
-    fn preprocessed_text(&self, source: &str) -> String {
-        let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
-            &expand_gather_blocks(&expand_lazy_imports(source)),
-        ))));
-        preprocess(&expanded).python_source
+    /// Return the [`SourceFile`] Salsa handle for `uri`, or `None` when the
+    /// file has not been opened.
+    async fn source_file_for(&self, uri: &Uri) -> Option<SourceFile> {
+        let docs = self.documents.lock().await;
+        docs.get(uri.as_str()).map(|(sf, _)| *sf)
     }
+}
 
-    /// Resolve the module so hover / go-to-definition can query bindings
-    /// and references.  Returns `None` when the source fails to parse.
-    fn resolve_in_text(&self, source: &str) -> Option<ResolvedModule> {
-        let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
-            &expand_gather_blocks(&expand_lazy_imports(source)),
-        ))));
-        let prep = preprocess(&expanded);
-        let module = parse(&prep.python_source, Mode::Module, "<lsp>").ok()?;
-        let (resolved, _) =
-            tyc_resolve::resolve_module("<lsp>", &prep.python_source, &prep.stripped, &module);
-        Some(resolved)
-    }
+/// Parse and resolve a pre-preprocessed Python source string so hover and
+/// go-to-definition can query bindings and references.  Returns `None` when
+/// the source fails to parse.
+///
+/// Passes `&[]` for the stripped-line metadata — the resolver's strict
+/// `val`-reassignment checks are not needed for position queries, and the
+/// same approach is used by the `module_decl_names` salsa query.
+fn resolve_in_preprocessed(preprocessed: &str) -> Option<ResolvedModule> {
+    let module = parse(preprocessed, Mode::Module, "<lsp>").ok()?;
+    let (resolved, _) = tyc_resolve::resolve_module("<lsp>", preprocessed, &[], &module);
+    Some(resolved)
 }
 
 /// Log-message level for the LSP backend. Maps the user-facing `--log-level`
@@ -953,6 +981,33 @@ mod tests {
         let body = render_hover(&symbol);
         assert!(body.contains("function"), "got: {body}");
         assert!(!body.contains("declaration site"), "got: {body}");
+    }
+
+    // ── resolve_in_preprocessed ──────────────────────────────────────────
+
+    #[test]
+    fn resolve_in_preprocessed_finds_bindings() {
+        // After preprocessing, `val x` becomes `x: int = 1`.  The resolver
+        // should see `x` as a binding at offset 0.
+        let preprocessed = "x: int = 1\n";
+        let resolved =
+            resolve_in_preprocessed(preprocessed).expect("parse and resolve should succeed");
+        let names: Vec<String> = resolved
+            .module_scope()
+            .bindings
+            .iter()
+            .map(|b| b.name.clone())
+            .collect();
+        assert!(
+            names.contains(&"x".to_owned()),
+            "x should be resolved; got {names:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_in_preprocessed_returns_none_for_syntax_error() {
+        let result = resolve_in_preprocessed("def (broken syntax)\n");
+        assert!(result.is_none(), "parse error should produce None");
     }
 
     // ── Phase 4: completion ──────────────────────────────────────────────

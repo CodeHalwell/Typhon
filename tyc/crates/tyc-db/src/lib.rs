@@ -95,12 +95,32 @@ impl TycDatabase {
 /// implement `salsa::Update`; they will be moved under salsa in later
 /// phases.
 pub fn check_file(db: &mut TycDatabase, path: String, text: String) -> Diagnostics {
-    // Currently the resolver and type-checker need the full PreprocessResult
-    // (including `stripped` and `optionals` metadata), which doesn't yet
-    // implement `salsa::Update` — so we run preprocess directly here. The
-    // `preprocessed_text` salsa query above remains the cached entry point
-    // for callers that only need the Python-compatible source string.
     let _ = SourceFile::new(db, path.clone(), text.clone());
+    check_impl(&path, &text)
+}
+
+/// Like [`check_file`] but uses a caller-supplied [`SourceFile`] handle.
+///
+/// The handle must already exist in `db` (created via [`SourceFile::new`] or
+/// updated via `source_file.set_text(&mut db).to(text)`).  The LSP uses this
+/// variant so it can retain the handle across `did_open`/`did_change` events
+/// and then call [`preprocessed_text`] from hover/definition handlers; Salsa
+/// serves the preprocessed source from cache when the file has not changed.
+pub fn check_source_file(db: &mut TycDatabase, source_file: SourceFile) -> Diagnostics {
+    let path = source_file.path(db).clone();
+    let text = source_file.text(db).clone();
+    check_impl(&path, &text)
+}
+
+/// Shared check implementation used by both [`check_file`] and
+/// [`check_source_file`].
+fn check_impl(path: &str, text: &str) -> Diagnostics {
+    // The resolver and type-checker need the full PreprocessResult (including
+    // `stripped` and `optionals` metadata), which doesn't yet implement
+    // `salsa::Update` — so we run preprocess directly here. The
+    // `preprocessed_text` salsa query above remains the cached entry point
+    // for callers (e.g. the LSP hover handler) that only need the
+    // Python-compatible source string.
     let mut diags = Diagnostics::new();
 
     // Validate `?` operator context before expanding it.  This runs on the
@@ -108,22 +128,22 @@ pub fn check_file(db: &mut TycDatabase, path: String, text: String) -> Diagnosti
     // Return early on any errors: invalid `?` usage causes `expand_question_ops`
     // to inject `return` at top level, which would produce a cascading parse
     // error that obscures the real problem.
-    for err in validate_question_ops(&text) {
+    for err in validate_question_ops(text) {
         diags.push_error(TycError::invalid_question_op(
             err.message,
-            &path,
-            &text,
+            path,
+            text,
             err.offset,
             1,
         ));
     }
     // Reject unsupported `lazy from … import …` constructs early so the
     // downstream parser doesn't try to give a misleading diagnostic.
-    for err in validate_lazy_usage(&text) {
+    for err in validate_lazy_usage(text) {
         diags.push_error(TycError::lazy_usage(
             err.message,
-            &path,
-            &text,
+            path,
+            text,
             err.offset,
             4, // length of "lazy"
         ));
@@ -131,11 +151,11 @@ pub fn check_file(db: &mut TycDatabase, path: String, text: String) -> Diagnosti
     // Reject `extend BUILTIN:` declarations.  Python's built-in types cannot
     // be modified at runtime, so the silent drop performed by the impl-merge
     // desugar pass would surprise the user.
-    for err in validate_extend_usage(&text) {
+    for err in validate_extend_usage(text) {
         diags.push_error(TycError::extend_builtin(
             err.message,
-            &path,
-            &text,
+            path,
+            text,
             err.offset,
             6, // length of "extend"
         ));
@@ -148,15 +168,15 @@ pub fn check_file(db: &mut TycDatabase, path: String, text: String) -> Diagnosti
     // Python parser sees valid Python.  `tyc fmt` skips these expansions to
     // preserve Typhon syntax in the formatter's round trip.
     let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
-        &expand_gather_blocks(&text),
+        &expand_gather_blocks(text),
     ))));
     let prep = preprocess(&expanded);
 
-    let module = match parse(&prep.python_source, Mode::Module, &path) {
+    let module = match parse(&prep.python_source, Mode::Module, path) {
         Ok(m) => m,
         Err(e) => {
             diags.push_error(TycError::parse(
-                path,
+                path.to_owned(),
                 prep.python_source,
                 e.to_string(),
                 usize::from(e.offset),
@@ -165,12 +185,16 @@ pub fn check_file(db: &mut TycDatabase, path: String, text: String) -> Diagnosti
         }
     };
 
-    let (resolved, resolve_diags) =
-        resolve_module(path.clone(), &prep.python_source, &prep.stripped, &module);
+    let (resolved, resolve_diags) = resolve_module(
+        path.to_owned(),
+        &prep.python_source,
+        &prep.stripped,
+        &module,
+    );
     diags.extend(resolve_diags);
 
     let type_diags = check_module_with(
-        path,
+        path.to_owned(),
         &prep.python_source,
         &resolved,
         &module,
@@ -207,6 +231,60 @@ mod tests {
         assert!(names.contains(&"x".to_owned()));
         assert!(names.contains(&"y".to_owned()));
         assert!(names.contains(&"f".to_owned()));
+    }
+
+    // ── check_source_file ────────────────────────────────────────────────────
+
+    #[test]
+    fn check_source_file_clean_program() {
+        let mut db = TycDatabase::new();
+        let sf = SourceFile::new(&db, "<test>".to_owned(), "val x: int = 1\n".to_owned());
+        let diags = check_source_file(&mut db, sf);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn check_source_file_reports_type_error() {
+        let mut db = TycDatabase::new();
+        let sf = SourceFile::new(&db, "<test>".to_owned(), "val x: int = \"hi\"\n".to_owned());
+        let diags = check_source_file(&mut db, sf);
+        assert!(diags.has_errors(), "should report type mismatch");
+    }
+
+    #[test]
+    fn set_text_invalidates_preprocessed_text_cache() {
+        use salsa::Setter;
+        let mut db = TycDatabase::new();
+        let sf = SourceFile::new(&db, "<test>".to_owned(), "val x: int = 1\n".to_owned());
+        let first = preprocessed_text(&db, sf);
+        assert_eq!(first, "x: int = 1\n");
+        // Update the file text — Salsa should invalidate the cached result.
+        sf.set_text(&mut db)
+            .to("val y: str = \"hello\"\n".to_owned());
+        let second = preprocessed_text(&db, sf);
+        assert_eq!(second, "y: str = \"hello\"\n");
+        assert_ne!(
+            first, second,
+            "cached result must be invalidated after set_text"
+        );
+    }
+
+    #[test]
+    fn check_source_file_after_set_text_uses_new_content() {
+        use salsa::Setter;
+        let mut db = TycDatabase::new();
+        let sf = SourceFile::new(&db, "<test>".to_owned(), "val x: int = 1\n".to_owned());
+        // First check: no errors.
+        let diags1 = check_source_file(&mut db, sf);
+        assert!(!diags1.has_errors(), "first check should pass");
+        // Update text to introduce a type mismatch.
+        sf.set_text(&mut db)
+            .to("val x: int = \"oops\"\n".to_owned());
+        let diags2 = check_source_file(&mut db, sf);
+        assert!(
+            diags2.has_errors(),
+            "second check should fail after set_text"
+        );
     }
 
     #[test]

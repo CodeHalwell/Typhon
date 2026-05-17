@@ -1772,6 +1772,7 @@ dependencies = [
  "rustpython-ast",
  "rustpython-parser",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "toml",
@@ -1854,6 +1855,7 @@ version = "0.1.0"
 dependencies = [
  "miette",
  "rustpython-parser",
+ "salsa",
  "tokio",
  "tower-lsp-server",
  "tyc-db",
