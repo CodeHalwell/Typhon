@@ -1,0 +1,24 @@
+[package]
+name = "ruff_source_file"
+version = "0.0.0-typhon-vendor"
+edition = "2024"
+rust-version = "1.93"
+license.workspace = true
+description = "Vendored copy of ruff_source_file for Typhon"
+publish = false
+
+[dependencies]
+ruff_text_size = { workspace = true }
+
+get-size2 = { version = "0.8.0", features = ["derive"], optional = true }
+memchr = "2.7.1"
+serde = { version = "1.0.197", features = ["derive"], optional = true }
+
+[features]
+get-size = ["dep:get-size2", "ruff_text_size/get-size"]
+serde = ["dep:serde", "ruff_text_size/serde"]
+
+[lints.clippy]
+all = { level = "allow", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+nursery = { level = "allow", priority = -1 }
