@@ -7,9 +7,11 @@
 
 mod printer;
 mod stub;
+mod stubtest;
 
 pub use printer::Emitter;
 pub use stub::emit_stub;
+pub use stubtest::{compare_modules, StubTestFinding, StubTestKind};
 
 use rustpython_ast::Mod;
 

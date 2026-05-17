@@ -66,6 +66,11 @@ pub enum Type {
     Any,
     /// Unresolved type (annotation we don't yet understand).
     Unknown,
+    /// A PEP 695 type parameter that has not been bound yet.  Behaves like
+    /// `Any` in assignability checks (permissive in both directions) until
+    /// the call-site inference pass substitutes it with a concrete type.
+    /// The string is the type-parameter name as declared in the source.
+    TypeVar(String),
 }
 
 impl Type {
@@ -149,6 +154,7 @@ impl Type {
                 s.join(" | ")
             }
             Type::Any => "Any".into(),
+            Type::TypeVar(name) => name.clone(),
             Type::Unknown => "?".into(),
         }
     }
@@ -171,6 +177,9 @@ impl Type {
 pub fn assignable(expected: &Type, actual: &Type) -> bool {
     match (expected, actual) {
         (Type::Any, _) | (_, Type::Any) => true,
+        // Unbound PEP 695 type parameters behave like `Any` until call-site
+        // inference (`bind_typevars_and_substitute`) refines them.
+        (Type::TypeVar(_), _) | (_, Type::TypeVar(_)) => true,
         (Type::Unknown, _) | (_, Type::Unknown) => true,
         (Type::Float, Type::Int) => true,
         (Type::Union(variants), other) => variants.iter().any(|v| assignable(v, other)),
@@ -226,9 +235,12 @@ pub fn type_from_annotation_with_params(
             "bytes" => Type::Bytes,
             "None" => Type::None,
             "Any" => Type::Any,
-            // A type parameter (PEP 695) — treat as a top type until we
-            // have proper inference.
-            other if type_params.iter().any(|p| p == other) => Type::Any,
+            // A type parameter (PEP 695) — preserved as `Type::TypeVar` so
+            // call-site inference can substitute it with the concrete
+            // argument type.  Assignability still treats it as `Any` until
+            // substitution happens, so existing tests that compose generic
+            // signatures continue to type-check.
+            other if type_params.iter().any(|p| p == other) => Type::TypeVar(other.to_owned()),
             other if classes.iter().any(|c| c == other) => Type::Class(other.to_owned()),
             // Unknown but treat as nominal class (may be imported).
             other => Type::Class(other.to_owned()),
@@ -297,6 +309,151 @@ pub fn type_from_annotation_with_params(
         Expr::Constant(c) if matches!(c.value, Constant::None) => Type::None,
         _ => Type::Unknown,
     }
+}
+
+/// Walk `ty` and collect every `(name, position)` pair where a typevar
+/// appears.  The resulting structure feeds [`bind_typevars`] which walks
+/// the same positions of an actual argument type to read off bindings.
+fn collect_typevar_positions(ty: &Type) -> Vec<String> {
+    let mut out = Vec::new();
+    walk_typevars(ty, &mut out);
+    out
+}
+
+fn walk_typevars(ty: &Type, out: &mut Vec<String>) {
+    match ty {
+        Type::TypeVar(name) => {
+            if !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
+        Type::Union(xs) | Type::Generic(_, xs) => {
+            for x in xs {
+                walk_typevars(x, out);
+            }
+        }
+        Type::Function { params, ret, .. } => {
+            for p in params {
+                walk_typevars(p, out);
+            }
+            walk_typevars(ret, out);
+        }
+        _ => {}
+    }
+}
+
+/// Try to bind a `Type::TypeVar` to a concrete actual type by walking
+/// `formal` and `actual` in lockstep.  Recursive: `list[T]` against
+/// `list[int]` binds `T → int`.  Any binding conflict resolves by union
+/// (so calling `f[T](a: T, b: T)` with `(int, str)` infers `T = int|str`).
+fn bind_typevars(
+    formal: &Type,
+    actual: &Type,
+    bindings: &mut std::collections::HashMap<String, Type>,
+) {
+    match (formal, actual) {
+        (Type::TypeVar(name), other) => {
+            if let Some(existing) = bindings.get(name).cloned() {
+                if existing != *other {
+                    bindings.insert(name.clone(), Type::union_of(vec![existing, other.clone()]));
+                }
+            } else {
+                bindings.insert(name.clone(), other.clone());
+            }
+        }
+        (Type::Generic(fh, fa), Type::Generic(ah, aa)) if fh == ah && fa.len() == aa.len() => {
+            for (f, a) in fa.iter().zip(aa) {
+                bind_typevars(f, a, bindings);
+            }
+        }
+        (
+            Type::Function {
+                params: fp,
+                ret: fr,
+                ..
+            },
+            Type::Function {
+                params: ap,
+                ret: ar,
+                ..
+            },
+        ) if fp.len() == ap.len() => {
+            for (f, a) in fp.iter().zip(ap) {
+                bind_typevars(f, a, bindings);
+            }
+            bind_typevars(fr, ar, bindings);
+        }
+        _ => {}
+    }
+}
+
+/// Substitute every `TypeVar` in `ty` whose name appears in `bindings`
+/// with the bound type, recursively.  Unbound type vars are left as
+/// `TypeVar` so the caller can still see them in `Display` output.
+fn substitute_typevars(ty: &Type, bindings: &std::collections::HashMap<String, Type>) -> Type {
+    match ty {
+        Type::TypeVar(name) => bindings.get(name).cloned().unwrap_or_else(|| ty.clone()),
+        Type::Union(xs) => Type::union_of(
+            xs.iter()
+                .map(|x| substitute_typevars(x, bindings))
+                .collect(),
+        ),
+        Type::Generic(h, args) => Type::Generic(
+            h.clone(),
+            args.iter()
+                .map(|x| substitute_typevars(x, bindings))
+                .collect(),
+        ),
+        Type::Function {
+            params,
+            ret,
+            variadic,
+        } => Type::Function {
+            params: params
+                .iter()
+                .map(|p| substitute_typevars(p, bindings))
+                .collect(),
+            ret: Box::new(substitute_typevars(ret, bindings)),
+            variadic: *variadic,
+        },
+        other => other.clone(),
+    }
+}
+
+/// Top-level entry point for call-site PEP 695 inference.  Given the
+/// formal parameter types and actual argument types, infer the binding
+/// for every TypeVar mentioned in the formals, then substitute those
+/// bindings in `return_type`.  The result is the call's inferred return.
+pub fn bind_typevars_and_substitute(
+    formal_params: &[Type],
+    actual_args: &[Type],
+    return_type: &Type,
+) -> Type {
+    // Skip work when no formal mentions a TypeVar.
+    let has_typevar = formal_params
+        .iter()
+        .chain(std::iter::once(return_type))
+        .any(|t| {
+            let mut tmp = Vec::new();
+            walk_typevars(t, &mut tmp);
+            !tmp.is_empty()
+        });
+    if !has_typevar {
+        return return_type.clone();
+    }
+    let mut bindings: std::collections::HashMap<String, Type> = std::collections::HashMap::new();
+    for (formal, actual) in formal_params.iter().zip(actual_args.iter()) {
+        bind_typevars(formal, actual, &mut bindings);
+    }
+    substitute_typevars(return_type, &bindings)
+}
+
+/// Used by tests in lower layers (resolver, db) that want to enumerate
+/// known typevar names in a type expression without depending on the
+/// internal walker directly.
+#[doc(hidden)]
+pub fn typevars_in(ty: &Type) -> Vec<String> {
+    collect_typevar_positions(ty)
 }
 
 /// Collect the names of PEP 695 type parameters into a flat list.
@@ -395,13 +552,17 @@ struct Checker<'a> {
     /// Return type of the function whose body we are currently checking
     /// (None at module scope).
     current_return: Option<Type>,
-    /// Reserved for the no-implicit-Any region check: each `unsafe:` block
-    /// bumps this counter so the checker can later permit `Any` to bind
-    /// freely inside while still requiring an explicit annotation at the
-    /// boundary. v1 emits the `if True:` wrapper but doesn't yet use this
-    /// field — Phase 3+ will wire it.
-    #[allow(dead_code)]
+    /// Bumped on entry to an `unsafe:` block, decremented on exit.  While
+    /// positive, diagnostics produced by [`Checker::push_error`] /
+    /// [`Checker::push_warning`] are dropped so the user can interface with
+    /// untyped Python without fighting the checker.  Boundary checks at
+    /// assignment sites outside the block still apply normally.
     unsafe_depth: u32,
+    /// Byte offsets of the `if True:` statements that correspond to
+    /// `unsafe:` blocks.  Computed from the preprocessor's `unsafe_lines`
+    /// metadata; queried by [`check_stmt`] when entering an `if` body to
+    /// decide whether to bump `unsafe_depth`.
+    unsafe_line_starts: Vec<u32>,
 }
 
 /// Declared interface (`interface Name:` → `class Name(Protocol):`). Bundles
@@ -450,11 +611,20 @@ impl<'a> Checker<'a> {
             interfaces: HashMap::new(),
             class_shapes: HashMap::new(),
             unsafe_depth: 0,
+            unsafe_line_starts: Vec::new(),
             sealed_unions: HashMap::new(),
             env: TypeEnv::default(),
             diagnostics: Diagnostics::new(),
             current_return: None,
         }
+    }
+
+    /// True iff the `if True:` statement opening at this byte offset
+    /// originated from a `unsafe:` block.  Used by `check_if` to gate the
+    /// depth counter.
+    fn is_unsafe_marker(&self, range: TextRange) -> bool {
+        let start = u32::from(range.start());
+        self.unsafe_line_starts.binary_search(&start).is_ok()
     }
 
     /// Assignment compatibility check that accounts for sealed-union subtyping
@@ -554,6 +724,9 @@ impl<'a> Checker<'a> {
     }
 
     fn mismatch(&mut self, expected: &Type, actual: &Type, span: (usize, usize)) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
         let length = span.1.saturating_sub(span.0).max(1);
         // When the expected type is a known interface and the actual is a
         // class, render a structural-conformance error instead of a generic
@@ -586,6 +759,9 @@ impl<'a> Checker<'a> {
     }
 
     fn interface_isinstance(&mut self, iface: &str, span: (usize, usize)) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
         let length = span.1.saturating_sub(span.0).max(1);
         self.diagnostics.push_error(TycError::interface_isinstance(
             iface,
@@ -597,6 +773,9 @@ impl<'a> Checker<'a> {
     }
 
     fn nullable_use(&mut self, name: &str, expected: &Type, span: (usize, usize)) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
         let length = span.1.saturating_sub(span.0).max(1);
         self.diagnostics.push_error(TycError::nullable_use(
             name,
@@ -609,6 +788,9 @@ impl<'a> Checker<'a> {
     }
 
     fn wrong_args(&mut self, name: &str, expected: usize, actual: usize, span: (usize, usize)) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
         let length = span.1.saturating_sub(span.0).max(1);
         self.diagnostics.push_error(TycError::wrong_arg_count(
             name,
@@ -622,6 +804,9 @@ impl<'a> Checker<'a> {
     }
 
     fn not_callable(&mut self, typ: &Type, span: (usize, usize)) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
         let length = span.1.saturating_sub(span.0).max(1);
         self.diagnostics.push_error(TycError::not_callable(
             typ.display(),
@@ -633,6 +818,9 @@ impl<'a> Checker<'a> {
     }
 
     fn non_exhaustive_match(&mut self, union_name: &str, missing: &str, span: (usize, usize)) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
         let length = span.1.saturating_sub(span.0).max(1);
         self.diagnostics.push_error(TycError::non_exhaustive_match(
             union_name,
@@ -652,7 +840,24 @@ pub fn check_module(
     resolved: &ResolvedModule,
     module: &Mod,
 ) -> Diagnostics {
+    check_module_with(path, source, resolved, module, &[])
+}
+
+/// Type-check a module with knowledge of which lines opened an `unsafe:`
+/// block.  Diagnostics produced inside an unsafe region are suppressed:
+/// `Any` is permitted to flow freely so users can interface with untyped
+/// Python boundaries.  Diagnostics at the boundary (where untyped values
+/// leak back out) are still produced as normal at the assignment site
+/// outside the block.
+pub fn check_module_with(
+    path: impl Into<String>,
+    source: &str,
+    resolved: &ResolvedModule,
+    module: &Mod,
+    unsafe_lines: &[usize],
+) -> Diagnostics {
     let mut c = Checker::new(path.into(), source, resolved);
+    c.unsafe_line_starts = unsafe_byte_starts(source, unsafe_lines);
 
     if let Mod::Module(m) = module {
         // First pass: collect class names + function signatures so forward
@@ -675,6 +880,37 @@ pub fn check_module(
     }
 
     c.diagnostics
+}
+
+/// Compute the byte offset of the start of each line in `source` that was
+/// recorded as an `unsafe:` header.  The resulting offsets are used by the
+/// type checker to recognise lowered `if True:` statements that correspond
+/// to unsafe blocks.
+fn unsafe_byte_starts(source: &str, unsafe_lines: &[usize]) -> Vec<u32> {
+    if unsafe_lines.is_empty() {
+        return Vec::new();
+    }
+    let mut line_starts: Vec<usize> = vec![0];
+    for (i, b) in source.bytes().enumerate() {
+        if b == b'\n' {
+            line_starts.push(i + 1);
+        }
+    }
+    let mut starts: Vec<u32> = Vec::with_capacity(unsafe_lines.len());
+    for &line in unsafe_lines {
+        if let Some(&offset) = line_starts.get(line) {
+            // Skip leading whitespace so the start matches the `if True:`
+            // token's range.start exactly.
+            let rest = &source[offset..];
+            let lead = rest
+                .bytes()
+                .take_while(|&b| b == b' ' || b == b'\t')
+                .count();
+            starts.push((offset + lead) as u32);
+        }
+    }
+    starts.sort_unstable();
+    starts
 }
 
 /// Declare Typhon-specific built-in names that are not present in the
@@ -1156,14 +1392,26 @@ fn check_function(
 }
 
 fn check_if(c: &mut Checker, i: &rustpython_ast::StmtIf<TextRange>) {
+    // Recognise the `if True:` form that the preprocessor emits for an
+    // `unsafe:` block.  Inside the body, type-check diagnostics are
+    // suppressed; the `else` branch is empty in practice (the preprocessor
+    // never emits one) but is handled safely below.
+    let is_unsafe = c.is_unsafe_marker(i.range);
+
     let _ = infer_expr(c, &i.test);
 
     // Apply narrowing for the true branch.
     let narrowings = collect_narrowings(c, &i.test, /*negate=*/ false);
     let snap_pre = c.env.snapshot();
     apply_narrowings(c, &narrowings);
+    if is_unsafe {
+        c.unsafe_depth = c.unsafe_depth.saturating_add(1);
+    }
     for s in &i.body {
         check_stmt(c, s);
+    }
+    if is_unsafe {
+        c.unsafe_depth = c.unsafe_depth.saturating_sub(1);
     }
     c.env.restore(snap_pre);
 
@@ -1411,6 +1659,7 @@ fn infer_expr(c: &mut Checker, expr: &Expr<TextRange>) -> Type {
                         c.wrong_args(&name, params.len(), call.args.len(), call_span);
                     }
                     // Argument type checks (per-pair, ignoring excess).
+                    let mut actuals: Vec<Type> = Vec::with_capacity(params.len());
                     for (i, arg) in call.args.iter().enumerate() {
                         if i >= params.len() {
                             break;
@@ -1432,8 +1681,13 @@ fn infer_expr(c: &mut Checker, expr: &Expr<TextRange>) -> Type {
                                 c.nullable_use(n.id.as_str(), &params[i], span);
                             }
                         }
+                        actuals.push(actual);
                     }
-                    *ret
+                    // PEP 695 inference: bind every TypeVar mentioned in
+                    // the formals from the actuals, then substitute in the
+                    // declared return type so callers see a concrete
+                    // result instead of `Any`.
+                    bind_typevars_and_substitute(&params, &actuals, &ret)
                 }
                 Type::Class(name) => Type::Class(name),
                 Type::Unknown | Type::Any => {
@@ -2263,5 +2517,66 @@ val n: int = first(xs)
 ";
         let d = check(src);
         assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn bind_typevars_substitutes_simple_return() {
+        // Direct unit test of the substitution helper: given `f[T](T) -> T`,
+        // applying actual `int` to formal `T` should make the return `int`.
+        let formals = vec![Type::TypeVar("T".to_owned())];
+        let actuals = vec![Type::Int];
+        let ret = Type::TypeVar("T".to_owned());
+        let inferred = bind_typevars_and_substitute(&formals, &actuals, &ret);
+        assert_eq!(inferred, Type::Int);
+    }
+
+    #[test]
+    fn bind_typevars_substitutes_inside_generic() {
+        // `f[T](list[T]) -> T` with actual `list[str]` should infer `T = str`.
+        let formals = vec![Type::Generic(
+            "list".to_owned(),
+            vec![Type::TypeVar("T".to_owned())],
+        )];
+        let actuals = vec![Type::Generic("list".to_owned(), vec![Type::Str])];
+        let ret = Type::TypeVar("T".to_owned());
+        let inferred = bind_typevars_and_substitute(&formals, &actuals, &ret);
+        assert_eq!(inferred, Type::Str);
+    }
+
+    #[test]
+    fn bind_typevars_conflicting_args_widens_to_union() {
+        // Calling `f[T](T, T)` with `(int, str)` should bind `T = int | str`.
+        let formals = vec![Type::TypeVar("T".to_owned()), Type::TypeVar("T".to_owned())];
+        let actuals = vec![Type::Int, Type::Str];
+        let ret = Type::TypeVar("T".to_owned());
+        let inferred = bind_typevars_and_substitute(&formals, &actuals, &ret);
+        // Union variants are unordered semantically; check membership.
+        match inferred {
+            Type::Union(variants) => {
+                assert!(variants.contains(&Type::Int));
+                assert!(variants.contains(&Type::Str));
+            }
+            other => panic!("expected union, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pep695_inferred_return_flows_to_concrete_assignment() {
+        // After inference, calling `first[T](list[T]) -> T` with `list[int]`
+        // yields a return type of `int`, so assigning to a `str`-typed
+        // binding must now be rejected.  Before inference this passed
+        // because `T` was Any in the return position.
+        let src = "\
+def first[T](items: list[T]) -> T:
+    return items[0]
+
+val xs: list[int] = [1, 2, 3]
+val n: str = first(xs)
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "with PEP 695 inference, first(list[int]) returns int and must not assign to str"
+        );
     }
 }

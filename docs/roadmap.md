@@ -43,8 +43,11 @@ Realistic milestones for one person plus AI assistance. The headline target is a
   `@runtime_checkable`. Recursion / signature-compatibility refinement is
   deferred to Phase 4+.
 - ✅ **`unsafe`** block keyword — lowers to `if True:` so scoping survives
-  the Python round-trip. The boundary marker on the checker side is reserved
-  (`Checker::unsafe_depth`) but not yet enforced.
+  the Python round-trip. The type checker tracks `Checker::unsafe_depth`
+  and suppresses type-mismatch / nullable-use / interface-isinstance /
+  wrong-arg-count / not-callable / non-exhaustive-match diagnostics inside
+  the block so users can interface with untyped Python without fighting the
+  checker. Errors on lines outside the block are unaffected.
 - ✅ **Pure-function detection** with the six-condition rule (sync, no `raise`,
   no `try`, no I/O builtins, no entropy/clocks, no writes to module-level
   `var` state). `@pure`, `@memo`, and `@pure(memo=True)` decorators trigger

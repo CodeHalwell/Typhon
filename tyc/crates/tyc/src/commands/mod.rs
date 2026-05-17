@@ -5,6 +5,7 @@ pub mod check;
 pub mod fmt;
 pub mod init;
 pub mod lsp;
+pub mod migrate;
 pub mod profile;
 pub mod trace;
 pub mod util;

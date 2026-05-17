@@ -130,6 +130,66 @@ impl ResolvedModule {
         }
         None
     }
+
+    /// Iterator over every binding declared in any scope, paired with the
+    /// scope id it belongs to.  Useful for go-to-definition lookups.
+    pub fn all_bindings(&self) -> impl Iterator<Item = (ScopeId, &Binding)> {
+        self.scopes
+            .iter()
+            .flat_map(|s| s.bindings.iter().map(move |b| (s.id, b)))
+    }
+
+    /// Find the identifier (binding or reference) at the given byte offset
+    /// in the preprocessed source.  Returns the symbol name plus, if
+    /// resolvable, the corresponding binding (the definition site).
+    ///
+    /// Used by the LSP backend to implement hover and go-to-definition:
+    /// hover renders the binding kind and declaration span; go-to
+    /// jumps to the binding's offset.
+    pub fn symbol_at_offset(&self, offset: usize) -> Option<SymbolAtOffset<'_>> {
+        // Prefer references first — a binding's span overlaps the
+        // identifier in the declaration site, but a reference is the more
+        // useful match when the user clicks on a use.
+        for r in &self.references {
+            if r.span.0 <= offset && offset < r.span.1 {
+                let definition = self.lookup(r.scope, &r.name).map(|(b, _)| b);
+                return Some(SymbolAtOffset {
+                    name: r.name.clone(),
+                    span: r.span,
+                    definition,
+                    is_definition: false,
+                });
+            }
+        }
+        // Fall back to binding declaration sites.
+        for (_, b) in self.all_bindings() {
+            if b.span.0 <= offset && offset < b.span.1 {
+                return Some(SymbolAtOffset {
+                    name: b.name.clone(),
+                    span: b.span,
+                    definition: Some(b),
+                    is_definition: true,
+                });
+            }
+        }
+        None
+    }
+}
+
+/// What the resolver knows about an identifier at a given byte offset.
+#[derive(Debug, Clone)]
+pub struct SymbolAtOffset<'a> {
+    /// The identifier text.
+    pub name: String,
+    /// Byte range of the identifier itself in the preprocessed source.
+    pub span: (usize, usize),
+    /// The binding the identifier refers to, when resolvable.  `None` for
+    /// unresolved references (would also produce an "unknown name"
+    /// diagnostic at check time).
+    pub definition: Option<&'a Binding>,
+    /// True when this offset lies inside a declaration site (`val x =`,
+    /// `def foo`, `class Foo:`).
+    pub is_definition: bool,
 }
 
 /// Internal helper for building a [`ResolvedModule`] while walking the AST.
@@ -1600,5 +1660,51 @@ mod tests {
         let src = "import os as _unused\nval x: int = 1\n";
         let (_m, d) = resolve(src);
         assert_eq!(d.warning_count(), 0, "_-prefixed import must not warn");
+    }
+
+    #[test]
+    fn symbol_at_offset_finds_reference() {
+        // `val x: int = 1\nval y: int = x\n`
+        //   index in preprocessed source:
+        //   "x: int = 1\ny: int = x\n"
+        //       column 0..1 is `x` (declaration), column 11 is `y` (declaration),
+        //       column 20 is the reference `x` on the second line.
+        let src = "val x: int = 1\nval y: int = x\n";
+        let (m, _d) = resolve(src);
+        // The byte offset of the reference `x` on the second line in the
+        // preprocessed source: "x: int = 1\ny: int = x\n" — newline at byte 10,
+        // `y: int = x` follows so the `x` use sits at byte 20.
+        let symbol = m
+            .symbol_at_offset(20)
+            .expect("symbol_at_offset should find the reference");
+        assert_eq!(symbol.name, "x");
+        assert!(!symbol.is_definition, "this is a use site, not a decl");
+        let def = symbol.definition.expect("reference should resolve");
+        assert_eq!(def.name, "x");
+        assert_eq!(def.mutability, Mutability::Val);
+    }
+
+    #[test]
+    fn symbol_at_offset_finds_declaration() {
+        let src = "val foo: int = 1\n";
+        let (m, _d) = resolve(src);
+        // In the preprocessed source `foo: int = 1\n`, `foo` starts at byte 0.
+        let symbol = m.symbol_at_offset(1).expect("symbol should be found");
+        assert_eq!(symbol.name, "foo");
+        assert!(
+            symbol.is_definition,
+            "offset inside a binding span should be marked as definition"
+        );
+    }
+
+    #[test]
+    fn symbol_at_offset_returns_none_far_past_source() {
+        let src = "val x: int = 1\n";
+        let (m, _d) = resolve(src);
+        // An offset well past the end of every binding range must not match.
+        assert!(
+            m.symbol_at_offset(10_000).is_none(),
+            "offsets past source end should not resolve to any symbol"
+        );
     }
 }
