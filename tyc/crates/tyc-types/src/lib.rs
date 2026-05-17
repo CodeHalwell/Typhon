@@ -457,9 +457,7 @@ pub fn typevars_in(ty: &Type) -> Vec<String> {
 }
 
 /// Collect the names of PEP 695 type parameters into a flat list.
-pub fn collect_type_param_names(
-    type_params: &[ruff_python_ast::TypeParam],
-) -> Vec<String> {
+pub fn collect_type_param_names(type_params: &[ruff_python_ast::TypeParam]) -> Vec<String> {
     type_params
         .iter()
         .map(|tp| match tp {
@@ -1054,10 +1052,7 @@ fn has_runtime_checkable_decorator(decorators: &[ruff_python_ast::Decorator]) ->
 /// `classes` is the module-level class list, threaded through so nominal
 /// references in field annotations (`field: OtherClass`) resolve correctly
 /// rather than landing as `Type::Unknown`.
-fn collect_class_shape(
-    cd: &ruff_python_ast::StmtClassDef,
-    classes: &[String],
-) -> InterfaceShape {
+fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -> InterfaceShape {
     let mut shape = InterfaceShape::default();
     for stmt in &cd.body {
         match stmt {
@@ -1466,12 +1461,7 @@ fn collect_narrowings(c: &Checker, test: &Expr, negate: bool) -> Vec<Narrowing> 
     out
 }
 
-fn collect_narrowings_inner(
-    c: &Checker,
-    test: &Expr,
-    negate: bool,
-    out: &mut Vec<Narrowing>,
-) {
+fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Vec<Narrowing>) {
     match test {
         Expr::Compare(cmp) => {
             // x is None / x is not None

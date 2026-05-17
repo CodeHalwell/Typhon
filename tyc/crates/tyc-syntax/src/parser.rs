@@ -3,7 +3,7 @@
 //! the migration plan (see `vendor/README.md`).
 
 use rustpython_ast::Mod;
-use rustpython_parser::{Mode, parse};
+use rustpython_parser::{parse, Mode};
 
 pub use rustpython_parser::ParseError;
 

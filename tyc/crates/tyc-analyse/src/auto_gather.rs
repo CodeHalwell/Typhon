@@ -27,8 +27,8 @@
 use std::collections::HashSet;
 
 use ruff_python_ast::{
-    Arguments, AtomicNodeIndex, ExceptHandler, Expr, ExprAttribute, ExprCall, ExprContext,
-    ExprName, Identifier, Keyword, ModModule, Name, Stmt, StmtAssign, StmtWith, WithItem,
+    name::Name, Arguments, AtomicNodeIndex, ExceptHandler, Expr, ExprAttribute, ExprCall,
+    ExprContext, ExprName, Identifier, Keyword, ModModule, Stmt, StmtAssign, StmtWith, WithItem,
 };
 use ruff_text_size::TextRange;
 
@@ -388,8 +388,7 @@ fn expr_uses_any(expr: &Expr, bound: &HashSet<String>) -> bool {
         Expr::UnaryOp(u) => expr_uses_any(&u.operand, bound),
         Expr::BoolOp(b) => b.values.iter().any(|e| expr_uses_any(e, bound)),
         Expr::Compare(c) => {
-            expr_uses_any(&c.left, bound)
-                || c.comparators.iter().any(|e| expr_uses_any(e, bound))
+            expr_uses_any(&c.left, bound) || c.comparators.iter().any(|e| expr_uses_any(e, bound))
         }
         Expr::If(i) => {
             expr_uses_any(&i.test, bound)

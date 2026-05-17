@@ -18,5 +18,5 @@ pub mod parser;
 pub mod preprocess;
 pub mod ruff;
 
-pub use ruff::{ParseError, Parsed, parse_module};
+pub use ruff::{parse_module, ParseError, Parsed};
 pub use ruff_python_ast as ast;

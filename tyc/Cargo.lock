@@ -2116,8 +2116,9 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "miette",
- "rustpython-ast",
- "rustpython-parser",
+ "ruff_python_ast",
+ "ruff_python_parser",
+ "ruff_text_size",
  "serde",
  "serde_json",
  "tempfile",
@@ -2139,8 +2140,8 @@ dependencies = [
 name = "tyc-analyse"
 version = "0.1.0"
 dependencies = [
- "rustpython-ast",
- "rustpython-parser",
+ "ruff_python_ast",
+ "ruff_text_size",
  "tempfile",
  "tyc-diagnostics",
  "tyc-emit",
@@ -2152,8 +2153,6 @@ name = "tyc-db"
 version = "0.1.0"
 dependencies = [
  "criterion",
- "rustpython-ast",
- "rustpython-parser",
  "salsa",
  "tyc-diagnostics",
  "tyc-resolve",
@@ -2165,9 +2164,10 @@ dependencies = [
 name = "tyc-desugar"
 version = "0.1.0"
 dependencies = [
- "rustpython-ast",
- "rustpython-parser",
+ "ruff_python_ast",
+ "ruff_text_size",
  "tyc-emit",
+ "tyc-syntax",
 ]
 
 [[package]]
@@ -2182,9 +2182,10 @@ dependencies = [
 name = "tyc-emit"
 version = "0.1.0"
 dependencies = [
- "rustpython-ast",
- "rustpython-parser",
+ "ruff_python_ast",
+ "ruff_text_size",
  "thiserror",
+ "tyc-syntax",
 ]
 
 [[package]]
@@ -2201,7 +2202,6 @@ name = "tyc-lsp"
 version = "0.1.0"
 dependencies = [
  "miette",
- "rustpython-parser",
  "salsa",
  "tokio",
  "tower-lsp-server",
@@ -2215,8 +2215,8 @@ dependencies = [
 name = "tyc-resolve"
 version = "0.1.0"
 dependencies = [
- "rustpython-ast",
- "rustpython-parser",
+ "ruff_python_ast",
+ "ruff_text_size",
  "tyc-diagnostics",
  "tyc-syntax",
 ]
@@ -2237,8 +2237,8 @@ dependencies = [
 name = "tyc-types"
 version = "0.1.0"
 dependencies = [
- "rustpython-ast",
- "rustpython-parser",
+ "ruff_python_ast",
+ "ruff_text_size",
  "tyc-diagnostics",
  "tyc-resolve",
  "tyc-syntax",

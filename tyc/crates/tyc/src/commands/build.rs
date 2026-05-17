@@ -265,13 +265,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // the qualified `asyncio.TaskGroup` reference and injects
         // `import asyncio` if it isn't already in scope, so no extra
         // wiring is needed here.
-        let module = if config.strictness.auto_gather {
+        let mut module = module;
+        if config.strictness.auto_gather {
             let eligible = collect_gatherable_async_fn_names(&module);
-            let (rewritten, _stats) = rewrite_auto_gather(module, &eligible);
-            rewritten
-        } else {
-            module
-        };
+            let _stats = rewrite_auto_gather(&mut module, &eligible);
+        }
 
         let desugar_output = desugar_module_with(
             &module,

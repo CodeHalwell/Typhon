@@ -11,7 +11,7 @@ mod stubtest;
 
 pub use printer::Emitter;
 pub use stub::emit_stub;
-pub use stubtest::{StubTestFinding, StubTestKind, compare_modules};
+pub use stubtest::{compare_modules, StubTestFinding, StubTestKind};
 
 use ruff_python_ast::ModModule;
 

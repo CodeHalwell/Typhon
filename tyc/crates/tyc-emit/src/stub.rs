@@ -14,9 +14,7 @@
 //! consume directly. The `.dty` source remains the authoritative document for
 //! Typhon-internal use; `.pyi` is for the outside world.
 
-use ruff_python_ast::{
-    AtomicNodeIndex, Expr, ExprEllipsisLiteral, ModModule, Stmt, StmtExpr,
-};
+use ruff_python_ast::{AtomicNodeIndex, Expr, ExprEllipsisLiteral, ModModule, Stmt, StmtExpr};
 use ruff_text_size::TextRange;
 
 use crate::printer::Emitter;

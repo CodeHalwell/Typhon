@@ -901,11 +901,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
 /// Walk every annotation expression on the parameters of a function, so
 /// names used in those annotations are recorded as references and bound
 /// against the enclosing scope.
-fn walk_argument_annotations(
-    r: &mut Resolver,
-    scope: ScopeId,
-    args: &ast::Parameters,
-) {
+fn walk_argument_annotations(r: &mut Resolver, scope: ScopeId, args: &ast::Parameters) {
     let all = args
         .posonlyargs
         .iter()
@@ -970,11 +966,7 @@ fn walk_impl_method(r: &mut Resolver, cls_scope: ScopeId, stmt: &Stmt) {
 ///
 /// Bounds (`T: Number`) are resolved in the enclosing scope where the bound
 /// itself was written; we don't model variance / constraints in v1.
-fn declare_type_params(
-    r: &mut Resolver,
-    scope: ScopeId,
-    type_params: Option<&ast::TypeParams>,
-) {
+fn declare_type_params(r: &mut Resolver, scope: ScopeId, type_params: Option<&ast::TypeParams>) {
     let Some(tps) = type_params else { return };
     for tp in &tps.type_params {
         let (name, range, bound) = match tp {
@@ -996,14 +988,10 @@ fn declare_type_params(
 /// True when the function/class has no type parameters (either `None` or an
 /// empty `TypeParams` list).
 fn type_params_is_empty(type_params: Option<&ast::TypeParams>) -> bool {
-    type_params.map_or(true, |t| t.type_params.is_empty())
+    type_params.is_none_or(|t| t.type_params.is_empty())
 }
 
-fn declare_arguments(
-    r: &mut Resolver,
-    scope: ScopeId,
-    args: &ast::Parameters,
-) {
+fn declare_arguments(r: &mut Resolver, scope: ScopeId, args: &ast::Parameters) {
     let all = args
         .posonlyargs
         .iter()

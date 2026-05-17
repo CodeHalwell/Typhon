@@ -92,8 +92,7 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
     // module will reference it — either because we detected an Ok/
     // Err/Result name, because the user explicitly imported it, or
     // because a `go`/`lazy` lowering produced a qualified reference.
-    let needs_typhon_runtime =
-        has_result_usage || has_any_runtime_import || has_runtime_qualified;
+    let needs_typhon_runtime = has_result_usage || has_any_runtime_import || has_runtime_qualified;
     // Only skip injection when an existing `from typhon_runtime
     // import …` already covers all three names. A partial import
     // (e.g. just `Ok`) would leave `Err`/`Result` undefined, so we
@@ -184,7 +183,9 @@ fn stmt_uses_result_names(stmt: &Stmt) -> bool {
         Stmt::ClassDef(c) => {
             c.decorator_list.iter().any(decorator_uses_result_names)
                 || c.bases().iter().any(expr_uses_result_names)
-                || c.keywords().iter().any(|k| expr_uses_result_names(&k.value))
+                || c.keywords()
+                    .iter()
+                    .any(|k| expr_uses_result_names(&k.value))
                 || stmts_use_result_names(&c.body)
         }
         Stmt::AnnAssign(a) => {
@@ -410,11 +411,7 @@ fn make_typhon_runtime_import() -> Stmt {
         range: TextRange::default(),
         node_index: AtomicNodeIndex::NONE,
         module: Some(make_identifier("typhon_runtime")),
-        names: vec![
-            make_alias("Ok"),
-            make_alias("Err"),
-            make_alias("Result"),
-        ],
+        names: vec![make_alias("Ok"), make_alias("Err"), make_alias("Result")],
         level: 0,
         is_lazy: false,
     })
@@ -754,10 +751,7 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
 /// `def f`). Stripping of `@pure` / `@memo` markers, by contrast, recurses
 /// everywhere — otherwise those Typhon-only names would leak into the
 /// emitted Python and raise `NameError` at import time.
-fn inject_memoise_decorators(
-    body: Vec<Stmt>,
-    memoise: &[String],
-) -> (Vec<Stmt>, bool) {
+fn inject_memoise_decorators(body: Vec<Stmt>, memoise: &[String]) -> (Vec<Stmt>, bool) {
     let mut added = false;
     let new_body: Vec<Stmt> = body
         .into_iter()

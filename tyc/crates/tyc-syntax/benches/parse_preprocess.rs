@@ -12,7 +12,7 @@
 //! The goal is sub-100 ms on a representative module. Regressions above 20 %
 //! of the baseline should trigger a review before merging.
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use tyc_syntax::{parse_module, preprocess::preprocess};
 
 /// A small but representative Typhon module that exercises the common

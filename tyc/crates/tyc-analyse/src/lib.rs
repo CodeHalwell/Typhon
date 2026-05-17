@@ -620,13 +620,8 @@ fn analyse_stmts(
             // gates cache-decorator injection on the function silently
             // passing.
             if declared || memo {
-                let violation = check_purity(
-                    f.name.as_str(),
-                    &f.parameters,
-                    &f.body,
-                    f.is_async,
-                    module,
-                );
+                let violation =
+                    check_purity(f.name.as_str(), &f.parameters, &f.body, f.is_async, module);
                 out.push(PurityFinding {
                     name: f.name.as_str().to_owned(),
                     declared_pure: declared,
