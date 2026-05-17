@@ -89,7 +89,7 @@ fn init_rejects_existing_toml() {
 #[test]
 fn check_passes_on_valid_source() {
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("ok.ty"), "val x: int = 42\n").unwrap();
+    std::fs::write(tmp.path().join("ok.ty"), "let x: int = 42\n").unwrap();
     let status = tyc().arg("check").arg(tmp.path()).status().unwrap();
     assert!(status.success(), "tyc check should pass on valid source");
 }
@@ -97,7 +97,7 @@ fn check_passes_on_valid_source() {
 #[test]
 fn check_fails_on_type_error() {
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("bad.ty"), "val x: int = \"hello\"\n").unwrap();
+    std::fs::write(tmp.path().join("bad.ty"), "let x: int = \"hello\"\n").unwrap();
     let status = tyc().arg("check").arg(tmp.path()).status().unwrap();
     assert!(
         !status.success(),
@@ -108,7 +108,7 @@ fn check_fails_on_type_error() {
 #[test]
 fn check_passes_nullable_annotation() {
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("nullable.ty"), "val x: str? = None\n").unwrap();
+    std::fs::write(tmp.path().join("nullable.ty"), "let x: str? = None\n").unwrap();
     let status = tyc().arg("check").arg(tmp.path()).status().unwrap();
     assert!(
         status.success(),
@@ -121,7 +121,7 @@ fn check_passes_nullable_annotation() {
 #[test]
 fn fmt_check_passes_on_already_formatted_file() {
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("x.ty"), "val x: int = 1\n").unwrap();
+    std::fs::write(tmp.path().join("x.ty"), "let x: int = 1\n").unwrap();
     let status = tyc()
         .args(["fmt", "--check"])
         .arg(tmp.path())
@@ -167,7 +167,7 @@ fn fmt_rewrites_tab_indentation_in_place() {
 #[test]
 fn build_produces_py_file_from_simple_source() {
     let tmp = tempfile::tempdir().unwrap();
-    scaffold(tmp.path(), "val greeting: str = \"hello\"\n");
+    scaffold(tmp.path(), "let greeting: str = \"hello\"\n");
     let status = tyc().arg("build").arg(tmp.path()).status().unwrap();
     assert!(status.success(), "tyc build should succeed");
     assert!(
@@ -179,7 +179,7 @@ fn build_produces_py_file_from_simple_source() {
 #[test]
 fn build_fails_on_type_error() {
     let tmp = tempfile::tempdir().unwrap();
-    scaffold(tmp.path(), "val x: int = \"wrong type\"\n");
+    scaffold(tmp.path(), "let x: int = \"wrong type\"\n");
     let status = tyc().arg("build").arg(tmp.path()).status().unwrap();
     assert!(
         !status.success(),
@@ -372,8 +372,8 @@ type AnyGreeter = EnglishGreeter | SpanishGreeter
 def double(x: int) -> int:
     return x * 2
 
-val g: Greeter = EnglishGreeter()
-val result: int = double(21)
+let g: Greeter = EnglishGreeter()
+let result: int = double(21)
 "#;
     std::fs::write(tmp.path().join("src").join("main.ty"), src).unwrap();
 

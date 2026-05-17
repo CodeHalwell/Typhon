@@ -3,8 +3,8 @@
 //!
 //! Transformations performed here:
 //!
-//! 1. **`val` / `var` line prefixes** — `val x: T = expr` and
-//!    `var x: T = expr` are reduced to `x: T = expr`. The stripped keyword
+//! 1. **`let` / `mut` line prefixes** — `let x: T = expr` and
+//!    `mut x: T = expr` are reduced to `x: T = expr`. The stripped keyword
 //!    is recorded so the formatter can restore it.
 //!
 //! 2. **`T?` nullability sugar** — every `?` outside a string or comment is
@@ -16,8 +16,8 @@
 //!    `class ClassName(BaseModel):`. The preprocessor records the line index
 //!    so the formatter can restore the `model` keyword.
 //!
-//! 4. **`comptime val/var X: T = expr`** — the `comptime` prefix (and the
-//!    immediately following `val`/`var`) is stripped, leaving `X: T = expr`.
+//! 4. **`comptime let/mut X: T = expr`** — the `comptime` prefix (and the
+//!    immediately following `let`/`mut`) is stripped, leaving `X: T = expr`.
 //!    The binding name and line index are recorded so the build command can
 //!    evaluate the RHS at compile time and inline the result.
 //!
@@ -284,19 +284,19 @@ pub fn preprocess(source: &str) -> PreprocessResult {
                 }
             }
 
-            // ── `comptime val/var name…` → strip both prefixes ──────────────
+            // ── `comptime let/mut name…` → strip both prefixes ──────────────
             // `comptime` is a module-level concept; bindings inside functions
             // or classes cannot be evaluated at build time. Only record
             // top-level (indent_len == 0) comptime declarations.
             let mut stripped_line: Option<String> = None;
             if indent_len == 0 && rest.starts_with("comptime ") {
                 let after_comptime = &rest["comptime ".len()..];
-                // Extract the inner keyword (val/var) if present.
+                // Extract the inner keyword (let/mut) if present.
                 let (inner_kw, payload) =
-                    if after_comptime.starts_with("val ") && after_comptime.len() > 4 {
-                        (Some(TyphonKeyword::Val), &after_comptime["val ".len()..])
-                    } else if after_comptime.starts_with("var ") && after_comptime.len() > 4 {
-                        (Some(TyphonKeyword::Var), &after_comptime["var ".len()..])
+                    if after_comptime.starts_with("let ") && after_comptime.len() > 4 {
+                        (Some(TyphonKeyword::Let), &after_comptime["let ".len()..])
+                    } else if after_comptime.starts_with("mut ") && after_comptime.len() > 4 {
+                        (Some(TyphonKeyword::Mut), &after_comptime["mut ".len()..])
                     } else {
                         (None, after_comptime)
                     };
@@ -330,15 +330,15 @@ pub fn preprocess(source: &str) -> PreprocessResult {
                 }
             }
 
-            // ── `lazy val name…` / `lazy var name…` → strip both keywords ─
+            // ── `lazy let name…` / `lazy mut name…` → strip both keywords ─
             //
-            // Pushing `Val` (or `Var`) first and `Lazy` second means the
+            // Pushing `Let` (or `Mut`) first and `Lazy` second means the
             // postprocess restoration prepends them in stack order so the
-            // final line is `lazy val NAME …`.  This entry is independent of
+            // final line is `lazy let NAME …`.  This entry is independent of
             // `lazy import`, which is handled by the parallel
             // `lazy_imports` mechanism.
             if stripped_line.is_none() {
-                for inner_kw in &[TyphonKeyword::Val, TyphonKeyword::Var] {
+                for inner_kw in &[TyphonKeyword::Let, TyphonKeyword::Mut] {
                     let prefix = format!("lazy {} ", inner_kw.as_str());
                     if rest.starts_with(&prefix) && rest.len() > prefix.len() {
                         stripped.push(StrippedKeyword {
@@ -356,9 +356,9 @@ pub fn preprocess(source: &str) -> PreprocessResult {
                 }
             }
 
-            // ── `val name…` / `var name…` → strip keyword ──────────────────
+            // ── `let name…` / `mut name…` → strip keyword ──────────────────
             if stripped_line.is_none() {
-                for kw in &[TyphonKeyword::Val, TyphonKeyword::Var] {
+                for kw in &[TyphonKeyword::Let, TyphonKeyword::Mut] {
                     let prefix = kw.as_str();
                     if rest.starts_with(prefix)
                         && rest.len() > prefix.len()
@@ -794,7 +794,7 @@ pub fn postprocess_full(
                 };
                 lines[line_idx] = format!("{}{}", &line[..indent_len], restored);
             }
-            TyphonKeyword::Val | TyphonKeyword::Var | TyphonKeyword::Comptime => {
+            TyphonKeyword::Let | TyphonKeyword::Mut | TyphonKeyword::Comptime => {
                 // Prepend the keyword (and a space) before the non-whitespace content.
                 let line = &lines[line_idx];
                 let indent_len = line
@@ -859,7 +859,7 @@ pub fn postprocess_full(
                 lines[line_idx] = format!("{}{}", &line[..indent_len], restored);
             }
             // `lazy import` restoration is handled separately below via the
-            // `lazy_imports` vector.  `lazy val` round-trips through the
+            // `lazy_imports` vector.  `lazy let` round-trips through the
             // `stripped` mechanism: the inner `val`/`var` is restored first,
             // and this arm prepends the `lazy ` prefix on top.
             TyphonKeyword::Lazy => {
@@ -1293,13 +1293,13 @@ pub fn expand_lazy_imports(source: &str) -> String {
     // inside a docstring or multiline string is never mistakenly rewritten.
     let mut in_string: Option<StringMode> = None;
     // Stack of enclosing `class:` / `def:` block indents so we can decide
-    // whether a `lazy val` is module-level (→ `lazy_val(lambda: …)`) or
+    // whether a `lazy let` is module-level (→ `lazy_let(lambda: …)`) or
     // class-body (→ `@cached_property`).  Each entry is `(indent_of_header,
     // is_class_body)`.
     let mut block_stack: Vec<(usize, bool)> = Vec::new();
     // Track whether we have already injected the runtime imports so we don't
     // emit duplicates.
-    let mut needs_lazy_val_import = false;
+    let mut needs_lazy_let_import = false;
     let mut needs_cached_property_import = false;
     let mut emitted_lines: Vec<String> = Vec::new();
 
@@ -1359,8 +1359,8 @@ pub fn expand_lazy_imports(source: &str) -> String {
             }
         }
 
-        // ── `lazy val NAME: T = expr` ──────────────────────────────────────
-        if let Some(after) = trimmed.strip_prefix("lazy val ") {
+        // ── `lazy let NAME: T = expr` ──────────────────────────────────────
+        if let Some(after) = trimmed.strip_prefix("lazy let ") {
             // Are we directly inside a class body?
             let inside_class = block_stack
                 .last()
@@ -1373,10 +1373,10 @@ pub fn expand_lazy_imports(source: &str) -> String {
                 .map(|&(_, is_class)| !is_class)
                 .unwrap_or(false);
 
-            if let Some(binding) = parse_lazy_val_binding(after) {
+            if let Some(binding) = parse_lazy_let_binding(after) {
                 let indent = &raw[..indent_len];
                 if inside_function && !inside_class {
-                    // Function-local lazy val is not supported — leave the
+                    // Function-local lazy let is not supported — leave the
                     // line so the parser flags it. A linter pass can later
                     // produce a nicer diagnostic.
                     emitted_lines.push(line.to_owned());
@@ -1394,15 +1394,15 @@ pub fn expand_lazy_imports(source: &str) -> String {
                 }
                 if indent_len == 0 {
                     // Module-level: lower to
-                    //   NAME: T = __typhon_lazy_val(lambda: expr)
-                    needs_lazy_val_import = true;
+                    //   NAME: T = __typhon_lazy_let(lambda: expr)
+                    needs_lazy_let_import = true;
                     let typed = if let Some(ty) = &binding.annotation {
                         format!("{}: {}", binding.name, ty)
                     } else {
                         binding.name.clone()
                     };
                     emitted_lines.push(format!(
-                        "{}{} = __typhon_lazy_val(lambda: {})\n",
+                        "{}{} = __typhon_lazy_let(lambda: {})\n",
                         indent, typed, binding.expr
                     ));
                     continue;
@@ -1417,8 +1417,8 @@ pub fn expand_lazy_imports(source: &str) -> String {
     // imports, which by Python rules must remain at the top; for simplicity
     // we scan and insert after the last `from __future__ import …` line.
     let mut header = String::new();
-    if needs_lazy_val_import {
-        header.push_str("from typhon_runtime.lazy import lazy_val as __typhon_lazy_val\n");
+    if needs_lazy_let_import {
+        header.push_str("from typhon_runtime.lazy import lazy_let as __typhon_lazy_let\n");
     }
     if needs_cached_property_import {
         header.push_str("from functools import cached_property as __typhon_cached_property\n");
@@ -1456,19 +1456,19 @@ pub fn expand_lazy_imports(source: &str) -> String {
     result
 }
 
-/// Parsed `lazy val NAME [: T] = expr` body.
+/// Parsed `lazy let NAME [: T] = expr` body.
 #[derive(Debug)]
-struct LazyValBinding {
+struct LazyLetBinding {
     name: String,
     annotation: Option<String>,
     expr: String,
 }
 
-/// Parse the tail of a `lazy val ` line (everything after the keyword).  The
+/// Parse the tail of a `lazy let ` line (everything after the keyword).  The
 /// expected shapes are `NAME = expr` or `NAME: TYPE = expr`.
-fn parse_lazy_val_binding(tail: &str) -> Option<LazyValBinding> {
+fn parse_lazy_let_binding(tail: &str) -> Option<LazyLetBinding> {
     let tail = tail.trim_end_matches(['\n', '\r']);
-    // Strip a trailing comment so `lazy val x = 1  # note` works.
+    // Strip a trailing comment so `lazy let x = 1  # note` works.
     let code = strip_trailing_comment(tail);
     let eq = find_top_level_assign_eq(&code)?;
     let head = code[..eq].trim();
@@ -1486,7 +1486,7 @@ fn parse_lazy_val_binding(tail: &str) -> Option<LazyValBinding> {
     if !is_python_ident(&name) {
         return None;
     }
-    Some(LazyValBinding {
+    Some(LazyLetBinding {
         name,
         annotation,
         expr,
@@ -1593,8 +1593,8 @@ fn strip_trailing_comment(line: &str) -> String {
     line.to_owned()
 }
 
-/// Emit a `@cached_property`-decorated method for a class-body `lazy val`.
-fn render_cached_property(indent: &str, binding: &LazyValBinding) -> String {
+/// Emit a `@cached_property`-decorated method for a class-body `lazy let`.
+fn render_cached_property(indent: &str, binding: &LazyLetBinding) -> String {
     let ret = binding
         .annotation
         .as_deref()
@@ -3070,31 +3070,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strips_val() {
-        let result = preprocess("val x: int = 1\n");
+    fn strips_let() {
+        let result = preprocess("let x: int = 1\n");
         assert_eq!(result.python_source, "x: int = 1\n");
         assert_eq!(result.stripped.len(), 1);
-        assert!(matches!(result.stripped[0].keyword, TyphonKeyword::Val));
+        assert!(matches!(result.stripped[0].keyword, TyphonKeyword::Let));
         assert_eq!(result.stripped[0].line_index, 0);
     }
 
     #[test]
-    fn strips_var() {
-        let result = preprocess("var count: int = 0\n");
+    fn strips_mut() {
+        let result = preprocess("mut count: int = 0\n");
         assert_eq!(result.python_source, "count: int = 0\n");
         assert_eq!(result.stripped.len(), 1);
-        assert!(matches!(result.stripped[0].keyword, TyphonKeyword::Var));
+        assert!(matches!(result.stripped[0].keyword, TyphonKeyword::Mut));
     }
 
     #[test]
-    fn strips_indented_val() {
-        let result = preprocess("    val x: int = 1\n");
+    fn strips_indented_let() {
+        let result = preprocess("    let x: int = 1\n");
         assert_eq!(result.python_source, "    x: int = 1\n");
     }
 
     #[test]
     fn rewrites_optional_in_annotation() {
-        let result = preprocess("val email: str? = None\n");
+        let result = preprocess("let email: str? = None\n");
         assert_eq!(result.python_source, "email: str | None = None\n");
         assert_eq!(result.optionals.len(), 1);
         // The optional starts at column 11 ("email: str|").
@@ -3110,7 +3110,7 @@ mod tests {
 
     #[test]
     fn does_not_rewrite_question_mark_inside_string() {
-        let result = preprocess("val s: str = \"is this ok?\"\n");
+        let result = preprocess("let s: str = \"is this ok?\"\n");
         assert_eq!(result.python_source, "s: str = \"is this ok?\"\n");
         assert!(result.optionals.is_empty());
     }
@@ -3195,8 +3195,8 @@ mod tests {
     // ── comptime keyword ────────────────────────────────────────────────────
 
     #[test]
-    fn comptime_val_stripped_to_plain_assignment() {
-        let result = preprocess("comptime val PORT: int = 8080\n");
+    fn comptime_let_stripped_to_plain_assignment() {
+        let result = preprocess("comptime let PORT: int = 8080\n");
         assert_eq!(result.python_source, "PORT: int = 8080\n");
         assert_eq!(result.comptime_bindings.len(), 1);
         assert_eq!(result.comptime_bindings[0].name, "PORT");
@@ -3204,7 +3204,7 @@ mod tests {
 
     #[test]
     fn comptime_var_stripped_correctly() {
-        let result = preprocess("comptime var DB_URL: str = \"postgres://localhost\"\n");
+        let result = preprocess("comptime mut DB_URL: str = \"postgres://localhost\"\n");
         assert_eq!(
             result.python_source,
             "DB_URL: str = \"postgres://localhost\"\n"
@@ -3213,8 +3213,8 @@ mod tests {
     }
 
     #[test]
-    fn comptime_val_round_trips_via_postprocess() {
-        let src = "comptime val PORT: int = 8080\n";
+    fn comptime_let_round_trips_via_postprocess() {
+        let src = "comptime let PORT: int = 8080\n";
         let prep = preprocess(src);
         let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
         assert_eq!(out, src);
@@ -3259,12 +3259,12 @@ mod tests {
 
     #[test]
     fn question_op_preserves_indent() {
-        let src = "    val y = compute()?\n";
+        let src = "    let y = compute()?\n";
         let out = expand_question_ops(src);
         assert!(out.contains("    __typhon_q_0__ = compute()"), "out: {out}");
         assert!(out.contains("    if isinstance"), "out: {out}");
         assert!(
-            out.contains("    val y = __typhon_q_0__.value"),
+            out.contains("    let y = __typhon_q_0__.value"),
             "out: {out}"
         );
     }
@@ -4009,54 +4009,54 @@ def run() -> Result[str, str]:
     }
 
     #[test]
-    fn expand_lazy_val_module_level_lowers_to_lazy_val_call() {
-        let src = "lazy val CONFIG: dict = load_config()\n";
+    fn expand_lazy_let_module_level_lowers_to_lazy_let_call() {
+        let src = "lazy let CONFIG: dict = load_config()\n";
         let out = expand_lazy_imports(src);
         assert!(
-            out.contains("from typhon_runtime.lazy import lazy_val as __typhon_lazy_val"),
-            "module-level lazy val should inject the runtime import; got:\n{out}"
+            out.contains("from typhon_runtime.lazy import lazy_let as __typhon_lazy_let"),
+            "module-level lazy let should inject the runtime import; got:\n{out}"
         );
         assert!(
-            out.contains("CONFIG: dict = __typhon_lazy_val(lambda: load_config())"),
-            "module-level lazy val should lower to lazy_val(lambda: …); got:\n{out}"
+            out.contains("CONFIG: dict = __typhon_lazy_let(lambda: load_config())"),
+            "module-level lazy let should lower to lazy_let(lambda: …); got:\n{out}"
         );
     }
 
     #[test]
-    fn expand_lazy_val_module_level_without_annotation() {
-        let src = "lazy val PORT = 8080\n";
+    fn expand_lazy_let_module_level_without_annotation() {
+        let src = "lazy let PORT = 8080\n";
         let out = expand_lazy_imports(src);
         assert!(
-            out.contains("PORT = __typhon_lazy_val(lambda: 8080)"),
-            "lazy val without annotation should lower without colon: {out}"
+            out.contains("PORT = __typhon_lazy_let(lambda: 8080)"),
+            "lazy let without annotation should lower without colon: {out}"
         );
     }
 
     #[test]
-    fn expand_lazy_val_inside_class_lowers_to_cached_property() {
-        let src = "class Foo:\n    lazy val expensive: int = compute()\n";
+    fn expand_lazy_let_inside_class_lowers_to_cached_property() {
+        let src = "class Foo:\n    lazy let expensive: int = compute()\n";
         let out = expand_lazy_imports(src);
         assert!(
             out.contains("from functools import cached_property as __typhon_cached_property"),
-            "class-body lazy val should inject cached_property import; got:\n{out}"
+            "class-body lazy let should inject cached_property import; got:\n{out}"
         );
         assert!(
             out.contains("@__typhon_cached_property"),
-            "class-body lazy val should emit the @cached_property decorator; got:\n{out}"
+            "class-body lazy let should emit the @cached_property decorator; got:\n{out}"
         );
         assert!(
             out.contains("def expensive(self) -> int:"),
-            "class-body lazy val should emit a method signature; got:\n{out}"
+            "class-body lazy let should emit a method signature; got:\n{out}"
         );
         assert!(
             out.contains("return compute()"),
-            "class-body lazy val body should return the expr; got:\n{out}"
+            "class-body lazy let body should return the expr; got:\n{out}"
         );
     }
 
     #[test]
-    fn expand_lazy_val_inserts_imports_after_future() {
-        let src = "from __future__ import annotations\nlazy val X = 1\n";
+    fn expand_lazy_let_inserts_imports_after_future() {
+        let src = "from __future__ import annotations\nlazy let X = 1\n";
         let out = expand_lazy_imports(src);
         // The __future__ line must remain first; the injected import must
         // appear after it.
@@ -4073,46 +4073,46 @@ def run() -> Result[str, str]:
     }
 
     #[test]
-    fn expand_lazy_val_passes_through_inside_function() {
-        // Function-local lazy val is not supported in v1; the line must not
+    fn expand_lazy_let_passes_through_inside_function() {
+        // Function-local lazy let is not supported in v1; the line must not
         // be rewritten (the parser will flag it as a syntax error).
-        let src = "def f():\n    lazy val x: int = 1\n    return x\n";
+        let src = "def f():\n    lazy let x: int = 1\n    return x\n";
         let out = expand_lazy_imports(src);
         assert!(
-            out.contains("lazy val x: int = 1"),
-            "function-local lazy val should be passed through verbatim; got:\n{out}"
+            out.contains("lazy let x: int = 1"),
+            "function-local lazy let should be passed through verbatim; got:\n{out}"
         );
         assert!(
-            !out.contains("__typhon_lazy_val"),
-            "function-local lazy val must not be lowered; got:\n{out}"
+            !out.contains("__typhon_lazy_let"),
+            "function-local lazy let must not be lowered; got:\n{out}"
         );
     }
 
     #[test]
-    fn preprocess_strips_lazy_val_for_round_trip() {
-        let result = preprocess("lazy val CONFIG: int = 1\n");
+    fn preprocess_strips_lazy_let_for_round_trip() {
+        let result = preprocess("lazy let CONFIG: int = 1\n");
         // Both `lazy` and `val` are removed from the Python-facing source so
         // the parser sees plain `CONFIG: int = 1`; the formatter restores
         // them via the stripped-keyword list.
         assert_eq!(result.python_source, "CONFIG: int = 1\n");
         let kinds: Vec<TyphonKeyword> = result.stripped.iter().map(|sk| sk.keyword).collect();
         assert!(
-            kinds.contains(&TyphonKeyword::Val) && kinds.contains(&TyphonKeyword::Lazy),
-            "stripped list should contain both Val and Lazy; got {:?}",
+            kinds.contains(&TyphonKeyword::Let) && kinds.contains(&TyphonKeyword::Lazy),
+            "stripped list should contain both Let and Lazy; got {:?}",
             kinds
         );
-        // Round-trip: postprocess must rebuild the original `lazy val` form.
+        // Round-trip: postprocess must rebuild the original `lazy let` form.
         let restored = postprocess(&result.python_source, &result.stripped, &result.optionals);
-        assert_eq!(restored, "lazy val CONFIG: int = 1\n");
+        assert_eq!(restored, "lazy let CONFIG: int = 1\n");
     }
 
     #[test]
-    fn expand_lazy_val_parser_skips_compound_assignment() {
+    fn expand_lazy_let_parser_skips_compound_assignment() {
         // `==` inside the expression must not be confused with the binding `=`.
-        let src = "lazy val FLAG = a == b\n";
+        let src = "lazy let FLAG = a == b\n";
         let out = expand_lazy_imports(src);
         assert!(
-            out.contains("__typhon_lazy_val(lambda: a == b)"),
+            out.contains("__typhon_lazy_let(lambda: a == b)"),
             "RHS containing `==` must be captured intact; got:\n{out}"
         );
     }

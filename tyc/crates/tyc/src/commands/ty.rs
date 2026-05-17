@@ -144,7 +144,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let src_dir = tmp.path().join("src");
         std::fs::create_dir_all(&src_dir).unwrap();
-        std::fs::write(src_dir.join("main.ty"), "val x: int = 1\n").unwrap();
+        std::fs::write(src_dir.join("main.ty"), "let x: int = 1\n").unwrap();
         std::fs::write(
             tmp.path().join("typhon.toml"),
             "[project]\nname = \"test\"\n",
@@ -176,7 +176,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let src_dir = tmp.path().join("src");
         std::fs::create_dir_all(&src_dir).unwrap();
-        std::fs::write(src_dir.join("main.ty"), "val x: int = 1\n").unwrap();
+        std::fs::write(src_dir.join("main.ty"), "let x: int = 1\n").unwrap();
         std::fs::write(
             tmp.path().join("typhon.toml"),
             "[project]\nname = \"test\"\n",

@@ -152,7 +152,7 @@ fn eval_expr(expr: &Expr<TextRange>) -> Result<ComptimeValue, String> {
             match eval_expr(&u.operand)? {
                 ComptimeValue::Int(n) => Ok(ComptimeValue::Int(-n)),
                 ComptimeValue::Float(f) => Ok(ComptimeValue::Float(-f)),
-                _ => Err("unary `-` is only valid on numeric comptime values".into()),
+                _ => Err("unary `-` is only valid on numeric comptime letues".into()),
             }
         }
 
@@ -185,7 +185,7 @@ fn eval_constant(c: &Constant) -> Result<ComptimeValue, String> {
         Constant::Float(f) => Ok(ComptimeValue::Float(*f)),
         Constant::Str(s) => Ok(ComptimeValue::Str(s.clone())),
         Constant::Bool(b) => Ok(ComptimeValue::Bool(*b)),
-        Constant::None => Err("None is not a valid comptime value".into()),
+        Constant::None => Err("None is not a valid comptime letue".into()),
         other => Err(format!("unsupported literal kind: {:?}", other)),
     }
 }
@@ -355,7 +355,7 @@ fn eval_binop(
             }
         }
         _ => Err(format!(
-            "operator is not supported between these comptime value types: {:?} {:?} {:?}",
+            "operator is not supported between these comptime letue types: {:?} {:?} {:?}",
             op, lhs, rhs
         )),
     }
@@ -428,14 +428,14 @@ mod tests {
 
     #[test]
     fn integer_literal_evaluated() {
-        let (values, diags) = eval("comptime val PORT: int = 8080\n");
+        let (values, diags) = eval("comptime let PORT: int = 8080\n");
         assert!(!diags.has_errors(), "{:?}", diags.errors());
         assert!(matches!(values.get("PORT"), Some(ComptimeValue::Int(8080))));
     }
 
     #[test]
     fn string_literal_evaluated() {
-        let (values, diags) = eval("comptime val HOST: str = \"localhost\"\n");
+        let (values, diags) = eval("comptime let HOST: str = \"localhost\"\n");
         assert!(!diags.has_errors());
         assert!(matches!(values.get("HOST"), Some(ComptimeValue::Str(s)) if s == "localhost"));
     }
@@ -445,7 +445,7 @@ mod tests {
         // Use a unique name that no other test sets.
         std::env::remove_var("__TYPHON_TEST_UNSET_DEFAULT__");
         let (values, diags) = eval(
-            "comptime val PORT: int = int(env(\"__TYPHON_TEST_UNSET_DEFAULT__\", \"9000\"))\n",
+            "comptime let PORT: int = int(env(\"__TYPHON_TEST_UNSET_DEFAULT__\", \"9000\"))\n",
         );
         assert!(!diags.has_errors(), "{:?}", diags.errors());
         assert!(matches!(values.get("PORT"), Some(ComptimeValue::Int(9000))));
@@ -455,7 +455,7 @@ mod tests {
     fn env_with_default_uses_env_when_set() {
         std::env::set_var("__TYPHON_TEST_SET_DEFAULT__", "4321");
         let (values, diags) =
-            eval("comptime val PORT: int = int(env(\"__TYPHON_TEST_SET_DEFAULT__\", \"9000\"))\n");
+            eval("comptime let PORT: int = int(env(\"__TYPHON_TEST_SET_DEFAULT__\", \"9000\"))\n");
         std::env::remove_var("__TYPHON_TEST_SET_DEFAULT__");
         assert!(!diags.has_errors());
         assert!(matches!(values.get("PORT"), Some(ComptimeValue::Int(4321))));
@@ -465,13 +465,13 @@ mod tests {
     fn missing_required_env_is_an_error() {
         std::env::remove_var("__TYPHON_REQUIRED_TEST_UNIQUE__");
         let (_, diags) =
-            eval("comptime val DB_URL: str = env(\"__TYPHON_REQUIRED_TEST_UNIQUE__\")\n");
+            eval("comptime let DB_URL: str = env(\"__TYPHON_REQUIRED_TEST_UNIQUE__\")\n");
         assert!(diags.has_errors(), "missing env var must be a build error");
     }
 
     #[test]
     fn int_coercion_on_string() {
-        let (values, diags) = eval("comptime val N: int = int(\"42\")\n");
+        let (values, diags) = eval("comptime let N: int = int(\"42\")\n");
         assert!(!diags.has_errors());
         assert!(matches!(values.get("N"), Some(ComptimeValue::Int(42))));
     }

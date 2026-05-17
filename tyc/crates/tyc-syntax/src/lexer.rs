@@ -1,6 +1,6 @@
 //! Typhon-specific tokens that extend the Python token set.
 //!
-//! Phase 0 introduces `val` and `var` as first-class keywords.
+//! Phase 0 introduces `let` and `mut` as first-class keywords.
 //! Phase 2 adds `model` (Pydantic class emission) and `comptime` (build-time
 //! constant evaluation).
 //! Phase 3 adds `impl`, `extend`, `interface`, `unsafe`, `gather`, `go`, and
@@ -13,10 +13,10 @@
 /// A Typhon keyword that is not part of standard Python.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TyphonKeyword {
-    /// `val` — declares an immutable binding (like Rust's `let` or Kotlin's `val`).
-    Val,
-    /// `var` — declares a mutable binding.
-    Var,
+    /// `let` — declares an immutable binding (like Rust's `let`).
+    Let,
+    /// `mut` — declares a mutable binding (like Rust's `let mut`).
+    Mut,
     /// `model` — declares a Pydantic `BaseModel` class instead of a dataclass.
     Model,
     /// `comptime` — marks a binding whose RHS is evaluated at build time and
@@ -51,8 +51,8 @@ impl TyphonKeyword {
     /// Return the source spelling of this keyword.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Val => "val",
-            Self::Var => "var",
+            Self::Let => "let",
+            Self::Mut => "mut",
             Self::Model => "model",
             Self::Comptime => "comptime",
             Self::Impl => "impl",
@@ -68,8 +68,8 @@ impl TyphonKeyword {
     /// Try to parse a keyword from a source slice.
     pub fn keyword_of(s: &str) -> Option<Self> {
         match s {
-            "val" => Some(Self::Val),
-            "var" => Some(Self::Var),
+            "let" => Some(Self::Let),
+            "mut" => Some(Self::Mut),
             "model" => Some(Self::Model),
             "comptime" => Some(Self::Comptime),
             "impl" => Some(Self::Impl),
@@ -87,7 +87,7 @@ impl TyphonKeyword {
 /// A single token produced by the Typhon lexer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TyphonToken<'src> {
-    /// A Typhon-specific keyword (`val` / `var`).
+    /// A Typhon-specific keyword (`let` / `mut`).
     Keyword(TyphonKeyword),
     /// Any other text fragment (passed through unchanged to the Python parser).
     Text(&'src str),
@@ -96,7 +96,7 @@ pub enum TyphonToken<'src> {
 /// Lex a Typhon source string into a sequence of [`TyphonToken`]s.
 ///
 /// This is a *word-boundary* lexer: it splits the source on whitespace
-/// boundaries, recognises `val` and `var`, and returns everything else as
+/// boundaries, recognises `let` and `mut`, and returns everything else as
 /// [`TyphonToken::Text`] slices pointing into the original string.
 pub fn lex(source: &str) -> Vec<TyphonToken<'_>> {
     let mut tokens = Vec::new();
@@ -147,16 +147,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recognises_val_and_var() {
-        let src = "val x: int = 1";
+    fn recognises_let_and_mut() {
+        let src = "let x: int = 1";
         let tokens = lex(src);
-        assert_eq!(tokens[0], TyphonToken::Keyword(TyphonKeyword::Val));
+        assert_eq!(tokens[0], TyphonToken::Keyword(TyphonKeyword::Let));
     }
 
     #[test]
     fn does_not_match_partial_keyword() {
-        // "value" should NOT be tokenised as `val` + `ue`.
-        let src = "value = 1";
+        // "letter" should NOT be tokenised as `let` + `ter`.
+        let src = "letter = 1";
         let tokens = lex(src);
         assert!(
             tokens.iter().all(|t| !matches!(t, TyphonToken::Keyword(_))),
@@ -165,9 +165,9 @@ mod tests {
     }
 
     #[test]
-    fn var_keyword() {
-        let src = "var count: int = 0";
+    fn mut_keyword() {
+        let src = "mut count: int = 0";
         let tokens = lex(src);
-        assert_eq!(tokens[0], TyphonToken::Keyword(TyphonKeyword::Var));
+        assert_eq!(tokens[0], TyphonToken::Keyword(TyphonKeyword::Mut));
     }
 }

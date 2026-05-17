@@ -2,14 +2,14 @@
 //!
 //! Pipeline for a single `.ty` file:
 //!
-//! 1. Pre-process: strip `val`/`var` keywords so the Python parser can handle
+//! 1. Pre-process: strip `let`/`mut` keywords so the Python parser can handle
 //!    the remainder of the grammar.
 //! 2. Parse: verify the source is syntactically valid using
 //!    `rustpython_parser`.
 //! 3. Normalise: apply lightweight whitespace normalisation to the
 //!    pre-processed source (trailing spaces, final newline).  Comments and
 //!    blank lines are preserved.
-//! 4. Post-process: restore `val`/`var` at the appropriate locations.
+//! 4. Post-process: restore `let`/`mut` at the appropriate locations.
 //!
 //! Full AST-based reformatting (which would drop comments) is deferred to a
 //! later phase when a comment-preserving CST emitter is available.
@@ -66,7 +66,7 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
     //   • Expand tabs to 4 spaces.
     let normalised = normalise_whitespace(&prep.python_source);
 
-    // Step 4: post-process — restore val/var keywords, `?` sugar, and lazy imports.
+    // Step 4: post-process — restore let/mut keywords, `?` sugar, and lazy imports.
     let output = postprocess_full(
         &normalised,
         &prep.stripped,
@@ -144,24 +144,24 @@ mod tests {
     }
 
     #[test]
-    fn format_val_declaration() {
-        let src = "val x: int = 1\n";
+    fn format_let_declaration() {
+        let src = "let x: int = 1\n";
         let result = format_source(src, "<test>").unwrap();
         // The val keyword must be present in the output.
         assert!(
-            result.output.contains("val x"),
-            "output should contain 'val x', got: {}",
+            result.output.contains("let x"),
+            "output should contain 'let x', got: {}",
             result.output
         );
     }
 
     #[test]
-    fn format_var_declaration() {
-        let src = "var count: int = 0\n";
+    fn format_mut_declaration() {
+        let src = "mut count: int = 0\n";
         let result = format_source(src, "<test>").unwrap();
         assert!(
-            result.output.contains("var count"),
-            "output should contain 'var count', got: {}",
+            result.output.contains("mut count"),
+            "output should contain 'mut count', got: {}",
             result.output
         );
     }
@@ -176,13 +176,13 @@ mod tests {
 
     #[test]
     fn format_preserves_comments() {
-        let src = "# a comment\nval x: int = 1\n";
+        let src = "# a comment\nlet x: int = 1\n";
         let result = format_source(src, "<test>").unwrap();
         assert!(
             result.output.contains("# a comment"),
             "comments must be preserved"
         );
-        assert!(result.output.contains("val x"));
+        assert!(result.output.contains("let x"));
     }
 
     #[test]
@@ -208,10 +208,10 @@ mod tests {
         // line, matching the pre-refactor behaviour. (The leading-indent-only
         // tab-expansion path could otherwise leave the original whitespace
         // verbatim on whitespace-only lines.)
-        let src = "x: int = 1\n   \nval y: int = 2\n";
+        let src = "x: int = 1\n   \nlet y: int = 2\n";
         let result = format_source(src, "<test>").unwrap();
         assert!(
-            result.output.contains("\n\nval y"),
+            result.output.contains("\n\nlet y"),
             "whitespace-only line must collapse to empty, got: {:?}",
             result.output
         );
@@ -223,12 +223,12 @@ mod tests {
         // Python parser would otherwise refuse. The source is preserved verbatim.
         let src = "\
 def run() -> Result[int, str]:
-    val x = load()?
+    let x = load()?
     return Ok(x)
 ";
         let result = format_source(src, "<test>").unwrap();
         assert!(result.output.contains("load()?"), "got:\n{}", result.output);
-        assert!(result.output.contains("val x"), "got:\n{}", result.output);
+        assert!(result.output.contains("let x"), "got:\n{}", result.output);
     }
 
     #[test]
