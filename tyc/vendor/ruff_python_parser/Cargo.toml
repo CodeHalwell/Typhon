@@ -1,16 +1,28 @@
 [package]
 name = "ruff_python_parser"
-version = "0.0.0-typhon-scaffold"
-edition.workspace = true
+version = "0.0.0-typhon-vendor"
+edition = "2024"
+rust-version = "1.93"
 license.workspace = true
-description = "Vendored copy of ruff_python_parser (SCAFFOLD — empty stub)"
+description = "Vendored copy of ruff_python_parser for Typhon (with val/var token support)"
 publish = false
 
-# Part of the Phase-0-follow-up Ruff vendor effort.  See
-# vendor/README.md for the migration plan.  Empty stub today;
-# real source lands when the migration runs.  The `ruff_python_ast`
-# dependency edge is wired up so swapping in real source touches
-# only this crate, not the workspace topology.
+[lib]
+test = false
+doctest = false
 
 [dependencies]
-ruff_python_ast = { path = "../ruff_python_ast" }
+ruff_python_ast = { workspace = true, features = ["get-size"] }
+ruff_python_trivia = { workspace = true }
+ruff_text_size = { workspace = true, features = ["get-size"] }
+
+bitflags = "2.5.0"
+bstr = "1.9.1"
+compact_str = "0.9.0"
+get-size2 = { version = "0.8.0", features = ["derive", "smallvec", "hashbrown", "compact-str", "ordermap"] }
+memchr = "2.7.1"
+rustc-hash = "2.0.0"
+static_assertions = "1.1.0"
+unicode-ident = "1.0.12"
+unicode-normalization = "0.1.23"
+unicode_names2 = "1.2.2"

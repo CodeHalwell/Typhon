@@ -1,16 +1,42 @@
 [package]
 name = "ruff_python_ast"
-version = "0.0.0-typhon-scaffold"
-edition.workspace = true
+version = "0.0.0-typhon-vendor"
+edition = "2024"
+rust-version = "1.93"
 license.workspace = true
-description = "Vendored copy of ruff_python_ast (SCAFFOLD — empty stub)"
+description = "Vendored copy of ruff_python_ast for Typhon (with val/var mutability extensions)"
 publish = false
 
-# This crate is part of the Phase-0-follow-up Ruff vendor effort.  See
-# vendor/README.md for the migration plan.  It is intentionally empty
-# today: the workspace compiles it, but no consumer crate depends on
-# it yet.  When the migration runs, this stub gets replaced with the
-# real ruff_python_ast source plus the Typhon-specific token additions
-# (val/var) described in docs/roadmap.md.
+[lib]
+test = false
+doctest = false
 
 [dependencies]
+ruff_python_trivia = { workspace = true }
+ruff_source_file = { workspace = true }
+ruff_text_size = { workspace = true }
+
+aho-corasick = "1.1.3"
+bitflags = "2.5.0"
+compact_str = "0.9.0"
+get-size2 = { version = "0.8.0", features = ["derive", "smallvec", "hashbrown", "compact-str", "ordermap"], optional = true }
+is-macro = "0.3.5"
+memchr = "2.7.1"
+rustc-hash = "2.0.0"
+schemars = { version = "1.0.4", optional = true }
+serde = { version = "1.0.197", features = ["derive"], optional = true }
+serde_json = { version = "1.0.113", optional = true }
+thiserror = { workspace = true }
+
+[features]
+default = ["serde", "get-size"]
+schemars = ["dep:schemars", "dep:serde_json"]
+serde = [
+    "dep:serde",
+    "ruff_text_size/serde",
+    "compact_str/serde",
+]
+get-size = ["dep:get-size2", "ruff_text_size/get-size"]
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(feature, values("cache", "salsa"))'] }

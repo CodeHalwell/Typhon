@@ -1,0 +1,29 @@
+[package]
+name = "ruff_text_size"
+version = "0.0.0-typhon-vendor"
+edition = "2024"
+rust-version = "1.93"
+license.workspace = true
+description = "Vendored copy of ruff_text_size for Typhon"
+publish = false
+
+[lib]
+test = false
+
+[dependencies]
+get-size2 = { version = "0.8.0", features = ["derive"], optional = true }
+schemars = { version = "1.0.4", optional = true }
+serde = { version = "1.0.197", features = ["derive"], optional = true }
+
+[dev-dependencies]
+serde_test = "1"
+static_assertions = "1.1.0"
+
+[features]
+serde = ["dep:serde"]
+get-size = ["dep:get-size2"]
+
+[[test]]
+name = "serde"
+path = "tests/serde.rs"
+required-features = ["serde"]

@@ -11,9 +11,11 @@ members = [
     "crates/tyc-analyse",
     "crates/tyc-desugar",
     "crates/tyc-lsp",
-    # Vendored Ruff parser/AST — scaffolding for the Phase 0 follow-up.
-    # The crates compile as empty stubs today; the real source lands when
-    # the migration described in `vendor/README.md` runs.
+    # Vendored Ruff parser/AST — Typhon's in-tree fork.
+    # See `vendor/README.md` for the migration plan.
+    "vendor/ruff_text_size",
+    "vendor/ruff_source_file",
+    "vendor/ruff_python_trivia",
     "vendor/ruff_python_ast",
     "vendor/ruff_python_parser",
 ]
@@ -64,3 +66,10 @@ tyc-types       = { path = "crates/tyc-types" }
 tyc-analyse     = { path = "crates/tyc-analyse" }
 tyc-desugar     = { path = "crates/tyc-desugar" }
 tyc-lsp         = { path = "crates/tyc-lsp" }
+
+# Vendored Ruff fork — see vendor/README.md
+ruff_text_size     = { path = "vendor/ruff_text_size" }
+ruff_source_file   = { path = "vendor/ruff_source_file" }
+ruff_python_trivia = { path = "vendor/ruff_python_trivia" }
+ruff_python_ast    = { path = "vendor/ruff_python_ast" }
+ruff_python_parser = { path = "vendor/ruff_python_parser" }
