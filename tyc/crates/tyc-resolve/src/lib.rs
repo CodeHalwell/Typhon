@@ -1485,6 +1485,7 @@ fn builtin_names() -> std::collections::HashSet<&'static str> {
         // Decorators that may appear without an import in user code.
         "pure",
         "memo",
+        "gatherable",
         "runtime_checkable",
         "functools",
         "dataclass",

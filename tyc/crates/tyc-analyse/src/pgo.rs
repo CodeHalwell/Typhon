@@ -35,31 +35,27 @@ pub fn load_profile_samples(path: &Path) -> HashMap<String, ProfileSample> {
 /// Decide which function names in the current module should be added to
 /// the auto-memoise list based on profile data.
 ///
+/// `module_name` is the dotted Python module name for the file being
+/// emitted (e.g. `main`, `pkg.sub.helpers`). The matcher requires an
+/// exact `<module_name>.<fn>` key in `profile`, so a hot `main.fib`
+/// sample never promotes a coincidentally-named `util.fib` in another
+/// module. Bare-key profiles (no module qualifier) match by leaf as a
+/// fallback for profiles produced by drivers that don't record
+/// `__module__`.
+///
 /// Returns the subset of `candidate_fn_names` whose profile entry shows
-/// at least `min_calls` invocations. Matching is done by suffix on
-/// the profile key — a candidate `fib` matches any profile entry
-/// whose qualname ends with `.fib` or is exactly `fib`, so we don't
-/// need to know the runtime module name at build time. Class methods
-/// (e.g. `module.Cls.method`) are skipped: PGO targets module-level
-/// functions only, matching the existing memoise scope.
+/// at least `min_calls` invocations.
 pub fn pgo_memoise_targets(
     profile: &HashMap<String, ProfileSample>,
+    module_name: &str,
     candidate_fn_names: &[String],
     min_calls: u64,
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for name in candidate_fn_names {
-        // A bare function `foo` is profiled as `<module>.foo`; reject
-        // profile keys that contain a third segment (method on a class)
-        // by requiring exactly one dot before the name.
-        let hit = profile.iter().any(|(key, sample)| {
-            let matches_name = match key.rsplit_once('.') {
-                Some((module, qual)) => qual == name && !module.contains('.'),
-                None => key == name,
-            };
-            matches_name && sample.calls >= min_calls
-        });
-        if hit {
+        let qualified = format!("{}.{}", module_name, name);
+        let sample = profile.get(&qualified).or_else(|| profile.get(name));
+        if sample.is_some_and(|s| s.calls >= min_calls) {
             out.push(name.clone());
         }
     }
@@ -83,28 +79,37 @@ pub fn pgo_memoise_targets(
 /// `total_seconds`. Malformed input yields an empty map — PGO is
 /// best-effort.
 fn parse_profile_json(text: &str) -> HashMap<String, ProfileSample> {
+    // All-or-nothing: build into a local map and only commit on success.
+    // A truncated or otherwise malformed document yields an empty map
+    // rather than a partially-populated one, matching the documented
+    // best-effort behaviour. Without this, a parser error mid-document
+    // would silently promote whatever functions had already been read.
+    parse_profile_json_inner(text).unwrap_or_default()
+}
+
+fn parse_profile_json_inner(text: &str) -> Option<HashMap<String, ProfileSample>> {
     let mut out = HashMap::new();
     let mut cursor = Cursor::new(text);
+    // JSON allows leading whitespace before the root value; tolerate it
+    // so a profile saved with `json.dump(..., indent=2)` that wraps in
+    // newlines still parses.
+    cursor.skip_ws();
     if !cursor.eat_char('{') {
-        return out;
+        return None;
     }
     cursor.skip_ws();
     if cursor.peek() == Some('}') {
-        return out;
+        return Some(out);
     }
     loop {
         cursor.skip_ws();
-        let Some(key) = cursor.read_string() else {
-            return out;
-        };
+        let key = cursor.read_string()?;
         cursor.skip_ws();
         if !cursor.eat_char(':') {
-            return out;
+            return None;
         }
         cursor.skip_ws();
-        let Some(sample) = cursor.read_sample() else {
-            return out;
-        };
+        let sample = cursor.read_sample()?;
         out.insert(key, sample);
         cursor.skip_ws();
         match cursor.peek() {
@@ -112,10 +117,10 @@ fn parse_profile_json(text: &str) -> HashMap<String, ProfileSample> {
                 cursor.next();
             }
             Some('}') => break,
-            _ => return out,
+            _ => return None,
         }
     }
-    out
+    Some(out)
 }
 
 struct Cursor<'a> {
@@ -286,33 +291,50 @@ mod tests {
         assert!(parse_profile_json("{\"a.b\": 5}").is_empty());
     }
 
+    fn sample(calls: u64) -> ProfileSample {
+        ProfileSample {
+            calls,
+            total_seconds: 0.1,
+        }
+    }
+
     #[test]
-    fn pgo_targets_match_by_suffix() {
+    fn pgo_targets_require_module_qualified_match() {
+        // Regression for the Copilot/Codex review on leaf-name false
+        // positives: a hot `main.fib` profile entry must promote `fib`
+        // when emitting `main` but NOT when emitting `util` — those are
+        // different functions despite sharing a leaf name.
         let mut profile = HashMap::new();
-        profile.insert(
-            "main.fib".to_string(),
-            ProfileSample {
-                calls: 1000,
-                total_seconds: 0.1,
-            },
+        profile.insert("main.fib".to_string(), sample(1000));
+        let candidates = vec!["fib".to_string()];
+        assert_eq!(
+            pgo_memoise_targets(&profile, "main", &candidates, 100),
+            vec!["fib"]
         );
-        let candidates = vec!["fib".to_string(), "other".to_string()];
-        let targets = pgo_memoise_targets(&profile, &candidates, 100);
-        assert_eq!(targets, vec!["fib"]);
+        assert!(
+            pgo_memoise_targets(&profile, "util", &candidates, 100).is_empty(),
+            "different module must not match"
+        );
+    }
+
+    #[test]
+    fn pgo_targets_match_in_subpackage() {
+        // Regression for the gemini review on subpackages: dotted module
+        // names like `pkg.sub` must match a profile entry of the same
+        // shape (`pkg.sub.helper`), not be rejected for containing a dot.
+        let mut profile = HashMap::new();
+        profile.insert("pkg.sub.helper".to_string(), sample(1000));
+        let candidates = vec!["helper".to_string()];
+        let targets = pgo_memoise_targets(&profile, "pkg.sub", &candidates, 100);
+        assert_eq!(targets, vec!["helper"], "subpackage match must work");
     }
 
     #[test]
     fn pgo_targets_respect_min_calls_threshold() {
         let mut profile = HashMap::new();
-        profile.insert(
-            "main.cold".to_string(),
-            ProfileSample {
-                calls: 5,
-                total_seconds: 0.1,
-            },
-        );
+        profile.insert("main.cold".to_string(), sample(5));
         let candidates = vec!["cold".to_string()];
-        let targets = pgo_memoise_targets(&profile, &candidates, 100);
+        let targets = pgo_memoise_targets(&profile, "main", &candidates, 100);
         assert!(
             targets.is_empty(),
             "below-threshold fn must not be promoted"
@@ -321,37 +343,47 @@ mod tests {
 
     #[test]
     fn pgo_targets_skip_class_methods() {
-        // A profile entry like `main.Foo.method` carries a second dot
-        // before the leaf name. We only memoise module-level functions,
-        // so the suffix-matcher must reject these.
+        // `main.Foo.method` does not match the constructed `main.method`
+        // key, so the matcher correctly skips it without needing any
+        // class-naming heuristic.
         let mut profile = HashMap::new();
-        profile.insert(
-            "main.Foo.method".to_string(),
-            ProfileSample {
-                calls: 1000,
-                total_seconds: 0.1,
-            },
-        );
+        profile.insert("main.Foo.method".to_string(), sample(1000));
         let candidates = vec!["method".to_string()];
-        let targets = pgo_memoise_targets(&profile, &candidates, 100);
+        let targets = pgo_memoise_targets(&profile, "main", &candidates, 100);
         assert!(targets.is_empty(), "class methods must not match");
     }
 
     #[test]
-    fn pgo_targets_match_bare_key_without_dot() {
-        // Defensive: a profile that recorded the function as bare `fib`
-        // (e.g. produced by a different driver) should still match.
+    fn pgo_targets_match_bare_key_fallback() {
+        // A profile entry written as bare `fib` (no module qualifier)
+        // still matches as a fallback — useful for profiles produced by
+        // drivers that don't record `__module__`.
         let mut profile = HashMap::new();
-        profile.insert(
-            "fib".to_string(),
-            ProfileSample {
-                calls: 1000,
-                total_seconds: 0.1,
-            },
-        );
+        profile.insert("fib".to_string(), sample(1000));
         let candidates = vec!["fib".to_string()];
-        let targets = pgo_memoise_targets(&profile, &candidates, 100);
+        let targets = pgo_memoise_targets(&profile, "main", &candidates, 100);
         assert_eq!(targets, vec!["fib"]);
+    }
+
+    #[test]
+    fn parse_tolerates_leading_whitespace() {
+        // Regression for the gemini review: JSON allows leading
+        // whitespace before the root value. A profile written with
+        // `json.dump(..., indent=2)` plus surrounding newlines must
+        // still parse.
+        let json = "\n  \t{\"main.fib\": {\"calls\": 7, \"total_seconds\": 0.1}}";
+        let m = parse_profile_json(json);
+        assert_eq!(m.get("main.fib").unwrap().calls, 7);
+    }
+
+    #[test]
+    fn parse_malformed_after_valid_entries_yields_empty_map() {
+        // Regression for the Copilot review on partial maps: a profile
+        // that is well-formed for the first row but truncated after must
+        // produce an empty map, not a half-populated one.
+        let json = "{\"main.fib\": {\"calls\": 7, \"total_seconds\": 0.1}, \"main.broken\": ";
+        let m = parse_profile_json(json);
+        assert!(m.is_empty(), "partial parse must collapse to empty map");
     }
 
     #[test]

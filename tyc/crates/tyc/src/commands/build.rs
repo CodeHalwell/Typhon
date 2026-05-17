@@ -13,7 +13,7 @@ use rustpython_ast::{text_size::TextRange, Constant, Expr, ExprConstant, Mod, St
 use rustpython_parser::{parse, Mode};
 
 use tyc_analyse::{
-    analyse_purity, collect_module_async_fn_names, evaluate_comptime, load_profile_samples,
+    analyse_purity, collect_gatherable_async_fn_names, evaluate_comptime, load_profile_samples,
     pgo_memoise_targets, purity_diagnostics, rewrite_auto_gather, ComptimeValue, ProfileSample,
 };
 use tyc_db::{check_file, TycDatabase};
@@ -229,17 +229,22 @@ pub fn run(args: BuildArgs) -> Result<()> {
             .collect();
 
         // Phase 4 PGO: add every pure function whose observed call count
-        // (from the loaded profile) meets the threshold. Names already in
-        // `memoise_targets` are skipped so the desugarer doesn't emit two
-        // cache decorators on the same definition.
+        // (from the loaded profile) meets the threshold. The matcher
+        // requires an exact `<module>.<fn>` profile key for this file's
+        // module so a hot `main.fib` doesn't accidentally promote a
+        // coincidentally-named `util.fib` in another module. Names
+        // already in `memoise_targets` are skipped so the desugarer
+        // doesn't emit two cache decorators on the same definition.
         if !profile_samples.is_empty() {
             let pgo_candidates: Vec<String> = purity_findings
                 .iter()
                 .filter(|f| f.violation.is_none())
                 .map(|f| f.name.clone())
                 .collect();
+            let module_name = python_module_name_from_path(path, &src_dir);
             let promoted = pgo_memoise_targets(
                 &profile_samples,
+                &module_name,
                 &pgo_candidates,
                 config.strictness.pgo_min_calls,
             );
@@ -251,12 +256,16 @@ pub fn run(args: BuildArgs) -> Result<()> {
         }
 
         // Phase 4 auto-gather inference: when `[strictness] auto-gather = true`,
-        // fold runs of independent same-module awaits into `asyncio.TaskGroup`
-        // blocks. The desugar pass downstream notices the qualified
-        // `asyncio.TaskGroup` reference and injects `import asyncio` if it
-        // isn't already in scope, so no extra wiring is needed here.
+        // fold runs of independent awaits whose callees are `@gatherable`
+        // module-level `async def`s into `asyncio.TaskGroup` blocks. The
+        // user opts each callee in by writing the decorator; we never infer
+        // gather-safety since same-module async fns may share I/O ordering
+        // or other invisible state.  The desugar pass downstream notices
+        // the qualified `asyncio.TaskGroup` reference and injects
+        // `import asyncio` if it isn't already in scope, so no extra
+        // wiring is needed here.
         let module = if config.strictness.auto_gather {
-            let eligible = collect_module_async_fn_names(&module);
+            let eligible = collect_gatherable_async_fn_names(&module);
             let (rewritten, _stats) = rewrite_auto_gather(module, &eligible);
             rewritten
         } else {
@@ -387,6 +396,25 @@ pub fn run(args: BuildArgs) -> Result<()> {
 
     println!("built {} file(s) → '{}'", emitted, out_dir.display());
     Ok(())
+}
+
+/// Derive the dotted Python module name that the runtime profiler
+/// would record for a `.ty` source file. `src/main.ty` becomes `main`;
+/// `src/pkg/sub/helpers.ty` becomes `pkg.sub.helpers`. The matcher in
+/// `pgo_memoise_targets` keys profile lookups on this string so the
+/// build doesn't confuse same-named functions in different modules.
+fn python_module_name_from_path(path: &std::path::Path, src_dir: &std::path::Path) -> String {
+    let rel = path.strip_prefix(src_dir).unwrap_or(path);
+    let stem = rel.with_extension("");
+    let mut parts: Vec<String> = Vec::new();
+    for component in stem.components() {
+        if let std::path::Component::Normal(s) = component {
+            if let Some(name) = s.to_str() {
+                parts.push(name.to_owned());
+            }
+        }
+    }
+    parts.join(".")
 }
 
 /// Minimal JSON string escape for paths used in the `.py.map` body.  Only
@@ -1137,14 +1165,47 @@ def cold(n: int) -> int:
         );
     }
 
+    #[test]
+    fn build_auto_gather_requires_gatherable_decorator() {
+        // With auto-gather enabled but no @gatherable decorators on the
+        // callees, the pass must leave the sequential awaits alone.
+        // Regression for the Copilot review on auto-gather eligibility.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = "\
+async def fetch_a() -> int:
+    return 1
+async def fetch_b() -> int:
+    return 2
+
+async def load() -> int:
+    a = await fetch_a()
+    b = await fetch_b()
+    return a + b
+";
+        let (_, out_dir) = scaffold_auto_gather(tmp.path(), src);
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        })
+        .unwrap();
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        assert!(
+            !py.contains("TaskGroup"),
+            "callees without @gatherable must NOT be gathered; got:\n{py}"
+        );
+    }
+
     // ── Phase 4: auto-gather inference end-to-end ───────────────────────────
 
     #[test]
     fn build_auto_gather_flag_off_keeps_sequential_awaits() {
         let tmp = tempfile::tempdir().unwrap();
         let src = "\
+@gatherable
 async def fetch_a() -> int:
     return 1
+@gatherable
 async def fetch_b() -> int:
     return 2
 
@@ -1175,8 +1236,10 @@ async def load() -> int:
     fn build_auto_gather_flag_on_folds_independent_awaits() {
         let tmp = tempfile::tempdir().unwrap();
         let src = "\
+@gatherable
 async def fetch_a() -> int:
     return 1
+@gatherable
 async def fetch_b() -> int:
     return 2
 
@@ -1213,8 +1276,10 @@ async def load() -> int:
         // be folded even with auto-gather enabled.
         let tmp = tempfile::tempdir().unwrap();
         let src = "\
+@gatherable
 async def fetch_a() -> int:
     return 1
+@gatherable
 async def fetch_b(x: int) -> int:
     return x
 

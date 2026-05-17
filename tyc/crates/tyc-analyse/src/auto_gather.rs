@@ -43,14 +43,18 @@ pub struct AutoGatherStats {
 /// Rewrite eligible await-runs into `asyncio.TaskGroup` blocks.
 ///
 /// `eligible_async_fns` is the set of bare-name targets the caller has
-/// proven safe to gather (typically: all module-level `async def`s in
-/// the current file).
+/// proven safe to gather (typically: every `async def` carrying the
+/// `@gatherable` decorator — see [`collect_gatherable_async_fn_names`]).
 pub fn rewrite_auto_gather(
     module: Mod<TextRange>,
     eligible_async_fns: &HashSet<String>,
 ) -> (Mod<TextRange>, AutoGatherStats) {
     let mut stats = AutoGatherStats::default();
-    let mut counter: usize = 0;
+    // Seed the counter past any pre-existing `__typhon_autogather_*` name
+    // referenced in the module so the synthesized names never collide with
+    // user code or a previous rewrite that left identifiers behind. The
+    // scan is O(N) over the AST and only runs once per module.
+    let mut counter: usize = next_safe_counter(&module);
     let module = match module {
         Mod::Module(m) => {
             let body = rewrite_stmts(
@@ -71,6 +75,122 @@ pub fn rewrite_auto_gather(
     (module, stats)
 }
 
+/// Walk `module` and return a counter value that is strictly greater than
+/// any `__typhon_autogather_(tg|task)_N_` numeric suffix already in scope.
+/// Guards the synthesized identifiers in [`make_autogather_block`]
+/// against collisions with user names or earlier rewrites.
+fn next_safe_counter(module: &Mod<TextRange>) -> usize {
+    let mut highest_seen: Option<usize> = None;
+    let Mod::Module(m) = module else {
+        return 0;
+    };
+    scan_stmts_for_existing_counter(&m.body, &mut highest_seen);
+    highest_seen.map(|n| n + 1).unwrap_or(0)
+}
+
+fn scan_stmts_for_existing_counter(stmts: &[Stmt<TextRange>], highest: &mut Option<usize>) {
+    for stmt in stmts {
+        scan_stmt_for_existing_counter(stmt, highest);
+    }
+}
+
+fn scan_stmt_for_existing_counter(stmt: &Stmt<TextRange>, highest: &mut Option<usize>) {
+    use Stmt::*;
+    match stmt {
+        FunctionDef(f) => scan_stmts_for_existing_counter(&f.body, highest),
+        AsyncFunctionDef(f) => scan_stmts_for_existing_counter(&f.body, highest),
+        ClassDef(c) => scan_stmts_for_existing_counter(&c.body, highest),
+        If(s) => {
+            scan_stmts_for_existing_counter(&s.body, highest);
+            scan_stmts_for_existing_counter(&s.orelse, highest);
+        }
+        While(s) => {
+            scan_stmts_for_existing_counter(&s.body, highest);
+            scan_stmts_for_existing_counter(&s.orelse, highest);
+        }
+        For(s) => {
+            scan_stmts_for_existing_counter(&s.body, highest);
+            scan_stmts_for_existing_counter(&s.orelse, highest);
+        }
+        AsyncFor(s) => {
+            scan_stmts_for_existing_counter(&s.body, highest);
+            scan_stmts_for_existing_counter(&s.orelse, highest);
+        }
+        With(s) => scan_stmts_for_existing_counter(&s.body, highest),
+        AsyncWith(s) => scan_stmts_for_existing_counter(&s.body, highest),
+        Try(s) => {
+            scan_stmts_for_existing_counter(&s.body, highest);
+            scan_stmts_for_existing_counter(&s.orelse, highest);
+            scan_stmts_for_existing_counter(&s.finalbody, highest);
+            for h in &s.handlers {
+                let rustpython_ast::ExceptHandler::ExceptHandler(h) = h;
+                scan_stmts_for_existing_counter(&h.body, highest);
+            }
+        }
+        TryStar(s) => {
+            scan_stmts_for_existing_counter(&s.body, highest);
+            scan_stmts_for_existing_counter(&s.orelse, highest);
+            scan_stmts_for_existing_counter(&s.finalbody, highest);
+            for h in &s.handlers {
+                let rustpython_ast::ExceptHandler::ExceptHandler(h) = h;
+                scan_stmts_for_existing_counter(&h.body, highest);
+            }
+        }
+        Match(s) => {
+            for case in &s.cases {
+                scan_stmts_for_existing_counter(&case.body, highest);
+            }
+        }
+        Assign(a) => {
+            for t in &a.targets {
+                scan_expr_for_existing_counter(t, highest);
+            }
+            scan_expr_for_existing_counter(&a.value, highest);
+        }
+        AnnAssign(a) => {
+            scan_expr_for_existing_counter(&a.target, highest);
+            if let Some(v) = &a.value {
+                scan_expr_for_existing_counter(v, highest);
+            }
+        }
+        Expr(e) => scan_expr_for_existing_counter(&e.value, highest),
+        _ => {}
+    }
+}
+
+fn scan_expr_for_existing_counter(expr: &Expr<TextRange>, highest: &mut Option<usize>) {
+    if let Expr::Name(n) = expr {
+        if let Some(num) = parse_autogather_suffix(n.id.as_str()) {
+            *highest = Some(highest.map_or(num, |h| h.max(num)));
+        }
+    }
+    // We don't recurse into every expression kind: the only place the
+    // generated names appear in source-form is as bare `Name` references
+    // (assignment targets and assignment RHS). Catching them at those
+    // sites is sufficient because the rewrite only ever produces those
+    // forms.
+}
+
+/// Parse the trailing integer in a `__typhon_autogather_tg_<N>__` or
+/// `__typhon_autogather_task_<N>_<i>__` identifier. Returns the `<N>` so
+/// the seeder can step past it. Anything that doesn't match returns
+/// `None`.
+fn parse_autogather_suffix(name: &str) -> Option<usize> {
+    const TG_PREFIX: &str = "__typhon_autogather_tg_";
+    const TASK_PREFIX: &str = "__typhon_autogather_task_";
+    let body = if let Some(rest) = name.strip_prefix(TG_PREFIX) {
+        rest.strip_suffix("__")?.to_string()
+    } else if let Some(rest) = name.strip_prefix(TASK_PREFIX) {
+        // Strip the `_<i>__` task-index suffix.
+        let no_trailing = rest.strip_suffix("__")?;
+        let (head, _) = no_trailing.rsplit_once('_')?;
+        head.to_string()
+    } else {
+        return None;
+    };
+    body.parse().ok()
+}
+
 // ── walker ───────────────────────────────────────────────────────────────────
 
 fn rewrite_stmts(
@@ -89,8 +209,12 @@ fn rewrite_stmts(
         if inside_async {
             let run = collect_run(&body, i, eligible);
             if run.len() >= 2 {
-                let block = make_autogather_block(&run, counter);
-                out.push(block);
+                // Emit the synthesized async-with + result-extracts directly
+                // into the enclosing block; no `if True:` wrapper so the
+                // emitted Python stays at the same indent as the awaits it
+                // replaces.
+                let synthesized = make_autogather_block(&run, counter);
+                out.extend(synthesized);
                 stats.rewrites += 1;
                 stats.awaits_folded += run.len();
                 i += run.len();
@@ -301,6 +425,11 @@ fn expr_uses_any(expr: &Expr<TextRange>, bound: &HashSet<String>) -> bool {
         }
         Expr::Attribute(a) => expr_uses_any(&a.value, bound),
         Expr::Subscript(s) => expr_uses_any(&s.value, bound) || expr_uses_any(&s.slice, bound),
+        Expr::Slice(s) => {
+            s.lower.as_deref().is_some_and(|e| expr_uses_any(e, bound))
+                || s.upper.as_deref().is_some_and(|e| expr_uses_any(e, bound))
+                || s.step.as_deref().is_some_and(|e| expr_uses_any(e, bound))
+        }
         Expr::BinOp(b) => expr_uses_any(&b.left, bound) || expr_uses_any(&b.right, bound),
         Expr::UnaryOp(u) => expr_uses_any(&u.operand, bound),
         Expr::BoolOp(b) => b.values.iter().any(|e| expr_uses_any(e, bound)),
@@ -324,15 +453,56 @@ fn expr_uses_any(expr: &Expr<TextRange>, bound: &HashSet<String>) -> bool {
         Expr::Await(a) => expr_uses_any(&a.value, bound),
         Expr::FormattedValue(f) => expr_uses_any(&f.value, bound),
         Expr::JoinedStr(j) => j.values.iter().any(|e| expr_uses_any(e, bound)),
-        // Generators, comprehensions: skip; they introduce their own scopes.
+        // Walrus `:=` reads its RHS and writes its target; both can reference
+        // earlier-bound names (`b = await fb((x := a + 1) + x)` reads `a`).
+        Expr::NamedExpr(n) => expr_uses_any(&n.value, bound) || expr_uses_any(&n.target, bound),
+        // Comprehensions and generators introduce their own scope, but the
+        // first generator's `iter` is evaluated in the *enclosing* scope and
+        // any later `iter`/`ifs`/`elt`/`key`/`value` can reference outer
+        // names too. We walk every sub-expression conservatively: shadowing
+        // by a comprehension's own target only ever produces a false
+        // positive (we'd refuse to gather a run we could safely gather),
+        // never a false negative, which is the safe direction.
+        Expr::ListComp(c) => {
+            expr_uses_any(&c.elt, bound) || comp_generators_use_any(&c.generators, bound)
+        }
+        Expr::SetComp(c) => {
+            expr_uses_any(&c.elt, bound) || comp_generators_use_any(&c.generators, bound)
+        }
+        Expr::GeneratorExp(g) => {
+            expr_uses_any(&g.elt, bound) || comp_generators_use_any(&g.generators, bound)
+        }
+        Expr::DictComp(c) => {
+            expr_uses_any(&c.key, bound)
+                || expr_uses_any(&c.value, bound)
+                || comp_generators_use_any(&c.generators, bound)
+        }
+        Expr::Yield(y) => y.value.as_deref().is_some_and(|e| expr_uses_any(e, bound)),
+        Expr::YieldFrom(y) => expr_uses_any(&y.value, bound),
         // Constants, ellipsis: never reference bound names.
         _ => false,
     }
 }
 
+fn comp_generators_use_any(
+    generators: &[rustpython_ast::Comprehension<TextRange>],
+    bound: &HashSet<String>,
+) -> bool {
+    generators.iter().any(|g| {
+        expr_uses_any(&g.iter, bound)
+            || expr_uses_any(&g.target, bound)
+            || g.ifs.iter().any(|e| expr_uses_any(e, bound))
+    })
+}
+
 // ── synthesis ────────────────────────────────────────────────────────────────
 
-fn make_autogather_block(run: &[Candidate], counter: &mut usize) -> Stmt<TextRange> {
+/// Synthesize the statement sequence that replaces a candidate gather run.
+/// Returns the `async with asyncio.TaskGroup() as tg: ...` block followed
+/// by one `name = task.result()` extraction per candidate. The caller
+/// extends its enclosing block with the result so we don't need a wrapper
+/// statement (no `if True:` no-op block).
+fn make_autogather_block(run: &[Candidate], counter: &mut usize) -> Vec<Stmt<TextRange>> {
     let id = *counter;
     *counter += 1;
 
@@ -346,7 +516,6 @@ fn make_autogather_block(run: &[Candidate], counter: &mut usize) -> Stmt<TextRan
         block_body.push(make_create_task_assign(&tg_name, &task_name(i), c));
     }
 
-    // The async-with statement itself.
     let async_with = Stmt::AsyncWith(StmtAsyncWith {
         range: TextRange::default(),
         items: vec![WithItem {
@@ -358,21 +527,12 @@ fn make_autogather_block(run: &[Candidate], counter: &mut usize) -> Stmt<TextRan
         type_comment: None,
     });
 
-    // Result-extraction assignments AFTER the async-with block. To return them
-    // as a single Stmt we wrap the whole sequence in an `if True:` block — the
-    // emitter prints these as a flat block at the same indent as the surrounding
-    // body, which is the same trick `unsafe:` uses elsewhere in the pipeline.
-    let mut grouped: Vec<Stmt<TextRange>> = Vec::with_capacity(1 + run.len());
-    grouped.push(async_with);
+    let mut out: Vec<Stmt<TextRange>> = Vec::with_capacity(1 + run.len());
+    out.push(async_with);
     for (i, c) in run.iter().enumerate() {
-        grouped.push(make_result_extract(&c.bind, &task_name(i)));
+        out.push(make_result_extract(&c.bind, &task_name(i)));
     }
-    Stmt::If(rustpython_ast::StmtIf {
-        range: TextRange::default(),
-        test: Box::new(true_const()),
-        body: grouped,
-        orelse: vec![],
-    })
+    out
 }
 
 fn name_load(name: &str) -> Expr<TextRange> {
@@ -388,14 +548,6 @@ fn name_store(name: &str) -> Expr<TextRange> {
         range: TextRange::default(),
         id: Identifier::new(name),
         ctx: ExprContext::Store,
-    })
-}
-
-fn true_const() -> Expr<TextRange> {
-    Expr::Constant(rustpython_ast::ExprConstant {
-        range: TextRange::default(),
-        value: rustpython_ast::Constant::Bool(true),
-        kind: None,
     })
 }
 
@@ -464,19 +616,41 @@ fn make_result_extract(bind: &str, task: &str) -> Stmt<TextRange> {
 
 // ── module-level fn collection ──────────────────────────────────────────────
 
-/// Convenience: collect the names of every top-level `async def` in `module`.
-/// The build pipeline uses this as the default `eligible_async_fns` set when
-/// `auto_gather = true`.
-pub fn collect_module_async_fn_names(module: &Mod<TextRange>) -> HashSet<String> {
+/// Collect the names of every top-level `async def` in `module` carrying
+/// the `@gatherable` decorator. The build pipeline uses this as the
+/// `eligible_async_fns` set when `[strictness] auto-gather = true`.
+///
+/// Requiring an explicit decorator (rather than treating every async
+/// function in the module as gather-safe) is the safety boundary: an
+/// async function that looks independent by return-value data flow can
+/// still rely on ordering through I/O, shared state, locks, or rate
+/// limits. The user attests "this function is safe to run concurrently
+/// with peers in a gather block" by writing `@gatherable`; we never
+/// infer it.
+pub fn collect_gatherable_async_fn_names(module: &Mod<TextRange>) -> HashSet<String> {
     let mut out = HashSet::new();
     if let Mod::Module(m) = module {
         for stmt in &m.body {
             if let Stmt::AsyncFunctionDef(f) = stmt {
-                out.insert(f.name.as_str().to_owned());
+                if has_gatherable_decorator(&f.decorator_list) {
+                    out.insert(f.name.as_str().to_owned());
+                }
             }
         }
     }
     out
+}
+
+fn has_gatherable_decorator(decorators: &[Expr<TextRange>]) -> bool {
+    decorators.iter().any(|d| match d {
+        Expr::Name(n) => n.id.as_str() == "gatherable",
+        // `@gatherable(...)` — accept call-form too so future options
+        // can ride on the same decorator without breaking existing code.
+        Expr::Call(c) => {
+            matches!(&*c.func, Expr::Name(n) if n.id.as_str() == "gatherable")
+        }
+        _ => false,
+    })
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -496,7 +670,7 @@ mod tests {
 
     fn rewrite(src: &str) -> (String, AutoGatherStats) {
         let module = parse_module(src);
-        let eligible = collect_module_async_fn_names(&module);
+        let eligible = collect_gatherable_async_fn_names(&module);
         let (rewritten, stats) = rewrite_auto_gather(module, &eligible);
         (render(&rewritten), stats)
     }
@@ -504,9 +678,11 @@ mod tests {
     #[test]
     fn two_independent_awaits_are_folded() {
         let src = "\
+@gatherable
 async def fetch_a() -> int:
     return 1
 
+@gatherable
 async def fetch_b() -> int:
     return 2
 
@@ -540,9 +716,11 @@ async def load() -> int:
     fn dependent_await_breaks_run() {
         // `b` depends on `a`, so they cannot run concurrently.
         let src = "\
+@gatherable
 async def fetch_a() -> int:
     return 1
 
+@gatherable
 async def fetch_b(x: int) -> int:
     return x
 
@@ -560,8 +738,74 @@ async def load() -> int:
     }
 
     #[test]
+    fn comprehension_dependency_breaks_run() {
+        // Regression for the gemini/Codex review: a comprehension that
+        // closes over the first await's bound name `a` must NOT be
+        // treated as independent. Without recursion into the
+        // comprehension's `elt`/`iter`/`ifs`, the pass would happily
+        // gather these and the rewritten code would `NameError` on `a`.
+        let src = "\
+@gatherable
+async def fa() -> int:
+    return 1
+
+@gatherable
+async def fb(xs: list[int]) -> int:
+    return sum(xs)
+
+async def load() -> int:
+    a = await fa()
+    b = await fb([a for _ in range(3)])
+    return a + b
+";
+        let (_out, stats) = rewrite(src);
+        assert_eq!(stats.rewrites, 0, "comprehension closure must break run");
+    }
+
+    #[test]
+    fn walrus_dependency_breaks_run() {
+        let src = "\
+@gatherable
+async def fa() -> int:
+    return 1
+
+@gatherable
+async def fb(x: int) -> int:
+    return x
+
+async def load() -> int:
+    a = await fa()
+    b = await fb((y := a + 1))
+    return a + b + y
+";
+        let (_out, stats) = rewrite(src);
+        assert_eq!(stats.rewrites, 0, "walrus reading `a` must break run");
+    }
+
+    #[test]
+    fn slice_dependency_breaks_run() {
+        let src = "\
+@gatherable
+async def fa() -> int:
+    return 1
+
+@gatherable
+async def fb(xs: list[int]) -> int:
+    return 0
+
+async def load() -> int:
+    a = await fa()
+    b = await fb([1, 2, 3][a:])
+    return a + b
+";
+        let (_out, stats) = rewrite(src);
+        assert_eq!(stats.rewrites, 0, "slice using `a` must break run");
+    }
+
+    #[test]
     fn single_await_not_rewritten() {
         let src = "\
+@gatherable
 async def fetch_a() -> int:
     return 1
 
@@ -579,9 +823,11 @@ async def load() -> int:
         // The walker only attempts to gather inside async scope; since
         // this is parsed as a single sync function, no rewrite happens.
         let src = "\
+@gatherable
 async def fetch_a() -> int:
     return 1
 
+@gatherable
 async def fetch_b() -> int:
     return 2
 
@@ -596,9 +842,10 @@ def load():
 
     #[test]
     fn callee_not_in_eligible_set_breaks_run() {
-        // `external_fetch` isn't in the module's async fn set, so the
+        // `external_fetch` isn't in the module's @gatherable set, so the
         // walker treats it as opaque and doesn't gather.
         let src = "\
+@gatherable
 async def fetch_a() -> int:
     return 1
 
@@ -612,12 +859,39 @@ async def load() -> int:
     }
 
     #[test]
-    fn three_independent_awaits_fold_together() {
+    fn undecorated_callee_is_ineligible() {
+        // `fb` has no @gatherable decorator — auto-gather must skip it
+        // even though it is an async def in the same module.
         let src = "\
+@gatherable
 async def fa() -> int:
     return 1
+
 async def fb() -> int:
     return 2
+
+async def load() -> int:
+    a = await fa()
+    b = await fb()
+    return a + b
+";
+        let (_out, stats) = rewrite(src);
+        assert_eq!(
+            stats.rewrites, 0,
+            "undecorated callee must NOT be folded even when others are"
+        );
+    }
+
+    #[test]
+    fn three_independent_awaits_fold_together() {
+        let src = "\
+@gatherable
+async def fa() -> int:
+    return 1
+@gatherable
+async def fb() -> int:
+    return 2
+@gatherable
 async def fc() -> int:
     return 3
 
@@ -639,8 +913,10 @@ async def load() -> int:
     #[test]
     fn impure_statement_between_awaits_breaks_run() {
         let src = "\
+@gatherable
 async def fa() -> int:
     return 1
+@gatherable
 async def fb() -> int:
     return 2
 
@@ -659,8 +935,10 @@ async def load() -> int:
         // The inner `async def inner` switches the walker back into async
         // scope, so its body is eligible for gathering.
         let src = "\
+@gatherable
 async def fa() -> int:
     return 1
+@gatherable
 async def fb() -> int:
     return 2
 
@@ -676,9 +954,10 @@ def outer():
     }
 
     #[test]
-    fn collect_module_async_fn_names_finds_top_level_async_defs() {
+    fn collect_gatherable_finds_only_decorated_async_defs() {
         let module = parse_module(
             "\
+@gatherable
 async def alpha() -> int:
     return 1
 
@@ -687,20 +966,27 @@ def beta() -> int:
 
 async def gamma() -> int:
     return 3
+
+@gatherable
+async def delta() -> int:
+    return 4
 ",
         );
-        let names = collect_module_async_fn_names(&module);
-        assert!(names.contains("alpha"));
-        assert!(!names.contains("beta"));
-        assert!(names.contains("gamma"));
+        let names = collect_gatherable_async_fn_names(&module);
+        assert!(names.contains("alpha"), "alpha has @gatherable");
+        assert!(!names.contains("beta"), "beta is sync");
+        assert!(!names.contains("gamma"), "gamma lacks @gatherable");
+        assert!(names.contains("delta"));
         assert_eq!(names.len(), 2);
     }
 
     #[test]
     fn keyword_arg_dependency_breaks_run() {
         let src = "\
+@gatherable
 async def fa() -> int:
     return 1
+@gatherable
 async def fb(*, x: int) -> int:
     return x
 
@@ -716,12 +1002,16 @@ async def load() -> int:
     #[test]
     fn two_runs_in_one_function_each_get_rewritten() {
         let src = "\
+@gatherable
 async def fa() -> int:
     return 1
+@gatherable
 async def fb() -> int:
     return 2
+@gatherable
 async def fc() -> int:
     return 3
+@gatherable
 async def fd() -> int:
     return 4
 
@@ -739,5 +1029,63 @@ async def load() -> int:
             "two independent runs, two rewrites; got {stats:?}"
         );
         assert_eq!(stats.awaits_folded, 4);
+    }
+
+    #[test]
+    fn rewrite_emits_flat_block_not_if_true_wrapper() {
+        // Regression for the Copilot review: the synthesized rewrite
+        // must inline the async-with + result-extracts directly into
+        // the enclosing body without an `if True:` no-op block.
+        let src = "\
+@gatherable
+async def fa() -> int:
+    return 1
+@gatherable
+async def fb() -> int:
+    return 2
+
+async def load() -> int:
+    a = await fa()
+    b = await fb()
+    return a + b
+";
+        let (out, _) = rewrite(src);
+        assert!(
+            !out.contains("if True:"),
+            "must not emit `if True:` wrapper; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn synthesized_names_avoid_existing_collisions() {
+        // Regression for the Copilot review: a user binding named
+        // `__typhon_autogather_tg_0__` must not collide with the
+        // pass's synthesized names. The seeder scans the module and
+        // bumps the counter past the highest existing suffix.
+        let src = "\
+@gatherable
+async def fa() -> int:
+    return 1
+@gatherable
+async def fb() -> int:
+    return 2
+
+__typhon_autogather_tg_0__ = 99
+
+async def load() -> int:
+    a = await fa()
+    b = await fb()
+    return a + b
+";
+        let (out, _) = rewrite(src);
+        // Counter starts at 1 (past the user's `_0_`).
+        assert!(
+            out.contains("__typhon_autogather_tg_1__"),
+            "expected synthesized name with suffix 1+; got:\n{out}"
+        );
+        assert!(
+            !out.contains("__typhon_autogather_tg_0__ = asyncio.TaskGroup"),
+            "must not overwrite the user binding; got:\n{out}"
+        );
     }
 }

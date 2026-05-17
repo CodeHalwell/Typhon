@@ -478,8 +478,14 @@ pub fn compute_completion_items(
 /// Build the list of code actions for `diagnostics` against `text`.
 /// Pure of LSP plumbing so it can be unit-tested.
 ///
-/// v1 surfaces a single action: any `tyc::unused_import` diagnostic gets
-/// a "Remove unused import" quick-fix that deletes the offending line.
+/// v1 surfaces a single action: a `tyc::unused_import` diagnostic gets
+/// a "Remove unused import" quick-fix that deletes the offending line,
+/// but **only when the line is a single, simple import statement**.
+/// Lines that mix multiple imports (`import os, sys`), chain statements
+/// with `;`, or otherwise carry content beyond the import are skipped:
+/// deleting the whole line would lose the still-used parts.  A
+/// follow-up can offer a surgical edit that removes just the dead
+/// alias for the comma case.
 pub fn compute_code_actions(
     uri: &Uri,
     text: &str,
@@ -490,7 +496,14 @@ pub fn compute_code_actions(
         if !diagnostic_code_matches(diag, "tyc::unused_import") {
             continue;
         }
-        let line_range = whole_line_range(text, diag.range.start.line);
+        let line = diag.range.start.line;
+        let line_text = nth_line_content(text, line);
+        if !is_safe_single_import_line(line_text) {
+            // Bail rather than emit an unsafe edit. The diagnostic still
+            // surfaces in the editor; the user fixes by hand for now.
+            continue;
+        }
+        let line_range = whole_line_range(text, line);
         let edit = TextEdit {
             range: line_range,
             new_text: String::new(),
@@ -513,6 +526,67 @@ pub fn compute_code_actions(
         }));
     }
     actions
+}
+
+/// Extract the text content of `text`'s line `line` (0-indexed),
+/// without the trailing newline. Returns `""` if the line is out of
+/// range.
+fn nth_line_content(text: &str, line: u32) -> &str {
+    let mut current: u32 = 0;
+    let mut start: usize = 0;
+    let bytes = text.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        if current == line {
+            // Find end of this line.
+            let end = bytes[i..]
+                .iter()
+                .position(|c| *c == b'\n')
+                .map(|p| i + p)
+                .unwrap_or(bytes.len());
+            return &text[start..end];
+        }
+        if *b == b'\n' {
+            current += 1;
+            start = i + 1;
+        }
+    }
+    if current == line {
+        return &text[start..];
+    }
+    ""
+}
+
+/// True when `line` is exactly one simple import statement: `import X`,
+/// `import X as Y`, or `from M import N` / `from M import N as A` with
+/// no commas (which would indicate multiple imports), no semicolons
+/// (which would chain a second statement), and no inline `#` comment
+/// containing meaningful directives. The leading and trailing
+/// whitespace is allowed; a trailing `#` line-comment is also tolerated
+/// because dropping it with the import is harmless.
+fn is_safe_single_import_line(line: &str) -> bool {
+    // Strip a trailing line-comment first; we ignore it for the safety
+    // check because it's documentation for the import that's about to
+    // disappear anyway. Be careful not to split inside a string literal —
+    // imports never contain string literals so a simple `#` search
+    // suffices.
+    let core = match line.split_once('#') {
+        Some((before, _)) => before,
+        None => line,
+    };
+    let trimmed = core.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.contains(';') {
+        return false;
+    }
+    // `import a, b` and `from m import a, b` both signal multiple imports
+    // and make the whole-line edit unsafe — only the unused name should
+    // be removed in those cases, which the v1 quick-fix doesn't support.
+    if trimmed.contains(',') {
+        return false;
+    }
+    trimmed.starts_with("import ") || trimmed.starts_with("from ")
 }
 
 /// Convert a resolved binding to an LSP completion item.  The item kind
@@ -994,6 +1068,72 @@ def greet():
         assert_eq!(edits[0].range.start.character, 0);
         assert_eq!(edits[0].range.end.line, 1);
         assert_eq!(edits[0].range.end.character, 0);
+    }
+
+    #[test]
+    fn code_action_skips_multi_import_line() {
+        // Regression for the Copilot/gemini review: `import os, sys`
+        // with only `os` flagged must NOT produce a whole-line delete
+        // — that would also drop the still-used `sys` import.
+        let u = uri("file:///tmp/foo.ty");
+        let text = "import os, sys\nval x: int = 1\n";
+        let diag = unused_import_diag(0, 7, 2);
+        let actions = compute_code_actions(&u, text, &[diag]);
+        assert!(
+            actions.is_empty(),
+            "multi-import line must NOT produce a whole-line quick-fix"
+        );
+    }
+
+    #[test]
+    fn code_action_skips_chained_statement_line() {
+        // Regression for the gemini review: a line that chains a second
+        // statement via `;` would have its second statement deleted
+        // along with the import. Skip the quick-fix to stay safe.
+        let u = uri("file:///tmp/foo.ty");
+        let text = "import os; x = 1\n";
+        let diag = unused_import_diag(0, 7, 2);
+        let actions = compute_code_actions(&u, text, &[diag]);
+        assert!(
+            actions.is_empty(),
+            "chained-statement line must NOT produce a whole-line quick-fix"
+        );
+    }
+
+    #[test]
+    fn code_action_offers_fix_for_simple_import_with_comment() {
+        // Trailing `# comment` on the import line is OK to drop along
+        // with the import — the comment was documenting the now-gone
+        // import.
+        let u = uri("file:///tmp/foo.ty");
+        let text = "import os  # legacy\nval x: int = 1\n";
+        let diag = unused_import_diag(0, 7, 2);
+        let actions = compute_code_actions(&u, text, &[diag]);
+        assert_eq!(actions.len(), 1, "simple import + comment should fix");
+    }
+
+    #[test]
+    fn is_safe_single_import_line_classifications() {
+        assert!(is_safe_single_import_line("import os"));
+        assert!(is_safe_single_import_line("import os as o"));
+        assert!(is_safe_single_import_line("from m import x"));
+        assert!(is_safe_single_import_line("from m import x as y"));
+        assert!(is_safe_single_import_line("  import os  "));
+        assert!(is_safe_single_import_line("import os  # legacy"));
+        // Unsafe shapes:
+        assert!(!is_safe_single_import_line("import os, sys"));
+        assert!(!is_safe_single_import_line("from m import x, y"));
+        assert!(!is_safe_single_import_line("import os; x = 1"));
+        assert!(!is_safe_single_import_line(""));
+        assert!(!is_safe_single_import_line("x = 1"));
+    }
+
+    #[test]
+    fn nth_line_content_handles_last_line_no_newline() {
+        let text = "first\nsecond";
+        assert_eq!(nth_line_content(text, 0), "first");
+        assert_eq!(nth_line_content(text, 1), "second");
+        assert_eq!(nth_line_content(text, 5), "");
     }
 
     #[test]

@@ -41,7 +41,7 @@ use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_syntax::preprocess::ComptimeBinding;
 
 pub mod auto_gather;
-pub use auto_gather::{collect_module_async_fn_names, rewrite_auto_gather, AutoGatherStats};
+pub use auto_gather::{collect_gatherable_async_fn_names, rewrite_auto_gather, AutoGatherStats};
 
 pub mod pgo;
 pub use pgo::{load_profile_samples, pgo_memoise_targets, ProfileSample};
