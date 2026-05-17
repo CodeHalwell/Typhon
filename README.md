@@ -56,18 +56,27 @@ cargo build --release
 | `tyc trace` | Map a Python traceback back to Typhon source via `.py.map` files (v1: filename rewrite, line offsets are 1:1) |
 | `tyc profile` | Build then instrument every top-level function with call-count + wall-clock sampling; writes `typhon-profile.json` on interpreter exit |
 | `tyc migrate` | Convert typed Python (`.py`) into Typhon (`.ty`): `Optional[T]`/`T \| None` → `T?`, module-level annotated assigns gain `val`/`var`, `@dataclass` decorators and `from dataclasses import dataclass` are dropped |
+| `tyc ty`      | Build the project and run Astral's `ty` checker against the emitted Python. Requires `ty` to be installed separately (`pip install ty`). |
 
 See [docs/cli.md](docs/cli.md) for the full reference.
 
 ## Project status
 
-**Phase 0 — Foundation** substantially complete (Ruff parser fork deferred — currently using `rustpython-parser` 0.4 as the fallback):
+**Phase 0 — Foundation** substantially complete:
 
 - ✅ Cargo workspace skeleton with `crates/` directories
 - ✅ `val`/`var` keyword tokens (immutable and mutable bindings)
 - ✅ `tyc fmt` — parses and validates `.ty` source, normalises whitespace
 - ✅ `tyc check` — validates syntax and emits miette diagnostics
 - ✅ `tyc init` — scaffolds new projects with `typhon.toml`
+- ✅ Ruff parser fork vendored under `tyc/vendor/` with first-class
+  `val`/`var` soft-keyword support and a `Mutability` field on assignment
+  AST nodes. Available today as `tyc_syntax::ruff::parse_module`. Consumer
+  crates are still being migrated off `rustpython-parser` — see
+  [`tyc/vendor/README.md`](tyc/vendor/README.md) for the remaining steps.
+- ✅ `tyc ty` — optional integration that builds the project and runs
+  Astral's [`ty`](https://github.com/astral-sh/ty) type checker against
+  the emitted Python for a second opinion.
 
 **Phase 1 — Core types** complete:
 
@@ -148,7 +157,12 @@ tyc/
 │   ├── tyc-diagnostics/        miette-based diagnostics
 │   ├── tyc-lsp/                LSP backend (Phase 2+)
 │   └── tyc/                    CLI binary
-└── vendor/                     Vendored crates (ruff fork, Phase 1)
+└── vendor/                     Vendored crates — Typhon's fork of Ruff
+    ├── ruff_text_size/         TextSize/TextRange newtypes
+    ├── ruff_source_file/       Line-index over a source string
+    ├── ruff_python_trivia/     Whitespace + comment helpers
+    ├── ruff_python_ast/        Python AST + Typhon's Mutability extension
+    └── ruff_python_parser/     Lexer + parser with val/var soft keywords
 ```
 
 See [docs/architecture.md](docs/architecture.md) for the pipeline and crate-by-crate breakdown.
