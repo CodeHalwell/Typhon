@@ -14,35 +14,27 @@
 //! consume directly. The `.dty` source remains the authoritative document for
 //! Typhon-internal use; `.pyi` is for the outside world.
 
-use rustpython_ast::{
-    text_size::TextRange, Constant, Expr, ExprConstant, Mod, ModModule, Stmt, StmtExpr,
+use ruff_python_ast::{
+    AtomicNodeIndex, Expr, ExprEllipsisLiteral, ModModule, Stmt, StmtExpr,
 };
+use ruff_text_size::TextRange;
 
 use crate::printer::Emitter;
 
 /// Emit `module` as a `.pyi` stub. Returns the rendered stub text.
-pub fn emit_stub(module: &Mod<TextRange>) -> String {
-    match module {
-        Mod::Module(m) => {
-            let stub_body = strip_to_stubs(&m.body);
-            let stub_mod = Mod::Module(ModModule {
-                range: m.range,
-                body: stub_body,
-                type_ignores: m.type_ignores.clone(),
-            });
-            let mut emitter = Emitter::new();
-            emitter.emit_mod(&stub_mod);
-            emitter.finish()
-        }
-        other => {
-            let mut emitter = Emitter::new();
-            emitter.emit_mod(other);
-            emitter.finish()
-        }
-    }
+pub fn emit_stub(module: &ModModule) -> String {
+    let stub_body = strip_to_stubs(&module.body);
+    let stub_mod = ModModule {
+        range: module.range,
+        node_index: AtomicNodeIndex::NONE,
+        body: stub_body,
+    };
+    let mut emitter = Emitter::new();
+    emitter.emit_mod(&stub_mod);
+    emitter.finish()
 }
 
-fn strip_to_stubs(body: &[Stmt<TextRange>]) -> Vec<Stmt<TextRange>> {
+fn strip_to_stubs(body: &[Stmt]) -> Vec<Stmt> {
     let mut out = Vec::with_capacity(body.len());
     for stmt in body {
         if let Some(stripped) = stub_stmt(stmt) {
@@ -52,21 +44,18 @@ fn strip_to_stubs(body: &[Stmt<TextRange>]) -> Vec<Stmt<TextRange>> {
     out
 }
 
-fn stub_stmt(stmt: &Stmt<TextRange>) -> Option<Stmt<TextRange>> {
+fn stub_stmt(stmt: &Stmt) -> Option<Stmt> {
     match stmt {
         // Pass-through statements that carry public-API information.
         Stmt::Import(_) | Stmt::ImportFrom(_) | Stmt::AnnAssign(_) | Stmt::TypeAlias(_) => {
             Some(stmt.clone())
         }
+        // `StmtFunctionDef` now covers both sync and async functions via
+        // `is_async`; the body-rewrite is identical in both cases.
         Stmt::FunctionDef(f) => {
             let mut new_f = f.clone();
             new_f.body = vec![ellipsis_stmt(f.range)];
             Some(Stmt::FunctionDef(new_f))
-        }
-        Stmt::AsyncFunctionDef(f) => {
-            let mut new_f = f.clone();
-            new_f.body = vec![ellipsis_stmt(f.range)];
-            Some(Stmt::AsyncFunctionDef(new_f))
         }
         Stmt::ClassDef(c) => {
             let mut new_c = c.clone();
@@ -88,13 +77,13 @@ fn stub_stmt(stmt: &Stmt<TextRange>) -> Option<Stmt<TextRange>> {
     }
 }
 
-fn ellipsis_stmt(range: TextRange) -> Stmt<TextRange> {
+fn ellipsis_stmt(range: TextRange) -> Stmt {
     Stmt::Expr(StmtExpr {
         range,
-        value: Box::new(Expr::Constant(ExprConstant {
+        node_index: AtomicNodeIndex::NONE,
+        value: Box::new(Expr::EllipsisLiteral(ExprEllipsisLiteral {
             range,
-            value: Constant::Ellipsis,
-            kind: None,
+            node_index: AtomicNodeIndex::NONE,
         })),
     })
 }
@@ -102,11 +91,11 @@ fn ellipsis_stmt(range: TextRange) -> Stmt<TextRange> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustpython_parser::{parse, Mode};
+    use tyc_syntax::parse_module;
 
     fn stub(src: &str) -> String {
-        let m = parse(src, Mode::Module, "<test>").expect("parse failed");
-        emit_stub(&m)
+        let parsed = parse_module(src).expect("parse failed");
+        emit_stub(parsed.syntax())
     }
 
     #[test]

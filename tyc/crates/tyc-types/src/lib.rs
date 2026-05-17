@@ -1460,7 +1460,7 @@ struct Narrowing {
 
 /// Collect narrowings implied by `test`. If `negate` is true, invert the
 /// sense (used for the `else` branch).
-fn collect_narrowings(c: &Checker, test: &Expr<TextRange>, negate: bool) -> Vec<Narrowing> {
+fn collect_narrowings(c: &Checker, test: &Expr, negate: bool) -> Vec<Narrowing> {
     let mut out = Vec::new();
     collect_narrowings_inner(c, test, negate, &mut out);
     out
@@ -1468,7 +1468,7 @@ fn collect_narrowings(c: &Checker, test: &Expr<TextRange>, negate: bool) -> Vec<
 
 fn collect_narrowings_inner(
     c: &Checker,
-    test: &Expr<TextRange>,
+    test: &Expr,
     negate: bool,
     out: &mut Vec<Narrowing>,
 ) {
@@ -1476,32 +1476,30 @@ fn collect_narrowings_inner(
         Expr::Compare(cmp) => {
             // x is None / x is not None
             if cmp.ops.len() == 1 && cmp.comparators.len() == 1 {
-                let is_op = matches!(cmp.ops[0], rustpython_ast::CmpOp::Is);
-                let is_not_op = matches!(cmp.ops[0], rustpython_ast::CmpOp::IsNot);
+                let is_op = matches!(cmp.ops[0], ruff_python_ast::CmpOp::Is);
+                let is_not_op = matches!(cmp.ops[0], ruff_python_ast::CmpOp::IsNot);
                 if is_op || is_not_op {
-                    if let (Expr::Name(n), Expr::Constant(rc)) =
+                    if let (Expr::Name(n), Expr::NoneLiteral(_)) =
                         (cmp.left.as_ref(), &cmp.comparators[0])
                     {
-                        if matches!(rc.value, Constant::None) {
-                            if let Some(b) = c.env.lookup(n.id.as_str()) {
-                                // x is None  → name becomes None
-                                // x is not None → name becomes declared without None
-                                let positive_match = is_op; // is None
-                                let want_none = if negate {
-                                    !positive_match
-                                } else {
-                                    positive_match
-                                };
-                                let replacement = if want_none {
-                                    Type::None
-                                } else {
-                                    b.narrowed.strip_none()
-                                };
-                                out.push(Narrowing {
-                                    name: n.id.as_str().to_owned(),
-                                    replacement,
-                                });
-                            }
+                        if let Some(b) = c.env.lookup(n.id.as_str()) {
+                            // x is None  → name becomes None
+                            // x is not None → name becomes declared without None
+                            let positive_match = is_op; // is None
+                            let want_none = if negate {
+                                !positive_match
+                            } else {
+                                positive_match
+                            };
+                            let replacement = if want_none {
+                                Type::None
+                            } else {
+                                b.narrowed.strip_none()
+                            };
+                            out.push(Narrowing {
+                                name: n.id.as_str().to_owned(),
+                                replacement,
+                            });
                         }
                     }
                 }
@@ -1510,9 +1508,10 @@ fn collect_narrowings_inner(
         Expr::Call(call) => {
             // isinstance(x, T)
             if let Expr::Name(fn_name) = call.func.as_ref() {
-                if fn_name.id.as_str() == "isinstance" && call.args.len() == 2 {
-                    if let Expr::Name(target) = &call.args[0] {
-                        let new_type = type_from_annotation(&call.args[1], &c.classes);
+                let pos_args = &call.arguments.args;
+                if fn_name.id.as_str() == "isinstance" && pos_args.len() == 2 {
+                    if let Expr::Name(target) = &pos_args[0] {
+                        let new_type = type_from_annotation(&pos_args[1], &c.classes);
                         if let Some(b) = c.env.lookup(target.id.as_str()) {
                             let replacement = if negate {
                                 // Best-effort: strip the type out of the union.
@@ -1529,7 +1528,7 @@ fn collect_narrowings_inner(
                 }
             }
         }
-        Expr::UnaryOp(u) if matches!(u.op, rustpython_ast::UnaryOp::Not) => {
+        Expr::UnaryOp(u) if matches!(u.op, ruff_python_ast::UnaryOp::Not) => {
             collect_narrowings_inner(c, &u.operand, !negate, out);
         }
         _ => {}
@@ -1554,17 +1553,17 @@ fn apply_narrowings(c: &mut Checker, ns: &[Narrowing]) {
 }
 
 /// Infer the type of an expression.
-fn infer_expr(c: &mut Checker, expr: &Expr<TextRange>) -> Type {
+fn infer_expr(c: &mut Checker, expr: &Expr) -> Type {
     match expr {
-        Expr::Constant(con) => match &con.value {
-            Constant::Bool(_) => Type::Bool,
-            Constant::Int(_) => Type::Int,
-            Constant::Float(_) => Type::Float,
-            Constant::Str(_) => Type::Str,
-            Constant::Bytes(_) => Type::Bytes,
-            Constant::None => Type::None,
-            _ => Type::Unknown,
+        Expr::BooleanLiteral(_) => Type::Bool,
+        Expr::NumberLiteral(n) => match &n.value {
+            Number::Int(_) => Type::Int,
+            Number::Float(_) => Type::Float,
+            Number::Complex { .. } => Type::Unknown,
         },
+        Expr::StringLiteral(_) => Type::Str,
+        Expr::BytesLiteral(_) => Type::Bytes,
+        Expr::NoneLiteral(_) => Type::None,
         Expr::Name(n) => {
             if let Some(b) = c.env.lookup(n.id.as_str()) {
                 b.narrowed.clone()
@@ -1593,9 +1592,7 @@ fn infer_expr(c: &mut Checker, expr: &Expr<TextRange>) -> Type {
             match (&l.strip_none(), &r.strip_none()) {
                 (Type::Int, Type::Int) => Type::Int,
                 (Type::Float, _) | (_, Type::Float) => Type::Float,
-                (Type::Str, Type::Str) if matches!(b.op, rustpython_ast::Operator::Add) => {
-                    Type::Str
-                }
+                (Type::Str, Type::Str) if matches!(b.op, Operator::Add) => Type::Str,
                 _ => Type::Unknown,
             }
         }
@@ -1606,7 +1603,7 @@ fn infer_expr(c: &mut Checker, expr: &Expr<TextRange>) -> Type {
             match u.op {
                 // Boolean negation always produces a bool, regardless of
                 // operand type (Python: `not x` returns a bool).
-                rustpython_ast::UnaryOp::Not => Type::Bool,
+                ruff_python_ast::UnaryOp::Not => Type::Bool,
                 // Bitwise / arithmetic unary ops preserve the operand type.
                 _ => operand,
             }
