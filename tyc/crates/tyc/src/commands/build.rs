@@ -19,7 +19,7 @@ use tyc_analyse::{
 use tyc_db::{check_file, TycDatabase};
 use tyc_desugar::{desugar_module_with, DesugarOptions};
 use tyc_diagnostics::Diagnostics;
-use tyc_emit::{emit, emit_stub};
+use tyc_emit::{emit_stub, emit_with_line_offsets};
 use tyc_format::format_source;
 use tyc_syntax::preprocess::{
     expand_gather_blocks, expand_go_calls, expand_lazy_imports, expand_pipes, expand_question_ops,
@@ -281,7 +281,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         if desugar_output.needs_typhon_runtime {
             needs_runtime = true;
         }
-        let mut python_src = emit(&desugar_output.module);
+        let (mut python_src, line_offsets) = emit_with_line_offsets(&desugar_output.module);
 
         // Optionally normalise whitespace in the emitted Python (tabs → spaces,
         // trailing whitespace, final newline).  Full ruff-style reformatting
@@ -306,24 +306,22 @@ pub fn run(args: BuildArgs) -> Result<()> {
         std::fs::write(&out_file, &python_src)
             .map_err(|e| miette!("cannot write '{}': {e}", out_file.display()))?;
 
-        // Emit a sibling `<name>.py.map` recording the source `.ty` path so
-        // `tyc trace` can rewrite Python tracebacks back to Typhon
-        // filenames.  The current v1 map is filename-only; line-number
-        // adjustment for sugar that emits multiple lines (`with`-chains,
-        // `?`, `gather`) is a known limitation and tracked separately.
+        // Emit a v2 `.py.map` sidecar alongside the emitted `.py`.
+        //
+        // The `lines` array maps each Python output line (0-indexed) to a
+        // 1-indexed line number in the preprocessed Typhon source.  For most
+        // constructs the mapping is identity; sugar that emits multiple Python
+        // lines from one Typhon line (e.g. `?`, `gather:`, `with`-chains)
+        // correctly maps those lines back to the single originating line.
         let map_path = out_file.with_extension("py.map");
-        let map_body = format!(
-            "{{\"version\":1,\"source\":\"{}\",\"line_strategy\":\"identity\"}}\n",
-            // Use the path relative to the source directory so the file is
-            // portable across project copies.
-            escape_json_path(
-                &path
-                    .strip_prefix(&src_dir)
-                    .unwrap_or(path)
-                    .display()
-                    .to_string()
-            )
+        let source_rel = escape_json_path(
+            &path
+                .strip_prefix(&src_dir)
+                .unwrap_or(path)
+                .display()
+                .to_string(),
         );
+        let map_body = build_source_map_v2(&source_rel, &prep.python_source, &line_offsets);
         std::fs::write(&map_path, map_body)
             .map_err(|e| miette!("cannot write '{}': {e}", map_path.display()))?;
 
@@ -431,6 +429,37 @@ fn escape_json_path(s: &str) -> String {
         }
     }
     out
+}
+
+/// Convert a byte `offset` in `source` to a 1-indexed line number.
+fn offset_to_line(source: &str, offset: usize) -> u32 {
+    let clamped = offset.min(source.len());
+    source.as_bytes()[..clamped]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count() as u32
+        + 1
+}
+
+/// Build a v2 `.py.map` JSON body with a full `lines` table.
+///
+/// `line_offsets[i]` is the byte offset in `preprocessed` that was "active"
+/// when output line `i` (0-indexed) was emitted.  Each offset is converted to
+/// a 1-indexed line number and the array is serialised inline.  Synthesised
+/// lines (offset 0) correctly land on line 1, matching the identity fallback.
+fn build_source_map_v2(source_rel: &str, preprocessed: &str, line_offsets: &[usize]) -> String {
+    let lines: Vec<u32> = line_offsets
+        .iter()
+        .map(|&offset| offset_to_line(preprocessed, offset))
+        .collect();
+    let lines_json = lines
+        .iter()
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"version\":2,\"source\":\"{source_rel}\",\"line_strategy\":\"table\",\"lines\":[{lines_json}]}}\n"
+    )
 }
 
 // ── Comptime literal substitution ─────────────────────────────────────────────
@@ -1303,6 +1332,76 @@ async def load() -> int:
         assert!(
             py.contains("a = await fetch_a") && py.contains("b = await fetch_b(a)"),
             "sequential awaits must be preserved verbatim; got:\n{py}"
+        );
+    }
+
+    // ── Source map v2 helpers ────────────────────────────────────────────────
+
+    #[test]
+    fn offset_to_line_empty_offset_is_line_one() {
+        assert_eq!(offset_to_line("hello\nworld\n", 0), 1);
+    }
+
+    #[test]
+    fn offset_to_line_after_first_newline() {
+        // "hello\n" is 6 bytes; byte 6 is the start of "world"
+        assert_eq!(offset_to_line("hello\nworld\n", 6), 2);
+    }
+
+    #[test]
+    fn offset_to_line_clamps_past_end() {
+        let src = "a\nb\n";
+        assert_eq!(offset_to_line(src, 999), 3);
+    }
+
+    #[test]
+    fn build_source_map_v2_produces_correct_json() {
+        // Three output lines, all from preprocessed line 2 (offset 6 in "line1\nline2\n")
+        let preprocessed = "line1\nline2\n";
+        let offsets = vec![0usize, 6, 6];
+        let json = build_source_map_v2("main.ty", preprocessed, &offsets);
+        assert!(
+            json.contains("\"version\":2"),
+            "version must be 2; got: {json}"
+        );
+        assert!(
+            json.contains("\"source\":\"main.ty\""),
+            "source field missing; got: {json}"
+        );
+        assert!(
+            json.contains("\"line_strategy\":\"table\""),
+            "strategy must be table; got: {json}"
+        );
+        assert!(
+            json.contains("\"lines\":[1,2,2]"),
+            "lines array wrong; got: {json}"
+        );
+    }
+
+    #[test]
+    fn build_emits_v2_source_map_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, out_dir) = scaffold(tmp.path(), "val x: int = 1\n");
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        })
+        .unwrap();
+        let map_path = out_dir.join("main.py.map");
+        assert!(map_path.exists(), "main.py.map sidecar should be emitted");
+        let map = std::fs::read_to_string(&map_path).unwrap();
+        assert!(
+            map.contains("\"version\":2"),
+            "map should be v2; got: {map}"
+        );
+        assert!(
+            map.contains("\"line_strategy\":\"table\""),
+            "map strategy should be table; got: {map}"
+        );
+        assert!(
+            map.contains("\"lines\":["),
+            "map should contain lines array; got: {map}"
         );
     }
 

@@ -13,6 +13,15 @@ use rustpython_ast::{
 pub struct Emitter {
     output: String,
     indent: usize,
+    /// Input byte-offset that is "active" while the current statement is being
+    /// emitted.  Updated at the start of every `emit_stmt` call from the
+    /// statement's `TextRange`; synthesised nodes (zero-length range) leave it
+    /// unchanged so they inherit the last known real offset.
+    current_input_offset: usize,
+    /// One entry per output line (0-indexed).  Each entry is the
+    /// `current_input_offset` that was active when that line's newline was
+    /// emitted.  Used by the caller to build a `(py_line → ty_line)` table.
+    pub line_offsets: Vec<usize>,
 }
 
 const INDENT_WIDTH: usize = 4;
@@ -22,6 +31,8 @@ impl Emitter {
         Self {
             output: String::new(),
             indent: 0,
+            current_input_offset: 0,
+            line_offsets: Vec::new(),
         }
     }
 
@@ -37,10 +48,12 @@ impl Emitter {
 
     fn writeln(&mut self, s: &str) {
         self.output.push_str(s);
+        self.line_offsets.push(self.current_input_offset);
         self.output.push('\n');
     }
 
     fn newline(&mut self) {
+        self.line_offsets.push(self.current_input_offset);
         self.output.push('\n');
     }
 
@@ -89,6 +102,14 @@ impl Emitter {
     // ── statements ─────────────────────────────────────────────────────────
 
     pub fn emit_stmt(&mut self, node: &Stmt<TextRange>) {
+        // Update the active input offset from the node's source range.
+        // Synthesised AST nodes (produced by the desugar pass) carry a
+        // zero-length TextRange::default(); we skip those so they inherit
+        // the last real offset rather than resetting to 0.
+        let range = stmt_range(node);
+        if u32::from(range.start()) != u32::from(range.end()) {
+            self.current_input_offset = u32::from(range.start()) as usize;
+        }
         match node {
             Stmt::FunctionDef(f) => {
                 self.newline();
@@ -1243,6 +1264,45 @@ impl Emitter {
 impl Default for Emitter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Extract the `TextRange` from any `Stmt<TextRange>` variant.
+///
+/// Used by `emit_stmt` to update `current_input_offset` without a
+/// separate trait import.  Synthesised statements from the desugar pass
+/// carry `TextRange::default()` (start == end == 0); callers detect this
+/// by checking `start != end`.
+fn stmt_range(stmt: &Stmt<TextRange>) -> TextRange {
+    match stmt {
+        Stmt::FunctionDef(s) => s.range,
+        Stmt::AsyncFunctionDef(s) => s.range,
+        Stmt::ClassDef(s) => s.range,
+        Stmt::Return(s) => s.range,
+        Stmt::Delete(s) => s.range,
+        Stmt::Assign(s) => s.range,
+        Stmt::AugAssign(s) => s.range,
+        Stmt::AnnAssign(s) => s.range,
+        Stmt::For(s) => s.range,
+        Stmt::AsyncFor(s) => s.range,
+        Stmt::While(s) => s.range,
+        Stmt::If(s) => s.range,
+        Stmt::With(s) => s.range,
+        Stmt::AsyncWith(s) => s.range,
+        Stmt::Match(s) => s.range,
+        Stmt::Raise(s) => s.range,
+        Stmt::Try(s) => s.range,
+        Stmt::TryStar(s) => s.range,
+        Stmt::Assert(s) => s.range,
+        Stmt::Import(s) => s.range,
+        Stmt::ImportFrom(s) => s.range,
+        Stmt::Global(s) => s.range,
+        Stmt::Nonlocal(s) => s.range,
+        Stmt::Expr(s) => s.range,
+        Stmt::Pass(s) => s.range,
+        Stmt::Break(s) => s.range,
+        Stmt::Continue(s) => s.range,
+        Stmt::TypeAlias(s) => s.range,
     }
 }
 
