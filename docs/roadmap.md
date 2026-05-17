@@ -114,6 +114,12 @@ Everything beyond is polish and ambition.
   go-to-definition across `.ty` / `.py` boundaries via source maps is
   still pending the v2 source-map format.
 - Migration tooling from typed `.py` to `.ty` (`Optional[T]` → `T?`, dataclasses → Typhon classes, etc.).
+- **`ty` integration** as a complementary second-stage checker over the
+  desugared Python. Planned in two phases: first as a subprocess
+  invocation of `ty check` with diagnostic attribution via the source
+  maps (no dependency on the Ruff vendor), later as an embedded
+  library sharing the Salsa db. See [docs/ty-integration.md](ty-integration.md)
+  for the full plan.
 
 ## Scope-cutting rule
 

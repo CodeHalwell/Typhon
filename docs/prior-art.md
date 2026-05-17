@@ -13,7 +13,7 @@ Typhon stands on a lot of shoulders. These are the languages and tools to study 
 ## Tools
 
 - **rust-analyzer** — cleanest example of a Salsa-based incremental compiler with an LSP. Crate layering directly transferable.
-- **ty and Pyrefly** — Rust-based Python type checkers (Astral and Meta respectively). Both shipped in 2025; both architectural references for Typhon's checker. `ty` may be embedded as a library to handle standard typing-spec checking.
+- **ty and Pyrefly** — Rust-based Python type checkers (Astral and Meta respectively). Both shipped in 2025; both architectural references for Typhon's checker. `ty` may be embedded as a library to handle standard typing-spec checking — see [docs/ty-integration.md](ty-integration.md) for the concrete two-phase integration plan.
 - **oxc** — Rust-based JavaScript toolchain. Workspace layout (`oxc_parser`, `oxc_semantic`, `oxc_linter`, `oxc_formatter`, `oxlint` binary) is the template for `tyc`.
 - **Ruff** — Astral's Python linter/formatter. Source of `ruff_python_parser`, `ruff_python_ast`, `ruff_python_codegen`, `ruff_python_formatter`, all vendored.
 
