@@ -3,11 +3,9 @@ name = "tyc-syntax"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Typhon lexer and parser — extends rustpython-parser with Typhon-specific tokens (val, var)"
+description = "Typhon lexer and parser — vendored Ruff fork with Typhon-specific let/mut soft keywords"
 
 [dependencies]
-rustpython-parser = { workspace = true }
-rustpython-ast = { workspace = true }
 ruff_python_ast = { workspace = true }
 ruff_python_parser = { workspace = true }
 thiserror = { workspace = true }

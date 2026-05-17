@@ -14,7 +14,6 @@
 //! operator) into plain Python before parsing.
 
 pub mod lexer;
-pub mod parser;
 pub mod preprocess;
 pub mod ruff;
 

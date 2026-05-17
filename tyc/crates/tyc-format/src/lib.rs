@@ -2,17 +2,20 @@
 //!
 //! Pipeline for a single `.ty` file:
 //!
-//! 1. Pre-process: strip `let`/`mut` keywords so the Python parser can handle
-//!    the remainder of the grammar.
-//! 2. Parse: verify the source is syntactically valid using
-//!    `rustpython_parser`.
+//! 1. Pre-process: rewrite Typhon-specific sugar (`model:`, `interface:`,
+//!    `unsafe:`, `comptime`, `gather:`, `go`, `lazy`, `?` nullability) so
+//!    the underlying parser sees plain Python. `let` / `mut` are left in
+//!    place — the vendored Ruff parser recognises them natively.
+//! 2. Parse: verify the source is syntactically valid via the vendored
+//!    Ruff parser (`tyc_syntax::parse_module`).
 //! 3. Normalise: apply lightweight whitespace normalisation to the
-//!    pre-processed source (trailing spaces, final newline).  Comments and
+//!    pre-processed source (trailing spaces, final newline). Comments and
 //!    blank lines are preserved.
-//! 4. Post-process: restore `let`/`mut` at the appropriate locations.
+//! 4. Post-process: restore the keywords that *were* stripped (model /
+//!    impl / extend / interface / unsafe / comptime / lazy / gather / go).
 //!
-//! Full AST-based reformatting (which would drop comments) is deferred to a
-//! later phase when a comment-preserving CST emitter is available.
+//! Full AST-based reformatting (which would drop comments) is deferred to
+//! a later phase when a comment-preserving CST emitter is available.
 
 use std::path::Path;
 
