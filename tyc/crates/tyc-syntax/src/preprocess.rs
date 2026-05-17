@@ -949,6 +949,72 @@ pub fn validate_lazy_usage(source: &str) -> Vec<LazyUsageError> {
     errors
 }
 
+// ── `extend` usage validation ────────────────────────────────────────────────
+
+/// An error produced when `extend` is used in an unsupported form.
+#[derive(Debug, Clone)]
+pub struct ExtendUsageError {
+    /// 0-based line index in the original Typhon source.
+    pub line_index: usize,
+    /// Byte offset where the violating `extend` token starts.
+    pub offset: usize,
+    /// Human-readable error message.
+    pub message: String,
+}
+
+/// Built-in Python type names that cannot be the target of `extend`.
+///
+/// Adding methods to built-in types in pure Python is not possible because
+/// `str`, `int`, etc. are immutable from Python code.  Typhon v1 therefore
+/// rejects `extend BUILTIN:` rather than silently lowering it to an unused
+/// pseudo-class that would drop methods on the floor.  Phase 4 plans an
+/// alternative form via a call-site rewriter — see the roadmap.
+const BUILTIN_TYPES_REJECTED_BY_EXTEND: &[&str] = &[
+    "bool", "bytearray", "bytes", "complex", "dict", "float", "frozenset",
+    "int", "list", "object", "range", "set", "str", "tuple", "type",
+];
+
+/// Scan `source` for `extend BUILTIN:` declarations.  These are explicitly
+/// rejected in v1 because Python forbids adding methods to its built-in
+/// types — the lowering would silently drop the methods.
+pub fn validate_extend_usage(source: &str) -> Vec<ExtendUsageError> {
+    let mut errors = Vec::new();
+    let mut byte_offset: usize = 0;
+    let mut in_string: Option<StringMode> = None;
+    for (line_index, line) in source.split_inclusive('\n').enumerate() {
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let pre = in_string;
+        let _ = scan_line_code_end(raw, &mut in_string);
+        if pre.is_none() {
+            let indent_len = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
+            let body = &raw[indent_len..];
+            if let Some(rest) = body.strip_prefix("extend ") {
+                // Strip a trailing `:` (and optional base-class list) so
+                // `extend str:` and `extend str(Foo):` both extract `str`.
+                let head = rest
+                    .split([':', '('])
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                if BUILTIN_TYPES_REJECTED_BY_EXTEND.contains(&head) {
+                    errors.push(ExtendUsageError {
+                        line_index,
+                        offset: byte_offset + indent_len,
+                        message: format!(
+                            "`extend {head}:` is not supported — Python's built-in types \
+                             cannot be modified at runtime. Wrap the value in a \
+                             user-defined class, or move the helper to a free function. \
+                             A future call-site rewriter is planned (see roadmap.md)."
+                        ),
+                    });
+                }
+            }
+        }
+        byte_offset += line.len();
+    }
+    errors
+}
+
 // ── `?` operator validation ───────────────────────────────────────────────────
 
 /// An error produced when the `?` operator is used in an invalid context.

@@ -53,8 +53,8 @@ cargo build --release
 | `tyc fmt` | Format `.ty` source files in place |
 | `tyc lsp` | Run as a Language Server on stdio |
 | `tyc init` | Scaffold a new project: `typhon.toml`, `src/`, `tests/` |
-| `tyc trace` | Map a Python traceback back to Typhon source via `.py.map` files |
-| `tyc profile` | Instrument emitted code for hot-function detection (opt-in) |
+| `tyc trace` | Map a Python traceback back to Typhon source via `.py.map` files (v1: filename rewrite, line offsets are 1:1) |
+| `tyc profile` | Build then instrument every top-level function with call-count + wall-clock sampling; writes `typhon-profile.json` on interpreter exit |
 
 See [docs/cli.md](docs/cli.md) for the full reference.
 

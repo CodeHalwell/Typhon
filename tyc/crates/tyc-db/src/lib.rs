@@ -15,7 +15,7 @@ use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_resolve::resolve_module;
 use tyc_syntax::preprocess::{
     expand_gather_blocks, expand_go_calls, expand_pipes, expand_question_ops, expand_with_chains,
-    preprocess, validate_lazy_usage, validate_question_ops,
+    preprocess, validate_extend_usage, validate_lazy_usage, validate_question_ops,
 };
 use tyc_types::check_module_with;
 
@@ -128,6 +128,18 @@ pub fn check_file(db: &mut TycDatabase, path: String, text: String) -> Diagnosti
             4, // length of "lazy"
         ));
     }
+    // Reject `extend BUILTIN:` declarations.  Python's built-in types cannot
+    // be modified at runtime, so the silent drop performed by the impl-merge
+    // desugar pass would surprise the user.
+    for err in validate_extend_usage(&text) {
+        diags.push_error(TycError::extend_builtin(
+            err.message,
+            &path,
+            &text,
+            err.offset,
+            6, // length of "extend"
+        ));
+    }
     if diags.has_errors() {
         return diags;
     }
@@ -229,6 +241,40 @@ unsafe:
         assert!(
             !diags.has_errors(),
             "unsafe block should suppress type errors; got {:?}",
+            diags.errors()
+        );
+    }
+
+    #[test]
+    fn check_file_rejects_extend_on_builtin_str() {
+        let mut db = TycDatabase::new();
+        let src = "extend str:\n    def slug(self) -> str: return self\n";
+        let diags = check_file(&mut db, "<test>".to_owned(), src.to_owned());
+        assert!(
+            diags.has_errors(),
+            "extend on a built-in type must produce a diagnostic"
+        );
+        let msg = format!("{:?}", diags.errors()[0]);
+        assert!(
+            msg.contains("extend str") || msg.contains("built-in"),
+            "diagnostic should mention the rejected builtin; got {msg}"
+        );
+    }
+
+    #[test]
+    fn check_file_allows_extend_on_user_class() {
+        let mut db = TycDatabase::new();
+        let src = "\
+class User:
+    name: str
+
+extend User:
+    def greet(self) -> str: return self.name
+";
+        let diags = check_file(&mut db, "<test>".to_owned(), src.to_owned());
+        assert!(
+            !diags.has_errors(),
+            "extend on a user class must be accepted; got {:?}",
             diags.errors()
         );
     }

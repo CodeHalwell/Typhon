@@ -247,6 +247,27 @@ pub fn run(args: BuildArgs) -> Result<()> {
         std::fs::write(&out_file, &python_src)
             .map_err(|e| miette!("cannot write '{}': {e}", out_file.display()))?;
 
+        // Emit a sibling `<name>.py.map` recording the source `.ty` path so
+        // `tyc trace` can rewrite Python tracebacks back to Typhon
+        // filenames.  The current v1 map is filename-only; line-number
+        // adjustment for sugar that emits multiple lines (`with`-chains,
+        // `?`, `gather`) is a known limitation and tracked separately.
+        let map_path = out_file.with_extension("py.map");
+        let map_body = format!(
+            "{{\"version\":1,\"source\":\"{}\",\"line_strategy\":\"identity\"}}\n",
+            // Use the path relative to the source directory so the file is
+            // portable across project copies.
+            escape_json_path(
+                &path
+                    .strip_prefix(&src_dir)
+                    .unwrap_or(path)
+                    .display()
+                    .to_string()
+            )
+        );
+        std::fs::write(&map_path, map_body)
+            .map_err(|e| miette!("cannot write '{}': {e}", map_path.display()))?;
+
         emitted += 1;
     }
 
@@ -316,6 +337,22 @@ pub fn run(args: BuildArgs) -> Result<()> {
 
     println!("built {} file(s) → '{}'", emitted, out_dir.display());
     Ok(())
+}
+
+/// Minimal JSON string escape for paths used in the `.py.map` body.  Only
+/// backslashes and double quotes need escaping; the rest of ASCII passes
+/// through unchanged.  Non-ASCII bytes (e.g. UTF-8 multi-byte sequences) are
+/// passed through verbatim — modern JSON parsers accept them.
+fn escape_json_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 // ── Comptime literal substitution ─────────────────────────────────────────────
