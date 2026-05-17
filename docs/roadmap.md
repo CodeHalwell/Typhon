@@ -93,7 +93,14 @@ Everything beyond is polish and ambition.
 - Loop parallelisation for pure comprehensions on free-threaded Python.
 - Richer comptime: `comptime` functions, types as values.
 - PGO via `tyc profile`.
-- LSP completions and code actions; go-to-definition across `.ty` and `.py` boundaries via source maps.
+- ✅ **LSP completions and code actions**. `textDocument/completion`
+  returns visible bindings (walking the cursor's enclosing scope chain),
+  Typhon keywords (`val`, `var`, `gather`, `go`, `lazy`, …), and a
+  small set of common Python builtins; the LSP client filters by prefix.
+  `textDocument/codeAction` offers a "Remove unused import" quick-fix
+  for every `tyc::unused_import` diagnostic in range. Cross-file
+  go-to-definition across `.ty` / `.py` boundaries via source maps is
+  still pending the v2 source-map format.
 - Migration tooling from typed `.py` to `.ty` (`Optional[T]` → `T?`, dataclasses → Typhon classes, etc.).
 
 ## Scope-cutting rule

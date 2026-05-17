@@ -95,11 +95,21 @@ pub struct Scope {
     pub kind: ScopeKind,
     pub parent: Option<ScopeId>,
     pub bindings: Vec<Binding>,
+    /// Byte range covered by this scope in the preprocessed source.  The
+    /// module scope spans the entire file; function/class/lambda/
+    /// comprehension scopes span their AST node's range.  Used by
+    /// [`ResolvedModule::scope_at_offset`] to drive LSP completion.
+    pub span: (usize, usize),
 }
 
 impl Scope {
     pub fn lookup_local(&self, name: &str) -> Option<&Binding> {
         self.bindings.iter().find(|b| b.name == name)
+    }
+
+    /// `true` when `offset` lies inside this scope's byte range.
+    pub fn contains_offset(&self, offset: usize) -> bool {
+        offset >= self.span.0 && offset < self.span.1
     }
 }
 
@@ -137,6 +147,44 @@ impl ResolvedModule {
         self.scopes
             .iter()
             .flat_map(|s| s.bindings.iter().map(move |b| (s.id, b)))
+    }
+
+    /// Innermost scope whose byte range contains `offset`.  Falls back to
+    /// the module scope when no narrower scope matches (e.g. an offset that
+    /// sits between two top-level statements).
+    ///
+    /// Used by the LSP backend to drive completion: walk the parent chain
+    /// from this scope upward and collect every visible binding.
+    pub fn scope_at_offset(&self, offset: usize) -> ScopeId {
+        // Scopes are pushed in source order, so a deeper (later) scope that
+        // contains the offset is strictly the innermost match. Iterate from
+        // the end to find it without building a tree.
+        for s in self.scopes.iter().rev() {
+            if s.contains_offset(offset) {
+                return s.id;
+            }
+        }
+        0
+    }
+
+    /// Every binding visible from `scope` (its own bindings plus those
+    /// inherited from parent scopes).  Walks the parent chain to the
+    /// module scope; later definitions in nested scopes shadow earlier
+    /// ones with the same name.
+    pub fn visible_bindings(&self, scope: ScopeId) -> Vec<&Binding> {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut out: Vec<&Binding> = Vec::new();
+        let mut current = Some(scope);
+        while let Some(id) = current {
+            let s = &self.scopes[id];
+            for b in &s.bindings {
+                if seen.insert(b.name.as_str()) {
+                    out.push(b);
+                }
+            }
+            current = s.parent;
+        }
+        out
     }
 
     /// Find the identifier (binding or reference) at the given byte offset
@@ -214,6 +262,7 @@ impl<'a> Resolver<'a> {
             kind: ScopeKind::Module,
             parent: None,
             bindings: Vec::new(),
+            span: (0, source.len()),
         };
         let mut line_starts = vec![0usize];
         for (idx, b) in source.bytes().enumerate() {
@@ -232,13 +281,14 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    fn push_scope(&mut self, kind: ScopeKind, parent: ScopeId) -> ScopeId {
+    fn push_scope(&mut self, kind: ScopeKind, parent: ScopeId, span: (usize, usize)) -> ScopeId {
         let id = self.scopes.len();
         self.scopes.push(Scope {
             id,
             kind,
             parent: Some(parent),
             bindings: Vec::new(),
+            span,
         });
         id
     }
@@ -630,6 +680,12 @@ fn declare_target(r: &mut Resolver, scope: ScopeId, target: &Expr<TextRange>, de
 
 /// Walk a statement, recording references to names and descending into
 /// nested function/class scopes.
+/// Convert an AST `TextRange` to the (start, end) byte tuple used by
+/// `Scope::span` and binding spans.
+fn range_to_span(range: TextRange) -> (usize, usize) {
+    (range.start().to_usize(), range.end().to_usize())
+}
+
 fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
     match stmt {
         Stmt::FunctionDef(f) => {
@@ -637,7 +693,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
             for d in &f.decorator_list {
                 walk_expr(r, scope, d);
             }
-            let fn_scope = r.push_scope(ScopeKind::Function, scope);
+            let fn_scope = r.push_scope(ScopeKind::Function, scope, range_to_span(f.range));
             // PEP 695 type parameters (`def f[T](x: T) -> T`) bind into the
             // function scope so the parameter and return-type annotations can
             // resolve them.
@@ -667,7 +723,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
             for d in &f.decorator_list {
                 walk_expr(r, scope, d);
             }
-            let fn_scope = r.push_scope(ScopeKind::Function, scope);
+            let fn_scope = r.push_scope(ScopeKind::Function, scope, range_to_span(f.range));
             declare_type_params(r, fn_scope, &f.type_params);
             let ann_scope = if f.type_params.is_empty() {
                 scope
@@ -688,7 +744,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
             for d in &c.decorator_list {
                 walk_expr(r, scope, d);
             }
-            let cls_scope = r.push_scope(ScopeKind::Class, scope);
+            let cls_scope = r.push_scope(ScopeKind::Class, scope, range_to_span(c.range));
             declare_type_params(r, cls_scope, &c.type_params);
             // Base classes that reference type params need the class scope.
             let base_scope = if c.type_params.is_empty() {
@@ -715,7 +771,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
             // the alias body can reference `T`. The alias name itself binds
             // into the enclosing scope and is already pre-declared by
             // `collect_top_level`.
-            let alias_scope = r.push_scope(ScopeKind::Function, scope);
+            let alias_scope = r.push_scope(ScopeKind::Function, scope, range_to_span(ta.range));
             declare_type_params(r, alias_scope, &ta.type_params);
             walk_expr(r, alias_scope, &ta.value);
         }
@@ -967,7 +1023,7 @@ fn walk_impl_method(r: &mut Resolver, cls_scope: ScopeId, stmt: &Stmt<TextRange>
             if let Some(ret) = &f.returns {
                 walk_expr(r, cls_scope, ret);
             }
-            let fn_scope = r.push_scope(ScopeKind::Function, cls_scope);
+            let fn_scope = r.push_scope(ScopeKind::Function, cls_scope, range_to_span(f.range));
             // Pre-declare the implicit `self` the desugar pass will inject.
             r.declare(
                 fn_scope,
@@ -990,7 +1046,7 @@ fn walk_impl_method(r: &mut Resolver, cls_scope: ScopeId, stmt: &Stmt<TextRange>
             if let Some(ret) = &f.returns {
                 walk_expr(r, cls_scope, ret);
             }
-            let fn_scope = r.push_scope(ScopeKind::Function, cls_scope);
+            let fn_scope = r.push_scope(ScopeKind::Function, cls_scope, range_to_span(f.range));
             r.declare(
                 fn_scope,
                 "self",
@@ -1175,15 +1231,15 @@ fn walk_expr(r: &mut Resolver, scope: ScopeId, expr: &Expr<TextRange>) {
         }
         Expr::YieldFrom(y) => walk_expr(r, scope, &y.value),
         Expr::Lambda(l) => {
-            let scope2 = r.push_scope(ScopeKind::Function, scope);
+            let scope2 = r.push_scope(ScopeKind::Function, scope, range_to_span(l.range));
             declare_arguments(r, scope2, &l.args);
             walk_expr(r, scope2, &l.body);
         }
-        Expr::ListComp(c) => walk_comp(r, scope, &c.elt, &c.generators),
-        Expr::SetComp(c) => walk_comp(r, scope, &c.elt, &c.generators),
-        Expr::GeneratorExp(g) => walk_comp(r, scope, &g.elt, &g.generators),
+        Expr::ListComp(c) => walk_comp(r, scope, range_to_span(c.range), &c.elt, &c.generators),
+        Expr::SetComp(c) => walk_comp(r, scope, range_to_span(c.range), &c.elt, &c.generators),
+        Expr::GeneratorExp(g) => walk_comp(r, scope, range_to_span(g.range), &g.elt, &g.generators),
         Expr::DictComp(c) => {
-            let scope2 = r.push_scope(ScopeKind::Comprehension, scope);
+            let scope2 = r.push_scope(ScopeKind::Comprehension, scope, range_to_span(c.range));
             for gen in &c.generators {
                 walk_expr(r, scope2, &gen.iter);
                 if let Expr::Name(n) = &gen.target {
@@ -1229,10 +1285,11 @@ fn walk_expr(r: &mut Resolver, scope: ScopeId, expr: &Expr<TextRange>) {
 fn walk_comp(
     r: &mut Resolver,
     scope: ScopeId,
+    span: (usize, usize),
     elt: &Expr<TextRange>,
     generators: &[rustpython_ast::Comprehension<TextRange>],
 ) {
-    let scope2 = r.push_scope(ScopeKind::Comprehension, scope);
+    let scope2 = r.push_scope(ScopeKind::Comprehension, scope, span);
     for gen in generators {
         walk_expr(r, scope2, &gen.iter);
         if let Expr::Name(n) = &gen.target {
@@ -1451,6 +1508,69 @@ mod tests {
             &prep.stripped,
             &module,
         )
+    }
+
+    #[test]
+    fn scope_at_offset_picks_innermost_function() {
+        // The cursor sits inside `inner`'s body; `scope_at_offset` should
+        // return that function's scope, not the enclosing `outer` or module.
+        let src = "\
+def outer(a):
+    def inner(b):
+        return a + b
+";
+        let (m, _) = resolve(src);
+        // `b` first appears on the `return a + b` line; pick a byte offset
+        // inside that line.
+        let needle = "return a + b";
+        let offset = src.find(needle).unwrap();
+        let id = m.scope_at_offset(offset);
+        assert_eq!(m.scopes[id].kind, ScopeKind::Function);
+        // The chosen scope should contain a binding for `b` (inner's param)
+        // but not for `outer`'s `a` directly — `a` is reached via parent.
+        assert!(m.scopes[id].lookup_local("b").is_some());
+        assert!(m.scopes[id].lookup_local("a").is_none());
+    }
+
+    #[test]
+    fn visible_bindings_walks_parent_chain() {
+        let src = "\
+def outer(a):
+    def inner(b):
+        return a + b
+";
+        let (m, _) = resolve(src);
+        let needle = "return a + b";
+        let offset = src.find(needle).unwrap();
+        let id = m.scope_at_offset(offset);
+        let names: Vec<String> = m
+            .visible_bindings(id)
+            .into_iter()
+            .map(|b| b.name.clone())
+            .collect();
+        assert!(names.contains(&"a".to_owned()), "expected a in {names:?}");
+        assert!(names.contains(&"b".to_owned()), "expected b in {names:?}");
+        assert!(
+            names.contains(&"outer".to_owned()),
+            "expected outer in {names:?}"
+        );
+        assert!(
+            names.contains(&"inner".to_owned()),
+            "expected inner in {names:?}"
+        );
+    }
+
+    #[test]
+    fn scope_at_offset_outside_function_returns_module() {
+        let src = "\
+val x: int = 1
+def foo():
+    return x
+";
+        let (m, _) = resolve(src);
+        // Offset 0: very top of file, before any function definition.
+        let id = m.scope_at_offset(0);
+        assert_eq!(m.scopes[id].kind, ScopeKind::Module);
     }
 
     #[test]
