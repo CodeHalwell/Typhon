@@ -1064,8 +1064,8 @@ fn make_dataclasses_dot_dataclass_decorator() -> Decorator {
         arguments: Arguments {
             range: TextRange::default(),
             node_index: AtomicNodeIndex::NONE,
-            args: Box::from([]),
-            keywords: Box::from([Keyword {
+            args: Box::new([]),
+            keywords: Box::new([Keyword {
                 range: TextRange::default(),
                 node_index: AtomicNodeIndex::NONE,
                 arg: Some(make_identifier("slots")),
@@ -1237,8 +1237,8 @@ fn make_model_config_stmt() -> Stmt {
         arguments: Arguments {
             range: TextRange::default(),
             node_index: AtomicNodeIndex::NONE,
-            args: Box::from([]),
-            keywords: Box::from([Keyword {
+            args: Box::new([]),
+            keywords: Box::new([Keyword {
                 range: TextRange::default(),
                 node_index: AtomicNodeIndex::NONE,
                 arg: Some(make_identifier("extra")),
