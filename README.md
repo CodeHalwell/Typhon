@@ -99,7 +99,7 @@ See [docs/cli.md](docs/cli.md) for the full reference.
 - ✅ `lazy import np = numpy` lowers to a thread-safe inline proxy class; `lazy from … import …` is rejected. Module-level `lazy val` is deferred (the syntax pipeline does not yet recognise it).
 - ✅ Pipe operator `a |> f |> g(arg)` desugars to `g(f(a), arg)`.
 - ✅ `extend ClassName:` (alias for `impl` on user-defined classes; built-in extensions deferred).
-- ✅ `.dty` stub files compile to PEP 561 `.pyi`; `tyc check --stubs` validates them. The full `stubtest` runtime diff against the implementation module is a future enhancement.
+- ✅ `.dty` stub files compile to PEP 561 `.pyi`. `tyc check --stubs` parses every `.dty` and diffs its surface API (functions, classes, methods, annotated fields) against the sibling `.ty`/`.py` implementation, emitting `tyc::stub_mismatch` diagnostics for missing-in-impl / missing-in-stub / signature-mismatch findings. A runtime introspection probe (mypy's `stubtest` proper) is still a follow-up.
 
 See [docs/roadmap.md](docs/roadmap.md) for the phased plan through Phase 3 (month twelve) and beyond.
 

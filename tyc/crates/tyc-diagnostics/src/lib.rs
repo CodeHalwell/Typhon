@@ -195,6 +195,21 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// `tyc check --stubs` found a mismatch between a `.dty` stub and its
+    /// implementation module.
+    #[error("{message}")]
+    #[diagnostic(
+        code(tyc::stub_mismatch),
+        help("synchronise the stub with the implementation, or hide private names with a leading underscore")
+    )]
+    StubMismatch {
+        message: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("stub mismatch reported here")]
+        span: SourceSpan,
+    },
+
     /// A function decorated `@pure` violates one of the six purity conditions.
     #[error("`@pure` function '{name}' is not pure: {reason}")]
     #[diagnostic(
@@ -425,6 +440,21 @@ impl TycError {
         length: usize,
     ) -> Self {
         Self::LazyUsage {
+            message: message.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::StubMismatch`] diagnostic.
+    pub fn stub_mismatch(
+        message: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::StubMismatch {
             message: message.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),

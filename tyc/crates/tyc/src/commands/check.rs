@@ -9,9 +9,15 @@ use std::path::PathBuf;
 
 use clap::Args;
 use miette::{miette, Result};
+use rustpython_parser::{parse, Mode};
 
 use tyc_db::{check_file, TycDatabase};
 use tyc_diagnostics::{Diagnostics, TycError};
+use tyc_emit::{compare_modules, StubTestKind};
+use tyc_syntax::preprocess::{
+    expand_gather_blocks, expand_go_calls, expand_lazy_imports, expand_pipes, expand_question_ops,
+    expand_with_chains, preprocess,
+};
 
 use crate::commands::util::{apply_strictness, collect_dty_files, collect_ty_files};
 use crate::config::TyphonConfig;
@@ -77,9 +83,10 @@ pub fn run(args: CheckArgs) -> Result<()> {
             diags.extend(file_diags);
         }
 
-        // `--stubs`: also parse + type-check every `.dty` stub file under
-        // the same root so a malformed stub is surfaced. The full runtime
-        // diff against the implementation module is a future enhancement.
+        // `--stubs`: parse + type-check every `.dty` stub, then compare its
+        // surface API against the sibling `.ty` (or `.py`) implementation
+        // module.  Mismatches are reported through the standard diagnostics
+        // channel so CI treats them like any other check error.
         if args.stubs {
             for path in collect_dty_files(root)? {
                 file_count += 1;
@@ -90,8 +97,62 @@ pub fn run(args: CheckArgs) -> Result<()> {
                         continue;
                     }
                 };
-                let file_diags = check_file(&mut db, path.display().to_string(), source);
+                let file_diags =
+                    check_file(&mut db, path.display().to_string(), source.clone());
                 diags.extend(file_diags);
+
+                // Find the implementation module by stem.  Prefer a sibling
+                // `.ty` (Typhon source) over a `.py` (raw Python) so users
+                // can stub a Typhon module without also writing Python.
+                let impl_path = path
+                    .with_extension("ty")
+                    .exists()
+                    .then(|| path.with_extension("ty"))
+                    .or_else(|| {
+                        let py = path.with_extension("py");
+                        py.exists().then_some(py)
+                    });
+                let Some(impl_path) = impl_path else {
+                    // No implementation file located — stub stands alone, no
+                    // diff possible.  This is intentional for downstream
+                    // libraries the user is describing for type-checkers.
+                    continue;
+                };
+                let impl_source = match std::fs::read_to_string(&impl_path) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        diags.push_error(TycError::io(impl_path.display().to_string(), &e));
+                        continue;
+                    }
+                };
+
+                match diff_stub_against_impl(&source, &impl_source) {
+                    Ok(findings) => {
+                        for finding in findings {
+                            let label = match finding.kind {
+                                StubTestKind::MissingInImpl => "missing in implementation",
+                                StubTestKind::MissingInStub => "missing in stub",
+                                StubTestKind::SignatureMismatch => "signature mismatch",
+                            };
+                            diags.push_error(TycError::stub_mismatch(
+                                format!("{label}: {}", finding.message),
+                                path.display().to_string(),
+                                source.clone(),
+                                0,
+                                1,
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        diags.push_error(TycError::stub_mismatch(
+                            format!("could not diff stub against implementation: {e}"),
+                            path.display().to_string(),
+                            source.clone(),
+                            0,
+                            1,
+                        ));
+                    }
+                }
             }
         }
     }
@@ -125,6 +186,29 @@ pub fn run(args: CheckArgs) -> Result<()> {
         println!("checked {} file(s) — no errors", file_count);
     }
     Ok(())
+}
+
+/// Run the full preprocess + parse pipeline on `source` and return the
+/// resulting Python AST.  Used by the stub diff so that Typhon-specific
+/// syntax (`val`, `var`, `model`, `interface`, `extend`, sugar passes)
+/// is normalised before comparing.
+fn parse_for_diff(source: &str) -> Result<rustpython_ast::Mod<rustpython_ast::text_size::TextRange>>
+{
+    let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
+        &expand_gather_blocks(&expand_lazy_imports(source)),
+    ))));
+    let prep = preprocess(&expanded);
+    parse(&prep.python_source, Mode::Module, "<stubtest>")
+        .map_err(|e| miette!("parse error: {e}"))
+}
+
+fn diff_stub_against_impl(
+    stub_source: &str,
+    impl_source: &str,
+) -> Result<Vec<tyc_emit::StubTestFinding>> {
+    let stub = parse_for_diff(stub_source)?;
+    let imp = parse_for_diff(impl_source)?;
+    Ok(compare_modules(&stub, &imp))
 }
 
 #[cfg(test)]
@@ -179,5 +263,57 @@ mod tests {
             stubs: false,
         };
         assert!(run(args).is_err(), "val reassignment should be an error");
+    }
+
+    #[test]
+    fn check_stubs_passes_for_matching_stub_and_impl() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The stub and implementation expose the same function with the
+        // same parameter names — diff should be empty.
+        write_ty(tmp.path(), "lib.dty", "def hello(name: str) -> str: ...\n");
+        write_ty(
+            tmp.path(),
+            "lib.ty",
+            "def hello(name: str) -> str:\n    return name\n",
+        );
+        let args = CheckArgs {
+            paths: vec![tmp.path().to_path_buf()],
+            stubs: true,
+        };
+        run(args).unwrap();
+    }
+
+    #[test]
+    fn check_stubs_fails_when_function_missing_in_impl() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_ty(tmp.path(), "lib.dty", "def hello(name: str) -> str: ...\n");
+        write_ty(tmp.path(), "lib.ty", "def goodbye(name: str) -> str:\n    return name\n");
+        let args = CheckArgs {
+            paths: vec![tmp.path().to_path_buf()],
+            stubs: true,
+        };
+        assert!(
+            run(args).is_err(),
+            "stub declares hello() which impl does not — should error"
+        );
+    }
+
+    #[test]
+    fn check_stubs_fails_when_param_names_differ() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_ty(tmp.path(), "lib.dty", "def hello(name: str) -> str: ...\n");
+        write_ty(
+            tmp.path(),
+            "lib.ty",
+            "def hello(other_name: str) -> str:\n    return other_name\n",
+        );
+        let args = CheckArgs {
+            paths: vec![tmp.path().to_path_buf()],
+            stubs: true,
+        };
+        assert!(
+            run(args).is_err(),
+            "parameter rename should produce a signature-mismatch error"
+        );
     }
 }
