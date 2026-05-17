@@ -153,14 +153,14 @@ fn eval_expr(expr: &Expr) -> Result<ComptimeValue, String> {
         // String / boolean / none literals.
         Expr::StringLiteral(s) => Ok(ComptimeValue::Str(s.value.to_str().to_owned())),
         Expr::BooleanLiteral(b) => Ok(ComptimeValue::Bool(b.value)),
-        Expr::NoneLiteral(_) => Err("None is not a valid comptime letue".into()),
+        Expr::NoneLiteral(_) => Err("None is not a valid comptime value".into()),
 
         // Unary `-` for negative literals
         Expr::UnaryOp(u) if matches!(u.op, ruff_python_ast::UnaryOp::USub) => {
             match eval_expr(&u.operand)? {
                 ComptimeValue::Int(n) => Ok(ComptimeValue::Int(-n)),
                 ComptimeValue::Float(f) => Ok(ComptimeValue::Float(-f)),
-                _ => Err("unary `-` is only valid on numeric comptime letues".into()),
+                _ => Err("unary `-` is only valid on numeric comptime values".into()),
             }
         }
 
@@ -351,7 +351,7 @@ fn eval_binop(
             }
         }
         _ => Err(format!(
-            "operator is not supported between these comptime letue types: {:?} {:?} {:?}",
+            "operator is not supported between these comptime value types: {:?} {:?} {:?}",
             op, lhs, rhs
         )),
     }

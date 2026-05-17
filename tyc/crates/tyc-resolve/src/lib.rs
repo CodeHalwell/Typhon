@@ -1117,18 +1117,35 @@ fn walk_expr(r: &mut Resolver, scope: ScopeId, expr: &Expr) {
             }
             walk_expr(r, scope2, &c.value);
         }
-        // Literals and f/t-string templates contain no name references at this
-        // level; their interpolated expressions are part of the FString/TString
-        // value structure which the resolver does not look into in v1.
+        // Literal-shaped expressions with no embedded references.
         Expr::NumberLiteral(_)
         | Expr::StringLiteral(_)
         | Expr::BytesLiteral(_)
         | Expr::BooleanLiteral(_)
         | Expr::NoneLiteral(_)
         | Expr::EllipsisLiteral(_)
-        | Expr::FString(_)
-        | Expr::TString(_)
         | Expr::IpyEscapeCommand(_) => {}
+        // f-strings and t-strings carry interpolated expressions inside
+        // their `value` structure (ruff folds the rustpython
+        // `FormattedValue`/`JoinedStr` variants away). Walk every
+        // interpolation so name references inside `f"{x}"` still feed
+        // unknown-name and unused-binding diagnostics. Format-specs are
+        // themselves InterpolatedStringElements, so a nested `{spec}` is
+        // visited via the same path on the next pass through this code.
+        Expr::FString(fs) => {
+            for elem in fs.value.elements() {
+                if let ast::InterpolatedStringElement::Interpolation(interp) = elem {
+                    walk_expr(r, scope, &interp.expression);
+                }
+            }
+        }
+        Expr::TString(ts) => {
+            for elem in ts.value.elements() {
+                if let ast::InterpolatedStringElement::Interpolation(interp) = elem {
+                    walk_expr(r, scope, &interp.expression);
+                }
+            }
+        }
         Expr::Named(n) => {
             walk_expr(r, scope, &n.value);
             if let Expr::Name(name) = n.target.as_ref() {
@@ -1477,6 +1494,22 @@ def foo():
         assert!(d.has_errors());
         let msg = format!("{}", d.errors()[0]);
         assert!(msg.contains("cannot find 'z'"), "got {}", msg);
+    }
+
+    #[test]
+    fn unknown_name_inside_fstring_interpolation_is_flagged() {
+        // ruff's FString embeds the interpolated expression inside
+        // `value.elements()` rather than exposing it as a top-level
+        // `Expr`, so the resolver must explicitly walk the InterpolatedStringElement
+        // tree. Otherwise unknown names inside `f"{…}"` go undetected.
+        let (_m, d) = resolve("x = f\"{missing_name}\"\n");
+        assert!(d.has_errors(), "f-string interpolation must be walked");
+        let msg = format!("{}", d.errors()[0]);
+        assert!(
+            msg.contains("cannot find 'missing_name'"),
+            "expected the unknown-name diagnostic to fire on the interpolation; got {}",
+            msg
+        );
     }
 
     #[test]

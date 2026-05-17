@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
 
 use clap::Args;
@@ -20,6 +20,7 @@ use miette::{miette, Result};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 
 use crate::commands::build::{self, BuildArgs};
+use crate::config::TyphonConfig;
 
 /// Arguments for `tyc ty`.
 #[derive(Args, Debug)]
@@ -141,17 +142,39 @@ pub fn run(args: TyArgs) -> Result<()> {
 /// rebuild so we don't kick off N redundant ty checks.
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(300);
 
+/// Resolve the source directory the watcher should observe. Mirrors the
+/// resolution `tyc build` performs: look up `typhon.toml` from
+/// `project_path` (or any ancestor), then join its `[project] src`
+/// against the directory containing that toml. Falls back to
+/// `project_path/src` (the default `src = "src"`) when no config file
+/// is found, which matches `tyc build`'s fallback behaviour.
+fn resolve_watched_src_dir(project_path: &Path) -> Result<PathBuf> {
+    match TyphonConfig::load(project_path) {
+        Ok(Some((toml_path, cfg))) => {
+            let dir = toml_path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| project_path.to_path_buf());
+            Ok(dir.join(&cfg.project.src))
+        }
+        Ok(None) => Ok(project_path.join("src")),
+        Err(e) => Err(miette!("failed to read typhon.toml: {e}")),
+    }
+}
+
 /// Run-once-then-watch loop for `tyc ty --watch`.
 ///
-/// Watches the project's `src/` directory recursively for `.ty` / `.dty`
-/// changes and re-runs the full `tyc ty` pipeline each time. Errors from
-/// any single iteration are printed but don't tear down the watcher —
-/// the user fixes their code and the next save triggers another run.
+/// Watches the project's source directory (resolved via `typhon.toml`'s
+/// `[project] src = …`, matching `tyc build`) recursively for `.ty` /
+/// `.dty` changes and re-runs the full `tyc ty` pipeline each time.
+/// Errors from any single iteration are printed but don't tear down the
+/// watcher — the user fixes their code and the next save triggers
+/// another run.
 fn run_watch(args: TyArgs) -> Result<()> {
-    let src_dir = args.path.join("src");
+    let src_dir = resolve_watched_src_dir(&args.path)?;
     if !src_dir.exists() {
         return Err(miette!(
-            "watch target '{}' does not exist; expected a `src/` directory in the project",
+            "watch target '{}' does not exist; check the `[project] src` setting in typhon.toml",
             src_dir.display()
         ));
     }
@@ -180,21 +203,33 @@ fn run_watch(args: TyArgs) -> Result<()> {
     }
 
     while let Ok(first) = rx.recv() {
-        if !event_is_relevant(&first) {
-            // Drain any other irrelevant events that arrived in the
-            // meantime so we don't process them on the next iteration.
-            drain_events(&rx, WATCH_DEBOUNCE);
-            continue;
-        }
-        // Debounce: keep absorbing events until WATCH_DEBOUNCE has elapsed
-        // since the last one. Editor saves often emit Create + Modify +
-        // Remove in rapid succession.
-        let deadline = Instant::now() + WATCH_DEBOUNCE;
+        // Debounce by draining further events that arrive within
+        // WATCH_DEBOUNCE of the most recent one. A typical editor save
+        // emits Create + Modify + Remove in rapid succession, and
+        // unrelated events (vim swap files, formatter touches, …) may
+        // be interleaved. We re-run whenever *any* event in the
+        // debounce window touched a `.ty` / `.dty` file — never bail
+        // out early on a lone irrelevant event, otherwise an editor
+        // that emits its temp-file event first would mask the real
+        // source-file modify event behind it.
+        let mut relevant = event_is_relevant(&first);
+        let mut deadline = Instant::now() + WATCH_DEBOUNCE;
         while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
             match rx.recv_timeout(remaining) {
-                Ok(_) => continue,
+                Ok(ev) => {
+                    if event_is_relevant(&ev) {
+                        relevant = true;
+                    }
+                    // Extend the debounce window from the latest event so
+                    // a steady stream of saves coalesces into one rebuild.
+                    deadline = Instant::now() + WATCH_DEBOUNCE;
+                }
                 Err(_) => break,
             }
+        }
+
+        if !relevant {
+            continue;
         }
 
         eprintln!("tyc ty --watch: change detected, re-running…");
@@ -238,17 +273,6 @@ fn has_typhon_extension(path: &Path) -> bool {
         path.extension().and_then(|s| s.to_str()),
         Some("ty") | Some("dty")
     )
-}
-
-/// Drain any events queued up within `window` so the next blocking
-/// `rx.recv()` starts from a clean state.
-fn drain_events(rx: &Receiver<Event>, window: Duration) {
-    let deadline = Instant::now() + window;
-    while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-        if rx.recv_timeout(remaining).is_err() {
-            return;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -356,7 +380,8 @@ mod tests {
     #[test]
     fn watch_without_src_dir_errors() {
         let tmp = tempfile::tempdir().unwrap();
-        // Don't create src/ — watch should reject this with a useful message.
+        // Don't create the source directory — watch should reject this
+        // with a useful message that points at the config setting.
         let result = run(TyArgs {
             path: tmp.path().to_path_buf(),
             out: None,
@@ -368,9 +393,34 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{:?}", result.unwrap_err());
         assert!(
-            msg.contains("does not exist") && msg.contains("src/"),
-            "error should explain the missing src/ directory: {msg}"
+            msg.contains("does not exist") && msg.contains("typhon.toml"),
+            "error should mention the missing dir + the config knob: {msg}"
         );
+    }
+
+    #[test]
+    fn watch_honours_custom_src_dir_in_typhon_toml() {
+        // A project that configures `[project] src = "source"` should be
+        // watched at `<project>/source`, not the default `<project>/src`.
+        let tmp = tempfile::tempdir().unwrap();
+        let custom = tmp.path().join("source");
+        std::fs::create_dir_all(&custom).unwrap();
+        std::fs::write(custom.join("main.ty"), "let x: int = 1\n").unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname = \"t\"\nsrc = \"source\"\n",
+        )
+        .unwrap();
+        let resolved = resolve_watched_src_dir(tmp.path()).unwrap();
+        assert_eq!(resolved, custom);
+    }
+
+    #[test]
+    fn watch_falls_back_to_src_when_no_config_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        let resolved = resolve_watched_src_dir(tmp.path()).unwrap();
+        assert_eq!(resolved, tmp.path().join("src"));
     }
 
     #[test]
