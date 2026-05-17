@@ -223,38 +223,48 @@ fn build_emits_typhon_runtime_when_result_used() {
 // ── tyc trace ────────────────────────────────────────────────────────────────
 
 #[test]
-fn trace_exits_successfully_as_stub() {
+fn trace_exits_zero_with_no_input() {
     let status = tyc().arg("trace").status().unwrap();
-    assert!(status.success(), "tyc trace should exit 0 (stub)");
+    assert!(status.success(), "tyc trace should exit 0 with no input");
 }
 
 #[test]
-fn trace_reports_not_implemented() {
+fn trace_reports_not_yet_implemented() {
     let out = tyc().arg("trace").output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("not yet implemented"),
-        "tyc trace should print 'not yet implemented' message; got: {stderr}"
+        "tyc trace should report that source-map tracing is not yet implemented; got: {stderr}"
     );
 }
 
 // ── tyc profile ───────────────────────────────────────────────────────────────
 
 #[test]
-fn profile_exits_successfully_as_stub() {
+fn profile_instruments_scaffolded_project() {
     let tmp = tempfile::tempdir().unwrap();
+    scaffold(tmp.path(), "def greet() -> str:\n    return \"hello\"\n");
     let status = tyc().arg("profile").arg(tmp.path()).status().unwrap();
-    assert!(status.success(), "tyc profile should exit 0 (stub)");
+    assert!(
+        status.success(),
+        "tyc profile should succeed on a valid project"
+    );
+    assert!(
+        tmp.path().join("build").join("typhon_profile.py").exists(),
+        "typhon_profile.py should be dropped into the build dir"
+    );
 }
 
 #[test]
-fn profile_reports_not_implemented() {
+fn profile_decorates_top_level_functions() {
     let tmp = tempfile::tempdir().unwrap();
-    let out = tyc().arg("profile").arg(tmp.path()).output().unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    scaffold(tmp.path(), "def greet() -> str:\n    return \"hello\"\n");
+    let status = tyc().arg("profile").arg(tmp.path()).status().unwrap();
+    assert!(status.success(), "tyc profile should succeed");
+    let py = std::fs::read_to_string(tmp.path().join("build").join("main.py")).unwrap();
     assert!(
-        stderr.contains("not yet implemented"),
-        "tyc profile should print 'not yet implemented' message; got: {stderr}"
+        py.contains("@__typhon_profile_record"),
+        "top-level functions should be decorated with @__typhon_profile_record; got:\n{py}"
     );
 }
 

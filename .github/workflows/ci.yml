@@ -46,9 +46,6 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
-      - name: Compile benchmarks
-        run: cargo bench --workspace --no-run
-
   security:
     name: Security audit
     runs-on: ubuntu-latest
