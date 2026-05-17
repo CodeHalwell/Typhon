@@ -11,6 +11,10 @@ publish = false
 test = false
 doctest = false
 
+[[test]]
+name = "typhon_mutability"
+path = "tests/typhon_mutability.rs"
+
 [dependencies]
 ruff_python_ast = { workspace = true, features = ["get-size"] }
 ruff_python_trivia = { workspace = true }

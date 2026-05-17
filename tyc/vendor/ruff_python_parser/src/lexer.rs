@@ -738,6 +738,8 @@ impl<'src> Lexer<'src> {
             "return" => TokenKind::Return,
             "try" => TokenKind::Try,
             "type" => TokenKind::Type,
+            "val" => TokenKind::Val,
+            "var" => TokenKind::Var,
             "while" => TokenKind::While,
             "with" => TokenKind::With,
             "yield" => TokenKind::Yield,

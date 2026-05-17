@@ -261,6 +261,52 @@ impl<'src> Parser<'src> {
     ///
     /// See: <https://docs.python.org/3/reference/simple_stmts.html>
     fn parse_simple_statement(&mut self) -> Stmt {
+        // Typhon-specific: handle `val` / `var` prefix on assignments.
+        //
+        // `val name` and `var name` at the start of a simple statement are
+        // recognised as mutability prefixes; the keyword is consumed and the
+        // resulting `StmtAssign` / `StmtAnnAssign` carries the `mutability`
+        // field. Anywhere else `val` and `var` behave as ordinary identifiers
+        // (they are soft keywords).
+        let kind = self.current_token_kind();
+        if matches!(kind, TokenKind::Val | TokenKind::Var) && self.peek() == TokenKind::Name {
+            let mutability = match kind {
+                TokenKind::Val => ast::Mutability::Val,
+                TokenKind::Var => ast::Mutability::Var,
+                _ => unreachable!(),
+            };
+            let start = self.node_start();
+            self.bump(kind);
+
+            let parsed_expr =
+                self.parse_expression_list(ExpressionContext::yield_or_starred_bitwise_or());
+
+            if self.at(TokenKind::Equal) {
+                let mut stmt = self.parse_assign_statement(parsed_expr, start);
+                stmt.mutability = Some(mutability);
+                return Stmt::Assign(stmt);
+            } else if self.at(TokenKind::Colon) {
+                let mut stmt = self.parse_annotated_assignment_statement(parsed_expr, start);
+                stmt.mutability = Some(mutability);
+                return Stmt::AnnAssign(stmt);
+            }
+            // `val name` on its own is a syntax error in Typhon — emit a
+            // diagnostic and fall through, treating the result as an
+            // expression statement (the value will be the bare name).
+            self.add_error(
+                ParseErrorType::OtherError(format!(
+                    "`{}` must be followed by an assignment (`= value` or `: type = value`)",
+                    mutability.as_str(),
+                )),
+                self.current_token_range(),
+            );
+            return Stmt::Expr(ast::StmtExpr {
+                range: self.node_range(start),
+                value: Box::new(parsed_expr.expr),
+                node_index: AtomicNodeIndex::NONE,
+            });
+        }
+
         match self.current_token_kind() {
             TokenKind::Return => Stmt::Return(self.parse_return_statement()),
             TokenKind::Import => {
@@ -1254,6 +1300,7 @@ impl<'src> Parser<'src> {
             value: Box::new(value.expr),
             range: self.node_range(start),
             node_index: AtomicNodeIndex::NONE,
+            mutability: None,
         }
     }
 
@@ -1334,6 +1381,7 @@ impl<'src> Parser<'src> {
             simple,
             range: self.node_range(start),
             node_index: AtomicNodeIndex::NONE,
+            mutability: None,
         }
     }
 

@@ -27,6 +27,36 @@ use crate::{
     str::{Quote, TripleQuotes},
 };
 
+/// Typhon-specific mutability prefix attached to an assignment statement.
+///
+/// Added by Typhon's fork of `ruff_python_parser` so that `val x = 1` and
+/// `var x = 1` round-trip through the AST without a separate preprocessor
+/// pass. Standard Python keeps `mutability == None`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "get-size", derive(get_size2::GetSize))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum Mutability {
+    /// `val` — immutable binding.
+    Val,
+    /// `var` — mutable binding.
+    Var,
+}
+
+impl Mutability {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Mutability::Val => "val",
+            Mutability::Var => "var",
+        }
+    }
+}
+
+impl fmt::Display for Mutability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl StmtClassDef {
     /// Return an iterator over the bases of the class.
     pub fn bases(&self) -> &[Expr] {

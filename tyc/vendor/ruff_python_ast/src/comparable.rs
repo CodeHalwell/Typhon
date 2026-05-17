@@ -1689,6 +1689,7 @@ impl<'a> From<&'a ast::Stmt> for ComparableStmt<'a> {
                 value,
                 range: _,
                 node_index: _,
+                mutability: _,
             }) => Self::Assign(StmtAssign {
                 targets: targets.iter().map(Into::into).collect(),
                 value: value.into(),
@@ -1711,6 +1712,7 @@ impl<'a> From<&'a ast::Stmt> for ComparableStmt<'a> {
                 simple,
                 range: _,
                 node_index: _,
+                mutability: _,
             }) => Self::AnnAssign(StmtAnnAssign {
                 target: target.into(),
                 annotation: annotation.into(),

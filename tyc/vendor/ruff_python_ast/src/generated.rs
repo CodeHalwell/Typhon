@@ -9035,6 +9035,8 @@ pub struct StmtAssign {
     pub range: ruff_text_size::TextRange,
     pub targets: Vec<Expr>,
     pub value: Box<Expr>,
+    /// Typhon-specific `val` / `var` prefix; `None` for standard Python.
+    pub mutability: Option<crate::Mutability>,
 }
 
 /// See also [AugAssign](https://docs.python.org/3/library/ast.html#ast.AugAssign)
@@ -9058,6 +9060,8 @@ pub struct StmtAnnAssign {
     pub annotation: Box<Expr>,
     pub value: Option<Box<Expr>>,
     pub simple: bool,
+    /// Typhon-specific `val` / `var` prefix; `None` for standard Python.
+    pub mutability: Option<crate::Mutability>,
 }
 
 /// See also [For](https://docs.python.org/3/library/ast.html#ast.For)
@@ -9908,6 +9912,7 @@ impl StmtAssign {
             value,
             range: _,
             node_index: _,
+            mutability: _,
         } = self;
 
         for elm in targets {
@@ -9947,6 +9952,7 @@ impl StmtAnnAssign {
             simple: _,
             range: _,
             node_index: _,
+            mutability: _,
         } = self;
         visitor.visit_expr(target);
         visitor.visit_annotation(annotation);
