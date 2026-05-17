@@ -12,7 +12,10 @@ use miette::{miette, Result};
 use rustpython_ast::{text_size::TextRange, Constant, Expr, ExprConstant, Mod, Stmt};
 use rustpython_parser::{parse, Mode};
 
-use tyc_analyse::{analyse_purity, evaluate_comptime, purity_diagnostics, ComptimeValue};
+use tyc_analyse::{
+    analyse_purity, collect_gatherable_async_fn_names, evaluate_comptime, load_profile_samples,
+    pgo_memoise_targets, purity_diagnostics, rewrite_auto_gather, ComptimeValue, ProfileSample,
+};
 use tyc_db::{check_file, TycDatabase};
 use tyc_desugar::{desugar_module_with, DesugarOptions};
 use tyc_diagnostics::Diagnostics;
@@ -145,6 +148,18 @@ pub fn run(args: BuildArgs) -> Result<()> {
         ));
     }
 
+    // Phase 4 profile-guided optimisation: when `[strictness] pgo-memoise =
+    // true`, load `typhon-profile.json` from the project root once and feed
+    // it into each module's memoise-target computation. A missing file
+    // yields an empty map (PGO is best-effort), so projects that have not
+    // yet run `tyc profile` simply fall through to the explicit-decorator
+    // path.
+    let profile_samples: HashMap<String, ProfileSample> = if config.strictness.pgo_memoise {
+        load_profile_samples(&config_dir.join("typhon-profile.json"))
+    } else {
+        HashMap::new()
+    };
+
     // Phase 2: desugar and emit using the already-loaded source text.
     let mut emitted = 0usize;
     let mut needs_runtime = false;
@@ -207,11 +222,55 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 path.display()
             ));
         }
-        let memoise_targets: Vec<String> = purity_findings
+        let mut memoise_targets: Vec<String> = purity_findings
             .iter()
             .filter(|f| f.violation.is_none() && f.memoise)
             .map(|f| f.name.clone())
             .collect();
+
+        // Phase 4 PGO: add every pure function whose observed call count
+        // (from the loaded profile) meets the threshold. The matcher
+        // requires an exact `<module>.<fn>` profile key for this file's
+        // module so a hot `main.fib` doesn't accidentally promote a
+        // coincidentally-named `util.fib` in another module. Names
+        // already in `memoise_targets` are skipped so the desugarer
+        // doesn't emit two cache decorators on the same definition.
+        if !profile_samples.is_empty() {
+            let pgo_candidates: Vec<String> = purity_findings
+                .iter()
+                .filter(|f| f.violation.is_none())
+                .map(|f| f.name.clone())
+                .collect();
+            let module_name = python_module_name_from_path(path, &src_dir);
+            let promoted = pgo_memoise_targets(
+                &profile_samples,
+                &module_name,
+                &pgo_candidates,
+                config.strictness.pgo_min_calls,
+            );
+            for name in promoted {
+                if !memoise_targets.contains(&name) {
+                    memoise_targets.push(name);
+                }
+            }
+        }
+
+        // Phase 4 auto-gather inference: when `[strictness] auto-gather = true`,
+        // fold runs of independent awaits whose callees are `@gatherable`
+        // module-level `async def`s into `asyncio.TaskGroup` blocks. The
+        // user opts each callee in by writing the decorator; we never infer
+        // gather-safety since same-module async fns may share I/O ordering
+        // or other invisible state.  The desugar pass downstream notices
+        // the qualified `asyncio.TaskGroup` reference and injects
+        // `import asyncio` if it isn't already in scope, so no extra
+        // wiring is needed here.
+        let module = if config.strictness.auto_gather {
+            let eligible = collect_gatherable_async_fn_names(&module);
+            let (rewritten, _stats) = rewrite_auto_gather(module, &eligible);
+            rewritten
+        } else {
+            module
+        };
 
         let desugar_output = desugar_module_with(
             &module,
@@ -337,6 +396,25 @@ pub fn run(args: BuildArgs) -> Result<()> {
 
     println!("built {} file(s) → '{}'", emitted, out_dir.display());
     Ok(())
+}
+
+/// Derive the dotted Python module name that the runtime profiler
+/// would record for a `.ty` source file. `src/main.ty` becomes `main`;
+/// `src/pkg/sub/helpers.ty` becomes `pkg.sub.helpers`. The matcher in
+/// `pgo_memoise_targets` keys profile lookups on this string so the
+/// build doesn't confuse same-named functions in different modules.
+fn python_module_name_from_path(path: &std::path::Path, src_dir: &std::path::Path) -> String {
+    let rel = path.strip_prefix(src_dir).unwrap_or(path);
+    let stem = rel.with_extension("");
+    let mut parts: Vec<String> = Vec::new();
+    for component in stem.components() {
+        if let std::path::Component::Normal(s) = component {
+            if let Some(name) = s.to_str() {
+                parts.push(name.to_owned());
+            }
+        }
+    }
+    parts.join(".")
 }
 
 /// Minimal JSON string escape for paths used in the `.py.map` body.  Only
@@ -583,6 +661,67 @@ mod tests {
             dir.join("typhon.toml"),
             "[project]\nname = \"test\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
              [python]\ntarget = \"3.13\"\n[emit]\nformat = false\n[strictness]\n[env]\n",
+        )
+        .unwrap();
+        std::fs::write(src_dir.join("main.ty"), src_content).unwrap();
+        (src_dir, out_dir)
+    }
+
+    /// Same as `scaffold`, but with `pgo-memoise = true` and a synthetic
+    /// `typhon-profile.json` written at the project root so the Phase-4
+    /// PGO path runs end-to-end.
+    ///
+    /// `profile_entries` is a list of `(qualname, calls)` rows. The function
+    /// writes a minimal JSON object matching the schema `tyc profile`
+    /// emits.
+    fn scaffold_pgo(
+        dir: &std::path::Path,
+        src_content: &str,
+        profile_entries: &[(&str, u64)],
+        min_calls: u64,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let src_dir = dir.join("src");
+        let out_dir = dir.join("build");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let toml = format!(
+            "[project]\nname = \"test\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+             [python]\ntarget = \"3.13\"\n[emit]\nformat = false\n\
+             [strictness]\npgo-memoise = true\npgo-min-calls = {min_calls}\n[env]\n"
+        );
+        std::fs::write(dir.join("typhon.toml"), toml).unwrap();
+        std::fs::write(src_dir.join("main.ty"), src_content).unwrap();
+
+        // Build the profile JSON by hand to keep this test independent of
+        // the runtime helper's serialisation.
+        let mut profile = String::from("{");
+        for (i, (name, calls)) in profile_entries.iter().enumerate() {
+            if i > 0 {
+                profile.push(',');
+            }
+            profile.push_str(&format!(
+                "\"{name}\": {{\"calls\": {calls}, \"total_seconds\": 0.001}}"
+            ));
+        }
+        profile.push('}');
+        std::fs::write(dir.join("typhon-profile.json"), profile).unwrap();
+
+        (src_dir, out_dir)
+    }
+
+    /// Same as `scaffold`, but with `auto-gather = true` set under `[strictness]`
+    /// so the Phase-4 auto-gather pass runs end-to-end.
+    fn scaffold_auto_gather(
+        dir: &std::path::Path,
+        src_content: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let src_dir = dir.join("src");
+        let out_dir = dir.join("build");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(
+            dir.join("typhon.toml"),
+            "[project]\nname = \"test\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+             [python]\ntarget = \"3.13\"\n[emit]\nformat = false\n\
+             [strictness]\nauto-gather = true\n[env]\n",
         )
         .unwrap();
         std::fs::write(src_dir.join("main.ty"), src_content).unwrap();
@@ -930,6 +1069,240 @@ val pet: Animal = Dog(name=\"Rex\")
         assert!(
             result.is_err_and(|e| e.to_string().contains("fix type errors")),
             "assigning a non-conforming type to an interface variable should fail with a type error"
+        );
+    }
+
+    // ── Phase 4: profile-guided memoise end-to-end ──────────────────────────
+
+    #[test]
+    fn build_pgo_promotes_hot_pure_function_to_cache() {
+        // `@pure` function that the profile reports as hot — PGO should add
+        // it to the memoise list and the desugarer must emit
+        // `@functools.cache`.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = "\
+@pure
+def hot(n: int) -> int:
+    return n + 1
+";
+        let (_, out_dir) = scaffold_pgo(tmp.path(), src, &[("main.hot", 5_000)], 100);
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        })
+        .unwrap();
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        assert!(
+            py.contains("functools"),
+            "hot @pure function should be cached by PGO; got:\n{py}"
+        );
+        assert!(
+            py.contains("cache"),
+            "PGO should inject @functools.cache; got:\n{py}"
+        );
+    }
+
+    #[test]
+    fn build_pgo_leaves_cold_function_uncached() {
+        // The profile says `cold` was called once. With min-calls=100 PGO
+        // must NOT promote it, so the emitted Python should have no
+        // `functools.cache` decorator.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = "\
+@pure
+def cold(n: int) -> int:
+    return n + 1
+";
+        let (_, out_dir) = scaffold_pgo(tmp.path(), src, &[("main.cold", 1)], 100);
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        })
+        .unwrap();
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        assert!(
+            !py.contains("@functools.cache"),
+            "cold @pure function must NOT be cached by PGO; got:\n{py}"
+        );
+    }
+
+    #[test]
+    fn build_pgo_flag_off_ignores_profile_file() {
+        // Same source + profile as the hot-function test, but the project
+        // config does not enable PGO. The profile must be ignored.
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        let out_dir = tmp.path().join("build");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname = \"t\"\nversion = \"0.1\"\nsrc = \"src\"\nout = \"build\"\n\
+             [python]\ntarget = \"3.13\"\n[emit]\nformat = false\n[strictness]\n[env]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src_dir.join("main.ty"),
+            "@pure\ndef hot(n: int) -> int:\n    return n + 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("typhon-profile.json"),
+            "{\"main.hot\": {\"calls\": 5000, \"total_seconds\": 0.5}}",
+        )
+        .unwrap();
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        })
+        .unwrap();
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        assert!(
+            !py.contains("@functools.cache"),
+            "PGO off => profile must be ignored; got:\n{py}"
+        );
+    }
+
+    #[test]
+    fn build_auto_gather_requires_gatherable_decorator() {
+        // With auto-gather enabled but no @gatherable decorators on the
+        // callees, the pass must leave the sequential awaits alone.
+        // Regression for the Copilot review on auto-gather eligibility.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = "\
+async def fetch_a() -> int:
+    return 1
+async def fetch_b() -> int:
+    return 2
+
+async def load() -> int:
+    a = await fetch_a()
+    b = await fetch_b()
+    return a + b
+";
+        let (_, out_dir) = scaffold_auto_gather(tmp.path(), src);
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        })
+        .unwrap();
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        assert!(
+            !py.contains("TaskGroup"),
+            "callees without @gatherable must NOT be gathered; got:\n{py}"
+        );
+    }
+
+    // ── Phase 4: auto-gather inference end-to-end ───────────────────────────
+
+    #[test]
+    fn build_auto_gather_flag_off_keeps_sequential_awaits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = "\
+@gatherable
+async def fetch_a() -> int:
+    return 1
+@gatherable
+async def fetch_b() -> int:
+    return 2
+
+async def load() -> int:
+    a = await fetch_a()
+    b = await fetch_b()
+    return a + b
+";
+        let (_, out_dir) = scaffold(tmp.path(), src);
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        })
+        .unwrap();
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        assert!(
+            !py.contains("TaskGroup"),
+            "auto-gather is off — should NOT emit TaskGroup; got:\n{py}"
+        );
+        assert!(
+            py.contains("a = await fetch_a"),
+            "sequential await should be preserved; got:\n{py}"
+        );
+    }
+
+    #[test]
+    fn build_auto_gather_flag_on_folds_independent_awaits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = "\
+@gatherable
+async def fetch_a() -> int:
+    return 1
+@gatherable
+async def fetch_b() -> int:
+    return 2
+
+async def load() -> int:
+    a = await fetch_a()
+    b = await fetch_b()
+    return a + b
+";
+        let (_, out_dir) = scaffold_auto_gather(tmp.path(), src);
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        })
+        .unwrap();
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        assert!(
+            py.contains("asyncio.TaskGroup"),
+            "auto-gather is on — should emit asyncio.TaskGroup; got:\n{py}"
+        );
+        assert!(
+            py.contains("import asyncio"),
+            "should inject `import asyncio` for the rewritten block; got:\n{py}"
+        );
+        assert!(
+            !py.contains("a = await fetch_a"),
+            "original sequential await should be folded away; got:\n{py}"
+        );
+    }
+
+    #[test]
+    fn build_auto_gather_respects_data_dependencies() {
+        // Second await consumes the first's binding, so the run must NOT
+        // be folded even with auto-gather enabled.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = "\
+@gatherable
+async def fetch_a() -> int:
+    return 1
+@gatherable
+async def fetch_b(x: int) -> int:
+    return x
+
+async def load() -> int:
+    a = await fetch_a()
+    b = await fetch_b(a)
+    return a + b
+";
+        let (_, out_dir) = scaffold_auto_gather(tmp.path(), src);
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+        })
+        .unwrap();
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        assert!(
+            !py.contains("TaskGroup"),
+            "dependent awaits must NOT be gathered; got:\n{py}"
+        );
+        assert!(
+            py.contains("a = await fetch_a") && py.contains("b = await fetch_b(a)"),
+            "sequential awaits must be preserved verbatim; got:\n{py}"
         );
     }
 

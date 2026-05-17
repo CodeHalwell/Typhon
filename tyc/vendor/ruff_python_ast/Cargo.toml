@@ -1,0 +1,16 @@
+[package]
+name = "ruff_python_ast"
+version = "0.0.0-typhon-scaffold"
+edition.workspace = true
+license.workspace = true
+description = "Vendored copy of ruff_python_ast (SCAFFOLD — empty stub)"
+publish = false
+
+# This crate is part of the Phase-0-follow-up Ruff vendor effort.  See
+# vendor/README.md for the migration plan.  It is intentionally empty
+# today: the workspace compiles it, but no consumer crate depends on
+# it yet.  When the migration runs, this stub gets replaced with the
+# real ruff_python_ast source plus the Typhon-specific token additions
+# (val/var) described in docs/roadmap.md.
+
+[dependencies]

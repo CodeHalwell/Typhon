@@ -6,7 +6,13 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Phase 0 — Foundation (months 1–2) — substantially complete
 
-- ☐ Fork `ruff_python_parser` and `ruff_python_ast` into `vendor/`. *Deferred — currently using `rustpython-parser` 0.4 from crates.io as the Phase-0 fallback. The fork lands in a follow-up.*
+- ☐ Fork `ruff_python_parser` and `ruff_python_ast` into `vendor/`. *Scaffolded
+  — the workspace now declares empty `vendor/ruff_python_ast` and
+  `vendor/ruff_python_parser` member crates with the dependency edge
+  wired up; production Typhon still routes through `rustpython-parser`
+  0.4 from crates.io. The real source plus the `val`/`var` lexer
+  additions land when the migration described in `tyc/vendor/README.md`
+  runs.*
 - ✅ Add one or two custom tokens (`val`, `var`) to confirm the fork-extend workflow.
 - ☐ Round-trip Python through the fork via `ruff_python_codegen`: parse → emit, verify byte-identical (modulo whitespace) on a corpus of real Python files. *Hand-written `tyc-emit` printer covers the Python subset used in Phase 0/1 round-trip tests; corpus verification deferred until the ruff fork lands.*
 - ✅ `clap`-based `tyc` shell with `tyc fmt` working as the simplest end-to-end command.
@@ -84,12 +90,36 @@ Everything beyond is polish and ambition.
 
 ## Phase 4+ — Beyond v1
 
-- Automatic `asyncio.gather` inference (conservative, `@pure` straight-line code only).
+- ✅ **Automatic `asyncio.gather` inference** (conservative). Runs of two or
+  more independent `name = await callee(...)` statements inside an
+  `async def` are folded into an `asyncio.TaskGroup` block when the callee
+  is a same-module `async def` and the awaits are statically independent.
+  Opt-in via `[strictness] auto-gather = true`. The desugar pass injects
+  `import asyncio` if missing.
 - Loop parallelisation for pure comprehensions on free-threaded Python.
 - Richer comptime: `comptime` functions, types as values.
-- PGO via `tyc profile`.
-- LSP completions and code actions; go-to-definition across `.ty` and `.py` boundaries via source maps.
+- ✅ **PGO via `tyc profile`**. When `[strictness] pgo-memoise = true`,
+  `tyc build` loads `typhon-profile.json` from the project root and
+  promotes every `@pure` function whose observed call count meets
+  `pgo-min-calls` (default 100) to `@functools.cache`, even when the
+  user did not write `@memo`. Complements `auto-memoise` (which caches
+  every pure function regardless of profile data). Missing profile
+  file is not an error — PGO is best-effort.
+- ✅ **LSP completions and code actions**. `textDocument/completion`
+  returns visible bindings (walking the cursor's enclosing scope chain),
+  Typhon keywords (`val`, `var`, `gather`, `go`, `lazy`, …), and a
+  small set of common Python builtins; the LSP client filters by prefix.
+  `textDocument/codeAction` offers a "Remove unused import" quick-fix
+  for every `tyc::unused_import` diagnostic in range. Cross-file
+  go-to-definition across `.ty` / `.py` boundaries via source maps is
+  still pending the v2 source-map format.
 - Migration tooling from typed `.py` to `.ty` (`Optional[T]` → `T?`, dataclasses → Typhon classes, etc.).
+- **`ty` integration** as a complementary second-stage checker over the
+  desugared Python. Planned in two phases: first as a subprocess
+  invocation of `ty check` with diagnostic attribution via the source
+  maps (no dependency on the Ruff vendor), later as an embedded
+  library sharing the Salsa db. See [docs/ty-integration.md](ty-integration.md)
+  for the full plan.
 
 ## Scope-cutting rule
 

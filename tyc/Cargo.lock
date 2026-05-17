@@ -1200,6 +1200,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
+name = "ruff_python_ast"
+version = "0.0.0-typhon-scaffold"
+
+[[package]]
+name = "ruff_python_parser"
+version = "0.0.0-typhon-scaffold"
+dependencies = [
+ "ruff_python_ast",
+]
+
+[[package]]
 name = "rustc-demangle"
 version = "0.1.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1782,7 +1793,9 @@ version = "0.1.0"
 dependencies = [
  "rustpython-ast",
  "rustpython-parser",
+ "tempfile",
  "tyc-diagnostics",
+ "tyc-emit",
  "tyc-syntax",
 ]
 

@@ -13,11 +13,14 @@ use miette::{Diagnostic as MietteDiagnostic, LabeledSpan};
 use rustpython_parser::{parse, Mode};
 use tokio::sync::Mutex;
 use tower_lsp_server::ls_types::{
-    Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
-    HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
-    Location, MarkedString, MessageType, NumberOrString, OneOf, Position, Range,
-    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
+    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
+    CodeActionProviderCapability, CodeActionResponse, CompletionItem, CompletionItemKind,
+    CompletionOptions, CompletionParams, CompletionResponse, Diagnostic, DiagnosticSeverity,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
+    HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, Location,
+    MarkedString, MessageType, NumberOrString, OneOf, Position, Range, ServerCapabilities,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
 };
 use tower_lsp_server::{jsonrpc, Client, LanguageServer, LspService, Server};
 use tyc_db::{check_file, TycDatabase};
@@ -159,6 +162,14 @@ impl LanguageServer for Backend {
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                completion_provider: Some(CompletionOptions {
+                    // Trigger on `.` so member access pulls up class/instance
+                    // bindings (currently we just return the visible-name list;
+                    // the LSP client filters by prefix as the user types).
+                    trigger_characters: Some(vec![".".to_string()]),
+                    ..Default::default()
+                }),
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -228,6 +239,39 @@ impl LanguageServer for Backend {
             contents: HoverContents::Scalar(MarkedString::String(body)),
             range,
         }))
+    }
+
+    async fn completion(
+        &self,
+        params: CompletionParams,
+    ) -> jsonrpc::Result<Option<CompletionResponse>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let Some(text) = self.document_text(&uri).await else {
+            return Ok(None);
+        };
+        let Some(resolved) = self.resolve_in_text(&text) else {
+            return Ok(None);
+        };
+        let preprocessed = self.preprocessed_text(&text);
+        let items = compute_completion_items(&resolved, &preprocessed, position);
+        Ok(Some(CompletionResponse::Array(items)))
+    }
+
+    async fn code_action(
+        &self,
+        params: CodeActionParams,
+    ) -> jsonrpc::Result<Option<CodeActionResponse>> {
+        let uri = params.text_document.uri;
+        let Some(text) = self.document_text(&uri).await else {
+            return Ok(None);
+        };
+        let actions = compute_code_actions(&uri, &text, &params.context.diagnostics);
+        if actions.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(actions))
+        }
     }
 
     async fn goto_definition(
@@ -342,6 +386,300 @@ pub fn run_stdio(log_level: LogLevel) {
         });
         Server::new(stdin, stdout, socket).serve(service).await;
     });
+}
+
+/// Typhon-specific keywords that the LSP advertises in completion.  Kept
+/// in one place so adding a new keyword (e.g. `gather`, `pure`) updates
+/// completion uniformly.
+const TYPHON_KEYWORDS: &[&str] = &[
+    "val",
+    "var",
+    "interface",
+    "model",
+    "impl",
+    "extend",
+    "unsafe",
+    "comptime",
+    "lazy",
+    "gather",
+    "go",
+    "pure",
+    "memo",
+];
+
+/// A short, hand-curated list of Python builtins surfaced in completion so
+/// the LSP has something to offer even before any names are declared.  The
+/// resolver already accepts these as in-scope (see `builtin_names()` in
+/// `tyc-resolve`) so a completion that picks one is always valid.
+const COMMON_BUILTINS: &[&str] = &[
+    "print",
+    "len",
+    "range",
+    "abs",
+    "min",
+    "max",
+    "sum",
+    "sorted",
+    "list",
+    "dict",
+    "set",
+    "tuple",
+    "int",
+    "str",
+    "float",
+    "bool",
+    "bytes",
+    "isinstance",
+    "issubclass",
+    "type",
+    "enumerate",
+    "zip",
+    "map",
+    "filter",
+    "any",
+    "all",
+];
+
+/// Build the list of completion items for a cursor in `preprocessed` text
+/// at `position`.  Pure of LSP plumbing so it can be unit-tested.
+///
+/// The result combines (a) bindings visible from the cursor's enclosing
+/// scope, (b) Typhon keywords, and (c) a small set of common Python
+/// builtins.  The LSP client is responsible for prefix-filtering the
+/// returned list.
+pub fn compute_completion_items(
+    resolved: &ResolvedModule,
+    preprocessed: &str,
+    position: Position,
+) -> Vec<CompletionItem> {
+    let offset = position_to_byte(preprocessed, position);
+    let scope_id = resolved.scope_at_offset(offset);
+    let mut items: Vec<CompletionItem> = Vec::new();
+    for b in resolved.visible_bindings(scope_id) {
+        items.push(binding_to_completion(b));
+    }
+    for kw in TYPHON_KEYWORDS {
+        items.push(simple_completion(
+            kw,
+            CompletionItemKind::KEYWORD,
+            Some("Typhon keyword".to_owned()),
+        ));
+    }
+    for name in COMMON_BUILTINS {
+        items.push(simple_completion(
+            name,
+            CompletionItemKind::FUNCTION,
+            Some("builtin".to_owned()),
+        ));
+    }
+    items
+}
+
+/// Build the list of code actions for `diagnostics` against `text`.
+/// Pure of LSP plumbing so it can be unit-tested.
+///
+/// v1 surfaces a single action: a `tyc::unused_import` diagnostic gets
+/// a "Remove unused import" quick-fix that deletes the offending line,
+/// but **only when the line is a single, simple import statement**.
+/// Lines that mix multiple imports (`import os, sys`), chain statements
+/// with `;`, or otherwise carry content beyond the import are skipped:
+/// deleting the whole line would lose the still-used parts.  A
+/// follow-up can offer a surgical edit that removes just the dead
+/// alias for the comma case.
+pub fn compute_code_actions(
+    uri: &Uri,
+    text: &str,
+    diagnostics: &[Diagnostic],
+) -> Vec<CodeActionOrCommand> {
+    let mut actions: Vec<CodeActionOrCommand> = Vec::new();
+    for diag in diagnostics {
+        if !diagnostic_code_matches(diag, "tyc::unused_import") {
+            continue;
+        }
+        let line = diag.range.start.line;
+        let line_text = nth_line_content(text, line);
+        if !is_safe_single_import_line(line_text) {
+            // Bail rather than emit an unsafe edit. The diagnostic still
+            // surfaces in the editor; the user fixes by hand for now.
+            continue;
+        }
+        let line_range = whole_line_range(text, line);
+        let edit = TextEdit {
+            range: line_range,
+            new_text: String::new(),
+        };
+        let mut changes = std::collections::HashMap::new();
+        changes.insert(uri.clone(), vec![edit]);
+        actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+            title: "Remove unused import".to_string(),
+            kind: Some(CodeActionKind::QUICKFIX),
+            diagnostics: Some(vec![diag.clone()]),
+            edit: Some(WorkspaceEdit {
+                changes: Some(changes),
+                document_changes: None,
+                change_annotations: None,
+            }),
+            command: None,
+            is_preferred: Some(true),
+            disabled: None,
+            data: None,
+        }));
+    }
+    actions
+}
+
+/// Extract the text content of `text`'s line `line` (0-indexed),
+/// without the trailing newline. Returns `""` if the line is out of
+/// range.
+fn nth_line_content(text: &str, line: u32) -> &str {
+    let mut current: u32 = 0;
+    let mut start: usize = 0;
+    let bytes = text.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        if current == line {
+            // Find end of this line.
+            let end = bytes[i..]
+                .iter()
+                .position(|c| *c == b'\n')
+                .map(|p| i + p)
+                .unwrap_or(bytes.len());
+            return &text[start..end];
+        }
+        if *b == b'\n' {
+            current += 1;
+            start = i + 1;
+        }
+    }
+    if current == line {
+        return &text[start..];
+    }
+    ""
+}
+
+/// True when `line` is exactly one simple import statement: `import X`,
+/// `import X as Y`, or `from M import N` / `from M import N as A` with
+/// no commas (which would indicate multiple imports), no semicolons
+/// (which would chain a second statement), and no inline `#` comment
+/// containing meaningful directives. The leading and trailing
+/// whitespace is allowed; a trailing `#` line-comment is also tolerated
+/// because dropping it with the import is harmless.
+fn is_safe_single_import_line(line: &str) -> bool {
+    // Strip a trailing line-comment first; we ignore it for the safety
+    // check because it's documentation for the import that's about to
+    // disappear anyway. Be careful not to split inside a string literal —
+    // imports never contain string literals so a simple `#` search
+    // suffices.
+    let core = match line.split_once('#') {
+        Some((before, _)) => before,
+        None => line,
+    };
+    let trimmed = core.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.contains(';') {
+        return false;
+    }
+    // `import a, b` and `from m import a, b` both signal multiple imports
+    // and make the whole-line edit unsafe — only the unused name should
+    // be removed in those cases, which the v1 quick-fix doesn't support.
+    if trimmed.contains(',') {
+        return false;
+    }
+    trimmed.starts_with("import ") || trimmed.starts_with("from ")
+}
+
+/// Convert a resolved binding to an LSP completion item.  The item kind
+/// hints the editor's icon (function vs class vs variable); detail is a
+/// short type-ish string the editor shows alongside the name.
+fn binding_to_completion(binding: &tyc_resolve::Binding) -> CompletionItem {
+    let kind = match binding.kind {
+        BindingKind::Function => CompletionItemKind::FUNCTION,
+        BindingKind::Class => CompletionItemKind::CLASS,
+        BindingKind::Parameter => CompletionItemKind::VARIABLE,
+        BindingKind::Import => CompletionItemKind::MODULE,
+        BindingKind::Loop => CompletionItemKind::VARIABLE,
+        BindingKind::Value => match binding.mutability {
+            Mutability::Val => CompletionItemKind::CONSTANT,
+            Mutability::Var => CompletionItemKind::VARIABLE,
+        },
+    };
+    let detail = match binding.kind {
+        BindingKind::Function => Some("function".to_owned()),
+        BindingKind::Class => Some("class".to_owned()),
+        BindingKind::Parameter => Some("parameter".to_owned()),
+        BindingKind::Import => Some("import".to_owned()),
+        BindingKind::Loop => Some("loop binding".to_owned()),
+        BindingKind::Value => Some(
+            match binding.mutability {
+                Mutability::Val => "val",
+                Mutability::Var => "var",
+            }
+            .to_owned(),
+        ),
+    };
+    CompletionItem {
+        label: binding.name.clone(),
+        kind: Some(kind),
+        detail,
+        ..Default::default()
+    }
+}
+
+fn simple_completion(
+    label: &str,
+    kind: CompletionItemKind,
+    detail: Option<String>,
+) -> CompletionItem {
+    CompletionItem {
+        label: label.to_owned(),
+        kind: Some(kind),
+        detail,
+        ..Default::default()
+    }
+}
+
+/// Return the LSP `Range` covering the entirety of `line` (including its
+/// terminating newline, so deleting the edit removes the whole line).
+fn whole_line_range(text: &str, line: u32) -> Range {
+    // Walk to the start of `line` and to the start of `line + 1` (or EOF).
+    let mut byte = 0usize;
+    let mut seen_lines: u32 = 0;
+    let bytes = text.as_bytes();
+    let mut start = None;
+    while byte < bytes.len() {
+        if seen_lines == line && start.is_none() {
+            start = Some(byte);
+        }
+        if seen_lines == line + 1 {
+            break;
+        }
+        if bytes[byte] == b'\n' {
+            seen_lines += 1;
+        }
+        byte += 1;
+    }
+    if start.is_none() {
+        // Line out of range — collapse to a zero-width edit at EOF so the
+        // editor can still apply the action without erroring.
+        return Range {
+            start: byte_to_position(text, bytes.len()),
+            end: byte_to_position(text, bytes.len()),
+        };
+    }
+    Range {
+        start: byte_to_position(text, start.unwrap()),
+        end: byte_to_position(text, byte),
+    }
+}
+
+/// True when the diagnostic carries a code matching `wanted` (e.g.
+/// `tyc::unused_import`).  Used to gate code-action eligibility.
+fn diagnostic_code_matches(diag: &Diagnostic, wanted: &str) -> bool {
+    match &diag.code {
+        Some(NumberOrString::String(s)) => s == wanted,
+        _ => false,
+    }
 }
 
 /// Render the hover body for a resolved symbol.  Uses GitHub-flavoured
@@ -615,6 +953,214 @@ mod tests {
         let body = render_hover(&symbol);
         assert!(body.contains("function"), "got: {body}");
         assert!(!body.contains("declaration site"), "got: {body}");
+    }
+
+    // ── Phase 4: completion ──────────────────────────────────────────────
+
+    fn parse_resolved(src: &str) -> (ResolvedModule, String) {
+        let prep = tyc_syntax::preprocess::preprocess(src);
+        let module = rustpython_parser::parse(&prep.python_source, Mode::Module, "<test>").unwrap();
+        let (resolved, _) =
+            tyc_resolve::resolve_module("<test>", &prep.python_source, &prep.stripped, &module);
+        (resolved, prep.python_source)
+    }
+
+    #[test]
+    fn completion_includes_visible_bindings_and_keywords() {
+        let src = "\
+def outer(a):
+    def inner(b):
+        return a + b
+";
+        let (resolved, preprocessed) = parse_resolved(src);
+        // Position the cursor on the `return` line, at column 8 (inside the
+        // statement, after the indent).
+        let pos = Position {
+            line: 2,
+            character: 8,
+        };
+        let items = compute_completion_items(&resolved, &preprocessed, pos);
+        let labels: std::collections::HashSet<String> =
+            items.iter().map(|i| i.label.clone()).collect();
+        // Bindings from the enclosing scopes are present:
+        assert!(labels.contains("a"), "expected `a`: {labels:?}");
+        assert!(labels.contains("b"), "expected `b`: {labels:?}");
+        assert!(labels.contains("outer"), "expected `outer`: {labels:?}");
+        assert!(labels.contains("inner"), "expected `inner`: {labels:?}");
+        // Typhon keywords and a representative builtin:
+        assert!(labels.contains("val"), "missing val keyword: {labels:?}");
+        assert!(
+            labels.contains("gather"),
+            "missing gather keyword: {labels:?}"
+        );
+        assert!(
+            labels.contains("print"),
+            "missing print builtin: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn completion_kinds_distinguish_function_and_value() {
+        let src = "\
+val name: str = \"hi\"
+def greet():
+    return name
+";
+        let (resolved, preprocessed) = parse_resolved(src);
+        let pos = Position {
+            line: 0,
+            character: 0,
+        };
+        let items = compute_completion_items(&resolved, &preprocessed, pos);
+        let greet = items.iter().find(|i| i.label == "greet").expect("greet");
+        let name = items.iter().find(|i| i.label == "name").expect("name");
+        assert_eq!(greet.kind, Some(CompletionItemKind::FUNCTION));
+        // `val` bindings render as CONSTANT to differentiate from `var`.
+        assert_eq!(name.kind, Some(CompletionItemKind::CONSTANT));
+    }
+
+    // ── Phase 4: code actions ────────────────────────────────────────────
+
+    fn uri(s: &str) -> Uri {
+        s.parse().unwrap()
+    }
+
+    fn unused_import_diag(line: u32, character: u32, length: u32) -> Diagnostic {
+        Diagnostic {
+            range: Range {
+                start: Position { line, character },
+                end: Position {
+                    line,
+                    character: character + length,
+                },
+            },
+            severity: Some(DiagnosticSeverity::WARNING),
+            code: Some(NumberOrString::String("tyc::unused_import".to_string())),
+            code_description: None,
+            source: Some("tyc".into()),
+            message: "unused import `os`".to_string(),
+            related_information: None,
+            tags: None,
+            data: None,
+        }
+    }
+
+    #[test]
+    fn code_action_offers_remove_for_unused_import() {
+        let u = uri("file:///tmp/foo.ty");
+        let text = "import os\nval x: int = 1\n";
+        let diag = unused_import_diag(0, 7, 2);
+        let actions = compute_code_actions(&u, text, &[diag]);
+        assert_eq!(actions.len(), 1, "expected one action");
+        let CodeActionOrCommand::CodeAction(action) = &actions[0] else {
+            panic!("expected CodeAction variant");
+        };
+        assert_eq!(action.title, "Remove unused import");
+        assert_eq!(action.kind, Some(CodeActionKind::QUICKFIX));
+        assert_eq!(action.is_preferred, Some(true));
+
+        let edit = action.edit.as_ref().expect("edit set");
+        let changes = edit.changes.as_ref().expect("changes set");
+        let edits = changes.get(&u).expect("edits for our uri");
+        assert_eq!(edits.len(), 1);
+        // The edit must span the entire `import os\n` line so deleting it
+        // removes the trailing newline too.
+        assert_eq!(edits[0].new_text, "");
+        assert_eq!(edits[0].range.start.line, 0);
+        assert_eq!(edits[0].range.start.character, 0);
+        assert_eq!(edits[0].range.end.line, 1);
+        assert_eq!(edits[0].range.end.character, 0);
+    }
+
+    #[test]
+    fn code_action_skips_multi_import_line() {
+        // Regression for the Copilot/gemini review: `import os, sys`
+        // with only `os` flagged must NOT produce a whole-line delete
+        // — that would also drop the still-used `sys` import.
+        let u = uri("file:///tmp/foo.ty");
+        let text = "import os, sys\nval x: int = 1\n";
+        let diag = unused_import_diag(0, 7, 2);
+        let actions = compute_code_actions(&u, text, &[diag]);
+        assert!(
+            actions.is_empty(),
+            "multi-import line must NOT produce a whole-line quick-fix"
+        );
+    }
+
+    #[test]
+    fn code_action_skips_chained_statement_line() {
+        // Regression for the gemini review: a line that chains a second
+        // statement via `;` would have its second statement deleted
+        // along with the import. Skip the quick-fix to stay safe.
+        let u = uri("file:///tmp/foo.ty");
+        let text = "import os; x = 1\n";
+        let diag = unused_import_diag(0, 7, 2);
+        let actions = compute_code_actions(&u, text, &[diag]);
+        assert!(
+            actions.is_empty(),
+            "chained-statement line must NOT produce a whole-line quick-fix"
+        );
+    }
+
+    #[test]
+    fn code_action_offers_fix_for_simple_import_with_comment() {
+        // Trailing `# comment` on the import line is OK to drop along
+        // with the import — the comment was documenting the now-gone
+        // import.
+        let u = uri("file:///tmp/foo.ty");
+        let text = "import os  # legacy\nval x: int = 1\n";
+        let diag = unused_import_diag(0, 7, 2);
+        let actions = compute_code_actions(&u, text, &[diag]);
+        assert_eq!(actions.len(), 1, "simple import + comment should fix");
+    }
+
+    #[test]
+    fn is_safe_single_import_line_classifications() {
+        assert!(is_safe_single_import_line("import os"));
+        assert!(is_safe_single_import_line("import os as o"));
+        assert!(is_safe_single_import_line("from m import x"));
+        assert!(is_safe_single_import_line("from m import x as y"));
+        assert!(is_safe_single_import_line("  import os  "));
+        assert!(is_safe_single_import_line("import os  # legacy"));
+        // Unsafe shapes:
+        assert!(!is_safe_single_import_line("import os, sys"));
+        assert!(!is_safe_single_import_line("from m import x, y"));
+        assert!(!is_safe_single_import_line("import os; x = 1"));
+        assert!(!is_safe_single_import_line(""));
+        assert!(!is_safe_single_import_line("x = 1"));
+    }
+
+    #[test]
+    fn nth_line_content_handles_last_line_no_newline() {
+        let text = "first\nsecond";
+        assert_eq!(nth_line_content(text, 0), "first");
+        assert_eq!(nth_line_content(text, 1), "second");
+        assert_eq!(nth_line_content(text, 5), "");
+    }
+
+    #[test]
+    fn code_action_ignores_unrelated_diagnostics() {
+        let u = uri("file:///tmp/foo.ty");
+        let text = "val x: int = 1\n";
+        let mut diag = unused_import_diag(0, 0, 3);
+        diag.code = Some(NumberOrString::String("tyc::type_mismatch".to_string()));
+        let actions = compute_code_actions(&u, text, &[diag]);
+        assert!(
+            actions.is_empty(),
+            "non-matching code must not produce actions"
+        );
+    }
+
+    #[test]
+    fn whole_line_range_handles_last_line_without_newline() {
+        let text = "first\nsecond";
+        let range = whole_line_range(text, 1);
+        assert_eq!(range.start.line, 1);
+        assert_eq!(range.start.character, 0);
+        // Without a trailing newline the end position must clamp to the last
+        // character on the line rather than overshooting to the next line.
+        assert_eq!(range.end.line, 1);
+        assert_eq!(range.end.character, 6);
     }
 
     #[test]

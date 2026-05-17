@@ -10,3 +10,7 @@ rustpython-ast    = { workspace = true }
 rustpython-parser = { workspace = true }
 tyc-syntax        = { workspace = true }
 tyc-diagnostics   = { workspace = true }
+
+[dev-dependencies]
+tyc-emit          = { workspace = true }
+tempfile          = { workspace = true }

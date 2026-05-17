@@ -874,7 +874,11 @@ fn strip_purity_decorators(
 
 fn is_purity_marker(d: &rustpython_ast::Expr<TextRange>) -> bool {
     match d {
-        Expr::Name(n) => matches!(n.id.as_str(), "pure" | "memo"),
+        // `gatherable` lives alongside `pure` / `memo` as a Typhon-internal
+        // attestation: the user marks `async def fetch_user(...)` with it
+        // to opt the function in as an auto-gather candidate, but the name
+        // has no Python runtime form so the emitter must drop it.
+        Expr::Name(n) => matches!(n.id.as_str(), "pure" | "memo" | "gatherable"),
         Expr::Call(c) => is_purity_marker(&c.func),
         _ => false,
     }
