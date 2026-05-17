@@ -362,7 +362,7 @@ impl Backend {
 fn resolve_in_preprocessed(preprocessed: &str) -> Option<ResolvedModule> {
     let parsed = tyc_syntax::parse_module(preprocessed).ok()?;
     let module = parsed.into_syntax();
-    let (resolved, _) = tyc_resolve::resolve_module("<lsp>".to_owned(), preprocessed, &[], &module);
+    let (resolved, _) = tyc_resolve::resolve_module("<lsp>".to_owned(), preprocessed, &module);
     Some(resolved)
 }
 
@@ -1017,12 +1017,8 @@ mod tests {
         let module = tyc_syntax::parse_module(&prep.python_source)
             .unwrap()
             .into_syntax();
-        let (resolved, _) = tyc_resolve::resolve_module(
-            "<test>".to_owned(),
-            &prep.python_source,
-            &prep.stripped,
-            &module,
-        );
+        let (resolved, _) =
+            tyc_resolve::resolve_module("<test>".to_owned(), &prep.python_source, &module);
         (resolved, prep.python_source)
     }
 

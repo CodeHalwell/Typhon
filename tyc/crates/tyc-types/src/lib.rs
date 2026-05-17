@@ -1934,12 +1934,7 @@ mod tests {
         let module = tyc_syntax::parse_module(&prep.python_source)
             .unwrap()
             .into_syntax();
-        let (resolved, _) = resolve_module(
-            "<test>".to_owned(),
-            &prep.python_source,
-            &prep.stripped,
-            &module,
-        );
+        let (resolved, _) = resolve_module("<test>".to_owned(), &prep.python_source, &module);
         check_module("<test>", &prep.python_source, &resolved, &module)
     }
 

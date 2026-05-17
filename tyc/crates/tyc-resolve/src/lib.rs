@@ -16,8 +16,6 @@
 use ruff_python_ast::{self as ast, Expr, ModModule, Stmt};
 use ruff_text_size::TextRange;
 use tyc_diagnostics::{Diagnostics, TycError};
-use tyc_syntax::lexer::TyphonKeyword;
-use tyc_syntax::preprocess::StrippedKeyword;
 
 /// Mutability of a binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,19 +242,13 @@ pub struct SymbolAtOffset<'a> {
 struct Resolver<'a> {
     path: String,
     source: &'a str,
-    /// `stripped[i]` records that line `i` had a leading `val`/`var`. The
-    /// list is in source order; we consume entries as we hit assignments.
-    stripped: &'a [StrippedKeyword],
-    /// Byte offset of the first character on each line, computed once so
-    /// that `line_of_offset` is O(log N) per call instead of O(N).
-    line_starts: Vec<usize>,
     scopes: Vec<Scope>,
     references: Vec<Reference>,
     diagnostics: Diagnostics,
 }
 
 impl<'a> Resolver<'a> {
-    fn new(path: String, source: &'a str, stripped: &'a [StrippedKeyword]) -> Self {
+    fn new(path: String, source: &'a str) -> Self {
         let module = Scope {
             id: 0,
             kind: ScopeKind::Module,
@@ -264,17 +256,9 @@ impl<'a> Resolver<'a> {
             bindings: Vec::new(),
             span: (0, source.len()),
         };
-        let mut line_starts = vec![0usize];
-        for (idx, b) in source.bytes().enumerate() {
-            if b == b'\n' {
-                line_starts.push(idx + 1);
-            }
-        }
         Self {
             path,
             source,
-            stripped,
-            line_starts,
             scopes: vec![module],
             references: Vec::new(),
             diagnostics: Diagnostics::new(),
@@ -291,23 +275,6 @@ impl<'a> Resolver<'a> {
             span,
         });
         id
-    }
-
-    /// Map a byte offset in the preprocessed source to a 0-based line index.
-    /// O(log N) via binary search over precomputed line starts.
-    fn line_of_offset(&self, offset: usize) -> usize {
-        self.line_starts
-            .partition_point(|&start| start <= offset)
-            .saturating_sub(1)
-    }
-
-    /// Was the assignment statement on `line_idx` introduced with `val` or
-    /// `var`?
-    fn keyword_for_line(&self, line_idx: usize) -> Option<TyphonKeyword> {
-        self.stripped
-            .iter()
-            .find(|sk| sk.line_index == line_idx)
-            .map(|sk| sk.keyword)
     }
 
     /// Has a binding called `name` already been declared in `scope`?
@@ -447,10 +414,9 @@ impl<'a> Resolver<'a> {
 pub fn resolve_module(
     path: String,
     source: &str,
-    stripped: &[StrippedKeyword],
     module: &ModModule,
 ) -> (ResolvedModule, Diagnostics) {
-    let mut r = Resolver::new(path, source, stripped);
+    let mut r = Resolver::new(path, source);
 
     // First pass: collect top-level declarations so forward references
     // inside functions and classes resolve correctly.
@@ -510,11 +476,11 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt]) {
         match stmt {
             Stmt::Assign(a) => {
                 for t in &a.targets {
-                    declare_target(r, scope, t, default_val);
+                    declare_target(r, scope, t, default_val, a.mutability);
                 }
             }
             Stmt::AnnAssign(a) => {
-                declare_target(r, scope, &a.target, default_val);
+                declare_target(r, scope, &a.target, default_val, a.mutability);
             }
             _ => {}
         }
@@ -619,35 +585,25 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt]) {
     }
 }
 
-fn declare_target(r: &mut Resolver, scope: ScopeId, target: &Expr, default_val: bool) {
+fn declare_target(
+    r: &mut Resolver,
+    scope: ScopeId,
+    target: &Expr,
+    default_val: bool,
+    ast_mutability: Option<ast::Mutability>,
+) {
     if let Expr::Name(n) = target {
-        let line = r.line_of_offset(n.range.start().to_usize());
-        let kw = r.keyword_for_line(line);
-        // When no explicit `val`/`var` keyword is present, treat a bare
-        // assignment as a rebinding of any existing binding (taking its
-        // mutability) rather than a fresh declaration. Only the *first*
-        // bareword assignment in a module scope defaults to `val`; later
-        // bare assignments inherit the existing binding's mutability.
+        // When no explicit `let`/`mut` keyword is present in the AST,
+        // treat a bare assignment as a rebinding of any existing binding
+        // (taking its mutability) rather than a fresh declaration. Only
+        // the *first* bareword assignment in a module scope defaults to
+        // `let`; later bare assignments inherit the existing binding's
+        // mutability.
         let existing_mut = r.lookup_local(scope, n.id.as_str()).map(|b| b.mutability);
-        let mutability = match kw {
-            Some(TyphonKeyword::Let) => Mutability::Let,
-            Some(TyphonKeyword::Mut) => Mutability::Mut,
-            // `comptime let` records the inner `val` keyword, so Comptime
-            // alone would only appear when the inner keyword was omitted.
-            // None of the other keywords are value binding keywords — treat
-            // them like bare assignments (inherit or default).
-            Some(
-                TyphonKeyword::Model
-                | TyphonKeyword::Comptime
-                | TyphonKeyword::Impl
-                | TyphonKeyword::Extend
-                | TyphonKeyword::Interface
-                | TyphonKeyword::Unsafe
-                | TyphonKeyword::Gather
-                | TyphonKeyword::Go
-                | TyphonKeyword::Lazy,
-            )
-            | None => existing_mut.unwrap_or(if default_val {
+        let mutability = match ast_mutability {
+            Some(ast::Mutability::Let) => Mutability::Let,
+            Some(ast::Mutability::Mut) => Mutability::Mut,
+            None => existing_mut.unwrap_or(if default_val {
                 Mutability::Let
             } else {
                 Mutability::Mut
@@ -742,7 +698,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             let default_val = r.scopes[scope].kind == ScopeKind::Module;
             for t in &a.targets {
                 if let Expr::Name(_) = t {
-                    declare_target(r, scope, t, default_val);
+                    declare_target(r, scope, t, default_val, a.mutability);
                 } else {
                     walk_expr(r, scope, t);
                 }
@@ -755,7 +711,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             walk_expr(r, scope, &a.annotation);
             if let Expr::Name(_) = a.target.as_ref() {
                 let default_val = r.scopes[scope].kind == ScopeKind::Module;
-                declare_target(r, scope, &a.target, default_val);
+                declare_target(r, scope, &a.target, default_val, a.mutability);
             }
         }
         Stmt::AugAssign(a) => {
@@ -1414,12 +1370,7 @@ mod tests {
         let module = tyc_syntax::parse_module(&prep.python_source)
             .unwrap()
             .into_syntax();
-        resolve_module(
-            "<test>".to_owned(),
-            &prep.python_source,
-            &prep.stripped,
-            &module,
-        )
+        resolve_module("<test>".to_owned(), &prep.python_source, &module)
     }
 
     #[test]
@@ -1703,11 +1654,13 @@ def foo():
         //       column 20 is the reference `x` on the second line.
         let src = "let x: int = 1\nlet y: int = x\n";
         let (m, _d) = resolve(src);
-        // The byte offset of the reference `x` on the second line in the
-        // preprocessed source: "x: int = 1\ny: int = x\n" — newline at byte 10,
-        // `y: int = x` follows so the `x` use sits at byte 20.
+        // The byte offset of the reference `x` on the second line: the
+        // source is "let x: int = 1\nlet y: int = x\n" (preprocessor no
+        // longer strips let/mut). First line ends at byte 14 (newline
+        // inclusive at 14), second line `let y: int = x` puts `x` at
+        // byte 15 + 13 = 28.
         let symbol = m
-            .symbol_at_offset(20)
+            .symbol_at_offset(28)
             .expect("symbol_at_offset should find the reference");
         assert_eq!(symbol.name, "x");
         assert!(!symbol.is_definition, "this is a use site, not a decl");
@@ -1720,8 +1673,8 @@ def foo():
     fn symbol_at_offset_finds_declaration() {
         let src = "let foo: int = 1\n";
         let (m, _d) = resolve(src);
-        // In the preprocessed source `foo: int = 1\n`, `foo` starts at byte 0.
-        let symbol = m.symbol_at_offset(1).expect("symbol should be found");
+        // In the (unstripped) source `let foo: int = 1\n`, `foo` starts at byte 4.
+        let symbol = m.symbol_at_offset(5).expect("symbol should be found");
         assert_eq!(symbol.name, "foo");
         assert!(
             symbol.is_definition,
