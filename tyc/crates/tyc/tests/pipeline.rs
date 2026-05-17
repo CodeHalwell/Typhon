@@ -220,6 +220,44 @@ fn build_emits_typhon_runtime_when_result_used() {
     );
 }
 
+// ── tyc trace ────────────────────────────────────────────────────────────────
+
+#[test]
+fn trace_exits_successfully_as_stub() {
+    let status = tyc().arg("trace").status().unwrap();
+    assert!(status.success(), "tyc trace should exit 0 (stub)");
+}
+
+#[test]
+fn trace_reports_not_implemented() {
+    let out = tyc().arg("trace").output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not yet implemented"),
+        "tyc trace should print 'not yet implemented' message; got: {stderr}"
+    );
+}
+
+// ── tyc profile ───────────────────────────────────────────────────────────────
+
+#[test]
+fn profile_exits_successfully_as_stub() {
+    let tmp = tempfile::tempdir().unwrap();
+    let status = tyc().arg("profile").arg(tmp.path()).status().unwrap();
+    assert!(status.success(), "tyc profile should exit 0 (stub)");
+}
+
+#[test]
+fn profile_reports_not_implemented() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tyc().arg("profile").arg(tmp.path()).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not yet implemented"),
+        "tyc profile should print 'not yet implemented' message; got: {stderr}"
+    );
+}
+
 // ── full pipeline ─────────────────────────────────────────────────────────────
 
 /// Full pipeline smoke test: init → write Phase 3 source → check → build → verify output.

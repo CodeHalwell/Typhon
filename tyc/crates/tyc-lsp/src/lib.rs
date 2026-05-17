@@ -440,7 +440,9 @@ fn first_label(err: &TycError) -> Option<LabeledSpan> {
 /// buffer instead of drifting by a column or two after `val` is removed.
 fn diagnostic_source<'a>(err: &TycError, original: &'a str, preprocessed: &'a str) -> &'a str {
     match err {
-        TycError::InvalidQuestionOp { .. } => original,
+        // Both validators run against the original Typhon source, before any
+        // sugar expansion, so their byte offsets refer to the editor buffer.
+        TycError::InvalidQuestionOp { .. } | TycError::LazyUsage { .. } => original,
         _ => preprocessed,
     }
 }
@@ -625,5 +627,134 @@ mod tests {
         };
         let body = render_hover(&symbol);
         assert!(body.contains("unresolved"), "got: {body}");
+    }
+
+    // ── diagnostic_source selection ───────────────────────────────────────────
+
+    #[test]
+    fn diagnostic_source_returns_original_for_invalid_question_op() {
+        let original = "val x = y?";
+        let preprocessed = "x = y_result";
+        let err = TycError::invalid_question_op("bad use of ?", "f.ty", original, 8, 2);
+        assert_eq!(
+            diagnostic_source(&err, original, preprocessed),
+            original,
+            "InvalidQuestionOp diagnostics are anchored to the original Typhon source"
+        );
+    }
+
+    #[test]
+    fn diagnostic_source_returns_preprocessed_for_type_mismatch() {
+        let original = "val x: int = \"hi\"";
+        let preprocessed = "x: int = \"hi\"";
+        let err = TycError::type_mismatch("int", "str", "f.ty", preprocessed, 0, 1);
+        assert_eq!(
+            diagnostic_source(&err, original, preprocessed),
+            preprocessed,
+            "TypeMismatch diagnostics are anchored to the preprocessed source"
+        );
+    }
+
+    #[test]
+    fn diagnostic_source_returns_preprocessed_for_unknown_name() {
+        let original = "val y: str = z";
+        let preprocessed = "y: str = z";
+        let err = TycError::unknown_name("z", "f.ty", preprocessed, 9, 1);
+        assert_eq!(
+            diagnostic_source(&err, original, preprocessed),
+            preprocessed,
+            "UnknownName diagnostics are anchored to the preprocessed source"
+        );
+    }
+
+    #[test]
+    fn diagnostic_source_returns_original_for_lazy_usage() {
+        // validate_lazy_usage runs against the raw Typhon source before any
+        // sugar expansion, so its byte offsets refer to the editor buffer.
+        let original = "lazy from os import path";
+        let preprocessed = "from os import path";
+        let err = TycError::lazy_usage("unsupported lazy form", "f.ty", original, 0, 24);
+        assert_eq!(
+            diagnostic_source(&err, original, preprocessed),
+            original,
+            "LazyUsage diagnostics are anchored to the original (pre-expansion) source"
+        );
+    }
+
+    // ── tyc_error_to_lsp conversion ───────────────────────────────────────────
+
+    #[test]
+    fn tyc_error_to_lsp_returns_none_for_span_less_io_error() {
+        let err = TycError::io("f.ty", &std::io::Error::other("disk full"));
+        let result = tyc_error_to_lsp(&err, "source text", DiagnosticSeverity::ERROR);
+        assert!(
+            result.is_none(),
+            "I/O errors have no source span so conversion should return None"
+        );
+    }
+
+    #[test]
+    fn tyc_error_to_lsp_returns_none_for_span_less_comptime_error() {
+        let err = TycError::comptime("PORT", "missing env var");
+        let result = tyc_error_to_lsp(&err, "source text", DiagnosticSeverity::ERROR);
+        assert!(
+            result.is_none(),
+            "Comptime errors have no source span so conversion should return None"
+        );
+    }
+
+    #[test]
+    fn tyc_error_to_lsp_converts_type_mismatch_to_diagnostic() {
+        let src = "val x: int = \"hi\"";
+        let err = TycError::type_mismatch("int", "str", "f.ty", src, 0, 3);
+        let result = tyc_error_to_lsp(&err, src, DiagnosticSeverity::ERROR);
+        assert!(
+            result.is_some(),
+            "TypeMismatch should produce an LSP diagnostic"
+        );
+        let d = result.unwrap();
+        assert_eq!(d.range.start.line, 0, "span starts on line 0");
+        assert_eq!(d.range.start.character, 0, "span starts at column 0");
+        assert_eq!(d.range.end.character, 3, "span end reflects length 3");
+        assert!(
+            d.message.contains("int") && d.message.contains("str"),
+            "diagnostic message should mention both types"
+        );
+    }
+
+    #[test]
+    fn tyc_error_to_lsp_preserves_error_code() {
+        let src = "val x: int = \"hi\"";
+        let err = TycError::type_mismatch("int", "str", "f.ty", src, 0, 1);
+        let d = tyc_error_to_lsp(&err, src, DiagnosticSeverity::ERROR).unwrap();
+        assert!(
+            matches!(&d.code, Some(NumberOrString::String(s)) if s == "tyc::type_mismatch"),
+            "LSP diagnostic should carry the tyc::type_mismatch error code"
+        );
+    }
+
+    #[test]
+    fn tyc_error_to_lsp_sets_source_field() {
+        let src = "val x: int = \"hi\"";
+        let err = TycError::type_mismatch("int", "str", "f.ty", src, 0, 1);
+        let d = tyc_error_to_lsp(&err, src, DiagnosticSeverity::WARNING).unwrap();
+        assert_eq!(
+            d.source.as_deref(),
+            Some("tyc"),
+            "LSP diagnostic source should be 'tyc'"
+        );
+    }
+
+    #[test]
+    fn tyc_error_to_lsp_multiline_span_maps_correctly() {
+        // Span that starts at byte 4 (second line) in a two-line source.
+        let src = "abc\ndef";
+        let err = TycError::unknown_name("def", "f.ty", src, 4, 3);
+        let d = tyc_error_to_lsp(&err, src, DiagnosticSeverity::ERROR).unwrap();
+        assert_eq!(
+            d.range.start.line, 1,
+            "span should start on line 1 (second line)"
+        );
+        assert_eq!(d.range.start.character, 0, "span should start at column 0");
     }
 }
