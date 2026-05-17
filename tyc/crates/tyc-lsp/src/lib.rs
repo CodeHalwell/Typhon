@@ -6,21 +6,27 @@
 //! placeholder; richer responses arrive once the resolver and type checker
 //! expose query-by-position interfaces.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use miette::{Diagnostic as MietteDiagnostic, LabeledSpan};
+use rustpython_parser::{parse, Mode};
 use tokio::sync::Mutex;
 use tower_lsp_server::ls_types::{
     Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, Hover, HoverContents, HoverParams, HoverProviderCapability,
-    InitializeParams, InitializeResult, InitializedParams, MarkedString, MessageType,
-    NumberOrString, Position, Range, ServerCapabilities, TextDocumentSyncCapability,
-    TextDocumentSyncKind, Uri,
+    DidOpenTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
+    HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
+    Location, MarkedString, MessageType, NumberOrString, OneOf, Position, Range,
+    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
 };
 use tower_lsp_server::{jsonrpc, Client, LanguageServer, LspService, Server};
 use tyc_db::{check_file, TycDatabase};
 use tyc_diagnostics::TycError;
-use tyc_syntax::preprocess::{expand_pipes, expand_question_ops, expand_with_chains, preprocess};
+use tyc_resolve::{BindingKind, Mutability, ResolvedModule, SymbolAtOffset};
+use tyc_syntax::preprocess::{
+    expand_gather_blocks, expand_go_calls, expand_lazy_imports, expand_pipes, expand_question_ops,
+    expand_with_chains, preprocess,
+};
 
 /// The Typhon LSP backend. Holds a single shared salsa database and the
 /// `Client` handle used to send notifications back to the editor.
@@ -33,6 +39,9 @@ pub struct Backend {
     client: Client,
     db: Arc<Mutex<TycDatabase>>,
     log_level: LogLevel,
+    /// Per-document buffers cached so hover and go-to-definition can answer
+    /// without re-fetching the text from the editor.  Keyed by URI string.
+    documents: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl std::fmt::Debug for Backend {
@@ -81,6 +90,13 @@ impl Backend {
         let db = Arc::clone(&self.db);
         let text_for_check = text.clone();
         let path_for_check = path.clone();
+
+        // Cache the buffer so hover / go-to-definition can resolve without
+        // an additional round trip.
+        {
+            let mut docs = self.documents.lock().await;
+            docs.insert(uri.as_str().to_owned(), text.clone());
+        }
 
         let result = tokio::task::spawn_blocking(move || {
             // Compute the source string the diagnostics will reference for
@@ -142,6 +158,7 @@ impl LanguageServer for Backend {
                     TextDocumentSyncKind::FULL,
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
+                definition_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -179,21 +196,103 @@ impl LanguageServer for Backend {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         // Clear diagnostics when the user closes a file so stale errors do
         // not linger in the editor.
+        let uri = params.text_document.uri;
+        {
+            let mut docs = self.documents.lock().await;
+            docs.remove(uri.as_str());
+        }
         self.client
-            .publish_diagnostics(params.text_document.uri, Vec::new(), None)
+            .publish_diagnostics(uri, Vec::new(), None)
             .await;
     }
 
-    async fn hover(&self, _params: HoverParams) -> jsonrpc::Result<Option<Hover>> {
-        // Stub: hover-by-position over the resolved type table will be wired
-        // here when the resolver exposes a salsa query that takes a (file,
-        // position) pair and returns the symbol at that point.
+    async fn hover(&self, params: HoverParams) -> jsonrpc::Result<Option<Hover>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let Some(text) = self.document_text(&uri).await else {
+            return Ok(None);
+        };
+        let Some(resolved) = self.resolve_in_text(&text) else {
+            return Ok(None);
+        };
+        let preprocessed = self.preprocessed_text(&text);
+        let offset = position_to_byte(&preprocessed, position);
+        let Some(symbol) = resolved.symbol_at_offset(offset) else {
+            return Ok(None);
+        };
+
+        let body = render_hover(&symbol);
+        let range = Some(Range {
+            start: byte_to_position(&preprocessed, symbol.span.0),
+            end: byte_to_position(&preprocessed, symbol.span.1),
+        });
         Ok(Some(Hover {
-            contents: HoverContents::Scalar(MarkedString::String(
-                "Typhon — hover details land with structural typing in Phase 3".to_owned(),
-            )),
-            range: None,
+            contents: HoverContents::Scalar(MarkedString::String(body)),
+            range,
         }))
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> jsonrpc::Result<Option<GotoDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let Some(text) = self.document_text(&uri).await else {
+            return Ok(None);
+        };
+        let Some(resolved) = self.resolve_in_text(&text) else {
+            return Ok(None);
+        };
+        let preprocessed = self.preprocessed_text(&text);
+        let offset = position_to_byte(&preprocessed, position);
+        let Some(symbol) = resolved.symbol_at_offset(offset) else {
+            return Ok(None);
+        };
+        let Some(def) = symbol.definition else {
+            return Ok(None);
+        };
+
+        let location = Location {
+            uri,
+            range: Range {
+                start: byte_to_position(&preprocessed, def.span.0),
+                end: byte_to_position(&preprocessed, def.span.1),
+            },
+        };
+        Ok(Some(GotoDefinitionResponse::Scalar(location)))
+    }
+}
+
+impl Backend {
+    /// Look up the most recent text we received for `uri`.  Returns `None`
+    /// when the editor has not yet opened the file or it was closed.
+    async fn document_text(&self, uri: &Uri) -> Option<String> {
+        let docs = self.documents.lock().await;
+        docs.get(uri.as_str()).cloned()
+    }
+
+    /// Return the Python-compatible source produced by running the same
+    /// expansion + preprocess pipeline that `check_file` uses.  Both
+    /// hover offsets and resolver bindings reference this text.
+    fn preprocessed_text(&self, source: &str) -> String {
+        let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
+            &expand_gather_blocks(&expand_lazy_imports(source)),
+        ))));
+        preprocess(&expanded).python_source
+    }
+
+    /// Resolve the module so hover / go-to-definition can query bindings
+    /// and references.  Returns `None` when the source fails to parse.
+    fn resolve_in_text(&self, source: &str) -> Option<ResolvedModule> {
+        let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
+            &expand_gather_blocks(&expand_lazy_imports(source)),
+        ))));
+        let prep = preprocess(&expanded);
+        let module = parse(&prep.python_source, Mode::Module, "<lsp>").ok()?;
+        let (resolved, _) =
+            tyc_resolve::resolve_module("<lsp>", &prep.python_source, &prep.stripped, &module);
+        Some(resolved)
     }
 }
 
@@ -241,9 +340,61 @@ pub fn run_stdio(log_level: LogLevel) {
             client,
             db: Arc::new(Mutex::new(TycDatabase::new())),
             log_level,
+            documents: Arc::new(Mutex::new(HashMap::new())),
         });
         Server::new(stdin, stdout, socket).serve(service).await;
     });
+}
+
+/// Render the hover body for a resolved symbol.  Uses GitHub-flavoured
+/// markdown so editors that interpret it (VS Code, JetBrains) format the
+/// kind/mutability tags consistently.
+fn render_hover(symbol: &SymbolAtOffset<'_>) -> String {
+    let Some(def) = symbol.definition else {
+        return format!("**{}** — unresolved reference", symbol.name);
+    };
+    let kind = match def.kind {
+        BindingKind::Value => match def.mutability {
+            Mutability::Val => "immutable binding",
+            Mutability::Var => "mutable binding",
+        },
+        BindingKind::Function => "function",
+        BindingKind::Class => "class",
+        BindingKind::Parameter => "parameter",
+        BindingKind::Import => "import",
+        BindingKind::Loop => "loop binding",
+    };
+    let suffix = if symbol.is_definition {
+        " (declaration site)"
+    } else {
+        ""
+    };
+    format!("**{}** — *{}*{}", def.name, kind, suffix)
+}
+
+/// Convert an LSP `Position` (line + UTF-16 column) to a byte offset.
+/// Out-of-range positions clamp to the end of the document.
+fn position_to_byte(source: &str, position: Position) -> usize {
+    let mut current_line: u32 = 0;
+    let mut current_column: u32 = 0;
+    let mut byte: usize = 0;
+    for ch in source.chars() {
+        if current_line == position.line && current_column >= position.character {
+            return byte;
+        }
+        if ch == '\n' {
+            if current_line == position.line {
+                // Position requested beyond this line's content; clamp here.
+                return byte;
+            }
+            current_line += 1;
+            current_column = 0;
+        } else if current_line == position.line {
+            current_column += ch.len_utf16() as u32;
+        }
+        byte += ch.len_utf8();
+    }
+    byte
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -402,5 +553,79 @@ mod tests {
                 character: 5
             }
         );
+    }
+
+    #[test]
+    fn position_to_byte_round_trips_ascii() {
+        let src = "abc\ndef\nghij";
+        // Round-trip the same set of offsets used by byte_to_position_ascii.
+        for offset in [0usize, 2, 4, 9] {
+            let pos = byte_to_position(src, offset);
+            assert_eq!(position_to_byte(src, pos), offset);
+        }
+    }
+
+    #[test]
+    fn position_to_byte_handles_multibyte() {
+        // `café\n` occupies bytes 0..6 ('é' is 2 bytes), `x` starts at byte 6.
+        // Column 0 on line 1 therefore maps to byte 6.
+        let src = "café\nx";
+        let pos = Position {
+            line: 1,
+            character: 0,
+        };
+        assert_eq!(position_to_byte(src, pos), 6);
+    }
+
+    #[test]
+    fn render_hover_describes_val_binding() {
+        use tyc_resolve::{Binding, BindingKind, Mutability};
+        let binding = Binding {
+            name: "x".to_owned(),
+            kind: BindingKind::Value,
+            mutability: Mutability::Val,
+            span: (4, 5),
+        };
+        let symbol = SymbolAtOffset {
+            name: "x".to_owned(),
+            span: (4, 5),
+            definition: Some(&binding),
+            is_definition: true,
+        };
+        let body = render_hover(&symbol);
+        assert!(body.contains("immutable"), "got: {body}");
+        assert!(body.contains("declaration site"), "got: {body}");
+    }
+
+    #[test]
+    fn render_hover_describes_function() {
+        use tyc_resolve::{Binding, BindingKind, Mutability};
+        let binding = Binding {
+            name: "main".to_owned(),
+            kind: BindingKind::Function,
+            mutability: Mutability::Var,
+            span: (4, 8),
+        };
+        let symbol = SymbolAtOffset {
+            name: "main".to_owned(),
+            span: (10, 14),
+            definition: Some(&binding),
+            is_definition: false,
+        };
+        let body = render_hover(&symbol);
+        assert!(body.contains("function"), "got: {body}");
+        assert!(!body.contains("declaration site"), "got: {body}");
+    }
+
+    #[test]
+    fn render_hover_handles_unresolved_symbol() {
+        let symbol = SymbolAtOffset {
+            name: "mystery".to_owned(),
+            span: (0, 7),
+            definition: None,
+            is_definition: false,
+        };
+        let body = render_hover(&symbol);
+        assert!(body.contains("unresolved"), "got: {body}");
     }
 }

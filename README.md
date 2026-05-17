@@ -86,7 +86,7 @@ See [docs/cli.md](docs/cli.md) for the full reference.
 - ✅ `with`-chain Result sequencing with optional `else err:` block
 - ✅ `comptime val/var` with `env()` lookup; required env vars declared in `[env]`
 - ✅ `impl` blocks merged into class definitions at desugar
-- ✅ `tower-lsp-server` LSP backend: `tyc lsp` publishes diagnostics on `did_open` / `did_change` and serves a hover placeholder. Richer hover content lands with the resolver/type-checker position queries in Phase 3.
+- ✅ `tower-lsp-server` LSP backend: `tyc lsp` publishes diagnostics on `did_open` / `did_change`, serves position-based hover (binding kind + mutability), and answers go-to-definition by jumping to the resolver's recorded declaration site.
 
 **Phase 3 — Structural typing and advanced features** substantially complete:
 

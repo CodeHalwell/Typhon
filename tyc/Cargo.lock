@@ -1840,10 +1840,12 @@ name = "tyc-lsp"
 version = "0.1.0"
 dependencies = [
  "miette",
+ "rustpython-parser",
  "tokio",
  "tower-lsp-server",
  "tyc-db",
  "tyc-diagnostics",
+ "tyc-resolve",
  "tyc-syntax",
 ]
 

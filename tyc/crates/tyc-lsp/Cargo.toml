@@ -10,5 +10,7 @@ tower-lsp-server = { workspace = true }
 tokio = { workspace = true }
 tyc-db = { workspace = true }
 tyc-diagnostics = { workspace = true }
+tyc-resolve = { workspace = true }
 tyc-syntax = { workspace = true }
+rustpython-parser = { workspace = true }
 miette = { workspace = true }
