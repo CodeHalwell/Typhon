@@ -37,7 +37,6 @@
 use std::collections::HashMap;
 
 use ruff_python_ast::{Decorator, Expr, ExprCall, ModModule, Number, Parameters, Stmt};
-use ruff_text_size::TextRange;
 use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_syntax::preprocess::ComptimeBinding;
 
@@ -1140,11 +1139,6 @@ pub fn purity_diagnostics(findings: &[PurityFinding], path: &str, source: &str) 
     }
     diags
 }
-
-// Suppress an "unused import" warning when `TextRange` is only referenced
-// via its re-export through other crates in this module's tests.
-#[allow(dead_code)]
-fn _text_range_used(_: TextRange) {}
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

@@ -5,12 +5,12 @@
 //! input (whitespace and comment differences are acceptable in Phase 0).
 
 use ruff_python_ast::{
-    Alias, BoolOp, CmpOp, Comprehension, ExceptHandler, Expr, Keyword, MatchCase, ModModule,
-    Mutability, Number, Operator, Parameter, ParameterWithDefault, Parameters, Pattern, Singleton,
-    Stmt, TypeParam, TypeParams, UnaryOp, WithItem,
+    Alias, BoolOp, CmpOp, Comprehension, ExceptHandler, Expr, FStringPart,
+    InterpolatedStringElement, Keyword, MatchCase, ModModule, Mutability, Number, Operator,
+    Parameter, ParameterWithDefault, Parameters, Pattern, Singleton, Stmt, TypeParam, TypeParams,
+    UnaryOp, WithItem,
 };
-use ruff_python_ast::{InterpolatedStringElement, FStringPart};
-use ruff_text_size::{Ranged, TextRange};
+use ruff_text_size::Ranged;
 
 /// Internal state for the Python pretty-printer.
 pub struct Emitter {
@@ -628,7 +628,7 @@ impl Emitter {
 
             Expr::Lambda(l) => {
                 self.write("lambda");
-                if let Some(params) = &l.parameters {
+                if let Some(params) = l.parameters.as_deref() {
                     if !params.is_empty() {
                         self.write(" ");
                         self.emit_parameters(params);
@@ -1322,14 +1322,6 @@ fn expr_precedence(expr: &Expr) -> u8 {
         Expr::BinOp(b) => bin_op_precedence(&b.op),
         _ => u8::MAX,
     }
-}
-
-/// `TextRange` helper — `ruff_text_size::TextRange` does not derive `Ranged`
-/// but we just need the range of any AST node uniformly.  Kept as a free
-/// re-export so call-sites stay terse.
-#[allow(dead_code)]
-fn node_range<T: Ranged>(node: &T) -> TextRange {
-    node.range()
 }
 
 /// Escape a string value for emission as a double-quoted Python literal.

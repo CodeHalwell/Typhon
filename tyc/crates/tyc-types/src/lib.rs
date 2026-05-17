@@ -1205,7 +1205,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             check_function(
                 c,
                 f.name.as_str(),
-                &f.parameters,
+                f.parameters.as_ref(),
                 &f.body,
                 f.returns.as_deref(),
                 &tps,
@@ -1609,16 +1609,16 @@ fn infer_expr(c: &mut Checker, expr: &Expr) -> Type {
             }
         }
         Expr::Call(call) => {
+            // Ruff folds positional and keyword arguments into `call.arguments`.
+            let pos_args = &call.arguments.args;
+            let kw_args = &call.arguments.keywords;
             // Ok(value) and Err(error) are Result constructors: infer their
             // types as Generic("Ok", [T]) / Generic("Err", [E]) so that the
             // Result assignability rule in `assignable` can fire.
             if let Expr::Name(fn_name) = call.func.as_ref() {
                 let ctor = fn_name.id.as_str();
-                if (ctor == "Ok" || ctor == "Err")
-                    && call.args.len() == 1
-                    && call.keywords.is_empty()
-                {
-                    let arg_type = infer_expr(c, &call.args[0]);
+                if (ctor == "Ok" || ctor == "Err") && pos_args.len() == 1 && kw_args.is_empty() {
+                    let arg_type = infer_expr(c, &pos_args[0]);
                     return Type::Generic(ctor.to_owned(), vec![arg_type]);
                 }
                 // isinstance(x, Interface) is rejected unless the interface
@@ -1627,8 +1627,8 @@ fn infer_expr(c: &mut Checker, expr: &Expr) -> Type {
                 // so we reject the static use by default. Interfaces decorated
                 // `@runtime_checkable` are exempt — the user acknowledged the
                 // weaker guarantee.
-                if fn_name.id.as_str() == "isinstance" && call.args.len() == 2 {
-                    if let Expr::Name(t) = &call.args[1] {
+                if fn_name.id.as_str() == "isinstance" && pos_args.len() == 2 {
+                    if let Expr::Name(t) = &pos_args[1] {
                         if let Some(iface) = c.interfaces.get(t.id.as_str()) {
                             if !iface.runtime_checkable {
                                 let span = (
@@ -1669,20 +1669,20 @@ fn infer_expr(c: &mut Checker, expr: &Expr) -> Type {
                     // Argument count check (positional only — conservative).
                     // Variadic functions accept any number of args >= params.len().
                     let count_ok = if variadic {
-                        call.args.len() >= params.len()
+                        pos_args.len() >= params.len()
                     } else {
-                        call.args.len() == params.len()
+                        pos_args.len() == params.len()
                     };
                     if !count_ok {
                         let name = match call.func.as_ref() {
                             Expr::Name(n) => n.id.as_str().to_owned(),
                             _ => "<call>".to_owned(),
                         };
-                        c.wrong_args(&name, params.len(), call.args.len(), call_span);
+                        c.wrong_args(&name, params.len(), pos_args.len(), call_span);
                     }
                     // Argument type checks (per-pair, ignoring excess).
                     let mut actuals: Vec<Type> = Vec::with_capacity(params.len());
-                    for (i, arg) in call.args.iter().enumerate() {
+                    for (i, arg) in pos_args.iter().enumerate() {
                         if i >= params.len() {
                             break;
                         }
@@ -1713,7 +1713,7 @@ fn infer_expr(c: &mut Checker, expr: &Expr) -> Type {
                 }
                 Type::Class(name) => Type::Class(name),
                 Type::Unknown | Type::Any => {
-                    for a in &call.args {
+                    for a in pos_args.iter() {
                         let _ = infer_expr(c, a);
                     }
                     Type::Unknown
@@ -1761,7 +1761,7 @@ fn infer_expr(c: &mut Checker, expr: &Expr) -> Type {
 ///
 /// Uses an explicit stack rather than recursion to avoid stack overflow on
 /// deeply nested union expressions (e.g. `A | B | C | ... | Z`).
-fn extract_sealed_union_variants(expr: &Expr<TextRange>) -> Option<Vec<String>> {
+fn extract_sealed_union_variants(expr: &Expr) -> Option<Vec<String>> {
     let mut names = Vec::new();
     let mut stack = vec![expr];
     while let Some(current) = stack.pop() {
@@ -1787,7 +1787,7 @@ fn extract_sealed_union_variants(expr: &Expr<TextRange>) -> Option<Vec<String>> 
 /// has a wildcard arm.  Emits a [`TycError::NonExhaustiveMatch`] if not.
 fn check_match_exhaustiveness(
     c: &mut Checker,
-    cases: &[MatchCase<TextRange>],
+    cases: &[MatchCase],
     union_name: &str,
     variants: &[String],
     subject_span: (usize, usize),
@@ -1831,7 +1831,7 @@ fn check_match_exhaustiveness(
 /// - `case x:` → `MatchAs { pattern: None, name: Some("x") }` — wildcard capture.
 /// - `case <wild> as x:` → `MatchAs { pattern: Some(<wild>), ... }` — wildcard iff
 ///   the inner pattern is also a wildcard (recursive check).
-fn is_wildcard_pattern(pattern: &Pattern<TextRange>) -> bool {
+fn is_wildcard_pattern(pattern: &Pattern) -> bool {
     match pattern {
         Pattern::MatchAs(a) => match &a.pattern {
             None => true,
@@ -1845,7 +1845,7 @@ fn is_wildcard_pattern(pattern: &Pattern<TextRange>) -> bool {
 /// Collect the class names matched by `PatternMatchClass` nodes in a pattern,
 /// recursing through wrapper forms (`MatchAs`, `MatchOr`) so that patterns
 /// like `case Circle() as c:` count as covering the `Circle` variant.
-fn collect_matched_class_names(pattern: &Pattern<TextRange>, covered: &mut HashSet<String>) {
+fn collect_matched_class_names(pattern: &Pattern, covered: &mut HashSet<String>) {
     match pattern {
         Pattern::MatchClass(mc) => {
             if let Expr::Name(n) = mc.cls.as_ref() {
@@ -1871,7 +1871,7 @@ fn collect_matched_class_names(pattern: &Pattern<TextRange>, covered: &mut HashS
 /// that references to them inside the case body do not produce spurious
 /// "unknown name" errors.  Spans are set to the enclosing pattern's range so
 /// that any future narrowing diagnostics point at the right source location.
-fn bind_pattern_names(c: &mut Checker, pattern: &Pattern<TextRange>) {
+fn bind_pattern_names(c: &mut Checker, pattern: &Pattern) {
     match pattern {
         Pattern::MatchAs(a) => {
             if let Some(name) = &a.name {
@@ -1910,11 +1910,13 @@ fn bind_pattern_names(c: &mut Checker, pattern: &Pattern<TextRange>) {
             }
         }
         Pattern::MatchClass(mc) => {
-            for p in &mc.patterns {
+            // Ruff bundles the positional and keyword sub-patterns into a
+            // single `PatternArguments` value on `arguments`.
+            for p in &mc.arguments.patterns {
                 bind_pattern_names(c, p);
             }
-            for p in &mc.kwd_patterns {
-                bind_pattern_names(c, p);
+            for kw in &mc.arguments.keywords {
+                bind_pattern_names(c, &kw.pattern);
             }
         }
         Pattern::MatchOr(o) => {
@@ -1934,13 +1936,14 @@ fn bind_pattern_names(c: &mut Checker, pattern: &Pattern<TextRange>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustpython_parser::{parse, Mode};
     use tyc_resolve::resolve_module;
     use tyc_syntax::preprocess::preprocess;
 
     fn check(src: &str) -> Diagnostics {
         let prep = preprocess(src);
-        let module = parse(&prep.python_source, Mode::Module, "<test>").unwrap();
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
         let (resolved, _) = resolve_module(
             "<test>".to_owned(),
             &prep.python_source,
