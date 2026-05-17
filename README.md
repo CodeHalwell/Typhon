@@ -92,7 +92,7 @@ See [docs/cli.md](docs/cli.md) for the full reference.
 
 - ✅ Generics syntax locked to PEP 695 (`def f[T](x: T)`, `type Vec[T] = list[T]`). Type params resolve in scope; the type checker treats them as `Any` until a real bidirectional inference engine lands.
 - ✅ `interface Name:` lowers to `class Name(Protocol):` with a structural conformance check on assignment. `isinstance(x, Interface)` is rejected by default.
-- ✅ `unsafe:` lexical region keyword (lowers to `if True:` wrapper for now; checker-side boundary enforcement reserved for a follow-up).
+- ✅ `unsafe:` lexical region: lowers to `if True:` for scope preservation, and the type checker tracks `unsafe_depth` to suppress diagnostics inside the block so users can interface with untyped Python without fighting the checker. Boundary checks at assignment sites outside the block apply normally.
 - ✅ `@pure`/`@memo`/`@pure(memo=True)` decorators trigger the six-condition purity check; memoised functions get `@functools.cache` injected at desugar time. Project-wide opt-in via `[strictness] auto-memoise`.
 - ✅ `gather:` lowers to `asyncio.TaskGroup` by default; `gather(strategy="best-effort"):` to `asyncio.gather(..., return_exceptions=True)`.
 - ✅ `go f(x)` lowers through `typhon_runtime.tasks.spawn` with a strong-ref task registry.

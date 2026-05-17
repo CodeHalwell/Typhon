@@ -95,6 +95,11 @@ pub struct PreprocessResult {
     /// alias and module so [`postprocess`] can restore the original
     /// `lazy import ALIAS = MODULE` syntax.
     pub lazy_imports: Vec<LazyImport>,
+    /// 0-based line indices on which an `unsafe:` block opens.  Both the
+    /// original and preprocessed sources share line numbering, so these
+    /// indices can be used by downstream passes (resolver, type checker)
+    /// to locate the corresponding `if True:` statement in the parsed AST.
+    pub unsafe_lines: Vec<usize>,
 }
 
 /// Strip Typhon-specific syntax from `source` and return the Python-
@@ -105,6 +110,7 @@ pub fn preprocess(source: &str) -> PreprocessResult {
     let mut optionals = Vec::new();
     let mut comptime_bindings = Vec::new();
     let mut lazy_imports = Vec::new();
+    let mut unsafe_lines: Vec<usize> = Vec::new();
     // String state carried across lines (triple-quoted strings may span them).
     let mut in_string: Option<StringMode> = None;
 
@@ -236,6 +242,7 @@ pub fn preprocess(source: &str) -> PreprocessResult {
                         line_index,
                         keyword: TyphonKeyword::Unsafe,
                     });
+                    unsafe_lines.push(line_index);
                     let new_line = format!("{}{}", indent, line_body);
                     let (rewritten, marks) = rewrite_optionals(&new_line, &mut in_string);
                     for col in marks {
@@ -389,6 +396,7 @@ pub fn preprocess(source: &str) -> PreprocessResult {
         optionals,
         comptime_bindings,
         lazy_imports,
+        unsafe_lines,
     }
 }
 

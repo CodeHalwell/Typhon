@@ -395,13 +395,17 @@ struct Checker<'a> {
     /// Return type of the function whose body we are currently checking
     /// (None at module scope).
     current_return: Option<Type>,
-    /// Reserved for the no-implicit-Any region check: each `unsafe:` block
-    /// bumps this counter so the checker can later permit `Any` to bind
-    /// freely inside while still requiring an explicit annotation at the
-    /// boundary. v1 emits the `if True:` wrapper but doesn't yet use this
-    /// field — Phase 3+ will wire it.
-    #[allow(dead_code)]
+    /// Bumped on entry to an `unsafe:` block, decremented on exit.  While
+    /// positive, diagnostics produced by [`Checker::push_error`] /
+    /// [`Checker::push_warning`] are dropped so the user can interface with
+    /// untyped Python without fighting the checker.  Boundary checks at
+    /// assignment sites outside the block still apply normally.
     unsafe_depth: u32,
+    /// Byte offsets of the `if True:` statements that correspond to
+    /// `unsafe:` blocks.  Computed from the preprocessor's `unsafe_lines`
+    /// metadata; queried by [`check_stmt`] when entering an `if` body to
+    /// decide whether to bump `unsafe_depth`.
+    unsafe_line_starts: Vec<u32>,
 }
 
 /// Declared interface (`interface Name:` → `class Name(Protocol):`). Bundles
@@ -450,11 +454,20 @@ impl<'a> Checker<'a> {
             interfaces: HashMap::new(),
             class_shapes: HashMap::new(),
             unsafe_depth: 0,
+            unsafe_line_starts: Vec::new(),
             sealed_unions: HashMap::new(),
             env: TypeEnv::default(),
             diagnostics: Diagnostics::new(),
             current_return: None,
         }
+    }
+
+    /// True iff the `if True:` statement opening at this byte offset
+    /// originated from a `unsafe:` block.  Used by `check_if` to gate the
+    /// depth counter.
+    fn is_unsafe_marker(&self, range: TextRange) -> bool {
+        let start = u32::from(range.start());
+        self.unsafe_line_starts.binary_search(&start).is_ok()
     }
 
     /// Assignment compatibility check that accounts for sealed-union subtyping
@@ -554,6 +567,9 @@ impl<'a> Checker<'a> {
     }
 
     fn mismatch(&mut self, expected: &Type, actual: &Type, span: (usize, usize)) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
         let length = span.1.saturating_sub(span.0).max(1);
         // When the expected type is a known interface and the actual is a
         // class, render a structural-conformance error instead of a generic
@@ -586,6 +602,9 @@ impl<'a> Checker<'a> {
     }
 
     fn interface_isinstance(&mut self, iface: &str, span: (usize, usize)) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
         let length = span.1.saturating_sub(span.0).max(1);
         self.diagnostics.push_error(TycError::interface_isinstance(
             iface,
@@ -597,6 +616,9 @@ impl<'a> Checker<'a> {
     }
 
     fn nullable_use(&mut self, name: &str, expected: &Type, span: (usize, usize)) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
         let length = span.1.saturating_sub(span.0).max(1);
         self.diagnostics.push_error(TycError::nullable_use(
             name,
@@ -609,6 +631,9 @@ impl<'a> Checker<'a> {
     }
 
     fn wrong_args(&mut self, name: &str, expected: usize, actual: usize, span: (usize, usize)) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
         let length = span.1.saturating_sub(span.0).max(1);
         self.diagnostics.push_error(TycError::wrong_arg_count(
             name,
@@ -622,6 +647,9 @@ impl<'a> Checker<'a> {
     }
 
     fn not_callable(&mut self, typ: &Type, span: (usize, usize)) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
         let length = span.1.saturating_sub(span.0).max(1);
         self.diagnostics.push_error(TycError::not_callable(
             typ.display(),
@@ -633,6 +661,9 @@ impl<'a> Checker<'a> {
     }
 
     fn non_exhaustive_match(&mut self, union_name: &str, missing: &str, span: (usize, usize)) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
         let length = span.1.saturating_sub(span.0).max(1);
         self.diagnostics.push_error(TycError::non_exhaustive_match(
             union_name,
@@ -652,7 +683,24 @@ pub fn check_module(
     resolved: &ResolvedModule,
     module: &Mod,
 ) -> Diagnostics {
+    check_module_with(path, source, resolved, module, &[])
+}
+
+/// Type-check a module with knowledge of which lines opened an `unsafe:`
+/// block.  Diagnostics produced inside an unsafe region are suppressed:
+/// `Any` is permitted to flow freely so users can interface with untyped
+/// Python boundaries.  Diagnostics at the boundary (where untyped values
+/// leak back out) are still produced as normal at the assignment site
+/// outside the block.
+pub fn check_module_with(
+    path: impl Into<String>,
+    source: &str,
+    resolved: &ResolvedModule,
+    module: &Mod,
+    unsafe_lines: &[usize],
+) -> Diagnostics {
     let mut c = Checker::new(path.into(), source, resolved);
+    c.unsafe_line_starts = unsafe_byte_starts(source, unsafe_lines);
 
     if let Mod::Module(m) = module {
         // First pass: collect class names + function signatures so forward
@@ -675,6 +723,34 @@ pub fn check_module(
     }
 
     c.diagnostics
+}
+
+/// Compute the byte offset of the start of each line in `source` that was
+/// recorded as an `unsafe:` header.  The resulting offsets are used by the
+/// type checker to recognise lowered `if True:` statements that correspond
+/// to unsafe blocks.
+fn unsafe_byte_starts(source: &str, unsafe_lines: &[usize]) -> Vec<u32> {
+    if unsafe_lines.is_empty() {
+        return Vec::new();
+    }
+    let mut line_starts: Vec<usize> = vec![0];
+    for (i, b) in source.bytes().enumerate() {
+        if b == b'\n' {
+            line_starts.push(i + 1);
+        }
+    }
+    let mut starts: Vec<u32> = Vec::with_capacity(unsafe_lines.len());
+    for &line in unsafe_lines {
+        if let Some(&offset) = line_starts.get(line) {
+            // Skip leading whitespace so the start matches the `if True:`
+            // token's range.start exactly.
+            let rest = &source[offset..];
+            let lead = rest.bytes().take_while(|&b| b == b' ' || b == b'\t').count();
+            starts.push((offset + lead) as u32);
+        }
+    }
+    starts.sort_unstable();
+    starts
 }
 
 /// Declare Typhon-specific built-in names that are not present in the
@@ -1156,14 +1232,26 @@ fn check_function(
 }
 
 fn check_if(c: &mut Checker, i: &rustpython_ast::StmtIf<TextRange>) {
+    // Recognise the `if True:` form that the preprocessor emits for an
+    // `unsafe:` block.  Inside the body, type-check diagnostics are
+    // suppressed; the `else` branch is empty in practice (the preprocessor
+    // never emits one) but is handled safely below.
+    let is_unsafe = c.is_unsafe_marker(i.range);
+
     let _ = infer_expr(c, &i.test);
 
     // Apply narrowing for the true branch.
     let narrowings = collect_narrowings(c, &i.test, /*negate=*/ false);
     let snap_pre = c.env.snapshot();
     apply_narrowings(c, &narrowings);
+    if is_unsafe {
+        c.unsafe_depth = c.unsafe_depth.saturating_add(1);
+    }
     for s in &i.body {
         check_stmt(c, s);
+    }
+    if is_unsafe {
+        c.unsafe_depth = c.unsafe_depth.saturating_sub(1);
     }
     c.env.restore(snap_pre);
 

@@ -17,7 +17,7 @@ use tyc_syntax::preprocess::{
     expand_gather_blocks, expand_go_calls, expand_pipes, expand_question_ops, expand_with_chains,
     preprocess, validate_lazy_usage, validate_question_ops,
 };
-use tyc_types::check_module;
+use tyc_types::check_module_with;
 
 /// A source file held by the database — identified by path, with mutable
 /// text content. Changing `text` invalidates every query that derives
@@ -157,7 +157,13 @@ pub fn check_file(db: &mut TycDatabase, path: String, text: String) -> Diagnosti
         resolve_module(path.clone(), &prep.python_source, &prep.stripped, &module);
     diags.extend(resolve_diags);
 
-    let type_diags = check_module(path, &prep.python_source, &resolved, &module);
+    let type_diags = check_module_with(
+        path,
+        &prep.python_source,
+        &resolved,
+        &module,
+        &prep.unsafe_lines,
+    );
     diags.extend(type_diags);
 
     diags
@@ -207,6 +213,48 @@ mod tests {
             "val x: int = \"hi\"\n".to_owned(),
         );
         assert!(diags.has_errors());
+    }
+
+    #[test]
+    fn check_file_unsafe_block_suppresses_type_errors() {
+        // Inside an `unsafe:` block, type mismatches are suppressed so the
+        // user can interface with untyped Python.  Identical code outside the
+        // block remains an error (covered by check_file_reports_type_mismatch).
+        let mut db = TycDatabase::new();
+        let src = "\
+unsafe:
+    val x: int = \"hi\"
+";
+        let diags = check_file(&mut db, "<test>".to_owned(), src.to_owned());
+        assert!(
+            !diags.has_errors(),
+            "unsafe block should suppress type errors; got {:?}",
+            diags.errors()
+        );
+    }
+
+    #[test]
+    fn check_file_unsafe_block_does_not_leak_to_outer_scope() {
+        // A type error on a line outside the `unsafe:` block must still be
+        // reported even though another error occurs inside.
+        let mut db = TycDatabase::new();
+        let src = "\
+val outer: int = \"oops\"
+unsafe:
+    val inner: int = \"hi\"
+";
+        let diags = check_file(&mut db, "<test>".to_owned(), src.to_owned());
+        assert!(
+            diags.has_errors(),
+            "type error on outer line must still be reported"
+        );
+        // Exactly one error: the inner one is suppressed.
+        assert_eq!(
+            diags.errors().len(),
+            1,
+            "only the outer error should survive; got {:?}",
+            diags.errors()
+        );
     }
 
     #[test]
