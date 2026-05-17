@@ -10,10 +10,10 @@ Realistic milestones for one person plus AI assistance. The headline target is a
   — the workspace now declares empty `vendor/ruff_python_ast` and
   `vendor/ruff_python_parser` member crates with the dependency edge
   wired up; production Typhon still routes through `rustpython-parser`
-  0.4 from crates.io. The real source plus the `val`/`var` lexer
+  0.4 from crates.io. The real source plus the `let`/`mut` lexer
   additions land when the migration described in `tyc/vendor/README.md`
   runs.*
-- ✅ Add one or two custom tokens (`val`, `var`) to confirm the fork-extend workflow.
+- ✅ Add one or two custom tokens (`let`, `mut`) to confirm the fork-extend workflow.
 - ☐ Round-trip Python through the fork via `ruff_python_codegen`: parse → emit, verify byte-identical (modulo whitespace) on a corpus of real Python files. *Hand-written `tyc-emit` printer covers the Python subset used in Phase 0/1 round-trip tests; corpus verification deferred until the ruff fork lands.*
 - ✅ `clap`-based `tyc` shell with `tyc fmt` working as the simplest end-to-end command.
 - ✅ `miette` + `thiserror` diagnostic infrastructure.
@@ -22,7 +22,7 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 - Salsa db with cached `preprocessed_text` and `module_decl_names` queries; richer queries unlock as their outputs become `salsa::Update`-friendly.
 - Name resolution and scope construction with module / function / class / comprehension scopes.
-- `val` / `var` enforcement: reassigning a `val` is a hard error; top-level bindings default to `val`.
+- `let` / `mut` enforcement: reassigning a `let` is a hard error; top-level bindings default to `let`.
 - Nominal types: function signatures, assignment compatibility, primitive types, classes, generic containers.
 - Non-nullable by default with flow narrowing on `is None`, `is not None`, and `isinstance(x, T)` checks. `T?` is sugar for `T | None`.
 - `tyc check` emits useful "unknown name", "type mismatch", "nullable use", and "wrong argument count" diagnostics via `miette`.
@@ -56,7 +56,7 @@ Realistic milestones for one person plus AI assistance. The headline target is a
   checker. Errors on lines outside the block are unaffected.
 - ✅ **Pure-function detection** with the six-condition rule (sync, no `raise`,
   no `try`, no I/O builtins, no entropy/clocks, no writes to module-level
-  `var` state). `@pure`, `@memo`, and `@pure(memo=True)` decorators trigger
+  `mut` state). `@pure`, `@memo`, and `@pure(memo=True)` decorators trigger
   the check; violations are hard errors. Memoised functions get
   `@functools.cache` injected at desugar time; `@pure`/`@memo` markers are
   stripped because they are not real Python names.
@@ -71,7 +71,7 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 - ✅ **Lazy imports** — `lazy import np = numpy` lowers to a thread-safe
   proxy class generated inline by `expand_lazy_imports` (double-checked
   locking, no runtime helper dependency). `lazy from x import …` is rejected
-  because it defeats deferral. Module-level `lazy val NAME: T = expr` and
+  because it defeats deferral. Module-level `lazy let NAME: T = expr` and
   instance-level `cached_property` are deferred — the syntax pipeline does
   not yet recognise them.
 - ✅ **Pipe operator** `a |> f |> g(arg)` lowered to `g(f(a), arg)` left-
@@ -107,7 +107,7 @@ Everything beyond is polish and ambition.
   file is not an error — PGO is best-effort.
 - ✅ **LSP completions and code actions**. `textDocument/completion`
   returns visible bindings (walking the cursor's enclosing scope chain),
-  Typhon keywords (`val`, `var`, `gather`, `go`, `lazy`, …), and a
+  Typhon keywords (`let`, `mut`, `gather`, `go`, `lazy`, …), and a
   small set of common Python builtins; the LSP client filters by prefix.
   `textDocument/codeAction` offers a "Remove unused import" quick-fix
   for every `tyc::unused_import` diagnostic in range. Cross-file
@@ -131,7 +131,7 @@ In order:
 
 1. Set up the Cargo workspace skeleton with `crates/` and `vendor/` directories.
 2. Get parse → emit round-tripping a real Python file (e.g. one of Django's management commands) without losing anything.
-3. Add `val` and `var` as new keyword tokens. Confirm the fork-extend workflow is sustainable.
+3. Add `let` and `mut` as new keyword tokens. Confirm the fork-extend workflow is sustainable.
 4. Wire up `clap` with `tyc fmt` as the first working command.
 5. Add `miette` for diagnostics. Now any future error has somewhere good-looking to go.
 

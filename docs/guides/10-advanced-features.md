@@ -7,15 +7,15 @@ The features in this guide are the ones you'll reach for once Typhon is part of 
 A pipe (`|>`) takes the value on its left and threads it into the first positional slot of the call on its right:
 
 ```python
-val raw: str = "  Hello, World!  "
-val cleaned: str = raw |> str.strip() |> str.lower() |> str.replace(",", "")
+let raw: str = "  Hello, World!  "
+let cleaned: str = raw |> str.strip() |> str.lower() |> str.replace(",", "")
 # "hello world!"
 ```
 
 Reads top-down: take `raw`, strip it, lowercase it, drop the comma. The same chain without pipes:
 
 ```python
-val cleaned: str = str.replace(str.lower(str.strip(raw)), ",", "")
+let cleaned: str = str.replace(str.lower(str.strip(raw)), ",", "")
 ```
 
 …which is the standard Python jump-around-and-read-inside-out.
@@ -44,11 +44,11 @@ For one-step transformations, plain `f(x)` is fine.
 
 ## `comptime`
 
-`comptime val` bindings are evaluated by the compiler, at build time, and inlined as literals into the emitted Python. The most common use is **env-var validation**:
+`comptime let` bindings are evaluated by the compiler, at build time, and inlined as literals into the emitted Python. The most common use is **env-var validation**:
 
 ```python
-comptime val PORT: int = int(env("PORT", "8080"))
-comptime val DB_URL: str = env("DATABASE_URL")   # build fails if unset
+comptime let PORT: int = int(env("PORT", "8080"))
+comptime let DB_URL: str = env("DATABASE_URL")   # build fails if unset
 ```
 
 ```toml
@@ -85,16 +85,16 @@ It does **not** allow I/O, subprocesses, network access, random numbers, or impo
 ### Useful comptime patterns
 
 ```python
-comptime val BUILD: str = env("BUILD_TAG", "dev")
-comptime val IS_PROD: bool = BUILD == "prod"
+comptime let BUILD: str = env("BUILD_TAG", "dev")
+comptime let IS_PROD: bool = BUILD == "prod"
 
 comptime def feature_flag(name: str) -> bool:
     return env(f"FEATURE_{name.upper()}", "0") == "1"
 
-comptime val DARK_MODE: bool = feature_flag("dark_mode")
+comptime let DARK_MODE: bool = feature_flag("dark_mode")
 ```
 
-Each `comptime val` is a *constant* at runtime — there's no runtime cost to checking them, because they're already inlined.
+Each `comptime let` is a *constant* at runtime — there's no runtime cost to checking them, because they're already inlined.
 
 ## Lazy loading
 
@@ -106,7 +106,7 @@ lazy import np = numpy
 def main() -> None:
     # numpy is not loaded yet
     if len(sys.argv) > 1:
-        val arr: np.ndarray = np.array([1, 2, 3])    # loaded here, on first access
+        let arr: np.ndarray = np.array([1, 2, 3])    # loaded here, on first access
 ```
 
 `np` is a proxy object until you touch an attribute on it. The proxy is **thread-safe** — concurrent first accesses lock around the underlying `importlib.util.LazyLoader`.
@@ -127,25 +127,25 @@ lazy import numpy
 numpy.array(...)
 ```
 
-### `lazy val` for expensive module-level computation
+### `lazy let` for expensive module-level computation
 
 ```python
-lazy val CONFIG: Config = load_config_from_disk()
+lazy let CONFIG: Config = load_config_from_disk()
 ```
 
 This lowers to a cached getter with a sentinel + lock helper. First access pays the load cost; subsequent accesses are a memory read. Unlike `functools.cached_property` (which is instance-scoped, race-prone, and writable after first evaluation), the Typhon helper is robust under concurrency and one-shot.
 
-> Note: module-level `lazy val` is currently deferred — the syntax pipeline does not yet recognise it. Instance-level `lazy val` on effectively immutable classes lowers to `functools.cached_property`.
+> Note: module-level `lazy let` is currently deferred — the syntax pipeline does not yet recognise it. Instance-level `lazy let` on effectively immutable classes lowers to `functools.cached_property`.
 
 ### `lazy` return types
 
 ```python
 def primes_up_to(n: int) -> lazy[list[int]]:
-    val sieve: list[bool] = [True] * (n + 1)
-    var p: int = 2
+    let sieve: list[bool] = [True] * (n + 1)
+    mut p: int = 2
     while p * p <= n:
         if sieve[p]:
-            var k: int = p * p
+            mut k: int = p * p
             while k <= n:
                 sieve[k] = False
                 k = k + p
@@ -163,7 +163,7 @@ Typhon can verify that a function is **pure**: deterministic, side-effect-free, 
 2. **Hashable parameters.** Primitives, frozen dataclasses, tuples of hashables.
 3. **No I/O.** No `open`, `socket`, `subprocess`, `print`, logger, DB. Unsafe calls count as impure unless their stub is annotated `@pure`.
 4. **No non-determinism.** No `time.*`, `random.*`, `uuid.*`, `os.urandom`.
-5. **No mutable module state.** Reads from `comptime val` are fine; reads from a module `var` are not.
+5. **No mutable module state.** Reads from `comptime let` are fine; reads from a module `mut` are not.
 6. **No exceptions.** Pure functions express failure through `Result[T, E]`.
 
 When all six hold, the analyser **may** emit `@functools.cache` — but only when you opt in:
@@ -222,12 +222,12 @@ import some_messy_lib
 
 def main() -> None:
     unsafe:
-        val data = some_messy_lib.fetch()    # would otherwise be a tyc::implicit_any error
-        val first = data[0]
-        val tag = first.get("tag")
+        let data = some_messy_lib.fetch()    # would otherwise be a tyc::implicit_any error
+        let first = data[0]
+        let tag = first.get("tag")
 
     # at the unsafe boundary, you must re-assert the type
-    val tag_str: str = str(tag)              # explicit cast
+    let tag_str: str = str(tag)              # explicit cast
 ```
 
 What's special:
@@ -294,8 +294,8 @@ import sys
 
 lazy import np = numpy
 
-comptime val DB_URL: str = env("DATABASE_URL")
-comptime val MAX_BATCH: int = int(env("MAX_BATCH", "100"))
+comptime let DB_URL: str = env("DATABASE_URL")
+comptime let MAX_BATCH: int = int(env("MAX_BATCH", "100"))
 
 class Config:
     db: str
@@ -314,12 +314,12 @@ def fib(n: int) -> int:
     return fib(n - 1) + fib(n - 2)
 
 def main() -> None:
-    val cfg: Config = Config(db=DB_URL, batch=MAX_BATCH)
+    let cfg: Config = Config(db=DB_URL, batch=MAX_BATCH)
 
     match parse_arg(sys.argv[1] if len(sys.argv) > 1 else "10"):
         case Ok(n):
-            val series: list[int] = [fib(i) for i in range(n)]
-            val arr: np.ndarray = np.array(series)
+            let series: list[int] = [fib(i) for i in range(n)]
+            let arr: np.ndarray = np.array(series)
             print(arr |> np.diff() |> np.max())
         case Err(msg):
             print(f"bad input: {msg}")
@@ -330,7 +330,7 @@ if __name__ == "__main__":
 
 What this brings together:
 
-- `comptime val DB_URL` fails the build if `DATABASE_URL` isn't set — no surprises in prod.
+- `comptime let DB_URL` fails the build if `DATABASE_URL` isn't set — no surprises in prod.
 - `lazy import np = numpy` defers the ~150 ms numpy import; if the user passes an invalid arg, numpy never loads.
 - `@pure parse_arg` is verifiably pure — no I/O, no globals, no exceptions, errors through `Result`.
 - `@memo fib` caches recursive calls; the compiler has verified `fib` qualifies as pure.
@@ -358,10 +358,10 @@ Either drop `@pure` (and lose the memo eligibility) or refactor to take the body
 **`comptime` reading a runtime-only value:**
 
 ```python
-comptime val NOW: float = time.time()    # ❌ comptime sandbox forbids time.*
+comptime let NOW: float = time.time()    # ❌ comptime sandbox forbids time.*
 ```
 
-Fix: compute at runtime, cache with `lazy val`.
+Fix: compute at runtime, cache with `lazy let`.
 
 **Calling `lazy from foo import bar`:**
 
@@ -376,7 +376,7 @@ Fix: `lazy import numpy`, then use `numpy.array(...)`.
 ```python
 def parse() -> int:
     unsafe:
-        val v = messy_lib.get_int()
+        let v = messy_lib.get_int()
     return v    # ❌ Unsafe[Any] cannot flow into a concrete `int` context
 ```
 
@@ -385,8 +385,8 @@ Fix: re-assert inside or at the boundary:
 ```python
 def parse() -> int:
     unsafe:
-        val v = messy_lib.get_int()
-        val checked: int = int(v)
+        let v = messy_lib.get_int()
+        let checked: int = int(v)
     return checked
 ```
 

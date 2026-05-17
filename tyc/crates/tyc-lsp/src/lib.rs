@@ -420,8 +420,8 @@ pub fn run_stdio(log_level: LogLevel) {
 /// in one place so adding a new keyword (e.g. `gather`, `pure`) updates
 /// completion uniformly.
 const TYPHON_KEYWORDS: &[&str] = &[
-    "val",
-    "var",
+    "let",
+    "mut",
     "interface",
     "model",
     "impl",
@@ -628,8 +628,8 @@ fn binding_to_completion(binding: &tyc_resolve::Binding) -> CompletionItem {
         BindingKind::Import => CompletionItemKind::MODULE,
         BindingKind::Loop => CompletionItemKind::VARIABLE,
         BindingKind::Value => match binding.mutability {
-            Mutability::Val => CompletionItemKind::CONSTANT,
-            Mutability::Var => CompletionItemKind::VARIABLE,
+            Mutability::Let => CompletionItemKind::CONSTANT,
+            Mutability::Mut => CompletionItemKind::VARIABLE,
         },
     };
     let detail = match binding.kind {
@@ -640,8 +640,8 @@ fn binding_to_completion(binding: &tyc_resolve::Binding) -> CompletionItem {
         BindingKind::Loop => Some("loop binding".to_owned()),
         BindingKind::Value => Some(
             match binding.mutability {
-                Mutability::Val => "val",
-                Mutability::Var => "var",
+                Mutability::Let => "let",
+                Mutability::Mut => "mut",
             }
             .to_owned(),
         ),
@@ -719,8 +719,8 @@ fn render_hover(symbol: &SymbolAtOffset<'_>) -> String {
     };
     let kind = match def.kind {
         BindingKind::Value => match def.mutability {
-            Mutability::Val => "immutable binding",
-            Mutability::Var => "mutable binding",
+            Mutability::Let => "immutable binding",
+            Mutability::Mut => "mutable binding",
         },
         BindingKind::Function => "function",
         BindingKind::Class => "class",
@@ -800,7 +800,7 @@ fn first_label(err: &TycError) -> Option<LabeledSpan> {
 /// `validate_question_ops` errors carry offsets into the **original** Typhon
 /// source. Every other diagnostic produced by `check_file` (parse, resolve,
 /// type-check, unused-import, etc.) is anchored to the **preprocessed**
-/// source because that's what the parser and resolver see after `val`/`var`
+/// source because that's what the parser and resolver see after `let`/`mut`
 /// stripping and sugar expansion. Selecting the correct reference text per
 /// diagnostic variant keeps published LSP ranges aligned with the editor
 /// buffer instead of drifting by a column or two after `val` is removed.
@@ -949,7 +949,7 @@ mod tests {
         let binding = Binding {
             name: "x".to_owned(),
             kind: BindingKind::Value,
-            mutability: Mutability::Val,
+            mutability: Mutability::Let,
             span: (4, 5),
         };
         let symbol = SymbolAtOffset {
@@ -969,7 +969,7 @@ mod tests {
         let binding = Binding {
             name: "main".to_owned(),
             kind: BindingKind::Function,
-            mutability: Mutability::Var,
+            mutability: Mutability::Mut,
             span: (4, 8),
         };
         let symbol = SymbolAtOffset {
@@ -987,7 +987,7 @@ mod tests {
 
     #[test]
     fn resolve_in_preprocessed_finds_bindings() {
-        // After preprocessing, `val x` becomes `x: int = 1`.  The resolver
+        // After preprocessing, `let x` becomes `x: int = 1`.  The resolver
         // should see `x` as a binding at offset 0.
         let preprocessed = "x: int = 1\n";
         let resolved =
@@ -1043,7 +1043,7 @@ def outer(a):
         assert!(labels.contains("outer"), "expected `outer`: {labels:?}");
         assert!(labels.contains("inner"), "expected `inner`: {labels:?}");
         // Typhon keywords and a representative builtin:
-        assert!(labels.contains("val"), "missing val keyword: {labels:?}");
+        assert!(labels.contains("let"), "missing let keyword: {labels:?}");
         assert!(
             labels.contains("gather"),
             "missing gather keyword: {labels:?}"
@@ -1057,7 +1057,7 @@ def outer(a):
     #[test]
     fn completion_kinds_distinguish_function_and_value() {
         let src = "\
-val name: str = \"hi\"
+let name: str = \"hi\"
 def greet():
     return name
 ";
@@ -1070,7 +1070,7 @@ def greet():
         let greet = items.iter().find(|i| i.label == "greet").expect("greet");
         let name = items.iter().find(|i| i.label == "name").expect("name");
         assert_eq!(greet.kind, Some(CompletionItemKind::FUNCTION));
-        // `val` bindings render as CONSTANT to differentiate from `var`.
+        // `let` bindings render as CONSTANT to differentiate from `mut`.
         assert_eq!(name.kind, Some(CompletionItemKind::CONSTANT));
     }
 
@@ -1103,7 +1103,7 @@ def greet():
     #[test]
     fn code_action_offers_remove_for_unused_import() {
         let u = uri("file:///tmp/foo.ty");
-        let text = "import os\nval x: int = 1\n";
+        let text = "import os\nlet x: int = 1\n";
         let diag = unused_import_diag(0, 7, 2);
         let actions = compute_code_actions(&u, text, &[diag]);
         assert_eq!(actions.len(), 1, "expected one action");
@@ -1133,7 +1133,7 @@ def greet():
         // with only `os` flagged must NOT produce a whole-line delete
         // — that would also drop the still-used `sys` import.
         let u = uri("file:///tmp/foo.ty");
-        let text = "import os, sys\nval x: int = 1\n";
+        let text = "import os, sys\nlet x: int = 1\n";
         let diag = unused_import_diag(0, 7, 2);
         let actions = compute_code_actions(&u, text, &[diag]);
         assert!(
@@ -1163,7 +1163,7 @@ def greet():
         // with the import — the comment was documenting the now-gone
         // import.
         let u = uri("file:///tmp/foo.ty");
-        let text = "import os  # legacy\nval x: int = 1\n";
+        let text = "import os  # legacy\nlet x: int = 1\n";
         let diag = unused_import_diag(0, 7, 2);
         let actions = compute_code_actions(&u, text, &[diag]);
         assert_eq!(actions.len(), 1, "simple import + comment should fix");
@@ -1196,7 +1196,7 @@ def greet():
     #[test]
     fn code_action_ignores_unrelated_diagnostics() {
         let u = uri("file:///tmp/foo.ty");
-        let text = "val x: int = 1\n";
+        let text = "let x: int = 1\n";
         let mut diag = unused_import_diag(0, 0, 3);
         diag.code = Some(NumberOrString::String("tyc::type_mismatch".to_string()));
         let actions = compute_code_actions(&u, text, &[diag]);
@@ -1234,7 +1234,7 @@ def greet():
 
     #[test]
     fn diagnostic_source_returns_original_for_invalid_question_op() {
-        let original = "val x = y?";
+        let original = "let x = y?";
         let preprocessed = "x = y_result";
         let err = TycError::invalid_question_op("bad use of ?", "f.ty", original, 8, 2);
         assert_eq!(
@@ -1246,7 +1246,7 @@ def greet():
 
     #[test]
     fn diagnostic_source_returns_preprocessed_for_type_mismatch() {
-        let original = "val x: int = \"hi\"";
+        let original = "let x: int = \"hi\"";
         let preprocessed = "x: int = \"hi\"";
         let err = TycError::type_mismatch("int", "str", "f.ty", preprocessed, 0, 1);
         assert_eq!(
@@ -1258,7 +1258,7 @@ def greet():
 
     #[test]
     fn diagnostic_source_returns_preprocessed_for_unknown_name() {
-        let original = "val y: str = z";
+        let original = "let y: str = z";
         let preprocessed = "y: str = z";
         let err = TycError::unknown_name("z", "f.ty", preprocessed, 9, 1);
         assert_eq!(
@@ -1306,7 +1306,7 @@ def greet():
 
     #[test]
     fn tyc_error_to_lsp_converts_type_mismatch_to_diagnostic() {
-        let src = "val x: int = \"hi\"";
+        let src = "let x: int = \"hi\"";
         let err = TycError::type_mismatch("int", "str", "f.ty", src, 0, 3);
         let result = tyc_error_to_lsp(&err, src, DiagnosticSeverity::ERROR);
         assert!(
@@ -1325,7 +1325,7 @@ def greet():
 
     #[test]
     fn tyc_error_to_lsp_preserves_error_code() {
-        let src = "val x: int = \"hi\"";
+        let src = "let x: int = \"hi\"";
         let err = TycError::type_mismatch("int", "str", "f.ty", src, 0, 1);
         let d = tyc_error_to_lsp(&err, src, DiagnosticSeverity::ERROR).unwrap();
         assert!(
@@ -1336,7 +1336,7 @@ def greet():
 
     #[test]
     fn tyc_error_to_lsp_sets_source_field() {
-        let src = "val x: int = \"hi\"";
+        let src = "let x: int = \"hi\"";
         let err = TycError::type_mismatch("int", "str", "f.ty", src, 0, 1);
         let d = tyc_error_to_lsp(&err, src, DiagnosticSeverity::WARNING).unwrap();
         assert_eq!(

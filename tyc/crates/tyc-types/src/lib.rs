@@ -1930,13 +1930,13 @@ mod tests {
 
     #[test]
     fn accepts_matching_annotation() {
-        let d = check("val x: int = 1\n");
+        let d = check("let x: int = 1\n");
         assert!(!d.has_errors(), "{:?}", d.errors());
     }
 
     #[test]
     fn rejects_type_mismatch() {
-        let d = check("val x: int = \"hello\"\n");
+        let d = check("let x: int = \"hello\"\n");
         assert!(d.has_errors());
         let msg = format!("{}", d.errors()[0]);
         assert!(msg.contains("expected `int`"), "got {}", msg);
@@ -1944,25 +1944,25 @@ mod tests {
 
     #[test]
     fn accepts_int_into_float_target() {
-        let d = check("val x: float = 1\n");
+        let d = check("let x: float = 1\n");
         assert!(!d.has_errors(), "{:?}", d.errors());
     }
 
     #[test]
     fn rejects_none_in_non_nullable() {
-        let d = check("val x: int = None\n");
+        let d = check("let x: int = None\n");
         assert!(d.has_errors());
     }
 
     #[test]
     fn accepts_none_in_nullable() {
-        let d = check("val x: int | None = None\n");
+        let d = check("let x: int | None = None\n");
         assert!(!d.has_errors(), "{:?}", d.errors());
     }
 
     #[test]
     fn optional_sugar_accepted() {
-        let d = check("val x: int? = None\n");
+        let d = check("let x: int? = None\n");
         assert!(!d.has_errors(), "{:?}", d.errors());
     }
 
@@ -2006,7 +2006,7 @@ def f(x: int | str) -> int:
 def add(a: int, b: int) -> int:
     return a + b
 
-val r: int = add(1)
+let r: int = add(1)
 ";
         let d = check(src);
         assert!(d.has_errors());
@@ -2020,7 +2020,7 @@ val r: int = add(1)
 def add(a: int, b: int) -> int:
     return a + b
 
-val r: int = add(1, \"x\")
+let r: int = add(1, \"x\")
 ";
         let d = check(src);
         assert!(d.has_errors());
@@ -2033,7 +2033,7 @@ class Point:
     x: int
     y: int
 
-val p: Point = Point()
+let p: Point = Point()
 ";
         let d = check(src);
         assert!(!d.has_errors(), "{:?}", d.errors());
@@ -2042,7 +2042,7 @@ val p: Point = Point()
     #[test]
     fn not_returns_bool_regardless_of_operand() {
         // `not x` on a non-bool operand still has type bool.
-        let d = check("val flag: bool = not 1\n");
+        let d = check("let flag: bool = not 1\n");
         assert!(!d.has_errors(), "{:?}", d.errors());
     }
 
@@ -2087,7 +2087,7 @@ class Rectangle:
 
 type Shape = Circle | Rectangle
 
-val s: Shape = Circle()
+let s: Shape = Circle()
 ";
         let d = check(src);
         assert!(!d.has_errors(), "{:?}", d.errors());
@@ -2104,7 +2104,7 @@ class Rectangle:
 
 type Shape = Circle | Rectangle
 
-val s: Shape = Circle()
+let s: Shape = Circle()
 
 match s:
     case Circle():
@@ -2130,7 +2130,7 @@ class Triangle:
 
 type Shape = Circle | Rectangle | Triangle
 
-val s: Shape = Circle()
+let s: Shape = Circle()
 
 match s:
     case Circle():
@@ -2161,7 +2161,7 @@ class Triangle:
 
 type Shape = Circle | Rectangle | Triangle
 
-val s: Shape = Circle()
+let s: Shape = Circle()
 
 match s:
     case Circle():
@@ -2184,7 +2184,7 @@ class Rectangle:
 
 type Shape = Circle | Rectangle
 
-val s: Shape = Circle()
+let s: Shape = Circle()
 
 match s:
     case Circle():
@@ -2200,7 +2200,7 @@ match s:
     fn non_sealed_match_not_checked() {
         // A `match` on a plain int is not subject to exhaustiveness rules.
         let src = "\
-val x: int = 1
+let x: int = 1
 
 match x:
     case 1:
@@ -2223,7 +2223,7 @@ class Rectangle:
 
 type Shape = Circle | Rectangle
 
-val s: Shape = Circle()
+let s: Shape = Circle()
 
 match s:
     case Circle() if True:
@@ -2255,7 +2255,7 @@ class Rectangle:
 
 type Shape = Circle | Rectangle
 
-val s: Shape = Circle()
+let s: Shape = Circle()
 
 match s:
     case Circle() as c:
@@ -2280,7 +2280,7 @@ class Rectangle:
 
 type Shape = Circle | Rectangle
 
-val x: Shape? = Circle()
+let x: Shape? = Circle()
 ";
         let d = check(src);
         assert!(!d.has_errors(), "{:?}", d.errors());
@@ -2291,7 +2291,7 @@ val x: Shape? = Circle()
     #[test]
     fn ok_assignable_to_result() {
         let src = "\
-val r: Result[int, str] = Ok(42)
+let r: Result[int, str] = Ok(42)
 ";
         let d = check(src);
         assert!(!d.has_errors(), "{:?}", d.errors());
@@ -2300,7 +2300,7 @@ val r: Result[int, str] = Ok(42)
     #[test]
     fn err_assignable_to_result() {
         let src = "\
-val r: Result[int, str] = Err(\"oops\")
+let r: Result[int, str] = Err(\"oops\")
 ";
         let d = check(src);
         assert!(!d.has_errors(), "{:?}", d.errors());
@@ -2309,7 +2309,7 @@ val r: Result[int, str] = Err(\"oops\")
     #[test]
     fn plain_int_not_assignable_to_result() {
         let src = "\
-val r: Result[int, str] = 42
+let r: Result[int, str] = 42
 ";
         let d = check(src);
         assert!(d.has_errors(), "expected type-mismatch error");
@@ -2339,7 +2339,7 @@ def find(id: int) -> Result[int, str]:
     fn result_wrong_ok_type_rejected() {
         // Ok("text") should not fit Result[int, str]: Ok expects an int value.
         let src = "\
-val r: Result[int, str] = Ok(\"text\")
+let r: Result[int, str] = Ok(\"text\")
 ";
         let d = check(src);
         assert!(
@@ -2352,7 +2352,7 @@ val r: Result[int, str] = Ok(\"text\")
     fn result_wrong_err_type_rejected() {
         // Err(99) should not fit Result[int, str]: Err expects a str value.
         let src = "\
-val r: Result[int, str] = Err(99)
+let r: Result[int, str] = Err(99)
 ";
         let d = check(src);
         assert!(
@@ -2371,7 +2371,7 @@ def first() -> Result[int, str]:
     return Ok(1)
 
 def forward() -> Result[int, str]:
-    val r: Result[int, str] = first()
+    let r: Result[int, str] = first()
     return r
 ";
         let d = check(src);
@@ -2391,7 +2391,7 @@ class Circle:
     def draw(self) -> None:
         pass
 
-val d: Drawable = Circle()
+let d: Drawable = Circle()
 ";
         let d = check(src);
         assert!(!d.has_errors(), "{:?}", d.errors());
@@ -2410,7 +2410,7 @@ class Circle:
     def draw(self) -> None:
         pass
 
-val s: Drawable = Circle()
+let s: Drawable = Circle()
 ";
         let d = check(src);
         assert!(d.has_errors(), "missing-member must fail conformance");
@@ -2436,8 +2436,8 @@ class Circle:
     def draw(self) -> None:
         pass
 
-val c = Circle()
-val ok: bool = isinstance(c, Drawable)
+let c = Circle()
+let ok: bool = isinstance(c, Drawable)
 ";
         let d = check(src);
         assert!(
@@ -2459,8 +2459,8 @@ val ok: bool = isinstance(c, Drawable)
 class Circle:
     radius: float
 
-val c = Circle()
-val ok: bool = isinstance(c, Circle)
+let c = Circle()
+let ok: bool = isinstance(c, Circle)
 ";
         let d = check(src);
         assert!(!d.has_errors(), "{:?}", d.errors());
@@ -2481,8 +2481,8 @@ class Circle:
     def draw(self) -> None:
         pass
 
-val c = Circle()
-val ok: bool = isinstance(c, Drawable)
+let c = Circle()
+let ok: bool = isinstance(c, Drawable)
 ";
         let d = check(src);
         assert!(
@@ -2512,8 +2512,8 @@ def first[T](items: list[T]) -> T:
 def first[T](items: list[T]) -> T:
     return items[0]
 
-val xs: list[int] = [1, 2, 3]
-val n: int = first(xs)
+let xs: list[int] = [1, 2, 3]
+let n: int = first(xs)
 ";
         let d = check(src);
         assert!(!d.has_errors(), "{:?}", d.errors());
@@ -2570,8 +2570,8 @@ val n: int = first(xs)
 def first[T](items: list[T]) -> T:
     return items[0]
 
-val xs: list[int] = [1, 2, 3]
-val n: str = first(xs)
+let xs: list[int] = [1, 2, 3]
+let n: str = first(xs)
 ";
         let d = check(src);
         assert!(

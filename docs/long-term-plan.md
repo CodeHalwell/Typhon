@@ -15,7 +15,7 @@ The risk in the project is not technological. Every individual stage has a matur
 ### Goals
 
 - **Static safety**: non-nullable by default, no implicit `Any`, explicit error handling via `Result[T, E]`.
-- **Modern ergonomics**: `val`/`var`, interfaces, sealed unions with exhaustive matching, guards, pipes, comptime, lazy loading.
+- **Modern ergonomics**: `let`/`mut`, interfaces, sealed unions with exhaustive matching, guards, pipes, comptime, lazy loading.
 - **Clean compilation** to standard Python with no runtime dependency on Typhon-specific machinery.
 - **First-class tooling**: a single `tyc` binary that builds, checks, formats, and runs as an LSP, with sub-100 ms incremental feedback in the editor.
 - **Honest interop** with existing Python via `.dty` stubs and explicit `unsafe` regions.
@@ -40,7 +40,7 @@ The `tyc` binary is a multi-stage compiler with an embedded LSP, structured as a
 [tyc-syntax]   →  Typhon AST (Python AST + Typhon nodes)
         │
         ▼
-[tyc-resolve]  →  symbol tables, scopes, val/var classification
+[tyc-resolve]  →  symbol tables, scopes, let/mut classification
         │
         ▼
 [tyc-types]    →  typed AST, structural subtyping, sealed unions
@@ -66,7 +66,7 @@ tyc/
 ├── crates/
 │   ├── tyc-syntax/             forked ruff_python_ast + parser, Typhon nodes
 │   ├── tyc-db/                 Salsa database, input/tracked queries
-│   ├── tyc-resolve/            name resolution, imports, val/var
+│   ├── tyc-resolve/            name resolution, imports, let/mut
 │   ├── tyc-types/              structural + nominal type checker
 │   ├── tyc-analyse/            purity, async-gather, comptime, DCE
 │   ├── tyc-desugar/            Typhon AST → Python AST lowering
@@ -143,7 +143,7 @@ PEP 544's `@runtime_checkable` only validates **attribute presence**, not signat
 
 1. Permits expressions whose inferred type would otherwise be `Any` to bind freely.
 2. Tracks values originating from `unsafe` with a hidden `Unsafe[T]` marker that is invisible to user syntax but visible in diagnostics.
-3. Refuses to let `Unsafe[T]` flow into a non-`unsafe` context where a concrete `T` is required — the value must be re-asserted via an explicit cast, narrowing, or assignment to an annotated `val`/`var`.
+3. Refuses to let `Unsafe[T]` flow into a non-`unsafe` context where a concrete `T` is required — the value must be re-asserted via an explicit cast, narrowing, or assignment to an annotated `let`/`mut`.
 
 This means "no `Any`" is enforced at every region boundary even when a region internally tolerates dynamism. Stub files (`.dty`) and explicit `unsafe` blocks are the only two ways dynamic typing enters a Typhon program.
 
@@ -186,7 +186,7 @@ class ApiUser(BaseModel):
     email: str
 ```
 
-**`extra='forbid'` is the default.** Pydantic's stock default is `extra='ignore'`, which silently drops unexpected input. That contradicts Typhon's safety pitch, so `model` emission injects `extra='forbid'` by default. Users who want a permissive boundary opt in explicitly via `[emit] model-extra = "allow" | "ignore"` in `typhon.toml`, or per-class through a future modifier. `frozen=True` and similar configs remain opt-in; note that Pydantic immutability is *faux* — it blocks reassignment of fields but does not freeze nested mutable values. See `val` and `var` below for what Typhon does and does not guarantee about immutability.
+**`extra='forbid'` is the default.** Pydantic's stock default is `extra='ignore'`, which silently drops unexpected input. That contradicts Typhon's safety pitch, so `model` emission injects `extra='forbid'` by default. Users who want a permissive boundary opt in explicitly via `[emit] model-extra = "allow" | "ignore"` in `typhon.toml`, or per-class through a future modifier. `frozen=True` and similar configs remain opt-in; note that Pydantic immutability is *faux* — it blocks reassignment of fields but does not freeze nested mutable values. See `let` and `mut` below for what Typhon does and does not guarantee about immutability.
 
 ### Error handling
 
@@ -267,19 +267,19 @@ def spawn(coro):
 
 `go f(x)` desugars to `typhon_runtime.tasks.spawn(f(x))`. The registry holds strong references for the task's lifetime and releases them on completion. The same pattern applies to thread-pool `go` on free-threaded builds, with a `Future` registry instead.
 
-### `val` and `var`
+### `let` and `mut`
 
-`val` and `var` govern **binding immutability**, not deep value immutability. A `val u: User` cannot be reassigned, but if `User` exposes a mutable field, that field can still be written through. This matches Rust's `let` versus `let mut` and TypeScript's `const`; it does not match Clojure's deep immutability.
+`let` and `mut` govern **binding immutability**, not deep value immutability. A `let u: User` cannot be reassigned, but if `User` exposes a mutable field, that field can still be written through. This matches Rust's `let` versus `let mut` and TypeScript's `const`; it does not match Clojure's deep immutability.
 
-- `val` is immutable as a binding. Reassignment is a compile error.
-- `var` is mutable. Parallelisation passes refuse to touch any binding captured as `var` by a spawned task without explicit synchronisation.
-- Top-level module bindings default to `val` unless declared `var`.
+- `let` is immutable as a binding. Reassignment is a compile error.
+- `mut` is mutable. Parallelisation passes refuse to touch any binding captured as `mut` by a spawned task without explicit synchronisation.
+- Top-level module bindings default to `let` unless declared `mut`.
 
-Deep immutability for class instances is an emit-time concern, not a binding one: pass `frozen=True` to the underlying `@dataclass` or Pydantic config (Pydantic's flavour blocks reassignment of fields but does not recursively freeze nested values). A future `freeze` modifier may layer stronger deep-immutability semantics on top, but `val` itself stays scoped to bindings.
+Deep immutability for class instances is an emit-time concern, not a binding one: pass `frozen=True` to the underlying `@dataclass` or Pydantic config (Pydantic's flavour blocks reassignment of fields but does not recursively freeze nested values). A future `freeze` modifier may layer stronger deep-immutability semantics on top, but `let` itself stays scoped to bindings.
 
 ### Lazy loading
 
-`lazy import np = numpy` desugars to a `typhon_runtime.lazy_import_proxy` that defers module loading until first attribute access, built on `importlib.util.LazyLoader`. `lazy val` module-level bindings desugar to a cached getter. `lazy[list[T]]` return types emit generator functions instead of materialised lists.
+`lazy import np = numpy` desugars to a `typhon_runtime.lazy_import_proxy` that defers module loading until first attribute access, built on `importlib.util.LazyLoader`. `lazy let` module-level bindings desugar to a cached getter. `lazy[list[T]]` return types emit generator functions instead of materialised lists.
 
 ### Stubs and Python interop
 
@@ -302,8 +302,8 @@ This is the highest-leverage feature in the spec. Build-time env validation alon
 
 ```python
 # Typhon
-comptime val PORT: int = int(env("PORT", "8080"))
-comptime val DB_URL: str = env("DATABASE_URL")  # build fails if unset
+comptime let PORT: int = int(env("PORT", "8080"))
+comptime let DB_URL: str = env("DATABASE_URL")  # build fails if unset
 
 # Emitted Python
 PORT: int = 8080
@@ -332,7 +332,7 @@ A function is **inferable as pure** only if every one of the following holds:
 2. All parameter types are hashable (primitives, frozen dataclasses, tuples of hashable types, sealed-union variants whose payloads are themselves hashable). Unhashable arguments would break dictionary-based caches.
 3. No I/O calls in the transitive call graph: no `open`, no `socket`, no `subprocess`, no logger writes, no `print`, no DB drivers. The checker maintains a small allow-list and treats `unsafe`/stubbed calls as impure unless the stub itself is annotated `@pure`.
 4. No reads from non-deterministic clocks or entropy sources (`time.time`, `time.monotonic`, `random.*`, `secrets.*`, `uuid.uuid4`, `os.urandom`).
-5. No reads from or writes to mutable module-level state. Reads from `comptime val` bindings are fine; reads from a `var` module binding are not.
+5. No reads from or writes to mutable module-level state. Reads from `comptime let` bindings are fine; reads from a `mut` module binding are not.
 6. No exceptions raised through the function in the inferred return paths — pure functions return `Result[T, E]` if they need to express failure.
 
 When all six hold, the analyser may emit `@functools.cache` (unbounded) or `@functools.lru_cache(maxsize=N)` (bounded) at the user's preference, defaulting to `lru_cache(maxsize=1024)`. Caches are emitted only at the user's opt-in: a `@memo` attribute, a `[strictness] auto-memoise = true` toggle, or an explicit `@pure(memo=True)` annotation. The checker does not silently insert caches; if it could, it would also be silently extending the lifetime of every cached argument and return value.
@@ -345,7 +345,7 @@ This is the most open-ended part of the project. Structural subtyping in particu
 
 ### Hybrid strategy
 
-1. Run Typhon-specific checks on the Typhon AST: non-nullability, sealed-union exhaustiveness, `Result`/`?` propagation, `val`/`var`, no-implicit-`Any`, extension-method resolution.
+1. Run Typhon-specific checks on the Typhon AST: non-nullability, sealed-union exhaustiveness, `Result`/`?` propagation, `let`/`mut`, no-implicit-`Any`, extension-method resolution.
 2. Desugar to Python AST with rich type annotations preserved.
 3. Optionally run `ty` (as a library, depending on the Ruff git repo) over the desugared AST to catch standard Python typing violations.
 
@@ -414,7 +414,7 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 ### Phase 0 — Foundation (months 1–2)
 
 - Fork `ruff_python_parser` and `ruff_python_ast` into `vendor/`.
-- Add one or two custom tokens (`val`, `var`) to confirm the fork-extend workflow.
+- Add one or two custom tokens (`let`, `mut`) to confirm the fork-extend workflow.
 - Round-trip Python through the fork via `ruff_python_codegen`: parse → emit, verify byte-identical (modulo whitespace) on a corpus of real Python files.
 - `clap`-based `tyc` shell with `tyc fmt` working as the simplest end-to-end command.
 - `miette` + `thiserror` diagnostic infrastructure.
@@ -422,7 +422,7 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 ### Phase 1 — Core types (months 3–5)
 
 - Salsa db with `parse` and `resolve` queries.
-- Name resolution and scope construction; `val`/`var` enforcement (no types yet).
+- Name resolution and scope construction; `let`/`mut` enforcement (no types yet).
 - Nominal types: function signatures, assignment compatibility, primitive types, classes.
 - Non-nullable by default with flow narrowing on guards and `isinstance` checks.
 - `tyc check` produces useful "unknown name" and "type mismatch" diagnostics via `miette`.
@@ -444,7 +444,7 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 - Pure-function detection bound to the six-condition rule (sync, hashable args, no I/O, no entropy/clocks, no mutable module state, no exceptions). `@functools.cache` / `lru_cache` emission only with an explicit opt-in.
 - `gather` block, lowered to `asyncio.TaskGroup` by default. `gather(strategy="best-effort"):` for the `asyncio.gather(..., return_exceptions=True)` shape.
 - `go` lowered through `typhon_runtime.tasks.spawn` with a strong-ref registry.
-- Lazy imports (`lazy import np = numpy` only — `lazy from x import a, b` is rejected because it defeats deferral) and `lazy val` (cached getter for module-level, `cached_property` for instance-level on effectively immutable objects).
+- Lazy imports (`lazy import np = numpy` only — `lazy from x import a, b` is rejected because it defeats deferral) and `lazy let` (cached getter for module-level, `cached_property` for instance-level on effectively immutable objects).
 - Pipe operator, guards, extension methods.
 - `.dty` stub files, `.pyi` interop emission, and `tyc check --stubs` (stubtest port).
 
@@ -533,7 +533,7 @@ Concrete next steps, in order:
 
 1. Set up the Cargo workspace skeleton with `crates/` and `vendor/` directories.
 2. Get parse → emit round-tripping a real Python file (e.g. one of Django's management commands) without losing anything.
-3. Add `val` and `var` as new keyword tokens. Confirm the fork-extend workflow is sustainable.
+3. Add `let` and `mut` as new keyword tokens. Confirm the fork-extend workflow is sustainable.
 4. Wire up `clap` with `tyc fmt` as the first working command.
 5. Add `miette` for diagnostics. Now any future error has somewhere good-looking to go.
 

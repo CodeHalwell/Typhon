@@ -5,11 +5,11 @@
 //! - A tree of [`Scope`]s rooted at the module scope.
 //! - A [`SymbolTable`] that maps every introduced name to its declaration.
 //! - A set of [`Reference`]s recording each use of a name.
-//! - Diagnostics for unknown names and `val` re-assignments.
+//! - Diagnostics for unknown names and `let` re-assignments.
 //!
 //! The resolver consumes the original Typhon source plus the parsed Python
 //! AST. The Python AST has byte offsets relative to the *preprocessed*
-//! source, but the val/var stripping never alters line numbers and only
+//! source, but the let/mut stripping never alters line numbers and only
 //! removes characters at the start of a line, so positions inside
 //! expressions remain stable; we use them directly.
 
@@ -22,12 +22,12 @@ use tyc_syntax::preprocess::StrippedKeyword;
 /// Mutability of a binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mutability {
-    /// `val` — immutable; reassignment is a compile error.
-    Val,
-    /// `var`, function/class declaration, parameter, or import — mutable
-    /// or rebindable by the language semantics. Only `val` is rejected on
+    /// `let` — immutable; reassignment is a compile error.
+    Let,
+    /// `mut`, function/class declaration, parameter, or import — mutable
+    /// or rebindable by the language semantics. Only `let` is rejected on
     /// reassignment.
-    Var,
+    Mut,
 }
 
 /// What kind of entity a binding introduces.
@@ -235,7 +235,7 @@ pub struct SymbolAtOffset<'a> {
     /// unresolved references (would also produce an "unknown name"
     /// diagnostic at check time).
     pub definition: Option<&'a Binding>,
-    /// True when this offset lies inside a declaration site (`val x =`,
+    /// True when this offset lies inside a declaration site (`let x =`,
     /// `def foo`, `class Foo:`).
     pub is_definition: bool,
 }
@@ -335,7 +335,7 @@ impl<'a> Resolver<'a> {
             // via `def`, `class`, a for-loop target, or another assignment
             // all violate immutability.
             let _ = kind;
-            if existing.mutability == Mutability::Val || mutability == Mutability::Val {
+            if existing.mutability == Mutability::Let || mutability == Mutability::Let {
                 let decl_span = existing.span;
                 self.diagnostics.push_error(TycError::immutable_assign(
                     name,
@@ -504,7 +504,7 @@ fn find_def_name_span(
 /// Pre-declare names that should be visible across the whole body. Runs in
 /// two sub-passes so that `val` values are registered *before* function /
 /// class / import names — this lets the val-immutability check fire when a
-/// later `def x` or `class x` collides with an earlier `val x`.
+/// later `def x` or `class x` collides with an earlier `let x`.
 fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt<TextRange>]) {
     // Sub-pass 1: value bindings (so val-protection sees them first).
     let default_val = r.scopes[scope].kind == ScopeKind::Module;
@@ -536,7 +536,7 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt<TextRange>])
                     scope,
                     f.name.as_str(),
                     BindingKind::Function,
-                    Mutability::Var,
+                    Mutability::Mut,
                     span,
                 );
             }
@@ -551,7 +551,7 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt<TextRange>])
                     scope,
                     f.name.as_str(),
                     BindingKind::Function,
-                    Mutability::Var,
+                    Mutability::Mut,
                     span,
                 );
             }
@@ -566,7 +566,7 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt<TextRange>])
                     scope,
                     c.name.as_str(),
                     BindingKind::Class,
-                    Mutability::Var,
+                    Mutability::Mut,
                     span,
                 );
             }
@@ -593,7 +593,7 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt<TextRange>])
                         scope,
                         &bound_name,
                         BindingKind::Import,
-                        Mutability::Var,
+                        Mutability::Mut,
                         span,
                     );
                 }
@@ -609,7 +609,7 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt<TextRange>])
                         scope,
                         name.as_str(),
                         BindingKind::Import,
-                        Mutability::Var,
+                        Mutability::Mut,
                         span,
                     );
                 }
@@ -626,7 +626,7 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt<TextRange>])
                         scope,
                         n.id.as_str(),
                         BindingKind::Class,
-                        Mutability::Val,
+                        Mutability::Let,
                         span,
                     );
                 }
@@ -647,9 +647,9 @@ fn declare_target(r: &mut Resolver, scope: ScopeId, target: &Expr<TextRange>, de
         // bare assignments inherit the existing binding's mutability.
         let existing_mut = r.lookup_local(scope, n.id.as_str()).map(|b| b.mutability);
         let mutability = match kw {
-            Some(TyphonKeyword::Val) => Mutability::Val,
-            Some(TyphonKeyword::Var) => Mutability::Var,
-            // `comptime val` records the inner `val` keyword, so Comptime
+            Some(TyphonKeyword::Let) => Mutability::Let,
+            Some(TyphonKeyword::Mut) => Mutability::Mut,
+            // `comptime let` records the inner `val` keyword, so Comptime
             // alone would only appear when the inner keyword was omitted.
             // None of the other keywords are value binding keywords — treat
             // them like bare assignments (inherit or default).
@@ -665,9 +665,9 @@ fn declare_target(r: &mut Resolver, scope: ScopeId, target: &Expr<TextRange>, de
                 | TyphonKeyword::Lazy,
             )
             | None => existing_mut.unwrap_or(if default_val {
-                Mutability::Val
+                Mutability::Let
             } else {
-                Mutability::Var
+                Mutability::Mut
             }),
         };
         let span = (
@@ -836,7 +836,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
                     scope,
                     n.id.as_str(),
                     BindingKind::Loop,
-                    Mutability::Var,
+                    Mutability::Mut,
                     span,
                 );
             }
@@ -860,7 +860,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
                             scope,
                             n.id.as_str(),
                             BindingKind::Loop,
-                            Mutability::Var,
+                            Mutability::Mut,
                             span,
                         );
                     }
@@ -883,7 +883,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
                             scope,
                             n.id.as_str(),
                             BindingKind::Loop,
-                            Mutability::Var,
+                            Mutability::Mut,
                             span,
                         );
                     }
@@ -904,7 +904,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
                     scope,
                     n.id.as_str(),
                     BindingKind::Loop,
-                    Mutability::Var,
+                    Mutability::Mut,
                     span,
                 );
             }
@@ -933,7 +933,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
                         scope,
                         name.as_str(),
                         BindingKind::Loop,
-                        Mutability::Var,
+                        Mutability::Mut,
                         span,
                     );
                 }
@@ -1029,7 +1029,7 @@ fn walk_impl_method(r: &mut Resolver, cls_scope: ScopeId, stmt: &Stmt<TextRange>
                 fn_scope,
                 "self",
                 BindingKind::Parameter,
-                Mutability::Var,
+                Mutability::Mut,
                 (0, 0),
             );
             declare_arguments(r, fn_scope, &f.args);
@@ -1051,7 +1051,7 @@ fn walk_impl_method(r: &mut Resolver, cls_scope: ScopeId, stmt: &Stmt<TextRange>
                 fn_scope,
                 "self",
                 BindingKind::Parameter,
-                Mutability::Var,
+                Mutability::Mut,
                 (0, 0),
             );
             declare_arguments(r, fn_scope, &f.args);
@@ -1088,7 +1088,7 @@ fn declare_type_params(
             range.start().to_usize(),
             range.start().to_usize() + name.len(),
         );
-        r.declare(scope, name, BindingKind::Value, Mutability::Val, span);
+        r.declare(scope, name, BindingKind::Value, Mutability::Let, span);
     }
 }
 
@@ -1111,7 +1111,7 @@ fn declare_arguments(
             scope,
             arg.def.arg.as_str(),
             BindingKind::Parameter,
-            Mutability::Var,
+            Mutability::Mut,
             span,
         );
     }
@@ -1124,7 +1124,7 @@ fn declare_arguments(
             scope,
             va.arg.as_str(),
             BindingKind::Parameter,
-            Mutability::Var,
+            Mutability::Mut,
             span,
         );
     }
@@ -1137,7 +1137,7 @@ fn declare_arguments(
             scope,
             kw.arg.as_str(),
             BindingKind::Parameter,
-            Mutability::Var,
+            Mutability::Mut,
             span,
         );
     }
@@ -1251,7 +1251,7 @@ fn walk_expr(r: &mut Resolver, scope: ScopeId, expr: &Expr<TextRange>) {
                         scope2,
                         n.id.as_str(),
                         BindingKind::Loop,
-                        Mutability::Var,
+                        Mutability::Mut,
                         span,
                     );
                 }
@@ -1274,7 +1274,7 @@ fn walk_expr(r: &mut Resolver, scope: ScopeId, expr: &Expr<TextRange>) {
                     scope,
                     name.id.as_str(),
                     BindingKind::Value,
-                    Mutability::Var,
+                    Mutability::Mut,
                     span,
                 );
             }
@@ -1301,7 +1301,7 @@ fn walk_comp(
                 scope2,
                 n.id.as_str(),
                 BindingKind::Loop,
-                Mutability::Var,
+                Mutability::Mut,
                 span,
             );
         }
@@ -1564,7 +1564,7 @@ def outer(a):
     #[test]
     fn scope_at_offset_outside_function_returns_module() {
         let src = "\
-val x: int = 1
+let x: int = 1
 def foo():
     return x
 ";
@@ -1575,25 +1575,25 @@ def foo():
     }
 
     #[test]
-    fn collects_val_binding() {
-        let (m, d) = resolve("val x: int = 1\n");
+    fn collects_let_binding() {
+        let (m, d) = resolve("let x: int = 1\n");
         assert!(!d.has_errors(), "{:?}", d.errors());
         let scope = m.module_scope();
         let x = scope.lookup_local("x").unwrap();
-        assert_eq!(x.mutability, Mutability::Val);
+        assert_eq!(x.mutability, Mutability::Let);
     }
 
     #[test]
-    fn collects_var_binding() {
-        let (m, d) = resolve("var count: int = 0\n");
+    fn collects_mut_binding() {
+        let (m, d) = resolve("mut count: int = 0\n");
         assert!(!d.has_errors());
         let count = m.module_scope().lookup_local("count").unwrap();
-        assert_eq!(count.mutability, Mutability::Var);
+        assert_eq!(count.mutability, Mutability::Mut);
     }
 
     #[test]
     fn val_reassignment_is_an_error() {
-        let (_m, d) = resolve("val x: int = 1\nx = 2\n");
+        let (_m, d) = resolve("let x: int = 1\nx = 2\n");
         assert!(d.has_errors());
         let msg = format!("{}", d.errors()[0]);
         assert!(
@@ -1604,8 +1604,8 @@ def foo():
     }
 
     #[test]
-    fn var_reassignment_is_ok() {
-        let (_m, d) = resolve("var x: int = 1\nx = 2\n");
+    fn mut_reassignment_is_ok() {
+        let (_m, d) = resolve("mut x: int = 1\nx = 2\n");
         assert!(!d.has_errors(), "{:?}", d.errors());
     }
 
@@ -1658,7 +1658,7 @@ def foo():
 
     #[test]
     fn function_introduces_scope() {
-        let (m, _d) = resolve("def f() -> None:\n    val x: int = 1\n    print(x)\n");
+        let (m, _d) = resolve("def f() -> None:\n    let x: int = 1\n    print(x)\n");
         // Module scope has `f`; inner scope has `x`.
         assert!(m.module_scope().lookup_local("f").is_some());
         let fn_scope = m
@@ -1671,7 +1671,7 @@ def foo():
 
     #[test]
     fn dotted_import_binds_top_level_package() {
-        let (m, d) = resolve("import os.path\nval n: int = len(os.path.sep)\n");
+        let (m, d) = resolve("import os.path\nlet n: int = len(os.path.sep)\n");
         assert!(!d.has_errors(), "{:?}", d.errors());
         // Python binds `os`, not `os.path`.
         assert!(m.module_scope().lookup_local("os").is_some());
@@ -1679,14 +1679,14 @@ def foo():
     }
 
     #[test]
-    fn def_collision_with_val_errors() {
-        let (_m, d) = resolve("val x: int = 1\ndef x() -> None:\n    pass\n");
+    fn def_collision_with_let_errors() {
+        let (_m, d) = resolve("let x: int = 1\ndef x() -> None:\n    pass\n");
         assert!(d.has_errors(), "expected val/def collision");
     }
 
     #[test]
-    fn for_loop_target_cannot_rebind_val() {
-        let src = "val items: list = []\nfor items in [[1]]:\n    pass\n";
+    fn for_loop_target_cannot_rebind_let() {
+        let src = "let items: list = []\nfor items in [[1]]:\n    pass\n";
         let (_m, d) = resolve(src);
         assert!(d.has_errors(), "expected for-loop rebinding to error");
     }
@@ -1719,7 +1719,7 @@ def foo():
 
     #[test]
     fn used_import_has_no_warning() {
-        let (_m, d) = resolve("import os\nval n: int = len(os.sep)\n");
+        let (_m, d) = resolve("import os\nlet n: int = len(os.sep)\n");
         assert!(!d.has_errors(), "{:?}", d.errors());
         assert_eq!(d.warning_count(), 0, "used import must not warn");
     }
@@ -1734,7 +1734,7 @@ def foo():
 
     #[test]
     fn used_from_import_no_warning() {
-        let (_m, d) = resolve("from os import path\nval s: str = path.sep\n");
+        let (_m, d) = resolve("from os import path\nlet s: str = path.sep\n");
         assert!(!d.has_errors(), "{:?}", d.errors());
         assert_eq!(d.warning_count(), 0);
     }
@@ -1749,14 +1749,14 @@ def foo():
 
     #[test]
     fn import_as_alias_used_no_warning() {
-        let (_m, d) = resolve("import os.path as osp\nval s: str = osp.sep\n");
+        let (_m, d) = resolve("import os.path as osp\nlet s: str = osp.sep\n");
         assert!(!d.has_errors(), "{:?}", d.errors());
         assert_eq!(d.warning_count(), 0);
     }
 
     #[test]
     fn multiple_imports_only_unused_warns() {
-        let src = "import os\nimport sys\nval p: str = sys.version\n";
+        let src = "import os\nimport sys\nlet p: str = sys.version\n";
         let (_m, d) = resolve(src);
         assert_eq!(d.warning_count(), 1, "only `os` should warn");
         let msg = format!("{}", d.warnings()[0]);
@@ -1778,19 +1778,19 @@ def foo():
     #[test]
     fn underscore_prefixed_import_not_warned() {
         // `_unused` is the conventional marker for intentionally-unused names.
-        let src = "import os as _unused\nval x: int = 1\n";
+        let src = "import os as _unused\nlet x: int = 1\n";
         let (_m, d) = resolve(src);
         assert_eq!(d.warning_count(), 0, "_-prefixed import must not warn");
     }
 
     #[test]
     fn symbol_at_offset_finds_reference() {
-        // `val x: int = 1\nval y: int = x\n`
+        // `val x: int = 1\nlet y: int = x\n`
         //   index in preprocessed source:
         //   "x: int = 1\ny: int = x\n"
         //       column 0..1 is `x` (declaration), column 11 is `y` (declaration),
         //       column 20 is the reference `x` on the second line.
-        let src = "val x: int = 1\nval y: int = x\n";
+        let src = "let x: int = 1\nlet y: int = x\n";
         let (m, _d) = resolve(src);
         // The byte offset of the reference `x` on the second line in the
         // preprocessed source: "x: int = 1\ny: int = x\n" — newline at byte 10,
@@ -1802,12 +1802,12 @@ def foo():
         assert!(!symbol.is_definition, "this is a use site, not a decl");
         let def = symbol.definition.expect("reference should resolve");
         assert_eq!(def.name, "x");
-        assert_eq!(def.mutability, Mutability::Val);
+        assert_eq!(def.mutability, Mutability::Let);
     }
 
     #[test]
     fn symbol_at_offset_finds_declaration() {
-        let src = "val foo: int = 1\n";
+        let src = "let foo: int = 1\n";
         let (m, _d) = resolve(src);
         // In the preprocessed source `foo: int = 1\n`, `foo` starts at byte 0.
         let symbol = m.symbol_at_offset(1).expect("symbol should be found");
@@ -1820,7 +1820,7 @@ def foo():
 
     #[test]
     fn symbol_at_offset_returns_none_far_past_source() {
-        let src = "val x: int = 1\n";
+        let src = "let x: int = 1\n";
         let (m, _d) = resolve(src);
         // An offset well past the end of every binding range must not match.
         assert!(

@@ -27,11 +27,11 @@ pub enum TycError {
         span: SourceSpan,
     },
 
-    /// A `val` binding was re-assigned after its declaration.
+    /// A `let` binding was re-assigned after its declaration.
     #[error("cannot assign to immutable binding '{name}'")]
     #[diagnostic(
         code(tyc::immutable_assign),
-        help("change `val` to `var` if you need a mutable binding")
+        help("change `let` to `mut` if you need a mutable binding")
     )]
     ImmutableAssign {
         name: String,
@@ -47,7 +47,7 @@ pub enum TycError {
     #[error("cannot find '{name}' in scope")]
     #[diagnostic(
         code(tyc::unknown_name),
-        help("declare '{name}' with `val` or `var`, or import it from a module")
+        help("declare '{name}' with `let` or `mut`, or import it from a module")
     )]
     UnknownName {
         name: String,

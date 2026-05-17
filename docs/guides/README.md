@@ -9,7 +9,7 @@ A progressive walk through the language, from your first `.ty` file to advanced 
 | # | Guide | What you'll learn |
 |---|-------|-------------------|
 | 1 | [Hello, world](01-hello-world.md) | Install `tyc`, scaffold a project, write your first program, read the emitted Python |
-| 2 | [Values and types](02-values-and-types.md) | `val` vs `var`, primitives, non-nullable by default, the `T?` optional form, flow narrowing |
+| 2 | [Values and types](02-values-and-types.md) | `let` vs `mut`, primitives, non-nullable by default, the `T?` optional form, flow narrowing |
 | 3 | [Functions](03-functions.md) | Function declarations, parameter and return annotations, default arguments, the no-implicit-`Any` rule |
 | 4 | [Control flow and collections](04-control-flow-and-collections.md) | `if`/`while`/`for`, `list`/`dict`/`set`/`tuple`, comprehensions, guards |
 | 5 | [Classes and models](05-classes-and-models.md) | `class` (dataclass), `model` (Pydantic), `impl` blocks, `extend`, frozen instances |

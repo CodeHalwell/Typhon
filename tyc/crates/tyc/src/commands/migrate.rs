@@ -10,7 +10,7 @@
 //!
 //! 1. `Optional[T]` → `T?` (also `typing.Optional[T]`).
 //! 2. `T | None` → `T?` when used in an annotation.
-//! 3. Module-level `NAME: T = expr` gains a `val` keyword (or `var` if the
+//! 3. Module-level `NAME: T = expr` gains a `let` keyword (or `mut` if the
 //!    name is later reassigned in the same file).
 //! 4. `@dataclass`/`@dataclass(...)` decorations on a `class X:` lose the
 //!    decorator — Typhon defaults to dataclass emission.
@@ -129,15 +129,15 @@ fn rewrite_line(line: &str, reassigned: &HashSet<String>) -> String {
 
     body = rewrite_optional(&body);
 
-    // Module-level annotated assignment: prepend val/var.
+    // Module-level annotated assignment: prepend let/mut.
     if indent.is_empty() {
         if let Some(name) = leading_ann_assign_name(&body) {
             // Only rewrite when the user has not already added the keyword.
-            if !body.starts_with("val ") && !body.starts_with("var ") {
+            if !body.starts_with("let ") && !body.starts_with("mut ") {
                 let kw = if reassigned.contains(&name) {
-                    "var"
+                    "mut"
                 } else {
-                    "val"
+                    "let"
                 };
                 body = format!("{kw} {body}");
             }
@@ -428,13 +428,13 @@ mod tests {
     #[test]
     fn module_level_annotated_assign_gets_val() {
         let out = migrate_source("x: int = 1\n");
-        assert!(out.contains("val x: int = 1"), "got: {out}");
+        assert!(out.contains("let x: int = 1"), "got: {out}");
     }
 
     #[test]
     fn reassigned_name_becomes_var() {
         let out = migrate_source("x: int = 1\nx = 2\n");
-        assert!(out.contains("var x: int = 1"), "got: {out}");
+        assert!(out.contains("mut x: int = 1"), "got: {out}");
     }
 
     #[test]
@@ -455,9 +455,9 @@ mod tests {
     #[test]
     fn indented_annotated_assignment_left_alone() {
         // Class-body annotations should keep the bare form because they
-        // are dataclass fields, not val/var bindings.
+        // are dataclass fields, not let/mut bindings.
         let out = migrate_source("class U:\n    name: str\n");
-        assert!(!out.contains("val name"), "got: {out}");
+        assert!(!out.contains("let name"), "got: {out}");
         assert!(out.contains("    name: str"), "got: {out}");
     }
 
@@ -465,6 +465,6 @@ mod tests {
     fn comments_are_preserved_verbatim() {
         let out = migrate_source("# header comment\nx: int = 1\n");
         assert!(out.contains("# header comment"), "got: {out}");
-        assert!(out.contains("val x: int = 1"), "got: {out}");
+        assert!(out.contains("let x: int = 1"), "got: {out}");
     }
 }

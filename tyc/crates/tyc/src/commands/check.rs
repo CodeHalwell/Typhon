@@ -223,7 +223,7 @@ mod tests {
     #[test]
     fn check_passes_valid_ty_file() {
         let tmp = tempfile::tempdir().unwrap();
-        write_ty(tmp.path(), "ok.ty", "val x: int = 1\n");
+        write_ty(tmp.path(), "ok.ty", "let x: int = 1\n");
         let args = CheckArgs {
             paths: vec![tmp.path().to_path_buf()],
             stubs: false,
@@ -234,7 +234,7 @@ mod tests {
     #[test]
     fn check_reports_type_mismatch_as_error() {
         let tmp = tempfile::tempdir().unwrap();
-        write_ty(tmp.path(), "bad.ty", "val x: int = \"hello\"\n");
+        write_ty(tmp.path(), "bad.ty", "let x: int = \"hello\"\n");
         let args = CheckArgs {
             paths: vec![tmp.path().to_path_buf()],
             stubs: false,
@@ -245,7 +245,7 @@ mod tests {
     #[test]
     fn check_passes_nullable_annotation() {
         let tmp = tempfile::tempdir().unwrap();
-        write_ty(tmp.path(), "nullable.ty", "val x: str? = None\n");
+        write_ty(tmp.path(), "nullable.ty", "let x: str? = None\n");
         let args = CheckArgs {
             paths: vec![tmp.path().to_path_buf()],
             stubs: false,
@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn check_reports_val_reassignment_as_error() {
         let tmp = tempfile::tempdir().unwrap();
-        write_ty(tmp.path(), "immut.ty", "val x: int = 1\nx = 2\n");
+        write_ty(tmp.path(), "immut.ty", "let x: int = 1\nx = 2\n");
         let args = CheckArgs {
             paths: vec![tmp.path().to_path_buf()],
             stubs: false,

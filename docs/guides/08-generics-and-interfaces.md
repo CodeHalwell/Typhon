@@ -16,10 +16,10 @@ def first[T](xs: list[T]) -> T?:
 `T` is a type parameter scoped to this function. Call sites infer it from the arguments:
 
 ```python
-val n: int? = first([1, 2, 3])           # T = int
-val s: str? = first(["a", "b"])          # T = str
-val none_int: int? = first([])           # ⚠️ T unconstrained — annotate the call:
-val none_int: int? = first[int]([])      # ✅ explicit
+let n: int? = first([1, 2, 3])           # T = int
+let s: str? = first(["a", "b"])          # T = str
+let none_int: int? = first([])           # ⚠️ T unconstrained — annotate the call:
+let none_int: int? = first[int]([])      # ✅ explicit
 ```
 
 When the argument is empty (or any case where `T` can't be inferred), spell `T` explicitly with `first[int](...)`.
@@ -51,8 +51,8 @@ impl[T] Box[T]:
 Use them like any other type:
 
 ```python
-val b: Box[int] = Box(value=10)
-val s: Box[str] = b.map(lambda n: f"n={n}")    # Box[str]
+let b: Box[int] = Box(value=10)
+let s: Box[str] = b.map(lambda n: f"n={n}")    # Box[str]
 ```
 
 A few notes:
@@ -155,7 +155,7 @@ interface Ordered:
 def smallest[T: Ordered](xs: list[T]) -> T?:
     if len(xs) == 0:
         return None
-    var best: T = xs[0]
+    mut best: T = xs[0]
     for x in xs[1:]:
         if x < best:
             best = x
@@ -214,12 +214,12 @@ impl User:
         return {"id": str(id), "name": name}
 
 def main() -> None:
-    val users: Cache[int, User] = Cache(store={})
+    let users: Cache[int, User] = Cache(store={})
     users.put(1, User(id=1, name="Alice"))
     users.put(2, User(id=2, name="Bob"))
 
-    val all_users: list[User] = list(users.store.values())
-    val dump: list[dict[str, str]] = snapshot(all_users)
+    let all_users: list[User] = list(users.store.values())
+    let dump: list[dict[str, str]] = snapshot(all_users)
     print(dump)
 ```
 
@@ -249,10 +249,10 @@ See above — use static narrowing, or refactor to a sealed union if the variant
 **Unconstrained inference:**
 
 ```python
-val empty = first([])    # ❌ T unconstrained, can't infer
+let empty = first([])    # ❌ T unconstrained, can't infer
 ```
 
-Annotate explicitly: `val empty: int? = first[int]([])`.
+Annotate explicitly: `let empty: int? = first[int]([])`.
 
 **Mixing structural and nominal expectations:**
 

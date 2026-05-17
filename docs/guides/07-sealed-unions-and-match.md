@@ -246,20 +246,20 @@ def eval(e: Expr) -> Result[float, EvalError]:
         case Lit(v):
             return Ok(v)
         case Add(l, r):
-            val a: float = eval(l)?
-            val b: float = eval(r)?
+            let a: float = eval(l)?
+            let b: float = eval(r)?
             return Ok(a + b)
         case Sub(l, r):
-            val a: float = eval(l)?
-            val b: float = eval(r)?
+            let a: float = eval(l)?
+            let b: float = eval(r)?
             return Ok(a - b)
         case Mul(l, r):
-            val a: float = eval(l)?
-            val b: float = eval(r)?
+            let a: float = eval(l)?
+            let b: float = eval(r)?
             return Ok(a * b)
         case Div(l, r):
-            val a: float = eval(l)?
-            val b: float = eval(r)?
+            let a: float = eval(l)?
+            let b: float = eval(r)?
             if b == 0.0:
                 return Err(DivByZero())
             return Ok(a / b)

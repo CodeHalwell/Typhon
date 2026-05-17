@@ -91,7 +91,7 @@ mod tests {
     #[test]
     fn fmt_passes_on_already_formatted_file() {
         let tmp = tempfile::tempdir().unwrap();
-        write_ty(tmp.path(), "a.ty", "val x: int = 1\n");
+        write_ty(tmp.path(), "a.ty", "let x: int = 1\n");
         let args = FmtArgs {
             paths: vec![tmp.path().to_path_buf()],
             check: false,
@@ -130,7 +130,7 @@ mod tests {
     #[test]
     fn fmt_check_mode_passes_on_already_formatted_file() {
         let tmp = tempfile::tempdir().unwrap();
-        write_ty(tmp.path(), "d.ty", "val x: int = 1\n");
+        write_ty(tmp.path(), "d.ty", "let x: int = 1\n");
         let args = FmtArgs {
             paths: vec![tmp.path().to_path_buf()],
             check: true,

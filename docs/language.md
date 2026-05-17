@@ -38,7 +38,7 @@ declares a finite, sealed sum type. `match` on a sealed union must cover every v
 
 - Expressions that would otherwise infer to `Any` bind freely.
 - Values acquire a hidden `Unsafe[T]` marker (visible in diagnostics, not in source).
-- An `Unsafe[T]` cannot flow into a non-`unsafe` context expecting a concrete `T` — the user must re-assert the type via an annotated `val`/`var`, a narrowing check, or an explicit cast.
+- An `Unsafe[T]` cannot flow into a non-`unsafe` context expecting a concrete `T` — the user must re-assert the type via an annotated `let`/`mut`, a narrowing check, or an explicit cast.
 
 Dynamic typing enters Typhon only through `unsafe` blocks and `.dty` stubs; nothing else.
 
@@ -81,7 +81,7 @@ class ApiUser(BaseModel):
     email: str
 ```
 
-`model` emission injects `extra='forbid'` by default — Pydantic's stock `extra='ignore'` silently drops unexpected input, which directly contradicts Typhon's safety pitch. Permissive modes are opt-in via `[emit] model-extra = "allow" | "ignore"` in `typhon.toml`. Pydantic's `frozen=True` is *faux* immutability (it blocks field reassignment but does not freeze nested mutable values); see `val`/`var` for what Typhon's binding immutability does and does not guarantee.
+`model` emission injects `extra='forbid'` by default — Pydantic's stock `extra='ignore'` silently drops unexpected input, which directly contradicts Typhon's safety pitch. Permissive modes are opt-in via `[emit] model-extra = "allow" | "ignore"` in `typhon.toml`. Pydantic's `frozen=True` is *faux* immutability (it blocks field reassignment but does not freeze nested mutable values); see `let`/`mut` for what Typhon's binding immutability does and does not guarantee.
 
 ## Error handling
 
@@ -151,22 +151,22 @@ When `typhon.toml` sets `free-threaded = true`, the analyser emits `ThreadPoolEx
 
 `go` lowers through `typhon_runtime.tasks.spawn`, **never** to a bare `asyncio.create_task`. Python's event loop holds only weak references to tasks, so a fire-and-forget task whose handle is dropped can be garbage-collected mid-flight. The runtime helper keeps a strong-ref registry and discards entries from a done-callback. Same pattern, different registry, for thread-pool `go` on free-threaded builds.
 
-## `val` and `var`
+## `let` and `mut`
 
-`val` and `var` govern **binding immutability**, not deep value immutability — like Rust's `let`/`let mut` or TypeScript's `const`. A `val u: User` cannot be reassigned, but a mutable field on `u` can still be written through.
+`let` and `mut` govern **binding immutability**, not deep value immutability — like Rust's `let`/`let mut` or TypeScript's `const`. A `let u: User` cannot be reassigned, but a mutable field on `u` can still be written through.
 
-- `val` is immutable as a binding. Reassignment is a compile error.
-- `var` is mutable. Parallelisation passes refuse to touch any binding captured as `var` by a spawned task without explicit synchronisation.
-- Top-level module bindings default to `val` unless declared `var`.
+- `let` is immutable as a binding. Reassignment is a compile error.
+- `mut` is mutable. Parallelisation passes refuse to touch any binding captured as `mut` by a spawned task without explicit synchronisation.
+- Top-level module bindings default to `let` unless declared `mut`.
 
-Deep immutability for class instances is an emit-time concern: pass `frozen=True` to the underlying dataclass / Pydantic config. A `freeze` modifier with stronger recursive guarantees may land later; `val` itself stays scoped to bindings.
+Deep immutability for class instances is an emit-time concern: pass `frozen=True` to the underlying dataclass / Pydantic config. A `freeze` modifier with stronger recursive guarantees may land later; `let` itself stays scoped to bindings.
 
 ## Lazy loading
 
 - `lazy import np = numpy` → defers module loading until first attribute access via `importlib.util.LazyLoader`.
 - `lazy from foo import a, b` is **rejected** at parse time: PEP 690 notes that `from`-imports eagerly touch attributes on the source module and therefore defeat deferral. Use `lazy import foo` and access `foo.a` / `foo.b`.
-- `lazy val` module-level bindings → cached getter with a sentinel + lock helper in `typhon_runtime` (not `functools.cached_property`, which is instance-scoped, race-prone, and writable after first evaluation).
-- `lazy val` instance-level bindings on effectively immutable classes → `functools.cached_property`.
+- `lazy let` module-level bindings → cached getter with a sentinel + lock helper in `typhon_runtime` (not `functools.cached_property`, which is instance-scoped, race-prone, and writable after first evaluation).
+- `lazy let` instance-level bindings on effectively immutable classes → `functools.cached_property`.
 - `lazy[list[T]]` return types → generator functions instead of materialised lists.
 
 ## Stubs and Python interop
@@ -188,7 +188,7 @@ A function is **inferable as pure** only if every one of the following holds:
 2. All parameter types are hashable (primitives, frozen dataclasses, tuples of hashable types, sealed-union variants whose payloads are hashable).
 3. No I/O in the transitive call graph: no `open`, `socket`, `subprocess`, logger writes, `print`, DB drivers. `unsafe` and stubbed calls count as impure unless the stub is annotated `@pure`.
 4. No reads from non-deterministic clocks or entropy sources (`time.time`, `time.monotonic`, `random.*`, `secrets.*`, `uuid.uuid4`, `os.urandom`).
-5. No reads from or writes to mutable module-level state. Reads from `comptime val` bindings are fine; reads from a `var` module binding are not.
+5. No reads from or writes to mutable module-level state. Reads from `comptime let` bindings are fine; reads from a `mut` module binding are not.
 6. No exceptions raised — pure functions express failure through `Result[T, E]`.
 
 When all six hold, the analyser **may** emit `@functools.cache` or `@functools.lru_cache(maxsize=N)` — but only with an explicit opt-in: a `@memo` attribute on the function, an `@pure(memo=True)` annotation, or `[strictness] auto-memoise = true` in `typhon.toml`. The checker never inserts caches silently; caches extend the lifetime of every argument and return value, which is not a transparent change.
@@ -203,8 +203,8 @@ Build-time env validation alone is worth shipping.
 
 ```python
 # Typhon
-comptime val PORT: int = int(env("PORT", "8080"))
-comptime val DB_URL: str = env("DATABASE_URL")  # build fails if unset
+comptime let PORT: int = int(env("PORT", "8080"))
+comptime let DB_URL: str = env("DATABASE_URL")  # build fails if unset
 
 # Emitted Python
 PORT: int = 8080

@@ -35,7 +35,7 @@ contemporary laptop or desktop hardware.
 
 ### `tyc-syntax` — preprocess + parse latency
 
-The preprocessor strips Typhon line-prefix keywords (`val`/`var`/`model`/
+The preprocessor strips Typhon line-prefix keywords (`let`/`mut`/`model`/
 `interface`/`unsafe`/etc.) and expands sugar (`T?`, `|>`, `with`-chains,
 `gather:`, `go`, `lazy import`). The parser is `rustpython-parser` operating
 on the preprocessed Python source.

@@ -9,13 +9,13 @@ phase status.
 
 | Area | Change |
 |---|---|
-| Syntax | Module-level `lazy val NAME: T = expr` lowers to `lazy_val(lambda: expr)`; class-body `lazy val` lowers to `@cached_property`. Both round-trip through `tyc fmt`. |
+| Syntax | Module-level `lazy let NAME: T = expr` lowers to `lazy_val(lambda: expr)`; class-body `lazy let` lowers to `@cached_property`. Both round-trip through `tyc fmt`. |
 | Syntax | `extend BUILTIN:` is rejected at preprocess time with a dedicated `tyc::extend_builtin` diagnostic; user-defined classes still flow through `impl`-merge. |
 | Types | `unsafe:` blocks now bump `Checker::unsafe_depth` via preprocess line metadata; type-mismatch, nullable-use, interface-isinstance, wrong-arg-count, not-callable, and non-exhaustive-match diagnostics are dropped inside the block. Errors on lines outside the block are unaffected. |
 | Types | `Type::TypeVar(name)` replaces `Type::Any` for PEP 695 type parameters in signatures; call-site `bind_typevars_and_substitute` infers bindings (recursively, with conflict-widening) and substitutes them in the return type. |
 | CLI | `tyc trace` reads `.py.map` sidecars emitted by `tyc build` and rewrites `File "…/foo.py", line N` traceback entries to point at the original `.ty`. |
 | CLI | `tyc profile` post-processes the build output with a `@__typhon_profile_record` decorator on every top-level function plus a generated `typhon_profile.py` helper that flushes call counts and total wall-clock time to `typhon-profile.json` on `atexit`. |
-| CLI | `tyc migrate` converts typed Python (`.py`) to Typhon (`.ty`): `Optional[T]` / `T \| None` → `T?`, module-level annotated assigns gain `val`/`var` (val unless later reassigned), `@dataclass` decorators and the `dataclass` import are dropped. |
+| CLI | `tyc migrate` converts typed Python (`.py`) to Typhon (`.ty`): `Optional[T]` / `T \| None` → `T?`, module-level annotated assigns gain `let`/`mut` (let unless later reassigned), `@dataclass` decorators and the `dataclass` import are dropped. |
 | LSP | `Backend` caches the latest text per URI on `did_open`/`did_change` so hover and go-to-definition can resolve without re-fetching from the editor. |
 | LSP | `textDocument/hover` returns the binding kind + mutability rendered in markdown; `textDocument/definition` jumps to the resolver's recorded declaration span. Both rely on a new `ResolvedModule::symbol_at_offset` query. |
 | Stubs | `tyc check --stubs` now diffs each `.dty`'s public API against its sibling `.ty` (or `.py`) implementation via a new `tyc_emit::compare_modules`; mismatches surface as `tyc::stub_mismatch` diagnostics. Private names (leading underscore) are excluded by design. |
@@ -32,8 +32,8 @@ all pass.
 Still on `rustpython-parser` 0.4 from crates.io.  The fork is a
 multi-day effort even with focused scope: vendor
 `ruff_python_parser` + `ruff_python_ast` + the small slice of
-`ruff_text_size` they need, add the two extension tokens (`val`,
-`var`), get the `ruff_python_codegen` round-trip working on a
+`ruff_text_size` they need, add the two extension tokens (`let`,
+`mut`), get the `ruff_python_codegen` round-trip working on a
 representative corpus, then swap the dependency across every
 consumer crate.  Attempting it in this session would have produced
 an incomplete vendor tree, broken parsing, and a long red CI.
@@ -63,8 +63,8 @@ inference across helper calls also remains an aspiration.
 ### Source-map line accuracy
 
 `.py.map` records the source path only; line offsets are forwarded
-1:1.  Most preprocessing preserves line counts (val/var, comptime,
-lazy val, optional sugar), but `with`-chains, `gather:`, and `?`
+1:1.  Most preprocessing preserves line counts (let/mut, comptime,
+lazy let, optional sugar), but `with`-chains, `gather:`, and `?`
 propagation emit multiple Python lines from one Typhon line, so
 tracebacks pointing at those constructs may report a line offset
 by a small amount.  A proper line-array map (à la JS source maps

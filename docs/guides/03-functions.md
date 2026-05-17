@@ -55,7 +55,7 @@ Use a tuple; the call site destructures with normal Python syntax:
 def divmod_pair(a: int, b: int) -> tuple[int, int]:
     return a // b, a % b
 
-val q, r = divmod_pair(17, 5)    # q = 3, r = 2
+let q, r = divmod_pair(17, 5)    # q = 3, r = 2
 ```
 
 If two of those values mean different things, prefer a small `class` or `model` (guide 5) — readers shouldn't have to remember which slot is which.
@@ -101,8 +101,8 @@ Allowed, but each must be annotated:
 
 ```python
 def log_all(*messages: str, **tags: str) -> None:
-    val joined: str = ", ".join(messages)
-    val tag_pairs: str = " ".join(f"{k}={v}" for k, v in tags.items())
+    let joined: str = ", ".join(messages)
+    let tag_pairs: str = " ".join(f"{k}={v}" for k, v in tags.items())
     print(f"[log] {joined} ({tag_pairs})")
 
 log_all("start", "ready", env="prod", region="eu")
@@ -133,11 +133,11 @@ apply(double, 7)    # 14
 Single-expression anonymous functions; the parameter and return types are inferred from context:
 
 ```python
-val nums: list[int] = [1, 2, 3, 4]
-val squares: list[int] = [x * x for x in nums]
+let nums: list[int] = [1, 2, 3, 4]
+let squares: list[int] = [x * x for x in nums]
 
 # Or with map:
-val doubled: list[int] = list(map(lambda n: n * 2, nums))
+let doubled: list[int] = list(map(lambda n: n * 2, nums))
 ```
 
 If the context can't pin down the parameter type, you'll get an "implicit Any" error. Promote to a named function when that happens — lambdas are best kept short.
@@ -152,8 +152,8 @@ def first[T](xs: list[T]) -> T?:
         return None
     return xs[0]
 
-val n: int? = first([1, 2, 3])       # T inferred as int
-val s: str? = first(["a", "b"])      # T inferred as str
+let n: int? = first([1, 2, 3])       # T inferred as int
+let s: str? = first(["a", "b"])      # T inferred as str
 ```
 
 Generics are covered in depth in [guide 8](08-generics-and-interfaces.md).
@@ -201,7 +201,7 @@ The diagnostic points at the call site, not the definition.
 async def fetch() -> str: ...
 
 def main() -> None:
-    val s: str = fetch()    # ❌ coroutine, not str
+    let s: str = fetch()    # ❌ coroutine, not str
 ```
 
 This is a hard error in Typhon — not a runtime warning. (Async details in [guide 9](09-async-and-concurrency.md).)
@@ -214,8 +214,8 @@ A small CLI-style example:
 import sys
 
 def parse_args(argv: list[str]) -> tuple[str, int]:
-    val name: str = argv[1] if len(argv) > 1 else "world"
-    val times: int = int(argv[2]) if len(argv) > 2 else 1
+    let name: str = argv[1] if len(argv) > 1 else "world"
+    let times: int = int(argv[2]) if len(argv) > 2 else 1
     return name, times
 
 def greet(name: str, times: int = 1) -> None:
@@ -223,7 +223,7 @@ def greet(name: str, times: int = 1) -> None:
         print(f"Hello, {name}")
 
 def main() -> None:
-    val name, times = parse_args(sys.argv)
+    let name, times = parse_args(sys.argv)
     greet(name, times)
 
 if __name__ == "__main__":

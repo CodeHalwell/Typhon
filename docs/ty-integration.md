@@ -21,7 +21,7 @@ The plan below makes that concrete.
 
 `tyc-types` knows Typhon-specific semantics that `ty` will never know:
 non-nullable-by-default, sealed unions with exhaustive `match`,
-`Result[T, E]` + `?`, val/var enforcement, structural conformance for
+`Result[T, E]` + `?`, let/mut enforcement, structural conformance for
 `interface`, the six-condition `@pure` rule, comptime, and the auto-gather
 purity check.
 
@@ -63,7 +63,7 @@ the user sees as if from a single checker.
 ```rust
 let desugared = desugar_module_with(&module, opts);
 
-// Existing path: Typhon-specific semantics (val/var, sealed unions,
+// Existing path: Typhon-specific semantics (let/mut, sealed unions,
 // Result, interface conformance, purity).
 let tyc_diags = tyc_types::check(&desugared);
 
@@ -112,7 +112,7 @@ plugins.
 
 **Pros:** Smallest codebase.
 
-**Cons:** `ty` has no notion of `val`/`var`, sealed unions, Result
+**Cons:** `ty` has no notion of `let`/`mut`, sealed unions, Result
 purity, or interface structural conformance. We'd have to fork `ty`
 (or wait on plugin APIs that don't exist yet) and have the worst of
 both worlds. Rejected.
