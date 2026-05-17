@@ -17,8 +17,8 @@ The exact upstream revision is pinned in [`UPSTREAM`](./UPSTREAM).
 
 Two source-level changes ride on top of the upstream code:
 
-1. **`Mutability` enum + field** — `ruff_python_ast::Mutability` (`Val` /
-   `Var`) and a `mutability: Option<Mutability>` field on `StmtAssign`
+1. **`Mutability` enum + field** — `ruff_python_ast::Mutability` (`Let` /
+   `Mut`) and a `mutability: Option<Mutability>` field on `StmtAssign`
    and `StmtAnnAssign`. Standard Python keeps `mutability = None`.
    Defined in `ruff_python_ast/src/nodes.rs`; the field is added to
    `generated.rs` and to the explicit destructurings in
@@ -108,7 +108,7 @@ differences from `rustpython_ast`:
 3. For each vendored crate, diff the upstream `src/` against the local
    tree and reapply Typhon's extensions on top:
    - `ruff_python_ast::Mutability` enum + struct fields
-   - `TokenKind::Val` / `TokenKind::Var` and the `is_keyword` /
+   - `TokenKind::Let` / `TokenKind::Mut` and the `is_keyword` /
      `is_soft_keyword` bounds
    - `lexer.rs` keyword table entries
    - `parser/statement.rs::parse_simple_statement` let/mut dispatch

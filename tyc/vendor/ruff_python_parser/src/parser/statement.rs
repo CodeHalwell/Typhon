@@ -261,18 +261,18 @@ impl<'src> Parser<'src> {
     ///
     /// See: <https://docs.python.org/3/reference/simple_stmts.html>
     fn parse_simple_statement(&mut self) -> Stmt {
-        // Typhon-specific: handle `val` / `var` prefix on assignments.
+        // Typhon-specific: handle `let` / `mut` prefix on assignments.
         //
-        // `val name` and `var name` at the start of a simple statement are
+        // `let name` and `mut name` at the start of a simple statement are
         // recognised as mutability prefixes; the keyword is consumed and the
         // resulting `StmtAssign` / `StmtAnnAssign` carries the `mutability`
-        // field. Anywhere else `val` and `var` behave as ordinary identifiers
+        // field. Anywhere else `let` and `mut` behave as ordinary identifiers
         // (they are soft keywords).
         let kind = self.current_token_kind();
-        if matches!(kind, TokenKind::Val | TokenKind::Var) && self.peek() == TokenKind::Name {
+        if matches!(kind, TokenKind::Let | TokenKind::Mut) && self.peek() == TokenKind::Name {
             let mutability = match kind {
-                TokenKind::Val => ast::Mutability::Val,
-                TokenKind::Var => ast::Mutability::Var,
+                TokenKind::Let => ast::Mutability::Let,
+                TokenKind::Mut => ast::Mutability::Mut,
                 _ => unreachable!(),
             };
             let start = self.node_start();
@@ -290,7 +290,7 @@ impl<'src> Parser<'src> {
                 stmt.mutability = Some(mutability);
                 return Stmt::AnnAssign(stmt);
             }
-            // `val name` on its own is a syntax error in Typhon — emit a
+            // `let name` on its own is a syntax error in Typhon — emit a
             // diagnostic and fall through, treating the result as an
             // expression statement (the value will be the bare name).
             self.add_error(
