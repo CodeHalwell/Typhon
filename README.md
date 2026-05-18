@@ -28,6 +28,7 @@ Focused references:
 | [docs/roadmap.md](docs/roadmap.md) | Phased delivery plan |
 | [docs/risks.md](docs/risks.md) | Risks and mitigations |
 | [docs/prior-art.md](docs/prior-art.md) | TypeScript, rust-analyzer, ty, Pyrefly, oxc, Ruff |
+| [editors/vscode/README.md](editors/vscode/README.md) | VS Code extension — syntax highlighting and LSP client |
 
 ## Quick start
 

@@ -1,0 +1,113 @@
+{
+  "name": "typhon",
+  "displayName": "Typhon",
+  "description": "Language support for Typhon — a statically-typed superset of Python.",
+  "version": "0.1.0",
+  "publisher": "typhon-lang",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/codehalwell/typhon"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "typhon",
+    "python",
+    "tyc",
+    "typed-python"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onLanguage:typhon"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "typhon",
+        "aliases": [
+          "Typhon",
+          "typhon"
+        ],
+        "extensions": [
+          ".ty",
+          ".dty"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icons/typhon-light.png",
+          "dark": "./icons/typhon-dark.png"
+        }
+      }
+    ],
+    "grammars": [
+      {
+        "language": "typhon",
+        "scopeName": "source.typhon",
+        "path": "./syntaxes/typhon.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "type": "object",
+      "title": "Typhon",
+      "properties": {
+        "typhon.server.path": {
+          "type": "string",
+          "default": "tyc",
+          "description": "Path to the `tyc` binary. Use an absolute path if `tyc` is not on PATH."
+        },
+        "typhon.server.arguments": {
+          "type": "array",
+          "default": [
+            "lsp"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "Arguments passed to the `tyc` binary to start the language server."
+        },
+        "typhon.server.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable the Typhon language server. Disable to use grammar-only highlighting."
+        },
+        "typhon.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Trace LSP communication for debugging."
+        }
+      }
+    },
+    "configurationDefaults": {
+      "[typhon]": {
+        "editor.tabSize": 4,
+        "editor.insertSpaces": true,
+        "editor.detectIndentation": false,
+        "editor.wordBasedSuggestions": "off"
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}
