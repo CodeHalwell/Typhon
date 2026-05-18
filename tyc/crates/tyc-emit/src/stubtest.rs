@@ -11,16 +11,15 @@
 //!
 //! The shapes we compare:
 //!
-//! - **Functions** at module scope — name, positional-parameter count,
-//!   positional-parameter names.
+//! - **Functions** at module scope — name, positional-parameter names,
+//!   parameter type annotations, and return type.
 //! - **Classes** at module scope — name, set of methods (with parameter
-//!   counts), set of annotated fields.
+//!   names and annotations), set of annotated fields.
 //!
-//! Type annotations themselves are not yet structurally compared because
-//! a faithful diff requires the full type-checker's parsing rules; v1
-//! checks the *shape* only.  Mismatched annotations on individual
-//! fields/parameters will surface at type-check time in the consuming
-//! module.
+//! Type annotations are compared textually via the same code printer used
+//! for emission, so structurally-equivalent annotations compare equal.
+//! Full semantic comparison (resolving type aliases, checking variance) is
+//! a follow-up.
 
 use std::collections::BTreeMap;
 
@@ -71,6 +70,11 @@ struct FunctionShape {
     /// (`self`/`cls`) are kept because their absence/presence is a real
     /// difference between a stub and an implementation.
     params: Vec<String>,
+    /// Rendered annotation text for each positional parameter, in the same
+    /// order as `params`.  `None` when no annotation is present.
+    param_annotations: Vec<Option<String>>,
+    /// Rendered return-type annotation, or `None` if absent.
+    return_annotation: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -110,15 +114,59 @@ fn collect_top_level_stmt(stmt: &Stmt, api: &mut ModuleApi) {
     }
 }
 
+fn render_expr(expr: &ruff_python_ast::Expr) -> String {
+    let mut e = crate::Emitter::new();
+    e.emit_expr(expr);
+    e.finish().trim().to_owned()
+}
+
 fn function_shape(f: &StmtFunctionDef) -> FunctionShape {
     let mut params = Vec::new();
-    for arg in &f.parameters.posonlyargs {
+    let mut param_annotations = Vec::new();
+    for arg in f
+        .parameters
+        .posonlyargs
+        .iter()
+        .chain(f.parameters.args.iter())
+    {
         params.push(arg.parameter.name.as_str().to_owned());
+        param_annotations.push(arg.parameter.annotation.as_deref().map(render_expr));
     }
-    for arg in &f.parameters.args {
-        params.push(arg.parameter.name.as_str().to_owned());
+    let return_annotation = f.returns.as_deref().map(render_expr);
+    FunctionShape {
+        params,
+        param_annotations,
+        return_annotation,
     }
-    FunctionShape { params }
+}
+
+/// Describe the specific differences between two function shapes for
+/// inclusion in a `SignatureMismatch` diagnostic message.
+fn function_diff_detail(stub: &FunctionShape, implementation: &FunctionShape) -> String {
+    let mut parts = Vec::new();
+    if stub.params != implementation.params {
+        parts.push(format!(
+            "parameter names {:?} vs {:?}",
+            stub.params, implementation.params
+        ));
+    }
+    if stub.param_annotations != implementation.param_annotations {
+        parts.push(format!(
+            "parameter annotations {:?} vs {:?}",
+            stub.param_annotations, implementation.param_annotations
+        ));
+    }
+    if stub.return_annotation != implementation.return_annotation {
+        parts.push(format!(
+            "return type {:?} vs {:?}",
+            stub.return_annotation, implementation.return_annotation
+        ));
+    }
+    if parts.is_empty() {
+        "unknown difference".to_owned()
+    } else {
+        parts.join("; ")
+    }
 }
 
 fn class_shape(c: &StmtClassDef) -> ClassShape {
@@ -161,8 +209,8 @@ fn diff_apis(stub: &ModuleApi, implementation: &ModuleApi) -> Vec<StubTestFindin
             Some(impl_fn) if impl_fn != stub_fn => {
                 findings.push(StubTestFinding {
                     message: format!(
-                        "stub function `{name}` expects parameters {:?} but implementation has {:?}",
-                        stub_fn.params, impl_fn.params
+                        "stub function `{name}` signature mismatch: {}",
+                        function_diff_detail(stub_fn, impl_fn)
                     ),
                     kind: StubTestKind::SignatureMismatch,
                 });
@@ -231,8 +279,8 @@ fn diff_classes(
             Some(impl_method) if impl_method != stub_method => {
                 findings.push(StubTestFinding {
                     message: format!(
-                        "stub method `{name}.{mname}` expects parameters {:?} but implementation has {:?}",
-                        stub_method.params, impl_method.params
+                        "stub method `{name}.{mname}` signature mismatch: {}",
+                        function_diff_detail(stub_method, impl_method)
                     ),
                     kind: StubTestKind::SignatureMismatch,
                 });
@@ -375,6 +423,44 @@ mod tests {
         assert!(
             findings.iter().any(|f| f.message.contains("name")),
             "missing impl field should be flagged; got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn return_type_mismatch_is_flagged() {
+        let stub = parse_mod("def compute(n: int) -> int: ...\n");
+        let imp = parse_mod("def compute(n: int) -> str: return str(n)\n");
+        let findings = compare_modules(&stub, &imp);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.kind == StubTestKind::SignatureMismatch && f.message.contains("return")),
+            "return type mismatch should be flagged; got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn parameter_annotation_mismatch_is_flagged() {
+        let stub = parse_mod("def process(x: int) -> str: ...\n");
+        let imp = parse_mod("def process(x: str) -> str: return x\n");
+        let findings = compare_modules(&stub, &imp);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.kind == StubTestKind::SignatureMismatch
+                    && f.message.contains("annotation")),
+            "parameter annotation mismatch should be flagged; got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn matching_annotations_produce_no_findings() {
+        // Same names and same annotations — should be perfectly clean.
+        let stub = parse_mod("def add(a: int, b: int) -> int: ...\n");
+        let imp = parse_mod("def add(a: int, b: int) -> int:\n    return a + b\n");
+        assert!(
+            compare_modules(&stub, &imp).is_empty(),
+            "identical annotations should not produce findings"
         );
     }
 }

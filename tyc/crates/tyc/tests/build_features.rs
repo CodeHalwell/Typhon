@@ -1108,6 +1108,146 @@ fn fmt_check_fails_if_any_file_needs_changes() {
     );
 }
 
+// ── corpus round-trip — Phase 3+ features ───────────────────────────────────
+
+/// Exercises generics (TypeVar), interface (→ Protocol), @pure, nullable
+/// narrowing, and Ok[T] together through `tyc check`.
+///
+/// Note: nullable narrowing uses `if r is not None:` (positive narrowing)
+/// which is what the checker supports; negative early-return narrowing
+/// (`if r is None: return`) is a follow-up.
+#[test]
+fn corpus_phase3_features_check_clean() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "from typing import TypeVar\n\
+         T = TypeVar(\"T\")\n\
+         \n\
+         interface Describable:\n\
+         \x20   def describe(self) -> str:\n\
+         \x20       ...\n\
+         \n\
+         class Success:\n\
+         \x20   value: int\n\
+         \x20   def describe(self) -> str:\n\
+         \x20       return \"ok: \" + str(self.value)\n\
+         \n\
+         class Failure:\n\
+         \x20   reason: str\n\
+         \x20   def describe(self) -> str:\n\
+         \x20       return \"fail: \" + self.reason\n\
+         \n\
+         @pure\n\
+         def identity(x: T) -> T:\n\
+         \x20   return x\n\
+         \n\
+         def format_opt(r: Success?) -> str:\n\
+         \x20   if r is not None:\n\
+         \x20       return \"ok: \" + str(r.value)\n\
+         \x20   return \"none\"\n\
+         \n\
+         def safe_div(a: int, b: int) -> Ok[int]:\n\
+         \x20   if b == 0:\n\
+         \x20       return Ok(0)\n\
+         \x20   return Ok(a)\n",
+    );
+    let status = tyc().arg("check").arg(tmp.path()).status().unwrap();
+    assert!(
+        status.success(),
+        "Phase 3+ corpus program should type-check cleanly"
+    );
+}
+
+/// Builds and runs a program that exercises interface, @pure, nullable
+/// narrowing via field access, and class methods together through the full
+/// emit pipeline.
+///
+/// Note: nullable narrowing uses `if p is not None:` (positive narrowing).
+/// Method calls on the narrowed receiver work fine for non-nullable types.
+#[test]
+fn corpus_interface_pure_nullable_builds_and_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "interface Describable:\n\
+         \x20   def describe(self) -> str:\n\
+         \x20       ...\n\
+         \n\
+         class Point:\n\
+         \x20   x: int\n\
+         \x20   y: int\n\
+         \x20   def describe(self) -> str:\n\
+         \x20       return \"(\" + str(self.x) + \", \" + str(self.y) + \")\"\n\
+         \n\
+         @pure\n\
+         def negate(n: int) -> int:\n\
+         \x20   return 0 - n\n\
+         \n\
+         def label(p: Point?) -> str:\n\
+         \x20   if p is not None:\n\
+         \x20       return str(p.x) + \", \" + str(p.y)\n\
+         \x20   return \"nothing\"\n\
+         \n\
+         let origin: Point = Point(0, 0)\n\
+         print(origin.describe())\n\
+         print(label(Point(3, 4)))\n\
+         print(label(None))\n\
+         print(negate(7))\n",
+    );
+    let Some(out) = build_and_run_main(tmp.path()) else {
+        return;
+    };
+    assert!(
+        out.contains("(0, 0)"),
+        "Point.describe() on a non-nullable should yield `(0, 0)`; got:\n{out}"
+    );
+    assert!(
+        out.contains("3, 4"),
+        "label(Point(3, 4)) should yield `3, 4`; got:\n{out}"
+    );
+    assert!(
+        out.contains("nothing"),
+        "label(None) should yield `nothing`; got:\n{out}"
+    );
+    assert!(
+        out.contains("-7"),
+        "negate(7) should yield `-7`; got:\n{out}"
+    );
+}
+
+/// Ensures the Ok[T] / Err result type round-trips through emit and
+/// executes correctly when combined with nullable arguments.
+#[test]
+fn corpus_result_type_with_nullable_builds_and_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "def safe_div(a: int, b: int?) -> Ok[int]:\n\
+         \x20   if b is None:\n\
+         \x20       return Ok(0)\n\
+         \x20   if b == 0:\n\
+         \x20       return Ok(0)\n\
+         \x20   return Ok(a)\n\
+         \n\
+         r = safe_div(10, 2)\n\
+         print(r.value)\n\
+         r2 = safe_div(10, None)\n\
+         print(r2.value)\n",
+    );
+    let Some(out) = build_and_run_main(tmp.path()) else {
+        return;
+    };
+    assert!(
+        out.contains("10"),
+        "safe_div(10, 2) should yield 10; got:\n{out}"
+    );
+    assert!(
+        out.lines().filter(|l| l.trim() == "0").count() >= 1,
+        "safe_div(10, None) should yield 0; got:\n{out}"
+    );
+}
+
 // ── ensuring CARGO_BIN_EXE is set ───────────────────────────────────────────
 
 #[test]
