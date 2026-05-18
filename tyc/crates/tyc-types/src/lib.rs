@@ -640,6 +640,11 @@ struct Checker<'a> {
     /// E.g. `def f[T: Interface](x: T)` populates `{"f": {"T": Class("Interface")}}`.
     /// Checked at call sites via `Checker::check_call_typevar_bounds`.
     function_type_bounds: HashMap<String, HashMap<String, Type>>,
+    /// The bounds in effect for the function body currently being checked.
+    /// Populated by `check_function` from `function_type_bounds` so that
+    /// `Expr::Attribute` resolution can look up what interface a `T: Iface`
+    /// parameter conforms to.
+    active_typevar_bounds: HashMap<String, Type>,
     /// Sealed union declarations: name → ordered list of variant class names.
     /// Populated from `type Foo = A | B | C` statements in the first pass.
     sealed_unions: HashMap<String, Vec<String>>,
@@ -727,6 +732,7 @@ impl<'a> Checker<'a> {
             classes: Vec::new(),
             function_signatures: HashMap::new(),
             function_type_bounds: HashMap::new(),
+            active_typevar_bounds: HashMap::new(),
             interfaces: HashMap::new(),
             class_shapes: HashMap::new(),
             class_parents: HashMap::new(),
@@ -1717,7 +1723,6 @@ fn check_function(
     returns: Option<&Expr>,
     type_params: &[String],
 ) {
-    let _ = name;
     let classes = c.classes.clone();
     let ret_type = match returns {
         Some(r) => type_from_annotation_with_params(r, &classes, type_params),
@@ -1725,6 +1730,15 @@ fn check_function(
     };
 
     let saved_return = c.current_return.replace(ret_type);
+    // Load the TypeVar bounds for this function so the body's attribute
+    // accesses (e.g. `x.greet()` where `x: T` and `T: Greeter`) can resolve
+    // against the bound's interface shape.
+    let saved_bounds = std::mem::take(&mut c.active_typevar_bounds);
+    c.active_typevar_bounds = c
+        .function_type_bounds
+        .get(name)
+        .cloned()
+        .unwrap_or_default();
     c.env.enter();
 
     // Declare parameters with their annotation types. Type parameters resolve
@@ -1758,6 +1772,7 @@ fn check_function(
 
     c.env.leave();
     c.current_return = saved_return;
+    c.active_typevar_bounds = saved_bounds;
 }
 
 fn check_if(c: &mut Checker, i: &ruff_python_ast::StmtIf) {
@@ -2146,7 +2161,85 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     c.nullable_use(n.id.as_str(), &recv, span);
                 }
             }
-            Type::Unknown
+            let attr_name = a.attr.as_str();
+            // Resolve attribute access on known class instances and TypeVar-bounded parameters.
+            match &recv {
+                Type::Class(class_name) => {
+                    // Look up the attribute in the class shape (including interfaces).
+                    let class_name = class_name.clone();
+                    let shape_result = c
+                        .interfaces
+                        .get(class_name.as_str())
+                        .map(|iface| (&iface.shape.methods, &iface.shape.fields))
+                        .or_else(|| {
+                            c.class_shapes
+                                .get(class_name.as_str())
+                                .map(|s| (&s.methods, &s.fields))
+                        });
+                    if let Some((methods, fields)) = shape_result {
+                        if let Some(sig) = methods.get(attr_name) {
+                            let arity = sig.arity;
+                            let ret = sig.return_type.clone();
+                            return Type::Function {
+                                params: vec![Type::Unknown; arity],
+                                ret: Box::new(ret),
+                                variadic: false,
+                            };
+                        }
+                        if let Some(field_type) = fields.get(attr_name) {
+                            return field_type.clone();
+                        }
+                    }
+                    // Not found in shape — class may have dynamic attrs; no error.
+                    Type::Unknown
+                }
+                Type::TypeVar(tv_name) => {
+                    // TypeVar with a declared bound — look up the attribute in
+                    // the bound's interface/class shape.
+                    let tv_name = tv_name.clone();
+                    let bound = c.active_typevar_bounds.get(tv_name.as_str()).cloned();
+                    if let Some(Type::Class(bound_name)) = bound {
+                        let shape_result = c
+                            .interfaces
+                            .get(bound_name.as_str())
+                            .map(|iface| (&iface.shape.methods, &iface.shape.fields))
+                            .or_else(|| {
+                                c.class_shapes
+                                    .get(bound_name.as_str())
+                                    .map(|s| (&s.methods, &s.fields))
+                            });
+                        if let Some((methods, fields)) = shape_result {
+                            if let Some(sig) = methods.get(attr_name) {
+                                let arity = sig.arity;
+                                let ret = sig.return_type.clone();
+                                return Type::Function {
+                                    params: vec![Type::Unknown; arity],
+                                    ret: Box::new(ret),
+                                    variadic: false,
+                                };
+                            }
+                            if let Some(field_type) = fields.get(attr_name) {
+                                return field_type.clone();
+                            }
+                            // Attribute not found in the bound's shape — emit error.
+                            let span = (a.range.start().to_usize(), a.range.end().to_usize());
+                            let length = span.1.saturating_sub(span.0).max(1);
+                            if c.unsafe_depth == 0 {
+                                c.diagnostics.push_error(TycError::attribute_not_found(
+                                    attr_name,
+                                    tv_name.as_str(),
+                                    &c.path,
+                                    c.source,
+                                    span.0,
+                                    length,
+                                ));
+                            }
+                        }
+                    }
+                    Type::Unknown
+                }
+                _ => Type::Unknown,
+            }
         }
         Expr::Subscript(s) => {
             let _ = infer_expr(c, &s.value);
@@ -3713,6 +3806,85 @@ let g: Greeter = BareGreeter()
             !d.has_errors(),
             "unannotated method impl should satisfy interface (unknown return type); errors: {:?}",
             d.errors()
+        );
+    }
+
+    // ── Attribute resolution: class instances and TypeVar-bounded params ──────
+
+    #[test]
+    fn class_instance_method_call_type_checks() {
+        let src = "\
+class Greeter:
+    def greet(self) -> str:
+        return \"hello\"
+
+let g: Greeter = Greeter()
+let result: str = g.greet()
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "method call on class instance should type-check: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn typevar_bound_body_method_call_checks() {
+        // Inside the function body, x: T where T: Greeter — x.greet() must be valid
+        let src = "\
+interface Greeter:
+    def greet(self) -> str: ...
+
+def call_greet[T: Greeter](x: T) -> str:
+    return x.greet()
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "x.greet() on T: Greeter should type-check: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn typevar_bound_body_unknown_method_emits_error() {
+        // x.nonexistent() on T: Greeter must emit attribute_not_found
+        let src = "\
+interface Greeter:
+    def greet(self) -> str: ...
+
+def call_bad[T: Greeter](x: T) -> str:
+    return x.nonexistent()
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "x.nonexistent() on T: Greeter should emit attribute_not_found"
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| e.to_string().contains("nonexistent")),
+            "error should mention the missing attribute"
+        );
+    }
+
+    #[test]
+    fn typevar_bound_body_field_access_works() {
+        // x.name where T: Named (interface with field name: str) must work
+        let src = "\
+interface Named:
+    name: str
+
+def get_name[T: Named](x: T) -> str:
+    return x.name
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "field access on T: Named should type-check: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
     }
 }

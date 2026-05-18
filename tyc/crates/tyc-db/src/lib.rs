@@ -10,8 +10,10 @@
 //! Later phases will migrate more passes (resolve, type-check) into
 //! tracked queries as their output types acquire `salsa::Update`.
 
+use std::sync::Arc;
+
 use tyc_diagnostics::{Diagnostics, TycError};
-use tyc_resolve::resolve_module;
+use tyc_resolve::{resolve_module, ResolvedModule};
 use tyc_syntax::{
     parse_module,
     preprocess::{
@@ -74,6 +76,76 @@ pub fn module_decl_names(db: &dyn salsa::Database, file: SourceFile) -> Vec<Stri
         .iter()
         .map(|b| b.name.clone())
         .collect()
+}
+
+/// Newtype wrapper around `Arc<ResolvedModule>` so we can implement
+/// `salsa::Update` for it without violating the orphan rule.
+///
+/// Salsa requires the return type of a `#[salsa::tracked]` query to implement
+/// `Update`.  `ResolvedModule` contains `Vec`s of structs that don't implement
+/// `PartialEq`, so we use pointer comparison.  Salsa only calls `maybe_update`
+/// after the query body has already re-run (i.e. when an input changed), so
+/// the conservative "always-changed" strategy is correct.
+#[derive(Clone)]
+pub struct ArcResolvedModule(pub Arc<ResolvedModule>);
+
+impl PartialEq for ArcResolvedModule {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ArcResolvedModule {}
+
+impl std::ops::Deref for ArcResolvedModule {
+    type Target = ResolvedModule;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+// SAFETY: We write the new value into `old_pointer` using `ptr::write`, which
+// is the canonical Salsa pattern for `Update` implementations.  Pointer
+// equality is used as a conservative proxy for value equality.
+unsafe impl salsa::Update for ArcResolvedModule {
+    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
+        if Arc::ptr_eq(&(*old_pointer).0, &new_value.0) {
+            false
+        } else {
+            std::ptr::write(old_pointer, new_value);
+            true
+        }
+    }
+}
+
+/// Tracked query: parse and resolve the preprocessed source of a file.
+///
+/// Salsa re-evaluates this only when `preprocessed_text` changes, so LSP
+/// hover and go-to-definition handlers can call it directly instead of
+/// maintaining a separate `HashMap` cache.  The resolver runs once per text
+/// revision, and subsequent calls within the same revision are cache hits.
+///
+/// Returns an [`ArcResolvedModule`] (a thin newtype around
+/// `Arc<ResolvedModule>`) so the `salsa::Update` impl can satisfy the orphan
+/// rule.  Callers can deref directly or clone the inner `Arc` via `.0`.
+#[salsa::tracked]
+pub fn resolved_module(db: &dyn salsa::Database, file: SourceFile) -> ArcResolvedModule {
+    let source = preprocessed_text(db, file);
+    let path = file.path(db).clone();
+    match parse_module(&source) {
+        Ok(parsed) => {
+            let module = parsed.into_syntax();
+            let (resolved, _) = resolve_module(path, &source, &module);
+            ArcResolvedModule(Arc::new(resolved))
+        }
+        Err(_) => ArcResolvedModule(Arc::new(ResolvedModule::default())),
+    }
+}
+
+/// Convenience alias — extract the inner `Arc<ResolvedModule>` from a
+/// `resolved_module` query result.
+pub fn resolved_module_arc(db: &dyn salsa::Database, file: SourceFile) -> Arc<ResolvedModule> {
+    resolved_module(db, file).0
 }
 
 /// The Typhon database — concrete carrier of salsa state.
@@ -564,5 +636,20 @@ def f(x: str?) -> None:
         let mut db = TycDatabase::new();
         let diags = check_file(&mut db, "<test>".into(), src.to_owned());
         assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn resolved_module_query_returns_module_decl() {
+        let db = TycDatabase::new();
+        let file = SourceFile::new(&db, "test.ty".into(), "let x: int = 1\n".into());
+        let resolved = resolved_module(&db, file);
+        assert!(
+            resolved
+                .module_scope()
+                .bindings
+                .iter()
+                .any(|b| b.name == "x"),
+            "resolved_module should expose the let binding"
+        );
     }
 }

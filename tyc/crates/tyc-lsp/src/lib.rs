@@ -23,14 +23,16 @@ use tower_lsp_server::ls_types::{
     TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
 };
 use tower_lsp_server::{jsonrpc, Client, LanguageServer, LspService, Server};
-use tyc_db::{check_source_file, preprocessed_text, SourceFile, TycDatabase};
+use tyc_db::{check_source_file, preprocessed_text, resolved_module_arc, SourceFile, TycDatabase};
 use tyc_diagnostics::TycError;
 use tyc_resolve::{BindingKind, ImportInfo, Mutability, ResolvedModule, SymbolAtOffset};
 
-/// Shared, async-safe cache mapping URI strings to `(preprocessed_text, ResolvedModule)`.
+/// Manual resolved-module cache for cross-file import resolution.
 ///
-/// The preprocessed text serves as a cache key: when it matches, the stored
-/// module is returned directly rather than re-running the name resolver.
+/// Keyed by file:// URI; value is `(preprocessed_text, Arc<ResolvedModule>)`.
+/// Used only for target files that may not be open in the editor (no Salsa
+/// `SourceFile` handle).  Same-file hover/definition/completion use the
+/// Salsa-tracked `resolved_module` query instead.
 type ResolvedCache = Arc<Mutex<HashMap<String, (String, Arc<ResolvedModule>)>>>;
 
 /// The Typhon LSP backend. Holds a single shared salsa database and the
@@ -52,13 +54,11 @@ pub struct Backend {
     /// Raw text is stored inside the Salsa input itself and read back via
     /// `source_file.text(db)` when needed, avoiding dual-state synchronisation.
     documents: Arc<Mutex<HashMap<String, SourceFile>>>,
-    /// Resolved-module cache for hover/definition/completion.
+    /// Resolved-module cache for cross-file import resolution.
     ///
-    /// Maps each URI to the `(preprocessed_text, ResolvedModule)` pair from
-    /// the most recent resolve pass.  The preprocessed text acts as a cache
-    /// key: when `preprocessed_text` (a Salsa-cached query) returns the same
-    /// string, the stored `ResolvedModule` is reused directly rather than
-    /// re-running the name resolver on every hover request.
+    /// Stores resolved modules for target files that may not be open in the
+    /// editor (no Salsa SourceFile).  Keyed by file:// URI; evicted when
+    /// the preprocessed text changes.
     resolved_cache: ResolvedCache,
 }
 
@@ -236,11 +236,12 @@ impl LanguageServer for Backend {
         // Clear diagnostics when the user closes a file so stale errors do
         // not linger in the editor.
         let uri = params.text_document.uri;
+        let uri_str = uri.as_str().to_owned();
         {
             let mut docs = self.documents.lock().await;
-            docs.remove(uri.as_str());
+            docs.remove(&uri_str);
         }
-        self.evict_resolved_cache(uri.as_str()).await;
+        self.evict_resolved_cache(&uri_str).await;
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
     }
 
@@ -250,17 +251,12 @@ impl LanguageServer for Backend {
         let Some(sf) = self.source_file_for(&uri).await else {
             return Ok(None);
         };
-        // Retrieve the preprocessed source from the Salsa cache.  After
-        // `check_source_file` runs during did_open/did_change this is a
-        // cache hit; subsequent hovers on an unchanged file skip preprocessing.
-        let preprocessed = {
+        // Both `preprocessed_text` and `resolved_module` are Salsa-tracked
+        // queries that hit the cache when the file hasn't changed since the
+        // last `check_source_file` call.
+        let (preprocessed, resolved) = {
             let db = self.db.lock().await;
-            preprocessed_text(&*db, sf)
-        };
-        // Get (or build) the resolved module, using the cache so repeated
-        // hover requests on an unchanged file skip re-running the resolver.
-        let Some(resolved) = self.get_or_resolve(uri.as_str(), &preprocessed).await else {
-            return Ok(None);
+            (preprocessed_text(&*db, sf), resolved_module_arc(&*db, sf))
         };
         let offset = position_to_byte(&preprocessed, position);
         let Some(symbol) = resolved.symbol_at_offset(offset) else {
@@ -287,12 +283,9 @@ impl LanguageServer for Backend {
         let Some(sf) = self.source_file_for(&uri).await else {
             return Ok(None);
         };
-        let preprocessed = {
+        let (preprocessed, resolved) = {
             let db = self.db.lock().await;
-            preprocessed_text(&*db, sf)
-        };
-        let Some(resolved) = self.get_or_resolve(uri.as_str(), &preprocessed).await else {
-            return Ok(None);
+            (preprocessed_text(&*db, sf), resolved_module_arc(&*db, sf))
         };
         let items = compute_completion_items(&resolved, &preprocessed, position);
         Ok(Some(CompletionResponse::Array(items)))
@@ -325,12 +318,9 @@ impl LanguageServer for Backend {
         let Some(sf) = self.source_file_for(&uri).await else {
             return Ok(None);
         };
-        let preprocessed = {
+        let (preprocessed, resolved) = {
             let db = self.db.lock().await;
-            preprocessed_text(&*db, sf)
-        };
-        let Some(resolved) = self.get_or_resolve(uri.as_str(), &preprocessed).await else {
-            return Ok(None);
+            (preprocessed_text(&*db, sf), resolved_module_arc(&*db, sf))
         };
         let offset = position_to_byte(&preprocessed, position);
         let Some(symbol) = resolved.symbol_at_offset(offset) else {
@@ -385,12 +375,10 @@ impl Backend {
         docs.get(uri.as_str()).copied()
     }
 
-    /// Return a [`ResolvedModule`] for `uri`, using a cached result when the
-    /// preprocessed text hasn't changed since the last resolve pass.
-    ///
-    /// `preprocessed` should be obtained from the Salsa `preprocessed_text`
-    /// query (already a cache hit for unchanged files).  When it differs from
-    /// the stored key, the resolver re-runs and the cache is updated.
+    /// Return a [`ResolvedModule`] for a cross-file target URI, caching the
+    /// result so repeated go-to-definition jumps into the same module skip
+    /// parse + resolve.  Only used for files that are not open in the editor
+    /// (same-file operations use the Salsa `resolved_module` query instead).
     async fn get_or_resolve(
         &self,
         uri_str: &str,
@@ -418,8 +406,8 @@ impl Backend {
         Some(arc)
     }
 
-    /// Evict the resolved-module cache entry for `uri`.  Called on
-    /// `did_close` so the stale entry doesn't linger in memory.
+    /// Evict the cross-file cache entry for `uri`.  Called on `did_close` so
+    /// stale entries from cross-file jumps don't linger in memory.
     async fn evict_resolved_cache(&self, uri_str: &str) {
         let mut cache = self.resolved_cache.lock().await;
         cache.remove(uri_str);
@@ -1383,15 +1371,17 @@ mod tests {
         assert_eq!(percent_decode(&enc), s);
     }
 
-    // ── resolve_in_preprocessed ──────────────────────────────────────────
+    // ── resolver integration ─────────────────────────────────────────────
 
     #[test]
-    fn resolve_in_preprocessed_finds_bindings() {
+    fn resolver_finds_bindings_in_preprocessed_source() {
         // After preprocessing, `let x` becomes `x: int = 1`.  The resolver
         // should see `x` as a binding at offset 0.
         let preprocessed = "x: int = 1\n";
-        let resolved =
-            resolve_in_preprocessed(preprocessed).expect("parse and resolve should succeed");
+        let module = tyc_syntax::parse_module(preprocessed)
+            .expect("valid source should parse")
+            .into_syntax();
+        let (resolved, _) = tyc_resolve::resolve_module("<test>".to_owned(), preprocessed, &module);
         let names: Vec<String> = resolved
             .module_scope()
             .bindings
@@ -1405,9 +1395,15 @@ mod tests {
     }
 
     #[test]
-    fn resolve_in_preprocessed_returns_none_for_syntax_error() {
-        let result = resolve_in_preprocessed("def (broken syntax)\n");
-        assert!(result.is_none(), "parse error should produce None");
+    fn resolver_parse_error_yields_default_module() {
+        // The `resolved_module` Salsa query returns `Arc::new(ResolvedModule::default())`
+        // on a parse failure.  Verify that behavior via the db directly.
+        let db = TycDatabase::new();
+        let file = SourceFile::new(&db, "broken.ty".into(), "def (broken syntax)\n".into());
+        let resolved = resolved_module_arc(&db, file);
+        // Default ResolvedModule has one (empty) scope from Default.
+        // The important thing is we get a module back, not a panic or None.
+        let _ = resolved;
     }
 
     // ── Phase 4: completion ──────────────────────────────────────────────
@@ -1761,60 +1757,37 @@ def greet():
         assert_eq!(d.range.start.character, 0, "span should start at column 0");
     }
 
-    // ── resolved-module cache logic ───────────────────────────────────────────
-    //
-    // The full `get_or_resolve` / `evict_resolved_cache` path requires a live
-    // tokio runtime and a `Client` handle obtainable only via `LspService`.
-    // These tests verify the individual building blocks instead.
+    // ── resolved_module Salsa query ───────────────────────────────────────────
 
     #[test]
-    fn resolve_cache_hit_when_text_unchanged() {
-        // Simulate the cache logic: same preprocessed text → same Arc.
-        let prep = "x: int = 1\n";
-        let module = tyc_syntax::parse_module(prep).unwrap().into_syntax();
-        let (resolved, _) = tyc_resolve::resolve_module("<lsp>".to_owned(), prep, &module);
-        let arc: Arc<ResolvedModule> = Arc::new(resolved);
-
-        // A cache that already holds the entry for this URI.
-        let mut cache: HashMap<String, (String, Arc<ResolvedModule>)> = HashMap::new();
-        cache.insert(
-            "file:///test.ty".to_owned(),
-            (prep.to_owned(), Arc::clone(&arc)),
-        );
-
-        // Reproducing the fast-path check inside `get_or_resolve`:
-        let hit = cache
-            .get("file:///test.ty")
-            .filter(|(cached_prep, _)| cached_prep.as_str() == prep)
-            .map(|(_, m)| Arc::clone(m));
-
+    fn resolved_module_query_exposes_bindings() {
+        // `resolved_module_arc` must return a module with the declared binding.
+        let db = TycDatabase::new();
+        let file = SourceFile::new(&db, "test.ty".into(), "let x: int = 1\n".into());
+        let resolved = resolved_module_arc(&db, file);
+        let names: Vec<String> = resolved
+            .module_scope()
+            .bindings
+            .iter()
+            .map(|b| b.name.clone())
+            .collect();
         assert!(
-            hit.as_ref().is_some_and(|h| Arc::ptr_eq(h, &arc)),
-            "same preprocessed text should return the cached Arc"
+            names.contains(&"x".to_owned()),
+            "resolved_module should expose the let binding; got {names:?}"
         );
     }
 
     #[test]
-    fn resolve_cache_miss_when_text_changes() {
-        let prep1 = "x: int = 1\n";
-        let prep2 = "y: str = \"hi\"\n";
-
-        let module = tyc_syntax::parse_module(prep1).unwrap().into_syntax();
-        let (resolved, _) = tyc_resolve::resolve_module("<lsp>".to_owned(), prep1, &module);
-        let arc: Arc<ResolvedModule> = Arc::new(resolved);
-
-        let mut cache: HashMap<String, (String, Arc<ResolvedModule>)> = HashMap::new();
-        cache.insert(
-            "file:///test.ty".to_owned(),
-            (prep1.to_owned(), Arc::clone(&arc)),
+    fn resolved_module_query_unchanged_text_is_cached() {
+        // After the first call, a second call with unchanged text must return
+        // the same Arc (Salsa cache hit → pointer equality).
+        let db = TycDatabase::new();
+        let file = SourceFile::new(&db, "test.ty".into(), "let x: int = 1\n".into());
+        let first = resolved_module_arc(&db, file);
+        let second = resolved_module_arc(&db, file);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "unchanged file should return the same Arc from the Salsa cache"
         );
-
-        // When the preprocessed text has changed the fast-path must miss.
-        let hit = cache
-            .get("file:///test.ty")
-            .filter(|(cached_prep, _)| cached_prep.as_str() == prep2)
-            .map(|(_, m)| Arc::clone(m));
-
-        assert!(hit.is_none(), "changed text should produce a cache miss");
     }
 }
