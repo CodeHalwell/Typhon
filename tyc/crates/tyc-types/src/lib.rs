@@ -686,9 +686,9 @@ impl<'a> Checker<'a> {
         }
         for (f, iface_type) in &iface.shape.fields {
             match cls.fields.get(f) {
-                Some(cls_type) if assignable(iface_type, cls_type) => {}
+                Some(cls_type) if self.is_assignable(iface_type, cls_type) => {}
                 Some(_) => return false, // field present but wrong type
-                None if cls.methods.contains_key(f) => {} // property-like method satisfies field
+                None if cls.methods.get(f).is_some_and(|&arity| arity == 0) => {} // property-like method satisfies field
                 None => return false,
             }
         }
@@ -715,15 +715,19 @@ impl<'a> Checker<'a> {
             }
         }
         for (f, iface_type) in &iface.shape.fields {
-            let has_method = cls.is_some_and(|c| c.methods.contains_key(f));
+            let method_arity = cls.and_then(|c| c.methods.get(f));
             match cls.and_then(|c| c.fields.get(f)) {
-                Some(cls_type) if assignable(iface_type, cls_type) => {}
+                Some(cls_type) if self.is_assignable(iface_type, cls_type) => {}
                 Some(cls_type) => missing.push(format!(
                     "{f}: type mismatch (expected `{}`, got `{}`)",
                     iface_type.display(),
                     cls_type.display()
                 )),
-                None if has_method => {}
+                None if method_arity == Some(&0) => {} // property-like method satisfies field
+                None if method_arity.is_some() => missing.push(format!(
+                    "{f}(arity {}; expected field/property)",
+                    method_arity.unwrap()
+                )),
                 None => missing.push(f.clone()),
             }
         }
@@ -2876,6 +2880,77 @@ let c: Config = BadConfig()
         assert!(
             msg.contains("Config") || msg.contains("port"),
             "diagnostic should reference the interface or field name; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn interface_field_accepts_conforming_class_for_interface_typed_field() {
+        // When an interface field's type is itself an interface, a concrete class
+        // that structurally conforms to that nested interface should be accepted.
+        // This requires `self.is_assignable` (not the free `assignable`) so the
+        // structural conformance check fires.
+        let src = "\
+interface Pet:
+    name: str
+
+interface Owner:
+    pet: Pet
+
+class Dog:
+    name: str
+
+class Person:
+    pet: Dog
+
+let p: Owner = Person()
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "concrete class satisfying nested interface field should conform; errors: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn interface_field_satisfied_by_zero_arity_method_passes() {
+        // A zero-argument method (property-like) may satisfy an interface field.
+        // In Typhon's class shape, `def name(self)` records arity 0 (self excluded).
+        let src = "\
+interface Named:
+    name: str
+
+class Dog:
+    def name(self) -> str:
+        return \"Fido\"
+
+let d: Named = Dog()
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "zero-arity method should satisfy interface field; errors: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn interface_field_satisfied_by_nonzero_arity_method_rejected() {
+        // A method with arguments must NOT satisfy an interface field requirement.
+        let src = "\
+interface Named:
+    name: str
+
+class Dog:
+    def name(self, suffix: str) -> str:
+        return \"Fido\" + suffix
+
+let d: Named = Dog()
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "method with arguments must not satisfy interface field; should be rejected"
         );
     }
 }
