@@ -1,0 +1,146 @@
+import ast
+import json
+import os
+from typing import Callable
+
+from anthropic import Anthropic
+
+
+type ToolCall = WeatherCall | CalcCall | UnknownCall
+
+
+class WeatherCall:
+    city: str
+
+
+class CalcCall:
+    expression: str
+
+
+class UnknownCall:
+    name: str
+
+
+let TOOLS: list[dict[str, object]] = [
+    {
+        "name": "get_weather",
+        "description": "Get the current temperature (Celsius) for a city.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string", "description": "city name, e.g. Paris"},
+            },
+            "required": ["city"],
+        },
+    },
+    {
+        "name": "calculate",
+        "description": "Evaluate a basic arithmetic expression.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "expression": {"type": "string", "description": "e.g. (2 + 3) * 4"},
+            },
+            "required": ["expression"],
+        },
+    },
+]
+
+
+def get_weather(city: str) -> str:
+    let fake: dict[str, int] = {"paris": 19, "london": 14, "lagos": 31, "tokyo": 22}
+    let temp: int? = fake.get(city.lower())
+    if temp is None:
+        return json.dumps({"city": city, "error": "unknown"})
+    return json.dumps({"city": city, "temperature_c": temp})
+
+
+def _eval_arith(node: object) -> float:
+    unsafe:
+        if isinstance(node, ast.Constant):
+            let v = node.value
+            if isinstance(v, bool):
+                raise ValueError("booleans are not numbers")
+            if isinstance(v, int) or isinstance(v, float):
+                return float(v)
+            raise ValueError(f"non-numeric constant: {v!r}")
+        if isinstance(node, ast.BinOp):
+            let left: float = _eval_arith(node.left)
+            let right: float = _eval_arith(node.right)
+            if isinstance(node.op, ast.Add): return left + right
+            if isinstance(node.op, ast.Sub): return left - right
+            if isinstance(node.op, ast.Mult): return left * right
+            if isinstance(node.op, ast.Div): return left / right
+            raise ValueError(f"forbidden operator: {type(node.op).__name__}")
+        if isinstance(node, ast.UnaryOp):
+            if isinstance(node.op, ast.USub): return -_eval_arith(node.operand)
+            if isinstance(node.op, ast.UAdd): return _eval_arith(node.operand)
+            raise ValueError(f"forbidden unary op")
+        raise ValueError(f"forbidden node: {type(node).__name__}")
+
+
+def calculate(expression: str) -> str:
+    try:
+        let tree = ast.parse(expression, mode="eval")
+        return json.dumps({"result": _eval_arith(tree.body)})
+    except (SyntaxError, ValueError, ZeroDivisionError) as e:
+        return json.dumps({"error": str(e)})
+
+
+def dispatch(name: str, args: dict[str, object]) -> str:
+    if name == "get_weather":
+        return get_weather(str(args["city"]))
+    if name == "calculate":
+        return calculate(str(args["expression"]))
+    return json.dumps({"error": f"unknown tool: {name}"})
+
+
+def run_loop(client: Anthropic, question: str, max_turns: int = 5) -> str:
+    mut messages: list[dict[str, object]] = [{"role": "user", "content": question}]
+    mut turn: int = 0
+
+    while turn < max_turns:
+        let resp = client.messages.create(
+            model="claude-opus-4-7",
+            max_tokens=1024,
+            system="Use tools when helpful. Reply concisely.",
+            tools=TOOLS,
+            messages=messages,
+        )
+        messages.append({"role": "assistant", "content": resp.content})
+
+        if resp.stop_reason != "tool_use":
+            mut text_parts: list[str] = []
+            for block in resp.content:
+                if block.type == "text":
+                    text_parts.append(block.text)
+            return "".join(text_parts)
+
+        mut tool_results: list[dict[str, object]] = []
+        for block in resp.content:
+            if block.type == "tool_use":
+                let result_text: str = dispatch(block.name, dict(block.input))
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result_text,
+                })
+        messages.append({"role": "user", "content": tool_results})
+        turn = turn + 1
+
+    return "[gave up after max turns]"
+
+
+def main() -> None:
+    let key: str? = os.environ.get("ANTHROPIC_API_KEY")
+    if key is None:
+        print("ANTHROPIC_API_KEY not set — skipping")
+        return
+
+    let client: Anthropic = Anthropic(api_key=key)
+    let q1: str = "What is the weather in Paris, and what is 12 * (3 + 4)?"
+    print(run_loop(client, q1))
+
+
+if __name__ == "__main__":
+    main()

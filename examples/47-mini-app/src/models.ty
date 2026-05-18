@@ -1,0 +1,51 @@
+from datetime import datetime
+
+
+model AskRequest:
+    question: str
+
+
+model AskResponse:
+    answer: str
+    notes_saved: int
+    tool_calls: int
+
+
+model NoteOut:
+    id: int
+    title: str
+    body: str
+    created_at: str
+
+
+class Note:
+    id: int
+    title: str
+    body: str
+    created_at: datetime
+
+
+impl Note:
+    def to_out(self) -> NoteOut:
+        return NoteOut(
+            id=self.id,
+            title=self.title,
+            body=self.body,
+            created_at=self.created_at.isoformat(),
+        )
+
+
+type AgentEvent = ThoughtEvent | ToolCallEvent | FinalAnswerEvent
+
+
+class ThoughtEvent:
+    text: str
+
+
+class ToolCallEvent:
+    name: str
+    args: dict[str, object]
+
+
+class FinalAnswerEvent:
+    text: str

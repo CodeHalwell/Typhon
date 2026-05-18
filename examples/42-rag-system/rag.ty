@@ -1,0 +1,106 @@
+import os
+
+lazy import np = numpy
+
+from anthropic import Anthropic
+from sentence_transformers import SentenceTransformer
+
+
+class Document:
+    id: int
+    text: str
+    embedding: np.ndarray
+
+
+class Hit:
+    doc: Document
+    score: float
+
+
+class VectorStore:
+    docs: list[Document]
+    embed_dim: int
+
+
+impl VectorStore:
+    def add(self, text: str, embedder: SentenceTransformer) -> None:
+        let vec: np.ndarray = embedder.encode(text, normalize_embeddings=True)
+        self.docs.append(Document(id=len(self.docs), text=text, embedding=vec))
+
+    def search(self, query: str, embedder: SentenceTransformer, k: int = 3) -> list[Hit]:
+        let q: np.ndarray = embedder.encode(query, normalize_embeddings=True)
+        let scored: list[Hit] = [
+            Hit(doc=d, score=float(np.dot(q, d.embedding))) for d in self.docs
+        ]
+        return sorted(scored, key=lambda h: h.score, reverse=True)[:k]
+
+
+let CORPUS: list[str] = [
+    "Typhon is a statically-typed superset of Python. It compiles to clean CPython 3.13.",
+    "Typhon uses let/mut for local bindings; module-level bindings default to let.",
+    "Result[T, E] models recoverable failures. The ? operator short-circuits Err.",
+    "gather: lowers parallel awaits into asyncio.TaskGroup with cancel-on-failure.",
+    "Sealed unions are checked exhaustive at compile time via match statements.",
+    "lazy import name = module defers module loading until first attribute access.",
+    "comptime let inlines build-time constants from env vars and pure expressions.",
+    "The tyc binary handles check, build, fmt, lsp, migrate, and repl subcommands.",
+]
+
+
+def build_store(embedder: SentenceTransformer) -> VectorStore:
+    let store: VectorStore = VectorStore(docs=[], embed_dim=embedder.get_sentence_embedding_dimension())
+    for text in CORPUS:
+        store.add(text, embedder)
+    return store
+
+
+def ground(client: Anthropic, question: str, hits: list[Hit]) -> str:
+    mut context_lines: list[str] = []
+    for i, h in enumerate(hits):
+        context_lines.append(f"[{i + 1}] {h.doc.text}")
+    let context: str = "\n".join(context_lines)
+
+    let prompt: str = (
+        f"Use only the context to answer. If the context is insufficient, say so.\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question: {question}\n"
+        f"Cite passages by their [n] index."
+    )
+    let resp = client.messages.create(
+        model="claude-opus-4-7",
+        max_tokens=512,
+        system="You answer using only the provided context, with citations.",
+        messages=[{"role": "user", "content": prompt}],
+    )
+    mut parts: list[str] = []
+    for block in resp.content:
+        if block.type == "text":
+            parts.append(block.text)
+    return "".join(parts)
+
+
+def main() -> None:
+    let embedder: SentenceTransformer = SentenceTransformer("all-MiniLM-L6-v2")
+    let store: VectorStore = build_store(embedder)
+
+    let questions: list[str] = [
+        "How does Typhon handle parallel awaits?",
+        "What does the ? operator do?",
+        "Does Typhon emit Python or have its own runtime?",
+    ]
+
+    let key: str? = os.environ.get("ANTHROPIC_API_KEY")
+    let client: Anthropic? = Anthropic(api_key=key) if key is not None else None
+
+    for q in questions:
+        print(f"\nQ: {q}")
+        let hits: list[Hit] = store.search(q, embedder, k=3)
+        for h in hits:
+            print(f"  [{h.score:.3f}] {h.doc.text}")
+
+        if client is not None:
+            print(f"  answer: {ground(client, q, hits)}")
+
+
+if __name__ == "__main__":
+    main()
