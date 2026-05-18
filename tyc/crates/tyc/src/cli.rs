@@ -58,6 +58,18 @@ pub enum Commands {
     /// `ty check <out-dir>` as a subprocess. Requires `ty` to be installed
     /// separately (`pip install ty` or `uv tool install ty`).
     Ty(commands::ty::TyArgs),
+
+    /// Launch an interactive Typhon REPL.
+    ///
+    /// Accumulates `.ty` source across prompts and pipes each evaluation
+    /// through the full compile pipeline plus a Python subprocess.
+    Repl(commands::repl::ReplArgs),
+
+    /// Build the project and launch the emitted Python under a debugger.
+    ///
+    /// v1 thin wrapper that runs `python -m pdb build/main.py`. A full
+    /// source-mapping Typhon-native debugger is a Phase-5 item.
+    Debug(commands::debug::DebugArgs),
 }
 
 /// Entry point called from `main`.
@@ -74,5 +86,7 @@ pub fn run() -> Result<()> {
         Commands::Profile(args) => commands::profile::run(args),
         Commands::Migrate(args) => commands::migrate::run(args),
         Commands::Ty(args) => commands::ty::run(args),
+        Commands::Repl(args) => commands::repl::run(args),
+        Commands::Debug(args) => commands::debug::run(args),
     }
 }
