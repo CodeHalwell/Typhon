@@ -17,9 +17,9 @@ use tyc_resolve::{resolve_module_with, LazyImportRemap, ResolveOptions, Resolved
 use tyc_syntax::{
     parse_module,
     preprocess::{
-        expand_gather_blocks, expand_go_calls, expand_pipes, expand_question_ops,
-        expand_with_chains, line_byte_starts, preprocess, validate_extend_usage,
-        validate_lazy_usage, validate_question_ops,
+        expand_gather_blocks, expand_go_calls, expand_multiline_guards, expand_pipes,
+        expand_question_ops, expand_with_chains, line_byte_starts, preprocess,
+        validate_extend_usage, validate_lazy_usage, validate_question_ops,
     },
 };
 use tyc_types::check_module_with;
@@ -48,7 +48,7 @@ pub fn preprocessed_text(db: &dyn salsa::Database, file: SourceFile) -> String {
     // Apply Typhon sugar expansion in the same order as `check_file` and the
     // build pipeline: gather → go → with-chains → pipes → `?`.
     let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
-        &expand_gather_blocks(text),
+        &expand_gather_blocks(&expand_multiline_guards(text)),
     ))));
     preprocess(&expanded).python_source
 }
@@ -142,7 +142,7 @@ pub fn resolved_module(db: &dyn salsa::Database, file: SourceFile) -> ArcResolve
     // only need the text. The cost here is one extra preprocess per
     // source change, which is bounded by file size and cheap.
     let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
-        &expand_gather_blocks(&raw_text),
+        &expand_gather_blocks(&expand_multiline_guards(&raw_text)),
     ))));
     let prep = preprocess(&expanded);
     let lazy_import_remaps = build_lazy_import_remaps(&raw_text, &prep.lazy_imports);
@@ -322,7 +322,7 @@ fn check_impl(path: &str, text: &str) -> Diagnostics {
     // Python parser sees valid Python.  `tyc fmt` skips these expansions to
     // preserve Typhon syntax in the formatter's round trip.
     let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
-        &expand_gather_blocks(text),
+        &expand_gather_blocks(&expand_multiline_guards(text)),
     ))));
     let prep = preprocess(&expanded);
 

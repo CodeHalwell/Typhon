@@ -40,7 +40,8 @@ use tyc_db::{check_file, TycDatabase};
 use tyc_desugar::{desugar_module_with, DesugarOptions};
 use tyc_emit::emit_python_with_line_offsets;
 use tyc_syntax::preprocess::{
-    expand_gather_blocks, expand_go_calls, expand_lazy_imports, expand_pipes, expand_question_ops,
+    expand_gather_blocks, expand_go_calls, expand_lazy_imports, expand_multiline_guards,
+    expand_pipes, expand_question_ops,
     expand_with_chains, preprocess,
 };
 
@@ -452,7 +453,7 @@ fn wrap_bare_expression_for_repl(block: &str) -> String {
 
 pub(crate) fn compile_to_python(source: &str) -> Result<String> {
     let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
-        &expand_gather_blocks(&expand_lazy_imports(source)),
+        &expand_gather_blocks(&expand_multiline_guards(&expand_lazy_imports(source))),
     ))));
     let prep = preprocess(&expanded);
 

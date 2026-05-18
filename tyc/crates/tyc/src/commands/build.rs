@@ -29,8 +29,8 @@ use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_emit::{emit_python_with_line_offsets, emit_stub};
 use tyc_format::format_source;
 use tyc_syntax::preprocess::{
-    expand_gather_blocks, expand_go_calls, expand_lazy_imports, expand_pipes, expand_question_ops,
-    expand_with_chains, line_byte_starts, preprocess,
+    expand_gather_blocks, expand_go_calls, expand_lazy_imports, expand_multiline_guards,
+    expand_pipes, expand_question_ops, expand_with_chains, line_byte_starts, preprocess,
 };
 
 use crate::commands::util::{apply_strictness, collect_dty_files, collect_ty_files};
@@ -186,7 +186,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // become a full inline proxy class before the other sugar passes see
         // them.
         let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
-            &expand_gather_blocks(&expand_lazy_imports(source)),
+            &expand_gather_blocks(&expand_multiline_guards(&expand_lazy_imports(source))),
         ))));
         let prep = preprocess(&expanded);
 
@@ -413,7 +413,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // declarations.  Run the preprocessor so `val`/`var`/`model` stripping
         // works, then desugar to plain Python so the printer can emit it.
         let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
-            &expand_gather_blocks(&expand_lazy_imports(&source)),
+            &expand_gather_blocks(&expand_multiline_guards(&expand_lazy_imports(&source))),
         ))));
         let prep = preprocess(&expanded);
         let module = tyc_syntax::parse_module(&prep.python_source)
