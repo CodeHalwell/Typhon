@@ -2225,33 +2225,8 @@ pub fn expand_question_ops(source: &str) -> String {
     result
 }
 
-// ── `with`-chain expansion ────────────────────────────────────────────────────
+// ── multi-line `guard` expansion ───────────────────────────────────────────────
 
-/// Expand a `with`-chain into a flat sequence of guarded `Result` unwraps.
-///
-/// Source form:
-///
-/// ```text
-/// with user   = db.find_user(id)?,
-///      perms  = check_perms(user)?,
-///      report = build_report(user, perms)?:
-///     return Ok(report)
-/// else err:
-///     log.warn(err)
-///     return Err(err)
-/// ```
-///
-/// Each binding evaluates its RHS, returns the value when `Ok`, and runs the
-/// `else` block (with `err` bound to the unwrapped error value) on the first
-/// `Err`. When no `else` clause is provided the chain falls back to the
-/// default propagation form — `return <tmp>` — matching the `?` operator.
-///
-/// This rewrite runs **before** [`expand_question_ops`] and [`expand_pipes`]
-/// so that the rest of the pipeline sees only plain Python.
-///
-/// # Limitations
-///
-/// - The `with`-chain must sit at the top of its line and not be nested
 /// Expand the multi-line `guard NAME = EXPR else:` form into the same
 /// shape the in-preprocess single-line handler produces. Runs as a
 /// pre-pass so the rest of the pipeline (single-line guards included)
@@ -2361,8 +2336,9 @@ pub fn expand_multiline_guards(source: &str) -> String {
                 j += 1;
                 continue;
             }
-            let c_indent =
-                raw_c.find(|c: char| !c.is_whitespace()).unwrap_or(raw_c.len());
+            let c_indent = raw_c
+                .find(|c: char| !c.is_whitespace())
+                .unwrap_or(raw_c.len());
             if c_indent <= indent_len {
                 break;
             }
@@ -2442,6 +2418,33 @@ fn split_guard_name_equals_expr(s: &str) -> Option<(&str, &str)> {
     None
 }
 
+// ── `with`-chain expansion ────────────────────────────────────────────────────
+
+/// Expand a `with`-chain into a flat sequence of guarded `Result` unwraps.
+///
+/// Source form:
+///
+/// ```text
+/// with user   = db.find_user(id)?,
+///      perms  = check_perms(user)?,
+///      report = build_report(user, perms)?:
+///     return Ok(report)
+/// else err:
+///     log.warn(err)
+///     return Err(err)
+/// ```
+///
+/// Each binding evaluates its RHS, returns the value when `Ok`, and runs the
+/// `else` block (with `err` bound to the unwrapped error value) on the first
+/// `Err`. When no `else` clause is provided the chain falls back to the
+/// default propagation form — `return <tmp>` — matching the `?` operator.
+///
+/// This rewrite runs **before** [`expand_question_ops`] and [`expand_pipes`]
+/// so that the rest of the pipeline sees only plain Python.
+///
+/// # Limitations
+///
+/// - The `with`-chain must sit at the top of its line and not be nested
 ///   inside another expression.
 /// - Bindings continue on subsequent lines only; nesting another control
 ///   structure between bindings is not supported.

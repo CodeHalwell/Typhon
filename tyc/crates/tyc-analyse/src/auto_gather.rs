@@ -680,8 +680,7 @@ pub fn detect_missed_gathers(module: &ModModule) -> Vec<MissedGather> {
     // Anything in `local_async` but not in `decorated` is a missed
     // opportunity; that's the eligible set for "could have been
     // gathered if decorated".
-    let eligible_if_decorated: HashSet<String> =
-        local_async.iter().cloned().collect();
+    let eligible_if_decorated: HashSet<String> = local_async.iter().cloned().collect();
     let mut out = Vec::new();
     walk_missed_in_stmts(
         &module.body,
@@ -747,13 +746,9 @@ fn walk_missed_in_stmt(
     out: &mut Vec<MissedGather>,
 ) {
     match stmt {
-        Stmt::FunctionDef(f) => walk_missed_in_stmts(
-            &f.body,
-            eligible_if_decorated,
-            decorated,
-            f.is_async,
-            out,
-        ),
+        Stmt::FunctionDef(f) => {
+            walk_missed_in_stmts(&f.body, eligible_if_decorated, decorated, f.is_async, out)
+        }
         Stmt::ClassDef(c) => {
             walk_missed_in_stmts(&c.body, eligible_if_decorated, decorated, false, out);
         }
@@ -796,13 +791,7 @@ fn walk_missed_in_stmt(
             walk_missed_in_stmts(&s.body, eligible_if_decorated, decorated, inside_async, out);
             for h in &s.handlers {
                 let ExceptHandler::ExceptHandler(h) = h;
-                walk_missed_in_stmts(
-                    &h.body,
-                    eligible_if_decorated,
-                    decorated,
-                    inside_async,
-                    out,
-                );
+                walk_missed_in_stmts(&h.body, eligible_if_decorated, decorated, inside_async, out);
             }
             walk_missed_in_stmts(
                 &s.orelse,
@@ -1354,7 +1343,10 @@ async def load() -> int:
 ";
         let module = parse_module(src);
         let missed = detect_missed_gathers(&module);
-        assert!(missed.is_empty(), "single await is never a run; got {missed:?}");
+        assert!(
+            missed.is_empty(),
+            "single await is never a run; got {missed:?}"
+        );
     }
 
     #[test]
@@ -1374,6 +1366,9 @@ async def load() -> int:
 ";
         let module = parse_module(src);
         let missed = detect_missed_gathers(&module);
-        assert!(missed.is_empty(), "imported callees ineligible; got {missed:?}");
+        assert!(
+            missed.is_empty(),
+            "imported callees ineligible; got {missed:?}"
+        );
     }
 }

@@ -1957,9 +1957,8 @@ def foo():
         // Compiler-synthesised `__typhon_*` temps (e.g. the `?` operator's
         // `__typhon_q_N__`) must not trigger the diagnostic — the
         // user-source spelling is `expr?`, never a bare assignment.
-        let (_m, d) = resolve(
-            "def f() -> None:\n    __typhon_q_0__ = 1\n    print(__typhon_q_0__)\n",
-        );
+        let (_m, d) =
+            resolve("def f() -> None:\n    __typhon_q_0__ = 1\n    print(__typhon_q_0__)\n");
         assert!(
             !d.errors()
                 .iter()

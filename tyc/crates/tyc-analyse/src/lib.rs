@@ -47,8 +47,8 @@ const MAX_COMPTIME_DEPTH: usize = 64;
 
 pub mod auto_gather;
 pub use auto_gather::{
-    collect_gatherable_async_fn_names, detect_missed_gathers, rewrite_auto_gather,
-    AutoGatherStats, MissedGather,
+    collect_gatherable_async_fn_names, detect_missed_gathers, rewrite_auto_gather, AutoGatherStats,
+    MissedGather,
 };
 
 pub mod pgo;
@@ -1637,8 +1637,7 @@ comptime let Y: int = use_outer()
 
     #[test]
     fn comptime_dict_literal_evaluated() {
-        let (values, diags) =
-            eval("comptime let CFG: dict[str, int] = {\"a\": 1, \"b\": 2}\n");
+        let (values, diags) = eval("comptime let CFG: dict[str, int] = {\"a\": 1, \"b\": 2}\n");
         assert!(!diags.has_errors(), "{:?}", diags.errors());
         let v = values.get("CFG").expect("CFG must evaluate");
         assert!(matches!(v, ComptimeValue::Dict(items) if items.len() == 2));
@@ -1661,8 +1660,7 @@ comptime let Y: int = use_outer()
 
     #[test]
     fn comptime_nested_containers_evaluated() {
-        let (values, diags) =
-            eval("comptime let DATA: list[tuple[int, int]] = [(1, 2), (3, 4)]\n");
+        let (values, diags) = eval("comptime let DATA: list[tuple[int, int]] = [(1, 2), (3, 4)]\n");
         assert!(!diags.has_errors(), "{:?}", diags.errors());
         assert_eq!(
             values.get("DATA").map(|v| v.to_python_literal()),
@@ -1679,16 +1677,14 @@ comptime let Y: int = use_outer()
 
     #[test]
     fn comptime_str_replace_evaluated() {
-        let (values, diags) =
-            eval("comptime let P: str = \"a-b-c\".replace(\"-\", \"_\")\n");
+        let (values, diags) = eval("comptime let P: str = \"a-b-c\".replace(\"-\", \"_\")\n");
         assert!(!diags.has_errors(), "{:?}", diags.errors());
         assert!(matches!(values.get("P"), Some(ComptimeValue::Str(s)) if s == "a_b_c"));
     }
 
     #[test]
     fn comptime_str_split_returns_list() {
-        let (values, diags) =
-            eval("comptime let PARTS: list[str] = \"a,b,c\".split(\",\")\n");
+        let (values, diags) = eval("comptime let PARTS: list[str] = \"a,b,c\".split(\",\")\n");
         assert!(!diags.has_errors(), "{:?}", diags.errors());
         assert_eq!(
             values.get("PARTS").map(|v| v.to_python_literal()),

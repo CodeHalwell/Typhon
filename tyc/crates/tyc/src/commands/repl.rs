@@ -41,8 +41,7 @@ use tyc_desugar::{desugar_module_with, DesugarOptions};
 use tyc_emit::emit_python_with_line_offsets;
 use tyc_syntax::preprocess::{
     expand_gather_blocks, expand_go_calls, expand_lazy_imports, expand_multiline_guards,
-    expand_pipes, expand_question_ops,
-    expand_with_chains, preprocess,
+    expand_pipes, expand_question_ops, expand_with_chains, preprocess,
 };
 
 /// Arguments for `tyc repl`.

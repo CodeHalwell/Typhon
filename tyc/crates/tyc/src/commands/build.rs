@@ -19,9 +19,8 @@ use ruff_text_size::TextRange;
 use tyc_analyse::{
     analyse_purity, collect_gatherable_async_fn_names, detect_missed_gathers,
     evaluate_comptime_with_functions, extract_builtin_extensions, load_profile_samples,
-    pgo_memoise_targets, purity_diagnostics, rewrite_auto_gather,
-    rewrite_builtin_extension_calls, rewrite_parallel_comprehensions, ComptimeValue,
-    ProfileSample,
+    pgo_memoise_targets, purity_diagnostics, rewrite_auto_gather, rewrite_builtin_extension_calls,
+    rewrite_parallel_comprehensions, ComptimeValue, ProfileSample,
 };
 use tyc_db::{check_file, TycDatabase};
 use tyc_desugar::{desugar_module_with, DesugarOptions};
