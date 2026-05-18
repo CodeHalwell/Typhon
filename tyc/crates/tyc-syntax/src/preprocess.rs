@@ -386,6 +386,35 @@ pub fn preprocess(source: &str) -> PreprocessResult {
                 }
             }
 
+            // ── `guard NAME = EXPR else: BODY` (single-line) ────────────────
+            // Lowers to a None-check + an early-return body + a `let`
+            // binding of the narrowed value. Stashes EXPR in a per-line
+            // temp so the narrowing applies to the binding (the checker
+            // can only narrow Name expressions, not arbitrary call
+            // results).
+            //
+            //   guard w = weight else: return
+            //
+            //   →   let __typhon_guard_<N> = (weight)
+            //       if __typhon_guard_<N> is None: return
+            //       let w = __typhon_guard_<N>
+            //
+            // Only the single-line form is recognised; multi-line guards
+            // (`else:\n    return`) are deferred.
+            if rest.starts_with("guard ") {
+                if let Some(rewritten) = expand_guard_one_liner(rest, indent, line_index) {
+                    let (rewritten, marks) = rewrite_optionals(&rewritten, &mut in_string);
+                    for col in marks {
+                        optionals.push(StrippedOptional {
+                            line_index,
+                            python_col: col,
+                        });
+                    }
+                    python_source.push_str(&rewritten);
+                    continue;
+                }
+            }
+
             // ── `model ClassName:` → `class ClassName(BaseModel):` ──────────
             if rest.starts_with("model ")
                 && rest.len() > "model ".len()
@@ -606,6 +635,97 @@ fn make_impl_class_line(after_impl: &str) -> Option<String> {
     let tail = &after_tps[colon_pos..]; // ":\n" or ":"
     let tp = impl_type_params.unwrap_or("");
     Some(format!("__typhon_impl_{}{}(object){}", name, tp, tail))
+}
+
+/// Expand a single-line `guard NAME = EXPR else: BODY` into a
+/// None-check + early-return + immutable binding. The caller has
+/// already verified the line starts with `guard ` and provides the
+/// leading-whitespace `indent` so the rewrite preserves indentation.
+///
+/// Returns `None` when the line doesn't match the single-line guard
+/// shape (multi-line `guard …\n    return` still hits a parse error;
+/// that case is a separate, larger lowering not yet implemented).
+fn expand_guard_one_liner(rest: &str, indent: &str, line_index: usize) -> Option<String> {
+    let after_guard = rest.strip_prefix("guard ")?;
+    // Body is everything after the `else:`. Walk the line tracking
+    // bracket depth so `else:` inside a parenthesised expression doesn't
+    // trip the matcher.
+    let body_marker = " else:";
+    let mut depth = 0i32;
+    let mut idx = 0usize;
+    let bytes = after_guard.as_bytes();
+    let mut found = None;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b' ' if depth == 0
+                && idx + body_marker.len() <= bytes.len()
+                && &bytes[idx..idx + body_marker.len()] == body_marker.as_bytes() =>
+            {
+                found = Some(idx);
+                break;
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    let split = found?;
+    let head = &after_guard[..split]; // `NAME = EXPR`
+    let tail = &after_guard[split + body_marker.len()..]; // ` BODY\n`
+
+    // Split head on the first `=` outside of brackets.
+    let mut depth = 0i32;
+    let mut eq_pos = None;
+    for (i, b) in head.bytes().enumerate() {
+        match b {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'=' if depth == 0 => {
+                // Reject `==` / `!=` / `<=` / `>=`.
+                let prev = i.checked_sub(1).map(|j| head.as_bytes()[j]).unwrap_or(0);
+                let next = head.as_bytes().get(i + 1).copied().unwrap_or(0);
+                if matches!(prev, b'=' | b'!' | b'<' | b'>') || next == b'=' {
+                    continue;
+                }
+                eq_pos = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let eq_pos = eq_pos?;
+    let name = head[..eq_pos].trim();
+    let expr = head[eq_pos + 1..].trim();
+    if !is_simple_identifier(name) || expr.is_empty() {
+        return None;
+    }
+    let body = tail.trim_end_matches(['\n', '\r']).trim();
+    if body.is_empty() {
+        return None;
+    }
+    // Stash EXPR in a unique-per-line temp so flow narrowing can fire
+    // — the checker narrows Name expressions, not arbitrary call
+    // results, so referencing the same `find_user(t)` twice in the
+    // post-`if` `let` would yield `T?` again.
+    let tmp = format!("__typhon_guard_{}", line_index);
+    Some(format!(
+        "{indent}let {tmp} = ({expr})\n{indent}if {tmp} is None: {body}\n{indent}let {name} = {tmp}\n"
+    ))
+}
+
+/// Cheap identifier test for the `guard` name binding: ASCII letter or
+/// underscore start, ASCII alphanumeric / underscore body.
+fn is_simple_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    let first = match chars.next() {
+        Some(c) => c,
+        None => return false,
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// If `line` is a `def NAME(...) -> TYPE` declaration with no body

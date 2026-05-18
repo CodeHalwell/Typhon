@@ -1984,6 +1984,7 @@ fn check_if(c: &mut Checker, i: &ruff_python_ast::StmtIf) {
     if is_unsafe {
         c.unsafe_depth = c.unsafe_depth.saturating_sub(1);
     }
+    let body_exits = body_always_exits(&i.body);
     c.env.restore(snap_pre);
 
     // Apply opposite narrowing for the elif/else cascade. Ruff flattens
@@ -1994,7 +1995,50 @@ fn check_if(c: &mut Checker, i: &ruff_python_ast::StmtIf) {
     let snap_pre = c.env.snapshot();
     apply_narrowings(c, &neg);
     check_elif_else_clauses(c, &i.elif_else_clauses);
+    let elif_exits = !i.elif_else_clauses.is_empty()
+        && elif_else_chain_always_exits(&i.elif_else_clauses);
     c.env.restore(snap_pre);
+
+    // Flow-sensitive narrowing: if every branch we've examined ends in
+    // an unconditional exit (return / raise / break / continue), the
+    // negated narrowing should persist into the surrounding scope. This
+    // makes the `guard X = expr else: return` lowering work — after the
+    // None-check, `expr` is reliably non-None for the rest of the body.
+    if body_exits && (i.elif_else_clauses.is_empty() || elif_exits) {
+        apply_narrowings(c, &neg);
+    }
+}
+
+/// True when every reachable path through `stmts` exits the enclosing
+/// function (return / raise / break / continue) before falling off the
+/// end. Used by `check_if` to decide whether to propagate the negated
+/// narrowing of the `if`'s test into the post-`if` scope.
+fn body_always_exits(stmts: &[Stmt]) -> bool {
+    stmts.last().is_some_and(stmt_always_exits)
+}
+
+/// True when every branch of an elif/else chain always exits.
+fn elif_else_chain_always_exits(clauses: &[ruff_python_ast::ElifElseClause]) -> bool {
+    // The chain "always exits" only when there is a terminal `else:` and
+    // every elif/else body always exits. Without a terminal `else`, the
+    // fall-through path is "do nothing" — not an exit.
+    let has_terminal_else = clauses.iter().any(|c| c.test.is_none());
+    if !has_terminal_else {
+        return false;
+    }
+    clauses.iter().all(|c| body_always_exits(&c.body))
+}
+
+/// True when this statement unconditionally exits its enclosing scope.
+fn stmt_always_exits(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Return(_) | Stmt::Raise(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
+        // An if/elif/else where every branch exits is itself an exit.
+        Stmt::If(s) => {
+            body_always_exits(&s.body) && elif_else_chain_always_exits(&s.elif_else_clauses)
+        }
+        _ => false,
+    }
 }
 
 /// Recursively check the `elif`/`else` cascade of a [`StmtIf`].  Each

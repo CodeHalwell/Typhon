@@ -151,6 +151,26 @@ modifier must be recognised before the colon.
 
 ## 2. `guard NAME = EXPR else: BODY` is a parse error (bug)
 
+**Status:** **FIXED (single-line)** on `claude/update-findings-IdfrH`. The
+preprocessor now expands `guard NAME = EXPR else: BODY` into three
+lines: a temp `let __typhon_guard_<line> = (EXPR)`, an `if … is None:
+BODY` guard, and the user-facing `let NAME = __typhon_guard_<line>`.
+The temp is necessary because the type-checker can only narrow `Name`
+expressions, not arbitrary call results — without it
+`guard u = find_user(t) else: …` would re-call `find_user` and lose
+narrowing.
+
+Paired with a new piece of flow-sensitive narrowing in `check_if`:
+when the `if`-body always exits (return/raise/break/continue) and the
+elif/else chain either is empty or also always exits, the negated
+narrowing is applied to the post-`if` scope. This is what makes
+`guard t = find_token(uid) else: return "anon"` correctly narrow `t`
+for the rest of the function body, and is also what closes the
+common idiomatic shape `if x is None: return; use_x_as_T()` for any
+caller, not just `guard` expansions.
+
+Multi-line `guard NAME = EXPR else:\n    BODY` is deferred.
+
 **Severity:** bug — documented core feature is unparseable.
 
 Both the readability section and the pitfalls list show:
