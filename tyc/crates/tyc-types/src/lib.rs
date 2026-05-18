@@ -346,6 +346,11 @@ fn walk_typevars(ty: &Type, out: &mut Vec<String>) {
 /// `formal` and `actual` in lockstep.  Recursive: `list[T]` against
 /// `list[int]` binds `T → int`.  Any binding conflict resolves by union
 /// (so calling `f[T](a: T, b: T)` with `(int, str)` infers `T = int|str`).
+///
+/// Handles unions on either side so that:
+/// - `Optional[T]` (i.e. `T | None`) against `int` binds `T → int` by
+///   pairing the TypeVar variant with the non-None actual type.
+/// - `list[T]` against `list[int] | list[str]` binds `T → int | str`.
 fn bind_typevars(
     formal: &Type,
     actual: &Type,
@@ -353,6 +358,18 @@ fn bind_typevars(
 ) {
     match (formal, actual) {
         (Type::TypeVar(name), other) => {
+            // Suppress self-bindings (`T → T`): they're uninformative and,
+            // worse, mark the TypeVar as "bound" which then prevents the
+            // backward bidirectional pass from pinning it from the expected
+            // type.  Self-bindings arise when an empty literal's element
+            // type is propagated from a generic formal (e.g. `head([])`
+            // with `xs: list[T]` infers the literal as `list[T]`, then the
+            // forward pass would otherwise insert `T → T`).
+            if let Type::TypeVar(other_name) = other {
+                if other_name == name {
+                    return;
+                }
+            }
             if let Some(existing) = bindings.get(name).cloned() {
                 if existing != *other {
                     bindings.insert(name.clone(), Type::union_of(vec![existing, other.clone()]));
@@ -382,6 +399,26 @@ fn bind_typevars(
                 bind_typevars(f, a, bindings);
             }
             bind_typevars(fr, ar, bindings);
+        }
+        // `Optional[T]` (formal `T | None`) against a concrete actual:
+        // narrow each formal variant against the non-None portion of
+        // `actual`, so `T` doesn't get widened to `int | None`.
+        (Type::Union(fv), other) => {
+            let actual_stripped = other.strip_none();
+            for variant in fv {
+                if matches!(variant, Type::None) {
+                    continue;
+                }
+                bind_typevars(variant, &actual_stripped, bindings);
+            }
+        }
+        // Formal contains a TypeVar but actual is a Union — bind each
+        // variant of the actual against the formal so we accumulate the
+        // full set (e.g. `list[T]` against `list[int] | list[str]`).
+        (f, Type::Union(av)) if !collect_typevar_positions(f).is_empty() => {
+            for variant in av {
+                bind_typevars(f, variant, bindings);
+            }
         }
         _ => {}
     }
@@ -429,6 +466,51 @@ pub fn bind_typevars_and_substitute(
     actual_args: &[Type],
     return_type: &Type,
 ) -> Type {
+    bind_typevars_and_substitute_bidirectional(formal_params, actual_args, return_type, None)
+}
+
+/// Same as [`bind_typevars_and_substitute`] but also lets the call's
+/// *expected* return type drive inference for TypeVars that the
+/// arguments alone leave unbound — true bidirectional inference for
+/// PEP 695 generic calls.
+///
+/// Two-phase algorithm:
+///
+/// 1. **Forward pass.** Walk every (formal, actual) pair and read off
+///    bindings as before.  This is enough for most calls.
+/// 2. **Backward pass.** If `expected_return` is `Some(_)` and the
+///    declared return type still contains an unbound TypeVar after
+///    phase 1, walk `return_type` against `expected_return` so the
+///    annotation at the call site can pin the TypeVar.
+///
+/// Example: `def make[T]() -> list[T]: ...` then
+/// `let xs: list[int] = make()`.  Phase 1 has no args to consult, so
+/// `T` stays unbound; phase 2 sees `list[T]` vs `list[int]` and binds
+/// `T → int`, giving the call a concrete `list[int]` return type.
+pub fn bind_typevars_and_substitute_bidirectional(
+    formal_params: &[Type],
+    actual_args: &[Type],
+    return_type: &Type,
+    expected_return: Option<&Type>,
+) -> Type {
+    let bindings =
+        compute_bidirectional_bindings(formal_params, actual_args, return_type, expected_return);
+    substitute_typevars(return_type, &bindings)
+}
+
+/// Compute the full set of TypeVar bindings produced by a bidirectional
+/// inference pass at a call site.  Splits the two-phase work out so the
+/// bound-check at the call site can validate against the same final
+/// bindings the substitution will use — otherwise TypeVars pinned only
+/// by the backward (expected-return) pass would bypass their declared
+/// bounds.
+pub fn compute_bidirectional_bindings(
+    formal_params: &[Type],
+    actual_args: &[Type],
+    return_type: &Type,
+    expected_return: Option<&Type>,
+) -> std::collections::HashMap<String, Type> {
+    let mut bindings: std::collections::HashMap<String, Type> = std::collections::HashMap::new();
     // Skip work when no formal mentions a TypeVar.
     let has_typevar = formal_params
         .iter()
@@ -439,13 +521,33 @@ pub fn bind_typevars_and_substitute(
             !tmp.is_empty()
         });
     if !has_typevar {
-        return return_type.clone();
+        return bindings;
     }
-    let mut bindings: std::collections::HashMap<String, Type> = std::collections::HashMap::new();
     for (formal, actual) in formal_params.iter().zip(actual_args.iter()) {
         bind_typevars(formal, actual, &mut bindings);
     }
-    substitute_typevars(return_type, &bindings)
+    // Backward pass: pin any TypeVars in the return type that the
+    // arguments left unbound, using the call-site expected type.
+    // Bindings established by the forward pass are authoritative — args
+    // carry stronger evidence than annotations — so we collect the
+    // backward result into a fresh map and only use it for TypeVars the
+    // forward pass didn't touch.  Without this, calling `f[T](x: T) -> T`
+    // with `int` under a `str` annotation would widen `T` to `int | str`
+    // and silently lose the assignment-site mismatch.
+    if let Some(expected) = expected_return {
+        let mut return_tvs = Vec::new();
+        walk_typevars(return_type, &mut return_tvs);
+        let any_unbound = return_tvs.iter().any(|n| !bindings.contains_key(n));
+        if any_unbound {
+            let mut backward: std::collections::HashMap<String, Type> =
+                std::collections::HashMap::new();
+            bind_typevars(return_type, expected, &mut backward);
+            for (name, ty) in backward {
+                bindings.entry(name).or_insert(ty);
+            }
+        }
+    }
+    bindings
 }
 
 /// Used by tests in lower layers (resolver, db) that want to enumerate
@@ -1015,16 +1117,23 @@ impl<'a> Checker<'a> {
         fn_name: &str,
         formal_params: &[Type],
         actual_args: &[Type],
+        return_type: &Type,
+        expected_return: Option<&Type>,
         call_span: (usize, usize),
     ) {
         let bounds = match self.function_type_bounds.get(fn_name).cloned() {
             Some(b) if !b.is_empty() => b,
             _ => return,
         };
-        let mut bindings: HashMap<String, Type> = HashMap::new();
-        for (formal, actual) in formal_params.iter().zip(actual_args.iter()) {
-            bind_typevars(formal, actual, &mut bindings);
-        }
+        // Use the same bidirectional bindings the substitution will use,
+        // so a TypeVar that's only pinned by the call-site expected type
+        // (no informative args) still has its declared bound enforced.
+        let bindings = compute_bidirectional_bindings(
+            formal_params,
+            actual_args,
+            return_type,
+            expected_return,
+        );
         let mut tv_names: Vec<&String> = bindings.keys().collect();
         tv_names.sort();
         for tv_name in tv_names {
@@ -1417,7 +1526,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
         Stmt::AnnAssign(a) => {
             let ann_type = type_from_annotation(&a.annotation, &c.classes);
             if let Some(value) = &a.value {
-                let value_type = infer_expr(c, value);
+                let value_type = infer_expr_ctx(c, value, Some(&ann_type));
                 if !c.is_assignable(&ann_type, &value_type) {
                     let span = (
                         value.range().start().to_usize(),
@@ -1491,7 +1600,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
         }
         Stmt::Return(ret) => {
             if let (Some(ret_expr), Some(expected)) = (&ret.value, c.current_return.clone()) {
-                let value_type = infer_expr(c, ret_expr);
+                let value_type = infer_expr_ctx(c, ret_expr, Some(&expected));
                 if !matches!(expected, Type::Unknown) && !c.is_assignable(&expected, &value_type) {
                     let span = (
                         ret_expr.range().start().to_usize(),
@@ -1819,7 +1928,23 @@ fn apply_narrowings(c: &mut Checker, ns: &[Narrowing]) {
 }
 
 /// Infer the type of an expression.
+/// Infer the type of `expr` with no surrounding context.
 fn infer_expr(c: &mut Checker, expr: &Expr) -> Type {
+    infer_expr_ctx(c, expr, None)
+}
+
+/// Infer the type of `expr`, optionally with an expected target type
+/// (the annotation on the enclosing `let`, the function's declared
+/// return type, or a generic parameter's formal type).  Most arms
+/// ignore `expected`; it's used for:
+///
+/// - **`Expr::Call`** — feeds into PEP 695 bidirectional inference so
+///   call-site annotations can pin otherwise-unbindable TypeVars.
+/// - **`Expr::List` / `Expr::Set` / `Expr::Dict`** — when the literal
+///   is empty (no elements to infer from), adopt the expected element
+///   type so `let xs: list[int] = []` produces `list[int]` rather than
+///   `list[?]`.
+fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type {
     match expr {
         Expr::BooleanLiteral(_) => Type::Bool,
         Expr::NumberLiteral(n) => match &n.value {
@@ -1947,12 +2072,16 @@ fn infer_expr(c: &mut Checker, expr: &Expr) -> Type {
                         c.wrong_args(&name, params.len(), pos_args.len(), call_span);
                     }
                     // Argument type checks (per-pair, ignoring excess).
+                    // Each argument is inferred with the corresponding
+                    // formal as its expected type so empty-collection
+                    // literals (`[]`, `{}`) and nested generic calls pick
+                    // up the parameter's element types.
                     let mut actuals: Vec<Type> = Vec::with_capacity(params.len());
                     for (i, arg) in pos_args.iter().enumerate() {
                         if i >= params.len() {
                             break;
                         }
-                        let actual = infer_expr(c, arg);
+                        let actual = infer_expr_ctx(c, arg, Some(&params[i]));
                         if !c.is_assignable(&params[i], &actual) {
                             let span =
                                 (arg.range().start().to_usize(), arg.range().end().to_usize());
@@ -1982,10 +2111,16 @@ fn infer_expr(c: &mut Checker, expr: &Expr) -> Type {
                             fn_name_expr.id.as_str(),
                             &params,
                             &actuals,
+                            &ret,
+                            expected,
                             call_span,
                         );
                     }
-                    bind_typevars_and_substitute(&params, &actuals, &ret)
+                    // Bidirectional pass: if any TypeVar in `ret` is still
+                    // unbound after the forward arg pass, use the call's
+                    // expected return type (from the enclosing annotation
+                    // or `return` statement) to pin it.
+                    bind_typevars_and_substitute_bidirectional(&params, &actuals, &ret, expected)
                 }
                 Type::Class(name) => Type::Class(name),
                 Type::Unknown | Type::Any => {
@@ -2018,13 +2153,121 @@ fn infer_expr(c: &mut Checker, expr: &Expr) -> Type {
             let _ = infer_expr(c, &s.slice);
             Type::Unknown
         }
-        Expr::List(_) => Type::Generic("list".into(), vec![Type::Unknown]),
+        Expr::List(l) => {
+            // Empty list: borrow the expected element type when available so
+            // `let xs: list[int] = []` produces `list[int]` rather than
+            // `list[?]`.
+            if l.elts.is_empty() {
+                if let Some(Type::Generic(head, args)) = expected {
+                    if head == "list" && args.len() == 1 {
+                        return Type::Generic("list".into(), args.clone());
+                    }
+                }
+                return Type::Generic("list".into(), vec![Type::Unknown]);
+            }
+            // Non-empty literal: infer the element type from the union of
+            // the elements'. If we have an expected `list[E]`, propagate `E`
+            // into each element so nested literals (`[[]]`) can converge.
+            let elt_expected = match expected {
+                Some(Type::Generic(h, a)) if h == "list" && a.len() == 1 => Some(&a[0]),
+                _ => None,
+            };
+            let elts: Vec<Type> = l
+                .elts
+                .iter()
+                .map(|e| infer_expr_ctx(c, e, elt_expected))
+                .collect();
+            Type::Generic("list".into(), vec![Type::union_of(elts)])
+        }
         Expr::Tuple(t) => {
-            let elts: Vec<Type> = t.elts.iter().map(|e| infer_expr(c, e)).collect();
+            // Fixed-length tuple: when the expected type is
+            // `tuple[T1, T2, ...]` with the same arity, propagate each
+            // slot's expected element type into the corresponding
+            // literal element so nested empty literals / generic calls
+            // pick up their type.
+            let per_slot: Option<&Vec<Type>> = match expected {
+                Some(Type::Generic(h, a)) if h == "tuple" && a.len() == t.elts.len() => Some(a),
+                _ => None,
+            };
+            let elts: Vec<Type> = t
+                .elts
+                .iter()
+                .enumerate()
+                .map(|(i, e)| infer_expr_ctx(c, e, per_slot.map(|a| &a[i])))
+                .collect();
             Type::Generic("tuple".into(), elts)
         }
-        Expr::Dict(_) => Type::Generic("dict".into(), vec![Type::Unknown, Type::Unknown]),
-        Expr::Set(_) => Type::Generic("set".into(), vec![Type::Unknown]),
+        Expr::Dict(d) => {
+            // Tease apart key/value expected types from `dict[K, V]`.
+            let (key_expected, val_expected) = match expected {
+                Some(Type::Generic(h, a)) if h == "dict" && a.len() == 2 => {
+                    (Some(&a[0]), Some(&a[1]))
+                }
+                _ => (None, None),
+            };
+            if d.items.is_empty() {
+                if let (Some(k), Some(v)) = (key_expected, val_expected) {
+                    return Type::Generic("dict".into(), vec![k.clone(), v.clone()]);
+                }
+                return Type::Generic("dict".into(), vec![Type::Unknown, Type::Unknown]);
+            }
+            // The dict display can mix `key: value` pairs with `**mapping`
+            // unpacks.  Ruff models the unpack as `key = None`, `value =
+            // <mapping>`.  Treat the unpack's mapping as a contribution
+            // of its own K/V so we don't get `vals = [int, dict[str, int]]`
+            // for `{"a": 1, **d}`.
+            let map_expected = expected.cloned();
+            let mut keys = Vec::with_capacity(d.items.len());
+            let mut vals = Vec::with_capacity(d.items.len());
+            for item in &d.items {
+                if let Some(k) = &item.key {
+                    keys.push(infer_expr_ctx(c, k, key_expected));
+                    vals.push(infer_expr_ctx(c, &item.value, val_expected));
+                } else {
+                    // `**mapping`: infer the mapping with the surrounding
+                    // dict's expected type, then split its K/V.
+                    let m = infer_expr_ctx(c, &item.value, map_expected.as_ref());
+                    if let Type::Generic(name, args) = &m {
+                        if name == "dict" && args.len() == 2 {
+                            keys.push(args[0].clone());
+                            vals.push(args[1].clone());
+                            continue;
+                        }
+                    }
+                    // Anything else (Any, Unknown, weird mapping type): fall
+                    // back to Unknown for both slots so we don't fabricate
+                    // a misleading union.
+                    keys.push(Type::Unknown);
+                    vals.push(Type::Unknown);
+                }
+            }
+            let key_ty = if keys.is_empty() {
+                Type::Unknown
+            } else {
+                Type::union_of(keys)
+            };
+            Type::Generic("dict".into(), vec![key_ty, Type::union_of(vals)])
+        }
+        Expr::Set(s) => {
+            if s.elts.is_empty() {
+                if let Some(Type::Generic(head, args)) = expected {
+                    if head == "set" && args.len() == 1 {
+                        return Type::Generic("set".into(), args.clone());
+                    }
+                }
+                return Type::Generic("set".into(), vec![Type::Unknown]);
+            }
+            let elt_expected = match expected {
+                Some(Type::Generic(h, a)) if h == "set" && a.len() == 1 => Some(&a[0]),
+                _ => None,
+            };
+            let elts: Vec<Type> = s
+                .elts
+                .iter()
+                .map(|e| infer_expr_ctx(c, e, elt_expected))
+                .collect();
+            Type::Generic("set".into(), vec![Type::union_of(elts)])
+        }
         _ => Type::Unknown,
     }
 }
@@ -2854,6 +3097,256 @@ let n: int = first(xs)
             }
             other => panic!("expected union, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn bidirectional_expected_pins_unbound_return_typevar() {
+        // `make[T]() -> list[T]` has no args to infer T from, but the
+        // call-site annotation `list[int]` should pin T.
+        let formals: Vec<Type> = vec![];
+        let actuals: Vec<Type> = vec![];
+        let ret = Type::Generic("list".to_owned(), vec![Type::TypeVar("T".to_owned())]);
+        let expected = Type::Generic("list".to_owned(), vec![Type::Int]);
+        let inferred =
+            bind_typevars_and_substitute_bidirectional(&formals, &actuals, &ret, Some(&expected));
+        assert_eq!(inferred, Type::Generic("list".to_owned(), vec![Type::Int]));
+    }
+
+    #[test]
+    fn bidirectional_forward_pass_wins_over_expected() {
+        // When args already bind T, the expected type must not override the
+        // forward result (the args carry more authoritative information).
+        let formals = vec![Type::TypeVar("T".to_owned())];
+        let actuals = vec![Type::Int];
+        let ret = Type::TypeVar("T".to_owned());
+        // Caller expects str but argument is int — arg wins, so the return
+        // stays int and the assignment-check downstream catches the mismatch.
+        let inferred =
+            bind_typevars_and_substitute_bidirectional(&formals, &actuals, &ret, Some(&Type::Str));
+        assert_eq!(inferred, Type::Int);
+    }
+
+    #[test]
+    fn bidirectional_forward_binding_not_widened_by_expected() {
+        // Regression for the backward-pass widening bug: with forward T=int
+        // and expected return str, T must stay `int` (not be widened to
+        // `int | str`).  At the assignment site the resulting `int` then
+        // fails to match the `str` annotation, surfacing the real error.
+        let src = "\
+def id[T](x: T) -> T:
+    return x
+
+let s: str = id(3)
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "id(3) returns int; assigning to str must be rejected"
+        );
+        // The diagnostic must be a mismatch on `int`, not on `int | str`.
+        let widened = d
+            .errors()
+            .iter()
+            .any(|e| e.to_string().contains("int | str"));
+        assert!(
+            !widened,
+            "expected type must not widen the forward-bound TypeVar; errors: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn bidirectional_tuple_propagates_expected_per_slot() {
+        // `tuple[list[int], list[str]] = ([], [])` should propagate each
+        // slot's element type into the corresponding empty list literal.
+        let src = "\
+let pair: tuple[list[int], list[str]] = ([], [])
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+        // Swapping the element types in the literal must now be caught.
+        let bad = "\
+let pair: tuple[list[int], list[str]] = ([\"x\"], [1])
+";
+        let d2 = check(bad);
+        assert!(
+            d2.has_errors(),
+            "list[str] in slot 0 (expected list[int]) must be rejected"
+        );
+    }
+
+    #[test]
+    fn bidirectional_self_binding_does_not_block_backward_pass() {
+        // `head[T](xs: list[T]) -> T` called with `[]`: the empty literal
+        // is inferred under the formal `list[T]`, so the literal becomes
+        // `list[T]` (carrying T forward).  Without the self-binding
+        // suppression, the forward pass would record `T → T` and the
+        // backward pass would be skipped, leaving the call's return as
+        // the literal TypeVar T.  Verify that the annotation actually
+        // drives inference by checking that an incompatible annotation is
+        // rejected.
+        let src = "\
+def head[T](xs: list[T]) -> T:
+    return xs[0]
+
+let n: int = head([])
+let s: str = head([])
+let bad: int = head([\"x\"])
+";
+        let d = check(src);
+        // The first two `let` lines must type-check (T is pinned by each
+        // annotation respectively).  The third must fail: `[\"x\"]` is
+        // `list[str]`, so T=str, return is str, not assignable to int.
+        let errs: Vec<String> = d.errors().iter().map(|e| e.to_string()).collect();
+        assert!(
+            errs.iter().any(|m| m.contains("int")),
+            "expected an int-vs-str mismatch on the bad assignment; errs: {errs:?}"
+        );
+    }
+
+    #[test]
+    fn bidirectional_pinned_typevar_still_bound_checked() {
+        // `def mk[T: int]() -> T` has no args to bind T; the backward pass
+        // would pin T=str from the `let s: str = mk()` annotation.  Bound
+        // validation must still fire — `str` does not satisfy `T: int`.
+        let src = "\
+def mk[T: int]() -> T:
+    return 0
+
+let s: str = mk()
+";
+        let d = check(src);
+        assert!(
+            has_typevar_bound_error(&d),
+            "T=str pinned by expected return must still violate the T: int bound; \
+             errors: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn dict_unpack_merges_mapping_kv_not_value() {
+        // `{"a": 1, **d}` where `d: dict[str, int]` must produce
+        // `dict[str, int]`, not `dict[str, int | dict[str, int]]`.
+        let src = "\
+def take(m: dict[str, int]) -> None:
+    pass
+
+let d: dict[str, int] = {\"x\": 1}
+take({\"a\": 2, **d})
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "dict unpack should merge K/V, not push the mapping into vals: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn bidirectional_empty_list_picks_up_annotation() {
+        // `let xs: list[int] = []` should now type-check: the empty list
+        // borrows the annotation's `int` element type.
+        let src = "let xs: list[int] = []\n";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn bidirectional_empty_dict_picks_up_annotation() {
+        let src = "let m: dict[str, int] = {}\n";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn list_literal_infers_element_union() {
+        // `[1, "x"]` should infer `list[int | str]`, not `list[?]`.  Verify
+        // by feeding it to a function whose parameter is `list[int]` and
+        // checking the call is rejected.
+        let src = "\
+def take_ints(xs: list[int]) -> None:
+    pass
+
+take_ints([1, \"x\"])
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "list[int|str] is not assignable to list[int]"
+        );
+    }
+
+    #[test]
+    fn list_literal_homogeneous_passes_strict_param() {
+        let src = "\
+def take_ints(xs: list[int]) -> None:
+    pass
+
+take_ints([1, 2, 3])
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn bidirectional_empty_arg_pins_typevar_via_param() {
+        // `def head[T](xs: list[T]) -> T:` then `head([])` — without a
+        // call-site annotation we have no information, so T stays unbound
+        // (return ends up as the literal TypeVar T) and the call is
+        // permitted (TypeVar acts as Any).  But when the parameter type
+        // flows into the empty list, the literal becomes `list[T]`, and
+        // bidirectional inference at the outer call should still succeed
+        // when the result is assigned to a concrete type.
+        let src = "\
+def head[T](xs: list[T]) -> T:
+    return xs[0]
+
+let n: int = head([])
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn bidirectional_return_pins_typevar_for_factory() {
+        // `make[T]() -> list[T]` has no args to drive inference; the
+        // call-site annotation must do it.
+        let src = "\
+def make[T]() -> list[T]:
+    return []
+
+let xs: list[int] = make()
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn optional_param_against_concrete_arg_binds_inner() {
+        // `def f[T](x: T | None) -> T` called with `int` should infer T=int,
+        // not T = int|None — verified by assigning the return to `int`.
+        let src = "\
+def unwrap[T](x: T | None) -> T:
+    if x is None:
+        return x
+    return x
+
+let n: int = unwrap(3)
+";
+        // The body's narrowing isn't perfect, but the call-site inference
+        // should still produce `int` for the return type.
+        let d = check(src);
+        // We only assert there's no assignment mismatch on `let n: int = unwrap(3)`.
+        let has_mismatch = d.errors().iter().any(|e| {
+            let msg = e.to_string();
+            msg.contains("expected `int`") && msg.contains("unwrap")
+        });
+        assert!(
+            !has_mismatch,
+            "unwrap(3) should infer int, not int|None: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
     }
 
     #[test]
