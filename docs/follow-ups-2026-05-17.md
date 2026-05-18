@@ -10,7 +10,7 @@ phase status.
 | Area | Change |
 |---|---|
 | Syntax | Module-level `lazy let NAME: T = expr` lowers to `lazy_val(lambda: expr)`; class-body `lazy let` lowers to `@cached_property`. Both round-trip through `tyc fmt`. |
-| Syntax | `extend BUILTIN:` is rejected at preprocess time with a dedicated `tyc::extend_builtin` diagnostic; user-defined classes still flow through `impl`-merge. |
+| Syntax | `extend BUILTIN:` is rejected at preprocess time with a dedicated `tyc::extend_builtin` diagnostic; user-defined classes still flow through `impl`-merge. *(Update: built-in extensions have since landed — `extract_builtin_extensions` lowers each method to a free function and rewrites annotated call sites. The `validate_extend_usage` validator is now a no-op kept for back-compat with the diagnostic enum.)* |
 | Types | `unsafe:` blocks now bump `Checker::unsafe_depth` via preprocess line metadata; type-mismatch, nullable-use, interface-isinstance, wrong-arg-count, not-callable, and non-exhaustive-match diagnostics are dropped inside the block. Errors on lines outside the block are unaffected. |
 | Types | `Type::TypeVar(name)` replaces `Type::Any` for PEP 695 type parameters in signatures; call-site `bind_typevars_and_substitute` infers bindings (recursively, with conflict-widening) and substitutes them in the return type. |
 | CLI | `tyc trace` reads `.py.map` sidecars emitted by `tyc build` and rewrites `File "…/foo.py", line N` traceback entries to point at the original `.ty`. |
@@ -27,29 +27,30 @@ all pass.
 
 ## Deliberately deferred
 
-### Ruff parser fork
+### Ruff parser fork — ✅ landed since this sprint
 
-Still on `rustpython-parser` 0.4 from crates.io.  The fork is a
-multi-day effort even with focused scope: vendor
-`ruff_python_parser` + `ruff_python_ast` + the small slice of
-`ruff_text_size` they need, add the two extension tokens (`let`,
-`mut`), get the `ruff_python_codegen` round-trip working on a
-representative corpus, then swap the dependency across every
-consumer crate.  Attempting it in this session would have produced
-an incomplete vendor tree, broken parsing, and a long red CI.
+This follow-up has been resolved. `ruff_python_parser`,
+`ruff_python_ast`, `ruff_python_trivia`, `ruff_source_file`, and
+`ruff_text_size` are vendored under `tyc/vendor/` with `let`/`mut`
+soft-keyword support and a `Mutability` field on assignment AST
+nodes. Every consumer crate now parses through
+`tyc_syntax::parse_module`; the `rustpython-parser` dependency has
+been removed. See `tyc/vendor/README.md` for the migration record.
 
-What we have today: hand-written `tyc-emit` printer covers the
-Python subset used by every emitted file, all current tests pass,
-and the preprocessor handles the Typhon-specific keyword surface.
-The fork is therefore an optimisation/cleanup project, not a
-blocker.
+`ruff_python_codegen` was *not* vendored — `tyc-emit` retains its
+hand-written printer because upstream codegen does not expose the
+per-statement line-offset hook required for `.py.map` source maps.
+Vendoring it remains an open optional follow-up.
 
-### Auto-gather inference and loop parallelisation
+### Auto-gather inference and loop parallelisation — ✅ landed since this sprint
 
-Phase 4 features in the long-term plan.  Both require interaction
-with the purity engine (already landed) and the type checker to
-prove that the candidate region is safe — fundamentally new
-analysis passes, not local tweaks.  Not attempted in this sprint.
+Both have shipped behind `[strictness]` opt-ins. Straight-line
+independent `await` runs inside an `async def` fold into an
+`asyncio.TaskGroup` when `auto-gather = true`; pure list
+comprehensions over an iterable that meets `parallel-min-size`
+rewrite to a thread-pool map when `auto-parallel = true`. Both
+respect the six-condition purity check and only fire when the
+candidate region is statically safe.
 
 ### PEP 695 inference depth
 
@@ -60,15 +61,14 @@ considerations, and higher-kinded forms are not handled — the
 engine still treats those positions permissively.  Multi-stmt
 inference across helper calls also remains an aspiration.
 
-### Source-map line accuracy
+### Source-map line accuracy — ✅ landed since this sprint
 
-`.py.map` records the source path only; line offsets are forwarded
-1:1.  Most preprocessing preserves line counts (let/mut, comptime,
-lazy let, optional sugar), but `with`-chains, `gather:`, and `?`
-propagation emit multiple Python lines from one Typhon line, so
-tracebacks pointing at those constructs may report a line offset
-by a small amount.  A proper line-array map (à la JS source maps
-v3) lands later.
+The printer now records a per-statement `line_offsets` table while
+emitting; `.py.map` v2 stores a `(out_line → ty_line)` mapping that
+`tyc trace` reads to rewrite tracebacks at line granularity, even
+across multi-line expansions (`with`-chains, `gather:`, `?`
+propagation). The format is JS-source-maps-v3-shaped enough for the
+LSP's cross-file go-to-definition path to consume it too.
 
 ### Runtime stubtest probe
 
@@ -81,14 +81,19 @@ delete, signature change).
 
 ## Recommended next steps, in order
 
-1. Vendor the Ruff parser fork.  The longer it slides, the more
-   workarounds accumulate in `tyc-syntax/preprocess.rs`.
-2. Promote `bind_typevars_and_substitute` into a structural
-   sub-type checker.  The substitution table is the right
-   anchor for `where T: SomeInterface` once it lands.
-3. Expand the source-map format to a `(out_line → ty_line)`
-   table emitted from the printer.  `tyc trace` already uses the
-   file once it exists; the missing piece is the writer.
-4. Replace the documents cache in `tyc-lsp` with a salsa-tracked
-   per-file input so hover/definition share the same incremental
-   db as `check_file`.
+> **Update (May 2026):** items 1, 3, and 4 below have all landed.
+> The current list of open follow-ups is:
+
+1. Promote `bind_typevars_and_substitute` into a full structural
+   sub-type checker. Bounded type-var checking and basic
+   conformance now use the substitution table; variance and
+   higher-kinded forms remain partial.
+2. Vendor `ruff_python_codegen` to replace `tyc-emit/src/printer.rs`,
+   preserving the `line_offsets` hook the hand-written printer
+   exposes today (see `tyc/vendor/README.md`).
+3. Runtime `stubtest` probe via `mypy --stubtest` as a complement
+   to the AST-level `tyc check --stubs` diff. Catches dynamically
+   created members the AST cannot see.
+4. `ty` integration as a complementary second-stage checker (see
+   `docs/ty-integration.md`).
+5. Richer comptime: `comptime` functions, types as values.

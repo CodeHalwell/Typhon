@@ -40,10 +40,12 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 ## Phase 3 — Structural typing and advanced features ✅ complete (subset)
 
 - ✅ **Generics syntax decision locked** (PEP 695). The parser accepts
-  `def f[T](x: T)` and `type Vector[T] = ...` directly via `rustpython-parser`;
-  the resolver declares type params into the function/class scope and the
-  emitter round-trips the `[T]` syntax. Type inference treats `T` as `Any`
-  until a proper bidirectional inference engine lands.
+  `def f[T](x: T)` and `type Vector[T] = ...` directly via the vendored Ruff
+  parser; the resolver declares type params into the function/class scope and
+  the emitter round-trips the `[T]` syntax. Bidirectional inference binds
+  typevars from actual arguments (recursively, with conflict-widening) and
+  substitutes them in the return type; bounded-type-var checking is in place.
+  Full variance and higher-kinded forms are deferred.
 - ✅ **Interface declarations** (`interface Name:` → `class Name(Protocol):`)
   with structural conformance check on assignment: a class is assignable to
   an interface only when its member shape covers every required member.
@@ -73,19 +75,25 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 - ✅ **Lazy imports** — `lazy import np = numpy` lowers to a thread-safe
   proxy class generated inline by `expand_lazy_imports` (double-checked
   locking, no runtime helper dependency). `lazy from x import …` is rejected
-  because it defeats deferral. Module-level `lazy let NAME: T = expr` and
-  instance-level `cached_property` are deferred — the syntax pipeline does
-  not yet recognise them.
+  because it defeats deferral. Module-level `lazy let NAME: T = expr` lowers
+  to a sentinel-cached `lazy_val(lambda: expr)`; class-body `lazy let` lowers
+  to `@cached_property`. Both round-trip through `tyc fmt`.
 - ✅ **Pipe operator** `a |> f |> g(arg)` lowered to `g(f(a), arg)` left-
   associatively. Guards in `match` cases pass through to Python directly.
-- ✅ **`extend`** keyword for adding methods to user-defined classes — an
-  alias for `impl` in v1; extension on built-in types is deferred until a
-  type-aware call-site rewriter lands.
+- ✅ **`extend`** keyword for adding methods to user-defined classes
+  (alias for `impl`) and for the recognised Python built-ins (`str`,
+  `list`, `dict`, …). Built-in extensions are extracted to module-level
+  free functions `__typhon_ext_<TYPE>__<METHOD>` at desugar time, and
+  call sites are rewritten when the receiver has a matching static
+  annotation. No monkey-patching of built-ins.
 - ✅ **`.dty` stub files** with `.pyi` interop emission — every `.dty` next to
   the project is compiled to a PEP 561 `.pyi` (function/method bodies become
   `...`, plain `Assign` is dropped, annotated fields are kept). `tyc check
-  --stubs` validates that every `.dty` parses, resolves, and type-checks;
-  the full mypy-`stubtest` runtime diff is deferred.
+  --stubs` parses every `.dty` and diffs its surface API (functions, classes,
+  methods, annotated fields, parameter shapes) against the sibling `.ty`/`.py`
+  implementation, emitting `tyc::stub_mismatch` diagnostics for
+  missing-in-impl / missing-in-stub / signature-mismatch findings. A runtime
+  introspection probe (mypy's `stubtest` proper) is still a follow-up.
 
 At the end of Phase 3, Typhon is useful for a real backend or CLI project.
 Everything beyond is polish and ambition.

@@ -133,9 +133,7 @@ numpy.array(...)
 lazy let CONFIG: Config = load_config_from_disk()
 ```
 
-This lowers to a cached getter with a sentinel + lock helper. First access pays the load cost; subsequent accesses are a memory read. Unlike `functools.cached_property` (which is instance-scoped, race-prone, and writable after first evaluation), the Typhon helper is robust under concurrency and one-shot.
-
-> Note: module-level `lazy let` is currently deferred — the syntax pipeline does not yet recognise it. Instance-level `lazy let` on effectively immutable classes lowers to `functools.cached_property`.
+This lowers to a sentinel-cached `lazy_val(lambda: load_config_from_disk())` helper emitted into `typhon_runtime`. First access pays the load cost; subsequent accesses are a memory read. Unlike `functools.cached_property` (which is instance-scoped, race-prone, and writable after first evaluation), the module-level helper is robust under concurrency and one-shot. Inside a class body, `lazy let` lowers to `@cached_property` because the per-instance scope is the intended semantics there.
 
 ### `lazy` return types
 
@@ -275,14 +273,9 @@ The `Redis` class corresponds to whatever the underlying `redis-py` exposes. Ins
 - Names present at runtime but missing in the stub.
 - Signature mismatches between stub and implementation.
 
-Configure severity in `typhon.toml`:
+Drift surfaces as `tyc::stub_mismatch` diagnostics with the standard severity wiring. For an in-tree implementation (you wrote both the `.ty` and the stub), drift is a code-review fail. For third-party stubs, drift means the library was upgraded; update the stub and re-check.
 
-```toml
-[strictness]
-stub-check = "error"   # or "warn" / "off"
-```
-
-For an in-tree implementation (you wrote both the `.ty` and the stub), drift is a code-review fail. For third-party stubs, drift means the library was upgraded; update the stub and re-check.
+> A configurable `stub-check` severity knob is on the roadmap but not yet wired into `typhon.toml`. Today drift uses the default diagnostic severity.
 
 ## Putting it together
 
