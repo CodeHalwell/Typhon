@@ -105,7 +105,11 @@ pub fn run(args: RunArgs) -> Result<()> {
     if !args.no_build {
         build::run(BuildArgs {
             path: args.path.clone(),
-            out: if args.temp { Some(out_dir.clone()) } else { None },
+            out: if args.temp {
+                Some(out_dir.clone())
+            } else {
+                None
+            },
             no_format: false,
         })?;
     }
@@ -160,7 +164,11 @@ mod tests {
     #[test]
     fn script_args_pass_through_after_double_dash() {
         let parsed = <WrapRun as clap::Parser>::try_parse_from([
-            "run", "--", "--flag", "value", "positional",
+            "run",
+            "--",
+            "--flag",
+            "value",
+            "positional",
         ])
         .unwrap();
         assert_eq!(
