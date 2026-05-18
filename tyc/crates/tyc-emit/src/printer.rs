@@ -5,7 +5,7 @@
 //! input (whitespace and comment differences are acceptable in Phase 0).
 
 use ruff_python_ast::{
-    Alias, BoolOp, CmpOp, Comprehension, ExceptHandler, Expr, FStringPart,
+    self as ast, Alias, BoolOp, CmpOp, Comprehension, ExceptHandler, Expr, FStringPart,
     InterpolatedStringElement, Keyword, MatchCase, ModModule, Mutability, Number, Operator,
     Parameter, ParameterWithDefault, Parameters, Pattern, Singleton, Stmt, TypeParam, TypeParams,
     UnaryOp, WithItem,
@@ -36,6 +36,13 @@ pub struct Emitter {
     /// extra blank line.  Reset to `false` after emitting a non-block stmt
     /// at indent 0.
     prev_top_level_was_block: bool,
+    /// Stack of outer-quote characters for currently-active f-strings. When
+    /// we emit a `StringLiteral` while one is non-empty, the literal must
+    /// be wrapped in a quote character that differs from the f-string's
+    /// outer delimiter so PEP 701 nesting works on 3.11/3.12 and isn't
+    /// ambiguous on 3.13+. Tracked as a stack so nested f-strings
+    /// (`f"{ f'{x}' }"`) compose correctly.
+    fstring_quote_stack: Vec<char>,
 }
 
 const INDENT_WIDTH: usize = 4;
@@ -49,6 +56,7 @@ impl Emitter {
             line_offsets: Vec::new(),
             suppress_mutability: false,
             prev_top_level_was_block: false,
+            fstring_quote_stack: Vec::new(),
         }
     }
 
@@ -876,21 +884,63 @@ impl Emitter {
             // Each part is either a literal `StringLiteral` or an `FString`
             // whose elements are interleaved literal/interpolation pieces.
             Expr::FString(fs) => {
-                self.write("f\"");
+                // Pick an outer quote that won't collide with any nested
+                // same-quoted string literal inside the interpolations.
+                // Default to `"` and only flip if we'd produce invalid
+                // Python 3.11 output otherwise. This is the same strategy
+                // Black uses for f-string formatting.
+                let outer = pick_fstring_outer_quote(fs);
+                self.fstring_quote_stack.push(outer);
+                self.write("f");
+                self.write(&outer.to_string());
                 for part in fs.value.iter() {
                     match part {
                         FStringPart::Literal(lit) => {
-                            self.write(&escape_python_string(lit.as_str()));
+                            self.write(&escape_python_string_with_quote(lit.as_str(), outer));
                         }
                         FStringPart::FString(inner) => {
                             for elem in &inner.elements {
                                 match elem {
                                     InterpolatedStringElement::Literal(lit) => {
-                                        self.write(&escape_python_string(&lit.value));
+                                        self.write(&escape_python_string_with_quote(
+                                            &lit.value, outer,
+                                        ));
                                     }
                                     InterpolatedStringElement::Interpolation(interp) => {
                                         self.write("{");
                                         self.emit_expr(&interp.expression);
+                                        // Emit `!r` / `!s` / `!a` conversion flags
+                                        // — these are stripped by default by the
+                                        // AST but carried on the `conversion`
+                                        // field. Losing them silently changes
+                                        // runtime output of `f"{x!r}"` etc.
+                                        if let Some(c) = interp.conversion.to_char() {
+                                            self.write("!");
+                                            self.write(&c.to_string());
+                                        }
+                                        // Emit `:FORMAT_SPEC` — the spec is
+                                        // itself a mini-f-string that may
+                                        // contain further interpolations
+                                        // (`f"{n:>{width}}"`).
+                                        if let Some(spec) = &interp.format_spec {
+                                            self.write(":");
+                                            for spec_elem in &spec.elements {
+                                                match spec_elem {
+                                                    InterpolatedStringElement::Literal(lit) => {
+                                                        self.write(&escape_python_string_with_quote(
+                                                            &lit.value, outer,
+                                                        ));
+                                                    }
+                                                    InterpolatedStringElement::Interpolation(
+                                                        nested,
+                                                    ) => {
+                                                        self.write("{");
+                                                        self.emit_expr(&nested.expression);
+                                                        self.write("}");
+                                                    }
+                                                }
+                                            }
+                                        }
                                         self.write("}");
                                     }
                                 }
@@ -898,7 +948,8 @@ impl Emitter {
                         }
                     }
                 }
-                self.write("\"");
+                self.write(&outer.to_string());
+                self.fstring_quote_stack.pop();
             }
 
             // PEP 750 template strings — Phase 0 falls back to f-string-like
@@ -945,9 +996,21 @@ impl Emitter {
             },
 
             Expr::StringLiteral(s) => {
-                self.write("\"");
-                self.write(&escape_python_string(s.value.to_str()));
-                self.write("\"");
+                // Inside an f-string interpolation, a nested string literal
+                // must use a different quote delimiter than the enclosing
+                // f-string. Python 3.12+ (PEP 701) permits identical-quote
+                // nesting, but 3.11 doesn't, and the universal-quote-style
+                // form is what Black/ruff emit. Track the active outer
+                // quote(s) in `fstring_quote_stack`.
+                let outer = self.fstring_quote_stack.last().copied();
+                let quote = match outer {
+                    Some('"') => '\'',
+                    Some('\'') => '"',
+                    _ => '"',
+                };
+                self.write(&quote.to_string());
+                self.write(&escape_python_string_with_quote(s.value.to_str(), quote));
+                self.write(&quote.to_string());
             }
 
             Expr::BytesLiteral(b) => {
@@ -1442,11 +1505,21 @@ fn expr_precedence(expr: &Expr) -> u8 {
 /// escapes (`\n`, `\r`, `\t`), and other ASCII control characters via
 /// `\xNN`.
 fn escape_python_string(s: &str) -> String {
+    escape_python_string_with_quote(s, '"')
+}
+
+/// Escape a Python string literal for output between the given quote
+/// character. Only the *active* quote is backslash-escaped — the opposite
+/// quote can appear verbatim, matching Black's quote-style policy.
+fn escape_python_string_with_quote(s: &str, quote: char) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
             '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
@@ -1457,6 +1530,61 @@ fn escape_python_string(s: &str) -> String {
         }
     }
     out
+}
+
+/// Choose an outer-quote character for an f-string so nested same-quoted
+/// string literals don't collide with the delimiter on Python 3.11. We
+/// scan every interpolation's expression tree for string literals; if any
+/// already contains `"`, we use `'` for the outer instead. Conservative:
+/// when both styles appear, we prefer `"` and let the inner-literal pass
+/// flip its quote (the universal Black/ruff convention).
+fn pick_fstring_outer_quote(fs: &ast::ExprFString) -> char {
+    use ast::visitor::source_order::{walk_expr, SourceOrderVisitor};
+
+    struct Probe {
+        needs_double: bool,
+        needs_single: bool,
+    }
+    impl<'a> SourceOrderVisitor<'a> for Probe {
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            if let Expr::StringLiteral(s) = expr {
+                let v = s.value.to_str();
+                if v.contains('"') {
+                    self.needs_double = true;
+                }
+                if v.contains('\'') {
+                    self.needs_single = true;
+                }
+            }
+            walk_expr(self, expr);
+        }
+    }
+
+    let mut probe = Probe {
+        needs_double: false,
+        needs_single: false,
+    };
+    for part in fs.value.iter() {
+        if let FStringPart::FString(inner) = part {
+            for elem in &inner.elements {
+                if let InterpolatedStringElement::Interpolation(interp) = elem {
+                    probe.visit_expr(&interp.expression);
+                    if let Some(spec) = &interp.format_spec {
+                        for spec_elem in &spec.elements {
+                            if let InterpolatedStringElement::Interpolation(nested) = spec_elem {
+                                probe.visit_expr(&nested.expression);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Prefer `"`; flip to `'` only if a nested literal already needs `"`.
+    match (probe.needs_double, probe.needs_single) {
+        (true, false) => '\'',
+        _ => '"',
+    }
 }
 
 #[cfg(test)]

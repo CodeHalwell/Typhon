@@ -1673,6 +1673,13 @@ Workaround: `for pair in xs: let i: int = pair[0]; let s: str = pair[1]`
 
 ## 41. F-string format specs and conversions are stripped (bug, critical)
 
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. The
+`Expr::FString` arm in `tyc-emit/src/printer.rs` now walks each
+`InterpolatedElement`'s `conversion` flag (`!r` / `!s` / `!a`) and
+`format_spec` (a nested mini-f-string supporting interpolations like
+`f"{n:>{width}}"`). Verified: `f"{n:03d}"` → `005`, `f"{n!r}"` → `5`,
+`f"{pi:.2f}"` → `3.14`, `f"{s:>10}"` → `        hi`.
+
 **Severity:** bug — critical; emitter loses information.
 
 ```ty
@@ -1710,6 +1717,14 @@ formatting, every log line that pads/aligns, every CLI tool that uses
 ---
 
 ## 42. F-string nested same-quoted strings emit malformed Python (bug)
+
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. The
+printer now (1) tracks an `fstring_quote_stack` so a `StringLiteral`
+emitted inside an interpolation auto-flips to the opposite quote
+character, and (2) calls `pick_fstring_outer_quote` to choose the outer
+`"`/`'` delimiter based on the literals that appear in any
+interpolation expression. `f"{'name':<10}={'value':>5}"` now emits
+unchanged on the Typhon side and runs cleanly on Python 3.11 and 3.13.
 
 **Severity:** bug — output fails to parse on 3.11; ambiguous on 3.12+.
 
