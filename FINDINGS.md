@@ -333,6 +333,14 @@ the type safety that motivated the annotation in the first place.
 
 ## 8. `nullable_use` and `type_mismatch` double-fire for the same call (papercut)
 
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. The arg-type loop
+in `infer_expr_ctx`'s `Expr::Call` arm now branches: when the actual is
+nullable and the parameter is not, it emits `nullable_use` exclusively
+(skipping the redundant `type_mismatch` on the same span). The
+fallback for non-name args (e.g. `greet(find())`) still emits
+`type_mismatch` because there's no identifier to anchor a
+`nullable_use` diagnostic at.
+
 **Severity:** papercut — noisy diagnostics.
 
 ```ty
@@ -947,6 +955,14 @@ document loudly that `tyc build --check` is the real CI gate.
 
 ## 29. Comptime evaluator supports far less than documented (gap, big)
 
+**Status:** **FIXED (docs)** on `claude/update-findings-IdfrH`. Rewrote
+the SKILL.md comptime section to reflect what `tyc-analyse` actually
+supports (literal types + arithmetic + comparisons + `env` / `int` /
+`str` / `float`), and flagged container literals, string method calls,
+and user-defined `comptime def` evaluation as roadmapped-but-not-yet
+work. The evaluator itself wasn't expanded here — that's a meatier
+follow-up; the docs are now honest about the gap.
+
 **Severity:** gap — docs over-promise; implementation does the minimum.
 
 Skill / language.md says:
@@ -1144,6 +1160,13 @@ Right now we have the worst of both.
 ---
 
 ## 35. Doc-spec'd `auto-gather` requires undocumented `@gatherable` decorator (doc)
+
+**Status:** **FIXED (docs)** on `claude/update-findings-IdfrH`. The
+SKILL.md "Automatic `gather`" section now includes a worked example
+showing `@gatherable` on each callee, and explicitly notes that
+forgetting the decorator silently disables auto-gather (no diagnostic
+fires). Adding a `tyc::auto_gather_missed` info-level diagnostic is
+left as a separate follow-up.
 
 **Severity:** doc — opt-in works but the decorator's *existence* is
 the gate, and it's barely described.

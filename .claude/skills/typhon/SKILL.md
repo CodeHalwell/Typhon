@@ -442,6 +442,23 @@ Lowers to `asyncio.gather(..., return_exceptions=True)`.
 
 `[strictness] auto-gather = true` rewrites straight-line runs of independent `name = await callee(...)` into a `TaskGroup`, **but only when every callee is a same-module `async def` carrying `@gatherable`** and the LHS bindings don't alias. Imported async callees are left untouched so you cannot surprise upstream callers.
 
+The `@gatherable` decorator is the gate — without it, auto-gather is a no-op for that callee:
+
+```python
+@gatherable                          # opts this function in to auto-gather
+async def fetch_user(uid: int) -> User: ...
+
+@gatherable
+async def fetch_posts(uid: int) -> list[Post]: ...
+
+async def load(uid: int) -> Dashboard:
+    let user = await fetch_user(uid)     # rewritten into a TaskGroup …
+    let posts = await fetch_posts(uid)   # … because both callees are @gatherable
+    return Dashboard(user=user, posts=posts)
+```
+
+There is no diagnostic when a callee lacks `@gatherable` — the awaits just stay sequential. If you forget to decorate, you'll see no parallelism *and* no error. Run `tyc trace` or read the emitted Python to confirm whether a particular run got rewritten.
+
 ### `go` — fire-and-forget
 
 ```python
@@ -514,10 +531,12 @@ comptime let PORT: int = int(env("PORT", "8080"))
 comptime let DB_URL: str = env("DATABASE_URL")   # build fails if unset
 comptime let IS_PROD: bool = env("BUILD_TAG", "dev") == "prod"
 
+# User-defined `comptime def` functions parse today but the evaluator
+# can't yet inline calls to them — only the built-in `env()`, `int()`,
+# `str()`, `float()`, and arithmetic / comparison primitives are
+# supported. Listed here as the intended surface.
 comptime def feature(name: str) -> bool:
     return env(f"FEATURE_{name.upper()}", "0") == "1"
-
-comptime let DARK_MODE: bool = feature("dark_mode")
 ```
 
 Declare required env vars in `typhon.toml`:
@@ -527,7 +546,7 @@ Declare required env vars in `typhon.toml`:
 required = ["DATABASE_URL"]
 ```
 
-The sandbox allows: pure arithmetic, string ops, `env(name, default?)`, `list`/`dict`/`tuple` construction, calls to other `comptime` functions. It forbids: I/O, subprocess, network, random/time, arbitrary imports.
+The sandbox is intentionally tight. Today it supports: integer / float / string / boolean literals, basic arithmetic (`+ - * / //` and the comparable comparison ops), `env("NAME")` / `env("NAME", "default")`, and the `int()` / `str()` / `float()` casts. Container literals (`[...]`, `{...}`, `(...)`), method calls on strings (`"hi".upper()`), and user-defined `comptime def` functions are roadmapped but not yet evaluable. Anything else — I/O, subprocess, network, `random` / `time`, arbitrary imports — is permanently out of scope.
 
 Emitted Python sees only the inlined literal:
 

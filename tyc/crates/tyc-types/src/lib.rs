@@ -2289,21 +2289,34 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                             break;
                         }
                         let actual = infer_expr_ctx(c, arg, Some(&params[i]));
-                        if !c.is_assignable(&params[i], &actual) {
-                            let span =
-                                (arg.range().start().to_usize(), arg.range().end().to_usize());
-                            c.mismatch(&params[i], &actual, span);
-                        }
-                        // Specifically reject possibly-None args bound to a
-                        // non-nullable parameter.
-                        if !params[i].is_nullable() && actual.is_nullable() {
+                        // Check the nullable-use case first: when the actual
+                        // is nullable and the parameter is not, `nullable_use`
+                        // is the more helpful diagnostic — it points at the
+                        // narrowing fix (`if x is not None:` / `guard`).
+                        // Emitting `type_mismatch` alongside would just be
+                        // noise on the same span (FINDINGS #8). Only emit the
+                        // type_mismatch when nullable_use isn't going to fire.
+                        let nullable_into_non_nullable =
+                            !params[i].is_nullable() && actual.is_nullable();
+                        if nullable_into_non_nullable {
                             if let Expr::Name(n) = arg {
                                 let span = (
                                     n.range.start().to_usize(),
                                     n.range.start().to_usize() + n.id.as_str().len(),
                                 );
                                 c.nullable_use(n.id.as_str(), &params[i], span);
+                            } else {
+                                // Non-name arg (e.g. `greet(find())`) — no
+                                // identifier to point at, fall back to the
+                                // generic mismatch diagnostic.
+                                let span =
+                                    (arg.range().start().to_usize(), arg.range().end().to_usize());
+                                c.mismatch(&params[i], &actual, span);
                             }
+                        } else if !c.is_assignable(&params[i], &actual) {
+                            let span =
+                                (arg.range().start().to_usize(), arg.range().end().to_usize());
+                            c.mismatch(&params[i], &actual, span);
                         }
                         actuals.push(actual);
                     }
