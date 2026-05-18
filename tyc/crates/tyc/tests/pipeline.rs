@@ -731,11 +731,20 @@ def parse(s: str) -> Result[int, str]:
     assert!(py_path.exists(), "main.py should exist");
     assert!(map_path.exists(), "main.py.map should exist");
 
-    // Read the actual emitted Python to find a line number in the expanded block.
+    // Scan the emitted Python for a line injected by the `?` expansion
+    // (`__typhon_q_N__`) so we don't hardcode a brittle line number.
     let py_src = std::fs::read_to_string(&py_path).unwrap();
-    // The `?` expansion injects result-handling lines; pick Python line 2 as a
-    // representative frame inside the function body (1-indexed).
-    let frame_py_line: u32 = 2;
+    let frame_py_line: u32 = py_src
+        .lines()
+        .enumerate()
+        .find_map(|(i, l)| {
+            if l.contains("__typhon_q_") {
+                Some((i + 1) as u32)
+            } else {
+                None
+            }
+        })
+        .expect("emitted Python should contain a __typhon_q_ variable from ? expansion");
 
     let tb = format!(
         "Traceback (most recent call last):\n  File \"{}\", line {}, in parse\n",
@@ -757,9 +766,8 @@ def parse(s: str) -> Result[int, str]:
         !stdout.contains("main.py\""),
         ".py path should be replaced in trace output; got: {stdout}"
     );
-    // We don't assert on the exact line number because the `?` expansion
-    // shifts lines — the important thing is that the path rewrite worked.
-    let _ = py_src; // used to make the variable non-dead
+    // We don't assert on the exact remapped line number because the `?`
+    // expansion shifts lines — the important thing is that the path rewrite worked.
 }
 
 #[test]
