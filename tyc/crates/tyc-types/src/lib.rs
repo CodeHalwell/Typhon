@@ -879,7 +879,10 @@ impl<'a> Checker<'a> {
         for (formal, actual) in formal_params.iter().zip(actual_args.iter()) {
             bind_typevars(formal, actual, &mut bindings);
         }
-        for (tv_name, inferred) in &bindings {
+        let mut tv_names: Vec<&String> = bindings.keys().collect();
+        tv_names.sort();
+        for tv_name in tv_names {
+            let inferred = &bindings[tv_name];
             if let Some(bound) = bounds.get(tv_name) {
                 if !self.is_assignable(bound, inferred) {
                     self.typevar_bound_violation(
@@ -2701,10 +2704,13 @@ let n: str = first(xs)
     // ── TypeVar bound checking ────────────────────────────────────────────────
 
     #[test]
-    fn typevar_bound_satisfied_by_conforming_class() {
-        // `def f[T: Animal](x: T)` called with a value of class `Dog` — if
-        // `Dog` conforms to `Animal` (same declared class name here), no
-        // diagnostic should fire.
+    fn typevar_bound_subclass_without_structural_check_emits_violation() {
+        // `def f[T: Animal](x: T)` called with `Dog` — in our nominal-only
+        // checker `Dog` is a distinct class from `Animal`, so it does NOT
+        // satisfy the `T: Animal` bound and a diagnostic is expected.
+        // This test documents the current behaviour; full subtype checking
+        // (where Dog extends Animal counts as satisfying the bound) is a
+        // future improvement.
         let src = "\
 class Animal:
     pass
@@ -2719,13 +2725,12 @@ let d: Dog = Dog()
 let r: Dog = f(d)
 ";
         let d = check(src);
-        // The type system accepts Dog as a class type; bound check should not
-        // fire when the actual class matches the bound exactly or is the bound.
-        // (Dog is not a subtype of Animal in our nominal system, so this
-        // emits a bound violation — that is correct and expected today given
-        // our nominal-only checker.)
-        // The important check: the function call itself is parsed and checked.
-        let _ = d; // smoke test: must not panic
+        assert!(
+            has_typevar_bound_error(&d),
+            "nominal-only checker: Dog does not satisfy T: Animal bound; expected a \
+             typevar_bound diagnostic; errors: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
     }
 
     fn has_typevar_bound_error(d: &Diagnostics) -> bool {
