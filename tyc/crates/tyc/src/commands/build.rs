@@ -9,8 +9,12 @@ use std::path::PathBuf;
 
 use clap::Args;
 use miette::{miette, Result};
-use rustpython_ast::{text_size::TextRange, Constant, Expr, ExprConstant, Mod, Stmt};
-use rustpython_parser::{parse, Mode};
+use ruff_python_ast::{
+    AtomicNodeIndex, Expr, ExprStringLiteral, ModModule, Stmt, StringLiteral, StringLiteralFlags,
+    StringLiteralValue,
+};
+use ruff_python_parser::parse_expression;
+use ruff_text_size::TextRange;
 
 use tyc_analyse::{
     analyse_purity, collect_gatherable_async_fn_names, evaluate_comptime, load_profile_samples,
@@ -183,12 +187,9 @@ pub fn run(args: BuildArgs) -> Result<()> {
         ))));
         let prep = preprocess(&expanded);
 
-        let module = parse(
-            &prep.python_source,
-            Mode::Module,
-            &path.display().to_string(),
-        )
-        .map_err(|e| miette!("parse error in '{}': {e}", path.display()))?;
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .map(|p| p.into_syntax())
+            .map_err(|e| miette!("parse error in '{}': {e}", path.display()))?;
 
         // Evaluate all `comptime` bindings and substitute their literals into
         // the AST before desugaring.
@@ -264,13 +265,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // the qualified `asyncio.TaskGroup` reference and injects
         // `import asyncio` if it isn't already in scope, so no extra
         // wiring is needed here.
-        let module = if config.strictness.auto_gather {
+        let mut module = module;
+        if config.strictness.auto_gather {
             let eligible = collect_gatherable_async_fn_names(&module);
-            let (rewritten, _stats) = rewrite_auto_gather(module, &eligible);
-            rewritten
-        } else {
-            module
-        };
+            let _stats = rewrite_auto_gather(&mut module, &eligible);
+        }
 
         let desugar_output = desugar_module_with(
             &module,
@@ -344,12 +343,9 @@ pub fn run(args: BuildArgs) -> Result<()> {
             &expand_gather_blocks(&expand_lazy_imports(&source)),
         ))));
         let prep = preprocess(&expanded);
-        let module = parse(
-            &prep.python_source,
-            Mode::Module,
-            &path.display().to_string(),
-        )
-        .map_err(|e| miette!("parse error in '{}': {e}", path.display()))?;
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .map(|p| p.into_syntax())
+            .map_err(|e| miette!("parse error in '{}': {e}", path.display()))?;
         let desugar = desugar_module_with(&module, DesugarOptions::default());
         let stub_text = emit_stub(&desugar.module);
 
@@ -476,27 +472,21 @@ fn build_source_map_v2(source_rel: &str, preprocessed: &str, line_offsets: &[usi
 /// PORT: int = 8080
 /// ```
 fn substitute_comptime_literals(
-    module: Mod<TextRange>,
+    mut module: ModModule,
     values: &HashMap<String, ComptimeValue>,
-) -> Mod<TextRange> {
+) -> ModModule {
     if values.is_empty() {
         return module;
     }
-    let Mod::Module(mut m) = module else {
-        return module;
-    };
-    m.body = m
+    module.body = module
         .body
         .into_iter()
         .map(|stmt| substitute_stmt(stmt, values))
         .collect();
-    Mod::Module(m)
+    module
 }
 
-fn substitute_stmt(
-    stmt: Stmt<TextRange>,
-    values: &HashMap<String, ComptimeValue>,
-) -> Stmt<TextRange> {
+fn substitute_stmt(stmt: Stmt, values: &HashMap<String, ComptimeValue>) -> Stmt {
     if let Stmt::AnnAssign(mut ann) = stmt {
         if let Expr::Name(ref n) = *ann.target {
             if let Some(cv) = values.get(n.id.as_str()) {
@@ -510,19 +500,25 @@ fn substitute_stmt(
     }
 }
 
-/// Convert a [`ComptimeValue`] to its Python AST constant expression
-/// by round-tripping through the Python parser.
-fn comptime_value_to_expr(value: &ComptimeValue) -> Expr<TextRange> {
+/// Convert a [`ComptimeValue`] to its Python AST expression by
+/// round-tripping through the Python expression parser.
+fn comptime_value_to_expr(value: &ComptimeValue) -> Expr {
     let literal = value.to_python_literal();
-    match parse(&literal, Mode::Expression, "<comptime>") {
-        Ok(Mod::Expression(e)) => *e.body,
-        _ => {
+    match parse_expression(&literal) {
+        Ok(parsed) => *parsed.into_syntax().body,
+        Err(_) => {
             // Fallback: emit as a string-quoted constant.  Should never happen
             // for the value types we produce.
-            Expr::Constant(ExprConstant {
+            let lit = StringLiteral {
                 range: TextRange::default(),
-                value: Constant::Str(literal),
-                kind: None,
+                node_index: AtomicNodeIndex::NONE,
+                value: Box::from(literal.as_str()),
+                flags: StringLiteralFlags::empty(),
+            };
+            Expr::StringLiteral(ExprStringLiteral {
+                range: TextRange::default(),
+                node_index: AtomicNodeIndex::NONE,
+                value: StringLiteralValue::single(lit),
             })
         }
     }

@@ -274,7 +274,7 @@ impl TycError {
         }
     }
 
-    /// Construct a [`TycError::Parse`] from a rustpython parse error.
+    /// Construct a [`TycError::Parse`] from a parser error.
     pub fn parse(
         path: impl Into<String>,
         source: impl Into<String>,

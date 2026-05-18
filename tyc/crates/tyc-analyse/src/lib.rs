@@ -36,7 +36,7 @@
 
 use std::collections::HashMap;
 
-use rustpython_ast::{text_size::TextRange, Constant, Expr, Mod, Stmt};
+use ruff_python_ast::{Decorator, Expr, ExprCall, ModModule, Number, Parameters, Stmt};
 use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_syntax::preprocess::ComptimeBinding;
 
@@ -90,7 +90,7 @@ impl ComptimeValue {
 /// A missing required environment variable (`env("NAME")` without a default)
 /// is also an error.
 pub fn evaluate_comptime(
-    module: &Mod<TextRange>,
+    module: &ModModule,
     bindings: &[ComptimeBinding],
 ) -> (HashMap<String, ComptimeValue>, Diagnostics) {
     let mut values = HashMap::new();
@@ -100,10 +100,7 @@ pub fn evaluate_comptime(
         return (values, diags);
     }
 
-    let body = match module {
-        Mod::Module(m) => &m.body,
-        _ => return (values, diags),
-    };
+    let body = &module.body;
 
     for binding in bindings {
         // Find the annotated assignment whose target matches this binding name
@@ -142,17 +139,28 @@ pub fn evaluate_comptime(
 
 // ── Expression evaluator ──────────────────────────────────────────────────────
 
-fn eval_expr(expr: &Expr<TextRange>) -> Result<ComptimeValue, String> {
+fn eval_expr(expr: &Expr) -> Result<ComptimeValue, String> {
     match expr {
-        // Literals
-        Expr::Constant(c) => eval_constant(&c.value),
+        // Numeric literals.
+        Expr::NumberLiteral(n) => match &n.value {
+            Number::Int(i) => i
+                .as_i64()
+                .map(ComptimeValue::Int)
+                .ok_or_else(|| format!("integer literal '{}' overflows i64", i)),
+            Number::Float(f) => Ok(ComptimeValue::Float(*f)),
+            Number::Complex { .. } => Err("complex literals are not comptime-evaluable".into()),
+        },
+        // String / boolean / none literals.
+        Expr::StringLiteral(s) => Ok(ComptimeValue::Str(s.value.to_str().to_owned())),
+        Expr::BooleanLiteral(b) => Ok(ComptimeValue::Bool(b.value)),
+        Expr::NoneLiteral(_) => Err("None is not a valid comptime value".into()),
 
         // Unary `-` for negative literals
-        Expr::UnaryOp(u) if matches!(u.op, rustpython_ast::UnaryOp::USub) => {
+        Expr::UnaryOp(u) if matches!(u.op, ruff_python_ast::UnaryOp::USub) => {
             match eval_expr(&u.operand)? {
                 ComptimeValue::Int(n) => Ok(ComptimeValue::Int(-n)),
                 ComptimeValue::Float(f) => Ok(ComptimeValue::Float(-f)),
-                _ => Err("unary `-` is only valid on numeric comptime letues".into()),
+                _ => Err("unary `-` is only valid on numeric comptime values".into()),
             }
         }
 
@@ -173,24 +181,7 @@ fn eval_expr(expr: &Expr<TextRange>) -> Result<ComptimeValue, String> {
     }
 }
 
-fn eval_constant(c: &Constant) -> Result<ComptimeValue, String> {
-    match c {
-        Constant::Int(i) => {
-            // rustpython_ast wraps integers in a BigInt; convert via string.
-            let s = i.to_string();
-            s.parse::<i64>()
-                .map(ComptimeValue::Int)
-                .map_err(|_| format!("integer literal '{}' overflows i64", s))
-        }
-        Constant::Float(f) => Ok(ComptimeValue::Float(*f)),
-        Constant::Str(s) => Ok(ComptimeValue::Str(s.clone())),
-        Constant::Bool(b) => Ok(ComptimeValue::Bool(*b)),
-        Constant::None => Err("None is not a valid comptime letue".into()),
-        other => Err(format!("unsupported literal kind: {:?}", other)),
-    }
-}
-
-fn eval_call(call: &rustpython_ast::ExprCall<TextRange>) -> Result<ComptimeValue, String> {
+fn eval_call(call: &ExprCall) -> Result<ComptimeValue, String> {
     let func_name = match call.func.as_ref() {
         Expr::Name(n) => n.id.as_str(),
         _ => return Err(
@@ -199,13 +190,16 @@ fn eval_call(call: &rustpython_ast::ExprCall<TextRange>) -> Result<ComptimeValue
         ),
     };
 
+    let args = &call.arguments.args;
+    let keywords = &call.arguments.keywords;
+
     match func_name {
         "env" => eval_env_call(call),
         "int" => {
-            if call.args.len() != 1 || !call.keywords.is_empty() {
+            if args.len() != 1 || !keywords.is_empty() {
                 return Err("int() in comptime context takes exactly one argument".into());
             }
-            match eval_expr(&call.args[0])? {
+            match eval_expr(&args[0])? {
                 ComptimeValue::Str(s) => s
                     .trim()
                     .parse::<i64>()
@@ -217,10 +211,10 @@ fn eval_call(call: &rustpython_ast::ExprCall<TextRange>) -> Result<ComptimeValue
             }
         }
         "float" => {
-            if call.args.len() != 1 || !call.keywords.is_empty() {
+            if args.len() != 1 || !keywords.is_empty() {
                 return Err("float() in comptime context takes exactly one argument".into());
             }
-            match eval_expr(&call.args[0])? {
+            match eval_expr(&args[0])? {
                 ComptimeValue::Str(s) => s
                     .trim()
                     .parse::<f64>()
@@ -232,10 +226,10 @@ fn eval_call(call: &rustpython_ast::ExprCall<TextRange>) -> Result<ComptimeValue
             }
         }
         "str" => {
-            if call.args.len() != 1 || !call.keywords.is_empty() {
+            if args.len() != 1 || !keywords.is_empty() {
                 return Err("str() in comptime context takes exactly one argument".into());
             }
-            let v = eval_expr(&call.args[0])?;
+            let v = eval_expr(&args[0])?;
             Ok(ComptimeValue::Str(match v {
                 ComptimeValue::Str(s) => s,
                 ComptimeValue::Int(n) => n.to_string(),
@@ -250,15 +244,17 @@ fn eval_call(call: &rustpython_ast::ExprCall<TextRange>) -> Result<ComptimeValue
     }
 }
 
-fn eval_env_call(call: &rustpython_ast::ExprCall<TextRange>) -> Result<ComptimeValue, String> {
-    if call.args.is_empty() || call.args.len() > 2 {
+fn eval_env_call(call: &ExprCall) -> Result<ComptimeValue, String> {
+    let args = &call.arguments.args;
+    let keywords = &call.arguments.keywords;
+    if args.is_empty() || args.len() > 2 {
         return Err("env() requires one or two positional arguments: env(\"NAME\") or env(\"NAME\", \"default\")".into());
     }
-    if !call.keywords.is_empty() {
+    if !keywords.is_empty() {
         return Err("env() does not accept keyword arguments".into());
     }
 
-    let var_name = match eval_expr(&call.args[0])? {
+    let var_name = match eval_expr(&args[0])? {
         ComptimeValue::Str(s) => s,
         _ => return Err("env() first argument must be a string literal".into()),
     };
@@ -266,9 +262,9 @@ fn eval_env_call(call: &rustpython_ast::ExprCall<TextRange>) -> Result<ComptimeV
     match std::env::var(&var_name) {
         Ok(val) => Ok(ComptimeValue::Str(val)),
         Err(_) => {
-            if call.args.len() == 2 {
+            if args.len() == 2 {
                 // Use the default value.
-                eval_expr(&call.args[1])
+                eval_expr(&args[1])
             } else {
                 Err(format!(
                     "required environment variable '{}' is not set",
@@ -280,11 +276,11 @@ fn eval_env_call(call: &rustpython_ast::ExprCall<TextRange>) -> Result<ComptimeV
 }
 
 fn eval_binop(
-    op: rustpython_ast::Operator,
+    op: ruff_python_ast::Operator,
     lhs: ComptimeValue,
     rhs: ComptimeValue,
 ) -> Result<ComptimeValue, String> {
-    use rustpython_ast::Operator::*;
+    use ruff_python_ast::Operator::*;
     match (op, &lhs, &rhs) {
         // ── Add ──────────────────────────────────────────────────────────────
         (Add, ComptimeValue::Int(a), ComptimeValue::Int(b)) => a
@@ -355,7 +351,7 @@ fn eval_binop(
             }
         }
         _ => Err(format!(
-            "operator is not supported between these comptime letue types: {:?} {:?} {:?}",
+            "operator is not supported between these comptime value types: {:?} {:?} {:?}",
             op, lhs, rhs
         )),
     }
@@ -380,28 +376,33 @@ fn python_string_literal(s: &str) -> String {
     out
 }
 
-fn expr_kind_name(expr: &Expr<TextRange>) -> &'static str {
+fn expr_kind_name(expr: &Expr) -> &'static str {
     match expr {
         Expr::BoolOp(_) => "BoolOp",
-        Expr::NamedExpr(_) => "NamedExpr",
+        Expr::Named(_) => "NamedExpr",
         Expr::BinOp(_) => "BinOp",
         Expr::UnaryOp(_) => "UnaryOp",
         Expr::Lambda(_) => "Lambda",
-        Expr::IfExp(_) => "IfExp",
+        Expr::If(_) => "IfExp",
         Expr::Dict(_) => "Dict",
         Expr::Set(_) => "Set",
         Expr::ListComp(_) => "ListComp",
         Expr::SetComp(_) => "SetComp",
         Expr::DictComp(_) => "DictComp",
-        Expr::GeneratorExp(_) => "GeneratorExp",
+        Expr::Generator(_) => "GeneratorExp",
         Expr::Await(_) => "Await",
         Expr::Yield(_) => "Yield",
         Expr::YieldFrom(_) => "YieldFrom",
         Expr::Compare(_) => "Compare",
         Expr::Call(_) => "Call",
-        Expr::FormattedValue(_) => "FormattedValue",
-        Expr::JoinedStr(_) => "JoinedStr",
-        Expr::Constant(_) => "Constant",
+        Expr::FString(_) => "FString",
+        Expr::TString(_) => "TString",
+        Expr::StringLiteral(_) => "StringLiteral",
+        Expr::BytesLiteral(_) => "BytesLiteral",
+        Expr::NumberLiteral(_) => "NumberLiteral",
+        Expr::BooleanLiteral(_) => "BooleanLiteral",
+        Expr::NoneLiteral(_) => "NoneLiteral",
+        Expr::EllipsisLiteral(_) => "EllipsisLiteral",
         Expr::Attribute(_) => "Attribute",
         Expr::Subscript(_) => "Subscript",
         Expr::Starred(_) => "Starred",
@@ -409,6 +410,7 @@ fn expr_kind_name(expr: &Expr<TextRange>) -> &'static str {
         Expr::List(_) => "List",
         Expr::Tuple(_) => "Tuple",
         Expr::Slice(_) => "Slice",
+        Expr::IpyEscapeCommand(_) => "IpyEscapeCommand",
     }
 }
 
@@ -417,12 +419,13 @@ fn expr_kind_name(expr: &Expr<TextRange>) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustpython_parser::{parse, Mode};
     use tyc_syntax::preprocess::preprocess;
 
     fn eval(src: &str) -> (HashMap<String, ComptimeValue>, Diagnostics) {
         let prep = preprocess(src);
-        let module = parse(&prep.python_source, Mode::Module, "<test>").expect("parse failed");
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .expect("parse failed")
+            .into_syntax();
         evaluate_comptime(&module, &prep.comptime_bindings)
     }
 
@@ -520,28 +523,26 @@ pub struct PurityFinding {
 /// `typhon.toml` (defaulting to `false`). When `true`, every pure function is
 /// treated as if the user had written `@memo` so the desugarer emits a cache
 /// decorator.
-pub fn analyse_purity(module: &Mod<TextRange>, auto_memoise: bool) -> Vec<PurityFinding> {
+pub fn analyse_purity(module: &ModModule, auto_memoise: bool) -> Vec<PurityFinding> {
     let mut out = Vec::new();
-    if let Mod::Module(m) = module {
-        // Phase 1: collect a module-scope view that purity decisions depend
-        // on. We need three things:
-        //   - The set of module-level names introduced by *any* assignment
-        //     (including `AnnAssign`). Pure functions are forbidden from
-        //     mutating these through attribute or subscript writes.
-        //   - The set of class names declared at module level — they double
-        //     as legitimate constructors and so are pure-callable.
-        //   - The set of user-defined functions declared at module level,
-        //     keyed by name, along with whether each is itself declared pure
-        //     (so we can enforce transitive purity through call graphs).
-        let module = ModuleScope::collect(&m.body, auto_memoise);
-        analyse_stmts(
-            &m.body,
-            &module,
-            auto_memoise,
-            &mut out,
-            /*async_context=*/ false,
-        );
-    }
+    // Phase 1: collect a module-scope view that purity decisions depend
+    // on. We need three things:
+    //   - The set of module-level names introduced by *any* assignment
+    //     (including `AnnAssign`). Pure functions are forbidden from
+    //     mutating these through attribute or subscript writes.
+    //   - The set of class names declared at module level — they double
+    //     as legitimate constructors and so are pure-callable.
+    //   - The set of user-defined functions declared at module level,
+    //     keyed by name, along with whether each is itself declared pure
+    //     (so we can enforce transitive purity through call graphs).
+    let scope = ModuleScope::collect(&module.body, auto_memoise);
+    analyse_stmts(
+        &module.body,
+        &scope,
+        auto_memoise,
+        &mut out,
+        /*async_context=*/ false,
+    );
     out
 }
 
@@ -564,7 +565,7 @@ struct ModuleScope {
 }
 
 impl ModuleScope {
-    fn collect(body: &[Stmt<TextRange>], auto_memoise: bool) -> Self {
+    fn collect(body: &[Stmt], auto_memoise: bool) -> Self {
         let mut s = Self::default();
         for stmt in body {
             match stmt {
@@ -588,11 +589,6 @@ impl ModuleScope {
                     s.user_functions
                         .insert(f.name.as_str().to_owned(), declared);
                 }
-                Stmt::AsyncFunctionDef(f) => {
-                    let (declared, _) = decorator_intent(&f.decorator_list, auto_memoise);
-                    s.user_functions
-                        .insert(f.name.as_str().to_owned(), declared);
-                }
                 _ => {}
             }
         }
@@ -601,7 +597,7 @@ impl ModuleScope {
 }
 
 fn analyse_stmts(
-    body: &[Stmt<TextRange>],
+    body: &[Stmt],
     module: &ModuleScope,
     auto_memoise: bool,
     out: &mut Vec<PurityFinding>,
@@ -616,57 +612,27 @@ fn analyse_stmts(
     // top-level scope until we thread span-based identifiers through to
     // the desugarer.
     for stmt in body {
-        match stmt {
-            Stmt::FunctionDef(f) => {
-                let (declared, memo) = decorator_intent(&f.decorator_list, auto_memoise);
-                // Run the purity check whenever the user opted in OR the
-                // project asked for automatic caching. Auto-memoise never
-                // produces an error (see `purity_diagnostics`); it just
-                // gates cache-decorator injection on the function silently
-                // passing.
-                if declared || memo {
-                    let violation = check_purity(
-                        f.name.as_str(),
-                        &f.args,
-                        &f.body,
-                        /*is_async=*/ false,
-                        module,
-                    );
-                    out.push(PurityFinding {
-                        name: f.name.as_str().to_owned(),
-                        declared_pure: declared,
-                        memoise: memo,
-                        violation,
-                        span: (
-                            f.range.start().to_usize(),
-                            f.range.start().to_usize() + f.name.as_str().len(),
-                        ),
-                    });
-                }
+        if let Stmt::FunctionDef(f) = stmt {
+            let (declared, memo) = decorator_intent(&f.decorator_list, auto_memoise);
+            // Run the purity check whenever the user opted in OR the
+            // project asked for automatic caching. Auto-memoise never
+            // produces an error (see `purity_diagnostics`); it just
+            // gates cache-decorator injection on the function silently
+            // passing.
+            if declared || memo {
+                let violation =
+                    check_purity(f.name.as_str(), &f.parameters, &f.body, f.is_async, module);
+                out.push(PurityFinding {
+                    name: f.name.as_str().to_owned(),
+                    declared_pure: declared,
+                    memoise: memo,
+                    violation,
+                    span: (
+                        f.range.start().to_usize(),
+                        f.range.start().to_usize() + f.name.as_str().len(),
+                    ),
+                });
             }
-            Stmt::AsyncFunctionDef(f) => {
-                let (declared, memo) = decorator_intent(&f.decorator_list, auto_memoise);
-                if declared || memo {
-                    let violation = check_purity(
-                        f.name.as_str(),
-                        &f.args,
-                        &f.body,
-                        /*is_async=*/ true,
-                        module,
-                    );
-                    out.push(PurityFinding {
-                        name: f.name.as_str().to_owned(),
-                        declared_pure: declared,
-                        memoise: memo,
-                        violation,
-                        span: (
-                            f.range.start().to_usize(),
-                            f.range.start().to_usize() + f.name.as_str().len(),
-                        ),
-                    });
-                }
-            }
-            _ => {}
         }
     }
 }
@@ -681,11 +647,11 @@ fn analyse_stmts(
 ///     `@pure(memo=True)`, or `auto_memoise`. The desugarer only injects
 ///     `@functools.cache` when the function ALSO passes the purity check;
 ///     `auto_memoise` is therefore a silent best-effort, never a hard error.
-fn decorator_intent(decorators: &[Expr<TextRange>], auto_memoise: bool) -> (bool, bool) {
+fn decorator_intent(decorators: &[Decorator], auto_memoise: bool) -> (bool, bool) {
     let mut declared = false;
     let mut memoise = auto_memoise;
     for d in decorators {
-        match d {
+        match &d.expression {
             Expr::Name(n) if n.id.as_str() == "pure" => {
                 declared = true;
             }
@@ -696,11 +662,11 @@ fn decorator_intent(decorators: &[Expr<TextRange>], auto_memoise: bool) -> (bool
             Expr::Call(call) => match call.func.as_ref() {
                 Expr::Name(n) if n.id.as_str() == "pure" => {
                     declared = true;
-                    if call.keywords.iter().any(|k| {
+                    if call.arguments.keywords.iter().any(|k| {
                         k.arg.as_ref().is_some_and(|a| a.as_str() == "memo")
                             && matches!(
                                 &k.value,
-                                Expr::Constant(c) if matches!(c.value, Constant::Bool(true))
+                                Expr::BooleanLiteral(b) if b.value
                             )
                     }) {
                         memoise = true;
@@ -720,8 +686,8 @@ fn decorator_intent(decorators: &[Expr<TextRange>], auto_memoise: bool) -> (bool
 
 fn check_purity(
     name: &str,
-    args: &rustpython_ast::Arguments<TextRange>,
-    body: &[Stmt<TextRange>],
+    parameters: &Parameters,
+    body: &[Stmt],
     is_async: bool,
     module: &ModuleScope,
 ) -> Option<String> {
@@ -733,7 +699,7 @@ fn check_purity(
     // 2. Hashable parameter types — memoisation backs every cache hit with a
     //    dict keyed on `args`. Reject obviously unhashable annotations so the
     //    cache decorator the desugarer injects never crashes at runtime.
-    if let Some(reason) = unhashable_param_reason(args) {
+    if let Some(reason) = unhashable_param_reason(parameters) {
         return Some(reason);
     }
     // The remaining four conditions are checked by walking the body.
@@ -745,34 +711,34 @@ fn check_purity(
     ctx.violation
 }
 
-/// If `args` declares a parameter whose annotation is a known-unhashable
+/// If `parameters` declares a parameter whose annotation is a known-unhashable
 /// container type (`list`, `dict`, `set`, `bytearray`), return a reason
 /// string. Annotations the analyser doesn't understand are treated as
 /// hashable by default — we err on the side of accepting code rather than
 /// blocking valid use of opaque types.
-fn unhashable_param_reason(args: &rustpython_ast::Arguments<TextRange>) -> Option<String> {
+fn unhashable_param_reason(parameters: &Parameters) -> Option<String> {
     let report = |name: &str, ty: &str| -> Option<String> {
         Some(format!(
             "parameter '{}' has unhashable type `{}` — pure functions need hashable args so memoised caches can key on them",
             name, ty
         ))
     };
-    for arg in args
+    for pwd in parameters
         .posonlyargs
         .iter()
-        .chain(args.args.iter())
-        .chain(args.kwonlyargs.iter())
+        .chain(parameters.args.iter())
+        .chain(parameters.kwonlyargs.iter())
     {
-        if let Some(ann) = &arg.def.annotation {
+        if let Some(ann) = &pwd.parameter.annotation {
             if let Some(t) = annotation_unhashable_name(ann) {
-                return report(arg.def.arg.as_str(), &t);
+                return report(pwd.parameter.name.as_str(), &t);
             }
         }
     }
     None
 }
 
-fn annotation_unhashable_name(ann: &Expr<TextRange>) -> Option<String> {
+fn annotation_unhashable_name(ann: &Expr) -> Option<String> {
     // Both `list` and `list[int]` are unhashable. Look at the head identifier.
     let head = match ann {
         Expr::Name(n) => n.id.as_str().to_owned(),
@@ -802,7 +768,7 @@ impl PurityCtx<'_> {
     }
 }
 
-fn walk_stmts_purity(stmts: &[Stmt<TextRange>], ctx: &mut PurityCtx) {
+fn walk_stmts_purity(stmts: &[Stmt], ctx: &mut PurityCtx) {
     for stmt in stmts {
         if ctx.violation.is_some() {
             return;
@@ -811,7 +777,7 @@ fn walk_stmts_purity(stmts: &[Stmt<TextRange>], ctx: &mut PurityCtx) {
     }
 }
 
-fn walk_stmt_purity(stmt: &Stmt<TextRange>, ctx: &mut PurityCtx) {
+fn walk_stmt_purity(stmt: &Stmt, ctx: &mut PurityCtx) {
     match stmt {
         Stmt::Raise(_) => {
             ctx.fail("pure functions must not raise — return Result[T, E] to express failure")
@@ -861,7 +827,12 @@ fn walk_stmt_purity(stmt: &Stmt<TextRange>, ctx: &mut PurityCtx) {
         Stmt::If(s) => {
             walk_expr_purity(&s.test, ctx);
             walk_stmts_purity(&s.body, ctx);
-            walk_stmts_purity(&s.orelse, ctx);
+            for clause in &s.elif_else_clauses {
+                if let Some(test) = &clause.test {
+                    walk_expr_purity(test, ctx);
+                }
+                walk_stmts_purity(&clause.body, ctx);
+            }
         }
         Stmt::While(s) => {
             walk_expr_purity(&s.test, ctx);
@@ -869,11 +840,21 @@ fn walk_stmt_purity(stmt: &Stmt<TextRange>, ctx: &mut PurityCtx) {
             walk_stmts_purity(&s.orelse, ctx);
         }
         Stmt::For(s) => {
+            if s.is_async {
+                ctx.fail("pure functions must not use async constructs");
+                return;
+            }
             walk_expr_purity(&s.iter, ctx);
             walk_stmts_purity(&s.body, ctx);
             walk_stmts_purity(&s.orelse, ctx);
         }
-        Stmt::With(s) => walk_stmts_purity(&s.body, ctx),
+        Stmt::With(s) => {
+            if s.is_async {
+                ctx.fail("pure functions must not use async constructs");
+                return;
+            }
+            walk_stmts_purity(&s.body, ctx);
+        }
         Stmt::Match(s) => {
             walk_expr_purity(&s.subject, ctx);
             for case in &s.cases {
@@ -883,17 +864,14 @@ fn walk_stmt_purity(stmt: &Stmt<TextRange>, ctx: &mut PurityCtx) {
                 walk_stmts_purity(&case.body, ctx);
             }
         }
-        Stmt::FunctionDef(_) | Stmt::AsyncFunctionDef(_) | Stmt::ClassDef(_) => {
+        Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {
             // Nested defs / classes are out of scope for purity propagation.
-        }
-        Stmt::AsyncFor(_) | Stmt::AsyncWith(_) | Stmt::TryStar(_) => {
-            ctx.fail("pure functions must not use async constructs");
         }
         _ => {}
     }
 }
 
-fn walk_expr_purity(expr: &Expr<TextRange>, ctx: &mut PurityCtx) {
+fn walk_expr_purity(expr: &Expr, ctx: &mut PurityCtx) {
     match expr {
         Expr::Await(_) | Expr::Yield(_) | Expr::YieldFrom(_) => {
             ctx.fail("pure functions must not be async or generator-flavoured (`await`, `yield`)")
@@ -915,10 +893,10 @@ fn walk_expr_purity(expr: &Expr<TextRange>, ctx: &mut PurityCtx) {
                 }
             }
             walk_expr_purity(&c.func, ctx);
-            for a in &c.args {
+            for a in c.arguments.args.iter() {
                 walk_expr_purity(a, ctx);
             }
-            for k in &c.keywords {
+            for k in c.arguments.keywords.iter() {
                 walk_expr_purity(&k.value, ctx);
             }
         }
@@ -934,11 +912,11 @@ fn walk_expr_purity(expr: &Expr<TextRange>, ctx: &mut PurityCtx) {
         Expr::UnaryOp(u) => walk_expr_purity(&u.operand, ctx),
         Expr::Compare(c) => {
             walk_expr_purity(&c.left, ctx);
-            for cm in &c.comparators {
+            for cm in c.comparators.iter() {
                 walk_expr_purity(cm, ctx);
             }
         }
-        Expr::IfExp(i) => {
+        Expr::If(i) => {
             walk_expr_purity(&i.test, ctx);
             walk_expr_purity(&i.body, ctx);
             walk_expr_purity(&i.orelse, ctx);
@@ -967,7 +945,7 @@ fn walk_expr_purity(expr: &Expr<TextRange>, ctx: &mut PurityCtx) {
 /// variables (Python scoping makes them so once `global` is forbidden) and
 /// are fine; attribute and subscript targets whose root is a module-level
 /// binding are not.
-fn check_mutation_target(target: &Expr<TextRange>, ctx: &mut PurityCtx) {
+fn check_mutation_target(target: &Expr, ctx: &mut PurityCtx) {
     match target {
         Expr::Name(_) => {
             // Local. `Stmt::Global` is already a hard error, so any bare name
@@ -1003,7 +981,7 @@ fn check_mutation_target(target: &Expr<TextRange>, ctx: &mut PurityCtx) {
 /// Follow an attribute / subscript chain back to its base `Name`. Returns
 /// `None` if the chain doesn't bottom out at a single identifier (e.g.
 /// `f().attr = 1` — the receiver is a call expression, not a module name).
-fn mutation_root_name(target: &Expr<TextRange>) -> Option<String> {
+fn mutation_root_name(target: &Expr) -> Option<String> {
     match target {
         Expr::Name(n) => Some(n.id.as_str().to_owned()),
         Expr::Attribute(a) => mutation_root_name(&a.value),
@@ -1075,7 +1053,7 @@ fn is_pure_builtin(name: &str) -> bool {
 
 /// If `func` references a forbidden callable (I/O, entropy, clock), return a
 /// concrete reason string. Otherwise return `None`.
-fn forbidden_callee(func: &Expr<TextRange>) -> Option<String> {
+fn forbidden_callee(func: &Expr) -> Option<String> {
     let path = dotted_path(func)?;
     // Bare-name builtins.
     match path.as_str() {
@@ -1120,7 +1098,7 @@ fn forbidden_callee(func: &Expr<TextRange>) -> Option<String> {
     None
 }
 
-fn dotted_path(expr: &Expr<TextRange>) -> Option<String> {
+fn dotted_path(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Name(n) => Some(n.id.as_str().to_owned()),
         Expr::Attribute(a) => {
@@ -1162,10 +1140,11 @@ pub fn purity_diagnostics(findings: &[PurityFinding], path: &str, source: &str) 
 #[cfg(test)]
 mod purity_tests {
     use super::*;
-    use rustpython_parser::{parse, Mode};
 
     fn analyse(src: &str) -> Vec<PurityFinding> {
-        let module = parse(src, Mode::Module, "<test>").expect("parse failed");
+        let module = tyc_syntax::parse_module(src)
+            .expect("parse failed")
+            .into_syntax();
         analyse_purity(&module, false)
     }
 
@@ -1251,7 +1230,7 @@ mod purity_tests {
         // silent best-effort: a finding is recorded (so the memoise pass
         // knows to SKIP this one) but the diagnostic stage drops it.
         let src = "def fetch(url: str) -> str:\n    return open(url).read()\n";
-        let module = parse(src, Mode::Module, "<test>").unwrap();
+        let module = tyc_syntax::parse_module(src).unwrap().into_syntax();
         let findings = analyse_purity(&module, /*auto_memoise=*/ true);
         assert_eq!(findings.len(), 1);
         // Not declared pure → never a hard error.
@@ -1274,7 +1253,7 @@ mod purity_tests {
         // finding with `memoise = true && violation = None`, which the
         // build pipeline turns into a `@functools.cache` injection.
         let src = "def add(a: int, b: int) -> int:\n    return a + b\n";
-        let module = parse(src, Mode::Module, "<test>").unwrap();
+        let module = tyc_syntax::parse_module(src).unwrap().into_syntax();
         let findings = analyse_purity(&module, /*auto_memoise=*/ true);
         assert_eq!(findings.len(), 1);
         assert!(!findings[0].declared_pure);

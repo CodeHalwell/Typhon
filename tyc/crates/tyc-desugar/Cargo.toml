@@ -6,8 +6,9 @@ license.workspace = true
 description = "Typhon AST → Python AST lowering (Phase 2+)"
 
 [dependencies]
-rustpython-ast = { workspace = true }
+ruff_python_ast = { workspace = true }
+ruff_text_size  = { workspace = true }
 
 [dev-dependencies]
-rustpython-parser = { workspace = true }
-tyc-emit          = { workspace = true }
+tyc-syntax       = { workspace = true }
+tyc-emit         = { workspace = true }

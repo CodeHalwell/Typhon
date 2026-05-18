@@ -6,10 +6,8 @@ license.workspace = true
 description = "Nominal and structural type checker for Typhon"
 
 [dependencies]
-rustpython-ast = { workspace = true }
+ruff_python_ast = { workspace = true }
+ruff_text_size = { workspace = true }
 tyc-syntax = { workspace = true }
 tyc-resolve = { workspace = true }
 tyc-diagnostics = { workspace = true }
-
-[dev-dependencies]
-rustpython-parser = { workspace = true }

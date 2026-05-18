@@ -9,7 +9,6 @@ use std::path::PathBuf;
 
 use clap::Args;
 use miette::{miette, Result};
-use rustpython_parser::{parse, Mode};
 
 use tyc_db::{check_file, TycDatabase};
 use tyc_diagnostics::{Diagnostics, TycError};
@@ -191,14 +190,14 @@ pub fn run(args: CheckArgs) -> Result<()> {
 /// resulting Python AST.  Used by the stub diff so that Typhon-specific
 /// syntax (`val`, `var`, `model`, `interface`, `extend`, sugar passes)
 /// is normalised before comparing.
-fn parse_for_diff(
-    source: &str,
-) -> Result<rustpython_ast::Mod<rustpython_ast::text_size::TextRange>> {
+fn parse_for_diff(source: &str) -> Result<ruff_python_ast::ModModule> {
     let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
         &expand_gather_blocks(&expand_lazy_imports(source)),
     ))));
     let prep = preprocess(&expanded);
-    parse(&prep.python_source, Mode::Module, "<stubtest>").map_err(|e| miette!("parse error: {e}"))
+    tyc_syntax::parse_module(&prep.python_source)
+        .map(|p| p.into_syntax())
+        .map_err(|e| miette!("parse error: {e}"))
 }
 
 fn diff_stub_against_impl(

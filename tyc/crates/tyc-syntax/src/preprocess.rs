@@ -284,25 +284,23 @@ pub fn preprocess(source: &str) -> PreprocessResult {
                 }
             }
 
-            // ── `comptime let/mut name…` → strip both prefixes ──────────────
-            // `comptime` is a module-level concept; bindings inside functions
-            // or classes cannot be evaluated at build time. Only record
-            // top-level (indent_len == 0) comptime declarations.
+            // ── `comptime [let|mut] name…` → strip only the `comptime`
+            // prefix; any inner `let`/`mut` is left for the Ruff parser.
+            // `comptime` is a module-level concept; bindings inside
+            // functions or classes cannot be evaluated at build time. Only
+            // record top-level (indent_len == 0) comptime declarations.
             let mut stripped_line: Option<String> = None;
             if indent_len == 0 && rest.starts_with("comptime ") {
-                let after_comptime = &rest["comptime ".len()..];
-                // Extract the inner keyword (let/mut) if present.
-                let (inner_kw, payload) =
-                    if after_comptime.starts_with("let ") && after_comptime.len() > 4 {
-                        (Some(TyphonKeyword::Let), &after_comptime["let ".len()..])
-                    } else if after_comptime.starts_with("mut ") && after_comptime.len() > 4 {
-                        (Some(TyphonKeyword::Mut), &after_comptime["mut ".len()..])
-                    } else {
-                        (None, after_comptime)
-                    };
-
-                // Extract the binding name (first identifier before `:` or `=`).
-                let binding_name = payload
+                let payload = &rest["comptime ".len()..];
+                // Skip past any inner let/mut to find the binding name.
+                let name_source = if let Some(s) = payload.strip_prefix("let ") {
+                    s
+                } else if let Some(s) = payload.strip_prefix("mut ") {
+                    s
+                } else {
+                    payload
+                };
+                let binding_name = name_source
                     .split([':', '='])
                     .next()
                     .unwrap_or("")
@@ -314,14 +312,6 @@ pub fn preprocess(source: &str) -> PreprocessResult {
                         name: binding_name,
                         line_index,
                     });
-                    // Record inner val/var first so postprocess restores it
-                    // before prepending `comptime`.
-                    if let Some(kw) = inner_kw {
-                        stripped.push(StrippedKeyword {
-                            line_index,
-                            keyword: kw,
-                        });
-                    }
                     stripped.push(StrippedKeyword {
                         line_index,
                         keyword: TyphonKeyword::Comptime,
@@ -330,50 +320,28 @@ pub fn preprocess(source: &str) -> PreprocessResult {
                 }
             }
 
-            // ── `lazy let name…` / `lazy mut name…` → strip both keywords ─
-            //
-            // Pushing `Let` (or `Mut`) first and `Lazy` second means the
-            // postprocess restoration prepends them in stack order so the
-            // final line is `lazy let NAME …`.  This entry is independent of
-            // `lazy import`, which is handled by the parallel
-            // `lazy_imports` mechanism.
-            if stripped_line.is_none() {
-                for inner_kw in &[TyphonKeyword::Let, TyphonKeyword::Mut] {
-                    let prefix = format!("lazy {} ", inner_kw.as_str());
-                    if rest.starts_with(&prefix) && rest.len() > prefix.len() {
-                        stripped.push(StrippedKeyword {
-                            line_index,
-                            keyword: *inner_kw,
-                        });
-                        stripped.push(StrippedKeyword {
-                            line_index,
-                            keyword: TyphonKeyword::Lazy,
-                        });
-                        let after_kw = &rest[prefix.len()..];
-                        stripped_line = Some(format!("{}{}", indent, after_kw));
-                        break;
-                    }
+            // ── `lazy [let|mut] name…` → strip only the `lazy` prefix; the
+            // inner `let`/`mut` (if any) is left for the Ruff parser. This
+            // entry is independent of `lazy import`, which is handled by
+            // the parallel `lazy_imports` mechanism.
+            if stripped_line.is_none() && rest.starts_with("lazy ") && rest.len() > 5 {
+                let after_lazy = &rest["lazy ".len()..];
+                // Only strip when followed by a `let`/`mut` binding so we
+                // don't accidentally swallow `lazy import …` here (that's
+                // handled above).
+                if after_lazy.starts_with("let ") || after_lazy.starts_with("mut ") {
+                    stripped.push(StrippedKeyword {
+                        line_index,
+                        keyword: TyphonKeyword::Lazy,
+                    });
+                    stripped_line = Some(format!("{}{}", indent, after_lazy));
                 }
             }
 
-            // ── `let name…` / `mut name…` → strip keyword ──────────────────
-            if stripped_line.is_none() {
-                for kw in &[TyphonKeyword::Let, TyphonKeyword::Mut] {
-                    let prefix = kw.as_str();
-                    if rest.starts_with(prefix)
-                        && rest.len() > prefix.len()
-                        && rest.as_bytes()[prefix.len()] == b' '
-                    {
-                        stripped.push(StrippedKeyword {
-                            line_index,
-                            keyword: *kw,
-                        });
-                        let after_kw = &rest[prefix.len() + 1..];
-                        stripped_line = Some(format!("{}{}", indent, after_kw));
-                        break;
-                    }
-                }
-            }
+            // `let` / `mut` line prefixes are recognised natively by the
+            // Ruff parser as soft keywords, so the preprocessor no longer
+            // strips them. The resolver reads `mutability` directly from
+            // the AST.
 
             stripped_line.unwrap_or_else(|| line.to_owned())
         } else {
@@ -3070,35 +3038,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strips_let() {
+    fn preserves_let_keyword() {
+        // `let` / `mut` are recognised by the Ruff parser directly, so the
+        // preprocessor leaves them in place.
         let result = preprocess("let x: int = 1\n");
-        assert_eq!(result.python_source, "x: int = 1\n");
-        assert_eq!(result.stripped.len(), 1);
-        assert!(matches!(result.stripped[0].keyword, TyphonKeyword::Let));
-        assert_eq!(result.stripped[0].line_index, 0);
+        assert_eq!(result.python_source, "let x: int = 1\n");
+        assert!(result.stripped.is_empty());
     }
 
     #[test]
-    fn strips_mut() {
+    fn preserves_mut_keyword() {
         let result = preprocess("mut count: int = 0\n");
-        assert_eq!(result.python_source, "count: int = 0\n");
-        assert_eq!(result.stripped.len(), 1);
-        assert!(matches!(result.stripped[0].keyword, TyphonKeyword::Mut));
+        assert_eq!(result.python_source, "mut count: int = 0\n");
+        assert!(result.stripped.is_empty());
     }
 
     #[test]
-    fn strips_indented_let() {
+    fn preserves_indented_let() {
         let result = preprocess("    let x: int = 1\n");
-        assert_eq!(result.python_source, "    x: int = 1\n");
+        assert_eq!(result.python_source, "    let x: int = 1\n");
     }
 
     #[test]
     fn rewrites_optional_in_annotation() {
         let result = preprocess("let email: str? = None\n");
-        assert_eq!(result.python_source, "email: str | None = None\n");
+        assert_eq!(result.python_source, "let email: str | None = None\n");
         assert_eq!(result.optionals.len(), 1);
-        // The optional starts at column 11 ("email: str|").
-        assert_eq!(result.optionals[0].python_col, 10);
+        // The optional starts at column 14 ("let email: str|").
+        assert_eq!(result.optionals[0].python_col, 14);
     }
 
     #[test]
@@ -3111,7 +3078,7 @@ mod tests {
     #[test]
     fn does_not_rewrite_question_mark_inside_string() {
         let result = preprocess("let s: str = \"is this ok?\"\n");
-        assert_eq!(result.python_source, "s: str = \"is this ok?\"\n");
+        assert_eq!(result.python_source, "let s: str = \"is this ok?\"\n");
         assert!(result.optionals.is_empty());
     }
 
@@ -3195,19 +3162,21 @@ mod tests {
     // ── comptime keyword ────────────────────────────────────────────────────
 
     #[test]
-    fn comptime_let_stripped_to_plain_assignment() {
+    fn comptime_let_stripped_to_let_assignment() {
+        // Only the `comptime` prefix is stripped — the inner `let` is left
+        // for the Ruff parser to consume natively.
         let result = preprocess("comptime let PORT: int = 8080\n");
-        assert_eq!(result.python_source, "PORT: int = 8080\n");
+        assert_eq!(result.python_source, "let PORT: int = 8080\n");
         assert_eq!(result.comptime_bindings.len(), 1);
         assert_eq!(result.comptime_bindings[0].name, "PORT");
     }
 
     #[test]
-    fn comptime_var_stripped_correctly() {
+    fn comptime_mut_stripped_correctly() {
         let result = preprocess("comptime mut DB_URL: str = \"postgres://localhost\"\n");
         assert_eq!(
             result.python_source,
-            "DB_URL: str = \"postgres://localhost\"\n"
+            "mut DB_URL: str = \"postgres://localhost\"\n"
         );
         assert_eq!(result.comptime_bindings[0].name, "DB_URL");
     }
@@ -4089,16 +4058,16 @@ def run() -> Result[str, str]:
     }
 
     #[test]
-    fn preprocess_strips_lazy_let_for_round_trip() {
+    fn preprocess_strips_only_lazy_prefix_for_round_trip() {
+        // Only the `lazy` keyword is stripped; the inner `let` (or `mut`)
+        // is left for the Ruff parser. The formatter restores `lazy` via
+        // the stripped-keyword list.
         let result = preprocess("lazy let CONFIG: int = 1\n");
-        // Both `lazy` and `val` are removed from the Python-facing source so
-        // the parser sees plain `CONFIG: int = 1`; the formatter restores
-        // them via the stripped-keyword list.
-        assert_eq!(result.python_source, "CONFIG: int = 1\n");
+        assert_eq!(result.python_source, "let CONFIG: int = 1\n");
         let kinds: Vec<TyphonKeyword> = result.stripped.iter().map(|sk| sk.keyword).collect();
         assert!(
-            kinds.contains(&TyphonKeyword::Let) && kinds.contains(&TyphonKeyword::Lazy),
-            "stripped list should contain both Let and Lazy; got {:?}",
+            kinds == vec![TyphonKeyword::Lazy],
+            "stripped list should contain only Lazy; got {:?}",
             kinds
         );
         // Round-trip: postprocess must rebuild the original `lazy let` form.

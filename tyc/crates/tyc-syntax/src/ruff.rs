@@ -5,7 +5,7 @@
 //! It exposes a small surface deliberately:
 //!
 //! * [`parse_module`] — parse Typhon source directly (no preprocessor needed
-//!   for `val` / `var`; sugar passes like `?`, `|>`, `with`-chains, and
+//!   for `let` / `mut`; sugar passes like `?`, `|>`, `with`-chains, and
 //!   `gather:` still require preprocessing because they are surface syntax
 //!   we don't extend the parser for).
 //! * Re-exports of [`ast`] and the upstream [`Mutability`] enum so callers
@@ -26,7 +26,7 @@ use ruff_python_ast::ModModule;
 
 /// Parse a Typhon source file with the vendored Ruff parser.
 ///
-/// `source` should contain Typhon source. `val` / `var` are recognised as
+/// `source` should contain Typhon source. `let` / `mut` are recognised as
 /// soft keywords directly — no preprocessing pass is required for them.
 /// Other Typhon-specific sugar (`?`, `|>`, `gather:`, `with`-chains, `go`,
 /// etc.) is *not* yet known to this parser; callers that need to accept
@@ -42,21 +42,21 @@ mod tests {
     use ast::Stmt;
 
     #[test]
-    fn val_binding_carries_mutability() {
-        let parsed = parse_module("val x: int = 1\n").expect("parse");
+    fn let_binding_carries_mutability() {
+        let parsed = parse_module("let x: int = 1\n").expect("parse");
         let Stmt::AnnAssign(a) = parsed.into_syntax().body.into_iter().next().unwrap() else {
             panic!("expected StmtAnnAssign");
         };
-        assert_eq!(a.mutability, Some(Mutability::Val));
+        assert_eq!(a.mutability, Some(Mutability::Let));
     }
 
     #[test]
-    fn var_binding_carries_mutability() {
-        let parsed = parse_module("var counter = 0\n").expect("parse");
+    fn mut_binding_carries_mutability() {
+        let parsed = parse_module("mut counter = 0\n").expect("parse");
         let Stmt::Assign(a) = parsed.into_syntax().body.into_iter().next().unwrap() else {
             panic!("expected StmtAssign");
         };
-        assert_eq!(a.mutability, Some(Mutability::Var));
+        assert_eq!(a.mutability, Some(Mutability::Mut));
     }
 
     #[test]
@@ -66,9 +66,9 @@ mod tests {
     }
 
     #[test]
-    fn val_identifier_outside_statement_start() {
-        // `val` mid-expression is still a regular identifier.
-        let parsed = parse_module("y = val + 1\n").expect("parse");
+    fn let_identifier_outside_statement_start() {
+        // `let` mid-expression is still a regular identifier.
+        let parsed = parse_module("y = let + 1\n").expect("parse");
         let Stmt::Assign(a) = parsed.into_syntax().body.into_iter().next().unwrap() else {
             panic!("expected StmtAssign");
         };

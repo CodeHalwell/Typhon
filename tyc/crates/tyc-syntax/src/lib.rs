@@ -1,23 +1,21 @@
 //! Typhon syntax — lexer, parser, and AST extensions.
 //!
-//! Two parser back-ends are exposed:
+//! The canonical AST is the vendored fork of `ruff_python_ast` in
+//! [`vendor/ruff_python_ast`](../../vendor/ruff_python_ast). The parser is
+//! the vendored fork of `ruff_python_parser`, which recognises `let` and
+//! `mut` as first-class soft keywords — the resulting `StmtAssign` and
+//! `StmtAnnAssign` AST nodes carry a `mutability: Option<Mutability>`
+//! field directly, so no preprocessor pass is required for the binding
+//! prefixes.
 //!
-//! * The legacy [`parser`] module wraps `rustpython_parser`. Consumer crates
-//!   that haven't been ported yet still use this path; the `val` / `var`
-//!   keywords are stripped by the preprocessor before the source is handed
-//!   off, and restored at codegen time.
-//! * The new [`ruff`] module wraps the vendored fork of `ruff_python_parser`
-//!   in [`vendor/ruff_python_parser`](../../vendor/ruff_python_parser).
-//!   This back-end recognises `val` / `var` as first-class soft keywords;
-//!   the resulting `StmtAssign` / `StmtAnnAssign` AST node carries a
-//!   `mutability: Option<Mutability>` field directly. Consumer crates are
-//!   being migrated to this back-end incrementally — see
-//!   [`vendor/README.md`](../../vendor/README.md) for the plan.
+//! The [`preprocess`] module still rewrites surface sugar (`?`
+//! nullability, `model:`, `interface:`, `unsafe:`, `comptime`,
+//! `gather:`, `go`, `lazy`, `with`-chains, the `?` error-propagation
+//! operator) into plain Python before parsing.
 
 pub mod lexer;
-pub mod parser;
 pub mod preprocess;
 pub mod ruff;
 
-pub use rustpython_ast as ast;
-pub use rustpython_parser::{Mode, Parse};
+pub use ruff::{parse_module, ParseError, Parsed};
+pub use ruff_python_ast as ast;

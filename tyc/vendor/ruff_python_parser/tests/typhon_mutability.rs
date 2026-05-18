@@ -1,4 +1,4 @@
-//! Typhon-specific parser tests for the `val` / `var` mutability prefix.
+//! Typhon-specific parser tests for the `let` / `mut` mutability prefix.
 //!
 //! These tests live in the vendored fork; they prove the lexer recognises the
 //! new soft keywords and the parser attaches a `Mutability` to the resulting
@@ -18,35 +18,35 @@ fn first_stmt(src: &str) -> Stmt {
 }
 
 #[test]
-fn val_assignment_carries_val_mutability() {
-    let Stmt::Assign(a) = first_stmt("val x = 1\n") else {
+fn let_assignment_carries_let_mutability() {
+    let Stmt::Assign(a) = first_stmt("let x = 1\n") else {
         panic!("expected StmtAssign");
     };
-    assert_eq!(a.mutability, Some(Mutability::Val));
+    assert_eq!(a.mutability, Some(Mutability::Let));
 }
 
 #[test]
-fn var_assignment_carries_var_mutability() {
-    let Stmt::Assign(a) = first_stmt("var counter = 0\n") else {
+fn mut_assignment_carries_mut_mutability() {
+    let Stmt::Assign(a) = first_stmt("mut counter = 0\n") else {
         panic!("expected StmtAssign");
     };
-    assert_eq!(a.mutability, Some(Mutability::Var));
+    assert_eq!(a.mutability, Some(Mutability::Mut));
 }
 
 #[test]
-fn val_annotated_assignment_carries_mutability() {
-    let Stmt::AnnAssign(a) = first_stmt("val x: int = 1\n") else {
+fn let_annotated_assignment_carries_mutability() {
+    let Stmt::AnnAssign(a) = first_stmt("let x: int = 1\n") else {
         panic!("expected StmtAnnAssign");
     };
-    assert_eq!(a.mutability, Some(Mutability::Val));
+    assert_eq!(a.mutability, Some(Mutability::Let));
 }
 
 #[test]
-fn var_annotated_assignment_carries_mutability() {
-    let Stmt::AnnAssign(a) = first_stmt("var y: str = \"hi\"\n") else {
+fn mut_annotated_assignment_carries_mutability() {
+    let Stmt::AnnAssign(a) = first_stmt("mut y: str = \"hi\"\n") else {
         panic!("expected StmtAnnAssign");
     };
-    assert_eq!(a.mutability, Some(Mutability::Var));
+    assert_eq!(a.mutability, Some(Mutability::Mut));
 }
 
 #[test]
@@ -58,9 +58,9 @@ fn plain_assignment_has_no_mutability() {
 }
 
 #[test]
-fn val_as_identifier_outside_statement_start() {
-    // `val` mid-expression should remain a regular identifier.
-    let module = parse_module("y = val + 1\n").expect("parse should succeed");
+fn let_as_identifier_outside_statement_start() {
+    // `let` mid-expression should remain a regular identifier.
+    let module = parse_module("y = let + 1\n").expect("parse should succeed");
     let stmt = module.into_syntax().body.into_iter().next().unwrap();
     let Stmt::Assign(a) = stmt else {
         panic!("expected StmtAssign");
@@ -69,9 +69,9 @@ fn val_as_identifier_outside_statement_start() {
 }
 
 #[test]
-fn var_as_identifier_in_function_argument() {
-    // `f(var)` — `var` is just an identifier here.
-    let module = parse_module("f(var)\n").expect("parse should succeed");
+fn mut_as_identifier_in_function_argument() {
+    // `f(mut)` — `mut` is just an identifier here.
+    let module = parse_module("f(mut)\n").expect("parse should succeed");
     let stmt = module.into_syntax().body.into_iter().next().unwrap();
     assert!(matches!(stmt, Stmt::Expr(_)));
 }

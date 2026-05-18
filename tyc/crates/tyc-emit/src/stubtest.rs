@@ -24,7 +24,7 @@
 
 use std::collections::BTreeMap;
 
-use rustpython_ast::{text_size::TextRange, Mod, Stmt, StmtClassDef, StmtFunctionDef};
+use ruff_python_ast::{Expr, ModModule, Stmt, StmtClassDef, StmtFunctionDef};
 
 /// One finding produced by [`compare_modules`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,10 +50,7 @@ pub enum StubTestKind {
 /// Compare two parsed modules and return every difference as a finding.
 /// The stub module is the source of truth for the public API; the
 /// implementation is what callers actually use at runtime.
-pub fn compare_modules(
-    stub: &Mod<TextRange>,
-    implementation: &Mod<TextRange>,
-) -> Vec<StubTestFinding> {
+pub fn compare_modules(stub: &ModModule, implementation: &ModModule) -> Vec<StubTestFinding> {
     let stub_api = extract_api(stub);
     let impl_api = extract_api(implementation);
     diff_apis(&stub_api, &impl_api)
@@ -86,29 +83,24 @@ struct ClassShape {
     fields: BTreeMap<String, String>,
 }
 
-fn extract_api(module: &Mod<TextRange>) -> ModuleApi {
+fn extract_api(module: &ModModule) -> ModuleApi {
     let mut api = ModuleApi::default();
-    if let Mod::Module(m) = module {
-        for stmt in &m.body {
-            collect_top_level_stmt(stmt, &mut api);
-        }
+    for stmt in &module.body {
+        collect_top_level_stmt(stmt, &mut api);
     }
     api
 }
 
-fn collect_top_level_stmt(stmt: &Stmt<TextRange>, api: &mut ModuleApi) {
+fn collect_top_level_stmt(stmt: &Stmt, api: &mut ModuleApi) {
     match stmt {
+        // Ruff collapses sync/async function defs into a single
+        // `StmtFunctionDef`; we treat both as the same surface shape for
+        // v1 so a sync stub of an async impl is flagged via the signature
+        // diff (parameter list match) rather than a separate axis.
+        // Improving this is a follow-up.
         Stmt::FunctionDef(f) => {
             api.functions
                 .insert(f.name.as_str().to_owned(), function_shape(f));
-        }
-        Stmt::AsyncFunctionDef(f) => {
-            // Async/sync distinction is part of the runtime contract but for v1 we
-            // collapse them to the same shape so a sync stub of an async impl is
-            // flagged via the signature diff (parameter list match) rather than a
-            // separate axis.  Improving this is a follow-up.
-            api.functions
-                .insert(f.name.as_str().to_owned(), async_function_shape(f));
         }
         Stmt::ClassDef(c) => {
             api.classes
@@ -118,29 +110,18 @@ fn collect_top_level_stmt(stmt: &Stmt<TextRange>, api: &mut ModuleApi) {
     }
 }
 
-fn function_shape(f: &StmtFunctionDef<TextRange>) -> FunctionShape {
+fn function_shape(f: &StmtFunctionDef) -> FunctionShape {
     let mut params = Vec::new();
-    for arg in &f.args.posonlyargs {
-        params.push(arg.def.arg.as_str().to_owned());
+    for arg in &f.parameters.posonlyargs {
+        params.push(arg.parameter.name.as_str().to_owned());
     }
-    for arg in &f.args.args {
-        params.push(arg.def.arg.as_str().to_owned());
+    for arg in &f.parameters.args {
+        params.push(arg.parameter.name.as_str().to_owned());
     }
     FunctionShape { params }
 }
 
-fn async_function_shape(f: &rustpython_ast::StmtAsyncFunctionDef<TextRange>) -> FunctionShape {
-    let mut params = Vec::new();
-    for arg in &f.args.posonlyargs {
-        params.push(arg.def.arg.as_str().to_owned());
-    }
-    for arg in &f.args.args {
-        params.push(arg.def.arg.as_str().to_owned());
-    }
-    FunctionShape { params }
-}
-
-fn class_shape(c: &StmtClassDef<TextRange>) -> ClassShape {
+fn class_shape(c: &StmtClassDef) -> ClassShape {
     let mut shape = ClassShape::default();
     for stmt in &c.body {
         match stmt {
@@ -149,13 +130,8 @@ fn class_shape(c: &StmtClassDef<TextRange>) -> ClassShape {
                     .methods
                     .insert(f.name.as_str().to_owned(), function_shape(f));
             }
-            Stmt::AsyncFunctionDef(f) => {
-                shape
-                    .methods
-                    .insert(f.name.as_str().to_owned(), async_function_shape(f));
-            }
             Stmt::AnnAssign(a) => {
-                if let rustpython_ast::Expr::Name(n) = a.target.as_ref() {
+                if let Expr::Name(n) = a.target.as_ref() {
                     // Render the annotation through the same printer used by
                     // emit() so that two structurally-equivalent annotations
                     // produce the same text.
@@ -315,10 +291,10 @@ fn diff_classes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustpython_parser::{parse, Mode};
+    use tyc_syntax::parse_module;
 
-    fn parse_mod(src: &str) -> Mod<TextRange> {
-        parse(src, Mode::Module, "<test>").expect("parse failed")
+    fn parse_mod(src: &str) -> ModModule {
+        parse_module(src).expect("parse failed").into_syntax()
     }
 
     #[test]

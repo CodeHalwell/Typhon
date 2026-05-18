@@ -6,8 +6,8 @@ license.workspace = true
 description = "Purity, async, comptime, and optimisation analysis for Typhon (Phase 2+)"
 
 [dependencies]
-rustpython-ast    = { workspace = true }
-rustpython-parser = { workspace = true }
+ruff_python_ast   = { workspace = true }
+ruff_text_size    = { workspace = true }
 tyc-syntax        = { workspace = true }
 tyc-diagnostics   = { workspace = true }
 

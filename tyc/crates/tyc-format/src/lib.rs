@@ -2,23 +2,26 @@
 //!
 //! Pipeline for a single `.ty` file:
 //!
-//! 1. Pre-process: strip `let`/`mut` keywords so the Python parser can handle
-//!    the remainder of the grammar.
-//! 2. Parse: verify the source is syntactically valid using
-//!    `rustpython_parser`.
+//! 1. Pre-process: rewrite Typhon-specific sugar (`model:`, `interface:`,
+//!    `unsafe:`, `comptime`, `gather:`, `go`, `lazy`, `?` nullability) so
+//!    the underlying parser sees plain Python. `let` / `mut` are left in
+//!    place — the vendored Ruff parser recognises them natively.
+//! 2. Parse: verify the source is syntactically valid via the vendored
+//!    Ruff parser (`tyc_syntax::parse_module`).
 //! 3. Normalise: apply lightweight whitespace normalisation to the
-//!    pre-processed source (trailing spaces, final newline).  Comments and
+//!    pre-processed source (trailing spaces, final newline). Comments and
 //!    blank lines are preserved.
-//! 4. Post-process: restore `let`/`mut` at the appropriate locations.
+//! 4. Post-process: restore the keywords that *were* stripped (model /
+//!    impl / extend / interface / unsafe / comptime / lazy / gather / go).
 //!
-//! Full AST-based reformatting (which would drop comments) is deferred to a
-//! later phase when a comment-preserving CST emitter is available.
+//! Full AST-based reformatting (which would drop comments) is deferred to
+//! a later phase when a comment-preserving CST emitter is available.
 
 use std::path::Path;
 
 use tyc_diagnostics::TycError;
 use tyc_syntax::{
-    parser::parse_module,
+    parse_module,
     preprocess::{
         expand_gather_blocks, expand_go_calls, expand_pipes, expand_question_ops,
         expand_with_chains, postprocess_full, preprocess,
@@ -53,8 +56,8 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
     let validation_input = expand_question_ops(&expand_pipes(&expand_with_chains(
         &expand_go_calls(&expand_gather_blocks(&prep.python_source)),
     )));
-    parse_module(&validation_input, path).map_err(|e| {
-        let offset = usize::from(e.offset);
+    parse_module(&validation_input).map_err(|e| {
+        let offset = usize::from(e.location.start());
         TycError::parse(path, &validation_input, e.to_string(), offset)
     })?;
 

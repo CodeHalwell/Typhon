@@ -29,24 +29,24 @@ use crate::{
 
 /// Typhon-specific mutability prefix attached to an assignment statement.
 ///
-/// Added by Typhon's fork of `ruff_python_parser` so that `val x = 1` and
-/// `var x = 1` round-trip through the AST without a separate preprocessor
+/// Added by Typhon's fork of `ruff_python_parser` so that `let x = 1` and
+/// `mut x = 1` round-trip through the AST without a separate preprocessor
 /// pass. Standard Python keeps `mutability == None`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "get-size", derive(get_size2::GetSize))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Mutability {
-    /// `val` — immutable binding.
-    Val,
-    /// `var` — mutable binding.
-    Var,
+    /// `let` — immutable binding.
+    Let,
+    /// `mut` — mutable binding.
+    Mut,
 }
 
 impl Mutability {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Mutability::Val => "val",
-            Mutability::Var => "var",
+            Mutability::Let => "let",
+            Mutability::Mut => "mut",
         }
     }
 }

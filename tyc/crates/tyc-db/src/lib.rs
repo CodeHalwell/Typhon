@@ -10,12 +10,15 @@
 //! Later phases will migrate more passes (resolve, type-check) into
 //! tracked queries as their output types acquire `salsa::Update`.
 
-use rustpython_parser::{parse, Mode};
 use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_resolve::resolve_module;
-use tyc_syntax::preprocess::{
-    expand_gather_blocks, expand_go_calls, expand_pipes, expand_question_ops, expand_with_chains,
-    preprocess, validate_extend_usage, validate_lazy_usage, validate_question_ops,
+use tyc_syntax::{
+    parse_module,
+    preprocess::{
+        expand_gather_blocks, expand_go_calls, expand_pipes, expand_question_ops,
+        expand_with_chains, preprocess, validate_extend_usage, validate_lazy_usage,
+        validate_question_ops,
+    },
 };
 use tyc_types::check_module_with;
 
@@ -58,11 +61,12 @@ pub fn preprocessed_text(db: &dyn salsa::Database, file: SourceFile) -> String {
 pub fn module_decl_names(db: &dyn salsa::Database, file: SourceFile) -> Vec<String> {
     let source = preprocessed_text(db, file);
     let path = file.path(db).clone();
-    let module = match parse(&source, Mode::Module, &path) {
-        Ok(m) => m,
+    let parsed = match parse_module(&source) {
+        Ok(p) => p,
         Err(_) => return Vec::new(),
     };
-    let (resolved, _) = resolve_module(path, &source, &[], &module);
+    let module = parsed.into_syntax();
+    let (resolved, _) = resolve_module(path, &source, &module);
     resolved
         .module_scope()
         .bindings
@@ -172,25 +176,20 @@ fn check_impl(path: &str, text: &str) -> Diagnostics {
     ))));
     let prep = preprocess(&expanded);
 
-    let module = match parse(&prep.python_source, Mode::Module, path) {
-        Ok(m) => m,
+    let module = match parse_module(&prep.python_source) {
+        Ok(p) => p.into_syntax(),
         Err(e) => {
             diags.push_error(TycError::parse(
                 path.to_owned(),
                 prep.python_source,
                 e.to_string(),
-                usize::from(e.offset),
+                usize::from(e.location.start()),
             ));
             return diags;
         }
     };
 
-    let (resolved, resolve_diags) = resolve_module(
-        path.to_owned(),
-        &prep.python_source,
-        &prep.stripped,
-        &module,
-    );
+    let (resolved, resolve_diags) = resolve_module(path.to_owned(), &prep.python_source, &module);
     diags.extend(resolve_diags);
 
     let type_diags = check_module_with(
@@ -215,7 +214,7 @@ mod tests {
         let file = SourceFile::new(&db, "<test>".to_owned(), "let x: int = 1\n".to_owned());
         let p1 = preprocessed_text(&db, file);
         let p2 = preprocessed_text(&db, file);
-        assert_eq!(p1, "x: int = 1\n");
+        assert_eq!(p1, "let x: int = 1\n");
         assert_eq!(p1, p2);
     }
 
@@ -257,12 +256,12 @@ mod tests {
         let mut db = TycDatabase::new();
         let sf = SourceFile::new(&db, "<test>".to_owned(), "let x: int = 1\n".to_owned());
         let first = preprocessed_text(&db, sf);
-        assert_eq!(first, "x: int = 1\n");
+        assert_eq!(first, "let x: int = 1\n");
         // Update the file text — Salsa should invalidate the cached result.
         sf.set_text(&mut db)
             .to("let y: str = \"hello\"\n".to_owned());
         let second = preprocessed_text(&db, sf);
-        assert_eq!(second, "y: str = \"hello\"\n");
+        assert_eq!(second, "let y: str = \"hello\"\n");
         assert_ne!(
             first, second,
             "cached result must be invalidated after set_text"

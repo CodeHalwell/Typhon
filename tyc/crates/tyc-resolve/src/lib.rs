@@ -13,11 +13,9 @@
 //! removes characters at the start of a line, so positions inside
 //! expressions remain stable; we use them directly.
 
-use rustpython_ast::text_size::TextRange;
-use rustpython_ast::{Expr, Mod, Stmt};
+use ruff_python_ast::{self as ast, Expr, ModModule, Stmt};
+use ruff_text_size::TextRange;
 use tyc_diagnostics::{Diagnostics, TycError};
-use tyc_syntax::lexer::TyphonKeyword;
-use tyc_syntax::preprocess::StrippedKeyword;
 
 /// Mutability of a binding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,19 +242,13 @@ pub struct SymbolAtOffset<'a> {
 struct Resolver<'a> {
     path: String,
     source: &'a str,
-    /// `stripped[i]` records that line `i` had a leading `val`/`var`. The
-    /// list is in source order; we consume entries as we hit assignments.
-    stripped: &'a [StrippedKeyword],
-    /// Byte offset of the first character on each line, computed once so
-    /// that `line_of_offset` is O(log N) per call instead of O(N).
-    line_starts: Vec<usize>,
     scopes: Vec<Scope>,
     references: Vec<Reference>,
     diagnostics: Diagnostics,
 }
 
 impl<'a> Resolver<'a> {
-    fn new(path: String, source: &'a str, stripped: &'a [StrippedKeyword]) -> Self {
+    fn new(path: String, source: &'a str) -> Self {
         let module = Scope {
             id: 0,
             kind: ScopeKind::Module,
@@ -264,17 +256,9 @@ impl<'a> Resolver<'a> {
             bindings: Vec::new(),
             span: (0, source.len()),
         };
-        let mut line_starts = vec![0usize];
-        for (idx, b) in source.bytes().enumerate() {
-            if b == b'\n' {
-                line_starts.push(idx + 1);
-            }
-        }
         Self {
             path,
             source,
-            stripped,
-            line_starts,
             scopes: vec![module],
             references: Vec::new(),
             diagnostics: Diagnostics::new(),
@@ -291,23 +275,6 @@ impl<'a> Resolver<'a> {
             span,
         });
         id
-    }
-
-    /// Map a byte offset in the preprocessed source to a 0-based line index.
-    /// O(log N) via binary search over precomputed line starts.
-    fn line_of_offset(&self, offset: usize) -> usize {
-        self.line_starts
-            .partition_point(|&start| start <= offset)
-            .saturating_sub(1)
-    }
-
-    /// Was the assignment statement on `line_idx` introduced with `val` or
-    /// `var`?
-    fn keyword_for_line(&self, line_idx: usize) -> Option<TyphonKeyword> {
-        self.stripped
-            .iter()
-            .find(|sk| sk.line_index == line_idx)
-            .map(|sk| sk.keyword)
     }
 
     /// Has a binding called `name` already been declared in `scope`?
@@ -445,22 +412,19 @@ impl<'a> Resolver<'a> {
 
 /// Resolve a parsed module and return scopes + diagnostics.
 pub fn resolve_module(
-    path: impl Into<String>,
+    path: String,
     source: &str,
-    stripped: &[StrippedKeyword],
-    module: &Mod,
+    module: &ModModule,
 ) -> (ResolvedModule, Diagnostics) {
-    let mut r = Resolver::new(path.into(), source, stripped);
+    let mut r = Resolver::new(path, source);
 
-    if let Mod::Module(m) = module {
-        // First pass: collect top-level declarations so forward references
-        // inside functions and classes resolve correctly.
-        collect_top_level(&mut r, 0, &m.body);
+    // First pass: collect top-level declarations so forward references
+    // inside functions and classes resolve correctly.
+    collect_top_level(&mut r, 0, &module.body);
 
-        // Second pass: walk bodies to record references and inner scopes.
-        for stmt in &m.body {
-            walk_stmt(&mut r, 0, stmt);
-        }
+    // Second pass: walk bodies to record references and inner scopes.
+    for stmt in &module.body {
+        walk_stmt(&mut r, 0, stmt);
     }
 
     r.report_unknown_names();
@@ -505,18 +469,18 @@ fn find_def_name_span(
 /// two sub-passes so that `val` values are registered *before* function /
 /// class / import names — this lets the val-immutability check fire when a
 /// later `def x` or `class x` collides with an earlier `let x`.
-fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt<TextRange>]) {
+fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt]) {
     // Sub-pass 1: value bindings (so val-protection sees them first).
     let default_val = r.scopes[scope].kind == ScopeKind::Module;
     for stmt in body {
         match stmt {
             Stmt::Assign(a) => {
                 for t in &a.targets {
-                    declare_target(r, scope, t, default_val);
+                    declare_target(r, scope, t, default_val, a.mutability);
                 }
             }
             Stmt::AnnAssign(a) => {
-                declare_target(r, scope, &a.target, default_val);
+                declare_target(r, scope, &a.target, default_val, a.mutability);
             }
             _ => {}
         }
@@ -526,21 +490,6 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt<TextRange>])
     for stmt in body {
         match stmt {
             Stmt::FunctionDef(f) => {
-                let span = find_def_name_span(
-                    r.source,
-                    f.range.start().to_usize(),
-                    "def ",
-                    f.name.as_str(),
-                );
-                r.declare(
-                    scope,
-                    f.name.as_str(),
-                    BindingKind::Function,
-                    Mutability::Mut,
-                    span,
-                );
-            }
-            Stmt::AsyncFunctionDef(f) => {
                 let span = find_def_name_span(
                     r.source,
                     f.range.start().to_usize(),
@@ -636,35 +585,25 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt<TextRange>])
     }
 }
 
-fn declare_target(r: &mut Resolver, scope: ScopeId, target: &Expr<TextRange>, default_val: bool) {
+fn declare_target(
+    r: &mut Resolver,
+    scope: ScopeId,
+    target: &Expr,
+    default_val: bool,
+    ast_mutability: Option<ast::Mutability>,
+) {
     if let Expr::Name(n) = target {
-        let line = r.line_of_offset(n.range.start().to_usize());
-        let kw = r.keyword_for_line(line);
-        // When no explicit `val`/`var` keyword is present, treat a bare
-        // assignment as a rebinding of any existing binding (taking its
-        // mutability) rather than a fresh declaration. Only the *first*
-        // bareword assignment in a module scope defaults to `val`; later
-        // bare assignments inherit the existing binding's mutability.
+        // When no explicit `let`/`mut` keyword is present in the AST,
+        // treat a bare assignment as a rebinding of any existing binding
+        // (taking its mutability) rather than a fresh declaration. Only
+        // the *first* bareword assignment in a module scope defaults to
+        // `let`; later bare assignments inherit the existing binding's
+        // mutability.
         let existing_mut = r.lookup_local(scope, n.id.as_str()).map(|b| b.mutability);
-        let mutability = match kw {
-            Some(TyphonKeyword::Let) => Mutability::Let,
-            Some(TyphonKeyword::Mut) => Mutability::Mut,
-            // `comptime let` records the inner `val` keyword, so Comptime
-            // alone would only appear when the inner keyword was omitted.
-            // None of the other keywords are value binding keywords — treat
-            // them like bare assignments (inherit or default).
-            Some(
-                TyphonKeyword::Model
-                | TyphonKeyword::Comptime
-                | TyphonKeyword::Impl
-                | TyphonKeyword::Extend
-                | TyphonKeyword::Interface
-                | TyphonKeyword::Unsafe
-                | TyphonKeyword::Gather
-                | TyphonKeyword::Go
-                | TyphonKeyword::Lazy,
-            )
-            | None => existing_mut.unwrap_or(if default_val {
+        let mutability = match ast_mutability {
+            Some(ast::Mutability::Let) => Mutability::Let,
+            Some(ast::Mutability::Mut) => Mutability::Mut,
+            None => existing_mut.unwrap_or(if default_val {
                 Mutability::Let
             } else {
                 Mutability::Mut
@@ -686,32 +625,32 @@ fn range_to_span(range: TextRange) -> (usize, usize) {
     (range.start().to_usize(), range.end().to_usize())
 }
 
-fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
+fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
     match stmt {
         Stmt::FunctionDef(f) => {
             // Decorators are evaluated in the enclosing scope.
             for d in &f.decorator_list {
-                walk_expr(r, scope, d);
+                walk_expr(r, scope, &d.expression);
             }
             let fn_scope = r.push_scope(ScopeKind::Function, scope, range_to_span(f.range));
             // PEP 695 type parameters (`def f[T](x: T) -> T`) bind into the
             // function scope so the parameter and return-type annotations can
             // resolve them.
-            declare_type_params(r, fn_scope, &f.type_params);
+            declare_type_params(r, fn_scope, f.type_params.as_deref());
             // Annotations on parameters/return type may reference the type
             // params, so resolve them in the function scope rather than the
             // enclosing one when type params are present.
-            let ann_scope = if f.type_params.is_empty() {
+            let ann_scope = if type_params_is_empty(f.type_params.as_deref()) {
                 scope
             } else {
                 fn_scope
             };
-            walk_argument_annotations(r, ann_scope, &f.args);
+            walk_argument_annotations(r, ann_scope, &f.parameters);
             if let Some(ret) = &f.returns {
                 walk_expr(r, ann_scope, ret);
             }
             // Parameters become bindings in the new scope.
-            declare_arguments(r, fn_scope, &f.args);
+            declare_arguments(r, fn_scope, &f.parameters);
             // Pre-collect declarations within the function body so forward
             // references work.
             collect_top_level(r, fn_scope, &f.body);
@@ -719,40 +658,19 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
                 walk_stmt(r, fn_scope, s);
             }
         }
-        Stmt::AsyncFunctionDef(f) => {
-            for d in &f.decorator_list {
-                walk_expr(r, scope, d);
-            }
-            let fn_scope = r.push_scope(ScopeKind::Function, scope, range_to_span(f.range));
-            declare_type_params(r, fn_scope, &f.type_params);
-            let ann_scope = if f.type_params.is_empty() {
-                scope
-            } else {
-                fn_scope
-            };
-            walk_argument_annotations(r, ann_scope, &f.args);
-            if let Some(ret) = &f.returns {
-                walk_expr(r, ann_scope, ret);
-            }
-            declare_arguments(r, fn_scope, &f.args);
-            collect_top_level(r, fn_scope, &f.body);
-            for s in &f.body {
-                walk_stmt(r, fn_scope, s);
-            }
-        }
         Stmt::ClassDef(c) => {
             for d in &c.decorator_list {
-                walk_expr(r, scope, d);
+                walk_expr(r, scope, &d.expression);
             }
             let cls_scope = r.push_scope(ScopeKind::Class, scope, range_to_span(c.range));
-            declare_type_params(r, cls_scope, &c.type_params);
+            declare_type_params(r, cls_scope, c.type_params.as_deref());
             // Base classes that reference type params need the class scope.
-            let base_scope = if c.type_params.is_empty() {
+            let base_scope = if type_params_is_empty(c.type_params.as_deref()) {
                 scope
             } else {
                 cls_scope
             };
-            for base in &c.bases {
+            for base in c.bases() {
                 walk_expr(r, base_scope, base);
             }
             collect_top_level(r, cls_scope, &c.body);
@@ -772,7 +690,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
             // into the enclosing scope and is already pre-declared by
             // `collect_top_level`.
             let alias_scope = r.push_scope(ScopeKind::Function, scope, range_to_span(ta.range));
-            declare_type_params(r, alias_scope, &ta.type_params);
+            declare_type_params(r, alias_scope, ta.type_params.as_deref());
             walk_expr(r, alias_scope, &ta.value);
         }
         Stmt::Assign(a) => {
@@ -780,7 +698,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
             let default_val = r.scopes[scope].kind == ScopeKind::Module;
             for t in &a.targets {
                 if let Expr::Name(_) = t {
-                    declare_target(r, scope, t, default_val);
+                    declare_target(r, scope, t, default_val, a.mutability);
                 } else {
                     walk_expr(r, scope, t);
                 }
@@ -793,7 +711,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
             walk_expr(r, scope, &a.annotation);
             if let Expr::Name(_) = a.target.as_ref() {
                 let default_val = r.scopes[scope].kind == ScopeKind::Module;
-                declare_target(r, scope, &a.target, default_val);
+                declare_target(r, scope, &a.target, default_val, a.mutability);
             }
         }
         Stmt::AugAssign(a) => {
@@ -811,8 +729,13 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
             for s in &i.body {
                 walk_stmt(r, scope, s);
             }
-            for s in &i.orelse {
-                walk_stmt(r, scope, s);
+            for clause in &i.elif_else_clauses {
+                if let Some(test) = &clause.test {
+                    walk_expr(r, scope, test);
+                }
+                for s in &clause.body {
+                    walk_stmt(r, scope, s);
+                }
             }
         }
         Stmt::While(w) => {
@@ -870,57 +793,12 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
                 walk_stmt(r, scope, s);
             }
         }
-        Stmt::AsyncWith(w) => {
-            for item in &w.items {
-                walk_expr(r, scope, &item.context_expr);
-                if let Some(var) = &item.optional_vars {
-                    if let Expr::Name(n) = var.as_ref() {
-                        let span = (
-                            n.range.start().to_usize(),
-                            n.range.start().to_usize() + n.id.as_str().len(),
-                        );
-                        r.declare(
-                            scope,
-                            n.id.as_str(),
-                            BindingKind::Loop,
-                            Mutability::Mut,
-                            span,
-                        );
-                    }
-                }
-            }
-            for s in &w.body {
-                walk_stmt(r, scope, s);
-            }
-        }
-        Stmt::AsyncFor(f) => {
-            walk_expr(r, scope, &f.iter);
-            if let Expr::Name(n) = f.target.as_ref() {
-                let span = (
-                    n.range.start().to_usize(),
-                    n.range.start().to_usize() + n.id.as_str().len(),
-                );
-                r.declare(
-                    scope,
-                    n.id.as_str(),
-                    BindingKind::Loop,
-                    Mutability::Mut,
-                    span,
-                );
-            }
-            for s in &f.body {
-                walk_stmt(r, scope, s);
-            }
-            for s in &f.orelse {
-                walk_stmt(r, scope, s);
-            }
-        }
         Stmt::Try(t) => {
             for s in &t.body {
                 walk_stmt(r, scope, s);
             }
             for h in &t.handlers {
-                let rustpython_ast::ExceptHandler::ExceptHandler(h) = h;
+                let ast::ExceptHandler::ExceptHandler(h) = h;
                 if let Some(typ) = &h.type_ {
                     walk_expr(r, scope, typ);
                 }
@@ -979,18 +857,14 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt<TextRange>) {
 /// Walk every annotation expression on the parameters of a function, so
 /// names used in those annotations are recorded as references and bound
 /// against the enclosing scope.
-fn walk_argument_annotations(
-    r: &mut Resolver,
-    scope: ScopeId,
-    args: &rustpython_ast::Arguments<TextRange>,
-) {
+fn walk_argument_annotations(r: &mut Resolver, scope: ScopeId, args: &ast::Parameters) {
     let all = args
         .posonlyargs
         .iter()
         .chain(args.args.iter())
         .chain(args.kwonlyargs.iter());
     for arg in all {
-        if let Some(ann) = &arg.def.annotation {
+        if let Some(ann) = &arg.parameter.annotation {
             walk_expr(r, scope, ann);
         }
     }
@@ -1008,18 +882,18 @@ fn walk_argument_annotations(
 
 /// Walk a single statement from an `impl` pseudo-class body.
 ///
-/// Identical to [`walk_stmt`] for `FunctionDef` and `AsyncFunctionDef`, but
+/// Identical to [`walk_stmt`] for `FunctionDef` (sync and async), but
 /// additionally pre-declares a synthetic `self` binding in each method's
 /// scope.  The desugar pass injects `self` as the actual first parameter
 /// later; this declaration prevents false "unknown name: self" errors during
 /// resolution.  All other statement kinds fall through to [`walk_stmt`].
-fn walk_impl_method(r: &mut Resolver, cls_scope: ScopeId, stmt: &Stmt<TextRange>) {
+fn walk_impl_method(r: &mut Resolver, cls_scope: ScopeId, stmt: &Stmt) {
     match stmt {
         Stmt::FunctionDef(f) => {
             for d in &f.decorator_list {
-                walk_expr(r, cls_scope, d);
+                walk_expr(r, cls_scope, &d.expression);
             }
-            walk_argument_annotations(r, cls_scope, &f.args);
+            walk_argument_annotations(r, cls_scope, &f.parameters);
             if let Some(ret) = &f.returns {
                 walk_expr(r, cls_scope, ret);
             }
@@ -1032,29 +906,7 @@ fn walk_impl_method(r: &mut Resolver, cls_scope: ScopeId, stmt: &Stmt<TextRange>
                 Mutability::Mut,
                 (0, 0),
             );
-            declare_arguments(r, fn_scope, &f.args);
-            collect_top_level(r, fn_scope, &f.body);
-            for s in &f.body {
-                walk_stmt(r, fn_scope, s);
-            }
-        }
-        Stmt::AsyncFunctionDef(f) => {
-            for d in &f.decorator_list {
-                walk_expr(r, cls_scope, d);
-            }
-            walk_argument_annotations(r, cls_scope, &f.args);
-            if let Some(ret) = &f.returns {
-                walk_expr(r, cls_scope, ret);
-            }
-            let fn_scope = r.push_scope(ScopeKind::Function, cls_scope, range_to_span(f.range));
-            r.declare(
-                fn_scope,
-                "self",
-                BindingKind::Parameter,
-                Mutability::Mut,
-                (0, 0),
-            );
-            declare_arguments(r, fn_scope, &f.args);
+            declare_arguments(r, fn_scope, &f.parameters);
             collect_top_level(r, fn_scope, &f.body);
             for s in &f.body {
                 walk_stmt(r, fn_scope, s);
@@ -1070,16 +922,13 @@ fn walk_impl_method(r: &mut Resolver, cls_scope: ScopeId, stmt: &Stmt<TextRange>
 ///
 /// Bounds (`T: Number`) are resolved in the enclosing scope where the bound
 /// itself was written; we don't model variance / constraints in v1.
-fn declare_type_params(
-    r: &mut Resolver,
-    scope: ScopeId,
-    type_params: &[rustpython_ast::TypeParam<TextRange>],
-) {
-    for tp in type_params {
+fn declare_type_params(r: &mut Resolver, scope: ScopeId, type_params: Option<&ast::TypeParams>) {
+    let Some(tps) = type_params else { return };
+    for tp in &tps.type_params {
         let (name, range, bound) = match tp {
-            rustpython_ast::TypeParam::TypeVar(t) => (t.name.as_str(), t.range, t.bound.as_deref()),
-            rustpython_ast::TypeParam::ParamSpec(p) => (p.name.as_str(), p.range, None),
-            rustpython_ast::TypeParam::TypeVarTuple(t) => (t.name.as_str(), t.range, None),
+            ast::TypeParam::TypeVar(t) => (t.name.as_str(), t.range, t.bound.as_deref()),
+            ast::TypeParam::ParamSpec(p) => (p.name.as_str(), p.range, None),
+            ast::TypeParam::TypeVarTuple(t) => (t.name.as_str(), t.range, None),
         };
         if let Some(b) = bound {
             walk_expr(r, scope, b);
@@ -1092,11 +941,13 @@ fn declare_type_params(
     }
 }
 
-fn declare_arguments(
-    r: &mut Resolver,
-    scope: ScopeId,
-    args: &rustpython_ast::Arguments<TextRange>,
-) {
+/// True when the function/class has no type parameters (either `None` or an
+/// empty `TypeParams` list).
+fn type_params_is_empty(type_params: Option<&ast::TypeParams>) -> bool {
+    type_params.is_none_or(|t| t.type_params.is_empty())
+}
+
+fn declare_arguments(r: &mut Resolver, scope: ScopeId, args: &ast::Parameters) {
     let all = args
         .posonlyargs
         .iter()
@@ -1104,12 +955,12 @@ fn declare_arguments(
         .chain(args.kwonlyargs.iter());
     for arg in all {
         let span = (
-            arg.def.range.start().to_usize(),
-            arg.def.range.start().to_usize() + arg.def.arg.as_str().len(),
+            arg.parameter.range.start().to_usize(),
+            arg.parameter.range.start().to_usize() + arg.parameter.name.as_str().len(),
         );
         r.declare(
             scope,
-            arg.def.arg.as_str(),
+            arg.parameter.name.as_str(),
             BindingKind::Parameter,
             Mutability::Mut,
             span,
@@ -1118,11 +969,11 @@ fn declare_arguments(
     if let Some(va) = &args.vararg {
         let span = (
             va.range.start().to_usize(),
-            va.range.start().to_usize() + va.arg.as_str().len(),
+            va.range.start().to_usize() + va.name.as_str().len(),
         );
         r.declare(
             scope,
-            va.arg.as_str(),
+            va.name.as_str(),
             BindingKind::Parameter,
             Mutability::Mut,
             span,
@@ -1131,11 +982,11 @@ fn declare_arguments(
     if let Some(kw) = &args.kwarg {
         let span = (
             kw.range.start().to_usize(),
-            kw.range.start().to_usize() + kw.arg.as_str().len(),
+            kw.range.start().to_usize() + kw.name.as_str().len(),
         );
         r.declare(
             scope,
-            kw.arg.as_str(),
+            kw.name.as_str(),
             BindingKind::Parameter,
             Mutability::Mut,
             span,
@@ -1144,7 +995,7 @@ fn declare_arguments(
 }
 
 /// Walk an expression, recording every name reference.
-fn walk_expr(r: &mut Resolver, scope: ScopeId, expr: &Expr<TextRange>) {
+fn walk_expr(r: &mut Resolver, scope: ScopeId, expr: &Expr) {
     match expr {
         Expr::Name(n) => {
             let span = (
@@ -1165,10 +1016,10 @@ fn walk_expr(r: &mut Resolver, scope: ScopeId, expr: &Expr<TextRange>) {
         Expr::UnaryOp(u) => walk_expr(r, scope, &u.operand),
         Expr::Call(c) => {
             walk_expr(r, scope, &c.func);
-            for a in &c.args {
+            for a in &c.arguments.args {
                 walk_expr(r, scope, a);
             }
-            for k in &c.keywords {
+            for k in &c.arguments.keywords {
                 walk_expr(r, scope, &k.value);
             }
         }
@@ -1179,7 +1030,7 @@ fn walk_expr(r: &mut Resolver, scope: ScopeId, expr: &Expr<TextRange>) {
         }
         Expr::Compare(c) => {
             walk_expr(r, scope, &c.left);
-            for c2 in &c.comparators {
+            for c2 in c.comparators.iter() {
                 walk_expr(r, scope, c2);
             }
         }
@@ -1199,14 +1050,14 @@ fn walk_expr(r: &mut Resolver, scope: ScopeId, expr: &Expr<TextRange>) {
             }
         }
         Expr::Dict(d) => {
-            for k in d.keys.iter().flatten() {
-                walk_expr(r, scope, k);
-            }
-            for v in &d.values {
-                walk_expr(r, scope, v);
+            for item in &d.items {
+                if let Some(k) = &item.key {
+                    walk_expr(r, scope, k);
+                }
+                walk_expr(r, scope, &item.value);
             }
         }
-        Expr::IfExp(i) => {
+        Expr::If(i) => {
             walk_expr(r, scope, &i.test);
             walk_expr(r, scope, &i.body);
             walk_expr(r, scope, &i.orelse);
@@ -1232,12 +1083,14 @@ fn walk_expr(r: &mut Resolver, scope: ScopeId, expr: &Expr<TextRange>) {
         Expr::YieldFrom(y) => walk_expr(r, scope, &y.value),
         Expr::Lambda(l) => {
             let scope2 = r.push_scope(ScopeKind::Function, scope, range_to_span(l.range));
-            declare_arguments(r, scope2, &l.args);
+            if let Some(params) = &l.parameters {
+                declare_arguments(r, scope2, params);
+            }
             walk_expr(r, scope2, &l.body);
         }
         Expr::ListComp(c) => walk_comp(r, scope, range_to_span(c.range), &c.elt, &c.generators),
         Expr::SetComp(c) => walk_comp(r, scope, range_to_span(c.range), &c.elt, &c.generators),
-        Expr::GeneratorExp(g) => walk_comp(r, scope, range_to_span(g.range), &g.elt, &g.generators),
+        Expr::Generator(g) => walk_comp(r, scope, range_to_span(g.range), &g.elt, &g.generators),
         Expr::DictComp(c) => {
             let scope2 = r.push_scope(ScopeKind::Comprehension, scope, range_to_span(c.range));
             for gen in &c.generators {
@@ -1259,11 +1112,41 @@ fn walk_expr(r: &mut Resolver, scope: ScopeId, expr: &Expr<TextRange>) {
                     walk_expr(r, scope2, cond);
                 }
             }
-            walk_expr(r, scope2, &c.key);
+            if let Some(key) = &c.key {
+                walk_expr(r, scope2, key);
+            }
             walk_expr(r, scope2, &c.value);
         }
-        Expr::Constant(_) | Expr::JoinedStr(_) | Expr::FormattedValue(_) => {}
-        Expr::NamedExpr(n) => {
+        // Literal-shaped expressions with no embedded references.
+        Expr::NumberLiteral(_)
+        | Expr::StringLiteral(_)
+        | Expr::BytesLiteral(_)
+        | Expr::BooleanLiteral(_)
+        | Expr::NoneLiteral(_)
+        | Expr::EllipsisLiteral(_)
+        | Expr::IpyEscapeCommand(_) => {}
+        // f-strings and t-strings carry interpolated expressions inside
+        // their `value` structure (ruff folds the rustpython
+        // `FormattedValue`/`JoinedStr` variants away). Walk every
+        // interpolation so name references inside `f"{x}"` still feed
+        // unknown-name and unused-binding diagnostics. Format-specs are
+        // themselves InterpolatedStringElements, so a nested `{spec}` is
+        // visited via the same path on the next pass through this code.
+        Expr::FString(fs) => {
+            for elem in fs.value.elements() {
+                if let ast::InterpolatedStringElement::Interpolation(interp) = elem {
+                    walk_expr(r, scope, &interp.expression);
+                }
+            }
+        }
+        Expr::TString(ts) => {
+            for elem in ts.value.elements() {
+                if let ast::InterpolatedStringElement::Interpolation(interp) = elem {
+                    walk_expr(r, scope, &interp.expression);
+                }
+            }
+        }
+        Expr::Named(n) => {
             walk_expr(r, scope, &n.value);
             if let Expr::Name(name) = n.target.as_ref() {
                 let span = (
@@ -1286,8 +1169,8 @@ fn walk_comp(
     r: &mut Resolver,
     scope: ScopeId,
     span: (usize, usize),
-    elt: &Expr<TextRange>,
-    generators: &[rustpython_ast::Comprehension<TextRange>],
+    elt: &Expr,
+    generators: &[ast::Comprehension],
 ) {
     let scope2 = r.push_scope(ScopeKind::Comprehension, scope, span);
     for gen in generators {
@@ -1497,18 +1380,14 @@ fn builtin_names() -> std::collections::HashSet<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustpython_parser::{parse, Mode};
     use tyc_syntax::preprocess::preprocess;
 
     fn resolve(src: &str) -> (ResolvedModule, Diagnostics) {
         let prep = preprocess(src);
-        let module = parse(&prep.python_source, Mode::Module, "<test>").unwrap();
-        resolve_module(
-            "<test>".to_owned(),
-            &prep.python_source,
-            &prep.stripped,
-            &module,
-        )
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
+        resolve_module("<test>".to_owned(), &prep.python_source, &module)
     }
 
     #[test]
@@ -1615,6 +1494,22 @@ def foo():
         assert!(d.has_errors());
         let msg = format!("{}", d.errors()[0]);
         assert!(msg.contains("cannot find 'z'"), "got {}", msg);
+    }
+
+    #[test]
+    fn unknown_name_inside_fstring_interpolation_is_flagged() {
+        // ruff's FString embeds the interpolated expression inside
+        // `value.elements()` rather than exposing it as a top-level
+        // `Expr`, so the resolver must explicitly walk the InterpolatedStringElement
+        // tree. Otherwise unknown names inside `f"{…}"` go undetected.
+        let (_m, d) = resolve("x = f\"{missing_name}\"\n");
+        assert!(d.has_errors(), "f-string interpolation must be walked");
+        let msg = format!("{}", d.errors()[0]);
+        assert!(
+            msg.contains("cannot find 'missing_name'"),
+            "expected the unknown-name diagnostic to fire on the interpolation; got {}",
+            msg
+        );
     }
 
     #[test]
@@ -1792,11 +1687,13 @@ def foo():
         //       column 20 is the reference `x` on the second line.
         let src = "let x: int = 1\nlet y: int = x\n";
         let (m, _d) = resolve(src);
-        // The byte offset of the reference `x` on the second line in the
-        // preprocessed source: "x: int = 1\ny: int = x\n" — newline at byte 10,
-        // `y: int = x` follows so the `x` use sits at byte 20.
+        // The byte offset of the reference `x` on the second line: the
+        // source is "let x: int = 1\nlet y: int = x\n" (preprocessor no
+        // longer strips let/mut). First line ends at byte 14 (newline
+        // inclusive at 14), second line `let y: int = x` puts `x` at
+        // byte 15 + 13 = 28.
         let symbol = m
-            .symbol_at_offset(20)
+            .symbol_at_offset(28)
             .expect("symbol_at_offset should find the reference");
         assert_eq!(symbol.name, "x");
         assert!(!symbol.is_definition, "this is a use site, not a decl");
@@ -1809,8 +1706,8 @@ def foo():
     fn symbol_at_offset_finds_declaration() {
         let src = "let foo: int = 1\n";
         let (m, _d) = resolve(src);
-        // In the preprocessed source `foo: int = 1\n`, `foo` starts at byte 0.
-        let symbol = m.symbol_at_offset(1).expect("symbol should be found");
+        // In the (unstripped) source `let foo: int = 1\n`, `foo` starts at byte 4.
+        let symbol = m.symbol_at_offset(5).expect("symbol should be found");
         assert_eq!(symbol.name, "foo");
         assert!(
             symbol.is_definition,

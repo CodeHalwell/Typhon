@@ -20,18 +20,21 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rustpython_ast::{
-    text_size::TextRange, Alias, Arg, ArgWithDefault, Constant, Expr, ExprCall, ExprConstant,
-    ExprContext, ExprName, Identifier, Mod, ModModule, Stmt, StmtAssign, StmtImport,
-    StmtImportFrom,
+use ruff_python_ast::name::Name;
+use ruff_python_ast::{
+    Alias, Arguments, AtomicNodeIndex, Decorator, ExceptHandler, Expr, ExprAttribute,
+    ExprBooleanLiteral, ExprCall, ExprContext, ExprName, ExprStringLiteral, Identifier, Keyword,
+    ModModule, Parameter, ParameterWithDefault, Parameters, Stmt, StmtAssign, StmtImport,
+    StmtImportFrom, StringLiteral, StringLiteralFlags, StringLiteralValue, WithItem,
 };
+use ruff_text_size::TextRange;
 
 // ── public API ───────────────────────────────────────────────────────────────
 
 /// Output of the module desugaring pass.
 pub struct DesugarOutput {
     /// The desugared Python-compatible AST.
-    pub module: Mod<TextRange>,
+    pub module: ModModule,
     /// Whether the emitted module will import from `typhon_runtime`. When
     /// true, the build command must write `typhon_runtime.py` alongside the
     /// other output files so the generated import can resolve at runtime.
@@ -65,7 +68,7 @@ pub struct DesugarOptions {
 ///    `Result` anywhere, `from typhon_runtime import Ok, Err, Result` is
 ///    injected after any leading docstring and future-imports so the generated
 ///    Python can use those names.
-pub fn desugar_module(module: &Mod<TextRange>) -> DesugarOutput {
+pub fn desugar_module(module: &ModModule) -> DesugarOutput {
     desugar_module_with(module, DesugarOptions::default())
 }
 
@@ -74,97 +77,88 @@ pub fn desugar_module(module: &Mod<TextRange>) -> DesugarOutput {
 /// Used by `tyc build` to thread purity-analysis results (which top-level
 /// functions opted into `@memo` and therefore need an injected
 /// `@functools.cache` decorator) through to the desugar pass.
-pub fn desugar_module_with(module: &Mod<TextRange>, options: DesugarOptions) -> DesugarOutput {
-    match module {
-        Mod::Module(m) => {
-            let desugared_mod = desugar_mod_module_with(m, &options);
+pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> DesugarOutput {
+    let desugared_mod = desugar_mod_module_with(module, &options);
 
-            let has_result_usage = stmts_use_result_names(&m.body);
-            let has_any_runtime_import = has_any_typhon_runtime_import(&m.body);
-            let import_covers_all = typhon_runtime_import_covers_all(&m.body);
-            // Detect `typhon_runtime.tasks.spawn(...)` (lowered `go`) and
-            // `typhon_runtime.lazy.lazy_import(...)` / `typhon_runtime.lazy.lazy_val(...)`
-            // (lowered `lazy import` / `lazy val`) calls so we know to import
-            // the runtime as a module and emit the helper file.
-            let has_runtime_qualified = expr_tree_uses_runtime_attribute(&desugared_mod.body);
-            // The build must write `typhon_runtime.py` whenever the emitted
-            // module will reference it — either because we detected an Ok/
-            // Err/Result name, because the user explicitly imported it, or
-            // because a `go`/`lazy` lowering produced a qualified reference.
-            let needs_typhon_runtime =
-                has_result_usage || has_any_runtime_import || has_runtime_qualified;
-            // Only skip injection when an existing `from typhon_runtime
-            // import …` already covers all three names. A partial import
-            // (e.g. just `Ok`) would leave `Err`/`Result` undefined, so we
-            // still inject. A bare `import typhon_runtime` doesn't bring
-            // `Ok`/`Err`/`Result` into scope, so we also still inject.
-            let inject_result_import = has_result_usage && !import_covers_all;
+    let has_result_usage = stmts_use_result_names(&module.body);
+    let has_any_runtime_import = has_any_typhon_runtime_import(&module.body);
+    let import_covers_all = typhon_runtime_import_covers_all(&module.body);
+    // Detect `typhon_runtime.tasks.spawn(...)` (lowered `go`) and
+    // `typhon_runtime.lazy.lazy_import(...)` / `typhon_runtime.lazy.lazy_val(...)`
+    // (lowered `lazy import` / `lazy val`) calls so we know to import
+    // the runtime as a module and emit the helper file.
+    let has_runtime_qualified = expr_tree_uses_runtime_attribute(&desugared_mod.body);
+    // The build must write `typhon_runtime.py` whenever the emitted
+    // module will reference it — either because we detected an Ok/
+    // Err/Result name, because the user explicitly imported it, or
+    // because a `go`/`lazy` lowering produced a qualified reference.
+    let needs_typhon_runtime = has_result_usage || has_any_runtime_import || has_runtime_qualified;
+    // Only skip injection when an existing `from typhon_runtime
+    // import …` already covers all three names. A partial import
+    // (e.g. just `Ok`) would leave `Err`/`Result` undefined, so we
+    // still inject. A bare `import typhon_runtime` doesn't bring
+    // `Ok`/`Err`/`Result` into scope, so we also still inject.
+    let inject_result_import = has_result_usage && !import_covers_all;
 
-            // Inject pydantic imports for any class that inherits from BaseModel
-            // (produced by the `model` keyword preprocessor).  Track BaseModel and
-            // ConfigDict independently: a module that already has
-            // `from pydantic import BaseModel` still needs `ConfigDict` imported
-            // because the desugarer injects `model_config = ConfigDict(extra="forbid")`.
-            let needs_pydantic = stmts_use_basemodel(&desugared_mod.body);
-            let inject_basemodel = needs_pydantic && !has_pydantic_import(&desugared_mod.body);
-            let inject_config_dict = needs_pydantic && !has_config_dict_import(&desugared_mod.body);
+    // Inject pydantic imports for any class that inherits from BaseModel
+    // (produced by the `model` keyword preprocessor).  Track BaseModel and
+    // ConfigDict independently: a module that already has
+    // `from pydantic import BaseModel` still needs `ConfigDict` imported
+    // because the desugarer injects `model_config = ConfigDict(extra="forbid")`.
+    let needs_pydantic = stmts_use_basemodel(&desugared_mod.body);
+    let inject_basemodel = needs_pydantic && !has_pydantic_import(&desugared_mod.body);
+    let inject_config_dict = needs_pydantic && !has_config_dict_import(&desugared_mod.body);
 
-            // `interface Name:` lowers to `class Name(Protocol):` — ensure
-            // `from typing import Protocol` is in scope.
-            let needs_protocol = stmts_use_protocol_base(&desugared_mod.body);
-            let inject_protocol = needs_protocol && !has_protocol_import(&desugared_mod.body);
+    // `interface Name:` lowers to `class Name(Protocol):` — ensure
+    // `from typing import Protocol` is in scope.
+    let needs_protocol = stmts_use_protocol_base(&desugared_mod.body);
+    let inject_protocol = needs_protocol && !has_protocol_import(&desugared_mod.body);
 
-            // `gather:` lowers to `asyncio.TaskGroup` and best-effort to
-            // `asyncio.gather(...)` — ensure `import asyncio` is in scope.
-            let needs_asyncio = stmts_use_asyncio_qualified(&desugared_mod.body);
-            let inject_asyncio = needs_asyncio && !has_asyncio_import(&desugared_mod.body);
+    // `gather:` lowers to `asyncio.TaskGroup` and best-effort to
+    // `asyncio.gather(...)` — ensure `import asyncio` is in scope.
+    let needs_asyncio = stmts_use_asyncio_qualified(&desugared_mod.body);
+    let inject_asyncio = needs_asyncio && !has_asyncio_import(&desugared_mod.body);
 
-            // `go` and `lazy` lower to `typhon_runtime.tasks.spawn(...)` /
-            // `typhon_runtime.lazy.…` — ensure a bare `import typhon_runtime`
-            // is in scope when the user hasn't already arranged one.
-            let inject_runtime_module =
-                has_runtime_qualified && !has_bare_typhon_runtime_import(&desugared_mod.body);
+    // `go` and `lazy` lower to `typhon_runtime.tasks.spawn(...)` /
+    // `typhon_runtime.lazy.…` — ensure a bare `import typhon_runtime`
+    // is in scope when the user hasn't already arranged one.
+    let inject_runtime_module =
+        has_runtime_qualified && !has_bare_typhon_runtime_import(&desugared_mod.body);
 
-            let mut body = desugared_mod.body;
-            let insert_at = import_insert_pos(&body);
+    let mut body = desugared_mod.body;
+    let insert_at = import_insert_pos(&body);
 
-            // Insert imports in reverse order so later `insert_at` calls don't
-            // shift indices of earlier insertions.
-            if inject_runtime_module {
-                body.insert(insert_at, make_bare_typhon_runtime_import());
-            }
-            if inject_asyncio {
-                body.insert(insert_at, make_asyncio_import());
-            }
-            if inject_protocol {
-                body.insert(insert_at, make_protocol_import());
-            }
-            if inject_result_import {
-                body.insert(insert_at, make_typhon_runtime_import());
-            }
-            // Emit the fewest imports possible: combine into one statement when
-            // both are needed, otherwise emit just the missing one.
-            if inject_basemodel && inject_config_dict {
-                body.insert(insert_at, make_pydantic_basemodel_import()); // includes both
-            } else if inject_basemodel {
-                body.insert(insert_at, make_pydantic_basemodel_only_import());
-            } else if inject_config_dict {
-                body.insert(insert_at, make_config_dict_only_import());
-            }
+    // Insert imports in reverse order so later `insert_at` calls don't
+    // shift indices of earlier insertions.
+    if inject_runtime_module {
+        body.insert(insert_at, make_bare_typhon_runtime_import());
+    }
+    if inject_asyncio {
+        body.insert(insert_at, make_asyncio_import());
+    }
+    if inject_protocol {
+        body.insert(insert_at, make_protocol_import());
+    }
+    if inject_result_import {
+        body.insert(insert_at, make_typhon_runtime_import());
+    }
+    // Emit the fewest imports possible: combine into one statement when
+    // both are needed, otherwise emit just the missing one.
+    if inject_basemodel && inject_config_dict {
+        body.insert(insert_at, make_pydantic_basemodel_import()); // includes both
+    } else if inject_basemodel {
+        body.insert(insert_at, make_pydantic_basemodel_only_import());
+    } else if inject_config_dict {
+        body.insert(insert_at, make_config_dict_only_import());
+    }
 
-            DesugarOutput {
-                module: Mod::Module(ModModule {
-                    range: desugared_mod.range,
-                    body,
-                    type_ignores: desugared_mod.type_ignores,
-                }),
-                needs_typhon_runtime,
-            }
-        }
-        other => DesugarOutput {
-            module: other.clone(),
-            needs_typhon_runtime: false,
+    DesugarOutput {
+        module: ModModule {
+            range: desugared_mod.range,
+            node_index: AtomicNodeIndex::NONE,
+            body,
         },
+        needs_typhon_runtime,
     }
 }
 
@@ -172,32 +166,26 @@ pub fn desugar_module_with(module: &Mod<TextRange>, options: DesugarOptions) -> 
 
 /// Return `true` if any statement in `stmts` (or its nested bodies) references
 /// the identifiers `Ok`, `Err`, or `Result`.
-fn stmts_use_result_names(stmts: &[Stmt<TextRange>]) -> bool {
+fn stmts_use_result_names(stmts: &[Stmt]) -> bool {
     stmts.iter().any(stmt_uses_result_names)
 }
 
-fn stmt_uses_result_names(stmt: &Stmt<TextRange>) -> bool {
+fn stmt_uses_result_names(stmt: &Stmt) -> bool {
     match stmt {
         Stmt::FunctionDef(f) => {
             f.returns
                 .as_ref()
                 .is_some_and(|r| expr_uses_result_names(r))
-                || arguments_use_result_names(&f.args)
-                || f.decorator_list.iter().any(expr_uses_result_names)
-                || stmts_use_result_names(&f.body)
-        }
-        Stmt::AsyncFunctionDef(f) => {
-            f.returns
-                .as_ref()
-                .is_some_and(|r| expr_uses_result_names(r))
-                || arguments_use_result_names(&f.args)
-                || f.decorator_list.iter().any(expr_uses_result_names)
+                || parameters_use_result_names(&f.parameters)
+                || f.decorator_list.iter().any(decorator_uses_result_names)
                 || stmts_use_result_names(&f.body)
         }
         Stmt::ClassDef(c) => {
-            c.decorator_list.iter().any(expr_uses_result_names)
-                || c.bases.iter().any(expr_uses_result_names)
-                || c.keywords.iter().any(|k| expr_uses_result_names(&k.value))
+            c.decorator_list.iter().any(decorator_uses_result_names)
+                || c.bases().iter().any(expr_uses_result_names)
+                || c.keywords()
+                    .iter()
+                    .any(|k| expr_uses_result_names(&k.value))
                 || stmts_use_result_names(&c.body)
         }
         Stmt::AnnAssign(a) => {
@@ -214,7 +202,10 @@ fn stmt_uses_result_names(stmt: &Stmt<TextRange>) -> bool {
         Stmt::If(i) => {
             expr_uses_result_names(&i.test)
                 || stmts_use_result_names(&i.body)
-                || stmts_use_result_names(&i.orelse)
+                || i.elif_else_clauses.iter().any(|c| {
+                    c.test.as_ref().is_some_and(expr_uses_result_names)
+                        || stmts_use_result_names(&c.body)
+                })
         }
         Stmt::While(w) => {
             expr_uses_result_names(&w.test)
@@ -227,25 +218,10 @@ fn stmt_uses_result_names(stmt: &Stmt<TextRange>) -> bool {
                 || stmts_use_result_names(&f.body)
                 || stmts_use_result_names(&f.orelse)
         }
-        Stmt::AsyncFor(f) => {
-            expr_uses_result_names(&f.target)
-                || expr_uses_result_names(&f.iter)
-                || stmts_use_result_names(&f.body)
-                || stmts_use_result_names(&f.orelse)
-        }
         Stmt::With(w) => {
             w.items.iter().any(with_item_uses_result_names) || stmts_use_result_names(&w.body)
         }
-        Stmt::AsyncWith(w) => {
-            w.items.iter().any(with_item_uses_result_names) || stmts_use_result_names(&w.body)
-        }
         Stmt::Try(t) => {
-            stmts_use_result_names(&t.body)
-                || t.handlers.iter().any(except_handler_uses_result_names)
-                || stmts_use_result_names(&t.orelse)
-                || stmts_use_result_names(&t.finalbody)
-        }
-        Stmt::TryStar(t) => {
             stmts_use_result_names(&t.body)
                 || t.handlers.iter().any(except_handler_uses_result_names)
                 || stmts_use_result_names(&t.orelse)
@@ -274,27 +250,26 @@ fn stmt_uses_result_names(stmt: &Stmt<TextRange>) -> bool {
     }
 }
 
-fn arguments_use_result_names(args: &rustpython_ast::Arguments<TextRange>) -> bool {
-    let plain_arg_uses = |arg: &rustpython_ast::Arg<TextRange>| {
-        arg.annotation
+fn parameters_use_result_names(params: &Parameters) -> bool {
+    let plain_param_uses = |p: &Parameter| {
+        p.annotation
             .as_ref()
             .is_some_and(|a| expr_uses_result_names(a))
     };
-    let with_default_uses = |arg: &rustpython_ast::ArgWithDefault<TextRange>| {
-        plain_arg_uses(&arg.def)
-            || arg
-                .default
+    let with_default_uses = |p: &ParameterWithDefault| {
+        plain_param_uses(&p.parameter)
+            || p.default
                 .as_ref()
                 .is_some_and(|d| expr_uses_result_names(d))
     };
-    args.posonlyargs.iter().any(with_default_uses)
-        || args.args.iter().any(with_default_uses)
-        || args.kwonlyargs.iter().any(with_default_uses)
-        || args.vararg.as_ref().is_some_and(|a| plain_arg_uses(a))
-        || args.kwarg.as_ref().is_some_and(|a| plain_arg_uses(a))
+    params.posonlyargs.iter().any(with_default_uses)
+        || params.args.iter().any(with_default_uses)
+        || params.kwonlyargs.iter().any(with_default_uses)
+        || params.vararg.as_ref().is_some_and(|a| plain_param_uses(a))
+        || params.kwarg.as_ref().is_some_and(|a| plain_param_uses(a))
 }
 
-fn with_item_uses_result_names(item: &rustpython_ast::WithItem<TextRange>) -> bool {
+fn with_item_uses_result_names(item: &WithItem) -> bool {
     expr_uses_result_names(&item.context_expr)
         || item
             .optional_vars
@@ -302,29 +277,36 @@ fn with_item_uses_result_names(item: &rustpython_ast::WithItem<TextRange>) -> bo
             .is_some_and(|v| expr_uses_result_names(v))
 }
 
-fn except_handler_uses_result_names(handler: &rustpython_ast::ExceptHandler<TextRange>) -> bool {
-    let rustpython_ast::ExceptHandler::ExceptHandler(h) = handler;
+fn except_handler_uses_result_names(handler: &ExceptHandler) -> bool {
+    let ExceptHandler::ExceptHandler(h) = handler;
     h.type_.as_ref().is_some_and(|t| expr_uses_result_names(t)) || stmts_use_result_names(&h.body)
 }
 
-fn expr_uses_result_names(expr: &Expr<TextRange>) -> bool {
+fn decorator_uses_result_names(d: &Decorator) -> bool {
+    expr_uses_result_names(&d.expression)
+}
+
+fn expr_uses_result_names(expr: &Expr) -> bool {
     match expr {
         Expr::Name(n) => matches!(n.id.as_str(), "Ok" | "Err" | "Result"),
         Expr::Call(c) => {
             expr_uses_result_names(&c.func)
-                || c.args.iter().any(expr_uses_result_names)
-                || c.keywords.iter().any(|k| expr_uses_result_names(&k.value))
+                || c.arguments.args.iter().any(expr_uses_result_names)
+                || c.arguments
+                    .keywords
+                    .iter()
+                    .any(|k| expr_uses_result_names(&k.value))
         }
         Expr::Subscript(s) => expr_uses_result_names(&s.value) || expr_uses_result_names(&s.slice),
         Expr::BinOp(b) => expr_uses_result_names(&b.left) || expr_uses_result_names(&b.right),
         Expr::BoolOp(b) => b.values.iter().any(expr_uses_result_names),
         Expr::UnaryOp(u) => expr_uses_result_names(&u.operand),
-        Expr::NamedExpr(n) => expr_uses_result_names(&n.target) || expr_uses_result_names(&n.value),
+        Expr::Named(n) => expr_uses_result_names(&n.target) || expr_uses_result_names(&n.value),
         Expr::Compare(c) => {
             expr_uses_result_names(&c.left) || c.comparators.iter().any(expr_uses_result_names)
         }
         Expr::Lambda(l) => expr_uses_result_names(&l.body),
-        Expr::IfExp(i) => {
+        Expr::If(i) => {
             expr_uses_result_names(&i.test)
                 || expr_uses_result_names(&i.body)
                 || expr_uses_result_names(&i.orelse)
@@ -332,12 +314,10 @@ fn expr_uses_result_names(expr: &Expr<TextRange>) -> bool {
         Expr::Tuple(t) => t.elts.iter().any(expr_uses_result_names),
         Expr::List(l) => l.elts.iter().any(expr_uses_result_names),
         Expr::Set(s) => s.elts.iter().any(expr_uses_result_names),
-        Expr::Dict(d) => {
-            d.keys
-                .iter()
-                .any(|k| k.as_ref().is_some_and(expr_uses_result_names))
-                || d.values.iter().any(expr_uses_result_names)
-        }
+        Expr::Dict(d) => d.items.iter().any(|item| {
+            item.key.as_ref().is_some_and(expr_uses_result_names)
+                || expr_uses_result_names(&item.value)
+        }),
         Expr::ListComp(c) => {
             expr_uses_result_names(&c.elt)
                 || c.generators.iter().any(comprehension_uses_result_names)
@@ -346,12 +326,12 @@ fn expr_uses_result_names(expr: &Expr<TextRange>) -> bool {
             expr_uses_result_names(&c.elt)
                 || c.generators.iter().any(comprehension_uses_result_names)
         }
-        Expr::GeneratorExp(g) => {
+        Expr::Generator(g) => {
             expr_uses_result_names(&g.elt)
                 || g.generators.iter().any(comprehension_uses_result_names)
         }
         Expr::DictComp(d) => {
-            expr_uses_result_names(&d.key)
+            d.key.as_ref().is_some_and(|k| expr_uses_result_names(k))
                 || expr_uses_result_names(&d.value)
                 || d.generators.iter().any(comprehension_uses_result_names)
         }
@@ -364,15 +344,19 @@ fn expr_uses_result_names(expr: &Expr<TextRange>) -> bool {
                 || s.upper.as_ref().is_some_and(|e| expr_uses_result_names(e))
                 || s.step.as_ref().is_some_and(|e| expr_uses_result_names(e))
         }
-        Expr::FormattedValue(f) => expr_uses_result_names(&f.value),
-        Expr::JoinedStr(j) => j.values.iter().any(expr_uses_result_names),
+        Expr::FString(f) => f.value.elements().any(|el| match el {
+            ruff_python_ast::InterpolatedStringElement::Interpolation(i) => {
+                expr_uses_result_names(&i.expression)
+            }
+            ruff_python_ast::InterpolatedStringElement::Literal(_) => false,
+        }),
         Expr::Attribute(a) => expr_uses_result_names(&a.value),
-        // Leaf nodes that cannot contain Result names: constants, etc.
+        // Leaf nodes that cannot contain Result names: literals, etc.
         _ => false,
     }
 }
 
-fn comprehension_uses_result_names(gen: &rustpython_ast::Comprehension<TextRange>) -> bool {
+fn comprehension_uses_result_names(gen: &ruff_python_ast::Comprehension) -> bool {
     expr_uses_result_names(&gen.target)
         || expr_uses_result_names(&gen.iter)
         || gen.ifs.iter().any(expr_uses_result_names)
@@ -383,13 +367,13 @@ fn comprehension_uses_result_names(gen: &rustpython_ast::Comprehension<TextRange
 /// When true, the build must still write the runtime helper file even if
 /// no Ok/Err/Result names appear directly in expressions (the user may be
 /// calling `typhon_runtime.Ok(...)` via the bare-import / qualified style).
-fn has_any_typhon_runtime_import(body: &[Stmt<TextRange>]) -> bool {
+fn has_any_typhon_runtime_import(body: &[Stmt]) -> bool {
     body.iter().any(|stmt| match stmt {
         Stmt::Import(imp) => imp
             .names
             .iter()
             .any(|a| a.name.as_str() == "typhon_runtime"),
-        Stmt::ImportFrom(imp) => imp.module.as_deref() == Some("typhon_runtime"),
+        Stmt::ImportFrom(imp) => imp.module.as_ref().map(|m| m.as_str()) == Some("typhon_runtime"),
         _ => false,
     })
 }
@@ -398,9 +382,11 @@ fn has_any_typhon_runtime_import(body: &[Stmt<TextRange>]) -> bool {
 /// all three runtime names (`Ok`, `Err`, `Result`) into scope. Used to skip
 /// injection only when the user-provided import is complete; partial imports
 /// (e.g. just `Ok`) still need injection so the missing names resolve.
-fn typhon_runtime_import_covers_all(body: &[Stmt<TextRange>]) -> bool {
+fn typhon_runtime_import_covers_all(body: &[Stmt]) -> bool {
     body.iter().any(|stmt| match stmt {
-        Stmt::ImportFrom(imp) if imp.module.as_deref() == Some("typhon_runtime") => {
+        Stmt::ImportFrom(imp)
+            if imp.module.as_ref().map(|m| m.as_str()) == Some("typhon_runtime") =>
+        {
             let mut ok = false;
             let mut err = false;
             let mut result = false;
@@ -420,73 +406,53 @@ fn typhon_runtime_import_covers_all(body: &[Stmt<TextRange>]) -> bool {
 }
 
 /// Build `from typhon_runtime import Ok, Err, Result`.
-fn make_typhon_runtime_import() -> Stmt<TextRange> {
+fn make_typhon_runtime_import() -> Stmt {
     Stmt::ImportFrom(StmtImportFrom {
         range: TextRange::default(),
-        module: Some(Identifier::new("typhon_runtime")),
-        names: vec![
-            Alias {
-                range: TextRange::default(),
-                name: Identifier::new("Ok"),
-                asname: None,
-            },
-            Alias {
-                range: TextRange::default(),
-                name: Identifier::new("Err"),
-                asname: None,
-            },
-            Alias {
-                range: TextRange::default(),
-                name: Identifier::new("Result"),
-                asname: None,
-            },
-        ],
-        level: None,
+        node_index: AtomicNodeIndex::NONE,
+        module: Some(make_identifier("typhon_runtime")),
+        names: vec![make_alias("Ok"), make_alias("Err"), make_alias("Result")],
+        level: 0,
+        is_lazy: false,
     })
 }
 
 /// Build `import typhon_runtime`.
-fn make_bare_typhon_runtime_import() -> Stmt<TextRange> {
+fn make_bare_typhon_runtime_import() -> Stmt {
     Stmt::Import(StmtImport {
         range: TextRange::default(),
-        names: vec![Alias {
-            range: TextRange::default(),
-            name: Identifier::new("typhon_runtime"),
-            asname: None,
-        }],
+        node_index: AtomicNodeIndex::NONE,
+        names: vec![make_alias("typhon_runtime")],
+        is_lazy: false,
     })
 }
 
 /// Build `import asyncio`.
-fn make_asyncio_import() -> Stmt<TextRange> {
+fn make_asyncio_import() -> Stmt {
     Stmt::Import(StmtImport {
         range: TextRange::default(),
-        names: vec![Alias {
-            range: TextRange::default(),
-            name: Identifier::new("asyncio"),
-            asname: None,
-        }],
+        node_index: AtomicNodeIndex::NONE,
+        names: vec![make_alias("asyncio")],
+        is_lazy: false,
     })
 }
 
 /// Build `from typing import Protocol`.
-fn make_protocol_import() -> Stmt<TextRange> {
+fn make_protocol_import() -> Stmt {
     Stmt::ImportFrom(StmtImportFrom {
         range: TextRange::default(),
-        module: Some(Identifier::new("typing")),
-        names: vec![Alias {
-            range: TextRange::default(),
-            name: Identifier::new("Protocol"),
-            asname: None,
-        }],
-        level: None,
+        node_index: AtomicNodeIndex::NONE,
+        module: Some(make_identifier("typing")),
+        names: vec![make_alias("Protocol")],
+        level: 0,
+        is_lazy: false,
     })
 }
 
 /// `true` when `body` binds the bare module name `asyncio`. The `gather`
 /// lowering emits `asyncio.TaskGroup` / `asyncio.gather` against that exact
 /// name; an `import asyncio as aio` doesn't satisfy the reference.
-fn has_asyncio_import(body: &[Stmt<TextRange>]) -> bool {
+fn has_asyncio_import(body: &[Stmt]) -> bool {
     body.iter().any(|stmt| match stmt {
         Stmt::Import(i) => i.names.iter().any(|a| {
             a.name.as_str() == "asyncio"
@@ -503,10 +469,10 @@ fn has_asyncio_import(body: &[Stmt<TextRange>]) -> bool {
 /// emits `class Foo(Protocol):` against the unaliased name).
 /// `from typing import Protocol as P` doesn't satisfy this; `from typing
 /// import *` does.
-fn has_protocol_import(body: &[Stmt<TextRange>]) -> bool {
+fn has_protocol_import(body: &[Stmt]) -> bool {
     body.iter().any(|stmt| match stmt {
         Stmt::ImportFrom(i) => {
-            i.module.as_deref() == Some("typing")
+            i.module.as_ref().map(|m| m.as_str()) == Some("typing")
                 && i.names.iter().any(|a| match a.name.as_str() {
                     "Protocol" => matches!(
                         a.asname.as_ref().map(|n| n.as_str()),
@@ -523,7 +489,7 @@ fn has_protocol_import(body: &[Stmt<TextRange>]) -> bool {
 /// Return `true` if `body` already has a bare `import typhon_runtime`. The
 /// lowered `go` / `lazy` expressions need the module bound under that exact
 /// name; an `import typhon_runtime as tr` doesn't satisfy that.
-fn has_bare_typhon_runtime_import(body: &[Stmt<TextRange>]) -> bool {
+fn has_bare_typhon_runtime_import(body: &[Stmt]) -> bool {
     body.iter().any(|stmt| match stmt {
         Stmt::Import(i) => i.names.iter().any(|a| {
             a.name.as_str() == "typhon_runtime"
@@ -538,11 +504,11 @@ fn has_bare_typhon_runtime_import(body: &[Stmt<TextRange>]) -> bool {
 
 /// Walk every expression in `stmts` and return `true` if any `typhon_runtime.<…>`
 /// attribute access appears (e.g. `typhon_runtime.tasks.spawn(...)`).
-fn expr_tree_uses_runtime_attribute(stmts: &[Stmt<TextRange>]) -> bool {
+fn expr_tree_uses_runtime_attribute(stmts: &[Stmt]) -> bool {
     stmts.iter().any(stmt_uses_runtime_attribute)
 }
 
-fn stmt_uses_runtime_attribute(stmt: &Stmt<TextRange>) -> bool {
+fn stmt_uses_runtime_attribute(stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Expr(e) => expr_uses_runtime_attribute(&e.value),
         Stmt::Assign(a) => {
@@ -563,12 +529,14 @@ fn stmt_uses_runtime_attribute(stmt: &Stmt<TextRange>) -> bool {
             .as_ref()
             .is_some_and(|v| expr_uses_runtime_attribute(v)),
         Stmt::FunctionDef(f) => expr_tree_uses_runtime_attribute(&f.body),
-        Stmt::AsyncFunctionDef(f) => expr_tree_uses_runtime_attribute(&f.body),
         Stmt::ClassDef(c) => expr_tree_uses_runtime_attribute(&c.body),
         Stmt::If(i) => {
             expr_uses_runtime_attribute(&i.test)
                 || expr_tree_uses_runtime_attribute(&i.body)
-                || expr_tree_uses_runtime_attribute(&i.orelse)
+                || i.elif_else_clauses.iter().any(|c| {
+                    c.test.as_ref().is_some_and(expr_uses_runtime_attribute)
+                        || expr_tree_uses_runtime_attribute(&c.body)
+                })
         }
         Stmt::While(w) => {
             expr_uses_runtime_attribute(&w.test)
@@ -580,13 +548,7 @@ fn stmt_uses_runtime_attribute(stmt: &Stmt<TextRange>) -> bool {
                 || expr_tree_uses_runtime_attribute(&f.body)
                 || expr_tree_uses_runtime_attribute(&f.orelse)
         }
-        Stmt::AsyncFor(f) => {
-            expr_uses_runtime_attribute(&f.iter)
-                || expr_tree_uses_runtime_attribute(&f.body)
-                || expr_tree_uses_runtime_attribute(&f.orelse)
-        }
         Stmt::With(w) => expr_tree_uses_runtime_attribute(&w.body),
-        Stmt::AsyncWith(w) => expr_tree_uses_runtime_attribute(&w.body),
         Stmt::Try(t) => {
             expr_tree_uses_runtime_attribute(&t.body)
                 || expr_tree_uses_runtime_attribute(&t.orelse)
@@ -602,7 +564,7 @@ fn stmt_uses_runtime_attribute(stmt: &Stmt<TextRange>) -> bool {
     }
 }
 
-fn expr_uses_runtime_attribute(expr: &Expr<TextRange>) -> bool {
+fn expr_uses_runtime_attribute(expr: &Expr) -> bool {
     match expr {
         Expr::Attribute(a) => {
             // Root attribute chain: `typhon_runtime.<x>.<y>...`
@@ -615,8 +577,9 @@ fn expr_uses_runtime_attribute(expr: &Expr<TextRange>) -> bool {
         }
         Expr::Call(c) => {
             expr_uses_runtime_attribute(&c.func)
-                || c.args.iter().any(expr_uses_runtime_attribute)
-                || c.keywords
+                || c.arguments.args.iter().any(expr_uses_runtime_attribute)
+                || c.arguments
+                    .keywords
                     .iter()
                     .any(|k| expr_uses_runtime_attribute(&k.value))
         }
@@ -625,7 +588,7 @@ fn expr_uses_runtime_attribute(expr: &Expr<TextRange>) -> bool {
             expr_uses_runtime_attribute(&b.left) || expr_uses_runtime_attribute(&b.right)
         }
         Expr::UnaryOp(u) => expr_uses_runtime_attribute(&u.operand),
-        Expr::IfExp(i) => {
+        Expr::If(i) => {
             expr_uses_runtime_attribute(&i.test)
                 || expr_uses_runtime_attribute(&i.body)
                 || expr_uses_runtime_attribute(&i.orelse)
@@ -639,28 +602,32 @@ fn expr_uses_runtime_attribute(expr: &Expr<TextRange>) -> bool {
 
 /// Return `true` if any class in `body` inherits from `Protocol` (Typhon's
 /// `interface` lowering).
-fn stmts_use_protocol_base(body: &[Stmt<TextRange>]) -> bool {
+fn stmts_use_protocol_base(body: &[Stmt]) -> bool {
     body.iter().any(|stmt| match stmt {
         Stmt::ClassDef(c) => {
-            c.bases
+            c.bases()
                 .iter()
                 .any(|b| matches!(b, Expr::Name(n) if n.id.as_str() == "Protocol"))
                 || stmts_use_protocol_base(&c.body)
         }
         Stmt::FunctionDef(f) => stmts_use_protocol_base(&f.body),
-        Stmt::AsyncFunctionDef(f) => stmts_use_protocol_base(&f.body),
-        Stmt::If(s) => stmts_use_protocol_base(&s.body) || stmts_use_protocol_base(&s.orelse),
+        Stmt::If(s) => {
+            stmts_use_protocol_base(&s.body)
+                || s.elif_else_clauses
+                    .iter()
+                    .any(|c| stmts_use_protocol_base(&c.body))
+        }
         _ => false,
     })
 }
 
 /// Return `true` if any expression in `body` references the `asyncio` module
 /// by qualified attribute access (`asyncio.TaskGroup`, `asyncio.gather`, …).
-fn stmts_use_asyncio_qualified(body: &[Stmt<TextRange>]) -> bool {
+fn stmts_use_asyncio_qualified(body: &[Stmt]) -> bool {
     body.iter().any(stmt_uses_asyncio_qualified)
 }
 
-fn stmt_uses_asyncio_qualified(stmt: &Stmt<TextRange>) -> bool {
+fn stmt_uses_asyncio_qualified(stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Expr(e) => expr_uses_asyncio_qualified(&e.value),
         Stmt::Assign(a) => {
@@ -684,29 +651,20 @@ fn stmt_uses_asyncio_qualified(stmt: &Stmt<TextRange>) -> bool {
                 .any(|i| expr_uses_asyncio_qualified(&i.context_expr))
                 || stmts_use_asyncio_qualified(&w.body)
         }
-        Stmt::AsyncWith(w) => {
-            w.items
-                .iter()
-                .any(|i| expr_uses_asyncio_qualified(&i.context_expr))
-                || stmts_use_asyncio_qualified(&w.body)
-        }
         Stmt::FunctionDef(f) => stmts_use_asyncio_qualified(&f.body),
-        Stmt::AsyncFunctionDef(f) => stmts_use_asyncio_qualified(&f.body),
         Stmt::ClassDef(c) => stmts_use_asyncio_qualified(&c.body),
         Stmt::If(i) => {
             expr_uses_asyncio_qualified(&i.test)
                 || stmts_use_asyncio_qualified(&i.body)
-                || stmts_use_asyncio_qualified(&i.orelse)
+                || i.elif_else_clauses.iter().any(|c| {
+                    c.test.as_ref().is_some_and(expr_uses_asyncio_qualified)
+                        || stmts_use_asyncio_qualified(&c.body)
+                })
         }
         Stmt::While(w) => {
             stmts_use_asyncio_qualified(&w.body) || stmts_use_asyncio_qualified(&w.orelse)
         }
         Stmt::For(f) => {
-            expr_uses_asyncio_qualified(&f.iter)
-                || stmts_use_asyncio_qualified(&f.body)
-                || stmts_use_asyncio_qualified(&f.orelse)
-        }
-        Stmt::AsyncFor(f) => {
             expr_uses_asyncio_qualified(&f.iter)
                 || stmts_use_asyncio_qualified(&f.body)
                 || stmts_use_asyncio_qualified(&f.orelse)
@@ -720,7 +678,7 @@ fn stmt_uses_asyncio_qualified(stmt: &Stmt<TextRange>) -> bool {
     }
 }
 
-fn expr_uses_asyncio_qualified(expr: &Expr<TextRange>) -> bool {
+fn expr_uses_asyncio_qualified(expr: &Expr) -> bool {
     match expr {
         Expr::Attribute(a) => {
             if let Expr::Name(n) = a.value.as_ref() {
@@ -732,8 +690,9 @@ fn expr_uses_asyncio_qualified(expr: &Expr<TextRange>) -> bool {
         }
         Expr::Call(c) => {
             expr_uses_asyncio_qualified(&c.func)
-                || c.args.iter().any(expr_uses_asyncio_qualified)
-                || c.keywords
+                || c.arguments.args.iter().any(expr_uses_asyncio_qualified)
+                || c.arguments
+                    .keywords
                     .iter()
                     .any(|k| expr_uses_asyncio_qualified(&k.value))
         }
@@ -749,10 +708,7 @@ fn expr_uses_asyncio_qualified(expr: &Expr<TextRange>) -> bool {
 
 // ── module-level desugaring ──────────────────────────────────────────────────
 
-fn desugar_mod_module_with(
-    m: &ModModule<TextRange>,
-    options: &DesugarOptions,
-) -> ModModule<TextRange> {
+fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule {
     let (new_body, transformed_classes) = desugar_stmts(&m.body);
 
     // Merge `impl` pseudo-classes into their target classes and remove the stubs.
@@ -778,8 +734,8 @@ fn desugar_mod_module_with(
 
     ModModule {
         range: m.range,
+        node_index: AtomicNodeIndex::NONE,
         body: final_body,
-        type_ignores: m.type_ignores.clone(),
     }
 }
 
@@ -795,12 +751,9 @@ fn desugar_mod_module_with(
 /// `def f`). Stripping of `@pure` / `@memo` markers, by contrast, recurses
 /// everywhere — otherwise those Typhon-only names would leak into the
 /// emitted Python and raise `NameError` at import time.
-fn inject_memoise_decorators(
-    body: Vec<Stmt<TextRange>>,
-    memoise: &[String],
-) -> (Vec<Stmt<TextRange>>, bool) {
+fn inject_memoise_decorators(body: Vec<Stmt>, memoise: &[String]) -> (Vec<Stmt>, bool) {
     let mut added = false;
-    let new_body: Vec<Stmt<TextRange>> = body
+    let new_body: Vec<Stmt> = body
         .into_iter()
         .map(|stmt| match stmt {
             Stmt::FunctionDef(mut f) => {
@@ -809,21 +762,11 @@ fn inject_memoise_decorators(
                 if memoise.iter().any(|n| n == f.name.as_str())
                     && !has_cache_decorator(&f.decorator_list)
                 {
-                    f.decorator_list.insert(0, make_functools_dot_cache_call());
+                    f.decorator_list
+                        .insert(0, make_functools_dot_cache_decorator());
                     added = true;
                 }
                 Stmt::FunctionDef(f)
-            }
-            Stmt::AsyncFunctionDef(mut f) => {
-                f.decorator_list = strip_purity_decorators(f.decorator_list);
-                f.body = strip_purity_decorators_in_body(f.body);
-                if memoise.iter().any(|n| n == f.name.as_str())
-                    && !has_cache_decorator(&f.decorator_list)
-                {
-                    f.decorator_list.insert(0, make_functools_dot_cache_call());
-                    added = true;
-                }
-                Stmt::AsyncFunctionDef(f)
             }
             Stmt::ClassDef(mut c) => {
                 c.body = strip_purity_decorators_in_body(c.body);
@@ -839,18 +782,13 @@ fn inject_memoise_decorators(
 /// inside `body` (and any nested function/class bodies). Used to clean up
 /// Typhon-only decorators that the top-level pass doesn't see directly —
 /// class methods and nested functions.
-fn strip_purity_decorators_in_body(body: Vec<Stmt<TextRange>>) -> Vec<Stmt<TextRange>> {
+fn strip_purity_decorators_in_body(body: Vec<Stmt>) -> Vec<Stmt> {
     body.into_iter()
         .map(|stmt| match stmt {
             Stmt::FunctionDef(mut f) => {
                 f.decorator_list = strip_purity_decorators(f.decorator_list);
                 f.body = strip_purity_decorators_in_body(f.body);
                 Stmt::FunctionDef(f)
-            }
-            Stmt::AsyncFunctionDef(mut f) => {
-                f.decorator_list = strip_purity_decorators(f.decorator_list);
-                f.body = strip_purity_decorators_in_body(f.body);
-                Stmt::AsyncFunctionDef(f)
             }
             Stmt::ClassDef(mut c) => {
                 c.body = strip_purity_decorators_in_body(c.body);
@@ -863,16 +801,14 @@ fn strip_purity_decorators_in_body(body: Vec<Stmt<TextRange>>) -> Vec<Stmt<TextR
 
 /// Drop `@pure`, `@pure(...)`, and `@memo` decorators from a function — they
 /// are Typhon-only metadata, not actual Python runtime decorators.
-fn strip_purity_decorators(
-    decorators: Vec<rustpython_ast::Expr<TextRange>>,
-) -> Vec<rustpython_ast::Expr<TextRange>> {
+fn strip_purity_decorators(decorators: Vec<Decorator>) -> Vec<Decorator> {
     decorators
         .into_iter()
-        .filter(|d| !is_purity_marker(d))
+        .filter(|d| !is_purity_marker(&d.expression))
         .collect()
 }
 
-fn is_purity_marker(d: &rustpython_ast::Expr<TextRange>) -> bool {
+fn is_purity_marker(d: &Expr) -> bool {
     match d {
         // `gatherable` lives alongside `pure` / `memo` as a Typhon-internal
         // attestation: the user marks `async def fetch_user(...)` with it
@@ -884,9 +820,9 @@ fn is_purity_marker(d: &rustpython_ast::Expr<TextRange>) -> bool {
     }
 }
 
-fn has_cache_decorator(decorators: &[rustpython_ast::Expr<TextRange>]) -> bool {
+fn has_cache_decorator(decorators: &[Decorator]) -> bool {
     decorators.iter().any(|d| {
-        let path = match d {
+        let path = match &d.expression {
             Expr::Name(n) => Some(n.id.as_str().to_owned()),
             Expr::Attribute(a) => {
                 if let Expr::Name(n) = a.value.as_ref() {
@@ -922,7 +858,7 @@ fn has_cache_decorator(decorators: &[rustpython_ast::Expr<TextRange>]) -> bool {
 /// (`from functools import cache`) intentionally do NOT count: neither
 /// binds the name `functools` itself, so the injected reference would
 /// raise `NameError` at import time.
-fn has_functools_import(body: &[Stmt<TextRange>]) -> bool {
+fn has_functools_import(body: &[Stmt]) -> bool {
     body.iter().any(|stmt| match stmt {
         Stmt::Import(i) => i.names.iter().any(|a| {
             a.name.as_str() == "functools"
@@ -935,42 +871,46 @@ fn has_functools_import(body: &[Stmt<TextRange>]) -> bool {
     })
 }
 
-fn make_functools_import() -> Stmt<TextRange> {
+fn make_functools_import() -> Stmt {
     Stmt::Import(StmtImport {
         range: TextRange::default(),
-        names: vec![Alias {
-            range: TextRange::default(),
-            name: Identifier::new("functools"),
-            asname: None,
-        }],
+        node_index: AtomicNodeIndex::NONE,
+        names: vec![make_alias("functools")],
+        is_lazy: false,
     })
 }
 
-fn make_functools_dot_cache_call() -> rustpython_ast::Expr<TextRange> {
-    use rustpython_ast::ExprAttribute;
-    let functools_name = rustpython_ast::Expr::Name(ExprName {
+/// Build the decorator `@functools.cache` (as a `Decorator` node).
+fn make_functools_dot_cache_decorator() -> Decorator {
+    let functools_name = Expr::Name(ExprName {
         range: TextRange::default(),
-        id: Identifier::new("functools"),
+        node_index: AtomicNodeIndex::NONE,
+        id: Name::new("functools"),
         ctx: ExprContext::Load,
     });
-    rustpython_ast::Expr::Attribute(ExprAttribute {
+    let expr = Expr::Attribute(ExprAttribute {
         range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
         value: Box::new(functools_name),
-        attr: Identifier::new("cache"),
+        attr: make_identifier("cache"),
         ctx: ExprContext::Load,
-    })
+    });
+    Decorator {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        expression: expr,
+    }
 }
 
 /// Return the index at which a new top-level import should be inserted,
 /// skipping past an optional module docstring and any `from __future__ import`
 /// statements (both must remain at the top of a Python module).
-fn import_insert_pos(body: &[Stmt<TextRange>]) -> usize {
+fn import_insert_pos(body: &[Stmt]) -> usize {
     let mut pos = 0;
 
-    // Skip optional module docstring (a bare string-constant expression).
+    // Skip optional module docstring (a bare string-literal expression).
     if let Some(Stmt::Expr(e)) = body.first() {
-        if matches!(&*e.value, rustpython_ast::Expr::Constant(c) if matches!(c.value, Constant::Str(_)))
-        {
+        if matches!(&*e.value, Expr::StringLiteral(_)) {
             pos = 1;
         }
     }
@@ -978,7 +918,7 @@ fn import_insert_pos(body: &[Stmt<TextRange>]) -> usize {
     // Skip `from __future__ import ...` statements.
     while pos < body.len() {
         if let Stmt::ImportFrom(imp) = &body[pos] {
-            if imp.module.as_deref() == Some("__future__") {
+            if imp.module.as_ref().map(|m| m.as_str()) == Some("__future__") {
                 pos += 1;
                 continue;
             }
@@ -993,7 +933,7 @@ fn import_insert_pos(body: &[Stmt<TextRange>]) -> usize {
 
 /// Desugar a list of statements, returning the transformed list and whether
 /// any class was modified at any nesting depth.
-fn desugar_stmts(stmts: &[Stmt<TextRange>]) -> (Vec<Stmt<TextRange>>, bool) {
+fn desugar_stmts(stmts: &[Stmt]) -> (Vec<Stmt>, bool) {
     let mut any_transformed = false;
     let new_stmts = stmts
         .iter()
@@ -1011,7 +951,7 @@ fn desugar_stmts(stmts: &[Stmt<TextRange>]) -> (Vec<Stmt<TextRange>>, bool) {
 /// Desugar a single statement, recursing into any nested statement lists.
 /// Returns the (possibly modified) statement and whether any class was
 /// transformed at this level or deeper.
-fn desugar_stmt(stmt: &Stmt<TextRange>) -> (Stmt<TextRange>, bool) {
+fn desugar_stmt(stmt: &Stmt) -> (Stmt, bool) {
     match stmt {
         Stmt::ClassDef(c) => {
             let is_pydantic = class_inherits_basemodel(c);
@@ -1045,15 +985,14 @@ fn desugar_stmt(stmt: &Stmt<TextRange>) -> (Stmt<TextRange>, bool) {
             if needs_decorator {
                 new_class
                     .decorator_list
-                    .insert(0, make_dataclasses_dot_dataclass_call());
+                    .insert(0, make_dataclasses_dot_dataclass_decorator());
             }
             if needs_model_config {
                 // Insert after a leading class docstring so that `__doc__` is
                 // preserved.  Python requires the docstring to be the first
                 // statement in the class body.
                 let insert_at = if let Some(Stmt::Expr(e)) = new_class.body.first() {
-                    if matches!(&*e.value, Expr::Constant(c) if matches!(c.value, Constant::Str(_)))
-                    {
+                    if matches!(&*e.value, Expr::StringLiteral(_)) {
                         1
                     } else {
                         0
@@ -1079,88 +1018,92 @@ fn desugar_stmt(stmt: &Stmt<TextRange>) -> (Stmt<TextRange>, bool) {
             new_f.body = new_body;
             (Stmt::FunctionDef(new_f), transformed)
         }
-        Stmt::AsyncFunctionDef(f) => {
-            let (new_body, transformed) = desugar_stmts(&f.body);
-            let mut new_f = f.clone();
-            new_f.body = new_body;
-            (Stmt::AsyncFunctionDef(new_f), transformed)
-        }
         other => (other.clone(), false),
     }
 }
 
 // ── AST helpers ──────────────────────────────────────────────────────────────
 
-/// Build the expression `dataclasses.dataclass(slots=True)`.
+/// Build the decorator `@dataclasses.dataclass(slots=True)`.
 ///
 /// Using the qualified form avoids shadowing: even if the user has a local
 /// binding named `dataclass`, `dataclasses.dataclass` still resolves to the
 /// standard-library function.
-fn make_dataclasses_dot_dataclass_call() -> rustpython_ast::Expr<TextRange> {
-    use rustpython_ast::{ExprAttribute, Keyword};
-
-    let dataclasses_name = rustpython_ast::Expr::Name(ExprName {
+fn make_dataclasses_dot_dataclass_decorator() -> Decorator {
+    let dataclasses_name = Expr::Name(ExprName {
         range: TextRange::default(),
-        id: Identifier::new("dataclasses"),
+        node_index: AtomicNodeIndex::NONE,
+        id: Name::new("dataclasses"),
         ctx: ExprContext::Load,
     });
 
-    let dataclass_attr = rustpython_ast::Expr::Attribute(ExprAttribute {
+    let dataclass_attr = Expr::Attribute(ExprAttribute {
         range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
         value: Box::new(dataclasses_name),
-        attr: Identifier::new("dataclass"),
+        attr: make_identifier("dataclass"),
         ctx: ExprContext::Load,
     });
 
-    rustpython_ast::Expr::Call(ExprCall {
+    let true_lit = Expr::BooleanLiteral(ExprBooleanLiteral {
         range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        value: true,
+    });
+
+    let call = Expr::Call(ExprCall {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
         func: Box::new(dataclass_attr),
-        args: vec![],
-        keywords: vec![Keyword {
+        arguments: Arguments {
             range: TextRange::default(),
-            arg: Some(Identifier::new("slots")),
-            value: rustpython_ast::Expr::Constant(ExprConstant {
+            node_index: AtomicNodeIndex::NONE,
+            args: Box::new([]),
+            keywords: Box::new([Keyword {
                 range: TextRange::default(),
-                value: Constant::Bool(true),
-                kind: None,
-            }),
-        }],
-    })
+                node_index: AtomicNodeIndex::NONE,
+                arg: Some(make_identifier("slots")),
+                value: true_lit,
+            }]),
+        },
+    });
+
+    Decorator {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        expression: call,
+    }
 }
 
 /// Build the statement `import dataclasses`.
-fn make_dataclasses_import() -> Stmt<TextRange> {
-    use rustpython_ast::Alias;
-
+fn make_dataclasses_import() -> Stmt {
     Stmt::Import(StmtImport {
         range: TextRange::default(),
-        names: vec![Alias {
-            range: TextRange::default(),
-            name: Identifier::new("dataclasses"),
-            asname: None,
-        }],
+        node_index: AtomicNodeIndex::NONE,
+        names: vec![make_alias("dataclasses")],
+        is_lazy: false,
     })
 }
 
 /// Return `true` if any statement in `stmts` (recursively) uses `BaseModel`
 /// as a base class — i.e. the module was produced from `model` keywords.
-fn stmts_use_basemodel(stmts: &[Stmt<TextRange>]) -> bool {
+fn stmts_use_basemodel(stmts: &[Stmt]) -> bool {
     stmts.iter().any(|stmt| match stmt {
         Stmt::ClassDef(c) => class_inherits_basemodel(c) || stmts_use_basemodel(&c.body),
         Stmt::FunctionDef(f) => stmts_use_basemodel(&f.body),
-        Stmt::AsyncFunctionDef(f) => stmts_use_basemodel(&f.body),
-        Stmt::If(s) => stmts_use_basemodel(&s.body) || stmts_use_basemodel(&s.orelse),
+        Stmt::If(s) => {
+            stmts_use_basemodel(&s.body)
+                || s.elif_else_clauses
+                    .iter()
+                    .any(|c| stmts_use_basemodel(&c.body))
+        }
         Stmt::For(s) => stmts_use_basemodel(&s.body) || stmts_use_basemodel(&s.orelse),
-        Stmt::AsyncFor(s) => stmts_use_basemodel(&s.body) || stmts_use_basemodel(&s.orelse),
         Stmt::While(s) => stmts_use_basemodel(&s.body) || stmts_use_basemodel(&s.orelse),
         Stmt::With(s) => stmts_use_basemodel(&s.body),
-        Stmt::AsyncWith(s) => stmts_use_basemodel(&s.body),
         Stmt::Try(s) => {
             stmts_use_basemodel(&s.body)
                 || s.handlers.iter().any(|h| match h {
-                    rustpython_ast::ExceptHandler::ExceptHandler(eh) => {
-                        stmts_use_basemodel(&eh.body)
-                    }
+                    ExceptHandler::ExceptHandler(eh) => stmts_use_basemodel(&eh.body),
                 })
                 || stmts_use_basemodel(&s.orelse)
                 || stmts_use_basemodel(&s.finalbody)
@@ -1170,25 +1113,25 @@ fn stmts_use_basemodel(stmts: &[Stmt<TextRange>]) -> bool {
 }
 
 /// Return `true` if `c` inherits directly from `BaseModel`.
-fn class_inherits_basemodel(c: &rustpython_ast::StmtClassDef<TextRange>) -> bool {
-    c.bases
+fn class_inherits_basemodel(c: &ruff_python_ast::StmtClassDef) -> bool {
+    c.bases()
         .iter()
-        .any(|base| matches!(base, rustpython_ast::Expr::Name(n) if n.id.as_str() == "BaseModel"))
+        .any(|base| matches!(base, Expr::Name(n) if n.id.as_str() == "BaseModel"))
 }
 
 /// Return `true` if `c` inherits directly from `Protocol`.
-fn class_inherits_protocol(c: &rustpython_ast::StmtClassDef<TextRange>) -> bool {
-    c.bases
+fn class_inherits_protocol(c: &ruff_python_ast::StmtClassDef) -> bool {
+    c.bases()
         .iter()
-        .any(|base| matches!(base, rustpython_ast::Expr::Name(n) if n.id.as_str() == "Protocol"))
+        .any(|base| matches!(base, Expr::Name(n) if n.id.as_str() == "Protocol"))
 }
 
 /// Return `true` if the module already has `from pydantic import BaseModel`
 /// where the name is bound as `BaseModel` (not aliased to something else).
-fn has_pydantic_import(body: &[Stmt<TextRange>]) -> bool {
+fn has_pydantic_import(body: &[Stmt]) -> bool {
     body.iter().any(|stmt| match stmt {
         Stmt::ImportFrom(imp) => {
-            imp.module.as_deref() == Some("pydantic")
+            imp.module.as_ref().map(|m| m.as_str()) == Some("pydantic")
                 && imp.names.iter().any(|a| {
                     a.name.as_str() == "BaseModel"
                         // Only suppress injection when the bound name is
@@ -1204,39 +1147,28 @@ fn has_pydantic_import(body: &[Stmt<TextRange>]) -> bool {
 }
 
 /// Build `from pydantic import BaseModel, ConfigDict`.
-fn make_pydantic_basemodel_import() -> Stmt<TextRange> {
+fn make_pydantic_basemodel_import() -> Stmt {
     Stmt::ImportFrom(StmtImportFrom {
         range: TextRange::default(),
-        module: Some(Identifier::new("pydantic")),
-        names: vec![
-            Alias {
-                range: TextRange::default(),
-                name: Identifier::new("BaseModel"),
-                asname: None,
-            },
-            Alias {
-                range: TextRange::default(),
-                name: Identifier::new("ConfigDict"),
-                asname: None,
-            },
-        ],
-        level: None,
+        node_index: AtomicNodeIndex::NONE,
+        module: Some(make_identifier("pydantic")),
+        names: vec![make_alias("BaseModel"), make_alias("ConfigDict")],
+        level: 0,
+        is_lazy: false,
     })
 }
 
 /// Build `from pydantic import BaseModel` (without ConfigDict).
 ///
 /// Used when only BaseModel is missing — ConfigDict is already imported.
-fn make_pydantic_basemodel_only_import() -> Stmt<TextRange> {
+fn make_pydantic_basemodel_only_import() -> Stmt {
     Stmt::ImportFrom(StmtImportFrom {
         range: TextRange::default(),
-        module: Some(Identifier::new("pydantic")),
-        names: vec![Alias {
-            range: TextRange::default(),
-            name: Identifier::new("BaseModel"),
-            asname: None,
-        }],
-        level: None,
+        node_index: AtomicNodeIndex::NONE,
+        module: Some(make_identifier("pydantic")),
+        names: vec![make_alias("BaseModel")],
+        level: 0,
+        is_lazy: false,
     })
 }
 
@@ -1244,24 +1176,22 @@ fn make_pydantic_basemodel_only_import() -> Stmt<TextRange> {
 ///
 /// Used when a module already imports `BaseModel` explicitly but does not yet
 /// import `ConfigDict`, which is needed for the injected `model_config` statement.
-fn make_config_dict_only_import() -> Stmt<TextRange> {
+fn make_config_dict_only_import() -> Stmt {
     Stmt::ImportFrom(StmtImportFrom {
         range: TextRange::default(),
-        module: Some(Identifier::new("pydantic")),
-        names: vec![Alias {
-            range: TextRange::default(),
-            name: Identifier::new("ConfigDict"),
-            asname: None,
-        }],
-        level: None,
+        node_index: AtomicNodeIndex::NONE,
+        module: Some(make_identifier("pydantic")),
+        names: vec![make_alias("ConfigDict")],
+        level: 0,
+        is_lazy: false,
     })
 }
 
 /// Return `true` if `body` already imports `ConfigDict` from `pydantic`.
-fn has_config_dict_import(body: &[Stmt<TextRange>]) -> bool {
+fn has_config_dict_import(body: &[Stmt]) -> bool {
     body.iter().any(|stmt| match stmt {
         Stmt::ImportFrom(imp) => {
-            imp.module.as_deref() == Some("pydantic")
+            imp.module.as_ref().map(|m| m.as_str()) == Some("pydantic")
                 && imp
                     .names
                     .iter()
@@ -1272,7 +1202,7 @@ fn has_config_dict_import(body: &[Stmt<TextRange>]) -> bool {
 }
 
 /// Return `true` if `body` already contains a `model_config = ...` statement.
-fn has_model_config_stmt(body: &[Stmt<TextRange>]) -> bool {
+fn has_model_config_stmt(body: &[Stmt]) -> bool {
     body.iter().any(|stmt| match stmt {
         Stmt::Assign(a) => a
             .targets
@@ -1286,37 +1216,42 @@ fn has_model_config_stmt(body: &[Stmt<TextRange>]) -> bool {
 }
 
 /// Build `model_config = ConfigDict(extra="forbid")`.
-fn make_model_config_stmt() -> Stmt<TextRange> {
-    use rustpython_ast::Keyword;
+fn make_model_config_stmt() -> Stmt {
+    let forbid_lit = make_string_literal_expr("forbid");
 
     let config_dict_call = Expr::Call(ExprCall {
         range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
         func: Box::new(Expr::Name(ExprName {
             range: TextRange::default(),
-            id: Identifier::new("ConfigDict"),
+            node_index: AtomicNodeIndex::NONE,
+            id: Name::new("ConfigDict"),
             ctx: ExprContext::Load,
         })),
-        args: vec![],
-        keywords: vec![Keyword {
+        arguments: Arguments {
             range: TextRange::default(),
-            arg: Some(Identifier::new("extra")),
-            value: Expr::Constant(ExprConstant {
+            node_index: AtomicNodeIndex::NONE,
+            args: Box::new([]),
+            keywords: Box::new([Keyword {
                 range: TextRange::default(),
-                value: Constant::Str("forbid".to_string()),
-                kind: None,
-            }),
-        }],
+                node_index: AtomicNodeIndex::NONE,
+                arg: Some(make_identifier("extra")),
+                value: forbid_lit,
+            }]),
+        },
     });
 
     Stmt::Assign(StmtAssign {
         range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
         targets: vec![Expr::Name(ExprName {
             range: TextRange::default(),
-            id: Identifier::new("model_config"),
+            node_index: AtomicNodeIndex::NONE,
+            id: Name::new("model_config"),
             ctx: ExprContext::Store,
         })],
         value: Box::new(config_dict_call),
-        type_comment: None,
+        mutability: None,
     })
 }
 
@@ -1326,37 +1261,66 @@ fn make_model_config_stmt() -> Stmt<TextRange> {
 /// - `@dataclass(...)`     (call, from-import style)
 /// - `@dataclasses.dataclass`
 /// - `@dataclasses.dataclass(...)`
-fn has_dataclass_decorator(decorators: &[rustpython_ast::Expr<TextRange>]) -> bool {
-    decorators.iter().any(is_dataclass_expr)
+fn has_dataclass_decorator(decorators: &[Decorator]) -> bool {
+    decorators.iter().any(|d| is_dataclass_expr(&d.expression))
 }
 
-fn is_dataclass_expr(expr: &rustpython_ast::Expr<TextRange>) -> bool {
+fn is_dataclass_expr(expr: &Expr) -> bool {
     match expr {
         // @dataclass
-        rustpython_ast::Expr::Name(n) => n.id.as_str() == "dataclass",
+        Expr::Name(n) => n.id.as_str() == "dataclass",
         // @dataclasses.dataclass
-        rustpython_ast::Expr::Attribute(a) => {
+        Expr::Attribute(a) => {
             a.attr.as_str() == "dataclass"
                 && matches!(a.value.as_ref(),
-                    rustpython_ast::Expr::Name(n) if n.id.as_str() == "dataclasses"
+                    Expr::Name(n) if n.id.as_str() == "dataclasses"
                 )
         }
         // @dataclass(...) or @dataclasses.dataclass(...)
-        rustpython_ast::Expr::Call(c) => is_dataclass_expr(c.func.as_ref()),
+        Expr::Call(c) => is_dataclass_expr(c.func.as_ref()),
         _ => false,
     }
 }
 
 /// Return `true` if the body already contains `import dataclasses` or
 /// `from dataclasses import dataclass` (either form means the import is covered).
-fn has_dataclasses_import(body: &[Stmt<TextRange>]) -> bool {
+fn has_dataclasses_import(body: &[Stmt]) -> bool {
     body.iter().any(|stmt| match stmt {
         Stmt::Import(imp) => imp.names.iter().any(|a| a.name.as_str() == "dataclasses"),
         Stmt::ImportFrom(imp) => {
-            imp.module.as_deref() == Some("dataclasses")
+            imp.module.as_ref().map(|m| m.as_str()) == Some("dataclasses")
                 && imp.names.iter().any(|a| a.name.as_str() == "dataclass")
         }
         _ => false,
+    })
+}
+
+// ── small construction helpers ──────────────────────────────────────────────
+
+fn make_identifier(name: &str) -> Identifier {
+    Identifier::new(name, TextRange::default())
+}
+
+fn make_alias(name: &str) -> Alias {
+    Alias {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        name: make_identifier(name),
+        asname: None,
+    }
+}
+
+fn make_string_literal_expr(text: &str) -> Expr {
+    let lit = StringLiteral {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        value: Box::from(text),
+        flags: StringLiteralFlags::empty(),
+    };
+    Expr::StringLiteral(ExprStringLiteral {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        value: StringLiteralValue::single(lit),
     })
 }
 
@@ -1377,7 +1341,7 @@ const IMPL_PREFIX: &str = "__typhon_impl_";
 /// Returns the modified statement list and `true` when at least one impl block
 /// was found.  Missing target classes are silently skipped (the type checker
 /// surfaces a better diagnostic for that case).
-fn merge_impl_blocks(body: Vec<Stmt<TextRange>>) -> (Vec<Stmt<TextRange>>, bool) {
+fn merge_impl_blocks(body: Vec<Stmt>) -> (Vec<Stmt>, bool) {
     // Phase 1: identify impl pseudo-class indices and their target names.
     let impl_indices: Vec<(usize, String)> = body
         .iter()
@@ -1399,10 +1363,10 @@ fn merge_impl_blocks(body: Vec<Stmt<TextRange>>) -> (Vec<Stmt<TextRange>>, bool)
     // Phase 2: collect methods (with `self` injected) into a map keyed by
     // target class name.  Multiple impl blocks for the same class accumulate.
     let impl_index_set: HashSet<usize> = impl_indices.iter().map(|(i, _)| *i).collect();
-    let mut impl_methods_map: HashMap<String, Vec<Stmt<TextRange>>> = HashMap::new();
+    let mut impl_methods_map: HashMap<String, Vec<Stmt>> = HashMap::new();
     for (impl_idx, target_name) in &impl_indices {
         if let Stmt::ClassDef(c) = &body[*impl_idx] {
-            let methods: Vec<Stmt<TextRange>> = c.body.iter().map(insert_self_param).collect();
+            let methods: Vec<Stmt> = c.body.iter().map(insert_self_param).collect();
             impl_methods_map
                 .entry(target_name.clone())
                 .or_default()
@@ -1412,7 +1376,7 @@ fn merge_impl_blocks(body: Vec<Stmt<TextRange>>) -> (Vec<Stmt<TextRange>>, bool)
 
     // Phase 3: rebuild the body, merging methods into target classes and
     // dropping the impl pseudo-classes.
-    let new_body: Vec<Stmt<TextRange>> = body
+    let new_body: Vec<Stmt> = body
         .into_iter()
         .enumerate()
         .filter(|(i, _)| !impl_index_set.contains(i))
@@ -1434,8 +1398,8 @@ fn merge_impl_blocks(body: Vec<Stmt<TextRange>>) -> (Vec<Stmt<TextRange>>, bool)
 
 /// Inject an implicit receiver parameter into a method from an `impl` block.
 ///
-/// Handles both `Stmt::FunctionDef` and `Stmt::AsyncFunctionDef`; all other
-/// statement kinds pass through unchanged.
+/// Handles `Stmt::FunctionDef` (which now subsumes async functions via the
+/// `is_async` flag); all other statement kinds pass through unchanged.
 ///
 /// Rules:
 /// - `@staticmethod`: no parameter is injected (static methods have no receiver).
@@ -1446,28 +1410,30 @@ fn merge_impl_blocks(body: Vec<Stmt<TextRange>>) -> (Vec<Stmt<TextRange>>, bool)
 /// positional-only arguments (preserving correct parameter order around `/`),
 /// or into `args` otherwise.  If the receiver name is already present as the
 /// first parameter, it is not duplicated.
-fn insert_self_param(stmt: &Stmt<TextRange>) -> Stmt<TextRange> {
-    fn make_receiver_arg(name: &'static str) -> ArgWithDefault<TextRange> {
-        ArgWithDefault {
-            range: Default::default(),
-            def: Arg {
+fn insert_self_param(stmt: &Stmt) -> Stmt {
+    fn make_receiver_param(name: &'static str) -> ParameterWithDefault {
+        ParameterWithDefault {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            parameter: Parameter {
                 range: TextRange::default(),
-                arg: Identifier::new(name),
+                node_index: AtomicNodeIndex::NONE,
+                name: make_identifier(name),
                 annotation: None,
-                type_comment: None,
             },
             default: None,
         }
     }
 
-    fn first_param_name(args: &rustpython_ast::Arguments<TextRange>) -> Option<&str> {
-        args.posonlyargs
+    fn first_param_name(params: &Parameters) -> Option<&str> {
+        params
+            .posonlyargs
             .first()
-            .or_else(|| args.args.first())
-            .map(|a| a.def.arg.as_str())
+            .or_else(|| params.args.first())
+            .map(|p| p.parameter.name.as_str())
     }
 
-    fn decorator_name(d: &Expr<TextRange>) -> Option<&str> {
+    fn decorator_name(d: &Expr) -> Option<&str> {
         match d {
             Expr::Name(n) => Some(n.id.as_str()),
             Expr::Call(c) => decorator_name(&c.func),
@@ -1475,9 +1441,9 @@ fn insert_self_param(stmt: &Stmt<TextRange>) -> Stmt<TextRange> {
         }
     }
 
-    fn receiver_for(decorators: &[Expr<TextRange>]) -> Option<&'static str> {
+    fn receiver_for(decorators: &[Decorator]) -> Option<&'static str> {
         for d in decorators {
-            match decorator_name(d) {
+            match decorator_name(&d.expression) {
                 Some("staticmethod") => return None, // no receiver
                 Some("classmethod") => return Some("cls"),
                 _ => {}
@@ -1486,15 +1452,15 @@ fn insert_self_param(stmt: &Stmt<TextRange>) -> Stmt<TextRange> {
         Some("self")
     }
 
-    fn inject(args: &mut rustpython_ast::Arguments<TextRange>, receiver: &'static str) {
-        if first_param_name(args) == Some(receiver) {
+    fn inject(params: &mut Parameters, receiver: &'static str) {
+        if first_param_name(params) == Some(receiver) {
             return; // already present — do not duplicate
         }
-        let param = make_receiver_arg(receiver);
-        if args.posonlyargs.is_empty() {
-            args.args.insert(0, param);
+        let param = make_receiver_param(receiver);
+        if params.posonlyargs.is_empty() {
+            params.args.insert(0, param);
         } else {
-            args.posonlyargs.insert(0, param);
+            params.posonlyargs.insert(0, param);
         }
     }
 
@@ -1502,16 +1468,9 @@ fn insert_self_param(stmt: &Stmt<TextRange>) -> Stmt<TextRange> {
         Stmt::FunctionDef(f) => {
             let mut new_f = f.clone();
             if let Some(receiver) = receiver_for(&new_f.decorator_list) {
-                inject(&mut new_f.args, receiver);
+                inject(&mut new_f.parameters, receiver);
             }
             Stmt::FunctionDef(new_f)
-        }
-        Stmt::AsyncFunctionDef(f) => {
-            let mut new_f = f.clone();
-            if let Some(receiver) = receiver_for(&new_f.decorator_list) {
-                inject(&mut new_f.args, receiver);
-            }
-            Stmt::AsyncFunctionDef(new_f)
         }
         other => other.clone(),
     }
@@ -1522,12 +1481,12 @@ fn insert_self_param(stmt: &Stmt<TextRange>) -> Stmt<TextRange> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustpython_parser::{parse, Mode};
     use tyc_emit::emit;
 
     fn parse_and_desugar(src: &str) -> String {
-        let m = parse(src, Mode::Module, "<test>").expect("parse failed");
-        let output = desugar_module(&m);
+        let parsed = tyc_syntax::parse_module(src).expect("parse failed");
+        let module = parsed.into_syntax();
+        let output = desugar_module(&module);
         emit(&output.module)
     }
 
@@ -1703,8 +1662,9 @@ mod tests {
     #[test]
     fn needs_typhon_runtime_flag_set_when_result_used() {
         let src = "def f() -> None:\n    x = Ok(1)\n";
-        let m = parse(src, Mode::Module, "<test>").expect("parse failed");
-        let output = desugar_module(&m);
+        let parsed = tyc_syntax::parse_module(src).expect("parse failed");
+        let module = parsed.into_syntax();
+        let output = desugar_module(&module);
         assert!(
             output.needs_typhon_runtime,
             "flag should be true when Ok is used"
@@ -1714,8 +1674,9 @@ mod tests {
     #[test]
     fn needs_typhon_runtime_flag_clear_when_result_not_used() {
         let src = "x: int = 1\n";
-        let m = parse(src, Mode::Module, "<test>").expect("parse failed");
-        let output = desugar_module(&m);
+        let parsed = tyc_syntax::parse_module(src).expect("parse failed");
+        let module = parsed.into_syntax();
+        let output = desugar_module(&module);
         assert!(
             !output.needs_typhon_runtime,
             "flag should be false when Result not used"
@@ -1879,8 +1840,9 @@ mod tests {
         // not bring Ok/Err/Result into scope, but the build still needs to
         // emit the runtime file.
         let src = "import typhon_runtime\nx = typhon_runtime.Ok(1)\n";
-        let m = parse(src, Mode::Module, "<test>").expect("parse failed");
-        let output = desugar_module(&m);
+        let parsed = tyc_syntax::parse_module(src).expect("parse failed");
+        let module = parsed.into_syntax();
+        let output = desugar_module(&module);
         assert!(
             output.needs_typhon_runtime,
             "bare `import typhon_runtime` must set needs_typhon_runtime"

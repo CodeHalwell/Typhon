@@ -315,12 +315,12 @@ pub enum TokenKind {
     // Soft keywords
     Case,
     Lazy,
+    /// Typhon-specific soft keyword `let` (immutable binding prefix).
+    Let,
     Match,
+    /// Typhon-specific soft keyword `mut` (mutable binding prefix).
+    Mut,
     Type,
-    /// Typhon-specific soft keyword `val` (immutable binding prefix).
-    Val,
-    /// Typhon-specific soft keyword `var` (mutable binding prefix).
-    Var,
 
     Unknown,
 }
@@ -346,7 +346,7 @@ impl TokenKind {
     /// [`is_non_soft_keyword`]: TokenKind::is_non_soft_keyword
     #[inline]
     pub fn is_keyword(self) -> bool {
-        TokenKind::And <= self && self <= TokenKind::Var
+        TokenKind::And <= self && self <= TokenKind::Type
     }
 
     /// Returns `true` if the token is strictly a soft keyword.
@@ -357,7 +357,7 @@ impl TokenKind {
     /// [`is_non_soft_keyword`]: TokenKind::is_non_soft_keyword
     #[inline]
     pub fn is_soft_keyword(self) -> bool {
-        TokenKind::Case <= self && self <= TokenKind::Var
+        TokenKind::Case <= self && self <= TokenKind::Type
     }
 
     /// Returns `true` if the token is strictly a non-soft keyword.
@@ -730,11 +730,11 @@ impl fmt::Display for TokenKind {
             TokenKind::Try => "`try`",
             TokenKind::While => "`while`",
             TokenKind::Lazy => "`lazy`",
+            TokenKind::Let => "`let`",
             TokenKind::Match => "`match`",
+            TokenKind::Mut => "`mut`",
             TokenKind::Type => "`type`",
             TokenKind::Case => "`case`",
-            TokenKind::Val => "`val`",
-            TokenKind::Var => "`var`",
             TokenKind::With => "`with`",
             TokenKind::Yield => "`yield`",
         };

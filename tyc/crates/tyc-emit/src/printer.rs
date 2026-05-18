@@ -4,10 +4,13 @@
 //! Aim: parse → emit produces output that is semantically equivalent to the
 //! input (whitespace and comment differences are acceptable in Phase 0).
 
-use rustpython_ast::{
-    text_size::TextRange, Alias, ArgWithDefault, BoolOp, CmpOp, Comprehension, ExceptHandler, Expr,
-    Keyword, MatchCase, Mod, Operator, Pattern, Stmt, UnaryOp, WithItem,
+use ruff_python_ast::{
+    Alias, BoolOp, CmpOp, Comprehension, ExceptHandler, Expr, FStringPart,
+    InterpolatedStringElement, Keyword, MatchCase, ModModule, Mutability, Number, Operator,
+    Parameter, ParameterWithDefault, Parameters, Pattern, Singleton, Stmt, TypeParam, TypeParams,
+    UnaryOp, WithItem,
 };
+use ruff_text_size::Ranged;
 
 /// Internal state for the Python pretty-printer.
 pub struct Emitter {
@@ -79,80 +82,43 @@ impl Emitter {
 
     // ── module ─────────────────────────────────────────────────────────────
 
-    pub fn emit_mod(&mut self, node: &Mod) {
-        match node {
-            Mod::Module(m) => {
-                for stmt in &m.body {
-                    self.emit_stmt(stmt);
-                }
-            }
-            Mod::Interactive(i) => {
-                for stmt in &i.body {
-                    self.emit_stmt(stmt);
-                }
-            }
-            Mod::Expression(e) => {
-                self.emit_expr(&e.body);
-                self.newline();
-            }
-            Mod::FunctionType(_) => {}
+    /// Emit a parsed module.  Ruff's `parse_module` always returns a
+    /// `ModModule`, so the emitter only needs the single-variant signature.
+    pub fn emit_mod(&mut self, module: &ModModule) {
+        for stmt in &module.body {
+            self.emit_stmt(stmt);
         }
     }
 
     // ── statements ─────────────────────────────────────────────────────────
 
-    pub fn emit_stmt(&mut self, node: &Stmt<TextRange>) {
+    pub fn emit_stmt(&mut self, node: &Stmt) {
         // Update the active input offset from the node's source range.
         // Synthesised AST nodes (produced by the desugar pass) carry a
         // zero-length TextRange::default(); we skip those so they inherit
         // the last real offset rather than resetting to 0.
-        let range = stmt_range(node);
+        let range = node.range();
         if u32::from(range.start()) != u32::from(range.end()) {
             self.current_input_offset = u32::from(range.start()) as usize;
         }
         match node {
+            // `StmtFunctionDef` collapses sync and async; branch on `is_async`.
             Stmt::FunctionDef(f) => {
                 self.newline();
                 for decorator in &f.decorator_list {
                     self.fill("@");
-                    self.emit_expr(decorator);
+                    self.emit_expr(&decorator.expression);
                     self.newline();
                 }
-                self.fill("def ");
-                self.write(f.name.as_str());
-                self.emit_type_params(&f.type_params);
-                self.write("(");
-                self.emit_arguments(&f.args);
-                self.write(")");
-                if let Some(ret) = &f.returns {
-                    self.write(" -> ");
-                    self.emit_expr(ret);
-                }
-                self.writeln(":");
-                self.enter_block();
-                if f.body.is_empty() {
-                    self.fill("pass");
-                    self.newline();
+                if f.is_async {
+                    self.fill("async def ");
                 } else {
-                    for stmt in &f.body {
-                        self.emit_stmt(stmt);
-                    }
+                    self.fill("def ");
                 }
-                self.leave_block();
-            }
-
-            Stmt::AsyncFunctionDef(f) => {
-                self.newline();
-                for decorator in &f.decorator_list {
-                    self.fill("@");
-                    self.emit_expr(decorator);
-                    self.newline();
-                }
-                self.fill("async def ");
                 self.write(f.name.as_str());
-                self.emit_type_params(&f.type_params);
+                self.emit_type_params(f.type_params.as_deref());
                 self.write("(");
-                self.emit_arguments(&f.args);
+                self.emit_parameters(&f.parameters);
                 self.write(")");
                 if let Some(ret) = &f.returns {
                     self.write(" -> ");
@@ -175,23 +141,25 @@ impl Emitter {
                 self.newline();
                 for decorator in &c.decorator_list {
                     self.fill("@");
-                    self.emit_expr(decorator);
+                    self.emit_expr(&decorator.expression);
                     self.newline();
                 }
                 self.fill("class ");
                 self.write(c.name.as_str());
-                self.emit_type_params(&c.type_params);
-                if !c.bases.is_empty() || !c.keywords.is_empty() {
+                self.emit_type_params(c.type_params.as_deref());
+                let bases = c.bases();
+                let keywords = c.keywords();
+                if !bases.is_empty() || !keywords.is_empty() {
                     self.write("(");
                     let mut first = true;
-                    for base in &c.bases {
+                    for base in bases {
                         if !first {
                             self.write(", ");
                         }
                         self.emit_expr(base);
                         first = false;
                     }
-                    for kw in &c.keywords {
+                    for kw in keywords {
                         if !first {
                             self.write(", ");
                         }
@@ -239,8 +207,18 @@ impl Emitter {
                 self.newline();
             }
 
+            // Ruff's `StmtAssign` carries a Typhon-specific `mutability` that
+            // tags the binding as `let` (immutable) or `mut` (mutable).  When
+            // it's set we prepend the keyword before the targets so the
+            // emitted Python preserves the source-level kind.  Plain Python
+            // assigns leave `mutability` at `None` and no prefix is emitted.
             Stmt::Assign(a) => {
                 self.fill("");
+                match a.mutability {
+                    Some(Mutability::Let) => self.write("let "),
+                    Some(Mutability::Mut) => self.write("mut "),
+                    None => {}
+                }
                 let mut first = true;
                 for target in &a.targets {
                     if !first {
@@ -264,8 +242,16 @@ impl Emitter {
                 self.newline();
             }
 
+            // As with `StmtAssign`, the optional `mutability` prefix (if
+            // present) is emitted before the annotated target so a Typhon
+            // `let x: int = 1` round-trips intact.
             Stmt::AnnAssign(a) => {
                 self.fill("");
+                match a.mutability {
+                    Some(Mutability::Let) => self.write("let "),
+                    Some(Mutability::Mut) => self.write("mut "),
+                    None => {}
+                }
                 self.emit_expr(&a.target);
                 self.write(": ");
                 self.emit_expr(&a.annotation);
@@ -276,28 +262,13 @@ impl Emitter {
                 self.newline();
             }
 
+            // `StmtFor` collapses sync / async; branch on `is_async`.
             Stmt::For(f) => {
-                self.fill("for ");
-                self.emit_expr(&f.target);
-                self.write(" in ");
-                self.emit_expr(&f.iter);
-                self.writeln(":");
-                self.enter_block();
-                self.emit_body(&f.body);
-                self.leave_block();
-                if !f.orelse.is_empty() {
-                    self.fill("else:");
-                    self.newline();
-                    self.enter_block();
-                    for stmt in &f.orelse {
-                        self.emit_stmt(stmt);
-                    }
-                    self.leave_block();
+                if f.is_async {
+                    self.fill("async for ");
+                } else {
+                    self.fill("for ");
                 }
-            }
-
-            Stmt::AsyncFor(f) => {
-                self.fill("async for ");
                 self.emit_expr(&f.target);
                 self.write(" in ");
                 self.emit_expr(&f.iter);
@@ -334,6 +305,10 @@ impl Emitter {
                 }
             }
 
+            // Ruff's `StmtIf` doesn't have a recursive `orelse: Vec<Stmt>`
+            // chain; it carries an explicit list of `ElifElseClause`s where
+            // each clause has `test: Some(_)` for `elif` and `test: None`
+            // for the trailing `else:` block.
             Stmt::If(i) => {
                 self.fill("if ");
                 self.emit_expr(&i.test);
@@ -341,25 +316,34 @@ impl Emitter {
                 self.enter_block();
                 self.emit_body(&i.body);
                 self.leave_block();
-                self.emit_elif_or_else(&i.orelse);
-            }
-
-            Stmt::With(w) => {
-                self.fill("with ");
-                for (idx, item) in w.items.iter().enumerate() {
-                    if idx > 0 {
-                        self.write(", ");
+                for clause in &i.elif_else_clauses {
+                    match &clause.test {
+                        Some(test) => {
+                            self.fill("elif ");
+                            self.emit_expr(test);
+                            self.writeln(":");
+                            self.enter_block();
+                            self.emit_body(&clause.body);
+                            self.leave_block();
+                        }
+                        None => {
+                            self.fill("else:");
+                            self.newline();
+                            self.enter_block();
+                            self.emit_body(&clause.body);
+                            self.leave_block();
+                        }
                     }
-                    self.emit_with_item(item);
                 }
-                self.writeln(":");
-                self.enter_block();
-                self.emit_body(&w.body);
-                self.leave_block();
             }
 
-            Stmt::AsyncWith(w) => {
-                self.fill("async with ");
+            // `StmtWith` collapses sync / async; branch on `is_async`.
+            Stmt::With(w) => {
+                if w.is_async {
+                    self.fill("async with ");
+                } else {
+                    self.fill("with ");
+                }
                 for (idx, item) in w.items.iter().enumerate() {
                     if idx > 0 {
                         self.write(", ");
@@ -401,6 +385,8 @@ impl Emitter {
                 self.newline();
             }
 
+            // Ruff merges `try` / `try*` into a single `StmtTry` discriminated
+            // by `is_star`.
             Stmt::Try(t) => {
                 self.fill("try:");
                 self.newline();
@@ -408,36 +394,7 @@ impl Emitter {
                 self.emit_body(&t.body);
                 self.leave_block();
                 for handler in &t.handlers {
-                    self.emit_except_handler(handler, false);
-                }
-                if !t.orelse.is_empty() {
-                    self.fill("else:");
-                    self.newline();
-                    self.enter_block();
-                    for stmt in &t.orelse {
-                        self.emit_stmt(stmt);
-                    }
-                    self.leave_block();
-                }
-                if !t.finalbody.is_empty() {
-                    self.fill("finally:");
-                    self.newline();
-                    self.enter_block();
-                    for stmt in &t.finalbody {
-                        self.emit_stmt(stmt);
-                    }
-                    self.leave_block();
-                }
-            }
-
-            Stmt::TryStar(t) => {
-                self.fill("try:");
-                self.newline();
-                self.enter_block();
-                self.emit_body(&t.body);
-                self.leave_block();
-                for handler in &t.handlers {
-                    self.emit_except_handler(handler, true);
+                    self.emit_except_handler(handler, t.is_star);
                 }
                 if !t.orelse.is_empty() {
                     self.fill("else:");
@@ -482,11 +439,12 @@ impl Emitter {
                 self.newline();
             }
 
+            // `level` is now a plain `u32` rather than `Option<Int>`; emit
+            // that many leading dots.
             Stmt::ImportFrom(i) => {
                 self.fill("from ");
-                if let Some(level) = i.level {
-                    let dots: String = ".".repeat(level.to_usize());
-                    self.write(&dots);
+                for _ in 0..i.level {
+                    self.write(".");
                 }
                 if let Some(module) = &i.module {
                     self.write(module.as_str());
@@ -541,40 +499,53 @@ impl Emitter {
             Stmt::TypeAlias(t) => {
                 self.fill("type ");
                 self.emit_expr(&t.name);
-                self.emit_type_params(&t.type_params);
+                self.emit_type_params(t.type_params.as_deref());
                 self.write(" = ");
                 self.emit_expr(&t.value);
+                self.newline();
+            }
+
+            // Ruff exposes IPython escape commands as a dedicated statement
+            // kind.  Plain Python source can't contain them, so we emit
+            // their raw text verbatim and trust the source position to
+            // signal anything Phase 0 isn't expected to handle.
+            Stmt::IpyEscapeCommand(cmd) => {
+                self.fill("");
+                self.write(&cmd.value);
                 self.newline();
             }
         }
     }
 
     /// Emit a PEP 695 type-parameter list (`[T]`, `[T: Number]`, `[*Ts, **P]`).
-    /// No output when the list is empty.
-    fn emit_type_params(&mut self, params: &[rustpython_ast::TypeParam<TextRange>]) {
+    /// No output when the list is missing or empty.
+    fn emit_type_params(&mut self, params: Option<&TypeParams>) {
+        let Some(params) = params else {
+            return;
+        };
         if params.is_empty() {
             return;
         }
         self.write("[");
         let mut first = true;
-        for tp in params {
+        for tp in &params.type_params {
             if !first {
                 self.write(", ");
             }
             first = false;
             match tp {
-                rustpython_ast::TypeParam::TypeVar(t) => {
+                TypeParam::TypeVar(t) => {
                     self.write(t.name.as_str());
                     if let Some(bound) = &t.bound {
                         self.write(": ");
                         self.emit_expr(bound);
                     }
                 }
-                rustpython_ast::TypeParam::ParamSpec(p) => {
+                TypeParam::ParamSpec(p) => {
                     self.write("**");
                     self.write(p.name.as_str());
                 }
-                rustpython_ast::TypeParam::TypeVarTuple(t) => {
+                TypeParam::TypeVarTuple(t) => {
                     self.write("*");
                     self.write(t.name.as_str());
                 }
@@ -585,7 +556,7 @@ impl Emitter {
 
     // ── expressions ────────────────────────────────────────────────────────
 
-    pub fn emit_expr(&mut self, node: &Expr<TextRange>) {
+    pub fn emit_expr(&mut self, node: &Expr) {
         match node {
             Expr::BoolOp(b) => {
                 let op = match b.op {
@@ -602,7 +573,8 @@ impl Emitter {
                 }
             }
 
-            Expr::NamedExpr(n) => {
+            // Ruff renamed `NamedExpr` → `Named` (walrus operator).
+            Expr::Named(n) => {
                 self.emit_expr(&n.target);
                 self.write(" := ");
                 self.emit_expr(&n.value);
@@ -655,13 +627,19 @@ impl Emitter {
             }
 
             Expr::Lambda(l) => {
-                self.write("lambda ");
-                self.emit_arguments(&l.args);
+                self.write("lambda");
+                if let Some(params) = l.parameters.as_deref() {
+                    if !params.is_empty() {
+                        self.write(" ");
+                        self.emit_parameters(params);
+                    }
+                }
                 self.write(": ");
                 self.emit_expr(&l.body);
             }
 
-            Expr::IfExp(i) => {
+            // `IfExp` is now `Expr::If`.
+            Expr::If(i) => {
                 self.emit_expr(&i.body);
                 self.write(" if ");
                 self.emit_expr(&i.test);
@@ -669,20 +647,23 @@ impl Emitter {
                 self.emit_expr(&i.orelse);
             }
 
+            // Ruff packs the dict entries as `Vec<DictItem>` where each entry
+            // has `key: Option<Expr>` and `value: Expr`; a missing key means
+            // `**spread`.
             Expr::Dict(d) => {
                 self.write("{");
                 let mut first = true;
-                for (key, val) in d.keys.iter().zip(d.values.iter()) {
+                for item in &d.items {
                     if !first {
                         self.write(", ");
                     }
-                    if let Some(k) = key {
+                    if let Some(k) = &item.key {
                         self.emit_expr(k);
                         self.write(": ");
-                        self.emit_expr(val);
+                        self.emit_expr(&item.value);
                     } else {
                         self.write("**");
-                        self.emit_expr(val);
+                        self.emit_expr(&item.value);
                     }
                     first = false;
                 }
@@ -720,10 +701,14 @@ impl Emitter {
                 self.write("}");
             }
 
+            // Ruff makes `key` an `Option<Expr>`; treat a missing key as
+            // an unreachable codepath in valid Python but stay defensive.
             Expr::DictComp(d) => {
                 self.write("{");
-                self.emit_expr(&d.key);
-                self.write(": ");
+                if let Some(key) = &d.key {
+                    self.emit_expr(key);
+                    self.write(": ");
+                }
                 self.emit_expr(&d.value);
                 for gen in &d.generators {
                     self.emit_comprehension(gen);
@@ -731,7 +716,8 @@ impl Emitter {
                 self.write("}");
             }
 
-            Expr::GeneratorExp(g) => {
+            // `GeneratorExp` is now `Expr::Generator`.
+            Expr::Generator(g) => {
                 self.write("(");
                 self.emit_expr(&g.elt);
                 for gen in &g.generators {
@@ -778,18 +764,20 @@ impl Emitter {
                 }
             }
 
+            // Ruff bundles positional args and keywords under
+            // `ExprCall.arguments: Arguments`.
             Expr::Call(c) => {
                 self.emit_expr(&c.func);
                 self.write("(");
                 let mut first = true;
-                for arg in &c.args {
+                for arg in c.arguments.args.iter() {
                     if !first {
                         self.write(", ");
                     }
                     self.emit_expr(arg);
                     first = false;
                 }
-                for kw in &c.keywords {
+                for kw in c.arguments.keywords.iter() {
                     if !first {
                         self.write(", ");
                     }
@@ -799,34 +787,98 @@ impl Emitter {
                 self.write(")");
             }
 
-            Expr::FormattedValue(f) => {
-                // Part of an f-string — emit the inner expression.
-                self.emit_expr(&f.value);
-            }
-
-            Expr::JoinedStr(j) => {
-                // f-string literal reconstruction.
+            // `JoinedStr` + `FormattedValue` are now a single `ExprFString`.
+            // Each part is either a literal `StringLiteral` or an `FString`
+            // whose elements are interleaved literal/interpolation pieces.
+            Expr::FString(fs) => {
                 self.write("f\"");
-                for part in &j.values {
+                for part in fs.value.iter() {
                     match part {
-                        Expr::Constant(c) => {
-                            if let rustpython_ast::Constant::Str(s) = &c.value {
-                                self.write(s.as_str());
+                        FStringPart::Literal(lit) => {
+                            self.write(&escape_python_string(lit.as_str()));
+                        }
+                        FStringPart::FString(inner) => {
+                            for elem in &inner.elements {
+                                match elem {
+                                    InterpolatedStringElement::Literal(lit) => {
+                                        self.write(&escape_python_string(&lit.value));
+                                    }
+                                    InterpolatedStringElement::Interpolation(interp) => {
+                                        self.write("{");
+                                        self.emit_expr(&interp.expression);
+                                        self.write("}");
+                                    }
+                                }
                             }
                         }
-                        Expr::FormattedValue(fv) => {
-                            self.write("{");
-                            self.emit_expr(&fv.value);
-                            self.write("}");
-                        }
-                        _ => {}
                     }
                 }
                 self.write("\"");
             }
 
-            Expr::Constant(c) => {
-                self.emit_constant(&c.value);
+            // PEP 750 template strings — Phase 0 falls back to f-string-like
+            // rendering since `t"..."` is not yet part of the Phase 0 source
+            // subset.  Emitting as `t"..."` keeps semantics distinct from
+            // f-strings.
+            Expr::TString(ts) => {
+                self.write("t\"");
+                for part in ts.value.iter() {
+                    for elem in &part.elements {
+                        match elem {
+                            InterpolatedStringElement::Literal(lit) => {
+                                self.write(&escape_python_string(&lit.value));
+                            }
+                            InterpolatedStringElement::Interpolation(interp) => {
+                                self.write("{");
+                                self.emit_expr(&interp.expression);
+                                self.write("}");
+                            }
+                        }
+                    }
+                }
+                self.write("\"");
+            }
+
+            // Typed-literal arms — each was previously a `Constant` variant.
+            Expr::NumberLiteral(n) => match &n.value {
+                Number::Int(i) => {
+                    self.write(&i.to_string());
+                }
+                Number::Float(f) => {
+                    self.write(&format!("{}", f));
+                }
+                Number::Complex { real, imag } => {
+                    if *real != 0.0 {
+                        self.write(&format!("{}+", real));
+                    }
+                    self.write(&format!("{}j", imag));
+                }
+            },
+
+            Expr::StringLiteral(s) => {
+                self.write("\"");
+                self.write(&escape_python_string(s.value.to_str()));
+                self.write("\"");
+            }
+
+            Expr::BytesLiteral(b) => {
+                self.write("b\"");
+                for byte in b.value.bytes() {
+                    self.write(&format!("\\x{:02x}", byte));
+                }
+                self.write("\"");
+            }
+
+            Expr::BooleanLiteral(b) => {
+                self.write(if b.value { "True" } else { "False" });
+            }
+
+            Expr::NoneLiteral(_) => {
+                self.write("None");
+            }
+
+            Expr::EllipsisLiteral(_) => {
+                self.write("...");
             }
 
             Expr::Attribute(a) => {
@@ -922,90 +974,50 @@ impl Emitter {
                     self.emit_expr(step);
                 }
             }
+
+            // IPython escape expression (`dir = !pwd` etc.) — render the raw
+            // command text verbatim; not part of the Phase 0 source subset.
+            Expr::IpyEscapeCommand(cmd) => {
+                self.write(&cmd.value);
+            }
         }
     }
 
     // ── helpers ────────────────────────────────────────────────────────────
 
-    fn emit_constant(&mut self, c: &rustpython_ast::Constant) {
-        use rustpython_ast::Constant;
-        match c {
-            Constant::None => self.write("None"),
-            Constant::Bool(b) => self.write(if *b { "True" } else { "False" }),
-            Constant::Str(s) => {
-                self.write("\"");
-                let escaped = escape_python_string(s.as_str());
-                self.write(&escaped);
-                self.write("\"");
-            }
-            Constant::Bytes(b) => {
-                self.write("b\"");
-                for byte in b {
-                    self.write(&format!("\\x{:02x}", byte));
-                }
-                self.write("\"");
-            }
-            Constant::Int(i) => {
-                self.write(&i.to_string());
-            }
-            Constant::Tuple(elems) => {
-                self.write("(");
-                let mut first = true;
-                for elem in elems {
-                    if !first {
-                        self.write(", ");
-                    }
-                    self.emit_constant(elem);
-                    first = false;
-                }
-                self.write(")");
-            }
-            Constant::Float(f) => {
-                self.write(&format!("{}", f));
-            }
-            Constant::Complex { real, imag } => {
-                if *real != 0.0 {
-                    self.write(&format!("{}+", real));
-                }
-                self.write(&format!("{}j", imag));
-            }
-            Constant::Ellipsis => self.write("..."),
-        }
-    }
-
-    fn emit_arguments(&mut self, args: &rustpython_ast::Arguments<TextRange>) {
+    fn emit_parameters(&mut self, params: &Parameters) {
         let mut first = true;
 
         // Positional-only args (before /)
-        for arg in &args.posonlyargs {
+        for arg in &params.posonlyargs {
             if !first {
                 self.write(", ");
             }
-            self.emit_arg_with_default(arg);
+            self.emit_param_with_default(arg);
             first = false;
         }
-        if !args.posonlyargs.is_empty() {
+        if !params.posonlyargs.is_empty() {
             self.write(", /");
         }
 
         // Regular args (each carries its own optional default)
-        for arg in &args.args {
+        for arg in &params.args {
             if !first {
                 self.write(", ");
             }
-            self.emit_arg_with_default(arg);
+            self.emit_param_with_default(arg);
             first = false;
         }
 
         // *args
-        if let Some(vararg) = &args.vararg {
+        if let Some(vararg) = &params.vararg {
             if !first {
                 self.write(", ");
             }
             self.write("*");
-            self.emit_plain_arg(vararg);
+            self.emit_plain_param(vararg);
             first = false;
-        } else if !args.kwonlyargs.is_empty() {
+        } else if !params.kwonlyargs.is_empty() {
             if !first {
                 self.write(", ");
             }
@@ -1014,44 +1026,44 @@ impl Emitter {
         }
 
         // Keyword-only args (each carries its own optional default)
-        for arg in &args.kwonlyargs {
+        for arg in &params.kwonlyargs {
             if !first {
                 self.write(", ");
             }
-            self.emit_arg_with_default(arg);
+            self.emit_param_with_default(arg);
             first = false;
         }
 
         // **kwargs
-        if let Some(kwarg) = &args.kwarg {
+        if let Some(kwarg) = &params.kwarg {
             if !first {
                 self.write(", ");
             }
             self.write("**");
-            self.emit_plain_arg(kwarg);
+            self.emit_plain_param(kwarg);
         }
     }
 
-    /// Emit an `ArgWithDefault` — the arg name, optional annotation, and
-    /// optional default value.
-    fn emit_arg_with_default(&mut self, arg: &ArgWithDefault<TextRange>) {
-        self.emit_plain_arg(&arg.def);
+    /// Emit a `ParameterWithDefault` — the parameter name, optional
+    /// annotation, and optional default value.
+    fn emit_param_with_default(&mut self, arg: &ParameterWithDefault) {
+        self.emit_plain_param(&arg.parameter);
         if let Some(default) = &arg.default {
             self.write(" = ");
             self.emit_expr(default);
         }
     }
 
-    /// Emit a plain `Arg` (name + optional annotation, no default).
-    fn emit_plain_arg(&mut self, arg: &rustpython_ast::Arg<TextRange>) {
-        self.write(arg.arg.as_str());
-        if let Some(ann) = &arg.annotation {
+    /// Emit a plain `Parameter` (name + optional annotation, no default).
+    fn emit_plain_param(&mut self, param: &Parameter) {
+        self.write(param.name.as_str());
+        if let Some(ann) = &param.annotation {
             self.write(": ");
             self.emit_expr(ann);
         }
     }
 
-    fn emit_alias(&mut self, alias: &Alias<TextRange>) {
+    fn emit_alias(&mut self, alias: &Alias) {
         self.write(alias.name.as_str());
         if let Some(asname) = &alias.asname {
             self.write(" as ");
@@ -1059,7 +1071,7 @@ impl Emitter {
         }
     }
 
-    fn emit_keyword(&mut self, kw: &Keyword<TextRange>) {
+    fn emit_keyword(&mut self, kw: &Keyword) {
         if let Some(arg) = &kw.arg {
             self.write(arg.as_str());
             self.write("=");
@@ -1069,7 +1081,7 @@ impl Emitter {
         self.emit_expr(&kw.value);
     }
 
-    fn emit_comprehension(&mut self, gen: &Comprehension<TextRange>) {
+    fn emit_comprehension(&mut self, gen: &Comprehension) {
         if gen.is_async {
             self.write(" async for ");
         } else {
@@ -1084,7 +1096,7 @@ impl Emitter {
         }
     }
 
-    fn emit_with_item(&mut self, item: &WithItem<TextRange>) {
+    fn emit_with_item(&mut self, item: &WithItem) {
         self.emit_expr(&item.context_expr);
         if let Some(var) = &item.optional_vars {
             self.write(" as ");
@@ -1092,31 +1104,28 @@ impl Emitter {
         }
     }
 
-    fn emit_except_handler(&mut self, handler: &ExceptHandler<TextRange>, star: bool) {
-        match handler {
-            ExceptHandler::ExceptHandler(h) => {
-                if star {
-                    self.fill("except*");
-                } else {
-                    self.fill("except");
-                }
-                if let Some(typ) = &h.type_ {
-                    self.write(" ");
-                    self.emit_expr(typ);
-                }
-                if let Some(name) = &h.name {
-                    self.write(" as ");
-                    self.write(name.as_str());
-                }
-                self.writeln(":");
-                self.enter_block();
-                self.emit_body(&h.body);
-                self.leave_block();
-            }
+    fn emit_except_handler(&mut self, handler: &ExceptHandler, star: bool) {
+        let ExceptHandler::ExceptHandler(h) = handler;
+        if star {
+            self.fill("except*");
+        } else {
+            self.fill("except");
         }
+        if let Some(typ) = &h.type_ {
+            self.write(" ");
+            self.emit_expr(typ);
+        }
+        if let Some(name) = &h.name {
+            self.write(" as ");
+            self.write(name.as_str());
+        }
+        self.writeln(":");
+        self.enter_block();
+        self.emit_body(&h.body);
+        self.leave_block();
     }
 
-    fn emit_match_case(&mut self, case: &MatchCase<TextRange>) {
+    fn emit_match_case(&mut self, case: &MatchCase) {
         self.fill("case ");
         self.emit_pattern(&case.pattern);
         if let Some(guard) = &case.guard {
@@ -1131,7 +1140,7 @@ impl Emitter {
 
     /// Emit a compound-statement body, falling back to `pass` when empty so
     /// the generated Python remains syntactically valid.
-    fn emit_body(&mut self, body: &[Stmt<TextRange>]) {
+    fn emit_body(&mut self, body: &[Stmt]) {
         if body.is_empty() {
             self.fill("pass");
             self.newline();
@@ -1142,37 +1151,16 @@ impl Emitter {
         }
     }
 
-    /// Recursively emit `elif`/`else` chains from an `if`/`elif` orelse list,
-    /// preserving the original `elif`-chain structure (so two or more elif
-    /// branches don't collapse into bare statements).
-    fn emit_elif_or_else(&mut self, orelse: &[Stmt<TextRange>]) {
-        if orelse.len() == 1 {
-            if let Stmt::If(elif) = &orelse[0] {
-                self.fill("elif ");
-                self.emit_expr(&elif.test);
-                self.writeln(":");
-                self.enter_block();
-                self.emit_body(&elif.body);
-                self.leave_block();
-                self.emit_elif_or_else(&elif.orelse);
-                return;
-            }
-        }
-        if !orelse.is_empty() {
-            self.fill("else:");
-            self.newline();
-            self.enter_block();
-            for stmt in orelse {
-                self.emit_stmt(stmt);
-            }
-            self.leave_block();
-        }
-    }
-
-    fn emit_pattern(&mut self, pattern: &Pattern<TextRange>) {
+    fn emit_pattern(&mut self, pattern: &Pattern) {
         match pattern {
             Pattern::MatchValue(v) => self.emit_expr(&v.value),
-            Pattern::MatchSingleton(s) => self.emit_constant(&s.value),
+            // `PatternMatchSingleton` now carries a `Singleton` enum directly
+            // (None / True / False) instead of a wrapped `Constant`.
+            Pattern::MatchSingleton(s) => match s.value {
+                Singleton::None => self.write("None"),
+                Singleton::True => self.write("True"),
+                Singleton::False => self.write("False"),
+            },
             Pattern::MatchSequence(seq) => {
                 self.write("[");
                 let mut first = true;
@@ -1206,24 +1194,27 @@ impl Emitter {
                 }
                 self.write("}");
             }
+            // The class-pattern arguments are now bundled under
+            // `PatternArguments { patterns, keywords }` where each keyword is
+            // a `PatternKeyword { attr, pattern }`.
             Pattern::MatchClass(c) => {
                 self.emit_expr(&c.cls);
                 self.write("(");
                 let mut first = true;
-                for p in &c.patterns {
+                for p in &c.arguments.patterns {
                     if !first {
                         self.write(", ");
                     }
                     self.emit_pattern(p);
                     first = false;
                 }
-                for (key, p) in c.kwd_attrs.iter().zip(c.kwd_patterns.iter()) {
+                for kw in &c.arguments.keywords {
                     if !first {
                         self.write(", ");
                     }
-                    self.write(key.as_str());
+                    self.write(kw.attr.as_str());
                     self.write("=");
-                    self.emit_pattern(p);
+                    self.emit_pattern(&kw.pattern);
                     first = false;
                 }
                 self.write(")");
@@ -1264,45 +1255,6 @@ impl Emitter {
 impl Default for Emitter {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// Extract the `TextRange` from any `Stmt<TextRange>` variant.
-///
-/// Used by `emit_stmt` to update `current_input_offset` without a
-/// separate trait import.  Synthesised statements from the desugar pass
-/// carry `TextRange::default()` (start == end == 0); callers detect this
-/// by checking `start != end`.
-fn stmt_range(stmt: &Stmt<TextRange>) -> TextRange {
-    match stmt {
-        Stmt::FunctionDef(s) => s.range,
-        Stmt::AsyncFunctionDef(s) => s.range,
-        Stmt::ClassDef(s) => s.range,
-        Stmt::Return(s) => s.range,
-        Stmt::Delete(s) => s.range,
-        Stmt::Assign(s) => s.range,
-        Stmt::AugAssign(s) => s.range,
-        Stmt::AnnAssign(s) => s.range,
-        Stmt::For(s) => s.range,
-        Stmt::AsyncFor(s) => s.range,
-        Stmt::While(s) => s.range,
-        Stmt::If(s) => s.range,
-        Stmt::With(s) => s.range,
-        Stmt::AsyncWith(s) => s.range,
-        Stmt::Match(s) => s.range,
-        Stmt::Raise(s) => s.range,
-        Stmt::Try(s) => s.range,
-        Stmt::TryStar(s) => s.range,
-        Stmt::Assert(s) => s.range,
-        Stmt::Import(s) => s.range,
-        Stmt::ImportFrom(s) => s.range,
-        Stmt::Global(s) => s.range,
-        Stmt::Nonlocal(s) => s.range,
-        Stmt::Expr(s) => s.range,
-        Stmt::Pass(s) => s.range,
-        Stmt::Break(s) => s.range,
-        Stmt::Continue(s) => s.range,
-        Stmt::TypeAlias(s) => s.range,
     }
 }
 
@@ -1354,10 +1306,10 @@ fn bin_op_precedence(op: &Operator) -> u8 {
 /// `not` has very low precedence in Python (between `and` and comparisons),
 /// so it is distinguished from the arithmetic unary operators which sit
 /// just below `**`.
-fn expr_precedence(expr: &Expr<TextRange>) -> u8 {
+fn expr_precedence(expr: &Expr) -> u8 {
     match expr {
         Expr::Lambda(_) => 1,
-        Expr::IfExp(_) => 2,
+        Expr::If(_) => 2,
         Expr::BoolOp(b) => match b.op {
             BoolOp::Or => 3,
             BoolOp::And => 4,
@@ -1399,11 +1351,11 @@ fn escape_python_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::emit;
-    use rustpython_parser::{parse, Mode};
+    use tyc_syntax::parse_module;
 
     fn round_trip(src: &str) -> String {
-        let ast = parse(src, Mode::Module, "<test>").expect("parse failed");
-        emit(&ast)
+        let parsed = parse_module(src).expect("parse failed");
+        emit(parsed.syntax())
     }
 
     #[test]
