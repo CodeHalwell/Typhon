@@ -2124,6 +2124,16 @@ Doesn't affect runtime; affects readability of generated code and
 
 ## 55. `tyc init NAME` scaffolds into CWD instead of `./NAME/` (papercut)
 
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. `tyc init` now
+treats a positional `NAME` as the target sub-directory: `tyc init myapp`
+creates `./myapp/typhon.toml`, `./myapp/src/main.ty`, `./myapp/tests/` and
+prints `Initialised Typhon project 'myapp' in <abs>/myapp`. Bare `tyc init`
+(no name) still scaffolds into the current directory and infers the name
+from the basename, matching `tyc init --dir <existing>` behaviour. Tests
+updated in `tyc/crates/tyc/src/commands/init.rs` and a new
+`init_with_name_creates_subdirectory` regression guard verifies the parent
+directory stays clean.
+
 **Severity:** papercut — UX confusion.
 
 ```text
