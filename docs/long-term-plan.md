@@ -70,15 +70,17 @@ tyc/
 │   ├── tyc-types/              structural + nominal type checker
 │   ├── tyc-analyse/            purity, async-gather, comptime, DCE
 │   ├── tyc-desugar/            Typhon AST → Python AST lowering
-│   ├── tyc-emit/               Python codegen via vendored ruff_python_codegen
+│   ├── tyc-emit/               Python codegen (hand-written printer; tracks line offsets for .py.map)
 │   ├── tyc-format/             post-process emitter output through ruff format
 │   ├── tyc-diagnostics/        miette-based diagnostic rendering
 │   ├── tyc-lsp/                tower-lsp-server Backend over tyc-db
 │   └── tyc/                    thin CLI binary, clap subcommands
-└── vendor/
-    ├── ruff_python_ast/        forked from Ruff monorepo
-    ├── ruff_python_parser/     forked and extended with Typhon tokens
-    └── ruff_python_codegen/    forked for emission
+└── vendor/                     Typhon's in-tree fork of Ruff (pinned via vendor/UPSTREAM)
+    ├── ruff_text_size/         TextSize / TextRange newtypes
+    ├── ruff_source_file/       Line-index over a source string
+    ├── ruff_python_trivia/     Whitespace + comment helpers
+    ├── ruff_python_ast/        Python AST + Typhon's Mutability extension
+    └── ruff_python_parser/     Lexer + parser, plus let/mut soft-keyword support
 ```
 
 This is the same crate-per-stage layout used by `oxc` and `rust-analyzer`. The single most important meta-rule: every external crate gets wrapped behind a one-function-wide module of our own, so when Salsa changes its API or Ruff renames a node, the blast radius stays small.
@@ -93,7 +95,7 @@ These are the load-bearing choices. Each has a sensible fallback if the primary 
 | AST | Fork `ruff_python_ast` | Hand-written | AST is partly TOML-generated; adding Typhon variants is mechanical. |
 | Incremental engine | `salsa` (salsa-rs) | Hand-rolled query cache | Powers `rust-analyzer` and `ty`. Free cancellation and parallel queries. |
 | Type checker | Custom on Salsa, `ty` as reference | Embed `ty` as a library on the desugared AST | Typhon-specific rules (non-null, Result, sealed unions) require own checker; `ty` handles the Python subset. |
-| Code emission | Fork `ruff_python_codegen` | Hand-written pretty-printer | Small, internal, vendor-friendly. Post-process through `ruff format`. |
+| Code emission | Hand-written pretty-printer (today) | Fork `ruff_python_codegen` (deferred) | Hand-written printer tracks line offsets for `.py.map`; upstream codegen lacks that hook. Post-process through `ruff format`. |
 | LSP transport | `tower-lsp-server` (community fork) | `lsp-server` (rust-analyzer style) | Ergonomic, active fork on `lsp-types` 0.97+. |
 | CLI | `clap` v4 derive | — | Standard. |
 | Diagnostics | `miette` + `thiserror` | `ariadne` | Best-in-class source-span rendering. |
@@ -116,14 +118,9 @@ A plain `T` forbids `None`; `T?` is the optional form. Internally `T?` is repres
 
 #### Generics
 
-Angle-bracket syntax (`def f<T>(x: T) -> T`) instead of PEP 484 TypeVars. Inference is bidirectional: constraints flow from arguments to type parameters, falling back to explicit annotation when ambiguous. Generics are type-erased at emit time; runtime relies on Python's duck typing and (where present) Pydantic validation.
+**Locked: PEP 695 bracket syntax** (`def f[T](x: T) -> T`, `type Vector[T: float] = ...`). The choice was forced by two factors: the vendored Ruff parser already accepts PEP 695, so the grammar work is zero; and divergence from CPython grammar is the dominant cost on a one-person project. The angle-bracket aesthetic kinship with TS/Rust loses on every load-bearing dimension.
 
-**Generics syntax — locked: PEP 695 brackets.** Typhon adopts Python 3.12's PEP 695
-syntax (`def f[T](x: T) -> T`, `type Vector[T: float] = ...`). The decision was
-forced by two factors: `rustpython-parser` already accepts PEP 695, so the
-grammar work is zero; and we have no parser fork to absorb the cost of angle
-brackets. Aesthetic kinship with TS/Rust loses to the practical reality that
-divergence from CPython grammar is the dominant cost on a one-person project.
+Inference is bidirectional: constraints flow from arguments to type parameters (recursively, with conflict-widening into a union when bindings disagree) and substitute through the return type, falling back to explicit annotation when ambiguous. Bounded-type-var checking is wired up; full variance and higher-kinded forms remain partial. Generics are type-erased at emit time; runtime relies on Python's duck typing and (where present) Pydantic validation.
 
 #### Interfaces (structural)
 
@@ -374,12 +371,17 @@ Single binary, `clap` subcommands:
 | Command | Purpose |
 |---------|---------|
 | `tyc build` | Full pipeline: parse, check, analyse, desugar, emit, format. |
-| `tyc check` | Up to analyser, no emit. Used by CI. |
+| `tyc check` | Up to analyser, no emit. Used by CI. `--stubs` adds the `.dty` vs `.ty`/`.py` surface-API diff. |
 | `tyc fmt` | Format `.ty` source. Wraps `ruff format` applied to a Typhon-aware pretty-printer. |
-| `tyc lsp` | Run as a Language Server. |
+| `tyc lsp` | Run as a Language Server (diagnostics, hover, go-to-definition, completion, code actions). |
 | `tyc init` | Scaffold a new project: `typhon.toml`, `src/`, `tests/`. |
-| `tyc trace` | Map a Python traceback back to Typhon source via `.py.map` files. |
+| `tyc trace` | Map a Python traceback back to Typhon source via `.py.map` source maps. |
 | `tyc profile` | Instrument emitted code for hot-function detection (advanced, opt-in). |
+| `tyc migrate` | Convert typed Python (`.py`) into Typhon (`.ty`): `Optional[T]`/`T \| None` → `T?`, module-level annotated assigns gain `let`/`mut`, `@dataclass` decorators are dropped. |
+| `tyc ty` | Build the project and run Astral's `ty` checker against the emitted Python (subprocess, opt-in). |
+| `tyc repl` | Interactive Typhon evaluator — pipes each block through the full compile pipeline and a Python interpreter. |
+| `tyc debug` | Build the project and launch the emitted Python under a debugger (default `pdb`). Thin v1; a source-mapping Typhon-native debugger is a Phase-5 deliverable. |
+| `tyc add` / `tyc remove` / `tyc sync` | Lightweight package-manager surface over `uv`: rewrite `[dependencies]` / `[dev-dependencies]` in `typhon.toml` and run `uv sync`. |
 
 ### `typhon.toml`
 
@@ -402,24 +404,38 @@ format = true               # post-process through ruff format
 no-implicit-any = true
 unused-import = "error"
 exhaustive-match = "error"
+auto-memoise = false        # insert @functools.cache on inferred-pure functions
+auto-gather = false         # fold straight-line independent `await` runs into TaskGroup
+auto-parallel = false       # rewrite pure list comprehensions to a thread-pool map
+parallel-min-size = 64
+pgo-memoise = false         # promote hot pure fns to @functools.cache from typhon-profile.json
+pgo-min-calls = 100
 
 [env]
 required = ["DATABASE_URL"]  # comptime env() lookups must resolve at build time
+
+[dependencies]               # synced with `tyc add` / `tyc remove` / `tyc sync`
+requests = ">=2.31"
+
+[dev-dependencies]
+pytest = "8.2"
 ```
 
 ## Roadmap
 
 Realistic milestones for one person plus AI assistance. The headline target is a useful subset shippable in twelve months.
 
-### Phase 0 — Foundation (months 1–2)
+> **Status (May 2026):** Phases 0–3 are complete. Phase 4+ work has begun — auto-gather, auto-parallel, PGO, LSP completions and code actions, cross-file go-to-definition, the package-manager surface, REPL, debugger, and `tyc migrate` have all landed. See [docs/roadmap.md](roadmap.md) for the canonical per-feature status.
 
-- Fork `ruff_python_parser` and `ruff_python_ast` into `vendor/`.
-- Add one or two custom tokens (`let`, `mut`) to confirm the fork-extend workflow.
-- Round-trip Python through the fork via `ruff_python_codegen`: parse → emit, verify byte-identical (modulo whitespace) on a corpus of real Python files.
+### Phase 0 — Foundation (months 1–2) ✅ complete
+
+- Fork `ruff_python_parser`, `ruff_python_ast`, `ruff_python_trivia`, `ruff_source_file`, and `ruff_text_size` into `vendor/`.
+- Add `let` / `mut` soft keywords and a `Mutability` field on assignment AST nodes to confirm the fork-extend workflow.
+- Round-trip Python through the fork: every emitted `.py` is verified by the integration test suite. A representative third-party corpus sweep is a future hardening task. (The original plan called for vendoring `ruff_python_codegen` as well; we instead ship a hand-written printer in `tyc-emit` because it tracks the per-statement line offsets needed for `.py.map` source maps. Vendoring `ruff_python_codegen` remains an open follow-up — see `tyc/vendor/README.md`.)
 - `clap`-based `tyc` shell with `tyc fmt` working as the simplest end-to-end command.
 - `miette` + `thiserror` diagnostic infrastructure.
 
-### Phase 1 — Core types (months 3–5)
+### Phase 1 — Core types (months 3–5) ✅ complete
 
 - Salsa db with `parse` and `resolve` queries.
 - Name resolution and scope construction; `let`/`mut` enforcement (no types yet).
@@ -427,7 +443,7 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 - Non-nullable by default with flow narrowing on guards and `isinstance` checks.
 - `tyc check` produces useful "unknown name" and "type mismatch" diagnostics via `miette`.
 
-### Phase 2 — Class and value features (months 6–8)
+### Phase 2 — Class and value features (months 6–8) ✅ complete
 
 - Class emission as `@dataclass(slots=True)`; the `model` keyword for Pydantic with `extra='forbid'` injected by default.
 - Sealed unions and exhaustive `match`. (This is high-value and mechanically simple — front-load it.)
@@ -435,9 +451,9 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 - Comptime constants with `env()` lookup. Build fails on missing required env.
 - `tower-lsp-server` backend: diagnostics and hover working in VS Code.
 
-### Phase 3 — Structural typing and advanced features (months 9–12)
+### Phase 3 — Structural typing and advanced features (months 9–12) ✅ complete
 
-- **Generics syntax decision locked** (angle brackets vs PEP 695 — see *Open questions*). Implementation follows.
+- **Generics syntax decision locked**: PEP 695 brackets (see *Open questions* below).
 - Generics: bidirectional inference, type erasure at emit.
 - Interface declarations and structural subtyping with memoised relation cache. `is`/`isinstance` against an interface is rejected unless explicitly opted into.
 - `unsafe` block semantics: lexical regions with an `Unsafe[T]` boundary marker (see No-implicit-`Any`).
@@ -450,14 +466,18 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 At the end of Phase 3 — roughly month twelve — Typhon is useful for a real backend or CLI project. Everything beyond is polish and ambition.
 
-### Phase 4+ — Beyond v1
+### Phase 4+ — Beyond v1 (in progress)
 
-- Automatic `asyncio.gather` inference (the conservative version that fires only on `@pure` straight-line code).
-- Loop parallelisation for pure comprehensions on free-threaded Python.
-- Richer comptime: `comptime` functions, types as values.
-- PGO via `tyc profile`.
-- LSP completions and code actions; go-to-definition across `.ty` and `.py` boundaries via source maps.
-- Migration tooling from typed `.py` to `.ty` (`Optional[T]` → `T?`, dataclasses → Typhon classes, etc.).
+- ✅ Automatic `asyncio.gather` inference (opt-in via `[strictness] auto-gather`): straight-line independent `await` runs inside an `async def` fold into a `TaskGroup`.
+- ✅ Loop parallelisation for pure list comprehensions on free-threaded Python (opt-in via `[strictness] auto-parallel`, threshold `parallel-min-size`).
+- Richer comptime: `comptime` functions, types as values. (Not yet started.)
+- ✅ PGO via `tyc profile` (opt-in via `[strictness] pgo-memoise`): promotes hot pure functions to `@functools.cache` from `typhon-profile.json`.
+- ✅ LSP completions (visible bindings + Typhon keywords + common builtins) and a "Remove unused import" code-action quick-fix; cross-file go-to-definition across `.ty`/`.py` boundaries via the resolver's Salsa `resolved_module` query and the v2 `.py.map` source maps.
+- ✅ Migration tooling from typed `.py` to `.ty` (`Optional[T]` → `T?`, `let`/`mut` on annotated assigns, `@dataclass` decorators dropped) via `tyc migrate`.
+- ✅ Interactive REPL (`tyc repl`) and a thin pdb-launcher debugger (`tyc debug`).
+- ✅ Package-manager surface over `uv` (`tyc add` / `tyc remove` / `tyc sync`).
+- Runtime `stubtest` probe (mypy-style introspection) as a complement to the AST-level `tyc check --stubs` diff. (Deferred.)
+- `ty` integration as a complementary second-stage checker over the desugared Python — see [docs/ty-integration.md](ty-integration.md). (Deferred.)
 
 ## Risks and how to manage them
 
@@ -471,7 +491,7 @@ At the end of Phase 3 — roughly month twelve — Typhon is useful for a real b
 | Pydantic coupling alienates users | Medium | Default emit is `@dataclass`, not `BaseModel`. Pydantic is opt-in via `model`. |
 | Pre-emptive runtime helpers force a Typhon package on users | Medium | Emit `typhon_runtime/` as generated source the build owns; no PyPI package required. |
 | Solo developer burnout on a multi-year project | High | Cut scope aggressively. The minimum-viable Typhon is non-null types + sealed unions + `Result` + dataclass emit. That alone is publishable. |
-| Generics syntax choice locks parser fork shape | High | Decide angle brackets vs PEP 695 before Phase 3 begins; the cost grows with every checker change after that point. |
+| Generics syntax choice locks parser fork shape | Resolved | Locked to PEP 695 brackets at Phase 3 entry — see *Open questions*. The vendored Ruff parser accepts them natively and the emitter round-trips them unchanged. |
 | `go` tasks GC'd mid-flight (weak refs in event loop) | Medium | Lower `go` through `typhon_runtime.tasks.spawn`, never to a bare `asyncio.create_task`. Strong-ref registry with done-callback cleanup. |
 | `asyncio.gather` exception semantics surprise users | Medium | Default `gather` block lowers to `TaskGroup` (cancels siblings on first failure). Reserve `gather(strategy="best-effort")` for the legacy `gather(...)` behaviour. |
 | Pydantic's default `extra='ignore'` silently drops input | Medium | `model` emission injects `extra='forbid'` by default. Permissive modes are opt-in via `typhon.toml`. |
@@ -498,7 +518,7 @@ wins on every load-bearing dimension for a one-person project:
 
 | | Angle brackets `<T>` | PEP 695 brackets `[T]` (chosen) |
 |---|---|---|
-| Parser fork cost | Higher: ambiguous with comparison operators, needs lookahead | Zero: `rustpython-parser` already accepts it |
+| Parser fork cost | Higher: ambiguous with comparison operators, needs lookahead | Zero: the vendored Ruff parser already accepts it |
 | Lowering cost | Heavier rewrite into `[T]` / `TypeVar` shapes | Pass-through — same syntax Python emits |
 | Long-term divergence from CPython | Grows with every Python release | Stays in lockstep |
 

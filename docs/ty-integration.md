@@ -98,11 +98,10 @@ maps.
 vendor. Users can swap `ty` for `mypy` or `pyright` trivially.
 
 **Cons:** Slow (re-parses + re-elaborates the entire build on every
-check). Diagnostic attribution via source maps requires the
-[Phase-4 source-map v2](roadmap.md#phase-4--beyond-v1) work to land
-first; without it tracebacks point at the wrong line. Each external
-checker run shells out to Python (a `ty` process is fast but not
-free).
+check). Each external checker run shells out to Python (a `ty`
+process is fast but not free). The accurate diagnostic attribution
+this needs is already available — `.py.map` v2 ships the
+per-statement `(out_line → ty_line)` table the printer emits.
 
 ### C — `ty` as the only checker
 
@@ -186,8 +185,8 @@ references. Re-use the existing `tyc trace` logic in
 `tyc/src/commands/trace.rs` (currently used for tracebacks) to
 rewrite `ty`'s diagnostics to point at `.ty` lines.
 
-When source-map v2 lands, swap from filename-only mapping to the line
-table.
+The `.py.map` v2 line table is already shipped, so the rewriter can
+attribute at line granularity from day one.
 
 #### Step 1.4 — Diagnostic merging
 
@@ -325,7 +324,8 @@ Salsa caching.
 
 ## Decision
 
-Implement **Phase 1 (subprocess `ty check`)** next, after the
-Phase-4 source-map v2 work makes diagnostic attribution accurate.
-Schedule **Phase 2 (embedded library)** for after the Ruff vendor
-migration completes.
+Implement **Phase 1 (subprocess `ty check`)** next: both
+prerequisites — the Ruff vendor migration and the `.py.map` v2
+line table — have already landed. Schedule **Phase 2 (embedded
+library)** afterwards once the subprocess path has shaken out the
+diagnostic-translation work.

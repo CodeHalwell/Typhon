@@ -43,16 +43,23 @@ tyc/
 │   ├── tyc-types/              structural + nominal type checker
 │   ├── tyc-analyse/            purity, async-gather, comptime, DCE
 │   ├── tyc-desugar/            Typhon AST → Python AST lowering
-│   ├── tyc-emit/               Python codegen via vendored ruff_python_codegen
+│   ├── tyc-emit/               Python codegen (hand-written printer; tracks line offsets for .py.map)
 │   ├── tyc-format/             post-process emitter output through ruff format
 │   ├── tyc-diagnostics/        miette-based diagnostic rendering
 │   ├── tyc-lsp/                tower-lsp-server Backend over tyc-db
 │   └── tyc/                    thin CLI binary, clap subcommands
-└── vendor/
-    ├── ruff_python_ast/        forked from Ruff monorepo
-    ├── ruff_python_parser/     forked and extended with Typhon tokens
-    └── ruff_python_codegen/    forked for emission
+└── vendor/                     Typhon's in-tree fork of Ruff (pinned via vendor/UPSTREAM)
+    ├── ruff_text_size/         TextSize / TextRange newtypes
+    ├── ruff_source_file/       Line-index over a source string
+    ├── ruff_python_trivia/     Whitespace + comment helpers
+    ├── ruff_python_ast/        Python AST + Typhon's Mutability extension
+    └── ruff_python_parser/     Lexer + parser, plus let/mut soft-keyword support
 ```
+
+> The Phase-0 plan called for vendoring `ruff_python_codegen` as well. That
+> task was deferred: `tyc-emit` currently uses a hand-written printer because
+> upstream codegen does not expose the per-statement line-offset hook required
+> for `.py.map` source maps. See `tyc/vendor/README.md` for the open follow-up.
 
 This is the same crate-per-stage layout used by `oxc` and `rust-analyzer`. The single most important meta-rule: every external crate gets wrapped behind a one-function-wide module of our own, so when Salsa changes its API or Ruff renames a node, the blast radius stays small.
 
@@ -64,7 +71,7 @@ This is the same crate-per-stage layout used by `oxc` and `rust-analyzer`. The s
 | AST | Fork `ruff_python_ast` | Hand-written | AST is partly TOML-generated; adding Typhon variants is mechanical. |
 | Incremental engine | `salsa` (salsa-rs) | Hand-rolled query cache | Powers `rust-analyzer` and `ty`. Free cancellation and parallel queries. |
 | Type checker | Custom on Salsa, `ty` as reference | Embed `ty` as a library | Typhon-specific rules need own checker; `ty` handles the Python subset. |
-| Code emission | Fork `ruff_python_codegen` | Hand-written pretty-printer | Small, internal, vendor-friendly. Post-process through `ruff format`. |
+| Code emission | Hand-written pretty-printer (today) | Fork `ruff_python_codegen` (deferred) | Hand-written printer tracks line offsets for `.py.map`; upstream codegen lacks that hook. Post-process through `ruff format`. |
 | LSP transport | `tower-lsp-server` | `lsp-server` | Ergonomic, active fork on `lsp-types` 0.97+. |
 | CLI | `clap` v4 derive | — | Standard. |
 | Diagnostics | `miette` + `thiserror` | `ariadne` | Best-in-class source-span rendering. |
@@ -93,8 +100,8 @@ Express each analysis as a Salsa query: `parse(file)`, `resolve(module)`, `infer
 
 ## Code emission
 
-Pipeline: Typhon AST → desugar to plain Python AST → `ruff_python_codegen` → `ruff_python_formatter`. Emitted files carry a generated-header comment.
+Pipeline: Typhon AST → desugar to plain Python AST → `tyc-emit` hand-written printer → `ruff format` post-process (when `[emit] format = true`). Emitted files carry a generated-header comment.
 
-Source maps mapping `.py` line/column back to `.ty` are written as a sidecar `.py.map` file. The LSP uses these for go-to-definition across the boundary; `tyc trace` maps Python tracebacks back to Typhon source.
+Source maps mapping `.py` lines back to `.ty` are written as a sidecar `.py.map` file. The printer records a `line_offsets` table as it prints each statement; the v2 format stores the resulting `(out_line → ty_line)` mapping. `tyc trace` uses it to rewrite Python tracebacks back to Typhon source, and the LSP uses it for cross-file go-to-definition across the `.ty`/`.py` boundary.
 
 There is deliberately **no Typhon-specific runtime package** the user must install. The handful of helpers needed (`Result`/`Ok`/`Err`, `lazy_import`, `str_to_slug`-style extension shims) are emitted inline into each project as a generated `typhon_runtime/` module the build owns.

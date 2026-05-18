@@ -21,18 +21,18 @@ free-threaded = false       # opt-in; requires 3.13t/3.14t
 
 [emit]
 class-default = "dataclass" # or "pydantic"
-model-extra = "forbid"      # "forbid" | "allow" | "ignore" — passes to Pydantic ConfigDict
 format = true               # post-process through ruff format
-pyi-stubs = true            # emit .pyi alongside .py for interop with mypy / pyright / Pyrefly / ty
 
 [strictness]
 no-implicit-any = true
 unused-import = "error"
 exhaustive-match = "error"
 auto-memoise = false        # opt-in: insert @functools.cache on inferred-pure functions
+auto-gather = false         # opt-in: fold straight-line independent `await` runs into TaskGroup
 auto-parallel = false       # opt-in: rewrite pure list comprehensions to a thread-pool map
 parallel-min-size = 64      # minimum iterable size for auto-parallel to fire
-stub-check = "error"        # tyc check --stubs severity; compares .pyi against runtime modules
+pgo-memoise = false         # opt-in: promote hot pure fns to @functools.cache from typhon-profile.json
+pgo-min-calls = 100         # minimum profile-recorded call count for pgo-memoise to fire
 
 [env]
 required = ["DATABASE_URL"]  # comptime env() lookups must resolve at build time
@@ -70,9 +70,9 @@ pytest = "8.2"              # bare version → ==8.2
 | Key | Type | Description |
 |-----|------|-------------|
 | `class-default` | `"dataclass"` \| `"pydantic"` | Default emit target for `class` declarations. Overridable per-class via the `model` keyword. |
-| `model-extra` | `"forbid"` \| `"allow"` \| `"ignore"` | Value passed to Pydantic's `ConfigDict(extra=...)` for `model` emissions. Default `"forbid"` — Typhon does not inherit Pydantic's stock `"ignore"` because silently dropping input contradicts the safety pitch. |
 | `format` | bool | Post-process emitted `.py` through `ruff format`. |
-| `pyi-stubs` | bool | Emit a PEP 561 `.pyi` next to every `.py`. Default `true`. Disable for projects that vendor stubs separately. |
+
+> Pydantic `model` classes are always emitted with `model_config = ConfigDict(extra="forbid")`; a configurable `model-extra` knob is on the roadmap but not yet wired in.
 
 ### `[strictness]`
 
@@ -82,7 +82,11 @@ pytest = "8.2"              # bare version → ==8.2
 | `unused-import` | `"error"` \| `"warn"` \| `"off"` | Severity for unused imports. |
 | `exhaustive-match` | `"error"` \| `"warn"` \| `"off"` | Severity for non-exhaustive `match` over sealed unions. |
 | `auto-memoise` | bool | Whether to apply `@functools.cache` to functions the analyser infers as pure. Default `false`. Caches are *never* inserted silently: even when enabled, the analyser requires all six purity conditions (see [language.md](language.md)). |
-| `stub-check` | `"error"` \| `"warn"` \| `"off"` | Severity for drift between a `.dty` source and the runtime module it describes. Surfaced by `tyc check --stubs`. |
+| `auto-gather` | bool | When `true`, runs of two-or-more consecutive independent `name = await callee(...)` statements inside an `async def` are folded into an `asyncio.TaskGroup` so they execute concurrently. Independence is decided by static data-flow on bound names; runs are only folded when every callee is an `async def` declared in the same module. Default `false`. Explicit `gather:` blocks are unaffected. |
+| `auto-parallel` | bool | When `true`, list comprehensions whose element is a pure call are rewritten at build time into a thread-pool map. Combine with `[python] free-threaded` to release the GIL across workers; on stock CPython the rewrite still runs but the GIL serialises workers. Default `false`. |
+| `parallel-min-size` | int | Minimum statically-detectable iterable length for a comprehension to qualify for `auto-parallel`. Default `64`. When the iterable size cannot be inferred, the threshold is treated as zero — users opting in accept that contract. |
+| `pgo-memoise` | bool | When `true`, `tyc build` reads `typhon-profile.json` (produced by a prior `tyc profile` run) and promotes every pure function whose observed call count meets `pgo-min-calls` to `@functools.cache`, even if the user did not write `@memo`. Complements `auto-memoise` (which caches every pure function regardless of profile data). Missing profile file is not an error — PGO is best-effort. Default `false`. |
+| `pgo-min-calls` | int | Minimum observed call count for a function to be promoted by `pgo-memoise`. Default `100` — high enough that one-off entry points stay un-cached, low enough that an inner-loop helper qualifies after a single representative run. |
 
 ### `[env]`
 

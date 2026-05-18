@@ -54,10 +54,13 @@ cargo build --release
 | `tyc fmt` | Format `.ty` source files in place |
 | `tyc lsp` | Run as a Language Server on stdio |
 | `tyc init` | Scaffold a new project: `typhon.toml`, `src/`, `tests/` |
-| `tyc trace` | Map a Python traceback back to Typhon source via `.py.map` files (v1: filename rewrite, line offsets are 1:1) |
+| `tyc trace` | Map a Python traceback back to Typhon source via `.py.map` v2 source maps (per-statement `(out_line → ty_line)` table emitted by the printer) |
 | `tyc profile` | Build then instrument every top-level function with call-count + wall-clock sampling; writes `typhon-profile.json` on interpreter exit |
-| `tyc migrate` | Convert typed Python (`.py`) into Typhon (`.ty`): `Optional[T]`/`T \| None` → `T?`, module-level annotated assigns gain `val`/`var`, `@dataclass` decorators and `from dataclasses import dataclass` are dropped |
+| `tyc migrate` | Convert typed Python (`.py`) into Typhon (`.ty`): `Optional[T]`/`T \| None` → `T?`, module-level annotated assigns gain `let`/`mut`, `@dataclass` decorators and `from dataclasses import dataclass` are dropped |
 | `tyc ty`      | Build the project and run Astral's `ty` checker against the emitted Python. Requires `ty` to be installed separately (`pip install ty`). |
+| `tyc repl`    | Interactive Typhon evaluator. Compiles each block through the full pipeline and executes against a Python interpreter |
+| `tyc debug`   | Build the project and launch the emitted Python under a debugger (default `pdb`). Thin v1 — a Typhon-native source-mapping debugger is a Phase-5 item |
+| `tyc add` / `tyc remove` / `tyc sync` | Lightweight package-manager surface over `uv`: rewrite `[dependencies]` / `[dev-dependencies]` in `typhon.toml` and run `uv sync` to install |
 
 See [docs/cli.md](docs/cli.md) for the full reference.
 
@@ -99,20 +102,31 @@ See [docs/cli.md](docs/cli.md) for the full reference.
 - ✅ `impl` blocks merged into class definitions at desugar
 - ✅ `tower-lsp-server` LSP backend: `tyc lsp` publishes diagnostics on `did_open` / `did_change`, serves position-based hover (binding kind + mutability), and answers go-to-definition by jumping to the resolver's recorded declaration site.
 
-**Phase 3 — Structural typing and advanced features** substantially complete:
+**Phase 3 — Structural typing and advanced features** complete:
 
-- ✅ Generics syntax locked to PEP 695 (`def f[T](x: T)`, `type Vec[T] = list[T]`). Type params resolve in scope and are preserved as `Type::TypeVar(name)` through signatures. Call-site bidirectional inference binds typevars from actual arguments (recursively, e.g. `list[T]` against `list[int]` infers `T=int`; conflicting bindings widen to a union) and substitutes them in the return type. Multi-arg constraint solving and bounded type vars are still partial.
-- ✅ `interface Name:` lowers to `class Name(Protocol):` with a structural conformance check on assignment. `isinstance(x, Interface)` is rejected by default.
+- ✅ Generics syntax locked to PEP 695 (`def f[T](x: T)`, `type Vec[T] = list[T]`). Type params resolve in scope and are preserved as `Type::TypeVar(name)` through signatures. Call-site bidirectional inference binds typevars from actual arguments (recursively, e.g. `list[T]` against `list[int]` infers `T=int`; conflicting bindings widen to a union) and substitutes them in the return type. Multi-arg constraint solving and bounded type-var checking are wired up; full variance and higher-kinded forms remain partial.
+- ✅ `interface Name:` lowers to `class Name(Protocol):` with a structural conformance check on assignment that walks the candidate's MRO and matches field types. `isinstance(x, Interface)` is rejected by default.
 - ✅ `unsafe:` lexical region: lowers to `if True:` for scope preservation, and the type checker tracks `unsafe_depth` to suppress diagnostics inside the block so users can interface with untyped Python without fighting the checker. Boundary checks at assignment sites outside the block apply normally.
 - ✅ `@pure`/`@memo`/`@pure(memo=True)` decorators trigger the six-condition purity check; memoised functions get `@functools.cache` injected at desugar time. Project-wide opt-in via `[strictness] auto-memoise`.
 - ✅ `gather:` lowers to `asyncio.TaskGroup` by default; `gather(strategy="best-effort"):` to `asyncio.gather(..., return_exceptions=True)`.
 - ✅ `go f(x)` lowers through `typhon_runtime.tasks.spawn` with a strong-ref task registry.
-- ✅ `lazy import np = numpy` lowers to a thread-safe inline proxy class; `lazy from … import …` is rejected. Module-level `lazy let NAME: T = expr` lowers to `lazy_val(lambda: expr)`; class-body `lazy let` lowers to `@cached_property`.
+- ✅ `lazy import np = numpy` lowers to a thread-safe inline proxy class; `lazy from … import …` is rejected. Module-level `lazy let NAME: T = expr` lowers to a sentinel-cached `lazy_val(lambda: expr)`; class-body `lazy let` lowers to `@cached_property`.
 - ✅ Pipe operator `a |> f |> g(arg)` desugars to `g(f(a), arg)`.
-- ✅ `extend ClassName:` (alias for `impl` on user-defined classes; built-in extensions deferred).
-- ✅ `.dty` stub files compile to PEP 561 `.pyi`. `tyc check --stubs` parses every `.dty` and diffs its surface API (functions, classes, methods, annotated fields) against the sibling `.ty`/`.py` implementation, emitting `tyc::stub_mismatch` diagnostics for missing-in-impl / missing-in-stub / signature-mismatch findings. A runtime introspection probe (mypy's `stubtest` proper) is still a follow-up.
+- ✅ `extend ClassName:` (alias for `impl` on user-defined classes; `extend BUILTIN:` is rejected at preprocess time with a `tyc::extend_builtin` diagnostic).
+- ✅ `.dty` stub files compile to PEP 561 `.pyi`. `tyc check --stubs` parses every `.dty` and diffs its surface API (functions, classes, methods, annotated fields, parameter shapes) against the sibling `.ty`/`.py` implementation, emitting `tyc::stub_mismatch` diagnostics for missing-in-impl / missing-in-stub / signature-mismatch findings. A runtime introspection probe (mypy's `stubtest` proper) is still a follow-up.
 
-See [docs/roadmap.md](docs/roadmap.md) for the phased plan through Phase 3 (month twelve) and beyond.
+**Phase 4+ — Beyond v1** in progress:
+
+- ✅ Automatic `asyncio.gather` inference (opt-in via `[strictness] auto-gather`): straight-line runs of two-or-more independent `await` calls inside an `async def` are folded into a `TaskGroup`.
+- ✅ Loop parallelisation for pure list comprehensions on free-threaded Python (opt-in via `[strictness] auto-parallel`, threshold `parallel-min-size`).
+- ✅ PGO via `tyc profile` (opt-in via `[strictness] pgo-memoise`): `tyc build` reads `typhon-profile.json` and promotes pure functions whose call counts meet `pgo-min-calls` to `@functools.cache`.
+- ✅ LSP completions (visible bindings + Typhon keywords + common builtins) and a "Remove unused import" code-action quick-fix.
+- ✅ Cross-file go-to-definition across `.ty`/`.py` boundaries via the resolver's Salsa-tracked `resolved_module` query.
+- ✅ Attribute resolution against class definitions (`obj.method`, `Class.field`) and re-export-aware import resolution.
+- ✅ `tyc migrate` (typed Python → Typhon), `tyc repl` (interactive evaluator), `tyc debug` (pdb launcher), and `tyc add`/`remove`/`sync` (uv-backed package manager).
+- ✅ Source-map line accuracy: `.py.map` records a per-statement `(out_line → ty_line)` table consumed by `tyc trace`.
+
+See [docs/roadmap.md](docs/roadmap.md) for the phased plan and [docs/follow-ups-2026-05-17.md](docs/follow-ups-2026-05-17.md) for the remaining tracked follow-ups.
 
 ## Configuration
 
@@ -163,7 +177,7 @@ tyc/
     ├── ruff_source_file/       Line-index over a source string
     ├── ruff_python_trivia/     Whitespace + comment helpers
     ├── ruff_python_ast/        Python AST + Typhon's Mutability extension
-    └── ruff_python_parser/     Lexer + parser with val/var soft keywords
+    └── ruff_python_parser/     Lexer + parser with let/mut soft keywords
 ```
 
 See [docs/architecture.md](docs/architecture.md) for the pipeline and crate-by-crate breakdown.

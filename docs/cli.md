@@ -18,6 +18,8 @@ Typhon ships a single binary, `tyc`, that handles every stage of the workflow. S
 | `tyc migrate` | Convert typed Python (`.py`) to Typhon (`.ty`): rewrites `Optional[T]`/`T \| None` → `T?`, adds `let`/`mut` to module-level annotated assigns, strips `@dataclass` decorators. |
 | `tyc ty` | Build the project and run Astral's `ty` checker against the emitted Python. Requires `ty` on `PATH` (`pip install ty`). Supports `--watch` for continuous feedback. |
 | `tyc repl` | Interactive Typhon evaluator. Reads `.ty` source one block at a time, compiles it through the full pipeline, and executes the result with a Python interpreter. |
+| `tyc debug` | Build the project and launch the emitted Python under a debugger (default `pdb`). Thin v1 wrapper — a Typhon-native source-mapping debugger is a Phase-5 item. |
+| `tyc add` / `tyc remove` / `tyc sync` | Lightweight package-manager surface over `uv`: rewrite `[dependencies]` / `[dev-dependencies]` in `typhon.toml` and run `uv sync` to install. |
 
 ## Typical workflow
 
@@ -105,6 +107,49 @@ tyc repl --python python3.13
 | `:show` | Dump the current session source |
 
 **Known limitations:** each prompt re-executes the entire accumulated session (pure-scratch semantics); side effects fire once per prompt. Multi-line blocks end on the first blank line. No readline/arrow-key support.
+
+## `tyc debug`
+
+Builds the project, then execs the configured Python debugger on the emitted entry-point. v1 is a deliberately thin wrapper — frames surface as `build/*.py` paths; pair with `tyc trace` to remap captured tracebacks back to `.ty` source via the `.py.map` sidecars.
+
+```bash
+# Step through build/main.py under pdb:
+tyc debug
+
+# Different entry point + debugger:
+tyc debug --entry api.py --debugger pudb
+
+# Forward args to the script:
+tyc debug -- --verbose --port 8080
+```
+
+| Flag | Purpose |
+|------|---------|
+| `--entry FILE` | Entry-point file relative to the build dir (default `main.py`) |
+| `--python PATH` | Python interpreter (default `python3`) |
+| `--debugger MODULE` | Module to launch under `python -m` (default `pdb`; e.g. `pudb`, `ipdb`, `debugpy`) |
+| `--no-build` | Skip rebuilding; assume `build/` is current |
+
+## `tyc add` / `tyc remove` / `tyc sync`
+
+Manage project dependencies declared in `[dependencies]` and `[dev-dependencies]` of `typhon.toml`. The commands rewrite the manifest and shell out to [`uv`](https://github.com/astral-sh/uv) for the install step; `uv` itself is not bundled, so when it is missing the manifest still updates and the command prints a clear "install uv" message.
+
+```bash
+# Add a runtime dependency (latest), then a dev dependency at a version:
+tyc add requests
+tyc add --dev pytest@8.2
+
+# Remove a package:
+tyc remove rich
+
+# Materialise [dependencies] into a generated pyproject.toml and uv sync:
+tyc sync
+
+# Preview the generated pyproject.toml without writing or installing:
+tyc sync --dry-run
+```
+
+`--no-sync` on `tyc add` / `tyc remove` skips the `uv` install step — useful for batching edits and running `tyc sync` once at the end.
 
 ## CI integration
 

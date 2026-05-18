@@ -12,9 +12,9 @@ A plain `T` forbids `None`; `T?` is the optional form. Internally `T?` is repres
 
 ### Generics
 
-Angle-bracket syntax (`def f<T>(x: T) -> T`) instead of PEP 484 TypeVars. Inference is bidirectional: constraints flow from arguments to type parameters, falling back to explicit annotation when ambiguous. Generics are **type-erased** at emit time; runtime relies on Python's duck typing and (where present) Pydantic validation.
+PEP 695 bracket syntax (`def f[T](x: T) -> T`, `type Vec[T] = list[T]`) — chosen at Phase 3 entry because `ruff_python_parser` already accepts it and it stays in lockstep with CPython grammar. Type parameters declare into the function/class scope as `Type::TypeVar(name)` and survive through signatures.
 
-> **Open question:** PEP 695 syntax (`def f[T](x: T)`) is on the table as a lower-friction alternative — it aligns with Python 3.12+ grammar, shrinks the parser fork, and emits without rewriting. A decision is required **before Phase 3 generics work begins**. See the *Open questions* section of [long-term-plan.md](long-term-plan.md).
+Inference is bidirectional: call sites bind typevars from actual arguments (recursively, e.g. `list[T]` against `list[int]` infers `T = int`; conflicting bindings widen to a union) and substitute them in the return type. Multi-argument constraint solving and bounded-type-var checking are wired up; full variance and higher-kinded forms remain partial. Generics are **type-erased** at emit time; runtime relies on Python's duck typing and (where present) Pydantic validation.
 
 ### Interfaces (structural)
 
@@ -223,9 +223,18 @@ DB_URL: str = "postgresql://..."
 
 ### Extension methods
 
+`extend ClassName:` attaches methods to a user-defined class declared elsewhere — `impl`'s twin for code you don't want to keep in the original module. The merge happens at desugar; downstream callers see a single class with both sets of methods.
+
 ```
-extend str:
-    def to_slug() -> str: ...
+# domain/user.ty
+class User:
+    id: int
+    name: str
+
+# analytics/user_metrics.ty
+extend User:
+    def tracking_id() -> str:
+        return f"user-{id:08d}"
 ```
 
-emits a free function `str_to_slug(self: str) -> str` and rewrites call sites `"hello".to_slug()` as `str_to_slug("hello")` at emit time. No monkey-patching of built-ins.
+`extend BUILTIN:` (extending types you don't own — `str`, `list`, etc., with a free-function rewrite) is **rejected** at preprocess time with a `tyc::extend_builtin` diagnostic. The free-function lowering is on the roadmap but not yet wired in; stick to user-defined classes for now.

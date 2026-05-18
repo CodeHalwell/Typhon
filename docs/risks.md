@@ -14,7 +14,7 @@ The risk in Typhon is **not technological**. Every individual stage has a mature
 | Pydantic coupling alienates users | Medium | Default emit is `@dataclass`, not `BaseModel`. Pydantic is opt-in via `model`. |
 | Pre-emptive runtime helpers force a Typhon package on users | Medium | Emit `typhon_runtime/` as generated source the build owns; no PyPI package required. |
 | Solo developer burnout on a multi-year project | High | Cut scope aggressively. The minimum-viable Typhon is non-null types + sealed unions + `Result` + dataclass emit. That alone is publishable. |
-| Generics syntax choice locks parser fork shape | High | Decide angle brackets vs PEP 695 before Phase 3 begins. Switching afterward is expensive because both the parser and the emitter touch generics. |
+| Generics syntax choice locks parser fork shape | Resolved | Locked to PEP 695 brackets at Phase 3 entry. The vendored Ruff parser accepts them natively, the resolver and emitter round-trip them unchanged, and divergence from CPython grammar stays at zero. |
 | `go` tasks GC'd mid-flight (event loop holds weak refs) | Medium | Lower `go` through `typhon_runtime.tasks.spawn` with a strong-ref registry and done-callback cleanup. Never to a bare `asyncio.create_task`. |
 | `asyncio.gather` exception semantics surprise users | Medium | Default `gather:` lowers to `asyncio.TaskGroup` (cancels siblings on first failure). Legacy semantics reserved for explicit `gather(strategy="best-effort"):`. |
 | Pydantic's default `extra='ignore'` silently drops input | Medium | `model` emission injects `extra='forbid'` by default. Permissive modes opt in via `[emit] model-extra`. |
