@@ -26,7 +26,7 @@ def demo() -> None:
     count = count + 1
 ```
 
-The `let`/`mut` keyword is enforced at compile time and erased at emit. Reassignment of a `let` is `tyc::let_reassign`.
+The `let`/`mut` keyword is enforced at compile time and erased at emit. Reassignment of a `let` is `tyc::immutable_assign`.
 
 ### Module-level bindings
 
@@ -727,7 +727,7 @@ def fib(n: int) -> int:
 def expensive(k: str) -> int: ...
 ```
 
-`@pure` alone emits nothing — it's a static assertion. `@memo` (or `@pure(memo=True)`) inserts `functools.cache` / `lru_cache`. Manual `@pure` on a function failing any of the six purity conditions is `tyc::pure_violation`.
+`@pure` alone emits nothing — it's a static assertion. `@memo` (or `@pure(memo=True)`) inserts `functools.cache` / `lru_cache`. Manual `@pure` on a function failing any of the six purity conditions is `tyc::impure_pure_fn`.
 
 ---
 

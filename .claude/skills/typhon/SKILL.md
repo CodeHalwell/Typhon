@@ -99,7 +99,7 @@ def demo() -> None:
     let pi: float = 3.14159      # immutable
     mut counter: int = 0         # mutable
     counter = counter + 1        # ✅
-    # pi = 3.14                  # ❌ tyc::let_reassign
+    # pi = 3.14                  # ❌ tyc::immutable_assign
 ```
 
 Module-level bindings default to `let` if you skip the keyword — but a *local* `name = "x"` with no keyword is `tyc::missing_binding_kind`. Reach for `mut` only when you actually rebind.
@@ -574,7 +574,7 @@ pgo-memoise = true               # also opt-in; reads typhon-profile.json
 pgo-min-calls = 100              # threshold; default 100
 ```
 
-Manually marking a function `@pure` that fails any of the six conditions is a hard error (`tyc::pure_violation`).
+Manually marking a function `@pure` that fails any of the six conditions is a hard error (`tyc::impure_pure_fn`).
 
 ---
 
@@ -772,16 +772,16 @@ The recurring diagnostic codes and what they actually mean. All are documented i
 | `tyc::missing_return_type` | Function has no `-> T` | Add an explicit return type — `-> None` if it returns nothing |
 | `tyc::implicit_any` | RHS infers to `Any` outside `unsafe` | Annotate, wrap in `unsafe:`, or stub the source via `.dty` |
 | `tyc::missing_binding_kind` | Local `=` without `let`/`mut` | Add `let` (default) or `mut` (if rebound) |
-| `tyc::let_reassign` | Reassigning a `let` binding | Change to `mut`, or extract a new `let` |
+| `tyc::immutable_assign` | Reassigning a `let` binding | Change to `mut`, or extract a new `let` |
 | `tyc::nullable_use` | Passing `T?` where `T` required | Narrow with `is None` / `guard` / early-return |
 | `tyc::missing_await` | Sync context calling `async def` | Add `await` and make caller `async` |
 | `tyc::async_without_await` (warn) | `async def` with no `await` inside | Drop `async` or await something |
 | `tyc::manual_init` | `class` defines `__init__` | Remove it — constructor is generated |
 | `tyc::frozen_assign` | Writing a field on a `frozen` class | Build a new instance |
 | `tyc::non_exhaustive_match` | `match` on a sealed union misses a variant | Add the missing `case` or use `case _:` |
-| `tyc::result_propagate_outside_result` | `?` inside a non-`Result` function | Change the signature or `match` explicitly |
+| `tyc::invalid_question_op` | `?` inside a non-`Result` function | Change the signature or `match` explicitly |
 | `tyc::result_error_mismatch` | `?` returns an `Err[E1]` into `Result[T, E2]` | Convert at the boundary |
-| `tyc::pure_violation` | `@pure` function fails one of the 6 conditions | Refactor or drop `@pure` |
+| `tyc::impure_pure_fn` | `@pure` function fails one of the 6 conditions | Refactor or drop `@pure` |
 | `tyc::interface_isinstance` | `isinstance(x, SomeInterface)` | Use static narrowing or refactor to a sealed union |
 | `tyc::stub_mismatch` | `.dty` vs `.py` drift detected by `tyc check --stubs` | Update the stub or implementation |
 | `tyc::unused_import` | Severity controlled by `[strictness] unused-import` | Remove the import (LSP "Remove unused import" code-action exists) |

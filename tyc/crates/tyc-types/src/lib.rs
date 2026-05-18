@@ -182,6 +182,14 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
         (Type::TypeVar(_), _) | (_, Type::TypeVar(_)) => true,
         (Type::Unknown, _) | (_, Type::Unknown) => true,
         (Type::Float, Type::Int) => true,
+        // Union/Union must come before the single-Union arms: every actual
+        // variant has to be assignable to *some* expected variant. Falling
+        // through to `(Union, other)` then `(other, Union)` recursively
+        // requires every actual variant to match every expected variant,
+        // which fails for `int | None = int | None`.
+        (Type::Union(expected_vs), Type::Union(actual_vs)) => actual_vs
+            .iter()
+            .all(|a| expected_vs.iter().any(|e| assignable(e, a))),
         (Type::Union(variants), other) => variants.iter().any(|v| assignable(v, other)),
         (other, Type::Union(variants)) => variants.iter().all(|v| assignable(other, v)),
         (Type::Generic(an, aa), Type::Generic(bn, bb)) => {

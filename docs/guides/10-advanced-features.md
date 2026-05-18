@@ -342,7 +342,7 @@ def fetch(url: str) -> str:
 ```
 
 ```
-error[tyc::pure_violation]: `fetch` is annotated `@pure` but performs I/O
+error[tyc::impure_pure_fn]: `fetch` is annotated `@pure` but performs I/O
                             (urllib.request.urlopen)
 ```
 

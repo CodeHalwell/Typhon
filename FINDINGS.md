@@ -248,6 +248,12 @@ bindings are an exception to Rule 2 — or change the syntax to require
 
 ## 7. `T?`-returning function cannot be bound to `T?` annotation (bug, critical)
 
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Added a dedicated
+`(Union, Union)` arm in `assignable` (tyc-types/src/lib.rs) that uses subset
+semantics — every actual variant must be assignable to some expected variant
+— so `int | None = int | None` succeeds. The single-Union arms below it are
+unchanged and continue to handle the asymmetric cases.
+
 **Severity:** bug — critical; breaks the documented happy path for nullables.
 
 ```ty
@@ -881,6 +887,10 @@ that doesn't enforce the strictness it advertises.
 
 ## 31. Float literals `1.0` emit as `1` (bug)
 
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Switched
+`tyc-emit/src/printer.rs`'s `Number::Float` arm from `{}` to `{:?}` so whole-
+number f64 values keep their `.0` suffix in emitted Python.
+
 **Severity:** bug — emit truncates whole-number floats.
 
 ```ty
@@ -909,6 +919,13 @@ detect the whole-number case and append `.0`.
 ---
 
 ## 32. Self-referencing type annotations break the emit (bug)
+
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. `emit_mod` now
+injects `from __future__ import annotations` at the top of every Python
+build output (after any module docstring), so PEP 563 string-evaluation
+makes self-references, recursive types, and operator overloads safe. The
+header is only emitted in build mode (`suppress_mutability = true`) — `tyc
+fmt` round-trips Typhon source unchanged.
 
 **Severity:** bug — common pattern (operator overloading) blows up at import.
 
@@ -1008,6 +1025,14 @@ the loop.
 ---
 
 ## 36. Diagnostic-code drift between docs and reality (doc)
+
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Renamed the three
+drifted codes across the skill (SKILL.md, REFERENCE.md, PITFALLS.md) and
+the guides (`docs/guides/06-error-handling.md`,
+`docs/guides/10-advanced-features.md`):
+`tyc::let_reassign` → `tyc::immutable_assign`,
+`tyc::result_propagate_outside_result` → `tyc::invalid_question_op`,
+`tyc::pure_violation` → `tyc::impure_pure_fn`.
 
 **Severity:** doc — diagnostic catalog in `docs/` and the skill drifts
 from reality.

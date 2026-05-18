@@ -58,7 +58,7 @@ def demo() -> None:
 ```
 
 ```
-error[tyc::let_reassign]: cannot reassign `let` binding `count`
+error[tyc::immutable_assign]: cannot reassign `let` binding `count`
  ┌─ src/main.ty:3:5
  │
 3 │     count = count + 1
@@ -267,7 +267,7 @@ def main() -> None:
 ```
 
 ```
-error[tyc::result_propagate_outside_result]: `?` can only short-circuit inside a function
+error[tyc::invalid_question_op]: `?` can only short-circuit inside a function
                                               returning a compatible `Result`
 ```
 
@@ -311,7 +311,7 @@ def fetch(url: str) -> str:
 ```
 
 ```
-error[tyc::pure_violation]: `fetch` is annotated `@pure` but performs I/O
+error[tyc::impure_pure_fn]: `fetch` is annotated `@pure` but performs I/O
                             (urllib.request.urlopen)
 ```
 
@@ -510,7 +510,7 @@ def main() -> None:
 ```
 
 ```
-error[tyc::result_propagate_outside_result]: `?` inside a `with`-chain requires
+error[tyc::invalid_question_op]: `?` inside a `with`-chain requires
                                               an enclosing `Result`-returning function
 ```
 

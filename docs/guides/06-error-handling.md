@@ -58,12 +58,12 @@ If `parse_port` returns `Err(msg)`, the `?` short-circuits and `parse_address` r
 
 ```python
 def bad() -> int:
-    let n: int = parse_port("8080")?    # ❌ tyc::result_propagate_outside_result
+    let n: int = parse_port("8080")?    # ❌ tyc::invalid_question_op
     return n
 ```
 
 ```
-error[tyc::result_propagate_outside_result]: `?` can only short-circuit inside a function
+error[tyc::invalid_question_op]: `?` can only short-circuit inside a function
                                               returning a compatible `Result`
  ┌─ src/main.ty:2:13
  │
