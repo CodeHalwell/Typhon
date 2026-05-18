@@ -9,7 +9,7 @@ The compiler and language server live in a single Rust binary called `tyc`.
 ## Why
 
 - **Static safety** — non-nullable by default, no implicit `Any`, explicit error handling via `Result[T, E]`.
-- **Modern ergonomics** — `val`/`var`, interfaces, sealed unions with exhaustive matching, guards, pipes, comptime, lazy loading.
+- **Modern ergonomics** — `let`/`mut`, interfaces, sealed unions with exhaustive matching, guards, pipes, comptime, lazy loading.
 - **Clean output** — emits idiomatic Python; deploy like any other Python project, no Typhon runtime to install.
 - **First-class tooling** — one binary builds, checks, formats, and runs as an LSP with sub-100 ms incremental feedback.
 
@@ -22,7 +22,7 @@ Focused references:
 | | |
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | Compiler pipeline, crate layout, toolchain choices |
-| [docs/language.md](docs/language.md) | Type system, error handling, async, `val`/`var`, comptime |
+| [docs/language.md](docs/language.md) | Type system, error handling, async, `let`/`mut`, comptime |
 | [docs/cli.md](docs/cli.md) | The `tyc` binary and its subcommands |
 | [docs/configuration.md](docs/configuration.md) | `typhon.toml` reference |
 | [docs/roadmap.md](docs/roadmap.md) | Phased delivery plan |
@@ -65,15 +65,15 @@ See [docs/cli.md](docs/cli.md) for the full reference.
 **Phase 0 — Foundation** substantially complete:
 
 - ✅ Cargo workspace skeleton with `crates/` directories
-- ✅ `val`/`var` keyword tokens (immutable and mutable bindings)
+- ✅ `let`/`mut` keyword tokens (immutable and mutable bindings)
 - ✅ `tyc fmt` — parses and validates `.ty` source, normalises whitespace
 - ✅ `tyc check` — validates syntax and emits miette diagnostics
 - ✅ `tyc init` — scaffolds new projects with `typhon.toml`
 - ✅ Ruff parser fork vendored under `tyc/vendor/` with first-class
-  `val`/`var` soft-keyword support and a `Mutability` field on assignment
-  AST nodes. Available today as `tyc_syntax::ruff::parse_module`. Consumer
-  crates are still being migrated off `rustpython-parser` — see
-  [`tyc/vendor/README.md`](tyc/vendor/README.md) for the remaining steps.
+  `let`/`mut` soft-keyword support and a `Mutability` field on assignment
+  AST nodes. All consumer crates now use `ruff_python_ast` via
+  `tyc_syntax::parse_module`; the migration off `rustpython-parser` is
+  complete — see [`tyc/vendor/README.md`](tyc/vendor/README.md) for details.
 - ✅ `tyc ty` — optional integration that builds the project and runs
   Astral's [`ty`](https://github.com/astral-sh/ty) type checker against
   the emitted Python for a second opinion.
@@ -81,7 +81,7 @@ See [docs/cli.md](docs/cli.md) for the full reference.
 **Phase 1 — Core types** complete:
 
 - ✅ Salsa db with `preprocessed_text` and `module_decl_names` queries
-- ✅ Name resolution and scope construction; `val`/`var` enforcement
+- ✅ Name resolution and scope construction; `let`/`mut` enforcement
 - ✅ Nominal types: function signatures, assignment compatibility, primitives, classes
 - ✅ Non-nullable by default with flow narrowing on `is None` / `is not None` / `isinstance`
 - ✅ `T?` syntax sugar for `T | None` in annotations
@@ -94,7 +94,7 @@ See [docs/cli.md](docs/cli.md) for the full reference.
 - ✅ `Result[T, E]`, `Ok`/`Err` constructors, generated `typhon_runtime.py` helper
 - ✅ `?` operator for `Result` error propagation (context-checked against the enclosing function's return type)
 - ✅ `with`-chain Result sequencing with optional `else err:` block
-- ✅ `comptime val/var` with `env()` lookup; required env vars declared in `[env]`
+- ✅ `comptime let/mut` with `env()` lookup; required env vars declared in `[env]`
 - ✅ `impl` blocks merged into class definitions at desugar
 - ✅ `tower-lsp-server` LSP backend: `tyc lsp` publishes diagnostics on `did_open` / `did_change`, serves position-based hover (binding kind + mutability), and answers go-to-definition by jumping to the resolver's recorded declaration site.
 
@@ -106,7 +106,7 @@ See [docs/cli.md](docs/cli.md) for the full reference.
 - ✅ `@pure`/`@memo`/`@pure(memo=True)` decorators trigger the six-condition purity check; memoised functions get `@functools.cache` injected at desugar time. Project-wide opt-in via `[strictness] auto-memoise`.
 - ✅ `gather:` lowers to `asyncio.TaskGroup` by default; `gather(strategy="best-effort"):` to `asyncio.gather(..., return_exceptions=True)`.
 - ✅ `go f(x)` lowers through `typhon_runtime.tasks.spawn` with a strong-ref task registry.
-- ✅ `lazy import np = numpy` lowers to a thread-safe inline proxy class; `lazy from … import …` is rejected. Module-level `lazy val` is deferred (the syntax pipeline does not yet recognise it).
+- ✅ `lazy import np = numpy` lowers to a thread-safe inline proxy class; `lazy from … import …` is rejected. Module-level `lazy let NAME: T = expr` lowers to `lazy_val(lambda: expr)`; class-body `lazy let` lowers to `@cached_property`.
 - ✅ Pipe operator `a |> f |> g(arg)` desugars to `g(f(a), arg)`.
 - ✅ `extend ClassName:` (alias for `impl` on user-defined classes; built-in extensions deferred).
 - ✅ `.dty` stub files compile to PEP 561 `.pyi`. `tyc check --stubs` parses every `.dty` and diffs its surface API (functions, classes, methods, annotated fields) against the sibling `.ty`/`.py` implementation, emitting `tyc::stub_mismatch` diagnostics for missing-in-impl / missing-in-stub / signature-mismatch findings. A runtime introspection probe (mypy's `stubtest` proper) is still a follow-up.
