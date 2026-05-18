@@ -121,17 +121,44 @@ fn render_expr(expr: &ruff_python_ast::Expr) -> String {
 }
 
 fn function_shape(f: &StmtFunctionDef) -> FunctionShape {
-    let mut params = Vec::new();
-    let mut param_annotations = Vec::new();
-    for arg in f
-        .parameters
-        .posonlyargs
-        .iter()
-        .chain(f.parameters.args.iter())
-    {
+    let mut params: Vec<String> = Vec::new();
+    let mut param_annotations: Vec<Option<String>> = Vec::new();
+
+    // Positional-only params (before `/`).
+    for arg in &f.parameters.posonlyargs {
         params.push(arg.parameter.name.as_str().to_owned());
         param_annotations.push(arg.parameter.annotation.as_deref().map(render_expr));
     }
+    // Explicit `/` separator — present iff there are positional-only params.
+    if !f.parameters.posonlyargs.is_empty() {
+        params.push("/".to_owned());
+        param_annotations.push(None);
+    }
+    // Regular positional params.
+    for arg in &f.parameters.args {
+        params.push(arg.parameter.name.as_str().to_owned());
+        param_annotations.push(arg.parameter.annotation.as_deref().map(render_expr));
+    }
+    // `*args` or bare `*` separator (when there are keyword-only params but
+    // no variadic positional).
+    if let Some(arg) = &f.parameters.vararg {
+        params.push(format!("*{}", arg.name.as_str()));
+        param_annotations.push(arg.annotation.as_deref().map(render_expr));
+    } else if !f.parameters.kwonlyargs.is_empty() {
+        params.push("*".to_owned());
+        param_annotations.push(None);
+    }
+    // Keyword-only params (after `*` or `*args`).
+    for arg in &f.parameters.kwonlyargs {
+        params.push(arg.parameter.name.as_str().to_owned());
+        param_annotations.push(arg.parameter.annotation.as_deref().map(render_expr));
+    }
+    // `**kwargs`.
+    if let Some(arg) = &f.parameters.kwarg {
+        params.push(format!("**{}", arg.name.as_str()));
+        param_annotations.push(arg.annotation.as_deref().map(render_expr));
+    }
+
     let return_annotation = f.returns.as_deref().map(render_expr);
     FunctionShape {
         params,
@@ -461,6 +488,61 @@ mod tests {
         assert!(
             compare_modules(&stub, &imp).is_empty(),
             "identical annotations should not produce findings"
+        );
+    }
+
+    #[test]
+    fn varargs_mismatch_is_flagged() {
+        // Stub declares *args but impl does not.
+        let stub = parse_mod("def f(*args: int) -> None: ...\n");
+        let imp = parse_mod("def f() -> None: pass\n");
+        let findings = compare_modules(&stub, &imp);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.kind == StubTestKind::SignatureMismatch),
+            "vararg mismatch should be flagged; got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn kwargs_mismatch_is_flagged() {
+        // Stub declares **kwargs but impl does not.
+        let stub = parse_mod("def f(**kwargs: str) -> None: ...\n");
+        let imp = parse_mod("def f() -> None: pass\n");
+        let findings = compare_modules(&stub, &imp);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.kind == StubTestKind::SignatureMismatch),
+            "kwarg mismatch should be flagged; got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn kwonly_mismatch_is_flagged() {
+        // Stub has a keyword-only param that impl omits.
+        let stub = parse_mod("def f(a: int, *, verbose: bool) -> None: ...\n");
+        let imp = parse_mod("def f(a: int) -> None: pass\n");
+        let findings = compare_modules(&stub, &imp);
+        assert!(
+            findings
+                .iter()
+                .any(|f| f.kind == StubTestKind::SignatureMismatch),
+            "keyword-only param mismatch should be flagged; got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn full_signature_match_no_findings() {
+        // All parameter kinds present and identical — no findings expected.
+        let stub =
+            parse_mod("def f(a: int, /, b: str, *args: float, c: bool, **kw: int) -> None: ...\n");
+        let imp =
+            parse_mod("def f(a: int, /, b: str, *args: float, c: bool, **kw: int) -> None: pass\n");
+        assert!(
+            compare_modules(&stub, &imp).is_empty(),
+            "full matching signature should produce no findings"
         );
     }
 }
