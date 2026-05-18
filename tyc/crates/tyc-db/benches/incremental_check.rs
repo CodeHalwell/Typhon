@@ -26,8 +26,8 @@ const PATH: &str = "<bench>";
 /// A representative small module that exercises resolve and type-check paths:
 /// bindings, function signatures, nullable annotations, class declarations.
 const MODULE_V1: &str = r#"
-val host: str = "localhost"
-var port: int = 8080
+let host: str = "localhost"
+mut port: int = 8080
 
 class Config:
     host: str
@@ -45,8 +45,8 @@ def greet(name: str?) -> str:
 /// `MODULE_V1` with one value changed (8080 → 9090). Salsa should skip
 /// unaffected queries, so this measures only the incremental re-check cost.
 const MODULE_V2: &str = r#"
-val host: str = "localhost"
-var port: int = 9090
+let host: str = "localhost"
+mut port: int = 9090
 
 class Config:
     host: str
@@ -63,8 +63,8 @@ def greet(name: str?) -> str:
 
 /// A medium module with more declarations to stress the resolver.
 const MEDIUM_MODULE: &str = r#"
-val app: str = "demo"
-var counter: int = 0
+let app: str = "demo"
+mut counter: int = 0
 
 class User:
     id: int
@@ -104,9 +104,9 @@ def clamp(value: int, lo: int, hi: int) -> int:
 /// annotations, and function calls to exercise non-linear resolver paths and
 /// expose performance regressions that short modules cannot trigger.
 const LARGE_MODULE: &str = r#"
-val app_name: str = "typhon-bench"
-var request_id: int = 0
-val base_url: str = "https://example.com"
+let app_name: str = "typhon-bench"
+mut request_id: int = 0
+let base_url: str = "https://example.com"
 
 class User:
     id: int
