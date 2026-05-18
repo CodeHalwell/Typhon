@@ -1658,6 +1658,46 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             )
         }
         Stmt::ClassDef(cd) => {
+            // FINDINGS #17: nudge users toward `impl ClassName:` when they
+            // put a `def` inside `class ClassName:`. Skipped for impl
+            // pseudo-classes (`__typhon_impl_*`), Protocols (interfaces),
+            // Pydantic models, and the lazy/builtin-extend stubs — those
+            // legitimately carry method definitions inside the class body.
+            let class_name = cd.name.as_str();
+            let is_pseudo = class_name.starts_with("__typhon_")
+                || class_name.starts_with("__TyphonLazy_");
+            let is_protocol = class_inherits_protocol(cd);
+            // Mirror the desugar pass's heuristic: a `model X:` becomes
+            // `class X(BaseModel):` after preprocess. Looking for any
+            // base named `BaseModel` is good enough for this warning.
+            let is_pydantic = cd.bases().iter().any(|b| match b {
+                Expr::Name(n) => n.id.as_str() == "BaseModel",
+                _ => false,
+            });
+            if !is_pseudo && !is_protocol && !is_pydantic {
+                for s in &cd.body {
+                    if let Stmt::FunctionDef(f) = s {
+                        let method = f.name.as_str();
+                        // Don't warn on dunders the user is *expected* to
+                        // override (e.g. `__add__`, `__lt__`); those are
+                        // legitimate uses of class-body methods too. The
+                        // canonical bad case is user-named methods like
+                        // `draw`, `display`, `is_admin`.
+                        if method.starts_with("__") && method.ends_with("__") {
+                            continue;
+                        }
+                        let span_start = f.name.range.start().to_usize();
+                        c.diagnostics.push_warning(TycError::method_in_class_body(
+                            class_name.to_owned(),
+                            method.to_owned(),
+                            c.path.clone(),
+                            c.source,
+                            span_start,
+                            method.len().max(1),
+                        ));
+                    }
+                }
+            }
             c.env.enter();
             for s in &cd.body {
                 check_stmt(c, s);

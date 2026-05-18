@@ -616,6 +616,16 @@ issues with `from`/relative imports). Just update the docs.
 
 ## 17. `class Foo:` body cannot contain `def` (correct, but only for impl)
 
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Added a new
+`tyc::method_in_class_body` warning that fires when a `def NAME(...)`
+appears inside a `class NAME:` body that isn't a pseudo-impl/extend
+class, an interface (`Protocol`), or a Pydantic model. The diagnostic
+includes both the class and method names and a help message pointing
+at `impl ClassName:`. Dunders (`__add__`, `__lt__`, ...) are exempted
+because operator overloads are a legitimate class-body use today.
+Emitted as a warning so existing tests don't break; the FINDINGS doc
+notes promotion to error is a separate v0.2 decision (#34).
+
 **Severity:** positive note — emitting `tyc::method_in_class` would help.
 
 When users put a method inside `class` (Python habit), they get an obscure
@@ -1138,6 +1148,17 @@ generic type mismatch.
 ---
 
 ## 34. `class Foo:` body method definitions silently bypass the impl-only rule (gap)
+
+**Status:** **PARTIALLY FIXED** on `claude/update-findings-IdfrH`. #17's
+new `tyc::method_in_class_body` warning now flags every method
+definition inside a non-pseudo, non-interface, non-Pydantic class
+body. The diagnostic is a *warning* rather than an error so existing
+tests and downstream user code keep compiling; promoting to error
+under a `[strictness] methods-in-class-body = "error"` config option
+(or just unconditionally) is a separate decision the FINDINGS doc
+called out. Interface conformance now works equally well for class-body
+methods and `impl`-block methods (#26), so the two forms no longer
+pull in opposite directions.
 
 **Severity:** gap — Rule 4 not enforced.
 
