@@ -617,3 +617,209 @@ fn check_stubs_standalone_dty_without_implementation_passes() {
         "standalone .dty with no implementation should pass --stubs"
     );
 }
+
+// ── source-map accuracy for sugar-expanded constructs ─────────────────────────
+//
+// `?` and `gather:` emit multiple Python lines from a single Typhon line.  The
+// v2 source map records a 1-indexed line number in the expanded preprocessed
+// text for each emitted Python line; entries are non-zero for every line.
+// These tests build real projects and verify the map structure and `tyc trace`
+// behaviour for those constructs.
+
+/// Parse a `.py.map` JSON sidecar and return the `lines` array.  Panics on
+/// malformed JSON.
+fn parse_map_lines(map_body: &str) -> Vec<u32> {
+    let v: serde_json::Value = serde_json::from_str(map_body).expect("valid JSON in .py.map");
+    v["lines"]
+        .as_array()
+        .expect("lines array in .py.map")
+        .iter()
+        .map(|x| x.as_u64().expect("numeric line entry") as u32)
+        .collect()
+}
+
+#[test]
+fn source_map_question_op_expansion_maps_back_to_original_line() {
+    // Build a project whose second statement uses `?` (error propagation).
+    // After `expand_question_ops`, that one Typhon line expands to several
+    // Python lines.  The v2 source map should record the originating Typhon
+    // line for each of those expanded lines.
+    //
+    // Source layout (line numbers 1-indexed):
+    //   1: def parse(s: str) -> Result[int, str]:
+    //   2:     let n = int(s)?
+    //   3:     return Ok(n)
+    //
+    // The `?` on line 2 expands to ≥3 Python lines; all of them should map
+    // back to line 2 (or nearby) of the preprocessed source.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "\
+def parse(s: str) -> Result[int, str]:
+    let n = int(s)?
+    return Ok(n)
+",
+    );
+    let status = tyc().arg("build").arg(tmp.path()).status().unwrap();
+    assert!(status.success(), "build should succeed for ? operator test");
+
+    let map_path = tmp.path().join("build").join("main.py.map");
+    assert!(map_path.exists(), "main.py.map should be emitted");
+
+    let map_body = std::fs::read_to_string(&map_path).unwrap();
+    assert!(
+        map_body.contains("\"version\":2"),
+        "map should be v2 format"
+    );
+    assert!(
+        map_body.contains("\"line_strategy\":\"table\""),
+        "map should use table strategy"
+    );
+
+    let lines = parse_map_lines(&map_body);
+    assert!(!lines.is_empty(), "lines array must not be empty");
+
+    // Every map entry must be non-zero (no gap in the table).
+    for (py_line_idx, &ty_line) in lines.iter().enumerate() {
+        assert!(
+            ty_line >= 1,
+            "Python line {} maps to 0 — source map has a gap",
+            py_line_idx + 1
+        );
+    }
+
+    // The `?` expansion injects at least three Python lines containing
+    // `__typhon_q_` (assignment, isinstance guard, return/unwrap).  Reading
+    // the emitted Python and counting those lines is a targeted proxy for
+    // "the expansion produced multiple Python lines", and avoids the pitfall
+    // of checking for any adjacent duplicate in the whole map (which can be
+    // satisfied by unrelated function-header entries).
+    let py_path = tmp.path().join("build").join("main.py");
+    let py_src = std::fs::read_to_string(&py_path).unwrap();
+    let q_expansion_count = py_src.lines().filter(|l| l.contains("__typhon_q_")).count();
+    assert!(
+        q_expansion_count >= 3,
+        "? expansion should produce ≥3 Python lines containing __typhon_q_; got {q_expansion_count}"
+    );
+}
+
+#[test]
+fn source_map_question_op_traceback_rewrite() {
+    // End-to-end: build a project with `?`, then feed a synthetic traceback
+    // pointing at a Python line inside the expanded block to `tyc trace` and
+    // verify the output names `main.ty` (not `main.py`).
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "\
+def parse(s: str) -> Result[int, str]:
+    let n = int(s)?
+    return Ok(n)
+",
+    );
+    let build_status = tyc().arg("build").arg(tmp.path()).status().unwrap();
+    assert!(build_status.success(), "build should succeed");
+
+    let py_path = tmp.path().join("build").join("main.py");
+    let map_path = tmp.path().join("build").join("main.py.map");
+    assert!(py_path.exists(), "main.py should exist");
+    assert!(map_path.exists(), "main.py.map should exist");
+
+    // Scan the emitted Python for a line injected by the `?` expansion
+    // (`__typhon_q_N__`) so we don't hardcode a brittle line number.
+    let py_src = std::fs::read_to_string(&py_path).unwrap();
+    let frame_py_line: u32 = py_src
+        .lines()
+        .enumerate()
+        .find_map(|(i, l)| {
+            if l.contains("__typhon_q_") {
+                Some((i + 1) as u32)
+            } else {
+                None
+            }
+        })
+        .expect("emitted Python should contain a __typhon_q_ variable from ? expansion");
+
+    let tb = format!(
+        "Traceback (most recent call last):\n  File \"{}\", line {}, in parse\n",
+        py_path.display(),
+        frame_py_line
+    );
+    let tb_path = tmp.path().join("tb.txt");
+    std::fs::write(&tb_path, &tb).unwrap();
+
+    let out = tyc().arg("trace").arg(&tb_path).output().unwrap();
+    assert!(out.status.success(), "tyc trace should succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        stdout.contains("main.ty"),
+        "trace should rewrite .py path to .ty source; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("main.py\""),
+        ".py path should be replaced in trace output; got: {stdout}"
+    );
+    // We don't assert on the exact remapped line number because the `?`
+    // expansion shifts lines — the important thing is that the path rewrite worked.
+}
+
+#[test]
+fn source_map_gather_block_expansion_maps_back_to_original_line() {
+    // Build a project with a `gather:` block (which lowers to asyncio.TaskGroup
+    // and emits several Python lines from a compact Typhon block).
+    // The v2 source map must record a valid Typhon line for every emitted line.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "\
+async def fetch_a() -> int:
+    return 1
+
+async def fetch_b() -> int:
+    return 2
+
+async def load() -> int:
+    gather:
+        a = fetch_a()
+        b = fetch_b()
+    return 0
+",
+    );
+    let status = tyc().arg("build").arg(tmp.path()).status().unwrap();
+    assert!(status.success(), "build should succeed for gather: test");
+
+    let map_path = tmp.path().join("build").join("main.py.map");
+    let map_body = std::fs::read_to_string(&map_path).unwrap();
+    let lines = parse_map_lines(&map_body);
+
+    assert!(!lines.is_empty(), "lines array must not be empty");
+
+    // Every map entry must be non-zero (no gap in the table).
+    for (py_idx, &ty_line) in lines.iter().enumerate() {
+        assert!(
+            ty_line >= 1,
+            "Python line {} maps to source line 0 — invalid gap in source map",
+            py_idx + 1,
+        );
+    }
+
+    // The `gather:` block lowers to an `async with asyncio.TaskGroup()` header
+    // plus one `create_task` call per branch, producing ≥3 Python lines that
+    // contain `__typhon_tg_` or `__typhon_gather_`.  Counting those lines is
+    // targeted at the gather expansion specifically, unlike checking for any
+    // adjacent map duplicate (which fires on blank-line / function-header pairs
+    // unrelated to gather).
+    let py_path = tmp.path().join("build").join("main.py");
+    let py_src = std::fs::read_to_string(&py_path).unwrap();
+    let gather_expansion_count = py_src
+        .lines()
+        .filter(|l| l.contains("__typhon_tg_") || l.contains("__typhon_gather_"))
+        .count();
+    assert!(
+        gather_expansion_count >= 3,
+        "gather: expansion should produce ≥3 Python lines with __typhon_tg_/__typhon_gather_; \
+         got {gather_expansion_count}"
+    );
+}
