@@ -1,6 +1,29 @@
-# Typhon
+<div align="center">
+  <img src="assets/typhon-logo.png" alt="Typhon — type-safe, optimised, compiles to CPython" width="480" />
 
-A statically-typed, stricter superset of Python that compiles to clean, readable CPython 3.13+ code with no runtime dependency on the toolchain.
+  <h1>Typhon</h1>
+
+  <p><strong>A statically-typed, stricter superset of Python that compiles to clean, readable CPython 3.13+ — with no runtime dependency on the toolchain.</strong></p>
+
+  <p>
+    <a href="https://github.com/codehalwell/Typhon/actions/workflows/ci.yml"><img src="https://github.com/codehalwell/Typhon/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+    <a href="https://github.com/codehalwell/Typhon/actions/workflows/deploy-docs.yml"><img src="https://github.com/codehalwell/Typhon/actions/workflows/deploy-docs.yml/badge.svg" alt="Docs"></a>
+    <a href="https://github.com/codehalwell/Typhon/actions/workflows/vscode-extension.yml"><img src="https://github.com/codehalwell/Typhon/actions/workflows/vscode-extension.yml/badge.svg" alt="VS Code Extension"></a>
+    <a href="https://codehalwell.github.io/Typhon/"><img src="https://img.shields.io/badge/docs-codehalwell.github.io%2FTyphon-2563eb" alt="Documentation"></a>
+    <img src="https://img.shields.io/badge/license-MIT-yellow.svg" alt="License: MIT">
+    <img src="https://img.shields.io/badge/rust-1.94-orange.svg" alt="Rust 1.94">
+    <img src="https://img.shields.io/badge/python-3.13%2B-blue.svg" alt="Python 3.13+">
+  </p>
+
+  <p>
+    <a href="https://codehalwell.github.io/Typhon/"><strong>Documentation</strong></a> ·
+    <a href="docs/language.md">Language Reference</a> ·
+    <a href="docs/cli.md">CLI Guide</a> ·
+    <a href="docs/roadmap.md">Roadmap</a>
+  </p>
+</div>
+
+---
 
 > Every `.ty` file emits valid, idiomatic `.py`. Not all `.py` is valid Typhon.
 
@@ -14,6 +37,8 @@ The compiler and language server live in a single Rust binary called `tyc`.
 - **First-class tooling** — one binary builds, checks, formats, and runs as an LSP with sub-100 ms incremental feedback.
 
 ## Documentation
+
+📖 **The full documentation site lives at [codehalwell.github.io/Typhon](https://codehalwell.github.io/Typhon/)** — browsable guides, references, and tutorials generated from [`docs-site/`](docs-site/).
 
 The canonical design doc is **[the long-term plan](docs/long-term-plan.md)** — goals, architecture, language design, roadmap, and risks in one place.
 
