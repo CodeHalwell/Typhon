@@ -289,14 +289,42 @@ API_URL: str = "https://api.example.com"
 
 The function definitions remain in the emitted output (they're ordinary Python `def`s — the `comptime` prefix is a build-time marker, not a runtime signal) so the same helpers stay available at runtime should you also call them from non-comptime code.
 
-The contract is intentionally tight in v1:
+The contract is intentionally tight in v1, but already covers most build-time configuration shapes:
 
-- Bodies must be exactly `return EXPR` — no local assignments, no `if`/`else`, no loops. Anything else is a hard error so the contract is obvious rather than half-implemented.
-- Parameters must be plain positional names — no defaults, `*args`, `**kwargs`, or keyword-only forms.
-- Free variables (module-level names other than parameters) are not in scope inside the body. Comptime evaluation is hermetic — call sites pass everything in as arguments.
-- Recursion depth is capped (currently 64) so a buggy definition fails the build rather than hanging it.
+- **Statements**: `return EXPR`, local bindings (`x = EXPR`, `let x: T = EXPR`, `mut x: T = EXPR`), and `if`/`elif`/`else` are supported. Loops, exceptions, `with`-blocks, `class`/`def` declarations, and `raise` are not — call sites should compose smaller comptime helpers instead.
+- **Expressions**: every form available to a `comptime let` initialiser, plus parameter and local-binding references, comparisons (`==`, `!=`, `<`, `<=`, `>`, `>=`), boolean operators (`and`, `or`, `not`), and the `EXPR if COND else EXPR` ternary.
+- **Parameters** must be plain positional names — no defaults, `*args`, `**kwargs`, or keyword-only forms.
+- **Free variables** (module-level names other than parameters and local bindings) are not in scope inside the body. Comptime evaluation is hermetic — call sites pass everything in as arguments.
+- **Recursion depth** is capped (currently 64) so a buggy definition fails the build rather than hanging it.
 
-These restrictions exist because comptime evaluation runs *inside the compiler*. Lifting them later is incremental work; the current rule of thumb is "if a comptime function couldn't be a one-liner pure expression, that probably belongs at runtime."
+These restrictions exist because comptime evaluation runs *inside the compiler*. Lifting them further (loops, container construction, types as values) is incremental work; the rule of thumb today is "if a comptime function couldn't be a small pure helper over arithmetic, strings, and booleans, it probably belongs at runtime."
+
+Concrete examples that work today:
+
+```python
+comptime def grade(score: int) -> str:
+    if score >= 90:
+        return "A"
+    elif score >= 80:
+        return "B"
+    elif score >= 70:
+        return "C"
+    else:
+        return "F"
+
+comptime def clamp_port(p: int) -> int:
+    let lower: int = 1024
+    let upper: int = 65535
+    if p < lower:
+        return lower
+    if p > upper:
+        return upper
+    return p
+
+comptime let MY_GRADE:  str = grade(82)           # → "B"
+comptime let SAFE_PORT: int = clamp_port(80)      # → 1024
+comptime let MAX_SCORE: int = 100 if env("STRICT", "1") == "1" else 80
+```
 
 ## Readability features
 

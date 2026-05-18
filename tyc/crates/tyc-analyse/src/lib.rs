@@ -291,12 +291,22 @@ fn eval_expr(expr: &Expr, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue, St
             )
         }),
 
-        // Unary `-` for negative literals.
-        Expr::UnaryOp(u) if matches!(u.op, ruff_python_ast::UnaryOp::USub) => {
-            match eval_expr(&u.operand, ctx)? {
-                ComptimeValue::Int(n) => Ok(ComptimeValue::Int(-n)),
-                ComptimeValue::Float(f) => Ok(ComptimeValue::Float(-f)),
-                _ => Err("unary `-` is only valid on numeric comptime values".into()),
+        // Unary operators: `-x`, `+x`, `not x`.
+        Expr::UnaryOp(u) => {
+            let operand = eval_expr(&u.operand, ctx)?;
+            match (u.op, operand) {
+                (ruff_python_ast::UnaryOp::USub, ComptimeValue::Int(n)) => {
+                    Ok(ComptimeValue::Int(-n))
+                }
+                (ruff_python_ast::UnaryOp::USub, ComptimeValue::Float(f)) => {
+                    Ok(ComptimeValue::Float(-f))
+                }
+                (ruff_python_ast::UnaryOp::UAdd, v @ ComptimeValue::Int(_)) => Ok(v),
+                (ruff_python_ast::UnaryOp::UAdd, v @ ComptimeValue::Float(_)) => Ok(v),
+                (ruff_python_ast::UnaryOp::Not, ComptimeValue::Bool(b)) => {
+                    Ok(ComptimeValue::Bool(!b))
+                }
+                _ => Err("unary operator not supported on this comptime value".into()),
             }
         }
 
@@ -311,11 +321,134 @@ fn eval_expr(expr: &Expr, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue, St
             eval_binop(b.op, lhs, rhs)
         }
 
+        // Comparison chains: `a < b`, `a == b`, `0 < n <= 10`. The
+        // comparison is evaluated short-circuit, matching Python's
+        // semantics — the first false comparator collapses the whole
+        // chain to `False`.
+        Expr::Compare(c) => eval_compare(c, ctx),
+
+        // Boolean `and` / `or`: short-circuit on the first decisive
+        // operand. The result of `a and b` is `b` if `a` is truthy and
+        // `a` otherwise (matching Python's actual return values rather
+        // than coercing to a plain bool).
+        Expr::BoolOp(b) => eval_boolop(b, ctx),
+
+        // Ternary `x if cond else y`. Condition must reduce to a Bool;
+        // the other branch is only evaluated if its arm is selected,
+        // matching short-circuit semantics.
+        Expr::If(e) => {
+            let cond = eval_expr(&e.test, ctx)?;
+            match cond {
+                ComptimeValue::Bool(true) => eval_expr(&e.body, ctx),
+                ComptimeValue::Bool(false) => eval_expr(&e.orelse, ctx),
+                _ => Err("comptime `if-expression` condition must reduce to a bool".into()),
+            }
+        }
+
         other => Err(format!(
             "expression is not a comptime-evaluable constant: {}",
             expr_kind_name(other)
         )),
     }
+}
+
+/// Evaluate a Python comparison chain (`a < b`, `0 < n <= 10`, …) in a
+/// comptime context. Returns `Bool(true)` only when every adjacent pair
+/// satisfies its operator; short-circuits on the first false comparator.
+fn eval_compare(
+    c: &ruff_python_ast::ExprCompare,
+    ctx: &mut EvalContext<'_>,
+) -> Result<ComptimeValue, String> {
+    let mut prev = eval_expr(&c.left, ctx)?;
+    for (op, rhs_expr) in c.ops.iter().zip(c.comparators.iter()) {
+        let rhs = eval_expr(rhs_expr, ctx)?;
+        let outcome = eval_cmpop(*op, &prev, &rhs)?;
+        if !outcome {
+            return Ok(ComptimeValue::Bool(false));
+        }
+        prev = rhs;
+    }
+    Ok(ComptimeValue::Bool(true))
+}
+
+fn eval_cmpop(
+    op: ruff_python_ast::CmpOp,
+    lhs: &ComptimeValue,
+    rhs: &ComptimeValue,
+) -> Result<bool, String> {
+    use ruff_python_ast::CmpOp::*;
+    // Promote int/float to a common float for ordering when types mix.
+    fn as_f64(v: &ComptimeValue) -> Option<f64> {
+        match v {
+            ComptimeValue::Int(n) => Some(*n as f64),
+            ComptimeValue::Float(f) => Some(*f),
+            _ => None,
+        }
+    }
+    match (op, lhs, rhs) {
+        (Eq, a, b) => Ok(values_equal(a, b)),
+        (NotEq, a, b) => Ok(!values_equal(a, b)),
+        (Lt | LtE | Gt | GtE, ComptimeValue::Str(a), ComptimeValue::Str(b)) => Ok(match op {
+            Lt => a < b,
+            LtE => a <= b,
+            Gt => a > b,
+            GtE => a >= b,
+            _ => unreachable!(),
+        }),
+        (Lt | LtE | Gt | GtE, a, b) => match (as_f64(a), as_f64(b)) {
+            (Some(x), Some(y)) => Ok(match op {
+                Lt => x < y,
+                LtE => x <= y,
+                Gt => x > y,
+                GtE => x >= y,
+                _ => unreachable!(),
+            }),
+            _ => Err("comptime ordering comparison requires two numerics or two strings".into()),
+        },
+        (other, _, _) => Err(format!(
+            "comparison operator `{:?}` is not supported in comptime expressions",
+            other
+        )),
+    }
+}
+
+fn values_equal(a: &ComptimeValue, b: &ComptimeValue) -> bool {
+    match (a, b) {
+        (ComptimeValue::Int(x), ComptimeValue::Int(y)) => x == y,
+        (ComptimeValue::Float(x), ComptimeValue::Float(y)) => x == y,
+        (ComptimeValue::Int(x), ComptimeValue::Float(y)) => (*x as f64) == *y,
+        (ComptimeValue::Float(x), ComptimeValue::Int(y)) => *x == (*y as f64),
+        (ComptimeValue::Str(x), ComptimeValue::Str(y)) => x == y,
+        (ComptimeValue::Bool(x), ComptimeValue::Bool(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Evaluate Python's short-circuiting `and` / `or` with Python's actual
+/// return-value semantics: `a and b` is `b` when `a` is truthy and `a`
+/// otherwise; `a or b` is `a` when `a` is truthy and `b` otherwise.
+/// Only Bool operands are accepted in v1 — promoting numeric or string
+/// values to a truthiness rule would surprise readers.
+fn eval_boolop(
+    b: &ruff_python_ast::ExprBoolOp,
+    ctx: &mut EvalContext<'_>,
+) -> Result<ComptimeValue, String> {
+    use ruff_python_ast::BoolOp::*;
+    let mut last = ComptimeValue::Bool(matches!(b.op, And));
+    for operand in &b.values {
+        let v = eval_expr(operand, ctx)?;
+        let truthy = match v {
+            ComptimeValue::Bool(x) => x,
+            _ => return Err("comptime `and`/`or` operands must be booleans".into()),
+        };
+        last = v;
+        match (b.op, truthy) {
+            (And, false) => return Ok(last),
+            (Or, true) => return Ok(last),
+            _ => {}
+        }
+    }
+    Ok(last)
 }
 
 fn eval_call(call: &ExprCall, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue, String> {
@@ -447,40 +580,124 @@ fn eval_user_comptime_call(
     result.map_err(|e| format!("in comptime call to '{name}': {e}"))
 }
 
-/// Evaluate a comptime function body. v1 supports a single top-level
-/// `return EXPR` statement (with optional docstring). Anything else
-/// (assignments, branches, loops, multiple statements) is rejected with
-/// a clear "this comptime body shape is not supported" message so the
-/// user knows the contract is intentional and what to do about it.
+/// Outcome of executing a statement (or sequence) inside a comptime
+/// function body: either control fell through to the next statement, or
+/// the function `return`ed with a value.
+enum StmtOutcome {
+    Returned(ComptimeValue),
+    FellThrough,
+}
+
+/// Evaluate a comptime function body and return the value it `return`ed.
+/// Supported statement shapes:
+///
+/// - `return EXPR`,
+/// - `NAME[: T] = EXPR` (with or without annotation) — binds a local,
+/// - `if COND: ... elif/else: ...` — branches on a boolean condition,
+/// - a leading docstring is tolerated.
+///
+/// Loops, exceptions, with-blocks, and class/def declarations are not
+/// supported in v1; calling one is a hard error. Walking off the end of
+/// the body without a `return` is also an error — a comptime function
+/// must produce a value.
 fn eval_function_body(body: &[Stmt], ctx: &mut EvalContext<'_>) -> Result<ComptimeValue, String> {
-    // Tolerate a leading bare-string docstring before the return.
-    let mut iter = body.iter().peekable();
-    if let Some(Stmt::Expr(e)) = iter.peek() {
+    let mut start = 0;
+    if let Some(Stmt::Expr(e)) = body.first() {
         if matches!(e.value.as_ref(), Expr::StringLiteral(_)) {
-            iter.next();
+            start = 1;
         }
     }
-    match iter.next() {
-        Some(Stmt::Return(r)) => {
-            if iter.next().is_some() {
-                return Err(
-                    "comptime function body must end with `return EXPR` (no statements after the \
-                     return are allowed in v1)"
-                        .into(),
-                );
-            }
+    match eval_stmts(&body[start..], ctx)? {
+        StmtOutcome::Returned(v) => Ok(v),
+        StmtOutcome::FellThrough => {
+            Err("comptime function fell through without `return`ing a value".into())
+        }
+    }
+}
+
+fn eval_stmts(stmts: &[Stmt], ctx: &mut EvalContext<'_>) -> Result<StmtOutcome, String> {
+    for stmt in stmts {
+        match eval_stmt(stmt, ctx)? {
+            StmtOutcome::FellThrough => continue,
+            ret @ StmtOutcome::Returned(_) => return Ok(ret),
+        }
+    }
+    Ok(StmtOutcome::FellThrough)
+}
+
+fn eval_stmt(stmt: &Stmt, ctx: &mut EvalContext<'_>) -> Result<StmtOutcome, String> {
+    match stmt {
+        Stmt::Return(r) => {
             let Some(value) = r.value.as_deref() else {
                 return Err(
                     "comptime function must `return` a value (bare `return` is not valid)".into(),
                 );
             };
-            eval_expr(value, ctx)
+            Ok(StmtOutcome::Returned(eval_expr(value, ctx)?))
         }
-        _ => Err(
-            "comptime function body must be exactly `return EXPR` in v1 (optionally preceded by a \
-             docstring)"
-                .into(),
-        ),
+        Stmt::Assign(a) => {
+            if a.targets.len() != 1 {
+                return Err("comptime function does not support multi-target assignment".into());
+            }
+            let Expr::Name(n) = &a.targets[0] else {
+                return Err("comptime function only supports `NAME = EXPR` assignments".into());
+            };
+            let value = eval_expr(&a.value, ctx)?;
+            ctx.locals.insert(n.id.as_str().to_owned(), value);
+            Ok(StmtOutcome::FellThrough)
+        }
+        Stmt::AnnAssign(a) => {
+            let Expr::Name(n) = a.target.as_ref() else {
+                return Err(
+                    "comptime function only supports `NAME[: T] = EXPR` annotated assignments"
+                        .into(),
+                );
+            };
+            let Some(rhs) = a.value.as_deref() else {
+                return Err(
+                    "annotated declaration inside a comptime function must have an initialiser"
+                        .into(),
+                );
+            };
+            let value = eval_expr(rhs, ctx)?;
+            ctx.locals.insert(n.id.as_str().to_owned(), value);
+            Ok(StmtOutcome::FellThrough)
+        }
+        Stmt::If(i) => {
+            let cond = eval_expr(&i.test, ctx)?;
+            let truthy = match cond {
+                ComptimeValue::Bool(b) => b,
+                _ => return Err("comptime `if` condition must reduce to a bool".into()),
+            };
+            if truthy {
+                return eval_stmts(&i.body, ctx);
+            }
+            // Python's AST encodes `elif`/`else` as a list of clauses;
+            // the first one with `test = None` is the `else`.
+            for clause in &i.elif_else_clauses {
+                match &clause.test {
+                    Some(test) => {
+                        let cond = eval_expr(test, ctx)?;
+                        let truthy = match cond {
+                            ComptimeValue::Bool(b) => b,
+                            _ => {
+                                return Err("comptime `elif` condition must reduce to a bool".into())
+                            }
+                        };
+                        if truthy {
+                            return eval_stmts(&clause.body, ctx);
+                        }
+                    }
+                    None => return eval_stmts(&clause.body, ctx),
+                }
+            }
+            Ok(StmtOutcome::FellThrough)
+        }
+        Stmt::Expr(_) => Ok(StmtOutcome::FellThrough),
+        other => Err(format!(
+            "statement is not supported inside a comptime function body: {:?}",
+            std::mem::discriminant(other)
+        )),
     }
 }
 
@@ -835,20 +1052,160 @@ comptime let X: int = double(n=2)
     }
 
     #[test]
-    fn comptime_function_with_multi_statement_body_rejected() {
-        // v1 contract: a comptime function body must be exactly
-        // `return EXPR` (optionally preceded by a docstring). A real
-        // statement before the return is a clear error so users know
-        // the contract is intentional rather than half-implemented.
+    fn comptime_function_with_local_binding_supported() {
+        // A local `NAME = EXPR` (or `let NAME: T = EXPR`) inside a
+        // comptime function body binds in the local scope and is
+        // available to subsequent statements / the return expression.
         let src = "\
 comptime def thing() -> int:
     x = 1
-    return x
+    return x + 2
+
+comptime let X: int = thing()
+";
+        let (values, diags) = eval(src);
+        assert!(
+            !diags.has_errors(),
+            "local binding must be supported: {:?}",
+            diags.errors()
+        );
+        assert!(matches!(values.get("X"), Some(ComptimeValue::Int(3))));
+    }
+
+    #[test]
+    fn comptime_function_with_annotated_local_binding_supported() {
+        let src = "\
+comptime def thing() -> int:
+    let x: int = 10
+    return x * x
+
+comptime let X: int = thing()
+";
+        let (values, diags) = eval(src);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("X"), Some(ComptimeValue::Int(100))));
+    }
+
+    #[test]
+    fn comptime_function_if_else_picks_then_branch() {
+        let src = "\
+comptime def clamp(n: int) -> int:
+    if n > 100:
+        return 100
+    return n
+
+comptime let X: int = clamp(250)
+";
+        let (values, diags) = eval(src);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("X"), Some(ComptimeValue::Int(100))));
+    }
+
+    #[test]
+    fn comptime_function_if_else_picks_else_branch() {
+        let src = "\
+comptime def clamp(n: int) -> int:
+    if n > 100:
+        return 100
+    return n
+
+comptime let X: int = clamp(7)
+";
+        let (values, diags) = eval(src);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("X"), Some(ComptimeValue::Int(7))));
+    }
+
+    #[test]
+    fn comptime_function_elif_chain() {
+        let src = "\
+comptime def grade(score: int) -> str:
+    if score >= 90:
+        return \"A\"
+    elif score >= 80:
+        return \"B\"
+    elif score >= 70:
+        return \"C\"
+    else:
+        return \"F\"
+
+comptime let G1: str = grade(95)
+comptime let G2: str = grade(82)
+comptime let G3: str = grade(50)
+";
+        let (values, diags) = eval(src);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("G1"), Some(ComptimeValue::Str(s)) if s == "A"));
+        assert!(matches!(values.get("G2"), Some(ComptimeValue::Str(s)) if s == "B"));
+        assert!(matches!(values.get("G3"), Some(ComptimeValue::Str(s)) if s == "F"));
+    }
+
+    #[test]
+    fn comptime_ternary_if_expression() {
+        let src = "\
+comptime def sign(n: int) -> int:
+    return 1 if n > 0 else -1
+
+comptime let A: int = sign(7)
+comptime let B: int = sign(-3)
+";
+        let (values, diags) = eval(src);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("A"), Some(ComptimeValue::Int(1))));
+        assert!(matches!(values.get("B"), Some(ComptimeValue::Int(-1))));
+    }
+
+    #[test]
+    fn comptime_boolean_operators_short_circuit() {
+        let src = "\
+comptime def both(a: bool, b: bool) -> bool:
+    return a and b
+
+comptime def either(a: bool, b: bool) -> bool:
+    return a or b
+
+comptime let T1: bool = both(True, True)
+comptime let T2: bool = both(True, False)
+comptime let T3: bool = either(False, True)
+";
+        let (values, diags) = eval(src);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("T1"), Some(ComptimeValue::Bool(true))));
+        assert!(matches!(values.get("T2"), Some(ComptimeValue::Bool(false))));
+        assert!(matches!(values.get("T3"), Some(ComptimeValue::Bool(true))));
+    }
+
+    #[test]
+    fn comptime_function_without_return_is_an_error() {
+        // A function that runs every branch without hitting `return` is
+        // a hard error — the comptime binding has no value to inline.
+        let src = "\
+comptime def thing(n: int) -> int:
+    let x: int = n + 1
+
+comptime let X: int = thing(2)
+";
+        let (_, diags) = eval(src);
+        assert!(diags.has_errors(), "missing return must be an error");
+        let msg = format!("{:?}", diags.errors()[0]);
+        assert!(msg.contains("fell through"), "got: {msg}");
+    }
+
+    #[test]
+    fn comptime_function_loop_statement_rejected() {
+        // Loops aren't supported in v1 — make sure the error message
+        // points at the unsupported statement category rather than
+        // silently producing wrong output.
+        let src = "\
+comptime def thing() -> int:
+    for i in [1, 2, 3]:
+        let x: int = i
+    return 0
 
 comptime let X: int = thing()
 ";
         let (_, diags) = eval(src);
-        assert!(diags.has_errors(), "multi-stmt body should be rejected");
+        assert!(diags.has_errors(), "for-loop body must be rejected");
     }
 
     #[test]
