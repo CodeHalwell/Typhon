@@ -14,3 +14,7 @@ tyc-diagnostics = { workspace = true }
 tyc-resolve = { workspace = true }
 tyc-syntax = { workspace = true }
 miette = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -65,6 +65,17 @@ pub enum Commands {
     /// through the full compile pipeline plus a Python subprocess.
     Repl(commands::repl::ReplArgs),
 
+    /// Add a Python package to the project (`[dependencies]` in
+    /// `typhon.toml`) and run `uv sync` to install it.
+    Add(commands::deps::AddArgs),
+
+    /// Remove a Python package from `typhon.toml` and re-sync.
+    Remove(commands::deps::RemoveArgs),
+
+    /// Materialise `[dependencies]` into a generated `pyproject.toml`
+    /// and run `uv sync` to install everything.
+    Sync(commands::deps::SyncArgs),
+
     /// Build the project and launch the emitted Python under a debugger.
     ///
     /// v1 thin wrapper that runs `python -m pdb build/main.py`. A full
@@ -88,5 +99,8 @@ pub fn run() -> Result<()> {
         Commands::Ty(args) => commands::ty::run(args),
         Commands::Repl(args) => commands::repl::run(args),
         Commands::Debug(args) => commands::debug::run(args),
+        Commands::Add(args) => commands::deps::run_add(args),
+        Commands::Remove(args) => commands::deps::run_remove(args),
+        Commands::Sync(args) => commands::deps::run_sync(args),
     }
 }

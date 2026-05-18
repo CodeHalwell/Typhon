@@ -2069,7 +2069,9 @@ version = "0.1.0"
 dependencies = [
  "miette",
  "salsa",
+ "tempfile",
  "tokio",
+ "toml",
  "tower-lsp-server",
  "tyc-db",
  "tyc-diagnostics",

@@ -53,6 +53,25 @@ pub struct Binding {
     pub mutability: Mutability,
     /// Byte range of the declaration site in the preprocessed source.
     pub span: (usize, usize),
+    /// For `BindingKind::Import` bindings, carries the imported module
+    /// path and (for `from`-imports) the original symbol name so cross-file
+    /// go-to-definition can resolve `pkg.util.frobnicate` back to the
+    /// originating `.ty` source.  `None` for non-import bindings.
+    pub import_info: Option<ImportInfo>,
+}
+
+/// Origin metadata for an import binding, used by the LSP backend to drive
+/// cross-file go-to-definition.
+#[derive(Debug, Clone)]
+pub struct ImportInfo {
+    /// Dotted Python module path the symbol was sourced from.
+    /// `import pkg.util`        → `pkg.util`
+    /// `from pkg.util import f` → `pkg.util`
+    pub module: String,
+    /// For `from … import name` (or `from … import name as alias`), the
+    /// original member name. `None` for bare `import` statements where
+    /// the bound name is the module itself.
+    pub member: Option<String>,
 }
 
 impl Binding {
@@ -290,6 +309,18 @@ impl<'a> Resolver<'a> {
         mutability: Mutability,
         span: (usize, usize),
     ) {
+        self.declare_with(scope, name, kind, mutability, span, None);
+    }
+
+    fn declare_with(
+        &mut self,
+        scope: ScopeId,
+        name: &str,
+        kind: BindingKind,
+        mutability: Mutability,
+        span: (usize, usize),
+        import_info: Option<ImportInfo>,
+    ) {
         if let Some(existing) = self.lookup_local(scope, name) {
             // Re-entry at exactly the same span is just the same statement
             // being visited twice (e.g. pre-collect followed by walk_stmt);
@@ -324,6 +355,7 @@ impl<'a> Resolver<'a> {
             kind,
             mutability,
             span,
+            import_info,
         });
     }
 
@@ -538,28 +570,46 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt]) {
                         alias.range.start().to_usize(),
                         alias.range.start().to_usize() + bound_name.len(),
                     );
-                    r.declare(
+                    let module = if alias.asname.is_some() {
+                        alias.name.as_str().to_owned()
+                    } else {
+                        // Bare `import pkg.sub` binds `pkg`; the import
+                        // target is still the leaf-most module that name
+                        // brings into scope — encode `pkg` so the LSP
+                        // jumps to `pkg/__init__.ty`.
+                        bound_name.clone()
+                    };
+                    r.declare_with(
                         scope,
                         &bound_name,
                         BindingKind::Import,
                         Mutability::Mut,
                         span,
+                        Some(ImportInfo {
+                            module,
+                            member: None,
+                        }),
                     );
                 }
             }
             Stmt::ImportFrom(i) => {
+                let module = i.module.as_ref().map(|m| m.as_str().to_owned());
                 for alias in &i.names {
                     let name = alias.asname.as_ref().unwrap_or(&alias.name);
                     let span = (
                         alias.range.start().to_usize(),
                         alias.range.start().to_usize() + name.as_str().len(),
                     );
-                    r.declare(
+                    r.declare_with(
                         scope,
                         name.as_str(),
                         BindingKind::Import,
                         Mutability::Mut,
                         span,
+                        module.as_ref().map(|m| ImportInfo {
+                            module: m.clone(),
+                            member: Some(alias.name.as_str().to_owned()),
+                        }),
                     );
                 }
             }

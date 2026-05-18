@@ -25,7 +25,7 @@ use tower_lsp_server::ls_types::{
 use tower_lsp_server::{jsonrpc, Client, LanguageServer, LspService, Server};
 use tyc_db::{check_source_file, preprocessed_text, SourceFile, TycDatabase};
 use tyc_diagnostics::TycError;
-use tyc_resolve::{BindingKind, Mutability, ResolvedModule, SymbolAtOffset};
+use tyc_resolve::{BindingKind, ImportInfo, Mutability, ResolvedModule, SymbolAtOffset};
 
 /// Shared, async-safe cache mapping URI strings to `(preprocessed_text, ResolvedModule)`.
 ///
@@ -340,6 +340,20 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
+        // Cross-file go-to-definition: when the local declaration site is
+        // an `import` binding, resolve the module path back to a sibling
+        // `.ty` source in the workspace and jump to the member's
+        // declaration there.  Falls through to the local declaration span
+        // when the import can't be resolved on disk (e.g. third-party
+        // stdlib, missing source file).
+        if def.kind == BindingKind::Import {
+            if let Some(info) = &def.import_info {
+                if let Some(loc) = self.resolve_cross_file_import(&uri, info).await {
+                    return Ok(Some(GotoDefinitionResponse::Scalar(loc)));
+                }
+            }
+        }
+
         let location = Location {
             uri,
             range: Range {
@@ -410,7 +424,274 @@ impl Backend {
         let mut cache = self.resolved_cache.lock().await;
         cache.remove(uri_str);
     }
+
+    /// Resolve an import binding to a `Location` in the originating `.ty`
+    /// file, if it can be found on disk.
+    ///
+    /// Resolution walks up from the current file looking for a `typhon.toml`
+    /// to find the workspace root; the configured `src` directory then
+    /// anchors the dotted-module lookup.  Returns `None` for stdlib /
+    /// third-party imports — those have no `.ty` source to jump to.
+    ///
+    /// The returned [`Location`] is mapped back to *original* `.ty`
+    /// offsets so the LSP client lands on the same column the user sees,
+    /// not the preprocessed offset (which would be off by `len("let ")`
+    /// for a `let`/`mut` declaration).  The resolved module is cached in
+    /// `resolved_cache` keyed by file:// URI so subsequent requests for
+    /// the same target skip the parse + resolve work.
+    async fn resolve_cross_file_import(
+        &self,
+        current: &Uri,
+        info: &ImportInfo,
+    ) -> Option<Location> {
+        let current_path = uri_to_path(current)?;
+        let (_project_root, src_dir) = find_workspace_layout(&current_path)?;
+        let module_path = resolve_module_to_file(&src_dir, &info.module)?;
+        let original_source = std::fs::read_to_string(&module_path).ok()?;
+
+        // Cache key: the canonicalised file:// URI of the target file.
+        // We store `(preprocessed_text, ResolvedModule)` exactly like the
+        // primary did-open path so repeated jumps into the same module
+        // skip parse + resolve.
+        let target_uri = path_to_uri(&module_path)?;
+        let target_uri_str = target_uri.as_str().to_owned();
+
+        let prep = tyc_syntax::preprocess::preprocess(&original_source);
+        let resolved = match self
+            .get_or_resolve(&target_uri_str, &prep.python_source)
+            .await
+        {
+            Some(r) => r,
+            None => return None,
+        };
+
+        let target_name = info.member.clone();
+        let module_scope = 0;
+        let target_binding = match target_name {
+            Some(name) => resolved
+                .scopes
+                .get(module_scope)?
+                .bindings
+                .iter()
+                .find(|b| b.name == name),
+            None => None,
+        };
+
+        let (start_prep, end_prep) = if let Some(b) = target_binding {
+            (b.span.0, b.span.1)
+        } else {
+            (0, 0)
+        };
+        // Map preprocessed-source offsets back to original-source offsets
+        // by adding back the bytes preprocess stripped from earlier lines
+        // (each `let ` or `mut ` removed 4 chars from a single line).
+        let (start, end) = (
+            map_preprocessed_offset_to_original(&prep, &original_source, start_prep),
+            map_preprocessed_offset_to_original(&prep, &original_source, end_prep),
+        );
+        Some(Location {
+            uri: target_uri,
+            range: Range {
+                start: byte_to_position(&original_source, start),
+                end: byte_to_position(&original_source, end),
+            },
+        })
+    }
 }
+
+/// Map a byte offset in `preprocessed` text back to a byte offset in
+/// `original`.  Preprocessing only strips characters from the start of a
+/// line (`let ` / `mut `), and lines are not added or removed, so the
+/// mapping per line is "original_line_start + (preprocessed_col + stripped_prefix_len)".
+///
+/// For lines that don't have a stripped prefix the mapping is identity.
+fn map_preprocessed_offset_to_original(
+    prep: &tyc_syntax::preprocess::PreprocessResult,
+    original: &str,
+    prep_offset: usize,
+) -> usize {
+    let prep_text = prep.python_source.as_str();
+    // Walk both strings line-by-line, finding which line `prep_offset`
+    // falls into and the column within that line.
+    let mut line_idx = 0usize;
+    let mut prep_line_start = 0usize;
+    while prep_line_start < prep_text.len() {
+        let line_end = prep_text[prep_line_start..]
+            .find('\n')
+            .map(|i| prep_line_start + i + 1)
+            .unwrap_or(prep_text.len());
+        if prep_offset < line_end {
+            break;
+        }
+        prep_line_start = line_end;
+        line_idx += 1;
+    }
+    let prep_col = prep_offset.saturating_sub(prep_line_start);
+
+    // Find the same line in the original text.
+    let mut orig_line_start = 0usize;
+    for _ in 0..line_idx {
+        let Some(i) = original[orig_line_start..].find('\n') else {
+            return original.len();
+        };
+        orig_line_start += i + 1;
+    }
+
+    // How many bytes did preprocess strip from the start of this line?
+    // Each `let `/`mut ` removed 4 chars; other stripped keywords (impl,
+    // extend, …) become wider lowering forms instead of getting trimmed,
+    // so they don't shift offsets.
+    let stripped_prefix: usize = prep
+        .stripped
+        .iter()
+        .filter(|s| s.line_index == line_idx)
+        .map(|s| match s.keyword {
+            tyc_syntax::lexer::TyphonKeyword::Let | tyc_syntax::lexer::TyphonKeyword::Mut => 4,
+            _ => 0,
+        })
+        .sum();
+
+    (orig_line_start + prep_col + stripped_prefix).min(original.len())
+}
+
+/// Convert an `lsp_types::Uri` into a local filesystem path.  Only `file:`
+/// URIs are supported — anything else (e.g. `untitled:`) returns `None`.
+fn uri_to_path(uri: &Uri) -> Option<std::path::PathBuf> {
+    let s = uri.as_str();
+    let stripped = s.strip_prefix("file://")?;
+    // Strip the host component (always empty for local files but the LSP
+    // URI may emit it as "//"). Anything past the first `/` is the path.
+    let path = if let Some(rest) = stripped.strip_prefix('/') {
+        format!("/{rest}")
+    } else {
+        stripped.to_owned()
+    };
+    Some(std::path::PathBuf::from(percent_decode(&path)))
+}
+
+/// Convert a local filesystem path back into an `lsp_types::Uri`.
+fn path_to_uri(path: &std::path::Path) -> Option<Uri> {
+    let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let s = abs.to_str()?;
+    let encoded = percent_encode(s);
+    Uri::from_str(&format!("file://{encoded}")).ok()
+}
+
+/// Minimal RFC 3986 percent-encoder for file paths. Encodes everything that
+/// isn't an ASCII alphanumeric, `/`, `.`, `-`, or `_` so spaces, `?`, etc.
+/// survive the round-trip without confusing the LSP client.
+fn percent_encode(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for b in input.bytes() {
+        let safe = b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'-' | b'_' | b'~');
+        if safe {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Minimal percent decoder — inverse of [`percent_encode`].
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (from_hex(bytes[i + 1]), from_hex(bytes[i + 2])) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|e| {
+        // Invalid UTF-8 means the URI was corrupted upstream; fall back to
+        // the lossy decode rather than panic so the LSP request still
+        // returns a (possibly imprecise) answer.
+        String::from_utf8_lossy(&e.into_bytes()).into_owned()
+    })
+}
+
+fn from_hex(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Walk up from `file_path` looking for a `typhon.toml`.  Returns
+/// `(project_root, src_dir)` — `src_dir` defaults to `project_root/src`
+/// when the toml does not specify, matching `tyc init`'s scaffolding.
+fn find_workspace_layout(
+    file_path: &std::path::Path,
+) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let mut dir = file_path.parent()?.to_path_buf();
+    loop {
+        let candidate = dir.join("typhon.toml");
+        if candidate.exists() {
+            let src = parse_src_dir(&candidate).unwrap_or_else(|| "src".to_owned());
+            let src_dir = dir.join(src);
+            return Some((dir, src_dir));
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+/// Pull out the `[project] src` field from `typhon.toml`.
+///
+/// Uses the `toml` crate so inline-table values, end-of-line comments,
+/// nested tables, and the array-of-tables syntax are handled correctly
+/// (the previous line-by-line scanner choked on any of those).  Returns
+/// `None` when the file is unreadable, malformed, or doesn't carry a
+/// `[project] src = "…"` entry — callers fall through to the default
+/// `"src"` directory in that case.
+fn parse_src_dir(toml_path: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(toml_path).ok()?;
+    let parsed: toml::Value = toml::from_str(&text).ok()?;
+    let project = parsed.get("project")?.as_table()?;
+    let src = project.get("src")?.as_str()?;
+    Some(src.to_owned())
+}
+
+/// Map a dotted module name to a `.ty` file path under `src_dir`.
+///
+/// `pkg.util` → `src_dir/pkg/util.ty`, falling back to
+/// `src_dir/pkg/util/__init__.ty` when the leaf is itself a package.
+/// Returns `None` when neither candidate exists on disk.
+fn resolve_module_to_file(src_dir: &std::path::Path, module: &str) -> Option<std::path::PathBuf> {
+    let parts: Vec<&str> = module.split('.').collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let mut leaf = src_dir.to_path_buf();
+    for (i, segment) in parts.iter().enumerate() {
+        if i + 1 == parts.len() {
+            let direct = leaf.join(format!("{segment}.ty"));
+            if direct.exists() {
+                return Some(direct);
+            }
+            let pkg_init = leaf.join(segment).join("__init__.ty");
+            if pkg_init.exists() {
+                return Some(pkg_init);
+            }
+            return None;
+        } else {
+            leaf = leaf.join(segment);
+        }
+    }
+    None
+}
+
+use std::str::FromStr;
 
 /// Parse and resolve a pre-preprocessed Python source string so hover and
 /// go-to-definition can query bindings and references.  Returns `None` when
@@ -1008,6 +1289,7 @@ mod tests {
             kind: BindingKind::Value,
             mutability: Mutability::Let,
             span: (4, 5),
+            import_info: None,
         };
         let symbol = SymbolAtOffset {
             name: "x".to_owned(),
@@ -1028,6 +1310,7 @@ mod tests {
             kind: BindingKind::Function,
             mutability: Mutability::Mut,
             span: (4, 8),
+            import_info: None,
         };
         let symbol = SymbolAtOffset {
             name: "main".to_owned(),
@@ -1038,6 +1321,66 @@ mod tests {
         let body = render_hover(&symbol);
         assert!(body.contains("function"), "got: {body}");
         assert!(!body.contains("declaration site"), "got: {body}");
+    }
+
+    // ── cross-file import resolution ─────────────────────────────────────
+
+    #[test]
+    fn resolve_module_to_file_prefers_direct_module_over_package() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("pkg")).unwrap();
+        std::fs::write(src.join("util.ty"), "let x: int = 1\n").unwrap();
+        std::fs::write(src.join("pkg").join("__init__.ty"), "let y: int = 2\n").unwrap();
+
+        let direct = resolve_module_to_file(&src, "util").expect("util.ty must resolve");
+        assert_eq!(direct.file_name().unwrap(), "util.ty");
+
+        let pkg = resolve_module_to_file(&src, "pkg").expect("pkg/__init__.ty must resolve");
+        assert_eq!(pkg.file_name().unwrap(), "__init__.ty");
+        assert!(pkg.parent().unwrap().ends_with("pkg"));
+    }
+
+    #[test]
+    fn resolve_module_to_file_returns_none_for_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        assert!(resolve_module_to_file(&src, "missing").is_none());
+    }
+
+    #[test]
+    fn find_workspace_layout_walks_up_to_typhon_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname=\"x\"\nsrc=\"lib\"\n",
+        )
+        .unwrap();
+        let src = tmp.path().join("lib");
+        std::fs::create_dir_all(&src).unwrap();
+        let file = src.join("main.ty");
+        std::fs::write(&file, "let x: int = 1\n").unwrap();
+
+        let (root, src_dir) = find_workspace_layout(&file).expect("layout should be detected");
+        assert_eq!(root, tmp.path());
+        assert_eq!(src_dir, src);
+    }
+
+    #[test]
+    fn parse_src_dir_extracts_quoted_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let toml = tmp.path().join("typhon.toml");
+        std::fs::write(&toml, "[project]\nsrc = \"src\"\n").unwrap();
+        assert_eq!(parse_src_dir(&toml).as_deref(), Some("src"));
+    }
+
+    #[test]
+    fn percent_round_trip_preserves_spaces() {
+        let s = "/tmp/some dir/file.ty";
+        let enc = percent_encode(s);
+        assert!(enc.contains("%20"), "{enc}");
+        assert_eq!(percent_decode(&enc), s);
     }
 
     // ── resolve_in_preprocessed ──────────────────────────────────────────

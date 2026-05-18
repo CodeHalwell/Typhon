@@ -56,6 +56,41 @@ fn build(dir: &Path) {
     assert!(status.success(), "tyc build failed for: {}", dir.display());
 }
 
+/// Scaffold a project that opts into `[strictness] auto-parallel = true`
+/// plus free-threaded Python so the loop-parallelisation rewrite fires
+/// against the emitted code.
+fn scaffold_parallel(dir: &Path, src_content: &str) {
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(
+        dir.join("typhon.toml"),
+        "[project]\nname = \"feat\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+         [python]\ntarget = \"3.13\"\nfree-threaded = true\n\
+         [emit]\nformat = false\n\
+         [strictness]\nauto-parallel = true\n[env]\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("src").join("main.ty"), src_content).unwrap();
+}
+
+/// Run `tyc build` only when a usable Python interpreter is present.
+///
+/// Tests that subsequently execute the emitted Python use this gate so a
+/// machine without Python skips the build step too rather than running it
+/// only to drop the artifact on the floor.  Returns `None` when no Python
+/// 3.12+ interpreter could be discovered.
+fn build_if_python(dir: &Path) -> Option<String> {
+    let py = python()?;
+    build(dir);
+    Some(py)
+}
+
+/// Combined `build_if_python` + `run_main`: skips upfront when Python is
+/// absent, otherwise builds and runs `main.py`. Returns the script's stdout.
+fn build_and_run_main(dir: &Path) -> Option<String> {
+    let _py = build_if_python(dir)?;
+    run_main(dir)
+}
+
 fn main_py(dir: &Path) -> String {
     std::fs::read_to_string(dir.join("build").join("main.py")).unwrap()
 }
@@ -109,8 +144,7 @@ fn build_emits_valid_python_for_mut_binding() {
 fn build_emits_runnable_hello_world() {
     let tmp = tempfile::tempdir().unwrap();
     scaffold(tmp.path(), "print(\"hi\")\n");
-    build(tmp.path());
-    let Some(out) = run_main(tmp.path()) else {
+    let Some(out) = build_and_run_main(tmp.path()) else {
         return;
     };
     assert_eq!(out.trim(), "hi");
@@ -123,8 +157,7 @@ fn build_emits_runnable_let_then_print() {
         tmp.path(),
         "let greeting: str = \"hello world\"\nprint(greeting)\n",
     );
-    build(tmp.path());
-    let Some(out) = run_main(tmp.path()) else {
+    let Some(out) = build_and_run_main(tmp.path()) else {
         return;
     };
     assert_eq!(out.trim(), "hello world");
@@ -137,8 +170,7 @@ fn build_emits_runnable_function_call() {
         tmp.path(),
         "def double(x: int) -> int:\n    return x * 2\n\nprint(double(21))\n",
     );
-    build(tmp.path());
-    let Some(out) = run_main(tmp.path()) else {
+    let Some(out) = build_and_run_main(tmp.path()) else {
         return;
     };
     assert_eq!(out.trim(), "42");
@@ -176,8 +208,7 @@ fn build_class_with_methods_runs() {
         tmp.path(),
         "class Greeter:\n    name: str\n    def hello(self) -> str:\n        return \"hi \" + self.name\n\nprint(Greeter(\"world\").hello())\n",
     );
-    build(tmp.path());
-    let Some(out) = run_main(tmp.path()) else {
+    let Some(out) = build_and_run_main(tmp.path()) else {
         return;
     };
     assert_eq!(out.trim(), "hi world");
@@ -239,8 +270,7 @@ fn build_ok_result_runs_end_to_end() {
         tmp.path(),
         "def f() -> Ok[int]:\n    return Ok(1)\n\nprint(f().value)\n",
     );
-    build(tmp.path());
-    let Some(out) = run_main(tmp.path()) else {
+    let Some(out) = build_and_run_main(tmp.path()) else {
         return;
     };
     assert_eq!(out.trim(), "1");
@@ -582,6 +612,176 @@ fn repl_reset_clears_session() {
     assert!(
         stdout.contains("after-reset"),
         "post-reset block should run; got:\n{stdout}"
+    );
+}
+
+// ── extend BUILTIN — extension methods on built-ins ─────────────────────────
+
+#[test]
+fn build_accepts_extend_str_and_emits_free_function() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "extend str:\n    def shout(self) -> str:\n        return self.upper()\n",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    assert!(
+        py.contains("def __typhon_ext_str__shout"),
+        "extend str: should lower to a free function; got:\n{py}"
+    );
+    assert!(
+        !py.contains("class __typhon_builtin_ext_str"),
+        "the sentinel class must be removed; got:\n{py}"
+    );
+}
+
+#[test]
+fn build_rewrites_str_extension_call_site() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "extend str:\n    def shout(self) -> str:\n        return self.upper()\n\n\
+         let greeting: str = \"hi\"\nprint(greeting.shout())\n",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    assert!(
+        py.contains("__typhon_ext_str__shout(greeting)"),
+        "call site must be rewritten; got:\n{py}"
+    );
+    if let Some(out) = run_main(tmp.path()) {
+        assert_eq!(out.trim(), "HI");
+    }
+}
+
+// ── auto-parallel comprehensions ────────────────────────────────────────────
+
+#[test]
+fn build_rewrites_pure_listcomp_under_auto_parallel() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_parallel(
+        tmp.path(),
+        "@pure\ndef square(n: int) -> int:\n    return n * n\n\n\
+         xs: list[int] = [1, 2, 3]\nys: list[int] = [square(x) for x in xs]\n",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    assert!(
+        py.contains("typhon_runtime.parallel.map_pure"),
+        "auto-parallel should rewrite the comprehension; got:\n{py}"
+    );
+    let pkg = tmp.path().join("build/typhon_runtime/parallel.py");
+    assert!(pkg.exists(), "parallel.py helper must be emitted");
+}
+
+#[test]
+fn build_leaves_impure_comprehension_alone_under_auto_parallel() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold_parallel(
+        tmp.path(),
+        "def io_call(n: int) -> int:\n    print(n)\n    return n\n\n\
+         xs: list[int] = [1, 2, 3]\nys: list[int] = [io_call(x) for x in xs]\n",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    assert!(
+        !py.contains("typhon_runtime.parallel.map_pure"),
+        "impure callee must not trigger the rewrite; got:\n{py}"
+    );
+}
+
+#[test]
+fn build_skips_rewrite_when_auto_parallel_off() {
+    // Default scaffold has auto-parallel disabled.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "@pure\ndef square(n: int) -> int:\n    return n * n\n\n\
+         xs: list[int] = [1, 2, 3]\nys: list[int] = [square(x) for x in xs]\n",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    assert!(
+        !py.contains("typhon_runtime.parallel.map_pure"),
+        "rewrite must require the auto-parallel opt-in; got:\n{py}"
+    );
+}
+
+// ── REPL dedent terminator ──────────────────────────────────────────────────
+
+#[test]
+fn repl_dedent_terminator_closes_block_and_runs_next_line() {
+    // Typed by hand:
+    //   def greet():
+    //       print("hi")
+    //   print("after")     ← dedent-to-0 terminator
+    // The REPL should treat the first two lines as one `def` block, then
+    // execute `print("after")` as a fresh top-level statement. Stdout
+    // should include "after"; "hi" only fires when `greet()` is called.
+    let Some(py) = python() else { return };
+    let mut child = tyc()
+        .arg("repl")
+        .arg("--python")
+        .arg(&py)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"def greet():\n    print(\"hi\")\nprint(\"after\")\n:quit\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "repl should exit 0; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("after"),
+        "dedent-terminated block should let the next statement run; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn repl_backslash_continuation_preserves_payload() {
+    // Backslash continuation joins two physical lines into one logical
+    // statement.  The dedent rule must NOT apply here — `2` on column 0
+    // is legitimate continuation content, not a sibling top-level
+    // statement.  The eventual `print(x)` should see x = 1 + 2 = 3.
+    let Some(py) = python() else { return };
+    let mut child = tyc()
+        .arg("repl")
+        .arg("--python")
+        .arg(&py)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"x = 1 + \\\n2\n\nprint(x)\n:quit\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "repl should exit 0; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains('3'),
+        "backslash continuation should yield x=3; got:\n{stdout}"
     );
 }
 

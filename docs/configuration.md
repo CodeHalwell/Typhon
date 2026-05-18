@@ -2,7 +2,9 @@
 
 > Excerpted from the [long-term plan](long-term-plan.md). The plan is the source of truth.
 
-Each Typhon project has a `typhon.toml` at its root, written by `tyc init` and read by every subcommand. Standard `pip`/`uv` workflows handle dependencies — Typhon does not ship a package manager.
+Each Typhon project has a `typhon.toml` at its root, written by `tyc init` and read by every subcommand.
+
+Dependencies can be managed externally with `uv`/`pip`, or declared inline in `[dependencies]` / `[dev-dependencies]` and synced with `tyc add` / `tyc remove` / `tyc sync` — those commands rewrite the manifest and shell out to `uv` for the install step.
 
 ## Full example
 
@@ -28,10 +30,21 @@ no-implicit-any = true
 unused-import = "error"
 exhaustive-match = "error"
 auto-memoise = false        # opt-in: insert @functools.cache on inferred-pure functions
+auto-parallel = false       # opt-in: rewrite pure list comprehensions to a thread-pool map
+parallel-min-size = 64      # minimum iterable size for auto-parallel to fire
 stub-check = "error"        # tyc check --stubs severity; compares .pyi against runtime modules
 
 [env]
 required = ["DATABASE_URL"]  # comptime env() lookups must resolve at build time
+
+# Inline dependency management — synced with `tyc add` / `tyc remove` / `tyc sync`,
+# which write a generated `pyproject.toml` and shell out to `uv`.
+[dependencies]
+requests = ">=2.31"
+rich = "*"                  # bare name → any version
+
+[dev-dependencies]
+pytest = "8.2"              # bare version → ==8.2
 ```
 
 ## Sections

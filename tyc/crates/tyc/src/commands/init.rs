@@ -55,6 +55,8 @@ pub fn run(args: InitArgs) -> Result<()> {
         emit: EmitConfig::default(),
         strictness: StrictnessConfig::default(),
         env: EnvConfig::default(),
+        dependencies: Default::default(),
+        dev_dependencies: Default::default(),
     };
     let toml_str = config
         .to_toml_string()

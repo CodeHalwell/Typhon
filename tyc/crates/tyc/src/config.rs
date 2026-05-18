@@ -1,6 +1,7 @@
 //! `typhon.toml` configuration file parsing.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// The contents of a `typhon.toml` project file.
@@ -12,6 +13,21 @@ pub struct TyphonConfig {
     pub emit: EmitConfig,
     pub strictness: StrictnessConfig,
     pub env: EnvConfig,
+    /// Runtime Python dependencies, keyed by package name. The value is a
+    /// PEP 440 version specifier (e.g. `"^2.0"`, `">=1.0,<2"`, `"*"`).
+    /// Empty when typhon.toml does not declare any dependencies — projects
+    /// can still manage them through `uv`/`pip` directly without using the
+    /// `tyc add` / `tyc sync` commands.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dependencies: BTreeMap<String, String>,
+    /// Development-only dependencies (test runners, linters, etc.). Not
+    /// installed for downstream consumers of the package.
+    #[serde(
+        default,
+        rename = "dev-dependencies",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub dev_dependencies: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -100,6 +116,20 @@ pub struct StrictnessConfig {
     /// that one-off entry points stay un-cached, low enough that an
     /// inner-loop helper qualifies after a single representative run.
     pub pgo_min_calls: u64,
+    /// When true, list comprehensions whose element is a pure call (no
+    /// I/O, no module-state writes, no entropy/clock) are rewritten at
+    /// build time into a thread-pool map.  Combine with
+    /// [`PythonConfig::free_threaded`] to release the GIL across workers
+    /// and get real parallelism; on a stock CPython the rewrite still
+    /// runs but the GIL serialises the workers.  Off by default.
+    pub auto_parallel: bool,
+    /// Minimum statically-detectable iterable length for a comprehension
+    /// to qualify for parallelisation.  Below this threshold the
+    /// thread-pool overhead exceeds any wins, so the rewrite is skipped.
+    /// Default 64.  When the iterable size cannot be inferred (e.g. an
+    /// arbitrary function call), the threshold is treated as zero —
+    /// users opting into `auto-parallel` accept that contract.
+    pub parallel_min_size: u64,
 }
 
 impl Default for StrictnessConfig {
@@ -112,6 +142,8 @@ impl Default for StrictnessConfig {
             auto_gather: false,
             pgo_memoise: false,
             pgo_min_calls: 100,
+            auto_parallel: false,
+            parallel_min_size: 64,
         }
     }
 }

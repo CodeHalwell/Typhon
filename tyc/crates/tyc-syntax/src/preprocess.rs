@@ -175,15 +175,23 @@ pub fn preprocess(source: &str) -> PreprocessResult {
             // ── `extend ClassName:` → `class __typhon_impl_ClassName(object):` ─
             // For Typhon v1, `extend` on user-defined classes is an alias for
             // `impl` — the methods are merged into the target class at desugar.
-            // Extension methods on built-ins (e.g. `extend str:`) are deferred
-            // to a later phase that can rewrite call sites with type info.
+            // For built-ins (`extend str:`, `extend list:`, …) the same
+            // preprocess emits a `class __typhon_builtin_ext_BUILTIN:` stub
+            // that a later analyse pass extracts to free functions and uses
+            // to drive call-site rewriting.
             if rest.starts_with("extend ")
                 && rest.len() > "extend ".len()
                 && (rest.as_bytes()["extend ".len()].is_ascii_alphanumeric()
                     || rest.as_bytes()["extend ".len()] == b'_')
             {
                 let after_extend = &rest["extend ".len()..];
-                if let Some(class_header) = make_impl_class_line(after_extend) {
+                let target = extract_extend_target(after_extend);
+                let header_opt = if target.map(is_builtin_extend_target).unwrap_or(false) {
+                    make_builtin_extend_class_line(after_extend)
+                } else {
+                    make_impl_class_line(after_extend)
+                };
+                if let Some(class_header) = header_opt {
                     stripped.push(StrippedKeyword {
                         line_index,
                         keyword: TyphonKeyword::Extend,
@@ -436,6 +444,55 @@ fn make_impl_class_line(after_impl: &str) -> Option<String> {
     };
     let tail = &after_impl[colon_pos..]; // ":\n" or ":"
     Some(format!("__typhon_impl_{}(object){}", name, tail))
+}
+
+/// Same as [`make_impl_class_line`] but uses the `__typhon_builtin_ext_`
+/// prefix so the analyse pass can find these classes, extract their
+/// methods to free functions, and drive the call-site rewrite.  Kept
+/// separate from the user-class lowering because the desugar paths
+/// diverge: builtin extensions never merge into the original type.
+fn make_builtin_extend_class_line(after_extend: &str) -> Option<String> {
+    let mut depth = 0i32;
+    let mut colon_pos = None;
+    for (i, c) in after_extend.char_indices() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth -= 1,
+            ':' if depth == 0 => {
+                colon_pos = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let colon_pos = colon_pos?;
+    let raw = after_extend[..colon_pos].trim_end();
+    let name = if let Some(paren) = raw.find('(') {
+        raw[..paren].trim_end()
+    } else {
+        raw
+    };
+    let tail = &after_extend[colon_pos..];
+    Some(format!("__typhon_builtin_ext_{}(object){}", name, tail))
+}
+
+/// Pull the target type identifier out of an `extend …:` header.
+fn extract_extend_target(after_extend: &str) -> Option<&str> {
+    let head = after_extend.split([':', '(']).next()?.trim();
+    if head.is_empty() {
+        None
+    } else {
+        Some(head)
+    }
+}
+
+/// True when `target` names a Python built-in type that the extension-on-
+/// builtins pass should handle (vs. delegating to the regular user-class
+/// `impl`-style merge).  Kept consistent with
+/// [`BUILTIN_TYPES_REJECTED_BY_EXTEND`] — that list was the previous
+/// hard-error gate and now drives the extraction pass.
+fn is_builtin_extend_target(target: &str) -> bool {
+    BUILTIN_TYPES_REJECTED_BY_EXTEND.contains(&target)
 }
 
 /// Build the class-header portion of an `interface` line, converting
@@ -951,41 +1008,16 @@ const BUILTIN_TYPES_REJECTED_BY_EXTEND: &[&str] = &[
     "type",
 ];
 
-/// Scan `source` for `extend BUILTIN:` declarations.  These are explicitly
-/// rejected in v1 because Python forbids adding methods to its built-in
-/// types — the lowering would silently drop the methods.
-pub fn validate_extend_usage(source: &str) -> Vec<ExtendUsageError> {
-    let mut errors = Vec::new();
-    let mut byte_offset: usize = 0;
-    let mut in_string: Option<StringMode> = None;
-    for (line_index, line) in source.split_inclusive('\n').enumerate() {
-        let raw = line.trim_end_matches(['\n', '\r']);
-        let pre = in_string;
-        let _ = scan_line_code_end(raw, &mut in_string);
-        if pre.is_none() {
-            let indent_len = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
-            let body = &raw[indent_len..];
-            if let Some(rest) = body.strip_prefix("extend ") {
-                // Strip a trailing `:` (and optional base-class list) so
-                // `extend str:` and `extend str(Foo):` both extract `str`.
-                let head = rest.split([':', '(']).next().unwrap_or("").trim();
-                if BUILTIN_TYPES_REJECTED_BY_EXTEND.contains(&head) {
-                    errors.push(ExtendUsageError {
-                        line_index,
-                        offset: byte_offset + indent_len,
-                        message: format!(
-                            "`extend {head}:` is not supported — Python's built-in types \
-                             cannot be modified at runtime. Wrap the value in a \
-                             user-defined class, or move the helper to a free function. \
-                             A future call-site rewriter is planned (see roadmap.md)."
-                        ),
-                    });
-                }
-            }
-        }
-        byte_offset += line.len();
-    }
-    errors
+/// Scan `source` for `extend BUILTIN:` declarations.
+///
+/// In Typhon ≥ 0.2 these are *not* rejected — the preprocess pass lowers
+/// `extend BUILTIN:` blocks to a sentinel `class __typhon_builtin_ext_BUILTIN:`
+/// stub that a downstream analyse pass extracts to module-level free
+/// functions plus a call-site rewriter.  This validator is retained as a
+/// no-op so existing wiring (and the diagnostic enum) keep compiling; it
+/// will go away once every caller switches to the rewriter directly.
+pub fn validate_extend_usage(_source: &str) -> Vec<ExtendUsageError> {
+    Vec::new()
 }
 
 // ── `?` operator validation ───────────────────────────────────────────────────
