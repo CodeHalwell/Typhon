@@ -1630,6 +1630,16 @@ Same fix family — emit `let t1 = typhon_runtime.tasks.spawn(...)`.
 
 ## 40. `for k, v in d.items():` doesn't declare `k`/`v` (bug, critical)
 
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. Extracted
+a `declare_loop_target` helper in `tyc-resolve/src/lib.rs` that recurses
+into `Expr::Tuple` / `Expr::List` / `Expr::Starred` and reuses it from
+the `Stmt::For`, `Stmt::With`, and comprehension generator walkers. The
+helper declares each contained name as `BindingKind::Loop` with
+`Mutability::Mut`, the same shape used previously for bare-name loop
+targets. Verified end-to-end on `for k, v in d.items()`,
+`for i, x in enumerate(xs)`, `for (a, b) in pairs:`, and tuple-target
+comprehensions.
+
 **Severity:** bug — critical; basic Python idiom; cascades through the
 examples suite.
 

@@ -945,6 +945,49 @@ fn declare_target(
     }
 }
 
+/// Declare the target(s) bound by a `for` / `with` / `async for` statement.
+///
+/// Recurses through `Expr::Tuple`, `Expr::List`, and `Expr::Starred` so unpack
+/// shapes (`for k, v in d.items():`, `for (a, b) in pairs:`, `for a, *rest in xs:`)
+/// register every name they introduce as a `BindingKind::Loop` local. Without
+/// this recursion the resolver only saw the outermost `Expr::Tuple` and the
+/// names inside were treated as unknown — FINDINGS #40.
+///
+/// Loop / context-manager targets aren't subject to Rule 2 (the `for`/`with`
+/// keyword itself introduces the binding), so this helper does not emit
+/// `tyc::missing_binding_kind` like `declare_target` does for bare assignments.
+fn declare_loop_target(r: &mut Resolver, scope: ScopeId, target: &Expr) {
+    match target {
+        Expr::Name(n) => {
+            let span = (
+                n.range.start().to_usize(),
+                n.range.start().to_usize() + n.id.as_str().len(),
+            );
+            r.declare(
+                scope,
+                n.id.as_str(),
+                BindingKind::Loop,
+                Mutability::Mut,
+                span,
+            );
+        }
+        Expr::Tuple(t) => {
+            for elt in &t.elts {
+                declare_loop_target(r, scope, elt);
+            }
+        }
+        Expr::List(l) => {
+            for elt in &l.elts {
+                declare_loop_target(r, scope, elt);
+            }
+        }
+        Expr::Starred(s) => {
+            declare_loop_target(r, scope, &s.value);
+        }
+        _ => {}
+    }
+}
+
 /// Walk a statement, recording references to names and descending into
 /// nested function/class scopes.
 /// Convert an AST `TextRange` to the (start, end) byte tuple used by
@@ -1081,20 +1124,11 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
         }
         Stmt::For(f) => {
             walk_expr(r, scope, &f.iter);
-            // Loop target introduces a binding.
-            if let Expr::Name(n) = f.target.as_ref() {
-                let span = (
-                    n.range.start().to_usize(),
-                    n.range.start().to_usize() + n.id.as_str().len(),
-                );
-                r.declare(
-                    scope,
-                    n.id.as_str(),
-                    BindingKind::Loop,
-                    Mutability::Mut,
-                    span,
-                );
-            }
+            // Loop target introduces one or more bindings. Recurse into
+            // `Expr::Tuple` / `Expr::List` / `Expr::Starred` so unpack
+            // forms (`for k, v in d.items():`, `for i, x in enumerate(xs):`,
+            // `for (a, *rest) in pairs:`) declare every name they bind.
+            declare_loop_target(r, scope, f.target.as_ref());
             for s in &f.body {
                 walk_stmt(r, scope, s);
             }
@@ -1106,19 +1140,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             for item in &w.items {
                 walk_expr(r, scope, &item.context_expr);
                 if let Some(var) = &item.optional_vars {
-                    if let Expr::Name(n) = var.as_ref() {
-                        let span = (
-                            n.range.start().to_usize(),
-                            n.range.start().to_usize() + n.id.as_str().len(),
-                        );
-                        r.declare(
-                            scope,
-                            n.id.as_str(),
-                            BindingKind::Loop,
-                            Mutability::Mut,
-                            span,
-                        );
-                    }
+                    declare_loop_target(r, scope, var.as_ref());
                 }
             }
             for s in &w.body {
@@ -1507,19 +1529,9 @@ fn walk_comp(
     let scope2 = r.push_scope(ScopeKind::Comprehension, scope, span);
     for gen in generators {
         walk_expr(r, scope2, &gen.iter);
-        if let Expr::Name(n) = &gen.target {
-            let span = (
-                n.range.start().to_usize(),
-                n.range.start().to_usize() + n.id.as_str().len(),
-            );
-            r.declare(
-                scope2,
-                n.id.as_str(),
-                BindingKind::Loop,
-                Mutability::Mut,
-                span,
-            );
-        }
+        // Comprehension targets share the recursive shape of `for`/`with`
+        // targets — e.g. `[v for k, v in d.items()]` binds both `k` and `v`.
+        declare_loop_target(r, scope2, &gen.target);
         for cond in &gen.ifs {
             walk_expr(r, scope2, cond);
         }
