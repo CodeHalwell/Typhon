@@ -2244,12 +2244,18 @@ pub fn expand_question_ops(source: &str) -> String {
 /// Lowered to:
 ///
 /// ```text
-///     let __typhon_guard_<N> = (weight)
-///     if __typhon_guard_<N> is None:
+///     let __typhon_mguard_<N> = (weight)
+///     if __typhon_mguard_<N> is None:
 ///         log("missing")
 ///         return 0
-///     let w = __typhon_guard_<N>
+///     let w = __typhon_mguard_<N>
 /// ```
+///
+/// The `mguard` prefix (rather than the single-line form's `guard`) is
+/// deliberate: the single-line handler uses the source `line_index`
+/// directly, while this multi-line pass uses a per-call counter. Using
+/// distinct prefixes guarantees a multi-line and single-line guard on
+/// the same line index can never share a temp name.
 ///
 /// Behaviour:
 /// - The body must be indented strictly deeper than the `guard` header.
@@ -2317,21 +2323,37 @@ pub fn expand_multiline_guards(source: &str) -> String {
 
         // Collect the indented body. End at the first non-blank,
         // non-comment-only line whose code indent is <= header indent.
+        //
+        // Three special cases bypass the indent-based termination:
+        //   1. Lines whose start sits inside an unterminated triple-
+        //      quoted string opened in an earlier body line — the
+        //      content's leading-column-0 text isn't real indentation.
+        //   2. Blank lines — the Python tokenizer skips them for
+        //      indentation purposes, and a body author might place
+        //      one before the first indented statement for clarity.
+        //   3. Comment-only lines — same reasoning; a `# comment` at
+        //      column 0 between two body statements doesn't dedent
+        //      the surrounding block.
+        // The body ends only when we hit a real code line at indent
+        // <= header indent (outside a string).
         let mut body_lines: Vec<&str> = Vec::new();
         let mut body_state = in_string;
         let mut j = i + 1;
         while j < lines.len() {
             let candidate = lines[j];
             let raw_c = candidate.trim_end_matches(['\n', '\r']);
-            // Blank / whitespace-only lines belong to whichever block
-            // surrounds them — treat them as part of the body if we've
-            // already started collecting, otherwise pass through.
-            if raw_c.chars().all(|c| c.is_whitespace()) {
-                if body_lines.is_empty() {
-                    // Header followed by a blank line before any indented
-                    // statement means the body is empty — bail.
-                    break;
-                }
+            // Case 1: inside a triple-quoted string opened in an
+            // earlier body line. Push and keep scanning string state.
+            if body_state.is_some() {
+                let _ = scan_line_code_end(raw_c, &mut body_state);
+                body_lines.push(candidate);
+                j += 1;
+                continue;
+            }
+            // Case 2/3: blank or comment-only line.
+            let stripped = raw_c.trim_start();
+            let is_blank_like = stripped.is_empty() || stripped.starts_with('#');
+            if is_blank_like {
                 body_lines.push(candidate);
                 j += 1;
                 continue;
@@ -2343,10 +2365,43 @@ pub fn expand_multiline_guards(source: &str) -> String {
                 break;
             }
             // Track string state so a triple-quoted string opened
-            // inside the body doesn't confuse later passes.
+            // inside the body is recognised on the next iteration.
             let _ = scan_line_code_end(raw_c, &mut body_state);
             body_lines.push(candidate);
             j += 1;
+        }
+        // Drop trailing blank/comment-only lines from the body: they
+        // belong to the *surrounding* scope (the trailing `let NAME = …`
+        // we're about to emit must come before them so the binding is
+        // visible to subsequent statements). Without this, a guard
+        // followed by a blank-line gap before unrelated code would
+        // swallow the gap into the lowered `if` body and bury the
+        // binding too deeply.
+        while body_lines
+            .last()
+            .map(|l| {
+                let raw = l.trim_end_matches(['\n', '\r']);
+                let trimmed = raw.trim_start();
+                trimmed.is_empty() || trimmed.starts_with('#')
+            })
+            .unwrap_or(false)
+        {
+            body_lines.pop();
+            j -= 1;
+        }
+        // Body is "empty" if every collected line was blank/comment-only
+        // (now all popped). Bail and let the parser surface its own
+        // indent error rather than emitting an `if … is None:` with
+        // nothing inside it.
+        let has_code = body_lines.iter().any(|l| {
+            let raw = l.trim_end_matches(['\n', '\r']);
+            let trimmed = raw.trim_start();
+            !trimmed.is_empty() && !trimmed.starts_with('#')
+        });
+        if !has_code {
+            out.push_str(line);
+            i += 1;
+            continue;
         }
         if body_lines.is_empty() {
             // Empty body — leave the source alone and let the parser
@@ -5102,5 +5157,85 @@ def b(y: int?) -> int:
         // The lowered form must not appear inside a string literal.
         assert!(!out.contains("__typhon_mguard_"));
         assert_eq!(out, src);
+    }
+
+    #[test]
+    fn expand_multiline_guards_leading_blank_line_is_absorbed() {
+        // Python ignores blank lines for indentation; a leading blank
+        // line after `else:` must not terminate the body before the
+        // first indented statement is seen. Regression for the
+        // gemini-code-assist / Copilot reviews on PR #51.
+        let src = "\
+def f(x: int?) -> int:
+    guard v = x else:
+
+        return 0
+    return v
+";
+        let out = expand_multiline_guards(src);
+        assert!(
+            out.contains("if __typhon_mguard_0 is None:"),
+            "leading blank must not break the rewrite; got:\n{out}"
+        );
+        assert!(
+            out.contains("        return 0"),
+            "body statement after the blank must be preserved; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn expand_multiline_guards_comment_only_dedent_does_not_terminate_body() {
+        // Comment-only lines (even at column 0) don't change Python's
+        // indentation context, so they must not split the body across
+        // the lowered `if`. Regression for the Codex P1 review on
+        // PR #51.
+        let src = "\
+def f(x: int?) -> int:
+    guard v = x else:
+        log(\"first\")
+# leading-column comment between body statements
+        return 0
+    return v
+";
+        let out = expand_multiline_guards(src);
+        // Both body statements end up inside the lowered `if`, with the
+        // comment preserved between them.
+        let if_block_start = out.find("if __typhon_mguard_0 is None:").unwrap();
+        let after_if = &out[if_block_start..];
+        let log_pos = after_if
+            .find("        log(\"first\")")
+            .expect("log call in body");
+        let comment_pos = after_if
+            .find("# leading-column comment between body statements")
+            .expect("comment preserved");
+        let return_pos = after_if.find("        return 0").expect("return in body");
+        // Source order is preserved.
+        assert!(log_pos < comment_pos && comment_pos < return_pos);
+        // The `let v = …` binding sits after the body, not before
+        // `return 0` (i.e. the comment did NOT terminate the body).
+        let let_pos = after_if.find("    let v = __typhon_mguard_0").unwrap();
+        assert!(return_pos < let_pos);
+    }
+
+    #[test]
+    fn expand_multiline_guards_triple_quoted_string_in_body_preserved() {
+        // A triple-quoted string opened in the body whose content
+        // dedents to column 0 must not terminate the body. Regression
+        // for the Copilot review on PR #51.
+        let src = "\
+def f(x: int?) -> int:
+    guard v = x else:
+        log(\"\"\"
+multi-line
+string content
+\"\"\")
+        return 0
+    return v
+";
+        let out = expand_multiline_guards(src);
+        assert!(out.contains("if __typhon_mguard_0 is None:"));
+        assert!(out.contains("multi-line"));
+        assert!(out.contains("string content"));
+        assert!(out.contains("        return 0"));
     }
 }

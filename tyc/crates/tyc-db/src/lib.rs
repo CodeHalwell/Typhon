@@ -46,7 +46,9 @@ pub struct SourceFile {
 pub fn preprocessed_text(db: &dyn salsa::Database, file: SourceFile) -> String {
     let text = file.text(db);
     // Apply Typhon sugar expansion in the same order as `check_file` and the
-    // build pipeline: gather → go → with-chains → pipes → `?`.
+    // build pipeline: multi-line guard → gather → go → with-chains → pipes → `?`.
+    // The multi-line guard pre-pass runs first so its body can still contain
+    // any of the later forms (`gather:`, `?`, pipes, etc.).
     let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
         &expand_gather_blocks(&expand_multiline_guards(text)),
     ))));
@@ -163,11 +165,18 @@ pub fn resolved_module(db: &dyn salsa::Database, file: SourceFile) -> ArcResolve
 
 /// Convert preprocessor `lazy_imports` metadata into [`LazyImportRemap`]s
 /// the resolver can consume. The preprocessor records each
-/// `lazy import ALIAS = MODULE` statement's line index and alias name;
-/// here we compute the byte offset of the alias inside the *original*
-/// Typhon source so the diagnostic anchors on the user-written form
-/// rather than the preprocessor's `import MODULE as ALIAS` rewrite
-/// (FINDINGS #15).
+/// `lazy import ALIAS = MODULE` statement's line index in the
+/// *post-sugar* source (after multi-line-guard and other line-drifting
+/// passes have run), so we cannot use that index directly into the
+/// original Typhon source — a guard expansion that added lines above
+/// would offset every subsequent lazy-import line.
+///
+/// Instead, walk the original source independently for `lazy import`
+/// lines (which are never moved or removed by sugar passes — they only
+/// appear at module level), then pair them with `lazy_imports` in
+/// source order. The resolver still keys on `line_index` from the
+/// preprocessed source (matching the binding's span) but the offset
+/// it surfaces points at the alias in the original (FINDINGS #15).
 fn build_lazy_import_remaps(
     original_source: &str,
     lazy_imports: &[tyc_syntax::preprocess::LazyImport],
@@ -175,46 +184,89 @@ fn build_lazy_import_remaps(
     if lazy_imports.is_empty() {
         return Vec::new();
     }
-    // Build a line-start table once for the original source so we can
-    // O(1) look up each lazy_import line's byte offset.
-    let mut line_starts: Vec<usize> = vec![0];
-    for (i, b) in original_source.bytes().enumerate() {
-        if b == b'\n' {
-            line_starts.push(i + 1);
-        }
-    }
-    let prefix = "lazy import ";
+    let original_aliases = collect_original_lazy_import_alias_spans(original_source);
+    // Pair by source order. Sugar passes don't add, remove, or
+    // reorder `lazy import` lines, so the nth lazy import in the
+    // original is the nth lazy import in the preprocessed source.
+    // Optionally verify the alias names match as a sanity check;
+    // a mismatch (which would mean a sugar pass started producing
+    // synthetic lazy imports) silently drops that remap so the
+    // user gets the preprocessed-source fallback instead of a
+    // mis-anchored diagnostic.
     let mut out = Vec::with_capacity(lazy_imports.len());
-    for li in lazy_imports {
-        let Some(&line_start) = line_starts.get(li.line_index) else {
+    for (i, li) in lazy_imports.iter().enumerate() {
+        let Some(original) = original_aliases.get(i) else {
             continue;
         };
-        let line_end = line_starts
-            .get(li.line_index + 1)
-            .copied()
-            .unwrap_or(original_source.len());
-        let line = &original_source[line_start..line_end];
-        // Skip leading whitespace, then the `lazy import ` keyword span,
-        // then any extra whitespace before the alias. Matches what the
-        // preprocessor itself does in `parse_lazy_import`.
-        let indent = line
-            .bytes()
-            .take_while(|&b| b == b' ' || b == b'\t')
-            .count();
-        let after_indent = &line[indent..];
-        let Some(after_kw) = after_indent.strip_prefix(prefix) else {
+        if original.alias != li.alias {
             continue;
-        };
-        let extra_ws = after_kw
-            .bytes()
-            .take_while(|&b| b == b' ' || b == b'\t')
-            .count();
-        let alias_offset = line_start + indent + prefix.len() + extra_ws;
+        }
         out.push(LazyImportRemap {
             line_index: li.line_index,
-            original_alias_offset: alias_offset,
-            original_alias_length: li.alias.len(),
+            original_alias_offset: original.offset,
+            original_alias_length: original.length,
         });
+    }
+    out
+}
+
+/// One `lazy import ALIAS = MODULE` declaration as seen in the original
+/// Typhon source, with the byte offset and length of the ALIAS token.
+/// Internal to [`build_lazy_import_remaps`].
+struct OriginalLazyAlias {
+    alias: String,
+    offset: usize,
+    length: usize,
+}
+
+/// Walk `source` line-by-line and return every `lazy import ALIAS =
+/// MODULE` declaration in source order. Mirrors the preprocessor's
+/// recognition (only module-level — indent 0 — with the literal
+/// `lazy import ` prefix), but operates on the *original* (pre-sugar)
+/// text so the alias offsets remain valid after upstream line-drifting
+/// passes like `expand_multiline_guards`.
+fn collect_original_lazy_import_alias_spans(source: &str) -> Vec<OriginalLazyAlias> {
+    let prefix = "lazy import ";
+    let mut out = Vec::new();
+    let mut line_start = 0usize;
+    for (line_end, byte) in source
+        .bytes()
+        .enumerate()
+        .map(|(i, b)| (i + 1, b))
+        .filter(|&(_, b)| b == b'\n')
+        .chain(std::iter::once((source.len() + 1, 0u8)))
+    {
+        // `line_end` is one past the `\n` (or one past EOF for the
+        // synthetic terminator). Slice up to it minus the newline.
+        let end_excl = line_end.saturating_sub(1).min(source.len());
+        let line = &source[line_start..end_excl];
+        // Module-level lazy imports start at indent 0. Indented `lazy`
+        // expressions are left alone by the preprocessor, so we
+        // mirror that here.
+        if let Some(after_kw) = line.strip_prefix(prefix) {
+            let extra_ws = after_kw
+                .bytes()
+                .take_while(|&b| b == b' ' || b == b'\t')
+                .count();
+            let alias_start_in_line = prefix.len() + extra_ws;
+            let after_alias = &line[alias_start_in_line..];
+            let alias_len = after_alias
+                .bytes()
+                .take_while(|&b| b.is_ascii_alphanumeric() || b == b'_')
+                .count();
+            if alias_len > 0 {
+                let alias = after_alias[..alias_len].to_owned();
+                out.push(OriginalLazyAlias {
+                    alias,
+                    offset: line_start + alias_start_in_line,
+                    length: alias_len,
+                });
+            }
+        }
+        line_start = line_end;
+        // Suppress unused-variable warning on `byte` (only used to
+        // gate the iter chain above).
+        let _ = byte;
     }
     out
 }
@@ -683,6 +735,57 @@ def parse(s: str) -> Result[int, str]:
                 &source_text[offset..offset + 2],
                 "np",
                 "span must point at the alias `np`; got `{}` at offset {offset} in:\n{source_text}",
+                &source_text[offset..offset + 2.min(source_text.len() - offset)]
+            );
+        } else {
+            unreachable!("matched above");
+        }
+    }
+
+    #[test]
+    fn check_file_unused_lazy_import_anchors_correctly_with_line_drift() {
+        // Regression for the Codex P2 review on PR #51: a line-drifting
+        // sugar pass (here, a multi-line `guard`) inserts lines above
+        // a `lazy import`, so the preprocessor's `line_index` in the
+        // expanded source no longer maps directly into the original
+        // source. The remap builder must scan the original source
+        // independently and pair by position.
+        //
+        // Original layout: lazy import is at line 8.
+        // After multi-line guard expansion (1 header → 3 lines, +2):
+        // lazy import shifts to expanded line 10.
+        // Without the fix, the remap would point at original line 10
+        // (`return 0`), where there's no `lazy import` prefix — so
+        // the remap would silently drop and the user would see the
+        // preprocessor-rewritten `import math as np` again.
+        let src = "\
+def f(x: int?) -> int:
+    guard v = x else:
+        print(\"oops\")
+        return 0
+    return v
+
+lazy import np = math
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file(&mut db, "<test>".into(), src.to_owned());
+        let all: Vec<&TycError> = diags.errors().iter().chain(diags.warnings()).collect();
+        let unused = all
+            .iter()
+            .copied()
+            .find(|e| matches!(e, TycError::UnusedImport { .. }))
+            .expect("expected an unused_import diagnostic");
+        if let TycError::UnusedImport { src, span, .. } = unused {
+            let source_text: &str = src.inner();
+            assert!(
+                source_text.contains("lazy import np = math"),
+                "remap must survive the line drift; got:\n{source_text}"
+            );
+            let offset: usize = span.offset();
+            assert_eq!(
+                &source_text[offset..offset + 2],
+                "np",
+                "span must still point at `np` after line drift; got `{}` at offset {offset}",
                 &source_text[offset..offset + 2.min(source_text.len() - offset)]
             );
         } else {

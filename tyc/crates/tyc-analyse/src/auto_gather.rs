@@ -618,10 +618,27 @@ fn make_result_extract(bind: &str, task: &str) -> Stmt {
 pub fn collect_gatherable_async_fn_names(module: &ModModule) -> HashSet<String> {
     let mut out = HashSet::new();
     for stmt in &module.body {
-        if let Stmt::FunctionDef(f) = stmt {
-            if f.is_async && has_gatherable_decorator(&f.decorator_list) {
+        match stmt {
+            Stmt::FunctionDef(f) if f.is_async && has_gatherable_decorator(&f.decorator_list) => {
                 out.insert(f.name.as_str().to_owned());
             }
+            // Methods declared inside `class Foo:` or the
+            // preprocessor's `__typhon_impl_Foo` pseudo-class (the
+            // lowered form of `impl Foo:`) are scanned too so a
+            // `@gatherable` annotation on a method is honoured. The
+            // gather rewriter already recurses into class bodies, so
+            // the eligibility set has to match for the rewrite to
+            // fire on a class-method bare-name call.
+            Stmt::ClassDef(c) => {
+                for inner in &c.body {
+                    if let Stmt::FunctionDef(f) = inner {
+                        if f.is_async && has_gatherable_decorator(&f.decorator_list) {
+                            out.insert(f.name.as_str().to_owned());
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
     out
@@ -695,10 +712,26 @@ pub fn detect_missed_gathers(module: &ModModule) -> Vec<MissedGather> {
 fn collect_local_async_fn_names(module: &ModModule) -> HashSet<String> {
     let mut out = HashSet::new();
     for stmt in &module.body {
-        if let Stmt::FunctionDef(f) = stmt {
-            if f.is_async {
+        match stmt {
+            Stmt::FunctionDef(f) if f.is_async => {
                 out.insert(f.name.as_str().to_owned());
             }
+            // Match `collect_gatherable_async_fn_names`'s scan into
+            // class bodies (covers both real `class Foo:` declarations
+            // and the preprocessor's `__typhon_impl_Foo` pseudo-class
+            // form). Without this, the missed-gather detector would
+            // skip async methods even when the gather rewriter would
+            // happily fold them given the right decorator.
+            Stmt::ClassDef(c) => {
+                for inner in &c.body {
+                    if let Stmt::FunctionDef(f) = inner {
+                        if f.is_async {
+                            out.insert(f.name.as_str().to_owned());
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
     out
@@ -1369,6 +1402,52 @@ async def load() -> int:
         assert!(
             missed.is_empty(),
             "imported callees ineligible; got {missed:?}"
+        );
+    }
+
+    #[test]
+    fn detect_missed_includes_class_method_callees() {
+        // Async methods defined inside a class body (or the
+        // preprocessor's `__typhon_impl_<Name>` pseudo-class form of
+        // an `impl` block) are local to the module too. Without the
+        // class-body scan, a run of bare-name calls to class methods
+        // would be silently ignored by the detector. Regression for
+        // the gemini-code-assist review on PR #51.
+        let src = "\
+class Service:
+    async def fetch_a(self) -> int:
+        return 1
+    async def fetch_b(self) -> int:
+        return 2
+
+async def load() -> int:
+    a = await fetch_a()
+    b = await fetch_b()
+    return a + b
+";
+        let module = parse_module(src);
+        let missed = detect_missed_gathers(&module);
+        assert_eq!(missed.len(), 1, "expected 1 missed run; got {missed:?}");
+        // First missing callee is `fetch_a` (none decorated).
+        assert_eq!(missed[0].missing_callee, "fetch_a");
+    }
+
+    #[test]
+    fn collect_gatherable_includes_class_methods() {
+        // Symmetric to the missed-detection scan: a `@gatherable`
+        // decorator on an async method must register the method name
+        // so the rewriter's eligibility set includes it.
+        let src = "\
+class Service:
+    @gatherable
+    async def fetch_a(self) -> int:
+        return 1
+";
+        let module = parse_module(src);
+        let names = collect_gatherable_async_fn_names(&module);
+        assert!(
+            names.contains("fetch_a"),
+            "class-method gatherable must be collected; got {names:?}"
         );
     }
 }
