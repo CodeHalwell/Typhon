@@ -1131,14 +1131,7 @@ mod tests {
 
     #[test]
     fn frozen_assign_contains_class_and_field() {
-        let e = TycError::frozen_assign(
-            "Identity",
-            "name",
-            "a.ty",
-            "i.name = \"Bob\"",
-            0,
-            6,
-        );
+        let e = TycError::frozen_assign("Identity", "name", "a.ty", "i.name = \"Bob\"", 0, 6);
         assert!(matches!(e, TycError::FrozenAssign { .. }));
         let msg = e.to_string();
         assert!(msg.contains("Identity"));

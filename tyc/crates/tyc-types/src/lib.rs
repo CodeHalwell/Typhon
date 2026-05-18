@@ -1471,7 +1471,7 @@ fn unsafe_byte_starts(source: &str, unsafe_lines: &[usize]) -> Vec<u32> {
 /// by the preprocessor, and methods inside it bind `self` to the pseudo
 /// type — not to `FrozenClass` itself. To make `self.field = ...` writes
 /// inside such methods still trip the frozen check, the matching impl
-/// pseudo-class is registered as frozen too.
+/// pseudo-class is registered as frozen in the same pass.
 fn populate_frozen_classes(c: &mut Checker, body: &[Stmt], frozen_starts: &[u32]) {
     if frozen_starts.is_empty() {
         return;
@@ -1484,20 +1484,11 @@ fn populate_frozen_classes(c: &mut Checker, body: &[Stmt], frozen_starts: &[u32]
                 .iter()
                 .any(|&m| m >= class_start && m <= name_start)
             {
-                c.frozen_classes.insert(cd.name.as_str().to_owned());
+                let name = cd.name.as_str();
+                c.frozen_classes.insert(name.to_owned());
+                c.frozen_classes.insert(format!("__typhon_impl_{}", name));
             }
         }
-    }
-    // Mirror frozen-ness onto `__typhon_impl_<NAME>` pseudo-classes so
-    // `self`-rooted writes inside `impl FrozenClass: def m(self): self.x = ...`
-    // are flagged at the same time as the matching `f.x = ...` from outside.
-    let impl_targets: Vec<String> = c
-        .frozen_classes
-        .iter()
-        .map(|n| format!("__typhon_impl_{}", n))
-        .collect();
-    for n in impl_targets {
-        c.frozen_classes.insert(n);
     }
 }
 
@@ -1534,8 +1525,12 @@ fn check_attr_assign_not_frozen(c: &mut Checker, target: &Expr) {
         .strip_prefix("__typhon_impl_")
         .unwrap_or(&class_name)
         .to_owned();
-    let span_start = attr.range.start().to_usize();
-    let span_end = attr.range.end().to_usize();
+    // Point the span at the field identifier (`name` in
+    // `user.identity.name = ...`) rather than the whole attribute
+    // expression. Tighter spans render better in miette, and for nested
+    // chains the field is the actual thing being written.
+    let span_start = attr.attr.range.start().to_usize();
+    let span_end = attr.attr.range.end().to_usize();
     let length = span_end.saturating_sub(span_start).max(1);
     c.diagnostics.push_error(TycError::frozen_assign(
         display_class,
@@ -1996,9 +1991,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 }
             }
             c.env.enter();
-            let saved_class = c
-                .current_class
-                .replace(cd.name.as_str().to_owned());
+            let saved_class = c.current_class.replace(cd.name.as_str().to_owned());
             for s in &cd.body {
                 check_stmt(c, s);
             }
@@ -4747,8 +4740,9 @@ i.name = \"Bob\"
             "direct write to a frozen field must be rejected"
         );
         assert!(
-            d.errors().iter().any(|e| e.to_string().contains("frozen")
-                && e.to_string().contains("name")),
+            d.errors()
+                .iter()
+                .any(|e| e.to_string().contains("frozen") && e.to_string().contains("name")),
             "diagnostic should name the frozen field: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
