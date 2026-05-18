@@ -1015,6 +1015,20 @@ fn desugar_stmt(stmt: &Stmt, raw_class_starts: &[u32]) -> (Stmt, bool) {
                 };
                 new_class.body.insert(insert_at, make_model_config_stmt());
             }
+            // `class!` classes whose body lacks an explicit `__init__` AND
+            // which have at least one positional base get a synthesised
+            // constructor: `super().__init__()` followed by `self.x = x` for
+            // every annotated field, in source order. The class-level field
+            // annotations are kept so type checkers still see the field
+            // shape (mirrors the dataclass convention).
+            if is_raw && class_has_any_base(c) && !body_has_init(&new_class.body) {
+                let synthesised = synthesise_raw_class_init(&new_class.body);
+                // Place `__init__` after the leading run of (docstring +
+                // field annotations) so the class reads top-to-bottom:
+                // doc → fields → __init__ → methods.
+                let insert_at = raw_class_init_insert_pos(&new_class.body);
+                new_class.body.insert(insert_at, synthesised);
+            }
             // Only propagate `true` when a dataclass decorator was added (or
             // was added deeper in the body) — that's the signal used by
             // `desugar_mod_module` to decide whether to inject `import dataclasses`.
@@ -1323,6 +1337,210 @@ fn make_alias(name: &str) -> Alias {
     }
 }
 
+// ── `class!` __init__ synthesis ─────────────────────────────────────────────
+
+/// True when the class has at least one positional base (`class Foo(Bar):`).
+/// Keyword arguments alone — `metaclass=`, `total=False`, etc. — don't
+/// count; a class with no positional base has nothing meaningful to chain
+/// `super().__init__()` through.
+fn class_has_any_base(c: &ruff_python_ast::StmtClassDef) -> bool {
+    c.arguments
+        .as_ref()
+        .map(|a| !a.args.is_empty())
+        .unwrap_or(false)
+}
+
+/// True when the class body already defines a `def __init__`.  We never
+/// overwrite an author-written constructor.
+fn body_has_init(body: &[Stmt]) -> bool {
+    body.iter().any(|s| match s {
+        Stmt::FunctionDef(f) => f.name.as_str() == "__init__",
+        _ => false,
+    })
+}
+
+/// Insertion index for a synthesised `__init__`: skip past a leading
+/// docstring and the contiguous run of field annotations that follows.
+/// Stops at the first method (FunctionDef), assignment without
+/// annotation, or other statement so the synthesised constructor lands
+/// where a hand-written one would naturally go.
+fn raw_class_init_insert_pos(body: &[Stmt]) -> usize {
+    let mut idx = 0;
+    if let Some(Stmt::Expr(e)) = body.first() {
+        if matches!(&*e.value, Expr::StringLiteral(_)) {
+            idx = 1;
+        }
+    }
+    while let Some(stmt) = body.get(idx) {
+        if matches!(stmt, Stmt::AnnAssign(_)) {
+            idx += 1;
+        } else {
+            break;
+        }
+    }
+    idx
+}
+
+/// Synthesise an `__init__(self, …) -> None` for a `class!` body. The
+/// function calls `super().__init__()` first, then assigns every
+/// `AnnAssign`-declared field through `self`. Fields with a default value
+/// become keyword-defaulted parameters in source order.
+fn synthesise_raw_class_init(body: &[Stmt]) -> Stmt {
+    use ruff_python_ast::{StmtAnnAssign, StmtFunctionDef};
+    // Collect (name, annotation, optional default) for each top-level
+    // annotated field. Non-Name targets (subscript / attribute annotations)
+    // are skipped — they're not fields.
+    let fields: Vec<(&Name, Expr, Option<Expr>)> = body
+        .iter()
+        .filter_map(|s| {
+            if let Stmt::AnnAssign(StmtAnnAssign {
+                target,
+                annotation,
+                value,
+                ..
+            }) = s
+            {
+                if let Expr::Name(n) = target.as_ref() {
+                    return Some((&n.id, (**annotation).clone(), value.as_deref().cloned()));
+                }
+            }
+            None
+        })
+        .collect();
+
+    // Build the parameter list: `self` + one entry per field.
+    let mut args: Vec<ParameterWithDefault> = Vec::with_capacity(fields.len() + 1);
+    args.push(ParameterWithDefault {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        parameter: Parameter {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            name: make_identifier("self"),
+            annotation: None,
+        },
+        default: None,
+    });
+    for (name, annotation, default) in &fields {
+        args.push(ParameterWithDefault {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            parameter: Parameter {
+                range: TextRange::default(),
+                node_index: AtomicNodeIndex::NONE,
+                name: make_identifier(name.as_str()),
+                annotation: Some(Box::new(annotation.clone())),
+            },
+            default: default.as_ref().map(|d| Box::new(d.clone())),
+        });
+    }
+
+    // Build the body: `super().__init__()` followed by `self.x = x` …
+    let mut new_body: Vec<Stmt> = Vec::with_capacity(fields.len() + 1);
+    new_body.push(make_super_init_call_stmt());
+    for (name, _, _) in &fields {
+        new_body.push(make_self_field_assign_stmt(name.as_str()));
+    }
+
+    Stmt::FunctionDef(StmtFunctionDef {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        is_async: false,
+        decorator_list: Vec::new(),
+        name: make_identifier("__init__"),
+        type_params: None,
+        parameters: Box::new(Parameters {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            posonlyargs: Vec::new(),
+            args,
+            vararg: None,
+            kwonlyargs: Vec::new(),
+            kwarg: None,
+        }),
+        returns: Some(Box::new(make_none_expr())),
+        body: new_body,
+    })
+}
+
+/// `super().__init__()` as an expression statement.
+fn make_super_init_call_stmt() -> Stmt {
+    use ruff_python_ast::StmtExpr;
+    // super()
+    let super_call = Expr::Call(ExprCall {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        func: Box::new(make_bare_name_expr("super")),
+        arguments: Arguments {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            args: Box::new([]),
+            keywords: Box::new([]),
+        },
+    });
+    // super().__init__
+    let super_init = Expr::Attribute(ExprAttribute {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        value: Box::new(super_call),
+        attr: make_identifier("__init__"),
+        ctx: ExprContext::Load,
+    });
+    // super().__init__()
+    let call = Expr::Call(ExprCall {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        func: Box::new(super_init),
+        arguments: Arguments {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            args: Box::new([]),
+            keywords: Box::new([]),
+        },
+    });
+    Stmt::Expr(StmtExpr {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        value: Box::new(call),
+    })
+}
+
+/// `self.<name> = <name>` as an assignment statement.
+fn make_self_field_assign_stmt(field: &str) -> Stmt {
+    let target = Expr::Attribute(ExprAttribute {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        value: Box::new(make_bare_name_expr("self")),
+        attr: make_identifier(field),
+        ctx: ExprContext::Store,
+    });
+    let value = make_bare_name_expr(field);
+    Stmt::Assign(StmtAssign {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        targets: vec![target],
+        value: Box::new(value),
+        mutability: None,
+    })
+}
+
+fn make_bare_name_expr(name: &str) -> Expr {
+    Expr::Name(ExprName {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        id: Name::new(name),
+        ctx: ExprContext::Load,
+    })
+}
+
+fn make_none_expr() -> Expr {
+    use ruff_python_ast::ExprNoneLiteral;
+    Expr::NoneLiteral(ExprNoneLiteral {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+    })
+}
+
 fn make_string_literal_expr(text: &str) -> Expr {
     let lit = StringLiteral {
         range: TextRange::default(),
@@ -1512,6 +1730,144 @@ mod tests {
             "output:\n{out}"
         );
         assert!(out.contains("import dataclasses"), "output:\n{out}");
+    }
+
+    fn raw_class_starts_for(src: &str) -> (ModModule, Vec<u32>) {
+        let parsed = tyc_syntax::parse_module(src).expect("parse failed");
+        let module = parsed.into_syntax();
+        let starts: Vec<u32> = module
+            .body
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::ClassDef(c) => Some(u32::from(c.range.start())),
+                _ => None,
+            })
+            .collect();
+        (module, starts)
+    }
+
+    #[test]
+    fn raw_class_with_fields_synthesises_init_with_super() {
+        let src = "class Net(Module):\n    layer: int\n    dropout: float\n";
+        let (module, starts) = raw_class_starts_for(src);
+        let out = desugar_module_with(
+            &module,
+            DesugarOptions {
+                memoise_functions: Vec::new(),
+                raw_class_line_starts: starts,
+            },
+        );
+        let emitted = emit(&out.module);
+        assert!(
+            emitted.contains("def __init__(self, layer: int, dropout: float) -> None:"),
+            "expected synthesised __init__ signature:\n{emitted}"
+        );
+        assert!(
+            emitted.contains("super().__init__()"),
+            "expected super() call:\n{emitted}"
+        );
+        assert!(
+            emitted.contains("self.layer = layer"),
+            "expected self.layer assignment:\n{emitted}"
+        );
+        assert!(
+            emitted.contains("self.dropout = dropout"),
+            "expected self.dropout assignment:\n{emitted}"
+        );
+        // Annotations stay above the synthesised init (canonical layout).
+        let init_pos = emitted.find("def __init__").unwrap();
+        let layer_pos = emitted.find("layer: int").unwrap();
+        assert!(
+            layer_pos < init_pos,
+            "fields should precede __init__:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn raw_class_default_value_flows_into_init_signature() {
+        let src = "class Net(Module):\n    width: int\n    height: int = 100\n";
+        let (module, starts) = raw_class_starts_for(src);
+        let out = desugar_module_with(
+            &module,
+            DesugarOptions {
+                memoise_functions: Vec::new(),
+                raw_class_line_starts: starts,
+            },
+        );
+        let emitted = emit(&out.module);
+        assert!(
+            emitted.contains("def __init__(self, width: int, height: int = 100) -> None:"),
+            "expected default value in synthesised __init__:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn raw_class_with_explicit_init_is_left_alone() {
+        let src =
+            "class Net(Module):\n    width: int\n\n    def __init__(self, width: int) -> None:\n        self.width = width * 2\n";
+        let (module, starts) = raw_class_starts_for(src);
+        let out = desugar_module_with(
+            &module,
+            DesugarOptions {
+                memoise_functions: Vec::new(),
+                raw_class_line_starts: starts,
+            },
+        );
+        let emitted = emit(&out.module);
+        // Only ONE __init__: the user's.
+        assert_eq!(
+            emitted.matches("def __init__").count(),
+            1,
+            "explicit __init__ must not be duplicated:\n{emitted}"
+        );
+        // The user's body is preserved.
+        assert!(
+            emitted.contains("self.width = width * 2"),
+            "user __init__ body must be preserved:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn raw_class_without_bases_skips_synthesis() {
+        // No bases → no super() chain to invoke; we leave the class alone.
+        let src = "class Standalone:\n    x: int\n";
+        let (module, starts) = raw_class_starts_for(src);
+        let out = desugar_module_with(
+            &module,
+            DesugarOptions {
+                memoise_functions: Vec::new(),
+                raw_class_line_starts: starts,
+            },
+        );
+        let emitted = emit(&out.module);
+        assert!(
+            !emitted.contains("def __init__"),
+            "no __init__ should be synthesised for a raw class with no bases:\n{emitted}"
+        );
+        // Also: no dataclass decorator (since `class!` was set).
+        assert!(
+            !emitted.contains("@dataclasses.dataclass"),
+            "raw class must still skip @dataclass:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn plain_class_unaffected_by_init_synthesis() {
+        // Plain `class` (not `class!`) keeps its dataclass treatment and
+        // never gets a hand-rolled __init__ injected.
+        let src = "class Plain(Base):\n    x: int\n";
+        let parsed = tyc_syntax::parse_module(src).expect("parse failed");
+        let module = parsed.into_syntax();
+        let out = desugar_module_with(&module, DesugarOptions::default());
+        let emitted = emit(&out.module);
+        assert!(
+            emitted.contains("@dataclasses.dataclass"),
+            "plain class should still receive @dataclass:\n{emitted}"
+        );
+        assert!(
+            !emitted.contains("def __init__"),
+            "plain class must NOT get a synthesised __init__:\n{emitted}"
+        );
     }
 
     #[test]

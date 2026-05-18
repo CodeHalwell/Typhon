@@ -98,9 +98,30 @@ Working example:
 import torch.nn as nn
 
 class! MyModel(nn.Module):
-    def __init__(self, n: int) -> None:
+    layer: nn.Linear
+    dropout: float
+
+    def forward(self, x):
+        return self.layer(x)
+```
+
+The desugar pass now **auto-generates `__init__`** for any `class!`
+that has at least one positional base and no hand-written `def
+__init__` in the body. The synthesised constructor calls
+`super().__init__()` and then assigns every annotated field through
+`self`, in source order. Field defaults flow into the parameter
+signature. Hand-written `__init__` blocks are preserved verbatim. So
+the example above lowers to:
+
+```python
+class MyModel(nn.Module):
+    layer: nn.Linear
+    dropout: float
+
+    def __init__(self, layer: nn.Linear, dropout: float) -> None:
         super().__init__()
-        self.layer = nn.Linear(n, n)
+        self.layer = layer
+        self.dropout = dropout
 
     def forward(self, x):
         return self.layer(x)
