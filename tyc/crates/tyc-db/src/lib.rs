@@ -104,15 +104,16 @@ impl std::ops::Deref for ArcResolvedModule {
     }
 }
 
-// SAFETY: We write the new value into `old_pointer` using `ptr::write`, which
-// is the canonical Salsa pattern for `Update` implementations.  Pointer
-// equality is used as a conservative proxy for value equality.
+// SAFETY: `old_pointer` is a valid, aligned, live pointer to an `ArcResolvedModule`
+// managed by Salsa.  The assignment `*old_pointer = new_value` drops the previous
+// Arc (decrementing its refcount) before storing the new one, which is correct.
+// Pointer equality is used as a conservative proxy for value equality.
 unsafe impl salsa::Update for ArcResolvedModule {
     unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
         if Arc::ptr_eq(&(*old_pointer).0, &new_value.0) {
             false
         } else {
-            std::ptr::write(old_pointer, new_value);
+            *old_pointer = new_value;
             true
         }
     }

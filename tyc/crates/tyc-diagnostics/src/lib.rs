@@ -676,8 +676,17 @@ impl Diagnostics {
 }
 
 fn dedup_vec(v: &mut Vec<TycError>) {
+    use miette::Diagnostic;
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    v.retain(|e| seen.insert(e.to_string()));
+    v.retain(|e| {
+        let code = e.code().map(|c| c.to_string()).unwrap_or_default();
+        let span = e
+            .labels()
+            .and_then(|mut it| it.next())
+            .map(|l| format!("{}:{}", l.inner().offset(), l.inner().len()))
+            .unwrap_or_default();
+        seen.insert(format!("{}\x00{}\x00{}", e, code, span))
+    });
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────

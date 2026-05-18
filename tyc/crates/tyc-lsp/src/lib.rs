@@ -1401,9 +1401,15 @@ mod tests {
         let db = TycDatabase::new();
         let file = SourceFile::new(&db, "broken.ty".into(), "def (broken syntax)\n".into());
         let resolved = resolved_module_arc(&db, file);
-        // Default ResolvedModule has one (empty) scope from Default.
-        // The important thing is we get a module back, not a panic or None.
-        let _ = resolved;
+        // A default ResolvedModule has empty scopes and references — not a panic or None.
+        assert!(
+            resolved.scopes.is_empty(),
+            "default module on parse failure should have no scopes"
+        );
+        assert!(
+            resolved.references.is_empty(),
+            "default module on parse failure should have no references"
+        );
     }
 
     // ── Phase 4: completion ──────────────────────────────────────────────

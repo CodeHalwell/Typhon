@@ -1588,6 +1588,11 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
         }
         Stmt::FunctionDef(f) => {
             let tps = type_param_names_from(f.type_params.as_deref());
+            let bounds = type_param_bounds_from(f.type_params.as_deref(), &c.classes.clone());
+            if !bounds.is_empty() {
+                c.function_type_bounds
+                    .insert(f.name.as_str().to_owned(), bounds);
+            }
             check_function(
                 c,
                 f.name.as_str(),
@@ -2165,19 +2170,29 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             // Resolve attribute access on known class instances and TypeVar-bounded parameters.
             match &recv {
                 Type::Class(class_name) => {
-                    // Look up the attribute in the class shape (including interfaces).
                     let class_name = class_name.clone();
-                    let shape_result = c
-                        .interfaces
-                        .get(class_name.as_str())
-                        .map(|iface| (&iface.shape.methods, &iface.shape.fields))
-                        .or_else(|| {
-                            c.class_shapes
-                                .get(class_name.as_str())
-                                .map(|s| (&s.methods, &s.fields))
-                        });
-                    if let Some((methods, fields)) = shape_result {
-                        if let Some(sig) = methods.get(attr_name) {
+                    if let Some(sig) = c.find_method(class_name.as_str(), attr_name) {
+                        let arity = sig.arity;
+                        let ret = sig.return_type.clone();
+                        return Type::Function {
+                            params: vec![Type::Unknown; arity],
+                            ret: Box::new(ret),
+                            variadic: false,
+                        };
+                    }
+                    if let Some(field_type) = c.find_field(class_name.as_str(), attr_name) {
+                        return field_type.clone();
+                    }
+                    // Not found — class may have dynamic attrs; no error.
+                    Type::Unknown
+                }
+                Type::TypeVar(tv_name) => {
+                    // TypeVar with a declared bound — look up the attribute in
+                    // the bound's class/interface hierarchy.
+                    let tv_name = tv_name.clone();
+                    let bound = c.active_typevar_bounds.get(tv_name.as_str()).cloned();
+                    if let Some(Type::Class(bound_name)) = bound {
+                        if let Some(sig) = c.find_method(bound_name.as_str(), attr_name) {
                             let arity = sig.arity;
                             let ret = sig.return_type.clone();
                             return Type::Function {
@@ -2186,54 +2201,28 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                                 variadic: false,
                             };
                         }
-                        if let Some(field_type) = fields.get(attr_name) {
+                        if let Some(field_type) = c.find_field(bound_name.as_str(), attr_name) {
                             return field_type.clone();
                         }
-                    }
-                    // Not found in shape — class may have dynamic attrs; no error.
-                    Type::Unknown
-                }
-                Type::TypeVar(tv_name) => {
-                    // TypeVar with a declared bound — look up the attribute in
-                    // the bound's interface/class shape.
-                    let tv_name = tv_name.clone();
-                    let bound = c.active_typevar_bounds.get(tv_name.as_str()).cloned();
-                    if let Some(Type::Class(bound_name)) = bound {
-                        let shape_result = c
-                            .interfaces
-                            .get(bound_name.as_str())
-                            .map(|iface| (&iface.shape.methods, &iface.shape.fields))
-                            .or_else(|| {
-                                c.class_shapes
-                                    .get(bound_name.as_str())
-                                    .map(|s| (&s.methods, &s.fields))
-                            });
-                        if let Some((methods, fields)) = shape_result {
-                            if let Some(sig) = methods.get(attr_name) {
-                                let arity = sig.arity;
-                                let ret = sig.return_type.clone();
-                                return Type::Function {
-                                    params: vec![Type::Unknown; arity],
-                                    ret: Box::new(ret),
-                                    variadic: false,
-                                };
-                            }
-                            if let Some(field_type) = fields.get(attr_name) {
-                                return field_type.clone();
-                            }
-                            // Attribute not found in the bound's shape — emit error.
-                            let span = (a.range.start().to_usize(), a.range.end().to_usize());
-                            let length = span.1.saturating_sub(span.0).max(1);
-                            if c.unsafe_depth == 0 {
-                                c.diagnostics.push_error(TycError::attribute_not_found(
-                                    attr_name,
-                                    tv_name.as_str(),
-                                    &c.path,
-                                    c.source,
-                                    span.0,
-                                    length,
-                                ));
-                            }
+                        // Attribute not found in the bound's hierarchy — emit error
+                        // labelled at the attribute name token, not the full expression.
+                        let attr_start = a.attr.range.start().to_usize();
+                        let attr_len = a
+                            .attr
+                            .range
+                            .end()
+                            .to_usize()
+                            .saturating_sub(attr_start)
+                            .max(1);
+                        if c.unsafe_depth == 0 {
+                            c.diagnostics.push_error(TycError::attribute_not_found(
+                                attr_name,
+                                bound_name.as_str(),
+                                &c.path,
+                                c.source,
+                                attr_start,
+                                attr_len,
+                            ));
                         }
                     }
                     Type::Unknown
