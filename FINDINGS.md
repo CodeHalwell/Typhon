@@ -138,6 +138,54 @@ branch.
 
 ---
 
+## Status as of `claude/fix-findings-diagnostics-hYj8K`
+
+This branch picks up the remaining open findings plus a handful of
+polish follow-ups that were flagged in commit messages on the prior
+branch but not implemented.
+
+**Closed in this branch:**
+
+- **#15** lazy-import span fidelity — `tyc::unused_import` on a
+  `lazy import ALIAS = MODULE` line now renders the original
+  Typhon source and anchors the label at the alias offset in the
+  original text. Threaded through a new `ResolveOptions.lazy_import_remaps`
+  + `original_source` pair, populated by `tyc-db`.
+- **#2 (multi-line)** `guard NAME = EXPR else:\n    BODY` form now
+  parses and lowers correctly through a new `expand_multiline_guards`
+  pre-pass.
+- **#34 (promotion)** `[strictness] methods-in-class-body = "error"`
+  (also `"off"` / `"warn"`) routes through `apply_strictness` so
+  projects can break CI on Rule-4 violations without changing the
+  type-checker's default behaviour.
+- **#13 polish** `tyc::result_error_mismatch` is now a dedicated
+  diagnostic variant emitted at the `?`-op return site when the
+  callee's `Err[E1]` doesn't match the caller's `Result[T, E2]`.
+  The generic `tyc::type_mismatch` no longer absorbs this case.
+- **#35 polish** `tyc::auto_gather_missed` advice-level diagnostic
+  is now emitted by `tyc build` when `[strictness] auto-gather = true`
+  and a run of independent adjacent awaits would have folded into a
+  TaskGroup if every callee carried `@gatherable`.
+- **#29 polish** Comptime evaluator now supports container literals
+  (`[1, 2, 3]`, `{"a": 1}`, `(1, 2)`), pure string method calls
+  (`.upper()`, `.split(",")`, etc.), and `len()` on str / list / tuple
+  / dict. End-to-end verified through `tyc build`.
+- **Rule-2 enforcement** `tyc::missing_binding_kind` now fires when
+  a bareword `name = 1` appears as the first declaration of a name
+  in a function/method scope. Synthesised `__typhon_*` temporaries
+  are exempted. The `gather:` strict lowering now emits explicit
+  `let user = ...` so its bindings flow through the same path
+  without special-casing.
+
+**Still open after this branch:**
+
+- **#18** `tyc fmt` is a no-op — Phase-5 deferral, unchanged.
+
+`cargo test --workspace --release` is green for every commit on this
+branch.
+
+---
+
 ## 1. `class Foo frozen:` is a parse error (bug)
 
 **Status:** **FIXED** on `claude/update-findings-IdfrH`. Mirrored the existing
@@ -179,7 +227,18 @@ modifier must be recognised before the colon.
 
 ## 2. `guard NAME = EXPR else: BODY` is a parse error (bug)
 
-**Status:** **FIXED (single-line)** on `claude/update-findings-IdfrH`. The
+**Status:** **FIXED** on `claude/fix-findings-diagnostics-hYj8K`.
+The single-line form landed earlier; the multi-line block-body form
+now also lowers correctly through a new `expand_multiline_guards`
+pre-pass. The pass detects `<indent>guard NAME = EXPR else:` headers
+with no body suffix, collects the strictly-deeper-indented body, and
+emits the same three-statement shape as the single-line handler
+(`let __typhon_mguard_<N> = (EXPR)`, `if __typhon_mguard_<N> is None:`,
+body, `let NAME = __typhon_mguard_<N>`). Wired into every pipeline
+call site (db check/build, repl, format) ahead of the other sugar
+transforms so the body can still contain `?`, pipes, `gather:`, etc.
+
+**Status (historic):** **FIXED (single-line)** on `claude/update-findings-IdfrH`. The
 preprocessor now expands `guard NAME = EXPR else: BODY` into three
 lines: a temp `let __typhon_guard_<line> = (EXPR)`, an `if … is None:
 BODY` guard, and the user-facing `let NAME = __typhon_guard_<line>`.
@@ -196,8 +255,6 @@ narrowing is applied to the post-`if` scope. This is what makes
 for the rest of the function body, and is also what closes the
 common idiomatic shape `if x is None: return; use_x_as_T()` for any
 caller, not just `guard` expansions.
-
-Multi-line `guard NAME = EXPR else:\n    BODY` is deferred.
 
 **Severity:** bug — documented core feature is unparseable.
 
@@ -568,7 +625,17 @@ Type-checks and emits to `asyncio.TaskGroup` correctly. The bug (Finding
 
 ## 13. `tyc::result_error_mismatch` is documented but never emitted (gap)
 
-**Status:** **FIXED** on `claude/update-findings-IdfrH`. The root cause
+**Status:** **FIXED** on `claude/fix-findings-diagnostics-hYj8K`. The
+polish follow-up from the prior branch now landed: a new
+`TycError::ResultErrorMismatch` variant carries the dedicated
+`tyc::result_error_mismatch` code, and the return-stmt type-checker
+detects the synthesised `return __typhon_q_N__` form (produced by
+`expand_question_ops`), extracts the `Err[E_callee]` and the
+enclosing `Result[T, E_caller]`'s `E`, and emits the specific
+diagnostic when those `E`s don't match. Falls back to the generic
+`tyc::type_mismatch` when the shapes don't fit the `?`-op pattern.
+
+**Status (historic):** **FIXED** on `claude/update-findings-IdfrH`. The root cause
 was that `isinstance(x, Err)` narrowing reduced `x: Result[T, E]` to
 the bare class `Class("Err")` — losing `E` — so the bare-`Result`
 accepts-bare-class assignability arm forgave the mismatch when the
@@ -578,11 +645,7 @@ preserves the generic parameter when narrowing `Result[T, E]`
 against `Ok` / `Err`, giving the post-narrowing type
 `Generic("Err", [E])`. The existing `Generic`-vs-`Generic` arm of
 `assignable` then catches the mismatch: `Result[int, int]` rejects
-`Err[str]` with the standard `tyc::type_mismatch` diagnostic. The
-diagnostic text doesn't yet read "result_error_mismatch" — it's
-surfaced via `type_mismatch` — but the safety property the
-catalog entry was promising is now enforced. A dedicated
-diagnostic code for this specific case is a polish follow-up.
+`Err[str]` with the standard `tyc::type_mismatch` diagnostic.
 
 **Severity:** gap — documented checker rule unimplemented.
 
@@ -631,15 +694,22 @@ above narrow. Today's behaviour is correct-by-design but undocumented.
 
 ## 15. `lazy import X = Y` is flagged as unused (bug)
 
-**Status:** **PARTIALLY FIXED**. The headline false-positive is resolved
-on `main` (cannot be reproduced today: `lazy import np = math` + a
-later `print(np)` checks cleanly). The remaining issue is span
-fidelity: when the lazy import really is unused, the diagnostic
-points at the preprocessor's rewritten line (`import math as np`)
-rather than the user's original (`lazy import np = math`). Remapping
-diagnostic spans back through the lazy-import rewrite requires
-threading a translation table from `preprocess` through `tyc-db`'s
-diagnostic emitters — meaningful enough to ship separately.
+**Status:** **FIXED** on `claude/fix-findings-diagnostics-hYj8K`. Span
+fidelity now matches the user-written form: `ResolveOptions` carries
+a `lazy_import_remaps: Vec<LazyImportRemap>` and the original Typhon
+source, populated by `tyc-db` from `PreprocessResult::lazy_imports`.
+When `report_unused_imports` is about to fire on an import binding,
+the resolver checks whether the binding's preprocessed line index
+matches a `lazy_import` line; if so, it swaps in the original
+source and anchors the span at the alias offset in the original.
+The diagnostic now reads `lazy import np = math` and points at `np`
+instead of showing the preprocessor's `import math as np` rewrite.
+
+**Status (historic):** **PARTIALLY FIXED** on `claude/update-findings-IdfrH`.
+The headline false-positive was resolved on `main` (cannot be
+reproduced today: `lazy import np = math` + a later `print(np)`
+checks cleanly). The remaining issue was span fidelity, addressed
+in the current branch.
 
 **Severity:** bug — documented form falsely reported as unused.
 
@@ -1087,13 +1157,26 @@ document loudly that `tyc build --check` is the real CI gate.
 
 ## 29. Comptime evaluator supports far less than documented (gap, big)
 
-**Status:** **FIXED (docs)** on `claude/update-findings-IdfrH`. Rewrote
-the SKILL.md comptime section to reflect what `tyc-analyse` actually
-supports (literal types + arithmetic + comparisons + `env` / `int` /
-`str` / `float`), and flagged container literals, string method calls,
-and user-defined `comptime def` evaluation as roadmapped-but-not-yet
-work. The evaluator itself wasn't expanded here — that's a meatier
-follow-up; the docs are now honest about the gap.
+**Status:** **FIXED** on `claude/fix-findings-diagnostics-hYj8K`. The
+evaluator now supports the roadmapped surface that the docs had
+to retract on the prior branch:
+- container literals (`[1, 2, 3]`, `{"a": 1}`, `(1, 2)`, including
+  empty containers and single-element tuples with the right trailing
+  comma in the emitted Python),
+- pure string method calls (`upper`, `lower`, `strip`, `lstrip`,
+  `rstrip`, `replace`, `startswith`, `endswith`, `split`),
+- `len()` on str / list / tuple / dict,
+- chained method calls (`"  hi  ".strip().upper()`).
+
+Unsupported methods produce a clear "not supported" diagnostic that
+lists what IS supported instead of the generic "not comptime-evaluable"
+message. End-to-end verified through `tyc build` — container literals
+substitute as inlined Python literals (`TAGS: list[int] = [1, 2, 3]`),
+and the emitted module runs unmodified.
+
+**Status (historic):** **FIXED (docs)** on `claude/update-findings-IdfrH`. The
+docs were tightened on the previous branch to match the evaluator's
+narrow scope; the current branch expanded the evaluator instead.
 
 **Severity:** gap — docs over-promise; implementation does the minimum.
 
@@ -1262,16 +1345,23 @@ generic type mismatch.
 
 ## 34. `class Foo:` body method definitions silently bypass the impl-only rule (gap)
 
-**Status:** **PARTIALLY FIXED** on `claude/update-findings-IdfrH`. #17's
+**Status:** **FIXED** on `claude/fix-findings-diagnostics-hYj8K`. The
+`[strictness] methods-in-class-body` config option now reroutes the
+diagnostic in `apply_strictness`:
+- `"warn"` (default) keeps the previous behaviour.
+- `"error"` promotes the diagnostic so CI breaks on the form.
+- `"off"` suppresses it entirely (useful for codebases mid-migration).
+
+The type-checker still emits a single warning unconditionally; the
+per-project policy decides how to render it. Promoting to error
+unconditionally would have broken downstream users who rely on the
+class-body form, so the toggle is the right escape hatch.
+
+**Status (historic):** **PARTIALLY FIXED** on `claude/update-findings-IdfrH`. #17's
 new `tyc::method_in_class_body` warning now flags every method
 definition inside a non-pseudo, non-interface, non-Pydantic class
-body. The diagnostic is a *warning* rather than an error so existing
-tests and downstream user code keep compiling; promoting to error
-under a `[strictness] methods-in-class-body = "error"` config option
-(or just unconditionally) is a separate decision the FINDINGS doc
-called out. Interface conformance now works equally well for class-body
-methods and `impl`-block methods (#26), so the two forms no longer
-pull in opposite directions.
+body. The diagnostic was a *warning* rather than an error; the
+promotion config landed in the current branch.
 
 **Severity:** gap — Rule 4 not enforced.
 
@@ -1304,12 +1394,19 @@ Right now we have the worst of both.
 
 ## 35. Doc-spec'd `auto-gather` requires undocumented `@gatherable` decorator (doc)
 
-**Status:** **FIXED (docs)** on `claude/update-findings-IdfrH`. The
-SKILL.md "Automatic `gather`" section now includes a worked example
-showing `@gatherable` on each callee, and explicitly notes that
-forgetting the decorator silently disables auto-gather (no diagnostic
-fires). Adding a `tyc::auto_gather_missed` info-level diagnostic is
-left as a separate follow-up.
+**Status:** **FIXED** on `claude/fix-findings-diagnostics-hYj8K`. The
+follow-up `tyc::auto_gather_missed` advice-level diagnostic now fires
+from `tyc build` when `[strictness] auto-gather = true` and a run of
+2+ adjacent independent `name = await CALLEE(args)` statements would
+have been folded into a `TaskGroup` if every callee carried
+`@gatherable`. Local async callees are eligible; imported async
+callees are ignored (the user can't decorate them anyway). Printed
+through miette so the rendered output shows the [Advice] severity
+badge; doesn't block builds.
+
+**Status (historic):** **FIXED (docs)** on `claude/update-findings-IdfrH`. The
+docs were updated to call out the gate; the diagnostic itself
+landed in the current branch.
 
 **Severity:** doc — opt-in works but the decorator's *existence* is
 the gate, and it's barely described.
