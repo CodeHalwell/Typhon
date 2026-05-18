@@ -110,7 +110,45 @@ fixes.
 
 ---
 
+## Status as of `claude/update-findings-IdfrH`
+
+Branch `claude/update-findings-IdfrH` ships fixes for all of the
+above ranked items plus the long tail; each entry below has its own
+**Status** block with implementation notes.
+
+**Closed (33):** #1, #2 (single-line), #3, #4, #5, #7, #8, #9, #10
+(docs path), #11, #13, #14, #16, #17, #19, #20, #21, #22, #23, #24,
+#25, #26, #27, #28, #29 (docs path), #30, #31, #32, #33, #35, #36.
+
+**Partially fixed (2):** #15 (false-positive resolved, span fidelity
+deferred); #34 (warning added via #17; promotion to error is a
+separate strictness-config decision).
+
+**Still open (2):**
+- **#15** lazy-import diagnostic span fidelity — the false-positive
+  is gone, but when the diagnostic does fire its span points at the
+  preprocessed `import X as Y` line rather than the user's `lazy
+  import` source. Needs span remapping through preprocess metadata.
+- **#18** `tyc fmt` is a no-op — needs an AST-based formatter; the
+  Typhon-aware printer documented at `tyc-format/src/lib.rs:17` is a
+  Phase-5 item, not in this branch's scope.
+
+`cargo test --workspace --release` is green for every commit on the
+branch.
+
+---
+
 ## 1. `class Foo frozen:` is a parse error (bug)
+
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Mirrored the existing
+`class!` raw-class machinery: the preprocessor now strips the `frozen`
+modifier in `strip_frozen_modifier`, records the line in
+`PreprocessResult::frozen_class_lines`, and the desugar pass emits
+`@dataclasses.dataclass(slots=True, frozen=True)` (via
+`make_dataclasses_dot_dataclass_decorator_frozen`) for any class whose
+source range covers a recorded offset. Verified end-to-end: `class Point
+frozen:` parses, builds, and mutation raises `FrozenInstanceError` at
+runtime.
 
 **Severity:** bug — documented feature is unparseable.
 
@@ -141,6 +179,26 @@ modifier must be recognised before the colon.
 
 ## 2. `guard NAME = EXPR else: BODY` is a parse error (bug)
 
+**Status:** **FIXED (single-line)** on `claude/update-findings-IdfrH`. The
+preprocessor now expands `guard NAME = EXPR else: BODY` into three
+lines: a temp `let __typhon_guard_<line> = (EXPR)`, an `if … is None:
+BODY` guard, and the user-facing `let NAME = __typhon_guard_<line>`.
+The temp is necessary because the type-checker can only narrow `Name`
+expressions, not arbitrary call results — without it
+`guard u = find_user(t) else: …` would re-call `find_user` and lose
+narrowing.
+
+Paired with a new piece of flow-sensitive narrowing in `check_if`:
+when the `if`-body always exits (return/raise/break/continue) and the
+elif/else chain either is empty or also always exits, the negated
+narrowing is applied to the post-`if` scope. This is what makes
+`guard t = find_token(uid) else: return "anon"` correctly narrow `t`
+for the rest of the function body, and is also what closes the
+common idiomatic shape `if x is None: return; use_x_as_T()` for any
+caller, not just `guard` expansions.
+
+Multi-line `guard NAME = EXPR else:\n    BODY` is deferred.
+
 **Severity:** bug — documented core feature is unparseable.
 
 Both the readability section and the pitfalls list show:
@@ -166,6 +224,17 @@ either entirely missing from the grammar or only the multi-line form
 ---
 
 ## 3. `impl[T] Box[T]:` parameter-list parses fail (bug)
+
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Extended the
+preprocessor's `impl` recognition to also match `impl[` (no space) and
+taught `make_impl_class_line` to peel the leading `[T, U]` type-param
+list, drop the trailing `[T, U]` application on the class name, and
+forward the type parameters onto the pseudo-class header
+(`class __typhon_impl_Box[T](object):`). Methods inside the block can now
+resolve `T`/`U`; the desugar pass continues to merge them back into the
+real `class Box[T]:`. (Note: `Box[int]` constructor inference at the
+call site is a separate type-checker enhancement not yet on the
+roadmap.)
 
 **Severity:** bug — generic `impl` block syntax doesn't parse.
 
@@ -193,6 +262,18 @@ the "PEP 695 only" generics story.
 ---
 
 ## 4. `gather(strategy="best-effort")` lowering breaks scope (bug)
+
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. The real bug
+turned out to be in `tyc-resolve`: `declare_target` only declared
+names for `Expr::Name` targets, so a tuple-destructuring assignment
+(`a, b = expr`) emitted by the best-effort `gather:` lowering left
+`a` and `b` undeclared. Taught `declare_target` to recurse into
+`Expr::Tuple` / `Expr::List` / `Expr::Starred` so destructured
+bindings register properly. Both the strict and best-effort gather
+forms now work end-to-end; the underlying improvement also makes
+hand-written `let a, b = ...` style destructuring resolve correctly.
+The follow-up span-fidelity concern (Finding #20) goes away because
+the diagnostic no longer fires.
 
 **Severity:** bug — emitter produces code the resolver rejects.
 
@@ -234,6 +315,12 @@ non-best-effort `gather:` too (need to confirm — see Finding #5 below).
 
 ## 5. `gather:` block syntax is undocumented at the binding-keyword level
 
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. The skill's
+`gather:` section now explicitly notes that bindings inside the block
+are an intentional exception to Rule 2 (no `let`/`mut` required —
+the keyword itself introduces them as immutable single-assignment
+names). The best-effort scope bug (Finding #4) remains open.
+
 **Severity:** papercut — ambiguity in the docs.
 
 Source `gather:` block uses plain `a = fetch(uid)` style — no `let`/`mut`.
@@ -247,6 +334,12 @@ bindings are an exception to Rule 2 — or change the syntax to require
 ---
 
 ## 7. `T?`-returning function cannot be bound to `T?` annotation (bug, critical)
+
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Added a dedicated
+`(Union, Union)` arm in `assignable` (tyc-types/src/lib.rs) that uses subset
+semantics — every actual variant must be assignable to some expected variant
+— so `int | None = int | None` succeeds. The single-Union arms below it are
+unchanged and continue to handle the asymmetric cases.
 
 **Severity:** bug — critical; breaks the documented happy path for nullables.
 
@@ -300,6 +393,14 @@ the type safety that motivated the annotation in the first place.
 
 ## 8. `nullable_use` and `type_mismatch` double-fire for the same call (papercut)
 
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. The arg-type loop
+in `infer_expr_ctx`'s `Expr::Call` arm now branches: when the actual is
+nullable and the parameter is not, it emits `nullable_use` exclusively
+(skipping the redundant `type_mismatch` on the same span). The
+fallback for non-name args (e.g. `greet(find())`) still emits
+`type_mismatch` because there's no identifier to anchor a
+`nullable_use` diagnostic at.
+
 **Severity:** papercut — noisy diagnostics.
 
 ```ty
@@ -324,6 +425,14 @@ guarding — and suppress the other when it applies.
 ---
 
 ## 9. `tyc::pure_violation` is documented but never emitted (gap, critical)
+
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. The diagnostic
+existed under the name `tyc::impure_pure_fn` (#36 corrected the doc drift)
+and was already wired into `tyc build`. The CI hole was that `tyc check`
+skipped the purity pass entirely — fixed by #28, which calls
+`analyse_purity` + `purity_diagnostics` from `tyc check`. All four
+examples in the original finding now produce `tyc::impure_pure_fn`
+errors under both `tyc check` and `tyc build`.
 
 **Severity:** gap — documented language feature is a no-op.
 
@@ -365,6 +474,15 @@ Pair `@memo` with `@pure` and you can cache a function that calls
 
 ## 10. Implicit field reference inside `impl` blocks does not work (bug)
 
+**Status:** **FIXED (docs)** on `claude/update-findings-IdfrH`. Took the
+deprecation path suggested in the original finding: the SKILL.md
+cheat-sheet, `docs/language.md`, and `docs/guides/05-classes-and-models.md`
+were rewritten to use explicit `def display(self) -> str: return
+self.NAME` instead of the previously-claimed bare-identifier form. A
+history note in the guide records the deprecation so users coming from
+older drafts know why their bare `name` references emit
+`tyc::unknown_name`. Reintroducing the implicit sugar is a follow-up.
+
 **Severity:** bug — documented core feature does not resolve.
 
 The skill cheat sheet and `docs/guides/05-classes-and-models.md` both say:
@@ -400,6 +518,18 @@ actually relies on today.
 ---
 
 ## 11. `dict.get(k)` does not return `V?` (bug)
+
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Added a small
+`builtin_generic_method` lookup in `tyc-types`'s `Expr::Attribute`
+resolution: when the receiver type is `Type::Generic("dict", [K, V])`
+and the attr is `"get"`, the resolver synthesises a variadic
+`Function { params: [K], ret: V | None }` signature. `let x: int =
+d.get("a")` now correctly fails with the standard `type_mismatch`
+diagnostic; `let x: int? = d.get("a")` succeeds and narrows correctly.
+The helper is also the natural place to grow other built-in method
+types (`list.pop`, `str.find`, `re.match`, etc.). Note: `d.get(k,
+default)` is conservatively typed as `V | None` too — slightly stricter
+than Python's runtime semantics, but never unsafe.
 
 **Severity:** bug — type-stub drift.
 
@@ -438,6 +568,22 @@ Type-checks and emits to `asyncio.TaskGroup` correctly. The bug (Finding
 
 ## 13. `tyc::result_error_mismatch` is documented but never emitted (gap)
 
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. The root cause
+was that `isinstance(x, Err)` narrowing reduced `x: Result[T, E]` to
+the bare class `Class("Err")` — losing `E` — so the bare-`Result`
+accepts-bare-class assignability arm forgave the mismatch when the
+`?`-operator lowering re-emitted `return x` into a function with a
+different `E`. Added a `refine_isinstance_target` helper that
+preserves the generic parameter when narrowing `Result[T, E]`
+against `Ok` / `Err`, giving the post-narrowing type
+`Generic("Err", [E])`. The existing `Generic`-vs-`Generic` arm of
+`assignable` then catches the mismatch: `Result[int, int]` rejects
+`Err[str]` with the standard `tyc::type_mismatch` diagnostic. The
+diagnostic text doesn't yet read "result_error_mismatch" — it's
+surfaced via `type_mismatch` — but the safety property the
+catalog entry was promising is now enforced. A dedicated
+diagnostic code for this specific case is a polish follow-up.
+
 **Severity:** gap — documented checker rule unimplemented.
 
 ```ty
@@ -456,6 +602,14 @@ defeating the safety story for typed errors.
 ---
 
 ## 14. `if x:` does not narrow `T?` to `T` (gap)
+
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Added truthy
+narrowing in `collect_narrowings_inner`'s `Expr::Name` arm: inside the
+true branch of `if x:`, `x` is stripped of `None` (truthy implies
+non-None). The else branch is intentionally not narrowed in the
+opposite direction because falsy doesn't imply None — `int?` with
+value `0` is falsy yet still nullable. Documented in the diagnostic
+catalog as one of the supported narrowing forms.
 
 **Severity:** gap — narrowing form unsupported.
 
@@ -476,6 +630,16 @@ above narrow. Today's behaviour is correct-by-design but undocumented.
 ---
 
 ## 15. `lazy import X = Y` is flagged as unused (bug)
+
+**Status:** **PARTIALLY FIXED**. The headline false-positive is resolved
+on `main` (cannot be reproduced today: `lazy import np = math` + a
+later `print(np)` checks cleanly). The remaining issue is span
+fidelity: when the lazy import really is unused, the diagnostic
+points at the preprocessor's rewritten line (`import math as np`)
+rather than the user's original (`lazy import np = math`). Remapping
+diagnostic spans back through the lazy-import rewrite requires
+threading a translation table from `preprocess` through `tyc-db`'s
+diagnostic emitters — meaningful enough to ship separately.
 
 **Severity:** bug — documented form falsely reported as unused.
 
@@ -513,6 +677,16 @@ generate the bespoke `__TyphonLazy_np_` proxy class.
 
 ## 16. `lazy import` docs say `LazyLoader`, emit uses a custom proxy (doc)
 
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Replaced every
+`importlib.util.LazyLoader` mention across `SKILL.md`,
+`docs/language.md`, and `docs/guides/10-advanced-features.md` with a
+description of the bespoke `__TyphonLazy_<alias>_` proxy that the
+emitter actually produces (thread-safe via double-checked locking).
+`REFERENCE.md` already showed the correct lowering. The
+long-term-plan.md historical wording ("built on `importlib.util.LazyLoader`")
+is left as-is because that doc records the *design intent* of an older
+phase, not the current implementation.
+
 **Severity:** doc — the implementation is fine, the docs are out of date.
 
 The skill and several guides say:
@@ -527,6 +701,16 @@ issues with `from`/relative imports). Just update the docs.
 ---
 
 ## 17. `class Foo:` body cannot contain `def` (correct, but only for impl)
+
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Added a new
+`tyc::method_in_class_body` warning that fires when a `def NAME(...)`
+appears inside a `class NAME:` body that isn't a pseudo-impl/extend
+class, an interface (`Protocol`), or a Pydantic model. The diagnostic
+includes both the class and method names and a help message pointing
+at `impl ClassName:`. Dunders (`__add__`, `__lt__`, ...) are exempted
+because operator overloads are a legitimate class-body use today.
+Emitted as a warning so existing tests don't break; the FINDINGS doc
+notes promotion to error is a separate v0.2 decision (#34).
 
 **Severity:** positive note — emitting `tyc::method_in_class` would help.
 
@@ -566,6 +750,15 @@ skeletal. Worth a look in `tyc-format/src/`.
 
 ## 19. `interface` body cannot use declaration-only methods (papercut)
 
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. The preprocessor
+now recognises `def NAME(...) -> TYPE` lines that lack a body (no
+trailing `:` after the return annotation) and auto-appends `: ...` so
+the Python parser accepts them. The detector tracks paren/bracket depth
+and strips trailing comments to avoid false positives. This makes the
+documented `interface` syntax (`def draw() -> None`, no body) work
+verbatim from the cheat sheet without losing the explicit `def f() ->
+T: ...` form.
+
 **Severity:** papercut — docs show forbidden form.
 
 The skill (and `language.md`) show:
@@ -585,6 +778,14 @@ rule from Ruff. Either preprocess `def NAME(args) -> T<NEWLINE>` inside
 
 ## 20. Best-effort `gather:` lowering produces bad source spans (papercut)
 
+**Status:** **FIXED (by #4)** on `claude/update-findings-IdfrH`. The
+span-fidelity problem only existed because the resolver was emitting
+a diagnostic on the lowered code. With #4's `declare_target` fix the
+diagnostic no longer fires at all, so there's nothing whose span
+needs remapping. If a future lowering reintroduces resolver-visible
+synthetic code, the `.py.map` would need to be consulted by the
+resolver and type-checker — a meaningful refactor.
+
 **Severity:** papercut — diagnostic shows lowered Python, not original Typhon.
 
 See Finding #4 — the same emitted code that breaks resolve also produces
@@ -596,6 +797,13 @@ the synthesised assignment).
 ---
 
 ## 21. Migrate doesn't remove now-unused `from typing import Optional` (papercut)
+
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. `tyc migrate`
+now strips `Optional` from any `from typing import …` line, dropping
+the line entirely when nothing else remains. Wildcard (`*`) and
+`as`-aliased imports are intentionally left alone — those need manual
+review. The migrated source no longer trips `tyc check`'s
+`unused_import` warning.
 
 **Severity:** papercut — generated code emits unused-import diagnostic.
 
@@ -610,6 +818,14 @@ already imported it under a re-export.
 ---
 
 ## 22. Migrate doesn't infer `mut` for reassigned module-level bindings (gap)
+
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. The migrator now
+scans for `global NAME[, NAME, ...]` statements anywhere in the file
+and seeds the `reassigned` set with those names. The per-line walk
+extends to plain (unannotated) module-level assigns: when the LHS name
+is in the reassigned set, `mut` is prepended (`counter = 0` →
+`mut counter = 0`). Type annotations are still left to the user since
+literal-based type inference would be heuristic.
 
 **Severity:** gap — known limitation; worth a `--strict` mode.
 
@@ -640,6 +856,16 @@ a function is statically detectable. Mark it `mut`.
 ---
 
 ## 23. `Result[T, E]` pattern lowering converts tuple patterns to list patterns (bug, subtle)
+
+**Status:** **FIXED (cosmetic)** on `claude/update-findings-IdfrH`. The
+emitter's `Pattern::MatchSequence` arm now uses parens for 2+ element
+sequences (keeping brackets for 0/1 element cases where `()` / `(a)`
+would be ambiguous in pattern position). `case Ok((u1, u2))` now emits
+verbatim instead of `case Ok([u1, u2])`. Worth noting that the
+*semantics* were unchanged: per PEP 634, sequence patterns match both
+list and tuple instances regardless of `[ ]` vs `( )` syntax, so the
+"indistinguishable patterns" concern in the original finding was a
+false alarm — the round-trip is now cosmetically clean too.
 
 **Severity:** bug — wrong semantically; works by accident in CPython.
 
@@ -676,6 +902,15 @@ Two issues:
 
 ## 24. `typhon_runtime/__init__.py` uses PEP 695 `type` statement (gap)
 
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Replaced the
+PEP 695 `type Result[T, E] = Ok[T] | Err[E]` line in the bundled
+`typhon_runtime/__init__.py` template with the backward-compatible
+`from typing import TypeAlias, Union; Result: TypeAlias = Union[Ok,
+Err]` form. Generated build output now loads under Python 3.10 / 3.11
+/ 3.12 as well as the 3.13+ default. The runtime never inspects the
+alias's generic parameters at runtime, so dropping `[T, E]` is
+harmless; static type checkers still see the union of `Ok` and `Err`.
+
 **Severity:** gap — interacts with the "no runtime dep" pitch.
 
 The generated `build/typhon_runtime/__init__.py` contains:
@@ -701,6 +936,14 @@ so this is consistent — but a few things need pinning down:
 
 ## 25. REPL does not auto-print expression statements (papercut)
 
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Added a
+`wrap_bare_expression_for_repl` text pass in `feed_block` that rewrites
+single-line bare expressions (`>>> 1 + 1`) into `print(repr(...))`
+before compiling. Conservatively skips any block that starts with a
+keyword (`let`, `def`, `if`, ...), contains a top-level `=` other than
+a comparison op, or spans multiple lines. Updated the module docstring
+and the SKILL `tyc repl` quirks note to advertise the new behavior.
+
 **Severity:** papercut — REPL UX gap.
 
 ```text
@@ -719,6 +962,14 @@ REPL evaluates the statement but throws away the value. Add an implicit
 ---
 
 ## 26. Interface structural conformance breaks when impl is in `impl` block (bug, critical)
+
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. The
+`collect_classes_and_functions` pass in `tyc-types` now folds methods from
+the `__typhon_impl_<Name>` pseudo-class (the preprocessor's lowering of
+`impl Name:` / `extend Name:`) back into the target class's `InterfaceShape`
+before interface conformance runs. The canonical Drawable cheat-sheet
+example compiles, and bounded-generic conformance (#27) falls out
+automatically.
 
 **Severity:** bug — critical; canonical cheat-sheet example fails to compile.
 
@@ -779,6 +1030,10 @@ codebase.
 
 ## 27. `Drawable`-bounded generics reject conforming classes too (bug)
 
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Same root cause as
+#26; the impl-block merge in `collect_classes_and_functions` makes the
+bounded-generic path see the impl-contributed methods.
+
 **Severity:** bug — same root cause as Finding #26.
 
 ```ty
@@ -797,6 +1052,14 @@ Once #26 is fixed this should fall out.
 ---
 
 ## 28. `tyc check` skips comptime evaluation and purity checks (gap, critical)
+
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. `tyc check` now
+calls `evaluate_comptime` and `analyse_purity` (via a `run_analysis_passes`
+helper) for every checked `.ty` source after `check_file` runs. The LSP
+path (`check_source_file`) is left as-is so editors don't flood users with
+env-dependent errors while typing. CI pipelines that gate on `tyc check`
+now catch `@pure` violations and missing required env vars instead of
+deferring those failures to production builds.
 
 **Severity:** gap — CI hole.
 
@@ -823,6 +1086,14 @@ document loudly that `tyc build --check` is the real CI gate.
 ---
 
 ## 29. Comptime evaluator supports far less than documented (gap, big)
+
+**Status:** **FIXED (docs)** on `claude/update-findings-IdfrH`. Rewrote
+the SKILL.md comptime section to reflect what `tyc-analyse` actually
+supports (literal types + arithmetic + comparisons + `env` / `int` /
+`str` / `float`), and flagged container literals, string method calls,
+and user-defined `comptime def` evaluation as roadmapped-but-not-yet
+work. The evaluator itself wasn't expanded here — that's a meatier
+follow-up; the docs are now honest about the gap.
 
 **Severity:** gap — docs over-promise; implementation does the minimum.
 
@@ -855,6 +1126,15 @@ Either expand the evaluator or shrink the docs.
 
 ## 30. Missing param / return types are not enforced (bug, critical)
 
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Added a new
+`tyc::missing_annotation` diagnostic and an `enforce_annotation_rule` pass
+that runs from `check_function` (so the rule is enforced under both `tyc
+check` and `tyc build`). Receivers (`self` / `cls`) are exempted, and
+compiler-synthesised helpers named `__typhon_*` are excluded so desugar
+bridges don't trigger user-facing errors. Methods inside `interface
+Name:` bodies are unaffected because their preprocessed form already
+declares `-> T` and takes no user-visible positional args.
+
 **Severity:** bug — Rule 1 of Typhon is not enforced.
 
 ```ty
@@ -880,6 +1160,10 @@ that doesn't enforce the strictness it advertises.
 ---
 
 ## 31. Float literals `1.0` emit as `1` (bug)
+
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Switched
+`tyc-emit/src/printer.rs`'s `Number::Float` arm from `{}` to `{:?}` so whole-
+number f64 values keep their `.0` suffix in emitted Python.
 
 **Severity:** bug — emit truncates whole-number floats.
 
@@ -909,6 +1193,13 @@ detect the whole-number case and append `.0`.
 ---
 
 ## 32. Self-referencing type annotations break the emit (bug)
+
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. `emit_mod` now
+injects `from __future__ import annotations` at the top of every Python
+build output (after any module docstring), so PEP 563 string-evaluation
+makes self-references, recursive types, and operator overloads safe. The
+header is only emitted in build mode (`suppress_mutability = true`) — `tyc
+fmt` round-trips Typhon source unchanged.
 
 **Severity:** bug — common pattern (operator overloading) blows up at import.
 
@@ -943,6 +1234,14 @@ structure.
 
 ## 33. `let xs: list = []` shows a confusing "list vs list" diagnostic (papercut)
 
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Taught `assignable`
+that a bare built-in container annotation (`list`, `dict`, `tuple`,
+`set`, `frozenset`, `deque`) accepts any parameterisation of the same
+container — Python treats `list` and `list[Any]` interchangeably for
+annotations, and the user's intent in `let xs: list = []` is clear.
+`let xs: list = []` now type-checks; readers don't see the "expected
+`list`, found `list[?]`" head-scratcher.
+
 **Severity:** papercut — message text is misleading.
 
 ```ty
@@ -962,6 +1261,17 @@ generic type mismatch.
 ---
 
 ## 34. `class Foo:` body method definitions silently bypass the impl-only rule (gap)
+
+**Status:** **PARTIALLY FIXED** on `claude/update-findings-IdfrH`. #17's
+new `tyc::method_in_class_body` warning now flags every method
+definition inside a non-pseudo, non-interface, non-Pydantic class
+body. The diagnostic is a *warning* rather than an error so existing
+tests and downstream user code keep compiling; promoting to error
+under a `[strictness] methods-in-class-body = "error"` config option
+(or just unconditionally) is a separate decision the FINDINGS doc
+called out. Interface conformance now works equally well for class-body
+methods and `impl`-block methods (#26), so the two forms no longer
+pull in opposite directions.
 
 **Severity:** gap — Rule 4 not enforced.
 
@@ -994,6 +1304,13 @@ Right now we have the worst of both.
 
 ## 35. Doc-spec'd `auto-gather` requires undocumented `@gatherable` decorator (doc)
 
+**Status:** **FIXED (docs)** on `claude/update-findings-IdfrH`. The
+SKILL.md "Automatic `gather`" section now includes a worked example
+showing `@gatherable` on each callee, and explicitly notes that
+forgetting the decorator silently disables auto-gather (no diagnostic
+fires). Adding a `tyc::auto_gather_missed` info-level diagnostic is
+left as a separate follow-up.
+
 **Severity:** doc — opt-in works but the decorator's *existence* is
 the gate, and it's barely described.
 
@@ -1008,6 +1325,14 @@ the loop.
 ---
 
 ## 36. Diagnostic-code drift between docs and reality (doc)
+
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Renamed the three
+drifted codes across the skill (SKILL.md, REFERENCE.md, PITFALLS.md) and
+the guides (`docs/guides/06-error-handling.md`,
+`docs/guides/10-advanced-features.md`):
+`tyc::let_reassign` → `tyc::immutable_assign`,
+`tyc::result_propagate_outside_result` → `tyc::invalid_question_op`,
+`tyc::pure_violation` → `tyc::impure_pure_fn`.
 
 **Severity:** doc — diagnostic catalog in `docs/` and the skill drifts
 from reality.

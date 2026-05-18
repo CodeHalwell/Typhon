@@ -762,6 +762,17 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt]) {
     }
 }
 
+/// True when this assignment-target expression introduces one or more
+/// names into scope (Name, Tuple-of-targets, List-of-targets, or a
+/// Starred wrapper around one of those). Attribute / subscript targets
+/// are *not* declarations — they're mutations of an existing object.
+fn assignment_target_declares_names(t: &Expr) -> bool {
+    matches!(
+        t,
+        Expr::Name(_) | Expr::Tuple(_) | Expr::List(_) | Expr::Starred(_)
+    )
+}
+
 fn declare_target(
     r: &mut Resolver,
     scope: ScopeId,
@@ -769,28 +780,49 @@ fn declare_target(
     default_val: bool,
     ast_mutability: Option<ast::Mutability>,
 ) {
-    if let Expr::Name(n) = target {
-        // When no explicit `let`/`mut` keyword is present in the AST,
-        // treat a bare assignment as a rebinding of any existing binding
-        // (taking its mutability) rather than a fresh declaration. Only
-        // the *first* bareword assignment in a module scope defaults to
-        // `let`; later bare assignments inherit the existing binding's
-        // mutability.
-        let existing_mut = r.lookup_local(scope, n.id.as_str()).map(|b| b.mutability);
-        let mutability = match ast_mutability {
-            Some(ast::Mutability::Let) => Mutability::Let,
-            Some(ast::Mutability::Mut) => Mutability::Mut,
-            None => existing_mut.unwrap_or(if default_val {
-                Mutability::Let
-            } else {
-                Mutability::Mut
-            }),
-        };
-        let span = (
-            n.range.start().to_usize(),
-            n.range.start().to_usize() + n.id.as_str().len(),
-        );
-        r.declare(scope, n.id.as_str(), BindingKind::Value, mutability, span);
+    match target {
+        Expr::Name(n) => {
+            // When no explicit `let`/`mut` keyword is present in the AST,
+            // treat a bare assignment as a rebinding of any existing binding
+            // (taking its mutability) rather than a fresh declaration. Only
+            // the *first* bareword assignment in a module scope defaults to
+            // `let`; later bare assignments inherit the existing binding's
+            // mutability.
+            let existing_mut = r.lookup_local(scope, n.id.as_str()).map(|b| b.mutability);
+            let mutability = match ast_mutability {
+                Some(ast::Mutability::Let) => Mutability::Let,
+                Some(ast::Mutability::Mut) => Mutability::Mut,
+                None => existing_mut.unwrap_or(if default_val {
+                    Mutability::Let
+                } else {
+                    Mutability::Mut
+                }),
+            };
+            let span = (
+                n.range.start().to_usize(),
+                n.range.start().to_usize() + n.id.as_str().len(),
+            );
+            r.declare(scope, n.id.as_str(), BindingKind::Value, mutability, span);
+        }
+        // Tuple destructuring (`a, b = expr`, `(a, b) = expr`) and list
+        // destructuring (`[a, b] = expr`) recurse into each element. Used
+        // by the best-effort `gather:` lowering, which produces a
+        // `a, b = __typhon_gather_N__` assignment that previously left
+        // `a` and `b` undeclared (FINDINGS #4).
+        Expr::Tuple(t) => {
+            for elt in &t.elts {
+                declare_target(r, scope, elt, default_val, ast_mutability);
+            }
+        }
+        Expr::List(l) => {
+            for elt in &l.elts {
+                declare_target(r, scope, elt, default_val, ast_mutability);
+            }
+        }
+        Expr::Starred(s) => {
+            declare_target(r, scope, &s.value, default_val, ast_mutability);
+        }
+        _ => {}
     }
 }
 
@@ -874,7 +906,11 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             walk_expr(r, scope, &a.value);
             let default_val = r.scopes[scope].kind == ScopeKind::Module;
             for t in &a.targets {
-                if let Expr::Name(_) = t {
+                // Names / Tuples / Lists / Starred are destructuring
+                // targets handled by `declare_target`. Anything else
+                // (e.g. `obj.attr = …`, `xs[0] = …`) is a reference, not
+                // a binding declaration, so walk it for name resolution.
+                if assignment_target_declares_names(t) {
                     declare_target(r, scope, t, default_val, a.mutability);
                 } else {
                     walk_expr(r, scope, t);

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use clap::Args;
 use miette::{miette, Result};
 
+use tyc_analyse::{analyse_purity, evaluate_comptime, purity_diagnostics};
 use tyc_db::{check_file, TycDatabase};
 use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_emit::{compare_modules, StubTestKind};
@@ -78,8 +79,17 @@ pub fn run(args: CheckArgs) -> Result<()> {
                 }
             };
 
-            let file_diags = check_file(&mut db, path.display().to_string(), source);
+            let file_diags = check_file(&mut db, path.display().to_string(), source.clone());
             diags.extend(file_diags);
+
+            // Run comptime + purity analysis to match what `tyc build` would
+            // reject. Without this pass, CI pipelines running only `tyc check`
+            // would silently accept `@pure` violations and unsatisfied
+            // required env vars that production builds catch. The work
+            // duplicates `tyc build`'s phase 2/3 setup; salsa caches the
+            // preprocess so it's cheap on warm runs.
+            let analysis_diags = run_analysis_passes(&path.display().to_string(), &source);
+            diags.extend(analysis_diags);
         }
 
         // `--stubs`: parse + type-check every `.dty` stub, then compare its
@@ -187,6 +197,35 @@ pub fn run(args: CheckArgs) -> Result<()> {
         println!("checked {} file(s) — no errors", file_count);
     }
     Ok(())
+}
+
+/// Run comptime evaluation and purity verification on a single source file.
+///
+/// These passes also run inside `tyc build`; lifting them up to `tyc check`
+/// closes the documented CI hole where `@pure` violations and missing
+/// `[env] required` variables only fail at build time. Any non-comptime,
+/// non-purity error has already been reported by `check_file`, so this
+/// helper deliberately swallows preprocess / parse failures (they would
+/// surface a second time otherwise).
+fn run_analysis_passes(path: &str, source: &str) -> Diagnostics {
+    let mut diags = Diagnostics::new();
+    let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
+        &expand_gather_blocks(&expand_lazy_imports(source)),
+    ))));
+    let prep = preprocess(&expanded);
+    let module = match tyc_syntax::parse_module(&prep.python_source) {
+        Ok(p) => p.into_syntax(),
+        Err(_) => return diags,
+    };
+
+    let (_, comptime_diags) = evaluate_comptime(&module, &prep.comptime_bindings);
+    diags.extend(comptime_diags);
+
+    let purity_findings = analyse_purity(&module, false);
+    let purity_diags = purity_diagnostics(&purity_findings, path, source);
+    diags.extend(purity_diags);
+
+    diags
 }
 
 /// Run the full preprocess + parse pipeline on `source` and return the

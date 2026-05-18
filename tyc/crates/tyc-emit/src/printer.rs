@@ -122,6 +122,29 @@ impl Emitter {
     /// Emit a parsed module.  Ruff's `parse_module` always returns a
     /// `ModModule`, so the emitter only needs the single-variant signature.
     pub fn emit_mod(&mut self, module: &ModModule) {
+        // For Python build output (suppress_mutability=true), inject
+        // `from __future__ import annotations` so self-referencing class
+        // annotations (Vec2 inside `impl Vec2`, recursive data structures,
+        // operator overloads) don't blow up at class-body evaluation time
+        // with NameError. PEP 563 makes annotations strings that resolve
+        // lazily. Skipped for `tyc fmt` so Typhon source isn't perturbed.
+        if self.suppress_mutability {
+            // Future imports must come after any module docstring. Detect
+            // a leading bare-string-literal expression statement and emit
+            // it first, then the future import, then the rest.
+            let mut iter = module.body.iter();
+            if let Some(first) = iter.clone().next() {
+                if is_module_docstring(first) {
+                    self.emit_stmt(first);
+                    iter.next();
+                }
+            }
+            self.writeln("from __future__ import annotations");
+            for stmt in iter {
+                self.emit_stmt(stmt);
+            }
+            return;
+        }
         for stmt in &module.body {
             self.emit_stmt(stmt);
         }
@@ -907,7 +930,11 @@ impl Emitter {
                     self.write(&i.to_string());
                 }
                 Number::Float(f) => {
-                    self.write(&format!("{}", f));
+                    // `{}` drops `.0` on whole-number f64 — emit `1` rather
+                    // than `1.0`, which then loads as int at runtime and
+                    // breaks isinstance(x, float), JSON output, repr, etc.
+                    // Use Debug formatting so 1.0 stays "1.0".
+                    self.write(&format!("{:?}", f));
                 }
                 Number::Complex { real, imag } => {
                     if *real != 0.0 {
@@ -1224,7 +1251,17 @@ impl Emitter {
                 Singleton::False => self.write("False"),
             },
             Pattern::MatchSequence(seq) => {
-                self.write("[");
+                // Python's sequence patterns accept both `[a, b]` and
+                // `(a, b)` (PEP 634); they're semantically identical and
+                // both match list *or* tuple instances. We default to
+                // parens for 2+ elements because it reads better in
+                // emitted Python ("destructure this pair"), but keep
+                // brackets for 0/1 elements where parens would be
+                // ambiguous (`()` is invalid in pattern position; `(a)`
+                // would parse as a capture, not a 1-tuple).
+                let use_parens = seq.patterns.len() >= 2;
+                let (open, close) = if use_parens { ("(", ")") } else { ("[", "]") };
+                self.write(open);
                 let mut first = true;
                 for p in &seq.patterns {
                     if !first {
@@ -1233,7 +1270,7 @@ impl Emitter {
                     self.emit_pattern(p);
                     first = false;
                 }
-                self.write("]");
+                self.write(close);
             }
             Pattern::MatchMapping(m) => {
                 self.write("{");
@@ -1317,6 +1354,18 @@ impl Emitter {
 impl Default for Emitter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// True when `stmt` is a module-level docstring (`Expr::StringLiteral`
+/// wrapped in `Stmt::Expr`). PEP 236 requires future imports to follow
+/// the docstring, so the emitter peels the docstring off before
+/// injecting `from __future__ import annotations`.
+fn is_module_docstring(stmt: &Stmt) -> bool {
+    if let Stmt::Expr(e) = stmt {
+        matches!(e.value.as_ref(), Expr::StringLiteral(_))
+    } else {
+        false
     }
 }
 

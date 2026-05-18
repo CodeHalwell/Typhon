@@ -114,6 +114,13 @@ pub struct PreprocessResult {
     /// the class should NOT receive a `@dataclass` decorator at desugar
     /// time.
     pub raw_class_lines: Vec<usize>,
+    /// 0-based line indices on which a `class NAME frozen:` declaration
+    /// appears.  The preprocessor strips the `frozen` modifier so the
+    /// Python parser sees a plain `class Foo:` / `class Foo(Base):`;
+    /// downstream passes consult this list to emit
+    /// `@dataclasses.dataclass(slots=True, frozen=True)` instead of the
+    /// default decorator.
+    pub frozen_class_lines: Vec<usize>,
 }
 
 /// Convert a list of 0-based line indices into byte offsets pointing at
@@ -158,6 +165,7 @@ pub fn preprocess(source: &str) -> PreprocessResult {
     let mut lazy_imports = Vec::new();
     let mut unsafe_lines: Vec<usize> = Vec::new();
     let mut raw_class_lines: Vec<usize> = Vec::new();
+    let mut frozen_class_lines: Vec<usize> = Vec::new();
     // String state carried across lines (triple-quoted strings may span them).
     let mut in_string: Option<StringMode> = None;
 
@@ -195,27 +203,36 @@ pub fn preprocess(source: &str) -> PreprocessResult {
             }
 
             // ── `impl ClassName:` → `class __typhon_impl_ClassName(object):` ─
-            if rest.starts_with("impl ")
-                && rest.len() > "impl ".len()
-                && (rest.as_bytes()["impl ".len()].is_ascii_alphanumeric()
-                    || rest.as_bytes()["impl ".len()] == b'_')
-            {
-                let after_impl = &rest["impl ".len()..];
-                if let Some(class_header) = make_impl_class_line(after_impl) {
-                    stripped.push(StrippedKeyword {
-                        line_index,
-                        keyword: TyphonKeyword::Impl,
-                    });
-                    let new_line = format!("{}class {}", indent, class_header);
-                    let (rewritten, marks) = rewrite_optionals(&new_line, &mut in_string);
-                    for col in marks {
-                        optionals.push(StrippedOptional {
+            // Also `impl[T, U] ClassName[T, U]:` for generic impl blocks
+            // (PEP 695); the type parameters are forwarded to the pseudo
+            // class so methods can resolve `T`/`U` while the desugar pass
+            // merges them back into the real `ClassName[T, U]`.
+            let after_impl_kw = if let Some(s) = rest.strip_prefix("impl ") {
+                Some(s)
+            } else if rest.starts_with("impl[") {
+                Some(&rest["impl".len()..])
+            } else {
+                None
+            };
+            if let Some(after_impl) = after_impl_kw {
+                let first = after_impl.as_bytes().first().copied().unwrap_or(0);
+                if first.is_ascii_alphanumeric() || first == b'_' || first == b'[' {
+                    if let Some(class_header) = make_impl_class_line(after_impl) {
+                        stripped.push(StrippedKeyword {
                             line_index,
-                            python_col: col,
+                            keyword: TyphonKeyword::Impl,
                         });
+                        let new_line = format!("{}class {}", indent, class_header);
+                        let (rewritten, marks) = rewrite_optionals(&new_line, &mut in_string);
+                        for col in marks {
+                            optionals.push(StrippedOptional {
+                                line_index,
+                                python_col: col,
+                            });
+                        }
+                        python_source.push_str(&rewritten);
+                        continue;
                     }
-                    python_source.push_str(&rewritten);
-                    continue;
                 }
             }
 
@@ -281,6 +298,25 @@ pub fn preprocess(source: &str) -> PreprocessResult {
                 }
             }
 
+            // ── interface-style `def NAME(...) -> T` (no body) ──────────────
+            // The docs show declaration-only methods inside `interface` blocks
+            // (`def draw() -> None`). The Python parser rejects a `def` line
+            // with no body, so we auto-append `: ...` here. The same rewrite
+            // applies inside `class!`/`class` bodies too — `def f() -> int`
+            // without a body is invalid Python anyway, and `: ...` is a strict
+            // upgrade that never changes a valid program's meaning.
+            if let Some(with_body) = append_ellipsis_to_bodiless_def(line) {
+                let (rewritten, marks) = rewrite_optionals(&with_body, &mut in_string);
+                for col in marks {
+                    optionals.push(StrippedOptional {
+                        line_index,
+                        python_col: col,
+                    });
+                }
+                python_source.push_str(&rewritten);
+                continue;
+            }
+
             // ── `unsafe:` → `if True:  # __typhon_unsafe__` ────────────────
             // The body is a no-op wrapper that preserves Python scoping. The
             // type checker tracks the marker so it can permit `Any` to flow
@@ -336,6 +372,56 @@ pub fn preprocess(source: &str) -> PreprocessResult {
                 }
                 python_source.push_str(&rewritten);
                 continue;
+            }
+
+            // ── `class NAME frozen:` / `class NAME frozen(BASES):` ──────────
+            // Strip the `frozen` modifier and record the line so the desugar
+            // pass can emit `@dataclasses.dataclass(slots=True, frozen=True)`
+            // for this class. Plain `class NAME:` (no modifier) is left to
+            // fall through to the Python parser unchanged.
+            if rest.starts_with("class ") && rest.contains(" frozen") {
+                if let Some(rewritten_class) = strip_frozen_modifier(rest) {
+                    frozen_class_lines.push(line_index);
+                    let new_line = format!("{}{}", indent, rewritten_class);
+                    let (rewritten, marks) = rewrite_optionals(&new_line, &mut in_string);
+                    for col in marks {
+                        optionals.push(StrippedOptional {
+                            line_index,
+                            python_col: col,
+                        });
+                    }
+                    python_source.push_str(&rewritten);
+                    continue;
+                }
+            }
+
+            // ── `guard NAME = EXPR else: BODY` (single-line) ────────────────
+            // Lowers to a None-check + an early-return body + a `let`
+            // binding of the narrowed value. Stashes EXPR in a per-line
+            // temp so the narrowing applies to the binding (the checker
+            // can only narrow Name expressions, not arbitrary call
+            // results).
+            //
+            //   guard w = weight else: return
+            //
+            //   →   let __typhon_guard_<N> = (weight)
+            //       if __typhon_guard_<N> is None: return
+            //       let w = __typhon_guard_<N>
+            //
+            // Only the single-line form is recognised; multi-line guards
+            // (`else:\n    return`) are deferred.
+            if rest.starts_with("guard ") {
+                if let Some(rewritten) = expand_guard_one_liner(rest, indent, line_index) {
+                    let (rewritten, marks) = rewrite_optionals(&rewritten, &mut in_string);
+                    for col in marks {
+                        optionals.push(StrippedOptional {
+                            line_index,
+                            python_col: col,
+                        });
+                    }
+                    python_source.push_str(&rewritten);
+                    continue;
+                }
             }
 
             // ── `model ClassName:` → `class ClassName(BaseModel):` ──────────
@@ -469,6 +555,7 @@ pub fn preprocess(source: &str) -> PreprocessResult {
         lazy_imports,
         unsafe_lines,
         raw_class_lines,
+        frozen_class_lines,
     }
 }
 
@@ -516,10 +603,43 @@ fn is_dotted_python_ident(s: &str) -> bool {
 /// `class __typhon_impl_User(Base)(object):`.
 ///
 /// Returns `None` when the line doesn't look like a class header (no `:`).
+///
+/// Handles two forms:
+/// - `Name:` / `Name(Bases):` — plain `impl Name:`.
+/// - `[T1, ...] Name[T1, ...]:` — generic `impl[T] Name[T]:`. The
+///   leading bracket list is the impl's PEP 695 type parameters; it is
+///   forwarded onto the pseudo class so the methods inside resolve
+///   `T`/`U`. The trailing bracket list on the class name is dropped
+///   from the pseudo class header (PEP 695 introduces type params on
+///   the class header itself; we don't need to repeat them as bases).
 fn make_impl_class_line(after_impl: &str) -> Option<String> {
+    // Optionally consume a leading `[...]` type-param list. Track bracket
+    // depth so commas inside nested brackets don't fool the scanner.
+    let (impl_type_params, after_tps) = if after_impl.starts_with('[') {
+        let mut depth = 0i32;
+        let mut end = None;
+        for (i, c) in after_impl.char_indices() {
+            match c {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end?;
+        (Some(&after_impl[..end]), after_impl[end..].trim_start())
+    } else {
+        (None, after_impl)
+    };
+
     let mut depth = 0i32;
     let mut colon_pos = None;
-    for (i, c) in after_impl.char_indices() {
+    for (i, c) in after_tps.char_indices() {
         match c {
             '(' | '[' => depth += 1,
             ')' | ']' => depth -= 1,
@@ -531,15 +651,232 @@ fn make_impl_class_line(after_impl: &str) -> Option<String> {
         }
     }
     let colon_pos = colon_pos?;
-    let raw = after_impl[..colon_pos].trim_end();
+    let raw = after_tps[..colon_pos].trim_end();
     // Strip any base-class list — `impl` blocks don't support inheritance.
+    // Also strip the `[T, U]` trailing type-param application on the class
+    // name; the pseudo class carries its own type params on the header.
     let name = if let Some(paren) = raw.find('(') {
         raw[..paren].trim_end()
+    } else if let Some(bracket) = raw.find('[') {
+        raw[..bracket].trim_end()
     } else {
         raw
     };
-    let tail = &after_impl[colon_pos..]; // ":\n" or ":"
-    Some(format!("__typhon_impl_{}(object){}", name, tail))
+    let tail = &after_tps[colon_pos..]; // ":\n" or ":"
+    let tp = impl_type_params.unwrap_or("");
+    Some(format!("__typhon_impl_{}{}(object){}", name, tp, tail))
+}
+
+/// Expand a single-line `guard NAME = EXPR else: BODY` into a
+/// None-check + early-return + immutable binding. The caller has
+/// already verified the line starts with `guard ` and provides the
+/// leading-whitespace `indent` so the rewrite preserves indentation.
+///
+/// Returns `None` when the line doesn't match the single-line guard
+/// shape (multi-line `guard …\n    return` still hits a parse error;
+/// that case is a separate, larger lowering not yet implemented).
+fn expand_guard_one_liner(rest: &str, indent: &str, line_index: usize) -> Option<String> {
+    let after_guard = rest.strip_prefix("guard ")?;
+    // Body is everything after the `else:`. Walk the line tracking
+    // bracket depth so `else:` inside a parenthesised expression doesn't
+    // trip the matcher.
+    let body_marker = " else:";
+    let mut depth = 0i32;
+    let mut idx = 0usize;
+    let bytes = after_guard.as_bytes();
+    let mut found = None;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b' ' if depth == 0
+                && idx + body_marker.len() <= bytes.len()
+                && &bytes[idx..idx + body_marker.len()] == body_marker.as_bytes() =>
+            {
+                found = Some(idx);
+                break;
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    let split = found?;
+    let head = &after_guard[..split]; // `NAME = EXPR`
+    let tail = &after_guard[split + body_marker.len()..]; // ` BODY\n`
+
+    // Split head on the first `=` outside of brackets.
+    let mut depth = 0i32;
+    let mut eq_pos = None;
+    for (i, b) in head.bytes().enumerate() {
+        match b {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'=' if depth == 0 => {
+                // Reject `==` / `!=` / `<=` / `>=`.
+                let prev = i.checked_sub(1).map(|j| head.as_bytes()[j]).unwrap_or(0);
+                let next = head.as_bytes().get(i + 1).copied().unwrap_or(0);
+                if matches!(prev, b'=' | b'!' | b'<' | b'>') || next == b'=' {
+                    continue;
+                }
+                eq_pos = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let eq_pos = eq_pos?;
+    let name = head[..eq_pos].trim();
+    let expr = head[eq_pos + 1..].trim();
+    if !is_simple_identifier(name) || expr.is_empty() {
+        return None;
+    }
+    let body = tail.trim_end_matches(['\n', '\r']).trim();
+    if body.is_empty() {
+        return None;
+    }
+    // Stash EXPR in a unique-per-line temp so flow narrowing can fire
+    // — the checker narrows Name expressions, not arbitrary call
+    // results, so referencing the same `find_user(t)` twice in the
+    // post-`if` `let` would yield `T?` again.
+    let tmp = format!("__typhon_guard_{}", line_index);
+    Some(format!(
+        "{indent}let {tmp} = ({expr})\n{indent}if {tmp} is None: {body}\n{indent}let {name} = {tmp}\n"
+    ))
+}
+
+/// Cheap identifier test for the `guard` name binding: ASCII letter or
+/// underscore start, ASCII alphanumeric / underscore body.
+fn is_simple_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    let first = match chars.next() {
+        Some(c) => c,
+        None => return false,
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// If `line` is a `def NAME(...) -> TYPE` declaration with no body
+/// (no trailing `:` after the return type), return a rewritten copy
+/// with `: ...` appended so the Python parser accepts it. Returns
+/// `None` when the line doesn't match the bodiless-def shape.
+///
+/// This makes interface-body declarations like
+/// `def draw() -> None` legal source, mirroring the docs and the
+/// skill cheat-sheet's syntax for `interface` bodies.
+fn append_ellipsis_to_bodiless_def(line: &str) -> Option<String> {
+    // Preserve trailing newline / CRLF.
+    let (body, terminator) = match line.rfind('\n') {
+        Some(idx) => {
+            let term_start = if idx > 0 && line.as_bytes()[idx - 1] == b'\r' {
+                idx - 1
+            } else {
+                idx
+            };
+            (&line[..term_start], &line[term_start..])
+        }
+        None => (line, ""),
+    };
+    let indent_len = body.find(|c: char| !c.is_whitespace())?;
+    let rest = &body[indent_len..];
+    if !rest.starts_with("def ") {
+        return None;
+    }
+    // Confirm balanced parens before checking for the bodiless tail. Track
+    // bracket depth so `[T, U]`-style annotations in the return type don't
+    // throw the scanner off.
+    let mut paren_depth = 0i32;
+    let mut bracket_depth = 0i32;
+    let mut found_close_paren = false;
+    for b in rest.as_bytes() {
+        match b {
+            b'(' => paren_depth += 1,
+            b')' => {
+                paren_depth -= 1;
+                if paren_depth == 0 {
+                    found_close_paren = true;
+                }
+            }
+            b'[' => bracket_depth += 1,
+            b']' => bracket_depth -= 1,
+            _ => {}
+        }
+    }
+    if !found_close_paren || paren_depth != 0 || bracket_depth != 0 {
+        return None;
+    }
+    // Strip a trailing comment (if any) before checking the bodiless tail.
+    let no_comment = strip_trailing_comment(rest);
+    let trimmed = no_comment.trim_end();
+    // Detect the function's header colon — anything at depth 0 *after*
+    // the closing `)`. A `:` there means the function has a body (either
+    // single-line `def f(): pass` or multi-line `def f():\n …`), so we
+    // must NOT rewrite — the line is already valid Python.
+    let mut depth = 0i32;
+    let mut past_close = false;
+    let bytes = trimmed.as_bytes();
+    for &b in bytes {
+        match b {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                if depth == 0 && b == b')' {
+                    past_close = true;
+                }
+            }
+            b':' if depth == 0 && past_close => return None,
+            _ => {}
+        }
+    }
+    // Require a `-> TYPE` return annotation so we don't accidentally
+    // rewrite a syntactically invalid `def f()` (no return type, no
+    // body) into something that masks a real user error.
+    if !trimmed.contains("->") {
+        return None;
+    }
+    Some(format!("{}: ...{}", body.trim_end(), terminator))
+}
+
+/// Strip the `frozen` modifier from a `class NAME frozen:` or
+/// `class NAME frozen(BASES):` header so the Python parser accepts it.
+///
+/// Returns the rewritten line (including the trailing newline if one was
+/// present), or `None` if the input does not match the expected shape.
+/// The leading `class ` is preserved so callers can simply prepend the
+/// captured indent.
+fn strip_frozen_modifier(rest: &str) -> Option<String> {
+    // Walk after `class ` to find the end of the class name (first non-id
+    // character). Everything up through the name is the prefix we keep.
+    let after_class = rest.strip_prefix("class ")?;
+    let name_end = after_class
+        .bytes()
+        .position(|b| !(b.is_ascii_alphanumeric() || b == b'_'))?;
+    if name_end == 0 {
+        return None;
+    }
+    let name = &after_class[..name_end];
+    let after_name = &after_class[name_end..];
+    // The modifier must follow whitespace and be the bare token `frozen`,
+    // terminated by `:` or `(` (with whatever whitespace sits between).
+    let trimmed = after_name.trim_start();
+    let leading_ws = after_name.len() - trimmed.len();
+    if leading_ws == 0 {
+        return None;
+    }
+    let rest_after_mod = trimmed.strip_prefix("frozen")?;
+    // Reject `frozen` followed by an identifier character (e.g. `frozenset`)
+    // so the modifier match is unambiguous.
+    if let Some(next) = rest_after_mod.bytes().next() {
+        if next.is_ascii_alphanumeric() || next == b'_' {
+            return None;
+        }
+    }
+    // Anything after the modifier (bases list, colon, trailing newline) is
+    // preserved verbatim — the Python parser handles `(Base):` natively.
+    let tail = rest_after_mod.trim_start();
+    Some(format!("class {}{}", name, tail))
 }
 
 /// Same as [`make_impl_class_line`] but uses the `__typhon_builtin_ext_`

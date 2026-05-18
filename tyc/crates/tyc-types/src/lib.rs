@@ -185,6 +185,14 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
         (Type::TypeVar(_), _) | (_, Type::TypeVar(_)) => true,
         (Type::Unknown, _) | (_, Type::Unknown) => true,
         (Type::Float, Type::Int) => true,
+        // Union/Union must come before the single-Union arms: every actual
+        // variant has to be assignable to *some* expected variant. Falling
+        // through to `(Union, other)` then `(other, Union)` recursively
+        // requires every actual variant to match every expected variant,
+        // which fails for `int | None = int | None`.
+        (Type::Union(expected_vs), Type::Union(actual_vs)) => actual_vs
+            .iter()
+            .all(|a| expected_vs.iter().any(|e| assignable(e, a))),
         (Type::Union(variants), other) => variants.iter().any(|v| assignable(v, other)),
         (other, Type::Union(variants)) => variants.iter().all(|v| assignable(other, v)),
         (Type::Generic(an, aa), Type::Generic(bn, bb)) => {
@@ -238,8 +246,26 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
         {
             true
         }
+        // Bare-container annotations (`list`, `dict`, `tuple`, `set`,
+        // `frozenset`) act as `name[Any]` — they accept any
+        // parameterisation. Without this rule, `let xs: list = []`
+        // produces the misleading "expected `list`, found `list[?]`"
+        // diagnostic from FINDINGS #33 because the RHS infers as
+        // `Generic("list", [Unknown])` but the annotation is
+        // `Class("list")`.
+        (Type::Class(en), Type::Generic(an, _)) if en == an && is_bare_container_name(en) => true,
         (a, b) => a == b,
     }
+}
+
+/// Return `true` if `name` is a built-in container type whose bare
+/// (unparameterised) form should be treated as accepting any
+/// parameterisation (`list` ≡ `list[Any]`, etc.).
+fn is_bare_container_name(name: &str) -> bool {
+    matches!(
+        name,
+        "list" | "dict" | "tuple" | "set" | "frozenset" | "deque"
+    )
 }
 
 /// Variance of a type parameter — controls the assignability direction
@@ -1507,6 +1533,31 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
             c.class_shapes.insert(name, shape);
         }
     }
+    // Second pass (continued): fold `impl ClassName:` and `extend ClassName:`
+    // contributions into the target class's shape. The preprocessor rewrites
+    // both forms into a pseudo-class named `__typhon_impl_ClassName`; methods
+    // defined there must count toward interface structural conformance for
+    // the documented "methods live in `impl`" rule to interoperate with
+    // structural typing. Without this merge, `class Button:` + `impl Button:
+    // def draw() -> None` fails to satisfy `Drawable` even though the
+    // cheat-sheet says it should.
+    for stmt in body {
+        if let Stmt::ClassDef(cd) = stmt {
+            let pseudo = cd.name.as_str();
+            if let Some(target) = pseudo.strip_prefix("__typhon_impl_") {
+                if c.class_shapes.contains_key(target) {
+                    let impl_shape = collect_class_shape(cd, &classes);
+                    let target_shape = c.class_shapes.get_mut(target).expect("checked above");
+                    for (m, sig) in impl_shape.methods {
+                        target_shape.methods.entry(m).or_insert(sig);
+                    }
+                    for (f, ty) in impl_shape.fields {
+                        target_shape.fields.entry(f).or_insert(ty);
+                    }
+                }
+            }
+        }
+    }
     // Third pass: record function signatures (also needs the full class list).
     // Ruff folds `async def` into `Stmt::FunctionDef` with `is_async = true`,
     // so a single arm covers both sync and async forms.
@@ -1771,6 +1822,46 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             )
         }
         Stmt::ClassDef(cd) => {
+            // FINDINGS #17: nudge users toward `impl ClassName:` when they
+            // put a `def` inside `class ClassName:`. Skipped for impl
+            // pseudo-classes (`__typhon_impl_*`), Protocols (interfaces),
+            // Pydantic models, and the lazy/builtin-extend stubs — those
+            // legitimately carry method definitions inside the class body.
+            let class_name = cd.name.as_str();
+            let is_pseudo =
+                class_name.starts_with("__typhon_") || class_name.starts_with("__TyphonLazy_");
+            let is_protocol = class_inherits_protocol(cd);
+            // Mirror the desugar pass's heuristic: a `model X:` becomes
+            // `class X(BaseModel):` after preprocess. Looking for any
+            // base named `BaseModel` is good enough for this warning.
+            let is_pydantic = cd.bases().iter().any(|b| match b {
+                Expr::Name(n) => n.id.as_str() == "BaseModel",
+                _ => false,
+            });
+            if !is_pseudo && !is_protocol && !is_pydantic {
+                for s in &cd.body {
+                    if let Stmt::FunctionDef(f) = s {
+                        let method = f.name.as_str();
+                        // Don't warn on dunders the user is *expected* to
+                        // override (e.g. `__add__`, `__lt__`); those are
+                        // legitimate uses of class-body methods too. The
+                        // canonical bad case is user-named methods like
+                        // `draw`, `display`, `is_admin`.
+                        if method.starts_with("__") && method.ends_with("__") {
+                            continue;
+                        }
+                        let span_start = f.name.range.start().to_usize();
+                        c.diagnostics.push_warning(TycError::method_in_class_body(
+                            class_name.to_owned(),
+                            method.to_owned(),
+                            c.path.clone(),
+                            c.source,
+                            span_start,
+                            method.len().max(1),
+                        ));
+                    }
+                }
+            }
             c.env.enter();
             for s in &cd.body {
                 check_stmt(c, s);
@@ -1888,6 +1979,83 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
     }
 }
 
+/// Enforce Rule 1: every parameter and return type must be annotated.
+/// The first positional named `self` or `cls` is exempted (the desugarer
+/// inserts unannotated receivers for `impl` methods, and explicit
+/// `self`/`cls` is idiomatic Python). `*args` / `**kwargs` are likewise
+/// not required to carry annotations.
+fn enforce_annotation_rule(
+    c: &mut Checker,
+    function: &str,
+    parameters: &ruff_python_ast::Parameters,
+    returns: Option<&Expr>,
+) {
+    // Skip the leading `self` / `cls` receiver, if present, so methods
+    // continue to pass without annotating it.
+    let positional: Vec<&ruff_python_ast::ParameterWithDefault> = parameters
+        .posonlyargs
+        .iter()
+        .chain(parameters.args.iter())
+        .collect();
+    let mut params_iter = positional.iter().peekable();
+    if let Some(first) = params_iter.peek() {
+        let name = first.parameter.name.as_str();
+        if name == "self" || name == "cls" {
+            params_iter.next();
+        }
+    }
+    for pwd in params_iter {
+        if pwd.parameter.annotation.is_none() {
+            let pname = pwd.parameter.name.as_str();
+            let span = (
+                pwd.parameter.range.start().to_usize(),
+                pwd.parameter.range.start().to_usize() + pname.len(),
+            );
+            c.diagnostics.push_error(TycError::missing_annotation(
+                function.to_owned(),
+                format!("parameter `{}`", pname),
+                c.path.clone(),
+                c.source,
+                span.0,
+                pname.len().max(1),
+            ));
+        }
+    }
+    for pwd in parameters.kwonlyargs.iter() {
+        if pwd.parameter.annotation.is_none() {
+            let pname = pwd.parameter.name.as_str();
+            let span = (
+                pwd.parameter.range.start().to_usize(),
+                pwd.parameter.range.start().to_usize() + pname.len(),
+            );
+            c.diagnostics.push_error(TycError::missing_annotation(
+                function.to_owned(),
+                format!("parameter `{}`", pname),
+                c.path.clone(),
+                c.source,
+                span.0,
+                pname.len().max(1),
+            ));
+        }
+    }
+
+    if returns.is_none() {
+        // Anchor the diagnostic on the function name. Spans for the
+        // closing-paren / arrow position aren't easily reachable from
+        // `ruff_python_ast::Parameters`; the name is unambiguous and
+        // matches the user's mental model ("annotate this function").
+        let span_start = parameters.range.start().to_usize();
+        c.diagnostics.push_error(TycError::missing_annotation(
+            function.to_owned(),
+            "return type".to_owned(),
+            c.path.clone(),
+            c.source,
+            span_start,
+            1,
+        ));
+    }
+}
+
 fn check_function(
     c: &mut Checker,
     name: &str,
@@ -1901,6 +2069,14 @@ fn check_function(
         Some(r) => type_from_annotation_with_params(r, &classes, type_params),
         None => Type::Unknown,
     };
+
+    // Rule 1: every parameter and return type must be annotated.
+    // Auto-synthesised compiler helpers (anything `__typhon_*`) are
+    // exempted so the desugar pass can keep emitting unannotated
+    // bridges without provoking the user-facing diagnostic.
+    if !name.starts_with("__typhon_") {
+        enforce_annotation_rule(c, name, parameters, returns);
+    }
 
     let saved_return = c.current_return.replace(ret_type);
     // Load the TypeVar bounds for this function so the body's attribute
@@ -1970,6 +2146,7 @@ fn check_if(c: &mut Checker, i: &ruff_python_ast::StmtIf) {
     if is_unsafe {
         c.unsafe_depth = c.unsafe_depth.saturating_sub(1);
     }
+    let body_exits = body_always_exits(&i.body);
     c.env.restore(snap_pre);
 
     // Apply opposite narrowing for the elif/else cascade. Ruff flattens
@@ -1980,7 +2157,50 @@ fn check_if(c: &mut Checker, i: &ruff_python_ast::StmtIf) {
     let snap_pre = c.env.snapshot();
     apply_narrowings(c, &neg);
     check_elif_else_clauses(c, &i.elif_else_clauses);
+    let elif_exits =
+        !i.elif_else_clauses.is_empty() && elif_else_chain_always_exits(&i.elif_else_clauses);
     c.env.restore(snap_pre);
+
+    // Flow-sensitive narrowing: if every branch we've examined ends in
+    // an unconditional exit (return / raise / break / continue), the
+    // negated narrowing should persist into the surrounding scope. This
+    // makes the `guard X = expr else: return` lowering work — after the
+    // None-check, `expr` is reliably non-None for the rest of the body.
+    if body_exits && (i.elif_else_clauses.is_empty() || elif_exits) {
+        apply_narrowings(c, &neg);
+    }
+}
+
+/// True when every reachable path through `stmts` exits the enclosing
+/// function (return / raise / break / continue) before falling off the
+/// end. Used by `check_if` to decide whether to propagate the negated
+/// narrowing of the `if`'s test into the post-`if` scope.
+fn body_always_exits(stmts: &[Stmt]) -> bool {
+    stmts.last().is_some_and(stmt_always_exits)
+}
+
+/// True when every branch of an elif/else chain always exits.
+fn elif_else_chain_always_exits(clauses: &[ruff_python_ast::ElifElseClause]) -> bool {
+    // The chain "always exits" only when there is a terminal `else:` and
+    // every elif/else body always exits. Without a terminal `else`, the
+    // fall-through path is "do nothing" — not an exit.
+    let has_terminal_else = clauses.iter().any(|c| c.test.is_none());
+    if !has_terminal_else {
+        return false;
+    }
+    clauses.iter().all(|c| body_always_exits(&c.body))
+}
+
+/// True when this statement unconditionally exits its enclosing scope.
+fn stmt_always_exits(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Return(_) | Stmt::Raise(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
+        // An if/elif/else where every branch exits is itself an exit.
+        Stmt::If(s) => {
+            body_always_exits(&s.body) && elif_else_chain_always_exits(&s.elif_else_clauses)
+        }
+        _ => false,
+    }
 }
 
 /// Recursively check the `elif`/`else` cascade of a [`StmtIf`].  Each
@@ -2080,7 +2300,14 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                                 // Best-effort: strip the type out of the union.
                                 strip_variant(&b.narrowed, &new_type)
                             } else {
-                                new_type
+                                // Preserve generic parameters when narrowing
+                                // `Result[T, E]` against `Ok` or `Err`.
+                                // Without this, the post-`?`-operator
+                                // `return x` (where `x` is now `Class("Err")`)
+                                // would lose `E` and the
+                                // `result_error_mismatch` check (FINDINGS #13)
+                                // can't fire.
+                                refine_isinstance_target(&b.narrowed, &new_type)
                             };
                             out.push(Narrowing {
                                 name: target.id.as_str().to_owned(),
@@ -2094,8 +2321,80 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
         Expr::UnaryOp(u) if matches!(u.op, ruff_python_ast::UnaryOp::Not) => {
             collect_narrowings_inner(c, &u.operand, !negate, out);
         }
+        Expr::Name(n) => {
+            // Truthy narrowing: `if x:` strips None from `x` in the true
+            // branch (truthy implies not None). The else branch isn't
+            // narrowed in the opposite direction because falsy doesn't
+            // imply None — `int? == 0` is also falsy and stays nullable.
+            if !negate {
+                if let Some(b) = c.env.lookup(n.id.as_str()) {
+                    if b.narrowed.is_nullable() {
+                        out.push(Narrowing {
+                            name: n.id.as_str().to_owned(),
+                            replacement: b.narrowed.strip_none(),
+                        });
+                    }
+                }
+            }
+        }
         _ => {}
     }
+}
+
+/// Return the [`Type::Function`] signature for a built-in method on a
+/// generic container, or `None` when the receiver/method combo isn't a
+/// known intrinsic.
+///
+/// Today this covers the cases the FINDINGS doc called out — primarily
+/// `dict.get(k)` which must return `V?`, not `V` — and is the right
+/// place to grow other built-in method types (`list.pop`, `str.find`,
+/// `re.match`, …) without scattering them across the inference engine.
+fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
+    let Type::Generic(head, args) = recv else {
+        return None;
+    };
+    match (head.as_str(), attr, args.as_slice()) {
+        ("dict", "get", [k, v]) => {
+            // `d.get(k)` → V?  ;  `d.get(k, default)` → also typed as V?
+            // (the default may broaden the runtime type, but the static
+            // contract Typhon advertises is "V?"). Variadic so 1- and
+            // 2-arg call sites both pass the arity check.
+            let ret = Type::union_of(vec![v.clone(), Type::None]);
+            Some(Type::Function {
+                params: vec![k.clone()],
+                ret: Box::new(ret),
+                variadic: true,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Refine the type chosen by an `isinstance(x, T)` narrowing so that
+/// generic parameters survive when the source `x: Result[A, B]` is
+/// narrowed against the bare `Err` / `Ok` constructor. Without this
+/// the post-`isinstance` `return x` from a `?`-operator expansion
+/// would have type `Class("Err")` and the
+/// `result_error_mismatch` check wouldn't see `Err[E]` vs
+/// `Result[T, E_outer]`.
+fn refine_isinstance_target(current: &Type, narrowed_to: &Type) -> Type {
+    let current_generic = match current {
+        Type::Generic(name, args) if name == "Result" && args.len() == 2 => Some(args),
+        _ => None,
+    };
+    let narrowed_class = match narrowed_to {
+        Type::Class(name) if name == "Ok" || name == "Err" => Some(name.as_str()),
+        _ => None,
+    };
+    if let (Some(args), Some(class)) = (current_generic, narrowed_class) {
+        let param = match class {
+            "Ok" => args[0].clone(),
+            "Err" => args[1].clone(),
+            _ => unreachable!(),
+        };
+        return Type::Generic(class.to_owned(), vec![param]);
+    }
+    narrowed_to.clone()
 }
 
 fn strip_variant(typ: &Type, variant: &Type) -> Type {
@@ -2270,21 +2569,34 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                             break;
                         }
                         let actual = infer_expr_ctx(c, arg, Some(&params[i]));
-                        if !c.is_assignable(&params[i], &actual) {
-                            let span =
-                                (arg.range().start().to_usize(), arg.range().end().to_usize());
-                            c.mismatch(&params[i], &actual, span);
-                        }
-                        // Specifically reject possibly-None args bound to a
-                        // non-nullable parameter.
-                        if !params[i].is_nullable() && actual.is_nullable() {
+                        // Check the nullable-use case first: when the actual
+                        // is nullable and the parameter is not, `nullable_use`
+                        // is the more helpful diagnostic — it points at the
+                        // narrowing fix (`if x is not None:` / `guard`).
+                        // Emitting `type_mismatch` alongside would just be
+                        // noise on the same span (FINDINGS #8). Only emit the
+                        // type_mismatch when nullable_use isn't going to fire.
+                        let nullable_into_non_nullable =
+                            !params[i].is_nullable() && actual.is_nullable();
+                        if nullable_into_non_nullable {
                             if let Expr::Name(n) = arg {
                                 let span = (
                                     n.range.start().to_usize(),
                                     n.range.start().to_usize() + n.id.as_str().len(),
                                 );
                                 c.nullable_use(n.id.as_str(), &params[i], span);
+                            } else {
+                                // Non-name arg (e.g. `greet(find())`) — no
+                                // identifier to point at, fall back to the
+                                // generic mismatch diagnostic.
+                                let span =
+                                    (arg.range().start().to_usize(), arg.range().end().to_usize());
+                                c.mismatch(&params[i], &actual, span);
                             }
+                        } else if !c.is_assignable(&params[i], &actual) {
+                            let span =
+                                (arg.range().start().to_usize(), arg.range().end().to_usize());
+                            c.mismatch(&params[i], &actual, span);
                         }
                         actuals.push(actual);
                     }
@@ -2336,6 +2648,9 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             }
             let attr_name = a.attr.as_str();
             // Resolve attribute access on known class instances and TypeVar-bounded parameters.
+            if let Some(method_type) = builtin_generic_method(&recv, attr_name) {
+                return method_type;
+            }
             match &recv {
                 Type::Class(class_name) => {
                     let class_name = class_name.clone();
@@ -4071,9 +4386,13 @@ let g: Greeter = GoodGreeter()
     }
 
     #[test]
-    fn interface_method_unannotated_impl_passes_conformance() {
-        // When the implementing class has no return annotation, conformance should
-        // succeed (we can't statically verify the return type, so we accept it).
+    fn interface_method_unannotated_impl_now_rejected_by_rule_one() {
+        // Rule 1 (every parameter and return type annotated) is now
+        // enforced, so an unannotated `def greet(self):` is itself a
+        // diagnostic before conformance is ever consulted. The conformance
+        // path that treats `Type::Unknown` permissively still exists for
+        // compiler-synthesised stubs; it just can't be reached through
+        // user source without violating Rule 1.
         let src = "\
 interface Greeter:
     def greet(self) -> str: ...
@@ -4086,8 +4405,15 @@ let g: Greeter = BareGreeter()
 ";
         let d = check(src);
         assert!(
-            !d.has_errors(),
-            "unannotated method impl should satisfy interface (unknown return type); errors: {:?}",
+            d.has_errors(),
+            "Rule 1 should reject the unannotated `greet` impl; errors: {:?}",
+            d.errors()
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| format!("{e}").contains("missing a type annotation")),
+            "expected a missing_annotation diagnostic; got: {:?}",
             d.errors()
         );
     }

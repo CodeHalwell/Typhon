@@ -319,6 +319,45 @@ pub enum TycError {
         #[label("no attribute `{attr}` on `{recv_type}`")]
         span: SourceSpan,
     },
+
+    /// A method is defined inside a `class NAME:` body instead of a
+    /// matching `impl NAME:` block. Today the type checker still accepts
+    /// the method (Python allows it), so this is surfaced as a warning to
+    /// nudge users toward the recommended `impl` form without breaking
+    /// existing code. Promotion to error is a separate v0.2 decision.
+    #[error(
+        "method `{method}` defined inside `class {class}:` body — methods live in `impl {class}:`"
+    )]
+    #[diagnostic(
+        code(tyc::method_in_class_body),
+        help("move the method into an `impl {class}:` block at the same scope (multiple `impl` blocks for one class are merged at desugar)")
+    )]
+    MethodInClassBody {
+        class: String,
+        method: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("`def` here belongs in `impl {class}:`")]
+        span: SourceSpan,
+    },
+
+    /// A function parameter or return type is missing its annotation. Rule 1
+    /// of the Typhon language: every parameter and return type is annotated.
+    /// Defaults on (`[strictness] no-implicit-any = true`) — turning it off
+    /// is supported but almost never what you want.
+    #[error("`{what}` on `{function}` is missing a type annotation")]
+    #[diagnostic(
+        code(tyc::missing_annotation),
+        help("Typhon's Rule 1: annotate every parameter and return type. For a function that returns nothing, write `-> None`.")
+    )]
+    MissingAnnotation {
+        function: String,
+        what: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("annotation required here")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -646,6 +685,42 @@ impl TycError {
         Self::AttributeNotFound {
             attr: attr.into(),
             recv_type: recv_type.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::MethodInClassBody`] diagnostic.
+    pub fn method_in_class_body(
+        class: impl Into<String>,
+        method: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::MethodInClassBody {
+            class: class.into(),
+            method: method.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::MissingAnnotation`] diagnostic. `what` is the
+    /// human-readable description of what's unannotated (e.g. `parameter
+    /// `name`` or `return type`).
+    pub fn missing_annotation(
+        function: impl Into<String>,
+        what: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::MissingAnnotation {
+            function: function.into(),
+            what: what.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

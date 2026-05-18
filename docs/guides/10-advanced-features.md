@@ -109,7 +109,7 @@ def main() -> None:
         let arr: np.ndarray = np.array([1, 2, 3])    # loaded here, on first access
 ```
 
-`np` is a proxy object until you touch an attribute on it. The proxy is **thread-safe** — concurrent first accesses lock around the underlying `importlib.util.LazyLoader`.
+`np` is a proxy object until you touch an attribute on it. The proxy is **thread-safe** — concurrent first accesses lock around the underlying module load using double-checked locking inside a generated `__TyphonLazy_np_` class.
 
 ### What's *not* allowed
 
@@ -342,7 +342,7 @@ def fetch(url: str) -> str:
 ```
 
 ```
-error[tyc::pure_violation]: `fetch` is annotated `@pure` but performs I/O
+error[tyc::impure_pure_fn]: `fetch` is annotated `@pure` but performs I/O
                             (urllib.request.urlopen)
 ```
 

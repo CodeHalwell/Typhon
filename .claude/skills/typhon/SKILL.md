@@ -51,7 +51,7 @@ The 30-second mental model. Everything else in this skill is detail under one of
 | Class | `class User: id: int` | `@dataclass(slots=True) class User: id: int` |
 | Pydantic model | `model ApiUser: id: int` | `class ApiUser(BaseModel): model_config = ConfigDict(extra="forbid"); id: int` |
 | Frozen class | `class P frozen: x: float` | `@dataclass(slots=True, frozen=True)` |
-| Methods | `impl User: def display() -> str: ...` (no `self`) | merged into class with `self` inserted |
+| Methods | `impl User: def display(self) -> str: ...` (explicit `self`, then `self.NAME`) | merged into the class body |
 | Extend foreign class | `extend User: def x() -> int: ...` | merged at desugar |
 | Extend built-in | `extend str: def slug() -> str: ...` | extracted to `__typhon_ext_str__slug` free fn + receiver-typed call rewrites |
 | Result type | `Result[T, E]`, `Ok(v)`, `Err(e)` | generated `typhon_runtime.Ok/Err` dataclasses |
@@ -65,7 +65,7 @@ The 30-second mental model. Everything else in this skill is detail under one of
 | Parallel awaits | `gather: a = f(); b = g()` | `async with asyncio.TaskGroup() as _tg: ...` |
 | Best-effort gather | `gather(strategy="best-effort"):` | `asyncio.gather(..., return_exceptions=True)` |
 | Spawn | `go f(x)` / `go f(x) -> task` | `typhon_runtime.tasks.spawn(...)` (strong-ref registry) |
-| Lazy module | `lazy import np = numpy` | `importlib.util.LazyLoader` proxy class |
+| Lazy module | `lazy import np = numpy` | bespoke `__TyphonLazy_np_` proxy class with double-checked locking |
 | Lazy module-level let | `lazy let CFG: Config = load()` | sentinel-cached `lazy_val(lambda: load())` |
 | Lazy class-level let | `lazy let cfg: Config = ...` inside class | `@cached_property` |
 | Comptime constant | `comptime let PORT: int = int(env("PORT", "8080"))` | inlined literal at build time |
@@ -99,7 +99,7 @@ def demo() -> None:
     let pi: float = 3.14159      # immutable
     mut counter: int = 0         # mutable
     counter = counter + 1        # ✅
-    # pi = 3.14                  # ❌ tyc::let_reassign
+    # pi = 3.14                  # ❌ tyc::immutable_assign
 ```
 
 Module-level bindings default to `let` if you skip the keyword — but a *local* `name = "x"` with no keyword is `tyc::missing_binding_kind`. Reach for `mut` only when you actually rebind.
@@ -130,11 +130,13 @@ class User:
     name: str
 
 impl User:
-    def display() -> str:        # no `self`; reference fields as plain names
-        return f"{name} (#{id})"
+    def display(self) -> str:    # take an explicit `self`; use `self.NAME`
+        return f"{self.name} (#{self.id})"
 ```
 
-Writing methods inside `class` is `tyc::manual_init` / wrong-place errors. Writing `__init__` is rejected — the constructor is generated. `self` is inserted at desugar.
+Earlier drafts of this guide suggested an implicit-`self` form where bare `name` resolved to `self.name`. That form was never implemented (the resolver can't see the enclosing class's fields by the time it walks the method body), so the explicit `self.NAME` access shown above is what works today. The bare-identifier sugar may come back later; explicit `self` is the durable form.
+
+Writing `__init__` inside `class` is rejected — the constructor is generated. `self` on impl-block methods is currently optional (it's inserted at desugar if omitted, but you can't reach class fields from a no-`self` method), so writing it explicitly is the recommended style.
 
 ### Rule 5 — `Any` only enters through `unsafe:` or `.dty` stubs
 
@@ -428,7 +430,7 @@ async def load(uid: int) -> Dashboard:
     return Dashboard(user=user, posts=posts, notifs=notifs)
 ```
 
-Lowers to `asyncio.TaskGroup` (cancel-on-failure). For best-effort semantics where each binding becomes `T | Exception`:
+Lowers to `asyncio.TaskGroup` (cancel-on-failure). Bindings inside the `gather:` block are an intentional exception to Rule 2 — they don't need `let`/`mut` because the keyword itself introduces them as immutable single-assignment names (the desugarer wraps the whole block as a fresh scope). For best-effort semantics where each binding becomes `T | Exception`:
 
 ```python
 gather(strategy="best-effort"):
@@ -441,6 +443,23 @@ Lowers to `asyncio.gather(..., return_exceptions=True)`.
 ### Automatic `gather` (opt-in)
 
 `[strictness] auto-gather = true` rewrites straight-line runs of independent `name = await callee(...)` into a `TaskGroup`, **but only when every callee is a same-module `async def` carrying `@gatherable`** and the LHS bindings don't alias. Imported async callees are left untouched so you cannot surprise upstream callers.
+
+The `@gatherable` decorator is the gate — without it, auto-gather is a no-op for that callee:
+
+```python
+@gatherable                          # opts this function in to auto-gather
+async def fetch_user(uid: int) -> User: ...
+
+@gatherable
+async def fetch_posts(uid: int) -> list[Post]: ...
+
+async def load(uid: int) -> Dashboard:
+    let user = await fetch_user(uid)     # rewritten into a TaskGroup …
+    let posts = await fetch_posts(uid)   # … because both callees are @gatherable
+    return Dashboard(user=user, posts=posts)
+```
+
+There is no diagnostic when a callee lacks `@gatherable` — the awaits just stay sequential. If you forget to decorate, you'll see no parallelism *and* no error. Run `tyc trace` or read the emitted Python to confirm whether a particular run got rewritten.
 
 ### `go` — fire-and-forget
 
@@ -487,7 +506,7 @@ Top-level module bindings default to `let` unless declared `mut`. Inside functio
 ## Lazy loading
 
 ```python
-lazy import np = numpy           # ✅ deferred via importlib.util.LazyLoader
+lazy import np = numpy           # ✅ deferred via bespoke `__TyphonLazy_np_` proxy class
 lazy from numpy import array     # ❌ rejected at parse time (PEP 690)
 ```
 
@@ -514,10 +533,12 @@ comptime let PORT: int = int(env("PORT", "8080"))
 comptime let DB_URL: str = env("DATABASE_URL")   # build fails if unset
 comptime let IS_PROD: bool = env("BUILD_TAG", "dev") == "prod"
 
+# User-defined `comptime def` functions parse today but the evaluator
+# can't yet inline calls to them — only the built-in `env()`, `int()`,
+# `str()`, `float()`, and arithmetic / comparison primitives are
+# supported. Listed here as the intended surface.
 comptime def feature(name: str) -> bool:
     return env(f"FEATURE_{name.upper()}", "0") == "1"
-
-comptime let DARK_MODE: bool = feature("dark_mode")
 ```
 
 Declare required env vars in `typhon.toml`:
@@ -527,7 +548,7 @@ Declare required env vars in `typhon.toml`:
 required = ["DATABASE_URL"]
 ```
 
-The sandbox allows: pure arithmetic, string ops, `env(name, default?)`, `list`/`dict`/`tuple` construction, calls to other `comptime` functions. It forbids: I/O, subprocess, network, random/time, arbitrary imports.
+The sandbox is intentionally tight. Today it supports: integer / float / string / boolean literals, basic arithmetic (`+ - * / //` and the comparable comparison ops), `env("NAME")` / `env("NAME", "default")`, and the `int()` / `str()` / `float()` casts. Container literals (`[...]`, `{...}`, `(...)`), method calls on strings (`"hi".upper()`), and user-defined `comptime def` functions are roadmapped but not yet evaluable. Anything else — I/O, subprocess, network, `random` / `time`, arbitrary imports — is permanently out of scope.
 
 Emitted Python sees only the inlined literal:
 
@@ -574,7 +595,7 @@ pgo-memoise = true               # also opt-in; reads typhon-profile.json
 pgo-min-calls = 100              # threshold; default 100
 ```
 
-Manually marking a function `@pure` that fails any of the six conditions is a hard error (`tyc::pure_violation`).
+Manually marking a function `@pure` that fails any of the six conditions is a hard error (`tyc::impure_pure_fn`).
 
 ---
 
@@ -716,7 +737,7 @@ Notable flags:
 - `tyc debug --entry api.py --debugger pudb`
 - `tyc add --dev pytest@8.2` / `tyc add --no-sync` / `tyc sync --dry-run`
 
-`tyc repl` quirks: each prompt re-executes the entire accumulated session (pure-scratch semantics, side effects fire once per prompt), multi-line blocks end on the first blank line, no readline/arrow-key support yet.
+`tyc repl` quirks: each prompt re-executes the entire accumulated session (pure-scratch semantics, side effects fire once per prompt), multi-line blocks end on the first blank line, no readline/arrow-key support yet. Bare single-line expressions auto-print their `repr(...)` — `>>> 1 + 1` prints `2` — matching the universal REPL convention.
 
 `tyc debug` is a v1 wrapper — frames surface as `build/*.py` paths. Pair with `tyc trace` to remap captured tracebacks back to `.ty`. A Typhon-native source-mapping debugger is a Phase-5 item.
 
@@ -772,16 +793,16 @@ The recurring diagnostic codes and what they actually mean. All are documented i
 | `tyc::missing_return_type` | Function has no `-> T` | Add an explicit return type — `-> None` if it returns nothing |
 | `tyc::implicit_any` | RHS infers to `Any` outside `unsafe` | Annotate, wrap in `unsafe:`, or stub the source via `.dty` |
 | `tyc::missing_binding_kind` | Local `=` without `let`/`mut` | Add `let` (default) or `mut` (if rebound) |
-| `tyc::let_reassign` | Reassigning a `let` binding | Change to `mut`, or extract a new `let` |
+| `tyc::immutable_assign` | Reassigning a `let` binding | Change to `mut`, or extract a new `let` |
 | `tyc::nullable_use` | Passing `T?` where `T` required | Narrow with `is None` / `guard` / early-return |
 | `tyc::missing_await` | Sync context calling `async def` | Add `await` and make caller `async` |
 | `tyc::async_without_await` (warn) | `async def` with no `await` inside | Drop `async` or await something |
 | `tyc::manual_init` | `class` defines `__init__` | Remove it — constructor is generated |
 | `tyc::frozen_assign` | Writing a field on a `frozen` class | Build a new instance |
 | `tyc::non_exhaustive_match` | `match` on a sealed union misses a variant | Add the missing `case` or use `case _:` |
-| `tyc::result_propagate_outside_result` | `?` inside a non-`Result` function | Change the signature or `match` explicitly |
+| `tyc::invalid_question_op` | `?` inside a non-`Result` function | Change the signature or `match` explicitly |
 | `tyc::result_error_mismatch` | `?` returns an `Err[E1]` into `Result[T, E2]` | Convert at the boundary |
-| `tyc::pure_violation` | `@pure` function fails one of the 6 conditions | Refactor or drop `@pure` |
+| `tyc::impure_pure_fn` | `@pure` function fails one of the 6 conditions | Refactor or drop `@pure` |
 | `tyc::interface_isinstance` | `isinstance(x, SomeInterface)` | Use static narrowing or refactor to a sealed union |
 | `tyc::stub_mismatch` | `.dty` vs `.py` drift detected by `tyc check --stubs` | Update the stub or implementation |
 | `tyc::unused_import` | Severity controlled by `[strictness] unused-import` | Remove the import (LSP "Remove unused import" code-action exists) |

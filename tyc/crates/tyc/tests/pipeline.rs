@@ -257,9 +257,10 @@ fn trace_rewrites_frame_with_map_file() {
     // feed a synthetic traceback pointing at the emitted `.py` to
     // `tyc trace` and verify the path is rewritten to the `.ty` source.
     //
-    // Use two annotated-assignment statements so Python lines 1 and 2 map
-    // directly to ty lines 1 and 2 (no leading blank line that a function
-    // definition would insert).
+    // Use two annotated-assignment statements. The emitter prepends a
+    // `from __future__ import annotations` header to every built module
+    // (so self-referencing class annotations don't NameError at import),
+    // so Python lines 2 and 3 map to ty lines 1 and 2 respectively.
     let tmp = tempfile::tempdir().unwrap();
     scaffold(tmp.path(), "x: int = 1\ny: str = \"hello\"\n");
     let build_status = tyc().arg("build").arg(tmp.path()).status().unwrap();
@@ -273,11 +274,11 @@ fn trace_rewrites_frame_with_map_file() {
     assert!(py_path.exists(), "main.py should exist after build");
     assert!(map_path.exists(), "main.py.map should exist after build");
 
-    // Write a synthetic traceback referencing line 2 of the built .py file.
-    // The v2 source map maps Python line 2 → ty line 2, so the line number
-    // is preserved in the rewritten output.
+    // Write a synthetic traceback referencing line 3 of the built .py file
+    // (the second user-visible statement, after the future-import header).
+    // The v2 source map should remap that back to ty line 2.
     let tb = format!(
-        "Traceback (most recent call last):\n  File \"{}\", line 2, in <module>\n    y: str = \"hello\"\n",
+        "Traceback (most recent call last):\n  File \"{}\", line 3, in <module>\n    y: str = \"hello\"\n",
         py_path.display()
     );
     let tb_path = tmp.path().join("tb.txt");

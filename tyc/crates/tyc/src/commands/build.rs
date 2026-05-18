@@ -312,11 +312,14 @@ pub fn run(args: BuildArgs) -> Result<()> {
         }
 
         let raw_class_line_starts = line_byte_starts(&prep.python_source, &prep.raw_class_lines);
+        let frozen_class_line_starts =
+            line_byte_starts(&prep.python_source, &prep.frozen_class_lines);
         let desugar_output = desugar_module_with(
             &module,
             DesugarOptions {
                 memoise_functions: memoise_targets,
                 raw_class_line_starts,
+                frozen_class_line_starts,
             },
         );
         if desugar_output.needs_typhon_runtime {
@@ -392,11 +395,14 @@ pub fn run(args: BuildArgs) -> Result<()> {
             .map(|p| p.into_syntax())
             .map_err(|e| miette!("parse error in '{}': {e}", path.display()))?;
         let raw_class_line_starts = line_byte_starts(&prep.python_source, &prep.raw_class_lines);
+        let frozen_class_line_starts =
+            line_byte_starts(&prep.python_source, &prep.frozen_class_lines);
         let desugar = desugar_module_with(
             &module,
             DesugarOptions {
                 memoise_functions: Vec::new(),
                 raw_class_line_starts,
+                frozen_class_line_starts,
             },
         );
         let stub_text = emit_stub(&desugar.module);
@@ -608,7 +614,15 @@ class Err(Generic[_E]):
     error: _E
 
 
-type Result[T, E] = Ok[T] | Err[E]
+# Use `typing.Union` rather than PEP 695 `type Result[T, E] = …` so the
+# generated runtime loads under Python 3.10 / 3.11 / 3.12 as well as the
+# 3.13+ default. The runtime never inspects the alias's generic
+# parameters — `isinstance(x, Err)` and the dataclass shape are what the
+# rest of the runtime relies on — so dropping the parameters here is
+# harmless. Static type checkers still see `Result` as a union of `Ok`
+# and `Err`.
+from typing import TypeAlias, Union
+Result: TypeAlias = Union[Ok, Err]
 
 __all__ = [\"Ok\", \"Err\", \"Result\", \"tasks\", \"lazy\", \"stdlib\", \"result\", \"parallel\"]
 ";
