@@ -46,6 +46,15 @@ pub use auto_gather::{collect_gatherable_async_fn_names, rewrite_auto_gather, Au
 pub mod pgo;
 pub use pgo::{load_profile_samples, pgo_memoise_targets, ProfileSample};
 
+pub mod parallel;
+pub use parallel::{rewrite_parallel_comprehensions, ParallelStats};
+
+pub mod extend_builtin;
+pub use extend_builtin::{
+    extract_builtin_extensions, rewrite_builtin_extension_calls, ExtensionExtractionStats,
+    ExtensionRegistry,
+};
+
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /// A value that was determined at build time by evaluating a `comptime`

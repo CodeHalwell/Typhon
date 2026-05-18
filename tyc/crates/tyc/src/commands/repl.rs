@@ -88,19 +88,28 @@ pub fn run(args: ReplArgs) -> Result<()> {
     let mut stdout = stdout.lock();
 
     let mut buf = String::new();
+    // Holds a line that closed a previous multi-line block as its
+    // dedent-to-0 terminator. When set, it is processed as the next
+    // top-level prompt instead of reading stdin.
+    let mut pending: Option<String> = None;
     loop {
-        write!(stdout, ">>> ").ok();
-        stdout.flush().ok();
-        buf.clear();
-        let n = stdin
-            .read_line(&mut buf)
-            .map_err(|e| miette!("read failed: {e}"))?;
-        if n == 0 {
-            // EOF — exit cleanly.
-            writeln!(stdout).ok();
-            break;
-        }
-        let line = buf.trim_end_matches(['\r', '\n']);
+        let line_owned: String = if let Some(p) = pending.take() {
+            p
+        } else {
+            write!(stdout, ">>> ").ok();
+            stdout.flush().ok();
+            buf.clear();
+            let n = stdin
+                .read_line(&mut buf)
+                .map_err(|e| miette!("read failed: {e}"))?;
+            if n == 0 {
+                // EOF — exit cleanly.
+                writeln!(stdout).ok();
+                break;
+            }
+            buf.trim_end_matches(['\r', '\n']).to_owned()
+        };
+        let line = line_owned.as_str();
         match line.trim() {
             ":quit" | ":q" | ":exit" => break,
             ":reset" => {
@@ -117,11 +126,18 @@ pub fn run(args: ReplArgs) -> Result<()> {
         }
 
         // Multi-line: if the line ends with `:` or `\`, keep reading until
-        // a blank line. Keeps `def`/`class` blocks practical. EOF mid-
-        // block exits cleanly rather than half-compiling a torn block.
+        // a block terminator. Two terminators are accepted:
+        //   • a blank line (matches Python's REPL — convenient for typed
+        //     `def`/`class` bodies), or
+        //   • a fully-dedented continuation line (one that starts at
+        //     column 0 and is not itself a continuation). The dedent line
+        //     is preserved and treated as the next prompt's body, so a
+        //     follow-up sibling statement isn't lost.
+        // EOF mid-block exits cleanly rather than half-compiling a torn block.
         let mut block = String::from(line);
         block.push('\n');
         let mut hit_eof = false;
+        let mut carryover: Option<String> = None;
         if needs_continuation(line) {
             loop {
                 write!(stdout, "... ").ok();
@@ -137,13 +153,27 @@ pub fn run(args: ReplArgs) -> Result<()> {
                 if buf.trim().is_empty() {
                     break;
                 }
-                block.push_str(buf.trim_end_matches(['\r', '\n']));
+                let body = buf.trim_end_matches(['\r', '\n']);
+                // Dedent-to-0 terminator: a non-blank line starting at
+                // column 0 closes the current block. The line itself is
+                // carried over so the next loop iteration processes it as
+                // a fresh top-level prompt rather than discarding the
+                // user's input.
+                let indented = body.starts_with([' ', '\t']);
+                if !indented {
+                    carryover = Some(body.to_owned());
+                    break;
+                }
+                block.push_str(body);
                 block.push('\n');
             }
         }
         if hit_eof {
             writeln!(stdout).ok();
             break;
+        }
+        if let Some(next) = carryover {
+            pending = Some(next);
         }
 
         // Try to compile; on error, roll back and report.

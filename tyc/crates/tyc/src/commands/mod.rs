@@ -3,6 +3,7 @@
 pub mod build;
 pub mod check;
 pub mod debug;
+pub mod deps;
 pub mod fmt;
 pub mod init;
 pub mod lsp;

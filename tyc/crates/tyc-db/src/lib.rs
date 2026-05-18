@@ -324,18 +324,19 @@ unsafe:
     }
 
     #[test]
-    fn check_file_rejects_extend_on_builtin_str() {
+    fn check_file_accepts_extend_on_builtin_str() {
+        // `extend BUILTIN:` was previously a hard error.  As of the
+        // extension-method-on-builtins work it is accepted: preprocess
+        // lowers the block to a sentinel class that downstream passes
+        // promote to free functions plus a call-site rewrite.  The type
+        // checker should therefore see no diagnostics here.
         let mut db = TycDatabase::new();
         let src = "extend str:\n    def slug(self) -> str: return self\n";
         let diags = check_file(&mut db, "<test>".to_owned(), src.to_owned());
         assert!(
-            diags.has_errors(),
-            "extend on a built-in type must produce a diagnostic"
-        );
-        let msg = format!("{:?}", diags.errors()[0]);
-        assert!(
-            msg.contains("extend str") || msg.contains("built-in"),
-            "diagnostic should mention the rejected builtin; got {msg}"
+            !diags.has_errors(),
+            "extend on a built-in type must no longer error; got {:?}",
+            diags.errors()
         );
     }
 
