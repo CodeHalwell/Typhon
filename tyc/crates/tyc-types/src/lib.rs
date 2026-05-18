@@ -668,8 +668,9 @@ impl<'a> Checker<'a> {
     }
 
     /// Return `true` if class `cls_name`'s member shape covers every required
-    /// member of `iface_name`'s shape (member presence only — full signature
-    /// compatibility is a future enhancement).
+    /// member of `iface_name`'s shape.  Checks method arity and annotated field
+    /// types — a field declared `name: str` in the interface must be `str` in
+    /// the implementing class too.
     fn class_conforms_to_interface(&self, cls_name: &str, iface_name: &str) -> bool {
         let Some(iface) = self.interfaces.get(iface_name) else {
             return false;
@@ -683,9 +684,12 @@ impl<'a> Checker<'a> {
                 _ => return false,
             }
         }
-        for f in iface.shape.fields.keys() {
-            if !cls.fields.contains_key(f) && !cls.methods.contains_key(f) {
-                return false;
+        for (f, iface_type) in &iface.shape.fields {
+            match cls.fields.get(f) {
+                Some(cls_type) if assignable(iface_type, cls_type) => {}
+                Some(_) => return false, // field present but wrong type
+                None if cls.methods.contains_key(f) => {} // property-like method satisfies field
+                None => return false,
             }
         }
         true
@@ -710,11 +714,17 @@ impl<'a> Checker<'a> {
                 None => missing.push(m.clone()),
             }
         }
-        for f in iface.shape.fields.keys() {
-            let has_field = cls.is_some_and(|c| c.fields.contains_key(f));
+        for (f, iface_type) in &iface.shape.fields {
             let has_method = cls.is_some_and(|c| c.methods.contains_key(f));
-            if !has_field && !has_method {
-                missing.push(f.clone());
+            match cls.and_then(|c| c.fields.get(f)) {
+                Some(cls_type) if assignable(iface_type, cls_type) => {}
+                Some(cls_type) => missing.push(format!(
+                    "{f}: type mismatch (expected `{}`, got `{}`)",
+                    iface_type.display(),
+                    cls_type.display()
+                )),
+                None if has_method => {}
+                None => missing.push(f.clone()),
             }
         }
         missing.sort();
@@ -2775,6 +2785,97 @@ let r: str = identity(s)
         assert!(
             !has_typevar_bound_error(&d),
             "unbounded typevar should not produce a typevar_bound diagnostic"
+        );
+    }
+
+    // ── interface field type checking ────────────────────────────────────────
+
+    #[test]
+    fn interface_field_correct_type_passes() {
+        let src = "\
+interface Named:
+    name: str
+
+class Dog:
+    name: str
+
+let d: Named = Dog()
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "class with correct field type should conform to interface; errors: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn interface_field_wrong_type_rejected() {
+        // `Dog.name: int` does not satisfy `Named.name: str`.
+        let src = "\
+interface Named:
+    name: str
+
+class Dog:
+    name: int
+
+let d: Named = Dog()
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "class with wrong field type must not conform to interface"
+        );
+        let msg = format!("{}", d.errors()[0]);
+        assert!(
+            msg.contains("Named") || msg.contains("name"),
+            "diagnostic should mention the interface or field; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn interface_field_missing_rejected() {
+        // `Dog` is missing the `name` field entirely.
+        let src = "\
+interface Named:
+    name: str
+
+class Dog:
+    age: int
+
+let d: Named = Dog()
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "class missing required interface field must be rejected"
+        );
+        let msg = format!("{}", d.errors()[0]);
+        assert!(
+            msg.contains("name") || msg.contains("Named"),
+            "diagnostic should name the missing field; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn interface_field_mismatch_diagnostic_names_types() {
+        // The diagnostic text should include both the expected and actual types.
+        let src = "\
+interface Config:
+    port: int
+
+class BadConfig:
+    port: str
+
+let c: Config = BadConfig()
+";
+        let d = check(src);
+        assert!(d.has_errors(), "type-mismatched field must be rejected");
+        let msg = format!("{}", d.errors()[0]);
+        // The conformance error wraps field mismatches; the outer message names the interface.
+        assert!(
+            msg.contains("Config") || msg.contains("port"),
+            "diagnostic should reference the interface or field name; got: {msg}"
         );
     }
 }

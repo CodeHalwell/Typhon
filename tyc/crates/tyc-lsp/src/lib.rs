@@ -44,14 +44,14 @@ pub struct Backend {
     client: Client,
     db: Arc<Mutex<TycDatabase>>,
     log_level: LogLevel,
-    /// Per-document Salsa handles and raw text, keyed by URI string.
+    /// Per-document Salsa handles, keyed by URI string.
     ///
     /// The [`SourceFile`] handle is the Salsa input for this document; on
     /// `did_change` it is updated via `set_text` so Salsa propagates
     /// invalidations incrementally rather than creating a fresh entity.
-    /// The raw `String` is kept alongside it so hover/definition can read
-    /// the original Typhon source without acquiring the db lock.
-    documents: Arc<Mutex<HashMap<String, (SourceFile, String)>>>,
+    /// Raw text is stored inside the Salsa input itself and read back via
+    /// `source_file.text(db)` when needed, avoiding dual-state synchronisation.
+    documents: Arc<Mutex<HashMap<String, SourceFile>>>,
     /// Resolved-module cache for hover/definition/completion.
     ///
     /// Maps each URI to the `(preprocessed_text, ResolvedModule)` pair from
@@ -119,7 +119,7 @@ impl Backend {
         let source_file: SourceFile = {
             let existing = {
                 let docs = self.documents.lock().await;
-                docs.get(&uri_str).map(|(sf, _)| *sf)
+                docs.get(&uri_str).copied()
             };
             let mut db_guard = self.db.lock().await;
             if let Some(sf) = existing {
@@ -130,11 +130,11 @@ impl Backend {
             }
         };
 
-        // Cache the (handle, raw text) pair so hover/definition handlers can
-        // resolve without locking the db for text access.
+        // Cache the Salsa handle; raw text is stored inside Salsa itself and
+        // retrieved via `source_file.text(db)` when needed.
         {
             let mut docs = self.documents.lock().await;
-            docs.insert(uri_str, (source_file, text.clone()));
+            docs.insert(uri_str, source_file);
         }
 
         let result = tokio::task::spawn_blocking(move || {
@@ -354,18 +354,21 @@ impl LanguageServer for Backend {
 impl Backend {
     /// Look up the most recent raw Typhon source text for `uri`.  Returns
     /// `None` when the editor has not yet opened the file or it was closed.
-    /// Does not acquire the db lock — text is stored alongside the SourceFile
-    /// handle in the documents map.
+    /// Text is read back from the Salsa database rather than a duplicate store.
     async fn document_text(&self, uri: &Uri) -> Option<String> {
-        let docs = self.documents.lock().await;
-        docs.get(uri.as_str()).map(|(_, text)| text.clone())
+        let sf = {
+            let docs = self.documents.lock().await;
+            docs.get(uri.as_str()).copied()?
+        };
+        let db = self.db.lock().await;
+        Some(sf.text(&*db).clone())
     }
 
     /// Return the [`SourceFile`] Salsa handle for `uri`, or `None` when the
     /// file has not been opened.
     async fn source_file_for(&self, uri: &Uri) -> Option<SourceFile> {
         let docs = self.documents.lock().await;
-        docs.get(uri.as_str()).map(|(sf, _)| *sf)
+        docs.get(uri.as_str()).copied()
     }
 
     /// Return a [`ResolvedModule`] for `uri`, using a cached result when the
