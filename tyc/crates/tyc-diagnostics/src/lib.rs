@@ -256,6 +256,22 @@ pub enum TycError {
         #[label("not a `{interface}`")]
         span: SourceSpan,
     },
+
+    /// A type argument at a call site doesn't satisfy the TypeVar's declared bound.
+    #[error("type argument `{actual}` for `{typevar}` does not satisfy bound `{bound}`")]
+    #[diagnostic(
+        code(tyc::typevar_bound),
+        help("pass a value whose type is a subtype of `{bound}`")
+    )]
+    TypeVarBoundViolation {
+        typevar: String,
+        actual: String,
+        bound: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("inferred `{actual}` for `{typevar}`, which must satisfy `{bound}`")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -524,6 +540,25 @@ impl TycError {
             missing: missing.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::TypeVarBoundViolation`] diagnostic.
+    pub fn typevar_bound_violation(
+        typevar: impl Into<String>,
+        actual: impl Into<String>,
+        bound: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::TypeVarBoundViolation {
+            typevar: typevar.into(),
+            actual: actual.into(),
+            bound: bound.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
         }
     }
 
@@ -868,5 +903,23 @@ mod tests {
                 "code mismatch for {expected_code}: got {code}"
             );
         }
+    }
+
+    #[test]
+    fn typevar_bound_violation_contains_all_three_names() {
+        let e = TycError::typevar_bound_violation("T", "int", "Comparable", "f.ty", "f(1)", 0, 4);
+        assert!(matches!(e, TycError::TypeVarBoundViolation { .. }));
+        let msg = e.to_string();
+        assert!(msg.contains('T'), "typevar name should appear");
+        assert!(msg.contains("int"), "actual type should appear");
+        assert!(msg.contains("Comparable"), "bound should appear");
+    }
+
+    #[test]
+    fn typevar_bound_violation_code_is_stable() {
+        use miette::Diagnostic;
+        let e = TycError::typevar_bound_violation("T", "int", "C", "f.ty", "src", 0, 1);
+        let code = e.code().unwrap().to_string();
+        assert_eq!(code, "tyc::typevar_bound");
     }
 }

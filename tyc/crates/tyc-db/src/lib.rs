@@ -35,10 +35,11 @@ pub struct SourceFile {
 
 /// Tracked query: the preprocessed (Python-compatible) text of a file.
 ///
-/// This is the "parse-prepare" step: it strips `val`/`var` and rewrites
-/// `T?` to `T | None`. Salsa caches the result, so an editor edit that
-/// doesn't change the file's text content (e.g. saving with no edits)
-/// avoids re-running the preprocess pass.
+/// This is the "parse-prepare" step: it strips Typhon-specific line-prefix
+/// keywords (`let`/`mut`, `model`, `interface`, etc.) and rewrites `T?` to
+/// `T | None`. Salsa caches the result, so an editor edit that doesn't change
+/// the file's text content (e.g. saving with no edits) avoids re-running the
+/// preprocess pass.
 #[salsa::tracked]
 pub fn preprocessed_text(db: &dyn salsa::Database, file: SourceFile) -> String {
     let text = file.text(db);

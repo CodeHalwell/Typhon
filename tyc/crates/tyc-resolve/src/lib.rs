@@ -31,7 +31,7 @@ pub enum Mutability {
 /// What kind of entity a binding introduces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindingKind {
-    /// A `val` or `var` value binding (annotated or not).
+    /// A `let` or `mut` value binding (annotated or not).
     Value,
     /// A `def` function definition.
     Function,
