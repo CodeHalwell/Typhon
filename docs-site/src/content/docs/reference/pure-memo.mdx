@@ -1,0 +1,147 @@
+---
+title: "@pure and @memo"
+description: Purity verification and opt-in functools.cache injection.
+sidebar:
+  order: 16
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+`@pure` asserts a function meets six conditions. `@memo` adds `@functools.cache` after the check. `@pure(memo=True)` is the combined form.
+
+## The six conditions
+
+A function is verifiable as **pure** only if all six hold:
+
+1. **Synchronous.** No coroutines, generators, or async generators.
+2. **All parameter types are hashable.** Primitives, frozen dataclasses, tuples of hashable types, sealed-union variants whose payloads are themselves hashable.
+3. **No I/O in the transitive call graph.** No `open`, `socket`, `subprocess`, logger writes, `print`, DB drivers. `unsafe`-region and stubbed calls count as impure unless the stub is annotated `@pure`.
+4. **No non-determinism.** No `time.*`, `random.*`, `secrets.*`, `uuid.*`, `os.urandom`.
+5. **No reads from or writes to mutable module-level state.** Reads from `comptime let` are fine; reads from a module `mut` are not.
+6. **No exceptions raised.** Pure functions return `Result[T, E]` to express failure.
+
+## `@pure`
+
+Asserts purity. Verifies the six conditions; raises `tyc::impure_pure_fn` on violation.
+
+```python
+@pure
+def normalise(s: str) -> str:
+    return s.strip().lower()
+```
+
+`@pure` is erased at emit — nothing decorates the emitted function.
+
+## `@memo`
+
+Inserts `@functools.cache`. The function must qualify as pure.
+
+```python
+@memo
+def fib(n: int) -> int:
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+```
+
+Emits:
+
+```python
+import functools
+
+@functools.cache
+def fib(n: int) -> int:
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+```
+
+`import functools` is auto-injected if needed.
+
+### Bounded cache
+
+```python
+@memo(max=128)
+def expensive(args: ...) -> ...: ...
+```
+
+Emits `@functools.lru_cache(maxsize=128)`.
+
+## `@pure(memo=True)`
+
+Combined form:
+
+```python
+@pure(memo=True)
+def hash_password(salt: str, pw: str) -> str:
+    ...
+```
+
+Same effect as `@pure` + `@memo` together.
+
+## Project-wide auto-memoisation
+
+```toml
+[strictness]
+auto-memoise = true
+```
+
+When on, *every* function the analyser infers as pure gets `@functools.cache` automatically. **Off by default.** Caches extend the lifetime of every argument and return value; that is not a transparent change. Opt in deliberately.
+
+## PGO-guided memoisation
+
+```toml
+[strictness]
+pgo-memoise = true
+pgo-min-calls = 100
+```
+
+When on, `tyc build` reads `typhon-profile.json` (produced by a prior `tyc profile` run) and promotes pure functions whose observed call count meets `pgo-min-calls` to `@functools.cache`. Missing profile file is not an error — PGO is best-effort.
+
+This is the right shape for hot-loop helpers that aren't worth manually marking but show up at the top of a profile.
+
+## When `@pure` fails
+
+```python
+@pure
+def fetch(url: str) -> str:
+    import urllib.request
+    return urllib.request.urlopen(url).read().decode()
+```
+
+```
+error[tyc::impure_pure_fn]: `fetch` is annotated `@pure` but performs I/O
+                            (urllib.request.urlopen)
+ ┌─ src/main.ty:3:12
+ │
+3 │     return urllib.request.urlopen(url).read().decode()
+ │            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ I/O is not allowed in `@pure` functions
+```
+
+Fix: drop `@pure`, or refactor to take the body as a parameter (the *caller* does the I/O; the pure function processes the result).
+
+## Why no implicit memoisation?
+
+Caches change observable behaviour:
+
+- The first call costs full computation; subsequent calls are O(1).
+- Cached arguments and return values **stay alive forever** (or until cache eviction). For large args / large returns this matters.
+- The cache is process-local. Different processes (workers, threads with separate event loops) won't share.
+
+These are tradeoffs, not free lunches. Opt in deliberately.
+
+## When to use which
+
+| Want | Use |
+|------|-----|
+| Assert purity but no cache | `@pure` |
+| Cache, with purity check | `@memo` |
+| Combined, with explicit max | `@pure(memo=True)` + `@memo(max=N)` (separate) |
+| Project-wide caching of every pure fn | `[strictness] auto-memoise = true` |
+| Cache only the actually-hot pure fns | `[strictness] pgo-memoise = true` plus `tyc profile` |
+
+## Where next
+
+- [Advanced Features (tour)](/Typhon/tour/advanced/) — teaching page.
+- [Purity Errors (diagnostics)](/Typhon/diagnostics/purity-errors/) — `impure_pure_fn` and friends.
+- [`tyc profile`](/Typhon/cli/profile/) — generating profile data.

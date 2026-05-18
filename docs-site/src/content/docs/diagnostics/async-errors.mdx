@@ -1,0 +1,58 @@
+---
+title: Async Errors
+description: Diagnostics around async / await / gather / go.
+sidebar:
+  order: 8
+---
+
+## `tyc::missing_await`
+
+A sync context calls an `async def` without `await`:
+
+```python
+async def fetch(url: str) -> str: ...
+
+def main() -> None:
+    let body: str = fetch("...")    # ❌ coroutine, not str
+```
+
+**Fix:** add `await` (and make `main` async):
+
+```python
+async def main_async() -> None:
+    let body: str = await fetch("...")
+
+def main() -> None:
+    asyncio.run(main_async())
+```
+
+## `tyc::async_without_await` (warning)
+
+An `async def` contains no `await`:
+
+```python
+async def helper() -> int:
+    return 42    # ⚠️ no await
+```
+
+**Fix:** drop `async`, or actually `await` something. Don't suppress — it's almost always a mistake.
+
+## `tyc::interface_isinstance`
+
+`isinstance(x, MyInterface)`:
+
+```python
+interface Drawable:
+    def draw(self) -> None
+
+def f(x: object) -> None:
+    if isinstance(x, Drawable):    # ❌
+        x.draw()
+```
+
+**Fix:** use static narrowing or a sealed union; or write an explicit predicate function. See [Interfaces](/Typhon/types/interfaces/) for why.
+
+## Where next
+
+- [`async`, `await`, `gather`, `go` reference](/Typhon/reference/async/) — the surface.
+- [Async and Concurrency (tour)](/Typhon/tour/async/) — teaching page.

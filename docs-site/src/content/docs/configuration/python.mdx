@@ -1,0 +1,36 @@
+---
+title: "[python]"
+description: Python target version and free-threaded mode.
+sidebar:
+  order: 3
+---
+
+```toml
+[python]
+target = "3.13"
+free-threaded = false
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `target` | `"3.13"` \| `"3.14"` | `"3.13"` | Target CPython version. Drives syntax choices and a few lowering decisions. |
+| `free-threaded` | bool | `false` | Allow emit paths that use threads for parallelism (requires 3.13t/3.14t). Default `false` until 3.14 ships as the default Python. |
+
+## Targets
+
+- **`"3.13"`** — default. Supports PEP 695 generics natively. Most projects.
+- **`"3.14"`** — same, plus any 3.14-specific syntax the emitter takes advantage of.
+
+Older targets (`"3.12"`, `"3.11"`) are not supported in v1 — they would need a PEP 695 → `TypeVar` rewrite that we haven't built.
+
+## `free-threaded = true`
+
+Opts into the threading-based parallelism emit paths:
+
+- `go` on a CPU-bound function lowers to `ThreadPoolExecutor.submit` instead of `asyncio.Task`.
+- The analyser may emit `ThreadPoolExecutor.map(...)` for pure-function comprehensions over large collections (`[strictness] auto-parallel`).
+- Every emitted parallel block first checks `sys._is_gil_enabled()` and falls back to sequential if a GIL build is detected.
+
+Requires the special `python3.13t` / `python3.14t` interpreter build. On a stock GIL build, the runtime fallback keeps the code correct (sequential execution).
+
+**Default off until 3.14 ships as the default Python.**

@@ -1,0 +1,81 @@
+---
+title: unsafe
+description: Lexical region that tolerates dynamism; values must be re-asserted at the boundary.
+sidebar:
+  order: 17
+---
+
+`unsafe:` opens a lexical region where the checker tolerates `Any`-shaped expressions. Values inside acquire an `Unsafe[T]` marker that cannot cross out without re-assertion.
+
+## Syntax
+
+```
+"unsafe" ":" suite
+```
+
+```python
+unsafe:
+    let data = some_untyped_lib.fetch()
+    let first = data[0]
+    let tag = first.get("tag")
+```
+
+## What is suppressed
+
+Inside `unsafe:`, the checker silences these diagnostics:
+
+- `tyc::implicit_any`
+- `tyc::type_mismatch`
+- `tyc::nullable_use`
+- `tyc::interface_isinstance`
+- `tyc::wrong_arg_count`
+- `tyc::not_callable`
+- `tyc::non_exhaustive_match`
+
+Outside the block, diagnostics apply normally.
+
+## Boundary check
+
+Values originating in `unsafe:` carry a hidden `Unsafe[T]` marker. They cannot flow into a concrete-typed context without re-assertion:
+
+```python
+def parse() -> int:
+    unsafe:
+        let v = mystery()
+    return v       # ❌ Unsafe[Any] does not satisfy int
+```
+
+Re-assert via annotation, narrowing, or cast:
+
+```python
+def parse() -> int:
+    unsafe:
+        let v = mystery()
+        let checked: int = int(v)
+    return checked
+```
+
+## Lowering
+
+`unsafe:` lowers to `if True:` so scope rules are preserved:
+
+```python
+# Emitted
+if True:
+    data = some_untyped_lib.fetch()
+    first = data[0]
+    tag = first.get("tag")
+```
+
+## When to use
+
+- Exploring a new dependency.
+- One-off scripts touching untyped code.
+- Genuinely dynamic code (`eval`, RPC stubs).
+
+For anything long-lived, write a [`.dty` stub](/Typhon/interop/dty-stubs/) instead.
+
+## See also
+
+- [The Unsafe Boundary](/Typhon/types/unsafe/) — the full reference.
+- [Wrapping an Untyped Library (recipe)](/Typhon/recipes/wrapping-library/) — patterns.

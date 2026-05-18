@@ -1,0 +1,190 @@
+---
+title: async, await, gather, go
+description: Asynchronous primitives and Typhon's concurrency helpers.
+sidebar:
+  order: 12
+---
+
+Typhon's async story is **explicit, not inferred**. A function is async because you said so. The keywords:
+
+- `async def` / `await` — Python's standard coroutine machinery.
+- `gather:` — parallel awaits (lowers to `TaskGroup`).
+- `go` — fire-and-forget spawn (lowers to `typhon_runtime.tasks.spawn`).
+
+## `async def` and `await`
+
+```python
+async def fetch(url: str) -> bytes:
+    body = await http.get(url)
+    return body
+```
+
+Static checks:
+
+- A function declared `async` with no `await` is `tyc::async_without_await` (warning).
+- A sync function calling an `async def` without `await` is `tyc::missing_await` (hard error).
+
+## `gather:`
+
+A block that awaits multiple expressions in parallel:
+
+```python
+async def f(uid: int) -> Dashboard:
+    gather:
+        user   = fetch_user(uid)
+        posts  = fetch_posts(uid)
+        notifs = fetch_notifs(uid)
+    return Dashboard(user=user, posts=posts, notifs=notifs)
+```
+
+Bindings inside `gather:` are single-assignment (no `let`/`mut` required — desugarer wraps the whole block as a fresh scope).
+
+### Lowering
+
+```python
+# Emitted (default)
+async with asyncio.TaskGroup() as _tg:
+    _t_user   = _tg.create_task(fetch_user(uid))
+    _t_posts  = _tg.create_task(fetch_posts(uid))
+    _t_notifs = _tg.create_task(fetch_notifs(uid))
+user   = _t_user.result()
+posts  = _t_posts.result()
+notifs = _t_notifs.result()
+```
+
+`TaskGroup` is the safe default: any task's failure cancels the siblings.
+
+### Best-effort variant
+
+```python
+gather(strategy="best-effort"):
+    user   = fetch_user(uid)
+    posts  = fetch_posts(uid)
+```
+
+Lowers to `asyncio.gather(..., return_exceptions=True)`. Each binding's type becomes `T | BaseException` — the checker reflects that.
+
+### Automatic gather (opt-in)
+
+```toml
+[strictness]
+auto-gather = true
+```
+
+When on, the analyser rewrites straight-line runs of independent `name = await callee(...)` statements into a `TaskGroup`, *but only when*:
+
+1. Every callee is a same-module `async def` with the `@gatherable` decorator.
+2. LHS bindings don't alias.
+3. The statements are contiguous and independent.
+
+```python
+@gatherable
+async def fetch_user(uid: int) -> User: ...
+
+@gatherable
+async def fetch_posts(uid: int) -> list[Post]: ...
+
+async def load(uid: int) -> tuple[User, list[Post]]:
+    let user  = await fetch_user(uid)     # rewritten…
+    let posts = await fetch_posts(uid)    # …into a TaskGroup
+    return user, posts
+```
+
+Without `@gatherable`, the rewrite doesn't fire. There's no diagnostic when callees are undecorated; you simply get sequential execution.
+
+## `go`
+
+Fire-and-forget spawn:
+
+```python
+go send_welcome(user)
+```
+
+Lowers to:
+
+```python
+typhon_runtime.tasks.spawn(send_welcome(user))
+```
+
+The runtime helper holds a strong reference to the task and clears it from a done-callback. This prevents the common Python footgun where a bare `asyncio.create_task(...)` whose handle is dropped can be garbage-collected mid-flight (the event loop holds only weak references).
+
+### Capturing the handle
+
+```python
+go send_welcome(user) -> email_task
+# later:
+await email_task
+```
+
+The `-> handle` form binds the spawn result so you can join later.
+
+### Free-threaded variant
+
+When `[python] free-threaded = true`, `go` on a CPU-bound function lowers to `ThreadPoolExecutor.submit` instead of `asyncio.Task`. The emitter inserts `sys._is_gil_enabled()` checks at runtime to fall back to sequential when run under a GIL build.
+
+## Lifecycle
+
+`asyncio.run(main())` is the standard entry point. Typhon's primitives compose normally:
+
+```python
+import asyncio
+
+async def main_async(argv: list[str]) -> int:
+    gather:
+        a = fetch_a()
+        b = fetch_b()
+    go background_task()
+    return 0
+
+def main() -> None:
+    sys.exit(asyncio.run(main_async(sys.argv)))
+```
+
+## `import asyncio` is auto-injected
+
+The desugar pass inserts `import asyncio` when any `gather:` or `go` lowering needs it. You don't have to add the import yourself (though it's harmless to).
+
+## Common mistakes
+
+### Forgetting `await`
+
+```python
+async def main() -> None:
+    let body: str = fetch("...")    # ❌ coroutine, not str
+```
+
+`tyc::missing_await`. Add `await`.
+
+### `async` with no `await`
+
+```python
+async def helper() -> int:
+    return 42
+```
+
+`tyc::async_without_await` (warning). Drop `async` or await something.
+
+### `asyncio.create_task` for fire-and-forget
+
+```python
+asyncio.create_task(send_welcome(user))    # ⚠️ task may be GC'd
+```
+
+Use `go send_welcome(user)`.
+
+### Blocking I/O inside `async`
+
+```python
+async def load() -> bytes:
+    with open("data.bin", "rb") as f:
+        return f.read()    # blocks the event loop
+```
+
+Typhon doesn't catch this (Python-wide hazard). Use `aiofiles` or `asyncio.to_thread(...)`.
+
+## Where next
+
+- [Async and Concurrency (tour)](/Typhon/tour/async/) — teaching page.
+- [`gather:` → TaskGroup (lowering)](/Typhon/lowering/gather/) — exactly what is emitted.
+- [`go` → spawn registry (lowering)](/Typhon/lowering/go/) — strong-ref details.
+- [Concurrent Data Fetching (recipe)](/Typhon/recipes/concurrent-fetch/) — worked pattern.

@@ -1,0 +1,77 @@
+---
+title: Source Maps (.py.map)
+description: Per-statement (out_line → ty_line) tables that let tyc trace remap tracebacks back to .ty source.
+sidebar:
+  order: 9
+---
+
+Every emitted `.py` ships with a sidecar `.py.map` file in v2 format. It carries a per-statement `(out_line → ty_line)` table the LSP and `tyc trace` use.
+
+## What's in a `.py.map` v2
+
+```json
+{
+  "version": 2,
+  "source_file": "src/main.ty",
+  "mappings": [
+    {"out_line": 1, "ty_line": 1},
+    {"out_line": 5, "ty_line": 4},
+    {"out_line": 7, "ty_line": 7},
+    ...
+  ]
+}
+```
+
+Each mapping records the *first line of a statement* in the output file and the corresponding line in the input. Statements that span multiple lines map to their start lines.
+
+## Why per-statement, not per-token
+
+TypeScript's `.js.map` is per-token, which is great for column-level navigation. Typhon's `.py.map` is per-statement because:
+
+- Typhon's transformations are statement-grained (a `gather:` block becomes a multi-line `TaskGroup`, but the *first statement* of each preserves its original line).
+- Per-statement maps are 10× smaller and 10× faster to parse.
+- Column-level mapping would be a Phase-5 enhancement; we haven't needed it yet.
+
+## How `tyc trace` uses it
+
+```bash
+python build/main.py 2>err.log
+tyc trace err.log
+```
+
+`tyc trace` reads the Python traceback, looks up each `File "build/main.py", line N` frame, finds the matching `out_line → ty_line` mapping, and rewrites the frame to `File "src/main.ty", line M`.
+
+The output looks like a normal Python traceback but points at your source.
+
+## How the LSP uses it
+
+For cross-file go-to-definition across the `.ty` / `.py` boundary. When you're in a `.ty` file and you go-to-definition on an import from a `.py` (or vice versa), the LSP uses the source maps to land on the right line.
+
+## Where the maps live
+
+Alongside the emitted `.py`:
+
+```
+build/
+├── main.py
+├── main.py.map
+├── lib/users.py
+└── lib/users.py.map
+```
+
+Safe to delete; they regenerate on the next `tyc build`. Don't commit them.
+
+## Implementation
+
+The hand-written printer in `tyc-emit` records each statement's start line as it prints. When the printer is done, it emits the JSON sidecar.
+
+The choice to hand-write the printer (rather than vendor `ruff_python_codegen`) was driven by exactly this requirement: upstream codegen doesn't expose the per-statement line-offset hook. See [Architecture](/Typhon/internals/architecture/) for more on the printer.
+
+## v1 → v2 migration
+
+Older `.py.map` files used v1 format (single offset for the whole file). v2 is per-statement. `tyc trace` reads both formats but emits v2 only.
+
+## Where next
+
+- [`tyc trace`](/Typhon/cli/trace/) — the consumer of source maps.
+- [Architecture](/Typhon/internals/architecture/) — why we hand-wrote the printer.

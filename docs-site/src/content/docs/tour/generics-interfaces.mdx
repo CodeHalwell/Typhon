@@ -1,0 +1,293 @@
+---
+title: Generics and Interfaces
+description: PEP 695 generics with bidirectional inference, and structural interfaces that lower to typing.Protocol.
+sidebar:
+  order: 8
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Two tools for writing code that works across many types: **generics** (one definition, many parameter types) and **interfaces** (structural contracts — anything with the right shape satisfies them). Both erase at emit time — Python's duck typing carries the runtime; Typhon checks at compile time.
+
+## Generic functions
+
+Typhon uses **PEP 695** generic syntax: type parameters live in square brackets right after the name.
+
+```python
+def first[T](xs: list[T]) -> T?:
+    if len(xs) == 0:
+        return None
+    return xs[0]
+```
+
+`T` is a type parameter scoped to this function. Call sites infer it from the arguments:
+
+```python
+let n: int? = first([1, 2, 3])           # T = int
+let s: str? = first(["a", "b"])          # T = str
+let none_int: int? = first([])           # ⚠️ T unconstrained — annotate the call:
+let none_int: int? = first[int]([])      # ✅ explicit
+```
+
+When the argument is empty (or any case where `T` can't be inferred), spell `T` explicitly with `first[int](...)`.
+
+### How inference works
+
+Inference is **bidirectional**:
+
+- **Forward.** Parameter type → typevar binding. `first([1, 2, 3])` binds `T` to `int` because the list element is `int`.
+- **Recursive.** Structural patterns work. `def get[K, V](d: dict[K, V], k: K) -> V?` binds both `K` and `V` from the dict argument.
+- **Conflict resolution.** If two parameters force conflicting bindings, the result widens to a union. `pair[T](a: T, b: T)` called as `pair(1, "two")` infers `T = int | str`.
+
+Multi-argument constraint solving and bounded type vars are still partial in the current release — when in doubt, spell `T` explicitly.
+
+## Generic classes
+
+```python
+class Box[T]:
+    value: T
+
+impl[T] Box[T]:
+    def get(self) -> T:
+        return self.value
+
+    def map[U](self, f: Callable[[T], U]) -> Box[U]:
+        return Box(value=f(self.value))
+```
+
+Use them like any other type:
+
+```python
+let b: Box[int] = Box(value=10)
+let s: Box[str] = b.map(lambda n: f"n={n}")    # Box[str]
+```
+
+A few notes:
+
+- `Box[T]` in the `class` declaration introduces `T`. Reference `Box[T]` (the concrete-but-still-generic type) inside `impl[T] Box[T]:`.
+- `map` introduces a *new* type parameter `U` because it's converting `Box[T]` to `Box[U]`. The compiler binds `U` from the return type of `f`.
+
+## Type aliases
+
+```python
+type Vec[T] = list[T]
+type Pair[A, B] = tuple[A, B]
+type Lookup[K, V] = dict[K, list[V]]
+```
+
+Aliases are transparent — `Vec[int]` *is* `list[int]`. They're a readability tool, not a new type.
+
+## Interfaces
+
+An `interface` is a *structural* contract: any type that provides the listed members (with compatible signatures) satisfies the interface, no explicit `implements` clause required.
+
+```python
+interface Drawable:
+    def draw(self) -> None
+    def width(self) -> float
+    def height(self) -> float
+
+class Button:
+    label: str
+
+impl Button:
+    def draw(self) -> None:
+        print(f"[ {self.label} ]")
+    def width(self) -> float:
+        return float(len(self.label) + 4)
+    def height(self) -> float:
+        return 1.0
+
+def render(d: Drawable) -> None:
+    d.draw()
+
+render(Button(label="click me"))    # ✅ Button satisfies Drawable
+```
+
+The checker verifies, at the call site, that `Button` provides `draw`, `width`, and `height` with compatible signatures. Nothing in `Button`'s declaration mentions `Drawable` — that's what "structural" means.
+
+### Interfaces emit as `typing.Protocol`
+
+```python
+# Typhon
+interface Drawable:
+    def draw(self) -> None
+    def width(self) -> float
+    def height(self) -> float
+
+# Emitted Python
+from typing import Protocol
+
+class Drawable(Protocol):
+    def draw(self) -> None: ...
+    def width(self) -> float: ...
+    def height(self) -> float: ...
+```
+
+Mypy, pyright, and IDEs all understand `Protocol` the same way Typhon does.
+
+### Runtime `isinstance` is rejected by default
+
+This is a subtle but important rule. Python's `@runtime_checkable` validates only *attribute presence*, not signatures — so `isinstance(x, Drawable)` would say `True` for a class with a `draw` *field* that isn't even callable. Typhon refuses to compile bare `isinstance` against an interface:
+
+```python
+def render_if_able(x: object) -> None:
+    if isinstance(x, Drawable):    # ❌ tyc::interface_isinstance
+        x.draw()
+```
+
+```
+error[tyc::interface_isinstance]: runtime `isinstance` against an interface is unsafe
+                                  by default; use static narrowing or opt into
+                                  `@runtime_checkable` explicitly
+```
+
+Either redesign to use static types (sealed union, generic parameter), or, if you genuinely need a runtime check, write an explicit predicate function.
+
+### When to reach for an interface
+
+- You have **multiple unrelated** types that should share behaviour. A sealed union doesn't fit (the variants aren't fixed); inheritance doesn't fit (the types are unrelated).
+- The set of conforming types is **open** — third-party callers can write their own implementations.
+
+For closed sets of variants, prefer a sealed union ([Sealed Unions and Match](/Typhon/tour/sealed-unions/)).
+
+## Bounded type parameters (partial)
+
+A bound says "any `T` *that satisfies* some interface or class":
+
+```python
+interface Ordered:
+    def __lt__(self, other: Self) -> bool
+
+def smallest[T: Ordered](xs: list[T]) -> T?:
+    if len(xs) == 0:
+        return None
+    mut best: T = xs[0]
+    for x in xs[1:]:
+        if x < best:
+            best = x
+    return best
+```
+
+<Aside type="caution">
+  Bounded type vars are listed as **partial** in the current implementation — the syntax parses, but full constraint solving across multiple arguments is still landing. For now, use bounds in single-argument signatures and verify your call sites with `tyc check`.
+</Aside>
+
+## Generics emit as type-erased Python
+
+Typhon erases generics at emit time. The runtime sees plain `list`, `dict`, and untyped classes; type safety is a compile-time property only.
+
+```python
+# Typhon
+def first[T](xs: list[T]) -> T?:
+    if len(xs) == 0:
+        return None
+    return xs[0]
+
+# Emitted Python (PEP 695 preserved on the 3.13+ target)
+def first[T](xs: list[T]) -> T | None:
+    if len(xs) == 0:
+        return None
+    return xs[0]
+```
+
+PEP 695 syntax is preserved (Python 3.12+ supports it natively). Older targets would need a `TypeVar` rewrite — for 3.13+ (Typhon's default), the syntax goes through unchanged.
+
+## Putting it together
+
+A small worked example: a generic in-memory cache with a structural "serialisable" interface.
+
+```python
+interface Serialisable:
+    def to_dict(self) -> dict[str, str]
+
+class Cache[K, V]:
+    store: dict[K, V]
+
+impl[K, V] Cache[K, V]:
+    def get(self, k: K) -> V?:
+        return self.store.get(k)
+
+    def put(self, k: K, v: V) -> None:
+        self.store[k] = v
+
+def snapshot[T: Serialisable](items: list[T]) -> list[dict[str, str]]:
+    return [item.to_dict() for item in items]
+
+class User:
+    id: int
+    name: str
+
+impl User:
+    def to_dict(self) -> dict[str, str]:
+        return {"id": str(self.id), "name": self.name}
+
+def main() -> None:
+    let users: Cache[int, User] = Cache(store={})
+    users.put(1, User(id=1, name="Alice"))
+    users.put(2, User(id=2, name="Bob"))
+
+    let all_users: list[User] = list(users.store.values())
+    let dump: list[dict[str, str]] = snapshot(all_users)
+    print(dump)
+```
+
+What's going on:
+
+- `Cache[K, V]` is generic over both key and value types. `Cache[int, User]` is a concrete instantiation.
+- `Serialisable` is an interface — `User` satisfies it because it has `to_dict() -> dict[str, str]`. There's no `implements Serialisable` clause.
+- `snapshot[T: Serialisable](...)` constrains `T` to "anything with `to_dict`". The compiler verifies `User` qualifies.
+
+## Common mistakes
+
+### Using `TypeVar` from `typing`
+
+```python
+from typing import TypeVar
+T = TypeVar("T")
+
+def first(xs: list[T]) -> T | None: ...    # ❌ use PEP 695
+```
+
+Fix: `def first[T](xs: list[T]) -> T?:`. Typhon does not use the `TypeVar` import path.
+
+### Calling `isinstance` on an interface
+
+See above — use static narrowing, or refactor to a sealed union if the variants are closed.
+
+### Unconstrained inference
+
+```python
+let empty = first([])    # ❌ T unconstrained, can't infer
+```
+
+Annotate explicitly: `let empty: int? = first[int]([])`.
+
+### Mixing structural and nominal expectations
+
+```python
+interface HasName:
+    def name(self) -> str
+
+class Box:
+    name: str    # field, not method
+
+def show(x: HasName) -> None: ...
+show(Box(name="b"))    # ❌ Box.name is a field; HasName expects a method
+```
+
+Either change `HasName.name()` to a field, or change `Box.name` to a method (via `impl`).
+
+## What you've learned
+
+- Generic functions and classes use PEP 695 (`def f[T](...)`, `class Box[T]:`, `type Vec[T] = list[T]`).
+- Inference is bidirectional; annotate when it can't pin `T` down.
+- Interfaces are structural — anything with the right members satisfies them; emission is `typing.Protocol`.
+- Runtime `isinstance` against interfaces is rejected; use static narrowing or sealed unions.
+- Generics are erased at emit; the runtime is plain Python.
+
+## Where next
+
+- [Async and Concurrency](/Typhon/tour/async/) — `async`/`await`, `gather:` blocks, and `go` spawn.
+- [Generics (PEP 695)](/Typhon/types/generics/) — the full reference.
+- [Interfaces (Protocols)](/Typhon/types/interfaces/) — what's checked and what isn't.

@@ -1,0 +1,73 @@
+---
+title: Match Errors
+description: Diagnostics around exhaustive matching on sealed unions.
+sidebar:
+  order: 7
+---
+
+## `tyc::non_exhaustive_match`
+
+A `match` on a sealed union doesn't cover every variant:
+
+```python
+type Shape = Circle | Rectangle | Triangle
+
+def area(s: Shape) -> float:
+    match s:
+        case Circle(r):       return 3.14 * r * r
+        case Rectangle(w, h): return w * h
+        # ❌ missing Triangle
+```
+
+```
+error[tyc::non_exhaustive_match]: match does not cover variant `Triangle`
+ ┌─ src/shapes.ty:4:5
+ │
+4 │     match s:
+ │     ^^^^^^^^ add `case Triangle(base, height): ...` or use `case _:`
+```
+
+**Fix:** add the missing variant, or use `case _:` for a deliberate catch-all (opts out of exhaustiveness for the rest of the union).
+
+```python
+def area(s: Shape) -> float:
+    match s:
+        case Circle(r):       return 3.14 * r * r
+        case Rectangle(w, h): return w * h
+        case Triangle(b, h):  return 0.5 * b * h
+```
+
+## Severity
+
+Controlled by `[strictness] exhaustive-match`:
+
+- `"error"` — default. Fails CI.
+- `"warn"` — flagged as a warning.
+- `"off"` — no exhaustiveness check.
+
+Keep it at `"error"` outside of refactor windows.
+
+## What "exhaustive" means
+
+The checker counts variants listed on the `type X = A | B | C` alias. If the `match` covers every variant exactly once (either explicitly or via `_`), it's exhaustive.
+
+Guards (`case X(...) if cond:`) don't satisfy exhaustiveness for the variant — you still need an unguarded fallback.
+
+## Adding a variant
+
+The whole point of sealing. Adding `Square` to `Shape`:
+
+```python
+type Shape = Circle | Rectangle | Triangle | Square    # added Square
+
+class Square:
+    side: float
+```
+
+Every `match s: ...` in the project now fails with `tyc::non_exhaustive_match` until updated. That's the feature.
+
+## Where next
+
+- [Sealed Unions](/Typhon/types/sealed-unions/) — the type-system reference.
+- [`match` reference](/Typhon/reference/match/) — pattern shapes.
+- [Sealed Unions and Match (tour)](/Typhon/tour/sealed-unions/) — teaching page.

@@ -1,0 +1,159 @@
+/* Typhon docs custom theme */
+
+:root {
+  --sl-font: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --sl-font-mono: 'JetBrains Mono', 'SF Mono', Monaco, Consolas, 'Liberation Mono', monospace;
+}
+
+:root[data-theme='dark'] {
+  --sl-color-accent-low: #1c2a4a;
+  --sl-color-accent: #4f8cff;
+  --sl-color-accent-high: #b6cdff;
+  --sl-color-white: #ffffff;
+  --sl-color-gray-1: #e7e9f5;
+  --sl-color-gray-2: #c0c2d4;
+  --sl-color-gray-3: #888bb0;
+  --sl-color-gray-4: #50547a;
+  --sl-color-gray-5: #2f3258;
+  --sl-color-gray-6: #1c1d3a;
+  --sl-color-black: #0b0c20;
+}
+
+:root[data-theme='light'] {
+  --sl-color-accent-low: #d4e2ff;
+  --sl-color-accent: #2563eb;
+  --sl-color-accent-high: #143173;
+  --sl-color-white: #11142a;
+  --sl-color-gray-1: #1b1f3a;
+  --sl-color-gray-2: #3d4060;
+  --sl-color-gray-3: #6d6f8e;
+  --sl-color-gray-4: #9c9fb6;
+  --sl-color-gray-5: #d0d3e2;
+  --sl-color-gray-6: #ebedf6;
+  --sl-color-gray-7: #f5f6fb;
+  --sl-color-black: #ffffff;
+}
+
+/* Page hero on the landing page */
+.hero {
+  background:
+    radial-gradient(1200px 600px at 0% 0%, color-mix(in srgb, var(--sl-color-accent) 22%, transparent), transparent 60%),
+    radial-gradient(900px 500px at 100% 0%, color-mix(in srgb, var(--sl-color-accent) 12%, transparent), transparent 60%);
+  border-radius: 1.25rem;
+  padding: 3rem clamp(1.5rem, 4vw, 4rem);
+  margin-bottom: 1.5rem;
+}
+
+.hero h1 {
+  font-size: clamp(2.25rem, 5vw, 3.75rem);
+  letter-spacing: -0.03em;
+  line-height: 1.05;
+  background: linear-gradient(135deg, var(--sl-color-white), var(--sl-color-accent));
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.hero p.lede {
+  font-size: 1.2rem;
+  color: var(--sl-color-gray-2);
+  max-width: 65ch;
+  margin-top: 0.75rem;
+}
+
+/* Card grid used across the site */
+.card-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr));
+  margin: 1.5rem 0 2rem;
+}
+
+.card {
+  background: color-mix(in srgb, var(--sl-color-gray-6) 70%, transparent);
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 0.75rem;
+  padding: 1rem 1.1rem;
+  transition: border-color 120ms ease, transform 120ms ease;
+}
+
+.card:hover {
+  border-color: var(--sl-color-accent);
+  transform: translateY(-2px);
+}
+
+.card h3 {
+  font-size: 1rem;
+  margin-top: 0;
+}
+
+.card p {
+  color: var(--sl-color-gray-2);
+  font-size: 0.95rem;
+  margin: 0.25rem 0 0;
+}
+
+/* Subtle badge */
+.tag {
+  display: inline-block;
+  padding: 0.1rem 0.55rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--sl-color-accent) 18%, transparent);
+  color: var(--sl-color-accent-high);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+/* Inline code feels slightly lighter */
+:not(pre) > code {
+  background: color-mix(in srgb, var(--sl-color-gray-5) 50%, transparent);
+  padding: 0.1rem 0.35rem;
+  border-radius: 0.35rem;
+  font-size: 0.9em;
+}
+
+/* Tables read better with a softer divider */
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.95rem;
+}
+
+table th,
+table td {
+  border-bottom: 1px solid var(--sl-color-gray-5);
+  padding: 0.55rem 0.65rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+table th {
+  font-weight: 600;
+  color: var(--sl-color-gray-1);
+}
+
+/* Two-column compare block */
+.compare {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr));
+  gap: 1rem;
+  margin: 1.25rem 0;
+}
+
+.compare > div {
+  background: color-mix(in srgb, var(--sl-color-gray-6) 60%, transparent);
+  padding: 0.75rem 1rem;
+  border-radius: 0.6rem;
+  border: 1px solid var(--sl-color-gray-5);
+}
+
+.compare h4 {
+  margin-top: 0;
+  margin-bottom: 0.5rem;
+  font-size: 0.85rem;
+  color: var(--sl-color-gray-3);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}

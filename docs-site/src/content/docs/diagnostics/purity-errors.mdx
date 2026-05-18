@@ -1,0 +1,64 @@
+---
+title: Purity Errors
+description: Diagnostics around @pure and the six purity conditions.
+sidebar:
+  order: 9
+---
+
+## `tyc::impure_pure_fn`
+
+A function marked `@pure` violates one of the six purity conditions:
+
+1. **Synchronous.** No coroutines or generators.
+2. **Hashable parameters.**
+3. **No I/O** in the transitive call graph.
+4. **No non-determinism** (no `time.*`, `random.*`, `uuid.*`, `os.urandom`).
+5. **No reads/writes of mutable module-level state.**
+6. **No exceptions raised.**
+
+Example:
+
+```python
+@pure
+def fetch(url: str) -> str:
+    import urllib.request
+    return urllib.request.urlopen(url).read().decode()    # ❌ I/O
+```
+
+```
+error[tyc::impure_pure_fn]: `fetch` is annotated `@pure` but performs I/O
+                            (urllib.request.urlopen)
+ ┌─ src/main.ty:3:12
+ │
+3 │     return urllib.request.urlopen(url).read().decode()
+ │            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^ I/O is not allowed in `@pure` functions
+```
+
+**Fix:** drop `@pure` (and lose memoisation eligibility), or refactor to take the I/O result as a parameter.
+
+## What's I/O?
+
+- `open(...)`, `socket`, `subprocess`, `urllib`, `requests`, `httpx`, `aiohttp`.
+- `print()`, logger calls.
+- Database drivers.
+- Filesystem operations.
+- `unsafe:` calls (unless the stub is annotated `@pure`).
+
+## What's non-determinism?
+
+- `time.time()`, `time.monotonic()`, `datetime.now()`.
+- `random.*`, `secrets.*`.
+- `uuid.uuid4()` (the others — `uuid1`, `uuid3`, `uuid5` — are deterministic if their inputs are).
+- `os.urandom()`.
+
+## What's mutable module state?
+
+- Reads from a module-level `mut` binding.
+- Writes to any module-level binding (including `let`, via mutation through fields).
+
+`comptime let` reads are fine — those are inlined as literals.
+
+## Where next
+
+- [`@pure` and `@memo` reference](/Typhon/reference/pure-memo/) — the six conditions in detail.
+- [Advanced Features (tour)](/Typhon/tour/advanced/) — teaching page.

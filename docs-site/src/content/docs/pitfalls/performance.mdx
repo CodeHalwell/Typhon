@@ -1,0 +1,105 @@
+---
+title: Performance Gotchas
+description: What to watch when performance matters.
+sidebar:
+  order: 3
+---
+
+Typhon doesn't change Python's runtime characteristics. The emitted `.py` runs as fast as the same hand-written Python. But a few patterns warrant attention.
+
+## `slots=True` is the default
+
+`class Foo:` emits `@dataclass(slots=True)`. This:
+
+- Saves memory per instance (~30%).
+- Forbids attribute writes outside declared fields.
+- Slightly slows attribute access in some micro-benchmarks (Python 3.11+ erased most of this).
+
+The win on memory and bug-catching usually outweighs the micro-overhead. If you genuinely need `__dict__` (e.g. for dynamic attribute injection), use `class!`.
+
+## Pydantic validates at construction
+
+```python
+model UserInput:
+    email: str
+```
+
+`UserInput(email="...")` runs Pydantic validation. For hot paths (constructing millions of instances), use `class` instead.
+
+Default to `class`; use `model` at trust boundaries.
+
+## `Result[T, E]` allocates
+
+Every `Ok(v)` / `Err(e)` is a fresh dataclass instance. For very hot loops returning `Result`, this can show up in profiles.
+
+Mitigation: short-circuit early. Don't build deeply-nested `Result` chains where the failure path is common.
+
+## `@memo` extends lifetimes
+
+`@functools.cache` (what `@memo` emits) keeps a strong reference to every argument and return value. For long-lived processes, this can leak memory.
+
+Mitigations:
+
+- `@memo(max=N)` for bounded caches.
+- Reset the cache periodically: `fn.cache_clear()`.
+- Don't cache functions whose arguments are large objects.
+
+## `gather:` overhead
+
+`asyncio.TaskGroup` has small but non-zero startup cost. For two awaits where each is microseconds, sequential is fine. For two awaits that are tens of milliseconds each, parallel pays.
+
+Rule of thumb: if the calls are sub-millisecond, don't bother. If they're network-bound, definitely parallel.
+
+## `lazy import` first-call cost
+
+First access to `np.array` triggers `import numpy`, which can take 150ms+. Subsequent calls are zero-cost.
+
+For very latency-sensitive entry points, prefer eager `import` so the cost is paid once at startup rather than at the worst possible moment (the first request).
+
+## `comptime let` is free
+
+Inlined as a literal. No runtime cost.
+
+## `let` / `mut` are free
+
+Erased at emit time. No runtime cost.
+
+## `T?` is free
+
+Same as `T | None`. No runtime overhead — it's just an annotation.
+
+## `unsafe:` is free
+
+Lowers to `if True:`. No runtime cost.
+
+## `pipe (|>)` is free
+
+Lowers to nested function calls. No runtime cost beyond what the calls themselves do.
+
+## Free-threaded mode
+
+When `[python] free-threaded = true`:
+
+- `go` on CPU-bound functions lowers to `ThreadPoolExecutor.submit` — actual parallelism.
+- The single-threaded overhead of free-threaded CPython is ~5-10% vs the GIL build.
+- The fallback runtime check (`sys._is_gil_enabled()`) costs nothing on the parallel path.
+
+If your code is CPU-bound and you can run the free-threaded build, this is a real speedup. If your code is I/O-bound, `asyncio` is the better answer.
+
+## PGO-guided memoisation
+
+`[strictness] pgo-memoise = true` with `tyc profile` data caches the hottest pure functions automatically. Cheaper than `auto-memoise = true` (which caches every pure function), more targeted than manual `@memo`.
+
+Workflow:
+
+1. Run a representative workload under `tyc profile`.
+2. Commit `typhon-profile.json`.
+3. `tyc build` with `pgo-memoise = true`.
+
+The promoted functions get `@functools.cache`; subsequent calls are O(1).
+
+## Where next
+
+- [`@pure` and `@memo`](/Typhon/reference/pure-memo/) — purity and caching.
+- [Async and Concurrency (tour)](/Typhon/tour/async/) — `gather`, `go`, free-threaded.
+- [Performance Baseline (project)](/Typhon/project/performance/) — measured numbers we won't regress.

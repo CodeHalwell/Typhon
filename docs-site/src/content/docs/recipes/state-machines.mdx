@@ -1,0 +1,124 @@
+---
+title: State Machines with Sealed Unions
+description: Exhaustive transition tables and impossible-state-makes-impossible-illegal patterns.
+sidebar:
+  order: 8
+---
+
+Sealed unions are the right tool for modelling a state machine where the transitions are known at design time. The checker enforces that every state has a transition handler, and you can't construct an illegal state.
+
+## A simple order workflow
+
+```python
+type Order = Pending | Submitted | Paid | Shipped | Delivered | Cancelled
+
+class Pending:
+    items: list[Item]
+
+class Submitted:
+    items: list[Item]
+    submitted_at: datetime
+
+class Paid:
+    items: list[Item]
+    submitted_at: datetime
+    paid_at: datetime
+    payment_id: str
+
+class Shipped:
+    items: list[Item]
+    paid_at: datetime
+    tracking_no: str
+
+class Delivered:
+    items: list[Item]
+    delivered_at: datetime
+
+class Cancelled:
+    items: list[Item]
+    reason: str
+```
+
+Each state carries the fields it needs. `Paid` has `payment_id`; `Shipped` has `tracking_no`. **You cannot construct a `Shipped` order without a tracking number** — the type system enforces that.
+
+## Transitions
+
+```python
+type TransitionError = AlreadySubmitted | AlreadyPaid | NotPaid | NotShipped
+
+class AlreadySubmitted: pass
+class AlreadyPaid: pass
+class NotPaid: pass
+class NotShipped: pass
+
+def submit(o: Order) -> Result[Submitted, TransitionError]:
+    match o:
+        case Pending(items):
+            return Ok(Submitted(items=items, submitted_at=datetime.now()))
+        case _:
+            return Err(AlreadySubmitted())
+
+def pay(o: Order, payment_id: str) -> Result[Paid, TransitionError]:
+    match o:
+        case Submitted(items, submitted_at):
+            return Ok(Paid(
+                items=items, submitted_at=submitted_at,
+                paid_at=datetime.now(), payment_id=payment_id,
+            ))
+        case _:
+            return Err(NotPaid())
+
+def ship(o: Order, tracking_no: str) -> Result[Shipped, TransitionError]:
+    match o:
+        case Paid(items, _, paid_at, _):
+            return Ok(Shipped(items=items, paid_at=paid_at, tracking_no=tracking_no))
+        case _:
+            return Err(NotPaid())
+```
+
+Each function takes the whole `Order` and returns a specific state. The `match` is exhaustive over the union; the only legal transitions are the named ones.
+
+## Why this is better than fields-on-one-class
+
+```python
+# Anti-pattern
+class Order:
+    state: str                  # "pending" | "submitted" | ...
+    payment_id: str?             # set only if paid
+    tracking_no: str?            # set only if shipped
+    ...
+```
+
+- ❌ Nullable fields proliferate. Every consumer has to narrow.
+- ❌ "Impossible states" are constructible. `Order(state="pending", payment_id="...")` compiles.
+- ❌ Adding a new state means touching every consumer; no exhaustiveness help.
+
+The sealed-union pattern fixes all three.
+
+## A tag-with-attributes variant
+
+For very simple state machines, you can use a tag alone:
+
+```python
+type Order = Pending | Submitted
+
+class Pending: pass
+class Submitted:
+    submitted_at: datetime
+```
+
+…and store the rest of the data in the *outer* class:
+
+```python
+class OrderContext:
+    items: list[Item]
+    state: Order
+```
+
+This pattern works when most data is shared across states.
+
+## Where next
+
+- [Sealed Unions](/Typhon/types/sealed-unions/) — the type-system reference.
+- [Sealed Unions and Match (tour)](/Typhon/tour/sealed-unions/) — teaching page.
+- [Errors as Values](/Typhon/recipes/errors-as-values/) — sealed unions for `E` in `Result[T, E]`.

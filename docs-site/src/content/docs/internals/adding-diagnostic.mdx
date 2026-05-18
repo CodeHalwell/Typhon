@@ -1,0 +1,104 @@
+---
+title: Adding a Diagnostic
+description: Worked walk-through for adding a new diagnostic code.
+sidebar:
+  order: 6
+---
+
+import { Steps } from '@astrojs/starlight/components';
+
+How to add a new `tyc::*` diagnostic, end to end.
+
+## The pattern
+
+Every diagnostic:
+
+1. Has a stable code (`tyc::my_new_check`).
+2. Is registered once in `tyc-diagnostics`.
+3. Is emitted from one or more sites in upstream crates.
+4. Has a test in the relevant crate.
+5. Is documented in `docs-site/src/content/docs/diagnostics/`.
+
+## Walk-through
+
+<Steps>
+
+1. **Pick the code name.** Conventions: lowercase, snake_case, descriptive. Examples: `nullable_use`, `non_exhaustive_match`, `missing_await`.
+
+2. **Register it in `tyc-diagnostics`.** Add a variant to the `Diagnostic` enum (or the equivalent — see `tyc/crates/tyc-diagnostics/src/lib.rs`):
+
+   ```rust
+   #[derive(Diagnostic, thiserror::Error, Debug)]
+   pub enum Diagnostic {
+       // ... existing variants ...
+
+       #[error("describe the problem in plain English")]
+       #[diagnostic(
+           code(tyc::my_new_check),
+           help("suggest a concrete fix")
+       )]
+       MyNewCheck {
+           #[source_code]
+           src: NamedSource,
+           #[label("primary span")]
+           span: SourceSpan,
+       },
+   }
+   ```
+
+3. **Emit it from the check site.** In the relevant crate (e.g. `tyc-types`), construct the diagnostic and push it onto the diagnostics buffer:
+
+   ```rust
+   diagnostics.push(Diagnostic::MyNewCheck {
+       src: NamedSource::new(file_path, source.to_string()),
+       span: span_for(node),
+   });
+   ```
+
+4. **Add an integration test.** In `tyc/tests/` (or the relevant crate's `tests/`), write a small `.ty` file that triggers the diagnostic and assert the code appears in the output:
+
+   ```rust
+   #[test]
+   fn my_new_check_fires() {
+       let result = check_str(r#"
+           # source that triggers the diagnostic
+       "#);
+       assert!(result.diagnostics.iter().any(|d| d.code() == "tyc::my_new_check"));
+   }
+   ```
+
+5. **Document it.** Add an entry to the relevant page under `docs-site/src/content/docs/diagnostics/`. Include:
+   - The code name.
+   - A short description.
+   - A minimal example that triggers it.
+   - The recommended fix.
+
+6. **Run the workspace tests.**
+
+   ```bash
+   cd tyc && cargo test --workspace
+   ```
+
+</Steps>
+
+## Tips
+
+- **Search for an existing similar diagnostic** and copy its pattern. Style consistency matters for the catalog.
+- **Make the help message actionable.** Not "type mismatch"; "expected `int`, found `str` — convert with `int(...)` or change the annotation".
+- **Use `[label("...")]` annotations on related spans** for multi-span diagnostics. The label text shows up in the rendered output.
+- **Test both the positive and negative case.** The diagnostic should fire when it should, and *not* fire when it shouldn't.
+- **Keep the code name stable.** Once a diagnostic ships, downstream users grep for the code. Renaming it is a breaking change.
+
+## Severity
+
+Most diagnostics are `error`. Warnings are reserved for things that compile but are probably bugs (e.g. `async_without_await`). The severity is set on the `Diagnostic` variant; see existing examples for the macro form.
+
+## Linking from the catalog
+
+Once documented, link the catalog page from any tour / reference page where it might come up. The cross-linking is what makes the docs navigable.
+
+## Where next
+
+- [Reading Diagnostics](/Typhon/diagnostics/reading/) — what the user sees.
+- [Workspace Layout](/Typhon/internals/workspace/) — where the crates live.
+- [Contributing](/Typhon/internals/contributing/) — sending the PR.

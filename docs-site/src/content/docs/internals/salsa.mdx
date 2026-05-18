@@ -1,0 +1,74 @@
+---
+title: Salsa Queries
+description: The incremental query layer that powers the LSP's sub-100ms feedback.
+sidebar:
+  order: 4
+---
+
+[Salsa](https://github.com/salsa-rs/salsa) is the incremental computation framework `tyc` uses (the same one that powers `rust-analyzer` and `ty`). Each compilation stage is a Salsa query; outputs are cached and invalidated only when relevant inputs change.
+
+## The query layer
+
+```
+tyc-db
+├── inputs:
+│   ├── source(file_id) -> String
+│   └── …
+├── tracked:
+│   ├── preprocessed_text(file_id) -> String
+│   ├── module_decl_names(file_id) -> Set<Name>
+│   ├── resolved_module(file_id) -> ResolvedModule
+│   └── …
+└── interned types: NameId, ScopeId, TypeId, ...
+```
+
+When the CLI invokes `tyc check`, it asks Salsa for the diagnostics of each file. Salsa runs the query, caching everything along the way. When the LSP receives `didChange` for the same file, it updates the input, and Salsa knows which downstream queries to re-run.
+
+## Why Salsa, not hand-rolled
+
+Three reasons:
+
+1. **Cancellation** — when the user keeps typing, in-flight queries cancel cleanly.
+2. **Parallelism** — independent queries can run on different threads.
+3. **Durability levels** — stdlib queries (rarely change) vs user-file queries (change every keystroke) get different cache eviction policies.
+
+Hand-rolling these is months of work; Salsa gives them for free.
+
+## Tracked queries
+
+Today:
+
+- `preprocessed_text(file_id)` — the file's contents after BOM stripping etc.
+- `module_decl_names(file_id)` — the set of top-level names declared in the module.
+- `resolved_module(file_id)` — the symbol table and scope tree.
+
+More queries are added as needed; the rule is "if it's expensive to recompute and the result is reusable across edits, make it a query." Smaller helper functions remain plain `fn`s.
+
+## Adding a query
+
+The pattern (with the Salsa 0.x API; check `tyc/crates/tyc-db/src/lib.rs` for the current canonical form):
+
+```rust
+#[salsa::tracked]
+fn my_analysis(db: &dyn Db, file_id: FileId) -> AnalysedThing {
+    let resolved = resolved_module(db, file_id);
+    // ... do work ...
+    AnalysedThing { ... }
+}
+```
+
+Then call `my_analysis(&db, file_id)` from anywhere that has the `Db` handle. Salsa caches the result; subsequent calls with the same `file_id` are free.
+
+## Cache invalidation
+
+When `set_source(db, file_id, new_text)` is called, Salsa invalidates `source(file_id)` and every downstream tracked query that depended on it. The LSP relies on this to publish diagnostics quickly after edits.
+
+## The Salsa wrapper
+
+Salsa's API changes between minor versions. Every Salsa call in `tyc` sits behind a one-function-wide wrapper in `tyc-db`. When Salsa renames a macro or changes a trait, the blast radius is one crate.
+
+## Where next
+
+- [Architecture](/Typhon/internals/architecture/) — the bigger picture.
+- [The Pipeline](/Typhon/internals/pipeline/) — what each query does.
+- [Salsa upstream docs](https://salsa-rs.netlify.app/) — for deeper API reference.

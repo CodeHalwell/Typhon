@@ -1,0 +1,77 @@
+---
+title: tyc add / remove / sync
+description: Lightweight package-manager surface over uv.
+sidebar:
+  order: 15
+---
+
+```
+tyc add PACKAGE[@VERSION] [--dev] [--no-sync]
+tyc remove PACKAGE [--no-sync]
+tyc sync [--dry-run]
+```
+
+Rewrites `[dependencies]` / `[dev-dependencies]` in `typhon.toml`, generates a `pyproject.toml`, and shells out to [`uv`](https://github.com/astral-sh/uv) for the install step. `uv` itself is not bundled — if missing, the manifest still updates and the command prints "install uv to complete".
+
+## Examples
+
+```bash
+tyc add requests                      # add a runtime dep at the latest version
+tyc add httpx@0.27                    # add at a specific version
+tyc add --dev pytest@8.2              # dev dep
+tyc remove rich                       # remove
+tyc sync                              # materialise pyproject.toml and `uv sync`
+tyc sync --dry-run                    # preview the generated pyproject.toml
+tyc add --no-sync foo                 # batch edits; finish with `tyc sync`
+```
+
+## `tyc add`
+
+Inserts the package into `[dependencies]` (or `[dev-dependencies]` with `--dev`) and runs `tyc sync`. The version selector follows uv's conventions:
+
+```toml
+[dependencies]
+requests = ">=2.31"      # version range
+rich = "*"               # any version (bare name in tyc add)
+httpx = "0.27"           # bare version → "==0.27"
+```
+
+## `tyc remove`
+
+Drops the package from `[dependencies]` / `[dev-dependencies]` and runs `tyc sync`.
+
+## `tyc sync`
+
+Materialises a `pyproject.toml` from `typhon.toml`'s `[dependencies]` / `[dev-dependencies]` and runs `uv sync`. The generated `pyproject.toml` is overwritten on every sync (don't hand-edit it).
+
+`--dry-run` prints what would be written without writing.
+
+## When `uv` is missing
+
+The manifest still updates. The command exits 0 but prints:
+
+```
+warning: `uv` is not installed; manifest updated but `uv sync` skipped
+help: install uv from https://github.com/astral-sh/uv
+```
+
+Without `uv` you can still install dependencies with `pip install -e .` against the generated `pyproject.toml`, or migrate to `uv` later.
+
+## Why not bundle a resolver?
+
+Dependency resolution for Python is a hard, evolving problem. `uv` is Astral's resolver and the consensus best-in-class in 2026. Building our own would waste years of effort.
+
+The `tyc add` / `remove` / `sync` surface is a thin manifest editor — its job is to keep `typhon.toml` and the generated `pyproject.toml` in sync. The actual install is `uv`'s.
+
+## Flags
+
+| Flag | Effect |
+|------|--------|
+| `--dev` | Add to `[dev-dependencies]` instead of `[dependencies]`. |
+| `--no-sync` | Edit the manifest only; don't run `uv sync`. |
+| `--dry-run` (on `sync`) | Print the generated `pyproject.toml` without writing or installing. |
+
+## Where next
+
+- [`[dependencies]` config](/Typhon/configuration/dependencies/) — the manifest format.
+- [`uv` upstream docs](https://docs.astral.sh/uv/) — what the install step is doing under the hood.

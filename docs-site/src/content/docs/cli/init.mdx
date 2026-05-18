@@ -1,0 +1,73 @@
+---
+title: tyc init
+description: Scaffold a new Typhon project.
+sidebar:
+  order: 2
+---
+
+```
+tyc init NAME [--path DIR]
+```
+
+Creates a new Typhon project with a default `typhon.toml`, an empty `src/` directory with a placeholder `main.ty`, and an empty `tests/` directory.
+
+## Examples
+
+```bash
+tyc init hello                # creates ./hello/
+tyc init hello --path /tmp    # creates /tmp/hello/
+```
+
+## What gets generated
+
+```
+hello/
+├── typhon.toml      # Default config — see /Typhon/configuration/overview/
+├── src/
+│   └── main.ty      # Placeholder entry point with a Hello, world body
+├── tests/           # Empty; pytest or pyaspect work
+└── .gitignore       # Excludes build/ and target/
+```
+
+## Default `typhon.toml`
+
+```toml
+[project]
+name = "hello"
+version = "0.1.0"
+src = "src"
+out = "build"
+
+[python]
+target = "3.13"
+
+[emit]
+class-default = "dataclass"
+format = true
+
+[strictness]
+no-implicit-any = true
+unused-import = "error"
+exhaustive-match = "error"
+```
+
+You'll edit this as the project grows. See [`typhon.toml` Overview](/Typhon/configuration/overview/) for every key.
+
+## Flags
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--path DIR` | `.` | Parent directory for the new project. |
+| `--no-git` | | Skip writing `.gitignore`. |
+| `--target {3.13,3.14}` | `3.13` | Python target to pre-fill in `typhon.toml`. |
+
+## What `tyc init` doesn't do
+
+- It does **not** run `git init`. Run that yourself if you want a repository.
+- It does **not** install dependencies. Use [`tyc add`](/Typhon/cli/packages/) for that.
+- It does **not** create a virtualenv. Use `uv venv` or `python -m venv` if you want one.
+
+## Where next
+
+- [Hello, world](/Typhon/getting-started/hello-world/) — your first program.
+- [Project Layout](/Typhon/getting-started/project-layout/) — what each file is for.

@@ -1,0 +1,89 @@
+---
+title: Prior Art
+description: The languages and tools Typhon learned from.
+sidebar:
+  order: 3
+---
+
+Typhon stands on a lot of shoulders. This page lists the ones that mattered most.
+
+## Languages
+
+### TypeScript
+
+The closest analogue. Scanner → parser → binder → checker → emitter. The `checker.ts` file is the canonical reference for structural subtyping at scale. The "superset that emits the host language" framing is directly borrowed.
+
+### Rust
+
+`let` / `let mut`, `Result<T, E>` and the `?` operator, `impl` blocks. Typhon borrows the surface; it does not borrow ownership, borrowing, or lifetimes.
+
+### Mojo
+
+The cautionary tale. Pitched as a "Python superset", then walked back. The lesson: **be honest about what subset of Python `.ty` accepts** and emit a clean error for the rest. Typhon never tries to be a full Python superset; some patterns require escape hatches (`unsafe:`, `class!`).
+
+### Elixir
+
+`with`-chains for sequenced fallible operations are borrowed from Elixir's `with` form.
+
+### Swift
+
+`guard let` early-return narrowing is a fixed idea in modern languages; Typhon's `guard x = expr else: ...` is the Pythonic spelling.
+
+### Zig
+
+`comptime` evaluation borrows the name and the basic idea — a sandboxed interpreter that runs at compile time. Typhon's sandbox is much smaller than Zig's by design.
+
+### Coconut, Hy, Cython
+
+Older Python supersets. Useful for emission patterns; none built on modern Rust tooling.
+
+## Tools
+
+### `rust-analyzer`
+
+The cleanest example of a Salsa-based incremental compiler with an LSP. Crate layering directly transferable. Reading `rust-analyzer`'s architecture docs is recommended before contributing to `tyc-lsp` or `tyc-db`.
+
+### `ty` and Pyrefly
+
+Rust-based Python type checkers (Astral and Meta respectively). Both shipped in 2025; both architectural references for Typhon's checker. The [`tyc ty`](/Typhon/cli/ty/) subcommand defers to Astral's `ty` for second-opinion checking.
+
+### `oxc`
+
+Rust-based JavaScript toolchain. Workspace layout (`oxc_parser`, `oxc_semantic`, `oxc_linter`, `oxc_formatter`, `oxlint` binary) is the template for `tyc`.
+
+### Ruff
+
+Astral's Python linter/formatter. Source of `ruff_python_parser`, `ruff_python_ast`, `ruff_python_codegen`, `ruff_python_formatter`. All vendored under `tyc/vendor/`.
+
+### Salsa
+
+The incremental computation framework that powers `rust-analyzer` and `ty`. Free cancellation, parallel queries, durability levels. Wrapped at one-function granularity to insulate against API changes.
+
+### `tower-lsp-server`
+
+The active community fork of `tower-lsp` tracking `lsp-types` 0.97+. Used for `tyc lsp`.
+
+### `miette`
+
+Best-in-class source-span diagnostics. The reason Typhon's error messages look as nice as `rustc`'s.
+
+### `clap` v4 (derive)
+
+Standard Rust CLI framework. Powers `tyc`'s subcommands.
+
+## What we read
+
+- [TypeScript's `checker.ts`](https://github.com/microsoft/TypeScript/blob/main/src/compiler/checker.ts) — for structural subtyping.
+- [`rust-analyzer` architecture](https://rust-analyzer.github.io/book/contributing/architecture.html) — for the Salsa-and-LSP layering.
+- [Astral's `ty` repo](https://github.com/astral-sh/ty) — for Python-specific type-checking patterns.
+- [Meta's Pyrefly](https://github.com/meta-pyrefly/pyrefly) — for an alternative Rust-Python type checker.
+- [The PEP index](https://peps.python.org/) — for typing-spec patterns (484, 526, 544, 586, 604, 612, 646, 654, 690, 695, 701).
+
+## Naming
+
+The project ships as **Typhon**. Phonetic kinship with Python without sounding like a portmanteau. The mythology lines up (Typhon is the serpent-monster of Hesiod, sometimes treated as the father of Python). The binary is `tyc`, the file extension is `.ty`, the stub extension is `.dty`, the config file is `typhon.toml`.
+
+## Where next
+
+- [Architecture](/Typhon/internals/architecture/) — how prior art shapes the codebase.
+- [Roadmap](/Typhon/project/roadmap/) — what's left to do.

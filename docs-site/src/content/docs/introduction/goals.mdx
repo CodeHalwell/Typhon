@@ -1,0 +1,94 @@
+---
+title: Goals and Non-Goals
+description: What Typhon is trying to do, and explicitly what it is not trying to do.
+sidebar:
+  order: 4
+---
+
+Programming language scope is the largest single source of project failure. Most languages either ship a year late because they kept adding features, or they ship something incoherent because they didn't draw the line clearly enough. This page draws the line.
+
+## Goals
+
+These are the things Typhon explicitly aims to be good at. They are listed roughly in priority order; when two goals conflict, the earlier one wins.
+
+### Static safety on top of Python's runtime
+
+Typhon makes Python's permissive defaults strict. Non-nullable types by default; no implicit `Any`; explicit error handling via `Result[T, E]`; exhaustive matching on sealed unions; `let`/`mut` enforcement on every binding. The compiler shifts as many failure modes as it can from runtime to compile time, without giving up Python's library ecosystem.
+
+### Modern ergonomics, drawn from Rust and TypeScript
+
+`let` and `mut`, interfaces (structural typing à la TypeScript's `Protocol`), sealed unions with exhaustive `match`, `guard` for early-return narrowing, pipes (`|>`) for left-to-right composition, `comptime` for build-time evaluation, `lazy import` for deferred loading. None of these features are new to programming-language design; what is new is putting them on Python without breaking interop.
+
+### Clean compilation to standard CPython
+
+The emitted `.py` is the same Python an experienced engineer would have hand-written for the same intent. No bespoke ABI; no metaclass tricks; no runtime fingerprints to identify "this is Typhon-emitted code". The handful of helpers we need (`Result[T, E]`, the lazy-import proxy, the strong-ref task registry) ship as generated source in a local `typhon_runtime/` module — *not* as a PyPI dependency users need to install.
+
+### First-class tooling
+
+A single `tyc` binary handles every stage: parse, check, format, build, lint, REPL, debugger launch, package management. The same binary runs as an LSP backend so editor diagnostics, hover, completion, and go-to-definition come for free. Sub-100ms incremental feedback in the LSP, backed by Salsa.
+
+### Honest interop with Python
+
+Untyped Python doesn't disappear; it shows up at the boundary. Typhon's job is to make that boundary visible: `.dty` stubs in the Typhon dialect, lowered to `.pyi` for the rest of the typing ecosystem; `unsafe:` blocks as the only escape hatch in user code; `tyc check --stubs` to catch stub-vs-runtime drift. Typhon does not pretend Python doesn't exist.
+
+### A minimum-viable language that ships
+
+The "minimum publishable Typhon" was decided up front: **non-null types + sealed unions + `Result` + dataclass emit**. That is the floor — every feature added on top (interfaces, comptime, lazy, gather, generics, the LSP) is layered on without changing the meaning of any program written against the minimum core. The principle behind this is that scope must always be cuttable when reality intervenes.
+
+## Non-goals
+
+These are the things Typhon explicitly is *not* trying to do. Some of them might happen later; some of them never will. Either way, do not wait for them.
+
+### Not replacing CPython
+
+Typhon targets CPython 3.13+. The emitted `.py` runs under the standard interpreter you already have. We do not ship a new VM. We do not aim to outperform CPython on hot loops — that is Cython's job. The free-threaded 3.13t / 3.14t build is opt-in and additive (it enables `ThreadPoolExecutor`-based parallelism for pure comprehensions on `[python] free-threaded = true`), not required.
+
+### Not beating Pyrefly or ty on typing-spec conformance in v1
+
+`ty` (Astral) and Pyrefly (Meta) are the reference Python type checkers in 2026. They are the right tool when you need to check every corner of the typing spec on a Python codebase. Typhon's checker is *custom* because Typhon has rules Python doesn't (non-null defaults, `Result[T, E]`, sealed unions, `let`/`mut`, `unsafe:`). For the pure typing-spec edge cases the [`tyc ty`](/Typhon/cli/ty/) subcommand defers to Astral's checker over the emitted Python.
+
+### Not aggressive auto-parallelisation
+
+The risky bits — automatic `asyncio.gather`, parallel comprehensions, pure-function auto-memoisation, PGO-based caching — ship behind opt-in `[strictness]` flags first. Inference is conservative or off by default. We would rather under-parallelise correctly than over-parallelise and introduce races that surface in production at 3am.
+
+### Not a novel package manager
+
+Standard `pip` / `uv` workflows are fine. [`tyc add`](/Typhon/cli/packages/) / `tyc remove` / `tyc sync` are a thin layer that edits `[dependencies]` in `typhon.toml`, generates a `pyproject.toml`, and shells out to `uv` for the actual install step. If `uv` is missing, the manifest still updates. We are not in the wheel-resolution business.
+
+### Not a typing-spec laboratory
+
+Typhon does not exist to push the typing spec forward. It picks the subset of PEP 484/526/544/586/695/etc. that is useful for static safety on real-world Python code, locks the choices it makes, and ships. Higher-kinded types, full variance, dependent types, refinement types — all interesting research, all out of scope for v1.
+
+### Not a Python superset for every Python program
+
+Some patterns are not expressible in Typhon without escape hatches:
+
+- Subclassing framework base classes whose `__init__` needs configuration (`torch.nn.Module`, `Enum`, `unittest.TestCase`, Django models) requires [`class!`](/Typhon/interop/class-escape/).
+- Monkey-patching built-ins is not possible; `extend BUILTIN:` extracts methods to free functions with a static-receiver rewrite.
+- Calling untyped Python without stubs requires [`unsafe:`](/Typhon/reference/unsafe/) plus a re-assertion at the boundary.
+- Programs that rely on full dynamism (e.g. `eval`, `getattr` chains, runtime AST manipulation) work but spend most of their time inside `unsafe:`.
+
+If most of your program is dynamic, Typhon will fight you. That is intentional. Use Python directly for those programs and Typhon for the parts that benefit from static safety.
+
+### Not a debugger replacement
+
+`tyc debug` is a thin v1 wrapper around `python -m pdb build/main.py`. Frames surface as `build/*.py` paths; pair with [`tyc trace`](/Typhon/cli/trace/) to remap a captured traceback back to `.ty` source via the `.py.map` sidecar. A Typhon-native source-mapping debugger is a Phase-5 deliverable. For now, the Python tooling you already have works.
+
+### Not a documentation generator (yet)
+
+Typhon does not produce HTML / Markdown docs from source comments. PEP 257 docstrings work; they pass through the emitter into the generated `.py` and any standard Python docs tool (Sphinx, pdoc, mkdocstrings) can consume them. A Typhon-aware docs generator is on the list but not scheduled.
+
+## Where the lines are
+
+Decisions that were tempting and explicitly *not* taken:
+
+- **Async-by-default with inference.** Rejected because inferring async means a function's "colour" can change when a deep callee changes, making refactoring fragile and stack traces confusing.
+- **Implicit memoisation.** Rejected by default because `@functools.cache` extends the lifetime of every argument and return value, which is not a transparent change. Opt in per-function (`@memo`, `@pure(memo=True)`) or project-wide (`[strictness] auto-memoise = true`).
+- **`isinstance(x, MyInterface)`** at runtime. Rejected because `@runtime_checkable` only validates attribute *presence*, not signatures — a much weaker guarantee than the static structural check Typhon already does. Use static narrowing, or refactor to a sealed union.
+- **`Optional[T]` import path.** Rejected in favour of `T?`. The shorter form gets used; the longer one rots in PRs.
+- **`TypeVar` from `typing`.** Rejected in favour of PEP 695 brackets (`def f[T](...)`). One syntax wins; we picked the one Python itself ships.
+- **A bespoke runtime package on PyPI.** Rejected — the helpers (`Result`, lazy proxy, task registry) emit as local generated source in `typhon_runtime/`. Production servers do not install anything Typhon-specific.
+
+## What "v1" means
+
+We use "v1" to mean "the first release where everything in this page is delivered". As of the time of writing, Phases 0 through 3 of the [roadmap](/Typhon/project/roadmap/) are complete, and Phase 4+ (auto-gather, auto-parallel, PGO, LSP completions, cross-file go-to-definition, REPL, debugger, `tyc migrate`, package-manager surface) is in progress. The minimum-viable Typhon is shippable today. Read the roadmap for the per-feature status.

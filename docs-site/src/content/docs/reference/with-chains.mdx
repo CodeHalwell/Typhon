@@ -1,0 +1,138 @@
+---
+title: with-chains
+description: Sequencing Result-producing calls with a single failure-handling site.
+sidebar:
+  order: 9
+---
+
+A `with`-chain sequences several `Result`-producing expressions, binding each success value, with an optional `else err:` block for the first `Err`. Modelled on Elixir.
+
+## Syntax
+
+```
+with NAME = EXPR "?" ("," NAME = EXPR "?")* ":" suite ["else" NAME ":" suite]
+```
+
+```python
+with user   = db.find(id)?,
+     perms  = check(user)?,
+     report = build(user, perms)?:
+    return Ok(report)
+else err:
+    log.warn(err)
+    return Err(err)
+```
+
+Read as: bind each name by unwrapping the `Ok` of its expression; if any expression yields `Err`, jump to the `else err:` block with that error in scope.
+
+## Rules
+
+- Each binding's expression must be a `Result`-typed expression with `?`.
+- Names are introduced into the `with`-block's suite (and the `else` block sees only `err`).
+- The enclosing function must return a `Result` if `else` is omitted (the chain short-circuits via `?` to the enclosing return).
+- `else err:` is optional. Without it, the first `Err` propagates as if you had written `let x = expr?` for each binding.
+
+## With or without `else`
+
+### With `else err:`
+
+```python
+def f() -> Result[int, str]:
+    with a = step1()?,
+         b = step2(a)?:
+        return Ok(a + b)
+    else err:
+        log.warn(err)
+        return Err(err)
+```
+
+The `else` block runs once, with `err` bound to the first `Err`'s payload.
+
+### Without `else`
+
+```python
+def f() -> Result[int, str]:
+    with a = step1()?,
+         b = step2(a)?:
+        return Ok(a + b)
+```
+
+Same as:
+
+```python
+def f() -> Result[int, str]:
+    let a: int = step1()?
+    let b: int = step2(a)?
+    return Ok(a + b)
+```
+
+The chain reads top-down as a sequence; on first `Err`, the function returns.
+
+## How `with`-chains desugar
+
+```python
+# Typhon
+with a = f()?, b = g(a)?:
+    return Ok(a + b)
+else err:
+    return Err(err)
+
+# Emitted Python
+_tmp_0 = f()
+if isinstance(_tmp_0, Err):
+    err = _tmp_0.error
+    return Err(err)
+a = _tmp_0.value
+_tmp_1 = g(a)
+if isinstance(_tmp_1, Err):
+    err = _tmp_1.error
+    return Err(err)
+b = _tmp_1.value
+return Ok(a + b)
+```
+
+No nested `try` blocks, no exception machinery. Stack traces stay clean.
+
+## Bindings inside the chain
+
+The binding names introduced by `with`-chains do *not* need `let` / `mut` — they are single-assignment by construction, scoped to the `with`-block's suite.
+
+## Bindings in the `else` block
+
+The `err` name in `else err:` is the unwrapped payload of the first `Err`, not the `Err` itself. Its type is the `E` of the chained `Result`s (must match across all bindings).
+
+## Error type compatibility
+
+All `?`-applied expressions in the chain must agree on `E`. Mixing error types is a `tyc::result_error_mismatch`. Convert at the boundary:
+
+```python
+def f() -> Result[T, AppError]:
+    with parsed = parse_str()?,                         # Result[int, str] — ❌
+         loaded = load_int(parsed)?:                    # Result[T, AppError]
+        return Ok(loaded)
+```
+
+Fix:
+
+```python
+def f() -> Result[T, AppError]:
+    match parse_str():
+        case Ok(parsed):
+            with loaded = load_int(parsed)?:
+                return Ok(loaded)
+        case Err(msg):
+            return Err(AppError(message=msg))
+```
+
+## When to use a `with`-chain
+
+- **Three or more `Result`-returning calls** where each depends on the previous.
+- You want a single failure-handling site (logging, metrics, rollback) for any step that fails.
+
+For one or two calls, plain `let x = expr?` on separate lines reads fine.
+
+## Where next
+
+- [The ? Operator](/Typhon/reference/question-operator/) — the underlying propagation form.
+- [`Result, Ok, Err`](/Typhon/reference/result/) — the type and its constructors.
+- [Error Handling (tour)](/Typhon/tour/error-handling/) — teaching page.

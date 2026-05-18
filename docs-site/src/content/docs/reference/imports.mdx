@@ -1,0 +1,108 @@
+---
+title: Imports
+description: import, from-import, and lazy import.
+sidebar:
+  order: 19
+---
+
+Imports follow Python's syntax, with one Typhon addition (`lazy import`) and one Typhon restriction (`lazy from` is rejected).
+
+## `import`
+
+```python
+import sys
+import os.path
+import json
+import requests as rq
+```
+
+Standard Python — names land in the importing module's namespace.
+
+## `from ... import`
+
+```python
+from typing import Callable
+from collections.abc import Iterable
+from .users import User
+from ..lib import helper
+```
+
+Relative imports (`.`, `..`) work as in Python.
+
+## Conditional imports
+
+```python
+import sys
+
+if sys.platform == "win32":
+    import winreg
+else:
+    import os
+```
+
+Standard Python — Typhon doesn't restrict this.
+
+## Re-exports
+
+A module-level `__all__` list controls what `from module import *` exposes:
+
+```python
+# in users.ty
+__all__ = ["User", "find_user"]
+```
+
+For imports the resolver follows `__all__` when computing what a `from module import` provides.
+
+## `lazy import`
+
+Defers module loading until first attribute access:
+
+```python
+lazy import np = numpy
+lazy import torch
+```
+
+The first form gives the proxy an alias; the second uses the module name directly. See [`lazy`](/Typhon/reference/lazy/) for the full reference.
+
+## `lazy from` is rejected
+
+```python
+lazy from numpy import array        # ❌ parse error
+```
+
+```
+error[tyc::lazy_from_import]: `lazy from … import` defeats deferred loading;
+                              use `lazy import numpy` plus `numpy.array(...)`
+```
+
+`from`-imports eagerly touch attributes on the source module — they cannot defer.
+
+## Unused imports
+
+Severity controlled by `[strictness] unused-import` in `typhon.toml`:
+
+- `"error"` — default. Unused imports fail the build.
+- `"warn"` — flagged as a warning.
+- `"off"` — no check.
+
+The LSP offers a "Remove unused import" quick-fix.
+
+## Import side effects
+
+Python imports run module-level code. Typhon does not change this — `import some_module` runs `some_module/__init__.py` as it always has.
+
+Use `lazy import` to defer that cost when it matters (e.g. for CLIs that may not need the module).
+
+## Cyclic imports
+
+Typhon does not introduce new rules. Python's existing semantics apply: cyclic imports work as long as the cycle doesn't access module-level names before they're defined. The checker doesn't enforce a "no cycles" rule.
+
+## Where the checker treats `.pyi` / `.py` as boundaries
+
+When you `import` from a plain `.py` (no `.dty` stub authored), the imported symbols are treated as if they crossed an `unsafe:` boundary unless they're typed in the source. Use [`.dty` stubs](/Typhon/interop/dty-stubs/) to give third-party libraries proper typed signatures.
+
+## Where next
+
+- [`lazy`](/Typhon/reference/lazy/) — deferred import reference.
+- [Writing .dty Stubs](/Typhon/interop/dty-stubs/) — typing third-party imports.
+- [Interop Overview](/Typhon/interop/overview/) — Python interop story.

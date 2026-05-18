@@ -1,0 +1,106 @@
+---
+title: Calling Python from Typhon
+description: What happens when you import an untyped Python module.
+sidebar:
+  order: 2
+---
+
+When you `import` from a plain `.py`, three outcomes are possible:
+
+1. **The module is typed** (PEP 484 / 526 annotations everywhere). The checker accepts the types and treats the import like a Typhon module.
+2. **An authored `.dty` stub exists** for the module. The stub is the typed surface; the runtime `.py` is the implementation.
+3. **The module is untyped.** Imports return `Any` — which is `tyc::implicit_any` unless the call site is in an `unsafe:` block.
+
+## Typed Python imports
+
+```python
+# typed_lib.py — typed Python
+def add(a: int, b: int) -> int:
+    return a + b
+
+# main.ty
+from typed_lib import add
+
+def f() -> int:
+    return add(1, 2)        # ✅ types flow through
+```
+
+The checker reads the Python type annotations and treats `add` like a Typhon function.
+
+## Stubbed Python imports
+
+```python
+# stubs/redis.dty — authored stub
+class Redis:
+    host: str
+    port: int
+
+impl Redis:
+    def get(self, key: str) -> str?
+    def set(self, key: str, value: str) -> bool
+
+# main.ty
+import redis
+
+def f() -> str?:
+    let r: redis.Redis = redis.Redis(host="localhost", port=6379)
+    return r.get("k")       # ✅ typed via the stub
+```
+
+See [Writing .dty Stubs](/Typhon/interop/dty-stubs/) for the stub format.
+
+## Untyped Python imports
+
+```python
+import messy_lib
+
+def f() -> int:
+    let raw = messy_lib.fetch()    # ❌ tyc::implicit_any
+```
+
+Three fixes, in order of preference:
+
+```python
+# Option A: write a .dty stub
+# (best for long-lived dependencies)
+
+# Option B: annotate explicitly
+let raw: dict[str, int] = messy_lib.fetch()
+
+# Option C: wrap in unsafe
+unsafe:
+    let raw = messy_lib.fetch()
+let parsed: dict[str, int] = ...    # re-assert at the boundary
+```
+
+## What gets emitted
+
+Typhon's `import` lowers to a plain Python `import`. The imported name's runtime behaviour is unchanged:
+
+```python
+# Typhon
+import messy_lib
+
+# Emitted
+import messy_lib
+```
+
+The strictness is *compile-time only*. At runtime, the import resolves the same way Python always has.
+
+## Calling async Python
+
+```python
+import some_async_lib
+
+async def f() -> str:
+    let body: str = await some_async_lib.fetch_async("url")
+    return body
+```
+
+Calling an `async def` Python function from a Typhon `async def` works as expected. Sync function calling async without `await` is a hard error (`tyc::missing_await`).
+
+## Where next
+
+- [Writing .dty Stubs](/Typhon/interop/dty-stubs/) — the typed-stub format.
+- [The Unsafe Boundary](/Typhon/types/unsafe/) — the escape hatch's mechanics.
+- [Wrapping an Untyped Library (recipe)](/Typhon/recipes/wrapping-library/) — worked patterns.

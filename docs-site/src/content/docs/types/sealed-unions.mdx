@@ -1,0 +1,201 @@
+---
+title: Sealed Unions
+description: type X = A | B | C is closed; match must be exhaustive.
+sidebar:
+  order: 7
+---
+
+A *sealed* union, declared with the `type` keyword, is a closed sum: every inhabitant is one of the variants listed in the alias. The checker uses this to enforce exhaustive `match`. Adding a new variant fails every `match` site that doesn't cover it.
+
+See [Sealed Unions and Match (tour)](/Typhon/tour/sealed-unions/) for the full walk-through; this page is the reference.
+
+## Declaration
+
+```python
+type Shape = Circle | Rectangle | Triangle
+
+class Circle:
+    radius: float
+
+class Rectangle:
+    width: float
+    height: float
+
+class Triangle:
+    base: float
+    height: float
+```
+
+The `type` keyword declares the alias. The set on the right side is the *complete* list of inhabitants. Nothing outside this file can extend `Shape`.
+
+## What "sealed" means
+
+The seal is enforced at the **type level**, not at runtime — Python has no concept of sealed classes. The checker:
+
+- Treats the union as exactly the listed variants for purposes of exhaustiveness.
+- Refuses to compile a `match` over a sealed union that misses a variant.
+- Does *not* prevent a Python subclass at runtime from being passed in; if such an instance reaches a `match`, it'll fall through unmatched (just like Python).
+
+For closed sets known at design time, that's fine. For genuinely open sums (third-party extensions), use a base class or an `interface` instead.
+
+## `class` variants
+
+Variants are normal classes. They can have:
+
+- Fields (with or without defaults).
+- `impl` blocks (per-variant methods).
+- `frozen` modifiers.
+- Generic parameters.
+
+```python
+type Tree[T] = Leaf[T] | Node[T]
+
+class Leaf[T]:
+    value: T
+
+class Node[T]:
+    left: Tree[T]
+    right: Tree[T]
+```
+
+## `pass`-bodied variants
+
+For variants that carry no data:
+
+```python
+type Token = Number | Ident | Plus | Minus | LParen | RParen | EOF
+
+class Number:
+    value: float
+class Ident:
+    name: str
+class Plus: pass
+class Minus: pass
+class LParen: pass
+class RParen: pass
+class EOF: pass
+```
+
+`pass`-bodied classes still need parentheses on construction: `Plus()`, `EOF()`. The constructor is generated.
+
+## Pattern matching
+
+Each variant has a positional structural pattern: `case Variant(field1, field2, ...)`.
+
+```python
+def area(s: Shape) -> float:
+    match s:
+        case Circle(radius):
+            return 3.14159 * radius * radius
+        case Rectangle(width, height):
+            return width * height
+        case Triangle(base, height):
+            return 0.5 * base * height
+```
+
+Destructured names are new bindings, narrowed to their field types.
+
+### Wildcards
+
+`case _:` is a deliberate catch-all. Using it opts out of exhaustiveness:
+
+```python
+def describe(s: Shape) -> str:
+    match s:
+        case Circle(_):
+            return "circle"
+        case _:
+            return "polygon"     # catches Rectangle and Triangle
+```
+
+The compiler won't warn when new variants are added. Use sparingly.
+
+### Guards
+
+`case X if cond:` adds an additional predicate:
+
+```python
+match s:
+    case Circle(r) if r > 100:
+        return "huge circle"
+    case Circle(_):
+        return "circle"
+    case _:
+        return "polygon"
+```
+
+A guarded `case` does *not* satisfy exhaustiveness for that variant — you still need an unguarded `case Circle(_)` (or similar) for cases where the guard is false.
+
+## Generic sealed unions
+
+```python
+type Result[T, E] = Ok[T] | Err[E]
+
+class Ok[T]:
+    value: T
+
+class Err[E]:
+    error: E
+```
+
+This is in fact how `Result[T, E]` itself is defined in `typhon_runtime`. The checker instantiates `T` and `E` at the use site.
+
+## Cross-file variants
+
+Variants must all be visible in the same scope as the `type` alias. A common layout:
+
+```python
+# events.ty
+class UserCreated:
+    user_id: int
+
+class UserDeleted:
+    user_id: int
+
+class UserRenamed:
+    user_id: int
+    new_name: str
+
+type UserEvent = UserCreated | UserDeleted | UserRenamed
+```
+
+Importing `UserEvent` from another file gives you the full sealed type. Adding a fourth variant requires editing this file — and the addition lights up every `match` in the codebase.
+
+## Adding a variant
+
+The whole point of sealing. When you add `Square` to `Shape`:
+
+```python
+type Shape = Circle | Rectangle | Triangle | Square
+
+class Square:
+    side: float
+```
+
+Every `match s:` in the codebase that doesn't have a `case Square(...):` becomes `tyc::non_exhaustive_match`. The diagnostic tells you exactly which variant is missing and where each match site is.
+
+This is the single biggest static-safety win the language offers — refactors that would have been multi-week archaeology in plain Python become checklist work.
+
+## Common mistakes
+
+### Forgetting `type`
+
+```python
+class Circle: ...
+class Rectangle: ...
+
+def area(s: Circle | Rectangle) -> float:    # ⚠️ ad-hoc union, not sealed
+    ...
+```
+
+Without `type X = ...`, the union is anonymous. Exhaustiveness still works for *this* call site, but there's no named type that catches drift across files. Always declare a `type` alias for sealed unions.
+
+### Treating `case _:` as a default
+
+`case _:` opts out of exhaustiveness. Use it when you genuinely want a catch-all; avoid it when you want the compiler to remind you about new variants.
+
+## Where next
+
+- [Sealed Unions and Match (tour)](/Typhon/tour/sealed-unions/) — worked examples.
+- [`match`](/Typhon/reference/match/) — the reference page.
+- [State Machines with Sealed Unions](/Typhon/recipes/state-machines/) — a worked pattern.

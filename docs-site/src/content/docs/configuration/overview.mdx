@@ -1,0 +1,73 @@
+---
+title: typhon.toml Overview
+description: Every key the compiler reads.
+sidebar:
+  order: 1
+---
+
+`typhon.toml` lives at the project root and drives every `tyc` subcommand. The default scaffold (`tyc init`) gets you started; this section enumerates every key.
+
+## The default
+
+```toml
+[project]
+name = "myapp"
+version = "0.1.0"
+src = "src"
+out = "build"
+
+[python]
+target = "3.13"
+free-threaded = false
+
+[emit]
+class-default = "dataclass"
+format = true
+
+[strictness]
+no-implicit-any = true
+unused-import = "error"
+exhaustive-match = "error"
+auto-memoise = false
+auto-gather = false
+auto-parallel = false
+parallel-min-size = 64
+pgo-memoise = false
+pgo-min-calls = 100
+
+[env]
+required = ["DATABASE_URL"]
+
+[dependencies]
+requests = ">=2.31"
+
+[dev-dependencies]
+pytest = "8.2"
+```
+
+## Sections
+
+| Section | Purpose | Page |
+|---------|---------|------|
+| `[project]` | Name, version, src/out dirs | [→](/Typhon/configuration/project/) |
+| `[python]` | Target version, free-threaded mode | [→](/Typhon/configuration/python/) |
+| `[emit]` | Class default, format toggle | [→](/Typhon/configuration/emit/) |
+| `[strictness]` | Every strictness knob | [→](/Typhon/configuration/strictness/) |
+| `[env]` | Required build-time env vars | [→](/Typhon/configuration/env/) |
+| `[dependencies]` / `[dev-dependencies]` | Package manifest | [→](/Typhon/configuration/dependencies/) |
+
+See [Recommended Presets](/Typhon/configuration/presets/) for opinionated starting points.
+
+## Always-on behaviour
+
+Two emit policies are no longer configurable and run unconditionally:
+
+- **PEP 561 `.pyi` stubs** are emitted for every `.dty` file next to the project, so mypy / pyright / Pyrefly / `ty` can consume Typhon-authored libraries without an interop tax. The previously-documented `[emit] pyi-stubs` toggle has been removed.
+- **Pydantic `model` classes** are always emitted with `model_config = ConfigDict(extra="forbid")` — the safety pitch forbids silently dropping unexpected input. A configurable `model-extra` knob is on the roadmap but not yet wired in.
+
+## Conventions
+
+- Boolean keys: lowercase `true` / `false`.
+- Path keys: relative to the manifest directory.
+- Enum keys: lowercase strings (`"error"`, `"warn"`, `"off"`).
+- Version selectors in `[dependencies]`: uv-compatible (`"*"`, `">=2.31"`, `"==8.2"`, bare version → `"==N"`).

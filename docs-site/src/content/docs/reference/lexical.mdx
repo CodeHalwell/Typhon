@@ -1,0 +1,151 @@
+---
+title: Lexical Structure
+description: Tokens, keywords, identifiers, literals, indentation, comments — Typhon's lexical surface.
+sidebar:
+  order: 1
+---
+
+Typhon's lexical structure inherits from Python with a small set of additions. This page enumerates what the lexer accepts.
+
+## Source encoding
+
+Files are UTF-8. There is no PEP 263 encoding declaration; UTF-8 is the only supported encoding.
+
+File extensions:
+
+- `.ty` — Typhon source.
+- `.dty` — Typhon stub source (compiles to `.pyi`).
+- `typhon.toml` — project configuration (TOML).
+
+## Indentation
+
+Significant whitespace, same as Python. Indentation introduces blocks; the first indented line sets the unit (typically 4 spaces). Tabs and spaces cannot mix within the same indent unit.
+
+```python
+def f() -> int:
+    if True:
+        return 1
+    return 0
+```
+
+## Comments
+
+```python
+# Line comment, runs to end of line.
+let x: int = 1  # also valid as trailing
+```
+
+No multi-line comment syntax. Use `#` per line, or a triple-quoted string the parser ignores as an expression statement (the Python convention).
+
+## Identifiers
+
+```
+identifier ::= (letter | "_") (letter | digit | "_")*
+```
+
+Same as Python — `[a-zA-Z_][a-zA-Z0-9_]*`. Unicode identifiers (PEP 3131) are accepted.
+
+## Keywords
+
+The standard Python keywords are reserved:
+
+```
+False    None     True     and      as       assert   async    await
+break    class    continue def      del      elif     else     except
+finally  for      from     global   if       import   in       is
+lambda   nonlocal not      or       pass     raise    return   try
+while    with     yield    match    case
+```
+
+`match` and `case` are soft keywords (only reserved in match-statement position), same as Python 3.10+.
+
+## Typhon soft keywords
+
+These are recognised as keywords only in syntactically distinguishing positions:
+
+| Keyword | Where |
+|---------|-------|
+| `let` | Local binding declarations. |
+| `mut` | Local binding declarations. |
+| `comptime` | Before `let`, `mut`, or `def` at module level. |
+| `lazy` | Before `import`, `let`, or in return type position (`-> lazy[T]`). |
+| `unsafe` | At the start of a statement, introducing a colon-block. |
+| `gather` | At the start of a statement, introducing a colon-block; or with `(strategy="...")` for best-effort. |
+| `go` | At the start of an expression statement: `go f(x)` or `go f(x) -> handle`. |
+| `guard` | At the start of a statement: `guard name = expr else: ...`. |
+| `interface` | At the start of a top-level declaration. |
+| `impl` | At the start of a top-level declaration. |
+| `extend` | At the start of a top-level declaration. |
+| `model` | At the start of a class declaration: `model Foo:`. |
+| `frozen` | After a class name: `class Foo frozen:`. |
+| `type` | At the start of a top-level declaration: `type X = ...`. |
+| `Ok` / `Err` | Constructor calls; not reserved otherwise. |
+
+Soft keywords can appear as identifiers in other positions (`let x: dict = {"impl": 1}` is fine).
+
+## Literals
+
+### Numeric
+
+```python
+0       42      -1      1_000_000
+0x1F    0o17    0b1010
+3.14    1e6     1.0e-6  inf     nan
+```
+
+### String
+
+```python
+"single"        'single'
+"""triple"""    '''triple'''
+r"raw"          R"raw"
+b"bytes"        B"bytes"
+f"f-string {x}" F"f-string"
+rb"raw bytes"   br"raw bytes"
+```
+
+f-string syntax follows PEP 701: nested expressions, format specifiers, `=` for self-documenting.
+
+### Container
+
+```python
+[1, 2, 3]                      # list
+(1, 2, 3)                      # tuple (parens optional in some positions)
+{1, 2, 3}                      # set
+{"a": 1, "b": 2}               # dict
+[]      ()       {}            # empty list, tuple, dict (set is `set()`)
+(1,)                            # 1-tuple (trailing comma required)
+```
+
+## Operators
+
+Standard Python operators, plus:
+
+| Operator | Meaning |
+|----------|---------|
+| `\|>` | Pipe — `a \|> f(b)` is `f(a, b)`. Left-associative. |
+| `?` (suffix, on type) | Nullable — `T?` is `T \| None`. |
+| `?` (suffix, on expression) | Result propagation — only inside a function returning a `Result`. |
+
+See [Operators and Precedence](/Typhon/reference/operators/) for the full table.
+
+## Line continuation
+
+Backslash-newline (`\`) for explicit continuation, and implicit continuation inside `()`, `[]`, `{}`.
+
+## Statements
+
+A statement ends at a newline (or `;`, though `;` is discouraged outside REPL contexts). Compound statements (`if`, `for`, `while`, `def`, `class`, `match`, `try`, `with`, `async with`, `unsafe`, `gather`) introduce a colon-block.
+
+## Reserved for future use
+
+The following tokens are reserved for possible future use and currently rejected:
+
+- `<` / `>` for angle-bracket generics. (Locked: PEP 695 brackets are the only form.)
+- `unsafe expr` (per-expression cast). (Lexical block is the only form.)
+
+## Where next
+
+- [`let` and `mut`](/Typhon/reference/let-mut/) — the binding-kind keywords.
+- [Operators and Precedence](/Typhon/reference/operators/) — the full operator table.
+- [Grammar Cheat Sheet](/Typhon/reference/grammar/) — a one-page summary of the grammar.

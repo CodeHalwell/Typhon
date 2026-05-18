@@ -1,0 +1,87 @@
+---
+title: Architecture Overview
+description: The tyc compiler is a Cargo workspace of small crates mirroring a classical pipeline.
+sidebar:
+  order: 1
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+`tyc` is a multi-stage compiler with an embedded LSP, structured as a Cargo workspace of small crates that mirror the pipeline stages. Each stage produces a typed Rust value that the next stage consumes; analysis results are stored as Salsa queries so the LSP can reuse them incrementally.
+
+## The pipeline
+
+```
+.ty source files
+        │
+        ▼
+[tyc-syntax]   →  Typhon AST (Python AST + Typhon nodes)
+        │
+        ▼
+[tyc-resolve]  →  symbol tables, scopes, let/mut classification
+        │
+        ▼
+[tyc-types]    →  typed AST, structural subtyping, sealed unions
+        │
+        ▼
+[tyc-analyse]  →  purity, async/concurrency, comptime, optimisation hints
+        │
+        ▼
+[tyc-desugar]  →  plain Python AST
+        │
+        ▼
+[tyc-emit]     →  .py source via hand-written printer
+        │
+        ▼
+[tyc-format]   →  post-process through ruff format
+        │
+        ▼
+[tyc-lsp]      →  reuses the above stages incrementally via Salsa
+```
+
+This is the same crate-per-stage layout used by [oxc](https://github.com/oxc-project/oxc) and [rust-analyzer](https://rust-analyzer.github.io/). The single most important meta-rule: every external crate gets wrapped behind a one-function-wide module of our own, so when Salsa changes its API or Ruff renames a node, the blast radius stays small.
+
+<CardGrid>
+  <Card title="The Pipeline" icon="forward-slash">
+    [→](/Typhon/internals/pipeline/) — each stage in detail, with the queries it owns.
+  </Card>
+  <Card title="Workspace Layout" icon="document">
+    [→](/Typhon/internals/workspace/) — every crate, its responsibility, and its dependencies.
+  </Card>
+  <Card title="Salsa Queries" icon="setting">
+    [→](/Typhon/internals/salsa/) — the incremental query layer.
+  </Card>
+  <Card title="The Vendored Ruff Fork" icon="puzzle">
+    [→](/Typhon/internals/ruff-fork/) — what we vendored from Ruff and why.
+  </Card>
+  <Card title="Adding a Diagnostic" icon="warning">
+    [→](/Typhon/internals/adding-diagnostic/) — the worked walk-through for compiler contributors.
+  </Card>
+  <Card title="Contributing" icon="open-book">
+    [→](/Typhon/internals/contributing/) — how to send a PR.
+  </Card>
+</CardGrid>
+
+## Toolchain decisions
+
+| Stage | Primary choice | Fallback | Why |
+|-------|----------------|----------|-----|
+| Parser | Fork `ruff_python_parser` | `rustpython-parser` | Fastest, most spec-compliant Python parser in Rust. Not on crates.io, so vendor it. |
+| AST | Fork `ruff_python_ast` | Hand-written | AST is partly TOML-generated; adding Typhon variants is mechanical. |
+| Incremental engine | `salsa` (salsa-rs) | Hand-rolled query cache | Powers `rust-analyzer` and `ty`. Free cancellation and parallel queries. |
+| Type checker | Custom on Salsa, `ty` as reference | Embed `ty` as a library | Typhon-specific rules need their own checker; `ty` handles the Python subset (deferred). |
+| Code emission | Hand-written pretty-printer | Fork `ruff_python_codegen` (deferred) | Hand-written printer tracks line offsets for `.py.map`. |
+| LSP transport | `tower-lsp-server` | `lsp-server` (rust-analyzer style) | Ergonomic, active fork on `lsp-types` 0.97+. |
+| CLI | `clap` v4 derive | — | Standard. |
+| Diagnostics | `miette` + `thiserror` | `ariadne` | Best-in-class source-span rendering. |
+| Config | `serde` + `toml` | — | Standard. |
+
+## Why vendor the Ruff parser
+
+Python's significant-whitespace lexing is non-trivial. Hand-writing a full Python parser using `chumsky` or `lalrpop` would mean spending months catching up to mainstream Python syntax before writing a single new feature. Vendoring Ruff's parser inherits its battle-testing on real codebases and its same-AST contract with `ty`, which simplifies later type-checker integration. The cost is grammar-sync work whenever Python releases new syntax.
+
+## Where next
+
+- [The Pipeline](/Typhon/internals/pipeline/) — each stage.
+- [Workspace Layout](/Typhon/internals/workspace/) — crate-by-crate.
+- [Contributing](/Typhon/internals/contributing/) — sending a PR.

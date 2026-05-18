@@ -1,0 +1,113 @@
+---
+title: Python Habits to Drop
+description: Patterns that work in Python but fight Typhon's checker.
+sidebar:
+  order: 2
+---
+
+Patterns that are idiomatic Python but produce friction in Typhon.
+
+## "It worked before I added types"
+
+Adding types reveals bugs that were always there. A `T?` parameter that was passed `None` 1% of the time was always crashing — the checker just told you about it. Don't suppress the diagnostic; fix the underlying flow.
+
+## `Optional[T]` from `typing`
+
+Spell it `T?`.
+
+```python
+from typing import Optional
+def f(x: Optional[int]) -> None: ...    # ❌
+def f(x: int?) -> None: ...              # ✅
+```
+
+`tyc migrate` rewrites this automatically.
+
+## `Union[A, B]`
+
+Spell it `A | B`. The migrator handles this.
+
+## `dict.get(k)` as if it returned `V`
+
+Default to non-nullable Python is the wrong intuition. `dict.get(k)` returns `V?`; either provide a default (`dict.get(k, default)`) or narrow.
+
+## Catching exceptions for control flow
+
+```python
+try:
+    return cache[key]
+except KeyError:
+    return compute()
+```
+
+Refactor to:
+
+```python
+let cached: V? = cache.get(key)
+if cached is not None:
+    return cached
+return compute()
+```
+
+Or use `defaultdict`.
+
+## Bare `class` for things that need validation
+
+If the data crosses a trust boundary, use `model`. `class` is for fully-trusted internal types.
+
+## `from typing import TypeVar` and friends
+
+PEP 695 syntax is the Typhon form. The migrator handles this.
+
+## `isinstance(x, MyInterface)`
+
+Static narrowing or sealed unions. Read [Interfaces](/Typhon/types/interfaces/) for why.
+
+## Sticking `assert isinstance(x, T)` to narrow
+
+```python
+assert isinstance(x, str)
+x.upper()
+```
+
+Works, but `if isinstance(x, str): ...` or `guard ...` reads better and the checker treats them identically.
+
+## Single-letter generic names where the meaning is unclear
+
+`T` is fine for "any type". For two-parameter generics, prefer `K, V` over `T, U`; for "key / value / element" use `K, V, T` rather than `T1, T2, T3`.
+
+## Mutating arguments
+
+```python
+def append(xs: list[int]) -> None:
+    xs.append(42)       # ⚠️ caller's list mutated
+```
+
+Typhon doesn't enforce immutability of arguments. If you need pass-by-value semantics, copy at the boundary or use `tuple`.
+
+## Long parameter lists without keyword-only markers
+
+```python
+def connect(host: str, port: int = 5432, ssl: bool = True, timeout: int = 30) -> None: ...
+```
+
+Call sites become positional puzzles. Add `*` for keyword-only:
+
+```python
+def connect(host: str, *, port: int = 5432, ssl: bool = True, timeout: int = 30) -> None: ...
+```
+
+Now `connect("localhost", port=5433)` is the only legal call shape — much easier to read.
+
+## Returning `None` to mean "no result"
+
+`Result[T, E]` with a typed `E` is more informative than `T?`. Use `T?` only when the absence is meaningful and uniform; use `Result[T, E]` when there's *why* it failed.
+
+## `from typhon_runtime import ...` by hand
+
+Don't. The runtime module is generated. Importing from it manually couples your source to compiler internals.
+
+## Where next
+
+- [Top Pitfalls](/Typhon/pitfalls/top/) — the most common mistakes.
+- [Performance Gotchas](/Typhon/pitfalls/performance/) — perf-related.

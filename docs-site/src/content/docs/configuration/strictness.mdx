@@ -1,0 +1,100 @@
+---
+title: "[strictness]"
+description: Every strictness knob — what each one does and what it costs to flip.
+sidebar:
+  order: 5
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+```toml
+[strictness]
+no-implicit-any = true
+unused-import = "error"
+exhaustive-match = "error"
+auto-memoise = false
+auto-gather = false
+auto-parallel = false
+parallel-min-size = 64
+pgo-memoise = false
+pgo-min-calls = 100
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `no-implicit-any` | bool | `true` | Implicit `Any` is a hard error outside `unsafe:` blocks. |
+| `unused-import` | `"error"` \| `"warn"` \| `"off"` | `"error"` | Severity for unused imports. The LSP offers a "Remove unused import" quick-fix. |
+| `exhaustive-match` | `"error"` \| `"warn"` \| `"off"` | `"error"` | Severity for non-exhaustive `match` over sealed unions. |
+| `auto-memoise` | bool | `false` | Insert `@functools.cache` on every function the analyser infers as pure. **Off by default — caches extend lifetimes invisibly.** |
+| `auto-gather` | bool | `false` | Fold straight-line independent `await` runs into `asyncio.TaskGroup`, but only for `@gatherable`-decorated callees. |
+| `auto-parallel` | bool | `false` | Rewrite pure list comprehensions over large iterables to a `ThreadPoolExecutor.map` (needs `free-threaded`). |
+| `parallel-min-size` | int | `64` | Minimum iterable size for `auto-parallel` to fire. When the size can't be statically inferred, treated as zero. |
+| `pgo-memoise` | bool | `false` | Promote hot pure functions to `@functools.cache` based on `typhon-profile.json` from a prior `tyc profile` run. |
+| `pgo-min-calls` | int | `100` | Threshold for `pgo-memoise`. |
+
+## `no-implicit-any`
+
+The flagship strictness rule. Implicit `Any` outside `unsafe:` is a hard error:
+
+```python
+let data = some_untyped_lib.fetch()    # ❌ tyc::implicit_any
+```
+
+Setting `false` would surface this as a warning instead of an error. We strongly recommend leaving it on.
+
+## `unused-import`
+
+Three settings:
+
+- `"error"` (default) — fails CI on unused imports.
+- `"warn"` — flagged but doesn't fail CI.
+- `"off"` — no check.
+
+The LSP includes a "Remove unused import" code action that fires on these diagnostics.
+
+## `exhaustive-match`
+
+Drives the exhaustiveness check on `match` over sealed unions. Default `"error"` — keep it.
+
+Lower to `"warn"` only during big refactors, and raise it back before merging.
+
+## `auto-memoise`
+
+**Off by default.** When on, every function the analyser infers as pure (all six conditions hold) gets `@functools.cache`. The runtime impact:
+
+- Cached arguments stay alive forever (or until the cache is cleared).
+- Cached return values stay alive forever.
+- Process-local — different processes don't share.
+
+These tradeoffs aren't free. Opt in deliberately, ideally after profiling.
+
+<Aside type="caution">
+  Even when `auto-memoise = true`, the analyser still requires all six purity conditions to hold. It does not blindly wrap impure functions.
+</Aside>
+
+## `auto-gather`
+
+Folds runs of two-or-more consecutive independent `name = await callee(...)` statements inside an `async def` into an `asyncio.TaskGroup`. **Every callee must be a same-module `async def` carrying an explicit `@gatherable` decorator** — undecorated async functions and externally-imported callees are left alone.
+
+There is no diagnostic when a callee lacks `@gatherable` — the awaits just stay sequential. If you forget to decorate, you'll see no parallelism *and* no error. Run `tyc trace` or read the emitted Python to confirm whether a particular run got rewritten.
+
+Default `false`. Explicit `gather:` blocks are unaffected by this setting.
+
+## `auto-parallel`
+
+When `true`, pure list comprehensions whose element is a pure call are rewritten at build time to a `ThreadPoolExecutor.map`. Combine with `[python] free-threaded = true` to release the GIL across workers; on stock CPython the rewrite still runs but the GIL serialises.
+
+`parallel-min-size` is the minimum statically-detectable iterable length. Default `64`. When the iterable size cannot be inferred, the threshold is treated as zero — users opting in accept that contract.
+
+## `pgo-memoise`
+
+When `true`, `tyc build` reads `typhon-profile.json` (from a prior [`tyc profile`](/Typhon/cli/profile/) run) and promotes every pure function whose observed call count meets `pgo-min-calls` to `@functools.cache`, even if the user did not write `@memo`. Complements `auto-memoise` (which caches every pure function regardless of profile data).
+
+Missing profile file is not an error — PGO is best-effort.
+
+## Where next
+
+- [`tyc check`](/Typhon/cli/check/) — sees `[strictness]` directly.
+- [`@pure` and `@memo`](/Typhon/reference/pure-memo/) — the purity check used for memoisation.
+- [`async`, `await`, `gather`, `go`](/Typhon/reference/async/) — `@gatherable` for `auto-gather`.
+- [Recommended Presets](/Typhon/configuration/presets/) — opinionated starting points.

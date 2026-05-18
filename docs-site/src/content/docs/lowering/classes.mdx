@@ -1,0 +1,187 @@
+---
+title: Classes → dataclass
+description: How class, model, class!, and frozen lower to Python.
+sidebar:
+  order: 2
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+## `class` → `@dataclass(slots=True)`
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    class User:
+        id: int
+        name: str = "anon"
+        email: str?
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    from dataclasses import dataclass
+
+    @dataclass(slots=True)
+    class User:
+        id: int
+        name: str = "anon"
+        email: str | None = None
+    ```
+  </TabItem>
+</Tabs>
+
+- `slots=True` — instances don't carry a per-object `__dict__`; saves memory and catches typo'd attribute writes.
+- `from dataclasses import dataclass` is auto-injected.
+- Fields without defaults come first; fields with defaults follow (Python's rule).
+
+## `frozen` modifier
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    class Point frozen:
+        x: float
+        y: float
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    from dataclasses import dataclass
+
+    @dataclass(slots=True, frozen=True)
+    class Point:
+        x: float
+        y: float
+    ```
+  </TabItem>
+</Tabs>
+
+Field reassignment is a hard error (`tyc::frozen_assign`); runtime raises `FrozenInstanceError`.
+
+## `impl ... :` merges into class body
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    class User:
+        id: int
+        name: str
+
+    impl User:
+        def display(self) -> str:
+            return f"{self.name} (#{self.id})"
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    @dataclass(slots=True)
+    class User:
+        id: int
+        name: str
+
+        def display(self) -> str:
+            return f"{self.name} (#{self.id})"
+    ```
+  </TabItem>
+</Tabs>
+
+Multiple `impl` blocks (across files) all merge.
+
+## `model` → Pydantic
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    model ApiUser:
+        id: int
+        email: str
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    from pydantic import BaseModel, ConfigDict
+
+    class ApiUser(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
+        id: int
+        email: str
+    ```
+  </TabItem>
+</Tabs>
+
+`extra="forbid"` is the default (Pydantic's stock `extra="ignore"` is rejected by Typhon's safety posture). The configurable `[emit] model-extra` knob is roadmapped.
+
+## `class!` — escape hatch
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    class! MyModel(nn.Module):
+        layer: nn.Linear
+        dropout: float
+
+        def forward(self, x):
+            return self.layer(x)
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    import torch.nn as nn
+
+    class MyModel(nn.Module):
+        layer: nn.Linear
+        dropout: float
+
+        def __init__(self, layer: nn.Linear, dropout: float) -> None:
+            super().__init__()
+            self.layer = layer
+            self.dropout = dropout
+
+        def forward(self, x):
+            return self.layer(x)
+    ```
+  </TabItem>
+</Tabs>
+
+`class!`:
+
+- No `@dataclass` decorator.
+- `__init__` is synthesised — calls `super().__init__()` first, then assigns annotated fields in source order.
+- Hand-written `__init__` is preserved verbatim.
+
+## Generic classes
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    class Box[T]:
+        value: T
+
+    impl[T] Box[T]:
+        def get(self) -> T:
+            return self.value
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    from dataclasses import dataclass
+
+    @dataclass(slots=True)
+    class Box[T]:
+        value: T
+
+        def get(self) -> T:
+            return self.value
+    ```
+  </TabItem>
+</Tabs>
+
+PEP 695 generic syntax is preserved (Python 3.13+ default target).
+
+## Where next
+
+- [`class`, `model`, `class!` reference](/Typhon/reference/classes/) — declaration forms.
+- [`impl` and `extend` reference](/Typhon/reference/impl-extend/) — method merging.
+- [Class Escape Hatches](/Typhon/interop/class-escape/) — `class!` patterns by framework.

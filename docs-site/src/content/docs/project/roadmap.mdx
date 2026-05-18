@@ -1,0 +1,81 @@
+---
+title: Roadmap
+description: Phased delivery plan — what's shipped, what's in progress, what's deferred.
+sidebar:
+  order: 1
+---
+
+Phases 0–3 are complete. Phase 4+ is in progress. The minimum-viable Typhon — non-null types + sealed unions + `Result` + dataclass emit — is shippable today.
+
+## Phase 0 — Foundation ✅
+
+- Cargo workspace with crate-per-stage layout.
+- Vendored Ruff fork (`ruff_text_size`, `ruff_source_file`, `ruff_python_trivia`, `ruff_python_ast`, `ruff_python_parser`) with `let` / `mut` soft keywords and `Mutability` field.
+- `clap`-based `tyc` shell.
+- `miette` + `thiserror` diagnostics.
+- `tyc fmt`, `tyc check`, `tyc init`.
+
+## Phase 1 — Core types ✅
+
+- Salsa DB with `preprocessed_text` / `module_decl_names` queries.
+- Name resolution + `let` / `mut` enforcement.
+- Nominal types: signatures, assignment compatibility, primitives, classes, generics containers.
+- Non-nullable by default with flow narrowing on `is None` / `is not None` / `isinstance`.
+- `T?` sugar.
+- `tyc check` emits "unknown name", "type mismatch", "nullable use" diagnostics.
+
+## Phase 2 — Class and value features ✅
+
+- `class` → `@dataclass(slots=True)`; `model` → Pydantic `BaseModel(extra="forbid")`.
+- Sealed unions + exhaustive `match`.
+- `Result[T, E]`, `?` operator, `with`-chains.
+- `comptime let` with `env()` lookup; required env vars declared in `[env]`.
+- `impl` blocks merged into class bodies.
+- `tower-lsp-server` backend: diagnostics + hover.
+
+## Phase 3 — Structural typing and advanced ✅
+
+- Generics syntax: PEP 695 brackets, bidirectional inference, conflict-widening, bounded type vars.
+- `interface` → `class Name(Protocol):` with structural conformance check.
+- `unsafe:` lexical region with `Unsafe[T]` boundary marker.
+- `@pure` / `@memo` / `@pure(memo=True)` with six-condition purity check.
+- `gather:` → `asyncio.TaskGroup` (or `asyncio.gather(return_exceptions=True)` for best-effort).
+- `go` → `typhon_runtime.tasks.spawn` (strong-ref registry).
+- `lazy import np = numpy` (proxy class); `lazy from … import …` rejected. `lazy let` (module + class-body forms).
+- Pipe operator (`|>`).
+- `extend ClassName:` and `extend BUILTIN:`.
+- `.dty` stub files → `.pyi` emission; `tyc check --stubs` AST diff.
+
+## Phase 4+ — Beyond v1 (in progress)
+
+Shipped:
+
+- ✅ Automatic `asyncio.gather` inference (`[strictness] auto-gather`).
+- ✅ Loop parallelisation for pure list comprehensions on free-threaded Python (`[strictness] auto-parallel`).
+- ✅ PGO via `tyc profile` (`[strictness] pgo-memoise`).
+- ✅ LSP completions and "Remove unused import" code action.
+- ✅ Cross-file go-to-definition across `.ty` / `.py`.
+- ✅ `tyc migrate` (typed `.py` → `.ty`).
+- ✅ `tyc repl`, `tyc debug`, `tyc run`.
+- ✅ `tyc add` / `remove` / `sync` over `uv`.
+
+Deferred:
+
+- ⏳ Richer comptime (container literals, string methods, loops in `comptime def`).
+- ⏳ Full structural subtyping with proper variance and bounded higher-kinded forms.
+- ⏳ `ty` integration as an embedded library (today: subprocess via `tyc ty`).
+- ⏳ Runtime `stubtest` introspection (today: shells out to `mypy.stubtest`).
+- ⏳ A Typhon-native source-mapping debugger (today: thin `pdb` launcher).
+- ⏳ Corpus round-trip sweep across third-party Python projects.
+- ⏳ `[emit] model-extra` knob to relax Pydantic `extra="forbid"`.
+- ⏳ Async public-API stability rules if async inference is ever added.
+
+## Scope-cutting rule
+
+The minimum-viable Typhon is **non-null types + sealed unions + `Result` + dataclass emit**. That is the floor. Everything else is layered on without changing the meaning of any program written against the minimum core.
+
+## Where next
+
+- [Risks](/Typhon/project/risks/) — known hazards and how we mitigate them.
+- [Status](/Typhon/introduction/status/) — quick summary.
+- [Performance Baseline](/Typhon/project/performance/) — measured numbers we will not regress.

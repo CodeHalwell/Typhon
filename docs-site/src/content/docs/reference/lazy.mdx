@@ -1,0 +1,162 @@
+---
+title: lazy
+description: Deferred imports, lazy bindings, and lazy return types.
+sidebar:
+  order: 13
+---
+
+`lazy` is Typhon's deferred-evaluation keyword. It comes in three forms: `lazy import`, `lazy let`, and `lazy[T]` return type.
+
+## `lazy import`
+
+Defer module loading until first attribute access:
+
+```python
+lazy import np = numpy
+
+def main() -> None:
+    if len(sys.argv) > 1:
+        let arr: np.ndarray = np.array([1, 2, 3])   # numpy loaded here
+```
+
+`np` is a proxy until first access. Subsequent accesses pass through to the loaded module.
+
+### Lowering
+
+The desugarer generates a per-module proxy class with double-checked locking:
+
+```python
+# Emitted (roughly)
+class __TyphonLazy_np_:
+    _module = None
+    _lock = threading.Lock()
+
+    @classmethod
+    def _load(cls):
+        if cls._module is None:
+            with cls._lock:
+                if cls._module is None:
+                    import numpy
+                    cls._module = numpy
+        return cls._module
+
+    def __getattr__(self, name):
+        return getattr(self._load(), name)
+
+np = __TyphonLazy_np_()
+```
+
+Thread-safe, one-shot. No runtime dependency required (the proxy class is inlined).
+
+### `lazy from` is rejected
+
+```python
+lazy from numpy import array    # ❌ parse error
+```
+
+```
+error[tyc::lazy_from_import]: `lazy from … import` is not allowed because it eagerly
+                              touches attributes on the source module — use
+                              `lazy import numpy` plus `numpy.array(...)`
+```
+
+PEP 690 explains why: `from`-imports eagerly resolve attributes, defeating deferral.
+
+## `lazy let` (module-level)
+
+```python
+lazy let CONFIG: Config = load_config_from_disk()
+```
+
+Defers the initialiser until first access. Lowers to a sentinel-cached `lazy_val(lambda: ...)` helper in `typhon_runtime`:
+
+```python
+# Emitted
+from typhon_runtime import lazy_val
+
+CONFIG = lazy_val(lambda: load_config_from_disk())
+```
+
+Unlike `functools.cached_property` (instance-scoped, race-prone, writable after first eval), `lazy_val` is thread-safe and one-shot.
+
+## `lazy let` (class-level)
+
+Inside a class body, `lazy let` lowers to `@cached_property`:
+
+```python
+class Server:
+    config_path: str
+
+impl Server:
+    lazy let parsed_config: Config:
+        return load_config(self.config_path)
+```
+
+Emits:
+
+```python
+@dataclass(slots=True)
+class Server:
+    config_path: str
+
+    @cached_property
+    def parsed_config(self) -> Config:
+        return load_config(self.config_path)
+```
+
+Per-instance caching is the intended semantics inside classes.
+
+## `lazy[T]` return type
+
+```python
+def primes_up_to(n: int) -> lazy[list[int]]:
+    let sieve: list[bool] = [True] * (n + 1)
+    # ... compute ...
+    return [i for i in range(2, n + 1) if sieve[i]]
+```
+
+Emits as a generator function — useful when the caller may only need a prefix:
+
+```python
+# Emitted (roughly)
+def primes_up_to(n: int) -> Iterator[int]:
+    sieve: list[bool] = [True] * (n + 1)
+    # ... compute ...
+    for i in range(2, n + 1):
+        if sieve[i]:
+            yield i
+```
+
+## When to use which
+
+| Form | Use |
+|------|-----|
+| `lazy import foo = bar` | Defer expensive module imports (numpy, pandas, torch) for CLIs / short-running scripts. |
+| `lazy let X = expr` (module-level) | Defer expensive module initialisation (config parsing, DB pool creation). |
+| `lazy let x = expr` (class-level) | Per-instance lazily-computed property. |
+| `def f() -> lazy[T]` | Caller may only need part of the result. |
+
+## Common mistakes
+
+### `lazy from` import
+
+```python
+lazy from numpy import array    # ❌
+```
+
+Use `lazy import np = numpy` plus `np.array(...)`.
+
+### Mutating a `lazy let`
+
+```python
+lazy let CONFIG: Config = load_config()
+CONFIG = Config(...)    # ❌ tyc::immutable_assign — lazy let is implicitly immutable
+```
+
+Use a `lazy_val` plus an explicit `mut` wrapper if you genuinely need re-evaluation.
+
+## Where next
+
+- [`lazy` → proxies (lowering)](/Typhon/lowering/lazy/) — implementation details.
+- [Advanced Features (tour)](/Typhon/tour/advanced/) — teaching page.
+- [The typhon_runtime module](/Typhon/lowering/runtime/) — `lazy_val` and friends.

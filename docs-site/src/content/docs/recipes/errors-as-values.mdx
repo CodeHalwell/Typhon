@@ -1,0 +1,150 @@
+---
+title: Errors as Values
+description: Designing your error types.
+sidebar:
+  order: 7
+---
+
+`Result[T, E]` puts errors in the type system. The remaining design question is: **what's `E`?** Four common shapes, with trade-offs.
+
+## 1. A string (good for prototypes)
+
+```python
+def parse_port(raw: str) -> Result[int, str]: ...
+```
+
+- ✅ Easy to read, easy to write.
+- ❌ Can't pattern-match on the *kind* of failure — only the text.
+- ❌ Localisation / i18n is harder later.
+
+Use for early development and one-off scripts.
+
+## 2. A sealed union (good for domain code)
+
+```python
+type ParseError = NotANumber | OutOfRange
+
+class NotANumber:
+    raw: str
+
+class OutOfRange:
+    value: int
+    min: int
+    max: int
+
+def parse_port(raw: str) -> Result[int, ParseError]: ...
+
+# At the call site:
+match parse_port(raw):
+    case Ok(p):
+        listen(p)
+    case Err(NotANumber(r)):
+        report(f"bad port number: {r}")
+    case Err(OutOfRange(v, min, max)):
+        report(f"port {v} not in [{min}, {max}]")
+```
+
+- ✅ Exhaustive match enforces handling every variant.
+- ✅ Carries structured data per variant.
+- ✅ Adding a variant lights up every match site (the seal-and-extend pattern).
+
+The recommended default for domain code.
+
+## 3. A class hierarchy (good for cross-cutting errors)
+
+```python
+class AppError:
+    message: str
+    correlation_id: str
+
+class DatabaseError(AppError):
+    query: str
+
+class HttpError(AppError):
+    status: int
+```
+
+- ✅ Uniform shape for logging / serialisation.
+- ✅ Subtype polymorphism — `Result[T, AppError]` accepts any subclass.
+- ❌ Sealed unions are stronger for exhaustiveness.
+
+Use when many call sites need the same error-shaped logging / metrics, regardless of the kind.
+
+## 4. A wrapped exception (boundary pattern)
+
+```python
+class ExternalFailure:
+    cause: Exception
+
+def call_external() -> Result[Response, ExternalFailure]:
+    try:
+        return Ok(http.get("..."))
+    except (requests.RequestException, TimeoutError) as e:
+        return Err(ExternalFailure(cause=e))
+```
+
+- ✅ Bridges the Python exception world cleanly.
+- ❌ The error type erases the kind of failure (you lose `match`-ability on `e`).
+
+Use at the boundary into untyped libraries; convert to a sealed union inside your domain.
+
+## Layering
+
+A common pattern: each layer defines its own sealed-union error type, and converts at the boundary.
+
+```python
+# storage/errors.ty
+type StorageError = NotFound | Conflict | Backend
+
+# auth/errors.ty
+type AuthError = StorageError | Forbidden | InvalidToken
+
+# api/errors.ty
+type ApiError = AuthError | ValidationError | RateLimited
+```
+
+The conversion happens at each layer boundary:
+
+```python
+def serve(token: str) -> Result[User, ApiError]:
+    match validate(token):
+        case Err(InvalidToken(reason)):
+            return Err(InvalidToken(reason=reason))      # bubble
+        case Err(e):
+            return Err(ValidationError(detail=str(e)))   # convert
+        case Ok(claims):
+            return resolve_user(claims)?
+```
+
+Use the `?` operator when error types match; `match` to convert when they don't.
+
+## Anti-patterns
+
+### Returning `Result[T, Exception]` everywhere
+
+```python
+def f() -> Result[T, Exception]: ...
+```
+
+Loses all the safety. `Exception` is too broad to pattern-match meaningfully. Convert to a sealed union at the boundary.
+
+### Mixing exception-raising and Result-returning in one function
+
+```python
+def f() -> Result[int, str]:
+    if cond:
+        raise ValueError("bad")    # ❌ caller has both to handle
+    return Ok(42)
+```
+
+Pick one — usually `Result`. The `raise` undermines the type signature.
+
+### Using `Result[T, str]` for production code
+
+The string-as-error pattern is fine for prototypes; it doesn't scale. Define a proper error type as soon as you have multiple call sites.
+
+## Where next
+
+- [Error Handling (tour)](/Typhon/tour/error-handling/) — teaching page.
+- [`Result, Ok, Err` reference](/Typhon/reference/result/) — the type.
+- [Sealed Unions](/Typhon/types/sealed-unions/) — the type for `E`.

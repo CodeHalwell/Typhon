@@ -1,0 +1,119 @@
+---
+title: Decorators
+description: Standard Python decorators plus Typhon-specific @pure, @memo, @gatherable.
+sidebar:
+  order: 18
+---
+
+Decorators work the same as in Python. Typhon adds a small set of build-time-only decorators.
+
+## Standard Python decorators
+
+```python
+import functools
+
+@functools.cache
+def f(n: int) -> int: ...
+
+@functools.wraps(f)
+def wrapper(...): ...
+
+@staticmethod
+def helper() -> int: ...
+
+@classmethod
+def from_dict(cls, data: dict) -> Self: ...
+
+@property
+def value(self) -> int: ...
+```
+
+All work as Python expects them to.
+
+## Typhon-specific decorators
+
+These are recognised by the analyser, used at build time, and either erased or transformed at emit.
+
+### `@pure`
+
+Asserts a function is pure per the [six conditions](/Typhon/reference/pure-memo/). Erased at emit.
+
+```python
+@pure
+def normalise(s: str) -> str:
+    return s.strip().lower()
+```
+
+### `@memo`
+
+Inserts `@functools.cache` (or `@functools.lru_cache(maxsize=N)` for `@memo(max=N)`). Function must qualify as pure.
+
+```python
+@memo
+def fib(n: int) -> int: ...
+```
+
+### `@pure(memo=True)`
+
+Combined form of `@pure` + `@memo`.
+
+```python
+@pure(memo=True)
+def hash_pw(salt: str, pw: str) -> str: ...
+```
+
+### `@gatherable`
+
+Opts a function into automatic-`gather` rewriting (only fires when `[strictness] auto-gather = true`):
+
+```python
+@gatherable
+async def fetch_user(uid: int) -> User: ...
+```
+
+Without the decorator, auto-gather skips this callee.
+
+## Decorator order
+
+For Python-standard decorators, order matters as it does in Python (innermost first). For Typhon-specific decorators, order doesn't matter — they are processed as a set at desugar time.
+
+```python
+@pure          # processed as a set with @memo
+@memo
+def f(...) -> ...: ...
+
+# equivalent to:
+@memo @pure def f(...) -> ...: ...
+# equivalent to:
+@pure(memo=True) def f(...) -> ...: ...
+```
+
+## Custom decorators
+
+Standard Python decorators work without ceremony:
+
+```python
+def timing(f):
+    import time, functools
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        t0 = time.time()
+        result = f(*args, **kwargs)
+        print(f"{f.__name__}: {time.time() - t0:.3f}s")
+        return result
+    return wrapper
+
+@timing
+def expensive(): ...
+```
+
+The decorator must be in scope at the decoration site, like in Python.
+
+## Type-checking decorators
+
+The checker preserves the wrapped function's signature when the decorator is a typed function (`Callable[[F], F]` for parameter-preserving decorators). For decorators that change signatures, it may lose precision — annotate the decorated function explicitly when this matters.
+
+## Where next
+
+- [`@pure` and `@memo`](/Typhon/reference/pure-memo/) — the purity decorators in depth.
+- [`async`, `await`, `gather`, `go`](/Typhon/reference/async/) — `@gatherable` for auto-gather.

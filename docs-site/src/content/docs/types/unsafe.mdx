@@ -1,0 +1,187 @@
+---
+title: The Unsafe Boundary
+description: "How unsafe: works under the hood — lexical regions, the Unsafe[T] marker, and the re-assertion rule."
+sidebar:
+  order: 9
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+`unsafe:` is Typhon's escape hatch for talking to code the type system can't reason about — typically untyped third-party libraries or genuinely dynamic Python. It is a **lexical region**, not a per-value cast, with a hidden marker that prevents `Any` from leaking into typed code.
+
+## The shape
+
+```python
+import some_untyped_lib
+
+def f() -> int:
+    unsafe:
+        let raw = some_untyped_lib.fetch()       # would be implicit_any outside
+        let first = raw[0]
+        let value = first.get("count")
+    # `value` carries an `Unsafe[T]` marker — must re-assert before crossing out
+
+    let count: int = int(value)                  # re-assertion
+    return count
+```
+
+What happens:
+
+1. **Inside `unsafe:`**, expressions that would normally infer `Any` bind freely. The checker suppresses `tyc::implicit_any`, `tyc::type_mismatch`, `tyc::nullable_use`, `tyc::interface_isinstance`, `tyc::wrong_arg_count`, `tyc::not_callable`, and `tyc::non_exhaustive_match` inside the block depth.
+2. **Values acquire a hidden `Unsafe[T]` marker.** Visible in diagnostics, not in source.
+3. **Crossing out of the block** into a non-`unsafe` context requires re-assertion: an annotation, a narrowing check, or an explicit cast.
+
+The block lowers to `if True:` so scope rules are preserved:
+
+```python
+# Emitted Python
+if True:
+    raw = some_untyped_lib.fetch()
+    first = raw[0]
+    value = first.get("count")
+count: int = int(value)
+return count
+```
+
+## Why a lexical region, not a per-value cast?
+
+A per-expression `unsafe expr` form (TypeScript's `as Any`) would let users sprinkle dynamism everywhere. A lexical region forces it into one visible scope where readers can spot it and reviewers can interrogate it. The `Unsafe[T]` marker means the boundary is enforced even when the region tolerates dynamism internally.
+
+If real codebases show a pattern of `unsafe { single_call() }`, we may revisit. For v1, blocks have been good enough.
+
+## What is suppressed
+
+Inside `unsafe:`, the checker tracks an `unsafe_depth` counter. While the counter is non-zero, these diagnostics are silenced:
+
+- `tyc::implicit_any` — values that would otherwise infer `Any` bind freely.
+- `tyc::type_mismatch` — assignments / calls with incompatible types are allowed.
+- `tyc::nullable_use` — `T?` values can be used as if `T`.
+- `tyc::interface_isinstance` — runtime `isinstance` against an interface is permitted (caveat: still PEP 544 semantics — attribute-presence only).
+- `tyc::wrong_arg_count` — call-site arity mismatches are tolerated.
+- `tyc::not_callable` — invoking a non-callable is tolerated.
+- `tyc::non_exhaustive_match` — `match` on a sealed union without all variants is allowed.
+
+Diagnostics on lines **outside** the block are unaffected. The boundary is enforced at the block exit.
+
+## What is *not* suppressed
+
+`unsafe:` doesn't disable parse errors, name-resolution errors, syntax checks, formatting rules, the `?` operator's enclosing-function check, or any structural rule that doesn't depend on inferred types.
+
+```python
+unsafe:
+    let x = 1
+    let x: int = 2     # ❌ shadowing — still a resolver error
+```
+
+```python
+unsafe:
+    let y: int = bad?  # ❌ ? outside a Result-returning function — still an error
+```
+
+## Re-assertion forms
+
+To use an `Unsafe[T]` value outside the block, re-assert the type with one of:
+
+### Annotated `let` / `mut`
+
+```python
+unsafe:
+    let raw = some_lib.fetch()
+let parsed: dict[str, int] = raw      # ✅ annotation makes the type concrete
+```
+
+### Narrowing
+
+```python
+unsafe:
+    let raw = some_lib.fetch()
+if isinstance(raw, dict):
+    use_dict(raw)                     # ✅ narrowed
+```
+
+### Explicit cast
+
+```python
+unsafe:
+    let raw = some_lib.fetch()
+let s: str = str(raw)                 # ✅ str() is the cast
+```
+
+## When to use `unsafe:`
+
+- **Exploring a new dependency.** First day with a third-party library — wrap in `unsafe:` while you figure out the API.
+- **Genuinely dynamic code.** `eval`, RPC stubs, `getattr` chains, dynamic class construction.
+- **Quick scripts.** One-off CLI glue where writing stubs isn't worth it.
+
+For anything long-lived, write a `.dty` stub. The block stops being a code smell when the surface area is genuinely untypeable.
+
+## When *not* to use `unsafe:`
+
+- **To silence a checker error you disagree with.** Read the diagnostic first; it's almost always pointing at a real bug.
+- **As a per-call cast.** The block scope is the unit; don't wrap a single line just to short-circuit a diagnostic.
+- **Long-term production code.** If you find yourself with `unsafe:` blocks scattered through `src/`, the libraries deserve stubs. Run `tyc check --stubs` after writing them.
+
+## `unsafe:` inside `async def`
+
+Works as expected. The block doesn't make the function async or sync; it just opens the dynamism gate.
+
+```python
+async def fetch() -> dict[str, int]:
+    unsafe:
+        let raw = await some_lib.fetch_async()
+        let data = raw["payload"]
+    let parsed: dict[str, int] = data
+    return parsed
+```
+
+## Common mistakes
+
+### Smuggling `Unsafe[T]` out
+
+```python
+def parse() -> int:
+    unsafe:
+        let v = messy_lib.get_int()
+    return v       # ❌ Unsafe[Any] cannot flow into a concrete `int` context
+```
+
+Fix: re-assert inside or at the boundary:
+
+```python
+def parse() -> int:
+    unsafe:
+        let v = messy_lib.get_int()
+        let checked: int = int(v)
+    return checked
+```
+
+### Wrapping too much
+
+```python
+unsafe:
+    let raw = some_lib.fetch()
+    process_safely(raw)            # ⚠️ also runs inside unsafe — diagnostics suppressed
+```
+
+Keep `unsafe:` blocks small. If `process_safely` is part of your typed code, lift it out:
+
+```python
+unsafe:
+    let raw = some_lib.fetch()
+let payload: dict[str, int] = raw
+process_safely(payload)
+```
+
+## Implementation note
+
+`unsafe:` is implemented in two parts:
+
+- **The parser** treats `unsafe:` as a soft keyword with a colon-introduced suite (same shape as `if`).
+- **The checker** wraps the suite in a depth-tracked `enter_unsafe()` / `exit_unsafe()` pair. Values originating inside the block carry an `Unsafe<T>` wrapper in the type lattice; assignments at the boundary require coercion to the concrete `T`.
+- **The desugarer** rewrites the block as `if True:` so the scope rules apply unchanged in the emitted Python.
+
+## Where next
+
+- [`unsafe`](/Typhon/reference/unsafe/) — the reference page.
+- [Wrapping an Untyped Library](/Typhon/recipes/wrapping-library/) — patterns for taming dependency surface area.
+- [Writing .dty Stubs](/Typhon/interop/dty-stubs/) — the long-term alternative to `unsafe:`.

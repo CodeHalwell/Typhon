@@ -1,0 +1,266 @@
+---
+title: Your First Real Program
+description: A small but realistic Typhon program — a CLI tool that touches half the language's headline features.
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem, Aside } from '@astrojs/starlight/components';
+
+`Hello, world` is the smallest possible program. This page walks through a small but realistic one — a CLI that loads config at build time, parses arguments with typed errors, fetches data concurrently, and reports failures distinctly per variant. We touch maybe half the language's headline features in under 80 lines.
+
+## The program
+
+Imagine a CLI that takes a user ID, fetches their profile from three independent endpoints in parallel, and prints a one-line summary. If any fetch fails, the program prints a typed error and exits non-zero. The port and the database URL come from the environment at build time.
+
+```python
+# src/main.ty
+import asyncio
+import sys
+
+# 1. Build-time config — fails the build if DATABASE_URL is unset.
+comptime let DB_URL:   str = env("DATABASE_URL")
+comptime let API_PORT: int = int(env("API_PORT", "8080"))
+
+# 2. Domain types — plain dataclasses, internal to the app.
+class User:
+    id: int
+    name: str
+    email: str?
+
+class Post:
+    id: int
+    title: str
+
+class Notif:
+    id: int
+    text: str
+
+# 3. Errors as a sealed union — match must cover every variant.
+type LoadError = NotFound | Timeout | Backend
+
+class NotFound:
+    what: str
+class Timeout:
+    after_ms: int
+class Backend:
+    detail: str
+
+# 4. Stubbed async fetches — in a real app these'd hit a database / HTTP API.
+async def fetch_user(id: int) -> Result[User, LoadError]:
+    await asyncio.sleep(0.05)
+    if id == 0:
+        return Err(NotFound(what=f"user {id}"))
+    return Ok(User(id=id, name=f"user-{id}", email=f"u{id}@example.com"))
+
+async def fetch_posts(id: int) -> Result[list[Post], LoadError]:
+    await asyncio.sleep(0.05)
+    return Ok([Post(id=1, title="hello"), Post(id=2, title="world")])
+
+async def fetch_notifs(id: int) -> Result[list[Notif], LoadError]:
+    await asyncio.sleep(0.05)
+    return Ok([Notif(id=1, text="welcome")])
+
+# 5. Domain logic — parallel fetch, typed propagation, no try/except.
+async def load_summary(user_id: int) -> Result[str, LoadError]:
+    gather:
+        user_r   = fetch_user(user_id)
+        posts_r  = fetch_posts(user_id)
+        notifs_r = fetch_notifs(user_id)
+
+    let user: User       = user_r?
+    let posts: list[Post] = posts_r?
+    let notifs: list[Notif] = notifs_r?
+
+    let email: str = user.email if user.email is not None else "(no email)"
+    return Ok(f"{user.name} <{email}> — {len(posts)} posts, {len(notifs)} notifs")
+
+# 6. Entry point — argument parsing, error reporting, exit codes.
+def parse_user_id(argv: list[str]) -> Result[int, str]:
+    if len(argv) < 2:
+        return Err("usage: main <user_id>")
+    let raw: str = argv[1]
+    if not raw.isdigit():
+        return Err(f"not a number: {raw}")
+    return Ok(int(raw))
+
+async def main_async(argv: list[str]) -> int:
+    match parse_user_id(argv):
+        case Err(msg):
+            print(f"error: {msg}", file=sys.stderr)
+            return 2
+        case Ok(uid):
+            match await load_summary(uid):
+                case Ok(summary):
+                    print(summary)
+                    return 0
+                case Err(NotFound(what)):
+                    print(f"missing: {what}", file=sys.stderr); return 4
+                case Err(Timeout(after_ms)):
+                    print(f"timed out after {after_ms}ms", file=sys.stderr); return 5
+                case Err(Backend(detail)):
+                    print(f"backend error: {detail}", file=sys.stderr); return 6
+
+def main() -> None:
+    sys.exit(asyncio.run(main_async(sys.argv)))
+
+if __name__ == "__main__":
+    main()
+```
+
+## Walking the program
+
+### 1. Build-time config
+
+`comptime let` runs the compiler's sandboxed interpreter at build time and inlines the result as a literal:
+
+```python
+comptime let DB_URL: str = env("DATABASE_URL")
+```
+
+If `DATABASE_URL` is not set in the build environment, the build **fails** — not the first request in production. Declare required env vars in `typhon.toml` to make the contract explicit:
+
+```toml
+[env]
+required = ["DATABASE_URL"]
+```
+
+In the emitted Python, `DB_URL` is a string literal. There is no runtime call to `env()`.
+
+### 2. Domain types
+
+```python
+class User:
+    id: int
+    name: str
+    email: str?
+```
+
+Three fields. The `?` on `email` says "this is `str | None`". The constructor is generated; `User(id=1, name="alice")` works (email defaults to `None`). Behind the scenes:
+
+```python
+# Emitted
+@dataclass(slots=True)
+class User:
+    id: int
+    name: str
+    email: str | None = None
+```
+
+### 3. Errors as a sealed union
+
+```python
+type LoadError = NotFound | Timeout | Backend
+```
+
+This declares a *sealed* union — nothing outside this file can extend `LoadError`. A `match` on it must cover every variant; add a fourth and every match site goes red until you update it. That is the largest single static-safety win Typhon offers over typed Python.
+
+### 4. Stubbed async fetches
+
+Three `async def` functions, each returning `Result[T, LoadError]`. The return shape carries the error in the type system. Callers can't ignore the failure case because the checker enforces handling.
+
+### 5. Parallel fetch with `gather:`
+
+```python
+gather:
+    user_r   = fetch_user(user_id)
+    posts_r  = fetch_posts(user_id)
+    notifs_r = fetch_notifs(user_id)
+```
+
+The three calls run **in parallel**. Total latency is roughly the slowest one, not the sum. `gather:` lowers to `asyncio.TaskGroup` (cancel-on-failure):
+
+```python
+# Emitted
+async with asyncio.TaskGroup() as _tg:
+    _t_user_r   = _tg.create_task(fetch_user(user_id))
+    _t_posts_r  = _tg.create_task(fetch_posts(user_id))
+    _t_notifs_r = _tg.create_task(fetch_notifs(user_id))
+user_r   = _t_user_r.result()
+posts_r  = _t_posts_r.result()
+notifs_r = _t_notifs_r.result()
+```
+
+If any task raises, the siblings are cancelled — exactly what you want when the fetches have side effects.
+
+After the block, `?` unwraps each `Result`:
+
+```python
+let user: User       = user_r?
+let posts: list[Post] = posts_r?
+let notifs: list[Notif] = notifs_r?
+```
+
+If `user_r` is an `Err(...)`, the function returns it immediately — no `try`, no `if isinstance`, no hidden control flow. The lowering is plain:
+
+```python
+# Emitted (for the first line)
+_tmp_0 = user_r
+if isinstance(_tmp_0, Err):
+    return _tmp_0
+user: User = _tmp_0.value
+```
+
+### 6. Entry point
+
+`parse_user_id` returns `Result[int, str]` — a typed "either I parsed the int, or here's the message to show". The outer `match` handles both cases and sets the exit code.
+
+The inner `match` on `LoadError` is **exhaustive** — every variant of the sealed union is handled. Add `Backend(detail)` first, then later add a `RateLimited(retry_after_ms)` variant to the union, and the compiler will tell you exactly where the new case needs handling.
+
+`sys.exit(asyncio.run(...))` is the standard async-CLI shape; no Typhon-specific scaffolding.
+
+## Run it
+
+```bash
+DATABASE_URL=postgres://localhost/myapp tyc build
+python build/main.py 42
+# user-42 <u42@example.com> — 2 posts, 1 notifs
+
+python build/main.py 0
+# missing: user 0
+
+python build/main.py
+# error: usage: main <user_id>
+```
+
+If you forget to set `DATABASE_URL` at build time:
+
+```bash
+tyc build
+# error[tyc::comptime_env_missing]: required environment variable `DATABASE_URL` is not set
+```
+
+The build fails. Production never sees `KeyError: 'DATABASE_URL'`.
+
+## What this demonstrates
+
+- **`comptime let`** for build-time config. Missing required env vars fail the build.
+- **`class`** for internal value types (`@dataclass(slots=True)` under the hood).
+- **`type X = A | B | C`** for sealed unions, with `match` exhaustiveness enforced.
+- **`Result[T, E]`** for typed errors, propagated with `?`.
+- **`gather:`** for parallel awaits, lowered to `asyncio.TaskGroup`.
+- **`let` / `mut`** for binding immutability.
+- **`T?`** for nullable values, with flow narrowing on `is not None`.
+
+All of this fits in 80 lines. None of it requires installing anything Typhon-specific to run — `python build/main.py` is enough.
+
+## What we didn't use
+
+This program deliberately skips:
+
+- **Pydantic `model`** — useful at HTTP boundaries; see [Pydantic Boundary Models](/Typhon/interop/pydantic/).
+- **Interfaces** — useful for structural contracts; see [Interfaces](/Typhon/types/interfaces/).
+- **`go`** — fire-and-forget tasks; see [`go`](/Typhon/reference/async/#go).
+- **`lazy import`** — deferred module loading; see [`lazy`](/Typhon/reference/lazy/).
+- **`@pure` / `@memo`** — purity verification and caching; see [`@pure` and `@memo`](/Typhon/reference/pure-memo/).
+- **Pipes (`|>`)** — left-to-right composition; see [Pipes](/Typhon/reference/pipes/).
+- **`unsafe:`** — escape hatch for untyped Python; see [`unsafe`](/Typhon/reference/unsafe/).
+
+Each is covered in its own page; you don't need them all to ship.
+
+## Where next
+
+- [The Five Rules](/Typhon/tour/five-rules/) — internalise these before writing more code.
+- [Editor Setup](/Typhon/getting-started/editor-setup/) — get diagnostics in your editor.
+- [Language Tour](/Typhon/tour/values-bindings/) — walk every feature in order.
+- [Recipes](/Typhon/recipes/patterns/) — worked examples for common real-world tasks.

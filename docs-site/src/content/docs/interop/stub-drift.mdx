@@ -1,0 +1,100 @@
+---
+title: Stub Drift
+description: Keeping .dty stubs in sync with the runtime modules they describe.
+sidebar:
+  order: 5
+---
+
+When the library updates, your stub can fall behind. Typhon catches drift via two tools:
+
+- **`tyc check --stubs`** — AST-level diff between the `.dty` and the sibling `.ty` / `.py`.
+- **`tyc stubtest`** — runtime introspection via `python -m mypy.stubtest`.
+
+Both are useful; neither subsumes the other.
+
+## `tyc check --stubs` (AST diff)
+
+Compares every `.dty` against the runtime symbols of the implementation module:
+
+```bash
+tyc check --stubs
+```
+
+Surfaces:
+
+- Names declared in the stub but missing at runtime.
+- Names present at runtime but missing in the stub.
+- Signature drift (parameter shapes, return types).
+
+Reported as `tyc::stub_mismatch` diagnostics.
+
+### What it sees
+
+The AST diff sees what the parser sees:
+
+- Top-level functions and classes.
+- Class methods and fields.
+- Parameter shapes (name, type, default-present-or-not).
+
+### What it doesn't see
+
+- Dynamically-injected attributes (`__init_subclass__`, metaclass tricks).
+- Pydantic auto-generated fields.
+- Attributes set by `__init__` rather than declared.
+
+For those, use `tyc stubtest`.
+
+## `tyc stubtest` (runtime introspection)
+
+Runs `python -m mypy.stubtest` on every emitted `.pyi`:
+
+```bash
+tyc stubtest
+```
+
+Imports the module at build time and introspects the actual runtime symbols — catches dynamic surface the AST can't see. Requires `mypy` installed in the chosen interpreter.
+
+### Combine both
+
+For thorough CI:
+
+```yaml
+- name: Stub drift (AST)
+  run: tyc check --stubs
+
+- name: Stub drift (runtime)
+  run: tyc stubtest -- --allowlist stubtest-allow.txt
+```
+
+The runtime probe is slower (it imports the module), so consider nightly rather than per-PR if compile-time matters.
+
+## Recommended workflow
+
+1. **Write the stub.** `stubs/<library>.dty`.
+2. **Run `tyc check --stubs`** to verify the AST surface matches.
+3. **Run `tyc stubtest`** to catch dynamic mismatches.
+4. **Add both to CI** so library upgrades surface drift immediately.
+
+When the library upgrades:
+
+1. CI catches the drift.
+2. Update the stub (or pin the library version until you do).
+3. Re-run.
+
+## Allowlists for unavoidable drift
+
+`mypy.stubtest` supports `--allowlist FILE` for entries you want to ignore:
+
+```
+# stubtest-allow.txt
+some_module._internal_helper
+some_module.OldDeprecatedClass
+```
+
+Use sparingly — every allowlisted entry is one the checker won't catch in future.
+
+## Where next
+
+- [Writing .dty Stubs](/Typhon/interop/dty-stubs/) — stub authoring.
+- [`tyc check --stubs`](/Typhon/cli/check/) — the AST-diff command.
+- [`tyc stubtest`](/Typhon/cli/stubtest/) — the runtime-probe command.

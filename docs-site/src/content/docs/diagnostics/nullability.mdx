@@ -1,0 +1,58 @@
+---
+title: Nullability Errors
+description: Diagnostics around T? and the nullability rules.
+sidebar:
+  order: 4
+---
+
+## `tyc::nullable_use`
+
+Passing or using a `T?` value where a `T` is required, without narrowing first:
+
+```python
+def greet(name: str) -> None: ...
+def find_user(id: int) -> str?: ...
+
+let found: str? = find_user(1)
+greet(found)    # ❌
+```
+
+**Fix:** narrow before use. Five forms:
+
+```python
+# 1. is None / is not None
+if found is not None:
+    greet(found)
+
+# 2. Early return
+if found is None:
+    return
+greet(found)
+
+# 3. isinstance
+if isinstance(found, str):
+    greet(found)
+
+# 4. guard
+guard f = found else: return
+greet(f)
+
+# 5. or-fallback
+greet(found or "anonymous")
+```
+
+See [Flow Narrowing](/Typhon/types/narrowing/) for every form the checker recognises.
+
+## What does *not* narrow
+
+- **Fields and attribute paths** — `if u.email is not None: u.email.upper()` does not narrow `u.email`. Copy to a local first.
+- **Indexed access** — `if xs[0] is not None:` does not narrow `xs[0]`.
+- **Cross-mutation** — explicit `u.refresh()` in between invalidates the narrowing on `u`'s fields.
+
+See [Flow Narrowing](/Typhon/types/narrowing/) for the rules and limits.
+
+## Where next
+
+- [Nullable Types](/Typhon/types/nullable/) — `T?` reference.
+- [Flow Narrowing](/Typhon/types/narrowing/) — narrowing forms.
+- [`guard`](/Typhon/reference/guard/) — the sugar form.

@@ -1,0 +1,114 @@
+---
+title: Operators and Precedence
+description: Every operator Typhon understands, in precedence order.
+sidebar:
+  order: 20
+---
+
+Typhon's operators are Python's, plus two:
+
+- `|>` — pipe, for left-to-right composition.
+- `?` — nullable type suffix, *and* Result-propagation expression suffix (context-dependent).
+
+## Precedence table
+
+From tightest to loosest binding. Within a row, operators are left-associative unless noted otherwise.
+
+| Precedence | Operators | Type | Notes |
+|------------|-----------|------|-------|
+| 1 (tightest) | `f(...)`, `x[...]`, `x.attr` | call, subscript, attribute | |
+| 2 | `**` | exponent | right-associative |
+| 3 | `+x`, `-x`, `~x` | unary | |
+| 4 | `*`, `@`, `/`, `//`, `%` | multiplicative | |
+| 5 | `+`, `-` | additive | |
+| 6 | `<<`, `>>` | bitwise shift | |
+| 7 | `&` | bitwise AND | |
+| 8 | `^` | bitwise XOR | |
+| 9 | `\|` | bitwise OR | |
+| 10 | `\|>` | **pipe** (Typhon-specific) | |
+| 11 | `in`, `not in`, `is`, `is not`, `<`, `<=`, `>`, `>=`, `!=`, `==` | comparison | chainable: `0 < x < 10` |
+| 12 | `not x` | boolean NOT | |
+| 13 | `and` | boolean AND | short-circuit |
+| 14 | `or` | boolean OR | short-circuit |
+| 15 | `a if c else b` | conditional | |
+| 16 | `lambda` | anonymous fn | |
+| 17 | `:=` | walrus | |
+| 18 (loosest) | assignment, `yield`, `return` | statements | |
+
+The `?` suffix on a `Result`-typed expression binds at the same precedence as `f(...)` (call) — it's part of the postfix chain.
+
+## Pipe precedence in detail
+
+`a |> f()` binds tighter than comparisons and boolean ops, looser than arithmetic:
+
+```python
+x + 1 |> f()        # parses as (x + 1) |> f() == f(x + 1)
+x |> f() == 0       # parses as (x |> f()) == 0
+x |> f() and g(x)   # parses as (x |> f()) and g(x)
+```
+
+When in doubt, parenthesise.
+
+## Augmented assignments
+
+```python
+x += 1
+x -= 1
+x *= 2
+x /= 2.0
+x //= 2
+x %= 2
+x **= 2
+x <<= 1
+x >>= 1
+x &= 0xFF
+x |= 0x01
+x ^= 0xAA
+```
+
+All require the target to be `mut`. The checker enforces.
+
+## Type-only operators
+
+- `T?` — nullable suffix on a type expression (only in annotation position).
+- `T | U` — union (annotation position); `T or U` is *not* valid in annotations.
+
+## Walrus (`:=`)
+
+Standard Python:
+
+```python
+if (n := len(xs)) > 10:
+    print(f"{n} is too many")
+```
+
+The walrus binds — and the binding is implicitly `let` (no `mut` form supported).
+
+## Common gotchas
+
+### `is` vs `==`
+
+Same as Python: `is` is identity, `==` is equality. Use `is None` / `is not None` for nullability checks (the checker only narrows on `is`).
+
+### `or` for nullable defaults
+
+```python
+let name: str = maybe_name or "anonymous"
+```
+
+`or` collapses falsy values (including `None`) to the right side. Common idiom for narrowing `T?` to `T` when "empty" is treated like "missing".
+
+### Pipe and method calls
+
+```python
+"hello" |> str.upper()    # str.upper("hello") → "HELLO"
+"hello".upper()           # also "HELLO"
+```
+
+Both work. Use whichever reads more naturally.
+
+## Where next
+
+- [Pipes (`|>`)](/Typhon/reference/pipes/) — the dedicated reference.
+- [Nullable Types](/Typhon/types/nullable/) — `T?` reference.
+- [The ? Operator](/Typhon/reference/question-operator/) — Result propagation.

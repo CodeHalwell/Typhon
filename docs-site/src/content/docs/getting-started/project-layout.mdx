@@ -1,0 +1,208 @@
+---
+title: Project Layout
+description: What `tyc init` produces and what each file does.
+sidebar:
+  order: 3
+---
+
+import { FileTree, Aside } from '@astrojs/starlight/components';
+
+`tyc init NAME` scaffolds a fresh Typhon project. This page describes the resulting layout, what each file is for, and the conventions you should follow as the project grows.
+
+## What `tyc init` produces
+
+<FileTree>
+
+- hello/
+  - typhon.toml      Project configuration
+  - src/             Source directory (`.ty` files)
+    - main.ty        Entry point
+  - tests/           Test directory (Python or `.ty` tests)
+  - .gitignore       Excludes `build/` and `target/` by default
+
+</FileTree>
+
+The shape is intentionally close to a small Python project so it's familiar.
+
+## `typhon.toml`
+
+The single configuration file every `tyc` subcommand reads. Default contents:
+
+```toml
+[project]
+name = "hello"
+version = "0.1.0"
+src = "src"
+out = "build"
+
+[python]
+target = "3.13"
+
+[emit]
+class-default = "dataclass"
+format = true
+
+[strictness]
+no-implicit-any = true
+unused-import = "error"
+exhaustive-match = "error"
+```
+
+Full reference: [Configuration](/Typhon/configuration/overview/).
+
+### Common edits
+
+- **Add dependencies** with [`tyc add`](/Typhon/cli/packages/) — writes `[dependencies]` and `[dev-dependencies]` sections.
+- **Pin a Python target.** `target = "3.14"` to opt into newer syntax; `free-threaded = true` to opt into the threading parallelism emit paths (requires the `t` build).
+- **Tune strictness.** Lower `unused-import` to `"warn"` during refactors; raise `auto-memoise` to `true` if you want pure-function caching project-wide.
+
+## `src/`
+
+The source directory. Every `.ty` file here is compiled into a matching `.py` in `build/` when you run `tyc build`. Module structure mirrors the directory layout — `src/foo/bar.ty` becomes `build/foo/bar.py` and is importable as `foo.bar`.
+
+### What goes here
+
+- `.ty` source files.
+- `.dty` stubs for third-party libraries (see [Writing .dty stubs](/Typhon/interop/dty-stubs/)).
+- Plain `.py` files when you can't or don't want to rewrite them — they pass through untouched.
+
+### What doesn't go here
+
+- Build artefacts (`build/`).
+- Editor files (`.vscode/`, `.idea/`).
+- Generated `typhon_runtime/` — that lands in `build/`, not in `src/`.
+
+## `tests/`
+
+Test files. Typhon has no opinion on which test framework you use; pytest works perfectly against the emitted Python.
+
+A common layout:
+
+<FileTree>
+
+- tests/
+  - conftest.py      pytest fixtures (plain Python)
+  - test_users.py    Tests against build/users.py
+  - test_users.ty    Or write tests in Typhon
+
+</FileTree>
+
+When you write tests in `.ty`, they compile to `.py` like any other source file. You can run pytest against the emitted Python:
+
+```bash
+tyc build
+pytest build/tests/
+```
+
+Or use [`tyc run`](/Typhon/cli/run/) with an entry point that hosts your test runner.
+
+## `build/`
+
+The output directory (configurable via `[project] out`). Created by `tyc build`; safe to delete at any time. Contains:
+
+<FileTree>
+
+- build/
+  - main.py                     Emitted from src/main.ty
+  - main.py.map                 Source map: out_line → ty_line
+  - typhon_runtime/             Generated runtime helpers (only if used)
+    - __init__.py
+    - tasks.py                  Strong-ref task registry for `go`
+    - result.py                 Ok / Err / Result classes
+    - lazy.py                   `lazy_val` helper
+
+</FileTree>
+
+### `typhon_runtime/`
+
+A small, generated Python module with the helpers Typhon programs need: the `Result` ADT (`Ok` / `Err`), the `lazy_val` thread-safe one-shot helper, the `tasks.spawn` strong-ref registry. **It is not on PyPI** — it is generated source the build owns. If you don't use `Result`, `lazy let`, or `go`, the module isn't emitted at all.
+
+This is by design: production servers run the emitted Python plus this small helper. There is no Typhon package to install anywhere.
+
+### `.py.map` files
+
+Source maps (v2 format), per-statement `(out_line → ty_line)` tables. Used by:
+
+- [`tyc trace`](/Typhon/cli/trace/) to map a Python traceback back to `.ty` source.
+- The LSP for cross-file go-to-definition across the `.ty` / `.py` boundary.
+
+Safe to delete; they regenerate.
+
+## Conventions as projects grow
+
+### Module organisation
+
+The same conventions as a Python package: small, focused modules; one class per file (or a few related ones); domain logic in `src/<package>/<module>.ty`. Use `__init__.ty` for package roots — `tyc` treats it like Python's `__init__.py`.
+
+### Stubs go beside the project, not inside `src/`
+
+A common pattern:
+
+<FileTree>
+
+- myproj/
+  - typhon.toml
+  - src/                       Application source (compiled to `build/`)
+  - stubs/                     `.dty` stubs for untyped third-party libraries
+    - redis.dty
+    - kafka.dty
+
+</FileTree>
+
+`tyc check --stubs` finds `.dty` files anywhere in the project tree.
+
+### Multiple entry points
+
+Place each entry point as its own `.ty` file at the root of `src/`:
+
+<FileTree>
+
+- src/
+  - api.ty       Web server entry
+  - cli.ty       CLI tool entry
+  - worker.ty    Background worker entry
+  - lib/         Shared modules
+    - users.ty
+    - db.ty
+
+</FileTree>
+
+Run a specific one with `tyc run --entry api.py`. Or wire each in your packaging tool (`pyproject.toml` `[project.scripts]`, a Dockerfile, etc.).
+
+### Mixed `.ty` and `.py`
+
+Plain `.py` files in `src/` are copied to `build/` unchanged. They can import from emitted modules, and vice versa. Useful for:
+
+- Files you haven't migrated yet.
+- Generated code (e.g. protobuf bindings).
+- Things that genuinely can't be expressed in Typhon (or aren't worth the rewrite).
+
+The checker treats imports from a plain `.py` as if they crossed an `unsafe:` boundary unless an authored `.dty` overrides them.
+
+## What's in version control
+
+```gitignore
+# .gitignore (created by `tyc init`)
+build/
+target/
+*.py.map
+__pycache__/
+.pytest_cache/
+```
+
+- **Yes commit:** `typhon.toml`, `src/`, `tests/`, `stubs/`, `editors/` configs.
+- **No commit:** `build/` (deterministic from `src/`), `target/` (Rust artefacts if you're building `tyc` here too), `*.py.map`.
+
+`typhon-profile.json` (the PGO profile) is a judgement call. Commit it if you want CI to use it; gitignore it if it's developer-local.
+
+## Multi-project monorepos
+
+For monorepos with multiple Typhon projects, each project gets its own `typhon.toml`. `tyc` looks for the nearest `typhon.toml` up the directory tree, so subcommands "just work" from inside any project's `src/`.
+
+The compiler does not yet have a workspace concept (cross-project shared dependencies, common config inheritance). For now, duplicate `typhon.toml` across projects and use a top-level `Makefile` / `justfile` to drive builds.
+
+## Where next
+
+- [Your First Real Program](/Typhon/getting-started/first-program/) — moving past `Hello, world`.
+- [Editor Setup](/Typhon/getting-started/editor-setup/) — VS Code, Neovim, Helix.
+- [`typhon.toml` Overview](/Typhon/configuration/overview/) — every key, every default.

@@ -1,0 +1,198 @@
+---
+title: Flow Narrowing
+description: Every form the checker recognises for narrowing a value's type within a scope.
+sidebar:
+  order: 5
+---
+
+Flow narrowing is what makes non-nullable-by-default usable. The checker tracks the type of every binding through branches, guards, and early returns — once you've eliminated a case, the narrowed type sticks.
+
+## What gets narrowed
+
+Narrowing applies to:
+
+- **Nullable types** — `T?` narrows to `T` after a check.
+- **Union types** — `A | B` narrows to one side after an `isinstance` test.
+- **Sealed unions** — `type Shape = Circle | Rectangle` narrows inside a `match` arm.
+
+It does *not* apply to fields:
+
+```python
+def f(u: User?) -> str:
+    if u is None: return ""
+    return u.name           # ✅ u narrowed to User
+
+def g(u: User) -> str:
+    if u.email is None: return ""
+    return u.email.upper()  # ⚠️ u.email NOT narrowed (it's a field, may be re-read)
+```
+
+Narrowing only tracks **local bindings**, not fields, indexed access (`xs[0]`), or attribute paths. For those, copy into a local first:
+
+```python
+def g(u: User) -> str:
+    let e: str? = u.email
+    if e is None: return ""
+    return e.upper()        # ✅ e narrowed
+```
+
+## Narrowing forms
+
+### `is None` / `is not None`
+
+```python
+def f(x: int?) -> int:
+    if x is None:
+        return 0
+    return x        # narrowed to int
+```
+
+### Early-return
+
+If the failure case exits the scope (return, raise, continue, break), the success case is narrowed for the rest of the function:
+
+```python
+def f(x: int?) -> int:
+    if x is None:
+        return 0
+    # `x` is `int` here onwards
+    return x + 1
+```
+
+### `isinstance(x, T)`
+
+Single-type and tuple-of-types forms both work:
+
+```python
+def f(x: int | str | None) -> str:
+    if isinstance(x, str):
+        return x          # narrowed to str
+    if isinstance(x, (int, type(None))):
+        return str(x)     # narrowed to int | None
+    return ""
+```
+
+<aside>
+  Tuple-of-types narrows to the union of the named types, not to a single specific one.
+</aside>
+
+### `guard` early-return
+
+```python
+def f(maybe: int?) -> int:
+    guard x = maybe else:
+        return 0
+    return x      # narrowed to int
+```
+
+### Truthiness
+
+```python
+def f(x: str?) -> int:
+    if x:           # narrows to non-empty str (so non-None)
+        return len(x)
+    return 0
+```
+
+### Equality with literals
+
+```python
+def f(t: Literal["a", "b", "c"]) -> int:
+    if t == "a":
+        return 1     # narrowed to Literal["a"]
+    if t == "b":
+        return 2
+    return 3
+```
+
+### `match` patterns
+
+Each `case` narrows the scrutinee to the matched variant:
+
+```python
+def area(s: Shape) -> float:
+    match s:
+        case Circle(r):
+            return 3.14 * r * r   # s narrowed to Circle; r: float
+        case Rectangle(w, h):
+            return w * h          # s narrowed to Rectangle
+        case Triangle(b, h):
+            return 0.5 * b * h
+```
+
+Destructured names (`r`, `w`, `h`) take the field types.
+
+## Re-widening
+
+A binding's narrowed type lasts *until reassignment*. If you reassign with `mut`, the new type is whatever you put in:
+
+```python
+mut x: int? = some_call()
+if x is not None:
+    x = x + 1     # ✅ still int
+    x = None      # re-widens to int?
+    # `x` is `int?` again here
+```
+
+## Narrowing inside `gather:` and `with` chains
+
+Bindings inside a `gather:` block or a `with`-chain are narrowed to their unwrapped types:
+
+```python
+gather:
+    user_r   = fetch_user(id)
+    posts_r  = fetch_posts(id)
+
+let user: User       = user_r?      # Result[User, E] → User after ?
+let posts: list[Post] = posts_r?
+```
+
+## What does *not* narrow
+
+These cases look like they should narrow but don't:
+
+### Mutated fields
+
+```python
+def f(u: User) -> str:
+    if u.email is None: return ""
+    u.refresh()                # arbitrary mutation
+    return u.email.upper()     # ❌ u.email could be None again
+```
+
+Fix: copy to a local first, then narrow.
+
+### Indexed access
+
+```python
+def f(xs: list[int?]) -> int:
+    if xs[0] is None: return 0
+    return xs[0] + 1     # ❌ xs[0] is a fresh read; not narrowed
+```
+
+Fix: bind to a local.
+
+### Cross-function calls
+
+The checker can't prove a function preserves a narrowing. If you call a function in between, the narrowing is invalidated:
+
+```python
+def f(u: User?) -> str:
+    if u is None: return ""
+    log("got user")            # external call
+    return u.name              # ✅ this is fine — `u` itself wasn't mutated
+```
+
+(Local bindings *do* persist across calls because the checker treats them as scope-local, not as a fact about the world.)
+
+## Implementation note
+
+The narrowing engine lives in `tyc-types`. Every binding carries a `NarrowedType` that the checker updates as it walks the AST. The narrowing facts are merged at control-flow joins (`if/else` end, `match` end, loop entry).
+
+Narrowing is implemented as a fixed-point over the control-flow graph, with type joins at merge points. The cost is small because Typhon's narrowing rules are simpler than TypeScript's (no covariance / contravariance on generic positions inside narrowed types).
+
+## Where next
+
+- [Nullable Types](/Typhon/types/nullable/) — `T?` reference.
+- [Sealed Unions](/Typhon/types/sealed-unions/) — `match` exhaustiveness.
+- [`guard`](/Typhon/reference/guard/) — the dedicated narrowing form.

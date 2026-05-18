@@ -1,0 +1,115 @@
+---
+title: tyc CLI Overview
+description: Every tyc subcommand at a glance.
+sidebar:
+  order: 1
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+The `tyc` binary is the compiler, formatter, language server, REPL, migrator, debugger launcher, and package manager. All subcommands share the same Salsa-backed engine, so incremental work is reused across invocations.
+
+## Subcommand index
+
+<CardGrid>
+  <Card title="tyc init" icon="add-document">
+    Scaffold a new project — `typhon.toml`, `src/`, `tests/`. [Reference →](/Typhon/cli/init/)
+  </Card>
+  <Card title="tyc check" icon="approve-check">
+    Type-check without emitting `.py`. CI's command. [Reference →](/Typhon/cli/check/)
+  </Card>
+  <Card title="tyc build" icon="rocket">
+    Full pipeline: parse → check → analyse → desugar → emit → format. [Reference →](/Typhon/cli/build/)
+  </Card>
+  <Card title="tyc fmt" icon="pencil">
+    Format `.ty` source in place. [Reference →](/Typhon/cli/fmt/)
+  </Card>
+  <Card title="tyc run" icon="forward-slash">
+    Build then exec — `tsx` for Typhon. `--temp` for ephemeral builds. [Reference →](/Typhon/cli/run/)
+  </Card>
+  <Card title="tyc lsp" icon="puzzle">
+    Language Server on stdio. Diagnostics, hover, completion, code actions. [Reference →](/Typhon/cli/lsp/)
+  </Card>
+  <Card title="tyc repl" icon="terminal">
+    Interactive evaluator. [Reference →](/Typhon/cli/repl/)
+  </Card>
+  <Card title="tyc debug" icon="bug">
+    Build then launch the emitted Python under pdb. [Reference →](/Typhon/cli/debug/)
+  </Card>
+  <Card title="tyc trace" icon="external">
+    Map a Python traceback back to `.ty` source via `.py.map`. [Reference →](/Typhon/cli/trace/)
+  </Card>
+  <Card title="tyc profile" icon="setting">
+    Instrument top-level functions; write `typhon-profile.json`. [Reference →](/Typhon/cli/profile/)
+  </Card>
+  <Card title="tyc migrate" icon="open-book">
+    Convert typed `.py` to `.ty` — `Optional[T]` → `T?`, add `let`/`mut`, drop `@dataclass`. [Reference →](/Typhon/cli/migrate/)
+  </Card>
+  <Card title="tyc ty" icon="approve-check-circle">
+    Build and run Astral's `ty` checker over the emitted Python. [Reference →](/Typhon/cli/ty/)
+  </Card>
+  <Card title="tyc stubtest" icon="warning">
+    Runtime probe via `mypy --stubtest` against emitted `.pyi`. [Reference →](/Typhon/cli/stubtest/)
+  </Card>
+  <Card title="tyc add / remove / sync" icon="seti:config">
+    Package-manager surface over `uv`. [Reference →](/Typhon/cli/packages/)
+  </Card>
+</CardGrid>
+
+## Typical workflow
+
+```bash
+# Once per project
+tyc init myapp
+cd myapp
+
+# Daily loop
+tyc fmt src/
+tyc check src/      # ← fast feedback
+tyc build           # ← full emit
+tyc run             # ← build + exec in one step
+```
+
+## In CI
+
+`tyc check` is the recommended CI command. It runs everything up to the analyser without producing artefacts:
+
+```yaml
+- name: Typhon type-check
+  run: tyc check src/
+```
+
+For projects shipping `.dty` stubs, add `tyc check --stubs` to catch drift, and `tyc stubtest` for runtime introspection (requires `mypy`).
+
+## Global flags
+
+| Flag | Effect |
+|------|--------|
+| `--help` / `-h` | Print help for a command. |
+| `--version` / `-V` | Print `tyc` version. |
+| `--quiet` / `-q` | Suppress non-error output. |
+| `--verbose` / `-v` | More logging; repeat `-vv` for max. |
+| `--manifest PATH` | Override the path to `typhon.toml`. |
+| `--color {auto,always,never}` | Control miette ANSI output. |
+
+Per-command flags are documented on each command's page.
+
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success. |
+| 1 | Error — invalid input, missing manifest, unknown command. |
+| 2 | Compile-time error — diagnostics emitted. |
+| 130 | Interrupted (Ctrl-C). |
+
+`tyc run` propagates the child Python's exit code instead of overriding.
+
+See [Exit Codes](/Typhon/cli/exit-codes/) for the full table.
+
+## Where next
+
+- [tyc check](/Typhon/cli/check/) — daily-loop type checking.
+- [tyc build](/Typhon/cli/build/) — full pipeline.
+- [tyc run](/Typhon/cli/run/) — build + exec.
+- [tyc lsp](/Typhon/cli/lsp/) — editor integration.

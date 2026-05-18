@@ -1,0 +1,85 @@
+---
+title: tyc check
+description: Type-check and analyse without emitting Python. CI's command.
+sidebar:
+  order: 3
+---
+
+```
+tyc check [PATHS]... [--stubs]
+```
+
+Runs everything up to the analyser — lex, parse, resolve, type-check, purity check, async check, comptime evaluation — without emitting any `.py`. Exits non-zero if any error-severity diagnostic fires.
+
+## Examples
+
+```bash
+tyc check                 # check the whole project (default: src/)
+tyc check src/users.ty    # check a single file
+tyc check src/ tests/     # multiple paths
+tyc check --stubs         # also diff .dty stubs against runtime modules
+```
+
+## What it does
+
+Per file:
+
+1. **Lex + parse** through the vendored Ruff parser.
+2. **Resolve** names; classify `let`/`mut`; build scope tree.
+3. **Type-check** signatures, assignments, narrowing, exhaustiveness, `?` validity, etc.
+4. **Analyse** purity, async correctness, comptime evaluation, auto-gather candidates.
+
+If everything is clean, exits 0 with no output. Otherwise, emits miette-formatted diagnostics and exits 2.
+
+## `--stubs`
+
+Additionally diffs every `.dty` stub against the runtime symbols of the module it describes. Emits `tyc::stub_mismatch` diagnostics for missing-in-impl / missing-in-stub / signature-mismatch findings.
+
+```bash
+tyc check --stubs
+```
+
+Useful as a CI gate when you ship `.dty` stubs.
+
+## Flags
+
+| Flag | Effect |
+|------|--------|
+| `--stubs` | Also diff `.dty` stubs against runtime modules. |
+| `--watch` | Re-run on file changes (debounced). |
+| `--quiet` | Suppress the "no diagnostics" line. |
+| `--manifest PATH` | Use a specific `typhon.toml`. |
+
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | No errors. |
+| 1 | Invalid input (missing path, bad flag). |
+| 2 | At least one error-severity diagnostic. |
+
+Warning-severity diagnostics do not change the exit code. To gate CI on warnings as well, raise `[strictness]` levels in `typhon.toml`.
+
+## Recommended CI shape
+
+```yaml
+jobs:
+  typhon:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tyc
+        run: |
+          cd tyc && cargo build --release
+          echo "$PWD/target/release" >> $GITHUB_PATH
+      - name: Type-check
+        run: tyc check src/
+      - name: Stub drift
+        run: tyc check --stubs    # if you ship stubs
+```
+
+## Where next
+
+- [Reading Diagnostics](/Typhon/diagnostics/reading/) — how to interpret the output.
+- [`tyc build`](/Typhon/cli/build/) — the full pipeline including emit.
+- [`tyc ty`](/Typhon/cli/ty/) — additional second-opinion check via Astral's `ty`.

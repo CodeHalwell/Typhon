@@ -1,0 +1,32 @@
+---
+title: "[project]"
+description: Project name, version, source and output directories.
+sidebar:
+  order: 2
+---
+
+```toml
+[project]
+name = "myapp"
+version = "0.1.0"
+src = "src"
+out = "build"
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `name` | string | (required) | Project name. Used for package metadata and error messages. |
+| `version` | string | `"0.1.0"` | Semver. |
+| `src` | path | `"src"` | Source directory (relative to manifest). |
+| `out` | path | `"build"` | Emit directory (relative to manifest). |
+
+## Notes
+
+- `name` should be a valid Python distribution name (lowercase, `_`-separated). Used as the wheel name if you build one.
+- `version` is consumed by `tyc sync` when generating `pyproject.toml`.
+- `src` and `out` can be reset; the defaults are conventional.
+- Both `src` and `out` are created on demand by `tyc init` / `tyc build` if missing.
+
+## Multiple source dirs
+
+Not currently supported — `src` is a single directory. For multi-package layouts, use one `typhon.toml` per package.

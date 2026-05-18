@@ -1,0 +1,218 @@
+---
+title: class, model, class!
+description: The three forms of class declaration — dataclass, Pydantic, and the framework-escape hatch.
+sidebar:
+  order: 4
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Typhon has three keywords for declaring class-like types, each emitting a different shape of Python.
+
+## `class` — dataclass emission (default)
+
+```python
+class User:
+    id: int
+    name: str = "anon"
+    email: str?
+```
+
+Emits `@dataclass(slots=True)`. The constructor is generated; fields with defaults can be omitted at construction time.
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    class User:
+        id: int
+        name: str = "anon"
+        email: str?
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    from dataclasses import dataclass
+
+    @dataclass(slots=True)
+    class User:
+        id: int
+        name: str = "anon"
+        email: str | None = None
+    ```
+  </TabItem>
+</Tabs>
+
+### `frozen` modifier
+
+```python
+class Point frozen:
+    x: float
+    y: float
+```
+
+Emits `@dataclass(slots=True, frozen=True)`. Field reassignment is a hard error; rebuild a new instance instead.
+
+Note: dataclass `frozen=True` blocks *field* reassignment only — nested mutable containers can still be mutated. Use `tuple` / `frozenset` inside the class for deep guarantees.
+
+### Inheritance
+
+```python
+class Animal:
+    name: str
+
+class Dog(Animal):
+    breed: str
+```
+
+Standard Python inheritance. The dataclass-MRO rule applies: fields without defaults must precede fields with defaults across the whole MRO.
+
+### Body restrictions
+
+A `class` body may contain:
+
+- Annotated field declarations (`name: T` or `name: T = default`).
+- Class-level docstring.
+- `lazy let` bindings (lower to `@cached_property`).
+
+It may *not* contain:
+
+- `def __init__` — generated. `tyc::manual_init`.
+- Other `def` methods — put them in an `impl` block instead.
+- Plain assignments without annotations (`name = "..."` at class scope).
+
+## `model` — Pydantic emission
+
+```python
+model ApiUser:
+    id: int
+    email: str
+    name: str = "anon"
+```
+
+Emits a Pydantic `BaseModel` with `extra="forbid"`:
+
+```python
+# Emitted
+from pydantic import BaseModel, ConfigDict
+
+class ApiUser(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    email: str
+    name: str = "anon"
+```
+
+### Validation
+
+Pydantic validates at construction time:
+
+```python
+ApiUser(id=1, email="a@b.com")              # ✅
+ApiUser(id="oops", email="a@b.com")          # ❌ ValidationError at runtime
+ApiUser(id=1, email="a@b.com", extra="x")   # ❌ ValidationError — extra="forbid"
+```
+
+The type checker catches the first two at compile time; the third is a runtime check Pydantic enforces because `extra="forbid"` is on.
+
+### When to use `model` vs `class`
+
+| `class` (dataclass) | `model` (Pydantic) |
+|---------------------|---------------------|
+| Internal types | Data crossing trust boundaries |
+| Maximum performance | Runtime validation |
+| No extra constraints | `Field(min_length=1, ...)` validators available |
+
+## `class!` — framework escape hatch
+
+```python
+class! MyModel(nn.Module):
+    layer: nn.Linear
+    dropout: float
+
+    def forward(self, x):
+        return self.layer(x)
+```
+
+Emits a bare `class` with auto-synthesised `__init__` that calls `super().__init__()` first.
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    import torch.nn as nn
+
+    class! MyModel(nn.Module):
+        layer: nn.Linear
+        dropout: float
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    import torch.nn as nn
+
+    class MyModel(nn.Module):
+        layer: nn.Linear
+        dropout: float
+
+        def __init__(self, layer: nn.Linear, dropout: float) -> None:
+            super().__init__()
+            self.layer = layer
+            self.dropout = dropout
+    ```
+  </TabItem>
+</Tabs>
+
+### What `class!` changes
+
+- **No `@dataclass` decorator.** The class is emitted verbatim with whatever bases it declares.
+- **`__init__` is auto-synthesised** when the body declares no `def __init__` and at least one base is present. The synthesised constructor calls `super().__init__()`, then assigns every annotated field through `self` in source order.
+- **Hand-written `__init__` is preserved verbatim.** Use this when the base class needs configuration arguments that aren't 1:1 with declared fields.
+
+### When to use `class!`
+
+For classes that *must* extend a framework base with a non-trivial `__init__`:
+
+- `torch.nn.Module`
+- `enum.Enum`
+- `typing.NamedTuple`
+- `unittest.TestCase`
+- Django models
+- SQLAlchemy declarative bases
+
+See [Class Escape Hatches](/Typhon/interop/class-escape/) for the patterns.
+
+## Generics
+
+Each form supports PEP 695 generics:
+
+```python
+class Box[T]:
+    value: T
+
+model PagedResult[T]:
+    items: list[T]
+    next_cursor: str?
+
+class! GenericModule[T](nn.Module):
+    weights: Tensor
+```
+
+## Constructor signatures
+
+For `class` and `model`:
+
+- Fields without defaults are positional.
+- Fields with defaults follow, positional-or-keyword.
+- The constructor's parameter names match the field names.
+
+For `class!`:
+
+- The synthesised constructor has the same shape as `class` / `model`.
+- Hand-written `__init__` is preserved verbatim — any signature you write is the signature.
+
+## Where next
+
+- [Classes and Models (tour)](/Typhon/tour/classes/) — teaching page with worked examples.
+- [`impl` and `extend`](/Typhon/reference/impl-extend/) — attaching methods.
+- [Pydantic Boundary Models](/Typhon/interop/pydantic/) — `model` patterns for HTTP/CLI/file inputs.
+- [Class Escape Hatches](/Typhon/interop/class-escape/) — `class!` patterns by framework.

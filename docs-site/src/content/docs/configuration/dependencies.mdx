@@ -1,0 +1,71 @@
+---
+title: "[dependencies]"
+description: Package manifest — synced with tyc add / remove / sync to uv.
+sidebar:
+  order: 7
+---
+
+```toml
+[dependencies]
+requests = ">=2.31"
+rich = "*"
+httpx = "0.27"
+
+[dev-dependencies]
+pytest = "8.2"
+mypy = "*"
+```
+
+| Key (table) | Type | Description |
+|-------------|------|-------------|
+| `[dependencies]` | table | Runtime dependencies. Installed into the active environment by `tyc sync`. |
+| `[dev-dependencies]` | table | Dev / test / lint dependencies. Installed separately when using `uv sync --dev` (or the moral equivalent). |
+
+## Version selectors
+
+Each entry maps a package name to a version selector:
+
+| Value | Meaning |
+|-------|---------|
+| `"*"` | Any version. |
+| `">=2.31"` | Range. |
+| `">=2.31,<3"` | Range with upper bound. |
+| `"0.27"` | Bare version → `==0.27`. |
+| `"==0.27"` | Explicit pin. |
+
+Format follows [PEP 440](https://peps.python.org/pep-0440/) — same as `pyproject.toml` `[project.dependencies]`.
+
+## Managing dependencies
+
+Three subcommands manage the tables:
+
+```bash
+tyc add requests                # adds to [dependencies] at latest version
+tyc add httpx@0.27              # adds at specific version
+tyc add --dev pytest@8.2        # adds to [dev-dependencies]
+tyc remove rich                 # removes
+tyc sync                        # materialises pyproject.toml and runs `uv sync`
+```
+
+See [`tyc add` / `remove` / `sync`](/Typhon/cli/packages/).
+
+## What `tyc sync` does
+
+1. Reads `[dependencies]` and `[dev-dependencies]` from `typhon.toml`.
+2. Generates a `pyproject.toml` (using your `[project]` metadata).
+3. Runs `uv sync`.
+
+The generated `pyproject.toml` is overwritten on every `tyc sync`. Don't hand-edit it.
+
+## Without `uv`
+
+If `uv` is not installed, `tyc sync` updates `typhon.toml` and prints "install uv to complete". You can still use `pip install -e .` against the generated `pyproject.toml`, or `pip install -r requirements.txt` after exporting via uv.
+
+## Why not declare deps directly in `pyproject.toml`?
+
+You can. `typhon.toml`'s `[dependencies]` is a *convenience* — having the manifest in one place keeps Typhon-specific config and dependency info together. The compiler doesn't strictly need this section; if you'd rather manage `pyproject.toml` directly, drop the section and use `pip install -e .` / `uv sync` manually.
+
+## Where next
+
+- [`tyc add` / `remove` / `sync`](/Typhon/cli/packages/) — the management commands.
+- [`uv` docs](https://docs.astral.sh/uv/) — what the install step is doing.

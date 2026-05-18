@@ -1,0 +1,178 @@
+---
+title: Interfaces (Protocols)
+description: Structural typing in Typhon — anything with the right shape satisfies the interface.
+sidebar:
+  order: 8
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+An `interface` is a *structural* contract: any type that provides the listed members with compatible signatures satisfies the interface, without an explicit `implements` clause. Interfaces emit as `typing.Protocol` subclasses, so mypy / pyright / IDEs see them the same way.
+
+## Declaration
+
+```python
+interface Drawable:
+    def draw(self) -> None
+    def width(self) -> float
+    def height(self) -> float
+```
+
+The bodies are signatures, not implementations. (`...` is implicit; you can write it explicitly if you prefer.)
+
+A class with matching members satisfies the interface — no opt-in:
+
+```python
+class Button:
+    label: str
+
+impl Button:
+    def draw(self) -> None:
+        print(f"[ {self.label} ]")
+    def width(self) -> float:
+        return float(len(self.label) + 4)
+    def height(self) -> float:
+        return 1.0
+
+def render(d: Drawable) -> None:
+    d.draw()
+
+render(Button(label="click me"))    # ✅ Button satisfies Drawable
+```
+
+## Lowering
+
+```python
+# Typhon
+interface Drawable:
+    def draw(self) -> None
+    def width(self) -> float
+
+# Emitted Python
+from typing import Protocol
+
+class Drawable(Protocol):
+    def draw(self) -> None: ...
+    def width(self) -> float: ...
+```
+
+`Protocol` is part of the typing stdlib (PEP 544). Every Python tool already understands it.
+
+## Conformance checking
+
+The checker verifies, at the call site (or assignment), that the candidate type provides every required member with compatible signatures. Recursion in signatures is handled via memoised "assumed subtype" sets.
+
+A *member* is:
+
+- A method (`def name(self, ...) -> R`).
+- A field (`name: T`).
+
+Method signatures must match parameter and return types. Optional parameters in the interface are satisfied by required parameters in the implementation (and vice versa, in either direction).
+
+## `isinstance` against an interface is rejected
+
+```python
+def render_if_able(x: object) -> None:
+    if isinstance(x, Drawable):    # ❌ tyc::interface_isinstance
+        x.draw()
+```
+
+```
+error[tyc::interface_isinstance]: runtime `isinstance` against an interface is unsafe
+                                  by default; use static narrowing or opt into
+                                  `@runtime_checkable` explicitly
+```
+
+**Why?** PEP 544's `@runtime_checkable` validates *attribute presence* at runtime — it does not check signatures or types. `isinstance(x, Drawable)` would return `True` for a class with a `draw` *field* (even a string!) and no `width` / `height` methods. The runtime check is much weaker than the static check Typhon already does.
+
+If you genuinely need a runtime predicate, write one:
+
+```python
+def is_drawable(x: object) -> bool:
+    return (
+        callable(getattr(x, "draw", None)) and
+        callable(getattr(x, "width", None)) and
+        callable(getattr(x, "height", None))
+    )
+```
+
+Or refactor to a sealed union, where exhaustiveness gives you stronger guarantees.
+
+## When to reach for an interface
+
+- **Multiple unrelated types share behaviour.** A sealed union doesn't fit (the variants aren't fixed); inheritance doesn't fit (the types are unrelated).
+- **The set of conforming types is open.** Third-party callers can write their own implementations.
+
+For closed sets, prefer a sealed union — exhaustiveness is stronger than structural conformance.
+
+## Generic interfaces
+
+```python
+interface Container[T]:
+    def add(self, item: T) -> None
+    def items(self) -> list[T]
+```
+
+Same PEP 695 syntax as generic classes. Conformance is checked with `T` bound:
+
+```python
+class IntBag:
+    bag: list[int]
+
+impl IntBag:
+    def add(self, item: int) -> None:
+        self.bag.append(item)
+    def items(self) -> list[int]:
+        return list(self.bag)
+
+def consume[T](c: Container[T]) -> int:
+    return len(c.items())
+
+consume(IntBag(bag=[]))     # ✅ T = int
+```
+
+## Bounded type parameters
+
+A bound says "any T that satisfies this interface" — see [Generics](/Typhon/types/generics/#bounded-type-parameters).
+
+```python
+interface Ordered:
+    def __lt__(self, other: Self) -> bool
+
+def min_of[T: Ordered](xs: list[T]) -> T?: ...
+```
+
+## Common mistakes
+
+### Mixing fields and methods
+
+```python
+interface HasName:
+    def name(self) -> str        # method
+
+class Box:
+    name: str                     # field
+
+show(Box(name="b"))               # ❌ Box.name is a field; HasName expects a method
+```
+
+Either change the interface to a field (`name: str`) or the class to a method (via `impl`).
+
+### Trying to `isinstance` an interface
+
+See above — use static narrowing, or write an explicit predicate, or refactor.
+
+### Forgetting `self` on interface methods
+
+```python
+interface Drawable:
+    def draw() -> None     # ❌ missing self
+```
+
+Interfaces follow the same rule as `impl` blocks: methods take an explicit `self`.
+
+## Where next
+
+- [`interface`](/Typhon/reference/interface/) — the reference page.
+- [Sealed Unions](/Typhon/types/sealed-unions/) — closed sums; the alternative to open structural typing.
+- [Generics](/Typhon/types/generics/) — type parameters and bounds.

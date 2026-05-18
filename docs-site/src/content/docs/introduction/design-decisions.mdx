@@ -1,0 +1,200 @@
+---
+title: Design Decisions
+description: The reasoning behind every load-bearing decision Typhon makes — what the alternatives were, why we picked this one, and what the cost is.
+sidebar:
+  order: 3
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+This page is the long-form rationale for every load-bearing decision in Typhon. Most language docs hide this; we put it front and centre because Typhon is small enough that all of its decisions fit into one page, and because *understanding why something is the way it is* will save you a lot of time when you hit a sharp edge.
+
+The decisions are listed in roughly the order they were made.
+
+## 1. Compile to Python, not to a new runtime
+
+**Alternative considered:** ship a new runtime, the Mojo path. Pick the parts of Python's semantics we like, drop the parts we don't, and produce a bespoke ABI.
+
+**Decision:** compile to standard CPython 3.13+ and ship no runtime.
+
+**Why:** the entire reason anyone uses Python is the ecosystem. Reinventing the runtime walls you off from `requests`, `httpx`, `sqlalchemy`, `numpy`, `pandas`, `torch`, `pydantic`, `fastapi`, and every framework that depends on them. We'd rather have a Python that's harder to write but easier to maintain, than a not-quite-Python that's easier to write but cannot reuse the world.
+
+**Cost:** Typhon will never beat CPython on hot loops the way Cython or Mojo can. That's fine — Typhon is a static-safety tool, not a performance tool.
+
+## 2. Single Rust binary (`tyc`), not multiple tools
+
+**Alternative considered:** separate `tyc-build`, `tyc-check`, `tyc-fmt`, `tyc-lsp` binaries the way Python tooling traditionally fragments (`black`, `isort`, `flake8`, `mypy`, `pylint`).
+
+**Decision:** one binary, clap v4 subcommands, every stage backed by the same Salsa database.
+
+**Why:** Astral's [`oxc`](https://github.com/oxc-project/oxc) and Ruff demonstrated that the one-binary approach scales — sub-100ms incremental feedback in the LSP, zero cross-tool config drift, one install path. The downside (a single large binary) is irrelevant in 2026; people happily install gigabytes of node_modules.
+
+**Cost:** every change to a stage rebuilds the whole binary. Compile times on `tyc` itself matter to contributors; non-contributors do not see this.
+
+## 3. Vendor a fork of `ruff_python_parser` rather than write our own
+
+**Alternative considered:** hand-roll a Python parser with `chumsky` or `lalrpop`. Or use the crates.io `rustpython-parser`.
+
+**Decision:** vendor Ruff's parser as a sibling crate (`tyc/vendor/ruff_python_parser/`), extend it with `let` and `mut` soft keywords plus a `Mutability` field on assignment AST nodes, track upstream loosely.
+
+**Why:** Python's significant-whitespace lexing is non-trivial. Months of catch-up work before writing a single new feature. Ruff's parser is the fastest, most spec-compliant Python parser in Rust, and shares an AST contract with `ty` (Astral's type checker) which simplifies later integration. `rustpython-parser` was the fallback but lags Ruff on Python-version coverage.
+
+**Cost:** weekly grammar-sync work when CPython releases new syntax (PEP 695, structural patterns, etc.). The diff against upstream stays small by convention.
+
+## 4. PEP 695 brackets for generics (`def f[T](x: T)`), not angle brackets
+
+**Alternative considered:** TS/Rust-style `<T>`.
+
+**Decision:** PEP 695 bracket syntax. Locked at Phase 3 entry.
+
+**Why:** zero parser-fork cost (the vendored Ruff parser already accepts PEP 695), zero lowering cost (the same syntax Python emits), and zero grammar-divergence cost going forward — Typhon stays in lockstep with CPython. The angle-bracket aesthetic was never worth the multi-month parser work and the future syntax-drift tax.
+
+**Cost:** the aesthetic kinship with TypeScript / Rust is lost. We may revisit `<T>` as surface-only sugar at a later date if real codebases ask for it.
+
+## 5. `let` / `mut` as soft keywords, not annotations
+
+**Alternative considered:** `Final[T]` annotation, à la Python's typing module. Or no marker at all (every binding mutable; rely on `Final` opt-in).
+
+**Decision:** `let` and `mut` are soft keywords in the lexer, with a `Mutability::Let | Mut | None` field on assignment AST nodes. Inside functions, locals must declare one. Module-level bindings default to `let`.
+
+**Why:** the marker has to be visible at the binding site, not buried in a type annotation, so a reader can scan a function and see at a glance which names get reassigned. `Final[T]` is the wrong shape (it's a type, not a binding kind) and doesn't compose with `T?`, `Result[T, E]`, etc. Soft keywords keep parser changes mechanical and let us re-use existing `name` tokens elsewhere.
+
+**Cost:** users typing `name = x` inside a function get `tyc::missing_binding_kind`. The diagnostic is the friendliest in the catalog and points at the fix.
+
+## 6. Non-nullable by default with `T?` sugar
+
+**Alternative considered:** `Optional[T]` import from `typing`, à la mypy/pyright in their early years. Or `T | None` longhand, à la modern Python.
+
+**Decision:** plain `T` cannot hold `None`. Optional values are spelled `T?`. Internally `T?` is `Nullable[T]`; the emitter lowers it to `T | None`.
+
+**Why:** the noisier the form, the less it gets used; the less it gets used, the more `None`s leak. `T?` is one character, reads as the question it represents ("is this set?"), and the emitter still produces standard `T | None` for downstream tools (mypy / pyright / IDEs).
+
+**Cost:** users who copy a typed Python signature wholesale need to translate `Optional[T]` and `T | None` to `T?`. The [`tyc migrate`](/Typhon/cli/migrate/) tool does this mechanically.
+
+## 7. `Result[T, E]` with `?` operator and `with`-chains, not just exceptions
+
+**Alternative considered:** keep Python exceptions as the only error mechanism. Or use `panic!`-style early termination.
+
+**Decision:** introduce `Result[T, E]`, `Ok(T)`, `Err(E)` as the typed-error channel. The `?` suffix unwraps `Ok` and short-circuits `Err` to the enclosing function (which must return a compatible `Result`). The `with name = expr?, ...:` chain sequences several `Result`-returning calls with an optional `else err:` block.
+
+Python exceptions still exist; they are the right tool at the Typhon/Python boundary. Inside Typhon, `Result` is the preferred shape for expected failures (parsing, lookups, validation, RPC).
+
+**Why:** Python's exceptions don't appear in type signatures. A function annotated `-> User` might raise `ValueError`, `KeyError`, `DatabaseError`, or anything else — and callers can't tell from the signature, the editor, or the type checker. `Result[T, E]` puts the error in the return type where the type checker can enforce coverage. The `?` operator removes the boilerplate that always killed Result-style approaches in earlier languages.
+
+**Cost:** users have to learn one more thing. `Result` is emitted as a tagged dataclass in a generated `typhon_runtime` module — a small "Typhon-shaped" surface to maintain in the output. We accepted this because it keeps everything generated rather than depending on a PyPI package.
+
+## 8. Sealed unions via `type X = A | B`, exhaustive `match` enforced statically
+
+**Alternative considered:** use Python's existing `Union[A, B]` / `A | B` without sealing, and rely on `match` plus runtime checks.
+
+**Decision:** introduce `type X = A | B | C` as a *sealed* alias. Nothing outside the source file can extend the union. `match` on a sealed union must cover every variant — checked at compile time.
+
+**Why:** unsealed unions cannot deliver exhaustiveness because the compiler cannot enumerate the world's possible variants. Sealed unions are the single biggest static-safety win Typhon offers over typed Python, and they cost almost nothing to implement.
+
+**Cost:** users who want truly open extensibility need to use a base class or an `interface` instead. That is the right boundary.
+
+## 9. `class` = `@dataclass(slots=True)`, `model` = Pydantic `BaseModel(extra="forbid")`
+
+**Alternative considered:** make Pydantic `BaseModel` the default; force every class to validate.
+
+**Decision:** default emit target is `@dataclass(slots=True)`. The `model` keyword opts into Pydantic emission, and Pydantic emissions always include `extra="forbid"`.
+
+**Why:** Pydantic is heavyweight (`__init__` validates every field at construction), and most classes inside a real codebase do not cross a trust boundary. Defaulting to `@dataclass` keeps the runtime cost honest — validation is only paid where it matters. `extra="forbid"` is the safety-first default; Pydantic's stock `extra="ignore"` silently drops unexpected fields, which is exactly the quiet failure mode Typhon exists to prevent.
+
+**Cost:** users who want validation everywhere have to write `model` instead of `class`. That is acceptable; opting *in* to validation is more visible than opting out.
+
+## 10. `class!` as the escape hatch for framework base classes
+
+**Alternative considered:** force every class through the dataclass-emit path; reject `torch.nn.Module` subclasses.
+
+**Decision:** `class!` emits a bare `class` with an auto-synthesised `__init__` that calls `super().__init__()` first, then assigns annotated fields. Hand-written `__init__` is preserved verbatim.
+
+**Why:** some frameworks (`torch.nn.Module`, `enum.Enum`, `typing.NamedTuple`, `unittest.TestCase`, Django models, SQLAlchemy declarative bases) cannot be expressed as a dataclass because their `__init__` needs to run before fields are assigned. Rather than wall them off, we provide a single-character marker (`!`) that opts out of dataclass emit while keeping every other Typhon guarantee (annotations, `let`/`mut`, `T?`, `Result`).
+
+**Cost:** users have to remember to write `class!` for framework bases. The compiler emits a clear diagnostic when you try to dataclass-emit something that needs `class!`.
+
+## 11. `gather:` lowers to `asyncio.TaskGroup`, not `asyncio.gather`
+
+**Alternative considered:** lower `gather:` to `asyncio.gather(...)` (the older, more familiar API).
+
+**Decision:** `gather:` lowers to `asyncio.TaskGroup` by default. Users who genuinely want partial-success semantics opt in via `gather(strategy="best-effort"):`, which lowers to `asyncio.gather(..., return_exceptions=True)`.
+
+**Why:** `asyncio.gather(...)` propagates the first exception but lets siblings keep running in the background. For side-effectful work (HTTP calls with retries, queue publishes, payment processing) that is a footgun — you can leave half-completed state lying around when an error fires. `asyncio.TaskGroup` (Python 3.11+) cancels siblings on first failure, which is the right default for almost every concurrent-fan-out use case.
+
+**Cost:** users moving from `asyncio.gather` patterns need to understand the cancellation semantics. The [async guide](/Typhon/tour/async/) covers it.
+
+## 12. `go` lowers through `typhon_runtime.tasks.spawn`, not bare `asyncio.create_task`
+
+**Alternative considered:** lower `go f(x)` to `asyncio.create_task(f(x))` directly.
+
+**Decision:** lower through a small runtime helper that keeps a strong-ref `set[asyncio.Task]` and clears entries from a `done_callback`.
+
+**Why:** Python's event loop holds only **weak references** to tasks. A fire-and-forget `asyncio.create_task(...)` whose handle is dropped can be garbage-collected mid-flight — a known footgun documented in the CPython docs. The runtime helper takes one line and prevents the entire class of bug.
+
+**Cost:** the runtime helper sits in the generated `typhon_runtime/` module. We pay roughly 10 lines of generated Python for "fire-and-forget tasks that don't disappear".
+
+## 13. `unsafe:` is a lexical region, not a per-value cast
+
+**Alternative considered:** TypeScript-style per-expression `as Any` cast.
+
+**Decision:** `unsafe:` is a lexical block. Inside it, expressions that would otherwise infer `Any` bind freely; values acquire a hidden `Unsafe[T]` marker that cannot cross out of the block into a concrete-typed context without re-assertion (annotation, narrowing, or explicit cast).
+
+**Why:** a per-value cast invites sprinkling dynamism everywhere. A lexical region forces the dynamism into one visible scope where readers can spot it and reviewers can interrogate it. The `Unsafe[T]` marker means the boundary is enforced even when the region tolerates dynamism internally.
+
+**Cost:** users sometimes wish they could `unsafe expr` for a single subexpression. We may revisit if the pattern becomes common; for now, blocks have been good enough.
+
+## 14. `comptime` evaluation runs in a sandbox, not arbitrary Python
+
+**Alternative considered:** evaluate `comptime` bindings with a full Python interpreter (the way Zig's `comptime` can run almost anything).
+
+**Decision:** `comptime` runs in a tightly-scoped sandbox: literals, arithmetic, comparisons, boolean ops, ternaries, `env()` lookup, `int() / str() / float()` casts, parameter and local-binding references, and calls to user-defined `comptime def` functions. No I/O, no imports, no `time.*`, no `random.*`, no loops, no exception handling.
+
+**Why:** `comptime` evaluation happens *inside the compiler*. Letting it touch the filesystem or the network would make builds non-deterministic and would let a maliciously-crafted `comptime def` exfiltrate data from a CI environment. The sandbox is small enough to audit on one screen.
+
+**Cost:** `comptime` is more limited than `zig comptime`. The features it covers (env validation, derived constants, feature flags) are the high-leverage 80%. The rest belongs at runtime, possibly behind `lazy let`.
+
+## 15. `lazy from x import y` is rejected at parse time
+
+**Alternative considered:** allow `lazy from numpy import array` and emit a proxy for each named import.
+
+**Decision:** `lazy from ... import ...` is a hard parse error. Use `lazy import np = numpy` plus `np.array(...)` instead.
+
+**Why:** PEP 690's deferred-import analysis showed that `from ... import x` eagerly touches `x` on the source module — which defeats deferral. Allowing the form would have given users false confidence in laziness that they don't actually get. Rejecting at parse time and offering the alternative in the diagnostic message is clearer.
+
+**Cost:** one extra line of diagnostic copy. Users adjust within seconds.
+
+## 16. The diagnostic surface lives in `miette`, not custom rendering
+
+**Alternative considered:** roll our own ANSI rendering, à la `rustc` in its early years.
+
+**Decision:** use `miette` + `thiserror`. Every diagnostic carries a source span, a label, and a help message.
+
+**Why:** `miette` is the canonical Rust crate for source-span diagnostics, used by oxc, ty, Pyrefly, and many other modern tools. Rolling our own is a multi-month yak-shave.
+
+**Cost:** we are tied to `miette`'s API. Wrapped in a one-function-wide module to keep the blast radius small if it changes.
+
+## 17. LSP via `tower-lsp-server`, sharing the Salsa DB
+
+**Alternative considered:** `lsp-server` (rust-analyzer style), or a bespoke transport.
+
+**Decision:** `tower-lsp-server`, the active community fork of `tower-lsp` tracking `lsp-types` 0.97+. The LSP shares the same Salsa database as the CLI's `tyc check`.
+
+**Why:** the LSP and CLI share the same queries (`parse`, `resolve`, `check`). Sharing the DB means an edit invalidates the right Salsa nodes and the LSP republishes diagnostics in tens of milliseconds. `tower-lsp-server` is more ergonomic than `lsp-server` and stays current with the LSP spec.
+
+**Cost:** Salsa API breakage hits the LSP and CLI together. Wrapped at one-function granularity to limit blast radius.
+
+## 18. `tyc add` / `remove` / `sync` shells out to `uv`, not a bundled resolver
+
+**Alternative considered:** ship a Cargo-style resolver bundled with `tyc`.
+
+**Decision:** `tyc add` rewrites `[dependencies]` in `typhon.toml`, generates a `pyproject.toml`, and shells out to `uv sync`. If `uv` is missing, the manifest still updates and the command prints "install uv to complete".
+
+**Why:** dependency resolution for Python is a hard, evolving problem. `uv` is Astral's resolver and the consensus best-in-class in 2026. Building our own would waste years of effort.
+
+**Cost:** users without `uv` get a partial workflow. That's fine — the manifest is portable, and `pip install` against the generated `pyproject.toml` works too.
+
+## A note on stability
+
+Typhon is not yet 1.0. Some of the decisions above will be re-examined as we get usage. The ones least likely to change are: compile-to-Python (1), non-null by default (6), `Result[T, E]` (7), sealed unions (8), and `class!` as the escape hatch (10). The rest are stable but reviewable.
+
+If you have feedback on any of these decisions, the project tracker is open: [github.com/CodeHalwell/Typhon/issues](https://github.com/CodeHalwell/Typhon/issues).

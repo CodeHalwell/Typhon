@@ -1,0 +1,85 @@
+---
+title: tyc profile
+description: Instrument top-level functions; write typhon-profile.json.
+sidebar:
+  order: 11
+---
+
+```
+tyc profile [--out FILE] [-- ARGS...]
+```
+
+Builds the project with instrumentation that records every top-level function's call count and wall-clock time. On interpreter exit, writes the data to `typhon-profile.json`. Used by `[strictness] pgo-memoise` to drive PGO-guided cache injection.
+
+## Examples
+
+```bash
+tyc profile -- --representative-args
+# runs the program; on exit, writes typhon-profile.json
+
+tyc profile --out /tmp/profile.json -- --bench
+```
+
+## What the profile contains
+
+A JSON object keyed by qualified function name:
+
+```json
+{
+  "src/main.py:parse_port": {
+    "calls": 12483,
+    "wall_clock_ns": 8429311
+  },
+  "src/users.py:find_user": {
+    "calls": 4521,
+    "wall_clock_ns": 124883201
+  }
+}
+```
+
+## Using the profile
+
+Enable PGO in `typhon.toml`:
+
+```toml
+[strictness]
+pgo-memoise = true
+pgo-min-calls = 100         # threshold; default 100
+```
+
+On the next `tyc build`, every `@pure`-eligible function whose call count meets `pgo-min-calls` is promoted to `@functools.cache` — even if you didn't write `@memo`. This complements `auto-memoise` (which caches *every* pure function regardless of hot-ness).
+
+## Missing profile file
+
+Not an error. PGO is best-effort:
+
+```
+tyc build
+# warning: pgo-memoise enabled, but typhon-profile.json is missing — no PGO applied
+```
+
+## Recommended workflow
+
+1. Write a "representative" entry point (e.g. a benchmark or a CLI invocation that exercises hot paths).
+2. `tyc profile -- <args>`.
+3. Commit `typhon-profile.json` (or generate in CI).
+4. `tyc build` with `pgo-memoise = true`.
+
+The PGO is purely additive — functions promoted by PGO behave the same as ones you marked `@memo` manually. They get cached; their purity is verified at build time.
+
+## What's profiled
+
+Currently: every top-level `def` in the project's modules (not class methods; not closures inside other functions). Future work may broaden the surface.
+
+## Flags
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--out FILE` | `typhon-profile.json` | Where to write the profile data. |
+| `--entry FILE` | `main.py` | Entry-point to profile. |
+| `--python PATH` | `python3` | Interpreter. |
+
+## Where next
+
+- [`@pure` and `@memo`](/Typhon/reference/pure-memo/) — the purity check used for PGO eligibility.
+- [`[strictness] pgo-memoise`](/Typhon/configuration/strictness/) — config knob.

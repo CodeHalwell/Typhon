@@ -1,0 +1,75 @@
+---
+title: tyc fmt
+description: Format .ty source files in place.
+sidebar:
+  order: 5
+---
+
+```
+tyc fmt [PATHS]... [--check]
+```
+
+Parses `.ty` files, validates the syntax, normalises whitespace and indentation, and writes the formatted result back to disk. Wraps `ruff format` applied to a Typhon-aware pretty-printer.
+
+## Examples
+
+```bash
+tyc fmt src/                  # format every .ty in src/
+tyc fmt src/main.ty           # format one file
+tyc fmt --check src/          # exit 1 if anything would change (CI mode)
+```
+
+## What it changes
+
+- **Whitespace normalisation** — same rules as `ruff format` / `black`.
+- **Indentation** — 4 spaces, no tabs.
+- **Trailing whitespace** — removed.
+- **Line endings** — `\n`.
+- **Blank lines** — two between top-level functions / classes; one inside.
+- **Operator spacing** — `a + b`, not `a+b`.
+- **Hanging vs vertical layout** — `ruff format`'s heuristics.
+
+## What it preserves
+
+- **String quotes** — left as-is (Typhon doesn't take a side between `"` and `'`).
+- **`let` / `mut`** placement.
+- **`type` aliases** — single-line if they fit.
+- **Comments** — kept on the same line if they fit; promoted to a previous line otherwise.
+
+## Flags
+
+| Flag | Effect |
+|------|--------|
+| `--check` | Exit 1 if any file would change. No writes. |
+| `--diff` | Print a unified diff instead of writing. |
+| `--quiet` | Suppress per-file output. |
+
+## CI integration
+
+```yaml
+- name: Format check
+  run: tyc fmt --check src/
+```
+
+## Pre-commit
+
+```yaml
+# .pre-commit-config.yaml
+repos:
+  - repo: local
+    hooks:
+      - id: tyc-fmt
+        name: tyc fmt
+        entry: tyc fmt
+        language: system
+        files: \.ty$
+```
+
+## What about `tyc fmt` on `.dty`?
+
+Yes — `.dty` files format with the same rules. The bodies are signatures, but the lexer / printer treat them like `.ty`.
+
+## Where next
+
+- [`tyc check`](/Typhon/cli/check/) — type-check after formatting.
+- [Editor Setup](/Typhon/getting-started/editor-setup/) — format-on-save.

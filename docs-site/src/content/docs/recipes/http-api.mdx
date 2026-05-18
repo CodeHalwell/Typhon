@@ -1,0 +1,125 @@
+---
+title: HTTP API with Pydantic
+description: FastAPI plus model request/response shapes.
+sidebar:
+  order: 4
+---
+
+A small FastAPI service that creates users, with `model` for the request and response shapes (Pydantic validates at the boundary), `class` for internal state, and `Result[T, E]` for typed errors.
+
+## The service
+
+```python
+import asyncio
+from datetime import datetime
+from typing import Annotated
+
+import fastapi
+from fastapi import HTTPException, Path
+
+# --- Input / output models ---
+
+model CreateUserInput:
+    email: str
+    name: str = "anon"
+
+model UserResponse:
+    id: int
+    email: str
+    name: str
+    created_at: datetime
+
+# --- Internal types ---
+
+class User:
+    id: int
+    email: str
+    name: str
+    created_at: datetime
+
+# --- Typed errors ---
+
+type CreateError = DuplicateEmail | InvalidEmail
+
+class DuplicateEmail:
+    email: str
+class InvalidEmail:
+    email: str
+    detail: str
+
+# --- Domain functions ---
+
+def validate_email(email: str) -> Result[str, InvalidEmail]:
+    if "@" not in email:
+        return Err(InvalidEmail(email=email, detail="missing @"))
+    return Ok(email)
+
+async def create_user(input: CreateUserInput) -> Result[User, CreateError]:
+    let email: str = validate_email(input.email)?
+    if await user_exists(email):
+        return Err(DuplicateEmail(email=email))
+    let id: int = await next_id()
+    return Ok(User(id=id, email=email, name=input.name, created_at=datetime.now()))
+
+# (user_exists, next_id stubs omitted)
+
+# --- API ---
+
+app = fastapi.FastAPI()
+
+@app.post("/users", response_model=UserResponse, status_code=201)
+async def post_user(input: CreateUserInput) -> UserResponse:
+    match await create_user(input):
+        case Ok(u):
+            return UserResponse(
+                id=u.id, email=u.email, name=u.name, created_at=u.created_at,
+            )
+        case Err(InvalidEmail(email, detail)):
+            raise HTTPException(status_code=422, detail=f"invalid email '{email}': {detail}")
+        case Err(DuplicateEmail(email)):
+            raise HTTPException(status_code=409, detail=f"email '{email}' already exists")
+```
+
+## Things to notice
+
+- **`model` for request / response.** Pydantic validates `CreateUserInput` at construction; rejects `{"email": "...", "extra": "boom"}` because `extra="forbid"` is the default.
+- **`class` for internal `User`.** No runtime validation overhead.
+- **Typed errors with `Result[T, E]`.** `CreateError` is a sealed union; the `match` in `post_user` is exhaustive.
+- **`?` propagation in `create_user`.** `validate_email` returns `Result[str, InvalidEmail]`; the `?` short-circuits if invalid.
+- **HTTP status codes per error variant.** `InvalidEmail` → 422; `DuplicateEmail` → 409. Easy to read, easy to extend.
+
+## With dependency injection
+
+FastAPI's `Depends()` works as expected:
+
+```python
+async def get_db() -> Database: ...
+
+@app.get("/users/{user_id}", response_model=UserResponse)
+async def get_user(
+    user_id: Annotated[int, Path(ge=1)],
+    db: Annotated[Database, fastapi.Depends(get_db)],
+) -> UserResponse:
+    let u: User? = await db.find_user(user_id)
+    guard found = u else:
+        raise HTTPException(status_code=404, detail=f"user {user_id} not found")
+    return UserResponse(...)
+```
+
+`Annotated[T, Path(...)]` works with Typhon's `T?` rules unchanged.
+
+## Why Pydantic for boundary, dataclass for internal
+
+| Use case | Type |
+|----------|------|
+| Request body parsing (untrusted input) | `model` (Pydantic validation) |
+| Response serialisation | `model` |
+| Domain types (already validated, perf matters) | `class` (dataclass) |
+
+The split keeps validation cost honest — paid where it matters, free where it doesn't.
+
+## Where next
+
+- [Pydantic Boundary Models](/Typhon/interop/pydantic/) — when to use `model`.
+- [Error Handling (tour)](/Typhon/tour/error-handling/) — `Result` patterns.
+- [Concurrent Data Fetching](/Typhon/recipes/concurrent-fetch/) — `gather:` for fanned-out reads.

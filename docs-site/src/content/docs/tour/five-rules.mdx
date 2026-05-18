@@ -1,0 +1,214 @@
+---
+title: The Five Rules of Typhon
+description: If you remember nothing else from these docs, remember these five rules. Everything follows.
+sidebar:
+  order: 1
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Typhon's syntax is *close* to Python — close enough that most code transfers over with minor rewrites. Five rules quietly diverge from Python's defaults, and every "but the same code works in Python!" surprise traces back to one of them. Internalise these five and the checker stops surprising you.
+
+## Rule 1 — Every parameter and return type is annotated
+
+There is no inference fallback for missing annotations. `-> None` is mandatory for sync functions that return nothing.
+
+```python
+def add(a: int, b: int) -> int:    # ✅
+    return a + b
+
+def add(a, b):                     # ❌ tyc::missing_return_type / implicit Any
+    return a + b
+```
+
+```
+error[tyc::missing_return_type]: function `add` is missing a return type
+ ┌─ src/main.ty:1:5
+ │
+1 │ def add(a, b):
+ │     ^^^ add `-> int` (or another type) here
+```
+
+This is enforced by `[strictness] no-implicit-any = true`, which defaults on. You almost never want to turn it off — implicit `Any` is the chief reason Python codebases get hard to refactor.
+
+**The fix:** annotate. Always. Even `-> None` is required.
+
+## Rule 2 — Local bindings declare `let` or `mut`
+
+Inside functions, every local binding picks one keyword:
+
+- `let` — immutable binding. Reassignment is a compile error.
+- `mut` — mutable binding. Required for any name you intend to rebind.
+
+```python
+def demo() -> None:
+    let pi: float = 3.14159      # immutable
+    mut counter: int = 0         # mutable
+    counter = counter + 1        # ✅
+    # pi = 3.14                  # ❌ tyc::immutable_assign
+```
+
+```
+error[tyc::immutable_assign]: cannot reassign `pi`, which is bound with `let`
+ ┌─ src/main.ty:5:5
+ │
+2 │     let pi: float = 3.14159
+ │     ----------------------- bound here as `let`
+…
+5 │     pi = 3.14
+ │     ^^ change the original binding to `mut`, or extract a new `let`
+```
+
+**Module-level bindings default to `let`** if you skip the keyword. But a *local* `name = "x"` with no keyword is `tyc::missing_binding_kind`.
+
+**The fix:** reach for `mut` only when you actually rebind. `let` for everything else.
+
+<Aside type="tip">
+  This is *binding* immutability, like Rust's `let` vs `let mut` or TypeScript's `const`. A `let u: User` cannot point at a new object, but the object it points at can still be mutated. For deep immutability, use `class Foo frozen:`.
+</Aside>
+
+## Rule 3 — `T` cannot hold `None`
+
+Plain `T` is non-nullable. Optional values are spelled `T?` (sugar for `T | None`).
+
+```python
+def greet(name: str) -> None: ...
+def find(id: int) -> str?: ...   # str? == str | None
+
+let found: str? = find(1)
+greet(found)                     # ❌ tyc::nullable_use
+
+if found is not None:
+    greet(found)                 # ✅ narrowed to str
+
+guard f = found else: return     # ✅ same effect, prettier
+greet(f)
+```
+
+Narrowing forms the checker understands:
+
+- `if x is None: return` (early return) — narrows `x` to `T` after the `if`.
+- `if x is not None: ...` (positive check) — narrows `x` to `T` inside the block.
+- `isinstance(x, T)` — narrows `x` to `T` inside the block.
+- `guard x = expr else: return` — narrows `x` to the non-null form after the guard.
+
+**The fix:** narrow before use, or change the parameter to `T?` if `None` is a legitimate input.
+
+In the emitted Python, `T?` becomes `T | None` so mypy / pyright / IDEs handle it the way they always have.
+
+## Rule 4 — Methods live in `impl`, not in `class`
+
+`class` declares the shape; `impl ClassName:` attaches methods. Write the methods with an explicit `self` parameter; reference fields as `self.NAME`.
+
+```python
+class User:
+    id: int
+    name: str
+
+impl User:
+    def display(self) -> str:
+        return f"{self.name} (#{self.id})"
+```
+
+Writing `__init__` inside `class` is rejected — the constructor is generated:
+
+```python
+class User:
+    id: int
+
+    def __init__(self, id: int) -> None:    # ❌ tyc::manual_init
+        self.id = id
+```
+
+```
+error[tyc::manual_init]: classes do not declare `__init__`; the constructor is generated
+```
+
+<Aside type="caution">
+  **History note.** Early drafts of the docs suggested implicit `self` and bare-field access (`def display() -> str: return f"{name}"`). That form was never implemented because the resolver can't see the enclosing class's fields at name-resolution time. The explicit `self.NAME` access shown above is the durable form. The bare-identifier sugar may come back later; use explicit `self` for now.
+</Aside>
+
+**The fix:** move methods into `impl ClassName:` blocks. Use `extend ClassName:` for cross-module additions. See [Classes and Models](/Typhon/tour/classes/) for the full story.
+
+## Rule 5 — `Any` only enters through `unsafe:` or `.dty` stubs
+
+Typhon refuses to infer `Any` outside an `unsafe:` region. There is no per-value escape hatch.
+
+```python
+import messy
+
+let data = messy.fetch()         # ❌ tyc::implicit_any
+
+unsafe:
+    let data = messy.fetch()     # ✅ inside the region
+let parsed: dict[str, int] = ... # re-assert at the boundary
+```
+
+`unsafe:` is a **lexical region**, not a per-value annotation. Values inside acquire a hidden `Unsafe[T]` marker that cannot cross out into a concrete-typed context without re-assertion (annotation, narrowing, or cast). The block lowers to `if True:` so scope rules are unchanged.
+
+**The fix, in order of preference:**
+
+1. **Write a [`.dty` stub](/Typhon/interop/dty-stubs/)** for the library if you'll use it a lot. The stub becomes the typed API; downstream code doesn't need `unsafe:`.
+2. **Annotate the value explicitly** at the call site (`let data: dict[str, int] = messy.fetch()`). Tells the checker what to trust.
+3. **Wrap in `unsafe:`** when you genuinely don't know the type — typically exploratory code or one-off scripts.
+
+Long-lived production code should not have `unsafe:` blocks scattered through it. They are a code smell that something deserves a stub.
+
+## A worked example
+
+A tiny program that touches all five rules:
+
+```python
+def find_user(id: int) -> str?:           # Rule 1: return type required
+    if id == 1:
+        return "Alice"
+    return None
+
+class Greeter:                            # Rule 4: class is shape only
+    style: str
+
+impl Greeter:                             # Rule 4: methods in impl
+    def hello(self, name: str) -> str:
+        return f"{self.style}, {name}"
+
+def main() -> None:                       # Rule 1
+    let g: Greeter = Greeter(style="Hi")  # Rule 2: `let` for the binding
+    let found: str? = find_user(1)        # Rule 3: `?` because it may be None
+    if found is None:                     # Rule 3: narrow before use
+        print("anonymous")
+        return
+    print(g.hello(found))                 # narrowed to str
+```
+
+Every line follows one or more rules. Once you see the pattern, you stop fighting the checker.
+
+## Cheat sheet
+
+| Topic | Typhon | Emitted Python |
+|-------|--------|----------------|
+| Local binding | `let x: int = 1` / `mut x: int = 1` | `x: int = 1` |
+| Module binding | `X: int = 1` (implicit `let`) or `mut X: int = 1` | `X: int = 1` |
+| Nullable | `name: str?` | `name: str \| None` |
+| Class | `class User: id: int` | `@dataclass(slots=True) class User: id: int` |
+| Pydantic model | `model ApiUser: id: int` | `class ApiUser(BaseModel): model_config = ConfigDict(extra="forbid"); id: int` |
+| Frozen | `class P frozen: x: float` | `@dataclass(slots=True, frozen=True)` |
+| Methods | `impl User: def display(self) -> str: ...` | merged into the class body |
+| Result type | `Result[T, E]`, `Ok(v)`, `Err(e)` | generated `typhon_runtime.Ok/Err` dataclasses |
+| Error propagation | `let n: int = f()?` | inline `isinstance(_t, Err): return _t; n = _t.value` |
+| Sealed union | `type Shape = Circle \| Rectangle` | `Shape = Circle \| Rectangle` (alias) |
+| Exhaustive match | `match s: case Circle(r): ...` (no `_` needed) | vanilla Python `match` |
+| Parallel awaits | `gather: a = f(); b = g()` | `async with asyncio.TaskGroup()` |
+| Spawn | `go f(x)` | `typhon_runtime.tasks.spawn(...)` |
+| Lazy module | `lazy import np = numpy` | `__TyphonLazy_np_` proxy class |
+| Comptime constant | `comptime let PORT = int(env("PORT", "8080"))` | inlined literal at build time |
+| Pure assertion | `@pure def f(...) -> T:` | nothing emitted unless `@memo` too |
+| Pipe | `a \|> f() \|> g(arg)` | `g(f(a), arg)` |
+| Guard | `guard x = expr else: return ...` | `if expr is None: return ...; x = expr` |
+| Unsafe boundary | `unsafe: let x = mystery()` | `if True:` (scope-preserving) |
+
+## Where next
+
+- [Values and Bindings](/Typhon/tour/values-bindings/) — `let` and `mut` in detail.
+- [Functions](/Typhon/tour/functions/) — signatures, defaults, `*args`, `**kwargs`, lambdas.
+- [Classes and Models](/Typhon/tour/classes/) — `class`, `model`, `frozen`, `impl`, `extend`.
+- [Error Handling](/Typhon/tour/error-handling/) — `Result[T, E]`, `?`, `with`-chains.

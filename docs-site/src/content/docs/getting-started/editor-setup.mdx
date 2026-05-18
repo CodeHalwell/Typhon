@@ -1,0 +1,231 @@
+---
+title: Editor Setup
+description: Wire `tyc lsp` into VS Code, Neovim, Helix, Zed, or any LSP-aware editor.
+sidebar:
+  order: 5
+---
+
+import { Tabs, TabItem, Steps, Aside } from '@astrojs/starlight/components';
+
+`tyc lsp` runs as a Language Server on stdio and speaks the standard LSP protocol. Every LSP-aware editor can use it for diagnostics, hover, go-to-definition, completion, and the "Remove unused import" code action.
+
+The reference VS Code extension lives in `editors/vscode/`. Other editors need a small adapter — examples below.
+
+## VS Code (reference extension)
+
+<Steps>
+
+1. Build the extension:
+
+   ```bash
+   cd Typhon/editors/vscode
+   npm install
+   npm run package           # produces typhon-X.Y.Z.vsix
+   ```
+
+2. Install it:
+
+   ```bash
+   code --install-extension typhon-*.vsix
+   ```
+
+3. Open any `.ty` file. You should see:
+
+   - Syntax highlighting (`let`, `mut`, `interface`, `model`, etc. are highlighted).
+   - Diagnostics on save (and on type, with a brief debounce).
+   - Hover for binding kind + mutability.
+   - Go-to-definition.
+   - Completion (visible bindings, Typhon keywords, common Python builtins).
+   - "Remove unused import" quick-fix on `tyc::unused_import` warnings.
+
+</Steps>
+
+### Extension settings
+
+Open VS Code settings (`Cmd/Ctrl+,`) and search "Typhon":
+
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `typhon.lsp.path` | `tyc` | Path to the `tyc` binary. Set if `tyc` is not on the editor's PATH. |
+| `typhon.lsp.trace.server` | `off` | LSP request/response trace. `verbose` is useful for debugging. |
+| `typhon.format.onSave` | `false` | Run `tyc fmt` on save. |
+
+### Troubleshooting
+
+- **LSP doesn't start.** Open `View → Output → Typhon`. The extension logs the `tyc lsp` invocation; if `tyc` isn't on the PATH the *editor process* sees, set `typhon.lsp.path` to an absolute path.
+- **Diagnostics seem stale.** `tyc lsp` republishes on `did_change`. If you see staleness, save the file (`Cmd/Ctrl+S`) and check the Output panel for errors.
+
+## Neovim
+
+Two routes: built-in `vim.lsp.start_client` (Neovim 0.11+) or the `nvim-lspconfig` plugin.
+
+<Tabs>
+  <TabItem label="nvim-lspconfig (recommended)">
+
+Add a custom server entry to your Neovim config. Example with `lazy.nvim`:
+
+```lua
+require("lspconfig.configs").typhon = {
+  default_config = {
+    cmd = { "tyc", "lsp" },
+    filetypes = { "typhon" },
+    root_dir = require("lspconfig.util").root_pattern("typhon.toml"),
+    settings = {},
+  },
+}
+
+require("lspconfig").typhon.setup({})
+
+vim.filetype.add({ extension = { ty = "typhon", dty = "typhon" } })
+```
+
+  </TabItem>
+  <TabItem label="Built-in LSP">
+
+```lua
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = "typhon",
+  callback = function()
+    vim.lsp.start({
+      name = "tyc",
+      cmd = { "tyc", "lsp" },
+      root_dir = vim.fs.dirname(vim.fs.find({ "typhon.toml" }, { upward = true })[1]),
+    })
+  end,
+})
+
+vim.filetype.add({ extension = { ty = "typhon", dty = "typhon" } })
+```
+
+  </TabItem>
+</Tabs>
+
+### Syntax highlighting
+
+Treesitter doesn't yet ship a Typhon grammar. As a workable approximation, use the Python grammar (the syntax is close enough):
+
+```lua
+vim.treesitter.language.register("python", "typhon")
+```
+
+Or write minimal Vim regex highlighting in `after/syntax/typhon.vim`. A full Treesitter grammar is on the roadmap.
+
+## Helix
+
+Add to `~/.config/helix/languages.toml`:
+
+```toml
+[[language]]
+name = "typhon"
+scope = "source.typhon"
+file-types = ["ty", "dty"]
+roots = ["typhon.toml"]
+language-servers = ["tyc"]
+indent = { tab-width = 4, unit = "    " }
+comment-token = "#"
+
+[language-server.tyc]
+command = "tyc"
+args = ["lsp"]
+```
+
+Use the Python grammar for highlighting until a dedicated grammar ships:
+
+```toml
+[[language]]
+name = "typhon"
+# ... fields above ...
+grammar = "python"
+```
+
+## Zed
+
+Zed picks up LSP servers via extensions. A community extension can wrap `tyc lsp`; the minimal `extension.toml`:
+
+```toml
+id = "typhon"
+name = "Typhon"
+version = "0.1.0"
+schema_version = 1
+authors = ["You <you@example.com>"]
+description = "Typhon language support"
+
+[language_servers.typhon]
+name = "Typhon"
+language = "Typhon"
+```
+
+…plus a tiny Rust adapter that returns `["tyc", "lsp"]` for the language-server command. See [Zed's extension docs](https://zed.dev/docs/extensions/languages).
+
+## Emacs
+
+Using `lsp-mode`:
+
+```elisp
+(require 'lsp-mode)
+
+(add-to-list 'auto-mode-alist '("\\.ty\\'" . python-mode))
+(add-to-list 'auto-mode-alist '("\\.dty\\'" . python-mode))
+
+(with-eval-after-load 'lsp-mode
+  (add-to-list 'lsp-language-id-configuration '(typhon-mode . "typhon"))
+  (lsp-register-client
+   (make-lsp-client
+    :new-connection (lsp-stdio-connection '("tyc" "lsp"))
+    :activation-fn (lsp-activate-on "typhon")
+    :server-id 'tyc-lsp)))
+
+(add-hook 'python-mode-hook 'lsp)
+```
+
+Or with `eglot`:
+
+```elisp
+(with-eval-after-load 'eglot
+  (add-to-list 'eglot-server-programs '(python-mode . ("tyc" "lsp"))))
+```
+
+## Sublime Text
+
+Install [LSP](https://lsp.sublimetext.io/) via Package Control. Add to `Preferences → Package Settings → LSP → Settings`:
+
+```json
+{
+  "clients": {
+    "typhon": {
+      "enabled": true,
+      "command": ["tyc", "lsp"],
+      "selector": "source.python",
+      "schemes": ["file"]
+    }
+  },
+  "auto_show_diagnostics_panel": "always"
+}
+```
+
+Then map `.ty` and `.dty` to Python syntax in `Settings → Syntax → Open All with Current Extension As`.
+
+## What the LSP supports today
+
+| Feature | Status |
+|---------|--------|
+| Diagnostics on `did_open` / `did_change` | ✅ |
+| Hover (binding kind + mutability) | ✅ |
+| Go-to-definition (in-file + cross-file via Salsa `resolved_module` query) | ✅ |
+| Completion (visible bindings + Typhon keywords + common builtins) | ✅ |
+| "Remove unused import" code action | ✅ |
+| Document symbols | ⏳ planned |
+| Workspace symbols | ⏳ planned |
+| Find references | ⏳ planned |
+| Rename symbol | ⏳ planned |
+| Inlay hints | ⏳ planned |
+| Semantic tokens | ⏳ planned |
+| Format on save (via `tyc fmt`) | ✅ (via extension setting) |
+
+Track the LSP-specific items in the [roadmap](/Typhon/project/roadmap/).
+
+## Where next
+
+- [`tyc lsp`](/Typhon/cli/lsp/) — what the language server does, under the hood.
+- [Reading Diagnostics](/Typhon/diagnostics/reading/) — how Typhon's `miette`-rendered errors are structured.
+- [`tyc fmt`](/Typhon/cli/fmt/) — the formatter, if you want pre-commit hook integration.

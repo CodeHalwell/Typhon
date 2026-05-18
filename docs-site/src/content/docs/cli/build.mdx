@@ -1,0 +1,90 @@
+---
+title: tyc build
+description: Full pipeline — parse, check, analyse, desugar, emit, format.
+sidebar:
+  order: 4
+---
+
+```
+tyc build [--out DIR] [--no-format]
+```
+
+Runs the full compilation pipeline and writes the emitted Python to the output directory (default `build/`, configurable via `[project] out`).
+
+## Examples
+
+```bash
+tyc build                       # full project → build/
+tyc build --out dist/           # → dist/ instead
+tyc build --no-format           # skip the ruff format post-process
+```
+
+## What it produces
+
+For a project with `src/main.ty` and `src/users.ty`:
+
+```
+build/
+├── main.py
+├── main.py.map               # source map v2
+├── users.py
+├── users.py.map
+└── typhon_runtime/           # only if Result / go / lazy let are used
+    ├── __init__.py
+    ├── result.py
+    ├── tasks.py
+    └── lazy.py
+```
+
+And, if you have `.dty` stubs:
+
+```
+build/
+├── ... (above)
+└── *.pyi                     # PEP 561 stubs alongside emitted .py
+```
+
+## The pipeline stages
+
+1. **Lex + parse** (`tyc-syntax`).
+2. **Resolve** (`tyc-resolve`) — symbol tables, scopes, `let`/`mut` classification.
+3. **Type-check** (`tyc-types`) — narrowing, signature compatibility, exhaustiveness.
+4. **Analyse** (`tyc-analyse`) — purity, async, comptime, auto-gather.
+5. **Desugar** (`tyc-desugar`) — merge `impl` blocks, expand `?`, lower `gather:` / `go` / `lazy`, evaluate `comptime`.
+6. **Emit** (`tyc-emit`) — hand-written printer produces `.py` + `.py.map`.
+7. **Format** (`tyc-format`) — post-process through `ruff format` when `[emit] format = true`.
+
+Each stage is a Salsa query; on incremental rebuilds, only invalidated outputs are recomputed.
+
+## Flags
+
+| Flag | Effect |
+|------|--------|
+| `--out DIR` | Override the `[project] out` directory. |
+| `--no-format` | Skip the `ruff format` post-process. |
+| `--watch` | Re-build on file changes. |
+| `--quiet` | Suppress informational logs. |
+
+## When the build fails
+
+If any error-severity diagnostic fires during check or analyse, the build does not produce output. The diagnostics are emitted to stderr and the process exits 2.
+
+You can run `tyc check` first to fail-fast in CI without producing partial artefacts.
+
+## What's *not* in `build/`
+
+- **Python bytecode (`*.pyc`, `__pycache__/`)** — created by Python at runtime, not by `tyc build`.
+- **Cargo artefacts (`target/`)** — those are from building `tyc` itself, kept in the `tyc/` subdirectory.
+- **Editor or test caches** — `tyc` doesn't manage those.
+
+Safe to delete `build/` at any time; it regenerates.
+
+## Incremental rebuilds
+
+Salsa caches every stage's output. If you change one function in one file, the rebuild typically touches only that file's emit, not the whole project. The cost is roughly proportional to the change size.
+
+## Where next
+
+- [`tyc run`](/Typhon/cli/run/) — build then exec in one step.
+- [`tyc check`](/Typhon/cli/check/) — type-check without emit.
+- [Lowering Overview](/Typhon/lowering/overview/) — what each construct compiles to.

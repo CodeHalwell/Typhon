@@ -1,0 +1,110 @@
+---
+title: Pydantic Boundary Models
+description: When and how to use `model` for data crossing trust boundaries.
+sidebar:
+  order: 6
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+`model Foo:` emits a Pydantic `BaseModel(extra="forbid")`. Use it for data crossing a trust boundary — HTTP requests, JSON files, env-derived structures, message-queue payloads — where you want runtime validation in addition to compile-time types.
+
+## A worked example
+
+```python
+model UserInput:
+    email: str
+    name: str = "anon"
+    age: int? = None
+
+# Emitted Python
+class UserInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    email: str
+    name: str = "anon"
+    age: int | None = None
+```
+
+## What you get
+
+- **Compile-time type-checking** — Typhon's static rules apply.
+- **Runtime validation** — Pydantic checks types and rejects on construction.
+- **`extra="forbid"`** — unexpected fields raise `ValidationError`, not silently drop.
+- **`@dataclass`-style construction** — `UserInput(email="a@b")`.
+- **`.model_dump()` / `.model_validate()`** — for JSON serialisation.
+
+## When to use `model` vs `class`
+
+| `class` (dataclass) | `model` (Pydantic) |
+|---------------------|---------------------|
+| Internal types | Data crossing trust boundaries |
+| Maximum performance | Runtime validation |
+| No extra constraints | `Field(min_length=1, ...)` validators |
+
+Mix freely in one project.
+
+## With Pydantic field validators
+
+```python
+from pydantic import Field
+
+model UserInput:
+    email: str = Field(..., pattern=r"^[^@]+@[^@]+$")
+    age: int = Field(..., ge=0, le=150)
+```
+
+`Field(...)` is Pydantic — the checker treats it as Pydantic-equivalent and the runtime validator enforces. Typhon does not introduce its own validator surface; Pydantic's is mature.
+
+## In FastAPI / similar frameworks
+
+```python
+from fastapi import FastAPI
+
+app = FastAPI()
+
+model CreateUser:
+    email: str
+    name: str
+
+model UserResponse:
+    id: int
+    email: str
+    name: str
+
+@app.post("/users", response_model=UserResponse)
+async def create_user(input: CreateUser) -> UserResponse:
+    ...
+```
+
+`model` plays exactly as Pydantic does — FastAPI sees the BaseModel and binds it to the request body.
+
+## Why `extra="forbid"` is the default
+
+Pydantic's stock setting is `extra="ignore"`, which **silently drops unexpected fields**. Typhon's safety pitch forbids quiet failures: if a client sends `{"email": "a@b", "extra": "boom"}`, you want a 422 response, not a silent drop.
+
+If you genuinely need permissive mode, the configurable `[emit] model-extra` knob is roadmapped. For now, override per-class by hand if you need:
+
+```python
+model OldApi:
+    # ...
+
+# Override the Pydantic config by adding model_config explicitly (rare):
+# (not supported via Typhon syntax today; edit the emitted .py or wait for the config knob)
+```
+
+## Frozen models
+
+```python
+model Coordinate frozen:
+    x: float
+    y: float
+```
+
+Emits `model_config = ConfigDict(extra="forbid", frozen=True)`. Pydantic's `frozen=True` blocks field reassignment (faux immutability — nested mutables can still be mutated).
+
+## Where next
+
+- [Classes and Models (tour)](/Typhon/tour/classes/) — `class` vs `model`.
+- [`class`, `model`, `class!` reference](/Typhon/reference/classes/) — declaration forms.
+- [HTTP API recipe](/Typhon/recipes/http-api/) — worked Pydantic + FastAPI pattern.

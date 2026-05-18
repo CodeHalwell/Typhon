@@ -1,0 +1,94 @@
+---
+title: guard
+description: Early-return-with-narrowing sugar.
+sidebar:
+  order: 10
+---
+
+`guard` binds a value and short-circuits the falsy / `None` case to the `else:` block. After the `guard`, the bound name is narrowed to its non-null form.
+
+## Syntax
+
+```
+guard NAME = EXPR "else" ":" suite
+```
+
+```python
+def shipping(weight: float?) -> float:
+    guard w = weight else:
+        return 0.0
+    return w * 1.25
+```
+
+`w` is bound to the narrowed `float`. The `else:` block must `return`, `raise`, `continue`, `break`, or otherwise leave the enclosing scope.
+
+## How it desugars
+
+```python
+# Typhon
+guard w = weight else:
+    return 0.0
+return w * 1.25
+
+# Emitted Python
+if weight is None:
+    return 0.0
+w: float = weight
+return w * 1.25
+```
+
+The narrowed binding (`w`) sticks for the rest of the enclosing scope.
+
+## Chain naturally
+
+```python
+guard t = token else: return "anonymous"
+guard u = user_id else: return "anonymous"
+return f"session({t}, {u})"
+```
+
+Each `guard` narrows independently. The cumulative effect reads as a series of "check or bail" gates.
+
+## Rules
+
+1. **The `else:` block must exit the enclosing scope.** Return, raise, `continue`, `break`. If it can fall through, the bound name's narrowing would be invalid.
+2. **The right-hand side must be nullable or "falsy-narrowable".** Typically `T?`, but the checker also accepts truthy/falsy narrowing on `str`, `list`, etc. — the same rules as `if x:` narrowing.
+3. **The bound name is `let` (immutable).** Reassigning it inside the surviving scope is `tyc::immutable_assign`.
+
+## What `guard` is *not*
+
+- **Not Swift's `guard`.** Typhon's form is purely sugar for an early-return pattern; there is no associated lifetime extension or special compiler treatment.
+- **Not a context manager.** Unlike `with`, `guard` does not call `__enter__` / `__exit__`.
+
+## Common patterns
+
+### Optional input → default
+
+```python
+def shipping(weight: float?) -> float:
+    guard w = weight else: return 0.0
+    return w * 1.25
+```
+
+### Optional input → error
+
+```python
+def find_user(id: int?) -> Result[User, str]:
+    guard i = id else: return Err("missing id")
+    return db.find_user(i)
+```
+
+### Multiple narrowings
+
+```python
+def report(token: str?, user_id: int?) -> str:
+    guard t = token else: return "anon"
+    guard u = user_id else: return "anon"
+    return f"({t}, {u})"
+```
+
+## Where next
+
+- [Flow Narrowing](/Typhon/types/narrowing/) — every narrowing form.
+- [Nullable Types](/Typhon/types/nullable/) — `T?` reference.
+- [Control Flow (tour)](/Typhon/tour/control-flow/) — teaching page.

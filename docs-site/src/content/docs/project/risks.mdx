@@ -1,0 +1,46 @@
+---
+title: Risks and Mitigations
+description: Known hazards and the mitigations we have in place.
+sidebar:
+  order: 2
+---
+
+The risk in Typhon is not technological — every stage has a mature, MIT-licensed Rust implementation to depend on, vendor, or learn from. The risk is scope. This page lists the hazards we've identified and the mitigations.
+
+| Risk | Severity | Mitigation |
+|------|----------|------------|
+| Structural subtyping is months of work | High | Deferred to Phase 3; Phase 0–2 ships without interfaces. Nominal types alone are useful. |
+| Ruff parser API drifts under us | Medium | Pin to a SHA; review upstream monthly; keep diff small. |
+| Salsa breaking changes between minor versions | Medium | Every Salsa call sits behind a one-function-wide wrapper module. |
+| Free-threaded Python is a moving target | Medium | Default off until 3.14 ships as default. Sequential fallback via `sys._is_gil_enabled()`. |
+| Auto-parallelisation introduces races | High | Ship only the explicit `gather:` keyword in v1; inference is opt-in and conservative. |
+| Pydantic coupling alienates users | Medium | Default emit is `@dataclass`, not `BaseModel`. Pydantic is opt-in via `model`. |
+| Pre-emptive runtime helpers force a Typhon package on users | Medium | Emit `typhon_runtime/` as generated source the build owns; no PyPI package required. |
+| Solo-developer burnout on a multi-year project | High | Cut scope aggressively. The minimum-viable Typhon is publishable. |
+| Generics syntax choice locks parser fork shape | Resolved | PEP 695 brackets — vendored parser accepts them natively. |
+| `go` tasks GC'd mid-flight (weak refs in event loop) | Medium | Lower `go` through `typhon_runtime.tasks.spawn` with a strong-ref registry. Never bare `asyncio.create_task`. |
+| `asyncio.gather` exception semantics surprise users | Medium | `gather:` defaults to `TaskGroup` (cancel-on-failure). Reserve `gather(strategy="best-effort")` for `return_exceptions=True`. |
+| Pydantic's default `extra='ignore'` silently drops input | Medium | `model` emission always injects `extra='forbid'`. |
+| `.pyi` interop drift from `.dty` source | Medium | `tyc check --stubs` runs an AST diff; `tyc stubtest` runs runtime introspection. |
+| Auto-memoisation extends object lifetimes invisibly | Medium | Never silently insert `@functools.cache`. Requires `@memo`, `@pure(memo=True)`, or `[strictness] auto-memoise = true`, plus all six purity conditions. |
+| Runtime `isinstance(x, MyInterface)` gives false confidence | Low | `@runtime_checkable` only checks attribute presence. Typhon refuses to compile interface `isinstance` unless explicitly opted in. |
+| Lazy `from x import y` defeats deferral (PEP 690) | Low | Rejected at parse time. Use `lazy import x` plus `x.y` instead. |
+| comptime sandbox lets users do dangerous things | Low | Sandbox is intentionally tiny; no I/O, time, random, imports. Auditable on one screen. |
+
+## Two dominant risks
+
+The two hazards that genuinely worry us:
+
+1. **Structural subtyping correctness.** The recursive-type cases and bounded type vars are the largest single source of latent bugs. Mitigated by: extensive tests, conservative implementation, deferring full variance to Phase 4+, the `tyc ty` second-opinion option.
+2. **Parser sync with upstream Python.** Every CPython release that adds syntax (PEP 695, structural patterns, etc.) we have to track. Mitigated by: vendoring Ruff (which already tracks upstream), keeping the diff small, monthly upstream review.
+
+## What we *don't* worry about
+
+- **Performance.** The architecture is the same as `rust-analyzer`, `ty`, and `oxc` — all of which are fast.
+- **Runtime correctness.** The lowering produces standard Python; CPython does the work.
+- **Adoption.** This is a personal-project / community-of-interest tool. We are not trying to be Mojo.
+
+## Where next
+
+- [Roadmap](/Typhon/project/roadmap/) — phased delivery plan.
+- [Prior Art](/Typhon/project/prior-art/) — what we learned from.

@@ -1,0 +1,101 @@
+---
+title: Type System Overview
+description: The shape of Typhon's type checker — what it knows, what it enforces, and where it differs from Python's typing spec.
+sidebar:
+  order: 1
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Typhon's type system is intentionally close to Python's, with a small set of stricter rules and a few additions. This page is the map of every type-shape the checker understands; subsequent pages drill into each.
+
+## The shapes
+
+| Shape | Example | Page |
+|-------|---------|------|
+| Primitives | `int`, `float`, `bool`, `str`, `bytes`, `None` | [Primitives](/Typhon/types/primitives/) |
+| Collections | `list[T]`, `dict[K, V]`, `set[T]`, `tuple[A, B, ...]` | [Collections](/Typhon/types/collections/) |
+| Nullable | `T?` (sugar for `T \| None`) | [Nullable Types](/Typhon/types/nullable/) |
+| Functions / callables | `Callable[[A, B], R]` | [Callables (Functions tour)](/Typhon/tour/functions/) |
+| Classes | `class User:` → `@dataclass(slots=True)` | [Classes and Models tour](/Typhon/tour/classes/) |
+| Pydantic models | `model ApiUser:` → `BaseModel(extra="forbid")` | [Pydantic Boundary Models](/Typhon/interop/pydantic/) |
+| Sealed unions | `type Shape = Circle \| Rectangle` | [Sealed Unions](/Typhon/types/sealed-unions/) |
+| Interfaces (Protocols) | `interface Drawable:` → `class Drawable(Protocol):` | [Interfaces](/Typhon/types/interfaces/) |
+| Generics | `def first[T](xs: list[T]) -> T?` | [Generics (PEP 695)](/Typhon/types/generics/) |
+| Type aliases | `type Vec[T] = list[T]` | [Type Aliases](/Typhon/types/aliases/) |
+| Results | `Result[T, E]`, `Ok`, `Err` | [Result reference](/Typhon/reference/result/) |
+| Lazy | `lazy[list[T]]` (return type) | [`lazy` reference](/Typhon/reference/lazy/) |
+| Unsafe | `unsafe:` block introduces hidden `Unsafe[T]` | [The Unsafe Boundary](/Typhon/types/unsafe/) |
+
+Top type: `object`. Bottom type: not surfaced (an unreachable branch). `Any` exists but is reachable only through `unsafe:` or `.dty` stubs — it cannot be inferred outside those regions.
+
+## What the checker enforces
+
+Beyond standard typing-spec assignment compatibility, Typhon enforces these extra rules:
+
+1. **No implicit `Any`.** Untyped values are a hard error outside `unsafe:`.
+2. **Non-nullable defaults.** `T` cannot hold `None`; use `T?`.
+3. **Flow narrowing.** `is None`, `is not None`, `isinstance`, `guard`, early return — all narrow.
+4. **`let` / `mut` enforcement.** Reassigning a `let` is `tyc::immutable_assign`.
+5. **Exhaustive `match` on sealed unions.** Missing variants → `tyc::non_exhaustive_match`.
+6. **`?` placement.** Only inside a function returning a compatible `Result`.
+7. **`@pure` six conditions.** Synchronous, hashable args, no I/O, no entropy/clocks, no mutable module state, no exceptions.
+8. **`async`/`await` correctness.** Missing `await` in a sync context is a hard error; redundant `async` is a warning.
+9. **Class body restrictions.** No `__init__`, no body methods (use `impl` instead). `class!` is the escape hatch for framework bases.
+10. **Interface `isinstance` rejection.** Bare `isinstance(x, MyInterface)` is unsafe; rejected unless explicitly opted in.
+
+The full diagnostic catalog enumerates each rule with examples and fixes — see [Reading Diagnostics](/Typhon/diagnostics/reading/).
+
+## What the checker *doesn't* enforce
+
+For honesty:
+
+- **Deep value immutability.** `let` / `mut` are binding-only. Use `class Foo frozen:` for shallow field-reassignment immunity; use `tuple` / `frozenset` for deep structure.
+- **Full typing-spec corner cases.** Higher-kinded types, complete variance, dependent / refinement types — out of scope for v1. [`tyc ty`](/Typhon/cli/ty/) defers to Astral's checker for those.
+- **Side-effect freedom outside `@pure`.** Functions that aren't `@pure` may freely touch the world; the checker doesn't track effects.
+- **Runtime invariants.** Pydantic validators do, but the type system itself does not enforce e.g. "this `int` is between 1 and 100" — see [Pydantic Boundary Models](/Typhon/interop/pydantic/) for runtime validators.
+- **Concurrency races on `mut`.** The parallelisation passes refuse to touch any binding captured as `mut` by a spawned task without explicit synchronisation, but the checker doesn't prove freedom from races in user code that you wrote yourself with threading primitives.
+
+## Type system rules of thumb
+
+When in doubt about which shape to reach for:
+
+| You want | Use |
+|---|---|
+| A small value type that lives inside the app | `class Foo:` |
+| Data crossing a trust boundary (HTTP, files, env, queues) | `model Foo:` |
+| A subclass of a framework base (`nn.Module`, `Enum`, `TestCase`) | `class! Foo(Base):` |
+| A closed sum (every variant known at design time) | `type X = A \| B \| C` + sealed match |
+| A behaviour shared across unrelated types | `interface Foo:` + structural typing |
+| To say "this may be `None`" | `T?`, not `Optional[T]` |
+| To say "this function may fail" | `Result[T, E]`, not `raise` |
+| One function over many types | `def f[T](...)` (PEP 695 generic) |
+| A typed alias for readability | `type Vec[T] = list[T]` |
+| Build-time-known constants | `comptime let` |
+| A typed wrapper around an untyped library | `.dty` stub |
+
+Use `unsafe:` only when the surface area is genuinely untypeable.
+
+## Hybrid checking strategy
+
+Internally the checker is hybrid:
+
+1. **Typhon-specific checks on the Typhon AST.** Non-nullability, sealed-union exhaustiveness, `Result`/`?` propagation, `let`/`mut`, no-implicit-`Any`, extension-method resolution.
+2. **Desugar to Python AST with rich annotations preserved.**
+3. **Optionally run `ty` over the desugared AST** ([`tyc ty`](/Typhon/cli/ty/)) for standard typing-spec coverage.
+
+This split lets Typhon enforce its strict rules without re-implementing the entire Python typing spec, and lets `ty`'s mature engine handle the rest.
+
+## Where to read next
+
+Drill into a specific shape:
+
+- [Primitives](/Typhon/types/primitives/)
+- [Collections](/Typhon/types/collections/)
+- [Nullable Types](/Typhon/types/nullable/)
+- [Flow Narrowing](/Typhon/types/narrowing/)
+- [Generics (PEP 695)](/Typhon/types/generics/)
+- [Sealed Unions](/Typhon/types/sealed-unions/)
+- [Interfaces (Protocols)](/Typhon/types/interfaces/)
+- [The Unsafe Boundary](/Typhon/types/unsafe/)
+- [Type Aliases](/Typhon/types/aliases/)

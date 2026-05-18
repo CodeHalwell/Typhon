@@ -1,0 +1,79 @@
+---
+title: tyc lsp
+description: Language Server on stdio — diagnostics, hover, go-to-definition, completion, code actions.
+sidebar:
+  order: 7
+---
+
+```
+tyc lsp
+```
+
+Runs Typhon as an LSP server, speaking the standard LSP protocol over stdio. Used by editors (VS Code, Neovim, Helix, Zed, Emacs, Sublime).
+
+## Examples
+
+```bash
+tyc lsp     # speaks LSP on stdio; typically invoked by an editor
+```
+
+You usually do not run this by hand — the editor extension does. See [Editor Setup](/Typhon/getting-started/editor-setup/).
+
+## Capabilities
+
+| Capability | Status |
+|------------|--------|
+| `textDocument/publishDiagnostics` (on `didOpen`, `didChange`) | ✅ |
+| `textDocument/hover` (binding kind + mutability) | ✅ |
+| `textDocument/definition` (in-file + cross-file via `resolved_module`) | ✅ |
+| `textDocument/completion` (bindings + keywords + builtins) | ✅ |
+| `textDocument/codeAction` ("Remove unused import") | ✅ |
+| `textDocument/formatting` (via `tyc fmt`) | ✅ |
+| `textDocument/documentSymbol` | ⏳ planned |
+| `workspace/symbol` | ⏳ planned |
+| `textDocument/references` | ⏳ planned |
+| `textDocument/rename` | ⏳ planned |
+| `textDocument/inlayHint` | ⏳ planned |
+| `textDocument/semanticTokens` | ⏳ planned |
+
+## How it works
+
+`tyc lsp` shares the Salsa database with `tyc check`. On `didChange`:
+
+1. Update the in-memory source for the changed file.
+2. Invalidate Salsa nodes downstream of the file.
+3. Re-run `parse` / `resolve` / `check` queries.
+4. Publish diagnostics for affected files.
+
+Median latency for a single-file edit in a 100-module project is well under 100ms.
+
+## Trace logs
+
+To debug LSP traffic, set the trace level in your editor. For VS Code, settings:
+
+```json
+{
+  "typhon.lsp.trace.server": "verbose"
+}
+```
+
+Output appears in `View → Output → Typhon`. Other editors have similar settings.
+
+## Underlying transport
+
+Standard JSON-RPC over stdio. The implementation uses `tower-lsp-server` (the active fork of `tower-lsp` that tracks `lsp-types` 0.97+).
+
+## Configuration
+
+The LSP picks up project settings from `typhon.toml` automatically (it walks up from the open file). `[strictness]` settings, `[python] target`, and `[emit]` all flow through.
+
+## Common issues
+
+- **LSP doesn't start.** Check that `tyc` is on the PATH the *editor process* sees. Set `typhon.lsp.path` to an absolute path if needed.
+- **Stale diagnostics.** Save the file (or close-and-reopen). If still stale, check the trace logs.
+- **Slow completion.** Completion latency is bounded by the Salsa check time for the active file. Profile with `--verbose` to find slow queries.
+
+## Where next
+
+- [Editor Setup](/Typhon/getting-started/editor-setup/) — wiring into VS Code, Neovim, Helix, Zed.
+- [Reading Diagnostics](/Typhon/diagnostics/reading/) — how the published diagnostics map to fixes.

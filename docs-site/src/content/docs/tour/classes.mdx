@@ -1,0 +1,396 @@
+---
+title: Classes and Models
+description: class, model, class!, impl, extend, frozen, and inheritance — the full data-modelling story.
+sidebar:
+  order: 5
+---
+
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
+
+Typhon's `class` is deliberately minimal: no `__init__`, no explicit `self`-in-body. The compiler emits a `@dataclass(slots=True)` by default, a Pydantic `BaseModel` if you use the `model` keyword, or a bare class with synthesised `__init__` if you use `class!` for framework bases. Methods live in `impl` blocks, Rust-style.
+
+## A first class
+
+```python
+class User:
+    id: int
+    name: str = "anon"
+    email: str?
+```
+
+Three fields. Two have explicit defaults (or implicit ones — `email: str?` defaults to `None`). One is required (`id`).
+
+The constructor is generated for you:
+
+```python
+let u: User = User(id=1, name="Alice", email="alice@example.com")
+let anon: User = User(id=2)               # name defaults to "anon", email to None
+```
+
+### What it emits
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    class User:
+        id: int
+        name: str = "anon"
+        email: str?
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    from dataclasses import dataclass
+
+    @dataclass(slots=True)
+    class User:
+        id: int
+        name: str = "anon"
+        email: str | None = None
+    ```
+  </TabItem>
+</Tabs>
+
+`slots=True` is the default — instances don't carry a per-object `__dict__`, which saves memory and catches typos (`u.emial = "x"` is an `AttributeError`).
+
+## Adding methods with `impl`
+
+Methods live in a separate `impl` block. Take an explicit `self` parameter and access fields as `self.NAME`:
+
+```python
+class User:
+    id: int
+    name: str
+    email: str?
+
+impl User:
+    def display(self) -> str:
+        return f"{self.name} <{self.email}>" if self.email is not None else self.name
+
+    def is_admin(self) -> bool:
+        return self.id == 0
+```
+
+Calls look normal:
+
+```python
+let u: User = User(id=1, name="Alice", email="alice@example.com")
+print(u.display())            # Alice <alice@example.com>
+print(u.is_admin())           # False
+```
+
+The desugarer **merges the `impl` block into the class**:
+
+```python
+# Emitted
+@dataclass(slots=True)
+class User:
+    id: int
+    name: str
+    email: str | None = None
+
+    def display(self) -> str:
+        return f"{self.name} <{self.email}>" if self.email is not None else self.name
+
+    def is_admin(self) -> bool:
+        return self.id == 0
+```
+
+You can split `impl` blocks across files (e.g. keep `User` in `models.ty` and add domain methods from `auth.ty`). The desugarer collects them all.
+
+### Why `impl` instead of methods-in-class?
+
+Two reasons:
+
+1. **Data and behaviour are separable.** The `class` shows the shape; `impl` blocks show what you can *do* with it. New methods can be added without touching the data definition.
+2. **Cross-file extensions.** `impl ClassName:` in another file adds methods to the same class — invaluable when domain logic and data definitions live in different modules.
+
+<Aside type="caution">
+  **History note.** Earlier drafts described an implicit-`self` form (`def display() -> str: return f"{name} (#{id})"`). That form was never implemented — the resolver can't see the enclosing class's fields at name-resolution time, so bare `name` reads as "unknown name". Use the explicit `self.NAME` syntax shown above.
+</Aside>
+
+## Mutability of fields
+
+Fields are mutable by default; the `frozen` modifier on the class disables field reassignment:
+
+```python
+class Point:
+    x: float
+    y: float
+
+let p: Point = Point(x=1.0, y=2.0)
+p.x = 5.0    # ✅ allowed
+
+class FrozenPoint frozen:
+    x: float
+    y: float
+
+let q: FrozenPoint = FrozenPoint(x=1.0, y=2.0)
+q.x = 5.0    # ❌ tyc::frozen_assign at compile time; FrozenInstanceError at runtime
+```
+
+<Aside type="caution">
+  Dataclass `frozen=True` only stops *field reassignment*. If a field is a mutable container (`list`, `dict`), the container's contents can still be mutated. For deeper guarantees, use immutable containers (`tuple`, `frozenset`) inside the class.
+</Aside>
+
+## `model` — Pydantic emission
+
+When you need runtime validation — typical for API boundaries — use `model`:
+
+```python
+model ApiUser:
+    id: int
+    email: str
+    name: str = "anon"
+```
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    model ApiUser:
+        id: int
+        email: str
+        name: str = "anon"
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    from pydantic import BaseModel, ConfigDict
+
+    class ApiUser(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
+        id: int
+        email: str
+        name: str = "anon"
+    ```
+  </TabItem>
+</Tabs>
+
+Two things to notice:
+
+- **`extra="forbid"`** is the default. Pydantic's stock setting is `"ignore"`, which silently drops unknown fields — exactly the kind of quiet failure Typhon exists to prevent.
+- **Pydantic validates at construction time**, not at compile time. `ApiUser(id="oops", email="a@b")` raises `ValidationError` at runtime. The type checker catches the same thing at compile time, but `model` adds a second line of defence for data crossing trust boundaries (HTTP requests, file inputs).
+
+### When to use `model` vs `class`
+
+| Use `class` (dataclass) | Use `model` (Pydantic) |
+|-------------------------|-------------------------|
+| Internal types, fully under your control | Data from outside (HTTP, JSON files, env, queues) |
+| You want maximum performance | You want runtime validation |
+| You don't need extra constraints | You need `Field(min_length=1, ...)` style validators |
+
+You can mix both freely in one project.
+
+## `class!` — the escape hatch for framework bases
+
+Some classes can't be expressed as dataclasses: `torch.nn.Module`, `enum.Enum`, `typing.NamedTuple`, `unittest.TestCase`, Django models, SQLAlchemy declarative bases — anything whose base class needs a non-trivial `__init__` to run *before* fields are assigned. For those, use `class!`:
+
+```python
+import torch.nn as nn
+
+class! MyModel(nn.Module):
+    layer: nn.Linear
+    dropout: float
+
+    def forward(self, x):
+        return self.layer(x)
+```
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    class! MyModel(nn.Module):
+        layer: nn.Linear
+        dropout: float
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    class MyModel(nn.Module):
+        layer: nn.Linear
+        dropout: float
+
+        def __init__(self, layer: nn.Linear, dropout: float) -> None:
+            super().__init__()
+            self.layer = layer
+            self.dropout = dropout
+    ```
+  </TabItem>
+</Tabs>
+
+What `class!` changes vs a plain `class`:
+
+- **No `@dataclass` decorator.** The class is emitted verbatim with whatever bases it declares.
+- **`__init__` is auto-synthesised** when the body declares no `def __init__` and at least one base is present. The synthesised constructor calls `super().__init__()` and then assigns every annotated field through `self`, in source order.
+- **A hand-written `__init__` is preserved verbatim.** Use this when the base class needs configuration arguments that aren't 1:1 with your declared fields.
+
+See [Class Escape Hatches](/Typhon/interop/class-escape/) for the framework-by-framework patterns.
+
+## `extend` — adding methods to existing classes
+
+`extend` is `impl`'s twin for cases where the class is declared elsewhere:
+
+```python
+# domain/user.ty
+class User:
+    id: int
+    name: str
+
+# analytics/user_metrics.ty
+extend User:
+    def tracking_id(self) -> str:
+        return f"user-{self.id:08d}"
+```
+
+The merge happens at desugar; downstream callers see a single class with both sets of methods.
+
+### Extending built-ins
+
+`extend BUILTIN:` (`str`, `list`, `int`, `dict`, …) extracts each method to a module-level free function and rewrites call sites when the receiver has a matching static annotation:
+
+```python
+extend str:
+    def to_slug(self) -> str:
+        return self.lower().replace(" ", "-")
+
+let title: str = "Hello World"
+let slug: str = title.to_slug()    # ✅ resolved via type annotation
+```
+
+Emitted:
+
+```python
+def __typhon_ext_str__to_slug(self: str) -> str:
+    return self.lower().replace(" ", "-")
+
+title: str = "Hello World"
+slug: str = __typhon_ext_str__to_slug(title)
+```
+
+**No monkey-patching of built-ins.** Un-annotated receivers (`some_dynamic.to_slug()`) raise `AttributeError` at runtime, matching Python's existing semantics. The rewrite is strictly opt-in by type annotation.
+
+## Inheritance
+
+Single inheritance works the way it does in Python. You spell the parent class in parentheses:
+
+```python
+class Animal:
+    name: str
+
+impl Animal:
+    def speak(self) -> str:
+        return "..."
+
+class Dog(Animal):
+    breed: str
+
+impl Dog:
+    def speak(self) -> str:
+        return "woof"
+```
+
+<Aside type="caution">
+  Dataclass inheritance has a wrinkle — fields without defaults must come before fields with defaults across the whole MRO. The checker will flag the conflict, but it's worth knowing the underlying constraint.
+</Aside>
+
+For most domain modelling, prefer **sealed unions** ([Sealed Unions and Match](/Typhon/tour/sealed-unions/)) over inheritance. They give you exhaustive matching, and the checker enforces variant coverage in a way subclassing cannot.
+
+## Putting it together
+
+A worked example: a tiny user system that mixes a `model` (for the API), a `class` (for internal state), and `impl` blocks for methods.
+
+```python
+# src/users.ty
+from datetime import datetime
+
+model UserInput:
+    email: str
+    name: str = "anon"
+
+class User:
+    id: int
+    email: str
+    name: str
+    created_at: datetime
+
+impl User:
+    def display(self) -> str:
+        return f"{self.name} <{self.email}>"
+
+    def age_seconds(self, now: datetime) -> float:
+        return (now - self.created_at).total_seconds()
+
+def create(input: UserInput, id: int) -> User:
+    return User(
+        id=id,
+        email=input.email,
+        name=input.name,
+        created_at=datetime.now(),
+    )
+```
+
+Notes:
+
+- `UserInput` is a `model` because it comes from outside (an HTTP body, say). Pydantic will reject `{"email": "a@b", "name": "alice", "extra": "boom"}` at construction time (because `extra="forbid"` is the default).
+- `User` is a `class` because it lives entirely inside the app — no validation needed, just a dataclass.
+- `display` and `age_seconds` are methods on `User`, defined in a separate `impl` block. The compiler merges them in.
+- `create` is a free function. There's no requirement that constructor-like functions live as static methods; module-level functions are first-class.
+
+## Common mistakes
+
+### Writing `__init__`
+
+```python
+class User:
+    id: int
+
+    def __init__(self, id: int) -> None:    # ❌
+        self.id = id
+```
+
+```
+error[tyc::manual_init]: classes do not declare `__init__`; the constructor is generated
+```
+
+Fix: drop the method. Use field defaults for "convenience" constructors, or write a free function.
+
+### Putting methods inside `class`
+
+```python
+class User:
+    id: int
+
+    def display(self) -> str:      # ❌ wrong place
+        return f"user {self.id}"
+```
+
+Fix: move into an `impl User:` block.
+
+### Mutating a frozen instance
+
+```python
+class FrozenPoint frozen:
+    x: float
+    y: float
+
+let p: FrozenPoint = FrozenPoint(x=1.0, y=2.0)
+p.x = 3.0     # ❌ tyc::frozen_assign
+```
+
+Construct a fresh instance instead: `let q: FrozenPoint = FrozenPoint(x=3.0, y=p.y)`.
+
+## What you've learned
+
+- `class` emits `@dataclass(slots=True)`; `model` emits Pydantic `BaseModel(extra="forbid")`; `class!` is the escape hatch for framework bases.
+- Methods live in `impl` blocks with explicit `self` and `self.NAME` field access.
+- `extend ClassName:` adds methods to existing user-defined classes from elsewhere.
+- `extend BUILTIN:` extracts to free functions with static-receiver rewrites — no monkey-patching.
+- Prefer composition or sealed unions over inheritance for domain modelling.
+
+## Where next
+
+- [Error Handling](/Typhon/tour/error-handling/) — typed errors with `Result[T, E]`.
+- [Sealed Unions and Match](/Typhon/tour/sealed-unions/) — closed sums with exhaustive `match`.
+- [Class Escape Hatches](/Typhon/interop/class-escape/) — `class!` patterns for `torch.nn.Module`, `Enum`, `unittest.TestCase`, etc.
+- [`impl` and `extend`](/Typhon/reference/impl-extend/) — the reference page.

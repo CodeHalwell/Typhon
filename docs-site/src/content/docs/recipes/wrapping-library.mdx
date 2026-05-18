@@ -1,0 +1,123 @@
+---
+title: Wrapping an Untyped Library
+description: "From unsafe: to .dty stub, with a typed adapter in between."
+sidebar:
+  order: 9
+---
+
+A workflow for taming a third-party library's dynamic surface: start with `unsafe:`, write a small typed adapter, promote to a `.dty` stub when the surface stabilises.
+
+## Day 0 — `unsafe:` exploration
+
+```python
+import some_untyped_lib
+
+def fetch_user_raw(id: int) -> dict[str, str]:
+    unsafe:
+        let raw = some_untyped_lib.fetch_user(id)
+    return raw     # ❌ would fail boundary — Unsafe[Any] can't flow into concrete
+```
+
+Re-assert at the boundary:
+
+```python
+def fetch_user_raw(id: int) -> dict[str, str]:
+    unsafe:
+        let raw = some_untyped_lib.fetch_user(id)
+        let result: dict[str, str] = raw    # re-assertion via annotation
+    return result
+```
+
+`unsafe:` lets you talk to the library. The annotation at the boundary is your "I claim this is the shape" assertion.
+
+## Day 1 — Typed adapter
+
+Wrap each call in a small typed function. Inside it, `unsafe:` does the call. Outside, callers see a typed signature:
+
+```python
+import some_untyped_lib
+
+class User:
+    id: int
+    name: str
+    email: str
+
+type UserError = NotFound | NetworkError
+
+class NotFound:
+    id: int
+class NetworkError:
+    detail: str
+
+def fetch_user(id: int) -> Result[User, UserError]:
+    unsafe:
+        try:
+            let raw = some_untyped_lib.fetch_user(id)
+        except some_untyped_lib.UserNotFoundError:
+            return Err(NotFound(id=id))
+        except some_untyped_lib.NetworkError as e:
+            return Err(NetworkError(detail=str(e)))
+
+        let id_int: int = int(raw["id"])
+        let name: str   = str(raw["name"])
+        let email: str  = str(raw["email"])
+
+    return Ok(User(id=id_int, name=name, email=email))
+```
+
+Now downstream callers consume `fetch_user`'s typed signature. The dynamic-typing exposure is confined to the adapter.
+
+## Day N — `.dty` stub
+
+When the library's API has stabilised in your usage, write a `.dty` stub:
+
+```python
+# stubs/some_untyped_lib.dty
+class User:
+    id: int
+    name: str
+    email: str
+
+class UserNotFoundError(Exception):
+    user_id: int
+
+class NetworkError(Exception):
+    pass
+
+def fetch_user(id: int) -> User
+```
+
+Now `import some_untyped_lib` gives you `some_untyped_lib.fetch_user(id) -> User` directly. The adapter shrinks to:
+
+```python
+def fetch_user(id: int) -> Result[User, UserError]:
+    try:
+        return Ok(some_untyped_lib.fetch_user(id))
+    except some_untyped_lib.UserNotFoundError:
+        return Err(NotFound(id=id))
+    except some_untyped_lib.NetworkError as e:
+        return Err(NetworkError(detail=str(e)))
+```
+
+No more `unsafe:`. The dynamism crosses through the stub, not through your code.
+
+## Drift detection
+
+Run `tyc check --stubs` and `tyc stubtest` in CI. When the library upgrades and your stub falls behind, the drift surfaces immediately.
+
+```yaml
+- name: Stub drift
+  run: |
+    tyc check --stubs
+    tyc stubtest
+```
+
+## When to skip the stub
+
+For one-off scripts or genuinely-dynamic libraries (RPC stubs, `eval` heavy), keep the adapter pattern. Don't write stubs that you'd have to constantly update.
+
+## Where next
+
+- [The Unsafe Boundary](/Typhon/types/unsafe/) — `unsafe:` mechanics.
+- [Writing .dty Stubs](/Typhon/interop/dty-stubs/) — stub format.
+- [Stub Drift](/Typhon/interop/stub-drift/) — keeping in sync.

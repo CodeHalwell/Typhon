@@ -1,0 +1,43 @@
+---
+title: Recipes & Patterns
+description: Worked examples for common real-world tasks.
+sidebar:
+  order: 1
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+Worked patterns for the situations you'll actually hit. Each recipe is a small, self-contained example with the code, the lowering, and the design rationale.
+
+<CardGrid>
+  <Card title="Migrating from Python" icon="document">
+    [→](/Typhon/recipes/migrating/) — incremental Python → Typhon, with `tyc migrate` and manual cleanup.
+  </Card>
+  <Card title="CLI Application" icon="terminal">
+    [→](/Typhon/recipes/cli-application/) — argparse / click, typed errors, exit codes.
+  </Card>
+  <Card title="HTTP API with Pydantic" icon="rocket">
+    [→](/Typhon/recipes/http-api/) — FastAPI + `model` request/response shapes.
+  </Card>
+  <Card title="Concurrent Data Fetching" icon="forward-slash">
+    [→](/Typhon/recipes/concurrent-fetch/) — `gather:` blocks, `Result[T, E]` propagation, partial-success modes.
+  </Card>
+  <Card title="Build-Time Env Validation" icon="setting">
+    [→](/Typhon/recipes/env-validation/) — `comptime let` + `[env] required` for fail-fast configuration.
+  </Card>
+  <Card title="Errors as Values" icon="approve-check">
+    [→](/Typhon/recipes/errors-as-values/) — designing your error types.
+  </Card>
+  <Card title="State Machines with Sealed Unions" icon="puzzle">
+    [→](/Typhon/recipes/state-machines/) — exhaustive transition tables.
+  </Card>
+  <Card title="Wrapping an Untyped Library" icon="open-book">
+    [→](/Typhon/recipes/wrapping-library/) — from `unsafe:` to `.dty` stub.
+  </Card>
+  <Card title="Testing Typhon Code" icon="approve-check">
+    [→](/Typhon/recipes/testing/) — pytest against emitted Python.
+  </Card>
+  <Card title="CI Integration" icon="external">
+    [→](/Typhon/recipes/ci/) — `tyc check`, format-check, stub-drift, type-only second-opinion.
+  </Card>
+</CardGrid>
