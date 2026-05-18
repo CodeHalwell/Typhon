@@ -980,6 +980,41 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Emit a [`TycError::TypeReassignMismatch`] for a reassignment that
+    /// disagrees with the binding's declared type. Distinct from
+    /// [`Self::mismatch`] because the diagnostic carries a second label
+    /// pointing at the original declaration site and explains `mut`
+    /// semantics in its help text — the previous "type mismatch:
+    /// expected X, found Y" message routinely confused users who had
+    /// written `mut name = …` expecting it to behave like a fresh
+    /// declaration.
+    fn reassign_mismatch(
+        &mut self,
+        name: &str,
+        expected: &Type,
+        actual: &Type,
+        span: (usize, usize),
+        decl_span: (usize, usize),
+    ) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
+        let length = span.1.saturating_sub(span.0).max(1);
+        let decl_length = decl_span.1.saturating_sub(decl_span.0).max(1);
+        self.diagnostics
+            .push_error(TycError::type_reassign_mismatch(
+                name,
+                expected.display(),
+                actual.display(),
+                &self.path,
+                self.source,
+                span.0,
+                length,
+                decl_span.0,
+                decl_length,
+            ));
+    }
+
     fn mismatch(&mut self, expected: &Type, actual: &Type, span: (usize, usize)) {
         if self.unsafe_depth > 0 {
             return;
@@ -1565,13 +1600,24 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     let existing = c.env.lookup(n.id.as_str()).cloned();
                     if let Some(b) = existing {
                         // Reassignment: the static type stays as declared;
-                        // check the new value fits.
+                        // check the new value fits. When it doesn't, emit
+                        // the dedicated reassignment-mismatch diagnostic
+                        // so the user sees both the offending value AND
+                        // the original declaration site (with help text
+                        // that explains `mut` allows new values of the
+                        // same type, not a new type).
                         if !c.is_assignable(&b.declared, &value_type) {
                             let vspan = (
                                 a.value.range().start().to_usize(),
                                 a.value.range().end().to_usize(),
                             );
-                            c.mismatch(&b.declared, &value_type, vspan);
+                            c.reassign_mismatch(
+                                n.id.as_str(),
+                                &b.declared,
+                                &value_type,
+                                vspan,
+                                b.span,
+                            );
                         }
                         // Reset any narrowing on the reassigned name.
                         c.env.narrow(n.id.as_str(), b.declared);
@@ -2561,6 +2607,48 @@ mod tests {
         assert!(d.has_errors());
         let msg = format!("{}", d.errors()[0]);
         assert!(msg.contains("expected `int`"), "got {}", msg);
+    }
+
+    #[test]
+    fn reassign_type_mismatch_carries_decl_site_and_explains_mut() {
+        // Regression test for the misleading-diagnostic case raised on
+        // PR #48: `mut greeting: str = "..."` followed by
+        // `mut greeting = 8` previously produced a bare "expected str,
+        // found int" message that read like a compiler bug. The new
+        // diagnostic names the binding, mentions both sites, and
+        // explains what `mut` actually permits.
+        let d = check("mut greeting: str = \"hi\"\ngreeting = 8\n");
+        assert!(d.has_errors(), "{:?}", d.errors());
+        let err = &d.errors()[0];
+        // Variant identity — the new dedicated diagnostic, not the
+        // generic `TypeMismatch`.
+        assert!(
+            matches!(err, TycError::TypeReassignMismatch { .. }),
+            "expected TypeReassignMismatch, got: {err:?}"
+        );
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("greeting") && msg.contains("`str`") && msg.contains("`int`"),
+            "message should name the binding and both types; got: {msg}"
+        );
+        // The diagnostic carries two labels — one at the value, one at
+        // the declaration — so the user can navigate from the bad
+        // reassignment back to the original declaration. The help text
+        // must mention `mut` so the user understands why the rebinding
+        // isn't accepted (the typical mental model is "mut means I can
+        // change it to anything"). Both invariants are encoded in the
+        // miette derive attributes on the variant.
+        if let TycError::TypeReassignMismatch {
+            name,
+            expected,
+            actual,
+            ..
+        } = err
+        {
+            assert_eq!(name, "greeting");
+            assert_eq!(expected, "str");
+            assert_eq!(actual, "int");
+        }
     }
 
     #[test]
