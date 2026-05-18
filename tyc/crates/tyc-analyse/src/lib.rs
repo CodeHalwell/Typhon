@@ -697,7 +697,19 @@ fn eval_stmt(stmt: &Stmt, ctx: &mut EvalContext<'_>) -> Result<StmtOutcome, Stri
             }
             Ok(StmtOutcome::FellThrough)
         }
-        Stmt::Expr(_) => Ok(StmtOutcome::FellThrough),
+        // Bare expression statements (other than a leading docstring,
+        // which `eval_function_body` peels off before delegating here)
+        // are rejected. Silently skipping them would let a body like
+        // `1 / 0; return 1` produce the literal `1` at compile time
+        // even though the same code emitted as a Python `def` would
+        // crash at runtime — divergence between comptime constants
+        // and runtime behaviour is exactly the kind of bug the
+        // hermetic-evaluator contract is supposed to prevent.
+        Stmt::Expr(_) => Err(
+            "bare expression statement is not supported inside a comptime function body \
+             (only a leading docstring is allowed)"
+                .into(),
+        ),
         other => Err(format!(
             "`{}` is not supported inside a comptime function body (v1 supports \
              `return`, local assignments, and `if`/`elif`/`else`)",
@@ -1283,6 +1295,32 @@ comptime let X: int = thing()
             diags.errors()
         );
         assert!(matches!(values.get("X"), Some(ComptimeValue::Int(7))));
+    }
+
+    #[test]
+    fn comptime_function_bare_expression_statement_rejected() {
+        // A bare expression statement (other than a leading docstring)
+        // must NOT be silently skipped at compile time — the same code
+        // emitted as Python `def` would execute the expression, so
+        // skipping it would let `1/0` produce a literal value at
+        // build time even though the runtime call would crash.
+        let src = "\
+comptime def thing() -> int:
+    1 / 0
+    return 1
+
+comptime let X: int = thing()
+";
+        let (_, diags) = eval(src);
+        assert!(
+            diags.has_errors(),
+            "bare expression statement must be rejected, not silently skipped"
+        );
+        let msg = format!("{:?}", diags.errors()[0]);
+        assert!(
+            msg.contains("bare expression statement"),
+            "expected dedicated bare-expression diagnostic, got: {msg}"
+        );
     }
 
     #[test]
