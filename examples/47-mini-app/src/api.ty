@@ -12,8 +12,17 @@ from store import NoteStore, open_store
 let DB_PATH: Path = Path(os.environ.get("NOTES_DB", "/tmp/typhon-notes.db"))
 
 
+def _require_api_key() -> str:
+    let key: str? = os.environ.get("ANTHROPIC_API_KEY")
+    if key is None or len(key) == 0:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY is not set — refusing to start without a real API key"
+        )
+    return key
+
+
 let store: NoteStore = open_store(DB_PATH)
-let client: Anthropic = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY", ""))
+let client: Anthropic = Anthropic(api_key=_require_api_key())
 let agent: Agent = Agent(client=client, store=store)
 
 

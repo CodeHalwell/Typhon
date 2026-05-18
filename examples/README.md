@@ -5,21 +5,26 @@ system. Every example is a real-world-shaped snippet, not a contrived demo. Each
 file is standalone — read top-to-bottom, or jump to the topic you care about.
 
 Each numbered directory contains one descriptively-named `.ty` file (e.g.
-`01-hello-world/hello.ty`, `33-pytorch-tensors/pytorch_tensors.ty`). Compile
-and run any of them with:
+`01-hello-world/hello.ty`, `33-pytorch-tensors/pytorch_tensors.ty`).
+
+The suite is **not** a single buildable Typhon project — each example has
+its own dependency footprint (one needs `pytorch`, the next needs `redis`,
+the next needs `anthropic`…). The recommended way to run any example is
+to scaffold a fresh project, drop the example in, install its deps, and
+build:
 
 ```bash
-tyc build examples/01-hello-world/hello.ty
-python build/hello.py
-```
-
-Most examples are single-file. A few projects (e.g. `47-mini-app/`) span
-multiple files; build the directory instead:
-
-```bash
-tyc build examples/47-mini-app/src/
+# pick any example, e.g. 01-hello-world
+tyc init playground
+cp examples/01-hello-world/hello.ty playground/src/main.ty
+cd playground
+# install whatever the example imports (see top of the .ty file)
+tyc build
 python build/main.py
 ```
+
+Example 47 ships as a real multi-file project with its own
+`typhon.toml`; see `47-mini-app/README.md` for build/run steps.
 
 ## The lineup
 

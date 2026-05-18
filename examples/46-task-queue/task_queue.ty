@@ -48,21 +48,20 @@ def envelope_to_json(env: JobEnvelope) -> str:
 def envelope_from_json(raw: str) -> JobEnvelope?:
     try:
         let p: dict[str, object] = json.loads(raw)
-    except json.JSONDecodeError:
+        let kind: str = str(p["kind"])
+        let data: dict[str, object] = dict(p["data"])
+        mut job: Job? = None
+        if kind == "resize":
+            job = ResizeJob(image_path=str(data["image_path"]), width=int(data["width"]))
+        elif kind == "email":
+            job = EmailJob(to=str(data["to"]), subject=str(data["subject"]), body=str(data["body"]))
+        elif kind == "report":
+            job = ReportJob(report_id=str(data["report_id"]))
+        if job is None:
+            return None
+        return JobEnvelope(id=str(p["id"]), enqueued_at=float(p["ts"]), job=job)
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
         return None
-
-    let kind: str = str(p["kind"])
-    let data: dict[str, object] = dict(p["data"])
-    mut job: Job? = None
-    if kind == "resize":
-        job = ResizeJob(image_path=str(data["image_path"]), width=int(data["width"]))
-    elif kind == "email":
-        job = EmailJob(to=str(data["to"]), subject=str(data["subject"]), body=str(data["body"]))
-    elif kind == "report":
-        job = ReportJob(report_id=str(data["report_id"]))
-    if job is None:
-        return None
-    return JobEnvelope(id=str(p["id"]), enqueued_at=float(p["ts"]), job=job)
 
 
 async def enqueue(r: aioredis.Redis, queue: str, job: Job) -> str:

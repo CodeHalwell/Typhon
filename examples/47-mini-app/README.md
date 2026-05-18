@@ -12,9 +12,13 @@ A small multi-file project that ties most of the earlier examples together:
 
 ## Run
 
+`tyc build` resolves the project from `typhon.toml` and emits relative to
+that project root, so build from inside this directory:
+
 ```bash
+cd examples/47-mini-app
 export ANTHROPIC_API_KEY=sk-ant-...
-tyc build examples/47-mini-app/src/
+tyc build
 python build/main.py
 # in another shell:
 curl -X POST localhost:8000/ask -H 'content-type: application/json' \
