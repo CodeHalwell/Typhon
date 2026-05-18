@@ -37,7 +37,7 @@ contemporary laptop or desktop hardware.
 
 The preprocessor strips Typhon line-prefix keywords (`let`/`mut`/`model`/
 `interface`/`unsafe`/etc.) and expands sugar (`T?`, `|>`, `with`-chains,
-`gather:`, `go`, `lazy import`). The parser is `rustpython-parser` operating
+`gather:`, `go`, `lazy import`). The parser is `ruff_python_parser` operating
 on the preprocessed Python source.
 
 Fixture sizes:
