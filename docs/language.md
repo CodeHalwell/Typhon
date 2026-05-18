@@ -83,6 +83,52 @@ class ApiUser(BaseModel):
 
 `model` emission injects `extra='forbid'` by default — Pydantic's stock `extra='ignore'` silently drops unexpected input, which directly contradicts Typhon's safety pitch. Permissive modes are opt-in via `[emit] model-extra = "allow" | "ignore"` in `typhon.toml`. Pydantic's `frozen=True` is *faux* immutability (it blocks field reassignment but does not freeze nested mutable values); see `let`/`mut` for what Typhon's binding immutability does and does not guarantee.
 
+### `class!` (raw class)
+
+`class!` is the escape hatch for classes that cannot be expressed as a dataclass: `torch.nn.Module`, `enum.Enum`, `typing.NamedTuple`, `unittest.TestCase`, Django models, SQLAlchemy declarative bases — anything whose base class needs a non-trivial `__init__` to run *before* fields are assigned.
+
+```python
+# Typhon
+import torch.nn as nn
+
+class! MyModel(nn.Module):
+    layer: nn.Linear
+    dropout: float
+
+    def forward(self, x):
+        return self.layer(x)
+
+# Emitted Python (no @dataclass; super().__init__() runs first)
+import torch.nn as nn
+
+class MyModel(nn.Module):
+    layer: nn.Linear
+    dropout: float
+
+    def __init__(self, layer: nn.Linear, dropout: float) -> None:
+        super().__init__()
+        self.layer = layer
+        self.dropout = dropout
+
+    def forward(self, x):
+        return self.layer(x)
+```
+
+What `class!` changes versus a plain `class`:
+
+- **No `@dataclass` decorator** is injected. The class is emitted verbatim with whatever bases it declares.
+- **`__init__` is auto-synthesised** when the body declares no `def __init__` and at least one base is present. The synthesised constructor calls `super().__init__()` and then assigns every annotated field through `self`, in source order. Field defaults flow into the parameter signature; fields without defaults are positional, fields with defaults are keyword-or-positional after them.
+- **A hand-written `__init__` is preserved verbatim.** Use this when the base class needs configuration arguments that aren't 1:1 with your declared fields.
+
+When to reach for which class form:
+
+| Form | Emits | Use when |
+|---|---|---|
+| `class Foo:` | `@dataclass(slots=True)` | Plain value type. Default for new code. |
+| `model Foo:` | `BaseModel` (Pydantic, `extra='forbid'`) | Validated input at a system boundary. |
+| `interface Foo:` | `Protocol` | Structural contract you check against, not a concrete type. |
+| `class! Foo(Base):` | bare `class Foo(Base):` + synthesised or hand-written `__init__` | Subclassing a framework base that owns its own `__init__`. |
+
 ## Error handling
 
 ### `Result[T, E]`

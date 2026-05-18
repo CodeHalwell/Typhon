@@ -25,7 +25,9 @@ use tower_lsp_server::ls_types::{
 use tower_lsp_server::{jsonrpc, Client, LanguageServer, LspService, Server};
 use tyc_db::{check_source_file, preprocessed_text, resolved_module_arc, SourceFile, TycDatabase};
 use tyc_diagnostics::TycError;
-use tyc_resolve::{BindingKind, ImportInfo, Mutability, ResolvedModule, SymbolAtOffset};
+use tyc_resolve::{
+    BindingKind, ClassKind, ImportInfo, Mutability, ResolveOptions, ResolvedModule, SymbolAtOffset,
+};
 
 /// Manual resolved-module cache for cross-file import resolution.
 ///
@@ -379,10 +381,15 @@ impl Backend {
     /// result so repeated go-to-definition jumps into the same module skip
     /// parse + resolve.  Only used for files that are not open in the editor
     /// (same-file operations use the Salsa `resolved_module` query instead).
+    ///
+    /// `raw_class_byte_starts` lets the resolver tag `class!` declarations
+    /// in the cross-file target so hover renders the raw-class marker even
+    /// after a go-to-definition jump.
     async fn get_or_resolve(
         &self,
         uri_str: &str,
         preprocessed: &str,
+        raw_class_byte_starts: Vec<u32>,
     ) -> Option<Arc<ResolvedModule>> {
         // Fast path: check the cache under a short lock.
         {
@@ -394,7 +401,10 @@ impl Backend {
             }
         }
         // Slow path: parse and resolve, then store.
-        let resolved = resolve_in_preprocessed(preprocessed)?;
+        let options = ResolveOptions {
+            raw_class_byte_starts,
+        };
+        let resolved = resolve_in_preprocessed(preprocessed, options)?;
         let arc = Arc::new(resolved);
         {
             let mut cache = self.resolved_cache.lock().await;
@@ -445,8 +455,10 @@ impl Backend {
         let target_uri_str = target_uri.as_str().to_owned();
 
         let prep = tyc_syntax::preprocess::preprocess(&original_source);
+        let raw_class_byte_starts =
+            tyc_syntax::preprocess::line_byte_starts(&prep.python_source, &prep.raw_class_lines);
         let resolved = match self
-            .get_or_resolve(&target_uri_str, &prep.python_source)
+            .get_or_resolve(&target_uri_str, &prep.python_source, raw_class_byte_starts)
             .await
         {
             Some(r) => r,
@@ -684,10 +696,15 @@ use std::str::FromStr;
 /// Parse and resolve a pre-preprocessed Python source string so hover and
 /// go-to-definition can query bindings and references.  Returns `None` when
 /// the source fails to parse.
-fn resolve_in_preprocessed(preprocessed: &str) -> Option<ResolvedModule> {
+///
+/// `options` carries Typhon-specific metadata the parser cannot recover from
+/// the preprocessed text (e.g. which `class` declarations were originally
+/// written `class!`).
+fn resolve_in_preprocessed(preprocessed: &str, options: ResolveOptions) -> Option<ResolvedModule> {
     let parsed = tyc_syntax::parse_module(preprocessed).ok()?;
     let module = parsed.into_syntax();
-    let (resolved, _) = tyc_resolve::resolve_module("<lsp>".to_owned(), preprocessed, &module);
+    let (resolved, _) =
+        tyc_resolve::resolve_module_with("<lsp>".to_owned(), preprocessed, &module, options);
     Some(resolved)
 }
 
@@ -1049,7 +1066,10 @@ fn render_hover(symbol: &SymbolAtOffset<'_>) -> String {
             Mutability::Mut => "mutable binding",
         },
         BindingKind::Function => "function",
-        BindingKind::Class => "class",
+        BindingKind::Class => match def.class_kind {
+            ClassKind::Plain => "class",
+            ClassKind::Raw => "raw class (`class!`)",
+        },
         BindingKind::Parameter => "parameter",
         BindingKind::Import => "import",
         BindingKind::Loop => "loop binding",
@@ -1271,13 +1291,14 @@ mod tests {
 
     #[test]
     fn render_hover_describes_val_binding() {
-        use tyc_resolve::{Binding, BindingKind, Mutability};
+        use tyc_resolve::{Binding, BindingKind, ClassKind, Mutability};
         let binding = Binding {
             name: "x".to_owned(),
             kind: BindingKind::Value,
             mutability: Mutability::Let,
             span: (4, 5),
             import_info: None,
+            class_kind: ClassKind::Plain,
         };
         let symbol = SymbolAtOffset {
             name: "x".to_owned(),
@@ -1292,13 +1313,14 @@ mod tests {
 
     #[test]
     fn render_hover_describes_function() {
-        use tyc_resolve::{Binding, BindingKind, Mutability};
+        use tyc_resolve::{Binding, BindingKind, ClassKind, Mutability};
         let binding = Binding {
             name: "main".to_owned(),
             kind: BindingKind::Function,
             mutability: Mutability::Mut,
             span: (4, 8),
             import_info: None,
+            class_kind: ClassKind::Plain,
         };
         let symbol = SymbolAtOffset {
             name: "main".to_owned(),
@@ -1309,6 +1331,44 @@ mod tests {
         let body = render_hover(&symbol);
         assert!(body.contains("function"), "got: {body}");
         assert!(!body.contains("declaration site"), "got: {body}");
+    }
+
+    #[test]
+    fn render_hover_distinguishes_raw_class() {
+        use tyc_resolve::{Binding, BindingKind, ClassKind, Mutability};
+        let raw = Binding {
+            name: "MyModel".to_owned(),
+            kind: BindingKind::Class,
+            mutability: Mutability::Mut,
+            span: (0, 7),
+            import_info: None,
+            class_kind: ClassKind::Raw,
+        };
+        let plain = Binding {
+            name: "User".to_owned(),
+            kind: BindingKind::Class,
+            mutability: Mutability::Mut,
+            span: (0, 4),
+            import_info: None,
+            class_kind: ClassKind::Plain,
+        };
+        let raw_sym = SymbolAtOffset {
+            name: raw.name.clone(),
+            span: raw.span,
+            definition: Some(&raw),
+            is_definition: true,
+        };
+        let plain_sym = SymbolAtOffset {
+            name: plain.name.clone(),
+            span: plain.span,
+            definition: Some(&plain),
+            is_definition: true,
+        };
+        let raw_body = render_hover(&raw_sym);
+        let plain_body = render_hover(&plain_sym);
+        assert!(raw_body.contains("raw class"), "got: {raw_body}");
+        assert!(raw_body.contains("class!"), "got: {raw_body}");
+        assert!(!plain_body.contains("raw class"), "got: {plain_body}");
     }
 
     // ── cross-file import resolution ─────────────────────────────────────
