@@ -257,6 +257,47 @@ PORT: int = 8080
 DB_URL: str = "postgresql://..."
 ```
 
+### `comptime def` functions
+
+A `comptime def` declares a function that the evaluator can call from a `comptime let` initialiser. The function name is registered at build time; its body must be a single `return EXPR` statement (optionally preceded by a docstring), and the expression follows the same rules as any other comptime RHS — literals, arithmetic, string concatenation, `env()` / `int()` / `str()` / `float()` calls, parameter references, and calls to other `comptime def` functions.
+
+```python
+# Typhon
+comptime def double(n: int) -> int:
+    return n * 2
+
+comptime def join(prefix: str, suffix: str) -> str:
+    return prefix + suffix
+
+comptime let PORT:    int = double(4000)
+comptime let API_URL: str = join("https://api.", env("DOMAIN", "example.com"))
+```
+
+The Typhon checker invokes `double` and `join` at compile time and substitutes the resulting literals before emission:
+
+```python
+# Emitted Python
+def double(n: int) -> int:
+    return n * 2
+
+def join(prefix: str, suffix: str) -> str:
+    return prefix + suffix
+
+PORT: int = 8000
+API_URL: str = "https://api.example.com"
+```
+
+The function definitions remain in the emitted output (they're ordinary Python `def`s — the `comptime` prefix is a build-time marker, not a runtime signal) so the same helpers stay available at runtime should you also call them from non-comptime code.
+
+The contract is intentionally tight in v1:
+
+- Bodies must be exactly `return EXPR` — no local assignments, no `if`/`else`, no loops. Anything else is a hard error so the contract is obvious rather than half-implemented.
+- Parameters must be plain positional names — no defaults, `*args`, `**kwargs`, or keyword-only forms.
+- Free variables (module-level names other than parameters) are not in scope inside the body. Comptime evaluation is hermetic — call sites pass everything in as arguments.
+- Recursion depth is capped (currently 64) so a buggy definition fails the build rather than hanging it.
+
+These restrictions exist because comptime evaluation runs *inside the compiler*. Lifting them later is incremental work; the current rule of thumb is "if a comptime function couldn't be a one-liner pure expression, that probably belongs at runtime."
+
 ## Readability features
 
 ### Guards
