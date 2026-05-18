@@ -1,0 +1,84 @@
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+
+from models import Note
+
+
+class StoreError:
+    op: str
+    reason: str
+
+
+class NoteStore:
+    conn: sqlite3.Connection
+
+
+impl NoteStore:
+    def init_schema(self) -> None:
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS notes (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                title       TEXT NOT NULL,
+                body        TEXT NOT NULL,
+                created_at  TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_notes_title ON notes(title);
+        """)
+        self.conn.commit()
+
+    def save(self, title: str, body: str) -> Result[Note, StoreError]:
+        let now: datetime = datetime.now(timezone.utc)
+        try:
+            let cur = self.conn.execute(
+                "INSERT INTO notes (title, body, created_at) VALUES (?, ?, ?)",
+                (title, body, now.isoformat()),
+            )
+            self.conn.commit()
+            return Ok(Note(
+                id=int(cur.lastrowid or 0),
+                title=title,
+                body=body,
+                created_at=now,
+            ))
+        except sqlite3.Error as e:
+            return Err(StoreError(op="save", reason=str(e)))
+
+    def search(self, needle: str, limit: int = 10) -> list[Note]:
+        let cur = self.conn.execute(
+            "SELECT id, title, body, created_at FROM notes "
+            "WHERE title LIKE ? OR body LIKE ? "
+            "ORDER BY id DESC LIMIT ?",
+            (f"%{needle}%", f"%{needle}%", limit),
+        )
+        return [
+            Note(
+                id=int(row[0]),
+                title=str(row[1]),
+                body=str(row[2]),
+                created_at=datetime.fromisoformat(str(row[3])),
+            )
+            for row in cur.fetchall()
+        ]
+
+    def list_recent(self, limit: int = 20) -> list[Note]:
+        let cur = self.conn.execute(
+            "SELECT id, title, body, created_at FROM notes ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+        return [
+            Note(
+                id=int(row[0]),
+                title=str(row[1]),
+                body=str(row[2]),
+                created_at=datetime.fromisoformat(str(row[3])),
+            )
+            for row in cur.fetchall()
+        ]
+
+
+def open_store(path: Path) -> NoteStore:
+    let conn: sqlite3.Connection = sqlite3.connect(str(path), check_same_thread=False)
+    let store: NoteStore = NoteStore(conn=conn)
+    store.init_schema()
+    return store

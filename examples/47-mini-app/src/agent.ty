@@ -1,0 +1,133 @@
+import json
+
+from anthropic import Anthropic
+
+from models import AgentEvent, FinalAnswerEvent, ThoughtEvent, ToolCallEvent
+from store import NoteStore
+
+
+class AgentError:
+    stage: str
+    message: str
+
+
+class AgentRun:
+    events: list[AgentEvent]
+    answer: str
+    tool_calls: int
+    notes_saved: int
+
+
+let TOOLS: list[dict[str, object]] = [
+    {
+        "name": "save_note",
+        "description": "Save a short note for later recall.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "body": {"type": "string"},
+            },
+            "required": ["title", "body"],
+        },
+    },
+    {
+        "name": "search_notes",
+        "description": "Search previously saved notes by keyword.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    },
+]
+
+
+let SYSTEM_PROMPT: str = (
+    "You are a research assistant. When the user asks a question, answer it "
+    "concisely. If the answer is worth keeping, use save_note. If the user "
+    "asks about something you may have seen before, try search_notes first."
+)
+
+
+class Agent:
+    client: Anthropic
+    store: NoteStore
+
+
+impl Agent:
+    def dispatch(self, name: str, args: dict[str, object]) -> tuple[str, bool]:
+        if name == "save_note":
+            match self.store.save(str(args["title"]), str(args["body"])):
+                case Ok(note):
+                    return (json.dumps({"saved_id": note.id}), True)
+                case Err(e):
+                    return (json.dumps({"error": e.reason}), False)
+        if name == "search_notes":
+            let hits = self.store.search(str(args["query"]))
+            return (
+                json.dumps({
+                    "hits": [
+                        {"id": n.id, "title": n.title, "body": n.body[:200]}
+                        for n in hits
+                    ],
+                }),
+                False,
+            )
+        return (json.dumps({"error": f"unknown tool {name}"}), False)
+
+    def run(self, question: str, max_turns: int = 6) -> Result[AgentRun, AgentError]:
+        mut messages: list[dict[str, object]] = [{"role": "user", "content": question}]
+        mut events: list[AgentEvent] = []
+        mut tool_calls: int = 0
+        mut saved: int = 0
+        mut turn: int = 0
+
+        while turn < max_turns:
+            try:
+                let resp = self.client.messages.create(
+                    model="claude-opus-4-7",
+                    max_tokens=1024,
+                    system=SYSTEM_PROMPT,
+                    tools=TOOLS,
+                    messages=messages,
+                )
+            except Exception as e:
+                return Err(AgentError(stage="api", message=str(e)))
+
+            messages.append({"role": "assistant", "content": resp.content})
+
+            if resp.stop_reason != "tool_use":
+                mut text_parts: list[str] = []
+                for block in resp.content:
+                    if block.type == "text":
+                        text_parts.append(block.text)
+                let final_text: str = "".join(text_parts)
+                events.append(FinalAnswerEvent(text=final_text))
+                return Ok(AgentRun(
+                    events=events,
+                    answer=final_text,
+                    tool_calls=tool_calls,
+                    notes_saved=saved,
+                ))
+
+            mut tool_results: list[dict[str, object]] = []
+            for block in resp.content:
+                if block.type == "text":
+                    events.append(ThoughtEvent(text=block.text))
+                if block.type == "tool_use":
+                    let args: dict[str, object] = dict(block.input)
+                    events.append(ToolCallEvent(name=block.name, args=args))
+                    tool_calls = tool_calls + 1
+                    let (result_text, was_save) = self.dispatch(block.name, args)
+                    if was_save:
+                        saved = saved + 1
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result_text,
+                    })
+            messages.append({"role": "user", "content": tool_results})
+            turn = turn + 1
+
+        return Err(AgentError(stage="loop", message=f"max_turns {max_turns} exhausted"))

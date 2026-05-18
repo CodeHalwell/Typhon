@@ -1,0 +1,67 @@
+from pathlib import Path
+
+
+def write_lines(path: Path, lines: list[str]) -> Result[None, str]:
+    try:
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return Ok(None)
+    except OSError as e:
+        return Err(f"could not write {path}: {e}")
+
+
+def read_lines(path: Path) -> Result[list[str], str]:
+    try:
+        let text: str = path.read_text(encoding="utf-8")
+        return Ok([line for line in text.splitlines() if len(line) > 0])
+    except FileNotFoundError:
+        return Err(f"missing file: {path}")
+    except OSError as e:
+        return Err(f"could not read {path}: {e}")
+
+
+def count_lines(path: Path) -> Result[int, str]:
+    let lines: list[str] = read_lines(path)?
+    return Ok(len(lines))
+
+
+def grep(path: Path, needle: str) -> Result[list[str], str]:
+    let lines: list[str] = read_lines(path)?
+    return Ok([line for line in lines if needle in line])
+
+
+def tail(path: Path, n: int) -> Result[list[str], str]:
+    let lines: list[str] = read_lines(path)?
+    return Ok(lines[-n:])
+
+
+def main() -> None:
+    let path: Path = Path("/tmp/typhon-text-demo.txt")
+
+    match write_lines(path, ["alpha", "beta", "gamma", "delta", "epsilon"]):
+        case Ok(_):
+            print(f"wrote {path}")
+        case Err(msg):
+            print(msg)
+            return
+
+    match count_lines(path):
+        case Ok(n):
+            print(f"line count: {n}")
+        case Err(msg):
+            print(msg)
+
+    match grep(path, "a"):
+        case Ok(matches):
+            print(f"lines containing 'a': {matches}")
+        case Err(msg):
+            print(msg)
+
+    match tail(path, 2):
+        case Ok(last):
+            print(f"last 2 lines: {last}")
+        case Err(msg):
+            print(msg)
+
+
+if __name__ == "__main__":
+    main()

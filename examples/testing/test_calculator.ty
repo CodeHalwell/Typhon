@@ -1,0 +1,52 @@
+import pytest
+
+from calculator import DivideByZero, add, average, div, mul, sub
+
+
+def test_add() -> None:
+    assert add(2.0, 3.0) == 5.0
+
+
+def test_sub_negative() -> None:
+    assert sub(2.0, 5.0) == -3.0
+
+
+def test_mul_zero() -> None:
+    assert mul(7.0, 0.0) == 0.0
+
+
+def test_div_ok() -> None:
+    match div(10.0, 4.0):
+        case Ok(v):
+            assert v == 2.5
+        case Err(_):
+            pytest.fail("expected Ok")
+
+
+def test_div_by_zero() -> None:
+    match div(1.0, 0.0):
+        case Ok(_):
+            pytest.fail("expected Err")
+        case Err(e):
+            assert isinstance(e, DivideByZero)
+
+
+def test_average_empty() -> None:
+    match average([]):
+        case Err(msg):
+            assert "empty" in msg
+        case Ok(_):
+            pytest.fail("expected Err on empty list")
+
+
+@pytest.mark.parametrize("xs,expected", [
+    ([1.0], 1.0),
+    ([1.0, 3.0], 2.0),
+    ([2.0, 2.0, 2.0, 2.0], 2.0),
+])
+def test_average_parametrised(xs: list[float], expected: float) -> None:
+    match average(xs):
+        case Ok(v):
+            assert v == expected
+        case Err(_):
+            pytest.fail("unexpected Err")

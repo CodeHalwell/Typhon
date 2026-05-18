@@ -1,0 +1,61 @@
+lazy import torch = torch
+
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, pipeline
+
+
+class SentimentResult:
+    text: str
+    label: str
+    score: float
+
+
+def run_pipeline(sentences: list[str]) -> list[SentimentResult]:
+    let clf = pipeline(
+        "sentiment-analysis",
+        model="distilbert-base-uncased-finetuned-sst-2-english",
+    )
+    let raw: list[dict[str, object]] = clf(sentences)
+    return [
+        SentimentResult(text=text, label=str(r["label"]), score=float(r["score"]))
+        for text, r in zip(sentences, raw)
+    ]
+
+
+def run_manual(sentences: list[str]) -> list[SentimentResult]:
+    let model_id: str = "distilbert-base-uncased-finetuned-sst-2-english"
+    let tokenizer = AutoTokenizer.from_pretrained(model_id)
+    let model = AutoModelForSequenceClassification.from_pretrained(model_id)
+    model.eval()
+
+    let inputs = tokenizer(sentences, return_tensors="pt", padding=True, truncation=True)
+    with torch.no_grad():
+        let logits: torch.Tensor = model(**inputs).logits
+        let probs: torch.Tensor = torch.softmax(logits, dim=-1)
+        let pred_ids: torch.Tensor = probs.argmax(dim=-1)
+
+    mut results: list[SentimentResult] = []
+    for i, text in enumerate(sentences):
+        let label_id: int = int(pred_ids[i].item())
+        let label: str = model.config.id2label[label_id]
+        let score: float = float(probs[i, label_id].item())
+        results.append(SentimentResult(text=text, label=label, score=score))
+    return results
+
+
+def main() -> None:
+    let samples: list[str] = [
+        "This compiler is delightful — finally, types that bite.",
+        "Production downtime cost us a small fortune today.",
+        "It works, I guess. Could be worse.",
+    ]
+    print("--- pipeline ---")
+    for r in run_pipeline(samples):
+        print(f"  {r.label:10s} {r.score:.3f}  {r.text}")
+
+    print("--- manual ---")
+    for r in run_manual(samples):
+        print(f"  {r.label:10s} {r.score:.3f}  {r.text}")
+
+
+if __name__ == "__main__":
+    main()

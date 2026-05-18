@@ -1,0 +1,166 @@
+import json
+import os
+from typing import Callable
+
+from anthropic import Anthropic
+
+
+class Tool:
+    name: str
+    description: str
+    input_schema: dict[str, object]
+    run: Callable[[dict[str, object]], str]
+
+
+class AgentError:
+    stage: str
+    message: str
+
+
+class Agent:
+    client: Anthropic
+    model: str
+    tools: dict[str, Tool]
+    system: str
+    history: list[dict[str, object]]
+
+
+impl Agent:
+    def register(self, tool: Tool) -> None:
+        self.tools[tool.name] = tool
+
+    def tool_schemas(self) -> list[dict[str, object]]:
+        return [
+            {"name": t.name, "description": t.description, "input_schema": t.input_schema}
+            for t in self.tools.values()
+        ]
+
+    def step(self, max_turns: int = 6) -> Result[str, AgentError]:
+        mut turn: int = 0
+        while turn < max_turns:
+            try:
+                let resp = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=1024,
+                    system=self.system,
+                    tools=self.tool_schemas(),
+                    messages=self.history,
+                )
+            except Exception as e:
+                return Err(AgentError(stage="api", message=str(e)))
+
+            self.history.append({"role": "assistant", "content": resp.content})
+
+            if resp.stop_reason != "tool_use":
+                mut text_parts: list[str] = []
+                for block in resp.content:
+                    if block.type == "text":
+                        text_parts.append(block.text)
+                return Ok("".join(text_parts))
+
+            mut tool_results: list[dict[str, object]] = []
+            for block in resp.content:
+                if block.type == "tool_use":
+                    let tool: Tool? = self.tools.get(block.name)
+                    let out: str = (
+                        tool.run(dict(block.input)) if tool is not None
+                        else f'{{"error": "unknown tool {block.name}"}}'
+                    )
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": out,
+                    })
+            self.history.append({"role": "user", "content": tool_results})
+            turn = turn + 1
+        return Err(AgentError(stage="loop", message=f"max_turns={max_turns} exhausted"))
+
+    def ask(self, question: str) -> Result[str, AgentError]:
+        self.history.append({"role": "user", "content": question})
+        return self.step()
+
+
+def search_tool() -> Tool:
+    let docs: dict[str, str] = {
+        "typhon": "Statically-typed superset of Python that compiles to .py.",
+        "tyc": "The single-binary Typhon compiler. Subcommands: build, check, fmt, lsp.",
+        "result": "Result[T, E] models recoverable failures; ? short-circuits.",
+    }
+
+    def run(args: dict[str, object]) -> str:
+        let query: str = str(args["query"]).lower()
+        mut hits: list[dict[str, str]] = []
+        for k, v in docs.items():
+            if query in k or query in v.lower():
+                hits.append({"key": k, "text": v})
+        return json.dumps({"hits": hits})
+
+    return Tool(
+        name="search_docs",
+        description="Search internal Typhon docs by keyword.",
+        input_schema={
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+        run=run,
+    )
+
+
+def calc_tool() -> Tool:
+    def run(args: dict[str, object]) -> str:
+        let expr: str = str(args["expression"])
+        let allowed: set[str] = set("0123456789+-*/(). ")
+        if not all(c in allowed for c in expr):
+            return json.dumps({"error": "forbidden characters"})
+        try:
+            return json.dumps({"value": float(eval(expr, {"__builtins__": {}}, {}))})
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    return Tool(
+        name="calculate",
+        description="Evaluate a numeric expression.",
+        input_schema={
+            "type": "object",
+            "properties": {"expression": {"type": "string"}},
+            "required": ["expression"],
+        },
+        run=run,
+    )
+
+
+def make_agent(client: Anthropic) -> Agent:
+    let agent: Agent = Agent(
+        client=client,
+        model="claude-opus-4-7",
+        tools={},
+        system="You are a helpful research agent. Use tools when they would beat guessing.",
+        history=[],
+    )
+    agent.register(search_tool())
+    agent.register(calc_tool())
+    return agent
+
+
+def main() -> None:
+    let key: str? = os.environ.get("ANTHROPIC_API_KEY")
+    if key is None:
+        print("ANTHROPIC_API_KEY not set — skipping")
+        return
+
+    let agent: Agent = make_agent(Anthropic(api_key=key))
+    for q in [
+        "What does the Typhon compiler do? Quote the docs.",
+        "Compute 17 * (3 + 4) and explain.",
+    ]:
+        print(f"\n> {q}")
+        match agent.ask(q):
+            case Ok(reply):
+                print(reply)
+            case Err(e):
+                print(f"agent error: {e.stage}/{e.message}")
+
+
+if __name__ == "__main__":
+    main()
