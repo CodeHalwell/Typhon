@@ -214,7 +214,7 @@ fn strip_optional_from_typing_import(trimmed_line: &str) -> Option<String> {
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
-    if !names.iter().any(|n| *n == "Optional") {
+    if !names.contains(&"Optional") {
         return None;
     }
     let kept: Vec<&str> = names.iter().copied().filter(|n| *n != "Optional").collect();
