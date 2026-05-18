@@ -36,7 +36,6 @@
         { "include": "#result-types" },
         { "include": "#builtin-types" },
         { "include": "#builtin-functions" },
-        { "include": "#nullable-suffix" },
         { "include": "#try-operator" },
         { "include": "#pipe-operator" },
         { "include": "#operators" },

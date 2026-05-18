@@ -1,11 +1,11 @@
 import * as path from "node:path";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import {
   ExtensionContext,
   workspace,
   window,
   commands,
-  WorkspaceConfiguration,
 } from "vscode";
 import {
   LanguageClient,
@@ -18,10 +18,10 @@ let client: LanguageClient | undefined;
 
 export async function activate(context: ExtensionContext): Promise<void> {
   context.subscriptions.push(
-    commands.registerCommand("typhon.restartServer", () => restart(context)),
+    commands.registerCommand("typhon.restartServer", () => restart()),
   );
 
-  await start(context);
+  await start();
 }
 
 export async function deactivate(): Promise<void> {
@@ -31,16 +31,17 @@ export async function deactivate(): Promise<void> {
   }
 }
 
-async function start(context: ExtensionContext): Promise<void> {
+async function start(): Promise<void> {
   const config = workspace.getConfiguration("typhon");
   if (!config.get<boolean>("server.enable", true)) {
     return;
   }
 
-  const command = resolveCommand(config);
+  const configured = config.get<string>("server.path", "tyc");
+  const command = resolveCommand(configured);
   if (!command) {
     window.showWarningMessage(
-      "Typhon: `tyc` binary not found. Set `typhon.server.path` or add `tyc` to PATH. " +
+      `Typhon: \`${configured}\` not found. Set \`typhon.server.path\` or add \`tyc\` to PATH. ` +
         "Syntax highlighting will still work without the language server.",
     );
     return;
@@ -77,25 +78,50 @@ async function start(context: ExtensionContext): Promise<void> {
 
   try {
     await client.start();
-    context.subscriptions.push(client);
   } catch (err) {
-    window.showErrorMessage(`Typhon: failed to start \`tyc lsp\`: ${err}`);
+    window.showErrorMessage(
+      `Typhon: failed to start \`${command} ${args.join(" ")}\`: ${err}`,
+    );
     client = undefined;
   }
 }
 
-async function restart(context: ExtensionContext): Promise<void> {
+async function restart(): Promise<void> {
   if (client) {
     await client.stop();
     client = undefined;
   }
-  await start(context);
+  await start();
 }
 
-function resolveCommand(config: WorkspaceConfiguration): string | undefined {
-  const configured = config.get<string>("server.path", "tyc");
+function resolveCommand(configured: string): string | undefined {
   if (path.isAbsolute(configured)) {
     return fs.existsSync(configured) ? configured : undefined;
   }
-  return configured;
+  if (configured.includes(path.sep) || configured.includes("/")) {
+    const resolved = path.resolve(configured);
+    return fs.existsSync(resolved) ? resolved : undefined;
+  }
+  return findOnPath(configured);
+}
+
+function findOnPath(name: string): string | undefined {
+  const pathEnv = process.env.PATH;
+  if (!pathEnv) {
+    return undefined;
+  }
+  const isWindows = os.platform() === "win32";
+  const extensions = isWindows
+    ? (process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";")
+    : [""];
+  for (const dir of pathEnv.split(path.delimiter)) {
+    if (!dir) continue;
+    for (const ext of extensions) {
+      const candidate = path.join(dir, name + ext);
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
+    }
+  }
+  return undefined;
 }

@@ -37,11 +37,14 @@
           ".ty",
           ".dty"
         ],
-        "configuration": "./language-configuration.json",
-        "icon": {
-          "light": "./icons/typhon-light.png",
-          "dark": "./icons/typhon-dark.png"
-        }
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "typhon.restartServer",
+        "title": "Restart Language Server",
+        "category": "Typhon"
       }
     ],
     "grammars": [
