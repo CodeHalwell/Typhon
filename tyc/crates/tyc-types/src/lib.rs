@@ -1358,6 +1358,31 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
             c.class_shapes.insert(name, shape);
         }
     }
+    // Second pass (continued): fold `impl ClassName:` and `extend ClassName:`
+    // contributions into the target class's shape. The preprocessor rewrites
+    // both forms into a pseudo-class named `__typhon_impl_ClassName`; methods
+    // defined there must count toward interface structural conformance for
+    // the documented "methods live in `impl`" rule to interoperate with
+    // structural typing. Without this merge, `class Button:` + `impl Button:
+    // def draw() -> None` fails to satisfy `Drawable` even though the
+    // cheat-sheet says it should.
+    for stmt in body {
+        if let Stmt::ClassDef(cd) = stmt {
+            let pseudo = cd.name.as_str();
+            if let Some(target) = pseudo.strip_prefix("__typhon_impl_") {
+                if c.class_shapes.contains_key(target) {
+                    let impl_shape = collect_class_shape(cd, &classes);
+                    let target_shape = c.class_shapes.get_mut(target).expect("checked above");
+                    for (m, sig) in impl_shape.methods {
+                        target_shape.methods.entry(m).or_insert(sig);
+                    }
+                    for (f, ty) in impl_shape.fields {
+                        target_shape.fields.entry(f).or_insert(ty);
+                    }
+                }
+            }
+        }
+    }
     // Third pass: record function signatures (also needs the full class list).
     // Ruff folds `async def` into `Stmt::FunctionDef` with `is_async = true`,
     // so a single arm covers both sync and async forms.
@@ -1728,6 +1753,85 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
     }
 }
 
+/// Enforce Rule 1: every parameter and return type must be annotated.
+/// The first positional named `self` or `cls` is exempted (the desugarer
+/// inserts unannotated receivers for `impl` methods, and explicit
+/// `self`/`cls` is idiomatic Python). `*args` / `**kwargs` are likewise
+/// not required to carry annotations.
+fn enforce_annotation_rule(
+    c: &mut Checker,
+    function: &str,
+    parameters: &ruff_python_ast::Parameters,
+    returns: Option<&Expr>,
+) {
+    // Skip the leading `self` / `cls` receiver, if present, so methods
+    // continue to pass without annotating it.
+    let positional: Vec<&ruff_python_ast::ParameterWithDefault> = parameters
+        .posonlyargs
+        .iter()
+        .chain(parameters.args.iter())
+        .collect();
+    let mut params_iter = positional.iter().peekable();
+    if let Some(first) = params_iter.peek() {
+        let name = first.parameter.name.as_str();
+        if name == "self" || name == "cls" {
+            params_iter.next();
+        }
+    }
+    for pwd in params_iter {
+        if pwd.parameter.annotation.is_none() {
+            let pname = pwd.parameter.name.as_str();
+            let span = (
+                pwd.parameter.range.start().to_usize(),
+                pwd.parameter.range.start().to_usize() + pname.len(),
+            );
+            c.diagnostics
+                .push_error(TycError::missing_annotation(
+                    function.to_owned(),
+                    format!("parameter `{}`", pname),
+                    c.path.clone(),
+                    c.source,
+                    span.0,
+                    pname.len().max(1),
+                ));
+        }
+    }
+    for pwd in parameters.kwonlyargs.iter() {
+        if pwd.parameter.annotation.is_none() {
+            let pname = pwd.parameter.name.as_str();
+            let span = (
+                pwd.parameter.range.start().to_usize(),
+                pwd.parameter.range.start().to_usize() + pname.len(),
+            );
+            c.diagnostics
+                .push_error(TycError::missing_annotation(
+                    function.to_owned(),
+                    format!("parameter `{}`", pname),
+                    c.path.clone(),
+                    c.source,
+                    span.0,
+                    pname.len().max(1),
+                ));
+        }
+    }
+
+    if returns.is_none() {
+        // Anchor the diagnostic on the function name. Spans for the
+        // closing-paren / arrow position aren't easily reachable from
+        // `ruff_python_ast::Parameters`; the name is unambiguous and
+        // matches the user's mental model ("annotate this function").
+        let span_start = parameters.range.start().to_usize();
+        c.diagnostics.push_error(TycError::missing_annotation(
+            function.to_owned(),
+            "return type".to_owned(),
+            c.path.clone(),
+            c.source,
+            span_start,
+            1,
+        ));
+    }
+}
+
 fn check_function(
     c: &mut Checker,
     name: &str,
@@ -1741,6 +1845,14 @@ fn check_function(
         Some(r) => type_from_annotation_with_params(r, &classes, type_params),
         None => Type::Unknown,
     };
+
+    // Rule 1: every parameter and return type must be annotated.
+    // Auto-synthesised compiler helpers (anything `__typhon_*`) are
+    // exempted so the desugar pass can keep emitting unannotated
+    // bridges without provoking the user-facing diagnostic.
+    if !name.starts_with("__typhon_") {
+        enforce_annotation_rule(c, name, parameters, returns);
+    }
 
     let saved_return = c.current_return.replace(ret_type);
     // Load the TypeVar bounds for this function so the body's attribute
@@ -3785,9 +3897,13 @@ let g: Greeter = GoodGreeter()
     }
 
     #[test]
-    fn interface_method_unannotated_impl_passes_conformance() {
-        // When the implementing class has no return annotation, conformance should
-        // succeed (we can't statically verify the return type, so we accept it).
+    fn interface_method_unannotated_impl_now_rejected_by_rule_one() {
+        // Rule 1 (every parameter and return type annotated) is now
+        // enforced, so an unannotated `def greet(self):` is itself a
+        // diagnostic before conformance is ever consulted. The conformance
+        // path that treats `Type::Unknown` permissively still exists for
+        // compiler-synthesised stubs; it just can't be reached through
+        // user source without violating Rule 1.
         let src = "\
 interface Greeter:
     def greet(self) -> str: ...
@@ -3800,8 +3916,15 @@ let g: Greeter = BareGreeter()
 ";
         let d = check(src);
         assert!(
-            !d.has_errors(),
-            "unannotated method impl should satisfy interface (unknown return type); errors: {:?}",
+            d.has_errors(),
+            "Rule 1 should reject the unannotated `greet` impl; errors: {:?}",
+            d.errors()
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| format!("{e}").contains("missing a type annotation")),
+            "expected a missing_annotation diagnostic; got: {:?}",
             d.errors()
         );
     }

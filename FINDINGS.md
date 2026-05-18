@@ -331,6 +331,14 @@ guarding — and suppress the other when it applies.
 
 ## 9. `tyc::pure_violation` is documented but never emitted (gap, critical)
 
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. The diagnostic
+existed under the name `tyc::impure_pure_fn` (#36 corrected the doc drift)
+and was already wired into `tyc build`. The CI hole was that `tyc check`
+skipped the purity pass entirely — fixed by #28, which calls
+`analyse_purity` + `purity_diagnostics` from `tyc check`. All four
+examples in the original finding now produce `tyc::impure_pure_fn`
+errors under both `tyc check` and `tyc build`.
+
 **Severity:** gap — documented language feature is a no-op.
 
 The `@pure` decorator is the canonical contract in Typhon — six conditions
@@ -726,6 +734,14 @@ REPL evaluates the statement but throws away the value. Add an implicit
 
 ## 26. Interface structural conformance breaks when impl is in `impl` block (bug, critical)
 
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. The
+`collect_classes_and_functions` pass in `tyc-types` now folds methods from
+the `__typhon_impl_<Name>` pseudo-class (the preprocessor's lowering of
+`impl Name:` / `extend Name:`) back into the target class's `InterfaceShape`
+before interface conformance runs. The canonical Drawable cheat-sheet
+example compiles, and bounded-generic conformance (#27) falls out
+automatically.
+
 **Severity:** bug — critical; canonical cheat-sheet example fails to compile.
 
 Verbatim from the skill cheat-sheet:
@@ -785,6 +801,10 @@ codebase.
 
 ## 27. `Drawable`-bounded generics reject conforming classes too (bug)
 
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Same root cause as
+#26; the impl-block merge in `collect_classes_and_functions` makes the
+bounded-generic path see the impl-contributed methods.
+
 **Severity:** bug — same root cause as Finding #26.
 
 ```ty
@@ -803,6 +823,14 @@ Once #26 is fixed this should fall out.
 ---
 
 ## 28. `tyc check` skips comptime evaluation and purity checks (gap, critical)
+
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. `tyc check` now
+calls `evaluate_comptime` and `analyse_purity` (via a `run_analysis_passes`
+helper) for every checked `.ty` source after `check_file` runs. The LSP
+path (`check_source_file`) is left as-is so editors don't flood users with
+env-dependent errors while typing. CI pipelines that gate on `tyc check`
+now catch `@pure` violations and missing required env vars instead of
+deferring those failures to production builds.
 
 **Severity:** gap — CI hole.
 
@@ -860,6 +888,15 @@ Either expand the evaluator or shrink the docs.
 ---
 
 ## 30. Missing param / return types are not enforced (bug, critical)
+
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Added a new
+`tyc::missing_annotation` diagnostic and an `enforce_annotation_rule` pass
+that runs from `check_function` (so the rule is enforced under both `tyc
+check` and `tyc build`). Receivers (`self` / `cls`) are exempted, and
+compiler-synthesised helpers named `__typhon_*` are excluded so desugar
+bridges don't trigger user-facing errors. Methods inside `interface
+Name:` bodies are unaffected because their preprocessed form already
+declares `-> T` and takes no user-visible positional args.
 
 **Severity:** bug — Rule 1 of Typhon is not enforced.
 
