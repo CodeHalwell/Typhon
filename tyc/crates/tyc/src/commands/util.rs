@@ -7,17 +7,28 @@ use tyc_diagnostics::{Diagnostics, TycError};
 
 use crate::config::TyphonConfig;
 
-/// Re-classify warnings as errors according to the `[strictness]` config section.
+/// Re-classify warnings according to the `[strictness]` config section.
 ///
-/// Currently handles `unused-import`:
-/// - `"warn"`: `UnusedImport` diagnostics remain warnings.
-/// - `"error"` (default): `UnusedImport` diagnostics are promoted to errors.
+/// Currently handles:
+/// - `unused-import`:
+///   - `"warn"`: `UnusedImport` diagnostics remain warnings.
+///   - `"error"` (default): `UnusedImport` diagnostics are promoted to errors.
+/// - `methods-in-class-body`:
+///   - `"warn"` (default): `MethodInClassBody` stays a warning.
+///   - `"error"`: `MethodInClassBody` is promoted to an error so CI breaks
+///     on Rule-4 violations (methods belong in `impl Name:`, not the
+///     class body).
+///   - `"off"`: `MethodInClassBody` is dropped entirely — useful for
+///     codebases still mid-migration to the `impl`-only form.
 ///
-/// All other warnings are passed through unchanged.  The function consumes the
+/// All other warnings are passed through unchanged. The function consumes the
 /// input `Diagnostics` to avoid cloning individual diagnostics.
 pub fn apply_strictness(diags: Diagnostics, config: &TyphonConfig) -> Diagnostics {
     let promote_unused_import = config.strictness.unused_import == "error";
-    if !promote_unused_import {
+    let methods_in_class_body = config.strictness.methods_in_class_body.as_str();
+    if !promote_unused_import
+        && (methods_in_class_body == "warn" || methods_in_class_body.is_empty())
+    {
         return diags;
     }
     let (errors, warnings) = diags.into_parts();
@@ -26,8 +37,14 @@ pub fn apply_strictness(diags: Diagnostics, config: &TyphonConfig) -> Diagnostic
         new_diags.push_error(err);
     }
     for warn in warnings {
-        if matches!(warn, TycError::UnusedImport { .. }) {
+        if promote_unused_import && matches!(warn, TycError::UnusedImport { .. }) {
             new_diags.push_error(warn);
+        } else if matches!(warn, TycError::MethodInClassBody { .. }) {
+            match methods_in_class_body {
+                "off" => {} // drop the diagnostic entirely
+                "error" => new_diags.push_error(warn),
+                _ => new_diags.push_warning(warn),
+            }
         } else {
             new_diags.push_warning(warn);
         }
@@ -80,4 +97,67 @@ fn collect_with_ext(root: &Path, ext: &str, acc: &mut Vec<PathBuf>) -> Result<()
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::TyphonConfig;
+
+    fn config_with_methods_in_class_body(severity: &str) -> TyphonConfig {
+        let mut c = TyphonConfig::default();
+        c.strictness.methods_in_class_body = severity.into();
+        c
+    }
+
+    fn method_in_class_body_warning() -> TycError {
+        TycError::method_in_class_body("Button", "draw", "<test>", "x", 0, 1)
+    }
+
+    #[test]
+    fn methods_in_class_body_warn_keeps_as_warning() {
+        let mut diags = Diagnostics::new();
+        diags.push_warning(method_in_class_body_warning());
+        let out = apply_strictness(diags, &config_with_methods_in_class_body("warn"));
+        assert_eq!(out.errors().len(), 0);
+        assert_eq!(out.warning_count(), 1);
+    }
+
+    #[test]
+    fn methods_in_class_body_error_promotes_to_error() {
+        let mut diags = Diagnostics::new();
+        diags.push_warning(method_in_class_body_warning());
+        let out = apply_strictness(diags, &config_with_methods_in_class_body("error"));
+        assert_eq!(out.errors().len(), 1);
+        assert_eq!(out.warning_count(), 0);
+    }
+
+    #[test]
+    fn methods_in_class_body_off_drops_the_diagnostic() {
+        let mut diags = Diagnostics::new();
+        diags.push_warning(method_in_class_body_warning());
+        let out = apply_strictness(diags, &config_with_methods_in_class_body("off"));
+        assert_eq!(out.errors().len(), 0);
+        assert_eq!(out.warning_count(), 0);
+    }
+
+    #[test]
+    fn methods_in_class_body_does_not_affect_other_warnings() {
+        // Promoting MethodInClassBody to error must not also promote other
+        // warnings (e.g. UnusedImport, which has its own knob).
+        let mut diags = Diagnostics::new();
+        diags.push_warning(method_in_class_body_warning());
+        diags.push_warning(TycError::unused_import("os", "<test>", "import os", 0, 9));
+        let mut config = TyphonConfig::default();
+        config.strictness.unused_import = "warn".into();
+        config.strictness.methods_in_class_body = "error".into();
+        let out = apply_strictness(diags, &config);
+        // MethodInClassBody promoted, UnusedImport stays a warning.
+        assert_eq!(out.errors().len(), 1);
+        assert_eq!(out.warning_count(), 1);
+        assert!(matches!(
+            out.errors()[0],
+            TycError::MethodInClassBody { .. }
+        ));
+    }
 }

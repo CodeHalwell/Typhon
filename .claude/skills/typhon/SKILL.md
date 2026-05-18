@@ -459,7 +459,7 @@ async def load(uid: int) -> Dashboard:
     return Dashboard(user=user, posts=posts)
 ```
 
-There is no diagnostic when a callee lacks `@gatherable` — the awaits just stay sequential. If you forget to decorate, you'll see no parallelism *and* no error. Run `tyc trace` or read the emitted Python to confirm whether a particular run got rewritten.
+When a run of 2+ adjacent independent awaits would have been gathered but at least one callee lacks `@gatherable`, `tyc build` surfaces a `tyc::auto_gather_missed` advice-level diagnostic naming the missing callee. (Only fires with `[strictness] auto-gather = true`; the nudge is silent when you haven't opted in.) Imported async callees are deliberately excluded — you can't decorate code you don't own — so the diagnostic only flags missed opportunities you could actually fix.
 
 ### `go` — fire-and-forget
 
@@ -532,13 +532,13 @@ Module-level lazy bindings use the runtime helper rather than `functools.cached_
 comptime let PORT: int = int(env("PORT", "8080"))
 comptime let DB_URL: str = env("DATABASE_URL")   # build fails if unset
 comptime let IS_PROD: bool = env("BUILD_TAG", "dev") == "prod"
+comptime let TAGS: list[str] = ["alpha", "beta"].split(",") if False else ["alpha", "beta"]
+comptime let HOST: str = env("HOST", "localhost").lower()
 
-# User-defined `comptime def` functions parse today but the evaluator
-# can't yet inline calls to them — only the built-in `env()`, `int()`,
-# `str()`, `float()`, and arithmetic / comparison primitives are
-# supported. Listed here as the intended surface.
 comptime def feature(name: str) -> bool:
-    return env(f"FEATURE_{name.upper()}", "0") == "1"
+    return env("FEATURE_" + name.upper(), "0") == "1"
+
+comptime let SHIPS_AUTH: bool = feature("auth")
 ```
 
 Declare required env vars in `typhon.toml`:
@@ -548,7 +548,7 @@ Declare required env vars in `typhon.toml`:
 required = ["DATABASE_URL"]
 ```
 
-The sandbox is intentionally tight. Today it supports: integer / float / string / boolean literals, basic arithmetic (`+ - * / //` and the comparable comparison ops), `env("NAME")` / `env("NAME", "default")`, and the `int()` / `str()` / `float()` casts. Container literals (`[...]`, `{...}`, `(...)`), method calls on strings (`"hi".upper()`), and user-defined `comptime def` functions are roadmapped but not yet evaluable. Anything else — I/O, subprocess, network, `random` / `time`, arbitrary imports — is permanently out of scope.
+The sandbox is intentionally tight, but covers a useful surface. Today it supports: integer / float / string / boolean literals, container literals (`[1, 2, 3]`, `{"a": 1}`, `(1, "x")`, including empty containers and the trailing-comma single-element tuple form), basic arithmetic (`+ - * / //` and the comparable comparison ops), boolean ops (`and` / `or`), ternaries (`x if cond else y`), `env("NAME")` / `env("NAME", "default")`, the `int()` / `str()` / `float()` / `len()` casts, a small pure-only set of string methods (`upper`, `lower`, `strip`, `lstrip`, `rstrip`, `replace`, `startswith`, `endswith`, `split`), and calls to user-defined `comptime def` functions. Anything else — I/O, subprocess, network, `random` / `time`, arbitrary imports, mutation — is permanently out of scope.
 
 Emitted Python sees only the inlined literal:
 
@@ -677,6 +677,7 @@ format = true                    # post-process through ruff format
 no-implicit-any = true
 unused-import = "error"          # or "warn" | "off"
 exhaustive-match = "error"
+methods-in-class-body = "warn"   # or "error" (break CI) | "off"
 auto-memoise = false             # opt-in; inserts @functools.cache on inferred pure fns
 auto-gather = false              # opt-in; folds independent awaits into TaskGroup (needs @gatherable)
 auto-parallel = false            # opt-in; pure list comprehensions → thread-pool map
@@ -806,6 +807,8 @@ The recurring diagnostic codes and what they actually mean. All are documented i
 | `tyc::interface_isinstance` | `isinstance(x, SomeInterface)` | Use static narrowing or refactor to a sealed union |
 | `tyc::stub_mismatch` | `.dty` vs `.py` drift detected by `tyc check --stubs` | Update the stub or implementation |
 | `tyc::unused_import` | Severity controlled by `[strictness] unused-import` | Remove the import (LSP "Remove unused import" code-action exists) |
+| `tyc::method_in_class_body` (warn by default) | A `def` inside `class Name:` instead of `impl Name:` (Rule 4) | Move into an `impl Name:` block. Severity controlled by `[strictness] methods-in-class-body` (`warn` / `error` / `off`). |
+| `tyc::auto_gather_missed` (advice) | Adjacent awaits look gather-able but a callee lacks `@gatherable` | Decorate the named callee. Fires from `tyc build` only when `[strictness] auto-gather = true`. |
 
 When in doubt about a diagnostic, `rg "TYC_CODE_NAME" tyc/crates` — every code is registered once in source.
 

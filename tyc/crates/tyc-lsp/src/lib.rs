@@ -400,9 +400,15 @@ impl Backend {
                 }
             }
         }
-        // Slow path: parse and resolve, then store.
+        // Slow path: parse and resolve, then store. The LSP doesn't
+        // surface unused-import diagnostics on a per-keystroke basis, so
+        // the lazy-import remap path stays inert here (empty list +
+        // None original source); the disk-backed `tyc check` carries
+        // the user-friendly FINDINGS #15 remap.
         let options = ResolveOptions {
             raw_class_byte_starts,
+            lazy_import_remaps: Vec::new(),
+            original_source: None,
         };
         let resolved = resolve_in_preprocessed(preprocessed, options)?;
         let arc = Arc::new(resolved);

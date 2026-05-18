@@ -92,6 +92,13 @@ pub struct StrictnessConfig {
     pub no_implicit_any: bool,
     pub unused_import: String,
     pub exhaustive_match: String,
+    /// Severity for `tyc::method_in_class_body` (Rule 4: methods live in
+    /// `impl Name:`, not in the class body). `"warn"` (default) is the
+    /// shipped behaviour and matches every other "nudge" diagnostic.
+    /// `"error"` promotes it through [`crate::commands::util::apply_strictness`]
+    /// so CI breaks on the form. `"off"` suppresses the diagnostic
+    /// entirely — useful for codebases still mid-migration.
+    pub methods_in_class_body: String,
     /// When true, every function that passes the six-condition purity check
     /// is treated as if the user had written `@memo` — the desugarer emits a
     /// `@functools.cache` decorator. Off by default; opt in per-project.
@@ -138,6 +145,7 @@ impl Default for StrictnessConfig {
             no_implicit_any: true,
             unused_import: "error".into(),
             exhaustive_match: "error".into(),
+            methods_in_class_body: "warn".into(),
             auto_memoise: false,
             auto_gather: false,
             pgo_memoise: false,

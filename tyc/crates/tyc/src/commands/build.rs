@@ -17,19 +17,19 @@ use ruff_python_parser::parse_expression;
 use ruff_text_size::TextRange;
 
 use tyc_analyse::{
-    analyse_purity, collect_gatherable_async_fn_names, evaluate_comptime_with_functions,
-    extract_builtin_extensions, load_profile_samples, pgo_memoise_targets, purity_diagnostics,
-    rewrite_auto_gather, rewrite_builtin_extension_calls, rewrite_parallel_comprehensions,
-    ComptimeValue, ProfileSample,
+    analyse_purity, collect_gatherable_async_fn_names, detect_missed_gathers,
+    evaluate_comptime_with_functions, extract_builtin_extensions, load_profile_samples,
+    pgo_memoise_targets, purity_diagnostics, rewrite_auto_gather, rewrite_builtin_extension_calls,
+    rewrite_parallel_comprehensions, ComptimeValue, ProfileSample,
 };
 use tyc_db::{check_file, TycDatabase};
 use tyc_desugar::{desugar_module_with, DesugarOptions};
-use tyc_diagnostics::Diagnostics;
+use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_emit::{emit_python_with_line_offsets, emit_stub};
 use tyc_format::format_source;
 use tyc_syntax::preprocess::{
-    expand_gather_blocks, expand_go_calls, expand_lazy_imports, expand_pipes, expand_question_ops,
-    expand_with_chains, line_byte_starts, preprocess,
+    expand_gather_blocks, expand_go_calls, expand_lazy_imports, expand_multiline_guards,
+    expand_pipes, expand_question_ops, expand_with_chains, line_byte_starts, preprocess,
 };
 
 use crate::commands::util::{apply_strictness, collect_dty_files, collect_ty_files};
@@ -185,7 +185,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // become a full inline proxy class before the other sugar passes see
         // them.
         let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
-            &expand_gather_blocks(&expand_lazy_imports(source)),
+            &expand_gather_blocks(&expand_multiline_guards(&expand_lazy_imports(source))),
         ))));
         let prep = preprocess(&expanded);
 
@@ -274,6 +274,30 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // wiring is needed here.
         let mut module = module;
         if config.strictness.auto_gather {
+            // Surface runs that would have been gathered if every callee
+            // carried `@gatherable`. Advice-only; doesn't block builds.
+            // Print directly through miette so the rendered output shows
+            // the [Advice] severity badge — these don't go through the
+            // Diagnostics warnings list because Phase 1 has already
+            // exited if any error was present. Run before the rewrite so
+            // we see the original shape, not the lowered TaskGroup.
+            for missed in detect_missed_gathers(&module) {
+                let offset = missed.call_range.start().to_usize();
+                let length = missed
+                    .call_range
+                    .end()
+                    .to_usize()
+                    .saturating_sub(offset)
+                    .max(1);
+                let advice = TycError::auto_gather_missed(
+                    missed.missing_callee,
+                    path.display().to_string(),
+                    &prep.python_source,
+                    offset,
+                    length,
+                );
+                eprintln!("{:?}", miette::Report::new_boxed(Box::new(advice)));
+            }
             let eligible = collect_gatherable_async_fn_names(&module);
             let _stats = rewrite_auto_gather(&mut module, &eligible);
         }
@@ -388,7 +412,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // declarations.  Run the preprocessor so `val`/`var`/`model` stripping
         // works, then desugar to plain Python so the printer can emit it.
         let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
-            &expand_gather_blocks(&expand_lazy_imports(&source)),
+            &expand_gather_blocks(&expand_multiline_guards(&expand_lazy_imports(&source))),
         ))));
         let prep = preprocess(&expanded);
         let module = tyc_syntax::parse_module(&prep.python_source)
@@ -1597,8 +1621,8 @@ async def fetch_b() -> int:
     return 2
 
 async def load() -> int:
-    a = await fetch_a()
-    b = await fetch_b()
+    let a = await fetch_a()
+    let b = await fetch_b()
     return a + b
 ";
         let (_, out_dir) = scaffold_auto_gather(tmp.path(), src);
@@ -1629,8 +1653,8 @@ async def fetch_b() -> int:
     return 2
 
 async def load() -> int:
-    a = await fetch_a()
-    b = await fetch_b()
+    let a = await fetch_a()
+    let b = await fetch_b()
     return a + b
 ";
         let (_, out_dir) = scaffold(tmp.path(), src);
@@ -1663,8 +1687,8 @@ async def fetch_b() -> int:
     return 2
 
 async def load() -> int:
-    a = await fetch_a()
-    b = await fetch_b()
+    let a = await fetch_a()
+    let b = await fetch_b()
     return a + b
 ";
         let (_, out_dir) = scaffold_auto_gather(tmp.path(), src);
@@ -1703,8 +1727,8 @@ async def fetch_b(x: int) -> int:
     return x
 
 async def load() -> int:
-    a = await fetch_a()
-    b = await fetch_b(a)
+    let a = await fetch_a()
+    let b = await fetch_b(a)
     return a + b
 ";
         let (_, out_dir) = scaffold_auto_gather(tmp.path(), src);

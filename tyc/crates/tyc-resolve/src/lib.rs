@@ -165,6 +165,38 @@ pub struct ResolveOptions {
     /// next line break — is tagged [`ClassKind::Raw`]. The preprocessor
     /// emits this list via [`tyc_syntax::preprocess::line_byte_starts`].
     pub raw_class_byte_starts: Vec<u32>,
+    /// Lazy-import diagnostic remaps. When the unused-import pass fires
+    /// on a binding whose preprocessed line was originally a `lazy
+    /// import` declaration, the resolver rewrites the diagnostic's
+    /// source and span to point at the user-authored
+    /// `lazy import ALIAS = MODULE` line instead of the
+    /// preprocessor-synthesised `import MODULE as ALIAS` (FINDINGS #15).
+    /// Empty for callers that don't have the metadata handy.
+    pub lazy_import_remaps: Vec<LazyImportRemap>,
+    /// The original Typhon source (pre-preprocess). Required when
+    /// `lazy_import_remaps` is non-empty so the diagnostic can render
+    /// the user-written line. Ignored when no remaps are present.
+    pub original_source: Option<String>,
+}
+
+/// One `lazy import ALIAS = MODULE` declaration's mapping back to the
+/// original Typhon source. Built by callers from
+/// [`tyc_syntax::preprocess::PreprocessResult::lazy_imports`] plus the
+/// raw text and surfaced to the resolver through [`ResolveOptions`].
+#[derive(Debug, Clone)]
+pub struct LazyImportRemap {
+    /// The 0-based line index of the `lazy import` statement. The
+    /// preprocessor preserves line numbering exactly (each `lazy import`
+    /// line becomes one `import X as Y` line), so this same index
+    /// applies to both the original Typhon source and the preprocessed
+    /// Python source the resolver walks.
+    pub line_index: usize,
+    /// Byte offset in the *original* source of the alias identifier
+    /// (the `np` in `lazy import np = numpy`). This is where the
+    /// diagnostic's label anchors.
+    pub original_alias_offset: usize,
+    /// Length of the alias identifier in bytes.
+    pub original_alias_length: usize,
 }
 
 /// The resolved structure of a module: scopes, bindings, references, plus
@@ -306,11 +338,26 @@ struct Resolver<'a> {
     /// without this guard a re-declaration would emit the same diagnostic
     /// twice.
     seen_immutable_redecl: std::collections::HashSet<((usize, usize), (usize, usize))>,
+    /// `(scope, span)` pairs already reported as `missing_binding_kind`.
+    /// Same dedup story as `seen_immutable_redecl`: the bareword
+    /// assignment is visited once per pre-collect pass and once per
+    /// walk pass, but we only want one diagnostic per source location.
+    seen_missing_binding_kind: std::collections::HashSet<(ScopeId, (usize, usize))>,
     /// Sorted byte offsets pointing at the first non-whitespace character
     /// of each `class!` declaration line in [`Self::source`]. Consulted
     /// when declaring a class binding to decide whether to tag it
     /// [`ClassKind::Raw`].
     raw_class_byte_starts: Vec<u32>,
+    /// Lazy-import remap metadata + the original Typhon source. When
+    /// `lazy_import_remaps` is non-empty, the unused-import emitter
+    /// rewrites its diagnostic to anchor on the original `lazy import
+    /// ALIAS = MODULE` line (FINDINGS #15).
+    lazy_import_remaps: Vec<LazyImportRemap>,
+    original_source: Option<String>,
+    /// Line starts (byte offsets) of the preprocessed source. Lazily
+    /// computed the first time the unused-import emitter needs to
+    /// translate a preprocessed byte offset to a line index.
+    preprocessed_line_starts: std::cell::OnceCell<Vec<usize>>,
 }
 
 impl<'a> Resolver<'a> {
@@ -329,7 +376,11 @@ impl<'a> Resolver<'a> {
             references: Vec::new(),
             diagnostics: Diagnostics::new(),
             seen_immutable_redecl: std::collections::HashSet::new(),
+            seen_missing_binding_kind: std::collections::HashSet::new(),
             raw_class_byte_starts: options.raw_class_byte_starts,
+            lazy_import_remaps: options.lazy_import_remaps,
+            original_source: options.original_source,
+            preprocessed_line_starts: std::cell::OnceCell::new(),
         }
     }
 
@@ -540,6 +591,22 @@ impl<'a> Resolver<'a> {
                     continue;
                 }
                 if !used_bindings.contains(&(scope_id, binding_idx)) {
+                    // FINDINGS #15: when this import sits on a line that
+                    // was originally `lazy import ALIAS = MODULE`, render
+                    // the diagnostic against the original Typhon source
+                    // and anchor on the user-written alias offset.
+                    if let Some(remap) = self.lazy_import_remap_for(binding.span.0) {
+                        if let Some(orig) = self.original_source.as_ref() {
+                            self.diagnostics.push_warning(TycError::unused_import(
+                                binding.name.clone(),
+                                &self.path,
+                                orig.clone(),
+                                remap.original_alias_offset,
+                                remap.original_alias_length.max(1),
+                            ));
+                            continue;
+                        }
+                    }
                     let length = binding.span_length().max(1);
                     self.diagnostics.push_warning(TycError::unused_import(
                         binding.name.clone(),
@@ -551,6 +618,38 @@ impl<'a> Resolver<'a> {
                 }
             }
         }
+    }
+
+    /// Translate a preprocessed-source byte offset to a 0-based line
+    /// index, computing (and caching) the line-start table on first
+    /// use. Lazily computed because most resolves don't need it.
+    fn preprocessed_line_at_offset(&self, offset: usize) -> usize {
+        let starts = self.preprocessed_line_starts.get_or_init(|| {
+            let mut v = vec![0usize];
+            for (i, b) in self.source.bytes().enumerate() {
+                if b == b'\n' {
+                    v.push(i + 1);
+                }
+            }
+            v
+        });
+        match starts.binary_search(&offset) {
+            Ok(line) => line,
+            Err(line) => line.saturating_sub(1),
+        }
+    }
+
+    /// If `offset` (preprocessed) lies on a `lazy import` declaration
+    /// line, return the matching remap. Returns `None` for non-lazy
+    /// import bindings (the common case).
+    fn lazy_import_remap_for(&self, offset: usize) -> Option<&LazyImportRemap> {
+        if self.lazy_import_remaps.is_empty() {
+            return None;
+        }
+        let line = self.preprocessed_line_at_offset(offset);
+        self.lazy_import_remaps
+            .iter()
+            .find(|r| r.line_index == line)
     }
 }
 
@@ -789,6 +888,30 @@ fn declare_target(
             // `let`; later bare assignments inherit the existing binding's
             // mutability.
             let existing_mut = r.lookup_local(scope, n.id.as_str()).map(|b| b.mutability);
+            // Rule 2 of Typhon: a first bareword assignment to a new name
+            // inside a function/method scope is `tyc::missing_binding_kind`.
+            // Skipped for compiler-synthesised `__typhon_*` temporaries
+            // (e.g. the `?` operator's `__typhon_q_N__`, `with`-chain
+            // intermediates, auto-gather TaskGroup names) so desugar
+            // bridges don't trigger user-facing errors.
+            let span = (
+                n.range.start().to_usize(),
+                n.range.start().to_usize() + n.id.as_str().len(),
+            );
+            if ast_mutability.is_none()
+                && existing_mut.is_none()
+                && r.scopes[scope].kind == ScopeKind::Function
+                && !n.id.as_str().starts_with("__typhon_")
+                && r.seen_missing_binding_kind.insert((scope, span))
+            {
+                r.diagnostics.push_error(TycError::missing_binding_kind(
+                    n.id.as_str(),
+                    &r.path,
+                    r.source,
+                    span.0,
+                    n.id.as_str().len().max(1),
+                ));
+            }
             let mutability = match ast_mutability {
                 Some(ast::Mutability::Let) => Mutability::Let,
                 Some(ast::Mutability::Mut) => Mutability::Mut,
@@ -798,10 +921,6 @@ fn declare_target(
                     Mutability::Mut
                 }),
             };
-            let span = (
-                n.range.start().to_usize(),
-                n.range.start().to_usize() + n.id.as_str().len(),
-            );
             r.declare(scope, n.id.as_str(), BindingKind::Value, mutability, span);
         }
         // Tuple destructuring (`a, b = expr`, `(a, b) = expr`) and list
@@ -1613,6 +1732,7 @@ mod tests {
             tyc_syntax::preprocess::line_byte_starts(&prep.python_source, &prep.raw_class_lines);
         let options = ResolveOptions {
             raw_class_byte_starts,
+            ..ResolveOptions::default()
         };
         let module = tyc_syntax::parse_module(&prep.python_source)
             .unwrap()
@@ -1794,6 +1914,75 @@ def foo():
         assert!(d.has_errors());
         let msg = format!("{}", d.errors()[0]);
         assert!(msg.contains("cannot find 'z'"), "got {}", msg);
+    }
+
+    #[test]
+    fn function_local_bareword_assign_requires_binding_kind() {
+        // Rule 2: locals must carry `let` or `mut`. Module scope still
+        // defaults to `let`, so this only fires at function scope.
+        let (_m, d) = resolve("def f() -> None:\n    counter = 1\n");
+        assert!(d.has_errors(), "bareword local must error");
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingBindingKind { .. })),
+            "expected MissingBindingKind variant, got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn function_local_let_assignment_is_clean() {
+        // Sanity: explicit `let` does not trigger missing_binding_kind.
+        let (_m, d) = resolve("def f() -> None:\n    let counter = 1\n");
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn function_local_mut_assignment_is_clean() {
+        let (_m, d) = resolve("def f() -> None:\n    mut counter = 0\n    counter = counter + 1\n");
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn module_level_bareword_assign_still_clean() {
+        // Rule 2 only applies at function scope; module-level bindings
+        // default to `let` and are exempt.
+        let (_m, d) = resolve("counter = 1\n");
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn synthetic_temp_assignment_is_exempt() {
+        // Compiler-synthesised `__typhon_*` temps (e.g. the `?` operator's
+        // `__typhon_q_N__`) must not trigger the diagnostic — the
+        // user-source spelling is `expr?`, never a bare assignment.
+        let (_m, d) =
+            resolve("def f() -> None:\n    __typhon_q_0__ = 1\n    print(__typhon_q_0__)\n");
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingBindingKind { .. })),
+            "synthesised temp must not fire MissingBindingKind: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn function_local_rebind_inherits_kind_without_diagnostic() {
+        // The first declaration carries the keyword; later bareword
+        // assignments to the same name in the same scope inherit the
+        // existing binding's mutability and don't re-trigger the
+        // diagnostic. (Reassignment of a `let` still produces
+        // `immutable_assign`, which is the right diagnostic for that case.)
+        let (_m, d) = resolve("def f() -> None:\n    mut counter = 0\n    counter = counter + 1\n");
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingBindingKind { .. })),
+            "rebind of existing local must not fire MissingBindingKind: {:?}",
+            d.errors()
+        );
     }
 
     #[test]

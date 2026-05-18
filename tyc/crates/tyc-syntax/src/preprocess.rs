@@ -2225,6 +2225,254 @@ pub fn expand_question_ops(source: &str) -> String {
     result
 }
 
+// ── multi-line `guard` expansion ───────────────────────────────────────────────
+
+/// Expand the multi-line `guard NAME = EXPR else:` form into the same
+/// shape the in-preprocess single-line handler produces. Runs as a
+/// pre-pass so the rest of the pipeline (single-line guards included)
+/// only sees one of two shapes: either the lowered form, or a still-
+/// unhandled guard line that the single-line path then matches.
+///
+/// Source form:
+///
+/// ```text
+///     guard w = weight else:
+///         log("missing")
+///         return 0
+/// ```
+///
+/// Lowered to:
+///
+/// ```text
+///     let __typhon_mguard_<N> = (weight)
+///     if __typhon_mguard_<N> is None:
+///         log("missing")
+///         return 0
+///     let w = __typhon_mguard_<N>
+/// ```
+///
+/// The `mguard` prefix (rather than the single-line form's `guard`) is
+/// deliberate: the single-line handler uses the source `line_index`
+/// directly, while this multi-line pass uses a per-call counter. Using
+/// distinct prefixes guarantees a multi-line and single-line guard on
+/// the same line index can never share a temp name.
+///
+/// Behaviour:
+/// - The body must be indented strictly deeper than the `guard` header.
+///   The body ends at the first line whose code (skipping blank and
+///   comment-only lines) indents at or above the header's indent.
+/// - An empty body (no indented lines after `else:`) is left unrewritten
+///   — the rest of the pipeline will produce a normal parse error.
+/// - Lines inside triple-quoted strings are passed through untouched.
+/// - This pass produces line-count drift: 1 header line lowers to 2
+///   non-body lines plus a trailing `let NAME = …` line, matching the
+///   single-line form's drift. Downstream span fidelity is the same
+///   as for single-line guards.
+pub fn expand_multiline_guards(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut in_string: Option<StringMode> = None;
+    let lines: Vec<&str> = source.split_inclusive('\n').collect();
+    let mut i = 0;
+    let mut counter: usize = 0;
+
+    while i < lines.len() {
+        let line = lines[i];
+        let pre = in_string;
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let _ = scan_line_code_end(raw, &mut in_string);
+
+        if pre.is_some() {
+            out.push_str(line);
+            i += 1;
+            continue;
+        }
+
+        let indent_len = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
+        let header_indent = &raw[..indent_len];
+        let body = &raw[indent_len..];
+
+        // Match `guard NAME = EXPR else:` with nothing after the colon
+        // (single-line form is handled inside `preprocess`). The
+        // header must end with `else:` and have no body suffix.
+        let Some(after_guard) = body.strip_prefix("guard ") else {
+            out.push_str(line);
+            i += 1;
+            continue;
+        };
+        let trimmed = after_guard.trim_end();
+        let Some(head) = trimmed.strip_suffix("else:") else {
+            // Either single-line form or unrecognised — leave it alone.
+            out.push_str(line);
+            i += 1;
+            continue;
+        };
+        // Require a space before `else:` so we don't match `selse:` or
+        // `relse:` inside an identifier.
+        if !head.ends_with(' ') {
+            out.push_str(line);
+            i += 1;
+            continue;
+        }
+        let assign_part = head.trim_end();
+        // Split NAME = EXPR on the first `=` outside brackets.
+        let Some((name, expr)) = split_guard_name_equals_expr(assign_part) else {
+            out.push_str(line);
+            i += 1;
+            continue;
+        };
+
+        // Collect the indented body. End at the first non-blank,
+        // non-comment-only line whose code indent is <= header indent.
+        //
+        // Three special cases bypass the indent-based termination:
+        //   1. Lines whose start sits inside an unterminated triple-
+        //      quoted string opened in an earlier body line — the
+        //      content's leading-column-0 text isn't real indentation.
+        //   2. Blank lines — the Python tokenizer skips them for
+        //      indentation purposes, and a body author might place
+        //      one before the first indented statement for clarity.
+        //   3. Comment-only lines — same reasoning; a `# comment` at
+        //      column 0 between two body statements doesn't dedent
+        //      the surrounding block.
+        // The body ends only when we hit a real code line at indent
+        // <= header indent (outside a string).
+        let mut body_lines: Vec<&str> = Vec::new();
+        let mut body_state = in_string;
+        let mut j = i + 1;
+        while j < lines.len() {
+            let candidate = lines[j];
+            let raw_c = candidate.trim_end_matches(['\n', '\r']);
+            // Case 1: inside a triple-quoted string opened in an
+            // earlier body line. Push and keep scanning string state.
+            if body_state.is_some() {
+                let _ = scan_line_code_end(raw_c, &mut body_state);
+                body_lines.push(candidate);
+                j += 1;
+                continue;
+            }
+            // Case 2/3: blank or comment-only line.
+            let stripped = raw_c.trim_start();
+            let is_blank_like = stripped.is_empty() || stripped.starts_with('#');
+            if is_blank_like {
+                body_lines.push(candidate);
+                j += 1;
+                continue;
+            }
+            let c_indent = raw_c
+                .find(|c: char| !c.is_whitespace())
+                .unwrap_or(raw_c.len());
+            if c_indent <= indent_len {
+                break;
+            }
+            // Track string state so a triple-quoted string opened
+            // inside the body is recognised on the next iteration.
+            let _ = scan_line_code_end(raw_c, &mut body_state);
+            body_lines.push(candidate);
+            j += 1;
+        }
+        // Drop trailing blank/comment-only lines from the body: they
+        // belong to the *surrounding* scope (the trailing `let NAME = …`
+        // we're about to emit must come before them so the binding is
+        // visible to subsequent statements). Without this, a guard
+        // followed by a blank-line gap before unrelated code would
+        // swallow the gap into the lowered `if` body and bury the
+        // binding too deeply.
+        while body_lines
+            .last()
+            .map(|l| {
+                let raw = l.trim_end_matches(['\n', '\r']);
+                let trimmed = raw.trim_start();
+                trimmed.is_empty() || trimmed.starts_with('#')
+            })
+            .unwrap_or(false)
+        {
+            body_lines.pop();
+            j -= 1;
+        }
+        // Body is "empty" if every collected line was blank/comment-only
+        // (now all popped). Bail and let the parser surface its own
+        // indent error rather than emitting an `if … is None:` with
+        // nothing inside it.
+        let has_code = body_lines.iter().any(|l| {
+            let raw = l.trim_end_matches(['\n', '\r']);
+            let trimmed = raw.trim_start();
+            !trimmed.is_empty() && !trimmed.starts_with('#')
+        });
+        if !has_code {
+            out.push_str(line);
+            i += 1;
+            continue;
+        }
+        if body_lines.is_empty() {
+            // Empty body — leave the source alone and let the parser
+            // surface its own indent error.
+            out.push_str(line);
+            i += 1;
+            continue;
+        }
+
+        // Emit the lowered form. Use a counter rather than the line
+        // index so each guard in a multi-line file gets a unique temp
+        // even when two headers share a column.
+        let tmp = format!("__typhon_mguard_{}", counter);
+        counter += 1;
+        out.push_str(header_indent);
+        out.push_str("let ");
+        out.push_str(&tmp);
+        out.push_str(" = (");
+        out.push_str(expr);
+        out.push_str(")\n");
+        out.push_str(header_indent);
+        out.push_str("if ");
+        out.push_str(&tmp);
+        out.push_str(" is None:\n");
+        for b in &body_lines {
+            out.push_str(b);
+        }
+        out.push_str(header_indent);
+        out.push_str("let ");
+        out.push_str(name);
+        out.push_str(" = ");
+        out.push_str(&tmp);
+        out.push('\n');
+        // Advance past the consumed lines + body.
+        in_string = body_state;
+        i = j;
+    }
+
+    out
+}
+
+/// Split `NAME = EXPR` on the first `=` outside brackets, returning
+/// `(NAME, EXPR)` trimmed. Returns `None` for malformed input (missing
+/// `=`, empty name, name that isn't a simple identifier, empty expr).
+fn split_guard_name_equals_expr(s: &str) -> Option<(&str, &str)> {
+    let mut depth = 0i32;
+    let bytes = s.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'=' if depth == 0 => {
+                // Reject `==` / `!=` / `<=` / `>=`.
+                let prev = i.checked_sub(1).map(|j| bytes[j]).unwrap_or(0);
+                let next = bytes.get(i + 1).copied().unwrap_or(0);
+                if matches!(prev, b'=' | b'!' | b'<' | b'>') || next == b'=' {
+                    continue;
+                }
+                let name = s[..i].trim();
+                let expr = s[i + 1..].trim();
+                if !is_simple_identifier(name) || expr.is_empty() {
+                    return None;
+                }
+                return Some((name, expr));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 // ── `with`-chain expansion ────────────────────────────────────────────────────
 
 /// Expand a `with`-chain into a flat sequence of guarded `Result` unwraps.
@@ -2824,8 +3072,15 @@ fn render_gather_block(
                 out.push_str(")\n");
                 task_names.push(task_name);
             }
+            // Emit `let` on each user-named binding so the resolver records
+            // them as explicit immutable bindings. The `gather:` keyword
+            // already advertises single-assignment semantics, so `let` is
+            // always the right mutability; `mut` would be wrong. Without
+            // the `let` here, the `tyc::missing_binding_kind` Rule-2
+            // enforcement would fire on the lowered assignment.
             for (b, task) in bindings.iter().zip(task_names.iter()) {
                 out.push_str(header_indent);
+                out.push_str("let ");
                 out.push_str(&b.name);
                 out.push_str(" = ");
                 out.push_str(task);
@@ -2852,6 +3107,13 @@ fn render_gather_block(
             // single binding we still need a trailing comma so Python performs
             // sequence unpacking (`x, = results`) rather than binding the
             // whole list to one name (`x = results`).
+            //
+            // We deliberately do NOT prefix `let` here: tuple-destructuring
+            // is not currently supported with a Typhon binding-kind
+            // keyword, and `declare_target`'s recursion into tuple
+            // patterns already declares the names. The Rule-2 enforcement
+            // in `declare_target` only fires on bare `Expr::Name` targets,
+            // so a tuple unpack is safe.
             out.push_str(header_indent);
             for (idx, b) in bindings.iter().enumerate() {
                 if idx > 0 {
@@ -4818,5 +5080,162 @@ def run() -> Result[str, str]:
         // `goto` (no space) must not trigger the rewrite.
         let out = expand_go_calls("goto = 1\n");
         assert_eq!(out, "goto = 1\n");
+    }
+
+    // ── #2: multi-line guard ────────────────────────────────────────────
+
+    #[test]
+    fn expand_multiline_guards_simple_body() {
+        let src = "\
+def f(x: int?) -> int:
+    guard v = x else:
+        return 0
+    return v
+";
+        let out = expand_multiline_guards(src);
+        assert!(out.contains("let __typhon_mguard_0 = (x)"));
+        assert!(out.contains("if __typhon_mguard_0 is None:"));
+        assert!(out.contains("        return 0"));
+        assert!(out.contains("let v = __typhon_mguard_0"));
+        assert!(!out.contains("guard v = x else:"));
+    }
+
+    #[test]
+    fn expand_multiline_guards_preserves_multiple_body_statements() {
+        let src = "\
+def f(x: int?) -> int:
+    guard v = x else:
+        print(\"oops\")
+        return 0
+    return v
+";
+        let out = expand_multiline_guards(src);
+        assert!(out.contains("        print(\"oops\")"));
+        assert!(out.contains("        return 0"));
+    }
+
+    #[test]
+    fn expand_multiline_guards_leaves_single_line_form_alone() {
+        // Single-line form is handled inside `preprocess`; this pre-pass
+        // must not touch it.
+        let src = "def f(x: int?) -> int:\n    guard v = x else: return 0\n    return v\n";
+        let out = expand_multiline_guards(src);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn expand_multiline_guards_empty_body_left_alone() {
+        // No indented body after `else:` — let the parser produce its
+        // own (better) diagnostic. Don't rewrite into nonsense.
+        let src = "def f(x: int?) -> int:\n    guard v = x else:\n    return v\n";
+        let out = expand_multiline_guards(src);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn expand_multiline_guards_counter_is_per_call_unique() {
+        let src = "\
+def a(x: int?) -> int:
+    guard v = x else:
+        return 0
+    return v
+
+def b(y: int?) -> int:
+    guard w = y else:
+        return 0
+    return w
+";
+        let out = expand_multiline_guards(src);
+        assert!(out.contains("__typhon_mguard_0"));
+        assert!(out.contains("__typhon_mguard_1"));
+    }
+
+    #[test]
+    fn expand_multiline_guards_inside_string_is_untouched() {
+        let src = "x = \"\"\"\nguard v = x else:\n    return 0\n\"\"\"\n";
+        let out = expand_multiline_guards(src);
+        // The lowered form must not appear inside a string literal.
+        assert!(!out.contains("__typhon_mguard_"));
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn expand_multiline_guards_leading_blank_line_is_absorbed() {
+        // Python ignores blank lines for indentation; a leading blank
+        // line after `else:` must not terminate the body before the
+        // first indented statement is seen. Regression for the
+        // gemini-code-assist / Copilot reviews on PR #51.
+        let src = "\
+def f(x: int?) -> int:
+    guard v = x else:
+
+        return 0
+    return v
+";
+        let out = expand_multiline_guards(src);
+        assert!(
+            out.contains("if __typhon_mguard_0 is None:"),
+            "leading blank must not break the rewrite; got:\n{out}"
+        );
+        assert!(
+            out.contains("        return 0"),
+            "body statement after the blank must be preserved; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn expand_multiline_guards_comment_only_dedent_does_not_terminate_body() {
+        // Comment-only lines (even at column 0) don't change Python's
+        // indentation context, so they must not split the body across
+        // the lowered `if`. Regression for the Codex P1 review on
+        // PR #51.
+        let src = "\
+def f(x: int?) -> int:
+    guard v = x else:
+        log(\"first\")
+# leading-column comment between body statements
+        return 0
+    return v
+";
+        let out = expand_multiline_guards(src);
+        // Both body statements end up inside the lowered `if`, with the
+        // comment preserved between them.
+        let if_block_start = out.find("if __typhon_mguard_0 is None:").unwrap();
+        let after_if = &out[if_block_start..];
+        let log_pos = after_if
+            .find("        log(\"first\")")
+            .expect("log call in body");
+        let comment_pos = after_if
+            .find("# leading-column comment between body statements")
+            .expect("comment preserved");
+        let return_pos = after_if.find("        return 0").expect("return in body");
+        // Source order is preserved.
+        assert!(log_pos < comment_pos && comment_pos < return_pos);
+        // The `let v = …` binding sits after the body, not before
+        // `return 0` (i.e. the comment did NOT terminate the body).
+        let let_pos = after_if.find("    let v = __typhon_mguard_0").unwrap();
+        assert!(return_pos < let_pos);
+    }
+
+    #[test]
+    fn expand_multiline_guards_triple_quoted_string_in_body_preserved() {
+        // A triple-quoted string opened in the body whose content
+        // dedents to column 0 must not terminate the body. Regression
+        // for the Copilot review on PR #51.
+        let src = "\
+def f(x: int?) -> int:
+    guard v = x else:
+        log(\"\"\"
+multi-line
+string content
+\"\"\")
+        return 0
+    return v
+";
+        let out = expand_multiline_guards(src);
+        assert!(out.contains("if __typhon_mguard_0 is None:"));
+        assert!(out.contains("multi-line"));
+        assert!(out.contains("string content"));
+        assert!(out.contains("        return 0"));
     }
 }

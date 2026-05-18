@@ -46,7 +46,10 @@ use tyc_syntax::preprocess::ComptimeBinding;
 const MAX_COMPTIME_DEPTH: usize = 64;
 
 pub mod auto_gather;
-pub use auto_gather::{collect_gatherable_async_fn_names, rewrite_auto_gather, AutoGatherStats};
+pub use auto_gather::{
+    collect_gatherable_async_fn_names, detect_missed_gathers, rewrite_auto_gather, AutoGatherStats,
+    MissedGather,
+};
 
 pub mod pgo;
 pub use pgo::{load_profile_samples, pgo_memoise_targets, ProfileSample};
@@ -70,6 +73,16 @@ pub enum ComptimeValue {
     Float(f64),
     Str(String),
     Bool(bool),
+    /// `[a, b, c]` — order-preserving heterogeneous list.
+    List(Vec<ComptimeValue>),
+    /// `(a, b)` — same shape as List at the value level; only the
+    /// emitted Python literal differs (parens vs brackets).
+    Tuple(Vec<ComptimeValue>),
+    /// `{"a": 1, "b": 2}` — order-preserving sequence of pairs.
+    /// Stored as a Vec rather than a HashMap so insertion order is
+    /// stable (Python dicts preserve insertion order from 3.7+, and
+    /// reproducible emit is important for build determinism).
+    Dict(Vec<(ComptimeValue, ComptimeValue)>),
 }
 
 impl ComptimeValue {
@@ -88,6 +101,45 @@ impl ComptimeValue {
             }
             ComptimeValue::Str(s) => python_string_literal(s),
             ComptimeValue::Bool(b) => if *b { "True" } else { "False" }.into(),
+            ComptimeValue::List(xs) => {
+                let mut s = String::from("[");
+                for (i, v) in xs.iter().enumerate() {
+                    if i > 0 {
+                        s.push_str(", ");
+                    }
+                    s.push_str(&v.to_python_literal());
+                }
+                s.push(']');
+                s
+            }
+            ComptimeValue::Tuple(xs) => {
+                let mut s = String::from("(");
+                for (i, v) in xs.iter().enumerate() {
+                    if i > 0 {
+                        s.push_str(", ");
+                    }
+                    s.push_str(&v.to_python_literal());
+                }
+                // Single-element tuples need the trailing comma.
+                if xs.len() == 1 {
+                    s.push(',');
+                }
+                s.push(')');
+                s
+            }
+            ComptimeValue::Dict(items) => {
+                let mut s = String::from("{");
+                for (i, (k, v)) in items.iter().enumerate() {
+                    if i > 0 {
+                        s.push_str(", ");
+                    }
+                    s.push_str(&k.to_python_literal());
+                    s.push_str(": ");
+                    s.push_str(&v.to_python_literal());
+                }
+                s.push('}');
+                s
+            }
         }
     }
 }
@@ -349,6 +401,59 @@ fn eval_expr(expr: &Expr, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue, St
             }
         }
 
+        // Container literals: `[1, 2, 3]`, `(1, 2)`, `{"a": 1}`.
+        // Empty containers are evaluable too — they're useful as
+        // base cases (`comptime let TAGS: list[str] = []` etc.). A
+        // Tuple with a single element parses through `Expr::Tuple`
+        // even when written as `(x,)`.
+        Expr::List(l) => {
+            let mut elts = Vec::with_capacity(l.elts.len());
+            for e in &l.elts {
+                elts.push(eval_expr(e, ctx)?);
+            }
+            Ok(ComptimeValue::List(elts))
+        }
+        Expr::Tuple(t) => {
+            let mut elts = Vec::with_capacity(t.elts.len());
+            for e in &t.elts {
+                elts.push(eval_expr(e, ctx)?);
+            }
+            Ok(ComptimeValue::Tuple(elts))
+        }
+        Expr::Dict(d) => {
+            // Build with last-write-wins on duplicate keys, matching
+            // Python's runtime dict semantics — `{"a": 1, "a": 2}` is
+            // `{"a": 2}` at runtime and likewise here. Keeping the
+            // dedup at construction time means `to_python_literal`
+            // emits a literal that round-trips identically, and the
+            // free `len()` correctly reports the unique-key count
+            // rather than the source-pair count.
+            let mut items: Vec<(ComptimeValue, ComptimeValue)> = Vec::with_capacity(d.items.len());
+            for item in &d.items {
+                let Some(key_expr) = item.key.as_ref() else {
+                    // `**spread` in a dict literal — comptime evaluation
+                    // doesn't model variadic spreads.
+                    return Err(
+                        "`**` dict spreading is not supported in comptime expressions".into(),
+                    );
+                };
+                let k = eval_expr(key_expr, ctx)?;
+                let v = eval_expr(&item.value, ctx)?;
+                if let Some(existing) = items.iter_mut().find(|(ek, _)| values_equal(ek, &k)) {
+                    existing.1 = v;
+                } else {
+                    items.push((k, v));
+                }
+            }
+            Ok(ComptimeValue::Dict(items))
+        }
+
+        // Attribute access exists only as part of a method call —
+        // `"hi".upper()` parses as Call(Attribute(StringLiteral("hi"),
+        // "upper"), []). The bare `Expr::Attribute` is handed off to
+        // [`eval_call`] only via the call form; outside of that
+        // context, attribute access on a comptime value has no
+        // meaning yet (no records, no namespaced functions).
         other => Err(format!(
             "expression is not a comptime-evaluable constant: {}",
             expr_kind_name(other)
@@ -456,6 +561,17 @@ fn eval_boolop(
 }
 
 fn eval_call(call: &ExprCall, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue, String> {
+    // Method-call form: `RECEIVER.METHOD(args)`. Currently supports a
+    // small set of pure string methods (`upper`, `lower`, `strip`,
+    // `replace`, `split`, `startswith`, `endswith`, `len`-via-`__len__`-
+    // free); the broader Python str API is intentionally narrow because
+    // comptime evaluation is hermetic and every method here must be
+    // determinable from inputs alone.
+    if let Expr::Attribute(attr) = call.func.as_ref() {
+        let receiver = eval_expr(&attr.value, ctx)?;
+        return eval_method_call(receiver, attr.attr.as_str(), call, ctx);
+    }
+
     let func_name = match call.func.as_ref() {
         Expr::Name(n) => n.id.as_str(),
         _ => return Err(
@@ -482,6 +598,11 @@ fn eval_call(call: &ExprCall, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue
                 ComptimeValue::Int(n) => Ok(ComptimeValue::Int(n)),
                 ComptimeValue::Float(f) => Ok(ComptimeValue::Int(f as i64)),
                 ComptimeValue::Bool(b) => Ok(ComptimeValue::Int(if b { 1 } else { 0 })),
+                ComptimeValue::List(_)
+                | ComptimeValue::Tuple(_)
+                | ComptimeValue::Dict(_) => {
+                    Err("int() in comptime context cannot accept a container".into())
+                }
             }
         }
         "float" => {
@@ -497,6 +618,11 @@ fn eval_call(call: &ExprCall, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue
                 ComptimeValue::Int(n) => Ok(ComptimeValue::Float(n as f64)),
                 ComptimeValue::Float(f) => Ok(ComptimeValue::Float(f)),
                 ComptimeValue::Bool(b) => Ok(ComptimeValue::Float(if b { 1.0 } else { 0.0 })),
+                ComptimeValue::List(_)
+                | ComptimeValue::Tuple(_)
+                | ComptimeValue::Dict(_) => {
+                    Err("float() in comptime context cannot accept a container".into())
+                }
             }
         }
         "str" => {
@@ -509,7 +635,41 @@ fn eval_call(call: &ExprCall, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue
                 ComptimeValue::Int(n) => n.to_string(),
                 ComptimeValue::Float(f) => f.to_string(),
                 ComptimeValue::Bool(b) => if b { "True" } else { "False" }.into(),
+                // Reject `str(container)` at comptime: matching Python's
+                // `str(["a"])` -> `"['a']"` (single-quoted nested
+                // strings) would require a separate Python-flavoured
+                // repr serialiser. `to_python_literal` always emits
+                // double-quoted strings, which is valid Python source
+                // but differs from Python's runtime `str()` output by
+                // one character per nested string. Better to reject
+                // than silently produce a value that contradicts what
+                // the same expression would compute at runtime.
+                ComptimeValue::List(_)
+                | ComptimeValue::Tuple(_)
+                | ComptimeValue::Dict(_) => {
+                    return Err(
+                        "str() on a container in comptime context would not match Python's runtime \
+                         repr (single-quoted nested strings); fold to a literal explicitly instead"
+                            .into(),
+                    );
+                }
             }))
+        }
+        "len" => {
+            if args.len() != 1 || !keywords.is_empty() {
+                return Err("len() in comptime context takes exactly one argument".into());
+            }
+            match eval_expr(&args[0], ctx)? {
+                ComptimeValue::Str(s) => Ok(ComptimeValue::Int(s.chars().count() as i64)),
+                ComptimeValue::List(xs) | ComptimeValue::Tuple(xs) => {
+                    Ok(ComptimeValue::Int(xs.len() as i64))
+                }
+                // Dict items are unique-keyed at construction time (see
+                // `Expr::Dict` arm in `eval_expr`), so the Vec length
+                // matches Python's `len(d)`.
+                ComptimeValue::Dict(items) => Ok(ComptimeValue::Int(items.len() as i64)),
+                _ => Err("len() requires a str, list, tuple, or dict".into()),
+            }
         }
         // Dispatch into a user-defined `comptime def` if one matches.
         _ if ctx.functions.contains_key(func_name) => {
@@ -524,6 +684,112 @@ fn eval_call(call: &ExprCall, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue
             "function '{}' is not valid in a comptime expression; use env(), int(), str(), float(), \
              or a top-level `comptime def`",
             other
+        )),
+    }
+}
+
+/// Dispatch a method call on an already-evaluated comptime value.
+/// Today supports a tight, pure-only subset of the Python string and
+/// container APIs — every method has a deterministic value-from-value
+/// contract (no I/O, no locale, no randomness). Reject everything
+/// else with a generic "unsupported" message so users discover the
+/// limit without combinatorial diagnostic per method name.
+fn eval_method_call(
+    receiver: ComptimeValue,
+    method: &str,
+    call: &ExprCall,
+    ctx: &mut EvalContext<'_>,
+) -> Result<ComptimeValue, String> {
+    if !call.arguments.keywords.is_empty() {
+        return Err(format!(
+            "comptime method '{method}' does not accept keyword arguments"
+        ));
+    }
+    let args: Vec<ComptimeValue> = call
+        .arguments
+        .args
+        .iter()
+        .map(|a| eval_expr(a, ctx))
+        .collect::<Result<_, _>>()?;
+    match (&receiver, method) {
+        // ── str methods ──────────────────────────────────────────────
+        (ComptimeValue::Str(s), "upper") => {
+            expect_arity(method, 0, &args)?;
+            Ok(ComptimeValue::Str(s.to_uppercase()))
+        }
+        (ComptimeValue::Str(s), "lower") => {
+            expect_arity(method, 0, &args)?;
+            Ok(ComptimeValue::Str(s.to_lowercase()))
+        }
+        (ComptimeValue::Str(s), "strip") => {
+            expect_arity(method, 0, &args)?;
+            Ok(ComptimeValue::Str(s.trim().to_owned()))
+        }
+        (ComptimeValue::Str(s), "lstrip") => {
+            expect_arity(method, 0, &args)?;
+            Ok(ComptimeValue::Str(s.trim_start().to_owned()))
+        }
+        (ComptimeValue::Str(s), "rstrip") => {
+            expect_arity(method, 0, &args)?;
+            Ok(ComptimeValue::Str(s.trim_end().to_owned()))
+        }
+        (ComptimeValue::Str(s), "replace") => {
+            expect_arity(method, 2, &args)?;
+            let needle = expect_str(method, &args[0])?;
+            let replacement = expect_str(method, &args[1])?;
+            Ok(ComptimeValue::Str(s.replace(needle, replacement)))
+        }
+        (ComptimeValue::Str(s), "startswith") => {
+            expect_arity(method, 1, &args)?;
+            let prefix = expect_str(method, &args[0])?;
+            Ok(ComptimeValue::Bool(s.starts_with(prefix)))
+        }
+        (ComptimeValue::Str(s), "endswith") => {
+            expect_arity(method, 1, &args)?;
+            let suffix = expect_str(method, &args[0])?;
+            Ok(ComptimeValue::Bool(s.ends_with(suffix)))
+        }
+        (ComptimeValue::Str(s), "split") => {
+            expect_arity(method, 1, &args)?;
+            let sep = expect_str(method, &args[0])?;
+            if sep.is_empty() {
+                return Err("comptime str.split() requires a non-empty separator".into());
+            }
+            let parts: Vec<ComptimeValue> = s
+                .split(sep)
+                .map(|p| ComptimeValue::Str(p.to_owned()))
+                .collect();
+            Ok(ComptimeValue::List(parts))
+        }
+        (ComptimeValue::Str(_), other) => Err(format!(
+            "comptime str method '{other}' is not supported; available: upper, lower, strip, lstrip, rstrip, replace, startswith, endswith, split"
+        )),
+
+        // ── unsupported receiver ─────────────────────────────────────
+        // Note: list / tuple / dict have no comptime methods. `len()`
+        // is exposed as the free function in `eval_call`, matching
+        // Python's `len(x)` rather than the non-Pythonic `x.len()`.
+        _ => Err(format!(
+            "comptime method '{method}' is not supported on this value type"
+        )),
+    }
+}
+
+fn expect_arity(method: &str, expected: usize, args: &[ComptimeValue]) -> Result<(), String> {
+    if args.len() != expected {
+        return Err(format!(
+            "comptime method '{method}' expects {expected} argument(s), got {}",
+            args.len()
+        ));
+    }
+    Ok(())
+}
+
+fn expect_str<'a>(method: &str, v: &'a ComptimeValue) -> Result<&'a str, String> {
+    match v {
+        ComptimeValue::Str(s) => Ok(s.as_str()),
+        _ => Err(format!(
+            "comptime method '{method}' expects a string argument"
         )),
     }
 }
@@ -1358,6 +1624,208 @@ comptime let Y: int = use_outer()
         assert!(diags.has_errors());
         let msg = format!("{:?}", diags.errors()[0]);
         assert!(msg.contains("unknown name"), "got: {msg}");
+    }
+
+    // ── #29: comptime container literals + string methods ────────────────
+
+    #[test]
+    fn comptime_list_literal_evaluated() {
+        let (values, diags) = eval("comptime let TAGS: list[int] = [1, 2, 3]\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        let v = values.get("TAGS").expect("TAGS must evaluate");
+        assert!(matches!(v, ComptimeValue::List(xs) if xs.len() == 3));
+        assert_eq!(v.to_python_literal(), "[1, 2, 3]");
+    }
+
+    #[test]
+    fn comptime_tuple_literal_evaluated() {
+        let (values, diags) = eval("comptime let PAIR: tuple[int, str] = (1, \"a\")\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert_eq!(
+            values.get("PAIR").map(|v| v.to_python_literal()),
+            Some("(1, \"a\")".into())
+        );
+    }
+
+    #[test]
+    fn comptime_single_element_tuple_literal_evaluated() {
+        // Python's single-element tuple shape; the to_python_literal
+        // round-trip must include the trailing comma.
+        let (values, diags) = eval("comptime let ONLY: tuple[int] = (1,)\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert_eq!(
+            values.get("ONLY").map(|v| v.to_python_literal()),
+            Some("(1,)".into())
+        );
+    }
+
+    #[test]
+    fn comptime_dict_literal_evaluated() {
+        let (values, diags) = eval("comptime let CFG: dict[str, int] = {\"a\": 1, \"b\": 2}\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        let v = values.get("CFG").expect("CFG must evaluate");
+        assert!(matches!(v, ComptimeValue::Dict(items) if items.len() == 2));
+        assert_eq!(v.to_python_literal(), "{\"a\": 1, \"b\": 2}");
+    }
+
+    #[test]
+    fn comptime_empty_containers_evaluated() {
+        let (values, _) = eval("comptime let A: list[int] = []\n");
+        assert_eq!(
+            values.get("A").map(|v| v.to_python_literal()),
+            Some("[]".into())
+        );
+        let (values, _) = eval("comptime let B: dict[str, int] = {}\n");
+        assert_eq!(
+            values.get("B").map(|v| v.to_python_literal()),
+            Some("{}".into())
+        );
+    }
+
+    #[test]
+    fn comptime_nested_containers_evaluated() {
+        let (values, diags) = eval("comptime let DATA: list[tuple[int, int]] = [(1, 2), (3, 4)]\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert_eq!(
+            values.get("DATA").map(|v| v.to_python_literal()),
+            Some("[(1, 2), (3, 4)]".into())
+        );
+    }
+
+    #[test]
+    fn comptime_str_upper_evaluated() {
+        let (values, diags) = eval("comptime let SHOUT: str = \"hi\".upper()\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("SHOUT"), Some(ComptimeValue::Str(s)) if s == "HI"));
+    }
+
+    #[test]
+    fn comptime_str_replace_evaluated() {
+        let (values, diags) = eval("comptime let P: str = \"a-b-c\".replace(\"-\", \"_\")\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("P"), Some(ComptimeValue::Str(s)) if s == "a_b_c"));
+    }
+
+    #[test]
+    fn comptime_str_split_returns_list() {
+        let (values, diags) = eval("comptime let PARTS: list[str] = \"a,b,c\".split(\",\")\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert_eq!(
+            values.get("PARTS").map(|v| v.to_python_literal()),
+            Some("[\"a\", \"b\", \"c\"]".into())
+        );
+    }
+
+    #[test]
+    fn comptime_str_startswith_evaluated() {
+        let (values, diags) = eval("comptime let IS: bool = \"hello\".startswith(\"he\")\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("IS"), Some(ComptimeValue::Bool(true))));
+    }
+
+    #[test]
+    fn comptime_str_strip_chains_with_replace() {
+        // Composes method calls — receiver of `.replace` is the result
+        // of `.strip()`. Tests recursion through the receiver.
+        let (values, diags) =
+            eval("comptime let X: str = \"  hi  \".strip().replace(\"h\", \"H\")\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("X"), Some(ComptimeValue::Str(s)) if s == "Hi"));
+    }
+
+    #[test]
+    fn comptime_len_on_str_and_list() {
+        let (values, _) = eval("comptime let S: int = len(\"hello\")\n");
+        assert!(matches!(values.get("S"), Some(ComptimeValue::Int(5))));
+        let (values, _) = eval("comptime let L: int = len([1, 2, 3, 4])\n");
+        assert!(matches!(values.get("L"), Some(ComptimeValue::Int(4))));
+    }
+
+    #[test]
+    fn comptime_unsupported_str_method_emits_error() {
+        // `str.title()` isn't in the supported set. We want a clear
+        // error that lists what IS supported rather than a generic
+        // "expression is not comptime-evaluable".
+        let (_, diags) = eval("comptime let X: str = \"hi\".title()\n");
+        assert!(diags.has_errors(), "title() should not be evaluable");
+        let msg = format!("{}", diags.errors()[0]);
+        assert!(
+            msg.contains("not supported") && msg.contains("title"),
+            "expected a friendly diagnostic; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn comptime_user_fn_returning_list_supported() {
+        // Closes the loop: a user-defined comptime def can now return
+        // a container, since the evaluator and the substitution
+        // pipeline both handle them end-to-end.
+        let src = "\
+comptime def pair(a: int, b: int) -> tuple[int, int]:
+    return (a, b)
+
+comptime let P: tuple[int, int] = pair(1, 2)
+";
+        let (values, diags) = eval(src);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert_eq!(
+            values.get("P").map(|v| v.to_python_literal()),
+            Some("(1, 2)".into())
+        );
+    }
+
+    #[test]
+    fn comptime_dict_duplicate_keys_last_write_wins() {
+        // Matches Python's runtime dict semantics — duplicate keys
+        // collapse to the last value. Regression for the
+        // gemini-code-assist review on PR #51.
+        let (values, diags) = eval("comptime let M: dict[str, int] = {\"a\": 1, \"a\": 2}\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        let v = values.get("M").expect("M must evaluate");
+        // Length matches Python's `len({"a": 1, "a": 2}) == 1`.
+        assert!(matches!(v, ComptimeValue::Dict(items) if items.len() == 1));
+        // The kept value is the last write.
+        assert_eq!(v.to_python_literal(), "{\"a\": 2}");
+    }
+
+    #[test]
+    fn comptime_dict_duplicate_int_keys_dedup_too() {
+        // Numeric keys dedup against `values_equal`, matching Python's
+        // `{1: "a", 1.0: "b"}` -> `{1: "b"}` semantics.
+        let (values, diags) = eval("comptime let M: dict[int, str] = {1: \"a\", 1: \"b\"}\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        let v = values.get("M").expect("M must evaluate");
+        assert!(matches!(v, ComptimeValue::Dict(items) if items.len() == 1));
+    }
+
+    #[test]
+    fn comptime_str_on_container_is_rejected() {
+        // Python's `str(["a"])` -> `"['a']"` (single-quoted nested
+        // string) doesn't match our double-quoted `to_python_literal`,
+        // so reject rather than silently producing a value that would
+        // contradict the same expression's runtime result. Regression
+        // for the Copilot review on PR #51.
+        let (_, diags) = eval("comptime let S: str = str([\"a\"])\n");
+        assert!(diags.has_errors(), "str(container) must error");
+        let msg = format!("{}", diags.errors()[0]);
+        assert!(
+            msg.contains("str()") && msg.contains("container"),
+            "expected the dedicated diagnostic; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn comptime_method_call_on_list_is_rejected() {
+        // `.len()` on a list isn't a Python method — `len()` is the
+        // free function instead. Regression for the gemini-code-assist
+        // / Copilot reviews on PR #51.
+        let (_, diags) = eval("comptime let N: int = [1, 2, 3].len()\n");
+        assert!(diags.has_errors(), ".len() on list must error");
+        let msg = format!("{}", diags.errors()[0]);
+        assert!(
+            msg.contains("not supported"),
+            "expected the 'not supported' diagnostic; got: {msg}"
+        );
     }
 }
 

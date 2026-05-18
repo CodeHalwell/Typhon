@@ -1198,6 +1198,28 @@ impl<'a> Checker<'a> {
         ));
     }
 
+    /// Emit a [`TycError::ResultErrorMismatch`] diagnostic — the dedicated
+    /// shape for an error-type mismatch surfaced through `?` propagation.
+    fn result_error_mismatch(
+        &mut self,
+        expected_err: &Type,
+        actual_err: &Type,
+        span: (usize, usize),
+    ) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
+        let length = span.1.saturating_sub(span.0).max(1);
+        self.diagnostics.push_error(TycError::result_error_mismatch(
+            expected_err.display(),
+            actual_err.display(),
+            &self.path,
+            self.source,
+            span.0,
+            length,
+        ));
+    }
+
     fn interface_isinstance(&mut self, iface: &str, span: (usize, usize)) {
         if self.unsafe_depth > 0 {
             return;
@@ -1876,6 +1898,23 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         ret_expr.range().start().to_usize(),
                         ret_expr.range().end().to_usize(),
                     );
+                    // When `?` is desugared, the synthesised return reads
+                    // `return __typhon_q_N__` where the value type is
+                    // `Generic("Err", [E_callee])`. Surface this as a
+                    // dedicated `tyc::result_error_mismatch` so the user
+                    // sees a `?`-propagation framing instead of a generic
+                    // type mismatch (FINDINGS #13).
+                    if is_question_op_temp(ret_expr) {
+                        if let (Some(expected_err), Some(actual_err)) = (
+                            extract_result_error_type(&expected),
+                            extract_err_generic_param(&value_type),
+                        ) {
+                            if !c.is_assignable(&expected_err, &actual_err) {
+                                c.result_error_mismatch(&expected_err, &actual_err, span);
+                                return;
+                            }
+                        }
+                    }
                     c.mismatch(&expected, &value_type, span);
                 }
             } else if ret.value.is_none() {
@@ -2377,6 +2416,44 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
 /// would have type `Class("Err")` and the
 /// `result_error_mismatch` check wouldn't see `Err[E]` vs
 /// `Result[T, E_outer]`.
+/// `true` when `expr` is a bare reference to a `?`-operator temporary
+/// (`__typhon_q_N__`). These names are synthesised by the preprocessor's
+/// [`tyc_syntax::expand_question_ops`] pass; a `return __typhon_q_N__`
+/// statement is therefore guaranteed to come from a `?` lowering, never
+/// from user-written code (the leading double underscore is reserved).
+fn is_question_op_temp(expr: &Expr) -> bool {
+    if let Expr::Name(n) = expr {
+        let s = n.id.as_str();
+        return s.starts_with("__typhon_q_") && s.ends_with("__");
+    }
+    false
+}
+
+/// Extract `E` from a `Result[T, E]` type. Returns `None` for any other
+/// shape — including the bare `Result` class (which would carry no
+/// information for the diagnostic).
+fn extract_result_error_type(typ: &Type) -> Option<Type> {
+    if let Type::Generic(name, args) = typ {
+        if name == "Result" && args.len() == 2 {
+            return Some(args[1].clone());
+        }
+    }
+    None
+}
+
+/// Extract `E` from a `Generic("Err", [E])` type as produced by
+/// [`refine_isinstance_target`] when narrowing a `Result[T, E]` against
+/// `Err`. Returns `None` for `Class("Err")` (no generic parameter
+/// surviving) or any unrelated type.
+fn extract_err_generic_param(typ: &Type) -> Option<Type> {
+    if let Type::Generic(name, args) = typ {
+        if name == "Err" && args.len() == 1 {
+            return Some(args[0].clone());
+        }
+    }
+    None
+}
+
 fn refine_isinstance_target(current: &Type, narrowed_to: &Type) -> Type {
     let current_generic = match current {
         Type::Generic(name, args) if name == "Result" && args.len() == 2 => Some(args),

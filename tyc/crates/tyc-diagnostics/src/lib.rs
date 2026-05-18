@@ -119,6 +119,25 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// The error type propagated by `?` from a callee does not match the
+    /// caller's `Result[T, E]` declaration. Distinct from the generic
+    /// `tyc::type_mismatch` so users see immediately that the failure is
+    /// at a `?`-propagation boundary and can act accordingly (convert at
+    /// the boundary, or change one of the function signatures).
+    #[error("`?` propagates `Err[{actual_err}]` into `Result[_, {expected_err}]`")]
+    #[diagnostic(
+        code(tyc::result_error_mismatch),
+        help("the `?` operator forwards the callee's `Err` value as-is; convert it with a `match` or change one signature so the error types match")
+    )]
+    ResultErrorMismatch {
+        expected_err: String,
+        actual_err: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("error type does not match the enclosing function's `Result`")]
+        span: SourceSpan,
+    },
+
     /// A function was called with the wrong number of positional arguments.
     #[error("wrong number of arguments to `{name}`: expected {expected}, got {actual}")]
     #[diagnostic(code(tyc::arg_count))]
@@ -358,6 +377,49 @@ pub enum TycError {
         #[label("annotation required here")]
         span: SourceSpan,
     },
+
+    /// A local assignment inside a function body did not declare `let`
+    /// or `mut`. Rule 2 of the Typhon language: local bindings always
+    /// carry a binding-kind keyword so readers can tell at a glance
+    /// whether a name is rebound later. Module-level bindings still
+    /// default to `let`, so this only fires at function/method scope.
+    #[error("local binding '{name}' is missing `let` or `mut`")]
+    #[diagnostic(
+        code(tyc::missing_binding_kind),
+        help("write `let {name} = …` for an immutable binding, or `mut {name} = …` if you intend to rebind it later")
+    )]
+    MissingBindingKind {
+        name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("declare with `let` or `mut`")]
+        span: SourceSpan,
+    },
+
+    /// Two or more adjacent `await CALLEE(...)` statements look
+    /// independent enough to fold into an `asyncio.TaskGroup` block,
+    /// but at least one callee is a same-module `async def` that
+    /// lacks the `@gatherable` decorator. The auto-gather pass only
+    /// rewrites runs where every callee carries `@gatherable` (the
+    /// decorator is the user's attestation that the function is safe
+    /// to run concurrently with peers); without it, the awaits stay
+    /// sequential silently. This advice-level diagnostic surfaces the
+    /// missed opportunity so users can decide whether to decorate.
+    #[error(
+        "two or more adjacent awaits look gather-able but `{missing}` is not decorated `@gatherable`"
+    )]
+    #[diagnostic(
+        severity(Advice),
+        code(tyc::auto_gather_missed),
+        help("decorate `{missing}` (and any other same-module async callees in the run) with `@gatherable` to fold the awaits into an `asyncio.TaskGroup` automatically")
+    )]
+    AutoGatherMissed {
+        missing: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("auto-gather skipped this run")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -464,6 +526,23 @@ impl TycError {
         Self::NullableUse {
             name: name.into(),
             expected: expected.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::ResultErrorMismatch`] diagnostic.
+    pub fn result_error_mismatch(
+        expected_err: impl Into<String>,
+        actual_err: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::ResultErrorMismatch {
+            expected_err: expected_err.into(),
+            actual_err: actual_err.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }
@@ -721,6 +800,36 @@ impl TycError {
         Self::MissingAnnotation {
             function: function.into(),
             what: what.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::MissingBindingKind`] diagnostic.
+    pub fn missing_binding_kind(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::MissingBindingKind {
+            name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::AutoGatherMissed`] advice diagnostic.
+    pub fn auto_gather_missed(
+        missing: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::AutoGatherMissed {
+            missing: missing.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

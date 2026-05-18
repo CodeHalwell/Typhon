@@ -618,10 +618,27 @@ fn make_result_extract(bind: &str, task: &str) -> Stmt {
 pub fn collect_gatherable_async_fn_names(module: &ModModule) -> HashSet<String> {
     let mut out = HashSet::new();
     for stmt in &module.body {
-        if let Stmt::FunctionDef(f) = stmt {
-            if f.is_async && has_gatherable_decorator(&f.decorator_list) {
+        match stmt {
+            Stmt::FunctionDef(f) if f.is_async && has_gatherable_decorator(&f.decorator_list) => {
                 out.insert(f.name.as_str().to_owned());
             }
+            // Methods declared inside `class Foo:` or the
+            // preprocessor's `__typhon_impl_Foo` pseudo-class (the
+            // lowered form of `impl Foo:`) are scanned too so a
+            // `@gatherable` annotation on a method is honoured. The
+            // gather rewriter already recurses into class bodies, so
+            // the eligibility set has to match for the rewrite to
+            // fire on a class-method bare-name call.
+            Stmt::ClassDef(c) => {
+                for inner in &c.body {
+                    if let Stmt::FunctionDef(f) = inner {
+                        if f.is_async && has_gatherable_decorator(&f.decorator_list) {
+                            out.insert(f.name.as_str().to_owned());
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
     out
@@ -637,6 +654,206 @@ fn has_gatherable_decorator(decorators: &[ruff_python_ast::Decorator]) -> bool {
         }
         _ => false,
     })
+}
+
+// ── missed-gather detection (advice diagnostic, no rewrite) ──────────────────
+
+/// One run of adjacent awaits that would have folded into a TaskGroup
+/// if every callee carried `@gatherable`. Reported via
+/// [`TycError::AutoGatherMissed`] so users see WHY auto-gather silently
+/// left a run sequential.
+#[derive(Debug, Clone)]
+pub struct MissedGather {
+    /// The first same-module async callee in the run that is missing
+    /// the decorator. We only mention one in the diagnostic to keep
+    /// the message terse; users add the decorator iteratively.
+    pub missing_callee: String,
+    /// Byte range of the first `await CALLEE(...)` call in the run, so
+    /// the diagnostic anchors at the start of the would-be gather
+    /// block.
+    pub call_range: TextRange,
+}
+
+/// Scan `module` for runs of 2+ adjacent `name = await CALLEE(...)`
+/// assignments inside `async def` bodies where:
+///
+/// - every callee is a bare-name reference to a same-module `async def`
+///   (so auto-gather *could* fold this run if decorators were in
+///   place),
+/// - at least one callee lacks `@gatherable`,
+/// - the run is independent (later awaits don't consume earlier
+///   bindings),
+/// - no later assignment in the run shadows an earlier one.
+///
+/// Returns one [`MissedGather`] per run, in source order. The caller
+/// is responsible for converting these into [`TycError::AutoGatherMissed`]
+/// advice diagnostics with the right source path / text.
+///
+/// Skipped when `[strictness] auto-gather` is off — without the opt-in,
+/// the user almost certainly doesn't want the nudge.
+pub fn detect_missed_gathers(module: &ModModule) -> Vec<MissedGather> {
+    let decorated = collect_gatherable_async_fn_names(module);
+    let local_async = collect_local_async_fn_names(module);
+    // Anything in `local_async` but not in `decorated` is a missed
+    // opportunity; that's the eligible set for "could have been
+    // gathered if decorated".
+    let eligible_if_decorated: HashSet<String> = local_async.iter().cloned().collect();
+    let mut out = Vec::new();
+    walk_missed_in_stmts(
+        &module.body,
+        &eligible_if_decorated,
+        &decorated,
+        /* inside_async */ false,
+        &mut out,
+    );
+    out
+}
+
+fn collect_local_async_fn_names(module: &ModModule) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for stmt in &module.body {
+        match stmt {
+            Stmt::FunctionDef(f) if f.is_async => {
+                out.insert(f.name.as_str().to_owned());
+            }
+            // Match `collect_gatherable_async_fn_names`'s scan into
+            // class bodies (covers both real `class Foo:` declarations
+            // and the preprocessor's `__typhon_impl_Foo` pseudo-class
+            // form). Without this, the missed-gather detector would
+            // skip async methods even when the gather rewriter would
+            // happily fold them given the right decorator.
+            Stmt::ClassDef(c) => {
+                for inner in &c.body {
+                    if let Stmt::FunctionDef(f) = inner {
+                        if f.is_async {
+                            out.insert(f.name.as_str().to_owned());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn walk_missed_in_stmts(
+    body: &[Stmt],
+    eligible_if_decorated: &HashSet<String>,
+    decorated: &HashSet<String>,
+    inside_async: bool,
+    out: &mut Vec<MissedGather>,
+) {
+    let mut i = 0;
+    while i < body.len() {
+        if inside_async {
+            let run = collect_run(body, i, eligible_if_decorated);
+            if run.len() >= 2 {
+                let missing = run.iter().find(|c| !decorated.contains(&c.call_func));
+                if let Some(m) = missing {
+                    out.push(MissedGather {
+                        missing_callee: m.call_func.clone(),
+                        call_range: run[0].call_range,
+                    });
+                }
+                i += run.len();
+                continue;
+            }
+        }
+        walk_missed_in_stmt(
+            &body[i],
+            eligible_if_decorated,
+            decorated,
+            inside_async,
+            out,
+        );
+        i += 1;
+    }
+}
+
+fn walk_missed_in_stmt(
+    stmt: &Stmt,
+    eligible_if_decorated: &HashSet<String>,
+    decorated: &HashSet<String>,
+    inside_async: bool,
+    out: &mut Vec<MissedGather>,
+) {
+    match stmt {
+        Stmt::FunctionDef(f) => {
+            walk_missed_in_stmts(&f.body, eligible_if_decorated, decorated, f.is_async, out)
+        }
+        Stmt::ClassDef(c) => {
+            walk_missed_in_stmts(&c.body, eligible_if_decorated, decorated, false, out);
+        }
+        Stmt::If(s) => {
+            walk_missed_in_stmts(&s.body, eligible_if_decorated, decorated, inside_async, out);
+            for clause in &s.elif_else_clauses {
+                walk_missed_in_stmts(
+                    &clause.body,
+                    eligible_if_decorated,
+                    decorated,
+                    inside_async,
+                    out,
+                );
+            }
+        }
+        Stmt::While(s) => {
+            walk_missed_in_stmts(&s.body, eligible_if_decorated, decorated, inside_async, out);
+            walk_missed_in_stmts(
+                &s.orelse,
+                eligible_if_decorated,
+                decorated,
+                inside_async,
+                out,
+            );
+        }
+        Stmt::For(s) => {
+            walk_missed_in_stmts(&s.body, eligible_if_decorated, decorated, inside_async, out);
+            walk_missed_in_stmts(
+                &s.orelse,
+                eligible_if_decorated,
+                decorated,
+                inside_async,
+                out,
+            );
+        }
+        Stmt::With(s) => {
+            walk_missed_in_stmts(&s.body, eligible_if_decorated, decorated, inside_async, out);
+        }
+        Stmt::Try(s) => {
+            walk_missed_in_stmts(&s.body, eligible_if_decorated, decorated, inside_async, out);
+            for h in &s.handlers {
+                let ExceptHandler::ExceptHandler(h) = h;
+                walk_missed_in_stmts(&h.body, eligible_if_decorated, decorated, inside_async, out);
+            }
+            walk_missed_in_stmts(
+                &s.orelse,
+                eligible_if_decorated,
+                decorated,
+                inside_async,
+                out,
+            );
+            walk_missed_in_stmts(
+                &s.finalbody,
+                eligible_if_decorated,
+                decorated,
+                inside_async,
+                out,
+            );
+        }
+        Stmt::Match(s) => {
+            for case in &s.cases {
+                walk_missed_in_stmts(
+                    &case.body,
+                    eligible_if_decorated,
+                    decorated,
+                    inside_async,
+                    out,
+                );
+            }
+        }
+        _ => {}
+    }
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -1073,6 +1290,164 @@ async def load() -> int:
         assert!(
             !out.contains("__typhon_autogather_tg_0__ = asyncio.TaskGroup"),
             "must not overwrite the user binding; got:\n{out}"
+        );
+    }
+
+    // ── detect_missed_gathers (advice diagnostic, no rewrite) ────────────
+
+    #[test]
+    fn detect_missed_flags_run_with_missing_decorator() {
+        // `fa` is decorated, `fb` is not. The run looks gather-able by
+        // shape, so the missed-detection should fire and name `fb`.
+        let src = "\
+@gatherable
+async def fa() -> int:
+    return 1
+
+async def fb() -> int:
+    return 2
+
+async def load() -> int:
+    a = await fa()
+    b = await fb()
+    return a + b
+";
+        let module = parse_module(src);
+        let missed = detect_missed_gathers(&module);
+        assert_eq!(missed.len(), 1, "expected 1 missed run; got {missed:?}");
+        assert_eq!(missed[0].missing_callee, "fb");
+    }
+
+    #[test]
+    fn detect_missed_silent_when_all_decorated() {
+        // Both callees are decorated — auto-gather would actually rewrite
+        // this run, so no missed-opportunity diagnostic.
+        let src = "\
+@gatherable
+async def fa() -> int:
+    return 1
+
+@gatherable
+async def fb() -> int:
+    return 2
+
+async def load() -> int:
+    a = await fa()
+    b = await fb()
+    return a + b
+";
+        let module = parse_module(src);
+        let missed = detect_missed_gathers(&module);
+        assert!(missed.is_empty(), "no missed run expected; got {missed:?}");
+    }
+
+    #[test]
+    fn detect_missed_silent_when_run_is_dependent() {
+        // The run is not gather-able by shape (b depends on a), so
+        // there's no missed opportunity even if neither callee is
+        // decorated.
+        let src = "\
+async def fa() -> int:
+    return 1
+
+async def fb(x: int) -> int:
+    return x
+
+async def load() -> int:
+    a = await fa()
+    b = await fb(a)
+    return a + b
+";
+        let module = parse_module(src);
+        let missed = detect_missed_gathers(&module);
+        assert!(missed.is_empty(), "no missed run expected; got {missed:?}");
+    }
+
+    #[test]
+    fn detect_missed_silent_when_single_await() {
+        // A single await is not a gather opportunity in any case.
+        let src = "\
+async def fa() -> int:
+    return 1
+
+async def load() -> int:
+    a = await fa()
+    return a
+";
+        let module = parse_module(src);
+        let missed = detect_missed_gathers(&module);
+        assert!(
+            missed.is_empty(),
+            "single await is never a run; got {missed:?}"
+        );
+    }
+
+    #[test]
+    fn detect_missed_ignores_imported_callees() {
+        // The callees here aren't local `async def`s (we never declared
+        // them in this module), so detect_missed_gathers must not nudge
+        // the user — auto-gather wouldn't touch imported async fns
+        // anyway, and the user can't add `@gatherable` to code they
+        // don't own.
+        let src = "\
+import remote
+
+async def load() -> int:
+    a = await remote.fetch_a()
+    b = await remote.fetch_b()
+    return a + b
+";
+        let module = parse_module(src);
+        let missed = detect_missed_gathers(&module);
+        assert!(
+            missed.is_empty(),
+            "imported callees ineligible; got {missed:?}"
+        );
+    }
+
+    #[test]
+    fn detect_missed_includes_class_method_callees() {
+        // Async methods defined inside a class body (or the
+        // preprocessor's `__typhon_impl_<Name>` pseudo-class form of
+        // an `impl` block) are local to the module too. Without the
+        // class-body scan, a run of bare-name calls to class methods
+        // would be silently ignored by the detector. Regression for
+        // the gemini-code-assist review on PR #51.
+        let src = "\
+class Service:
+    async def fetch_a(self) -> int:
+        return 1
+    async def fetch_b(self) -> int:
+        return 2
+
+async def load() -> int:
+    a = await fetch_a()
+    b = await fetch_b()
+    return a + b
+";
+        let module = parse_module(src);
+        let missed = detect_missed_gathers(&module);
+        assert_eq!(missed.len(), 1, "expected 1 missed run; got {missed:?}");
+        // First missing callee is `fetch_a` (none decorated).
+        assert_eq!(missed[0].missing_callee, "fetch_a");
+    }
+
+    #[test]
+    fn collect_gatherable_includes_class_methods() {
+        // Symmetric to the missed-detection scan: a `@gatherable`
+        // decorator on an async method must register the method name
+        // so the rewriter's eligibility set includes it.
+        let src = "\
+class Service:
+    @gatherable
+    async def fetch_a(self) -> int:
+        return 1
+";
+        let module = parse_module(src);
+        let names = collect_gatherable_async_fn_names(&module);
+        assert!(
+            names.contains("fetch_a"),
+            "class-method gatherable must be collected; got {names:?}"
         );
     }
 }

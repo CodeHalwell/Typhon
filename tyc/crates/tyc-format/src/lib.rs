@@ -23,8 +23,8 @@ use tyc_diagnostics::TycError;
 use tyc_syntax::{
     parse_module,
     preprocess::{
-        expand_gather_blocks, expand_go_calls, expand_pipes, expand_question_ops,
-        expand_with_chains, postprocess_full, preprocess,
+        expand_gather_blocks, expand_go_calls, expand_multiline_guards, expand_pipes,
+        expand_question_ops, expand_with_chains, postprocess_full, preprocess,
     },
 };
 
@@ -53,9 +53,10 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
     // a throw-away copy of the source purely for validation; the normalised
     // output below is still derived from `prep.python_source` so the Typhon
     // sugar is preserved when the file is rewritten.
-    let validation_input = expand_question_ops(&expand_pipes(&expand_with_chains(
-        &expand_go_calls(&expand_gather_blocks(&prep.python_source)),
-    )));
+    let validation_input =
+        expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
+            &expand_gather_blocks(&expand_multiline_guards(&prep.python_source)),
+        ))));
     parse_module(&validation_input).map_err(|e| {
         let offset = usize::from(e.location.start());
         TycError::parse(path, &validation_input, e.to_string(), offset)

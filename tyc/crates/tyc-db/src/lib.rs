@@ -13,13 +13,13 @@
 use std::sync::Arc;
 
 use tyc_diagnostics::{Diagnostics, TycError};
-use tyc_resolve::{resolve_module_with, ResolveOptions, ResolvedModule};
+use tyc_resolve::{resolve_module_with, LazyImportRemap, ResolveOptions, ResolvedModule};
 use tyc_syntax::{
     parse_module,
     preprocess::{
-        expand_gather_blocks, expand_go_calls, expand_pipes, expand_question_ops,
-        expand_with_chains, line_byte_starts, preprocess, validate_extend_usage,
-        validate_lazy_usage, validate_question_ops,
+        expand_gather_blocks, expand_go_calls, expand_multiline_guards, expand_pipes,
+        expand_question_ops, expand_with_chains, line_byte_starts, preprocess,
+        validate_extend_usage, validate_lazy_usage, validate_question_ops,
     },
 };
 use tyc_types::check_module_with;
@@ -46,9 +46,11 @@ pub struct SourceFile {
 pub fn preprocessed_text(db: &dyn salsa::Database, file: SourceFile) -> String {
     let text = file.text(db);
     // Apply Typhon sugar expansion in the same order as `check_file` and the
-    // build pipeline: gather → go → with-chains → pipes → `?`.
+    // build pipeline: multi-line guard → gather → go → with-chains → pipes → `?`.
+    // The multi-line guard pre-pass runs first so its body can still contain
+    // any of the later forms (`gather:`, `?`, pipes, etc.).
     let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
-        &expand_gather_blocks(text),
+        &expand_gather_blocks(&expand_multiline_guards(text)),
     ))));
     preprocess(&expanded).python_source
 }
@@ -142,11 +144,14 @@ pub fn resolved_module(db: &dyn salsa::Database, file: SourceFile) -> ArcResolve
     // only need the text. The cost here is one extra preprocess per
     // source change, which is bounded by file size and cheap.
     let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
-        &expand_gather_blocks(&raw_text),
+        &expand_gather_blocks(&expand_multiline_guards(&raw_text)),
     ))));
     let prep = preprocess(&expanded);
+    let lazy_import_remaps = build_lazy_import_remaps(&raw_text, &prep.lazy_imports);
     let options = ResolveOptions {
         raw_class_byte_starts: line_byte_starts(&prep.python_source, &prep.raw_class_lines),
+        lazy_import_remaps,
+        original_source: Some(raw_text.clone()),
     };
     match parse_module(&prep.python_source) {
         Ok(parsed) => {
@@ -156,6 +161,114 @@ pub fn resolved_module(db: &dyn salsa::Database, file: SourceFile) -> ArcResolve
         }
         Err(_) => ArcResolvedModule(Arc::new(ResolvedModule::default())),
     }
+}
+
+/// Convert preprocessor `lazy_imports` metadata into [`LazyImportRemap`]s
+/// the resolver can consume. The preprocessor records each
+/// `lazy import ALIAS = MODULE` statement's line index in the
+/// *post-sugar* source (after multi-line-guard and other line-drifting
+/// passes have run), so we cannot use that index directly into the
+/// original Typhon source — a guard expansion that added lines above
+/// would offset every subsequent lazy-import line.
+///
+/// Instead, walk the original source independently for `lazy import`
+/// lines (which are never moved or removed by sugar passes — they only
+/// appear at module level), then pair them with `lazy_imports` in
+/// source order. The resolver still keys on `line_index` from the
+/// preprocessed source (matching the binding's span) but the offset
+/// it surfaces points at the alias in the original (FINDINGS #15).
+fn build_lazy_import_remaps(
+    original_source: &str,
+    lazy_imports: &[tyc_syntax::preprocess::LazyImport],
+) -> Vec<LazyImportRemap> {
+    if lazy_imports.is_empty() {
+        return Vec::new();
+    }
+    let original_aliases = collect_original_lazy_import_alias_spans(original_source);
+    // Pair by source order. Sugar passes don't add, remove, or
+    // reorder `lazy import` lines, so the nth lazy import in the
+    // original is the nth lazy import in the preprocessed source.
+    // Optionally verify the alias names match as a sanity check;
+    // a mismatch (which would mean a sugar pass started producing
+    // synthetic lazy imports) silently drops that remap so the
+    // user gets the preprocessed-source fallback instead of a
+    // mis-anchored diagnostic.
+    let mut out = Vec::with_capacity(lazy_imports.len());
+    for (i, li) in lazy_imports.iter().enumerate() {
+        let Some(original) = original_aliases.get(i) else {
+            continue;
+        };
+        if original.alias != li.alias {
+            continue;
+        }
+        out.push(LazyImportRemap {
+            line_index: li.line_index,
+            original_alias_offset: original.offset,
+            original_alias_length: original.length,
+        });
+    }
+    out
+}
+
+/// One `lazy import ALIAS = MODULE` declaration as seen in the original
+/// Typhon source, with the byte offset and length of the ALIAS token.
+/// Internal to [`build_lazy_import_remaps`].
+struct OriginalLazyAlias {
+    alias: String,
+    offset: usize,
+    length: usize,
+}
+
+/// Walk `source` line-by-line and return every `lazy import ALIAS =
+/// MODULE` declaration in source order. Mirrors the preprocessor's
+/// recognition (only module-level — indent 0 — with the literal
+/// `lazy import ` prefix), but operates on the *original* (pre-sugar)
+/// text so the alias offsets remain valid after upstream line-drifting
+/// passes like `expand_multiline_guards`.
+fn collect_original_lazy_import_alias_spans(source: &str) -> Vec<OriginalLazyAlias> {
+    let prefix = "lazy import ";
+    let mut out = Vec::new();
+    let mut line_start = 0usize;
+    for (line_end, byte) in source
+        .bytes()
+        .enumerate()
+        .map(|(i, b)| (i + 1, b))
+        .filter(|&(_, b)| b == b'\n')
+        .chain(std::iter::once((source.len() + 1, 0u8)))
+    {
+        // `line_end` is one past the `\n` (or one past EOF for the
+        // synthetic terminator). Slice up to it minus the newline.
+        let end_excl = line_end.saturating_sub(1).min(source.len());
+        let line = &source[line_start..end_excl];
+        // Module-level lazy imports start at indent 0. Indented `lazy`
+        // expressions are left alone by the preprocessor, so we
+        // mirror that here.
+        if let Some(after_kw) = line.strip_prefix(prefix) {
+            let extra_ws = after_kw
+                .bytes()
+                .take_while(|&b| b == b' ' || b == b'\t')
+                .count();
+            let alias_start_in_line = prefix.len() + extra_ws;
+            let after_alias = &line[alias_start_in_line..];
+            let alias_len = after_alias
+                .bytes()
+                .take_while(|&b| b.is_ascii_alphanumeric() || b == b'_')
+                .count();
+            if alias_len > 0 {
+                let alias = after_alias[..alias_len].to_owned();
+                out.push(OriginalLazyAlias {
+                    alias,
+                    offset: line_start + alias_start_in_line,
+                    length: alias_len,
+                });
+            }
+        }
+        line_start = line_end;
+        // Suppress unused-variable warning on `byte` (only used to
+        // gate the iter chain above).
+        let _ = byte;
+    }
+    out
 }
 
 /// Convenience alias — extract the inner `Arc<ResolvedModule>` from a
@@ -261,7 +374,7 @@ fn check_impl(path: &str, text: &str) -> Diagnostics {
     // Python parser sees valid Python.  `tyc fmt` skips these expansions to
     // preserve Typhon syntax in the formatter's round trip.
     let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
-        &expand_gather_blocks(text),
+        &expand_gather_blocks(&expand_multiline_guards(text)),
     ))));
     let prep = preprocess(&expanded);
 
@@ -280,6 +393,8 @@ fn check_impl(path: &str, text: &str) -> Diagnostics {
 
     let resolve_options = ResolveOptions {
         raw_class_byte_starts: line_byte_starts(&prep.python_source, &prep.raw_class_lines),
+        lazy_import_remaps: build_lazy_import_remaps(text, &prep.lazy_imports),
+        original_source: Some(text.to_owned()),
     };
     let (resolved, resolve_diags) = resolve_module_with(
         path.to_owned(),
@@ -584,6 +699,101 @@ def parse(s: str) -> Result[int, str]:
     }
 
     #[test]
+    fn check_file_unused_lazy_import_anchors_on_original_source() {
+        // FINDINGS #15: when an unused-import diagnostic fires on a
+        // `lazy import` line, it must render the user-written
+        // `lazy import np = math` line rather than the preprocessor's
+        // synthesised `import math as np`. The label byte-offset is the
+        // alias's position in the original source.
+        let src = "lazy import np = math\n";
+        let mut db = TycDatabase::new();
+        let diags = check_file(&mut db, "<test>".into(), src.to_owned());
+        // The warning is promoted to an error by default strictness;
+        // either way it must be present.
+        let all: Vec<&TycError> = diags.errors().iter().chain(diags.warnings()).collect();
+        let unused: &TycError = all
+            .iter()
+            .copied()
+            .find(|e| matches!(e, TycError::UnusedImport { .. }))
+            .expect("expected an unused_import diagnostic");
+        // Verify the rewritten source + span flow through.
+        if let TycError::UnusedImport { src, span, .. } = unused {
+            let source_text: &str = src.inner();
+            assert!(
+                source_text.contains("lazy import np = math"),
+                "diagnostic must quote the user-written line; got:\n{source_text}"
+            );
+            assert!(
+                !source_text.contains("import math as np"),
+                "preprocessor rewrite must not leak into the diagnostic; got:\n{source_text}"
+            );
+            // The span anchor must land on the alias `np`, not on
+            // `math` (where the preprocessed `import math as np` would
+            // have put it).
+            let offset: usize = span.offset();
+            assert_eq!(
+                &source_text[offset..offset + 2],
+                "np",
+                "span must point at the alias `np`; got `{}` at offset {offset} in:\n{source_text}",
+                &source_text[offset..offset + 2.min(source_text.len() - offset)]
+            );
+        } else {
+            unreachable!("matched above");
+        }
+    }
+
+    #[test]
+    fn check_file_unused_lazy_import_anchors_correctly_with_line_drift() {
+        // Regression for the Codex P2 review on PR #51: a line-drifting
+        // sugar pass (here, a multi-line `guard`) inserts lines above
+        // a `lazy import`, so the preprocessor's `line_index` in the
+        // expanded source no longer maps directly into the original
+        // source. The remap builder must scan the original source
+        // independently and pair by position.
+        //
+        // Original layout: lazy import is at line 8.
+        // After multi-line guard expansion (1 header → 3 lines, +2):
+        // lazy import shifts to expanded line 10.
+        // Without the fix, the remap would point at original line 10
+        // (`return 0`), where there's no `lazy import` prefix — so
+        // the remap would silently drop and the user would see the
+        // preprocessor-rewritten `import math as np` again.
+        let src = "\
+def f(x: int?) -> int:
+    guard v = x else:
+        print(\"oops\")
+        return 0
+    return v
+
+lazy import np = math
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file(&mut db, "<test>".into(), src.to_owned());
+        let all: Vec<&TycError> = diags.errors().iter().chain(diags.warnings()).collect();
+        let unused = all
+            .iter()
+            .copied()
+            .find(|e| matches!(e, TycError::UnusedImport { .. }))
+            .expect("expected an unused_import diagnostic");
+        if let TycError::UnusedImport { src, span, .. } = unused {
+            let source_text: &str = src.inner();
+            assert!(
+                source_text.contains("lazy import np = math"),
+                "remap must survive the line drift; got:\n{source_text}"
+            );
+            let offset: usize = span.offset();
+            assert_eq!(
+                &source_text[offset..offset + 2],
+                "np",
+                "span must still point at `np` after line drift; got `{}` at offset {offset}",
+                &source_text[offset..offset + 2.min(source_text.len() - offset)]
+            );
+        } else {
+            unreachable!("matched above");
+        }
+    }
+
+    #[test]
     fn check_file_used_import_no_warning() {
         let src = "import os\nlet sep: str = os.sep\n";
         let mut db = TycDatabase::new();
@@ -629,6 +839,50 @@ def divide(a: int, b: int) -> Result[int, str]:
     if b == 0:
         return Err(\"division by zero\")
     return Ok(a // b)
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file(&mut db, "<test>".into(), src.to_owned());
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn check_file_result_error_mismatch_via_question_op() {
+        // FINDINGS #13 polish: when `?` propagates an `Err[E1]` into a
+        // function returning `Result[T, E2]` with `E1 != E2`, the diagnostic
+        // must carry the dedicated `tyc::result_error_mismatch` code rather
+        // than the generic `tyc::type_mismatch`.
+        let src = "\
+def parse_port(raw: str) -> Result[int, str]:
+    return Ok(int(raw))
+
+def bad(raw: str) -> Result[int, int]:
+    let n: int = parse_port(raw)?
+    return Ok(n)
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file(&mut db, "<test>".into(), src.to_owned());
+        assert!(diags.has_errors(), "?-op error mismatch must error");
+        assert!(
+            diags
+                .errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ResultErrorMismatch { .. })),
+            "expected ResultErrorMismatch variant, got: {:?}",
+            diags.errors()
+        );
+    }
+
+    #[test]
+    fn check_file_result_matching_errs_no_diagnostic() {
+        // Sanity check: matching error types through `?` continue to type-
+        // check clean (no false positives from the new detection path).
+        let src = "\
+def parse_port(raw: str) -> Result[int, str]:
+    return Ok(int(raw))
+
+def good(raw: str) -> Result[int, str]:
+    let n: int = parse_port(raw)?
+    return Ok(n)
 ";
         let mut db = TycDatabase::new();
         let diags = check_file(&mut db, "<test>".into(), src.to_owned());
