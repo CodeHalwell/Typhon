@@ -295,7 +295,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 .map(|f| f.name.clone())
                 .collect();
             if !pure_names.is_empty() {
-                let stats = rewrite_parallel_comprehensions(&mut module, &pure_names);
+                let stats = rewrite_parallel_comprehensions(
+                    &mut module,
+                    &pure_names,
+                    config.strictness.parallel_min_size,
+                );
                 if stats.rewrites > 0 {
                     needs_runtime = true;
                 }

@@ -432,28 +432,41 @@ impl Backend {
     /// to find the workspace root; the configured `src` directory then
     /// anchors the dotted-module lookup.  Returns `None` for stdlib /
     /// third-party imports — those have no `.ty` source to jump to.
+    ///
+    /// The returned [`Location`] is mapped back to *original* `.ty`
+    /// offsets so the LSP client lands on the same column the user sees,
+    /// not the preprocessed offset (which would be off by `len("let ")`
+    /// for a `let`/`mut` declaration).  The resolved module is cached in
+    /// `resolved_cache` keyed by file:// URI so subsequent requests for
+    /// the same target skip the parse + resolve work.
     async fn resolve_cross_file_import(
         &self,
         current: &Uri,
         info: &ImportInfo,
     ) -> Option<Location> {
         let current_path = uri_to_path(current)?;
-        let (project_root, src_dir) = find_workspace_layout(&current_path)?;
+        let (_project_root, src_dir) = find_workspace_layout(&current_path)?;
         let module_path = resolve_module_to_file(&src_dir, &info.module)?;
-        let _ = project_root; // currently unused but kept for future fallbacks
-        let source = std::fs::read_to_string(&module_path).ok()?;
+        let original_source = std::fs::read_to_string(&module_path).ok()?;
 
-        // Walk the imported file to find the member's declaration span.
-        let prep = tyc_syntax::preprocess::preprocess(&source);
-        let parsed = tyc_syntax::parse_module(&prep.python_source).ok()?;
-        let module_ast = parsed.into_syntax();
-        let (resolved, _) = tyc_resolve::resolve_module(
-            module_path.display().to_string(),
-            &prep.python_source,
-            &module_ast,
-        );
+        // Cache key: the canonicalised file:// URI of the target file.
+        // We store `(preprocessed_text, ResolvedModule)` exactly like the
+        // primary did-open path so repeated jumps into the same module
+        // skip parse + resolve.
+        let target_uri = path_to_uri(&module_path)?;
+        let target_uri_str = target_uri.as_str().to_owned();
+
+        let prep = tyc_syntax::preprocess::preprocess(&original_source);
+        let resolved = match self
+            .get_or_resolve(&target_uri_str, &prep.python_source)
+            .await
+        {
+            Some(r) => r,
+            None => return None,
+        };
+
         let target_name = info.member.clone();
-        let module_scope = 0; // resolve_module always seeds the module scope as id 0
+        let module_scope = 0;
         let target_binding = match target_name {
             Some(name) => resolved
                 .scopes
@@ -464,21 +477,81 @@ impl Backend {
             None => None,
         };
 
-        let (start, end) = if let Some(b) = target_binding {
+        let (start_prep, end_prep) = if let Some(b) = target_binding {
             (b.span.0, b.span.1)
         } else {
-            // Bare `import pkg` → jump to the top of the file.
             (0, 0)
         };
-        let target_uri = path_to_uri(&module_path)?;
+        // Map preprocessed-source offsets back to original-source offsets
+        // by adding back the bytes preprocess stripped from earlier lines
+        // (each `let ` or `mut ` removed 4 chars from a single line).
+        let (start, end) = (
+            map_preprocessed_offset_to_original(&prep, &original_source, start_prep),
+            map_preprocessed_offset_to_original(&prep, &original_source, end_prep),
+        );
         Some(Location {
             uri: target_uri,
             range: Range {
-                start: byte_to_position(&prep.python_source, start),
-                end: byte_to_position(&prep.python_source, end),
+                start: byte_to_position(&original_source, start),
+                end: byte_to_position(&original_source, end),
             },
         })
     }
+}
+
+/// Map a byte offset in `preprocessed` text back to a byte offset in
+/// `original`.  Preprocessing only strips characters from the start of a
+/// line (`let ` / `mut `), and lines are not added or removed, so the
+/// mapping per line is "original_line_start + (preprocessed_col + stripped_prefix_len)".
+///
+/// For lines that don't have a stripped prefix the mapping is identity.
+fn map_preprocessed_offset_to_original(
+    prep: &tyc_syntax::preprocess::PreprocessResult,
+    original: &str,
+    prep_offset: usize,
+) -> usize {
+    let prep_text = prep.python_source.as_str();
+    // Walk both strings line-by-line, finding which line `prep_offset`
+    // falls into and the column within that line.
+    let mut line_idx = 0usize;
+    let mut prep_line_start = 0usize;
+    while prep_line_start < prep_text.len() {
+        let line_end = prep_text[prep_line_start..]
+            .find('\n')
+            .map(|i| prep_line_start + i + 1)
+            .unwrap_or(prep_text.len());
+        if prep_offset < line_end {
+            break;
+        }
+        prep_line_start = line_end;
+        line_idx += 1;
+    }
+    let prep_col = prep_offset.saturating_sub(prep_line_start);
+
+    // Find the same line in the original text.
+    let mut orig_line_start = 0usize;
+    for _ in 0..line_idx {
+        let Some(i) = original[orig_line_start..].find('\n') else {
+            return original.len();
+        };
+        orig_line_start += i + 1;
+    }
+
+    // How many bytes did preprocess strip from the start of this line?
+    // Each `let `/`mut ` removed 4 chars; other stripped keywords (impl,
+    // extend, …) become wider lowering forms instead of getting trimmed,
+    // so they don't shift offsets.
+    let stripped_prefix: usize = prep
+        .stripped
+        .iter()
+        .filter(|s| s.line_index == line_idx)
+        .map(|s| match s.keyword {
+            tyc_syntax::lexer::TyphonKeyword::Let | tyc_syntax::lexer::TyphonKeyword::Mut => 4,
+            _ => 0,
+        })
+        .sum();
+
+    (orig_line_start + prep_col + stripped_prefix).min(original.len())
 }
 
 /// Convert an `lsp_types::Uri` into a local filesystem path.  Only `file:`
@@ -573,33 +646,20 @@ fn find_workspace_layout(
     }
 }
 
-/// Pull out the `[project] src` field from `typhon.toml` with the minimum
-/// of dependencies — a 6-line scan beats wiring `tyc-config` into the LSP
-/// crate purely for one path.
+/// Pull out the `[project] src` field from `typhon.toml`.
+///
+/// Uses the `toml` crate so inline-table values, end-of-line comments,
+/// nested tables, and the array-of-tables syntax are handled correctly
+/// (the previous line-by-line scanner choked on any of those).  Returns
+/// `None` when the file is unreadable, malformed, or doesn't carry a
+/// `[project] src = "…"` entry — callers fall through to the default
+/// `"src"` directory in that case.
 fn parse_src_dir(toml_path: &std::path::Path) -> Option<String> {
     let text = std::fs::read_to_string(toml_path).ok()?;
-    let mut in_project = false;
-    for line in text.lines() {
-        let t = line.trim();
-        if t.starts_with('[') {
-            in_project = t == "[project]";
-            continue;
-        }
-        if !in_project {
-            continue;
-        }
-        let Some((k, v)) = t.split_once('=') else {
-            continue;
-        };
-        if k.trim() == "src" {
-            return Some(
-                v.trim()
-                    .trim_matches(|c: char| c == '"' || c == '\'')
-                    .to_owned(),
-            );
-        }
-    }
-    None
+    let parsed: toml::Value = toml::from_str(&text).ok()?;
+    let project = parsed.get("project")?.as_table()?;
+    let src = project.get("src")?.as_str()?;
+    Some(src.to_owned())
 }
 
 /// Map a dotted module name to a `.ty` file path under `src_dir`.

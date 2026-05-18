@@ -749,6 +749,42 @@ fn repl_dedent_terminator_closes_block_and_runs_next_line() {
     );
 }
 
+#[test]
+fn repl_backslash_continuation_preserves_payload() {
+    // Backslash continuation joins two physical lines into one logical
+    // statement.  The dedent rule must NOT apply here — `2` on column 0
+    // is legitimate continuation content, not a sibling top-level
+    // statement.  The eventual `print(x)` should see x = 1 + 2 = 3.
+    let Some(py) = python() else { return };
+    let mut child = tyc()
+        .arg("repl")
+        .arg("--python")
+        .arg(&py)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"x = 1 + \\\n2\n\nprint(x)\n:quit\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "repl should exit 0; stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains('3'),
+        "backslash continuation should yield x=3; got:\n{stdout}"
+    );
+}
+
 // ── debug command — surface tests ───────────────────────────────────────────
 
 #[test]

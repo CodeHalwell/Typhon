@@ -47,112 +47,134 @@ pub struct ParallelStats {
 /// `pure_callees` is the set of bare-name functions that the purity pass
 /// already proved safe to invoke concurrently.  When the set is empty the
 /// pass is effectively a no-op.
+///
+/// `min_size` is the minimum *statically-known* iterable length below
+/// which the rewrite is suppressed (matches `[strictness]
+/// parallel-min-size` in `typhon.toml`).  When the iterable is a literal
+/// list/tuple shorter than `min_size`, the comprehension is left alone
+/// so the thread-pool overhead does not exceed the work.  When the
+/// iterable's size cannot be inferred (e.g. it is an arbitrary call or
+/// bound name), the threshold is treated as zero — the user opted into
+/// `auto-parallel` and we honour that for unknown sizes.
 pub fn rewrite_parallel_comprehensions(
     module: &mut ModModule,
     pure_callees: &HashSet<String>,
+    min_size: u64,
 ) -> ParallelStats {
     let mut stats = ParallelStats::default();
+    let ctx = RewriteCtx {
+        pure: pure_callees,
+        min_size,
+    };
     for stmt in &mut module.body {
-        rewrite_stmt(stmt, pure_callees, &mut stats);
+        rewrite_stmt(stmt, &ctx, &mut stats);
     }
     stats
 }
 
-fn rewrite_stmt(stmt: &mut Stmt, pure: &HashSet<String>, stats: &mut ParallelStats) {
+struct RewriteCtx<'a> {
+    pure: &'a HashSet<String>,
+    min_size: u64,
+}
+
+fn rewrite_stmt(stmt: &mut Stmt, ctx: &RewriteCtx<'_>, stats: &mut ParallelStats) {
     match stmt {
         Stmt::FunctionDef(f) => {
             for s in &mut f.body {
-                rewrite_stmt(s, pure, stats);
+                rewrite_stmt(s, ctx, stats);
             }
         }
         Stmt::ClassDef(c) => {
             for s in &mut c.body {
-                rewrite_stmt(s, pure, stats);
+                rewrite_stmt(s, ctx, stats);
             }
         }
         Stmt::Assign(a) => {
-            rewrite_expr(&mut a.value, pure, stats);
+            rewrite_expr(&mut a.value, ctx, stats);
         }
         Stmt::AnnAssign(a) => {
             if let Some(v) = a.value.as_mut() {
-                rewrite_expr(v, pure, stats);
+                rewrite_expr(v, ctx, stats);
             }
         }
         Stmt::AugAssign(a) => {
-            rewrite_expr(&mut a.value, pure, stats);
+            rewrite_expr(&mut a.value, ctx, stats);
         }
         Stmt::Expr(e) => {
-            rewrite_expr(&mut e.value, pure, stats);
+            rewrite_expr(&mut e.value, ctx, stats);
         }
         Stmt::Return(r) => {
             if let Some(v) = r.value.as_mut() {
-                rewrite_expr(v, pure, stats);
+                rewrite_expr(v, ctx, stats);
             }
         }
         Stmt::If(i) => {
-            rewrite_expr(&mut i.test, pure, stats);
+            rewrite_expr(&mut i.test, ctx, stats);
             for s in &mut i.body {
-                rewrite_stmt(s, pure, stats);
+                rewrite_stmt(s, ctx, stats);
             }
             for clause in &mut i.elif_else_clauses {
+                if let Some(test) = clause.test.as_mut() {
+                    rewrite_expr(test, ctx, stats);
+                }
                 for s in &mut clause.body {
-                    rewrite_stmt(s, pure, stats);
+                    rewrite_stmt(s, ctx, stats);
                 }
             }
         }
         Stmt::While(w) => {
-            rewrite_expr(&mut w.test, pure, stats);
+            rewrite_expr(&mut w.test, ctx, stats);
             for s in &mut w.body {
-                rewrite_stmt(s, pure, stats);
+                rewrite_stmt(s, ctx, stats);
             }
         }
         Stmt::For(f) => {
-            rewrite_expr(&mut f.iter, pure, stats);
+            rewrite_expr(&mut f.iter, ctx, stats);
             for s in &mut f.body {
-                rewrite_stmt(s, pure, stats);
+                rewrite_stmt(s, ctx, stats);
             }
         }
         Stmt::With(w) => {
             for s in &mut w.body {
-                rewrite_stmt(s, pure, stats);
+                rewrite_stmt(s, ctx, stats);
             }
         }
         _ => {}
     }
 }
 
-fn rewrite_expr(expr: &mut Expr, pure: &HashSet<String>, stats: &mut ParallelStats) {
+fn rewrite_expr(expr: &mut Expr, ctx: &RewriteCtx<'_>, stats: &mut ParallelStats) {
     // Depth-first: a nested comprehension is rewritten before the outer
     // one sees it, so a `[f(x) for x in g(...)]` still triggers when the
     // iterable is itself complex.
     match expr {
         Expr::ListComp(lc) => {
             for gen in &mut lc.generators {
-                rewrite_expr(&mut gen.iter, pure, stats);
+                rewrite_expr(&mut gen.iter, ctx, stats);
                 for f in &mut gen.ifs {
-                    rewrite_expr(f, pure, stats);
+                    rewrite_expr(f, ctx, stats);
                 }
             }
-            rewrite_expr(&mut lc.elt, pure, stats);
-            if let Some(rewritten) = try_rewrite_listcomp(lc, pure) {
+            rewrite_expr(&mut lc.elt, ctx, stats);
+            if let Some(rewritten) = try_rewrite_listcomp(lc, ctx) {
                 *expr = rewritten;
                 stats.rewrites += 1;
             }
         }
         Expr::Call(c) => {
-            rewrite_expr(&mut c.func, pure, stats);
+            rewrite_expr(&mut c.func, ctx, stats);
             for arg in &mut c.arguments.args {
-                rewrite_expr(arg, pure, stats);
+                rewrite_expr(arg, ctx, stats);
             }
         }
         Expr::Tuple(t) => {
             for e in &mut t.elts {
-                rewrite_expr(e, pure, stats);
+                rewrite_expr(e, ctx, stats);
             }
         }
         Expr::List(l) => {
             for e in &mut l.elts {
-                rewrite_expr(e, pure, stats);
+                rewrite_expr(e, ctx, stats);
             }
         }
         _ => {}
@@ -162,7 +184,7 @@ fn rewrite_expr(expr: &mut Expr, pure: &HashSet<String>, stats: &mut ParallelSta
 /// Attempt the rewrite on a single list comprehension. Returns `None` when
 /// the shape does not match the conservative template documented at the
 /// module level; the caller leaves the original expression in place.
-fn try_rewrite_listcomp(lc: &ExprListComp, pure: &HashSet<String>) -> Option<Expr> {
+fn try_rewrite_listcomp(lc: &ExprListComp, ctx: &RewriteCtx<'_>) -> Option<Expr> {
     if lc.generators.len() != 1 {
         return None;
     }
@@ -182,8 +204,18 @@ fn try_rewrite_listcomp(lc: &ExprListComp, pure: &HashSet<String>) -> Option<Exp
         Expr::Name(n) => n.id.as_str().to_owned(),
         _ => return None,
     };
-    if !pure.contains(&callee_name) {
+    if !ctx.pure.contains(&callee_name) {
         return None;
+    }
+    // Honour `[strictness] parallel-min-size`: suppress the rewrite when
+    // the iterable is a literal list/tuple shorter than the configured
+    // threshold.  Unknown sizes (an arbitrary call, name reference, …)
+    // fall through — the user opted into auto-parallel and we trust the
+    // shape will be worth parallelising at runtime.
+    if let Some(literal_len) = literal_iter_len(&gen.iter) {
+        if literal_len < ctx.min_size {
+            return None;
+        }
     }
     if !call.arguments.keywords.is_empty() || call.arguments.args.len() != 1 {
         return None;
@@ -261,6 +293,21 @@ fn ident(name: &str, range: TextRange) -> ruff_python_ast::Identifier {
     }
 }
 
+/// Statically-known length for a literal iterable expression.
+///
+/// Recognises `[a, b, c]` and `(a, b, c)` shapes and returns their element
+/// count.  All other forms (`range(n)`, a bare name, a function call)
+/// return `None`, signalling "unknown size" so the auto-parallel pass
+/// proceeds as before.
+fn literal_iter_len(expr: &Expr) -> Option<u64> {
+    match expr {
+        Expr::List(l) => Some(l.elts.len() as u64),
+        Expr::Tuple(t) => Some(t.elts.len() as u64),
+        Expr::Set(s) => Some(s.elts.len() as u64),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -277,7 +324,7 @@ mod tests {
     fn rewrites_pure_listcomp() {
         let src = "ys = [f(x) for x in xs]\n";
         let mut m = parse(src);
-        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]));
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
         assert_eq!(stats.rewrites, 1);
         let emit = tyc_emit::emit_python(&m);
         assert!(
@@ -294,7 +341,7 @@ mod tests {
     fn leaves_impure_callee_alone() {
         let src = "ys = [g(x) for x in xs]\n";
         let mut m = parse(src);
-        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]));
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
         assert_eq!(stats.rewrites, 0);
     }
 
@@ -302,7 +349,7 @@ mod tests {
     fn leaves_filtered_comprehension_alone() {
         let src = "ys = [f(x) for x in xs if x > 0]\n";
         let mut m = parse(src);
-        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]));
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
         assert_eq!(stats.rewrites, 0, "filter must veto the rewrite");
     }
 
@@ -310,7 +357,7 @@ mod tests {
     fn leaves_nested_comprehension_alone() {
         let src = "ys = [f(x) for row in rows for x in row]\n";
         let mut m = parse(src);
-        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]));
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
         assert_eq!(stats.rewrites, 0);
     }
 
@@ -318,7 +365,7 @@ mod tests {
     fn leaves_multi_arg_call_alone() {
         let src = "ys = [f(x, 1) for x in xs]\n";
         let mut m = parse(src);
-        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]));
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
         assert_eq!(stats.rewrites, 0);
     }
 
@@ -326,7 +373,44 @@ mod tests {
     fn rewrites_inside_function_body() {
         let src = "def run() -> list[int]:\n    return [f(x) for x in xs]\n";
         let mut m = parse(src);
-        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]));
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
         assert_eq!(stats.rewrites, 1);
+    }
+
+    #[test]
+    fn min_size_threshold_suppresses_short_literal_iters() {
+        // `[1, 2, 3]` is statically size 3; threshold 64 should suppress.
+        let src = "ys = [f(x) for x in [1, 2, 3]]\n";
+        let mut m = parse(src);
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 64);
+        assert_eq!(
+            stats.rewrites, 0,
+            "literal iter shorter than threshold must not rewrite"
+        );
+    }
+
+    #[test]
+    fn min_size_threshold_passes_long_literal_iters() {
+        // 64 elements ≥ threshold of 64 → rewrite.
+        let elts = (0..64)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let src = format!("ys = [f(x) for x in [{elts}]]\n");
+        let mut m = parse(&src);
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 64);
+        assert_eq!(stats.rewrites, 1);
+    }
+
+    #[test]
+    fn min_size_threshold_passes_unknown_size_iters() {
+        // An arbitrary call has no statically-known size — proceed.
+        let src = "ys = [f(x) for x in fetch()]\n";
+        let mut m = parse(src);
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 64);
+        assert_eq!(
+            stats.rewrites, 1,
+            "unknown iter size should fall through the threshold"
+        );
     }
 }

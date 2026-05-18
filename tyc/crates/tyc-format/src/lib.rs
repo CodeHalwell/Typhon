@@ -231,18 +231,65 @@ fn apply_simple_style_rules(line: &str) -> String {
 /// string starting on this line, if any.  When a triple-quoted string is
 /// opened *and* closed on the same line we treat it as fully balanced and
 /// return `None`.
+///
+/// Scanned character-by-character with awareness of regular single- and
+/// double-quoted regions, so a sequence like `x = "'''"` (which contains
+/// `'''` inside a normal string) does not falsely look like a
+/// triple-quote opener.
 fn detect_triple_quote_open(line: &str) -> Option<char> {
-    for q in ['"', '\''] {
-        let triple: String = std::iter::repeat_n(q, 3).collect();
-        let opens = line.matches(&triple).count();
-        if opens.is_multiple_of(2) {
+    let mut counts = [0u32, 0u32]; // [single, double]
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut inside: Option<u8> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = inside {
+            // Inside a regular (non-triple) string. Skip escapes.
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                inside = None;
+            }
+            i += 1;
             continue;
         }
-        return Some(q);
+        if (b == b'"' || b == b'\'')
+            && i + 2 < bytes.len()
+            && bytes[i + 1] == b
+            && bytes[i + 2] == b
+        {
+            let idx = if b == b'\'' { 0 } else { 1 };
+            counts[idx] += 1;
+            i += 3;
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            inside = Some(b);
+            i += 1;
+            continue;
+        }
+        if b == b'#' {
+            // Comment end — anything past `#` (outside a string) is text.
+            break;
+        }
+        i += 1;
+    }
+    if !counts[0].is_multiple_of(2) {
+        return Some('\'');
+    }
+    if !counts[1].is_multiple_of(2) {
+        return Some('"');
     }
     None
 }
 
+/// Whether the remainder of a multi-line triple-quoted string is closed
+/// on this `line` by the matching `q` triple.  The check is intentionally
+/// loose (string match) because once we are *inside* a triple-quoted
+/// region, regular-quote string syntax does not apply — the only way out
+/// is the matching triple.
 fn line_closes_triple_quote(line: &str, q: char) -> bool {
     let triple: String = std::iter::repeat_n(q, 3).collect();
     line.contains(&triple)
@@ -485,6 +532,29 @@ def run() -> Result[int, str]:
             "triple-quoted contents must stay verbatim; got: {:?}",
             result.output
         );
+    }
+
+    #[test]
+    fn format_treats_triple_inside_regular_string_as_text() {
+        // `"'''"` is a regular string containing three apostrophes — it
+        // must NOT count as opening a triple-quoted block, otherwise
+        // subsequent lines stop receiving normalisation.
+        let src = "x: str = \"'''\"\ny: int = 1  #pack\n";
+        let result = format_source(src, "<test>").unwrap();
+        assert!(
+            result.output.contains("# pack"),
+            "subsequent comment must be normalised since the previous \
+             line did not actually open a triple-quoted block; got: {:?}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn detect_triple_quote_open_ignores_triples_inside_regular_strings() {
+        assert_eq!(detect_triple_quote_open("x = \"'''\""), None);
+        assert_eq!(detect_triple_quote_open("x = '\"\"\"'"), None);
+        // But a real triple-quote opener still produces Some.
+        assert_eq!(detect_triple_quote_open("x = \"\"\"hi"), Some('"'));
     }
 
     #[test]

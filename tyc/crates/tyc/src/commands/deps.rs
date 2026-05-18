@@ -238,7 +238,12 @@ pub(crate) fn render_pyproject(config: &TyphonConfig) -> String {
         out.push_str("dependencies = []\n");
     }
     if !config.dev_dependencies.is_empty() {
-        out.push_str("\n[project.optional-dependencies]\n");
+        // PEP 735 dependency-groups: `uv sync` installs the `dev` group
+        // by default (no `--extra` flag needed).  An earlier draft used
+        // `[project.optional-dependencies]`, but uv only installs those
+        // when explicitly enabled via `--extra dev` / `--all-extras`,
+        // so `tyc add --dev pytest` was silently a no-op.
+        out.push_str("\n[dependency-groups]\n");
         let mut dev: Vec<String> = config
             .dev_dependencies
             .iter()
@@ -371,7 +376,10 @@ mod tests {
         assert!(out.contains("name = \"demo\""), "{out}");
         assert!(out.contains("requests"), "{out}");
         assert!(out.contains("rich>=13"), "{out}");
-        assert!(out.contains("[project.optional-dependencies]"), "{out}");
+        // Dev deps go in `[dependency-groups]` so `uv sync` installs them
+        // by default (PEP 735); the old `optional-dependencies` table
+        // required `--extra dev` and silently skipped them otherwise.
+        assert!(out.contains("[dependency-groups]"), "{out}");
         assert!(out.contains("pytest==8.2"), "{out}");
     }
 
@@ -380,6 +388,6 @@ mod tests {
         let cfg = TyphonConfig::default();
         let out = render_pyproject(&cfg);
         assert!(out.contains("dependencies = []"));
-        assert!(!out.contains("[project.optional-dependencies]"));
+        assert!(!out.contains("[dependency-groups]"));
     }
 }

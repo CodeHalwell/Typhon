@@ -126,18 +126,23 @@ pub fn run(args: ReplArgs) -> Result<()> {
         }
 
         // Multi-line: if the line ends with `:` or `\`, keep reading until
-        // a block terminator. Two terminators are accepted:
-        //   • a blank line (matches Python's REPL — convenient for typed
-        //     `def`/`class` bodies), or
-        //   • a fully-dedented continuation line (one that starts at
-        //     column 0 and is not itself a continuation). The dedent line
-        //     is preserved and treated as the next prompt's body, so a
-        //     follow-up sibling statement isn't lost.
+        // a block terminator.  Termination rules depend on what opened
+        // the continuation:
+        //   • A `:`-opened block (def/class/if/...) terminates on the
+        //     first blank line OR a non-blank line that returns to
+        //     column 0.  The dedent line is carried over to the next
+        //     prompt as a fresh top-level statement so a sibling
+        //     declaration typed right after the body isn't lost.
+        //   • A `\`-opened block (explicit line continuation) only
+        //     terminates on a blank line: a continuation by definition
+        //     starts at any column, and the user has no other way to
+        //     end the expression.
         // EOF mid-block exits cleanly rather than half-compiling a torn block.
         let mut block = String::from(line);
         block.push('\n');
         let mut hit_eof = false;
         let mut carryover: Option<String> = None;
+        let colon_opened = line.trim_end().ends_with(':');
         if needs_continuation(line) {
             loop {
                 write!(stdout, "... ").ok();
@@ -154,15 +159,12 @@ pub fn run(args: ReplArgs) -> Result<()> {
                     break;
                 }
                 let body = buf.trim_end_matches(['\r', '\n']);
-                // Dedent-to-0 terminator: a non-blank line starting at
-                // column 0 closes the current block. The line itself is
-                // carried over so the next loop iteration processes it as
-                // a fresh top-level prompt rather than discarding the
-                // user's input.
-                let indented = body.starts_with([' ', '\t']);
-                if !indented {
-                    carryover = Some(body.to_owned());
-                    break;
+                if colon_opened {
+                    let indented = body.starts_with([' ', '\t']);
+                    if !indented {
+                        carryover = Some(body.to_owned());
+                        break;
+                    }
                 }
                 block.push_str(body);
                 block.push('\n');
