@@ -156,6 +156,30 @@ mod tests {
     }
 
     #[test]
+    fn init_writes_main_ty_with_let_not_deprecated_val() {
+        // Regression guard: the scaffolded `main.ty` must use `let`, the
+        // current binding keyword.  `val` was an early-development spelling
+        // that has since been removed from the lexer; reintroducing it in
+        // the template would generate a project that doesn't type-check on
+        // the first `tyc check`.
+        let tmp = tempfile::tempdir().unwrap();
+        let args = InitArgs {
+            name: Some("regression".into()),
+            dir: tmp.path().to_path_buf(),
+        };
+        run(args).unwrap();
+        let body = std::fs::read_to_string(tmp.path().join("src/main.ty")).unwrap();
+        assert!(
+            !body.split_whitespace().any(|tok| tok == "val"),
+            "scaffold leaked the deprecated `val` keyword:\n{body}"
+        );
+        assert!(
+            body.contains("let "),
+            "scaffold should use the current `let` keyword:\n{body}"
+        );
+    }
+
+    #[test]
     fn init_uses_dir_name_when_no_name_given() {
         let tmp = tempfile::tempdir().unwrap();
         let args = InitArgs {

@@ -150,7 +150,8 @@ mod tests {
     fn format_let_declaration() {
         let src = "let x: int = 1\n";
         let result = format_source(src, "<test>").unwrap();
-        // The val keyword must be present in the output.
+        // The let keyword must be preserved through the format round-trip
+        // (the soft-keyword survives ruff's Python parser via preprocessing).
         assert!(
             result.output.contains("let x"),
             "output should contain 'let x', got: {}",
