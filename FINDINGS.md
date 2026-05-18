@@ -436,6 +436,18 @@ actually relies on today.
 
 ## 11. `dict.get(k)` does not return `V?` (bug)
 
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Added a small
+`builtin_generic_method` lookup in `tyc-types`'s `Expr::Attribute`
+resolution: when the receiver type is `Type::Generic("dict", [K, V])`
+and the attr is `"get"`, the resolver synthesises a variadic
+`Function { params: [K], ret: V | None }` signature. `let x: int =
+d.get("a")` now correctly fails with the standard `type_mismatch`
+diagnostic; `let x: int? = d.get("a")` succeeds and narrows correctly.
+The helper is also the natural place to grow other built-in method
+types (`list.pop`, `str.find`, `re.match`, etc.). Note: `d.get(k,
+default)` is conservatively typed as `V | None` too — slightly stricter
+than Python's runtime semantics, but never unsafe.
+
 **Severity:** bug — type-stub drift.
 
 ```ty
@@ -491,6 +503,14 @@ defeating the safety story for typed errors.
 ---
 
 ## 14. `if x:` does not narrow `T?` to `T` (gap)
+
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Added truthy
+narrowing in `collect_narrowings_inner`'s `Expr::Name` arm: inside the
+true branch of `if x:`, `x` is stripped of `None` (truthy implies
+non-None). The else branch is intentionally not narrowed in the
+opposite direction because falsy doesn't imply None — `int?` with
+value `0` is falsy yet still nullable. Documented in the diagnostic
+catalog as one of the supported narrowing forms.
 
 **Severity:** gap — narrowing form unsupported.
 
@@ -600,6 +620,15 @@ skeletal. Worth a look in `tyc-format/src/`.
 ---
 
 ## 19. `interface` body cannot use declaration-only methods (papercut)
+
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. The preprocessor
+now recognises `def NAME(...) -> TYPE` lines that lack a body (no
+trailing `:` after the return annotation) and auto-appends `: ...` so
+the Python parser accepts them. The detector tracks paren/bracket depth
+and strips trailing comments to avoid false positives. This makes the
+documented `interface` syntax (`def draw() -> None`, no body) work
+verbatim from the cheat sheet without losing the explicit `def f() ->
+T: ...` form.
 
 **Severity:** papercut — docs show forbidden form.
 

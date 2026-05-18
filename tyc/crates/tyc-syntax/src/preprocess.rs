@@ -289,6 +289,25 @@ pub fn preprocess(source: &str) -> PreprocessResult {
                 }
             }
 
+            // ── interface-style `def NAME(...) -> T` (no body) ──────────────
+            // The docs show declaration-only methods inside `interface` blocks
+            // (`def draw() -> None`). The Python parser rejects a `def` line
+            // with no body, so we auto-append `: ...` here. The same rewrite
+            // applies inside `class!`/`class` bodies too — `def f() -> int`
+            // without a body is invalid Python anyway, and `: ...` is a strict
+            // upgrade that never changes a valid program's meaning.
+            if let Some(with_body) = append_ellipsis_to_bodiless_def(line) {
+                let (rewritten, marks) = rewrite_optionals(&with_body, &mut in_string);
+                for col in marks {
+                    optionals.push(StrippedOptional {
+                        line_index,
+                        python_col: col,
+                    });
+                }
+                python_source.push_str(&rewritten);
+                continue;
+            }
+
             // ── `unsafe:` → `if True:  # __typhon_unsafe__` ────────────────
             // The body is a no-op wrapper that preserves Python scoping. The
             // type checker tracks the marker so it can permit `Any` to flow
@@ -587,6 +606,70 @@ fn make_impl_class_line(after_impl: &str) -> Option<String> {
     let tail = &after_tps[colon_pos..]; // ":\n" or ":"
     let tp = impl_type_params.unwrap_or("");
     Some(format!("__typhon_impl_{}{}(object){}", name, tp, tail))
+}
+
+/// If `line` is a `def NAME(...) -> TYPE` declaration with no body
+/// (no trailing `:` after the return type), return a rewritten copy
+/// with `: ...` appended so the Python parser accepts it. Returns
+/// `None` when the line doesn't match the bodiless-def shape.
+///
+/// This makes interface-body declarations like
+/// `def draw() -> None` legal source, mirroring the docs and the
+/// skill cheat-sheet's syntax for `interface` bodies.
+fn append_ellipsis_to_bodiless_def(line: &str) -> Option<String> {
+    // Preserve trailing newline / CRLF.
+    let (body, terminator) = match line.rfind('\n') {
+        Some(idx) => {
+            let term_start = if idx > 0 && line.as_bytes()[idx - 1] == b'\r' {
+                idx - 1
+            } else {
+                idx
+            };
+            (&line[..term_start], &line[term_start..])
+        }
+        None => (line, ""),
+    };
+    let indent_len = body.find(|c: char| !c.is_whitespace())?;
+    let rest = &body[indent_len..];
+    if !rest.starts_with("def ") {
+        return None;
+    }
+    // Confirm balanced parens before checking for the bodiless tail. Track
+    // bracket depth so `[T, U]`-style annotations in the return type don't
+    // throw the scanner off.
+    let mut paren_depth = 0i32;
+    let mut bracket_depth = 0i32;
+    let mut found_close_paren = false;
+    for b in rest.as_bytes() {
+        match b {
+            b'(' => paren_depth += 1,
+            b')' => {
+                paren_depth -= 1;
+                if paren_depth == 0 {
+                    found_close_paren = true;
+                }
+            }
+            b'[' => bracket_depth += 1,
+            b']' => bracket_depth -= 1,
+            _ => {}
+        }
+    }
+    if !found_close_paren || paren_depth != 0 || bracket_depth != 0 {
+        return None;
+    }
+    // Strip a trailing comment (if any) before checking the bodiless tail.
+    let no_comment = strip_trailing_comment(rest);
+    let trimmed = no_comment.trim_end();
+    if trimmed.ends_with(':') || trimmed.ends_with("...") {
+        return None;
+    }
+    // Require either a `-> TYPE` return annotation or at least a closing
+    // `)`, so we don't accidentally rewrite a syntactically invalid line
+    // into something that masks a real user error.
+    if !trimmed.contains("->") && !trimmed.ends_with(')') {
+        return None;
+    }
+    Some(format!("{}: ...{}", body.trim_end(), terminator))
 }
 
 /// Strip the `frozen` modifier from a `class NAME frozen:` or

@@ -2046,7 +2046,52 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
         Expr::UnaryOp(u) if matches!(u.op, ruff_python_ast::UnaryOp::Not) => {
             collect_narrowings_inner(c, &u.operand, !negate, out);
         }
+        Expr::Name(n) => {
+            // Truthy narrowing: `if x:` strips None from `x` in the true
+            // branch (truthy implies not None). The else branch isn't
+            // narrowed in the opposite direction because falsy doesn't
+            // imply None — `int? == 0` is also falsy and stays nullable.
+            if !negate {
+                if let Some(b) = c.env.lookup(n.id.as_str()) {
+                    if b.narrowed.is_nullable() {
+                        out.push(Narrowing {
+                            name: n.id.as_str().to_owned(),
+                            replacement: b.narrowed.strip_none(),
+                        });
+                    }
+                }
+            }
+        }
         _ => {}
+    }
+}
+
+/// Return the [`Type::Function`] signature for a built-in method on a
+/// generic container, or `None` when the receiver/method combo isn't a
+/// known intrinsic.
+///
+/// Today this covers the cases the FINDINGS doc called out — primarily
+/// `dict.get(k)` which must return `V?`, not `V` — and is the right
+/// place to grow other built-in method types (`list.pop`, `str.find`,
+/// `re.match`, …) without scattering them across the inference engine.
+fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
+    let Type::Generic(head, args) = recv else {
+        return None;
+    };
+    match (head.as_str(), attr, args.as_slice()) {
+        ("dict", "get", [k, v]) => {
+            // `d.get(k)` → V?  ;  `d.get(k, default)` → also typed as V?
+            // (the default may broaden the runtime type, but the static
+            // contract Typhon advertises is "V?"). Variadic so 1- and
+            // 2-arg call sites both pass the arity check.
+            let ret = Type::union_of(vec![v.clone(), Type::None]);
+            Some(Type::Function {
+                params: vec![k.clone()],
+                ret: Box::new(ret),
+                variadic: true,
+            })
+        }
+        _ => None,
     }
 }
 
@@ -2288,6 +2333,9 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             }
             let attr_name = a.attr.as_str();
             // Resolve attribute access on known class instances and TypeVar-bounded parameters.
+            if let Some(method_type) = builtin_generic_method(&recv, attr_name) {
+                return method_type;
+            }
             match &recv {
                 Type::Class(class_name) => {
                     let class_name = class_name.clone();
