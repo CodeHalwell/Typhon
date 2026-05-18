@@ -2613,10 +2613,11 @@ mod tests {
     fn reassign_type_mismatch_carries_decl_site_and_explains_mut() {
         // Regression test for the misleading-diagnostic case raised on
         // PR #48: `mut greeting: str = "..."` followed by
-        // `mut greeting = 8` previously produced a bare "expected str,
+        // `greeting = 8` previously produced a bare "expected str,
         // found int" message that read like a compiler bug. The new
-        // diagnostic names the binding, mentions both sites, and
-        // explains what `mut` actually permits.
+        // diagnostic names the binding and both types in the headline,
+        // anchors short labels to the declaration and the offending
+        // value, and explains `mut` semantics in the help line.
         let d = check("mut greeting: str = \"hi\"\ngreeting = 8\n");
         assert!(d.has_errors(), "{:?}", d.errors());
         let err = &d.errors()[0];
@@ -2626,18 +2627,15 @@ mod tests {
             matches!(err, TycError::TypeReassignMismatch { .. }),
             "expected TypeReassignMismatch, got: {err:?}"
         );
+        // Headline must name the binding, the actual type, and the
+        // declared type so the user has every relevant fact in the
+        // first line of output — the labels are intentionally terse
+        // and only carry the per-anchor disambiguator.
         let msg = format!("{}", err);
         assert!(
-            msg.contains("greeting") && msg.contains("`str`") && msg.contains("`int`"),
-            "message should name the binding and both types; got: {msg}"
+            msg.contains("greeting") && msg.contains("str") && msg.contains("`int`"),
+            "headline should name the binding and both types; got: {msg}"
         );
-        // The diagnostic carries two labels — one at the value, one at
-        // the declaration — so the user can navigate from the bad
-        // reassignment back to the original declaration. The help text
-        // must mention `mut` so the user understands why the rebinding
-        // isn't accepted (the typical mental model is "mut means I can
-        // change it to anything"). Both invariants are encoded in the
-        // miette derive attributes on the variant.
         if let TycError::TypeReassignMismatch {
             name,
             expected,

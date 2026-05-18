@@ -80,14 +80,17 @@ pub enum TycError {
     /// users routinely interpret the bare "type mismatch" as a bug,
     /// since they wrote a literal `mut name = …` and (reasonably)
     /// expected that to behave like a fresh declaration.
-    #[error("type mismatch: cannot assign `{actual}` to `{name}` (declared `{expected}`)")]
+    ///
+    /// The labels are kept terse on purpose: miette renders one
+    /// connector per labelled span, and verbose label text quickly
+    /// turns a two-site diagnostic into a wall of branches on narrow
+    /// terminals. The redundant information (binding name, declared
+    /// type) lives in the headline message; the labels only carry
+    /// what's unique to each anchor.
+    #[error("cannot assign `{actual}` to `{name}: {expected}`")]
     #[diagnostic(
         code(tyc::type_mismatch),
-        help(
-            "`{name}` was declared with type `{expected}`; `mut` allows reassignment to a new \
-             value of the same type, not a different type. Change the value to a `{expected}`, \
-             or use a different name for a `{actual}` binding."
-        )
+        help("`mut` only permits new values of the declared type. Use a different name to bind type `{actual}`.")
     )]
     TypeReassignMismatch {
         name: String,
@@ -95,9 +98,9 @@ pub enum TycError {
         actual: String,
         #[source_code]
         src: NamedSource<String>,
-        #[label("expected `{expected}` here")]
+        #[label("`{actual}`")]
         span: SourceSpan,
-        #[label("`{name}` declared `{expected}` here")]
+        #[label("declared here")]
         decl_span: SourceSpan,
     },
 
