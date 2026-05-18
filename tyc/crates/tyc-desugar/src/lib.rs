@@ -54,6 +54,13 @@ pub struct DesugarOptions {
     /// the `@dataclass` decorator injection is skipped.  Populated from
     /// the preprocessor's `raw_class_lines` via `line_byte_starts`.
     pub raw_class_line_starts: Vec<u32>,
+    /// Byte offsets (start of the line) at which a `class NAME frozen:`
+    /// declaration appears in the *preprocessed* source.  A class whose
+    /// `TextRange` starts at or just after one of these offsets gets
+    /// `@dataclasses.dataclass(slots=True, frozen=True)` instead of the
+    /// default decorator.  Populated from the preprocessor's
+    /// `frozen_class_lines` via `line_byte_starts`.
+    pub frozen_class_line_starts: Vec<u32>,
 }
 
 /// Desugar a Typhon module AST into a plain Python AST.
@@ -715,7 +722,11 @@ fn expr_uses_asyncio_qualified(expr: &Expr) -> bool {
 // ── module-level desugaring ──────────────────────────────────────────────────
 
 fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule {
-    let (new_body, transformed_classes) = desugar_stmts(&m.body, &options.raw_class_line_starts);
+    let markers = ClassMarkers {
+        raw_starts: &options.raw_class_line_starts,
+        frozen_starts: &options.frozen_class_line_starts,
+    };
+    let (new_body, transformed_classes) = desugar_stmts(&m.body, markers);
 
     // Merge `impl` pseudo-classes into their target classes and remove the stubs.
     let (merged_body, _) = merge_impl_blocks(new_body);
@@ -937,14 +948,40 @@ fn import_insert_pos(body: &[Stmt]) -> usize {
 
 // ── recursive statement desugaring ──────────────────────────────────────────
 
+/// Bundle of class-line-offset slices threaded through the recursive desugar
+/// walk so individual classes can be checked against multiple modifier flags
+/// (`class!` raw, `class … frozen`) without ballooning the function
+/// signature.
+#[derive(Copy, Clone)]
+struct ClassMarkers<'a> {
+    raw_starts: &'a [u32],
+    frozen_starts: &'a [u32],
+}
+
+impl ClassMarkers<'_> {
+    /// Return `true` if `starts` contains an offset in the half-open
+    /// range `[class_start, name_start)` — i.e. a marker that lives on
+    /// the same line as this class's `class` keyword.
+    fn marker_covers(starts: &[u32], class_start: u32, name_start: u32) -> bool {
+        starts.partition_point(|&off| off < class_start)
+            != starts.partition_point(|&off| off < name_start)
+    }
+    fn is_raw(self, class_start: u32, name_start: u32) -> bool {
+        Self::marker_covers(self.raw_starts, class_start, name_start)
+    }
+    fn is_frozen(self, class_start: u32, name_start: u32) -> bool {
+        Self::marker_covers(self.frozen_starts, class_start, name_start)
+    }
+}
+
 /// Desugar a list of statements, returning the transformed list and whether
 /// any class was modified at any nesting depth.
-fn desugar_stmts(stmts: &[Stmt], raw_class_starts: &[u32]) -> (Vec<Stmt>, bool) {
+fn desugar_stmts(stmts: &[Stmt], markers: ClassMarkers<'_>) -> (Vec<Stmt>, bool) {
     let mut any_transformed = false;
     let new_stmts = stmts
         .iter()
         .map(|stmt| {
-            let (new_stmt, transformed) = desugar_stmt(stmt, raw_class_starts);
+            let (new_stmt, transformed) = desugar_stmt(stmt, markers);
             if transformed {
                 any_transformed = true;
             }
@@ -956,12 +993,11 @@ fn desugar_stmts(stmts: &[Stmt], raw_class_starts: &[u32]) -> (Vec<Stmt>, bool) 
 
 /// Desugar a single statement, recursing into any nested statement lists.
 /// Returns the (possibly modified) statement and whether any class was
-/// transformed at this level or deeper.  `raw_class_starts` is the list
-/// of preprocessed-source byte offsets where a `class!` was declared;
-/// classes whose `TextRange` covers one of those offsets (between the
-/// node start and the class name) are emitted without the automatic
-/// `@dataclass` decorator.
-fn desugar_stmt(stmt: &Stmt, raw_class_starts: &[u32]) -> (Stmt, bool) {
+/// transformed at this level or deeper.  `markers` carries the per-class
+/// modifier offsets collected by the preprocessor (`class!` raw,
+/// `frozen`); classes whose source range covers a marker are emitted
+/// with the corresponding decorator (or no decorator, for `class!`).
+fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
     match stmt {
         Stmt::ClassDef(c) => {
             // We can't compare against `c.range.start()` directly because
@@ -975,8 +1011,8 @@ fn desugar_stmt(stmt: &Stmt, raw_class_starts: &[u32]) -> (Stmt, bool) {
             // sit beyond `c.name.range.start()`.
             let class_start = u32::from(c.range.start());
             let name_start = u32::from(c.name.range.start());
-            let is_raw = raw_class_starts.partition_point(|&off| off < class_start)
-                != raw_class_starts.partition_point(|&off| off < name_start);
+            let is_raw = markers.is_raw(class_start, name_start);
+            let is_frozen = markers.is_frozen(class_start, name_start);
             let is_pydantic = class_inherits_basemodel(c);
             // `impl` pseudo-classes (`__typhon_impl_*`) are temporary stubs
             // that will be merged into their target class by `merge_impl_blocks`;
@@ -1003,13 +1039,16 @@ fn desugar_stmt(stmt: &Stmt, raw_class_starts: &[u32]) -> (Stmt, bool) {
             // as their first body statement unless the user already defined it.
             let needs_model_config =
                 is_pydantic && !is_impl_stub && !has_model_config_stmt(&c.body);
-            let (new_body, body_transformed) = desugar_stmts(&c.body, raw_class_starts);
+            let (new_body, body_transformed) = desugar_stmts(&c.body, markers);
             let mut new_class = c.clone();
             new_class.body = new_body;
             if needs_decorator {
-                new_class
-                    .decorator_list
-                    .insert(0, make_dataclasses_dot_dataclass_decorator());
+                let decorator = if is_frozen {
+                    make_dataclasses_dot_dataclass_decorator_frozen()
+                } else {
+                    make_dataclasses_dot_dataclass_decorator()
+                };
+                new_class.decorator_list.insert(0, decorator);
             }
             if needs_model_config {
                 // Insert after a leading class docstring so that `__doc__` is
@@ -1051,7 +1090,7 @@ fn desugar_stmt(stmt: &Stmt, raw_class_starts: &[u32]) -> (Stmt, bool) {
             )
         }
         Stmt::FunctionDef(f) => {
-            let (new_body, transformed) = desugar_stmts(&f.body, raw_class_starts);
+            let (new_body, transformed) = desugar_stmts(&f.body, markers);
             let mut new_f = f.clone();
             new_f.body = new_body;
             (Stmt::FunctionDef(new_f), transformed)
@@ -1061,6 +1100,64 @@ fn desugar_stmt(stmt: &Stmt, raw_class_starts: &[u32]) -> (Stmt, bool) {
 }
 
 // ── AST helpers ──────────────────────────────────────────────────────────────
+
+/// Build the decorator `@dataclasses.dataclass(slots=True, frozen=True)`
+/// for a `class NAME frozen:` declaration. Companion to
+/// [`make_dataclasses_dot_dataclass_decorator`].
+fn make_dataclasses_dot_dataclass_decorator_frozen() -> Decorator {
+    let dataclasses_name = Expr::Name(ExprName {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        id: Name::new("dataclasses"),
+        ctx: ExprContext::Load,
+    });
+    let dataclass_attr = Expr::Attribute(ExprAttribute {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        value: Box::new(dataclasses_name),
+        attr: make_identifier("dataclass"),
+        ctx: ExprContext::Load,
+    });
+    let true_lit_a = Expr::BooleanLiteral(ExprBooleanLiteral {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        value: true,
+    });
+    let true_lit_b = Expr::BooleanLiteral(ExprBooleanLiteral {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        value: true,
+    });
+    let call = Expr::Call(ExprCall {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        func: Box::new(dataclass_attr),
+        arguments: Arguments {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            args: Box::new([]),
+            keywords: Box::new([
+                Keyword {
+                    range: TextRange::default(),
+                    node_index: AtomicNodeIndex::NONE,
+                    arg: Some(make_identifier("slots")),
+                    value: true_lit_a,
+                },
+                Keyword {
+                    range: TextRange::default(),
+                    node_index: AtomicNodeIndex::NONE,
+                    arg: Some(make_identifier("frozen")),
+                    value: true_lit_b,
+                },
+            ]),
+        },
+    });
+    Decorator {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        expression: call,
+    }
+}
 
 /// Build the decorator `@dataclasses.dataclass(slots=True)`.
 ///
@@ -1779,6 +1876,7 @@ mod tests {
             DesugarOptions {
                 memoise_functions: Vec::new(),
                 raw_class_line_starts: starts,
+                frozen_class_line_starts: Vec::new(),
             },
         );
         let emitted = emit(&out.module);
@@ -1828,6 +1926,7 @@ mod tests {
             DesugarOptions {
                 memoise_functions: Vec::new(),
                 raw_class_line_starts: vec![class_kw],
+                frozen_class_line_starts: Vec::new(),
             },
         );
         let emitted = emit(&out.module);
@@ -1858,6 +1957,7 @@ mod tests {
             DesugarOptions {
                 memoise_functions: Vec::new(),
                 raw_class_line_starts: starts,
+                frozen_class_line_starts: Vec::new(),
             },
         );
         let emitted = emit(&out.module);
@@ -1893,6 +1993,7 @@ mod tests {
             DesugarOptions {
                 memoise_functions: Vec::new(),
                 raw_class_line_starts: starts,
+                frozen_class_line_starts: Vec::new(),
             },
         );
         let emitted = emit(&out.module);
@@ -1912,6 +2013,7 @@ mod tests {
             DesugarOptions {
                 memoise_functions: Vec::new(),
                 raw_class_line_starts: starts,
+                frozen_class_line_starts: Vec::new(),
             },
         );
         let emitted = emit(&out.module);
@@ -1938,6 +2040,7 @@ mod tests {
             DesugarOptions {
                 memoise_functions: Vec::new(),
                 raw_class_line_starts: starts,
+                frozen_class_line_starts: Vec::new(),
             },
         );
         let emitted = emit(&out.module);
@@ -1989,6 +2092,7 @@ mod tests {
             DesugarOptions {
                 memoise_functions: Vec::new(),
                 raw_class_line_starts: vec![class_start],
+                frozen_class_line_starts: Vec::new(),
             },
         );
         let emitted = emit(&out.module);

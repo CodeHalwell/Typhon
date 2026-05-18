@@ -307,11 +307,14 @@ pub fn run(args: BuildArgs) -> Result<()> {
         }
 
         let raw_class_line_starts = line_byte_starts(&prep.python_source, &prep.raw_class_lines);
+        let frozen_class_line_starts =
+            line_byte_starts(&prep.python_source, &prep.frozen_class_lines);
         let desugar_output = desugar_module_with(
             &module,
             DesugarOptions {
                 memoise_functions: memoise_targets,
                 raw_class_line_starts,
+                frozen_class_line_starts,
             },
         );
         if desugar_output.needs_typhon_runtime {
@@ -387,11 +390,14 @@ pub fn run(args: BuildArgs) -> Result<()> {
             .map(|p| p.into_syntax())
             .map_err(|e| miette!("parse error in '{}': {e}", path.display()))?;
         let raw_class_line_starts = line_byte_starts(&prep.python_source, &prep.raw_class_lines);
+        let frozen_class_line_starts =
+            line_byte_starts(&prep.python_source, &prep.frozen_class_lines);
         let desugar = desugar_module_with(
             &module,
             DesugarOptions {
                 memoise_functions: Vec::new(),
                 raw_class_line_starts,
+                frozen_class_line_starts,
             },
         );
         let stub_text = emit_stub(&desugar.module);

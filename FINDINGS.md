@@ -112,6 +112,16 @@ fixes.
 
 ## 1. `class Foo frozen:` is a parse error (bug)
 
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Mirrored the existing
+`class!` raw-class machinery: the preprocessor now strips the `frozen`
+modifier in `strip_frozen_modifier`, records the line in
+`PreprocessResult::frozen_class_lines`, and the desugar pass emits
+`@dataclasses.dataclass(slots=True, frozen=True)` (via
+`make_dataclasses_dot_dataclass_decorator_frozen`) for any class whose
+source range covers a recorded offset. Verified end-to-end: `class Point
+frozen:` parses, builds, and mutation raises `FrozenInstanceError` at
+runtime.
+
 **Severity:** bug — documented feature is unparseable.
 
 Both `docs/guides/` examples and the skill cheat sheet say:
@@ -166,6 +176,17 @@ either entirely missing from the grammar or only the multi-line form
 ---
 
 ## 3. `impl[T] Box[T]:` parameter-list parses fail (bug)
+
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Extended the
+preprocessor's `impl` recognition to also match `impl[` (no space) and
+taught `make_impl_class_line` to peel the leading `[T, U]` type-param
+list, drop the trailing `[T, U]` application on the class name, and
+forward the type parameters onto the pseudo-class header
+(`class __typhon_impl_Box[T](object):`). Methods inside the block can now
+resolve `T`/`U`; the desugar pass continues to merge them back into the
+real `class Box[T]:`. (Note: `Box[int]` constructor inference at the
+call site is a separate type-checker enhancement not yet on the
+roadmap.)
 
 **Severity:** bug — generic `impl` block syntax doesn't parse.
 

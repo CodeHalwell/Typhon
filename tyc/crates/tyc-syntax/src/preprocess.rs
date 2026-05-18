@@ -106,6 +106,13 @@ pub struct PreprocessResult {
     /// the class should NOT receive a `@dataclass` decorator at desugar
     /// time.
     pub raw_class_lines: Vec<usize>,
+    /// 0-based line indices on which a `class NAME frozen:` declaration
+    /// appears.  The preprocessor strips the `frozen` modifier so the
+    /// Python parser sees a plain `class Foo:` / `class Foo(Base):`;
+    /// downstream passes consult this list to emit
+    /// `@dataclasses.dataclass(slots=True, frozen=True)` instead of the
+    /// default decorator.
+    pub frozen_class_lines: Vec<usize>,
 }
 
 /// Convert a list of 0-based line indices into byte offsets pointing at
@@ -149,6 +156,7 @@ pub fn preprocess(source: &str) -> PreprocessResult {
     let mut lazy_imports = Vec::new();
     let mut unsafe_lines: Vec<usize> = Vec::new();
     let mut raw_class_lines: Vec<usize> = Vec::new();
+    let mut frozen_class_lines: Vec<usize> = Vec::new();
     // String state carried across lines (triple-quoted strings may span them).
     let mut in_string: Option<StringMode> = None;
 
@@ -186,27 +194,36 @@ pub fn preprocess(source: &str) -> PreprocessResult {
             }
 
             // ── `impl ClassName:` → `class __typhon_impl_ClassName(object):` ─
-            if rest.starts_with("impl ")
-                && rest.len() > "impl ".len()
-                && (rest.as_bytes()["impl ".len()].is_ascii_alphanumeric()
-                    || rest.as_bytes()["impl ".len()] == b'_')
-            {
-                let after_impl = &rest["impl ".len()..];
-                if let Some(class_header) = make_impl_class_line(after_impl) {
-                    stripped.push(StrippedKeyword {
-                        line_index,
-                        keyword: TyphonKeyword::Impl,
-                    });
-                    let new_line = format!("{}class {}", indent, class_header);
-                    let (rewritten, marks) = rewrite_optionals(&new_line, &mut in_string);
-                    for col in marks {
-                        optionals.push(StrippedOptional {
+            // Also `impl[T, U] ClassName[T, U]:` for generic impl blocks
+            // (PEP 695); the type parameters are forwarded to the pseudo
+            // class so methods can resolve `T`/`U` while the desugar pass
+            // merges them back into the real `ClassName[T, U]`.
+            let after_impl_kw = if let Some(s) = rest.strip_prefix("impl ") {
+                Some(s)
+            } else if rest.starts_with("impl[") {
+                Some(&rest["impl".len()..])
+            } else {
+                None
+            };
+            if let Some(after_impl) = after_impl_kw {
+                let first = after_impl.as_bytes().first().copied().unwrap_or(0);
+                if first.is_ascii_alphanumeric() || first == b'_' || first == b'[' {
+                    if let Some(class_header) = make_impl_class_line(after_impl) {
+                        stripped.push(StrippedKeyword {
                             line_index,
-                            python_col: col,
+                            keyword: TyphonKeyword::Impl,
                         });
+                        let new_line = format!("{}class {}", indent, class_header);
+                        let (rewritten, marks) = rewrite_optionals(&new_line, &mut in_string);
+                        for col in marks {
+                            optionals.push(StrippedOptional {
+                                line_index,
+                                python_col: col,
+                            });
+                        }
+                        python_source.push_str(&rewritten);
+                        continue;
                     }
-                    python_source.push_str(&rewritten);
-                    continue;
                 }
             }
 
@@ -329,6 +346,27 @@ pub fn preprocess(source: &str) -> PreprocessResult {
                 continue;
             }
 
+            // ── `class NAME frozen:` / `class NAME frozen(BASES):` ──────────
+            // Strip the `frozen` modifier and record the line so the desugar
+            // pass can emit `@dataclasses.dataclass(slots=True, frozen=True)`
+            // for this class. Plain `class NAME:` (no modifier) is left to
+            // fall through to the Python parser unchanged.
+            if rest.starts_with("class ") && rest.contains(" frozen") {
+                if let Some(rewritten_class) = strip_frozen_modifier(rest) {
+                    frozen_class_lines.push(line_index);
+                    let new_line = format!("{}{}", indent, rewritten_class);
+                    let (rewritten, marks) = rewrite_optionals(&new_line, &mut in_string);
+                    for col in marks {
+                        optionals.push(StrippedOptional {
+                            line_index,
+                            python_col: col,
+                        });
+                    }
+                    python_source.push_str(&rewritten);
+                    continue;
+                }
+            }
+
             // ── `model ClassName:` → `class ClassName(BaseModel):` ──────────
             if rest.starts_with("model ")
                 && rest.len() > "model ".len()
@@ -439,6 +477,7 @@ pub fn preprocess(source: &str) -> PreprocessResult {
         lazy_imports,
         unsafe_lines,
         raw_class_lines,
+        frozen_class_lines,
     }
 }
 
@@ -486,10 +525,43 @@ fn is_dotted_python_ident(s: &str) -> bool {
 /// `class __typhon_impl_User(Base)(object):`.
 ///
 /// Returns `None` when the line doesn't look like a class header (no `:`).
+///
+/// Handles two forms:
+/// - `Name:` / `Name(Bases):` — plain `impl Name:`.
+/// - `[T1, ...] Name[T1, ...]:` — generic `impl[T] Name[T]:`. The
+///   leading bracket list is the impl's PEP 695 type parameters; it is
+///   forwarded onto the pseudo class so the methods inside resolve
+///   `T`/`U`. The trailing bracket list on the class name is dropped
+///   from the pseudo class header (PEP 695 introduces type params on
+///   the class header itself; we don't need to repeat them as bases).
 fn make_impl_class_line(after_impl: &str) -> Option<String> {
+    // Optionally consume a leading `[...]` type-param list. Track bracket
+    // depth so commas inside nested brackets don't fool the scanner.
+    let (impl_type_params, after_tps) = if after_impl.starts_with('[') {
+        let mut depth = 0i32;
+        let mut end = None;
+        for (i, c) in after_impl.char_indices() {
+            match c {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end?;
+        (Some(&after_impl[..end]), after_impl[end..].trim_start())
+    } else {
+        (None, after_impl)
+    };
+
     let mut depth = 0i32;
     let mut colon_pos = None;
-    for (i, c) in after_impl.char_indices() {
+    for (i, c) in after_tps.char_indices() {
         match c {
             '(' | '[' => depth += 1,
             ')' | ']' => depth -= 1,
@@ -501,15 +573,60 @@ fn make_impl_class_line(after_impl: &str) -> Option<String> {
         }
     }
     let colon_pos = colon_pos?;
-    let raw = after_impl[..colon_pos].trim_end();
+    let raw = after_tps[..colon_pos].trim_end();
     // Strip any base-class list — `impl` blocks don't support inheritance.
+    // Also strip the `[T, U]` trailing type-param application on the class
+    // name; the pseudo class carries its own type params on the header.
     let name = if let Some(paren) = raw.find('(') {
         raw[..paren].trim_end()
+    } else if let Some(bracket) = raw.find('[') {
+        raw[..bracket].trim_end()
     } else {
         raw
     };
-    let tail = &after_impl[colon_pos..]; // ":\n" or ":"
-    Some(format!("__typhon_impl_{}(object){}", name, tail))
+    let tail = &after_tps[colon_pos..]; // ":\n" or ":"
+    let tp = impl_type_params.unwrap_or("");
+    Some(format!("__typhon_impl_{}{}(object){}", name, tp, tail))
+}
+
+/// Strip the `frozen` modifier from a `class NAME frozen:` or
+/// `class NAME frozen(BASES):` header so the Python parser accepts it.
+///
+/// Returns the rewritten line (including the trailing newline if one was
+/// present), or `None` if the input does not match the expected shape.
+/// The leading `class ` is preserved so callers can simply prepend the
+/// captured indent.
+fn strip_frozen_modifier(rest: &str) -> Option<String> {
+    // Walk after `class ` to find the end of the class name (first non-id
+    // character). Everything up through the name is the prefix we keep.
+    let after_class = rest.strip_prefix("class ")?;
+    let name_end = after_class
+        .bytes()
+        .position(|b| !(b.is_ascii_alphanumeric() || b == b'_'))?;
+    if name_end == 0 {
+        return None;
+    }
+    let name = &after_class[..name_end];
+    let after_name = &after_class[name_end..];
+    // The modifier must follow whitespace and be the bare token `frozen`,
+    // terminated by `:` or `(` (with whatever whitespace sits between).
+    let trimmed = after_name.trim_start();
+    let leading_ws = after_name.len() - trimmed.len();
+    if leading_ws == 0 {
+        return None;
+    }
+    let rest_after_mod = trimmed.strip_prefix("frozen")?;
+    // Reject `frozen` followed by an identifier character (e.g. `frozenset`)
+    // so the modifier match is unambiguous.
+    if let Some(next) = rest_after_mod.bytes().next() {
+        if next.is_ascii_alphanumeric() || next == b'_' {
+            return None;
+        }
+    }
+    // Anything after the modifier (bases list, colon, trailing newline) is
+    // preserved verbatim — the Python parser handles `(Base):` natively.
+    let tail = rest_after_mod.trim_start();
+    Some(format!("class {}{}", name, tail))
 }
 
 /// Same as [`make_impl_class_line`] but uses the `__typhon_builtin_ext_`
