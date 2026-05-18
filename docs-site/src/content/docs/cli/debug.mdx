@@ -1,0 +1,60 @@
+---
+title: tyc debug
+description: Build then launch the emitted Python under pdb. Thin v1 wrapper.
+sidebar:
+  order: 9
+---
+
+```
+tyc debug [--entry FILE] [--debugger MODULE] [--python PATH] [--no-build] [-- ARGS...]
+```
+
+Builds the project, then execs `python -m pdb build/<entry>.py` (or another debugger module). Thin v1 — a Typhon-native source-mapping debugger is a Phase-5 deliverable.
+
+## Examples
+
+```bash
+tyc debug                          # step through build/main.py under pdb
+tyc debug --entry api.py           # different entry point
+tyc debug --debugger pudb          # use pudb instead
+tyc debug --debugger ipdb          # ipdb if you have it
+tyc debug -- --verbose --port 8080  # forward args to the script
+tyc debug --no-build               # reuse existing build/
+```
+
+## Flags
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--entry FILE` | `main.py` | Entry-point file relative to the build dir. |
+| `--python PATH` | `python3` | Python interpreter. |
+| `--debugger MODULE` | `pdb` | Module to launch via `python -m`. Common choices: `pdb`, `ipdb`, `pudb`, `debugpy`. |
+| `--no-build` | off | Skip rebuilding; assume `build/` is current. |
+
+## Frame remapping
+
+`tyc debug` is a thin wrapper — frames surface as `build/*.py` paths. To map a captured traceback back to `.ty` source, run `tyc trace` on the saved traceback file:
+
+```bash
+tyc debug -- --bad-arg     # crashes
+# (debugger session ends)
+
+# Re-run capturing stderr:
+tyc run -- --bad-arg 2>err.log
+tyc trace err.log          # remaps frames to .ty
+```
+
+## What's coming
+
+A Typhon-native source-mapping debugger that:
+
+- Sets breakpoints on `.ty` lines (translating to `build/*.py` lines via `.py.map`).
+- Displays stack frames with `.ty` source.
+- Steps `.ty` statements (one Python statement → one Typhon statement, even when `gather:` lowers to several Python lines).
+
+That work is a Phase-5 deliverable. For v1, use the thin wrapper plus `tyc trace`.
+
+## Where next
+
+- [`tyc trace`](/Typhon/cli/trace/) — map a Python traceback back to `.ty`.
+- [`tyc run`](/Typhon/cli/run/) — non-debugger build + exec.

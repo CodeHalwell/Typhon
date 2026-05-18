@@ -1,0 +1,142 @@
+---
+title: Typhon
+description: A statically-typed, stricter superset of Python that compiles to clean CPython 3.13+ — with zero runtime dependency on the toolchain.
+template: splash
+hero:
+  tagline: A statically-typed, stricter superset of Python that compiles to clean, readable CPython 3.13+ — with zero runtime dependency on the toolchain.
+  image:
+    file: ../../assets/logo-dark.svg
+  actions:
+    - text: Read the ethos
+      link: /Typhon/introduction/ethos/
+      icon: right-arrow
+      variant: primary
+    - text: Install tyc
+      link: /Typhon/getting-started/installation/
+      icon: external
+    - text: GitHub
+      link: https://github.com/CodeHalwell/Typhon
+      icon: github
+      variant: minimal
+---
+
+import { Card, CardGrid, LinkCard, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## The 30-second pitch
+
+> Every `.ty` file emits valid, idiomatic `.py`. Not all `.py` is valid Typhon.
+
+Typhon is what Python could look like if you started over with three decades of language-design hindsight, while still keeping every Python library you love. It is a *compile-to-Python* language in the same sense that TypeScript is a *compile-to-JavaScript* language: you write the stricter, safer, more ergonomic dialect, and the compiler hands you idiomatic CPython that runs everywhere Python runs — no Typhon runtime, no PyPI dependency, no special interpreter.
+
+<Tabs syncKey="pitch">
+  <TabItem label="Typhon">
+
+```python
+type LoadError = NotFound | Timeout
+
+class NotFound:
+    path: str
+class Timeout:
+    after_ms: int
+
+def load(path: str) -> Result[str, LoadError]:
+    try:
+        with open(path) as f:
+            return Ok(f.read())
+    except FileNotFoundError:
+        return Err(NotFound(path=path))
+
+def main() -> None:
+    match load("config.toml"):
+        case Ok(body):
+            print(body)
+        case Err(NotFound(path)):
+            print(f"missing: {path}")
+        case Err(Timeout(after_ms)):
+            print(f"timed out after {after_ms}ms")
+```
+
+  </TabItem>
+  <TabItem label="Emitted Python">
+
+```python
+from dataclasses import dataclass
+from typhon_runtime import Ok, Err
+
+@dataclass(slots=True)
+class NotFound:
+    path: str
+
+@dataclass(slots=True)
+class Timeout:
+    after_ms: int
+
+LoadError = NotFound | Timeout
+
+def load(path: str) -> Ok[str] | Err[LoadError]:
+    try:
+        with open(path) as f:
+            return Ok(f.read())
+    except FileNotFoundError:
+        return Err(NotFound(path=path))
+
+def main() -> None:
+    match load("config.toml"):
+        case Ok(body):
+            print(body)
+        case Err(NotFound(path)):
+            print(f"missing: {path}")
+        case Err(Timeout(after_ms)):
+            print(f"timed out after {after_ms}ms")
+```
+
+  </TabItem>
+</Tabs>
+
+The match on `LoadError` is statically exhaustive — add a third variant to the union and every match site goes red until you handle it. That is, in one screenshot, the kind of safety Typhon brings to Python.
+
+## What you get
+
+<CardGrid>
+  <Card title="Non-nullable by default" icon="approve-check">
+    Plain `T` cannot hold `None`. Use `T?` when you mean optional. Flow narrowing on `is None`, `is not None`, `isinstance`, `guard`, and early returns.
+  </Card>
+  <Card title="No implicit Any" icon="warning">
+    Untyped values are a hard error outside `unsafe:` blocks. The strictness is stronger than TypeScript's `noImplicitAny`.
+  </Card>
+  <Card title="Errors as values" icon="puzzle">
+    `Result[T, E]`, `Ok`, `Err`, and the `?` operator make failure visible in signatures — without giving up Python's exception bridge.
+  </Card>
+  <Card title="Sealed unions + exhaustive match" icon="setting">
+    `type Shape = Circle | Rectangle | Triangle`. Add a variant; every `match` lights up red. Refactor with confidence.
+  </Card>
+  <Card title="Explicit async, smarter concurrency" icon="rocket">
+    `gather:` lowers to `asyncio.TaskGroup` (the safe default). `go f(x)` spawns fire-and-forget through a strong-ref registry. No GC'd tasks.
+  </Card>
+  <Card title="Build-time configuration" icon="seti:config">
+    `comptime let PORT: int = int(env("PORT", "8080"))` inlines at build time. Missing required env vars fail the build, not production.
+  </Card>
+  <Card title="Clean output, no runtime tax" icon="document">
+    Emits idiomatic Python you can read, debug, and ship. The handful of helpers (`Result`, `lazy`, task registry) is generated locally as `typhon_runtime/`. No PyPI install.
+  </Card>
+  <Card title="One binary, full pipeline" icon="terminal">
+    `tyc` is the compiler, formatter, language server, REPL, migrator, debugger launcher, and package-manager surface — sub-100ms incremental feedback via Salsa.
+  </Card>
+</CardGrid>
+
+## Start here
+
+<CardGrid stagger>
+  <LinkCard title="The Ethos of Typhon" href="/Typhon/introduction/ethos/" description="Why this language exists, the values behind every design decision, and what kind of code Typhon is for." />
+  <LinkCard title="Install in 60 seconds" href="/Typhon/getting-started/installation/" description="Build the tyc binary from source, scaffold a project, and run your first program." />
+  <LinkCard title="The Five Rules" href="/Typhon/tour/five-rules/" description="If you remember nothing else from these docs, remember these five rules. Everything follows." />
+  <LinkCard title="Language Tour" href="/Typhon/tour/values-bindings/" description="A guided walk through every feature with worked examples and emitted Python side by side." />
+  <LinkCard title="Language Reference" href="/Typhon/reference/lexical/" description="The full surface of the language, syntax-form by syntax-form, for when you need the spec." />
+  <LinkCard title="CLI Reference" href="/Typhon/cli/overview/" description="Every tyc subcommand and flag, with examples." />
+</CardGrid>
+
+## Status
+
+Phases 0 through 3 of the [roadmap](/Typhon/project/roadmap/) are complete. Phase 4+ is in progress: auto-gather, auto-parallel for free-threaded Python, PGO, LSP completions, cross-file go-to-definition, REPL, debugger, `tyc migrate`, and a package-manager surface over `uv` have all landed. The minimum-viable language — non-null types, sealed unions, `Result`, dataclass emit — is shippable today.
+
+Typhon targets CPython 3.13+ (and the free-threaded 3.13t/3.14t builds when you opt in). It is not a new runtime, not a Mojo-style separate language, and not a replacement for the Python you already write. It is the language you reach for when you want Python's libraries with Rust-flavoured static safety and ergonomics.

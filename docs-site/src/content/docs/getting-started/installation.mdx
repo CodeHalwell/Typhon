@@ -1,0 +1,173 @@
+---
+title: Installation
+description: Build the tyc binary from source and put it on your PATH.
+sidebar:
+  order: 1
+---
+
+import { Tabs, TabItem, Aside, Steps } from '@astrojs/starlight/components';
+
+Typhon ships as a single Rust binary called `tyc`. Building it is one `cargo` command; there are no other dependencies for the compiler itself. Optional integrations (`tyc ty`, `tyc stubtest`) shell out to Python tools you can install on demand.
+
+## Prerequisites
+
+- **A Rust toolchain** — `cargo` 1.85+ recommended. Install via [rustup](https://rustup.rs/) if you don't already have it.
+- **A Python interpreter** — CPython 3.13 (or 3.14, or the free-threaded `t` variants). Typhon emits code targeting 3.13 by default; you can change the target in `typhon.toml`.
+- **(Optional) `uv`** — Astral's package manager. Used by `tyc add` / `tyc remove` / `tyc sync` for dependency installation. Install with `pipx install uv` or via [the uv install script](https://docs.astral.sh/uv/getting-started/installation/).
+- **(Optional) `ty`** — Astral's Python type checker. Used by `tyc ty` for a second-opinion typing pass against the emitted Python. Install with `pip install ty` or `uv tool install ty`.
+
+## Build from source
+
+<Steps>
+
+1. **Clone the repository.**
+
+   ```bash
+   git clone https://github.com/CodeHalwell/Typhon.git
+   cd Typhon
+   ```
+
+2. **Build the compiler in release mode.**
+
+   ```bash
+   cd tyc
+   cargo build --release
+   ```
+
+   This produces `tyc/target/release/tyc`. The first build will take a few minutes (the vendored Ruff fork is large); subsequent builds are incremental.
+
+3. **Put it on your PATH.** Either copy the binary to a directory already on `PATH`, or alias it.
+
+   <Tabs>
+     <TabItem label="Symlink" icon="seti:bash">
+       ```bash
+       sudo ln -s "$PWD/target/release/tyc" /usr/local/bin/tyc
+       ```
+     </TabItem>
+     <TabItem label="Bash/zsh alias" icon="seti:bash">
+       ```bash
+       echo "alias tyc='$PWD/target/release/tyc'" >> ~/.bashrc
+       # or ~/.zshrc
+       source ~/.bashrc
+       ```
+     </TabItem>
+     <TabItem label="Fish alias" icon="seti:bash">
+       ```fish
+       alias --save tyc "$PWD/target/release/tyc"
+       ```
+     </TabItem>
+   </Tabs>
+
+4. **Verify the install.**
+
+   ```bash
+   tyc --version
+   tyc --help
+   ```
+
+   You should see the version banner and the list of subcommands.
+
+</Steps>
+
+## Updating
+
+Pull the latest commits and rebuild:
+
+```bash
+cd /path/to/Typhon
+git pull
+cd tyc && cargo build --release
+```
+
+If you symlinked, you don't need to redo it; the symlink points at the freshly-rebuilt binary.
+
+## Optional integrations
+
+### `ty` (Astral's type checker)
+
+For a second-opinion pass over the emitted Python:
+
+<Tabs syncKey="install">
+  <TabItem label="uv">
+    ```bash
+    uv tool install ty
+    ```
+  </TabItem>
+  <TabItem label="pip">
+    ```bash
+    pip install ty
+    ```
+  </TabItem>
+  <TabItem label="pipx">
+    ```bash
+    pipx install ty
+    ```
+  </TabItem>
+</Tabs>
+
+Then run [`tyc ty`](/Typhon/cli/ty/) in any Typhon project.
+
+### `mypy` (for `tyc stubtest`)
+
+The runtime-introspection probe for `.dty` / `.pyi` stub drift:
+
+```bash
+pip install mypy
+# or
+uv tool install mypy
+```
+
+Then run [`tyc stubtest`](/Typhon/cli/stubtest/) in projects that ship stubs.
+
+### `uv` (for `tyc add` / `remove` / `sync`)
+
+The package-manager surface shells out to `uv` for installs. Without `uv`, `tyc add` / `remove` still edit `typhon.toml`; they just won't install. Recommended:
+
+```bash
+pipx install uv
+# or
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+## VS Code extension (reference)
+
+The repository ships a reference VS Code extension under `editors/vscode/`. It wires up `tyc lsp` over stdio. To install:
+
+```bash
+cd editors/vscode
+npm install
+npm run package          # produces typhon-X.Y.Z.vsix
+code --install-extension typhon-*.vsix
+```
+
+Restart VS Code; opening a `.ty` file should give you syntax highlighting and diagnostics on save. See [editors/vscode/README.md](https://github.com/CodeHalwell/Typhon/blob/main/editors/vscode/README.md) for details.
+
+Other LSP-aware editors (Neovim, Helix, Zed, etc.) can wire `tyc lsp` directly. See [Editor Setup](/Typhon/getting-started/editor-setup/) for examples.
+
+## Troubleshooting
+
+### "command not found: cargo"
+
+Install Rust via [rustup](https://rustup.rs/). On the first run it sets up `cargo`, `rustc`, and the toolchain in `~/.cargo/bin`. Open a new shell or `source $HOME/.cargo/env` to pick it up.
+
+### Build fails with linker errors
+
+You need a working C linker. On Linux: `sudo apt install build-essential` (Debian / Ubuntu) or `sudo dnf install gcc` (Fedora). On macOS: `xcode-select --install`. On Windows: install Visual Studio Build Tools.
+
+### "tyc check" complains about missing typhon.toml
+
+You're running outside a Typhon project. Either `cd` into one or scaffold one first with [`tyc init`](/Typhon/cli/init/).
+
+### LSP doesn't start in VS Code
+
+Open the Output panel (`View → Output`) and select "Typhon" from the dropdown. The extension logs the `tyc lsp` invocation; if `tyc` is not on the PATH the editor process sees, the LSP won't start. Set the binary path in extension settings, or fix your `PATH`.
+
+### Cargo build is slow
+
+The first `cargo build --release` rebuilds the entire vendored Ruff fork plus every Typhon crate. Subsequent builds are incremental. If you're hacking on the compiler, `cargo build` (debug mode) is faster.
+
+## Next steps
+
+- Walk through [Hello, world](/Typhon/getting-started/hello-world/) for the shortest end-to-end Typhon program.
+- Read [Project Layout](/Typhon/getting-started/project-layout/) to understand what `tyc init` produces.
+- Skim [The Five Rules](/Typhon/tour/five-rules/) so you know what the checker will and will not tolerate.

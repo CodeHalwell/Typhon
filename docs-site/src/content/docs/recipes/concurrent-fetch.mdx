@@ -1,0 +1,98 @@
+---
+title: Concurrent Data Fetching
+description: "gather: blocks, Result[T, E] propagation, partial-success modes."
+sidebar:
+  order: 5
+---
+
+Fanning out independent reads in parallel, with proper error handling.
+
+## Strict — all-or-nothing with `gather:`
+
+```python
+async def load_dashboard(uid: int) -> Result[Dashboard, LoadError]:
+    gather:
+        user_r   = fetch_user(uid)
+        posts_r  = fetch_posts(uid)
+        notifs_r = fetch_notifs(uid)
+
+    let user: User       = user_r?
+    let posts: list[Post] = posts_r?
+    let notifs: list[Notif] = notifs_r?
+
+    return Ok(Dashboard(user=user, posts=posts, notifs=notifs))
+```
+
+Lowers to `asyncio.TaskGroup`: any failure cancels the siblings.
+
+If `user_r` is `Err(...)`, the `?` returns immediately. The `posts` and `notifs` tasks were cancelled by the `TaskGroup`.
+
+## Partial-success — `best-effort`
+
+When you'd rather get what you can:
+
+```python
+async def load_dashboard_partial(uid: int) -> Dashboard:
+    gather(strategy="best-effort"):
+        user   = fetch_user(uid)         # T | BaseException
+        posts  = fetch_posts(uid)
+        notifs = fetch_notifs(uid)
+
+    return Dashboard(
+        user=user if not isinstance(user, BaseException) else default_user(),
+        posts=posts if not isinstance(posts, BaseException) else [],
+        notifs=notifs if not isinstance(notifs, BaseException) else [],
+    )
+```
+
+Lowers to `asyncio.gather(..., return_exceptions=True)`. Each binding's type becomes `T | BaseException`.
+
+## Sequential with intermediate dependencies
+
+If each step depends on the previous, plain sequential awaits — `gather:` won't help:
+
+```python
+async def signup(email: str) -> Result[User, AppError]:
+    let validated: str = await validate_email(email)?
+    let id: int = await reserve_id()
+    return Ok(User(id=id, email=validated, ...))
+```
+
+## Spawning fire-and-forget
+
+For metrics / logging that shouldn't block the response:
+
+```python
+async def signup(email: str) -> Result[User, AppError]:
+    let u: User = await create_user(email)?
+    go record_signup(u.id)            # fire and forget
+    go send_welcome_email(u)
+    return Ok(u)
+```
+
+`go` lowers through `typhon_runtime.tasks.spawn` — strong-ref registry prevents GC mid-flight.
+
+## Iterating with concurrency
+
+For lists where each item is independent:
+
+```python
+import asyncio
+
+async def fetch_many(urls: list[str]) -> list[Result[str, FetchError]]:
+    # Use asyncio.gather directly — gather: is for fixed-arity bindings
+    let coros = [fetch_one(u) for u in urls]
+    return await asyncio.gather(*coros, return_exceptions=False)
+```
+
+`gather:` is for fixed-arity (`a = ..., b = ..., c = ...`); `asyncio.gather(*[...])` is the right shape for a list.
+
+## Cancellation propagation
+
+When the outer task is cancelled (e.g. client disconnect), `TaskGroup` cancels children. Resource cleanup happens via standard Python `try/finally` or async context managers.
+
+## Where next
+
+- [Async and Concurrency (tour)](/Typhon/tour/async/) — `gather`, `go`, free-threaded.
+- [`async`, `await`, `gather`, `go` reference](/Typhon/reference/async/) — full surface.
+- [`gather:` → TaskGroup (lowering)](/Typhon/lowering/gather/) — what's emitted.

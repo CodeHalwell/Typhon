@@ -1,0 +1,118 @@
+---
+title: comptime → inlined literals
+description: Compile-time evaluation produces Python literals.
+sidebar:
+  order: 7
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+`comptime let` and `comptime def` calls run inside `tyc`'s sandboxed interpreter at build time. The result is inlined as a Python literal.
+
+## `comptime let`
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    comptime let PORT:   int  = int(env("PORT", "8080"))
+    comptime let DB_URL: str  = env("DATABASE_URL")
+    comptime let IS_PROD: bool = env("BUILD_TAG", "dev") == "prod"
+    ```
+  </TabItem>
+  <TabItem label="Emitted (with PORT=8080, DB_URL=postgres://..., BUILD_TAG=prod)">
+    ```python
+    PORT: int = 8080
+    DB_URL: str = "postgres://..."
+    IS_PROD: bool = True
+    ```
+  </TabItem>
+</Tabs>
+
+The runtime sees only the literal — there is no `env()` call at runtime.
+
+## `comptime def`
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    comptime def double(n: int) -> int:
+        return n * 2
+
+    comptime def grade(score: int) -> str:
+        if score >= 90:
+            return "A"
+        elif score >= 80:
+            return "B"
+        else:
+            return "F"
+
+    comptime let PORT:     int = double(4000)
+    comptime let MY_GRADE: str = grade(82)
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    def double(n: int) -> int:
+        return n * 2
+
+    def grade(score: int) -> str:
+        if score >= 90:
+            return "A"
+        elif score >= 80:
+            return "B"
+        else:
+            return "F"
+
+    PORT: int = 8000
+    MY_GRADE: str = "B"
+    ```
+  </TabItem>
+</Tabs>
+
+The function definitions remain in the output (they're ordinary Python functions; `comptime` is a build-time marker), so they're available at runtime too.
+
+## Missing required env
+
+```python
+comptime let DB_URL: str = env("DATABASE_URL")
+```
+
+```toml
+[env]
+required = ["DATABASE_URL"]
+```
+
+If `DATABASE_URL` is unset at build time, the build fails:
+
+```
+error[tyc::comptime_env_missing]: required environment variable `DATABASE_URL` is not set
+ ┌─ src/main.ty:1:33
+ │
+1 │ comptime let DB_URL: str = env("DATABASE_URL")
+ │                             ^^^^^^^^^^^^^^^^^^^^
+```
+
+No quiet `KeyError: 'DATABASE_URL'` at the first request in production.
+
+## Sandbox
+
+Implementation in `tyc-analyse`. Walks the comptime AST, producing a `ComptimeValue` enum:
+
+```rust
+enum ComptimeValue {
+    Int(i128),
+    Float(f64),
+    Str(String),
+    Bool(bool),
+}
+```
+
+Supported operations: literals, arithmetic, comparisons, boolean ops, ternaries, `env()`, `int()/str()/float()/bool()`, parameter and local-binding references, `if/elif/else`, `return`, `comptime def` calls.
+
+Not supported (in v1): containers, string methods, loops, I/O, time, random, imports, exceptions. See [`comptime` reference](/Typhon/reference/comptime/) for the full contract.
+
+## Where next
+
+- [`comptime` reference](/Typhon/reference/comptime/) — the full surface.
+- [Build-Time Env Validation (recipe)](/Typhon/recipes/env-validation/) — worked patterns.
+- [`[env]` config section](/Typhon/configuration/env/) — declaring required vars.

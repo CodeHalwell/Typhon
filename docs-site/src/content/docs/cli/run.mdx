@@ -1,0 +1,82 @@
+---
+title: tyc run
+description: Build then exec the emitted Python in one step. Like tsx for Typhon.
+sidebar:
+  order: 6
+---
+
+```
+tyc run [--entry FILE] [--temp] [--no-build] [--python PATH] [-- ARGS...]
+```
+
+Builds the project and execs `python build/<entry>.py`. Two output modes — persistent (default) or ephemeral (`--temp`).
+
+## Examples
+
+```bash
+tyc run                            # build into build/, exec main.py
+tyc run -- --port 8080             # forward args to the script
+tyc run --temp -- --port 8080      # ephemeral build, deleted on exit
+tyc run --entry api.py             # different entry point
+tyc run --no-build                 # reuse existing build/
+```
+
+## Output modes
+
+### Persistent (default)
+
+Builds into the configured `out` dir (default `build/`). Subsequent runs reuse the incremental Salsa cache, and `.py.map` sidecars remain on disk so a post-crash `tyc trace` can map frames back to `.ty`.
+
+```bash
+tyc run                            # build/ persists
+ls build/                          # main.py, main.py.map, ...
+```
+
+### `--temp` (`-t`)
+
+Builds into a fresh `tempfile::tempdir()` that is deleted when `tyc run` exits. No project artefacts persist. Trades the incremental cache and on-disk source map for a clean tree — ideal for one-shot iteration.
+
+```bash
+tyc run --temp                     # nothing left behind after exit
+```
+
+## Exit code propagation
+
+The script's exit code propagates verbatim to `tyc run`'s exit code, so shell pipelines see the child's status unchanged:
+
+```bash
+tyc run -- --check; echo "exit=$?"
+# Whatever the script exited with
+```
+
+Build failures and spawn failures surface as the usual miette errors with exit code 1.
+
+## Forwarding args
+
+Pass `--` to mark the start of args for the Python script:
+
+```bash
+tyc run -- --port 8080 ./input.csv
+# Python receives: ['build/main.py', '--port', '8080', './input.csv']
+```
+
+## Flags
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--entry FILE` | `main.py` | Entry-point file relative to the build dir. |
+| `--python PATH` | `python3` | Python interpreter. |
+| `--temp` / `-t` | off | Ephemeral tempdir build. Mutually exclusive with `--no-build`. |
+| `--no-build` | off | Skip rebuilding; assume the persistent `build/` is current. |
+
+## What `tyc run` is not
+
+- **Not a new VM.** It is a UX shortcut around `tyc build && python build/main.py`. The execution model is unchanged.
+- **Not an interpreter.** For interactive evaluation use [`tyc repl`](/Typhon/cli/repl/).
+- **Not a debugger.** For pdb-style stepping use [`tyc debug`](/Typhon/cli/debug/).
+
+## Where next
+
+- [`tyc build`](/Typhon/cli/build/) — the build step `tyc run` wraps.
+- [`tyc repl`](/Typhon/cli/repl/) — interactive evaluation.
+- [`tyc debug`](/Typhon/cli/debug/) — launch under pdb.

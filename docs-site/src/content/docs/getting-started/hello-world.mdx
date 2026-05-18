@@ -1,0 +1,223 @@
+---
+title: Hello, world
+description: The shortest end-to-end Typhon program — scaffold, write, check, build, run.
+sidebar:
+  order: 2
+---
+
+import { Tabs, TabItem, Steps, Aside } from '@astrojs/starlight/components';
+
+The shortest useful Typhon program, end to end: scaffold a project, write code, type-check, compile to Python, and run the emitted Python. This page assumes you have already [installed `tyc`](/Typhon/getting-started/installation/).
+
+## Scaffold a project
+
+<Steps>
+
+1. Create the project:
+
+   ```bash
+   tyc init hello
+   cd hello
+   ```
+
+2. `tyc init` produces:
+
+   ```
+   hello/
+   ├── typhon.toml      # project config
+   ├── src/
+   │   └── main.ty      # entry point
+   └── tests/
+   ```
+
+3. The default `typhon.toml`:
+
+   ```toml
+   [project]
+   name = "hello"
+   version = "0.1.0"
+   src = "src"
+   out = "build"
+
+   [python]
+   target = "3.13"
+
+   [emit]
+   class-default = "dataclass"
+   format = true
+
+   [strictness]
+   no-implicit-any = true
+   unused-import = "error"
+   exhaustive-match = "error"
+   ```
+
+   You can edit these later; the defaults are conservative.
+
+</Steps>
+
+## Your first program
+
+Edit `src/main.ty`:
+
+```python
+def main() -> None:
+    print("Hello, world")
+
+if __name__ == "__main__":
+    main()
+```
+
+Three things to notice:
+
+- **Return types are required.** `-> None` is not optional — Typhon's `[strictness] no-implicit-any` defaults to `true`. Omit it and `tyc check` will complain with `tyc::missing_return_type`.
+- **`print` works.** Built-in Python functions are available without ceremony; Typhon is a (stricter) superset of typed Python.
+- **`if __name__ == "__main__":` is unchanged.** Typhon emits idiomatic Python; module entrypoints look identical.
+
+## Check, build, run
+
+<Steps>
+
+1. **Type-check.** This runs everything up to the analyser without emitting any `.py`.
+
+   ```bash
+   tyc check src/
+   ```
+
+   If everything is well-typed, the command exits 0 with no output.
+
+2. **Build.** Runs the full pipeline: lex, parse, resolve, type-check, desugar, emit, and (if `[emit] format = true`) post-process with `ruff format`.
+
+   ```bash
+   tyc build
+   ```
+
+   You get `build/main.py`. If you used `Result[T, E]`, `go`, or `lazy let`, you also get `build/typhon_runtime.py` (and friends).
+
+3. **Run.** Standard Python — no Typhon involvement:
+
+   ```bash
+   python build/main.py
+   # Hello, world
+   ```
+
+   Or use the convenience shortcut:
+
+   ```bash
+   tyc run                 # builds into build/, then execs python build/main.py
+   tyc run --temp          # builds into a tempdir; nothing persists
+   ```
+
+</Steps>
+
+## What does the emitted Python look like?
+
+`build/main.py`:
+
+```python
+def main() -> None:
+    print("Hello, world")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+For Hello, world the input and output are byte-identical (formatting aside). That's the point: **every `.ty` file emits valid, idiomatic `.py`**. There is no Typhon runtime to install on production servers — Typhon is a build-time tool, like TypeScript.
+
+## A slightly less trivial example
+
+Take a name from `argv` and greet it:
+
+```python
+import sys
+
+def main() -> None:
+    let name: str = sys.argv[1] if len(sys.argv) > 1 else "world"
+    print(f"Hello, {name}")
+
+if __name__ == "__main__":
+    main()
+```
+
+New things:
+
+- **`let name: str = ...`** — an immutable local binding with an explicit type. Use `mut` instead if you want to reassign it later. ([Values and Bindings](/Typhon/tour/values-bindings/) goes deep on this.)
+- **Top-level imports** — `import sys` is unchanged from Python. Typhon adds `lazy import` for deferred loading (see [`lazy`](/Typhon/reference/lazy/)), but plain `import` still works.
+
+Compile and run:
+
+```bash
+tyc build
+python build/main.py Alice
+# Hello, Alice
+```
+
+## Common first-time errors
+
+### Forgetting the return type
+
+```python
+def main():           # ❌ missing return annotation
+    print("Hello")
+```
+
+```
+error[tyc::missing_return_type]: function `main` is missing a return type
+ ┌─ src/main.ty:1:5
+ │
+1 │ def main():
+ │     ^^^^ add `-> None` (or another type) here
+```
+
+Fix: write `def main() -> None:`.
+
+### Using `=` for a local binding without `let` or `mut`
+
+```python
+def main() -> None:
+    name = "Alice"    # ❌ missing let/mut
+    print(name)
+```
+
+```
+error[tyc::missing_binding_kind]: local bindings must be declared with `let` or `mut`
+ ┌─ src/main.ty:2:5
+ │
+2 │     name = "Alice"
+ │     ^^^^ add `let` (immutable) or `mut` (mutable) here
+```
+
+Fix: `let name: str = "Alice"` or `mut name: str = "Alice"`.
+
+<Aside type="tip">
+  **Module-level bindings default to `let` automatically.** It's locals that need an explicit kind.
+</Aside>
+
+### Inferring `Any`
+
+```python
+import some_library
+
+def main() -> None:
+    let data = some_library.fetch()    # ❌ infers Any
+```
+
+```
+error[tyc::implicit_any]: cannot infer a type for `data`
+```
+
+Fix: annotate explicitly (`let data: dict[str, int] = ...`), wrap in `unsafe:`, or write a [`.dty` stub](/Typhon/interop/dty-stubs/) for the library.
+
+## What you've learned
+
+- How to scaffold a project with `tyc init`.
+- The three commands you'll use daily: `tyc check`, `tyc build`, `tyc fmt`.
+- That Typhon emits clean Python with no runtime dependency.
+- The first three diagnostics you'll see and how to fix each.
+
+## Where next
+
+- [Project Layout](/Typhon/getting-started/project-layout/) — what `tyc init` produces and why.
+- [Your First Real Program](/Typhon/getting-started/first-program/) — beyond Hello World: a small typed CLI.
+- [The Five Rules](/Typhon/tour/five-rules/) — the rules every Typhon program follows; internalise these and the checker stops surprising you.

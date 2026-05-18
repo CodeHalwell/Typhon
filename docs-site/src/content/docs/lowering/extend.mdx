@@ -1,0 +1,121 @@
+---
+title: extend → free functions
+description: "How extend BUILTIN: lowers to module-level free functions with static-receiver rewrites."
+sidebar:
+  order: 8
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+`extend ClassName:` for a user-defined class is identical to `impl` — methods merge into the class body at desugar.
+
+`extend BUILTIN:` (where `BUILTIN` is `str`, `list`, `dict`, etc.) is different: each method is extracted to a module-level free function, and call sites are rewritten when the receiver has a matching static annotation.
+
+## User-defined class
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    # domain/user.ty
+    class User:
+        id: int
+        name: str
+
+    # analytics/user_metrics.ty
+    extend User:
+        def tracking_id(self) -> str:
+            return f"user-{self.id:08d}"
+    ```
+  </TabItem>
+  <TabItem label="Emitted (after impl merge)">
+    ```python
+    # build/domain/user.py
+    @dataclass(slots=True)
+    class User:
+        id: int
+        name: str
+
+        def tracking_id(self) -> str:    # merged from extend
+            return f"user-{self.id:08d}"
+
+    # build/analytics/user_metrics.py
+    # (empty — extend was merged elsewhere)
+    ```
+  </TabItem>
+</Tabs>
+
+The desugar pass collects every `impl` and `extend` over the same user-defined class and merges them into the class definition.
+
+## Built-in extension
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    extend str:
+        def to_slug(self) -> str:
+            return self.lower().replace(" ", "-")
+
+    let title: str = "Hello World"
+    let slug: str = title.to_slug()
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    def __typhon_ext_str__to_slug(self: str) -> str:
+        return self.lower().replace(" ", "-")
+
+    title: str = "Hello World"
+    slug: str = __typhon_ext_str__to_slug(title)
+    ```
+  </TabItem>
+</Tabs>
+
+Key points:
+
+- The method becomes a free function with a Typhon-internal name (`__typhon_ext_<TYPE>__<METHOD>`).
+- The call site `title.to_slug()` is rewritten to `__typhon_ext_str__to_slug(title)` because `title` has the static annotation `str`.
+- **Un-annotated receivers** continue to use native attribute lookup. `some_dynamic.to_slug()` raises `AttributeError` at runtime, matching Python's existing semantics.
+
+## Why this design
+
+We could have monkey-patched `str` at module-load time:
+
+```python
+str.to_slug = lambda self: self.lower().replace(" ", "-")
+```
+
+…but that has *global* effect. Every `str` in the entire process gets a new method, regardless of whether the project that called it expected it. That's a recipe for cross-library footguns.
+
+Typhon's approach is **strictly opt-in**: only static-annotation-matching call sites are rewritten. The extension is invisible to code that didn't ask for it.
+
+## Recognised built-ins
+
+The set that supports `extend BUILTIN:`:
+
+- `str`
+- `bytes`
+- `int`
+- `float`
+- `bool`
+- `list`
+- `dict`
+- `set`
+- `frozenset`
+- `tuple`
+
+Other built-in types (`type`, `object`, `range`, etc.) are not currently rewritten.
+
+## Extending generic built-ins
+
+```python
+extend list[int]:
+    def sum_squared(self) -> int:
+        return sum(x * x for x in self)
+```
+
+Currently the rewrite matches on the *bare* container type (`list`, not `list[int]`). Generic-parameterised extensions are roadmapped.
+
+## Where next
+
+- [`impl` and `extend` reference](/Typhon/reference/impl-extend/) — the full surface.
+- [Classes and Models (tour)](/Typhon/tour/classes/) — teaching page.

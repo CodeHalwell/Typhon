@@ -1,0 +1,156 @@
+---
+title: Function Definitions
+description: def, async def, parameters, return types, defaults, *args/**kwargs, decorators.
+sidebar:
+  order: 3
+---
+
+Function definitions follow Python's grammar with two mandatory rules: every parameter and the return type must be annotated.
+
+## Syntax
+
+```
+function_def ::= [decorator]* ["async"] "def" NAME [type_params] "(" parameters ")" "->" TYPE ":" suite
+type_params  ::= "[" type_param ("," type_param)* "]"
+type_param   ::= NAME [":" BOUND]
+parameters   ::= [param ("," param)*]
+param        ::= [("/" | "*")] [NAME ":" TYPE ["=" DEFAULT]]
+```
+
+Examples:
+
+```python
+def f(x: int) -> int: ...
+def f(x: int, y: int = 0) -> int: ...
+def f(x: int, /, y: int, *, z: int) -> int: ...
+def f(*args: int, **kwargs: str) -> None: ...
+def f[T](xs: list[T]) -> T?: ...
+def f[T, U](x: T, f: Callable[[T], U]) -> U: ...
+async def g(url: str) -> bytes: ...
+```
+
+## Mandatory annotations
+
+Every parameter must have a type annotation; the return type must be present (`-> None` for void).
+
+```python
+def add(a, b): ...       # ❌ tyc::missing_param_type and tyc::missing_return_type
+def add(a: int, b: int): ...     # ❌ tyc::missing_return_type
+def add(a: int, b: int) -> int: ...    # ✅
+```
+
+`tyc check` is unambiguous about both kinds of error.
+
+## Default values
+
+The default must match the annotation:
+
+```python
+def f(n: int = 0) -> int: ...      # ✅
+def f(n: int = "zero") -> int: ...  # ❌ type_mismatch on the default
+```
+
+## Nullable parameters
+
+`T?` does not auto-default to `None`:
+
+```python
+def find(name: str?) -> int?: ...           # caller must pass an arg
+def find(name: str? = None) -> int?: ...    # caller may omit
+```
+
+## Keyword-only and positional-only
+
+Python's `*` and `/` separators work unchanged:
+
+```python
+def connect(host: str, /, *, port: int = 5432, ssl: bool = True) -> None: ...
+
+connect("localhost", port=5433)         # ✅
+connect(host="localhost")               # ❌ host is positional-only
+connect("localhost", 5433)              # ❌ port is keyword-only
+```
+
+## `*args` and `**kwargs`
+
+Each must be annotated:
+
+```python
+def log_all(*messages: str, **tags: str) -> None:
+    # messages: tuple[str, ...]
+    # tags:     dict[str, str]
+    ...
+```
+
+## Decorators
+
+Standard Python decorators work:
+
+```python
+import functools
+
+@functools.cache
+def fib_plain(n: int) -> int: ...
+```
+
+Typhon-specific decorators:
+
+| Decorator | Effect |
+|-----------|--------|
+| `@pure` | Asserts the six purity conditions. Erased at emit. |
+| `@memo` | Adds `@functools.cache` at desugar (function must be pure-eligible). |
+| `@memo(max=N)` | `@functools.lru_cache(maxsize=N)`. |
+| `@pure(memo=True)` | Combined. |
+| `@gatherable` | Opts into automatic `gather` rewriting (only fires when `[strictness] auto-gather = true`). |
+
+See [`@pure` and `@memo`](/Typhon/reference/pure-memo/).
+
+## Generic type parameters (PEP 695)
+
+```python
+def first[T](xs: list[T]) -> T?: ...
+def pair[T, U](a: T, b: U) -> tuple[T, U]: ...
+def smallest[T: Ordered](xs: list[T]) -> T?: ...
+```
+
+See [Generics](/Typhon/types/generics/) for the full reference.
+
+## `async def`
+
+```python
+async def fetch(url: str) -> bytes:
+    ...
+```
+
+The checker enforces:
+
+- `async def` containing no `await` is a warning (`tyc::async_without_await`).
+- Calling an `async def` from a sync function without `await` is a hard error (`tyc::missing_await`).
+
+## Return-path checking
+
+Every reachable exit from a function must either `return` a value of the declared type or be unreachable:
+
+```python
+def f() -> int:
+    if cond:
+        return 1
+    # ❌ tyc::missing_return — function may exit without returning int
+```
+
+`raise` counts as an exit. `unreachable_code()` / `sys.exit()` do not change the analysis (the checker doesn't know they don't return).
+
+## Lambdas
+
+```python
+let double = lambda n: n * 2     # type inferred from context
+```
+
+Lambda parameters and return types are inferred from the call site or assignment target. If the context can't pin them down, you get `tyc::implicit_any` — promote to a named function.
+
+## Where next
+
+- [Functions (tour)](/Typhon/tour/functions/) — the teaching page.
+- [Generics](/Typhon/types/generics/) — type parameters.
+- [`@pure` and `@memo`](/Typhon/reference/pure-memo/) — purity decorators.
+- [`async`, `await`, `gather`, `go`](/Typhon/reference/async/) — async functions.

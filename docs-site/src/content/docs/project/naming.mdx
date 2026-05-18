@@ -1,0 +1,41 @@
+---
+title: Naming
+description: Where the names come from.
+sidebar:
+  order: 4
+---
+
+| Name | Role | Notes |
+|------|------|-------|
+| **Typhon** | Project name | Phonetic kinship with Python. The mythology lines up (Typhon is the serpent-monster of Hesiod, sometimes treated as the father of Python). |
+| `tyc` | The binary | Three letters, fast to type. Stands loosely for "Typhon compiler" by way of `tsc` (TypeScript compiler) and `gcc`. |
+| `.ty` | Source file extension | The shortest possible, distinct from `.py`. |
+| `.dty` | Stub file extension | "D" for "definition". Matches the `.dy` / `.dts` pattern of other stub formats. |
+| `typhon.toml` | Project config | Conventional `<name>.toml` shape, alongside `pyproject.toml` rather than replacing it. |
+| `typhon_runtime` | Generated helper module | The single Python-side name we own. Underscore form is conventional Python. |
+| `tyc::*` | Diagnostic codes | Namespaced by the binary's name; stable across releases. |
+
+## What we considered
+
+A few alternatives that didn't make it:
+
+- **`stricter`** — too generic, conflicts with established libraries.
+- **`pyx`** — `.pyx` is Cython's extension.
+- **`spy`** — taken.
+- **`pytypeon`** — too long, lacks resonance.
+
+## PyPI namespace
+
+The project ships as **Typhon**. Before committing, search PyPI for active "typhon" packages — a couple of dormant ones exist; none clash with documentation or import names we care about. We do not publish a `typhon` PyPI package (the runtime helpers are generated in-project).
+
+## Why not "Python++"
+
+Two reasons:
+
+1. **It's not a superset.** Some patterns require escape hatches; the language is *stricter* than Python, not a strict superset.
+2. **Naming convention.** Languages named "\<base\>++" tend to age poorly (C++ is the exception).
+
+## Where next
+
+- [Project Status](/Typhon/introduction/status/) — what's shipped.
+- [Roadmap](/Typhon/project/roadmap/) — what's planned.

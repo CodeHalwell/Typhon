@@ -1,0 +1,125 @@
+---
+title: let and mut
+description: Binding-immutability keywords — the reference page.
+sidebar:
+  order: 2
+---
+
+`let` and `mut` declare local binding kinds. They are soft keywords in the lexer; the parser attaches a `Mutability` field to the resulting `Assign` node.
+
+## Syntax
+
+```
+binding ::= ("let" | "mut") NAME [":" TYPE] "=" EXPR
+```
+
+Examples:
+
+```python
+let x: int = 1
+mut counter: int = 0
+let xs = [1, 2, 3]              # type inferred as list[int]
+mut total = 0                    # type inferred as int
+let user, posts = (u, ps)        # destructuring
+let xs: list[int] = []           # empty container; annotation required
+```
+
+## Rules
+
+1. **Inside functions, every local binding declares `let` or `mut`.**
+
+   ```python
+   def f() -> None:
+       x = 1            # ❌ tyc::missing_binding_kind
+       let x: int = 1   # ✅
+   ```
+
+2. **`let` bindings cannot be reassigned.**
+
+   ```python
+   def f() -> None:
+       let x: int = 1
+       x = 2            # ❌ tyc::immutable_assign
+   ```
+
+3. **`mut` bindings can be reassigned at the same type or a subtype.**
+
+   ```python
+   def f() -> None:
+       mut x: int = 1
+       x = 2            # ✅
+       x = "two"        # ❌ tyc::type_mismatch
+   ```
+
+4. **Module-level bindings default to `let`** if neither keyword is present.
+
+   ```python
+   PI: float = 3.14                # implicit let
+   mut feature_flag: bool = False  # explicit mut
+   ```
+
+   Locals do *not* default — the keyword is always required inside functions.
+
+5. **Loop variables and `with` targets are *not* `let` / `mut`.** They follow Python's scoping rules and are implicitly rebindable each iteration / context entry.
+
+6. **`gather:` bindings are immutable single-assignment** (no `let` / `mut` keyword needed inside the block — the desugarer treats them as fresh local bindings).
+
+## Type inference
+
+If a `let` / `mut` omits the annotation, the type is inferred from the RHS:
+
+```python
+let x = 1                    # inferred int
+let s = "hello"              # inferred str
+let xs = [1, 2, 3]           # inferred list[int]
+let mixed = [1, "two"]       # ❌ would infer list[int | str] but rejected as implicit_any
+                              # because heterogeneous literals need an explicit annotation
+let empty = []               # ❌ tyc::implicit_any — annotate as list[T]
+```
+
+For nullable RHS (e.g. `dict.get`), the inferred type is nullable:
+
+```python
+let x = some_dict.get("k")   # inferred int?
+```
+
+## Destructuring
+
+```python
+let q, r = divmod(17, 5)            # q: int, r: int
+let x, y = point                     # x: float, y: float (from tuple[float, float])
+let head, *rest = [1, 2, 3, 4]      # head: int, rest: list[int]
+```
+
+`*rest` follows Python's semantics. All destructured names take the `let`/`mut` of the enclosing keyword.
+
+## Shadowing
+
+```python
+def f() -> None:
+    let x: int = 1
+    let x: str = "two"    # ✅ new binding shadows the old one
+```
+
+Same-block shadowing is allowed; the new binding fully replaces the old (including the kind — you can shadow a `let` with a `mut` or vice versa).
+
+## Emit
+
+`let` and `mut` are erased at emit time:
+
+```python
+# Typhon
+let x: int = 1
+mut y: int = 2
+y = y + 1
+
+# Emitted Python
+x: int = 1
+y: int = 2
+y = y + 1
+```
+
+## Where next
+
+- [Values and Bindings (tour)](/Typhon/tour/values-bindings/) — the teaching page.
+- [Binding Errors (diagnostics)](/Typhon/diagnostics/binding-errors/) — `missing_binding_kind`, `immutable_assign`, etc.

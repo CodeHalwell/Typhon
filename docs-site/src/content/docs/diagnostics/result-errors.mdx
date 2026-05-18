@@ -1,0 +1,57 @@
+---
+title: Result Errors
+description: Diagnostics around Result[T, E], the ? operator, and with-chains.
+sidebar:
+  order: 6
+---
+
+## `tyc::invalid_question_op`
+
+`?` used in a function whose return type isn't a compatible `Result`:
+
+```python
+def f() -> int:
+    let n: int = parse_port("8080")?    # ❌ — function returns int, not Result
+    return n
+```
+
+**Fix:** change the signature, or `match` explicitly.
+
+```python
+def f() -> Result[int, str]:
+    let n: int = parse_port("8080")?
+    return Ok(n)
+```
+
+## `tyc::result_error_mismatch`
+
+`?` short-circuits an `Err[E1]` to a function returning `Result[T, E2]` where `E1` is not assignable to `E2`:
+
+```python
+def parse_str() -> Result[int, str]: ...
+
+def f() -> Result[int, AppError]:
+    let n: int = parse_str()?    # ❌ — str not assignable to AppError
+    return Ok(n)
+```
+
+**Fix:** convert at the boundary.
+
+```python
+def f() -> Result[int, AppError]:
+    match parse_str():
+        case Ok(n):
+            return Ok(n)
+        case Err(msg):
+            return Err(AppError(message=msg))
+```
+
+## `tyc::result_unused`
+
+A `Result`-returning call's value is discarded (future-reserved diagnostic for `f();` where `f -> Result[...]`).
+
+## Where next
+
+- [`Result, Ok, Err` reference](/Typhon/reference/result/) — the type.
+- [The ? Operator reference](/Typhon/reference/question-operator/) — every rule.
+- [Error Handling (tour)](/Typhon/tour/error-handling/) — teaching page.

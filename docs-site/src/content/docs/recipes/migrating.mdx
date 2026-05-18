@@ -1,0 +1,121 @@
+---
+title: Migrating from Python
+description: Incremental Python → Typhon, with tyc migrate and manual cleanup.
+sidebar:
+  order: 2
+---
+
+import { Steps } from '@astrojs/starlight/components';
+
+You don't need to convert your whole codebase. Typhon and Python interoperate; you can migrate a single file at a time. This recipe walks the process.
+
+## Prerequisites
+
+- A typed Python codebase. Untyped Python migrates too but with more `unsafe:` blocks.
+- `tyc` installed; project scaffolded with `tyc init` (or set up by hand).
+
+## Strategy
+
+Migrate leaves first (small utility modules with no inbound deps) → up through the dependency graph. At each step:
+
+<Steps>
+
+1. **Run `tyc migrate`** on the candidate file. Inspect the diff with `--check`.
+
+   ```bash
+   tyc migrate --check src/utils.py
+   tyc migrate src/utils.py    # writes src/utils.ty
+   ```
+
+2. **Delete or rename `utils.py`.** (Keep it briefly during transition if other Python modules import from it; Typhon emits `build/utils.py`, which they'll pick up.)
+
+3. **Run `tyc check src/`.** Fix the diagnostics. Common ones:
+
+   - `tyc::missing_binding_kind` — add `let` (default) or `mut` (if rebound).
+   - `tyc::nullable_use` — narrow before use.
+   - `tyc::missing_return_type` — annotate.
+
+4. **Run the test suite.** It exercises the emitted `.py`; if tests pass against the migrated `.ty`, you're good.
+
+5. **Commit and move on.** Pick the next leaf.
+
+</Steps>
+
+## What `tyc migrate` handles
+
+Automatic rewrites:
+
+- `Optional[T]` / `T | None` → `T?`
+- `from typing import TypeVar`, `T = TypeVar("T")` → PEP 695 generic syntax
+- `@dataclass` decorators and their imports → dropped (default emit is `@dataclass(slots=True)`)
+- Module-level annotated assigns (`x: int = 1`) → `let x: int = 1`
+
+## What you do by hand
+
+- **Add `let` / `mut` to function-local bindings.** The migrator inserts `let` for module-level assigns; locals are flagged by the checker (`tyc::missing_binding_kind`). Run `tyc check`, scan the diagnostics, decide `let` vs `mut`.
+- **Convert `try/except` to `Result[T, E]`** where errors are expected. Mechanical translation:
+
+  ```python
+  # Python
+  def parse(raw: str) -> int:
+      try:
+          return int(raw)
+      except ValueError:
+          raise BadInput(raw)
+
+  # Typhon
+  def parse(raw: str) -> Result[int, BadInput]:
+      try:
+          return Ok(int(raw))
+      except ValueError:
+          return Err(BadInput(raw=raw))
+  ```
+
+- **Convert `class X(BaseModel)` to `model X:`** by hand. Auto-detection would mis-fire on cases that need Pydantic-specific decorators (`@validator`, `Field(...)`); leave it to the human.
+- **Mark framework bases `class!`.** `class X(torch.nn.Module):` → `class! X(torch.nn.Module):`. See [Class Escape Hatches](/Typhon/interop/class-escape/).
+- **Sealed-union refactors.** Where you have an open union (`A | B`), consider adding a `type X = A | B` alias to seal it and enable exhaustive `match`.
+
+## Mixed `.ty` / `.py`
+
+Plain `.py` files in `src/` are copied to `build/` unchanged. They can import from emitted modules, and vice versa. You don't need to migrate all-or-nothing.
+
+A typical pattern:
+
+```
+src/
+├── core.ty            # migrated
+├── api.ty             # migrated
+├── workers.py         # not yet migrated
+├── legacy_etl.py      # never migrated
+└── third_party_glue.py
+```
+
+Imports cross the boundary fine. Untyped imports from `.py` are treated as crossing an `unsafe:` boundary; write `.dty` stubs if you need them typed.
+
+## Common gotchas
+
+### `let` everywhere makes loops fail
+
+The migrator inserts `let` by default for module-level assigns; locals fail with `tyc::missing_binding_kind` and the checker doesn't know what to suggest. For loop counters / accumulators, you need `mut`. Manually pass through the file.
+
+### `try/except` for control flow
+
+If the Python codebase uses exceptions for *expected* failures (`KeyError` to detect missing config, etc.), refactor to `Result[T, E]` or use `dict.get(...)`. The mechanical port would compile but keep the bad pattern.
+
+### Pydantic auto-generated fields
+
+If a Pydantic model uses `model_config = ConfigDict(...)` or `Field(...)` with side effects, the auto-converted `model` may not behave the same. Inspect carefully.
+
+### Framework base classes
+
+`class X(SomeFrameworkBase):` may need `class!` for the synthesised `super().__init__()` call. See [Class Escape Hatches](/Typhon/interop/class-escape/).
+
+## When to stop
+
+You don't have to migrate everything. Migrating leaf modules first gets the high-value safety wins (typed errors, sealed unions, non-null checks) without the cost of touching glue layers. If a module would mostly be `unsafe:` blocks, leave it as `.py`.
+
+## Where next
+
+- [`tyc migrate`](/Typhon/cli/migrate/) — the command reference.
+- [Calling Python from Typhon](/Typhon/interop/calling-python/) — mixed-language interop.
+- [Class Escape Hatches](/Typhon/interop/class-escape/) — framework base patterns.

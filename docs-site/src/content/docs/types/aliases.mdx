@@ -1,0 +1,98 @@
+---
+title: Type Aliases
+description: type Name = ... — transparent renames for readability.
+sidebar:
+  order: 10
+---
+
+A `type` alias gives a name to another type. It is **transparent** — the alias is interchangeable with what it aliases. No new type is created.
+
+## Plain alias
+
+```python
+type UserId = int
+type Json = dict[str, str | int | float | bool | None]
+type ConnString = str
+```
+
+These are pure readability tools. The checker substitutes through them:
+
+```python
+def find(id: UserId) -> str?:
+    ...
+
+let u = find(42)        # ✅ int is assignable to UserId (same type)
+```
+
+## Generic alias
+
+```python
+type Vec[T] = list[T]
+type Pair[A, B] = tuple[A, B]
+type Lookup[K, V] = dict[K, list[V]]
+type Maybe[T] = T?
+```
+
+The parameters bind at the use site:
+
+```python
+let xs: Vec[int] = [1, 2, 3]     # same as list[int]
+let p: Pair[str, int] = ("a", 1) # same as tuple[str, int]
+```
+
+## Aliases for sealed unions
+
+The most common use:
+
+```python
+type Shape = Circle | Rectangle | Triangle
+type Result[T, E] = Ok[T] | Err[E]
+type LoadError = NotFound | Timeout | Backend
+```
+
+The `type` keyword on the left is what makes the union *sealed* for exhaustiveness purposes (see [Sealed Unions](/Typhon/types/sealed-unions/)).
+
+## What aliases are not
+
+- **Not new nominal types.** `type UserId = int` does not give you a fresh type — `UserId` is interchangeable with `int`. If you want a distinct wrapper (for accidental-confusion safety), use a small class:
+
+  ```python
+  class UserId:
+      value: int
+  ```
+
+- **Not generic constraints.** `type Vec[T: Ordered] = list[T]` parses but the constraint is *partial* in the current release. For now, put the bound on the *consumer* function.
+
+- **Not the same as `TypeAlias`.** Typhon does not use `typing.TypeAlias` — the `type` keyword (PEP 695 syntax) is the only form.
+
+## Emitting
+
+Aliases emit as plain Python aliases:
+
+```python
+# Typhon
+type Vec[T] = list[T]
+type Json = dict[str, int]
+
+# Emitted Python
+type Vec[T] = list[T]
+type Json = dict[str, int]
+```
+
+PEP 695 introduces `type X = ...` as a Python-native form on 3.12+. The emitter passes it through unchanged.
+
+## When to alias
+
+- The type is long and repeats (`dict[str, list[tuple[int, int, int]]]`).
+- The name communicates intent better than the structure (`UserId` vs `int`).
+- You have a sealed union — the alias is the seal.
+
+When *not* to alias:
+
+- A single-character rename. `type S = str` adds nothing.
+- A type that already has a good name. `type Map[K, V] = dict[K, V]` is busywork.
+
+## Where next
+
+- [Sealed Unions](/Typhon/types/sealed-unions/) — the primary use of `type X = A | B`.
+- [Generics](/Typhon/types/generics/) — PEP 695 reference.

@@ -1,0 +1,177 @@
+---
+title: Nullable Types (T?)
+description: T? sugar for T | None, with all the rules and narrowing forms.
+sidebar:
+  order: 4
+---
+
+`T?` is sugar for `T | None`. Plain `T` cannot hold `None` — that is the core of Typhon's non-nullable-by-default rule. The checker tracks nullability flow-sensitively and narrows `T?` to `T` after the usual checks.
+
+## Spelling
+
+| Want | Typhon | Emitted |
+|------|--------|---------|
+| Non-nullable `int` | `int` | `int` |
+| Nullable `int` | `int?` | `int \| None` |
+| Nullable list of nullable strings | `list[str?]?` | `list[str \| None] \| None` |
+| Nullable dict value | `dict[str, int?]` | `dict[str, int \| None]` |
+| Nullable param with default `None` | `name: str? = None` | `name: str \| None = None` |
+
+`Optional[T]` from `typing` and `T | None` are both rejected in `.ty` source; the migrator rewrites them. Internally Typhon represents nullability as `Nullable[T]`, but the emitter always lowers to `T | None`.
+
+## Default values
+
+`T?` does **not** auto-default to `None`. If you want both nullable and defaulted, spell it:
+
+```python
+def find(name: str?) -> int?: ...     # caller must pass an arg (even None)
+def find(name: str? = None) -> int?: ...   # caller may omit
+```
+
+## Narrowing forms
+
+The checker recognises five narrowing forms:
+
+### 1. `is None` / `is not None`
+
+```python
+def f(x: int?) -> int:
+    if x is None:
+        return 0
+    return x      # narrowed to int
+```
+
+### 2. Early-return from `is None`
+
+```python
+def f(x: int?) -> int:
+    if x is None:
+        return 0
+    return x + 1  # narrowed to int by reachability
+```
+
+### 3. `isinstance(x, T)`
+
+```python
+def f(x: int | str | None) -> str:
+    if isinstance(x, str):
+        return x      # narrowed to str
+    if isinstance(x, int):
+        return str(x)  # narrowed to int
+    return ""
+```
+
+### 4. `guard x = expr else: ...`
+
+```python
+def f(maybe: int?) -> int:
+    guard x = maybe else:
+        return 0
+    return x      # narrowed to int
+```
+
+### 5. Truthiness (limited)
+
+Truthy / falsy narrowing works on nullable types specifically:
+
+```python
+def f(x: str?) -> int:
+    if x:           # narrows x to str (non-empty)
+        return len(x)
+    return 0
+```
+
+<aside>
+  This is conservative. `if x:` on `int?` narrows `x` to `int` but does *not* prove it's non-zero. Use explicit `is not None` for clarity when you only mean "set".
+</aside>
+
+## Width-preserving operations
+
+Some operations preserve nullability through their type:
+
+```python
+let xs: list[int]? = get_list()
+let ys: list[int]? = xs            # still nullable
+let s: list[int] = xs or []        # `or` collapses None → []
+```
+
+`or` with a fallback is a common idiom for "narrow to T":
+
+```python
+let name: str = maybe_name or "anonymous"
+```
+
+## How `T?` emits
+
+```python
+# Typhon
+def greet(name: str?) -> str: ...
+
+# Emitted Python
+def greet(name: str | None) -> str: ...
+```
+
+Existing Python type checkers (mypy, pyright, IDEs) handle `T | None` natively. There is no Typhon-specific type to learn at the interop boundary.
+
+## Common cases
+
+### `dict.get(k)` returns `V?`
+
+```python
+let counts: dict[str, int] = {"a": 1}
+let n: int? = counts.get("missing")    # nullable
+```
+
+### `re.match` returns `Match?`
+
+```python
+import re
+let m: re.Match? = re.match(r"\d+", "123")
+if m is not None:
+    print(m.group())
+```
+
+### Optional-chaining is **not** supported
+
+Typhon does not ship the `?.` operator. Use `guard` / `if x is not None`:
+
+```python
+guard u = find_user(id) else:
+    return None
+print(u.name)
+```
+
+## Common mistakes
+
+### Calling a method on a `T?` without narrowing
+
+```python
+let s: str? = maybe_str()
+print(s.upper())     # ❌ tyc::nullable_use
+```
+
+Fix: narrow first (`if s is not None:`) or use `guard`.
+
+### Returning `None` from a `T` function
+
+```python
+def find(id: int) -> str:
+    return None    # ❌ None not assignable to str
+```
+
+Fix: change the signature to `-> str?` or return a real `str`.
+
+### `Optional[T]` from `typing`
+
+```python
+from typing import Optional
+def f(x: Optional[int]) -> None: ...    # ❌ — use `x: int?`
+```
+
+`tyc migrate` rewrites this automatically.
+
+## Where next
+
+- [Flow Narrowing](/Typhon/types/narrowing/) — every form the checker recognises.
+- [`guard`](/Typhon/reference/guard/) — the dedicated early-return-with-narrowing form.
+- [Result reference](/Typhon/reference/result/) — when "missing" is really a typed error.

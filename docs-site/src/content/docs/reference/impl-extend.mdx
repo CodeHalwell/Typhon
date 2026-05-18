@@ -1,0 +1,156 @@
+---
+title: impl and extend
+description: Attaching methods to classes — same file, different file, or to built-ins.
+sidebar:
+  order: 5
+---
+
+## `impl`
+
+`impl ClassName:` attaches methods to a class declared in the same project. The desugarer merges the methods into the class body.
+
+```python
+class User:
+    id: int
+    name: str
+
+impl User:
+    def display(self) -> str:
+        return f"{self.name} (#{self.id})"
+
+    def is_admin(self) -> bool:
+        return self.id == 0
+```
+
+Emits as:
+
+```python
+@dataclass(slots=True)
+class User:
+    id: int
+    name: str
+
+    def display(self) -> str:
+        return f"{self.name} (#{self.id})"
+
+    def is_admin(self) -> bool:
+        return self.id == 0
+```
+
+### Multiple `impl` blocks
+
+Allowed, and merged. They may live in different files:
+
+```python
+# domain/user.ty
+class User:
+    id: int
+
+impl User:
+    def display(self) -> str: ...
+
+# auth/admin.ty
+impl User:
+    def is_admin(self) -> bool: ...
+```
+
+Both methods land on `User` at desugar time.
+
+### Methods take explicit `self`
+
+```python
+impl User:
+    def hi(self) -> str:        # ✅
+        return f"hi, {self.name}"
+
+    def hi() -> str:             # ❌ tyc::missing_self
+        ...
+```
+
+The `self` parameter is required. Earlier docs suggested an implicit-`self` form (bare `name` resolving to `self.name`); that was never implemented because the resolver can't see the enclosing class's fields at name-resolution time. Use explicit `self.NAME`.
+
+### Generic classes
+
+```python
+class Box[T]:
+    value: T
+
+impl[T] Box[T]:
+    def get(self) -> T:
+        return self.value
+```
+
+Re-declare the generic parameters with `impl[T]`. The parameter names must match the class declaration.
+
+## `extend`
+
+`extend ClassName:` is `impl`'s twin for two cases:
+
+- **Cross-module additions** to user-defined classes — semantically identical to `impl` but lives in a different file.
+- **Extensions on built-ins** — adds methods that desugar to free functions, with call-site rewrites.
+
+### Extending user-defined classes
+
+```python
+# domain/user.ty
+class User:
+    id: int
+    name: str
+
+# analytics/user_metrics.ty
+extend User:
+    def tracking_id(self) -> str:
+        return f"user-{self.id:08d}"
+```
+
+Functionally the same as `impl User:` in another file. `extend` is the recommended spelling for cross-module additions because the keyword signals intent ("I am adding to a type defined elsewhere").
+
+### Extending built-ins
+
+```python
+extend str:
+    def to_slug(self) -> str:
+        return self.lower().replace(" ", "-")
+```
+
+For built-in types (`str`, `list`, `int`, `dict`, `bytes`, `set`, `frozenset`, `tuple`), each method is extracted to a module-level free function and call sites are rewritten when the receiver has a matching static annotation:
+
+```python
+let title: str = "Hello World"
+let slug: str = title.to_slug()
+```
+
+Emits as:
+
+```python
+def __typhon_ext_str__to_slug(self: str) -> str:
+    return self.lower().replace(" ", "-")
+
+title: str = "Hello World"
+slug: str = __typhon_ext_str__to_slug(title)
+```
+
+**No monkey-patching.** The rewrite is strictly opt-in by static annotation. An un-annotated receiver (`some_dynamic.to_slug()`) raises `AttributeError` at runtime — Python's existing semantics.
+
+### Which built-ins are extendable?
+
+The recognised set:
+
+- `str`
+- `bytes`
+- `int`
+- `float`
+- `bool`
+- `list`
+- `dict`
+- `set`
+- `frozenset`
+- `tuple`
+
+Extensions on other built-ins (`type`, `object`, `range`, etc.) are not currently rewritten.
+
+## Where next
+
+- [Classes and Models (tour)](/Typhon/tour/classes/) — teaching page.
+- [`class`, `model`, `class!`](/Typhon/reference/classes/) — class declaration forms.
+- [`extend` → free functions (lowering)](/Typhon/lowering/extend/) — how the rewrite works.

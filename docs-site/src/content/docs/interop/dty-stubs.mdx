@@ -1,0 +1,127 @@
+---
+title: Writing .dty Stubs
+description: Typhon's stub format — strict signatures for untyped third-party APIs.
+sidebar:
+  order: 3
+---
+
+A `.dty` stub describes a Python module's API in Typhon's strict dialect (`T?`, `Result[T, E]`, sealed unions, interfaces). The compiler:
+
+- Checks your code against the stub at build time.
+- Emits a `.pyi` companion so mypy / pyright / Pyrefly / `ty` also understand it.
+
+## File location
+
+Place `.dty` files anywhere in the project tree (commonly `stubs/<module>.dty`). `tyc check --stubs` walks the project tree to find them.
+
+## Example
+
+```python
+# stubs/redis.dty
+class Redis:
+    host: str
+    port: int
+
+impl Redis:
+    def get(self, key: str) -> str?
+    def set(self, key: str, value: str) -> bool
+    def delete(self, *keys: str) -> int
+    def keys(self, pattern: str) -> list[str]
+
+def from_url(url: str) -> Redis
+```
+
+Notes:
+
+- The same syntax as `.ty`, but methods have no body (signatures only).
+- `T?` is `T | None` in the emitted `.pyi`.
+- Class fields work — the stub asserts their types.
+- Free functions sit at module level.
+
+## What emits as `.pyi`
+
+```python
+# Emitted alongside build/redis.py (or, for an external module, build/redis.pyi)
+class Redis:
+    host: str
+    port: int
+
+    def get(self, key: str) -> str | None: ...
+    def set(self, key: str, value: str) -> bool: ...
+    def delete(self, *keys: str) -> int: ...
+    def keys(self, pattern: str) -> list[str]: ...
+
+def from_url(url: str) -> Redis: ...
+```
+
+Standard PEP 561 stub. Method bodies become `...`.
+
+## Stubbing a third-party module
+
+If you're stubbing a module you don't own (e.g. `redis-py`):
+
+1. Write `stubs/redis.dty`.
+2. Run `tyc check --stubs` to confirm the stub matches the runtime module's surface.
+3. Update the stub when the library upgrades and `tyc check --stubs` complains.
+
+## Stubbing a Typhon-authored library for Python consumers
+
+If you're writing a `.ty` library that Python users will consume via the emitted `.py`:
+
+1. The `.py` carries Typhon's annotations as standard Python annotations (`T | None`, etc.).
+2. You usually don't need a separate `.dty` — the emitted `.py` is typed already.
+
+You'd write a `.dty` only if you want to expose a stricter API surface in Typhon than the implementation reveals (e.g. hiding an internal helper).
+
+## Common patterns
+
+### Optional return that's also nullable
+
+```python
+# stubs/db.dty
+impl Database:
+    def find_user(self, id: int) -> User?      # may be None
+```
+
+### Generic methods
+
+```python
+# stubs/cache.dty
+class Cache[K, V]:
+    def get(self, key: K) -> V?
+    def put(self, key: K, value: V) -> None
+```
+
+### Class hierarchies
+
+```python
+# stubs/orm.dty
+class Model:
+    id: int
+
+class User(Model):
+    name: str
+```
+
+### Async functions
+
+```python
+impl HttpClient:
+    async def get(self, url: str) -> Response
+    async def post(self, url: str, body: bytes) -> Response
+```
+
+## What's *not* stubbed
+
+`.dty` is for *typed* surfaces. If the module is genuinely dynamic (returns `Any` everywhere, uses `**kwargs` extensively), you may need to:
+
+- Use `unsafe:` blocks at the call site.
+- Wrap the dynamism in a small typed adapter.
+
+You don't *have* to stub everything — only what your project consumes.
+
+## Where next
+
+- [.pyi Emission](/Typhon/interop/pyi/) — what the emitted stub looks like.
+- [Stub Drift](/Typhon/interop/stub-drift/) — `tyc check --stubs` and `tyc stubtest`.
+- [Wrapping an Untyped Library (recipe)](/Typhon/recipes/wrapping-library/) — patterns.

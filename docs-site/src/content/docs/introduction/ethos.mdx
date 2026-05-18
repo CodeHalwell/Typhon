@@ -1,0 +1,121 @@
+---
+title: The Ethos of Typhon
+description: The values, philosophy, and design principles behind Typhon.
+sidebar:
+  order: 2
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Every programming language is, before it is anything else, a stack of opinions. Some of them are conscious; most are inherited from whatever existed when the designer started writing the parser. Typhon's opinions are deliberate, finite, and small enough to fit on one screen. This page is that screen.
+
+## The one-line ethos
+
+> **Python you can refactor at 2am without breaking production.**
+
+That is the entire point. If a change to the language, the type checker, or the standard library helps you do that, it is in scope. If a change makes the language faster but adds a footgun, it is out of scope. If a change makes the language more typing-spec-pure but harder to refactor at 2am, it is out of scope.
+
+## Five principles
+
+These five principles, in priority order, are the constitution. When two principles conflict — and they sometimes do — the earlier one wins.
+
+### 1. Mistakes are cheaper at compile time than at runtime
+
+This is the single largest reason Python is a hard language to ship at scale: too much of its safety is enforced by tests, runtime, or convention. Typhon shifts as many failure modes as it can into the compiler:
+
+- A `None` flowing into a `str` parameter — caught.
+- A missing `Square` variant in a `match` over `type Shape = Circle | Rectangle | Square` — caught.
+- A function annotated `@pure` that calls `open(...)` — caught.
+- A sync function calling an `async def` without `await` — caught.
+- A `__init__` written by hand on a dataclass-emitting `class` — caught.
+- A reassigned `let` — caught.
+- A `?` propagating an `Err[ParseError]` out of a function returning `Result[T, IoError]` — caught.
+
+Every error in the [diagnostics catalog](/Typhon/diagnostics/reading/) is a runtime bug we already prevented.
+
+### 2. The emitted Python must be code you would have written
+
+Typhon does not introduce new ABIs, new garbage-collection roots, or new datatypes. The output is what an experienced Python author would have produced for the same intent. We are *very* deliberate about this:
+
+- `class User` emits `@dataclass(slots=True)`, not a bespoke metaclass.
+- `Result[T, E]` emits small frozen dataclasses with a `value` / `error` field, not a runtime trick.
+- `gather:` emits an `asyncio.TaskGroup` — the same thing you would have typed by hand.
+- `lazy import np = numpy` emits a small `__TyphonLazy_np_` proxy class with double-checked locking — not magic.
+
+Why does this matter? Because production crashes happen in *Python tracebacks*, not Typhon tracebacks. Even though [`tyc trace`](/Typhon/cli/trace/) can remap frames back to `.ty` source via `.py.map`, you should be able to read the emitted Python and understand what is happening. There is no "Typhon-only" runtime layer to debug.
+
+This principle is what makes [migration onto Typhon and back off again](/Typhon/recipes/migrating/) tolerable. If you stop using Typhon tomorrow, you are left with a Python codebase you can read and maintain. There is no lock-in.
+
+### 3. Permission is opt-in, not opt-out
+
+In Python, almost everything is allowed by default. You can mutate any binding, leave any variable un-annotated, raise any exception, monkey-patch any class, drop any return into a function expecting another. The cost of that permissiveness shows up in code review, in `mypy: ignore` comments, in 2am pages.
+
+Typhon inverts the default. The dangerous things require an explicit token:
+
+- Mutation requires `mut`.
+- Untyped values require `unsafe:`.
+- Optional values require `?`.
+- Cross-thread spawning requires `go`.
+- Build-time evaluation requires `comptime`.
+- Memoisation requires `@memo`.
+- Pyhon-extra-fields requires `[emit] model-extra = "allow"` plus a deliberate config edit.
+- Subclassing a framework base requires `class!`.
+
+None of these tokens stop you from doing the thing you wanted to do; they make the thing **visible at the call site** so a reader can spot it. That is the whole game.
+
+### 4. Honesty about the Python boundary
+
+Typhon does not pretend Python doesn't exist. The vast majority of useful libraries — `requests`, `httpx`, `sqlalchemy`, `numpy`, `pandas`, `torch`, `pydantic`, `fastapi`, every framework and adapter you can name — are Python libraries. Typhon's job is to talk to them honestly, not to wrap them in a leaky abstraction.
+
+The boundary has two formal shapes:
+
+- **[`.dty` stubs](/Typhon/interop/dty-stubs/)** — Typhon-flavoured signatures for third-party Python APIs. Strictly typed in the Typhon dialect (`T?`, `Result[T, E]`, sealed unions, interfaces). The compiler emits a `.pyi` companion so mypy / pyright / ty also understand it. Drift between the stub and the runtime module is caught by [`tyc check --stubs`](/Typhon/interop/stub-drift/).
+- **[`unsafe:` blocks](/Typhon/reference/unsafe/)** — a lexical region where the checker tolerates dynamism, but emits an `Unsafe[T]` marker that cannot cross out into a concrete context without re-assertion.
+
+These are the only two ways `Any` enters a Typhon program. There is no `// @ts-ignore` for Typhon.
+
+### 5. The minimum-viable language is publishable
+
+This is a design principle, not just a project-management one. Typhon was built so that you could ship a useful subset on day one: **non-null types + sealed unions + `Result` + dataclass emit**. Every feature added after that — interfaces, comptime, lazy, async-`gather`, generics, the LSP, the migrator — is layered on top without changing the meaning of any program you wrote with the minimum core.
+
+When scope tensions appear, the minimum core wins. That keeps the language small enough that you can read the whole spec in an evening.
+
+## What Typhon refuses to do
+
+Some things have been considered and rejected. They are listed here so that you can stop waiting for them.
+
+### Implicit async inference
+
+Some languages (Effekt, Koka, even some Rust async runtimes) infer the async-ness of a function from its callees. Typhon does not. The reason is concrete: when async-ness is inferred, refactoring a deep callee can silently change the "colour" of every caller — and the resulting stack traces are confusing. Typhon stays with Python's explicit `async def`, and *adds* two checks: an `async` function with no `await` is a warning, and a sync function calling `async` without `await` is a hard error.
+
+### Implicit memoisation
+
+It is tempting to look at a function that satisfies all six [purity conditions](/Typhon/reference/pure-memo/) and wrap it in `@functools.cache` automatically. Typhon refuses by default. Caches extend the lifetime of every argument and every return value indefinitely; that is not a transparent change. You opt in per-function with `@memo` or `@pure(memo=True)`, or project-wide with `[strictness] auto-memoise = true`. The checker never decides for you.
+
+### Hidden runtime helpers
+
+Typhon needs a small set of helpers: the `Result` ADT, the lazy-import proxy, the strong-ref task registry. These could have been published as a PyPI package the user must `pip install`. Typhon refuses. The helpers are emitted into your project as a local `typhon_runtime/` module the build owns. That decision means you can ship a Typhon-compiled wheel to a server that has never heard of Typhon and it will run.
+
+### Monkey-patching built-ins
+
+`extend str:` looks like it ought to allow you to add a `.to_slug()` method to every `str` in the program. It does not. The compiler extracts the method to a module-level free function (`__typhon_ext_str__to_slug`) and rewrites call sites *only when the receiver has a static `str` annotation*. Un-annotated receivers still raise `AttributeError`. This is intentional. Monkey-patching built-ins is the kind of thing that looks helpful for two weeks and is impossible to debug for the next two years.
+
+### Runtime `isinstance(x, SomeInterface)`
+
+PEP 544's `@runtime_checkable` only verifies attribute presence at runtime — it cannot check signatures or types. That makes `isinstance(x, MyInterface)` weaker than the static structural check Typhon already does. Typhon refuses to compile `isinstance` against an `interface` unless you explicitly opt in with `@runtime_checkable`. Static narrowing is the primary mechanism; if you need a real predicate, write one.
+
+### A bespoke package manager
+
+Typhon does not invent a new package manager. The [`tyc add`](/Typhon/cli/packages/) / `tyc remove` / `tyc sync` surface is a thin layer over [`uv`](https://github.com/astral-sh/uv) — the manifest is in `typhon.toml`, but the install step shells out to `uv` against a generated `pyproject.toml`. If `uv` is missing, the commands edit the manifest and tell you what to install. We do not want to be in the wheel-resolution business.
+
+## What you are signing up for
+
+When you write a `.ty` file you are signing up for:
+
+- A compiler that will refuse to let you ignore `None`.
+- A compiler that will refuse to let you skip the return type.
+- A compiler that will refuse to let you forget a `Square` variant in a `match`.
+- A compiler that will refuse to let you spawn a fire-and-forget task into the void.
+- A compiler that will refuse to let you wrap a side-effecting function in `@functools.cache`.
+
+In exchange you get a program you can refactor at 2am without breaking production. That is the trade. If it sounds like a good one, [install `tyc`](/Typhon/getting-started/installation/) and write the [Hello, world](/Typhon/getting-started/hello-world/).

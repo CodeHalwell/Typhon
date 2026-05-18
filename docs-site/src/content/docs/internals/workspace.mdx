@@ -1,0 +1,108 @@
+---
+title: Workspace Layout
+description: Every crate, its responsibility, and where it sits in the dependency graph.
+sidebar:
+  order: 3
+---
+
+```
+tyc/
+├── Cargo.toml                  (workspace root)
+├── crates/
+│   ├── tyc-syntax/             Typhon lexer/parser
+│   ├── tyc-db/                 Salsa database
+│   ├── tyc-resolve/            Name resolution, scopes, let/mut
+│   ├── tyc-types/              Nominal/structural type checker
+│   ├── tyc-analyse/            Purity, async, comptime
+│   ├── tyc-desugar/            Typhon AST → Python AST
+│   ├── tyc-emit/               Python codegen + .py.map
+│   ├── tyc-format/             ruff format wrapper
+│   ├── tyc-diagnostics/        miette-based renderer
+│   ├── tyc-lsp/                LSP backend
+│   └── tyc/                    CLI binary
+└── vendor/                     Typhon's fork of Ruff
+    ├── ruff_text_size/
+    ├── ruff_source_file/
+    ├── ruff_python_trivia/
+    ├── ruff_python_ast/        + Mutability extension
+    └── ruff_python_parser/     + let/mut soft keywords
+```
+
+## Dependency direction
+
+The arrows in the pipeline are the dependency arrows:
+
+```
+tyc-syntax → tyc-resolve → tyc-types → tyc-analyse → tyc-desugar → tyc-emit → tyc-format
+                              ↓
+                         tyc-diagnostics (everyone)
+                              ↓
+                          tyc-db (everyone needing incremental cache)
+                              ↓
+                          tyc-lsp (everyone above)
+                              ↓
+                            tyc (everyone)
+```
+
+`tyc-diagnostics` and `tyc-db` are shared infrastructure; everyone else is on the pipeline.
+
+## Per-crate notes
+
+### `tyc-syntax`
+
+Re-exports the vendored `ruff_python_ast` and `ruff_python_parser`. Public surface: `parse_module(&str) -> Result<Mod, ParseError>`. Adds the `Mutability` enum and the assignment-node extension.
+
+### `tyc-db`
+
+Salsa database root. Exposes input queries (`set_source(file, text)`), tracked queries (`preprocessed_text`, `module_decl_names`, `resolved_module`), and the cancellation primitives. Every other crate that needs caching goes through this.
+
+### `tyc-resolve`
+
+Walks `Mod` to build a `ResolvedModule`. Independent of types — purely scopes and binding kinds.
+
+### `tyc-types`
+
+The biggest crate. Implements the type checker: assignment compatibility, narrowing, generic inference, structural conformance, sealed-union exhaustiveness, `?` validity.
+
+### `tyc-analyse`
+
+Purity, async correctness, comptime evaluation, auto-gather candidates. Each is a Salsa-tracked function.
+
+### `tyc-desugar`
+
+Typhon AST → Python AST. Owns the lowering tables for `gather:`, `go`, `lazy`, `comptime`, `extend`, `Result?`.
+
+### `tyc-emit`
+
+Hand-written pretty-printer. Records per-statement `(out_line → ty_line)` for `.py.map` v2.
+
+### `tyc-format`
+
+Shells out to `ruff format`. One function, one concern.
+
+### `tyc-diagnostics`
+
+Every diagnostic code is registered here. Search `tyc::CODE_NAME` to find every emission site.
+
+### `tyc-lsp`
+
+`tower-lsp-server` backend. Reuses the same Salsa DB as the CLI.
+
+### `tyc`
+
+The clap-based CLI. Wires everything together.
+
+## Where to start if you're contributing
+
+- **Bug in type inference?** `tyc-types`.
+- **Bug in lowering?** `tyc-desugar`.
+- **Bug in emitted Python format?** `tyc-emit`.
+- **Bug in diagnostic wording?** `tyc-diagnostics` plus the call site.
+- **New CLI flag?** `tyc/crates/tyc`.
+- **Salsa cache invalidation?** `tyc-db`.
+
+## Where next
+
+- [The Pipeline](/Typhon/internals/pipeline/) — stage by stage.
+- [The Vendored Ruff Fork](/Typhon/internals/ruff-fork/) — `vendor/` details.
+- [Adding a Diagnostic](/Typhon/internals/adding-diagnostic/) — a worked walk-through.

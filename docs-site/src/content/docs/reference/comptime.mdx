@@ -1,0 +1,171 @@
+---
+title: comptime
+description: Build-time evaluation with a sandboxed interpreter.
+sidebar:
+  order: 14
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+`comptime` bindings and functions are evaluated by `tyc` at build time inside a sandboxed interpreter. Results are inlined as literals into the emitted Python.
+
+## `comptime let`
+
+```python
+comptime let PORT: int = int(env("PORT", "8080"))
+comptime let DB_URL: str = env("DATABASE_URL")        # build fails if unset
+comptime let IS_PROD: bool = env("BUILD_TAG", "dev") == "prod"
+```
+
+Emits:
+
+```python
+PORT: int = 8080
+DB_URL: str = "postgresql://..."
+IS_PROD: bool = False
+```
+
+The runtime sees only the literal — there is no runtime call to `env()`.
+
+## `comptime def`
+
+User-defined functions usable from `comptime let` initialisers:
+
+```python
+comptime def double(n: int) -> int:
+    return n * 2
+
+comptime def grade(score: int) -> str:
+    if score >= 90:
+        return "A"
+    elif score >= 80:
+        return "B"
+    elif score >= 70:
+        return "C"
+    else:
+        return "F"
+
+comptime let PORT:     int = double(4000)        # → 8000
+comptime let MY_GRADE: str = grade(82)            # → "B"
+```
+
+The `def`s remain in the emitted output (they're ordinary Python functions; `comptime` is a build-time marker). The call sites become literals.
+
+## What the sandbox supports
+
+The v1 contract:
+
+| Form | Supported? |
+|------|------------|
+| Integer / float / string / boolean literals | ✅ |
+| Arithmetic (`+ - * / // % **`) | ✅ |
+| Comparisons (`== != < <= > >=`) | ✅ |
+| Boolean ops (`and`, `or`, `not`) | ✅ |
+| Ternary (`a if c else b`) | ✅ |
+| `env(name)`, `env(name, default)` | ✅ |
+| `int()`, `str()`, `float()`, `bool()` casts | ✅ |
+| `if` / `elif` / `else` | ✅ (inside `comptime def`) |
+| `return` | ✅ (inside `comptime def`) |
+| Local bindings (`x = EXPR`, `let x: T = EXPR`, `mut x: T = EXPR`) | ✅ |
+| Calls to other `comptime def` functions | ✅ |
+| Container literals (`[...]`, `{...}`, `(...)`) | ⏳ roadmap |
+| String methods (`"hi".upper()`) | ⏳ roadmap |
+| Loops (`for`, `while`) | ⏳ roadmap |
+| Exception handling (`try`, `raise`) | ❌ |
+| `with` statements | ❌ |
+| `class` / `def` declarations inside a comptime function | ❌ |
+| I/O, subprocess, network | ❌ |
+| `random.*`, `time.*`, `os.urandom` | ❌ |
+| Imports | ❌ |
+
+The contract is intentionally small. If your `comptime def` couldn't be a small pure helper over arithmetic, strings, and booleans, it probably belongs at runtime.
+
+## Recursion
+
+`comptime def` calls are recursion-checked. The depth limit is currently 64 — buggy definitions fail the build rather than hanging it.
+
+## Required env vars
+
+Declare in `typhon.toml`:
+
+```toml
+[env]
+required = ["DATABASE_URL", "API_KEY"]
+```
+
+Missing required vars fail the build with `tyc::comptime_env_missing`.
+
+## Failure modes
+
+- **Missing required env var.** `tyc::comptime_env_missing`.
+- **Cast failure.** `int("abc")` raises `ValueError` at build time → `tyc::comptime_eval_failed`.
+- **Recursion limit hit.** `tyc::comptime_recursion_limit`.
+- **Unsupported form.** `tyc::comptime_unsupported`.
+
+The diagnostics are formatted to point at the source span that triggered the failure, with the underlying exception included for cast errors.
+
+## Where the sandbox lives
+
+Implementation in `tyc-analyse`. The interpreter walks the AST and produces a `ComptimeValue` ADT (`Int(i64)`, `Float(f64)`, `Str(String)`, `Bool(bool)`). The value is then re-rendered as a Python literal by `tyc-desugar`.
+
+## Common patterns
+
+### Required env validation
+
+```python
+comptime let DB_URL:  str = env("DATABASE_URL")
+comptime let API_KEY: str = env("API_KEY")
+```
+
+```toml
+[env]
+required = ["DATABASE_URL", "API_KEY"]
+```
+
+### Feature flags
+
+```python
+comptime def feature(name: str) -> bool:
+    return env(f"FEATURE_{name.upper()}", "0") == "1"
+
+comptime let DARK_MODE:    bool = feature("dark_mode")
+comptime let EXPERIMENTAL: bool = feature("experimental")
+```
+
+### Derived constants
+
+```python
+comptime let BASE_URL:  str = env("BASE_URL", "https://api.example.com")
+comptime let USERS_URL: str = BASE_URL + "/users"
+```
+
+### Build-tag branching
+
+```python
+comptime let BUILD: str = env("BUILD_TAG", "dev")
+comptime let LOG_LEVEL: str = "DEBUG" if BUILD == "dev" else "INFO"
+```
+
+## Common mistakes
+
+### `comptime` reading runtime values
+
+```python
+comptime let NOW: float = time.time()    # ❌ time.* forbidden in sandbox
+```
+
+Use `lazy let NOW: float = time.time()` for one-shot runtime caching.
+
+### Unsupported form
+
+```python
+comptime let xs: list[int] = [1, 2, 3]    # ⏳ container literals not supported in v1
+```
+
+Compute container literals at runtime; only scalar `comptime` results in v1.
+
+## Where next
+
+- [Build-Time Env Validation (recipe)](/Typhon/recipes/env-validation/) — worked patterns.
+- [`comptime` → inlined literals (lowering)](/Typhon/lowering/comptime/) — implementation details.
+- [`[env]` config section](/Typhon/configuration/env/) — declaring required vars.

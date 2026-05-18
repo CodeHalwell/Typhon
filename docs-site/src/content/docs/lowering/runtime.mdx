@@ -1,0 +1,116 @@
+---
+title: The typhon_runtime module
+description: Every helper Typhon emits into build/typhon_runtime/.
+sidebar:
+  order: 10
+---
+
+When you use `Result`, `go`, or `lazy let`, the compiler generates a small `typhon_runtime/` package alongside your code. This page lists what's in it.
+
+## `typhon_runtime/result.py`
+
+Emitted when `Result`, `Ok`, or `Err` appears anywhere in the project.
+
+```python
+from dataclasses import dataclass
+from typing import Generic, TypeVar
+
+T = TypeVar("T")
+E = TypeVar("E")
+
+@dataclass(slots=True, frozen=True)
+class Ok(Generic[T]):
+    value: T
+
+@dataclass(slots=True, frozen=True)
+class Err(Generic[E]):
+    error: E
+```
+
+`Result[T, E]` itself is a type alias declared at use sites, not in the runtime module.
+
+## `typhon_runtime/tasks.py`
+
+Emitted when `go` appears.
+
+```python
+import asyncio
+
+_BACKGROUND: set[asyncio.Task] = set()
+
+def spawn(coro):
+    """
+    Fire-and-forget task spawn with a strong-ref registry.
+    Prevents the well-known footgun where asyncio.create_task tasks
+    can be garbage-collected mid-flight because the loop holds only
+    weak references.
+    """
+    task = asyncio.create_task(coro)
+    _BACKGROUND.add(task)
+    task.add_done_callback(_BACKGROUND.discard)
+    return task
+```
+
+For `[python] free-threaded = true`, `typhon_runtime/tasks_threaded.py` emits a parallel `ThreadPoolExecutor`-backed version.
+
+## `typhon_runtime/lazy.py`
+
+Emitted when module-level `lazy let` appears.
+
+```python
+import threading
+
+_SENTINEL = object()
+
+class lazy_val:
+    """
+    Thread-safe one-shot cached value.
+    Wraps a zero-arg factory; the factory runs at most once across all
+    threads (double-checked locking) and the result is memoised.
+    """
+    __slots__ = ("_factory", "_value", "_lock")
+
+    def __init__(self, factory):
+        self._factory = factory
+        self._value = _SENTINEL
+        self._lock = threading.Lock()
+
+    def __call__(self):
+        if self._value is _SENTINEL:
+            with self._lock:
+                if self._value is _SENTINEL:
+                    self._value = self._factory()
+        return self._value
+```
+
+## `typhon_runtime/__init__.py`
+
+Re-exports the helpers used in your project:
+
+```python
+# Generated based on what's used
+from .result import Ok, Err
+from .tasks import spawn
+from .lazy import lazy_val
+```
+
+The exact set depends on which features your code actually uses — if you never use `Result`, `Ok` and `Err` are not exported.
+
+## Why generated source, not PyPI?
+
+Two reasons:
+
+1. **Deployment story.** A Typhon-compiled wheel ships with these files in it. Production servers run vanilla CPython plus your code; no `pip install typhon-runtime` step. There is no shared dependency that can drift between Typhon-compiled wheels.
+2. **No version coupling.** Each project's `typhon_runtime/` is exactly the version that compiled it. Upgrading `tyc` doesn't break existing wheels in flight.
+
+The cost (~150 lines of generated Python per project) is negligible compared to the deployment-clarity benefit.
+
+## Customising
+
+You can't. `typhon_runtime/` is generated; it gets overwritten on every `tyc build`. If you need to customise, write a wrapper module that imports and re-exports.
+
+## Where next
+
+- [Result → typhon_runtime](/Typhon/lowering/result/) — `Ok`, `Err`, and the `?` operator.
+- [go → spawn registry](/Typhon/lowering/go/) — task registry details.
+- [lazy → proxies](/Typhon/lowering/lazy/) — `lazy_val` and the proxy classes.

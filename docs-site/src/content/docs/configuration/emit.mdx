@@ -1,0 +1,40 @@
+---
+title: "[emit]"
+description: Class emission default and the format post-process toggle.
+sidebar:
+  order: 4
+---
+
+```toml
+[emit]
+class-default = "dataclass"
+format = true
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `class-default` | `"dataclass"` \| `"pydantic"` | `"dataclass"` | Default emission target for `class` declarations. Overridable per-class via the `model` keyword. |
+| `format` | bool | `true` | Post-process emitted `.py` through `ruff format`. |
+
+## `class-default`
+
+- `"dataclass"` — `class Foo:` emits `@dataclass(slots=True)`. The recommended default — performance-cheap, no PyPI dependency.
+- `"pydantic"` — `class Foo:` emits a Pydantic `BaseModel(extra="forbid")`. Use when *every* class in the project crosses a trust boundary. (Rare.)
+
+You can mix both freely regardless of the default. `class` follows the default; `model` always emits Pydantic.
+
+## `format`
+
+When `true` (default), emitted `.py` is post-processed through `ruff format` for consistent style. Off is occasionally useful when you want to see the raw printer output for debugging.
+
+## Always-on behaviour
+
+Two emit policies that were previously documented are no longer configurable:
+
+- **PEP 561 `.pyi` stubs** are always emitted for every `.dty` file.
+- **Pydantic `model` classes** are always emitted with `extra="forbid"`. A `model-extra` knob is on the roadmap but not yet wired in.
+
+## Where next
+
+- [Classes → dataclass (lowering)](/Typhon/lowering/classes/) — what `class` and `model` compile to.
+- [Pydantic Boundary Models](/Typhon/interop/pydantic/) — when to choose `model`.

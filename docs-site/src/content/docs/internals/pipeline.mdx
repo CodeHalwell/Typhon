@@ -1,0 +1,113 @@
+---
+title: The Pipeline
+description: Stage by stage — what each crate does and what it produces.
+sidebar:
+  order: 2
+---
+
+Each stage is a Salsa-tracked function. Outputs are cached; an unchanged file's downstream queries reuse previous results.
+
+## 1. `tyc-syntax` — Lex + Parse
+
+**Input:** `&str` (source).
+**Output:** `Mod` (Python AST + Typhon nodes) from the vendored `ruff_python_ast`.
+
+Wraps the vendored Ruff parser. Adds `let` and `mut` as soft keywords; attaches `Mutability::Let | Mut | None` to assignment AST nodes.
+
+The parser is shared with Ruff's upstream; the Mutability extension and the new soft keywords are the only deltas.
+
+## 2. `tyc-resolve` — Name Resolution
+
+**Input:** `Mod`.
+**Output:** `ResolvedModule` — symbol table, scope tree, classification of every assignment as `let` / `mut` / module-default.
+
+Walks the AST, building a scope tree. Each scope (module, function, class, comprehension, `with`-block) gets a symbol table; each name resolves to its declaration site.
+
+Enforces:
+
+- Every local binding has `let` or `mut`.
+- `let` bindings aren't reassigned.
+- Re-declarations follow shadowing rules.
+
+## 3. `tyc-types` — Type Check
+
+**Input:** `ResolvedModule`.
+**Output:** `TypedModule` — every expression annotated with its inferred / declared type.
+
+Implements:
+
+- Assignment compatibility (`T` is assignable to `U` iff...).
+- Non-null defaults and `T?` narrowing.
+- Generic inference (bidirectional, recursive, conflict-widening).
+- Structural conformance for `interface`.
+- `?` operator validity (enclosing-function check, error-type compatibility).
+- Sealed-union exhaustiveness for `match`.
+
+## 4. `tyc-analyse` — Purity, Async, Comptime
+
+**Input:** `TypedModule`.
+**Output:** `AnalysedModule` — purity verdicts per function, async correctness diagnostics, comptime values.
+
+Runs:
+
+- The six-condition purity check.
+- Async correctness (`missing_await`, `async_without_await`).
+- The comptime sandboxed evaluator.
+- Auto-gather candidate detection.
+
+## 5. `tyc-desugar` — Typhon AST → Python AST
+
+**Input:** `AnalysedModule`.
+**Output:** `PythonModule` — a plain Python AST.
+
+Per construct:
+
+- Merges `impl` / `extend` blocks into class bodies.
+- Expands `?` into `if isinstance(_tmp, Err): return _tmp; v = _tmp.value`.
+- Lowers `gather:` to `asyncio.TaskGroup` (or `asyncio.gather`).
+- Lowers `go f(x)` to `typhon_runtime.tasks.spawn(f(x))`.
+- Lowers `lazy import np = numpy` to the proxy class.
+- Lowers `lazy let X` to `lazy_val(lambda: ...)`.
+- Inlines `comptime let` results as literals.
+- Rewrites `extend BUILTIN:` methods to free functions and call-site rewrites.
+
+## 6. `tyc-emit` — Python Codegen
+
+**Input:** `PythonModule`.
+**Output:** `String` (the emitted Python) + `SourceMap` (the `.py.map` v2 table).
+
+Hand-written pretty-printer (rather than vendored `ruff_python_codegen`) because we need to record per-statement line offsets for source maps.
+
+## 7. `tyc-format` — Post-process
+
+**Input:** emitted `.py` string.
+**Output:** formatted `.py` string.
+
+Runs `ruff format` on the emitted code. Skipped when `[emit] format = false`.
+
+## 8. `tyc-diagnostics` — Render
+
+**Input:** any of the upstream stages' diagnostic streams.
+**Output:** rendered miette output (to stderr / LSP wire).
+
+Every diagnostic code is registered once in this crate. Search for the code to find every site that emits it.
+
+## 9. `tyc-lsp` — Language Server
+
+**Input:** LSP messages on stdio.
+**Output:** LSP messages on stdio (diagnostics, hover, definition, completion, code actions).
+
+Reuses every Salsa query above. On `didChange`, invalidates the relevant inputs and republishes.
+
+## 10. `tyc` — CLI binary
+
+**Input:** CLI args.
+**Output:** stdout / stderr / exit code.
+
+Wires everything together with `clap` v4 subcommands.
+
+## Where next
+
+- [Workspace Layout](/Typhon/internals/workspace/) — every crate.
+- [Salsa Queries](/Typhon/internals/salsa/) — the incremental layer.
+- [Adding a Diagnostic](/Typhon/internals/adding-diagnostic/) — a worked walkthrough.

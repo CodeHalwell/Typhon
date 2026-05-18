@@ -1,0 +1,189 @@
+---
+title: Testing Typhon Code
+description: pytest against emitted Python; testing strategies for Result, sealed unions, and async code.
+sidebar:
+  order: 10
+---
+
+Typhon's emitted Python is plain Python, so every Python test framework works. `pytest` is the path of least resistance.
+
+## Project layout
+
+```
+myapp/
+├── typhon.toml
+├── src/
+│   └── users.ty
+├── tests/
+│   ├── conftest.py            # pytest fixtures (plain Python)
+│   └── test_users.py          # tests against build/users.py
+```
+
+You can also write tests in `.ty`:
+
+```
+tests/
+├── conftest.py
+└── test_users.ty              # compiles to build/tests/test_users.py
+```
+
+Both work. `.ty` tests get all the type safety; `.py` tests are sometimes simpler for fixture wiring.
+
+## Running
+
+```bash
+tyc build
+pytest build/                  # runs all tests in build/
+pytest build/tests/test_users.py::test_specific
+```
+
+For projects with `tests/` as `.ty`:
+
+```bash
+tyc build
+pytest build/tests/
+```
+
+## Testing `Result[T, E]`
+
+```python
+# build/users.py — emitted
+def parse_port(raw): ...
+
+# tests/test_users.py
+from typhon_runtime import Ok, Err
+from users import parse_port
+
+def test_parse_port_ok():
+    result = parse_port("8080")
+    assert isinstance(result, Ok)
+    assert result.value == 8080
+
+def test_parse_port_err():
+    result = parse_port("abc")
+    assert isinstance(result, Err)
+    assert "not a number" in result.error
+```
+
+Or in `.ty`:
+
+```python
+import pytest
+from users import parse_port
+
+def test_parse_port_ok() -> None:
+    match parse_port("8080"):
+        case Ok(v):
+            assert v == 8080
+        case Err(_):
+            pytest.fail("expected Ok")
+
+def test_parse_port_err() -> None:
+    match parse_port("abc"):
+        case Ok(_):
+            pytest.fail("expected Err")
+        case Err(msg):
+            assert "not a number" in msg
+```
+
+## Testing sealed unions
+
+```python
+def test_load_dispatches_correctly() -> None:
+    let r: Result[Dashboard, LoadError] = load(0)
+    match r:
+        case Err(NotFound(_)):
+            pass    # expected
+        case Err(Timeout(_)):
+            pytest.fail("did not expect Timeout")
+        case Ok(_):
+            pytest.fail("did not expect Ok")
+```
+
+The `match` in tests serves both as the assertion and as documentation of the expected behaviour.
+
+## Testing async code
+
+`pytest-asyncio` works as expected:
+
+```python
+import pytest
+
+@pytest.mark.asyncio
+async def test_fetch_dashboard() -> None:
+    let d: Dashboard = await load_dashboard(42)
+    assert d.user.id == 42
+```
+
+## Fixtures
+
+In `.ty`:
+
+```python
+import pytest
+
+@pytest.fixture
+def sample_user() -> User:
+    return User(id=1, name="alice", email="a@b.com")
+
+def test_display(sample_user: User) -> None:
+    assert sample_user.display() == "alice <a@b.com>"
+```
+
+Fixtures work as in plain pytest — Typhon's only addition is that the types are checked.
+
+## Mocking
+
+`unittest.mock.patch` works:
+
+```python
+from unittest.mock import patch
+
+def test_db_failure() -> None:
+    with patch("users.db.find_user", return_value=None):
+        result = get_user(1)
+        assert isinstance(result, Err)
+```
+
+For typed mocks of `interface` types, write a small implementing class:
+
+```python
+class FakeDB:
+    users: dict[int, User]
+
+impl FakeDB:
+    def find_user(self, id: int) -> User?:
+        return self.users.get(id)
+
+def test_with_fake_db() -> None:
+    let db: Database = FakeDB(users={1: User(...)})
+    ...
+```
+
+The `FakeDB` structurally satisfies the `Database` interface.
+
+## CI integration
+
+```yaml
+- name: Build
+  run: tyc build
+- name: Type-check
+  run: tyc check src/ tests/
+- name: Test
+  run: pytest build/
+```
+
+## Coverage
+
+`pytest-cov` works against `build/`:
+
+```bash
+pytest --cov=build/users build/tests/test_users.py
+```
+
+The coverage report points at the emitted Python; use `tyc trace` on tracebacks if you need to navigate to `.ty` source.
+
+## Where next
+
+- [CI Integration](/Typhon/recipes/ci/) — wiring everything together.
+- [Sealed Unions](/Typhon/types/sealed-unions/) — for assertion patterns.

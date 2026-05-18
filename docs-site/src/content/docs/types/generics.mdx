@@ -1,0 +1,200 @@
+---
+title: Generics (PEP 695)
+description: PEP 695 bracket syntax, bidirectional inference, generic classes, type aliases, and bounded parameters.
+sidebar:
+  order: 6
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Typhon uses **PEP 695** generic syntax exclusively. Type parameters live in square brackets after the function or class name. The vendored Ruff parser accepts the syntax natively, the resolver declares type parameters into scope, and the emitter round-trips them unchanged.
+
+```python
+def first[T](xs: list[T]) -> T?:
+    if len(xs) == 0:
+        return None
+    return xs[0]
+```
+
+`T` is a type parameter scoped to this function. Call sites infer it from the arguments.
+
+## Generic functions
+
+```python
+def map_each[T, U](xs: list[T], f: Callable[[T], U]) -> list[U]:
+    return [f(x) for x in xs]
+
+let lengths: list[int] = map_each(["a", "bb", "ccc"], len)    # T = str, U = int
+```
+
+Multiple type parameters work as expected.
+
+## Generic classes
+
+```python
+class Box[T]:
+    value: T
+
+impl[T] Box[T]:
+    def get(self) -> T:
+        return self.value
+
+    def map[U](self, f: Callable[[T], U]) -> Box[U]:
+        return Box(value=f(self.value))
+```
+
+Notes:
+
+- `Box[T]` in the `class` declaration introduces `T`.
+- `impl[T] Box[T]:` re-declares `T` for use in the methods. The names must match.
+- `map[U]` introduces a *new* type parameter local to the method.
+
+Usage:
+
+```python
+let b: Box[int] = Box(value=10)
+let s: Box[str] = b.map(lambda n: f"n={n}")    # Box[str]
+```
+
+## Type aliases
+
+```python
+type Vec[T] = list[T]
+type Pair[A, B] = tuple[A, B]
+type Lookup[K, V] = dict[K, list[V]]
+```
+
+Aliases are transparent — `Vec[int]` *is* `list[int]`. They're a readability tool, not a new type. The checker substitutes through every alias.
+
+## Bidirectional inference
+
+Inference flows in both directions:
+
+### Forward — from arguments
+
+```python
+def first[T](xs: list[T]) -> T?: ...
+let n: int? = first([1, 2, 3])       # T = int
+let s: str? = first(["a", "b"])      # T = str
+```
+
+### Recursive — structural
+
+```python
+def get[K, V](d: dict[K, V], k: K) -> V?:
+    return d.get(k)
+
+let v: int? = get({"a": 1}, "a")     # K = str, V = int (both inferred)
+```
+
+### Conflict widening
+
+If two parameters force conflicting bindings, the result widens to a union:
+
+```python
+def pair[T](a: T, b: T) -> tuple[T, T]: ...
+
+let p = pair(1, "two")               # T = int | str
+```
+
+This matches Python's `|` semantics. To force a specific binding, annotate the call:
+
+```python
+let p = pair[int](1, 2)              # explicit T = int
+```
+
+## When inference fails
+
+Empty collections, return-only positions, and ambiguous contexts can prevent inference. Annotate explicitly:
+
+```python
+let empty: list[int]? = first[int]([])       # ✅ explicit T
+
+# or:
+let empty: list[int] = []
+let first_or_none: int? = first(empty)       # T inferred from the list
+```
+
+## Bounded type parameters
+
+A bound says "any `T` *that satisfies* some interface or class":
+
+```python
+interface Ordered:
+    def __lt__(self, other: Self) -> bool
+
+def smallest[T: Ordered](xs: list[T]) -> T?:
+    if len(xs) == 0:
+        return None
+    mut best: T = xs[0]
+    for x in xs[1:]:
+        if x < best:
+            best = x
+    return best
+```
+
+<Aside type="caution">
+  Bounded type vars are listed as **partial** in the current release — the syntax parses and single-argument bounds work, but full constraint solving across multiple arguments is still landing. Use bounds in single-argument signatures for now; verify with `tyc check`.
+</Aside>
+
+## Variance
+
+Variance describes how a generic type relates to its parameters: `Box[Dog]` is to `Box[Animal]` as `Dog` is to `Animal` (covariant), opposite (contravariant), or unrelated (invariant).
+
+The current checker treats container generics conservatively:
+
+- **`list[T]`** — invariant (because `list` is mutable).
+- **`tuple[T, ...]`** — covariant (read-only).
+- **`Callable[[A], R]`** — contravariant in `A`, covariant in `R`.
+- **User generics (`Box[T]`)** — invariant by default.
+
+Full variance annotations (PEP 695's `out T`, `in T`) are partial; future work will tighten this.
+
+## Type erasure at emit
+
+Typhon erases generics at emit time. The runtime sees plain `list`, `dict`, and untyped classes; type safety is a compile-time property only.
+
+```python
+# Typhon
+def first[T](xs: list[T]) -> T?: ...
+
+# Emitted Python (PEP 695 preserved on Python 3.13+ default)
+def first[T](xs: list[T]) -> T | None: ...
+```
+
+PEP 695 syntax is preserved because the target is 3.12+. The runtime semantics are identical to plain `first(xs)` — Python's runtime doesn't enforce the constraint.
+
+## Common mistakes
+
+### Importing `TypeVar`
+
+```python
+from typing import TypeVar
+T = TypeVar("T")
+
+def first(xs: list[T]) -> T | None: ...    # ❌
+```
+
+Fix: `def first[T](xs: list[T]) -> T?:`.
+
+### Unconstrained inference
+
+```python
+let empty = first([])    # ❌ T unconstrained
+```
+
+Fix: `let empty: int? = first[int]([])`.
+
+### Calling `isinstance` on a generic type
+
+```python
+isinstance(x, Box[int])    # ❌ runtime error — generics erase
+```
+
+Fix: check the erased form (`isinstance(x, Box)`) and re-cast separately.
+
+## Where next
+
+- [Type Aliases](/Typhon/types/aliases/) — transparent renames for readability.
+- [Interfaces (Protocols)](/Typhon/types/interfaces/) — structural typing for bounds.
+- [Sealed Unions](/Typhon/types/sealed-unions/) — closed sums with exhaustive matching.

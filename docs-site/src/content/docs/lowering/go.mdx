@@ -1,0 +1,102 @@
+---
+title: go → spawn registry
+description: Fire-and-forget spawn through a strong-ref task registry.
+sidebar:
+  order: 5
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+`go f(x)` spawns a task in the background. Lowers through `typhon_runtime.tasks.spawn`, *never* a bare `asyncio.create_task`.
+
+## Async context
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    async def signup(email: str) -> User:
+        let user: User = await create_user(email)
+        go send_welcome(user)
+        return user
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    from typhon_runtime import tasks
+
+    async def signup(email: str) -> User:
+        user: User = await create_user(email)
+        tasks.spawn(send_welcome(user))
+        return user
+    ```
+  </TabItem>
+</Tabs>
+
+## With handle
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    async def signup(email: str) -> User:
+        let user: User = await create_user(email)
+        go send_welcome(user) -> email_task
+        await email_task
+        return user
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    from typhon_runtime import tasks
+
+    async def signup(email: str) -> User:
+        user: User = await create_user(email)
+        email_task = tasks.spawn(send_welcome(user))
+        await email_task
+        return user
+    ```
+  </TabItem>
+</Tabs>
+
+## The runtime helper
+
+```python
+# build/typhon_runtime/tasks.py
+import asyncio
+
+_BACKGROUND: set[asyncio.Task] = set()
+
+def spawn(coro):
+    task = asyncio.create_task(coro)
+    _BACKGROUND.add(task)
+    task.add_done_callback(_BACKGROUND.discard)
+    return task
+```
+
+10 lines, generated into your `build/` tree. Solves the well-known footgun: Python's event loop holds only **weak references** to tasks. A fire-and-forget `asyncio.create_task(...)` whose handle is dropped can be garbage-collected mid-flight. The `_BACKGROUND` set holds strong references; the done-callback clears entries on completion.
+
+## Free-threaded variant
+
+When `[python] free-threaded = true`, `go` on a CPU-bound function lowers to `ThreadPoolExecutor.submit` instead of `asyncio.Task`. The runtime helper has a parallel `Future` registry. The emitter inserts `sys._is_gil_enabled()` runtime checks to fall back to sequential execution if run under a GIL build.
+
+```python
+# Emitted (free-threaded variant)
+from typhon_runtime import tasks_threaded as tasks
+
+def heavy_work(): ...
+
+def run() -> None:
+    fut = tasks.spawn(heavy_work)
+    # ...
+```
+
+## Why never `asyncio.create_task` directly?
+
+This is a well-known CPython gotcha — see [the asyncio docs](https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task) for the warning. Tasks are weakly referenced by the loop. Without an external strong reference, the GC may collect the task and silently cancel the coroutine.
+
+The runtime helper takes one line of overhead and prevents the entire bug class.
+
+## Where next
+
+- [`async`, `await`, `gather`, `go` reference](/Typhon/reference/async/) — full surface.
+- [Async and Concurrency (tour)](/Typhon/tour/async/) — teaching page.
+- [The typhon_runtime module](/Typhon/lowering/runtime/) — every helper.

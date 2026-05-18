@@ -1,0 +1,84 @@
+---
+title: tyc repl
+description: Interactive Typhon evaluator.
+sidebar:
+  order: 8
+---
+
+```
+tyc repl [--load FILE] [--python PATH]
+```
+
+Interactive Typhon evaluator. Each prompt accumulates source, recompiles the whole session through the full Typhon pipeline, and executes the result with a Python interpreter. Only the new tail of stdout is displayed after each input.
+
+## Examples
+
+```bash
+tyc repl                          # auto-detects python3.13 / python3.12 / python3
+tyc repl --load src/lib.ty        # pre-load a .ty file as the initial session
+tyc repl --python python3.13      # use a specific interpreter
+```
+
+## Session model
+
+The REPL accumulates **all** source you enter. On each prompt:
+
+1. Append the new block to the accumulated session.
+2. Recompile the whole session.
+3. Execute via the Python interpreter (a fresh subprocess each time).
+4. Display only the new tail of stdout.
+
+This is "pure-scratch" semantics: every prompt re-runs everything from the top. Side effects fire once per prompt.
+
+## REPL commands
+
+| Input | Effect |
+|-------|--------|
+| `:quit` | Exit the REPL. |
+| `:reset` | Clear the accumulated session. |
+| `:show` | Dump the current session source. |
+
+## Multi-line blocks
+
+End on the first **blank line**:
+
+```
+>>> def add(a: int, b: int) -> int:
+...     return a + b
+...                                  ← blank line ends the block
+
+>>> add(1, 2)
+3
+```
+
+## Bare expressions auto-print
+
+```
+>>> 1 + 1
+2
+>>> "hello".upper()
+'HELLO'
+```
+
+The convention matches every other REPL — bare single-line expressions are auto-printed via `repr(...)`.
+
+## Known limitations
+
+- **Pure-scratch semantics** mean side effects fire once per prompt. If you `open(...)` a file, it'll reopen on every subsequent prompt.
+- **No readline / arrow-key support** in v1. Each line is a fresh `read_line`.
+- **Multi-line blocks end on a blank line**, not by counting indentation depth like CPython's REPL.
+
+These are tracked for follow-up.
+
+## Use cases
+
+- Quick experiments with `Result[T, E]` chaining.
+- Trying out comptime arithmetic.
+- Running a small `.ty` lib interactively without scaffolding a project.
+
+For sustained interactive work, write the code to a file and run `tyc run`.
+
+## Where next
+
+- [`tyc run`](/Typhon/cli/run/) — file-based equivalent.
+- [Hello, world](/Typhon/getting-started/hello-world/) — your first program.

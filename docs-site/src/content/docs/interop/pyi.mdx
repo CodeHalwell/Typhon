@@ -1,0 +1,56 @@
+---
+title: .pyi Emission
+description: PEP 561 stubs emitted alongside every .dty.
+sidebar:
+  order: 4
+---
+
+Every `.dty` you write produces a PEP 561 `.pyi` alongside the emitted `.py` (or, for stubs of external modules, directly into the project's stub directory).
+
+## Why
+
+`.pyi` is what every other Python tool understands — mypy, pyright, Pyrefly, `ty`, IDEs. Emitting `.pyi` means Typhon users do not pay an interop tax to consume Typhon-authored libraries from plain Python code.
+
+## What `.dty` lowers to in `.pyi`
+
+The emitter lowers Typhon-only forms back to typing-spec equivalents:
+
+| Typhon (in `.dty`) | Python (in `.pyi`) |
+|---|---|
+| `T?` | `T \| None` |
+| `Result[T, E]` | `Ok[T] \| Err[E]` (references the generated `typhon_runtime` classes) |
+| Sealed union `type X = A \| B` | `X = A \| B` (plain alias) |
+| `interface Foo:` | `class Foo(Protocol):` |
+| `class Foo frozen:` | `@dataclass(slots=True, frozen=True)` |
+| `model Foo:` | `class Foo(BaseModel):` |
+| `def f(...)` (in stub) | `def f(...) -> R: ...` |
+
+Method bodies become `...` (the standard `.pyi` convention).
+
+## Always-on
+
+`.pyi` emission is unconditional. The previously-documented `[emit] pyi-stubs` toggle was removed because every consumer benefits from `.pyi` and the emission cost is negligible.
+
+## Where the `.pyi` lands
+
+- For Typhon-authored modules (`src/foo.ty` + `src/foo.dty`): the `.pyi` lands at `build/foo.pyi` alongside `build/foo.py`.
+- For external-module stubs (`stubs/redis.dty`): the `.pyi` lands at `build/redis.pyi`.
+
+## What mypy / pyright see
+
+A standard PEP 561 typed package. They don't know Typhon emitted the `.pyi`; they just see types.
+
+## Round-tripping
+
+`.pyi` consumed *by* Typhon (e.g. from a third-party typed library) is treated as if it crossed an `unsafe:` boundary unless an authored `.dty` overrides it. This is because:
+
+- `.pyi` has no concept of `T?` (only `T | None`).
+- `.pyi` has no concept of sealed unions (the seal exists in Typhon only).
+- `.pyi` interfaces are `Protocol`-typed — runtime-checkable, not the static-only Typhon variant.
+
+The lossy direction is intentional. Strict guarantees flow *out* (Typhon → `.pyi`), not *in* (`.pyi` → Typhon).
+
+## Where next
+
+- [Writing .dty Stubs](/Typhon/interop/dty-stubs/) — the source format.
+- [Stub Drift](/Typhon/interop/stub-drift/) — keeping stubs and impls in sync.

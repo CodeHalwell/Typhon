@@ -1,0 +1,65 @@
+---
+title: tyc migrate
+description: Convert typed Python (.py) to Typhon (.ty).
+sidebar:
+  order: 12
+---
+
+```
+tyc migrate FILE [--check]
+```
+
+Converts typed Python (`.py`) to Typhon (`.ty`) in one pass. Used to bootstrap a Typhon project from an existing typed Python codebase.
+
+## What it rewrites
+
+- **`Optional[T]` / `T | None`** → **`T?`** in annotation positions.
+- **`@dataclass` decorators** and their `from dataclasses import dataclass` are dropped (Typhon classes emit as dataclasses by default).
+- **Module-level annotated assignments** (`x: int = 1`) gain `let` (or `mut` if reassigned later in the same module).
+- **`from typing import TypeVar` plus `T = TypeVar("T")`** scaffolding is dropped; generic functions become PEP 695 form.
+
+## Examples
+
+```bash
+tyc migrate src/app.py             # writes src/app.ty alongside
+tyc migrate --check src/app.py     # preview to stdout (no writes)
+```
+
+## `--check` mode
+
+Useful in CI to confirm a `.py` file is already Typhon-compatible:
+
+```yaml
+- name: Confirm app.py migrates cleanly
+  run: tyc migrate --check src/app.py
+```
+
+`--check` exits 0 if no changes are needed, 1 if there are diffs to apply.
+
+## What it can *not* do automatically
+
+- **Add `let` / `mut` to function-local bindings.** The migrator inserts `let` by default for module-level annotated assigns, but inside function bodies it cannot tell counters / accumulators from constants without flow analysis. After migration, run `tyc check` and fix the resulting `tyc::immutable_assign` diagnostics by changing the relevant `let`s to `mut`.
+- **Rewrite `try/except` into `Result[T, E]`.** That's a design-level refactor, not a mechanical translation. Migrate the file first; then refactor errors incrementally.
+- **Convert `class X(BaseModel)` into `model X:`.** Pydantic-using classes are detected but not auto-converted; you do it manually because the field ordering and Pydantic-specific decorators (`@validator`, `Field(...)`, etc.) need attention.
+- **Subclasses of framework bases** (`torch.nn.Module`, `Enum`, `unittest.TestCase`) are not detected as candidates for `class!`. After migration, convert them by hand.
+
+The migrator is the boring 80%; the remaining 20% is design work.
+
+## Recommended migration sequence
+
+1. **Audit the project.** Identify modules that are obvious wins (pure value types, helpers without Pydantic / framework bases) vs ones that need design work.
+2. **Migrate a leaf module first** (`tyc migrate src/utils.py`). Verify with `tyc check`. Fix `tyc::missing_binding_kind` (add `let` / `mut`).
+3. **Migrate adjacent modules.** Where you cross into framework bases, mark them `class!` (or leave them as `.py` for now).
+4. **Convert Pydantic-using classes to `model`** by hand when ready.
+5. **Refactor `try/except` to `Result[T, E]`** module-by-module as time allows.
+
+You don't have to migrate the whole project — `.ty` and `.py` interoperate freely. The dial moves at whatever speed is right for your team.
+
+## Mixed `.ty` / `.py` projects
+
+Plain `.py` files in `src/` are copied to `build/` unchanged. They can import from emitted modules, and vice versa. See [Project Layout](/Typhon/getting-started/project-layout/) for the conventions.
+
+## Where next
+
+- [Migrating from Python (recipe)](/Typhon/recipes/migrating/) — design patterns and pitfalls.
+- [Calling Python from Typhon](/Typhon/interop/calling-python/) — how interop works across the boundary.

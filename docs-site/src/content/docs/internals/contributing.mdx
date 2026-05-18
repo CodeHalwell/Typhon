@@ -1,0 +1,102 @@
+---
+title: Contributing
+description: How to send a PR to Typhon.
+sidebar:
+  order: 7
+---
+
+import { Steps } from '@astrojs/starlight/components';
+
+Typhon is open to contributions. The project is small enough that you can read the whole thing in a weekend; the scope is well-defined; the test suite is fast.
+
+## Before you start
+
+1. **Check the [roadmap](/Typhon/project/roadmap/).** If your feature isn't there, file an issue first to confirm it fits.
+2. **Check the [risks](/Typhon/project/risks/).** Some additions are intentionally deferred.
+3. **Read [the design decisions](/Typhon/introduction/design-decisions/).** The constitution of the language.
+
+## Setting up
+
+<Steps>
+
+1. Fork and clone:
+
+   ```bash
+   git clone https://github.com/CodeHalwell/Typhon.git
+   cd Typhon
+   ```
+
+2. Build:
+
+   ```bash
+   cd tyc && cargo build --release
+   ```
+
+3. Run the tests:
+
+   ```bash
+   cargo test --workspace
+   ```
+
+4. Verify the docs site builds (if you're changing docs):
+
+   ```bash
+   cd ../docs-site && npm install && npm run build
+   ```
+
+</Steps>
+
+## Patch hygiene
+
+- **One concern per PR.** Mixing a bug fix with a feature makes reviews painful.
+- **Add a test for every behaviour change.** The test corpus is fast; there's no reason not to.
+- **Run `cargo fmt --workspace` and `cargo clippy --workspace --all-targets`** before pushing. CI gates on both.
+- **Run `cargo deny check`** for dependency audits. (Not always required for docs-only PRs.)
+
+## Where to make changes
+
+| Change | Crate |
+|--------|-------|
+| Parse / lex | `tyc-syntax` (plus the vendored Ruff fork) |
+| Scope / binding rules | `tyc-resolve` |
+| Type system | `tyc-types` |
+| Purity / async / comptime | `tyc-analyse` |
+| Lowering | `tyc-desugar` |
+| Python output | `tyc-emit` |
+| Source maps | `tyc-emit` |
+| Diagnostics | `tyc-diagnostics` (plus the emission site) |
+| LSP | `tyc-lsp` |
+| CLI | `tyc/crates/tyc` |
+
+## Adding a feature
+
+The high-level pattern:
+
+1. **Design.** Open an issue. Get feedback. The design is what's hard; the implementation usually follows.
+2. **Tests first.** Write a `.ty` file in the integration test corpus that exercises the feature. Watch the test fail.
+3. **Implement.** Modify the relevant crate(s).
+4. **Make the test pass.**
+5. **Document.** Add or update pages under `docs-site/src/content/docs/`.
+
+## Style
+
+- Rust: standard `rustfmt` style. `cargo fmt --workspace` is the source of truth.
+- Comments: explain *why*, not *what*. The code already says what.
+- Public APIs: doc-comment them.
+
+## PR description
+
+- What changes and why.
+- Which issue (if any) it closes.
+- Migration notes if behaviour changes.
+- Test plan: which tests cover the change.
+
+## Code of conduct
+
+Be kind, be clear, be brief. We do not have a long CoC; common decency is the rule.
+
+## Where next
+
+- [Architecture](/Typhon/internals/architecture/) — the codebase tour.
+- [Adding a Diagnostic](/Typhon/internals/adding-diagnostic/) — a worked example.
+- [Roadmap](/Typhon/project/roadmap/) — what's planned.

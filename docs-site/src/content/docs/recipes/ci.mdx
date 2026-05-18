@@ -1,0 +1,164 @@
+---
+title: CI Integration
+description: GitHub Actions, GitLab CI, and other shapes.
+sidebar:
+  order: 11
+---
+
+A reference CI pipeline that type-checks, format-checks, stub-checks, second-opinion-checks with `ty`, and runs tests.
+
+## GitHub Actions
+
+```yaml
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  typhon:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tyc/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('tyc/Cargo.lock') }}
+
+      - name: Build tyc
+        run: |
+          cd tyc && cargo build --release
+          echo "$PWD/target/release" >> $GITHUB_PATH
+
+      - name: Format check
+        run: tyc fmt --check src/
+
+      - name: Type-check
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: tyc check src/
+
+      - name: Stub drift (AST)
+        run: tyc check --stubs
+
+  python:
+    runs-on: ubuntu-latest
+    needs: typhon
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install ty (second-opinion type-checker)
+        run: pip install ty mypy
+
+      - name: Build
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: tyc build
+
+      - name: ty over emitted Python
+        run: tyc ty -- --strict
+
+      - name: Stub drift (runtime)
+        run: tyc stubtest
+
+      - name: Tests
+        run: pytest build/
+```
+
+(Adapt `secrets.DATABASE_URL` etc. to your actual `[env] required` set.)
+
+## GitLab CI
+
+```yaml
+stages:
+  - check
+  - test
+
+variables:
+  CARGO_HOME: ${CI_PROJECT_DIR}/.cargo
+
+cache:
+  paths:
+    - .cargo/
+    - tyc/target/
+
+typhon:
+  stage: check
+  image: rust:1.85
+  script:
+    - cd tyc && cargo build --release
+    - export PATH="$PWD/target/release:$PATH"
+    - tyc fmt --check src/
+    - tyc check src/
+    - tyc check --stubs
+
+python:
+  stage: test
+  image: python:3.13
+  needs: [typhon]
+  script:
+    - pip install ty mypy
+    - tyc build
+    - tyc ty
+    - tyc stubtest
+    - pytest build/
+```
+
+## Local pre-commit
+
+```yaml
+# .pre-commit-config.yaml
+repos:
+  - repo: local
+    hooks:
+      - id: tyc-fmt
+        name: tyc fmt
+        entry: tyc fmt
+        language: system
+        files: \.ty$
+      - id: tyc-check
+        name: tyc check
+        entry: tyc check src/
+        language: system
+        pass_filenames: false
+```
+
+## What to gate on
+
+In order of importance:
+
+1. **`tyc check`** — every commit. Fast, reliable, fails on type errors.
+2. **`tyc fmt --check`** — every commit. Cheap, prevents bikeshedding.
+3. **Tests** — every commit.
+4. **`tyc check --stubs`** — every commit if you ship stubs.
+5. **`tyc stubtest`** — nightly (it imports the module, slower).
+6. **`tyc ty`** — nightly or per-PR (depends on team size).
+
+Skipping `tyc check` is the most expensive mistake — it's also the cheapest check, so always run it.
+
+## Caching
+
+The Rust build is the slow part. Cache `~/.cargo` and `tyc/target/` between runs. After the first build, subsequent CI runs reuse the binary.
+
+For Typhon's own incremental cache (Salsa), each `tyc build` invocation reuses what's still valid. The cache lives in `.tyc/` (or similar — implementation detail) and is safe to delete.
+
+## Where next
+
+- [`tyc check`](/Typhon/cli/check/) — the daily-loop command.
+- [`tyc ty`](/Typhon/cli/ty/) — second-opinion type checking.
+- [`tyc stubtest`](/Typhon/cli/stubtest/) — runtime stub probe.

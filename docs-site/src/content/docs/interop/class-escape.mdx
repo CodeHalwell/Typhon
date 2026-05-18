@@ -1,0 +1,190 @@
+---
+title: Class Escape Hatches
+description: class! patterns for framework base classes that can't be dataclass-emitted.
+sidebar:
+  order: 7
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+Some classes can't be expressed as `@dataclass(slots=True)` because their base class needs configuration to run *before* fields are assigned. `class!` is the escape hatch.
+
+## When you need `class!`
+
+If subclassing any of these:
+
+- `torch.nn.Module`
+- `enum.Enum`
+- `typing.NamedTuple`
+- `unittest.TestCase`
+- Django models (`django.db.models.Model`)
+- SQLAlchemy declarative bases (`DeclarativeBase`)
+- Custom framework classes with non-trivial `__init__`
+
+## How `class!` differs from `class`
+
+- **No `@dataclass` decorator.**
+- **`__init__` is auto-synthesised** when the body declares no `def __init__` and at least one base is present. The synthesised constructor calls `super().__init__()` first, then assigns annotated fields in source order.
+- **Hand-written `__init__` is preserved verbatim** — use when the base needs configuration arguments that aren't 1:1 with declared fields.
+
+## `torch.nn.Module`
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    import torch.nn as nn
+
+    class! MyModel(nn.Module):
+        layer1: nn.Linear
+        layer2: nn.Linear
+        dropout: float
+
+        def forward(self, x):
+            return self.layer2(self.layer1(x))
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    import torch.nn as nn
+
+    class MyModel(nn.Module):
+        layer1: nn.Linear
+        layer2: nn.Linear
+        dropout: float
+
+        def __init__(self, layer1: nn.Linear, layer2: nn.Linear, dropout: float) -> None:
+            super().__init__()
+            self.layer1 = layer1
+            self.layer2 = layer2
+            self.dropout = dropout
+
+        def forward(self, x):
+            return self.layer2(self.layer1(x))
+    ```
+  </TabItem>
+</Tabs>
+
+`super().__init__()` runs first — `nn.Module`'s setup must complete before fields can be assigned.
+
+## `enum.Enum`
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    from enum import Enum
+
+    class! Status(Enum):
+        ACTIVE = "active"
+        PAUSED = "paused"
+        DELETED = "deleted"
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    from enum import Enum
+
+    class Status(Enum):
+        ACTIVE = "active"
+        PAUSED = "paused"
+        DELETED = "deleted"
+    ```
+  </TabItem>
+</Tabs>
+
+Enums use class-level `name = value` assignments. `class!` preserves them verbatim and skips `__init__` synthesis (Enum's metaclass owns construction).
+
+## `unittest.TestCase`
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    import unittest
+
+    class! TestUsers(unittest.TestCase):
+        def test_creation(self) -> None:
+            let u = User(id=1, name="a")
+            self.assertEqual(u.id, 1)
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    import unittest
+
+    class TestUsers(unittest.TestCase):
+        def test_creation(self) -> None:
+            u = User(id=1, name="a")
+            self.assertEqual(u.id, 1)
+    ```
+  </TabItem>
+</Tabs>
+
+No annotated fields → no synthesised `__init__`. `unittest`'s machinery owns the test instance lifecycle.
+
+## Django models
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    from django.db import models
+
+    class! UserModel(models.Model):
+        name = models.CharField(max_length=100)
+        email = models.EmailField()
+
+        class Meta:
+            db_table = "users"
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    from django.db import models
+
+    class UserModel(models.Model):
+        name = models.CharField(max_length=100)
+        email = models.EmailField()
+
+        class Meta:
+            db_table = "users"
+    ```
+  </TabItem>
+</Tabs>
+
+Django's `Model` base has its own metaclass; assignments like `name = models.CharField(...)` are class-level declarations, not field annotations. `class!` preserves them verbatim.
+
+## SQLAlchemy declarative
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+    class Base(DeclarativeBase): pass
+
+    class! User(Base):
+        __tablename__ = "users"
+        id: Mapped[int] = mapped_column(primary_key=True)
+        name: Mapped[str] = mapped_column()
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+    class Base(DeclarativeBase): pass
+
+    class User(Base):
+        __tablename__ = "users"
+        id: Mapped[int] = mapped_column(primary_key=True)
+        name: Mapped[str] = mapped_column()
+    ```
+  </TabItem>
+</Tabs>
+
+## When *not* to use `class!`
+
+For your own value types — use plain `class` or `model`. `class!` exists for the cases where the framework owns construction.
+
+## Where next
+
+- [Classes and Models (tour)](/Typhon/tour/classes/) — when to reach for which.
+- [`class`, `model`, `class!` reference](/Typhon/reference/classes/) — declaration forms.

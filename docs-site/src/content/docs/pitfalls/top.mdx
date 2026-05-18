@@ -1,0 +1,138 @@
+---
+title: Top Pitfalls
+description: The mistakes every newcomer makes, ranked by frequency.
+sidebar:
+  order: 1
+---
+
+The list of mistakes everyone hits at least once. Internalising these will save you a lot of red squiggles.
+
+## 1. Forgetting `-> None`
+
+Sync functions returning nothing still need the annotation.
+
+```python
+def main():           # ❌
+    print("hi")
+
+def main() -> None:   # ✅
+    print("hi")
+```
+
+## 2. Writing `x = 1` at function scope
+
+Locals require `let` or `mut`.
+
+```python
+def f() -> None:
+    x = 1           # ❌
+    let x: int = 1  # ✅
+```
+
+Module-level bindings default to `let`.
+
+## 3. Passing `dict.get(k)` somewhere expecting `V`
+
+`dict.get(k)` returns `V?`. Narrow first.
+
+```python
+let counts: dict[str, int] = {"a": 1}
+let n: int = counts.get("missing")    # ❌
+let n: int = counts.get("missing", 0)  # ✅ (default)
+```
+
+## 4. Putting `def display(self) -> str` inside `class`
+
+Methods go in `impl` blocks.
+
+```python
+class User:
+    id: int
+
+    def display(self) -> str:    # ❌
+        ...
+
+# ✅
+class User:
+    id: int
+
+impl User:
+    def display(self) -> str:
+        return f"user {self.id}"
+```
+
+## 5. Writing `__init__`
+
+Don't. The constructor is generated. Use field defaults or a free function.
+
+```python
+class User:
+    id: int
+
+    def __init__(self, id: int) -> None: ...    # ❌
+```
+
+For framework bases that need `__init__`, use `class!`.
+
+## 6. `from typing import TypeVar`
+
+Use PEP 695 instead.
+
+```python
+from typing import TypeVar
+T = TypeVar("T")                                   # ❌
+
+def first[T](xs: list[T]) -> T?: ...               # ✅
+```
+
+## 7. `isinstance(x, MyInterface)`
+
+Rejected by default — PEP 544 only checks attribute presence, not signatures. Use static narrowing or refactor to a sealed union.
+
+## 8. `asyncio.create_task(...)` for fire-and-forget
+
+Use `go f(x)` instead — the runtime registry holds a strong reference.
+
+## 9. `lazy from numpy import array`
+
+Rejected at parse time. Use `lazy import np = numpy` plus `np.array(...)`.
+
+## 10. `comptime let NOW: float = time.time()`
+
+The sandbox forbids `time.*`. Compute at runtime with `lazy let` or a plain function.
+
+## 11. Returning early from a `with`-chain without an `else err:`
+
+Fine — but only if the enclosing function returns a compatible `Result`. Without an `else`, the first `Err` short-circuits via the function's return.
+
+## 12. Empty container without annotation
+
+```python
+let xs: list = []           # ❌ implicit Any element
+let xs: list[int] = []      # ✅
+```
+
+## 13. Putting blocking I/O inside `async def`
+
+Typhon doesn't catch this (it's a Python-wide hazard). Use `aiofiles` or `asyncio.to_thread(...)`.
+
+## 14. Treating `bool` as `int`
+
+The checker treats them as distinct. Cast explicitly with `int(b)` / `bool(n)`.
+
+## 15. Mutating a frozen instance
+
+```python
+class P frozen:
+    x: float
+
+let p = P(x=1.0)
+p.x = 2.0    # ❌
+```
+
+Construct a new instance.
+
+## Where next
+
+- [Python Habits to Drop](/Typhon/pitfalls/python-habits/) — patterns that work in Python but fight Typhon.
+- [Performance Gotchas](/Typhon/pitfalls/performance/) — what to watch when perf matters.

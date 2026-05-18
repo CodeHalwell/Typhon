@@ -1,0 +1,52 @@
+---
+title: Interop with Python
+description: How Typhon talks to standard Python — stubs, unsafe regions, mixed-language projects.
+sidebar:
+  order: 1
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+Typhon's whole pitch is "static safety on top of Python's runtime." That means *talking to Python* is a first-class concern, not an edge case. This section maps every way `.ty` and `.py` interact.
+
+## The interop surface
+
+| Direction | Mechanism | Page |
+|-----------|-----------|------|
+| Typhon imports Python | Treat as `unsafe` boundary; or write a `.dty` stub | [Calling Python](/Typhon/interop/calling-python/) |
+| Python imports Typhon | Read the emitted `.py` and `.pyi` | [.pyi Emission](/Typhon/interop/pyi/) |
+| Stubs for third-party Python | `.dty` files compile to `.pyi` | [Writing .dty Stubs](/Typhon/interop/dty-stubs/) |
+| Drift between stub and impl | `tyc check --stubs` AST diff; `tyc stubtest` runtime probe | [Stub Drift](/Typhon/interop/stub-drift/) |
+| HTTP / file / queue inputs | `model` Pydantic emission | [Pydantic Boundary Models](/Typhon/interop/pydantic/) |
+| Framework base classes | `class!` escape hatch | [Class Escape Hatches](/Typhon/interop/class-escape/) |
+
+<CardGrid>
+  <Card title="Calling Python from Typhon" icon="forward-slash">
+    What happens when you `import` a Python module — and how to make it strict via `.dty` stubs.
+  </Card>
+  <Card title="Writing .dty Stubs" icon="document">
+    The Typhon-flavoured stub format. Strict dialect, lowers to PEP 561 `.pyi`.
+  </Card>
+  <Card title="Pydantic Boundary Models" icon="approve-check">
+    `model` emission for data crossing trust boundaries. `extra="forbid"` always.
+  </Card>
+  <Card title="Class Escape Hatches" icon="puzzle">
+    `class!` patterns for `torch.nn.Module`, `Enum`, `unittest.TestCase`, Django, SQLAlchemy.
+  </Card>
+</CardGrid>
+
+## Mixed-language projects
+
+`.ty` and `.py` interoperate freely. You can:
+
+- Migrate a single file at a time.
+- Keep generated code (protobuf, gRPC) as `.py`.
+- Use `.ty` for new code, `.py` for legacy.
+
+Plain `.py` files in `src/` are copied to `build/` unchanged. They can import from emitted modules and vice versa. Imports from a plain `.py` are treated as if they crossed an `unsafe:` boundary unless an authored `.dty` overrides them.
+
+## Where next
+
+- [Calling Python from Typhon](/Typhon/interop/calling-python/) — the import boundary.
+- [Writing .dty Stubs](/Typhon/interop/dty-stubs/) — the long-term solution to untyped dependencies.
+- [Class Escape Hatches](/Typhon/interop/class-escape/) — `class!` patterns.

@@ -1,0 +1,113 @@
+---
+title: Build-Time Env Validation
+description: comptime let plus [env] required for fail-fast configuration.
+sidebar:
+  order: 6
+---
+
+Declaring environment variables that *must* be present at build time, and validating their format. The build fails — not the first request in production.
+
+## The basic shape
+
+```python
+# src/config.ty
+comptime let DB_URL:     str  = env("DATABASE_URL")
+comptime let API_KEY:    str  = env("API_KEY")
+comptime let PORT:       int  = int(env("PORT", "8080"))
+comptime let BUILD_TAG:  str  = env("BUILD_TAG", "dev")
+comptime let IS_PROD:    bool = BUILD_TAG == "prod"
+```
+
+```toml
+# typhon.toml
+[env]
+required = ["DATABASE_URL", "API_KEY"]
+```
+
+Build with the vars set:
+
+```bash
+DATABASE_URL=postgres://... API_KEY=sk-... tyc build
+# success
+```
+
+Build without:
+
+```bash
+tyc build
+# error[tyc::comptime_env_missing]: required environment variable `DATABASE_URL` is not set
+```
+
+In the emitted Python, every `comptime let` is a literal:
+
+```python
+DB_URL: str = "postgres://..."
+API_KEY: str = "sk-..."
+PORT: int = 8080
+BUILD_TAG: str = "prod"
+IS_PROD: bool = True
+```
+
+No runtime call to `env()`.
+
+## With derived constants
+
+```python
+comptime let BASE_URL: str = env("BASE_URL", "https://api.example.com")
+comptime let USERS_ENDPOINT:  str = BASE_URL + "/users"
+comptime let POSTS_ENDPOINT:  str = BASE_URL + "/posts"
+```
+
+## Feature flags
+
+```python
+comptime def feature(name: str) -> bool:
+    return env(f"FEATURE_{name.upper()}", "0") == "1"
+
+comptime let DARK_MODE:    bool = feature("dark_mode")
+comptime let EXPERIMENTAL: bool = feature("experimental")
+```
+
+## Build-tag branching
+
+```python
+comptime let BUILD: str = env("BUILD_TAG", "dev")
+comptime let LOG_LEVEL: str = "DEBUG" if BUILD == "dev" else "INFO"
+comptime let SENTRY_DSN: str = env("SENTRY_DSN", "") if BUILD == "prod" else ""
+```
+
+## What you *can't* do at comptime
+
+The sandbox forbids I/O, time, randomness, and arbitrary imports:
+
+```python
+comptime let NOW: float = time.time()                # ❌ time.* forbidden
+comptime let PWD: str = os.getcwd()                  # ❌ os.* forbidden (except env)
+comptime let CONFIG = json.loads(open("c.json"))     # ❌ open() forbidden
+```
+
+For runtime-only computations, use `lazy let`:
+
+```python
+lazy let CONFIG: Config = load_config_from_disk()
+```
+
+(See [`lazy`](/Typhon/reference/lazy/).)
+
+## CI integration
+
+```yaml
+- name: Build
+  env:
+    DATABASE_URL: ${{ secrets.DATABASE_URL }}
+    API_KEY: ${{ secrets.API_KEY }}
+  run: tyc build
+```
+
+If a secret is missing from the workflow env, the build fails — visible at PR time, not in production.
+
+## Where next
+
+- [`comptime` reference](/Typhon/reference/comptime/) — the full surface.
+- [`[env]` config](/Typhon/configuration/env/) — declaring required vars.
+- [`comptime` → inlined literals (lowering)](/Typhon/lowering/comptime/) — implementation details.

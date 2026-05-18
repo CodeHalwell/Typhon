@@ -1,0 +1,54 @@
+---
+title: Glossary
+description: Every Typhon-specific term, defined.
+sidebar:
+  order: 6
+---
+
+| Term | Definition |
+|------|------------|
+| **`.dty`** | Typhon stub source file. Strictly typed in the Typhon dialect; compiles to PEP 561 `.pyi`. |
+| **`.py.map`** | Source map v2 sidecar. Per-statement `(out_line → ty_line)` table. Used by `tyc trace` and the LSP. |
+| **`.ty`** | Typhon source file. |
+| **`class!`** | Class form for framework bases (`torch.nn.Module`, `Enum`, `unittest.TestCase`, etc.) that synthesises `__init__` with `super().__init__()` first. |
+| **`comptime`** | Build-time evaluation. `comptime let X = expr` inlines `X` as a literal in the emitted Python. |
+| **comptime sandbox** | The interpreter that runs `comptime` expressions. Tightly scoped — no I/O, no time, no random. |
+| **`extend`** | Cross-module method attachment to a user-defined class; or method extension to built-ins (with static-receiver call-site rewrites). |
+| **`frozen`** | Class modifier; emits `@dataclass(slots=True, frozen=True)`. Blocks field reassignment. |
+| **`gather:`** | Concurrent-await block. Lowers to `asyncio.TaskGroup` by default. |
+| **`gatherable`** | Decorator that opts a callee into automatic-`gather` rewriting (when `[strictness] auto-gather = true`). |
+| **`go`** | Fire-and-forget spawn. Lowers through `typhon_runtime.tasks.spawn` with a strong-ref registry. |
+| **`guard`** | Sugar for early-return-with-narrowing on `T?`. |
+| **`impl`** | Method block attached to a class. Methods take `self` explicitly; merged into the class at desugar. |
+| **`interface`** | Structural contract. Lowers to `class Name(Protocol):`. |
+| **`lazy import`** | Deferred module import via a proxy class. Thread-safe with double-checked locking. |
+| **`lazy let`** | Deferred binding. Module-level → `lazy_val(lambda: ...)`. Class-level → `@cached_property`. |
+| **`let`** | Immutable local binding. Reassignment is `tyc::immutable_assign`. |
+| **`miette`** | The Rust crate Typhon uses for diagnostic rendering. |
+| **`model`** | Class form for Pydantic `BaseModel` emission. Always `extra="forbid"` in v1. |
+| **`mut`** | Mutable local binding. |
+| **`Ok` / `Err`** | The two constructors of `Result[T, E]`. |
+| **PEP 695** | Python's generic-syntax PEP (`def f[T](x: T)`). Typhon's only generic form. |
+| **`@pure`** | Decorator that asserts a function meets the six purity conditions. |
+| **`@memo`** | Decorator that inserts `@functools.cache` (or `@lru_cache(maxsize=N)`). Requires the function to qualify as pure. |
+| **PGO** | Profile-guided optimisation. With `[strictness] pgo-memoise`, hot pure functions get `@functools.cache` from `typhon-profile.json`. |
+| **pipe (`|>`)** | Left-to-right composition. `a |> f(b)` = `f(a, b)`. |
+| **`Result[T, E]`** | Sealed sum type for typed errors. Two constructors: `Ok(T)` and `Err(E)`. |
+| **Salsa** | The incremental computation framework Typhon uses. Same one as `rust-analyzer` and `ty`. |
+| **sealed union** | `type X = A | B | C` — closed set of variants. `match` over it must be exhaustive. |
+| **soft keyword** | A token that's a keyword only in certain positions (e.g. `let` at the start of a statement). Used for `let`, `mut`, `comptime`, `lazy`, `unsafe`, `gather`, `go`, `guard`, `interface`, `impl`, `extend`, `model`, `frozen`, `type`. |
+| **structural conformance** | A type satisfies an interface if it provides the listed members with compatible signatures, without an `implements` clause. |
+| **`tyc`** | The Typhon compiler binary. |
+| **`type`** | Type-alias keyword. `type X = A | B` declares a sealed union. |
+| **`typhon_runtime`** | Generated helper module in `build/`. Emitted only when `Result` / `go` / `lazy let` are used. |
+| **`typhon.toml`** | Project configuration file. |
+| **`unsafe:`** | Lexical region that tolerates `Any`-inferred expressions. Values acquire an `Unsafe[T]` marker that must be re-asserted at the boundary. |
+| **with-chain** | `with name = expr?, ...:` — sequences `Result`-returning calls with an optional `else err:` block. |
+| **`?` (suffix on type)** | Nullable type. `T?` is `T | None`. |
+| **`?` (suffix on expression)** | Result propagation. Unwraps `Ok`; short-circuits `Err` to the enclosing function. |
+
+## See also
+
+- [Five Rules of Typhon](/Typhon/tour/five-rules/) — the most important page.
+- [Grammar Cheat Sheet](/Typhon/reference/grammar/) — every form in one place.
+- [FAQ](/Typhon/project/faq/) — common questions.

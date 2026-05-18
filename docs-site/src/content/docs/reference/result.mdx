@@ -1,0 +1,139 @@
+---
+title: Result, Ok, Err
+description: The typed-error type and its constructors.
+sidebar:
+  order: 7
+---
+
+`Result[T, E]` is a sealed sum with two constructors, `Ok(T)` and `Err(E)`. It is emitted as a tagged dataclass in a generated `typhon_runtime` module — no PyPI dependency.
+
+## Spelling
+
+```python
+def parse(raw: str) -> Result[int, str]:
+    if raw.isdigit():
+        return Ok(int(raw))
+    return Err(f"not a number: {raw}")
+```
+
+`Result[T, E]` is a sealed alias for `Ok[T] | Err[E]`. The two constructors are the only inhabitants.
+
+## Constructors
+
+```python
+Ok(value)               # T inferred from value
+Err(error)              # E inferred from error
+Ok[int](42)             # explicit T
+Err[str]("oops")        # explicit E
+```
+
+`Ok` and `Err` are generic over their payload types.
+
+## Pattern matching
+
+`match` on a `Result` must cover both `Ok` and `Err`:
+
+```python
+match parse("42"):
+    case Ok(n):
+        print(f"got {n}")
+    case Err(msg):
+        print(f"error: {msg}")
+```
+
+The checker enforces exhaustiveness over the two variants.
+
+## The `?` operator
+
+`?` suffix on a `Result`-typed expression unwraps `Ok` and short-circuits `Err`:
+
+```python
+def f() -> Result[int, str]:
+    let n: int = parse("42")?    # short-circuits Err to enclosing return
+    return Ok(n + 1)
+```
+
+See [The ? Operator](/Typhon/reference/question-operator/) for every rule.
+
+## `with`-chains
+
+```python
+def f() -> Result[Report, AppError]:
+    with user   = db.find(id)?,
+         perms  = check(user)?,
+         report = build(user, perms)?:
+        return Ok(report)
+    else err:
+        log.warn(err)
+        return Err(err)
+```
+
+See [`with`-chains](/Typhon/reference/with-chains/).
+
+## What is emitted
+
+A generated `typhon_runtime.py` module is written into the output tree when `Result` is used:
+
+```python
+# build/typhon_runtime.py (excerpt)
+from dataclasses import dataclass
+from typing import Generic, TypeVar
+
+T = TypeVar("T")
+E = TypeVar("E")
+
+@dataclass(slots=True, frozen=True)
+class Ok(Generic[T]):
+    value: T
+
+@dataclass(slots=True, frozen=True)
+class Err(Generic[E]):
+    error: E
+
+Result = Ok[T] | Err[E]
+```
+
+Not a PyPI package. The module lives in your project's `build/` tree and ships with your wheel.
+
+## Common patterns
+
+### Lifting an exception into `Result`
+
+```python
+import json
+
+def load(path: str) -> Result[dict, str]:
+    try:
+        with open(path) as f:
+            return Ok(json.load(f))
+    except FileNotFoundError:
+        return Err(f"not found: {path}")
+    except json.JSONDecodeError as e:
+        return Err(f"invalid JSON: {e}")
+```
+
+### Mapping over `Ok`
+
+```python
+def parse_and_double(raw: str) -> Result[int, str]:
+    let n: int = parse(raw)?
+    return Ok(n * 2)
+```
+
+### Converting an error type
+
+```python
+def f(raw: str) -> Result[int, AppError]:
+    match parse(raw):
+        case Ok(n):
+            return Ok(n)
+        case Err(msg):
+            return Err(AppError(message=msg))
+```
+
+## Where next
+
+- [Error Handling (tour)](/Typhon/tour/error-handling/) — teaching page.
+- [The ? Operator](/Typhon/reference/question-operator/) — every rule.
+- [`with`-chains](/Typhon/reference/with-chains/) — sequencing Results.
+- [Errors as Values](/Typhon/recipes/errors-as-values/) — design pattern.

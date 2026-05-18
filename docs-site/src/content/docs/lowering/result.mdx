@@ -1,0 +1,132 @@
+---
+title: Result → typhon_runtime
+description: How Result, Ok, Err, ?, and with-chains lower to Python.
+sidebar:
+  order: 3
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+## `Result[T, E]`, `Ok`, `Err`
+
+When `Result` is used anywhere in the project, a `typhon_runtime/result.py` (or equivalent) is generated:
+
+```python
+# build/typhon_runtime/result.py
+from dataclasses import dataclass
+from typing import Generic, TypeVar
+
+T = TypeVar("T")
+E = TypeVar("E")
+
+@dataclass(slots=True, frozen=True)
+class Ok(Generic[T]):
+    value: T
+
+@dataclass(slots=True, frozen=True)
+class Err(Generic[E]):
+    error: E
+
+# Result is a type alias:
+# Result[T, E] = Ok[T] | Err[E]
+```
+
+User code imports:
+
+```python
+# Emitted at the top of any module using Result
+from typhon_runtime import Ok, Err
+```
+
+## The `?` operator
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    def f() -> Result[int, str]:
+        let n: int = parse(raw)?
+        return Ok(n + 1)
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    def f() -> Ok[int] | Err[str]:
+        _tmp_0 = parse(raw)
+        if isinstance(_tmp_0, Err):
+            return _tmp_0
+        n: int = _tmp_0.value
+        return Ok(n + 1)
+    ```
+  </TabItem>
+</Tabs>
+
+- A fresh `_tmp_N` is generated per `?` site.
+- The check uses `isinstance(_tmp_N, Err)`.
+- On `Err`, the whole expression is returned (carrying the original `Err` value forward).
+- On `Ok`, the value is unwrapped and bound.
+
+No `try`/`except`. Stack traces stay clean.
+
+## `with`-chains
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    def f() -> Result[Report, AppError]:
+        with user   = db.find(id)?,
+             perms  = check(user)?,
+             report = build(user, perms)?:
+            return Ok(report)
+        else err:
+            log.warn(err)
+            return Err(err)
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    def f() -> Ok[Report] | Err[AppError]:
+        _tmp_0 = db.find(id)
+        if isinstance(_tmp_0, Err):
+            err = _tmp_0.error
+            log.warn(err)
+            return Err(err)
+        user = _tmp_0.value
+
+        _tmp_1 = check(user)
+        if isinstance(_tmp_1, Err):
+            err = _tmp_1.error
+            log.warn(err)
+            return Err(err)
+        perms = _tmp_1.value
+
+        _tmp_2 = build(user, perms)
+        if isinstance(_tmp_2, Err):
+            err = _tmp_2.error
+            log.warn(err)
+            return Err(err)
+        report = _tmp_2.value
+
+        return Ok(report)
+    ```
+  </TabItem>
+</Tabs>
+
+Each step's error path runs the same `else err:` block (the unwrapped `error` is bound to `err`).
+
+Without an `else err:`, the lowering omits the block and uses bare `return _tmp_N` short-circuits.
+
+## Why a separate runtime module?
+
+Two reasons:
+
+1. **The dataclasses need a single canonical definition.** Generating them inline per-module would explode the output tree.
+2. **`isinstance` needs to compare against a single class.** Each module's `Ok` / `Err` must be the same class for `isinstance` checks to work — a shared `typhon_runtime.result` ensures that.
+
+The module is small (~50 lines), generated, and lives in your `build/` tree alongside your code. There is no PyPI install required.
+
+## Where next
+
+- [`Result, Ok, Err` reference](/Typhon/reference/result/) — the type and its constructors.
+- [The ? Operator reference](/Typhon/reference/question-operator/) — every rule.
+- [`with`-chains reference](/Typhon/reference/with-chains/) — chained Results.
+- [The typhon_runtime module](/Typhon/lowering/runtime/) — what's in the helper module.

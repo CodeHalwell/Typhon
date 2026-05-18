@@ -1,0 +1,79 @@
+---
+title: tyc stubtest
+description: Runtime probe via mypy --stubtest against emitted .pyi.
+sidebar:
+  order: 14
+---
+
+```
+tyc stubtest [--out DIR] [--no-build] [--python BIN] [--keep-going] [-- STUBTEST_FLAGS...]
+```
+
+Builds the project and runs `python -m mypy.stubtest` against every emitted `.pyi`. Complements [`tyc check --stubs`](/Typhon/cli/check/) (AST diff) by catching dynamically-created attributes that the AST cannot see — `__init_subclass__` injection, metaclass-driven member registration, Pydantic auto-generated fields.
+
+Requires `mypy` to be installed in the chosen interpreter:
+
+```bash
+pip install mypy
+# or
+uv tool install mypy
+```
+
+## Examples
+
+```bash
+tyc stubtest                              # build into a temp dir and probe every stub
+tyc stubtest --out build/                 # keep build output for inspection
+tyc stubtest --out build/ --no-build      # reuse an existing build
+tyc stubtest --python .venv/bin/python    # specific virtualenv
+tyc stubtest --keep-going                 # continue past the first failure
+tyc stubtest -- --allowlist allow.txt     # forward to mypy.stubtest
+```
+
+## What it catches
+
+- Names present at runtime but missing in the stub (dynamic attributes).
+- Names in the stub but missing at runtime (drift).
+- Constructor arity / signature mismatches the AST diff couldn't see.
+
+Pair with [`tyc check --stubs`](/Typhon/cli/check/) for full coverage:
+
+| Tool | Catches |
+|------|---------|
+| `tyc check --stubs` | Static AST-level drift between `.dty` and the sibling `.ty` / `.py`. |
+| `tyc stubtest` | Runtime introspection — dynamically-created attributes, metaclass magic, Pydantic auto-fields. |
+
+Both are useful; neither subsumes the other.
+
+## Flags
+
+| Flag | Effect |
+|------|--------|
+| `--out DIR` | Write emitted Python here instead of a temp dir. |
+| `--no-build` | Skip the build step; requires `--out`. |
+| `--python BIN` | Python interpreter (default: `python3`). |
+| `--keep-going` | Probe every module even after one reports drift. |
+
+Anything after `--` is forwarded to `python -m mypy.stubtest` verbatim.
+
+## If `mypy` is missing
+
+The command surfaces a clear error pointing at the install command rather than failing opaquely inside the subprocess.
+
+## CI integration
+
+```yaml
+- name: Stub drift (AST)
+  run: tyc check --stubs
+
+- name: Stub drift (runtime)
+  run: tyc stubtest -- --allowlist stubtest-allow.txt
+```
+
+The runtime probe is slower (it imports the module), so consider running it nightly rather than on every PR.
+
+## Where next
+
+- [`tyc check --stubs`](/Typhon/cli/check/) — the AST-level diff.
+- [Writing .dty Stubs](/Typhon/interop/dty-stubs/) — what stubs look like.
+- [Stub Drift](/Typhon/interop/stub-drift/) — patterns for keeping stubs in sync.

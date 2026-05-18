@@ -1,0 +1,126 @@
+---
+title: Type & Inference Errors
+description: Diagnostics related to type checking and inference.
+sidebar:
+  order: 2
+---
+
+Diagnostics in the `tyc::*` namespace related to type checking and inference.
+
+## `tyc::missing_return_type`
+
+The function has no `-> T` annotation.
+
+```python
+def add(a: int, b: int):    # ❌
+    return a + b
+```
+
+**Fix:** add the return type. Use `-> None` for void.
+
+```python
+def add(a: int, b: int) -> int:
+    return a + b
+```
+
+## `tyc::missing_param_type`
+
+A parameter has no annotation.
+
+```python
+def add(a, b: int) -> int: ...    # ❌
+```
+
+**Fix:** annotate every parameter.
+
+## `tyc::implicit_any`
+
+The RHS infers to `Any` outside an `unsafe:` block.
+
+```python
+import messy
+let data = messy.fetch()    # ❌
+```
+
+**Fix:**
+
+1. Annotate explicitly: `let data: dict[str, int] = ...`
+2. Wrap in `unsafe:` block.
+3. Write a [`.dty` stub](/Typhon/interop/dty-stubs/) for the library.
+
+## `tyc::type_mismatch`
+
+A value's type doesn't match what's expected.
+
+```python
+let x: int = "hello"    # ❌
+```
+
+**Fix:** change the value, the annotation, or convert explicitly (`int("...")`).
+
+## `tyc::wrong_arg_count`
+
+Call site has too few or too many arguments.
+
+```python
+def add(a: int, b: int) -> int: ...
+add(1)          # ❌ missing b
+add(1, 2, 3)    # ❌ extra arg
+```
+
+**Fix:** match the signature.
+
+## `tyc::not_callable`
+
+Trying to call something that isn't a function.
+
+```python
+let x: int = 42
+x()    # ❌
+```
+
+**Fix:** call the right thing.
+
+## `tyc::unknown_name`
+
+A name isn't in scope.
+
+```python
+def f() -> None:
+    print(undefined_name)    # ❌
+```
+
+**Fix:** define or import the name. Check for typos.
+
+## `tyc::missing_return`
+
+A function may exit without returning a value of the declared type.
+
+```python
+def f(c: bool) -> int:
+    if c:
+        return 1
+    # ❌ falls through without returning
+```
+
+**Fix:** add a `return` on the missing path, or make the type nullable (`-> int?`).
+
+## `tyc::generic_unconstrained`
+
+A generic call cannot infer `T`.
+
+```python
+let xs = first([])    # ❌ T unconstrained
+```
+
+**Fix:** annotate the call: `first[int]([])` or annotate the target: `let xs: int? = first([])`.
+
+## Suppressed inside `unsafe:`
+
+Most of these (except `missing_return_type`, `missing_param_type`, `unknown_name`) are suppressed inside an `unsafe:` block. See [The Unsafe Boundary](/Typhon/types/unsafe/).
+
+## Where next
+
+- [Binding Errors](/Typhon/diagnostics/binding-errors/) — `missing_binding_kind`, `immutable_assign`.
+- [Nullability Errors](/Typhon/diagnostics/nullability/) — `nullable_use`.
+- [Reading Diagnostics](/Typhon/diagnostics/reading/) — the format.

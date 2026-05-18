@@ -1,0 +1,158 @@
+---
+title: The ? Operator
+description: "? unwraps Ok and short-circuits Err to the enclosing function's return."
+sidebar:
+  order: 8
+---
+
+The `?` suffix is sugar for "unwrap the `Ok` or short-circuit the `Err` to the enclosing function." It is the only way to propagate `Result` errors compactly.
+
+## Syntax
+
+```python
+EXPR?
+```
+
+Where `EXPR` has type `Result[T, E]` for some `T` and `E`. The result of `EXPR?` is `T`.
+
+```python
+let n: int = parse_port(raw)?
+```
+
+## Where `?` is allowed
+
+`?` is only allowed in two places:
+
+1. **Inside a function whose return type is a compatible `Result[U, E']`.** The `E` of the unwrapped expression must be assignable to `E'`.
+
+2. **Inside a `with`-chain binding** (which itself is inside a Result-returning function).
+
+```python
+def f() -> Result[int, str]:
+    let n: int = parse_port("8080")?    # ✅ enclosing returns Result[int, str]
+    return Ok(n)
+
+def g() -> int:
+    let n: int = parse_port("8080")?    # ❌ enclosing returns int, not Result
+    return n
+```
+
+```
+error[tyc::invalid_question_op]: `?` can only short-circuit inside a function
+                                 returning a compatible `Result`
+```
+
+## Error type compatibility
+
+The `E` of `?`-applied expression must be assignable to the enclosing function's `Result[_, E']`:
+
+```python
+def parse() -> Result[int, str]: ...
+
+def f() -> Result[int, str]:
+    let n: int = parse()?            # ✅ E (str) matches enclosing E (str)
+    return Ok(n)
+
+def g() -> Result[int, AppError]:
+    let n: int = parse()?            # ❌ E mismatch — str not assignable to AppError
+    return Ok(n)
+```
+
+```
+error[tyc::result_error_mismatch]: `?` returns Err(str), but the enclosing function
+                                   returns Result[int, AppError]
+```
+
+To bridge incompatible error types, convert explicitly with `match`:
+
+```python
+def g() -> Result[int, AppError]:
+    match parse():
+        case Ok(n):
+            return Ok(n)
+        case Err(msg):
+            return Err(AppError(message=msg))
+```
+
+## How `?` desugars
+
+`?` does **not** lower to `try/except`. It's a plain inline check:
+
+```python
+# Typhon
+let n: int = parse(raw)?
+
+# Emitted Python
+_tmp_0 = parse(raw)
+if isinstance(_tmp_0, Err):
+    return _tmp_0
+n: int = _tmp_0.value
+```
+
+No hidden exception flow. Every short-circuit is visible in the emitted source. Stack traces remain meaningful.
+
+The temporary `_tmp_N` names are reserved by the desugarer and won't collide with user names.
+
+## In expression position
+
+`?` can appear inside any expression that participates in a `Result`-returning function:
+
+```python
+def total(xs: list[str]) -> Result[int, str]:
+    mut sum: int = 0
+    for raw in xs:
+        sum = sum + parse(raw)?       # ✅ inline use
+    return Ok(sum)
+```
+
+The check happens at each evaluation; on `Err`, the function returns immediately.
+
+## In `with`-chain bindings
+
+`with` requires `?` on each binding:
+
+```python
+with user   = db.find(id)?,
+     perms  = check(user)?,
+     report = build(user, perms)?:
+    return Ok(report)
+else err:
+    log.warn(err)
+    return Err(err)
+```
+
+The `?` is what distinguishes a chained Result-unwrap from a regular `with` statement (context manager). See [`with`-chains](/Typhon/reference/with-chains/).
+
+## Common mistakes
+
+### Using `?` outside a `Result` function
+
+```python
+def main() -> None:
+    let n: int = parse("42")?    # ❌ main returns None
+```
+
+Fix: change the signature, or `match` explicitly.
+
+### Mismatched error types
+
+```python
+def f() -> Result[int, AppError]:
+    let n: int = parse_str()?    # ❌ if parse_str returns Result[int, str]
+```
+
+Fix: convert at the boundary (see above).
+
+### Using `?` on a non-`Result` value
+
+```python
+let n: int = (1 + 2)?    # ❌ ? requires a Result-typed expression
+```
+
+Fix: don't.
+
+## Where next
+
+- [`Result, Ok, Err`](/Typhon/reference/result/) — the type and its constructors.
+- [`with`-chains](/Typhon/reference/with-chains/) — sequencing multiple `?`-propagations.
+- [Error Handling (tour)](/Typhon/tour/error-handling/) — teaching page.

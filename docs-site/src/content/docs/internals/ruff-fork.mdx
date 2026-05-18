@@ -1,0 +1,67 @@
+---
+title: The Vendored Ruff Fork
+description: What's under tyc/vendor/ and why.
+sidebar:
+  order: 5
+---
+
+`tyc/vendor/` contains a fork of five Ruff crates. They are workspace members; consumer crates depend on them as ordinary path dependencies.
+
+## What's vendored
+
+```
+tyc/vendor/
+├── ruff_text_size/         TextSize / TextRange newtypes
+├── ruff_source_file/       Line index over a source string
+├── ruff_python_trivia/     Whitespace / comment helpers
+├── ruff_python_ast/        Python AST + Typhon's Mutability extension
+└── ruff_python_parser/     Lexer + parser + let/mut soft keywords
+```
+
+## Why a fork
+
+Ruff's parser is the fastest, most spec-compliant Python parser in Rust. It is *not* published to crates.io — only the Ruff binary is shipped to PyPI. So to use the parser we either had to:
+
+1. Depend on Ruff via a git dep (fragile across upstream changes).
+2. Vendor the source we need.
+
+Vendoring won. The deltas against upstream are tiny:
+
+- `Mutability` enum and an extra field on assignment AST nodes (`ruff_python_ast`).
+- `let` and `mut` soft-keyword support in the lexer / parser (`ruff_python_parser`).
+
+The rest is upstream Ruff verbatim.
+
+## Tracking upstream
+
+`tyc/vendor/UPSTREAM` records the upstream SHA we vendored. Sync work:
+
+1. Check the upstream Ruff repo for relevant changes.
+2. Cherry-pick into vendor branches.
+3. Update `tyc/vendor/UPSTREAM`.
+4. Run `cargo test --workspace` to verify.
+
+In practice this is monthly; the parser is stable.
+
+## Why not vendor `ruff_python_codegen`?
+
+The Phase-0 plan called for it. We ended up writing a hand-rolled printer in `tyc-emit` because:
+
+- Upstream codegen doesn't expose the per-statement line-offset hook needed for `.py.map` v2.
+- The Typhon-specific lowerings (`Result?`, `gather:`, `go`, `lazy`) needed custom emission anyway.
+
+Vendoring `ruff_python_codegen` remains an open follow-up — see `tyc/vendor/README.md` in the repo.
+
+## Why not `rustpython-parser` (on crates.io)?
+
+It lags Ruff on Python-version coverage and is slower. It's the fallback if Ruff's parser ever stops being usable.
+
+## When upstream renames things
+
+Every Ruff API call in `tyc` sits behind a one-function-wide module of our own (in `tyc-syntax`). When upstream renames a node, the change is localised.
+
+## Where next
+
+- [Architecture](/Typhon/internals/architecture/) — the bigger picture.
+- [Workspace Layout](/Typhon/internals/workspace/) — every crate.
+- [Ruff upstream repo](https://github.com/astral-sh/ruff) — for upstream API reference.

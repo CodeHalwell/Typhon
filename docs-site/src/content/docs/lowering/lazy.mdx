@@ -1,0 +1,167 @@
+---
+title: lazy → proxies
+description: How lazy import, lazy let, and lazy[T] lower to Python.
+sidebar:
+  order: 6
+---
+
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
+## `lazy import` → proxy class
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    lazy import np = numpy
+
+    def main() -> None:
+        if len(sys.argv) > 1:
+            let arr: np.ndarray = np.array([1, 2, 3])
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    import threading
+
+    class __TyphonLazy_np_:
+        _module = None
+        _lock = threading.Lock()
+
+        @classmethod
+        def _load(cls):
+            if cls._module is None:
+                with cls._lock:
+                    if cls._module is None:
+                        import numpy
+                        cls._module = numpy
+            return cls._module
+
+        def __getattr__(self, name):
+            return getattr(self._load(), name)
+
+    np = __TyphonLazy_np_()
+
+    def main() -> None:
+        if len(sys.argv) > 1:
+            arr: np.ndarray = np.array([1, 2, 3])
+    ```
+  </TabItem>
+</Tabs>
+
+Thread-safe (double-checked locking), one-shot. No `typhon_runtime` dependency — the proxy is inlined.
+
+## `lazy let` (module-level) → `lazy_val`
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    lazy let CONFIG: Config = load_config_from_disk()
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    from typhon_runtime import lazy_val
+
+    CONFIG = lazy_val(lambda: load_config_from_disk())
+    ```
+  </TabItem>
+</Tabs>
+
+The runtime helper:
+
+```python
+# build/typhon_runtime/lazy.py
+import threading
+
+_SENTINEL = object()
+
+class lazy_val:
+    __slots__ = ("_factory", "_value", "_lock")
+
+    def __init__(self, factory):
+        self._factory = factory
+        self._value = _SENTINEL
+        self._lock = threading.Lock()
+
+    def __call__(self):
+        if self._value is _SENTINEL:
+            with self._lock:
+                if self._value is _SENTINEL:
+                    self._value = self._factory()
+        return self._value
+```
+
+Access with `CONFIG()` (callable). Subsequent calls are a memory read.
+
+Why not `functools.cached_property`? Because `cached_property` is instance-scoped, writable after first evaluation, and not robust under concurrency. `lazy_val` is the module-level equivalent that gets all three right.
+
+## `lazy let` (class-level) → `@cached_property`
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    class Server:
+        config_path: str
+
+    impl Server:
+        lazy let parsed_config: Config:
+            return load_config(self.config_path)
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    from functools import cached_property
+    from dataclasses import dataclass
+
+    @dataclass(slots=True)
+    class Server:
+        config_path: str
+
+        @cached_property
+        def parsed_config(self) -> Config:
+            return load_config(self.config_path)
+    ```
+  </TabItem>
+</Tabs>
+
+Per-instance caching is the intended semantics inside classes; `cached_property` is the right primitive.
+
+## `lazy[T]` return type → generator
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    def primes_up_to(n: int) -> lazy[list[int]]:
+        let sieve: list[bool] = [True] * (n + 1)
+        # ... compute ...
+        return [i for i in range(2, n + 1) if sieve[i]]
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    from collections.abc import Iterator
+
+    def primes_up_to(n: int) -> Iterator[int]:
+        sieve: list[bool] = [True] * (n + 1)
+        # ... compute ...
+        for i in range(2, n + 1):
+            if sieve[i]:
+                yield i
+    ```
+  </TabItem>
+</Tabs>
+
+`return [...]` rewrites to a generator emission. Useful when the caller may only need a prefix.
+
+## `lazy from` is rejected
+
+```python
+lazy from numpy import array     # ❌ tyc::lazy_from_import
+```
+
+PEP 690's analysis: `from`-imports eagerly resolve attributes, defeating deferral. The diagnostic redirects you to `lazy import numpy`.
+
+## Where next
+
+- [`lazy` reference](/Typhon/reference/lazy/) — the full surface.
+- [The typhon_runtime module](/Typhon/lowering/runtime/) — `lazy_val` details.

@@ -1,0 +1,100 @@
+---
+title: interface
+description: Structural contracts lowered to typing.Protocol.
+sidebar:
+  order: 6
+---
+
+`interface Name:` declares a structural contract. Lowered to `class Name(Protocol):` from `typing`.
+
+```python
+interface Drawable:
+    def draw(self) -> None
+    def width(self) -> float
+    def height(self) -> float
+```
+
+## Members
+
+An interface may declare:
+
+- **Method signatures**: `def name(self, ...) -> R` (no body — `...` is implicit).
+- **Field signatures**: `name: T`.
+
+```python
+interface Stored:
+    id: int
+    def serialise(self) -> dict[str, str]
+```
+
+## Structural conformance
+
+A class satisfies an interface if it provides every required member with compatible signatures. No `implements` clause:
+
+```python
+class Button:
+    label: str
+
+impl Button:
+    def draw(self) -> None: ...
+    def width(self) -> float: return 10.0
+    def height(self) -> float: return 1.0
+
+def render(d: Drawable) -> None: ...
+render(Button(label="x"))    # ✅ structurally matches
+```
+
+The checker verifies at the call / assignment site.
+
+## `isinstance` is rejected by default
+
+```python
+isinstance(x, Drawable)    # ❌ tyc::interface_isinstance
+```
+
+Use static narrowing or refactor to a sealed union. See [Interfaces (Protocols)](/Typhon/types/interfaces/) for the full reasoning.
+
+## Generic interfaces
+
+```python
+interface Container[T]:
+    def add(self, item: T) -> None
+    def items(self) -> list[T]
+```
+
+Bound at the use site:
+
+```python
+def consume[T](c: Container[T]) -> int:
+    return len(c.items())
+```
+
+## Bounded type parameters
+
+Interfaces are valid as bounds for generic type parameters:
+
+```python
+def smallest[T: Ordered](xs: list[T]) -> T?: ...
+```
+
+(Bounded inference is partial in v1; verify with `tyc check`.)
+
+## Emit
+
+```python
+# Typhon
+interface Drawable:
+    def draw(self) -> None
+
+# Emitted
+from typing import Protocol
+
+class Drawable(Protocol):
+    def draw(self) -> None: ...
+```
+
+## Where next
+
+- [Interfaces (Protocols)](/Typhon/types/interfaces/) — the type system reference.
+- [Sealed Unions](/Typhon/types/sealed-unions/) — the closed-set alternative.
+- [Generics](/Typhon/types/generics/) — bounded type parameters.

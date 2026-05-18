@@ -1,0 +1,59 @@
+---
+title: Binding Errors
+description: Diagnostics around let / mut and binding kinds.
+sidebar:
+  order: 3
+---
+
+## `tyc::missing_binding_kind`
+
+A local binding has no `let` or `mut`:
+
+```python
+def f() -> None:
+    name = "Alice"    # ❌
+```
+
+**Fix:** add `let` (immutable, default) or `mut` (mutable).
+
+```python
+def f() -> None:
+    let name: str = "Alice"
+```
+
+Module-level bindings default to `let`; only locals require the keyword.
+
+## `tyc::immutable_assign`
+
+Reassigning a `let` binding:
+
+```python
+def f() -> None:
+    let x: int = 1
+    x = 2    # ❌
+```
+
+**Fix:** declare `mut` instead, or shadow with a new `let`:
+
+```python
+def f() -> None:
+    mut x: int = 1
+    x = 2
+```
+
+Or:
+
+```python
+def f() -> None:
+    let x: int = 1
+    let x: int = 2   # shadows
+```
+
+## `tyc::shadowing_in_same_scope` (warning)
+
+(Future-reserved diagnostic for confusing shadowing patterns.)
+
+## Where next
+
+- [`let` and `mut` reference](/Typhon/reference/let-mut/) — the keyword spec.
+- [Values and Bindings (tour)](/Typhon/tour/values-bindings/) — teaching page.

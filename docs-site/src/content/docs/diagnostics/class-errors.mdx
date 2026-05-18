@@ -1,0 +1,85 @@
+---
+title: Class Errors
+description: Diagnostics around class, model, impl, extend, frozen.
+sidebar:
+  order: 5
+---
+
+## `tyc::manual_init`
+
+Writing `__init__` inside `class` / `model`:
+
+```python
+class User:
+    id: int
+
+    def __init__(self, id: int) -> None:    # ❌
+        self.id = id
+```
+
+**Fix:** drop the method. The constructor is generated. Use field defaults, or a free function for "convenience constructors". For framework bases that need `__init__`, use `class!`.
+
+## `tyc::frozen_assign`
+
+Writing a field on a `frozen` class:
+
+```python
+class P frozen:
+    x: float
+
+let p = P(x=1.0)
+p.x = 2.0    # ❌
+```
+
+**Fix:** construct a new instance.
+
+```python
+let q = P(x=2.0)
+```
+
+## `tyc::missing_self`
+
+A method in `impl` / `extend` is missing the `self` parameter:
+
+```python
+impl User:
+    def display() -> str:    # ❌
+        ...
+```
+
+**Fix:** add `self`.
+
+```python
+impl User:
+    def display(self) -> str:
+        return f"...{self.name}..."
+```
+
+## `tyc::method_in_class_body`
+
+A `def` appearing in a `class` body (instead of an `impl` block):
+
+```python
+class User:
+    id: int
+
+    def display(self) -> str:    # ❌ wrong place
+        return f"user {self.id}"
+```
+
+**Fix:** move into an `impl User:` block.
+
+```python
+class User:
+    id: int
+
+impl User:
+    def display(self) -> str:
+        return f"user {self.id}"
+```
+
+## Where next
+
+- [Classes and Models (tour)](/Typhon/tour/classes/) — teaching page.
+- [`class`, `model`, `class!` reference](/Typhon/reference/classes/) — declaration forms.
+- [`impl` and `extend` reference](/Typhon/reference/impl-extend/) — method attachment.

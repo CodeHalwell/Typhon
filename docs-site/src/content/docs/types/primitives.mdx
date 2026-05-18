@@ -1,0 +1,159 @@
+---
+title: Primitives
+description: int, float, bool, str, bytes, and None — Python's primitives with stricter type rules.
+sidebar:
+  order: 2
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+The same primitives as Python, with three stricter rules: `int` and `float` don't auto-coerce (only widen), `bool` is not a subtype of `int` for the checker, and `None` cannot inhabit a plain `T` (only a `T?`).
+
+## The primitive types
+
+| Type | Literals | Notes |
+|------|----------|-------|
+| `int` | `0`, `42`, `-1`, `0x10`, `0o17`, `0b101`, `1_000_000` | Arbitrary precision. |
+| `float` | `0.0`, `3.14`, `1e6`, `inf`, `nan` | 64-bit IEEE 754. |
+| `bool` | `True`, `False` | Not assignable to / from `int` without `int()` / `bool()`. |
+| `str` | `"hi"`, `'hi'`, `"""hi"""`, `f"hi {x}"` | UTF-8 strings, identical to Python. |
+| `bytes` | `b"hi"`, `b'\x00\x01'` | Immutable byte sequences. |
+| `None` | `None` | Inhabits the unit type. Only valid in `T?` or as the return of `-> None`. |
+
+## Widening rules
+
+`int` widens to `float`:
+
+```python
+let x: float = 3      # ✅ int → float
+let y: int = 3.0      # ❌ type_mismatch: expected int, found float
+```
+
+`bool` does not widen to `int`:
+
+```python
+let n: int = True     # ❌ type_mismatch: expected int, found bool
+let n: int = int(True)  # ✅
+let n: int = 1 if flag else 0  # ✅
+```
+
+This catches the common Python bug where a boolean accidentally ends up in numeric arithmetic — `True + True` is `2` in Python, but the type system insists on an explicit cast.
+
+## String literals
+
+All Python string forms are accepted:
+
+```python
+let single: str = 'hello'
+let double: str = "hello"
+let multi: str = """multi
+line"""
+let raw: str = r"\n is literal"
+let f_str: str = f"name = {name}, age = {age}"
+let bytes: bytes = b"binary"
+```
+
+f-strings (PEP 701) inherit Python's grammar: nested expressions, format specifiers, conversion modifiers (`!r`, `!s`, `!a`), and `=` for self-documenting (`f"{x=}"`) all work.
+
+## `None` and the unit type
+
+`None` is the sole inhabitant of the unit type. Use it for "no value" in nullable parameters / returns, and as the return type of functions that don't return anything:
+
+```python
+def log(msg: str) -> None:
+    print(msg)
+
+def find(id: int) -> str?:
+    return None      # ✅ allowed because the return is T?
+```
+
+Without the `?`, `None` cannot flow into the return:
+
+```python
+def find(id: int) -> str:
+    return None      # ❌ None not assignable to str
+```
+
+## Conversion and casts
+
+Standard Python casts work — they're function calls, not language constructs:
+
+```python
+let n: int   = int("42")       # may raise ValueError at runtime
+let x: float = float("3.14")
+let s: str   = str(42)
+let b: bytes = bytes("hi", "utf-8")
+```
+
+For runtime parsing where the input might be invalid, wrap in `Result`:
+
+```python
+def parse_int(raw: str) -> Result[int, str]:
+    try:
+        return Ok(int(raw))
+    except ValueError:
+        return Err(f"not a number: {raw}")
+```
+
+## Common operations
+
+### Arithmetic
+
+```python
+let a: int = 5 + 3        # 8
+let b: float = 5 / 3      # 1.666... (true division, always float)
+let c: int = 5 // 3       # 1 (floor division)
+let d: int = 5 % 3        # 2
+let e: int = 2 ** 10      # 1024
+let f: int = abs(-7)      # 7
+```
+
+`/` always returns `float`; `//` returns `int` (or `float` if either operand is `float`). The checker tracks the result type.
+
+### String operations
+
+```python
+let s: str = "Hello"
+let lower: str = s.lower()
+let parts: list[str] = s.split(",")
+let n: int = len(s)
+let exists: bool = "Hello" in s
+let joined: str = ", ".join(["a", "b", "c"])
+let rep: str = "abc" * 3
+```
+
+All Python `str` methods are available with their normal signatures. Some return `T?` (e.g. `str.find` returns `int` — but `int = -1` on miss, not `None`; spell it explicitly with `str.index` if you'd rather have an exception).
+
+## Common mistakes
+
+### Treating `bool` as `int`
+
+```python
+let total: int = True + False    # ❌
+```
+
+Fix: `let total: int = int(True) + int(False)`.
+
+### Truncating `float` to `int` implicitly
+
+```python
+let n: int = 3.7    # ❌
+let n: int = int(3.7)  # ✅ → 3
+```
+
+### Returning `None` from a `T` function
+
+```python
+def find(id: int) -> str:
+    if id == 0:
+        return None    # ❌
+    return "value"
+```
+
+Fix the annotation to `-> str?`, or always return a real `str`.
+
+## Where next
+
+- [Collections](/Typhon/types/collections/) — `list`, `dict`, `set`, `tuple` with mandatory element types.
+- [Nullable Types](/Typhon/types/nullable/) — `T?` and every narrowing form.
+- [Flow Narrowing](/Typhon/types/narrowing/) — exactly what the checker tracks.

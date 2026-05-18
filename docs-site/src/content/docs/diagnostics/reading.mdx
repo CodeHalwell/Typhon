@@ -1,0 +1,103 @@
+---
+title: Reading Diagnostics
+description: How Typhon's miette-rendered diagnostics are structured, and how to interpret each part.
+sidebar:
+  order: 1
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+Typhon's diagnostics are rendered through [miette](https://github.com/zkat/miette) — the same library used by oxc, `ty`, Pyrefly. Every diagnostic has a stable code, a severity, a source span, and a help message. This page explains the format; subsequent pages enumerate each diagnostic group.
+
+## Anatomy of a diagnostic
+
+```
+error[tyc::nullable_use]: cannot pass `str | None` where `str` is required
+ ┌─ src/main.ty:9:11
+ │
+9 │     greet(found)
+ │           ^^^^^ check this is not `None` before passing it
+ │
+ = help: narrow with `if found is not None:` or use `guard found = ... else: ...`
+```
+
+| Part | Meaning |
+|------|---------|
+| `error` | Severity. One of `error`, `warning`, `note`. |
+| `[tyc::nullable_use]` | Stable code. Every diagnostic has one; search by it. |
+| `cannot pass ...` | Human message describing the problem. |
+| `┌─ src/main.ty:9:11` | Primary source span: file, line, column. |
+| `^^^^^` underline | The exact substring at fault. |
+| `= help: ...` | Suggested fix. |
+
+## Severity
+
+| Severity | Exit code impact | Typical cause |
+|----------|------------------|---------------|
+| `error` | Sets exit to 2. | Type mismatch, missing return, broken syntax. |
+| `warning` | No exit code change. | Unused import (with `unused-import = "warn"`), `async def` with no `await`. |
+| `note` | No exit code change. | Informational; rare. |
+
+`[strictness]` in `typhon.toml` controls some severities — e.g. `unused-import = "error"` promotes the warning to an error.
+
+## Stable codes
+
+Every diagnostic has a `tyc::*` code. The catalog is enumerated across the following pages, grouped by what triggers them:
+
+<CardGrid>
+  <Card title="Type & Inference Errors" icon="warning">
+    [→](/Typhon/diagnostics/type-errors/) — `type_mismatch`, `implicit_any`, `not_callable`, `wrong_arg_count`, ...
+  </Card>
+  <Card title="Binding Errors" icon="document">
+    [→](/Typhon/diagnostics/binding-errors/) — `missing_binding_kind`, `immutable_assign`, ...
+  </Card>
+  <Card title="Nullability Errors" icon="puzzle">
+    [→](/Typhon/diagnostics/nullability/) — `nullable_use`, ...
+  </Card>
+  <Card title="Class Errors" icon="setting">
+    [→](/Typhon/diagnostics/class-errors/) — `manual_init`, `frozen_assign`, `missing_self`, ...
+  </Card>
+  <Card title="Result Errors" icon="approve-check">
+    [→](/Typhon/diagnostics/result-errors/) — `invalid_question_op`, `result_error_mismatch`, ...
+  </Card>
+  <Card title="Match Errors" icon="puzzle">
+    [→](/Typhon/diagnostics/match-errors/) — `non_exhaustive_match`, ...
+  </Card>
+  <Card title="Async Errors" icon="rocket">
+    [→](/Typhon/diagnostics/async-errors/) — `missing_await`, `async_without_await`, ...
+  </Card>
+  <Card title="Purity Errors" icon="forward-slash">
+    [→](/Typhon/diagnostics/purity-errors/) — `impure_pure_fn`, ...
+  </Card>
+  <Card title="Stub Errors" icon="open-book">
+    [→](/Typhon/diagnostics/stub-errors/) — `stub_mismatch`, ...
+  </Card>
+</CardGrid>
+
+## Filtering / formatting
+
+| Flag | Effect |
+|------|--------|
+| `--color {auto,always,never}` | ANSI colour control. |
+| `--quiet` | Suppress diagnostics whose severity is below `error`. |
+| `--verbose` | Add extra context (typically the source span of the related code). |
+
+The LSP publishes diagnostics directly to your editor; the editor renders them.
+
+## Searching for a code
+
+When you hit `error[tyc::some_code]`:
+
+1. **Look up the page** — the catalog groups codes by what triggers them.
+2. **`rg "tyc::some_code" tyc/crates`** in the compiler source if you're hacking on `tyc` — every code is registered once.
+3. **`tyc lsp` "Remove unused import" code action** fires on the relevant diagnostics; check your editor's quick-fix menu.
+
+## What if the diagnostic is wrong?
+
+Most diagnostics are unambiguous. If you think one is mis-firing:
+
+1. Reduce the case to a minimal `.ty` file.
+2. Confirm `tyc check` reproduces.
+3. File an issue at [github.com/CodeHalwell/Typhon/issues](https://github.com/CodeHalwell/Typhon/issues) with the minimal repro and the diagnostic output.
+
+Don't disable strictness flags as a workaround — file the bug instead.

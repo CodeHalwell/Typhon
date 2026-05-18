@@ -1,0 +1,103 @@
+---
+title: tyc trace
+description: Map a Python traceback back to .ty source via .py.map.
+sidebar:
+  order: 10
+---
+
+```
+tyc trace TRACEBACK_FILE [--map-dir DIR]
+```
+
+Reads a Python traceback file, locates the matching `.py.map` v2 source maps, and rewrites `File "build/main.py", line N` frames to `File "src/main.ty", line M`.
+
+## Examples
+
+```bash
+python build/main.py 2>err.log
+tyc trace err.log
+
+# Or pipe directly:
+python build/main.py 2>&1 | tyc trace -
+```
+
+## What it does
+
+1. Parse the traceback text (standard Python traceback shape).
+2. For each frame referring to a `build/*.py`, find the matching `.py.map` v2.
+3. Look up the `out_line → ty_line` mapping for the frame's line number.
+4. Rewrite the frame to point at `src/*.ty` line M.
+5. Print the remapped traceback.
+
+The output looks like a normal Python traceback, but the frames are `.ty` paths and line numbers.
+
+## When to use
+
+- After a production crash, on the captured `stderr`.
+- During development, to make pdb frames legible.
+- In CI logs, to show team members the `.ty` source rather than the emitted `.py`.
+
+## Flags
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `--map-dir DIR` | `build/` | Where to look for `.py.map` files. |
+| `--no-color` | off | Disable ANSI colour. |
+
+## Limitations
+
+- Works per-statement (the `.py.map` v2 granularity). Column-level remapping is a future enhancement.
+- Only remaps frames whose Python file is under the configured `build/` dir. External frames (stdlib, third-party packages) are left alone.
+
+## A worked example
+
+A program that raises:
+
+```python
+# src/main.ty
+def divide(a: int, b: int) -> int:
+    return a // b
+
+def main() -> None:
+    print(divide(10, 0))      # line 5
+
+if __name__ == "__main__":
+    main()
+```
+
+Run and capture:
+
+```bash
+python build/main.py 2>err.log
+```
+
+`err.log`:
+
+```
+Traceback (most recent call last):
+  File "build/main.py", line 7, in <module>
+    main()
+  File "build/main.py", line 5, in main
+    print(divide(10, 0))
+  File "build/main.py", line 2, in divide
+    return a // b
+ZeroDivisionError: integer division or modulo by zero
+```
+
+After `tyc trace err.log`:
+
+```
+Traceback (most recent call last):
+  File "src/main.ty", line 7, in <module>
+    main()
+  File "src/main.ty", line 5, in main
+    print(divide(10, 0))
+  File "src/main.ty", line 2, in divide
+    return a // b
+ZeroDivisionError: integer division or modulo by zero
+```
+
+## Where next
+
+- [Source Maps (lowering)](/Typhon/lowering/source-maps/) — `.py.map` v2 format.
+- [`tyc debug`](/Typhon/cli/debug/) — pair with `tyc trace` for stepping.

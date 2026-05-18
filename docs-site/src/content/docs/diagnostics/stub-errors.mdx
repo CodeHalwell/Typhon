@@ -1,0 +1,58 @@
+---
+title: Stub Errors
+description: Diagnostics around .dty stubs and tyc check --stubs.
+sidebar:
+  order: 10
+---
+
+## `tyc::stub_mismatch`
+
+A `.dty` stub differs from the runtime module it describes:
+
+```
+error[tyc::stub_mismatch]: `Redis.get` is declared in stub but missing at runtime
+ ┌─ stubs/redis.dty:5:9
+ │
+5 │     def get(self, key: str) -> str?
+ │         ^^^ method not found on `redis.Redis`
+```
+
+Three kinds of drift:
+
+- **Missing-in-impl** — name declared in `.dty` but not on the runtime class.
+- **Missing-in-stub** — runtime class has a public method the stub doesn't declare.
+- **Signature mismatch** — parameter shapes or return type differ.
+
+## When it surfaces
+
+Only when you run `tyc check --stubs`. Drift is **not** part of the default `tyc check` because the runtime-introspection step is expensive (it imports the module).
+
+For thorough checking, pair `tyc check --stubs` (AST diff) with `tyc stubtest` (runtime introspection via `mypy --stubtest`).
+
+## Fixing
+
+Most drift fixes itself when you update the stub:
+
+```python
+# Before — stub says the method exists but it doesn't at runtime:
+impl Redis:
+    def get(self, key: str) -> str?
+    def lpop(self, key: str) -> str?    # removed from redis-py 5.x
+
+# After — drop the stale method:
+impl Redis:
+    def get(self, key: str) -> str?
+```
+
+If the runtime method exists with a different signature, update the stub to match.
+
+## Severity
+
+Default severity is the standard error level. A `[strictness] stub-check` knob is on the roadmap but not yet wired in — for now drift uses the default diagnostic severity.
+
+## Where next
+
+- [Writing .dty Stubs](/Typhon/interop/dty-stubs/) — stub authoring.
+- [Stub Drift](/Typhon/interop/stub-drift/) — the full story.
+- [`tyc check --stubs`](/Typhon/cli/check/) — the CLI command.
+- [`tyc stubtest`](/Typhon/cli/stubtest/) — the runtime probe.

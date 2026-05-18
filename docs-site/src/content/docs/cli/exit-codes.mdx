@@ -1,0 +1,51 @@
+---
+title: Exit Codes
+description: What each tyc command's exit code means.
+sidebar:
+  order: 16
+---
+
+`tyc` follows the conventional "0 = success, non-zero = failure" pattern. Specific values:
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success. |
+| 1 | CLI / invocation error — invalid arguments, missing manifest, unknown command, missing required tool (e.g. `uv` not installed for `tyc add`). |
+| 2 | Compile-time error — at least one error-severity diagnostic was emitted. |
+| 130 | Interrupted (`Ctrl-C` / `SIGINT`). |
+
+## Per-command notes
+
+| Command | 0 means | Non-zero means |
+|---------|---------|----------------|
+| `tyc check` | No errors. | 2 if any error-severity diagnostic; 1 if invalid invocation. |
+| `tyc check --stubs` | No drift. | 2 if any `tyc::stub_mismatch`. |
+| `tyc build` | Build succeeded. | 2 if any error-severity diagnostic stops emission. |
+| `tyc fmt` | No changes / changes written. | 1 (with `--check`) if any file would change. |
+| `tyc run` | Script exited 0. | **Propagates the script's exit code** verbatim. |
+| `tyc repl` | Clean exit. | 130 on Ctrl-C. |
+| `tyc debug` | Debugger exited 0. | Whatever the debugger exits with. |
+| `tyc trace` | Traceback remapped. | 1 if the file is unreadable / not a valid traceback. |
+| `tyc profile` | Profile written. | Whatever the profiled script exits with; 1 if instrumentation failed. |
+| `tyc migrate` | Wrote `.ty`. | 1 if input is missing; 1 (with `--check`) if changes would be needed. |
+| `tyc ty` | `ty` returned 0. | Propagates `ty`'s exit code. |
+| `tyc stubtest` | `mypy.stubtest` returned 0. | Propagates mypy's exit code. |
+| `tyc add` / `remove` / `sync` | Manifest updated and `uv sync` succeeded. | 1 if uv missing; non-zero from uv on resolution failure. |
+
+## Severity-to-exit-code mapping
+
+`[strictness]` keys control whether a finding is `error`, `warn`, or `off`. Only `error`-severity findings change the exit code.
+
+```toml
+[strictness]
+unused-import = "warn"        # surfaces but doesn't fail CI
+exhaustive-match = "error"    # fails CI
+```
+
+To gate CI on warnings, raise the severity, or use `--quiet` plus `grep "warning"` in your CI script.
+
+## Where next
+
+- [`tyc check`](/Typhon/cli/check/) — the CI command.
+- [Reading Diagnostics](/Typhon/diagnostics/reading/) — diagnostic severities and format.
+- [`[strictness]` config](/Typhon/configuration/strictness/) — every severity knob.

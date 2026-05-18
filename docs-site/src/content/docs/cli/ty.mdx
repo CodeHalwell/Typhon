@@ -1,0 +1,78 @@
+---
+title: tyc ty
+description: Build the project and run Astral's `ty` type checker against the emitted Python.
+sidebar:
+  order: 13
+---
+
+```
+tyc ty [--out DIR] [--watch] [--ty-bin BIN] [-- TY_FLAGS...]
+```
+
+Builds the project and runs Astral's [`ty`](https://github.com/astral-sh/ty) type checker against the emitted Python. Useful as a second-opinion typing pass for the corners of the typing spec Typhon's checker doesn't try to cover.
+
+Requires `ty` to be installed separately:
+
+```bash
+pip install ty
+# or
+uv tool install ty
+```
+
+## Examples
+
+```bash
+tyc ty                          # one-shot
+tyc ty --out build/             # explicit out dir
+tyc ty --watch                  # re-runs on .ty / .dty changes
+tyc ty -- --strict              # forward flags to `ty check`
+```
+
+## What it covers
+
+Typhon's checker enforces the Typhon-specific rules (non-null defaults, `Result[T, E]`, sealed unions, `let`/`mut`, no implicit `Any`). `tyc ty` covers the standard typing-spec corners that Typhon's checker doesn't try to match `ty` / Pyrefly on:
+
+- Higher-kinded type interactions.
+- Variance edge cases.
+- `TypedDict`, `NamedTuple`, `Generic`-class subtleties.
+- Stubs from third-party packages (in your venv).
+
+It's complementary to `tyc check`, not a replacement.
+
+## Flags
+
+| Flag | Effect |
+|------|--------|
+| `--out DIR` | Write emitted Python here instead of a temp dir. |
+| `--ty-bin BIN` | Path to the `ty` executable (default: `ty`). |
+| `--no-build` | Skip the build step; requires `--out`. |
+| `--watch` | Watch source and re-run on `.ty` / `.dty` changes. |
+
+Anything after `--` is forwarded to `ty check` verbatim.
+
+## CI integration
+
+```yaml
+- name: Type-check with ty
+  run: tyc ty -- --strict
+```
+
+`ty` is fast (sub-second on small projects), so adding it to CI costs little.
+
+## Exit codes
+
+`tyc ty` propagates `ty`'s exit code:
+
+- 0 — clean.
+- 1 — typing errors found.
+- 2 — `ty` itself failed (missing binary, bad invocation).
+
+## What if `ty` isn't installed?
+
+`tyc ty` prints a clear "install ty" message and exits 1. It does not silently skip the check.
+
+## Where next
+
+- [`tyc check`](/Typhon/cli/check/) — Typhon's own checker (always run first).
+- [`tyc stubtest`](/Typhon/cli/stubtest/) — runtime stub introspection.
+- [docs/ty-integration.md (canonical plan)](https://github.com/CodeHalwell/Typhon/blob/main/docs/ty-integration.md) — the longer plan for `ty` integration as an embedded library.

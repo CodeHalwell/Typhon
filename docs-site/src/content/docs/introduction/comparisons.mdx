@@ -1,0 +1,141 @@
+---
+title: Comparison with Other Languages
+description: How Typhon relates to Python, TypeScript, Rust, Mojo, Cython, and the other Rust-based Python type checkers.
+sidebar:
+  order: 5
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+If you have written any of the languages on this page, this is the fastest way to understand what Typhon is and is not. Each comparison answers two questions: what is *the same*, and what is *different*.
+
+## Typhon vs typed Python
+
+**The same:** the syntax. Whitespace, decorators, `def`, `class`, `async def`, list comprehensions, `match`, f-strings, dataclasses, context managers. Imports work the same. `print` is `print`. Every standard library and every PyPI package is available without ceremony. Type annotations follow PEP 484 / 526 / 604 / 695 spelling.
+
+**Different:**
+
+- **Mandatory annotations.** Every parameter and return type must be annotated. `def add(a, b): return a + b` is `tyc::missing_return_type`. Python's `mypy --strict` enforces something similar; Typhon's checker enforces it always, no opt-in.
+- **`let` / `mut` on locals.** Inside functions, every local binding declares `let` (immutable) or `mut` (mutable). Module-level bindings default to `let` unless declared `mut`. Python has no equivalent.
+- **`T?` for nullable.** `Optional[T]` and `T | None` are both spelled `T?` in Typhon source. Emitted Python is `T | None` so other tooling agrees.
+- **No implicit `Any`.** `let x = some_untyped_fn()` is a hard error. Wrap in `unsafe:` or annotate explicitly. Python tolerates this; Typhon does not.
+- **`Result[T, E]` for typed errors.** Built-in, with `?` propagation and `with`-chains. Python does not have `Result` in the stdlib (some libraries provide it; none is canonical).
+- **Sealed unions.** `type Shape = Circle | Rectangle` declares a *closed* set; `match` over it must be exhaustive. Python's `|` union is open.
+- **`class` emits `@dataclass(slots=True)`.** Methods live in `impl` blocks, not in the class body. `model` keyword emits Pydantic. `class!` is the escape hatch for framework bases.
+- **`gather:` / `go`.** Explicit concurrency primitives that lower to `asyncio.TaskGroup` (cancel-on-failure) and a strong-ref-registered `asyncio.Task`.
+- **`comptime let`.** Build-time evaluation that inlines literals into the emitted Python. Missing required env vars fail the build.
+
+For a programmer who already writes typed Python well, the learning curve is small — half a day to internalise the five rules, a week to stop fighting the checker on `let` / `mut` / `T?`. The payoff is exhaustive `match`, typed errors, and refactoring without `mypy: ignore` comments.
+
+## Typhon vs TypeScript
+
+TypeScript is the closest analogue: a statically-typed superset of a host language, compiling to the host language, sharing the host's ecosystem.
+
+**The same:**
+
+- Compiles to the host language (TypeScript → JavaScript, Typhon → Python).
+- Structural typing (TypeScript's interfaces and `type` aliases; Typhon's `interface` declarations).
+- Sealed unions via tagged variants (TypeScript's discriminated unions; Typhon's `type X = A | B`).
+- Erasure at emit time (TypeScript erases types; Typhon erases generic type parameters).
+- One canonical binary (`tsc`; `tyc`).
+- Source maps for runtime → source mapping (`.js.map`; `.py.map`).
+- LSP-first editing experience.
+
+**Different:**
+
+- **Stricter by default.** Typhon has no `noImplicitAny: false` knob — `Any` is always a hard error outside `unsafe:`. TypeScript ships with `strict: true` available, but most legacy codebases run with parts of it disabled.
+- **Errors as values.** `Result[T, E]` and `?` make failure visible in signatures. TypeScript stays with `throw`, which is invisible to the checker.
+- **Sealed unions are syntactically sealed.** `type X = A | B` in Typhon is closed — nothing outside the source file can extend it. TypeScript's discriminated unions are convention; the type can be extended elsewhere.
+- **No global types.** Typhon has no equivalent of `tsconfig.json`'s ambient `lib` declarations. Every name comes from an import or a `.dty` stub.
+- **`unsafe:` is a lexical region**, not a per-value cast. TypeScript's `as unknown as T` works expression-level. Typhon's design is intentionally less granular.
+
+If you have written modern TypeScript, you will be productive in Typhon within a day. The mental model is identical; the syntax (Python-flavoured) is what changes.
+
+## Typhon vs Rust
+
+Typhon borrows three things from Rust: `let` / `mut`, `Result[T, E]`, and `impl` blocks. It deliberately does *not* borrow ownership, borrowing, or lifetimes.
+
+**The same:**
+
+- **`let` and `mut`** are binding-immutability markers. `let x = 1` is immutable; `mut y = 0` is reassignable. Identical semantics.
+- **`Result<T, E>` and the `?` operator.** Same shape, same semantics — Typhon spells it `Result[T, E]` and uses Python's `?` placement on the expression rather than after the call expression like Rust. Lowering is `if isinstance(_tmp, Err): return _tmp; v = _tmp.value`.
+- **`impl Type:` blocks** attach methods to a class. Same separation of data (`class`) and behaviour (`impl`) as Rust.
+
+**Different:**
+
+- **No ownership.** Python has garbage collection; Typhon does not introduce borrow-checking. `let u: User = ...` cannot be reassigned, but the `User` instance can still be mutated through (unless you wrote `class User frozen:`).
+- **No lifetimes.** All references are runtime-managed by CPython's GC.
+- **No traits as values.** Typhon's `interface` is a structural contract for the type checker, not a vtable. There is no `Box<dyn Drawable>` equivalent.
+- **No safety boundary.** Typhon's `unsafe:` is about *type* safety (letting `Any` flow), not memory safety. Misusing it cannot corrupt memory; it just lets the checker pass code it would otherwise reject.
+
+If you have written Rust, the `let` / `mut`, `Result`, and `impl` parts will feel natural. Set aside the ownership intuition — that's not what Typhon is for.
+
+## Typhon vs Mojo
+
+Mojo is the cautionary tale in Typhon's design notes. It was pitched as a "Python superset" and then walked back to a different language with Python-like syntax. Typhon explicitly avoids that path.
+
+**The same:**
+
+- Both market themselves as Python-flavoured, statically-typed languages.
+- Both target a niche where Python's safety / performance is insufficient.
+
+**Different:**
+
+- **Typhon compiles to Python.** Mojo compiles to its own AOT runtime. A Mojo program does not run under CPython; a Typhon program does. Everything you wrote in Python keeps working; everything you wrote in Mojo needs the Mojo runtime.
+- **No new datatypes.** Typhon does not introduce `Float32` / `Float64` / `SIMD[T, N]` etc. It uses Python's `int`, `float`, `str`. Mojo introduces a Rust-like type system with new primitives.
+- **No performance pitch.** Typhon does not promise speedups. Mojo's headline is "1000x faster than Python on hot loops". Typhon's headline is "Python you can refactor at 2am". Different problems.
+- **No vendor lock.** A `.ty` file emits idiomatic `.py`. If Typhon disappears tomorrow, your code is Python source you can read and maintain. Mojo's IR is its own.
+
+If you wanted Mojo for performance, Typhon is not what you want. If you wanted Mojo for static safety in Python land, Typhon is closer to the original pitch.
+
+## Typhon vs Cython
+
+Cython is the older "compile Python to something faster" tool. It is still excellent for what it does.
+
+**The same:**
+
+- Both are compile-time tools for Python.
+- Both emit Python-compatible artefacts (Cython emits C extensions; Typhon emits `.py`).
+
+**Different:**
+
+- **Performance vs safety.** Cython's pitch is "type your hot loops, get C performance". Typhon's pitch is "type your whole codebase, refactor without fear". Cython adds optional `cdef int x = 0`; Typhon makes every annotation mandatory.
+- **Output format.** Cython compiles to `.c` / `.so` extension modules. Typhon emits readable `.py`.
+- **Use case.** Cython is the right tool when you have a Python program that's too slow on numerics. Typhon is the right tool when you have a Python program that's growing too large to maintain.
+
+They are not mutually exclusive. You could write a Typhon project that imports a Cython extension via a `.dty` stub.
+
+## Typhon vs ty / Pyrefly
+
+`ty` (Astral) and Pyrefly (Meta) are the Rust-based Python type checkers that shipped in 2025. They are the architectural reference for Typhon's checker, *not* its competitor.
+
+**The same:**
+
+- Both written in Rust (like `tyc`).
+- Both use Salsa for incremental query caching.
+- Both check Python code against the typing spec.
+- Both pioneered the "fast, modern, Rust-backed Python type checker" niche.
+
+**Different:**
+
+- **Typhon checks `.ty`, ty / Pyrefly check `.py`.** Typhon is its own dialect; the others check standard Python.
+- **Typhon emits Python.** ty / Pyrefly are pure checkers; they don't transform code.
+- **Typhon has stricter rules** (no implicit `Any`, non-null defaults, `Result[T, E]`, sealed unions) that aren't in the typing spec.
+- **Typhon does not aim to match the typing spec corner-for-corner** — the [`tyc ty`](/Typhon/cli/ty/) subcommand defers to Astral's checker for that.
+
+If you write standard typed Python, use `ty` or Pyrefly. If you want to opt into stricter rules and accept a small dialect change, use Typhon.
+
+## When to pick what
+
+| You want | Use |
+|---|---|
+| Modern Python with light type checking | `ty` or Pyrefly + typed Python |
+| Python with stricter compile-time safety | **Typhon** |
+| Python with raw performance on numerics | Cython, NumPy/PyTorch internals |
+| A new language with Python-like syntax | Mojo |
+| TypeScript-style static safety for Python | **Typhon** |
+| Rust-style errors-as-values for Python | **Typhon** |
+| To migrate an existing Python codebase incrementally | **Typhon** ([`tyc migrate`](/Typhon/cli/migrate/)) |
+| To check a Python codebase without changing the source | `ty` / Pyrefly / mypy / pyright |
+
+Typhon is a deliberate addition to the Python tooling ecosystem, not a replacement for any of it. The other tools do what they do well; Typhon is for the cases where stricter static safety than typed Python provides is worth a small dialect shift.

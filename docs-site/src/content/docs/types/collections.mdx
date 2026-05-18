@@ -1,0 +1,274 @@
+---
+title: Collections
+description: list, dict, set, tuple — every collection type requires its element types spelled out.
+sidebar:
+  order: 3
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Typhon's collection types are Python's, with one stricter rule: **element types are mandatory**. Bare `list`, bare `dict`, bare `set` are `tyc::implicit_any` errors.
+
+## `list[T]`
+
+Mutable, ordered sequences. The element type is required:
+
+```python
+let primes: list[int] = [2, 3, 5, 7, 11]
+
+mut bag: list[str] = []
+bag.append("hello")
+```
+
+A heterogeneous literal is rejected unless the annotation is a union:
+
+```python
+let mixed: list[int] = [1, "two"]            # ❌ str not assignable to int
+let mixed: list[int | str] = [1, "two"]      # ✅
+```
+
+### Methods
+
+All Python `list` methods are available with their normal signatures:
+
+```python
+let xs: list[int] = [3, 1, 4, 1, 5, 9, 2, 6]
+
+xs.append(5)
+xs.extend([1, 1, 5])
+xs.insert(0, 99)
+xs.sort()
+xs.reverse()
+let n: int = xs.count(1)
+let i: int = xs.index(5)        # raises ValueError if missing
+xs.remove(1)
+let popped: int = xs.pop()      # raises IndexError on empty
+let copy: list[int] = xs.copy()
+```
+
+Element access by index is typed `T`:
+
+```python
+let first: int = xs[0]      # ✅
+let bad: int = xs[100]      # ✅ at type level; raises IndexError at runtime
+```
+
+If you want a `T?` "either there or absent" form, write a helper:
+
+```python
+def at[T](xs: list[T], i: int) -> T?:
+    if 0 <= i < len(xs):
+        return xs[i]
+    return None
+```
+
+## `dict[K, V]`
+
+Mutable mappings, both key and value type required:
+
+```python
+let counts: dict[str, int] = {"apples": 3, "pears": 1}
+let n: int? = counts.get("apples")    # `.get` returns V | None
+```
+
+<Aside type="caution">
+  **`dict.get(key)` returns `V?`.** There is no implicit `None`-stripping. Either check / narrow before use, or use `dict[key]` (which raises `KeyError` and is typed `V`).
+</Aside>
+
+### Methods
+
+```python
+let m: dict[str, int] = {"a": 1, "b": 2}
+
+m["c"] = 3
+let exists: bool = "a" in m
+let val: int = m["a"]               # typed V; raises KeyError on miss
+let or_default: int = m.get("z", 0)  # second arg sets the default; type stays V
+let popped: int = m.pop("a")          # raises KeyError if missing
+let keys: list[str] = list(m.keys())
+let values: list[int] = list(m.values())
+let items: list[tuple[str, int]] = list(m.items())
+```
+
+### Default values
+
+`dict.get(key, default)` returns `V` (not `V?`) when a default is provided:
+
+```python
+let n: int = counts.get("missing", 0)    # ✅ typed int (default `0` fills in)
+```
+
+For more complex defaults, `defaultdict` works:
+
+```python
+from collections import defaultdict
+let by_letter: defaultdict[str, list[int]] = defaultdict(list)
+by_letter["a"].append(1)
+```
+
+## `set[T]`
+
+Mutable, unordered, unique-element collections:
+
+```python
+let seen: set[int] = {1, 2, 3}
+mut working: set[str] = set()
+working.add("hello")
+working.update(["world", "again"])
+
+let exists: bool = 1 in seen
+let count: int = len(seen)
+```
+
+### Set operations
+
+```python
+let a: set[int] = {1, 2, 3}
+let b: set[int] = {2, 3, 4}
+
+let union: set[int] = a | b           # {1, 2, 3, 4}
+let intersect: set[int] = a & b       # {2, 3}
+let diff: set[int] = a - b            # {1}
+let sym_diff: set[int] = a ^ b        # {1, 4}
+
+let subset: bool = a <= b              # False
+let superset: bool = a >= b            # False
+```
+
+For frozen sets, use `frozenset[T]` — same operations, hashable, suitable for dict keys.
+
+## `tuple[...]`
+
+Fixed-arity tuples spell the type of every slot:
+
+```python
+let point: tuple[float, float] = (1.0, 2.0)
+let rgb: tuple[int, int, int] = (255, 128, 0)
+let person: tuple[str, int, bool] = ("alice", 30, True)
+```
+
+Destructuring works as in Python:
+
+```python
+let x, y = point
+let r, g, b = rgb
+let name, age, active = person
+```
+
+### Variable-length homogeneous tuples
+
+```python
+let nums: tuple[float, ...] = (1.0, 2.0, 3.0)
+```
+
+`tuple[T, ...]` is "any length of `T`". Used by `*args`:
+
+```python
+def average(*nums: float) -> float:
+    # `nums` has type `tuple[float, ...]`
+    return sum(nums) / len(nums)
+```
+
+### Single-element tuples
+
+A common Python pitfall:
+
+```python
+let t1: tuple[int] = (1,)       # ✅ trailing comma — this is a 1-tuple
+let t1: tuple[int] = (1)        # ❌ this is just the int 1 in parens
+```
+
+## Comprehensions
+
+List, set, and dict comprehensions are unchanged from Python:
+
+```python
+let nums: list[int] = [1, 2, 3, 4, 5]
+let squares: list[int] = [n * n for n in nums]
+let evens: set[int] = {n for n in nums if n % 2 == 0}
+let by_value: dict[int, int] = {n: n * n for n in nums}
+```
+
+Generator expressions exist; their type is `Iterator[T]`:
+
+```python
+let gen: Iterator[int] = (n * 2 for n in nums)
+let total: int = sum(n * 2 for n in nums)    # Iterator[int] consumed by sum
+```
+
+## Iteration
+
+`for x in xs:` works on anything iterable; the checker infers the element type:
+
+```python
+let names: list[str] = ["a", "b", "c"]
+for name in names:                    # name: str
+    print(name)
+
+for i, name in enumerate(names):      # i: int, name: str
+    print(f"{i}: {name}")
+
+let pairs: dict[str, int] = {"a": 1, "b": 2}
+for k, v in pairs.items():            # k: str, v: int
+    print(f"{k}={v}")
+
+for a, b in zip(["a", "b"], [1, 2]):  # a: str, b: int
+    print(a, b)
+```
+
+## Iterating safely over optional collections
+
+A common shape: a function returns `list[T]?` ("none if not found"), and you want to iterate the result. Narrow first:
+
+```python
+def first_letters(words: list[str]?) -> list[str]:
+    guard ws = words else: return []
+    return [w[0] for w in ws if len(w) > 0]
+```
+
+The `guard` narrows `words` to `list[str]`, so the comprehension type-checks. Without the guard, `for w in words` would be a `tyc::nullable_use` error.
+
+## Mutable vs immutable
+
+The standard library distinction holds:
+
+| Mutable | Immutable |
+|---------|-----------|
+| `list[T]` | `tuple[T, ...]`, `tuple[A, B]` |
+| `dict[K, V]` | `MappingProxyType[K, V]` (read-only view) |
+| `set[T]` | `frozenset[T]` |
+
+For deep immutability inside a `frozen` class, use immutable containers (`tuple`, `frozenset`) for the field types.
+
+## Common mistakes
+
+### Bare collection annotations
+
+```python
+let xs: list = [1, 2, 3]      # ❌ implicit Any element
+let d: dict = {"a": 1}        # ❌ implicit Any keys and values
+```
+
+Fix: spell the type parameters.
+
+### Treating `dict.get` as non-nullable
+
+```python
+let counts: dict[str, int] = {"a": 1}
+let n: int = counts.get("missing")    # ❌ get() returns int | None
+```
+
+Fix: `let n: int? = counts.get("missing")`, or provide a default: `let n: int = counts.get("missing", 0)`.
+
+### Heterogeneous list without a union annotation
+
+```python
+let mixed: list[int] = [1, "two"]    # ❌
+```
+
+Fix: `let mixed: list[int | str] = [1, "two"]` or split into separate typed lists.
+
+## Where next
+
+- [Nullable Types](/Typhon/types/nullable/) — `T?`, narrowing forms, and `dict.get`.
+- [Flow Narrowing](/Typhon/types/narrowing/) — exactly what the checker tracks.

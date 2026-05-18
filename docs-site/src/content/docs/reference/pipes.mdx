@@ -1,0 +1,108 @@
+---
+title: Pipes (|>)
+description: Left-to-right composition that fills the first positional slot of the next call.
+sidebar:
+  order: 15
+---
+
+`a |> f(arg)` is exactly `f(a, arg)`. Left-associative; the pipe argument fills the *first* positional slot of the next call.
+
+## Syntax
+
+```
+EXPR "|>" CALL
+```
+
+Where `CALL` is a function call expression. Chain freely:
+
+```python
+let cleaned: str = raw |> str.strip() |> str.lower() |> str.replace(",", "")
+```
+
+## Desugaring
+
+```python
+# Typhon
+result = x |> normalise() |> scale(2.0) |> clamp(0.0, 1.0)
+
+# Emitted Python
+result = clamp(scale(normalise(x), 2.0), 0.0, 1.0)
+```
+
+No partial application, no curry, no special placeholder. Just first-positional threading.
+
+## Precedence
+
+Pipes bind looser than function calls and attribute access; tighter than comparisons, boolean ops, and conditionals:
+
+```python
+a |> f() + 1            # ❌ parses as (a |> f()) + 1
+a |> (f() + 1)          # ❌ doesn't make sense — f()+1 isn't a call
+let n: int = a |> f() if cond else b |> g()   # parses as you'd hope
+```
+
+When in doubt, parenthesise.
+
+## What's allowed on the right
+
+The right-hand side must be a *call expression*. A bare identifier is not enough:
+
+```python
+x |> str.upper       # ❌ — not a call
+x |> str.upper()     # ✅ — pipe fills the first positional slot
+```
+
+Methods accessed on the value itself are allowed, but the pipe still threads into the *first positional slot* of the resulting call — which is the receiver in method form:
+
+```python
+"hello" |> str.upper()           # str.upper("hello") → "HELLO"
+"hello".upper()                  # also "HELLO" — pipes don't replace methods
+```
+
+## When pipes shine
+
+- Long data-cleaning chains (strings, lists, dataframes).
+- Validation pipelines where each step returns the next stage's input.
+- Anywhere the inside-out call form is the reading bottleneck.
+
+For one-step transformations, plain `f(x)` is fine.
+
+## Common patterns
+
+### String pipelines
+
+```python
+let slug: str = title
+    |> str.lower()
+    |> str.strip()
+    |> str.replace(" ", "-")
+```
+
+### List pipelines
+
+```python
+let total: int = items
+    |> filter(lambda i: i.active)
+    |> map(lambda i: i.weight)
+    |> sum()
+```
+
+(Note: `filter` and `map` return iterators; you may need `list(...)` at the end.)
+
+### Numerical pipelines
+
+```python
+let smoothed = signal |> np.convolve(kernel, mode="same") |> np.clip(0, 1)
+```
+
+## What pipes are *not*
+
+- **Not partial application.** There is no `f(_, b)` placeholder. The pipe always fills slot 0.
+- **Not curry.** No `f(a)(b)`.
+- **Not type-changing.** The output type is whatever the call returns.
+- **Not async-special.** Pipe an async value and you'll need to `await`.
+
+## Where next
+
+- [Advanced Features (tour)](/Typhon/tour/advanced/) — teaching page.
+- [Operators and Precedence](/Typhon/reference/operators/) — full precedence table.

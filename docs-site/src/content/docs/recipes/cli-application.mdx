@@ -1,0 +1,117 @@
+---
+title: CLI Application
+description: A typed CLI with argparse / click, typed errors, exit codes.
+sidebar:
+  order: 3
+---
+
+A CLI that takes a user ID, looks them up, and prints a one-line summary. Demonstrates `Result[T, E]` for parsing errors, sealed unions for typed failure modes, and `sys.exit` for exit-code propagation.
+
+## With `argparse`
+
+```python
+import argparse
+import sys
+
+type LookupError = NotFound | BadInput
+
+class NotFound:
+    id: int
+class BadInput:
+    detail: str
+
+def parse_id(raw: str) -> Result[int, BadInput]:
+    if not raw.isdigit():
+        return Err(BadInput(detail=f"not a number: {raw}"))
+    return Ok(int(raw))
+
+def lookup(id: int) -> Result[str, LookupError]:
+    if id == 0:
+        return Err(NotFound(id=id))
+    return Ok(f"user-{id}")
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("user_id", help="numeric user ID")
+    args = parser.parse_args()
+
+    match parse_id(args.user_id):
+        case Err(BadInput(detail)):
+            print(f"error: {detail}", file=sys.stderr)
+            return 2
+
+        case Ok(id):
+            match lookup(id):
+                case Ok(name):
+                    print(name)
+                    return 0
+                case Err(NotFound(id)):
+                    print(f"missing: user {id}", file=sys.stderr)
+                    return 4
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+## With `click`
+
+```python
+import sys
+import click
+
+# ... LookupError, NotFound, BadInput, parse_id, lookup as above ...
+
+@click.command()
+@click.argument("user_id")
+def cli(user_id: str) -> None:
+    match parse_id(user_id):
+        case Err(BadInput(detail)):
+            click.echo(f"error: {detail}", err=True)
+            sys.exit(2)
+
+        case Ok(id):
+            match lookup(id):
+                case Ok(name):
+                    click.echo(name)
+                case Err(NotFound(id)):
+                    click.echo(f"missing: user {id}", err=True)
+                    sys.exit(4)
+
+if __name__ == "__main__":
+    cli()
+```
+
+## Things to notice
+
+- **Typed errors with sealed unions.** `LookupError = NotFound | BadInput` — exhaustive match in the entry point.
+- **Result chaining.** `parse_id` returns `Result[int, BadInput]`; `lookup` returns `Result[str, LookupError]`. Both compose with `match`.
+- **Exit codes per failure variant.** `BadInput` → 2; `NotFound` → 4. The CLI's contract is visible in the source.
+- **`sys.exit(main())` shape.** Standard Python idiom. The exit code propagates through `tyc run`.
+
+## Running
+
+```bash
+tyc build
+python build/main.py 42
+# user-42
+
+python build/main.py abc
+# error: not a number: abc
+
+python build/main.py 0
+# missing: user 0
+```
+
+Or with `tyc run`:
+
+```bash
+tyc run -- 42
+tyc run -- abc
+tyc run -- 0
+```
+
+## Where next
+
+- [Error Handling (tour)](/Typhon/tour/error-handling/) — `Result` patterns.
+- [Sealed Unions and Match (tour)](/Typhon/tour/sealed-unions/) — closed sums.
+- [`tyc run`](/Typhon/cli/run/) — build + exec.

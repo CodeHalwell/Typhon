@@ -1,0 +1,93 @@
+---
+title: How Typhon Lowers
+description: An overview of what each Typhon construct compiles to in Python.
+sidebar:
+  order: 1
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+Typhon is a compile-to-Python language. Each Typhon construct lowers to an explicit, readable Python form — the same code an experienced Pythonista would have written by hand. This section maps every Typhon-specific form to its emitted Python.
+
+## The pipeline
+
+```
+.ty source
+    │
+    ▼ tyc-syntax     (lex + parse)
+    ▼ tyc-resolve    (name resolution, let/mut classification)
+    ▼ tyc-types      (type check, narrowing)
+    ▼ tyc-analyse    (purity, async, comptime, auto-gather)
+    ▼ tyc-desugar    (Typhon AST → Python AST: merge impl, expand ?, lower gather/go, ...)
+    ▼ tyc-emit       (Python source + .py.map)
+    ▼ tyc-format     (ruff format post-process)
+    ▼
+    .py + .py.map + (typhon_runtime/*.py if used)
+```
+
+See [Architecture Overview](/Typhon/internals/architecture/) for the compiler internals.
+
+## Quick reference
+
+<CardGrid>
+  <Card title="Classes → dataclass" icon="puzzle">
+    `class User:` → `@dataclass(slots=True)`. `model User:` → Pydantic `BaseModel`. `class!` → bare class with synthesised `__init__`. [Details →](/Typhon/lowering/classes/)
+  </Card>
+  <Card title="Result → typhon_runtime" icon="rocket">
+    `Result[T, E]`, `Ok`, `Err` lower to frozen dataclasses in a generated `typhon_runtime` module. `?` lowers to inline `isinstance(_t, Err): return _t`. [Details →](/Typhon/lowering/result/)
+  </Card>
+  <Card title="gather: → TaskGroup" icon="forward-slash">
+    `gather:` lowers to `asyncio.TaskGroup`. `gather(strategy="best-effort"):` lowers to `asyncio.gather(..., return_exceptions=True)`. [Details →](/Typhon/lowering/gather/)
+  </Card>
+  <Card title="go → spawn registry" icon="approve-check">
+    `go f(x)` lowers to `typhon_runtime.tasks.spawn(f(x))` — strong-ref registry prevents GC mid-flight. [Details →](/Typhon/lowering/go/)
+  </Card>
+  <Card title="lazy → proxies" icon="setting">
+    `lazy import np = numpy` → bespoke `__TyphonLazy_np_` proxy class. `lazy let X` → sentinel-cached `lazy_val`. `lazy[T]` return → generator. [Details →](/Typhon/lowering/lazy/)
+  </Card>
+  <Card title="comptime → inlined literals" icon="document">
+    `comptime let PORT = int(env("PORT", "8080"))` → `PORT: int = 8080` after sandbox evaluation. [Details →](/Typhon/lowering/comptime/)
+  </Card>
+  <Card title="extend → free functions" icon="open-book">
+    `extend str: def to_slug(): ...` → `def __typhon_ext_str__to_slug(self): ...` with call-site rewrites for statically-annotated receivers. [Details →](/Typhon/lowering/extend/)
+  </Card>
+  <Card title="Source maps" icon="external">
+    Each emitted `.py` ships with a `.py.map` v2 file recording per-statement `(out_line → ty_line)` for `tyc trace` and the LSP. [Details →](/Typhon/lowering/source-maps/)
+  </Card>
+</CardGrid>
+
+## Principles
+
+Three rules guide every lowering decision:
+
+1. **The emitted Python should be code you would have written.** No bespoke ABI, no metaclass tricks, no runtime fingerprints. Production crashes happen in Python tracebacks; you should be able to read them without learning a Typhon-specific runtime layer.
+2. **Helpers ship inline, not on PyPI.** When Typhon needs runtime support (the `Result` ADT, the lazy-import proxy, the strong-ref task registry), the code emits as local `typhon_runtime/` source. Production servers do not install Typhon-specific anything.
+3. **Source maps preserve the link back to `.ty`.** Per-statement `(out_line → ty_line)` tables let [`tyc trace`](/Typhon/cli/trace/) remap tracebacks, and let the LSP do cross-file go-to-definition across the `.ty` / `.py` boundary.
+
+## What's generated
+
+When you `tyc build`, the emitted tree contains:
+
+- **`build/<your modules>.py`** — your compiled source.
+- **`build/<your modules>.py.map`** — source maps.
+- **`build/typhon_runtime/`** — only when you use features that need it:
+  - `result.py` — `Ok`, `Err`, `Result` aliases.
+  - `tasks.py` — `spawn(coro)` with the strong-ref `_BACKGROUND` set.
+  - `lazy.py` — `lazy_val(lambda: ...)`.
+- **`build/<your modules>.pyi`** — for every `.dty` you wrote.
+
+Nothing else. No `__pycache__/` (Python creates that at runtime), no Cargo artefacts, no Typhon-marker files.
+
+## Where next
+
+Drill into a specific lowering:
+
+- [Classes → dataclass](/Typhon/lowering/classes/)
+- [Result → typhon_runtime](/Typhon/lowering/result/)
+- [gather: → TaskGroup](/Typhon/lowering/gather/)
+- [go → spawn registry](/Typhon/lowering/go/)
+- [lazy → proxies](/Typhon/lowering/lazy/)
+- [comptime → inlined literals](/Typhon/lowering/comptime/)
+- [extend → free functions](/Typhon/lowering/extend/)
+- [Source Maps](/Typhon/lowering/source-maps/)
+- [The typhon_runtime module](/Typhon/lowering/runtime/)

@@ -1,0 +1,84 @@
+---
+title: Frequently Asked Questions
+description: Questions that come up often.
+sidebar:
+  order: 7
+---
+
+## Is Typhon a different language from Python?
+
+It is **a stricter dialect** that compiles to Python. Syntactically close enough that most Python code transfers with mechanical rewrites. The compiler is the only thing that disagrees with you on what's legal.
+
+Every `.ty` file emits valid, idiomatic `.py`. Not all `.py` is valid Typhon.
+
+## Do I need to install anything to run a compiled Typhon program?
+
+No. The emitted `.py` runs under standard CPython 3.13+. The handful of helpers Typhon needs (`Result`, lazy proxy, task registry) ship as generated source in `typhon_runtime/`. There is no PyPI dependency.
+
+## Can I gradually migrate a Python codebase?
+
+Yes. `.ty` and `.py` interoperate freely. Migrate a file at a time with [`tyc migrate`](/Typhon/cli/migrate/); plain `.py` files in `src/` are copied unchanged.
+
+## What Python version does Typhon target?
+
+3.13 by default; 3.14 is selectable via `[python] target = "3.14"`. The free-threaded `t` builds are opt-in via `[python] free-threaded = true`.
+
+## What about libraries that don't have types?
+
+Write a [`.dty` stub](/Typhon/interop/dty-stubs/), or wrap the calls in [`unsafe:`](/Typhon/reference/unsafe/). For long-lived dependencies, the stub is the right answer.
+
+## Why doesn't Typhon catch this Python pattern?
+
+Probably because the pattern is legal in standard Python and Typhon stays out of typing-spec corners. If you think it's a real bug, file an issue.
+
+## Is Typhon ready for production?
+
+The minimum-viable language (non-null types, sealed unions, `Result`, dataclass emit) is publishable today. Most of the more advanced features (interfaces, comptime, lazy, async-gather, generics, the LSP, the package manager) are also landed. We are pre-1.0 — expect occasional renames and tightenings, none of which should break programs following [The Five Rules](/Typhon/tour/five-rules/).
+
+## Will my IDE work?
+
+If it speaks LSP, yes. `tyc lsp` runs on stdio. There's a reference VS Code extension; other editors need a small adapter. See [Editor Setup](/Typhon/getting-started/editor-setup/).
+
+## Why not just use mypy / pyright / ty?
+
+Use them if you write standard typed Python. Use Typhon if you want stricter rules than the typing spec gives you (non-null defaults, `Result[T, E]`, sealed unions, `let` / `mut`, `unsafe:`). They're complementary tools, not competitors. [`tyc ty`](/Typhon/cli/ty/) defers to Astral's `ty` for the pure typing-spec corners.
+
+## How is this different from Mojo?
+
+Mojo is a new language with its own runtime and ABI. Typhon compiles to standard CPython. Mojo's pitch is performance; Typhon's pitch is static safety. Different problems.
+
+## How is this different from Cython?
+
+Cython compiles Python to C for speed. Typhon compiles Typhon to readable Python for safety. Different goals.
+
+## Will Typhon ever beat Python on performance?
+
+Not directly. The emitted Python runs at Python's speed. Small wins come from `@memo` (pure-function caching), `lazy import` (deferred startup), `gather:` (parallel I/O), and free-threaded `auto-parallel` (CPU-bound comprehensions). None of these are the headline.
+
+## What if my framework's base class needs configuration in `__init__`?
+
+Use [`class!`](/Typhon/interop/class-escape/). Patterns for `torch.nn.Module`, `Enum`, `unittest.TestCase`, Django, SQLAlchemy.
+
+## Is the compiler open source?
+
+Yes. MIT-licensed. [github.com/CodeHalwell/Typhon](https://github.com/CodeHalwell/Typhon).
+
+## Can I contribute?
+
+Please do. See [Contributing](/Typhon/internals/contributing/).
+
+## What if I find a bug?
+
+File an issue with a minimal repro: [github.com/CodeHalwell/Typhon/issues](https://github.com/CodeHalwell/Typhon/issues).
+
+## Where can I get help?
+
+- File a GitHub issue.
+- Read the [language tour](/Typhon/tour/values-bindings/) — it covers most patterns.
+- Read the [pitfalls](/Typhon/pitfalls/top/) — most newcomer questions are answered there.
+
+## What's the long-term plan?
+
+Phases 0–3 are done. Phase 4+ work is in progress. The full list lives in the [roadmap](/Typhon/project/roadmap/). Beyond Phase 4+: variance and higher-kinded generics, embedded `ty` integration, a source-mapping native debugger, deeper comptime, broader corpus testing.
+
+The project is small and the scope is finite. We're aiming for a stable v1 inside two years of active work.

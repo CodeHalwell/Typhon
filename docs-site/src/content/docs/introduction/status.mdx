@@ -1,0 +1,97 @@
+---
+title: Project Status
+description: What is shipped, what is in progress, and what is deferred.
+sidebar:
+  order: 6
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+Typhon is in **active development**. The minimum-viable language — non-null types, sealed unions, `Result[T, E]`, dataclass-emit classes — is shippable today. Most of the more advanced features (interfaces, comptime, lazy loading, automatic gather, free-threaded parallelism, the package-manager surface, the REPL, the debugger launcher, the migrator) are also landed; what remains is polish.
+
+The canonical per-feature status lives in the [Roadmap](/Typhon/project/roadmap/). This page is a quick summary.
+
+## Shipped (Phases 0 – 3 complete)
+
+### Core compiler
+
+- ✅ Cargo workspace with the crate-per-stage layout (`tyc-syntax`, `tyc-db`, `tyc-resolve`, `tyc-types`, `tyc-analyse`, `tyc-desugar`, `tyc-emit`, `tyc-format`, `tyc-diagnostics`, `tyc-lsp`, `tyc`).
+- ✅ Salsa-backed incremental queries (`preprocessed_text`, `module_decl_names`, `resolved_module`).
+- ✅ Vendored Ruff fork (`ruff_text_size`, `ruff_source_file`, `ruff_python_trivia`, `ruff_python_ast`, `ruff_python_parser`) with `let` / `mut` soft keywords and a `Mutability` field on assignment AST nodes. Migration off `rustpython-parser` is complete.
+- ✅ Diagnostics infrastructure (`miette` + `thiserror`).
+
+### Language features
+
+- ✅ `let` / `mut` for binding immutability, with reassignment errors and module-level defaulting.
+- ✅ Nominal types: function signatures, assignment compatibility, primitives, classes, generic containers.
+- ✅ Non-nullable by default with flow narrowing on `is None`, `is not None`, `isinstance`, `guard`, early-return.
+- ✅ `T?` sugar for `T | None` in annotations.
+- ✅ `class` → `@dataclass(slots=True)`; `model` → Pydantic `BaseModel(extra="forbid")`; `frozen` modifier; `class!` escape hatch for framework bases.
+- ✅ `impl` blocks merged into class bodies at desugar; `extend` for cross-module method addition; `extend BUILTIN:` extracts to free functions with static-receiver rewrites.
+- ✅ Sealed unions via `type X = A | B`, exhaustive `match` checked at compile time.
+- ✅ `Result[T, E]` with `Ok` / `Err` constructors, the `?` operator, and `with`-chains (with optional `else err:` block). `typhon_runtime` module generated when used.
+- ✅ Generics via PEP 695 brackets, bidirectional inference with recursive conflict-widening, bounded type vars.
+- ✅ Interface declarations lowering to `class Name(Protocol):` with structural conformance check on assignment; `isinstance(x, Interface)` rejected by default.
+- ✅ `unsafe:` lexical block, lowered to `if True:` for scope preservation, with `Unsafe[T]` boundary marker.
+- ✅ `@pure` / `@memo` / `@pure(memo=True)` decorators with the six-condition purity check.
+- ✅ `gather:` blocks lowering to `asyncio.TaskGroup` (default) or `asyncio.gather(return_exceptions=True)` (`strategy="best-effort"`).
+- ✅ `go f(x)` lowered through `typhon_runtime.tasks.spawn` with a strong-ref registry.
+- ✅ `lazy import np = numpy` with a thread-safe proxy class (`__TyphonLazy_np_`); `lazy from x import …` rejected at parse time. Module-level `lazy let` → `lazy_val(lambda: ...)`; class-body `lazy let` → `@cached_property`.
+- ✅ Pipes (`a |> f() |> g(arg)` → `g(f(a), arg)`); guards (`guard x = expr else: ...`).
+- ✅ `comptime let` bindings with `env(name, default?)` lookup and the sandboxed evaluator (literals, arithmetic, comparisons, boolean ops, ternaries, `int() / str() / float()` casts, `if/elif/else`, `return`, local bindings). `comptime def` user-defined functions usable from initialisers.
+- ✅ `.dty` stub files compiling to PEP 561 `.pyi`; `tyc check --stubs` AST diff against runtime modules.
+
+### Tooling
+
+- ✅ `tyc init`, `tyc fmt`, `tyc check`, `tyc build`, `tyc run`, `tyc lsp`, `tyc repl`, `tyc debug`, `tyc trace`, `tyc profile`, `tyc migrate`, `tyc add` / `remove` / `sync`, `tyc ty`.
+- ✅ Source maps (`.py.map` v2 with per-statement `out_line → ty_line` tables) for `tyc trace` and cross-file go-to-definition.
+- ✅ `tower-lsp-server`-backed LSP: diagnostics, hover, go-to-definition, completion (visible bindings + keywords + builtins), "Remove unused import" code action.
+- ✅ Reference VS Code extension under `editors/vscode/`.
+
+### Project plumbing
+
+- ✅ CI (`cargo fmt`, `clippy -D warnings`, `cargo test --workspace`, `cargo-deny`).
+- ✅ Generated `typhon_runtime/` ships as local source — no PyPI dependency.
+
+## In progress (Phase 4+)
+
+- ✅ Automatic `asyncio.gather` inference (opt-in via `[strictness] auto-gather`).
+- ✅ Loop parallelisation for pure list comprehensions on free-threaded Python (opt-in via `[strictness] auto-parallel`, threshold `parallel-min-size`).
+- ✅ PGO via `tyc profile` (opt-in via `[strictness] pgo-memoise`).
+- ✅ LSP completions and "Remove unused import" code action.
+- ✅ Cross-file go-to-definition across `.ty` / `.py` boundaries.
+- ✅ `tyc migrate` (typed Python → Typhon).
+- ✅ `tyc repl`, `tyc debug`, `tyc run`.
+- ✅ `tyc add` / `remove` / `sync` package-manager surface over `uv`.
+
+## Deferred
+
+These items appear on the roadmap but are not actively being worked. They will land when the value justifies the effort.
+
+- ⏳ Richer `comptime`: container literals (`[...]`, `{...}`), string methods (`"hi".upper()`), `comptime def` evaluation in initialisers beyond the v1 expression grammar. (Today only literals, arithmetic, comparisons, boolean ops, ternaries, `env()`, `int() / str() / float()`, and references work.)
+- ⏳ Full structural subtyping with proper variance and bounded higher-kinded forms. Current implementation handles single-argument bounds and recursive structural conformance; complex multi-argument constraint solving is partial.
+- ⏳ `ty` integration as an embedded library (currently a subprocess call via `tyc ty`).
+- ⏳ Runtime `stubtest` introspection via `mypy --stubtest` as a complement to the AST-level `tyc check --stubs` diff. ([`tyc stubtest`](/Typhon/cli/stubtest/) wires the subprocess; the introspection probe itself is opt-in via `mypy` install.)
+- ⏳ A Typhon-native source-mapping debugger (current `tyc debug` is a thin `pdb` launcher; pair with `tyc trace` for frame remapping).
+- ⏳ Corpus round-trip sweep across a representative set of third-party Python projects.
+- ⏳ Phase 4+ `[emit] model-extra` knob to relax Pydantic `extra="forbid"`. (Currently the default is always `extra="forbid"`; the config key is documented as roadmap-only.)
+- ⏳ Async public-API stability rules if Phase 4+ ever introduces async inference. (Likely answer: inference applies to file-internal functions only; exported functions stay explicit.)
+
+## What "Phase X complete" means
+
+A phase is "complete" when every must-have feature from that phase has landed and is covered by tests. It does not mean the implementation is fully polished or that every diagnostic has the perfect wording. It means the feature is shippable and you can use it without hitting "not implemented" errors.
+
+## Versioning
+
+Typhon is pre-1.0. The semantics described in these docs are the *current* semantics, not the locked-in v1 spec. Breaking changes to surface syntax are tracked in the changelog and called out in [`tyc migrate`](/Typhon/cli/migrate/). Changes to emitted Python (the lowering) follow the same rules.
+
+Once the language hits 1.0, syntax is locked under semver. Until then, expect occasional renames and tightenings — none should break programs that follow the [Five Rules](/Typhon/tour/five-rules/).
+
+## How to follow along
+
+- **[GitHub](https://github.com/CodeHalwell/Typhon)** — issues, PRs, milestones.
+- **[Roadmap](/Typhon/project/roadmap/)** — canonical per-feature status.
+- **[Risks](/Typhon/project/risks/)** — known hazards and how we mitigate them.
+- **[Performance Baseline](/Typhon/project/performance/)** — measured numbers we will not regress.
+
+If a feature you want is not in the shipped list, file an issue. If a feature you do not want is in the shipped list, file an issue. Active development means the surface is still moveable.

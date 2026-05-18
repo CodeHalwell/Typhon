@@ -1,0 +1,77 @@
+---
+title: Welcome to Typhon
+description: A high-level orientation to Typhon — what it is, what it is not, and where to go next.
+sidebar:
+  order: 1
+---
+
+import { Card, CardGrid, Aside } from '@astrojs/starlight/components';
+
+Typhon is a statically-typed, stricter superset of Python. It compiles `.ty` source files to clean, idiomatic CPython 3.13+ — the same Python you would have written by hand, only with a compiler that has already enforced non-nullability, exhaustive matching, typed errors, and explicit concurrency on your behalf.
+
+The compiler and the language server live in a single Rust binary called `tyc`. There is no separate runtime, no plugin to install on production servers, no Pyhton package to add to your wheel — Typhon's output is *just Python*, and the few helpers it needs (the `Result` ADT, the lazy-import proxy, the strong-ref task registry) are emitted alongside your code as a generated `typhon_runtime/` module the build owns.
+
+## The 30-second mental model
+
+> **Every `.ty` file emits valid, idiomatic `.py`. Not all `.py` is valid Typhon.**
+
+That single line is the contract. If you can read Python, you can read Typhon — the syntax is deliberately close. What is different is what the *compiler* will let you write. Where Python is permissive ("the runtime will figure it out"), Typhon insists you commit at compile time: every parameter and return type annotated; every local binding marked `let` or `mut`; every nullable value narrowed before use; every sealed-union match exhaustive; every untyped escape hatch confined to a clearly-named `unsafe:` region.
+
+If TypeScript is "JavaScript with a static-safety jacket on", Typhon is the same idea for Python — with sharper opinions about error handling, immutability, and concurrency.
+
+## What this documentation contains
+
+These docs are intended to be **the only manual anyone will ever need to learn, use, and contribute to Typhon.** They are organised the way you read a programming-language book: starting with the philosophy and design decisions, walking the language feature by feature, exhausting the type system, drilling into every CLI subcommand and every config knob, cataloguing every diagnostic, and finally opening the hood on the compiler internals for the people who want to hack on `tyc` itself.
+
+<CardGrid>
+  <Card title="Just trying it out?" icon="rocket">
+    Read [the ethos](/Typhon/introduction/ethos/), then [install `tyc`](/Typhon/getting-started/installation/) and walk the [Five Rules](/Typhon/tour/five-rules/).
+  </Card>
+  <Card title="Already writing Typhon?" icon="open-book">
+    The [language tour](/Typhon/tour/values-bindings/) covers every feature with worked examples. The [language reference](/Typhon/reference/lexical/) is the syntax-form-by-syntax-form spec.
+  </Card>
+  <Card title="Coming from typed Python?" icon="pencil">
+    Read [Migrating from Python](/Typhon/recipes/migrating/) and run [`tyc migrate`](/Typhon/cli/migrate/) on a single file to see the rewrites.
+  </Card>
+  <Card title="Hacking on the compiler?" icon="seti:rust">
+    Start at [the architecture overview](/Typhon/internals/architecture/) and then [Adding a Diagnostic](/Typhon/internals/adding-diagnostic/).
+  </Card>
+</CardGrid>
+
+## How to read these docs
+
+The sidebar groups pages into roughly the order you would want them when you encounter the language for the first time:
+
+1. **Introduction** — ethos, design decisions, comparisons, and project status. Skim this once before you write any code; it will save you arguing with the compiler later.
+2. **Getting Started** — install, scaffold, edit, build, run. Concrete, hands-on.
+3. **Language Tour** — each major feature with worked examples and the Python it emits.
+4. **Type System** — every shape the type checker understands.
+5. **Language Reference** — the syntax-form-by-syntax-form spec.
+6. **How Typhon Lowers** — what each Typhon construct compiles into, why, and the runtime helpers it depends on.
+7. **Tooling (tyc CLI)** — every subcommand and flag.
+8. **Configuration** — every key in `typhon.toml`.
+9. **Interop with Python** — `.dty` stubs, `.pyi` emission, Pydantic models, escape hatches for framework base classes.
+10. **Diagnostics Catalog** — every error and warning the compiler emits, with examples and fixes.
+11. **Recipes & Patterns** — worked examples for common real-world tasks.
+12. **Common Pitfalls** — the mistakes every newcomer makes.
+13. **Compiler Internals** — the pipeline, the Salsa DB, the vendored Ruff fork, and how to add features.
+14. **Project** — roadmap, risks, prior art, glossary, FAQ.
+
+You do not need to read top-to-bottom. The sidebar is structured so that any one page makes sense in isolation. Cross-references between pages do the linking work for you.
+
+## What Typhon is *not*
+
+Lest you waste an hour testing the wrong assumption:
+
+- **Not a new runtime.** Typhon targets CPython 3.13+. The emitted `.py` runs under the standard interpreter you already have. The free-threaded 3.13t / 3.14t build is opt-in and additive, not required.
+- **Not a Mojo.** Typhon does not invent new datatypes or a new ABI. It does not aim to outperform CPython on hot loops — that is Cython's job. Typhon is a *static-safety* tool, not a *performance* tool. (You get small wins from `@memo`, lazy loading, and parallel `gather:`, but they are side effects, not the pitch.)
+- **Not a typing-spec conformance race.** `ty` and Pyrefly are the reference Python type checkers in 2026. Typhon's checker is custom because Typhon has rules Python doesn't (non-null defaults, `Result[T, E]`, sealed unions, `let`/`mut`). For pure typing-spec edge cases the [`tyc ty`](/Typhon/cli/ty/) subcommand can defer to Astral's checker.
+- **Not a Python superset for *every* Python program.** Some patterns (subclassing `torch.nn.Module`, `Enum`, `unittest.TestCase`) need the [`class!` escape hatch](/Typhon/interop/class-escape/). Some patterns (monkey-patching built-ins, `Optional[T] = T | None` without `?`, untagged `Any` everywhere) are simply not expressible without `unsafe:`.
+
+## A pithy version
+
+A friend of mine who writes a lot of Python and a lot of Rust summarised Typhon like this:
+
+> "Python you can refactor at 2am without breaking production."
+
+That is the brief. Now read on.

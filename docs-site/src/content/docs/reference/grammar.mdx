@@ -1,0 +1,185 @@
+---
+title: Grammar Cheat Sheet
+description: A one-page summary of Typhon's grammar — every form, in EBNF-ish notation.
+sidebar:
+  order: 21
+---
+
+A one-page summary of Typhon's grammar. Each form links to its detail page.
+
+## Module
+
+```
+module ::= statement*
+```
+
+## Statements
+
+```
+statement ::= import_stmt
+            | binding_stmt
+            | function_def
+            | class_def
+            | interface_def
+            | impl_block
+            | extend_block
+            | type_alias
+            | if_stmt | while_stmt | for_stmt | match_stmt
+            | try_stmt | with_stmt | unsafe_block | gather_block | guard_stmt
+            | go_stmt | return_stmt | raise_stmt | pass | break | continue
+            | expression_stmt
+            | comptime_let | comptime_def
+            | lazy_import | lazy_let
+```
+
+## Bindings
+
+```
+let_binding   ::= "let"  NAME [":" TYPE] "=" EXPR
+mut_binding   ::= "mut"  NAME [":" TYPE] "=" EXPR
+module_let    ::= NAME ":" TYPE "=" EXPR              (implicit let at module top-level)
+```
+
+See [`let` and `mut`](/Typhon/reference/let-mut/).
+
+## Functions
+
+```
+function_def  ::= [decorator]* ["async"] "def" NAME [type_params] "(" parameters ")" "->" TYPE ":" suite
+type_params   ::= "[" type_param ("," type_param)* "]"
+type_param    ::= NAME [":" BOUND]
+parameters    ::= ["/"|"*"] [(NAME ":" TYPE ["=" DEFAULT]) ("," ...)*]
+```
+
+See [Function Definitions](/Typhon/reference/functions/).
+
+## Classes
+
+```
+class_def     ::= "class" ["!"] NAME [type_params] [bases] ["frozen"] ":" class_body
+model_def     ::= "model" NAME [type_params] [bases] ":" class_body
+class_body    ::= (field | lazy_let | docstring | pass)+
+
+field         ::= NAME ":" TYPE ["=" DEFAULT]
+bases         ::= "(" expr ("," expr)* ")"
+```
+
+See [`class`, `model`, `class!`](/Typhon/reference/classes/).
+
+## Methods
+
+```
+impl_block    ::= "impl" [type_params] CLASS_NAME [type_args] ":" (method_def | pass)+
+extend_block  ::= "extend" [type_params] CLASS_NAME [type_args] ":" (method_def | pass)+
+method_def    ::= function_def     (must take `self` as first param)
+```
+
+See [`impl` and `extend`](/Typhon/reference/impl-extend/).
+
+## Interfaces
+
+```
+interface_def ::= "interface" NAME [type_params] [bases] ":" interface_body
+interface_body ::= (method_sig | field | pass)+
+method_sig    ::= "def" NAME [type_params] "(" parameters ")" "->" TYPE
+```
+
+See [`interface`](/Typhon/reference/interface/).
+
+## Type aliases
+
+```
+type_alias    ::= "type" NAME [type_params] "=" TYPE
+```
+
+See [Type Aliases](/Typhon/types/aliases/).
+
+## Control flow
+
+```
+if_stmt       ::= "if" EXPR ":" suite ("elif" EXPR ":" suite)* ["else" ":" suite]
+while_stmt    ::= "while" EXPR ":" suite
+for_stmt      ::= "for" TARGET "in" EXPR ":" suite
+match_stmt    ::= "match" EXPR ":" (case_arm)+
+case_arm      ::= "case" PATTERN ["if" GUARD] ":" suite
+try_stmt      ::= "try" ":" suite (except_clause)+ ["else" ":" suite] ["finally" ":" suite]
+with_stmt     ::= "with" (CTX ["as" NAME]) ("," CTX ["as" NAME])* ":" suite
+                 | "with" (NAME "=" EXPR "?")+ ":" suite ["else" NAME ":" suite]   (Result chain)
+guard_stmt    ::= "guard" NAME "=" EXPR "else" ":" suite
+unsafe_block  ::= "unsafe" ":" suite
+```
+
+See [Control Flow tour](/Typhon/tour/control-flow/), [`guard`](/Typhon/reference/guard/), [`with`-chains](/Typhon/reference/with-chains/), [`match`](/Typhon/reference/match/).
+
+## Async / concurrency
+
+```
+async_def     ::= "async" function_def
+await_expr    ::= "await" EXPR
+gather_block  ::= "gather" ["(" "strategy" "=" STRING ")"] ":" (NAME "=" EXPR)+
+go_stmt       ::= "go" CALL ["->" NAME]
+```
+
+See [`async`, `await`, `gather`, `go`](/Typhon/reference/async/).
+
+## Lazy
+
+```
+lazy_import   ::= "lazy" "import" NAME ["as" NAME | "=" NAME]
+lazy_let      ::= "lazy" "let" NAME ":" TYPE "=" EXPR
+lazy_method   ::= "lazy" "let" NAME ":" TYPE ":" suite   (class body — emits @cached_property)
+lazy_type     ::= "lazy" "[" TYPE "]"
+```
+
+See [`lazy`](/Typhon/reference/lazy/).
+
+## Comptime
+
+```
+comptime_let  ::= "comptime" "let" NAME ":" TYPE "=" EXPR
+comptime_def  ::= "comptime" "def" NAME "(" parameters ")" "->" TYPE ":" suite
+```
+
+See [`comptime`](/Typhon/reference/comptime/).
+
+## Error handling
+
+```
+question_expr ::= EXPR "?"          (only on Result-typed expressions in Result-returning fns)
+Result_type   ::= "Result" "[" TYPE "," TYPE "]"
+Ok_call       ::= "Ok" "(" EXPR ")"
+Err_call      ::= "Err" "(" EXPR ")"
+```
+
+See [`Result, Ok, Err`](/Typhon/reference/result/), [The ? Operator](/Typhon/reference/question-operator/).
+
+## Types
+
+```
+type          ::= primitive | container | generic | nullable | callable | union | "Any"
+primitive     ::= "int" | "float" | "bool" | "str" | "bytes" | "None"
+container     ::= "list" "[" type "]"
+                | "dict" "[" type "," type "]"
+                | "set" "[" type "]"
+                | "tuple" "[" type ("," type)* | type "," "..." "]"
+generic       ::= NAME "[" type ("," type)* "]"
+nullable      ::= type "?"                       (sugar for `type | None`)
+callable      ::= "Callable" "[" "[" type ("," type)* "]" "," type "]"
+union         ::= type "|" type
+```
+
+## Operators
+
+See [Operators and Precedence](/Typhon/reference/operators/).
+
+## Decorators
+
+```
+decorator     ::= "@" expression NEWLINE
+```
+
+Python-standard decorators plus Typhon's `@pure`, `@memo`, `@pure(memo=True)`, `@gatherable`. See [Decorators](/Typhon/reference/decorators/).
+
+## Where next
+
+If you've landed here looking for syntax: pick the form you need from the sidebar. Each linked page has the full reference.
