@@ -43,6 +43,21 @@ pub enum TycError {
         assignment: SourceSpan,
     },
 
+    /// A field on a `frozen` class was assigned outside the constructor.
+    #[error("cannot assign to field '{field}' on frozen class `{class}`")]
+    #[diagnostic(
+        code(tyc::frozen_assign),
+        help("`frozen` classes are immutable. Construct a new `{class}` with the desired values instead of mutating in place.")
+    )]
+    FrozenAssign {
+        class: String,
+        field: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("assignment to frozen field")]
+        span: SourceSpan,
+    },
+
     /// A name is used but never declared in any enclosing scope.
     #[error("cannot find '{name}' in scope")]
     #[diagnostic(
@@ -835,6 +850,23 @@ impl TycError {
         }
     }
 
+    /// Construct a [`TycError::FrozenAssign`] diagnostic.
+    pub fn frozen_assign(
+        class: impl Into<String>,
+        field: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::FrozenAssign {
+            class: class.into(),
+            field: field.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
     /// Construct an [`TycError::ImmutableAssign`] diagnostic.
     pub fn immutable_assign(
         name: impl Into<String>,
@@ -1095,6 +1127,15 @@ mod tests {
         let e = TycError::immutable_assign("x", "a.ty", "val x: int = 1\nx = 2", 4, 1, 15, 1);
         assert!(matches!(e, TycError::ImmutableAssign { .. }));
         assert!(e.to_string().contains("x"));
+    }
+
+    #[test]
+    fn frozen_assign_contains_class_and_field() {
+        let e = TycError::frozen_assign("Identity", "name", "a.ty", "i.name = \"Bob\"", 0, 6);
+        assert!(matches!(e, TycError::FrozenAssign { .. }));
+        let msg = e.to_string();
+        assert!(msg.contains("Identity"));
+        assert!(msg.contains("name"));
     }
 
     // ── Diagnostics collection API ────────────────────────────────────────────

@@ -306,6 +306,33 @@ mod tests {
     }
 
     #[test]
+    fn check_reports_frozen_field_write_as_error() {
+        // End-to-end guard for the user-visible flow: `tyc check` must
+        // surface `tyc::frozen_assign` instead of letting the program
+        // build cleanly and crash at runtime with `FrozenInstanceError`.
+        let tmp = tempfile::tempdir().unwrap();
+        write_ty(
+            tmp.path(),
+            "frozen.ty",
+            "\
+class Identity frozen:
+    name: str
+
+let i: Identity = Identity(name=\"Alice\")
+i.name = \"Bob\"
+",
+        );
+        let args = CheckArgs {
+            paths: vec![tmp.path().to_path_buf()],
+            stubs: false,
+        };
+        assert!(
+            run(args).is_err(),
+            "writes to a frozen class field must fail `tyc check`"
+        );
+    }
+
+    #[test]
     fn check_stubs_passes_for_matching_stub_and_impl() {
         let tmp = tempfile::tempdir().unwrap();
         // The stub and implementation expose the same function with the
