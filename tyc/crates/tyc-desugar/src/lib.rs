@@ -958,14 +958,25 @@ fn desugar_stmts(stmts: &[Stmt], raw_class_starts: &[u32]) -> (Vec<Stmt>, bool) 
 /// Returns the (possibly modified) statement and whether any class was
 /// transformed at this level or deeper.  `raw_class_starts` is the list
 /// of preprocessed-source byte offsets where a `class!` was declared;
-/// classes whose `TextRange` starts at one of those offsets are emitted
-/// without the automatic `@dataclass` decorator.
+/// classes whose `TextRange` covers one of those offsets (between the
+/// node start and the class name) are emitted without the automatic
+/// `@dataclass` decorator.
 fn desugar_stmt(stmt: &Stmt, raw_class_starts: &[u32]) -> (Stmt, bool) {
     match stmt {
         Stmt::ClassDef(c) => {
-            let is_raw = raw_class_starts
-                .binary_search(&u32::from(c.range.start()))
-                .is_ok();
+            // We can't compare against `c.range.start()` directly because
+            // Ruff sets that to the `@` token when the class has
+            // decorators — but the preprocessor's recorded offset points
+            // at the `class` keyword, which sits on a later line. Match
+            // instead by looking for any recorded offset in the half-open
+            // range `[c.range.start(), c.name.range.start())` — the
+            // `class` keyword always lives in that window regardless of
+            // decorators, and a nested raw class inside this one would
+            // sit beyond `c.name.range.start()`.
+            let class_start = u32::from(c.range.start());
+            let name_start = u32::from(c.name.range.start());
+            let is_raw = raw_class_starts.partition_point(|&off| off < class_start)
+                != raw_class_starts.partition_point(|&off| off < name_start);
             let is_pydantic = class_inherits_basemodel(c);
             // `impl` pseudo-classes (`__typhon_impl_*`) are temporary stubs
             // that will be merged into their target class by `merge_impl_blocks`;
@@ -1383,14 +1394,17 @@ fn raw_class_init_insert_pos(body: &[Stmt]) -> usize {
 
 /// Synthesise an `__init__(self, …) -> None` for a `class!` body. The
 /// function calls `super().__init__()` first, then assigns every
-/// `AnnAssign`-declared field through `self`. Fields with a default value
-/// become keyword-defaulted parameters in source order.
+/// `AnnAssign`-declared field through `self`. Fields without a default
+/// come before fields with one — Python disallows a default-bearing
+/// positional parameter from preceding a non-default one, so we
+/// stable-partition the field list to keep the generated signature
+/// valid. Relative order within each group is preserved.
 fn synthesise_raw_class_init(body: &[Stmt]) -> Stmt {
     use ruff_python_ast::{StmtAnnAssign, StmtFunctionDef};
     // Collect (name, annotation, optional default) for each top-level
     // annotated field. Non-Name targets (subscript / attribute annotations)
     // are skipped — they're not fields.
-    let fields: Vec<(&Name, Expr, Option<Expr>)> = body
+    let raw_fields: Vec<(&Name, Expr, Option<Expr>)> = body
         .iter()
         .filter_map(|s| {
             if let Stmt::AnnAssign(StmtAnnAssign {
@@ -1407,6 +1421,13 @@ fn synthesise_raw_class_init(body: &[Stmt]) -> Stmt {
             None
         })
         .collect();
+    // Stable partition: non-defaulted params first, then defaulted ones.
+    let (no_default, with_default): (Vec<_>, Vec<_>) = raw_fields
+        .iter()
+        .cloned()
+        .partition(|(_, _, default)| default.is_none());
+    let fields: Vec<(&Name, Expr, Option<Expr>)> =
+        no_default.into_iter().chain(with_default).collect();
 
     // Build the parameter list: `self` + one entry per field.
     let mut args: Vec<ParameterWithDefault> = Vec::with_capacity(fields.len() + 1);
@@ -1436,9 +1457,12 @@ fn synthesise_raw_class_init(body: &[Stmt]) -> Stmt {
     }
 
     // Build the body: `super().__init__()` followed by `self.x = x` …
-    let mut new_body: Vec<Stmt> = Vec::with_capacity(fields.len() + 1);
+    // Assignments use source order (the `raw_fields` order, not the
+    // partitioned signature order) so the body reads top-to-bottom like
+    // the original class definition.
+    let mut new_body: Vec<Stmt> = Vec::with_capacity(raw_fields.len() + 1);
     new_body.push(make_super_init_call_stmt());
-    for (name, _, _) in &fields {
+    for (name, _, _) in &raw_fields {
         new_body.push(make_self_field_assign_stmt(name.as_str()));
     }
 
@@ -1780,6 +1804,83 @@ mod tests {
         assert!(
             layer_pos < init_pos,
             "fields should precede __init__:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn raw_class_with_decorator_still_recognised() {
+        // Ruff sets `StmtClassDef.range.start()` to the `@` token when
+        // decorators are present, but the preprocessor records the
+        // `class` keyword line. The desugar pass must look at the
+        // header span (start..name) rather than the node start, or this
+        // raw class would silently receive `@dataclass`. The source
+        // here is the *post-preprocess* form (the `!` is already
+        // stripped), matching what `tyc_syntax::parse_module` sees.
+        let src = "@deco\nclass Net(Module):\n    rank: int\n";
+        let parsed = tyc_syntax::parse_module(src).expect("parse failed");
+        let module = parsed.into_syntax();
+        // Match what `tyc_syntax::preprocess::line_byte_starts` would
+        // emit for the `class!` line: the byte offset of the `class`
+        // keyword (after leading whitespace).
+        let class_kw = src.find("class").unwrap() as u32;
+        let out = desugar_module_with(
+            &module,
+            DesugarOptions {
+                memoise_functions: Vec::new(),
+                raw_class_line_starts: vec![class_kw],
+            },
+        );
+        let emitted = emit(&out.module);
+        assert!(
+            !emitted.contains("@dataclasses.dataclass"),
+            "decorated raw class must skip @dataclass:\n{emitted}"
+        );
+        assert!(
+            emitted.contains("def __init__(self, rank: int) -> None:"),
+            "decorated raw class must still get the synthesised __init__:\n{emitted}"
+        );
+        assert!(
+            emitted.contains("@deco"),
+            "the author's decorator must survive:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn raw_class_defaults_partition_to_keep_signature_valid() {
+        // Source order is x (default) → y (no default) → z (no default).
+        // Naive emission would produce `def __init__(self, x=1, y, z)`,
+        // which is a SyntaxError. The synthesis must stable-partition so
+        // non-defaulted params come first.
+        let src = "class Net(Module):\n    x: int = 1\n    y: int\n    z: str\n";
+        let (module, starts) = raw_class_starts_for(src);
+        let out = desugar_module_with(
+            &module,
+            DesugarOptions {
+                memoise_functions: Vec::new(),
+                raw_class_line_starts: starts,
+            },
+        );
+        let emitted = emit(&out.module);
+        assert!(
+            emitted.contains("def __init__(self, y: int, z: str, x: int = 1) -> None:"),
+            "synthesised __init__ must reorder defaults to the tail:\n{emitted}"
+        );
+        // Assignment block stays in source order (reads top-to-bottom).
+        let body_order = emitted
+            .lines()
+            .filter_map(|l| {
+                let t = l.trim();
+                if let Some(rest) = t.strip_prefix("self.") {
+                    rest.split(' ').next()
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            body_order,
+            vec!["x", "y", "z"],
+            "self.<field> assignments must follow source order:\n{emitted}"
         );
     }
 

@@ -79,9 +79,12 @@ impl Emitter {
         self.output.push('\n');
     }
 
-    /// Extend `self.output` with newlines until it ends in exactly `count`
-    /// `\n` bytes.  Used to enforce PEP 8's two-blank-line rule around
-    /// top-level class/def blocks (two blanks = three trailing `\n`).
+    /// Append newlines until `self.output` ends in *at least* `count`
+    /// trailing `\n` bytes (existing trailing newlines are preserved, not
+    /// trimmed). Used to enforce PEP 8's two-blank-line rule around
+    /// top-level class/def blocks: two blanks = three trailing `\n`.
+    /// Callers rely on the floor; nothing in the pipeline produces a
+    /// runaway tail of newlines, so trimming would only mask bugs.
     fn ensure_trailing_newlines(&mut self, count: usize) {
         let trailing = self
             .output
