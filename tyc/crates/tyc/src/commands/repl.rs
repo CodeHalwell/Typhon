@@ -203,8 +203,7 @@ impl ReplSession {
             .suffix(".py")
             .tempfile()
             .map_err(|e| miette!("cannot create temp file: {e}"))?;
-        std::fs::write(tmp.path(), &py)
-            .map_err(|e| miette!("cannot write temp file: {e}"))?;
+        std::fs::write(tmp.path(), &py).map_err(|e| miette!("cannot write temp file: {e}"))?;
 
         let output = Command::new(&self.python)
             .arg(tmp.path())
@@ -287,7 +286,10 @@ mod tests {
     fn compile_simple_assignment_returns_python() {
         let py = compile_to_python("let x: int = 42\n").expect("should compile");
         assert!(py.contains("x"), "emitted python should mention `x`: {py}");
-        assert!(py.contains("42"), "emitted python should mention `42`: {py}");
+        assert!(
+            py.contains("42"),
+            "emitted python should mention `42`: {py}"
+        );
     }
 
     #[test]
@@ -303,12 +305,16 @@ mod tests {
     #[test]
     fn session_rejects_bad_block_and_keeps_state() {
         let mut s = ReplSession::new("python3".into());
-        s.feed_block("let x: int = 1\n").expect("good block accepted");
+        s.feed_block("let x: int = 1\n")
+            .expect("good block accepted");
         let err = s.feed_block("let y: int = \"nope\"\n");
         assert!(err.is_err(), "bad block must be rejected");
         // The good block is still in the session.
         assert!(s.source().contains("x: int = 1"));
-        assert!(!s.source().contains("nope"), "bad block must not be committed");
+        assert!(
+            !s.source().contains("nope"),
+            "bad block must not be committed"
+        );
     }
 
     #[test]

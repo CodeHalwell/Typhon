@@ -280,7 +280,11 @@ fn build_processes_nested_src_files() {
 
     assert!(tmp.path().join("build").join("main.py").exists());
     assert!(
-        tmp.path().join("build").join("pkg").join("util.py").exists(),
+        tmp.path()
+            .join("build")
+            .join("pkg")
+            .join("util.py")
+            .exists(),
         "nested .ty should produce nested .py"
     );
 }
@@ -332,11 +336,16 @@ fn check_passes_on_clean_function() {
         "def add(a: int, b: int) -> int:\n    return a + b\n",
     )
     .unwrap();
-    assert!(tyc().arg("check").arg(tmp.path()).status().unwrap().success());
+    assert!(tyc()
+        .arg("check")
+        .arg(tmp.path())
+        .status()
+        .unwrap()
+        .success());
 }
 
 #[test]
-fn check_fails_when_None_assigned_to_non_optional() {
+fn check_fails_when_none_assigned_to_non_optional() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("n.ty"), "let x: int = None\n").unwrap();
     let status = tyc().arg("check").arg(tmp.path()).status().unwrap();
@@ -398,10 +407,7 @@ fn tyc_version_returns_zero() {
 #[test]
 fn tyc_unknown_subcommand_fails() {
     let status = tyc().arg("nonsense").status().unwrap();
-    assert!(
-        !status.success(),
-        "unknown subcommand should exit non-zero"
-    );
+    assert!(!status.success(), "unknown subcommand should exit non-zero");
 }
 
 // ── trace command — extra cases ──────────────────────────────────────────────
@@ -503,7 +509,10 @@ fn repl_rejects_type_error_block_keeps_session() {
     assert!(out.status.success(), "repl should not crash on type error");
     let stdout = String::from_utf8_lossy(&out.stdout);
     // First block ok → 1 isn't auto-printed but x is still in scope for `print(x)`.
-    assert!(stdout.contains('1'), "session state should survive; got:\n{stdout}");
+    assert!(
+        stdout.contains('1'),
+        "session state should survive; got:\n{stdout}"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.to_lowercase().contains("error")
@@ -531,12 +540,7 @@ fn repl_load_flag_preloads_file() {
         .spawn()
         .unwrap();
     use std::io::Write;
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(b":quit\n")
-        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(b":quit\n").unwrap();
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -767,8 +771,8 @@ fn typhon_runtime_init_reexports_result_and_stdlib() {
     let tmp = tempfile::tempdir().unwrap();
     scaffold(tmp.path(), "def f() -> Ok[int]:\n    return Ok(1)\n");
     build(tmp.path());
-    let init = std::fs::read_to_string(tmp.path().join("build/typhon_runtime/__init__.py"))
-        .unwrap();
+    let init =
+        std::fs::read_to_string(tmp.path().join("build/typhon_runtime/__init__.py")).unwrap();
     assert!(init.contains("stdlib"), "stdlib should be re-exported");
     assert!(init.contains("result"), "result should be re-exported");
 }
@@ -862,11 +866,7 @@ fn build_writes_relative_to_typhon_toml_not_cwd() {
 fn check_accepts_default_dot_path() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("only.ty"), "let x: int = 1\n").unwrap();
-    let status = tyc()
-        .current_dir(tmp.path())
-        .arg("check")
-        .status()
-        .unwrap();
+    let status = tyc().current_dir(tmp.path()).arg("check").status().unwrap();
     assert!(status.success(), "tyc check with no path should scan cwd");
 }
 
@@ -906,6 +906,9 @@ fn fmt_check_fails_if_any_file_needs_changes() {
 #[test]
 fn cargo_bin_exe_path_is_set() {
     let path = PathBuf::from(env!("CARGO_BIN_EXE_tyc"));
-    assert!(path.exists(), "CARGO_BIN_EXE_tyc should point at a real file");
+    assert!(
+        path.exists(),
+        "CARGO_BIN_EXE_tyc should point at a real file"
+    );
     assert!(path.is_file());
 }
