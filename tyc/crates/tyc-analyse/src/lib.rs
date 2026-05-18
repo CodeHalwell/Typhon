@@ -46,7 +46,10 @@ use tyc_syntax::preprocess::ComptimeBinding;
 const MAX_COMPTIME_DEPTH: usize = 64;
 
 pub mod auto_gather;
-pub use auto_gather::{collect_gatherable_async_fn_names, rewrite_auto_gather, AutoGatherStats};
+pub use auto_gather::{
+    collect_gatherable_async_fn_names, detect_missed_gathers, rewrite_auto_gather,
+    AutoGatherStats, MissedGather,
+};
 
 pub mod pgo;
 pub use pgo::{load_profile_samples, pgo_memoise_targets, ProfileSample};

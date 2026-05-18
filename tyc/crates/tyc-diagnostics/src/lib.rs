@@ -395,6 +395,31 @@ pub enum TycError {
         #[label("declare with `let` or `mut`")]
         span: SourceSpan,
     },
+
+    /// Two or more adjacent `await CALLEE(...)` statements look
+    /// independent enough to fold into an `asyncio.TaskGroup` block,
+    /// but at least one callee is a same-module `async def` that
+    /// lacks the `@gatherable` decorator. The auto-gather pass only
+    /// rewrites runs where every callee carries `@gatherable` (the
+    /// decorator is the user's attestation that the function is safe
+    /// to run concurrently with peers); without it, the awaits stay
+    /// sequential silently. This advice-level diagnostic surfaces the
+    /// missed opportunity so users can decide whether to decorate.
+    #[error(
+        "two or more adjacent awaits look gather-able but `{missing}` is not decorated `@gatherable`"
+    )]
+    #[diagnostic(
+        severity(Advice),
+        code(tyc::auto_gather_missed),
+        help("decorate `{missing}` (and any other same-module async callees in the run) with `@gatherable` to fold the awaits into an `asyncio.TaskGroup` automatically")
+    )]
+    AutoGatherMissed {
+        missing: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("auto-gather skipped this run")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -790,6 +815,21 @@ impl TycError {
     ) -> Self {
         Self::MissingBindingKind {
             name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::AutoGatherMissed`] advice diagnostic.
+    pub fn auto_gather_missed(
+        missing: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::AutoGatherMissed {
+            missing: missing.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }
