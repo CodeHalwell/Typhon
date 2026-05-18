@@ -7,12 +7,24 @@
 //! not re-displayed every iteration.
 //!
 //! Limitations:
-//!   - The REPL recompiles the entire session each evaluation; large
-//!     sessions get slower. Acceptable for v1 exploratory use.
-//!   - Expression statements are *not* auto-printed; the user must call
-//!     `print(...)` explicitly. This matches Python's `python -c` and
-//!     keeps the REPL identical in behaviour to `tyc build` + run.
-//!   - There is no readline support; arrow keys insert escape sequences.
+//!   - **Re-execution semantics.** Each prompt re-runs the entire
+//!     accumulated session against a fresh interpreter. Any side effects
+//!     in prior blocks (network calls, file writes, mutation of external
+//!     state, `random`, timestamps) therefore fire *once per prompt*.
+//!     Treat the REPL as a scratch pad for pure code; reach for `tyc
+//!     build` + `python` for anything with externally visible effects.
+//!   - **"New output" diffing.** The visible tail is computed as the
+//!     suffix of the new stdout past the previous run's stdout length.
+//!     When earlier prints are non-deterministic the diff is best-effort
+//!     and can either show "old" lines again or hide changes. The
+//!     stdout slice is taken on a char boundary, so a divergent prefix
+//!     containing multi-byte characters never panics.
+//!   - **Multi-line blocks** end on the first blank line — matching
+//!     Python's own REPL, which is also unable to contain a blank line
+//!     inside a `def` / `class` body when typed directly.
+//!   - **No auto-print** of expression statements; use `print(...)`
+//!     explicitly. Keeps the REPL identical to `tyc build` + run.
+//!   - No readline support; arrow keys insert escape sequences.
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -23,7 +35,7 @@ use miette::{miette, Result};
 
 use tyc_db::{check_file, TycDatabase};
 use tyc_desugar::{desugar_module_with, DesugarOptions};
-use tyc_emit::emit_with_line_offsets;
+use tyc_emit::emit_python_with_line_offsets;
 use tyc_syntax::preprocess::{
     expand_gather_blocks, expand_go_calls, expand_lazy_imports, expand_pipes, expand_question_ops,
     expand_with_chains, preprocess,
@@ -32,9 +44,10 @@ use tyc_syntax::preprocess::{
 /// Arguments for `tyc repl`.
 #[derive(Args, Debug)]
 pub struct ReplArgs {
-    /// Python interpreter to use (defaults to `python3`).
-    #[arg(long, value_name = "PATH", default_value = "python3")]
-    pub python: String,
+    /// Python interpreter to use.  When omitted, `tyc` searches for
+    /// `python3.13`, `python3.12`, then `python3` on `PATH`.
+    #[arg(long, value_name = "PATH")]
+    pub python: Option<String>,
 
     /// Pre-load this `.ty` file as the initial session before prompting.
     #[arg(long, value_name = "FILE")]
@@ -42,7 +55,16 @@ pub struct ReplArgs {
 }
 
 pub fn run(args: ReplArgs) -> Result<()> {
-    let mut session = ReplSession::new(args.python.clone());
+    let python = match args.python.clone() {
+        Some(p) => p,
+        None => discover_python().ok_or_else(|| {
+            miette!(
+                "no Python interpreter found on PATH (tried python3.13, python3.12, python3); \
+                 pass --python <path>"
+            )
+        })?,
+    };
+    let mut session = ReplSession::new(python.clone());
 
     if let Some(path) = args.load.as_deref() {
         let src = std::fs::read_to_string(path)
@@ -57,7 +79,7 @@ pub fn run(args: ReplArgs) -> Result<()> {
     println!(
         "tyc repl — Typhon {} on {}\nType `:quit` to exit, `:reset` to clear, `:show` to dump the session.",
         env!("CARGO_PKG_VERSION"),
-        args.python
+        python
     );
 
     let stdin = std::io::stdin();
@@ -94,10 +116,12 @@ pub fn run(args: ReplArgs) -> Result<()> {
             _ => {}
         }
 
-        // Multi-line: if the line ends with `:` or `\`, keep reading until a
-        // blank line. Keeps `def`/`class` blocks practical.
+        // Multi-line: if the line ends with `:` or `\`, keep reading until
+        // a blank line. Keeps `def`/`class` blocks practical. EOF mid-
+        // block exits cleanly rather than half-compiling a torn block.
         let mut block = String::from(line);
         block.push('\n');
+        let mut hit_eof = false;
         if needs_continuation(line) {
             loop {
                 write!(stdout, "... ").ok();
@@ -107,6 +131,7 @@ pub fn run(args: ReplArgs) -> Result<()> {
                     .read_line(&mut buf)
                     .map_err(|e| miette!("read failed: {e}"))?;
                 if n == 0 {
+                    hit_eof = true;
                     break;
                 }
                 if buf.trim().is_empty() {
@@ -115,6 +140,10 @@ pub fn run(args: ReplArgs) -> Result<()> {
                 block.push_str(buf.trim_end_matches(['\r', '\n']));
                 block.push('\n');
             }
+        }
+        if hit_eof {
+            writeln!(stdout).ok();
+            break;
         }
 
         // Try to compile; on error, roll back and report.
@@ -145,12 +174,18 @@ fn needs_continuation(line: &str) -> bool {
 
 // ── session state ────────────────────────────────────────────────────────────
 
-/// Holds the accumulated `.ty` source and the last stdout we observed, so we
-/// can emit only the new tail after each evaluation.
+/// Holds the accumulated `.ty` source plus the cached emit and last-run
+/// stdout, so each prompt does one compile (in `feed_block`) and one
+/// subprocess invocation (in `evaluate`).
 struct ReplSession {
     python: String,
     blocks: Vec<String>,
-    last_stdout_len: usize,
+    /// Emitted Python from the most-recently-accepted `feed_block`,
+    /// reused by `evaluate`.
+    cached_py: Option<String>,
+    /// Previous run's stdout, for computing the new tail without
+    /// slicing on a byte offset that might split a UTF-8 code point.
+    last_stdout: String,
 }
 
 impl ReplSession {
@@ -158,13 +193,15 @@ impl ReplSession {
         Self {
             python,
             blocks: Vec::new(),
-            last_stdout_len: 0,
+            cached_py: None,
+            last_stdout: String::new(),
         }
     }
 
     fn reset(&mut self) {
         self.blocks.clear();
-        self.last_stdout_len = 0;
+        self.cached_py = None;
+        self.last_stdout.clear();
     }
 
     fn source(&self) -> String {
@@ -172,31 +209,37 @@ impl ReplSession {
     }
 
     /// Type-check `block` in the *context* of the current session before
-    /// committing it. Rejecting bad blocks here keeps the cumulative source
-    /// from getting wedged.
+    /// committing it.  On success the emitted Python is cached so the
+    /// follow-up `evaluate` call doesn't have to re-compile.
     fn feed_block(&mut self, block: &str) -> Result<()> {
         let mut trial = self.source();
         if !trial.ends_with('\n') {
             trial.push('\n');
         }
         trial.push_str(block);
-        compile_to_python(&trial)?;
+        let py = compile_to_python(&trial)?;
         self.blocks.push(if block.ends_with('\n') {
             block.to_owned()
         } else {
             format!("{block}\n")
         });
+        self.cached_py = Some(py);
         Ok(())
     }
 
-    /// Compile the cumulative session, run it under the configured Python,
-    /// and return the *new* stdout tail (None if nothing was produced).
+    /// Run the cached compile under the configured Python and return the
+    /// *new* stdout tail since the previous run.  Returns `None` when the
+    /// session is empty.
+    ///
+    /// The "new tail" is computed by character-prefix comparison rather
+    /// than byte slicing, so a divergent prefix containing multi-byte
+    /// characters never lands inside a code point.
     fn evaluate(&mut self) -> Result<Option<String>> {
-        let src = self.source();
-        if src.trim().is_empty() {
+        if self.cached_py.is_none() {
+            // Empty session, or a prior failed feed_block — nothing to run.
             return Ok(None);
         }
-        let py = compile_to_python(&src)?;
+        let py = self.cached_py.clone().unwrap();
 
         let tmp = tempfile::Builder::new()
             .prefix("tyc-repl-")
@@ -222,14 +265,50 @@ impl ReplSession {
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let new_tail = if stdout.len() > self.last_stdout_len {
-            stdout[self.last_stdout_len..].to_owned()
-        } else {
-            String::new()
-        };
-        self.last_stdout_len = stdout.len();
+        let new_tail = char_suffix_after(&self.last_stdout, &stdout);
+        self.last_stdout = stdout;
         Ok(Some(new_tail))
     }
+}
+
+/// Return the suffix of `new` that follows the longest *character*-aligned
+/// common prefix shared with `old`. Never slices inside a UTF-8 code point.
+///
+/// When `old` is a prefix of `new` (the common stable case for a growing
+/// session), this is exactly the new tail. When the runs diverge, it
+/// surfaces from the first differing character on — a best-effort signal
+/// that says "something changed", which matches what an interactive user
+/// expects more than a panic does.
+fn char_suffix_after(old: &str, new: &str) -> String {
+    let mut common_bytes = 0;
+    for (a, b) in old.chars().zip(new.chars()) {
+        if a != b {
+            break;
+        }
+        common_bytes += a.len_utf8();
+    }
+    new[common_bytes..].to_owned()
+}
+
+/// Probe `PATH` for the best available Python interpreter (3.13 first,
+/// falling back to 3.12, then plain `python3`). Returns `None` when none
+/// of them spawn successfully — callers should surface that as a clear
+/// error rather than letting the eventual subprocess fail.
+fn discover_python() -> Option<String> {
+    for candidate in ["python3.13", "python3.12", "python3"] {
+        if Command::new(candidate)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            return Some(candidate.to_owned());
+        }
+    }
+    None
 }
 
 // ── compile pipeline ────────────────────────────────────────────────────────
@@ -260,8 +339,8 @@ pub(crate) fn compile_to_python(source: &str) -> Result<String> {
         .map_err(|e| miette!("parse error: {e}"))?;
 
     let desugar = desugar_module_with(&module, DesugarOptions::default());
-    let (py, _offsets) = emit_with_line_offsets(&desugar.module);
-    Ok(crate::commands::build::strip_mutability_keywords(&py))
+    let (py, _offsets) = emit_python_with_line_offsets(&desugar.module);
+    Ok(py)
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
@@ -321,9 +400,69 @@ mod tests {
     fn session_reset_clears_state() {
         let mut s = ReplSession::new("python3".into());
         s.feed_block("let x: int = 1\n").unwrap();
-        s.last_stdout_len = 12;
+        s.last_stdout = "previous output".into();
         s.reset();
         assert!(s.source().is_empty());
-        assert_eq!(s.last_stdout_len, 0);
+        assert!(s.last_stdout.is_empty());
+        assert!(s.cached_py.is_none());
+    }
+
+    #[test]
+    fn feed_block_caches_emitted_python_for_evaluate() {
+        let mut s = ReplSession::new("python3".into());
+        assert!(s.cached_py.is_none());
+        s.feed_block("let x: int = 1\n").unwrap();
+        let cached = s.cached_py.as_ref().expect("cache should be populated");
+        // Cached output should be the same compile_to_python would produce.
+        let direct = compile_to_python("let x: int = 1\n").unwrap();
+        assert_eq!(cached, &direct);
+    }
+
+    // ── char_suffix_after ───────────────────────────────────────────────────
+
+    #[test]
+    fn char_suffix_after_returns_pure_tail_when_old_is_prefix() {
+        assert_eq!(char_suffix_after("hello\n", "hello\nworld\n"), "world\n");
+    }
+
+    #[test]
+    fn char_suffix_after_returns_empty_when_outputs_match() {
+        assert_eq!(char_suffix_after("abc", "abc"), "");
+    }
+
+    #[test]
+    fn char_suffix_after_handles_multibyte_safely() {
+        // Common prefix is "héllo " (7 bytes), then the new run diverges.
+        // A naive `new[old.len()..]` would slice inside the é.
+        let old = "héllo ";
+        let new = "héllo world";
+        assert_eq!(char_suffix_after(old, new), "world");
+    }
+
+    #[test]
+    fn char_suffix_after_surfaces_divergent_tail_from_divergence_point() {
+        // First two chars match, third differs — surface from the diverging
+        // character on, never panic.
+        let old = "abc";
+        let new = "abXYZ";
+        assert_eq!(char_suffix_after(old, new), "XYZ");
+    }
+
+    #[test]
+    fn char_suffix_after_empty_old_returns_full_new() {
+        assert_eq!(char_suffix_after("", "anything"), "anything");
+    }
+
+    // ── discover_python ─────────────────────────────────────────────────────
+
+    #[test]
+    fn discover_python_returns_some_when_interpreter_present() {
+        // CI always provides at least one Python; skip when absent.
+        if let Some(name) = discover_python() {
+            assert!(
+                ["python3.13", "python3.12", "python3"].contains(&name.as_str()),
+                "unexpected interpreter: {name}"
+            );
+        }
     }
 }

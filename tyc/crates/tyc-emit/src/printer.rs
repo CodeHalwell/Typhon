@@ -25,6 +25,11 @@ pub struct Emitter {
     /// `current_input_offset` that was active when that line's newline was
     /// emitted.  Used by the caller to build a `(py_line → ty_line)` table.
     pub line_offsets: Vec<usize>,
+    /// When `true`, Typhon's `let`/`mut` soft keywords (carried on
+    /// `StmtAssign.mutability` / `StmtAnnAssign.mutability`) are *not*
+    /// emitted.  Set this for build output that must be valid Python;
+    /// leave it `false` for `tyc fmt`-style round-tripping.
+    suppress_mutability: bool,
 }
 
 const INDENT_WIDTH: usize = 4;
@@ -36,7 +41,14 @@ impl Emitter {
             indent: 0,
             current_input_offset: 0,
             line_offsets: Vec::new(),
+            suppress_mutability: false,
         }
+    }
+
+    /// Configure this emitter to drop Typhon's `let`/`mut` soft keywords.
+    /// Build output uses this; `tyc fmt` does not.
+    pub fn suppress_mutability_keywords(&mut self) {
+        self.suppress_mutability = true;
     }
 
     pub fn finish(self) -> String {
@@ -214,10 +226,12 @@ impl Emitter {
             // assigns leave `mutability` at `None` and no prefix is emitted.
             Stmt::Assign(a) => {
                 self.fill("");
-                match a.mutability {
-                    Some(Mutability::Let) => self.write("let "),
-                    Some(Mutability::Mut) => self.write("mut "),
-                    None => {}
+                if !self.suppress_mutability {
+                    match a.mutability {
+                        Some(Mutability::Let) => self.write("let "),
+                        Some(Mutability::Mut) => self.write("mut "),
+                        None => {}
+                    }
                 }
                 let mut first = true;
                 for target in &a.targets {
@@ -247,10 +261,12 @@ impl Emitter {
             // `let x: int = 1` round-trips intact.
             Stmt::AnnAssign(a) => {
                 self.fill("");
-                match a.mutability {
-                    Some(Mutability::Let) => self.write("let "),
-                    Some(Mutability::Mut) => self.write("mut "),
-                    None => {}
+                if !self.suppress_mutability {
+                    match a.mutability {
+                        Some(Mutability::Let) => self.write("let "),
+                        Some(Mutability::Mut) => self.write("mut "),
+                        None => {}
+                    }
                 }
                 self.emit_expr(&a.target);
                 self.write(": ");

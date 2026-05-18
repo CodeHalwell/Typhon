@@ -16,6 +16,10 @@ pub use stubtest::{compare_modules, StubTestFinding, StubTestKind};
 use ruff_python_ast::ModModule;
 
 /// Emit a [`ModModule`] AST node as Python source text.
+///
+/// Preserves Typhon's `let`/`mut` soft keywords so the output round-trips
+/// through `tyc fmt`.  For valid-Python output (e.g. `tyc build`), use
+/// [`emit_python`] or [`emit_python_with_line_offsets`].
 pub fn emit(module: &ModModule) -> String {
     let mut emitter = Emitter::new();
     emitter.emit_mod(module);
@@ -32,8 +36,35 @@ pub fn emit(module: &ModModule) -> String {
 /// Synthesised statements (e.g. `import dataclasses` injected by the
 /// desugar pass) carry a zero-length `TextRange`; they inherit the offset
 /// of the nearest preceding real statement.
+///
+/// Preserves `let`/`mut` like [`emit`].  Use
+/// [`emit_python_with_line_offsets`] for build output that must run under
+/// CPython.
 pub fn emit_with_line_offsets(module: &ModModule) -> (String, Vec<usize>) {
     let mut emitter = Emitter::new();
+    emitter.emit_mod(module);
+    let offsets = emitter.line_offsets.clone();
+    (emitter.finish(), offsets)
+}
+
+/// Like [`emit`] but suppresses Typhon's `let`/`mut` soft keywords so the
+/// output is valid Python.
+pub fn emit_python(module: &ModModule) -> String {
+    let mut emitter = Emitter::new();
+    emitter.suppress_mutability_keywords();
+    emitter.emit_mod(module);
+    emitter.finish()
+}
+
+/// Like [`emit_with_line_offsets`] but suppresses Typhon's `let`/`mut`
+/// soft keywords so the output is valid Python.  This is the path
+/// `tyc build` uses; the AST-level suppression is safe to apply to all
+/// statements (including those nested inside string literals — which the
+/// printer never visits) and avoids the brittleness of a post-pass
+/// text rewrite.
+pub fn emit_python_with_line_offsets(module: &ModModule) -> (String, Vec<usize>) {
+    let mut emitter = Emitter::new();
+    emitter.suppress_mutability_keywords();
     emitter.emit_mod(module);
     let offsets = emitter.line_offsets.clone();
     (emitter.finish(), offsets)

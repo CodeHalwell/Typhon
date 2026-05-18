@@ -23,7 +23,7 @@ use tyc_analyse::{
 use tyc_db::{check_file, TycDatabase};
 use tyc_desugar::{desugar_module_with, DesugarOptions};
 use tyc_diagnostics::Diagnostics;
-use tyc_emit::{emit_stub, emit_with_line_offsets};
+use tyc_emit::{emit_python_with_line_offsets, emit_stub};
 use tyc_format::format_source;
 use tyc_syntax::preprocess::{
     expand_gather_blocks, expand_go_calls, expand_lazy_imports, expand_pipes, expand_question_ops,
@@ -280,13 +280,10 @@ pub fn run(args: BuildArgs) -> Result<()> {
         if desugar_output.needs_typhon_runtime {
             needs_runtime = true;
         }
-        let (mut python_src, line_offsets) = emit_with_line_offsets(&desugar_output.module);
-
-        // The pretty-printer round-trips Typhon's `let`/`mut` soft keywords
-        // (it doubles as the formatter input for `tyc fmt`). The build
-        // output must be valid Python, so strip any leading `let `/`mut `
-        // before writing the `.py` file.
-        python_src = strip_mutability_keywords(&python_src);
+        // Build output must be valid Python, so emit with `let`/`mut`
+        // suppressed at the AST level — a text-based strip would corrupt
+        // string-literal contents that happen to start with those words.
+        let (mut python_src, line_offsets) = emit_python_with_line_offsets(&desugar_output.module);
 
         // Optionally normalise whitespace in the emitted Python (tabs → spaces,
         // trailing whitespace, final newline).  Full ruff-style reformatting
@@ -398,37 +395,6 @@ pub fn run(args: BuildArgs) -> Result<()> {
 
     println!("built {} file(s) → '{}'", emitted, out_dir.display());
     Ok(())
-}
-
-/// Strip leading `let ` / `mut ` keywords from every line of `source`.
-///
-/// The Typhon emitter doubles as a `tyc fmt` round-tripper, so it preserves
-/// the soft keywords from the AST's `mutability` field.  Build output, by
-/// contrast, must be valid Python — these keywords are nominal only and have
-/// no Python equivalent.  This stripper runs after `emit` and before the
-/// `format_source` whitespace pass so neither downstream sees them.
-///
-/// The replacement is whitespace-preserving: indentation up to (but not
-/// including) the keyword is kept; the keyword and its single trailing
-/// space are removed.
-pub(crate) fn strip_mutability_keywords(source: &str) -> String {
-    let mut out = String::with_capacity(source.len());
-    for line in source.split_inclusive('\n') {
-        let indent_end = line
-            .find(|c: char| !c.is_whitespace())
-            .unwrap_or(line.len());
-        let (indent, rest) = line.split_at(indent_end);
-        if let Some(stripped) = rest.strip_prefix("let ") {
-            out.push_str(indent);
-            out.push_str(stripped);
-        } else if let Some(stripped) = rest.strip_prefix("mut ") {
-            out.push_str(indent);
-            out.push_str(stripped);
-        } else {
-            out.push_str(line);
-        }
-    }
-    out
 }
 
 /// Derive the dotted Python module name that the runtime profiler
@@ -582,12 +548,12 @@ _T = TypeVar(\"_T\")
 _E = TypeVar(\"_E\")
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, frozen=True)
 class Ok(Generic[_T]):
     value: _T
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, frozen=True)
 class Err(Generic[_E]):
     error: _E
 
@@ -793,7 +759,12 @@ def flatten(items: Iterable[Iterable[_T]]) -> Iterator[_T]:
 
 
 def unique(items: Iterable[_T]) -> Iterator[_T]:
-    \"\"\"Yield each element from *items* the first time it is seen.\"\"\"
+    \"\"\"Yield each element from *items* the first time it is seen.
+
+    Elements must be hashable; this uses a `set` for O(1) membership.
+    For unhashable inputs build your own dedup keyed on `id()` or a
+    user-provided key function.
+    \"\"\"
     seen: set[_T] = set()
     for item in items:
         if item in seen:
@@ -803,7 +774,11 @@ def unique(items: Iterable[_T]) -> Iterator[_T]:
 
 
 def group_by(items: Iterable[_T], key: Callable[[_T], _U]) -> dict[_U, list[_T]]:
-    \"\"\"Group *items* into a dict keyed by `key(item)`. Order preserved.\"\"\"
+    \"\"\"Group *items* into a dict keyed by `key(item)`. Order preserved.
+
+    The result of `key(item)` must be hashable (the runtime's `Ok` / `Err`
+    are `frozen=True` so they qualify).
+    \"\"\"
     groups: dict[_U, list[_T]] = {}
     for item in items:
         groups.setdefault(key(item), []).append(item)
@@ -818,10 +793,14 @@ def strip_prefix(s: str, prefix: str) -> str | None:
 
 
 def strip_suffix(s: str, suffix: str) -> str | None:
-    \"\"\"Return *s* with *suffix* removed, or `None` if no match.\"\"\"
-    if s.endswith(suffix):
-        return s[: len(s) - len(suffix)] if suffix else s
-    return None
+    \"\"\"Return *s* with *suffix* removed, or `None` if no match.
+
+    `strip_suffix(s, \"\")` returns `s` (mirrors `strip_prefix`'s
+    behaviour for an empty separator).
+    \"\"\"
+    if not s.endswith(suffix):
+        return None
+    return s[: len(s) - len(suffix)]
 
 
 def split_once(s: str, sep: str) -> tuple[str, str] | None:
@@ -844,11 +823,11 @@ def retry(
         raise ValueError(\"attempts must be positive\")
     Ok, Err = _ok_err()
     delay = backoff
-    last: BaseException | None = None
+    last: Exception | None = None
     for i in range(attempts):
         try:
             return Ok(op())
-        except BaseException as exc:  # noqa: BLE001 — intentional: we surface it
+        except Exception as exc:  # noqa: BLE001 — KeyboardInterrupt/SystemExit propagate
             last = exc
             if i == attempts - 1:
                 break
@@ -865,7 +844,13 @@ def retry(
 /// values without falling into nested `match` ladders.
 const TYPHON_RUNTIME_RESULT_PY: &str = "\
 # generated by tyc — do not edit
-\"\"\"Combinators for `Result[T, E]` — map / and_then / unwrap helpers.\"\"\"
+\"\"\"Combinators for `Result[T, E]` — map / and_then / unwrap helpers.
+
+Several names here (`map`, `and_then`, `unwrap`) collide with builtins
+or common identifiers if star-imported.  Prefer qualified access via
+`typhon_runtime.result.map(r, f)` over `from typhon_runtime.result
+import map`, which would shadow `builtins.map` in the caller's scope.
+\"\"\"
 from __future__ import annotations
 
 from typing import Callable, TypeVar
@@ -968,49 +953,6 @@ def unwrap_or_else(r: object, f: Callable[[_E], _T]) -> _T:
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── strip_mutability_keywords ─────────────────────────────────────────────
-
-    #[test]
-    fn strip_mutability_removes_leading_let() {
-        let out = strip_mutability_keywords("let x: int = 1\n");
-        assert_eq!(out, "x: int = 1\n");
-    }
-
-    #[test]
-    fn strip_mutability_removes_leading_mut() {
-        let out = strip_mutability_keywords("mut counter: int = 0\n");
-        assert_eq!(out, "counter: int = 0\n");
-    }
-
-    #[test]
-    fn strip_mutability_preserves_indentation() {
-        let out = strip_mutability_keywords("    let local: int = 1\n");
-        assert_eq!(out, "    local: int = 1\n");
-    }
-
-    #[test]
-    fn strip_mutability_leaves_plain_assigns_alone() {
-        let out = strip_mutability_keywords("x: int = 1\ny = 2\n");
-        assert_eq!(out, "x: int = 1\ny = 2\n");
-    }
-
-    #[test]
-    fn strip_mutability_does_not_touch_identifiers_containing_let() {
-        // `letter` is not the keyword; must not be stripped.
-        let out = strip_mutability_keywords("letter: str = 'a'\n");
-        assert_eq!(out, "letter: str = 'a'\n");
-    }
-
-    #[test]
-    fn strip_mutability_handles_multiline_program() {
-        let src = "let x: int = 1\nmut y: int = 2\ndef f():\n    let z: int = 3\n    return z\n";
-        let out = strip_mutability_keywords(src);
-        assert_eq!(
-            out,
-            "x: int = 1\ny: int = 2\ndef f():\n    z: int = 3\n    return z\n"
-        );
-    }
 
     /// Scaffold a minimal project under `dir` and return the src and build paths.
     fn scaffold(

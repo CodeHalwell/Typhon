@@ -387,13 +387,20 @@ fn tyc_help_lists_all_subcommands() {
     let out = tyc().arg("--help").output().unwrap();
     assert!(out.status.success());
     let text = String::from_utf8_lossy(&out.stdout);
+    // Asserting the bare subcommand name is too weak — e.g. `"ty"` is also
+    // a prefix of `"tyc"`, `"Typhon"`, etc., so the assertion would pass
+    // even if the subcommand were dropped. Match each command at the
+    // start of its line (clap renders subcommands as `  <name>  <desc>`).
     for cmd in [
         "build", "check", "fmt", "init", "lsp", "trace", "profile", "migrate", "ty", "repl",
         "debug",
     ] {
+        let expected = format!("  {cmd} ");
+        let expected_indent4 = format!("    {cmd} ");
         assert!(
-            text.contains(cmd),
-            "subcommand `{cmd}` missing from help:\n{text}"
+            text.lines()
+                .any(|l| l.starts_with(&expected) || l.starts_with(&expected_indent4)),
+            "subcommand `{cmd}` missing from help (looked for line starting with `{expected}`):\n{text}"
         );
     }
 }
