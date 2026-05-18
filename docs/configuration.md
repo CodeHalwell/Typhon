@@ -72,7 +72,17 @@ pytest = "8.2"              # bare version → ==8.2
 | `class-default` | `"dataclass"` \| `"pydantic"` | Default emit target for `class` declarations. Overridable per-class via the `model` keyword. |
 | `format` | bool | Post-process emitted `.py` through `ruff format`. |
 
-> Pydantic `model` classes are always emitted with `model_config = ConfigDict(extra="forbid")`; a configurable `model-extra` knob is on the roadmap but not yet wired in.
+> **Always-on behaviour.** Two emit policies that used to be exposed in
+> `typhon.toml` are no longer configurable and run unconditionally:
+>
+> - **PEP 561 `.pyi` stubs** are emitted for every `.dty` file next to the
+>   project, so mypy / pyright / Pyrefly / `ty` can consume Typhon-authored
+>   libraries without an interop tax. The previously-documented
+>   `[emit] pyi-stubs` toggle has been removed.
+> - **Pydantic `model` classes** are always emitted with
+>   `model_config = ConfigDict(extra="forbid")` — the safety pitch
+>   forbids silently dropping unexpected input. A configurable
+>   `model-extra` knob is on the roadmap but not yet wired in.
 
 ### `[strictness]`
 
@@ -82,7 +92,7 @@ pytest = "8.2"              # bare version → ==8.2
 | `unused-import` | `"error"` \| `"warn"` \| `"off"` | Severity for unused imports. |
 | `exhaustive-match` | `"error"` \| `"warn"` \| `"off"` | Severity for non-exhaustive `match` over sealed unions. |
 | `auto-memoise` | bool | Whether to apply `@functools.cache` to functions the analyser infers as pure. Default `false`. Caches are *never* inserted silently: even when enabled, the analyser requires all six purity conditions (see [language.md](language.md)). |
-| `auto-gather` | bool | When `true`, runs of two-or-more consecutive independent `name = await callee(...)` statements inside an `async def` are folded into an `asyncio.TaskGroup` so they execute concurrently. Independence is decided by static data-flow on bound names; runs are only folded when every callee is an `async def` declared in the same module. Default `false`. Explicit `gather:` blocks are unaffected. |
+| `auto-gather` | bool | When `true`, runs of two-or-more consecutive independent `name = await callee(...)` statements inside an `async def` are folded into an `asyncio.TaskGroup` so they execute concurrently. Independence is decided by static data-flow on bound names; **every callee must be a same-module `async def` carrying an explicit `@gatherable` decorator** — undecorated async functions and externally-imported callees are left alone, so opting a project into `auto-gather` does not surprise callers that aren't ready to run concurrently. Default `false`. Explicit `gather:` blocks are unaffected. |
 | `auto-parallel` | bool | When `true`, list comprehensions whose element is a pure call are rewritten at build time into a thread-pool map. Combine with `[python] free-threaded` to release the GIL across workers; on stock CPython the rewrite still runs but the GIL serialises workers. Default `false`. |
 | `parallel-min-size` | int | Minimum statically-detectable iterable length for a comprehension to qualify for `auto-parallel`. Default `64`. When the iterable size cannot be inferred, the threshold is treated as zero — users opting in accept that contract. |
 | `pgo-memoise` | bool | When `true`, `tyc build` reads `typhon-profile.json` (produced by a prior `tyc profile` run) and promotes every pure function whose observed call count meets `pgo-min-calls` to `@functools.cache`, even if the user did not write `@memo`. Complements `auto-memoise` (which caches every pure function regardless of profile data). Missing profile file is not an error — PGO is best-effort. Default `false`. |

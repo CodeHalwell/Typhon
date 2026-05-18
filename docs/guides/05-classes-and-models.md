@@ -170,7 +170,7 @@ extend User:
 
 The merge happens at desugar; downstream callers see a single class with both sets of methods.
 
-> Built-in extensions (e.g. `extend str:`) are deferred — extending types you don't own with a free-function rewrite is on the roadmap but not yet available. Stick to extending classes you've declared in Typhon.
+Built-in extensions (e.g. `extend str:`) are also supported: each method is extracted to a module-level free function `__typhon_ext_str__METHOD` at desugar time, and call sites like `"hi".to_slug()` are rewritten to `__typhon_ext_str__to_slug("hi")` whenever the receiver has a static `str` annotation. There is no monkey-patching of built-ins; un-annotated receivers fall back to native attribute lookup (i.e. `AttributeError` when the method does not exist on the underlying type).
 
 ## Inheritance
 

@@ -237,4 +237,4 @@ extend User:
         return f"user-{id:08d}"
 ```
 
-`extend BUILTIN:` (extending types you don't own — `str`, `list`, etc., with a free-function rewrite) is **rejected** at preprocess time with a `tyc::extend_builtin` diagnostic. The free-function lowering is on the roadmap but not yet wired in; stick to user-defined classes for now.
+`extend BUILTIN:` (extending the recognised Python built-ins — `str`, `list`, `int`, `dict`, …) is also supported. Each method is extracted at desugar time to a module-level free function `__typhon_ext_<TYPE>__<METHOD>`, and call sites `x.method(...)` are rewritten to `__typhon_ext_<TYPE>__method(x, ...)` whenever the receiver `x` has a static annotation matching one of the registered built-ins. There is no monkey-patching of built-in types; the rewrite is strictly opt-in by type annotation, so calls on un-annotated receivers continue to raise `AttributeError` at runtime, matching Python's existing semantics.

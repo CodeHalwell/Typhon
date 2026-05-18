@@ -80,10 +80,12 @@ Realistic milestones for one person plus AI assistance. The headline target is a
   to `@cached_property`. Both round-trip through `tyc fmt`.
 - ✅ **Pipe operator** `a |> f |> g(arg)` lowered to `g(f(a), arg)` left-
   associatively. Guards in `match` cases pass through to Python directly.
-- ✅ **`extend`** keyword for adding methods to user-defined classes — an
-  alias for `impl` in v1; `extend BUILTIN:` is rejected at preprocess time
-  with a `tyc::extend_builtin` diagnostic. The free-function call-site
-  rewriter for built-in extensions is deferred.
+- ✅ **`extend`** keyword for adding methods to user-defined classes
+  (alias for `impl`) and for the recognised Python built-ins (`str`,
+  `list`, `dict`, …). Built-in extensions are extracted to module-level
+  free functions `__typhon_ext_<TYPE>__<METHOD>` at desugar time, and
+  call sites are rewritten when the receiver has a matching static
+  annotation. No monkey-patching of built-ins.
 - ✅ **`.dty` stub files** with `.pyi` interop emission — every `.dty` next to
   the project is compiled to a PEP 561 `.pyi` (function/method bodies become
   `...`, plain `Assign` is dropped, annotated fields are kept). `tyc check
