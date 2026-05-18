@@ -22,8 +22,11 @@
 //!   - **Multi-line blocks** end on the first blank line — matching
 //!     Python's own REPL, which is also unable to contain a blank line
 //!     inside a `def` / `class` body when typed directly.
-//!   - **No auto-print** of expression statements; use `print(...)`
-//!     explicitly. Keeps the REPL identical to `tyc build` + run.
+//!   - **Auto-print** of bare single-line expression statements: a
+//!     prompt like `>>> 1 + 1` is rewritten to `print(repr(1 + 1))`
+//!     before compiling so the user sees `2` immediately. Multi-line
+//!     blocks, assignments, and any statement starting with a keyword
+//!     (`let`, `def`, `if`, ...) are left untouched.
 //!   - No readline support; arrow keys insert escape sequences.
 
 use std::io::{BufRead, Write};
@@ -244,16 +247,21 @@ impl ReplSession {
     /// committing it.  On success the emitted Python is cached so the
     /// follow-up `evaluate` call doesn't have to re-compile.
     fn feed_block(&mut self, block: &str) -> Result<()> {
+        // FINDINGS #25: a bare expression block (`1 + 1`, `x + 1`) should
+        // print its value — that's the universal REPL UX expectation. If
+        // the block looks like a single expression statement, wrap it in
+        // `print(repr(...))` before compiling.
+        let effective_block = wrap_bare_expression_for_repl(block);
         let mut trial = self.source();
         if !trial.ends_with('\n') {
             trial.push('\n');
         }
-        trial.push_str(block);
+        trial.push_str(&effective_block);
         let py = compile_to_python(&trial)?;
-        self.blocks.push(if block.ends_with('\n') {
-            block.to_owned()
+        self.blocks.push(if effective_block.ends_with('\n') {
+            effective_block.clone()
         } else {
-            format!("{block}\n")
+            format!("{effective_block}\n")
         });
         self.cached_py = Some(py);
         Ok(())
@@ -349,6 +357,61 @@ fn discover_python() -> Option<String> {
 /// and return the emitted Python text. Diagnostics are surfaced as miette
 /// errors with a one-line summary; the full set is dropped (the REPL is for
 /// interactive use, not CI).
+/// If `block` is a single bare expression statement (`1 + 1`, `x + 1`,
+/// `f(x)`, etc.), return a wrapped version that prints its repr. The
+/// detection is text-based and intentionally conservative: anything
+/// that looks like a statement (starts with a known keyword or
+/// contains a top-level `=`) is returned unchanged.
+fn wrap_bare_expression_for_repl(block: &str) -> String {
+    // Only single-line, single-statement blocks are eligible.
+    let stripped = block.trim_end_matches(['\n', '\r']);
+    if stripped.contains('\n') {
+        return block.to_owned();
+    }
+    let trimmed = stripped.trim();
+    if trimmed.is_empty() {
+        return block.to_owned();
+    }
+    // Reject anything that's already a statement / declaration / control flow.
+    const STATEMENT_PREFIXES: &[&str] = &[
+        "let ", "mut ", "def ", "class ", "if ", "elif ", "else:", "else ", "while ", "for ",
+        "import ", "from ", "return", "raise", "try:", "try ", "except", "finally", "with ",
+        "match ", "case ", "pass", "break", "continue", "global ", "nonlocal ", "async ",
+        "await ", "go ", "gather:", "gather ", "yield", "@", "#", "lazy ", "comptime ",
+        "interface ", "extend ", "impl ", "impl[", "model ", "unsafe", "class!",
+    ];
+    if STATEMENT_PREFIXES
+        .iter()
+        .any(|p| trimmed.starts_with(p) || trimmed == p.trim_end_matches([' ', ':']))
+    {
+        return block.to_owned();
+    }
+    // Reject lines containing a top-level `=` (assignment / augmented
+    // assignment) — those produce no value to print. Walk depth so
+    // `f(a=1)` doesn't trip the check; reject `==`, `>=`, `<=`, `!=`
+    // by requiring the `=` not be part of a comparison op.
+    let bytes = trimmed.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'=' if depth == 0 => {
+                let prev = i.checked_sub(1).map(|j| bytes[j]).unwrap_or(0);
+                let next = bytes.get(i + 1).copied().unwrap_or(0);
+                let is_comparison = matches!(prev, b'=' | b'!' | b'<' | b'>') || next == b'=';
+                if !is_comparison {
+                    return block.to_owned();
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    format!("print(repr({}))\n", trimmed)
+}
+
 pub(crate) fn compile_to_python(source: &str) -> Result<String> {
     let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
         &expand_gather_blocks(&expand_lazy_imports(source)),

@@ -677,6 +677,13 @@ the synthesised assignment).
 
 ## 21. Migrate doesn't remove now-unused `from typing import Optional` (papercut)
 
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. `tyc migrate`
+now strips `Optional` from any `from typing import …` line, dropping
+the line entirely when nothing else remains. Wildcard (`*`) and
+`as`-aliased imports are intentionally left alone — those need manual
+review. The migrated source no longer trips `tyc check`'s
+`unused_import` warning.
+
 **Severity:** papercut — generated code emits unused-import diagnostic.
 
 `tyc migrate src/x.py` rewrites `Optional[T]` → `T?` but leaves
@@ -690,6 +697,14 @@ already imported it under a re-export.
 ---
 
 ## 22. Migrate doesn't infer `mut` for reassigned module-level bindings (gap)
+
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. The migrator now
+scans for `global NAME[, NAME, ...]` statements anywhere in the file
+and seeds the `reassigned` set with those names. The per-line walk
+extends to plain (unannotated) module-level assigns: when the LHS name
+is in the reassigned set, `mut` is prepended (`counter = 0` →
+`mut counter = 0`). Type annotations are still left to the user since
+literal-based type inference would be heuristic.
 
 **Severity:** gap — known limitation; worth a `--strict` mode.
 
@@ -780,6 +795,14 @@ so this is consistent — but a few things need pinning down:
 ---
 
 ## 25. REPL does not auto-print expression statements (papercut)
+
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Added a
+`wrap_bare_expression_for_repl` text pass in `feed_block` that rewrites
+single-line bare expressions (`>>> 1 + 1`) into `print(repr(...))`
+before compiling. Conservatively skips any block that starts with a
+keyword (`let`, `def`, `if`, ...), contains a top-level `=` other than
+a comparison op, or spans multiple lines. Updated the module docstring
+and the SKILL `tyc repl` quirks note to advertise the new behavior.
 
 **Severity:** papercut — REPL UX gap.
 

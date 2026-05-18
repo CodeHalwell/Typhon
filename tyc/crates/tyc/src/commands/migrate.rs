@@ -115,6 +115,20 @@ fn rewrite_line(line: &str, reassigned: &HashSet<String>) -> String {
         return String::new();
     }
 
+    // Rule 5b: `Optional` was just rewritten to `T?` everywhere, so any
+    // `from typing import Optional` (or grouped form) is now dead weight.
+    // Filter it out, and drop the whole `from typing import …` line when
+    // nothing else remains. Skips lines containing `*` or `as` aliases —
+    // those are rare and need manual review.
+    if let Some(rewritten) = strip_optional_from_typing_import(trimmed) {
+        if rewritten.is_empty() {
+            return String::new();
+        }
+        let indent_len = line.len() - trimmed.len();
+        let indent = &line[..indent_len];
+        return format!("{indent}{rewritten}");
+    }
+
     // Rule 4: drop a `@dataclass` decorator line (with or without args).
     if let Some(rest) = trimmed.strip_prefix("@dataclass") {
         let after = rest.trim();
@@ -141,10 +155,62 @@ fn rewrite_line(line: &str, reassigned: &HashSet<String>) -> String {
                 };
                 body = format!("{kw} {body}");
             }
+        } else if let Some(name) = leading_plain_assign_name(&body) {
+            // Module-level plain `counter = 0`: when reassigned (via a
+            // `global counter` inside a function), prepend `mut` so the
+            // type checker sees the intended mutability. Unreassigned
+            // names are left untouched — the user can pick `let` after
+            // adding an annotation. This closes FINDINGS #22.
+            if reassigned.contains(&name)
+                && !body.starts_with("let ")
+                && !body.starts_with("mut ")
+            {
+                body = format!("mut {body}");
+            }
         }
     }
 
     format!("{indent}{body}")
+}
+
+/// Rewrite `from typing import …, Optional, …` by dropping the `Optional`
+/// name (now unused after Rule 1). Returns `Some(rewritten)` when the
+/// line matched; `Some("")` signals the caller should drop the line
+/// entirely (the import would otherwise be empty). Returns `None` when
+/// the line wasn't a `from typing import …` form, so the caller can
+/// continue with other rewrites.
+///
+/// Conservatively skips wildcard (`*`) and `as`-aliased imports so we
+/// never silently drop a renamed `Optional` the user may use elsewhere.
+fn strip_optional_from_typing_import(trimmed_line: &str) -> Option<String> {
+    let rest = trimmed_line.strip_prefix("from typing import")?;
+    let rest = rest.trim();
+    // Drop a trailing comment so the parser doesn't see it as a name.
+    let (names_src, comment) = match rest.find('#') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    if names_src.contains('*') || names_src.contains(" as ") {
+        return None;
+    }
+    let names: Vec<&str> = names_src
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !names.iter().any(|n| *n == "Optional") {
+        return None;
+    }
+    let kept: Vec<&str> = names.iter().copied().filter(|n| *n != "Optional").collect();
+    if kept.is_empty() {
+        return Some(String::new());
+    }
+    let suffix = if comment.is_empty() {
+        String::new()
+    } else {
+        format!("  {comment}")
+    };
+    Some(format!("from typing import {}{}", kept.join(", "), suffix))
 }
 
 /// Rewrite every `Optional[T]` (including `typing.Optional[T]`) to `T?`
@@ -302,6 +368,23 @@ fn leading_ann_assign_name(line: &str) -> Option<String> {
 fn collect_reassigned_names(source: &str) -> HashSet<String> {
     let mut declared: HashSet<String> = HashSet::new();
     let mut reassigned: HashSet<String> = HashSet::new();
+    // First pass: scan for `global NAME[, NAME, ...]` statements anywhere
+    // in the file. Any name declared `global` and then assigned inside a
+    // function body is a module-level reassignment — exactly what `mut`
+    // is meant for. The original migrator only looked at top-level
+    // assignments and so missed counter/accumulator patterns lifted via
+    // `global`. (FINDINGS #22)
+    for raw in source.lines() {
+        let trimmed = raw.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("global ") {
+            for name in rest.split(',') {
+                let name = name.trim().trim_end_matches(['#']).trim();
+                if !name.is_empty() && is_python_identifier(name) {
+                    reassigned.insert(name.to_owned());
+                }
+            }
+        }
+    }
     for raw in source.lines() {
         let trimmed = raw.trim_start();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -327,6 +410,20 @@ fn collect_reassigned_names(source: &str) -> HashSet<String> {
         }
     }
     reassigned
+}
+
+/// Cheap check: does `s` look like a Python identifier (`[A-Za-z_][A-Za-z0-9_]*`)?
+/// Used by the `global` scanner so we don't accept stray punctuation.
+fn is_python_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    let first = match chars.next() {
+        Some(c) => c,
+        None => return false,
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Extract `NAME` from a leading `NAME = …` line.  Returns `None` for

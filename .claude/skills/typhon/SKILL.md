@@ -716,7 +716,7 @@ Notable flags:
 - `tyc debug --entry api.py --debugger pudb`
 - `tyc add --dev pytest@8.2` / `tyc add --no-sync` / `tyc sync --dry-run`
 
-`tyc repl` quirks: each prompt re-executes the entire accumulated session (pure-scratch semantics, side effects fire once per prompt), multi-line blocks end on the first blank line, no readline/arrow-key support yet.
+`tyc repl` quirks: each prompt re-executes the entire accumulated session (pure-scratch semantics, side effects fire once per prompt), multi-line blocks end on the first blank line, no readline/arrow-key support yet. Bare single-line expressions auto-print their `repr(...)` — `>>> 1 + 1` prints `2` — matching the universal REPL convention.
 
 `tyc debug` is a v1 wrapper — frames surface as `build/*.py` paths. Pair with `tyc trace` to remap captured tracebacks back to `.ty`. A Typhon-native source-mapping debugger is a Phase-5 item.
 
