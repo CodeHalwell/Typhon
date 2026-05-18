@@ -1,13 +1,13 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 130" width="100%" height="100%">
   <defs>
     <linearGradient id="docGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#1f2937" />
-      <stop offset="100%" stop-color="#111827" />
+      <stop offset="0%" stop-color="#64748b" />
+      <stop offset="100%" stop-color="#334155" />
     </linearGradient>
 
     <linearGradient id="foldGrad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#374151" />
-      <stop offset="100%" stop-color="#1f2937" />
+      <stop offset="0%" stop-color="#94a3b8" />
+      <stop offset="100%" stop-color="#475569" />
     </linearGradient>
 
     <linearGradient id="pyBlue" x1="0%" y1="0%" x2="100%" y2="100%">
@@ -43,7 +43,7 @@
            A 5 5 0 0 1 15 110
            V 15
            A 5 5 0 0 1 20 10 Z"
-        fill="url(#docGrad)" stroke="#4b5563" stroke-width="1" filter="url(#shadow)"/>
+        fill="url(#docGrad)" stroke="#cbd5e1" stroke-width="1" filter="url(#shadow)"/>
 
   <path d="M 60 10 V 30 A 5 5 0 0 0 65 35 H 85 Z" fill="url(#foldGrad)"/>
 

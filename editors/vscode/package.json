@@ -40,7 +40,7 @@
         "configuration": "./language-configuration.json",
         "icon": {
           "light": "./icons/ty.svg",
-          "dark": "./icons/ty.svg"
+          "dark": "./icons/ty-dark.svg"
         }
       }
     ],
