@@ -59,6 +59,16 @@ pub enum Commands {
     /// separately (`pip install ty` or `uv tool install ty`).
     Ty(commands::ty::TyArgs),
 
+    /// Probe emitted `.pyi` stubs against the running module via mypy's
+    /// `stubtest`. Complements `tyc check --stubs` (an AST diff) by
+    /// catching dynamically-created attributes the AST cannot see.
+    ///
+    /// Builds the project and invokes
+    /// `python -m mypy.stubtest <module>` for every emitted `.pyi`.
+    /// Requires `mypy` to be installed in the chosen interpreter
+    /// (`pip install mypy`).
+    Stubtest(commands::stubtest::StubtestArgs),
+
     /// Launch an interactive Typhon REPL.
     ///
     /// Accumulates `.ty` source across prompts and pipes each evaluation
@@ -104,6 +114,7 @@ pub fn run() -> Result<()> {
         Commands::Profile(args) => commands::profile::run(args),
         Commands::Migrate(args) => commands::migrate::run(args),
         Commands::Ty(args) => commands::ty::run(args),
+        Commands::Stubtest(args) => commands::stubtest::run(args),
         Commands::Repl(args) => commands::repl::run(args),
         Commands::Debug(args) => commands::debug::run(args),
         Commands::Run(args) => commands::run::run(args),

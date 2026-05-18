@@ -40,6 +40,11 @@ use ruff_python_ast::{Decorator, Expr, ExprCall, ModModule, Number, Parameters, 
 use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_syntax::preprocess::ComptimeBinding;
 
+/// Recursion limit for `comptime def` calls. Generous enough for any
+/// realistic build-time configuration computation, low enough that an
+/// infinite recursion bug terminates the build instead of hanging it.
+const MAX_COMPTIME_DEPTH: usize = 64;
+
 pub mod auto_gather;
 pub use auto_gather::{collect_gatherable_async_fn_names, rewrite_auto_gather, AutoGatherStats};
 
@@ -102,18 +107,38 @@ pub fn evaluate_comptime(
     module: &ModModule,
     bindings: &[ComptimeBinding],
 ) -> (HashMap<String, ComptimeValue>, Diagnostics) {
+    evaluate_comptime_with_functions(module, bindings, &[])
+}
+
+/// Like [`evaluate_comptime`] but with a registry of `comptime def`
+/// functions: any `Stmt::FunctionDef` in `module.body` whose name appears
+/// in `comptime_function_names` is callable from a `comptime let` RHS.
+///
+/// Comptime functions follow a restricted contract — bodies support
+/// `return EXPR`, local `NAME[: T] = EXPR` bindings, and `if`/`elif`/
+/// `else` branches; expressions follow the same rules as a `comptime
+/// let` initialiser (literals, arithmetic, string concatenation,
+/// comparisons, boolean ops, ternaries, and calls to `env`/`int`/`str`/
+/// `float` or other `comptime def` functions), with parameters bound to
+/// the call's actual arguments. Recursion depth is capped at
+/// [`MAX_COMPTIME_DEPTH`] so a buggy definition fails the build rather
+/// than hanging it. See [`eval_stmt`] for the full statement contract.
+pub fn evaluate_comptime_with_functions(
+    module: &ModModule,
+    bindings: &[ComptimeBinding],
+    comptime_function_names: &[String],
+) -> (HashMap<String, ComptimeValue>, Diagnostics) {
     let mut values = HashMap::new();
     let mut diags = Diagnostics::new();
 
-    if bindings.is_empty() {
+    if bindings.is_empty() && comptime_function_names.is_empty() {
         return (values, diags);
     }
 
     let body = &module.body;
+    let functions = collect_comptime_function_defs(body, comptime_function_names);
 
     for binding in bindings {
-        // Find the annotated assignment whose target matches this binding name
-        // in the module body.
         let rhs = body.iter().find_map(|stmt| {
             if let Stmt::AnnAssign(a) = stmt {
                 if let Expr::Name(n) = a.target.as_ref() {
@@ -132,23 +157,116 @@ pub fn evaluate_comptime(
                     format!("comptime binding '{}' has no initialiser", binding.name),
                 ));
             }
-            Some(expr) => match eval_expr(expr) {
-                Ok(v) => {
-                    values.insert(binding.name.clone(), v);
+            Some(expr) => {
+                let mut ctx = EvalContext::new(&functions);
+                match eval_expr(expr, &mut ctx) {
+                    Ok(v) => {
+                        values.insert(binding.name.clone(), v);
+                    }
+                    Err(e) => {
+                        diags.push_error(TycError::comptime(binding.name.clone(), e));
+                    }
                 }
-                Err(e) => {
-                    diags.push_error(TycError::comptime(binding.name.clone(), e));
-                }
-            },
+            }
         }
     }
 
     (values, diags)
 }
 
+/// One `comptime def` registered in the function registry. Holds borrows
+/// into the parsed module so the evaluator can read parameters and body
+/// without cloning the AST.
+struct ComptimeFnDef<'a> {
+    name: &'a str,
+    params: Vec<&'a str>,
+    body: &'a [Stmt],
+}
+
+/// Per-evaluation context: a function registry shared across recursive
+/// calls plus a local scope (parameter bindings, mutated when entering
+/// a function call and restored on return) and a recursion-depth counter.
+struct EvalContext<'a> {
+    functions: &'a HashMap<&'a str, ComptimeFnDef<'a>>,
+    locals: HashMap<String, ComptimeValue>,
+    depth: usize,
+}
+
+impl<'a> EvalContext<'a> {
+    fn new(functions: &'a HashMap<&'a str, ComptimeFnDef<'a>>) -> Self {
+        Self {
+            functions,
+            locals: HashMap::new(),
+            depth: 0,
+        }
+    }
+}
+
+/// Scan `body` for `Stmt::FunctionDef` nodes whose name appears in
+/// `names`, extract their parameter list and body, and return a name →
+/// definition map keyed by the parsed AST's name string slices (no
+/// copying — the map borrows from the module).
+///
+/// Functions that fail validation (a non-name parameter pattern, missing
+/// from the body, …) are silently dropped here. The first attempt to
+/// call such a function from a comptime expression will fail with the
+/// generic "unknown comptime function" diagnostic, which is fine: the
+/// user's recourse is the same either way (fix the declaration).
+fn collect_comptime_function_defs<'a>(
+    body: &'a [Stmt],
+    names: &[String],
+) -> HashMap<&'a str, ComptimeFnDef<'a>> {
+    let wanted: std::collections::HashSet<&str> = names.iter().map(|s| s.as_str()).collect();
+    let mut out = HashMap::new();
+    for stmt in body {
+        if let Stmt::FunctionDef(f) = stmt {
+            let name = f.name.as_str();
+            if !wanted.contains(name) {
+                continue;
+            }
+            // Pull parameter names. Reject any non-trivial parameter
+            // form (defaults, *args, **kwargs, posonly, kwonly) — keeping
+            // the surface tight makes the contract obvious and the
+            // evaluator simple.
+            let Some(params) = simple_parameter_names(&f.parameters) else {
+                continue;
+            };
+            out.insert(
+                name,
+                ComptimeFnDef {
+                    name,
+                    params,
+                    body: &f.body,
+                },
+            );
+        }
+    }
+    out
+}
+
+/// Extract positional parameter names from a `Parameters` node, returning
+/// `None` if any "fancy" form is used (defaults, *args, **kwargs, etc.).
+/// The comptime evaluator only supports straight positional parameters.
+fn simple_parameter_names(params: &Parameters) -> Option<Vec<&str>> {
+    if params.vararg.is_some() || params.kwarg.is_some() {
+        return None;
+    }
+    if !params.posonlyargs.is_empty() || !params.kwonlyargs.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(params.args.len());
+    for p in &params.args {
+        if p.default.is_some() {
+            return None;
+        }
+        out.push(p.parameter.name.as_str());
+    }
+    Some(out)
+}
+
 // ── Expression evaluator ──────────────────────────────────────────────────────
 
-fn eval_expr(expr: &Expr) -> Result<ComptimeValue, String> {
+fn eval_expr(expr: &Expr, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue, String> {
     match expr {
         // Numeric literals.
         Expr::NumberLiteral(n) => match &n.value {
@@ -164,23 +282,71 @@ fn eval_expr(expr: &Expr) -> Result<ComptimeValue, String> {
         Expr::BooleanLiteral(b) => Ok(ComptimeValue::Bool(b.value)),
         Expr::NoneLiteral(_) => Err("None is not a valid comptime value".into()),
 
-        // Unary `-` for negative literals
-        Expr::UnaryOp(u) if matches!(u.op, ruff_python_ast::UnaryOp::USub) => {
-            match eval_expr(&u.operand)? {
-                ComptimeValue::Int(n) => Ok(ComptimeValue::Int(-n)),
-                ComptimeValue::Float(f) => Ok(ComptimeValue::Float(-f)),
-                _ => Err("unary `-` is only valid on numeric comptime values".into()),
+        // Name reference: looks up a parameter or local binding from the
+        // current comptime function call frame. Free variables
+        // (module-level names, including other `comptime let` bindings)
+        // are intentionally rejected — comptime evaluation is hermetic,
+        // so call sites must pass everything in as arguments.
+        Expr::Name(n) => ctx.locals.get(n.id.as_str()).cloned().ok_or_else(|| {
+            format!(
+                "unknown name '{}' in comptime expression — only the enclosing function's \
+                 parameters and locally-bound names are in scope (comptime evaluation is hermetic)",
+                n.id
+            )
+        }),
+
+        // Unary operators: `-x`, `+x`, `not x`.
+        Expr::UnaryOp(u) => {
+            let operand = eval_expr(&u.operand, ctx)?;
+            match (u.op, operand) {
+                (ruff_python_ast::UnaryOp::USub, ComptimeValue::Int(n)) => {
+                    Ok(ComptimeValue::Int(-n))
+                }
+                (ruff_python_ast::UnaryOp::USub, ComptimeValue::Float(f)) => {
+                    Ok(ComptimeValue::Float(-f))
+                }
+                (ruff_python_ast::UnaryOp::UAdd, v @ ComptimeValue::Int(_)) => Ok(v),
+                (ruff_python_ast::UnaryOp::UAdd, v @ ComptimeValue::Float(_)) => Ok(v),
+                (ruff_python_ast::UnaryOp::Not, ComptimeValue::Bool(b)) => {
+                    Ok(ComptimeValue::Bool(!b))
+                }
+                _ => Err("unary operator not supported on this comptime value".into()),
             }
         }
 
-        // Function calls: env(), int(), str(), float()
-        Expr::Call(call) => eval_call(call),
+        // Function calls: env(), int(), str(), float(), or a registered
+        // `comptime def`.
+        Expr::Call(call) => eval_call(call, ctx),
 
         // Binary arithmetic on compile-time numerics and string concatenation.
         Expr::BinOp(b) => {
-            let lhs = eval_expr(&b.left)?;
-            let rhs = eval_expr(&b.right)?;
+            let lhs = eval_expr(&b.left, ctx)?;
+            let rhs = eval_expr(&b.right, ctx)?;
             eval_binop(b.op, lhs, rhs)
+        }
+
+        // Comparison chains: `a < b`, `a == b`, `0 < n <= 10`. The
+        // comparison is evaluated short-circuit, matching Python's
+        // semantics — the first false comparator collapses the whole
+        // chain to `False`.
+        Expr::Compare(c) => eval_compare(c, ctx),
+
+        // Boolean `and` / `or`: short-circuit on the first decisive
+        // operand. The result of `a and b` is `b` if `a` is truthy and
+        // `a` otherwise (matching Python's actual return values rather
+        // than coercing to a plain bool).
+        Expr::BoolOp(b) => eval_boolop(b, ctx),
+
+        // Ternary `x if cond else y`. Condition must reduce to a Bool;
+        // the other branch is only evaluated if its arm is selected,
+        // matching short-circuit semantics.
+        Expr::If(e) => {
+            let cond = eval_expr(&e.test, ctx)?;
+            match cond {
+                ComptimeValue::Bool(true) => eval_expr(&e.body, ctx),
+                ComptimeValue::Bool(false) => eval_expr(&e.orelse, ctx),
+                _ => Err("comptime `if-expression` condition must reduce to a bool".into()),
+            }
         }
 
         other => Err(format!(
@@ -190,11 +356,110 @@ fn eval_expr(expr: &Expr) -> Result<ComptimeValue, String> {
     }
 }
 
-fn eval_call(call: &ExprCall) -> Result<ComptimeValue, String> {
+/// Evaluate a Python comparison chain (`a < b`, `0 < n <= 10`, …) in a
+/// comptime context. Returns `Bool(true)` only when every adjacent pair
+/// satisfies its operator; short-circuits on the first false comparator.
+fn eval_compare(
+    c: &ruff_python_ast::ExprCompare,
+    ctx: &mut EvalContext<'_>,
+) -> Result<ComptimeValue, String> {
+    let mut prev = eval_expr(&c.left, ctx)?;
+    for (op, rhs_expr) in c.ops.iter().zip(c.comparators.iter()) {
+        let rhs = eval_expr(rhs_expr, ctx)?;
+        let outcome = eval_cmpop(*op, &prev, &rhs)?;
+        if !outcome {
+            return Ok(ComptimeValue::Bool(false));
+        }
+        prev = rhs;
+    }
+    Ok(ComptimeValue::Bool(true))
+}
+
+fn eval_cmpop(
+    op: ruff_python_ast::CmpOp,
+    lhs: &ComptimeValue,
+    rhs: &ComptimeValue,
+) -> Result<bool, String> {
+    use ruff_python_ast::CmpOp::*;
+    // Promote int/float to a common float for ordering when types mix.
+    fn as_f64(v: &ComptimeValue) -> Option<f64> {
+        match v {
+            ComptimeValue::Int(n) => Some(*n as f64),
+            ComptimeValue::Float(f) => Some(*f),
+            _ => None,
+        }
+    }
+    match (op, lhs, rhs) {
+        (Eq, a, b) => Ok(values_equal(a, b)),
+        (NotEq, a, b) => Ok(!values_equal(a, b)),
+        (Lt | LtE | Gt | GtE, ComptimeValue::Str(a), ComptimeValue::Str(b)) => Ok(match op {
+            Lt => a < b,
+            LtE => a <= b,
+            Gt => a > b,
+            GtE => a >= b,
+            _ => unreachable!(),
+        }),
+        (Lt | LtE | Gt | GtE, a, b) => match (as_f64(a), as_f64(b)) {
+            (Some(x), Some(y)) => Ok(match op {
+                Lt => x < y,
+                LtE => x <= y,
+                Gt => x > y,
+                GtE => x >= y,
+                _ => unreachable!(),
+            }),
+            _ => Err("comptime ordering comparison requires two numerics or two strings".into()),
+        },
+        (other, _, _) => Err(format!(
+            "comparison operator `{:?}` is not supported in comptime expressions",
+            other
+        )),
+    }
+}
+
+fn values_equal(a: &ComptimeValue, b: &ComptimeValue) -> bool {
+    match (a, b) {
+        (ComptimeValue::Int(x), ComptimeValue::Int(y)) => x == y,
+        (ComptimeValue::Float(x), ComptimeValue::Float(y)) => x == y,
+        (ComptimeValue::Int(x), ComptimeValue::Float(y)) => (*x as f64) == *y,
+        (ComptimeValue::Float(x), ComptimeValue::Int(y)) => *x == (*y as f64),
+        (ComptimeValue::Str(x), ComptimeValue::Str(y)) => x == y,
+        (ComptimeValue::Bool(x), ComptimeValue::Bool(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// Evaluate Python's short-circuiting `and` / `or` with Python's actual
+/// return-value semantics: `a and b` is `b` when `a` is truthy and `a`
+/// otherwise; `a or b` is `a` when `a` is truthy and `b` otherwise.
+/// Only Bool operands are accepted in v1 — promoting numeric or string
+/// values to a truthiness rule would surprise readers.
+fn eval_boolop(
+    b: &ruff_python_ast::ExprBoolOp,
+    ctx: &mut EvalContext<'_>,
+) -> Result<ComptimeValue, String> {
+    use ruff_python_ast::BoolOp::*;
+    let mut last = ComptimeValue::Bool(matches!(b.op, And));
+    for operand in &b.values {
+        let v = eval_expr(operand, ctx)?;
+        let truthy = match v {
+            ComptimeValue::Bool(x) => x,
+            _ => return Err("comptime `and`/`or` operands must be booleans".into()),
+        };
+        last = v;
+        match (b.op, truthy) {
+            (And, false) => return Ok(last),
+            (Or, true) => return Ok(last),
+            _ => {}
+        }
+    }
+    Ok(last)
+}
+
+fn eval_call(call: &ExprCall, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue, String> {
     let func_name = match call.func.as_ref() {
         Expr::Name(n) => n.id.as_str(),
         _ => return Err(
-            "only simple function calls (env, int, str, float) are valid in comptime expressions"
+            "only simple function calls (env, int, str, float, or a `comptime def`) are valid in comptime expressions"
                 .into(),
         ),
     };
@@ -203,12 +468,12 @@ fn eval_call(call: &ExprCall) -> Result<ComptimeValue, String> {
     let keywords = &call.arguments.keywords;
 
     match func_name {
-        "env" => eval_env_call(call),
+        "env" => eval_env_call(call, ctx),
         "int" => {
             if args.len() != 1 || !keywords.is_empty() {
                 return Err("int() in comptime context takes exactly one argument".into());
             }
-            match eval_expr(&args[0])? {
+            match eval_expr(&args[0], ctx)? {
                 ComptimeValue::Str(s) => s
                     .trim()
                     .parse::<i64>()
@@ -223,7 +488,7 @@ fn eval_call(call: &ExprCall) -> Result<ComptimeValue, String> {
             if args.len() != 1 || !keywords.is_empty() {
                 return Err("float() in comptime context takes exactly one argument".into());
             }
-            match eval_expr(&args[0])? {
+            match eval_expr(&args[0], ctx)? {
                 ComptimeValue::Str(s) => s
                     .trim()
                     .parse::<f64>()
@@ -238,7 +503,7 @@ fn eval_call(call: &ExprCall) -> Result<ComptimeValue, String> {
             if args.len() != 1 || !keywords.is_empty() {
                 return Err("str() in comptime context takes exactly one argument".into());
             }
-            let v = eval_expr(&args[0])?;
+            let v = eval_expr(&args[0], ctx)?;
             Ok(ComptimeValue::Str(match v {
                 ComptimeValue::Str(s) => s,
                 ComptimeValue::Int(n) => n.to_string(),
@@ -246,14 +511,214 @@ fn eval_call(call: &ExprCall) -> Result<ComptimeValue, String> {
                 ComptimeValue::Bool(b) => if b { "True" } else { "False" }.into(),
             }))
         }
+        // Dispatch into a user-defined `comptime def` if one matches.
+        _ if ctx.functions.contains_key(func_name) => {
+            if !keywords.is_empty() {
+                return Err(format!(
+                    "comptime function '{func_name}' does not accept keyword arguments"
+                ));
+            }
+            eval_user_comptime_call(func_name, args, ctx)
+        }
         other => Err(format!(
-            "function '{}' is not valid in a comptime expression; use env(), int(), str(), or float()",
+            "function '{}' is not valid in a comptime expression; use env(), int(), str(), float(), \
+             or a top-level `comptime def`",
             other
         )),
     }
 }
 
-fn eval_env_call(call: &ExprCall) -> Result<ComptimeValue, String> {
+/// Dispatch a call into a user-declared `comptime def` function. Binds
+/// each evaluated argument to the matching parameter name in a fresh
+/// scope, recurses on the body, and restores the caller's locals on
+/// return. Recursion depth is capped to avoid hanging the build on a
+/// definition that recurses without a base case.
+fn eval_user_comptime_call(
+    name: &str,
+    args: &[Expr],
+    ctx: &mut EvalContext<'_>,
+) -> Result<ComptimeValue, String> {
+    let def = ctx
+        .functions
+        .get(name)
+        .expect("caller already checked the registry");
+
+    if args.len() != def.params.len() {
+        return Err(format!(
+            "comptime function '{}' expects {} argument(s), got {}",
+            def.name,
+            def.params.len(),
+            args.len()
+        ));
+    }
+
+    if ctx.depth >= MAX_COMPTIME_DEPTH {
+        return Err(format!(
+            "comptime call depth exceeded {} while evaluating '{}' (recursive comptime function?)",
+            MAX_COMPTIME_DEPTH, name
+        ));
+    }
+
+    // Evaluate arguments in the caller's scope first; binding into the
+    // callee's scope only after all args are computed avoids leaking
+    // partially-bound state if one of them errors out.
+    let mut evaluated = Vec::with_capacity(args.len());
+    for arg in args {
+        evaluated.push(eval_expr(arg, ctx)?);
+    }
+
+    // Swap in a fresh locals frame so callee parameters don't shadow the
+    // caller's bindings in a way the caller can observe on return.
+    let previous_locals = std::mem::take(&mut ctx.locals);
+    for (param, value) in def.params.iter().zip(evaluated.into_iter()) {
+        ctx.locals.insert((*param).to_owned(), value);
+    }
+    ctx.depth += 1;
+
+    let result = eval_function_body(def.body, ctx);
+
+    // Restore caller state. Must happen even when the call errors out.
+    ctx.depth -= 1;
+    ctx.locals = previous_locals;
+
+    result.map_err(|e| format!("in comptime call to '{name}': {e}"))
+}
+
+/// Outcome of executing a statement (or sequence) inside a comptime
+/// function body: either control fell through to the next statement, or
+/// the function `return`ed with a value.
+enum StmtOutcome {
+    Returned(ComptimeValue),
+    FellThrough,
+}
+
+/// Evaluate a comptime function body and return the value it `return`ed.
+/// Supported statement shapes:
+///
+/// - `return EXPR`,
+/// - `NAME[: T] = EXPR` (with or without annotation) — binds a local,
+/// - `if COND: ... elif/else: ...` — branches on a boolean condition,
+/// - a leading docstring is tolerated.
+///
+/// Loops, exceptions, with-blocks, and class/def declarations are not
+/// supported in v1; calling one is a hard error. Walking off the end of
+/// the body without a `return` is also an error — a comptime function
+/// must produce a value.
+fn eval_function_body(body: &[Stmt], ctx: &mut EvalContext<'_>) -> Result<ComptimeValue, String> {
+    let mut start = 0;
+    if let Some(Stmt::Expr(e)) = body.first() {
+        if matches!(e.value.as_ref(), Expr::StringLiteral(_)) {
+            start = 1;
+        }
+    }
+    match eval_stmts(&body[start..], ctx)? {
+        StmtOutcome::Returned(v) => Ok(v),
+        StmtOutcome::FellThrough => {
+            Err("comptime function fell through without `return`ing a value".into())
+        }
+    }
+}
+
+fn eval_stmts(stmts: &[Stmt], ctx: &mut EvalContext<'_>) -> Result<StmtOutcome, String> {
+    for stmt in stmts {
+        match eval_stmt(stmt, ctx)? {
+            StmtOutcome::FellThrough => continue,
+            ret @ StmtOutcome::Returned(_) => return Ok(ret),
+        }
+    }
+    Ok(StmtOutcome::FellThrough)
+}
+
+fn eval_stmt(stmt: &Stmt, ctx: &mut EvalContext<'_>) -> Result<StmtOutcome, String> {
+    match stmt {
+        Stmt::Return(r) => {
+            let Some(value) = r.value.as_deref() else {
+                return Err(
+                    "comptime function must `return` a value (bare `return` is not valid)".into(),
+                );
+            };
+            Ok(StmtOutcome::Returned(eval_expr(value, ctx)?))
+        }
+        Stmt::Assign(a) => {
+            if a.targets.len() != 1 {
+                return Err("comptime function does not support multi-target assignment".into());
+            }
+            let Expr::Name(n) = &a.targets[0] else {
+                return Err("comptime function only supports `NAME = EXPR` assignments".into());
+            };
+            let value = eval_expr(&a.value, ctx)?;
+            ctx.locals.insert(n.id.as_str().to_owned(), value);
+            Ok(StmtOutcome::FellThrough)
+        }
+        Stmt::AnnAssign(a) => {
+            let Expr::Name(n) = a.target.as_ref() else {
+                return Err(
+                    "comptime function only supports `NAME[: T] = EXPR` annotated assignments"
+                        .into(),
+                );
+            };
+            let Some(rhs) = a.value.as_deref() else {
+                return Err(
+                    "annotated declaration inside a comptime function must have an initialiser"
+                        .into(),
+                );
+            };
+            let value = eval_expr(rhs, ctx)?;
+            ctx.locals.insert(n.id.as_str().to_owned(), value);
+            Ok(StmtOutcome::FellThrough)
+        }
+        Stmt::If(i) => {
+            let cond = eval_expr(&i.test, ctx)?;
+            let truthy = match cond {
+                ComptimeValue::Bool(b) => b,
+                _ => return Err("comptime `if` condition must reduce to a bool".into()),
+            };
+            if truthy {
+                return eval_stmts(&i.body, ctx);
+            }
+            // Python's AST encodes `elif`/`else` as a list of clauses;
+            // the first one with `test = None` is the `else`.
+            for clause in &i.elif_else_clauses {
+                match &clause.test {
+                    Some(test) => {
+                        let cond = eval_expr(test, ctx)?;
+                        let truthy = match cond {
+                            ComptimeValue::Bool(b) => b,
+                            _ => {
+                                return Err("comptime `elif` condition must reduce to a bool".into())
+                            }
+                        };
+                        if truthy {
+                            return eval_stmts(&clause.body, ctx);
+                        }
+                    }
+                    None => return eval_stmts(&clause.body, ctx),
+                }
+            }
+            Ok(StmtOutcome::FellThrough)
+        }
+        // Bare expression statements (other than a leading docstring,
+        // which `eval_function_body` peels off before delegating here)
+        // are rejected. Silently skipping them would let a body like
+        // `1 / 0; return 1` produce the literal `1` at compile time
+        // even though the same code emitted as a Python `def` would
+        // crash at runtime — divergence between comptime constants
+        // and runtime behaviour is exactly the kind of bug the
+        // hermetic-evaluator contract is supposed to prevent.
+        Stmt::Expr(_) => Err(
+            "bare expression statement is not supported inside a comptime function body \
+             (only a leading docstring is allowed)"
+                .into(),
+        ),
+        other => Err(format!(
+            "`{}` is not supported inside a comptime function body (v1 supports \
+             `return`, local assignments, and `if`/`elif`/`else`)",
+            stmt_kind_name(other)
+        )),
+    }
+}
+
+fn eval_env_call(call: &ExprCall, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue, String> {
     let args = &call.arguments.args;
     let keywords = &call.arguments.keywords;
     if args.is_empty() || args.len() > 2 {
@@ -263,7 +728,7 @@ fn eval_env_call(call: &ExprCall) -> Result<ComptimeValue, String> {
         return Err("env() does not accept keyword arguments".into());
     }
 
-    let var_name = match eval_expr(&args[0])? {
+    let var_name = match eval_expr(&args[0], ctx)? {
         ComptimeValue::Str(s) => s,
         _ => return Err("env() first argument must be a string literal".into()),
     };
@@ -273,7 +738,7 @@ fn eval_env_call(call: &ExprCall) -> Result<ComptimeValue, String> {
         Err(_) => {
             if args.len() == 2 {
                 // Use the default value.
-                eval_expr(&args[1])
+                eval_expr(&args[1], ctx)
             } else {
                 Err(format!(
                     "required environment variable '{}' is not set",
@@ -423,19 +888,69 @@ fn expr_kind_name(expr: &Expr) -> &'static str {
     }
 }
 
+/// Human-readable name for a `Stmt` variant. Surfaced in the comptime
+/// "unsupported statement" diagnostic so the user sees "while-loop" or
+/// "raise" rather than the opaque `Discriminant(...)` debug print.
+fn stmt_kind_name(stmt: &Stmt) -> &'static str {
+    match stmt {
+        Stmt::FunctionDef(_) => "function definition",
+        Stmt::ClassDef(_) => "class definition",
+        Stmt::Return(_) => "return",
+        Stmt::Delete(_) => "del",
+        Stmt::Assign(_) => "assignment",
+        Stmt::AugAssign(_) => "augmented assignment",
+        Stmt::AnnAssign(_) => "annotated assignment",
+        Stmt::TypeAlias(_) => "type alias",
+        Stmt::For(_) => "for-loop",
+        Stmt::While(_) => "while-loop",
+        Stmt::If(_) => "if",
+        Stmt::With(_) => "with-block",
+        Stmt::Match(_) => "match",
+        Stmt::Raise(_) => "raise",
+        Stmt::Try(_) => "try/except",
+        Stmt::Assert(_) => "assert",
+        Stmt::Import(_) => "import",
+        Stmt::ImportFrom(_) => "from-import",
+        Stmt::Global(_) => "global",
+        Stmt::Nonlocal(_) => "nonlocal",
+        Stmt::Expr(_) => "expression statement",
+        Stmt::Pass(_) => "pass",
+        Stmt::Break(_) => "break",
+        Stmt::Continue(_) => "continue",
+        Stmt::IpyEscapeCommand(_) => "IPython escape command",
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
     use tyc_syntax::preprocess::preprocess;
+
+    /// Process-wide lock for tests that read or mutate `std::env`.
+    ///
+    /// Cargo runs `#[test]` functions in parallel and `std::env::set_var`
+    /// / `remove_var` mutate shared global state — two tests racing on
+    /// the same variable will produce flaky failures. Any test that
+    /// touches the environment acquires this guard first; tests that
+    /// don't touch the env are free to run in parallel as usual.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Acquire [`ENV_LOCK`], recovering from poisoning. A panic inside an
+    /// env-touching test would otherwise poison the mutex and make every
+    /// subsequent env test fail with `PoisonError` instead of running.
+    fn lock_env() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
 
     fn eval(src: &str) -> (HashMap<String, ComptimeValue>, Diagnostics) {
         let prep = preprocess(src);
         let module = tyc_syntax::parse_module(&prep.python_source)
             .expect("parse failed")
             .into_syntax();
-        evaluate_comptime(&module, &prep.comptime_bindings)
+        evaluate_comptime_with_functions(&module, &prep.comptime_bindings, &prep.comptime_functions)
     }
 
     #[test]
@@ -454,6 +969,7 @@ mod tests {
 
     #[test]
     fn env_with_default_uses_default_when_unset() {
+        let _guard = lock_env();
         // Use a unique name that no other test sets.
         std::env::remove_var("__TYPHON_TEST_UNSET_DEFAULT__");
         let (values, diags) = eval(
@@ -465,6 +981,7 @@ mod tests {
 
     #[test]
     fn env_with_default_uses_env_when_set() {
+        let _guard = lock_env();
         std::env::set_var("__TYPHON_TEST_SET_DEFAULT__", "4321");
         let (values, diags) =
             eval("comptime let PORT: int = int(env(\"__TYPHON_TEST_SET_DEFAULT__\", \"9000\"))\n");
@@ -475,6 +992,7 @@ mod tests {
 
     #[test]
     fn missing_required_env_is_an_error() {
+        let _guard = lock_env();
         std::env::remove_var("__TYPHON_REQUIRED_TEST_UNIQUE__");
         let (_, diags) =
             eval("comptime let DB_URL: str = env(\"__TYPHON_REQUIRED_TEST_UNIQUE__\")\n");
@@ -503,6 +1021,343 @@ mod tests {
     fn to_python_literal_bool() {
         assert_eq!(ComptimeValue::Bool(true).to_python_literal(), "True");
         assert_eq!(ComptimeValue::Bool(false).to_python_literal(), "False");
+    }
+
+    // ── `comptime def` functions ─────────────────────────────────────────────
+
+    #[test]
+    fn comptime_function_called_from_binding_rhs() {
+        let src = "\
+comptime def double(n: int) -> int:
+    return n * 2
+
+comptime let SIZE: int = double(21)
+";
+        let (values, diags) = eval(src);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("SIZE"), Some(ComptimeValue::Int(42))));
+    }
+
+    #[test]
+    fn comptime_function_chains_with_env() {
+        let _guard = lock_env();
+        // `comptime def` can compose with `env()`, demonstrating that the
+        // user-defined function and the built-in lookups share a single
+        // evaluator scope.
+        std::env::set_var("__TYPHON_COMPTIME_CHAIN__", "5");
+        let src = "\
+comptime def plus_one(n: int) -> int:
+    return n + 1
+
+comptime let RESULT: int = plus_one(int(env(\"__TYPHON_COMPTIME_CHAIN__\")))
+";
+        let (values, diags) = eval(src);
+        std::env::remove_var("__TYPHON_COMPTIME_CHAIN__");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("RESULT"), Some(ComptimeValue::Int(6))));
+    }
+
+    #[test]
+    fn comptime_function_two_args() {
+        let src = "\
+comptime def join(prefix: str, suffix: str) -> str:
+    return prefix + suffix
+
+comptime let URL: str = join(\"https://\", \"example.com\")
+";
+        let (values, diags) = eval(src);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(
+            matches!(values.get("URL"), Some(ComptimeValue::Str(s)) if s == "https://example.com")
+        );
+    }
+
+    #[test]
+    fn comptime_function_can_call_another_comptime_function() {
+        let src = "\
+comptime def double(n: int) -> int:
+    return n * 2
+
+comptime def quad(n: int) -> int:
+    return double(double(n))
+
+comptime let X: int = quad(3)
+";
+        let (values, diags) = eval(src);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("X"), Some(ComptimeValue::Int(12))));
+    }
+
+    #[test]
+    fn comptime_call_with_wrong_arity_is_an_error() {
+        let src = "\
+comptime def double(n: int) -> int:
+    return n * 2
+
+comptime let X: int = double(1, 2)
+";
+        let (_, diags) = eval(src);
+        assert!(diags.has_errors(), "wrong arity must produce an error");
+        let msg = format!("{:?}", diags.errors()[0]);
+        assert!(
+            msg.contains("expects 1 argument"),
+            "expected arity error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn comptime_call_with_keyword_args_is_an_error() {
+        let src = "\
+comptime def double(n: int) -> int:
+    return n * 2
+
+comptime let X: int = double(n=2)
+";
+        let (_, diags) = eval(src);
+        assert!(diags.has_errors());
+        let msg = format!("{:?}", diags.errors()[0]);
+        assert!(
+            msg.contains("keyword arguments"),
+            "expected keyword-arg error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn comptime_function_with_local_binding_supported() {
+        // A local `NAME = EXPR` (or `let NAME: T = EXPR`) inside a
+        // comptime function body binds in the local scope and is
+        // available to subsequent statements / the return expression.
+        let src = "\
+comptime def thing() -> int:
+    x = 1
+    return x + 2
+
+comptime let X: int = thing()
+";
+        let (values, diags) = eval(src);
+        assert!(
+            !diags.has_errors(),
+            "local binding must be supported: {:?}",
+            diags.errors()
+        );
+        assert!(matches!(values.get("X"), Some(ComptimeValue::Int(3))));
+    }
+
+    #[test]
+    fn comptime_function_with_annotated_local_binding_supported() {
+        let src = "\
+comptime def thing() -> int:
+    let x: int = 10
+    return x * x
+
+comptime let X: int = thing()
+";
+        let (values, diags) = eval(src);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("X"), Some(ComptimeValue::Int(100))));
+    }
+
+    #[test]
+    fn comptime_function_if_else_picks_then_branch() {
+        let src = "\
+comptime def clamp(n: int) -> int:
+    if n > 100:
+        return 100
+    return n
+
+comptime let X: int = clamp(250)
+";
+        let (values, diags) = eval(src);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("X"), Some(ComptimeValue::Int(100))));
+    }
+
+    #[test]
+    fn comptime_function_if_else_picks_else_branch() {
+        let src = "\
+comptime def clamp(n: int) -> int:
+    if n > 100:
+        return 100
+    return n
+
+comptime let X: int = clamp(7)
+";
+        let (values, diags) = eval(src);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("X"), Some(ComptimeValue::Int(7))));
+    }
+
+    #[test]
+    fn comptime_function_elif_chain() {
+        let src = "\
+comptime def grade(score: int) -> str:
+    if score >= 90:
+        return \"A\"
+    elif score >= 80:
+        return \"B\"
+    elif score >= 70:
+        return \"C\"
+    else:
+        return \"F\"
+
+comptime let G1: str = grade(95)
+comptime let G2: str = grade(82)
+comptime let G3: str = grade(50)
+";
+        let (values, diags) = eval(src);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("G1"), Some(ComptimeValue::Str(s)) if s == "A"));
+        assert!(matches!(values.get("G2"), Some(ComptimeValue::Str(s)) if s == "B"));
+        assert!(matches!(values.get("G3"), Some(ComptimeValue::Str(s)) if s == "F"));
+    }
+
+    #[test]
+    fn comptime_ternary_if_expression() {
+        let src = "\
+comptime def sign(n: int) -> int:
+    return 1 if n > 0 else -1
+
+comptime let A: int = sign(7)
+comptime let B: int = sign(-3)
+";
+        let (values, diags) = eval(src);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("A"), Some(ComptimeValue::Int(1))));
+        assert!(matches!(values.get("B"), Some(ComptimeValue::Int(-1))));
+    }
+
+    #[test]
+    fn comptime_boolean_operators_short_circuit() {
+        let src = "\
+comptime def both(a: bool, b: bool) -> bool:
+    return a and b
+
+comptime def either(a: bool, b: bool) -> bool:
+    return a or b
+
+comptime let T1: bool = both(True, True)
+comptime let T2: bool = both(True, False)
+comptime let T3: bool = either(False, True)
+";
+        let (values, diags) = eval(src);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("T1"), Some(ComptimeValue::Bool(true))));
+        assert!(matches!(values.get("T2"), Some(ComptimeValue::Bool(false))));
+        assert!(matches!(values.get("T3"), Some(ComptimeValue::Bool(true))));
+    }
+
+    #[test]
+    fn comptime_function_without_return_is_an_error() {
+        // A function that runs every branch without hitting `return` is
+        // a hard error — the comptime binding has no value to inline.
+        let src = "\
+comptime def thing(n: int) -> int:
+    let x: int = n + 1
+
+comptime let X: int = thing(2)
+";
+        let (_, diags) = eval(src);
+        assert!(diags.has_errors(), "missing return must be an error");
+        let msg = format!("{:?}", diags.errors()[0]);
+        assert!(msg.contains("fell through"), "got: {msg}");
+    }
+
+    #[test]
+    fn comptime_function_loop_statement_rejected() {
+        // Loops aren't supported in v1 — make sure the error message
+        // points at the unsupported statement category rather than
+        // silently producing wrong output.
+        let src = "\
+comptime def thing() -> int:
+    for i in [1, 2, 3]:
+        let x: int = i
+    return 0
+
+comptime let X: int = thing()
+";
+        let (_, diags) = eval(src);
+        assert!(diags.has_errors(), "for-loop body must be rejected");
+    }
+
+    #[test]
+    fn comptime_function_docstring_before_return_is_allowed() {
+        let src = "\
+comptime def thing() -> int:
+    \"a tiny helper\"
+    return 7
+
+comptime let X: int = thing()
+";
+        let (values, diags) = eval(src);
+        assert!(
+            !diags.has_errors(),
+            "docstring + return must be supported: {:?}",
+            diags.errors()
+        );
+        assert!(matches!(values.get("X"), Some(ComptimeValue::Int(7))));
+    }
+
+    #[test]
+    fn comptime_function_bare_expression_statement_rejected() {
+        // A bare expression statement (other than a leading docstring)
+        // must NOT be silently skipped at compile time — the same code
+        // emitted as Python `def` would execute the expression, so
+        // skipping it would let `1/0` produce a literal value at
+        // build time even though the runtime call would crash.
+        let src = "\
+comptime def thing() -> int:
+    1 / 0
+    return 1
+
+comptime let X: int = thing()
+";
+        let (_, diags) = eval(src);
+        assert!(
+            diags.has_errors(),
+            "bare expression statement must be rejected, not silently skipped"
+        );
+        let msg = format!("{:?}", diags.errors()[0]);
+        assert!(
+            msg.contains("bare expression statement"),
+            "expected dedicated bare-expression diagnostic, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn comptime_function_recursion_depth_capped() {
+        // A function that calls itself without a base case must terminate
+        // the build with the recursion-depth diagnostic rather than
+        // hanging.
+        let src = "\
+comptime def boom(n: int) -> int:
+    return boom(n)
+
+comptime let X: int = boom(1)
+";
+        let (_, diags) = eval(src);
+        assert!(diags.has_errors());
+        let msg = format!("{:?}", diags.errors()[0]);
+        assert!(msg.contains("depth"), "expected depth error, got: {msg}");
+    }
+
+    #[test]
+    fn comptime_module_level_name_is_not_in_scope() {
+        // Names other than the function's own parameters are not in scope
+        // inside a comptime function body — comptime evaluation is
+        // hermetic. (A free reference would also be a runtime crash in
+        // Python if the bound name didn't exist; failing fast at build
+        // time keeps the contract clear.)
+        let src = "\
+comptime def use_outer() -> int:
+    return outer_x
+
+comptime let OUTER_X: int = 1
+comptime let Y: int = use_outer()
+";
+        let (_, diags) = eval(src);
+        assert!(diags.has_errors());
+        let msg = format!("{:?}", diags.errors()[0]);
+        assert!(msg.contains("unknown name"), "got: {msg}");
     }
 }
 

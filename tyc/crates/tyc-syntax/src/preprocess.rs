@@ -91,6 +91,14 @@ pub struct PreprocessResult {
     /// Bindings that were declared `comptime` and whose RHS the build command
     /// must evaluate and inline.
     pub comptime_bindings: Vec<ComptimeBinding>,
+    /// Names of `comptime def` functions declared at module top level.
+    /// The analyser turns these into a registry so the comptime
+    /// evaluator can dispatch into them when a `comptime let` binding's
+    /// RHS references the function. Bodies are read from the parsed AST
+    /// at evaluation time; this list only carries the function names
+    /// (which the evaluator uses to decide which `def` statements are
+    /// callable from a comptime context).
+    pub comptime_functions: Vec<String>,
     /// Lazy import declarations, in source order.  Each entry records the
     /// alias and module so [`postprocess`] can restore the original
     /// `lazy import ALIAS = MODULE` syntax.
@@ -146,6 +154,7 @@ pub fn preprocess(source: &str) -> PreprocessResult {
     let mut stripped = Vec::new();
     let mut optionals = Vec::new();
     let mut comptime_bindings = Vec::new();
+    let mut comptime_functions: Vec<String> = Vec::new();
     let mut lazy_imports = Vec::new();
     let mut unsafe_lines: Vec<usize> = Vec::new();
     let mut raw_class_lines: Vec<usize> = Vec::new();
@@ -357,39 +366,59 @@ pub fn preprocess(source: &str) -> PreprocessResult {
                 }
             }
 
-            // ── `comptime [let|mut] name…` → strip only the `comptime`
+            // ── `comptime [let|mut|def] name…` → strip only the `comptime`
             // prefix; any inner `let`/`mut` is left for the Ruff parser.
-            // `comptime` is a module-level concept; bindings inside
-            // functions or classes cannot be evaluated at build time. Only
-            // record top-level (indent_len == 0) comptime declarations.
+            // `comptime` is a module-level concept; bindings and function
+            // defs inside functions or classes cannot be evaluated at
+            // build time. Only record top-level (indent_len == 0)
+            // comptime declarations.
             let mut stripped_line: Option<String> = None;
             if indent_len == 0 && rest.starts_with("comptime ") {
                 let payload = &rest["comptime ".len()..];
-                // Skip past any inner let/mut to find the binding name.
-                let name_source = if let Some(s) = payload.strip_prefix("let ") {
-                    s
-                } else if let Some(s) = payload.strip_prefix("mut ") {
-                    s
-                } else {
-                    payload
-                };
-                let binding_name = name_source
-                    .split([':', '='])
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .to_owned();
 
-                if !binding_name.is_empty() {
-                    comptime_bindings.push(ComptimeBinding {
-                        name: binding_name,
-                        line_index,
-                    });
-                    stripped.push(StrippedKeyword {
-                        line_index,
-                        keyword: TyphonKeyword::Comptime,
-                    });
-                    stripped_line = Some(format!("{}{}", indent, payload));
+                // Function declaration: `comptime def NAME(...):` — the
+                // function becomes callable from comptime expression
+                // evaluation. The Python `def` body is left intact for
+                // the parser; the evaluator pulls the body straight from
+                // the parsed AST when a comptime call dispatches to this
+                // name.
+                if let Some(after_def) = payload.strip_prefix("def ") {
+                    let name = after_def.split('(').next().unwrap_or("").trim().to_owned();
+                    if !name.is_empty() {
+                        comptime_functions.push(name);
+                        stripped.push(StrippedKeyword {
+                            line_index,
+                            keyword: TyphonKeyword::Comptime,
+                        });
+                        stripped_line = Some(format!("{}{}", indent, payload));
+                    }
+                } else {
+                    // Skip past any inner let/mut to find the binding name.
+                    let name_source = if let Some(s) = payload.strip_prefix("let ") {
+                        s
+                    } else if let Some(s) = payload.strip_prefix("mut ") {
+                        s
+                    } else {
+                        payload
+                    };
+                    let binding_name = name_source
+                        .split([':', '='])
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_owned();
+
+                    if !binding_name.is_empty() {
+                        comptime_bindings.push(ComptimeBinding {
+                            name: binding_name,
+                            line_index,
+                        });
+                        stripped.push(StrippedKeyword {
+                            line_index,
+                            keyword: TyphonKeyword::Comptime,
+                        });
+                        stripped_line = Some(format!("{}{}", indent, payload));
+                    }
                 }
             }
 
@@ -436,6 +465,7 @@ pub fn preprocess(source: &str) -> PreprocessResult {
         stripped,
         optionals,
         comptime_bindings,
+        comptime_functions,
         lazy_imports,
         unsafe_lines,
         raw_class_lines,

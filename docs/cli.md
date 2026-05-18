@@ -17,6 +17,7 @@ Typhon ships a single binary, `tyc`, that handles every stage of the workflow. S
 | `tyc profile` | Instrument emitted code for hot-function detection (advanced, opt-in). |
 | `tyc migrate` | Convert typed Python (`.py`) to Typhon (`.ty`): rewrites `Optional[T]`/`T \| None` → `T?`, adds `let`/`mut` to module-level annotated assigns, strips `@dataclass` decorators. |
 | `tyc ty` | Build the project and run Astral's `ty` checker against the emitted Python. Requires `ty` on `PATH` (`pip install ty`). Supports `--watch` for continuous feedback. |
+| `tyc stubtest` | Build the project and run `python -m mypy.stubtest` against every emitted `.pyi` stub. Complements `tyc check --stubs` (which performs an AST diff) by catching dynamically-created attributes the AST cannot see. Requires `mypy` in the chosen interpreter (`pip install mypy`). |
 | `tyc repl` | Interactive Typhon evaluator. Reads `.ty` source one block at a time, compiles it through the full pipeline, and executes the result with a Python interpreter. |
 | `tyc debug` | Build the project and launch the emitted Python under a debugger (default `pdb`). Thin v1 wrapper — a Typhon-native source-mapping debugger is a Phase-5 item. |
 | `tyc run` | Build the project and execute the emitted Python in one step. `--temp` builds into a tempdir that is removed on exit — the "tyx in-memory" mode for quick iteration. |
@@ -83,6 +84,39 @@ tyc ty -- --strict
 | `--ty-bin BIN` | Path to the `ty` executable (default: `ty`) |
 | `--no-build` | Skip the build step; requires `--out` so the directory is known |
 | `--watch` | Watch source directory and re-run on `.ty` / `.dty` changes |
+
+## `tyc stubtest`
+
+Runtime probe that complements `tyc check --stubs`. The `--stubs` check performs an AST-level diff between every `.dty` stub and its sibling implementation; `tyc stubtest` adds the runtime introspection step that catches dynamically-created attributes the AST cannot see — `__init_subclass__` injection, metaclass-driven member registration, Pydantic auto-generated fields, and so on. Under the hood it builds the project and runs `python -m mypy.stubtest <module>` for every emitted `.pyi`.
+
+```bash
+# Build into a temp directory and probe every stub:
+tyc stubtest
+
+# Keep the build output for inspection:
+tyc stubtest --out build/
+
+# Re-use an existing build:
+tyc stubtest --out build/ --no-build
+
+# Probe against a specific virtualenv:
+tyc stubtest --python .venv/bin/python
+
+# Continue past the first failure to get the full drift report:
+tyc stubtest --keep-going
+
+# Forward extra flags to mypy.stubtest:
+tyc stubtest -- --allowlist stubtest-allow.txt --ignore-positional-only
+```
+
+| Flag | Purpose |
+|------|---------|
+| `--out DIR` | Write emitted Python here instead of a temp dir |
+| `--no-build` | Skip the build step; requires `--out` so the directory is known |
+| `--python BIN` | Python interpreter (default: `python3`) |
+| `--keep-going` | Probe every module even after one reports drift |
+
+Requires `mypy` to be installed in the chosen interpreter (`pip install mypy`). When `mypy` is missing the command surfaces a clear error pointing the user at the install command rather than failing opaquely inside the subprocess.
 
 ## `tyc repl`
 

@@ -83,6 +83,52 @@ class ApiUser(BaseModel):
 
 `model` emission injects `extra='forbid'` by default — Pydantic's stock `extra='ignore'` silently drops unexpected input, which directly contradicts Typhon's safety pitch. Permissive modes are opt-in via `[emit] model-extra = "allow" | "ignore"` in `typhon.toml`. Pydantic's `frozen=True` is *faux* immutability (it blocks field reassignment but does not freeze nested mutable values); see `let`/`mut` for what Typhon's binding immutability does and does not guarantee.
 
+### `class!` (raw class)
+
+`class!` is the escape hatch for classes that cannot be expressed as a dataclass: `torch.nn.Module`, `enum.Enum`, `typing.NamedTuple`, `unittest.TestCase`, Django models, SQLAlchemy declarative bases — anything whose base class needs a non-trivial `__init__` to run *before* fields are assigned.
+
+```python
+# Typhon
+import torch.nn as nn
+
+class! MyModel(nn.Module):
+    layer: nn.Linear
+    dropout: float
+
+    def forward(self, x):
+        return self.layer(x)
+
+# Emitted Python (no @dataclass; super().__init__() runs first)
+import torch.nn as nn
+
+class MyModel(nn.Module):
+    layer: nn.Linear
+    dropout: float
+
+    def __init__(self, layer: nn.Linear, dropout: float) -> None:
+        super().__init__()
+        self.layer = layer
+        self.dropout = dropout
+
+    def forward(self, x):
+        return self.layer(x)
+```
+
+What `class!` changes versus a plain `class`:
+
+- **No `@dataclass` decorator** is injected. The class is emitted verbatim with whatever bases it declares.
+- **`__init__` is auto-synthesised** when the body declares no `def __init__` and at least one base is present. The synthesised constructor calls `super().__init__()` and then assigns every annotated field through `self`, in source order. Field defaults flow into the parameter signature; fields without defaults are positional, fields with defaults are keyword-or-positional after them.
+- **A hand-written `__init__` is preserved verbatim.** Use this when the base class needs configuration arguments that aren't 1:1 with your declared fields.
+
+When to reach for which class form:
+
+| Form | Emits | Use when |
+|---|---|---|
+| `class Foo:` | `@dataclass(slots=True)` | Plain value type. Default for new code. |
+| `model Foo:` | `BaseModel` (Pydantic, `extra='forbid'`) | Validated input at a system boundary. |
+| `interface Foo:` | `Protocol` | Structural contract you check against, not a concrete type. |
+| `class! Foo(Base):` | bare `class Foo(Base):` + synthesised or hand-written `__init__` | Subclassing a framework base that owns its own `__init__`. |
+
 ## Error handling
 
 ### `Result[T, E]`
@@ -209,6 +255,75 @@ comptime let DB_URL: str = env("DATABASE_URL")  # build fails if unset
 # Emitted Python
 PORT: int = 8080
 DB_URL: str = "postgresql://..."
+```
+
+### `comptime def` functions
+
+A `comptime def` declares a function that the evaluator can call from a `comptime let` initialiser. The function name is registered at build time; the body can mix `return` with local bindings (`x = EXPR`, `let x: T = EXPR`, `mut x: T = EXPR`) and `if` / `elif` / `else` branches. Expressions follow the same rules as any other comptime RHS — literals, arithmetic, string concatenation, comparisons, boolean ops, ternaries, `env()` / `int()` / `str()` / `float()` calls, parameter references, and calls to other `comptime def` functions. The full statement and expression grammar is enumerated in the "v1 contract" section below.
+
+```python
+# Typhon
+comptime def double(n: int) -> int:
+    return n * 2
+
+comptime def join(prefix: str, suffix: str) -> str:
+    return prefix + suffix
+
+comptime let PORT:    int = double(4000)
+comptime let API_URL: str = join("https://api.", env("DOMAIN", "example.com"))
+```
+
+The Typhon checker invokes `double` and `join` at compile time and substitutes the resulting literals before emission:
+
+```python
+# Emitted Python
+def double(n: int) -> int:
+    return n * 2
+
+def join(prefix: str, suffix: str) -> str:
+    return prefix + suffix
+
+PORT: int = 8000
+API_URL: str = "https://api.example.com"
+```
+
+The function definitions remain in the emitted output (they're ordinary Python `def`s — the `comptime` prefix is a build-time marker, not a runtime signal) so the same helpers stay available at runtime should you also call them from non-comptime code.
+
+The contract is intentionally tight in v1, but already covers most build-time configuration shapes:
+
+- **Statements**: `return EXPR`, local bindings (`x = EXPR`, `let x: T = EXPR`, `mut x: T = EXPR`), and `if`/`elif`/`else` are supported. Loops, exceptions, `with`-blocks, `class`/`def` declarations, and `raise` are not — call sites should compose smaller comptime helpers instead.
+- **Expressions**: every form available to a `comptime let` initialiser, plus parameter and local-binding references, comparisons (`==`, `!=`, `<`, `<=`, `>`, `>=`), boolean operators (`and`, `or`, `not`), and the `EXPR if COND else EXPR` ternary.
+- **Parameters** must be plain positional names — no defaults, `*args`, `**kwargs`, or keyword-only forms.
+- **Free variables** (module-level names other than parameters and local bindings) are not in scope inside the body. Comptime evaluation is hermetic — call sites pass everything in as arguments.
+- **Recursion depth** is capped (currently 64) so a buggy definition fails the build rather than hanging it.
+
+These restrictions exist because comptime evaluation runs *inside the compiler*. Lifting them further (loops, container construction, types as values) is incremental work; the rule of thumb today is "if a comptime function couldn't be a small pure helper over arithmetic, strings, and booleans, it probably belongs at runtime."
+
+Concrete examples that work today:
+
+```python
+comptime def grade(score: int) -> str:
+    if score >= 90:
+        return "A"
+    elif score >= 80:
+        return "B"
+    elif score >= 70:
+        return "C"
+    else:
+        return "F"
+
+comptime def clamp_port(p: int) -> int:
+    let lower: int = 1024
+    let upper: int = 65535
+    if p < lower:
+        return lower
+    if p > upper:
+        return upper
+    return p
+
+comptime let MY_GRADE:  str = grade(82)           # → "B"
+comptime let SAFE_PORT: int = clamp_port(80)      # → 1024
+comptime let MAX_SCORE: int = 100 if env("STRICT", "1") == "1" else 80
 ```
 
 ## Readability features
