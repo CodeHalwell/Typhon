@@ -51,7 +51,7 @@ The 30-second mental model. Everything else in this skill is detail under one of
 | Class | `class User: id: int` | `@dataclass(slots=True) class User: id: int` |
 | Pydantic model | `model ApiUser: id: int` | `class ApiUser(BaseModel): model_config = ConfigDict(extra="forbid"); id: int` |
 | Frozen class | `class P frozen: x: float` | `@dataclass(slots=True, frozen=True)` |
-| Methods | `impl User: def display() -> str: ...` (no `self`) | merged into class with `self` inserted |
+| Methods | `impl User: def display(self) -> str: ...` (explicit `self`, then `self.NAME`) | merged into the class body |
 | Extend foreign class | `extend User: def x() -> int: ...` | merged at desugar |
 | Extend built-in | `extend str: def slug() -> str: ...` | extracted to `__typhon_ext_str__slug` free fn + receiver-typed call rewrites |
 | Result type | `Result[T, E]`, `Ok(v)`, `Err(e)` | generated `typhon_runtime.Ok/Err` dataclasses |
@@ -130,11 +130,13 @@ class User:
     name: str
 
 impl User:
-    def display() -> str:        # no `self`; reference fields as plain names
-        return f"{name} (#{id})"
+    def display(self) -> str:    # take an explicit `self`; use `self.NAME`
+        return f"{self.name} (#{self.id})"
 ```
 
-Writing methods inside `class` is `tyc::manual_init` / wrong-place errors. Writing `__init__` is rejected — the constructor is generated. `self` is inserted at desugar.
+Earlier drafts of this guide suggested an implicit-`self` form where bare `name` resolved to `self.name`. That form was never implemented (the resolver can't see the enclosing class's fields by the time it walks the method body), so the explicit `self.NAME` access shown above is what works today. The bare-identifier sugar may come back later; explicit `self` is the durable form.
+
+Writing `__init__` inside `class` is rejected — the constructor is generated. `self` on impl-block methods is currently optional (it's inserted at desugar if omitted, but you can't reach class fields from a no-`self` method), so writing it explicitly is the recommended style.
 
 ### Rule 5 — `Any` only enters through `unsafe:` or `.dty` stubs
 

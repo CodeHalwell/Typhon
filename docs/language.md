@@ -44,7 +44,7 @@ Dynamic typing enters Typhon only through `unsafe` blocks and `.dty` stubs; noth
 
 ## Classes and `impl` blocks
 
-`class` declarations are minimalist: no explicit `__init__`, no `self` parameter on methods. Separate `impl` blocks attach methods to a class, Rust-style. The desugarer merges `impl` blocks into the class definition and inserts `self`.
+`class` declarations are minimalist: no explicit `__init__`, no body methods. Separate `impl` blocks attach methods to a class, Rust-style. Method definitions take an explicit `self` and reference fields as `self.NAME`; the desugarer merges them back into the class definition.
 
 Default emit target is `@dataclass(slots=True)`. Pydantic emission is opt-in via the `model` keyword.
 

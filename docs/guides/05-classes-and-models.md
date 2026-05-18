@@ -36,7 +36,7 @@ class User:
 
 ## Adding methods with `impl`
 
-Methods live in a separate `impl` block, with no `self` parameter:
+Methods live in a separate `impl` block. Take an explicit `self` parameter and access fields as `self.NAME`:
 
 ```python
 class User:
@@ -45,12 +45,14 @@ class User:
     email: str?
 
 impl User:
-    def display() -> str:
-        return f"{name} <{email}>" if email is not None else name
+    def display(self) -> str:
+        return f"{self.name} <{self.email}>" if self.email is not None else self.name
 
-    def is_admin() -> bool:
-        return id == 0
+    def is_admin(self) -> bool:
+        return self.id == 0
 ```
+
+> **History note.** Earlier drafts described an implicit-`self` form (`def display() -> str: return f"{name} (#{id})"`). That form was never implemented — the resolver doesn't know which class an impl-block method belongs to at name-resolution time, so bare `name` reads as "unknown name". Use the explicit `self.NAME` syntax shown above.
 
 Calls look normal:
 
@@ -60,7 +62,7 @@ print(u.display())            # Alice <alice@example.com>
 print(u.is_admin())           # False
 ```
 
-The desugarer **merges the `impl` block into the class** and inserts `self` everywhere it's needed:
+The desugarer **merges the `impl` block into the class**:
 
 ```python
 @dataclass(slots=True)
@@ -83,7 +85,7 @@ You can split `impl` blocks across files (e.g. keep `User` definition in `models
 Two reasons:
 
 1. **Data and behaviour are separable.** A `class` declaration shows the shape; `impl` blocks show what you can *do* with it. New methods can be added without touching the data definition.
-2. **No accidental `self`.** Forgetting `self` in Python silently makes a function instead of a method. In Typhon there's no `self` to forget — the desugarer adds it.
+2. **Methods are explicit, fields are nominal.** Write `def display(self) -> str:` and access fields via `self.NAME` — the resolver can't see the enclosing class's fields from a method body otherwise. (If you forget `self` on a method that touches fields, you'll get `tyc::unknown_name` for each field reference.)
 
 ## Mutability of fields
 

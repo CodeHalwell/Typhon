@@ -414,6 +414,15 @@ Pair `@memo` with `@pure` and you can cache a function that calls
 
 ## 10. Implicit field reference inside `impl` blocks does not work (bug)
 
+**Status:** **FIXED (docs)** on `claude/update-findings-IdfrH`. Took the
+deprecation path suggested in the original finding: the SKILL.md
+cheat-sheet, `docs/language.md`, and `docs/guides/05-classes-and-models.md`
+were rewritten to use explicit `def display(self) -> str: return
+self.NAME` instead of the previously-claimed bare-identifier form. A
+history note in the guide records the deprecation so users coming from
+older drafts know why their bare `name` references emit
+`tyc::unknown_name`. Reintroducing the implicit sugar is a follow-up.
+
 **Severity:** bug — documented core feature does not resolve.
 
 The skill cheat sheet and `docs/guides/05-classes-and-models.md` both say:
