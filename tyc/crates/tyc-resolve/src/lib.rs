@@ -264,6 +264,11 @@ struct Resolver<'a> {
     scopes: Vec<Scope>,
     references: Vec<Reference>,
     diagnostics: Diagnostics,
+    /// `(decl_span, new_span)` pairs already reported as `immutable_assign`.
+    /// The resolver double-visits each body (pre-collect + walk_stmt), so
+    /// without this guard a re-declaration would emit the same diagnostic
+    /// twice.
+    seen_immutable_redecl: std::collections::HashSet<((usize, usize), (usize, usize))>,
 }
 
 impl<'a> Resolver<'a> {
@@ -281,6 +286,7 @@ impl<'a> Resolver<'a> {
             scopes: vec![module],
             references: Vec::new(),
             diagnostics: Diagnostics::new(),
+            seen_immutable_redecl: std::collections::HashSet::new(),
         }
     }
 
@@ -335,15 +341,17 @@ impl<'a> Resolver<'a> {
             let _ = kind;
             if existing.mutability == Mutability::Let || mutability == Mutability::Let {
                 let decl_span = existing.span;
-                self.diagnostics.push_error(TycError::immutable_assign(
-                    name,
-                    &self.path,
-                    self.source,
-                    decl_span.0,
-                    decl_span.1.saturating_sub(decl_span.0).max(1),
-                    span.0,
-                    span.1.saturating_sub(span.0).max(1),
-                ));
+                if self.seen_immutable_redecl.insert((decl_span, span)) {
+                    self.diagnostics.push_error(TycError::immutable_assign(
+                        name,
+                        &self.path,
+                        self.source,
+                        decl_span.0,
+                        decl_span.1.saturating_sub(decl_span.0).max(1),
+                        span.0,
+                        span.1.saturating_sub(span.0).max(1),
+                    ));
+                }
                 return;
             }
             // Non-val rebinding: silently keep the first declaration.
@@ -466,7 +474,9 @@ pub fn resolve_module(
         scopes: std::mem::take(&mut r.scopes),
         references: std::mem::take(&mut r.references),
     };
-    (resolved, r.diagnostics)
+    let mut diagnostics = r.diagnostics;
+    diagnostics.dedup();
+    (resolved, diagnostics)
 }
 
 /// Search for `name` as a whole-word ASCII identifier in `source` starting
@@ -1536,6 +1546,25 @@ def foo():
     fn mut_reassignment_is_ok() {
         let (_m, d) = resolve("mut x: int = 1\nx = 2\n");
         assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn duplicate_let_emits_one_diagnostic() {
+        // The resolver double-visits each body (pre-collect + walk_stmt);
+        // a re-declaration must only be reported once.
+        let (_m, d) = resolve("let x = 1\nlet x = 2\n");
+        let immutable_errors: Vec<_> = d
+            .errors()
+            .iter()
+            .filter(|e| format!("{}", e).contains("cannot assign to immutable binding 'x'"))
+            .collect();
+        assert_eq!(
+            immutable_errors.len(),
+            1,
+            "expected exactly one immutable_assign diagnostic, got {}: {:?}",
+            immutable_errors.len(),
+            d.errors()
+        );
     }
 
     #[test]
