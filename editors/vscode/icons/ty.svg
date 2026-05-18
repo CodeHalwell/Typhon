@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 130" width="100%" height="100%">
+  <defs>
+    <linearGradient id="docGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1f2937" />
+      <stop offset="100%" stop-color="#111827" />
+    </linearGradient>
+
+    <linearGradient id="foldGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#374151" />
+      <stop offset="100%" stop-color="#1f2937" />
+    </linearGradient>
+
+    <linearGradient id="pyBlue" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#306998" />
+      <stop offset="100%" stop-color="#1e415e" />
+    </linearGradient>
+
+    <linearGradient id="pyYellow" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFD43B" />
+      <stop offset="100%" stop-color="#d6ab1c" />
+    </linearGradient>
+
+    <linearGradient id="stormFire" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ff9900" />
+      <stop offset="100%" stop-color="#cc3300" />
+    </linearGradient>
+
+    <filter id="shadow" x="-10%" y="-10%" width="130%" height="130%">
+      <feDropShadow dx="1" dy="2" stdDeviation="2" flood-color="#000" flood-opacity="0.5"/>
+    </filter>
+
+    <pattern id="scales" width="10" height="10" patternUnits="userSpaceOnUse">
+      <path d="M 5 0 L 10 5 L 5 10 L 0 5 Z" fill="none" stroke="#265175" stroke-width="0.75"/>
+    </pattern>
+  </defs>
+
+  <path d="M 20 10
+           H 60
+           L 85 35
+           V 110
+           A 5 5 0 0 1 80 115
+           H 20
+           A 5 5 0 0 1 15 110
+           V 15
+           A 5 5 0 0 1 20 10 Z"
+        fill="url(#docGrad)" filter="url(#shadow)"/>
+
+  <path d="M 60 10 V 30 A 5 5 0 0 0 65 35 H 85 Z" fill="url(#foldGrad)"/>
+
+  <path d="M 25 40
+           L 50 30
+           L 75 40
+           V 70
+           C 75 95 50 110 50 110
+           C 50 110 25 95 25 70 Z"
+        fill="url(#pyBlue)" filter="url(#shadow)"/>
+
+  <path d="M 25 40 L 50 30 L 75 40 V 70 C 75 95 50 110 50 110 C 50 110 25 95 25 70 Z" fill="url(#scales)"/>
+
+  <circle cx="38" cy="48" r="2.5" fill="#ff4500" filter="url(#shadow)"/>
+  <circle cx="62" cy="48" r="2.5" fill="#ff4500" filter="url(#shadow)"/>
+
+  <path d="M 51 32
+           L 41 58
+           H 54
+           L 47 80
+           L 66 52
+           H 52 Z"
+        fill="url(#stormFire)" opacity="0.8" filter="url(#shadow)"/>
+
+  <text x="50" y="82"
+        font-family="Georgia, 'Times New Roman', serif"
+        font-size="38"
+        font-weight="bold"
+        font-style="italic"
+        fill="url(#pyYellow)"
+        text-anchor="middle"
+        filter="url(#shadow)">Ty</text>
+</svg>
