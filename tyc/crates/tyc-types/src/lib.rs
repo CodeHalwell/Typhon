@@ -648,15 +648,20 @@ impl<'a> Checker<'a> {
     /// Assignment compatibility check that accounts for sealed-union subtyping
     /// and structural conformance against `interface` declarations.
     ///
-    /// Extends the module-level [`assignable`] function with three rules:
+    /// Extends the module-level [`assignable`] function with four rules:
     ///
     /// 1. **Variant → sealed union**: `Circle` is assignable to `Shape` when
     ///    `type Shape = Circle | Rectangle | ...` is declared.
     /// 2. **Class → interface**: a class is assignable to an `interface` when
-    ///    its member shape covers every required member of the interface.
-    /// 3. **Union interception**: when `expected` is a `Union`, retry each
-    ///    variant with `is_assignable` so the above rules are available inside
-    ///    composite types like `Shape | None` or `list[Shape]`.
+    ///    its member shape (including inherited members) covers every required
+    ///    member of the interface.
+    /// 3. **Union expected interception**: when `expected` is a `Union`, retry
+    ///    each variant with `is_assignable` so the above rules are available
+    ///    inside composite types like `Shape | None` or `list[Shape]`.
+    /// 4. **Union actual interception**: when `actual` is a `Union` (e.g. a
+    ///    conditional expression narrowed to `Dog | Cat`), every variant must
+    ///    be assignable to `expected` so nominal and structural rules apply to
+    ///    each arm.
     fn is_assignable(&self, expected: &Type, actual: &Type) -> bool {
         if assignable(expected, actual) {
             return true;
@@ -673,7 +678,12 @@ impl<'a> Checker<'a> {
                 return true;
             }
             // Nominal: actual inherits from expected class?
-            if self.class_inherits_from(act_name, exp_name) {
+            // Interfaces are structural-only: a class that merely lists an
+            // interface as a base without implementing its members must not
+            // satisfy the interface contract.
+            if !self.interfaces.contains_key(exp_name.as_str())
+                && self.class_inherits_from(act_name, exp_name)
+            {
                 return true;
             }
         }
@@ -683,28 +693,41 @@ impl<'a> Checker<'a> {
         if let Type::Union(variants) = expected {
             return variants.iter().any(|v| self.is_assignable(v, actual));
         }
+        // For Union actual types (e.g. `Dog | Cat`), every variant must satisfy
+        // `expected` so nominal and structural checks apply to each arm.
+        if let Type::Union(variants) = actual {
+            return variants.iter().all(|v| self.is_assignable(expected, v));
+        }
         false
     }
 
-    /// Return `true` if class `cls_name`'s member shape covers every required
-    /// member of `iface_name`'s shape.  Checks method arity and annotated field
-    /// types — a field declared `name: str` in the interface must be `str` in
-    /// the implementing class too.
+    /// Return `true` if class `cls_name`'s member shape (including inherited
+    /// members) covers every required member of `iface_name`'s shape.  Checks
+    /// method arity, return type, and annotated field types using
+    /// hierarchy-aware `find_method` / `find_field` lookups so that methods
+    /// and fields contributed by a base class count toward conformance.
     fn class_conforms_to_interface(&self, cls_name: &str, iface_name: &str) -> bool {
         let Some(iface) = self.interfaces.get(iface_name) else {
             return false;
         };
-        let Some(cls) = self.class_shapes.get(cls_name) else {
+        // Verify the class exists (it may not be in class_shapes if it was
+        // never collected — treat that as non-conforming).
+        if !self.class_shapes.contains_key(cls_name) {
             return false;
-        };
+        }
+        let iface_class_type = Type::Class(iface_name.to_owned());
         for (m, iface_sig) in &iface.shape.methods {
-            match cls.methods.get(m) {
+            match self.find_method(cls_name, m) {
                 Some(cls_sig) if cls_sig.arity == iface_sig.arity => {
                     // Both return types must be known to enforce compatibility.
                     // Unknown return type on either side is treated as compatible
                     // so unannotated methods don't block conformance.
+                    // Skip the check when the interface method returns the same
+                    // interface type to avoid infinite recursion for
+                    // self-referential interfaces (e.g. `def next(self) -> Node`).
                     if iface_sig.return_type != Type::Unknown
                         && cls_sig.return_type != Type::Unknown
+                        && iface_sig.return_type != iface_class_type
                         && !self.is_assignable(&iface_sig.return_type, &cls_sig.return_type)
                     {
                         return false;
@@ -714,10 +737,10 @@ impl<'a> Checker<'a> {
             }
         }
         for (f, iface_type) in &iface.shape.fields {
-            match cls.fields.get(f) {
+            match self.find_field(cls_name, f) {
                 Some(cls_type) if self.is_assignable(iface_type, cls_type) => {}
                 Some(_) => return false, // field present but wrong type
-                None if cls.methods.get(f).is_some_and(|s| s.arity == 0) => {} // property-like method satisfies field
+                None if self.find_method(cls_name, f).is_some_and(|s| s.arity == 0) => {} // property-like method satisfies field
                 None => return false,
             }
         }
@@ -744,6 +767,52 @@ impl<'a> Checker<'a> {
         false
     }
 
+    /// Look up a method by name in `cls_name`'s hierarchy.  Walks `class_parents`
+    /// depth-first so methods inherited from a base class are found even when not
+    /// directly declared on the queried class.  Returns the first matching
+    /// [`MethodSig`] found, or `None` when no class in the hierarchy defines it.
+    fn find_method<'b>(&'b self, cls_name: &str, method_name: &str) -> Option<&'b MethodSig> {
+        let mut stack: Vec<&str> = vec![cls_name];
+        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        while let Some(name) = stack.pop() {
+            if !visited.insert(name) {
+                continue;
+            }
+            if let Some(shape) = self.class_shapes.get(name) {
+                if let Some(sig) = shape.methods.get(method_name) {
+                    return Some(sig);
+                }
+            }
+            if let Some(parents) = self.class_parents.get(name) {
+                stack.extend(parents.iter().map(String::as_str));
+            }
+        }
+        None
+    }
+
+    /// Look up a field by name in `cls_name`'s hierarchy.  Walks `class_parents`
+    /// depth-first so fields inherited from a base class are found even when not
+    /// directly declared on the queried class.  Returns the first matching
+    /// field type found, or `None` when no class in the hierarchy defines it.
+    fn find_field<'b>(&'b self, cls_name: &str, field_name: &str) -> Option<&'b Type> {
+        let mut stack: Vec<&str> = vec![cls_name];
+        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        while let Some(name) = stack.pop() {
+            if !visited.insert(name) {
+                continue;
+            }
+            if let Some(shape) = self.class_shapes.get(name) {
+                if let Some(ty) = shape.fields.get(field_name) {
+                    return Some(ty);
+                }
+            }
+            if let Some(parents) = self.class_parents.get(name) {
+                stack.extend(parents.iter().map(String::as_str));
+            }
+        }
+        None
+    }
+
     /// Return the missing-member text for a failed interface conformance check.
     /// Returns `None` when the class actually conforms (caller should use
     /// `class_conforms_to_interface` to gate this call).
@@ -752,14 +821,15 @@ impl<'a> Checker<'a> {
             Some(i) => i,
             None => return String::new(),
         };
-        let cls = self.class_shapes.get(cls_name);
+        let iface_class_type = Type::Class(iface_name.to_owned());
         let mut missing = Vec::new();
         for (m, iface_sig) in &iface.shape.methods {
-            match cls.and_then(|c| c.methods.get(m)) {
+            match self.find_method(cls_name, m) {
                 Some(cls_sig) if cls_sig.arity == iface_sig.arity => {
                     // Check return type mismatch when both are annotated.
                     if iface_sig.return_type != Type::Unknown
                         && cls_sig.return_type != Type::Unknown
+                        && iface_sig.return_type != iface_class_type
                         && !self.is_assignable(&iface_sig.return_type, &cls_sig.return_type)
                     {
                         missing.push(format!(
@@ -777,8 +847,8 @@ impl<'a> Checker<'a> {
             }
         }
         for (f, iface_type) in &iface.shape.fields {
-            let method_sig = cls.and_then(|c| c.methods.get(f));
-            match cls.and_then(|c| c.fields.get(f)) {
+            let method_sig = self.find_method(cls_name, f);
+            match self.find_field(cls_name, f) {
                 Some(cls_type) if self.is_assignable(iface_type, cls_type) => {}
                 Some(cls_type) => missing.push(format!(
                     "{f}: type mismatch (expected `{}`, got `{}`)",
@@ -1110,17 +1180,22 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                 let name = cd.name.as_str().to_owned();
                 c.classes.push(name.clone());
                 // Collect direct base class names for inheritance tracking.
-                // Only simple `Name` bases are recorded; subscript bases (e.g.
-                // `Generic[T]`) are skipped since they don't introduce nominal parents.
+                // Handle both plain `Name` bases and `Subscript` bases like
+                // `list[int]` — in the latter case the base name is the subscript
+                // value (e.g. `list`).
                 let parents: Vec<String> = cd
                     .bases()
                     .iter()
-                    .filter_map(|b| {
-                        if let Expr::Name(n) = b {
-                            Some(n.id.as_str().to_owned())
-                        } else {
-                            None
+                    .filter_map(|b| match b {
+                        Expr::Name(n) => Some(n.id.as_str().to_owned()),
+                        Expr::Subscript(s) => {
+                            if let Expr::Name(n) = s.value.as_ref() {
+                                Some(n.id.as_str().to_owned())
+                            } else {
+                                None
+                            }
                         }
+                        _ => None,
                     })
                     .collect();
                 if !parents.is_empty() {
