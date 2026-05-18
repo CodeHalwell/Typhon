@@ -43,7 +43,7 @@
            A 5 5 0 0 1 15 110
            V 15
            A 5 5 0 0 1 20 10 Z"
-        fill="url(#docGrad)" filter="url(#shadow)"/>
+        fill="url(#docGrad)" stroke="#4b5563" stroke-width="1" filter="url(#shadow)"/>
 
   <path d="M 60 10 V 30 A 5 5 0 0 0 65 35 H 85 Z" fill="url(#foldGrad)"/>
 
