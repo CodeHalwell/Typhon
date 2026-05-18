@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use tyc_diagnostics::{Diagnostics, TycError};
-use tyc_resolve::{resolve_module_with, ResolveOptions, ResolvedModule};
+use tyc_resolve::{resolve_module_with, LazyImportRemap, ResolveOptions, ResolvedModule};
 use tyc_syntax::{
     parse_module,
     preprocess::{
@@ -145,8 +145,11 @@ pub fn resolved_module(db: &dyn salsa::Database, file: SourceFile) -> ArcResolve
         &expand_gather_blocks(&raw_text),
     ))));
     let prep = preprocess(&expanded);
+    let lazy_import_remaps = build_lazy_import_remaps(&raw_text, &prep.lazy_imports);
     let options = ResolveOptions {
         raw_class_byte_starts: line_byte_starts(&prep.python_source, &prep.raw_class_lines),
+        lazy_import_remaps,
+        original_source: Some(raw_text.clone()),
     };
     match parse_module(&prep.python_source) {
         Ok(parsed) => {
@@ -156,6 +159,64 @@ pub fn resolved_module(db: &dyn salsa::Database, file: SourceFile) -> ArcResolve
         }
         Err(_) => ArcResolvedModule(Arc::new(ResolvedModule::default())),
     }
+}
+
+/// Convert preprocessor `lazy_imports` metadata into [`LazyImportRemap`]s
+/// the resolver can consume. The preprocessor records each
+/// `lazy import ALIAS = MODULE` statement's line index and alias name;
+/// here we compute the byte offset of the alias inside the *original*
+/// Typhon source so the diagnostic anchors on the user-written form
+/// rather than the preprocessor's `import MODULE as ALIAS` rewrite
+/// (FINDINGS #15).
+fn build_lazy_import_remaps(
+    original_source: &str,
+    lazy_imports: &[tyc_syntax::preprocess::LazyImport],
+) -> Vec<LazyImportRemap> {
+    if lazy_imports.is_empty() {
+        return Vec::new();
+    }
+    // Build a line-start table once for the original source so we can
+    // O(1) look up each lazy_import line's byte offset.
+    let mut line_starts: Vec<usize> = vec![0];
+    for (i, b) in original_source.bytes().enumerate() {
+        if b == b'\n' {
+            line_starts.push(i + 1);
+        }
+    }
+    let prefix = "lazy import ";
+    let mut out = Vec::with_capacity(lazy_imports.len());
+    for li in lazy_imports {
+        let Some(&line_start) = line_starts.get(li.line_index) else {
+            continue;
+        };
+        let line_end = line_starts
+            .get(li.line_index + 1)
+            .copied()
+            .unwrap_or(original_source.len());
+        let line = &original_source[line_start..line_end];
+        // Skip leading whitespace, then the `lazy import ` keyword span,
+        // then any extra whitespace before the alias. Matches what the
+        // preprocessor itself does in `parse_lazy_import`.
+        let indent = line
+            .bytes()
+            .take_while(|&b| b == b' ' || b == b'\t')
+            .count();
+        let after_indent = &line[indent..];
+        let Some(after_kw) = after_indent.strip_prefix(prefix) else {
+            continue;
+        };
+        let extra_ws = after_kw
+            .bytes()
+            .take_while(|&b| b == b' ' || b == b'\t')
+            .count();
+        let alias_offset = line_start + indent + prefix.len() + extra_ws;
+        out.push(LazyImportRemap {
+            line_index: li.line_index,
+            original_alias_offset: alias_offset,
+            original_alias_length: li.alias.len(),
+        });
+    }
+    out
 }
 
 /// Convenience alias — extract the inner `Arc<ResolvedModule>` from a
@@ -280,6 +341,8 @@ fn check_impl(path: &str, text: &str) -> Diagnostics {
 
     let resolve_options = ResolveOptions {
         raw_class_byte_starts: line_byte_starts(&prep.python_source, &prep.raw_class_lines),
+        lazy_import_remaps: build_lazy_import_remaps(text, &prep.lazy_imports),
+        original_source: Some(text.to_owned()),
     };
     let (resolved, resolve_diags) = resolve_module_with(
         path.to_owned(),
@@ -581,6 +644,50 @@ def parse(s: str) -> Result[int, str]:
             diags.warning_count() > 0,
             "expected unused-import warning for `os`"
         );
+    }
+
+    #[test]
+    fn check_file_unused_lazy_import_anchors_on_original_source() {
+        // FINDINGS #15: when an unused-import diagnostic fires on a
+        // `lazy import` line, it must render the user-written
+        // `lazy import np = math` line rather than the preprocessor's
+        // synthesised `import math as np`. The label byte-offset is the
+        // alias's position in the original source.
+        let src = "lazy import np = math\n";
+        let mut db = TycDatabase::new();
+        let diags = check_file(&mut db, "<test>".into(), src.to_owned());
+        // The warning is promoted to an error by default strictness;
+        // either way it must be present.
+        let all: Vec<&TycError> = diags.errors().iter().chain(diags.warnings()).collect();
+        let unused: &TycError = all
+            .iter()
+            .copied()
+            .find(|e| matches!(e, TycError::UnusedImport { .. }))
+            .expect("expected an unused_import diagnostic");
+        // Verify the rewritten source + span flow through.
+        if let TycError::UnusedImport { src, span, .. } = unused {
+            let source_text: &str = src.inner();
+            assert!(
+                source_text.contains("lazy import np = math"),
+                "diagnostic must quote the user-written line; got:\n{source_text}"
+            );
+            assert!(
+                !source_text.contains("import math as np"),
+                "preprocessor rewrite must not leak into the diagnostic; got:\n{source_text}"
+            );
+            // The span anchor must land on the alias `np`, not on
+            // `math` (where the preprocessed `import math as np` would
+            // have put it).
+            let offset: usize = span.offset();
+            assert_eq!(
+                &source_text[offset..offset + 2],
+                "np",
+                "span must point at the alias `np`; got `{}` at offset {offset} in:\n{source_text}",
+                &source_text[offset..offset + 2.min(source_text.len() - offset)]
+            );
+        } else {
+            unreachable!("matched above");
+        }
     }
 
     #[test]

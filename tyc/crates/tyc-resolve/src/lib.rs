@@ -165,6 +165,38 @@ pub struct ResolveOptions {
     /// next line break — is tagged [`ClassKind::Raw`]. The preprocessor
     /// emits this list via [`tyc_syntax::preprocess::line_byte_starts`].
     pub raw_class_byte_starts: Vec<u32>,
+    /// Lazy-import diagnostic remaps. When the unused-import pass fires
+    /// on a binding whose preprocessed line was originally a `lazy
+    /// import` declaration, the resolver rewrites the diagnostic's
+    /// source and span to point at the user-authored
+    /// `lazy import ALIAS = MODULE` line instead of the
+    /// preprocessor-synthesised `import MODULE as ALIAS` (FINDINGS #15).
+    /// Empty for callers that don't have the metadata handy.
+    pub lazy_import_remaps: Vec<LazyImportRemap>,
+    /// The original Typhon source (pre-preprocess). Required when
+    /// `lazy_import_remaps` is non-empty so the diagnostic can render
+    /// the user-written line. Ignored when no remaps are present.
+    pub original_source: Option<String>,
+}
+
+/// One `lazy import ALIAS = MODULE` declaration's mapping back to the
+/// original Typhon source. Built by callers from
+/// [`tyc_syntax::preprocess::PreprocessResult::lazy_imports`] plus the
+/// raw text and surfaced to the resolver through [`ResolveOptions`].
+#[derive(Debug, Clone)]
+pub struct LazyImportRemap {
+    /// The 0-based line index of the `lazy import` statement. The
+    /// preprocessor preserves line numbering exactly (each `lazy import`
+    /// line becomes one `import X as Y` line), so this same index
+    /// applies to both the original Typhon source and the preprocessed
+    /// Python source the resolver walks.
+    pub line_index: usize,
+    /// Byte offset in the *original* source of the alias identifier
+    /// (the `np` in `lazy import np = numpy`). This is where the
+    /// diagnostic's label anchors.
+    pub original_alias_offset: usize,
+    /// Length of the alias identifier in bytes.
+    pub original_alias_length: usize,
 }
 
 /// The resolved structure of a module: scopes, bindings, references, plus
@@ -316,6 +348,16 @@ struct Resolver<'a> {
     /// when declaring a class binding to decide whether to tag it
     /// [`ClassKind::Raw`].
     raw_class_byte_starts: Vec<u32>,
+    /// Lazy-import remap metadata + the original Typhon source. When
+    /// `lazy_import_remaps` is non-empty, the unused-import emitter
+    /// rewrites its diagnostic to anchor on the original `lazy import
+    /// ALIAS = MODULE` line (FINDINGS #15).
+    lazy_import_remaps: Vec<LazyImportRemap>,
+    original_source: Option<String>,
+    /// Line starts (byte offsets) of the preprocessed source. Lazily
+    /// computed the first time the unused-import emitter needs to
+    /// translate a preprocessed byte offset to a line index.
+    preprocessed_line_starts: std::cell::OnceCell<Vec<usize>>,
 }
 
 impl<'a> Resolver<'a> {
@@ -336,6 +378,9 @@ impl<'a> Resolver<'a> {
             seen_immutable_redecl: std::collections::HashSet::new(),
             seen_missing_binding_kind: std::collections::HashSet::new(),
             raw_class_byte_starts: options.raw_class_byte_starts,
+            lazy_import_remaps: options.lazy_import_remaps,
+            original_source: options.original_source,
+            preprocessed_line_starts: std::cell::OnceCell::new(),
         }
     }
 
@@ -546,6 +591,22 @@ impl<'a> Resolver<'a> {
                     continue;
                 }
                 if !used_bindings.contains(&(scope_id, binding_idx)) {
+                    // FINDINGS #15: when this import sits on a line that
+                    // was originally `lazy import ALIAS = MODULE`, render
+                    // the diagnostic against the original Typhon source
+                    // and anchor on the user-written alias offset.
+                    if let Some(remap) = self.lazy_import_remap_for(binding.span.0) {
+                        if let Some(orig) = self.original_source.as_ref() {
+                            self.diagnostics.push_warning(TycError::unused_import(
+                                binding.name.clone(),
+                                &self.path,
+                                orig.clone(),
+                                remap.original_alias_offset,
+                                remap.original_alias_length.max(1),
+                            ));
+                            continue;
+                        }
+                    }
                     let length = binding.span_length().max(1);
                     self.diagnostics.push_warning(TycError::unused_import(
                         binding.name.clone(),
@@ -557,6 +618,38 @@ impl<'a> Resolver<'a> {
                 }
             }
         }
+    }
+
+    /// Translate a preprocessed-source byte offset to a 0-based line
+    /// index, computing (and caching) the line-start table on first
+    /// use. Lazily computed because most resolves don't need it.
+    fn preprocessed_line_at_offset(&self, offset: usize) -> usize {
+        let starts = self.preprocessed_line_starts.get_or_init(|| {
+            let mut v = vec![0usize];
+            for (i, b) in self.source.bytes().enumerate() {
+                if b == b'\n' {
+                    v.push(i + 1);
+                }
+            }
+            v
+        });
+        match starts.binary_search(&offset) {
+            Ok(line) => line,
+            Err(line) => line.saturating_sub(1),
+        }
+    }
+
+    /// If `offset` (preprocessed) lies on a `lazy import` declaration
+    /// line, return the matching remap. Returns `None` for non-lazy
+    /// import bindings (the common case).
+    fn lazy_import_remap_for(&self, offset: usize) -> Option<&LazyImportRemap> {
+        if self.lazy_import_remaps.is_empty() {
+            return None;
+        }
+        let line = self.preprocessed_line_at_offset(offset);
+        self.lazy_import_remaps
+            .iter()
+            .find(|r| r.line_index == line)
     }
 }
 
@@ -1639,6 +1732,7 @@ mod tests {
             tyc_syntax::preprocess::line_byte_starts(&prep.python_source, &prep.raw_class_lines);
         let options = ResolveOptions {
             raw_class_byte_starts,
+            ..ResolveOptions::default()
         };
         let module = tyc_syntax::parse_module(&prep.python_source)
             .unwrap()
