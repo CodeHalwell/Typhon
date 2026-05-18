@@ -1597,8 +1597,8 @@ async def fetch_b() -> int:
     return 2
 
 async def load() -> int:
-    a = await fetch_a()
-    b = await fetch_b()
+    let a = await fetch_a()
+    let b = await fetch_b()
     return a + b
 ";
         let (_, out_dir) = scaffold_auto_gather(tmp.path(), src);
@@ -1629,8 +1629,8 @@ async def fetch_b() -> int:
     return 2
 
 async def load() -> int:
-    a = await fetch_a()
-    b = await fetch_b()
+    let a = await fetch_a()
+    let b = await fetch_b()
     return a + b
 ";
         let (_, out_dir) = scaffold(tmp.path(), src);
@@ -1663,8 +1663,8 @@ async def fetch_b() -> int:
     return 2
 
 async def load() -> int:
-    a = await fetch_a()
-    b = await fetch_b()
+    let a = await fetch_a()
+    let b = await fetch_b()
     return a + b
 ";
         let (_, out_dir) = scaffold_auto_gather(tmp.path(), src);
@@ -1703,8 +1703,8 @@ async def fetch_b(x: int) -> int:
     return x
 
 async def load() -> int:
-    a = await fetch_a()
-    b = await fetch_b(a)
+    let a = await fetch_a()
+    let b = await fetch_b(a)
     return a + b
 ";
         let (_, out_dir) = scaffold_auto_gather(tmp.path(), src);

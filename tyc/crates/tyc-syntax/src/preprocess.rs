@@ -2824,8 +2824,15 @@ fn render_gather_block(
                 out.push_str(")\n");
                 task_names.push(task_name);
             }
+            // Emit `let` on each user-named binding so the resolver records
+            // them as explicit immutable bindings. The `gather:` keyword
+            // already advertises single-assignment semantics, so `let` is
+            // always the right mutability; `mut` would be wrong. Without
+            // the `let` here, the `tyc::missing_binding_kind` Rule-2
+            // enforcement would fire on the lowered assignment.
             for (b, task) in bindings.iter().zip(task_names.iter()) {
                 out.push_str(header_indent);
+                out.push_str("let ");
                 out.push_str(&b.name);
                 out.push_str(" = ");
                 out.push_str(task);
@@ -2852,6 +2859,13 @@ fn render_gather_block(
             // single binding we still need a trailing comma so Python performs
             // sequence unpacking (`x, = results`) rather than binding the
             // whole list to one name (`x = results`).
+            //
+            // We deliberately do NOT prefix `let` here: tuple-destructuring
+            // is not currently supported with a Typhon binding-kind
+            // keyword, and `declare_target`'s recursion into tuple
+            // patterns already declares the names. The Rule-2 enforcement
+            // in `declare_target` only fires on bare `Expr::Name` targets,
+            // so a tuple unpack is safe.
             out.push_str(header_indent);
             for (idx, b) in bindings.iter().enumerate() {
                 if idx > 0 {

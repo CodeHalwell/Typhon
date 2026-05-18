@@ -377,6 +377,24 @@ pub enum TycError {
         #[label("annotation required here")]
         span: SourceSpan,
     },
+
+    /// A local assignment inside a function body did not declare `let`
+    /// or `mut`. Rule 2 of the Typhon language: local bindings always
+    /// carry a binding-kind keyword so readers can tell at a glance
+    /// whether a name is rebound later. Module-level bindings still
+    /// default to `let`, so this only fires at function/method scope.
+    #[error("local binding '{name}' is missing `let` or `mut`")]
+    #[diagnostic(
+        code(tyc::missing_binding_kind),
+        help("write `let {name} = …` for an immutable binding, or `mut {name} = …` if you intend to rebind it later")
+    )]
+    MissingBindingKind {
+        name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("declare with `let` or `mut`")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -757,6 +775,21 @@ impl TycError {
         Self::MissingAnnotation {
             function: function.into(),
             what: what.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::MissingBindingKind`] diagnostic.
+    pub fn missing_binding_kind(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::MissingBindingKind {
+            name: name.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

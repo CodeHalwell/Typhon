@@ -306,6 +306,11 @@ struct Resolver<'a> {
     /// without this guard a re-declaration would emit the same diagnostic
     /// twice.
     seen_immutable_redecl: std::collections::HashSet<((usize, usize), (usize, usize))>,
+    /// `(scope, span)` pairs already reported as `missing_binding_kind`.
+    /// Same dedup story as `seen_immutable_redecl`: the bareword
+    /// assignment is visited once per pre-collect pass and once per
+    /// walk pass, but we only want one diagnostic per source location.
+    seen_missing_binding_kind: std::collections::HashSet<(ScopeId, (usize, usize))>,
     /// Sorted byte offsets pointing at the first non-whitespace character
     /// of each `class!` declaration line in [`Self::source`]. Consulted
     /// when declaring a class binding to decide whether to tag it
@@ -329,6 +334,7 @@ impl<'a> Resolver<'a> {
             references: Vec::new(),
             diagnostics: Diagnostics::new(),
             seen_immutable_redecl: std::collections::HashSet::new(),
+            seen_missing_binding_kind: std::collections::HashSet::new(),
             raw_class_byte_starts: options.raw_class_byte_starts,
         }
     }
@@ -789,6 +795,30 @@ fn declare_target(
             // `let`; later bare assignments inherit the existing binding's
             // mutability.
             let existing_mut = r.lookup_local(scope, n.id.as_str()).map(|b| b.mutability);
+            // Rule 2 of Typhon: a first bareword assignment to a new name
+            // inside a function/method scope is `tyc::missing_binding_kind`.
+            // Skipped for compiler-synthesised `__typhon_*` temporaries
+            // (e.g. the `?` operator's `__typhon_q_N__`, `with`-chain
+            // intermediates, auto-gather TaskGroup names) so desugar
+            // bridges don't trigger user-facing errors.
+            let span = (
+                n.range.start().to_usize(),
+                n.range.start().to_usize() + n.id.as_str().len(),
+            );
+            if ast_mutability.is_none()
+                && existing_mut.is_none()
+                && r.scopes[scope].kind == ScopeKind::Function
+                && !n.id.as_str().starts_with("__typhon_")
+                && r.seen_missing_binding_kind.insert((scope, span))
+            {
+                r.diagnostics.push_error(TycError::missing_binding_kind(
+                    n.id.as_str(),
+                    &r.path,
+                    r.source,
+                    span.0,
+                    n.id.as_str().len().max(1),
+                ));
+            }
             let mutability = match ast_mutability {
                 Some(ast::Mutability::Let) => Mutability::Let,
                 Some(ast::Mutability::Mut) => Mutability::Mut,
@@ -798,10 +828,6 @@ fn declare_target(
                     Mutability::Mut
                 }),
             };
-            let span = (
-                n.range.start().to_usize(),
-                n.range.start().to_usize() + n.id.as_str().len(),
-            );
             r.declare(scope, n.id.as_str(), BindingKind::Value, mutability, span);
         }
         // Tuple destructuring (`a, b = expr`, `(a, b) = expr`) and list
@@ -1794,6 +1820,76 @@ def foo():
         assert!(d.has_errors());
         let msg = format!("{}", d.errors()[0]);
         assert!(msg.contains("cannot find 'z'"), "got {}", msg);
+    }
+
+    #[test]
+    fn function_local_bareword_assign_requires_binding_kind() {
+        // Rule 2: locals must carry `let` or `mut`. Module scope still
+        // defaults to `let`, so this only fires at function scope.
+        let (_m, d) = resolve("def f() -> None:\n    counter = 1\n");
+        assert!(d.has_errors(), "bareword local must error");
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingBindingKind { .. })),
+            "expected MissingBindingKind variant, got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn function_local_let_assignment_is_clean() {
+        // Sanity: explicit `let` does not trigger missing_binding_kind.
+        let (_m, d) = resolve("def f() -> None:\n    let counter = 1\n");
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn function_local_mut_assignment_is_clean() {
+        let (_m, d) = resolve("def f() -> None:\n    mut counter = 0\n    counter = counter + 1\n");
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn module_level_bareword_assign_still_clean() {
+        // Rule 2 only applies at function scope; module-level bindings
+        // default to `let` and are exempt.
+        let (_m, d) = resolve("counter = 1\n");
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn synthetic_temp_assignment_is_exempt() {
+        // Compiler-synthesised `__typhon_*` temps (e.g. the `?` operator's
+        // `__typhon_q_N__`) must not trigger the diagnostic — the
+        // user-source spelling is `expr?`, never a bare assignment.
+        let (_m, d) = resolve(
+            "def f() -> None:\n    __typhon_q_0__ = 1\n    print(__typhon_q_0__)\n",
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingBindingKind { .. })),
+            "synthesised temp must not fire MissingBindingKind: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn function_local_rebind_inherits_kind_without_diagnostic() {
+        // The first declaration carries the keyword; later bareword
+        // assignments to the same name in the same scope inherit the
+        // existing binding's mutability and don't re-trigger the
+        // diagnostic. (Reassignment of a `let` still produces
+        // `immutable_assign`, which is the right diagnostic for that case.)
+        let (_m, d) = resolve("def f() -> None:\n    mut counter = 0\n    counter = counter + 1\n");
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingBindingKind { .. })),
+            "rebind of existing local must not fire MissingBindingKind: {:?}",
+            d.errors()
+        );
     }
 
     #[test]
