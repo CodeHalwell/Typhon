@@ -1421,6 +1421,768 @@ the loop.
 
 ---
 
+## Status as of `claude/test-typhon-library-kxGRX` (fresh round, 2026-05-18)
+
+Built `tyc` from this commit (release, ~84s clean build) and ran a new
+battery of ~50 hand-written `.ty` programs through `tyc check`, `tyc build`,
+`tyc fmt`, `tyc migrate`, `tyc repl`, `tyc add`, plus all 47 files in the
+`examples/` suite. The compiler was inherited via the `main` merge after
+the prior `claude/fix-findings-diagnostics-hYj8K` work landed.
+
+**What's working well now:** the previously-fixed surface still holds —
+`class Foo frozen:`, single-line `guard`, `impl[T] Box[T]:`,
+`Union/Union` assign, `if x:` truthy narrow, `dict.get(k)` as `V?`,
+`result_error_mismatch`, `method_in_class_body` warning, missing-annotation
+enforcement (Rule 1), float-literal `1.0` emission, `from __future__
+import annotations` injection, comptime container/string-method literals,
+single-arg `extend BUILTIN:` end-to-end, simple `gather:` and `go`,
+multi-module imports, recursive class refs, operator overloads, walrus,
+list/dict comprehensions, `try/except` → `Result` bridging.
+
+**The big new breakage:** Rule 2 enforcement (`tyc::missing_binding_kind`)
+shipped without updating every desugarer to emit `let` — so several
+documented headline features now fail at check time **on their own emitted
+output**:
+
+1. **`with` chain bindings (any form) emit `a = __typhon_with_N__.value`
+   without `let`** — #37. Both single- and multi-binding forms break
+   under `tyc check`. Critical, regression.
+2. **Best-effort `gather:` emits `a, b = __typhon_gather_N__`** — #15 in
+   the original list re-broken by Rule 2 enforcement. #38.
+3. **`go fn() -> task` emits `t1 = typhon_runtime.tasks.spawn(...)`** —
+   #39.
+4. **For-loop tuple unpacking (`for k, v in d.items():`)** — the
+   resolver doesn't register `k`/`v` as locals (declare-target doesn't
+   recurse into `Expr::Tuple` for `for` targets) — #40. This blocks ~10
+   of the 47 example programs single-handed.
+
+**The other big new breakage** isn't a regression — these surfaced now
+because the test surface grew:
+
+5. **F-string format specs (and `!r`/`!s` conversions) are completely
+   stripped** by the printer — `f"{n:03d}"` → `f"{n}"`. #41. Critical.
+   Any logging/CLI tool that formats numbers loses its formatting.
+6. **F-string with nested same-quoted strings emits raw-nested quotes**
+   — `f"{'name':<10}"` → `f"{"name"}"`, breaking on 3.11 and confusing on
+   3.13. #42.
+7. **`Callable[[T], U]` cannot be called** — every value typed as
+   `Callable` is rejected as not-a-function. #43. Blocks higher-order
+   programming (`map`, `filter`, decorators, closures).
+8. **Keyword args don't count toward arity, defaults don't either, `*args`
+   defs report `expected 0`, trailing-comma-in-call reports `got 0`** —
+   the arg-count check counts only positional, no-default, no-trailing-
+   comma args. #44.
+9. **Covariance not implemented** — `list[Drawable]` rejects
+   `list[Button|Slider]`; `Result[Cmd, _]` rejects `Ok[SubCmd]` even
+   when `SubCmd ⊆ Cmd`. #45.
+10. **Generic class instantiation doesn't infer type params** —
+    `Box(value=42)` infers `Box` (no params), making
+    `let b: Box[int] = Box(value=42)` fail. #46.
+11. **PEP 695 syntax emitted even when interpreter is < 3.12** — `def
+    first[T](...)` and `type T = A | B` survive `from __future__ import
+    annotations` (PEP 695 is syntactic, not annotation-string-based),
+    so output fails with `SyntaxError` on the user's runtime. No
+    diagnostic when `[python] target` ≥ 3.12 but interpreter is 3.11.
+    #47.
+12. **Comptime can't reference other comptime constants, can't call
+    user-defined `comptime def`** — both are documented as supported.
+    #48.
+13. **`tyc::missing_await` not enforced** — sync function `let x: int
+    = fetch()` (coroutine assigned to int annotation) checks clean. #49.
+14. **`class` body `__init__` accepted; dataclass + manual `__init__`
+    both emitted; documented as `tyc::manual_init`** — #50.
+15. **`yield` in `-> int` (non-iterator) checks clean** — #51.
+16. **Multi-line `|>` (newline at start of pipe segment) fails to parse**
+    — common Python wrap pattern. #52.
+17. **REPL `print(x)` prints `None` after the value** — auto-print pass
+    wraps even bare calls and re-prints the result. #53.
+18. **`extend BUILTIN:` emits the lifted free fn with implicit-`Any`
+    `self`** — `__typhon_ext_str__slug(self) -> str:`. No type
+    annotation on the parameter even though it's known to be `str`. #54.
+19. **`tyc init NAME`** scaffolds into CWD, not into `./NAME/`. #55.
+20. **Examples suite — 27 of 47 fail `tyc check`**. #56.
+
+**Still open from prior branches:** #18 (`tyc fmt` no-op — confirmed).
+
+**Roughly-ranked fix order for a v0.3 push:**
+
+The Rule-2 desugar regressions (#37, #38, #39) and the for-loop unpack
+(#40) should be fixed first — together they account for most of the
+example-suite failures. The f-string printer (#41, #42), arg-count
+counting (#44), and `Callable` invocation (#43) are next: these aren't
+regressions but they each block whole feature areas (logging, CLI,
+higher-order programming) that the examples depend on. After that:
+covariance (#45) is the big design call — it unblocks the rest of the
+examples but needs care around variance rules. Then the long tail.
+
+`cargo test --workspace --release` was not re-run on this branch (no
+code changes from me — this is a pure stress-test pass).
+
+---
+
+## 37. `with`-chain bindings emit without `let`, fail Rule 2 (bug, critical)
+
+**Severity:** bug — critical; regression caused by Rule 2 enforcement
+shipping in `claude/fix-findings-diagnostics-hYj8K` without updating
+the `with`-chain desugarer.
+
+```ty
+def f1() -> Result[int, str]:
+    return Ok(1)
+
+def chain() -> Result[int, str]:
+    with a = f1()?:
+        return Ok(a)
+```
+
+```text
+tyc::missing_binding_kind
+  × local binding 'a' is missing `let` or `mut`
+   ╭─[src/main.ty:8:5]
+ 7 │         return __typhon_with_0__
+ 8 │     a = __typhon_with_0__.value
+   ·     ┬
+   ·     ╰── declare with `let` or `mut`
+```
+
+The lowering emits `a = __typhon_with_0__.value` rather than `let a =
+__typhon_with_0__.value`, and Rule 2 then rejects it. The diagnostic
+even shows the lowered code (`return __typhon_with_0__`), so span
+fidelity is also broken on the same path (cf. Finding #20).
+
+Same root cause makes every `with`-chain in `examples/07-error-handling/`
+fail. The desugarer for `with NAME = EXPR?:` needs to emit the binding
+as `let NAME = ...`. Synthesised compiler temporaries (`__typhon_*`)
+are already exempted from Rule 2; the user-visible `NAME` is not.
+
+---
+
+## 38. Best-effort `gather:` tuple destructure missing `let` (bug, critical)
+
+**Severity:** bug — same family as #37; Rule 2 catches the synthesised
+destructure.
+
+```ty
+async def run() -> None:
+    gather(strategy="best-effort"):
+        a = fa()
+        b = fb()
+    print(a, b)
+```
+
+The lowering produces `a, b = __typhon_gather_N__` — no `let`. Original
+Finding #4 fixed `declare_target` to recurse into `Expr::Tuple`, so the
+resolver now sees `a` and `b`. But Rule-2's `tyc::missing_binding_kind`
+fires *before* / *alongside* that check on the same statement. Need to
+either emit `let a, b = ...` (preferred — match the strict-gather form
+that does `let a = ...; let b = ...` per element), or exempt the
+synthesised assign from Rule 2.
+
+The strict (non-best-effort) `gather:` already works because its lowering
+spells out each binding individually as `let` (verified — emits a
+sequence of `let user = ...` lines), so the fix is to mirror that for
+the best-effort path.
+
+---
+
+## 39. `go fn() -> task` emits without `let` (bug)
+
+**Severity:** bug — same family as #37/#38.
+
+```ty
+async def run() -> None:
+    go work(1) -> t1
+    let v: int = await t1
+```
+
+Lowers to `t1 = typhon_runtime.tasks.spawn(work(1))`. Rule 2 fires:
+
+```text
+tyc::missing_binding_kind
+  × local binding 't1' is missing `let` or `mut`
+```
+
+Same fix family — emit `let t1 = typhon_runtime.tasks.spawn(...)`.
+
+---
+
+## 40. `for k, v in d.items():` doesn't declare `k`/`v` (bug, critical)
+
+**Severity:** bug — critical; basic Python idiom; cascades through the
+examples suite.
+
+```ty
+def main() -> None:
+    let xs: list[tuple[int, str]] = [(1, "a"), (2, "b")]
+    for i, s in xs:
+        print(i, s)
+```
+
+```text
+tyc::unknown_name
+  × cannot find 'i' in scope
+  × cannot find 's' in scope
+```
+
+The resolver's `for`-target walk handles bare `Name` targets but doesn't
+recurse into `Tuple` targets. Finding #4's fix added tuple recursion to
+`declare_target` for general-assignment LHS but didn't apply the same
+to the `for`-stmt target.
+
+This single bug blocks `for k, v in dict.items():`, `for i, x in
+enumerate(xs):`, `for (a, b) in pairs:`, and similar — present in at
+least 10 of the 47 example programs (20-logging, 42-rag-system,
+43-agent-framework, and others).
+
+Workaround: `for pair in xs: let i: int = pair[0]; let s: str = pair[1]`
+— awful.
+
+---
+
+## 41. F-string format specs and conversions are stripped (bug, critical)
+
+**Severity:** bug — critical; emitter loses information.
+
+```ty
+def main() -> None:
+    let n: int = 5
+    let s: str = "hi"
+    print(f"{n:03d}")
+    print(f"{s:>10}")
+    print(f"{n!r}")
+```
+
+Emits:
+
+```py
+def main() -> None:
+    n: int = 5
+    s: str = "hi"
+    print(f"{n}")
+    print(f"{n}")    # !r conversion lost
+    print(f"{s}")
+```
+
+All format-spec (`:03d`, `:>10`, `:.2f`, `:>10.3f`, etc.) and conversion
+(`!r`, `!s`, `!a`) suffixes are dropped. Pi-format `f"{pi:.2f}"` becomes
+`f"{pi}"` — wrong runtime value rendered.
+
+Root cause is in the printer's f-string handler in `tyc-emit/src/printer.rs`
+(likely `FormattedValue` / `ConversionFlag` / `format_spec` not being
+walked).
+
+This breaks essentially every program that prints numbers with
+formatting, every log line that pads/aligns, every CLI tool that uses
+`:>` or `:<` alignment. Trivially user-visible.
+
+---
+
+## 42. F-string nested same-quoted strings emit malformed Python (bug)
+
+**Severity:** bug — output fails to parse on 3.11; ambiguous on 3.12+.
+
+```ty
+def main() -> None:
+    print(f"{'name':<10}={'value':>5}")
+```
+
+Emits:
+
+```py
+print(f"{"name"}={"value"}")
+```
+
+Two problems:
+
+1. The format-spec was dropped (Finding #41).
+2. The single quotes inside the f-string were rewritten as double
+   quotes (matching the outer string delimiter), producing a Python
+   3.11 `SyntaxError: f-string: expecting '}'`.
+
+PEP 701 (Python 3.12+) does permit identical-quote nesting inside
+f-strings, so the output is technically valid on 3.13. But losing
+the nested-quote flip-flop machinery is a portability regression
+relative to typical Black/ruff output.
+
+Fix: walk the f-string parts; if an inner string would collide with
+the outer delimiter, swap quotes (Black's strategy).
+
+---
+
+## 43. `Callable[[T], U]` is not callable (bug, critical)
+
+**Severity:** bug — critical; blocks higher-order programming, custom
+decorators, closures, callback patterns.
+
+```ty
+from typing import Callable
+
+def apply(f: Callable[[int], int], v: int) -> int:
+    return f(v)
+
+def main() -> None:
+    print(apply(lambda x: x * 2, 5))
+```
+
+```text
+tyc::not_callable
+  × `Callable[?, int]` is not callable
+   ╭─[src/main.ty:5:12]
+ 5 │     return f(v)
+   ·            ──┬─
+   ·              ╰── this value is not a function
+```
+
+`Callable[[T], U]` is treated as `Callable[?, U]` (param-list lost) and
+then rejected from being called. Any function-returning-function,
+custom decorator, closure-returning-closure, or callback-taking-fn breaks.
+
+Confirmed root cause is in `tyc-types`: the `Callable[...]` shape is
+constructed without a real param-type list, so the callable arm of the
+expression type-checker never matches. Examples `22-http-requests` (HOF
+retry pattern), `43-agent-framework` (tool dispatch table), several
+others fail on this.
+
+---
+
+## 44. Arg-count check ignores keyword args, defaults, *args, trailing commas (bug, critical)
+
+**Severity:** bug — critical; every multi-arg call with kwargs/defaults
+fails.
+
+```ty
+def greet(name: str, prefix: str = "Hi", n: int = 1) -> None: ...
+greet("alice", n=3)              # × expected 3, got 1
+greet()                          # × expected 3, got 0  (when all default)
+
+def f(a: int, b: int = 10) -> int: ...
+f(1)                             # × expected 2, got 1  (default ignored)
+
+def variadic(*args: int) -> int: ...
+variadic(1, 2, 3)                # × expected 0, got 3  (*args expected 0?!)
+
+def add(a: int, b: int, c: int) -> int: ...
+add(*xs)                         # × expected 3, got 1
+
+def long_call(a: int, b: int, c: int) -> int: ...
+long_call(a=1, b=2, c=3,)        # × expected 3, got 0   (trailing-comma kills it)
+```
+
+The arg-count check appears to count only positional, non-defaulted,
+non-trailing-comma arguments at the call site, and treats `*args`
+defs as zero-arity functions.
+
+Five distinct bugs in the same check:
+
+a. **Keyword args** (`f(name="x")`) — not counted, treated as 0 args
+   to the arity check.
+b. **Default params** — `def f(a, b=10)` → calling `f(1)` rejected.
+c. **`*args` def** — accepted definition but call site count is "expected 0".
+d. **`**kwargs` def** — likely similar (didn't fully isolate).
+e. **Trailing comma** — `f(a, b, c,)` treated as 0 args.
+
+The first two together (a, b) make any function with a default param
+practically unusable. Cascades across ~5 example programs.
+
+---
+
+## 45. Generic covariance not implemented (bug)
+
+**Severity:** bug — multiple symptoms; design call.
+
+```ty
+interface Drawable: ...
+class Button: ...
+class Slider: ...
+
+let xs: list[Drawable] = [Button(...), Slider(...)]    # rejected
+```
+
+```text
+tyc::type_mismatch
+  × type mismatch: expected `list[Drawable]`, found `list[Button | Slider]`
+```
+
+Same with:
+
+```ty
+def parse() -> Result[Cmd, str]:
+    return Ok(AddCmd(...))    # rejected: Ok[AddCmd] vs Result[Cmd, str]
+```
+
+```ty
+let m: list[dict[str, object]] = [{"name": "x"}, {"name": "y", "age": 10}]
+# rejected because inner inferred dicts are dict[str, str] / dict[str, str|int]
+# not widened to dict[str, object]
+```
+
+Generics are treated invariantly. There's a design call here — Python's
+own typing treats `list[T]` invariant for type-checker safety, so this
+isn't strictly wrong, but combined with sealed unions and `Result`
+ergonomics the friction is severe. The most-leverage fix:
+
+- **`Result[T, E]`**: variant-form widening on return — when the function's
+  declared return is `Result[T, E]` and the expression is `Ok(v: V)` where
+  `V ⊆ T`, accept. This is how all rust-y Result languages work.
+- **Heterogeneous-list inference**: when a literal `[a, b, c]` is bound
+  to `list[T]` and every element is `⊆ T`, infer the LHS instead of the
+  joined RHS type. Same for dict/tuple.
+
+Cascade: 17-file-io-json, 21-cli-tool, 25-sqlite-database, 09-interfaces.
+
+---
+
+## 46. Generic class instantiation drops type params (bug)
+
+**Severity:** bug — generic types unusable through their constructors.
+
+```ty
+class Box[T]:
+    value: T
+
+impl[T] Box[T]:
+    def unwrap(self) -> T:
+        return self.value
+
+let b: Box[int] = Box(value=42)
+```
+
+```text
+tyc::type_mismatch
+  × type mismatch: expected `Box[int]`, found `Box`
+   ╭─[src/main.ty:9:23]
+ 9 │     let b: Box[int] = Box(value=42)
+   ·                       ──────┬──────
+   ·                             ╰── expected `Box[int]`
+```
+
+`Box(value=42)` should infer `Box[int]` from the field type. Today it
+infers bare `Box` (no params). Either:
+
+1. Bidirectional: when LHS is annotated `Box[int]`, propagate `T=int`
+   to the constructor call and check `value: int`.
+2. Forward: from `value: T` and arg `42`, solve `T = int`.
+
+Both are standard. Workaround: drop the annotation — `let b = Box(value=42)`
+— but you also lose `Box[int]` propagation to downstream sites.
+
+---
+
+## 47. PEP 695 syntax emitted even when interpreter is < 3.12 (gap)
+
+**Severity:** gap — silent runtime failure; doc says "clean CPython 3.13+"
+but no enforcement.
+
+```ty
+def first[T](xs: list[T]) -> T?:
+    return xs[0] if xs else None
+
+type Color = Red | Green | Blue
+```
+
+Emits unchanged:
+
+```py
+def first[T](xs: list[T]) -> T | None: ...
+type Color = Red | Green | Blue
+```
+
+Both `def f[T](...)` (PEP 695 generics) and `type X = ...` (PEP 695 type
+aliases) are **syntactic** features that need Python 3.12+. `from
+__future__ import annotations` (which `tyc-emit` correctly injects)
+doesn't help — that flag only affects annotation strings, not the
+top-level grammar.
+
+On Python 3.11 (still the default in many CI images, Ubuntu 22.04 LTS,
+etc.) the emitted output fails with `SyntaxError` at import time. Two
+mitigations:
+
+1. **Detect interpreter mismatch**: if `[python] target = "3.13"` but the
+   interpreter at `tyc build` time is older, warn loudly. (Today: no
+   warning.)
+2. **Lower for older targets**: when `[python] target = "3.10"` /
+   `"3.11"`, lower `def f[T]:` to `TypeVar`-based form and `type X = ...`
+   to `X: TypeAlias = ...`. Already done for `Result` in Finding #24's fix.
+
+This bites every example that uses generics or sealed unions.
+
+---
+
+## 48. Comptime can't reference other comptime constants or call comptime defs (gap)
+
+**Severity:** gap — documented features unimplemented.
+
+```ty
+comptime let A: int = 5
+comptime let B: int = A + 10   # × unknown name 'A' in comptime expression
+
+comptime def is_prod(name: str) -> bool:
+    return name == "prod"
+comptime let SHIPS: bool = is_prod("dev")   # × function 'is_prod' is not valid
+```
+
+Both errors are emitted by the comptime evaluator in `tyc-analyse`. The
+skill explicitly documents:
+
+> `comptime def feature(name: str) -> bool: ...`
+> `comptime let SHIPS_AUTH: bool = feature("auth")`
+
+…as a supported form. Today the sandbox scope only contains the
+current expression's locally-bound names; module-level comptime constants
+aren't seen, and user-defined `comptime def` functions aren't dispatched.
+
+These limitations directly block `examples/15-comptime-config`.
+
+Either:
+
+- **Expand the evaluator** to (a) seed scope with previously-evaluated
+  comptime constants from the same module, and (b) register
+  `comptime def` bodies as callable.
+- **Or shrink the docs** further; the prior round already pulled back
+  the spec once, but `comptime def` and cross-`comptime let` references
+  are still in the skill.
+
+---
+
+## 49. `tyc::missing_await` not enforced (gap)
+
+**Severity:** gap — documented hard error doesn't fire.
+
+```ty
+async def fetch() -> int:
+    return 1
+
+def caller() -> int:
+    let x: int = fetch()    # should be tyc::missing_await
+    return x
+```
+
+Type-checks clean. The skill says:
+
+> A sync function calling an `async` one without `await` is a **hard
+> error** (`tyc::missing_await`).
+
+Reality: `fetch()` is treated as returning `int` (not `Coroutine[Any,
+Any, int]`), so it binds happily to `let x: int = ...` and the caller
+returns a coroutine to the print. At runtime Python emits the standard
+"coroutine 'fetch' was never awaited" warning.
+
+`grep -r "missing_await" tyc/crates/` should land in the async pass —
+it's currently not wired.
+
+---
+
+## 50. `__init__` in `class` body silently accepted, both emitted (gap)
+
+**Severity:** gap — Rule says it's an error; emitter produces wrong code.
+
+```ty
+class User:
+    name: str
+    def __init__(self, name: str) -> None:
+        self.name = name
+```
+
+Type-checks clean (only emits the `method_in_class_body` warning;
+`__init__` should be an error per docs). Emits:
+
+```py
+@dataclasses.dataclass(slots=True)
+class User:
+    name: str
+    def __init__(self, name: str) -> None:
+        self.name = name
+```
+
+This works at runtime (the user's `__init__` overrides the dataclass-
+generated one), but it's wrong on three counts:
+
+1. The skill says writing `__init__` is rejected with `tyc::manual_init`.
+2. The emitter shouldn't emit a `@dataclass(slots=True)` decorator
+   *and* a hand-written `__init__` — `slots=True` is incompatible with
+   user-defined `__init__` in obscure ways (you have to use
+   `object.__setattr__` to bypass the slots check).
+3. Rule 4 says methods go in `impl`; this method goes in `class`. The
+   `method_in_class_body` warning does fire but `__init__` should be a
+   distinct, harder error.
+
+---
+
+## 51. `yield` in non-iterator-typed function checks clean (gap)
+
+**Severity:** gap — type-checker accepts incorrect return-type.
+
+```ty
+def counter(n: int) -> int:
+    mut i: int = 0
+    while i < n:
+        yield i
+        i += 1
+```
+
+Type-checks clean. Should be `tyc::type_mismatch` or a dedicated
+`tyc::generator_return_type` ("function with `yield` should be typed
+`Iterator[T]` / `Generator[T, S, R]`").
+
+At runtime calling `counter(3)` returns a `generator` object, not an
+`int`, so any caller annotated `let x: int = counter(3)` would crash if
+typed.
+
+Async generators have the same issue (`async def gen() -> int: yield 1`
+checks clean).
+
+---
+
+## 52. Multi-line pipe (`|>` at start of next line) fails to parse (bug)
+
+**Severity:** bug — common Python wrap pattern.
+
+```ty
+let r: str = (
+    "  hi  "
+    |> str.strip()
+    |> str.upper()
+)
+```
+
+```text
+tyc::parse
+  × parse error in 'src/main.ty'
+    ╭─[src/main.ty:10:10]
+ 10 │         |> strip_ws()
+    ·          ▲
+    ·          ╰── Expected an expression at byte range 167..168
+```
+
+Python normally allows operators at start of next line inside parens
+(black/ruff format `+`, `and`, `|`, etc. that way). The `|>` operator
+doesn't survive the same wrap — the lexer or preprocessor isn't seeing
+the previous-line continuation. Same root cause in
+`examples/10-pipes-and-guards`.
+
+Single-line pipes work fine. Workaround: keep the chain on one line.
+
+---
+
+## 53. REPL re-prints `print(...)` return as `None` (bug, papercut)
+
+**Severity:** papercut — REPL auto-print overzealous.
+
+```text
+$ tyc repl
+>>> print(5 * 2)
+10
+None
+>>>
+```
+
+The auto-print pass (Finding #25's fix) wraps too aggressively — it
+rewrites `print(5 * 2)` into `print(repr(print(5 * 2)))`, which evaluates
+the inner `print` (emits `10`) then prints the outer call's return
+(`None`).
+
+The fix in `feed_block`'s `wrap_bare_expression_for_repl` needs to detect
+that the top-level expression is *itself* a call that produces visible
+output (or just: detect a top-level `print(...)` call by name and skip
+the wrap), or — simpler — only wrap when the bare expression's value is
+non-None at type-check time (typed `None` returns are skipped).
+
+Bare expressions otherwise work (`1 + 1` → `2`, `"hi".upper()` → `'HI'`).
+
+---
+
+## 54. `extend BUILTIN:` emits lifted free fn without param type annotation (papercut)
+
+**Severity:** papercut — receiver type elided in lifted function.
+
+```ty
+extend str:
+    def slug(self) -> str:
+        return self.lower().replace(" ", "-")
+```
+
+Emits:
+
+```py
+def __typhon_ext_str__slug(self) -> str:    # self lacks type annotation
+    return self.lower().replace(" ", "-")
+```
+
+The parameter `self` is unannotated, so:
+
+- The lifted free fn technically violates Rule 1 (every param annotated).
+- Downstream callers lose type-checking on the receiver position
+  (the type-checker rewrites `s.slug()` to `__typhon_ext_str__slug(s)`
+  using the receiver's static type, so this isn't a *runtime* bug —
+  just a clarity gap).
+
+Emit `self: str` (or the appropriate built-in type) for consistency.
+Doesn't affect runtime; affects readability of generated code and
+`tyc ty`'s second-opinion checking.
+
+---
+
+## 55. `tyc init NAME` scaffolds into CWD instead of `./NAME/` (papercut)
+
+**Severity:** papercut — UX confusion.
+
+```text
+$ pwd
+/home/user/playground
+$ tyc init myapp
+Initialised Typhon project `myapp` in /home/user/playground
+  typhon.toml        ← created in CWD, not in playground/myapp/
+  src/main.ty
+  tests/
+```
+
+The recorded project name (`myapp`) is written into `typhon.toml` but
+the project is scaffolded into the **current** directory. Every other
+language scaffolder (`cargo new`, `npm init`, `bun init NAME`, `uv
+init NAME`) creates a subdirectory. The CLI message also reads
+ambiguously ("in /home/user/playground" vs "as /home/user/playground/myapp").
+
+Likely fix in `tyc/src/commands/init.rs` — `mkdir NAME && cd NAME` then
+write files. Document the breaking change in the next release notes.
+
+---
+
+## 56. Examples suite — 27 of 47 fail `tyc check` (gap)
+
+**Severity:** gap — the shipped example suite doesn't pass the
+shipped checker.
+
+Running `tyc check` on every `examples/<NN>/<name>.ty` file in the
+repo: 20 pass, 27 fail. Common root causes (each cascades through
+multiple files):
+
+| Root cause | Finding | Affected examples |
+|---|---|---|
+| `for k, v in d.items()` | #40 | 20, 42, 43, others |
+| `Callable` not callable | #43 | 22, 43 |
+| Arg-count w/ kwargs/defaults | #44 | 30, 38, others |
+| Generic covariance | #45 | 09, 17, 21, 25 |
+| `with`-chain missing `let` | #37 | 07 |
+| Multi-line pipe | #52 | 10 |
+| `let (x, y) = ...` parse | (subsumed by #46-family) | 04, 46 |
+| Comptime user fn | #48 | 15 |
+
+Fixing #37/#38/#39/#40/#43/#44/#45 would clear most of the suite.
+
+The 20 examples that pass include `01-hello-world`, `02-variables-and-
+types`, `03-control-flow`, `06-classes-and-models`, `11-string-
+manipulation`, `12-math-operations`, `13-dates-and-times`, `14-regex`,
+`16-file-io-text`, `18-file-io-csv`, `23-async-basics`,
+`24-async-gather-and-go`, `29-numpy-arrays`, `33-pytorch-tensors`,
+`41-llm-structured-output`.
+
+A CI gate that runs `tyc check examples/**/*.ty` would catch
+regressions in the language surface as the compiler evolves; today
+the example suite is a documentation artefact rather than a test
+corpus.
+
+---
+
 ## 36. Diagnostic-code drift between docs and reality (doc)
 
 **Status:** **FIXED** on `claude/update-findings-IdfrH`. Renamed the three
