@@ -45,6 +45,23 @@ pub enum BindingKind {
     Loop,
 }
 
+/// Sub-kind for `BindingKind::Class`. Plain `class` is a dataclass at emit
+/// time; `class!` opts out of that and may carry a synthesised or hand-
+/// written `__init__` that calls `super().__init__()`.
+///
+/// Only populated for `BindingKind::Class` bindings; every other kind
+/// uses the default [`ClassKind::Plain`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClassKind {
+    /// Default `class Foo:` — emits as `@dataclass(slots=True) class Foo:`.
+    #[default]
+    Plain,
+    /// `class! Foo(Base):` — raw class, no dataclass decorator. The
+    /// desugar pass may synthesise an `__init__` that calls
+    /// `super().__init__()` before assigning declared fields.
+    Raw,
+}
+
 /// One name introduced in some scope.
 #[derive(Debug, Clone)]
 pub struct Binding {
@@ -58,6 +75,10 @@ pub struct Binding {
     /// go-to-definition can resolve `pkg.util.frobnicate` back to the
     /// originating `.ty` source.  `None` for non-import bindings.
     pub import_info: Option<ImportInfo>,
+    /// For `BindingKind::Class` bindings, indicates whether the source
+    /// declared the class as `class!` (raw) or plain `class`. Other
+    /// binding kinds always carry [`ClassKind::Plain`].
+    pub class_kind: ClassKind,
 }
 
 /// Origin metadata for an import binding, used by the LSP backend to drive
@@ -128,6 +149,22 @@ impl Scope {
     pub fn contains_offset(&self, offset: usize) -> bool {
         offset >= self.span.0 && offset < self.span.1
     }
+}
+
+/// Options passed to [`resolve_module_with`] so downstream stages can
+/// surface Typhon-specific syntax that the Python AST has already lost.
+///
+/// Today only `raw_class_byte_starts` is carried; future fields (e.g.
+/// `interface_byte_starts`, `model_byte_starts`) will likely use the
+/// same pattern instead of widening the resolver's public signature.
+#[derive(Debug, Clone, Default)]
+pub struct ResolveOptions {
+    /// Sorted byte offsets (in the preprocessed source) at the start of
+    /// each `class!` declaration line. A class declaration whose stmt
+    /// range starts at or after one of these offsets — and before the
+    /// next line break — is tagged [`ClassKind::Raw`]. The preprocessor
+    /// emits this list via [`tyc_syntax::preprocess::line_byte_starts`].
+    pub raw_class_byte_starts: Vec<u32>,
 }
 
 /// The resolved structure of a module: scopes, bindings, references, plus
@@ -269,10 +306,15 @@ struct Resolver<'a> {
     /// without this guard a re-declaration would emit the same diagnostic
     /// twice.
     seen_immutable_redecl: std::collections::HashSet<((usize, usize), (usize, usize))>,
+    /// Sorted byte offsets pointing at the first non-whitespace character
+    /// of each `class!` declaration line in [`Self::source`]. Consulted
+    /// when declaring a class binding to decide whether to tag it
+    /// [`ClassKind::Raw`].
+    raw_class_byte_starts: Vec<u32>,
 }
 
 impl<'a> Resolver<'a> {
-    fn new(path: String, source: &'a str) -> Self {
+    fn new_with(path: String, source: &'a str, options: ResolveOptions) -> Self {
         let module = Scope {
             id: 0,
             kind: ScopeKind::Module,
@@ -287,7 +329,24 @@ impl<'a> Resolver<'a> {
             references: Vec::new(),
             diagnostics: Diagnostics::new(),
             seen_immutable_redecl: std::collections::HashSet::new(),
+            raw_class_byte_starts: options.raw_class_byte_starts,
         }
+    }
+
+    /// True when the statement starting at `stmt_start` (a byte offset
+    /// into [`Self::source`]) sits on a line that was originally written
+    /// as `class!`. Cheap binary search over the sorted offsets list.
+    fn is_raw_class_offset(&self, stmt_start: usize) -> bool {
+        if self.raw_class_byte_starts.is_empty() {
+            return false;
+        }
+        // Find the line start at or before `stmt_start`. A `class!` line
+        // start is recorded as the first non-whitespace byte on the line,
+        // which is exactly where the `class` keyword begins after the
+        // preprocessor strips the `!`. The statement's range therefore
+        // starts at that byte (no leading whitespace is part of the range).
+        let target = stmt_start as u32;
+        self.raw_class_byte_starts.binary_search(&target).is_ok()
     }
 
     fn push_scope(&mut self, kind: ScopeKind, parent: ScopeId, span: (usize, usize)) -> ScopeId {
@@ -315,7 +374,7 @@ impl<'a> Resolver<'a> {
         mutability: Mutability,
         span: (usize, usize),
     ) {
-        self.declare_with(scope, name, kind, mutability, span, None);
+        self.declare_full(scope, name, kind, mutability, span, None, ClassKind::Plain);
     }
 
     fn declare_with(
@@ -326,6 +385,50 @@ impl<'a> Resolver<'a> {
         mutability: Mutability,
         span: (usize, usize),
         import_info: Option<ImportInfo>,
+    ) {
+        self.declare_full(
+            scope,
+            name,
+            kind,
+            mutability,
+            span,
+            import_info,
+            ClassKind::Plain,
+        );
+    }
+
+    /// Declare a class binding with an explicit [`ClassKind`]. Used for
+    /// `class!` declarations so downstream queries (LSP hover, migrate,
+    /// future cross-module checks) can see the raw-class marker on the
+    /// binding metadata itself rather than re-scanning byte offsets.
+    fn declare_class(
+        &mut self,
+        scope: ScopeId,
+        name: &str,
+        span: (usize, usize),
+        class_kind: ClassKind,
+    ) {
+        self.declare_full(
+            scope,
+            name,
+            BindingKind::Class,
+            Mutability::Mut,
+            span,
+            None,
+            class_kind,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn declare_full(
+        &mut self,
+        scope: ScopeId,
+        name: &str,
+        kind: BindingKind,
+        mutability: Mutability,
+        span: (usize, usize),
+        import_info: Option<ImportInfo>,
+        class_kind: ClassKind,
     ) {
         if let Some(existing) = self.lookup_local(scope, name) {
             // Re-entry at exactly the same span is just the same statement
@@ -364,6 +467,7 @@ impl<'a> Resolver<'a> {
             mutability,
             span,
             import_info,
+            class_kind,
         });
     }
 
@@ -450,13 +554,31 @@ impl<'a> Resolver<'a> {
     }
 }
 
-/// Resolve a parsed module and return scopes + diagnostics.
+/// Resolve a parsed module and return scopes + diagnostics. Uses the
+/// default [`ResolveOptions`] (no `class!` tagging, etc.). Call
+/// [`resolve_module_with`] from contexts that have preprocess metadata
+/// available so the resolver can surface Typhon-specific markers on
+/// the resulting bindings.
 pub fn resolve_module(
     path: String,
     source: &str,
     module: &ModModule,
 ) -> (ResolvedModule, Diagnostics) {
-    let mut r = Resolver::new(path, source);
+    resolve_module_with(path, source, module, ResolveOptions::default())
+}
+
+/// Like [`resolve_module`] but with explicit options. Currently the only
+/// option is `raw_class_byte_starts`, which lets the resolver tag every
+/// `class!` binding with [`ClassKind::Raw`] so the LSP can render
+/// distinct hover text and downstream passes can branch on the marker
+/// without re-scanning byte ranges.
+pub fn resolve_module_with(
+    path: String,
+    source: &str,
+    module: &ModModule,
+    options: ResolveOptions,
+) -> (ResolvedModule, Diagnostics) {
+    let mut r = Resolver::new_with(path, source, options);
 
     // First pass: collect top-level declarations so forward references
     // inside functions and classes resolve correctly.
@@ -547,19 +669,14 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt]) {
                 );
             }
             Stmt::ClassDef(c) => {
-                let span = find_def_name_span(
-                    r.source,
-                    c.range.start().to_usize(),
-                    "class ",
-                    c.name.as_str(),
-                );
-                r.declare(
-                    scope,
-                    c.name.as_str(),
-                    BindingKind::Class,
-                    Mutability::Mut,
-                    span,
-                );
+                let stmt_start = c.range.start().to_usize();
+                let span = find_def_name_span(r.source, stmt_start, "class ", c.name.as_str());
+                let kind = if r.is_raw_class_offset(stmt_start) {
+                    ClassKind::Raw
+                } else {
+                    ClassKind::Plain
+                };
+                r.declare_class(scope, c.name.as_str(), span, kind);
             }
             Stmt::Import(i) => {
                 for alias in &i.names {
@@ -1479,11 +1596,79 @@ mod tests {
     use tyc_syntax::preprocess::preprocess;
 
     fn resolve(src: &str) -> (ResolvedModule, Diagnostics) {
+        resolve_with_options(src, ResolveOptions::default())
+    }
+
+    fn resolve_with_options(src: &str, options: ResolveOptions) -> (ResolvedModule, Diagnostics) {
         let prep = preprocess(src);
         let module = tyc_syntax::parse_module(&prep.python_source)
             .unwrap()
             .into_syntax();
-        resolve_module("<test>".to_owned(), &prep.python_source, &module)
+        resolve_module_with("<test>".to_owned(), &prep.python_source, &module, options)
+    }
+
+    fn resolve_with_raw_classes(src: &str) -> (ResolvedModule, Diagnostics) {
+        let prep = preprocess(src);
+        let raw_class_byte_starts =
+            tyc_syntax::preprocess::line_byte_starts(&prep.python_source, &prep.raw_class_lines);
+        let options = ResolveOptions {
+            raw_class_byte_starts,
+        };
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
+        resolve_module_with("<test>".to_owned(), &prep.python_source, &module, options)
+    }
+
+    #[test]
+    fn raw_class_binding_carries_raw_class_kind() {
+        let src = "class! Foo:\n    pass\n";
+        let (m, _) = resolve_with_raw_classes(src);
+        let b = m
+            .module_scope()
+            .lookup_local("Foo")
+            .expect("Foo must be declared");
+        assert_eq!(b.kind, BindingKind::Class);
+        assert_eq!(b.class_kind, ClassKind::Raw);
+    }
+
+    #[test]
+    fn plain_class_binding_keeps_plain_class_kind() {
+        let src = "class Foo:\n    pass\n";
+        let (m, _) = resolve_with_raw_classes(src);
+        let b = m
+            .module_scope()
+            .lookup_local("Foo")
+            .expect("Foo must be declared");
+        assert_eq!(b.class_kind, ClassKind::Plain);
+    }
+
+    #[test]
+    fn raw_class_tagging_is_offset_specific() {
+        // Two classes, only the second is raw. The tagging must pick out
+        // exactly the right binding.
+        let src = "class A:\n    pass\nclass! B:\n    pass\n";
+        let (m, _) = resolve_with_raw_classes(src);
+        let a = m.module_scope().lookup_local("A").unwrap();
+        let b = m.module_scope().lookup_local("B").unwrap();
+        assert_eq!(a.class_kind, ClassKind::Plain);
+        assert_eq!(b.class_kind, ClassKind::Raw);
+    }
+
+    #[test]
+    fn resolve_with_default_options_never_tags_raw() {
+        // Without the byte-starts list, no class is tagged raw even if the
+        // source uses `class!` — keeps the default API safe for callers
+        // that don't have preprocess metadata handy.
+        let src = "class! Foo:\n    pass\n";
+        let (m, _) = resolve(src);
+        let b = m.module_scope().lookup_local("Foo").unwrap();
+        assert_eq!(b.class_kind, ClassKind::Plain);
+    }
+    // Silence the unused-helper warning when the doc tests are skipped.
+    #[allow(dead_code)]
+    fn _resolve_with_options_must_compile(src: &str) {
+        let _ = resolve_with_options(src, ResolveOptions::default());
     }
 
     #[test]

@@ -161,24 +161,103 @@ delete, signature change).
 
 ## Recommended next steps, in order
 
-> **Update (May 2026):** items 1, 3, and 4 below have all landed.
-> The current list of open follow-ups is:
+> **Update (May 2026 — second pass):** items 3, 5, and 6 below have all
+> landed since the last revision. The current list of open follow-ups is:
 
-1. Promote `bind_typevars_and_substitute` into a full structural
-   sub-type checker. Bounded type-var checking and basic
-   conformance now use the substitution table; variance and
-   higher-kinded forms remain partial.
-2. Vendor `ruff_python_codegen` to replace `tyc-emit/src/printer.rs`,
-   preserving the `line_offsets` hook the hand-written printer
-   exposes today (see `tyc/vendor/README.md`).
-3. Runtime `stubtest` probe via `mypy --stubtest` as a complement
-   to the AST-level `tyc check --stubs` diff. Catches dynamically
-   created members the AST cannot see.
-4. `ty` integration as a complementary second-stage checker (see
-   `docs/ty-integration.md`).
-5. Richer comptime: `comptime` functions, types as values.
-6. Document `class!` in `docs/language.md`, teach `tyc migrate` to
-   emit it when the source `.py` has a hand-rolled `__init__` that
-   conflicts with dataclass generation, and surface the modifier in
-   LSP hover. The prototype landed; see the "`class!` raw-class
-   modifier" section above.
+1. ✅ **Variance landed** — `assignable` now consults a hand-curated
+   `generic_param_variance(head, idx)` table for every generic
+   parameter, applying covariance / contravariance / invariance per
+   position instead of recursing covariantly everywhere. Mutable
+   containers (`list`, `set`, `dict[K, V]` both axes, the `Mutable*`
+   ABCs) are invariant; read-only views (`Sequence`, `Iterable`,
+   `Mapping[V]` value position, …) are covariant; `Callable` is
+   contravariant in arguments and covariant in return; user-defined
+   generics default to invariant for soundness. Unblocks the soundness
+   bug where `list[int]` previously flowed into `list[float]` under
+   numeric widening. See `tyc-types/src/lib.rs::assignable` and
+   `generic_param_variance`. Higher-kinded forms (`T[U]` where `T`
+   is itself a type variable) remain partial — rare in practice and
+   the substitution table handles them permissively.
+
+2. **Vendor `ruff_python_codegen` — deliberately not done.** Probed in
+   May 2026 and concluded the cost outweighs the benefit:
+
+   - Upstream `ruff_python_codegen` has no per-statement `line_offsets`
+     hook. Adding one means instrumenting every newline emit site
+     (~36 in upstream `generator.rs` at the pinned revision), which
+     is the same amount of work as maintaining the hand-written
+     printer.
+   - Upstream pulls in `ruff_python_literal` for string escapes,
+     which transitively pulls `icu_properties` — a sizable
+     dependency just for Unicode classification.
+   - Vendored ruff_python_ast has Typhon's `Mutability` extension;
+     to emit `let`/`mut` round-trip, upstream codegen needs patched
+     too — defeating the "use upstream as-is" benefit.
+
+   Net: vendoring would *replace* a working 1.6 kLOC printer with a
+   patched 2.5 kLOC vendor (plus dependencies) for zero functional
+   gain. The right call is to keep the hand-written printer; the
+   sync burden a vendor introduces wouldn't be earned.
+
+   If the picture changes (upstream adds a public line-offset hook,
+   the `let`/`mut` extension lands upstream as a feature flag), the
+   vendor becomes attractive — until then, leave it alone.
+3. ✅ **Runtime `stubtest` probe** — landed as `tyc stubtest`. The
+   command builds the project, walks the output for `.pyi` stubs,
+   derives Python import paths, and invokes
+   `python -m mypy.stubtest <module>` with `PYTHONPATH` pointing at
+   the build directory. Flags mirror `tyc ty` where they overlap;
+   `--keep-going` gets the full drift report in CI rather than
+   stopping at the first failure. Documented in `docs/cli.md` and
+   surfaced in the README's subcommand table.
+4. **`ty` integration as a complementary second-stage checker.**
+   Phase 1 (subprocess `tyc ty`) ships. Phase 2 (embedded library
+   sharing the Salsa db) was probed in May 2026 and deferred —
+   what's required, in order:
+
+   - Vendor `ty_python_semantic` plus its workspace siblings: `ruff_db`,
+     `ruff_diagnostics`, `ruff_index`, `ruff_macros`,
+     `ruff_memory_usage`, `ruff_python_literal`, `ruff_python_stdlib`,
+     `ty_module_resolver`, `ty_site_packages`, `ty_python_core`.
+     Roughly 8 new crates on top of the 5 already vendored.
+   - `ty_python_semantic` consumes `ruff_python_ast` — Typhon's
+     fork has a `Mutability` extension on assignment AST nodes that
+     upstream doesn't have. Either keep the fork compatible with
+     upstream's expected shape (workable: the extension is an
+     additive field) or maintain a translation layer.
+   - `ty`'s public API is alpha pre-1.0; the integration doc
+     explicitly recommends pinning a commit and treating each upgrade
+     as a deliberate sync. The first sync after embedding will be
+     instructive — likely several days of effort.
+   - The Salsa-db sharing in `docs/ty-integration.md` Phase 2 Step 2.3
+     wants both checkers' queries to invalidate together. That
+     requires `ty_python_semantic::Db` to be impl'd on `TycDatabase`,
+     which in turn requires the vendored ty crate to compile in
+     this workspace — non-trivial because ty uses workspace-level
+     deps Typhon doesn't declare.
+
+   The subprocess path (`tyc ty`) covers the practical "second
+   opinion" use case today. Phase 2 should land when (a) `ty` ≥ 1.0
+   so the API is stable, or (b) a Typhon program actually needs
+   sub-100ms incremental ty checking (the subprocess re-invokes ty's
+   parser each time). Neither is true today.
+5. ✅ **Richer comptime — `comptime def` functions.** The evaluator
+   now dispatches into user-declared `comptime def` helpers from
+   any `comptime let` RHS. v1 body grammar covers `return EXPR`,
+   local `let`/`mut`/plain assignments, `if`/`elif`/`else`, the
+   ternary `EXPR if COND else EXPR`, comparisons, and short-circuit
+   `and`/`or`/`not`. Recursion depth is capped at 64. Loops, exceptions,
+   `with`-blocks, and `class`/`def` declarations stay rejected.
+   Examples in `docs/language.md`. Types as values remain future
+   work.
+6. ✅ **`class!` polish** — documented in `docs/language.md`,
+   surfaced in LSP hover (rendered as "raw class (`class!`)"), and
+   `tyc migrate` now promotes a `class Name(...)` declaration to
+   `class! Name(...)` whenever the body declares a hand-written
+   `def __init__` at the immediate body indent and the class isn't
+   already opting into dataclass semantics via `@dataclass`. The
+   resolver carries a `ClassKind { Plain, Raw }` on every class
+   binding so downstream passes can branch on the marker without
+   re-scanning byte ranges; cross-file go-to-definition jumps
+   carry the metadata along, so hover after a jump still renders
+   the correct kind.

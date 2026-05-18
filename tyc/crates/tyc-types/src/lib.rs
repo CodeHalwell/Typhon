@@ -172,7 +172,10 @@ impl Type {
 ///   to any variant.
 /// - `actual = Union` ⇒ allowed only if every variant is assignable
 ///   to `expected`.
-/// - Generic types match on the head name and check each arg pairwise.
+/// - Generic types match on the head name and check each arg pairwise,
+///   consulting [`generic_param_variance`] per parameter so
+///   `list[T]` (mutable container) stays invariant while
+///   `Sequence[T]` / `Iterable[T]` (read-only view) flow covariantly.
 /// - Otherwise structural equality.
 pub fn assignable(expected: &Type, actual: &Type) -> bool {
     match (expected, actual) {
@@ -203,7 +206,36 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
                     _ => {}
                 }
             }
-            an == bn && aa.len() == bb.len() && aa.iter().zip(bb).all(|(x, y)| assignable(x, y))
+            if an != bn || aa.len() != bb.len() {
+                return false;
+            }
+            aa.iter()
+                .zip(bb)
+                .enumerate()
+                .all(|(idx, (formal, actual_arg))| {
+                    match generic_param_variance(an, idx) {
+                        // Covariant: `Box[Sub]` flows into `Box[Super]`. The
+                        // recursive call mirrors the outer assignability rule,
+                        // including primitive widening (`Int -> Float`).
+                        Variance::Covariant => assignable(formal, actual_arg),
+                        // Contravariant (callable args): `Callable[[Animal]]`
+                        // accepts a callable taking `Cat` because anyone able
+                        // to handle the wider type can handle the narrower
+                        // one. Direction is flipped: actual must be assignable
+                        // *to* formal.
+                        Variance::Contravariant => assignable(actual_arg, formal),
+                        // Invariant: the parameter must match exactly. This
+                        // is the safe default for mutable containers (`list`,
+                        // `set`, `dict[K]`) — covariance there is unsound
+                        // because a write through the wider view can break
+                        // readers of the narrower view. Bidirectional
+                        // assignability captures structural equality without
+                        // forcing `PartialEq` on every `Type` arm.
+                        Variance::Invariant => {
+                            assignable(formal, actual_arg) && assignable(actual_arg, formal)
+                        }
+                    }
+                })
         }
         // Bare (unparameterized) `Ok` or `Err` is assignable to `Result[T, E]`
         // without parameter checking. This arises when the `?` operator expands
@@ -238,6 +270,96 @@ fn is_bare_container_name(name: &str) -> bool {
         name,
         "list" | "dict" | "tuple" | "set" | "frozenset" | "deque"
     )
+}
+
+/// Variance of a type parameter — controls the assignability direction
+/// applied when comparing two `Generic` types with matching heads.
+///
+/// PEP 484 / 695 treat all parameters as invariant by default. Typhon
+/// mirrors that for unknown / user-defined generics so a user class
+/// `class Box[T]` is sound regardless of how `T` is used internally;
+/// individual stdlib generics declare their own variance below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Variance {
+    /// `T` only flows out of the container (read-only). `Seq[Sub]`
+    /// accepts `Seq[Super]` when reading.
+    Covariant,
+    /// `T` only flows in (write-only). `Sink[Super]` accepts `Sink[Sub]`.
+    Contravariant,
+    /// `T` flows both ways. Must match exactly. Default for mutable
+    /// containers (`list`, `set`, `dict` value position) and any
+    /// user-defined generic.
+    Invariant,
+}
+
+/// Variance of the `idx`-th type parameter of the generic head `head`.
+///
+/// Hand-curated map covering the Python built-ins and typing-module
+/// abstract base classes Typhon's stdlib stubs reference. Anything not
+/// listed defaults to [`Variance::Invariant`], which is the safe choice
+/// — a misclassified user generic that should be covariant rejects
+/// otherwise-valid programs, but a misclassified mutable container that
+/// flows covariantly silently accepts unsound programs. The former is
+/// fixable by writing the obvious cast; the latter is a real bug source.
+pub fn generic_param_variance(head: &str, idx: usize) -> Variance {
+    match (head, idx) {
+        // ── Mutable containers — invariant in every position. ─────────
+        ("list", 0)
+        | ("set", 0)
+        | ("MutableSequence", 0)
+        | ("MutableSet", 0)
+        | ("MutableMapping", 0)
+        | ("MutableMapping", 1)
+        | ("Dict", 0)
+        | ("Dict", 1)
+        | ("dict", 0)
+        | ("dict", 1)
+        | ("Set", 0)
+        | ("List", 0) => Variance::Invariant,
+
+        // ── Read-only views / immutable containers — covariant in T. ──
+        ("Sequence", 0)
+        | ("Iterable", 0)
+        | ("Iterator", 0)
+        | ("Container", 0)
+        | ("Collection", 0)
+        | ("Reversible", 0)
+        | ("AbstractSet", 0)
+        | ("FrozenSet", 0)
+        | ("frozenset", 0)
+        | ("tuple", 0)
+        | ("Tuple", 0)
+        | ("Awaitable", 0)
+        | ("Coroutine", 0)
+        | ("AsyncIterable", 0)
+        | ("AsyncIterator", 0)
+        | ("Generator", 0)
+        | ("AsyncGenerator", 0)
+        | ("ContextManager", 0) => Variance::Covariant,
+
+        // ── Mapping[K, V] — invariant in K (keys are hashed/compared
+        // exactly) and covariant in V (values flow out via __getitem__).
+        ("Mapping", 0) => Variance::Invariant,
+        ("Mapping", 1) => Variance::Covariant,
+
+        // ── Optional[T] / Union flattening — covariant. ───────────────
+        ("Optional", 0) => Variance::Covariant,
+
+        // ── Callable[[Args], Ret] — args contravariant, return
+        // covariant. The args position is encoded as parameter 0 in
+        // Typhon's `Generic` shape; the return is parameter 1. (A more
+        // structured Callable type can refine this later — today's
+        // single-arg shape already gets us the right direction.) ──────
+        ("Callable", 0) => Variance::Contravariant,
+        ("Callable", 1) => Variance::Covariant,
+
+        // ── Result[T, E] — Ok and Err payloads only flow out, so both
+        // positions are covariant (a Result[Sub, Err] is a Result[Super, Err]). ─
+        ("Result", 0) | ("Result", 1) => Variance::Covariant,
+
+        // Unknown head / parameter — default invariant.
+        _ => Variance::Invariant,
+    }
 }
 
 /// Translate an annotation expression into a [`Type`].
@@ -1010,6 +1132,41 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Emit a [`TycError::TypeReassignMismatch`] for a reassignment that
+    /// disagrees with the binding's declared type. Distinct from
+    /// [`Self::mismatch`] because the diagnostic carries a second label
+    /// pointing at the original declaration site and explains `mut`
+    /// semantics in its help text — the previous "type mismatch:
+    /// expected X, found Y" message routinely confused users who had
+    /// written `mut name = …` expecting it to behave like a fresh
+    /// declaration.
+    fn reassign_mismatch(
+        &mut self,
+        name: &str,
+        expected: &Type,
+        actual: &Type,
+        span: (usize, usize),
+        decl_span: (usize, usize),
+    ) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
+        let length = span.1.saturating_sub(span.0).max(1);
+        let decl_length = decl_span.1.saturating_sub(decl_span.0).max(1);
+        self.diagnostics
+            .push_error(TycError::type_reassign_mismatch(
+                name,
+                expected.display(),
+                actual.display(),
+                &self.path,
+                self.source,
+                span.0,
+                length,
+                decl_span.0,
+                decl_length,
+            ));
+    }
+
     fn mismatch(&mut self, expected: &Type, actual: &Type, span: (usize, usize)) {
         if self.unsafe_depth > 0 {
             return;
@@ -1620,13 +1777,24 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     let existing = c.env.lookup(n.id.as_str()).cloned();
                     if let Some(b) = existing {
                         // Reassignment: the static type stays as declared;
-                        // check the new value fits.
+                        // check the new value fits. When it doesn't, emit
+                        // the dedicated reassignment-mismatch diagnostic
+                        // so the user sees both the offending value AND
+                        // the original declaration site (with help text
+                        // that explains `mut` allows new values of the
+                        // same type, not a new type).
                         if !c.is_assignable(&b.declared, &value_type) {
                             let vspan = (
                                 a.value.range().start().to_usize(),
                                 a.value.range().end().to_usize(),
                             );
-                            c.mismatch(&b.declared, &value_type, vspan);
+                            c.reassign_mismatch(
+                                n.id.as_str(),
+                                &b.declared,
+                                &value_type,
+                                vspan,
+                                b.span,
+                            );
                         }
                         // Reset any narrowing on the reassigned name.
                         c.env.narrow(n.id.as_str(), b.declared);
@@ -2882,6 +3050,132 @@ mod tests {
         assert!(d.has_errors());
         let msg = format!("{}", d.errors()[0]);
         assert!(msg.contains("expected `int`"), "got {}", msg);
+    }
+
+    // ── Variance ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn list_is_invariant_no_implicit_int_to_float_widening() {
+        // Mutable container — promoting `list[int]` to `list[float]` is
+        // unsound because a write through the wider view (`xs.append(2.5)`)
+        // would put a float into a list the original holder expects to
+        // contain only ints. The invariance rule rejects this.
+        let d = check("mut xs: list[float] = [1.0, 2.0]\nlet ys: list[int] = [1, 2]\nxs = ys\n");
+        assert!(
+            d.has_errors(),
+            "list invariance must reject list[int] -> list[float]; got: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn list_of_same_type_still_assigns() {
+        // Sanity check: invariance for `list` doesn't break the common
+        // `list[T] -> list[T]` case.
+        let d = check("mut xs: list[int] = [1, 2]\nlet ys: list[int] = [3, 4]\nxs = ys\n");
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn sequence_is_covariant_accepts_subtype_widening() {
+        // Read-only view — `Sequence[int]` flows into `Sequence[float]`
+        // covariantly. Tests the symmetric improvement: tightening
+        // mutable-container variance shouldn't accidentally tighten
+        // read-only-view variance. We construct both bindings as
+        // `Sequence[T]` directly so the test exercises variance on
+        // matching heads without needing list <: Sequence nominal
+        // subtyping (which Typhon doesn't model today).
+        let d = check("def f(xs: Sequence[int]) -> Sequence[float]:\n    return xs\n");
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn dict_is_invariant_in_both_positions() {
+        // `dict` is mutable on both axes (key reassignment, value
+        // replacement), so neither parameter is variant. The function
+        // form sidesteps the empty-dict literal type-inference quirk
+        // (which would resolve to `dict[Any, Any]` and gloss over the
+        // variance we want to test).
+        let d = check("def f(m: dict[str, int]) -> dict[str, float]:\n    return m\n");
+        assert!(d.has_errors(), "dict value invariance should reject");
+    }
+
+    #[test]
+    fn mapping_is_covariant_in_value_position() {
+        // The read-only `Mapping` ABC is invariant in the key (keys are
+        // hashed/compared exactly) and covariant in the value.
+        let d = check("def f(m: Mapping[str, int]) -> Mapping[str, float]:\n    return m\n");
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn mapping_is_invariant_in_key_position() {
+        // Keys must match exactly even on the read-only `Mapping`:
+        // anyone iterating keys expects the declared type, and key
+        // hashing is observable through `__getitem__`.
+        let d = check("def f(m: Mapping[int, str]) -> Mapping[float, str]:\n    return m\n");
+        assert!(d.has_errors(), "Mapping key invariance should reject");
+    }
+
+    #[test]
+    fn variance_lookup_table_matches_spec() {
+        // Unit-level check on the registry itself: misclassifying a
+        // mutable builtin would silently introduce a soundness hole.
+        assert_eq!(generic_param_variance("list", 0), Variance::Invariant);
+        assert_eq!(generic_param_variance("set", 0), Variance::Invariant);
+        assert_eq!(generic_param_variance("dict", 0), Variance::Invariant);
+        assert_eq!(generic_param_variance("dict", 1), Variance::Invariant);
+        assert_eq!(generic_param_variance("Sequence", 0), Variance::Covariant);
+        assert_eq!(generic_param_variance("Iterable", 0), Variance::Covariant);
+        assert_eq!(generic_param_variance("Mapping", 0), Variance::Invariant);
+        assert_eq!(generic_param_variance("Mapping", 1), Variance::Covariant);
+        assert_eq!(
+            generic_param_variance("Callable", 0),
+            Variance::Contravariant
+        );
+        assert_eq!(generic_param_variance("Callable", 1), Variance::Covariant);
+        // Unknown head defaults to invariant — safest for user generics.
+        assert_eq!(generic_param_variance("MyBox", 0), Variance::Invariant);
+    }
+
+    #[test]
+    fn reassign_type_mismatch_carries_decl_site_and_explains_mut() {
+        // Regression test for the misleading-diagnostic case raised on
+        // PR #48: `mut greeting: str = "..."` followed by
+        // `greeting = 8` previously produced a bare "expected str,
+        // found int" message that read like a compiler bug. The new
+        // diagnostic names the binding and both types in the headline,
+        // anchors short labels to the declaration and the offending
+        // value, and explains `mut` semantics in the help line.
+        let d = check("mut greeting: str = \"hi\"\ngreeting = 8\n");
+        assert!(d.has_errors(), "{:?}", d.errors());
+        let err = &d.errors()[0];
+        // Variant identity — the new dedicated diagnostic, not the
+        // generic `TypeMismatch`.
+        assert!(
+            matches!(err, TycError::TypeReassignMismatch { .. }),
+            "expected TypeReassignMismatch, got: {err:?}"
+        );
+        // Headline must name the binding, the actual type, and the
+        // declared type so the user has every relevant fact in the
+        // first line of output — the labels are intentionally terse
+        // and only carry the per-anchor disambiguator.
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("greeting") && msg.contains("str") && msg.contains("`int`"),
+            "headline should name the binding and both types; got: {msg}"
+        );
+        if let TycError::TypeReassignMismatch {
+            name,
+            expected,
+            actual,
+            ..
+        } = err
+        {
+            assert_eq!(name, "greeting");
+            assert_eq!(expected, "str");
+            assert_eq!(actual, "int");
+        }
     }
 
     #[test]

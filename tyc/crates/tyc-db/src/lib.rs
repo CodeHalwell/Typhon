@@ -13,13 +13,13 @@
 use std::sync::Arc;
 
 use tyc_diagnostics::{Diagnostics, TycError};
-use tyc_resolve::{resolve_module, ResolvedModule};
+use tyc_resolve::{resolve_module_with, ResolveOptions, ResolvedModule};
 use tyc_syntax::{
     parse_module,
     preprocess::{
         expand_gather_blocks, expand_go_calls, expand_pipes, expand_question_ops,
-        expand_with_chains, preprocess, validate_extend_usage, validate_lazy_usage,
-        validate_question_ops,
+        expand_with_chains, line_byte_starts, preprocess, validate_extend_usage,
+        validate_lazy_usage, validate_question_ops,
     },
 };
 use tyc_types::check_module_with;
@@ -69,7 +69,9 @@ pub fn module_decl_names(db: &dyn salsa::Database, file: SourceFile) -> Vec<Stri
         Err(_) => return Vec::new(),
     };
     let module = parsed.into_syntax();
-    let (resolved, _) = resolve_module(path, &source, &module);
+    // This query only reads names, so the default options are fine — no
+    // call site walks the bindings for raw-class kind from here.
+    let (resolved, _) = resolve_module_with(path, &source, &module, ResolveOptions::default());
     resolved
         .module_scope()
         .bindings
@@ -131,12 +133,25 @@ unsafe impl salsa::Update for ArcResolvedModule {
 /// rule.  Callers can deref directly or clone the inner `Arc` via `.0`.
 #[salsa::tracked]
 pub fn resolved_module(db: &dyn salsa::Database, file: SourceFile) -> ArcResolvedModule {
-    let source = preprocessed_text(db, file);
+    let raw_text = file.text(db).clone();
     let path = file.path(db).clone();
-    match parse_module(&source) {
+    // Re-run the sugar-expand + preprocess pipeline here so the resolver
+    // has access to the full preprocess metadata (raw class lines, …).
+    // `preprocessed_text` caches the same expansion, so the Salsa cache
+    // hit on subsequent reads still avoids double work for callers that
+    // only need the text. The cost here is one extra preprocess per
+    // source change, which is bounded by file size and cheap.
+    let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
+        &expand_gather_blocks(&raw_text),
+    ))));
+    let prep = preprocess(&expanded);
+    let options = ResolveOptions {
+        raw_class_byte_starts: line_byte_starts(&prep.python_source, &prep.raw_class_lines),
+    };
+    match parse_module(&prep.python_source) {
         Ok(parsed) => {
             let module = parsed.into_syntax();
-            let (resolved, _) = resolve_module(path, &source, &module);
+            let (resolved, _) = resolve_module_with(path, &prep.python_source, &module, options);
             ArcResolvedModule(Arc::new(resolved))
         }
         Err(_) => ArcResolvedModule(Arc::new(ResolvedModule::default())),
@@ -263,7 +278,15 @@ fn check_impl(path: &str, text: &str) -> Diagnostics {
         }
     };
 
-    let (resolved, resolve_diags) = resolve_module(path.to_owned(), &prep.python_source, &module);
+    let resolve_options = ResolveOptions {
+        raw_class_byte_starts: line_byte_starts(&prep.python_source, &prep.raw_class_lines),
+    };
+    let (resolved, resolve_diags) = resolve_module_with(
+        path.to_owned(),
+        &prep.python_source,
+        &module,
+        resolve_options,
+    );
     diags.extend(resolve_diags);
 
     let type_diags = check_module_with(

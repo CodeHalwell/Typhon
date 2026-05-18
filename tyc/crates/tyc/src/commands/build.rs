@@ -17,7 +17,7 @@ use ruff_python_parser::parse_expression;
 use ruff_text_size::TextRange;
 
 use tyc_analyse::{
-    analyse_purity, collect_gatherable_async_fn_names, evaluate_comptime,
+    analyse_purity, collect_gatherable_async_fn_names, evaluate_comptime_with_functions,
     extract_builtin_extensions, load_profile_samples, pgo_memoise_targets, purity_diagnostics,
     rewrite_auto_gather, rewrite_builtin_extension_calls, rewrite_parallel_comprehensions,
     ComptimeValue, ProfileSample,
@@ -194,8 +194,13 @@ pub fn run(args: BuildArgs) -> Result<()> {
             .map_err(|e| miette!("parse error in '{}': {e}", path.display()))?;
 
         // Evaluate all `comptime` bindings and substitute their literals into
-        // the AST before desugaring.
-        let (comptime_values, comptime_diags) = evaluate_comptime(&module, &prep.comptime_bindings);
+        // the AST before desugaring. `comptime def` functions registered by
+        // the preprocessor are dispatchable from the binding RHSs.
+        let (comptime_values, comptime_diags) = evaluate_comptime_with_functions(
+            &module,
+            &prep.comptime_bindings,
+            &prep.comptime_functions,
+        );
         if comptime_diags.has_errors() {
             for err in comptime_diags.errors() {
                 eprintln!("{:?}", miette::Report::new_boxed(Box::new(err.clone())));
