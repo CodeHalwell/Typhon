@@ -2138,7 +2138,14 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                                 // Best-effort: strip the type out of the union.
                                 strip_variant(&b.narrowed, &new_type)
                             } else {
-                                new_type
+                                // Preserve generic parameters when narrowing
+                                // `Result[T, E]` against `Ok` or `Err`.
+                                // Without this, the post-`?`-operator
+                                // `return x` (where `x` is now `Class("Err")`)
+                                // would lose `E` and the
+                                // `result_error_mismatch` check (FINDINGS #13)
+                                // can't fire.
+                                refine_isinstance_target(&b.narrowed, &new_type)
                             };
                             out.push(Narrowing {
                                 name: target.id.as_str().to_owned(),
@@ -2199,6 +2206,33 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
         }
         _ => None,
     }
+}
+
+/// Refine the type chosen by an `isinstance(x, T)` narrowing so that
+/// generic parameters survive when the source `x: Result[A, B]` is
+/// narrowed against the bare `Err` / `Ok` constructor. Without this
+/// the post-`isinstance` `return x` from a `?`-operator expansion
+/// would have type `Class("Err")` and the
+/// `result_error_mismatch` check wouldn't see `Err[E]` vs
+/// `Result[T, E_outer]`.
+fn refine_isinstance_target(current: &Type, narrowed_to: &Type) -> Type {
+    let current_generic = match current {
+        Type::Generic(name, args) if name == "Result" && args.len() == 2 => Some(args),
+        _ => None,
+    };
+    let narrowed_class = match narrowed_to {
+        Type::Class(name) if name == "Ok" || name == "Err" => Some(name.as_str()),
+        _ => None,
+    };
+    if let (Some(args), Some(class)) = (current_generic, narrowed_class) {
+        let param = match class {
+            "Ok" => args[0].clone(),
+            "Err" => args[1].clone(),
+            _ => unreachable!(),
+        };
+        return Type::Generic(class.to_owned(), vec![param]);
+    }
+    narrowed_to.clone()
 }
 
 fn strip_variant(typ: &Type, variant: &Type) -> Type {

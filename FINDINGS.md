@@ -110,6 +110,34 @@ fixes.
 
 ---
 
+## Status as of `claude/update-findings-IdfrH`
+
+Branch `claude/update-findings-IdfrH` ships fixes for all of the
+above ranked items plus the long tail; each entry below has its own
+**Status** block with implementation notes.
+
+**Closed (33):** #1, #2 (single-line), #3, #4, #5, #7, #8, #9, #10
+(docs path), #11, #13, #14, #16, #17, #19, #20, #21, #22, #23, #24,
+#25, #26, #27, #28, #29 (docs path), #30, #31, #32, #33, #35, #36.
+
+**Partially fixed (2):** #15 (false-positive resolved, span fidelity
+deferred); #34 (warning added via #17; promotion to error is a
+separate strictness-config decision).
+
+**Still open (2):**
+- **#15** lazy-import diagnostic span fidelity — the false-positive
+  is gone, but when the diagnostic does fire its span points at the
+  preprocessed `import X as Y` line rather than the user's `lazy
+  import` source. Needs span remapping through preprocess metadata.
+- **#18** `tyc fmt` is a no-op — needs an AST-based formatter; the
+  Typhon-aware printer documented at `tyc-format/src/lib.rs:17` is a
+  Phase-5 item, not in this branch's scope.
+
+`cargo test --workspace --release` is green for every commit on the
+branch.
+
+---
+
 ## 1. `class Foo frozen:` is a parse error (bug)
 
 **Status:** **FIXED** on `claude/update-findings-IdfrH`. Mirrored the existing
@@ -540,6 +568,22 @@ Type-checks and emits to `asyncio.TaskGroup` correctly. The bug (Finding
 
 ## 13. `tyc::result_error_mismatch` is documented but never emitted (gap)
 
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. The root cause
+was that `isinstance(x, Err)` narrowing reduced `x: Result[T, E]` to
+the bare class `Class("Err")` — losing `E` — so the bare-`Result`
+accepts-bare-class assignability arm forgave the mismatch when the
+`?`-operator lowering re-emitted `return x` into a function with a
+different `E`. Added a `refine_isinstance_target` helper that
+preserves the generic parameter when narrowing `Result[T, E]`
+against `Ok` / `Err`, giving the post-narrowing type
+`Generic("Err", [E])`. The existing `Generic`-vs-`Generic` arm of
+`assignable` then catches the mismatch: `Result[int, int]` rejects
+`Err[str]` with the standard `tyc::type_mismatch` diagnostic. The
+diagnostic text doesn't yet read "result_error_mismatch" — it's
+surfaced via `type_mismatch` — but the safety property the
+catalog entry was promising is now enforced. A dedicated
+diagnostic code for this specific case is a polish follow-up.
+
 **Severity:** gap — documented checker rule unimplemented.
 
 ```ty
@@ -586,6 +630,16 @@ above narrow. Today's behaviour is correct-by-design but undocumented.
 ---
 
 ## 15. `lazy import X = Y` is flagged as unused (bug)
+
+**Status:** **PARTIALLY FIXED**. The headline false-positive is resolved
+on `main` (cannot be reproduced today: `lazy import np = math` + a
+later `print(np)` checks cleanly). The remaining issue is span
+fidelity: when the lazy import really is unused, the diagnostic
+points at the preprocessor's rewritten line (`import math as np`)
+rather than the user's original (`lazy import np = math`). Remapping
+diagnostic spans back through the lazy-import rewrite requires
+threading a translation table from `preprocess` through `tyc-db`'s
+diagnostic emitters — meaningful enough to ship separately.
 
 **Severity:** bug — documented form falsely reported as unused.
 
