@@ -114,12 +114,15 @@ pub fn evaluate_comptime(
 /// functions: any `Stmt::FunctionDef` in `module.body` whose name appears
 /// in `comptime_function_names` is callable from a `comptime let` RHS.
 ///
-/// Comptime functions follow a restricted contract — the body must be a
-/// single `return EXPR` statement and `EXPR` must be evaluable under the
-/// same rules as a `comptime let` initialiser, with parameters bound to
+/// Comptime functions follow a restricted contract — bodies support
+/// `return EXPR`, local `NAME[: T] = EXPR` bindings, and `if`/`elif`/
+/// `else` branches; expressions follow the same rules as a `comptime
+/// let` initialiser (literals, arithmetic, string concatenation,
+/// comparisons, boolean ops, ternaries, and calls to `env`/`int`/`str`/
+/// `float` or other `comptime def` functions), with parameters bound to
 /// the call's actual arguments. Recursion depth is capped at
 /// [`MAX_COMPTIME_DEPTH`] so a buggy definition fails the build rather
-/// than hanging it.
+/// than hanging it. See [`eval_stmt`] for the full statement contract.
 pub fn evaluate_comptime_with_functions(
     module: &ModModule,
     bindings: &[ComptimeBinding],
@@ -279,14 +282,15 @@ fn eval_expr(expr: &Expr, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue, St
         Expr::BooleanLiteral(b) => Ok(ComptimeValue::Bool(b.value)),
         Expr::NoneLiteral(_) => Err("None is not a valid comptime value".into()),
 
-        // Name reference: looks up a parameter binding from the current
-        // comptime function call frame. Free variables (module-level
-        // names that aren't comptime parameters) are intentionally an
-        // error — comptime evaluation must be hermetic.
+        // Name reference: looks up a parameter or local binding from the
+        // current comptime function call frame. Free variables
+        // (module-level names, including other `comptime let` bindings)
+        // are intentionally rejected — comptime evaluation is hermetic,
+        // so call sites must pass everything in as arguments.
         Expr::Name(n) => ctx.locals.get(n.id.as_str()).cloned().ok_or_else(|| {
             format!(
-                "unknown name '{}' in comptime expression — only function parameters \
-                     and other comptime bindings are in scope",
+                "unknown name '{}' in comptime expression — only the enclosing function's \
+                 parameters and locally-bound names are in scope (comptime evaluation is hermetic)",
                 n.id
             )
         }),
@@ -695,8 +699,9 @@ fn eval_stmt(stmt: &Stmt, ctx: &mut EvalContext<'_>) -> Result<StmtOutcome, Stri
         }
         Stmt::Expr(_) => Ok(StmtOutcome::FellThrough),
         other => Err(format!(
-            "statement is not supported inside a comptime function body: {:?}",
-            std::mem::discriminant(other)
+            "`{}` is not supported inside a comptime function body (v1 supports \
+             `return`, local assignments, and `if`/`elif`/`else`)",
+            stmt_kind_name(other)
         )),
     }
 }
@@ -871,12 +876,62 @@ fn expr_kind_name(expr: &Expr) -> &'static str {
     }
 }
 
+/// Human-readable name for a `Stmt` variant. Surfaced in the comptime
+/// "unsupported statement" diagnostic so the user sees "while-loop" or
+/// "raise" rather than the opaque `Discriminant(...)` debug print.
+fn stmt_kind_name(stmt: &Stmt) -> &'static str {
+    match stmt {
+        Stmt::FunctionDef(_) => "function definition",
+        Stmt::ClassDef(_) => "class definition",
+        Stmt::Return(_) => "return",
+        Stmt::Delete(_) => "del",
+        Stmt::Assign(_) => "assignment",
+        Stmt::AugAssign(_) => "augmented assignment",
+        Stmt::AnnAssign(_) => "annotated assignment",
+        Stmt::TypeAlias(_) => "type alias",
+        Stmt::For(_) => "for-loop",
+        Stmt::While(_) => "while-loop",
+        Stmt::If(_) => "if",
+        Stmt::With(_) => "with-block",
+        Stmt::Match(_) => "match",
+        Stmt::Raise(_) => "raise",
+        Stmt::Try(_) => "try/except",
+        Stmt::Assert(_) => "assert",
+        Stmt::Import(_) => "import",
+        Stmt::ImportFrom(_) => "from-import",
+        Stmt::Global(_) => "global",
+        Stmt::Nonlocal(_) => "nonlocal",
+        Stmt::Expr(_) => "expression statement",
+        Stmt::Pass(_) => "pass",
+        Stmt::Break(_) => "break",
+        Stmt::Continue(_) => "continue",
+        Stmt::IpyEscapeCommand(_) => "IPython escape command",
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
     use tyc_syntax::preprocess::preprocess;
+
+    /// Process-wide lock for tests that read or mutate `std::env`.
+    ///
+    /// Cargo runs `#[test]` functions in parallel and `std::env::set_var`
+    /// / `remove_var` mutate shared global state — two tests racing on
+    /// the same variable will produce flaky failures. Any test that
+    /// touches the environment acquires this guard first; tests that
+    /// don't touch the env are free to run in parallel as usual.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Acquire [`ENV_LOCK`], recovering from poisoning. A panic inside an
+    /// env-touching test would otherwise poison the mutex and make every
+    /// subsequent env test fail with `PoisonError` instead of running.
+    fn lock_env() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
 
     fn eval(src: &str) -> (HashMap<String, ComptimeValue>, Diagnostics) {
         let prep = preprocess(src);
@@ -902,6 +957,7 @@ mod tests {
 
     #[test]
     fn env_with_default_uses_default_when_unset() {
+        let _guard = lock_env();
         // Use a unique name that no other test sets.
         std::env::remove_var("__TYPHON_TEST_UNSET_DEFAULT__");
         let (values, diags) = eval(
@@ -913,6 +969,7 @@ mod tests {
 
     #[test]
     fn env_with_default_uses_env_when_set() {
+        let _guard = lock_env();
         std::env::set_var("__TYPHON_TEST_SET_DEFAULT__", "4321");
         let (values, diags) =
             eval("comptime let PORT: int = int(env(\"__TYPHON_TEST_SET_DEFAULT__\", \"9000\"))\n");
@@ -923,6 +980,7 @@ mod tests {
 
     #[test]
     fn missing_required_env_is_an_error() {
+        let _guard = lock_env();
         std::env::remove_var("__TYPHON_REQUIRED_TEST_UNIQUE__");
         let (_, diags) =
             eval("comptime let DB_URL: str = env(\"__TYPHON_REQUIRED_TEST_UNIQUE__\")\n");
@@ -970,6 +1028,7 @@ comptime let SIZE: int = double(21)
 
     #[test]
     fn comptime_function_chains_with_env() {
+        let _guard = lock_env();
         // `comptime def` can compose with `env()`, demonstrating that the
         // user-defined function and the built-in lookups share a single
         // evaluator scope.

@@ -259,7 +259,7 @@ DB_URL: str = "postgresql://..."
 
 ### `comptime def` functions
 
-A `comptime def` declares a function that the evaluator can call from a `comptime let` initialiser. The function name is registered at build time; its body must be a single `return EXPR` statement (optionally preceded by a docstring), and the expression follows the same rules as any other comptime RHS — literals, arithmetic, string concatenation, `env()` / `int()` / `str()` / `float()` calls, parameter references, and calls to other `comptime def` functions.
+A `comptime def` declares a function that the evaluator can call from a `comptime let` initialiser. The function name is registered at build time; the body can mix `return` with local bindings (`x = EXPR`, `let x: T = EXPR`, `mut x: T = EXPR`) and `if` / `elif` / `else` branches. Expressions follow the same rules as any other comptime RHS — literals, arithmetic, string concatenation, comparisons, boolean ops, ternaries, `env()` / `int()` / `str()` / `float()` calls, parameter references, and calls to other `comptime def` functions. The full statement and expression grammar is enumerated in the "v1 contract" section below.
 
 ```python
 # Typhon

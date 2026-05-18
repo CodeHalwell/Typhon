@@ -26,6 +26,7 @@
 //! (`pip install mypy` or `uv tool install mypy`). The command surfaces a
 //! clear "mypy not found" message when the subprocess fails to start.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -81,15 +82,24 @@ pub fn run(args: StubtestArgs) -> Result<()> {
         ));
     }
 
-    // Same directory-resolution dance as `tyc ty`: relative paths anchor
-    // against the project root so a stubtest run from elsewhere agrees
-    // with the build about where the artefacts live.
+    // Canonicalise the project path up front so every downstream
+    // computation (build out_dir, subprocess cwd, PYTHONPATH) sees the
+    // same absolute root. Without this, a relative `--out` would be
+    // joined against `args.path` here AND re-anchored by `tyc build`,
+    // producing a duplicated path like
+    // `<root>/<project_path>/<project_path>/build`. Resolving once
+    // matches the behaviour of `tyc build`'s own resolution.
+    let project_root = args
+        .path
+        .canonicalize()
+        .map_err(|e| miette!("cannot resolve project path '{}': {e}", args.path.display()))?;
+
     let (out_dir, _tempdir_guard) = match (&args.out, args.no_build) {
         (Some(dir), _) => {
             let resolved = if dir.is_absolute() {
                 dir.clone()
             } else {
-                args.path.join(dir)
+                project_root.join(dir)
             };
             (resolved, None)
         }
@@ -103,8 +113,11 @@ pub fn run(args: StubtestArgs) -> Result<()> {
     };
 
     if !args.no_build {
+        // Pass the already-absolute `out_dir` into `tyc build` so its own
+        // resolution stays a no-op (an absolute --out short-circuits the
+        // project_root.join in build.rs).
         build::run(BuildArgs {
-            path: args.path.clone(),
+            path: project_root.clone(),
             out: Some(out_dir.clone()),
             no_format: false,
         })?;
@@ -127,7 +140,7 @@ pub fn run(args: StubtestArgs) -> Result<()> {
 
     let mut failures: Vec<String> = Vec::new();
     for module in &stubs {
-        match run_stubtest_for_module(&args, &out_dir, module) {
+        match run_stubtest_for_module(&args, &project_root, &out_dir, module) {
             Ok(()) => {}
             Err(e) => {
                 if args.keep_going {
@@ -153,18 +166,36 @@ pub fn run(args: StubtestArgs) -> Result<()> {
 }
 
 /// Invoke `python -m mypy.stubtest <module>` with `PYTHONPATH` pointing at
-/// the build output directory. The stubtest tool prints its findings to
-/// stdout/stderr directly; this function only checks the exit status and
-/// surfaces a structured error.
-fn run_stubtest_for_module(args: &StubtestArgs, out_dir: &Path, module: &str) -> Result<()> {
+/// the build output directory and the working directory anchored at the
+/// project root so mypy picks up `mypy.ini` / `pyproject.toml` from the
+/// project rather than the caller's cwd and any relative `--allowlist`
+/// path forwarded via `stubtest_args` resolves against the project too.
+///
+/// Captures stdout/stderr so we can distinguish "stubtest found drift"
+/// from "stubtest itself failed to start" — the most common case being a
+/// missing `mypy` install, which surfaces as `No module named mypy` on
+/// stderr. Either way the captured output is streamed to the parent
+/// stdio so the user sees stubtest's diagnostics verbatim.
+fn run_stubtest_for_module(
+    args: &StubtestArgs,
+    project_root: &Path,
+    out_dir: &Path,
+    module: &str,
+) -> Result<()> {
     let mut cmd = Command::new(&args.python);
     cmd.arg("-m").arg("mypy.stubtest").arg(module);
     for extra in &args.stubtest_args {
         cmd.arg(extra);
     }
+    // Anchor the subprocess at the project root. Mirrors `tyc ty`'s
+    // behaviour so mypy/stubtest discover the project's config and any
+    // relative paths forwarded via `--` resolve where the user expects.
+    cmd.current_dir(project_root);
     // Prepend the build directory to PYTHONPATH so the just-emitted
     // module shadows any installed copy with the same name. Appending
     // instead would let an installed package mask the local build.
+    // `out_dir` is absolute by construction (see `run`), so the cwd
+    // change above doesn't affect resolution.
     let existing = std::env::var("PYTHONPATH").unwrap_or_default();
     let joined = if existing.is_empty() {
         out_dir.display().to_string()
@@ -173,7 +204,7 @@ fn run_stubtest_for_module(args: &StubtestArgs, out_dir: &Path, module: &str) ->
     };
     cmd.env("PYTHONPATH", joined);
 
-    let status = cmd.status().map_err(|e| match e.kind() {
+    let output = cmd.output().map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => miette!(
             "`{}` not found on PATH — install Python (or pass --python to point at \
              your interpreter)",
@@ -185,14 +216,38 @@ fn run_stubtest_for_module(args: &StubtestArgs, out_dir: &Path, module: &str) ->
         ),
     })?;
 
-    if !status.success() {
+    // Echo the subprocess output to the user's terminal verbatim so
+    // stubtest's diagnostics are preserved even though we captured them.
+    let _ = std::io::stdout().write_all(&output.stdout);
+    let _ = std::io::stderr().write_all(&output.stderr);
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    // Map the most common "not actually drift" failure mode (mypy not
+    // installed in the chosen interpreter) to a clearer error so the
+    // help-text guidance to `pip install mypy` is reliable. Python
+    // surfaces this as `No module named mypy` or, for older builds,
+    // `Error while finding module specification for 'mypy.stubtest'`.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("No module named 'mypy'")
+        || stderr.contains("No module named mypy")
+        || stderr.contains("mypy.stubtest") && stderr.contains("ModuleNotFoundError")
+    {
         return Err(miette!(
-            "`{} -m mypy.stubtest {module}` reported drift (exit {})",
+            "`{}` cannot import `mypy.stubtest` — install mypy in this interpreter \
+             (`{} -m pip install mypy`) or pass `--python` to one that has it",
             args.python,
-            status.code().unwrap_or(-1)
+            args.python,
         ));
     }
-    Ok(())
+
+    Err(miette!(
+        "`{} -m mypy.stubtest {module}` reported drift (exit {})",
+        args.python,
+        output.status.code().unwrap_or(-1)
+    ))
 }
 
 /// Walk `out_dir` recursively and return the Python import path of every
