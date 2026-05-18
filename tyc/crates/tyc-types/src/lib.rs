@@ -253,11 +253,7 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
         // diagnostic from FINDINGS #33 because the RHS infers as
         // `Generic("list", [Unknown])` but the annotation is
         // `Class("list")`.
-        (Type::Class(en), Type::Generic(an, _))
-            if en == an && is_bare_container_name(en) =>
-        {
-            true
-        }
+        (Type::Class(en), Type::Generic(an, _)) if en == an && is_bare_container_name(en) => true,
         (a, b) => a == b,
     }
 }
@@ -1832,8 +1828,8 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             // Pydantic models, and the lazy/builtin-extend stubs — those
             // legitimately carry method definitions inside the class body.
             let class_name = cd.name.as_str();
-            let is_pseudo = class_name.starts_with("__typhon_")
-                || class_name.starts_with("__TyphonLazy_");
+            let is_pseudo =
+                class_name.starts_with("__typhon_") || class_name.starts_with("__TyphonLazy_");
             let is_protocol = class_inherits_protocol(cd);
             // Mirror the desugar pass's heuristic: a `model X:` becomes
             // `class X(BaseModel):` after preprocess. Looking for any
@@ -2015,15 +2011,14 @@ fn enforce_annotation_rule(
                 pwd.parameter.range.start().to_usize(),
                 pwd.parameter.range.start().to_usize() + pname.len(),
             );
-            c.diagnostics
-                .push_error(TycError::missing_annotation(
-                    function.to_owned(),
-                    format!("parameter `{}`", pname),
-                    c.path.clone(),
-                    c.source,
-                    span.0,
-                    pname.len().max(1),
-                ));
+            c.diagnostics.push_error(TycError::missing_annotation(
+                function.to_owned(),
+                format!("parameter `{}`", pname),
+                c.path.clone(),
+                c.source,
+                span.0,
+                pname.len().max(1),
+            ));
         }
     }
     for pwd in parameters.kwonlyargs.iter() {
@@ -2033,15 +2028,14 @@ fn enforce_annotation_rule(
                 pwd.parameter.range.start().to_usize(),
                 pwd.parameter.range.start().to_usize() + pname.len(),
             );
-            c.diagnostics
-                .push_error(TycError::missing_annotation(
-                    function.to_owned(),
-                    format!("parameter `{}`", pname),
-                    c.path.clone(),
-                    c.source,
-                    span.0,
-                    pname.len().max(1),
-                ));
+            c.diagnostics.push_error(TycError::missing_annotation(
+                function.to_owned(),
+                format!("parameter `{}`", pname),
+                c.path.clone(),
+                c.source,
+                span.0,
+                pname.len().max(1),
+            ));
         }
     }
 
@@ -2163,8 +2157,8 @@ fn check_if(c: &mut Checker, i: &ruff_python_ast::StmtIf) {
     let snap_pre = c.env.snapshot();
     apply_narrowings(c, &neg);
     check_elif_else_clauses(c, &i.elif_else_clauses);
-    let elif_exits = !i.elif_else_clauses.is_empty()
-        && elif_else_chain_always_exits(&i.elif_else_clauses);
+    let elif_exits =
+        !i.elif_else_clauses.is_empty() && elif_else_chain_always_exits(&i.elif_else_clauses);
     c.env.restore(snap_pre);
 
     // Flow-sensitive narrowing: if every branch we've examined ends in

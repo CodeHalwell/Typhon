@@ -179,9 +179,7 @@ fn rewrite_line(
             // type checker sees the intended mutability. Unreassigned
             // names are left untouched — the user can pick `let` after
             // adding an annotation. This closes FINDINGS #22.
-            if reassigned.contains(&name)
-                && !body.starts_with("let ")
-                && !body.starts_with("mut ")
+            if reassigned.contains(&name) && !body.starts_with("let ") && !body.starts_with("mut ")
             {
                 body = format!("mut {body}");
             }

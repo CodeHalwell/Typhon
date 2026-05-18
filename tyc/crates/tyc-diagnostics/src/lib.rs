@@ -325,7 +325,9 @@ pub enum TycError {
     /// the method (Python allows it), so this is surfaced as a warning to
     /// nudge users toward the recommended `impl` form without breaking
     /// existing code. Promotion to error is a separate v0.2 decision.
-    #[error("method `{method}` defined inside `class {class}:` body — methods live in `impl {class}:`")]
+    #[error(
+        "method `{method}` defined inside `class {class}:` body — methods live in `impl {class}:`"
+    )]
     #[diagnostic(
         code(tyc::method_in_class_body),
         help("move the method into an `impl {class}:` block at the same scope (multiple `impl` blocks for one class are merged at desugar)")
