@@ -997,7 +997,9 @@ fn init_with_explicit_name_uses_given_name() {
         .status()
         .unwrap();
     assert!(status.success());
-    let toml = std::fs::read_to_string(sub.join("typhon.toml")).unwrap();
+    // `tyc init NAME --dir DIR` scaffolds into `DIR/NAME/`, matching
+    // `cargo new NAME` / `bun init NAME` / `uv init NAME` conventions.
+    let toml = std::fs::read_to_string(sub.join("specific").join("typhon.toml")).unwrap();
     assert!(
         toml.contains("specific"),
         "explicit name should win over dir name; got:\n{toml}"
@@ -1012,7 +1014,11 @@ fn init_main_ty_compiles_via_check() {
         .arg(tmp.path())
         .status()
         .unwrap();
-    let status = tyc().arg("check").arg(tmp.path()).status().unwrap();
+    let status = tyc()
+        .arg("check")
+        .arg(tmp.path().join("demo"))
+        .status()
+        .unwrap();
     assert!(
         status.success(),
         "scaffolded project should type-check out of the box"
@@ -1028,10 +1034,11 @@ fn init_main_ty_builds_to_valid_python() {
         .arg(tmp.path())
         .status()
         .unwrap();
-    let status = tyc().arg("build").arg(tmp.path()).status().unwrap();
+    let project = tmp.path().join("demo");
+    let status = tyc().arg("build").arg(&project).status().unwrap();
     assert!(status.success(), "scaffolded project should build");
     let out = Command::new(py)
-        .arg(tmp.path().join("build").join("main.py"))
+        .arg(project.join("build").join("main.py"))
         .output()
         .unwrap();
     assert!(

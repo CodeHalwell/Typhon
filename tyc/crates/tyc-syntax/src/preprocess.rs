@@ -2821,9 +2821,13 @@ fn render_chain(chain: &WithChain, chain_indent: &str, counter: &mut usize) -> S
 
         match (&chain.err_var, !chain.else_body.is_empty()) {
             (Some(name), true) => {
-                // Bind `err = tmp.error` at one indent past the guard,
-                // using the detected unit indent.
+                // Bind `let err = tmp.error` at one indent past the guard,
+                // using the detected unit indent. The `let` keyword is
+                // required so the resolver records it as an immutable
+                // local rather than tripping Rule-2's
+                // `tyc::missing_binding_kind` on the user-visible name.
                 out.push_str(&inner_indent);
+                out.push_str("let ");
                 out.push_str(name);
                 out.push_str(" = ");
                 out.push_str(&tmp);
@@ -2844,7 +2848,13 @@ fn render_chain(chain: &WithChain, chain_indent: &str, counter: &mut usize) -> S
             }
         }
 
+        // Emit the user-visible unwrap as `let NAME = tmp.value` so the
+        // resolver sees an explicit binding-kind keyword. Without `let`
+        // here, Rule-2's `tyc::missing_binding_kind` would fire on the
+        // lowered statement (and the diagnostic would point at the
+        // synthesised line rather than the user's `with` source).
         out.push_str(chain_indent);
+        out.push_str("let ");
         out.push_str(&binding.target);
         out.push_str(" = ");
         out.push_str(&tmp);
@@ -3103,30 +3113,25 @@ fn render_gather_block(
                 out.push_str(", ");
             }
             out.push_str("return_exceptions=True)\n");
-            // Tuple-unpack the results into the user-named bindings. With a
-            // single binding we still need a trailing comma so Python performs
-            // sequence unpacking (`x, = results`) rather than binding the
-            // whole list to one name (`x = results`).
-            //
-            // We deliberately do NOT prefix `let` here: tuple-destructuring
-            // is not currently supported with a Typhon binding-kind
-            // keyword, and `declare_target`'s recursion into tuple
-            // patterns already declares the names. The Rule-2 enforcement
-            // in `declare_target` only fires on bare `Expr::Name` targets,
-            // so a tuple unpack is safe.
-            out.push_str(header_indent);
+            // Index each result into a `let NAME = __typhon_gather_N__[i]`
+            // line so every user-visible binding carries an explicit
+            // binding-kind keyword. We deliberately avoid emitting the
+            // earlier tuple-destructure form (`a, b = results`) because
+            // Rule-2's `tyc::missing_binding_kind` enforcement would fire
+            // on the synthesised target without a way for the user to
+            // add `let` themselves (the `gather:` block keyword is the
+            // closest surface form, and that exception only applies to
+            // the strict TaskGroup lowering today).
             for (idx, b) in bindings.iter().enumerate() {
-                if idx > 0 {
-                    out.push_str(", ");
-                }
+                out.push_str(header_indent);
+                out.push_str("let ");
                 out.push_str(&b.name);
+                out.push_str(" = ");
+                out.push_str(&results);
+                out.push('[');
+                out.push_str(&idx.to_string());
+                out.push_str("]\n");
             }
-            if bindings.len() == 1 {
-                out.push(',');
-            }
-            out.push_str(" = ");
-            out.push_str(&results);
-            out.push('\n');
         }
     }
     out
@@ -3164,7 +3169,12 @@ pub fn expand_go_calls(source: &str) -> String {
         if let Some(rest) = body.strip_prefix("go ") {
             if let Some((call_expr, handle)) = parse_go_call(rest) {
                 if let Some(handle) = handle {
+                    // Emit `let handle = …` so the user-visible task
+                    // identifier carries an explicit binding-kind keyword
+                    // and Rule-2's `tyc::missing_binding_kind` doesn't
+                    // fire on the synthesised assignment.
                     out.push_str(indent);
+                    out.push_str("let ");
                     out.push_str(&handle);
                     out.push_str(" = typhon_runtime.tasks.spawn(");
                     out.push_str(&call_expr);
@@ -4452,9 +4462,15 @@ def run() -> Result[str, str]:
             out.contains("if isinstance(__typhon_with_0__, Err):"),
             "out:\n{out}"
         );
-        assert!(out.contains("err = __typhon_with_0__.error"), "out:\n{out}");
+        assert!(
+            out.contains("let err = __typhon_with_0__.error"),
+            "out:\n{out}"
+        );
         assert!(out.contains("return Err(err)"), "out:\n{out}");
-        assert!(out.contains("x = __typhon_with_0__.value"), "out:\n{out}");
+        assert!(
+            out.contains("let x = __typhon_with_0__.value"),
+            "out:\n{out}"
+        );
         assert!(out.contains("return Ok(x)"), "out:\n{out}");
     }
 
@@ -4470,9 +4486,9 @@ def run() -> Result[str, str]:
 ";
         let out = expand_with_chains(src);
         assert!(out.contains("__typhon_with_0__ = f()"), "out:\n{out}");
-        assert!(out.contains("a = __typhon_with_0__.value"), "out:\n{out}");
+        assert!(out.contains("let a = __typhon_with_0__.value"), "out:\n{out}");
         assert!(out.contains("__typhon_with_1__ = g(a)"), "out:\n{out}");
-        assert!(out.contains("b = __typhon_with_1__.value"), "out:\n{out}");
+        assert!(out.contains("let b = __typhon_with_1__.value"), "out:\n{out}");
     }
 
     #[test]
@@ -4507,7 +4523,7 @@ def run() -> Result[str, str]:
 ";
         let out = expand_with_chains(src);
         assert!(
-            out.contains("_err = __typhon_with_0__.error"),
+            out.contains("let _err = __typhon_with_0__.error"),
             "out:\n{out}"
         );
         assert!(out.contains("return Err(\"oops\")"), "out:\n{out}");
@@ -5015,8 +5031,8 @@ def run() -> Result[str, str]:
             "create_task call missing: {out}"
         );
         assert!(
-            out.contains("user = __typhon_gather"),
-            "user binding missing: {out}"
+            out.contains("let user = __typhon_gather"),
+            "user binding missing or unbound by `let`: {out}"
         );
     }
 
@@ -5032,9 +5048,19 @@ def run() -> Result[str, str]:
             out.contains("return_exceptions=True"),
             "return_exceptions flag missing: {out}"
         );
-        // Tuple destructure of the result vector should land in the
-        // user-named bindings.
-        assert!(out.contains("a, b = "), "destructure missing: {out}");
+        // Each user binding is indexed out of the results vector with an
+        // explicit `let` so Rule-2's `tyc::missing_binding_kind` doesn't
+        // fire on the lowered statements.
+        assert!(
+            out.contains("let a = __typhon_gather"),
+            "let a indexed binding missing: {out}"
+        );
+        assert!(
+            out.contains("let b = __typhon_gather"),
+            "let b indexed binding missing: {out}"
+        );
+        assert!(out.contains("[0]"), "index 0 missing: {out}");
+        assert!(out.contains("[1]"), "index 1 missing: {out}");
     }
 
     #[test]
@@ -5061,8 +5087,8 @@ def run() -> Result[str, str]:
     fn go_call_with_handle_binds_task() {
         let out = expand_go_calls("async def f():\n    go fetch(x) -> fut\n");
         assert!(
-            out.contains("fut = typhon_runtime.tasks.spawn(fetch(x))"),
-            "handle binding missing: {out}"
+            out.contains("let fut = typhon_runtime.tasks.spawn(fetch(x))"),
+            "handle binding missing or unbound by `let`: {out}"
         );
     }
 

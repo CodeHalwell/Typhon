@@ -1522,6 +1522,14 @@ code changes from me — this is a pure stress-test pass).
 
 ## 37. `with`-chain bindings emit without `let`, fail Rule 2 (bug, critical)
 
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. The
+`render_chain` desugarer in `tyc-syntax/src/preprocess.rs` now prefixes
+both the success unwrap (`let NAME = __typhon_with_N__.value`) and the
+`else err:` error binding (`let err = __typhon_with_N__.error`) with
+explicit `let` keywords so the resolver records them as immutable
+locals. Verified end-to-end: the cheat-sheet `with x = f()?:` example
+now `tyc check`s clean and produces runnable Python.
+
 **Severity:** bug — critical; regression caused by Rule 2 enforcement
 shipping in `claude/fix-findings-diagnostics-hYj8K` without updating
 the `with`-chain desugarer.
@@ -1559,6 +1567,14 @@ are already exempted from Rule 2; the user-visible `NAME` is not.
 
 ## 38. Best-effort `gather:` tuple destructure missing `let` (bug, critical)
 
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. The
+best-effort `gather` lowering in `render_gather_block` no longer emits a
+tuple destructure (`a, b = __typhon_gather_N__`); instead each binding
+is indexed into its own `let NAME = __typhon_gather_N__[i]` statement.
+This matches the strict-gather form's per-binding shape and side-steps
+Rule-2's `tyc::missing_binding_kind` cleanly. Verified at runtime — the
+example program now builds and prints `1 2`.
+
 **Severity:** bug — same family as #37; Rule 2 catches the synthesised
 destructure.
 
@@ -1586,6 +1602,12 @@ the best-effort path.
 ---
 
 ## 39. `go fn() -> task` emits without `let` (bug)
+
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. The
+`expand_go_calls` pass now emits `let NAME = typhon_runtime.tasks.spawn(...)`
+when a `-> handle` is supplied. The bare `go f(x)` form is unchanged
+(no user-visible target to declare). Verified end-to-end via `tyc build`
+and a runtime `await`.
 
 **Severity:** bug — same family as #37/#38.
 
