@@ -235,6 +235,18 @@ the "PEP 695 only" generics story.
 
 ## 4. `gather(strategy="best-effort")` lowering breaks scope (bug)
 
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. The real bug
+turned out to be in `tyc-resolve`: `declare_target` only declared
+names for `Expr::Name` targets, so a tuple-destructuring assignment
+(`a, b = expr`) emitted by the best-effort `gather:` lowering left
+`a` and `b` undeclared. Taught `declare_target` to recurse into
+`Expr::Tuple` / `Expr::List` / `Expr::Starred` so destructured
+bindings register properly. Both the strict and best-effort gather
+forms now work end-to-end; the underlying improvement also makes
+hand-written `let a, b = ...` style destructuring resolve correctly.
+The follow-up span-fidelity concern (Finding #20) goes away because
+the diagnostic no longer fires.
+
 **Severity:** bug — emitter produces code the resolver rejects.
 
 Source:
@@ -711,6 +723,14 @@ rule from Ruff. Either preprocess `def NAME(args) -> T<NEWLINE>` inside
 ---
 
 ## 20. Best-effort `gather:` lowering produces bad source spans (papercut)
+
+**Status:** **FIXED (by #4)** on `claude/update-findings-IdfrH`. The
+span-fidelity problem only existed because the resolver was emitting
+a diagnostic on the lowered code. With #4's `declare_target` fix the
+diagnostic no longer fires at all, so there's nothing whose span
+needs remapping. If a future lowering reintroduces resolver-visible
+synthetic code, the `.py.map` would need to be consulted by the
+resolver and type-checker — a meaningful refactor.
 
 **Severity:** papercut — diagnostic shows lowered Python, not original Typhon.
 
