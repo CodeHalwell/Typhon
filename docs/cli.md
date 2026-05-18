@@ -20,6 +20,7 @@ Typhon ships a single binary, `tyc`, that handles every stage of the workflow. S
 | `tyc stubtest` | Build the project and run `python -m mypy.stubtest` against every emitted `.pyi` stub. Complements `tyc check --stubs` (which performs an AST diff) by catching dynamically-created attributes the AST cannot see. Requires `mypy` in the chosen interpreter (`pip install mypy`). |
 | `tyc repl` | Interactive Typhon evaluator. Reads `.ty` source one block at a time, compiles it through the full pipeline, and executes the result with a Python interpreter. |
 | `tyc debug` | Build the project and launch the emitted Python under a debugger (default `pdb`). Thin v1 wrapper — a Typhon-native source-mapping debugger is a Phase-5 item. |
+| `tyc run` | Build the project and execute the emitted Python in one step. `--temp` builds into a tempdir that is removed on exit — the "tyx in-memory" mode for quick iteration. |
 | `tyc add` / `tyc remove` / `tyc sync` | Lightweight package-manager surface over `uv`: rewrite `[dependencies]` / `[dev-dependencies]` in `typhon.toml` and run `uv sync` to install. |
 
 ## Typical workflow
@@ -163,6 +164,41 @@ tyc debug -- --verbose --port 8080
 | `--python PATH` | Python interpreter (default `python3`) |
 | `--debugger MODULE` | Module to launch under `python -m` (default `pdb`; e.g. `pudb`, `ipdb`, `debugpy`) |
 | `--no-build` | Skip rebuilding; assume `build/` is current |
+
+## `tyc run`
+
+Builds the project and execs the emitted Python in a single step — the same shape as `tsx`/`ts-node` for TypeScript. Typhon has no separate VM: this is a UX shortcut around the standard `tyc build && python build/main.py` flow, not a new execution model.
+
+Two output modes:
+
+- **Persistent (default).** Builds into the configured `out` dir (default `build/`). Subsequent runs reuse the incremental Salsa cache, and `.py.map` sidecars remain on disk so a post-crash `tyc trace` can map frames back to `.ty`.
+- **`--temp` (`-t`).** Builds into a fresh `tempfile::tempdir()` that is deleted when `tyc run` exits. No project artifacts persist. Trades the incremental cache and on-disk source map for a clean tree — ideal for one-shot iteration.
+
+The script's exit code propagates verbatim, so shell pipelines see the child's status unchanged. Build failures and spawn failures surface as the usual miette errors with exit code 1.
+
+```bash
+# Compile-and-go, persistent build/:
+tyc run
+
+# Forward args to the script after `--`:
+tyc run -- --port 8080 ./input.csv
+
+# Ephemeral build — leaves no artifacts behind:
+tyc run --temp -- --port 8080
+
+# Different entry point in a multi-binary project:
+tyc run --entry api.py
+
+# Reuse the existing build/ without rebuilding:
+tyc run --no-build
+```
+
+| Flag | Purpose |
+|------|---------|
+| `--entry FILE` | Entry-point file relative to the build dir (default `main.py`) |
+| `--python PATH` | Python interpreter (default `python3`) |
+| `--temp` / `-t` | Build into a tempdir that is deleted on exit; mutually exclusive with `--no-build` |
+| `--no-build` | Skip rebuilding; assume the persistent `build/` is current |
 
 ## `tyc add` / `tyc remove` / `tyc sync`
 

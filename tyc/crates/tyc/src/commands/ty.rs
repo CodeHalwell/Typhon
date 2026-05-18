@@ -416,9 +416,18 @@ mod tests {
     }
 
     #[test]
-    fn watch_falls_back_to_src_when_no_config_file() {
+    fn watch_uses_default_src_when_typhon_toml_omits_src() {
+        // A typhon.toml that omits `[project] src` falls back to the
+        // default `src = "src"` — the same observable behaviour as a
+        // project with no toml at all.  We plant the toml inside the
+        // tempdir (rather than testing the truly "no toml anywhere"
+        // branch) so `TyphonConfig::load`'s ancestor walk terminates
+        // here, instead of escaping upward and latching onto a stray
+        // `/tmp/typhon.toml` the host filesystem might carry — which
+        // would otherwise resolve to `/tmp/src` and fail the assertion.
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("typhon.toml"), "[project]\nname = \"t\"\n").unwrap();
         let resolved = resolve_watched_src_dir(tmp.path()).unwrap();
         assert_eq!(resolved, tmp.path().join("src"));
     }

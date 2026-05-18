@@ -91,6 +91,13 @@ pub enum Commands {
     /// v1 thin wrapper that runs `python -m pdb build/main.py`. A full
     /// source-mapping Typhon-native debugger is a Phase-5 item.
     Debug(commands::debug::DebugArgs),
+
+    /// Build the project and execute the emitted Python in one step.
+    ///
+    /// Mirrors how `tsx`/`ts-node` hide the TypeScript compile step.
+    /// Use `--temp` for an ephemeral build that leaves no artifacts on
+    /// disk — the "tyx in-memory" mode for quick iteration.
+    Run(commands::run::RunArgs),
 }
 
 /// Entry point called from `main`.
@@ -110,6 +117,7 @@ pub fn run() -> Result<()> {
         Commands::Stubtest(args) => commands::stubtest::run(args),
         Commands::Repl(args) => commands::repl::run(args),
         Commands::Debug(args) => commands::debug::run(args),
+        Commands::Run(args) => commands::run::run(args),
         Commands::Add(args) => commands::deps::run_add(args),
         Commands::Remove(args) => commands::deps::run_remove(args),
         Commands::Sync(args) => commands::deps::run_sync(args),
