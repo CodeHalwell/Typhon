@@ -48,6 +48,12 @@ pub struct DesugarOptions {
     /// from the purity analyser when the user opts into `@memo` /
     /// `@pure(memo=True)` / `[strictness] auto-memoise = true`.
     pub memoise_functions: Vec<String>,
+    /// Byte offsets (start of the line) at which a `class!` declaration
+    /// appears in the *preprocessed* source.  A class whose `TextRange`
+    /// starts at or just after one of these offsets is treated as raw and
+    /// the `@dataclass` decorator injection is skipped.  Populated from
+    /// the preprocessor's `raw_class_lines` via `line_byte_starts`.
+    pub raw_class_line_starts: Vec<u32>,
 }
 
 /// Desugar a Typhon module AST into a plain Python AST.
@@ -709,7 +715,7 @@ fn expr_uses_asyncio_qualified(expr: &Expr) -> bool {
 // ── module-level desugaring ──────────────────────────────────────────────────
 
 fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule {
-    let (new_body, transformed_classes) = desugar_stmts(&m.body);
+    let (new_body, transformed_classes) = desugar_stmts(&m.body, &options.raw_class_line_starts);
 
     // Merge `impl` pseudo-classes into their target classes and remove the stubs.
     let (merged_body, _) = merge_impl_blocks(new_body);
@@ -933,12 +939,12 @@ fn import_insert_pos(body: &[Stmt]) -> usize {
 
 /// Desugar a list of statements, returning the transformed list and whether
 /// any class was modified at any nesting depth.
-fn desugar_stmts(stmts: &[Stmt]) -> (Vec<Stmt>, bool) {
+fn desugar_stmts(stmts: &[Stmt], raw_class_starts: &[u32]) -> (Vec<Stmt>, bool) {
     let mut any_transformed = false;
     let new_stmts = stmts
         .iter()
         .map(|stmt| {
-            let (new_stmt, transformed) = desugar_stmt(stmt);
+            let (new_stmt, transformed) = desugar_stmt(stmt, raw_class_starts);
             if transformed {
                 any_transformed = true;
             }
@@ -950,10 +956,16 @@ fn desugar_stmts(stmts: &[Stmt]) -> (Vec<Stmt>, bool) {
 
 /// Desugar a single statement, recursing into any nested statement lists.
 /// Returns the (possibly modified) statement and whether any class was
-/// transformed at this level or deeper.
-fn desugar_stmt(stmt: &Stmt) -> (Stmt, bool) {
+/// transformed at this level or deeper.  `raw_class_starts` is the list
+/// of preprocessed-source byte offsets where a `class!` was declared;
+/// classes whose `TextRange` starts at one of those offsets are emitted
+/// without the automatic `@dataclass` decorator.
+fn desugar_stmt(stmt: &Stmt, raw_class_starts: &[u32]) -> (Stmt, bool) {
     match stmt {
         Stmt::ClassDef(c) => {
+            let is_raw = raw_class_starts
+                .binary_search(&u32::from(c.range.start()))
+                .is_ok();
             let is_pydantic = class_inherits_basemodel(c);
             // `impl` pseudo-classes (`__typhon_impl_*`) are temporary stubs
             // that will be merged into their target class by `merge_impl_blocks`;
@@ -970,7 +982,8 @@ fn desugar_stmt(stmt: &Stmt) -> (Stmt, bool) {
             // Skip the dataclass decorator for Pydantic model classes,
             // Protocol classes, and lazy proxies; they already carry the
             // right shape.
-            let needs_decorator = !is_pydantic
+            let needs_decorator = !is_raw
+                && !is_pydantic
                 && !is_protocol
                 && !is_impl_stub
                 && !is_lazy_proxy
@@ -979,7 +992,7 @@ fn desugar_stmt(stmt: &Stmt) -> (Stmt, bool) {
             // as their first body statement unless the user already defined it.
             let needs_model_config =
                 is_pydantic && !is_impl_stub && !has_model_config_stmt(&c.body);
-            let (new_body, body_transformed) = desugar_stmts(&c.body);
+            let (new_body, body_transformed) = desugar_stmts(&c.body, raw_class_starts);
             let mut new_class = c.clone();
             new_class.body = new_body;
             if needs_decorator {
@@ -1013,7 +1026,7 @@ fn desugar_stmt(stmt: &Stmt) -> (Stmt, bool) {
             )
         }
         Stmt::FunctionDef(f) => {
-            let (new_body, transformed) = desugar_stmts(&f.body);
+            let (new_body, transformed) = desugar_stmts(&f.body, raw_class_starts);
             let mut new_f = f.clone();
             new_f.body = new_body;
             (Stmt::FunctionDef(new_f), transformed)
@@ -1499,6 +1512,38 @@ mod tests {
             "output:\n{out}"
         );
         assert!(out.contains("import dataclasses"), "output:\n{out}");
+    }
+
+    #[test]
+    fn raw_class_skips_dataclass_decorator() {
+        // Simulate the preprocessor output: `class!` is stripped to `class`
+        // and the line index is recorded in `raw_class_line_starts`.  The
+        // desugar pass should leave the class alone — no `@dataclass`, no
+        // injected `import dataclasses`.
+        let src = "class MyModel:\n    name: str\n";
+        let parsed = tyc_syntax::parse_module(src).expect("parse failed");
+        let module = parsed.into_syntax();
+        let class_start = match &module.body[0] {
+            Stmt::ClassDef(c) => u32::from(c.range.start()),
+            _ => panic!("expected class def"),
+        };
+        let out = desugar_module_with(
+            &module,
+            DesugarOptions {
+                memoise_functions: Vec::new(),
+                raw_class_line_starts: vec![class_start],
+            },
+        );
+        let emitted = emit(&out.module);
+        assert!(
+            !emitted.contains("@dataclasses.dataclass"),
+            "raw class must not receive @dataclass:\n{emitted}"
+        );
+        assert!(
+            !emitted.contains("import dataclasses"),
+            "raw class must not trigger dataclasses import:\n{emitted}"
+        );
+        assert!(emitted.contains("class MyModel:"), "output:\n{emitted}");
     }
 
     #[test]

@@ -83,7 +83,12 @@ impl Emitter {
     /// `\n` bytes.  Used to enforce PEP 8's two-blank-line rule around
     /// top-level class/def blocks (two blanks = three trailing `\n`).
     fn ensure_trailing_newlines(&mut self, count: usize) {
-        let trailing = self.output.bytes().rev().take_while(|&b| b == b'\n').count();
+        let trailing = self
+            .output
+            .bytes()
+            .rev()
+            .take_while(|&b| b == b'\n')
+            .count();
         for _ in trailing..count {
             self.newline();
         }
@@ -1576,16 +1581,8 @@ mod tests {
         let src =
             "class A:\n    def foo(self) -> None:\n        pass\n    def bar(self) -> None:\n        pass\n";
         let out = round_trip(src);
-        assert!(
-            out.contains("def foo"),
-            "missing foo: {}",
-            out
-        );
-        assert!(
-            out.contains("def bar"),
-            "missing bar: {}",
-            out
-        );
+        assert!(out.contains("def foo"), "missing foo: {}", out);
+        assert!(out.contains("def bar"), "missing bar: {}", out);
         assert!(
             !out.contains("\n\n\n    def bar"),
             "methods must not get two blank lines between them, got: {:?}",

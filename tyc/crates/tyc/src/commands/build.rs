@@ -29,7 +29,7 @@ use tyc_emit::{emit_python_with_line_offsets, emit_stub};
 use tyc_format::format_source;
 use tyc_syntax::preprocess::{
     expand_gather_blocks, expand_go_calls, expand_lazy_imports, expand_pipes, expand_question_ops,
-    expand_with_chains, preprocess,
+    expand_with_chains, line_byte_starts, preprocess,
 };
 
 use crate::commands::util::{apply_strictness, collect_dty_files, collect_ty_files};
@@ -306,10 +306,12 @@ pub fn run(args: BuildArgs) -> Result<()> {
             }
         }
 
+        let raw_class_line_starts = line_byte_starts(&prep.python_source, &prep.raw_class_lines);
         let desugar_output = desugar_module_with(
             &module,
             DesugarOptions {
                 memoise_functions: memoise_targets,
+                raw_class_line_starts,
             },
         );
         if desugar_output.needs_typhon_runtime {
@@ -384,7 +386,14 @@ pub fn run(args: BuildArgs) -> Result<()> {
         let module = tyc_syntax::parse_module(&prep.python_source)
             .map(|p| p.into_syntax())
             .map_err(|e| miette!("parse error in '{}': {e}", path.display()))?;
-        let desugar = desugar_module_with(&module, DesugarOptions::default());
+        let raw_class_line_starts = line_byte_starts(&prep.python_source, &prep.raw_class_lines);
+        let desugar = desugar_module_with(
+            &module,
+            DesugarOptions {
+                memoise_functions: Vec::new(),
+                raw_class_line_starts,
+            },
+        );
         let stub_text = emit_stub(&desugar.module);
 
         let rel = path

@@ -100,6 +100,43 @@ pub struct PreprocessResult {
     /// indices can be used by downstream passes (resolver, type checker)
     /// to locate the corresponding `if True:` statement in the parsed AST.
     pub unsafe_lines: Vec<usize>,
+    /// 0-based line indices on which a `class!` (raw class) declaration
+    /// appears.  The preprocessor strips the `!` so the Python parser sees
+    /// a plain `class Foo:`; downstream passes consult this list to know
+    /// the class should NOT receive a `@dataclass` decorator at desugar
+    /// time.
+    pub raw_class_lines: Vec<usize>,
+}
+
+/// Convert a list of 0-based line indices into byte offsets pointing at
+/// the first non-whitespace character on each line of `source`.  The
+/// returned vector is sorted so callers can binary-search it.  Mirrors
+/// the private `unsafe_byte_starts` helper in `tyc-types`; lifted here
+/// so multiple consumers (desugar, type-checker) can share one
+/// implementation.
+pub fn line_byte_starts(source: &str, lines: &[usize]) -> Vec<u32> {
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let mut line_starts: Vec<usize> = vec![0];
+    for (i, b) in source.bytes().enumerate() {
+        if b == b'\n' {
+            line_starts.push(i + 1);
+        }
+    }
+    let mut starts: Vec<u32> = Vec::with_capacity(lines.len());
+    for &line in lines {
+        if let Some(&offset) = line_starts.get(line) {
+            let rest = &source[offset..];
+            let lead = rest
+                .bytes()
+                .take_while(|&b| b == b' ' || b == b'\t')
+                .count();
+            starts.push((offset + lead) as u32);
+        }
+    }
+    starts.sort_unstable();
+    starts
 }
 
 /// Strip Typhon-specific syntax from `source` and return the Python-
@@ -111,6 +148,7 @@ pub fn preprocess(source: &str) -> PreprocessResult {
     let mut comptime_bindings = Vec::new();
     let mut lazy_imports = Vec::new();
     let mut unsafe_lines: Vec<usize> = Vec::new();
+    let mut raw_class_lines: Vec<usize> = Vec::new();
     // String state carried across lines (triple-quoted strings may span them).
     let mut in_string: Option<StringMode> = None;
 
@@ -264,6 +302,33 @@ pub fn preprocess(source: &str) -> PreprocessResult {
                 }
             }
 
+            // ── `class! ClassName(...):` → `class ClassName(...):` ──────────
+            // The `!` is stripped and the line index is recorded so the
+            // desugar pass knows to skip its automatic `@dataclass` injection
+            // on this class.
+            if rest.starts_with("class! ")
+                && rest.len() > "class! ".len()
+                && (rest.as_bytes()["class! ".len()].is_ascii_alphanumeric()
+                    || rest.as_bytes()["class! ".len()] == b'_')
+            {
+                stripped.push(StrippedKeyword {
+                    line_index,
+                    keyword: TyphonKeyword::RawClass,
+                });
+                raw_class_lines.push(line_index);
+                let after_marker = &rest["class! ".len()..];
+                let new_line = format!("{}class {}", indent, after_marker);
+                let (rewritten, marks) = rewrite_optionals(&new_line, &mut in_string);
+                for col in marks {
+                    optionals.push(StrippedOptional {
+                        line_index,
+                        python_col: col,
+                    });
+                }
+                python_source.push_str(&rewritten);
+                continue;
+            }
+
             // ── `model ClassName:` → `class ClassName(BaseModel):` ──────────
             if rest.starts_with("model ")
                 && rest.len() > "model ".len()
@@ -373,6 +438,7 @@ pub fn preprocess(source: &str) -> PreprocessResult {
         comptime_bindings,
         lazy_imports,
         unsafe_lines,
+        raw_class_lines,
     }
 }
 
@@ -899,6 +965,21 @@ pub fn postprocess_full(
                 // These constructs are expanded by separate passes
                 // (`expand_gather_blocks`, `expand_go_calls`); they never
                 // end up in the `stripped` keyword list.
+            }
+            TyphonKeyword::RawClass => {
+                // Restore `class Foo(...):` → `class! Foo(...):` by
+                // rewriting just the leading `class` keyword.
+                let line = &lines[line_idx];
+                let indent_len = line
+                    .find(|c: char| !c.is_whitespace())
+                    .unwrap_or(line.len());
+                let content = &line[indent_len..];
+                let restored = if let Some(tail) = content.strip_prefix("class ") {
+                    format!("class! {}", tail)
+                } else {
+                    content.to_owned()
+                };
+                lines[line_idx] = format!("{}{}", &line[..indent_len], restored);
             }
         }
     }
@@ -3178,6 +3259,55 @@ mod tests {
         let prep = preprocess(src);
         let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
         assert_eq!(out, src);
+    }
+
+    // ── class! (raw class) keyword ──────────────────────────────────────────
+
+    #[test]
+    fn raw_class_strips_bang_and_records_line() {
+        let result = preprocess("class! MyModel(nn.Module):\n    pass\n");
+        assert!(
+            result.python_source.contains("class MyModel(nn.Module):"),
+            "output: {}",
+            result.python_source
+        );
+        assert!(
+            !result.python_source.contains("class!"),
+            "bang should be stripped: {}",
+            result.python_source
+        );
+        assert_eq!(result.raw_class_lines, vec![0]);
+        assert!(result
+            .stripped
+            .iter()
+            .any(|k| matches!(k.keyword, TyphonKeyword::RawClass)));
+    }
+
+    #[test]
+    fn raw_class_round_trips_via_postprocess() {
+        let src = "class! MyModel(nn.Module):\n    pass\n";
+        let prep = preprocess(src);
+        let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn raw_class_with_no_bases_round_trips() {
+        let src = "class! Foo:\n    name: str\n";
+        let prep = preprocess(src);
+        assert!(prep.python_source.contains("class Foo:"));
+        let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn plain_class_is_not_marked_raw() {
+        let result = preprocess("class Foo:\n    pass\n");
+        assert!(result.raw_class_lines.is_empty());
+        assert!(!result
+            .stripped
+            .iter()
+            .any(|k| matches!(k.keyword, TyphonKeyword::RawClass)));
     }
 
     #[test]
