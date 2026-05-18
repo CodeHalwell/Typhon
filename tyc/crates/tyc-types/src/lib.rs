@@ -804,6 +804,11 @@ struct Checker<'a> {
     /// All classes declared in the module along with their declared member
     /// names.  Used for structural conformance against an interface.
     class_shapes: HashMap<String, InterfaceShape>,
+    /// Classes declared with the `frozen` modifier (`class Foo frozen:`).
+    /// Used to reject attribute writes to instances of these classes at
+    /// check time — matches the runtime behaviour of the emitted
+    /// `@dataclass(frozen=True)` decorator (`FrozenInstanceError`).
+    frozen_classes: std::collections::HashSet<String>,
     /// Class inheritance: maps each class name to its direct base class names
     /// as written in the source (`class Dog(Animal):` → `{"Dog": ["Animal"]}`).
     /// Used by `class_inherits_from` to resolve nominal subtype relationships.
@@ -813,6 +818,11 @@ struct Checker<'a> {
     /// Return type of the function whose body we are currently checking
     /// (None at module scope).
     current_return: Option<Type>,
+    /// Name of the class whose body we are currently checking, including
+    /// the `__typhon_impl_<NAME>` pseudo-class form. Used to give an
+    /// unannotated `self` parameter the enclosing class's type so writes
+    /// to `self.field` participate in the frozen-class check.
+    current_class: Option<String>,
     /// Bumped on entry to an `unsafe:` block, decremented on exit.  While
     /// positive, diagnostics produced by [`Checker::push_error`] /
     /// [`Checker::push_warning`] are dropped so the user can interface with
@@ -883,6 +893,7 @@ impl<'a> Checker<'a> {
             active_typevar_bounds: HashMap::new(),
             interfaces: HashMap::new(),
             class_shapes: HashMap::new(),
+            frozen_classes: std::collections::HashSet::new(),
             class_parents: HashMap::new(),
             unsafe_depth: 0,
             unsafe_line_starts: Vec::new(),
@@ -890,6 +901,7 @@ impl<'a> Checker<'a> {
             env: TypeEnv::default(),
             diagnostics: Diagnostics::new(),
             current_return: None,
+            current_class: None,
         }
     }
 
@@ -1370,7 +1382,7 @@ pub fn check_module(
     resolved: &ResolvedModule,
     module: &ModModule,
 ) -> Diagnostics {
-    check_module_with(path, source, resolved, module, &[])
+    check_module_with(path, source, resolved, module, &[], &[])
 }
 
 /// Type-check a module with knowledge of which lines opened an `unsafe:`
@@ -1379,19 +1391,27 @@ pub fn check_module(
 /// Python boundaries.  Diagnostics at the boundary (where untyped values
 /// leak back out) are still produced as normal at the assignment site
 /// outside the block.
+///
+/// `frozen_class_lines` is the preprocessor's 0-based line index list for
+/// `class NAME frozen:` declarations; the checker matches these line
+/// offsets against class definitions in the AST to identify frozen
+/// classes, then rejects attribute writes to their instances.
 pub fn check_module_with(
     path: impl Into<String>,
     source: &str,
     resolved: &ResolvedModule,
     module: &ModModule,
     unsafe_lines: &[usize],
+    frozen_class_lines: &[usize],
 ) -> Diagnostics {
     let mut c = Checker::new(path.into(), source, resolved);
     c.unsafe_line_starts = unsafe_byte_starts(source, unsafe_lines);
+    let frozen_starts = unsafe_byte_starts(source, frozen_class_lines);
 
     // First pass: collect class names + function signatures so forward
     // references work.
     collect_classes_and_functions(&mut c, &module.body);
+    populate_frozen_classes(&mut c, &module.body, &frozen_starts);
 
     c.env.enter();
     // Seed module scope with collected classes/functions and resolver bindings.
@@ -1439,6 +1459,92 @@ fn unsafe_byte_starts(source: &str, unsafe_lines: &[usize]) -> Vec<u32> {
     }
     starts.sort_unstable();
     starts
+}
+
+/// Populate [`Checker::frozen_classes`] from the preprocessor's
+/// `frozen_class_lines` metadata. Each entry in `frozen_starts` is the
+/// byte offset of the first non-whitespace character on a line containing
+/// a `class NAME frozen:` declaration; a class definition matches when
+/// its body range covers one of those offsets.
+///
+/// `impl FrozenClass:` is rewritten to `class __typhon_impl_FrozenClass(object):`
+/// by the preprocessor, and methods inside it bind `self` to the pseudo
+/// type — not to `FrozenClass` itself. To make `self.field = ...` writes
+/// inside such methods still trip the frozen check, the matching impl
+/// pseudo-class is registered as frozen too.
+fn populate_frozen_classes(c: &mut Checker, body: &[Stmt], frozen_starts: &[u32]) {
+    if frozen_starts.is_empty() {
+        return;
+    }
+    for stmt in body {
+        if let Stmt::ClassDef(cd) = stmt {
+            let class_start = u32::from(cd.range.start());
+            let name_start = u32::from(cd.name.range.start());
+            if frozen_starts
+                .iter()
+                .any(|&m| m >= class_start && m <= name_start)
+            {
+                c.frozen_classes.insert(cd.name.as_str().to_owned());
+            }
+        }
+    }
+    // Mirror frozen-ness onto `__typhon_impl_<NAME>` pseudo-classes so
+    // `self`-rooted writes inside `impl FrozenClass: def m(self): self.x = ...`
+    // are flagged at the same time as the matching `f.x = ...` from outside.
+    let impl_targets: Vec<String> = c
+        .frozen_classes
+        .iter()
+        .map(|n| format!("__typhon_impl_{}", n))
+        .collect();
+    for n in impl_targets {
+        c.frozen_classes.insert(n);
+    }
+}
+
+/// Walk an attribute-assignment target and, if its receiver resolves to a
+/// frozen class, emit a [`TycError::FrozenAssign`] diagnostic. Handles
+/// nested attribute access (`a.b.c = ...`) by inferring the type of the
+/// immediate receiver `a.b`; chains where any inner step lands on a
+/// frozen class are flagged at the outermost write. Augmented and
+/// annotated forms (`Stmt::AugAssign`, `Stmt::AnnAssign`) share this
+/// helper.
+fn check_attr_assign_not_frozen(c: &mut Checker, target: &Expr) {
+    if c.frozen_classes.is_empty() || c.unsafe_depth > 0 {
+        return;
+    }
+    let Expr::Attribute(attr) = target else {
+        return;
+    };
+    let recv = infer_expr(c, &attr.value);
+    // Nullable receivers are already flagged with `tyc::nullable_use`;
+    // we still want to surface the frozen error when narrowed forms
+    // (`T | None`) hit a frozen class, so peel the optional and look at
+    // the underlying class name.
+    let class_name = match recv.strip_none() {
+        Type::Class(name) => name,
+        _ => return,
+    };
+    if !c.frozen_classes.contains(&class_name) {
+        return;
+    }
+    // `impl FrozenClass: def m(self): self.x = ...` is checked via the
+    // `__typhon_impl_FrozenClass` pseudo-class. The diagnostic should
+    // name the class the user wrote, not the internal pseudo.
+    let display_class = class_name
+        .strip_prefix("__typhon_impl_")
+        .unwrap_or(&class_name)
+        .to_owned();
+    let span_start = attr.range.start().to_usize();
+    let span_end = attr.range.end().to_usize();
+    let length = span_end.saturating_sub(span_start).max(1);
+    c.diagnostics.push_error(TycError::frozen_assign(
+        display_class,
+        attr.attr.as_str(),
+        c.path.clone(),
+        c.source,
+        span_start,
+        length,
+    ));
 }
 
 /// Declare Typhon-specific built-in names that are not present in the
@@ -1770,6 +1876,10 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     );
                     c.mismatch(&ann_type, &value_type, span);
                 }
+                // `a.b: T = ...` — uncommon, but still a write to `a.b`.
+                // Field declarations inside a class body have no value
+                // and a bare-name target, so they don't hit this branch.
+                check_attr_assign_not_frozen(c, a.target.as_ref());
             }
             if let Expr::Name(n) = a.target.as_ref() {
                 let span = (
@@ -1787,6 +1897,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
         Stmt::Assign(a) => {
             let value_type = infer_expr(c, &a.value);
             for target in &a.targets {
+                check_attr_assign_not_frozen(c, target);
                 if let Expr::Name(n) = target {
                     let span = (
                         n.range.start().to_usize(),
@@ -1885,9 +1996,13 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 }
             }
             c.env.enter();
+            let saved_class = c
+                .current_class
+                .replace(cd.name.as_str().to_owned());
             for s in &cd.body {
                 check_stmt(c, s);
             }
+            c.current_class = saved_class;
             c.env.leave();
         }
         Stmt::Return(ret) => {
@@ -1962,6 +2077,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
         Stmt::AugAssign(a) => {
             let _ = infer_expr(c, &a.target);
             let _ = infer_expr(c, &a.value);
+            check_attr_assign_not_frozen(c, &a.target);
         }
         Stmt::With(w) => {
             for item in &w.items {
@@ -2130,18 +2246,51 @@ fn check_function(
     c.env.enter();
 
     // Declare parameters with their annotation types. Type parameters resolve
-    // to `Any` until a real inference engine lands.
+    // to `Any` until a real inference engine lands. Inside a class body, an
+    // unannotated leading `self` parameter inherits the enclosing class
+    // type so writes like `self.field = ...` participate in field-level
+    // checks (currently: the frozen-class rejection).
+    let positional_first_name = parameters
+        .posonlyargs
+        .first()
+        .or_else(|| parameters.args.first())
+        .map(|p| p.parameter.name.as_str().to_owned());
     let all = parameters
         .posonlyargs
         .iter()
         .chain(parameters.args.iter())
         .chain(parameters.kwonlyargs.iter());
     for pwd in all {
+        let param_name = pwd.parameter.name.as_str();
+        let is_self_receiver = positional_first_name.as_deref() == Some(param_name)
+            && (param_name == "self" || param_name == "cls");
         let t = match &pwd.parameter.annotation {
             Some(ann) => type_from_annotation_with_params(ann, &classes, type_params),
-            None => Type::Unknown,
+            None => {
+                if is_self_receiver {
+                    // `extend BUILTIN:` is lowered to a
+                    // `__typhon_builtin_ext_*` sentinel class whose methods
+                    // are later extracted to free functions; `self` there
+                    // morally has the builtin's type, not the sentinel's.
+                    // Leave it `Unknown` until the extraction pass can
+                    // supply the real receiver type.
+                    let in_builtin_ext = c
+                        .current_class
+                        .as_deref()
+                        .is_some_and(|n| n.starts_with("__typhon_builtin_ext_"));
+                    if in_builtin_ext {
+                        Type::Unknown
+                    } else {
+                        match c.current_class.as_deref() {
+                            Some(cls) => Type::Class(cls.to_owned()),
+                            None => Type::Unknown,
+                        }
+                    }
+                } else {
+                    Type::Unknown
+                }
+            }
         };
-        let param_name = pwd.parameter.name.as_str();
         let span = (
             pwd.parameter.range.start().to_usize(),
             pwd.parameter.range.start().to_usize() + param_name.len(),
@@ -3106,7 +3255,14 @@ mod tests {
             .unwrap()
             .into_syntax();
         let (resolved, _) = resolve_module("<test>".to_owned(), &prep.python_source, &module);
-        check_module("<test>", &prep.python_source, &resolved, &module)
+        check_module_with(
+            "<test>",
+            &prep.python_source,
+            &resolved,
+            &module,
+            &prep.unsafe_lines,
+            &prep.frozen_class_lines,
+        )
     }
 
     #[test]
@@ -4570,6 +4726,137 @@ def get_name[T: Named](x: T) -> str:
         assert!(
             !d.has_errors(),
             "field access on T: Named should type-check: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    // ── frozen-class field-write rejection ───────────────────────────────────
+
+    #[test]
+    fn rejects_direct_write_to_frozen_field() {
+        let src = "\
+class Identity frozen:
+    name: str
+
+let i: Identity = Identity(name=\"Alice\")
+i.name = \"Bob\"
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "direct write to a frozen field must be rejected"
+        );
+        assert!(
+            d.errors().iter().any(|e| e.to_string().contains("frozen")
+                && e.to_string().contains("name")),
+            "diagnostic should name the frozen field: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn rejects_nested_write_to_frozen_field() {
+        // The exact case from the user's bug report: a frozen field is
+        // reached through one or more attribute hops from a mutable
+        // container. The receiver `outer.inner` resolves to a frozen
+        // class, so the final write must be rejected.
+        let src = "\
+class Identity frozen:
+    name: str
+
+class User:
+    identity: Identity
+    age: int
+
+let user: User = User(identity=Identity(name=\"Alice\"), age=30)
+user.identity.name = \"Bob\"
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "nested write to a frozen field must be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_aug_assign_to_frozen_field() {
+        let src = "\
+class Counter frozen:
+    n: int
+
+let c: Counter = Counter(n=0)
+c.n += 1
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "augmented assignment to a frozen field must be rejected"
+        );
+    }
+
+    #[test]
+    fn rejects_self_write_inside_impl_of_frozen_class() {
+        // The user can still write `impl FrozenClass: def m(self): self.x = ...`;
+        // we want the same diagnostic to fire there, not just at outside
+        // call sites.
+        let src = "\
+class Identity frozen:
+    name: str
+
+impl Identity:
+    def rename(self, new_name: str) -> None:
+        self.name = new_name
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "self-write inside impl of frozen class must be rejected"
+        );
+        // The diagnostic should display the original class name, not the
+        // `__typhon_impl_*` pseudo-class name.
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| e.to_string().contains("`Identity`")),
+            "diagnostic should display the user-visible class name `Identity`, not the pseudo: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn allows_write_to_mutable_class_field() {
+        let src = "\
+class User:
+    name: str
+
+impl User:
+    def rename(self, new_name: str) -> None:
+        self.name = new_name
+
+let u: User = User(name=\"Alice\")
+u.name = \"Bob\"
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "writes to mutable class fields must still pass: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn allows_field_declarations_in_frozen_class_body() {
+        // `class X frozen:` field annotations (`name: str`) are
+        // declarations, not assignments — they must not be flagged.
+        let src = "\
+class Identity frozen:
+    name: str
+    age: int = 0
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "field declarations inside a frozen class body must not be flagged: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
     }

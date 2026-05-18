@@ -410,6 +410,7 @@ fn check_impl(path: &str, text: &str) -> Diagnostics {
         &resolved,
         &module,
         &prep.unsafe_lines,
+        &prep.frozen_class_lines,
     );
     diags.extend(type_diags);
 
