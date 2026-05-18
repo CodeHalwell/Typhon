@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/typhon-logo.png" alt="Typhon — type-safe, optimised, compiles to CPython" width="480" />
+  <img src="docs-site/src/assets/typhon-logo.png" alt="Typhon — type-safe, optimised, compiles to CPython" width="480" />
 
   <h1>Typhon</h1>
 
