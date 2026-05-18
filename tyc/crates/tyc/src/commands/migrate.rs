@@ -17,6 +17,11 @@
 //! 5. `from dataclasses import dataclass` becomes a no-op (still kept for
 //!    safety if any other reference exists, but the line is removed when
 //!    `dataclass` was its only import).
+//! 6. `class Name(...):` declarations whose body contains a hand-written
+//!    `def __init__` (and that did *not* carry a `@dataclass` decorator)
+//!    are rewritten as `class! Name(...):` — the dataclass-default of
+//!    `class` would clash with a custom constructor, so the raw-class form
+//!    is the safe target.
 //!
 //! Output is written next to the input with the `.ty` extension; `--check`
 //! emits to stdout without touching the disk so the user can preview.
@@ -76,16 +81,17 @@ pub fn run(args: MigrateArgs) -> Result<()> {
 /// rewrites incrementally on a buffer.
 pub fn migrate_source(source: &str) -> String {
     let reassigned = collect_reassigned_names(source);
+    let bang_class_lines = collect_bang_class_lines(source);
 
     let mut out = String::with_capacity(source.len());
-    for line in source.split_inclusive('\n') {
+    for (line_index, line) in source.split_inclusive('\n').enumerate() {
         let raw = line.trim_end_matches(['\n', '\r']);
         let terminator = &line[raw.len()..];
 
         let rewritten = if raw.trim().is_empty() {
             raw.to_owned()
         } else {
-            rewrite_line(raw, &reassigned)
+            rewrite_line(raw, &reassigned, line_index, &bang_class_lines)
         };
 
         // Skip lines reduced to nothing (only `from dataclasses import
@@ -103,7 +109,12 @@ pub fn migrate_source(source: &str) -> String {
 
 /// Walk every line and apply rewrite rules in order.  Returns the
 /// transformed line (without its terminator).
-fn rewrite_line(line: &str, reassigned: &HashSet<String>) -> String {
+fn rewrite_line(
+    line: &str,
+    reassigned: &HashSet<String>,
+    line_index: usize,
+    bang_class_lines: &HashSet<usize>,
+) -> String {
     // Quick exit for comments — leave them untouched.
     let trimmed = line.trim_start();
     if trimmed.starts_with('#') {
@@ -129,6 +140,13 @@ fn rewrite_line(line: &str, reassigned: &HashSet<String>) -> String {
 
     body = rewrite_optional(&body);
 
+    // Rule 6: `class Name(...):` with a hand-rolled `__init__` and no
+    // `@dataclass` decorator becomes `class! Name(...):` so the Typhon
+    // dataclass injection does not clash with the custom constructor.
+    if bang_class_lines.contains(&line_index) && (body.starts_with("class ") || body == "class") {
+        body = format!("class!{}", &body["class".len()..]);
+    }
+
     // Module-level annotated assignment: prepend let/mut.
     if indent.is_empty() {
         if let Some(name) = leading_ann_assign_name(&body) {
@@ -145,6 +163,97 @@ fn rewrite_line(line: &str, reassigned: &HashSet<String>) -> String {
     }
 
     format!("{indent}{body}")
+}
+
+/// Identify class declarations that should emit as `class!` rather than
+/// plain `class`. A class qualifies when it has at least one
+/// `def __init__` somewhere in its body AND no `@dataclass[(...)]`
+/// decorator on the contiguous decorator stack above the `class`
+/// keyword. The returned set holds 0-based source line indices pointing
+/// at the `class` declaration line itself.
+fn collect_bang_class_lines(source: &str) -> HashSet<usize> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut out: HashSet<usize> = HashSet::new();
+
+    for (idx, raw) in lines.iter().enumerate() {
+        let trimmed = raw.trim_start();
+        if !trimmed.starts_with("class ") && trimmed != "class" {
+            continue;
+        }
+        // Walk back over the decorator stack: skip blank lines and lines
+        // that begin with `@`. If any decorator is `@dataclass[...]` the
+        // class already opts into dataclass semantics — leave it alone.
+        let indent_len = raw.len() - trimmed.len();
+        let mut had_dataclass_decorator = false;
+        let mut probe = idx;
+        while probe > 0 {
+            probe -= 1;
+            let prev = lines[probe];
+            let prev_trim = prev.trim_start();
+            if prev_trim.is_empty() {
+                continue;
+            }
+            // Decorators must sit at the same indent as the class header.
+            let prev_indent = prev.len() - prev_trim.len();
+            if prev_indent != indent_len {
+                break;
+            }
+            if !prev_trim.starts_with('@') {
+                break;
+            }
+            if let Some(after_kw) = prev_trim.strip_prefix("@dataclass") {
+                let after = after_kw.trim();
+                if after.is_empty() || after.starts_with('(') {
+                    had_dataclass_decorator = true;
+                    break;
+                }
+            }
+        }
+        if had_dataclass_decorator {
+            continue;
+        }
+
+        // Walk forward looking for a `def __init__` at the immediate
+        // body indent (one level deeper than the class header). Lines at
+        // deeper indents belong to nested constructs (an inner class,
+        // a method body, …) and must NOT count toward the outer class.
+        // The body indent is locked in from the first non-trivial line.
+        let outer_indent = indent_len;
+        let mut body_indent: Option<usize> = None;
+        let mut has_explicit_init = false;
+        let mut look = idx + 1;
+        while look < lines.len() {
+            let candidate = lines[look];
+            let cand_trim = candidate.trim_start();
+            if cand_trim.is_empty() || cand_trim.starts_with('#') {
+                look += 1;
+                continue;
+            }
+            let cand_indent = candidate.len() - cand_trim.len();
+            if cand_indent <= outer_indent {
+                break;
+            }
+            let body_at = *body_indent.get_or_insert(cand_indent);
+            if cand_indent == body_at
+                && cand_trim.starts_with("def __init__")
+                && cand_trim
+                    .as_bytes()
+                    .get("def __init__".len())
+                    .map(|&b| b == b'(' || b == b' ' || b == b'\t')
+                    .unwrap_or(false)
+            {
+                has_explicit_init = true;
+                break;
+            }
+            look += 1;
+        }
+
+        if has_explicit_init {
+            out.insert(idx);
+        }
+    }
+
+    out
 }
 
 /// Rewrite every `Optional[T]` (including `typing.Optional[T]`) to `T?`
@@ -466,5 +575,51 @@ mod tests {
         let out = migrate_source("# header comment\nx: int = 1\n");
         assert!(out.contains("# header comment"), "got: {out}");
         assert!(out.contains("let x: int = 1"), "got: {out}");
+    }
+
+    #[test]
+    fn class_with_explicit_init_becomes_class_bang() {
+        let src = "class MyModel(nn.Module):\n    def __init__(self, layers: int) -> None:\n        super().__init__()\n        self.layers = layers\n";
+        let out = migrate_source(src);
+        assert!(out.starts_with("class! MyModel(nn.Module):"), "got: {out}");
+    }
+
+    #[test]
+    fn dataclass_decorated_class_does_not_become_class_bang() {
+        // The dataclass decorator gets dropped (Typhon's default), but the
+        // class header must remain plain `class` — the user opted into
+        // dataclass semantics so the synthesised __init__ is what they want.
+        let src = "@dataclass\nclass U:\n    name: str\n    def __init__(self, name: str) -> None:\n        self.name = name\n";
+        let out = migrate_source(src);
+        assert!(!out.contains("class!"), "got: {out}");
+        assert!(out.contains("class U:"), "got: {out}");
+    }
+
+    #[test]
+    fn class_without_init_stays_plain() {
+        let src = "class Point:\n    x: int\n    y: int\n";
+        let out = migrate_source(src);
+        assert!(!out.contains("class!"), "got: {out}");
+        assert!(out.contains("class Point:"), "got: {out}");
+    }
+
+    #[test]
+    fn class_with_init_in_nested_function_still_promoted() {
+        // The walker finds __init__ at any depth inside the class body —
+        // a closure called `__init__` defined inside a method is rare
+        // enough that we accept the false-positive here.
+        let src = "class Outer:\n    def __init__(self) -> None:\n        pass\n";
+        let out = migrate_source(src);
+        assert!(out.contains("class! Outer:"), "got: {out}");
+    }
+
+    #[test]
+    fn nested_class_bang_promotion_respects_indent() {
+        // Inner class with explicit __init__ should be promoted too.
+        let src = "class Outer:\n    class Inner:\n        def __init__(self) -> None:\n            pass\n";
+        let out = migrate_source(src);
+        assert!(out.contains("class! Inner:"), "got: {out}");
+        // Outer has no __init__ of its own, must stay plain.
+        assert!(out.contains("class Outer:"), "got: {out}");
     }
 }

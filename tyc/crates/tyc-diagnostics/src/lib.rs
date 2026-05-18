@@ -72,6 +72,38 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A reassignment supplied a value whose type doesn't match the
+    /// binding's declared type. Distinct from [`TycError::TypeMismatch`]
+    /// so the diagnostic can point at the original declaration site and
+    /// explain `mut`'s semantics — `mut` allows new *values* of the same
+    /// type, not a re-declaration with a new type. Without this variant
+    /// users routinely interpret the bare "type mismatch" as a bug,
+    /// since they wrote a literal `mut name = …` and (reasonably)
+    /// expected that to behave like a fresh declaration.
+    ///
+    /// The labels are kept terse on purpose: miette renders one
+    /// connector per labelled span, and verbose label text quickly
+    /// turns a two-site diagnostic into a wall of branches on narrow
+    /// terminals. The redundant information (binding name, declared
+    /// type) lives in the headline message; the labels only carry
+    /// what's unique to each anchor.
+    #[error("cannot assign `{actual}` to `{name}: {expected}`")]
+    #[diagnostic(
+        code(tyc::type_mismatch),
+        help("`mut` only permits new values of the declared type. Use a different name to bind type `{actual}`.")
+    )]
+    TypeReassignMismatch {
+        name: String,
+        expected: String,
+        actual: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("`{actual}`")]
+        span: SourceSpan,
+        #[label("declared here")]
+        decl_span: SourceSpan,
+    },
+
     /// A nullable value (`T | None`) was used in a position requiring `T`.
     #[error("possibly-None value used where `{expected}` is required")]
     #[diagnostic(
@@ -353,6 +385,31 @@ impl TycError {
             actual: actual.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::TypeReassignMismatch`] diagnostic that
+    /// points at both the offending assignment and the original
+    /// declaration site, with help text explaining what `mut` permits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn type_reassign_mismatch(
+        name: impl Into<String>,
+        expected: impl Into<String>,
+        actual: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+        decl_offset: usize,
+        decl_length: usize,
+    ) -> Self {
+        Self::TypeReassignMismatch {
+            name: name.into(),
+            expected: expected.into(),
+            actual: actual.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+            decl_span: SourceSpan::new(SourceOffset::from(decl_offset), decl_length.max(1)),
         }
     }
 
