@@ -156,7 +156,10 @@ pub fn run(args: CheckArgs) -> Result<()> {
     }
 
     // Apply strictness rules (e.g. promote unused-import warnings to errors).
-    let diags = apply_strictness(diags, &config);
+    let mut diags = apply_strictness(diags, &config);
+    // Remove duplicate diagnostics that can arise when multiple files share
+    // an error root (e.g. a repeated definition across passes).
+    diags.dedup();
 
     // Emit warnings regardless of whether there are errors.
     for warn in diags.warnings() {

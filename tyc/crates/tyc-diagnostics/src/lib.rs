@@ -272,6 +272,21 @@ pub enum TycError {
         #[label("inferred `{actual}` for `{typevar}`, which must satisfy `{bound}`")]
         span: SourceSpan,
     },
+
+    /// An attribute is accessed on a value whose type doesn't expose it.
+    #[error("attribute `{attr}` is not defined on `{recv_type}`")]
+    #[diagnostic(
+        code(tyc::attribute_not_found),
+        help("check the definition of `{recv_type}` for its available attributes")
+    )]
+    AttributeNotFound {
+        attr: String,
+        recv_type: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("no attribute `{attr}` on `{recv_type}`")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -562,6 +577,23 @@ impl TycError {
         }
     }
 
+    /// Construct a [`TycError::AttributeNotFound`] diagnostic.
+    pub fn attribute_not_found(
+        attr: impl Into<String>,
+        recv_type: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::AttributeNotFound {
+            attr: attr.into(),
+            recv_type: recv_type.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
     /// Construct an [`TycError::ImmutableAssign`] diagnostic.
     pub fn immutable_assign(
         name: impl Into<String>,
@@ -633,6 +665,28 @@ impl Diagnostics {
     pub fn into_parts(self) -> (Vec<TycError>, Vec<TycError>) {
         (self.errors, self.warnings)
     }
+
+    /// Remove duplicate diagnostics — entries with the same `Display` text
+    /// and diagnostic code are considered identical.  Deduplication preserves
+    /// the first occurrence and drops subsequent ones.
+    pub fn dedup(&mut self) {
+        dedup_vec(&mut self.errors);
+        dedup_vec(&mut self.warnings);
+    }
+}
+
+fn dedup_vec(v: &mut Vec<TycError>) {
+    use miette::Diagnostic;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    v.retain(|e| {
+        let code = e.code().map(|c| c.to_string()).unwrap_or_default();
+        let span = e
+            .labels()
+            .and_then(|mut it| it.next())
+            .map(|l| format!("{}:{}", l.inner().offset(), l.inner().len()))
+            .unwrap_or_default();
+        seen.insert(format!("{}\x00{}\x00{}", e, code, span))
+    });
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -921,5 +975,28 @@ mod tests {
         let e = TycError::typevar_bound_violation("T", "int", "C", "f.ty", "src", 0, 1);
         let code = e.code().unwrap().to_string();
         assert_eq!(code, "tyc::typevar_bound");
+    }
+
+    #[test]
+    fn dedup_removes_identical_errors() {
+        let mut d = Diagnostics::new();
+        d.push_error(TycError::generic("same error"));
+        d.push_error(TycError::generic("same error"));
+        d.push_error(TycError::generic("different error"));
+        d.dedup();
+        assert_eq!(d.error_count(), 2, "dedup should remove the duplicate");
+    }
+
+    #[test]
+    fn dedup_preserves_distinct_warnings() {
+        let mut d = Diagnostics::new();
+        d.push_warning(TycError::generic("warn a"));
+        d.push_warning(TycError::generic("warn b"));
+        d.dedup();
+        assert_eq!(
+            d.warning_count(),
+            2,
+            "distinct warnings should both survive dedup"
+        );
     }
 }
