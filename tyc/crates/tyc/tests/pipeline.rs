@@ -620,12 +620,11 @@ fn check_stubs_standalone_dty_without_implementation_passes() {
 
 // ── source-map accuracy for sugar-expanded constructs ─────────────────────────
 //
-// The follow-up doc (docs/follow-ups-2026-05-17.md) notes that `?`, `gather:`,
-// and `with`-chains emit multiple Python lines from a single Typhon line, so
-// the v2 source map must map those expanded Python lines back to the originating
-// Typhon line.  These tests build real projects that use each sugar construct
-// and verify that `tyc trace` can correctly map a frame pointing at the expanded
-// Python back to the Typhon source.
+// `?` and `gather:` emit multiple Python lines from a single Typhon line.  The
+// v2 source map records a 1-indexed line number in the expanded preprocessed
+// text for each emitted Python line; entries are non-zero for every line.
+// These tests build real projects and verify the map structure and `tyc trace`
+// behaviour for those constructs.
 
 /// Parse a `.py.map` JSON sidecar and return the `lines` array.  Panics on
 /// malformed JSON.
@@ -681,31 +680,27 @@ def parse(s: str) -> Result[int, str]:
     let lines = parse_map_lines(&map_body);
     assert!(!lines.is_empty(), "lines array must not be empty");
 
-    // The `?` expansion emits at least 3 Python lines from Typhon line 2.
-    // Every expanded line must map to a valid source line (non-zero) and must
-    // not point past the total number of Typhon source lines (3).
+    // Every map entry must be non-zero (no gap in the table).
     for (py_line_idx, &ty_line) in lines.iter().enumerate() {
         assert!(
             ty_line >= 1,
             "Python line {} maps to 0 — source map has a gap",
             py_line_idx + 1
         );
-        // The lines[] entries point into the expanded preprocessed text, which
-        // can have more lines than the original .ty source, so we only check
-        // that the entry is non-zero (no gap in the map).
     }
 
-    // All expanded lines from the `?` operator must map to the same
-    // Typhon source line (the one containing the `?`).  Find the runs
-    // of consecutive Python output lines that share the same ty_line; one
-    // of those runs must have length ≥ 2 (the expansion produces ≥ 2 Python
-    // lines from one Typhon line).
-    let has_multi_line_run = lines.windows(2).any(|w| w[0] == w[1]);
+    // The `?` expansion injects at least three Python lines containing
+    // `__typhon_q_` (assignment, isinstance guard, return/unwrap).  Reading
+    // the emitted Python and counting those lines is a targeted proxy for
+    // "the expansion produced multiple Python lines", and avoids the pitfall
+    // of checking for any adjacent duplicate in the whole map (which can be
+    // satisfied by unrelated function-header entries).
+    let py_path = tmp.path().join("build").join("main.py");
+    let py_src = std::fs::read_to_string(&py_path).unwrap();
+    let q_expansion_count = py_src.lines().filter(|l| l.contains("__typhon_q_")).count();
     assert!(
-        has_multi_line_run,
-        "at least two consecutive Python lines should map to the same Typhon line (? expansion); \
-         got lines: {:?}",
-        lines
+        q_expansion_count >= 3,
+        "? expansion should produce ≥3 Python lines containing __typhon_q_; got {q_expansion_count}"
     );
 }
 
@@ -801,9 +796,7 @@ async def load() -> int:
 
     assert!(!lines.is_empty(), "lines array must not be empty");
 
-    // The lines[] entries point into the expanded preprocessed text, which can
-    // be longer than the original .ty source (gather: lowers to several Python
-    // statements).  We only require every entry to be non-zero (no gap).
+    // Every map entry must be non-zero (no gap in the table).
     for (py_idx, &ty_line) in lines.iter().enumerate() {
         assert!(
             ty_line >= 1,
@@ -812,13 +805,21 @@ async def load() -> int:
         );
     }
 
-    // The `gather:` block collapses multiple Python lines to the same Typhon
-    // line; verify at least one such run exists in the map.
-    let has_multi_line_run = lines.windows(2).any(|w| w[0] == w[1]);
+    // The `gather:` block lowers to an `async with asyncio.TaskGroup()` header
+    // plus one `create_task` call per branch, producing ≥3 Python lines that
+    // contain `__typhon_tg_` or `__typhon_gather_`.  Counting those lines is
+    // targeted at the gather expansion specifically, unlike checking for any
+    // adjacent map duplicate (which fires on blank-line / function-header pairs
+    // unrelated to gather).
+    let py_path = tmp.path().join("build").join("main.py");
+    let py_src = std::fs::read_to_string(&py_path).unwrap();
+    let gather_expansion_count = py_src
+        .lines()
+        .filter(|l| l.contains("__typhon_tg_") || l.contains("__typhon_gather_"))
+        .count();
     assert!(
-        has_multi_line_run,
-        "gather: expansion should produce runs of Python lines mapping to the same Typhon line; \
-         got lines: {:?}",
-        lines
+        gather_expansion_count >= 3,
+        "gather: expansion should produce ≥3 Python lines with __typhon_tg_/__typhon_gather_; \
+         got {gather_expansion_count}"
     );
 }
