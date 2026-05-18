@@ -10,6 +10,7 @@ pub mod lsp;
 pub mod migrate;
 pub mod profile;
 pub mod repl;
+pub mod run;
 pub mod trace;
 pub mod ty;
 pub mod util;
