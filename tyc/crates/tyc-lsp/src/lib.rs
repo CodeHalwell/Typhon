@@ -776,6 +776,8 @@ const TYPHON_KEYWORDS: &[&str] = &[
     "go",
     "pure",
     "memo",
+    // Raw-class modifier: `class! Foo(Base):` skips dataclass injection.
+    "class!",
 ];
 
 /// A short, hand-curated list of Python builtins surfaced in completion so
