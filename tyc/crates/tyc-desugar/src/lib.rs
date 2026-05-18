@@ -48,6 +48,12 @@ pub struct DesugarOptions {
     /// from the purity analyser when the user opts into `@memo` /
     /// `@pure(memo=True)` / `[strictness] auto-memoise = true`.
     pub memoise_functions: Vec<String>,
+    /// Byte offsets (start of the line) at which a `class!` declaration
+    /// appears in the *preprocessed* source.  A class whose `TextRange`
+    /// starts at or just after one of these offsets is treated as raw and
+    /// the `@dataclass` decorator injection is skipped.  Populated from
+    /// the preprocessor's `raw_class_lines` via `line_byte_starts`.
+    pub raw_class_line_starts: Vec<u32>,
 }
 
 /// Desugar a Typhon module AST into a plain Python AST.
@@ -709,7 +715,7 @@ fn expr_uses_asyncio_qualified(expr: &Expr) -> bool {
 // ── module-level desugaring ──────────────────────────────────────────────────
 
 fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule {
-    let (new_body, transformed_classes) = desugar_stmts(&m.body);
+    let (new_body, transformed_classes) = desugar_stmts(&m.body, &options.raw_class_line_starts);
 
     // Merge `impl` pseudo-classes into their target classes and remove the stubs.
     let (merged_body, _) = merge_impl_blocks(new_body);
@@ -933,12 +939,12 @@ fn import_insert_pos(body: &[Stmt]) -> usize {
 
 /// Desugar a list of statements, returning the transformed list and whether
 /// any class was modified at any nesting depth.
-fn desugar_stmts(stmts: &[Stmt]) -> (Vec<Stmt>, bool) {
+fn desugar_stmts(stmts: &[Stmt], raw_class_starts: &[u32]) -> (Vec<Stmt>, bool) {
     let mut any_transformed = false;
     let new_stmts = stmts
         .iter()
         .map(|stmt| {
-            let (new_stmt, transformed) = desugar_stmt(stmt);
+            let (new_stmt, transformed) = desugar_stmt(stmt, raw_class_starts);
             if transformed {
                 any_transformed = true;
             }
@@ -950,10 +956,27 @@ fn desugar_stmts(stmts: &[Stmt]) -> (Vec<Stmt>, bool) {
 
 /// Desugar a single statement, recursing into any nested statement lists.
 /// Returns the (possibly modified) statement and whether any class was
-/// transformed at this level or deeper.
-fn desugar_stmt(stmt: &Stmt) -> (Stmt, bool) {
+/// transformed at this level or deeper.  `raw_class_starts` is the list
+/// of preprocessed-source byte offsets where a `class!` was declared;
+/// classes whose `TextRange` covers one of those offsets (between the
+/// node start and the class name) are emitted without the automatic
+/// `@dataclass` decorator.
+fn desugar_stmt(stmt: &Stmt, raw_class_starts: &[u32]) -> (Stmt, bool) {
     match stmt {
         Stmt::ClassDef(c) => {
+            // We can't compare against `c.range.start()` directly because
+            // Ruff sets that to the `@` token when the class has
+            // decorators — but the preprocessor's recorded offset points
+            // at the `class` keyword, which sits on a later line. Match
+            // instead by looking for any recorded offset in the half-open
+            // range `[c.range.start(), c.name.range.start())` — the
+            // `class` keyword always lives in that window regardless of
+            // decorators, and a nested raw class inside this one would
+            // sit beyond `c.name.range.start()`.
+            let class_start = u32::from(c.range.start());
+            let name_start = u32::from(c.name.range.start());
+            let is_raw = raw_class_starts.partition_point(|&off| off < class_start)
+                != raw_class_starts.partition_point(|&off| off < name_start);
             let is_pydantic = class_inherits_basemodel(c);
             // `impl` pseudo-classes (`__typhon_impl_*`) are temporary stubs
             // that will be merged into their target class by `merge_impl_blocks`;
@@ -970,7 +993,8 @@ fn desugar_stmt(stmt: &Stmt) -> (Stmt, bool) {
             // Skip the dataclass decorator for Pydantic model classes,
             // Protocol classes, and lazy proxies; they already carry the
             // right shape.
-            let needs_decorator = !is_pydantic
+            let needs_decorator = !is_raw
+                && !is_pydantic
                 && !is_protocol
                 && !is_impl_stub
                 && !is_lazy_proxy
@@ -979,7 +1003,7 @@ fn desugar_stmt(stmt: &Stmt) -> (Stmt, bool) {
             // as their first body statement unless the user already defined it.
             let needs_model_config =
                 is_pydantic && !is_impl_stub && !has_model_config_stmt(&c.body);
-            let (new_body, body_transformed) = desugar_stmts(&c.body);
+            let (new_body, body_transformed) = desugar_stmts(&c.body, raw_class_starts);
             let mut new_class = c.clone();
             new_class.body = new_body;
             if needs_decorator {
@@ -1002,6 +1026,20 @@ fn desugar_stmt(stmt: &Stmt) -> (Stmt, bool) {
                 };
                 new_class.body.insert(insert_at, make_model_config_stmt());
             }
+            // `class!` classes whose body lacks an explicit `__init__` AND
+            // which have at least one positional base get a synthesised
+            // constructor: `super().__init__()` followed by `self.x = x` for
+            // every annotated field, in source order. The class-level field
+            // annotations are kept so type checkers still see the field
+            // shape (mirrors the dataclass convention).
+            if is_raw && class_has_any_base(c) && !body_has_init(&new_class.body) {
+                let synthesised = synthesise_raw_class_init(&new_class.body);
+                // Place `__init__` after the leading run of (docstring +
+                // field annotations) so the class reads top-to-bottom:
+                // doc → fields → __init__ → methods.
+                let insert_at = raw_class_init_insert_pos(&new_class.body);
+                new_class.body.insert(insert_at, synthesised);
+            }
             // Only propagate `true` when a dataclass decorator was added (or
             // was added deeper in the body) — that's the signal used by
             // `desugar_mod_module` to decide whether to inject `import dataclasses`.
@@ -1013,7 +1051,7 @@ fn desugar_stmt(stmt: &Stmt) -> (Stmt, bool) {
             )
         }
         Stmt::FunctionDef(f) => {
-            let (new_body, transformed) = desugar_stmts(&f.body);
+            let (new_body, transformed) = desugar_stmts(&f.body, raw_class_starts);
             let mut new_f = f.clone();
             new_f.body = new_body;
             (Stmt::FunctionDef(new_f), transformed)
@@ -1310,6 +1348,223 @@ fn make_alias(name: &str) -> Alias {
     }
 }
 
+// ── `class!` __init__ synthesis ─────────────────────────────────────────────
+
+/// True when the class has at least one positional base (`class Foo(Bar):`).
+/// Keyword arguments alone — `metaclass=`, `total=False`, etc. — don't
+/// count; a class with no positional base has nothing meaningful to chain
+/// `super().__init__()` through.
+fn class_has_any_base(c: &ruff_python_ast::StmtClassDef) -> bool {
+    c.arguments
+        .as_ref()
+        .map(|a| !a.args.is_empty())
+        .unwrap_or(false)
+}
+
+/// True when the class body already defines a `def __init__`.  We never
+/// overwrite an author-written constructor.
+fn body_has_init(body: &[Stmt]) -> bool {
+    body.iter().any(|s| match s {
+        Stmt::FunctionDef(f) => f.name.as_str() == "__init__",
+        _ => false,
+    })
+}
+
+/// Insertion index for a synthesised `__init__`: skip past a leading
+/// docstring and the contiguous run of field annotations that follows.
+/// Stops at the first method (FunctionDef), assignment without
+/// annotation, or other statement so the synthesised constructor lands
+/// where a hand-written one would naturally go.
+fn raw_class_init_insert_pos(body: &[Stmt]) -> usize {
+    let mut idx = 0;
+    if let Some(Stmt::Expr(e)) = body.first() {
+        if matches!(&*e.value, Expr::StringLiteral(_)) {
+            idx = 1;
+        }
+    }
+    while let Some(stmt) = body.get(idx) {
+        if matches!(stmt, Stmt::AnnAssign(_)) {
+            idx += 1;
+        } else {
+            break;
+        }
+    }
+    idx
+}
+
+/// Synthesise an `__init__(self, …) -> None` for a `class!` body. The
+/// function calls `super().__init__()` first, then assigns every
+/// `AnnAssign`-declared field through `self`. Fields without a default
+/// come before fields with one — Python disallows a default-bearing
+/// positional parameter from preceding a non-default one, so we
+/// stable-partition the field list to keep the generated signature
+/// valid. Relative order within each group is preserved.
+fn synthesise_raw_class_init(body: &[Stmt]) -> Stmt {
+    use ruff_python_ast::{StmtAnnAssign, StmtFunctionDef};
+    // Collect (name, annotation, optional default) for each top-level
+    // annotated field. Non-Name targets (subscript / attribute annotations)
+    // are skipped — they're not fields.
+    let raw_fields: Vec<(&Name, Expr, Option<Expr>)> = body
+        .iter()
+        .filter_map(|s| {
+            if let Stmt::AnnAssign(StmtAnnAssign {
+                target,
+                annotation,
+                value,
+                ..
+            }) = s
+            {
+                if let Expr::Name(n) = target.as_ref() {
+                    return Some((&n.id, (**annotation).clone(), value.as_deref().cloned()));
+                }
+            }
+            None
+        })
+        .collect();
+    // Stable partition: non-defaulted params first, then defaulted ones.
+    let (no_default, with_default): (Vec<_>, Vec<_>) = raw_fields
+        .iter()
+        .cloned()
+        .partition(|(_, _, default)| default.is_none());
+    let fields: Vec<(&Name, Expr, Option<Expr>)> =
+        no_default.into_iter().chain(with_default).collect();
+
+    // Build the parameter list: `self` + one entry per field.
+    let mut args: Vec<ParameterWithDefault> = Vec::with_capacity(fields.len() + 1);
+    args.push(ParameterWithDefault {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        parameter: Parameter {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            name: make_identifier("self"),
+            annotation: None,
+        },
+        default: None,
+    });
+    for (name, annotation, default) in &fields {
+        args.push(ParameterWithDefault {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            parameter: Parameter {
+                range: TextRange::default(),
+                node_index: AtomicNodeIndex::NONE,
+                name: make_identifier(name.as_str()),
+                annotation: Some(Box::new(annotation.clone())),
+            },
+            default: default.as_ref().map(|d| Box::new(d.clone())),
+        });
+    }
+
+    // Build the body: `super().__init__()` followed by `self.x = x` …
+    // Assignments use source order (the `raw_fields` order, not the
+    // partitioned signature order) so the body reads top-to-bottom like
+    // the original class definition.
+    let mut new_body: Vec<Stmt> = Vec::with_capacity(raw_fields.len() + 1);
+    new_body.push(make_super_init_call_stmt());
+    for (name, _, _) in &raw_fields {
+        new_body.push(make_self_field_assign_stmt(name.as_str()));
+    }
+
+    Stmt::FunctionDef(StmtFunctionDef {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        is_async: false,
+        decorator_list: Vec::new(),
+        name: make_identifier("__init__"),
+        type_params: None,
+        parameters: Box::new(Parameters {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            posonlyargs: Vec::new(),
+            args,
+            vararg: None,
+            kwonlyargs: Vec::new(),
+            kwarg: None,
+        }),
+        returns: Some(Box::new(make_none_expr())),
+        body: new_body,
+    })
+}
+
+/// `super().__init__()` as an expression statement.
+fn make_super_init_call_stmt() -> Stmt {
+    use ruff_python_ast::StmtExpr;
+    // super()
+    let super_call = Expr::Call(ExprCall {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        func: Box::new(make_bare_name_expr("super")),
+        arguments: Arguments {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            args: Box::new([]),
+            keywords: Box::new([]),
+        },
+    });
+    // super().__init__
+    let super_init = Expr::Attribute(ExprAttribute {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        value: Box::new(super_call),
+        attr: make_identifier("__init__"),
+        ctx: ExprContext::Load,
+    });
+    // super().__init__()
+    let call = Expr::Call(ExprCall {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        func: Box::new(super_init),
+        arguments: Arguments {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            args: Box::new([]),
+            keywords: Box::new([]),
+        },
+    });
+    Stmt::Expr(StmtExpr {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        value: Box::new(call),
+    })
+}
+
+/// `self.<name> = <name>` as an assignment statement.
+fn make_self_field_assign_stmt(field: &str) -> Stmt {
+    let target = Expr::Attribute(ExprAttribute {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        value: Box::new(make_bare_name_expr("self")),
+        attr: make_identifier(field),
+        ctx: ExprContext::Store,
+    });
+    let value = make_bare_name_expr(field);
+    Stmt::Assign(StmtAssign {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        targets: vec![target],
+        value: Box::new(value),
+        mutability: None,
+    })
+}
+
+fn make_bare_name_expr(name: &str) -> Expr {
+    Expr::Name(ExprName {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        id: Name::new(name),
+        ctx: ExprContext::Load,
+    })
+}
+
+fn make_none_expr() -> Expr {
+    use ruff_python_ast::ExprNoneLiteral;
+    Expr::NoneLiteral(ExprNoneLiteral {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+    })
+}
+
 fn make_string_literal_expr(text: &str) -> Expr {
     let lit = StringLiteral {
         range: TextRange::default(),
@@ -1499,6 +1754,253 @@ mod tests {
             "output:\n{out}"
         );
         assert!(out.contains("import dataclasses"), "output:\n{out}");
+    }
+
+    fn raw_class_starts_for(src: &str) -> (ModModule, Vec<u32>) {
+        let parsed = tyc_syntax::parse_module(src).expect("parse failed");
+        let module = parsed.into_syntax();
+        let starts: Vec<u32> = module
+            .body
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::ClassDef(c) => Some(u32::from(c.range.start())),
+                _ => None,
+            })
+            .collect();
+        (module, starts)
+    }
+
+    #[test]
+    fn raw_class_with_fields_synthesises_init_with_super() {
+        let src = "class Net(Module):\n    layer: int\n    dropout: float\n";
+        let (module, starts) = raw_class_starts_for(src);
+        let out = desugar_module_with(
+            &module,
+            DesugarOptions {
+                memoise_functions: Vec::new(),
+                raw_class_line_starts: starts,
+            },
+        );
+        let emitted = emit(&out.module);
+        assert!(
+            emitted.contains("def __init__(self, layer: int, dropout: float) -> None:"),
+            "expected synthesised __init__ signature:\n{emitted}"
+        );
+        assert!(
+            emitted.contains("super().__init__()"),
+            "expected super() call:\n{emitted}"
+        );
+        assert!(
+            emitted.contains("self.layer = layer"),
+            "expected self.layer assignment:\n{emitted}"
+        );
+        assert!(
+            emitted.contains("self.dropout = dropout"),
+            "expected self.dropout assignment:\n{emitted}"
+        );
+        // Annotations stay above the synthesised init (canonical layout).
+        let init_pos = emitted.find("def __init__").unwrap();
+        let layer_pos = emitted.find("layer: int").unwrap();
+        assert!(
+            layer_pos < init_pos,
+            "fields should precede __init__:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn raw_class_with_decorator_still_recognised() {
+        // Ruff sets `StmtClassDef.range.start()` to the `@` token when
+        // decorators are present, but the preprocessor records the
+        // `class` keyword line. The desugar pass must look at the
+        // header span (start..name) rather than the node start, or this
+        // raw class would silently receive `@dataclass`. The source
+        // here is the *post-preprocess* form (the `!` is already
+        // stripped), matching what `tyc_syntax::parse_module` sees.
+        let src = "@deco\nclass Net(Module):\n    rank: int\n";
+        let parsed = tyc_syntax::parse_module(src).expect("parse failed");
+        let module = parsed.into_syntax();
+        // Match what `tyc_syntax::preprocess::line_byte_starts` would
+        // emit for the `class!` line: the byte offset of the `class`
+        // keyword (after leading whitespace).
+        let class_kw = src.find("class").unwrap() as u32;
+        let out = desugar_module_with(
+            &module,
+            DesugarOptions {
+                memoise_functions: Vec::new(),
+                raw_class_line_starts: vec![class_kw],
+            },
+        );
+        let emitted = emit(&out.module);
+        assert!(
+            !emitted.contains("@dataclasses.dataclass"),
+            "decorated raw class must skip @dataclass:\n{emitted}"
+        );
+        assert!(
+            emitted.contains("def __init__(self, rank: int) -> None:"),
+            "decorated raw class must still get the synthesised __init__:\n{emitted}"
+        );
+        assert!(
+            emitted.contains("@deco"),
+            "the author's decorator must survive:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn raw_class_defaults_partition_to_keep_signature_valid() {
+        // Source order is x (default) → y (no default) → z (no default).
+        // Naive emission would produce `def __init__(self, x=1, y, z)`,
+        // which is a SyntaxError. The synthesis must stable-partition so
+        // non-defaulted params come first.
+        let src = "class Net(Module):\n    x: int = 1\n    y: int\n    z: str\n";
+        let (module, starts) = raw_class_starts_for(src);
+        let out = desugar_module_with(
+            &module,
+            DesugarOptions {
+                memoise_functions: Vec::new(),
+                raw_class_line_starts: starts,
+            },
+        );
+        let emitted = emit(&out.module);
+        assert!(
+            emitted.contains("def __init__(self, y: int, z: str, x: int = 1) -> None:"),
+            "synthesised __init__ must reorder defaults to the tail:\n{emitted}"
+        );
+        // Assignment block stays in source order (reads top-to-bottom).
+        let body_order = emitted
+            .lines()
+            .filter_map(|l| {
+                let t = l.trim();
+                if let Some(rest) = t.strip_prefix("self.") {
+                    rest.split(' ').next()
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            body_order,
+            vec!["x", "y", "z"],
+            "self.<field> assignments must follow source order:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn raw_class_default_value_flows_into_init_signature() {
+        let src = "class Net(Module):\n    width: int\n    height: int = 100\n";
+        let (module, starts) = raw_class_starts_for(src);
+        let out = desugar_module_with(
+            &module,
+            DesugarOptions {
+                memoise_functions: Vec::new(),
+                raw_class_line_starts: starts,
+            },
+        );
+        let emitted = emit(&out.module);
+        assert!(
+            emitted.contains("def __init__(self, width: int, height: int = 100) -> None:"),
+            "expected default value in synthesised __init__:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn raw_class_with_explicit_init_is_left_alone() {
+        let src =
+            "class Net(Module):\n    width: int\n\n    def __init__(self, width: int) -> None:\n        self.width = width * 2\n";
+        let (module, starts) = raw_class_starts_for(src);
+        let out = desugar_module_with(
+            &module,
+            DesugarOptions {
+                memoise_functions: Vec::new(),
+                raw_class_line_starts: starts,
+            },
+        );
+        let emitted = emit(&out.module);
+        // Only ONE __init__: the user's.
+        assert_eq!(
+            emitted.matches("def __init__").count(),
+            1,
+            "explicit __init__ must not be duplicated:\n{emitted}"
+        );
+        // The user's body is preserved.
+        assert!(
+            emitted.contains("self.width = width * 2"),
+            "user __init__ body must be preserved:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn raw_class_without_bases_skips_synthesis() {
+        // No bases → no super() chain to invoke; we leave the class alone.
+        let src = "class Standalone:\n    x: int\n";
+        let (module, starts) = raw_class_starts_for(src);
+        let out = desugar_module_with(
+            &module,
+            DesugarOptions {
+                memoise_functions: Vec::new(),
+                raw_class_line_starts: starts,
+            },
+        );
+        let emitted = emit(&out.module);
+        assert!(
+            !emitted.contains("def __init__"),
+            "no __init__ should be synthesised for a raw class with no bases:\n{emitted}"
+        );
+        // Also: no dataclass decorator (since `class!` was set).
+        assert!(
+            !emitted.contains("@dataclasses.dataclass"),
+            "raw class must still skip @dataclass:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn plain_class_unaffected_by_init_synthesis() {
+        // Plain `class` (not `class!`) keeps its dataclass treatment and
+        // never gets a hand-rolled __init__ injected.
+        let src = "class Plain(Base):\n    x: int\n";
+        let parsed = tyc_syntax::parse_module(src).expect("parse failed");
+        let module = parsed.into_syntax();
+        let out = desugar_module_with(&module, DesugarOptions::default());
+        let emitted = emit(&out.module);
+        assert!(
+            emitted.contains("@dataclasses.dataclass"),
+            "plain class should still receive @dataclass:\n{emitted}"
+        );
+        assert!(
+            !emitted.contains("def __init__"),
+            "plain class must NOT get a synthesised __init__:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn raw_class_skips_dataclass_decorator() {
+        // Simulate the preprocessor output: `class!` is stripped to `class`
+        // and the line index is recorded in `raw_class_line_starts`.  The
+        // desugar pass should leave the class alone — no `@dataclass`, no
+        // injected `import dataclasses`.
+        let src = "class MyModel:\n    name: str\n";
+        let parsed = tyc_syntax::parse_module(src).expect("parse failed");
+        let module = parsed.into_syntax();
+        let class_start = match &module.body[0] {
+            Stmt::ClassDef(c) => u32::from(c.range.start()),
+            _ => panic!("expected class def"),
+        };
+        let out = desugar_module_with(
+            &module,
+            DesugarOptions {
+                memoise_functions: Vec::new(),
+                raw_class_line_starts: vec![class_start],
+            },
+        );
+        let emitted = emit(&out.module);
+        assert!(
+            !emitted.contains("@dataclasses.dataclass"),
+            "raw class must not receive @dataclass:\n{emitted}"
+        );
+        assert!(
+            !emitted.contains("import dataclasses"),
+            "raw class must not trigger dataclasses import:\n{emitted}"
+        );
+        assert!(emitted.contains("class MyModel:"), "output:\n{emitted}");
     }
 
     #[test]

@@ -70,6 +70,86 @@ across multi-line expansions (`with`-chains, `gather:`, `?`
 propagation). The format is JS-source-maps-v3-shaped enough for the
 LSP's cross-file go-to-definition path to consume it too.
 
+### `class!` raw-class modifier — prototype landed, polish outstanding
+
+**Status: prototype implemented.** A `class!` modifier now suppresses
+the automatic `@dataclass` decorator injection at desugar time. The
+preprocessor strips the `!`, records the line in
+`PreprocessResult::raw_class_lines`, and `desugar_module_with` skips
+the decorator (and the `import dataclasses` injection) for any class
+whose `TextRange` starts at one of those byte offsets. Round-trips
+through `tyc fmt`. See `crates/tyc-syntax/src/preprocess.rs`,
+`crates/tyc-desugar/src/lib.rs:973`, and the regression tests
+`raw_class_strips_bang_and_records_line`,
+`raw_class_round_trips_via_postprocess`, and
+`raw_class_skips_dataclass_decorator`.
+
+The motivating problem: subclassing `torch.nn.Module`, `enum.Enum`,
+`typing.NamedTuple`, `unittest.TestCase`, or framework declarative
+bases (Django, SQLAlchemy) all need a non-trivial `__init__` that
+runs *before* field assignment. The auto-injected dataclass
+`__init__` never calls `super().__init__()`, so e.g. `nn.Module._parameters`
+is never initialised and the first attribute assignment crashes
+inside `Module.__setattr__`.
+
+Working example:
+
+```typhon
+import torch.nn as nn
+
+class! MyModel(nn.Module):
+    layer: nn.Linear
+    dropout: float
+
+    def forward(self, x):
+        return self.layer(x)
+```
+
+The desugar pass now **auto-generates `__init__`** for any `class!`
+that has at least one positional base and no hand-written `def
+__init__` in the body. The synthesised constructor calls
+`super().__init__()` and then assigns every annotated field through
+`self`, in source order. Field defaults flow into the parameter
+signature. Hand-written `__init__` blocks are preserved verbatim. So
+the example above lowers to:
+
+```python
+class MyModel(nn.Module):
+    layer: nn.Linear
+    dropout: float
+
+    def __init__(self, layer: nn.Linear, dropout: float) -> None:
+        super().__init__()
+        self.layer = layer
+        self.dropout = dropout
+
+    def forward(self, x):
+        return self.layer(x)
+```
+
+Outstanding before this can ship as a documented feature:
+
+- **Language guide.** No mention in `docs/language.md` yet — needs a
+  short section explaining when to reach for `class!` vs. `class` /
+  `model` / `interface`.
+- **Type-checker integration.** A `class!` body still gets the same
+  treatment as a plain `class` in `tyc-types`; in particular the
+  field-initialisation requirement no longer applies (the user's
+  `__init__` does the work), but the checker doesn't know that. Today
+  this is fine because field annotations on a raw class compile to
+  bare class-level annotations, but a future check that warns on
+  missing initialisers needs to be class-kind-aware.
+- **`tyc migrate` symmetry.** Going `.py` → `.ty`, classes with an
+  explicit `__init__` that doesn't match the dataclass shape should
+  emit as `class!` rather than `class`. Currently `migrate` always
+  emits plain `class`.
+- **LSP hover.** `class!` declarations should advertise themselves in
+  hover output the way `mut`/`let` bindings do.
+- **Cross-module raw-class tracking.** The byte-offset list is
+  per-module today. If a future pass needs to know "is this class
+  raw?" from a different module, the resolver should propagate the
+  flag onto the binding metadata rather than rely on line lookup.
+
 ### Runtime stubtest probe
 
 `tyc check --stubs` performs an AST diff today.  mypy's `stubtest`
@@ -97,3 +177,8 @@ delete, signature change).
 4. `ty` integration as a complementary second-stage checker (see
    `docs/ty-integration.md`).
 5. Richer comptime: `comptime` functions, types as values.
+6. Document `class!` in `docs/language.md`, teach `tyc migrate` to
+   emit it when the source `.py` has a hand-rolled `__init__` that
+   conflicts with dataclass generation, and surface the modifier in
+   LSP hover. The prototype landed; see the "`class!` raw-class
+   modifier" section above.

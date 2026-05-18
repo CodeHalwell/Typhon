@@ -30,6 +30,12 @@ pub struct Emitter {
     /// emitted.  Set this for build output that must be valid Python;
     /// leave it `false` for `tyc fmt`-style round-tripping.
     suppress_mutability: bool,
+    /// PEP 8 requires two blank lines around top-level class/def statements.
+    /// We track whether the previous *module-level* statement was a class or
+    /// function definition so the next top-level statement can prepend the
+    /// extra blank line.  Reset to `false` after emitting a non-block stmt
+    /// at indent 0.
+    prev_top_level_was_block: bool,
 }
 
 const INDENT_WIDTH: usize = 4;
@@ -42,6 +48,7 @@ impl Emitter {
             current_input_offset: 0,
             line_offsets: Vec::new(),
             suppress_mutability: false,
+            prev_top_level_was_block: false,
         }
     }
 
@@ -70,6 +77,24 @@ impl Emitter {
     fn newline(&mut self) {
         self.line_offsets.push(self.current_input_offset);
         self.output.push('\n');
+    }
+
+    /// Append newlines until `self.output` ends in *at least* `count`
+    /// trailing `\n` bytes (existing trailing newlines are preserved, not
+    /// trimmed). Used to enforce PEP 8's two-blank-line rule around
+    /// top-level class/def blocks: two blanks = three trailing `\n`.
+    /// Callers rely on the floor; nothing in the pipeline produces a
+    /// runaway tail of newlines, so trimming would only mask bugs.
+    fn ensure_trailing_newlines(&mut self, count: usize) {
+        let trailing = self
+            .output
+            .bytes()
+            .rev()
+            .take_while(|&b| b == b'\n')
+            .count();
+        for _ in trailing..count {
+            self.newline();
+        }
     }
 
     fn indent_str(&self) -> String {
@@ -113,10 +138,26 @@ impl Emitter {
         if u32::from(range.start()) != u32::from(range.end()) {
             self.current_input_offset = u32::from(range.start()) as usize;
         }
+        // PEP 8: surround top-level class/def with two blank lines.  We
+        // enforce this on either side of the block by checking both the
+        // current statement and the previous top-level one.  Two blank
+        // lines = three trailing `\n` characters before we emit anything
+        // for the new statement.  The legacy `self.newline()` calls at
+        // the start of the FunctionDef/ClassDef branches stay in place
+        // for non-module scopes (methods inside a class).
+        let current_is_block = matches!(node, Stmt::FunctionDef(_) | Stmt::ClassDef(_));
+        if self.indent == 0
+            && !self.output.is_empty()
+            && (current_is_block || self.prev_top_level_was_block)
+        {
+            self.ensure_trailing_newlines(3);
+        }
         match node {
             // `StmtFunctionDef` collapses sync and async; branch on `is_async`.
             Stmt::FunctionDef(f) => {
-                self.newline();
+                if self.indent != 0 {
+                    self.newline();
+                }
                 for decorator in &f.decorator_list {
                     self.fill("@");
                     self.emit_expr(&decorator.expression);
@@ -150,7 +191,9 @@ impl Emitter {
             }
 
             Stmt::ClassDef(c) => {
-                self.newline();
+                if self.indent != 0 {
+                    self.newline();
+                }
                 for decorator in &c.decorator_list {
                     self.fill("@");
                     self.emit_expr(&decorator.expression);
@@ -530,6 +573,9 @@ impl Emitter {
                 self.write(&cmd.value);
                 self.newline();
             }
+        }
+        if self.indent == 0 {
+            self.prev_top_level_was_block = current_is_block;
         }
     }
 
@@ -1498,6 +1544,51 @@ mod tests {
         assert!(
             out.contains("a + (not b)"),
             "`not` as BinOp child must be parenthesised, got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn two_blank_lines_between_top_level_classes() {
+        let src = "class A:\n    x: int\n\nclass B:\n    y: int\n";
+        let out = round_trip(src);
+        assert!(
+            out.contains("y: int\n"),
+            "field missing from emitted class B: {}",
+            out
+        );
+        assert!(
+            out.contains("\n\n\nclass B"),
+            "PEP 8 requires two blank lines before top-level class, got: {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn two_blank_lines_after_top_level_class() {
+        // The statement that follows a top-level class/def must also have
+        // two blank lines before it, even when the statement itself is not
+        // a block (e.g. a module-level assignment or a bare call).
+        let src = "class A:\n    x: int\n\ngreeting = \"hi\"\nmain()\n";
+        let out = round_trip(src);
+        assert!(
+            out.contains("\n\n\ngreeting = "),
+            "expected two blank lines between top-level class and assignment, got: {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn methods_keep_single_blank_line() {
+        // Inside a class body methods are separated by ONE blank line, not two.
+        let src =
+            "class A:\n    def foo(self) -> None:\n        pass\n    def bar(self) -> None:\n        pass\n";
+        let out = round_trip(src);
+        assert!(out.contains("def foo"), "missing foo: {}", out);
+        assert!(out.contains("def bar"), "missing bar: {}", out);
+        assert!(
+            !out.contains("\n\n\n    def bar"),
+            "methods must not get two blank lines between them, got: {:?}",
             out
         );
     }

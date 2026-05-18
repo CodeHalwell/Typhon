@@ -45,6 +45,16 @@ pub enum TyphonKeyword {
     /// `lazy` — prefix for `lazy import X = module`; the module is loaded on
     /// first attribute access rather than at import time.
     Lazy,
+    /// `class!` — declares a raw class that suppresses `@dataclass`
+    /// injection at desugar time. Intended for subclasses of bases that
+    /// need a non-trivial `__init__` to run before fields are assigned —
+    /// `torch.nn.Module`, `enum.Enum`, `unittest.TestCase`, and ORM
+    /// declarative bases. When the body has no hand-written `def
+    /// __init__` and the class has at least one positional base, the
+    /// desugar pass synthesises one that calls `super().__init__()` and
+    /// then assigns each annotated field through `self`; otherwise the
+    /// author's `__init__` is preserved verbatim.
+    RawClass,
 }
 
 impl TyphonKeyword {
@@ -62,6 +72,7 @@ impl TyphonKeyword {
             Self::Gather => "gather",
             Self::Go => "go",
             Self::Lazy => "lazy",
+            Self::RawClass => "class!",
         }
     }
 
@@ -79,6 +90,7 @@ impl TyphonKeyword {
             "gather" => Some(Self::Gather),
             "go" => Some(Self::Go),
             "lazy" => Some(Self::Lazy),
+            "class!" => Some(Self::RawClass),
             _ => None,
         }
     }
