@@ -70,6 +70,46 @@ across multi-line expansions (`with`-chains, `gather:`, `?`
 propagation). The format is JS-source-maps-v3-shaped enough for the
 LSP's cross-file go-to-definition path to consume it too.
 
+### `class` cannot escape the dataclass decorator
+
+`tyc-desugar` injects `@dataclasses.dataclass(slots=True)` onto every
+`class` whose base list is neither `Protocol` (interfaces) nor
+`BaseModel` (Pydantic). There is no escape hatch — no `class!`, no
+`extern class`, no support for an author-written `def __init__` that
+suppresses the decorator.
+
+That breaks any class whose base needs a non-trivial `__init__` to
+register state on `self` before fields are assigned. The dominant
+real-world case is `torch.nn.Module`:
+
+```typhon
+import torch.nn as nn
+
+class MyModel(nn.Module):
+    layer: nn.Linear
+```
+
+…lowers to a dataclass whose generated `__init__` never calls
+`nn.Module.__init__`, so `_parameters` / `_modules` / `_buffers` are
+never initialised and the first attribute assignment crashes inside
+`Module.__setattr__`. The same shape blocks `enum.Enum`, `typing.NamedTuple`,
+`unittest.TestCase`, and most ORM model bases (Django, SQLAlchemy
+declarative).
+
+The current workarounds — defining the class in a `.py` file and
+importing it, or wrapping the call site in `unsafe:` — both surrender
+Typhon's value proposition for the file in question.
+
+Proposed shape (to discuss): introduce a `class!` modifier (parallels
+the existing `model` keyword for Pydantic emission) that suppresses
+`@dataclass` injection and lets the author write a hand-rolled
+`__init__` with `super().__init__()` as the first call. The change
+touches: vendored parser (recognise the `!` suffix or a new soft
+keyword), `Mutability`-style flag on `StmtClassDef`, the desugar
+guard at `tyc-desugar/src/lib.rs:973`, and the emitter (no decorator
+emitted for raw classes). Should land before any ML-adjacent example
+makes it into the guides.
+
 ### Runtime stubtest probe
 
 `tyc check --stubs` performs an AST diff today.  mypy's `stubtest`
@@ -97,3 +137,7 @@ delete, signature change).
 4. `ty` integration as a complementary second-stage checker (see
    `docs/ty-integration.md`).
 5. Richer comptime: `comptime` functions, types as values.
+6. Raw-class escape hatch (`class!` or equivalent) so authors can
+   subclass `torch.nn.Module` / `enum.Enum` / framework bases that
+   need a hand-rolled `__init__` — see the "`class` cannot escape the
+   dataclass decorator" section above.
