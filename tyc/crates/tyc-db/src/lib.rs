@@ -636,6 +636,50 @@ def divide(a: int, b: int) -> Result[int, str]:
     }
 
     #[test]
+    fn check_file_result_error_mismatch_via_question_op() {
+        // FINDINGS #13 polish: when `?` propagates an `Err[E1]` into a
+        // function returning `Result[T, E2]` with `E1 != E2`, the diagnostic
+        // must carry the dedicated `tyc::result_error_mismatch` code rather
+        // than the generic `tyc::type_mismatch`.
+        let src = "\
+def parse_port(raw: str) -> Result[int, str]:
+    return Ok(int(raw))
+
+def bad(raw: str) -> Result[int, int]:
+    let n: int = parse_port(raw)?
+    return Ok(n)
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file(&mut db, "<test>".into(), src.to_owned());
+        assert!(diags.has_errors(), "?-op error mismatch must error");
+        assert!(
+            diags
+                .errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ResultErrorMismatch { .. })),
+            "expected ResultErrorMismatch variant, got: {:?}",
+            diags.errors()
+        );
+    }
+
+    #[test]
+    fn check_file_result_matching_errs_no_diagnostic() {
+        // Sanity check: matching error types through `?` continue to type-
+        // check clean (no false positives from the new detection path).
+        let src = "\
+def parse_port(raw: str) -> Result[int, str]:
+    return Ok(int(raw))
+
+def good(raw: str) -> Result[int, str]:
+    let n: int = parse_port(raw)?
+    return Ok(n)
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file(&mut db, "<test>".into(), src.to_owned());
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
     fn check_file_comptime_binding_recognised() {
         let src = "\
 comptime let PORT: int = 8080

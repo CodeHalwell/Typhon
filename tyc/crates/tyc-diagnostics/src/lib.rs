@@ -119,6 +119,25 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// The error type propagated by `?` from a callee does not match the
+    /// caller's `Result[T, E]` declaration. Distinct from the generic
+    /// `tyc::type_mismatch` so users see immediately that the failure is
+    /// at a `?`-propagation boundary and can act accordingly (convert at
+    /// the boundary, or change one of the function signatures).
+    #[error("`?` propagates `Err[{actual_err}]` into `Result[_, {expected_err}]`")]
+    #[diagnostic(
+        code(tyc::result_error_mismatch),
+        help("the `?` operator forwards the callee's `Err` value as-is; convert it with a `match` or change one signature so the error types match")
+    )]
+    ResultErrorMismatch {
+        expected_err: String,
+        actual_err: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("error type does not match the enclosing function's `Result`")]
+        span: SourceSpan,
+    },
+
     /// A function was called with the wrong number of positional arguments.
     #[error("wrong number of arguments to `{name}`: expected {expected}, got {actual}")]
     #[diagnostic(code(tyc::arg_count))]
@@ -464,6 +483,23 @@ impl TycError {
         Self::NullableUse {
             name: name.into(),
             expected: expected.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::ResultErrorMismatch`] diagnostic.
+    pub fn result_error_mismatch(
+        expected_err: impl Into<String>,
+        actual_err: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::ResultErrorMismatch {
+            expected_err: expected_err.into(),
+            actual_err: actual_err.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }
