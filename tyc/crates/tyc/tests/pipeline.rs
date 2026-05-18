@@ -413,7 +413,10 @@ fn migrate_rewrites_optional_annotation() {
     .unwrap();
 
     let status = tyc().arg("migrate").arg(&py_path).status().unwrap();
-    assert!(status.success(), "tyc migrate should succeed on valid Python");
+    assert!(
+        status.success(),
+        "tyc migrate should succeed on valid Python"
+    );
 
     let ty_path = tmp.path().join("app.ty");
     assert!(ty_path.exists(), "tyc migrate should produce a .ty file");
