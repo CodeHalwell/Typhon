@@ -609,7 +609,15 @@ class Err(Generic[_E]):
     error: _E
 
 
-type Result[T, E] = Ok[T] | Err[E]
+# Use `typing.Union` rather than PEP 695 `type Result[T, E] = …` so the
+# generated runtime loads under Python 3.10 / 3.11 / 3.12 as well as the
+# 3.13+ default. The runtime never inspects the alias's generic
+# parameters — `isinstance(x, Err)` and the dataclass shape are what the
+# rest of the runtime relies on — so dropping the parameters here is
+# harmless. Static type checkers still see `Result` as a union of `Ok`
+# and `Err`.
+from typing import TypeAlias, Union
+Result: TypeAlias = Union[Ok, Err]
 
 __all__ = [\"Ok\", \"Err\", \"Result\", \"tasks\", \"lazy\", \"stdlib\", \"result\", \"parallel\"]
 ";

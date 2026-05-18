@@ -1251,7 +1251,17 @@ impl Emitter {
                 Singleton::False => self.write("False"),
             },
             Pattern::MatchSequence(seq) => {
-                self.write("[");
+                // Python's sequence patterns accept both `[a, b]` and
+                // `(a, b)` (PEP 634); they're semantically identical and
+                // both match list *or* tuple instances. We default to
+                // parens for 2+ elements because it reads better in
+                // emitted Python ("destructure this pair"), but keep
+                // brackets for 0/1 elements where parens would be
+                // ambiguous (`()` is invalid in pattern position; `(a)`
+                // would parse as a capture, not a 1-tuple).
+                let use_parens = seq.patterns.len() >= 2;
+                let (open, close) = if use_parens { ("(", ")") } else { ("[", "]") };
+                self.write(open);
                 let mut first = true;
                 for p in &seq.patterns {
                     if !first {
@@ -1260,7 +1270,7 @@ impl Emitter {
                     self.emit_pattern(p);
                     first = false;
                 }
-                self.write("]");
+                self.write(close);
             }
             Pattern::MatchMapping(m) => {
                 self.write("{");

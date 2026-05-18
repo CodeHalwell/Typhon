@@ -763,6 +763,16 @@ a function is statically detectable. Mark it `mut`.
 
 ## 23. `Result[T, E]` pattern lowering converts tuple patterns to list patterns (bug, subtle)
 
+**Status:** **FIXED (cosmetic)** on `claude/update-findings-IdfrH`. The
+emitter's `Pattern::MatchSequence` arm now uses parens for 2+ element
+sequences (keeping brackets for 0/1 element cases where `()` / `(a)`
+would be ambiguous in pattern position). `case Ok((u1, u2))` now emits
+verbatim instead of `case Ok([u1, u2])`. Worth noting that the
+*semantics* were unchanged: per PEP 634, sequence patterns match both
+list and tuple instances regardless of `[ ]` vs `( )` syntax, so the
+"indistinguishable patterns" concern in the original finding was a
+false alarm — the round-trip is now cosmetically clean too.
+
 **Severity:** bug — wrong semantically; works by accident in CPython.
 
 Source:
@@ -797,6 +807,15 @@ Two issues:
 ---
 
 ## 24. `typhon_runtime/__init__.py` uses PEP 695 `type` statement (gap)
+
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Replaced the
+PEP 695 `type Result[T, E] = Ok[T] | Err[E]` line in the bundled
+`typhon_runtime/__init__.py` template with the backward-compatible
+`from typing import TypeAlias, Union; Result: TypeAlias = Union[Ok,
+Err]` form. Generated build output now loads under Python 3.10 / 3.11
+/ 3.12 as well as the 3.13+ default. The runtime never inspects the
+alias's generic parameters at runtime, so dropping `[T, E]` is
+harmless; static type checkers still see the union of `Ok` and `Err`.
 
 **Severity:** gap — interacts with the "no runtime dep" pitch.
 
