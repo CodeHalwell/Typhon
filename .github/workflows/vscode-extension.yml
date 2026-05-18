@@ -1,0 +1,47 @@
+name: VS Code Extension
+
+on:
+  push:
+    branches: ["main", "dev/**", "claude/**"]
+    paths:
+      - "editors/vscode/**"
+      - ".github/workflows/vscode-extension.yml"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "editors/vscode/**"
+      - ".github/workflows/vscode-extension.yml"
+
+jobs:
+  build:
+    name: Build & package
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: editors/vscode
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Compile TypeScript
+        run: npm run compile
+
+      - name: Package extension
+        run: npx --yes @vscode/vsce package --allow-missing-repository --out typhon.vsix
+
+      - name: Upload VSIX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: typhon-vscode-extension
+          path: editors/vscode/typhon.vsix
+          if-no-files-found: error
