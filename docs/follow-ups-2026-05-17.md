@@ -161,8 +161,8 @@ delete, signature change).
 
 ## Recommended next steps, in order
 
-> **Update (May 2026):** items 1, 3, and 4 below have all landed.
-> The current list of open follow-ups is:
+> **Update (May 2026 — second pass):** items 3, 5, and 6 below have all
+> landed since the last revision. The current list of open follow-ups is:
 
 1. Promote `bind_typevars_and_substitute` into a full structural
    sub-type checker. Bounded type-var checking and basic
@@ -171,14 +171,34 @@ delete, signature change).
 2. Vendor `ruff_python_codegen` to replace `tyc-emit/src/printer.rs`,
    preserving the `line_offsets` hook the hand-written printer
    exposes today (see `tyc/vendor/README.md`).
-3. Runtime `stubtest` probe via `mypy --stubtest` as a complement
-   to the AST-level `tyc check --stubs` diff. Catches dynamically
-   created members the AST cannot see.
+3. ✅ **Runtime `stubtest` probe** — landed as `tyc stubtest`. The
+   command builds the project, walks the output for `.pyi` stubs,
+   derives Python import paths, and invokes
+   `python -m mypy.stubtest <module>` with `PYTHONPATH` pointing at
+   the build directory. Flags mirror `tyc ty` where they overlap;
+   `--keep-going` gets the full drift report in CI rather than
+   stopping at the first failure. Documented in `docs/cli.md` and
+   surfaced in the README's subcommand table.
 4. `ty` integration as a complementary second-stage checker (see
-   `docs/ty-integration.md`).
-5. Richer comptime: `comptime` functions, types as values.
-6. Document `class!` in `docs/language.md`, teach `tyc migrate` to
-   emit it when the source `.py` has a hand-rolled `__init__` that
-   conflicts with dataclass generation, and surface the modifier in
-   LSP hover. The prototype landed; see the "`class!` raw-class
-   modifier" section above.
+   `docs/ty-integration.md`). The subprocess form (`tyc ty`) is
+   shipped; the embedded-library form is still future work.
+5. ✅ **Richer comptime — `comptime def` functions.** The evaluator
+   now dispatches into user-declared `comptime def` helpers from
+   any `comptime let` RHS. v1 body grammar covers `return EXPR`,
+   local `let`/`mut`/plain assignments, `if`/`elif`/`else`, the
+   ternary `EXPR if COND else EXPR`, comparisons, and short-circuit
+   `and`/`or`/`not`. Recursion depth is capped at 64. Loops, exceptions,
+   `with`-blocks, and `class`/`def` declarations stay rejected.
+   Examples in `docs/language.md`. Types as values remain future
+   work.
+6. ✅ **`class!` polish** — documented in `docs/language.md`,
+   surfaced in LSP hover (rendered as "raw class (`class!`)"), and
+   `tyc migrate` now promotes a `class Name(...)` declaration to
+   `class! Name(...)` whenever the body declares a hand-written
+   `def __init__` at the immediate body indent and the class isn't
+   already opting into dataclass semantics via `@dataclass`. The
+   resolver carries a `ClassKind { Plain, Raw }` on every class
+   binding so downstream passes can branch on the marker without
+   re-scanning byte ranges; cross-file go-to-definition jumps
+   carry the metadata along, so hover after a jump still renders
+   the correct kind.
