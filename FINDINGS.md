@@ -255,6 +255,12 @@ non-best-effort `gather:` too (need to confirm — see Finding #5 below).
 
 ## 5. `gather:` block syntax is undocumented at the binding-keyword level
 
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. The skill's
+`gather:` section now explicitly notes that bindings inside the block
+are an intentional exception to Rule 2 (no `let`/`mut` required —
+the keyword itself introduces them as immutable single-assignment
+names). The best-effort scope bug (Finding #4) remains open.
+
 **Severity:** papercut — ambiguity in the docs.
 
 Source `gather:` block uses plain `a = fetch(uid)` style — no `let`/`mut`.
@@ -567,6 +573,16 @@ generate the bespoke `__TyphonLazy_np_` proxy class.
 ---
 
 ## 16. `lazy import` docs say `LazyLoader`, emit uses a custom proxy (doc)
+
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Replaced every
+`importlib.util.LazyLoader` mention across `SKILL.md`,
+`docs/language.md`, and `docs/guides/10-advanced-features.md` with a
+description of the bespoke `__TyphonLazy_<alias>_` proxy that the
+emitter actually produces (thread-safe via double-checked locking).
+`REFERENCE.md` already showed the correct lowering. The
+long-term-plan.md historical wording ("built on `importlib.util.LazyLoader`")
+is left as-is because that doc records the *design intent* of an older
+phase, not the current implementation.
 
 **Severity:** doc — the implementation is fine, the docs are out of date.
 
@@ -1046,6 +1062,14 @@ structure.
 ---
 
 ## 33. `let xs: list = []` shows a confusing "list vs list" diagnostic (papercut)
+
+**Status:** **FIXED** on `claude/update-findings-IdfrH`. Taught `assignable`
+that a bare built-in container annotation (`list`, `dict`, `tuple`,
+`set`, `frozenset`, `deque`) accepts any parameterisation of the same
+container — Python treats `list` and `list[Any]` interchangeably for
+annotations, and the user's intent in `let xs: list = []` is clear.
+`let xs: list = []` now type-checks; readers don't see the "expected
+`list`, found `list[?]`" head-scratcher.
 
 **Severity:** papercut — message text is misleading.
 

@@ -163,7 +163,7 @@ Deep immutability for class instances is an emit-time concern: pass `frozen=True
 
 ## Lazy loading
 
-- `lazy import np = numpy` → defers module loading until first attribute access via `importlib.util.LazyLoader`.
+- `lazy import np = numpy` → defers module loading until first attribute access via a generated `__TyphonLazy_<alias>_` proxy class (thread-safe, double-checked locking).
 - `lazy from foo import a, b` is **rejected** at parse time: PEP 690 notes that `from`-imports eagerly touch attributes on the source module and therefore defeat deferral. Use `lazy import foo` and access `foo.a` / `foo.b`.
 - `lazy let` module-level bindings → cached getter with a sentinel + lock helper in `typhon_runtime` (not `functools.cached_property`, which is instance-scoped, race-prone, and writable after first evaluation).
 - `lazy let` instance-level bindings on effectively immutable classes → `functools.cached_property`.

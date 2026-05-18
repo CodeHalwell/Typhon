@@ -660,13 +660,30 @@ fn append_ellipsis_to_bodiless_def(line: &str) -> Option<String> {
     // Strip a trailing comment (if any) before checking the bodiless tail.
     let no_comment = strip_trailing_comment(rest);
     let trimmed = no_comment.trim_end();
-    if trimmed.ends_with(':') || trimmed.ends_with("...") {
-        return None;
+    // Detect the function's header colon — anything at depth 0 *after*
+    // the closing `)`. A `:` there means the function has a body (either
+    // single-line `def f(): pass` or multi-line `def f():\n …`), so we
+    // must NOT rewrite — the line is already valid Python.
+    let mut depth = 0i32;
+    let mut past_close = false;
+    let bytes = trimmed.as_bytes();
+    for &b in bytes {
+        match b {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth -= 1;
+                if depth == 0 && b == b')' {
+                    past_close = true;
+                }
+            }
+            b':' if depth == 0 && past_close => return None,
+            _ => {}
+        }
     }
-    // Require either a `-> TYPE` return annotation or at least a closing
-    // `)`, so we don't accidentally rewrite a syntactically invalid line
-    // into something that masks a real user error.
-    if !trimmed.contains("->") && !trimmed.ends_with(')') {
+    // Require a `-> TYPE` return annotation so we don't accidentally
+    // rewrite a syntactically invalid `def f()` (no return type, no
+    // body) into something that masks a real user error.
+    if !trimmed.contains("->") {
         return None;
     }
     Some(format!("{}: ...{}", body.trim_end(), terminator))

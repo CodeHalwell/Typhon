@@ -65,7 +65,7 @@ The 30-second mental model. Everything else in this skill is detail under one of
 | Parallel awaits | `gather: a = f(); b = g()` | `async with asyncio.TaskGroup() as _tg: ...` |
 | Best-effort gather | `gather(strategy="best-effort"):` | `asyncio.gather(..., return_exceptions=True)` |
 | Spawn | `go f(x)` / `go f(x) -> task` | `typhon_runtime.tasks.spawn(...)` (strong-ref registry) |
-| Lazy module | `lazy import np = numpy` | `importlib.util.LazyLoader` proxy class |
+| Lazy module | `lazy import np = numpy` | bespoke `__TyphonLazy_np_` proxy class with double-checked locking |
 | Lazy module-level let | `lazy let CFG: Config = load()` | sentinel-cached `lazy_val(lambda: load())` |
 | Lazy class-level let | `lazy let cfg: Config = ...` inside class | `@cached_property` |
 | Comptime constant | `comptime let PORT: int = int(env("PORT", "8080"))` | inlined literal at build time |
@@ -428,7 +428,7 @@ async def load(uid: int) -> Dashboard:
     return Dashboard(user=user, posts=posts, notifs=notifs)
 ```
 
-Lowers to `asyncio.TaskGroup` (cancel-on-failure). For best-effort semantics where each binding becomes `T | Exception`:
+Lowers to `asyncio.TaskGroup` (cancel-on-failure). Bindings inside the `gather:` block are an intentional exception to Rule 2 — they don't need `let`/`mut` because the keyword itself introduces them as immutable single-assignment names (the desugarer wraps the whole block as a fresh scope). For best-effort semantics where each binding becomes `T | Exception`:
 
 ```python
 gather(strategy="best-effort"):
@@ -487,7 +487,7 @@ Top-level module bindings default to `let` unless declared `mut`. Inside functio
 ## Lazy loading
 
 ```python
-lazy import np = numpy           # ✅ deferred via importlib.util.LazyLoader
+lazy import np = numpy           # ✅ deferred via bespoke `__TyphonLazy_np_` proxy class
 lazy from numpy import array     # ❌ rejected at parse time (PEP 690)
 ```
 

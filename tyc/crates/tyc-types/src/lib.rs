@@ -214,8 +214,30 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
         {
             true
         }
+        // Bare-container annotations (`list`, `dict`, `tuple`, `set`,
+        // `frozenset`) act as `name[Any]` — they accept any
+        // parameterisation. Without this rule, `let xs: list = []`
+        // produces the misleading "expected `list`, found `list[?]`"
+        // diagnostic from FINDINGS #33 because the RHS infers as
+        // `Generic("list", [Unknown])` but the annotation is
+        // `Class("list")`.
+        (Type::Class(en), Type::Generic(an, _))
+            if en == an && is_bare_container_name(en) =>
+        {
+            true
+        }
         (a, b) => a == b,
     }
+}
+
+/// Return `true` if `name` is a built-in container type whose bare
+/// (unparameterised) form should be treated as accepting any
+/// parameterisation (`list` ≡ `list[Any]`, etc.).
+fn is_bare_container_name(name: &str) -> bool {
+    matches!(
+        name,
+        "list" | "dict" | "tuple" | "set" | "frozenset" | "deque"
+    )
 }
 
 /// Translate an annotation expression into a [`Type`].
