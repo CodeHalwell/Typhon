@@ -2864,6 +2864,9 @@ mod tests {
     fn typed_dict_skips_dataclass_decorator() {
         let src = "from typing import TypedDict\nclass U(TypedDict):\n    id: int\n    name: str\n";
         let out = parse_and_desugar(src);
-        assert!(!out.contains("dataclass"), "TypedDict must not get dataclass decorator: {out}");
+        assert!(
+            !out.contains("dataclass"),
+            "TypedDict must not get dataclass decorator: {out}"
+        );
     }
 }

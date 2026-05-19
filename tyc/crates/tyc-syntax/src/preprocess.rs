@@ -3365,7 +3365,9 @@ fn collect_gather_bindings(
         let body = &raw[line_indent..];
         let eq = find_assignment_eq(body)?;
         let name = body[..eq].trim().to_owned();
-        let expr = strip_inline_comment(body[eq + 1..].trim()).trim().to_owned();
+        let expr = strip_inline_comment(body[eq + 1..].trim())
+            .trim()
+            .to_owned();
         if name.is_empty() || expr.is_empty() {
             return None;
         }
@@ -5886,8 +5888,14 @@ string content
     fn gather_strips_trailing_comment() {
         let src = "async def f() -> None:\n    gather:\n        a = fetch_a()  # first\n        b = fetch_b()  # second\n    print(a, b)\n";
         let out = expand_gather_blocks(src);
-        assert!(!out.contains("# first"), "comment should be stripped: {out}");
-        assert!(!out.contains("# second"), "comment should be stripped: {out}");
+        assert!(
+            !out.contains("# first"),
+            "comment should be stripped: {out}"
+        );
+        assert!(
+            !out.contains("# second"),
+            "comment should be stripped: {out}"
+        );
         assert!(out.contains("create_task(fetch_a())"), "call intact: {out}");
         assert!(out.contains("create_task(fetch_b())"), "call intact: {out}");
     }
