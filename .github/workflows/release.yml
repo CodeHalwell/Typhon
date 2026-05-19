@@ -1,0 +1,175 @@
+name: Release
+
+# Build pre-built `tyc` binaries for macOS (Apple Silicon + Intel) on every
+# `v*` tag and attach the tarballs + checksums to a GitHub Release.
+#
+# Linux/Windows are intentionally out of scope here — Mac-only for now.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.1.0). Required for manual runs."
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-macos:
+    name: Build (${{ matrix.target }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+          - target: x86_64-apple-darwin
+
+    steps:
+      # Check out the requested tag (not branch HEAD) when triggered
+      # manually via workflow_dispatch — otherwise a manual run for
+      # `vX.Y.Z` would build from whatever the workflow file's branch
+      # happens to point at, producing mislabeled artifacts.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          version="${tag#v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $tag (version: $version)"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.94"
+          targets: ${{ matrix.target }}
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tyc/target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('tyc/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: Build tyc (release, ${{ matrix.target }})
+        working-directory: tyc
+        run: |
+          cargo build --release -p tyc --target ${{ matrix.target }}
+
+      - name: Ad-hoc codesign
+        # No paid Apple Developer cert — use ad-hoc signature (`-`).
+        # This avoids the silent "killed: 9" Gatekeeper failure on macOS;
+        # users will still see a one-time "downloaded from internet"
+        # prompt unless they clear the quarantine xattr (the installer
+        # does this automatically).
+        run: |
+          bin="tyc/target/${{ matrix.target }}/release/tyc"
+          codesign --sign - --force --timestamp=none "$bin"
+          codesign --verify --verbose "$bin"
+
+      - name: Package tarball + checksum
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.tag.outputs.version }}"
+          target="${{ matrix.target }}"
+          stage="$(mktemp -d)"
+          name="tyc-${version}-${target}"
+          mkdir -p "$stage/$name"
+          cp "tyc/target/${target}/release/tyc" "$stage/$name/tyc"
+          cp README.md "$stage/$name/README.md" 2>/dev/null || true
+          # LICENSE may not exist at repo root; tolerate either way.
+          cp LICENSE "$stage/$name/LICENSE" 2>/dev/null || true
+
+          mkdir -p dist
+          tar -C "$stage" -czf "dist/${name}.tar.gz" "$name"
+          (cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256")
+          ls -la dist/
+          echo "tarball=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/${name}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            ${{ steps.package.outputs.tarball }}
+            ${{ steps.package.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: build-macos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Assemble release directory + combined SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          # Each artifact lives under artifacts/<name>/dist/<name>.tar.gz
+          # (and .sha256). Flatten and recompute the combined SHA256SUMS.
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.sha256' \) \
+            -exec cp {} release/ \;
+          (cd release && shasum -a 256 *.tar.gz > SHA256SUMS)
+          ls -la release/
+          cat release/SHA256SUMS
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          files: |
+            release/*.tar.gz
+            release/SHA256SUMS

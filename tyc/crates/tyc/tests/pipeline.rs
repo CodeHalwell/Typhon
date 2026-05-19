@@ -122,6 +122,207 @@ fn check_passes_nullable_annotation() {
     );
 }
 
+#[test]
+fn dict_get_two_arg_narrows_to_v() {
+    // FINDINGS #71: `d.get(k, default)` where `default: V` must narrow
+    // from `V | None` to `V`. With a V-incompatible default the result
+    // widens to `V | type(default)`. The one-arg form stays nullable.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("dict_get.ty"),
+        "def main() -> None:\n    \
+            let d: dict[str, int] = {\"a\": 1}\n    \
+            let x: int = d.get(\"a\", 0)\n    \
+            let y: int | str = d.get(\"a\", \"fallback\")\n    \
+            let z: int | None = d.get(\"a\")\n    \
+            print(x, y, z)\n",
+    )
+    .unwrap();
+    let status = tyc().arg("check").arg(tmp.path()).status().unwrap();
+    assert!(
+        status.success(),
+        "tyc check should narrow dict.get(k, default) to V (or V | type(default))"
+    );
+}
+
+#[test]
+fn dict_get_default_kwarg_narrows_to_v() {
+    // Follow-up to #71: the kwarg form `d.get(k, default=…)` must
+    // narrow the same way as the positional form. Without this, users
+    // writing the more-readable kwarg call would silently get the
+    // nullable signature and a confusing `int | None` mismatch.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("dict_get_kwarg.ty"),
+        "def main() -> None:\n    \
+            let d: dict[str, int] = {\"a\": 1}\n    \
+            let x: int = d.get(\"a\", default=0)\n    \
+            let y: int | str = d.get(\"a\", default=\"fallback\")\n    \
+            print(x, y)\n",
+    )
+    .unwrap();
+    let status = tyc().arg("check").arg(tmp.path()).status().unwrap();
+    assert!(
+        status.success(),
+        "tyc check should narrow dict.get(k, default=…) the same as the positional form"
+    );
+}
+
+#[test]
+fn dict_get_two_arg_mismatched_default_still_rejects_non_nullable_target() {
+    // FINDINGS #71 follow-up: if the default's type can't fit the target
+    // annotation, the union widening must still surface as a mismatch.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("dict_get_bad.ty"),
+        "def main() -> None:\n    \
+            let d: dict[str, int] = {\"a\": 1}\n    \
+            let z: int = d.get(\"a\", \"wrong\")\n    \
+            print(z)\n",
+    )
+    .unwrap();
+    let status = tyc().arg("check").arg(tmp.path()).status().unwrap();
+    assert!(
+        !status.success(),
+        "tyc check should still reject a default whose type doesn't fit the annotation"
+    );
+}
+
+#[test]
+fn duplicate_class_emits_diagnostic() {
+    // FINDINGS #77: two `class Foo:` declarations in the same module must
+    // surface as `tyc::duplicate_class` rather than silently shadowing.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("dup.ty"),
+        "class Foo:\n    a: int\n\nclass Foo:\n    b: str\n\ndef main() -> None:\n    print(\"ok\")\n",
+    )
+    .unwrap();
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "expected duplicate_class to fail check"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let combined = format!("{stderr}{stdout}");
+    assert!(
+        combined.contains("tyc::duplicate_class"),
+        "expected tyc::duplicate_class in output, got: {combined}"
+    );
+}
+
+#[test]
+fn impl_unknown_class_emits_diagnostic() {
+    // FINDINGS #78: `impl UnknownClass:` for a class that doesn't exist
+    // must fire `tyc::impl_unknown_class` rather than emitting dead code.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("imp.ty"),
+        "impl UnknownClass:\n    def hello(self) -> None:\n        print(\"hi\")\n\n\
+            def main() -> None:\n    print(\"ok\")\n",
+    )
+    .unwrap();
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "expected impl_unknown_class to fail check"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        combined.contains("tyc::impl_unknown_class"),
+        "expected tyc::impl_unknown_class in output, got: {combined}"
+    );
+}
+
+#[test]
+fn cyclic_type_alias_emits_diagnostic() {
+    // FINDINGS #81: `type A = B; type B = A` forms a cycle. No concrete
+    // type can ever satisfy it; reject at check time instead of letting
+    // Python's lazy alias evaluation defer the error indefinitely.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("cyc.ty"),
+        "type A = B\ntype B = A\n\ndef main() -> None:\n    print(\"ok\")\n",
+    )
+    .unwrap();
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(
+        !out.status.success(),
+        "expected cyclic_type_alias to fail check"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        combined.contains("tyc::cyclic_type_alias"),
+        "expected tyc::cyclic_type_alias in output, got: {combined}"
+    );
+}
+
+#[test]
+fn async_without_await_emits_warning() {
+    // FINDINGS #83: an `async def` body that never `await`s should fire
+    // a `tyc::async_without_await` warning. The warning must not block
+    // a check from succeeding (it's an advisory, not an error).
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("quiet.ty"),
+        "async def quiet() -> int:\n    return 1\n\n\
+            def main() -> None:\n    print(\"ok\")\n",
+    )
+    .unwrap();
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(
+        out.status.success(),
+        "async_without_await is a warning; check should still succeed"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        combined.contains("tyc::async_without_await"),
+        "expected tyc::async_without_await in output, got: {combined}"
+    );
+}
+
+#[test]
+fn async_with_await_does_not_warn() {
+    // Negative case: an `async def` that actually `await`s something must
+    // not produce the warning. Use `asyncio.sleep(0)` so we have an
+    // `await` site without a second `async def` that would itself fire
+    // `async_without_await`.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("awaits.ty"),
+        "import asyncio\n\n\
+            async def outer() -> int:\n    \
+                await asyncio.sleep(0)\n    \
+                return 1\n\n\
+            def main() -> None:\n    print(\"ok\")\n",
+    )
+    .unwrap();
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(out.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !combined.contains("tyc::async_without_await"),
+        "did not expect tyc::async_without_await for a body that awaits, got: {combined}"
+    );
+}
+
 // ── tyc fmt ──────────────────────────────────────────────────────────────────
 
 #[test]

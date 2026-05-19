@@ -17,7 +17,7 @@ use tower_lsp_server::ls_types::{
     CodeActionProviderCapability, CodeActionResponse, CompletionItem, CompletionItemKind,
     CompletionOptions, CompletionParams, CompletionResponse, Diagnostic, DiagnosticSeverity,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
+    Documentation, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
     HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, Location,
     MarkedString, MessageType, NumberOrString, OneOf, Position, Range, ServerCapabilities,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
@@ -28,6 +28,9 @@ use tyc_diagnostics::TycError;
 use tyc_resolve::{
     BindingKind, ClassKind, ImportInfo, Mutability, ResolveOptions, ResolvedModule, SymbolAtOffset,
 };
+
+mod stdlib_stubs;
+mod venv_introspect;
 
 /// Manual resolved-module cache for cross-file import resolution.
 ///
@@ -62,6 +65,24 @@ pub struct Backend {
     /// editor (no Salsa SourceFile).  Keyed by file:// URI; evicted when
     /// the preprocessed text changes.
     resolved_cache: ResolvedCache,
+    /// Per-project-root introspection caches. Keyed on the directory
+    /// containing the project's `typhon.toml`; value is a Mutex-guarded
+    /// cache that shells to `.venv/bin/python` on misses and remembers
+    /// the result. One cache per project keeps unrelated workspaces
+    /// from sharing module results — different venvs have different
+    /// installed packages.
+    ///
+    /// The *inner* mutex is a `std::sync::Mutex` (not a `tokio::Mutex`)
+    /// because every consumer holds it across a synchronous subprocess
+    /// call, and `tokio::Mutex::blocking_lock` panics from an async
+    /// context. The whole introspection block is wrapped in
+    /// `tokio::task::spawn_blocking` at the call site so the
+    /// single-threaded LSP runtime keeps serving unrelated requests.
+    introspection: Arc<
+        Mutex<
+            HashMap<std::path::PathBuf, Arc<std::sync::Mutex<venv_introspect::IntrospectionCache>>>,
+        >,
+    >,
 }
 
 impl std::fmt::Debug for Backend {
@@ -289,7 +310,79 @@ impl LanguageServer for Backend {
             let db = self.db.lock().await;
             (preprocessed_text(&*db, sf), resolved_module_arc(&*db, sf))
         };
-        let items = compute_completion_items(&resolved, &preprocessed, position);
+        // Mid-type buffers (`os.<cursor>`) typically don't parse — the
+        // trailing dot is a syntax error. The cached `ResolvedModule`
+        // returned above is empty in that state, so imports aren't
+        // visible to `compute_completion_items` and aliased lookups
+        // (`import numpy as np; np.<cursor>`) fail. Patch the source
+        // with a placeholder identifier after the cursor's bare `.`
+        // and re-resolve so the resolver can see the rest of the
+        // module. We only pay this cost when the cached resolution is
+        // empty (parse failure), so happy-path edits don't take the
+        // hit.
+        let (preprocessed, resolved) = if resolved.scopes.is_empty() {
+            try_fixup_and_resolve(&preprocessed, position)
+                .map(|(p, r)| (p, Arc::new(r)))
+                .unwrap_or((preprocessed, resolved))
+        } else {
+            (preprocessed, resolved)
+        };
+        // Pre-fetch introspection results for the candidate modules
+        // *before* dropping into the synchronous completion path. The
+        // cache shells to `.venv/bin/python`, which is a blocking
+        // operation — calling it from inside the async handler would
+        // wedge the LSP's single-threaded runtime, and the previous
+        // `tokio::Mutex::blocking_lock` shape panicked outright.
+        // `spawn_blocking` parks the work on Tokio's blocking thread
+        // pool while the runtime keeps serving other requests.
+        let prefetched: HashMap<String, Vec<CompletionItem>> = {
+            let cache_handle = self.introspection_cache_for(&uri).await;
+            let receiver = extract_member_access_receiver(
+                &preprocessed,
+                position_to_byte(&preprocessed, position),
+            );
+            match (cache_handle, receiver) {
+                (Some((root, cache)), Some(receiver)) => {
+                    let candidates = candidate_module_paths(&resolved, &receiver, {
+                        position_to_byte(&preprocessed, position)
+                    });
+                    tokio::task::spawn_blocking(move || {
+                        let mut map: HashMap<String, Vec<CompletionItem>> = HashMap::new();
+                        // `lock()` on a poisoned std::Mutex returns `Err`;
+                        // recover the data anyway — poisoning came from a
+                        // panic in an earlier completion, which we
+                        // recorded as a `None` cache entry, so the next
+                        // request just re-runs the lookup.
+                        let mut guard = match cache.lock() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        for module in candidates {
+                            if let Some(members) = guard.members(&root, &module) {
+                                map.insert(module, introspected_members_to_completion(&members));
+                            }
+                        }
+                        map
+                    })
+                    .await
+                    .unwrap_or_default()
+                }
+                _ => HashMap::new(),
+            }
+        };
+        let introspect_closure =
+            |module: &str| -> Option<Vec<CompletionItem>> { prefetched.get(module).cloned() };
+        let introspect_ref: Option<&IntrospectFn<'_>> = if prefetched.is_empty() {
+            None
+        } else {
+            Some(&introspect_closure)
+        };
+        let items = compute_completion_items_with_introspection(
+            &resolved,
+            &preprocessed,
+            position,
+            introspect_ref,
+        );
         Ok(Some(CompletionResponse::Array(items)))
     }
 
@@ -375,6 +468,38 @@ impl Backend {
     async fn source_file_for(&self, uri: &Uri) -> Option<SourceFile> {
         let docs = self.documents.lock().await;
         docs.get(uri.as_str()).copied()
+    }
+
+    /// Locate `uri`'s project root (walking upward for `typhon.toml`)
+    /// and return its [`venv_introspect::IntrospectionCache`], creating
+    /// one on first access. Returns `None` when the URI isn't a local
+    /// `file://` path or no `typhon.toml` ancestor exists.
+    ///
+    /// One cache per project root keeps different workspaces isolated:
+    /// project A's `requests` package shouldn't appear as a completion
+    /// when project B (which doesn't depend on it) is active.
+    async fn introspection_cache_for(
+        &self,
+        uri: &Uri,
+    ) -> Option<(
+        std::path::PathBuf,
+        Arc<std::sync::Mutex<venv_introspect::IntrospectionCache>>,
+    )> {
+        // We only know how to introspect when the editor is operating
+        // on a real path. `file:///` URIs convert; anything else
+        // (`untitled:` / `inmemory:`) doesn't have a venv to point at.
+        let path = uri_to_path(uri)?;
+        let root = venv_introspect::find_project_root(&path)?;
+        let mut guard = self.introspection.lock().await;
+        let cache = guard
+            .entry(root.clone())
+            .or_insert_with(|| {
+                Arc::new(std::sync::Mutex::new(
+                    venv_introspect::IntrospectionCache::for_project_root(&root),
+                ))
+            })
+            .clone();
+        Some((root, cache))
     }
 
     /// Return a [`ResolvedModule`] for a cross-file target URI, caching the
@@ -760,6 +885,7 @@ pub fn run_stdio(log_level: LogLevel) {
             log_level,
             documents: Arc::new(Mutex::new(HashMap::new())),
             resolved_cache: Arc::new(Mutex::new(HashMap::new())),
+            introspection: Arc::new(Mutex::new(HashMap::new())),
         });
         Server::new(stdin, stdout, socket).serve(service).await;
     });
@@ -822,16 +948,64 @@ const COMMON_BUILTINS: &[&str] = &[
 /// Build the list of completion items for a cursor in `preprocessed` text
 /// at `position`.  Pure of LSP plumbing so it can be unit-tested.
 ///
-/// The result combines (a) bindings visible from the cursor's enclosing
-/// scope, (b) Typhon keywords, and (c) a small set of common Python
-/// builtins.  The LSP client is responsible for prefix-filtering the
-/// returned list.
+/// Two modes:
+///
+/// 1. **Member access** — when the cursor sits just after a `.` (or
+///    after `<identifier>.<prefix>`), [`extract_member_access_receiver`]
+///    returns the dotted receiver. We resolve that receiver through the
+///    scope chain; if it bottoms out at an `import` binding, the
+///    imported module is queried via the optional venv-introspection
+///    callback (production wiring) and, on failure, via the curated
+///    [`stdlib_stubs`] table.
+///    Type-driven completion for builtin-typed `let` bindings
+///    (`let xs: list[int] = []; xs.<TAB>` → list methods) is not wired
+///    yet; tracked as a follow-up.
+/// 2. **Open completion** — the original behaviour: every binding
+///    visible from the cursor's scope, every Typhon keyword, and a
+///    small set of common Python builtins.
+///
+/// The LSP client is responsible for prefix-filtering the returned list,
+/// so we always return the full menu rather than filtering ourselves.
 pub fn compute_completion_items(
     resolved: &ResolvedModule,
     preprocessed: &str,
     position: Position,
 ) -> Vec<CompletionItem> {
+    compute_completion_items_with_introspection(resolved, preprocessed, position, None)
+}
+
+/// Variant of [`compute_completion_items`] that accepts a venv-driven
+/// introspection callback. When supplied, the callback is consulted
+/// first for member-access completions; it receives the resolved
+/// dotted module path (e.g. `"os.path"` after walking through
+/// `ImportInfo`) and returns the introspected member list. A `None`
+/// return signals "module not importable / no venv available" and we
+/// fall back to the curated [`stdlib_stubs`] tables.
+///
+/// The production LSP backend passes a closure that delegates to
+/// [`venv_introspect::IntrospectionCache`]; unit tests pass `None` to
+/// exercise the curated-stub path deterministically.
+pub fn compute_completion_items_with_introspection(
+    resolved: &ResolvedModule,
+    preprocessed: &str,
+    position: Position,
+    introspect: Option<&IntrospectFn<'_>>,
+) -> Vec<CompletionItem> {
     let offset = position_to_byte(preprocessed, position);
+    // Member-access path: detect `receiver.` (with optional partial member
+    // name) immediately before the cursor and try to surface stub members.
+    if let Some(receiver) = extract_member_access_receiver(preprocessed, offset) {
+        if let Some(items) = member_completion_items(resolved, &receiver, offset, introspect) {
+            return items;
+        }
+        // Receiver was an identifier but we couldn't resolve it to a
+        // known module / builtin. Returning an empty list is intentional
+        // here: emitting the open-completion menu after `.` would just
+        // be noise (none of those names are valid members) and confuse
+        // the editor's UX. The client falls back to its own filtering
+        // on the next keystroke once more context is typed.
+        return Vec::new();
+    }
     let scope_id = resolved.scope_at_offset(offset);
     let mut items: Vec<CompletionItem> = Vec::new();
     for b in resolved.visible_bindings(scope_id) {
@@ -852,6 +1026,265 @@ pub fn compute_completion_items(
         ));
     }
     items
+}
+
+/// Re-parse `preprocessed` after inserting a placeholder identifier
+/// where the cursor sits, returning the patched text + a fresh
+/// `ResolvedModule`. Used as a fallback when the cached resolution is
+/// empty (typical mid-keystroke state: the source has a trailing `.`
+/// and the parser refuses).
+///
+/// The patch is intentionally minimal: a single byte `X` is appended
+/// after a trailing `.` before the cursor when one exists. That turns
+/// `os.<cursor>` into `os.X<cursor>` which parses cleanly. We never
+/// touch the cursor position — `compute_completion_items` reads from
+/// the same offset, and the placeholder appears strictly after it, so
+/// receiver extraction still sees `os` as the receiver.
+///
+/// Returns `None` when no useful fix-up exists (e.g. the cursor is not
+/// after a `.`), letting the caller fall back to the empty resolution.
+fn try_fixup_and_resolve(
+    preprocessed: &str,
+    position: Position,
+) -> Option<(String, ResolvedModule)> {
+    let offset = position_to_byte(preprocessed, position);
+    // Cursor must sit immediately after `<id>.` (with possibly some
+    // already-typed partial member chars between the dot and the cursor).
+    let bytes = preprocessed.as_bytes();
+    if offset > bytes.len() {
+        return None;
+    }
+    // Walk left past any in-progress identifier chars.
+    let mut i = offset;
+    while i > 0 {
+        let c = bytes[i - 1];
+        if c.is_ascii_alphanumeric() || c == b'_' {
+            i -= 1;
+        } else {
+            break;
+        }
+    }
+    if i == 0 || bytes[i - 1] != b'.' {
+        return None;
+    }
+    // Insert `X` (a stand-in identifier) at byte offset `offset` — i.e.
+    // right where the cursor sits. Pushing it strictly *after* the
+    // cursor matters: `extract_member_access_receiver` reads from the
+    // cursor backwards, so the placeholder doesn't show up in the
+    // receiver text.
+    let mut patched = String::with_capacity(preprocessed.len() + 1);
+    patched.push_str(&preprocessed[..offset]);
+    patched.push('X');
+    patched.push_str(&preprocessed[offset..]);
+    // Re-run preprocess + parse + resolve on the patched source. If any
+    // step still fails (broken source elsewhere in the file), bail.
+    let prep = tyc_syntax::preprocess::preprocess(&patched);
+    let parsed = tyc_syntax::parse_module(&prep.python_source).ok()?;
+    let (resolved, _) = tyc_resolve::resolve_module(
+        "<lsp-fixup>".to_owned(),
+        &prep.python_source,
+        parsed.syntax(),
+    );
+    Some((prep.python_source, resolved))
+}
+
+/// Scan backwards from `offset` looking for a `<dotted-name>.<partial>?`
+/// pattern and return the dotted name. Returns `None` when the cursor is
+/// not in a member-access context.
+///
+/// We're operating on raw text (not the AST) deliberately: completion
+/// fires *while* the user is typing, so the surrounding source very
+/// often does not parse. Skipping the AST keeps us robust against
+/// in-flight syntax.
+///
+/// The receiver is allowed to be a multi-segment dotted name (`os.path`,
+/// `pkg.sub.mod`) so completion works on submodules too. We don't try to
+/// look inside parens, brackets, or string literals — those forms would
+/// need real lexer state, and the failure mode (no completion menu) is
+/// strictly less bad than guessing wrong.
+pub fn extract_member_access_receiver(text: &str, offset: usize) -> Option<String> {
+    let bytes = text.as_bytes();
+    if offset > bytes.len() {
+        return None;
+    }
+    // Skip any in-progress member name to the left of the cursor — chars
+    // that could be part of an identifier. The cursor might sit anywhere
+    // from immediately after `.` to several characters into the member
+    // name (`os.path.jo|`), so we walk left over identifier characters
+    // first and then expect to land on a `.`.
+    let mut i = offset;
+    while i > 0 {
+        let c = bytes[i - 1];
+        if c.is_ascii_alphanumeric() || c == b'_' {
+            i -= 1;
+        } else {
+            break;
+        }
+    }
+    if i == 0 {
+        return None;
+    }
+    if bytes[i - 1] != b'.' {
+        return None;
+    }
+    // Now walk left over the dotted receiver. Identifier chars plus `.`
+    // are the only allowed glyphs; whitespace, parens, etc. terminate
+    // the receiver.
+    let end = i - 1; // index of the `.` immediately before the partial member
+    let mut start = end;
+    while start > 0 {
+        let c = bytes[start - 1];
+        if c.is_ascii_alphanumeric() || c == b'_' || c == b'.' {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    // Trim any trailing `.` from the receiver (shouldn't happen — we
+    // anchored on a `.` and `end` points at it — but be defensive). The
+    // receiver text spans `[start, end)`.
+    if start >= end {
+        return None;
+    }
+    let receiver = &text[start..end];
+    // Reject a receiver that's empty after stripping or that starts /
+    // ends with `.` — those signal a syntactically incomplete chain
+    // (`.foo`, `os..path`) and we can't meaningfully complete them.
+    if receiver.is_empty() || receiver.starts_with('.') || receiver.ends_with('.') {
+        return None;
+    }
+    Some(receiver.to_owned())
+}
+
+/// Signature for the per-completion-request introspection callback.
+/// Defined as a type alias so the function/handler signatures don't
+/// trip clippy's `type_complexity` lint and stay readable.
+type IntrospectFn<'a> = dyn Fn(&str) -> Option<Vec<CompletionItem>> + 'a;
+
+/// Resolve `receiver` against the scope visible at `offset` and return
+/// the candidate dotted module paths to query for member completion.
+/// Each path is tried in order; the first one that produces members
+/// wins. Returns an empty `Vec` when no plausible interpretation
+/// exists (unknown receiver, non-import binding, etc.).
+///
+/// Used both at completion time (to feed `member_completion_items`)
+/// and at the async-handler boundary (to know which modules to
+/// pre-introspect before entering the synchronous completion path).
+///
+/// Interpretations, in priority order:
+///
+/// 1. **Dotted module path** — `os.path`, `urllib.parse`: the receiver
+///    text *is* the module path. Handles the common case where the
+///    user typed the fully-qualified name without aliasing.
+/// 2. **Imported alias** — `np` from `import numpy as np`: walk the
+///    binding's `ImportInfo` back to the original module name. For
+///    dotted receivers (`np.linalg.`), the alias resolves only the
+///    head; the trailing segments are appended onto the
+///    `ImportInfo.module` path.
+fn candidate_module_paths(resolved: &ResolvedModule, receiver: &str, offset: usize) -> Vec<String> {
+    let mut out: Vec<String> = vec![receiver.to_owned()];
+    let (head, tail) = match receiver.split_once('.') {
+        Some((h, t)) => (h, Some(t)),
+        None => (receiver, None),
+    };
+    let scope_id = resolved.scope_at_offset(offset);
+    let Some(binding) = resolved.lookup(scope_id, head).map(|(b, _)| b) else {
+        return out;
+    };
+    if binding.kind != BindingKind::Import {
+        return out;
+    }
+    let Some(info) = binding.import_info.as_ref() else {
+        return out;
+    };
+    let module_path = match (info.member.as_deref(), tail) {
+        // `import os` + receiver `os.path` → `"os.path"`.
+        (None, Some(t)) => format!("{}.{}", info.module, t),
+        // `import os` + receiver `os` → `"os"`.
+        (None, None) => info.module.clone(),
+        // `from os import path` + receiver `path` → `"os.path"`.
+        (Some(m), None) => format!("{}.{}", info.module, m),
+        // `from os import path` + receiver `path.foo` → `"os.path.foo"`.
+        (Some(m), Some(t)) => format!("{}.{}.{}", info.module, m, t),
+    };
+    if !out.contains(&module_path) {
+        out.push(module_path);
+    }
+    out
+}
+
+/// Resolve `receiver` against the scope visible at `offset` and, if it
+/// bottoms out at a known import, return the matching stub members.
+/// Calls [`candidate_module_paths`] to enumerate interpretations and
+/// then asks the optional `introspect` callback (which is itself
+/// backed by venv-driven Python introspection in the production
+/// handler) before falling back to the curated [`stdlib_stubs`] table.
+fn member_completion_items(
+    resolved: &ResolvedModule,
+    receiver: &str,
+    offset: usize,
+    introspect: Option<&IntrospectFn<'_>>,
+) -> Option<Vec<CompletionItem>> {
+    for module in candidate_module_paths(resolved, receiver, offset) {
+        if let Some(cb) = introspect {
+            if let Some(items) = cb(&module) {
+                return Some(items);
+            }
+        }
+        if let Some(members) = stdlib_stubs::lookup(&module) {
+            return Some(stub_members_to_completion(members));
+        }
+    }
+    None
+}
+
+/// Convert a venv-introspected [`venv_introspect::MemberInfo`] list
+/// into LSP `CompletionItem`s, mapping the string `kind` to the LSP
+/// enum and skipping any member whose name starts with `_` (the
+/// introspect script already drops those, but the second filter
+/// here makes the public contract self-contained).
+pub(crate) fn introspected_members_to_completion(
+    members: &[venv_introspect::MemberInfo],
+) -> Vec<CompletionItem> {
+    members
+        .iter()
+        .filter(|m| !m.name.starts_with('_'))
+        .map(|m| CompletionItem {
+            label: m.name.clone(),
+            kind: Some(introspected_kind_to_lsp(&m.kind)),
+            detail: m.signature.clone(),
+            documentation: m.documentation.clone().map(Documentation::String),
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// Map the string kind the Python helper writes (`"function"`,
+/// `"class"`, `"module"`, `"value"`) to a `CompletionItemKind` so the
+/// editor renders the appropriate icon.
+fn introspected_kind_to_lsp(kind: &str) -> CompletionItemKind {
+    match kind {
+        "class" => CompletionItemKind::CLASS,
+        "module" => CompletionItemKind::MODULE,
+        "function" => CompletionItemKind::FUNCTION,
+        _ => CompletionItemKind::VALUE,
+    }
+}
+
+/// Convert a slice of curated [`stdlib_stubs::StubMember`] entries into
+/// LSP `CompletionItem`s, populating `detail` from the signature line
+/// and `documentation` from the one-liner doc when present.
+fn stub_members_to_completion(members: &[stdlib_stubs::StubMember]) -> Vec<CompletionItem> {
+    members
+        .iter()
+        .map(|m| CompletionItem {
+            label: m.name.to_owned(),
+            kind: Some(m.kind),
+            detail: m.signature.map(|s| s.to_owned()),
+            documentation: m.documentation.map(|d| Documentation::String(d.to_owned())),
+            ..Default::default()
+        })
+        .collect()
 }
 
 /// Build the list of code actions for `diagnostics` against `text`.
@@ -1544,6 +1977,320 @@ def greet():
         assert_eq!(greet.kind, Some(CompletionItemKind::FUNCTION));
         // `let` bindings render as CONSTANT to differentiate from `mut`.
         assert_eq!(name.kind, Some(CompletionItemKind::CONSTANT));
+    }
+
+    // ── Phase 5: library / module member completion ──────────────────────
+
+    #[test]
+    fn extract_receiver_handles_trailing_dot() {
+        // Cursor immediately after `os.` — no partial member typed yet.
+        let text = "import os\n\ndef f() -> None:\n    os.\n";
+        let offset = text.find("os.\n").unwrap() + "os.".len();
+        let r = extract_member_access_receiver(text, offset);
+        assert_eq!(r.as_deref(), Some("os"));
+    }
+
+    #[test]
+    fn extract_receiver_handles_partial_member() {
+        // Cursor in the middle of typing `os.getc|wd` — must still
+        // return `os` as the receiver.
+        let text = "import os\n\ndef f() -> None:\n    os.getc";
+        let offset = text.len();
+        let r = extract_member_access_receiver(text, offset);
+        assert_eq!(r.as_deref(), Some("os"));
+    }
+
+    #[test]
+    fn extract_receiver_handles_dotted_chain() {
+        // `os.path.|` — receiver is the full dotted path.
+        let text = "import os\n\ndef f() -> None:\n    os.path.";
+        let offset = text.len();
+        let r = extract_member_access_receiver(text, offset);
+        assert_eq!(r.as_deref(), Some("os.path"));
+    }
+
+    #[test]
+    fn extract_receiver_returns_none_without_dot() {
+        // Plain identifier without a trailing dot is not a member access.
+        let text = "def f() -> None:\n    print";
+        let offset = text.len();
+        let r = extract_member_access_receiver(text, offset);
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn extract_receiver_rejects_leading_dot() {
+        // `.foo` — no receiver to complete against.
+        let text = "def f() -> None:\n    .";
+        let offset = text.len();
+        let r = extract_member_access_receiver(text, offset);
+        assert_eq!(r, None);
+    }
+
+    // The completion path is fed by the LSP every keystroke — including
+    // when the buffer is mid-edit and doesn't parse. The Salsa
+    // `resolved_module_arc` query returns an empty `ResolvedModule` on
+    // parse failure (verified by `resolver_parse_error_yields_default_module`),
+    // so our completion-after-`.` tests need source that parses cleanly.
+    // We achieve that by ending the partial member with a real
+    // identifier (e.g. `os.getcwd`) and positioning the cursor right
+    // after the dot. The receiver-extraction logic uses byte offsets,
+    // so the trailing identifier is invisible to the resolution path.
+
+    #[test]
+    fn completion_after_import_module_returns_stub_members() {
+        // `import os` then `os.<cursor>getcwd()` — placing the cursor
+        // immediately after the dot should surface curated stub members
+        // (`getcwd`, `listdir`, …) and *only* those.
+        let src = "\
+import os
+
+def f() -> None:
+    let _x: str = os.getcwd()
+";
+        let (resolved, preprocessed) = parse_resolved(src);
+        let needle = "os.getcwd()";
+        let offset = preprocessed.find(needle).unwrap() + "os.".len();
+        let position = byte_to_position(&preprocessed, offset);
+        let items = compute_completion_items(&resolved, &preprocessed, position);
+        let labels: std::collections::HashSet<String> =
+            items.iter().map(|i| i.label.clone()).collect();
+        assert!(labels.contains("getcwd"), "expected `getcwd`: {labels:?}");
+        assert!(labels.contains("listdir"), "expected `listdir`: {labels:?}");
+        assert!(labels.contains("path"), "expected `path`: {labels:?}");
+        // Make sure we did NOT return the open-completion grab-bag — the
+        // function `f`, the keyword `let`, and the builtin `print` should
+        // all be absent because we're in a member-access context.
+        assert!(!labels.contains("f"), "scope binding leaked: {labels:?}");
+        assert!(!labels.contains("let"), "keyword leaked: {labels:?}");
+        assert!(!labels.contains("print"), "builtin leaked: {labels:?}");
+    }
+
+    #[test]
+    fn completion_after_alias_resolves_through_import_info() {
+        // `import collections as c` then `c.deque(...)` — the alias `c`
+        // must resolve back to the `collections` module so the popup
+        // surfaces `deque`, `Counter`, etc.
+        let src = "\
+import collections as c
+
+def f() -> None:
+    let _q = c.deque()
+";
+        let (resolved, preprocessed) = parse_resolved(src);
+        let needle = "c.deque()";
+        let offset = preprocessed.find(needle).unwrap() + "c.".len();
+        let position = byte_to_position(&preprocessed, offset);
+        let items = compute_completion_items(&resolved, &preprocessed, position);
+        let labels: std::collections::HashSet<String> =
+            items.iter().map(|i| i.label.clone()).collect();
+        assert!(labels.contains("deque"), "expected `deque`: {labels:?}");
+        assert!(labels.contains("Counter"), "expected `Counter`: {labels:?}");
+    }
+
+    #[test]
+    fn completion_after_submodule_dot_resolves_combined_path() {
+        // `import os` then `os.path.join(...)` — joining the import root
+        // with the dotted tail must look up `os.path` in the stub
+        // registry and return *its* members.
+        let src = "\
+import os
+
+def f() -> None:
+    let _p: str = os.path.join(\"a\", \"b\")
+";
+        let (resolved, preprocessed) = parse_resolved(src);
+        let needle = "os.path.join";
+        let offset = preprocessed.find(needle).unwrap() + "os.path.".len();
+        let position = byte_to_position(&preprocessed, offset);
+        let items = compute_completion_items(&resolved, &preprocessed, position);
+        let labels: std::collections::HashSet<String> =
+            items.iter().map(|i| i.label.clone()).collect();
+        assert!(labels.contains("join"), "expected `join`: {labels:?}");
+        assert!(labels.contains("exists"), "expected `exists`: {labels:?}");
+        // Crucially the parent module's members must NOT leak in.
+        assert!(
+            !labels.contains("getcwd"),
+            "os leaked into os.path: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn completion_after_unknown_receiver_returns_empty() {
+        // `randomname.foo` where `randomname` isn't a known binding —
+        // we return an empty list rather than the open-completion menu.
+        // Emitting `let`, `print`, etc. as member completions after a
+        // dot would be misleading.
+        let src = "\
+def f() -> None:
+    let _x = randomname.foo()
+";
+        let (resolved, preprocessed) = parse_resolved(src);
+        let needle = "randomname.foo";
+        let offset = preprocessed.find(needle).unwrap() + "randomname.".len();
+        let position = byte_to_position(&preprocessed, offset);
+        let items = compute_completion_items(&resolved, &preprocessed, position);
+        assert!(
+            items.is_empty(),
+            "expected empty completion, got: {labels:?}",
+            labels = items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn fixup_resolves_source_with_trailing_dot() {
+        // Simulates the mid-keystroke state: the file ends in `os.` and
+        // doesn't parse cleanly. `try_fixup_and_resolve` should insert a
+        // placeholder and re-resolve, exposing the `import os` binding.
+        let src = "\
+import os
+
+def f() -> None:
+    os.
+";
+        let prep = tyc_syntax::preprocess::preprocess(src);
+        let offset = prep.python_source.find("    os.").unwrap() + "    os.".len();
+        let position = byte_to_position(&prep.python_source, offset);
+        let (patched, resolved) = try_fixup_and_resolve(&prep.python_source, position)
+            .expect("fixup should succeed for `os.<cursor>`");
+        assert!(
+            !resolved.scopes.is_empty(),
+            "expected non-empty scopes after fixup"
+        );
+        // Sanity: the placeholder is at the cursor position, not before.
+        let cursor_in_patched = position_to_byte(&patched, position);
+        assert_eq!(
+            &patched[cursor_in_patched..cursor_in_patched + 1],
+            "X",
+            "placeholder should sit at the cursor offset"
+        );
+        // Running completion on the patched source should now surface the
+        // stub members — `os` is visible through resolution.
+        let items = compute_completion_items(&resolved, &patched, position);
+        let labels: std::collections::HashSet<String> =
+            items.iter().map(|i| i.label.clone()).collect();
+        assert!(labels.contains("getcwd"), "expected `getcwd`: {labels:?}");
+    }
+
+    #[test]
+    fn fixup_returns_none_when_not_after_dot() {
+        // No trailing `.` at the cursor → no fix-up worth attempting.
+        let src = "let _ = 1\n";
+        let prep = tyc_syntax::preprocess::preprocess(src);
+        let position = byte_to_position(&prep.python_source, prep.python_source.len());
+        assert!(try_fixup_and_resolve(&prep.python_source, position).is_none());
+    }
+
+    #[test]
+    fn introspection_takes_precedence_over_curated_stubs() {
+        // When a venv-introspection callback is supplied, its result
+        // wins over the curated stub registry. Verify by handing in a
+        // fake callback that returns a single member with a distinctive
+        // name and confirming it surfaces (instead of the curated `os`
+        // member list).
+        let src = "\
+import os
+
+def f() -> None:
+    let _x = os.getcwd()
+";
+        let (resolved, preprocessed) = parse_resolved(src);
+        let offset = preprocessed.find("os.getcwd").unwrap() + "os.".len();
+        let position = byte_to_position(&preprocessed, offset);
+
+        // Sanity: with no callback we hit the curated stubs path.
+        let baseline = compute_completion_items(&resolved, &preprocessed, position);
+        assert!(
+            baseline.iter().any(|i| i.label == "getcwd"),
+            "curated baseline should include getcwd"
+        );
+
+        // Now provide a callback that ignores the curated table and
+        // returns a synthetic member.
+        let stubbed = |module: &str| -> Option<Vec<CompletionItem>> {
+            assert_eq!(module, "os", "callback should see resolved module path");
+            Some(vec![CompletionItem {
+                label: "from_introspection".to_owned(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                detail: Some("synthetic() -> None".to_owned()),
+                ..Default::default()
+            }])
+        };
+        let items = compute_completion_items_with_introspection(
+            &resolved,
+            &preprocessed,
+            position,
+            Some(&stubbed),
+        );
+        let labels: std::collections::HashSet<String> =
+            items.iter().map(|i| i.label.clone()).collect();
+        assert!(
+            labels.contains("from_introspection"),
+            "expected introspection result: {labels:?}"
+        );
+        // Curated `getcwd` must NOT appear when introspection succeeded —
+        // we don't want to mix the two sources or surface stale entries.
+        assert!(
+            !labels.contains("getcwd"),
+            "introspection should suppress curated stub: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn introspection_failure_falls_back_to_curated_stubs() {
+        // If the introspection callback returns None (module not in
+        // the venv, subprocess failure, etc.), we drop to the curated
+        // stub table so the user still gets useful suggestions.
+        let src = "\
+import os
+
+def f() -> None:
+    let _x = os.getcwd()
+";
+        let (resolved, preprocessed) = parse_resolved(src);
+        let offset = preprocessed.find("os.getcwd").unwrap() + "os.".len();
+        let position = byte_to_position(&preprocessed, offset);
+
+        let always_none = |_module: &str| -> Option<Vec<CompletionItem>> { None };
+        let items = compute_completion_items_with_introspection(
+            &resolved,
+            &preprocessed,
+            position,
+            Some(&always_none),
+        );
+        let labels: std::collections::HashSet<String> =
+            items.iter().map(|i| i.label.clone()).collect();
+        assert!(
+            labels.contains("getcwd"),
+            "expected curated fallback: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn completion_member_items_carry_signature_detail() {
+        // The curated `detail` line from the stub should flow through as
+        // the LSP `CompletionItem.detail` field — that's what the editor
+        // renders next to the member name in the popup.
+        let src = "\
+import json
+
+def f() -> None:
+    let _v = json.loads(\"{}\")
+";
+        let (resolved, preprocessed) = parse_resolved(src);
+        let needle = "json.loads";
+        let offset = preprocessed.find(needle).unwrap() + "json.".len();
+        let position = byte_to_position(&preprocessed, offset);
+        let items = compute_completion_items(&resolved, &preprocessed, position);
+        let loads = items
+            .iter()
+            .find(|i| i.label == "loads")
+            .expect("loads completion present");
+        let detail = loads.detail.as_deref().expect("loads has a signature");
+        assert!(
+            detail.contains("loads(s: str)"),
+            "expected loads signature, got: {detail}"
+        );
     }
 
     // ── Phase 4: code actions ────────────────────────────────────────────

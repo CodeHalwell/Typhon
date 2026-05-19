@@ -234,23 +234,6 @@ pub enum TycError {
         span: SourceSpan,
     },
 
-    /// An `async` function body contains no `await` expression. This is
-    /// usually a mistake — either the `async` keyword is unnecessary, or
-    /// an `await` was forgotten. Surfaced as a warning so it doesn't break
-    /// existing code.
-    #[error("`async def {name}` contains no `await` expression")]
-    #[diagnostic(
-        code(tyc::async_without_await),
-        help("either remove `async` (if the function is synchronous) or add an `await` for the intended async call")
-    )]
-    AsyncWithoutAwait {
-        name: String,
-        #[source_code]
-        src: NamedSource<String>,
-        #[label("`async` here but no `await` inside")]
-        span: SourceSpan,
-    },
-
     /// A `match` on a sealed union does not cover all variants and has no wildcard arm.
     #[error("non-exhaustive `match` on sealed union `{union_name}`: missing variant(s) {missing}")]
     #[diagnostic(
@@ -509,6 +492,75 @@ pub enum TycError {
         #[label("auto-gather skipped this run")]
         span: SourceSpan,
     },
+
+    /// A `class NAME:` statement re-uses a name that has already been
+    /// declared at the same scope. Python silently lets the second
+    /// definition shadow the first; Typhon flags it so the user can
+    /// either rename one of them or merge the body into `impl NAME:`.
+    /// FINDINGS #77.
+    #[error("class `{name}` is declared more than once in this module")]
+    #[diagnostic(
+        code(tyc::duplicate_class),
+        help("rename one of the declarations, or merge the second body into `impl {name}:` / `extend {name}:`")
+    )]
+    DuplicateClass {
+        name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("redeclaration here")]
+        span: SourceSpan,
+    },
+
+    /// An `impl NAME:` block targets a class that does not exist in the
+    /// current module. The methods otherwise lower into a free-floating
+    /// `__typhon_impl_NAME` pseudo-class that the merge pass silently
+    /// drops, producing dead code. FINDINGS #78.
+    #[error("`impl {name}:` targets an unknown class")]
+    #[diagnostic(
+        code(tyc::impl_unknown_class),
+        help("declare `class {name}:` first, or fix the name to match an existing class in this module")
+    )]
+    ImplUnknownClass {
+        name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("no such class in scope")]
+        span: SourceSpan,
+    },
+
+    /// A `type` alias chain forms a cycle (`type A = B; type B = A`).
+    /// The runtime never crashes because Python evaluates aliases
+    /// lazily, but no caller can ever resolve the type. FINDINGS #81.
+    #[error("type alias `{name}` is part of a cycle")]
+    #[diagnostic(
+        code(tyc::cyclic_type_alias),
+        help("break the cycle by pointing at a concrete type or removing one of the alias declarations")
+    )]
+    CyclicTypeAlias {
+        name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("alias here is in a cycle")]
+        span: SourceSpan,
+    },
+
+    /// An `async def` function body never `await`s. The function still
+    /// returns a coroutine, but the `async` keyword is functionally a
+    /// no-op — usually a sign of a half-finished refactor or a missing
+    /// `await` on an internal call. FINDINGS #83.
+    #[error("`async def {name}` has no `await` expression")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::async_without_await),
+        help("drop `async` if the function is synchronous, or `await` the call(s) that should run concurrently")
+    )]
+    AsyncWithoutAwait {
+        name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("no `await` inside this body")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -713,21 +765,6 @@ impl TycError {
     ) -> Self {
         Self::MissingAwait {
             callee: callee.into(),
-            src: NamedSource::new(path.into(), source.into()),
-            span: SourceSpan::new(SourceOffset::from(offset), length),
-        }
-    }
-
-    /// Construct a [`TycError::AsyncWithoutAwait`] diagnostic.
-    pub fn async_without_await(
-        name: impl Into<String>,
-        path: impl Into<String>,
-        source: impl Into<String>,
-        offset: usize,
-        length: usize,
-    ) -> Self {
-        Self::AsyncWithoutAwait {
-            name: name.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }
@@ -998,6 +1035,66 @@ impl TycError {
         Self::FrozenAssign {
             class: class.into(),
             field: field.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::DuplicateClass`] diagnostic.
+    pub fn duplicate_class(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::DuplicateClass {
+            name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::ImplUnknownClass`] diagnostic.
+    pub fn impl_unknown_class(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::ImplUnknownClass {
+            name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::CyclicTypeAlias`] diagnostic.
+    pub fn cyclic_type_alias(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::CyclicTypeAlias {
+            name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::AsyncWithoutAwait`] diagnostic.
+    pub fn async_without_await(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::AsyncWithoutAwait {
+            name: name.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

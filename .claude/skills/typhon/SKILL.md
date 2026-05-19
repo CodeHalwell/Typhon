@@ -664,7 +664,7 @@ src = "src"
 out = "build"
 
 [python]
-target = "3.13"                  # or "3.14"
+target = "3.13"                  # **required: 3.13+ only**. Valid: "3.13" / "3.13t" / "3.14" / "3.14t". Older values are rejected at config load.
 free-threaded = false            # requires 3.13t/3.14t; off by default
 
 [emit]
@@ -720,7 +720,7 @@ See `docs/cli.md` for the full surface. The most-used commands:
 | `tyc check src/` | parse → resolve → type → analyse (no emit) | CI; daily editing |
 | `tyc build` | full pipeline through emit + ruff format | local run; produces `build/*.py` + `build/*.py.map` |
 | `tyc fmt src/` | parse + pretty-print | pre-commit |
-| `tyc lsp` | LSP on stdio (diagnostics, hover, go-to-def, completions, "Remove unused import") | editor |
+| `tyc lsp` | LSP on stdio (diagnostics, hover, go-to-def, member completions via venv introspection, "Remove unused import") | editor |
 | `tyc init NAME` | scaffold `typhon.toml`, `src/`, `tests/` | new project |
 | `tyc trace traceback.txt` | map Python frames back to `.ty` via `.py.map` | debugging emitted code |
 | `tyc profile` | instrument top-level fns with call-count + wall-clock; writes `typhon-profile.json` on interpreter exit | feeds `pgo-memoise` |

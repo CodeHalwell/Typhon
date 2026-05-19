@@ -1,3 +1,4 @@
 /tyc/target/
 *.pyc
 __pycache__/
+.claude/worktrees/

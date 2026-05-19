@@ -2070,6 +2070,8 @@ version = "0.1.0"
 dependencies = [
  "miette",
  "salsa",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "toml",
