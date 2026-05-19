@@ -183,9 +183,14 @@ fi
 say "Verifying SHA-256 checksum"
 (
     cd "$tmpdir"
-    # `shasum -c` will fail loudly on mismatch / missing file; we filter the
-    # combined SHA256SUMS to just our tarball line to keep output clean.
-    grep " $tarball_name\$" "$checksums_name" > "$tarball_name.sha256" \
+    # `shasum -c` will fail loudly on mismatch / missing file; we filter
+    # the combined SHA256SUMS to just our tarball line to keep output
+    # clean. `grep -F` so the `.` in the filename is matched literally
+    # rather than as a regex metachar, and the leading two spaces
+    # match `shasum`'s two-space-separated format (`<hash>  <file>`)
+    # exactly — avoids accidentally matching a substring within a
+    # longer filename.
+    grep -F "  $tarball_name" "$checksums_name" > "$tarball_name.sha256" \
         || die "no checksum entry for $tarball_name in $checksums_name"
     shasum -a 256 -c "$tarball_name.sha256"
 )

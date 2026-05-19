@@ -146,6 +146,29 @@ fn dict_get_two_arg_narrows_to_v() {
 }
 
 #[test]
+fn dict_get_default_kwarg_narrows_to_v() {
+    // Follow-up to #71: the kwarg form `d.get(k, default=…)` must
+    // narrow the same way as the positional form. Without this, users
+    // writing the more-readable kwarg call would silently get the
+    // nullable signature and a confusing `int | None` mismatch.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("dict_get_kwarg.ty"),
+        "def main() -> None:\n    \
+            let d: dict[str, int] = {\"a\": 1}\n    \
+            let x: int = d.get(\"a\", default=0)\n    \
+            let y: int | str = d.get(\"a\", default=\"fallback\")\n    \
+            print(x, y)\n",
+    )
+    .unwrap();
+    let status = tyc().arg("check").arg(tmp.path()).status().unwrap();
+    assert!(
+        status.success(),
+        "tyc check should narrow dict.get(k, default=…) the same as the positional form"
+    );
+}
+
+#[test]
 fn dict_get_two_arg_mismatched_default_still_rejects_non_nullable_target() {
     // FINDINGS #71 follow-up: if the default's type can't fit the target
     // annotation, the union widening must still surface as a mismatch.

@@ -34,7 +34,13 @@ jobs:
           - target: x86_64-apple-darwin
 
     steps:
+      # Check out the requested tag (not branch HEAD) when triggered
+      # manually via workflow_dispatch — otherwise a manual run for
+      # `vX.Y.Z` would build from whatever the workflow file's branch
+      # happens to point at, producing mislabeled artifacts.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - name: Resolve release tag
         id: tag
@@ -123,6 +129,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
 
       - name: Resolve release tag
         id: tag

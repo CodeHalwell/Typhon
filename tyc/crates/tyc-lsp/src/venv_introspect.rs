@@ -92,14 +92,12 @@ impl IntrospectionCache {
     /// construction so we don't pay it on every completion request
     /// — only on miss.
     pub fn members(&mut self, project_root: &Path, module: &str) -> Option<Arc<Vec<MemberInfo>>> {
-        // Cheap cache check — if we already know about this module,
-        // return whatever we've got (`None` value short-circuits
-        // repeated failures, `Some` returns the result).
-        if let Some(entry) = self.cache.get(module) {
-            return entry.clone();
-        }
-        // Cache miss — refresh the venv stamp; rebuild from scratch
-        // if it moved.
+        // Re-stat the venv stamp BEFORE the cache check. The previous
+        // shape (cache check first, stat only on miss) would happily
+        // serve stale entries for modules the user had already queried
+        // when `uv sync` / `uv pip install` ran in the background —
+        // exactly the case where fresh information matters most. The
+        // stat is microseconds; pay it on every call.
         let current_stamp = stat_pyvenv_cfg(project_root);
         if current_stamp != self.venv_stamp {
             self.cache.clear();
@@ -112,6 +110,11 @@ impl IntrospectionCache {
             } else {
                 which_python3()
             };
+        }
+        // Cache check — `None` value short-circuits repeated failures,
+        // `Some` returns the result.
+        if let Some(entry) = self.cache.get(module) {
+            return entry.clone();
         }
         let python = self.python_bin.clone()?;
         let result = introspect_via_python(&python, module);
@@ -219,7 +222,7 @@ main()
 fn introspect_via_python(python: &Path, module: &str) -> Option<Vec<MemberInfo>> {
     // We feed the script over stdin rather than `-c "<code>"` to avoid
     // quoting hell across platforms; `python -` reads from stdin.
-    use std::io::Write;
+    use std::io::{Read, Write};
     let mut child = Command::new(python)
         .arg("-")
         .arg(module)
@@ -229,31 +232,47 @@ fn introspect_via_python(python: &Path, module: &str) -> Option<Vec<MemberInfo>>
         .spawn()
         .ok()?;
     {
-        let stdin = child.stdin.as_mut()?;
+        let mut stdin = child.stdin.take()?;
         stdin.write_all(INTROSPECT_SCRIPT.as_bytes()).ok()?;
+        // Explicit close (drop) so the child's `sys.stdin.read()` sees
+        // EOF and exits the import loop; otherwise the script blocks
+        // forever waiting for more input.
     }
-    // Wait with a timeout. `Child::wait_with_output` blocks indefinitely,
-    // so we poll. Coarse 50ms polling is fine for the 3s ceiling.
+    // Drain stdout on a dedicated thread. Without this, modules with
+    // a large surface (e.g. `numpy` exposes hundreds of names) can
+    // fill the stdout pipe buffer (typically 64 KB on macOS/Linux) and
+    // the child blocks on `print()`, never reaching `sys.exit(0)`;
+    // the timeout below would kill it but the result is always None.
+    let mut stdout = child.stdout.take()?;
+    let drainer = std::thread::spawn(move || -> Vec<u8> {
+        let mut buf = Vec::with_capacity(64 * 1024);
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    // Wait with a timeout. `Child::wait` blocks indefinitely, so we
+    // poll. Coarse 50 ms polling is fine for the 3 s ceiling and
+    // happens to be the granularity at which a hung import becomes
+    // user-visible anyway.
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    loop {
+    let success = loop {
         match child.try_wait().ok()? {
-            Some(_status) => break,
+            Some(status) => break status.success(),
             None => {
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return None;
+                    break false;
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
-    }
-    let output = child.wait_with_output().ok()?;
-    if !output.status.success() {
+    };
+    let stdout_bytes = drainer.join().ok()?;
+    if !success {
         return None;
     }
-    let stdout = String::from_utf8(output.stdout).ok()?;
-    let parsed: Vec<MemberInfo> = serde_json::from_str(stdout.trim()).ok()?;
+    let stdout_str = std::str::from_utf8(&stdout_bytes).ok()?;
+    let parsed: Vec<MemberInfo> = serde_json::from_str(stdout_str.trim()).ok()?;
     if parsed.is_empty() {
         // An empty result is the script's "couldn't import" signal —
         // record it as a miss so we don't retry.

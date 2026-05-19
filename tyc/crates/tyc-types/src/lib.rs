@@ -2183,24 +2183,25 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
         match stmt {
             Stmt::ClassDef(cd) => {
                 let name = cd.name.as_str().to_owned();
-                if !name.starts_with("__typhon_impl_") && !name.starts_with("__TyphonLazy_") {
-                    if !seen_class_names.insert(name.clone()) {
-                        let span_start = cd.name.range.start().to_usize();
-                        let span_len = cd
-                            .name
-                            .range
-                            .end()
-                            .to_usize()
-                            .saturating_sub(span_start)
-                            .max(1);
-                        c.diagnostics.push_error(TycError::duplicate_class(
-                            name.as_str(),
-                            &c.path,
-                            c.source,
-                            span_start,
-                            span_len,
-                        ));
-                    }
+                if !name.starts_with("__typhon_impl_")
+                    && !name.starts_with("__TyphonLazy_")
+                    && !seen_class_names.insert(name.clone())
+                {
+                    let span_start = cd.name.range.start().to_usize();
+                    let span_len = cd
+                        .name
+                        .range
+                        .end()
+                        .to_usize()
+                        .saturating_sub(span_start)
+                        .max(1);
+                    c.diagnostics.push_error(TycError::duplicate_class(
+                        name.as_str(),
+                        &c.path,
+                        c.source,
+                        span_start,
+                        span_len,
+                    ));
                 }
                 c.classes.push(name.clone());
                 // Collect direct base class names for inheritance tracking.
@@ -3851,15 +3852,34 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // is V-compatible. Without this, the one-arg signature
                     // (`V | None`) leaks into the two-arg call site even
                     // though Python guarantees a non-None return when a
-                    // default is supplied.
-                    if pos_args.len() == 2 {
-                        if let Expr::Attribute(attr) = call.func.as_ref() {
-                            if attr.attr.as_str() == "get" {
+                    // default is supplied. The default may be supplied
+                    // positionally (`d.get("a", 0)`) or by keyword
+                    // (`d.get("a", default=0)`); both forms are handled
+                    // by looking for either shape before falling through
+                    // to the nullable signature.
+                    if let Expr::Attribute(attr) = call.func.as_ref() {
+                        if attr.attr.as_str() == "get" {
+                            let default_expr: Option<&Expr> = if pos_args.len() == 2 {
+                                Some(&pos_args[1])
+                            } else if pos_args.len() == 1 {
+                                kw_args
+                                    .iter()
+                                    .find(|k| {
+                                        k.arg
+                                            .as_ref()
+                                            .map(|ident| ident.as_str() == "default")
+                                            .unwrap_or(false)
+                                    })
+                                    .map(|k| &k.value)
+                            } else {
+                                None
+                            };
+                            if let Some(default_expr) = default_expr {
                                 let recv = infer_expr(c, &attr.value);
                                 if let Type::Generic(head, dict_args) = &recv {
                                     if head == "dict" && dict_args.len() == 2 {
                                         let v = dict_args[1].clone();
-                                        let default_ty = infer_expr(c, &pos_args[1]);
+                                        let default_ty = infer_expr(c, default_expr);
                                         return if c.is_assignable(&v, &default_ty) {
                                             v
                                         } else {

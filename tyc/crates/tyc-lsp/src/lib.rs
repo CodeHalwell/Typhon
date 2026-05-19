@@ -71,8 +71,18 @@ pub struct Backend {
     /// the result. One cache per project keeps unrelated workspaces
     /// from sharing module results — different venvs have different
     /// installed packages.
-    introspection:
-        Arc<Mutex<HashMap<std::path::PathBuf, Arc<Mutex<venv_introspect::IntrospectionCache>>>>>,
+    ///
+    /// The *inner* mutex is a `std::sync::Mutex` (not a `tokio::Mutex`)
+    /// because every consumer holds it across a synchronous subprocess
+    /// call, and `tokio::Mutex::blocking_lock` panics from an async
+    /// context. The whole introspection block is wrapped in
+    /// `tokio::task::spawn_blocking` at the call site so the
+    /// single-threaded LSP runtime keeps serving unrelated requests.
+    introspection: Arc<
+        Mutex<
+            HashMap<std::path::PathBuf, Arc<std::sync::Mutex<venv_introspect::IntrospectionCache>>>,
+        >,
+    >,
 }
 
 impl std::fmt::Debug for Backend {
@@ -317,35 +327,61 @@ impl LanguageServer for Backend {
         } else {
             (preprocessed, resolved)
         };
-        // Resolve the project root once so we can wire venv
-        // introspection through to the completion path. The cache
-        // shell-launches `.venv/bin/python` on miss, so we run it
-        // off the runtime thread to keep async handlers responsive.
-        let cache_handle = self.introspection_cache_for(&uri).await;
-        let introspect_owned: Option<
-            Box<dyn Fn(&str) -> Option<Vec<CompletionItem>> + Send + Sync>,
-        > = match cache_handle {
-            Some((root, cache)) => Some(Box::new(move |module: &str| {
-                // `members` may block on a subprocess; we're inside an
-                // async fn but the rest of the LSP isn't holding
-                // anything that needs us to yield, so a short blocking
-                // lock here is fine. The cache itself is process-wide
-                // synchronised so a second concurrent completion for
-                // the same module just blocks on the prior result.
-                let mut guard = cache.blocking_lock();
-                guard
-                    .members(&root, module)
-                    .map(|m| introspected_members_to_completion(&m))
-            })),
-            None => None,
+        // Pre-fetch introspection results for the candidate modules
+        // *before* dropping into the synchronous completion path. The
+        // cache shells to `.venv/bin/python`, which is a blocking
+        // operation — calling it from inside the async handler would
+        // wedge the LSP's single-threaded runtime, and the previous
+        // `tokio::Mutex::blocking_lock` shape panicked outright.
+        // `spawn_blocking` parks the work on Tokio's blocking thread
+        // pool while the runtime keeps serving other requests.
+        let prefetched: HashMap<String, Vec<CompletionItem>> = {
+            let cache_handle = self.introspection_cache_for(&uri).await;
+            let receiver = extract_member_access_receiver(
+                &preprocessed,
+                position_to_byte(&preprocessed, position),
+            );
+            match (cache_handle, receiver) {
+                (Some((root, cache)), Some(receiver)) => {
+                    let candidates = candidate_module_paths(&resolved, &receiver, {
+                        position_to_byte(&preprocessed, position)
+                    });
+                    tokio::task::spawn_blocking(move || {
+                        let mut map: HashMap<String, Vec<CompletionItem>> = HashMap::new();
+                        // `lock()` on a poisoned std::Mutex returns `Err`;
+                        // recover the data anyway — poisoning came from a
+                        // panic in an earlier completion, which we
+                        // recorded as a `None` cache entry, so the next
+                        // request just re-runs the lookup.
+                        let mut guard = match cache.lock() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        for module in candidates {
+                            if let Some(members) = guard.members(&root, &module) {
+                                map.insert(module, introspected_members_to_completion(&members));
+                            }
+                        }
+                        map
+                    })
+                    .await
+                    .unwrap_or_default()
+                }
+                _ => HashMap::new(),
+            }
+        };
+        let introspect_closure =
+            |module: &str| -> Option<Vec<CompletionItem>> { prefetched.get(module).cloned() };
+        let introspect_ref: Option<&IntrospectFn<'_>> = if prefetched.is_empty() {
+            None
+        } else {
+            Some(&introspect_closure)
         };
         let items = compute_completion_items_with_introspection(
             &resolved,
             &preprocessed,
             position,
-            introspect_owned
-                .as_ref()
-                .map(|b| b.as_ref() as &dyn Fn(&str) -> Option<Vec<CompletionItem>>),
+            introspect_ref,
         );
         Ok(Some(CompletionResponse::Array(items)))
     }
@@ -447,7 +483,7 @@ impl Backend {
         uri: &Uri,
     ) -> Option<(
         std::path::PathBuf,
-        Arc<Mutex<venv_introspect::IntrospectionCache>>,
+        Arc<std::sync::Mutex<venv_introspect::IntrospectionCache>>,
     )> {
         // We only know how to introspect when the editor is operating
         // on a real path. `file:///` URIs convert; anything else
@@ -458,7 +494,7 @@ impl Backend {
         let cache = guard
             .entry(root.clone())
             .or_insert_with(|| {
-                Arc::new(Mutex::new(
+                Arc::new(std::sync::Mutex::new(
                     venv_introspect::IntrospectionCache::for_project_root(&root),
                 ))
             })
@@ -917,10 +953,13 @@ const COMMON_BUILTINS: &[&str] = &[
 /// 1. **Member access** — when the cursor sits just after a `.` (or
 ///    after `<identifier>.<prefix>`), [`extract_member_access_receiver`]
 ///    returns the dotted receiver. We resolve that receiver through the
-///    scope chain; if it bottoms out at an `import` binding, we look up
-///    the imported module in [`stdlib_stubs`] and return its members.
-///    Builtin-typed `let` bindings (`let xs: list[int] = []`) also
-///    contribute their type's method list.
+///    scope chain; if it bottoms out at an `import` binding, the
+///    imported module is queried via the optional venv-introspection
+///    callback (production wiring) and, on failure, via the curated
+///    [`stdlib_stubs`] table.
+///    Type-driven completion for builtin-typed `let` bindings
+///    (`let xs: list[int] = []; xs.<TAB>` → list methods) is not wired
+///    yet; tracked as a follow-up.
 /// 2. **Open completion** — the original behaviour: every binding
 ///    visible from the cursor's scope, every Typhon keyword, and a
 ///    small set of common Python builtins.
@@ -950,7 +989,7 @@ pub fn compute_completion_items_with_introspection(
     resolved: &ResolvedModule,
     preprocessed: &str,
     position: Position,
-    introspect: Option<&dyn Fn(&str) -> Option<Vec<CompletionItem>>>,
+    introspect: Option<&IntrospectFn<'_>>,
 ) -> Vec<CompletionItem> {
     let offset = position_to_byte(preprocessed, position);
     // Member-access path: detect `receiver.` (with optional partial member
@@ -1044,7 +1083,7 @@ fn try_fixup_and_resolve(
     let (resolved, _) = tyc_resolve::resolve_module(
         "<lsp-fixup>".to_owned(),
         &prep.python_source,
-        &parsed.syntax(),
+        parsed.syntax(),
     );
     Some((prep.python_source, resolved))
 }
@@ -1117,65 +1156,47 @@ pub fn extract_member_access_receiver(text: &str, offset: usize) -> Option<Strin
     Some(receiver.to_owned())
 }
 
-/// Resolve `receiver` against the scope visible at `offset` and, if it
-/// bottoms out at a known import, return the matching stub members.
+/// Signature for the per-completion-request introspection callback.
+/// Defined as a type alias so the function/handler signatures don't
+/// trip clippy's `type_complexity` lint and stay readable.
+type IntrospectFn<'a> = dyn Fn(&str) -> Option<Vec<CompletionItem>> + 'a;
+
+/// Resolve `receiver` against the scope visible at `offset` and return
+/// the candidate dotted module paths to query for member completion.
+/// Each path is tried in order; the first one that produces members
+/// wins. Returns an empty `Vec` when no plausible interpretation
+/// exists (unknown receiver, non-import binding, etc.).
 ///
-/// Resolution order:
+/// Used both at completion time (to feed `member_completion_items`)
+/// and at the async-handler boundary (to know which modules to
+/// pre-introspect before entering the synchronous completion path).
 ///
-/// 1. **Dotted module path** — `os.path`, `urllib.parse`: try
-///    [`stdlib_stubs::lookup`] on the full string first, in case it
-///    matches a curated submodule entry directly. This handles the
-///    case where the receiver is *already* a fully-qualified module
-///    name (e.g. the user typed it out without an alias).
+/// Interpretations, in priority order:
+///
+/// 1. **Dotted module path** — `os.path`, `urllib.parse`: the receiver
+///    text *is* the module path. Handles the common case where the
+///    user typed the fully-qualified name without aliasing.
 /// 2. **Imported alias** — `np` from `import numpy as np`: walk the
-///    binding's `ImportInfo` back to the original module name and look
-///    that up. For dotted receivers (`np.linalg.`), the alias resolves
-///    only the head; the trailing segments are appended onto the
-///    `ImportInfo.module` path before lookup.
-///
-/// Type-driven completion (e.g. `let xs: list[int] = []; xs.` →
-/// list-method members) is a planned follow-up and would require
-/// either (a) running the type checker at LSP completion time, or
-/// (b) walking the binding's declaration site to read its annotation
-/// text. Neither is wired today; the stub registry path covers the
-/// "import a stdlib module and want to see its surface" case which is
-/// the bulk of the autocomplete value.
-fn member_completion_items(
-    resolved: &ResolvedModule,
-    receiver: &str,
-    offset: usize,
-    introspect: Option<&dyn Fn(&str) -> Option<Vec<CompletionItem>>>,
-) -> Option<Vec<CompletionItem>> {
-    // Try every plausible interpretation of `receiver` in order:
-    //   1. Receiver is literally a dotted module name (`os.path`).
-    //   2. Receiver's head is an imported alias; rejoin with the tail.
-    // For each interpretation, prefer venv introspection (the user's
-    // *actual* installed packages) before falling back to the curated
-    // stub registry.
-    let try_resolve = |module: &str| -> Option<Vec<CompletionItem>> {
-        if let Some(cb) = introspect {
-            if let Some(items) = cb(module) {
-                return Some(items);
-            }
-        }
-        stdlib_stubs::lookup(module).map(stub_members_to_completion)
-    };
-    // Interpretation 1: the receiver text *is* the module path.
-    if let Some(items) = try_resolve(receiver) {
-        return Some(items);
-    }
-    // Interpretation 2: head resolves through the scope chain to an
-    // imported module; tail (if any) extends the module path.
+///    binding's `ImportInfo` back to the original module name. For
+///    dotted receivers (`np.linalg.`), the alias resolves only the
+///    head; the trailing segments are appended onto the
+///    `ImportInfo.module` path.
+fn candidate_module_paths(resolved: &ResolvedModule, receiver: &str, offset: usize) -> Vec<String> {
+    let mut out: Vec<String> = vec![receiver.to_owned()];
     let (head, tail) = match receiver.split_once('.') {
         Some((h, t)) => (h, Some(t)),
         None => (receiver, None),
     };
     let scope_id = resolved.scope_at_offset(offset);
-    let binding = resolved.lookup(scope_id, head).map(|(b, _)| b)?;
+    let Some(binding) = resolved.lookup(scope_id, head).map(|(b, _)| b) else {
+        return out;
+    };
     if binding.kind != BindingKind::Import {
-        return None;
+        return out;
     }
-    let info = binding.import_info.as_ref()?;
+    let Some(info) = binding.import_info.as_ref() else {
+        return out;
+    };
     let module_path = match (info.member.as_deref(), tail) {
         // `import os` + receiver `os.path` → `"os.path"`.
         (None, Some(t)) => format!("{}.{}", info.module, t),
@@ -1186,7 +1207,35 @@ fn member_completion_items(
         // `from os import path` + receiver `path.foo` → `"os.path.foo"`.
         (Some(m), Some(t)) => format!("{}.{}.{}", info.module, m, t),
     };
-    try_resolve(&module_path)
+    if !out.contains(&module_path) {
+        out.push(module_path);
+    }
+    out
+}
+
+/// Resolve `receiver` against the scope visible at `offset` and, if it
+/// bottoms out at a known import, return the matching stub members.
+/// Calls [`candidate_module_paths`] to enumerate interpretations and
+/// then asks the optional `introspect` callback (which is itself
+/// backed by venv-driven Python introspection in the production
+/// handler) before falling back to the curated [`stdlib_stubs`] table.
+fn member_completion_items(
+    resolved: &ResolvedModule,
+    receiver: &str,
+    offset: usize,
+    introspect: Option<&IntrospectFn<'_>>,
+) -> Option<Vec<CompletionItem>> {
+    for module in candidate_module_paths(resolved, receiver, offset) {
+        if let Some(cb) = introspect {
+            if let Some(items) = cb(&module) {
+                return Some(items);
+            }
+        }
+        if let Some(members) = stdlib_stubs::lookup(&module) {
+            return Some(stub_members_to_completion(members));
+        }
+    }
+    None
 }
 
 /// Convert a venv-introspected [`venv_introspect::MemberInfo`] list
