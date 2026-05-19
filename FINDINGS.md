@@ -2303,6 +2303,17 @@ Bare expressions otherwise work (`1 + 1` → `2`, `"hi".upper()` → `'HI'`).
 
 ## 54. `extend BUILTIN:` emits lifted free fn without param type annotation (papercut)
 
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`.
+`extract_builtin_extensions` in `tyc-analyse/src/extend_builtin.rs`
+now calls a new `annotate_self_param_with_builtin` helper on each
+promoted method, which sets the receiver parameter's annotation to
+the builtin's name. The helper only fires when the first positional
+parameter is named `self` and is currently unannotated, so user-
+authored explicit annotations always win. Verified: `extend str: def
+slug(self) -> str: ...` now emits `def __typhon_ext_str__slug(self:
+str) -> str:`, satisfying Rule 1 and letting downstream type-checkers
+see the receiver type.
+
 **Severity:** papercut — receiver type elided in lifted function.
 
 ```ty
