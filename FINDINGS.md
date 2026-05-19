@@ -1802,6 +1802,26 @@ others fail on this.
 
 ## 44. Arg-count check ignores keyword args, defaults, *args, trailing commas (bug, critical)
 
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. Added a
+new per-function `ArityInfo` sidecar (param names, min/max positional
+counts, kw-only names + required subset, `**kwargs` flag) populated by
+`arity_info_from_parameters` and stored on `Checker.function_arity_info`.
+The call-site arity arm now routes through `check_arity_with_info`,
+which:
+
+1. Counts kwargs against the parameter-name list, with `**kwargs` as a
+   catch-all.
+2. Allows positional counts in `[min_positional, max_positional]`,
+   where `max_positional = None` whenever `*args` is declared.
+3. Detects positional/keyword conflicts on the same parameter.
+4. Requires every non-defaulted positional and kw-only param to be
+   supplied (by either form).
+
+The `function_signature` helper now also sets `variadic = true` when
+the function declares `*args`. Verified end-to-end on each of the five
+shapes called out by the finding (kwargs, defaults, `*args`, splatted
+positionals, trailing-comma kwargs).
+
 **Severity:** bug — critical; every multi-arg call with kwargs/defaults
 fails.
 

@@ -832,6 +832,13 @@ struct Checker<'a> {
     classes: Vec<String>,
     /// For each declared function name, its inferred signature type.
     function_signatures: HashMap<String, Type>,
+    /// Per-function arity metadata that doesn't fit in `Type::Function`
+    /// (which only tracks positional types + a single `variadic` flag).
+    /// Indexed by function name; entries are populated alongside
+    /// `function_signatures` from the AST so the call-site check can
+    /// honour default values, `*args`, `**kwargs`, and keyword arguments
+    /// without rejecting valid calls (FINDINGS #44).
+    function_arity_info: HashMap<String, ArityInfo>,
     /// Bounds declared on PEP 695 type parameters, keyed by function name.
     /// E.g. `def f[T: Interface](x: T)` populates `{"f": {"T": Class("Interface")}}`.
     /// Checked at call sites via `Checker::check_call_typevar_bounds`.
@@ -882,6 +889,39 @@ struct Checker<'a> {
     /// metadata; queried by [`check_stmt`] when entering an `if` body to
     /// decide whether to bump `unsafe_depth`.
     unsafe_line_starts: Vec<u32>,
+}
+
+/// Per-function arity metadata kept alongside `Type::Function` so the
+/// call-site arity check can honour default values, `*args`, `**kwargs`,
+/// and keyword-argument matching (FINDINGS #44).
+///
+/// `Type::Function`'s `params: Vec<Type>` only tracks positional types,
+/// and its single `variadic` flag conflates "has `*args`" with "accepts
+/// any extra args". We need richer information to distinguish:
+/// - `def f(a, b=10)` → 1 required, 2 optional
+/// - `def variadic(*args)` → 0 required, no fixed max, accepts kwargs only via `**kw`
+/// - `f(name="x")` keyword-arg matching against `param_names`
+#[derive(Debug, Clone, Default)]
+struct ArityInfo {
+    /// Names of the positional / pos-or-kw / kw-only parameters declared
+    /// on the function, in source order. Used to match keyword arguments
+    /// at call sites (`f(name="x")`).
+    param_names: Vec<String>,
+    /// Minimum number of positional arguments the caller must supply
+    /// (i.e. count of params without default values, excluding kw-only).
+    /// `def f(a, b=10) -> ...` → `min_positional = 1`.
+    min_positional: usize,
+    /// Maximum number of positional arguments — the total count of
+    /// posonlyargs + args. Kw-only params don't count. `None` for
+    /// `*args` functions, which accept unbounded positionals.
+    max_positional: Option<usize>,
+    /// Names of kw-only parameters (after `*` or `*args`).
+    kwonly_names: Vec<String>,
+    /// Kw-only names that don't have a default value.
+    kwonly_required: Vec<String>,
+    /// True when the function declares `**kwargs`, accepting any
+    /// otherwise-unmatched keyword argument.
+    has_kwarg: bool,
 }
 
 /// Declared interface (`interface Name:` → `class Name(Protocol):`). Bundles
@@ -937,6 +977,7 @@ impl<'a> Checker<'a> {
             resolved,
             classes: Vec::new(),
             function_signatures: HashMap::new(),
+            function_arity_info: HashMap::new(),
             function_type_bounds: HashMap::new(),
             active_typevar_bounds: HashMap::new(),
             interfaces: HashMap::new(),
@@ -1739,6 +1780,13 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                 function_signature(&classes, f.parameters.as_ref(), f.returns.as_deref(), &tps);
             c.function_signatures
                 .insert(f.name.as_str().to_owned(), sig);
+            // Record per-function arity metadata so the call-site arity
+            // check can accept keyword args, defaults, `*args`, and
+            // `**kwargs` without false positives (FINDINGS #44).
+            c.function_arity_info.insert(
+                f.name.as_str().to_owned(),
+                arity_info_from_parameters(f.parameters.as_ref()),
+            );
             // Also extract any declared TypeVar bounds so they can be checked
             // at call sites.
             let bounds = type_param_bounds_from(f.type_params.as_deref(), &classes);
@@ -1877,7 +1925,138 @@ fn function_signature(
     Type::Function {
         params,
         ret: Box::new(ret),
-        variadic: false,
+        // `variadic = true` when the function carries `*args`. This lets
+        // the call-site arity check accept any number of positional
+        // arguments beyond the declared params (FINDINGS #44c).
+        variadic: parameters.vararg.is_some(),
+    }
+}
+
+/// Decide whether a call site's positional + keyword arguments are
+/// compatible with the named function's [`ArityInfo`]. Returns `true`
+/// for an OK call, `false` for an arity mismatch — the caller emits
+/// the diagnostic.
+///
+/// Rules:
+/// 1. Every kw argument must either match a parameter name (positional
+///    or kw-only), or be absorbed by `**kwargs`. Mismatch → `false`.
+/// 2. A parameter can be filled by either a positional or a kw arg —
+///    not both. Conflicts → `false`.
+/// 3. Every required positional / kw-only param must be filled.
+/// 4. The total positional count must not exceed `max_positional`
+///    (unless the function has `*args`, in which case `max_positional`
+///    is `None`).
+fn check_arity_with_info(
+    info: &ArityInfo,
+    pos_args: &[Expr],
+    kw_args: &[ruff_python_ast::Keyword],
+) -> bool {
+    // Filter out the `**double-star` unpacking keywords (`kw.arg == None`) — we
+    // can't statically know how many keys they contain, so we treat them as
+    // matching anything (kwarg sentinel).
+    let named_kwargs: Vec<&str> = kw_args
+        .iter()
+        .filter_map(|k| k.arg.as_ref().map(|i| i.as_str()))
+        .collect();
+    let has_double_star = kw_args.iter().any(|k| k.arg.is_none());
+
+    // Rule 4: positional count must fit max_positional (None → unbounded).
+    if let Some(max) = info.max_positional {
+        if pos_args.len() > max {
+            return false;
+        }
+    }
+
+    // Rule 1: every named kw must hit a parameter (or `**kwargs`).
+    if !info.has_kwarg {
+        for name in &named_kwargs {
+            let hits_pos = info.param_names.iter().any(|p| p == name);
+            let hits_kwonly = info.kwonly_names.iter().any(|p| p == name);
+            if !hits_pos && !hits_kwonly {
+                return false;
+            }
+        }
+    }
+
+    // Rule 2: a positional-bound name can't also appear as a kw.
+    let filled_positionally = pos_args.len().min(info.param_names.len());
+    for name in &named_kwargs {
+        if info.param_names[..filled_positionally].iter().any(|p| p == name) {
+            return false;
+        }
+    }
+
+    // Rule 3a: every required positional must be filled by a pos arg or
+    // matching kw arg. Stops being checkable when `**kwargs` unpacking is
+    // present — in that case we trust the user.
+    if !has_double_star {
+        for (i, p) in info.param_names.iter().enumerate().take(info.min_positional) {
+            if i < pos_args.len() {
+                continue;
+            }
+            if named_kwargs.iter().any(|kw| kw == p) {
+                continue;
+            }
+            return false;
+        }
+        // Rule 3b: every required kw-only must be filled.
+        for required in &info.kwonly_required {
+            if !named_kwargs.iter().any(|kw| kw == required) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Compute the [`ArityInfo`] sidecar for a `def`'s parameter list.
+///
+/// Walks the same positional / keyword / vararg / kwarg shape as
+/// `function_signature` but extracts the metadata that doesn't fit on
+/// `Type::Function` (param names for keyword-arg matching, count of
+/// defaulted params for the min-arity bound, kw-only requireds, and
+/// the `**kwargs` flag).
+fn arity_info_from_parameters(parameters: &ruff_python_ast::Parameters) -> ArityInfo {
+    let mut param_names: Vec<String> = Vec::new();
+    let mut min_positional: usize = 0;
+    // Walk positional-only + positional-or-keyword. A defaulted positional
+    // doesn't count toward `min_positional`; once we see the first
+    // defaulted param all subsequent positionals must also be defaulted
+    // (Python grammar enforces this), so we can stop incrementing once
+    // we encounter a default.
+    let positional_chain = parameters.posonlyargs.iter().chain(parameters.args.iter());
+    let mut hit_default = false;
+    let mut max_positional_count: usize = 0;
+    for pwd in positional_chain {
+        param_names.push(pwd.parameter.name.as_str().to_owned());
+        max_positional_count += 1;
+        if pwd.default.is_none() && !hit_default {
+            min_positional += 1;
+        } else {
+            hit_default = true;
+        }
+    }
+    let max_positional = if parameters.vararg.is_some() {
+        None
+    } else {
+        Some(max_positional_count)
+    };
+    let mut kwonly_names: Vec<String> = Vec::new();
+    let mut kwonly_required: Vec<String> = Vec::new();
+    for pwd in &parameters.kwonlyargs {
+        let name = pwd.parameter.name.as_str().to_owned();
+        kwonly_names.push(name.clone());
+        if pwd.default.is_none() {
+            kwonly_required.push(name);
+        }
+    }
+    ArityInfo {
+        param_names,
+        min_positional,
+        max_positional,
+        kwonly_names,
+        kwonly_required,
+        has_kwarg: parameters.kwarg.is_some(),
     }
 }
 
@@ -2811,18 +2990,31 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     ret,
                     variadic,
                 } => {
-                    // Argument count check (positional only — conservative).
-                    // Variadic functions accept any number of args >= params.len().
-                    let count_ok = if variadic {
+                    // Argument count check honours defaults, keyword args,
+                    // `*args`, and `**kwargs` by looking up the function's
+                    // rich `ArityInfo` (when known by name) — FINDINGS #44.
+                    // For callable values whose origin we can't resolve
+                    // (e.g. `apply(f, v)` where `f: Callable[[int], int]`),
+                    // we fall back to the structural shape: positional
+                    // count must match `params.len()` exactly unless
+                    // `variadic`, and kwargs are accepted iff the
+                    // structural type spelled `*args` / `**kwargs`.
+                    let fn_name: Option<String> = match call.func.as_ref() {
+                        Expr::Name(n) => Some(n.id.as_str().to_owned()),
+                        _ => None,
+                    };
+                    let arity_info: Option<&ArityInfo> = fn_name
+                        .as_deref()
+                        .and_then(|n| c.function_arity_info.get(n));
+                    let count_ok = if let Some(info) = arity_info {
+                        check_arity_with_info(info, pos_args, kw_args)
+                    } else if variadic {
                         pos_args.len() >= params.len()
                     } else {
                         pos_args.len() == params.len()
                     };
                     if !count_ok {
-                        let name = match call.func.as_ref() {
-                            Expr::Name(n) => n.id.as_str().to_owned(),
-                            _ => "<call>".to_owned(),
-                        };
+                        let name = fn_name.clone().unwrap_or_else(|| "<call>".to_owned());
                         c.wrong_args(&name, params.len(), pos_args.len(), call_span);
                     }
                     // Argument type checks (per-pair, ignoring excess).
