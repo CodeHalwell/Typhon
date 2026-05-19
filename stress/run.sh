@@ -7,8 +7,18 @@ if [ ! -x "$TYC" ]; then
     exit 1
 fi
 mkdir -p out
-for f in tests/*.ty; do
+shopt -s nullglob
+files=(tests/*.ty)
+if [ "${#files[@]}" -eq 0 ]; then
+    echo "no .ty files found in tests/" >&2
+    exit 1
+fi
+for f in "${files[@]}"; do
     name=$(basename "$f" .ty)
+    if [ -z "$name" ]; then
+        echo "skipping '$f' — empty basename" >&2
+        continue
+    fi
     echo "=== $name ===" >&2
     "$TYC" check "$f" > "out/$name.check.out" 2>&1
     code=$?

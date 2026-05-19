@@ -12,6 +12,10 @@ fi
 mkdir -p builds
 for tc in "$@"; do
     name=$(basename "$tc" .ty)
+    if [ -z "$name" ]; then
+        echo "skipping '$tc' — empty basename would resolve workdir to 'builds/'" >&2
+        continue
+    fi
     workdir="builds/$name"
     rm -rf "$workdir"
     mkdir -p "$workdir/src"
