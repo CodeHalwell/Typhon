@@ -3299,6 +3299,43 @@ struct GatherBinding {
     expr: String,
 }
 
+/// Strip a trailing Python inline comment from `s`.
+///
+/// Scans through `s` tracking whether we are inside a single-quoted (`'`)
+/// or double-quoted (`"`) string literal (handling `\\` escapes). Returns
+/// the slice up to the first `#` found **outside** a string, with any
+/// trailing whitespace trimmed. If no such `#` exists the original `s` is
+/// returned unchanged.
+fn strip_inline_comment(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    let mut in_string: Option<u8> = None; // Some(b'\'') or Some(b'"')
+    while i < bytes.len() {
+        let b = bytes[i];
+        match in_string {
+            Some(quote) => {
+                if b == b'\\' {
+                    // Skip the escaped character.
+                    i += 2;
+                    continue;
+                }
+                if b == quote {
+                    in_string = None;
+                }
+            }
+            None => {
+                if b == b'\'' || b == b'"' {
+                    in_string = Some(b);
+                } else if b == b'#' {
+                    return s[..i].trim_end();
+                }
+            }
+        }
+        i += 1;
+    }
+    s
+}
+
 /// Collect indented `name = expr` bindings under a `gather:` header.
 /// Returns the bindings, the number of lines consumed (header + bindings),
 /// and the resulting triple-quoted-string state.
@@ -3328,7 +3365,7 @@ fn collect_gather_bindings(
         let body = &raw[line_indent..];
         let eq = find_assignment_eq(body)?;
         let name = body[..eq].trim().to_owned();
-        let expr = body[eq + 1..].trim().to_owned();
+        let expr = strip_inline_comment(body[eq + 1..].trim()).trim().to_owned();
         if name.is_empty() || expr.is_empty() {
             return None;
         }
@@ -5843,5 +5880,15 @@ string content
         assert!(out.contains("multi-line"));
         assert!(out.contains("string content"));
         assert!(out.contains("        return 0"));
+    }
+
+    #[test]
+    fn gather_strips_trailing_comment() {
+        let src = "async def f() -> None:\n    gather:\n        a = fetch_a()  # first\n        b = fetch_b()  # second\n    print(a, b)\n";
+        let out = expand_gather_blocks(src);
+        assert!(!out.contains("# first"), "comment should be stripped: {out}");
+        assert!(!out.contains("# second"), "comment should be stripped: {out}");
+        assert!(out.contains("create_task(fetch_a())"), "call intact: {out}");
+        assert!(out.contains("create_task(fetch_b())"), "call intact: {out}");
     }
 }

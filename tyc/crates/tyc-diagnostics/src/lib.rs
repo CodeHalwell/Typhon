@@ -234,6 +234,23 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// An `async` function body contains no `await` expression. This is
+    /// usually a mistake — either the `async` keyword is unnecessary, or
+    /// an `await` was forgotten. Surfaced as a warning so it doesn't break
+    /// existing code.
+    #[error("`async def {name}` contains no `await` expression")]
+    #[diagnostic(
+        code(tyc::async_without_await),
+        help("either remove `async` (if the function is synchronous) or add an `await` for the intended async call")
+    )]
+    AsyncWithoutAwait {
+        name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("`async` here but no `await` inside")]
+        span: SourceSpan,
+    },
+
     /// A `match` on a sealed union does not cover all variants and has no wildcard arm.
     #[error("non-exhaustive `match` on sealed union `{union_name}`: missing variant(s) {missing}")]
     #[diagnostic(
@@ -696,6 +713,21 @@ impl TycError {
     ) -> Self {
         Self::MissingAwait {
             callee: callee.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::AsyncWithoutAwait`] diagnostic.
+    pub fn async_without_await(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::AsyncWithoutAwait {
+            name: name.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

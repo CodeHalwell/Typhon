@@ -344,6 +344,53 @@ fn body_has_yield(body: &[Stmt]) -> bool {
     found
 }
 
+/// Return `true` when the function body contains at least one `await`
+/// expression at the top level of this function (nested function/class/lambda
+/// bodies are skipped — an `await` inside an inner async def doesn't count).
+/// Used by `check_function` to flag `async def` with no `await` (FINDINGS #83).
+fn body_has_await(body: &[Stmt]) -> bool {
+    struct AwaitVisitor<'a> {
+        found: &'a mut bool,
+    }
+    impl<'a, 'b> ruff_python_ast::visitor::source_order::SourceOrderVisitor<'a> for AwaitVisitor<'b> {
+        fn visit_expr(&mut self, e: &'a Expr) {
+            if *self.found {
+                return;
+            }
+            if matches!(e, Expr::Await(_)) {
+                *self.found = true;
+                return;
+            }
+            // Don't descend into nested function / lambda definitions.
+            if matches!(e, Expr::Lambda(_)) {
+                return;
+            }
+            ruff_python_ast::visitor::source_order::walk_expr(self, e);
+        }
+        fn visit_stmt(&mut self, s: &'a Stmt) {
+            if *self.found {
+                return;
+            }
+            if matches!(s, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                return;
+            }
+            ruff_python_ast::visitor::source_order::walk_stmt(self, s);
+        }
+    }
+    let mut found = false;
+    {
+        let mut visitor = AwaitVisitor { found: &mut found };
+        for s in body {
+            use ruff_python_ast::visitor::source_order::SourceOrderVisitor;
+            visitor.visit_stmt(s);
+            if *visitor.found {
+                break;
+            }
+        }
+    }
+    found
+}
+
 /// Return `true` when `returns` is annotated as one of the
 /// generator-compatible types. Recognises both PEP 484 (`Iterator[T]`,
 /// `Generator[T, S, R]`, `Iterable[T]`, `AsyncIterator[T]`,
@@ -2890,6 +2937,26 @@ fn check_function(
                 ));
             }
         }
+    }
+
+    // `async def` with no `await` — warn per tyc::async_without_await (FINDINGS #83).
+    // Only fires for user-authored async functions, not compiler-synthesised helpers
+    // (prefixed with `__typhon_`).
+    if is_async && !name.starts_with("__typhon_") && !body_has_await(body) {
+        let (off, len) = if let Some(r) = returns {
+            let s = r.range().start().to_usize();
+            let e = r.range().end().to_usize();
+            (s, e.saturating_sub(s).max(1))
+        } else {
+            (0, 1)
+        };
+        c.diagnostics.push_warning(TycError::async_without_await(
+            name,
+            c.path.clone(),
+            c.source,
+            off,
+            len,
+        ));
     }
 
     let saved_return = c.current_return.replace(ret_type);
