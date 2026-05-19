@@ -186,6 +186,7 @@ impl TyphonConfig {
                         path: candidate.display().to_string(),
                         cause: e.to_string(),
                     })?;
+                config.validate(&candidate)?;
                 return Ok(Some((candidate, config)));
             }
             if !dir.pop() {
@@ -202,13 +203,79 @@ impl TyphonConfig {
     pub fn to_toml_string(&self) -> Result<String, toml::ser::Error> {
         toml::to_string_pretty(self)
     }
+
+    /// Reject any configuration that violates a hard project-wide
+    /// invariant. Today the only such invariant is the Python target:
+    /// Typhon requires CPython **3.13+** because the emit pipeline
+    /// depends on PEP 695 type-parameter syntax, PEP 692 `**kwargs`,
+    /// and `asyncio.TaskGroup` — all 3.11/3.12-or-later, with several
+    /// features (free-threaded mode, PEP 750 t-strings) gated on 3.13t
+    /// specifically. Older targets are not supported and would
+    /// silently emit code the user's runtime refuses.
+    ///
+    /// Accepts the bare-major form (`"3.13"`, `"3.14"`) and the
+    /// free-threaded suffix (`"3.13t"`, `"3.14t"`). Anything that
+    /// parses below 3.13 — including the still-supported-by-CPython
+    /// 3.11 and 3.12 — is a hard error pointing at the offending
+    /// `typhon.toml`.
+    pub fn validate(&self, source_path: &Path) -> Result<(), ConfigError> {
+        let raw = self.python.target.trim();
+        let (major, minor) = parse_python_target(raw).ok_or_else(|| {
+            ConfigError::UnsupportedPythonTarget {
+                path: source_path.display().to_string(),
+                target: raw.to_owned(),
+                reason: "expected a `MAJOR.MINOR` string such as `3.13` or `3.14t`".to_owned(),
+            }
+        })?;
+        if (major, minor) < (3, 13) {
+            return Err(ConfigError::UnsupportedPythonTarget {
+                path: source_path.display().to_string(),
+                target: raw.to_owned(),
+                reason: format!(
+                    "Typhon requires CPython 3.13+ (got {major}.{minor}); update `[python] target` to `\"3.13\"` or newer",
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Parse a `[python] target` value into `(major, minor)`. Accepts the
+/// `"3.13"` bare form, the `"3.13t"` free-threaded suffix, and tolerates
+/// patch-level strings like `"3.13.2"` by ignoring everything past
+/// the second segment. Returns `None` for malformed input.
+fn parse_python_target(s: &str) -> Option<(u32, u32)> {
+    let mut parts = s.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor_raw = parts.next()?;
+    // Trim the `t` (free-threaded) or `rc1` / `a1` style suffix — only
+    // the leading digits matter for the floor check.
+    let minor_digits: String = minor_raw.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if minor_digits.is_empty() {
+        return None;
+    }
+    let minor: u32 = minor_digits.parse().ok()?;
+    Some((major, minor))
 }
 
 /// Errors that can occur when loading a `typhon.toml` file.
 #[derive(Debug)]
 pub enum ConfigError {
-    Io { path: String, cause: String },
-    Parse { path: String, cause: String },
+    Io {
+        path: String,
+        cause: String,
+    },
+    Parse {
+        path: String,
+        cause: String,
+    },
+    /// `[python] target` is missing, malformed, or below the
+    /// project-wide 3.13 floor. Emitted by [`TyphonConfig::validate`].
+    UnsupportedPythonTarget {
+        path: String,
+        target: String,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -220,8 +287,84 @@ impl std::fmt::Display for ConfigError {
             ConfigError::Parse { path, cause } => {
                 write!(f, "invalid typhon.toml '{}': {}", path, cause)
             }
+            ConfigError::UnsupportedPythonTarget {
+                path,
+                target,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "unsupported `[python] target = \"{target}\"` in '{path}': {reason}",
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for ConfigError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with_target(t: &str) -> TyphonConfig {
+        TyphonConfig {
+            python: PythonConfig {
+                target: t.into(),
+                free_threaded: false,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn validate_accepts_supported_targets() {
+        let path = Path::new("typhon.toml");
+        for t in &["3.13", "3.13t", "3.14", "3.14t", "3.13.2"] {
+            cfg_with_target(t)
+                .validate(path)
+                .unwrap_or_else(|e| panic!("target {t} should be accepted, got {e}"));
+        }
+    }
+
+    #[test]
+    fn validate_rejects_below_3_13() {
+        let path = Path::new("typhon.toml");
+        for t in &["3.12", "3.11", "3.10", "3.9", "2.7"] {
+            let err = cfg_with_target(t)
+                .validate(path)
+                .expect_err(&format!("target {t} should be rejected"));
+            match err {
+                ConfigError::UnsupportedPythonTarget { reason, .. } => {
+                    assert!(reason.contains("3.13+"), "expected 3.13+ hint, got {reason}");
+                }
+                _ => panic!("expected UnsupportedPythonTarget for {t}, got {err:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn validate_rejects_malformed_target() {
+        let path = Path::new("typhon.toml");
+        for t in &["", "abc", "3", "..", "x.y"] {
+            let err = cfg_with_target(t)
+                .validate(path)
+                .expect_err(&format!("target {t:?} should be rejected"));
+            assert!(matches!(
+                err,
+                ConfigError::UnsupportedPythonTarget { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn parse_python_target_handles_suffixes() {
+        assert_eq!(parse_python_target("3.13"), Some((3, 13)));
+        assert_eq!(parse_python_target("3.13t"), Some((3, 13)));
+        assert_eq!(parse_python_target("3.14rc1"), Some((3, 14)));
+        assert_eq!(parse_python_target("3.13.2"), Some((3, 13)));
+        assert_eq!(parse_python_target(""), None);
+        assert_eq!(parse_python_target("3"), None);
+        assert_eq!(parse_python_target("abc"), None);
+    }
+}

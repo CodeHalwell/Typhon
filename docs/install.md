@@ -7,10 +7,12 @@ section of the README).
 ## Prerequisites
 
 - **macOS** on Apple Silicon (`arm64`) or Intel (`x86_64`).
-- **CPython 3.13 or newer** at runtime. Typhon emits Python that targets
-  3.13+ by default (configurable via `[python] target` in `typhon.toml`).
-  The default in the bundled `init` scaffold is `target = "3.13"`. The
-  emitted code is plain CPython — there is no Typhon runtime to install.
+- **CPython 3.13 or newer** at runtime. **This is a hard requirement** — Typhon
+  rejects any `[python] target` below 3.13 at config-load time with
+  `unsupported [python] target`. The valid values are `"3.13"`, `"3.13t"`
+  (free-threaded), `"3.14"`, `"3.14t"`. The bundled `init` scaffold defaults
+  to `"3.13"`. The emitted code is plain CPython — there is no Typhon
+  runtime to install.
 - `curl`, `tar`, and `shasum`. All ship with macOS by default.
 
 > The `tyc` binary itself doesn't need Python installed to compile your

@@ -30,6 +30,7 @@ use tyc_resolve::{
 };
 
 mod stdlib_stubs;
+mod venv_introspect;
 
 /// Manual resolved-module cache for cross-file import resolution.
 ///
@@ -64,6 +65,14 @@ pub struct Backend {
     /// editor (no Salsa SourceFile).  Keyed by file:// URI; evicted when
     /// the preprocessed text changes.
     resolved_cache: ResolvedCache,
+    /// Per-project-root introspection caches. Keyed on the directory
+    /// containing the project's `typhon.toml`; value is a Mutex-guarded
+    /// cache that shells to `.venv/bin/python` on misses and remembers
+    /// the result. One cache per project keeps unrelated workspaces
+    /// from sharing module results — different venvs have different
+    /// installed packages.
+    introspection:
+        Arc<Mutex<HashMap<std::path::PathBuf, Arc<Mutex<venv_introspect::IntrospectionCache>>>>>,
 }
 
 impl std::fmt::Debug for Backend {
@@ -308,7 +317,34 @@ impl LanguageServer for Backend {
         } else {
             (preprocessed, resolved)
         };
-        let items = compute_completion_items(&resolved, &preprocessed, position);
+        // Resolve the project root once so we can wire venv
+        // introspection through to the completion path. The cache
+        // shell-launches `.venv/bin/python` on miss, so we run it
+        // off the runtime thread to keep async handlers responsive.
+        let cache_handle = self.introspection_cache_for(&uri).await;
+        let introspect_owned: Option<
+            Box<dyn Fn(&str) -> Option<Vec<CompletionItem>> + Send + Sync>,
+        > = match cache_handle {
+            Some((root, cache)) => Some(Box::new(move |module: &str| {
+                // `members` may block on a subprocess; we're inside an
+                // async fn but the rest of the LSP isn't holding
+                // anything that needs us to yield, so a short blocking
+                // lock here is fine. The cache itself is process-wide
+                // synchronised so a second concurrent completion for
+                // the same module just blocks on the prior result.
+                let mut guard = cache.blocking_lock();
+                guard
+                    .members(&root, module)
+                    .map(|m| introspected_members_to_completion(&m))
+            })),
+            None => None,
+        };
+        let items = compute_completion_items_with_introspection(
+            &resolved,
+            &preprocessed,
+            position,
+            introspect_owned.as_ref().map(|b| b.as_ref() as &dyn Fn(&str) -> Option<Vec<CompletionItem>>),
+        );
         Ok(Some(CompletionResponse::Array(items)))
     }
 
@@ -394,6 +430,38 @@ impl Backend {
     async fn source_file_for(&self, uri: &Uri) -> Option<SourceFile> {
         let docs = self.documents.lock().await;
         docs.get(uri.as_str()).copied()
+    }
+
+    /// Locate `uri`'s project root (walking upward for `typhon.toml`)
+    /// and return its [`venv_introspect::IntrospectionCache`], creating
+    /// one on first access. Returns `None` when the URI isn't a local
+    /// `file://` path or no `typhon.toml` ancestor exists.
+    ///
+    /// One cache per project root keeps different workspaces isolated:
+    /// project A's `requests` package shouldn't appear as a completion
+    /// when project B (which doesn't depend on it) is active.
+    async fn introspection_cache_for(
+        &self,
+        uri: &Uri,
+    ) -> Option<(
+        std::path::PathBuf,
+        Arc<Mutex<venv_introspect::IntrospectionCache>>,
+    )> {
+        // We only know how to introspect when the editor is operating
+        // on a real path. `file:///` URIs convert; anything else
+        // (`untitled:` / `inmemory:`) doesn't have a venv to point at.
+        let path = uri_to_path(uri)?;
+        let root = venv_introspect::find_project_root(&path)?;
+        let mut guard = self.introspection.lock().await;
+        let cache = guard
+            .entry(root.clone())
+            .or_insert_with(|| {
+                Arc::new(Mutex::new(
+                    venv_introspect::IntrospectionCache::for_project_root(&root),
+                ))
+            })
+            .clone();
+        Some((root, cache))
     }
 
     /// Return a [`ResolvedModule`] for a cross-file target URI, caching the
@@ -779,6 +847,7 @@ pub fn run_stdio(log_level: LogLevel) {
             log_level,
             documents: Arc::new(Mutex::new(HashMap::new())),
             resolved_cache: Arc::new(Mutex::new(HashMap::new())),
+            introspection: Arc::new(Mutex::new(HashMap::new())),
         });
         Server::new(stdin, stdout, socket).serve(service).await;
     });
@@ -861,11 +930,31 @@ pub fn compute_completion_items(
     preprocessed: &str,
     position: Position,
 ) -> Vec<CompletionItem> {
+    compute_completion_items_with_introspection(resolved, preprocessed, position, None)
+}
+
+/// Variant of [`compute_completion_items`] that accepts a venv-driven
+/// introspection callback. When supplied, the callback is consulted
+/// first for member-access completions; it receives the resolved
+/// dotted module path (e.g. `"os.path"` after walking through
+/// `ImportInfo`) and returns the introspected member list. A `None`
+/// return signals "module not importable / no venv available" and we
+/// fall back to the curated [`stdlib_stubs`] tables.
+///
+/// The production LSP backend passes a closure that delegates to
+/// [`venv_introspect::IntrospectionCache`]; unit tests pass `None` to
+/// exercise the curated-stub path deterministically.
+pub fn compute_completion_items_with_introspection(
+    resolved: &ResolvedModule,
+    preprocessed: &str,
+    position: Position,
+    introspect: Option<&dyn Fn(&str) -> Option<Vec<CompletionItem>>>,
+) -> Vec<CompletionItem> {
     let offset = position_to_byte(preprocessed, position);
     // Member-access path: detect `receiver.` (with optional partial member
     // name) immediately before the cursor and try to surface stub members.
     if let Some(receiver) = extract_member_access_receiver(preprocessed, offset) {
-        if let Some(items) = member_completion_items(resolved, &receiver, offset) {
+        if let Some(items) = member_completion_items(resolved, &receiver, offset, introspect) {
             return items;
         }
         // Receiver was an identifier but we couldn't resolve it to a
@@ -1047,14 +1136,28 @@ fn member_completion_items(
     resolved: &ResolvedModule,
     receiver: &str,
     offset: usize,
+    introspect: Option<&dyn Fn(&str) -> Option<Vec<CompletionItem>>>,
 ) -> Option<Vec<CompletionItem>> {
-    // Path 1: exact match in the stub registry. Cheap and handles the
-    // common `os.path.` / `urllib.parse.` cases.
-    if let Some(members) = stdlib_stubs::lookup(receiver) {
-        return Some(stub_members_to_completion(members));
+    // Try every plausible interpretation of `receiver` in order:
+    //   1. Receiver is literally a dotted module name (`os.path`).
+    //   2. Receiver's head is an imported alias; rejoin with the tail.
+    // For each interpretation, prefer venv introspection (the user's
+    // *actual* installed packages) before falling back to the curated
+    // stub registry.
+    let try_resolve = |module: &str| -> Option<Vec<CompletionItem>> {
+        if let Some(cb) = introspect {
+            if let Some(items) = cb(module) {
+                return Some(items);
+            }
+        }
+        stdlib_stubs::lookup(module).map(stub_members_to_completion)
+    };
+    // Interpretation 1: the receiver text *is* the module path.
+    if let Some(items) = try_resolve(receiver) {
+        return Some(items);
     }
-    // Split into head and tail so we can resolve the head through the
-    // scope chain and re-join with the tail for the stub lookup.
+    // Interpretation 2: head resolves through the scope chain to an
+    // imported module; tail (if any) extends the module path.
     let (head, tail) = match receiver.split_once('.') {
         Some((h, t)) => (h, Some(t)),
         None => (receiver, None),
@@ -1075,8 +1178,43 @@ fn member_completion_items(
         // `from os import path` + receiver `path.foo` → `"os.path.foo"`.
         (Some(m), Some(t)) => format!("{}.{}.{}", info.module, m, t),
     };
-    let members = stdlib_stubs::lookup(&module_path)?;
-    Some(stub_members_to_completion(members))
+    try_resolve(&module_path)
+}
+
+/// Convert a venv-introspected [`venv_introspect::MemberInfo`] list
+/// into LSP `CompletionItem`s, mapping the string `kind` to the LSP
+/// enum and skipping any member whose name starts with `_` (the
+/// introspect script already drops those, but the second filter
+/// here makes the public contract self-contained).
+pub(crate) fn introspected_members_to_completion(
+    members: &[venv_introspect::MemberInfo],
+) -> Vec<CompletionItem> {
+    members
+        .iter()
+        .filter(|m| !m.name.starts_with('_'))
+        .map(|m| CompletionItem {
+            label: m.name.clone(),
+            kind: Some(introspected_kind_to_lsp(&m.kind)),
+            detail: m.signature.clone(),
+            documentation: m
+                .documentation
+                .clone()
+                .map(Documentation::String),
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// Map the string kind the Python helper writes (`"function"`,
+/// `"class"`, `"module"`, `"value"`) to a `CompletionItemKind` so the
+/// editor renders the appropriate icon.
+fn introspected_kind_to_lsp(kind: &str) -> CompletionItemKind {
+    match kind {
+        "class" => CompletionItemKind::CLASS,
+        "module" => CompletionItemKind::MODULE,
+        "function" => CompletionItemKind::FUNCTION,
+        _ => CompletionItemKind::VALUE,
+    }
 }
 
 /// Convert a slice of curated [`stdlib_stubs::StubMember`] entries into
@@ -1981,6 +2119,91 @@ def f() -> None:
         let prep = tyc_syntax::preprocess::preprocess(src);
         let position = byte_to_position(&prep.python_source, prep.python_source.len());
         assert!(try_fixup_and_resolve(&prep.python_source, position).is_none());
+    }
+
+    #[test]
+    fn introspection_takes_precedence_over_curated_stubs() {
+        // When a venv-introspection callback is supplied, its result
+        // wins over the curated stub registry. Verify by handing in a
+        // fake callback that returns a single member with a distinctive
+        // name and confirming it surfaces (instead of the curated `os`
+        // member list).
+        let src = "\
+import os
+
+def f() -> None:
+    let _x = os.getcwd()
+";
+        let (resolved, preprocessed) = parse_resolved(src);
+        let offset = preprocessed.find("os.getcwd").unwrap() + "os.".len();
+        let position = byte_to_position(&preprocessed, offset);
+
+        // Sanity: with no callback we hit the curated stubs path.
+        let baseline = compute_completion_items(&resolved, &preprocessed, position);
+        assert!(
+            baseline.iter().any(|i| i.label == "getcwd"),
+            "curated baseline should include getcwd"
+        );
+
+        // Now provide a callback that ignores the curated table and
+        // returns a synthetic member.
+        let stubbed = |module: &str| -> Option<Vec<CompletionItem>> {
+            assert_eq!(module, "os", "callback should see resolved module path");
+            Some(vec![CompletionItem {
+                label: "from_introspection".to_owned(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                detail: Some("synthetic() -> None".to_owned()),
+                ..Default::default()
+            }])
+        };
+        let items = compute_completion_items_with_introspection(
+            &resolved,
+            &preprocessed,
+            position,
+            Some(&stubbed),
+        );
+        let labels: std::collections::HashSet<String> =
+            items.iter().map(|i| i.label.clone()).collect();
+        assert!(
+            labels.contains("from_introspection"),
+            "expected introspection result: {labels:?}"
+        );
+        // Curated `getcwd` must NOT appear when introspection succeeded —
+        // we don't want to mix the two sources or surface stale entries.
+        assert!(
+            !labels.contains("getcwd"),
+            "introspection should suppress curated stub: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn introspection_failure_falls_back_to_curated_stubs() {
+        // If the introspection callback returns None (module not in
+        // the venv, subprocess failure, etc.), we drop to the curated
+        // stub table so the user still gets useful suggestions.
+        let src = "\
+import os
+
+def f() -> None:
+    let _x = os.getcwd()
+";
+        let (resolved, preprocessed) = parse_resolved(src);
+        let offset = preprocessed.find("os.getcwd").unwrap() + "os.".len();
+        let position = byte_to_position(&preprocessed, offset);
+
+        let always_none = |_module: &str| -> Option<Vec<CompletionItem>> { None };
+        let items = compute_completion_items_with_introspection(
+            &resolved,
+            &preprocessed,
+            position,
+            Some(&always_none),
+        );
+        let labels: std::collections::HashSet<String> =
+            items.iter().map(|i| i.label.clone()).collect();
+        assert!(
+            labels.contains("getcwd"),
+            "expected curated fallback: {labels:?}"
+        );
     }
 
     #[test]

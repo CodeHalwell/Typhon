@@ -62,8 +62,8 @@ pytest = "8.2"              # bare version → ==8.2
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `target` | `"3.13"` \| `"3.14"` | Target CPython version. |
-| `free-threaded` | bool | Allow free-threaded emission paths. Default `false` until 3.14 is the default Python. |
+| `target` | `"3.13"` \| `"3.13t"` \| `"3.14"` \| `"3.14t"` | Target CPython version. **Typhon requires 3.13+**; older targets are rejected at config load with `unsupported [python] target` and an actionable error. The `t` suffix selects free-threaded emission paths (PEP 703); see `free-threaded` below. |
+| `free-threaded` | bool | Allow free-threaded emission paths. Default `false` until 3.14 is the default Python. Use a `t` suffix on `target` to attest at config time. |
 
 ### `[emit]`
 

@@ -45,7 +45,7 @@ If you download the tarball manually (rather than via the script), clear the mac
 xattr -d com.apple.quarantine ~/.local/bin/tyc
 ```
 
-`tyc` itself runs anywhere a modern Rust toolchain produces a binary; the emitted Python targets **CPython 3.13+** by default.
+`tyc` itself runs anywhere a modern Rust toolchain produces a binary; the emitted Python **requires CPython 3.13 or newer** at runtime. Older targets are rejected at `typhon.toml` load time so projects can't accidentally build code their interpreter won't run.
 
 For a longer-form guide (custom install dir, pinned version, uninstall, troubleshooting) see [docs/install.md](docs/install.md).
 
