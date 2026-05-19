@@ -1,0 +1,19 @@
+import asyncio
+
+async def fetch_a() -> int:
+    return 1
+
+async def fetch_b(x: int) -> int:
+    return x + 1
+
+# gather with dependency between bindings — should be rejected? or behaves as sequential?
+async def bad() -> int:
+    gather:
+        a = fetch_a()
+        b = fetch_b(a)  # depends on a
+    return a + b
+
+async def main() -> None:
+    print(await bad())
+
+asyncio.run(main())

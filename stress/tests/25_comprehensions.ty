@@ -1,0 +1,8 @@
+def main() -> None:
+    let xs: list[int] = [x * 2 for x in range(10)]
+    let evens: list[int] = [x for x in range(20) if x % 2 == 0]
+    let squared: dict[int, int] = {x: x*x for x in range(5)}
+    let pairs: list[tuple[int, int]] = [(x, y) for x in range(3) for y in range(3)]
+    let s: set[int] = {x for x in range(5)}
+    let gen = (x for x in range(3))
+    print(len(xs))

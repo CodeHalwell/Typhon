@@ -1,0 +1,4 @@
+def main() -> None:
+    print("hello")
+# Notice: no `if __name__ == "__main__":` block — main() is never called.
+# tyc emits without warning.

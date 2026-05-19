@@ -1,0 +1,12 @@
+# or-pattern with bindings — Python rejects different bindings per alternative
+def f(x: int | str) -> int:
+    match x:
+        case int(n) | str(n):  # n bound in both alternatives
+            return len(str(n))
+
+def main() -> None:
+    print(f(5))
+    print(f("hi"))
+
+if __name__ == "__main__":
+    main()

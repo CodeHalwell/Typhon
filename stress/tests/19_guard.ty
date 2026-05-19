@@ -1,0 +1,16 @@
+def shipping(weight: float?) -> float:
+    guard w = weight else:
+        return 0.0
+    return w * 1.25
+
+def chain(token: str?, user_id: str?) -> str:
+    guard t = token else:
+        return "anon"
+    guard u = user_id else:
+        return "anon"
+    return f"({t}, {u})"
+
+def main() -> None:
+    print(shipping(2.5))
+    print(shipping(None))
+    print(chain("tok", "u1"))

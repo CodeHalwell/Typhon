@@ -1,0 +1,18 @@
+# `?` chain — multiple
+def step1(x: int) -> Result[int, str]:
+    return Ok(x + 1)
+
+def step2(x: int) -> Result[int, str]:
+    return Ok(x * 2)
+
+def step3(x: int) -> Result[int, str]:
+    return Ok(x - 1)
+
+def pipeline(x: int) -> Result[int, str]:
+    let a: int = step1(x)?
+    let b: int = step2(a)?
+    let c: int = step3(b)?
+    return Ok(c)
+
+def main() -> None:
+    print(pipeline(5))

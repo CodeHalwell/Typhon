@@ -1,0 +1,12 @@
+def greet(name: str, greeting: str = "Hello", excited: bool = False) -> str:
+    let punct: str = "!" if excited else "."
+    return f"{greeting}, {name}{punct}"
+
+def stars(n: int, *args: int, sep: str = ",", **kwargs: int) -> str:
+    return sep.join([str(a) for a in args])
+
+def main() -> None:
+    print(greet("Amy"))
+    print(greet("Bob", greeting="Hi"))
+    print(greet(name="Carol", excited=True))
+    print(stars(1, 2, 3, 4, sep="-"))

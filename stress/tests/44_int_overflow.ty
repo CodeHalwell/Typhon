@@ -1,0 +1,29 @@
+def factorial(n: int) -> int:
+    if n <= 1:
+        return 1
+    return n * factorial(n - 1)
+
+def main() -> None:
+    # Python arbitrary precision
+    let big: int = factorial(100)
+    print(big)
+
+    # Bit ops
+    let a: int = 0xFF
+    let b: int = 0b1010
+    let c: int = a | b
+    let d: int = a & b
+    let e: int = a ^ b
+    let f: int = a << 4
+    let g: int = a >> 2
+    print(c, d, e, f, g)
+
+    # Division
+    let x: float = 10 / 3
+    let y: int = 10 // 3
+    let z: int = 10 % 3
+    let w: float = 10 ** 0.5  # power: float result
+    print(x, y, z, w)
+
+if __name__ == "__main__":
+    main()

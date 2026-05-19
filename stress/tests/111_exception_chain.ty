@@ -1,0 +1,17 @@
+def deep() -> None:
+    raise ValueError("inner")
+
+def shallow() -> None:
+    try:
+        deep()
+    except ValueError as e:
+        raise RuntimeError("wrapper") from e
+
+def main() -> None:
+    try:
+        shallow()
+    except Exception as e:
+        print(e.__cause__)
+
+if __name__ == "__main__":
+    main()

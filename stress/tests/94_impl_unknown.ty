@@ -1,0 +1,6 @@
+impl UnknownClass:  # no such class
+    def f(self) -> int:
+        return 1
+
+def main() -> None:
+    print("x")

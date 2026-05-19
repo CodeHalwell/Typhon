@@ -1,0 +1,21 @@
+def find(id: int) -> str?:
+    if id == 0:
+        return None
+    return "user"
+
+def greet(name: str) -> None:
+    print(name)
+
+def main() -> None:
+    let found: str? = find(1)
+    # Should fail: nullable_use
+    greet(found)
+
+    # Narrow with is not None
+    if found is not None:
+        greet(found)
+
+    # Narrow with guard
+    guard f = find(1) else:
+        return
+    greet(f)

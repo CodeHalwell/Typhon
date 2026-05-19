@@ -1,0 +1,11 @@
+def add(a: int, b: int) -> int:
+    return a + b
+
+def main() -> None:
+    let x: int = 1
+    let y: float = 2.5
+    let z: float = add(x, x)  # int widens to float? checker?
+    let s: str = "hello"
+    let b: bool = True
+    let n: int = b  # bool subtype of int? docs say no
+    print(z)

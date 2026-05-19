@@ -1,0 +1,21 @@
+def double(x: int) -> int:
+    return x * 2
+
+def add(x: int, y: int) -> int:
+    return x + y
+
+def main() -> None:
+    let a: int = 5 |> double() |> add(3)
+    print(a)
+
+    let s: str = "  Hello  " |> str.strip() |> str.lower()
+    print(s)
+
+    # multi-line pipe in parens
+    let b: int = (
+        5
+        |> double()
+        |> add(10)
+        |> double()
+    )
+    print(b)

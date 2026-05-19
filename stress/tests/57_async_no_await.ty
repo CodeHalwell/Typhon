@@ -1,0 +1,5 @@
+async def maybe_async() -> int:
+    return 42  # no await — should warn tyc::async_without_await
+
+async def main() -> int:
+    return await maybe_async()

@@ -1,0 +1,22 @@
+type Report = ReportData
+
+class ReportData:
+    summary: str
+
+def find_user(uid: int) -> Result[int, str]:
+    return Ok(uid)
+
+def check_perms(uid: int) -> Result[bool, str]:
+    return Ok(True)
+
+def build_report(uid: int, perms: bool) -> Result[Report, str]:
+    return Ok(ReportData(summary=f"{uid}/{perms}"))
+
+def make_report(uid: int) -> Result[Report, str]:
+    with user = find_user(uid)?,
+         perms = check_perms(user)?,
+         report = build_report(user, perms)?:
+        return Ok(report)
+    else err:
+        print(err)
+        return Err(err)

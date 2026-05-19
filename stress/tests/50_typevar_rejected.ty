@@ -1,0 +1,10 @@
+# Docs say "Never import TypeVar from typing"
+from typing import TypeVar
+
+T = TypeVar("T")
+
+def first(xs: list[T]) -> T:
+    return xs[0]
+
+def main() -> None:
+    print(first([1, 2, 3]))

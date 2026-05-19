@@ -1,0 +1,13 @@
+def main() -> None:
+    let (a, b) = (1, 2)
+    let (c, d, e) = (1, 2, 3)
+    # nested
+    let (x, (y, z)) = (1, (2, 3))
+    # swap
+    mut p: int = 1
+    mut q: int = 2
+    p, q = q, p
+    print(a, b, c, d, e, x, y, z, p, q)
+
+if __name__ == "__main__":
+    main()

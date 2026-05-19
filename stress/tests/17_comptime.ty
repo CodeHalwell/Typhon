@@ -1,0 +1,19 @@
+comptime let PORT: int = int(env("PORT", "8080"))
+comptime let HOST: str = env("HOST", "localhost").lower()
+comptime let IS_PROD: bool = env("BUILD_TAG", "dev") == "prod"
+comptime let TAGS: list[str] = ["alpha", "beta"]
+comptime let CFG: dict[str, int] = {"a": 1, "b": 2}
+comptime let PAIR: tuple[int, str] = (1, "two")
+
+comptime def feature(name: str) -> bool:
+    return env("FEATURE_" + name.upper(), "0") == "1"
+
+comptime let SHIPS_AUTH: bool = feature("auth")
+
+# Should be rejected — time.* not in sandbox
+# comptime let NOW: float = time.time()
+
+def main() -> None:
+    print(PORT)
+    print(HOST)
+    print(TAGS)

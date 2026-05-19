@@ -1,0 +1,17 @@
+def main() -> None:
+    mut xs: list[int] = [1, 2, 3]
+    xs.append(4)
+    xs.extend([5, 6])
+    let l: int = len(xs)
+    xs.pop()
+    let s: int = sum(xs)
+    let mx: int = max(xs)
+    let mn: int = min(xs)
+    let srt: list[int] = sorted(xs)
+    let rev: list[int] = list(reversed(xs))
+    # comprehension over a sorted result
+    let half: list[float] = [x / 2 for x in xs]
+    print(l, s, mx, mn, srt, rev, half)
+
+if __name__ == "__main__":
+    main()

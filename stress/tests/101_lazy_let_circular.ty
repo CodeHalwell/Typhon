@@ -1,0 +1,5 @@
+lazy let A: int = B + 1
+lazy let B: int = A + 1
+
+def main() -> None:
+    print(A)

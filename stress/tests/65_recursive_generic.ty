@@ -1,0 +1,15 @@
+# Generic linked list
+class Node[T]:
+    value: T
+    next: Node[T]?
+
+def length[T](head: Node[T]?) -> int:
+    if head is None:
+        return 0
+    return 1 + length(head.next)
+
+def main() -> None:
+    let n1: Node[int] = Node(value=1, next=None)
+    let n2: Node[int] = Node(value=2, next=n1)
+    let n3: Node[int] = Node(value=3, next=n2)
+    print(length(n3))

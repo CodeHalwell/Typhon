@@ -1,0 +1,9 @@
+def parse_port(raw: str) -> Result[int, str]:
+    return Ok(int(raw))
+
+def regular() -> int:
+    let n: int = parse_port("80")?  # should be invalid_question_op
+    return n
+
+def main() -> None:
+    print(regular())

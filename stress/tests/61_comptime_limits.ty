@@ -1,0 +1,11 @@
+import time
+import random
+
+# time.* — should be rejected
+comptime let NOW: float = time.time()
+
+# random — should be rejected
+comptime let R: int = random.randint(0, 10)
+
+def main() -> None:
+    print(NOW)

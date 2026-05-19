@@ -1,0 +1,25 @@
+type Big = int | str | float | bool | bytes | None | list[int]
+
+def categorize(x: Big) -> str:
+    match x:
+        case int():
+            return "int"
+        case str():
+            return "str"
+        case float():
+            return "float"
+        case bool():
+            return "bool"
+        case bytes():
+            return "bytes"
+        case None:
+            return "none"
+        case list():
+            return "list"
+
+def main() -> None:
+    print(categorize(5))
+    print(categorize("hi"))
+
+if __name__ == "__main__":
+    main()

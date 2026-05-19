@@ -1,0 +1,11 @@
+def step(x: int) -> Result[int, str]:
+    return Ok(x + 1)
+
+def combined(x: int) -> Result[int, str]:
+    # ? inside larger expression
+    let y: int = step(x)? + step(x)?
+    return Ok(y)
+
+# ? in call
+def callsite(x: int) -> Result[int, str]:
+    return Ok(step(x)? + 1)

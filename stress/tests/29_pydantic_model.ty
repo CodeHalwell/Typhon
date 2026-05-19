@@ -1,0 +1,17 @@
+model ApiUser:
+    id: int
+    name: str
+    email: str?
+
+model Inner:
+    x: int
+
+model Outer:
+    inner: Inner
+    tags: list[str]
+
+def main() -> None:
+    let u: ApiUser = ApiUser(id=1, name="amy", email=None)
+    print(u.name)
+    let o: Outer = Outer(inner=Inner(x=5), tags=["a", "b"])
+    print(o.inner.x)

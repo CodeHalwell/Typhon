@@ -1,0 +1,12 @@
+comptime let A: int = 5 + 3 * 2
+comptime let B: float = 10.0 / 3.0
+comptime let C: bool = A > 5 and B < 5.0
+comptime let D: str = "hello".upper().replace("L", "X")
+comptime let E: list[int] = [1, 2, 3, 4, 5]
+comptime let F: int = E[0]  # subscript - documented?
+comptime let G: int = len(E)
+comptime let H: dict[str, int] = {"a": 1, "b": 2}
+comptime let I: int = H["a"]  # dict subscript
+
+def main() -> None:
+    print(A, B, C, D, E, F, G)

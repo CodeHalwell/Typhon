@@ -1,0 +1,11 @@
+from typing import Iterator
+
+def counter(n: int) -> Iterator[int]:
+    mut i: int = 0
+    while i < n:
+        yield i
+        i = i + 1
+
+def main() -> None:
+    for x in counter(5):
+        print(x)

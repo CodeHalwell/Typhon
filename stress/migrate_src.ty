@@ -1,0 +1,26 @@
+
+
+
+class User:
+    id: int
+    name: str
+    email: str? = None
+
+def find_user(uid: int) -> User?:
+    if uid == 0:
+        return None
+    return User(id=uid, name="amy", email="a@b.com")
+
+let COUNT: int = 10
+
+def main() -> None:
+    user = find_user(1)
+    if user is not None:
+        print(user.name)
+    total = 0
+    for i in range(COUNT):
+        total = total + i
+    print(total)
+
+if __name__ == "__main__":
+    main()

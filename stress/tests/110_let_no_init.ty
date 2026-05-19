@@ -1,0 +1,5 @@
+def main() -> None:
+    # uninitialized let?
+    let x: int
+    x = 5  # would normally need mut
+    print(x)

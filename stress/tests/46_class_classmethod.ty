@@ -1,0 +1,21 @@
+class Counter:
+    value: int
+
+impl Counter:
+    @classmethod
+    def make() -> Counter:
+        return Counter(value=0)
+
+    @staticmethod
+    def constant() -> int:
+        return 42
+
+    def inc(self) -> None:
+        self.value = self.value + 1
+
+def main() -> None:
+    let c: Counter = Counter.make()
+    print(Counter.constant())
+
+if __name__ == "__main__":
+    main()

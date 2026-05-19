@@ -1,0 +1,12 @@
+import json
+
+# implicit any outside unsafe
+def parse_loose(s: str):  # missing return type -> tyc::missing_return_type
+    data = json.loads(s)  # implicit_any expected
+    return data
+
+def parse_tight(s: str) -> int:
+    unsafe:
+        let raw = json.loads(s)  # ok inside unsafe
+    let n: int = int(raw)  # smuggling Unsafe[T] outside?
+    return n

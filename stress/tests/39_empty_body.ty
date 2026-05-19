@@ -1,0 +1,20 @@
+class Empty:
+    pass
+
+class FieldOnly:
+    x: int
+
+def stub() -> None:
+    pass
+
+def ellipsis_body() -> int:
+    ...  # might be valid python but missing return?
+
+interface IEmpty:
+    pass
+
+interface IOne:
+    def x() -> int
+
+def main() -> None:
+    pass

@@ -1,0 +1,21 @@
+def main() -> None:
+    let s: str = "Hello"
+    let n: int = 42
+
+    # f-string with format spec
+    let a: str = f"{n:04d}"
+    let b: str = f"{n:>10}"
+    let c: str = f"{n:.2f}"  # int with float format - python will reject
+    let d: str = f"{s!r}"
+    let e: str = f"{s!a}"
+    let f: str = f"{{escaped}}"
+
+    # nested f-strings  3.12+
+    let g: str = f"{f'{n} times'}"
+
+    # multi-line
+    let m: str = f"""
+    line 1: {n}
+    line 2: {s}
+    """
+    print(a, b, c, d, e, f, g)

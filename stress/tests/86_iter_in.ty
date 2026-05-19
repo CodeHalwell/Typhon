@@ -1,0 +1,21 @@
+def main() -> None:
+    let xs: list[int] = [1, 2, 3]
+    if 2 in xs:
+        print("yes")
+    if 4 not in xs:
+        print("no")
+
+    let d: dict[str, int] = {"a": 1}
+    if "a" in d:
+        print("key")
+
+    # iterate dict directly (iterates keys)
+    for k in d:
+        print(k)
+
+    let s: str = "hello"
+    for ch in s:
+        print(ch)
+
+if __name__ == "__main__":
+    main()

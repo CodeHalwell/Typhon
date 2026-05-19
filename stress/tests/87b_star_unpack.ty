@@ -1,0 +1,7 @@
+def main() -> None:
+    let a: tuple[int, int, int] = (1, 2, 3)
+    let (first, *rest) = a  # PEP 3132 starred in destructure
+    print(first, rest)
+
+if __name__ == "__main__":
+    main()

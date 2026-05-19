@@ -1,0 +1,14 @@
+from typing import Callable
+
+def apply(f: Callable[[int], int], x: int) -> int:
+    return f(x)
+
+def main() -> None:
+    let double = lambda x: x * 2  # missing annotations on lambda?
+    let r: int = apply(lambda x: x + 1, 5)
+    print(r)
+
+    let xs: list[int] = [1, 2, 3]
+    let doubled: list[int] = list(map(lambda x: x * 2, xs))
+    let filtered: list[int] = list(filter(lambda x: x > 1, xs))
+    print(doubled)

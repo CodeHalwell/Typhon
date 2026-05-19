@@ -1,0 +1,29 @@
+def first[T](xs: list[T]) -> T?:
+    if len(xs) == 0:
+        return None
+    return xs[0]
+
+def pair[T](a: T, b: T) -> tuple[T, T]:
+    return (a, b)
+
+class Box[T]:
+    value: T
+
+impl[T] Box[T]:
+    def get(self) -> T:
+        return self.value
+
+    def map[U](self, f: Callable[[T], U]) -> Box[U]:
+        return Box(value=f(self.value))
+
+type Vec[T] = list[T]
+
+def double_box(b: Box[int]) -> Box[int]:
+    return b.map(lambda x: x * 2)
+
+def main() -> None:
+    let xs: list[int] = [1, 2, 3]
+    let x: int? = first(xs)
+    let p: tuple[int, str] = pair(1, "two")  # widens to int|str?
+    let b: Box[int] = Box(value=42)
+    print(b.get())

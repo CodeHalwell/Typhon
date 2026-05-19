@@ -1,0 +1,6 @@
+def main() -> None:
+    unsafe:
+        let x = 1  # would normally be ok since literal
+        let y = [1, "two", 3.0]
+    let z: int = 5
+    print(z)

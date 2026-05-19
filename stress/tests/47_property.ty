@@ -1,0 +1,16 @@
+class Rect:
+    w: float
+    h: float
+
+impl Rect:
+    @property
+    def area(self) -> float:
+        return self.w * self.h
+
+def main() -> None:
+    let r: Rect = Rect(w=3.0, h=4.0)
+    let a: float = r.area
+    print(a)
+
+if __name__ == "__main__":
+    main()

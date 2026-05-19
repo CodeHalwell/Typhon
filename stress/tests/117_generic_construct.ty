@@ -1,0 +1,15 @@
+class Box[T]:
+    value: T
+
+def main() -> None:
+    # Constructor — does T get inferred?
+    let b: Box[int] = Box(value=5)
+    let c: Box[str] = Box(value="hi")
+    print(b.value, c.value)
+
+    # Without annotation — what's inferred?
+    let d = Box(value=10)
+    print(d.value)
+
+if __name__ == "__main__":
+    main()
