@@ -27,16 +27,22 @@ tyc fmt --check src/          # exit 1 if anything would change (CI mode)
 
 - **Interior whitespace** — runs of 2+ spaces past the leading indent are collapsed to one (`def    main` → `def main`).
 - **Bracket adjacency** — `(  x` → `(x`, `x  )` → `x)`, `x   ,` → `x,`.
-- **Trailing whitespace** — removed.
+- **Comma spacing** — a run of whitespace after `,` is normalised to a single space (`a,    b` → `a, b`).
+- **Comment hash spacing** — `#foo` → `# foo`. Shebangs (`#!…`) and section-marker double-hash comments (`## …`) are left alone.
+- **Leading tab expansion** — a tab character at the start of a line is expanded to four spaces.
+- **Blank-line runs** — three or more consecutive blank lines are collapsed to two.
+- **Trailing whitespace** — removed (including from whitespace-only lines, which become empty).
 - **Line endings** — `\n`.
+
+These rules all skip text inside `'…'`, `"…"`, and triple-quoted regions, so docstrings and embedded code stay verbatim.
 
 ## What it preserves
 
-- **Leading indentation** — 4-space indents are passed through verbatim.
+- **Indentation depth** — the leading run of spaces is kept; only the *characters* change (tab → four spaces).
 - **Spacing around `:`, `=`, `->`** — left as-is (needs slice/annotation disambiguation; deferred).
 - **String quotes** — left as-is (Typhon doesn't take a side between `"` and `'`).
 - **`let` / `mut`** placement.
-- **Comments** — preserved on the line they appear.
+- **Comment text** — content after the normalised `# ` prefix is kept verbatim; shebangs and `## …` lines are passed through unchanged.
 
 ## Flags
 

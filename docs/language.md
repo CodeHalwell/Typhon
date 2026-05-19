@@ -121,7 +121,7 @@ The rewrite is skipped for `model`, `interface`, and `class!` bodies, where the 
 
 #### `@property` accessors
 
-`@property` on an `impl`-block method is recognised by the type checker: attribute access against the class resolves to the property's return type (not the underlying `() -> T` callable), so `let area: float = rect.area` type-checks without a parenthesised call.
+`@property` on an `impl`-block method is recognised by the type checker: instance-level attribute access (`rect.area`, where `rect` is a `Rect` value — not `Rect.area` on the class object) resolves to the property's return type, not the underlying `() -> T` callable. `let area: float = rect.area` therefore type-checks without a parenthesised call.
 
 ```python
 class Rect:

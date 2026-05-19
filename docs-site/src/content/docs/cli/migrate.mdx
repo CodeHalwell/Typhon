@@ -32,14 +32,9 @@ tyc migrate --check src/app.py     # preview to stdout (no writes)
 
 ## `--check` mode
 
-Useful in CI to confirm a `.py` file is already Typhon-compatible:
+`--check` is a **preview** flag: it prints the migrated source to stdout (one block per file, headed by `# ── <path> ──`) instead of writing `.ty` files to disk. It does *not* compare the output against the original, and it always exits 0 on a successful migration — there is no "no diffs needed" exit code today.
 
-```yaml
-- name: Confirm app.py migrates cleanly
-  run: tyc migrate --check src/app.py
-```
-
-`--check` exits 0 if no changes are needed, 1 if there are diffs to apply.
+To confirm in CI that a `.py` file is already Typhon-compatible, pipe the preview into `diff` against an expected `.ty` (or run `tyc check` on the preview output via a tempfile). A native exit-1-on-changes mode is a deliberate follow-up.
 
 ## What it can *not* do automatically
 
