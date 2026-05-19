@@ -1863,6 +1863,31 @@ practically unusable. Cascades across ~5 example programs.
 
 ## 45. Generic covariance not implemented (bug)
 
+**Status:** **PARTIALLY FIXED** on `claude/resolve-open-findings-d6EIV`.
+Three cases were addressed:
+
+1. **`Result[T, E] = Ok[V] / Err[V]` with sealed-union T/E** — extended
+   `Checker::is_assignable` to recurse into the generic-pair arm using
+   itself rather than the free `assignable`, so sealed-union and
+   interface-conformance rules apply inside `Result`. The
+   `Result[Cmd, str] = Ok(AddCmd(...))` example now type-checks.
+2. **Heterogeneous container literals against an interface / union
+   element annotation** — `Expr::List`, `Expr::Dict`, and `Expr::Set`
+   inference now widens the element type to the expectation when every
+   inferred element is `c.is_assignable(expected, ...)`. Skipped when
+   the expectation is an unbound TypeVar so PEP 695 inference still
+   sees the concrete arg types. `let xs: list[Drawable] = [Button(...),
+   Slider(...)]` now passes.
+3. **`object` as the universal supertype** — added a top-level rule in
+   `assignable` that accepts any value as a `Class("object")`, matching
+   Python's runtime hierarchy and letting `list[dict[str, object]]`
+   accept `[{"name": "x"}]` style literals.
+
+What remains in this finding is the unsafe-by-default *general*
+covariance for mutable containers (`list[Sub] → list[Super]`) which is
+deliberately invariant in mypy/pyright and would require a deeper
+read/write distinction to do safely.
+
 **Severity:** bug — multiple symptoms; design call.
 
 ```ty

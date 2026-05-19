@@ -180,6 +180,11 @@ impl Type {
 pub fn assignable(expected: &Type, actual: &Type) -> bool {
     match (expected, actual) {
         (Type::Any, _) | (_, Type::Any) => true,
+        // `object` is Python's universal base type — every value is an
+        // instance, so anything is assignable to a `Class("object")`
+        // expectation. This makes `list[dict[str, object]]` accept
+        // `[{"name": "x"}]` without invariance fighting nested literals.
+        (Type::Class(name), _) if name == "object" => true,
         // Unbound PEP 695 type parameters behave like `Any` until call-site
         // inference (`bind_typevars_and_substitute`) refines them.
         (Type::TypeVar(_), _) | (_, Type::TypeVar(_)) => true,
@@ -256,6 +261,14 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
         (Type::Class(en), Type::Generic(an, _)) if en == an && is_bare_container_name(en) => true,
         (a, b) => a == b,
     }
+}
+
+/// Return `true` when the type is an unbound PEP 695 type parameter.
+/// Used by the container-literal widening rules to avoid prematurely
+/// resolving a TypeVar to a concrete element type (which would block
+/// PEP 695 inference from binding it from the actual arguments).
+fn is_typevar(t: &Type) -> bool {
+    matches!(t, Type::TypeVar(_))
 }
 
 /// Return `true` if `name` is a built-in container type whose bare
@@ -1054,6 +1067,37 @@ impl<'a> Checker<'a> {
         // `expected` so nominal and structural checks apply to each arm.
         if let Type::Union(variants) = actual {
             return variants.iter().all(|v| self.is_assignable(expected, v));
+        }
+        // Generic / generic (e.g. `Result[T, E] = Ok[V]`, `list[T] = list[V]`):
+        // recurse using `is_assignable` for the inner type pairs so sealed
+        // unions and interface conformance work *inside* generic containers.
+        // The free `assignable` checks above only saw class-name equality on
+        // the inner pair; without this arm, `Result[Cmd, str] = Ok(AddCmd(...))`
+        // fails when `Cmd` is a sealed union containing `AddCmd`. FINDINGS #45.
+        if let (Type::Generic(an, aa), Type::Generic(bn, bb)) = (expected, actual) {
+            // Result/Ok / Result/Err variance refinement — mirrors the rule
+            // in the free `assignable` but with sealed-union-aware recursion.
+            if an == "Result" && aa.len() == 2 {
+                match (bn.as_str(), bb.len()) {
+                    ("Ok", 1) => return self.is_assignable(&aa[0], &bb[0]),
+                    ("Err", 1) => return self.is_assignable(&aa[1], &bb[0]),
+                    _ => {}
+                }
+            }
+            if an == bn && aa.len() == bb.len() {
+                return aa
+                    .iter()
+                    .zip(bb)
+                    .enumerate()
+                    .all(|(idx, (formal, actual_arg))| match generic_param_variance(an, idx) {
+                        Variance::Covariant => self.is_assignable(formal, actual_arg),
+                        Variance::Contravariant => self.is_assignable(actual_arg, formal),
+                        Variance::Invariant => {
+                            self.is_assignable(formal, actual_arg)
+                                && self.is_assignable(actual_arg, formal)
+                        }
+                    });
+            }
         }
         false
     }
@@ -3201,6 +3245,26 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                 .iter()
                 .map(|e| infer_expr_ctx(c, e, elt_expected))
                 .collect();
+            // Heterogeneous-list widening (FINDINGS #45): when every
+            // inferred element is assignable to the expected element type
+            // (interface / sealed-union / nominal-subtype rules included),
+            // narrow the list's element type to the expectation rather
+            // than the joined union of the elements. Without this, a
+            // literal `[Button(...), Slider(...)]` infers as
+            // `list[Button | Slider]` and fails the invariant
+            // assignability check against `list[Drawable]` even when
+            // both classes structurally conform to `Drawable`.
+            //
+            // Skip widening when the expected element type is itself an
+            // unbound TypeVar — otherwise PEP 695 inference would lose
+            // the concrete element types it needs to bind `T`, and the
+            // backward-pass from a let annotation could mask real
+            // mismatches (cf. `bidirectional_self_binding_does_not_block_backward_pass`).
+            if let Some(exp) = elt_expected {
+                if !is_typevar(exp) && elts.iter().all(|t| c.is_assignable(exp, t)) {
+                    return Type::Generic("list".into(), vec![exp.clone()]);
+                }
+            }
             Type::Generic("list".into(), vec![Type::union_of(elts)])
         }
         Expr::Tuple(t) => {
@@ -3265,6 +3329,23 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     vals.push(Type::Unknown);
                 }
             }
+            // Heterogeneous-dict widening (FINDINGS #45): when each
+            // value is assignable to the expected V (using the
+            // checker's interface / sealed-union rules), narrow the
+            // emitted dict's value type to the expectation rather than
+            // joining the literal's distinct value types into a union.
+            // Skip widening when V is an unbound TypeVar — see the
+            // matching note on the list arm.
+            if let Some(v_exp) = val_expected {
+                if !is_typevar(v_exp) && vals.iter().all(|t| c.is_assignable(v_exp, t)) {
+                    let widened_k = match key_expected {
+                        Some(k) if keys.iter().all(|t| c.is_assignable(k, t)) => k.clone(),
+                        _ if keys.is_empty() => Type::Unknown,
+                        _ => Type::union_of(keys),
+                    };
+                    return Type::Generic("dict".into(), vec![widened_k, v_exp.clone()]);
+                }
+            }
             let key_ty = if keys.is_empty() {
                 Type::Unknown
             } else {
@@ -3290,6 +3371,14 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                 .iter()
                 .map(|e| infer_expr_ctx(c, e, elt_expected))
                 .collect();
+            // Heterogeneous-set widening (FINDINGS #45) — same shape
+            // as the list / dict cases above. Skip when the expected
+            // element type is an unbound TypeVar.
+            if let Some(exp) = elt_expected {
+                if !is_typevar(exp) && elts.iter().all(|t| c.is_assignable(exp, t)) {
+                    return Type::Generic("set".into(), vec![exp.clone()]);
+                }
+            }
             Type::Generic("set".into(), vec![Type::union_of(elts)])
         }
         _ => Type::Unknown,
