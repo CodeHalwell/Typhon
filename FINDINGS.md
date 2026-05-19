@@ -3222,6 +3222,17 @@ Repro: `stress/tests/103_dict_get_default.ty`.
 
 ## 72. Bare collection annotations (`list`, `dict`, `tuple`) accepted under `no-implicit-any = true` (bug)
 
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. Added
+`tyc::implicit_any` to `tyc-diagnostics`; the `Stmt::AnnAssign`
+arm in `tyc-types`'s `check_stmt` now calls a new
+`bare_collection_name` helper that detects bare `list` / `dict` /
+`tuple` / `set` / `frozenset` names and emits the diagnostic with
+help text pointing at the parameterised form (`list[int]`,
+`dict[K, V]`, `tuple[A, B, ...]`). Subscripted forms continue to
+type-check cleanly. Regression tests `bare_list_annotation_errors`,
+`bare_dict_annotation_errors`, `bare_tuple_annotation_errors`, and
+`parameterised_collection_annotation_is_clean`.
+
 **Severity:** bug — directly violates Rule 1 of the language and the
 documented default for `no-implicit-any`.
 

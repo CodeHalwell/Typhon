@@ -178,6 +178,24 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A bare collection annotation (`list`, `dict`, `tuple`, `set`,
+    /// `frozenset`) appears without element-type parameters. Per
+    /// Typhon Rule 1 / `[strictness] no-implicit-any = true` (the
+    /// default), every container annotation should spell out its
+    /// element types.
+    #[error("bare `{kind}` annotation has implicit `Any` element type")]
+    #[diagnostic(
+        code(tyc::implicit_any),
+        help("Spell out the element type so readers can see what the collection holds: `{kind}[<element-type>]`. For dicts use `dict[K, V]`; for tuples use `tuple[A, B, ...]` or `tuple[T, ...]` for a homogeneous tuple.")
+    )]
+    ImplicitAny {
+        kind: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("missing `[<element type>]`")]
+        span: SourceSpan,
+    },
+
     /// A value of one type was used where another type was expected.
     #[error("type mismatch: expected `{expected}`, found `{actual}`")]
     #[diagnostic(
@@ -816,6 +834,21 @@ impl TycError {
             keyword: keyword.into(),
             name: name.into(),
             annotation: annotation.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::ImplicitAny`] diagnostic.
+    pub fn implicit_any(
+        kind: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::ImplicitAny {
+            kind: kind.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

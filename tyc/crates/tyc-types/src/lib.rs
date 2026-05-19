@@ -2558,6 +2558,26 @@ fn function_signature(
     }
 }
 
+/// Return `Some(name)` when `expr` is a bare container-type annotation
+/// — `list`, `dict`, `tuple`, `set`, or `frozenset` written without a
+/// subscript. These shapes carry an implicit `Any` element type and
+/// violate Rule 1 / `[strictness] no-implicit-any = true` (FINDINGS
+/// #72). Subscripted forms (`list[int]`, `dict[str, int]`) and bare
+/// names that aren't container types return `None`.
+fn bare_collection_name(expr: &Expr) -> Option<&'static str> {
+    match expr {
+        Expr::Name(n) => match n.id.as_str() {
+            "list" => Some("list"),
+            "dict" => Some("dict"),
+            "tuple" => Some("tuple"),
+            "set" => Some("set"),
+            "frozenset" => Some("frozenset"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Build the `help:` string for a `tyc::unknown_kwarg` diagnostic
 /// (FINDINGS #80). If any candidate is "close enough" by character-level
 /// edit distance, suggest it; otherwise list every accepted parameter
@@ -2816,6 +2836,26 @@ fn seed_env_from_scope(c: &mut Checker, scope: ScopeId) {
 fn check_stmt(c: &mut Checker, stmt: &Stmt) {
     match stmt {
         Stmt::AnnAssign(a) => {
+            // FINDINGS #72: a bare `list` / `dict` / `tuple` / `set` /
+            // `frozenset` annotation has an implicit `Any` element type
+            // and violates Rule 1. Class-body field declarations also
+            // route through `Stmt::AnnAssign` but their annotations
+            // should be checked too — `name: list` is just as opaque
+            // inside a class as outside one.
+            if let Some(bare) = bare_collection_name(&a.annotation) {
+                let span = (
+                    a.annotation.range().start().to_usize(),
+                    a.annotation.range().end().to_usize(),
+                );
+                let length = span.1.saturating_sub(span.0).max(1);
+                c.diagnostics.push_error(TycError::implicit_any(
+                    bare,
+                    c.path.clone(),
+                    c.source,
+                    span.0,
+                    length,
+                ));
+            }
             let ann_type = type_from_annotation(&a.annotation, &c.classes);
             if let Some(value) = &a.value {
                 let value_type = infer_expr_ctx(c, value, Some(&ann_type));
@@ -4872,6 +4912,61 @@ let r: int = add(1)
         assert!(d.has_errors());
         let msg = format!("{}", d.errors()[0]);
         assert!(msg.contains("wrong number of arguments"), "got {}", msg);
+    }
+
+    // ── FINDINGS #72: bare collection annotations are implicit-any ────
+
+    #[test]
+    fn bare_list_annotation_errors() {
+        let src = "def main() -> None:\n    let xs: list = [1, 2, 3]\n";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ImplicitAny { kind, .. } if kind == "list")),
+            "expected ImplicitAny for `list`; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn bare_dict_annotation_errors() {
+        let src = "def main() -> None:\n    let d: dict = {\"a\": 1}\n";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ImplicitAny { kind, .. } if kind == "dict")),
+            "expected ImplicitAny for `dict`; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn bare_tuple_annotation_errors() {
+        let src = "def main() -> None:\n    let t: tuple = (1, 2)\n";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ImplicitAny { kind, .. } if kind == "tuple")),
+            "expected ImplicitAny for `tuple`; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn parameterised_collection_annotation_is_clean() {
+        // Subscripted forms must NOT fire — they carry explicit element types.
+        let src = "def main() -> None:\n    let xs: list[int] = [1, 2, 3]\n";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ImplicitAny { .. })),
+            "list[int] must not fire implicit_any: {:?}",
+            d.errors()
+        );
     }
 
     // ── FINDINGS #82: missing-return analysis ─────────────────────────
