@@ -14,7 +14,7 @@
 //! expressions remain stable; we use them directly.
 
 use ruff_python_ast::{self as ast, Expr, ModModule, Stmt};
-use ruff_text_size::TextRange;
+use ruff_text_size::{Ranged, TextRange};
 use tyc_diagnostics::{Diagnostics, TycError};
 
 /// Mutability of a binding.
@@ -786,7 +786,14 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt]) {
                 }
             }
             Stmt::AnnAssign(a) => {
-                declare_target(r, scope, &a.target, default_val, a.mutability);
+                // FINDINGS #91: an annotated declaration without an
+                // initialiser is a user error — skip the declaration
+                // so the second pass can emit `tyc::missing_initialiser`
+                // without also tripping `tyc::immutable_assign` on the
+                // user's subsequent `x = <expr>` reassignment.
+                if !(a.value.is_none() && a.mutability.is_some()) {
+                    declare_target(r, scope, &a.target, default_val, a.mutability);
+                }
             }
             _ => {}
         }
@@ -936,6 +943,18 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt]) {
     }
 }
 
+/// Slice `source` against a `TextRange`, returning `None` if the range
+/// falls outside the source's byte bounds. Used to recover the surface
+/// text of a node for inclusion in diagnostic messages.
+fn source_slice(source: &str, range: TextRange) -> Option<&str> {
+    let start = range.start().to_usize();
+    let end = range.end().to_usize();
+    if end > source.len() || start > end {
+        return None;
+    }
+    source.get(start..end)
+}
+
 /// Map a capitalised `typing.<Name>` alias to its lowercase built-in
 /// equivalent, when the built-in form exists. Returns `None` for typing
 /// names that aren't a direct alias of a Python built-in (e.g. `Optional`,
@@ -1052,6 +1071,11 @@ fn declare_target(
 /// Loop / context-manager targets aren't subject to Rule 2 (the `for`/`with`
 /// keyword itself introduces the binding), so this helper does not emit
 /// `tyc::missing_binding_kind` like `declare_target` does for bare assignments.
+///
+/// Targets are declared as `Mutability::Let` (FINDINGS #75): the loop
+/// itself rebinds the target each iteration through its own mechanism,
+/// but a user-written `i = i + 1` inside the body is a Rule 2 violation
+/// and now surfaces as `tyc::immutable_assign`.
 fn declare_loop_target(r: &mut Resolver, scope: ScopeId, target: &Expr) {
     match target {
         Expr::Name(n) => {
@@ -1063,7 +1087,7 @@ fn declare_loop_target(r: &mut Resolver, scope: ScopeId, target: &Expr) {
                 scope,
                 n.id.as_str(),
                 BindingKind::Loop,
-                Mutability::Mut,
+                Mutability::Let,
                 span,
             );
         }
@@ -1209,9 +1233,53 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
                 walk_expr(r, scope, v);
             }
             walk_expr(r, scope, &a.annotation);
+            // FINDINGS #91: `let NAME: T` (or `mut NAME: T`) without an
+            // initialiser produces a confusing immutable-assign error
+            // when the user later writes `NAME = <expr>`. Reject the
+            // declare-only form up front with a clear message that
+            // tells the user to inline the initialiser. Bare AnnAssign
+            // (no explicit `let`/`mut` keyword) is left alone because
+            // class-body field declarations (`name: str`) and dataclass
+            // attribute annotations legitimately omit initialisers.
+            let missing_init = a.value.is_none() && a.mutability.is_some();
+            if missing_init {
+                if let Expr::Name(n) = a.target.as_ref() {
+                    let keyword = match a.mutability {
+                        Some(ast::Mutability::Let) => "let",
+                        Some(ast::Mutability::Mut) => "mut",
+                        None => unreachable!(),
+                    };
+                    let annotation = source_slice(r.source, a.annotation.range())
+                        .unwrap_or("<type>")
+                        .to_owned();
+                    let span = (a.range.start().to_usize(), a.range.end().to_usize());
+                    let length = span.1.saturating_sub(span.0).max(1);
+                    r.diagnostics.push_error(TycError::missing_initialiser(
+                        keyword,
+                        n.id.as_str(),
+                        annotation,
+                        &r.path,
+                        r.source,
+                        span.0,
+                        length,
+                    ));
+                }
+            }
             if let Expr::Name(_) = a.target.as_ref() {
                 let default_val = r.scopes[scope].kind == ScopeKind::Module;
-                declare_target(r, scope, &a.target, default_val, a.mutability);
+                // When the initialiser is missing (FINDINGS #91), suppress
+                // the declaration entirely. Otherwise a later `x = 5`
+                // would either fire a redundant `tyc::immutable_assign`
+                // (the misleading cascade the finding is about) or — for
+                // `mut` — pretend the assignment was the first
+                // initialiser, masking the original mistake. The
+                // missing_initialiser error already tells the user what
+                // to do; downstream references to the un-declared name
+                // (`x` on subsequent lines) will produce the standard
+                // unknown-name flow.
+                if !missing_init {
+                    declare_target(r, scope, &a.target, default_val, a.mutability);
+                }
             }
         }
         Stmt::AugAssign(a) => {
@@ -2225,6 +2293,88 @@ def foo():
                 .any(|e| matches!(e, TycError::TypingAliasDeprecated { .. })),
             "Optional/Callable must not trigger the alias warning; got {:?}",
             d.warnings()
+        );
+    }
+
+    #[test]
+    fn for_loop_target_reassignment_is_rejected() {
+        // FINDINGS #75: the for-loop target is bindable as immutable
+        // (Rule 2) — `i = i + 1` inside the body must error rather
+        // than silently shadowing the loop variable.
+        let src = "def main() -> None:\n\
+                   \x20   let xs: list[int] = [1, 2, 3]\n\
+                   \x20   for i in xs:\n\
+                   \x20       i = i + 1\n";
+        let (_m, d) = resolve(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ImmutableAssign { name, .. } if name == "i")),
+            "expected ImmutableAssign on `i` rebind; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn for_loop_iteration_itself_is_clean() {
+        // Sanity: declaring the target should not itself trip
+        // immutable_assign — only user reassignments inside the body do.
+        let src = "def main() -> None:\n\
+                   \x20   let xs: list[int] = [1, 2, 3]\n\
+                   \x20   for i in xs:\n\
+                   \x20       print(i)\n";
+        let (_m, d) = resolve(src);
+        assert!(
+            !d.has_errors(),
+            "loop without rebind should be clean: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn let_without_initialiser_errors() {
+        // FINDINGS #91: `let x: int` (no `=`) must surface
+        // tyc::missing_initialiser rather than silently accepting the
+        // declaration and then complaining about the user's first
+        // `x = …` assignment as an immutable-assign error.
+        let (_m, d) = resolve("def f() -> None:\n    let x: int\n    x = 5\n");
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingInitialiser { .. })),
+            "expected MissingInitialiser variant; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn mut_without_initialiser_errors() {
+        // Same rule applies to `mut x: int` — the binding has nothing
+        // to bind to. Subsequent `x = 5` would otherwise pass because
+        // `mut` allows re-assignment, but the type-checker treats the
+        // value-less form inconsistently.
+        let (_m, d) = resolve("def f() -> None:\n    mut x: int\n    x = 5\n");
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingInitialiser { .. })),
+            "expected MissingInitialiser for mut; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn class_field_without_initialiser_is_clean() {
+        // Dataclass-style field declarations inside a `class` body
+        // legitimately omit initialisers — the constructor produces
+        // the value, no `= <expr>` is required.
+        let (_m, d) = resolve("class Point:\n    x: int\n    y: int\n");
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingInitialiser { .. })),
+            "class field declaration must not fire missing_initialiser: {:?}",
+            d.errors()
         );
     }
 

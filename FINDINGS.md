@@ -3307,6 +3307,16 @@ Repro: `stress/tests/71_typing_imports.ty`.
 
 ## 75. Reassigning a `for`-loop target accepted (bug)
 
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`.
+`declare_loop_target` in `tyc-resolve` now declares the loop target
+with `Mutability::Let` (and likewise for `with NAME = …` bindings
+and comprehension generators). The loop itself rebinds the target
+through its own machinery on each iteration; user-written
+`i = i + 1` inside the body now fires the standard
+`tyc::immutable_assign`. Regression tests
+`for_loop_target_reassignment_is_rejected` and
+`for_loop_iteration_itself_is_clean`.
+
 **Severity:** bug — violates Rule 2 of the language.
 
 ```python
@@ -3579,6 +3589,17 @@ Repro: `stress/tests/57_async_no_await.ty`.
 
 ## 84. `lazy let` emits an import for `typhon_runtime` but the package isn't written (bug, severe)
 
+**Status:** **FIXED**. Verified clean on
+`claude/review-findings-fixes-VRFJy`: `is_typhon_runtime_module` in
+`tyc-desugar/src/lib.rs` (line 405) matches `typhon_runtime` *and*
+`typhon_runtime.*`, so the `from typhon_runtime.lazy import
+lazy_let as __typhon_lazy_let` header injected by
+`expand_lazy_imports` for a `lazy let` triggers `needs_runtime` →
+`tyc build` writes the full `typhon_runtime/` package. Running the
+original repro (`stress/tests/101_lazy_let_circular.ty`) now
+produces `build/typhon_runtime/{__init__,lazy,parallel,result,stdlib,tasks}.py`
+and CPython imports the program without `ModuleNotFoundError`.
+
 **Severity:** bug, severe — every program that uses `lazy let` (and not
 also `Result`) crashes with `ModuleNotFoundError` at import time.
 
@@ -3810,6 +3831,19 @@ Repro: `stress/tests/92_self_outside_impl.ty`.
 ---
 
 ## 91. `let x: int` (no init) treated as a binding, then `x = 5` errors as re-assignment (papercut)
+
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. Took
+option 1 from the original finding — `let NAME: T` / `mut NAME: T`
+without an initialiser now surfaces a dedicated
+`tyc::missing_initialiser` diagnostic that names the keyword and
+the annotation in the help text. The resolver's `AnnAssign` arms
+(both the top-level sub-pass-1 collector and the walking pass) skip
+the declaration so the user's subsequent `NAME = <expr>` doesn't
+also fire the misleading `tyc::immutable_assign` cascade. Bare
+class-body field annotations (`name: str`) are untouched because
+they carry no `let`/`mut` keyword. Regression tests
+`let_without_initialiser_errors`, `mut_without_initialiser_errors`,
+and `class_field_without_initialiser_is_clean`.
 
 **Severity:** papercut — declare-without-init is silently accepted and
 then any later assignment is rejected.

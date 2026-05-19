@@ -158,6 +158,26 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// `let NAME: T` (or `mut NAME: T`) was written without an
+    /// initialiser. Typhon requires every binding to have a value at
+    /// declaration — the Rust-style "declare-then-assign-later" shape
+    /// produces a confusing `tyc::immutable_assign` on the next
+    /// assignment, so this dedicated diagnostic fires earlier.
+    #[error("`{keyword} {name}: {annotation}` is missing an initialiser")]
+    #[diagnostic(
+        code(tyc::missing_initialiser),
+        help("Typhon bindings must be initialised at the point of declaration. Write `{keyword} {name}: {annotation} = <expr>` instead.")
+    )]
+    MissingInitialiser {
+        keyword: String,
+        name: String,
+        annotation: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("missing `= <expr>` here")]
+        span: SourceSpan,
+    },
+
     /// A value of one type was used where another type was expected.
     #[error("type mismatch: expected `{expected}`, found `{actual}`")]
     #[diagnostic(
@@ -777,6 +797,25 @@ impl TycError {
         Self::MissingReturn {
             fn_name: fn_name.into(),
             ret_type: ret_type.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::MissingInitialiser`] diagnostic.
+    pub fn missing_initialiser(
+        keyword: impl Into<String>,
+        name: impl Into<String>,
+        annotation: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::MissingInitialiser {
+            keyword: keyword.into(),
+            name: name.into(),
+            annotation: annotation.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }
