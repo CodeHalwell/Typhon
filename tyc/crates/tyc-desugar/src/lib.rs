@@ -381,12 +381,20 @@ fn comprehension_uses_result_names(gen: &ruff_python_ast::Comprehension) -> bool
 /// no Ok/Err/Result names appear directly in expressions (the user may be
 /// calling `typhon_runtime.Ok(...)` via the bare-import / qualified style).
 fn has_any_typhon_runtime_import(body: &[Stmt]) -> bool {
+    // Match the runtime package and every submodule. The `lazy let`
+    // lowering emits `from typhon_runtime.lazy import lazy_let`, which
+    // is a `typhon_runtime` submodule import — without the `starts_with`
+    // check the runtime-emit gate stayed off and the build crashed at
+    // import time with `ModuleNotFoundError`. FINDINGS #84.
+    fn is_runtime_module(name: &str) -> bool {
+        name == "typhon_runtime" || name.starts_with("typhon_runtime.")
+    }
     body.iter().any(|stmt| match stmt {
-        Stmt::Import(imp) => imp
-            .names
-            .iter()
-            .any(|a| a.name.as_str() == "typhon_runtime"),
-        Stmt::ImportFrom(imp) => imp.module.as_ref().map(|m| m.as_str()) == Some("typhon_runtime"),
+        Stmt::Import(imp) => imp.names.iter().any(|a| is_runtime_module(a.name.as_str())),
+        Stmt::ImportFrom(imp) => imp
+            .module
+            .as_ref()
+            .is_some_and(|m| is_runtime_module(m.as_str())),
         _ => false,
     })
 }
@@ -1039,7 +1047,19 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             // as their first body statement unless the user already defined it.
             let needs_model_config =
                 is_pydantic && !is_impl_stub && !has_model_config_stmt(&c.body);
-            let (new_body, body_transformed) = desugar_stmts(&c.body, markers);
+            let (mut new_body, mut body_transformed) = desugar_stmts(&c.body, markers);
+            // Rewrite mutable defaults so Python's dataclass decorator
+            // doesn't raise `ValueError: mutable default ... is not allowed:
+            // use default_factory`. Targets `[]`, `{}`, `list()`, `dict()`,
+            // `set()` literals on class-body field annotations. We only do
+            // this for classes that will receive the dataclass decorator —
+            // pydantic models, protocols, and impl stubs keep their bodies
+            // untouched. FINDINGS #62.
+            if needs_decorator
+                && rewrite_mutable_field_defaults(&mut new_body)
+            {
+                body_transformed = true;
+            }
             let mut new_class = c.clone();
             new_class.body = new_body;
             if needs_decorator {
@@ -1157,6 +1177,89 @@ fn make_dataclasses_dot_dataclass_decorator_frozen() -> Decorator {
         node_index: AtomicNodeIndex::NONE,
         expression: call,
     }
+}
+
+/// Walk a class body and rewrite annotated assigns whose value is a
+/// mutable literal / no-arg constructor (`[]`, `{}`, `list()`, `dict()`,
+/// `set()`) to `dataclasses.field(default_factory=<ctor>)`. Returns
+/// `true` if any field was rewritten so the caller can mark the body
+/// as transformed (and therefore the `import dataclasses` injection is
+/// triggered). FINDINGS #62.
+fn rewrite_mutable_field_defaults(body: &mut [Stmt]) -> bool {
+    let mut changed = false;
+    for stmt in body.iter_mut() {
+        let Stmt::AnnAssign(a) = stmt else { continue };
+        let Some(value) = &a.value else { continue };
+        let Some(factory_name) = mutable_default_factory(value) else {
+            continue;
+        };
+        a.value = Some(Box::new(make_dataclasses_field_default_factory(factory_name)));
+        changed = true;
+    }
+    changed
+}
+
+/// If `value` is one of the recognised mutable-default expressions,
+/// return the name of the built-in factory to thread into
+/// `dataclasses.field(default_factory=...)`.
+fn mutable_default_factory(value: &Expr) -> Option<&'static str> {
+    match value {
+        Expr::List(l) if l.elts.is_empty() => Some("list"),
+        Expr::Dict(d) if d.items.is_empty() => Some("dict"),
+        Expr::Set(s) if s.elts.is_empty() => Some("set"),
+        Expr::Call(call) if call.arguments.args.is_empty() && call.arguments.keywords.is_empty() => {
+            if let Expr::Name(n) = call.func.as_ref() {
+                match n.id.as_str() {
+                    "list" => Some("list"),
+                    "dict" => Some("dict"),
+                    "set" => Some("set"),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Build `dataclasses.field(default_factory=<factory_name>)`.
+fn make_dataclasses_field_default_factory(factory_name: &str) -> Expr {
+    let dataclasses_name = Expr::Name(ExprName {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        id: Name::new("dataclasses"),
+        ctx: ExprContext::Load,
+    });
+    let field_attr = Expr::Attribute(ExprAttribute {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        value: Box::new(dataclasses_name),
+        attr: make_identifier("field"),
+        ctx: ExprContext::Load,
+    });
+    let factory_ref = Expr::Name(ExprName {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        id: Name::new(factory_name),
+        ctx: ExprContext::Load,
+    });
+    Expr::Call(ExprCall {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        func: Box::new(field_attr),
+        arguments: Arguments {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            args: Box::new([]),
+            keywords: Box::new([Keyword {
+                range: TextRange::default(),
+                node_index: AtomicNodeIndex::NONE,
+                arg: Some(make_identifier("default_factory")),
+                value: factory_ref,
+            }]),
+        },
+    })
 }
 
 /// Build the decorator `@dataclasses.dataclass(slots=True)`.

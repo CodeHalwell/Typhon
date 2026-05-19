@@ -1168,6 +1168,11 @@ struct InterfaceDecl {
 struct MethodSig {
     arity: usize,
     return_type: Type,
+    /// `true` when the method was decorated with `@property`. Attribute
+    /// access (`r.area`) on a property unwraps to `return_type` instead
+    /// of producing a `() -> return_type` bound-method handle.
+    /// FINDINGS #63.
+    is_property: bool,
 }
 
 /// Member shape recorded for an interface or class — methods are recorded as
@@ -2247,9 +2252,17 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
                     Some(r) => type_from_annotation(r, classes),
                     None => Type::Unknown,
                 };
-                shape
-                    .methods
-                    .insert(f.name.as_str().to_owned(), MethodSig { arity, return_type });
+                let is_property = f.decorator_list.iter().any(|d| {
+                    matches!(&d.expression, Expr::Name(n) if n.id.as_str() == "property")
+                });
+                shape.methods.insert(
+                    f.name.as_str().to_owned(),
+                    MethodSig {
+                        arity,
+                        return_type,
+                        is_property,
+                    },
+                );
             }
             Stmt::AnnAssign(a) => {
                 if let Expr::Name(n) = a.target.as_ref() {
@@ -3700,6 +3713,12 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                 Type::Class(class_name) => {
                     let class_name = class_name.clone();
                     if let Some(sig) = c.find_method(class_name.as_str(), attr_name) {
+                        // `@property` methods are read as attributes — return
+                        // the underlying type directly instead of a bound-
+                        // method handle. FINDINGS #63.
+                        if sig.is_property {
+                            return sig.return_type.clone();
+                        }
                         let arity = sig.arity;
                         let ret = sig.return_type.clone();
                         return Type::Function {
@@ -3721,6 +3740,9 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     let bound = c.active_typevar_bounds.get(tv_name.as_str()).cloned();
                     if let Some(Type::Class(bound_name)) = bound {
                         if let Some(sig) = c.find_method(bound_name.as_str(), attr_name) {
+                            if sig.is_property {
+                                return sig.return_type.clone();
+                            }
                             let arity = sig.arity;
                             let ret = sig.return_type.clone();
                             return Type::Function {
