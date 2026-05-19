@@ -4070,8 +4070,14 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         // Emitting `type_mismatch` alongside would just be
                         // noise on the same span (FINDINGS #8). Only emit the
                         // type_mismatch when nullable_use isn't going to fire.
-                        let nullable_into_non_nullable =
-                            !expected.is_nullable() && actual.is_nullable();
+                        //
+                        // Unbound PEP 695 TypeVars are exempt (FINDINGS #69):
+                        // a `def f[T](x: T)` formal can absorb a `None`
+                        // actual at the call site; bidirectional inference
+                        // will bind `T = None` from the expected return.
+                        let nullable_into_non_nullable = !expected.is_nullable()
+                            && actual.is_nullable()
+                            && !matches!(expected, Type::TypeVar(_));
                         if nullable_into_non_nullable {
                             if let Expr::Name(n) = arg {
                                 let span = (
@@ -5011,6 +5017,27 @@ let r: int = add(1)
                 .iter()
                 .any(|e| matches!(e, TycError::ImplicitAny { .. })),
             "list[int] must not fire implicit_any: {:?}",
+            d.errors()
+        );
+    }
+
+    // ── FINDINGS #69: None as TypeVar value ───────────────────────────
+
+    #[test]
+    fn none_arg_binds_to_typevar() {
+        // FINDINGS #69: `def f[T](x: T) -> T` should accept `None` as
+        // the argument and bind T = None. Pre-fix the call-site
+        // nullable-into-non-nullable check fired because `T` reports
+        // itself as non-nullable.
+        let src = "\
+def f[T](x: T) -> T:
+    return x
+let r: None = f(None)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "None should bind to TypeVar T: {:?}",
             d.errors()
         );
     }

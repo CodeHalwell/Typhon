@@ -3147,6 +3147,17 @@ Repro: `stress/tests/21_pattern_match.ty`.
 
 ## 69. Generic parameter inference fails when target is `None` (bug)
 
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. The
+arg-type loop's nullable-into-non-nullable carve-out (FINDINGS #8)
+was treating any non-nullable formal — including unbound PEP 695
+`Type::TypeVar` — as a target that can't absorb `None`. Added a
+`!matches!(expected, Type::TypeVar(_))` guard so a `None` actual
+against a generic formal flows through the standard
+`is_assignable` path (which already accepts TypeVars against any
+type via the catch-all `(Type::TypeVar(_), _)` arm). Bidirectional
+inference then binds `T = None` from the expected return type as
+usual. Regression test `none_arg_binds_to_typevar`.
+
 **Severity:** bug — `None` is treated as not-bindable to a type parameter.
 
 ```python
