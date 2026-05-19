@@ -43,6 +43,12 @@ pub struct Emitter {
     /// ambiguous on 3.13+. Tracked as a stack so nested f-strings
     /// (`f"{ f'{x}' }"`) compose correctly.
     fstring_quote_stack: Vec<char>,
+    /// Target Python minor version (3.X). When `< 12`, PEP 695 syntax
+    /// (`def f[T](...)`, `class Box[T]:`, `type X = Y`) is lowered to
+    /// the older `TypeVar` + `Generic[T]` + `X: TypeAlias = Y` shapes
+    /// so the emitted module parses on 3.10 / 3.11 (FINDINGS #47).
+    /// `0` means "unset" and disables lowering.
+    target_minor: u8,
 }
 
 const INDENT_WIDTH: usize = 4;
@@ -57,6 +63,7 @@ impl Emitter {
             suppress_mutability: false,
             prev_top_level_was_block: false,
             fstring_quote_stack: Vec::new(),
+            target_minor: 0,
         }
     }
 
@@ -64,6 +71,20 @@ impl Emitter {
     /// Build output uses this; `tyc fmt` does not.
     pub fn suppress_mutability_keywords(&mut self) {
         self.suppress_mutability = true;
+    }
+
+    /// Set the target Python minor version (`3.X`). When `< 12`, PEP 695
+    /// syntax is lowered to the legacy `TypeVar` / `Generic[T]` /
+    /// `X: TypeAlias = Y` shapes so the emitted module parses on the
+    /// older interpreter (FINDINGS #47). Default is unset → no lowering.
+    pub fn set_python_target(&mut self, minor: u8) {
+        self.target_minor = minor;
+    }
+
+    /// True when PEP 695 syntax must be lowered to TypeVar / Generic /
+    /// TypeAlias for the configured target.
+    fn lower_pep695(&self) -> bool {
+        self.target_minor > 0 && self.target_minor < 12
     }
 
     pub fn finish(self) -> String {
@@ -148,6 +169,47 @@ impl Emitter {
                 }
             }
             self.writeln("from __future__ import annotations");
+            // PEP 695 lowering prelude (FINDINGS #47): for target < 3.12,
+            // collect every PEP 695 type-param used in the module and
+            // emit `typing.TypeVar(...)` definitions plus the required
+            // `typing` imports. The def/class/type-alias arms then emit
+            // legacy shapes that reference these synthetic globals.
+            if self.lower_pep695() {
+                let typevars = collect_pep695_typevars(module);
+                let has_aliases = module
+                    .body
+                    .iter()
+                    .any(|s| matches!(s, Stmt::TypeAlias(_)));
+                let has_generic_class = module.body.iter().any(|s| match s {
+                    Stmt::ClassDef(c) => c
+                        .type_params
+                        .as_deref()
+                        .map(|tps| !tps.is_empty())
+                        .unwrap_or(false),
+                    _ => false,
+                });
+                if !typevars.is_empty() || has_aliases || has_generic_class {
+                    let mut imports: Vec<&str> = Vec::new();
+                    if !typevars.is_empty() {
+                        imports.push("TypeVar");
+                    }
+                    if has_generic_class {
+                        imports.push("Generic");
+                    }
+                    if has_aliases {
+                        imports.push("TypeAlias");
+                    }
+                    self.write("from typing import ");
+                    self.write(&imports.join(", "));
+                    self.newline();
+                    for tv in &typevars {
+                        self.write(tv);
+                        self.write(" = TypeVar(");
+                        self.write(&format!("\"{}\"", tv));
+                        self.writeln(")");
+                    }
+                }
+            }
             for stmt in iter {
                 self.emit_stmt(stmt);
             }
@@ -200,7 +262,12 @@ impl Emitter {
                     self.fill("def ");
                 }
                 self.write(f.name.as_str());
-                self.emit_type_params(f.type_params.as_deref());
+                // Skip the `[T]` type-param list when lowering to a
+                // legacy target (FINDINGS #47) — the module prelude
+                // emits matching `T = TypeVar("T")` definitions instead.
+                if !self.lower_pep695() {
+                    self.emit_type_params(f.type_params.as_deref());
+                }
                 self.write("(");
                 self.emit_parameters(&f.parameters);
                 self.write(")");
@@ -232,10 +299,33 @@ impl Emitter {
                 }
                 self.fill("class ");
                 self.write(c.name.as_str());
-                self.emit_type_params(c.type_params.as_deref());
+                let lowering = self.lower_pep695();
+                if !lowering {
+                    self.emit_type_params(c.type_params.as_deref());
+                }
                 let bases = c.bases();
                 let keywords = c.keywords();
-                if !bases.is_empty() || !keywords.is_empty() {
+                // Generic-class lowering for legacy targets (FINDINGS #47):
+                // synthesise a `Generic[T, U, ...]` base from the
+                // declared PEP 695 type-params so the runtime class
+                // still tracks its parameters via the `typing` machinery.
+                let generic_param_names: Vec<String> = if lowering {
+                    c.type_params
+                        .as_deref()
+                        .map(|tps| {
+                            tps.type_params
+                                .iter()
+                                .filter_map(|tp| match tp {
+                                    TypeParam::TypeVar(t) => Some(t.name.as_str().to_owned()),
+                                    _ => None,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                if !bases.is_empty() || !keywords.is_empty() || !generic_param_names.is_empty() {
                     self.write("(");
                     let mut first = true;
                     for base in bases {
@@ -243,6 +333,20 @@ impl Emitter {
                             self.write(", ");
                         }
                         self.emit_expr(base);
+                        first = false;
+                    }
+                    if !generic_param_names.is_empty() {
+                        if !first {
+                            self.write(", ");
+                        }
+                        self.write("Generic[");
+                        for (i, name) in generic_param_names.iter().enumerate() {
+                            if i > 0 {
+                                self.write(", ");
+                            }
+                            self.write(name);
+                        }
+                        self.write("]");
                         first = false;
                     }
                     for kw in keywords {
@@ -587,12 +691,26 @@ impl Emitter {
             }
 
             Stmt::TypeAlias(t) => {
-                self.fill("type ");
-                self.emit_expr(&t.name);
-                self.emit_type_params(t.type_params.as_deref());
-                self.write(" = ");
-                self.emit_expr(&t.value);
-                self.newline();
+                if self.lower_pep695() {
+                    // Legacy form: `X: TypeAlias = Y` (Python 3.10+).
+                    // PEP 695 `type X[T] = ...` parameterised aliases
+                    // can't be expressed in the legacy form, so we
+                    // drop the `[T]` and let the value carry the
+                    // parameterisation. This matches mypy's behaviour
+                    // for the `TypeAlias` form on older targets.
+                    self.fill("");
+                    self.emit_expr(&t.name);
+                    self.write(": TypeAlias = ");
+                    self.emit_expr(&t.value);
+                    self.newline();
+                } else {
+                    self.fill("type ");
+                    self.emit_expr(&t.name);
+                    self.emit_type_params(t.type_params.as_deref());
+                    self.write(" = ");
+                    self.emit_expr(&t.value);
+                    self.newline();
+                }
             }
 
             // Ruff exposes IPython escape commands as a dedicated statement
@@ -1528,6 +1646,56 @@ fn escape_python_string_with_quote(s: &str, quote: char) -> String {
             }
             c => out.push(c),
         }
+    }
+    out
+}
+
+/// Collect every distinct PEP 695 `TypeVar` name declared on any
+/// `def f[...]`, `class C[...]`, or `type X[...] = ...` in the module.
+/// Used by the legacy-target lowering (FINDINGS #47) to synthesise
+/// `T = TypeVar("T")` prelude lines that match the rewritten signatures.
+fn collect_pep695_typevars(module: &ModModule) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    fn push_unique(out: &mut Vec<String>, name: &str) {
+        if !out.iter().any(|n| n == name) {
+            out.push(name.to_owned());
+        }
+    }
+    fn walk_params(params: &TypeParams, out: &mut Vec<String>) {
+        for tp in &params.type_params {
+            if let TypeParam::TypeVar(t) = tp {
+                push_unique(out, t.name.as_str());
+            }
+        }
+    }
+    fn walk_stmt(stmt: &Stmt, out: &mut Vec<String>) {
+        match stmt {
+            Stmt::FunctionDef(f) => {
+                if let Some(tps) = f.type_params.as_deref() {
+                    walk_params(tps, out);
+                }
+                for nested in &f.body {
+                    walk_stmt(nested, out);
+                }
+            }
+            Stmt::ClassDef(c) => {
+                if let Some(tps) = c.type_params.as_deref() {
+                    walk_params(tps, out);
+                }
+                for nested in &c.body {
+                    walk_stmt(nested, out);
+                }
+            }
+            Stmt::TypeAlias(t) => {
+                if let Some(tps) = t.type_params.as_deref() {
+                    walk_params(tps, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    for stmt in &module.body {
+        walk_stmt(stmt, &mut out);
     }
     out
 }

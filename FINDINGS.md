@@ -1989,6 +1989,25 @@ Both are standard. Workaround: drop the annotation — `let b = Box(value=42)`
 
 ## 47. PEP 695 syntax emitted even when interpreter is < 3.12 (gap)
 
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. The
+emitter now lowers PEP 695 syntax for `[python] target` versions
+`< 3.12`. The build pipeline parses the target version via the new
+`parse_python_minor` helper and threads it through
+`emit_python_with_line_offsets_for_target`. When lowering:
+
+- A module-prelude scan collects every distinct `T` declared on any
+  `def`, `class`, or `type` and emits `T = TypeVar("T")` plus the
+  matching `from typing import TypeVar, Generic, TypeAlias` line.
+- `def f[T](...)` emits without the `[T]` suffix — the function refers
+  to the synthetic global `T` instead.
+- `class Box[T]:` emits as `class Box(Generic[T]):` (preserving any
+  existing bases).
+- `type X = Y` emits as `X: TypeAlias = Y`.
+
+Verified: `target = "3.11"` produces output that runs on Python 3.11;
+`target = "3.13"` (the default) is unchanged and still emits PEP 695.
+Generic functions, generic classes, and type aliases all round-trip.
+
 **Severity:** gap — silent runtime failure; doc says "clean CPython 3.13+"
 but no enforcement.
 
