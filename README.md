@@ -29,6 +29,26 @@
 
 The compiler and language server live in a single Rust binary called `tyc`.
 
+## Install on macOS
+
+One-line install (Apple Silicon and Intel both supported):
+
+```bash
+curl -sSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh | sh
+```
+
+This downloads the latest signed release tarball, verifies its SHA-256, and installs `tyc` to `$HOME/.local/bin`. If that directory isn't already on your `PATH`, the installer prints the exact `export PATH=…` line to add to `~/.zshrc` or `~/.bashrc`.
+
+If you download the tarball manually (rather than via the script), clear the macOS Gatekeeper quarantine attribute once before the first run:
+
+```bash
+xattr -d com.apple.quarantine ~/.local/bin/tyc
+```
+
+`tyc` itself runs anywhere a modern Rust toolchain produces a binary; the emitted Python targets **CPython 3.13+** by default.
+
+For a longer-form guide (custom install dir, pinned version, uninstall, troubleshooting) see [docs/install.md](docs/install.md).
+
 ## Why
 
 - **Static safety** — non-nullable by default, no implicit `Any`, explicit error handling via `Result[T, E]`.

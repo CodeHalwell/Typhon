@@ -3625,7 +3625,33 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // unbound after the forward arg pass, use the call's
                     // expected return type (from the enclosing annotation
                     // or `return` statement) to pin it.
-                    bind_typevars_and_substitute_bidirectional(&params, &actuals, &ret, expected)
+                    let result =
+                        bind_typevars_and_substitute_bidirectional(&params, &actuals, &ret, expected);
+                    // FINDINGS #71: narrow `<dict[K, V]>.get(k, default)` to
+                    // `V | type(default)`, which collapses to `V` when default
+                    // is V-compatible. Without this, the one-arg signature
+                    // (`V | None`) leaks into the two-arg call site even
+                    // though Python guarantees a non-None return when a
+                    // default is supplied.
+                    if pos_args.len() == 2 {
+                        if let Expr::Attribute(attr) = call.func.as_ref() {
+                            if attr.attr.as_str() == "get" {
+                                let recv = infer_expr(c, &attr.value);
+                                if let Type::Generic(head, dict_args) = &recv {
+                                    if head == "dict" && dict_args.len() == 2 {
+                                        let v = dict_args[1].clone();
+                                        let default_ty = infer_expr(c, &pos_args[1]);
+                                        return if c.is_assignable(&v, &default_ty) {
+                                            v
+                                        } else {
+                                            Type::union_of(vec![v, default_ty])
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    result
                 }
                 Type::Class(name) => {
                     // Generic class instantiation (FINDINGS #46) — when

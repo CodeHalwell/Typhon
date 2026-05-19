@@ -122,6 +122,49 @@ fn check_passes_nullable_annotation() {
     );
 }
 
+#[test]
+fn dict_get_two_arg_narrows_to_v() {
+    // FINDINGS #71: `d.get(k, default)` where `default: V` must narrow
+    // from `V | None` to `V`. With a V-incompatible default the result
+    // widens to `V | type(default)`. The one-arg form stays nullable.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("dict_get.ty"),
+        "def main() -> None:\n    \
+            let d: dict[str, int] = {\"a\": 1}\n    \
+            let x: int = d.get(\"a\", 0)\n    \
+            let y: int | str = d.get(\"a\", \"fallback\")\n    \
+            let z: int | None = d.get(\"a\")\n    \
+            print(x, y, z)\n",
+    )
+    .unwrap();
+    let status = tyc().arg("check").arg(tmp.path()).status().unwrap();
+    assert!(
+        status.success(),
+        "tyc check should narrow dict.get(k, default) to V (or V | type(default))"
+    );
+}
+
+#[test]
+fn dict_get_two_arg_mismatched_default_still_rejects_non_nullable_target() {
+    // FINDINGS #71 follow-up: if the default's type can't fit the target
+    // annotation, the union widening must still surface as a mismatch.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("dict_get_bad.ty"),
+        "def main() -> None:\n    \
+            let d: dict[str, int] = {\"a\": 1}\n    \
+            let z: int = d.get(\"a\", \"wrong\")\n    \
+            print(z)\n",
+    )
+    .unwrap();
+    let status = tyc().arg("check").arg(tmp.path()).status().unwrap();
+    assert!(
+        !status.success(),
+        "tyc check should still reject a default whose type doesn't fit the annotation"
+    );
+}
+
 // ── tyc fmt ──────────────────────────────────────────────────────────────────
 
 #[test]
