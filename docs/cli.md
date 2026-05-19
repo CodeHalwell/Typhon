@@ -8,7 +8,7 @@ Typhon ships a single binary, `tyc`, that handles every stage of the workflow. S
 
 | Command | Purpose |
 |---------|---------|
-| `tyc build` | Full pipeline: parse, check, analyse, desugar, emit, format. |
+| `tyc build` | Full pipeline: parse, check, analyse, desugar, emit, format. Also bootstraps the Python environment — merges `[dependencies]` / `[python] target` from `typhon.toml` into `pyproject.toml` (preserving any user-managed `[tool.*]` / `[project]` keys) and runs `uv sync` so `.venv` is ready. `uv sync` failure is downgraded to a warning. |
 | `tyc check` | Up to analyser, no emit. Used by CI. |
 | `tyc fmt` | Format `.ty` source. Wraps `ruff format` applied to a Typhon-aware pretty-printer. |
 | `tyc lsp` | Run as a Language Server. |
@@ -38,9 +38,32 @@ cd myapp
 tyc fmt src/
 tyc check src/
 
-# Emit Python
+# Emit Python (also generates pyproject.toml + .venv + runs `uv sync`)
 tyc build
 ```
+
+## `tyc build`
+
+In addition to the codegen pipeline, every `tyc build` bootstraps the
+Python environment for the project:
+
+1. **`pyproject.toml` merge.** The keys this tool owns — `[project] name`,
+   `version`, `requires-python`, `dependencies`, plus
+   `[dependency-groups] dev` when `[dev-dependencies]` is non-empty —
+   are derived from `typhon.toml` and written into `pyproject.toml` at
+   the project root. If the file already exists, the merge is
+   non-destructive: header comments, `[tool.*]` tables, and any
+   `[project]` keys the user manages themselves (`authors`, `readme`,
+   `classifiers`, …) are preserved byte-for-byte.
+2. **`uv sync`.** Materialises `.venv` (creating it on first run) and
+   installs the manifest. When `uv` isn't on `PATH`, or when `uv sync`
+   itself returns non-zero, the failure is downgraded to a warning so
+   the `.py` artefacts still land — the codegen output is useful
+   regardless of whether the install step resolved.
+
+The intent is that `tyc build` followed by `python build/main.py` works
+out of the box on a freshly cloned project, no separate `tyc sync`
+step required.
 
 ## `tyc migrate`
 

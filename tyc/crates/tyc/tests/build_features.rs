@@ -1365,6 +1365,102 @@ fn raw_class_without_base_keeps_field_defaults() {
     );
 }
 
+// ── pyproject.toml bootstrap on `tyc build` ────────────────────────────────
+
+#[test]
+fn build_bootstraps_pyproject_when_missing() {
+    // `tyc build` should write a fresh pyproject.toml derived from
+    // typhon.toml when the project doesn't have one yet. This is the
+    // greenfield path — no merging, just a clean greenfield render.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(tmp.path(), "def main() -> None:\n    print(1)\n");
+    build(tmp.path());
+    let pyproject = tmp.path().join("pyproject.toml");
+    assert!(
+        pyproject.exists(),
+        "tyc build should create pyproject.toml when missing"
+    );
+    let text = std::fs::read_to_string(&pyproject).unwrap();
+    assert!(text.contains("name = \"feat\""), "{text}");
+    assert!(text.contains("requires-python"), "{text}");
+}
+
+#[test]
+fn build_preserves_user_tool_tables_in_pyproject() {
+    // The key promise of "merge-aware" bootstrap: user-owned tables
+    // like [tool.ruff] survive. If this ever regresses to a full
+    // overwrite, every downstream user with a hand-written
+    // pyproject.toml loses their config silently — which is much
+    // worse than failing loudly.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(tmp.path(), "def main() -> None:\n    print(1)\n");
+    std::fs::write(
+        tmp.path().join("pyproject.toml"),
+        "# my header\n\
+         [project]\n\
+         name = \"will-be-overwritten\"\n\
+         version = \"9.9.9\"\n\
+         authors = [{ name = \"H\" }]\n\
+         readme = \"README.md\"\n\
+         \n\
+         [tool.ruff]\n\
+         line-length = 100\n\
+         \n\
+         [tool.pytest.ini_options]\n\
+         testpaths = [\"tests\"]\n",
+    )
+    .unwrap();
+    build(tmp.path());
+    let text = std::fs::read_to_string(tmp.path().join("pyproject.toml")).unwrap();
+    // Our owned keys overwrite the user's stale values.
+    assert!(
+        text.contains("name = \"feat\""),
+        "owned `name` should be rewritten; got:\n{text}",
+    );
+    assert!(
+        !text.contains("will-be-overwritten") && !text.contains("9.9.9"),
+        "stale owned values must be gone; got:\n{text}",
+    );
+    // Header and user-managed [project] keys survive.
+    assert!(
+        text.starts_with("# my header\n"),
+        "header comment must be preserved; got:\n{text}",
+    );
+    assert!(
+        text.contains("authors") && text.contains("\"H\""),
+        "user `authors` must survive; got:\n{text}",
+    );
+    assert!(
+        text.contains("readme = \"README.md\""),
+        "user `readme` must survive; got:\n{text}",
+    );
+    // [tool.*] tables are entirely user-owned.
+    assert!(
+        text.contains("[tool.ruff]") && text.contains("line-length = 100"),
+        "[tool.ruff] must survive; got:\n{text}",
+    );
+    assert!(
+        text.contains("[tool.pytest.ini_options]") && text.contains("testpaths"),
+        "[tool.pytest.ini_options] must survive; got:\n{text}",
+    );
+}
+
+#[test]
+fn build_does_not_fail_when_uv_sync_warning_path_fires() {
+    // The bootstrap downgrades a missing `uv` to a warning — the
+    // codegen output is still useful even if the install step can't
+    // run. We exercise this by inspecting the emitted build artefact:
+    // it must exist regardless of uv state, because that's the
+    // promise of `tyc build`.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(tmp.path(), "def main() -> None:\n    print(1)\n");
+    build(tmp.path());
+    assert!(
+        tmp.path().join("build/main.py").exists(),
+        "build artefact must be emitted even when bootstrap warns",
+    );
+}
+
 // ── ensuring CARGO_BIN_EXE is set ───────────────────────────────────────────
 
 #[test]

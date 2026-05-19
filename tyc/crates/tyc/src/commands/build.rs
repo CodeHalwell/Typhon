@@ -110,6 +110,14 @@ pub fn run(args: BuildArgs) -> Result<()> {
         ));
     }
 
+    // Bootstrap the Python environment before codegen: merge our owned
+    // keys into pyproject.toml (preserving user-managed tables) and run
+    // `uv sync` so `.venv` is ready when the user runs the emitted
+    // `.py`. Failure of `uv sync` is downgraded to a warning — the
+    // codegen output is useful regardless of whether the install
+    // step resolved.
+    crate::commands::deps::bootstrap_python_env(&config_dir, &config)?;
+
     let ty_files = collect_ty_files(&src_dir)?;
 
     if ty_files.is_empty() {
