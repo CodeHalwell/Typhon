@@ -62,8 +62,7 @@ fn init_embeds_project_name_in_toml() {
         .arg(tmp.path())
         .status()
         .unwrap();
-    let toml =
-        std::fs::read_to_string(tmp.path().join("coolproject").join("typhon.toml")).unwrap();
+    let toml = std::fs::read_to_string(tmp.path().join("coolproject").join("typhon.toml")).unwrap();
     assert!(
         toml.contains("coolproject"),
         "project name not present in typhon.toml"

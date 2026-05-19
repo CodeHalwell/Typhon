@@ -176,10 +176,7 @@ impl Emitter {
             // legacy shapes that reference these synthetic globals.
             if self.lower_pep695() {
                 let typevars = collect_pep695_typevars(module);
-                let has_aliases = module
-                    .body
-                    .iter()
-                    .any(|s| matches!(s, Stmt::TypeAlias(_)));
+                let has_aliases = module.body.iter().any(|s| matches!(s, Stmt::TypeAlias(_)));
                 let has_generic_class = module.body.iter().any(|s| match s {
                     Stmt::ClassDef(c) => c
                         .type_params
@@ -190,8 +187,20 @@ impl Emitter {
                 });
                 if !typevars.is_empty() || has_aliases || has_generic_class {
                     let mut imports: Vec<&str> = Vec::new();
-                    if !typevars.is_empty() {
+                    if typevars.iter().any(|p| p.kind == Pep695ParamKind::TypeVar) {
                         imports.push("TypeVar");
+                    }
+                    if typevars
+                        .iter()
+                        .any(|p| p.kind == Pep695ParamKind::ParamSpec)
+                    {
+                        imports.push("ParamSpec");
+                    }
+                    if typevars
+                        .iter()
+                        .any(|p| p.kind == Pep695ParamKind::TypeVarTuple)
+                    {
+                        imports.push("TypeVarTuple");
                     }
                     if has_generic_class {
                         imports.push("Generic");
@@ -203,9 +212,27 @@ impl Emitter {
                     self.write(&imports.join(", "));
                     self.newline();
                     for tv in &typevars {
-                        self.write(tv);
-                        self.write(" = TypeVar(");
-                        self.write(&format!("\"{}\"", tv));
+                        let constructor = match tv.kind {
+                            Pep695ParamKind::TypeVar => "TypeVar",
+                            Pep695ParamKind::ParamSpec => "ParamSpec",
+                            Pep695ParamKind::TypeVarTuple => "TypeVarTuple",
+                        };
+                        self.write(&tv.name);
+                        self.write(" = ");
+                        self.write(constructor);
+                        self.write("(");
+                        self.write(&format!("\"{}\"", tv.name));
+                        // Carry the declared bound through to the
+                        // legacy form so `def f[T: Iface](...)` lowers
+                        // to `T = TypeVar("T", bound=Iface)`. Bounds
+                        // are TypeVar-only — ParamSpec / TypeVarTuple
+                        // ignore the field.
+                        if tv.kind == Pep695ParamKind::TypeVar {
+                            if let Some(bound) = &tv.bound_src {
+                                self.write(", bound=");
+                                self.write(bound);
+                            }
+                        }
                         self.writeln(")");
                     }
                 }
@@ -1045,9 +1072,11 @@ impl Emitter {
                                             for spec_elem in &spec.elements {
                                                 match spec_elem {
                                                     InterpolatedStringElement::Literal(lit) => {
-                                                        self.write(&escape_python_string_with_quote(
-                                                            &lit.value, outer,
-                                                        ));
+                                                        self.write(
+                                                            &escape_python_string_with_quote(
+                                                                &lit.value, outer,
+                                                            ),
+                                                        );
                                                     }
                                                     InterpolatedStringElement::Interpolation(
                                                         nested,
@@ -1650,25 +1679,80 @@ fn escape_python_string_with_quote(s: &str, quote: char) -> String {
     out
 }
 
-/// Collect every distinct PEP 695 `TypeVar` name declared on any
+/// One PEP 695 type-parameter as collected for legacy-target lowering.
+/// `bound_src` is the rendered Python text of any declared bound
+/// expression (or `None` when there isn't one); the prelude uses it to
+/// emit `T = TypeVar("T", bound=Iface)` rather than dropping the
+/// constraint silently.
+#[derive(Debug, Clone)]
+pub(crate) struct Pep695Param {
+    pub name: String,
+    pub kind: Pep695ParamKind,
+    pub bound_src: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pep695ParamKind {
+    /// `def f[T]`, `class C[T]`, `type X[T]`
+    TypeVar,
+    /// `def f[**P]`
+    ParamSpec,
+    /// `def f[*Ts]`
+    TypeVarTuple,
+}
+
+/// Collect every distinct PEP 695 type-parameter declared on any
 /// `def f[...]`, `class C[...]`, or `type X[...] = ...` in the module.
 /// Used by the legacy-target lowering (FINDINGS #47) to synthesise
-/// `T = TypeVar("T")` prelude lines that match the rewritten signatures.
-fn collect_pep695_typevars(module: &ModModule) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    fn push_unique(out: &mut Vec<String>, name: &str) {
-        if !out.iter().any(|n| n == name) {
-            out.push(name.to_owned());
+/// matching `TypeVar` / `ParamSpec` / `TypeVarTuple` prelude lines.
+///
+/// Declared bounds (`T: Bound`) are rendered back to Python source via
+/// a throwaway sub-emitter so the prelude emits
+/// `T = TypeVar("T", bound=Bound)` rather than dropping the constraint.
+/// `ParamSpec` / `TypeVarTuple` ignore bounds (they don't carry any).
+fn collect_pep695_typevars(module: &ModModule) -> Vec<Pep695Param> {
+    let mut out: Vec<Pep695Param> = Vec::new();
+    fn push_unique(out: &mut Vec<Pep695Param>, param: Pep695Param) {
+        if !out.iter().any(|p| p.name == param.name) {
+            out.push(param);
         }
     }
-    fn walk_params(params: &TypeParams, out: &mut Vec<String>) {
+    fn render_bound(expr: &Expr) -> String {
+        let mut sub = Emitter::new();
+        sub.emit_expr(expr);
+        sub.finish()
+    }
+    fn walk_params(params: &TypeParams, out: &mut Vec<Pep695Param>) {
         for tp in &params.type_params {
-            if let TypeParam::TypeVar(t) = tp {
-                push_unique(out, t.name.as_str());
+            match tp {
+                TypeParam::TypeVar(t) => push_unique(
+                    out,
+                    Pep695Param {
+                        name: t.name.as_str().to_owned(),
+                        kind: Pep695ParamKind::TypeVar,
+                        bound_src: t.bound.as_deref().map(render_bound),
+                    },
+                ),
+                TypeParam::ParamSpec(p) => push_unique(
+                    out,
+                    Pep695Param {
+                        name: p.name.as_str().to_owned(),
+                        kind: Pep695ParamKind::ParamSpec,
+                        bound_src: None,
+                    },
+                ),
+                TypeParam::TypeVarTuple(t) => push_unique(
+                    out,
+                    Pep695Param {
+                        name: t.name.as_str().to_owned(),
+                        kind: Pep695ParamKind::TypeVarTuple,
+                        bound_src: None,
+                    },
+                ),
             }
         }
     }
-    fn walk_stmt(stmt: &Stmt, out: &mut Vec<String>) {
+    fn walk_stmt(stmt: &Stmt, out: &mut Vec<Pep695Param>) {
         match stmt {
             Stmt::FunctionDef(f) => {
                 if let Some(tps) = f.type_params.as_deref() {

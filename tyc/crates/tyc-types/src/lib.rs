@@ -251,6 +251,34 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
         {
             true
         }
+        // Function / Function — structural callable assignability.
+        // `Callable[..., R]` (modelled as empty params + `variadic`)
+        // accepts any function with an assignable return type. For
+        // fixed-arity callables, expected/actual must share arity and
+        // each parameter pair is contravariant (a callable that
+        // tolerates a wider input type can stand in for one expecting
+        // a narrower input).
+        (
+            Type::Function {
+                params: ep,
+                ret: er,
+                variadic: ev,
+            },
+            Type::Function {
+                params: ap,
+                ret: ar,
+                variadic: _av,
+            },
+        ) => {
+            if *ev && ep.is_empty() {
+                return assignable(er, ar);
+            }
+            if ep.len() != ap.len() {
+                return false;
+            }
+            // Contravariant params, covariant return.
+            ep.iter().zip(ap).all(|(e, a)| assignable(a, e)) && assignable(er, ar)
+        }
         // Bare-container annotations (`list`, `dict`, `tuple`, `set`,
         // `frozenset`) act as `name[Any]` — they accept any
         // parameterisation. Without this rule, `let xs: list = []`
@@ -267,37 +295,13 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
 /// a `yield` or `yield from` expression. Used by the return-type
 /// check in `check_function` to flag generator-shaped function bodies
 /// whose return annotation isn't iterator-shaped (FINDINGS #51).
+///
+/// Nested function and class bodies are skipped — a `yield` inside an
+/// inner generator doesn't make the *outer* function a generator. We
+/// dispatch through `visit_stmt` (not `walk_stmt`) at the top level
+/// so the visitor's own pruning of `Stmt::FunctionDef` / `Stmt::ClassDef`
+/// fires before we descend.
 fn body_has_yield(body: &[Stmt]) -> bool {
-    fn expr_has(e: &Expr) -> bool {
-        if matches!(e, Expr::Yield(_) | Expr::YieldFrom(_)) {
-            return true;
-        }
-        let mut found = false;
-        ruff_python_ast::visitor::source_order::walk_expr(
-            &mut YieldVisitor { found: &mut found },
-            e,
-        );
-        found
-    }
-    fn stmt_has(s: &Stmt) -> bool {
-        match s {
-            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {
-                // Don't descend into nested function / class bodies —
-                // a `yield` inside an inner generator doesn't make the
-                // *outer* function a generator. (Lambdas can't contain
-                // yields in Python syntax.)
-                false
-            }
-            _ => {
-                let mut found = false;
-                ruff_python_ast::visitor::source_order::walk_stmt(
-                    &mut YieldVisitor { found: &mut found },
-                    s,
-                );
-                found
-            }
-        }
-    }
     struct YieldVisitor<'a> {
         found: &'a mut bool,
     }
@@ -326,19 +330,18 @@ fn body_has_yield(body: &[Stmt]) -> bool {
             ruff_python_ast::visitor::source_order::walk_stmt(self, s);
         }
     }
-    let _ = expr_has;
-    let _ = stmt_has;
     let mut found = false;
-    for s in body {
-        ruff_python_ast::visitor::source_order::walk_stmt(
-            &mut YieldVisitor { found: &mut found },
-            s,
-        );
-        if found {
-            return true;
+    {
+        let mut visitor = YieldVisitor { found: &mut found };
+        for s in body {
+            use ruff_python_ast::visitor::source_order::SourceOrderVisitor;
+            visitor.visit_stmt(s);
+            if *visitor.found {
+                break;
+            }
         }
     }
-    false
+    found
 }
 
 /// Return `true` when `returns` is annotated as one of the
@@ -360,13 +363,15 @@ fn is_iterator_return_type(returns: &Expr, is_async: bool) -> bool {
         _ => None,
     };
     let Some(name) = head else { return false };
-    if sync_names.contains(&name) {
-        return true;
+    // `async def f() -> Iterator[T]` containing `yield` produces an
+    // *async* generator at runtime — Python only accepts the
+    // `AsyncIterator` / `AsyncIterable` / `AsyncGenerator` names for
+    // those. Accept only the matching family.
+    if is_async {
+        async_names.contains(&name)
+    } else {
+        sync_names.contains(&name)
     }
-    if is_async && async_names.contains(&name) {
-        return true;
-    }
-    false
 }
 
 /// Return `true` when the type is an unbound PEP 695 type parameter.
@@ -382,46 +387,46 @@ fn is_typevar(t: &Type) -> bool {
 /// Used by the `missing_await` check (FINDINGS #49) to suppress
 /// false positives on the canonical `asyncio.run(coro())` pattern.
 fn call_targets_coro_acceptor(call: &ruff_python_ast::ExprCall) -> bool {
-    // Match `asyncio.run`, `asyncio.create_task`, `asyncio.ensure_future`,
-    // `asyncio.gather`, `asyncio.wait`, `asyncio.wait_for`, plus the
-    // typhon_runtime spawn helper.
-    if let Expr::Attribute(a) = call.func.as_ref() {
-        let method = a.attr.as_str();
-        let is_coro_method = matches!(
-            method,
-            "run"
-                | "create_task"
-                | "ensure_future"
-                | "gather"
-                | "wait"
-                | "wait_for"
-                | "as_completed"
-                | "spawn"
-        );
-        if !is_coro_method {
-            return false;
-        }
-        // Check the receiver chain ends in `asyncio` or
-        // `typhon_runtime.tasks` (anywhere in the dotted chain).
-        let mut cur = a.value.as_ref();
-        loop {
-            match cur {
-                Expr::Name(n) => {
-                    let s = n.id.as_str();
-                    return s == "asyncio" || s == "typhon_runtime";
-                }
-                Expr::Attribute(inner) => {
-                    let s = inner.attr.as_str();
-                    if s == "asyncio" || s == "tasks" {
-                        return true;
-                    }
-                    cur = inner.value.as_ref();
-                }
-                _ => return false,
-            }
-        }
+    let Expr::Attribute(a) = call.func.as_ref() else {
+        return false;
+    };
+    let method = a.attr.as_str();
+    let is_coro_method = matches!(
+        method,
+        "run"
+            | "create_task"
+            | "ensure_future"
+            | "gather"
+            | "wait"
+            | "wait_for"
+            | "as_completed"
+            | "spawn"
+    );
+    if !is_coro_method {
+        return false;
     }
-    false
+    // Accept exactly two shapes:
+    //   1. `asyncio.<method>(coro())`
+    //   2. `typhon_runtime.tasks.<method>(coro())`
+    // (Plus aliased forms `<X>.asyncio.<method>(...)` are accepted too —
+    // common when users `import asyncio as aio` and re-export — but a
+    // bare `.tasks.<method>` whose receiver isn't `typhon_runtime` is
+    // rejected so a user module called `mypkg.tasks.gather(...)`
+    // doesn't silently suppress `tyc::missing_await`.)
+    match a.value.as_ref() {
+        // `asyncio.<method>(...)`
+        Expr::Name(n) if n.id.as_str() == "asyncio" => true,
+        // `typhon_runtime.tasks.<method>(...)`
+        Expr::Attribute(inner)
+            if inner.attr.as_str() == "tasks"
+                && matches!(inner.value.as_ref(), Expr::Name(n) if n.id.as_str() == "typhon_runtime") =>
+        {
+            true
+        }
+        // `pkg.asyncio.<method>(...)` — reasonably an aliased asyncio.
+        Expr::Attribute(inner) if inner.attr.as_str() == "asyncio" => true,
+        _ => false,
+    }
 }
 
 /// Walk a generic-class field-type / arg-type pair and bind any
@@ -642,13 +647,16 @@ pub fn type_from_annotation_with_params(
                                     variadic: false,
                                 };
                             }
-                            // `Callable[..., R]` — any args, fixed return.
-                            // Mirror Python's behaviour by treating the
-                            // arity as "any", which we model with a
-                            // single-param variadic function.
+                            // `Callable[..., R]` — any args (including
+                            // zero), fixed return. Empty `params` plus
+                            // `variadic: true` lets the call-site arity
+                            // check accept 0..N positional arguments;
+                            // using `vec![Type::Any]` would force at
+                            // least one arg via the `total >=
+                            // params.len()` path.
                             Expr::EllipsisLiteral(_) => {
                                 return Type::Function {
-                                    params: vec![Type::Any],
+                                    params: vec![],
                                     ret: Box::new(ret),
                                     variadic: true,
                                 };
@@ -659,10 +667,7 @@ pub fn type_from_annotation_with_params(
                 }
                 // Unrecognised shape — leave as a generic so existing
                 // variance / assignability checks keep working.
-                return Type::Generic(
-                    "Callable".into(),
-                    vec![Type::Unknown, Type::Unknown],
-                );
+                return Type::Generic("Callable".into(), vec![Type::Unknown, Type::Unknown]);
             }
             // Result[T, E] — two-parameter sealed sum type (Ok[T] | Err[E]).
             if head == "Result" {
@@ -1291,14 +1296,16 @@ impl<'a> Checker<'a> {
                     .iter()
                     .zip(bb)
                     .enumerate()
-                    .all(|(idx, (formal, actual_arg))| match generic_param_variance(an, idx) {
-                        Variance::Covariant => self.is_assignable(formal, actual_arg),
-                        Variance::Contravariant => self.is_assignable(actual_arg, formal),
-                        Variance::Invariant => {
-                            self.is_assignable(formal, actual_arg)
-                                && self.is_assignable(actual_arg, formal)
-                        }
-                    });
+                    .all(
+                        |(idx, (formal, actual_arg))| match generic_param_variance(an, idx) {
+                            Variance::Covariant => self.is_assignable(formal, actual_arg),
+                            Variance::Contravariant => self.is_assignable(actual_arg, formal),
+                            Variance::Invariant => {
+                                self.is_assignable(formal, actual_arg)
+                                    && self.is_assignable(actual_arg, formal)
+                            }
+                        },
+                    );
             }
         }
         false
@@ -2253,7 +2260,10 @@ fn check_arity_with_info(
     // Rule 2: a positional-bound name can't also appear as a kw.
     let filled_positionally = pos_args.len().min(info.param_names.len());
     for name in &named_kwargs {
-        if info.param_names[..filled_positionally].iter().any(|p| p == name) {
+        if info.param_names[..filled_positionally]
+            .iter()
+            .any(|p| p == name)
+        {
             return false;
         }
     }
@@ -2262,7 +2272,12 @@ fn check_arity_with_info(
     // matching kw arg. Stops being checkable when `**kwargs` unpacking is
     // present — in that case we trust the user.
     if !has_double_star {
-        for (i, p) in info.param_names.iter().enumerate().take(info.min_positional) {
+        for (i, p) in info
+            .param_names
+            .iter()
+            .enumerate()
+            .take(info.min_positional)
+        {
             if i < pos_args.len() {
                 continue;
             }
@@ -3317,10 +3332,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             if c.in_sync_function && c.inside_await == 0 {
                 if let Expr::Name(n) = call.func.as_ref() {
                     if c.async_functions.contains(n.id.as_str()) {
-                        let span = (
-                            n.range.start().to_usize(),
-                            n.range.end().to_usize(),
-                        );
+                        let span = (n.range.start().to_usize(), n.range.end().to_usize());
                         c.missing_await(n.id.as_str(), span);
                     }
                 }
@@ -3361,10 +3373,15 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         Expr::Name(n) => Some(n.id.as_str().to_owned()),
                         _ => None,
                     };
-                    let arity_info: Option<&ArityInfo> = fn_name
+                    // Clone arity info so the mutable Checker borrows
+                    // below (`infer_expr_ctx`, `c.mismatch`,
+                    // `c.nullable_use`) don't fight an outstanding
+                    // immutable borrow of `c.function_arity_info`.
+                    let arity_info: Option<ArityInfo> = fn_name
                         .as_deref()
-                        .and_then(|n| c.function_arity_info.get(n));
-                    let count_ok = if let Some(info) = arity_info {
+                        .and_then(|n| c.function_arity_info.get(n))
+                        .cloned();
+                    let count_ok = if let Some(info) = arity_info.as_ref() {
                         check_arity_with_info(info, pos_args, kw_args)
                     } else {
                         // No name-keyed arity info — this is a method
@@ -3430,6 +3447,57 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                             c.mismatch(&params[i], &actual, span);
                         }
                         actuals.push(actual);
+                    }
+                    // Keyword-argument type checks: when we have name-keyed
+                    // `ArityInfo`, each kwarg can be paired with the
+                    // parameter it fills (by position in `param_names`)
+                    // and checked against that parameter's type. Without
+                    // this, `def f(x: int) -> None; f(x="bad")` would
+                    // pass `tyc check` once kwargs were counted in the
+                    // arity check. (P1 review feedback from PR #57.)
+                    //
+                    // Clone the param-name slice up front so the
+                    // mutable `infer_expr_ctx` / `c.mismatch` /
+                    // `c.nullable_use` calls below don't fight the
+                    // `&ArityInfo` immutable borrow that `arity_info`
+                    // would keep alive across the loop.
+                    let kwarg_param_names: Option<Vec<String>> =
+                        arity_info.as_ref().map(|info| info.param_names.clone());
+                    if let Some(param_names) = kwarg_param_names {
+                        for kw in kw_args {
+                            let Some(ident) = &kw.arg else { continue };
+                            let Some(idx) = param_names.iter().position(|p| p == ident.as_str())
+                            else {
+                                continue;
+                            };
+                            if idx >= params.len() {
+                                continue;
+                            }
+                            let actual = infer_expr_ctx(c, &kw.value, Some(&params[idx]));
+                            let nullable_into_non_nullable =
+                                !params[idx].is_nullable() && actual.is_nullable();
+                            if nullable_into_non_nullable {
+                                if let Expr::Name(n) = &kw.value {
+                                    let span = (
+                                        n.range.start().to_usize(),
+                                        n.range.start().to_usize() + n.id.as_str().len(),
+                                    );
+                                    c.nullable_use(n.id.as_str(), &params[idx], span);
+                                } else {
+                                    let span = (
+                                        kw.value.range().start().to_usize(),
+                                        kw.value.range().end().to_usize(),
+                                    );
+                                    c.mismatch(&params[idx], &actual, span);
+                                }
+                            } else if !c.is_assignable(&params[idx], &actual) {
+                                let span = (
+                                    kw.value.range().start().to_usize(),
+                                    kw.value.range().end().to_usize(),
+                                );
+                                c.mismatch(&params[idx], &actual, span);
+                            }
+                        }
                     }
                     if suppresses_missing_await {
                         c.inside_await = c.inside_await.saturating_sub(1);

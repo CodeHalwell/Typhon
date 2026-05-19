@@ -39,10 +39,7 @@ const STUB_PREFIX: &str = "__typhon_builtin_ext_";
 /// node is synthesised with a zero-length `TextRange` so source-map
 /// emission inherits the surrounding offset (matching how other
 /// desugar passes synthesise AST nodes).
-fn annotate_self_param_with_builtin(
-    f: &mut ruff_python_ast::StmtFunctionDef,
-    builtin: &str,
-) {
+fn annotate_self_param_with_builtin(f: &mut ruff_python_ast::StmtFunctionDef, builtin: &str) {
     let target = f
         .parameters
         .posonlyargs

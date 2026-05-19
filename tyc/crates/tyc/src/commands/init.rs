@@ -125,15 +125,9 @@ mod tests {
         };
         run(args).unwrap();
         let project = tmp.path().join("myapp");
-        assert!(
-            project.join("typhon.toml").exists(),
-            "typhon.toml missing"
-        );
+        assert!(project.join("typhon.toml").exists(), "typhon.toml missing");
         assert!(project.join("src").is_dir(), "src/ dir missing");
-        assert!(
-            project.join("src/main.ty").exists(),
-            "src/main.ty missing"
-        );
+        assert!(project.join("src/main.ty").exists(), "src/main.ty missing");
         assert!(project.join("tests").is_dir(), "tests/ dir missing");
     }
 
@@ -165,8 +159,7 @@ mod tests {
             dir: tmp.path().to_path_buf(),
         };
         run(args).unwrap();
-        let toml =
-            std::fs::read_to_string(tmp.path().join("coolproject/typhon.toml")).unwrap();
+        let toml = std::fs::read_to_string(tmp.path().join("coolproject/typhon.toml")).unwrap();
         assert!(
             toml.contains("coolproject"),
             "project name not in typhon.toml"
@@ -201,8 +194,7 @@ mod tests {
             dir: tmp.path().to_path_buf(),
         };
         run(args).unwrap();
-        let body =
-            std::fs::read_to_string(tmp.path().join("regression/src/main.ty")).unwrap();
+        let body = std::fs::read_to_string(tmp.path().join("regression/src/main.ty")).unwrap();
         assert!(
             !body.split_whitespace().any(|tok| tok == "val"),
             "scaffold leaked the deprecated `val` keyword:\n{body}"

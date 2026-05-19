@@ -2780,23 +2780,139 @@ fn parse_else_var(header: &str) -> Option<String> {
 /// tab-indented or two-space code round-trips correctly.
 /// Replace every whole-word occurrence of `from` with `to` in `line`,
 /// respecting Python identifier boundaries (a leading or trailing
-/// alphanumeric / underscore character disqualifies the match).
-/// String literals are *not* protected — the caller is responsible for
-/// only invoking this on text where the substitution is semantically
-/// safe (e.g. the body of a `with`-chain `else err:` block where the
-/// user-supplied error identifier is the only thing being renamed).
+/// alphanumeric / underscore character disqualifies the match) **and**
+/// skipping over content inside regular string literals and `#`
+/// comments so the substitution can't corrupt user-visible text like
+/// `log.error("err occurred")` when renaming a synthesised `err`
+/// binding.
+///
+/// F-string interpolations (`f"... {EXPR} ..."`) are walked as code:
+/// the literal portions are left alone, but `{ ... }` expressions are
+/// rescanned so the identifier `err` inside `f"{err.field}"` is
+/// renamed exactly as it would be at top level. The scanner only
+/// handles single-line forms (matching the call site, which runs on
+/// already-line-split text from the `else err:` body).
 fn rename_whole_word(line: &str, from: &str, to: &str) -> String {
     if from.is_empty() || !line.contains(from) {
         return line.to_owned();
     }
-    let mut out = String::with_capacity(line.len());
-    let mut i = 0;
     let bytes = line.as_bytes();
     let from_bytes = from.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0usize;
+    /// Per-active-string state used to flip between literal-text and
+    /// interpolation modes correctly for f-strings.
+    #[derive(Clone, Copy)]
+    struct StrState {
+        quote: u8,
+        /// `true` when this string opened with `f"` / `f'` (or any
+        /// case-insensitive prefix containing `f`). Drives the `{` →
+        /// interpolation transition.
+        is_fstring: bool,
+        /// `true` once we've stepped into a `{ ... }` block. While
+        /// set, the scanner treats characters as code, recursing on
+        /// nested strings as needed.
+        in_interp: bool,
+    }
+    let mut stack: Vec<StrState> = Vec::new();
     while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(top) = stack.last().copied() {
+            if top.in_interp {
+                // Inside `f"... { CODE }"` we treat characters as code,
+                // recursing on nested string opens, and closing the
+                // interpolation on the matching `}` at depth 0 of the
+                // current interpolation. Track a local paren-style
+                // depth for `{ }` so dict literals inside the
+                // interpolation don't terminate it early.
+                match b {
+                    b'}' => {
+                        // Close the interpolation, fall back to string
+                        // literal mode.
+                        out.push('}');
+                        i += 1;
+                        if let Some(last) = stack.last_mut() {
+                            last.in_interp = false;
+                        }
+                        continue;
+                    }
+                    b'"' | b'\'' => {
+                        // Nested string literal inside the
+                        // interpolation. Push a fresh frame; the
+                        // outer f-string stays on the stack so we
+                        // return to it when this one closes.
+                        let is_fstring = is_fstring_prefix(bytes, i);
+                        stack.push(StrState {
+                            quote: b,
+                            is_fstring,
+                            in_interp: false,
+                        });
+                        out.push(b as char);
+                        i += 1;
+                        continue;
+                    }
+                    _ => {
+                        // Code byte — fall through to the bottom
+                        // matcher so identifier renaming applies.
+                    }
+                }
+            } else {
+                // Inside a literal portion of a string. Honour escapes
+                // and watch for the closing quote / f-string `{`.
+                if b == b'\\' && i + 1 < bytes.len() {
+                    let end = (i + 2).min(bytes.len());
+                    out.push_str(&line[i..end]);
+                    i = end;
+                    continue;
+                }
+                if b == top.quote {
+                    stack.pop();
+                    out.push(b as char);
+                    i += 1;
+                    continue;
+                }
+                if top.is_fstring && b == b'{' {
+                    // f-string interpolation opens. `{{` is a literal
+                    // brace — handle by checking the next byte.
+                    if bytes.get(i + 1) == Some(&b'{') {
+                        out.push_str("{{");
+                        i += 2;
+                        continue;
+                    }
+                    out.push('{');
+                    i += 1;
+                    if let Some(last) = stack.last_mut() {
+                        last.in_interp = true;
+                    }
+                    continue;
+                }
+                // Plain literal byte — preserve UTF-8.
+                let ch_len = utf8_char_len(bytes, i);
+                out.push_str(&line[i..i + ch_len]);
+                i += ch_len;
+                continue;
+            }
+        }
+        // Top-level (or interpolation-code) byte.
+        if b == b'#' {
+            // Comment to end of line — copy verbatim.
+            out.push_str(&line[i..]);
+            break;
+        }
+        if b == b'"' || b == b'\'' {
+            let is_fstring = is_fstring_prefix(bytes, i);
+            stack.push(StrState {
+                quote: b,
+                is_fstring,
+                in_interp: false,
+            });
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        // Word match in code position.
         if i + from_bytes.len() <= bytes.len() && &bytes[i..i + from_bytes.len()] == from_bytes {
-            let before_ok = i == 0
-                || !is_ident_continuation(bytes[i - 1]);
+            let before_ok = i == 0 || !is_ident_continuation(bytes[i - 1]);
             let after_ok = i + from_bytes.len() == bytes.len()
                 || !is_ident_continuation(bytes[i + from_bytes.len()]);
             if before_ok && after_ok {
@@ -2805,10 +2921,64 @@ fn rename_whole_word(line: &str, from: &str, to: &str) -> String {
                 continue;
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        // Copy one UTF-8 character — pushing `bytes[i] as char` would
+        // mojibake non-ASCII identifiers / string-literal continuation
+        // bytes.
+        let ch_len = utf8_char_len(bytes, i);
+        out.push_str(&line[i..i + ch_len]);
+        i += ch_len;
     }
     out
+}
+
+/// Return `true` when the quote byte at `bytes[i]` is preceded by a
+/// string-prefix that includes `f` / `F` (`f"..."`, `Rf"..."`, etc.).
+/// We scan backwards over the legal Python prefix bytes (`f`, `F`, `r`,
+/// `R`, `b`, `B`, `u`, `U`) — order doesn't matter, but `b`/`B` makes
+/// the string non-f. We only require that an `f`/`F` is present.
+fn is_fstring_prefix(bytes: &[u8], quote_idx: usize) -> bool {
+    let mut j = quote_idx;
+    let mut has_f = false;
+    let mut has_b = false;
+    while j > 0 {
+        let prev = bytes[j - 1];
+        if prev == b'f' || prev == b'F' {
+            has_f = true;
+            j -= 1;
+            continue;
+        }
+        if prev == b'r' || prev == b'R' || prev == b'u' || prev == b'U' {
+            j -= 1;
+            continue;
+        }
+        if prev == b'b' || prev == b'B' {
+            has_b = true;
+            j -= 1;
+            continue;
+        }
+        break;
+    }
+    has_f && !has_b
+}
+
+/// Length in bytes of the UTF-8 character starting at `bytes[i]`.
+/// Used by the byte-cursor scanners in this module to keep multi-byte
+/// sequences intact while still allowing constant-time byte indexing.
+fn utf8_char_len(bytes: &[u8], i: usize) -> usize {
+    let b = bytes[i];
+    if b < 0x80 {
+        1
+    } else if b < 0xC0 {
+        // Stray continuation byte — copy one byte to make progress.
+        1
+    } else if b < 0xE0 {
+        2
+    } else if b < 0xF0 {
+        3
+    } else {
+        4
+    }
+    .min(bytes.len() - i)
 }
 
 fn is_ident_continuation(b: u8) -> bool {
@@ -3381,13 +3551,12 @@ fn join_pipe_continuations(source: &str) -> String {
     let mut paren_depth: i32 = 0;
     let mut in_string: Option<StringMode> = None;
 
-    let flush =
-        |buffered: &mut Option<(String, String)>, out: &mut String| {
-            if let Some((line, term)) = buffered.take() {
-                out.push_str(&line);
-                out.push_str(&term);
-            }
-        };
+    let flush = |buffered: &mut Option<(String, String)>, out: &mut String| {
+        if let Some((line, term)) = buffered.take() {
+            out.push_str(&line);
+            out.push_str(&term);
+        }
+    };
 
     for line in source.split_inclusive('\n') {
         let raw = line.trim_end_matches(['\n', '\r']);
@@ -3429,16 +3598,37 @@ fn join_pipe_continuations(source: &str) -> String {
             buffered = Some((raw.to_owned(), terminator.to_owned()));
         }
 
-        // Track parenthesis depth based on the now-buffered or already-
-        // flushed line. We scan the original raw text (the join above
-        // preserves bracket-balance because it just glues two halves
-        // together).
-        for &b in raw.as_bytes() {
+        // Track parenthesis depth based on the original raw text (the
+        // join preserves bracket balance because it just glues two
+        // halves together). Skip bytes inside string literals and
+        // after `#` comments so a line like `s = "(((" ` doesn't
+        // mistakenly inflate `paren_depth` and trigger a bogus
+        // continuation fold on a later `|>` at module level.
+        let bytes = raw.as_bytes();
+        let mut local_str: Option<u8> = None;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if let Some(quote) = local_str {
+                if b == b'\\' && i + 1 < bytes.len() {
+                    // Escape skips the next byte (`\"`, `\'`, `\\`, etc).
+                    i += 2;
+                    continue;
+                }
+                if b == quote {
+                    local_str = None;
+                }
+                i += 1;
+                continue;
+            }
             match b {
+                b'#' => break,
+                b'"' | b'\'' => local_str = Some(b),
                 b'(' | b'[' | b'{' => paren_depth += 1,
                 b')' | b']' | b'}' => paren_depth -= 1,
                 _ => {}
             }
+            i += 1;
         }
     }
     flush(&mut buffered, &mut out);
@@ -4658,9 +4848,15 @@ def run() -> Result[str, str]:
 ";
         let out = expand_with_chains(src);
         assert!(out.contains("__typhon_with_0__ = f()"), "out:\n{out}");
-        assert!(out.contains("let a = __typhon_with_0__.value"), "out:\n{out}");
+        assert!(
+            out.contains("let a = __typhon_with_0__.value"),
+            "out:\n{out}"
+        );
         assert!(out.contains("__typhon_with_1__ = g(a)"), "out:\n{out}");
-        assert!(out.contains("let b = __typhon_with_1__.value"), "out:\n{out}");
+        assert!(
+            out.contains("let b = __typhon_with_1__.value"),
+            "out:\n{out}"
+        );
     }
 
     #[test]
