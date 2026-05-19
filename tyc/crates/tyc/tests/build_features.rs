@@ -1255,6 +1255,249 @@ fn corpus_result_type_with_nullable_builds_and_runs() {
     );
 }
 
+// ── class! __init__ synthesis ──────────────────────────────────────────────
+
+#[test]
+fn raw_class_strips_field_defaults_when_init_is_synthesised() {
+    // `class!` folds field defaults into the synthesised `__init__`
+    // signature; leaving them at class scope as well would evaluate
+    // each default twice (once as a shared class attribute at
+    // class-definition time, once per-instance inside `__init__`),
+    // which allocates extra objects and confuses libraries that
+    // introspect class attributes (e.g. PyTorch parameter
+    // registration on subclasses).
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "from torch.nn import Module, Linear, F, Tensor\n\
+         \n\
+         class! Model(Module):\n\
+         \x20   linear: Linear = Linear(10, 5)\n\
+         \x20   dropout: float = 0.5\n\
+         \n\
+         impl Model:\n\
+         \x20   def forward(self, x: Tensor) -> Tensor:\n\
+         \x20       mut x = self.linear(x)\n\
+         \x20       x = F.dropout(x, p=self.dropout)\n\
+         \x20       return x\n",
+    );
+    build(tmp.path());
+    let out = std::fs::read_to_string(tmp.path().join("build/main.py")).unwrap();
+    // Annotations survive so type checkers still see the field shape.
+    assert!(
+        out.contains("linear: Linear\n") || out.contains("linear: Linear\r\n"),
+        "bare `linear: Linear` annotation should remain after stripping default; got:\n{out}",
+    );
+    assert!(
+        out.contains("dropout: float\n") || out.contains("dropout: float\r\n"),
+        "bare `dropout: float` annotation should remain after stripping default; got:\n{out}",
+    );
+    // The default expression must not survive at class scope — the
+    // `__init__` signature is the single source of truth.
+    let class_body_end = out.find("def __init__").unwrap_or(out.len());
+    let class_body = &out[..class_body_end];
+    assert!(
+        !class_body.contains("Linear(10, 5)"),
+        "class-level `linear: Linear = Linear(10, 5)` default should be stripped; got class body:\n{class_body}",
+    );
+    assert!(
+        !class_body.contains("dropout: float = 0.5"),
+        "class-level `dropout: float = 0.5` default should be stripped; got class body:\n{class_body}",
+    );
+    // But the `__init__` signature still carries them as parameter defaults.
+    assert!(
+        out.contains("def __init__(self, linear: Linear = Linear(10, 5), dropout: float = 0.5)"),
+        "synthesised __init__ should carry the defaults; got:\n{out}",
+    );
+    // And the per-instance assignments remain in source order.
+    assert!(
+        out.contains("self.linear = linear"),
+        "synthesised __init__ should assign self.linear; got:\n{out}",
+    );
+    assert!(
+        out.contains("self.dropout = dropout"),
+        "synthesised __init__ should assign self.dropout; got:\n{out}",
+    );
+}
+
+#[test]
+fn plain_class_keeps_field_defaults() {
+    // The default-stripping rewrite is scoped to `class!` synthesis.
+    // A plain `class` lowers to `@dataclass(slots=True)`, where the
+    // class-level default *is* the source of the field default — it
+    // must not be stripped.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "class Point:\n\
+         \x20   x: float = 0.0\n\
+         \x20   y: float = 0.0\n",
+    );
+    build(tmp.path());
+    let out = std::fs::read_to_string(tmp.path().join("build/main.py")).unwrap();
+    assert!(
+        out.contains("x: float = 0.0") && out.contains("y: float = 0.0"),
+        "plain `class` must keep class-level defaults — they feed @dataclass; got:\n{out}",
+    );
+}
+
+#[test]
+fn raw_class_without_base_keeps_field_defaults() {
+    // The synthesis only fires for `class!` with at least one
+    // positional base (something to chain `super().__init__()`
+    // through). A bare `class! Foo:` falls through without synthesis,
+    // so defaults must survive.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "class! Empty:\n\
+         \x20   value: int = 42\n",
+    );
+    build(tmp.path());
+    let out = std::fs::read_to_string(tmp.path().join("build/main.py")).unwrap();
+    assert!(
+        out.contains("value: int = 42"),
+        "`class!` without a base does not synthesise __init__, so the default must remain; got:\n{out}",
+    );
+    assert!(
+        !out.contains("def __init__"),
+        "`class!` without a base must not synthesise __init__; got:\n{out}",
+    );
+}
+
+// ── pyproject.toml bootstrap on `tyc build` ────────────────────────────────
+
+#[test]
+fn build_bootstraps_pyproject_when_missing() {
+    // `tyc build` should write a fresh pyproject.toml derived from
+    // typhon.toml when the project doesn't have one yet. This is the
+    // greenfield path — no merging, just a clean greenfield render.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(tmp.path(), "def main() -> None:\n    print(1)\n");
+    build(tmp.path());
+    let pyproject = tmp.path().join("pyproject.toml");
+    assert!(
+        pyproject.exists(),
+        "tyc build should create pyproject.toml when missing"
+    );
+    let text = std::fs::read_to_string(&pyproject).unwrap();
+    assert!(text.contains("name = \"feat\""), "{text}");
+    assert!(text.contains("requires-python"), "{text}");
+}
+
+#[test]
+fn build_preserves_user_tool_tables_in_pyproject() {
+    // The key promise of "merge-aware" bootstrap: user-owned tables
+    // like [tool.ruff] survive. If this ever regresses to a full
+    // overwrite, every downstream user with a hand-written
+    // pyproject.toml loses their config silently — which is much
+    // worse than failing loudly.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(tmp.path(), "def main() -> None:\n    print(1)\n");
+    std::fs::write(
+        tmp.path().join("pyproject.toml"),
+        "# my header\n\
+         [project]\n\
+         name = \"will-be-overwritten\"\n\
+         version = \"9.9.9\"\n\
+         authors = [{ name = \"H\" }]\n\
+         readme = \"README.md\"\n\
+         \n\
+         [tool.ruff]\n\
+         line-length = 100\n\
+         \n\
+         [tool.pytest.ini_options]\n\
+         testpaths = [\"tests\"]\n",
+    )
+    .unwrap();
+    build(tmp.path());
+    let text = std::fs::read_to_string(tmp.path().join("pyproject.toml")).unwrap();
+    // Our owned keys overwrite the user's stale values.
+    assert!(
+        text.contains("name = \"feat\""),
+        "owned `name` should be rewritten; got:\n{text}",
+    );
+    assert!(
+        !text.contains("will-be-overwritten") && !text.contains("9.9.9"),
+        "stale owned values must be gone; got:\n{text}",
+    );
+    // Header and user-managed [project] keys survive.
+    assert!(
+        text.starts_with("# my header\n"),
+        "header comment must be preserved; got:\n{text}",
+    );
+    assert!(
+        text.contains("authors") && text.contains("\"H\""),
+        "user `authors` must survive; got:\n{text}",
+    );
+    assert!(
+        text.contains("readme = \"README.md\""),
+        "user `readme` must survive; got:\n{text}",
+    );
+    // [tool.*] tables are entirely user-owned.
+    assert!(
+        text.contains("[tool.ruff]") && text.contains("line-length = 100"),
+        "[tool.ruff] must survive; got:\n{text}",
+    );
+    assert!(
+        text.contains("[tool.pytest.ini_options]") && text.contains("testpaths"),
+        "[tool.pytest.ini_options] must survive; got:\n{text}",
+    );
+}
+
+#[test]
+fn build_emits_typhon_runtime_when_only_lazy_import_used() {
+    // A module whose only runtime contact is `lazy import` must still
+    // get `build/typhon_runtime/` emitted — the lowering injects
+    // `from typhon_runtime.lazy import lazy_import as ...`, so the
+    // generated Python imports the runtime package at startup. An
+    // earlier regression matched only the bare `typhon_runtime`
+    // module name and missed dotted submodule imports, producing a
+    // build that fails at startup with `ModuleNotFoundError`.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "lazy import np = numpy\nlet arr: object = np.array([1])\n",
+    );
+    build(tmp.path());
+    assert!(
+        tmp.path().join("build/main.py").exists(),
+        "main.py must be emitted",
+    );
+    assert!(
+        tmp.path().join("build/typhon_runtime").exists(),
+        "typhon_runtime/ package must be emitted when only `lazy import` is used \
+         (the injected `from typhon_runtime.lazy import …` would fail at startup otherwise)",
+    );
+    assert!(
+        tmp.path().join("build/typhon_runtime/lazy.py").exists(),
+        "typhon_runtime/lazy.py must ship with the package",
+    );
+}
+
+#[test]
+fn build_emits_codegen_artefact_regardless_of_bootstrap_outcome() {
+    // The bootstrap step (pyproject.toml merge + `uv sync`) is
+    // best-effort: a missing `uv`, a sync failure, or a transient
+    // network error must not prevent the `.py` artefacts from
+    // landing. The promise of `tyc build` is the codegen output.
+    //
+    // This test doesn't force `uv` off PATH (doing so reliably
+    // across CI runners is fiddly — `PATH=""` breaks coreutils,
+    // and overriding HOME/XDG_BIN can leak); it asserts the
+    // baseline guarantee on whatever state the runner has. The
+    // warning path itself is covered by the `run_uv_sync_warning`
+    // implementation: missing uv → warning, sync failure →
+    // warning, never a non-zero exit.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(tmp.path(), "def main() -> None:\n    print(1)\n");
+    build(tmp.path());
+    assert!(
+        tmp.path().join("build/main.py").exists(),
+        "build artefact must be emitted even when bootstrap warns",
+    );
+}
+
 // ── ensuring CARGO_BIN_EXE is set ───────────────────────────────────────────
 
 #[test]
