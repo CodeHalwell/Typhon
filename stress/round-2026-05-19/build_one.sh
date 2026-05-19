@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 # Build and run a single .ty file under a transient project.
+# Override TYC to point at a different binary; default is the repo's release build.
 set -u
-TYC="${TYC:-/home/user/Typhon/tyc/target/release/tyc}"
+TYC="${TYC:-$(git rev-parse --show-toplevel 2>/dev/null)/tyc/target/release/tyc}"
+if [ ! -x "$TYC" ]; then
+    echo "tyc binary not found at $TYC — set TYC=... or build with 'cargo build --release' in tyc/" >&2
+    exit 1
+fi
 PY="${PYTHON:-python3.13}"
 file="$1"
 work=$(mktemp -d)
-trap "rm -rf $work" EXIT
+trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/src"
 cp "$file" "$work/src/main.ty"
 cat > "$work/typhon.toml" <<EOF

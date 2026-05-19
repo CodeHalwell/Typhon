@@ -18,10 +18,12 @@ Repro artifacts for the FINDINGS.md "2026-05-19 fresh round" section
 - `build_one.sh` — copy FILE into a transient project, `tyc build`,
   print the emitted Python, then run it under `python3.13`.
 
-To re-run from scratch:
+The helper scripts locate `tyc` via `git rev-parse --show-toplevel` by
+default, so they work from any clone without `TYC=...` once the release
+build exists. To re-run from scratch, from the repo root:
 
 ```bash
-cargo build --release --manifest-path ../../tyc/Cargo.toml   # one-time
+cargo build --release --manifest-path tyc/Cargo.toml   # one-time
 cd stress/round-2026-05-19
 for f in cases/*.ty; do ./run_one.sh "$f"; done
 for f in cases/*.ty; do ./build_one.sh "$f"; done
