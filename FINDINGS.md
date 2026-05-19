@@ -186,6 +186,48 @@ branch.
 
 ---
 
+## Status as of `claude/resolve-open-findings-d6EIV`
+
+Picks up every remaining finding from the prior round and closes
+all of them except the Phase-5 `tyc fmt` deferral. Each fix lands
+as its own commit; `cargo test --workspace --release` stays green
+throughout.
+
+**Closed in this branch:** #37, #38, #39 (`with`/`gather`/`go`
+desugar emitting `let`), #40 (tuple targets in `for`/`with`/
+comprehensions), #41 (f-string format specs + `!r`/`!s`/`!a`
+conversions), #42 (f-string nested same-quoted strings), #43
+(`Callable[[P], R]` lowered to `Type::Function`), #44 (kwargs /
+defaults / `*args` / `**kwargs` at call sites, via new
+`ArityInfo` sidecar), #45 (Result/sealed-union covariance,
+heterogeneous container widening against an interface element,
+universal `object` super-type), #46 (generic-class instantiation
+binds type params bidirectionally + forward from kwargs), #47
+(PEP 695 syntax lowered to `TypeVar` / `Generic[T]` /
+`TypeAlias` for target < 3.12), #48 (cross-binding comptime
+scope + `comptime def` dispatch in `tyc check`), #49
+(`tyc::missing_await` enforced in sync function bodies,
+suppressed inside `asyncio.run` / `asyncio.gather` / friends),
+#50 (`tyc::manual_init` rejects `__init__` in class body), #51
+(`tyc::generator_return_type` flags `yield` in non-iterator
+return), #52 (multi-line pipe inside parens — paren-aware
+continuation join), #53 (REPL auto-print skips `print()`-style
+sinks), #54 (`extend BUILTIN:` lifted free fn annotates `self`),
+#55 (`tyc init NAME` scaffolds into `./NAME/`), #56 (examples
+suite: 20/47 → 39/47, remaining failures are example-side).
+
+Plus the unscheduled parser improvement to support `let (...) =`
+tuple destructuring and the pipe-head relaxation for bound
+methods on literal receivers (`words |> ", ".join()`).
+
+**Still open after this branch:**
+
+- **#18** `tyc fmt` is a no-op — Phase-5 deferral, still
+  unchanged. The Typhon-aware printer documented at
+  `tyc-format/src/lib.rs:17` remains future work.
+
+---
+
 ## 1. `class Foo frozen:` is a parse error (bug)
 
 **Status:** **FIXED** on `claude/update-findings-IdfrH`. Mirrored the existing
