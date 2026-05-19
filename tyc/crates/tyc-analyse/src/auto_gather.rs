@@ -325,21 +325,42 @@ fn collect_run(body: &[Stmt], start: usize, eligible: &HashSet<String>) -> Vec<C
     run
 }
 
-/// Match `name = await CALLEE(args)` where CALLEE is a bare name in
-/// `eligible`. Returns the deconstructed candidate or `None`.
+/// Match `name = await CALLEE(args)` or `name: T = await CALLEE(args)` where
+/// CALLEE is a bare name in `eligible`.  Returns the deconstructed candidate
+/// or `None`.
+///
+/// Both `Assign` (bare `a = await f()`) and `AnnAssign` (typed
+/// `let a: int = await f()`, which preprocesses to `a: int = await f()`) are
+/// recognised.  In real Typhon source, `let`-bound awaits are always
+/// `AnnAssign` after preprocessing because the user writes an explicit type
+/// annotation; omitting `parse_candidate`'s `AnnAssign` arm caused the
+/// auto-gather rewrite to silently fire zero candidates for every Typhon
+/// program.  FINDINGS #85.
 fn parse_candidate(stmt: &Stmt, eligible: &HashSet<String>) -> Option<Candidate> {
-    let assign = match stmt {
-        Stmt::Assign(a) => a,
+    // Normalise the two assignment forms into (bind_name, rhs_expr).
+    let (bind, rhs): (String, &Expr) = match stmt {
+        Stmt::Assign(a) => {
+            if a.targets.len() != 1 {
+                return None;
+            }
+            let bind = match &a.targets[0] {
+                Expr::Name(n) if matches!(n.ctx, ExprContext::Store) => n.id.as_str().to_owned(),
+                _ => return None,
+            };
+            (bind, &*a.value)
+        }
+        Stmt::AnnAssign(a) => {
+            let bind = match &*a.target {
+                Expr::Name(n) if matches!(n.ctx, ExprContext::Store) => n.id.as_str().to_owned(),
+                _ => return None,
+            };
+            let rhs = a.value.as_deref()?;
+            (bind, rhs)
+        }
         _ => return None,
     };
-    if assign.targets.len() != 1 {
-        return None;
-    }
-    let bind = match &assign.targets[0] {
-        Expr::Name(n) if matches!(n.ctx, ExprContext::Store) => n.id.as_str().to_owned(),
-        _ => return None,
-    };
-    let await_expr = match &*assign.value {
+
+    let await_expr = match rhs {
         Expr::Await(a) => a,
         _ => return None,
     };
@@ -877,6 +898,42 @@ mod tests {
         let eligible = collect_gatherable_async_fn_names(&module);
         let stats = rewrite_auto_gather(&mut module, &eligible);
         (render(&module), stats)
+    }
+
+    #[test]
+    fn annotated_let_awaits_are_folded() {
+        // FINDINGS #85: `let x: T = await f()` preprocesses to `x: T = await f()`
+        // (Stmt::AnnAssign).  The original `parse_candidate` only handled
+        // Stmt::Assign, so real Typhon programs never triggered the rewrite.
+        let src = "\
+@gatherable
+async def fetch_a() -> int:
+    return 1
+
+@gatherable
+async def fetch_b() -> int:
+    return 2
+
+async def load() -> int:
+    let a: int = await fetch_a()
+    let b: int = await fetch_b()
+    return a + b
+";
+        let (out, stats) = rewrite(src);
+        assert_eq!(stats.rewrites, 1, "expected 1 rewrite; got: {stats:?}");
+        assert_eq!(stats.awaits_folded, 2);
+        assert!(
+            out.contains("asyncio.TaskGroup"),
+            "expected TaskGroup in output:\n{out}"
+        );
+        assert!(
+            out.contains(".create_task(fetch_a())"),
+            "expected create_task(fetch_a()):\n{out}"
+        );
+        assert!(
+            out.contains(".create_task(fetch_b())"),
+            "expected create_task(fetch_b()):\n{out}"
+        );
     }
 
     #[test]

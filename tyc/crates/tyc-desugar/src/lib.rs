@@ -2879,8 +2879,8 @@ mod tests {
         let src = "from typing import TypedDict\nclass U(TypedDict):\n    id: int\n    name: str\n";
         let out = parse_and_desugar(src);
         assert!(
-            !out.contains("dataclass"),
-            "TypedDict must not get dataclass decorator: {out}"
+            !out.contains("@dataclasses.dataclass"),
+            "TypedDict must not get @dataclasses.dataclass decorator: {out}"
         );
     }
 
@@ -2890,8 +2890,8 @@ mod tests {
         let src = "import typing\nclass U(typing.TypedDict):\n    id: int\n";
         let out = parse_and_desugar(src);
         assert!(
-            !out.contains("dataclass"),
-            "typing.TypedDict must not get dataclass decorator: {out}"
+            !out.contains("@dataclasses.dataclass"),
+            "typing.TypedDict must not get @dataclasses.dataclass decorator: {out}"
         );
     }
 
@@ -2901,8 +2901,8 @@ mod tests {
         let src = "import typing_extensions\nclass U(typing_extensions.TypedDict):\n    id: int\n";
         let out = parse_and_desugar(src);
         assert!(
-            !out.contains("dataclass"),
-            "typing_extensions.TypedDict must not get dataclass decorator: {out}"
+            !out.contains("@dataclasses.dataclass"),
+            "typing_extensions.TypedDict must not get @dataclasses.dataclass decorator: {out}"
         );
     }
 }

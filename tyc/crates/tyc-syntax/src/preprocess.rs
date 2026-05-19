@@ -3310,19 +3310,6 @@ struct GatherBinding {
     expr: String,
 }
 
-/// Strip a trailing Python inline comment from `s`.
-///
-/// Delegates to [`scan_line_code_end`], which already handles single-quoted,
-/// double-quoted, and triple-quoted string literals (including `"""..."""` and
-/// `'''...'''`) as well as backslash escapes. Returns the slice up to the first
-/// `#` found **outside** a string, with any trailing whitespace trimmed. If no
-/// comment is present the original `s` is returned unchanged.
-fn strip_inline_comment(s: &str) -> &str {
-    let mut state = None;
-    let end = scan_line_code_end(s, &mut state);
-    s[..end].trim_end()
-}
-
 /// Collect indented `name = expr` bindings under a `gather:` header.
 /// Returns the bindings, the number of lines consumed (header + bindings),
 /// and the resulting triple-quoted-string state.
@@ -3350,11 +3337,17 @@ fn collect_gather_bindings(
             break;
         }
         let body = &raw[line_indent..];
-        let eq = find_assignment_eq(body)?;
-        let name = body[..eq].trim().to_owned();
-        let expr = strip_inline_comment(body[eq + 1..].trim())
-            .trim()
-            .to_owned();
+        // Use scan_line_code_end (which handles triple-quoted strings and raw
+        // strings) to find where code ends and a comment begins.  Only then
+        // run find_assignment_eq on the comment-free slice so that `=` inside
+        // a comment (e.g. `# note: x = 1`) can never be mistaken for the
+        // assignment operator.  FINDINGS #93 — hardened per review.
+        let mut snap = block_state;
+        let code_end = scan_line_code_end(body, &mut snap);
+        let code = body[..code_end].trim_end();
+        let eq = find_assignment_eq(code)?;
+        let name = code[..eq].trim().to_owned();
+        let expr = code[eq + 1..].trim().to_owned();
         if name.is_empty() || expr.is_empty() {
             return None;
         }
@@ -5678,6 +5671,56 @@ def run() -> Result[str, str]:
         assert_eq!(out, src);
     }
 
+    #[test]
+    fn gather_inline_comment_stripped_from_binding() {
+        // FINDINGS #93: a trailing comment on a gather binding was spliced
+        // into the `create_task(...)` call, closing the paren after the
+        // comment text and producing a cascade of synthetic parse errors.
+        let src = "async def f():\n    gather:\n        a = fetch_a()  # first fetch\n        b = fetch_b()  # second fetch\n";
+        let out = expand_gather_blocks(src);
+        // The comments must not appear in the lowered code at all.
+        assert!(
+            !out.contains("# first fetch"),
+            "comment leaked into lowering: {out}"
+        );
+        assert!(
+            !out.contains("# second fetch"),
+            "comment leaked into lowering: {out}"
+        );
+        // The expressions must be correct.
+        assert!(
+            out.contains(".create_task(fetch_a())"),
+            "create_task call missing or malformed: {out}"
+        );
+        assert!(
+            out.contains(".create_task(fetch_b())"),
+            "create_task call missing or malformed: {out}"
+        );
+    }
+
+    #[test]
+    fn gather_comment_with_equals_does_not_confuse_assignment_parser() {
+        // FINDINGS #93 (hardened): a comment containing `=` must not be seen
+        // by find_assignment_eq.  Previously find_assignment_eq ran on the raw
+        // body including the comment, so `# k=v` would be harmless here only
+        // by coincidence (first `=` wins).  The fix uses scan_line_code_end
+        // first so find_assignment_eq only ever sees comment-free code.
+        let src = "async def f():\n    gather:\n        a = fetch_a()  # k=v style note\n        b = fetch_b()  # result=ok\n";
+        let out = expand_gather_blocks(src);
+        assert!(
+            !out.contains("# k=v"),
+            "comment leaked into lowering: {out}"
+        );
+        assert!(
+            out.contains(".create_task(fetch_a())"),
+            "create_task(fetch_a()) missing: {out}"
+        );
+        assert!(
+            out.contains(".create_task(fetch_b())"),
+            "create_task(fetch_b()) missing: {out}"
+        );
+    }
+
     // ── go spawn ─────────────────────────────────────────────────────────────
 
     #[test]
@@ -5898,19 +5941,5 @@ string content
             out.contains(r#"create_task(get("""a#b"""))"#),
             "triple-quoted # must not be stripped: {out}"
         );
-    }
-
-    #[test]
-    fn strip_inline_comment_trims_comment() {
-        assert_eq!(strip_inline_comment("fetch()  # note"), "fetch()");
-        assert_eq!(strip_inline_comment("fetch()"), "fetch()");
-    }
-
-    #[test]
-    fn strip_inline_comment_preserves_hash_in_string() {
-        assert_eq!(strip_inline_comment(r#""a#b""#), r#""a#b""#);
-        assert_eq!(strip_inline_comment(r#"'a#b'"#), r#"'a#b'"#);
-        assert_eq!(strip_inline_comment(r#""""a#b""""#), r#""""a#b""""#);
-        assert_eq!(strip_inline_comment("'''a#b'''"), "'''a#b'''");
     }
 }
