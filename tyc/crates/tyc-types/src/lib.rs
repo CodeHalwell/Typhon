@@ -1752,6 +1752,31 @@ impl<'a> Checker<'a> {
         ));
     }
 
+    /// Emit `tyc::unknown_kwarg` (FINDINGS #80). `suggestion` is the
+    /// fully-formatted help string — either "did you mean `<x>`?" or a
+    /// list of accepted parameter names.
+    fn unknown_kwarg(
+        &mut self,
+        fn_name: &str,
+        kwarg: &str,
+        suggestion: String,
+        span: (usize, usize),
+    ) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
+        let length = span.1.saturating_sub(span.0).max(1);
+        self.diagnostics.push_error(TycError::unknown_kwarg(
+            fn_name,
+            kwarg,
+            suggestion,
+            &self.path,
+            self.source,
+            span.0,
+            length,
+        ));
+    }
+
     fn not_callable(&mut self, typ: &Type, span: (usize, usize)) {
         if self.unsafe_depth > 0 {
             return;
@@ -2533,16 +2558,95 @@ fn function_signature(
     }
 }
 
+/// Build the `help:` string for a `tyc::unknown_kwarg` diagnostic
+/// (FINDINGS #80). If any candidate is "close enough" by character-level
+/// edit distance, suggest it; otherwise list every accepted parameter
+/// name so users see what's available.
+fn suggest_candidate(typo: &str, candidates: &[String]) -> String {
+    let best = candidates
+        .iter()
+        .filter_map(|c| {
+            let d = levenshtein(typo, c);
+            // Threshold: at most one third of the longer name, capped at 3.
+            let max_d = (typo.len().max(c.len()) / 3).max(1).min(3);
+            if d <= max_d {
+                Some((d, c.as_str()))
+            } else {
+                None
+            }
+        })
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, name)| name);
+    match best {
+        Some(c) => format!("did you mean `{c}`?"),
+        None if candidates.is_empty() => "this function takes no keyword arguments".to_string(),
+        None => {
+            let names: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
+            format!("accepted parameters: {}", names.join(", "))
+        }
+    }
+}
+
+/// Plain Levenshtein edit distance over byte-level characters. Adequate
+/// for the short identifier strings used by `suggest_candidate`.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr: Vec<usize> = vec![0; b.len() + 1];
+    for i in 1..=a.len() {
+        curr[0] = i;
+        for j in 1..=b.len() {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1)
+                .min(curr[j - 1] + 1)
+                .min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+/// Outcome of an arity check against a function's [`ArityInfo`]. The
+/// specific failure mode is preserved so the caller can pick the right
+/// diagnostic — e.g. `UnknownKwarg` produces a friendlier
+/// `tyc::unknown_kwarg` instead of an arg-count miscount (FINDINGS #80).
+#[derive(Debug)]
+enum ArityCheck {
+    Ok,
+    /// A keyword argument was passed whose name doesn't match any
+    /// parameter (and the function doesn't have `**kwargs`).
+    UnknownKwarg {
+        /// The offending kwarg name (e.g. `"greetinx"`).
+        name: String,
+        /// All parameter names accepted by the function. Used to suggest
+        /// the closest match in the diagnostic.
+        candidates: Vec<String>,
+        /// The kw arg's source position.
+        span: (usize, usize),
+    },
+    /// Any other arity failure (count mismatch, double-bound name,
+    /// missing required, etc.). Falls back to `tyc::arg_count`.
+    Other,
+}
+
 /// Decide whether a call site's positional + keyword arguments are
-/// compatible with the named function's [`ArityInfo`]. Returns `true`
-/// for an OK call, `false` for an arity mismatch — the caller emits
-/// the diagnostic.
+/// compatible with the named function's [`ArityInfo`]. Returns
+/// [`ArityCheck::Ok`] for a sound call, or the specific failure mode
+/// otherwise — the caller picks the right diagnostic.
 ///
 /// Rules:
 /// 1. Every kw argument must either match a parameter name (positional
-///    or kw-only), or be absorbed by `**kwargs`. Mismatch → `false`.
+///    or kw-only), or be absorbed by `**kwargs`. Mismatch →
+///    [`ArityCheck::UnknownKwarg`].
 /// 2. A parameter can be filled by either a positional or a kw arg —
-///    not both. Conflicts → `false`.
+///    not both. Conflicts → [`ArityCheck::Other`].
 /// 3. Every required positional / kw-only param must be filled.
 /// 4. The total positional count must not exceed `max_positional`
 ///    (unless the function has `*args`, in which case `max_positional`
@@ -2551,7 +2655,7 @@ fn check_arity_with_info(
     info: &ArityInfo,
     pos_args: &[Expr],
     kw_args: &[ruff_python_ast::Keyword],
-) -> bool {
+) -> ArityCheck {
     // Filter out the `**double-star` unpacking keywords (`kw.arg == None`) — we
     // can't statically know how many keys they contain, so we treat them as
     // matching anything (kwarg sentinel).
@@ -2564,17 +2668,32 @@ fn check_arity_with_info(
     // Rule 4: positional count must fit max_positional (None → unbounded).
     if let Some(max) = info.max_positional {
         if pos_args.len() > max {
-            return false;
+            return ArityCheck::Other;
         }
     }
 
     // Rule 1: every named kw must hit a parameter (or `**kwargs`).
+    // Surface the first offender with a dedicated variant so the
+    // caller emits `tyc::unknown_kwarg` instead of a confusing
+    // `tyc::arg_count` (FINDINGS #80).
     if !info.has_kwarg {
-        for name in &named_kwargs {
+        for kw in kw_args {
+            let Some(ident) = &kw.arg else { continue };
+            let name = ident.as_str();
             let hits_pos = info.param_names.iter().any(|p| p == name);
             let hits_kwonly = info.kwonly_names.iter().any(|p| p == name);
             if !hits_pos && !hits_kwonly {
-                return false;
+                let mut candidates = info.param_names.clone();
+                candidates.extend(info.kwonly_names.iter().cloned());
+                let span = (
+                    ident.range.start().to_usize(),
+                    ident.range.start().to_usize() + name.len(),
+                );
+                return ArityCheck::UnknownKwarg {
+                    name: name.to_owned(),
+                    candidates,
+                    span,
+                };
             }
         }
     }
@@ -2586,7 +2705,7 @@ fn check_arity_with_info(
             .iter()
             .any(|p| p == name)
         {
-            return false;
+            return ArityCheck::Other;
         }
     }
 
@@ -2606,16 +2725,16 @@ fn check_arity_with_info(
             if named_kwargs.iter().any(|kw| kw == p) {
                 continue;
             }
-            return false;
+            return ArityCheck::Other;
         }
         // Rule 3b: every required kw-only must be filled.
         for required in &info.kwonly_required {
             if !named_kwargs.iter().any(|kw| kw == required) {
-                return false;
+                return ArityCheck::Other;
             }
         }
     }
-    true
+    ArityCheck::Ok
 }
 
 /// Compute the [`ArityInfo`] sidecar for a `def`'s parameter list.
@@ -3129,7 +3248,7 @@ fn check_function(
         ));
     }
 
-    let saved_return = c.current_return.replace(ret_type);
+    let saved_return = c.current_return.replace(ret_type.clone());
     // Track sync-vs-async for the body's call-site check
     // (`tyc::missing_await` — FINDINGS #49). Only sync function bodies
     // trip the diagnostic; async bodies use `await` naturally and
@@ -3210,10 +3329,76 @@ fn check_function(
         check_stmt(c, stmt);
     }
 
+    // Missing-return analysis (FINDINGS #82): when the declared return
+    // type cannot accommodate `None` and the body is not a generator
+    // (yield → iterator), every path through the function must end in
+    // `return` / `raise`. Auto-synthesised compiler helpers are exempt
+    // for the same reason as Rule 1 / Rule 4. Stub bodies (`...` /
+    // `pass` / docstring-only) are also exempt because that's the
+    // canonical shape for `interface` (Protocol) methods and abstract
+    // base-class declarations — both legitimately "don't return".
+    if !name.starts_with("__typhon_")
+        && returns.is_some()
+        && return_type_requires_value(&ret_type)
+        && !body_has_yield(body)
+        && !body_is_stub(body)
+        && !body_always_exits(body)
+    {
+        c.diagnostics.push_error(TycError::missing_return(
+            name,
+            ret_type.display(),
+            c.path.clone(),
+            c.source,
+            name_span_offset,
+            name_span_len,
+        ));
+    }
+
     c.env.leave();
     c.current_return = saved_return;
     c.active_typevar_bounds = saved_bounds;
     c.in_sync_function = saved_in_sync;
+}
+
+/// True when `body` is a stub — `...`, `pass`, or a single docstring
+/// followed by one of those. Used to exempt `interface` (Protocol)
+/// method declarations and abstract base-class methods from the
+/// missing-return check (FINDINGS #82).
+fn body_is_stub(body: &[Stmt]) -> bool {
+    let stmts: Vec<&Stmt> = body
+        .iter()
+        .filter(|s| !is_docstring_stmt(s))
+        .collect();
+    match stmts.as_slice() {
+        [Stmt::Pass(_)] => true,
+        [Stmt::Expr(e)] => matches!(e.value.as_ref(), Expr::EllipsisLiteral(_)),
+        [] => true, // body was nothing but docstrings
+        _ => false,
+    }
+}
+
+/// True when this statement is a bare string-literal expression — the
+/// canonical "docstring" shape that lives at the top of a function /
+/// class body.
+fn is_docstring_stmt(stmt: &Stmt) -> bool {
+    matches!(
+        stmt,
+        Stmt::Expr(e) if matches!(e.value.as_ref(), Expr::StringLiteral(_))
+    )
+}
+
+/// True when the declared return type can NOT silently accept a missing
+/// `return` (i.e. the implicit `return None` Python uses to fall off the
+/// end of a function). Anything that includes `None` in its surface
+/// (literal `None`, `T?` / `T | None`, the bare `Unknown` for unannotated
+/// returns, or `Type::Any`) is exempt — those are the cases where falling
+/// off the end is a legal value.
+fn return_type_requires_value(t: &Type) -> bool {
+    match t {
+        Type::Unknown | Type::Any | Type::None => false,
+        Type::Union(variants) => !variants.iter().any(|v| matches!(v, Type::None)),
+        _ => true,
+    }
 }
 
 fn check_if(c: &mut Checker, i: &ruff_python_ast::StmtIf) {
@@ -3291,8 +3476,26 @@ fn stmt_always_exits(stmt: &Stmt) -> bool {
         Stmt::If(s) => {
             body_always_exits(&s.body) && elif_else_chain_always_exits(&s.elif_else_clauses)
         }
+        // A `match` statement where every arm body exits, including a
+        // wildcard / capturing fallback that handles unmatched values,
+        // is itself an exit. Exhaustive sealed-union matches already
+        // have a `case _:` arm (the exhaustiveness pass would have
+        // rejected non-exhaustive ones), so this matches the user's
+        // intuition that a covered match doesn't fall through.
+        Stmt::Match(m) => match_arms_always_exit(&m.cases),
         _ => false,
     }
+}
+
+/// True when a `match` statement's arms each end in an unconditional
+/// exit. Exhaustiveness over sealed unions is enforced separately by
+/// `tyc::non_exhaustive_match`, so this only checks the arms' bodies —
+/// a non-exhaustive sealed match would have been rejected before
+/// missing-return analysis ran. Open-typed subjects (`int`, `Any`, …)
+/// where every arm exits are also treated as exiting, matching the
+/// shape that mypy / pyright accept.
+fn match_arms_always_exit(cases: &[ruff_python_ast::MatchCase]) -> bool {
+    !cases.is_empty() && cases.iter().all(|c| body_always_exits(&c.body))
 }
 
 /// Recursively check the `elif`/`else` cascade of a [`StmtIf`].  Each
@@ -3721,7 +3924,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         .as_deref()
                         .and_then(|n| c.function_arity_info.get(n))
                         .cloned();
-                    let count_ok = if let Some(info) = arity_info.as_ref() {
+                    let arity_outcome = if let Some(info) = arity_info.as_ref() {
                         check_arity_with_info(info, pos_args, kw_args)
                     } else {
                         // No name-keyed arity info — this is a method
@@ -3733,15 +3936,32 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         // cover the rest), and require ≥ params.len()
                         // when the function is variadic.
                         let total = pos_args.len() + kw_args.len();
-                        if variadic {
+                        let ok = if variadic {
                             total >= params.len()
                         } else {
                             total <= params.len()
-                        }
+                        };
+                        if ok { ArityCheck::Ok } else { ArityCheck::Other }
                     };
-                    if !count_ok {
-                        let name = fn_name.clone().unwrap_or_else(|| "<call>".to_owned());
-                        c.wrong_args(&name, params.len(), pos_args.len(), call_span);
+                    match arity_outcome {
+                        ArityCheck::Ok => {}
+                        ArityCheck::UnknownKwarg {
+                            name,
+                            candidates,
+                            span,
+                        } => {
+                            // FINDINGS #80: a typo'd kwarg surfaces a
+                            // dedicated `tyc::unknown_kwarg` with the
+                            // closest candidate, not an arg-count miscount.
+                            let suggestion = suggest_candidate(&name, &candidates);
+                            let fn_label =
+                                fn_name.clone().unwrap_or_else(|| "<call>".to_owned());
+                            c.unknown_kwarg(&fn_label, &name, suggestion, span);
+                        }
+                        ArityCheck::Other => {
+                            let name = fn_name.clone().unwrap_or_else(|| "<call>".to_owned());
+                            c.wrong_args(&name, params.len(), pos_args.len(), call_span);
+                        }
                     }
                     // Argument type checks (per-pair, ignoring excess).
                     // Each argument is inferred with the corresponding
@@ -4652,6 +4872,191 @@ let r: int = add(1)
         assert!(d.has_errors());
         let msg = format!("{}", d.errors()[0]);
         assert!(msg.contains("wrong number of arguments"), "got {}", msg);
+    }
+
+    // ── FINDINGS #82: missing-return analysis ─────────────────────────
+
+    #[test]
+    fn missing_return_on_some_paths_errors() {
+        let src = "\
+def maybe_int(x: int) -> int:
+    if x > 0:
+        return x
+";
+        let d = check(src);
+        assert!(d.has_errors(), "expected missing-return diagnostic");
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "expected MissingReturn variant, got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn return_on_every_path_is_clean() {
+        let src = "\
+def f(x: int) -> int:
+    if x > 0:
+        return x
+    return 0
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "every-path return must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn void_function_without_return_is_clean() {
+        let src = "\
+def f() -> None:
+    print(1)
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "void function must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn nullable_return_without_explicit_none_is_clean() {
+        // Declared `int | None`: falling off the end yields `None`,
+        // which is a legal value for the declared type.
+        let src = "\
+def f(x: int) -> int | None:
+    if x > 0:
+        return x
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "T | None must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn interface_stub_body_is_clean() {
+        // Protocol / interface method declarations end in `...` —
+        // missing_return must not fire on a stub body.
+        let src = "\
+interface Drawable:
+    def area(self) -> float:
+        ...
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "interface stub must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn raise_on_fallthrough_is_clean() {
+        // A function that always raises on every path satisfies the
+        // missing-return analysis even without a `return`.
+        let src = "\
+def fail() -> int:
+    raise ValueError(\"x\")
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "raise must satisfy missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    // ── FINDINGS #80: typo'd kwarg surfaces tyc::unknown_kwarg ────────
+
+    #[test]
+    fn typo_kwarg_emits_unknown_kwarg_with_suggestion() {
+        let src = "\
+def greet(name: str, greeting: str = \"Hello\") -> str:
+    return greeting + \", \" + name
+
+let r: str = greet(\"Amy\", greetinx=\"Hi\")
+";
+        let d = check(src);
+        assert!(d.has_errors());
+        let err = d
+            .errors()
+            .iter()
+            .find(|e| matches!(e, TycError::UnknownKwarg { .. }))
+            .expect("expected UnknownKwarg variant");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("greetinx") && msg.contains("greet"),
+            "headline should name kwarg and function; got: {msg}"
+        );
+        // The suggestion should pick up the close match `greeting`.
+        if let TycError::UnknownKwarg { suggestion, .. } = err {
+            assert!(
+                suggestion.contains("greeting"),
+                "suggestion should propose `greeting`; got: {suggestion}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_kwarg_lists_candidates_when_no_close_match() {
+        // Random kwarg that's nowhere near any parameter should fall
+        // back to listing every accepted parameter name.
+        let src = "\
+def greet(name: str, greeting: str = \"Hello\") -> str:
+    return greeting + \", \" + name
+
+let r: str = greet(\"Amy\", xyzzy=\"Hi\")
+";
+        let d = check(src);
+        let err = d
+            .errors()
+            .iter()
+            .find(|e| matches!(e, TycError::UnknownKwarg { .. }))
+            .expect("expected UnknownKwarg variant");
+        if let TycError::UnknownKwarg { suggestion, .. } = err {
+            assert!(
+                suggestion.contains("name") && suggestion.contains("greeting"),
+                "suggestion should list accepted params; got: {suggestion}"
+            );
+        }
+    }
+
+    #[test]
+    fn function_with_double_star_kwarg_accepts_arbitrary_names() {
+        // Functions declared with `**kwargs` should never emit
+        // unknown_kwarg — anything is legal.
+        let src = "\
+def greet(name: str, **extras: str) -> str:
+    return name
+
+let r: str = greet(\"Amy\", weird_name=\"Hi\", another=\"x\")
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UnknownKwarg { .. })),
+            "**kwargs must absorb arbitrary names; got {:?}",
+            d.errors()
+        );
     }
 
     #[test]

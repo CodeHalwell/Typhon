@@ -3444,6 +3444,19 @@ Repro: `stress/tests/83_multiple_files.ty`.
 
 ## 80. Wrong kwarg name surfaces as "expected N, got N-1" (papercut)
 
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. Added
+`tyc::unknown_kwarg` to `tyc-diagnostics`; the arity-check path in
+`tyc-types` (`check_arity_with_info`) now returns a structured
+`ArityCheck::UnknownKwarg { name, candidates, span }` variant when
+the failure is specifically a typo'd kwarg, and the caller routes
+that into the new diagnostic with a Levenshtein-best
+"did you mean `<x>`?" suggestion (or a fallback that lists every
+accepted parameter name). The plain count/conflict failures still
+fall back to `tyc::arg_count`. Regression tests
+`typo_kwarg_emits_unknown_kwarg_with_suggestion`,
+`unknown_kwarg_lists_candidates_when_no_close_match`, and
+`function_with_double_star_kwarg_accepts_arbitrary_names`.
+
 **Severity:** papercut — typoed keyword arguments produce a confusing
 `arg_count` mismatch instead of a clear unknown-kwarg diagnostic.
 
@@ -3492,6 +3505,26 @@ Repro: `stress/tests/78_circular_alias.ty`.
 ---
 
 ## 82. Non-returning branch on a non-None-return function accepted (gap)
+
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. Added
+`tyc::missing_return` to `tyc-diagnostics`; `check_function` in
+`tyc-types` now runs a missing-return pass at end-of-body: when the
+declared return type can't accept `None` (i.e. anything other than
+`None`, `T?`, `T | None`, `Any`, `Unknown`) and the body neither
+yields (generator) nor always exits, the diagnostic fires. The
+existing `body_always_exits` machinery covers `return` / `raise` /
+nested if-else exhaustion; the new `match_arms_always_exit` helper
+extends that to `match` statements whose every arm body exits
+(sealed-union exhaustiveness is still checked by the separate
+`tyc::non_exhaustive_match` pass, so the two compose correctly).
+Stub bodies — `pass`, `...`, or a single docstring — are exempt so
+`interface` (Protocol) method declarations stay clean. Six
+regression tests in `tyc-types`
+(`missing_return_on_some_paths_errors`,
+`return_on_every_path_is_clean`,
+`void_function_without_return_is_clean`,
+`nullable_return_without_explicit_none_is_clean`,
+`interface_stub_body_is_clean`, `raise_on_fallthrough_is_clean`).
 
 **Severity:** gap — a function declared `-> int` with a path that doesn't
 return should error.

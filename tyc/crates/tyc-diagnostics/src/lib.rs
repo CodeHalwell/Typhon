@@ -121,6 +121,43 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A call site passed a keyword argument whose name doesn't match
+    /// any of the callee's parameters (positional or keyword-only) and
+    /// the callee has no `**kwargs`. Distinct from `tyc::arg_count`
+    /// because the user's mistake is a typo, not a count error.
+    #[error("unknown keyword argument '{kwarg}' to `{fn_name}`")]
+    #[diagnostic(code(tyc::unknown_kwarg))]
+    UnknownKwarg {
+        fn_name: String,
+        kwarg: String,
+        /// Pre-formatted help string. When a similar parameter name was
+        /// found this reads "did you mean `<candidate>`?"; otherwise it
+        /// lists every accepted parameter name.
+        #[help]
+        suggestion: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("not a parameter of `{fn_name}`")]
+        span: SourceSpan,
+    },
+
+    /// A function declared with a non-`None` return type has at least
+    /// one execution path that reaches the end of the body without
+    /// `return` / `raise`. Equivalent to mypy's `missing-return`.
+    #[error("function `{fn_name}` is missing a return on some paths (declared `-> {ret_type}`)")]
+    #[diagnostic(
+        code(tyc::missing_return),
+        help("Add an explicit `return <{ret_type}>` (or `raise`) on every path, or widen the return type to `{ret_type} | None` / `None` if the function intentionally returns nothing.")
+    )]
+    MissingReturn {
+        fn_name: String,
+        ret_type: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("this function may fall off the end without a return value")]
+        span: SourceSpan,
+    },
+
     /// A value of one type was used where another type was expected.
     #[error("type mismatch: expected `{expected}`, found `{actual}`")]
     #[diagnostic(
@@ -701,6 +738,45 @@ impl TycError {
         Self::TypingAliasDeprecated {
             name: name.into(),
             lower: lower.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::UnknownKwarg`] diagnostic. `suggestion`
+    /// should be a complete help message — typically either "did you
+    /// mean `<candidate>`?" (when a close match exists) or a listing
+    /// of every accepted parameter name.
+    pub fn unknown_kwarg(
+        fn_name: impl Into<String>,
+        kwarg: impl Into<String>,
+        suggestion: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::UnknownKwarg {
+            fn_name: fn_name.into(),
+            kwarg: kwarg.into(),
+            suggestion: suggestion.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::MissingReturn`] diagnostic.
+    pub fn missing_return(
+        fn_name: impl Into<String>,
+        ret_type: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::MissingReturn {
+            fn_name: fn_name.into(),
+            ret_type: ret_type.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }
