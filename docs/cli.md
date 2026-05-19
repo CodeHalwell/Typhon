@@ -71,7 +71,7 @@ Converts typed Python (`.py`) to Typhon (`.ty`) in one pass:
 
 - `Optional[T]` / `T | None` → `T?`
 - Module-level annotated assignments (`x: int = 1`) gain `let` (or `mut` when later reassigned).
-- Function-body plain assignments (`user = find_user(1)`, `total = 0`) gain `let` on first occurrence in the scope, promoted to `mut` when the same name is reassigned later in the same function. Subsequent assignments to the same name in the same scope are left bare (correct re-binding). Class-body annotated assignments are left untouched — those are field declarations, not locals.
+- Function-body plain assignments (`user = find_user(1)`, `total = 0`) gain `let` on first occurrence per function, promoted to `mut` if the same name is reassigned anywhere else in the file (the reassignment flag is file-wide, so an accumulator named `total` in one function will also tag a one-shot `total = 0` in another function as `mut` — a deliberate over-approximation, since `mut` on an unmutated binding still type-checks). Subsequent assignments to the same name in the same scope are left bare (correct re-binding). Class-body annotated assignments are left untouched — those are field declarations, not locals.
 - `@dataclass` decorators and their `from dataclasses import dataclass` are dropped.
 
 The output is designed to pass `tyc check` cleanly out of the box; accumulators / counters surfaced as `mut` are worth a manual review when porting larger codebases.

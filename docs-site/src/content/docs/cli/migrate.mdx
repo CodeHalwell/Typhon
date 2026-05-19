@@ -16,7 +16,9 @@ Converts typed Python (`.py`) to Typhon (`.ty`) in one pass. Used to bootstrap a
 - **`Optional[T]` / `T | None`** → **`T?`** in annotation positions.
 - **`@dataclass` decorators** and their `from dataclasses import dataclass` are dropped (Typhon classes emit as dataclasses by default).
 - **Module-level annotated assignments** (`x: int = 1`) gain `let` (or `mut` if reassigned later in the same module).
-- **Function-body plain assignments** (`user = find_user(1)`, `total = 0`) gain `let` on the first occurrence of each name per function, promoted to `mut` when the same name is reassigned later in the same scope. Subsequent assignments to a name already bound in the same scope are left bare (a correct re-binding). Class-body annotated assignments are left alone — those are field declarations, not locals.
+- **Function-body plain assignments** (`user = find_user(1)`, `total = 0`) gain `let` on the first occurrence of each name per function. If the same name is reassigned anywhere else in the file (in this function or another), the first occurrence is promoted to `mut` instead. Subsequent assignments to a name already bound in the same scope are left bare (a correct re-binding). Class-body annotated assignments are left alone — those are field declarations, not locals.
+
+  The reassignment flag is file-wide (a single set, not per-function), so a `total = total + 1` accumulator in one function will also tag a one-shot `total = 0` in an unrelated function as `mut`. That's a deliberate over-approximation — `mut` of an unmutated binding still type-checks, whereas the inverse (`let` on a counter) would not. If the spurious `mut` bothers you, rename the unmutated local.
 - **`from typing import TypeVar` plus `T = TypeVar("T")`** scaffolding is dropped; generic functions become PEP 695 form.
 
 Migrated output is intended to pass `tyc check` on first try.
