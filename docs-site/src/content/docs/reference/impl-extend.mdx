@@ -63,11 +63,11 @@ impl User:
     def hi(self) -> str:        # ✅
         return f"hi, {self.name}"
 
-    def hi() -> str:             # ❌ tyc::missing_self
-        ...
+    def hi() -> str:             # also accepted — `self` is auto-injected
+        return "hello"
 ```
 
-The `self` parameter is required. Earlier docs suggested an implicit-`self` form (bare `name` resolving to `self.name`); that was never implemented because the resolver can't see the enclosing class's fields at name-resolution time. Use explicit `self.NAME`.
+The desugar pass injects `self` (or `cls` for `@classmethod` methods) as the first parameter if you omit it, so both forms emit identical Python. Convention is to write `self` explicitly — it documents the receiver and matches how the method body reads. Earlier docs suggested an implicit-`self` body form (bare `name` resolving to `self.name`); that is **not** implemented — the body must use `self.NAME` explicitly.
 
 ### Generic classes
 

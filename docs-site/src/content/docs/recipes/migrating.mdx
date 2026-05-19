@@ -33,7 +33,7 @@ Migrate leaves first (small utility modules with no inbound deps) → up through
 
    - `tyc::missing_binding_kind` — add `let` (default) or `mut` (if rebound).
    - `tyc::nullable_use` — narrow before use.
-   - `tyc::missing_return_type` — annotate.
+   - `tyc::missing_annotation` — annotate.
 
 4. **Run the test suite.** It exercises the emitted `.py`; if tests pass against the migrated `.ty`, you're good.
 

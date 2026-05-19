@@ -7,46 +7,25 @@ sidebar:
 
 Diagnostics in the `tyc::*` namespace related to type checking and inference.
 
-## `tyc::missing_return_type`
+## `tyc::missing_annotation`
 
-The function has no `-> T` annotation.
-
-```python
-def add(a: int, b: int):    # ❌
-    return a + b
-```
-
-**Fix:** add the return type. Use `-> None` for void.
+A function parameter or return type is missing its annotation — Rule 1 of the Typhon language: every parameter and return type is annotated.
 
 ```python
-def add(a: int, b: int) -> int:
-    return a + b
+def add(a, b: int) -> int: ...    # ❌ parameter `a` has no annotation
+def greet(name: str):             # ❌ no return type
+    print(name)
 ```
 
-## `tyc::missing_param_type`
-
-A parameter has no annotation.
+**Fix:** annotate every parameter and every return type. For a function that returns nothing, write `-> None`.
 
 ```python
-def add(a, b: int) -> int: ...    # ❌
+def add(a: int, b: int) -> int: ...
+def greet(name: str) -> None:
+    print(name)
 ```
 
-**Fix:** annotate every parameter.
-
-## `tyc::implicit_any`
-
-The RHS infers to `Any` outside an `unsafe:` block.
-
-```python
-import messy
-let data = messy.fetch()    # ❌
-```
-
-**Fix:**
-
-1. Annotate explicitly: `let data: dict[str, int] = ...`
-2. Wrap in `unsafe:` block.
-3. Write a [`.dty` stub](/Typhon/interop/dty-stubs/) for the library.
+This single diagnostic covers both missing-parameter-types and missing-return-types — Typhon does not separate them today.
 
 ## `tyc::type_mismatch`
 
@@ -58,9 +37,9 @@ let x: int = "hello"    # ❌
 
 **Fix:** change the value, the annotation, or convert explicitly (`int("...")`).
 
-## `tyc::wrong_arg_count`
+## `tyc::arg_count`
 
-Call site has too few or too many arguments.
+A call site has too few or too many arguments.
 
 ```python
 def add(a: int, b: int) -> int: ...
@@ -92,35 +71,97 @@ def f() -> None:
 
 **Fix:** define or import the name. Check for typos.
 
-## `tyc::missing_return`
+## `tyc::attribute_not_found`
 
-A function may exit without returning a value of the declared type.
-
-```python
-def f(c: bool) -> int:
-    if c:
-        return 1
-    # ❌ falls through without returning
-```
-
-**Fix:** add a `return` on the missing path, or make the type nullable (`-> int?`).
-
-## `tyc::generic_unconstrained`
-
-A generic call cannot infer `T`.
+An attribute is accessed on a value whose static type doesn't expose it.
 
 ```python
-let xs = first([])    # ❌ T unconstrained
+class User:
+    name: str
+
+def f(u: User) -> str:
+    return u.email    # ❌ no attribute `email` on `User`
 ```
 
-**Fix:** annotate the call: `first[int]([])` or annotate the target: `let xs: int? = first([])`.
+**Fix:** add the field (or method) to the class, fix the typo, or widen the type.
+
+## `tyc::generic`
+
+Generic catch-all used during early-phase type checking. The message text describes the specific problem — typically a generic-instantiation failure, an unresolved TypeVar, or a constraint conflict.
+
+```python
+def first[T](xs: list[T]) -> T?: ...
+
+let xs = first([])    # ❌ tyc::generic — cannot infer T from an empty list
+```
+
+**Fix:** annotate the call (`first[int]([])`), annotate the target (`let xs: int? = first([])`), or feed the function a non-empty input the inference can latch onto.
+
+## `tyc::typevar_bound`
+
+A type argument at a call site doesn't satisfy its TypeVar's declared bound.
+
+```python
+def largest[T: Comparable](xs: list[T]) -> T: ...
+
+class Widget: ...                      # not Comparable
+let w = largest([Widget(), Widget()])  # ❌ Widget does not satisfy `Comparable`
+```
+
+**Fix:** pass values whose type is a subtype of the bound, or widen the bound on the declaration.
+
+## `tyc::generator_return_type`
+
+A function uses `yield` (or `yield from`) but its declared return type isn't iterator-shaped. The function returns a generator object at runtime, so the annotation is wrong.
+
+```python
+def odds(n: int) -> list[int]:    # ❌ contains `yield`, so returns a generator
+    for i in range(n):
+        if i % 2:
+            yield i
+```
+
+**Fix:** annotate as `Iterator[T]` / `Generator[T, S, R]` (or `AsyncIterator[T]` / `AsyncGenerator[T, S]` for `async def`).
+
+```python
+from collections.abc import Iterator
+
+def odds(n: int) -> Iterator[int]:
+    for i in range(n):
+        if i % 2:
+            yield i
+```
+
+## `tyc::cyclic_type_alias`
+
+A `type` alias chain forms a cycle:
+
+```python
+type A = B
+type B = A    # ❌ no concrete type at the bottom
+```
+
+**Fix:** point at least one alias in the cycle at a concrete type, or remove one of the declarations.
+
+## `tyc::comptime`
+
+A `comptime` binding could not be evaluated at build time. The message text names the binding and explains the specific failure (e.g. unsupported expression, missing required env var, fell-through control flow).
+
+```python
+comptime let PORT: int = int(env("PORT"))    # ❌ if PORT is not declared in [env].required
+```
+
+**Fix:** declare the env var in `[env] required`, supply a default via `env("NAME", "fallback")`, or simplify the expression to a comptime-supported form (literals, arithmetic, `env(...)`, `int()` / `str()` / `float()`).
 
 ## Suppressed inside `unsafe:`
 
-Most of these (except `missing_return_type`, `missing_param_type`, `unknown_name`) are suppressed inside an `unsafe:` block. See [The Unsafe Boundary](/Typhon/types/unsafe/).
+Most type-checking diagnostics are suppressed inside an `unsafe:` block — the type checker tracks an `unsafe_depth` and stops emitting errors while it is greater than zero. Boundary checks at assignment sites *outside* the block still apply. See [The Unsafe Boundary](/Typhon/types/unsafe/).
+
+`tyc::missing_annotation` is not suppressed: it is a structural rule about the function declaration, not a typing decision at a use site.
 
 ## Where next
 
-- [Binding Errors](/Typhon/diagnostics/binding-errors/) — `missing_binding_kind`, `immutable_assign`.
+- [Binding Errors](/Typhon/diagnostics/binding-errors/) — `missing_binding_kind`, `immutable_assign`, `unused_import`.
 - [Nullability Errors](/Typhon/diagnostics/nullability/) — `nullable_use`.
+- [Class Errors](/Typhon/diagnostics/class-errors/) — `duplicate_class`, `impl_unknown_class`, `manual_init`.
 - [Reading Diagnostics](/Typhon/diagnostics/reading/) — the format.

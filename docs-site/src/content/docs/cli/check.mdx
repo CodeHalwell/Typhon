@@ -45,10 +45,9 @@ Useful as a CI gate when you ship `.dty` stubs.
 
 | Flag | Effect |
 |------|--------|
-| `--stubs` | Also diff `.dty` stubs against runtime modules. |
-| `--watch` | Re-run on file changes (debounced). |
-| `--quiet` | Suppress the "no diagnostics" line. |
-| `--manifest PATH` | Use a specific `typhon.toml`. |
+| `--stubs` | Also diff every `.dty` stub against its sibling `.ty` / `.py` implementation. |
+
+`tyc check` walks up from the first checked path looking for `typhon.toml`. To target a different project, pass an explicit path: `tyc check path/to/project`.
 
 ## Exit codes
 

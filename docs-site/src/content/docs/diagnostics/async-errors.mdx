@@ -37,6 +37,32 @@ async def helper() -> int:
 
 **Fix:** drop `async`, or actually `await` something. Don't suppress — it's almost always a mistake.
 
+## `tyc::auto_gather_missed` (advice)
+
+Two or more adjacent `await CALLEE(...)` statements look independent enough to fold into an `asyncio.TaskGroup` block, but at least one callee is a same-module `async def` that lacks the `@gatherable` decorator. The auto-gather pass only rewrites runs where every callee carries `@gatherable`; without it, the awaits stay sequential silently. This advice-level diagnostic surfaces the missed opportunity so users can decide whether to decorate.
+
+Only fires when [`[strictness] auto-gather = true`](/Typhon/configuration/strictness/).
+
+```python
+async def a() -> int: ...
+
+@gatherable
+async def b() -> int: ...
+
+async def main() -> None:
+    let x: int = await a()    # 💡 tyc::auto_gather_missed — `a` is not @gatherable
+    let y: int = await b()
+```
+
+**Fix:** decorate `a` (and any other same-module async callees in the run) with `@gatherable` to fold the awaits into an `asyncio.TaskGroup` automatically:
+
+```python
+@gatherable
+async def a() -> int: ...
+```
+
+Externally-imported async callees are never rewritten — opting a project into `auto-gather` does not surprise callers that aren't ready to run concurrently.
+
 ## `tyc::interface_isinstance`
 
 `isinstance(x, MyInterface)`:

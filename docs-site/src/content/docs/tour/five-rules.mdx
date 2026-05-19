@@ -17,16 +17,17 @@ There is no inference fallback for missing annotations. `-> None` is mandatory f
 def add(a: int, b: int) -> int:    # ✅
     return a + b
 
-def add(a, b):                     # ❌ tyc::missing_return_type / implicit Any
+def add(a, b):                     # ❌ tyc::missing_annotation — both params and return
     return a + b
 ```
 
 ```
-error[tyc::missing_return_type]: function `add` is missing a return type
- ┌─ src/main.ty:1:5
+error[tyc::missing_annotation]: `parameter a` on `add` is missing a type annotation
+ ┌─ src/main.ty:1:9
  │
 1 │ def add(a, b):
- │     ^^^ add `-> int` (or another type) here
+ │         ^ annotation required here
+ = help: Typhon's Rule 1: annotate every parameter and return type. For a function that returns nothing, write `-> None`.
 ```
 
 This is enforced by `[strictness] no-implicit-any = true`, which defaults on. You almost never want to turn it off — implicit `Any` is the chief reason Python codebases get hard to refactor.
@@ -132,16 +133,16 @@ error[tyc::manual_init]: classes do not declare `__init__`; the constructor is g
 
 ## Rule 5 — `Any` only enters through `unsafe:` or `.dty` stubs
 
-Typhon refuses to infer `Any` outside an `unsafe:` region. There is no per-value escape hatch.
+Typhon's intent is that `Any` only enters the program through an explicit `unsafe:` region or via a typed `.dty` stub. Today the type system *allows* `Any` to flow freely (it's the top type), so an unconstrained import binds silently; the recommended convention is to wrap untyped boundaries in `unsafe:` so reviewers can see where the dynamism lives.
 
 ```python
 import messy
 
-let data = messy.fetch()         # ❌ tyc::implicit_any
+let data = messy.fetch()         # binds to Any silently — opaque to the checker
 
 unsafe:
-    let data = messy.fetch()     # ✅ inside the region
-let parsed: dict[str, int] = ... # re-assert at the boundary
+    let data = messy.fetch()     # convention: wrap the boundary
+let parsed: dict[str, int] = ... # re-assert when leaving the region
 ```
 
 `unsafe:` is a **lexical region**, not a per-value annotation. Values inside acquire a hidden `Unsafe[T]` marker that cannot cross out into a concrete-typed context without re-assertion (annotation, narrowing, or cast). The block lowers to `if True:` so scope rules are unchanged.

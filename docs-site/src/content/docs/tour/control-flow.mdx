@@ -25,13 +25,13 @@ def classify(score: int) -> str:
         return "F"
 ```
 
-A branch must either return, raise (in `unsafe` regions), or fall through to a converging `return`. The checker tracks reachability; missing returns are flagged:
+Convention is that every branch either returns or falls through to a converging `return`. Static fall-through analysis is reserved for a future release, so the example below is accepted today — but exhaustive `match` over sealed unions (covered later) gives you the same guarantee with a stronger compile-time check:
 
 ```python
 def classify(score: int) -> str:
     if score >= 60:
         return "pass"
-    # ❌ tyc::missing_return: function exits without returning a str
+    # accepted today; prefer exhaustive match or always include an explicit else
 ```
 
 ## `while`
