@@ -1041,12 +1041,14 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             // dataclasses (the runtime Protocol behaviour conflicts with
             // dataclass field collection).
             let is_protocol = class_inherits_protocol(c);
+            let is_typed_dict = class_inherits_typed_dict(c);
             // Skip the dataclass decorator for Pydantic model classes,
-            // Protocol classes, and lazy proxies; they already carry the
-            // right shape.
+            // Protocol classes, TypedDict subclasses, and lazy proxies; they
+            // already carry the right shape or are incompatible with dataclass.
             let needs_decorator = !is_raw
                 && !is_pydantic
                 && !is_protocol
+                && !is_typed_dict
                 && !is_impl_stub
                 && !is_lazy_proxy
                 && !has_dataclass_decorator(&c.decorator_list);
@@ -1380,6 +1382,31 @@ fn class_inherits_protocol(c: &ruff_python_ast::StmtClassDef) -> bool {
     c.bases()
         .iter()
         .any(|base| matches!(base, Expr::Name(n) if n.id.as_str() == "Protocol"))
+}
+
+/// Return `true` if `c` inherits directly from `TypedDict`.
+///
+/// `TypedDict` subclasses must not receive `@dataclasses.dataclass(slots=True)`
+/// — Python raises `TypeError: cannot inherit from both a TypedDict type and a
+/// non-TypedDict base class` at class-definition time. FINDINGS #67.
+///
+/// Handles bare-name (`TypedDict`), `typing.TypedDict`, and
+/// `typing_extensions.TypedDict` forms.
+fn class_inherits_typed_dict(c: &ruff_python_ast::StmtClassDef) -> bool {
+    c.bases().iter().any(|base| match base {
+        // `class X(TypedDict):`
+        Expr::Name(n) => n.id.as_str() == "TypedDict",
+        // `class X(typing.TypedDict):` or `class X(typing_extensions.TypedDict):`
+        Expr::Attribute(a) => {
+            a.attr.as_str() == "TypedDict"
+                && matches!(
+                    &*a.value,
+                    Expr::Name(n)
+                    if n.id.as_str() == "typing" || n.id.as_str() == "typing_extensions"
+                )
+        }
+        _ => false,
+    })
 }
 
 /// Return `true` if the module already has `from pydantic import BaseModel`
@@ -2844,6 +2871,38 @@ mod tests {
             // "ConfigDict" appears in the import and in the model_config assignment
             2,
             "ConfigDict must not be imported a second time\noutput:\n{out}"
+        );
+    }
+
+    #[test]
+    fn typed_dict_skips_dataclass_decorator() {
+        let src = "from typing import TypedDict\nclass U(TypedDict):\n    id: int\n    name: str\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            !out.contains("dataclass"),
+            "TypedDict must not get dataclass decorator: {out}"
+        );
+    }
+
+    #[test]
+    fn typed_dict_qualified_skips_dataclass_decorator() {
+        // `typing.TypedDict` (qualified) must also be detected.
+        let src = "import typing\nclass U(typing.TypedDict):\n    id: int\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            !out.contains("dataclass"),
+            "typing.TypedDict must not get dataclass decorator: {out}"
+        );
+    }
+
+    #[test]
+    fn typed_dict_extensions_qualified_skips_dataclass_decorator() {
+        // `typing_extensions.TypedDict` must also be detected.
+        let src = "import typing_extensions\nclass U(typing_extensions.TypedDict):\n    id: int\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            !out.contains("dataclass"),
+            "typing_extensions.TypedDict must not get dataclass decorator: {out}"
         );
     }
 }

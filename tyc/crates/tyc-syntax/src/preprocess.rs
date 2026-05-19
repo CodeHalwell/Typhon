@@ -3299,6 +3299,19 @@ struct GatherBinding {
     expr: String,
 }
 
+/// Strip a trailing Python inline comment from `s`.
+///
+/// Delegates to [`scan_line_code_end`], which already handles single-quoted,
+/// double-quoted, and triple-quoted string literals (including `"""..."""` and
+/// `'''...'''`) as well as backslash escapes. Returns the slice up to the first
+/// `#` found **outside** a string, with any trailing whitespace trimmed. If no
+/// comment is present the original `s` is returned unchanged.
+fn strip_inline_comment(s: &str) -> &str {
+    let mut state = None;
+    let end = scan_line_code_end(s, &mut state);
+    s[..end].trim_end()
+}
+
 /// Collect indented `name = expr` bindings under a `gather:` header.
 /// Returns the bindings, the number of lines consumed (header + bindings),
 /// and the resulting triple-quoted-string state.
@@ -3328,7 +3341,9 @@ fn collect_gather_bindings(
         let body = &raw[line_indent..];
         let eq = find_assignment_eq(body)?;
         let name = body[..eq].trim().to_owned();
-        let expr = body[eq + 1..].trim().to_owned();
+        let expr = strip_inline_comment(body[eq + 1..].trim())
+            .trim()
+            .to_owned();
         if name.is_empty() || expr.is_empty() {
             return None;
         }
@@ -5843,5 +5858,48 @@ string content
         assert!(out.contains("multi-line"));
         assert!(out.contains("string content"));
         assert!(out.contains("        return 0"));
+    }
+
+    #[test]
+    fn gather_strips_trailing_comment() {
+        let src = "async def f() -> None:\n    gather:\n        a = fetch_a()  # first\n        b = fetch_b()  # second\n    print(a, b)\n";
+        let out = expand_gather_blocks(src);
+        assert!(
+            !out.contains("# first"),
+            "comment should be stripped: {out}"
+        );
+        assert!(
+            !out.contains("# second"),
+            "comment should be stripped: {out}"
+        );
+        assert!(out.contains("create_task(fetch_a())"), "call intact: {out}");
+        assert!(out.contains("create_task(fetch_b())"), "call intact: {out}");
+    }
+
+    #[test]
+    fn gather_preserves_hash_inside_triple_quoted_string() {
+        // A `#` inside a triple-quoted string literal is NOT a comment; the
+        // expression must not be truncated.
+        let src =
+            "async def f() -> None:\n    gather:\n        a = get(\"\"\"a#b\"\"\")\n    print(a)\n";
+        let out = expand_gather_blocks(src);
+        assert!(
+            out.contains(r#"create_task(get("""a#b"""))"#),
+            "triple-quoted # must not be stripped: {out}"
+        );
+    }
+
+    #[test]
+    fn strip_inline_comment_trims_comment() {
+        assert_eq!(strip_inline_comment("fetch()  # note"), "fetch()");
+        assert_eq!(strip_inline_comment("fetch()"), "fetch()");
+    }
+
+    #[test]
+    fn strip_inline_comment_preserves_hash_in_string() {
+        assert_eq!(strip_inline_comment(r#""a#b""#), r#""a#b""#);
+        assert_eq!(strip_inline_comment(r#"'a#b'"#), r#"'a#b'"#);
+        assert_eq!(strip_inline_comment(r#""""a#b""""#), r#""""a#b""""#);
+        assert_eq!(strip_inline_comment("'''a#b'''"), "'''a#b'''");
     }
 }
