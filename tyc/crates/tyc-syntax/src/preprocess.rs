@@ -3328,7 +3328,13 @@ fn collect_gather_bindings(
         let body = &raw[line_indent..];
         let eq = find_assignment_eq(body)?;
         let name = body[..eq].trim().to_owned();
-        let expr = body[eq + 1..].trim().to_owned();
+        // Strip trailing comments (e.g. `fetch_b(a)  # depends on a`) before
+        // storing the expression.  Without this the comment is spliced into
+        // `create_task(fetch_b(a)  # depends on a)` which makes the closing
+        // paren invisible to the parser and causes a cascade of synthetic
+        // parse errors.  FINDINGS #93.
+        let expr_raw = strip_trailing_comment(body[eq + 1..].trim());
+        let expr = expr_raw.trim().to_owned();
         if name.is_empty() || expr.is_empty() {
             return None;
         }
@@ -5650,6 +5656,33 @@ def run() -> Result[str, str]:
         let src = "gather:\n";
         let out = expand_gather_blocks(src);
         assert_eq!(out, src);
+    }
+
+    #[test]
+    fn gather_inline_comment_stripped_from_binding() {
+        // FINDINGS #93: a trailing comment on a gather binding was spliced
+        // into the `create_task(...)` call, closing the paren after the
+        // comment text and producing a cascade of synthetic parse errors.
+        let src = "async def f():\n    gather:\n        a = fetch_a()  # first fetch\n        b = fetch_b()  # second fetch\n";
+        let out = expand_gather_blocks(src);
+        // The comments must not appear in the lowered code at all.
+        assert!(
+            !out.contains("# first fetch"),
+            "comment leaked into lowering: {out}"
+        );
+        assert!(
+            !out.contains("# second fetch"),
+            "comment leaked into lowering: {out}"
+        );
+        // The expressions must be correct.
+        assert!(
+            out.contains(".create_task(fetch_a())"),
+            "create_task call missing or malformed: {out}"
+        );
+        assert!(
+            out.contains(".create_task(fetch_b())"),
+            "create_task call missing or malformed: {out}"
+        );
     }
 
     // ── go spawn ─────────────────────────────────────────────────────────────
