@@ -1,0 +1,10 @@
+def main() -> None:
+    let x: int = -5
+    let y: float = -3.14
+    let z: int = -0
+    let a: int = - -5  # double negative
+    let b: int = abs(-10)
+    print(x, y, z, a, b)
+
+if __name__ == "__main__":
+    main()

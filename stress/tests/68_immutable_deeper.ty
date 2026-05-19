@@ -1,0 +1,17 @@
+class User:
+    name: str
+
+def main() -> None:
+    let u: User = User(name="amy")
+    # let binding immutable for the *binding*; field still mutable
+    u.name = "bob"  # should be allowed
+    print(u.name)
+
+    # frozen vs deep frozen
+    let xs: list[int] = [1, 2, 3]
+    # u = User(name="x")  # would be immutable_assign
+    xs.append(4)  # mutation through let - allowed (binding immutable, value mutable)
+    print(xs)
+
+if __name__ == "__main__":
+    main()

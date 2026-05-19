@@ -1,0 +1,13 @@
+def main() -> None:
+    let x: int = 0
+    if x == 0:
+        if x == 0:
+            if x == 0:
+                if x == 0:
+                    if x == 0:
+                        if x == 0:
+                            if x == 0:
+                                if x == 0:
+                                    if x == 0:
+                                        if x == 0:
+                                            print("deep")

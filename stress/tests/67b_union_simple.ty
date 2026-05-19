@@ -1,0 +1,9 @@
+# Minimal: union assignment fails for literals matching union member
+type B = int | str
+
+def f(x: B) -> int:
+    return 1
+
+def main() -> None:
+    print(f(5))  # expected `B`, found `int` — but int IS in B
+    print(f("x"))

@@ -1,0 +1,17 @@
+def main() -> None:
+    let s: str = "Hello"
+    let a: str = s.upper()
+    let b: int = len(s)
+    let c: bool = s.startswith("He")
+    let d: list[str] = s.split("l")  # split returns list[str]
+    let e: str = s.replace("l", "L")
+    let f: str = s.lower()
+    let g: str = s.strip()
+    let h: str = "x".join(d)
+    let i: str = s[0]
+    let j: int = s.find("l")
+    let k: bool = "ell" in s
+    print(a, b, c, d, e, f, g, h, i, j, k)
+
+if __name__ == "__main__":
+    main()

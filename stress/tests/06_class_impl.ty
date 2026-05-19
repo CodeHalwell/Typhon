@@ -1,0 +1,21 @@
+class User:
+    id: int
+    name: str
+
+impl User:
+    def display(self) -> str:
+        return f"{self.name} (#{self.id})"
+
+    def is_admin(self) -> bool:
+        return self.id == 0
+
+# multiple impl blocks
+impl User:
+    def shouting(self) -> str:
+        return self.name.upper()
+
+def main() -> None:
+    let u: User = User(id=1, name="amy")
+    print(u.display())
+    print(u.is_admin())
+    print(u.shouting())

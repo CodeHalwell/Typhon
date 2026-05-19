@@ -83,16 +83,94 @@ pub fn migrate_source(source: &str) -> String {
     let reassigned = collect_reassigned_names(source);
     let bang_class_lines = collect_bang_class_lines(source);
 
+    // Scope stack so the line rewriter knows whether we're currently
+    // inside a `class` body (skip `let`/`mut` prepending — those are
+    // field declarations, not locals) or a `def` body (prepend on the
+    // first assignment to each name, skip on subsequent ones).
+    #[derive(Clone, Copy, PartialEq)]
+    enum ScopeKind {
+        Function,
+        Class,
+    }
+    struct Scope {
+        kind: ScopeKind,
+        indent: usize,
+        declared_in_this_scope: HashSet<String>,
+    }
+    let mut scope_stack: Vec<Scope> = Vec::new();
+
     let mut out = String::with_capacity(source.len());
     for (line_index, line) in source.split_inclusive('\n').enumerate() {
         let raw = line.trim_end_matches(['\n', '\r']);
         let terminator = &line[raw.len()..];
 
+        let trimmed = raw.trim_start();
+        let indent = raw.len() - trimmed.len();
+
+        // Pop scopes we've exited (any non-blank, non-comment line at
+        // indent ≤ the scope's header indent leaves that scope).
+        let is_structural = !trimmed.is_empty() && !trimmed.starts_with('#');
+        if is_structural {
+            while let Some(top) = scope_stack.last() {
+                if indent <= top.indent {
+                    scope_stack.pop();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Identify the innermost scope (if any) before rewriting this line.
+        let in_class_body = scope_stack
+            .last()
+            .is_some_and(|s| s.kind == ScopeKind::Class);
+        let already_declared_here = scope_stack
+            .last()
+            .map(|s| (s.kind == ScopeKind::Function, &s.declared_in_this_scope));
+
         let rewritten = if raw.trim().is_empty() {
             raw.to_owned()
         } else {
-            rewrite_line(raw, &reassigned, line_index, &bang_class_lines)
+            rewrite_line(
+                raw,
+                &reassigned,
+                line_index,
+                &bang_class_lines,
+                in_class_body,
+                already_declared_here,
+            )
         };
+
+        // Update scope tracking with the assignment we just rewrote (so
+        // a subsequent line with the same name knows to skip the kw).
+        if is_structural {
+            if let Some(scope) = scope_stack.last_mut() {
+                if scope.kind == ScopeKind::Function {
+                    if let Some(name) = leading_plain_assign_name(trimmed)
+                        .or_else(|| leading_ann_assign_name(trimmed))
+                    {
+                        scope.declared_in_this_scope.insert(name);
+                    }
+                }
+            }
+            // Push a new scope if this line opens one.
+            if trimmed.starts_with("def ") || trimmed.starts_with("async def ") {
+                scope_stack.push(Scope {
+                    kind: ScopeKind::Function,
+                    indent,
+                    declared_in_this_scope: HashSet::new(),
+                });
+            } else if trimmed.starts_with("class ")
+                || trimmed.starts_with("class!")
+                || trimmed == "class"
+            {
+                scope_stack.push(Scope {
+                    kind: ScopeKind::Class,
+                    indent,
+                    declared_in_this_scope: HashSet::new(),
+                });
+            }
+        }
 
         // Skip lines reduced to nothing (only `from dataclasses import
         // dataclass` qualifies today).
@@ -114,6 +192,8 @@ fn rewrite_line(
     reassigned: &HashSet<String>,
     line_index: usize,
     bang_class_lines: &HashSet<usize>,
+    in_class_body: bool,
+    already_declared_here: Option<(bool, &HashSet<String>)>,
 ) -> String {
     // Quick exit for comments — leave them untouched.
     let trimmed = line.trim_start();
@@ -182,6 +262,35 @@ fn rewrite_line(
             if reassigned.contains(&name) && !body.starts_with("let ") && !body.starts_with("mut ")
             {
                 body = format!("mut {body}");
+            }
+        }
+    } else if !in_class_body {
+        // Function-body assignment: Typhon requires every local to
+        // declare `let` or `mut`. Migrator default is `let` for first
+        // assignments and `mut` when the name was reassigned anywhere
+        // in the same function. Without this, migrated files fail
+        // `tyc check` with `missing_binding_kind`. FINDINGS #64.
+        //
+        // Class-body lines are skipped — `class Foo: x: int` is a
+        // field declaration, not a local. Subsequent assignments to
+        // the same name in this function are also skipped (the first
+        // assignment already declared the binding).
+        let already = already_declared_here
+            .map(|(is_fn, set)| (is_fn, set.clone()))
+            .unwrap_or((false, HashSet::new()));
+        let in_fn = already.0;
+        let already_set = already.1;
+        if in_fn && !body.starts_with("let ") && !body.starts_with("mut ") {
+            let name = leading_plain_assign_name(&body).or_else(|| leading_ann_assign_name(&body));
+            if let Some(name) = name {
+                if !already_set.contains(&name) {
+                    let kw = if reassigned.contains(&name) {
+                        "mut"
+                    } else {
+                        "let"
+                    };
+                    body = format!("{kw} {body}");
+                }
             }
         }
     }
@@ -470,17 +579,19 @@ fn leading_ann_assign_name(line: &str) -> Option<String> {
 }
 
 /// Walk every line and record names that appear on the LHS of a plain
-/// `NAME = …` assignment (no annotation).  Used to decide between `val`
-/// (single declaration) and `var` (later reassignment).
+/// `NAME = …` assignment more than once in the same scope.  Used to
+/// decide between `let` (single declaration) and `mut` (later
+/// reassignment).
+///
+/// Tracks module-level and per-function-body assignments separately so
+/// a reassignment in function A doesn't force `mut` on an unrelated
+/// `let` in function B. FINDINGS #64.
 fn collect_reassigned_names(source: &str) -> HashSet<String> {
-    let mut declared: HashSet<String> = HashSet::new();
     let mut reassigned: HashSet<String> = HashSet::new();
     // First pass: scan for `global NAME[, NAME, ...]` statements anywhere
     // in the file. Any name declared `global` and then assigned inside a
     // function body is a module-level reassignment — exactly what `mut`
-    // is meant for. The original migrator only looked at top-level
-    // assignments and so missed counter/accumulator patterns lifted via
-    // `global`. (FINDINGS #22)
+    // is meant for. (FINDINGS #22)
     for raw in source.lines() {
         let trimmed = raw.trim_start();
         if let Some(rest) = trimmed.strip_prefix("global ") {
@@ -492,27 +603,55 @@ fn collect_reassigned_names(source: &str) -> HashSet<String> {
             }
         }
     }
+    // Module-scope declared/reassigned tracking.
+    let mut module_declared: HashSet<String> = HashSet::new();
+    // Per-function scope. Pushed on `def` / `async def` at a deeper
+    // indent than the current top; popped when a non-blank, non-comment
+    // line returns to an indent ≤ the function's `def` indent.
+    struct FnScope {
+        def_indent: usize,
+        declared: HashSet<String>,
+    }
+    let mut fn_stack: Vec<FnScope> = Vec::new();
     for raw in source.lines() {
         let trimmed = raw.trim_start();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        // Skip indented lines (only top-level matters for the val/var
-        // distinction we apply).
-        if raw.len() != trimmed.len() {
-            continue;
-        }
-        if let Some(name) = leading_ann_assign_name(trimmed) {
-            declared.insert(name);
-            continue;
-        }
-        // Plain `NAME = expr` (no annotation): if the name was already
-        // declared, this is a reassignment.
-        if let Some(name) = leading_plain_assign_name(trimmed) {
-            if declared.contains(&name) {
-                reassigned.insert(name);
+        let indent = raw.len() - trimmed.len();
+        // Pop function scopes we've exited (any non-blank line at indent
+        // ≤ def_indent means we've left that function body).
+        while let Some(top) = fn_stack.last() {
+            if indent <= top.def_indent {
+                fn_stack.pop();
             } else {
-                declared.insert(name.clone());
+                break;
+            }
+        }
+        // Function definition opens a new scope.
+        if trimmed.starts_with("def ") || trimmed.starts_with("async def ") {
+            fn_stack.push(FnScope {
+                def_indent: indent,
+                declared: HashSet::new(),
+            });
+            continue;
+        }
+        // Identify the active declared-name set: innermost function if
+        // we're inside one, otherwise the module-scope set.
+        let declared = match fn_stack.last_mut() {
+            Some(scope) => &mut scope.declared,
+            None => &mut module_declared,
+        };
+        if let Some(name) = leading_ann_assign_name(trimmed) {
+            // Annotated assigns count as a declaration.
+            if !declared.insert(name.clone()) {
+                reassigned.insert(name);
+            }
+            continue;
+        }
+        if let Some(name) = leading_plain_assign_name(trimmed) {
+            if !declared.insert(name.clone()) {
+                reassigned.insert(name);
             }
         }
     }

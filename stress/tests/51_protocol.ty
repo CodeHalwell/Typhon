@@ -1,0 +1,21 @@
+from typing import Protocol
+
+class Walker(Protocol):
+    def walk(self) -> None: ...
+
+class Cat:
+    name: str
+
+impl Cat:
+    def walk(self) -> None:
+        print(f"{self.name} walks")
+
+def go(w: Walker) -> None:
+    w.walk()
+
+def main() -> None:
+    let c: Cat = Cat(name="kitty")
+    go(c)
+
+if __name__ == "__main__":
+    main()

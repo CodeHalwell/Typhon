@@ -1,0 +1,8 @@
+class Foo:
+    x: int
+
+class Foo:  # redeclare
+    y: int
+
+def main() -> None:
+    print("x")

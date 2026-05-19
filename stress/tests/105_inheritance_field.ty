@@ -1,0 +1,13 @@
+class Base:
+    name: str
+
+class Derived(Base):
+    age: int
+
+def main() -> None:
+    # constructor with both fields
+    let d: Derived = Derived(name="x", age=5)
+    print(d.name, d.age)
+
+if __name__ == "__main__":
+    main()

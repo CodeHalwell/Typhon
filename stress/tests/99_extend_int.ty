@@ -1,0 +1,10 @@
+extend int:
+    def doubled(self) -> int:
+        return self * 2
+
+def main() -> None:
+    let x: int = 5
+    print(x.doubled())
+
+if __name__ == "__main__":
+    main()

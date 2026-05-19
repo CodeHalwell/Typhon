@@ -1,0 +1,10 @@
+# Try the same without a type alias
+def f(x: int | str) -> int:
+    return 1
+
+def main() -> None:
+    print(f(5))
+    print(f("x"))
+
+if __name__ == "__main__":
+    main()

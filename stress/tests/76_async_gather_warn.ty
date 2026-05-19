@@ -1,0 +1,17 @@
+import asyncio
+
+@gatherable
+async def a() -> int:
+    return 1
+
+@gatherable
+async def b() -> int:
+    return 2
+
+# auto-gather is OFF by default in playground typhon.toml, but @gatherable decorators should still be valid
+async def load() -> int:
+    let x = await a()
+    let y = await b()
+    return x + y
+
+asyncio.run(load())

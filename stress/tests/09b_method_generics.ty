@@ -1,0 +1,15 @@
+# Smaller reproducer: generic method on a generic impl block
+class Box[T]:
+    value: T
+
+impl[T] Box[T]:
+    def get(self) -> T:
+        return self.value
+
+    # This is the documented form — method-level type param U
+    def map[U](self, f: Callable[[T], U]) -> Box[U]:
+        return Box(value=f(self.value))
+
+def main() -> None:
+    let b: Box[int] = Box(value=42)
+    print(b.get())

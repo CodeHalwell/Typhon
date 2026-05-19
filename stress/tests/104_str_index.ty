@@ -1,0 +1,9 @@
+def main() -> None:
+    let s: str = "hello"
+    let c: str = s[0]
+    # str index returns str (not int like rust); python convention
+    let n: int = ord(s[0])
+    print(c, n)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,2 @@
+def f() -> int:
+    return self.x  # self outside impl

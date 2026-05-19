@@ -2521,3 +2521,1111 @@ likely in `docs/guides/`. Pick one set of names and grep-fix the other.
 
 ---
 
+
+# 2026-05-19 stress-test campaign (follow-on)
+
+Branch: `claude/test-typhon-library-0oUj2`
+Compiler: `tyc` built from this commit (release profile, ~70s).
+Method: ~120 hand-written `.ty` programs under `stress/tests/`, run through
+`tyc check` / `tyc build` / `tyc fmt` / `tyc migrate` / `tyc trace` / `tyc repl`
+on Python 3.13. Build-then-run sanity-checks every program that passes
+`tyc check`.
+
+**Results:** 78 / 127 programs pass `tyc check` (61%). The 49 failures split
+roughly 50/50 between intentional failure tests (verifying diagnostics fire)
+and real bugs surfaced below. Of the 78 that build, 4 generate Python that
+crashes at runtime — captured below as critical bugs because the checker
+greenlit broken code.
+
+## Executive summary (new)
+
+Highest-impact bugs found in this campaign, in rough priority order:
+
+1. **#57 Type aliases of unions are not transparent** for assignability —
+   `type B = int | str; f(5)` rejects the int literal where direct
+   `int | str` accepts it. Cascades into the `Result[Alias, E]` family
+   below.
+2. **#58 `Ok[T]` not assignable to `Result[Alias, E]`** when `Alias`
+   resolves to the same `T`. Breaks the canonical Result pattern any time
+   a type alias is involved.
+3. **#59 Method-level type parameters on `impl[T]` blocks are not in
+   scope** — the cheat-sheet `def map[U](self, f: Callable[[T], U]) ->
+   Box[U]:` fails to compile.
+4. **#60 `gather:` block with dependent bindings builds clean and crashes
+   at runtime** — `b = g(a)` after `a = f()` emits Python that raises
+   `UnboundLocalError` instead of a static error.
+5. **#61 `global`/`nonlocal` declarations don't suppress
+   `missing_binding_kind`** — every program that uses module-level mutable
+   state via `global` is broken.
+6. **#62 Mutable defaults in `class` fields produce runtime `ValueError`** —
+   `tags: list[str] = []` builds but crashes at dataclass-creation time.
+7. **#63 `@property` accesses are typed as `() -> T` instead of `T`** —
+   any project that uses `@property` is forced to drop it.
+8. **#64 `tyc migrate` produces output that doesn't pass `tyc check`** —
+   function-body locals get neither `let` nor `mut`, contradicting the
+   skill that says "added as `let` by default".
+9. **#65 `tyc fmt` is effectively a no-op** — `def    add(a:int,b:int)->int:`
+   round-trips unchanged.
+10. **#66 `?` operator cannot appear mid-expression** — `Ok(step(x)?)`
+    parse-errors with a span inside the *emitted* Python.
+
+The breakage is concentrated in two areas: **type aliasing under union /
+generic / Result** (compounds across several findings), and **macro-style
+desugaring that doesn't quote source spans correctly** (gather, `?`,
+mid-expression cases — they all surface as parse errors against the
+generated Python, which is the wrong source-of-truth to point at the user).
+
+---
+
+## 57. Type alias of a union rejects literals that the union accepts (bug)
+
+**Severity:** bug — sealed-union ergonomics are broken whenever an alias is
+involved.
+
+```python
+type B = int | str
+
+def f(x: B) -> int:
+    return 1
+
+def main() -> None:
+    print(f(5))    # tyc::type_mismatch: expected `B`, found `int`
+    print(f("x"))  # tyc::type_mismatch: expected `B`, found `str`
+```
+
+Direct `def f(x: int | str)` accepts the same calls (verified in
+`stress/tests/67c_union_direct.ty`). The alias is not being expanded before
+the union-membership check in `assignable`.
+
+Repro: `tyc check stress/tests/67b_union_simple.ty`.
+
+---
+
+## 58. `Ok[T]` not assignable to `Result[Alias, E]` when `Alias` is a transparent type alias (bug)
+
+**Severity:** bug — breaks the canonical `Result` pattern any time the
+success type is aliased.
+
+```python
+class ReportData:
+    summary: str
+
+type Report = ReportData
+
+def build_report() -> Result[Report, str]:
+    return Ok(ReportData(summary="x"))
+    # tyc::type_mismatch: expected `Result[Report, str]`, found `Ok[ReportData]`
+```
+
+Replacing `Result[Report, str]` with `Result[ReportData, str]` makes it
+compile. Same family as #57 (alias not unwrapped before structural check).
+
+Repro: `tyc check stress/tests/05b_type_alias_result.ty`.
+
+---
+
+## 59. Method-level type parameters on `impl[T]` blocks are not in scope (bug)
+
+**Severity:** bug, high impact — this is the verbatim cheat-sheet example
+for `Box[T].map`.
+
+```python
+class Box[T]:
+    value: T
+
+impl[T] Box[T]:
+    def get(self) -> T: return self.value          # ok
+    def map[U](self, f: Callable[[T], U]) -> Box[U]:   # U not in scope
+        return Box(value=f(self.value))
+```
+
+Diagnostic:
+```
+tyc::unknown_name × cannot find 'U' in scope
+  help: declare 'U' with `let` or `mut`, or import it from a module
+```
+
+`U` is a freshly-introduced type parameter; the help text is misleading.
+The resolver isn't binding method-level type params declared inside an
+`impl[…]` block.
+
+Repro: `tyc check stress/tests/09b_method_generics.ty`.
+
+---
+
+## 60. `gather:` with dependent bindings builds clean and crashes at runtime (bug, severe)
+
+**Severity:** bug, severe — silent compile, runtime `UnboundLocalError`.
+
+```python
+async def bad() -> int:
+    gather:
+        a = fetch_a()
+        b = fetch_b(a)    # a is referenced before TaskGroup completes
+    return a + b
+```
+
+Emitted Python:
+```python
+async with asyncio.TaskGroup() as __typhon_tg_0__:
+    __typhon_gather_1__ = __typhon_tg_0__.create_task(fetch_a())
+    __typhon_gather_2__ = __typhon_tg_0__.create_task(fetch_b(a))
+    #                                                          ^ undefined here
+a = __typhon_gather_1__.result()
+b = __typhon_gather_2__.result()
+```
+
+Running it raises `UnboundLocalError: cannot access local variable 'a'`.
+`tyc check` should reject dependent bindings statically with a clear
+diagnostic (e.g. `tyc::gather_dependent_binding`), or the desugarer should
+fall back to sequential await.
+
+Repro: `tyc check && tyc build && python3.13 build/main.py` on
+`stress/tests/69b_gather_no_comment.ty`.
+
+---
+
+## 61. `global` / `nonlocal` declarations don't suppress `missing_binding_kind` (bug)
+
+**Severity:** bug, high impact — module-level mutable state via `global`
+is unusable.
+
+```python
+mut counter: int = 0
+
+def inc() -> None:
+    global counter
+    counter = counter + 1   # tyc::missing_binding_kind on `counter =`
+```
+
+Same with `nonlocal x` followed by `x = x + 1` inside a closure
+(`stress/tests/36_global_nonlocal.ty`). The resolver sees the assignment
+in the function and demands `let`/`mut`, ignoring the `global` /
+`nonlocal` declaration directly above.
+
+Repro: `stress/tests/48_module_const.ty`, `stress/tests/36_global_nonlocal.ty`.
+
+---
+
+## 62. Mutable defaults in `class` fields produce runtime `ValueError` (bug)
+
+**Severity:** bug — `tyc check` is silent; `tyc build` succeeds;
+`python3.13 build/main.py` crashes at class-definition time.
+
+```python
+class WithDefault:
+    name: str = "default"
+    count: int = 0
+    tags: list[str] = []      # <-- mutable default
+```
+
+Emitted Python is:
+
+```python
+@dataclasses.dataclass(slots=True)
+class WithDefault:
+    name: str = "default"
+    count: int = 0
+    tags: list[str] = []
+```
+
+which Python rejects:
+
+```
+ValueError: mutable default <class 'list'> for field tags is not allowed:
+use default_factory
+```
+
+Three reasonable fixes:
+
+1. Statically reject mutable defaults in `class` body, with a help that
+   suggests `field(default_factory=list)` or a non-defaulted field.
+2. Auto-rewrite `tags: list[str] = []` to `tags: list[str] = field(default_factory=list)`
+   in the dataclass emit.
+3. Use `tags: list[str] = dataclasses.field(default_factory=list)` as the
+   canonical lowering and document it.
+
+Option 1 is the most conservative; option 2 is the most Pythonic.
+
+Repro: `stress/tests/75_class_default.ty`.
+
+---
+
+## 63. `@property` access typed as the underlying callable, not the property value (bug)
+
+**Severity:** bug, high impact — `@property` is unusable.
+
+```python
+class Rect:
+    w: float
+    h: float
+
+impl Rect:
+    @property
+    def area(self) -> float:
+        return self.w * self.h
+
+def main() -> None:
+    let r: Rect = Rect(w=3.0, h=4.0)
+    let a: float = r.area
+    # tyc::type_mismatch: expected `float`, found `() -> float`
+```
+
+The checker is treating `r.area` as a bound method instead of recognising
+the `@property` decorator and unwrapping it to the return type.
+
+Repro: `stress/tests/47_property.ty`.
+
+---
+
+## 64. `tyc migrate` produces output that fails `tyc check` (bug, high impact)
+
+**Severity:** bug — the migrator is the documented entrypoint for moving
+Python code to Typhon, and its output isn't a valid Typhon program.
+
+Input:
+```python
+@dataclass
+class User:
+    id: int
+    email: Optional[str] = None
+
+def main() -> None:
+    user = find_user(1)
+    total = 0
+    for i in range(COUNT):
+        total = total + i
+```
+
+Migrated output (correct top-level rewrites — drops `@dataclass`, rewrites
+`Optional[T]` to `T?`, adds `let` to module-level annotated assigns):
+
+```python
+class User:
+    id: int
+    email: str? = None
+
+def main() -> None:
+    user = find_user(1)   # ← missing `let` or `mut`
+    total = 0             # ← same
+    for i in range(COUNT):
+        total = total + i
+```
+
+`tyc check` on the migrated output:
+```
+tyc::missing_binding_kind × local binding 'user' is missing `let` or `mut`
+tyc::missing_binding_kind × local binding 'total' is missing `let` or `mut`
+```
+
+The skill says "tyc migrate handles the mechanical rewrites; …
+function-body locals are added as `let` by default and need manual review
+for accumulators / counters". Today they're not added at all.
+
+Fix: prepend `let` to every plain function-body assignment in the
+migrator, and `mut` when the same name is assigned more than once in the
+same scope (the same heuristic the skill describes).
+
+Repro: see `stress/migrate_src.py` → `tyc migrate migrate_src.py` →
+`tyc check migrate_src.ty`.
+
+---
+
+## 65. `tyc fmt` is effectively a no-op (bug)
+
+**Severity:** bug — the documented pre-commit / pre-CI formatter doesn't
+actually format.
+
+Input (`stress/fmt2.ty`):
+```python
+def    add(a:int,b:int)->int:return a+b
+class    Foo:
+    x:int
+    y :   str
+def main(  )->None:
+    let a:int=add(1,2)
+    print(a)
+```
+
+After `tyc fmt fmt2.ty`:
+```
+0 files reformatted, 1 unchanged
+```
+
+…and the file is byte-identical to the input. `tyc fmt` claims to be
+"Typhon-aware printer wrapped in `ruff format`" (docs/architecture.md) but
+behaves like neither — it doesn't even compact `def    add` to `def add`.
+
+A different file (`stress/fmt_test.ty`) had `print(  x  ,    y  )` which
+became `print(  x  , y  )` — a single `,    y` → `, y` rewrite, then
+stopped. The fmt pass is firing exactly one heuristic.
+
+Repro: `stress/fmt2.ty` (the file is preserved in the repo for this report).
+
+---
+
+## 66. `?` operator cannot appear inside a sub-expression (gap)
+
+**Severity:** gap — the docs imply `?` is a sub-expression operator
+(matching Rust's `?`), but it only works as the RHS of a `let`/`mut` or as
+a standalone statement.
+
+These all parse-fail:
+
+```python
+def f(x: int) -> Result[int, str]:
+    return Ok(step(x)?)         # ? inside call
+    # tyc::parse: Got unexpected token ? at byte range …
+
+def g(x: int) -> Result[int, str]:
+    let y: int = step(x)? + step(x)?   # ? as sub-expression
+    # tyc::parse: Got unexpected token ? at byte range …
+```
+
+The error span points into the *desugared* Python (`__typhon_q_0__ =
+step(x)? + step(x)`), which is the wrong source of truth to surface to the
+user. Either:
+
+1. Lift the `?` lowering to handle arbitrary sub-expression positions
+   (assign each `?`-suffixed call to a fresh temp, then substitute the
+   `.value` access into the surrounding expression).
+2. Document the limitation crisply: "`?` is only valid as the entire RHS
+   of an assignment or as a standalone statement". Today the skill / docs
+   imply both work.
+
+Repro: `stress/tests/98_question_in_expr.ty`,
+`stress/tests/116_question_return.ty`.
+
+---
+
+## 67. `class X(TypedDict):` produces broken Python (bug)
+
+**Severity:** bug — `from typing import TypedDict` + a class inheriting
+from it builds clean and crashes at runtime.
+
+```python
+from typing import TypedDict
+
+class UserDict(TypedDict):
+    id: int
+    name: str
+```
+
+Emitted:
+```python
+@dataclasses.dataclass(slots=True)
+class UserDict(TypedDict):
+    id: int
+    name: str
+```
+
+Crashes at import time:
+```
+TypeError: cannot inherit from both a TypedDict type and a non-TypedDict base class
+```
+
+The `class X(TypedDict):` form needs to suppress the dataclass decorator
+(detected by base-class lookup) and emit a plain class body, or be
+documented as unsupported with a `tyc::typeddict_unsupported` diagnostic.
+
+Repro: `stress/tests/49_typed_dict.ty`.
+
+---
+
+## 68. Generic class constructor inference doesn't propagate from sealed-union target (bug)
+
+**Severity:** bug — `Just(value=5)` for a `Maybe[int]` target doesn't bind
+`T=int`.
+
+```python
+class Just[T]:
+    value: T
+class Nothing:
+    pass
+
+type Maybe[T] = Just[T] | Nothing
+
+def unwrap(m: Maybe[int]) -> int:
+    match m:
+        case Just(v): return v
+        case Nothing(): return -1
+
+def main() -> None:
+    print(unwrap(Just(value=5)))
+    # tyc::type_mismatch: expected `Maybe[int]`, found `Just[?]`
+```
+
+The bidirectional inference at the call site has all the information it
+needs — expected type is `Maybe[int] = Just[int] | Nothing`, RHS is
+`Just(value=5)` — but doesn't pick `Just[int]` and bind `T=int` from the
+value of the only field.
+
+Workaround: write `Just[int](value=5)` explicitly (verified to compile in
+`stress/tests/117_generic_construct.ty`).
+
+Repro: `stress/tests/21_pattern_match.ty`.
+
+---
+
+## 69. Generic parameter inference fails when target is `None` (bug)
+
+**Severity:** bug — `None` is treated as not-bindable to a type parameter.
+
+```python
+def f[A, B, C, D, E, F, G, H](
+    a: A, b: B, c: C, d: D, e: E, f: F, g: G, h: H
+) -> tuple[A, B, C, D, E, F, G, H]:
+    return (a, b, c, d, e, f, g, h)
+
+let t: tuple[int, str, float, bool, bytes, list[int], dict[str, int], None] = f(
+    1, "a", 1.0, True, b"x", [1], {"k": 1}, None
+)
+# tyc::type_mismatch: expected `H`, found `None`
+```
+
+The expected return type binds `H = None` (via the tuple annotation), but
+the inference rejects `None` as a value for an unbound `H`. Should bind
+fine — `None` is a perfectly good type witness.
+
+Repro: `stress/tests/109_huge_generic.ty`.
+
+---
+
+## 70. Generic type alias not transparent for assignability (bug)
+
+**Severity:** bug — same family as #57/#58, parametric form.
+
+```python
+type StringMap[V] = dict[str, V]
+
+def make() -> StringMap[int]:
+    return {"a": 1}
+    # tyc::type_mismatch: expected `StringMap[int]`, found `dict[str, int]`
+```
+
+Repro: `stress/tests/95_generic_class_alias.ty`.
+
+---
+
+## 71. `dict.get(k, default)` two-arg form not narrowed (bug)
+
+**Severity:** bug — `V | None` is correct for the one-arg form, but the
+two-arg form should narrow to `V` when `default: V`.
+
+```python
+let d: dict[str, int] = {"a": 1}
+let x: int = d.get("a", 0)
+# tyc::type_mismatch: expected `int`, found `int | None`
+```
+
+Python's actual signature is `get(key) -> V | None` and `get(key, default:
+D) -> V | D`. Tyc only knows the first overload.
+
+Repro: `stress/tests/103_dict_get_default.ty`.
+
+---
+
+## 72. Bare collection annotations (`list`, `dict`, `tuple`) accepted under `no-implicit-any = true` (bug)
+
+**Severity:** bug — directly violates Rule 1 of the language and the
+documented default for `no-implicit-any`.
+
+```python
+def main() -> None:
+    let xs: list = [1, 2, 3]    # accepted; should be tyc::implicit_any
+    let d: dict = {"a": 1}      # accepted; ditto
+    let t: tuple = (1, 2, 3)    # accepted; ditto
+```
+
+`tyc check` is clean. Per the skill: "Element types are required: `let xs:
+list = [1, 2, 3]  # implicit Any element`".
+
+Repro: `stress/tests/40b_implicit_any_collection.ty`.
+
+---
+
+## 73. `from typing import TypeVar` not specifically rejected (gap)
+
+**Severity:** gap — docs say "rejected", reality is "accepted with a
+useless downstream error".
+
+```python
+from typing import TypeVar
+T = TypeVar("T")
+
+def first(xs: list[T]) -> T:
+    return xs[0]
+
+def main() -> None:
+    print(first([1, 2, 3]))
+    # tyc::type_mismatch: expected `list[T]`, found `list[int]`
+```
+
+The skill (under Generics): "Never import `TypeVar` from `typing` — that
+path is rejected." Today the import goes through and `T` is treated as an
+unknown name in the annotation, producing a confusing
+`type_mismatch` instead of a clear `tyc::typevar_import_rejected`.
+
+Repro: `stress/tests/50_typevar_rejected.ty`.
+
+---
+
+## 74. `typing.List` / `typing.Dict` / `typing.Tuple` not aliased to lowercase (papercut)
+
+**Severity:** papercut — common Python idiom produces a confusing
+"expected `List[int]`, found `list[int]`" error.
+
+```python
+from typing import List
+def use_list(xs: List[int]) -> int: return len(xs)
+def main() -> None: print(use_list([1, 2, 3]))
+# tyc::type_mismatch: expected `List[int]`, found `list[int]`
+```
+
+Two reasonable fixes: (a) reject `from typing import List | Dict | Tuple |
+Set | FrozenSet | …` with a "use lowercase built-in instead" diagnostic,
+or (b) treat `typing.List[T]` as a transparent alias for `list[T]`.
+
+Repro: `stress/tests/71_typing_imports.ty`.
+
+---
+
+## 75. Reassigning a `for`-loop target accepted (bug)
+
+**Severity:** bug — violates Rule 2 of the language.
+
+```python
+def main() -> None:
+    let xs: list[int] = [1, 2, 3]
+    for i in xs:
+        i = i + 1     # for-target is implicit let, should be immutable_assign
+        print(i)
+```
+
+`tyc check` is clean. For consistency with Rule 2, the for-loop target
+should be bindable as immutable by default (`let` semantics) and require
+`mut` to rebind.
+
+Repro: `stress/tests/119_let_in_for.ty`.
+
+---
+
+## 76. Block-level shadowing surfaces as "illegal re-assignment" (papercut / doc)
+
+**Severity:** papercut — the diagnostic is wrong for what the user is
+doing.
+
+```python
+def main() -> None:
+    let x: int = 1
+    if True:
+        let x: str = "hi"   # tyc::immutable_assign — "illegal re-assignment"
+        print(x)
+    print(x)
+```
+
+The user's intent is *shadowing* (a fresh binding with the same name in a
+nested scope). Python doesn't have block scope, so the conservative
+rejection is defensible, but the diagnostic text "illegal re-assignment"
+and the help "change `let` to `mut`" are both misleading — `mut` won't
+fix this. A `tyc::no_block_shadow` or similar with a help that explains
+"Typhon names are function-scoped; pick a different name or use the outer
+binding" would be clearer.
+
+Also: the cheat sheet / language guide doesn't say one way or the other
+whether shadowing is permitted. Worth documenting.
+
+Repro: `stress/tests/120_shadowing.ty`.
+
+---
+
+## 77. Class redeclaration accepted silently (bug)
+
+**Severity:** bug — `class Foo: …; class Foo: …` should be at least a
+warning, ideally an error.
+
+```python
+class Foo:
+    x: int
+
+class Foo:
+    y: int
+
+def main() -> None:
+    print("x")
+```
+
+`tyc check`: clean. The emitted Python is also clean — second class wins,
+first is shadowed silently. A `tyc::duplicate_class` diagnostic would
+catch a class merge that the user probably meant to write as `impl Foo:`
+or `extend Foo:`.
+
+Repro: `stress/tests/93_redeclare.ty`.
+
+---
+
+## 78. `impl UnknownClass:` for undefined class accepted silently (bug)
+
+**Severity:** bug — typo in a class name silently produces dead code.
+
+```python
+impl UnknownClass:           # no such class
+    def f(self) -> int:
+        return 1
+```
+
+`tyc check` clean. The methods are emitted into the Python module as
+free-floating defs attached to a non-existent class. A
+`tyc::impl_unknown_class` diagnostic with a "did you mean `X`?"
+suggestion would catch typos.
+
+Repro: `stress/tests/94_impl_unknown.ty`.
+
+---
+
+## 79. Missing module in `from X import Y` accepted at check time (gap)
+
+**Severity:** gap — `tyc check` should resolve imports so a typo or
+missing dependency surfaces before `tyc build`.
+
+```python
+from other import helper      # `other` does not exist in this project
+def main() -> None:
+    print(helper(5))
+```
+
+`tyc check` clean. `python3.13 build/main.py` then raises
+`ModuleNotFoundError: No module named 'other'`.
+
+The checker is happy because no name is shadowed and no type binding
+fails (helper's return type is unknown/Any-via-import). A check-time
+resolver pass that errors on imports whose root module is neither in the
+project tree nor in a known `.dty` / `pyi` stub would catch this.
+
+Repro: `stress/tests/83_multiple_files.ty`.
+
+---
+
+## 80. Wrong kwarg name surfaces as "expected N, got N-1" (papercut)
+
+**Severity:** papercut — typoed keyword arguments produce a confusing
+`arg_count` mismatch instead of a clear unknown-kwarg diagnostic.
+
+```python
+def greet(name: str, greeting: str = "Hello") -> str: ...
+
+def main() -> None:
+    print(greet("Amy", greetinx="Hi"))
+    # tyc::arg_count: wrong number of arguments to `greet`: expected 2, got 1
+```
+
+The actual problem is `greetinx` doesn't exist as a parameter — the
+diagnostic should be `tyc::unknown_kwarg` with a "did you mean
+`greeting`?" suggestion, not an arg-count miscount.
+
+Repro: `stress/tests/80_named_args.ty`.
+
+---
+
+## 81. Circular `type` alias accepted silently (gap)
+
+**Severity:** gap — `type A = B; type B = A` should fail at resolve time.
+
+```python
+type A = B
+type B = A
+
+def f(x: A) -> A: return x
+```
+
+`tyc check` clean. The aliases are emitted to Python verbatim and Python
+lazily evaluates them, so no runtime error fires until something actually
+tries to resolve `A`. A `tyc::cyclic_type_alias` diagnostic would catch
+this at compile time.
+
+Repro: `stress/tests/78_circular_alias.ty`.
+
+---
+
+## 82. Non-returning branch on a non-None-return function accepted (gap)
+
+**Severity:** gap — a function declared `-> int` with a path that doesn't
+return should error.
+
+```python
+def maybe_int(x: int) -> int:
+    if x > 0:
+        return x
+    # missing return on the false branch
+```
+
+`tyc check` clean. Same idea as Python type-checkers' `missing-return`
+diagnostic — the analyser should detect a path through the function that
+reaches end-of-function without `return`, when the annotated return type
+isn't `None` (or compatible with `None`).
+
+Repro: `stress/tests/73_return_paths.ty`.
+
+---
+
+## 83. `async def` with no `await` doesn't fire `async_without_await` (gap)
+
+**Severity:** gap — the diagnostic is documented as a warning, but doesn't
+fire.
+
+```python
+async def maybe_async() -> int:
+    return 42       # no await — should warn tyc::async_without_await
+```
+
+`tyc check`: "no errors", no warnings.
+
+Per the skill: "An `async` function with no `await` is a **warning**
+(`tyc::async_without_await`)." The diagnostic-table entry is also there
+(`tyc::async_without_await (warn)`). The pass isn't running, or the
+predicate is missing the `return T` case (it may only check for explicit
+empty bodies / pass).
+
+Repro: `stress/tests/57_async_no_await.ty`.
+
+---
+
+## 84. `lazy let` emits an import for `typhon_runtime` but the package isn't written (bug, severe)
+
+**Severity:** bug, severe — every program that uses `lazy let` (and not
+also `Result`) crashes with `ModuleNotFoundError` at import time.
+
+```python
+lazy let A: int = B + 1
+lazy let B: int = A + 1
+```
+
+Emits:
+```python
+from typhon_runtime.lazy import lazy_let as __typhon_lazy_let
+A: int = __typhon_lazy_let(lambda: B + 1)
+B: int = __typhon_lazy_let(lambda: A + 1)
+```
+
+…but `build/typhon_runtime/` is **not** created. Compare with a program
+that uses `Result`/`Ok`/`Err`: there `build/typhon_runtime/` is emitted
+in full (including `lazy.py`).
+
+The runtime-emit gate appears to fire only on Result usage, not on lazy
+usage. Fix the gate to fire on any feature that imports from
+`typhon_runtime.*`.
+
+Repro: `stress/tests/101_lazy_let_circular.ty`,
+`stress/builds/101_lazy_let_circular/build/`.
+
+---
+
+## 85. `auto-gather = true` + `@gatherable` callees produce no rewrite (gap)
+
+**Severity:** gap — the configuration option exists, the decorator is
+accepted, but the rewrite never happens.
+
+```python
+@gatherable
+async def a() -> int: return 1
+
+@gatherable
+async def b() -> int: return 2
+
+async def load() -> int:
+    let x: int = await a()
+    let y: int = await b()
+    return x + y
+```
+
+With `[strictness] auto-gather = true` in `typhon.toml`, the emitted
+Python is:
+```python
+async def load() -> int:
+    x: int = await a()
+    y: int = await b()
+    return x + y
+```
+
+— no `TaskGroup`, no rewrite, no `auto_gather_missed` advice. Either
+`auto-gather` isn't running, or the `@gatherable` predicate isn't
+matching.
+
+Repro: `stress/builds/91_auto_gather/`.
+
+---
+
+## 86. `*args: T, sep: str = "-"` kwarg-after-varargs gets the wrong type error (bug)
+
+**Severity:** bug — calling `stars(1, 2, 3, sep="-")` on
+`def stars(n: int, *args: int, sep: str = ",", **kwargs: int)` fails with
+a wildly misleading diagnostic.
+
+```python
+def stars(n: int, *args: int, sep: str = ",", **kwargs: int) -> str:
+    return sep.join([str(a) for a in args])
+
+def main() -> None:
+    print(stars(1, 2, 3, 4, sep="-"))
+    # tyc::type_mismatch: expected `str`, found `int` (pointing at `2`)
+```
+
+The varargs type `int` is being checked against the *next named
+parameter* (`sep: str`) instead of being absorbed by `*args: int`. The
+checker isn't tracking the boundary between positional-vararg-absorbing
+and keyword-only parameters.
+
+Repro: `stress/tests/24_kwargs_defaults.ty`.
+
+---
+
+## 87. `comptime` help text drifts from documented surface (doc)
+
+**Severity:** doc — the diagnostic help text claims a much smaller
+surface than the language doc.
+
+When a comptime evaluation fails, the help is:
+
+```
+help: comptime expressions support: literals, env("NAME"), env("NAME",
+      "default"), int(), str(), float(), and basic arithmetic
+```
+
+The skill documents a much richer surface: integer / float / string /
+boolean literals, container literals, basic arithmetic, comparisons,
+boolean ops, ternaries, `int()` / `str()` / `float()` / `len()`,
+string methods (`upper`, `lower`, `strip`, `replace`, `startswith`,
+`endswith`, `split`), and user-defined `comptime def` calls.
+
+Either the help text is stale, or the docs are aspirational. Reconcile.
+
+Repro: any failing `comptime let`, e.g. `stress/tests/61_comptime_limits.ty`.
+
+---
+
+## 88. Comptime subscript `E[0]` / `H["a"]` rejected (gap)
+
+**Severity:** gap — comptime supports list/dict literals but not
+subscripting them.
+
+```python
+comptime let E: list[int] = [1, 2, 3, 4, 5]
+comptime let F: int = E[0]
+# tyc::comptime: expression is not a comptime-evaluable constant: Subscript
+```
+
+Indexing a comptime container literal is a natural follow-on operation
+and the docs do mention it loosely. Either lift the restriction or
+document the restriction explicitly.
+
+Repro: `stress/tests/62_comptime_arith.ty`.
+
+---
+
+## 89. Decorator factory pattern (`def trace(p): def dec(f): …`) impossible to type (gap)
+
+**Severity:** gap — a common Python idiom has no usable form in Typhon.
+
+```python
+import functools
+
+def trace(prefix: str):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            print(f"{prefix}: {func.__name__}")
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+@trace("LOG")
+def add(a: int, b: int) -> int:
+    return a + b
+```
+
+Every function in the closure ladder fires `tyc::missing_annotation` for
+parameters and return types. Annotating them properly requires writing
+out the precise `Callable[…, Callable[…, …]]` types, which gets gnarly
+fast and forces `Any` somewhere. No documented short-cut.
+
+Either ship a `Decorator` / `Wrapper` type alias in `typhon_runtime`,
+introduce a `@decorator-factory` style sugar, or document the canonical
+typed-decorator pattern (with `unsafe:`, `ParamSpec`, or `Any` as
+appropriate).
+
+Repro: `stress/tests/112_complex_decorator.ty`.
+
+---
+
+## 90. `self` outside `impl` produces generic `unknown_name` (papercut)
+
+**Severity:** papercut — the diagnostic is correct that `self` isn't
+defined, but the help is misleading.
+
+```python
+def f() -> int:
+    return self.x
+
+# tyc::unknown_name × cannot find 'self' in scope
+#   help: declare 'self' with `let` or `mut`, or import it from a module
+```
+
+`self` is a reserved-ish identifier in Typhon (per Rule 4: methods take
+explicit `self`, but free functions can't). A dedicated diagnostic like
+`tyc::self_outside_impl` with help "self is only available inside `impl
+ClassName:` method bodies" would be far clearer than telling the user to
+write `let self = …`.
+
+Repro: `stress/tests/92_self_outside_impl.ty`.
+
+---
+
+## 91. `let x: int` (no init) treated as a binding, then `x = 5` errors as re-assignment (papercut)
+
+**Severity:** papercut — declare-without-init is silently accepted and
+then any later assignment is rejected.
+
+```python
+def main() -> None:
+    let x: int             # accepted
+    x = 5                  # tyc::immutable_assign — "first declared here"
+    print(x)
+```
+
+Either:
+- Reject `let x: T` without `=` as a parse error / requires-init
+  diagnostic (the skill explicitly shows `let x: T = expr`, never `let x:
+  T`).
+- Treat `let x: T` as a declaration whose *first* assignment is the
+  initialiser (and subsequent assignments require `mut`).
+
+Today's behaviour confuses everyone who writes a Rust-style decl-then-init.
+
+Repro: `stress/tests/110_let_no_init.ty`.
+
+---
+
+## 92. No diagnostic when `def main()` is defined but never called (papercut)
+
+**Severity:** papercut — common newcomer mistake; canonical Typhon
+programs need an explicit `if __name__ == "__main__": main()` block,
+which isn't obvious from the cheat-sheet table.
+
+```python
+def main() -> None:
+    print("hello")
+# no `if __name__ == "__main__":` block
+```
+
+`tyc check`, `tyc build`, `python3.13 build/main.py` — all succeed, no
+output. Of the ~30 `tyc build` runs I did during this campaign, four
+silently produced empty-output programs because I forgot the entry line.
+
+Two reasonable fixes:
+
+1. Emit an advice-level diagnostic when a function named `main` is
+   defined in a top-level module but never referenced.
+2. Auto-emit `if __name__ == "__main__": main()` at the end of the
+   module when (a) a top-level `def main()` exists and (b) no `main()`
+   call exists anywhere in the module.
+
+Option 2 is the higher-impact fix (it makes Typhon match the
+shell-friendly default everyone expects from a script language) and
+keeps the boilerplate out of every example in the docs.
+
+Repro: `stress/builds/41_main_entry/`, plus every test in
+`stress/tests/` that omits the entry block.
+
+---
+
+## 93. Inline comment inside a `gather:` body causes parse error in emitted Python (bug)
+
+**Severity:** bug — adding a comment to a working `gather:` block breaks
+it.
+
+```python
+async def bad() -> int:
+    gather:
+        a = fetch_a()
+        b = fetch_b(a)  # depends on a
+    return a + b
+```
+
+Diagnostic (with span pointing at the desugared Python, not the source):
+```
+tyc::parse × parse error in 'tests/69_async_gather_dep.ty'
+  ╭─[…:14:5]
+ 13 │ __typhon_gather_2__ = __typhon_tg_0__.create_task(fetch_b(a)  # depends on a)
+ 14 │ let a = __typhon_gather_1__.result()
+    ·   ▲
+    ·   ╰── Expected `,`, found `let` at byte range 440..443
+```
+
+The `# depends on a` comment is being pulled into the `create_task(...)`
+call after desugar, so the closing paren ends up *after* the comment,
+which breaks subsequent statements. The desugarer needs to strip /
+re-attach trailing comments before splicing the call expression into a
+`create_task(...)` wrapper.
+
+(Note: the same source without the comment fails differently — see #60
+for the runtime UnboundLocalError.)
+
+Repro: `stress/tests/69_async_gather_dep.ty`.
+
+---
+
+## 94. `tyc check examples/` baseline — not re-run, but still relevant
+
+I did not re-run the examples suite in this campaign, but Finding #56
+from the previous campaign noted "39/47 passing after the upstream
+fixes." The findings above (#57, #58, #61, #70, #71, #74) overlap with
+the residual failures listed there (`25-sqlite-database`,
+`47-mini-app`, the `unused_import` cluster). Fixing them likely lifts
+the example pass rate further.
+
+---
+
+## 95. Summary table — campaign delta
+
+| Area | Pre-campaign | This campaign | Notes |
+|---|---|---|---|
+| Total `.ty` tests | ~47 | 127 | New batch in `stress/tests/` |
+| `tyc check` pass | unknown | 78 / 127 (61%) | Many failures are diagnostic-fire tests |
+| Real bugs surfaced | — | ~20 | Findings #57–#93 |
+| Critical runtime crashes from clean check | — | 4 | #60, #62, #67, #84 |
+| Doc/papercut drift | — | ~8 | #74, #76, #87, #89–#92 |
+| Compiler panics | — | 0 | tyc didn't crash once |
+
+`tyc` is robust at the binary level — no panics across 127 inputs. The
+top-of-funnel quality bugs are all in semantics: union-aliasing, generic
+inference, gather lowering, runtime-emission gating, and migrate
+output.
+
+---
+
+## 96. Suggested fix order (subjective)
+
+If I were sequencing the work behind the highest-impact wins:
+
+1. **Type-alias transparency in assignability** (#57, #58, #70). One
+   change unblocks five surface symptoms.
+2. **`global` / `nonlocal` suppression of `missing_binding_kind`** (#61).
+   Currently makes any global-state pattern unusable.
+3. **Method-level type params in `impl[T]` blocks** (#59). Cheat-sheet
+   example doesn't compile.
+4. **`gather:` dependent-binding detection** (#60). Static rejection or
+   sequential fallback — either is fine, just don't ship broken Python.
+5. **`@property` typing** (#63). Currently makes `@property` unusable.
+6. **`tyc migrate` writes valid Typhon** (#64). Migrator is the
+   onboarding path; today its output is broken.
+7. **Runtime-emission gate broadened to all `typhon_runtime.*` imports**
+   (#84). Cheap fix, eliminates a confusing runtime crash.
+8. **`tyc fmt` actually formats** (#65). The pre-commit story is broken
+   today.
+9. **Mutable-default rejection or rewrite in `class` body** (#62).
+   Pick option 1 or 2 from the finding; either fixes the crash.
+10. **`?` mid-expression desugar** (#66). Either lift the limitation or
+    document it crisply.
+
+Anything below this is a polish pass — better diagnostics, doc
+reconciliation, missing-return analysis, etc.

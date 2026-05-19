@@ -1,0 +1,6 @@
+# bare `list`, `dict`, `tuple` should fail with no-implicit-any = true
+def main() -> None:
+    let xs: list = [1, 2, 3]
+    let d: dict = {"a": 1}
+    let t: tuple = (1, 2, 3)
+    print(xs, d, t)

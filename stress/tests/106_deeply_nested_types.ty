@@ -1,0 +1,9 @@
+def f(x: list[list[list[list[list[list[int]]]]]]) -> int:
+    return x[0][0][0][0][0][0]
+
+def main() -> None:
+    let z: list[list[list[list[list[list[int]]]]]] = [[[[[[1]]]]]]
+    print(f(z))
+
+if __name__ == "__main__":
+    main()

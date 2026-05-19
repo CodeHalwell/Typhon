@@ -1,0 +1,8 @@
+# Does the `?` operator work as a method-chain terminator?
+def step(x: int) -> Result[int, str]:
+    return Ok(x + 1)
+
+def pipeline(x: int) -> Result[int, str]:
+    # bare ? at statement-level
+    step(x)?
+    return Ok(x)

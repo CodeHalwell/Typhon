@@ -1,0 +1,23 @@
+@pure
+def normalise(s: str) -> str:
+    return s.strip().lower()
+
+@memo
+def fib(n: int) -> int:
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+@pure(memo=True)
+def hash_pw(salt: str, pw: str) -> str:
+    return salt + pw
+
+# This one should fail @pure check
+@pure
+def impure() -> int:
+    print("hi")  # I/O
+    return 1
+
+def main() -> None:
+    print(normalise("  HI  "))
+    print(fib(10))

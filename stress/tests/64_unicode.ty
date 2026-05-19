@@ -1,0 +1,6 @@
+def main() -> None:
+    let s: str = "héllo wörld"
+    let emoji: str = "🚀 typhon"
+    let chinese: str = "你好"
+    print(s, emoji, chinese)
+    print(len(emoji))

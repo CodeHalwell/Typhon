@@ -343,6 +343,12 @@ struct Resolver<'a> {
     /// assignment is visited once per pre-collect pass and once per
     /// walk pass, but we only want one diagnostic per source location.
     seen_missing_binding_kind: std::collections::HashSet<(ScopeId, (usize, usize))>,
+    /// Names declared `global X` or `nonlocal X` per scope. Suppresses
+    /// `tyc::missing_binding_kind` on later `X = …` assignments inside
+    /// the same scope — the user has already told us *where* the binding
+    /// lives, so insisting on a `let`/`mut` keyword is noise.
+    /// FINDINGS #61.
+    global_nonlocal_names: std::collections::HashMap<ScopeId, std::collections::HashSet<String>>,
     /// Sorted byte offsets pointing at the first non-whitespace character
     /// of each `class!` declaration line in [`Self::source`]. Consulted
     /// when declaring a class binding to decide whether to tag it
@@ -377,6 +383,7 @@ impl<'a> Resolver<'a> {
             diagnostics: Diagnostics::new(),
             seen_immutable_redecl: std::collections::HashSet::new(),
             seen_missing_binding_kind: std::collections::HashSet::new(),
+            global_nonlocal_names: std::collections::HashMap::new(),
             raw_class_byte_starts: options.raw_class_byte_starts,
             lazy_import_remaps: options.lazy_import_remaps,
             original_source: options.original_source,
@@ -733,6 +740,27 @@ fn find_def_name_span(
 /// class / import names — this lets the val-immutability check fire when a
 /// later `def x` or `class x` collides with an earlier `let x`.
 fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt]) {
+    // Sub-pass 0: harvest `global X` / `nonlocal X` declarations so the
+    // missing_binding_kind check in `declare_target` sees them on the
+    // pre-collect walk too (not just the second resolve pass).
+    // FINDINGS #61.
+    for stmt in body {
+        match stmt {
+            Stmt::Global(g) => {
+                let entry = r.global_nonlocal_names.entry(scope).or_default();
+                for ident in &g.names {
+                    entry.insert(ident.id.as_str().to_owned());
+                }
+            }
+            Stmt::Nonlocal(n) => {
+                let entry = r.global_nonlocal_names.entry(scope).or_default();
+                for ident in &n.names {
+                    entry.insert(ident.id.as_str().to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
     // Sub-pass 1: value bindings (so val-protection sees them first).
     let default_val = r.scopes[scope].kind == ScopeKind::Module;
     for stmt in body {
@@ -898,10 +926,15 @@ fn declare_target(
                 n.range.start().to_usize(),
                 n.range.start().to_usize() + n.id.as_str().len(),
             );
+            let declared_global_or_nonlocal = r
+                .global_nonlocal_names
+                .get(&scope)
+                .is_some_and(|set| set.contains(n.id.as_str()));
             if ast_mutability.is_none()
                 && existing_mut.is_none()
                 && r.scopes[scope].kind == ScopeKind::Function
                 && !n.id.as_str().starts_with("__typhon_")
+                && !declared_global_or_nonlocal
                 && r.seen_missing_binding_kind.insert((scope, span))
             {
                 r.diagnostics.push_error(TycError::missing_binding_kind(
@@ -1218,7 +1251,18 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             // Already declared in collect_top_level.
         }
         Stmt::Pass(_) | Stmt::Break(_) | Stmt::Continue(_) => {}
-        Stmt::Global(_) | Stmt::Nonlocal(_) => {}
+        Stmt::Global(g) => {
+            let entry = r.global_nonlocal_names.entry(scope).or_default();
+            for ident in &g.names {
+                entry.insert(ident.id.as_str().to_owned());
+            }
+        }
+        Stmt::Nonlocal(n) => {
+            let entry = r.global_nonlocal_names.entry(scope).or_default();
+            for ident in &n.names {
+                entry.insert(ident.id.as_str().to_owned());
+            }
+        }
         Stmt::Assert(a) => {
             walk_expr(r, scope, &a.test);
             if let Some(m) = &a.msg {
@@ -1394,11 +1438,6 @@ fn walk_impl_method(r: &mut Resolver, cls_scope: ScopeId, stmt: &Stmt) {
             for d in &f.decorator_list {
                 walk_expr(r, cls_scope, &d.expression);
             }
-            walk_argument_annotations(r, cls_scope, &f.parameters);
-            walk_argument_defaults(r, cls_scope, &f.parameters);
-            if let Some(ret) = &f.returns {
-                walk_expr(r, cls_scope, ret);
-            }
             let fn_scope = r.push_scope(ScopeKind::Function, cls_scope, range_to_span(f.range));
             // Pre-declare the implicit `self` the desugar pass will inject.
             r.declare(
@@ -1408,6 +1447,26 @@ fn walk_impl_method(r: &mut Resolver, cls_scope: ScopeId, stmt: &Stmt) {
                 Mutability::Mut,
                 (0, 0),
             );
+            // PEP 695 method-level type parameters (`def map[U](...) ->
+            // Box[U]:`) bind into the function scope so the parameter and
+            // return-type annotations can resolve them. Without this the
+            // resolver walks the annotations in `cls_scope`, where `U` is
+            // unknown — the symptom for the docs' `Box[T].map[U]`
+            // example. FINDINGS #59.
+            declare_type_params(r, fn_scope, f.type_params.as_deref());
+            let ann_scope = if type_params_is_empty(f.type_params.as_deref()) {
+                cls_scope
+            } else {
+                fn_scope
+            };
+            walk_argument_annotations(r, ann_scope, &f.parameters);
+            // Default values are evaluated in the enclosing (class) scope
+            // before the method name is bound — walk them there so names used
+            // only as defaults don't trigger false unused-import warnings.
+            walk_argument_defaults(r, cls_scope, &f.parameters);
+            if let Some(ret) = &f.returns {
+                walk_expr(r, ann_scope, ret);
+            }
             declare_arguments(r, fn_scope, &f.parameters);
             collect_top_level(r, fn_scope, &f.body);
             for s in &f.body {

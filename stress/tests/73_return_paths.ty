@@ -1,0 +1,5 @@
+# Function that doesn't return on all paths
+def maybe_int(x: int) -> int:
+    if x > 0:
+        return x
+    # missing return — should fail?

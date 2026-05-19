@@ -1,0 +1,18 @@
+# Test various typing imports
+from typing import Optional, List, Dict, Tuple, Union, Any
+
+def use_optional(x: Optional[int]) -> int:
+    if x is None:
+        return 0
+    return x
+
+def use_list(xs: List[int]) -> int:
+    return len(xs)
+
+def use_any(x: Any) -> Any:
+    return x
+
+def main() -> None:
+    print(use_optional(5))
+    print(use_list([1, 2, 3]))
+    print(use_any("hi"))

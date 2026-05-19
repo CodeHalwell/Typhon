@@ -1,0 +1,17 @@
+def main() -> None:
+    let d: dict[str, int] = {"a": 1, "b": 2, "c": 3}
+
+    # iter items - was Finding #40 before
+    for k, v in d.items():
+        print(f"{k}={v}")
+
+    # values, keys
+    for k in d.keys():
+        print(k)
+    for v in d.values():
+        print(v)
+
+    # dict.get returns V?
+    let x: int? = d.get("a")
+    let y: int = d.get("a")  # should fail - V? not assignable to V
+    print(x)

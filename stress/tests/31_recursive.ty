@@ -1,0 +1,24 @@
+# Mutually recursive types
+class TreeNode:
+    value: int
+    left: TreeNode?
+    right: TreeNode?
+
+def sum_tree(t: TreeNode?) -> int:
+    if t is None:
+        return 0
+    return t.value + sum_tree(t.left) + sum_tree(t.right)
+
+# Recursive list-like
+class LinkedList:
+    head: int
+    tail: LinkedList?
+
+def length(l: LinkedList?) -> int:
+    if l is None:
+        return 0
+    return 1 + length(l.tail)
+
+def main() -> None:
+    let t: TreeNode = TreeNode(value=1, left=TreeNode(value=2, left=None, right=None), right=None)
+    print(sum_tree(t))

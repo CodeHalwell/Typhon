@@ -1,0 +1,15 @@
+import asyncio
+
+async def fetch_a() -> int:
+    return 1
+
+async def fetch_b(x: int) -> int:
+    return x + 1
+
+async def bad() -> int:
+    gather:
+        a = fetch_a()
+        b = fetch_b(a)
+    return a + b
+
+asyncio.run(bad())

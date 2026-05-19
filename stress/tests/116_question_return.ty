@@ -1,0 +1,5 @@
+def step(x: int) -> Result[int, str]:
+    return Ok(x + 1)
+
+def pipeline(x: int) -> Result[int, str]:
+    return Ok(step(x)?)  # ? in nested expression

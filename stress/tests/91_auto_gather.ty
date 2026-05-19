@@ -1,0 +1,16 @@
+import asyncio
+
+@gatherable
+async def a() -> int:
+    return 1
+
+@gatherable
+async def b() -> int:
+    return 2
+
+async def load() -> int:
+    let x: int = await a()
+    let y: int = await b()
+    return x + y
+
+asyncio.run(load())

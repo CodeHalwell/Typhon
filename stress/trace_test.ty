@@ -1,0 +1,9 @@
+def boom() -> int:
+    let xs: list[int] = []
+    return xs[0]  # IndexError
+
+def main() -> None:
+    print(boom())
+
+if __name__ == "__main__":
+    main()

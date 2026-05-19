@@ -1,0 +1,7 @@
+def main() -> None:
+    let π: float = 3.14159
+    let résultat: int = 5
+    print(π, résultat)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,21 @@
+def main() -> None:
+    # Wide format-spec usage
+    let n: float = 3.14159
+    let a: str = f"{n:10.2f}"
+    let b: str = f"{n:>20.4f}"
+    let c: str = f"{n:^15.3f}"
+    let d: str = f"{n:+.5f}"
+    let e: str = f"{n:.0e}"
+    let f: str = f"{n:%}"  # percent
+    print(a, b, c, d, e, f)
+
+    let m: int = 1234567
+    let g: str = f"{m:,}"
+    let h: str = f"{m:_}"
+    let i: str = f"{m:#x}"
+    let j: str = f"{m:#o}"
+    let k: str = f"{m:#b}"
+    print(g, h, i, j, k)
+
+if __name__ == "__main__":
+    main()

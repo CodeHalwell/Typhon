@@ -1,0 +1,38 @@
+def code(x: int) -> str:
+    match x:
+        case 0:
+            return "zero"
+        case 1 | 2 | 3:
+            return "small"
+        case n if n > 100:
+            return "huge"
+        case _:
+            return "other"
+
+# String literal patterns
+def msg(s: str) -> str:
+    match s:
+        case "hi":
+            return "hello"
+        case "bye":
+            return "farewell"
+        case _:
+            return "?"
+
+# Dict patterns
+def cmd(d: dict[str, str]) -> str:
+    match d:
+        case {"op": "add", "val": v}:
+            return f"add {v}"
+        case {"op": op}:
+            return op
+        case _:
+            return "unknown"
+
+def main() -> None:
+    print(code(2), code(101), code(0))
+    print(msg("hi"))
+    print(cmd({"op": "add", "val": "5"}))
+
+if __name__ == "__main__":
+    main()

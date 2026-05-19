@@ -1,0 +1,15 @@
+def greet(name: str, greeting: str = "Hello") -> str:
+    return f"{greeting}, {name}!"
+
+def main() -> None:
+    # All forms
+    print(greet("Amy"))
+    print(greet("Amy", "Hi"))
+    print(greet("Amy", greeting="Hi"))
+    print(greet(name="Amy"))
+    print(greet(name="Amy", greeting="Hi"))
+    # Wrong kwarg name
+    print(greet("Amy", greetinx="Hi"))  # typo
+
+if __name__ == "__main__":
+    main()

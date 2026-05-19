@@ -1,0 +1,31 @@
+import asyncio
+
+async def fetch_a() -> int:
+    await asyncio.sleep(0.0)
+    return 1
+
+async def fetch_b() -> int:
+    await asyncio.sleep(0.0)
+    return 2
+
+async def load() -> int:
+    gather:
+        a = fetch_a()
+        b = fetch_b()
+    return a + b
+
+async def best_effort_load() -> int:
+    gather(strategy="best-effort"):
+        a = fetch_a()
+        b = fetch_b()
+    return 0
+
+# sync function calling async - should error
+def broken() -> int:
+    return fetch_a()
+
+async def main() -> None:
+    let total: int = await load()
+    print(total)
+
+asyncio.run(main())

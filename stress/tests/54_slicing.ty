@@ -1,0 +1,13 @@
+def main() -> None:
+    let xs: list[int] = [1, 2, 3, 4, 5]
+    let a: list[int] = xs[1:3]
+    let b: list[int] = xs[:2]
+    let c: list[int] = xs[2:]
+    let d: list[int] = xs[::-1]
+    let e: int = xs[-1]
+    let s: str = "hello"
+    let sub: str = s[1:3]
+    print(a, b, c, d, e, sub)
+
+if __name__ == "__main__":
+    main()

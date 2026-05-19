@@ -1,0 +1,14 @@
+class WithDefault:
+    name: str = "default"
+    count: int = 0
+    tags: list[str] = []  # mutable default — Python footgun
+
+def main() -> None:
+    let a: WithDefault = WithDefault()
+    let b: WithDefault = WithDefault(name="x")
+    print(a.name, b.name)
+    a.tags.append("foo")
+    print(b.tags)  # is this affected? (shared default mutable bug)
+
+if __name__ == "__main__":
+    main()

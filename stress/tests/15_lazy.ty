@@ -1,0 +1,17 @@
+lazy import np = numpy
+lazy import os_mod = os
+
+class Config:
+    host: str
+    port: int
+
+def load_config() -> Config:
+    return Config(host="localhost", port=8080)
+
+lazy let CFG: Config = load_config()
+
+class Service:
+    lazy let cfg: Config = load_config()
+
+def main() -> None:
+    print(CFG.host)

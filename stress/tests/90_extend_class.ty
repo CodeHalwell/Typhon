@@ -1,0 +1,19 @@
+class User:
+    name: str
+
+impl User:
+    def greet(self) -> str:
+        return f"hi {self.name}"
+
+# Cross-module style — extend the same class
+extend User:
+    def shout(self) -> str:
+        return self.name.upper()
+
+def main() -> None:
+    let u: User = User(name="amy")
+    print(u.greet())
+    print(u.shout())
+
+if __name__ == "__main__":
+    main()

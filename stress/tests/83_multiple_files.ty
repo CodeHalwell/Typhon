@@ -1,0 +1,5 @@
+# Test cross-module — needs another file
+from other import helper
+
+def main() -> None:
+    print(helper(5))
