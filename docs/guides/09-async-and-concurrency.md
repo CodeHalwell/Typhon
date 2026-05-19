@@ -103,6 +103,23 @@ gather(strategy="best-effort"):
 
 In this mode, each bound name is `T | Exception` (or similar) — the failed ones come back as exception objects you can inspect. The checker reflects that in the types.
 
+### Dependent bindings inside `gather:`
+
+If a binding inside a `gather:` block references the name of an earlier binding in the same block, the lowering can't parallelise: each await depends on the previous, so the compiler falls back to a sequential `let x = await …` sequence in source order. Concurrency degrades gracefully rather than producing broken Python.
+
+```python
+# Typhon
+gather:
+    a = fetch_a()
+    b = fetch_b(a)          # references `a` — sequential lowering
+
+# Emitted Python (sequential, because b depends on a)
+a = await fetch_a()
+b = await fetch_b(a)
+```
+
+If you want the parallel `TaskGroup` lowering, factor the dependency out — compute `a` ahead of the block and `await` only the independent calls inside `gather:`.
+
 ### Automatic `asyncio.gather` (opt-in)
 
 The analyser can rewrite *sequential* awaits as `gather` automatically, but only when:

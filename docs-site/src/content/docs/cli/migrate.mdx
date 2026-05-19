@@ -16,7 +16,12 @@ Converts typed Python (`.py`) to Typhon (`.ty`) in one pass. Used to bootstrap a
 - **`Optional[T]` / `T | None`** → **`T?`** in annotation positions.
 - **`@dataclass` decorators** and their `from dataclasses import dataclass` are dropped (Typhon classes emit as dataclasses by default).
 - **Module-level annotated assignments** (`x: int = 1`) gain `let` (or `mut` if reassigned later in the same module).
+- **Function-body plain assignments** (`user = find_user(1)`, `total = 0`) gain `let` on the first occurrence of each name per function. If the same name is reassigned anywhere else in the file (in this function or another), the first occurrence is promoted to `mut` instead. Subsequent assignments to a name already bound in the same scope are left bare (a correct re-binding). Class-body annotated assignments are left alone — those are field declarations, not locals.
+
+  The reassignment flag is file-wide (a single set, not per-function), so a `total = total + 1` accumulator in one function will also tag a one-shot `total = 0` in an unrelated function as `mut`. That's a deliberate over-approximation — `mut` of an unmutated binding still type-checks, whereas the inverse (`let` on a counter) would not. If the spurious `mut` bothers you, rename the unmutated local.
 - **`from typing import TypeVar` plus `T = TypeVar("T")`** scaffolding is dropped; generic functions become PEP 695 form.
+
+Migrated output is intended to pass `tyc check` on first try.
 
 ## Examples
 
@@ -27,18 +32,12 @@ tyc migrate --check src/app.py     # preview to stdout (no writes)
 
 ## `--check` mode
 
-Useful in CI to confirm a `.py` file is already Typhon-compatible:
+`--check` is a **preview** flag: it prints the migrated source to stdout (one block per file, headed by `# ── <path> ──`) instead of writing `.ty` files to disk. It does *not* compare the output against the original, and it always exits 0 on a successful migration — there is no "no diffs needed" exit code today.
 
-```yaml
-- name: Confirm app.py migrates cleanly
-  run: tyc migrate --check src/app.py
-```
-
-`--check` exits 0 if no changes are needed, 1 if there are diffs to apply.
+To confirm in CI that a `.py` file is already Typhon-compatible, pipe the preview into `diff` against an expected `.ty` (or run `tyc check` on the preview output via a tempfile). A native exit-1-on-changes mode is a deliberate follow-up.
 
 ## What it can *not* do automatically
 
-- **Add `let` / `mut` to function-local bindings.** The migrator inserts `let` by default for module-level annotated assigns, but inside function bodies it cannot tell counters / accumulators from constants without flow analysis. After migration, run `tyc check` and fix the resulting `tyc::immutable_assign` diagnostics by changing the relevant `let`s to `mut`.
 - **Rewrite `try/except` into `Result[T, E]`.** That's a design-level refactor, not a mechanical translation. Migrate the file first; then refactor errors incrementally.
 - **Convert `class X(BaseModel)` into `model X:`.** Pydantic-using classes are detected but not auto-converted; you do it manually because the field ordering and Pydantic-specific decorators (`@validator`, `Field(...)`, etc.) need attention.
 - **Subclasses of framework bases** (`torch.nn.Module`, `Enum`, `unittest.TestCase`) are not detected as candidates for `class!`. After migration, convert them by hand.
@@ -48,7 +47,7 @@ The migrator is the boring 80%; the remaining 20% is design work.
 ## Recommended migration sequence
 
 1. **Audit the project.** Identify modules that are obvious wins (pure value types, helpers without Pydantic / framework bases) vs ones that need design work.
-2. **Migrate a leaf module first** (`tyc migrate src/utils.py`). Verify with `tyc check`. Fix `tyc::missing_binding_kind` (add `let` / `mut`).
+2. **Migrate a leaf module first** (`tyc migrate src/utils.py`). Verify with `tyc check`. The migrator now inserts `let`/`mut` on function-body locals, so the typical first run should be clean — any remaining diagnostics are usually design issues (`try/except` patterns, framework bases) rather than missing keywords.
 3. **Migrate adjacent modules.** Where you cross into framework bases, mark them `class!` (or leave them as `.py` for now).
 4. **Convert Pydantic-using classes to `model`** by hand when ready.
 5. **Refactor `try/except` to `Result[T, E]`** module-by-module as time allows.

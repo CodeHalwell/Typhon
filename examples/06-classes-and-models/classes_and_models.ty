@@ -27,6 +27,19 @@ impl Point:
         return Point(x=self.x + dx, y=self.y + dy)
 
 
+class Cart:
+    items: list[str] = []   # mutable default — lifted to default_factory at desugar
+
+
+impl Cart:
+    @property
+    def size(self) -> int:
+        return len(self.items)
+
+    def add(self, item: str) -> None:
+        self.items.append(item)
+
+
 model ApiUser:
     id: int
     name: str
@@ -54,6 +67,11 @@ def main() -> None:
 
     let title: str = "The Quick Brown Fox"
     print(title.slug())
+
+    let cart: Cart = Cart()
+    cart.add("apple")
+    cart.add("pear")
+    print(f"cart size: {cart.size}")    # @property — read like an attribute
 
 
 if __name__ == "__main__":

@@ -80,6 +80,26 @@ class User:
 
 You can split `impl` blocks across files (e.g. keep `User` definition in `models.ty` and add domain methods from `auth.ty`). The desugarer collects them all.
 
+### `@property`
+
+Decorate a no-argument method with `@property` to expose it as an attribute:
+
+```python
+class Rect:
+    w: float
+    h: float
+
+impl Rect:
+    @property
+    def area(self) -> float:
+        return self.w * self.h
+
+let r: Rect = Rect(w=3.0, h=4.0)
+let a: float = r.area     # not r.area() — `area` types as `float`, not `() -> float`
+```
+
+The type checker resolves `r.area` to the property's return type, so the access reads as a plain attribute read. Underneath, this lowers to standard Python `@property` semantics.
+
 ## Why `impl` instead of methods-in-class?
 
 Two reasons:

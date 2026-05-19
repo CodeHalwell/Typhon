@@ -10,12 +10,12 @@ Typhon ships a single binary, `tyc`, that handles every stage of the workflow. S
 |---------|---------|
 | `tyc build` | Full pipeline: parse, check, analyse, desugar, emit, format. Also bootstraps the Python environment — merges the owned keys (`[project] name/version/requires-python/dependencies`, plus `[dependency-groups].dev` when `[dev-dependencies]` is non-empty) into `pyproject.toml` (preserving any user-managed `[tool.*]` / other `[project]` keys) and runs `uv sync` so `.venv` is ready. `uv sync` failure is downgraded to a warning. |
 | `tyc check` | Up to analyser, no emit. Used by CI. |
-| `tyc fmt` | Format `.ty` source. Wraps `ruff format` applied to a Typhon-aware pretty-printer. |
+| `tyc fmt` | Format `.ty` source. The v1 pass collapses runs of interior whitespace, strips space after `(`/`[` and before `)`/`]`/`,`/`;`, and normalises trailing-whitespace / line-endings. Spacing around `:`, `=`, and `->` is left alone today — those need bracket-depth awareness (slice vs annotation) and are deferred. A full AST-based reprinter is a Phase-5 follow-up. |
 | `tyc lsp` | Run as a Language Server. |
 | `tyc init` | Scaffold a new project: `typhon.toml`, `src/`, `tests/`. |
 | `tyc trace` | Map a Python traceback back to Typhon source via `.py.map` files. |
 | `tyc profile` | Instrument emitted code for hot-function detection (advanced, opt-in). |
-| `tyc migrate` | Convert typed Python (`.py`) to Typhon (`.ty`): rewrites `Optional[T]`/`T \| None` → `T?`, adds `let`/`mut` to module-level annotated assigns, strips `@dataclass` decorators. |
+| `tyc migrate` | Convert typed Python (`.py`) to Typhon (`.ty`): rewrites `Optional[T]`/`T \| None` → `T?`, adds `let`/`mut` to module-level annotated assigns *and* function-body plain assignments, strips `@dataclass` decorators. |
 | `tyc ty` | Build the project and run Astral's `ty` checker against the emitted Python. Requires `ty` on `PATH` (`pip install ty`). Supports `--watch` for continuous feedback. |
 | `tyc stubtest` | Build the project and run `python -m mypy.stubtest` against every emitted `.pyi` stub. Complements `tyc check --stubs` (which performs an AST diff) by catching dynamically-created attributes the AST cannot see. Requires `mypy` in the chosen interpreter (`pip install mypy`). |
 | `tyc repl` | Interactive Typhon evaluator. Reads `.ty` source one block at a time, compiles it through the full pipeline, and executes the result with a Python interpreter. |
@@ -71,7 +71,10 @@ Converts typed Python (`.py`) to Typhon (`.ty`) in one pass:
 
 - `Optional[T]` / `T | None` → `T?`
 - Module-level annotated assignments (`x: int = 1`) gain `let` (or `mut` when later reassigned).
+- Function-body plain assignments (`user = find_user(1)`, `total = 0`) gain `let` on first occurrence per function, promoted to `mut` if the same name is reassigned anywhere else in the file (the reassignment flag is file-wide, so an accumulator named `total` in one function will also tag a one-shot `total = 0` in another function as `mut` — a deliberate over-approximation, since `mut` on an unmutated binding still type-checks). Subsequent assignments to the same name in the same scope are left bare (correct re-binding). Class-body annotated assignments are left untouched — those are field declarations, not locals.
 - `@dataclass` decorators and their `from dataclasses import dataclass` are dropped.
+
+The output is designed to pass `tyc check` cleanly out of the box; accumulators / counters surfaced as `mut` are worth a manual review when porting larger codebases.
 
 ```bash
 # Convert a single file (writes app.ty alongside app.py):
@@ -81,7 +84,7 @@ tyc migrate src/app.py
 tyc migrate --check src/app.py
 ```
 
-`--check` mode is useful in CI to confirm that a `.py` file is already Typhon-compatible.
+`--check` is a preview mode: it prints the migrated source to stdout instead of writing `.ty` files, but it does not compare against the input and always exits 0 on a successful migration. CI users who want a fail-on-diff signal should diff `--check` output against a checked-in `.ty`; a native exit-1-on-changes mode is a deliberate follow-up.
 
 ## `tyc ty`
 

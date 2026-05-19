@@ -9,7 +9,11 @@ sidebar:
 tyc fmt [PATHS]... [--check]
 ```
 
-Parses `.ty` files, validates the syntax, normalises whitespace and indentation, and writes the formatted result back to disk. Wraps `ruff format` applied to a Typhon-aware pretty-printer.
+Parses `.ty` files, validates the syntax, normalises a small set of whitespace rules, and writes the result back to disk.
+
+:::caution[v1 scope]
+The v1 formatter is a line-level whitespace pass, not yet a full AST-based reprinter. It collapses interior whitespace and tidies bracket/comma spacing, but leaves spacing around `:`, `=`, and `->` alone (those rules need bracket-depth awareness for slices vs annotations). A Typhon-aware AST-based reprinter wrapping `ruff format` is a Phase-5 follow-up.
+:::
 
 ## Examples
 
@@ -19,22 +23,26 @@ tyc fmt src/main.ty           # format one file
 tyc fmt --check src/          # exit 1 if anything would change (CI mode)
 ```
 
-## What it changes
+## What it changes today
 
-- **Whitespace normalisation** — same rules as `ruff format` / `black`.
-- **Indentation** — 4 spaces, no tabs.
-- **Trailing whitespace** — removed.
+- **Interior whitespace** — runs of 2+ spaces past the leading indent are collapsed to one (`def    main` → `def main`).
+- **Bracket adjacency** — `(  x` → `(x`, `x  )` → `x)`, `x   ,` → `x,`.
+- **Comma spacing** — a run of whitespace after `,` is normalised to a single space (`a,    b` → `a, b`).
+- **Comment hash spacing** — `#foo` → `# foo`. Shebangs (`#!…`) and section-marker double-hash comments (`## …`) are left alone.
+- **Leading tab expansion** — a tab character at the start of a line is expanded to four spaces.
+- **Blank-line runs** — three or more consecutive blank lines are collapsed to two.
+- **Trailing whitespace** — removed (including from whitespace-only lines, which become empty).
 - **Line endings** — `\n`.
-- **Blank lines** — two between top-level functions / classes; one inside.
-- **Operator spacing** — `a + b`, not `a+b`.
-- **Hanging vs vertical layout** — `ruff format`'s heuristics.
+
+These rules all skip text inside `'…'`, `"…"`, and triple-quoted regions, so docstrings and embedded code stay verbatim.
 
 ## What it preserves
 
+- **Indentation depth** — the leading run of spaces is kept; only the *characters* change (tab → four spaces).
+- **Spacing around `:`, `=`, `->`** — left as-is (needs slice/annotation disambiguation; deferred).
 - **String quotes** — left as-is (Typhon doesn't take a side between `"` and `'`).
 - **`let` / `mut`** placement.
-- **`type` aliases** — single-line if they fit.
-- **Comments** — kept on the same line if they fit; promoted to a previous line otherwise.
+- **Comment text** — content after the normalised `# ` prefix is kept verbatim; shebangs and `## …` lines are passed through unchanged.
 
 ## Flags
 
