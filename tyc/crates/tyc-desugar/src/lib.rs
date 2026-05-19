@@ -1055,9 +1055,7 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             // this for classes that will receive the dataclass decorator —
             // pydantic models, protocols, and impl stubs keep their bodies
             // untouched. FINDINGS #62.
-            if needs_decorator
-                && rewrite_mutable_field_defaults(&mut new_body)
-            {
+            if needs_decorator && rewrite_mutable_field_defaults(&mut new_body) {
                 body_transformed = true;
             }
             let mut new_class = c.clone();
@@ -1193,7 +1191,9 @@ fn rewrite_mutable_field_defaults(body: &mut [Stmt]) -> bool {
         let Some(factory_name) = mutable_default_factory(value) else {
             continue;
         };
-        a.value = Some(Box::new(make_dataclasses_field_default_factory(factory_name)));
+        a.value = Some(Box::new(make_dataclasses_field_default_factory(
+            factory_name,
+        )));
         changed = true;
     }
     changed
@@ -1207,7 +1207,9 @@ fn mutable_default_factory(value: &Expr) -> Option<&'static str> {
         Expr::List(l) if l.elts.is_empty() => Some("list"),
         Expr::Dict(d) if d.items.is_empty() => Some("dict"),
         Expr::Set(s) if s.elts.is_empty() => Some("set"),
-        Expr::Call(call) if call.arguments.args.is_empty() && call.arguments.keywords.is_empty() => {
+        Expr::Call(call)
+            if call.arguments.args.is_empty() && call.arguments.keywords.is_empty() =>
+        {
             if let Expr::Name(n) = call.func.as_ref() {
                 match n.id.as_str() {
                     "list" => Some("list"),

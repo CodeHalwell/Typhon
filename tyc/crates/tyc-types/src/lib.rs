@@ -1372,11 +1372,8 @@ impl<'a> Checker<'a> {
             Type::Generic(name, args) => {
                 if let Some((params, rhs)) = self.type_aliases.get(name.as_str()) {
                     if params.len() == args.len() {
-                        let bindings: std::collections::HashMap<String, Type> = params
-                            .iter()
-                            .cloned()
-                            .zip(args.iter().cloned())
-                            .collect();
+                        let bindings: std::collections::HashMap<String, Type> =
+                            params.iter().cloned().zip(args.iter().cloned()).collect();
                         let substituted = substitute_typevars(rhs, &bindings);
                         return self.unwrap_alias_inner(&substituted, depth + 1);
                     }
@@ -2084,8 +2081,7 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
             if let Expr::Name(n) = ta.name.as_ref() {
                 let alias_name = n.id.as_str().to_owned();
                 let params = type_param_names_from(ta.type_params.as_deref());
-                let rhs =
-                    type_from_annotation_with_params(ta.value.as_ref(), &classes, &params);
+                let rhs = type_from_annotation_with_params(ta.value.as_ref(), &classes, &params);
                 c.type_aliases.insert(alias_name, (params, rhs));
             }
         }
@@ -2252,9 +2248,10 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
                     Some(r) => type_from_annotation(r, classes),
                     None => Type::Unknown,
                 };
-                let is_property = f.decorator_list.iter().any(|d| {
-                    matches!(&d.expression, Expr::Name(n) if n.id.as_str() == "property")
-                });
+                let is_property = f
+                    .decorator_list
+                    .iter()
+                    .any(|d| matches!(&d.expression, Expr::Name(n) if n.id.as_str() == "property"));
                 shape.methods.insert(
                     f.name.as_str().to_owned(),
                     MethodSig {

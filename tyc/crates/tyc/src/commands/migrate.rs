@@ -280,12 +280,8 @@ fn rewrite_line(
             .unwrap_or((false, HashSet::new()));
         let in_fn = already.0;
         let already_set = already.1;
-        if in_fn
-            && !body.starts_with("let ")
-            && !body.starts_with("mut ")
-        {
-            let name = leading_plain_assign_name(&body)
-                .or_else(|| leading_ann_assign_name(&body));
+        if in_fn && !body.starts_with("let ") && !body.starts_with("mut ") {
+            let name = leading_plain_assign_name(&body).or_else(|| leading_ann_assign_name(&body));
             if let Some(name) = name {
                 if !already_set.contains(&name) {
                     let kw = if reassigned.contains(&name) {

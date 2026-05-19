@@ -348,8 +348,7 @@ struct Resolver<'a> {
     /// the same scope — the user has already told us *where* the binding
     /// lives, so insisting on a `let`/`mut` keyword is noise.
     /// FINDINGS #61.
-    global_nonlocal_names:
-        std::collections::HashMap<ScopeId, std::collections::HashSet<String>>,
+    global_nonlocal_names: std::collections::HashMap<ScopeId, std::collections::HashSet<String>>,
     /// Sorted byte offsets pointing at the first non-whitespace character
     /// of each `class!` declaration line in [`Self::source`]. Consulted
     /// when declaring a class binding to decide whether to tag it
