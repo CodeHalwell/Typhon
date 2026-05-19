@@ -1389,10 +1389,24 @@ fn class_inherits_protocol(c: &ruff_python_ast::StmtClassDef) -> bool {
 /// `TypedDict` subclasses must not receive `@dataclasses.dataclass(slots=True)`
 /// — Python raises `TypeError: cannot inherit from both a TypedDict type and a
 /// non-TypedDict base class` at class-definition time. FINDINGS #67.
+///
+/// Handles bare-name (`TypedDict`), `typing.TypedDict`, and
+/// `typing_extensions.TypedDict` forms.
 fn class_inherits_typed_dict(c: &ruff_python_ast::StmtClassDef) -> bool {
-    c.bases()
-        .iter()
-        .any(|base| matches!(base, Expr::Name(n) if n.id.as_str() == "TypedDict"))
+    c.bases().iter().any(|base| match base {
+        // `class X(TypedDict):`
+        Expr::Name(n) => n.id.as_str() == "TypedDict",
+        // `class X(typing.TypedDict):` or `class X(typing_extensions.TypedDict):`
+        Expr::Attribute(a) => {
+            a.attr.as_str() == "TypedDict"
+                && matches!(
+                    &*a.value,
+                    Expr::Name(n)
+                    if n.id.as_str() == "typing" || n.id.as_str() == "typing_extensions"
+                )
+        }
+        _ => false,
+    })
 }
 
 /// Return `true` if the module already has `from pydantic import BaseModel`
@@ -2867,6 +2881,28 @@ mod tests {
         assert!(
             !out.contains("dataclass"),
             "TypedDict must not get dataclass decorator: {out}"
+        );
+    }
+
+    #[test]
+    fn typed_dict_qualified_skips_dataclass_decorator() {
+        // `typing.TypedDict` (qualified) must also be detected.
+        let src = "import typing\nclass U(typing.TypedDict):\n    id: int\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            !out.contains("dataclass"),
+            "typing.TypedDict must not get dataclass decorator: {out}"
+        );
+    }
+
+    #[test]
+    fn typed_dict_extensions_qualified_skips_dataclass_decorator() {
+        // `typing_extensions.TypedDict` must also be detected.
+        let src = "import typing_extensions\nclass U(typing_extensions.TypedDict):\n    id: int\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            !out.contains("dataclass"),
+            "typing_extensions.TypedDict must not get dataclass decorator: {out}"
         );
     }
 }
