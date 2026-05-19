@@ -426,6 +426,54 @@ pub fn type_from_annotation_with_params(
                 }
                 return type_from_annotation_with_params(&s.slice, classes, type_params);
             }
+            // Callable[[P1, P2, ...], R] / Callable[..., R] — structural
+            // function type. Map to `Type::Function` so call expressions
+            // can be type-checked against the param list and the value is
+            // accepted by the call-site arm rather than rejected as
+            // `not_callable`. FINDINGS #43.
+            if head == "Callable" {
+                if let Expr::Tuple(t) = s.slice.as_ref() {
+                    if t.elts.len() == 2 {
+                        let ret =
+                            type_from_annotation_with_params(&t.elts[1], classes, type_params);
+                        match &t.elts[0] {
+                            // `Callable[[T, U], R]`
+                            Expr::List(list) => {
+                                let params: Vec<Type> = list
+                                    .elts
+                                    .iter()
+                                    .map(|e| {
+                                        type_from_annotation_with_params(e, classes, type_params)
+                                    })
+                                    .collect();
+                                return Type::Function {
+                                    params,
+                                    ret: Box::new(ret),
+                                    variadic: false,
+                                };
+                            }
+                            // `Callable[..., R]` — any args, fixed return.
+                            // Mirror Python's behaviour by treating the
+                            // arity as "any", which we model with a
+                            // single-param variadic function.
+                            Expr::EllipsisLiteral(_) => {
+                                return Type::Function {
+                                    params: vec![Type::Any],
+                                    ret: Box::new(ret),
+                                    variadic: true,
+                                };
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                // Unrecognised shape — leave as a generic so existing
+                // variance / assignability checks keep working.
+                return Type::Generic(
+                    "Callable".into(),
+                    vec![Type::Unknown, Type::Unknown],
+                );
+            }
             // Result[T, E] — two-parameter sealed sum type (Ok[T] | Err[E]).
             if head == "Result" {
                 if let Expr::Tuple(t) = s.slice.as_ref() {

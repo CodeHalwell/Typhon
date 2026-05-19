@@ -1758,6 +1758,14 @@ the outer delimiter, swap quotes (Black's strategy).
 
 ## 43. `Callable[[T], U]` is not callable (bug, critical)
 
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`.
+`type_from_annotation` in `tyc-types/src/lib.rs` now special-cases the
+`Callable[[P1, P2, ...], R]` and `Callable[..., R]` shapes and produces
+a `Type::Function { params, ret, variadic }` directly, so the call-site
+arm in `infer_expr` accepts it. Verified with both function arguments
+and `Callable`-returning composition patterns; the previous
+`tyc::not_callable` diagnostic no longer fires.
+
 **Severity:** bug — critical; blocks higher-order programming, custom
 decorators, closures, callback patterns.
 
