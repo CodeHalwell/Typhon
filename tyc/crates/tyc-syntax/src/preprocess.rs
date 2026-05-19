@@ -1626,8 +1626,19 @@ fn find_mid_expression_questionmarks(code: &str) -> Vec<usize> {
     let bytes = code.as_bytes();
     let trimmed_end = code.trim_end_matches([' ', '\t']).len();
     // Skip the *last* `?` if it ends the code — that's the supported form.
+    //
+    // Also skip the `?` that immediately precedes a trailing `,` or `:` —
+    // those are the `with`-chain terminators `expr?,` and `expr?:` which
+    // `expand_with_chains` recognises later in the pipeline.  Without this
+    // carve-out, the bindings on every line of a `with ... = ...?,
+    // ... = ...?:` chain would be spuriously flagged as mid-expression `?`.
     let scan_end = if trimmed_end > 0 && bytes[trimmed_end - 1] == b'?' {
         trimmed_end - 1
+    } else if trimmed_end >= 2
+        && (bytes[trimmed_end - 1] == b',' || bytes[trimmed_end - 1] == b':')
+        && bytes[trimmed_end - 2] == b'?'
+    {
+        trimmed_end - 2
     } else {
         trimmed_end
     };

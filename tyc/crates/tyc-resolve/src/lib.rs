@@ -1032,6 +1032,23 @@ fn range_to_span(range: TextRange) -> (usize, usize) {
 fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
     match stmt {
         Stmt::FunctionDef(f) => {
+            // Declare the function name in the enclosing scope.  Idempotent
+            // at the same span — top-level defs are already pre-declared by
+            // `collect_top_level`, but defs nested inside `with`, `if`, `try`,
+            // etc. would otherwise leave the name unbound in the parent.
+            let name_span = find_def_name_span(
+                r.source,
+                f.range.start().to_usize(),
+                "def ",
+                f.name.as_str(),
+            );
+            r.declare(
+                scope,
+                f.name.as_str(),
+                BindingKind::Function,
+                Mutability::Mut,
+                name_span,
+            );
             // Decorators are evaluated in the enclosing scope.
             for d in &f.decorator_list {
                 walk_expr(r, scope, &d.expression);
@@ -1063,6 +1080,18 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             }
         }
         Stmt::ClassDef(c) => {
+            // Declare the class name in the enclosing scope.  Same rationale
+            // as the FunctionDef arm above — handles classes nested in `with`,
+            // `if`, `try`, etc. which `collect_top_level` doesn't reach.
+            let cls_stmt_start = c.range.start().to_usize();
+            let cls_name_span =
+                find_def_name_span(r.source, cls_stmt_start, "class ", c.name.as_str());
+            let cls_kind = if r.is_raw_class_offset(cls_stmt_start) {
+                ClassKind::Raw
+            } else {
+                ClassKind::Plain
+            };
+            r.declare_class(scope, c.name.as_str(), cls_name_span, cls_kind);
             for d in &c.decorator_list {
                 walk_expr(r, scope, &d.expression);
             }
@@ -1248,13 +1277,116 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
                 walk_expr(r, scope, t);
             }
         }
+        Stmt::Match(m) => {
+            walk_expr(r, scope, &m.subject);
+            for case in &m.cases {
+                walk_pattern(r, scope, &case.pattern);
+                if let Some(g) = &case.guard {
+                    walk_expr(r, scope, g);
+                }
+                for s in &case.body {
+                    walk_stmt(r, scope, s);
+                }
+            }
+        }
         _ => {}
+    }
+}
+
+/// Walk a `match` pattern, recording name references (e.g. `Ok` in `case
+/// Ok(value):`) and declaring name bindings (e.g. `value` in the same case).
+///
+/// Python semantics: case bindings are introduced in the enclosing scope and
+/// remain visible after the `match` ends; they are rebindable like `for`
+/// loop targets, so they are declared with [`Mutability::Mut`].
+fn walk_pattern(r: &mut Resolver, scope: ScopeId, pattern: &ast::Pattern) {
+    use ast::Pattern;
+    match pattern {
+        Pattern::MatchValue(p) => walk_expr(r, scope, &p.value),
+        Pattern::MatchSingleton(_) => {}
+        Pattern::MatchSequence(p) => {
+            for sub in &p.patterns {
+                walk_pattern(r, scope, sub);
+            }
+        }
+        Pattern::MatchMapping(p) => {
+            for k in &p.keys {
+                walk_expr(r, scope, k);
+            }
+            for sub in &p.patterns {
+                walk_pattern(r, scope, sub);
+            }
+            if let Some(rest) = &p.rest {
+                let span = (
+                    rest.range.start().to_usize(),
+                    rest.range.start().to_usize() + rest.id.as_str().len(),
+                );
+                r.declare(
+                    scope,
+                    rest.id.as_str(),
+                    BindingKind::Loop,
+                    Mutability::Mut,
+                    span,
+                );
+            }
+        }
+        Pattern::MatchClass(p) => {
+            walk_expr(r, scope, &p.cls);
+            for sub in &p.arguments.patterns {
+                walk_pattern(r, scope, sub);
+            }
+            for kw in &p.arguments.keywords {
+                walk_pattern(r, scope, &kw.pattern);
+            }
+        }
+        Pattern::MatchStar(p) => {
+            if let Some(name) = &p.name {
+                let span = (
+                    name.range.start().to_usize(),
+                    name.range.start().to_usize() + name.id.as_str().len(),
+                );
+                r.declare(
+                    scope,
+                    name.id.as_str(),
+                    BindingKind::Loop,
+                    Mutability::Mut,
+                    span,
+                );
+            }
+        }
+        Pattern::MatchAs(p) => {
+            if let Some(sub) = &p.pattern {
+                walk_pattern(r, scope, sub);
+            }
+            if let Some(name) = &p.name {
+                let span = (
+                    name.range.start().to_usize(),
+                    name.range.start().to_usize() + name.id.as_str().len(),
+                );
+                r.declare(
+                    scope,
+                    name.id.as_str(),
+                    BindingKind::Loop,
+                    Mutability::Mut,
+                    span,
+                );
+            }
+        }
+        Pattern::MatchOr(p) => {
+            for sub in &p.patterns {
+                walk_pattern(r, scope, sub);
+            }
+        }
     }
 }
 
 /// Walk every annotation expression on the parameters of a function, so
 /// names used in those annotations are recorded as references and bound
 /// against the enclosing scope.
+///
+/// Default values on parameters are also walked so names referenced there
+/// (e.g. `Depends(get_db)` on a FastAPI dependency-injected parameter) are
+/// recorded as references against the enclosing scope.
 fn walk_argument_annotations(r: &mut Resolver, scope: ScopeId, args: &ast::Parameters) {
     let all = args
         .posonlyargs
@@ -1264,6 +1396,9 @@ fn walk_argument_annotations(r: &mut Resolver, scope: ScopeId, args: &ast::Param
     for arg in all {
         if let Some(ann) = &arg.parameter.annotation {
             walk_expr(r, scope, ann);
+        }
+        if let Some(def) = &arg.default {
+            walk_expr(r, scope, def);
         }
     }
     if let Some(va) = &args.vararg {
