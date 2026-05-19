@@ -1255,6 +1255,116 @@ fn corpus_result_type_with_nullable_builds_and_runs() {
     );
 }
 
+// ── class! __init__ synthesis ──────────────────────────────────────────────
+
+#[test]
+fn raw_class_strips_field_defaults_when_init_is_synthesised() {
+    // `class!` folds field defaults into the synthesised `__init__`
+    // signature; leaving them at class scope as well would evaluate
+    // each default twice (once as a shared class attribute at
+    // class-definition time, once per-instance inside `__init__`),
+    // which allocates extra objects and confuses libraries that
+    // introspect class attributes (e.g. PyTorch parameter
+    // registration on subclasses).
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "from torch.nn import Module, Linear, F, Tensor\n\
+         \n\
+         class! Model(Module):\n\
+         \x20   linear: Linear = Linear(10, 5)\n\
+         \x20   dropout: float = 0.5\n\
+         \n\
+         impl Model:\n\
+         \x20   def forward(self, x: Tensor) -> Tensor:\n\
+         \x20       mut x = self.linear(x)\n\
+         \x20       x = F.dropout(x, p=self.dropout)\n\
+         \x20       return x\n",
+    );
+    build(tmp.path());
+    let out = std::fs::read_to_string(tmp.path().join("build/main.py")).unwrap();
+    // Annotations survive so type checkers still see the field shape.
+    assert!(
+        out.contains("linear: Linear\n") || out.contains("linear: Linear\r\n"),
+        "bare `linear: Linear` annotation should remain after stripping default; got:\n{out}",
+    );
+    assert!(
+        out.contains("dropout: float\n") || out.contains("dropout: float\r\n"),
+        "bare `dropout: float` annotation should remain after stripping default; got:\n{out}",
+    );
+    // The default expression must not survive at class scope — the
+    // `__init__` signature is the single source of truth.
+    let class_body_end = out.find("def __init__").unwrap_or(out.len());
+    let class_body = &out[..class_body_end];
+    assert!(
+        !class_body.contains("Linear(10, 5)"),
+        "class-level `linear: Linear = Linear(10, 5)` default should be stripped; got class body:\n{class_body}",
+    );
+    assert!(
+        !class_body.contains("dropout: float = 0.5"),
+        "class-level `dropout: float = 0.5` default should be stripped; got class body:\n{class_body}",
+    );
+    // But the `__init__` signature still carries them as parameter defaults.
+    assert!(
+        out.contains("def __init__(self, linear: Linear = Linear(10, 5), dropout: float = 0.5)"),
+        "synthesised __init__ should carry the defaults; got:\n{out}",
+    );
+    // And the per-instance assignments remain in source order.
+    assert!(
+        out.contains("self.linear = linear"),
+        "synthesised __init__ should assign self.linear; got:\n{out}",
+    );
+    assert!(
+        out.contains("self.dropout = dropout"),
+        "synthesised __init__ should assign self.dropout; got:\n{out}",
+    );
+}
+
+#[test]
+fn plain_class_keeps_field_defaults() {
+    // The default-stripping rewrite is scoped to `class!` synthesis.
+    // A plain `class` lowers to `@dataclass(slots=True)`, where the
+    // class-level default *is* the source of the field default — it
+    // must not be stripped.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "class Point:\n\
+         \x20   x: float = 0.0\n\
+         \x20   y: float = 0.0\n",
+    );
+    build(tmp.path());
+    let out = std::fs::read_to_string(tmp.path().join("build/main.py")).unwrap();
+    assert!(
+        out.contains("x: float = 0.0") && out.contains("y: float = 0.0"),
+        "plain `class` must keep class-level defaults — they feed @dataclass; got:\n{out}",
+    );
+}
+
+#[test]
+fn raw_class_without_base_keeps_field_defaults() {
+    // The synthesis only fires for `class!` with at least one
+    // positional base (something to chain `super().__init__()`
+    // through). A bare `class! Foo:` falls through without synthesis,
+    // so defaults must survive.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "class! Empty:\n\
+         \x20   value: int = 42\n",
+    );
+    build(tmp.path());
+    let out = std::fs::read_to_string(tmp.path().join("build/main.py")).unwrap();
+    assert!(
+        out.contains("value: int = 42"),
+        "`class!` without a base does not synthesise __init__, so the default must remain; got:\n{out}",
+    );
+    assert!(
+        !out.contains("def __init__"),
+        "`class!` without a base must not synthesise __init__; got:\n{out}",
+    );
+}
+
 // ── ensuring CARGO_BIN_EXE is set ───────────────────────────────────────────
 
 #[test]

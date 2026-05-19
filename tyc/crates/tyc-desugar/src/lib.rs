@@ -1070,7 +1070,15 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             // constructor: `super().__init__()` followed by `self.x = x` for
             // every annotated field, in source order. The class-level field
             // annotations are kept so type checkers still see the field
-            // shape (mirrors the dataclass convention).
+            // shape, but their default expressions are stripped — the
+            // synthesised `__init__` carries the defaults in its parameter
+            // list, so leaving them at class scope would evaluate every
+            // default twice (once at class-definition time as a shared
+            // class attribute, then again per-instance in `__init__`).
+            // That double-eval is harmless for cheap literals like `0.5`
+            // but allocates real objects for things like `Linear(10, 5)`
+            // and confuses libraries that introspect class attributes
+            // (e.g. PyTorch parameter registration on subclasses).
             if is_raw && class_has_any_base(c) && !body_has_init(&new_class.body) {
                 let synthesised = synthesise_raw_class_init(&new_class.body);
                 // Place `__init__` after the leading run of (docstring +
@@ -1078,6 +1086,7 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
                 // doc → fields → __init__ → methods.
                 let insert_at = raw_class_init_insert_pos(&new_class.body);
                 new_class.body.insert(insert_at, synthesised);
+                strip_field_defaults(&mut new_class.body);
             }
             // Only propagate `true` when a dataclass decorator was added (or
             // was added deeper in the body) — that's the signal used by
@@ -1487,6 +1496,27 @@ fn raw_class_init_insert_pos(body: &[Stmt]) -> usize {
         }
     }
     idx
+}
+
+/// Strip the default value from each top-level `AnnAssign` whose target
+/// is a plain `Name`. Used after `synthesise_raw_class_init` has folded
+/// those defaults into the generated `__init__` signature — keeping them
+/// at class scope as well would mean the default expression is
+/// evaluated twice (once as a class attribute at class-definition time,
+/// then again per-instance in `__init__`).
+///
+/// Only top-level statements are touched; nested classes / functions
+/// are left alone. AnnAssigns with non-`Name` targets (subscripts,
+/// attribute writes) are also skipped because `synthesise_raw_class_init`
+/// never folds them into the constructor in the first place.
+fn strip_field_defaults(body: &mut [Stmt]) {
+    for stmt in body.iter_mut() {
+        if let Stmt::AnnAssign(a) = stmt {
+            if matches!(a.target.as_ref(), Expr::Name(_)) {
+                a.value = None;
+            }
+        }
+    }
 }
 
 /// Synthesise an `__init__(self, …) -> None` for a `class!` body. The
