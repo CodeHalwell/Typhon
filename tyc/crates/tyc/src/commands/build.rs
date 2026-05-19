@@ -220,7 +220,8 @@ pub fn run(args: BuildArgs) -> Result<()> {
             ));
         }
 
-        let module = substitute_comptime_literals(module, &comptime_values);
+        let module =
+            substitute_comptime_literals(module, &comptime_values, &prep.comptime_functions);
 
         // Phase 3 purity analysis: every `@pure` / `@memo` function is verified
         // against the six-condition rule, and the desugarer is told which
@@ -584,13 +585,26 @@ fn build_source_map_v2(source_rel: &str, preprocessed: &str, line_offsets: &[usi
 fn substitute_comptime_literals(
     mut module: ModModule,
     values: &HashMap<String, ComptimeValue>,
+    comptime_fn_names: &[String],
 ) -> ModModule {
-    if values.is_empty() {
+    if values.is_empty() && comptime_fn_names.is_empty() {
         return module;
     }
     module.body = module
         .body
         .into_iter()
+        // Drop the `def` for any `comptime def` function — those are only
+        // callable during build-time evaluation (their bodies typically
+        // reference `env(...)` and other comptime-only intrinsics that do
+        // not exist at runtime), so leaving them in the emitted Python
+        // would surface a `NameError` if anything called them.
+        .filter(|stmt| {
+            if let Stmt::FunctionDef(f) = stmt {
+                !comptime_fn_names.iter().any(|n| n == f.name.as_str())
+            } else {
+                true
+            }
+        })
         .map(|stmt| substitute_stmt(stmt, values))
         .collect();
     module
