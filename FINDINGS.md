@@ -2229,6 +2229,14 @@ checks clean).
 
 ## 52. Multi-line pipe (`|>` at start of next line) fails to parse (bug)
 
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. Added a
+`join_pipe_continuations` pre-pass that runs before `expand_pipes`.
+When a line inside an unclosed parenthesised expression starts (after
+whitespace) with `|>`, it is merged into the previous logical line
+with a single space joiner. The pass is paren-depth-aware and skips
+lines that begin inside a triple-quoted string. Outside parentheses
+it's a no-op — Python doesn't permit operator-at-line-start there.
+
 **Severity:** bug — common Python wrap pattern.
 
 ```ty

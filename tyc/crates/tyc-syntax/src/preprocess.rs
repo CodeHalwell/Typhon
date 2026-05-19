@@ -3275,6 +3275,16 @@ fn parse_go_call(rest: &str) -> Option<(String, Option<String>)> {
 /// Lines that begin inside a triple-quoted string are passed through
 /// verbatim. A line that contains no top-level `|>` is unchanged.
 pub fn expand_pipes(source: &str) -> String {
+    // First, fold multi-line pipe segments back onto their preceding
+    // line so the rest of the pass can stay line-oriented. Python
+    // allows operators at the start of a continuation line inside a
+    // parenthesised expression (black/ruff format `+`, `and`, `|`
+    // that way); `|>` follows the same convention. FINDINGS #52.
+    let joined = join_pipe_continuations(source);
+    expand_pipes_line_by_line(&joined)
+}
+
+fn expand_pipes_line_by_line(source: &str) -> String {
     let mut result = String::with_capacity(source.len());
     let mut in_string: Option<StringMode> = None;
 
@@ -3316,6 +3326,86 @@ pub fn expand_pipes(source: &str) -> String {
     }
 
     result
+}
+
+/// Fold multi-line pipe segments back onto their preceding line so the
+/// line-based [`expand_pipes`] pass can rewrite the chain. When a line
+/// inside an unclosed parenthesised expression starts (after whitespace)
+/// with `|>`, we treat it as a continuation of the previous logical
+/// line and join them with a single space. Outside parentheses the
+/// pass is a no-op — Python doesn't permit operator-at-line-start
+/// there anyway.
+///
+/// Lines that begin mid-string (e.g. triple-quoted continuation) are
+/// passed through verbatim so we don't perturb string contents.
+fn join_pipe_continuations(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut buffered: Option<(String, String)> = None; // (line_without_terminator, terminator)
+    let mut paren_depth: i32 = 0;
+    let mut in_string: Option<StringMode> = None;
+
+    let flush =
+        |buffered: &mut Option<(String, String)>, out: &mut String| {
+            if let Some((line, term)) = buffered.take() {
+                out.push_str(&line);
+                out.push_str(&term);
+            }
+        };
+
+    for line in source.split_inclusive('\n') {
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let terminator = &line[raw.len()..];
+
+        // Snapshot the string state at the start of this line.
+        let pre_string = in_string;
+        let _ = scan_line_code_end(raw, &mut in_string);
+
+        // If we entered this line inside a string literal, just emit
+        // the buffer-then-line as-is — we can't safely join across
+        // string boundaries.
+        if pre_string.is_some() {
+            flush(&mut buffered, &mut out);
+            out.push_str(line);
+            continue;
+        }
+
+        // Look for a leading `|>` (after any whitespace), but only
+        // accept it as a continuation if we are inside an unclosed
+        // parenthesised expression.
+        let trimmed = raw.trim_start();
+        let is_pipe_continuation =
+            paren_depth > 0 && trimmed.starts_with("|>") && buffered.is_some();
+
+        if is_pipe_continuation {
+            // Merge with the buffered previous line.
+            if let Some((prev_line, prev_term)) = buffered.take() {
+                // Drop the terminator on the previous line and the
+                // leading whitespace on this one, joining with a single
+                // space so existing tokenization keeps working.
+                let joined = format!("{} {}", prev_line, trimmed);
+                buffered = Some((joined, prev_term));
+            }
+        } else {
+            // Different shape — flush whatever was buffered and start
+            // buffering this line in its place.
+            flush(&mut buffered, &mut out);
+            buffered = Some((raw.to_owned(), terminator.to_owned()));
+        }
+
+        // Track parenthesis depth based on the now-buffered or already-
+        // flushed line. We scan the original raw text (the join above
+        // preserves bracket-balance because it just glues two halves
+        // together).
+        for &b in raw.as_bytes() {
+            match b {
+                b'(' | b'[' | b'{' => paren_depth += 1,
+                b')' | b']' | b'}' => paren_depth -= 1,
+                _ => {}
+            }
+        }
+    }
+    flush(&mut buffered, &mut out);
+    out
 }
 
 /// Locate every `|>` token in `code` that sits at parenthesis depth 0 and
