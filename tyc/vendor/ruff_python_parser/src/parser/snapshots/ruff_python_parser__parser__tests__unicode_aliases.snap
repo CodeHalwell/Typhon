@@ -1,5 +1,6 @@
 ---
-source: crates/ruff_python_parser/src/parser/tests.rs
+source: vendor/ruff_python_parser/src/parser/tests.rs
+assertion_line: 59
 expression: suite
 ---
 [
@@ -38,6 +39,7 @@ expression: suite
                     },
                 },
             ),
+            mutability: None,
         },
     ),
 ]
