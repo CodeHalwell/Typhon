@@ -1036,8 +1036,12 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             // at the same span — top-level defs are already pre-declared by
             // `collect_top_level`, but defs nested inside `with`, `if`, `try`,
             // etc. would otherwise leave the name unbound in the parent.
-            let name_span =
-                find_def_name_span(r.source, f.range.start().to_usize(), "def ", f.name.as_str());
+            let name_span = find_def_name_span(
+                r.source,
+                f.range.start().to_usize(),
+                "def ",
+                f.name.as_str(),
+            );
             r.declare(
                 scope,
                 f.name.as_str(),

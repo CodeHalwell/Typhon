@@ -1072,11 +1072,9 @@ impl Emitter {
                                             for spec_elem in &spec.elements {
                                                 match spec_elem {
                                                     InterpolatedStringElement::Literal(lit) => {
-                                                        self.write(
-                                                            &escape_python_fstring_literal(
-                                                                &lit.value, outer,
-                                                            ),
-                                                        );
+                                                        self.write(&escape_python_fstring_literal(
+                                                            &lit.value, outer,
+                                                        ));
                                                     }
                                                     InterpolatedStringElement::Interpolation(
                                                         nested,
