@@ -2268,6 +2268,14 @@ Single-line pipes work fine. Workaround: keep the chain on one line.
 
 ## 53. REPL re-prints `print(...)` return as `None` (bug, papercut)
 
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`.
+`wrap_bare_expression_for_repl` now consults
+`is_none_returning_top_level_call(expr)` and skips the
+`print(repr(...))` wrap when the bare expression is a syntactic call
+to a known None-returning builtin (`print(...)`, `pprint(...)`,
+`pprint.pprint(...)`). Other bare expressions still auto-print as
+before. Verified: `>>> print(5 * 2)` now prints `10` (was `10\nNone`).
+
 **Severity:** papercut — REPL auto-print overzealous.
 
 ```text

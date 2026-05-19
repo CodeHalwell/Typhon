@@ -447,7 +447,29 @@ fn wrap_bare_expression_for_repl(block: &str) -> String {
         }
         i += 1;
     }
+    // Skip the auto-print wrap when the bare expression is itself a
+    // call to a known None-returning builtin (FINDINGS #53). Otherwise
+    // `print(x)` becomes `print(repr(print(x)))` — the inner print
+    // emits `x`'s repr, then the outer prints `None`. Detection is
+    // syntactic: matches `print(...)` and the rarer `pprint.pprint(...)`.
+    if is_none_returning_top_level_call(trimmed) {
+        return block.to_owned();
+    }
     format!("print(repr({}))\n", trimmed)
+}
+
+/// Return `true` when `expr` is a top-level call to a function that's
+/// known to return `None` and produce visible side-effects on its own
+/// (so re-wrapping in `print(repr(...))` would double-render). Used
+/// by the REPL auto-print pass (FINDINGS #53).
+fn is_none_returning_top_level_call(expr: &str) -> bool {
+    const NONE_CALLS: &[&str] = &["print(", "pprint(", "pprint.pprint("];
+    for prefix in NONE_CALLS {
+        if expr.starts_with(prefix) && expr.ends_with(')') {
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) fn compile_to_python(source: &str) -> Result<String> {
