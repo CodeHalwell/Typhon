@@ -177,6 +177,25 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A `class` body declared `__init__` directly. Typhon generates
+    /// the constructor from the field annotations, so writing one
+    /// manually conflicts with the emitted dataclass / model. Use
+    /// field defaults or a free factory function instead. FINDINGS #50.
+    #[error("`{class_name}.__init__` cannot be defined — the constructor is generated from the class fields")]
+    #[diagnostic(
+        code(tyc::manual_init),
+        help(
+            "remove `__init__`; set per-field defaults on the class or write a free factory function"
+        )
+    )]
+    ManualInit {
+        class_name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("declared __init__ here")]
+        span: SourceSpan,
+    },
+
     /// A sync function called an `async def` without awaiting it. The
     /// expression's value is a coroutine, not the function's declared
     /// return type — and Python's runtime emits "coroutine was never
@@ -611,6 +630,21 @@ impl TycError {
     ) -> Self {
         Self::NotCallable {
             typ: typ.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::ManualInit`] diagnostic.
+    pub fn manual_init(
+        class_name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::ManualInit {
+            class_name: class_name.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

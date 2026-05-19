@@ -2147,6 +2147,16 @@ it's currently not wired.
 
 ## 50. `__init__` in `class` body silently accepted, both emitted (gap)
 
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. Added a
+new `TycError::ManualInit` variant with the documented
+`tyc::manual_init` code, plus the `manual_init` factory. The class-body
+walk in `tyc-types/src/lib.rs` now intercepts a `def __init__(...)`
+*before* the softer dunder skip, emits the error, and `continue`s past
+the body — so the existing `method_in_class_body` warning doesn't
+double-fire on the same span. The error fires at the function-name
+span and the build cannot proceed, preventing the conflicting emitted
+output described in the finding.
+
 **Severity:** gap — Rule says it's an error; emitter produces wrong code.
 
 ```ty

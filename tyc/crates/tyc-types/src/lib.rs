@@ -2317,6 +2317,25 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 for s in &cd.body {
                     if let Stmt::FunctionDef(f) = s {
                         let method = f.name.as_str();
+                        let span_start = f.name.range.start().to_usize();
+                        // `__init__` is generated from the field
+                        // annotations (`@dataclass(slots=True)` or
+                        // `BaseModel`). Writing one manually conflicts
+                        // with the emitted constructor and is rejected
+                        // by the docs (FINDINGS #50). Emit a dedicated
+                        // `tyc::manual_init` error here rather than
+                        // falling through to the softer
+                        // `method_in_class_body` warning.
+                        if method == "__init__" {
+                            c.diagnostics.push_error(TycError::manual_init(
+                                class_name.to_owned(),
+                                c.path.clone(),
+                                c.source,
+                                span_start,
+                                method.len(),
+                            ));
+                            continue;
+                        }
                         // Don't warn on dunders the user is *expected* to
                         // override (e.g. `__add__`, `__lt__`); those are
                         // legitimate uses of class-body methods too. The
@@ -2325,7 +2344,6 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         if method.starts_with("__") && method.ends_with("__") {
                             continue;
                         }
-                        let span_start = f.name.range.start().to_usize();
                         c.diagnostics.push_warning(TycError::method_in_class_body(
                             class_name.to_owned(),
                             method.to_owned(),
