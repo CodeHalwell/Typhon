@@ -37,15 +37,21 @@ fn init_creates_project_structure() {
         .status()
         .unwrap();
     assert!(status.success(), "tyc init should succeed");
+    // `tyc init NAME --dir DIR` scaffolds into `DIR/NAME/`, matching
+    // `cargo new` / `bun init NAME` / `uv init NAME` semantics.
+    let project = tmp.path().join("myapp");
     assert!(
-        tmp.path().join("typhon.toml").exists(),
-        "typhon.toml missing"
+        project.join("typhon.toml").exists(),
+        "typhon.toml missing in named subdirectory"
     );
     assert!(
-        tmp.path().join("src").join("main.ty").exists(),
-        "src/main.ty missing"
+        project.join("src").join("main.ty").exists(),
+        "src/main.ty missing in named subdirectory"
     );
-    assert!(tmp.path().join("tests").is_dir(), "tests/ dir missing");
+    assert!(
+        project.join("tests").is_dir(),
+        "tests/ dir missing in named subdirectory"
+    );
 }
 
 #[test]
@@ -56,7 +62,7 @@ fn init_embeds_project_name_in_toml() {
         .arg(tmp.path())
         .status()
         .unwrap();
-    let toml = std::fs::read_to_string(tmp.path().join("typhon.toml")).unwrap();
+    let toml = std::fs::read_to_string(tmp.path().join("coolproject").join("typhon.toml")).unwrap();
     assert!(
         toml.contains("coolproject"),
         "project name not present in typhon.toml"
@@ -376,17 +382,18 @@ def double(x: int) -> int:
 let g: Greeter = EnglishGreeter()
 let result: int = double(21)
 "#;
-    std::fs::write(tmp.path().join("src").join("main.ty"), src).unwrap();
+    let project = tmp.path().join("demo");
+    std::fs::write(project.join("src").join("main.ty"), src).unwrap();
 
     // `tyc check` must pass.
-    let status = tyc().arg("check").arg(tmp.path()).status().unwrap();
+    let status = tyc().arg("check").arg(&project).status().unwrap();
     assert!(status.success(), "tyc check failed on Phase 3 fixture");
 
     // `tyc build` must succeed and produce main.py.
-    let status = tyc().arg("build").arg(tmp.path()).status().unwrap();
+    let status = tyc().arg("build").arg(&project).status().unwrap();
     assert!(status.success(), "tyc build failed on Phase 3 fixture");
 
-    let py = std::fs::read_to_string(tmp.path().join("build").join("main.py")).unwrap();
+    let py = std::fs::read_to_string(project.join("build").join("main.py")).unwrap();
     assert!(
         py.contains("Protocol"),
         "interface should be emitted as a Protocol class"

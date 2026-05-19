@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use clap::Args;
 use miette::{miette, Result};
 
-use tyc_analyse::{analyse_purity, evaluate_comptime, purity_diagnostics};
+use tyc_analyse::{analyse_purity, evaluate_comptime_with_functions, purity_diagnostics};
 use tyc_db::{check_file, TycDatabase};
 use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_emit::{compare_modules, StubTestKind};
@@ -218,7 +218,13 @@ fn run_analysis_passes(path: &str, source: &str) -> Diagnostics {
         Err(_) => return diags,
     };
 
-    let (_, comptime_diags) = evaluate_comptime(&module, &prep.comptime_bindings);
+    // Pass `comptime_functions` so `comptime def` calls dispatch
+    // correctly in check the same way they do in build (FINDINGS #48).
+    let (_, comptime_diags) = evaluate_comptime_with_functions(
+        &module,
+        &prep.comptime_bindings,
+        &prep.comptime_functions,
+    );
     diags.extend(comptime_diags);
 
     let purity_findings = analyse_purity(&module, false);

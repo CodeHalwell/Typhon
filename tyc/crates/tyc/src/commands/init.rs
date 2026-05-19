@@ -22,14 +22,28 @@ pub struct InitArgs {
 }
 
 pub fn run(args: InitArgs) -> Result<()> {
-    let dir = args.dir.canonicalize().unwrap_or(args.dir.clone());
-
-    let name = args.name.unwrap_or_else(|| {
-        dir.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("myproject")
-            .to_owned()
-    });
+    // When a `NAME` is supplied, scaffold into `<dir>/<NAME>/` — matching the
+    // convention of `cargo new`, `bun init NAME`, `uv init NAME`. When only
+    // `--dir` is supplied (no name), scaffold into that directory and infer
+    // the project name from its basename.
+    let (dir, name) = match args.name {
+        Some(name) => {
+            let target = args.dir.join(&name);
+            std::fs::create_dir_all(&target)
+                .map_err(|e| miette!("cannot create {}: {}", target.display(), e))?;
+            let canonical = target.canonicalize().unwrap_or(target);
+            (canonical, name)
+        }
+        None => {
+            let base = args.dir.canonicalize().unwrap_or(args.dir.clone());
+            let inferred = base
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("myproject")
+                .to_owned();
+            (base, inferred)
+        }
+    };
 
     // Refuse to overwrite an existing typhon.toml.
     let config_path = dir.join("typhon.toml");
@@ -110,16 +124,31 @@ mod tests {
             dir: tmp.path().to_path_buf(),
         };
         run(args).unwrap();
+        let project = tmp.path().join("myapp");
+        assert!(project.join("typhon.toml").exists(), "typhon.toml missing");
+        assert!(project.join("src").is_dir(), "src/ dir missing");
+        assert!(project.join("src/main.ty").exists(), "src/main.ty missing");
+        assert!(project.join("tests").is_dir(), "tests/ dir missing");
+    }
+
+    #[test]
+    fn init_with_name_creates_subdirectory() {
+        // `tyc init NAME` should scaffold into `./NAME/`, not the CWD,
+        // matching `cargo new` / `bun init NAME` / `uv init NAME` semantics.
+        let tmp = tempfile::tempdir().unwrap();
+        let args = InitArgs {
+            name: Some("hello".into()),
+            dir: tmp.path().to_path_buf(),
+        };
+        run(args).unwrap();
         assert!(
-            tmp.path().join("typhon.toml").exists(),
-            "typhon.toml missing"
+            tmp.path().join("hello/typhon.toml").exists(),
+            "typhon.toml should land in the named subdirectory"
         );
-        assert!(tmp.path().join("src").is_dir(), "src/ dir missing");
         assert!(
-            tmp.path().join("src/main.ty").exists(),
-            "src/main.ty missing"
+            !tmp.path().join("typhon.toml").exists(),
+            "typhon.toml must not leak into the parent directory"
         );
-        assert!(tmp.path().join("tests").is_dir(), "tests/ dir missing");
     }
 
     #[test]
@@ -130,7 +159,7 @@ mod tests {
             dir: tmp.path().to_path_buf(),
         };
         run(args).unwrap();
-        let toml = std::fs::read_to_string(tmp.path().join("typhon.toml")).unwrap();
+        let toml = std::fs::read_to_string(tmp.path().join("coolproject/typhon.toml")).unwrap();
         assert!(
             toml.contains("coolproject"),
             "project name not in typhon.toml"
@@ -146,7 +175,7 @@ mod tests {
             dir: tmp.path().to_path_buf(),
         })
         .unwrap();
-        // Second init on the same dir must fail.
+        // Second init on the same dir + name must fail.
         let result = run(InitArgs {
             name: Some("proj".into()),
             dir: tmp.path().to_path_buf(),
@@ -159,18 +188,13 @@ mod tests {
 
     #[test]
     fn init_writes_main_ty_with_let_not_deprecated_val() {
-        // Regression guard: the scaffolded `main.ty` must use `let`, the
-        // current binding keyword.  `val` was an early-development spelling
-        // that has since been removed from the lexer; reintroducing it in
-        // the template would generate a project that doesn't type-check on
-        // the first `tyc check`.
         let tmp = tempfile::tempdir().unwrap();
         let args = InitArgs {
             name: Some("regression".into()),
             dir: tmp.path().to_path_buf(),
         };
         run(args).unwrap();
-        let body = std::fs::read_to_string(tmp.path().join("src/main.ty")).unwrap();
+        let body = std::fs::read_to_string(tmp.path().join("regression/src/main.ty")).unwrap();
         assert!(
             !body.split_whitespace().any(|tok| tok == "val"),
             "scaffold leaked the deprecated `val` keyword:\n{body}"

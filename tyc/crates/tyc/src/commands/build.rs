@@ -25,7 +25,7 @@ use tyc_analyse::{
 use tyc_db::{check_file, TycDatabase};
 use tyc_desugar::{desugar_module_with, DesugarOptions};
 use tyc_diagnostics::{Diagnostics, TycError};
-use tyc_emit::{emit_python_with_line_offsets, emit_stub};
+use tyc_emit::{emit_python_with_line_offsets_for_target, emit_stub};
 use tyc_format::format_source;
 use tyc_syntax::preprocess::{
     expand_gather_blocks, expand_go_calls, expand_lazy_imports, expand_multiline_guards,
@@ -352,7 +352,13 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // Build output must be valid Python, so emit with `let`/`mut`
         // suppressed at the AST level — a text-based strip would corrupt
         // string-literal contents that happen to start with those words.
-        let (mut python_src, line_offsets) = emit_python_with_line_offsets(&desugar_output.module);
+        // Parse the configured Python minor version so the emitter can
+        // lower PEP 695 syntax for targets < 3.12 (FINDINGS #47).
+        // Anything we can't parse falls back to `0` (no lowering),
+        // matching the previous default.
+        let target_minor = parse_python_minor(&config.python.target);
+        let (mut python_src, line_offsets) =
+            emit_python_with_line_offsets_for_target(&desugar_output.module, target_minor);
 
         // Optionally normalise whitespace in the emitted Python (tabs → spaces,
         // trailing whitespace, final newline).  Full ruff-style reformatting
@@ -494,6 +500,17 @@ fn python_module_name_from_path(path: &std::path::Path, src_dir: &std::path::Pat
         }
     }
     parts.join(".")
+}
+
+/// Parse a `[python] target = "3.X"` string into its minor version.
+/// Returns `0` for unparseable / unrecognised values (telling the
+/// emitter to skip PEP 695 lowering and keep the previous behaviour).
+/// Tolerates `"3.13"`, `"3.13t"` (free-threaded), `"3.10"`, etc.
+fn parse_python_minor(target: &str) -> u8 {
+    let rest = target.strip_prefix("3.").unwrap_or(target);
+    // Strip any trailing alphabetical suffix ("t" for free-threaded).
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse::<u8>().unwrap_or(0)
 }
 
 /// Minimal JSON string escape for paths used in the `.py.map` body.  Only

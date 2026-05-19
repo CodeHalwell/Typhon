@@ -5,7 +5,7 @@
 //! input (whitespace and comment differences are acceptable in Phase 0).
 
 use ruff_python_ast::{
-    Alias, BoolOp, CmpOp, Comprehension, ExceptHandler, Expr, FStringPart,
+    self as ast, Alias, BoolOp, CmpOp, Comprehension, ExceptHandler, Expr, FStringPart,
     InterpolatedStringElement, Keyword, MatchCase, ModModule, Mutability, Number, Operator,
     Parameter, ParameterWithDefault, Parameters, Pattern, Singleton, Stmt, TypeParam, TypeParams,
     UnaryOp, WithItem,
@@ -36,6 +36,19 @@ pub struct Emitter {
     /// extra blank line.  Reset to `false` after emitting a non-block stmt
     /// at indent 0.
     prev_top_level_was_block: bool,
+    /// Stack of outer-quote characters for currently-active f-strings. When
+    /// we emit a `StringLiteral` while one is non-empty, the literal must
+    /// be wrapped in a quote character that differs from the f-string's
+    /// outer delimiter so PEP 701 nesting works on 3.11/3.12 and isn't
+    /// ambiguous on 3.13+. Tracked as a stack so nested f-strings
+    /// (`f"{ f'{x}' }"`) compose correctly.
+    fstring_quote_stack: Vec<char>,
+    /// Target Python minor version (3.X). When `< 12`, PEP 695 syntax
+    /// (`def f[T](...)`, `class Box[T]:`, `type X = Y`) is lowered to
+    /// the older `TypeVar` + `Generic[T]` + `X: TypeAlias = Y` shapes
+    /// so the emitted module parses on 3.10 / 3.11 (FINDINGS #47).
+    /// `0` means "unset" and disables lowering.
+    target_minor: u8,
 }
 
 const INDENT_WIDTH: usize = 4;
@@ -49,6 +62,8 @@ impl Emitter {
             line_offsets: Vec::new(),
             suppress_mutability: false,
             prev_top_level_was_block: false,
+            fstring_quote_stack: Vec::new(),
+            target_minor: 0,
         }
     }
 
@@ -56,6 +71,20 @@ impl Emitter {
     /// Build output uses this; `tyc fmt` does not.
     pub fn suppress_mutability_keywords(&mut self) {
         self.suppress_mutability = true;
+    }
+
+    /// Set the target Python minor version (`3.X`). When `< 12`, PEP 695
+    /// syntax is lowered to the legacy `TypeVar` / `Generic[T]` /
+    /// `X: TypeAlias = Y` shapes so the emitted module parses on the
+    /// older interpreter (FINDINGS #47). Default is unset → no lowering.
+    pub fn set_python_target(&mut self, minor: u8) {
+        self.target_minor = minor;
+    }
+
+    /// True when PEP 695 syntax must be lowered to TypeVar / Generic /
+    /// TypeAlias for the configured target.
+    fn lower_pep695(&self) -> bool {
+        self.target_minor > 0 && self.target_minor < 12
     }
 
     pub fn finish(self) -> String {
@@ -140,6 +169,74 @@ impl Emitter {
                 }
             }
             self.writeln("from __future__ import annotations");
+            // PEP 695 lowering prelude (FINDINGS #47): for target < 3.12,
+            // collect every PEP 695 type-param used in the module and
+            // emit `typing.TypeVar(...)` definitions plus the required
+            // `typing` imports. The def/class/type-alias arms then emit
+            // legacy shapes that reference these synthetic globals.
+            if self.lower_pep695() {
+                let typevars = collect_pep695_typevars(module);
+                let has_aliases = module.body.iter().any(|s| matches!(s, Stmt::TypeAlias(_)));
+                let has_generic_class = module.body.iter().any(|s| match s {
+                    Stmt::ClassDef(c) => c
+                        .type_params
+                        .as_deref()
+                        .map(|tps| !tps.is_empty())
+                        .unwrap_or(false),
+                    _ => false,
+                });
+                if !typevars.is_empty() || has_aliases || has_generic_class {
+                    let mut imports: Vec<&str> = Vec::new();
+                    if typevars.iter().any(|p| p.kind == Pep695ParamKind::TypeVar) {
+                        imports.push("TypeVar");
+                    }
+                    if typevars
+                        .iter()
+                        .any(|p| p.kind == Pep695ParamKind::ParamSpec)
+                    {
+                        imports.push("ParamSpec");
+                    }
+                    if typevars
+                        .iter()
+                        .any(|p| p.kind == Pep695ParamKind::TypeVarTuple)
+                    {
+                        imports.push("TypeVarTuple");
+                    }
+                    if has_generic_class {
+                        imports.push("Generic");
+                    }
+                    if has_aliases {
+                        imports.push("TypeAlias");
+                    }
+                    self.write("from typing import ");
+                    self.write(&imports.join(", "));
+                    self.newline();
+                    for tv in &typevars {
+                        let constructor = match tv.kind {
+                            Pep695ParamKind::TypeVar => "TypeVar",
+                            Pep695ParamKind::ParamSpec => "ParamSpec",
+                            Pep695ParamKind::TypeVarTuple => "TypeVarTuple",
+                        };
+                        self.write(&tv.name);
+                        self.write(" = ");
+                        self.write(constructor);
+                        self.write("(");
+                        self.write(&format!("\"{}\"", tv.name));
+                        // Carry the declared bound through to the
+                        // legacy form so `def f[T: Iface](...)` lowers
+                        // to `T = TypeVar("T", bound=Iface)`. Bounds
+                        // are TypeVar-only — ParamSpec / TypeVarTuple
+                        // ignore the field.
+                        if tv.kind == Pep695ParamKind::TypeVar {
+                            if let Some(bound) = &tv.bound_src {
+                                self.write(", bound=");
+                                self.write(bound);
+                            }
+                        }
+                        self.writeln(")");
+                    }
+                }
+            }
             for stmt in iter {
                 self.emit_stmt(stmt);
             }
@@ -192,7 +289,12 @@ impl Emitter {
                     self.fill("def ");
                 }
                 self.write(f.name.as_str());
-                self.emit_type_params(f.type_params.as_deref());
+                // Skip the `[T]` type-param list when lowering to a
+                // legacy target (FINDINGS #47) — the module prelude
+                // emits matching `T = TypeVar("T")` definitions instead.
+                if !self.lower_pep695() {
+                    self.emit_type_params(f.type_params.as_deref());
+                }
                 self.write("(");
                 self.emit_parameters(&f.parameters);
                 self.write(")");
@@ -224,10 +326,33 @@ impl Emitter {
                 }
                 self.fill("class ");
                 self.write(c.name.as_str());
-                self.emit_type_params(c.type_params.as_deref());
+                let lowering = self.lower_pep695();
+                if !lowering {
+                    self.emit_type_params(c.type_params.as_deref());
+                }
                 let bases = c.bases();
                 let keywords = c.keywords();
-                if !bases.is_empty() || !keywords.is_empty() {
+                // Generic-class lowering for legacy targets (FINDINGS #47):
+                // synthesise a `Generic[T, U, ...]` base from the
+                // declared PEP 695 type-params so the runtime class
+                // still tracks its parameters via the `typing` machinery.
+                let generic_param_names: Vec<String> = if lowering {
+                    c.type_params
+                        .as_deref()
+                        .map(|tps| {
+                            tps.type_params
+                                .iter()
+                                .filter_map(|tp| match tp {
+                                    TypeParam::TypeVar(t) => Some(t.name.as_str().to_owned()),
+                                    _ => None,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                if !bases.is_empty() || !keywords.is_empty() || !generic_param_names.is_empty() {
                     self.write("(");
                     let mut first = true;
                     for base in bases {
@@ -235,6 +360,20 @@ impl Emitter {
                             self.write(", ");
                         }
                         self.emit_expr(base);
+                        first = false;
+                    }
+                    if !generic_param_names.is_empty() {
+                        if !first {
+                            self.write(", ");
+                        }
+                        self.write("Generic[");
+                        for (i, name) in generic_param_names.iter().enumerate() {
+                            if i > 0 {
+                                self.write(", ");
+                            }
+                            self.write(name);
+                        }
+                        self.write("]");
                         first = false;
                     }
                     for kw in keywords {
@@ -579,12 +718,26 @@ impl Emitter {
             }
 
             Stmt::TypeAlias(t) => {
-                self.fill("type ");
-                self.emit_expr(&t.name);
-                self.emit_type_params(t.type_params.as_deref());
-                self.write(" = ");
-                self.emit_expr(&t.value);
-                self.newline();
+                if self.lower_pep695() {
+                    // Legacy form: `X: TypeAlias = Y` (Python 3.10+).
+                    // PEP 695 `type X[T] = ...` parameterised aliases
+                    // can't be expressed in the legacy form, so we
+                    // drop the `[T]` and let the value carry the
+                    // parameterisation. This matches mypy's behaviour
+                    // for the `TypeAlias` form on older targets.
+                    self.fill("");
+                    self.emit_expr(&t.name);
+                    self.write(": TypeAlias = ");
+                    self.emit_expr(&t.value);
+                    self.newline();
+                } else {
+                    self.fill("type ");
+                    self.emit_expr(&t.name);
+                    self.emit_type_params(t.type_params.as_deref());
+                    self.write(" = ");
+                    self.emit_expr(&t.value);
+                    self.newline();
+                }
             }
 
             // Ruff exposes IPython escape commands as a dedicated statement
@@ -876,21 +1029,65 @@ impl Emitter {
             // Each part is either a literal `StringLiteral` or an `FString`
             // whose elements are interleaved literal/interpolation pieces.
             Expr::FString(fs) => {
-                self.write("f\"");
+                // Pick an outer quote that won't collide with any nested
+                // same-quoted string literal inside the interpolations.
+                // Default to `"` and only flip if we'd produce invalid
+                // Python 3.11 output otherwise. This is the same strategy
+                // Black uses for f-string formatting.
+                let outer = pick_fstring_outer_quote(fs);
+                self.fstring_quote_stack.push(outer);
+                self.write("f");
+                self.write(&outer.to_string());
                 for part in fs.value.iter() {
                     match part {
                         FStringPart::Literal(lit) => {
-                            self.write(&escape_python_string(lit.as_str()));
+                            self.write(&escape_python_string_with_quote(lit.as_str(), outer));
                         }
                         FStringPart::FString(inner) => {
                             for elem in &inner.elements {
                                 match elem {
                                     InterpolatedStringElement::Literal(lit) => {
-                                        self.write(&escape_python_string(&lit.value));
+                                        self.write(&escape_python_string_with_quote(
+                                            &lit.value, outer,
+                                        ));
                                     }
                                     InterpolatedStringElement::Interpolation(interp) => {
                                         self.write("{");
                                         self.emit_expr(&interp.expression);
+                                        // Emit `!r` / `!s` / `!a` conversion flags
+                                        // — these are stripped by default by the
+                                        // AST but carried on the `conversion`
+                                        // field. Losing them silently changes
+                                        // runtime output of `f"{x!r}"` etc.
+                                        if let Some(c) = interp.conversion.to_char() {
+                                            self.write("!");
+                                            self.write(&c.to_string());
+                                        }
+                                        // Emit `:FORMAT_SPEC` — the spec is
+                                        // itself a mini-f-string that may
+                                        // contain further interpolations
+                                        // (`f"{n:>{width}}"`).
+                                        if let Some(spec) = &interp.format_spec {
+                                            self.write(":");
+                                            for spec_elem in &spec.elements {
+                                                match spec_elem {
+                                                    InterpolatedStringElement::Literal(lit) => {
+                                                        self.write(
+                                                            &escape_python_string_with_quote(
+                                                                &lit.value, outer,
+                                                            ),
+                                                        );
+                                                    }
+                                                    InterpolatedStringElement::Interpolation(
+                                                        nested,
+                                                    ) => {
+                                                        self.write("{");
+                                                        self.emit_expr(&nested.expression);
+                                                        self.write("}");
+                                                    }
+                                                }
+                                            }
+                                        }
                                         self.write("}");
                                     }
                                 }
@@ -898,7 +1095,8 @@ impl Emitter {
                         }
                     }
                 }
-                self.write("\"");
+                self.write(&outer.to_string());
+                self.fstring_quote_stack.pop();
             }
 
             // PEP 750 template strings — Phase 0 falls back to f-string-like
@@ -945,9 +1143,21 @@ impl Emitter {
             },
 
             Expr::StringLiteral(s) => {
-                self.write("\"");
-                self.write(&escape_python_string(s.value.to_str()));
-                self.write("\"");
+                // Inside an f-string interpolation, a nested string literal
+                // must use a different quote delimiter than the enclosing
+                // f-string. Python 3.12+ (PEP 701) permits identical-quote
+                // nesting, but 3.11 doesn't, and the universal-quote-style
+                // form is what Black/ruff emit. Track the active outer
+                // quote(s) in `fstring_quote_stack`.
+                let outer = self.fstring_quote_stack.last().copied();
+                let quote = match outer {
+                    Some('"') => '\'',
+                    Some('\'') => '"',
+                    _ => '"',
+                };
+                self.write(&quote.to_string());
+                self.write(&escape_python_string_with_quote(s.value.to_str(), quote));
+                self.write(&quote.to_string());
             }
 
             Expr::BytesLiteral(b) => {
@@ -1442,11 +1652,21 @@ fn expr_precedence(expr: &Expr) -> u8 {
 /// escapes (`\n`, `\r`, `\t`), and other ASCII control characters via
 /// `\xNN`.
 fn escape_python_string(s: &str) -> String {
+    escape_python_string_with_quote(s, '"')
+}
+
+/// Escape a Python string literal for output between the given quote
+/// character. Only the *active* quote is backslash-escaped — the opposite
+/// quote can appear verbatim, matching Black's quote-style policy.
+fn escape_python_string_with_quote(s: &str, quote: char) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
             '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
@@ -1457,6 +1677,166 @@ fn escape_python_string(s: &str) -> String {
         }
     }
     out
+}
+
+/// One PEP 695 type-parameter as collected for legacy-target lowering.
+/// `bound_src` is the rendered Python text of any declared bound
+/// expression (or `None` when there isn't one); the prelude uses it to
+/// emit `T = TypeVar("T", bound=Iface)` rather than dropping the
+/// constraint silently.
+#[derive(Debug, Clone)]
+pub(crate) struct Pep695Param {
+    pub name: String,
+    pub kind: Pep695ParamKind,
+    pub bound_src: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pep695ParamKind {
+    /// `def f[T]`, `class C[T]`, `type X[T]`
+    TypeVar,
+    /// `def f[**P]`
+    ParamSpec,
+    /// `def f[*Ts]`
+    TypeVarTuple,
+}
+
+/// Collect every distinct PEP 695 type-parameter declared on any
+/// `def f[...]`, `class C[...]`, or `type X[...] = ...` in the module.
+/// Used by the legacy-target lowering (FINDINGS #47) to synthesise
+/// matching `TypeVar` / `ParamSpec` / `TypeVarTuple` prelude lines.
+///
+/// Declared bounds (`T: Bound`) are rendered back to Python source via
+/// a throwaway sub-emitter so the prelude emits
+/// `T = TypeVar("T", bound=Bound)` rather than dropping the constraint.
+/// `ParamSpec` / `TypeVarTuple` ignore bounds (they don't carry any).
+fn collect_pep695_typevars(module: &ModModule) -> Vec<Pep695Param> {
+    let mut out: Vec<Pep695Param> = Vec::new();
+    fn push_unique(out: &mut Vec<Pep695Param>, param: Pep695Param) {
+        if !out.iter().any(|p| p.name == param.name) {
+            out.push(param);
+        }
+    }
+    fn render_bound(expr: &Expr) -> String {
+        let mut sub = Emitter::new();
+        sub.emit_expr(expr);
+        sub.finish()
+    }
+    fn walk_params(params: &TypeParams, out: &mut Vec<Pep695Param>) {
+        for tp in &params.type_params {
+            match tp {
+                TypeParam::TypeVar(t) => push_unique(
+                    out,
+                    Pep695Param {
+                        name: t.name.as_str().to_owned(),
+                        kind: Pep695ParamKind::TypeVar,
+                        bound_src: t.bound.as_deref().map(render_bound),
+                    },
+                ),
+                TypeParam::ParamSpec(p) => push_unique(
+                    out,
+                    Pep695Param {
+                        name: p.name.as_str().to_owned(),
+                        kind: Pep695ParamKind::ParamSpec,
+                        bound_src: None,
+                    },
+                ),
+                TypeParam::TypeVarTuple(t) => push_unique(
+                    out,
+                    Pep695Param {
+                        name: t.name.as_str().to_owned(),
+                        kind: Pep695ParamKind::TypeVarTuple,
+                        bound_src: None,
+                    },
+                ),
+            }
+        }
+    }
+    fn walk_stmt(stmt: &Stmt, out: &mut Vec<Pep695Param>) {
+        match stmt {
+            Stmt::FunctionDef(f) => {
+                if let Some(tps) = f.type_params.as_deref() {
+                    walk_params(tps, out);
+                }
+                for nested in &f.body {
+                    walk_stmt(nested, out);
+                }
+            }
+            Stmt::ClassDef(c) => {
+                if let Some(tps) = c.type_params.as_deref() {
+                    walk_params(tps, out);
+                }
+                for nested in &c.body {
+                    walk_stmt(nested, out);
+                }
+            }
+            Stmt::TypeAlias(t) => {
+                if let Some(tps) = t.type_params.as_deref() {
+                    walk_params(tps, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    for stmt in &module.body {
+        walk_stmt(stmt, &mut out);
+    }
+    out
+}
+
+/// Choose an outer-quote character for an f-string so nested same-quoted
+/// string literals don't collide with the delimiter on Python 3.11. We
+/// scan every interpolation's expression tree for string literals; if any
+/// already contains `"`, we use `'` for the outer instead. Conservative:
+/// when both styles appear, we prefer `"` and let the inner-literal pass
+/// flip its quote (the universal Black/ruff convention).
+fn pick_fstring_outer_quote(fs: &ast::ExprFString) -> char {
+    use ast::visitor::source_order::{walk_expr, SourceOrderVisitor};
+
+    struct Probe {
+        needs_double: bool,
+        needs_single: bool,
+    }
+    impl<'a> SourceOrderVisitor<'a> for Probe {
+        fn visit_expr(&mut self, expr: &'a Expr) {
+            if let Expr::StringLiteral(s) = expr {
+                let v = s.value.to_str();
+                if v.contains('"') {
+                    self.needs_double = true;
+                }
+                if v.contains('\'') {
+                    self.needs_single = true;
+                }
+            }
+            walk_expr(self, expr);
+        }
+    }
+
+    let mut probe = Probe {
+        needs_double: false,
+        needs_single: false,
+    };
+    for part in fs.value.iter() {
+        if let FStringPart::FString(inner) = part {
+            for elem in &inner.elements {
+                if let InterpolatedStringElement::Interpolation(interp) = elem {
+                    probe.visit_expr(&interp.expression);
+                    if let Some(spec) = &interp.format_spec {
+                        for spec_elem in &spec.elements {
+                            if let InterpolatedStringElement::Interpolation(nested) = spec_elem {
+                                probe.visit_expr(&nested.expression);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Prefer `"`; flip to `'` only if a nested literal already needs `"`.
+    match (probe.needs_double, probe.needs_single) {
+        (true, false) => '\'',
+        _ => '"',
+    }
 }
 
 #[cfg(test)]

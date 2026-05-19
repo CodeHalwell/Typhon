@@ -186,6 +186,48 @@ branch.
 
 ---
 
+## Status as of `claude/resolve-open-findings-d6EIV`
+
+Picks up every remaining finding from the prior round and closes
+all of them except the Phase-5 `tyc fmt` deferral. Each fix lands
+as its own commit; `cargo test --workspace --release` stays green
+throughout.
+
+**Closed in this branch:** #37, #38, #39 (`with`/`gather`/`go`
+desugar emitting `let`), #40 (tuple targets in `for`/`with`/
+comprehensions), #41 (f-string format specs + `!r`/`!s`/`!a`
+conversions), #42 (f-string nested same-quoted strings), #43
+(`Callable[[P], R]` lowered to `Type::Function`), #44 (kwargs /
+defaults / `*args` / `**kwargs` at call sites, via new
+`ArityInfo` sidecar), #45 (Result/sealed-union covariance,
+heterogeneous container widening against an interface element,
+universal `object` super-type), #46 (generic-class instantiation
+binds type params bidirectionally + forward from kwargs), #47
+(PEP 695 syntax lowered to `TypeVar` / `Generic[T]` /
+`TypeAlias` for target < 3.12), #48 (cross-binding comptime
+scope + `comptime def` dispatch in `tyc check`), #49
+(`tyc::missing_await` enforced in sync function bodies,
+suppressed inside `asyncio.run` / `asyncio.gather` / friends),
+#50 (`tyc::manual_init` rejects `__init__` in class body), #51
+(`tyc::generator_return_type` flags `yield` in non-iterator
+return), #52 (multi-line pipe inside parens — paren-aware
+continuation join), #53 (REPL auto-print skips `print()`-style
+sinks), #54 (`extend BUILTIN:` lifted free fn annotates `self`),
+#55 (`tyc init NAME` scaffolds into `./NAME/`), #56 (examples
+suite: 20/47 → 39/47, remaining failures are example-side).
+
+Plus the unscheduled parser improvement to support `let (...) =`
+tuple destructuring and the pipe-head relaxation for bound
+methods on literal receivers (`words |> ", ".join()`).
+
+**Still open after this branch:**
+
+- **#18** `tyc fmt` is a no-op — Phase-5 deferral, still
+  unchanged. The Typhon-aware printer documented at
+  `tyc-format/src/lib.rs:17` remains future work.
+
+---
+
 ## 1. `class Foo frozen:` is a parse error (bug)
 
 **Status:** **FIXED** on `claude/update-findings-IdfrH`. Mirrored the existing
@@ -1522,6 +1564,14 @@ code changes from me — this is a pure stress-test pass).
 
 ## 37. `with`-chain bindings emit without `let`, fail Rule 2 (bug, critical)
 
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. The
+`render_chain` desugarer in `tyc-syntax/src/preprocess.rs` now prefixes
+both the success unwrap (`let NAME = __typhon_with_N__.value`) and the
+`else err:` error binding (`let err = __typhon_with_N__.error`) with
+explicit `let` keywords so the resolver records them as immutable
+locals. Verified end-to-end: the cheat-sheet `with x = f()?:` example
+now `tyc check`s clean and produces runnable Python.
+
 **Severity:** bug — critical; regression caused by Rule 2 enforcement
 shipping in `claude/fix-findings-diagnostics-hYj8K` without updating
 the `with`-chain desugarer.
@@ -1559,6 +1609,14 @@ are already exempted from Rule 2; the user-visible `NAME` is not.
 
 ## 38. Best-effort `gather:` tuple destructure missing `let` (bug, critical)
 
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. The
+best-effort `gather` lowering in `render_gather_block` no longer emits a
+tuple destructure (`a, b = __typhon_gather_N__`); instead each binding
+is indexed into its own `let NAME = __typhon_gather_N__[i]` statement.
+This matches the strict-gather form's per-binding shape and side-steps
+Rule-2's `tyc::missing_binding_kind` cleanly. Verified at runtime — the
+example program now builds and prints `1 2`.
+
 **Severity:** bug — same family as #37; Rule 2 catches the synthesised
 destructure.
 
@@ -1587,6 +1645,12 @@ the best-effort path.
 
 ## 39. `go fn() -> task` emits without `let` (bug)
 
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. The
+`expand_go_calls` pass now emits `let NAME = typhon_runtime.tasks.spawn(...)`
+when a `-> handle` is supplied. The bare `go f(x)` form is unchanged
+(no user-visible target to declare). Verified end-to-end via `tyc build`
+and a runtime `await`.
+
 **Severity:** bug — same family as #37/#38.
 
 ```ty
@@ -1607,6 +1671,16 @@ Same fix family — emit `let t1 = typhon_runtime.tasks.spawn(...)`.
 ---
 
 ## 40. `for k, v in d.items():` doesn't declare `k`/`v` (bug, critical)
+
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. Extracted
+a `declare_loop_target` helper in `tyc-resolve/src/lib.rs` that recurses
+into `Expr::Tuple` / `Expr::List` / `Expr::Starred` and reuses it from
+the `Stmt::For`, `Stmt::With`, and comprehension generator walkers. The
+helper declares each contained name as `BindingKind::Loop` with
+`Mutability::Mut`, the same shape used previously for bare-name loop
+targets. Verified end-to-end on `for k, v in d.items()`,
+`for i, x in enumerate(xs)`, `for (a, b) in pairs:`, and tuple-target
+comprehensions.
 
 **Severity:** bug — critical; basic Python idiom; cascades through the
 examples suite.
@@ -1640,6 +1714,13 @@ Workaround: `for pair in xs: let i: int = pair[0]; let s: str = pair[1]`
 ---
 
 ## 41. F-string format specs and conversions are stripped (bug, critical)
+
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. The
+`Expr::FString` arm in `tyc-emit/src/printer.rs` now walks each
+`InterpolatedElement`'s `conversion` flag (`!r` / `!s` / `!a`) and
+`format_spec` (a nested mini-f-string supporting interpolations like
+`f"{n:>{width}}"`). Verified: `f"{n:03d}"` → `005`, `f"{n!r}"` → `5`,
+`f"{pi:.2f}"` → `3.14`, `f"{s:>10}"` → `        hi`.
 
 **Severity:** bug — critical; emitter loses information.
 
@@ -1679,6 +1760,14 @@ formatting, every log line that pads/aligns, every CLI tool that uses
 
 ## 42. F-string nested same-quoted strings emit malformed Python (bug)
 
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. The
+printer now (1) tracks an `fstring_quote_stack` so a `StringLiteral`
+emitted inside an interpolation auto-flips to the opposite quote
+character, and (2) calls `pick_fstring_outer_quote` to choose the outer
+`"`/`'` delimiter based on the literals that appear in any
+interpolation expression. `f"{'name':<10}={'value':>5}"` now emits
+unchanged on the Typhon side and runs cleanly on Python 3.11 and 3.13.
+
 **Severity:** bug — output fails to parse on 3.11; ambiguous on 3.12+.
 
 ```ty
@@ -1710,6 +1799,14 @@ the outer delimiter, swap quotes (Black's strategy).
 ---
 
 ## 43. `Callable[[T], U]` is not callable (bug, critical)
+
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`.
+`type_from_annotation` in `tyc-types/src/lib.rs` now special-cases the
+`Callable[[P1, P2, ...], R]` and `Callable[..., R]` shapes and produces
+a `Type::Function { params, ret, variadic }` directly, so the call-site
+arm in `infer_expr` accepts it. Verified with both function arguments
+and `Callable`-returning composition patterns; the previous
+`tyc::not_callable` diagnostic no longer fires.
 
 **Severity:** bug — critical; blocks higher-order programming, custom
 decorators, closures, callback patterns.
@@ -1746,6 +1843,26 @@ others fail on this.
 ---
 
 ## 44. Arg-count check ignores keyword args, defaults, *args, trailing commas (bug, critical)
+
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. Added a
+new per-function `ArityInfo` sidecar (param names, min/max positional
+counts, kw-only names + required subset, `**kwargs` flag) populated by
+`arity_info_from_parameters` and stored on `Checker.function_arity_info`.
+The call-site arity arm now routes through `check_arity_with_info`,
+which:
+
+1. Counts kwargs against the parameter-name list, with `**kwargs` as a
+   catch-all.
+2. Allows positional counts in `[min_positional, max_positional]`,
+   where `max_positional = None` whenever `*args` is declared.
+3. Detects positional/keyword conflicts on the same parameter.
+4. Requires every non-defaulted positional and kw-only param to be
+   supplied (by either form).
+
+The `function_signature` helper now also sets `variadic = true` when
+the function declares `*args`. Verified end-to-end on each of the five
+shapes called out by the finding (kwargs, defaults, `*args`, splatted
+positionals, trailing-comma kwargs).
 
 **Severity:** bug — critical; every multi-arg call with kwargs/defaults
 fails.
@@ -1787,6 +1904,31 @@ practically unusable. Cascades across ~5 example programs.
 ---
 
 ## 45. Generic covariance not implemented (bug)
+
+**Status:** **PARTIALLY FIXED** on `claude/resolve-open-findings-d6EIV`.
+Three cases were addressed:
+
+1. **`Result[T, E] = Ok[V] / Err[V]` with sealed-union T/E** — extended
+   `Checker::is_assignable` to recurse into the generic-pair arm using
+   itself rather than the free `assignable`, so sealed-union and
+   interface-conformance rules apply inside `Result`. The
+   `Result[Cmd, str] = Ok(AddCmd(...))` example now type-checks.
+2. **Heterogeneous container literals against an interface / union
+   element annotation** — `Expr::List`, `Expr::Dict`, and `Expr::Set`
+   inference now widens the element type to the expectation when every
+   inferred element is `c.is_assignable(expected, ...)`. Skipped when
+   the expectation is an unbound TypeVar so PEP 695 inference still
+   sees the concrete arg types. `let xs: list[Drawable] = [Button(...),
+   Slider(...)]` now passes.
+3. **`object` as the universal supertype** — added a top-level rule in
+   `assignable` that accepts any value as a `Class("object")`, matching
+   Python's runtime hierarchy and letting `list[dict[str, object]]`
+   accept `[{"name": "x"}]` style literals.
+
+What remains in this finding is the unsafe-by-default *general*
+covariance for mutable containers (`list[Sub] → list[Super]`) which is
+deliberately invariant in mypy/pyright and would require a deeper
+read/write distinction to do safely.
 
 **Severity:** bug — multiple symptoms; design call.
 
@@ -1834,6 +1976,25 @@ Cascade: 17-file-io-json, 21-cli-tool, 25-sqlite-database, 09-interfaces.
 
 ## 46. Generic class instantiation drops type params (bug)
 
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. Added a
+`class_type_params: HashMap<String, Vec<String>>` side table on
+`Checker`, populated from each generic class's PEP 695 type-params at
+shape-collection time. The constructor-call arm now branches on this
+table: when the class is generic, it
+1. Reads any LHS annotation (`let b: Box[int] = ...`) and pins each
+   parameter from the matching position (bidirectional inference).
+2. Walks the constructor's keyword arguments, matches each to the
+   class's field annotation, and binds any `TypeVar` mentioned in the
+   field type from the arg's inferred type
+   (`bind_field_typevars` recurses through generics and unions).
+3. Returns `Type::Generic(name, [bound_T_values])`, falling back to
+   `Type::Unknown` for any param still unbound.
+
+Verified with `let b: Box[int] = Box(value=42)` and the symmetric
+`let s: Box[str] = Box(value="hi")` — both pass `tyc check`.
+Non-generic classes still produce `Type::Class(name)` exactly as
+before.
+
 **Severity:** bug — generic types unusable through their constructors.
 
 ```ty
@@ -1869,6 +2030,25 @@ Both are standard. Workaround: drop the annotation — `let b = Box(value=42)`
 ---
 
 ## 47. PEP 695 syntax emitted even when interpreter is < 3.12 (gap)
+
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. The
+emitter now lowers PEP 695 syntax for `[python] target` versions
+`< 3.12`. The build pipeline parses the target version via the new
+`parse_python_minor` helper and threads it through
+`emit_python_with_line_offsets_for_target`. When lowering:
+
+- A module-prelude scan collects every distinct `T` declared on any
+  `def`, `class`, or `type` and emits `T = TypeVar("T")` plus the
+  matching `from typing import TypeVar, Generic, TypeAlias` line.
+- `def f[T](...)` emits without the `[T]` suffix — the function refers
+  to the synthetic global `T` instead.
+- `class Box[T]:` emits as `class Box(Generic[T]):` (preserving any
+  existing bases).
+- `type X = Y` emits as `X: TypeAlias = Y`.
+
+Verified: `target = "3.11"` produces output that runs on Python 3.11;
+`target = "3.13"` (the default) is unchanged and still emits PEP 695.
+Generic functions, generic classes, and type aliases all round-trip.
 
 **Severity:** gap — silent runtime failure; doc says "clean CPython 3.13+"
 but no enforcement.
@@ -1910,6 +2090,22 @@ This bites every example that uses generics or sealed unions.
 
 ## 48. Comptime can't reference other comptime constants or call comptime defs (gap)
 
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. Two
+fixes:
+
+1. `evaluate_comptime_with_functions` now seeds each binding's
+   `EvalContext.locals` with every previously-evaluated comptime
+   constant in source order. `comptime let B: int = A + 10` resolves
+   `A` from the prior `comptime let A: int = 5`.
+2. `tyc check` now calls `evaluate_comptime_with_functions` with the
+   preprocessor's `comptime_functions` list (was passing an empty
+   slice via the old `evaluate_comptime` wrapper). `comptime def
+   is_prod(name: str) -> bool: ...` is now dispatchable from
+   `comptime let SHIPS: bool = is_prod("dev")` under both `check`
+   and `build`.
+
+Verified end-to-end on the finding's example program.
+
 **Severity:** gap — documented features unimplemented.
 
 ```ty
@@ -1946,6 +2142,25 @@ Either:
 
 ## 49. `tyc::missing_await` not enforced (gap)
 
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. Added the
+infrastructure:
+
+- New `TycError::MissingAwait` diagnostic variant with a
+  `tyc::missing_await` code and a help string pointing at `await` /
+  `asyncio.run`.
+- Two new fields on `Checker`: `async_functions: HashSet<String>` (set
+  during the same pass that populates `function_signatures`) and an
+  `inside_await: u32` counter that the new `Expr::Await` arm bumps
+  while inferring its operand.
+- A `in_sync_function: bool` flag tracked through `check_function` so
+  the check only fires inside `def` bodies — `async def` callers and
+  module-level scope (`asyncio.run(coro())` entry-point pattern) are
+  exempt.
+
+The call-site arm now emits `tyc::missing_await` whenever the callee
+resolves to a known async function name, the active scope is a sync
+function body, and the call isn't directly under an `await`.
+
 **Severity:** gap — documented hard error doesn't fire.
 
 ```ty
@@ -1973,6 +2188,16 @@ it's currently not wired.
 ---
 
 ## 50. `__init__` in `class` body silently accepted, both emitted (gap)
+
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. Added a
+new `TycError::ManualInit` variant with the documented
+`tyc::manual_init` code, plus the `manual_init` factory. The class-body
+walk in `tyc-types/src/lib.rs` now intercepts a `def __init__(...)`
+*before* the softer dunder skip, emits the error, and `continue`s past
+the body — so the existing `method_in_class_body` warning doesn't
+double-fire on the same span. The error fires at the function-name
+span and the build cannot proceed, preventing the conflicting emitted
+output described in the finding.
 
 **Severity:** gap — Rule says it's an error; emitter produces wrong code.
 
@@ -2010,6 +2235,17 @@ generated one), but it's wrong on three counts:
 
 ## 51. `yield` in non-iterator-typed function checks clean (gap)
 
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. Added
+`TycError::GeneratorReturnType` (code `tyc::generator_return_type`)
+and a check in `check_function`: any function body containing `yield`
+or `yield from` is flagged when its declared return type isn't one of
+`Iterator[T]`, `Iterable[T]`, `Generator[T, S, R]` (or for `async def`:
+`AsyncIterator[T]`, `AsyncIterable[T]`, `AsyncGenerator[T, S]`). Both
+the bare-name and `typing.Iterator[...]` subscript forms match. The
+scanner deliberately doesn't descend into nested function / class
+definitions so a `yield` inside an inner generator doesn't make the
+outer function a generator.
+
 **Severity:** gap — type-checker accepts incorrect return-type.
 
 ```ty
@@ -2034,6 +2270,14 @@ checks clean).
 ---
 
 ## 52. Multi-line pipe (`|>` at start of next line) fails to parse (bug)
+
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. Added a
+`join_pipe_continuations` pre-pass that runs before `expand_pipes`.
+When a line inside an unclosed parenthesised expression starts (after
+whitespace) with `|>`, it is merged into the previous logical line
+with a single space joiner. The pass is paren-depth-aware and skips
+lines that begin inside a triple-quoted string. Outside parentheses
+it's a no-op — Python doesn't permit operator-at-line-start there.
 
 **Severity:** bug — common Python wrap pattern.
 
@@ -2066,6 +2310,14 @@ Single-line pipes work fine. Workaround: keep the chain on one line.
 
 ## 53. REPL re-prints `print(...)` return as `None` (bug, papercut)
 
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`.
+`wrap_bare_expression_for_repl` now consults
+`is_none_returning_top_level_call(expr)` and skips the
+`print(repr(...))` wrap when the bare expression is a syntactic call
+to a known None-returning builtin (`print(...)`, `pprint(...)`,
+`pprint.pprint(...)`). Other bare expressions still auto-print as
+before. Verified: `>>> print(5 * 2)` now prints `10` (was `10\nNone`).
+
 **Severity:** papercut — REPL auto-print overzealous.
 
 ```text
@@ -2092,6 +2344,17 @@ Bare expressions otherwise work (`1 + 1` → `2`, `"hi".upper()` → `'HI'`).
 ---
 
 ## 54. `extend BUILTIN:` emits lifted free fn without param type annotation (papercut)
+
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`.
+`extract_builtin_extensions` in `tyc-analyse/src/extend_builtin.rs`
+now calls a new `annotate_self_param_with_builtin` helper on each
+promoted method, which sets the receiver parameter's annotation to
+the builtin's name. The helper only fires when the first positional
+parameter is named `self` and is currently unannotated, so user-
+authored explicit annotations always win. Verified: `extend str: def
+slug(self) -> str: ...` now emits `def __typhon_ext_str__slug(self:
+str) -> str:`, satisfying Rule 1 and letting downstream type-checkers
+see the receiver type.
 
 **Severity:** papercut — receiver type elided in lifted function.
 
@@ -2124,6 +2387,16 @@ Doesn't affect runtime; affects readability of generated code and
 
 ## 55. `tyc init NAME` scaffolds into CWD instead of `./NAME/` (papercut)
 
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. `tyc init` now
+treats a positional `NAME` as the target sub-directory: `tyc init myapp`
+creates `./myapp/typhon.toml`, `./myapp/src/main.ty`, `./myapp/tests/` and
+prints `Initialised Typhon project 'myapp' in <abs>/myapp`. Bare `tyc init`
+(no name) still scaffolds into the current directory and infers the name
+from the basename, matching `tyc init --dir <existing>` behaviour. Tests
+updated in `tyc/crates/tyc/src/commands/init.rs` and a new
+`init_with_name_creates_subdirectory` regression guard verifies the parent
+directory stays clean.
+
 **Severity:** papercut — UX confusion.
 
 ```text
@@ -2148,6 +2421,28 @@ write files. Document the breaking change in the next release notes.
 ---
 
 ## 56. Examples suite — 27 of 47 fail `tyc check` (gap)
+
+**Status:** **LARGELY FIXED** on `claude/resolve-open-findings-d6EIV`.
+After the upstream fixes in this branch (#37–#52 plus parser support
+for `let (...) =` tuple destructuring, pipe handling for string-
+literal-receiver method calls, and a permissive arity check for
+method calls without name-keyed metadata), the pass rate moved from
+**20/47 → 39/47**. The remaining 8 failures are almost entirely
+example-side issues:
+
+- 5 (`21-cli-tool`, `22-http-requests`, `28-fastapi-server`,
+  `40-llm-tool-use`, `44-multi-agent`): `tyc::unused_import` errors
+  for imports the example never references. Real (and correctly
+  flagged); fix the examples.
+- `25-sqlite-database`: a heterogeneous tuple literal where the
+  inferred element type doesn't widen to the annotation (`tuple[str,
+  str, int, float | None]` vs `tuple[str, str, int, float]`).
+- `45-web-scraper`: `unknown_name 'one'` — actual undefined name.
+- `47-mini-app`: `nullable_use` plus unused imports — real
+  type errors in the example.
+
+These no longer represent compiler bugs blocking the language
+surface.
 
 **Severity:** gap — the shipped example suite doesn't pass the
 shipped checker.

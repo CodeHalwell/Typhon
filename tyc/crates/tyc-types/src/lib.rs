@@ -180,6 +180,11 @@ impl Type {
 pub fn assignable(expected: &Type, actual: &Type) -> bool {
     match (expected, actual) {
         (Type::Any, _) | (_, Type::Any) => true,
+        // `object` is Python's universal base type — every value is an
+        // instance, so anything is assignable to a `Class("object")`
+        // expectation. This makes `list[dict[str, object]]` accept
+        // `[{"name": "x"}]` without invariance fighting nested literals.
+        (Type::Class(name), _) if name == "object" => true,
         // Unbound PEP 695 type parameters behave like `Any` until call-site
         // inference (`bind_typevars_and_substitute`) refines them.
         (Type::TypeVar(_), _) | (_, Type::TypeVar(_)) => true,
@@ -246,6 +251,34 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
         {
             true
         }
+        // Function / Function — structural callable assignability.
+        // `Callable[..., R]` (modelled as empty params + `variadic`)
+        // accepts any function with an assignable return type. For
+        // fixed-arity callables, expected/actual must share arity and
+        // each parameter pair is contravariant (a callable that
+        // tolerates a wider input type can stand in for one expecting
+        // a narrower input).
+        (
+            Type::Function {
+                params: ep,
+                ret: er,
+                variadic: ev,
+            },
+            Type::Function {
+                params: ap,
+                ret: ar,
+                variadic: _av,
+            },
+        ) => {
+            if *ev && ep.is_empty() {
+                return assignable(er, ar);
+            }
+            if ep.len() != ap.len() {
+                return false;
+            }
+            // Contravariant params, covariant return.
+            ep.iter().zip(ap).all(|(e, a)| assignable(a, e)) && assignable(er, ar)
+        }
         // Bare-container annotations (`list`, `dict`, `tuple`, `set`,
         // `frozenset`) act as `name[Any]` — they accept any
         // parameterisation. Without this rule, `let xs: list = []`
@@ -255,6 +288,168 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
         // `Class("list")`.
         (Type::Class(en), Type::Generic(an, _)) if en == an && is_bare_container_name(en) => true,
         (a, b) => a == b,
+    }
+}
+
+/// Return `true` when any statement in `body` (recursively) contains
+/// a `yield` or `yield from` expression. Used by the return-type
+/// check in `check_function` to flag generator-shaped function bodies
+/// whose return annotation isn't iterator-shaped (FINDINGS #51).
+///
+/// Nested function and class bodies are skipped — a `yield` inside an
+/// inner generator doesn't make the *outer* function a generator. We
+/// dispatch through `visit_stmt` (not `walk_stmt`) at the top level
+/// so the visitor's own pruning of `Stmt::FunctionDef` / `Stmt::ClassDef`
+/// fires before we descend.
+fn body_has_yield(body: &[Stmt]) -> bool {
+    struct YieldVisitor<'a> {
+        found: &'a mut bool,
+    }
+    impl<'a, 'b> ruff_python_ast::visitor::source_order::SourceOrderVisitor<'a> for YieldVisitor<'b> {
+        fn visit_expr(&mut self, e: &'a Expr) {
+            if *self.found {
+                return;
+            }
+            if matches!(e, Expr::Yield(_) | Expr::YieldFrom(_)) {
+                *self.found = true;
+                return;
+            }
+            // Don't descend into nested function / lambda definitions.
+            if matches!(e, Expr::Lambda(_)) {
+                return;
+            }
+            ruff_python_ast::visitor::source_order::walk_expr(self, e);
+        }
+        fn visit_stmt(&mut self, s: &'a Stmt) {
+            if *self.found {
+                return;
+            }
+            if matches!(s, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                return;
+            }
+            ruff_python_ast::visitor::source_order::walk_stmt(self, s);
+        }
+    }
+    let mut found = false;
+    {
+        let mut visitor = YieldVisitor { found: &mut found };
+        for s in body {
+            use ruff_python_ast::visitor::source_order::SourceOrderVisitor;
+            visitor.visit_stmt(s);
+            if *visitor.found {
+                break;
+            }
+        }
+    }
+    found
+}
+
+/// Return `true` when `returns` is annotated as one of the
+/// generator-compatible types. Recognises both PEP 484 (`Iterator[T]`,
+/// `Generator[T, S, R]`, `Iterable[T]`, `AsyncIterator[T]`,
+/// `AsyncGenerator[T, S]`) and the bare names (`Iterator`,
+/// `Generator`, etc.) which may flow in via stub imports.
+fn is_iterator_return_type(returns: &Expr, is_async: bool) -> bool {
+    let sync_names = ["Iterator", "Iterable", "Generator"];
+    let async_names = ["AsyncIterator", "AsyncIterable", "AsyncGenerator"];
+    let head = match returns {
+        Expr::Name(n) => Some(n.id.as_str()),
+        Expr::Subscript(s) => match s.value.as_ref() {
+            Expr::Name(n) => Some(n.id.as_str()),
+            Expr::Attribute(a) => Some(a.attr.as_str()),
+            _ => None,
+        },
+        Expr::Attribute(a) => Some(a.attr.as_str()),
+        _ => None,
+    };
+    let Some(name) = head else { return false };
+    // `async def f() -> Iterator[T]` containing `yield` produces an
+    // *async* generator at runtime — Python only accepts the
+    // `AsyncIterator` / `AsyncIterable` / `AsyncGenerator` names for
+    // those. Accept only the matching family.
+    if is_async {
+        async_names.contains(&name)
+    } else {
+        sync_names.contains(&name)
+    }
+}
+
+/// Return `true` when the type is an unbound PEP 695 type parameter.
+/// Used by the container-literal widening rules to avoid prematurely
+/// resolving a TypeVar to a concrete element type (which would block
+/// PEP 695 inference from binding it from the actual arguments).
+fn is_typevar(t: &Type) -> bool {
+    matches!(t, Type::TypeVar(_))
+}
+
+/// Return `true` when this call targets one of the well-known
+/// asyncio entry-points that accept coroutines as direct arguments.
+/// Used by the `missing_await` check (FINDINGS #49) to suppress
+/// false positives on the canonical `asyncio.run(coro())` pattern.
+fn call_targets_coro_acceptor(call: &ruff_python_ast::ExprCall) -> bool {
+    let Expr::Attribute(a) = call.func.as_ref() else {
+        return false;
+    };
+    let method = a.attr.as_str();
+    let is_coro_method = matches!(
+        method,
+        "run"
+            | "create_task"
+            | "ensure_future"
+            | "gather"
+            | "wait"
+            | "wait_for"
+            | "as_completed"
+            | "spawn"
+    );
+    if !is_coro_method {
+        return false;
+    }
+    // Accept exactly two shapes:
+    //   1. `asyncio.<method>(coro())`
+    //   2. `typhon_runtime.tasks.<method>(coro())`
+    // (Plus aliased forms `<X>.asyncio.<method>(...)` are accepted too —
+    // common when users `import asyncio as aio` and re-export — but a
+    // bare `.tasks.<method>` whose receiver isn't `typhon_runtime` is
+    // rejected so a user module called `mypkg.tasks.gather(...)`
+    // doesn't silently suppress `tyc::missing_await`.)
+    match a.value.as_ref() {
+        // `asyncio.<method>(...)`
+        Expr::Name(n) if n.id.as_str() == "asyncio" => true,
+        // `typhon_runtime.tasks.<method>(...)`
+        Expr::Attribute(inner)
+            if inner.attr.as_str() == "tasks"
+                && matches!(inner.value.as_ref(), Expr::Name(n) if n.id.as_str() == "typhon_runtime") =>
+        {
+            true
+        }
+        // `pkg.asyncio.<method>(...)` — reasonably an aliased asyncio.
+        Expr::Attribute(inner) if inner.attr.as_str() == "asyncio" => true,
+        _ => false,
+    }
+}
+
+/// Walk a generic-class field-type / arg-type pair and bind any
+/// TypeVar mentioned in the field type to the corresponding shape of
+/// the argument type. Used by the constructor-call inference path
+/// (FINDINGS #46) so `class Box[T]: value: T` learns `T = int` from
+/// `Box(value=42)` without needing the caller to spell `Box[int](...)`.
+fn bind_field_typevars(field_ty: &Type, arg_ty: &Type, out: &mut HashMap<String, Type>) {
+    match (field_ty, arg_ty) {
+        (Type::TypeVar(name), other) if !matches!(other, Type::TypeVar(_)) => {
+            out.entry(name.clone()).or_insert_with(|| other.clone());
+        }
+        (Type::Generic(_, fas), Type::Generic(_, aas)) if fas.len() == aas.len() => {
+            for (f, a) in fas.iter().zip(aas) {
+                bind_field_typevars(f, a, out);
+            }
+        }
+        (Type::Union(fs), Type::Union(as_)) if fs.len() == as_.len() => {
+            for (f, a) in fs.iter().zip(as_) {
+                bind_field_typevars(f, a, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -425,6 +620,54 @@ pub fn type_from_annotation_with_params(
                     return Type::union_of(args);
                 }
                 return type_from_annotation_with_params(&s.slice, classes, type_params);
+            }
+            // Callable[[P1, P2, ...], R] / Callable[..., R] — structural
+            // function type. Map to `Type::Function` so call expressions
+            // can be type-checked against the param list and the value is
+            // accepted by the call-site arm rather than rejected as
+            // `not_callable`. FINDINGS #43.
+            if head == "Callable" {
+                if let Expr::Tuple(t) = s.slice.as_ref() {
+                    if t.elts.len() == 2 {
+                        let ret =
+                            type_from_annotation_with_params(&t.elts[1], classes, type_params);
+                        match &t.elts[0] {
+                            // `Callable[[T, U], R]`
+                            Expr::List(list) => {
+                                let params: Vec<Type> = list
+                                    .elts
+                                    .iter()
+                                    .map(|e| {
+                                        type_from_annotation_with_params(e, classes, type_params)
+                                    })
+                                    .collect();
+                                return Type::Function {
+                                    params,
+                                    ret: Box::new(ret),
+                                    variadic: false,
+                                };
+                            }
+                            // `Callable[..., R]` — any args (including
+                            // zero), fixed return. Empty `params` plus
+                            // `variadic: true` lets the call-site arity
+                            // check accept 0..N positional arguments;
+                            // using `vec![Type::Any]` would force at
+                            // least one arg via the `total >=
+                            // params.len()` path.
+                            Expr::EllipsisLiteral(_) => {
+                                return Type::Function {
+                                    params: vec![],
+                                    ret: Box::new(ret),
+                                    variadic: true,
+                                };
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                // Unrecognised shape — leave as a generic so existing
+                // variance / assignability checks keep working.
+                return Type::Generic("Callable".into(), vec![Type::Unknown, Type::Unknown]);
             }
             // Result[T, E] — two-parameter sealed sum type (Ok[T] | Err[E]).
             if head == "Result" {
@@ -784,6 +1027,27 @@ struct Checker<'a> {
     classes: Vec<String>,
     /// For each declared function name, its inferred signature type.
     function_signatures: HashMap<String, Type>,
+    /// Per-function arity metadata that doesn't fit in `Type::Function`
+    /// (which only tracks positional types + a single `variadic` flag).
+    /// Indexed by function name; entries are populated alongside
+    /// `function_signatures` from the AST so the call-site check can
+    /// honour default values, `*args`, `**kwargs`, and keyword arguments
+    /// without rejecting valid calls (FINDINGS #44).
+    function_arity_info: HashMap<String, ArityInfo>,
+    /// Names of `async def` functions declared at module top level.
+    /// Used by the call-site arm to emit `tyc::missing_await`
+    /// (FINDINGS #49) when a sync context calls one without `await`.
+    async_functions: std::collections::HashSet<String>,
+    /// Bumped on entry to an `Expr::Await`, decremented on exit. While
+    /// positive, the call-site arm skips the `missing_await` check so
+    /// the user's `await f()` is accepted.
+    inside_await: u32,
+    /// True while we are checking a *sync* function body. Only sync
+    /// callers trip `tyc::missing_await`; `async def` bodies that
+    /// forget to await are flagged separately by `async_without_await`
+    /// (warn-level, not yet wired). Module scope is also exempt so
+    /// the canonical `asyncio.run(coro())` entry-point pattern passes.
+    in_sync_function: bool,
     /// Bounds declared on PEP 695 type parameters, keyed by function name.
     /// E.g. `def f[T: Interface](x: T)` populates `{"f": {"T": Class("Interface")}}`.
     /// Checked at call sites via `Checker::check_call_typevar_bounds`.
@@ -804,6 +1068,13 @@ struct Checker<'a> {
     /// All classes declared in the module along with their declared member
     /// names.  Used for structural conformance against an interface.
     class_shapes: HashMap<String, InterfaceShape>,
+    /// PEP 695 type-parameter names declared on each generic class.
+    /// `class Box[T]: ...` populates `{"Box": ["T"]}`. Empty for
+    /// non-generic classes. Used to drive bidirectional inference at
+    /// constructor calls so `let b: Box[int] = Box(value=42)` produces
+    /// `Type::Generic("Box", [Int])` rather than `Type::Class("Box")`
+    /// (FINDINGS #46).
+    class_type_params: HashMap<String, Vec<String>>,
     /// Classes declared with the `frozen` modifier (`class Foo frozen:`).
     /// Used to reject attribute writes to instances of these classes at
     /// check time — matches the runtime behaviour of the emitted
@@ -834,6 +1105,39 @@ struct Checker<'a> {
     /// metadata; queried by [`check_stmt`] when entering an `if` body to
     /// decide whether to bump `unsafe_depth`.
     unsafe_line_starts: Vec<u32>,
+}
+
+/// Per-function arity metadata kept alongside `Type::Function` so the
+/// call-site arity check can honour default values, `*args`, `**kwargs`,
+/// and keyword-argument matching (FINDINGS #44).
+///
+/// `Type::Function`'s `params: Vec<Type>` only tracks positional types,
+/// and its single `variadic` flag conflates "has `*args`" with "accepts
+/// any extra args". We need richer information to distinguish:
+/// - `def f(a, b=10)` → 1 required, 2 optional
+/// - `def variadic(*args)` → 0 required, no fixed max, accepts kwargs only via `**kw`
+/// - `f(name="x")` keyword-arg matching against `param_names`
+#[derive(Debug, Clone, Default)]
+struct ArityInfo {
+    /// Names of the positional / pos-or-kw / kw-only parameters declared
+    /// on the function, in source order. Used to match keyword arguments
+    /// at call sites (`f(name="x")`).
+    param_names: Vec<String>,
+    /// Minimum number of positional arguments the caller must supply
+    /// (i.e. count of params without default values, excluding kw-only).
+    /// `def f(a, b=10) -> ...` → `min_positional = 1`.
+    min_positional: usize,
+    /// Maximum number of positional arguments — the total count of
+    /// posonlyargs + args. Kw-only params don't count. `None` for
+    /// `*args` functions, which accept unbounded positionals.
+    max_positional: Option<usize>,
+    /// Names of kw-only parameters (after `*` or `*args`).
+    kwonly_names: Vec<String>,
+    /// Kw-only names that don't have a default value.
+    kwonly_required: Vec<String>,
+    /// True when the function declares `**kwargs`, accepting any
+    /// otherwise-unmatched keyword argument.
+    has_kwarg: bool,
 }
 
 /// Declared interface (`interface Name:` → `class Name(Protocol):`). Bundles
@@ -889,10 +1193,15 @@ impl<'a> Checker<'a> {
             resolved,
             classes: Vec::new(),
             function_signatures: HashMap::new(),
+            function_arity_info: HashMap::new(),
+            async_functions: std::collections::HashSet::new(),
+            inside_await: 0,
+            in_sync_function: false,
             function_type_bounds: HashMap::new(),
             active_typevar_bounds: HashMap::new(),
             interfaces: HashMap::new(),
             class_shapes: HashMap::new(),
+            class_type_params: HashMap::new(),
             frozen_classes: std::collections::HashSet::new(),
             class_parents: HashMap::new(),
             unsafe_depth: 0,
@@ -965,6 +1274,39 @@ impl<'a> Checker<'a> {
         // `expected` so nominal and structural checks apply to each arm.
         if let Type::Union(variants) = actual {
             return variants.iter().all(|v| self.is_assignable(expected, v));
+        }
+        // Generic / generic (e.g. `Result[T, E] = Ok[V]`, `list[T] = list[V]`):
+        // recurse using `is_assignable` for the inner type pairs so sealed
+        // unions and interface conformance work *inside* generic containers.
+        // The free `assignable` checks above only saw class-name equality on
+        // the inner pair; without this arm, `Result[Cmd, str] = Ok(AddCmd(...))`
+        // fails when `Cmd` is a sealed union containing `AddCmd`. FINDINGS #45.
+        if let (Type::Generic(an, aa), Type::Generic(bn, bb)) = (expected, actual) {
+            // Result/Ok / Result/Err variance refinement — mirrors the rule
+            // in the free `assignable` but with sealed-union-aware recursion.
+            if an == "Result" && aa.len() == 2 {
+                match (bn.as_str(), bb.len()) {
+                    ("Ok", 1) => return self.is_assignable(&aa[0], &bb[0]),
+                    ("Err", 1) => return self.is_assignable(&aa[1], &bb[0]),
+                    _ => {}
+                }
+            }
+            if an == bn && aa.len() == bb.len() {
+                return aa
+                    .iter()
+                    .zip(bb)
+                    .enumerate()
+                    .all(
+                        |(idx, (formal, actual_arg))| match generic_param_variance(an, idx) {
+                            Variance::Covariant => self.is_assignable(formal, actual_arg),
+                            Variance::Contravariant => self.is_assignable(actual_arg, formal),
+                            Variance::Invariant => {
+                                self.is_assignable(formal, actual_arg)
+                                    && self.is_assignable(actual_arg, formal)
+                            }
+                        },
+                    );
+            }
         }
         false
     }
@@ -1284,6 +1626,20 @@ impl<'a> Checker<'a> {
         let length = span.1.saturating_sub(span.0).max(1);
         self.diagnostics.push_error(TycError::not_callable(
             typ.display(),
+            &self.path,
+            self.source,
+            span.0,
+            length,
+        ));
+    }
+
+    fn missing_await(&mut self, callee: &str, span: (usize, usize)) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
+        let length = span.1.saturating_sub(span.0).max(1);
+        self.diagnostics.push_error(TycError::missing_await(
+            callee,
             &self.path,
             self.source,
             span.0,
@@ -1653,7 +2009,14 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                     },
                 );
             }
-            c.class_shapes.insert(name, shape);
+            c.class_shapes.insert(name.clone(), shape);
+            // Record PEP 695 type-parameter names so call-site
+            // inference can return `Type::Generic(name, [...])` for
+            // generic classes (FINDINGS #46).
+            let tps = type_param_names_from(cd.type_params.as_deref());
+            if !tps.is_empty() {
+                c.class_type_params.insert(name, tps);
+            }
         }
     }
     // Second pass (continued): fold `impl ClassName:` and `extend ClassName:`
@@ -1691,6 +2054,18 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                 function_signature(&classes, f.parameters.as_ref(), f.returns.as_deref(), &tps);
             c.function_signatures
                 .insert(f.name.as_str().to_owned(), sig);
+            // Record per-function arity metadata so the call-site arity
+            // check can accept keyword args, defaults, `*args`, and
+            // `**kwargs` without false positives (FINDINGS #44).
+            c.function_arity_info.insert(
+                f.name.as_str().to_owned(),
+                arity_info_from_parameters(f.parameters.as_ref()),
+            );
+            // Record `async def` names so the call-site arm can emit
+            // `tyc::missing_await` for sync calls (FINDINGS #49).
+            if f.is_async {
+                c.async_functions.insert(f.name.as_str().to_owned());
+            }
             // Also extract any declared TypeVar bounds so they can be checked
             // at call sites.
             let bounds = type_param_bounds_from(f.type_params.as_deref(), &classes);
@@ -1829,7 +2204,146 @@ fn function_signature(
     Type::Function {
         params,
         ret: Box::new(ret),
-        variadic: false,
+        // `variadic = true` when the function carries `*args`. This lets
+        // the call-site arity check accept any number of positional
+        // arguments beyond the declared params (FINDINGS #44c).
+        variadic: parameters.vararg.is_some(),
+    }
+}
+
+/// Decide whether a call site's positional + keyword arguments are
+/// compatible with the named function's [`ArityInfo`]. Returns `true`
+/// for an OK call, `false` for an arity mismatch — the caller emits
+/// the diagnostic.
+///
+/// Rules:
+/// 1. Every kw argument must either match a parameter name (positional
+///    or kw-only), or be absorbed by `**kwargs`. Mismatch → `false`.
+/// 2. A parameter can be filled by either a positional or a kw arg —
+///    not both. Conflicts → `false`.
+/// 3. Every required positional / kw-only param must be filled.
+/// 4. The total positional count must not exceed `max_positional`
+///    (unless the function has `*args`, in which case `max_positional`
+///    is `None`).
+fn check_arity_with_info(
+    info: &ArityInfo,
+    pos_args: &[Expr],
+    kw_args: &[ruff_python_ast::Keyword],
+) -> bool {
+    // Filter out the `**double-star` unpacking keywords (`kw.arg == None`) — we
+    // can't statically know how many keys they contain, so we treat them as
+    // matching anything (kwarg sentinel).
+    let named_kwargs: Vec<&str> = kw_args
+        .iter()
+        .filter_map(|k| k.arg.as_ref().map(|i| i.as_str()))
+        .collect();
+    let has_double_star = kw_args.iter().any(|k| k.arg.is_none());
+
+    // Rule 4: positional count must fit max_positional (None → unbounded).
+    if let Some(max) = info.max_positional {
+        if pos_args.len() > max {
+            return false;
+        }
+    }
+
+    // Rule 1: every named kw must hit a parameter (or `**kwargs`).
+    if !info.has_kwarg {
+        for name in &named_kwargs {
+            let hits_pos = info.param_names.iter().any(|p| p == name);
+            let hits_kwonly = info.kwonly_names.iter().any(|p| p == name);
+            if !hits_pos && !hits_kwonly {
+                return false;
+            }
+        }
+    }
+
+    // Rule 2: a positional-bound name can't also appear as a kw.
+    let filled_positionally = pos_args.len().min(info.param_names.len());
+    for name in &named_kwargs {
+        if info.param_names[..filled_positionally]
+            .iter()
+            .any(|p| p == name)
+        {
+            return false;
+        }
+    }
+
+    // Rule 3a: every required positional must be filled by a pos arg or
+    // matching kw arg. Stops being checkable when `**kwargs` unpacking is
+    // present — in that case we trust the user.
+    if !has_double_star {
+        for (i, p) in info
+            .param_names
+            .iter()
+            .enumerate()
+            .take(info.min_positional)
+        {
+            if i < pos_args.len() {
+                continue;
+            }
+            if named_kwargs.iter().any(|kw| kw == p) {
+                continue;
+            }
+            return false;
+        }
+        // Rule 3b: every required kw-only must be filled.
+        for required in &info.kwonly_required {
+            if !named_kwargs.iter().any(|kw| kw == required) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Compute the [`ArityInfo`] sidecar for a `def`'s parameter list.
+///
+/// Walks the same positional / keyword / vararg / kwarg shape as
+/// `function_signature` but extracts the metadata that doesn't fit on
+/// `Type::Function` (param names for keyword-arg matching, count of
+/// defaulted params for the min-arity bound, kw-only requireds, and
+/// the `**kwargs` flag).
+fn arity_info_from_parameters(parameters: &ruff_python_ast::Parameters) -> ArityInfo {
+    let mut param_names: Vec<String> = Vec::new();
+    let mut min_positional: usize = 0;
+    // Walk positional-only + positional-or-keyword. A defaulted positional
+    // doesn't count toward `min_positional`; once we see the first
+    // defaulted param all subsequent positionals must also be defaulted
+    // (Python grammar enforces this), so we can stop incrementing once
+    // we encounter a default.
+    let positional_chain = parameters.posonlyargs.iter().chain(parameters.args.iter());
+    let mut hit_default = false;
+    let mut max_positional_count: usize = 0;
+    for pwd in positional_chain {
+        param_names.push(pwd.parameter.name.as_str().to_owned());
+        max_positional_count += 1;
+        if pwd.default.is_none() && !hit_default {
+            min_positional += 1;
+        } else {
+            hit_default = true;
+        }
+    }
+    let max_positional = if parameters.vararg.is_some() {
+        None
+    } else {
+        Some(max_positional_count)
+    };
+    let mut kwonly_names: Vec<String> = Vec::new();
+    let mut kwonly_required: Vec<String> = Vec::new();
+    for pwd in &parameters.kwonlyargs {
+        let name = pwd.parameter.name.as_str().to_owned();
+        kwonly_names.push(name.clone());
+        if pwd.default.is_none() {
+            kwonly_required.push(name);
+        }
+    }
+    ArityInfo {
+        param_names,
+        min_positional,
+        max_positional,
+        kwonly_names,
+        kwonly_required,
+        has_kwarg: parameters.kwarg.is_some(),
     }
 }
 
@@ -1947,6 +2461,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 &f.body,
                 f.returns.as_deref(),
                 &tps,
+                f.is_async,
             )
         }
         Stmt::ClassDef(cd) => {
@@ -1970,6 +2485,25 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 for s in &cd.body {
                     if let Stmt::FunctionDef(f) = s {
                         let method = f.name.as_str();
+                        let span_start = f.name.range.start().to_usize();
+                        // `__init__` is generated from the field
+                        // annotations (`@dataclass(slots=True)` or
+                        // `BaseModel`). Writing one manually conflicts
+                        // with the emitted constructor and is rejected
+                        // by the docs (FINDINGS #50). Emit a dedicated
+                        // `tyc::manual_init` error here rather than
+                        // falling through to the softer
+                        // `method_in_class_body` warning.
+                        if method == "__init__" {
+                            c.diagnostics.push_error(TycError::manual_init(
+                                class_name.to_owned(),
+                                c.path.clone(),
+                                c.source,
+                                span_start,
+                                method.len(),
+                            ));
+                            continue;
+                        }
                         // Don't warn on dunders the user is *expected* to
                         // override (e.g. `__add__`, `__lt__`); those are
                         // legitimate uses of class-body methods too. The
@@ -1978,7 +2512,6 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         if method.starts_with("__") && method.ends_with("__") {
                             continue;
                         }
-                        let span_start = f.name.range.start().to_usize();
                         c.diagnostics.push_warning(TycError::method_in_class_body(
                             class_name.to_owned(),
                             method.to_owned(),
@@ -2211,6 +2744,7 @@ fn check_function(
     body: &[Stmt],
     returns: Option<&Expr>,
     type_params: &[String],
+    is_async: bool,
 ) {
     let classes = c.classes.clone();
     let ret_type = match returns {
@@ -2226,7 +2760,43 @@ fn check_function(
         enforce_annotation_rule(c, name, parameters, returns);
     }
 
+    // `yield` inside a non-iterator-typed function (FINDINGS #51): a
+    // body containing `yield` / `yield from` produces a generator at
+    // runtime, so the declared return type must match an iterator
+    // shape. Auto-synthesised helpers are exempt for the same reason
+    // as Rule 1.
+    if !name.starts_with("__typhon_") {
+        if let Some(returns_expr) = returns {
+            if body_has_yield(body) && !is_iterator_return_type(returns_expr, is_async) {
+                let span = (
+                    returns_expr.range().start().to_usize(),
+                    returns_expr.range().end().to_usize(),
+                );
+                let length = span.1.saturating_sub(span.0).max(1);
+                let returned = match returns_expr {
+                    Expr::Name(n) => n.id.as_str().to_owned(),
+                    _ => "the declared type".to_owned(),
+                };
+                c.diagnostics.push_error(TycError::generator_return_type(
+                    name,
+                    returned,
+                    c.path.clone(),
+                    c.source,
+                    span.0,
+                    length,
+                ));
+            }
+        }
+    }
+
     let saved_return = c.current_return.replace(ret_type);
+    // Track sync-vs-async for the body's call-site check
+    // (`tyc::missing_await` — FINDINGS #49). Only sync function bodies
+    // trip the diagnostic; async bodies use `await` naturally and
+    // module-level scope keeps the `asyncio.run(coro())` entry-point
+    // pattern free of false positives.
+    let saved_in_sync = c.in_sync_function;
+    c.in_sync_function = !is_async;
     // Load the TypeVar bounds for this function so the body's attribute
     // accesses (e.g. `x.greet()` where `x: T` and `T: Greeter`) can resolve
     // against the bound's interface shape.
@@ -2303,6 +2873,7 @@ fn check_function(
     c.env.leave();
     c.current_return = saved_return;
     c.active_typevar_bounds = saved_bounds;
+    c.in_sync_function = saved_in_sync;
 }
 
 fn check_if(c: &mut Checker, i: &ruff_python_ast::StmtIf) {
@@ -2742,6 +3313,32 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             let func_type = infer_expr(c, &call.func);
             let call_span = (call.range.start().to_usize(), call.range.end().to_usize());
 
+            // `tyc::missing_await` (FINDINGS #49): a *sync* function
+            // calling an `async def` without `await` returns a
+            // coroutine, not the declared return type — Python emits
+            // "coroutine was never awaited" at runtime. The check is
+            // gated on `in_sync_function` so `async def` bodies (which
+            // use `await` naturally) and module scope are exempt.
+            //
+            // The `inside_await` counter (bumped by the `Expr::Await`
+            // arm) suppresses the check when the call is the operand
+            // of `await`. The arg-walk below additionally bumps
+            // `inside_await` for arguments to known coroutine-accepting
+            // functions like `asyncio.run(coro())`,
+            // `asyncio.create_task(coro())`, `asyncio.gather(...)`,
+            // `asyncio.ensure_future(...)`, `asyncio.wait(...)`,
+            // `asyncio.wait_for(...)` — passing a bare coroutine to
+            // any of these is the canonical entry-point pattern.
+            if c.in_sync_function && c.inside_await == 0 {
+                if let Expr::Name(n) = call.func.as_ref() {
+                    if c.async_functions.contains(n.id.as_str()) {
+                        let span = (n.range.start().to_usize(), n.range.end().to_usize());
+                        c.missing_await(n.id.as_str(), span);
+                    }
+                }
+            }
+            let suppresses_missing_await = call_targets_coro_acceptor(call);
+
             // Argument access check on the receiver (for things like x.foo()
             // where x could be None).
             if let Expr::Attribute(attr) = call.func.as_ref() {
@@ -2763,18 +3360,47 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     ret,
                     variadic,
                 } => {
-                    // Argument count check (positional only — conservative).
-                    // Variadic functions accept any number of args >= params.len().
-                    let count_ok = if variadic {
-                        pos_args.len() >= params.len()
+                    // Argument count check honours defaults, keyword args,
+                    // `*args`, and `**kwargs` by looking up the function's
+                    // rich `ArityInfo` (when known by name) — FINDINGS #44.
+                    // For callable values whose origin we can't resolve
+                    // (e.g. `apply(f, v)` where `f: Callable[[int], int]`),
+                    // we fall back to the structural shape: positional
+                    // count must match `params.len()` exactly unless
+                    // `variadic`, and kwargs are accepted iff the
+                    // structural type spelled `*args` / `**kwargs`.
+                    let fn_name: Option<String> = match call.func.as_ref() {
+                        Expr::Name(n) => Some(n.id.as_str().to_owned()),
+                        _ => None,
+                    };
+                    // Clone arity info so the mutable Checker borrows
+                    // below (`infer_expr_ctx`, `c.mismatch`,
+                    // `c.nullable_use`) don't fight an outstanding
+                    // immutable borrow of `c.function_arity_info`.
+                    let arity_info: Option<ArityInfo> = fn_name
+                        .as_deref()
+                        .and_then(|n| c.function_arity_info.get(n))
+                        .cloned();
+                    let count_ok = if let Some(info) = arity_info.as_ref() {
+                        check_arity_with_info(info, pos_args, kw_args)
                     } else {
-                        pos_args.len() == params.len()
+                        // No name-keyed arity info — this is a method
+                        // call, a callable-from-value, or a builtin
+                        // generic method. We don't track defaults on
+                        // methods today, so adopt a permissive shape:
+                        // count kw args alongside positional, accept
+                        // any total ≤ params.len() (defaults could
+                        // cover the rest), and require ≥ params.len()
+                        // when the function is variadic.
+                        let total = pos_args.len() + kw_args.len();
+                        if variadic {
+                            total >= params.len()
+                        } else {
+                            total <= params.len()
+                        }
                     };
                     if !count_ok {
-                        let name = match call.func.as_ref() {
-                            Expr::Name(n) => n.id.as_str().to_owned(),
-                            _ => "<call>".to_owned(),
-                        };
+                        let name = fn_name.clone().unwrap_or_else(|| "<call>".to_owned());
                         c.wrong_args(&name, params.len(), pos_args.len(), call_span);
                     }
                     // Argument type checks (per-pair, ignoring excess).
@@ -2783,6 +3409,9 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // literals (`[]`, `{}`) and nested generic calls pick
                     // up the parameter's element types.
                     let mut actuals: Vec<Type> = Vec::with_capacity(params.len());
+                    if suppresses_missing_await {
+                        c.inside_await = c.inside_await.saturating_add(1);
+                    }
                     for (i, arg) in pos_args.iter().enumerate() {
                         if i >= params.len() {
                             break;
@@ -2819,6 +3448,60 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         }
                         actuals.push(actual);
                     }
+                    // Keyword-argument type checks: when we have name-keyed
+                    // `ArityInfo`, each kwarg can be paired with the
+                    // parameter it fills (by position in `param_names`)
+                    // and checked against that parameter's type. Without
+                    // this, `def f(x: int) -> None; f(x="bad")` would
+                    // pass `tyc check` once kwargs were counted in the
+                    // arity check. (P1 review feedback from PR #57.)
+                    //
+                    // Clone the param-name slice up front so the
+                    // mutable `infer_expr_ctx` / `c.mismatch` /
+                    // `c.nullable_use` calls below don't fight the
+                    // `&ArityInfo` immutable borrow that `arity_info`
+                    // would keep alive across the loop.
+                    let kwarg_param_names: Option<Vec<String>> =
+                        arity_info.as_ref().map(|info| info.param_names.clone());
+                    if let Some(param_names) = kwarg_param_names {
+                        for kw in kw_args {
+                            let Some(ident) = &kw.arg else { continue };
+                            let Some(idx) = param_names.iter().position(|p| p == ident.as_str())
+                            else {
+                                continue;
+                            };
+                            if idx >= params.len() {
+                                continue;
+                            }
+                            let actual = infer_expr_ctx(c, &kw.value, Some(&params[idx]));
+                            let nullable_into_non_nullable =
+                                !params[idx].is_nullable() && actual.is_nullable();
+                            if nullable_into_non_nullable {
+                                if let Expr::Name(n) = &kw.value {
+                                    let span = (
+                                        n.range.start().to_usize(),
+                                        n.range.start().to_usize() + n.id.as_str().len(),
+                                    );
+                                    c.nullable_use(n.id.as_str(), &params[idx], span);
+                                } else {
+                                    let span = (
+                                        kw.value.range().start().to_usize(),
+                                        kw.value.range().end().to_usize(),
+                                    );
+                                    c.mismatch(&params[idx], &actual, span);
+                                }
+                            } else if !c.is_assignable(&params[idx], &actual) {
+                                let span = (
+                                    kw.value.range().start().to_usize(),
+                                    kw.value.range().end().to_usize(),
+                                );
+                                c.mismatch(&params[idx], &actual, span);
+                            }
+                        }
+                    }
+                    if suppresses_missing_await {
+                        c.inside_await = c.inside_await.saturating_sub(1);
+                    }
                     // PEP 695 inference: bind every TypeVar mentioned in
                     // the formals from the actuals, then substitute in the
                     // declared return type so callers see a concrete
@@ -2841,10 +3524,60 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // or `return` statement) to pin it.
                     bind_typevars_and_substitute_bidirectional(&params, &actuals, &ret, expected)
                 }
-                Type::Class(name) => Type::Class(name),
+                Type::Class(name) => {
+                    // Generic class instantiation (FINDINGS #46) — when
+                    // the class declares PEP 695 type parameters, try
+                    // bidirectional inference from the call's expected
+                    // return type so `let b: Box[int] = Box(value=42)`
+                    // produces `Type::Generic("Box", [Int])` rather than
+                    // `Type::Class("Box")`. Falls back to a forward pass
+                    // that reads field annotations and binds each
+                    // declared TypeVar from the matching kwarg.
+                    if let Some(tparams) = c.class_type_params.get(&name).cloned() {
+                        let mut bindings: HashMap<String, Type> = HashMap::new();
+                        // Bidirectional: pin from the surrounding annotation.
+                        if let Some(Type::Generic(exp_name, exp_args)) = expected {
+                            if exp_name == &name && exp_args.len() == tparams.len() {
+                                for (tp, arg) in tparams.iter().zip(exp_args.iter()) {
+                                    bindings.insert(tp.clone(), arg.clone());
+                                }
+                            }
+                        }
+                        // Forward: read each kwarg, match it to the
+                        // class's field annotation, and if the field's
+                        // type is a TypeVar, bind it from the arg's
+                        // inferred type.
+                        let class_shape = c.class_shapes.get(&name).cloned();
+                        if let Some(shape) = class_shape {
+                            for kw in kw_args {
+                                if let Some(ident) = &kw.arg {
+                                    if let Some(field_ty) =
+                                        shape.fields.get(ident.as_str()).cloned()
+                                    {
+                                        let arg_ty = infer_expr(c, &kw.value);
+                                        bind_field_typevars(&field_ty, &arg_ty, &mut bindings);
+                                    }
+                                }
+                            }
+                        }
+                        let args: Vec<Type> = tparams
+                            .iter()
+                            .map(|tp| bindings.remove(tp).unwrap_or(Type::Unknown))
+                            .collect();
+                        Type::Generic(name, args)
+                    } else {
+                        Type::Class(name)
+                    }
+                }
                 Type::Unknown | Type::Any => {
+                    if suppresses_missing_await {
+                        c.inside_await = c.inside_await.saturating_add(1);
+                    }
                     for a in pos_args.iter() {
                         let _ = infer_expr(c, a);
+                    }
+                    if suppresses_missing_await {
+                        c.inside_await = c.inside_await.saturating_sub(1);
                     }
                     Type::Unknown
                 }
@@ -2961,6 +3694,26 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                 .iter()
                 .map(|e| infer_expr_ctx(c, e, elt_expected))
                 .collect();
+            // Heterogeneous-list widening (FINDINGS #45): when every
+            // inferred element is assignable to the expected element type
+            // (interface / sealed-union / nominal-subtype rules included),
+            // narrow the list's element type to the expectation rather
+            // than the joined union of the elements. Without this, a
+            // literal `[Button(...), Slider(...)]` infers as
+            // `list[Button | Slider]` and fails the invariant
+            // assignability check against `list[Drawable]` even when
+            // both classes structurally conform to `Drawable`.
+            //
+            // Skip widening when the expected element type is itself an
+            // unbound TypeVar — otherwise PEP 695 inference would lose
+            // the concrete element types it needs to bind `T`, and the
+            // backward-pass from a let annotation could mask real
+            // mismatches (cf. `bidirectional_self_binding_does_not_block_backward_pass`).
+            if let Some(exp) = elt_expected {
+                if !is_typevar(exp) && elts.iter().all(|t| c.is_assignable(exp, t)) {
+                    return Type::Generic("list".into(), vec![exp.clone()]);
+                }
+            }
             Type::Generic("list".into(), vec![Type::union_of(elts)])
         }
         Expr::Tuple(t) => {
@@ -3025,6 +3778,23 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     vals.push(Type::Unknown);
                 }
             }
+            // Heterogeneous-dict widening (FINDINGS #45): when each
+            // value is assignable to the expected V (using the
+            // checker's interface / sealed-union rules), narrow the
+            // emitted dict's value type to the expectation rather than
+            // joining the literal's distinct value types into a union.
+            // Skip widening when V is an unbound TypeVar — see the
+            // matching note on the list arm.
+            if let Some(v_exp) = val_expected {
+                if !is_typevar(v_exp) && vals.iter().all(|t| c.is_assignable(v_exp, t)) {
+                    let widened_k = match key_expected {
+                        Some(k) if keys.iter().all(|t| c.is_assignable(k, t)) => k.clone(),
+                        _ if keys.is_empty() => Type::Unknown,
+                        _ => Type::union_of(keys),
+                    };
+                    return Type::Generic("dict".into(), vec![widened_k, v_exp.clone()]);
+                }
+            }
             let key_ty = if keys.is_empty() {
                 Type::Unknown
             } else {
@@ -3050,7 +3820,26 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                 .iter()
                 .map(|e| infer_expr_ctx(c, e, elt_expected))
                 .collect();
+            // Heterogeneous-set widening (FINDINGS #45) — same shape
+            // as the list / dict cases above. Skip when the expected
+            // element type is an unbound TypeVar.
+            if let Some(exp) = elt_expected {
+                if !is_typevar(exp) && elts.iter().all(|t| c.is_assignable(exp, t)) {
+                    return Type::Generic("set".into(), vec![exp.clone()]);
+                }
+            }
             Type::Generic("set".into(), vec![Type::union_of(elts)])
+        }
+        // `await EXPR` — bump the `inside_await` counter while inferring
+        // EXPR so a `Call` to an async function inside it does not
+        // trip the `tyc::missing_await` check (FINDINGS #49). The
+        // inferred type is the inner call's return type (`async def f()
+        // -> int` → `await f()` is `int`).
+        Expr::Await(a) => {
+            c.inside_await = c.inside_await.saturating_add(1);
+            let inner = infer_expr_ctx(c, &a.value, expected);
+            c.inside_await = c.inside_await.saturating_sub(1);
+            inner
         }
         _ => Type::Unknown,
     }

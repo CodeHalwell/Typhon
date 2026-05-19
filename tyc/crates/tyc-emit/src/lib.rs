@@ -63,8 +63,22 @@ pub fn emit_python(module: &ModModule) -> String {
 /// printer never visits) and avoids the brittleness of a post-pass
 /// text rewrite.
 pub fn emit_python_with_line_offsets(module: &ModModule) -> (String, Vec<usize>) {
+    emit_python_with_line_offsets_for_target(module, 0)
+}
+
+/// Like [`emit_python_with_line_offsets`] but with an explicit target
+/// Python minor version (`3.X`). When `< 12`, PEP 695 syntax in the
+/// AST is lowered to the legacy `TypeVar` / `Generic[T]` /
+/// `X: TypeAlias = Y` shapes so the emitted module parses on older
+/// interpreters (FINDINGS #47). `0` disables lowering (the previous
+/// default behaviour).
+pub fn emit_python_with_line_offsets_for_target(
+    module: &ModModule,
+    target_minor: u8,
+) -> (String, Vec<usize>) {
     let mut emitter = Emitter::new();
     emitter.suppress_mutability_keywords();
+    emitter.set_python_target(target_minor);
     emitter.emit_mod(module);
     let offsets = emitter.line_offsets.clone();
     (emitter.finish(), offsets)

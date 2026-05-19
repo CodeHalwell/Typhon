@@ -177,6 +177,63 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A function uses `yield` (or `yield from`) but its declared
+    /// return type isn't iterator-shaped. Calling it returns a
+    /// generator object at runtime, not the declared type. FINDINGS #51.
+    #[error("`{fn_name}` contains `yield` so it returns a generator, not `{returned}`")]
+    #[diagnostic(
+        code(tyc::generator_return_type),
+        help(
+            "annotate the return type as `Iterator[T]` / `Generator[T, S, R]` (or `AsyncIterator[T]` / `AsyncGenerator[T, S]` for `async def`)"
+        )
+    )]
+    GeneratorReturnType {
+        fn_name: String,
+        returned: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("declared return type here")]
+        span: SourceSpan,
+    },
+
+    /// A `class` body declared `__init__` directly. Typhon generates
+    /// the constructor from the field annotations, so writing one
+    /// manually conflicts with the emitted dataclass / model. Use
+    /// field defaults or a free factory function instead. FINDINGS #50.
+    #[error("`{class_name}.__init__` cannot be defined — the constructor is generated from the class fields")]
+    #[diagnostic(
+        code(tyc::manual_init),
+        help(
+            "remove `__init__`; set per-field defaults on the class or write a free factory function"
+        )
+    )]
+    ManualInit {
+        class_name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("declared __init__ here")]
+        span: SourceSpan,
+    },
+
+    /// A sync function called an `async def` without awaiting it. The
+    /// expression's value is a coroutine, not the function's declared
+    /// return type — and Python's runtime emits "coroutine was never
+    /// awaited" warnings for these. FINDINGS #49.
+    #[error("missing `await` on async call to `{callee}`")]
+    #[diagnostic(
+        code(tyc::missing_await),
+        help(
+            "wrap the call in `await` (and make the caller `async`), or call `asyncio.run(...)` if you are at the top level"
+        )
+    )]
+    MissingAwait {
+        callee: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("this call returns a coroutine — `await` it")]
+        span: SourceSpan,
+    },
+
     /// A `match` on a sealed union does not cover all variants and has no wildcard arm.
     #[error("non-exhaustive `match` on sealed union `{union_name}`: missing variant(s) {missing}")]
     #[diagnostic(
@@ -592,6 +649,53 @@ impl TycError {
     ) -> Self {
         Self::NotCallable {
             typ: typ.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::GeneratorReturnType`] diagnostic.
+    pub fn generator_return_type(
+        fn_name: impl Into<String>,
+        returned: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::GeneratorReturnType {
+            fn_name: fn_name.into(),
+            returned: returned.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::ManualInit`] diagnostic.
+    pub fn manual_init(
+        class_name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::ManualInit {
+            class_name: class_name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::MissingAwait`] diagnostic.
+    pub fn missing_await(
+        callee: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::MissingAwait {
+            callee: callee.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

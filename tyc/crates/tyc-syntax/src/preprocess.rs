@@ -2778,6 +2778,213 @@ fn parse_else_var(header: &str) -> Option<String> {
 /// them verbatim. The unit-indent is detected from the source itself (the
 /// first non-blank body line) rather than assumed to be four spaces, so
 /// tab-indented or two-space code round-trips correctly.
+/// Replace every whole-word occurrence of `from` with `to` in `line`,
+/// respecting Python identifier boundaries (a leading or trailing
+/// alphanumeric / underscore character disqualifies the match) **and**
+/// skipping over content inside regular string literals and `#`
+/// comments so the substitution can't corrupt user-visible text like
+/// `log.error("err occurred")` when renaming a synthesised `err`
+/// binding.
+///
+/// F-string interpolations (`f"... {EXPR} ..."`) are walked as code:
+/// the literal portions are left alone, but `{ ... }` expressions are
+/// rescanned so the identifier `err` inside `f"{err.field}"` is
+/// renamed exactly as it would be at top level. The scanner only
+/// handles single-line forms (matching the call site, which runs on
+/// already-line-split text from the `else err:` body).
+fn rename_whole_word(line: &str, from: &str, to: &str) -> String {
+    if from.is_empty() || !line.contains(from) {
+        return line.to_owned();
+    }
+    let bytes = line.as_bytes();
+    let from_bytes = from.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0usize;
+    /// Per-active-string state used to flip between literal-text and
+    /// interpolation modes correctly for f-strings.
+    #[derive(Clone, Copy)]
+    struct StrState {
+        quote: u8,
+        /// `true` when this string opened with `f"` / `f'` (or any
+        /// case-insensitive prefix containing `f`). Drives the `{` →
+        /// interpolation transition.
+        is_fstring: bool,
+        /// `true` once we've stepped into a `{ ... }` block. While
+        /// set, the scanner treats characters as code, recursing on
+        /// nested strings as needed.
+        in_interp: bool,
+    }
+    let mut stack: Vec<StrState> = Vec::new();
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(top) = stack.last().copied() {
+            if top.in_interp {
+                // Inside `f"... { CODE }"` we treat characters as code,
+                // recursing on nested string opens, and closing the
+                // interpolation on the matching `}` at depth 0 of the
+                // current interpolation. Track a local paren-style
+                // depth for `{ }` so dict literals inside the
+                // interpolation don't terminate it early.
+                match b {
+                    b'}' => {
+                        // Close the interpolation, fall back to string
+                        // literal mode.
+                        out.push('}');
+                        i += 1;
+                        if let Some(last) = stack.last_mut() {
+                            last.in_interp = false;
+                        }
+                        continue;
+                    }
+                    b'"' | b'\'' => {
+                        // Nested string literal inside the
+                        // interpolation. Push a fresh frame; the
+                        // outer f-string stays on the stack so we
+                        // return to it when this one closes.
+                        let is_fstring = is_fstring_prefix(bytes, i);
+                        stack.push(StrState {
+                            quote: b,
+                            is_fstring,
+                            in_interp: false,
+                        });
+                        out.push(b as char);
+                        i += 1;
+                        continue;
+                    }
+                    _ => {
+                        // Code byte — fall through to the bottom
+                        // matcher so identifier renaming applies.
+                    }
+                }
+            } else {
+                // Inside a literal portion of a string. Honour escapes
+                // and watch for the closing quote / f-string `{`.
+                if b == b'\\' && i + 1 < bytes.len() {
+                    let end = (i + 2).min(bytes.len());
+                    out.push_str(&line[i..end]);
+                    i = end;
+                    continue;
+                }
+                if b == top.quote {
+                    stack.pop();
+                    out.push(b as char);
+                    i += 1;
+                    continue;
+                }
+                if top.is_fstring && b == b'{' {
+                    // f-string interpolation opens. `{{` is a literal
+                    // brace — handle by checking the next byte.
+                    if bytes.get(i + 1) == Some(&b'{') {
+                        out.push_str("{{");
+                        i += 2;
+                        continue;
+                    }
+                    out.push('{');
+                    i += 1;
+                    if let Some(last) = stack.last_mut() {
+                        last.in_interp = true;
+                    }
+                    continue;
+                }
+                // Plain literal byte — preserve UTF-8.
+                let ch_len = utf8_char_len(bytes, i);
+                out.push_str(&line[i..i + ch_len]);
+                i += ch_len;
+                continue;
+            }
+        }
+        // Top-level (or interpolation-code) byte.
+        if b == b'#' {
+            // Comment to end of line — copy verbatim.
+            out.push_str(&line[i..]);
+            break;
+        }
+        if b == b'"' || b == b'\'' {
+            let is_fstring = is_fstring_prefix(bytes, i);
+            stack.push(StrState {
+                quote: b,
+                is_fstring,
+                in_interp: false,
+            });
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        // Word match in code position.
+        if i + from_bytes.len() <= bytes.len() && &bytes[i..i + from_bytes.len()] == from_bytes {
+            let before_ok = i == 0 || !is_ident_continuation(bytes[i - 1]);
+            let after_ok = i + from_bytes.len() == bytes.len()
+                || !is_ident_continuation(bytes[i + from_bytes.len()]);
+            if before_ok && after_ok {
+                out.push_str(to);
+                i += from_bytes.len();
+                continue;
+            }
+        }
+        // Copy one UTF-8 character — pushing `bytes[i] as char` would
+        // mojibake non-ASCII identifiers / string-literal continuation
+        // bytes.
+        let ch_len = utf8_char_len(bytes, i);
+        out.push_str(&line[i..i + ch_len]);
+        i += ch_len;
+    }
+    out
+}
+
+/// Return `true` when the quote byte at `bytes[i]` is preceded by a
+/// string-prefix that includes `f` / `F` (`f"..."`, `Rf"..."`, etc.).
+/// We scan backwards over the legal Python prefix bytes (`f`, `F`, `r`,
+/// `R`, `b`, `B`, `u`, `U`) — order doesn't matter, but `b`/`B` makes
+/// the string non-f. We only require that an `f`/`F` is present.
+fn is_fstring_prefix(bytes: &[u8], quote_idx: usize) -> bool {
+    let mut j = quote_idx;
+    let mut has_f = false;
+    let mut has_b = false;
+    while j > 0 {
+        let prev = bytes[j - 1];
+        if prev == b'f' || prev == b'F' {
+            has_f = true;
+            j -= 1;
+            continue;
+        }
+        if prev == b'r' || prev == b'R' || prev == b'u' || prev == b'U' {
+            j -= 1;
+            continue;
+        }
+        if prev == b'b' || prev == b'B' {
+            has_b = true;
+            j -= 1;
+            continue;
+        }
+        break;
+    }
+    has_f && !has_b
+}
+
+/// Length in bytes of the UTF-8 character starting at `bytes[i]`.
+/// Used by the byte-cursor scanners in this module to keep multi-byte
+/// sequences intact while still allowing constant-time byte indexing.
+fn utf8_char_len(bytes: &[u8], i: usize) -> usize {
+    let b = bytes[i];
+    if b < 0x80 {
+        1
+    } else if b < 0xC0 {
+        // Stray continuation byte — copy one byte to make progress.
+        1
+    } else if b < 0xE0 {
+        2
+    } else if b < 0xF0 {
+        3
+    } else {
+        4
+    }
+    .min(bytes.len() - i)
+}
+
+fn is_ident_continuation(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
 fn render_chain(chain: &WithChain, chain_indent: &str, counter: &mut usize) -> String {
     let mut out = String::new();
 
@@ -2821,19 +3028,23 @@ fn render_chain(chain: &WithChain, chain_indent: &str, counter: &mut usize) -> S
 
         match (&chain.err_var, !chain.else_body.is_empty()) {
             (Some(name), true) => {
-                // Bind `err = tmp.error` at one indent past the guard,
-                // using the detected unit indent.
+                // Uniquify the user-visible `err` name so multiple
+                // `with`-chains in the same function don't trip the
+                // resolver's `tyc::immutable_assign` re-declaration
+                // check on a shared `let err = ...`. The synthesised
+                // name keys off the current tmp counter (which has
+                // already been bumped for this binding) so it's
+                // guaranteed unique without interleaving with the
+                // chain's own `__typhon_with_N__` numbering.
+                let unique_err = format!("__typhon_with_err_{}__", *counter - 1);
                 out.push_str(&inner_indent);
-                out.push_str(name);
+                out.push_str("let ");
+                out.push_str(&unique_err);
                 out.push_str(" = ");
                 out.push_str(&tmp);
                 out.push_str(".error\n");
-                // Else-body lines come in with their original indent (one
-                // level inside the `else err:` header, which sat at the
-                // chain indent). That matches the new `if` body's indent
-                // exactly, so emit verbatim.
                 for line in &chain.else_body {
-                    out.push_str(line);
+                    out.push_str(&rename_whole_word(line, name, &unique_err));
                 }
             }
             _ => {
@@ -2844,7 +3055,13 @@ fn render_chain(chain: &WithChain, chain_indent: &str, counter: &mut usize) -> S
             }
         }
 
+        // Emit the user-visible unwrap as `let NAME = tmp.value` so the
+        // resolver sees an explicit binding-kind keyword. Without `let`
+        // here, Rule-2's `tyc::missing_binding_kind` would fire on the
+        // lowered statement (and the diagnostic would point at the
+        // synthesised line rather than the user's `with` source).
         out.push_str(chain_indent);
+        out.push_str("let ");
         out.push_str(&binding.target);
         out.push_str(" = ");
         out.push_str(&tmp);
@@ -3103,30 +3320,25 @@ fn render_gather_block(
                 out.push_str(", ");
             }
             out.push_str("return_exceptions=True)\n");
-            // Tuple-unpack the results into the user-named bindings. With a
-            // single binding we still need a trailing comma so Python performs
-            // sequence unpacking (`x, = results`) rather than binding the
-            // whole list to one name (`x = results`).
-            //
-            // We deliberately do NOT prefix `let` here: tuple-destructuring
-            // is not currently supported with a Typhon binding-kind
-            // keyword, and `declare_target`'s recursion into tuple
-            // patterns already declares the names. The Rule-2 enforcement
-            // in `declare_target` only fires on bare `Expr::Name` targets,
-            // so a tuple unpack is safe.
-            out.push_str(header_indent);
+            // Index each result into a `let NAME = __typhon_gather_N__[i]`
+            // line so every user-visible binding carries an explicit
+            // binding-kind keyword. We deliberately avoid emitting the
+            // earlier tuple-destructure form (`a, b = results`) because
+            // Rule-2's `tyc::missing_binding_kind` enforcement would fire
+            // on the synthesised target without a way for the user to
+            // add `let` themselves (the `gather:` block keyword is the
+            // closest surface form, and that exception only applies to
+            // the strict TaskGroup lowering today).
             for (idx, b) in bindings.iter().enumerate() {
-                if idx > 0 {
-                    out.push_str(", ");
-                }
+                out.push_str(header_indent);
+                out.push_str("let ");
                 out.push_str(&b.name);
+                out.push_str(" = ");
+                out.push_str(&results);
+                out.push('[');
+                out.push_str(&idx.to_string());
+                out.push_str("]\n");
             }
-            if bindings.len() == 1 {
-                out.push(',');
-            }
-            out.push_str(" = ");
-            out.push_str(&results);
-            out.push('\n');
         }
     }
     out
@@ -3164,7 +3376,12 @@ pub fn expand_go_calls(source: &str) -> String {
         if let Some(rest) = body.strip_prefix("go ") {
             if let Some((call_expr, handle)) = parse_go_call(rest) {
                 if let Some(handle) = handle {
+                    // Emit `let handle = …` so the user-visible task
+                    // identifier carries an explicit binding-kind keyword
+                    // and Rule-2's `tyc::missing_binding_kind` doesn't
+                    // fire on the synthesised assignment.
                     out.push_str(indent);
+                    out.push_str("let ");
                     out.push_str(&handle);
                     out.push_str(" = typhon_runtime.tasks.spawn(");
                     out.push_str(&call_expr);
@@ -3265,6 +3482,16 @@ fn parse_go_call(rest: &str) -> Option<(String, Option<String>)> {
 /// Lines that begin inside a triple-quoted string are passed through
 /// verbatim. A line that contains no top-level `|>` is unchanged.
 pub fn expand_pipes(source: &str) -> String {
+    // First, fold multi-line pipe segments back onto their preceding
+    // line so the rest of the pass can stay line-oriented. Python
+    // allows operators at the start of a continuation line inside a
+    // parenthesised expression (black/ruff format `+`, `and`, `|`
+    // that way); `|>` follows the same convention. FINDINGS #52.
+    let joined = join_pipe_continuations(source);
+    expand_pipes_line_by_line(&joined)
+}
+
+fn expand_pipes_line_by_line(source: &str) -> String {
     let mut result = String::with_capacity(source.len());
     let mut in_string: Option<StringMode> = None;
 
@@ -3306,6 +3533,106 @@ pub fn expand_pipes(source: &str) -> String {
     }
 
     result
+}
+
+/// Fold multi-line pipe segments back onto their preceding line so the
+/// line-based [`expand_pipes`] pass can rewrite the chain. When a line
+/// inside an unclosed parenthesised expression starts (after whitespace)
+/// with `|>`, we treat it as a continuation of the previous logical
+/// line and join them with a single space. Outside parentheses the
+/// pass is a no-op — Python doesn't permit operator-at-line-start
+/// there anyway.
+///
+/// Lines that begin mid-string (e.g. triple-quoted continuation) are
+/// passed through verbatim so we don't perturb string contents.
+fn join_pipe_continuations(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut buffered: Option<(String, String)> = None; // (line_without_terminator, terminator)
+    let mut paren_depth: i32 = 0;
+    let mut in_string: Option<StringMode> = None;
+
+    let flush = |buffered: &mut Option<(String, String)>, out: &mut String| {
+        if let Some((line, term)) = buffered.take() {
+            out.push_str(&line);
+            out.push_str(&term);
+        }
+    };
+
+    for line in source.split_inclusive('\n') {
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let terminator = &line[raw.len()..];
+
+        // Snapshot the string state at the start of this line.
+        let pre_string = in_string;
+        let _ = scan_line_code_end(raw, &mut in_string);
+
+        // If we entered this line inside a string literal, just emit
+        // the buffer-then-line as-is — we can't safely join across
+        // string boundaries.
+        if pre_string.is_some() {
+            flush(&mut buffered, &mut out);
+            out.push_str(line);
+            continue;
+        }
+
+        // Look for a leading `|>` (after any whitespace), but only
+        // accept it as a continuation if we are inside an unclosed
+        // parenthesised expression.
+        let trimmed = raw.trim_start();
+        let is_pipe_continuation =
+            paren_depth > 0 && trimmed.starts_with("|>") && buffered.is_some();
+
+        if is_pipe_continuation {
+            // Merge with the buffered previous line.
+            if let Some((prev_line, prev_term)) = buffered.take() {
+                // Drop the terminator on the previous line and the
+                // leading whitespace on this one, joining with a single
+                // space so existing tokenization keeps working.
+                let joined = format!("{} {}", prev_line, trimmed);
+                buffered = Some((joined, prev_term));
+            }
+        } else {
+            // Different shape — flush whatever was buffered and start
+            // buffering this line in its place.
+            flush(&mut buffered, &mut out);
+            buffered = Some((raw.to_owned(), terminator.to_owned()));
+        }
+
+        // Track parenthesis depth based on the original raw text (the
+        // join preserves bracket balance because it just glues two
+        // halves together). Skip bytes inside string literals and
+        // after `#` comments so a line like `s = "(((" ` doesn't
+        // mistakenly inflate `paren_depth` and trigger a bogus
+        // continuation fold on a later `|>` at module level.
+        let bytes = raw.as_bytes();
+        let mut local_str: Option<u8> = None;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if let Some(quote) = local_str {
+                if b == b'\\' && i + 1 < bytes.len() {
+                    // Escape skips the next byte (`\"`, `\'`, `\\`, etc).
+                    i += 2;
+                    continue;
+                }
+                if b == quote {
+                    local_str = None;
+                }
+                i += 1;
+                continue;
+            }
+            match b {
+                b'#' => break,
+                b'"' | b'\'' => local_str = Some(b),
+                b'(' | b'[' | b'{' => paren_depth += 1,
+                b')' | b']' | b'}' => paren_depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+    flush(&mut buffered, &mut out);
+    out
 }
 
 /// Locate every `|>` token in `code` that sits at parenthesis depth 0 and
@@ -3592,7 +3919,11 @@ fn apply_pipe_call(acc: &str, rhs: &str) -> Option<String> {
         }
         Some(open) => {
             let func = rhs[..open].trim_end();
-            if !is_dotted_callable(func) {
+            // Accept either a plain identifier chain (`a.b.c`) or a
+            // bound method on a literal receiver (`", ".join`,
+            // `(a + b).method`). The latter shape is common in pipe
+            // chains that feed into stdlib container methods.
+            if !is_dotted_callable(func) && !is_method_call_head(func) {
                 return None;
             }
             // Validate the RHS is exactly `func(...)` — i.e. parens span to
@@ -3610,6 +3941,40 @@ fn apply_pipe_call(acc: &str, rhs: &str) -> Option<String> {
             }
         }
     }
+}
+
+/// True if `s` looks like a *bound method* call head — anything that
+/// ends in `.IDENT` where the preceding text is either a string /
+/// bytes literal or a parenthesised expression. Examples:
+///
+///   `", ".join`            → ok (string literal + `.join`)
+///   `b"x".decode`          → ok
+///   `(a + b).foo`          → ok
+///   `mod.func.helper`      → handled by `is_dotted_callable` instead
+fn is_method_call_head(s: &str) -> bool {
+    let s = s.trim_end();
+    let Some(dot_pos) = s.rfind('.') else {
+        return false;
+    };
+    let receiver = s[..dot_pos].trim_end();
+    let method = s[dot_pos + 1..].trim_start();
+    if receiver.is_empty() || method.is_empty() {
+        return false;
+    }
+    // Method must be a plain identifier.
+    let mut chars = method.chars();
+    let first = chars.next().unwrap();
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+    // Receiver: a string/bytes literal (quoted, possibly with a
+    // prefix like `b`, `r`, `f`), or a parenthesised expression.
+    let bytes = receiver.as_bytes();
+    let last = *bytes.last().unwrap();
+    matches!(last, b'"' | b'\'' | b')' | b']')
 }
 
 /// True if `s` looks like a (possibly dotted) callable identifier suitable as
@@ -4452,9 +4817,22 @@ def run() -> Result[str, str]:
             out.contains("if isinstance(__typhon_with_0__, Err):"),
             "out:\n{out}"
         );
-        assert!(out.contains("err = __typhon_with_0__.error"), "out:\n{out}");
-        assert!(out.contains("return Err(err)"), "out:\n{out}");
-        assert!(out.contains("x = __typhon_with_0__.value"), "out:\n{out}");
+        // The user-visible `err` name is uniquified to
+        // `__typhon_with_err_N__` to avoid `let err` clashing across
+        // multiple `with`-chains in the same function. References to
+        // `err` in the else_body are renamed to match.
+        assert!(
+            out.contains("let __typhon_with_err_0__ = __typhon_with_0__.error"),
+            "out:\n{out}"
+        );
+        assert!(
+            out.contains("return Err(__typhon_with_err_0__)"),
+            "out:\n{out}"
+        );
+        assert!(
+            out.contains("let x = __typhon_with_0__.value"),
+            "out:\n{out}"
+        );
         assert!(out.contains("return Ok(x)"), "out:\n{out}");
     }
 
@@ -4470,9 +4848,15 @@ def run() -> Result[str, str]:
 ";
         let out = expand_with_chains(src);
         assert!(out.contains("__typhon_with_0__ = f()"), "out:\n{out}");
-        assert!(out.contains("a = __typhon_with_0__.value"), "out:\n{out}");
+        assert!(
+            out.contains("let a = __typhon_with_0__.value"),
+            "out:\n{out}"
+        );
         assert!(out.contains("__typhon_with_1__ = g(a)"), "out:\n{out}");
-        assert!(out.contains("b = __typhon_with_1__.value"), "out:\n{out}");
+        assert!(
+            out.contains("let b = __typhon_with_1__.value"),
+            "out:\n{out}"
+        );
     }
 
     #[test]
@@ -4506,8 +4890,10 @@ def run() -> Result[str, str]:
         return Err(\"oops\")
 ";
         let out = expand_with_chains(src);
+        // Uniquified per the multi-chain fix; original name `_err`
+        // becomes `__typhon_with_err_N__` keyed off the binding's tmp.
         assert!(
-            out.contains("_err = __typhon_with_0__.error"),
+            out.contains("let __typhon_with_err_0__ = __typhon_with_0__.error"),
             "out:\n{out}"
         );
         assert!(out.contains("return Err(\"oops\")"), "out:\n{out}");
@@ -5015,8 +5401,8 @@ def run() -> Result[str, str]:
             "create_task call missing: {out}"
         );
         assert!(
-            out.contains("user = __typhon_gather"),
-            "user binding missing: {out}"
+            out.contains("let user = __typhon_gather"),
+            "user binding missing or unbound by `let`: {out}"
         );
     }
 
@@ -5032,9 +5418,19 @@ def run() -> Result[str, str]:
             out.contains("return_exceptions=True"),
             "return_exceptions flag missing: {out}"
         );
-        // Tuple destructure of the result vector should land in the
-        // user-named bindings.
-        assert!(out.contains("a, b = "), "destructure missing: {out}");
+        // Each user binding is indexed out of the results vector with an
+        // explicit `let` so Rule-2's `tyc::missing_binding_kind` doesn't
+        // fire on the lowered statements.
+        assert!(
+            out.contains("let a = __typhon_gather"),
+            "let a indexed binding missing: {out}"
+        );
+        assert!(
+            out.contains("let b = __typhon_gather"),
+            "let b indexed binding missing: {out}"
+        );
+        assert!(out.contains("[0]"), "index 0 missing: {out}");
+        assert!(out.contains("[1]"), "index 1 missing: {out}");
     }
 
     #[test]
@@ -5061,8 +5457,8 @@ def run() -> Result[str, str]:
     fn go_call_with_handle_binds_task() {
         let out = expand_go_calls("async def f():\n    go fetch(x) -> fut\n");
         assert!(
-            out.contains("fut = typhon_runtime.tasks.spawn(fetch(x))"),
-            "handle binding missing: {out}"
+            out.contains("let fut = typhon_runtime.tasks.spawn(fetch(x))"),
+            "handle binding missing or unbound by `let`: {out}"
         );
     }
 

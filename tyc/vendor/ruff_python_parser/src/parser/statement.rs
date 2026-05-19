@@ -269,7 +269,17 @@ impl<'src> Parser<'src> {
         // field. Anywhere else `let` and `mut` behave as ordinary identifiers
         // (they are soft keywords).
         let kind = self.current_token_kind();
-        if matches!(kind, TokenKind::Let | TokenKind::Mut) && self.peek() == TokenKind::Name {
+        // Accept `let NAME ...`, `let (PATTERN ...)`, and `let [PATTERN ...]`
+        // as binding-keyword prefixes so tuple / list destructuring
+        // assignments (`let (x, y) = pt`, `let [a, b] = pair`) work the
+        // same as bare-name `let x = ...`. Without `Lpar` / `Lsqb` in
+        // the lookahead set, the parser falls through and treats `let`
+        // as an identifier, surfacing the unhelpful "invalid assignment
+        // target" diagnostic. FINDINGS #56 (cascade — destructuring `let`).
+        let peek = self.peek();
+        let starts_binding = matches!(kind, TokenKind::Let | TokenKind::Mut)
+            && matches!(peek, TokenKind::Name | TokenKind::Lpar | TokenKind::Lsqb);
+        if starts_binding {
             let mutability = match kind {
                 TokenKind::Let => ast::Mutability::Let,
                 TokenKind::Mut => ast::Mutability::Mut,

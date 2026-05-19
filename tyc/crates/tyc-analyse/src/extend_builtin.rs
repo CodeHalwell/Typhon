@@ -32,6 +32,34 @@ use ruff_text_size::TextRange;
 /// of the recognised Python built-in types.
 const STUB_PREFIX: &str = "__typhon_builtin_ext_";
 
+/// Annotate the lifted free function's `self` parameter with the
+/// extended builtin's type (FINDINGS #54). Only fires when the first
+/// positional parameter is currently unannotated and named `self`; an
+/// explicit annotation the user already wrote wins. The annotation
+/// node is synthesised with a zero-length `TextRange` so source-map
+/// emission inherits the surrounding offset (matching how other
+/// desugar passes synthesise AST nodes).
+fn annotate_self_param_with_builtin(f: &mut ruff_python_ast::StmtFunctionDef, builtin: &str) {
+    let target = f
+        .parameters
+        .posonlyargs
+        .first_mut()
+        .or_else(|| f.parameters.args.first_mut());
+    let Some(target) = target else { return };
+    if target.parameter.name.as_str() != "self" {
+        return;
+    }
+    if target.parameter.annotation.is_some() {
+        return;
+    }
+    target.parameter.annotation = Some(Box::new(Expr::Name(ExprName {
+        range: ruff_text_size::TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        id: Name::new(builtin),
+        ctx: ruff_python_ast::ExprContext::Load,
+    })));
+}
+
 /// Free-function naming convention. `__typhon_ext_<TYPE>__<METHOD>`.
 fn free_fn_name(ty: &str, method: &str) -> String {
     format!("__typhon_ext_{ty}__{method}")
@@ -77,6 +105,16 @@ pub fn extract_builtin_extensions(
                             node_index: AtomicNodeIndex::NONE,
                             id: Name::new(&new_name),
                         };
+                        // Annotate the receiver (`self`) with the
+                        // builtin's type so the lifted free function
+                        // satisfies Rule 1 (FINDINGS #54) and `tyc ty`
+                        // / pyright / mypy can type-check the body.
+                        // The annotation is set only on the first
+                        // positional-or-keyword parameter if it is
+                        // currently unannotated and named `self`; any
+                        // explicit annotation the user already wrote
+                        // wins.
+                        annotate_self_param_with_builtin(&mut promoted, &builtin);
                         entry.insert(f.name.as_str().to_owned(), new_name);
                         rebuilt.push(Stmt::FunctionDef(promoted));
                         stats.methods += 1;
