@@ -16,8 +16,8 @@ use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
     CodeActionProviderCapability, CodeActionResponse, CompletionItem, CompletionItemKind,
     CompletionOptions, CompletionParams, CompletionResponse, Diagnostic, DiagnosticSeverity,
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams, Documentation,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    Documentation, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
     HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, Location,
     MarkedString, MessageType, NumberOrString, OneOf, Position, Range, ServerCapabilities,
     TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
@@ -343,7 +343,9 @@ impl LanguageServer for Backend {
             &resolved,
             &preprocessed,
             position,
-            introspect_owned.as_ref().map(|b| b.as_ref() as &dyn Fn(&str) -> Option<Vec<CompletionItem>>),
+            introspect_owned
+                .as_ref()
+                .map(|b| b.as_ref() as &dyn Fn(&str) -> Option<Vec<CompletionItem>>),
         );
         Ok(Some(CompletionResponse::Array(items)))
     }
@@ -1002,7 +1004,10 @@ pub fn compute_completion_items_with_introspection(
 ///
 /// Returns `None` when no useful fix-up exists (e.g. the cursor is not
 /// after a `.`), letting the caller fall back to the empty resolution.
-fn try_fixup_and_resolve(preprocessed: &str, position: Position) -> Option<(String, ResolvedModule)> {
+fn try_fixup_and_resolve(
+    preprocessed: &str,
+    position: Position,
+) -> Option<(String, ResolvedModule)> {
     let offset = position_to_byte(preprocessed, position);
     // Cursor must sit immediately after `<id>.` (with possibly some
     // already-typed partial member chars between the dot and the cursor).
@@ -1036,8 +1041,11 @@ fn try_fixup_and_resolve(preprocessed: &str, position: Position) -> Option<(Stri
     // step still fails (broken source elsewhere in the file), bail.
     let prep = tyc_syntax::preprocess::preprocess(&patched);
     let parsed = tyc_syntax::parse_module(&prep.python_source).ok()?;
-    let (resolved, _) =
-        tyc_resolve::resolve_module("<lsp-fixup>".to_owned(), &prep.python_source, &parsed.syntax());
+    let (resolved, _) = tyc_resolve::resolve_module(
+        "<lsp-fixup>".to_owned(),
+        &prep.python_source,
+        &parsed.syntax(),
+    );
     Some((prep.python_source, resolved))
 }
 
@@ -1196,10 +1204,7 @@ pub(crate) fn introspected_members_to_completion(
             label: m.name.clone(),
             kind: Some(introspected_kind_to_lsp(&m.kind)),
             detail: m.signature.clone(),
-            documentation: m
-                .documentation
-                .clone()
-                .map(Documentation::String),
+            documentation: m.documentation.clone().map(Documentation::String),
             ..Default::default()
         })
         .collect()
@@ -2055,7 +2060,10 @@ def f() -> None:
         assert!(labels.contains("join"), "expected `join`: {labels:?}");
         assert!(labels.contains("exists"), "expected `exists`: {labels:?}");
         // Crucially the parent module's members must NOT leak in.
-        assert!(!labels.contains("getcwd"), "os leaked into os.path: {labels:?}");
+        assert!(
+            !labels.contains("getcwd"),
+            "os leaked into os.path: {labels:?}"
+        );
     }
 
     #[test]
@@ -2096,7 +2104,10 @@ def f() -> None:
         let position = byte_to_position(&prep.python_source, offset);
         let (patched, resolved) = try_fixup_and_resolve(&prep.python_source, position)
             .expect("fixup should succeed for `os.<cursor>`");
-        assert!(!resolved.scopes.is_empty(), "expected non-empty scopes after fixup");
+        assert!(
+            !resolved.scopes.is_empty(),
+            "expected non-empty scopes after fixup"
+        );
         // Sanity: the placeholder is at the cursor position, not before.
         let cursor_in_patched = position_to_byte(&patched, position);
         assert_eq!(

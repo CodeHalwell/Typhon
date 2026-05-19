@@ -2186,7 +2186,13 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                 if !name.starts_with("__typhon_impl_") && !name.starts_with("__TyphonLazy_") {
                     if !seen_class_names.insert(name.clone()) {
                         let span_start = cd.name.range.start().to_usize();
-                        let span_len = cd.name.range.end().to_usize().saturating_sub(span_start).max(1);
+                        let span_len = cd
+                            .name
+                            .range
+                            .end()
+                            .to_usize()
+                            .saturating_sub(span_start)
+                            .max(1);
                         c.diagnostics.push_error(TycError::duplicate_class(
                             name.as_str(),
                             &c.path,
@@ -2321,11 +2327,7 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                     let span_start = name_start.saturating_add(prefix_len);
                     let span_len = name_end.saturating_sub(span_start).max(1);
                     c.diagnostics.push_error(TycError::impl_unknown_class(
-                        target,
-                        &c.path,
-                        c.source,
-                        span_start,
-                        span_len,
+                        target, &c.path, c.source, span_start, span_len,
                     ));
                 }
             }
@@ -3841,8 +3843,9 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // unbound after the forward arg pass, use the call's
                     // expected return type (from the enclosing annotation
                     // or `return` statement) to pin it.
-                    let result =
-                        bind_typevars_and_substitute_bidirectional(&params, &actuals, &ret, expected);
+                    let result = bind_typevars_and_substitute_bidirectional(
+                        &params, &actuals, &ret, expected,
+                    );
                     // FINDINGS #71: narrow `<dict[K, V]>.get(k, default)` to
                     // `V | type(default)`, which collapses to `V` when default
                     // is V-compatible. Without this, the one-arg signature

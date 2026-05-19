@@ -220,13 +220,12 @@ impl TyphonConfig {
     /// `typhon.toml`.
     pub fn validate(&self, source_path: &Path) -> Result<(), ConfigError> {
         let raw = self.python.target.trim();
-        let (major, minor) = parse_python_target(raw).ok_or_else(|| {
-            ConfigError::UnsupportedPythonTarget {
+        let (major, minor) =
+            parse_python_target(raw).ok_or_else(|| ConfigError::UnsupportedPythonTarget {
                 path: source_path.display().to_string(),
                 target: raw.to_owned(),
                 reason: "expected a `MAJOR.MINOR` string such as `3.13` or `3.14t`".to_owned(),
-            }
-        })?;
+            })?;
         if (major, minor) < (3, 13) {
             return Err(ConfigError::UnsupportedPythonTarget {
                 path: source_path.display().to_string(),
@@ -250,7 +249,10 @@ fn parse_python_target(s: &str) -> Option<(u32, u32)> {
     let minor_raw = parts.next()?;
     // Trim the `t` (free-threaded) or `rc1` / `a1` style suffix — only
     // the leading digits matter for the floor check.
-    let minor_digits: String = minor_raw.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let minor_digits: String = minor_raw
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     if minor_digits.is_empty() {
         return None;
     }
@@ -336,7 +338,10 @@ mod tests {
                 .expect_err(&format!("target {t} should be rejected"));
             match err {
                 ConfigError::UnsupportedPythonTarget { reason, .. } => {
-                    assert!(reason.contains("3.13+"), "expected 3.13+ hint, got {reason}");
+                    assert!(
+                        reason.contains("3.13+"),
+                        "expected 3.13+ hint, got {reason}"
+                    );
                 }
                 _ => panic!("expected UnsupportedPythonTarget for {t}, got {err:?}"),
             }
@@ -350,10 +355,7 @@ mod tests {
             let err = cfg_with_target(t)
                 .validate(path)
                 .expect_err(&format!("target {t:?} should be rejected"));
-            assert!(matches!(
-                err,
-                ConfigError::UnsupportedPythonTarget { .. }
-            ));
+            assert!(matches!(err, ConfigError::UnsupportedPythonTarget { .. }));
         }
     }
 

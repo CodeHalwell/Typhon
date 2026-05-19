@@ -176,7 +176,10 @@ fn duplicate_class_emits_diagnostic() {
     )
     .unwrap();
     let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
-    assert!(!out.status.success(), "expected duplicate_class to fail check");
+    assert!(
+        !out.status.success(),
+        "expected duplicate_class to fail check"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let combined = format!("{stderr}{stdout}");
@@ -198,7 +201,10 @@ fn impl_unknown_class_emits_diagnostic() {
     )
     .unwrap();
     let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
-    assert!(!out.status.success(), "expected impl_unknown_class to fail check");
+    assert!(
+        !out.status.success(),
+        "expected impl_unknown_class to fail check"
+    );
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stderr),
@@ -222,7 +228,10 @@ fn cyclic_type_alias_emits_diagnostic() {
     )
     .unwrap();
     let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
-    assert!(!out.status.success(), "expected cyclic_type_alias to fail check");
+    assert!(
+        !out.status.success(),
+        "expected cyclic_type_alias to fail check"
+    );
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stderr),

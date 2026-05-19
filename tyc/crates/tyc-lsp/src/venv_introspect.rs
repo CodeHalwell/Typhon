@@ -91,11 +91,7 @@ impl IntrospectionCache {
     /// re-stat-and-invalidate happens here rather than at cache
     /// construction so we don't pay it on every completion request
     /// — only on miss.
-    pub fn members(
-        &mut self,
-        project_root: &Path,
-        module: &str,
-    ) -> Option<Arc<Vec<MemberInfo>>> {
+    pub fn members(&mut self, project_root: &Path, module: &str) -> Option<Arc<Vec<MemberInfo>>> {
         // Cheap cache check — if we already know about this module,
         // return whatever we've got (`None` value short-circuits
         // repeated failures, `Some` returns the result).
@@ -300,10 +296,7 @@ mod tests {
         let found = find_project_root(&nested).expect("should find typhon.toml ancestor");
         // Normalise both via canonicalize so symlink prefixes (`/tmp` vs
         // `/private/tmp` on macOS) don't sneak in.
-        assert_eq!(
-            found.canonicalize().unwrap(),
-            root.canonicalize().unwrap()
-        );
+        assert_eq!(found.canonicalize().unwrap(), root.canonicalize().unwrap());
     }
 
     #[test]

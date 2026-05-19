@@ -43,10 +43,7 @@ pub struct ModuleStub {
 /// if known. Returns `None` for any module we haven't curated — the
 /// caller falls back to bindings-only completion in that case.
 pub fn lookup(module: &str) -> Option<&'static [StubMember]> {
-    STUBS
-        .iter()
-        .find(|s| s.module == module)
-        .map(|s| s.members)
+    STUBS.iter().find(|s| s.module == module).map(|s| s.members)
 }
 
 /// Return true when `name` looks like the receiver of a member access
@@ -598,7 +595,6 @@ static STUBS: &[ModuleStub] = &[
     },
 ];
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -626,5 +622,4 @@ mod tests {
             assert!(!members.is_empty(), "{name} stub is empty");
         }
     }
-
 }
