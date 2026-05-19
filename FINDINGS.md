@@ -3694,6 +3694,18 @@ Repro: `stress/builds/91_auto_gather/`.
 
 ## 86. `*args: T, sep: str = "-"` kwarg-after-varargs gets the wrong type error (bug)
 
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. The
+arg-type loop in the `Expr::Call` arm of `tyc-types` now uses
+`ArityInfo.param_names.len()` as the positional-versus-vararg
+boundary: pos_args beyond that cutoff are checked against the
+vararg's element type (a new `ArityInfo.vararg_type` field
+populated by `arity_info_from_parameters`) rather than the next
+listed `params` entry, which is a kw-only parameter the user never
+intended to fill positionally. Type-checking still fires when the
+absorbed positional doesn't match the vararg type. Regression
+tests `varargs_absorb_extra_positionals_against_correct_type` and
+`varargs_check_element_type_against_extras`.
+
 **Severity:** bug — calling `stars(1, 2, 3, sep="-")` on
 `def stars(n: int, *args: int, sep: str = ",", **kwargs: int)` fails with
 a wildly misleading diagnostic.

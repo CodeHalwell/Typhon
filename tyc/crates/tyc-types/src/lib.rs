@@ -1207,6 +1207,11 @@ struct ArityInfo {
     /// True when the function declares `**kwargs`, accepting any
     /// otherwise-unmatched keyword argument.
     has_kwarg: bool,
+    /// Declared element type of the `*args` variadic parameter, when
+    /// the function has one. Used at call sites to type-check the
+    /// excess positional args (FINDINGS #86). `Type::Unknown` when
+    /// the vararg is unannotated.
+    vararg_type: Option<Type>,
 }
 
 /// Declared interface (`interface Name:` → `class Name(Protocol):`). Bundles
@@ -2374,7 +2379,7 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
             // `**kwargs` without false positives (FINDINGS #44).
             c.function_arity_info.insert(
                 f.name.as_str().to_owned(),
-                arity_info_from_parameters(f.parameters.as_ref()),
+                arity_info_from_parameters(f.parameters.as_ref(), &classes, &tps),
             );
             // Record `async def` names so the call-site arm can emit
             // `tyc::missing_await` for sync calls (FINDINGS #49).
@@ -2764,7 +2769,11 @@ fn check_arity_with_info(
 /// `Type::Function` (param names for keyword-arg matching, count of
 /// defaulted params for the min-arity bound, kw-only requireds, and
 /// the `**kwargs` flag).
-fn arity_info_from_parameters(parameters: &ruff_python_ast::Parameters) -> ArityInfo {
+fn arity_info_from_parameters(
+    parameters: &ruff_python_ast::Parameters,
+    classes: &[String],
+    type_params: &[String],
+) -> ArityInfo {
     let mut param_names: Vec<String> = Vec::new();
     let mut min_positional: usize = 0;
     // Walk positional-only + positional-or-keyword. A defaulted positional
@@ -2798,6 +2807,15 @@ fn arity_info_from_parameters(parameters: &ruff_python_ast::Parameters) -> Arity
             kwonly_required.push(name);
         }
     }
+    // FINDINGS #86: record the *args element type so the call-site
+    // type-check can stop misapplying the next positional-or-kw
+    // parameter's annotation to absorbed extra positional args.
+    let vararg_type = parameters.vararg.as_ref().map(|va| {
+        va.annotation
+            .as_ref()
+            .map(|ann| type_from_annotation_with_params(ann, classes, type_params))
+            .unwrap_or(Type::Unknown)
+    });
     ArityInfo {
         param_names,
         min_positional,
@@ -2805,6 +2823,7 @@ fn arity_info_from_parameters(parameters: &ruff_python_ast::Parameters) -> Arity
         kwonly_names,
         kwonly_required,
         has_kwarg: parameters.kwarg.is_some(),
+        vararg_type,
     }
 }
 
@@ -4008,15 +4027,42 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // formal as its expected type so empty-collection
                     // literals (`[]`, `{}`) and nested generic calls pick
                     // up the parameter's element types.
+                    //
+                    // FINDINGS #86: when the function has `*args`, only
+                    // the first `positional_count` pos_args are paired
+                    // with the structural `params` slice (which is
+                    // `posonlyargs + args + kwonlyargs` flattened);
+                    // beyond that, the remaining positional args are
+                    // absorbed by `*args` and must be checked against
+                    // its element type instead of the kw-only
+                    // parameter that would otherwise occupy the slot.
+                    let positional_cutoff = arity_info
+                        .as_ref()
+                        .map(|info| info.param_names.len())
+                        .unwrap_or(params.len());
+                    let vararg_elem_type = arity_info
+                        .as_ref()
+                        .and_then(|info| info.vararg_type.clone());
                     let mut actuals: Vec<Type> = Vec::with_capacity(params.len());
                     if suppresses_missing_await {
                         c.inside_await = c.inside_await.saturating_add(1);
                     }
                     for (i, arg) in pos_args.iter().enumerate() {
-                        if i >= params.len() {
+                        // Pick the right expected type:
+                        // - First `positional_cutoff` pos_args fill the
+                        //   declared positional parameters in order.
+                        // - Beyond that, fall to the vararg element
+                        //   type (if any). With no vararg we just stop
+                        //   — the arity check has already flagged the
+                        //   extra positional.
+                        let expected: Type = if i < positional_cutoff && i < params.len() {
+                            params[i].clone()
+                        } else if let Some(t) = vararg_elem_type.clone() {
+                            t
+                        } else {
                             break;
-                        }
-                        let actual = infer_expr_ctx(c, arg, Some(&params[i]));
+                        };
+                        let actual = infer_expr_ctx(c, arg, Some(&expected));
                         // Check the nullable-use case first: when the actual
                         // is nullable and the parameter is not, `nullable_use`
                         // is the more helpful diagnostic — it points at the
@@ -4025,26 +4071,26 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         // noise on the same span (FINDINGS #8). Only emit the
                         // type_mismatch when nullable_use isn't going to fire.
                         let nullable_into_non_nullable =
-                            !params[i].is_nullable() && actual.is_nullable();
+                            !expected.is_nullable() && actual.is_nullable();
                         if nullable_into_non_nullable {
                             if let Expr::Name(n) = arg {
                                 let span = (
                                     n.range.start().to_usize(),
                                     n.range.start().to_usize() + n.id.as_str().len(),
                                 );
-                                c.nullable_use(n.id.as_str(), &params[i], span);
+                                c.nullable_use(n.id.as_str(), &expected, span);
                             } else {
                                 // Non-name arg (e.g. `greet(find())`) — no
                                 // identifier to point at, fall back to the
                                 // generic mismatch diagnostic.
                                 let span =
                                     (arg.range().start().to_usize(), arg.range().end().to_usize());
-                                c.mismatch(&params[i], &actual, span);
+                                c.mismatch(&expected, &actual, span);
                             }
-                        } else if !c.is_assignable(&params[i], &actual) {
+                        } else if !c.is_assignable(&expected, &actual) {
                             let span =
                                 (arg.range().start().to_usize(), arg.range().end().to_usize());
-                            c.mismatch(&params[i], &actual, span);
+                            c.mismatch(&expected, &actual, span);
                         }
                         actuals.push(actual);
                     }
@@ -4965,6 +5011,48 @@ let r: int = add(1)
                 .iter()
                 .any(|e| matches!(e, TycError::ImplicitAny { .. })),
             "list[int] must not fire implicit_any: {:?}",
+            d.errors()
+        );
+    }
+
+    // ── FINDINGS #86: *args type check vs kw-only ─────────────────────
+
+    #[test]
+    fn varargs_absorb_extra_positionals_against_correct_type() {
+        // Repro: `*args: int` should absorb the trailing `2, 3, 4`
+        // positional args; `sep="-"` matches the kw-only parameter.
+        // Pre-fix, the loop checked `2` against the next listed
+        // parameter (`sep: str`) and emitted a spurious type_mismatch.
+        let src = "\
+def stars(n: int, *args: int, sep: str = \",\", **kwargs: int) -> str:
+    return sep
+let r: str = stars(1, 2, 3, 4, sep=\"-\")
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "*args absorbing positionals must not fire type_mismatch: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn varargs_check_element_type_against_extras() {
+        // When *args is `int`, passing a `str` should still error
+        // (but with the right expected type — the vararg's element type).
+        let src = "\
+def stars(n: int, *args: int) -> int:
+    return n
+let r: int = stars(1, \"bad\")
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { expected, .. } if expected == "int")),
+            "vararg type check should fire when extra arg doesn't match: {:?}",
             d.errors()
         );
     }
