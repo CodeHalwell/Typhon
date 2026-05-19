@@ -72,6 +72,55 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// `self` was referenced outside an `impl ClassName:` method body.
+    /// Distinct from the generic `tyc::unknown_name` so the help text can
+    /// point users at the right shape (per Typhon Rule 4: methods take
+    /// explicit `self`, free functions cannot).
+    #[error("cannot find 'self' in scope")]
+    #[diagnostic(
+        code(tyc::self_outside_impl),
+        help("`self` is only available inside `impl ClassName:` method bodies. Move this function under an `impl` block, or replace `self` with an explicit parameter.")
+    )]
+    SelfOutsideImpl {
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("`self` is only valid inside an `impl` method body")]
+        span: SourceSpan,
+    },
+
+    /// `from typing import TypeVar` is rejected — Typhon uses PEP 695
+    /// type-parameter syntax (`def f[T](x: T) -> T:`) and the
+    /// `TypeVar(...)` constructor is not a supported value.
+    #[error("`from typing import TypeVar` is not supported in Typhon")]
+    #[diagnostic(
+        code(tyc::typevar_import_rejected),
+        help("Use PEP 695 syntax instead: `def f[T](x: T) -> T:` and `class Box[T]:` declare type parameters directly, no `TypeVar(...)` call needed.")
+    )]
+    TypeVarImportRejected {
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("remove this import and use `[T]` parameter syntax instead")]
+        span: SourceSpan,
+    },
+
+    /// Importing a deprecated capitalised collection alias from `typing`
+    /// (`List`, `Dict`, `Tuple`, `Set`, `FrozenSet`, `Type`) — Typhon prefers
+    /// the built-in lowercase forms (PEP 585) for consistency with the rest
+    /// of the language.
+    #[error("`from typing import {name}` is deprecated in Typhon")]
+    #[diagnostic(
+        code(tyc::typing_alias_deprecated),
+        help("Use the built-in lowercase `{lower}` instead — `{lower}[T]` works directly without importing anything.")
+    )]
+    TypingAliasDeprecated {
+        name: String,
+        lower: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("prefer `{lower}` over `typing.{name}`")]
+        span: SourceSpan,
+    },
+
     /// A value of one type was used where another type was expected.
     #[error("type mismatch: expected `{expected}`, found `{actual}`")]
     #[diagnostic(
@@ -253,7 +302,7 @@ pub enum TycError {
     #[error("comptime evaluation failed for '{name}': {message}")]
     #[diagnostic(
         code(tyc::comptime),
-        help("comptime expressions support: literals, env(\"NAME\"), env(\"NAME\", \"default\"), int(), str(), float(), and basic arithmetic")
+        help("comptime expressions support: int/float/str/bool literals, list/tuple/dict literals, arithmetic, comparisons, boolean ops (and/or/not), ternaries (`x if c else y`), env(\"NAME\"[, \"default\"]), int()/str()/float()/len(), pure str methods (upper, lower, strip, lstrip, rstrip, replace, startswith, endswith, split), and calls to user-defined `comptime def` functions")
     )]
     Comptime { name: String, message: String },
 
@@ -608,6 +657,50 @@ impl TycError {
     ) -> Self {
         Self::UnknownName {
             name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct an [`TycError::SelfOutsideImpl`] diagnostic.
+    pub fn self_outside_impl(
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::SelfOutsideImpl {
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::TypeVarImportRejected`] diagnostic.
+    pub fn typevar_import_rejected(
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::TypeVarImportRejected {
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::TypingAliasDeprecated`] diagnostic for a
+    /// capitalised `typing.<Name>` alias of a lowercase built-in.
+    pub fn typing_alias_deprecated(
+        name: impl Into<String>,
+        lower: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::TypingAliasDeprecated {
+            name: name.into(),
+            lower: lower.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

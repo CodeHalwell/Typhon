@@ -5,10 +5,24 @@
 //! time by [`evaluate_comptime`].  Supported RHS forms:
 //!
 //! - Integer, float, string, and boolean literals.
+//! - List / tuple / dict literals (`[1, 2]`, `(1, "a")`, `{"k": 1}`).
+//! - Subscripting list / tuple / str by integer (with Python's
+//!   negative-from-end semantics) and dict by any equality-comparable key.
+//! - Unary operators (`-x`, `+x`, `not x`).
+//! - Binary arithmetic (`+`, `-`, `*`, `/`, `%`, `//`, `**`, plus string
+//!   concatenation with `+`).
+//! - Comparisons (`==`, `!=`, `<`, `<=`, `>`, `>=`, plus chains).
+//! - Short-circuit boolean operators (`and`, `or`).
+//! - Ternary `x if cond else y`.
 //! - `env("NAME")` — reads the environment variable `NAME`; fails the build
 //!   if it is unset.
 //! - `env("NAME", "default")` — reads `NAME` with a fallback value.
 //! - `int(expr)`, `str(expr)`, `float(expr)` — type coercions on the above.
+//! - `len(expr)` for str / list / tuple / dict.
+//! - Pure `str` methods: `upper`, `lower`, `strip`, `lstrip`, `rstrip`,
+//!   `replace`, `startswith`, `endswith`, `split`.
+//! - Calls to user-defined `comptime def` functions (see
+//!   [`evaluate_comptime_with_functions`]).
 //!
 //! The evaluator produces a [`HashMap`] from binding name to
 //! [`ComptimeValue`].  The build command uses this map to substitute the
@@ -455,6 +469,15 @@ fn eval_expr(expr: &Expr, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue, St
             Ok(ComptimeValue::Dict(items))
         }
 
+        // Subscript: `E[0]`, `H["a"]`, `T[-1]`. Indexes list / tuple by
+        // integer (with Python-style negative-from-end), dicts by any
+        // comparable key. Slicing (`E[1:3]`) is not supported.
+        Expr::Subscript(s) => {
+            let receiver = eval_expr(&s.value, ctx)?;
+            let key = eval_expr(&s.slice, ctx)?;
+            eval_subscript(receiver, key)
+        }
+
         // Attribute access exists only as part of a method call —
         // `"hi".upper()` parses as Call(Attribute(StringLiteral("hi"),
         // "upper"), []). The bare `Expr::Attribute` is handed off to
@@ -525,6 +548,67 @@ fn eval_cmpop(
             "comparison operator `{:?}` is not supported in comptime expressions",
             other
         )),
+    }
+}
+
+/// Index into a comptime list / tuple / dict by an evaluated key.
+///
+/// Lists and tuples are indexed by integer with Python's negative-from-end
+/// semantics (`-1` is the last element). Out-of-range indices produce an
+/// error so the build fails loudly rather than silently shifting.
+///
+/// Dicts are indexed by any value that supports `==`-equality against the
+/// stored keys. A missing key is an error.
+///
+/// Slicing (`E[1:3]`) is not supported — comptime slicing would require
+/// modelling Python's `slice` object and adds little practical value for
+/// build-time constant computation.
+fn eval_subscript(receiver: ComptimeValue, key: ComptimeValue) -> Result<ComptimeValue, String> {
+    match (receiver, key) {
+        (ComptimeValue::List(items), ComptimeValue::Int(i))
+        | (ComptimeValue::Tuple(items), ComptimeValue::Int(i)) => {
+            let len = items.len() as i64;
+            let idx = if i < 0 { i + len } else { i };
+            if idx < 0 || idx >= len {
+                return Err(format!(
+                    "comptime index {} is out of range for a sequence of length {}",
+                    i, len
+                ));
+            }
+            Ok(items[idx as usize].clone())
+        }
+        (ComptimeValue::Dict(items), k) => items
+            .into_iter()
+            .find_map(|(ek, v)| if values_equal(&ek, &k) { Some(v) } else { None })
+            .ok_or_else(|| "comptime dict has no matching key".to_string()),
+        (ComptimeValue::Str(s), ComptimeValue::Int(i)) => {
+            let chars: Vec<char> = s.chars().collect();
+            let len = chars.len() as i64;
+            let idx = if i < 0 { i + len } else { i };
+            if idx < 0 || idx >= len {
+                return Err(format!(
+                    "comptime index {} is out of range for a string of length {}",
+                    i, len
+                ));
+            }
+            Ok(ComptimeValue::Str(chars[idx as usize].to_string()))
+        }
+        (recv, _) => Err(format!(
+            "comptime subscript not supported on {}",
+            comptime_value_kind(&recv)
+        )),
+    }
+}
+
+fn comptime_value_kind(v: &ComptimeValue) -> &'static str {
+    match v {
+        ComptimeValue::Int(_) => "int",
+        ComptimeValue::Float(_) => "float",
+        ComptimeValue::Str(_) => "str",
+        ComptimeValue::Bool(_) => "bool",
+        ComptimeValue::List(_) => "list",
+        ComptimeValue::Tuple(_) => "tuple",
+        ComptimeValue::Dict(_) => "dict",
     }
 }
 
@@ -1746,6 +1830,57 @@ comptime let Y: int = use_outer()
         assert!(matches!(values.get("S"), Some(ComptimeValue::Int(5))));
         let (values, _) = eval("comptime let L: int = len([1, 2, 3, 4])\n");
         assert!(matches!(values.get("L"), Some(ComptimeValue::Int(4))));
+    }
+
+    // ── #88: comptime subscript ──────────────────────────────────────────
+
+    #[test]
+    fn comptime_list_index_evaluates() {
+        let (values, diags) = eval("comptime let FIRST: int = [10, 20, 30][0]\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("FIRST"), Some(ComptimeValue::Int(10))));
+    }
+
+    #[test]
+    fn comptime_list_negative_index_evaluates() {
+        let (values, diags) = eval("comptime let LAST: int = [10, 20, 30][-1]\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("LAST"), Some(ComptimeValue::Int(30))));
+    }
+
+    #[test]
+    fn comptime_tuple_index_evaluates() {
+        let (values, diags) = eval("comptime let A: int = (1, 2, 3)[1]\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("A"), Some(ComptimeValue::Int(2))));
+    }
+
+    #[test]
+    fn comptime_dict_lookup_evaluates() {
+        let (values, diags) = eval("comptime let V: int = {\"a\": 1, \"b\": 2}[\"a\"]\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("V"), Some(ComptimeValue::Int(1))));
+    }
+
+    #[test]
+    fn comptime_str_index_evaluates() {
+        let (values, diags) = eval("comptime let C: str = \"hello\"[1]\n");
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(values.get("C"), Some(ComptimeValue::Str(s)) if s == "e"));
+    }
+
+    #[test]
+    fn comptime_list_index_out_of_range_errors() {
+        let (_, diags) = eval("comptime let X: int = [1, 2][5]\n");
+        assert!(diags.has_errors(), "out-of-range index must error");
+        let msg = format!("{}", diags.errors()[0]);
+        assert!(msg.contains("out of range"), "got: {msg}");
+    }
+
+    #[test]
+    fn comptime_dict_missing_key_errors() {
+        let (_, diags) = eval("comptime let X: int = {\"a\": 1}[\"missing\"]\n");
+        assert!(diags.has_errors(), "missing key must error");
     }
 
     #[test]

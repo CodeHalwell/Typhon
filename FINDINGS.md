@@ -3241,6 +3241,15 @@ Repro: `stress/tests/40b_implicit_any_collection.ty`.
 
 ## 73. `from typing import TypeVar` not specifically rejected (gap)
 
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. Added
+`tyc::typevar_import_rejected` to `tyc-diagnostics`; the resolver's
+`Stmt::ImportFrom` arm in `tyc-resolve` now fires the error
+specifically when `from typing import TypeVar` is encountered, with
+help text pointing at PEP 695 `def f[T](...)` / `class Box[T]:`
+syntax. The pre-existing `corpus_phase3_features_check_clean`
+build-features test was updated to use PEP 695 syntax. Regression
+test `typevar_import_is_rejected` in `tyc-resolve`.
+
 **Severity:** gap — docs say "rejected", reality is "accepted with a
 useless downstream error".
 
@@ -3266,6 +3275,17 @@ Repro: `stress/tests/50_typevar_rejected.ty`.
 ---
 
 ## 74. `typing.List` / `typing.Dict` / `typing.Tuple` not aliased to lowercase (papercut)
+
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. Took
+option (a) from the original finding — added
+`tyc::typing_alias_deprecated` as a warning fired by the resolver's
+`Stmt::ImportFrom` arm when any of `List`, `Dict`, `Tuple`, `Set`,
+`FrozenSet`, or `Type` is imported from `typing`. The diagnostic
+includes the lowercase replacement in the help text. Importing
+`Optional`, `Union`, `Callable`, `Iterator`, `Protocol`, etc. is
+unaffected (those names don't have a direct lowercase built-in
+form). Regression tests `typing_list_alias_is_warned` and
+`typing_optional_is_not_flagged` in `tyc-resolve`.
 
 **Severity:** papercut — common Python idiom produces a confusing
 "expected `List[int]`, found `list[int]`" error.
@@ -3619,6 +3639,15 @@ Repro: `stress/tests/24_kwargs_defaults.ty`.
 
 ## 87. `comptime` help text drifts from documented surface (doc)
 
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. The
+`tyc::comptime` diagnostic help text now lists the full supported
+surface: literals (int/float/str/bool), list/tuple/dict literals,
+arithmetic, comparisons, boolean ops, ternaries, env(),
+int()/str()/float()/len(), pure str methods (upper, lower, strip,
+lstrip, rstrip, replace, startswith, endswith, split), and calls to
+user-defined `comptime def` functions. The crate-level docs in
+`tyc-analyse/src/lib.rs` were also rewritten to match.
+
 **Severity:** doc — the diagnostic help text claims a much smaller
 surface than the language doc.
 
@@ -3642,6 +3671,23 @@ Repro: any failing `comptime let`, e.g. `stress/tests/61_comptime_limits.ty`.
 ---
 
 ## 88. Comptime subscript `E[0]` / `H["a"]` rejected (gap)
+
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. Added an
+`Expr::Subscript` arm to `eval_expr` in
+`tyc/crates/tyc-analyse/src/lib.rs` plus a new `eval_subscript` helper.
+Lists / tuples / strings index by `int` with Python's
+negative-from-end semantics (`xs[-1]` returns the last element);
+dicts look up by any equality-comparable key. Out-of-range indices
+and missing dict keys produce a clear comptime error rather than
+returning a default. Slicing (`E[1:3]`) is intentionally
+unsupported. Seven regression tests cover the new arms
+(`comptime_list_index_evaluates`,
+`comptime_list_negative_index_evaluates`,
+`comptime_tuple_index_evaluates`,
+`comptime_dict_lookup_evaluates`,
+`comptime_str_index_evaluates`,
+`comptime_list_index_out_of_range_errors`,
+`comptime_dict_missing_key_errors`).
 
 **Severity:** gap — comptime supports list/dict literals but not
 subscripting them.
@@ -3696,6 +3742,18 @@ Repro: `stress/tests/112_complex_decorator.ty`.
 ---
 
 ## 90. `self` outside `impl` produces generic `unknown_name` (papercut)
+
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. Added a
+dedicated `tyc::self_outside_impl` diagnostic in `tyc-diagnostics`;
+`report_unknown_names` in `tyc-resolve` checks for `r.name == "self"`
+before falling through to the generic `tyc::unknown_name` so the
+help text correctly points users at `impl ClassName:` instead of
+suggesting `let self = …`. Inside `impl` method bodies the synthetic
+`self` binding declared by `walk_impl_method` already prevents the
+unknown-name reference from firing, so this only triggers for the
+true "self outside impl" shape. Regression test
+`self_outside_impl_uses_dedicated_diagnostic` in
+`tyc/crates/tyc-resolve/src/lib.rs`.
 
 **Severity:** papercut — the diagnostic is correct that `self` isn't
 defined, but the help is misleading.

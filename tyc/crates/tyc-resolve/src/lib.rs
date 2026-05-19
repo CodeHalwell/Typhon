@@ -553,13 +553,28 @@ impl<'a> Resolver<'a> {
             }
             if !found && !builtins.contains(&r.name.as_str()) {
                 let length = r.span.1.saturating_sub(r.span.0).max(1);
-                self.diagnostics.push_error(TycError::unknown_name(
-                    r.name.clone(),
-                    &self.path,
-                    self.source,
-                    r.span.0,
-                    length,
-                ));
+                // `self` is special: it's only legal inside an `impl`
+                // method body, so an unresolved reference deserves a
+                // dedicated diagnostic that explains the rule rather
+                // than the generic "declare with `let`/`mut`" help
+                // (which would mislead the user — `let self = ...`
+                // does not solve the problem). FINDINGS #90.
+                if r.name == "self" {
+                    self.diagnostics.push_error(TycError::self_outside_impl(
+                        &self.path,
+                        self.source,
+                        r.span.0,
+                        length,
+                    ));
+                } else {
+                    self.diagnostics.push_error(TycError::unknown_name(
+                        r.name.clone(),
+                        &self.path,
+                        self.source,
+                        r.span.0,
+                        length,
+                    ));
+                }
             }
         }
     }
@@ -854,6 +869,38 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt]) {
                         alias.range.start().to_usize(),
                         alias.range.start().to_usize() + name.as_str().len(),
                     );
+                    // Typhon-specific rejections for `from typing import X`:
+                    //   - TypeVar: use PEP 695 `[T]` syntax instead (FINDINGS #73).
+                    //   - List/Dict/Tuple/Set/FrozenSet/Type: use the
+                    //     lowercase built-in form (FINDINGS #74).
+                    if module.as_deref() == Some("typing") {
+                        let imported = alias.name.as_str();
+                        let imported_span = (
+                            alias.range.start().to_usize(),
+                            alias.range.start().to_usize() + imported.len(),
+                        );
+                        let length = imported_span.1.saturating_sub(imported_span.0).max(1);
+                        if imported == "TypeVar" {
+                            r.diagnostics
+                                .push_error(TycError::typevar_import_rejected(
+                                    &r.path,
+                                    r.source,
+                                    imported_span.0,
+                                    length,
+                                ));
+                        } else if let Some(lower) = lowercase_typing_alias(imported) {
+                            r.diagnostics.push_warning(
+                                TycError::typing_alias_deprecated(
+                                    imported,
+                                    lower,
+                                    &r.path,
+                                    r.source,
+                                    imported_span.0,
+                                    length,
+                                ),
+                            );
+                        }
+                    }
                     r.declare_with(
                         scope,
                         name.as_str(),
@@ -886,6 +933,22 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt]) {
             }
             _ => {}
         }
+    }
+}
+
+/// Map a capitalised `typing.<Name>` alias to its lowercase built-in
+/// equivalent, when the built-in form exists. Returns `None` for typing
+/// names that aren't a direct alias of a Python built-in (e.g. `Optional`,
+/// `Union`, `Callable` — those have their own Typhon-native shapes).
+fn lowercase_typing_alias(name: &str) -> Option<&'static str> {
+    match name {
+        "List" => Some("list"),
+        "Dict" => Some("dict"),
+        "Tuple" => Some("tuple"),
+        "Set" => Some("set"),
+        "FrozenSet" => Some("frozenset"),
+        "Type" => Some("type"),
+        _ => None,
     }
 }
 
@@ -2117,6 +2180,69 @@ def foo():
         assert!(d.has_errors());
         let msg = format!("{}", d.errors()[0]);
         assert!(msg.contains("cannot find 'z'"), "got {}", msg);
+    }
+
+    #[test]
+    fn typevar_import_is_rejected() {
+        // FINDINGS #73: `from typing import TypeVar` must surface a
+        // dedicated diagnostic that points users at PEP 695 syntax.
+        let (_m, d) = resolve("from typing import TypeVar\n");
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeVarImportRejected { .. })),
+            "expected TypeVarImportRejected variant; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn typing_list_alias_is_warned() {
+        // FINDINGS #74: prefer lowercase `list` over `typing.List`. The
+        // warning anchors on the imported name; the import itself still
+        // succeeds so existing code keeps compiling — projects that
+        // promote warnings to errors will catch it in CI.
+        let (_m, d) = resolve("from typing import List\nlet xs: List[int] = []\n");
+        assert!(
+            d.warnings()
+                .iter()
+                .any(|e| matches!(e, TycError::TypingAliasDeprecated { .. })),
+            "expected TypingAliasDeprecated warning; got warnings={:?} errors={:?}",
+            d.warnings(),
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn typing_optional_is_not_flagged() {
+        // `Optional` / `Union` / `Callable` are not lowercase-aliased —
+        // they have their own Typhon-native shapes (`T?`, `T | U`,
+        // `Callable[[A], B]`), but the import itself is not deprecated.
+        let (_m, d) = resolve("from typing import Optional, Callable\n");
+        assert!(
+            !d.warnings()
+                .iter()
+                .any(|e| matches!(e, TycError::TypingAliasDeprecated { .. })),
+            "Optional/Callable must not trigger the alias warning; got {:?}",
+            d.warnings()
+        );
+    }
+
+    #[test]
+    fn self_outside_impl_uses_dedicated_diagnostic() {
+        // FINDINGS #90: `self` outside an `impl` method body must surface
+        // `tyc::self_outside_impl`, not the generic
+        // `tyc::unknown_name` whose help text would push the user
+        // toward `let self = …` (which doesn't fix the problem).
+        let (_m, d) = resolve("def f() -> int:\n    return self.x\n");
+        assert!(d.has_errors(), "self outside impl must be an error");
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::SelfOutsideImpl { .. })),
+            "expected SelfOutsideImpl variant; got {:?}",
+            d.errors()
+        );
     }
 
     #[test]
