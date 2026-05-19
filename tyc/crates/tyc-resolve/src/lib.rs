@@ -1003,27 +1003,6 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             for d in &f.decorator_list {
                 walk_expr(r, scope, &d.expression);
             }
-            // Declare the function name in the enclosing scope so it is visible
-            // from sibling statements that come after this definition — including
-            // comprehensions, closures, and statements inside the same `with`/`if`
-            // block body. `collect_top_level` already pre-declares names at the
-            // direct top level of a function body (enabling forward references);
-            // this call extends that to nested definitions. `declare` is a no-op
-            // when the span matches an existing binding (the top-level case), so
-            // there is no double-declaration risk.
-            let fn_name_span = find_def_name_span(
-                r.source,
-                f.range.start().to_usize(),
-                "def ",
-                f.name.as_str(),
-            );
-            r.declare(
-                scope,
-                f.name.as_str(),
-                BindingKind::Function,
-                Mutability::Mut,
-                fn_name_span,
-            );
             let fn_scope = r.push_scope(ScopeKind::Function, scope, range_to_span(f.range));
             // PEP 695 type parameters (`def f[T](x: T) -> T`) bind into the
             // function scope so the parameter and return-type annotations can
@@ -1038,11 +1017,35 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
                 fn_scope
             };
             walk_argument_annotations(r, ann_scope, &f.parameters);
-            // Default values are evaluated in the enclosing scope.
+            // Default values are evaluated in the enclosing scope, and Python
+            // evaluates them *before* binding the function name — so walk them
+            // before declaring the name to match that semantics. This prevents
+            // a self-referencing default like `def f(cb=f): ...` from
+            // incorrectly resolving against the function's own binding.
             walk_argument_defaults(r, scope, &f.parameters);
             if let Some(ret) = &f.returns {
                 walk_expr(r, ann_scope, ret);
             }
+            // Now declare the function name in the enclosing scope so it is
+            // visible to sibling statements that come after this definition.
+            // `collect_top_level` already pre-declares names at the direct top
+            // level of a function body (enabling forward references); this call
+            // extends that to nested definitions inside `with`/`if`/`for` blocks.
+            // `declare` is a no-op when the span matches an existing binding, so
+            // there is no double-declaration risk.
+            let fn_name_span = find_def_name_span(
+                r.source,
+                f.range.start().to_usize(),
+                "def ",
+                f.name.as_str(),
+            );
+            r.declare(
+                scope,
+                f.name.as_str(),
+                BindingKind::Function,
+                Mutability::Mut,
+                fn_name_span,
+            );
             // Parameters become bindings in the new scope.
             declare_arguments(r, fn_scope, &f.parameters);
             // Pre-collect declarations within the function body so forward
@@ -1262,7 +1265,13 @@ fn walk_match_pattern(r: &mut Resolver, scope: ScopeId, pat: &Pattern) {
                     name.range.start().to_usize(),
                     name.range.start().to_usize() + name.as_str().len(),
                 );
-                r.declare(scope, name.as_str(), BindingKind::Loop, Mutability::Mut, span);
+                r.declare(
+                    scope,
+                    name.as_str(),
+                    BindingKind::Loop,
+                    Mutability::Mut,
+                    span,
+                );
             }
         }
         // `case *rest` — binds the star name.
@@ -1272,7 +1281,13 @@ fn walk_match_pattern(r: &mut Resolver, scope: ScopeId, pat: &Pattern) {
                     name.range.start().to_usize(),
                     name.range.start().to_usize() + name.as_str().len(),
                 );
-                r.declare(scope, name.as_str(), BindingKind::Loop, Mutability::Mut, span);
+                r.declare(
+                    scope,
+                    name.as_str(),
+                    BindingKind::Loop,
+                    Mutability::Mut,
+                    span,
+                );
             }
         }
         // `case {k: v, **rest}` — keys are constant exprs (walk as refs),
@@ -1289,7 +1304,13 @@ fn walk_match_pattern(r: &mut Resolver, scope: ScopeId, pat: &Pattern) {
                     rest.range.start().to_usize(),
                     rest.range.start().to_usize() + rest.as_str().len(),
                 );
-                r.declare(scope, rest.as_str(), BindingKind::Loop, Mutability::Mut, span);
+                r.declare(
+                    scope,
+                    rest.as_str(),
+                    BindingKind::Loop,
+                    Mutability::Mut,
+                    span,
+                );
             }
         }
         // `case Ok(x)` / `case Circle(r)` — walk the class name as a reference
@@ -1332,12 +1353,7 @@ fn walk_match_pattern(r: &mut Resolver, scope: ScopeId, pat: &Pattern) {
 /// `Depends(get_store)`, `Query(...)`) are never registered as references and
 /// trigger false "unused import" warnings — FINDINGS #46.
 fn walk_argument_defaults(r: &mut Resolver, scope: ScopeId, args: &ast::Parameters) {
-    let all = args
-        .posonlyargs
-        .iter()
-        .chain(args.args.iter())
-        .chain(args.kwonlyargs.iter());
-    for arg in all {
+    for arg in iter_positional_args(args) {
         if let Some(default) = &arg.default {
             walk_expr(r, scope, default);
         }
@@ -1348,12 +1364,7 @@ fn walk_argument_defaults(r: &mut Resolver, scope: ScopeId, args: &ast::Paramete
 /// names used in those annotations are recorded as references and bound
 /// against the enclosing scope.
 fn walk_argument_annotations(r: &mut Resolver, scope: ScopeId, args: &ast::Parameters) {
-    let all = args
-        .posonlyargs
-        .iter()
-        .chain(args.args.iter())
-        .chain(args.kwonlyargs.iter());
-    for arg in all {
+    for arg in iter_positional_args(args) {
         if let Some(ann) = &arg.parameter.annotation {
             walk_expr(r, scope, ann);
         }
@@ -1438,13 +1449,22 @@ fn type_params_is_empty(type_params: Option<&ast::TypeParams>) -> bool {
     type_params.is_none_or(|t| t.type_params.is_empty())
 }
 
-fn declare_arguments(r: &mut Resolver, scope: ScopeId, args: &ast::Parameters) {
-    let all = args
-        .posonlyargs
+/// Iterate over positional-or-keyword, positional-only, and keyword-only
+/// parameters in source order, skipping `*args` and `**kwargs`.
+///
+/// Used by the three parameter-walking helpers to avoid repeating the
+/// `.posonlyargs.iter().chain(args.iter()).chain(kwonlyargs.iter())` chain.
+fn iter_positional_args(
+    args: &ast::Parameters,
+) -> impl Iterator<Item = &ast::ParameterWithDefault> {
+    args.posonlyargs
         .iter()
         .chain(args.args.iter())
-        .chain(args.kwonlyargs.iter());
-    for arg in all {
+        .chain(args.kwonlyargs.iter())
+}
+
+fn declare_arguments(r: &mut Resolver, scope: ScopeId, args: &ast::Parameters) {
+    for arg in iter_positional_args(args) {
         let span = (
             arg.parameter.range.start().to_usize(),
             arg.parameter.range.start().to_usize() + arg.parameter.name.as_str().len(),

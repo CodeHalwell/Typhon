@@ -4224,7 +4224,11 @@ mod tests {
             assignable(
                 &Type::Generic(
                     "tuple".into(),
-                    vec![Type::Str, Type::Int, Type::Union(vec![Type::Float, Type::None])]
+                    vec![
+                        Type::Str,
+                        Type::Int,
+                        Type::Union(vec![Type::Float, Type::None])
+                    ]
                 ),
                 &Type::Generic("tuple".into(), vec![Type::Str, Type::Int, Type::Float])
             ),
