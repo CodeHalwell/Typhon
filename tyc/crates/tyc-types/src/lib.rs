@@ -271,6 +271,30 @@ fn is_typevar(t: &Type) -> bool {
     matches!(t, Type::TypeVar(_))
 }
 
+/// Walk a generic-class field-type / arg-type pair and bind any
+/// TypeVar mentioned in the field type to the corresponding shape of
+/// the argument type. Used by the constructor-call inference path
+/// (FINDINGS #46) so `class Box[T]: value: T` learns `T = int` from
+/// `Box(value=42)` without needing the caller to spell `Box[int](...)`.
+fn bind_field_typevars(field_ty: &Type, arg_ty: &Type, out: &mut HashMap<String, Type>) {
+    match (field_ty, arg_ty) {
+        (Type::TypeVar(name), other) if !matches!(other, Type::TypeVar(_)) => {
+            out.entry(name.clone()).or_insert_with(|| other.clone());
+        }
+        (Type::Generic(_, fas), Type::Generic(_, aas)) if fas.len() == aas.len() => {
+            for (f, a) in fas.iter().zip(aas) {
+                bind_field_typevars(f, a, out);
+            }
+        }
+        (Type::Union(fs), Type::Union(as_)) if fs.len() == as_.len() => {
+            for (f, a) in fs.iter().zip(as_) {
+                bind_field_typevars(f, a, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Return `true` if `name` is a built-in container type whose bare
 /// (unparameterised) form should be treated as accepting any
 /// parameterisation (`list` ≡ `list[Any]`, etc.).
@@ -872,6 +896,13 @@ struct Checker<'a> {
     /// All classes declared in the module along with their declared member
     /// names.  Used for structural conformance against an interface.
     class_shapes: HashMap<String, InterfaceShape>,
+    /// PEP 695 type-parameter names declared on each generic class.
+    /// `class Box[T]: ...` populates `{"Box": ["T"]}`. Empty for
+    /// non-generic classes. Used to drive bidirectional inference at
+    /// constructor calls so `let b: Box[int] = Box(value=42)` produces
+    /// `Type::Generic("Box", [Int])` rather than `Type::Class("Box")`
+    /// (FINDINGS #46).
+    class_type_params: HashMap<String, Vec<String>>,
     /// Classes declared with the `frozen` modifier (`class Foo frozen:`).
     /// Used to reject attribute writes to instances of these classes at
     /// check time — matches the runtime behaviour of the emitted
@@ -995,6 +1026,7 @@ impl<'a> Checker<'a> {
             active_typevar_bounds: HashMap::new(),
             interfaces: HashMap::new(),
             class_shapes: HashMap::new(),
+            class_type_params: HashMap::new(),
             frozen_classes: std::collections::HashSet::new(),
             class_parents: HashMap::new(),
             unsafe_depth: 0,
@@ -1786,7 +1818,14 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                     },
                 );
             }
-            c.class_shapes.insert(name, shape);
+            c.class_shapes.insert(name.clone(), shape);
+            // Record PEP 695 type-parameter names so call-site
+            // inference can return `Type::Generic(name, [...])` for
+            // generic classes (FINDINGS #46).
+            let tps = type_param_names_from(cd.type_params.as_deref());
+            if !tps.is_empty() {
+                c.class_type_params.insert(name, tps);
+            }
         }
     }
     // Second pass (continued): fold `impl ClassName:` and `extend ClassName:`
@@ -3125,7 +3164,51 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // or `return` statement) to pin it.
                     bind_typevars_and_substitute_bidirectional(&params, &actuals, &ret, expected)
                 }
-                Type::Class(name) => Type::Class(name),
+                Type::Class(name) => {
+                    // Generic class instantiation (FINDINGS #46) — when
+                    // the class declares PEP 695 type parameters, try
+                    // bidirectional inference from the call's expected
+                    // return type so `let b: Box[int] = Box(value=42)`
+                    // produces `Type::Generic("Box", [Int])` rather than
+                    // `Type::Class("Box")`. Falls back to a forward pass
+                    // that reads field annotations and binds each
+                    // declared TypeVar from the matching kwarg.
+                    if let Some(tparams) = c.class_type_params.get(&name).cloned() {
+                        let mut bindings: HashMap<String, Type> = HashMap::new();
+                        // Bidirectional: pin from the surrounding annotation.
+                        if let Some(Type::Generic(exp_name, exp_args)) = expected {
+                            if exp_name == &name && exp_args.len() == tparams.len() {
+                                for (tp, arg) in tparams.iter().zip(exp_args.iter()) {
+                                    bindings.insert(tp.clone(), arg.clone());
+                                }
+                            }
+                        }
+                        // Forward: read each kwarg, match it to the
+                        // class's field annotation, and if the field's
+                        // type is a TypeVar, bind it from the arg's
+                        // inferred type.
+                        let class_shape = c.class_shapes.get(&name).cloned();
+                        if let Some(shape) = class_shape {
+                            for kw in kw_args {
+                                if let Some(ident) = &kw.arg {
+                                    if let Some(field_ty) =
+                                        shape.fields.get(ident.as_str()).cloned()
+                                    {
+                                        let arg_ty = infer_expr(c, &kw.value);
+                                        bind_field_typevars(&field_ty, &arg_ty, &mut bindings);
+                                    }
+                                }
+                            }
+                        }
+                        let args: Vec<Type> = tparams
+                            .iter()
+                            .map(|tp| bindings.remove(tp).unwrap_or(Type::Unknown))
+                            .collect();
+                        Type::Generic(name, args)
+                    } else {
+                        Type::Class(name)
+                    }
+                }
                 Type::Unknown | Type::Any => {
                     for a in pos_args.iter() {
                         let _ = infer_expr(c, a);

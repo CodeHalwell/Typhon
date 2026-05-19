@@ -1934,6 +1934,25 @@ Cascade: 17-file-io-json, 21-cli-tool, 25-sqlite-database, 09-interfaces.
 
 ## 46. Generic class instantiation drops type params (bug)
 
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. Added a
+`class_type_params: HashMap<String, Vec<String>>` side table on
+`Checker`, populated from each generic class's PEP 695 type-params at
+shape-collection time. The constructor-call arm now branches on this
+table: when the class is generic, it
+1. Reads any LHS annotation (`let b: Box[int] = ...`) and pins each
+   parameter from the matching position (bidirectional inference).
+2. Walks the constructor's keyword arguments, matches each to the
+   class's field annotation, and binds any `TypeVar` mentioned in the
+   field type from the arg's inferred type
+   (`bind_field_typevars` recurses through generics and unions).
+3. Returns `Type::Generic(name, [bound_T_values])`, falling back to
+   `Type::Unknown` for any param still unbound.
+
+Verified with `let b: Box[int] = Box(value=42)` and the symmetric
+`let s: Box[str] = Box(value="hi")` — both pass `tyc check`.
+Non-generic classes still produce `Type::Class(name)` exactly as
+before.
+
 **Severity:** bug — generic types unusable through their constructors.
 
 ```ty
