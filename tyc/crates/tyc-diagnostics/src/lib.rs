@@ -196,6 +196,26 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A second `let`/`mut` binding tries to shadow an outer binding
+    /// of the same name in the same function. Python's name scoping
+    /// is function-level, so what looks like block-scoped shadowing
+    /// actually rebinds the outer name — Typhon rejects this rather
+    /// than silently accepting a confusing capture.
+    #[error("cannot shadow `{name}` — Typhon names are function-scoped")]
+    #[diagnostic(
+        code(tyc::no_block_shadow),
+        help("Python doesn't have block scope, so a `let {name}: ...` inside a nested block would still rebind the outer `{name}`. Pick a different name, or remove the keyword to reuse the outer binding (if it's `mut`).")
+    )]
+    NoBlockShadow {
+        name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("first declared here")]
+        decl_span: SourceSpan,
+        #[label("re-declaration would shadow the outer binding")]
+        span: SourceSpan,
+    },
+
     /// A value of one type was used where another type was expected.
     #[error("type mismatch: expected `{expected}`, found `{actual}`")]
     #[diagnostic(
@@ -850,6 +870,25 @@ impl TycError {
         Self::ImplicitAny {
             kind: kind.into(),
             src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::NoBlockShadow`] diagnostic.
+    #[allow(clippy::too_many_arguments)]
+    pub fn no_block_shadow(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        decl_offset: usize,
+        decl_length: usize,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::NoBlockShadow {
+            name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            decl_span: SourceSpan::new(SourceOffset::from(decl_offset), decl_length),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }
     }

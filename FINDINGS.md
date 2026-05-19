@@ -3348,6 +3348,20 @@ Repro: `stress/tests/119_let_in_for.ty`.
 
 ## 76. Block-level shadowing surfaces as "illegal re-assignment" (papercut / doc)
 
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. Added
+`tyc::no_block_shadow` to `tyc-diagnostics`; `declare_target` in
+`tyc-resolve` now detects when a fresh `let`/`mut` keyword tries to
+re-declare a name already bound by a previous `let`/`mut`
+(`BindingKind::Value`) in the same scope, and surfaces the
+dedicated diagnostic. The help text explains Python's
+function-level scoping and tells the user to pick a different name
+(or drop the keyword if the outer binding is `mut`). Parameters,
+loop targets, imports, function defs, and class defs still take
+the previous codepaths so existing shadow-like patterns
+(`def f(x): mut x = ...`) keep working. Two regression tests:
+`block_let_shadow_uses_dedicated_diagnostic` and the updated
+`duplicate_let_emits_one_diagnostic`.
+
 **Severity:** papercut — the diagnostic is wrong for what the user is
 doing.
 

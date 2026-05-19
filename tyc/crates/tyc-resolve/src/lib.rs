@@ -1027,6 +1027,42 @@ fn declare_target(
                     n.id.as_str().len().max(1),
                 ));
             }
+            // FINDINGS #76: when the user writes a fresh `let`/`mut`
+            // binding for a name that was previously declared with an
+            // explicit `let`/`mut` in this function scope, they almost
+            // certainly mean block-scoped shadowing — which Python
+            // doesn't support (names are function-scoped). Surface a
+            // dedicated `tyc::no_block_shadow` with help that tells
+            // the user to pick a different name. Otherwise the user
+            // would get a generic `tyc::immutable_assign` whose
+            // "change `let` to `mut`" suggestion is wrong for
+            // shadowing intent.
+            //
+            // Only fire when the existing binding is also a value
+            // declaration (`BindingKind::Value`). A parameter / loop
+            // target / import / function / class re-declaration is a
+            // separate problem and not what this finding is about.
+            if ast_mutability.is_some() {
+                if let Some(existing) = r.lookup_local(scope, n.id.as_str()) {
+                    if existing.kind == BindingKind::Value {
+                        let decl_span = existing.span;
+                        if decl_span != span
+                            && r.seen_immutable_redecl.insert((decl_span, span))
+                        {
+                            r.diagnostics.push_error(TycError::no_block_shadow(
+                                n.id.as_str(),
+                                &r.path,
+                                r.source,
+                                decl_span.0,
+                                decl_span.1.saturating_sub(decl_span.0).max(1),
+                                span.0,
+                                span.1.saturating_sub(span.0).max(1),
+                            ));
+                        }
+                        return;
+                    }
+                }
+            }
             let mutability = match ast_mutability {
                 Some(ast::Mutability::Let) => Mutability::Let,
                 Some(ast::Mutability::Mut) => Mutability::Mut,
@@ -2226,18 +2262,52 @@ def foo():
     #[test]
     fn duplicate_let_emits_one_diagnostic() {
         // The resolver double-visits each body (pre-collect + walk_stmt);
-        // a re-declaration must only be reported once.
+        // a re-declaration must only be reported once. Since FINDINGS
+        // #76, `let x = 1; let x = 2` surfaces `tyc::no_block_shadow`
+        // (a clearer diagnostic for the shadowing case) instead of the
+        // generic `tyc::immutable_assign`.
         let (_m, d) = resolve("let x = 1\nlet x = 2\n");
-        let immutable_errors: Vec<_> = d
+        let shadow_errors: Vec<_> = d
             .errors()
             .iter()
-            .filter(|e| format!("{}", e).contains("cannot assign to immutable binding 'x'"))
+            .filter(|e| matches!(e, TycError::NoBlockShadow { .. }))
             .collect();
         assert_eq!(
-            immutable_errors.len(),
+            shadow_errors.len(),
             1,
-            "expected exactly one immutable_assign diagnostic, got {}: {:?}",
-            immutable_errors.len(),
+            "expected exactly one no_block_shadow diagnostic, got {}: {:?}",
+            shadow_errors.len(),
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn block_let_shadow_uses_dedicated_diagnostic() {
+        // FINDINGS #76: a `let` declaration inside an `if`/`while`/`for`
+        // block that names an outer binding is shadowing intent, not a
+        // re-assignment. Surface `tyc::no_block_shadow` so the help text
+        // can explain Python's function-level scoping.
+        let src = "def main() -> None:\n\
+                   \x20   let x: int = 1\n\
+                   \x20   if True:\n\
+                   \x20       let x: str = \"hi\"\n\
+                   \x20       print(x)\n";
+        let (_m, d) = resolve(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NoBlockShadow { name, .. } if name == "x")),
+            "expected NoBlockShadow on inner `let x`; got {:?}",
+            d.errors()
+        );
+        // The generic immutable-assign diagnostic should NOT also fire —
+        // the no-block-shadow path returns early after recording the
+        // dedicated error.
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ImmutableAssign { .. })),
+            "shadowing must not also fire immutable_assign: {:?}",
             d.errors()
         );
     }
