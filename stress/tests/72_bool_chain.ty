@@ -1,0 +1,16 @@
+def main() -> None:
+    let a: int = 5
+    let b: int = 10
+
+    # short-circuit and/or
+    let c: bool = a > 0 and b > 0
+    let d: bool = a < 0 or b > 0
+    let e: int = a if a > 0 else b  # ternary
+
+    # not
+    let f: bool = not a > 0
+
+    print(c, d, e, f)
+
+if __name__ == "__main__":
+    main()

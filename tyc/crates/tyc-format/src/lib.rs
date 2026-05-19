@@ -159,6 +159,9 @@ fn apply_simple_style_rules(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
     let mut quote: Option<char> = None;
+    // Track when we've just emitted an opening bracket/paren so the next
+    // run of spaces is stripped (`(   x` → `(x`). FINDINGS #65.
+    let mut just_opened_bracket = false;
     while let Some(c) = chars.next() {
         if let Some(q) = quote {
             out.push(c);
@@ -174,10 +177,51 @@ fn apply_simple_style_rules(line: &str) -> String {
             }
             continue;
         }
+        // Collapse runs of 2+ internal spaces to a single space — but not
+        // at the start of the line (indentation must be preserved verbatim).
+        // We're past indentation once `out` contains at least one
+        // non-whitespace character.
+        let past_indent = out.chars().any(|ch| !ch.is_whitespace());
+        if c == ' ' && past_indent {
+            // Look at the last non-space character to decide whether we
+            // should drop this space entirely (after an opening bracket)
+            // or keep one (between two tokens).
+            let drop_after_open = just_opened_bracket;
+            // Consume the rest of the whitespace run.
+            while let Some(&n) = chars.peek() {
+                if n == ' ' || n == '\t' {
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            // Strip the space entirely when:
+            //   - we just opened a bracket / paren (collapse `( x` → `(x`)
+            //   - the next char is a closing bracket / paren / `,` / `:`
+            //     (collapse `x )` → `x)`, `x ,` → `x,`, etc.)
+            let next = chars.peek().copied();
+            let drop_before_close = matches!(next, Some(')') | Some(']') | Some(',') | Some(';'));
+            // Also strip the spaces between every line-leading keyword and
+            // the next token (e.g. `def    main` → `def main`) by keeping
+            // exactly one space.
+            if drop_after_open || drop_before_close {
+                // Skip the entire whitespace run; do not emit a space.
+            } else {
+                out.push(' ');
+            }
+            just_opened_bracket = false;
+            continue;
+        }
         match c {
             '"' | '\'' => {
                 quote = Some(c);
                 out.push(c);
+                just_opened_bracket = false;
+            }
+            '(' | '[' => {
+                out.push(c);
+                just_opened_bracket = true;
+                continue;
             }
             '#' => {
                 // Normalise `#foo` → `# foo`, but leave shebangs and

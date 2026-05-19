@@ -1,0 +1,9 @@
+def main() -> None:
+    let d: dict[str, int] = {"a": 1}
+    # dict.get(k, default) should narrow to V
+    let x: int = d.get("a", 0)
+    let y: int? = d.get("missing")
+    print(x, y)
+
+if __name__ == "__main__":
+    main()

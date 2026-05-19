@@ -1,0 +1,46 @@
+# Various match patterns
+class Just[T]:
+    value: T
+class Nothing:
+    pass
+
+type Maybe[T] = Just[T] | Nothing
+
+def unwrap(m: Maybe[int]) -> int:
+    match m:
+        case Just(v):
+            return v
+        case Nothing():
+            return -1
+
+# match on tuple
+def tup(p: tuple[int, str]) -> str:
+    match p:
+        case (0, s):
+            return f"zero/{s}"
+        case (n, s):
+            return f"{n}/{s}"
+
+# match with guard
+def guarded(x: int) -> str:
+    match x:
+        case n if n < 0:
+            return "neg"
+        case 0:
+            return "zero"
+        case n if n > 100:
+            return "big"
+        case _:
+            return "ok"
+
+# nested
+def nest(p: tuple[int, tuple[int, int]]) -> int:
+    match p:
+        case (a, (b, c)):
+            return a + b + c
+
+def main() -> None:
+    print(unwrap(Just(value=5)))
+    print(tup((0, "ok")))
+    print(guarded(-1))
+    print(nest((1, (2, 3))))

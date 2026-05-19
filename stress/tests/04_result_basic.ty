@@ -1,0 +1,23 @@
+def parse_port(raw: str) -> Result[int, str]:
+    if not raw.isdigit():
+        return Err(f"not a number: {raw}")
+    let n: int = int(raw)
+    if n < 1 or n > 65535:
+        return Err(f"out of range: {n}")
+    return Ok(n)
+
+def parse_addr(host: str, raw: str) -> Result[tuple[str, int], str]:
+    let port: int = parse_port(raw)?
+    return Ok((host, port))
+
+def parse_addr_mismatch(host: str, raw: str) -> Result[tuple[str, int], int]:
+    let port: int = parse_port(raw)?  # error type mismatch str vs int
+    return Ok((host, port))
+
+def main() -> None:
+    let r: Result[int, str] = parse_port("80")
+    match r:
+        case Ok(v):
+            print(v)
+        case Err(e):
+            print(e)

@@ -1,0 +1,9 @@
+def main() -> None:
+    # Real `with` statement (not Result with-chain)
+    with open("/tmp/x.txt", "w") as f:
+        f.write("hi")
+
+    # Multiple
+    with open("/tmp/a.txt", "w") as a, open("/tmp/b.txt", "w") as b:
+        a.write("a")
+        b.write("b")

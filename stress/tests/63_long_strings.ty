@@ -1,0 +1,4 @@
+def main() -> None:
+    let s: str = "x" * 1000
+    let t: str = "a" + "b" + "c" + "d" + "e"
+    print(len(s), t)

@@ -1,0 +1,9 @@
+# Circular type alias
+type A = B
+type B = A
+
+def f(x: A) -> A:
+    return x
+
+def main() -> None:
+    print("ok")

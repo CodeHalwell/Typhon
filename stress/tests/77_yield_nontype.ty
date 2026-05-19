@@ -1,0 +1,7 @@
+# yield in function with non-iterator return type — should fire diagnostic per #51 fix
+def boom() -> int:
+    yield 1  # invalid_yield expected
+    return 2
+
+def main() -> None:
+    print(list(boom()))

@@ -1,0 +1,21 @@
+class A:
+    x: int
+class B:
+    y: int
+
+type C = A | B
+
+def f(v: C) -> int:
+    # Same union but through alias
+    match v:
+        case A(x):
+            return x
+        case B(y):
+            return y
+
+def main() -> None:
+    let a: A = A(x=5)
+    print(f(a))
+
+if __name__ == "__main__":
+    main()

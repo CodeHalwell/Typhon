@@ -1,0 +1,13 @@
+def f[A, B, C, D, E, F, G, H](
+    a: A, b: B, c: C, d: D, e: E, f: F, g: G, h: H
+) -> tuple[A, B, C, D, E, F, G, H]:
+    return (a, b, c, d, e, f, g, h)
+
+def main() -> None:
+    let t: tuple[int, str, float, bool, bytes, list[int], dict[str, int], None] = f(
+        1, "a", 1.0, True, b"x", [1], {"k": 1}, None
+    )
+    print(t)
+
+if __name__ == "__main__":
+    main()

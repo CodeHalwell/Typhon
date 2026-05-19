@@ -1,0 +1,7 @@
+class Point frozen:
+    x: float
+    y: float
+
+def main() -> None:
+    let p: Point = Point(x=1.0, y=2.0)
+    p.x = 5.0  # frozen_assign

@@ -1,0 +1,9 @@
+class Foo:
+    x: int
+
+    def __init__(self, x: int) -> None:  # should be rejected (Rule 4, manual_init)
+        self.x = x
+
+def main() -> None:
+    let f: Foo = Foo(1)
+    print(f.x)

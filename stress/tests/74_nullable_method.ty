@@ -1,0 +1,8 @@
+# Calling methods on a nullable
+def find() -> str?:
+    return "x"
+
+def main() -> None:
+    let s: str? = find()
+    let n: int = s.upper()  # should fail — method on nullable
+    print(n)

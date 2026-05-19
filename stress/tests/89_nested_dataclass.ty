@@ -1,0 +1,17 @@
+class Inner:
+    n: int
+
+class Outer:
+    inner: Inner
+    tags: list[str]
+
+impl Outer:
+    def show(self) -> str:
+        return f"{self.inner.n}/{self.tags}"
+
+def main() -> None:
+    let o: Outer = Outer(inner=Inner(n=5), tags=["a", "b"])
+    print(o.show())
+
+if __name__ == "__main__":
+    main()

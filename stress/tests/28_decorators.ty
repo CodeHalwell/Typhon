@@ -1,0 +1,16 @@
+import functools
+
+def cached(func):
+    return functools.cache(func)
+
+@cached
+def slow(n: int) -> int:
+    return n * 2
+
+@functools.lru_cache(maxsize=128)
+def slower(n: int) -> int:
+    return n + 1
+
+def main() -> None:
+    print(slow(5))
+    print(slower(5))

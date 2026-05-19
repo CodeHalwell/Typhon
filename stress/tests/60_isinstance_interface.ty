@@ -1,0 +1,19 @@
+interface Speaker:
+    def speak() -> str
+
+class Dog:
+    name: str
+
+impl Dog:
+    def speak(self) -> str:
+        return "woof"
+
+def shout(s: Speaker) -> None:
+    print(s.speak())
+
+def check(x: object) -> bool:
+    return isinstance(x, Speaker)  # rejected: tyc::interface_isinstance
+
+def main() -> None:
+    let d: Dog = Dog(name="rex")
+    print(check(d))

@@ -1,0 +1,16 @@
+# Module-level let
+PI: float = 3.14159
+mut counter: int = 0  # explicit mut at module level
+
+def bump() -> int:
+    global counter
+    counter = counter + 1
+    return counter
+
+def main() -> None:
+    print(PI)
+    print(bump())
+    print(bump())
+
+if __name__ == "__main__":
+    main()

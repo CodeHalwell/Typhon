@@ -1,0 +1,13 @@
+def main() -> None:
+    let xs: list[int] = [1, 2, 3]
+    let ys: list[int] = [4, 5, 6]
+    let z: list[int] = [*xs, *ys]
+    print(z)
+
+    let a: tuple[int, int, int] = (1, 2, 3)
+    let first: int
+    let rest: list[int]
+    first, *rest = a  # PEP 3132 starred assignment
+
+if __name__ == "__main__":
+    main()

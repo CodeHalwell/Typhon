@@ -1,0 +1,19 @@
+mut counter: int = 0
+
+def inc() -> None:
+    global counter
+    counter = counter + 1
+
+def outer() -> int:
+    mut x: int = 0
+    def inner() -> None:
+        nonlocal x
+        x = x + 1
+    inner()
+    return x
+
+def main() -> None:
+    inc()
+    inc()
+    print(counter)
+    print(outer())

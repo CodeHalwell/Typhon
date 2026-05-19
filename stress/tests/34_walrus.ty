@@ -1,0 +1,8 @@
+def main() -> None:
+    # walrus operator - what does typhon do with this?
+    if (n := 10) > 5:
+        print(n)
+
+    let xs: list[int] = [1, 2, 3, 4]
+    while (x := xs.pop() if len(xs) > 0 else None) is not None:
+        print(x)

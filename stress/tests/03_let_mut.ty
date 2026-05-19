@@ -1,0 +1,13 @@
+def main() -> None:
+    let x: int = 1
+    x = 2  # immutable_assign
+
+    mut y: int = 0
+    y = 5  # ok
+
+    # No keyword at function scope
+    z: int = 3
+    z = 4
+
+    let a: int = 10
+    let a: int = 20  # shadowing? same name redeclared

@@ -1,0 +1,9 @@
+def main() -> None:
+    let x: int = 1
+    if True:
+        let x: str = "hi"  # shadow in nested scope
+        print(x)
+    print(x)  # original
+
+if __name__ == "__main__":
+    main()

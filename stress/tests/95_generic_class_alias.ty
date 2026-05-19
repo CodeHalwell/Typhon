@@ -1,0 +1,12 @@
+# Generic type alias
+type StringMap[V] = dict[str, V]
+
+def make() -> StringMap[int]:
+    return {"a": 1}
+
+def main() -> None:
+    let m: StringMap[int] = make()
+    print(m["a"])
+
+if __name__ == "__main__":
+    main()

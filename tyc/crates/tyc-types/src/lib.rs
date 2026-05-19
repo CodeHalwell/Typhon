@@ -1060,6 +1060,15 @@ struct Checker<'a> {
     /// Sealed union declarations: name → ordered list of variant class names.
     /// Populated from `type Foo = A | B | C` statements in the first pass.
     sealed_unions: HashMap<String, Vec<String>>,
+    /// Transparent type-alias declarations: name → (type-parameter names,
+    /// RHS type). Populated from every `type X = ...` statement, including
+    /// the sealed-union ones (so an alias to `A | B | C` is *both* a sealed
+    /// union and a transparent alias). Consulted by [`unwrap_alias`] before
+    /// every assignability check so that `type Report = ReportData` allows
+    /// `Ok(ReportData(...))` to satisfy `Result[Report, str]`, and so that
+    /// `type B = int | str` accepts an `int` literal where `B` is required.
+    /// FINDINGS #57, #58, #70.
+    type_aliases: HashMap<String, (Vec<String>, Type)>,
     /// Interfaces (Typhon `interface Name:` → `class Name(Protocol):`).
     /// Maps the interface name to its required member shape and whether it
     /// opted in to runtime checking via `@runtime_checkable`. In v1 we
@@ -1159,6 +1168,11 @@ struct InterfaceDecl {
 struct MethodSig {
     arity: usize,
     return_type: Type,
+    /// `true` when the method was decorated with `@property`. Attribute
+    /// access (`r.area`) on a property unwraps to `return_type` instead
+    /// of producing a `() -> return_type` bound-method handle.
+    /// FINDINGS #63.
+    is_property: bool,
 }
 
 /// Member shape recorded for an interface or class — methods are recorded as
@@ -1207,6 +1221,7 @@ impl<'a> Checker<'a> {
             unsafe_depth: 0,
             unsafe_line_starts: Vec::new(),
             sealed_unions: HashMap::new(),
+            type_aliases: HashMap::new(),
             env: TypeEnv::default(),
             diagnostics: Diagnostics::new(),
             current_return: None,
@@ -1242,6 +1257,22 @@ impl<'a> Checker<'a> {
     fn is_assignable(&self, expected: &Type, actual: &Type) -> bool {
         if assignable(expected, actual) {
             return true;
+        }
+        // Transparent type-alias unwrap. `type Report = ReportData` and
+        // `type B = int | str` should let `Class("ReportData")` flow into
+        // a target typed `Report`, and `Int` flow into `B`. `unwrap_alias`
+        // returns the input untouched for non-alias types, so we recurse
+        // only when at least one side actually changed (avoids infinite
+        // loops on the no-op case). FINDINGS #57, #58, #70.
+        let exp_unwrapped = self.unwrap_alias(expected);
+        let act_unwrapped = self.unwrap_alias(actual);
+        if &exp_unwrapped != expected || &act_unwrapped != actual {
+            if assignable(&exp_unwrapped, &act_unwrapped) {
+                return true;
+            }
+            if self.is_assignable(&exp_unwrapped, &act_unwrapped) {
+                return true;
+            }
         }
         // Variant → sealed union coercion.
         if let (Type::Class(exp_name), Type::Class(act_name)) = (expected, actual) {
@@ -1309,6 +1340,48 @@ impl<'a> Checker<'a> {
             }
         }
         false
+    }
+
+    /// If `ty` (or its head, for a generic application) names a transparent
+    /// type alias, return the alias's RHS with the alias's parameters
+    /// substituted by the application's actual arguments. Returns the
+    /// input unchanged for non-alias types or after a substitution failure.
+    ///
+    /// Handles chains (`type A = B; type B = int`) by recursing up to a
+    /// fixed depth — both for performance and to break cycles introduced
+    /// by `type A = B; type B = A` (FINDINGS #81 — circular aliases no
+    /// longer cause infinite loops here; a dedicated diagnostic is left
+    /// as follow-up).
+    fn unwrap_alias(&self, ty: &Type) -> Type {
+        self.unwrap_alias_inner(ty, 0)
+    }
+
+    fn unwrap_alias_inner(&self, ty: &Type, depth: u8) -> Type {
+        // Bound the chain to prevent infinite loops on circular aliases.
+        // Eight levels is far more than any realistic alias-of-alias chain.
+        if depth >= 8 {
+            return ty.clone();
+        }
+        match ty {
+            Type::Class(name) => {
+                if let Some((_params, rhs)) = self.type_aliases.get(name.as_str()) {
+                    return self.unwrap_alias_inner(rhs, depth + 1);
+                }
+                ty.clone()
+            }
+            Type::Generic(name, args) => {
+                if let Some((params, rhs)) = self.type_aliases.get(name.as_str()) {
+                    if params.len() == args.len() {
+                        let bindings: std::collections::HashMap<String, Type> =
+                            params.iter().cloned().zip(args.iter().cloned()).collect();
+                        let substituted = substitute_typevars(rhs, &bindings);
+                        return self.unwrap_alias_inner(&substituted, depth + 1);
+                    }
+                }
+                ty.clone()
+            }
+            _ => ty.clone(),
+        }
     }
 
     /// Return `true` if class `cls_name`'s member shape (including inherited
@@ -1984,14 +2057,35 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                     let union_name = n.id.as_str().to_owned();
                     c.classes.push(union_name.clone());
                     if let Some(variants) = extract_sealed_union_variants(&ta.value) {
-                        c.sealed_unions.insert(union_name, variants);
+                        c.sealed_unions.insert(union_name.clone(), variants);
                     }
+                    // Record the alias for transparent unwrap during
+                    // assignability. We use a placeholder class list here —
+                    // the second pass below rewrites the RHS once every
+                    // class name is known.
+                    let params = type_param_names_from(ta.type_params.as_deref());
+                    c.type_aliases.insert(union_name, (params, Type::Unknown));
                 }
             }
             _ => {}
         }
     }
     let classes = c.classes.clone();
+    // Second pass: now that every class name is known, resolve each type
+    // alias's RHS into a concrete `Type`. Doing this in pass 1 would
+    // mis-translate forward references (e.g. `type Maybe[T] = Just[T] |
+    // Nothing` declared before `class Just[T]:` / `class Nothing:`).
+    // FINDINGS #57, #58, #70.
+    for stmt in body {
+        if let Stmt::TypeAlias(ta) = stmt {
+            if let Expr::Name(n) = ta.name.as_ref() {
+                let alias_name = n.id.as_str().to_owned();
+                let params = type_param_names_from(ta.type_params.as_deref());
+                let rhs = type_from_annotation_with_params(ta.value.as_ref(), &classes, &params);
+                c.type_aliases.insert(alias_name, (params, rhs));
+            }
+        }
+    }
     // Second pass: now that every class name is known, collect each class's
     // member shape so interface conformance can resolve nominal types in
     // field annotations.
@@ -2154,9 +2248,18 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
                     Some(r) => type_from_annotation(r, classes),
                     None => Type::Unknown,
                 };
-                shape
-                    .methods
-                    .insert(f.name.as_str().to_owned(), MethodSig { arity, return_type });
+                let is_property = f
+                    .decorator_list
+                    .iter()
+                    .any(|d| matches!(&d.expression, Expr::Name(n) if n.id.as_str() == "property"));
+                shape.methods.insert(
+                    f.name.as_str().to_owned(),
+                    MethodSig {
+                        arity,
+                        return_type,
+                        is_property,
+                    },
+                );
             }
             Stmt::AnnAssign(a) => {
                 if let Expr::Name(n) = a.target.as_ref() {
@@ -3607,6 +3710,12 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                 Type::Class(class_name) => {
                     let class_name = class_name.clone();
                     if let Some(sig) = c.find_method(class_name.as_str(), attr_name) {
+                        // `@property` methods are read as attributes — return
+                        // the underlying type directly instead of a bound-
+                        // method handle. FINDINGS #63.
+                        if sig.is_property {
+                            return sig.return_type.clone();
+                        }
                         let arity = sig.arity;
                         let ret = sig.return_type.clone();
                         return Type::Function {
@@ -3628,6 +3737,9 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     let bound = c.active_typevar_bounds.get(tv_name.as_str()).cloned();
                     if let Some(Type::Class(bound_name)) = bound {
                         if let Some(sig) = c.find_method(bound_name.as_str(), attr_name) {
+                            if sig.is_property {
+                                return sig.return_type.clone();
+                            }
                             let arity = sig.arity;
                             let ret = sig.return_type.clone();
                             return Type::Function {

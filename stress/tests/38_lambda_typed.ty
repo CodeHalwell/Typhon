@@ -1,0 +1,10 @@
+from typing import Callable
+
+def main() -> None:
+    # Can lambdas have type annotations? Python doesn't allow, what does Typhon do?
+    let f: Callable[[int], int] = lambda x: x + 1
+    print(f(5))
+
+    # nested
+    let g: Callable[[int], Callable[[int], int]] = lambda x: lambda y: x + y
+    print(g(3)(4))

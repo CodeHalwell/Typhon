@@ -1,0 +1,12 @@
+from typing import TypedDict
+
+class UserDict(TypedDict):
+    id: int
+    name: str
+
+def main() -> None:
+    let u: UserDict = UserDict(id=1, name="amy")
+    print(u)
+
+if __name__ == "__main__":
+    main()

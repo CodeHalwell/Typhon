@@ -1,0 +1,19 @@
+class A:
+    x: int
+class B:
+    y: int
+
+# Not a sealed union — separate classes
+def f(v: A | B) -> int:
+    match v:
+        case A(x):
+            return x
+        case B(y):
+            return y
+
+def main() -> None:
+    let a: A = A(x=5)
+    print(f(a))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,9 @@
+def main() -> None:
+    let x: int = 5
+    let a: bool = 0 < x < 10  # chained comparison
+    let b: bool = x == 5 == 5
+    let c: bool = 0 <= x <= 100
+    print(a, b, c)
+
+if __name__ == "__main__":
+    main()

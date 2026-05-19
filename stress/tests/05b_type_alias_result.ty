@@ -1,0 +1,10 @@
+# Smaller reproducer: Result with a transparent type alias as T
+class ReportData:
+    summary: str
+
+type Report = ReportData
+
+def build_report() -> Result[Report, str]:
+    # Ok wraps a ReportData which IS Report by alias —
+    # but checker reports "expected Result[Report, str], found Ok[ReportData]"
+    return Ok(ReportData(summary="x"))

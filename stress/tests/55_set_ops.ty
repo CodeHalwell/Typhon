@@ -1,0 +1,12 @@
+def main() -> None:
+    let a: set[int] = {1, 2, 3}
+    let b: set[int] = {2, 3, 4}
+    let u: set[int] = a | b
+    let i: set[int] = a & b
+    let d: set[int] = a - b
+    let s: set[int] = a ^ b
+    let f: frozenset[int] = frozenset([1, 2, 3])
+    print(u, i, d, s, f)
+
+if __name__ == "__main__":
+    main()

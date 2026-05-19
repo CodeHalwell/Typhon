@@ -1,0 +1,18 @@
+def search(xs: list[int], target: int) -> str:
+    for x in xs:
+        if x == target:
+            return "found"
+    else:
+        return "not found"
+
+def while_loop() -> int:
+    mut i: int = 0
+    while i < 10:
+        i = i + 1
+    else:
+        print("done")
+    return i
+
+def main() -> None:
+    print(search([1, 2, 3], 2))
+    print(while_loop())

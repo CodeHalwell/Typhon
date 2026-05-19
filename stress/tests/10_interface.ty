@@ -1,0 +1,29 @@
+interface Drawable:
+    def draw() -> None
+    def width() -> float
+
+class Button:
+    label: str
+
+impl Button:
+    def draw(self) -> None:
+        print(self.label)
+    def width(self) -> float:
+        return 10.0
+
+class Circle2:
+    r: float
+
+# This one MISSES width()
+impl Circle2:
+    def draw(self) -> None:
+        print(f"circle r={self.r}")
+
+def render(d: Drawable) -> None:
+    d.draw()
+
+def main() -> None:
+    let b: Button = Button(label="ok")
+    render(b)
+    let c: Circle2 = Circle2(r=2.0)
+    render(c)  # should fail: missing width

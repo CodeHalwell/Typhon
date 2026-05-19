@@ -1,0 +1,33 @@
+class Circle:
+    radius: float
+
+class Rectangle:
+    width: float
+    height: float
+
+class Triangle:
+    base: float
+    height: float
+
+type Shape = Circle | Rectangle | Triangle
+
+def area(s: Shape) -> float:
+    match s:
+        case Circle(radius):
+            return 3.14159 * radius * radius
+        case Rectangle(w, h):
+            return w * h
+        case Triangle(b, h):
+            return 0.5 * b * h
+
+# Missing variant - should fail non_exhaustive_match
+def area_missing(s: Shape) -> float:
+    match s:
+        case Circle(radius):
+            return 3.14159 * radius * radius
+        case Rectangle(w, h):
+            return w * h
+
+def main() -> None:
+    let c: Circle = Circle(radius=1.0)
+    print(area(c))

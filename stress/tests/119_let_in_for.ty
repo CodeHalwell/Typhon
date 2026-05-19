@@ -1,0 +1,17 @@
+def main() -> None:
+    let xs: list[int] = [1, 2, 3]
+    # for-loop target — is `i` a let or mut?
+    for i in xs:
+        print(i)
+
+    # for with tuple
+    for (i, x) in enumerate(xs):
+        print(i, x)
+
+    # try mut for-target rebinding
+    for i in xs:
+        i = i + 1  # should fail — for-target is implicit let
+        print(i)
+
+if __name__ == "__main__":
+    main()

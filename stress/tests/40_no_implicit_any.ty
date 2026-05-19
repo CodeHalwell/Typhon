@@ -1,0 +1,11 @@
+# Rule 1 enforcement test - all should fail
+def no_return(x: int):
+    return x
+
+def no_params(x):
+    return 1
+
+def main() -> None:
+    let xs: list = [1, 2, 3]  # missing type param
+    let d: dict = {"a": 1}
+    print(xs)

@@ -1,0 +1,24 @@
+import asyncio
+
+async def send_welcome(email: str) -> None:
+    await asyncio.sleep(0.01)
+    print(f"welcomed {email}")
+
+async def create(email: str) -> str:
+    return email
+
+async def signup(email: str) -> str:
+    let user: str = await create(email)
+    go send_welcome(user)
+    return user
+
+async def signup_handle(email: str) -> str:
+    let user: str = await create(email)
+    go send_welcome(user) -> task
+    await task
+    return user
+
+async def main() -> None:
+    print(await signup("a@b.com"))
+
+asyncio.run(main())

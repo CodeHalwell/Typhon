@@ -1561,6 +1561,22 @@ pub fn validate_question_ops(source: &str) -> Vec<QuestionOpError> {
             }
         }
 
+        // Detect mid-expression `?` — the lowering only handles `expr?` at
+        // statement / RHS end. `Ok(step(x)?)` and `step(x)? + step(x)?` get
+        // through this validator silently today and produce a useless parse
+        // error against the *desugared* Python with span "Got unexpected
+        // token ? …". Emit a targeted diagnostic instead. FINDINGS #66.
+        for offset in find_mid_expression_questionmarks(code) {
+            errors.push(QuestionOpError {
+                line_index,
+                offset: byte_offset + offset,
+                message: "`?` operator only works as the whole right-hand \
+                         side of an assignment or as a standalone statement \
+                         (Rust-style mid-expression `?` is not yet supported); \
+                         lift the inner call to a `let` binding first"
+                    .to_owned(),
+            });
+        }
         // Detect `)?` — the `?` error-propagation operator.  The same pattern
         // `expand_question_ops` uses: last code char is `?`, char before is `)`.
         // This check runs for ALL lines, including `)…` continuation lines.
@@ -1598,6 +1614,49 @@ pub fn validate_question_ops(source: &str) -> Vec<QuestionOpError> {
     }
 
     errors
+}
+
+/// Find byte offsets of `)?` patterns that are *not* at the end of `code`.
+/// These are mid-expression uses of the `?` propagation operator — the
+/// current desugar pass only handles end-of-statement `?`, so anything
+/// else produces a confusing parse error against the lowered Python.
+/// FINDINGS #66.
+fn find_mid_expression_questionmarks(code: &str) -> Vec<usize> {
+    let mut out = Vec::new();
+    let bytes = code.as_bytes();
+    let trimmed_end = code.trim_end_matches([' ', '\t']).len();
+    // Skip the *last* `?` if it ends the code — that's the supported form.
+    let scan_end = if trimmed_end > 0 && bytes[trimmed_end - 1] == b'?' {
+        trimmed_end - 1
+    } else {
+        trimmed_end
+    };
+    let mut in_str: Option<u8> = None;
+    let mut i = 0;
+    while i < scan_end {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            in_str = Some(b);
+            i += 1;
+            continue;
+        }
+        if b == b'?' && i > 0 && bytes[i - 1] == b')' {
+            out.push(i);
+        }
+        i += 1;
+    }
+    out
 }
 
 /// Return `true` when `ret` is the `Result` identifier (bare or subscripted).
@@ -3288,6 +3347,56 @@ fn collect_gather_bindings(
     Some((bindings, consumed, block_state))
 }
 
+/// True when binding `b` at position `idx` references the name of any
+/// earlier binding in the same gather block. Used to demote dependent
+/// gather blocks to sequential awaits — concurrent lowering would
+/// reference an undefined name inside `create_task(...)` and crash at
+/// runtime with `UnboundLocalError`. FINDINGS #60.
+fn gather_binding_depends_on_earlier(bindings: &[GatherBinding], idx: usize) -> bool {
+    if idx == 0 {
+        return false;
+    }
+    let expr = &bindings[idx].expr;
+    for prior in &bindings[..idx] {
+        if expr_references_identifier(expr, &prior.name) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Scan `expr` for a free occurrence of `name`. Word-boundary check using
+/// Python identifier-character rules; doesn't honour string literals or
+/// nested scopes, but those almost never trigger a false positive on a
+/// gather binding name (which is necessarily a `name = expr` shape).
+fn expr_references_identifier(expr: &str, name: &str) -> bool {
+    let bytes = expr.as_bytes();
+    let needle = name.as_bytes();
+    let n = needle.len();
+    if n == 0 || bytes.len() < n {
+        return false;
+    }
+    let is_id_char = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut i = 0;
+    while i + n <= bytes.len() {
+        if &bytes[i..i + n] == needle {
+            let prev_ok = i == 0 || !is_id_char(bytes[i - 1]);
+            let next_ok = i + n == bytes.len() || !is_id_char(bytes[i + n]);
+            if prev_ok && next_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// True when any binding in this gather block references the name of an
+/// earlier binding — the lowering must demote to sequential awaits.
+fn gather_has_dependent_bindings(bindings: &[GatherBinding]) -> bool {
+    (0..bindings.len()).any(|i| gather_binding_depends_on_earlier(bindings, i))
+}
+
 /// Render a `gather` block into the chosen Python concurrency primitive.
 fn render_gather_block(
     bindings: &[GatherBinding],
@@ -3296,6 +3405,21 @@ fn render_gather_block(
     counter: &mut usize,
 ) -> String {
     let mut out = String::new();
+    // Dependent bindings (b's expr references a's name) cannot be concurrent.
+    // Demote to sequential `let x = await expr` so the lowering is at least
+    // correct; a future diagnostic could warn that the gather intent was
+    // demoted. FINDINGS #60.
+    if gather_has_dependent_bindings(bindings) {
+        for b in bindings {
+            out.push_str(header_indent);
+            out.push_str("let ");
+            out.push_str(&b.name);
+            out.push_str(" = await ");
+            out.push_str(&b.expr);
+            out.push('\n');
+        }
+        return out;
+    }
     match strategy {
         GatherStrategy::TaskGroup => {
             let tg = format!("__typhon_tg_{}__", *counter);

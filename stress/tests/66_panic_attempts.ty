@@ -1,0 +1,4 @@
+# Try to make the parser unhappy
+def main() -> None:
+    let x: int = 1; let y: int = 2; print(x + y)  # semicolons
+    print("ok")
