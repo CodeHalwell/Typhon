@@ -2778,6 +2778,43 @@ fn parse_else_var(header: &str) -> Option<String> {
 /// them verbatim. The unit-indent is detected from the source itself (the
 /// first non-blank body line) rather than assumed to be four spaces, so
 /// tab-indented or two-space code round-trips correctly.
+/// Replace every whole-word occurrence of `from` with `to` in `line`,
+/// respecting Python identifier boundaries (a leading or trailing
+/// alphanumeric / underscore character disqualifies the match).
+/// String literals are *not* protected — the caller is responsible for
+/// only invoking this on text where the substitution is semantically
+/// safe (e.g. the body of a `with`-chain `else err:` block where the
+/// user-supplied error identifier is the only thing being renamed).
+fn rename_whole_word(line: &str, from: &str, to: &str) -> String {
+    if from.is_empty() || !line.contains(from) {
+        return line.to_owned();
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    let bytes = line.as_bytes();
+    let from_bytes = from.as_bytes();
+    while i < bytes.len() {
+        if i + from_bytes.len() <= bytes.len() && &bytes[i..i + from_bytes.len()] == from_bytes {
+            let before_ok = i == 0
+                || !is_ident_continuation(bytes[i - 1]);
+            let after_ok = i + from_bytes.len() == bytes.len()
+                || !is_ident_continuation(bytes[i + from_bytes.len()]);
+            if before_ok && after_ok {
+                out.push_str(to);
+                i += from_bytes.len();
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn is_ident_continuation(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
 fn render_chain(chain: &WithChain, chain_indent: &str, counter: &mut usize) -> String {
     let mut out = String::new();
 
@@ -2821,23 +2858,23 @@ fn render_chain(chain: &WithChain, chain_indent: &str, counter: &mut usize) -> S
 
         match (&chain.err_var, !chain.else_body.is_empty()) {
             (Some(name), true) => {
-                // Bind `let err = tmp.error` at one indent past the guard,
-                // using the detected unit indent. The `let` keyword is
-                // required so the resolver records it as an immutable
-                // local rather than tripping Rule-2's
-                // `tyc::missing_binding_kind` on the user-visible name.
+                // Uniquify the user-visible `err` name so multiple
+                // `with`-chains in the same function don't trip the
+                // resolver's `tyc::immutable_assign` re-declaration
+                // check on a shared `let err = ...`. The synthesised
+                // name keys off the current tmp counter (which has
+                // already been bumped for this binding) so it's
+                // guaranteed unique without interleaving with the
+                // chain's own `__typhon_with_N__` numbering.
+                let unique_err = format!("__typhon_with_err_{}__", *counter - 1);
                 out.push_str(&inner_indent);
                 out.push_str("let ");
-                out.push_str(name);
+                out.push_str(&unique_err);
                 out.push_str(" = ");
                 out.push_str(&tmp);
                 out.push_str(".error\n");
-                // Else-body lines come in with their original indent (one
-                // level inside the `else err:` header, which sat at the
-                // chain indent). That matches the new `if` body's indent
-                // exactly, so emit verbatim.
                 for line in &chain.else_body {
-                    out.push_str(line);
+                    out.push_str(&rename_whole_word(line, name, &unique_err));
                 }
             }
             _ => {
@@ -3692,7 +3729,11 @@ fn apply_pipe_call(acc: &str, rhs: &str) -> Option<String> {
         }
         Some(open) => {
             let func = rhs[..open].trim_end();
-            if !is_dotted_callable(func) {
+            // Accept either a plain identifier chain (`a.b.c`) or a
+            // bound method on a literal receiver (`", ".join`,
+            // `(a + b).method`). The latter shape is common in pipe
+            // chains that feed into stdlib container methods.
+            if !is_dotted_callable(func) && !is_method_call_head(func) {
                 return None;
             }
             // Validate the RHS is exactly `func(...)` — i.e. parens span to
@@ -3710,6 +3751,40 @@ fn apply_pipe_call(acc: &str, rhs: &str) -> Option<String> {
             }
         }
     }
+}
+
+/// True if `s` looks like a *bound method* call head — anything that
+/// ends in `.IDENT` where the preceding text is either a string /
+/// bytes literal or a parenthesised expression. Examples:
+///
+///   `", ".join`            → ok (string literal + `.join`)
+///   `b"x".decode`          → ok
+///   `(a + b).foo`          → ok
+///   `mod.func.helper`      → handled by `is_dotted_callable` instead
+fn is_method_call_head(s: &str) -> bool {
+    let s = s.trim_end();
+    let Some(dot_pos) = s.rfind('.') else {
+        return false;
+    };
+    let receiver = s[..dot_pos].trim_end();
+    let method = s[dot_pos + 1..].trim_start();
+    if receiver.is_empty() || method.is_empty() {
+        return false;
+    }
+    // Method must be a plain identifier.
+    let mut chars = method.chars();
+    let first = chars.next().unwrap();
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+    // Receiver: a string/bytes literal (quoted, possibly with a
+    // prefix like `b`, `r`, `f`), or a parenthesised expression.
+    let bytes = receiver.as_bytes();
+    let last = *bytes.last().unwrap();
+    matches!(last, b'"' | b'\'' | b')' | b']')
 }
 
 /// True if `s` looks like a (possibly dotted) callable identifier suitable as
@@ -4552,11 +4627,18 @@ def run() -> Result[str, str]:
             out.contains("if isinstance(__typhon_with_0__, Err):"),
             "out:\n{out}"
         );
+        // The user-visible `err` name is uniquified to
+        // `__typhon_with_err_N__` to avoid `let err` clashing across
+        // multiple `with`-chains in the same function. References to
+        // `err` in the else_body are renamed to match.
         assert!(
-            out.contains("let err = __typhon_with_0__.error"),
+            out.contains("let __typhon_with_err_0__ = __typhon_with_0__.error"),
             "out:\n{out}"
         );
-        assert!(out.contains("return Err(err)"), "out:\n{out}");
+        assert!(
+            out.contains("return Err(__typhon_with_err_0__)"),
+            "out:\n{out}"
+        );
         assert!(
             out.contains("let x = __typhon_with_0__.value"),
             "out:\n{out}"
@@ -4612,8 +4694,10 @@ def run() -> Result[str, str]:
         return Err(\"oops\")
 ";
         let out = expand_with_chains(src);
+        // Uniquified per the multi-chain fix; original name `_err`
+        // becomes `__typhon_with_err_N__` keyed off the binding's tmp.
         assert!(
-            out.contains("let _err = __typhon_with_0__.error"),
+            out.contains("let __typhon_with_err_0__ = __typhon_with_0__.error"),
             "out:\n{out}"
         );
         assert!(out.contains("return Err(\"oops\")"), "out:\n{out}");

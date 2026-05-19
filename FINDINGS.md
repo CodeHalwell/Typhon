@@ -2380,6 +2380,28 @@ write files. Document the breaking change in the next release notes.
 
 ## 56. Examples suite — 27 of 47 fail `tyc check` (gap)
 
+**Status:** **LARGELY FIXED** on `claude/resolve-open-findings-d6EIV`.
+After the upstream fixes in this branch (#37–#52 plus parser support
+for `let (...) =` tuple destructuring, pipe handling for string-
+literal-receiver method calls, and a permissive arity check for
+method calls without name-keyed metadata), the pass rate moved from
+**20/47 → 39/47**. The remaining 8 failures are almost entirely
+example-side issues:
+
+- 5 (`21-cli-tool`, `22-http-requests`, `28-fastapi-server`,
+  `40-llm-tool-use`, `44-multi-agent`): `tyc::unused_import` errors
+  for imports the example never references. Real (and correctly
+  flagged); fix the examples.
+- `25-sqlite-database`: a heterogeneous tuple literal where the
+  inferred element type doesn't widen to the annotation (`tuple[str,
+  str, int, float | None]` vs `tuple[str, str, int, float]`).
+- `45-web-scraper`: `unknown_name 'one'` — actual undefined name.
+- `47-mini-app`: `nullable_use` plus unused imports — real
+  type errors in the example.
+
+These no longer represent compiler bugs blocking the language
+surface.
+
 **Severity:** gap — the shipped example suite doesn't pass the
 shipped checker.
 

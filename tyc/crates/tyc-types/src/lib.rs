@@ -377,6 +377,53 @@ fn is_typevar(t: &Type) -> bool {
     matches!(t, Type::TypeVar(_))
 }
 
+/// Return `true` when this call targets one of the well-known
+/// asyncio entry-points that accept coroutines as direct arguments.
+/// Used by the `missing_await` check (FINDINGS #49) to suppress
+/// false positives on the canonical `asyncio.run(coro())` pattern.
+fn call_targets_coro_acceptor(call: &ruff_python_ast::ExprCall) -> bool {
+    // Match `asyncio.run`, `asyncio.create_task`, `asyncio.ensure_future`,
+    // `asyncio.gather`, `asyncio.wait`, `asyncio.wait_for`, plus the
+    // typhon_runtime spawn helper.
+    if let Expr::Attribute(a) = call.func.as_ref() {
+        let method = a.attr.as_str();
+        let is_coro_method = matches!(
+            method,
+            "run"
+                | "create_task"
+                | "ensure_future"
+                | "gather"
+                | "wait"
+                | "wait_for"
+                | "as_completed"
+                | "spawn"
+        );
+        if !is_coro_method {
+            return false;
+        }
+        // Check the receiver chain ends in `asyncio` or
+        // `typhon_runtime.tasks` (anywhere in the dotted chain).
+        let mut cur = a.value.as_ref();
+        loop {
+            match cur {
+                Expr::Name(n) => {
+                    let s = n.id.as_str();
+                    return s == "asyncio" || s == "typhon_runtime";
+                }
+                Expr::Attribute(inner) => {
+                    let s = inner.attr.as_str();
+                    if s == "asyncio" || s == "tasks" {
+                        return true;
+                    }
+                    cur = inner.value.as_ref();
+                }
+                _ => return false,
+            }
+        }
+    }
+    false
+}
+
 /// Walk a generic-class field-type / arg-type pair and bind any
 /// TypeVar mentioned in the field type to the corresponding shape of
 /// the argument type. Used by the constructor-call inference path
@@ -3254,14 +3301,19 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             // `tyc::missing_await` (FINDINGS #49): a *sync* function
             // calling an `async def` without `await` returns a
             // coroutine, not the declared return type — Python emits
-            // "coroutine was never awaited" at runtime. Restricted to
-            // sync function bodies so the canonical
-            // `asyncio.run(coro())` entry-point pattern at module
-            // scope passes, and so `async def` bodies (which use
-            // `await` naturally) don't trip the diagnostic. The
-            // `inside_await` counter (bumped by the `Expr::Await` arm)
-            // suppresses the check when the call is the operand of
-            // `await`.
+            // "coroutine was never awaited" at runtime. The check is
+            // gated on `in_sync_function` so `async def` bodies (which
+            // use `await` naturally) and module scope are exempt.
+            //
+            // The `inside_await` counter (bumped by the `Expr::Await`
+            // arm) suppresses the check when the call is the operand
+            // of `await`. The arg-walk below additionally bumps
+            // `inside_await` for arguments to known coroutine-accepting
+            // functions like `asyncio.run(coro())`,
+            // `asyncio.create_task(coro())`, `asyncio.gather(...)`,
+            // `asyncio.ensure_future(...)`, `asyncio.wait(...)`,
+            // `asyncio.wait_for(...)` — passing a bare coroutine to
+            // any of these is the canonical entry-point pattern.
             if c.in_sync_function && c.inside_await == 0 {
                 if let Expr::Name(n) = call.func.as_ref() {
                     if c.async_functions.contains(n.id.as_str()) {
@@ -3273,6 +3325,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     }
                 }
             }
+            let suppresses_missing_await = call_targets_coro_acceptor(call);
 
             // Argument access check on the receiver (for things like x.foo()
             // where x could be None).
@@ -3313,10 +3366,21 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         .and_then(|n| c.function_arity_info.get(n));
                     let count_ok = if let Some(info) = arity_info {
                         check_arity_with_info(info, pos_args, kw_args)
-                    } else if variadic {
-                        pos_args.len() >= params.len()
                     } else {
-                        pos_args.len() == params.len()
+                        // No name-keyed arity info — this is a method
+                        // call, a callable-from-value, or a builtin
+                        // generic method. We don't track defaults on
+                        // methods today, so adopt a permissive shape:
+                        // count kw args alongside positional, accept
+                        // any total ≤ params.len() (defaults could
+                        // cover the rest), and require ≥ params.len()
+                        // when the function is variadic.
+                        let total = pos_args.len() + kw_args.len();
+                        if variadic {
+                            total >= params.len()
+                        } else {
+                            total <= params.len()
+                        }
                     };
                     if !count_ok {
                         let name = fn_name.clone().unwrap_or_else(|| "<call>".to_owned());
@@ -3328,6 +3392,9 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // literals (`[]`, `{}`) and nested generic calls pick
                     // up the parameter's element types.
                     let mut actuals: Vec<Type> = Vec::with_capacity(params.len());
+                    if suppresses_missing_await {
+                        c.inside_await = c.inside_await.saturating_add(1);
+                    }
                     for (i, arg) in pos_args.iter().enumerate() {
                         if i >= params.len() {
                             break;
@@ -3363,6 +3430,9 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                             c.mismatch(&params[i], &actual, span);
                         }
                         actuals.push(actual);
+                    }
+                    if suppresses_missing_await {
+                        c.inside_await = c.inside_await.saturating_sub(1);
                     }
                     // PEP 695 inference: bind every TypeVar mentioned in
                     // the formals from the actuals, then substitute in the
@@ -3432,8 +3502,14 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     }
                 }
                 Type::Unknown | Type::Any => {
+                    if suppresses_missing_await {
+                        c.inside_await = c.inside_await.saturating_add(1);
+                    }
                     for a in pos_args.iter() {
                         let _ = infer_expr(c, a);
+                    }
+                    if suppresses_missing_await {
+                        c.inside_await = c.inside_await.saturating_sub(1);
                     }
                     Type::Unknown
                 }
