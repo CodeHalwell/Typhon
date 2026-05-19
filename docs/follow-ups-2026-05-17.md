@@ -261,3 +261,24 @@ delete, signature change).
    re-scanning byte ranges; cross-file go-to-definition jumps
    carry the metadata along, so hover after a jump still renders
    the correct kind.
+
+## May 19 stress-test pass — what landed
+
+The 2026-05-19 stress-test campaign (see `FINDINGS.md` #57–#96)
+surfaced a fresh batch of bugs in the corners of the language. The
+following landed since the May 17 follow-ups; the rest remain
+tracked in `FINDINGS.md`.
+
+| Finding | Area | What changed |
+|---|---|---|
+| #57 / #58 / #70 | Types | `type Alias = …` declarations are now transparent during assignability — including generic aliases (`type StringMap[V] = dict[str, V]`) and union aliases (`type B = int | str`). Cycles terminate at depth 8. |
+| #59 | Generics | Method-level type parameters on `impl[T]` blocks (`def map[U](self, f: Callable[[T], U])`) resolve correctly; both impl-level and method-level params share the function scope. |
+| #60 | Async | `gather:` blocks whose bindings reference earlier bindings in the same block fall back to a sequential `let x = await …` lowering instead of producing broken Python that would `UnboundLocalError` at runtime. Independent bindings keep the `TaskGroup` lowering. |
+| #61 | Resolve | `global` / `nonlocal` declarations are now respected by `tyc::missing_binding_kind`: names declared global/nonlocal in a function skip the let/mut requirement (the outer-scope binding owns the kind). |
+| #62 | Desugar | Mutable defaults in dataclass-backed `class` fields (`tags: list[str] = []`) are rewritten to `dataclasses.field(default_factory=<ctor>)` automatically. Skipped for `model`/`interface`/`class!`. |
+| #63 | Types | `@property` on an `impl`-block method types the attribute access as the property's return type, not the underlying `() -> T` callable. `let area: float = r.area` now type-checks. |
+| #64 | CLI | `tyc migrate` now adds `let` (or `mut` for later-reassigned names) to function-body plain assignments, scoped per-function. Output passes `tyc check` on first try. |
+| #65 (partial) | CLI | `tyc fmt` v1 now collapses runs of internal whitespace and tidies bracket/comma spacing (`def    main(  x  ,    y  )` → `def main(x, y)`). Spacing around `:`, `=`, `->` still left alone — those need bracket-depth awareness and are deferred to the AST-based reprinter (Phase 5). |
+| #66 (diagnostic) | Syntax | Mid-expression `?` (`return Ok(step(x)?)`) emits a targeted `tyc::invalid_question_op` diagnostic with a span in the user's source explaining "lift the inner call to a `let` binding first". The actual mid-expression lowering remains a follow-up. |
+| #84 | Desugar | `lazy let` now triggers the `typhon_runtime` package emission via `has_any_typhon_runtime_import`, which matches both the bare module import and every `typhon_runtime.<sub>` submodule (the lazy-let lowering uses `typhon_runtime.lazy`). |
+| `class!` polish | Desugar | When `class!` synthesises `__init__`, class-level field defaults are stripped from the body (the default is carried only in the generated parameter list). Annotations survive. Avoids double-evaluation that would, for example, register dead `nn.Linear` instances on a PyTorch subclass. |

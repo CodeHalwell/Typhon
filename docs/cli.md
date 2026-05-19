@@ -10,7 +10,7 @@ Typhon ships a single binary, `tyc`, that handles every stage of the workflow. S
 |---------|---------|
 | `tyc build` | Full pipeline: parse, check, analyse, desugar, emit, format. Also bootstraps the Python environment — merges the owned keys (`[project] name/version/requires-python/dependencies`, plus `[dependency-groups].dev` when `[dev-dependencies]` is non-empty) into `pyproject.toml` (preserving any user-managed `[tool.*]` / other `[project]` keys) and runs `uv sync` so `.venv` is ready. `uv sync` failure is downgraded to a warning. |
 | `tyc check` | Up to analyser, no emit. Used by CI. |
-| `tyc fmt` | Format `.ty` source. Wraps `ruff format` applied to a Typhon-aware pretty-printer. |
+| `tyc fmt` | Format `.ty` source. The v1 pass collapses runs of interior whitespace, strips space after `(`/`[` and before `)`/`]`/`,`/`;`, and normalises trailing-whitespace / line-endings. Spacing around `:`, `=`, and `->` is left alone today — those need bracket-depth awareness (slice vs annotation) and are deferred. A full AST-based reprinter is a Phase-5 follow-up. |
 | `tyc lsp` | Run as a Language Server. |
 | `tyc init` | Scaffold a new project: `typhon.toml`, `src/`, `tests/`. |
 | `tyc trace` | Map a Python traceback back to Typhon source via `.py.map` files. |
@@ -71,7 +71,10 @@ Converts typed Python (`.py`) to Typhon (`.ty`) in one pass:
 
 - `Optional[T]` / `T | None` → `T?`
 - Module-level annotated assignments (`x: int = 1`) gain `let` (or `mut` when later reassigned).
+- Function-body plain assignments (`user = find_user(1)`, `total = 0`) gain `let` on first occurrence in the scope, promoted to `mut` when the same name is reassigned later in the same function. Subsequent assignments to the same name in the same scope are left bare (correct re-binding). Class-body annotated assignments are left untouched — those are field declarations, not locals.
 - `@dataclass` decorators and their `from dataclasses import dataclass` are dropped.
+
+The output is designed to pass `tyc check` cleanly out of the box; accumulators / counters surfaced as `mut` are worth a manual review when porting larger codebases.
 
 ```bash
 # Convert a single file (writes app.ty alongside app.py):

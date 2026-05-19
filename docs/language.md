@@ -16,6 +16,21 @@ PEP 695 bracket syntax (`def f[T](x: T) -> T`, `type Vec[T] = list[T]`) — chos
 
 Inference is bidirectional: call sites bind typevars from actual arguments (recursively, e.g. `list[T]` against `list[int]` infers `T = int`; conflicting bindings widen to a union) and substitute them in the return type. Multi-argument constraint solving and bounded-type-var checking are wired up; full variance and higher-kinded forms remain partial. Generics are **type-erased** at emit time; runtime relies on Python's duck typing and (where present) Pydantic validation.
 
+Type parameters on `impl[T]` blocks scope over the methods inside, and methods can introduce additional type parameters of their own:
+
+```python
+class Box[T]:
+    value: T
+
+impl[T] Box[T]:
+    def map[U](self, f: Callable[[T], U]) -> Box[U]:
+        return Box(value=f(self.value))
+```
+
+Both `T` (from the `impl` block) and `U` (from `map`) resolve inside the method body; call-site inference binds `U` from `f`'s return type.
+
+Transparent `type` aliases — including generic ones (`type StringMap[V] = dict[str, V]`) and unions (`type B = int | str`) — are unwrapped during assignability checks, so `Ok[T]` flows into a `Result[Alias, E]` annotation and a literal that satisfies the underlying union flows into the alias.
+
 ### Interfaces (structural)
 
 `interface` declarations are structural contracts, like Python's `typing.Protocol`. The checker verifies that a candidate type provides every required member with compatible signatures, with memoised "assumed subtype" sets to handle recursion. Interfaces emit as `typing.Protocol` subclasses.
@@ -83,6 +98,42 @@ class ApiUser(BaseModel):
 
 `model` emission injects `extra='forbid'` by default — Pydantic's stock `extra='ignore'` silently drops unexpected input, which directly contradicts Typhon's safety pitch. Permissive modes are opt-in via `[emit] model-extra = "allow" | "ignore"` in `typhon.toml`. Pydantic's `frozen=True` is *faux* immutability (it blocks field reassignment but does not freeze nested mutable values); see `let`/`mut` for what Typhon's binding immutability does and does not guarantee.
 
+#### Mutable field defaults
+
+`@dataclass` rejects bare mutable literals at class-definition time (`tags: list[str] = []` raises `ValueError` in Python). Typhon rewrites every `field: T = [] | {} | set() | list() | dict()` on a class that emits as a dataclass into `dataclasses.field(default_factory=<ctor>)` at desugar time, so the literal form just works:
+
+```python
+# Typhon
+class Cart:
+    items: list[str] = []
+    seen: set[int] = set()
+
+# Emitted Python
+import dataclasses
+
+@dataclasses.dataclass(slots=True)
+class Cart:
+    items: list[str] = dataclasses.field(default_factory=list)
+    seen: set[int] = dataclasses.field(default_factory=set)
+```
+
+The rewrite is skipped for `model`, `interface`, and `class!` bodies, where the default's evaluation semantics differ (Pydantic validates, `__init__` is hand-synthesised, etc.).
+
+#### `@property` accessors
+
+`@property` on an `impl`-block method is recognised by the type checker: attribute access against the class resolves to the property's return type (not the underlying `() -> T` callable), so `let area: float = rect.area` type-checks without a parenthesised call.
+
+```python
+class Rect:
+    w: float
+    h: float
+
+impl Rect:
+    @property
+    def area(self) -> float:
+        return self.w * self.h
+```
+
 ### `class!` (raw class)
 
 `class!` is the escape hatch for classes that cannot be expressed as a dataclass: `torch.nn.Module`, `enum.Enum`, `typing.NamedTuple`, `unittest.TestCase`, Django models, SQLAlchemy declarative bases — anything whose base class needs a non-trivial `__init__` to run *before* fields are assigned.
@@ -118,6 +169,7 @@ What `class!` changes versus a plain `class`:
 
 - **No `@dataclass` decorator** is injected. The class is emitted verbatim with whatever bases it declares.
 - **`__init__` is auto-synthesised** when the body declares no `def __init__` and at least one base is present. The synthesised constructor calls `super().__init__()` and then assigns every annotated field through `self`, in source order. Field defaults flow into the parameter signature; fields without defaults are positional, fields with defaults are keyword-or-positional after them.
+- **Class-level field defaults are stripped from the body** when `__init__` is synthesised — the default is carried only in the generated parameter list. Leaving the literal at class scope would evaluate it twice (once at class-definition time as a shared class attribute, then again per-instance in `__init__`), which silently breaks libraries that introspect class attributes — e.g. PyTorch parameter registration would see a dead class-level `Linear(10, 5)` instance. Annotations survive so type checkers still see the field shape.
 - **A hand-written `__init__` is preserved verbatim.** Use this when the base class needs configuration arguments that aren't 1:1 with your declared fields.
 
 When to reach for which class form:
@@ -204,6 +256,15 @@ When `typhon.toml` sets `free-threaded = true`, the analyser emits `ThreadPoolEx
 - `let` is immutable as a binding. Reassignment is a compile error.
 - `mut` is mutable. Parallelisation passes refuse to touch any binding captured as `mut` by a spawned task without explicit synchronisation.
 - Top-level module bindings default to `let` unless declared `mut`.
+- Inside a function, every local binding must declare `let` or `mut` on first occurrence (`tyc::missing_binding_kind` otherwise). The one carve-out is for names declared `global` or `nonlocal` inside the same function: those refer to an outer-scope binding whose `let`/`mut` already lives at the declaration site, so the bareword assignment is accepted.
+
+```python
+mut counter: int = 0
+
+def inc() -> None:
+    global counter
+    counter = counter + 1   # OK — `counter` is declared at module scope
+```
 
 Deep immutability for class instances is an emit-time concern: pass `frozen=True` to the underlying dataclass / Pydantic config. A `freeze` modifier with stronger recursive guarantees may land later; `let` itself stays scoped to bindings.
 
