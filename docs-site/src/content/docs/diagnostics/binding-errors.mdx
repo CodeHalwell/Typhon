@@ -1,6 +1,6 @@
 ---
 title: Binding Errors
-description: Diagnostics around let / mut and binding kinds.
+description: Diagnostics around let / mut, binding kinds, and imports.
 sidebar:
   order: 3
 ---
@@ -21,7 +21,7 @@ def f() -> None:
     let name: str = "Alice"
 ```
 
-Module-level bindings default to `let`; only locals require the keyword.
+Module-level bindings default to `let`; only locals (function and method bodies) require the keyword.
 
 ## `tyc::immutable_assign`
 
@@ -49,11 +49,34 @@ def f() -> None:
     let x: int = 2   # shadows
 ```
 
-## `tyc::shadowing_in_same_scope` (warning)
+## `tyc::unused_import`
 
-(Future-reserved diagnostic for confusing shadowing patterns.)
+An imported name is never used in the module:
+
+```python
+import json    # ❌ never referenced
+import os      # used below
+
+def f() -> str:
+    return os.getcwd()
+```
+
+**Fix:** remove the import, or prefix it with `_` if it is intentionally unused.
+
+Severity is configurable via [`[strictness] unused-import`](/Typhon/configuration/strictness/):
+
+- `"error"` (default) — fails CI on unused imports.
+- `"warn"` — flagged but doesn't fail the build.
+- `"off"` — no check.
+
+The LSP exposes a "Remove unused import" code action that fires on these diagnostics.
+
+## `tyc::shadowing_in_same_scope` (reserved)
+
+Future-reserved diagnostic for confusing shadowing patterns. **Not yet emitted by the compiler.** A `let x` followed by another `let x` in the same scope is currently accepted (Typhon treats it as legitimate shadowing). The diagnostic name is reserved so the eventual rule has a stable code from day one.
 
 ## Where next
 
 - [`let` and `mut` reference](/Typhon/reference/let-mut/) — the keyword spec.
 - [Values and Bindings (tour)](/Typhon/tour/values-bindings/) — teaching page.
+- [`[strictness] unused-import`](/Typhon/configuration/strictness/) — severity knob.

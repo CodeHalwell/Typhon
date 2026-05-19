@@ -15,7 +15,7 @@ If you have written any of the languages on this page, this is the fastest way t
 
 **Different:**
 
-- **Mandatory annotations.** Every parameter and return type must be annotated. `def add(a, b): return a + b` is `tyc::missing_return_type`. Python's `mypy --strict` enforces something similar; Typhon's checker enforces it always, no opt-in.
+- **Mandatory annotations.** Every parameter and return type must be annotated. `def add(a, b): return a + b` is `tyc::missing_annotation`. Python's `mypy --strict` enforces something similar; Typhon's checker enforces it always, no opt-in.
 - **`let` / `mut` on locals.** Inside functions, every local binding declares `let` (immutable) or `mut` (mutable). Module-level bindings default to `let` unless declared `mut`. Python has no equivalent.
 - **`T?` for nullable.** `Optional[T]` and `T | None` are both spelled `T?` in Typhon source. Emitted Python is `T | None` so other tooling agrees.
 - **No implicit `Any`.** `let x = some_untyped_fn()` is a hard error. Wrap in `unsafe:` or annotate explicitly. Python tolerates this; Typhon does not.

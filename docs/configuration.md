@@ -27,6 +27,7 @@ format = true               # post-process through ruff format
 no-implicit-any = true
 unused-import = "error"
 exhaustive-match = "error"
+methods-in-class-body = "warn"  # severity for Rule-4 violations (methods belong in `impl Name:`)
 auto-memoise = false        # opt-in: insert @functools.cache on inferred-pure functions
 auto-gather = false         # opt-in: fold straight-line independent `await` runs into TaskGroup
 auto-parallel = false       # opt-in: rewrite pure list comprehensions to a thread-pool map
@@ -88,9 +89,10 @@ pytest = "8.2"              # bare version → ==8.2
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `no-implicit-any` | bool | Treat implicit `Any` as a hard error outside `unsafe` blocks. |
+| `no-implicit-any` | bool | Reserved — surfaces today as the `tyc::missing_annotation` diagnostic on un-annotated parameters and return types. The flag is parsed for forward compatibility; toggling it does not currently relax the check. |
 | `unused-import` | `"error"` \| `"warn"` \| `"off"` | Severity for unused imports. |
 | `exhaustive-match` | `"error"` \| `"warn"` \| `"off"` | Severity for non-exhaustive `match` over sealed unions. |
+| `methods-in-class-body` | `"error"` \| `"warn"` \| `"off"` | Severity for `tyc::method_in_class_body` (Rule 4: methods live in `impl Name:`, not the class body). Default `"warn"` matches every other nudge diagnostic. Promote to `"error"` to break CI once your codebase has migrated. `"off"` suppresses the diagnostic entirely — useful for codebases still mid-migration. |
 | `auto-memoise` | bool | Whether to apply `@functools.cache` to functions the analyser infers as pure. Default `false`. Caches are *never* inserted silently: even when enabled, the analyser requires all six purity conditions (see [language.md](language.md)). |
 | `auto-gather` | bool | When `true`, runs of two-or-more consecutive independent `name = await callee(...)` statements inside an `async def` are folded into an `asyncio.TaskGroup` so they execute concurrently. Independence is decided by static data-flow on bound names; **every callee must be a same-module `async def` carrying an explicit `@gatherable` decorator** — undecorated async functions and externally-imported callees are left alone, so opting a project into `auto-gather` does not surprise callers that aren't ready to run concurrently. Default `false`. Explicit `gather:` blocks are unaffected. |
 | `auto-parallel` | bool | When `true`, list comprehensions whose element is a pure call are rewritten at build time into a thread-pool map. Combine with `[python] free-threaded` to release the GIL across workers; on stock CPython the rewrite still runs but the GIL serialises workers. Default `false`. |

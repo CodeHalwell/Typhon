@@ -7,7 +7,7 @@ sidebar:
 
 import { Aside } from '@astrojs/starlight/components';
 
-Typhon's collection types are Python's, with one stricter rule: **element types are mandatory**. Bare `list`, bare `dict`, bare `set` are `tyc::implicit_any` errors.
+Typhon's collection types are Python's, with one stricter rule: **element types are mandatory**. A function parameter or return type annotated as bare `list` (without `[T]`) is rejected by `tyc::missing_annotation`; on a `let` / `mut` binding, an empty literal like `let xs = []` infers `list[Any]` and silently flows into whatever consumes it — annotate as `list[T]` to keep the type system honest.
 
 ## `list[T]`
 

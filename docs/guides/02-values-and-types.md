@@ -142,26 +142,18 @@ def find_user(id: int) -> str | None: ...
 
 Existing Python tooling (mypy, pyright, IDEs) sees `str | None` and handles it exactly as you'd expect.
 
-## No implicit `Any`
+## Implicit `Any` — the convention
 
-Typhon refuses to infer `Any` outside an `unsafe` block. This is stricter than TypeScript's `noImplicitAny` — there's no per-value escape hatch, only the lexical region.
+Typhon's long-term intent is to refuse implicit `Any` outside an `unsafe:` region — stricter than TypeScript's `noImplicitAny`. Today the type system *allows* `Any` to flow freely (it's the top type), so an unconstrained import binds silently:
 
 ```python
 import some_untyped_lib
 
 def main() -> None:
-    let data = some_untyped_lib.fetch()    # ❌ infers Any
+    let data = some_untyped_lib.fetch()    # binds to Any silently
 ```
 
-```
-error[tyc::implicit_any]: cannot infer a type for `data`
- ┌─ src/main.ty:4:9
- │
-4 │     let data = some_untyped_lib.fetch()
- │         ^^^^ the right-hand side has type `Any`; annotate or wrap in `unsafe`
-```
-
-Two fixes — pick the one that fits:
+The recommended convention is one of the two patterns below — write them yourself; reviewers will start expecting them, and a future release will enforce them:
 
 ```python
 # Option A: assert the type with an annotation

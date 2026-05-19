@@ -70,7 +70,7 @@ if __name__ == "__main__":
 
 Three things to notice:
 
-- **Return types are required.** `-> None` is not optional — Typhon's `[strictness] no-implicit-any` defaults to `true`. Omit it and `tyc check` will complain with `tyc::missing_return_type`.
+- **Return types are required.** `-> None` is not optional — Typhon's `[strictness] no-implicit-any` defaults to `true`. Omit it and `tyc check` will complain with `tyc::missing_annotation`.
 - **`print` works.** Built-in Python functions are available without ceremony; Typhon is a (stricter) superset of typed Python.
 - **`if __name__ == "__main__":` is unchanged.** Typhon emits idiomatic Python; module entrypoints look identical.
 
@@ -163,11 +163,12 @@ def main():           # ❌ missing return annotation
 ```
 
 ```
-error[tyc::missing_return_type]: function `main` is missing a return type
+error[tyc::missing_annotation]: `return type` on `main` is missing a type annotation
  ┌─ src/main.ty:1:5
  │
 1 │ def main():
- │     ^^^^ add `-> None` (or another type) here
+ │     ^^^^ annotation required here
+ = help: Typhon's Rule 1: annotate every parameter and return type. For a function that returns nothing, write `-> None`.
 ```
 
 Fix: write `def main() -> None:`.
@@ -200,14 +201,19 @@ Fix: `let name: str = "Alice"` or `mut name: str = "Alice"`.
 import some_library
 
 def main() -> None:
-    let data = some_library.fetch()    # ❌ infers Any
+    let data = some_library.fetch()    # infers Any silently
 ```
 
-```
-error[tyc::implicit_any]: cannot infer a type for `data`
+`Any` is the top type — it flows freely through assignments, so the checker doesn't reject the binding above. The recommended convention is to wrap untyped boundaries in `unsafe:` so reviewers can see where the dynamism lives:
+
+```python
+def main() -> None:
+    unsafe:
+        let raw = some_library.fetch()
+    let data: dict[str, int] = dict(raw)    # re-assert at the boundary
 ```
 
-Fix: annotate explicitly (`let data: dict[str, int] = ...`), wrap in `unsafe:`, or write a [`.dty` stub](/Typhon/interop/dty-stubs/) for the library.
+Long-term fixes: write a [`.dty` stub](/Typhon/interop/dty-stubs/) for the library, or annotate the binding explicitly (`let data: dict[str, int] = ...`).
 
 ## What you've learned
 

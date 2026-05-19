@@ -27,7 +27,7 @@ def f() -> int:
 
 What happens:
 
-1. **Inside `unsafe:`**, expressions that would normally infer `Any` bind freely. The checker suppresses `tyc::implicit_any`, `tyc::type_mismatch`, `tyc::nullable_use`, `tyc::interface_isinstance`, `tyc::wrong_arg_count`, `tyc::not_callable`, and `tyc::non_exhaustive_match` inside the block depth.
+1. **Inside `unsafe:`**, expressions that would normally infer `Any` bind freely. The checker suppresses `tyc::type_mismatch`, `tyc::nullable_use`, `tyc::interface_isinstance`, `tyc::arg_count`, `tyc::not_callable`, and `tyc::non_exhaustive_match` inside the block depth.
 2. **Values acquire a hidden `Unsafe[T]` marker.** Visible in diagnostics, not in source.
 3. **Crossing out of the block** into a non-`unsafe` context requires re-assertion: an annotation, a narrowing check, or an explicit cast.
 
@@ -53,11 +53,10 @@ If real codebases show a pattern of `unsafe { single_call() }`, we may revisit. 
 
 Inside `unsafe:`, the checker tracks an `unsafe_depth` counter. While the counter is non-zero, these diagnostics are silenced:
 
-- `tyc::implicit_any` — values that would otherwise infer `Any` bind freely.
 - `tyc::type_mismatch` — assignments / calls with incompatible types are allowed.
 - `tyc::nullable_use` — `T?` values can be used as if `T`.
 - `tyc::interface_isinstance` — runtime `isinstance` against an interface is permitted (caveat: still PEP 544 semantics — attribute-presence only).
-- `tyc::wrong_arg_count` — call-site arity mismatches are tolerated.
+- `tyc::arg_count` — call-site arity mismatches are tolerated.
 - `tyc::not_callable` — invoking a non-callable is tolerated.
 - `tyc::non_exhaustive_match` — `match` on a sealed union without all variants is allowed.
 

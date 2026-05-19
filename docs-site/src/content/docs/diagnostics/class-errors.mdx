@@ -17,7 +17,7 @@ class User:
         self.id = id
 ```
 
-**Fix:** drop the method. The constructor is generated. Use field defaults, or a free function for "convenience constructors". For framework bases that need `__init__`, use `class!`.
+**Fix:** drop the method. The constructor is generated from the field annotations. Use field defaults, or a free function for "convenience constructors". For framework bases that need a hand-written `__init__`, use `class!`.
 
 ## `tyc::frozen_assign`
 
@@ -37,37 +37,19 @@ p.x = 2.0    # ❌
 let q = P(x=2.0)
 ```
 
-## `tyc::missing_self`
-
-A method in `impl` / `extend` is missing the `self` parameter:
-
-```python
-impl User:
-    def display() -> str:    # ❌
-        ...
-```
-
-**Fix:** add `self`.
-
-```python
-impl User:
-    def display(self) -> str:
-        return f"...{self.name}..."
-```
-
 ## `tyc::method_in_class_body`
 
-A `def` appearing in a `class` body (instead of an `impl` block):
+A `def` appearing in a `class` body (instead of an `impl` block). Surfaces as a **warning** by default — set [`[strictness] methods-in-class-body = "error"`](/Typhon/configuration/strictness/) to break CI on this form, or `"off"` to suppress it during migration.
 
 ```python
 class User:
     id: int
 
-    def display(self) -> str:    # ❌ wrong place
+    def display(self) -> str:    # ⚠️ wrong place
         return f"user {self.id}"
 ```
 
-**Fix:** move into an `impl User:` block.
+**Fix:** move into an `impl User:` block at the same scope. Multiple `impl` blocks for one class are merged at desugar.
 
 ```python
 class User:
@@ -77,9 +59,58 @@ impl User:
     def display(self) -> str:
         return f"user {self.id}"
 ```
+
+`self` is auto-injected by the desugar pass, so an `impl` method written as `def display() -> str` still type-checks and emits the correct Python.
+
+## `tyc::duplicate_class`
+
+A `class NAME:` statement re-uses a name that has already been declared at the same scope:
+
+```python
+class User:
+    id: int
+
+class User:    # ❌ redeclaration
+    name: str
+```
+
+Python silently lets the second definition shadow the first; Typhon flags it so the user notices.
+
+**Fix:** rename one of the declarations, or merge the second body into `impl User:` / `extend User:`.
+
+```python
+class User:
+    id: int
+    name: str
+```
+
+## `tyc::impl_unknown_class`
+
+An `impl NAME:` block targets a class that does not exist in the current module:
+
+```python
+impl Account:    # ❌ no class Account in scope
+    def display(self) -> str: ...
+```
+
+The methods would otherwise lower into a free-floating `__typhon_impl_NAME` pseudo-class that the merge pass silently drops, producing dead code.
+
+**Fix:** declare `class Account:` first, or fix the name to match an existing class in this module. `extend Account:` (the alias for user-defined classes) reports the same diagnostic.
+
+## `tyc::extend_builtin`
+
+An `extend` declaration targets a Python built-in type (`str`, `list`, `dict`, …) that cannot be modified at runtime. Typhon handles this safely by extracting each method to a module-level free function and rewriting call sites whose receiver carries a matching static annotation; this diagnostic fires when the rewrite is impossible (e.g. unsupported builtin, conflict with a stdlib method).
+
+```python
+extend dict:
+    def __hash__(self) -> int: ...    # ❌ cannot override builtin dunder
+```
+
+**Fix:** wrap the value in a user-defined class and put the method there, or expose a free function on the module.
 
 ## Where next
 
 - [Classes and Models (tour)](/Typhon/tour/classes/) — teaching page.
 - [`class`, `model`, `class!` reference](/Typhon/reference/classes/) — declaration forms.
 - [`impl` and `extend` reference](/Typhon/reference/impl-extend/) — method attachment.
+- [`[strictness] methods-in-class-body`](/Typhon/configuration/strictness/) — severity knob for Rule 4.

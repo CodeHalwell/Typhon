@@ -12,6 +12,7 @@ import { Aside } from '@astrojs/starlight/components';
 no-implicit-any = true
 unused-import = "error"
 exhaustive-match = "error"
+methods-in-class-body = "warn"
 auto-memoise = false
 auto-gather = false
 auto-parallel = false
@@ -22,9 +23,10 @@ pgo-min-calls = 100
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `no-implicit-any` | bool | `true` | Implicit `Any` is a hard error outside `unsafe:` blocks. |
+| `no-implicit-any` | bool | `true` | Reserved — surfaces today as the [`tyc::missing_annotation`](/Typhon/diagnostics/type-errors/) diagnostic on un-annotated parameters and return types. The flag is parsed for forward compatibility; toggling it does not currently relax the check. |
 | `unused-import` | `"error"` \| `"warn"` \| `"off"` | `"error"` | Severity for unused imports. The LSP offers a "Remove unused import" quick-fix. |
 | `exhaustive-match` | `"error"` \| `"warn"` \| `"off"` | `"error"` | Severity for non-exhaustive `match` over sealed unions. |
+| `methods-in-class-body` | `"error"` \| `"warn"` \| `"off"` | `"warn"` | Severity for [`tyc::method_in_class_body`](/Typhon/diagnostics/class-errors/) — Rule 4: methods live in `impl Name:`, not the class body. Default `"warn"` matches every other nudge diagnostic; promote to `"error"` once a codebase has finished migrating off in-body methods. `"off"` suppresses it entirely. |
 | `auto-memoise` | bool | `false` | Insert `@functools.cache` on every function the analyser infers as pure. **Off by default — caches extend lifetimes invisibly.** |
 | `auto-gather` | bool | `false` | Fold straight-line independent `await` runs into `asyncio.TaskGroup`, but only for `@gatherable`-decorated callees. |
 | `auto-parallel` | bool | `false` | Rewrite pure list comprehensions over large iterables to a `ThreadPoolExecutor.map` (needs `free-threaded`). |
@@ -34,13 +36,14 @@ pgo-min-calls = 100
 
 ## `no-implicit-any`
 
-The flagship strictness rule. Implicit `Any` outside `unsafe:` is a hard error:
+The flagship strictness rule. Today it is enforced indirectly: every parameter and return type must carry an annotation (Rule 1), so the most common path to an implicit `Any` — an un-annotated parameter — is rejected by `tyc::missing_annotation`:
 
 ```python
-let data = some_untyped_lib.fetch()    # ❌ tyc::implicit_any
+def fetch(url):    # ❌ tyc::missing_annotation
+    ...
 ```
 
-Setting `false` would surface this as a warning instead of an error. We strongly recommend leaving it on.
+Inside an `unsafe:` block, type checking is relaxed and `Any` flows freely. We strongly recommend leaving the rule on; toggling it `false` is reserved for a future relaxation pass and has no observable effect today.
 
 ## `unused-import`
 
@@ -57,6 +60,26 @@ The LSP includes a "Remove unused import" code action that fires on these diagno
 Drives the exhaustiveness check on `match` over sealed unions. Default `"error"` — keep it.
 
 Lower to `"warn"` only during big refactors, and raise it back before merging.
+
+## `methods-in-class-body`
+
+Severity for [`tyc::method_in_class_body`](/Typhon/diagnostics/class-errors/) (Rule 4: methods belong in `impl Name:`, not the `class` body). Defaults to `"warn"` so existing codebases can adopt Typhon's `impl`-style without breaking CI overnight.
+
+```python
+class User:
+    id: int
+
+    def display(self) -> str:    # ⚠️ tyc::method_in_class_body
+        return f"user {self.id}"
+```
+
+Three settings:
+
+- `"warn"` (default) — the diagnostic fires as a warning; the type checker still accepts the method, so the build succeeds.
+- `"error"` — promotes the diagnostic to a hard error. Set this once your codebase has finished migrating to `impl Name:` blocks.
+- `"off"` — suppresses the diagnostic entirely. Useful during the transition.
+
+The fix is the same regardless of severity: move the `def` into an `impl ClassName:` block at the same scope. Multiple `impl` blocks for one class are merged at desugar time, so the split is cosmetic.
 
 ## `auto-memoise`
 

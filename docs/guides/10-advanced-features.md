@@ -220,7 +220,7 @@ import some_messy_lib
 
 def main() -> None:
     unsafe:
-        let data = some_messy_lib.fetch()    # would otherwise be a tyc::implicit_any error
+        let data = some_messy_lib.fetch()    # the `unsafe:` region marks the dynamic boundary
         let first = data[0]
         let tag = first.get("tag")
 

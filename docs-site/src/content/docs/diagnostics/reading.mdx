@@ -34,11 +34,12 @@ error[tyc::nullable_use]: cannot pass `str | None` where `str` is required
 
 | Severity | Exit code impact | Typical cause |
 |----------|------------------|---------------|
-| `error` | Sets exit to 2. | Type mismatch, missing return, broken syntax. |
-| `warning` | No exit code change. | Unused import (with `unused-import = "warn"`), `async def` with no `await`. |
+| `error` | Sets exit to 2. | Type mismatch, missing annotation, broken syntax. |
+| `warning` | No exit code change. | Unused import (with `unused-import = "warn"`), `async def` with no `await`, methods in class body. |
+| `advice` | No exit code change. | Missed optimisation hints, e.g. `auto_gather_missed`. |
 | `note` | No exit code change. | Informational; rare. |
 
-`[strictness]` in `typhon.toml` controls some severities — e.g. `unused-import = "error"` promotes the warning to an error.
+`[strictness]` in `typhon.toml` controls some severities — `unused-import = "error"` and `methods-in-class-body = "error"` both promote their respective warnings to errors.
 
 ## Stable codes
 
@@ -46,41 +47,40 @@ Every diagnostic has a `tyc::*` code. The catalog is enumerated across the follo
 
 <CardGrid>
   <Card title="Type & Inference Errors" icon="warning">
-    [→](/Typhon/diagnostics/type-errors/) — `type_mismatch`, `implicit_any`, `not_callable`, `wrong_arg_count`, ...
+    [→](/Typhon/diagnostics/type-errors/) — `missing_annotation`, `type_mismatch`, `arg_count`, `not_callable`, `unknown_name`, `attribute_not_found`, `generic`, `typevar_bound`, `generator_return_type`, `cyclic_type_alias`, `comptime`.
   </Card>
   <Card title="Binding Errors" icon="document">
-    [→](/Typhon/diagnostics/binding-errors/) — `missing_binding_kind`, `immutable_assign`, ...
+    [→](/Typhon/diagnostics/binding-errors/) — `missing_binding_kind`, `immutable_assign`, `unused_import`.
   </Card>
   <Card title="Nullability Errors" icon="puzzle">
-    [→](/Typhon/diagnostics/nullability/) — `nullable_use`, ...
+    [→](/Typhon/diagnostics/nullability/) — `nullable_use`.
   </Card>
   <Card title="Class Errors" icon="setting">
-    [→](/Typhon/diagnostics/class-errors/) — `manual_init`, `frozen_assign`, `missing_self`, ...
+    [→](/Typhon/diagnostics/class-errors/) — `manual_init`, `frozen_assign`, `method_in_class_body`, `duplicate_class`, `impl_unknown_class`, `extend_builtin`.
   </Card>
   <Card title="Result Errors" icon="approve-check">
-    [→](/Typhon/diagnostics/result-errors/) — `invalid_question_op`, `result_error_mismatch`, ...
+    [→](/Typhon/diagnostics/result-errors/) — `invalid_question_op`, `result_error_mismatch`.
   </Card>
   <Card title="Match Errors" icon="puzzle">
-    [→](/Typhon/diagnostics/match-errors/) — `non_exhaustive_match`, ...
+    [→](/Typhon/diagnostics/match-errors/) — `non_exhaustive_match`.
   </Card>
   <Card title="Async Errors" icon="rocket">
-    [→](/Typhon/diagnostics/async-errors/) — `missing_await`, `async_without_await`, ...
+    [→](/Typhon/diagnostics/async-errors/) — `missing_await`, `async_without_await`, `auto_gather_missed`, `interface_isinstance`.
   </Card>
   <Card title="Purity Errors" icon="forward-slash">
-    [→](/Typhon/diagnostics/purity-errors/) — `impure_pure_fn`, ...
+    [→](/Typhon/diagnostics/purity-errors/) — `impure_pure_fn`.
   </Card>
   <Card title="Stub Errors" icon="open-book">
-    [→](/Typhon/diagnostics/stub-errors/) — `stub_mismatch`, ...
+    [→](/Typhon/diagnostics/stub-errors/) — `stub_mismatch`.
+  </Card>
+  <Card title="Compile & Interface Errors" icon="error">
+    [→](/Typhon/diagnostics/compile-errors/) — `io`, `parse`, `interface_not_conforming`, `lazy_usage`.
   </Card>
 </CardGrid>
 
 ## Filtering / formatting
 
-| Flag | Effect |
-|------|--------|
-| `--color {auto,always,never}` | ANSI colour control. |
-| `--quiet` | Suppress diagnostics whose severity is below `error`. |
-| `--verbose` | Add extra context (typically the source span of the related code). |
+`tyc` does not currently expose a global `--quiet` / `--verbose` / `--color` switch — diagnostics always render through miette with its built-in ANSI heuristics. To gate CI on warnings, raise the relevant [`[strictness]`](/Typhon/configuration/strictness/) keys (e.g. `unused-import = "error"`, `methods-in-class-body = "error"`); the promotion happens before any rendering.
 
 The LSP publishes diagnostics directly to your editor; the editor renders them.
 

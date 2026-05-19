@@ -72,9 +72,8 @@ If a `let` / `mut` omits the annotation, the type is inferred from the RHS:
 let x = 1                    # inferred int
 let s = "hello"              # inferred str
 let xs = [1, 2, 3]           # inferred list[int]
-let mixed = [1, "two"]       # ❌ would infer list[int | str] but rejected as implicit_any
-                              # because heterogeneous literals need an explicit annotation
-let empty = []               # ❌ tyc::implicit_any — annotate as list[T]
+let mixed = [1, "two"]       # infers list[int | str]; annotate when the union is unintentional
+let empty = []               # infers list[Any] — annotate as list[T] to keep the element type honest
 ```
 
 For nullable RHS (e.g. `dict.get`), the inferred type is nullable:

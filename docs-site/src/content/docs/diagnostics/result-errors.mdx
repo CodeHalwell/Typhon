@@ -46,9 +46,17 @@ def f() -> Result[int, AppError]:
             return Err(AppError(message=msg))
 ```
 
-## `tyc::result_unused`
+## `tyc::result_unused` (reserved)
 
-A `Result`-returning call's value is discarded (future-reserved diagnostic for `f();` where `f -> Result[...]`).
+Future-reserved diagnostic for a `Result`-returning call whose value is discarded:
+
+```python
+def save() -> Result[None, str]: ...
+
+save()    # would warn: Result not consumed
+```
+
+**Not yet emitted by the compiler.** Today, an ignored `Result` is silently dropped; the diagnostic name is reserved so the eventual rule has a stable code from day one. Use [`?`](/Typhon/reference/question-operator/) or `match` to consume `Result` values today.
 
 ## Where next
 

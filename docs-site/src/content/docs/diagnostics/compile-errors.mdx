@@ -1,0 +1,85 @@
+---
+title: Compile & Interface Errors
+description: Diagnostics emitted by the compiler's structural / IO / interface checks.
+sidebar:
+  order: 10
+---
+
+Diagnostics that don't fit any single category above — file IO, parse failures, interface conformance, and unsupported `lazy` forms.
+
+## `tyc::io`
+
+The compiler could not read a `.ty` / `.dty` / `typhon.toml` file from disk. The message names the offending path and the OS-level cause (missing file, permission denied, …).
+
+```
+error[tyc::io]: cannot read 'src/main.ty': No such file or directory
+```
+
+**Fix:** check that the file exists, is readable, and that the path you passed `tyc check` / `tyc build` is correct.
+
+## `tyc::parse`
+
+A `.ty` (or `.dty`) source file failed to parse. The message text is forwarded from the vendored Ruff parser and points at the exact span that broke parsing.
+
+```python
+def f(:    # ❌ tyc::parse — unexpected `:` after `(`
+    pass
+```
+
+**Fix:** correct the syntax error. Parse failures stop the pipeline before any name resolution or type checking, so this is always the first thing to fix when it appears.
+
+## `tyc::interface_not_conforming`
+
+A value of type `T` is used where an `interface Iface` is expected, but `T` is missing one or more required members (or the member signatures don't match).
+
+```python
+interface Drawable:
+    def draw(self) -> None
+
+class Widget:
+    name: str
+    # ❌ no `draw` method
+
+def render(d: Drawable) -> None: ...
+
+render(Widget(name="x"))    # ❌ Widget does not conform to Drawable
+```
+
+**Fix:** add the missing member(s) — typically inside an `impl T:` block — with matching parameter types and return type:
+
+```python
+impl Widget:
+    def draw(self) -> None:
+        print(self.name)
+```
+
+The check walks the candidate's MRO and matches field types; it does not require an explicit `Widget(Drawable)` base. See [Interfaces](/Typhon/types/interfaces/).
+
+## `tyc::lazy_usage`
+
+A `lazy` construct was written in an unsupported form. The message text names the specific problem.
+
+Supported forms today:
+
+```python
+lazy import np = numpy                            # module-level
+lazy let SETTINGS: Settings = load_settings()     # module-level value
+class Cache:
+    lazy let entries: dict[str, int] = {}         # class-body (becomes @cached_property)
+```
+
+Unsupported forms (rejected with `tyc::lazy_usage`):
+
+```python
+lazy from numpy import array          # ❌ `lazy from ... import ...` not supported
+def f() -> None:
+    lazy let x: int = 1               # ❌ function-body `lazy let` not supported
+```
+
+**Fix:** rewrite to one of the supported forms above. For per-call laziness inside a function body, use a plain function or `functools.cache` directly.
+
+## Where next
+
+- [Lazy reference](/Typhon/reference/lazy/) — the supported forms.
+- [Interfaces](/Typhon/types/interfaces/) — structural conformance rules.
+- [`tyc check`](/Typhon/cli/check/) — the entry point for every compile-time diagnostic.
