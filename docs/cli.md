@@ -8,7 +8,7 @@ Typhon ships a single binary, `tyc`, that handles every stage of the workflow. S
 
 | Command | Purpose |
 |---------|---------|
-| `tyc build` | Full pipeline: parse, check, analyse, desugar, emit, format. Also bootstraps the Python environment — merges `[dependencies]` / `[python] target` from `typhon.toml` into `pyproject.toml` (preserving any user-managed `[tool.*]` / `[project]` keys) and runs `uv sync` so `.venv` is ready. `uv sync` failure is downgraded to a warning. |
+| `tyc build` | Full pipeline: parse, check, analyse, desugar, emit, format. Also bootstraps the Python environment — merges the owned keys (`[project] name/version/requires-python/dependencies`, plus `[dependency-groups].dev` when `[dev-dependencies]` is non-empty) into `pyproject.toml` (preserving any user-managed `[tool.*]` / other `[project]` keys) and runs `uv sync` so `.venv` is ready. `uv sync` failure is downgraded to a warning. |
 | `tyc check` | Up to analyser, no emit. Used by CI. |
 | `tyc fmt` | Format `.ty` source. Wraps `ruff format` applied to a Typhon-aware pretty-printer. |
 | `tyc lsp` | Run as a Language Server. |

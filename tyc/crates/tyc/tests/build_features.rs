@@ -1446,12 +1446,49 @@ fn build_preserves_user_tool_tables_in_pyproject() {
 }
 
 #[test]
-fn build_does_not_fail_when_uv_sync_warning_path_fires() {
-    // The bootstrap downgrades a missing `uv` to a warning — the
-    // codegen output is still useful even if the install step can't
-    // run. We exercise this by inspecting the emitted build artefact:
-    // it must exist regardless of uv state, because that's the
-    // promise of `tyc build`.
+fn build_emits_typhon_runtime_when_only_lazy_import_used() {
+    // A module whose only runtime contact is `lazy import` must still
+    // get `build/typhon_runtime/` emitted — the lowering injects
+    // `from typhon_runtime.lazy import lazy_import as ...`, so the
+    // generated Python imports the runtime package at startup. An
+    // earlier regression matched only the bare `typhon_runtime`
+    // module name and missed dotted submodule imports, producing a
+    // build that fails at startup with `ModuleNotFoundError`.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "lazy import np = numpy\nlet arr: object = np.array([1])\n",
+    );
+    build(tmp.path());
+    assert!(
+        tmp.path().join("build/main.py").exists(),
+        "main.py must be emitted",
+    );
+    assert!(
+        tmp.path().join("build/typhon_runtime").exists(),
+        "typhon_runtime/ package must be emitted when only `lazy import` is used \
+         (the injected `from typhon_runtime.lazy import …` would fail at startup otherwise)",
+    );
+    assert!(
+        tmp.path().join("build/typhon_runtime/lazy.py").exists(),
+        "typhon_runtime/lazy.py must ship with the package",
+    );
+}
+
+#[test]
+fn build_emits_codegen_artefact_regardless_of_bootstrap_outcome() {
+    // The bootstrap step (pyproject.toml merge + `uv sync`) is
+    // best-effort: a missing `uv`, a sync failure, or a transient
+    // network error must not prevent the `.py` artefacts from
+    // landing. The promise of `tyc build` is the codegen output.
+    //
+    // This test doesn't force `uv` off PATH (doing so reliably
+    // across CI runners is fiddly — `PATH=""` breaks coreutils,
+    // and overriding HOME/XDG_BIN can leak); it asserts the
+    // baseline guarantee on whatever state the runner has. The
+    // warning path itself is covered by the `run_uv_sync_warning`
+    // implementation: missing uv → warning, sync failure →
+    // warning, never a non-zero exit.
     let tmp = tempfile::tempdir().unwrap();
     scaffold(tmp.path(), "def main() -> None:\n    print(1)\n");
     build(tmp.path());

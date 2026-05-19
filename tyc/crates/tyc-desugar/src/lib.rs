@@ -385,10 +385,25 @@ fn has_any_typhon_runtime_import(body: &[Stmt]) -> bool {
         Stmt::Import(imp) => imp
             .names
             .iter()
-            .any(|a| a.name.as_str() == "typhon_runtime"),
-        Stmt::ImportFrom(imp) => imp.module.as_ref().map(|m| m.as_str()) == Some("typhon_runtime"),
+            .any(|a| is_typhon_runtime_module(a.name.as_str())),
+        Stmt::ImportFrom(imp) => imp
+            .module
+            .as_ref()
+            .map(|m| is_typhon_runtime_module(m.as_str()))
+            .unwrap_or(false),
         _ => false,
     })
+}
+
+/// True when `name` refers to the `typhon_runtime` package or one of its
+/// submodules (`typhon_runtime.lazy`, `typhon_runtime.tasks`, …).
+/// Matching only the bare package name would miss the `from
+/// typhon_runtime.lazy import lazy_import as …` injection emitted for
+/// `lazy import` lowering, leaving a lazy-import-only module without
+/// the generated `build/typhon_runtime/` package and failing at
+/// startup with `ModuleNotFoundError`.
+fn is_typhon_runtime_module(name: &str) -> bool {
+    name == "typhon_runtime" || name.starts_with("typhon_runtime.")
 }
 
 /// Return `true` if an existing `from typhon_runtime import …` already brings

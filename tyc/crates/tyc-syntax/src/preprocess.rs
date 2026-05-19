@@ -1878,16 +1878,50 @@ pub fn expand_lazy_imports(source: &str) -> String {
     }
 
     // Find the insertion point: after any leading `from __future__ import …`
-    // statements (these must remain at the top of the file).
+    // statements (these must remain at the top of the file) and after a
+    // module docstring if present. Inserting before the docstring would
+    // demote it from `__doc__` to a dead string literal, silently
+    // breaking `help(module)` and any tooling that reads `__doc__`.
     let mut insert_at = 0usize;
-    for (i, line) in emitted_lines.iter().enumerate() {
+    let mut i = 0usize;
+    while i < emitted_lines.len() {
+        let line = &emitted_lines[i];
         let trimmed = line.trim_start();
         if trimmed.starts_with("from __future__ import")
             || trimmed.is_empty()
             || trimmed.starts_with('#')
         {
-            insert_at = i + 1;
+            i += 1;
+            insert_at = i;
             continue;
+        }
+        // Module docstring detection: a triple-quoted string as the next
+        // logical statement. May be single-line (`"""one-liner"""`) or
+        // span multiple lines.
+        if let Some(quote) = docstring_open_quote(trimmed) {
+            // Check whether the opening triple quote also closes on the
+            // same line (after the opener). Strip the leading triple
+            // quote and look for a second occurrence.
+            let rest = &trimmed[3..];
+            if rest.contains(quote) {
+                // Single-line docstring — consumed by this one line.
+                i += 1;
+                insert_at = i;
+                break;
+            }
+            // Multi-line docstring — scan forward until we find the
+            // closing triple quote.
+            i += 1;
+            while i < emitted_lines.len() {
+                let body = &emitted_lines[i];
+                if body.contains(quote) {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            insert_at = i;
+            break;
         }
         break;
     }
@@ -2053,6 +2087,26 @@ fn render_cached_property(indent: &str, binding: &LazyLetBinding) -> String {
         ret = ret,
         expr = binding.expr,
     )
+}
+
+/// If `line` starts with a Python triple-quote (`"""` or `'''`),
+/// optionally preceded by an `r`/`b`/`u`/`rb`/`br` string prefix,
+/// return the quote characters. Used by the header-insertion logic
+/// to recognise a leading module docstring so injected imports don't
+/// land above it (which would demote it from `__doc__` to a no-op
+/// expression statement).
+fn docstring_open_quote(line: &str) -> Option<&'static str> {
+    // Strip an optional Python string prefix (one or two ASCII letters
+    // from the b/r/u/f set). Module docstrings won't use `f`, but it
+    // costs nothing to accept the wider set.
+    let rest = line.trim_start_matches(['r', 'R', 'b', 'B', 'u', 'U']);
+    if rest.starts_with("\"\"\"") {
+        Some("\"\"\"")
+    } else if rest.starts_with("'''") {
+        Some("'''")
+    } else {
+        None
+    }
 }
 
 /// Emit the single-line lowering for `lazy import ALIAS = MODULE`:
@@ -5102,6 +5156,57 @@ def run() -> Result[str, str]:
         assert!(
             out.contains("np = __typhon_lazy_import(\"numpy\")"),
             "trailing comment should not prevent expansion, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn expand_lazy_imports_inserts_header_after_module_docstring_single_line() {
+        // A single-line module docstring must remain the first
+        // statement of the module — inserting the injected header
+        // before it would demote it to a dead expression and break
+        // `__doc__` / `help(module)`.
+        let src = "\"\"\"My module.\"\"\"\nlazy import np = numpy\n";
+        let out = expand_lazy_imports(src);
+        let doc_pos = out.find("\"\"\"My module.\"\"\"").expect("docstring");
+        let import_pos = out
+            .find("from typhon_runtime.lazy import lazy_import")
+            .expect("injected import");
+        assert!(
+            doc_pos < import_pos,
+            "module docstring must precede the injected import; got:\n{out}",
+        );
+    }
+
+    #[test]
+    fn expand_lazy_imports_inserts_header_after_module_docstring_multi_line() {
+        // Same guarantee for a multi-line docstring spanning several lines.
+        let src = "\"\"\"First line.\n\nMore detail.\n\"\"\"\nlazy import np = numpy\n";
+        let out = expand_lazy_imports(src);
+        let doc_close = out.find("More detail.\n\"\"\"").expect("docstring close");
+        let import_pos = out
+            .find("from typhon_runtime.lazy import lazy_import")
+            .expect("injected import");
+        assert!(
+            doc_close < import_pos,
+            "multi-line docstring must fully precede the injected import; got:\n{out}",
+        );
+    }
+
+    #[test]
+    fn expand_lazy_imports_inserts_header_after_future_and_docstring() {
+        // Real-world mixed case: `from __future__` plus a module
+        // docstring. The injected import must land after both.
+        let src =
+            "from __future__ import annotations\n\"\"\"Module.\"\"\"\nlazy import np = numpy\n";
+        let out = expand_lazy_imports(src);
+        let future_pos = out.find("from __future__").expect("__future__");
+        let doc_pos = out.find("\"\"\"Module.\"\"\"").expect("docstring");
+        let import_pos = out
+            .find("from typhon_runtime.lazy import lazy_import")
+            .expect("injected import");
+        assert!(
+            future_pos < doc_pos && doc_pos < import_pos,
+            "order must be __future__ → docstring → injected import; got:\n{out}",
         );
     }
 
