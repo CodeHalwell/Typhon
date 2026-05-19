@@ -3326,15 +3326,17 @@ fn collect_gather_bindings(
             break;
         }
         let body = &raw[line_indent..];
-        let eq = find_assignment_eq(body)?;
-        let name = body[..eq].trim().to_owned();
-        // Strip trailing comments (e.g. `fetch_b(a)  # depends on a`) before
-        // storing the expression.  Without this the comment is spliced into
-        // `create_task(fetch_b(a)  # depends on a)` which makes the closing
-        // paren invisible to the parser and causes a cascade of synthetic
-        // parse errors.  FINDINGS #93.
-        let expr_raw = strip_trailing_comment(body[eq + 1..].trim());
-        let expr = expr_raw.trim().to_owned();
+        // Use scan_line_code_end (which handles triple-quoted strings and raw
+        // strings) to find where code ends and a comment begins.  Only then
+        // run find_assignment_eq on the comment-free slice so that `=` inside
+        // a comment (e.g. `# note: x = 1`) can never be mistaken for the
+        // assignment operator.  FINDINGS #93 — hardened per review.
+        let mut snap = block_state;
+        let code_end = scan_line_code_end(body, &mut snap);
+        let code = body[..code_end].trim_end();
+        let eq = find_assignment_eq(code)?;
+        let name = code[..eq].trim().to_owned();
+        let expr = code[eq + 1..].trim().to_owned();
         if name.is_empty() || expr.is_empty() {
             return None;
         }
@@ -5682,6 +5684,29 @@ def run() -> Result[str, str]:
         assert!(
             out.contains(".create_task(fetch_b())"),
             "create_task call missing or malformed: {out}"
+        );
+    }
+
+    #[test]
+    fn gather_comment_with_equals_does_not_confuse_assignment_parser() {
+        // FINDINGS #93 (hardened): a comment containing `=` must not be seen
+        // by find_assignment_eq.  Previously find_assignment_eq ran on the raw
+        // body including the comment, so `# k=v` would be harmless here only
+        // by coincidence (first `=` wins).  The fix uses scan_line_code_end
+        // first so find_assignment_eq only ever sees comment-free code.
+        let src = "async def f():\n    gather:\n        a = fetch_a()  # k=v style note\n        b = fetch_b()  # result=ok\n";
+        let out = expand_gather_blocks(src);
+        assert!(
+            !out.contains("# k=v"),
+            "comment leaked into lowering: {out}"
+        );
+        assert!(
+            out.contains(".create_task(fetch_a())"),
+            "create_task(fetch_a()) missing: {out}"
+        );
+        assert!(
+            out.contains(".create_task(fetch_b())"),
+            "create_task(fetch_b()) missing: {out}"
         );
     }
 

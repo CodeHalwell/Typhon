@@ -2953,7 +2953,7 @@ Repro: `stress/tests/98_question_in_expr.ty`,
 
 ## 67. `class X(TypedDict):` produces broken Python (bug) ✅ FIXED
 
-**Status:** Fixed in `claude/bold-brown-RR98w` — added `class_inherits_typeddict()` helper
+**Status:** Fixed in PR #64 — added `class_inherits_typeddict()` helper
 in `tyc-desugar/src/lib.rs` and `!is_typeddict` guard in `needs_decorator`; two new tests pass.
 
 **Severity:** bug — `from typing import TypedDict` + a class inheriting
@@ -3434,7 +3434,7 @@ Repro: `stress/tests/101_lazy_let_circular.ty`,
 
 ## 85. `auto-gather = true` + `@gatherable` callees produce no rewrite (gap) ✅ FIXED
 
-**Status:** Fixed in `claude/bold-brown-RR98w` — `parse_candidate()` in `tyc-analyse/src/auto_gather.rs`
+**Status:** Fixed in PR #64 — `parse_candidate()` in `tyc-analyse/src/auto_gather.rs`
 now handles `Stmt::AnnAssign` (annotated `let x: T = await f()`) in addition to bare `Stmt::Assign`;
 new test `annotated_let_awaits_are_folded` passes.
 
@@ -3656,9 +3656,10 @@ Repro: `stress/builds/41_main_entry/`, plus every test in
 
 ## 93. Inline comment inside a `gather:` body causes parse error in emitted Python (bug) ✅ FIXED
 
-**Status:** Fixed in `claude/bold-brown-RR98w` — `collect_gather_bindings()` in
-`tyc-syntax/src/preprocess.rs` now calls `strip_trailing_comment()` on the binding RHS before
-storing it; new test `gather_inline_comment_stripped_from_binding` passes.
+**Status:** Fixed in PR #64 — `collect_gather_bindings()` in `tyc-syntax/src/preprocess.rs`
+now uses `scan_line_code_end()` (triple-quote-aware) to strip comments before calling
+`find_assignment_eq`, preventing both comment leakage into `create_task(...)` and `=` inside
+comments from confusing the assignment parser; two new tests pass.
 
 **Severity:** bug — adding a comment to a working `gather:` block breaks
 it.

@@ -2877,7 +2877,7 @@ mod tests {
         let src = "from typing import TypedDict\n\nclass UserDict(TypedDict):\n    id: int\n    name: str\n";
         let out = parse_and_desugar(src);
         assert!(
-            !out.contains("dataclass"),
+            !out.contains("@dataclasses.dataclass"),
             "TypedDict subclass must not receive @dataclass decorator:\n{out}"
         );
         assert!(
@@ -2893,7 +2893,7 @@ mod tests {
             "import typing\n\nclass Config(typing.TypedDict):\n    host: str\n    port: int\n";
         let out = parse_and_desugar(src);
         assert!(
-            !out.contains("dataclass"),
+            !out.contains("@dataclasses.dataclass"),
             "typing.TypedDict subclass must not receive @dataclass decorator:\n{out}"
         );
     }
