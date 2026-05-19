@@ -1393,7 +1393,7 @@ class Foo:
     }
 
     #[test]
-    fn build_lazy_import_expands_to_proxy() {
+    fn build_lazy_import_expands_to_runtime_helper_call() {
         let tmp = tempfile::tempdir().unwrap();
         // Use `np` after the lazy import so the unused-import check passes.
         let src = "lazy import np = numpy\nlet arr: object = np.array([1, 2, 3])\n";
@@ -1405,18 +1405,33 @@ class Foo:
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
-        // The lazy import must be expanded to a proxy class; the raw `lazy import`
-        // syntax must not appear in the emitted Python.
+        // The lazy import must be expanded; the raw `lazy import np = …`
+        // Typhon syntax must not appear in the emitted Python. (Note the
+        // injected runtime header is `from typhon_runtime.lazy import
+        // lazy_import as …`, which also contains the substring
+        // "lazy import" — so the check is on the full Typhon form.)
         assert!(
-            !py.contains("lazy import"),
+            !py.contains("lazy import np ="),
             "lazy import must be expanded; got:\n{py}"
         );
-        // `expand_lazy_imports` generates `class __TyphonLazy_{alias}_` as the
-        // proxy class name — assert on this specific marker so the test would
-        // catch a regression to a plain `import numpy as np` instead.
+        // Today's emission delegates to the runtime helper — one header
+        // import plus one short call per lazy module — instead of a
+        // 30-line bespoke proxy class. The runtime wraps the stdlib's
+        // `importlib.util.LazyLoader`, so submodule loading and
+        // `isinstance(np, ModuleType)` work out of the box.
         assert!(
-            py.contains("__TyphonLazy_np_"),
-            "lazy import must emit the __TyphonLazy_np_ proxy class; got:\n{py}"
+            py.contains("from typhon_runtime.lazy import lazy_import as __typhon_lazy_import"),
+            "lazy import must inject the runtime helper import; got:\n{py}"
+        );
+        assert!(
+            py.contains("np = __typhon_lazy_import(\"numpy\")"),
+            "lazy import must lower to a __typhon_lazy_import call; got:\n{py}"
+        );
+        // The old per-import proxy class is gone — assert that the
+        // 30-line bespoke form has not crept back in.
+        assert!(
+            !py.contains("__TyphonLazy_"),
+            "old proxy class form must not be emitted; got:\n{py}"
         );
     }
 
