@@ -165,6 +165,132 @@ fn dict_get_two_arg_mismatched_default_still_rejects_non_nullable_target() {
     );
 }
 
+#[test]
+fn duplicate_class_emits_diagnostic() {
+    // FINDINGS #77: two `class Foo:` declarations in the same module must
+    // surface as `tyc::duplicate_class` rather than silently shadowing.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("dup.ty"),
+        "class Foo:\n    a: int\n\nclass Foo:\n    b: str\n\ndef main() -> None:\n    print(\"ok\")\n",
+    )
+    .unwrap();
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(!out.status.success(), "expected duplicate_class to fail check");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let combined = format!("{stderr}{stdout}");
+    assert!(
+        combined.contains("tyc::duplicate_class"),
+        "expected tyc::duplicate_class in output, got: {combined}"
+    );
+}
+
+#[test]
+fn impl_unknown_class_emits_diagnostic() {
+    // FINDINGS #78: `impl UnknownClass:` for a class that doesn't exist
+    // must fire `tyc::impl_unknown_class` rather than emitting dead code.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("imp.ty"),
+        "impl UnknownClass:\n    def hello(self) -> None:\n        print(\"hi\")\n\n\
+            def main() -> None:\n    print(\"ok\")\n",
+    )
+    .unwrap();
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(!out.status.success(), "expected impl_unknown_class to fail check");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        combined.contains("tyc::impl_unknown_class"),
+        "expected tyc::impl_unknown_class in output, got: {combined}"
+    );
+}
+
+#[test]
+fn cyclic_type_alias_emits_diagnostic() {
+    // FINDINGS #81: `type A = B; type B = A` forms a cycle. No concrete
+    // type can ever satisfy it; reject at check time instead of letting
+    // Python's lazy alias evaluation defer the error indefinitely.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("cyc.ty"),
+        "type A = B\ntype B = A\n\ndef main() -> None:\n    print(\"ok\")\n",
+    )
+    .unwrap();
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(!out.status.success(), "expected cyclic_type_alias to fail check");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        combined.contains("tyc::cyclic_type_alias"),
+        "expected tyc::cyclic_type_alias in output, got: {combined}"
+    );
+}
+
+#[test]
+fn async_without_await_emits_warning() {
+    // FINDINGS #83: an `async def` body that never `await`s should fire
+    // a `tyc::async_without_await` warning. The warning must not block
+    // a check from succeeding (it's an advisory, not an error).
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("quiet.ty"),
+        "async def quiet() -> int:\n    return 1\n\n\
+            def main() -> None:\n    print(\"ok\")\n",
+    )
+    .unwrap();
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(
+        out.status.success(),
+        "async_without_await is a warning; check should still succeed"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        combined.contains("tyc::async_without_await"),
+        "expected tyc::async_without_await in output, got: {combined}"
+    );
+}
+
+#[test]
+fn async_with_await_does_not_warn() {
+    // Negative case: an `async def` that actually `await`s something must
+    // not produce the warning. Use `asyncio.sleep(0)` so we have an
+    // `await` site without a second `async def` that would itself fire
+    // `async_without_await`.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("awaits.ty"),
+        "import asyncio\n\n\
+            async def outer() -> int:\n    \
+                await asyncio.sleep(0)\n    \
+                return 1\n\n\
+            def main() -> None:\n    print(\"ok\")\n",
+    )
+    .unwrap();
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(out.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !combined.contains("tyc::async_without_await"),
+        "did not expect tyc::async_without_await for a body that awaits, got: {combined}"
+    );
+}
+
 // ── tyc fmt ──────────────────────────────────────────────────────────────────
 
 #[test]

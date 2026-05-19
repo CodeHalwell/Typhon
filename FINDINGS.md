@@ -3211,6 +3211,15 @@ Repro: `stress/tests/120_shadowing.ty`.
 
 ## 77. Class redeclaration accepted silently (bug)
 
+**Status:** **FIXED** on `claude/add-library-autocomplete-1N2iS`. Added
+`tyc::duplicate_class` to `tyc-diagnostics`; the class-collection pass
+in `tyc-types` now tracks first-sighting of each user-declared class
+name and fires the diagnostic on the second declaration. Synthesised
+pseudo-classes (`__typhon_impl_*`, `__TyphonLazy_*`) are exempt because
+multiple `impl Foo:` blocks legitimately produce multiple stubs. Help
+text suggests merging into `impl Foo:` / `extend Foo:`. Regression test
+`duplicate_class_emits_diagnostic` in `tyc/tests/pipeline.rs`.
+
 **Severity:** bug — `class Foo: …; class Foo: …` should be at least a
 warning, ideally an error.
 
@@ -3235,6 +3244,18 @@ Repro: `stress/tests/93_redeclare.ty`.
 ---
 
 ## 78. `impl UnknownClass:` for undefined class accepted silently (bug)
+
+**Status:** **FIXED** on `claude/add-library-autocomplete-1N2iS`. Added
+`tyc::impl_unknown_class`. The class-collection pass walks every
+`__typhon_impl_*` pseudo-class and, when the suffix doesn't name a
+known user class, fires the diagnostic with the original class name
+restored in the message. Caveat: the source preview currently anchors
+on the preprocessor-synthesised `class __typhon_impl_X` line because
+the offsets are post-preprocess; the column points at the correct
+identifier but the rendered preview line is a generated stub. A
+source-map round-trip back to the user's `impl NAME:` line is a
+worthwhile follow-up (same family as the gather: span leak from
+prior findings). Regression test `impl_unknown_class_emits_diagnostic`.
 
 **Severity:** bug — typo in a class name silently produces dead code.
 
@@ -3299,6 +3320,14 @@ Repro: `stress/tests/80_named_args.ty`.
 
 ## 81. Circular `type` alias accepted silently (gap)
 
+**Status:** **FIXED** on `claude/add-library-autocomplete-1N2iS`. Added
+`tyc::cyclic_type_alias`. A new `detect_cyclic_type_aliases` pass in
+`tyc-types` builds the alias-reference graph (chasing `Name`,
+`Subscript`, and `BinOp` heads in each RHS) and DFS-walks from every
+declared alias looking for a path back to itself. Reaches transitive
+cycles too — `type A = list[B]`, `type B = dict[str, A]` is detected.
+Regression test `cyclic_type_alias_emits_diagnostic`.
+
 **Severity:** gap — `type A = B; type B = A` should fail at resolve time.
 
 ```python
@@ -3339,6 +3368,16 @@ Repro: `stress/tests/73_return_paths.ty`.
 ---
 
 ## 83. `async def` with no `await` doesn't fire `async_without_await` (gap)
+
+**Status:** **FIXED** on `claude/add-library-autocomplete-1N2iS`. Added
+`tyc::async_without_await` (severity `Warning`) and a `body_has_await`
+helper that walks an async function body looking for `Expr::Await`,
+`async for`, and `async with`. The class-collection pass fires the
+warning on any `async def` whose body has none. Nested lambdas /
+inner async defs don't satisfy the outer body. Regression tests
+`async_without_await_emits_warning` (positive, asserts the warning
+fires but `tyc check` still exits 0) and `async_with_await_does_not_warn`
+(negative).
 
 **Severity:** gap — the diagnostic is documented as a warning, but doesn't
 fire.
