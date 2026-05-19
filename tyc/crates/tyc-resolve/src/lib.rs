@@ -642,6 +642,61 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    /// Advice-level diagnostic for FINDINGS #92: a top-level
+    /// `def main() -> None:` is defined but `main` is never
+    /// referenced anywhere in the module. The script will compile
+    /// and run without output, which is almost always a mistake —
+    /// the canonical Python entry pattern is
+    /// `if __name__ == "__main__": main()`.
+    ///
+    /// Suppressed when `main` is referenced (even from a comment-
+    /// stripped `if` block), or when the module also defines a
+    /// classifier name like `__all__` that would suggest a library
+    /// shape (in which case the user is exporting `main` rather
+    /// than running it).
+    fn report_main_not_called(&mut self) {
+        // Find the module-level `main` binding, if any. Module scope is
+        // scope id 0.
+        let module_scope = &self.scopes[0];
+        let main_binding = match module_scope
+            .bindings
+            .iter()
+            .find(|b| b.name == "main" && b.kind == BindingKind::Function)
+        {
+            Some(b) => b.clone(),
+            None => return,
+        };
+        // Suppress when the module looks like a library (has `__all__`).
+        if module_scope.bindings.iter().any(|b| b.name == "__all__") {
+            return;
+        }
+        // Any reference to `main` other than the def site counts as a
+        // use. References track only call sites and bare-name reads,
+        // not the def site itself.
+        let has_use = self
+            .references
+            .iter()
+            .any(|r| r.name == "main" && r.span != main_binding.span);
+        if has_use {
+            return;
+        }
+        let length = main_binding
+            .span
+            .1
+            .saturating_sub(main_binding.span.0)
+            .max(1);
+        // Stored as a warning so it flows through the existing
+        // Diagnostics channels; the diagnostic itself carries
+        // `severity(Advice)` so miette renders it as advice rather
+        // than warning when displayed.
+        self.diagnostics.push_warning(TycError::main_not_called(
+            &self.path,
+            self.source,
+            main_binding.span.0,
+            length,
+        ));
+    }
+
     /// Translate a preprocessed-source byte offset to a 0-based line
     /// index, computing (and caching) the line-start table on first
     /// use. Lazily computed because most resolves don't need it.
@@ -712,6 +767,7 @@ pub fn resolve_module_with(
 
     r.report_unknown_names();
     r.report_unused_imports();
+    r.report_main_not_called();
 
     let resolved = ResolvedModule {
         scopes: std::mem::take(&mut r.scopes),
@@ -2318,6 +2374,55 @@ def foo():
         assert!(d.has_errors());
         let msg = format!("{}", d.errors()[0]);
         assert!(msg.contains("cannot find 'z'"), "got {}", msg);
+    }
+
+    #[test]
+    fn main_defined_but_not_called_warns() {
+        // FINDINGS #92: a top-level `def main()` with no call site
+        // should produce the `tyc::main_not_called` advice diagnostic
+        // (stored as a warning).
+        let (_m, d) = resolve("def main() -> None:\n    print(\"hi\")\n");
+        assert!(
+            d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::MainNotCalled { .. })),
+            "expected MainNotCalled warning; got {:?}",
+            d.warnings()
+        );
+    }
+
+    #[test]
+    fn main_called_at_module_level_is_clean() {
+        let src = "def main() -> None:\n\
+                   \x20   print(\"hi\")\n\
+                   \n\
+                   if __name__ == \"__main__\":\n\
+                   \x20   main()\n";
+        let (_m, d) = resolve(src);
+        assert!(
+            !d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::MainNotCalled { .. })),
+            "main() in __name__ block must suppress the diagnostic: {:?}",
+            d.warnings()
+        );
+    }
+
+    #[test]
+    fn module_with_all_export_suppresses_main_not_called() {
+        // Library shape: `__all__` lists exported names. A `main`
+        // declared for export shouldn't trigger the advice.
+        let src = "__all__ = [\"main\"]\n\
+                   def main() -> None:\n\
+                   \x20   print(\"hi\")\n";
+        let (_m, d) = resolve(src);
+        assert!(
+            !d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::MainNotCalled { .. })),
+            "module with __all__ must suppress the diagnostic: {:?}",
+            d.warnings()
+        );
     }
 
     #[test]

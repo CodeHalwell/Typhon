@@ -3918,6 +3918,23 @@ Repro: `stress/tests/110_let_no_init.ty`.
 
 ## 92. No diagnostic when `def main()` is defined but never called (papercut)
 
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. Took
+option 1 (advice diagnostic) from the original finding. Added
+`tyc::main_not_called` with `severity(Advice)` so it renders as
+advice in miette output but flows through the existing warning
+channel. A new `Resolver::report_main_not_called` pass runs after
+`report_unused_imports`: it locates a module-level
+`BindingKind::Function` named `main`, checks for any reference
+(other than the def site), and suppresses the advice when the
+module also defines `__all__` (library-shape modules legitimately
+export `main` without calling it). Regression tests
+`main_defined_but_not_called_warns`,
+`main_called_at_module_level_is_clean`, and
+`module_with_all_export_suppresses_main_not_called`. Option 2
+(auto-emit the entry block) was deferred — emitting code that
+the user didn't write would surprise the half-of-users who don't
+want it, so the advice is the safer first step.
+
 **Severity:** papercut — common newcomer mistake; canonical Typhon
 programs need an explicit `if __name__ == "__main__": main()` block,
 which isn't obvious from the cheat-sheet table.

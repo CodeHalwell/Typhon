@@ -637,6 +637,25 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A top-level `def main()` is defined but is never called from
+    /// the module. Common newcomer mistake — the script's `main`
+    /// function never runs, leaving the build apparently successful
+    /// but producing no output. Surfaced as advice (not an error) so
+    /// existing library-style modules with a `main` symbol that's
+    /// imported elsewhere aren't broken.
+    #[error("`main` is defined but never called in this module")]
+    #[diagnostic(
+        severity(Advice),
+        code(tyc::main_not_called),
+        help("Add `if __name__ == \"__main__\":\\n    main()` at the end of the module (the standard Python script-entry pattern) so the script runs when invoked directly.")
+    )]
+    MainNotCalled {
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("`main()` is never invoked")]
+        span: SourceSpan,
+    },
+
     /// A `class NAME:` statement re-uses a name that has already been
     /// declared at the same scope. Python silently lets the second
     /// definition shadow the first; Typhon flags it so the user can
@@ -1298,6 +1317,19 @@ impl TycError {
     ) -> Self {
         Self::AutoGatherMissed {
             missing: missing.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::MainNotCalled`] advice diagnostic.
+    pub fn main_not_called(
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::MainNotCalled {
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }
