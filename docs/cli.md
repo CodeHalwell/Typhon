@@ -253,4 +253,6 @@ tyc sync --dry-run
 
 ## Editor integration
 
-`tyc lsp` runs on stdio and speaks LSP. The reference VS Code extension wires it up; any LSP-aware editor can use it directly. Diagnostics, hover, and (over time) completions and code actions are exposed through the same Salsa-backed query engine the CLI uses.
+`tyc lsp` runs on stdio and speaks LSP. The reference VS Code extension wires it up; any LSP-aware editor can use it directly. Diagnostics, hover, go-to-definition, completion, and code actions are exposed through the same Salsa-backed query engine the CLI uses.
+
+Completion has two modes. Open completion (cursor outside any member access) returns every binding visible from the cursor's scope plus the Typhon keyword and common-builtin sets. **Member-access completion** triggers on `.`: when the receiver resolves to an `import` binding for one of the curated stdlib modules (`os`, `os.path`, `sys`, `json`, `math`, `re`, `pathlib`, `datetime`, `collections`, `itertools`, `functools`, `typing`, `asyncio`, `logging`, `dataclasses`), the popup surfaces that module's public members with signature and one-line docs. Aliased imports (`import numpy as np`, `import collections as c`) resolve back to the source module before lookup. Dotted submodule access (`os.path.<TAB>`) is supported. Mid-keystroke buffers that don't parse — the typical state right after typing `.` — go through a single-character fix-up so the resolver can still see the surrounding imports.
