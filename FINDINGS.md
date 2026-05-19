@@ -2579,6 +2579,14 @@ generated Python, which is the wrong source-of-truth to point at the user).
 
 ## 57. Type alias of a union rejects literals that the union accepts (bug)
 
+**Status:** **FIXED**. `Checker::is_assignable` now calls `unwrap_alias`
+on both sides before retrying the structural check (see
+`tyc/crates/tyc-types/src/lib.rs:1267`), and a second pass in
+`Checker::new_from_body` resolves the alias RHS once every class name is
+known so forward-referenced aliases work. Verified against the
+finding's repro — `def f(x: B) -> int: return 1` accepts both `f(5)`
+and `f("x")`.
+
 **Severity:** bug — sealed-union ergonomics are broken whenever an alias is
 involved.
 
@@ -2603,6 +2611,10 @@ Repro: `tyc check stress/tests/67b_union_simple.ty`.
 
 ## 58. `Ok[T]` not assignable to `Result[Alias, E]` when `Alias` is a transparent type alias (bug)
 
+**Status:** **FIXED** by the same `unwrap_alias` wiring as #57. Repro
+(`def build_report() -> Result[Report, str]: return Ok(ReportData(...))`)
+now type-checks clean.
+
 **Severity:** bug — breaks the canonical `Result` pattern any time the
 success type is aliased.
 
@@ -2625,6 +2637,12 @@ Repro: `tyc check stress/tests/05b_type_alias_result.ty`.
 ---
 
 ## 59. Method-level type parameters on `impl[T]` blocks are not in scope (bug)
+
+**Status:** **FIXED**. The `impl[T] Box[T]:` preprocessor expansion
+(see #3) already forwards the type parameters onto the pseudo-class
+header; per-method PEP 695 type params (`def map[U](...)`) are now
+also bound in the method's scope by the resolver. Verified against the
+cheat-sheet example.
 
 **Severity:** bug, high impact — this is the verbatim cheat-sheet example
 for `Box[T].map`.
@@ -2654,6 +2672,14 @@ Repro: `tyc check stress/tests/09b_method_generics.ty`.
 ---
 
 ## 60. `gather:` with dependent bindings builds clean and crashes at runtime (bug, severe)
+
+**Status:** **FIXED**. The desugarer now detects when a later `gather:`
+binding references an earlier one (`b = fetch_b(a)` after
+`a = fetch_a()`) and falls back to sequential `await`s instead of an
+`asyncio.TaskGroup`. Independent bindings still lower to a parallel
+`TaskGroup` with `create_task(...)` + `.result()` reads. Verified
+end-to-end against both shapes.
+
 
 **Severity:** bug, severe — silent compile, runtime `UnboundLocalError`.
 
@@ -2687,6 +2713,13 @@ Repro: `tyc check && tyc build && python3.13 build/main.py` on
 
 ## 61. `global` / `nonlocal` declarations don't suppress `missing_binding_kind` (bug)
 
+**Status:** **FIXED**. The resolver now recognises `global NAME` /
+`nonlocal NAME` declarations and treats subsequent bare assignments as
+re-binds of the outer-scope `mut`, not as fresh bindings requiring
+`let`/`mut`. Verified end-to-end with `mut counter: int = 0` +
+`global counter; counter = counter + 1` — no `missing_binding_kind`
+fires.
+
 **Severity:** bug, high impact — module-level mutable state via `global`
 is unusable.
 
@@ -2708,6 +2741,12 @@ Repro: `stress/tests/48_module_const.ty`, `stress/tests/36_global_nonlocal.ty`.
 ---
 
 ## 62. Mutable defaults in `class` fields produce runtime `ValueError` (bug)
+
+**Status:** **FIXED**. The emitter chose option 2 from the original
+finding — `tags: list[str] = []` now lowers to
+`tags: list[str] = dataclasses.field(default_factory=list)` (verified by
+inspecting `build/main.py` from the repro). Likewise for `dict` and
+`set` literal defaults.
 
 **Severity:** bug — `tyc check` is silent; `tyc build` succeeds;
 `python3.13 build/main.py` crashes at class-definition time.
@@ -2753,6 +2792,12 @@ Repro: `stress/tests/75_class_default.ty`.
 
 ## 63. `@property` access typed as the underlying callable, not the property value (bug)
 
+**Status:** **FIXED**. The attribute-access path in `infer_expr` (see
+`tyc/crates/tyc-types/src/lib.rs:3716`) now detects the `@property`
+decorator on the resolved method and returns the underlying return
+type instead of a bound-method handle. The same fix flows through
+`TypeVar`-bounded receivers.
+
 **Severity:** bug, high impact — `@property` is unusable.
 
 ```python
@@ -2779,6 +2824,14 @@ Repro: `stress/tests/47_property.ty`.
 ---
 
 ## 64. `tyc migrate` produces output that fails `tyc check` (bug, high impact)
+
+**Status:** **FIXED**. `tyc migrate` now correctly infers `let` (default)
+vs `mut` (reassigned within the function) for function-body locals,
+lifts module-level bindings to `let`, and rewrites
+`Optional[T]` to `T?`. Verified by round-tripping the FINDINGS repro
+through `tyc migrate` and re-running `tyc check` on the output — clean
+pass.
+
 
 **Severity:** bug — the migrator is the documented entrypoint for moving
 Python code to Typhon, and its output isn't a valid Typhon program.
@@ -2993,6 +3046,13 @@ Repro: `stress/tests/109_huge_generic.ty`.
 
 ## 70. Generic type alias not transparent for assignability (bug)
 
+**Status:** **FIXED** by the same alias-unwrap wiring as #57/#58.
+`unwrap_alias_inner` handles parametric aliases by substituting the
+alias's type parameters with the application's actual arguments
+(`tyc/crates/tyc-types/src/lib.rs:1372`). Verified with
+`type StringMap[V] = dict[str, V]` accepting a `dict[str, int]` literal
+through a `StringMap[int]` annotation.
+
 **Severity:** bug — same family as #57/#58, parametric form.
 
 ```python
@@ -3008,6 +3068,16 @@ Repro: `stress/tests/95_generic_class_alias.ty`.
 ---
 
 ## 71. `dict.get(k, default)` two-arg form not narrowed (bug)
+
+**Status:** **FIXED** on `claude/add-library-autocomplete-1N2iS`. The
+call-inference path for `Expr::Call` now detects `<dict[K, V]>.get(k,
+default)` with two positional args and narrows the return type to `V`
+when `default` is V-compatible, or `V | type(default)` when it isn't
+(`tyc/crates/tyc-types/src/lib.rs` Call arm). The one-arg form still
+produces `V | None` because `builtin_generic_method` is unchanged.
+Regression tests landed in `tyc/crates/tyc/tests/pipeline.rs` as
+`dict_get_two_arg_narrows_to_v` and
+`dict_get_two_arg_mismatched_default_still_rejects_non_nullable_target`.
 
 **Severity:** bug — `V | None` is correct for the one-arg form, but the
 two-arg form should narrow to `V` when `default: V`.
@@ -3141,6 +3211,15 @@ Repro: `stress/tests/120_shadowing.ty`.
 
 ## 77. Class redeclaration accepted silently (bug)
 
+**Status:** **FIXED** on `claude/add-library-autocomplete-1N2iS`. Added
+`tyc::duplicate_class` to `tyc-diagnostics`; the class-collection pass
+in `tyc-types` now tracks first-sighting of each user-declared class
+name and fires the diagnostic on the second declaration. Synthesised
+pseudo-classes (`__typhon_impl_*`, `__TyphonLazy_*`) are exempt because
+multiple `impl Foo:` blocks legitimately produce multiple stubs. Help
+text suggests merging into `impl Foo:` / `extend Foo:`. Regression test
+`duplicate_class_emits_diagnostic` in `tyc/tests/pipeline.rs`.
+
 **Severity:** bug — `class Foo: …; class Foo: …` should be at least a
 warning, ideally an error.
 
@@ -3165,6 +3244,18 @@ Repro: `stress/tests/93_redeclare.ty`.
 ---
 
 ## 78. `impl UnknownClass:` for undefined class accepted silently (bug)
+
+**Status:** **FIXED** on `claude/add-library-autocomplete-1N2iS`. Added
+`tyc::impl_unknown_class`. The class-collection pass walks every
+`__typhon_impl_*` pseudo-class and, when the suffix doesn't name a
+known user class, fires the diagnostic with the original class name
+restored in the message. Caveat: the source preview currently anchors
+on the preprocessor-synthesised `class __typhon_impl_X` line because
+the offsets are post-preprocess; the column points at the correct
+identifier but the rendered preview line is a generated stub. A
+source-map round-trip back to the user's `impl NAME:` line is a
+worthwhile follow-up (same family as the gather: span leak from
+prior findings). Regression test `impl_unknown_class_emits_diagnostic`.
 
 **Severity:** bug — typo in a class name silently produces dead code.
 
@@ -3229,6 +3320,14 @@ Repro: `stress/tests/80_named_args.ty`.
 
 ## 81. Circular `type` alias accepted silently (gap)
 
+**Status:** **FIXED** on `claude/add-library-autocomplete-1N2iS`. Added
+`tyc::cyclic_type_alias`. A new `detect_cyclic_type_aliases` pass in
+`tyc-types` builds the alias-reference graph (chasing `Name`,
+`Subscript`, and `BinOp` heads in each RHS) and DFS-walks from every
+declared alias looking for a path back to itself. Reaches transitive
+cycles too — `type A = list[B]`, `type B = dict[str, A]` is detected.
+Regression test `cyclic_type_alias_emits_diagnostic`.
+
 **Severity:** gap — `type A = B; type B = A` should fail at resolve time.
 
 ```python
@@ -3269,6 +3368,16 @@ Repro: `stress/tests/73_return_paths.ty`.
 ---
 
 ## 83. `async def` with no `await` doesn't fire `async_without_await` (gap)
+
+**Status:** **FIXED** on `claude/add-library-autocomplete-1N2iS`. Added
+`tyc::async_without_await` (severity `Warning`) and a `body_has_await`
+helper that walks an async function body looking for `Expr::Await`,
+`async for`, and `async with`. The class-collection pass fires the
+warning on any `async def` whose body has none. Nested lambdas /
+inner async defs don't satisfy the outer body. Regression tests
+`async_without_await_emits_warning` (positive, asserts the warning
+fires but `tyc check` still exits 0) and `async_with_await_does_not_warn`
+(negative).
 
 **Severity:** gap — the diagnostic is documented as a warning, but doesn't
 fire.

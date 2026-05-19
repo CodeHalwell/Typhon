@@ -344,6 +344,66 @@ fn body_has_yield(body: &[Stmt]) -> bool {
     found
 }
 
+/// Return `true` when `body` (recursively) contains an `await`
+/// expression — including the implicit awaits inside `async for` and
+/// `async with` headers. Nested function and class bodies are skipped
+/// so an `await` in an inner async lambda or nested coroutine doesn't
+/// satisfy the outer function. FINDINGS #83.
+fn body_has_await(body: &[Stmt]) -> bool {
+    struct AwaitVisitor<'a> {
+        found: &'a mut bool,
+    }
+    impl<'a, 'b> ruff_python_ast::visitor::source_order::SourceOrderVisitor<'a> for AwaitVisitor<'b> {
+        fn visit_expr(&mut self, e: &'a Expr) {
+            if *self.found {
+                return;
+            }
+            if matches!(e, Expr::Await(_)) {
+                *self.found = true;
+                return;
+            }
+            // Don't descend into nested function-like expressions.
+            if matches!(e, Expr::Lambda(_)) {
+                return;
+            }
+            ruff_python_ast::visitor::source_order::walk_expr(self, e);
+        }
+        fn visit_stmt(&mut self, s: &'a Stmt) {
+            if *self.found {
+                return;
+            }
+            // `async for` / `async with` headers (`Stmt::For` / `Stmt::With`
+            // with `is_async = true`) count as `await` for the purposes of
+            // this check.
+            match s {
+                Stmt::For(f) if f.is_async => {
+                    *self.found = true;
+                    return;
+                }
+                Stmt::With(w) if w.is_async => {
+                    *self.found = true;
+                    return;
+                }
+                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => return,
+                _ => {}
+            }
+            ruff_python_ast::visitor::source_order::walk_stmt(self, s);
+        }
+    }
+    let mut found = false;
+    {
+        let mut visitor = AwaitVisitor { found: &mut found };
+        for s in body {
+            use ruff_python_ast::visitor::source_order::SourceOrderVisitor;
+            visitor.visit_stmt(s);
+            if *visitor.found {
+                break;
+            }
+        }
+    }
+    found
+}
+
 /// Return `true` when `returns` is annotated as one of the
 /// generator-compatible types. Recognises both PEP 484 (`Iterator[T]`,
 /// `Generator[T, S, R]`, `Iterable[T]`, `AsyncIterator[T]`,
@@ -2018,16 +2078,131 @@ fn seed_typhon_builtins(c: &mut Checker) {
     });
 }
 
+/// Walk the type-alias graph and emit `tyc::cyclic_type_alias` for any
+/// alias whose chain returns to itself. FINDINGS #81. Operates on the
+/// raw `Stmt::TypeAlias` declarations (not the resolved `type_aliases`
+/// map) so the diagnostic span anchors at the original `type NAME = ...`
+/// header.
+fn detect_cyclic_type_aliases(c: &mut Checker, body: &[Stmt]) {
+    use std::collections::HashMap;
+    // Build `name -> set of alias names the RHS references`. We only
+    // chase plain `Name` and `Generic` heads — nothing else can introduce
+    // a self-referential alias cycle.
+    fn collect_referenced_aliases(expr: &Expr, into: &mut std::collections::HashSet<String>) {
+        match expr {
+            Expr::Name(n) => {
+                into.insert(n.id.as_str().to_owned());
+            }
+            Expr::Subscript(s) => {
+                collect_referenced_aliases(&s.value, into);
+                if let Expr::Tuple(t) = s.slice.as_ref() {
+                    for elt in &t.elts {
+                        collect_referenced_aliases(elt, into);
+                    }
+                } else {
+                    collect_referenced_aliases(&s.slice, into);
+                }
+            }
+            Expr::BinOp(b) => {
+                collect_referenced_aliases(&b.left, into);
+                collect_referenced_aliases(&b.right, into);
+            }
+            _ => {}
+        }
+    }
+    let mut graph: HashMap<String, (std::collections::HashSet<String>, usize, usize)> =
+        HashMap::new();
+    for stmt in body {
+        if let Stmt::TypeAlias(ta) = stmt {
+            if let Expr::Name(n) = ta.name.as_ref() {
+                let name = n.id.as_str().to_owned();
+                let mut refs = std::collections::HashSet::new();
+                collect_referenced_aliases(ta.value.as_ref(), &mut refs);
+                let span_start = n.range.start().to_usize();
+                let span_len = n.range.end().to_usize().saturating_sub(span_start).max(1);
+                graph.insert(name, (refs, span_start, span_len));
+            }
+        }
+    }
+    // For each alias, DFS the graph looking for itself. A cycle exists iff
+    // we can reach `start` from one of its referenced aliases.
+    for (start, (_refs, span_start, span_len)) in &graph {
+        let mut stack: Vec<&str> = vec![start.as_str()];
+        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut found_cycle = false;
+        // Seed with the start's direct referents (don't insert `start` itself
+        // into visited yet — we want to detect the case where the chain comes
+        // back to it).
+        let Some((direct_refs, _, _)) = graph.get(start) else {
+            continue;
+        };
+        stack.clear();
+        for r in direct_refs {
+            stack.push(r.as_str());
+        }
+        while let Some(node) = stack.pop() {
+            if node == start.as_str() {
+                found_cycle = true;
+                break;
+            }
+            if !visited.insert(node) {
+                continue;
+            }
+            if let Some((next_refs, _, _)) = graph.get(node) {
+                for r in next_refs {
+                    stack.push(r.as_str());
+                }
+            }
+        }
+        if found_cycle {
+            c.diagnostics.push_error(TycError::cyclic_type_alias(
+                start.as_str(),
+                &c.path,
+                c.source,
+                *span_start,
+                *span_len,
+            ));
+        }
+    }
+}
+
 fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
     // First pass: collect every class and type-alias *name* into `c.classes`
     // so the subsequent shape and signature passes can resolve nominal
     // references like `field: OtherClass`. Doing the shape collection in
     // the same pass would see an empty class list and treat every nominal
     // type as `Unknown`.
+    //
+    // Track class-name first-sightings so a second declaration with the
+    // same name fires `tyc::duplicate_class` (FINDINGS #77). Preprocessor-
+    // synthesised pseudo-classes (`__typhon_impl_*`, `__TyphonLazy_*`) are
+    // exempt: multiple `impl Foo:` blocks legitimately produce multiple
+    // pseudo-classes, and the merge pass handles deduplication.
+    let mut seen_class_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     for stmt in body {
         match stmt {
             Stmt::ClassDef(cd) => {
                 let name = cd.name.as_str().to_owned();
+                if !name.starts_with("__typhon_impl_")
+                    && !name.starts_with("__TyphonLazy_")
+                    && !seen_class_names.insert(name.clone())
+                {
+                    let span_start = cd.name.range.start().to_usize();
+                    let span_len = cd
+                        .name
+                        .range
+                        .end()
+                        .to_usize()
+                        .saturating_sub(span_start)
+                        .max(1);
+                    c.diagnostics.push_error(TycError::duplicate_class(
+                        name.as_str(),
+                        &c.path,
+                        c.source,
+                        span_start,
+                        span_len,
+                    ));
+                }
                 c.classes.push(name.clone());
                 // Collect direct base class names for inheritance tracking.
                 // Handle both plain `Name` bases and `Subscript` bases like
@@ -2086,6 +2261,13 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
             }
         }
     }
+    // FINDINGS #81: walk the alias graph and surface cycles. `unwrap_alias`
+    // is bounded to 8 hops so a cycle silently produces an opaque type
+    // instead of looping, which lets bad alias chains compile and emit
+    // working Python that returns `Any` everywhere. A cycle is a
+    // programming error: there is no concrete type the chain can resolve
+    // to, so reject it at check time.
+    detect_cyclic_type_aliases(c, body);
     // Second pass: now that every class name is known, collect each class's
     // member shape so interface conformance can resolve nominal types in
     // field annotations.
@@ -2134,6 +2316,20 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                     for (f, ty) in impl_shape.fields {
                         target_shape.fields.entry(f).or_insert(ty);
                     }
+                } else {
+                    // FINDINGS #78: `impl UnknownClass:` silently produced
+                    // dead code. Anchor the diagnostic on the class-name
+                    // identifier (`__typhon_impl_X` byte range, with the
+                    // synthetic prefix stripped) so the highlight covers
+                    // the user-visible class name from `impl NAME:`.
+                    let name_start = cd.name.range.start().to_usize();
+                    let name_end = cd.name.range.end().to_usize();
+                    let prefix_len = "__typhon_impl_".len();
+                    let span_start = name_start.saturating_add(prefix_len);
+                    let span_len = name_end.saturating_sub(span_start).max(1);
+                    c.diagnostics.push_error(TycError::impl_unknown_class(
+                        target, &c.path, c.source, span_start, span_len,
+                    ));
                 }
             }
         }
@@ -2159,6 +2355,29 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
             // `tyc::missing_await` for sync calls (FINDINGS #49).
             if f.is_async {
                 c.async_functions.insert(f.name.as_str().to_owned());
+                // FINDINGS #83: warn when an `async def` body has no
+                // `await`. The skill documents this as
+                // `tyc::async_without_await` (warning). Coroutine semantics
+                // are wasted on a body that never suspends — most often a
+                // leftover from a half-finished refactor or a forgotten
+                // `await` on an internal call.
+                if !body_has_await(&f.body) {
+                    let span_start = f.name.range.start().to_usize();
+                    let span_len = f
+                        .name
+                        .range
+                        .end()
+                        .to_usize()
+                        .saturating_sub(span_start)
+                        .max(1);
+                    c.diagnostics.push_warning(TycError::async_without_await(
+                        f.name.as_str(),
+                        &c.path,
+                        c.source,
+                        span_start,
+                        span_len,
+                    ));
+                }
             }
             // Also extract any declared TypeVar bounds so they can be checked
             // at call sites.
@@ -3625,7 +3844,53 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // unbound after the forward arg pass, use the call's
                     // expected return type (from the enclosing annotation
                     // or `return` statement) to pin it.
-                    bind_typevars_and_substitute_bidirectional(&params, &actuals, &ret, expected)
+                    let result = bind_typevars_and_substitute_bidirectional(
+                        &params, &actuals, &ret, expected,
+                    );
+                    // FINDINGS #71: narrow `<dict[K, V]>.get(k, default)` to
+                    // `V | type(default)`, which collapses to `V` when default
+                    // is V-compatible. Without this, the one-arg signature
+                    // (`V | None`) leaks into the two-arg call site even
+                    // though Python guarantees a non-None return when a
+                    // default is supplied. The default may be supplied
+                    // positionally (`d.get("a", 0)`) or by keyword
+                    // (`d.get("a", default=0)`); both forms are handled
+                    // by looking for either shape before falling through
+                    // to the nullable signature.
+                    if let Expr::Attribute(attr) = call.func.as_ref() {
+                        if attr.attr.as_str() == "get" {
+                            let default_expr: Option<&Expr> = if pos_args.len() == 2 {
+                                Some(&pos_args[1])
+                            } else if pos_args.len() == 1 {
+                                kw_args
+                                    .iter()
+                                    .find(|k| {
+                                        k.arg
+                                            .as_ref()
+                                            .map(|ident| ident.as_str() == "default")
+                                            .unwrap_or(false)
+                                    })
+                                    .map(|k| &k.value)
+                            } else {
+                                None
+                            };
+                            if let Some(default_expr) = default_expr {
+                                let recv = infer_expr(c, &attr.value);
+                                if let Type::Generic(head, dict_args) = &recv {
+                                    if head == "dict" && dict_args.len() == 2 {
+                                        let v = dict_args[1].clone();
+                                        let default_ty = infer_expr(c, default_expr);
+                                        return if c.is_assignable(&v, &default_ty) {
+                                            v
+                                        } else {
+                                            Type::union_of(vec![v, default_ty])
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    result
                 }
                 Type::Class(name) => {
                     // Generic class instantiation (FINDINGS #46) — when
