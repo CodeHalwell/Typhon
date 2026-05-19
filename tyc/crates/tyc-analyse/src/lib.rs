@@ -211,6 +211,13 @@ pub fn evaluate_comptime_with_functions(
             }
             Some(expr) => {
                 let mut ctx = EvalContext::new(&functions);
+                // Seed the evaluator's scope with previously-evaluated
+                // comptime constants so a later binding can reference an
+                // earlier one (FINDINGS #48). Bindings are evaluated in
+                // source order, matching Python's left-to-right reading.
+                for (name, value) in &values {
+                    ctx.locals.insert(name.clone(), value.clone());
+                }
                 match eval_expr(expr, &mut ctx) {
                     Ok(v) => {
                         values.insert(binding.name.clone(), v);

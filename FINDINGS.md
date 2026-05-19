@@ -2048,6 +2048,22 @@ This bites every example that uses generics or sealed unions.
 
 ## 48. Comptime can't reference other comptime constants or call comptime defs (gap)
 
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. Two
+fixes:
+
+1. `evaluate_comptime_with_functions` now seeds each binding's
+   `EvalContext.locals` with every previously-evaluated comptime
+   constant in source order. `comptime let B: int = A + 10` resolves
+   `A` from the prior `comptime let A: int = 5`.
+2. `tyc check` now calls `evaluate_comptime_with_functions` with the
+   preprocessor's `comptime_functions` list (was passing an empty
+   slice via the old `evaluate_comptime` wrapper). `comptime def
+   is_prod(name: str) -> bool: ...` is now dispatchable from
+   `comptime let SHIPS: bool = is_prod("dev")` under both `check`
+   and `build`.
+
+Verified end-to-end on the finding's example program.
+
 **Severity:** gap — documented features unimplemented.
 
 ```ty
