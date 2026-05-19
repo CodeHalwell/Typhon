@@ -1758,35 +1758,28 @@ fn extract_return_type_text(def_line: &str) -> Option<String> {
 /// on-first-access loader code.
 ///
 /// Each `lazy import` line at module level (indent = 0) is replaced by a
-/// class-based proxy that imports the module on the first attribute access:
+/// single call to the `typhon_runtime.lazy.lazy_import` helper, which
+/// builds on the stdlib's `importlib.util.LazyLoader` to defer the real
+/// import until the first attribute access:
 ///
 /// ```text
 /// # Input (Typhon)
 /// lazy import np = numpy
 ///
 /// # Output (valid Python)
-/// class __TyphonLazy_np_:
-///     __slots__ = ('_m', '_lock')
-///     def __init__(self):
-///         import threading as _t   # local import avoids __future__ conflicts
-///         object.__setattr__(self, '_m', None)
-///         object.__setattr__(self, '_lock', _t.Lock())
-///     def __getattr__(self, name):
-///         m = object.__getattribute__(self, '_m')
-///         if m is None:
-///             lock = object.__getattribute__(self, '_lock')
-///             with lock:
-///                 m = object.__getattribute__(self, '_m')
-///                 if m is None:
-///                     import numpy as _mod
-///                     object.__setattr__(self, '_m', _mod)
-///                     m = _mod
-///         return getattr(m, name)
-///     def __repr__(self):
-///         m = object.__getattribute__(self, '_m')
-///         return repr(m) if m is not None else '<lazy module numpy>'
-/// np = __TyphonLazy_np_()
+/// from typhon_runtime.lazy import lazy_import as __typhon_lazy_import
+/// np = __typhon_lazy_import("numpy")
 /// ```
+///
+/// An earlier emission inlined a ~30-line bespoke proxy class per import
+/// — `__TyphonLazy_<alias>_` with `__slots__`, double-checked-locking
+/// `__getattr__`, custom `__dir__` and `__repr__`. That paid a heavy
+/// per-import cost for behaviour the stdlib provides in five lines via
+/// `LazyLoader`, and produced N copies of the same boilerplate when a
+/// project lazily imported multiple modules. The runtime helper is
+/// strictly better: the value returned is a real `types.ModuleType`
+/// (so `isinstance(np, ModuleType)` is True), submodule loading works
+/// out of the box, and there is one helper, not N.
 ///
 /// `lazy from x import a, b` is not supported and is left unchanged so that
 /// the Python parser produces a diagnostic at the offending line.
@@ -1807,6 +1800,7 @@ pub fn expand_lazy_imports(source: &str) -> String {
     // Track whether we have already injected the runtime imports so we don't
     // emit duplicates.
     let mut needs_lazy_let_import = false;
+    let mut needs_lazy_import_import = false;
     let mut needs_cached_property_import = false;
     let mut emitted_lines: Vec<String> = Vec::new();
 
@@ -1860,6 +1854,7 @@ pub fn expand_lazy_imports(source: &str) -> String {
                 if let Some((alias, module)) = parse_lazy_import(after) {
                     let mut proxy = String::new();
                     emit_lazy_proxy(&mut proxy, &alias, &module);
+                    needs_lazy_import_import = true;
                     emitted_lines.push(proxy);
                     continue;
                 }
@@ -1924,6 +1919,9 @@ pub fn expand_lazy_imports(source: &str) -> String {
     // imports, which by Python rules must remain at the top; for simplicity
     // we scan and insert after the last `from __future__ import …` line.
     let mut header = String::new();
+    if needs_lazy_import_import {
+        header.push_str("from typhon_runtime.lazy import lazy_import as __typhon_lazy_import\n");
+    }
     if needs_lazy_let_import {
         header.push_str("from typhon_runtime.lazy import lazy_let as __typhon_lazy_let\n");
     }
@@ -1939,16 +1937,50 @@ pub fn expand_lazy_imports(source: &str) -> String {
     }
 
     // Find the insertion point: after any leading `from __future__ import …`
-    // statements (these must remain at the top of the file).
+    // statements (these must remain at the top of the file) and after a
+    // module docstring if present. Inserting before the docstring would
+    // demote it from `__doc__` to a dead string literal, silently
+    // breaking `help(module)` and any tooling that reads `__doc__`.
     let mut insert_at = 0usize;
-    for (i, line) in emitted_lines.iter().enumerate() {
+    let mut i = 0usize;
+    while i < emitted_lines.len() {
+        let line = &emitted_lines[i];
         let trimmed = line.trim_start();
         if trimmed.starts_with("from __future__ import")
             || trimmed.is_empty()
             || trimmed.starts_with('#')
         {
-            insert_at = i + 1;
+            i += 1;
+            insert_at = i;
             continue;
+        }
+        // Module docstring detection: a triple-quoted string as the next
+        // logical statement. May be single-line (`"""one-liner"""`) or
+        // span multiple lines.
+        if let Some(quote) = docstring_open_quote(trimmed) {
+            // Check whether the opening triple quote also closes on the
+            // same line (after the opener). Strip the leading triple
+            // quote and look for a second occurrence.
+            let rest = &trimmed[3..];
+            if rest.contains(quote) {
+                // Single-line docstring — consumed by this one line.
+                i += 1;
+                insert_at = i;
+                break;
+            }
+            // Multi-line docstring — scan forward until we find the
+            // closing triple quote.
+            i += 1;
+            while i < emitted_lines.len() {
+                let body = &emitted_lines[i];
+                if body.contains(quote) {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            insert_at = i;
+            break;
         }
         break;
     }
@@ -2116,42 +2148,39 @@ fn render_cached_property(indent: &str, binding: &LazyLetBinding) -> String {
     )
 }
 
-/// Emit the proxy class for a single `lazy import ALIAS = MODULE`.
+/// If `line` starts with a Python triple-quote (`"""` or `'''`),
+/// optionally preceded by an `r`/`b`/`u`/`rb`/`br` string prefix,
+/// return the quote characters. Used by the header-insertion logic
+/// to recognise a leading module docstring so injected imports don't
+/// land above it (which would demote it from `__doc__` to a no-op
+/// expression statement).
+fn docstring_open_quote(line: &str) -> Option<&'static str> {
+    // Strip an optional Python string prefix (one or two ASCII letters
+    // from the b/r/u/f set). Module docstrings won't use `f`, but it
+    // costs nothing to accept the wider set.
+    let rest = line.trim_start_matches(['r', 'R', 'b', 'B', 'u', 'U']);
+    if rest.starts_with("\"\"\"") {
+        Some("\"\"\"")
+    } else if rest.starts_with("'''") {
+        Some("'''")
+    } else {
+        None
+    }
+}
+
+/// Emit the single-line lowering for `lazy import ALIAS = MODULE`:
 ///
-/// The `threading` import is placed inside `__init__` rather than at module
-/// level so that it cannot conflict with `from __future__ import ...` or
-/// encoding cookies that must appear at the start of the file.
+/// ```text
+/// ALIAS = __typhon_lazy_import("MODULE")
+/// ```
+///
+/// The `__typhon_lazy_import` symbol is brought into scope by an
+/// injected `from typhon_runtime.lazy import lazy_import as
+/// __typhon_lazy_import` at the top of the file (handled by the
+/// caller, which sets `needs_lazy_import_import = true` when at least
+/// one `lazy import` line is rewritten).
 fn emit_lazy_proxy(out: &mut String, alias: &str, module: &str) {
-    let class = format!("__TyphonLazy_{alias}_");
-    out.push_str(&format!("class {class}:\n"));
-    out.push_str("    __slots__ = ('_m', '_lock')\n");
-    out.push_str("    def __init__(self):\n");
-    // Import threading locally so the proxy carries no module-level side
-    // effects and remains safe even when the source file has a __future__
-    // prologue or a custom encoding cookie.
-    out.push_str("        import threading as _t\n");
-    out.push_str("        object.__setattr__(self, '_m', None)\n");
-    out.push_str("        object.__setattr__(self, '_lock', _t.Lock())\n");
-    out.push_str("    def __getattr__(self, name):\n");
-    out.push_str("        m = object.__getattribute__(self, '_m')\n");
-    out.push_str("        if m is None:\n");
-    out.push_str("            lock = object.__getattribute__(self, '_lock')\n");
-    out.push_str("            with lock:\n");
-    out.push_str("                m = object.__getattribute__(self, '_m')\n");
-    out.push_str("                if m is None:\n");
-    out.push_str(&format!("                    import {module} as _mod\n"));
-    out.push_str("                    object.__setattr__(self, '_m', _mod)\n");
-    out.push_str("                    m = _mod\n");
-    out.push_str("        return getattr(m, name)\n");
-    out.push_str("    def __dir__(self):\n");
-    out.push_str("        m = object.__getattribute__(self, '_m')\n");
-    out.push_str("        return dir(m) if m is not None else []\n");
-    out.push_str("    def __repr__(self):\n");
-    out.push_str("        m = object.__getattribute__(self, '_m')\n");
-    out.push_str(&format!(
-        "        return repr(m) if m is not None else '<lazy module {module}>'\n"
-    ));
-    out.push_str(&format!("{alias} = {class}()\n"));
+    out.push_str(&format!("{alias} = __typhon_lazy_import(\"{module}\")\n"));
 }
 
 /// Expand the `?` error-propagation operator into equivalent Python guard code.
@@ -5170,55 +5199,61 @@ def run() -> Result[str, str]:
     }
 
     #[test]
-    fn expand_lazy_imports_emits_proxy_class() {
+    fn expand_lazy_imports_emits_runtime_helper_call() {
         let src = "lazy import np = numpy\n\nx = np.array([1])\n";
         let out = expand_lazy_imports(src);
         assert!(
-            out.contains("class __TyphonLazy_np_"),
-            "should emit proxy class, got:\n{out}"
+            out.contains("from typhon_runtime.lazy import lazy_import as __typhon_lazy_import"),
+            "should inject runtime helper import, got:\n{out}"
         );
-        assert!(out.contains("np = __TyphonLazy_np_()"), "got:\n{out}");
         assert!(
-            out.contains("import numpy as _mod"),
-            "should import numpy on first use, got:\n{out}"
+            out.contains("np = __typhon_lazy_import(\"numpy\")"),
+            "should lower lazy import to a runtime helper call, got:\n{out}"
         );
-        // threading is now imported inside __init__, not at module level
+        // The bespoke per-import proxy class is gone — the runtime
+        // helper handles deferred loading via importlib.util.LazyLoader.
         assert!(
-            out.contains("import threading as _t"),
-            "should include local threading import in __init__, got:\n{out}"
+            !out.contains("__TyphonLazy_"),
+            "old proxy class form must not be emitted, got:\n{out}"
+        );
+        assert!(
+            !out.contains("import threading"),
+            "lazy import no longer needs threading at the call site, got:\n{out}"
         );
     }
 
     #[test]
-    fn expand_lazy_imports_proxy_has_dir_and_repr() {
-        let src = "lazy import np = numpy\n";
-        let out = expand_lazy_imports(src);
-        assert!(
-            out.contains("def __dir__"),
-            "proxy should implement __dir__, got:\n{out}"
-        );
-        assert!(
-            out.contains("def __repr__"),
-            "proxy should implement __repr__, got:\n{out}"
-        );
-    }
-
-    #[test]
-    fn expand_lazy_imports_no_module_level_threading_for_multiple_lazy_imports() {
+    fn expand_lazy_imports_multiple_imports_share_one_header_import() {
         let src = "lazy import np = numpy\nlazy import pd = pandas\n";
         let out = expand_lazy_imports(src);
-        // threading must NOT appear at module level — only inside __init__
-        assert!(
-            !out.starts_with("import threading"),
-            "threading must not be at module level, got:\n{out}"
+        // Three imports → one header `from typhon_runtime.lazy import ...`
+        // line, not three (the old emission ballooned linearly).
+        let header_count = out
+            .matches("from typhon_runtime.lazy import lazy_import as __typhon_lazy_import")
+            .count();
+        assert_eq!(
+            header_count, 1,
+            "header import should appear exactly once, got:\n{out}"
         );
         assert!(
-            out.contains("class __TyphonLazy_np_"),
-            "np proxy missing, got:\n{out}"
+            out.contains("np = __typhon_lazy_import(\"numpy\")"),
+            "np call missing, got:\n{out}"
         );
         assert!(
-            out.contains("class __TyphonLazy_pd_"),
-            "pd proxy missing, got:\n{out}"
+            out.contains("pd = __typhon_lazy_import(\"pandas\")"),
+            "pd call missing, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn expand_lazy_imports_supports_dotted_submodules() {
+        // `LazyLoader` resolves dotted module paths via `find_spec`, so
+        // `lazy import nn = torch.nn` lowers to the same one-line form.
+        let src = "lazy import nn = torch.nn\n";
+        let out = expand_lazy_imports(src);
+        assert!(
+            out.contains("nn = __typhon_lazy_import(\"torch.nn\")"),
+            "dotted module name should round-trip through the call, got:\n{out}"
         );
     }
 
@@ -5229,7 +5264,7 @@ def run() -> Result[str, str]:
         let src = "x = \"\"\"\nlazy import np = numpy\n\"\"\"\n";
         let out = expand_lazy_imports(src);
         assert!(
-            !out.contains("__TyphonLazy_"),
+            !out.contains("__typhon_lazy_import"),
             "lazy import inside string must not be expanded, got:\n{out}"
         );
         assert!(
@@ -5243,8 +5278,59 @@ def run() -> Result[str, str]:
         let src = "lazy import np = numpy  # noqa\n";
         let out = expand_lazy_imports(src);
         assert!(
-            out.contains("class __TyphonLazy_np_"),
+            out.contains("np = __typhon_lazy_import(\"numpy\")"),
             "trailing comment should not prevent expansion, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn expand_lazy_imports_inserts_header_after_module_docstring_single_line() {
+        // A single-line module docstring must remain the first
+        // statement of the module — inserting the injected header
+        // before it would demote it to a dead expression and break
+        // `__doc__` / `help(module)`.
+        let src = "\"\"\"My module.\"\"\"\nlazy import np = numpy\n";
+        let out = expand_lazy_imports(src);
+        let doc_pos = out.find("\"\"\"My module.\"\"\"").expect("docstring");
+        let import_pos = out
+            .find("from typhon_runtime.lazy import lazy_import")
+            .expect("injected import");
+        assert!(
+            doc_pos < import_pos,
+            "module docstring must precede the injected import; got:\n{out}",
+        );
+    }
+
+    #[test]
+    fn expand_lazy_imports_inserts_header_after_module_docstring_multi_line() {
+        // Same guarantee for a multi-line docstring spanning several lines.
+        let src = "\"\"\"First line.\n\nMore detail.\n\"\"\"\nlazy import np = numpy\n";
+        let out = expand_lazy_imports(src);
+        let doc_close = out.find("More detail.\n\"\"\"").expect("docstring close");
+        let import_pos = out
+            .find("from typhon_runtime.lazy import lazy_import")
+            .expect("injected import");
+        assert!(
+            doc_close < import_pos,
+            "multi-line docstring must fully precede the injected import; got:\n{out}",
+        );
+    }
+
+    #[test]
+    fn expand_lazy_imports_inserts_header_after_future_and_docstring() {
+        // Real-world mixed case: `from __future__` plus a module
+        // docstring. The injected import must land after both.
+        let src =
+            "from __future__ import annotations\n\"\"\"Module.\"\"\"\nlazy import np = numpy\n";
+        let out = expand_lazy_imports(src);
+        let future_pos = out.find("from __future__").expect("__future__");
+        let doc_pos = out.find("\"\"\"Module.\"\"\"").expect("docstring");
+        let import_pos = out
+            .find("from typhon_runtime.lazy import lazy_import")
+            .expect("injected import");
+        assert!(
+            future_pos < doc_pos && doc_pos < import_pos,
+            "order must be __future__ → docstring → injected import; got:\n{out}",
         );
     }
 

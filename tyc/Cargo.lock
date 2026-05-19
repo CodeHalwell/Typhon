@@ -1990,6 +1990,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
+ "toml_edit",
  "tyc-analyse",
  "tyc-db",
  "tyc-desugar",
