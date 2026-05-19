@@ -1,7 +1,16 @@
 #!/bin/bash
-TYC=/home/user/Typhon/tyc/target/release/tyc
+# Build each .ty argument as a tyc project and run the emitted Python.
+# Overridable:
+#   TYC=/path/to/tyc       (default: <repo>/tyc/target/release/tyc)
+#   PYTHON=python3.13      (default: python3.13 — Typhon targets 3.13+)
+TYC=${TYC:-"$(git rev-parse --show-toplevel 2>/dev/null)/tyc/target/release/tyc"}
+PYTHON=${PYTHON:-python3.13}
+if [ ! -x "$TYC" ]; then
+    echo "tyc binary not found at $TYC — set TYC=... or build with 'cargo build --release' in tyc/" >&2
+    exit 1
+fi
 mkdir -p builds
-for tc in $@; do
+for tc in "$@"; do
     name=$(basename "$tc" .ty)
     workdir="builds/$name"
     rm -rf "$workdir"
@@ -30,11 +39,11 @@ TOML
     "$TYC" build > build.out 2>&1
     bcode=$?
     if [ $bcode -eq 0 ]; then
-        python3 build/main.py > run.out 2>&1
+        "$PYTHON" build/main.py > run.out 2>&1
         rcode=$?
         echo "$name: build=$bcode run=$rcode"
     else
-        echo "$name: build=$bcode (FAILED)"
+        echo "$name: build=$bcode FAILED"
     fi
     popd > /dev/null
 done
