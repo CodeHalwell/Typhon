@@ -14,10 +14,10 @@ def find_user(uid: int) -> User?:
 let COUNT: int = 10
 
 def main() -> None:
-    user = find_user(1)
+    let user = find_user(1)
     if user is not None:
         print(user.name)
-    total = 0
+    mut total = 0
     for i in range(COUNT):
         total = total + i
     print(total)
