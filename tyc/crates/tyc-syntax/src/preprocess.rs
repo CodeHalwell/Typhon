@@ -1861,9 +1861,7 @@ pub fn expand_lazy_imports(source: &str) -> String {
     // we scan and insert after the last `from __future__ import …` line.
     let mut header = String::new();
     if needs_lazy_import_import {
-        header.push_str(
-            "from typhon_runtime.lazy import lazy_import as __typhon_lazy_import\n",
-        );
+        header.push_str("from typhon_runtime.lazy import lazy_import as __typhon_lazy_import\n");
     }
     if needs_lazy_let_import {
         header.push_str("from typhon_runtime.lazy import lazy_let as __typhon_lazy_let\n");
@@ -2069,9 +2067,7 @@ fn render_cached_property(indent: &str, binding: &LazyLetBinding) -> String {
 /// caller, which sets `needs_lazy_import_import = true` when at least
 /// one `lazy import` line is rewritten).
 fn emit_lazy_proxy(out: &mut String, alias: &str, module: &str) {
-    out.push_str(&format!(
-        "{alias} = __typhon_lazy_import(\"{module}\")\n"
-    ));
+    out.push_str(&format!("{alias} = __typhon_lazy_import(\"{module}\")\n"));
 }
 
 /// Expand the `?` error-propagation operator into equivalent Python guard code.
@@ -5029,9 +5025,7 @@ def run() -> Result[str, str]:
         let src = "lazy import np = numpy\n\nx = np.array([1])\n";
         let out = expand_lazy_imports(src);
         assert!(
-            out.contains(
-                "from typhon_runtime.lazy import lazy_import as __typhon_lazy_import"
-            ),
+            out.contains("from typhon_runtime.lazy import lazy_import as __typhon_lazy_import"),
             "should inject runtime helper import, got:\n{out}"
         );
         assert!(

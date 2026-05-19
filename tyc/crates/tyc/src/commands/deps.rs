@@ -334,8 +334,7 @@ fn merge_pyproject(project_root: &Path, config: &TyphonConfig) -> Result<()> {
     let path = project_root.join("pyproject.toml");
     if !path.exists() {
         let text = render_pyproject(config);
-        std::fs::write(&path, text)
-            .map_err(|e| miette!("cannot write {}: {e}", path.display()))?;
+        std::fs::write(&path, text).map_err(|e| miette!("cannot write {}: {e}", path.display()))?;
         return Ok(());
     }
 
@@ -364,10 +363,7 @@ pub(crate) fn apply_owned_keys(doc: &mut toml_edit::DocumentMut, config: &Typhon
         .as_table_mut()
         .expect("[project] must be a table");
 
-    project.insert(
-        "name",
-        value(default_str(&config.project.name, "untitled")),
-    );
+    project.insert("name", value(default_str(&config.project.name, "untitled")));
     project.insert(
         "version",
         value(default_str(&config.project.version, "0.1.0")),
@@ -436,9 +432,9 @@ fn run_uv_sync_warning(project_root: &Path) {
         .status();
     match status {
         Ok(s) if s.success() => {}
-        Ok(s) => eprintln!(
-            "warning: `uv sync` exited with {s} — build artefacts were still emitted"
-        ),
+        Ok(s) => {
+            eprintln!("warning: `uv sync` exited with {s} — build artefacts were still emitted")
+        }
         Err(e) => eprintln!("warning: cannot spawn `uv`: {e}"),
     }
 }
