@@ -1,0 +1,12 @@
+import asyncio
+
+async def get_n() -> int:
+    return 42
+
+async def main() -> None:
+    let result: int = await get_n() + 1
+    print(result)
+    let xs: list[int] = [await get_n() for _ in range(3)]
+    print(xs)
+
+asyncio.run(main())

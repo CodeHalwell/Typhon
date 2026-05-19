@@ -1,0 +1,23 @@
+type JSON = int | str | bool | None | list["JSON"] | dict[str, "JSON"]
+
+def stringify(j: JSON) -> str:
+    match j:
+        case None:
+            return "null"
+        case True:
+            return "true"
+        case False:
+            return "false"
+        case x if isinstance(x, int):
+            return str(x)
+        case x if isinstance(x, str):
+            return f'"{x}"'
+        case _:
+            return "?"
+
+def main() -> None:
+    print(stringify(42))
+    print(stringify("hi"))
+    print(stringify(None))
+
+main()

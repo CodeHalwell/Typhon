@@ -1,0 +1,14 @@
+def parse(s: str) -> Result[int, str]:
+    if s.isdigit():
+        return Ok(int(s))
+    return Err("not digit")
+
+def double_parse(s: str) -> Result[int, str]:
+    let n: int = parse(s)?
+    return Ok(n * 2)
+
+def main() -> None:
+    print(double_parse("21"))
+    print(double_parse("oops"))
+
+main()

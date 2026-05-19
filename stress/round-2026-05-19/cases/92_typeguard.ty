@@ -1,0 +1,15 @@
+from typing import TypeGuard
+
+def is_str_list(xs: list[object]) -> TypeGuard[list[str]]:
+    return all(isinstance(x, str) for x in xs)
+
+def join_all(xs: list[object]) -> str:
+    if is_str_list(xs):
+        return ",".join(xs)
+    return ""
+
+def main() -> None:
+    print(join_all(["a", "b", "c"]))
+    print(join_all(["a", 1]))
+
+main()

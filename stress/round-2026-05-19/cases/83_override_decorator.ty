@@ -1,0 +1,22 @@
+from typing import override
+
+class Animal:
+    name: str
+
+impl Animal:
+    def speak(self) -> str:
+        return "..."
+
+class Dog(Animal):
+    breed: str
+
+impl Dog:
+    @override
+    def speak(self) -> str:
+        return "woof"
+
+def main() -> None:
+    let d: Dog = Dog(name="rex", breed="lab")
+    print(d.speak())
+
+main()

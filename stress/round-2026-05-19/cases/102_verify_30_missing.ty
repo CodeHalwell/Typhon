@@ -1,0 +1,7 @@
+def f(x):
+    return x + 1
+
+def main():
+    print(f(5))
+
+main()

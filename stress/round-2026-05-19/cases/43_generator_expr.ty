@@ -1,0 +1,7 @@
+def main() -> None:
+    let total: int = sum(x * x for x in range(10) if x % 2 == 0)
+    print(total)
+    let lengths: list[int] = list(len(s) for s in ["a", "bb", "ccc"])
+    print(lengths)
+
+main()

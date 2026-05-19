@@ -1,0 +1,12 @@
+class Counter:
+    start: int
+    name: str
+
+    def __post_init__(self) -> None:
+        self.name = f"counter_{self.start}"
+
+def main() -> None:
+    let c: Counter = Counter(start=10, name="")
+    print(c.name)
+
+main()

@@ -1,0 +1,19 @@
+type Animal = Dog | Cat
+
+class Dog:
+    name: str
+
+class Cat:
+    name: str
+    indoor: bool
+
+def is_indoor_cat(a: Animal) -> bool:
+    if isinstance(a, Cat):
+        return a.indoor
+    return False
+
+def main() -> None:
+    print(is_indoor_cat(Cat(name="whiskers", indoor=True)))
+    print(is_indoor_cat(Dog(name="rex")))
+
+main()

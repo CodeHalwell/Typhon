@@ -1,0 +1,10 @@
+def make_user(**fields: str) -> dict[str, str]:
+    return fields
+
+def main() -> None:
+    let u: dict[str, str] = make_user(name="alice", role="admin")
+    print(u)
+    let bad: dict[str, str] = make_user(age=30)
+    print(bad)
+
+main()

@@ -1,0 +1,12 @@
+def shout(s: str) -> str:
+    return s + "!"
+
+def main() -> None:
+    let result: str = "  hello  " |> str.strip() |> str.upper() |> shout()
+    print(result)
+
+    let xs: list[int] = [1, 2, 3, 4]
+    let total: int = xs |> sum()
+    print(total)
+
+main()

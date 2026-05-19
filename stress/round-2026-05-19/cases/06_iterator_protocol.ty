@@ -1,0 +1,19 @@
+from typing import Iterator
+
+class Counter:
+    start: int
+    stop: int
+
+impl Counter:
+    def __iter__(self) -> Iterator[int]:
+        mut i: int = self.start
+        while i < self.stop:
+            yield i
+            i = i + 1
+
+def main() -> None:
+    let c: Counter = Counter(start=0, stop=5)
+    for n in c:
+        print(n)
+
+main()

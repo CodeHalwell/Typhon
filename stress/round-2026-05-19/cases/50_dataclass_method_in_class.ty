@@ -1,0 +1,12 @@
+class User:
+    name: str
+    age: int
+
+    def hello(self) -> str:
+        return f"hi {self.name}"
+
+def main() -> None:
+    let u: User = User(name="x", age=1)
+    print(u.hello())
+
+main()

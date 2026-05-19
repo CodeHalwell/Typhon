@@ -1,0 +1,7 @@
+lazy import np = numpy
+
+def main() -> None:
+    let arr = np.array([1, 2, 3])
+    print(arr.sum())
+
+main()

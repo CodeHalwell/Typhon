@@ -1,0 +1,19 @@
+from typing import Callable
+import functools
+
+def timed(label: str) -> Callable[[Callable[..., int]], Callable[..., int]]:
+    def decorator(fn: Callable[..., int]) -> Callable[..., int]:
+        @functools.wraps(fn)
+        def wrapper(*args: object, **kwargs: object) -> int:
+            return fn(*args, **kwargs)
+        return wrapper
+    return decorator
+
+@timed("add")
+def add(a: int, b: int) -> int:
+    return a + b
+
+def main() -> None:
+    print(add(2, 3))
+
+main()

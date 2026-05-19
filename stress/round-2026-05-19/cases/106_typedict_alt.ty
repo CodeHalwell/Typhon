@@ -1,0 +1,14 @@
+from typing import TypedDict
+
+class User(TypedDict):
+    id: int
+    name: str
+
+def show(u: User) -> str:
+    return f"#{u['id']} {u['name']}"
+
+def main() -> None:
+    let alice: User = User(id=1, name="alice")
+    print(show(alice))
+
+main()

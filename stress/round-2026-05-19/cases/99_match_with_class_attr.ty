@@ -1,0 +1,27 @@
+type Event = Login | Logout
+
+class Login:
+    user: str
+    ts: int
+
+class Logout:
+    user: str
+    ts: int
+
+def latest(events: list[Event]) -> int:
+    mut t: int = 0
+    for e in events:
+        match e:
+            case Login(ts=ts):
+                if ts > t:
+                    t = ts
+            case Logout(ts=ts):
+                if ts > t:
+                    t = ts
+    return t
+
+def main() -> None:
+    let evs: list[Event] = [Login(user="a", ts=10), Logout(user="a", ts=20)]
+    print(latest(evs))
+
+main()

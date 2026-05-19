@@ -1,0 +1,9 @@
+import json
+
+def main() -> None:
+    unsafe:
+        let data = json.loads('{"k": 1}')
+        let k = data["k"]
+    print(k)
+
+main()

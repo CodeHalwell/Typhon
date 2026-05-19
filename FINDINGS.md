@@ -3872,3 +3872,243 @@ If I were sequencing the work behind the highest-impact wins:
 
 Anything below this is a polish pass — better diagnostics, doc
 reconciliation, missing-return analysis, etc.
+
+---
+
+## Status as of `claude/test-typhon-library-rNIYC` (fresh round, 2026-05-19)
+
+Built `tyc` from this commit (release, ~73s clean build) and ran a
+fresh battery of 107 hand-written `.ty` programs through `tyc check`,
+`tyc build`, `tyc fmt`, `tyc migrate`, `tyc trace`, plus all 46
+example projects in `examples/`. The corpus targets surface area the
+previous rounds didn't cover in depth: `typing` module markers
+(`Self`, `Literal`, `Final`, `ClassVar`, `Annotated`, `TypedDict`,
+`NamedTuple`, `Protocol[runtime_checkable]`, `TypeGuard`),
+iterator/descriptor/context-manager protocols, multiple inheritance,
+`__call__`/`__post_init__`/`@property.setter`/`@classmethod`,
+`async for` / `async with`, walrus, exception groups, deeper match
+patterns (mapping/sequence/guards/kw), `model X:` runtime,
+debug-`{x=}` f-strings, recursive type aliases, and recursive
+parser-torture inputs.
+
+**Headline result:** `tyc` does not panic on any of the 107 inputs
+plus 8 deliberate parser-torture programs. Every prior critical
+regression listed in the `kxGRX` campaign has been resolved — the
+`examples/` corpus now passes both `tyc check` AND `tyc build`
+end-to-end at **46 / 46** (previous round: 39/47 check, fewer build).
+The major leftover surface is the `typing` module's bridge-types,
+which the type-checker mostly treats as opaque generic wrappers
+instead of unwrapping them.
+
+### Re-verified as FIXED on this commit
+
+The following findings from prior rounds were re-run and confirmed
+green:
+
+| Finding | Status | Evidence |
+|---|---|---|
+| #7 — `T?`-returning function bound to `T?` annotation | ✅ FIXED | `cases/101_verify_07_nullable.ty` builds & runs |
+| #26 — interface conformance with `impl`-block methods | ✅ FIXED | `cases/91_interface_conformance.ty` builds & runs |
+| #30 — missing param/return annotations enforced | ✅ FIXED | `cases/102_verify_30_missing.ty` errors with `tyc::missing_annotation` and clear "Typhon's Rule 1" help |
+| #31 — float literal `1.0` emits as `1.0` (visible in JSON) | ✅ FIXED | `cases/103_verify_31_float.ty` emits `1.0` and `json.dumps` writes `1.0` |
+| #50 — `__init__` in class body silently accepted | ✅ FIXED | `cases/104_verify_50_init.ty` errors with `tyc::manual_init` |
+| #56 — examples suite failing | ✅ FIXED | full 46-project sweep, build pass-rate now 100% |
+| #66 — `?` mid-expression silent breakage | ✅ Diagnostic only — limitation now clearly stated (`cases/94_question_mid_expr.ty`). Lifting the limitation is still future work. |
+| #71 — `dict.get(k, default)` not narrowed | ✅ FIXED | `cases/97_dict_get_default.ty` types `d.get("a", 0)` as `int` |
+
+### Headline NEW issues (numbered 97+ below)
+
+**Critical / runtime-broken:**
+
+- **#97** — `from typing import Self` return-type fails with
+  `expected Self, found __typhon_impl_X`. The canonical builder
+  pattern doesn't compile.
+- **#98** — `Literal["a", "b"]` is rendered as `Literal[?, ?]` and
+  is unassignable in either direction.
+- **#99** — `Final[T]` and `ClassVar[T]` are treated as opaque
+  wrapper types: `MAX: Final[int] = 100` is `tyc::type_mismatch`.
+- **#100** — `Annotated[T, ...]` is not transparent — `int` doesn't
+  satisfy `Annotated[int, "..."]`.
+- **#101** — `class Point(NamedTuple):` builds clean but crashes at
+  runtime: `TypeError: Point already specifies __slots__`. The
+  desugarer wraps it in `@dataclasses.dataclass(slots=True)`.
+- **#102** — `class C(A, B):` with multiple inheritance crashes at
+  runtime: `TypeError: multiple bases have instance lay-out conflict`,
+  again because every class gets `slots=True`.
+- **#103** — `model X:` emits `from pydantic import …` but `tyc
+  build` does not auto-add `pydantic` to `[dependencies]`, so the
+  artefact fails to import at runtime.
+- **#104** — `type Err = str` shadows `Result`'s `Err` constructor:
+  `?` operator's `isinstance(_t, Err)` desugar resolves `Err` to the
+  alias (`str`) instead of `typhon_runtime.Err`, runtime `TypeError`.
+- **#105** — `lazy let CFG: int = …` followed by `print(CFG)` prints
+  `<lazy: unmaterialised>` instead of the value. The `_LazyValue`
+  proxy's `__repr__` deliberately doesn't materialise, and no
+  `__str__` exists to delegate.
+- **#106** — `f"{x=}"` debug-repr (Python 3.8+ PEP 501) is silently
+  stripped to `f"{x}"`. Follow-up to fixed #41; the conversions
+  `!r/!s/!a` and format specs `:03d` work, but `=` does not.
+- **#107** — `unsafe:` value leak isn't caught. A binding declared
+  inside `unsafe:` can be returned from a function whose annotated
+  return type is concrete (e.g. `-> int`) without re-asserting,
+  contradicting Rule 5 of the skill.
+
+**High-impact:**
+
+- **#108** — `let alice: User = {"id": 1, "name": "Alice"}` for a
+  TypedDict-derived `User` fails type-check (`expected User, found
+  dict[str, int | str]`). The `User(id=…, name=…)` constructor form
+  does work.
+- **#109** — `add3(*xs)` (single-star positional unpack) is rejected
+  by the arg-count check (`expected 3, got 1`).
+- **#110** — `gather:` with dependent bindings (`b = fetch_b(a)`
+  where `a = fetch_a()`) still warns only via the per-callee
+  `async_without_await` (warning); per #60 it still builds an
+  invalid TaskGroup. The dependency-detector is still absent.
+- **#111** — `case [x, y]:` and `case [x, *rest]:` sequence patterns
+  emit as **tuple** patterns `case (x, y):` / `case (x, *rest):`.
+  Runtime behaviour is equivalent in Python's `match`, but the emit
+  is misleading on read.
+- **#112** — `Protocol` + `@runtime_checkable` (`class Sized(Protocol):
+  def __len__(self) -> int: ...`) rejects built-ins: `take([1])`
+  fails with `expected Sized, found list[int]`. Built-ins don't
+  appear to participate in structural conformance against
+  user-declared Protocols.
+- **#113** — `ExceptionGroup` and `BaseExceptionGroup` are not
+  in scope as built-ins (PEP 654, in CPython since 3.11). `raise
+  ExceptionGroup("oops", […])` errors as `tyc::unknown_name`.
+
+**Medium / papercut:**
+
+- **#114** — `async def __aenter__` and `async def __aexit__`
+  (mandatory async-context-manager dunder signatures) trigger the
+  `tyc::async_without_await` warning even when the body legitimately
+  doesn't await.
+- **#115** — `from typing import Optional, List` round-trip:
+  `tyc migrate` rewrites `Optional[T]` → `T?` and removes the
+  `Optional` from the import, but leaves `List` untouched and does
+  not lower `List[X]` → `list[X]`. Output is still loud about
+  deprecated capital-`List`.
+- **#116** — `bytes` literals are re-escaped to `\xNN` form on
+  every byte: `b"hello"` emits as `b"\x68\x65\x6c\x6c\x6f"`, even
+  for printable ASCII. Equivalent runtime; awful to read.
+- **#117** — `5 |> (lambda x: x * 2)()` is a parse error — the
+  pipe operator's RHS does not accept a parenthesised lambda call.
+- **#118** — `s |> S.add(5)` desugars to `S.add(s, 5)`, but the
+  call-site arg-count check rejects it because `impl`-block method
+  types don't include `self` in the function arity that the
+  checker sees. Related to #59 (method-level type params).
+- **#119** — `(1 |> add(2)) |> add(3)` — pipe `|>` is not
+  recognised inside a parenthesised sub-expression: parser fails at
+  the inner `>`. Pipe is restricted to top-of-statement positions.
+- **#120** — `comptime let A: list[int] = [1, 2, 3]; comptime let
+  B: int = A[0]` — subscripting a comptime container is still
+  rejected (`expression is not a comptime-evaluable constant:
+  Subscript`). Same as the prior #88 — still open.
+- **#121** — Recursive type alias `type JSON = int | str | bool |
+  None | list["JSON"] | dict[str, "JSON"]`: passing a bare `None`
+  literal to `stringify(j: JSON)` is rejected as `expected JSON,
+  found None`. The union literally lists `None` as a member;
+  literal-`None` is not unified with the `None` member of the
+  union. Related to #69.
+- **#122** — `tyc fmt` still does almost nothing. After
+  `tyc fmt` on `def   main(   )    ->    None  :\n    let     x:int=
+  1\n    print(   x   )\nmain()`, the result is `def main() -> None
+  :\n    let x:int= 1\n    print(x)\nmain()` — still has `int=`,
+  the space before the `:` on the def line, and no blank line
+  before `main()`. Confirms #18/#65; nothing has improved on the
+  formatting axis.
+- **#123** — `tyc init NAME` scaffolds a `src/main.ty` that ends
+  with a bare `main()` call instead of `if __name__ == "__main__":
+  main()`. That works as a script but every importable module that
+  runs `main()` at import time is a footgun. Related to #92's
+  spirit (the canonical entry block isn't surfaced anywhere a
+  newcomer would see it).
+- **#124** — When `walrus :=` introduces a new binding (e.g.
+  `if (n := len(xs)) > 3:`), Typhon accepts the binding without
+  requiring `let`/`mut`. That's defensible, but a binding it
+  declared this way is then *immutable* implicitly, with no doc
+  reference to that fact. The skill's Rule 2 enumerates the forms
+  that bind without `let`/`mut` (the `gather:` exception) and does
+  not list walrus.
+- **#125** — `let q: int` (no init) then `q, r = divmod(...)` is
+  rejected as `immutable_assign`. The author's intent is "declare,
+  then initialise via a single tuple binding". Either disallow
+  `let X: T` without init at parse time, or treat the first
+  assignment as the initialisation. Same as the prior #91 — still
+  open.
+
+**Doc drift:**
+
+- **#126** — The skill claims `lazy let` lowers to a "sentinel-cached
+  `lazy_val(...)`" but the actual emit imports `lazy_let` from
+  `typhon_runtime.lazy` and the proxy class is `_LazyValue`. Minor
+  naming drift; sibling to #16.
+- **#127** — `cases/56_fstring_debug.ty` revealed that `f"{x=}"`,
+  `f"{x = }"`, `f"{x*2=}"`, `f"{name=!r}"` all silently drop the
+  `=` debug marker. The skill REFERENCE table mentions f-string
+  format specs and conversions but does not call out the `=`
+  modifier — either implement it or document the gap.
+
+### Tooling verifications
+
+- **`tyc trace`** still correctly maps `build/main.py` frames back
+  to `src/main.ty` line numbers (verified on a `ZeroDivisionError`
+  traceback). Works end-to-end.
+- **`tyc lsp`** boots and exits cleanly on stdio (no hang, no
+  panic) — full LSP-client conversation not attempted in this
+  round.
+- **`tyc check examples/`** — 46/46 PASS.
+- **`tyc build`** of every example into a temp project — 46/46
+  PASS.
+- **Parser robustness**: 8 deliberately-malformed inputs
+  (`"""triple""""""`, bare `def\n`, `class A(B(C(D))):`, `let x
+  =`, top-level `match\n  case _: pass`, `class[T]…`, very deep
+  parens / very long arithmetic) all emit clean miette diagnostics
+  with no panic / no abort.
+
+### Suggested fix order (subjective)
+
+If I were sequencing for a v0.3 push, the biggest unit-of-work-per
+unit-of-pain wins are:
+
+1. **Make typing-module bridge types transparent** (#97, #98, #99,
+   #100, #112). One pass through `tyc-types` that recognises and
+   unwraps `Self`, `Literal[…]`, `Final[T]`, `ClassVar[T]`,
+   `Annotated[T, …]` (and treats `Protocol`-derived classes as
+   user-level structural-conformance targets that include
+   built-ins).
+2. **Stop emitting `slots=True` blindly** (#101, #102). Either
+   detect multi-inheritance / `NamedTuple` subclassing and switch
+   to `slots=False`, or detect those forms and skip the
+   `@dataclasses.dataclass` wrapper entirely.
+3. **Auto-add `pydantic` to `[dependencies]` when emitting
+   `model`** (#103). One-line conditional in
+   `tyc/src/commands/build.rs`.
+4. **`type Err = …` shadowing fix** (#104). Either reserve `Ok` /
+   `Err` as type-alias targets, or have the `?` desugar reference
+   the runtime constructor by its fully-qualified path.
+5. **Make `lazy let` print materialise** (#105). Add `__str__`
+   that delegates to `__repr__(materialise)` on `_LazyValue`.
+6. **F-string `{x=}` support** (#106). The emitter already walks
+   `InterpolatedElement.conversion` / `format_spec` after the
+   #41 fix; extending that walk to preserve `debug_text` is small.
+7. **Catch the `unsafe:` leak** (#107). Make `Unsafe[T]` an
+   actual marker type in `tyc-types` and require re-assertion
+   before the value flows out of the lexical block.
+8. **`{…}` literal → `TypedDict` inference** (#108). Match dict
+   literals against the LHS-annotated TypedDict before falling
+   back to `dict[K, V]`.
+9. **Star-unpack in calls** (#109). Skip the strict arg-count
+   check when any `*args` / `**kwargs` is present and fall back
+   to a "compatible-with" check.
+10. **`gather:` dependent-binding detection** (#110, still open).
+    Reject or sequentially-fallback; either is fine, just don't
+    ship broken Python.
+11. **`tyc fmt`** (#122). Pick three rules and implement them
+    (no-space-before-colon, single-space-around-`=`/`+`,
+    two-blank-lines before top-level defs). Anything is better
+    than today.
+12. **`bytes` literal preservation** (#116). Skip the `\xNN`
+    re-escape when every byte is printable ASCII.
+

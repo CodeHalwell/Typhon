@@ -1,0 +1,20 @@
+class Celsius:
+    _value: float
+
+impl Celsius:
+    @property
+    def value(self) -> float:
+        return self._value
+
+    @value.setter
+    def value(self, v: float) -> None:
+        if v < -273.15:
+            raise ValueError("below absolute zero")
+        self._value = v
+
+def main() -> None:
+    let c: Celsius = Celsius(_value=0.0)
+    c.value = 25.0
+    print(c.value)
+
+main()

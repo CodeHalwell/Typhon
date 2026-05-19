@@ -1,0 +1,12 @@
+def main() -> None:
+    let a: bytes = b"hello"
+    let b: bytes = b"world"
+    print(a + b" " + b)
+    print(a.upper())
+    print(a.decode("utf-8"))
+    let arr: bytearray = bytearray(b"abc")
+    arr.append(100)
+    print(arr)
+    print(int.from_bytes(b"\x01\x02", "big"))
+
+main()

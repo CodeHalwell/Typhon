@@ -1,0 +1,19 @@
+class Resp:
+    status: int
+    body: str
+
+def handle(r: Resp) -> str:
+    match r:
+        case Resp(status=200, body=b):
+            return f"ok: {b}"
+        case Resp(status=404):
+            return "not found"
+        case Resp(status=s):
+            return f"other: {s}"
+
+def main() -> None:
+    print(handle(Resp(status=200, body="hi")))
+    print(handle(Resp(status=404, body="")))
+    print(handle(Resp(status=500, body="oops")))
+
+main()

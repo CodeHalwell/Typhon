@@ -1,0 +1,18 @@
+class File:
+    path: str
+    opened: bool
+
+impl File:
+    def __enter__(self) -> "File":
+        self.opened = True
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self.opened = False
+
+def main() -> None:
+    with File(path="x", opened=False) as f:
+        print(f.opened)
+    print(f.opened)
+
+main()

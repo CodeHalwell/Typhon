@@ -1,0 +1,13 @@
+from typing import Iterator
+
+def squares(n: int) -> Iterator[int]:
+    mut i: int = 0
+    while i < n:
+        yield i * i
+        i = i + 1
+
+def main() -> None:
+    for s in squares(5):
+        print(s)
+
+main()

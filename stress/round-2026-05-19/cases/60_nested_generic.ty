@@ -1,0 +1,11 @@
+def main() -> None:
+    let nested: dict[str, dict[str, list[tuple[int, str]]]] = {
+        "a": {"x": [(1, "one"), (2, "two")]},
+        "b": {"y": [(3, "three")]},
+    }
+    for k, inner in nested.items():
+        for k2, items in inner.items():
+            for n, s in items:
+                print(k, k2, n, s)
+
+main()

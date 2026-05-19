@@ -1,0 +1,11 @@
+from typing import NamedTuple
+
+class Point(NamedTuple):
+    x: int
+    y: int
+
+def main() -> None:
+    let p: Point = Point(x=1, y=2)
+    print(p.x, p.y, p[0], p[1])
+
+main()

@@ -1,0 +1,13 @@
+def main() -> None:
+    let xs: list[int] = list(range(10))
+    print(xs[::2])
+    print(xs[::-1])
+    print(xs[2:8:2])
+    print(xs[-3:])
+    print(xs[:-3])
+    let s: str = "abcdefghij"
+    print(s[::-1])
+    print(s[1:-1])
+    print(s[::3])
+
+main()

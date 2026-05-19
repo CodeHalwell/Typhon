@@ -1,0 +1,12 @@
+from typing import Final, ClassVar
+
+MAX: Final[int] = 100
+
+class Config:
+    DEFAULT_PORT: ClassVar[int] = 8080
+    host: str
+
+def main() -> None:
+    print(MAX, Config.DEFAULT_PORT)
+
+main()

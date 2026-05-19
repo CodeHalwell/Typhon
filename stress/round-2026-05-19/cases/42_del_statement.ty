@@ -1,0 +1,9 @@
+def main() -> None:
+    mut xs: list[int] = [1, 2, 3, 4, 5]
+    del xs[2]
+    print(xs)
+    let d: dict[str, int] = {"a": 1, "b": 2}
+    del d["a"]
+    print(d)
+
+main()

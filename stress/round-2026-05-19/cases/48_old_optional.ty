@@ -1,0 +1,19 @@
+from typing import Optional, Union
+
+def find(xs: list[int], k: int) -> Optional[int]:
+    for x in xs:
+        if x == k:
+            return x
+    return None
+
+def parse(s: str) -> Union[int, str]:
+    try:
+        return int(s)
+    except ValueError:
+        return s
+
+def main() -> None:
+    print(find([1, 2, 3], 2))
+    print(parse("42"))
+
+main()

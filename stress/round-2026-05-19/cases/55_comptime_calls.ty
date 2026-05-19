@@ -1,0 +1,15 @@
+comptime def double(x: int) -> int:
+    return x * 2
+
+comptime def fib(n: int) -> int:
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+comptime let D: int = double(21)
+comptime let F: int = fib(10)
+
+def main() -> None:
+    print(D, F)
+
+main()

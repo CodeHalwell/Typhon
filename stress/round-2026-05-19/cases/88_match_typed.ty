@@ -1,0 +1,14 @@
+type Either = int | str
+
+def show(e: Either) -> str:
+    match e:
+        case int():
+            return f"int: {e}"
+        case str():
+            return f"str: {e}"
+
+def main() -> None:
+    print(show(42))
+    print(show("hello"))
+
+main()

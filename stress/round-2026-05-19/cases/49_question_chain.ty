@@ -1,0 +1,27 @@
+type Err = str
+
+def a(x: int) -> Result[int, Err]:
+    if x < 0:
+        return Err("a: neg")
+    return Ok(x + 1)
+
+def b(x: int) -> Result[int, Err]:
+    if x > 100:
+        return Err("b: big")
+    return Ok(x * 2)
+
+def c(x: int) -> Result[int, Err]:
+    return Ok(x - 3)
+
+def chain(x: int) -> Result[int, Err]:
+    let v1: int = a(x)?
+    let v2: int = b(v1)?
+    let v3: int = c(v2)?
+    return Ok(v3)
+
+def main() -> None:
+    print(chain(5))
+    print(chain(-1))
+    print(chain(60))
+
+main()

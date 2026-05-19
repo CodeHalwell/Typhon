@@ -1,0 +1,14 @@
+import io
+
+def main() -> None:
+    with io.StringIO("a") as a, io.StringIO("b") as b:
+        print(a.read(), b.read())
+    let bigger: tuple[io.StringIO, io.StringIO, io.StringIO] = (io.StringIO("x"), io.StringIO("y"), io.StringIO("z"))
+    with (
+        bigger[0] as a2,
+        bigger[1] as b2,
+        bigger[2] as c2,
+    ):
+        print(a2.read(), b2.read(), c2.read())
+
+main()

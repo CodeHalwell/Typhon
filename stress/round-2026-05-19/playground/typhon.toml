@@ -1,0 +1,28 @@
+[project]
+name = "playground"
+version = "0.1.0"
+src = "src"
+out = "build"
+
+[python]
+target = "3.13"
+free-threaded = false
+
+[emit]
+class-default = "dataclass"
+format = true
+
+[strictness]
+no-implicit-any = true
+unused-import = "error"
+exhaustive-match = "error"
+methods-in-class-body = "warn"
+auto-memoise = false
+auto-gather = false
+pgo-memoise = false
+pgo-min-calls = 100
+auto-parallel = false
+parallel-min-size = 64
+
+[env]
+required = []

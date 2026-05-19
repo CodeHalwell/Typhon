@@ -1,0 +1,18 @@
+import asyncio
+
+class Resource:
+    name: str
+
+impl Resource:
+    async def __aenter__(self) -> "Resource":
+        print(f"acquire {self.name}")
+        return self
+
+    async def __aexit__(self, exc_type: object, exc: object, tb: object) -> None:
+        print(f"release {self.name}")
+
+async def main() -> None:
+    async with Resource(name="db") as r:
+        print(f"using {r.name}")
+
+asyncio.run(main())

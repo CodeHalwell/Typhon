@@ -1,0 +1,24 @@
+class Validated:
+    name: str
+    _min: int
+
+impl Validated:
+    def __set_name__(self, owner: type, name: str) -> None:
+        self.name = "_" + name
+
+    def __get__(self, obj: object, objtype: object) -> int:
+        return getattr(obj, self.name)
+
+    def __set__(self, obj: object, value: int) -> None:
+        if value < self._min:
+            raise ValueError(f"too small: {value}")
+        setattr(obj, self.name, value)
+
+class Box:
+    val: Validated
+
+def main() -> None:
+    let b: Box = Box(val=Validated(name="", _min=0))
+    print("constructed")
+
+main()

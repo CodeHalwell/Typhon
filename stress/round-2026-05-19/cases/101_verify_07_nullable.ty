@@ -1,0 +1,10 @@
+def find(id: int) -> str?:
+    if id == 1:
+        return "alice"
+    return None
+
+def main() -> None:
+    let result: str? = find(1)
+    print(result)
+
+main()

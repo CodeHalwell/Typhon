@@ -1,0 +1,9 @@
+def main() -> None:
+    let d: dict[str, int] = {"a": 1}
+    let x: int = d.get("a", 0)
+    let y: int = d.get("missing", 99)
+    print(x, y)
+    let z: int? = d.get("a")
+    print(z)
+
+main()

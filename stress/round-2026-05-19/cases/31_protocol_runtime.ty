@@ -1,0 +1,15 @@
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class Sized(Protocol):
+    def __len__(self) -> int: ...
+
+def take(s: Sized) -> int:
+    return len(s)
+
+def main() -> None:
+    print(take([1, 2, 3]))
+    print(take("hello"))
+    print(isinstance([1], Sized))
+
+main()

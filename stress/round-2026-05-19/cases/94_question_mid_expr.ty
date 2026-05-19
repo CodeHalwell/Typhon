@@ -1,0 +1,13 @@
+def parse(s: str) -> Result[int, str]:
+    if s.isdigit():
+        return Ok(int(s))
+    return Err("not digit")
+
+def add_two(s: str, t: str) -> Result[int, str]:
+    return Ok(parse(s)? + parse(t)?)
+
+def main() -> None:
+    print(add_two("10", "20"))
+    print(add_two("10", "x"))
+
+main()

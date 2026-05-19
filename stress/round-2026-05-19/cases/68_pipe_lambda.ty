@@ -1,0 +1,5 @@
+def main() -> None:
+    let result: int = 5 |> (lambda x: x * 2)() |> (lambda x: x + 1)()
+    print(result)
+
+main()

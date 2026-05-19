@@ -1,0 +1,12 @@
+def find(xs: list[int], target: int) -> int:
+    for x in xs:
+        if x == target:
+            return x
+    else:
+        return -1
+
+def main() -> None:
+    print(find([1, 2, 3], 2))
+    print(find([1, 2, 3], 5))
+
+main()

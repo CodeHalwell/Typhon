@@ -1,0 +1,14 @@
+class Node:
+    val: int
+    next: "Node?"
+
+impl Node:
+    def append(self, v: int) -> "Node":
+        return Node(val=v, next=self)
+
+def main() -> None:
+    let n1: Node = Node(val=1, next=None)
+    let n2: Node = n1.append(2)
+    print(n2.val, n2.next.val if n2.next is not None else -1)
+
+main()

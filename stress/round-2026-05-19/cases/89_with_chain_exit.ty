@@ -1,0 +1,18 @@
+def step(x: int) -> Result[int, str]:
+    if x < 0:
+        return Err("neg")
+    return Ok(x + 1)
+
+def pipeline(x: int) -> Result[int, str]:
+    with a = step(x)?,
+         b = step(a)?,
+         c = step(b)?:
+        return Ok(c)
+    else err:
+        return Err(f"failed: {err}")
+
+def main() -> None:
+    print(pipeline(0))
+    print(pipeline(-1))
+
+main()

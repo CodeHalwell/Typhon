@@ -1,0 +1,13 @@
+class Point frozen:
+    x: int
+    y: int
+
+def main() -> None:
+    let p1: Point = Point(x=1, y=2)
+    let p2: Point = Point(x=1, y=2)
+    let p3: Point = Point(x=3, y=4)
+    print(p1 == p2)
+    print(p1 == p3)
+    print(hash(p1) == hash(p2))
+
+main()

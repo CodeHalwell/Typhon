@@ -1,0 +1,11 @@
+lazy let CFG: dict[str, int] = build_cfg()
+
+def build_cfg() -> dict[str, int]:
+    print("building cfg")
+    return {"port": 8080, "workers": 4}
+
+def main() -> None:
+    print(CFG["port"])
+    print(CFG.get("workers"))
+
+main()

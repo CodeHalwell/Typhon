@@ -1,0 +1,11 @@
+import json
+
+def parse(s: str) -> int:
+    unsafe:
+        let data = json.loads(s)
+    return data
+
+def main() -> None:
+    print(parse('42'))
+
+main()
