@@ -1047,7 +1047,7 @@ impl Emitter {
                             for elem in &inner.elements {
                                 match elem {
                                     InterpolatedStringElement::Literal(lit) => {
-                                        self.write(&escape_python_string_with_quote(
+                                        self.write(&escape_python_fstring_literal(
                                             &lit.value, outer,
                                         ));
                                     }
@@ -1072,11 +1072,9 @@ impl Emitter {
                                             for spec_elem in &spec.elements {
                                                 match spec_elem {
                                                     InterpolatedStringElement::Literal(lit) => {
-                                                        self.write(
-                                                            &escape_python_string_with_quote(
-                                                                &lit.value, outer,
-                                                            ),
-                                                        );
+                                                        self.write(&escape_python_fstring_literal(
+                                                            &lit.value, outer,
+                                                        ));
                                                     }
                                                     InterpolatedStringElement::Interpolation(
                                                         nested,
@@ -1663,6 +1661,36 @@ fn escape_python_string_with_quote(s: &str, quote: char) -> String {
     for ch in s.chars() {
         match ch {
             '\\' => out.push_str("\\\\"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x00'..='\x1f' | '\x7f' => {
+                out.push_str(&format!("\\x{:02x}", ch as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Escape a literal segment from inside an f-string.  Identical to
+/// [`escape_python_string_with_quote`] but additionally doubles `{` → `{{`
+/// and `}` → `}}` — the ruff parser stores f-string literal segments with
+/// braces already un-escaped, so emitting them verbatim would turn a
+/// literal `{` back into an interpolation opener (`f"{ \"a\": 1 }"` would
+/// re-parse as `f"<expr>"` with `\"a\": 1` as the expression, which is a
+/// syntax error).
+fn escape_python_fstring_literal(s: &str, quote: char) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '{' => out.push_str("{{"),
+            '}' => out.push_str("}}"),
             c if c == quote => {
                 out.push('\\');
                 out.push(c);

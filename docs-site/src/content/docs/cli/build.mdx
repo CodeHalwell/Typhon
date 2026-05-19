@@ -60,10 +60,8 @@ Each stage is a Salsa query; on incremental rebuilds, only invalidated outputs a
 
 | Flag | Effect |
 |------|--------|
-| `--out DIR` | Override the `[project] out` directory. |
+| `--out DIR` (`-o`) | Override the `[project] out` directory. Relative paths resolve against the project root. |
 | `--no-format` | Skip the `ruff format` post-process. |
-| `--watch` | Re-build on file changes. |
-| `--quiet` | Suppress informational logs. |
 
 ## When the build fails
 

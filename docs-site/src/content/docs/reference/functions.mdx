@@ -34,8 +34,8 @@ async def g(url: str) -> bytes: ...
 Every parameter must have a type annotation; the return type must be present (`-> None` for void).
 
 ```python
-def add(a, b): ...       # ❌ tyc::missing_param_type and tyc::missing_return_type
-def add(a: int, b: int): ...     # ❌ tyc::missing_return_type
+def add(a, b): ...               # ❌ tyc::missing_annotation — both params and return type
+def add(a: int, b: int): ...     # ❌ tyc::missing_annotation — return type
 def add(a: int, b: int) -> int: ...    # ✅
 ```
 
@@ -127,18 +127,18 @@ The checker enforces:
 - `async def` containing no `await` is a warning (`tyc::async_without_await`).
 - Calling an `async def` from a sync function without `await` is a hard error (`tyc::missing_await`).
 
-## Return-path checking
+## Return-path checking (reserved)
 
-Every reachable exit from a function must either `return` a value of the declared type or be unreachable:
+Static fall-through analysis is reserved for a future Typhon release. Today the checker validates that every explicit `return` matches the declared type, but does not flag a function that may exit without returning:
 
 ```python
 def f() -> int:
     if cond:
         return 1
-    # ❌ tyc::missing_return — function may exit without returning int
+    # accepted today; future versions will surface this as a hard error
 ```
 
-`raise` counts as an exit. `unreachable_code()` / `sys.exit()` do not change the analysis (the checker doesn't know they don't return).
+`raise` counts as an exit at runtime. Prefer exhaustive `match` over sealed unions for guaranteed full-coverage control flow.
 
 ## Lambdas
 
@@ -146,7 +146,7 @@ def f() -> int:
 let double = lambda n: n * 2     # type inferred from context
 ```
 
-Lambda parameters and return types are inferred from the call site or assignment target. If the context can't pin them down, you get `tyc::implicit_any` — promote to a named function.
+Lambda parameters and return types are inferred from the call site or assignment target. If the context can't pin them down, the lambda's parameters fall back to `Any` and the inferred type leaks through — promote to a named function with explicit annotations when the binding outlives a single call.
 
 ## Where next
 

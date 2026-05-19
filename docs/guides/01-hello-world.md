@@ -140,11 +140,12 @@ def main():           # ❌ missing return annotation
 ```
 
 ```
-error[tyc::missing_return_type]: function `main` is missing a return type
+error[tyc::missing_annotation]: `return type` on `main` is missing a type annotation
  ┌─ src/main.ty:1:5
  │
 1 │ def main():
- │     ^^^^ add `-> None` (or another type) here
+ │     ^^^^ annotation required here
+ = help: Typhon's Rule 1: annotate every parameter and return type. For a function that returns nothing, write `-> None`.
 ```
 
 Fix: write `def main() -> None:`.

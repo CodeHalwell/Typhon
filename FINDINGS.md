@@ -228,6 +228,128 @@ methods on literal receivers (`words |> ", ".join()`).
 
 ---
 
+## Status as of `claude/review-examples-x5kgr`
+
+End-to-end audit of every example under `examples/`: compile each one,
+run `python -m py_compile` on the emitted Python, and execute the
+stdlib-only ones to confirm they work end-to-end. Before this branch,
+9 of 47 examples failed `tyc build` and many of the "built" ones still
+emitted Python that was rejected by CPython for syntax errors. After
+the fixes in this branch, all 47 examples build clean (`tyc build`),
+all 47 produce syntactically-valid Python (`python -m py_compile`),
+and all 21 examples whose runtime dependencies are pure stdlib +
+`typhon_runtime` execute correctly under CPython 3.13.
+
+The work surfaced seven distinct compiler bugs and four example-side
+bugs. Each is closed below.
+
+**Compiler bugs closed:**
+
+- **Resolver: `Stmt::Match` was never walked.** The match `subject`,
+  every `case` pattern, the guard, and the body all went unvisited,
+  so references inside match arms (`sys.exit(...)` inside
+  `case Ok(cmd):`) never marked the imported name as used, and case
+  bindings (`value` in `case Ok(value):`) were never declared in the
+  enclosing scope. Added `walk_pattern` covering every `Pattern::*`
+  variant and a `Stmt::Match` arm to `walk_stmt`.
+
+- **Resolver: parameter defaults were never walked.** `def f(x: int =
+  Depends(get_db))` recorded `Depends` only as part of the imported
+  binding list, never as a *reference*, so `tyc::unused_import`
+  spuriously fired against `from fastapi import Depends`. Default
+  expressions now go through `walk_expr` alongside annotations in
+  `walk_argument_annotations`.
+
+- **Resolver: nested function / class declarations were never inserted
+  into the enclosing scope.** `collect_top_level` only sees direct
+  children of a function/module body, so an `async def one(...)`
+  nested inside an `async with` block disappeared from its parent
+  scope and surfaced as `tyc::unknown_name` when called.
+  `walk_stmt(Stmt::FunctionDef)` and `walk_stmt(Stmt::ClassDef)` now
+  declare the name in `scope` first — idempotent at top level where
+  `collect_top_level` has already done it.
+
+- **Validator: `with`-chain question-op false positive.** The
+  question-op validator runs on the original (pre-expansion) source
+  so it can report offsets in the user's text, but
+  `find_mid_expression_questionmarks` treated *any* `?` not at end of
+  line as Rust-style mid-expression `?` — including the `?,` and
+  `?:` that terminate the bindings inside a `with x = f()?, y =
+  g()?:` chain. The check now also skips the `?` immediately before
+  a trailing `,` or `:`. This was hitting the docs' canonical
+  `with`-chain example verbatim (example 07).
+
+- **Format: `apply_simple_style_rules` stripped genuine inter-token
+  spaces.** The `just_opened_bracket` sentinel was set on `[` / `(`
+  but only reset inside the space-handling branch, so the *first*
+  space following any character emitted after an opener was treated
+  as "still adjacent to the opener" and removed. Output like
+  `[w for w in xs]` came out as `[wfor w in xs]` (invalid Python),
+  `len(trimmed) == 0` came out as `len(trimmed)== 0`, and so on
+  across most of the examples. Now resets the sentinel in every
+  non-bracket arm.
+
+- **Emit: f-string literal braces were not re-escaped.** Ruff stores
+  the contents of an f-string literal segment with `{{` /`}}`
+  already collapsed to `{` /`}`, so emitting the segment back via
+  `escape_python_string_with_quote` produced `f"{...}"` where the
+  source had `f'{{...}}'`. The single `{` then opened a spurious
+  expression, breaking 09-interfaces and 43-agent-framework. Added
+  `escape_python_fstring_literal` that doubles `{` and `}`, and
+  routed every f-string literal element (top-level + format-spec)
+  through it.
+
+- **Build: `comptime def` was emitted into the runtime `.py`.** The
+  preprocessor stripped the `comptime` keyword and tracked the
+  function name in `PreprocessResult::comptime_functions`, but
+  `substitute_comptime_literals` only replaced the AnnAssign values
+  — it never removed the `def` node itself. The emitted Python
+  therefore contained a regular Python function referencing
+  build-time-only intrinsics (`env(...)`), which would `NameError`
+  the moment anything called it. The pass now filters out function
+  defs whose name appears in `comptime_functions`.
+
+**Example bugs closed:**
+
+- **40-llm-tool-use, 44-multi-agent:** dropped truly-unused
+  `from typing import Callable`.
+
+- **25-sqlite-database:** the bulk-insert demo passed a list
+  literal where every rating was a non-None `float`, which Typhon's
+  inference unifies as `list[tuple[str, str, int, float]]` and
+  refuses to widen against the parameter's
+  `list[tuple[str, str, int, float?]]`. (Bidirectional inference
+  does not push the outer annotation through nested tuple element
+  types in v1.) Switched to building the list row by row with each
+  rating bound to a `let r: float? = …` first, so the literal
+  inferred the nullable element type directly. Worth tracking
+  separately as a v2 inference improvement.
+
+- **47-mini-app:** `if key is None or len(key) == 0: raise` did not
+  narrow `key` from `str?` to `str` on the post-`raise` path —
+  Typhon recognises the simple `if key is None: raise` form but not
+  the compound `or` branch. Split the check into two consecutive
+  `if`s. Worth tracking as a narrowing improvement.
+
+**Observations not fixed:**
+
+- The lightweight format step still does not wrap long lines, so
+  emitted output diverges from `ruff format` purely on line length.
+  Functional behaviour is correct; full reformatting is the
+  Phase-5 `tyc fmt` deferral (#18).
+
+- Triple-quoted strings emit as `"\n…"` with escaped newlines
+  rather than preserving the triple-quoted form. Runs fine; less
+  readable. Worth a v2 emit improvement.
+
+- `tyc init <PATH>` writes the literal arg as the `name` field in
+  `typhon.toml`, so passing a path produces an invalid
+  `pyproject.toml` for `uv sync` (the warning is shown but build
+  succeeds anyway). Worth basename-normalising the argument before
+  writing the config.
+
+---
+
 ## 1. `class Foo frozen:` is a parse error (bug)
 
 **Status:** **FIXED** on `claude/update-findings-IdfrH`. Mirrored the existing

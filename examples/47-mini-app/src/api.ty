@@ -14,9 +14,13 @@ let DB_PATH: Path = Path(os.environ.get("NOTES_DB", "/tmp/typhon-notes.db"))
 
 def _require_api_key() -> str:
     let key: str? = os.environ.get("ANTHROPIC_API_KEY")
-    if key is None or len(key) == 0:
+    if key is None:
         raise RuntimeError(
             "ANTHROPIC_API_KEY is not set — refusing to start without a real API key"
+        )
+    if len(key) == 0:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY is empty — refusing to start without a real API key"
         )
     return key
 

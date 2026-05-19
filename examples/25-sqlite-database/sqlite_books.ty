@@ -85,11 +85,19 @@ def main() -> None:
     init_schema(conn)
 
     insert_book(conn, "The Mythical Man-Month", "F. Brooks", 1975, 4.5)
-    transactional_bulk_insert(conn, [
-        ("Code Complete", "S. McConnell", 1993, 4.6),
-        ("Clean Code", "R. Martin", 2008, 3.9),
-        ("Refactoring", "M. Fowler", 1999, 4.4),
-    ])
+    # Build the list row-by-row so each rating widens into `float?`
+    # (Typhon's bidirectional inference does not push the outer annotation
+    # through nested tuple element types in v1).
+    mut bulk: list[tuple[str, str, int, float?]] = []
+    let r1: float? = 4.6
+    let r2: float? = 3.9
+    let r3: float? = 4.4
+    let r4: float? = None
+    bulk.append(("Code Complete", "S. McConnell", 1993, r1))
+    bulk.append(("Clean Code", "R. Martin", 2008, r2))
+    bulk.append(("Refactoring", "M. Fowler", 1999, r3))
+    bulk.append(("The C Programming Language", "K&R", 1978, r4))
+    transactional_bulk_insert(conn, bulk)
 
     for b in find_by_author(conn, "M. Fowler"):
         print(f"{b.title} ({b.year}) — {b.rating}")

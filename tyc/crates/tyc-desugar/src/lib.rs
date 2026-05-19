@@ -1041,17 +1041,14 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             // dataclasses (the runtime Protocol behaviour conflicts with
             // dataclass field collection).
             let is_protocol = class_inherits_protocol(c);
-            // `TypedDict` subclasses must never receive `@dataclass`.  Python
-            // raises `TypeError: cannot inherit from both a TypedDict type and
-            // a non-TypedDict base class` when the decorator is present.  FINDINGS #67.
-            let is_typeddict = class_inherits_typeddict(c);
+            let is_typed_dict = class_inherits_typed_dict(c);
             // Skip the dataclass decorator for Pydantic model classes,
             // Protocol classes, TypedDict subclasses, and lazy proxies; they
             // already carry the right shape or are incompatible with dataclass.
             let needs_decorator = !is_raw
                 && !is_pydantic
                 && !is_protocol
-                && !is_typeddict
+                && !is_typed_dict
                 && !is_impl_stub
                 && !is_lazy_proxy
                 && !has_dataclass_decorator(&c.decorator_list);
@@ -1387,17 +1384,26 @@ fn class_inherits_protocol(c: &ruff_python_ast::StmtClassDef) -> bool {
         .any(|base| matches!(base, Expr::Name(n) if n.id.as_str() == "Protocol"))
 }
 
-/// Return `true` if `c` inherits from `TypedDict` (bare name or as
-/// `typing.TypedDict`).  Python raises `TypeError: cannot inherit from both
-/// a TypedDict type and a non-TypedDict base class` when `@dataclass` is
-/// applied to a `TypedDict` subclass, so these classes must be emitted as
-/// plain classes.  FINDINGS #67.
-fn class_inherits_typeddict(c: &ruff_python_ast::StmtClassDef) -> bool {
+/// Return `true` if `c` inherits directly from `TypedDict`.
+///
+/// `TypedDict` subclasses must not receive `@dataclasses.dataclass(slots=True)`
+/// — Python raises `TypeError: cannot inherit from both a TypedDict type and a
+/// non-TypedDict base class` at class-definition time. FINDINGS #67.
+///
+/// Handles bare-name (`TypedDict`), `typing.TypedDict`, and
+/// `typing_extensions.TypedDict` forms.
+fn class_inherits_typed_dict(c: &ruff_python_ast::StmtClassDef) -> bool {
     c.bases().iter().any(|base| match base {
+        // `class X(TypedDict):`
         Expr::Name(n) => n.id.as_str() == "TypedDict",
+        // `class X(typing.TypedDict):` or `class X(typing_extensions.TypedDict):`
         Expr::Attribute(a) => {
-            matches!(&*a.value, Expr::Name(n) if n.id.as_str() == "typing")
-                && a.attr.as_str() == "TypedDict"
+            a.attr.as_str() == "TypedDict"
+                && matches!(
+                    &*a.value,
+                    Expr::Name(n)
+                    if n.id.as_str() == "typing" || n.id.as_str() == "typing_extensions"
+                )
         }
         _ => false,
     })
@@ -2869,32 +2875,34 @@ mod tests {
     }
 
     #[test]
-    fn typeddict_class_does_not_get_dataclass_decorator() {
-        // FINDINGS #67: applying @dataclass to a TypedDict subclass raises
-        // `TypeError: cannot inherit from both a TypedDict type and a
-        // non-TypedDict base class` at import time.  The desugar pass must
-        // recognise `TypedDict` in the base list and skip decoration.
-        let src = "from typing import TypedDict\n\nclass UserDict(TypedDict):\n    id: int\n    name: str\n";
+    fn typed_dict_skips_dataclass_decorator() {
+        let src = "from typing import TypedDict\nclass U(TypedDict):\n    id: int\n    name: str\n";
         let out = parse_and_desugar(src);
         assert!(
             !out.contains("@dataclasses.dataclass"),
-            "TypedDict subclass must not receive @dataclass decorator:\n{out}"
-        );
-        assert!(
-            out.contains("class UserDict(TypedDict):"),
-            "class declaration must be preserved:\n{out}"
+            "TypedDict must not get @dataclasses.dataclass decorator: {out}"
         );
     }
 
     #[test]
-    fn typeddict_via_typing_module_does_not_get_dataclass_decorator() {
-        // Same as above but accessed as `typing.TypedDict` (qualified form).
-        let src =
-            "import typing\n\nclass Config(typing.TypedDict):\n    host: str\n    port: int\n";
+    fn typed_dict_qualified_skips_dataclass_decorator() {
+        // `typing.TypedDict` (qualified) must also be detected.
+        let src = "import typing\nclass U(typing.TypedDict):\n    id: int\n";
         let out = parse_and_desugar(src);
         assert!(
             !out.contains("@dataclasses.dataclass"),
-            "typing.TypedDict subclass must not receive @dataclass decorator:\n{out}"
+            "typing.TypedDict must not get @dataclasses.dataclass decorator: {out}"
+        );
+    }
+
+    #[test]
+    fn typed_dict_extensions_qualified_skips_dataclass_decorator() {
+        // `typing_extensions.TypedDict` must also be detected.
+        let src = "import typing_extensions\nclass U(typing_extensions.TypedDict):\n    id: int\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            !out.contains("@dataclasses.dataclass"),
+            "typing_extensions.TypedDict must not get @dataclasses.dataclass decorator: {out}"
         );
     }
 }

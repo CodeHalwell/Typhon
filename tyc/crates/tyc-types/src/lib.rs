@@ -2778,7 +2778,11 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             }
             check_function(
                 c,
-                f.name.as_str(),
+                (
+                    f.name.as_str(),
+                    f.name.range.start().to_usize(),
+                    f.name.as_str().len().max(1),
+                ),
                 f.parameters.as_ref(),
                 &f.body,
                 f.returns.as_deref(),
@@ -3061,13 +3065,14 @@ fn enforce_annotation_rule(
 
 fn check_function(
     c: &mut Checker,
-    name: &str,
+    name_info: (&str, usize, usize),
     parameters: &ruff_python_ast::Parameters,
     body: &[Stmt],
     returns: Option<&Expr>,
     type_params: &[String],
     is_async: bool,
 ) {
+    let (name, name_span_offset, name_span_len) = name_info;
     let classes = c.classes.clone();
     let ret_type = match returns {
         Some(r) => type_from_annotation_with_params(r, &classes, type_params),
@@ -3109,6 +3114,19 @@ fn check_function(
                 ));
             }
         }
+    }
+
+    // `async def` with no `await` — warn per tyc::async_without_await (FINDINGS #83).
+    // Only fires for user-authored async functions, not compiler-synthesised helpers
+    // (prefixed with `__typhon_`).
+    if is_async && !name.starts_with("__typhon_") && !body_has_await(body) {
+        c.diagnostics.push_warning(TycError::async_without_await(
+            name,
+            c.path.clone(),
+            c.source,
+            name_span_offset,
+            name_span_len,
+        ));
     }
 
     let saved_return = c.current_return.replace(ret_type);
@@ -6018,6 +6036,84 @@ class Identity frozen:
             !d.has_errors(),
             "field declarations inside a frozen class body must not be flagged: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    // ── async_without_await ───────────────────────────────────────────────
+
+    fn has_async_without_await_warning(d: &Diagnostics) -> bool {
+        d.warnings().iter().any(|w: &TycError| {
+            let s = w.to_string();
+            s.contains("async_without_await") || s.contains("no `await`")
+        })
+    }
+
+    #[test]
+    fn async_without_await_warns_on_bare_async_def() {
+        let d = check("async def foo():\n    x: int = 1\n");
+        assert!(
+            has_async_without_await_warning(&d),
+            "expected async_without_await warning, got: {:?}",
+            d.warnings()
+                .iter()
+                .map(|w: &TycError| w.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn async_without_await_silent_when_await_present() {
+        let d = check("async def fetch() -> int:\n    x = await some_coro()\n    return x\n");
+        assert!(
+            !has_async_without_await_warning(&d),
+            "unexpected async_without_await warning: {:?}",
+            d.warnings()
+                .iter()
+                .map(|w: &TycError| w.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn async_without_await_not_triggered_by_await_in_nested_def() {
+        // An `await` that lives inside an inner `async def` does not count
+        // toward the outer function's await detection.
+        let d = check("async def outer():\n    async def inner():\n        await some_coro()\n");
+        assert!(
+            has_async_without_await_warning(&d),
+            "outer should warn because its own body has no await; got: {:?}",
+            d.warnings()
+                .iter()
+                .map(|w: &TycError| w.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn async_without_await_silent_for_async_for() {
+        // `async for` counts as an asynchronous construct — no warning expected.
+        let d = check("async def consume(ait):\n    async for item in ait:\n        pass\n");
+        assert!(
+            !has_async_without_await_warning(&d),
+            "async for should suppress async_without_await; got: {:?}",
+            d.warnings()
+                .iter()
+                .map(|w: &TycError| w.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn async_without_await_silent_for_async_with() {
+        // `async with` counts as an asynchronous construct — no warning expected.
+        let d = check("async def managed(cm):\n    async with cm as ctx:\n        pass\n");
+        assert!(
+            !has_async_without_await_warning(&d),
+            "async with should suppress async_without_await; got: {:?}",
+            d.warnings()
+                .iter()
+                .map(|w: &TycError| w.to_string())
+                .collect::<Vec<_>>()
         );
     }
 }

@@ -1626,8 +1626,19 @@ fn find_mid_expression_questionmarks(code: &str) -> Vec<usize> {
     let bytes = code.as_bytes();
     let trimmed_end = code.trim_end_matches([' ', '\t']).len();
     // Skip the *last* `?` if it ends the code — that's the supported form.
+    //
+    // Also skip the `?` that immediately precedes a trailing `,` or `:` —
+    // those are the `with`-chain terminators `expr?,` and `expr?:` which
+    // `expand_with_chains` recognises later in the pipeline.  Without this
+    // carve-out, the bindings on every line of a `with ... = ...?,
+    // ... = ...?:` chain would be spuriously flagged as mid-expression `?`.
     let scan_end = if trimmed_end > 0 && bytes[trimmed_end - 1] == b'?' {
         trimmed_end - 1
+    } else if trimmed_end >= 2
+        && (bytes[trimmed_end - 1] == b',' || bytes[trimmed_end - 1] == b':')
+        && bytes[trimmed_end - 2] == b'?'
+    {
+        trimmed_end - 2
     } else {
         trimmed_end
     };
@@ -5901,5 +5912,34 @@ string content
         assert!(out.contains("multi-line"));
         assert!(out.contains("string content"));
         assert!(out.contains("        return 0"));
+    }
+
+    #[test]
+    fn gather_strips_trailing_comment() {
+        let src = "async def f() -> None:\n    gather:\n        a = fetch_a()  # first\n        b = fetch_b()  # second\n    print(a, b)\n";
+        let out = expand_gather_blocks(src);
+        assert!(
+            !out.contains("# first"),
+            "comment should be stripped: {out}"
+        );
+        assert!(
+            !out.contains("# second"),
+            "comment should be stripped: {out}"
+        );
+        assert!(out.contains("create_task(fetch_a())"), "call intact: {out}");
+        assert!(out.contains("create_task(fetch_b())"), "call intact: {out}");
+    }
+
+    #[test]
+    fn gather_preserves_hash_inside_triple_quoted_string() {
+        // A `#` inside a triple-quoted string literal is NOT a comment; the
+        // expression must not be truncated.
+        let src =
+            "async def f() -> None:\n    gather:\n        a = get(\"\"\"a#b\"\"\")\n    print(a)\n";
+        let out = expand_gather_blocks(src);
+        assert!(
+            out.contains(r#"create_task(get("""a#b"""))"#),
+            "triple-quoted # must not be stripped: {out}"
+        );
     }
 }

@@ -238,6 +238,7 @@ fn apply_simple_style_rules(line: &str) -> String {
                 for c in chars.by_ref() {
                     out.push(c);
                 }
+                just_opened_bracket = false;
             }
             ',' => {
                 out.push(',');
@@ -265,8 +266,18 @@ fn apply_simple_style_rules(line: &str) -> String {
                     }
                     out.push(' ');
                 }
+                just_opened_bracket = false;
             }
-            _ => out.push(c),
+            _ => {
+                out.push(c);
+                // Reset the just-opened-bracket sentinel as soon as we emit
+                // any non-bracket, non-space content.  Without this, a
+                // genuine inter-token space after `[w` or `(x` (e.g. the
+                // space before `for` in `[w for w in xs]`) is mistakenly
+                // treated as "still adjacent to the opener" and stripped —
+                // turning a valid comprehension into `[wfor w in xs]`.
+                just_opened_bracket = false;
+            }
         }
     }
     out

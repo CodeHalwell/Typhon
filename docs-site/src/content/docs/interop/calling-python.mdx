@@ -9,7 +9,7 @@ When you `import` from a plain `.py`, three outcomes are possible:
 
 1. **The module is typed** (PEP 484 / 526 annotations everywhere). The checker accepts the types and treats the import like a Typhon module.
 2. **An authored `.dty` stub exists** for the module. The stub is the typed surface; the runtime `.py` is the implementation.
-3. **The module is untyped.** Imports return `Any` — which is `tyc::implicit_any` unless the call site is in an `unsafe:` block.
+3. **The module is untyped.** Imports return `Any` — values bind silently today, but the type system can't reason about them. Wrap the boundary in `unsafe:` or annotate the call site to keep the rest of the code base honest.
 
 ## Typed Python imports
 
@@ -55,7 +55,7 @@ See [Writing .dty Stubs](/Typhon/interop/dty-stubs/) for the stub format.
 import messy_lib
 
 def f() -> int:
-    let raw = messy_lib.fetch()    # ❌ tyc::implicit_any
+    let raw = messy_lib.fetch()    # binds to Any — opaque to the checker
 ```
 
 Three fixes, in order of preference:
