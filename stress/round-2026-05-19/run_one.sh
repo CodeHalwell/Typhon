@@ -7,7 +7,7 @@ if [ ! -x "$TYC" ]; then
     echo "tyc binary not found at $TYC — set TYC=... or build with 'cargo build --release' in tyc/" >&2
     exit 1
 fi
-file="$1"
+file="${1:?Usage: $0 <file.ty>}"
 echo "=== $file ==="
 "$TYC" check "$file" 2>&1
 echo "(exit: $?)"

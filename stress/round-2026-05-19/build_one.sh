@@ -8,7 +8,7 @@ if [ ! -x "$TYC" ]; then
     exit 1
 fi
 PY="${PYTHON:-python3.13}"
-file="$1"
+file="${1:?Usage: $0 <file.ty>}"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$work/src"
