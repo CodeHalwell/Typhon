@@ -13,7 +13,7 @@
 //! removes characters at the start of a line, so positions inside
 //! expressions remain stable; we use them directly.
 
-use ruff_python_ast::{self as ast, Expr, ModModule, Stmt};
+use ruff_python_ast::{self as ast, Expr, ModModule, Pattern, Stmt};
 use ruff_text_size::TextRange;
 use tyc_diagnostics::{Diagnostics, TycError};
 
@@ -1003,6 +1003,27 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             for d in &f.decorator_list {
                 walk_expr(r, scope, &d.expression);
             }
+            // Declare the function name in the enclosing scope so it is visible
+            // from sibling statements that come after this definition — including
+            // comprehensions, closures, and statements inside the same `with`/`if`
+            // block body. `collect_top_level` already pre-declares names at the
+            // direct top level of a function body (enabling forward references);
+            // this call extends that to nested definitions. `declare` is a no-op
+            // when the span matches an existing binding (the top-level case), so
+            // there is no double-declaration risk.
+            let fn_name_span = find_def_name_span(
+                r.source,
+                f.range.start().to_usize(),
+                "def ",
+                f.name.as_str(),
+            );
+            r.declare(
+                scope,
+                f.name.as_str(),
+                BindingKind::Function,
+                Mutability::Mut,
+                fn_name_span,
+            );
             let fn_scope = r.push_scope(ScopeKind::Function, scope, range_to_span(f.range));
             // PEP 695 type parameters (`def f[T](x: T) -> T`) bind into the
             // function scope so the parameter and return-type annotations can
@@ -1017,6 +1038,8 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
                 fn_scope
             };
             walk_argument_annotations(r, ann_scope, &f.parameters);
+            // Default values are evaluated in the enclosing scope.
+            walk_argument_defaults(r, scope, &f.parameters);
             if let Some(ret) = &f.returns {
                 walk_expr(r, ann_scope, ret);
             }
@@ -1204,7 +1227,120 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
                 walk_expr(r, scope, t);
             }
         }
+        Stmt::Match(m) => {
+            // Walk the subject so names referenced there (e.g. `sys.argv`)
+            // are counted as uses and don't trigger false unused-import warnings.
+            walk_expr(r, scope, &m.subject);
+            for case in &m.cases {
+                // Declare names introduced by the pattern so they're in scope
+                // for the guard and body.
+                walk_match_pattern(r, scope, &case.pattern);
+                if let Some(guard) = &case.guard {
+                    walk_expr(r, scope, guard);
+                }
+                for s in &case.body {
+                    walk_stmt(r, scope, s);
+                }
+            }
+        }
         _ => {}
+    }
+}
+
+/// Walk a match-case pattern, declaring any names it binds (capture variables,
+/// `*rest` targets, mapping rest keys) and recording any value references it
+/// contains (dotted constants like `Status.OK`, class names like `Ok`/`Err`).
+fn walk_match_pattern(r: &mut Resolver, scope: ScopeId, pat: &Pattern) {
+    match pat {
+        // `case x` or `case Some(x) as x` — binds the alias name.
+        Pattern::MatchAs(m) => {
+            if let Some(inner) = &m.pattern {
+                walk_match_pattern(r, scope, inner);
+            }
+            if let Some(name) = &m.name {
+                let span = (
+                    name.range.start().to_usize(),
+                    name.range.start().to_usize() + name.as_str().len(),
+                );
+                r.declare(scope, name.as_str(), BindingKind::Loop, Mutability::Mut, span);
+            }
+        }
+        // `case *rest` — binds the star name.
+        Pattern::MatchStar(m) => {
+            if let Some(name) = &m.name {
+                let span = (
+                    name.range.start().to_usize(),
+                    name.range.start().to_usize() + name.as_str().len(),
+                );
+                r.declare(scope, name.as_str(), BindingKind::Loop, Mutability::Mut, span);
+            }
+        }
+        // `case {k: v, **rest}` — keys are constant exprs (walk as refs),
+        // sub-patterns may bind names, and `rest` is bound if present.
+        Pattern::MatchMapping(m) => {
+            for key in &m.keys {
+                walk_expr(r, scope, key);
+            }
+            for sub in &m.patterns {
+                walk_match_pattern(r, scope, sub);
+            }
+            if let Some(rest) = &m.rest {
+                let span = (
+                    rest.range.start().to_usize(),
+                    rest.range.start().to_usize() + rest.as_str().len(),
+                );
+                r.declare(scope, rest.as_str(), BindingKind::Loop, Mutability::Mut, span);
+            }
+        }
+        // `case Ok(x)` / `case Circle(r)` — walk the class name as a reference
+        // so it's counted as a use; recurse on positional and keyword patterns.
+        Pattern::MatchClass(m) => {
+            walk_expr(r, scope, &m.cls);
+            for sub in &m.arguments.patterns {
+                walk_match_pattern(r, scope, sub);
+            }
+            for kw in &m.arguments.keywords {
+                walk_match_pattern(r, scope, &kw.pattern);
+            }
+        }
+        // `case p1 | p2 | p3` — each alternative may bind names.
+        Pattern::MatchOr(m) => {
+            for sub in &m.patterns {
+                walk_match_pattern(r, scope, sub);
+            }
+        }
+        // `case Status.OK` — a dotted value expression; walk as a reference.
+        Pattern::MatchValue(m) => {
+            walk_expr(r, scope, &m.value);
+        }
+        // `case [a, b, *rest]` — recurse on all sub-patterns.
+        Pattern::MatchSequence(m) => {
+            for sub in &m.patterns {
+                walk_match_pattern(r, scope, sub);
+            }
+        }
+        // `case True` / `case None` — literal constants; no bindings, no refs.
+        Pattern::MatchSingleton(_) => {}
+    }
+}
+
+/// Walk every *default value* expression on the parameters of a function.
+///
+/// Default values are evaluated in the *defining* (enclosing) scope — not
+/// inside the function's own scope — so they must be walked against the
+/// caller's `scope`. Without this, names used only as default values (e.g.
+/// `Depends(get_store)`, `Query(...)`) are never registered as references and
+/// trigger false "unused import" warnings — FINDINGS #46.
+fn walk_argument_defaults(r: &mut Resolver, scope: ScopeId, args: &ast::Parameters) {
+    let all = args
+        .posonlyargs
+        .iter()
+        .chain(args.args.iter())
+        .chain(args.kwonlyargs.iter());
+    for arg in all {
+        if let Some(default) = &arg.default {
+            walk_expr(r, scope, default);
+        }
     }
 }
 
@@ -1248,6 +1384,7 @@ fn walk_impl_method(r: &mut Resolver, cls_scope: ScopeId, stmt: &Stmt) {
                 walk_expr(r, cls_scope, &d.expression);
             }
             walk_argument_annotations(r, cls_scope, &f.parameters);
+            walk_argument_defaults(r, cls_scope, &f.parameters);
             if let Some(ret) = &f.returns {
                 walk_expr(r, cls_scope, ret);
             }
@@ -2224,6 +2361,110 @@ def foo():
         assert!(
             m.symbol_at_offset(10_000).is_none(),
             "offsets past source end should not resolve to any symbol"
+        );
+    }
+
+    // ── nested function visibility ────────────────────────────────────────────
+
+    #[test]
+    fn nested_def_in_with_block_is_visible_in_sibling_statement() {
+        // A `def` inside a `with` body must be visible to subsequent statements
+        // in the same block.  Before the fix, `walk_stmt` for `FunctionDef` did
+        // not declare the function name in the enclosing scope; only
+        // `collect_top_level` did, and it does not recurse into `with` bodies.
+        let src = "\
+def outer() -> None:
+    with open(\"f\") as fh:
+        def helper(x: int) -> int:
+            return x + 1
+        let y: int = helper(1)
+";
+        let (_m, d) = resolve(src);
+        assert!(
+            !d.has_errors(),
+            "nested def inside with-body must be visible in sibling statements; got: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn nested_def_in_if_block_is_visible_in_sibling_statement() {
+        let src = "\
+def outer() -> None:
+    if True:
+        def helper() -> int:
+            return 1
+        let y: int = helper()
+";
+        let (_m, d) = resolve(src);
+        assert!(
+            !d.has_errors(),
+            "nested def inside if-body must be visible; got: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn nested_def_visible_in_listcomp_in_sibling_return() {
+        // Mirrors the `45-web-scraper` pattern: an `async def one(u)` inside
+        // an `async with` block, used in a list comprehension on the `return`.
+        let src = "\
+def scrape(urls: list[str]) -> list[int]:
+    with open(\"f\") as _fh:
+        def process(u: str) -> int:
+            return len(u)
+        return [process(u) for u in urls]
+";
+        let (_m, d) = resolve(src);
+        assert!(
+            !d.has_errors(),
+            "def inside with-body must be reachable from list comp in same block; got: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn match_subject_and_patterns_are_walked_for_references() {
+        // Reproduces the `21-cli-tool` / `22-http-requests` false unused-import
+        // bug: names used only inside `match` subjects or patterns were never
+        // walked, so imports consumed only there appeared unused.
+        let src = "\
+from mymod import Status, Ok, Err
+
+def check(s: Status) -> str:
+    match s:
+        case Ok(v):
+            return v
+        case Err(e):
+            return e
+";
+        let (_m, d) = resolve(src);
+        // All three imports (Status, Ok, Err) are used inside the match —
+        // no unused-import diagnostics should fire.
+        assert!(
+            !d.has_errors(),
+            "names used inside match arms must not trigger unused-import; got: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn function_default_value_references_are_walked() {
+        // Reproduces the `28-fastapi-server` false unused-import bug: names used
+        // *only* as default argument values (e.g. `Depends(get_db)`, `Query(...)`)
+        // were never walked, so those imports appeared unused.
+        let src = "\
+from deps import Depends, get_db
+
+def route(db: str = Depends(get_db)) -> None:
+    return None
+";
+        let (_m, d) = resolve(src);
+        // `Depends` and `get_db` are both used in the default — no unused-import.
+        assert!(
+            !d.has_errors(),
+            "names used in default arg values must not trigger unused-import; got: {:?}",
+            d.errors()
         );
     }
 }

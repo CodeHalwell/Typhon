@@ -518,8 +518,11 @@ pub fn generic_param_variance(head: &str, idx: usize) -> Variance {
         | ("AbstractSet", 0)
         | ("FrozenSet", 0)
         | ("frozenset", 0)
-        | ("tuple", 0)
-        | ("Tuple", 0)
+        // Tuples are immutable, so all element positions are covariant —
+        // a `tuple[int, float]` is safely usable wherever `tuple[int, float|None]`
+        // is expected.  The wildcard `_` covers every positional index.
+        | ("tuple", _)
+        | ("Tuple", _)
         | ("Awaitable", 0)
         | ("Coroutine", 0)
         | ("AsyncIterable", 0)
@@ -4145,6 +4148,89 @@ mod tests {
         assert_eq!(generic_param_variance("Callable", 1), Variance::Covariant);
         // Unknown head defaults to invariant — safest for user generics.
         assert_eq!(generic_param_variance("MyBox", 0), Variance::Invariant);
+        // Tuples are immutable — all element positions must be covariant.
+        assert_eq!(generic_param_variance("tuple", 0), Variance::Covariant);
+        assert_eq!(generic_param_variance("tuple", 1), Variance::Covariant);
+        assert_eq!(generic_param_variance("tuple", 2), Variance::Covariant);
+        assert_eq!(generic_param_variance("tuple", 3), Variance::Covariant);
+        assert_eq!(generic_param_variance("Tuple", 2), Variance::Covariant);
+    }
+
+    // ── tuple covariance ─────────────────────────────────────────────────────
+
+    #[test]
+    fn tuple_with_non_nullable_float_assignable_to_nullable_float_tuple() {
+        // Tuples are immutable, so a `tuple[str, str, int, float]` should be
+        // assignable to `tuple[str, str, int, float | None]`.  Before the fix,
+        // only position 0 was declared covariant; positions 1+ defaulted to
+        // invariant, causing false type mismatches on function calls passing
+        // all-non-null tuple literals.
+        assert!(
+            assignable(
+                &Type::Generic(
+                    "tuple".into(),
+                    vec![
+                        Type::Str,
+                        Type::Str,
+                        Type::Int,
+                        Type::Union(vec![Type::Float, Type::None])
+                    ]
+                ),
+                &Type::Generic(
+                    "tuple".into(),
+                    vec![Type::Str, Type::Str, Type::Int, Type::Float]
+                )
+            ),
+            "tuple[str, str, int, float] should be assignable to tuple[str, str, int, float|None]"
+        );
+    }
+
+    #[test]
+    fn list_of_non_nullable_tuple_not_assignable_to_list_of_nullable_tuple() {
+        // `list` is invariant, so `list[tuple[str,int,float]]` is NOT directly
+        // assignable to `list[tuple[str,int,float|None]]` even though tuples are
+        // covariant. The invariant check requires both directions to hold:
+        //   - assignable(tuple[str,int,float|None], tuple[str,int,float]) = true
+        //     (covariant: any Union variant matches float ✓)
+        //   - assignable(tuple[str,int,float], tuple[str,int,float|None]) = false
+        //     (covariant: float doesn't accept float|None — None is not float ✗)
+        // The bidirectional test fails, so the list assignment is rejected.
+        let list_non_null = Type::Generic(
+            "list".into(),
+            vec![Type::Generic(
+                "tuple".into(),
+                vec![Type::Str, Type::Int, Type::Float],
+            )],
+        );
+        let list_nullable = Type::Generic(
+            "list".into(),
+            vec![Type::Generic(
+                "tuple".into(),
+                vec![
+                    Type::Str,
+                    Type::Int,
+                    Type::Union(vec![Type::Float, Type::None]),
+                ],
+            )],
+        );
+        assert!(
+            !assignable(&list_nullable, &list_non_null),
+            "list[tuple[str,int,float]] should NOT be directly assignable to \
+             list[tuple[str,int,float|None]] due to list invariance"
+        );
+        // The tuple-level direction that DOES hold (used e.g. for function
+        // call argument checking when the tuple is passed directly, not via list).
+        assert!(
+            assignable(
+                &Type::Generic(
+                    "tuple".into(),
+                    vec![Type::Str, Type::Int, Type::Union(vec![Type::Float, Type::None])]
+                ),
+                &Type::Generic("tuple".into(), vec![Type::Str, Type::Int, Type::Float])
+            ),
+            "tuple[str,int,float] IS assignable to tuple[str,int,float|None] \
+             because tuples are covariant and float <: float|None"
+        );
     }
 
     #[test]
