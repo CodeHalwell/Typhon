@@ -263,6 +263,112 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
     }
 }
 
+/// Return `true` when any statement in `body` (recursively) contains
+/// a `yield` or `yield from` expression. Used by the return-type
+/// check in `check_function` to flag generator-shaped function bodies
+/// whose return annotation isn't iterator-shaped (FINDINGS #51).
+fn body_has_yield(body: &[Stmt]) -> bool {
+    fn expr_has(e: &Expr) -> bool {
+        if matches!(e, Expr::Yield(_) | Expr::YieldFrom(_)) {
+            return true;
+        }
+        let mut found = false;
+        ruff_python_ast::visitor::source_order::walk_expr(
+            &mut YieldVisitor { found: &mut found },
+            e,
+        );
+        found
+    }
+    fn stmt_has(s: &Stmt) -> bool {
+        match s {
+            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {
+                // Don't descend into nested function / class bodies —
+                // a `yield` inside an inner generator doesn't make the
+                // *outer* function a generator. (Lambdas can't contain
+                // yields in Python syntax.)
+                false
+            }
+            _ => {
+                let mut found = false;
+                ruff_python_ast::visitor::source_order::walk_stmt(
+                    &mut YieldVisitor { found: &mut found },
+                    s,
+                );
+                found
+            }
+        }
+    }
+    struct YieldVisitor<'a> {
+        found: &'a mut bool,
+    }
+    impl<'a, 'b> ruff_python_ast::visitor::source_order::SourceOrderVisitor<'a> for YieldVisitor<'b> {
+        fn visit_expr(&mut self, e: &'a Expr) {
+            if *self.found {
+                return;
+            }
+            if matches!(e, Expr::Yield(_) | Expr::YieldFrom(_)) {
+                *self.found = true;
+                return;
+            }
+            // Don't descend into nested function / lambda definitions.
+            if matches!(e, Expr::Lambda(_)) {
+                return;
+            }
+            ruff_python_ast::visitor::source_order::walk_expr(self, e);
+        }
+        fn visit_stmt(&mut self, s: &'a Stmt) {
+            if *self.found {
+                return;
+            }
+            if matches!(s, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                return;
+            }
+            ruff_python_ast::visitor::source_order::walk_stmt(self, s);
+        }
+    }
+    let _ = expr_has;
+    let _ = stmt_has;
+    let mut found = false;
+    for s in body {
+        ruff_python_ast::visitor::source_order::walk_stmt(
+            &mut YieldVisitor { found: &mut found },
+            s,
+        );
+        if found {
+            return true;
+        }
+    }
+    false
+}
+
+/// Return `true` when `returns` is annotated as one of the
+/// generator-compatible types. Recognises both PEP 484 (`Iterator[T]`,
+/// `Generator[T, S, R]`, `Iterable[T]`, `AsyncIterator[T]`,
+/// `AsyncGenerator[T, S]`) and the bare names (`Iterator`,
+/// `Generator`, etc.) which may flow in via stub imports.
+fn is_iterator_return_type(returns: &Expr, is_async: bool) -> bool {
+    let sync_names = ["Iterator", "Iterable", "Generator"];
+    let async_names = ["AsyncIterator", "AsyncIterable", "AsyncGenerator"];
+    let head = match returns {
+        Expr::Name(n) => Some(n.id.as_str()),
+        Expr::Subscript(s) => match s.value.as_ref() {
+            Expr::Name(n) => Some(n.id.as_str()),
+            Expr::Attribute(a) => Some(a.attr.as_str()),
+            _ => None,
+        },
+        Expr::Attribute(a) => Some(a.attr.as_str()),
+        _ => None,
+    };
+    let Some(name) = head else { return false };
+    if sync_names.contains(&name) {
+        return true;
+    }
+    if is_async && async_names.contains(&name) {
+        return true;
+    }
+    false
+}
+
 /// Return `true` when the type is an unbound PEP 695 type parameter.
 /// Used by the container-literal widening rules to avoid prematurely
 /// resolving a TypeVar to a concrete element type (which would block
@@ -2590,6 +2696,35 @@ fn check_function(
     // bridges without provoking the user-facing diagnostic.
     if !name.starts_with("__typhon_") {
         enforce_annotation_rule(c, name, parameters, returns);
+    }
+
+    // `yield` inside a non-iterator-typed function (FINDINGS #51): a
+    // body containing `yield` / `yield from` produces a generator at
+    // runtime, so the declared return type must match an iterator
+    // shape. Auto-synthesised helpers are exempt for the same reason
+    // as Rule 1.
+    if !name.starts_with("__typhon_") {
+        if let Some(returns_expr) = returns {
+            if body_has_yield(body) && !is_iterator_return_type(returns_expr, is_async) {
+                let span = (
+                    returns_expr.range().start().to_usize(),
+                    returns_expr.range().end().to_usize(),
+                );
+                let length = span.1.saturating_sub(span.0).max(1);
+                let returned = match returns_expr {
+                    Expr::Name(n) => n.id.as_str().to_owned(),
+                    _ => "the declared type".to_owned(),
+                };
+                c.diagnostics.push_error(TycError::generator_return_type(
+                    name,
+                    returned,
+                    c.path.clone(),
+                    c.source,
+                    span.0,
+                    length,
+                ));
+            }
+        }
     }
 
     let saved_return = c.current_return.replace(ret_type);

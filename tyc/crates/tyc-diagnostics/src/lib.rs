@@ -177,6 +177,25 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A function uses `yield` (or `yield from`) but its declared
+    /// return type isn't iterator-shaped. Calling it returns a
+    /// generator object at runtime, not the declared type. FINDINGS #51.
+    #[error("`{fn_name}` contains `yield` so it returns a generator, not `{returned}`")]
+    #[diagnostic(
+        code(tyc::generator_return_type),
+        help(
+            "annotate the return type as `Iterator[T]` / `Generator[T, S, R]` (or `AsyncIterator[T]` / `AsyncGenerator[T, S]` for `async def`)"
+        )
+    )]
+    GeneratorReturnType {
+        fn_name: String,
+        returned: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("declared return type here")]
+        span: SourceSpan,
+    },
+
     /// A `class` body declared `__init__` directly. Typhon generates
     /// the constructor from the field annotations, so writing one
     /// manually conflicts with the emitted dataclass / model. Use
@@ -630,6 +649,23 @@ impl TycError {
     ) -> Self {
         Self::NotCallable {
             typ: typ.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::GeneratorReturnType`] diagnostic.
+    pub fn generator_return_type(
+        fn_name: impl Into<String>,
+        returned: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::GeneratorReturnType {
+            fn_name: fn_name.into(),
+            returned: returned.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

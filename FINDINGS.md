@@ -2193,6 +2193,17 @@ generated one), but it's wrong on three counts:
 
 ## 51. `yield` in non-iterator-typed function checks clean (gap)
 
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. Added
+`TycError::GeneratorReturnType` (code `tyc::generator_return_type`)
+and a check in `check_function`: any function body containing `yield`
+or `yield from` is flagged when its declared return type isn't one of
+`Iterator[T]`, `Iterable[T]`, `Generator[T, S, R]` (or for `async def`:
+`AsyncIterator[T]`, `AsyncIterable[T]`, `AsyncGenerator[T, S]`). Both
+the bare-name and `typing.Iterator[...]` subscript forms match. The
+scanner deliberately doesn't descend into nested function / class
+definitions so a `yield` inside an inner generator doesn't make the
+outer function a generator.
+
 **Severity:** gap — type-checker accepts incorrect return-type.
 
 ```ty
