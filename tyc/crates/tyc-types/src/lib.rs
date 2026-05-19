@@ -876,6 +876,20 @@ struct Checker<'a> {
     /// honour default values, `*args`, `**kwargs`, and keyword arguments
     /// without rejecting valid calls (FINDINGS #44).
     function_arity_info: HashMap<String, ArityInfo>,
+    /// Names of `async def` functions declared at module top level.
+    /// Used by the call-site arm to emit `tyc::missing_await`
+    /// (FINDINGS #49) when a sync context calls one without `await`.
+    async_functions: std::collections::HashSet<String>,
+    /// Bumped on entry to an `Expr::Await`, decremented on exit. While
+    /// positive, the call-site arm skips the `missing_await` check so
+    /// the user's `await f()` is accepted.
+    inside_await: u32,
+    /// True while we are checking a *sync* function body. Only sync
+    /// callers trip `tyc::missing_await`; `async def` bodies that
+    /// forget to await are flagged separately by `async_without_await`
+    /// (warn-level, not yet wired). Module scope is also exempt so
+    /// the canonical `asyncio.run(coro())` entry-point pattern passes.
+    in_sync_function: bool,
     /// Bounds declared on PEP 695 type parameters, keyed by function name.
     /// E.g. `def f[T: Interface](x: T)` populates `{"f": {"T": Class("Interface")}}`.
     /// Checked at call sites via `Checker::check_call_typevar_bounds`.
@@ -1022,6 +1036,9 @@ impl<'a> Checker<'a> {
             classes: Vec::new(),
             function_signatures: HashMap::new(),
             function_arity_info: HashMap::new(),
+            async_functions: std::collections::HashSet::new(),
+            inside_await: 0,
+            in_sync_function: false,
             function_type_bounds: HashMap::new(),
             active_typevar_bounds: HashMap::new(),
             interfaces: HashMap::new(),
@@ -1456,6 +1473,20 @@ impl<'a> Checker<'a> {
         ));
     }
 
+    fn missing_await(&mut self, callee: &str, span: (usize, usize)) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
+        let length = span.1.saturating_sub(span.0).max(1);
+        self.diagnostics.push_error(TycError::missing_await(
+            callee,
+            &self.path,
+            self.source,
+            span.0,
+            length,
+        ));
+    }
+
     fn non_exhaustive_match(&mut self, union_name: &str, missing: &str, span: (usize, usize)) {
         if self.unsafe_depth > 0 {
             return;
@@ -1870,6 +1901,11 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                 f.name.as_str().to_owned(),
                 arity_info_from_parameters(f.parameters.as_ref()),
             );
+            // Record `async def` names so the call-site arm can emit
+            // `tyc::missing_await` for sync calls (FINDINGS #49).
+            if f.is_async {
+                c.async_functions.insert(f.name.as_str().to_owned());
+            }
             // Also extract any declared TypeVar bounds so they can be checked
             // at call sites.
             let bounds = type_param_bounds_from(f.type_params.as_deref(), &classes);
@@ -2257,6 +2293,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 &f.body,
                 f.returns.as_deref(),
                 &tps,
+                f.is_async,
             )
         }
         Stmt::ClassDef(cd) => {
@@ -2521,6 +2558,7 @@ fn check_function(
     body: &[Stmt],
     returns: Option<&Expr>,
     type_params: &[String],
+    is_async: bool,
 ) {
     let classes = c.classes.clone();
     let ret_type = match returns {
@@ -2537,6 +2575,13 @@ fn check_function(
     }
 
     let saved_return = c.current_return.replace(ret_type);
+    // Track sync-vs-async for the body's call-site check
+    // (`tyc::missing_await` — FINDINGS #49). Only sync function bodies
+    // trip the diagnostic; async bodies use `await` naturally and
+    // module-level scope keeps the `asyncio.run(coro())` entry-point
+    // pattern free of false positives.
+    let saved_in_sync = c.in_sync_function;
+    c.in_sync_function = !is_async;
     // Load the TypeVar bounds for this function so the body's attribute
     // accesses (e.g. `x.greet()` where `x: T` and `T: Greeter`) can resolve
     // against the bound's interface shape.
@@ -2613,6 +2658,7 @@ fn check_function(
     c.env.leave();
     c.current_return = saved_return;
     c.active_typevar_bounds = saved_bounds;
+    c.in_sync_function = saved_in_sync;
 }
 
 fn check_if(c: &mut Checker, i: &ruff_python_ast::StmtIf) {
@@ -3052,6 +3098,29 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             let func_type = infer_expr(c, &call.func);
             let call_span = (call.range.start().to_usize(), call.range.end().to_usize());
 
+            // `tyc::missing_await` (FINDINGS #49): a *sync* function
+            // calling an `async def` without `await` returns a
+            // coroutine, not the declared return type — Python emits
+            // "coroutine was never awaited" at runtime. Restricted to
+            // sync function bodies so the canonical
+            // `asyncio.run(coro())` entry-point pattern at module
+            // scope passes, and so `async def` bodies (which use
+            // `await` naturally) don't trip the diagnostic. The
+            // `inside_await` counter (bumped by the `Expr::Await` arm)
+            // suppresses the check when the call is the operand of
+            // `await`.
+            if c.in_sync_function && c.inside_await == 0 {
+                if let Expr::Name(n) = call.func.as_ref() {
+                    if c.async_functions.contains(n.id.as_str()) {
+                        let span = (
+                            n.range.start().to_usize(),
+                            n.range.end().to_usize(),
+                        );
+                        c.missing_await(n.id.as_str(), span);
+                    }
+                }
+            }
+
             // Argument access check on the receiver (for things like x.foo()
             // where x could be None).
             if let Expr::Attribute(attr) = call.func.as_ref() {
@@ -3463,6 +3532,17 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                 }
             }
             Type::Generic("set".into(), vec![Type::union_of(elts)])
+        }
+        // `await EXPR` — bump the `inside_await` counter while inferring
+        // EXPR so a `Call` to an async function inside it does not
+        // trip the `tyc::missing_await` check (FINDINGS #49). The
+        // inferred type is the inner call's return type (`async def f()
+        // -> int` → `await f()` is `int`).
+        Expr::Await(a) => {
+            c.inside_await = c.inside_await.saturating_add(1);
+            let inner = infer_expr_ctx(c, &a.value, expected);
+            c.inside_await = c.inside_await.saturating_sub(1);
+            inner
         }
         _ => Type::Unknown,
     }

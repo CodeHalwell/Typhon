@@ -2100,6 +2100,25 @@ Either:
 
 ## 49. `tyc::missing_await` not enforced (gap)
 
+**Status:** **FIXED** on `claude/resolve-open-findings-d6EIV`. Added the
+infrastructure:
+
+- New `TycError::MissingAwait` diagnostic variant with a
+  `tyc::missing_await` code and a help string pointing at `await` /
+  `asyncio.run`.
+- Two new fields on `Checker`: `async_functions: HashSet<String>` (set
+  during the same pass that populates `function_signatures`) and an
+  `inside_await: u32` counter that the new `Expr::Await` arm bumps
+  while inferring its operand.
+- A `in_sync_function: bool` flag tracked through `check_function` so
+  the check only fires inside `def` bodies — `async def` callers and
+  module-level scope (`asyncio.run(coro())` entry-point pattern) are
+  exempt.
+
+The call-site arm now emits `tyc::missing_await` whenever the callee
+resolves to a known async function name, the active scope is a sync
+function body, and the call isn't directly under an `await`.
+
 **Severity:** gap — documented hard error doesn't fire.
 
 ```ty

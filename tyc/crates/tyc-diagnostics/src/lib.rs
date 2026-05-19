@@ -177,6 +177,25 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A sync function called an `async def` without awaiting it. The
+    /// expression's value is a coroutine, not the function's declared
+    /// return type — and Python's runtime emits "coroutine was never
+    /// awaited" warnings for these. FINDINGS #49.
+    #[error("missing `await` on async call to `{callee}`")]
+    #[diagnostic(
+        code(tyc::missing_await),
+        help(
+            "wrap the call in `await` (and make the caller `async`), or call `asyncio.run(...)` if you are at the top level"
+        )
+    )]
+    MissingAwait {
+        callee: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("this call returns a coroutine — `await` it")]
+        span: SourceSpan,
+    },
+
     /// A `match` on a sealed union does not cover all variants and has no wildcard arm.
     #[error("non-exhaustive `match` on sealed union `{union_name}`: missing variant(s) {missing}")]
     #[diagnostic(
@@ -592,6 +611,21 @@ impl TycError {
     ) -> Self {
         Self::NotCallable {
             typ: typ.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::MissingAwait`] diagnostic.
+    pub fn missing_await(
+        callee: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::MissingAwait {
+            callee: callee.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }
