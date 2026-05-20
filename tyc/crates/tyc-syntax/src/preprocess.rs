@@ -1642,6 +1642,16 @@ fn find_mid_expression_questionmarks(code: &str) -> Vec<usize> {
     } else {
         trimmed_end
     };
+    // Inline `with`-chains can carry multiple `expr?,` bindings and one
+    // trailing `expr?:` on the same line. Those are recognised later by
+    // `expand_with_chains` and must not be flagged here.
+    let is_with_chain_line = {
+        let trimmed = code.trim_start();
+        trimmed.starts_with("with ")
+            && code
+                .trim_end_matches([' ', '\t'])
+                .ends_with("?:")
+    };
     let mut in_str: Option<u8> = None;
     let mut i = 0;
     while i < scan_end {
@@ -1663,6 +1673,15 @@ fn find_mid_expression_questionmarks(code: &str) -> Vec<usize> {
             continue;
         }
         if b == b'?' && i > 0 && bytes[i - 1] == b')' {
+            // Inside a single-line `with`-chain, `)?,` and `)?:` are
+            // binding terminators handled by `expand_with_chains`.
+            if is_with_chain_line
+                && i + 1 < bytes.len()
+                && (bytes[i + 1] == b',' || bytes[i + 1] == b':')
+            {
+                i += 1;
+                continue;
+            }
             out.push(i);
         }
         i += 1;
@@ -2720,7 +2739,7 @@ pub fn expand_with_chains(source: &str) -> String {
         let body = &raw[indent_len..];
 
         if let Some(rest) = body.strip_prefix("with ") {
-            if let Some((first_binding, first_term)) = parse_with_binding(rest) {
+            if let Some((inline_bindings, first_term)) = parse_inline_with_bindings(rest) {
                 // Re-scan the binding line's string state so the continuation
                 // scanner picks up unfinished triple-quoted strings correctly.
                 let mut state_for_chain = pre_string;
@@ -2730,7 +2749,7 @@ pub fn expand_with_chains(source: &str) -> String {
                     &lines,
                     i,
                     chain_indent,
-                    first_binding,
+                    inline_bindings,
                     first_term,
                     state_for_chain,
                 ) {
@@ -2780,6 +2799,83 @@ struct WithChain {
     else_body: Vec<String>,
 }
 
+/// Parse one or more inline `name = expr?,` bindings followed by a final
+/// `name = expr?:` binding on a single `with` line. Returns the collected
+/// bindings and the terminator character of the *last* binding, which will
+/// be `:` for a complete inline chain and `,` when the chain continues onto
+/// the next line.
+fn parse_inline_with_bindings(s: &str) -> Option<(Vec<WithBinding>, char)> {
+    let trimmed = s.trim_end();
+    // Walk top-level (`?,` or `?:`) terminators, slicing each binding segment.
+    let bytes = trimmed.as_bytes();
+    let mut bindings = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i32;
+    let mut in_str: Option<u8> = None;
+    let mut i = 0usize;
+    let mut last_term: Option<char> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => in_str = Some(b),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'?' if depth == 0 && i + 1 < bytes.len() => {
+                let next = bytes[i + 1];
+                if next == b',' || next == b':' {
+                    let term = if next == b',' { ',' } else { ':' };
+                    let segment = &trimmed[start..=i + 1];
+                    let (binding, t) = parse_with_binding(segment)?;
+                    if t != term {
+                        return None;
+                    }
+                    bindings.push(binding);
+                    last_term = Some(term);
+                    i += 2;
+                    // Skip whitespace before the next binding.
+                    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                        i += 1;
+                    }
+                    start = i;
+                    if term == ':' {
+                        // Inline head ended; anything trailing means malformed.
+                        if i != bytes.len() {
+                            return None;
+                        }
+                        break;
+                    }
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if bindings.is_empty() {
+        return None;
+    }
+    // If we exited without seeing a final `?:`, the chain continues on the
+    // next line — require the trailing terminator on the last binding to be
+    // `,` so the multi-line scanner can resume.
+    let term = last_term?;
+    if term == ',' && start != bytes.len() {
+        // There's trailing junk after the last `?,` on this line.
+        return None;
+    }
+    Some((bindings, term))
+}
+
 /// Parse one `name = expr?(,|:)` segment from the tail of a binding line.
 ///
 /// Returns the binding plus the terminator character (`,` or `:`).
@@ -2819,11 +2915,11 @@ fn collect_chain(
     lines: &[&str],
     start: usize,
     chain_indent: &str,
-    first_binding: WithBinding,
+    inline_bindings: Vec<WithBinding>,
     first_term: char,
     initial_string_state: Option<StringMode>,
 ) -> Option<(WithChain, usize, Option<StringMode>)> {
-    let mut bindings = vec![first_binding];
+    let mut bindings = inline_bindings;
     let mut idx = start + 1;
     let mut term = first_term;
     let mut in_string = initial_string_state;
