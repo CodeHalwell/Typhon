@@ -355,6 +355,25 @@ fn is_async_protocol_dunder(name: &str) -> bool {
     matches!(name, "__aenter__" | "__aexit__" | "__aiter__" | "__anext__")
 }
 
+/// Return `true` when `body` is structurally a declaration-only body —
+/// any combination of `pass`, ellipsis expression statements, and
+/// docstrings (string literal expression statements). These bodies are
+/// typical of Protocol / interface method declarations and should not
+/// trigger `tyc::async_without_await`.
+fn body_is_declaration_only(body: &[Stmt]) -> bool {
+    if body.is_empty() {
+        return true;
+    }
+    body.iter().all(|s| match s {
+        Stmt::Pass(_) => true,
+        Stmt::Expr(e) => matches!(
+            e.value.as_ref(),
+            Expr::EllipsisLiteral(_) | Expr::StringLiteral(_)
+        ),
+        _ => false,
+    })
+}
+
 /// `async with` headers. Nested function and class bodies are skipped
 /// so an `await` in an inner async lambda or nested coroutine doesn't
 /// satisfy the outer function. FINDINGS #83.
@@ -2493,32 +2512,13 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                 arity_info_from_parameters(f.parameters.as_ref(), &classes, &tps),
             );
             // Record `async def` names so the call-site arm can emit
-            // `tyc::missing_await` for sync calls (FINDINGS #49).
+            // `tyc::missing_await` for sync calls (FINDINGS #49). The
+            // `async_without_await` warning is emitted from
+            // `check_function` so the carve-outs (declaration-only
+            // bodies, async generators, async-protocol dunders) live
+            // alongside the body walk.
             if f.is_async {
                 c.async_functions.insert(f.name.as_str().to_owned());
-                // FINDINGS #83: warn when an `async def` body has no
-                // `await`. The skill documents this as
-                // `tyc::async_without_await` (warning). Coroutine semantics
-                // are wasted on a body that never suspends — most often a
-                // leftover from a half-finished refactor or a forgotten
-                // `await` on an internal call.
-                if !body_has_await(&f.body) && !is_async_protocol_dunder(f.name.as_str()) {
-                    let span_start = f.name.range.start().to_usize();
-                    let span_len = f
-                        .name
-                        .range
-                        .end()
-                        .to_usize()
-                        .saturating_sub(span_start)
-                        .max(1);
-                    c.diagnostics.push_warning(TycError::async_without_await(
-                        f.name.as_str(),
-                        &c.path,
-                        c.source,
-                        span_start,
-                        span_len,
-                    ));
-                }
             }
             // Also extract any declared TypeVar bounds so they can be checked
             // at call sites.
@@ -3492,11 +3492,16 @@ fn check_function(
 
     // `async def` with no `await` — warn per tyc::async_without_await (FINDINGS #83).
     // Only fires for user-authored async functions, not compiler-synthesised helpers
-    // (prefixed with `__typhon_`).
+    // (prefixed with `__typhon_`). Carve-outs: async-protocol dunders
+    // (`__aenter__`/`__aexit__`/`__aiter__`/`__anext__`), declaration-only
+    // bodies (`...` / `pass` / docstring) that look like Protocol/interface
+    // signatures, and async generators (bodies that `yield`).
     if is_async
         && !name.starts_with("__typhon_")
         && !is_async_protocol_dunder(name)
         && !body_has_await(body)
+        && !body_is_declaration_only(body)
+        && !body_has_yield(body)
     {
         c.diagnostics.push_warning(TycError::async_without_await(
             name,
