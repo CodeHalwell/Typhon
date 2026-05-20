@@ -3612,9 +3612,22 @@ fn stmt_always_exits(stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Return(_) | Stmt::Raise(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
         // An if/elif/else where every branch exits is itself an exit.
+        // `if True:` (which is what `unsafe:` lowers to) collapses to
+        // "body always runs", so it exits iff the body exits.
         Stmt::If(s) => {
+            if is_constant_true(&s.test) {
+                return body_always_exits(&s.body);
+            }
             body_always_exits(&s.body) && elif_else_chain_always_exits(&s.elif_else_clauses)
         }
+        // A `with` / `async with` block exits the enclosing function only
+        // when every terminal in its body is *non-suppressible* —
+        // `return` / `break` / `continue`. Bare `raise` is suppressible
+        // by the context manager's `__exit__` (e.g.
+        // `contextlib.suppress(Exception)`), so a `with: raise` body
+        // is not a definite function exit even though the statement
+        // itself "exits" the with-block.
+        Stmt::With(w) => body_exits_non_suppressible(&w.body),
         // A `match` statement where every arm body exits, including a
         // wildcard / capturing fallback that handles unmatched values,
         // is itself an exit. Exhaustive sealed-union matches already
@@ -3694,19 +3707,27 @@ fn match_arms_always_exit_aware(c: &Checker, m: &ruff_python_ast::StmtMatch) -> 
     // guardless arm. The subject must be a bare name whose declared
     // type is a sealed-union class — same shape the
     // `check_match_exhaustiveness` pass relies on.
+    //
+    // `Result[T, E]` is a builtin sealed union whose variants
+    // (`Ok` | `Err`) are seeded in `seed_typhon_runtime_types` rather
+    // than declared by a user `type Result = Ok | Err` alias, so
+    // resolve it explicitly here (F4).
     if let Expr::Name(n) = m.subject.as_ref() {
         if let Some(binding) = c.env.lookup(n.id.as_str()) {
-            if let Type::Class(union_name) = &binding.declared {
-                if let Some(variants) = c.sealed_unions.get(union_name.as_str()) {
-                    let mut covered: HashSet<String> = HashSet::new();
-                    for case in &m.cases {
-                        if case.guard.is_some() {
-                            continue;
-                        }
-                        collect_matched_class_names(&case.pattern, &mut covered);
+            let variants: Option<Vec<String>> = match &binding.declared {
+                Type::Class(union_name) => c.sealed_unions.get(union_name.as_str()).cloned(),
+                Type::Generic(head, _) if head == "Result" => Some(vec!["Ok".into(), "Err".into()]),
+                _ => None,
+            };
+            if let Some(variants) = variants {
+                let mut covered: HashSet<String> = HashSet::new();
+                for case in &m.cases {
+                    if case.guard.is_some() {
+                        continue;
                     }
-                    return variants.iter().all(|v| covered.contains(v));
+                    collect_matched_class_names(&case.pattern, &mut covered);
                 }
+                return variants.iter().all(|v| covered.contains(v));
             }
         }
     }
@@ -3726,10 +3747,26 @@ fn stmt_always_exits_aware(c: &Checker, stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Return(_) | Stmt::Raise(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
         Stmt::If(s) => {
+            // `if True:` (constant-True test) is unconditional flow —
+            // the body always runs, so it exits iff the body exits. The
+            // `unsafe:` preprocessor lowers to exactly this shape, so
+            // teaching the analysis about it lets `unsafe: ... return`
+            // count as a definite return (F2).
+            if is_constant_true(&s.test) {
+                return body_always_exits_aware(c, &s.body);
+            }
             body_always_exits_aware(c, &s.body)
                 && elif_else_chain_always_exits_aware(c, &s.elif_else_clauses)
         }
         Stmt::Match(m) => match_arms_always_exit_aware(c, m),
+        // A `with` / `async with` block exits the enclosing function
+        // only when every terminal in its body is *non-suppressible*
+        // — `return` / `break` / `continue`. Bare `raise` is
+        // suppressible by the context manager's `__exit__`
+        // (e.g. `contextlib.suppress(Exception)`), so a `with: raise`
+        // is not a definite function exit. F3 examples end the with
+        // body in `return`, which is non-suppressible.
+        Stmt::With(w) => body_exits_non_suppressible_aware(c, &w.body),
         Stmt::Try(t) => {
             let finally_exits = !t.finalbody.is_empty() && body_always_exits_aware(c, &t.finalbody);
             let try_and_handlers_exit = body_always_exits_aware(c, &t.body)
@@ -3742,6 +3779,166 @@ fn stmt_always_exits_aware(c: &Checker, stmt: &Stmt) -> bool {
         }
         _ => false,
     }
+}
+
+/// True when `expr` is a literal `True`. Used to recognise the
+/// `if True:` shape that the `unsafe:` preprocessor lowers to, so the
+/// missing-return analysis can treat it as unconditional flow.
+fn is_constant_true(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::BooleanLiteral(lit) if lit.value
+    )
+}
+
+/// True when `stmts` always exits the enclosing function via a
+/// *non-suppressible* terminal — `return` / `break` / `continue` (or a
+/// composite whose every branch satisfies the same predicate).
+///
+/// Used for `with` / `async with` bodies in the missing-return
+/// analysis: a context manager's `__exit__` can swallow `raise`
+/// (`contextlib.suppress(Exception)`, custom managers returning
+/// truthy from `__exit__`), so a body whose only terminal is `raise`
+/// is not a definite function exit even though it locally exits the
+/// statement. `return` / `break` / `continue` are not exceptions and
+/// cannot be suppressed by `__exit__`.
+fn body_exits_non_suppressible(stmts: &[Stmt]) -> bool {
+    stmts.last().is_some_and(stmt_exits_non_suppressible)
+}
+
+fn stmt_exits_non_suppressible(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
+        // `raise` IS suppressible by the enclosing context manager.
+        Stmt::Raise(_) => false,
+        Stmt::If(s) => {
+            if is_constant_true(&s.test) {
+                return body_exits_non_suppressible(&s.body);
+            }
+            body_exits_non_suppressible(&s.body)
+                && elif_else_chain_exits_non_suppressible(&s.elif_else_clauses)
+        }
+        Stmt::With(w) => body_exits_non_suppressible(&w.body),
+        Stmt::Match(m) => {
+            !m.cases.is_empty() && m.cases.iter().all(|c| body_exits_non_suppressible(&c.body))
+        }
+        Stmt::Try(t) => {
+            let finally_exits =
+                !t.finalbody.is_empty() && body_exits_non_suppressible(&t.finalbody);
+            let try_and_handlers_exit = body_exits_non_suppressible(&t.body)
+                && t.handlers.iter().all(|h| {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    body_exits_non_suppressible(&h.body)
+                })
+                && (t.orelse.is_empty() || body_exits_non_suppressible(&t.orelse));
+            finally_exits || try_and_handlers_exit
+        }
+        _ => false,
+    }
+}
+
+fn elif_else_chain_exits_non_suppressible(clauses: &[ruff_python_ast::ElifElseClause]) -> bool {
+    let has_terminal_else = clauses.iter().any(|c| c.test.is_none());
+    if !has_terminal_else {
+        return false;
+    }
+    clauses.iter().all(|c| body_exits_non_suppressible(&c.body))
+}
+
+/// Checker-aware mirror of [`body_exits_non_suppressible`]. Identical
+/// shape, but recurses into [`Stmt::Match`] through the exhaustiveness
+/// pass so a sealed-union match whose arms each end in
+/// `return`/`break`/`continue` counts as a non-suppressible exit.
+fn body_exits_non_suppressible_aware(c: &Checker, stmts: &[Stmt]) -> bool {
+    stmts
+        .last()
+        .is_some_and(|s| stmt_exits_non_suppressible_aware(c, s))
+}
+
+fn stmt_exits_non_suppressible_aware(c: &Checker, stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
+        Stmt::Raise(_) => false,
+        Stmt::If(s) => {
+            if is_constant_true(&s.test) {
+                return body_exits_non_suppressible_aware(c, &s.body);
+            }
+            body_exits_non_suppressible_aware(c, &s.body)
+                && elif_else_chain_exits_non_suppressible_aware(c, &s.elif_else_clauses)
+        }
+        Stmt::With(w) => body_exits_non_suppressible_aware(c, &w.body),
+        Stmt::Match(m) => match_arms_exit_non_suppressible_aware(c, m),
+        Stmt::Try(t) => {
+            let finally_exits =
+                !t.finalbody.is_empty() && body_exits_non_suppressible_aware(c, &t.finalbody);
+            let try_and_handlers_exit = body_exits_non_suppressible_aware(c, &t.body)
+                && t.handlers.iter().all(|h| {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    body_exits_non_suppressible_aware(c, &h.body)
+                })
+                && (t.orelse.is_empty() || body_exits_non_suppressible_aware(c, &t.orelse));
+            finally_exits || try_and_handlers_exit
+        }
+        _ => false,
+    }
+}
+
+fn elif_else_chain_exits_non_suppressible_aware(
+    c: &Checker,
+    clauses: &[ruff_python_ast::ElifElseClause],
+) -> bool {
+    let has_terminal_else = clauses.iter().any(|c| c.test.is_none());
+    if !has_terminal_else {
+        return false;
+    }
+    clauses
+        .iter()
+        .all(|cl| body_exits_non_suppressible_aware(c, &cl.body))
+}
+
+fn match_arms_exit_non_suppressible_aware(c: &Checker, m: &ruff_python_ast::StmtMatch) -> bool {
+    // Mirror of `match_arms_always_exit_aware` but requiring every
+    // arm body to exit via a non-suppressible terminal.
+    if m.cases.is_empty() {
+        return false;
+    }
+    if !m
+        .cases
+        .iter()
+        .all(|case| body_exits_non_suppressible_aware(c, &case.body))
+    {
+        return false;
+    }
+    let has_catchall = m.cases.iter().any(|case| {
+        case.guard.is_none()
+            && matches!(
+                &case.pattern,
+                ruff_python_ast::Pattern::MatchAs(p) if p.pattern.is_none()
+            )
+    });
+    if has_catchall {
+        return true;
+    }
+    if let Expr::Name(n) = m.subject.as_ref() {
+        if let Some(binding) = c.env.lookup(n.id.as_str()) {
+            let variants: Option<Vec<String>> = match &binding.declared {
+                Type::Class(union_name) => c.sealed_unions.get(union_name.as_str()).cloned(),
+                Type::Generic(head, _) if head == "Result" => Some(vec!["Ok".into(), "Err".into()]),
+                _ => None,
+            };
+            if let Some(variants) = variants {
+                let mut covered: HashSet<String> = HashSet::new();
+                for case in &m.cases {
+                    if case.guard.is_some() {
+                        continue;
+                    }
+                    collect_matched_class_names(&case.pattern, &mut covered);
+                }
+                return variants.iter().all(|v| covered.contains(v));
+            }
+        }
+    }
+    false
 }
 
 fn elif_else_chain_always_exits_aware(
@@ -5584,6 +5781,93 @@ def area(s: Shape) -> float:
                 .iter()
                 .any(|e| matches!(e, TycError::MissingReturn { .. })),
             "exhaustive sealed-union match should satisfy missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn unsafe_block_with_inner_returns_satisfies_missing_return() {
+        // F2: `unsafe:` lowers to `if True:`, which is unconditional
+        // flow — when every path inside the block returns/raises, the
+        // function returns. Missing_return must not fire.
+        let src = "\
+def f(x: object) -> int:
+    unsafe:
+        if isinstance(x, int):
+            return x
+        raise ValueError(\"bad\")
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "unsafe block with terminal raise must satisfy missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn with_block_returning_body_satisfies_missing_return() {
+        // F3: a `with` block whose body's last statement is a return
+        // is a definite return of the enclosing function.
+        let src = "\
+def f() -> int:
+    with open(\"x\") as g:
+        return 1
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "with block ending in return must satisfy missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn with_block_raising_body_still_fires_missing_return() {
+        // Codex PR #73 review: a `with` body that ends in `raise`
+        // is NOT a definite function exit because the context
+        // manager's `__exit__` can suppress the exception
+        // (`contextlib.suppress(Exception)`, custom managers
+        // returning truthy). Missing-return must still fire.
+        let src = "\
+from contextlib import suppress
+
+def f() -> int:
+    with suppress(Exception):
+        raise ValueError(\"x\")
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "with+raise must still fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn exhaustive_result_match_satisfies_missing_return() {
+        // F4: `match` over `Result[T, E]` covering both `Ok` and `Err`
+        // arms (each ending in a return) is a definite return.
+        let src = "\
+def f(r: Result[int, str]) -> int:
+    match r:
+        case Ok(v):
+            return v
+        case Err(_):
+            return -1
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "exhaustive Result match must satisfy missing_return: {:?}",
             d.errors()
         );
     }

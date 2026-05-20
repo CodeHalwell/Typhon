@@ -435,6 +435,49 @@ pub fn python_stdlib_modules() -> &'static [&'static str] {
     ]
 }
 
+/// Precomputed import-vetting context — built once per `tyc check`
+/// invocation and shared across every file. Hoisting the HashSet
+/// construction out of [`check_unknown_modules`] keeps per-file cost
+/// proportional to the number of imports in the file, not the number
+/// of dependencies in the project.
+pub struct ImportVettingContext {
+    project_roots: std::collections::HashSet<String>,
+    extra_roots: std::collections::HashSet<String>,
+}
+
+impl ImportVettingContext {
+    /// Build the context from raw inputs. `project_modules` is the
+    /// dotted-name form of every `.ty` file in the project;
+    /// `extra_modules` is the list of dependency names (PyPI dist
+    /// names and/or top-level import names already resolved by the
+    /// caller). Both are normalised to their root segment for
+    /// fast lookup, and `extra_modules` additionally seeds the
+    /// hyphen->underscore variant so a `[dependencies]` entry of
+    /// `agent-framework-openai` resolves `agent_framework_openai`.
+    pub fn new(project_modules: &[String], extra_modules: &[String]) -> Self {
+        let project_roots: std::collections::HashSet<String> = project_modules
+            .iter()
+            .map(|m| m.split('.').next().unwrap_or(m.as_str()).to_owned())
+            .collect();
+        let mut extra_roots: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(extra_modules.len() * 2);
+        for m in extra_modules {
+            let raw = m.split('.').next().unwrap_or(m.as_str()).to_owned();
+            let underscored = raw.replace('-', "_");
+            if underscored != raw {
+                extra_roots.insert(raw);
+                extra_roots.insert(underscored);
+            } else {
+                extra_roots.insert(raw);
+            }
+        }
+        Self {
+            project_roots,
+            extra_roots,
+        }
+    }
+}
+
 /// Vet a module's imports against a set of resolvable module names and
 /// emit `tyc::unknown_module` warnings for any unresolvable root.
 ///
@@ -456,6 +499,11 @@ pub fn python_stdlib_modules() -> &'static [&'static str] {
 /// Unknown roots produce a warning (not an error) so existing programs
 /// that depend on quietly-installed sibling packages keep building;
 /// callers can promote the warning via strictness if desired. FINDINGS #79.
+///
+/// Callers that vet many files in a row should prefer
+/// [`check_unknown_modules_with`] and reuse a single
+/// [`ImportVettingContext`] across the batch — building the context's
+/// HashSets has cost proportional to the dependency count.
 pub fn check_unknown_modules(
     path: &str,
     source: &str,
@@ -463,18 +511,25 @@ pub fn check_unknown_modules(
     project_modules: &[String],
     extra_modules: &[String],
 ) -> Diagnostics {
+    let ctx = ImportVettingContext::new(project_modules, extra_modules);
+    check_unknown_modules_with(path, source, module, &ctx)
+}
+
+/// Batched variant of [`check_unknown_modules`]. Identical semantics
+/// but reuses a caller-built [`ImportVettingContext`] so the project
+/// and dependency HashSets aren't reconstructed per file.
+pub fn check_unknown_modules_with(
+    path: &str,
+    source: &str,
+    module: &ruff_python_ast::ModModule,
+    ctx: &ImportVettingContext,
+) -> Diagnostics {
     use ruff_python_ast::Stmt;
 
     let mut diags = Diagnostics::new();
     let stdlib: std::collections::HashSet<&str> = python_stdlib_modules().iter().copied().collect();
-    let project_roots: std::collections::HashSet<&str> = project_modules
-        .iter()
-        .map(|m| m.split('.').next().unwrap_or(m.as_str()))
-        .collect();
-    let extra_roots: std::collections::HashSet<&str> = extra_modules
-        .iter()
-        .map(|m| m.split('.').next().unwrap_or(m.as_str()))
-        .collect();
+    let project_roots = &ctx.project_roots;
+    let extra_roots = &ctx.extra_roots;
     let is_resolvable = |module_name: &str| -> bool {
         let root = module_name.split('.').next().unwrap_or(module_name);
         if root.is_empty() || root.starts_with('_') {
@@ -875,6 +930,16 @@ impl<'a> Resolver<'a> {
             // side is `val`, regardless of binding kind: rebinding a `val`
             // via `def`, `class`, a for-loop target, or another assignment
             // all violate immutability.
+            //
+            // Exception: two sibling `for x in ...:` loops in the same
+            // scope are idiomatic Python — each loop "rebinds" the
+            // target, but neither was an authored `let`. Allow the
+            // second loop to silently reuse the same name when both
+            // bindings are `Loop` (for / with / except / comprehension
+            // targets).
+            if existing.kind == BindingKind::Loop && kind == BindingKind::Loop {
+                return;
+            }
             let _ = kind;
             if existing.mutability == Mutability::Let || mutability == Mutability::Let {
                 let decl_span = existing.span;
@@ -2883,6 +2948,27 @@ def foo():
     }
 
     #[test]
+    fn hyphenated_dependency_resolves_underscored_import() {
+        // PyPI distribution names use hyphens; Python import names use
+        // underscores. A `[dependencies]` entry of `agent-framework-openai`
+        // must resolve `from agent_framework_openai import …`.
+        let src = "from agent_framework_openai import Agent\n";
+        let module = parse_module(src);
+        let diags = check_unknown_modules(
+            "t.ty",
+            src,
+            &module,
+            &[],
+            &["agent-framework-openai".to_string()],
+        );
+        assert!(
+            diags.warnings().is_empty(),
+            "hyphenated dep must resolve underscored import: {:?}",
+            diags.warnings()
+        );
+    }
+
+    #[test]
     fn relative_import_does_not_warn() {
         // Relative imports (`from .sibling import X`) aren't vettable
         // here — we don't model relative resolution. Just trust them.
@@ -3007,6 +3093,29 @@ def foo():
         assert!(
             !d.has_errors(),
             "loop without rebind should be clean: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn sibling_for_loops_can_reuse_target_name() {
+        // F1: two sibling `for x in ...:` loops in the same scope must
+        // not fire `tyc::immutable_assign` on the second loop — Python
+        // users reflexively reuse loop variable names across sibling
+        // loops, and the for-target is not a user-authored `let`.
+        let src = "def main() -> None:\n\
+                   \x20   let xs: list[int] = [1, 2, 3]\n\
+                   \x20   let ys: list[int] = [4, 5, 6]\n\
+                   \x20   for i in xs:\n\
+                   \x20       print(i)\n\
+                   \x20   for i in ys:\n\
+                   \x20       print(i)\n";
+        let (_m, d) = resolve(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ImmutableAssign { .. })),
+            "sibling for-loops must not fire immutable_assign: {:?}",
             d.errors()
         );
     }

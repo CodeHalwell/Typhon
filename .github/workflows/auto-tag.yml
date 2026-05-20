@@ -1,0 +1,107 @@
+name: Auto-tag on main
+
+# On every push to `main` (which is what a PR merge produces), look at
+# the workspace version in `tyc/Cargo.toml`. If there is no matching
+# `v<version>` tag yet, create one at this commit and trigger the
+# Release workflow so the macOS binaries + GitHub Release get
+# published automatically.
+#
+# Why this isn't just `git push origin <tag>`:
+#   Tags pushed by the default `GITHUB_TOKEN` do not trigger other
+#   workflows — that's a hard-coded GitHub policy to avoid recursive CI
+#   loops. We therefore push the tag *and* explicitly invoke
+#   `release.yml` via `gh workflow run`, which `GITHUB_TOKEN` is
+#   allowed to do.
+#
+# If the version in `Cargo.toml` is unchanged (the same `v<version>`
+# tag already exists), this workflow exits cleanly — re-running it on
+# unrelated commits to main is a no-op.
+
+on:
+  push:
+    branches: [main]
+
+# Only one auto-tag run at a time per ref — back-to-back merges would
+# otherwise race on tag creation.
+concurrency:
+  group: auto-tag-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  tag-and-release:
+    name: Tag + dispatch release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read workspace version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Take the first `version = "X.Y.Z"` line in workspace.package.
+          # tyc/Cargo.toml is small and the workspace.package block is
+          # the only one that uses the literal `version = "…"` shape
+          # (every crate uses `version.workspace = true`).
+          version="$(grep -m1 -E '^version = "' tyc/Cargo.toml | sed -E 's/^version = "([^"]+)".*/\1/')"
+          if [ -z "$version" ]; then
+            echo "::error::could not read workspace version from tyc/Cargo.toml"
+            exit 1
+          fi
+          tag="v${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "Resolved workspace version: ${version} (tag: ${tag})"
+
+      - name: Check whether tag already exists
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.ver.outputs.tag }}"
+          if git rev-parse "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "Tag ${tag} already exists locally — skipping."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          elif git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "Tag ${tag} already exists on remote — skipping."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag ${tag} does not exist yet — will create."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create and push tag
+        if: steps.check.outputs.exists == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.ver.outputs.tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${tag}" -m "Release ${tag}"
+          git push origin "${tag}"
+          echo "Pushed ${tag} at $(git rev-parse HEAD)"
+
+      - name: Dispatch Release workflow
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.ver.outputs.tag }}"
+          # `release.yml`'s `workflow_dispatch` accepts a `tag` input
+          # and (optionally) a `ref`. Now that the tag exists, leave
+          # `ref` empty so the release workflow checks out the tag
+          # itself — guaranteeing the build matches the commit that
+          # the tag points at.
+          gh workflow run release.yml \
+            --ref main \
+            -f tag="${tag}"
+          echo "Dispatched Release workflow for ${tag}"
