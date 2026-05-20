@@ -11,6 +11,7 @@ straight from a failed build to the corresponding documentation.
 ## Codes
 
 - [`tyc::arg_count`](./arg_count.md) — function, method, or class constructor called with the wrong number of arguments.
+- [`tyc::missing_field_init`](./missing_field_init.md) — `X.__new__(X)`-constructed instance escapes without every required field assigned.
 - [`tyc::async_without_await`](./async_without_await.md) — warning: `async def` body never uses `await`.
 - [`tyc::attribute_not_found`](./attribute_not_found.md) — attribute access on a type that doesn't declare it.
 - [`tyc::auto_gather_missed`](./auto_gather_missed.md) — advice: adjacent awaits look gatherable but a callee isn't `@gatherable`.

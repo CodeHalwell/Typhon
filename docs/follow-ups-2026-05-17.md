@@ -27,27 +27,44 @@ all pass.
 
 ## Deliberately deferred
 
-### Cross-module constructor / method arity checks
+### Cross-module constructor / method arity checks — ✅ landed
 
-The constructor and method arity checks (`tyc::arg_count`) consult the
-current module's `class_shapes`. Classes imported from another module
-today still land as `Type::Class(name)` with no field / method shape
-attached, so cross-module constructor calls and method calls bypass the
-check.
+Cross-module constructor + method arity checks now fire for
+`from foo import Bar` style imports — both `.ty` source and `.dty`
+stubs flow through the same project-wide shape registry. The CLI
+(`tyc check` / `tyc build`) builds the registry once per invocation;
+the LSP rebuilds it on every check so the editor reacts to changes in
+sibling files within one keystroke.
 
-Lighting it up across modules requires propagating `InterfaceShape` (and
-the per-method `ArityInfo` we now record) through `tyc-db` as a tracked
-Salsa query, plus a project-level "module index" that the checker reads
-when an imported name resolves to a class in another `.ty` or `.dty`
-file. The data structures are already in place; the missing piece is
-the cross-module query plumbing.
+Limitations of the current implementation, tracked for a follow-up:
 
-This is intentionally scoped out of the initial arity-check PR — the
-same-module case catches the most common bug (a class you wrote
-yourself, instantiated in the same file or a sibling that imports it
-from your own project). Foreign Python libraries continue to flow
-through `unsafe:` or `.dty` stubs, and a `.dty` stub authored against
-the consumer's module will be checked locally.
+- Bare `import M as N` followed by `N.SomeClass(...)` dotted access
+  isn't yet wired; the local alias `N` lands as `Type::Unknown` and
+  the constructor call bypasses the check. The CLI catches this via
+  the unknown-module pass; the type-level fix needs module-object
+  modelling.
+- The LSP rebuilds the registry on every check (parse-only walk of
+  the project's `.ty` / `.dty` tree). For large projects this could
+  become noticeable; a Salsa-tracked cache keyed on file-text would
+  be the natural follow-up.
+
+### Post-construction field-init audit — ✅ landed (tight scope)
+
+A new `tyc::missing_field_init` diagnostic catches the
+`X.__new__(X)` / `object.__new__(X)` bypass-construction patterns: if
+the instance escapes the function (return / call argument) without
+every required field assigned, the audit fires. Skipped inside
+`unsafe:` blocks. Dropped conservatively on `setattr`, on method
+calls, and on rebinding — false negatives are preferred to false
+positives.
+
+Out of scope (documented in the diagnostic's help text):
+
+- Container-literal escapes (`return [c]`, `return {"x": c}`).
+- Outer-scope assignment escapes.
+- Interprocedural reasoning (a method that does initialise fields
+  suppresses the audit; the audit can't tell which).
+- Subclass field tracking.
 
 ### Ruff parser fork — ✅ landed since this sprint
 

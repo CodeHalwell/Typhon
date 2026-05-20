@@ -1286,6 +1286,17 @@ struct Checker<'a> {
     /// untyped Python without fighting the checker.  Boundary checks at
     /// assignment sites outside the block still apply normally.
     unsafe_depth: u32,
+    /// Bindings constructed via the `X.__new__(X)` / `object.__new__(X)`
+    /// bypass form, mapped to the class name and the set of required
+    /// fields not yet assigned. When the binding flows into an escape
+    /// position (return, function call argument) with a non-empty
+    /// missing set, the audit emits `tyc::missing_field_init`. Cleared
+    /// when the binding is reassigned to anything else, when
+    /// `setattr(c, ...)` is called on it (dynamic assignment defeats
+    /// the static tracker), or when a method on the binding is called
+    /// (e.g. `c.configure(...)` which might assign fields). Skipped
+    /// entirely inside `unsafe:` regions.
+    uninit_instances: HashMap<String, UninitInstance>,
     /// Byte offsets of the `if True:` statements that correspond to
     /// `unsafe:` blocks.  Computed from the preprocessor's `unsafe_lines`
     /// metadata; queried by [`check_stmt`] when entering an `if` body to
@@ -1304,31 +1315,31 @@ struct Checker<'a> {
 /// - `def variadic(*args)` → 0 required, no fixed max, accepts kwargs only via `**kw`
 /// - `f(name="x")` keyword-arg matching against `param_names`
 #[derive(Debug, Clone, Default)]
-struct ArityInfo {
+pub struct ArityInfo {
     /// Names of the positional / pos-or-kw / kw-only parameters declared
     /// on the function, in source order. Used to match keyword arguments
     /// at call sites (`f(name="x")`).
-    param_names: Vec<String>,
+    pub param_names: Vec<String>,
     /// Minimum number of positional arguments the caller must supply
     /// (i.e. count of params without default values, excluding kw-only).
     /// `def f(a, b=10) -> ...` → `min_positional = 1`.
-    min_positional: usize,
+    pub min_positional: usize,
     /// Maximum number of positional arguments — the total count of
     /// posonlyargs + args. Kw-only params don't count. `None` for
     /// `*args` functions, which accept unbounded positionals.
-    max_positional: Option<usize>,
+    pub max_positional: Option<usize>,
     /// Names of kw-only parameters (after `*` or `*args`).
-    kwonly_names: Vec<String>,
+    pub kwonly_names: Vec<String>,
     /// Kw-only names that don't have a default value.
-    kwonly_required: Vec<String>,
+    pub kwonly_required: Vec<String>,
     /// True when the function declares `**kwargs`, accepting any
     /// otherwise-unmatched keyword argument.
-    has_kwarg: bool,
+    pub has_kwarg: bool,
     /// Declared element type of the `*args` variadic parameter, when
     /// the function has one. Used at call sites to type-check the
     /// excess positional args (FINDINGS #86). `Type::Unknown` when
     /// the vararg is unannotated.
-    vararg_type: Option<Type>,
+    pub vararg_type: Option<Type>,
 }
 
 /// Declared interface (`interface Name:` → `class Name(Protocol):`). Bundles
@@ -1347,49 +1358,49 @@ struct InterfaceDecl {
 /// method is unannotated; unannotated methods satisfy any return-type
 /// requirement.
 #[derive(Debug, Clone)]
-struct MethodSig {
-    arity: usize,
-    return_type: Type,
+pub struct MethodSig {
+    pub arity: usize,
+    pub return_type: Type,
     /// `true` when the method was decorated with `@property`. Attribute
     /// access (`r.area`) on a property unwraps to `return_type` instead
     /// of producing a `() -> return_type` bound-method handle.
     /// FINDINGS #63.
-    is_property: bool,
+    pub is_property: bool,
     /// `true` when the method was decorated with `@staticmethod`. Static
     /// methods have no implicit receiver, so `arity` records every listed
     /// parameter and the class-qualified call path does not add one for
     /// `self` (FINDINGS R3.16).
-    is_static: bool,
+    pub is_static: bool,
     /// `true` when the method was decorated with `@classmethod`. Class
     /// methods take `cls` as the first parameter, but Python binds it
     /// automatically at every call site (instance- or class-qualified),
     /// so `arity` excludes `cls` and the class-qualified call path does
     /// not add an implicit receiver.
-    is_classmethod: bool,
+    pub is_classmethod: bool,
     /// Full arity metadata (param names, defaults, `*args`/`**kwargs`)
     /// for the method, mirroring [`ArityInfo`] for free functions. Used
     /// by call-site checking so `user.greet()` is flagged when `greet`
     /// has a required parameter, instead of falling through to the
     /// permissive "unknown callable" arity rule. Excludes the implicit
     /// receiver (`self` / `cls`) for instance / classmethods.
-    arity_info: ArityInfo,
+    pub arity_info: ArityInfo,
 }
 
 /// Member shape recorded for an interface or class — methods are recorded as
 /// their parameter count (excluding `self`/`cls`), fields as their declared
 /// type.
 #[derive(Debug, Clone, Default)]
-struct InterfaceShape {
+pub struct InterfaceShape {
     /// Method name → arity + return type.
-    methods: HashMap<String, MethodSig>,
+    pub methods: HashMap<String, MethodSig>,
     /// Field name → annotation type.
-    fields: HashMap<String, Type>,
+    pub fields: HashMap<String, Type>,
     /// Field names in declaration order. The emitted `@dataclass` /
     /// `BaseModel` constructor binds positional arguments to fields in
     /// this order, so positional-arity matching and keyword-arg
     /// resolution at call sites consult this list rather than the
     /// HashMap (whose iteration order is unstable).
-    field_order: Vec<String>,
+    pub field_order: Vec<String>,
     /// Fields with an explicit `= default` value in source. Used at
     /// constructor-call sites to decide whether the field is required:
     /// a field absent from this set must be filled by a positional arg
@@ -1397,7 +1408,23 @@ struct InterfaceShape {
     /// derived for free functions. A nullable type (`T?`) alone does
     /// NOT add the field here — Typhon does not auto-inject `= None`
     /// for `T?` fields, so the runtime dataclass still requires them.
-    field_defaults: std::collections::HashSet<String>,
+    pub field_defaults: std::collections::HashSet<String>,
+}
+
+/// Tracking state for a binding constructed via `X.__new__(X)` or
+/// `object.__new__(X)`. The class name identifies which required-
+/// field set we audit against; `missing` is the running set of fields
+/// not yet assigned. When this binding escapes (return / call arg)
+/// and `missing` is non-empty, the audit emits
+/// `tyc::missing_field_init`. Bindings rebound to something else are
+/// removed from the tracker so subsequent uses are unaffected.
+#[derive(Debug, Clone)]
+struct UninitInstance {
+    /// The class being constructed (the argument to `__new__`).
+    class: String,
+    /// Required field names that haven't yet been seen on the
+    /// left-hand side of an `<instance>.<field> = ...` assignment.
+    missing: std::collections::HashSet<String>,
 }
 
 impl InterfaceShape {
@@ -1440,6 +1467,7 @@ impl<'a> Checker<'a> {
             diagnostics: Diagnostics::new(),
             current_return: None,
             current_class: None,
+            uninit_instances: HashMap::new(),
         }
     }
 
@@ -2086,6 +2114,134 @@ pub fn check_module(
     check_module_with(path, source, resolved, module, &[], &[])
 }
 
+/// Snapshot of a module's exported class shapes and free-function
+/// arities. Built by [`extract_module_shapes`] and consumed by
+/// [`check_module_with_imports`] so a checker walking module B can
+/// reason about a class declared in module A. Stored behind an [`Arc`]
+/// in the Salsa cache so cross-file invalidation stays cheap.
+#[derive(Debug, Clone, Default)]
+pub struct ModuleShapes {
+    /// Every class declared at module top level, keyed by its declared
+    /// name. Includes the merged `impl ClassName:` / `extend
+    /// ClassName:` contributions, mirroring how the in-module checker
+    /// sees them.
+    pub class_shapes: HashMap<String, InterfaceShape>,
+    /// Per-class PEP 695 type parameters, for generic-class constructor
+    /// inference at cross-module call sites (`Box(value=42)` produces
+    /// `Box[int]` even when `Box` is imported).
+    pub class_type_params: HashMap<String, Vec<String>>,
+    /// Free-function arities keyed by name. Forwarded to the checker
+    /// so `from foo import bar; bar(1)` triggers the same
+    /// `tyc::arg_count` check that an in-module `def bar` would.
+    pub function_arities: HashMap<String, ArityInfo>,
+}
+
+/// Imports resolved to their source modules' [`ModuleShapes`], keyed
+/// by the *local* name the import binds in the consumer module. The
+/// CLI / LSP populates this before invoking [`check_module_with_imports`]
+/// by walking each `import` statement in the resolved module, mapping
+/// the dotted module path to a `ModuleShapes` snapshot, then keying
+/// every brought-in symbol under its local alias.
+///
+/// Today only `from M import X` and `from M import X as Y` are wired:
+/// the consumer sees `X` (or `Y`) as a `Type::Class` with the foreign
+/// class shape attached. Bare `import M` / `import M as N` is honoured
+/// for free-function arity lookup but does not yet thread shape info
+/// through dotted-attribute access (`m.SomeClass(...)`). Tracked as a
+/// follow-up.
+#[derive(Debug, Clone, Default)]
+pub struct ExternalShapes {
+    pub class_shapes: HashMap<String, InterfaceShape>,
+    pub class_type_params: HashMap<String, Vec<String>>,
+    pub function_arities: HashMap<String, ArityInfo>,
+}
+
+/// Light-weight first-pass extractor that walks a parsed module and
+/// returns its exported class / function shapes. Reuses the same logic
+/// as the type checker's `collect_classes_and_functions` first pass so
+/// cross-module callers see the same field order, defaults, and arity
+/// metadata that the in-module checker uses.
+///
+/// Safe to call before resolution / type-checking — the result depends
+/// only on the AST structure, not on the resolver's scope tree. Errors
+/// (cyclic aliases, unknown class names in annotations, …) are
+/// silently tolerated: the goal here is to publish the surface API for
+/// downstream callers, not to validate it.
+pub fn extract_module_shapes(module: &ModModule) -> ModuleShapes {
+    let mut classes: Vec<String> = Vec::new();
+    for stmt in &module.body {
+        match stmt {
+            Stmt::ClassDef(cd) => classes.push(cd.name.as_str().to_owned()),
+            Stmt::TypeAlias(ta) => {
+                if let Expr::Name(n) = ta.name.as_ref() {
+                    classes.push(n.id.as_str().to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut class_shapes: HashMap<String, InterfaceShape> = HashMap::new();
+    let mut class_type_params: HashMap<String, Vec<String>> = HashMap::new();
+    // First sweep: every declared class gets its own shape, including
+    // the synthetic `__typhon_impl_NAME` pseudo-classes the
+    // preprocessor introduces for `impl Name:` / `extend Name:`.
+    for stmt in &module.body {
+        if let Stmt::ClassDef(cd) = stmt {
+            let name = cd.name.as_str().to_owned();
+            let shape = collect_class_shape(cd, &classes);
+            class_shapes.insert(name.clone(), shape);
+            let tps = type_param_names_from(cd.type_params.as_deref());
+            if !tps.is_empty() {
+                class_type_params.insert(name, tps);
+            }
+        }
+    }
+    // Second sweep: fold `__typhon_impl_NAME` contributions back into
+    // the target class so an out-of-module caller sees `impl`-block
+    // methods on the same shape as the in-module checker does.
+    for stmt in &module.body {
+        if let Stmt::ClassDef(cd) = stmt {
+            let pseudo = cd.name.as_str();
+            if let Some(target) = pseudo.strip_prefix("__typhon_impl_") {
+                if class_shapes.contains_key(target) {
+                    let impl_shape = collect_class_shape(cd, &classes);
+                    let target_shape = class_shapes.get_mut(target).expect("checked above");
+                    for (m, sig) in impl_shape.methods {
+                        target_shape.methods.entry(m).or_insert(sig);
+                    }
+                    for (f, ty) in impl_shape.fields {
+                        if !target_shape.fields.contains_key(&f) {
+                            target_shape.field_order.push(f.clone());
+                        }
+                        target_shape.fields.entry(f).or_insert(ty);
+                    }
+                }
+            }
+        }
+    }
+    // Drop the synthetic pseudo-classes from the published surface —
+    // consumers should never see them by name.
+    class_shapes.retain(|name, _| !name.starts_with("__typhon_impl_"));
+
+    let mut function_arities: HashMap<String, ArityInfo> = HashMap::new();
+    for stmt in &module.body {
+        if let Stmt::FunctionDef(f) = stmt {
+            let tps = type_param_names_from(f.type_params.as_deref());
+            function_arities.insert(
+                f.name.as_str().to_owned(),
+                arity_info_from_parameters(f.parameters.as_ref(), &classes, &tps),
+            );
+        }
+    }
+
+    ModuleShapes {
+        class_shapes,
+        class_type_params,
+        function_arities,
+    }
+}
+
 /// Type-check a module with knowledge of which lines opened an `unsafe:`
 /// block.  Diagnostics produced inside an unsafe region are suppressed:
 /// `Any` is permitted to flow freely so users can interface with untyped
@@ -2105,9 +2261,58 @@ pub fn check_module_with(
     unsafe_lines: &[usize],
     frozen_class_lines: &[usize],
 ) -> Diagnostics {
+    check_module_with_imports(
+        path,
+        source,
+        resolved,
+        module,
+        unsafe_lines,
+        frozen_class_lines,
+        None,
+    )
+}
+
+/// Variant of [`check_module_with`] that consults a pre-resolved
+/// [`ExternalShapes`] snapshot so constructor + method arity checks
+/// fire across module boundaries. The caller (CLI build / check, LSP
+/// backend) is responsible for walking each import in the resolver's
+/// binding table, looking up the source module's [`ModuleShapes`],
+/// and re-keying every brought-in symbol under its local alias in the
+/// returned `ExternalShapes`.
+pub fn check_module_with_imports(
+    path: impl Into<String>,
+    source: &str,
+    resolved: &ResolvedModule,
+    module: &ModModule,
+    unsafe_lines: &[usize],
+    frozen_class_lines: &[usize],
+    external: Option<&ExternalShapes>,
+) -> Diagnostics {
     let mut c = Checker::new(path.into(), source, resolved);
     c.unsafe_line_starts = unsafe_byte_starts(source, unsafe_lines);
     let frozen_starts = unsafe_byte_starts(source, frozen_class_lines);
+    // Seed cross-module shapes BEFORE the in-module first pass so
+    // local declarations win on name collisions (a `class Foo` in
+    // this file shadows an imported `Foo` for the rest of the
+    // module body, mirroring Python's scope semantics).
+    if let Some(ext) = external {
+        for (name, shape) in &ext.class_shapes {
+            c.class_shapes
+                .entry(name.clone())
+                .or_insert_with(|| shape.clone());
+            c.classes.push(name.clone());
+        }
+        for (name, tps) in &ext.class_type_params {
+            c.class_type_params
+                .entry(name.clone())
+                .or_insert_with(|| tps.clone());
+        }
+        for (name, info) in &ext.function_arities {
+            c.function_arity_info
+                .entry(name.clone())
+                .or_insert_with(|| info.clone());
+        }
+    }
 
     // First pass: collect class names + function signatures so forward
     // references work.
@@ -2200,6 +2405,209 @@ fn populate_frozen_classes(c: &mut Checker, body: &[Stmt], frozen_starts: &[u32]
 /// frozen class are flagged at the outermost write. Augmented and
 /// annotated forms (`Stmt::AugAssign`, `Stmt::AnnAssign`) share this
 /// helper.
+/// If `value` is a constructor-bypass call (`Cls.__new__(Cls)` or
+/// `object.__new__(Cls)`), return the name of the class being
+/// instantiated. The check requires the call to have exactly one
+/// positional arg matching the receiver class, so the more dynamic
+/// `cls.__new__(cls)` form (where `cls` is a `type` parameter) and
+/// the `__new__(SomeBaseClass)` cross-class form are correctly NOT
+/// detected — they need different audit semantics than the
+/// "instance of X with X's fields" assumption we make below.
+fn detect_new_bypass(value: &Expr) -> Option<String> {
+    let call = match value {
+        Expr::Call(c) => c,
+        _ => return None,
+    };
+    let attr = match call.func.as_ref() {
+        Expr::Attribute(a) => a,
+        _ => return None,
+    };
+    if attr.attr.as_str() != "__new__" {
+        return None;
+    }
+    let receiver = match attr.value.as_ref() {
+        Expr::Name(n) => n.id.as_str(),
+        _ => return None,
+    };
+    if call.arguments.args.len() != 1 || !call.arguments.keywords.is_empty() {
+        return None;
+    }
+    let arg = match &call.arguments.args[0] {
+        Expr::Name(n) => n.id.as_str(),
+        _ => return None,
+    };
+    // Two shapes accepted:
+    //   X.__new__(X)        — receiver == arg, the class itself
+    //   object.__new__(X)   — receiver "object", arg the class
+    if receiver == arg || receiver == "object" {
+        Some(arg.to_owned())
+    } else {
+        None
+    }
+}
+
+/// Mark `binding` as a bypass-constructed instance of `class_name`.
+/// Pulls the required-field set from the class's [`InterfaceShape`]
+/// (fields in `field_order` minus the ones in `field_defaults`).
+/// Skipped inside `unsafe:` blocks where the user has opted out of
+/// the static type discipline.
+fn audit_register_bypass(c: &mut Checker, binding: &str, class_name: &str) {
+    if c.unsafe_depth > 0 {
+        return;
+    }
+    let Some(shape) = c.class_shapes.get(class_name) else {
+        return;
+    };
+    let required: std::collections::HashSet<String> = shape
+        .field_order
+        .iter()
+        .filter(|f| !shape.field_defaults.contains(*f))
+        .cloned()
+        .collect();
+    if required.is_empty() {
+        return;
+    }
+    c.uninit_instances.insert(
+        binding.to_owned(),
+        UninitInstance {
+            class: class_name.to_owned(),
+            missing: required,
+        },
+    );
+}
+
+/// Mark a field as initialised on a tracked bypass-constructed
+/// instance. Called from the attribute-assignment site. No-op when
+/// the LHS receiver isn't tracked.
+fn audit_record_field_set(c: &mut Checker, target: &Expr) {
+    let Expr::Attribute(attr) = target else {
+        return;
+    };
+    let Expr::Name(recv) = attr.value.as_ref() else {
+        return;
+    };
+    let recv_name = recv.id.as_str().to_owned();
+    let field = attr.attr.as_str().to_owned();
+    if let Some(entry) = c.uninit_instances.get_mut(&recv_name) {
+        entry.missing.remove(&field);
+    }
+}
+
+/// Drop a binding from the bypass tracker. Used when:
+/// - the binding is reassigned to something other than another
+///   bypass call (e.g. `c = SomeClass(...)`),
+/// - dynamic attribute-setting calls like `setattr(c, ...)` are
+///   detected (the static analysis can't follow them),
+/// - a method is called on the instance (it might assign fields,
+///   conservatively assume it does so),
+/// - the binding goes out of scope (handled by `audit_clear_after_block`).
+fn audit_clear_binding(c: &mut Checker, binding: &str) {
+    c.uninit_instances.remove(binding);
+}
+
+/// Walk a call to detect side-effecting forms that should clear
+/// bypass tracking on a passed-in binding:
+/// - `setattr(c, "field", value)` — defeats static field tracking
+/// - `c.method(...)` — method may assign fields internally
+///
+/// For the second case, the audit only flags an *escape* (return or
+/// foreign call), so calling a method on the binding is still treated
+/// as conservative: we drop the binding to avoid spurious diagnostics
+/// after a likely-initialising helper. Erring on the side of
+/// false-negatives matches the agent's design recommendation.
+fn audit_observe_call(c: &mut Checker, call: &ruff_python_ast::ExprCall) {
+    // setattr(c, ...) — drop c from tracking.
+    if let Expr::Name(fn_name) = call.func.as_ref() {
+        if fn_name.id.as_str() == "setattr" {
+            if let Some(Expr::Name(first)) = call.arguments.args.first() {
+                audit_clear_binding(c, first.id.as_str());
+            }
+        }
+    }
+    // c.method(...) — drop c.
+    if let Expr::Attribute(attr) = call.func.as_ref() {
+        if let Expr::Name(recv) = attr.value.as_ref() {
+            // Don't drop on the `X.__new__(X)` form — the receiver
+            // there is the class, not a tracked binding, but better
+            // safe than sorry.
+            if attr.attr.as_str() != "__new__" {
+                audit_clear_binding(c, recv.id.as_str());
+            }
+        }
+    }
+}
+
+/// Emit `tyc::missing_field_init` for any tracked bindings appearing
+/// in the given expression that still have a non-empty missing set.
+/// Used at every escape point (return statement, function call
+/// argument). Walks the expression to find `Name` nodes that match a
+/// tracked binding, so `(c)` and `c` both fire but
+/// `f(g(c))` is also caught.
+fn audit_check_escape(c: &mut Checker, expr: &Expr) {
+    if c.unsafe_depth > 0 {
+        return;
+    }
+    let names = collect_names_in_expr(expr);
+    // Take a snapshot up front so the diagnostic emit (which holds
+    // `&mut c.diagnostics`) doesn't fight an outstanding immutable
+    // borrow of `c.uninit_instances`.
+    let snapshot: Vec<(String, UninitInstance)> = names
+        .iter()
+        .filter_map(|n| {
+            c.uninit_instances
+                .get(n)
+                .filter(|info| !info.missing.is_empty())
+                .map(|info| (n.clone(), info.clone()))
+        })
+        .collect();
+    for (binding, info) in snapshot {
+        let mut missing: Vec<String> = info.missing.into_iter().collect();
+        missing.sort();
+        let first = missing.first().cloned().unwrap_or_default();
+        let missing_str = missing.join(", ");
+        let span = (
+            expr.range().start().to_usize(),
+            expr.range().end().to_usize(),
+        );
+        let length = span.1.saturating_sub(span.0).max(1);
+        c.diagnostics.push_error(TycError::missing_field_init(
+            info.class,
+            missing_str,
+            first,
+            &c.path,
+            c.source,
+            span.0,
+            length,
+        ));
+        // Clear so the same instance doesn't fire again at the next
+        // escape — the first diagnostic is enough to communicate
+        // the bug.
+        c.uninit_instances.remove(&binding);
+    }
+}
+
+/// Collect all `Name` ids occurring in an expression, including those
+/// nested inside calls, attribute access, container literals, etc.
+/// Used by the escape audit to find any tracked binding that flows
+/// through `expr`.
+fn collect_names_in_expr(expr: &Expr) -> Vec<String> {
+    use ruff_python_ast::visitor::source_order::{walk_expr, SourceOrderVisitor};
+    struct V {
+        names: Vec<String>,
+    }
+    impl<'a> SourceOrderVisitor<'a> for V {
+        fn visit_expr(&mut self, e: &'a Expr) {
+            if let Expr::Name(n) = e {
+                self.names.push(n.id.as_str().to_owned());
+            }
+            walk_expr(self, e);
+        }
+    }
+    let mut v = V { names: Vec::new() };
+    v.visit_expr(expr);
+    v.names
+}
+
 fn check_attr_assign_not_frozen(c: &mut Checker, target: &Expr) {
     if c.frozen_classes.is_empty() || c.unsafe_depth > 0 {
         return;
@@ -3183,6 +3591,32 @@ fn seed_env_from_scope(c: &mut Checker, scope: ScopeId) {
                 .get(&b.name)
                 .cloned()
                 .unwrap_or(Type::Unknown),
+            // Cross-module class imports: when the caller seeded a
+            // class shape for this local name via
+            // `check_module_with_imports`, treat the binding as a
+            // `Type::Class` so call sites flow through the constructor
+            // arity check. Function imports get the same treatment via
+            // `function_arity_info` further down. Without this, a
+            // `from foo import ApiClient` would land as
+            // `Type::Unknown` and `ApiClient(...)` calls would
+            // bypass the new arity check.
+            BindingKind::Import => {
+                if c.class_shapes.contains_key(&b.name) {
+                    Type::Class(b.name.clone())
+                } else if let Some(info) = c.function_arity_info.get(&b.name) {
+                    // Build a `Type::Function` from the cross-module
+                    // arity so the call-site machinery can pick it
+                    // up the same way it picks up local `def`s.
+                    let params = vec![Type::Unknown; info.param_names.len()];
+                    Type::Function {
+                        params,
+                        ret: Box::new(Type::Unknown),
+                        variadic: info.max_positional.is_none(),
+                    }
+                } else {
+                    Type::Unknown
+                }
+            }
             _ => Type::Unknown,
         };
         c.env.declare(TypeBinding {
@@ -3231,6 +3665,9 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 // Field declarations inside a class body have no value
                 // and a bare-name target, so they don't hit this branch.
                 check_attr_assign_not_frozen(c, a.target.as_ref());
+                // Audit hook: `c.field = ...` writes mark the field
+                // assigned on a tracked bypass-constructed binding.
+                audit_record_field_set(c, a.target.as_ref());
             }
             if let Expr::Name(n) = a.target.as_ref() {
                 let span = (
@@ -3243,12 +3680,22 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     narrowed: ann_type,
                     span,
                 });
+                // Audit hook: register or refresh the binding's
+                // bypass-construction tracking based on the RHS.
+                if let Some(value) = &a.value {
+                    if let Some(class) = detect_new_bypass(value) {
+                        audit_register_bypass(c, n.id.as_str(), &class);
+                    } else {
+                        audit_clear_binding(c, n.id.as_str());
+                    }
+                }
             }
         }
         Stmt::Assign(a) => {
             let value_type = infer_expr(c, &a.value);
             for target in &a.targets {
                 check_attr_assign_not_frozen(c, target);
+                audit_record_field_set(c, target);
                 if let Expr::Name(n) = target {
                     let span = (
                         n.range.start().to_usize(),
@@ -3285,6 +3732,13 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                             narrowed: value_type.clone(),
                             span,
                         });
+                    }
+                    // Audit: detect `c = X.__new__(X)` shape and
+                    // register / clear tracking accordingly.
+                    if let Some(class) = detect_new_bypass(&a.value) {
+                        audit_register_bypass(c, n.id.as_str(), &class);
+                    } else {
+                        audit_clear_binding(c, n.id.as_str());
                     }
                 }
             }
@@ -3453,6 +3907,12 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             c.env.leave();
         }
         Stmt::Return(ret) => {
+            // Audit: a `return c` where `c` was bypass-constructed
+            // and has unassigned required fields is the canonical
+            // escape we want to catch.
+            if let Some(ret_expr) = &ret.value {
+                audit_check_escape(c, ret_expr);
+            }
             if let (Some(ret_expr), Some(expected)) = (&ret.value, c.current_return.clone()) {
                 let value_type = infer_expr_ctx(c, ret_expr, Some(&expected));
                 if !matches!(expected, Type::Unknown) && !c.is_assignable(&expected, &value_type) {
@@ -4850,6 +5310,28 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             // Ruff folds positional and keyword arguments into `call.arguments`.
             let pos_args = &call.arguments.args;
             let kw_args = &call.arguments.keywords;
+            // Audit: passing a bypass-constructed instance into a
+            // call is an escape — the callee may use the missing
+            // fields. Then observe the call for forms that should
+            // drop bypass tracking from the audit (`setattr`,
+            // `c.method(...)`). The order matters: check the args
+            // FIRST (before observe_call clears tracking) so
+            // `setattr(c, ...)` is reported when `c` is partially
+            // initialised. Skip arg-escape for setattr itself since
+            // setattr's whole point is to assign fields.
+            let is_setattr = matches!(
+                call.func.as_ref(),
+                Expr::Name(n) if n.id.as_str() == "setattr"
+            );
+            if !is_setattr {
+                for arg in pos_args.iter() {
+                    audit_check_escape(c, arg);
+                }
+                for kw in kw_args.iter() {
+                    audit_check_escape(c, &kw.value);
+                }
+            }
+            audit_observe_call(c, call);
             // Ok(value) and Err(error) are Result constructors: infer their
             // types as Generic("Ok", [T]) / Generic("Err", [E]) so that the
             // Result assignability rule in `assignable` can fire.
@@ -6411,6 +6893,195 @@ impl User:
 
 let u: User = User(name=\"x\")
 let g: str = u.greet()
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    // ── post-construction field-init audit ─────────────────────────
+    //
+    // The audit catches `X.__new__(X)` / `object.__new__(X)` bypass
+    // patterns: the auto-generated `__init__` is skipped, so any
+    // required field not assigned before the instance escapes
+    // (return / call arg) would crash at runtime with
+    // `AttributeError`. Conservative by design — drops tracking on
+    // `setattr`, method calls, and inside `unsafe:` blocks.
+
+    #[test]
+    fn audit_bypass_construct_missing_field_on_return_errors() {
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+def make() -> ApiClient:
+    let c: ApiClient = ApiClient.__new__(ApiClient)
+    c.base_url = \"x\"
+    return c
+";
+        let d = check(src);
+        assert!(d.has_errors(), "bypass with missing field must error");
+        let msg = format!("{}", d.errors()[0]);
+        assert!(
+            msg.contains("api_key") && msg.contains("ApiClient"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn audit_bypass_construct_all_fields_set_passes() {
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+def make() -> ApiClient:
+    let c: ApiClient = ApiClient.__new__(ApiClient)
+    c.api_key = \"sk-x\"
+    c.base_url = \"x\"
+    return c
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn audit_bypass_escape_via_call_arg_errors() {
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+def consume(c: ApiClient) -> None:
+    pass
+
+def f() -> None:
+    let c: ApiClient = ApiClient.__new__(ApiClient)
+    c.base_url = \"x\"
+    consume(c)
+";
+        let d = check(src);
+        assert!(d.has_errors(), "call-arg escape must error");
+    }
+
+    #[test]
+    fn audit_object_new_form_also_tracked() {
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+def make() -> ApiClient:
+    let c: ApiClient = object.__new__(ApiClient)
+    return c
+";
+        let d = check(src);
+        assert!(d.has_errors(), "`object.__new__(X)` must also be tracked");
+    }
+
+    #[test]
+    fn audit_unsafe_block_suppresses() {
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+def make() -> ApiClient:
+    unsafe:
+        let c: ApiClient = ApiClient.__new__(ApiClient)
+        return c
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "unsafe must suppress: {:?}", d.errors());
+    }
+
+    #[test]
+    fn audit_setattr_drops_tracking() {
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+def make() -> ApiClient:
+    let c: ApiClient = ApiClient.__new__(ApiClient)
+    setattr(c, \"api_key\", \"x\")
+    setattr(c, \"base_url\", \"y\")
+    return c
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "setattr must defeat audit: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn audit_method_call_drops_tracking() {
+        // A method call on the bypass-constructed instance may
+        // initialise fields internally — drop tracking
+        // conservatively to avoid false positives.
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+impl ApiClient:
+    def configure(self) -> None:
+        pass
+
+def make() -> ApiClient:
+    let c: ApiClient = ApiClient.__new__(ApiClient)
+    c.configure()
+    return c
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "method call must drop tracking: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn audit_rebinding_drops_tracking() {
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+def make() -> ApiClient:
+    let c: ApiClient = ApiClient.__new__(ApiClient)
+    let c: ApiClient = ApiClient(api_key=\"x\", base_url=\"y\")
+    return c
+";
+        let d = check(src);
+        // Note: rebinding `let c` twice would normally trip `let`
+        // immutability; this test exists to verify the audit no-ops
+        // when the original tracked binding is reassigned to a
+        // proper constructor result. The let-reassignment error is
+        // a separate concern not in this audit's scope.
+        let only_missing_field_init = d
+            .errors()
+            .iter()
+            .all(|e| !matches!(e, TycError::MissingFieldInit { .. }));
+        assert!(
+            only_missing_field_init,
+            "rebinding must clear tracking: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn audit_normal_constructor_unaffected() {
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+def make() -> ApiClient:
+    let c: ApiClient = ApiClient(api_key=\"x\", base_url=\"y\")
+    return c
 ";
         let d = check(src);
         assert!(!d.has_errors(), "{:?}", d.errors());

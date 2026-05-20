@@ -22,7 +22,13 @@ use tyc_syntax::{
         validate_extend_usage, validate_lazy_usage, validate_question_ops,
     },
 };
-use tyc_types::check_module_with;
+use tyc_types::{
+    check_module_with, check_module_with_imports, extract_module_shapes, ExternalShapes,
+};
+
+/// Re-export so downstream crates (CLI, LSP) can name the type
+/// without depending on `tyc-types` directly.
+pub use tyc_types::ModuleShapes;
 
 /// A source file held by the database — identified by path, with mutable
 /// text content. Changing `text` invalidates every query that derives
@@ -380,6 +386,183 @@ pub fn check_file(db: &mut TycDatabase, path: String, text: String) -> Diagnosti
 /// immediately, making incremental LSP re-checks near-zero cost.
 pub fn check_source_file(db: &mut TycDatabase, source_file: SourceFile) -> Diagnostics {
     (*check_diagnostics(db, source_file).0).clone()
+}
+
+/// Extract the publicly-visible class / function shapes from a Typhon
+/// source file without running the resolver or type checker. Used by
+/// the CLI and LSP backend to build a project-wide shape registry
+/// before the per-file check loop, so cross-module constructor /
+/// method arity validation has the data it needs.
+///
+/// Runs the same preprocess + parse front-end as [`check_impl`], but
+/// stops there. Returns an empty [`ModuleShapes`] on any parse error
+/// — the real diagnostic surfaces when the file is checked for real.
+pub fn extract_shapes_for_path(_path: &str, text: &str) -> ModuleShapes {
+    let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
+        &expand_gather_blocks(&expand_multiline_guards(&expand_lazy_lets(text))),
+    ))));
+    let prep = preprocess(&expanded);
+    let module = match parse_module(&prep.python_source) {
+        Ok(p) => p.into_syntax(),
+        Err(_) => return ModuleShapes::default(),
+    };
+    extract_module_shapes(&module)
+}
+
+/// Variant of [`check_file`] that consults a pre-built project-wide
+/// shape registry so cross-module constructor / method arity checks
+/// fire when an imported class is called.
+///
+/// The caller (typically the `tyc check` / `tyc build` driver or the
+/// LSP backend) walks the project, populates `shapes_by_module` with
+/// every dotted module name → [`ModuleShapes`] pairing, and then
+/// invokes this for each file in turn.
+///
+/// Unlike [`check_file`], this entry point does NOT go through the
+/// Salsa-cached `check_diagnostics` query — it threads the
+/// per-invocation `shapes_by_module` parameter through the checker,
+/// which couldn't be represented as a Salsa input without dragging
+/// the whole project's source state into the cache.
+pub fn check_file_with_imports(
+    _db: &mut TycDatabase,
+    path: String,
+    text: String,
+    shapes_by_module: &std::collections::HashMap<String, ModuleShapes>,
+) -> Diagnostics {
+    check_impl_with_imports(&path, &text, shapes_by_module)
+}
+
+/// Cross-module variant of [`check_impl`] used by
+/// [`check_file_with_imports`]. Runs the same parse + resolve +
+/// type-check pipeline but pre-walks the resolved module's import
+/// bindings to assemble an [`ExternalShapes`] snapshot that the
+/// checker seeds before walking the body.
+fn check_impl_with_imports(
+    path: &str,
+    text: &str,
+    shapes_by_module: &std::collections::HashMap<String, ModuleShapes>,
+) -> Diagnostics {
+    let mut diags = Diagnostics::new();
+
+    for err in validate_question_ops(text) {
+        diags.push_error(TycError::invalid_question_op(
+            err.message,
+            path,
+            text,
+            err.offset,
+            1,
+        ));
+    }
+    for err in validate_lazy_usage(text) {
+        diags.push_error(TycError::lazy_usage(err.message, path, text, err.offset, 4));
+    }
+    for err in validate_extend_usage(text) {
+        diags.push_error(TycError::extend_builtin(
+            err.message,
+            path,
+            text,
+            err.offset,
+            6,
+        ));
+    }
+    if diags.has_errors() {
+        return diags;
+    }
+
+    let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
+        &expand_gather_blocks(&expand_multiline_guards(&expand_lazy_lets(text))),
+    ))));
+    let prep = preprocess(&expanded);
+
+    let module = match parse_module(&prep.python_source) {
+        Ok(p) => p.into_syntax(),
+        Err(e) => {
+            diags.push_error(TycError::parse(
+                path.to_owned(),
+                prep.python_source,
+                e.to_string(),
+                usize::from(e.location.start()),
+            ));
+            return diags;
+        }
+    };
+
+    let resolve_options = ResolveOptions {
+        raw_class_byte_starts: line_byte_starts(&prep.python_source, &prep.raw_class_lines),
+        lazy_import_remaps: build_lazy_import_remaps(text, &prep.lazy_imports),
+        original_source: Some(text.to_owned()),
+    };
+    let (resolved, resolve_diags) = resolve_module_with(
+        path.to_owned(),
+        &prep.python_source,
+        &module,
+        resolve_options,
+    );
+    diags.extend(resolve_diags);
+
+    let external = build_external_shapes(&resolved, shapes_by_module);
+    let type_diags = check_module_with_imports(
+        path.to_owned(),
+        &prep.python_source,
+        &resolved,
+        &module,
+        &prep.unsafe_lines,
+        &prep.frozen_class_lines,
+        Some(&external),
+    );
+    diags.extend(type_diags);
+
+    diags
+}
+
+/// Walk the resolved module's bindings, pick out every import, and
+/// look its source module up in the project registry. Builds the
+/// [`ExternalShapes`] snapshot that
+/// [`tyc_types::check_module_with_imports`] consumes.
+///
+/// Today we wire two import shapes through:
+///
+/// - `from M import X` (with or without `as Y`) → the local name `X`
+///   (or `Y`) gets the class shape / function arity that module `M`
+///   exports for `X`. This is the common `from foo import ApiClient`
+///   pattern.
+/// - Bare `import M` / `import M as N` is intentionally left for a
+///   follow-up — its useful resolution requires modelling the module
+///   object so `m.SomeClass(...)` dotted access can locate the
+///   class, which is more invasive than the symbol-table seed used
+///   here. Bare imports still flow through normally; they just don't
+///   yet unlock cross-module arity checks for dotted access.
+fn build_external_shapes(
+    resolved: &ResolvedModule,
+    shapes_by_module: &std::collections::HashMap<String, ModuleShapes>,
+) -> ExternalShapes {
+    let mut external = ExternalShapes::default();
+    // Module-scope bindings live in scope 0.
+    let bindings = &resolved.scopes[0].bindings;
+    for b in bindings {
+        let Some(info) = &b.import_info else { continue };
+        // Only `from M import X` (member is Some) is wired — bare
+        // `import M` would need module-object modelling.
+        let Some(member) = info.member.as_ref() else {
+            continue;
+        };
+        let Some(module_shapes) = shapes_by_module.get(&info.module) else {
+            continue;
+        };
+        if let Some(shape) = module_shapes.class_shapes.get(member) {
+            external.class_shapes.insert(b.name.clone(), shape.clone());
+            if let Some(tps) = module_shapes.class_type_params.get(member) {
+                external
+                    .class_type_params
+                    .insert(b.name.clone(), tps.clone());
+            }
+        } else if let Some(arity) = module_shapes.function_arities.get(member) {
+            external
+                .function_arities
+                .insert(b.name.clone(), arity.clone());
+        }
+    }
+    external
 }
 
 /// Shared check implementation used by [`check_diagnostics`] (and transitively
@@ -895,6 +1078,152 @@ let u: User = User(id=1, name=\"Ada\")
         let mut db = TycDatabase::new();
         let diags = check_file(&mut db, "<test>".into(), src.to_owned());
         assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    // ── cross-module shape propagation ──────────────────────────────────
+    //
+    // `check_file_with_imports` walks each module's resolver bindings,
+    // looks every import up in the project shape registry, and seeds
+    // the imported class's `InterfaceShape` under the local alias. The
+    // result: constructor / method arity checks fire on imported
+    // symbols, not just locally-declared ones.
+
+    fn build_registry(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, ModuleShapes> {
+        let mut shapes = std::collections::HashMap::new();
+        for (dotted, text) in pairs {
+            shapes.insert(
+                (*dotted).to_owned(),
+                extract_shapes_for_path("<test>", text),
+            );
+        }
+        shapes
+    }
+
+    #[test]
+    fn cross_module_ctor_missing_required_field_errors() {
+        let lib = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+";
+        let registry = build_registry(&[("clients", lib)]);
+        let main = "\
+from clients import ApiClient
+
+let c: ApiClient = ApiClient(base_url=\"https://api.example.com\")
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
+        assert!(diags.has_errors(), "cross-module ctor must error");
+        let msg = format!("{}", diags.errors()[0]);
+        assert!(
+            msg.contains("ApiClient") && msg.contains("wrong number of arguments"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn cross_module_ctor_all_fields_filled_passes() {
+        let lib = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+";
+        let registry = build_registry(&[("clients", lib)]);
+        let main = "\
+from clients import ApiClient
+
+let c: ApiClient = ApiClient(api_key=\"k\", base_url=\"u\")
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn cross_module_method_missing_arg_errors() {
+        let lib = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+impl ApiClient:
+    def url(self, path: str) -> str:
+        return self.base_url + path
+";
+        let registry = build_registry(&[("clients", lib)]);
+        let main = "\
+from clients import ApiClient
+
+def f() -> None:
+    let c: ApiClient = ApiClient(api_key=\"k\", base_url=\"u\")
+    let s: str = c.url()
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
+        assert!(diags.has_errors(), "cross-module method arity must error");
+        let msg = format!("{}", diags.errors()[0]);
+        assert!(msg.contains("url") && msg.contains("wrong number of arguments"));
+    }
+
+    #[test]
+    fn cross_module_method_correct_arity_passes() {
+        let lib = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+impl ApiClient:
+    def url(self, path: str) -> str:
+        return self.base_url + path
+";
+        let registry = build_registry(&[("clients", lib)]);
+        let main = "\
+from clients import ApiClient
+
+def f() -> None:
+    let c: ApiClient = ApiClient(api_key=\"k\", base_url=\"u\")
+    let s: str = c.url(\"/v1\")
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn cross_module_unknown_module_falls_back_gracefully() {
+        // No registry entry for the imported module — the cross-module
+        // check is a no-op, matching the per-file semantics
+        // (`tyc::implicit_any` and friends would still flag misuse if
+        // the user tried to consume the imported value).
+        let registry: std::collections::HashMap<String, ModuleShapes> =
+            std::collections::HashMap::new();
+        let main = "\
+from nonexistent import Thing
+
+unsafe:
+    let t = Thing()
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn cross_module_imported_function_arity_checked() {
+        let lib = "\
+def add(a: int, b: int) -> int:
+    return a + b
+";
+        let registry = build_registry(&[("mathlib", lib)]);
+        let main = "\
+from mathlib import add
+
+let r: int = add(1)
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
+        assert!(diags.has_errors(), "cross-module function arity must error");
     }
 
     #[test]

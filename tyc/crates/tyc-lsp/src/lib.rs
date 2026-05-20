@@ -23,7 +23,10 @@ use tower_lsp_server::ls_types::{
     TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
 };
 use tower_lsp_server::{jsonrpc, Client, LanguageServer, LspService, Server};
-use tyc_db::{check_source_file, preprocessed_text, resolved_module_arc, SourceFile, TycDatabase};
+use tyc_db::{
+    check_file_with_imports, check_source_file, extract_shapes_for_path, preprocessed_text,
+    resolved_module_arc, ModuleShapes, SourceFile, TycDatabase,
+};
 use tyc_diagnostics::TycError;
 use tyc_resolve::{
     BindingKind, ClassKind, ImportInfo, Mutability, ResolveOptions, ResolvedModule, SymbolAtOffset,
@@ -163,14 +166,42 @@ impl Backend {
         // retrieved via `source_file.text(db)` when needed.
         {
             let mut docs = self.documents.lock().await;
-            docs.insert(uri_str, source_file);
+            docs.insert(uri_str.clone(), source_file);
         }
 
+        // Build a project-wide shape registry so cross-module
+        // constructor / method arity checks fire as the user types.
+        // We rebuild on every check rather than caching across calls:
+        // the work is parse-only (no resolve, no type-check) and
+        // the project file count is small enough that this stays
+        // responsive in practice. Editor performance regressions
+        // here would justify a Salsa-tracked cache as a follow-up.
+        let path_for_root = std::path::PathBuf::from(uri.path().as_str());
+        let project_shapes = build_project_shapes_for_path(&path_for_root, &uri_str, &text);
+
+        let text_for_check = text.clone();
+        let uri_str_for_check = uri_str.clone();
         let result = tokio::task::spawn_blocking(move || {
             // Hold the mutex only for the duration of the salsa call.
             let mut db = db.blocking_lock();
             #[allow(clippy::explicit_auto_deref)]
-            let diags = check_source_file(&mut *db, source_file);
+            let diags = if project_shapes.is_empty() {
+                // No workspace layout discovered — fall back to the
+                // Salsa-cached per-file check so isolated edits keep
+                // the LSP cache warm.
+                check_source_file(&mut *db, source_file)
+            } else {
+                // Cross-module-aware check: not cached by Salsa
+                // (the shape registry would be hard to model as a
+                // tracked input), but the parse+resolve+check is
+                // still cheap enough for incremental editing.
+                check_file_with_imports(
+                    &mut *db,
+                    uri_str_for_check,
+                    text_for_check,
+                    &project_shapes,
+                )
+            };
             // Retrieve the preprocessed source for diagnostic position
             // mapping.  After `check_source_file` runs the full pipeline the
             // Salsa `preprocessed_text` query is populated; hover/definition
@@ -888,6 +919,155 @@ fn from_hex(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+/// Build the dotted-name → public-shape registry for the project
+/// containing `file_path`. Walks the project's source root and pulls
+/// shapes out of every `.ty` and `.dty` file. Mirrors the
+/// `collect_project_shapes` helper in `tyc/commands/check.rs` so a
+/// `tyc check` warm-up and an LSP keystroke see the same set of
+/// cross-module shapes.
+///
+/// The currently-open file's shapes come straight from the editor
+/// buffer (`current_text`) rather than from disk — without this the
+/// LSP would lag a keystroke behind on edits that change the local
+/// class surface and the next-cross-module-call diagnostic would
+/// flicker.
+///
+/// Returns an empty map when no `typhon.toml` ancestor exists.
+fn build_project_shapes_for_path(
+    file_path: &std::path::Path,
+    current_uri: &str,
+    current_text: &str,
+) -> std::collections::HashMap<String, ModuleShapes> {
+    let Some((_project_root, src_dir)) = find_workspace_layout(file_path) else {
+        return std::collections::HashMap::new();
+    };
+    let src_root_name = src_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("src")
+        .to_owned();
+
+    let mut shapes: std::collections::HashMap<String, ModuleShapes> =
+        std::collections::HashMap::new();
+
+    // `.dty` stubs first so `.ty` insertions later skip them — stubs
+    // are the authored Typhon surface for foreign packages.
+    let dty_files = collect_files_with_ext(&src_dir, "dty");
+    for file in &dty_files {
+        let dotted = path_to_dotted(file, &src_root_name);
+        if let Ok(text) = std::fs::read_to_string(file) {
+            shapes
+                .entry(dotted)
+                .or_insert_with(|| extract_shapes_for_path(&file.display().to_string(), &text));
+        }
+    }
+
+    let ty_files = collect_files_with_ext(&src_dir, "ty");
+    for file in &ty_files {
+        let dotted = path_to_dotted(file, &src_root_name);
+        if shapes.contains_key(&dotted) {
+            continue;
+        }
+        // For the file the user is currently editing, prefer the
+        // in-flight buffer over the on-disk content — otherwise the
+        // cross-module check would lag a keystroke behind on edits
+        // that change this module's class surface.
+        let text_owned;
+        let text = if uri_matches_path(current_uri, file) {
+            current_text
+        } else {
+            match std::fs::read_to_string(file) {
+                Ok(t) => {
+                    text_owned = t;
+                    text_owned.as_str()
+                }
+                Err(_) => continue,
+            }
+        };
+        shapes.insert(
+            dotted,
+            extract_shapes_for_path(&file.display().to_string(), text),
+        );
+    }
+    shapes
+}
+
+/// Recursive file collection that mirrors the CLI's
+/// `collect_with_ext` — copied here so this crate stays free of a
+/// reverse dependency on the CLI binary crate.
+fn collect_files_with_ext(root: &std::path::Path, ext: &str) -> Vec<std::path::PathBuf> {
+    let mut acc = Vec::new();
+    collect_files_inner(root, ext, &mut acc);
+    acc.sort();
+    acc
+}
+
+fn collect_files_inner(root: &std::path::Path, ext: &str, acc: &mut Vec<std::path::PathBuf>) {
+    if root.is_file() {
+        if root.extension().and_then(|e| e.to_str()) == Some(ext) {
+            acc.push(root.to_path_buf());
+        }
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with('.') || name == "__pycache__" {
+                    continue;
+                }
+            }
+        }
+        collect_files_inner(&path, ext, acc);
+    }
+}
+
+/// Map a file path to its dotted Python module name. Identical
+/// semantics to `tyc::commands::util::path_to_dotted` (kept private
+/// here so the LSP crate doesn't need to depend on the CLI binary
+/// crate).
+fn path_to_dotted(path: &std::path::Path, src_root: &str) -> String {
+    let components: Vec<String> = path
+        .with_extension("")
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(os) => Some(os.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect();
+    let src_idx = components.iter().rposition(|c| c == src_root);
+    let tail: Vec<&str> = match src_idx {
+        Some(i) => components[i + 1..].iter().map(|s| s.as_str()).collect(),
+        None => components
+            .last()
+            .map(|s| vec![s.as_str()])
+            .unwrap_or_default(),
+    };
+    let mut tail = tail;
+    if tail.last().is_some_and(|s| *s == "__init__") {
+        tail.pop();
+    }
+    tail.join(".")
+}
+
+/// Best-effort check that an editor URI refers to the same file as
+/// `path`. Compares canonicalised forms so symlinks and `..` segments
+/// don't fool the equality check; falls back to suffix matching when
+/// canonicalisation fails (paths that don't exist yet, network FS).
+fn uri_matches_path(uri: &str, path: &std::path::Path) -> bool {
+    let Some(uri_path_str) = uri.strip_prefix("file://") else {
+        return false;
+    };
+    let uri_path = std::path::PathBuf::from(uri_path_str);
+    match (uri_path.canonicalize(), path.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => uri_path == path,
     }
 }
 
