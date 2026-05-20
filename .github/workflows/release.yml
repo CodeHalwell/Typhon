@@ -15,6 +15,11 @@ on:
         description: "Tag to release (e.g. v0.1.0). Required for manual runs."
         required: true
         type: string
+      ref:
+        description: "Branch, tag, or commit SHA to build from. Leave empty to build from `tag` itself (re-release an existing tag). Set this when `tag` does not yet exist — the tag will be created at this ref."
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: write
@@ -34,13 +39,15 @@ jobs:
           - target: x86_64-apple-darwin
 
     steps:
-      # Check out the requested tag (not branch HEAD) when triggered
-      # manually via workflow_dispatch — otherwise a manual run for
-      # `vX.Y.Z` would build from whatever the workflow file's branch
-      # happens to point at, producing mislabeled artifacts.
+      # On a tag push, build the tag itself. On workflow_dispatch, build
+      # the user-provided `ref` if any — otherwise fall back to `inputs.tag`
+      # so that re-releasing an existing tag still builds from the tag's
+      # commit (not the workflow branch HEAD). Releasing an as-yet-uncreated
+      # tag is supported by passing `ref` explicitly; action-gh-release then
+      # creates `tag_name` at the build SHA.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.ref != '' && inputs.ref || inputs.tag) || github.ref }}
 
       - name: Resolve release tag
         id: tag
@@ -130,7 +137,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.ref != '' && inputs.ref || inputs.tag) || github.ref }}
 
       - name: Resolve release tag
         id: tag
@@ -142,6 +149,12 @@ jobs:
             tag="${GITHUB_REF#refs/tags/}"
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          # Capture the SHA actually checked out, so action-gh-release
+          # can create a missing tag at this commit (workflow_dispatch
+          # path). For a tag-push trigger this still resolves to the
+          # tagged commit.
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Download build artifacts
         uses: actions/download-artifact@v4
@@ -166,6 +179,7 @@ jobs:
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: ${{ steps.tag.outputs.tag }}
+          target_commitish: ${{ steps.tag.outputs.sha }}
           draft: false
           prerelease: false
           fail_on_unmatched_files: true
