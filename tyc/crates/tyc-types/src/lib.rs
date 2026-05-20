@@ -346,6 +346,15 @@ fn body_has_yield(body: &[Stmt]) -> bool {
 
 /// Return `true` when `body` (recursively) contains an `await`
 /// expression — including the implicit awaits inside `async for` and
+/// Mandatory async-protocol dunders — these are legitimately allowed to
+/// have an `async def` body with no `await` (e.g. `__aenter__` that
+/// returns `self`, `__aexit__` that just records cleanup state, or an
+/// `__anext__` that immediately raises `StopAsyncIteration`). Suppress
+/// `tyc::async_without_await` for them. FINDINGS #114.
+fn is_async_protocol_dunder(name: &str) -> bool {
+    matches!(name, "__aenter__" | "__aexit__" | "__aiter__" | "__anext__")
+}
+
 /// `async with` headers. Nested function and class bodies are skipped
 /// so an `await` in an inner async lambda or nested coroutine doesn't
 /// satisfy the outer function. FINDINGS #83.
@@ -621,6 +630,29 @@ pub fn type_from_annotation(expr: &Expr, classes: &[String]) -> Type {
     type_from_annotation_with_params(expr, classes, &[])
 }
 
+/// Widen a `Literal[...]` element expression to its underlying type.
+/// `Literal["a"]` → `str`, `Literal[42]` → `int`, `Literal[True]` → `bool`,
+/// `Literal[b"x"]` → `bytes`, `Literal[None]` → `None`. Anything else
+/// (an identifier, a nested expression) falls back to `Type::Unknown`.
+/// FINDINGS #98.
+fn literal_widened_type(expr: &Expr) -> Type {
+    match expr {
+        Expr::StringLiteral(_) => Type::Str,
+        Expr::NumberLiteral(n) => match &n.value {
+            ruff_python_ast::Number::Int(_) => Type::Int,
+            ruff_python_ast::Number::Float(_) => Type::Float,
+            ruff_python_ast::Number::Complex { .. } => Type::Unknown,
+        },
+        Expr::BooleanLiteral(_) => Type::Bool,
+        Expr::BytesLiteral(_) => Type::Bytes,
+        Expr::NoneLiteral(_) => Type::None,
+        Expr::UnaryOp(u) if matches!(u.op, ruff_python_ast::UnaryOp::USub) => {
+            literal_widened_type(&u.operand)
+        }
+        _ => Type::Unknown,
+    }
+}
+
 /// Same as [`type_from_annotation`] but treats every name in `type_params`
 /// as `Type::Any` so that PEP 695 generic functions don't trip the
 /// assignability check before we have a real inference engine.
@@ -638,6 +670,19 @@ pub fn type_from_annotation_with_params(
             "bytes" => Type::Bytes,
             "None" => Type::None,
             "Any" => Type::Any,
+            // Synthetic shadow-resistant alias for the runtime `Err`,
+            // injected by `?` and `with`-chain lowerings. Treat as
+            // `Class("Err")` for type-checking purposes so post-`?`
+            // narrowing and `result_error_mismatch` continue to work
+            // even when the user shadowed `Err` with a type alias.
+            // FINDINGS #104.
+            "__typhon_Err__" => Type::Class("Err".into()),
+            // `typing.Self` — represents "the current class". Without a
+            // surrounding class context we treat it permissively as
+            // `Type::Any` so builder-pattern methods that return
+            // `Self` don't trip `tyc::type_mismatch` against the
+            // implementation class. FINDINGS #97.
+            "Self" => Type::Any,
             // A type parameter (PEP 695) — preserved as `Type::TypeVar` so
             // call-site inference can substitute it with the concrete
             // argument type.  Assignability still treats it as `Any` until
@@ -668,6 +713,36 @@ pub fn type_from_annotation_with_params(
                     classes,
                     type_params,
                 ));
+            }
+            // Final[T], ClassVar[T] — both are transparent wrappers
+            // that don't affect runtime types or assignability rules.
+            // FINDINGS #99.
+            if head == "Final" || head == "ClassVar" {
+                return type_from_annotation_with_params(&s.slice, classes, type_params);
+            }
+            // Annotated[T, ...] — first slice arg is the real type;
+            // the rest are runtime metadata that doesn't affect
+            // assignability. FINDINGS #100.
+            if head == "Annotated" {
+                let real = match s.slice.as_ref() {
+                    Expr::Tuple(t) if !t.elts.is_empty() => &t.elts[0],
+                    other => other,
+                };
+                return type_from_annotation_with_params(real, classes, type_params);
+            }
+            // Literal["a", "b"] / Literal[1, 2] — narrow to the
+            // widened literal type (str / int / bool / bytes / None).
+            // FINDINGS #98.
+            if head == "Literal" {
+                let variants: Vec<&Expr> = match s.slice.as_ref() {
+                    Expr::Tuple(t) => t.elts.iter().collect(),
+                    other => vec![other],
+                };
+                let widened: Vec<Type> = variants.into_iter().map(literal_widened_type).collect();
+                if widened.is_empty() {
+                    return Type::Unknown;
+                }
+                return Type::union_of(widened);
             }
             // Union[A, B, ...] / typing.Union[...]
             if head == "Union" {
@@ -2391,7 +2466,7 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                 // are wasted on a body that never suspends — most often a
                 // leftover from a half-finished refactor or a forgotten
                 // `await` on an internal call.
-                if !body_has_await(&f.body) {
+                if !body_has_await(&f.body) && !is_async_protocol_dunder(f.name.as_str()) {
                     let span_start = f.name.range.start().to_usize();
                     let span_len = f
                         .name
@@ -2687,10 +2762,14 @@ fn check_arity_with_info(
         .filter_map(|k| k.arg.as_ref().map(|i| i.as_str()))
         .collect();
     let has_double_star = kw_args.iter().any(|k| k.arg.is_none());
+    // A `*iter` positional unpack expands to an unknown number of
+    // positionals; we can't reason about specific positional slots so
+    // the arity check degrades to "trust the user". FINDINGS #109.
+    let has_starred_positional = pos_args.iter().any(|e| matches!(e, Expr::Starred(_)));
 
     // Rule 4: positional count must fit max_positional (None → unbounded).
     if let Some(max) = info.max_positional {
-        if pos_args.len() > max {
+        if !has_starred_positional && pos_args.len() > max {
             return ArityCheck::Other;
         }
     }
@@ -2734,8 +2813,10 @@ fn check_arity_with_info(
 
     // Rule 3a: every required positional must be filled by a pos arg or
     // matching kw arg. Stops being checkable when `**kwargs` unpacking is
-    // present — in that case we trust the user.
-    if !has_double_star {
+    // present — in that case we trust the user. A `*positional` unpack
+    // also expands to an unknown number of args, so skip the count
+    // check there too (FINDINGS #109).
+    if !has_double_star && !has_starred_positional {
         for (i, p) in info
             .param_names
             .iter()
@@ -3295,7 +3376,11 @@ fn check_function(
     // `async def` with no `await` — warn per tyc::async_without_await (FINDINGS #83).
     // Only fires for user-authored async functions, not compiler-synthesised helpers
     // (prefixed with `__typhon_`).
-    if is_async && !name.starts_with("__typhon_") && !body_has_await(body) {
+    if is_async
+        && !name.starts_with("__typhon_")
+        && !is_async_protocol_dunder(name)
+        && !body_has_await(body)
+    {
         c.diagnostics.push_warning(TycError::async_without_await(
             name,
             c.path.clone(),
@@ -4193,7 +4278,12 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         // a `def f[T](x: T)` formal can absorb a `None`
                         // actual at the call site; bidirectional inference
                         // will bind `T = None` from the expected return.
-                        let nullable_into_non_nullable = !expected.is_nullable()
+                        // Transparent type aliases are also exempt — a
+                        // `type JSON = int | str | None | ...` annotation
+                        // is nullable once unwrapped even though the bare
+                        // `Class("JSON")` doesn't look like it. FINDINGS #121.
+                        let expected_unwrapped_nullable = c.unwrap_alias(&expected).is_nullable();
+                        let nullable_into_non_nullable = !expected_unwrapped_nullable
                             && actual.is_nullable()
                             && !matches!(expected, Type::TypeVar(_));
                         if nullable_into_non_nullable {
@@ -4245,7 +4335,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                             }
                             let actual = infer_expr_ctx(c, &kw.value, Some(&params[idx]));
                             let nullable_into_non_nullable =
-                                !params[idx].is_nullable() && actual.is_nullable();
+                                !c.unwrap_alias(&params[idx]).is_nullable() && actual.is_nullable();
                             if nullable_into_non_nullable {
                                 if let Expr::Name(n) = &kw.value {
                                     let span = (

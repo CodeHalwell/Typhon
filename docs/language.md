@@ -256,7 +256,10 @@ When `typhon.toml` sets `free-threaded = true`, the analyser emits `ThreadPoolEx
 - `let` is immutable as a binding. Reassignment is a compile error.
 - `mut` is mutable. Parallelisation passes refuse to touch any binding captured as `mut` by a spawned task without explicit synchronisation.
 - Top-level module bindings default to `let` unless declared `mut`.
-- Inside a function, every local binding must declare `let` or `mut` on first occurrence (`tyc::missing_binding_kind` otherwise). The one carve-out is for names declared `global` or `nonlocal` inside the same function: those refer to an outer-scope binding whose `let`/`mut` already lives at the declaration site, so the bareword assignment is accepted.
+- Inside a function, every local binding must declare `let` or `mut` on first occurrence (`tyc::missing_binding_kind` otherwise). Three carve-outs:
+  - Names declared `global` or `nonlocal` inside the same function refer to an outer-scope binding whose `let`/`mut` already lives at the declaration site, so the bareword assignment is accepted.
+  - Bindings introduced by the walrus operator (`if (n := len(xs)) > 3:`) don't require a leading keyword; they are implicitly immutable (`let`-equivalent) and cannot be rebound without `mut`.
+  - Bindings introduced inside a `gather:` block (the keyword itself declares them as immutable single-assignment names) don't take `let`/`mut`.
 
 ```python
 mut counter: int = 0

@@ -66,7 +66,7 @@ The 30-second mental model. Everything else in this skill is detail under one of
 | Best-effort gather | `gather(strategy="best-effort"):` | `asyncio.gather(..., return_exceptions=True)` |
 | Spawn | `go f(x)` / `go f(x) -> task` | `typhon_runtime.tasks.spawn(...)` (strong-ref registry) |
 | Lazy module | `lazy import np = numpy` | bespoke `__TyphonLazy_np_` proxy class with double-checked locking |
-| Lazy module-level let | `lazy let CFG: Config = load()` | sentinel-cached `lazy_val(lambda: load())` |
+| Lazy module-level let | `lazy let CFG: Config = load()` | sentinel-cached `lazy_let(lambda: load())` |
 | Lazy class-level let | `lazy let cfg: Config = ...` inside class | `@cached_property` |
 | Comptime constant | `comptime let PORT: int = int(env("PORT", "8080"))` | inlined literal at build time |
 | Pure assertion | `@pure def f(...) -> T:` | nothing emitted unless `@memo` too |
@@ -103,6 +103,11 @@ def demo() -> None:
 ```
 
 Module-level bindings default to `let` if you skip the keyword — but a *local* `name = "x"` with no keyword is `tyc::missing_binding_kind`. Reach for `mut` only when you actually rebind.
+
+Carve-outs (no keyword required):
+- `global NAME` / `nonlocal NAME` declarations bind the outer-scope variable; the bareword assignment that follows refers to that binding.
+- `gather:` block bindings (`gather: a = fetch_a(); b = fetch_b()`) — the keyword itself introduces immutable single-assignment names.
+- Walrus operator: `if (n := len(xs)) > 3:` introduces `n` as an implicit `let` binding; rebinding `n` later requires `mut`.
 
 ### Rule 3 — `T` cannot hold `None`
 
@@ -516,7 +521,7 @@ Other lazy forms:
 
 | Form | Lowers to |
 |---|---|
-| `lazy let CFG: Config = load()` (module-level) | sentinel-cached `lazy_val(lambda: load())` in `typhon_runtime` (thread-safe, one-shot) |
+| `lazy let CFG: Config = load()` (module-level) | sentinel-cached `lazy_let(lambda: load())` in `typhon_runtime` (thread-safe, one-shot) |
 | `lazy let cfg: Config = load()` (class body) | `@cached_property` (per-instance is the intended scope) |
 | `def primes(n: int) -> lazy[list[int]]:` | generator function, not materialised list |
 

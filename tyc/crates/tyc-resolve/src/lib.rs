@@ -2417,6 +2417,9 @@ fn builtin_names() -> std::collections::HashSet<&'static str> {
         // Common exceptions
         "Exception",
         "BaseException",
+        // PEP 654 exception groups (CPython 3.11+). FINDINGS #113.
+        "ExceptionGroup",
+        "BaseExceptionGroup",
         "ValueError",
         "TypeError",
         "KeyError",

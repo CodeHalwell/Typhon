@@ -9,7 +9,7 @@ phase status.
 
 | Area | Change |
 |---|---|
-| Syntax | Module-level `lazy let NAME: T = expr` lowers to `lazy_val(lambda: expr)`; class-body `lazy let` lowers to `@cached_property`. Both round-trip through `tyc fmt`. |
+| Syntax | Module-level `lazy let NAME: T = expr` lowers to `lazy_let(lambda: expr)`; class-body `lazy let` lowers to `@cached_property`. Both round-trip through `tyc fmt`. |
 | Syntax | `extend BUILTIN:` is rejected at preprocess time with a dedicated `tyc::extend_builtin` diagnostic; user-defined classes still flow through `impl`-merge. *(Update: built-in extensions have since landed — `extract_builtin_extensions` lowers each method to a free function and rewrites annotated call sites. The `validate_extend_usage` validator is now a no-op kept for back-compat with the diagnostic enum.)* |
 | Types | `unsafe:` blocks now bump `Checker::unsafe_depth` via preprocess line metadata; type-mismatch, nullable-use, interface-isinstance, wrong-arg-count, not-callable, and non-exhaustive-match diagnostics are dropped inside the block. Errors on lines outside the block are unaffected. |
 | Types | `Type::TypeVar(name)` replaces `Type::Any` for PEP 695 type parameters in signatures; call-site `bind_typevars_and_substitute` infers bindings (recursively, with conflict-widening) and substitutes them in the return type. |

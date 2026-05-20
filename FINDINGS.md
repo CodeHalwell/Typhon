@@ -4453,3 +4453,199 @@ unit-of-pain wins are:
 12. **`bytes` literal preservation** (#116). Skip the `\xNN`
     re-escape when every byte is printable ASCII.
 
+---
+
+## Status as of `claude/resolve-open-findings-UDZfv`
+
+Picks up the open findings from the `rNIYC` campaign (#97–#127). Each
+fix lands as its own commit.
+
+### Closed in this branch
+
+- **#103** `model X:` auto-adds `pydantic` to `[dependencies]` —
+  `tyc build` now scans the source files for `model NAME:` declarations
+  before bootstrapping `pyproject.toml`. When any are present and
+  `pydantic` is not already a declared dependency, it is auto-injected
+  as `pydantic = "*"` so `uv sync` pulls it into the venv. Without the
+  fix, `model`-using artefacts crashed at import time with
+  `ModuleNotFoundError: No module named 'pydantic'`. New helper
+  `sources_use_model_keyword` in `tyc/src/commands/build.rs`.
+
+- **#116** `bytes` literal preservation — `Expr::BytesLiteral` emit in
+  `tyc-emit/src/printer.rs` no longer re-escapes every byte as
+  `\xNN`. Printable ASCII bytes (`0x20..=0x7e`) emit unchanged with
+  the conventional Python escapes for `\\`, `"`, `\n`, `\r`, `\t`;
+  non-printable / non-ASCII bytes still use the `\xNN` hex form.
+  `b"hello"` now round-trips as `b"hello"` instead of
+  `b"\x68\x65\x6c\x6c\x6f"`.
+
+- **#106** `f"{x=}"` debug-repr emission — the printer's `FString`
+  arm now checks `InterpolatedElement.debug_text` and emits its
+  verbatim contents (including the `=` and any surrounding
+  whitespace) in place of the parsed expression when present.
+  Conversion (`!r/!s/!a`) and format-spec emission continue to layer
+  on top, so `f"{name=!r}"`, `f"{x*2=}"`, and `f"{x = }"` all
+  round-trip with the `=` debug marker preserved. Verified
+  end-to-end via `tyc build` + CPython 3.13.
+
+- **#114** `tyc::async_without_await` carve-out for async-protocol
+  dunders — added `is_async_protocol_dunder` helper in
+  `tyc-types/src/lib.rs` that recognises `__aenter__`, `__aexit__`,
+  `__aiter__`, `__anext__`. The two warning sites (the impl-block
+  class walk and the top-level `check_function`) skip the warning
+  for those names, so users can legitimately write
+  `async def __aenter__(self) -> Self: return self` without the
+  noise.
+
+- **#101** `class X(NamedTuple):` no longer crashes at runtime — the
+  desugarer's class walk now checks `class_inherits_named_tuple(c)`
+  and skips the `@dataclasses.dataclass(slots=True)` decorator for
+  NamedTuple subclasses, mirroring the existing TypedDict carve-out.
+  `class Point(NamedTuple): x: int; y: int` builds and runs cleanly.
+
+- **#102** multi-inheritance no longer triggers `multiple bases have
+  instance lay-out conflict` — `class_has_multiple_concrete_bases`
+  identifies a class with 2+ concrete (non-`Protocol` / non-`Generic`)
+  bases and emits `@dataclasses.dataclass()` (no `slots=True`) for
+  it. A pre-scan in `desugar_mod_module_with` also collects every
+  class referenced as a base of such a multi-inheritance child, and
+  emits `slots=False` for those parents too — both parents need to
+  be unslotted for the child to load. `class C(A, B)` with simple
+  `class A` / `class B` now builds and runs.
+
+- **#105** `lazy let` print no longer shows `<lazy: unmaterialised>`
+  — added `__str__`, `__bool__`, `__eq__`, `__hash__`, and `__len__`
+  to `_LazyValue` in `typhon_runtime/lazy.py`. Each materialises the
+  underlying value before delegating, so `print(CFG)`,
+  `f"{CFG}"`, `if CFG:`, and `len(CFG)` all behave as if the user
+  had written the underlying value directly. `__repr__` keeps the
+  deliberate "don't materialise" debug behaviour.
+
+- **#104** `type Err = …` no longer shadows the `?` operator's
+  runtime `Err` — `expand_question_ops` and `expand_with_chains`
+  now emit `isinstance(_t, __typhon_Err__)` instead of
+  `isinstance(_t, Err)`, and both passes inject
+  `from typhon_runtime import Err as __typhon_Err__` at the top
+  of the source when any rewrite was made. `type_from_annotation`
+  in `tyc-types` maps the synthetic name back to
+  `Type::Class("Err")` so post-`?` narrowing and the
+  `result_error_mismatch` check continue to work. A user's
+  `type Err = str` can now coexist with `Result[T, str]` and the
+  `?` propagation routes through the runtime constructor.
+
+- **#97 / #98 / #99 / #100** typing-module bridge types now
+  transparent in `type_from_annotation`:
+  - `Self` — treated as `Type::Any` (builder-pattern methods that
+    return `Self` no longer trip `tyc::type_mismatch`).
+  - `Literal["a", "b"]` / `Literal[42, 0]` — widened to the
+    enclosing primitive (or union of primitives) via the new
+    `literal_widened_type` helper.
+  - `Final[T]` / `ClassVar[T]` — unwrapped to `T` since neither
+    affects runtime assignability.
+  - `Annotated[T, meta...]` — unwrapped to `T`; the metadata tail
+    is ignored.
+
+- **#113** `ExceptionGroup` / `BaseExceptionGroup` added to the
+  resolver's builtin whitelist — PEP 654 exception groups, in
+  CPython since 3.11, are now recognised as in-scope names.
+  `raise ExceptionGroup("oops", [...])` no longer fires
+  `tyc::unknown_name`.
+
+- **#123** `tyc init` scaffold now emits the canonical entry
+  block `if __name__ == "__main__": main()` instead of a bare
+  `main()` call. Scripts run identically; importing the module
+  no longer triggers `main()` as a side effect.
+
+- **#109** `*positional` unpack at call sites is no longer rejected
+  by the strict arg-count check — `check_arity_with_info` now
+  detects an `Expr::Starred` positional argument and degrades to
+  "trust the user" for the count rule (matching the existing
+  `**kwargs` carve-out). `add(*xs)` now type-checks; type-mismatch
+  on individual args still fires when the receiver type is known.
+
+- **#115** `tyc migrate` now rewrites `typing.List` / `Dict` /
+  `Tuple` / `Set` / `FrozenSet` / `Type` to their lowercase
+  built-ins in addition to the existing `Optional` → `T?`
+  rewrite, and the typing-import stripper drops every removed
+  name from the `from typing import …` line (dropping the line
+  entirely when nothing else remains). New `rewrite_typing_aliases`
+  helper handles both bare and `typing.<Name>[…]` forms; the
+  `TYPING_NAMES_TO_REWRITE` list keys the import-strip pass.
+
+- **#121** Recursive / union-bearing type aliases now accept
+  `None` literal at the call site. The arg-type loop's
+  `nullable_into_non_nullable` shortcut was firing on
+  `Class("JSON")` (the bare alias name) because `is_nullable` on a
+  Class returns false. Now we check `c.unwrap_alias(&expected)
+  .is_nullable()` so a `type JSON = int | str | None | ...` alias
+  is recognised as nullable on the parameter side. The kwarg arm
+  was updated the same way.
+
+- **#126 / #127** doc drift — replaced every `lazy_val(...)` /
+  `lazy_val(lambda:` mention across `README.md`, `docs/roadmap.md`,
+  `docs/follow-ups-2026-05-17.md`,
+  `docs/guides/10-advanced-features.md`,
+  `.claude/skills/typhon/SKILL.md`, and
+  `.claude/skills/typhon/REFERENCE.md` with the actual emitted
+  `lazy_let(...)` call. The REFERENCE.md emitted-Python sketch
+  now mirrors the real preprocessor lowering. F-string `=`
+  debug-marker support (#127) is covered by the #106 fix; no
+  separate doc change needed.
+
+- **#124** walrus-binding doc — added a "carve-outs (no keyword
+  required)" subsection to Rule 2 in `.claude/skills/typhon/SKILL.md`
+  and `docs/language.md` that lists the three known exceptions to
+  the local-binding-kind rule: `global` / `nonlocal` declarations,
+  `gather:` block bindings, and the walrus operator. Documents
+  that walrus introduces an implicit-`let` binding and requires
+  `mut` to rebind.
+
+### Verified already-fixed on a prior branch
+
+The following findings from the `rNIYC` campaign turned out to
+already be addressed by an earlier fix; re-verified on this branch
+and noted here so future readers don't chase them again.
+
+- **#110** `gather:` with dependent bindings — covered by the #60
+  fix on `claude/test-typhon-library-rNIYC` (the desugarer now
+  detects an inter-binding dependency and falls back to sequential
+  awaits instead of an `asyncio.TaskGroup`). Re-tested with
+  `gather: a = fetch_a(); b = fetch_b(a)` — emits sequential
+  `await`s as expected.
+- **#120** comptime container subscript — covered by the #88 fix
+  on `claude/review-findings-fixes-VRFJy`. `comptime let A: list[int]
+  = [1, 2, 3]; comptime let B: int = A[0]` now type-checks and
+  inlines correctly.
+- **#125** `let q: int` (no init) + tuple destructure — covered by
+  the #91 fix on `claude/review-findings-fixes-VRFJy`. The
+  uninitialised declaration is now rejected at the `let` site with
+  `tyc::missing_initialiser`, with help that suggests
+  `let q: int = <expr>`. Reassignment-via-destructure is not
+  separately accepted, but the diagnostic now clearly explains why.
+
+### Still open after this branch
+
+- **#107** `unsafe:` value leak detection — requires a real
+  `Unsafe[T]` marker type in `tyc-types` and a flow-sensitive
+  pass through the block boundary. Not in this branch's scope.
+- **#108** TypedDict dict-literal inference — requires the
+  type-checker to register TypedDict-derived class shapes and
+  match dict literals against the expected field set. Not in
+  this branch's scope.
+- **#111** sequence pattern `[a, b]` vs `(a, b)` round-trip —
+  PEP 634 makes these semantically identical and the runtime
+  behaviour is correct. Round-tripping the original bracket
+  choice requires source-range tracking on the pattern node and
+  is purely cosmetic.
+- **#112** Protocol structural conformance against built-ins —
+  requires the type-checker to know which built-in types
+  implement which dunder methods (`__len__`, `__iter__`, etc.).
+  Not in this branch's scope.
+- **#117 / #118 / #119** pipe corner cases (lambda RHS, impl
+  method self, parenthesised sub-expression) — pipe expansion is
+  a top-of-statement-line pre-pass; lifting it into general
+  expression position needs a lexer-aware rewrite.
+- **#122** `tyc fmt` is a no-op — Phase-5 deferral, unchanged
+  (same as the historical #18 / #65). The Typhon-aware printer
+  documented at `tyc-format/src/lib.rs:17` remains future work.
+

@@ -493,14 +493,9 @@ lazy let CONFIG: Config = load_config_from_disk()
 
 ```python
 # Emitted Python (sketch)
-from typhon_runtime import lazy_val
+from typhon_runtime.lazy import lazy_let as __typhon_lazy_let
 
-_CONFIG = lazy_val(lambda: load_config_from_disk())
-
-def __getattr__(name):
-    if name == "CONFIG":
-        return _CONFIG.value
-    raise AttributeError(name)
+CONFIG: Config = __typhon_lazy_let(lambda: load_config_from_disk())
 ```
 
 Inside a class body, `lazy let x: T = expr` lowers to `@cached_property`.

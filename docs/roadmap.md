@@ -76,7 +76,7 @@ Realistic milestones for one person plus AI assistance. The headline target is a
   proxy class generated inline by `expand_lazy_imports` (double-checked
   locking, no runtime helper dependency). `lazy from x import …` is rejected
   because it defeats deferral. Module-level `lazy let NAME: T = expr` lowers
-  to a sentinel-cached `lazy_val(lambda: expr)`; class-body `lazy let` lowers
+  to a sentinel-cached `lazy_let(lambda: expr)`; class-body `lazy let` lowers
   to `@cached_property`. Both round-trip through `tyc fmt`.
 - ✅ **Pipe operator** `a |> f |> g(arg)` lowered to `g(f(a), arg)` left-
   associatively. Guards in `match` cases pass through to Python directly.

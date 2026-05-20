@@ -737,9 +737,11 @@ fn expr_uses_asyncio_qualified(expr: &Expr) -> bool {
 // ── module-level desugaring ──────────────────────────────────────────────────
 
 fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule {
+    let multi_base_parents = collect_multi_base_parents(&m.body);
     let markers = ClassMarkers {
         raw_starts: &options.raw_class_line_starts,
         frozen_starts: &options.frozen_class_line_starts,
+        multi_base_parents: &multi_base_parents,
     };
     let (new_body, transformed_classes) = desugar_stmts(&m.body, markers);
 
@@ -971,6 +973,13 @@ fn import_insert_pos(body: &[Stmt]) -> usize {
 struct ClassMarkers<'a> {
     raw_starts: &'a [u32],
     frozen_starts: &'a [u32],
+    /// Names of classes that are referenced as a base in a multi-inheritance
+    /// (`class C(A, B):`) site somewhere in the same module. Adding
+    /// `slots=True` to either of A or B would later cause C's class
+    /// definition to raise `TypeError: multiple bases have instance
+    /// lay-out conflict`, so those classes are emitted without
+    /// `slots=True`. FINDINGS #102.
+    multi_base_parents: &'a std::collections::HashSet<String>,
 }
 
 impl ClassMarkers<'_> {
@@ -1042,13 +1051,24 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             // dataclass field collection).
             let is_protocol = class_inherits_protocol(c);
             let is_typed_dict = class_inherits_typed_dict(c);
+            let is_named_tuple = class_inherits_named_tuple(c);
+            // Multi-inheritance with concrete bases conflicts with
+            // `slots=True`; emit the decorator without `slots=True` in
+            // that case. FINDINGS #102. Also drop `slots=True` for any
+            // class that is itself a base of a multi-inheritance child
+            // class — both bases need to be unslotted for the child to
+            // load.
+            let has_multi_bases = class_has_multiple_concrete_bases(c)
+                || markers.multi_base_parents.contains(c.name.as_str());
             // Skip the dataclass decorator for Pydantic model classes,
-            // Protocol classes, TypedDict subclasses, and lazy proxies; they
-            // already carry the right shape or are incompatible with dataclass.
+            // Protocol classes, TypedDict subclasses, NamedTuple subclasses,
+            // and lazy proxies; they already carry the right shape or are
+            // incompatible with dataclass.
             let needs_decorator = !is_raw
                 && !is_pydantic
                 && !is_protocol
                 && !is_typed_dict
+                && !is_named_tuple
                 && !is_impl_stub
                 && !is_lazy_proxy
                 && !has_dataclass_decorator(&c.decorator_list);
@@ -1072,6 +1092,8 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             if needs_decorator {
                 let decorator = if is_frozen {
                     make_dataclasses_dot_dataclass_decorator_frozen()
+                } else if has_multi_bases {
+                    make_dataclasses_dot_dataclass_decorator_no_slots()
                 } else {
                     make_dataclasses_dot_dataclass_decorator()
                 };
@@ -1282,6 +1304,46 @@ fn make_dataclasses_field_default_factory(factory_name: &str) -> Expr {
     })
 }
 
+/// Build the decorator `@dataclasses.dataclass()` with no keyword
+/// arguments (no `slots=True`). Used when the class inherits from
+/// other classes whose layout would conflict with slots — Python
+/// raises `TypeError: multiple bases have instance lay-out conflict`
+/// when two slotted classes are combined. FINDINGS #102.
+fn make_dataclasses_dot_dataclass_decorator_no_slots() -> Decorator {
+    let dataclasses_name = Expr::Name(ExprName {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        id: Name::new("dataclasses"),
+        ctx: ExprContext::Load,
+    });
+
+    let dataclass_attr = Expr::Attribute(ExprAttribute {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        value: Box::new(dataclasses_name),
+        attr: make_identifier("dataclass"),
+        ctx: ExprContext::Load,
+    });
+
+    let call = Expr::Call(ExprCall {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        func: Box::new(dataclass_attr),
+        arguments: Arguments {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            args: Box::new([]),
+            keywords: Box::new([]),
+        },
+    });
+
+    Decorator {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        expression: call,
+    }
+}
+
 /// Build the decorator `@dataclasses.dataclass(slots=True)`.
 ///
 /// Using the qualified form avoids shadowing: even if the user has a local
@@ -1382,6 +1444,136 @@ fn class_inherits_protocol(c: &ruff_python_ast::StmtClassDef) -> bool {
     c.bases()
         .iter()
         .any(|base| matches!(base, Expr::Name(n) if n.id.as_str() == "Protocol"))
+}
+
+/// Pre-scan the module body and collect the names of every class that is
+/// referenced as a base in a multi-inheritance site (`class C(A, B):`).
+/// Those classes can't carry `slots=True` because two slotted bases
+/// trigger `TypeError: multiple bases have instance lay-out conflict`
+/// at class-definition time. FINDINGS #102.
+fn collect_multi_base_parents(body: &[Stmt]) -> std::collections::HashSet<String> {
+    let mut parents: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_multi_base_parents_into(body, &mut parents);
+    parents
+}
+
+fn collect_multi_base_parents_into(body: &[Stmt], parents: &mut std::collections::HashSet<String>) {
+    for stmt in body {
+        match stmt {
+            Stmt::ClassDef(c) => {
+                let concrete_bases: Vec<&Expr> = c
+                    .bases()
+                    .iter()
+                    .filter(|b| !is_layout_neutral_base(b))
+                    .collect();
+                if concrete_bases.len() > 1 {
+                    for b in &concrete_bases {
+                        if let Expr::Name(n) = b {
+                            parents.insert(n.id.as_str().to_owned());
+                        }
+                    }
+                }
+                collect_multi_base_parents_into(&c.body, parents);
+            }
+            Stmt::FunctionDef(f) => {
+                // Ruff folds `async def` into the same `FunctionDef`
+                // node (with `is_async = true`), so this arm covers
+                // both sync and async function bodies.
+                collect_multi_base_parents_into(&f.body, parents);
+            }
+            Stmt::If(i) => {
+                collect_multi_base_parents_into(&i.body, parents);
+                for clause in &i.elif_else_clauses {
+                    collect_multi_base_parents_into(&clause.body, parents);
+                }
+            }
+            Stmt::For(f) => {
+                // Ruff also folds `async for` into `For` (`is_async`).
+                collect_multi_base_parents_into(&f.body, parents);
+                collect_multi_base_parents_into(&f.orelse, parents);
+            }
+            Stmt::While(w) => {
+                collect_multi_base_parents_into(&w.body, parents);
+                collect_multi_base_parents_into(&w.orelse, parents);
+            }
+            Stmt::With(w) => {
+                // Ruff folds `async with` into `With` (`is_async`).
+                collect_multi_base_parents_into(&w.body, parents);
+            }
+            Stmt::Match(m) => {
+                for case in m.cases.iter() {
+                    collect_multi_base_parents_into(&case.body, parents);
+                }
+            }
+            Stmt::Try(t) => {
+                collect_multi_base_parents_into(&t.body, parents);
+                for handler in &t.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = handler;
+                    collect_multi_base_parents_into(&h.body, parents);
+                }
+                collect_multi_base_parents_into(&t.orelse, parents);
+                collect_multi_base_parents_into(&t.finalbody, parents);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Return `true` if `c` inherits directly from `NamedTuple`.
+///
+/// `NamedTuple` subclasses must not receive `@dataclasses.dataclass(slots=True)`
+/// — Python's `NamedTuple` metaclass already defines `__slots__` and adding
+/// the dataclass decorator triggers `TypeError: Point already specifies
+/// __slots__`. FINDINGS #101.
+///
+/// Handles bare-name (`NamedTuple`), `typing.NamedTuple`, and
+/// `typing_extensions.NamedTuple` forms.
+fn class_inherits_named_tuple(c: &ruff_python_ast::StmtClassDef) -> bool {
+    c.bases().iter().any(|base| match base {
+        Expr::Name(n) => n.id.as_str() == "NamedTuple",
+        Expr::Attribute(a) => {
+            a.attr.as_str() == "NamedTuple"
+                && matches!(
+                    &*a.value,
+                    Expr::Name(n)
+                    if n.id.as_str() == "typing" || n.id.as_str() == "typing_extensions"
+                )
+        }
+        _ => false,
+    })
+}
+
+/// Return `true` if `c` declares more than one concrete (non-`Protocol`,
+/// non-`Generic[T]`) base class. Adding `@dataclasses.dataclass(slots=True)`
+/// to a class with multiple slotted bases raises `TypeError: multiple
+/// bases have instance lay-out conflict` at class-definition time, so the
+/// decorator must be applied without `slots=True` in this case.
+/// FINDINGS #102.
+fn class_has_multiple_concrete_bases(c: &ruff_python_ast::StmtClassDef) -> bool {
+    let count = c
+        .bases()
+        .iter()
+        .filter(|base| !is_layout_neutral_base(base))
+        .count();
+    count > 1
+}
+
+/// `Protocol`, `Generic[T]`, and `object` don't carry an instance layout
+/// of their own, so they don't contribute to a multiple-base slot
+/// conflict. Everything else (user classes, `BaseException`, etc.) does.
+fn is_layout_neutral_base(base: &Expr) -> bool {
+    fn last_name(e: &Expr) -> Option<&str> {
+        match e {
+            Expr::Name(n) => Some(n.id.as_str()),
+            Expr::Attribute(a) => Some(a.attr.as_str()),
+            Expr::Subscript(s) => last_name(&s.value),
+            _ => None,
+        }
+    }
+    matches!(
+        last_name(base),
+        Some("Protocol") | Some("Generic") | Some("object")
+    )
 }
 
 /// Return `true` if `c` inherits directly from `TypedDict`.

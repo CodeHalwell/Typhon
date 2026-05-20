@@ -233,6 +233,7 @@ fn rewrite_line(
     let mut body = trimmed.to_owned();
 
     body = rewrite_optional(&body);
+    body = rewrite_typing_aliases(&body);
 
     // Rule 6: `class Name(...):` with a hand-rolled `__init__` and no
     // `@dataclass` decorator becomes `class! Name(...):` so the Typhon
@@ -298,15 +299,30 @@ fn rewrite_line(
     format!("{indent}{body}")
 }
 
-/// Rewrite `from typing import …, Optional, …` by dropping the `Optional`
-/// name (now unused after Rule 1). Returns `Some(rewritten)` when the
-/// line matched; `Some("")` signals the caller should drop the line
-/// entirely (the import would otherwise be empty). Returns `None` when
-/// the line wasn't a `from typing import …` form, so the caller can
-/// continue with other rewrites.
+/// Names imported from `typing` that the migrator rewrites away — either
+/// because they're replaced by Typhon-native sugar (`Optional` → `T?`),
+/// or because they're deprecated capital-case aliases for built-ins
+/// (`List` → `list`, `Dict` → `dict`, etc.). Removing them from the
+/// `from typing import …` line drops the now-dead names.
+const TYPING_NAMES_TO_REWRITE: &[&str] = &[
+    "Optional",
+    "List",
+    "Dict",
+    "Tuple",
+    "Set",
+    "FrozenSet",
+    "Type",
+];
+
+/// Rewrite `from typing import …, Optional, …` by dropping any name in
+/// [`TYPING_NAMES_TO_REWRITE`] (now unused after the matching rule
+/// in this migrator). Returns `Some(rewritten)` when the line matched;
+/// `Some("")` signals the caller should drop the line entirely. Returns
+/// `None` when the line wasn't a `from typing import …` form.
 ///
 /// Conservatively skips wildcard (`*`) and `as`-aliased imports so we
-/// never silently drop a renamed `Optional` the user may use elsewhere.
+/// never silently drop a renamed name the user may use elsewhere.
+/// FINDINGS #115.
 fn strip_optional_from_typing_import(trimmed_line: &str) -> Option<String> {
     let rest = trimmed_line.strip_prefix("from typing import")?;
     let rest = rest.trim();
@@ -323,10 +339,15 @@ fn strip_optional_from_typing_import(trimmed_line: &str) -> Option<String> {
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
-    if !names.contains(&"Optional") {
+    let has_rewritten = names.iter().any(|n| TYPING_NAMES_TO_REWRITE.contains(n));
+    if !has_rewritten {
         return None;
     }
-    let kept: Vec<&str> = names.iter().copied().filter(|n| *n != "Optional").collect();
+    let kept: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|n| !TYPING_NAMES_TO_REWRITE.contains(n))
+        .collect();
     if kept.is_empty() {
         return Some(String::new());
     }
@@ -471,6 +492,48 @@ fn rewrite_optional(line: &str) -> String {
     // boolean expressions that happen to mention `None`.
     s = rewrite_pipe_none(&s);
 
+    s
+}
+
+/// Rewrite deprecated capital-case `typing` aliases to their lowercase
+/// built-in equivalents: `List[T]` → `list[T]`, `Dict[K, V]` → `dict[K, V]`,
+/// `Tuple[...]` → `tuple[...]`, `Set[T]` → `set[T]`, `FrozenSet[T]` →
+/// `frozenset[T]`, `Type[T]` → `type[T]`. Also rewrites the
+/// `typing.<Name>[...]` qualified form. FINDINGS #115.
+fn rewrite_typing_aliases(line: &str) -> String {
+    const PAIRS: &[(&str, &str)] = &[
+        ("List", "list"),
+        ("Dict", "dict"),
+        ("Tuple", "tuple"),
+        ("Set", "set"),
+        ("FrozenSet", "frozenset"),
+        ("Type", "type"),
+    ];
+
+    let mut s = line.to_owned();
+    for (from, to) in PAIRS {
+        let qualified = format!("typing.{from}[");
+        let bare = format!("{from}[");
+        for needle in &[qualified.as_str(), bare.as_str()] {
+            let replacement = format!("{to}[");
+            let mut search_from = 0usize;
+            while let Some(pos) = s[search_from..].find(needle) {
+                let start = search_from + pos;
+                // Reject matches preceded by an identifier character —
+                // `MyList[int]` is not `List[int]`.
+                let prev = start
+                    .checked_sub(1)
+                    .and_then(|i| s.as_bytes().get(i).copied())
+                    .unwrap_or(b' ');
+                if prev.is_ascii_alphanumeric() || prev == b'_' || prev == b'.' {
+                    search_from = start + needle.len();
+                    continue;
+                }
+                s.replace_range(start..start + needle.len(), &replacement);
+                search_from = start + replacement.len();
+            }
+        }
+    }
     s
 }
 

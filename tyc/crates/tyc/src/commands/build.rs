@@ -110,14 +110,6 @@ pub fn run(args: BuildArgs) -> Result<()> {
         ));
     }
 
-    // Bootstrap the Python environment before codegen: merge our owned
-    // keys into pyproject.toml (preserving user-managed tables) and run
-    // `uv sync` so `.venv` is ready when the user runs the emitted
-    // `.py`. Failure of `uv sync` is downgraded to a warning — the
-    // codegen output is useful regardless of whether the install
-    // step resolved.
-    crate::commands::deps::bootstrap_python_env(&config_dir, &config)?;
-
     let ty_files = collect_ty_files(&src_dir)?;
 
     if ty_files.is_empty() {
@@ -134,6 +126,26 @@ pub fn run(args: BuildArgs) -> Result<()> {
             Ok((path, text))
         })
         .collect::<Result<_>>()?;
+
+    // Auto-add `pydantic` to [dependencies] when any source uses `model X:`
+    // declarations, since the emitter generates `from pydantic import …`
+    // imports for those. Without this the build artefact crashes at import
+    // time with ModuleNotFoundError when the user hasn't declared pydantic
+    // explicitly.
+    let mut config = config;
+    if sources_use_model_keyword(&sources) && !config.dependencies.contains_key("pydantic") {
+        config
+            .dependencies
+            .insert("pydantic".to_string(), "*".to_string());
+    }
+
+    // Bootstrap the Python environment before codegen: merge our owned
+    // keys into pyproject.toml (preserving user-managed tables) and run
+    // `uv sync` so `.venv` is ready when the user runs the emitted
+    // `.py`. Failure of `uv sync` is downgraded to a warning — the
+    // codegen output is useful regardless of whether the install
+    // step resolved.
+    crate::commands::deps::bootstrap_python_env(&config_dir, &config)?;
 
     // Phase 1: type-check all files first and fail fast on errors.
     let mut db = TycDatabase::new();
@@ -511,6 +523,96 @@ fn python_module_name_from_path(path: &std::path::Path, src_dir: &std::path::Pat
     parts.join(".")
 }
 
+/// Return `true` if any source file declares a `model X:` class. Used to
+/// auto-inject `pydantic` into `[dependencies]` before the pyproject.toml
+/// merge, since the emitter will produce `from pydantic import …`
+/// statements for those classes.
+fn sources_use_model_keyword(sources: &[(PathBuf, String)]) -> bool {
+    sources.iter().any(|(_, text)| source_uses_model(text))
+}
+
+fn source_uses_model(text: &str) -> bool {
+    // Track triple-quoted string state so a docstring or SQL string
+    // containing a line starting with `model ` doesn't falsely flag
+    // the source as needing pydantic.
+    let mut in_triple: Option<&'static str> = None;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+
+        // Update triple-quote tracking before deciding whether this line
+        // is code: a `"""…"""` opener that doesn't close on the same line
+        // puts us into multi-line-string mode for subsequent lines.
+        let (next_state, line_starts_in_string) = update_triple_quote_state(line, in_triple);
+        let was_in_string = in_triple.is_some();
+        in_triple = next_state;
+        if was_in_string || line_starts_in_string {
+            continue;
+        }
+
+        if !trimmed.starts_with("model ") {
+            continue;
+        }
+        // A line starting with `model ` only signals a model class when
+        // the next non-space char is an identifier character (so we
+        // reject `model "X":` and similar). Comments are already
+        // filtered out because `trim_start` leaves `#` in place.
+        let after = &trimmed["model ".len()..];
+        let first = after.chars().next();
+        if matches!(first, Some(c) if c.is_ascii_alphabetic() || c == '_') {
+            return true;
+        }
+    }
+    false
+}
+
+/// Walk `line` and update the triple-quoted-string state. Returns the
+/// state at the end of the line plus a flag indicating whether the
+/// line *started* inside a string (in which case the caller treats it
+/// as pure string content). Handles both `"""` and `'''` delimiters
+/// and counts opener/closer pairs per line so a single-line
+/// `"""...""".format(...)` doesn't leave the scanner stuck.
+fn update_triple_quote_state(
+    line: &str,
+    mut state: Option<&'static str>,
+) -> (Option<&'static str>, bool) {
+    let started_in_string = state.is_some();
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    while i + 2 < bytes.len() + 1 {
+        let three = bytes.get(i..i + 3);
+        match (state, three) {
+            (None, Some(b"\"\"\"")) => {
+                state = Some("\"\"\"");
+                i += 3;
+                continue;
+            }
+            (None, Some(b"'''")) => {
+                state = Some("'''");
+                i += 3;
+                continue;
+            }
+            (Some("\"\"\""), Some(b"\"\"\"")) => {
+                state = None;
+                i += 3;
+                continue;
+            }
+            (Some("'''"), Some(b"'''")) => {
+                state = None;
+                i += 3;
+                continue;
+            }
+            _ => {}
+        }
+        // When outside a string, stop scanning at a `#` comment start so
+        // a `# """foo"""` comment doesn't toggle state.
+        if state.is_none() && bytes[i] == b'#' {
+            break;
+        }
+        i += 1;
+    }
+    (state, started_in_string)
+}
+
 /// Parse a `[python] target = "3.X"` string into its minor version.
 /// Returns `0` for unparseable / unrecognised values (telling the
 /// emitter to skip PEP 695 lowering and keep the previous behaviour).
@@ -791,6 +893,24 @@ class _LazyValue:
         if value is _UNSET:
             return \"<lazy: unmaterialised>\"
         return repr(value)
+
+    def __str__(self) -> str:
+        # Materialise on `str(...)` / `print(...)` so the value is
+        # readable instead of the proxy's `<lazy: unmaterialised>`
+        # debug repr. FINDINGS #105.
+        return str(self._materialise())
+
+    def __bool__(self) -> bool:
+        return bool(self._materialise())
+
+    def __eq__(self, other: object) -> bool:
+        return self._materialise() == other
+
+    def __hash__(self) -> int:
+        return hash(self._materialise())
+
+    def __len__(self) -> int:
+        return len(self._materialise())
 
 
 _UNSET = object()
