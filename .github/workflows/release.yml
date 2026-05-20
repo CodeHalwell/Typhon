@@ -40,12 +40,14 @@ jobs:
 
     steps:
       # On a tag push, build the tag itself. On workflow_dispatch, build
-      # the user-provided `ref` if any — otherwise fall back to the
-      # default branch. Releasing an as-yet-uncreated tag is supported:
-      # softprops/action-gh-release creates `tag_name` at the build SHA.
+      # the user-provided `ref` if any — otherwise fall back to `inputs.tag`
+      # so that re-releasing an existing tag still builds from the tag's
+      # commit (not the workflow branch HEAD). Releasing an as-yet-uncreated
+      # tag is supported by passing `ref` explicitly; action-gh-release then
+      # creates `tag_name` at the build SHA.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.ref != '' && inputs.ref || inputs.tag) || github.ref }}
 
       - name: Resolve release tag
         id: tag
@@ -135,7 +137,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && (inputs.ref != '' && inputs.ref || inputs.tag) || github.ref }}
 
       - name: Resolve release tag
         id: tag
