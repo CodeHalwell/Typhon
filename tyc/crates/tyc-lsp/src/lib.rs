@@ -1234,10 +1234,21 @@ pub fn extract_from_import_module(text: &str, offset: usize) -> Option<String> {
     // "import|" (empty `rest`) so completion fires as soon as the
     // user finishes typing the keyword.
     match rest.chars().next() {
-        None => Some(module.to_owned()),
-        Some(c) if c.is_whitespace() || c == '(' => Some(module.to_owned()),
-        _ => None,
+        None => {}
+        Some(c) if c.is_whitespace() || c == '(' => {}
+        _ => return None,
     }
+    // Guard against the cursor having walked off the end of the
+    // import statement on the same line. `from os import path; x = `
+    // or `from os import path  # comment ` both literally start with
+    // `from … import …` but the cursor is no longer in the import
+    // list — `;` ends the statement, `#` starts a comment.  Either
+    // means open-code (or comment) completion is the right answer,
+    // not module members.
+    if rest.contains(';') || rest.contains('#') {
+        return None;
+    }
+    Some(module.to_owned())
 }
 
 /// Signature for the per-completion-request introspection callback.
@@ -2171,6 +2182,25 @@ def greet():
     fn extract_from_import_module_returns_none_for_relative_import() {
         // `from .foo import …` is a relative import; we can't introspect it.
         let text = "from .foo import ";
+        let r = extract_from_import_module(text, text.len());
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn extract_from_import_module_returns_none_after_semicolon() {
+        // `from os import path; x = <cursor>` — cursor walked past the
+        // statement terminator. Open-code completion (not from-import)
+        // is the right answer here.
+        let text = "from os import path; x = ";
+        let r = extract_from_import_module(text, text.len());
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn extract_from_import_module_returns_none_inside_comment() {
+        // `from os import path  # <cursor>` — cursor inside the
+        // trailing comment, not the import list.
+        let text = "from os import path  # ";
         let r = extract_from_import_module(text, text.len());
         assert_eq!(r, None);
     }
