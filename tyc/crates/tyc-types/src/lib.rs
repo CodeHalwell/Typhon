@@ -2765,10 +2765,14 @@ fn check_arity_with_info(
         .filter_map(|k| k.arg.as_ref().map(|i| i.as_str()))
         .collect();
     let has_double_star = kw_args.iter().any(|k| k.arg.is_none());
+    // A `*iter` positional unpack expands to an unknown number of
+    // positionals; we can't reason about specific positional slots so
+    // the arity check degrades to "trust the user". FINDINGS #109.
+    let has_starred_positional = pos_args.iter().any(|e| matches!(e, Expr::Starred(_)));
 
     // Rule 4: positional count must fit max_positional (None → unbounded).
     if let Some(max) = info.max_positional {
-        if pos_args.len() > max {
+        if !has_starred_positional && pos_args.len() > max {
             return ArityCheck::Other;
         }
     }
@@ -2812,8 +2816,10 @@ fn check_arity_with_info(
 
     // Rule 3a: every required positional must be filled by a pos arg or
     // matching kw arg. Stops being checkable when `**kwargs` unpacking is
-    // present — in that case we trust the user.
-    if !has_double_star {
+    // present — in that case we trust the user. A `*positional` unpack
+    // also expands to an unknown number of args, so skip the count
+    // check there too (FINDINGS #109).
+    if !has_double_star && !has_starred_positional {
         for (i, p) in info
             .param_names
             .iter()

@@ -4556,3 +4556,19 @@ fix lands as its own commit.
   `main()` call. Scripts run identically; importing the module
   no longer triggers `main()` as a side effect.
 
+- **#109** `*positional` unpack at call sites is no longer rejected
+  by the strict arg-count check — `check_arity_with_info` now
+  detects an `Expr::Starred` positional argument and degrades to
+  "trust the user" for the count rule (matching the existing
+  `**kwargs` carve-out). `add(*xs)` now type-checks; type-mismatch
+  on individual args still fires when the receiver type is known.
+
+- **#115** `tyc migrate` now rewrites `typing.List` / `Dict` /
+  `Tuple` / `Set` / `FrozenSet` / `Type` to their lowercase
+  built-ins in addition to the existing `Optional` → `T?`
+  rewrite, and the typing-import stripper drops every removed
+  name from the `from typing import …` line (dropping the line
+  entirely when nothing else remains). New `rewrite_typing_aliases`
+  helper handles both bare and `typing.<Name>[…]` forms; the
+  `TYPING_NAMES_TO_REWRITE` list keys the import-strip pass.
+
