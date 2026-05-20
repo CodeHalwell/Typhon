@@ -75,6 +75,11 @@ pub struct EmitConfig {
     pub class_default: String,
     /// Post-process emitted Python through ruff format.
     pub format: bool,
+    /// List of additional base-class names that, when used as a base class,
+    /// suppress the automatic `@dataclasses.dataclass(slots=True)` decorator.
+    /// Matched by last segment.
+    #[serde(default, rename = "skip-decoration-bases")]
+    pub skip_decoration_bases: Vec<String>,
 }
 
 impl Default for EmitConfig {
@@ -82,9 +87,16 @@ impl Default for EmitConfig {
         Self {
             class_default: "dataclass".into(),
             format: true,
+            skip_decoration_bases: Vec::new(),
         }
     }
 }
+
+/// Accepted values for `[emit] class-default`. Anything else is rejected by
+/// [`TyphonConfig::validate`] — including the empty string and historical
+/// aliases like `"struct"` / `"regular"` / `"none"` which were never wired
+/// through the emitter.
+pub const ALLOWED_CLASS_DEFAULTS: &[&str] = &["dataclass", "pydantic"];
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
@@ -235,6 +247,18 @@ impl TyphonConfig {
                 ),
             });
         }
+        // Reject `[emit] class-default = "..."` outside the allow-list.
+        // Empty strings, typos, and removed-aliases (`"struct"`,
+        // `"regular"`, `"none"`) all surface here rather than silently
+        // falling back to dataclass at emit time.
+        let cd = self.emit.class_default.trim();
+        if !ALLOWED_CLASS_DEFAULTS.contains(&cd) {
+            return Err(ConfigError::InvalidClassDefault {
+                path: source_path.display().to_string(),
+                value: self.emit.class_default.clone(),
+                allowed: ALLOWED_CLASS_DEFAULTS.join(", "),
+            });
+        }
         Ok(())
     }
 }
@@ -278,6 +302,13 @@ pub enum ConfigError {
         target: String,
         reason: String,
     },
+    /// `[emit] class-default` is set to a value outside
+    /// [`ALLOWED_CLASS_DEFAULTS`]. Emitted by [`TyphonConfig::validate`].
+    InvalidClassDefault {
+        path: String,
+        value: String,
+        allowed: String,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -297,6 +328,16 @@ impl std::fmt::Display for ConfigError {
                 write!(
                     f,
                     "unsupported `[python] target = \"{target}\"` in '{path}': {reason}",
+                )
+            }
+            ConfigError::InvalidClassDefault {
+                path,
+                value,
+                allowed,
+            } => {
+                write!(
+                    f,
+                    "invalid `[emit] class-default = \"{value}\"` in '{path}': allowed values are {allowed}",
                 )
             }
         }
@@ -357,6 +398,90 @@ mod tests {
                 .expect_err(&format!("target {t:?} should be rejected"));
             assert!(matches!(err, ConfigError::UnsupportedPythonTarget { .. }));
         }
+    }
+
+    #[test]
+    fn validate_accepts_dataclass_and_pydantic() {
+        let path = Path::new("typhon.toml");
+        for v in &["dataclass", "pydantic"] {
+            let mut cfg = cfg_with_target("3.13");
+            cfg.emit.class_default = (*v).into();
+            cfg.validate(path)
+                .unwrap_or_else(|e| panic!("class-default {v} should be accepted, got {e}"));
+        }
+    }
+
+    #[test]
+    fn validate_rejects_plain_regular_struct_none() {
+        let path = Path::new("typhon.toml");
+        for v in &["", "regular", "struct", "none", "plain"] {
+            let mut cfg = cfg_with_target("3.13");
+            cfg.emit.class_default = (*v).into();
+            let err = cfg
+                .validate(path)
+                .expect_err(&format!("class-default {v:?} should be rejected"));
+            match err {
+                ConfigError::InvalidClassDefault { value, allowed, .. } => {
+                    assert_eq!(value, *v);
+                    assert!(
+                        allowed.contains("dataclass") && allowed.contains("pydantic"),
+                        "expected allowed list to mention dataclass+pydantic, got {allowed}"
+                    );
+                }
+                other => panic!("expected InvalidClassDefault for {v:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unknown_class_default() {
+        let path = Path::new("typhon.toml");
+        let mut cfg = cfg_with_target("3.13");
+        cfg.emit.class_default = "msgspec".into();
+        let err = cfg
+            .validate(path)
+            .expect_err("msgspec should not be an accepted class-default");
+        let msg = format!("{err}");
+        assert!(msg.contains("msgspec"), "got {msg}");
+        assert!(msg.contains("dataclass"), "got {msg}");
+        assert!(msg.contains("pydantic"), "got {msg}");
+    }
+
+    #[test]
+    fn skip_decoration_bases_defaults_empty() {
+        let cfg = TyphonConfig::default();
+        assert!(
+            cfg.emit.skip_decoration_bases.is_empty(),
+            "expected default skip-decoration-bases to be empty, got {:?}",
+            cfg.emit.skip_decoration_bases
+        );
+    }
+
+    #[test]
+    fn skip_decoration_bases_round_trips_through_toml() {
+        let toml_src = "\
+[project]
+name = \"demo\"
+
+[emit]
+skip-decoration-bases = [\"BaseModel\", \"Enum\"]
+";
+        let parsed: TyphonConfig = toml::from_str(toml_src).expect("parse");
+        assert_eq!(
+            parsed.emit.skip_decoration_bases,
+            vec!["BaseModel".to_string(), "Enum".to_string()]
+        );
+        let reserialized = parsed
+            .to_toml_string()
+            .expect("serialize TyphonConfig back to toml");
+        assert!(
+            reserialized.contains("skip-decoration-bases"),
+            "expected kebab-cased field in output, got:\n{reserialized}"
+        );
+        assert!(
+            reserialized.contains("BaseModel") && reserialized.contains("Enum"),
+            "expected both base-class names in output, got:\n{reserialized}"
+        );
     }
 
     #[test]

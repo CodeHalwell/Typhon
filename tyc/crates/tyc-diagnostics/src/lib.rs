@@ -12,12 +12,16 @@ use thiserror::Error;
 pub enum TycError {
     /// The source file could not be read.
     #[error("could not read file '{path}': {cause}")]
-    #[diagnostic(code(tyc::io), help("check that the file exists and is readable"))]
+    #[diagnostic(
+        code(tyc::io),
+        url("https://typhon.dev/lang/diagnostics/io"),
+        help("check that the file exists and is readable")
+    )]
     Io { path: String, cause: String },
 
     /// The source file could not be parsed as a valid Typhon/Python program.
     #[error("parse error in '{path}'")]
-    #[diagnostic(code(tyc::parse))]
+    #[diagnostic(code(tyc::parse), url("https://typhon.dev/lang/diagnostics/parse"))]
     Parse {
         path: String,
         message: String,
@@ -31,6 +35,7 @@ pub enum TycError {
     #[error("cannot assign to immutable binding '{name}'")]
     #[diagnostic(
         code(tyc::immutable_assign),
+        url("https://typhon.dev/lang/diagnostics/immutable_assign"),
         help("change `let` to `mut` if you need a mutable binding")
     )]
     ImmutableAssign {
@@ -47,6 +52,7 @@ pub enum TycError {
     #[error("cannot assign to field '{field}' on frozen class `{class}`")]
     #[diagnostic(
         code(tyc::frozen_assign),
+        url("https://typhon.dev/lang/diagnostics/frozen_assign"),
         help("`frozen` classes are immutable. Construct a new `{class}` with the desired values instead of mutating in place.")
     )]
     FrozenAssign {
@@ -62,6 +68,7 @@ pub enum TycError {
     #[error("cannot find '{name}' in scope")]
     #[diagnostic(
         code(tyc::unknown_name),
+        url("https://typhon.dev/lang/diagnostics/unknown_name"),
         help("declare '{name}' with `let` or `mut`, or import it from a module")
     )]
     UnknownName {
@@ -79,6 +86,7 @@ pub enum TycError {
     #[error("cannot find 'self' in scope")]
     #[diagnostic(
         code(tyc::self_outside_impl),
+        url("https://typhon.dev/lang/diagnostics/self_outside_impl"),
         help("`self` is only available inside `impl ClassName:` method bodies. Move this function under an `impl` block, or replace `self` with an explicit parameter.")
     )]
     SelfOutsideImpl {
@@ -94,6 +102,7 @@ pub enum TycError {
     #[error("`from typing import TypeVar` is not supported in Typhon")]
     #[diagnostic(
         code(tyc::typevar_import_rejected),
+        url("https://typhon.dev/lang/diagnostics/typevar_import_rejected"),
         help("Use PEP 695 syntax instead: `def f[T](x: T) -> T:` and `class Box[T]:` declare type parameters directly, no `TypeVar(...)` call needed.")
     )]
     TypeVarImportRejected {
@@ -110,6 +119,7 @@ pub enum TycError {
     #[error("`from typing import {name}` is deprecated in Typhon")]
     #[diagnostic(
         code(tyc::typing_alias_deprecated),
+        url("https://typhon.dev/lang/diagnostics/typing_alias_deprecated"),
         help("Use the built-in lowercase `{lower}` instead — `{lower}[T]` works directly without importing anything.")
     )]
     TypingAliasDeprecated {
@@ -126,7 +136,10 @@ pub enum TycError {
     /// the callee has no `**kwargs`. Distinct from `tyc::arg_count`
     /// because the user's mistake is a typo, not a count error.
     #[error("unknown keyword argument '{kwarg}' to `{fn_name}`")]
-    #[diagnostic(code(tyc::unknown_kwarg))]
+    #[diagnostic(
+        code(tyc::unknown_kwarg),
+        url("https://typhon.dev/lang/diagnostics/unknown_kwarg")
+    )]
     UnknownKwarg {
         fn_name: String,
         kwarg: String,
@@ -147,6 +160,7 @@ pub enum TycError {
     #[error("function `{fn_name}` is missing a return on some paths (declared `-> {ret_type}`)")]
     #[diagnostic(
         code(tyc::missing_return),
+        url("https://typhon.dev/lang/diagnostics/missing_return"),
         help("Add an explicit `return <{ret_type}>` (or `raise`) on every path, or widen the return type to `{ret_type} | None` / `None` if the function intentionally returns nothing.")
     )]
     MissingReturn {
@@ -166,6 +180,7 @@ pub enum TycError {
     #[error("`{keyword} {name}: {annotation}` is missing an initialiser")]
     #[diagnostic(
         code(tyc::missing_initialiser),
+        url("https://typhon.dev/lang/diagnostics/missing_initialiser"),
         help("Typhon bindings must be initialised at the point of declaration. Write `{keyword} {name}: {annotation} = <expr>` instead.")
     )]
     MissingInitialiser {
@@ -186,6 +201,7 @@ pub enum TycError {
     #[error("bare `{kind}` annotation has implicit `Any` element type")]
     #[diagnostic(
         code(tyc::implicit_any),
+        url("https://typhon.dev/lang/diagnostics/implicit_any"),
         help("Spell out the element type so readers can see what the collection holds: `{kind}[<element-type>]`. For dicts use `dict[K, V]`; for tuples use `tuple[A, B, ...]` or `tuple[T, ...]` for a homogeneous tuple.")
     )]
     ImplicitAny {
@@ -204,6 +220,7 @@ pub enum TycError {
     #[error("cannot shadow `{name}` — Typhon names are function-scoped")]
     #[diagnostic(
         code(tyc::no_block_shadow),
+        url("https://typhon.dev/lang/diagnostics/no_block_shadow"),
         help("Python doesn't have block scope, so a `let {name}: ...` inside a nested block would still rebind the outer `{name}`. Pick a different name, or remove the keyword to reuse the outer binding (if it's `mut`).")
     )]
     NoBlockShadow {
@@ -220,6 +237,7 @@ pub enum TycError {
     #[error("type mismatch: expected `{expected}`, found `{actual}`")]
     #[diagnostic(
         code(tyc::type_mismatch),
+        url("https://typhon.dev/lang/diagnostics/type_mismatch"),
         help("change the value, or update the annotation to `{actual}`")
     )]
     TypeMismatch {
@@ -249,6 +267,7 @@ pub enum TycError {
     #[error("cannot assign `{actual}` to `{name}: {expected}`")]
     #[diagnostic(
         code(tyc::type_mismatch),
+        url("https://typhon.dev/lang/diagnostics/type_mismatch"),
         help("`mut` only permits new values of the declared type. Use a different name to bind type `{actual}`.")
     )]
     TypeReassignMismatch {
@@ -272,6 +291,7 @@ pub enum TycError {
     #[error("unsupported operand types for `{op}`: `{lhs}` and `{rhs}`")]
     #[diagnostic(
         code(tyc::operator_type_mismatch),
+        url("https://typhon.dev/lang/diagnostics/operator_type_mismatch"),
         help("convert one operand so the types match (e.g. `str(n)` / `int(s)`)")
     )]
     OperatorTypeMismatch {
@@ -290,6 +310,7 @@ pub enum TycError {
     #[error("tuple has {arity} element(s); index {index} is out of range")]
     #[diagnostic(
         code(tyc::tuple_index_out_of_range),
+        url("https://typhon.dev/lang/diagnostics/tuple_index_out_of_range"),
         help("use an index in `0..{arity}` (or `-{arity}..0` for negative indexing)")
     )]
     TupleIndexOutOfRange {
@@ -305,6 +326,7 @@ pub enum TycError {
     #[error("possibly-None value used where `{expected}` is required")]
     #[diagnostic(
         code(tyc::nullable_use),
+        url("https://typhon.dev/lang/diagnostics/nullable_use"),
         help("guard the value with `if {name} is not None:` to narrow it to `{expected}`")
     )]
     NullableUse {
@@ -324,6 +346,7 @@ pub enum TycError {
     #[error("`?` propagates `Err[{actual_err}]` into `Result[_, {expected_err}]`")]
     #[diagnostic(
         code(tyc::result_error_mismatch),
+        url("https://typhon.dev/lang/diagnostics/result_error_mismatch"),
         help("the `?` operator forwards the callee's `Err` value as-is; convert it with a `match` or change one signature so the error types match")
     )]
     ResultErrorMismatch {
@@ -337,7 +360,10 @@ pub enum TycError {
 
     /// A function was called with the wrong number of positional arguments.
     #[error("wrong number of arguments to `{name}`: expected {expected}, got {actual}")]
-    #[diagnostic(code(tyc::arg_count))]
+    #[diagnostic(
+        code(tyc::arg_count),
+        url("https://typhon.dev/lang/diagnostics/arg_count")
+    )]
     WrongArgCount {
         name: String,
         expected: usize,
@@ -350,7 +376,10 @@ pub enum TycError {
 
     /// Something that is not callable was called.
     #[error("`{typ}` is not callable")]
-    #[diagnostic(code(tyc::not_callable))]
+    #[diagnostic(
+        code(tyc::not_callable),
+        url("https://typhon.dev/lang/diagnostics/not_callable")
+    )]
     NotCallable {
         typ: String,
         #[source_code]
@@ -365,6 +394,7 @@ pub enum TycError {
     #[error("`{fn_name}` contains `yield` so it returns a generator, not `{returned}`")]
     #[diagnostic(
         code(tyc::generator_return_type),
+        url("https://typhon.dev/lang/diagnostics/generator_return_type"),
         help(
             "annotate the return type as `Iterator[T]` / `Generator[T, S, R]` (or `AsyncIterator[T]` / `AsyncGenerator[T, S]` for `async def`)"
         )
@@ -385,6 +415,7 @@ pub enum TycError {
     #[error("`{class_name}.__init__` cannot be defined — the constructor is generated from the class fields")]
     #[diagnostic(
         code(tyc::manual_init),
+        url("https://typhon.dev/lang/diagnostics/manual_init"),
         help(
             "remove `__init__`; set per-field defaults on the class or write a free factory function"
         )
@@ -404,6 +435,7 @@ pub enum TycError {
     #[error("missing `await` on async call to `{callee}`")]
     #[diagnostic(
         code(tyc::missing_await),
+        url("https://typhon.dev/lang/diagnostics/missing_await"),
         help(
             "wrap the call in `await` (and make the caller `async`), or call `asyncio.run(...)` if you are at the top level"
         )
@@ -420,6 +452,7 @@ pub enum TycError {
     #[error("non-exhaustive `match` on sealed union `{union_name}`: missing variant(s) {missing}")]
     #[diagnostic(
         code(tyc::non_exhaustive_match),
+        url("https://typhon.dev/lang/diagnostics/non_exhaustive_match"),
         help("add a `case <Variant>():` arm for each missing variant, or add a `case _:` wildcard arm")
     )]
     NonExhaustiveMatch {
@@ -435,19 +468,21 @@ pub enum TycError {
     #[error("comptime evaluation failed for '{name}': {message}")]
     #[diagnostic(
         code(tyc::comptime),
+        url("https://typhon.dev/lang/diagnostics/comptime"),
         help("comptime expressions support: int/float/str/bool literals, list/tuple/dict literals, arithmetic, comparisons, boolean ops (and/or/not), ternaries (`x if c else y`), env(\"NAME\"[, \"default\"]), int()/str()/float()/len(), pure str methods (upper, lower, strip, lstrip, rstrip, replace, startswith, endswith, split), and calls to user-defined `comptime def` functions")
     )]
     Comptime { name: String, message: String },
 
     /// Generic error with a human-readable message (used during early phases).
     #[error("{message}")]
-    #[diagnostic(code(tyc::generic))]
+    #[diagnostic(code(tyc::generic), url("https://typhon.dev/lang/diagnostics/generic"))]
     Generic { message: String },
 
     /// The `?` error-propagation operator was used outside a `Result`-returning function.
     #[error("{message}")]
     #[diagnostic(
         code(tyc::invalid_question_op),
+        url("https://typhon.dev/lang/diagnostics/invalid_question_op"),
         help("the `?` operator is only valid inside a function returning `Result[T, E]`")
     )]
     InvalidQuestionOp {
@@ -462,6 +497,7 @@ pub enum TycError {
     #[error("imported name '{name}' is never used")]
     #[diagnostic(
         code(tyc::unused_import),
+        url("https://typhon.dev/lang/diagnostics/unused_import"),
         help("remove the import, or prefix it with `_` if it is intentionally unused")
     )]
     UnusedImport {
@@ -476,6 +512,7 @@ pub enum TycError {
     #[error("{message}")]
     #[diagnostic(
         code(tyc::lazy_usage),
+        url("https://typhon.dev/lang/diagnostics/lazy_usage"),
         help("`lazy` supports `lazy import name = module` and `lazy val NAME: T = expr` only")
     )]
     LazyUsage {
@@ -490,6 +527,7 @@ pub enum TycError {
     #[error("{message}")]
     #[diagnostic(
         code(tyc::extend_builtin),
+        url("https://typhon.dev/lang/diagnostics/extend_builtin"),
         help("Python's built-in types cannot be modified at runtime; wrap the value in a user-defined class or expose a free function")
     )]
     ExtendBuiltin {
@@ -505,6 +543,7 @@ pub enum TycError {
     #[error("{message}")]
     #[diagnostic(
         code(tyc::stub_mismatch),
+        url("https://typhon.dev/lang/diagnostics/stub_mismatch"),
         help("synchronise the stub with the implementation, or hide private names with a leading underscore")
     )]
     StubMismatch {
@@ -519,6 +558,7 @@ pub enum TycError {
     #[error("`@pure` function '{name}' is not pure: {reason}")]
     #[diagnostic(
         code(tyc::impure_pure_fn),
+        url("https://typhon.dev/lang/diagnostics/impure_pure_fn"),
         help("pure functions must be sync, take hashable args, perform no I/O, no entropy/clocks, no mutable module state, and not raise — return Result[T, E] for failure")
     )]
     ImpurePureFn {
@@ -534,6 +574,7 @@ pub enum TycError {
     #[error("`isinstance(x, {interface})` is rejected: structural interfaces only validate attribute presence at runtime")]
     #[diagnostic(
         code(tyc::interface_isinstance),
+        url("https://typhon.dev/lang/diagnostics/interface_isinstance"),
         help("opt in by decorating the interface with `@runtime_checkable` (attribute-only check) or rely on static structural typing instead")
     )]
     InterfaceIsinstance {
@@ -548,6 +589,7 @@ pub enum TycError {
     #[error("`{actual}` does not structurally conform to interface `{interface}`: missing or incompatible member(s) {missing}")]
     #[diagnostic(
         code(tyc::interface_not_conforming),
+        url("https://typhon.dev/lang/diagnostics/interface_not_conforming"),
         help(
             "add the missing member(s) to `{actual}` with matching parameter types and return type"
         )
@@ -566,6 +608,7 @@ pub enum TycError {
     #[error("type argument `{actual}` for `{typevar}` does not satisfy bound `{bound}`")]
     #[diagnostic(
         code(tyc::typevar_bound),
+        url("https://typhon.dev/lang/diagnostics/typevar_bound"),
         help("pass a value whose type is a subtype of `{bound}`")
     )]
     TypeVarBoundViolation {
@@ -582,6 +625,7 @@ pub enum TycError {
     #[error("attribute `{attr}` is not defined on `{recv_type}`")]
     #[diagnostic(
         code(tyc::attribute_not_found),
+        url("https://typhon.dev/lang/diagnostics/attribute_not_found"),
         help("check the definition of `{recv_type}` for its available attributes")
     )]
     AttributeNotFound {
@@ -603,6 +647,7 @@ pub enum TycError {
     )]
     #[diagnostic(
         code(tyc::method_in_class_body),
+        url("https://typhon.dev/lang/diagnostics/method_in_class_body"),
         help("move the method into an `impl {class}:` block at the same scope (multiple `impl` blocks for one class are merged at desugar)")
     )]
     MethodInClassBody {
@@ -628,6 +673,7 @@ pub enum TycError {
     )]
     #[diagnostic(
         code(tyc::class_attr_shadows_slot),
+        url("https://typhon.dev/lang/diagnostics/class_attr_shadows_slot"),
         help("annotate each field as `ClassVar[T]` (from `typing`) so `@dataclass(slots=True)` excludes them from `__slots__`")
     )]
     ClassAttrShadowsSlot {
@@ -647,6 +693,7 @@ pub enum TycError {
     #[error("`{what}` on `{function}` is missing a type annotation")]
     #[diagnostic(
         code(tyc::missing_annotation),
+        url("https://typhon.dev/lang/diagnostics/missing_annotation"),
         help("Typhon's Rule 1: annotate every parameter and return type. For a function that returns nothing, write `-> None`.")
     )]
     MissingAnnotation {
@@ -666,6 +713,7 @@ pub enum TycError {
     #[error("local binding '{name}' is missing `let` or `mut`")]
     #[diagnostic(
         code(tyc::missing_binding_kind),
+        url("https://typhon.dev/lang/diagnostics/missing_binding_kind"),
         help("write `let {name} = …` for an immutable binding, or `mut {name} = …` if you intend to rebind it later")
     )]
     MissingBindingKind {
@@ -691,6 +739,7 @@ pub enum TycError {
     #[diagnostic(
         severity(Advice),
         code(tyc::auto_gather_missed),
+        url("https://typhon.dev/lang/diagnostics/auto_gather_missed"),
         help("decorate `{missing}` (and any other same-module async callees in the run) with `@gatherable` to fold the awaits into an `asyncio.TaskGroup` automatically")
     )]
     AutoGatherMissed {
@@ -711,6 +760,7 @@ pub enum TycError {
     #[diagnostic(
         severity(Advice),
         code(tyc::main_not_called),
+        url("https://typhon.dev/lang/diagnostics/main_not_called"),
         help("Add `if __name__ == \"__main__\":\\n    main()` at the end of the module (the standard Python script-entry pattern) so the script runs when invoked directly.")
     )]
     MainNotCalled {
@@ -728,6 +778,7 @@ pub enum TycError {
     #[error("module `{module}` is not in the stdlib, the project, or `typhon.toml` dependencies")]
     #[diagnostic(
         code(tyc::unknown_module),
+        url("https://typhon.dev/lang/diagnostics/unknown_module"),
         help("Either fix the import name, add `{module}` to the `[dependencies]` table in `typhon.toml` (then run `tyc sync`), or create a sibling `.ty` file with the right name.")
     )]
     UnknownModule {
@@ -746,6 +797,7 @@ pub enum TycError {
     #[error("class `{name}` is declared more than once in this module")]
     #[diagnostic(
         code(tyc::duplicate_class),
+        url("https://typhon.dev/lang/diagnostics/duplicate_class"),
         help("rename one of the declarations, or merge the second body into `impl {name}:` / `extend {name}:`")
     )]
     DuplicateClass {
@@ -763,6 +815,7 @@ pub enum TycError {
     #[error("`impl {name}:` targets an unknown class")]
     #[diagnostic(
         code(tyc::impl_unknown_class),
+        url("https://typhon.dev/lang/diagnostics/impl_unknown_class"),
         help("declare `class {name}:` first, or fix the name to match an existing class in this module")
     )]
     ImplUnknownClass {
@@ -779,6 +832,7 @@ pub enum TycError {
     #[error("type alias `{name}` is part of a cycle")]
     #[diagnostic(
         code(tyc::cyclic_type_alias),
+        url("https://typhon.dev/lang/diagnostics/cyclic_type_alias"),
         help("break the cycle by pointing at a concrete type or removing one of the alias declarations")
     )]
     CyclicTypeAlias {
@@ -797,6 +851,7 @@ pub enum TycError {
     #[diagnostic(
         severity(Warning),
         code(tyc::async_without_await),
+        url("https://typhon.dev/lang/diagnostics/async_without_await"),
         help("drop `async` if the function is synchronous, or `await` the call(s) that should run concurrently")
     )]
     AsyncWithoutAwait {
@@ -806,6 +861,73 @@ pub enum TycError {
         #[label("no `await` inside this body")]
         span: SourceSpan,
     },
+
+    /// `typhon.toml` declared a value that isn't in the allowed enumeration for
+    /// that key (e.g. `[emit] class-default = "plain"`). Rejected at config-
+    /// load time so the build never silently does the wrong thing.
+    #[error("invalid value `{value}` for `{key}` in `{path}`: expected one of {allowed}")]
+    #[diagnostic(
+        code(tyc::invalid_config_value),
+        url("https://typhon.dev/lang/diagnostics/invalid_config_value"),
+        help("Pick one of the listed values in your typhon.toml.")
+    )]
+    InvalidConfigValue {
+        key: String,
+        value: String,
+        allowed: String,
+        path: String,
+    },
+
+    /// A `from .NAME import …` references a sibling `.py` file that lives
+    /// outside the project's `src/` tree, so `tyc build` won't copy it into
+    /// the output. The emitted Python would crash at import time.
+    #[error("relative import `{import_path}` resolves outside `src/` and will not be copied to the build output")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::orphan_py_import),
+        url("https://typhon.dev/lang/diagnostics/orphan_py_import"),
+        help("Move the `.py` file under `src/`, or rewrite the import as a project-relative absolute import.")
+    )]
+    OrphanPyImport {
+        import_path: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("relative import resolves outside src/")]
+        span: SourceSpan,
+    },
+
+    /// Typhon's type checker rejects an expression that CPython would
+    /// happily evaluate. Used as a regression signal during the Phase 5
+    /// Python-semantic-alignment audit. Surfaces as a warning so existing
+    /// builds keep working while the underlying rule is corrected.
+    #[error("Typhon rejected `{expression}` but CPython accepts it: {detail}")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::python_semantic_drift),
+        url("https://typhon.dev/lang/diagnostics/python_semantic_drift"),
+        help("Open an issue with the offending snippet so the type-checker rule can be relaxed.")
+    )]
+    PythonSemanticDrift {
+        expression: String,
+        detail: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("Typhon and CPython disagree here")]
+        span: SourceSpan,
+    },
+
+    /// A `comptime let` binding whose name matches a secret-suffix heuristic
+    /// (`*KEY`, `*TOKEN`, `*PASSWORD`, `*SECRET`, `*PASS`, `*PWD`) inlines its
+    /// env value at build time, so the emitted Python contains the raw secret
+    /// as a string literal. Read the env var at runtime instead.
+    #[error("comptime binding `{name}` inlines a secret-shaped value at build time")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::contains_secret_literal),
+        url("https://typhon.dev/lang/diagnostics/contains_secret_literal"),
+        help("Replace `comptime let {name} = env(...)` with a runtime lookup such as `os.environ[\"{env_key}\"]`.")
+    )]
+    ContainsSecretLiteral { name: String, env_key: String },
 }
 
 impl TycError {
@@ -1583,6 +1705,65 @@ impl TycError {
             assignment: SourceSpan::new(SourceOffset::from(assignment_offset), assignment_len),
         }
     }
+
+    /// Construct a [`TycError::InvalidConfigValue`] diagnostic for a
+    /// `typhon.toml` value that's not in the allowed set for its key.
+    pub fn invalid_config_value(
+        key: impl Into<String>,
+        value: impl Into<String>,
+        allowed: impl Into<String>,
+        path: impl Into<String>,
+    ) -> Self {
+        Self::InvalidConfigValue {
+            key: key.into(),
+            value: value.into(),
+            allowed: allowed.into(),
+            path: path.into(),
+        }
+    }
+
+    /// Construct a [`TycError::OrphanPyImport`] warning for a relative `.py`
+    /// import that resolves outside the project's `src/` tree.
+    pub fn orphan_py_import(
+        import_path: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::OrphanPyImport {
+            import_path: import_path.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::PythonSemanticDrift`] warning surfaced by the
+    /// Phase 5 Python-semantic-alignment regression sweep.
+    pub fn python_semantic_drift(
+        expression: impl Into<String>,
+        detail: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::PythonSemanticDrift {
+            expression: expression.into(),
+            detail: detail.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::ContainsSecretLiteral`] warning for a
+    /// `comptime` binding whose name matches the secret-suffix heuristic.
+    pub fn contains_secret_literal(name: impl Into<String>, env_key: impl Into<String>) -> Self {
+        Self::ContainsSecretLiteral {
+            name: name.into(),
+            env_key: env_key.into(),
+        }
+    }
 }
 
 /// A list of diagnostics collected during a compiler phase.
@@ -1977,5 +2158,93 @@ mod tests {
             2,
             "distinct warnings should both survive dedup"
         );
+    }
+
+    // ── Doc URLs are wired to every variant ───────────────────────────────────
+
+    #[test]
+    fn immutable_assign_has_doc_url() {
+        use miette::Diagnostic;
+        let e = TycError::immutable_assign("x", "a.ty", "let x = 1\nx = 2", 4, 1, 10, 1);
+        let url = e.url().expect("expected a documentation URL").to_string();
+        assert!(url.contains("immutable_assign"), "got {url}");
+        assert!(url.starts_with("https://"), "got {url}");
+    }
+
+    // ── New Phase 5 variants ──────────────────────────────────────────────────
+
+    #[test]
+    fn invalid_config_value_contains_key_value_and_allowed() {
+        let e = TycError::invalid_config_value(
+            "emit.class-default",
+            "plain",
+            "`dataclass` | `frozen`",
+            "typhon.toml",
+        );
+        assert!(matches!(e, TycError::InvalidConfigValue { .. }));
+        let msg = e.to_string();
+        assert!(msg.contains("plain"), "value should appear");
+        assert!(msg.contains("emit.class-default"), "key should appear");
+        assert!(msg.contains("typhon.toml"), "path should appear");
+        assert!(msg.contains("dataclass"), "allowed list should appear");
+    }
+
+    #[test]
+    fn orphan_py_import_contains_import_path() {
+        let e =
+            TycError::orphan_py_import(".helper", "src/main.ty", "from .helper import foo", 0, 17);
+        assert!(matches!(e, TycError::OrphanPyImport { .. }));
+        assert!(e.to_string().contains(".helper"));
+    }
+
+    #[test]
+    fn python_semantic_drift_contains_expression_and_detail() {
+        let e = TycError::python_semantic_drift(
+            "1 + True",
+            "bool is a subtype of int in CPython",
+            "a.ty",
+            "1 + True",
+            0,
+            8,
+        );
+        assert!(matches!(e, TycError::PythonSemanticDrift { .. }));
+        let msg = e.to_string();
+        assert!(msg.contains("1 + True"));
+        assert!(msg.contains("bool is a subtype"));
+    }
+
+    #[test]
+    fn contains_secret_literal_contains_name_and_env_key() {
+        let e = TycError::contains_secret_literal("API_KEY", "MY_API_KEY");
+        assert!(matches!(e, TycError::ContainsSecretLiteral { .. }));
+        let msg = e.to_string();
+        assert!(msg.contains("API_KEY"), "binding name should appear");
+    }
+
+    #[test]
+    fn new_variant_codes_are_stable() {
+        use miette::Diagnostic;
+        let cases: &[(&str, TycError)] = &[
+            (
+                "tyc::invalid_config_value",
+                TycError::invalid_config_value("k", "v", "a|b", "typhon.toml"),
+            ),
+            (
+                "tyc::orphan_py_import",
+                TycError::orphan_py_import(".x", "a.ty", "from .x import y", 0, 1),
+            ),
+            (
+                "tyc::python_semantic_drift",
+                TycError::python_semantic_drift("e", "d", "a.ty", "e", 0, 1),
+            ),
+            (
+                "tyc::contains_secret_literal",
+                TycError::contains_secret_literal("API_KEY", "API_KEY"),
+            ),
+        ];
+        for (expected_code, err) in cases {
+            let code = err.code().unwrap().to_string();
+            assert_eq!(&code, expected_code, "code mismatch: got {code}");
+        }
     }
 }

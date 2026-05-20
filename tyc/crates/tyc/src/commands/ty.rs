@@ -103,6 +103,7 @@ pub fn run(args: TyArgs) -> Result<()> {
             path: args.path.clone(),
             out: Some(out_dir.clone()),
             no_format: false,
+            check: false,
         })?;
     }
 

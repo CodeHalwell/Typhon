@@ -1977,7 +1977,7 @@ dependencies = [
 
 [[package]]
 name = "tyc"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "clap",
  "miette",
@@ -2006,7 +2006,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-analyse"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "ruff_python_ast",
  "ruff_text_size",
@@ -2018,7 +2018,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-db"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "criterion",
  "salsa",
@@ -2030,7 +2030,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-desugar"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "ruff_python_ast",
  "ruff_text_size",
@@ -2040,7 +2040,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-diagnostics"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "miette",
  "thiserror",
@@ -2048,7 +2048,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-emit"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "ruff_python_ast",
  "ruff_text_size",
@@ -2058,7 +2058,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-format"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "thiserror",
  "tyc-diagnostics",
@@ -2067,7 +2067,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-lsp"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "miette",
  "salsa",
@@ -2085,7 +2085,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-resolve"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "ruff_python_ast",
  "ruff_text_size",
@@ -2095,7 +2095,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-syntax"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "criterion",
  "ruff_python_ast",
@@ -2105,7 +2105,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-types"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "ruff_python_ast",
  "ruff_text_size",
@@ -2116,7 +2116,7 @@ dependencies = [
 
 [[package]]
 name = "tyc-vm"
-version = "0.1.4"
+version = "0.1.6"
 dependencies = [
  "ruff_python_ast",
  "ruff_python_parser",

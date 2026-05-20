@@ -16,6 +16,14 @@ use crate::commands;
         "compiles to clean, readable CPython 3.13+ code with no runtime\n",
         "dependency on the toolchain."
     ),
+    after_help = concat!(
+        "Documentation:        https://typhon.dev\n",
+        "Language reference:   https://typhon.dev/lang\n",
+        "Migrate Python:       tyc migrate <path.py>\n",
+        "Cheat sheet:          tyc cheatsheet\n",
+        "Diagnostic catalog:   tyc explain <code>\n",
+        "Editor integration:   tyc lsp",
+    ),
     version,
     propagate_version = true
 )]
@@ -53,51 +61,34 @@ pub enum Commands {
     Migrate(commands::migrate::MigrateArgs),
 
     /// Run Astral's `ty` against the emitted Python.
-    ///
-    /// Builds the project (into a temp directory by default) and invokes
-    /// `ty check <out-dir>` as a subprocess. Requires `ty` to be installed
-    /// separately (`pip install ty` or `uv tool install ty`).
     Ty(commands::ty::TyArgs),
 
-    /// Probe emitted `.pyi` stubs against the running module via mypy's
-    /// `stubtest`. Complements `tyc check --stubs` (an AST diff) by
-    /// catching dynamically-created attributes the AST cannot see.
-    ///
-    /// Builds the project and invokes
-    /// `python -m mypy.stubtest <module>` for every emitted `.pyi`.
-    /// Requires `mypy` to be installed in the chosen interpreter
-    /// (`pip install mypy`).
+    /// Probe emitted `.pyi` stubs against the running module via mypy's `stubtest`.
     Stubtest(commands::stubtest::StubtestArgs),
 
     /// Launch an interactive Typhon REPL.
-    ///
-    /// Accumulates `.ty` source across prompts and pipes each evaluation
-    /// through the full compile pipeline plus a Python subprocess.
     Repl(commands::repl::ReplArgs),
 
-    /// Add a Python package to the project (`[dependencies]` in
-    /// `typhon.toml`) and run `uv sync` to install it.
+    /// Add a Python package to the project.
     Add(commands::deps::AddArgs),
 
     /// Remove a Python package from `typhon.toml` and re-sync.
     Remove(commands::deps::RemoveArgs),
 
-    /// Materialise `[dependencies]` into a generated `pyproject.toml`
-    /// and run `uv sync` to install everything.
+    /// Materialise `[dependencies]` into a generated `pyproject.toml`.
     Sync(commands::deps::SyncArgs),
 
     /// Build the project and launch the emitted Python under a debugger.
-    ///
-    /// v1 thin wrapper that runs `python -m pdb build/main.py`. A full
-    /// source-mapping Typhon-native debugger is a Phase-5 item.
     Debug(commands::debug::DebugArgs),
 
     /// Build the project and execute the emitted Python in one step.
-    ///
-    /// Mirrors how `tsx`/`ts-node` hide the TypeScript compile step.
-    /// Use `--temp` for an ephemeral build that leaves no artifacts on
-    /// disk — the "tyx in-memory" mode for quick iteration.
     Run(commands::run::RunArgs),
+
+    /// Print the catalog entry for a diagnostic code (mirrors `rustc --explain`).
+    Explain(commands::explain::ExplainArgs),
+
+    /// Print the 30-second Typhon cheat sheet to stdout.
+    Cheatsheet(commands::cheatsheet::CheatsheetArgs),
 }
 
 /// Entry point called from `main`.
@@ -121,5 +112,7 @@ pub fn run() -> Result<()> {
         Commands::Add(args) => commands::deps::run_add(args),
         Commands::Remove(args) => commands::deps::run_remove(args),
         Commands::Sync(args) => commands::deps::run_sync(args),
+        Commands::Explain(args) => commands::explain::run(args),
+        Commands::Cheatsheet(args) => commands::cheatsheet::run(args),
     }
 }

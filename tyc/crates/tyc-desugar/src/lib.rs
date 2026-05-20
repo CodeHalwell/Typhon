@@ -61,6 +61,20 @@ pub struct DesugarOptions {
     /// default decorator.  Populated from the preprocessor's
     /// `frozen_class_lines` via `line_byte_starts`.
     pub frozen_class_line_starts: Vec<u32>,
+    /// Byte offsets (start of the line) at which a `plain class NAME:`
+    /// declaration appears in the *preprocessed* source.  A class whose
+    /// `TextRange` starts at or just after one of these offsets skips the
+    /// `@dataclass` decorator entirely AND skips the raw-class `__init__`
+    /// synthesis — the class body is emitted exactly as written.
+    /// Populated from the preprocessor's `plain_class_lines` via
+    /// `line_byte_starts`.
+    pub plain_class_line_starts: Vec<u32>,
+    /// User-supplied class base names whose subclasses should NOT receive
+    /// the auto-`@dataclass` decoration.  Matched by *last* identifier
+    /// segment, so an entry of `"App"` matches both `class T(App):` and
+    /// `class T(textual.App):`.  Plumbed in from `typhon.toml`
+    /// (`[emit] skip-decoration-bases`).
+    pub skip_decoration_bases: Vec<String>,
 }
 
 /// Desugar a Typhon module AST into a plain Python AST.
@@ -747,7 +761,9 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
     let markers = ClassMarkers {
         raw_starts: &options.raw_class_line_starts,
         frozen_starts: &options.frozen_class_line_starts,
+        plain_starts: &options.plain_class_line_starts,
         multi_base_parents: &multi_base_parents,
+        skip_decoration_bases: &options.skip_decoration_bases,
     };
     let (new_body, transformed_classes) = desugar_stmts(&m.body, markers);
 
@@ -979,6 +995,7 @@ fn import_insert_pos(body: &[Stmt]) -> usize {
 struct ClassMarkers<'a> {
     raw_starts: &'a [u32],
     frozen_starts: &'a [u32],
+    plain_starts: &'a [u32],
     /// Names of classes that are referenced as a base in a multi-inheritance
     /// (`class C(A, B):`) site somewhere in the same module. Adding
     /// `slots=True` to either of A or B would later cause C's class
@@ -986,6 +1003,10 @@ struct ClassMarkers<'a> {
     /// lay-out conflict`, so those classes are emitted without
     /// `slots=True`. FINDINGS #102.
     multi_base_parents: &'a std::collections::HashSet<String>,
+    /// User-supplied list of base names whose subclasses should skip the
+    /// auto `@dataclass` decoration. Matched by last identifier segment
+    /// against each base in the class header.
+    skip_decoration_bases: &'a [String],
 }
 
 impl ClassMarkers<'_> {
@@ -1001,6 +1022,9 @@ impl ClassMarkers<'_> {
     }
     fn is_frozen(self, class_start: u32, name_start: u32) -> bool {
         Self::marker_covers(self.frozen_starts, class_start, name_start)
+    }
+    fn is_plain(self, class_start: u32, name_start: u32) -> bool {
+        Self::marker_covers(self.plain_starts, class_start, name_start)
     }
 }
 
@@ -1043,6 +1067,7 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             let name_start = u32::from(c.name.range.start());
             let is_raw = markers.is_raw(class_start, name_start);
             let is_frozen = markers.is_frozen(class_start, name_start);
+            let is_plain = markers.is_plain(class_start, name_start);
             let is_pydantic = class_inherits_basemodel(c);
             // `impl` pseudo-classes (`__typhon_impl_*`) are temporary stubs
             // that will be merged into their target class by `merge_impl_blocks`;
@@ -1058,6 +1083,12 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             let is_protocol = class_inherits_protocol(c);
             let is_typed_dict = class_inherits_typed_dict(c);
             let is_named_tuple = class_inherits_named_tuple(c);
+            // Skip auto-decoration for subclasses of non-dataclass-friendly
+            // bases: stdlib `Enum`/`Flag`/`ABC` and any user-supplied names
+            // from `skip_decoration_bases`. This makes plain `class X(Enum):`
+            // do the right thing without requiring `plain class`/`class!`.
+            let is_skip_decoration_subclass =
+                class_inherits_skip_decoration_base(c, markers.skip_decoration_bases);
             // Multi-inheritance with concrete bases conflicts with
             // `slots=True`; emit the decorator without `slots=True` in
             // that case. FINDINGS #102. Also drop `slots=True` for any
@@ -1071,12 +1102,14 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             // and lazy proxies; they already carry the right shape or are
             // incompatible with dataclass.
             let needs_decorator = !is_raw
+                && !is_plain
                 && !is_pydantic
                 && !is_protocol
                 && !is_typed_dict
                 && !is_named_tuple
                 && !is_impl_stub
                 && !is_lazy_proxy
+                && !is_skip_decoration_subclass
                 && !has_dataclass_decorator(&c.decorator_list);
             // Pydantic `model` classes must have `model_config = ConfigDict(extra="forbid")`
             // as their first body statement unless the user already defined it.
@@ -1134,7 +1167,7 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
             // but allocates real objects for things like `Linear(10, 5)`
             // and confuses libraries that introspect class attributes
             // (e.g. PyTorch parameter registration on subclasses).
-            if is_raw && class_has_any_base(c) && !body_has_init(&new_class.body) {
+            if is_raw && !is_plain && class_has_any_base(c) && !body_has_init(&new_class.body) {
                 let synthesised = synthesise_raw_class_init(&new_class.body);
                 // Place `__init__` after the leading run of (docstring +
                 // field annotations) so the class reads top-to-bottom:
@@ -1626,6 +1659,59 @@ fn is_layout_neutral_base(base: &Expr) -> bool {
         last_name(base),
         Some("Protocol") | Some("Generic") | Some("object")
     )
+}
+
+/// Stdlib base names whose subclasses should NOT receive the auto
+/// `@dataclasses.dataclass(slots=True)` decoration. Adding the dataclass
+/// decorator to an `Enum`/`Flag`/`ABC` subclass either silently breaks
+/// semantics (enum members get rewritten into instance fields) or raises
+/// `TypeError` at class-definition time.
+const SKIP_DECORATION_BUILTIN_BASES: &[&str] = &[
+    "Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "ABC", "ABCMeta",
+];
+
+/// Walk a base expression and return its trailing identifier segment.
+///
+/// Handles:
+/// - `Expr::Name(n)` → `n.id`
+/// - `Expr::Attribute(a)` (e.g. `enum.Enum`) → `a.attr`
+/// - `Expr::Subscript(s)` (e.g. `Generic[T]`, `MyBase[int, str]`) →
+///   recurses into the value side
+///
+/// Anything else returns `None` (call expressions in base lists are rare
+/// outside of metaclass tricks and don't need to participate in the
+/// skip-decoration heuristic).
+fn base_last_segment(base: &Expr) -> Option<&str> {
+    match base {
+        Expr::Name(n) => Some(n.id.as_str()),
+        Expr::Attribute(a) => Some(a.attr.as_str()),
+        Expr::Subscript(s) => base_last_segment(&s.value),
+        _ => None,
+    }
+}
+
+/// Return `true` if any base of `c` matches a known non-dataclass-friendly
+/// stdlib parent (`Enum`/`Flag`/`ABC` family) or a user-supplied entry in
+/// `extra`. User-supplied names are matched by last identifier segment so
+/// `"App"` covers both `class T(App):` and `class T(textual.App):`.
+fn class_inherits_skip_decoration_base(
+    c: &ruff_python_ast::StmtClassDef,
+    extra: &[String],
+) -> bool {
+    c.bases().iter().any(|base| {
+        let Some(seg) = base_last_segment(base) else {
+            return false;
+        };
+        if SKIP_DECORATION_BUILTIN_BASES.contains(&seg) {
+            return true;
+        }
+        extra.iter().any(|name| {
+            // Allow either a bare last-segment name or a dotted path
+            // (last segment of the configured name is compared).
+            let configured_seg = name.rsplit('.').next().unwrap_or(name.as_str());
+            configured_seg == seg
+        })
+    })
 }
 
 /// Return `true` if `c` inherits directly from `TypedDict`.
@@ -2290,6 +2376,7 @@ mod tests {
                 memoise_functions: Vec::new(),
                 raw_class_line_starts: starts,
                 frozen_class_line_starts: Vec::new(),
+                ..Default::default()
             },
         );
         let emitted = emit(&out.module);
@@ -2340,6 +2427,7 @@ mod tests {
                 memoise_functions: Vec::new(),
                 raw_class_line_starts: vec![class_kw],
                 frozen_class_line_starts: Vec::new(),
+                ..Default::default()
             },
         );
         let emitted = emit(&out.module);
@@ -2371,6 +2459,7 @@ mod tests {
                 memoise_functions: Vec::new(),
                 raw_class_line_starts: starts,
                 frozen_class_line_starts: Vec::new(),
+                ..Default::default()
             },
         );
         let emitted = emit(&out.module);
@@ -2407,6 +2496,7 @@ mod tests {
                 memoise_functions: Vec::new(),
                 raw_class_line_starts: starts,
                 frozen_class_line_starts: Vec::new(),
+                ..Default::default()
             },
         );
         let emitted = emit(&out.module);
@@ -2427,6 +2517,7 @@ mod tests {
                 memoise_functions: Vec::new(),
                 raw_class_line_starts: starts,
                 frozen_class_line_starts: Vec::new(),
+                ..Default::default()
             },
         );
         let emitted = emit(&out.module);
@@ -2454,6 +2545,7 @@ mod tests {
                 memoise_functions: Vec::new(),
                 raw_class_line_starts: starts,
                 frozen_class_line_starts: Vec::new(),
+                ..Default::default()
             },
         );
         let emitted = emit(&out.module);
@@ -2506,6 +2598,7 @@ mod tests {
                 memoise_functions: Vec::new(),
                 raw_class_line_starts: vec![class_start],
                 frozen_class_line_starts: Vec::new(),
+                ..Default::default()
             },
         );
         let emitted = emit(&out.module);
@@ -2518,6 +2611,165 @@ mod tests {
             "raw class must not trigger dataclasses import:\n{emitted}"
         );
         assert!(emitted.contains("class MyModel:"), "output:\n{emitted}");
+    }
+
+    // ── plain class keyword ─────────────────────────────────────────────────
+
+    #[test]
+    fn plain_class_skips_dataclass_decorator_and_init_synthesis() {
+        // The post-preprocess source already has `plain ` stripped — the
+        // preprocessor only forwards the recorded line offset.
+        let src = "class Net(Module):\n    layer: int\n    dropout: float\n";
+        let parsed = tyc_syntax::parse_module(src).expect("parse failed");
+        let module = parsed.into_syntax();
+        let class_start = match &module.body[0] {
+            Stmt::ClassDef(c) => u32::from(c.range.start()),
+            _ => panic!("expected class def"),
+        };
+        let out = desugar_module_with(
+            &module,
+            DesugarOptions {
+                plain_class_line_starts: vec![class_start],
+                ..Default::default()
+            },
+        );
+        let emitted = emit(&out.module);
+        assert!(
+            !emitted.contains("@dataclasses.dataclass"),
+            "plain class must skip @dataclass:\n{emitted}"
+        );
+        // Plain class MUST NOT synthesise an __init__ even though it has
+        // a base class — the body is emitted verbatim.
+        assert!(
+            !emitted.contains("def __init__"),
+            "plain class must not synthesise __init__:\n{emitted}"
+        );
+        // Field annotations survive as-is.
+        assert!(
+            emitted.contains("layer: int"),
+            "plain class fields must be preserved:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn plain_class_without_bases_emits_nothing_extra() {
+        let src = "class App:\n    x: int\n";
+        let parsed = tyc_syntax::parse_module(src).expect("parse failed");
+        let module = parsed.into_syntax();
+        let class_start = match &module.body[0] {
+            Stmt::ClassDef(c) => u32::from(c.range.start()),
+            _ => panic!("expected class def"),
+        };
+        let out = desugar_module_with(
+            &module,
+            DesugarOptions {
+                plain_class_line_starts: vec![class_start],
+                ..Default::default()
+            },
+        );
+        let emitted = emit(&out.module);
+        assert!(
+            !emitted.contains("@dataclasses.dataclass"),
+            "plain class must skip @dataclass:\n{emitted}"
+        );
+        assert!(
+            !emitted.contains("def __init__"),
+            "plain class must not synthesise __init__:\n{emitted}"
+        );
+        assert!(
+            !emitted.contains("import dataclasses"),
+            "plain class must not trigger dataclasses import:\n{emitted}"
+        );
+    }
+
+    // ── auto-skip dataclass for non-dataclass parents ──────────────────────
+
+    #[test]
+    fn enum_subclass_skips_dataclass_decorator() {
+        let src = "class Color(Enum):\n    RED = 1\n    BLUE = 2\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            !out.contains("@dataclasses.dataclass"),
+            "Enum subclass must not get @dataclass:\n{out}"
+        );
+    }
+
+    #[test]
+    fn int_enum_subclass_skips_dataclass_decorator() {
+        let src = "class Level(IntEnum):\n    LOW = 0\n    HIGH = 1\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            !out.contains("@dataclasses.dataclass"),
+            "IntEnum subclass must not get @dataclass:\n{out}"
+        );
+    }
+
+    #[test]
+    fn qualified_enum_subclass_skips_dataclass_decorator() {
+        let src = "class Color(enum.Enum):\n    RED = 1\n    BLUE = 2\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            !out.contains("@dataclasses.dataclass"),
+            "enum.Enum subclass must not get @dataclass:\n{out}"
+        );
+    }
+
+    #[test]
+    fn abc_subclass_skips_dataclass_decorator() {
+        let src = "class Animal(ABC):\n    name: str\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            !out.contains("@dataclasses.dataclass"),
+            "ABC subclass must not get @dataclass:\n{out}"
+        );
+    }
+
+    #[test]
+    fn user_listed_skip_base_suppresses_dataclass_decorator() {
+        let src = "class T(App):\n    name: str\n";
+        let parsed = tyc_syntax::parse_module(src).expect("parse failed");
+        let module = parsed.into_syntax();
+        let out = desugar_module_with(
+            &module,
+            DesugarOptions {
+                skip_decoration_bases: vec!["App".into()],
+                ..Default::default()
+            },
+        );
+        let emitted = emit(&out.module);
+        assert!(
+            !emitted.contains("@dataclasses.dataclass"),
+            "user-listed base must suppress @dataclass:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn user_listed_skip_base_matches_last_segment() {
+        let src = "class T(textual.App):\n    name: str\n";
+        let parsed = tyc_syntax::parse_module(src).expect("parse failed");
+        let module = parsed.into_syntax();
+        let out = desugar_module_with(
+            &module,
+            DesugarOptions {
+                skip_decoration_bases: vec!["App".into()],
+                ..Default::default()
+            },
+        );
+        let emitted = emit(&out.module);
+        assert!(
+            !emitted.contains("@dataclasses.dataclass"),
+            "user-listed base must match by last segment:\n{emitted}"
+        );
+    }
+
+    #[test]
+    fn unrelated_base_still_gets_dataclass_decorator() {
+        let src = "class T(SomeRegularBase):\n    name: str\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("@dataclasses.dataclass"),
+            "unrelated base must still get @dataclass:\n{out}"
+        );
     }
 
     #[test]

@@ -98,7 +98,18 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 At the end of Phase 3, Typhon is useful for a real backend or CLI project.
 Everything beyond is polish and ambition.
 
-## Phase 5 — Interop and developer experience
+## Phase 5 — Interop and developer experience ✅ complete (v0.1.6)
+
+Shipped in [v0.1.6](https://github.com/CodeHalwell/Typhon/releases/tag/v0.1.6):
+the `plain class` marker, auto-skip for `Enum`/`Flag`/`ABC` parents plus a
+user-configurable `[emit] skip-decoration-bases` list, `class-default`
+validation, `or`/`and` truthy-union typing, generator→`Iterable` conformance,
+`tyc explain <code>` / `tyc cheatsheet`, an upgraded `tyc init` scaffold,
+`.py`-in-`src/` copy-through, `tyc build --check`, the
+`tyc::contains_secret_literal` lint, miette `url(...)` deep-links on every
+diagnostic with 50+ catalog pages under `docs/diagnostics/`, `tyc fmt`
+wrapping `ruff format`, and `tyc debug --break <ty>:<line>` source-mapping.
+The full per-section status is recorded under each heading below.
 
 Phase 4+ is the "beyond v1" feature list. Phase 5 is the **friction
 list**: real adopters land on Typhon, hit the same handful of papercuts
@@ -107,7 +118,7 @@ deferrals (the AST-based reprinter and the source-mapping debugger)
 fold in here. Items are roughly ordered by how much they hurt; severity
 shown as `pain`, `gap`, `dx`, `dx-doc`.
 
-### 5.1 Class-emission reform — `pain`
+### 5.1 Class-emission reform — `pain` ✅
 
 `class-default = "dataclass"` slaps `@dataclasses.dataclass(slots=True)`
 on every class. This breaks any framework that sets attributes
@@ -145,7 +156,7 @@ Deliverables:
   PyPI packages without ceremony — track this as the project-level
   success metric for Phase 5.
 
-### 5.2 Python-semantic alignment in the type checker — `pain`
+### 5.2 Python-semantic alignment in the type checker — `pain` ✅ (two confirmed cases fixed)
 
 The "stricter superset" promise breaks when the type checker rejects
 expressions that CPython evaluates without complaint. Two confirmed
@@ -170,7 +181,7 @@ regression sweep*) is the Phase 5 deliverable. Each accepted-by-Python
 shape that Typhon rejects becomes a `tyc::python_semantic_drift`
 warning during the audit and a `pain`-level fix afterward.
 
-### 5.3 Discoverability — `dx`
+### 5.3 Discoverability — `dx` ✅
 
 Adopters today learn `mut`, `impl`, `interface`, and the class-default
 opt-out by running `tyc migrate` on hand-written Python, by brute-forcing
@@ -198,7 +209,7 @@ Deliverables:
   Mention it in `tyc --help`, in the README quickstart, and in the
   scaffolded `typhon.toml` comment block.
 
-### 5.4 `.py` interop in build output — `gap`
+### 5.4 `.py` interop in build output — `gap` ✅
 
 Today, dropping a `helper.py` into `src/` lets `.ty` files import it
 for type-checking, but `tyc build` doesn't copy it to the output
@@ -216,7 +227,7 @@ Deliverables:
   be copied** (e.g. a relative import in a non-standard layout).
   `tyc::orphan_py_import` warning.
 
-### 5.5 Diagnostic deep-links — `dx-doc`
+### 5.5 Diagnostic deep-links — `dx-doc` ✅
 
 The Rust-style diagnostics are the project's strongest UX. The gap is
 that the *first* time a user sees `impl ChatApp:` referenced inside a
@@ -236,7 +247,7 @@ Deliverables:
 - One-page-per-code docs site section (or anchored sections in the
   language reference).
 
-### 5.6 Build UX papercuts — `dx`
+### 5.6 Build UX papercuts — `dx` ✅
 
 - **`tyc build --check`** dry-run, mirroring `tyc fmt --check`. Lists
   which output files would be created or overwritten; no writes.
@@ -250,7 +261,7 @@ Deliverables:
   with build-time substitution and a `tyc::contains_secret_literal`
   lint that flags emitted plain-text occurrences).
 
-### 5.7 The two existing Phase-5 deferrals — `gap`
+### 5.7 The two existing Phase-5 deferrals — `gap` ✅ (pragmatic v1)
 
 These were called out as "Phase-5" in earlier docs and remain here for
 completeness:

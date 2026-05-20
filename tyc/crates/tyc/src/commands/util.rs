@@ -77,6 +77,60 @@ pub fn collect_dty_files(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(acc)
 }
 
+/// Recursively collect all `.py` files under `root` in sorted order.
+///
+/// Mirrors [`collect_ty_files`] but matches the `.py` extension. Skips
+/// `__pycache__/`, `tests/`, `.venv/`, and any hidden directory whose
+/// name starts with `.` — these are never part of the user-authored
+/// source tree that should be copied verbatim into the build output.
+///
+/// Returns `Ok(vec![])` (not an error) when `root` does not exist —
+/// `.py` files alongside `.ty` files are optional.
+pub fn collect_py_files(root: &Path) -> Result<Vec<PathBuf>> {
+    if !root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut acc = Vec::new();
+    collect_with_ext_filtered(root, "py", &mut acc)?;
+    Ok(acc)
+}
+
+/// Variant of [`collect_with_ext`] that skips conventional non-source
+/// directories: `__pycache__/`, `tests/`, `.venv/`, and any hidden
+/// `.X` directory. Files are still matched by extension.
+fn collect_with_ext_filtered(root: &Path, ext: &str, acc: &mut Vec<PathBuf>) -> Result<()> {
+    if root.is_file() {
+        if root.extension().map(|e| e == ext).unwrap_or(false) {
+            acc.push(root.to_path_buf());
+        }
+        return Ok(());
+    }
+    if root.is_dir() {
+        let entries = std::fs::read_dir(root)
+            .map_err(|e| miette!("cannot read directory {}: {}", root.display(), e))?;
+        let mut paths: Vec<PathBuf> = entries
+            .map(|res| res.map(|e| e.path()))
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(|e| miette!("cannot read directory entry in {}: {}", root.display(), e))?;
+        paths.sort();
+        for path in paths {
+            if path.is_dir() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name == "__pycache__"
+                        || name == "tests"
+                        || name == ".venv"
+                        || name.starts_with('.')
+                    {
+                        continue;
+                    }
+                }
+            }
+            collect_with_ext_filtered(&path, ext, acc)?;
+        }
+    }
+    Ok(())
+}
+
 fn collect_with_ext(root: &Path, ext: &str, acc: &mut Vec<PathBuf>) -> Result<()> {
     if root.is_file() {
         if root.extension().map(|e| e == ext).unwrap_or(false) {
@@ -139,6 +193,55 @@ mod tests {
         let out = apply_strictness(diags, &config_with_methods_in_class_body("off"));
         assert_eq!(out.errors().len(), 0);
         assert_eq!(out.warning_count(), 0);
+    }
+
+    #[test]
+    fn collect_py_files_picks_up_top_level_py_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.py"), "x = 1").unwrap();
+        std::fs::write(tmp.path().join("b.py"), "x = 2").unwrap();
+        std::fs::write(tmp.path().join("c.ty"), "let x: int = 3").unwrap();
+        let files = collect_py_files(tmp.path()).unwrap();
+        assert_eq!(files.len(), 2);
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"a.py".to_string()));
+        assert!(names.contains(&"b.py".to_string()));
+    }
+
+    #[test]
+    fn collect_py_files_recurses_into_subdirectories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("pkg");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("nested.py"), "x = 1").unwrap();
+        let files = collect_py_files(tmp.path()).unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("pkg/nested.py"));
+    }
+
+    #[test]
+    fn collect_py_files_skips_excluded_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        for dirname in ["__pycache__", "tests", ".venv", ".hidden"] {
+            let d = tmp.path().join(dirname);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("skip.py"), "x = 1").unwrap();
+        }
+        std::fs::write(tmp.path().join("keep.py"), "x = 1").unwrap();
+        let files = collect_py_files(tmp.path()).unwrap();
+        assert_eq!(files.len(), 1, "only keep.py should be returned: {files:?}");
+        assert!(files[0].ends_with("keep.py"));
+    }
+
+    #[test]
+    fn collect_py_files_missing_root_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("nope");
+        let files = collect_py_files(&missing).unwrap();
+        assert!(files.is_empty());
     }
 
     #[test]

@@ -211,6 +211,29 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
                     _ => {}
                 }
             }
+            // Generator[Y, S, R] / AsyncGenerator[Y, S] are structurally
+            // assignable to Iterable[T] / Iterator[T] (sync) and
+            // AsyncIterable[T] / AsyncIterator[T] (async) when the yielded
+            // element type Y is assignable to the target element T
+            // covariantly. Without this rule, a function that `yield`s
+            // (inferred as Generator[...]) could never satisfy a
+            // `-> Iterable[T]` return annotation, which is the common shape
+            // users write. The recursive `assignable` call carries the
+            // existing variance and union-flattening rules.
+            if (an == "Iterable" || an == "Iterator")
+                && bn == "Generator"
+                && aa.len() == 1
+                && !bb.is_empty()
+            {
+                return assignable(&aa[0], &bb[0]);
+            }
+            if (an == "AsyncIterable" || an == "AsyncIterator")
+                && bn == "AsyncGenerator"
+                && aa.len() == 1
+                && !bb.is_empty()
+            {
+                return assignable(&aa[0], &bb[0]);
+            }
             if an != bn || aa.len() != bb.len() {
                 return false;
             }
@@ -4506,6 +4529,61 @@ fn infer_expr(c: &mut Checker, expr: &Expr) -> Type {
     infer_expr_ctx(c, expr, None)
 }
 
+/// Type of a Python boolean operator expression (`a or b`, `a and b`).
+///
+/// Python's `or`/`and` are short-circuiting and return **the operand
+/// value**, not a coerced `bool`. So `update.text or ""` evaluates to
+/// `update.text` when truthy, otherwise `""` — and the static result
+/// type is the union of the two operand types, with `None` stripped
+/// from the LHS of an `or` (because that branch can only be taken when
+/// the LHS is truthy, and `None` is always falsy).
+///
+/// We fold left-to-right for chains: `a or b or c` ≡ `(a or b) or c`.
+///
+/// The `and` rule is intentionally a conservative widening (`typeof(lhs)
+/// ∪ typeof(rhs)`) rather than the strictest possible
+/// `typeof(rhs)` ∪ "falsy types of lhs". Modelling Python's full
+/// falsiness lattice (empty containers, `0`, `0.0`, `""`, etc.) is more
+/// machinery than the typer needs today; the widened union still keeps
+/// `let x: int = a and b` honest when both operands are `int`.
+fn infer_bool_op(c: &mut Checker, b: &ruff_python_ast::ExprBoolOp) -> Type {
+    if b.values.is_empty() {
+        return Type::Bool;
+    }
+    let mut acc = infer_expr(c, &b.values[0]);
+    for next in &b.values[1..] {
+        let rhs = infer_expr(c, next);
+        acc = match b.op {
+            // `a or b` evaluates to `a` when `a` is truthy, otherwise `b`.
+            // `truthy(&acc)` is `None` when `a` can never be truthy (e.g.
+            // a bare `None` literal); in that case the result is just `rhs`.
+            ruff_python_ast::BoolOp::Or => match truthy(&acc) {
+                Some(t) => Type::union_of(vec![t, rhs]),
+                None => rhs,
+            },
+            ruff_python_ast::BoolOp::And => Type::union_of(vec![acc, rhs]),
+        };
+    }
+    acc
+}
+
+/// Return the type a value can have *when it is truthy*, or `None` if the
+/// type has no truthy inhabitant. For a nullable `T | None` this strips the
+/// `None` (because `None` is always falsy); for bare `Type::None` returns
+/// `None` (the literal is unconditionally falsy, so the truthy branch is
+/// impossible); for `Bool` we keep `Bool` (the truthy value is `True :
+/// bool`); for everything else the type is unchanged (we do not try to
+/// enumerate falsy literals like `0`, `""`, or empty containers — that
+/// level of refinement is out of scope for the operator typer).
+fn truthy(t: &Type) -> Option<Type> {
+    match t {
+        Type::None => None,
+        Type::Bool => Some(Type::Bool),
+        Type::Union(_) if t.is_nullable() => Some(t.strip_none()),
+        other => Some(other.clone()),
+    }
+}
+
 /// Infer the type of `expr`, optionally with an expected target type
 /// (the annotation on the enclosing `let`, the function's declared
 /// return type, or a generic parameter's formal type).  Most arms
@@ -4578,7 +4656,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                 _ => Type::Unknown,
             }
         }
-        Expr::BoolOp(_) => Type::Bool,
+        Expr::BoolOp(b) => infer_bool_op(c, b),
         Expr::Compare(_) => Type::Bool,
         Expr::UnaryOp(u) => {
             let operand = infer_expr(c, &u.operand);
@@ -7928,6 +8006,137 @@ class Identity frozen:
                 .iter()
                 .map(|w: &TycError| w.to_string())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    // ── Phase 5.2: `or` / `and` typing ────────────────────────────────────
+
+    #[test]
+    fn or_returns_truthy_lhs_unioned_with_rhs() {
+        // The motivating case: a Telegram-style `update.text or ""` pattern
+        // where `text: str | None` should produce `str` after the `or`, not
+        // `bool`. Without the truthy-LHS rule this binds `bool` to a `str`
+        // annotation and errors.
+        let src = "\
+class Update:
+    text: str | None
+
+def handle(update: Update) -> None:
+    let s: str = update.text or \"\"
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "`str | None or str` should infer as `str`; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn or_keeps_bool_when_both_sides_bool() {
+        // The legacy behaviour (BoolOp -> Bool) must still hold for the
+        // common `flag or default` shape where both operands are booleans.
+        let src = "\
+def f(a: bool, b: bool) -> None:
+    let c: bool = a or b
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "`bool or bool` should still be `bool`; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn and_widens_to_union() {
+        // `a and b` evaluates to `a` when falsy, else `b`. The conservative
+        // union widening means a same-type `and` keeps the type — assigning
+        // `int and int` to an `int` annotation must NOT error.
+        let src = "\
+def f(a: int, b: int) -> None:
+    let c: int = a and b
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "`int and int` should be `int`; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn or_chain_regression_maybe_str_or_default() {
+        // End-to-end pipeline regression: the canonical Phase 5.2 motivating
+        // example. Reads as a free-standing module so the resolver, type
+        // narrower, and BoolOp inference all participate.
+        let src = "\
+let maybe_str: str | None = None
+let s: str = maybe_str or \"default\"
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "Phase 5.2 regression: `(str | None) or str` should be `str`; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    // ── Phase 5.2: Generator → Iterable conformance ───────────────────────
+
+    #[test]
+    fn generator_assignable_to_iterable_of_same_element() {
+        // `Generator[int, None, None]` should satisfy `Iterable[int]` — the
+        // shape `yield`-bodies most often have.
+        let g = Type::Generic("Generator".into(), vec![Type::Int, Type::None, Type::None]);
+        let it = Type::Generic("Iterable".into(), vec![Type::Int]);
+        assert!(
+            assignable(&it, &g),
+            "Generator[int, ...] should be assignable to Iterable[int]"
+        );
+    }
+
+    #[test]
+    fn generator_assignable_to_iterator() {
+        // `Iterator[T]` is the other common return annotation.
+        let g = Type::Generic("Generator".into(), vec![Type::Str, Type::None, Type::None]);
+        let it = Type::Generic("Iterator".into(), vec![Type::Str]);
+        assert!(
+            assignable(&it, &g),
+            "Generator[str, ...] should be assignable to Iterator[str]"
+        );
+    }
+
+    #[test]
+    fn async_generator_assignable_to_async_iterable() {
+        let ag = Type::Generic("AsyncGenerator".into(), vec![Type::Int, Type::None]);
+        let ait = Type::Generic("AsyncIterable".into(), vec![Type::Int]);
+        let aiter = Type::Generic("AsyncIterator".into(), vec![Type::Int]);
+        assert!(
+            assignable(&ait, &ag),
+            "AsyncGenerator[int, ...] should be assignable to AsyncIterable[int]"
+        );
+        assert!(
+            assignable(&aiter, &ag),
+            "AsyncGenerator[int, ...] should be assignable to AsyncIterator[int]"
+        );
+    }
+
+    #[test]
+    fn generator_function_returning_iterable_type_checks() {
+        // Full pipeline: a `yield`-bodied function annotated as
+        // `Iterable[int]` must not error. Without the conformance rule the
+        // body infers as `Generator[int, ...]` and fails the return check.
+        let src = "\
+def numbers() -> Iterable[int]:
+    yield 1
+    yield 2
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "yield-bodied -> Iterable[int] should type-check; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
     }
 }
