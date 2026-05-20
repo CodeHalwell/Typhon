@@ -12,3 +12,8 @@ node_modules/**
 !node_modules/vscode-languageserver-protocol/**
 !node_modules/vscode-languageserver-types/**
 !node_modules/semver/**
+# vscode-languageclient pulls these in transitively; without them the
+# extension fails to activate with `Cannot find module 'minimatch'`.
+!node_modules/minimatch/**
+!node_modules/brace-expansion/**
+!node_modules/balanced-match/**
