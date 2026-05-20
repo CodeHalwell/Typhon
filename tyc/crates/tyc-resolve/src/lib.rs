@@ -646,10 +646,14 @@ impl ResolvedModule {
 
     /// Walk the scope chain starting at `scope` and return the first
     /// binding matching `name`, plus the scope it was found in.
+    ///
+    /// Returns `None` when `scope` is out of bounds (e.g. querying an
+    /// empty `ResolvedModule` on parse failure) so the LSP completion
+    /// path doesn't crash mid-keystroke.
     pub fn lookup<'a>(&'a self, scope: ScopeId, name: &str) -> Option<(&'a Binding, ScopeId)> {
         let mut current = Some(scope);
         while let Some(id) = current {
-            let s = &self.scopes[id];
+            let s = self.scopes.get(id)?;
             if let Some(b) = s.lookup_local(name) {
                 return Some((b, id));
             }
@@ -688,12 +692,17 @@ impl ResolvedModule {
     /// inherited from parent scopes).  Walks the parent chain to the
     /// module scope; later definitions in nested scopes shadow earlier
     /// ones with the same name.
+    ///
+    /// Returns an empty list when `scope` is out of bounds — this happens
+    /// when the LSP queries an empty `ResolvedModule` (parse failure
+    /// mid-keystroke), and a panic here would crash the completion
+    /// handler and surface as "No suggestions" in the editor.
     pub fn visible_bindings(&self, scope: ScopeId) -> Vec<&Binding> {
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let mut out: Vec<&Binding> = Vec::new();
         let mut current = Some(scope);
         while let Some(id) = current {
-            let s = &self.scopes[id];
+            let Some(s) = self.scopes.get(id) else { break };
             for b in &s.bindings {
                 if seen.insert(b.name.as_str()) {
                     out.push(b);
@@ -2705,6 +2714,18 @@ def outer(a):
             names.contains(&"inner".to_owned()),
             "expected inner in {names:?}"
         );
+    }
+
+    #[test]
+    fn visible_bindings_on_empty_module_returns_empty() {
+        // A default `ResolvedModule` (what the Salsa query returns on
+        // parse failure) used to panic when `visible_bindings(0)`
+        // indexed into the empty `scopes` vec, crashing the LSP
+        // completion handler and surfacing as "No suggestions" in the
+        // editor while the user typed an unparseable buffer.
+        let empty = ResolvedModule::default();
+        assert!(empty.visible_bindings(0).is_empty());
+        assert!(empty.lookup(0, "anything").is_none());
     }
 
     #[test]
