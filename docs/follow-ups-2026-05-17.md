@@ -27,6 +27,28 @@ all pass.
 
 ## Deliberately deferred
 
+### Cross-module constructor / method arity checks
+
+The constructor and method arity checks (`tyc::arg_count`) consult the
+current module's `class_shapes`. Classes imported from another module
+today still land as `Type::Class(name)` with no field / method shape
+attached, so cross-module constructor calls and method calls bypass the
+check.
+
+Lighting it up across modules requires propagating `InterfaceShape` (and
+the per-method `ArityInfo` we now record) through `tyc-db` as a tracked
+Salsa query, plus a project-level "module index" that the checker reads
+when an imported name resolves to a class in another `.ty` or `.dty`
+file. The data structures are already in place; the missing piece is
+the cross-module query plumbing.
+
+This is intentionally scoped out of the initial arity-check PR — the
+same-module case catches the most common bug (a class you wrote
+yourself, instantiated in the same file or a sibling that imports it
+from your own project). Foreign Python libraries continue to flow
+through `unsafe:` or `.dty` stubs, and a `.dty` stub authored against
+the consumer's module will be checked locally.
+
 ### Ruff parser fork — ✅ landed since this sprint
 
 This follow-up has been resolved. `ruff_python_parser`,

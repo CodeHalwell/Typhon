@@ -1366,6 +1366,13 @@ struct MethodSig {
     /// so `arity` excludes `cls` and the class-qualified call path does
     /// not add an implicit receiver.
     is_classmethod: bool,
+    /// Full arity metadata (param names, defaults, `*args`/`**kwargs`)
+    /// for the method, mirroring [`ArityInfo`] for free functions. Used
+    /// by call-site checking so `user.greet()` is flagged when `greet`
+    /// has a required parameter, instead of falling through to the
+    /// permissive "unknown callable" arity rule. Excludes the implicit
+    /// receiver (`self` / `cls`) for instance / classmethods.
+    arity_info: ArityInfo,
 }
 
 /// Member shape recorded for an interface or class — methods are recorded as
@@ -1377,6 +1384,20 @@ struct InterfaceShape {
     methods: HashMap<String, MethodSig>,
     /// Field name → annotation type.
     fields: HashMap<String, Type>,
+    /// Field names in declaration order. The emitted `@dataclass` /
+    /// `BaseModel` constructor binds positional arguments to fields in
+    /// this order, so positional-arity matching and keyword-arg
+    /// resolution at call sites consult this list rather than the
+    /// HashMap (whose iteration order is unstable).
+    field_order: Vec<String>,
+    /// Fields with an explicit `= default` value in source. Used at
+    /// constructor-call sites to decide whether the field is required:
+    /// a field absent from this set must be filled by a positional arg
+    /// or matching kwarg. Mirrors how `ArityInfo::min_positional` is
+    /// derived for free functions. A nullable type (`T?`) alone does
+    /// NOT add the field here — Typhon does not auto-inject `= None`
+    /// for `T?` fields, so the runtime dataclass still requires them.
+    field_defaults: std::collections::HashSet<String>,
 }
 
 impl InterfaceShape {
@@ -2659,6 +2680,16 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
                     Expr::Attribute(a) => matches!(a.attr.as_str(), "property" | "cached_property"),
                     _ => false,
                 });
+                let tps = type_param_names_from(f.type_params.as_deref());
+                let full_arity = arity_info_from_parameters(f.parameters.as_ref(), classes, &tps);
+                // Drop the implicit receiver (`self` / `cls`) from the
+                // method's arity surface so call sites can match argument
+                // counts directly. Static methods take no receiver.
+                let arity_info = if is_static {
+                    full_arity
+                } else {
+                    strip_receiver_from_arity(full_arity)
+                };
                 shape.methods.insert(
                     f.name.as_str().to_owned(),
                     MethodSig {
@@ -2667,19 +2698,79 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
                         is_property,
                         is_static,
                         is_classmethod,
+                        arity_info,
                     },
                 );
             }
             Stmt::AnnAssign(a) => {
                 if let Expr::Name(n) = a.target.as_ref() {
                     let ty = type_from_annotation(&a.annotation, classes);
-                    shape.fields.insert(n.id.as_str().to_owned(), ty);
+                    let name = n.id.as_str().to_owned();
+                    if !shape.fields.contains_key(&name) {
+                        shape.field_order.push(name.clone());
+                    }
+                    if a.value.is_some() {
+                        shape.field_defaults.insert(name.clone());
+                    }
+                    shape.fields.insert(name, ty);
                 }
             }
             _ => {}
         }
     }
     shape
+}
+
+/// Drop the first positional parameter (the implicit `self` / `cls`
+/// receiver) from an [`ArityInfo`] computed over a raw method
+/// signature. Used so a method like `def greet(self, prefix: str) ->
+/// str` exposes a one-arg surface at the call site (`u.greet("hi")`)
+/// instead of demanding two positional args.
+fn strip_receiver_from_arity(mut info: ArityInfo) -> ArityInfo {
+    if info.param_names.is_empty() {
+        return info;
+    }
+    info.param_names.remove(0);
+    info.min_positional = info.min_positional.saturating_sub(1);
+    info.max_positional = info.max_positional.map(|n| n.saturating_sub(1));
+    info
+}
+
+/// Build an [`ArityInfo`] modelling the auto-generated constructor of a
+/// class declared with `class X:` (or `class X frozen:` / `model X:`).
+/// Both `@dataclass` and Pydantic's `BaseModel` bind `__init__` arguments
+/// to fields in declaration order, treating fields with an `= default`
+/// as optional. Nullable fields (`T?`) without an explicit default are
+/// NOT defaulted — Typhon does not auto-inject `= None`, matching the
+/// emitted dataclass's runtime behaviour. Returns `None` when the class
+/// has no fields recorded (zero-arg constructor accepts any call shape).
+fn class_constructor_arity(shape: &InterfaceShape) -> ArityInfo {
+    let mut min_positional = 0usize;
+    let max_positional = shape.field_order.len();
+    // A defaulted positional forces every subsequent positional to also
+    // be defaulted in Python (`SyntaxError` otherwise), but the equivalent
+    // is not enforced for `@dataclass` fields — `init` still places the
+    // non-defaulted ones first. Be conservative: count every leading
+    // non-defaulted field toward `min_positional`. If a non-defaulted
+    // field appears AFTER a defaulted one, dataclass init actually fails
+    // at class-definition time, so we'd be flagging that elsewhere.
+    let mut hit_default = false;
+    for name in &shape.field_order {
+        if shape.field_defaults.contains(name) {
+            hit_default = true;
+        } else if !hit_default {
+            min_positional += 1;
+        }
+    }
+    ArityInfo {
+        param_names: shape.field_order.clone(),
+        min_positional,
+        max_positional: Some(max_positional),
+        kwonly_names: Vec::new(),
+        kwonly_required: Vec::new(),
+        has_kwarg: false,
+        vararg_type: None,
+    }
 }
 
 fn method_arity_excluding_receiver(params: &ruff_python_ast::Parameters) -> usize {
@@ -2794,6 +2885,93 @@ fn levenshtein(a: &str, b: &str) -> usize {
         std::mem::swap(&mut prev, &mut curr);
     }
     prev[b.len()]
+}
+
+/// Resolve the `ArityInfo` for a method-call target of the form
+/// `<receiver>.<method>(...)`. Walks the receiver's static type to find
+/// the matching [`MethodSig`] and returns its stored `arity_info`,
+/// which already excludes the implicit `self` / `cls` receiver. Returns
+/// `None` when:
+///
+/// - the receiver isn't a known class instance (e.g. `Any`, a foreign
+///   type from `unsafe:`, or an unresolved name),
+/// - the attribute doesn't name a method on that class, or
+/// - the receiver IS the class name (`User.greet`, an unbound-method
+///   access) — those call sites would need to fill `self` themselves and
+///   are still handled by the legacy permissive shape until we model
+///   them properly.
+///
+/// Class-qualified calls into `@classmethod` and `@staticmethod`
+/// targets are accepted because the arity info already accounts for
+/// the absent (or auto-bound) receiver.
+fn method_arity_info_for_attribute(
+    c: &Checker,
+    attr: &ruff_python_ast::ExprAttribute,
+) -> Option<ArityInfo> {
+    // The same Expr::Attribute resolution path the call site uses to
+    // pick a method's return type, mirrored here so we can grab the
+    // richer arity surface that `Type::Function` discards.
+    let recv = infer_expr_readonly(c, &attr.value);
+    let class_name = match &recv {
+        Type::Class(n) => n.clone(),
+        Type::Generic(n, _) => n.clone(),
+        _ => return None,
+    };
+    let receiver_is_class_name = matches!(
+        attr.value.as_ref(),
+        Expr::Name(n) if c.classes.iter().any(|cn| cn == n.id.as_str())
+    );
+    let sig = c.find_method(&class_name, attr.attr.as_str())?;
+    if sig.is_property {
+        return None;
+    }
+    // For `ClassName.method(instance, ...)` (unbound-method form),
+    // an extra positional is required for the receiver. Modelling
+    // that re-adds the `self` slot to `param_names`; without it the
+    // call would falsely arity-fail. Keep the existing permissive
+    // shape there for now to avoid regressing class-qualified calls.
+    if receiver_is_class_name && !sig.is_static && !sig.is_classmethod {
+        return None;
+    }
+    Some(sig.arity_info.clone())
+}
+
+/// A side-effect-free variant of [`infer_expr`] that walks the same
+/// match arms but avoids emitting diagnostics. Used by
+/// [`method_arity_info_for_attribute`] to peek at the receiver's static
+/// type before the surrounding call-site machinery walks it for real.
+/// Limited to the cases we actually need (`Name` and `Attribute` chains);
+/// anything else degrades to `Type::Unknown`, which the caller treats as
+/// "no method arity info available" and falls back to the legacy
+/// permissive shape.
+fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
+    match e {
+        Expr::Name(n) => c
+            .env
+            .lookup(n.id.as_str())
+            .map(|b| b.narrowed.clone())
+            .unwrap_or(Type::Unknown),
+        Expr::Attribute(a) => {
+            let recv = infer_expr_readonly(c, &a.value);
+            match &recv {
+                Type::Class(class_name) | Type::Generic(class_name, _) => {
+                    if let Some(field_ty) = c.find_field(class_name, a.attr.as_str()) {
+                        field_ty.clone()
+                    } else if let Some(sig) = c.find_method(class_name, a.attr.as_str()) {
+                        if sig.is_property {
+                            sig.return_type.clone()
+                        } else {
+                            Type::Unknown
+                        }
+                    } else {
+                        Type::Unknown
+                    }
+                }
+                _ => Type::Unknown,
+            }
+        }
+        _ => Type::Unknown,
+    }
 }
 
 /// Outcome of an arity check against a function's [`ArityInfo`]. The
@@ -4763,16 +4941,35 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // structural type spelled `*args` / `**kwargs`.
                     let fn_name: Option<String> = match call.func.as_ref() {
                         Expr::Name(n) => Some(n.id.as_str().to_owned()),
+                        Expr::Attribute(a) => Some(a.attr.as_str().to_owned()),
                         _ => None,
                     };
                     // Clone arity info so the mutable Checker borrows
                     // below (`infer_expr_ctx`, `c.mismatch`,
                     // `c.nullable_use`) don't fight an outstanding
                     // immutable borrow of `c.function_arity_info`.
-                    let arity_info: Option<ArityInfo> = fn_name
-                        .as_deref()
-                        .and_then(|n| c.function_arity_info.get(n))
-                        .cloned();
+                    //
+                    // Method calls (`obj.foo(...)`) carry `ArityInfo` on
+                    // the resolved `MethodSig` rather than in the
+                    // module-level `function_arity_info` map, so we
+                    // look there first whenever the call func is an
+                    // attribute access on a known class instance. This
+                    // closes the long-standing gap where method calls
+                    // missing required args (e.g.
+                    // `user.greet()` for `def greet(self, prefix: str)`)
+                    // bypassed `tyc::arg_count`.
+                    let method_arity_info: Option<ArityInfo> =
+                        if let Expr::Attribute(a) = call.func.as_ref() {
+                            method_arity_info_for_attribute(c, a)
+                        } else {
+                            None
+                        };
+                    let arity_info: Option<ArityInfo> = method_arity_info.or_else(|| {
+                        fn_name
+                            .as_deref()
+                            .and_then(|n| c.function_arity_info.get(n))
+                            .cloned()
+                    });
                     let arity_outcome = if let Some(info) = arity_info.as_ref() {
                         check_arity_with_info(info, pos_args, kw_args)
                     } else {
@@ -5033,6 +5230,32 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                                     ident.range.start().to_usize() + kw_name.len(),
                                 );
                                 c.unknown_kwarg(&name, kw_name, suggestion, span);
+                            }
+                        }
+                        // Constructor-arity check: every non-defaulted field
+                        // must be filled by a positional arg or matching kw.
+                        // Reuses the same `check_arity_with_info` machinery
+                        // that powers free-function arity, treating the
+                        // auto-generated `__init__` as a function whose
+                        // params are the class fields in declaration order.
+                        // Without this check, calls like
+                        // `ApiClient(base_url="x")` for a class with a
+                        // required `api_key: str` field pass `tyc check`
+                        // and only crash at runtime with
+                        // `TypeError: missing 1 required positional argument`.
+                        let info = class_constructor_arity(&shape);
+                        if !info.param_names.is_empty() {
+                            match check_arity_with_info(&info, pos_args, kw_args) {
+                                ArityCheck::Ok => {}
+                                ArityCheck::UnknownKwarg { .. } => {
+                                    // Already handled by the dedicated
+                                    // unknown-kwarg loop above.
+                                }
+                                ArityCheck::Other => {
+                                    let supplied = pos_args.len()
+                                        + kw_args.iter().filter(|k| k.arg.is_some()).count();
+                                    c.wrong_args(&name, info.min_positional, supplied, call_span);
+                                }
                             }
                         }
                     }
@@ -5995,6 +6218,204 @@ let r: int = add(1)
         assert!(msg.contains("wrong number of arguments"), "got {}", msg);
     }
 
+    // ── constructor-arity checks ───────────────────────────────────────
+    //
+    // The generated `__init__` of a `class` / `model` declaration must
+    // be called with every non-defaulted field filled — either
+    // positionally or by keyword. Without these checks, a call like
+    // `ApiClient(base_url="...")` for a class with a required
+    // `api_key: str` field passed `tyc check` and only crashed at
+    // runtime with `TypeError: missing 1 required positional argument`.
+
+    #[test]
+    fn ctor_missing_required_kwarg_errors() {
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+let c: ApiClient = ApiClient(base_url=\"https://api.example.com\")
+";
+        let d = check(src);
+        assert!(d.has_errors(), "missing required field must error");
+        let msg = format!("{}", d.errors()[0]);
+        assert!(
+            msg.contains("ApiClient") && msg.contains("wrong number of arguments"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn ctor_no_args_errors_when_required() {
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+let c: ApiClient = ApiClient()
+";
+        let d = check(src);
+        assert!(d.has_errors(), "bare `ApiClient()` must error");
+    }
+
+    #[test]
+    fn ctor_all_required_filled_positionally_passes() {
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+let c: ApiClient = ApiClient(\"k\", \"u\")
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn ctor_all_required_filled_by_kwarg_passes() {
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+let c: ApiClient = ApiClient(api_key=\"k\", base_url=\"u\")
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn ctor_field_with_default_is_optional() {
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str = \"https://default.example.com\"
+
+let c: ApiClient = ApiClient(api_key=\"k\")
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn ctor_nullable_field_still_required_when_no_default() {
+        // Typhon does NOT auto-inject `= None` for `T?` fields, so the
+        // emitted `@dataclass` still requires them at construction. The
+        // check must match runtime — leniency here would let crashing
+        // code pass the build.
+        let src = "\
+class Foo:
+    name: str?
+
+let f: Foo = Foo()
+";
+        let d = check(src);
+        assert!(d.has_errors(), "`T?` without `= None` must still error");
+    }
+
+    #[test]
+    fn ctor_nullable_field_with_explicit_none_default_is_optional() {
+        let src = "\
+class Foo:
+    name: str? = None
+
+let f: Foo = Foo()
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn ctor_model_class_arity_checked() {
+        let src = "\
+model User:
+    id: int
+    name: str
+
+let u: User = User(id=1)
+";
+        let d = check(src);
+        assert!(d.has_errors(), "model classes must have the same check");
+    }
+
+    #[test]
+    fn ctor_too_many_positional_args_errors() {
+        let src = "\
+class Point:
+    x: int
+    y: int
+
+let p: Point = Point(1, 2, 3)
+";
+        let d = check(src);
+        assert!(d.has_errors(), "extra positional must error");
+    }
+
+    // ── method-arity checks ─────────────────────────────────────────
+    //
+    // Method calls (`obj.foo(args)`) used to fall into the permissive
+    // arity shape because `Expr::Attribute` callees had no name-keyed
+    // arity info. They now carry full `ArityInfo` on `MethodSig`.
+
+    #[test]
+    fn method_missing_required_arg_errors() {
+        let src = "\
+class User:
+    name: str
+
+impl User:
+    def greet(self, prefix: str) -> str:
+        return prefix + self.name
+
+let u: User = User(name=\"x\")
+let g: str = u.greet()
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "method call missing required arg must error"
+        );
+        let msg = format!("{}", d.errors()[0]);
+        assert!(
+            msg.contains("greet") && msg.contains("wrong number of arguments"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn method_call_with_required_arg_passes() {
+        let src = "\
+class User:
+    name: str
+
+impl User:
+    def greet(self, prefix: str) -> str:
+        return prefix + self.name
+
+let u: User = User(name=\"x\")
+let g: str = u.greet(\"hi \")
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn method_with_default_param_passes_without_arg() {
+        let src = "\
+class User:
+    name: str
+
+impl User:
+    def greet(self, prefix: str = \"hi \") -> str:
+        return prefix + self.name
+
+let u: User = User(name=\"x\")
+let g: str = u.greet()
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
     // ── FINDINGS #72: bare collection annotations are implicit-any ────
 
     #[test]
@@ -6565,7 +6986,7 @@ class Point:
     x: int
     y: int
 
-let p: Point = Point()
+let p: Point = Point(x=1, y=2)
 ";
         let d = check(src);
         assert!(!d.has_errors(), "{:?}", d.errors());
@@ -6619,7 +7040,7 @@ class Rectangle:
 
 type Shape = Circle | Rectangle
 
-let s: Shape = Circle()
+let s: Shape = Circle(radius=1)
 ";
         let d = check(src);
         assert!(!d.has_errors(), "{:?}", d.errors());
@@ -6636,7 +7057,7 @@ class Rectangle:
 
 type Shape = Circle | Rectangle
 
-let s: Shape = Circle()
+let s: Shape = Circle(radius=1)
 
 match s:
     case Circle():
@@ -6662,7 +7083,7 @@ class Triangle:
 
 type Shape = Circle | Rectangle | Triangle
 
-let s: Shape = Circle()
+let s: Shape = Circle(radius=1)
 
 match s:
     case Circle():
@@ -6693,7 +7114,7 @@ class Triangle:
 
 type Shape = Circle | Rectangle | Triangle
 
-let s: Shape = Circle()
+let s: Shape = Circle(radius=1)
 
 match s:
     case Circle():
@@ -6716,7 +7137,7 @@ class Rectangle:
 
 type Shape = Circle | Rectangle
 
-let s: Shape = Circle()
+let s: Shape = Circle(radius=1)
 
 match s:
     case Circle():
@@ -6755,7 +7176,7 @@ class Rectangle:
 
 type Shape = Circle | Rectangle
 
-let s: Shape = Circle()
+let s: Shape = Circle(radius=1)
 
 match s:
     case Circle() if True:
@@ -6787,7 +7208,7 @@ class Rectangle:
 
 type Shape = Circle | Rectangle
 
-let s: Shape = Circle()
+let s: Shape = Circle(radius=1)
 
 match s:
     case Circle() as c:
@@ -6812,7 +7233,7 @@ class Rectangle:
 
 type Shape = Circle | Rectangle
 
-let x: Shape? = Circle()
+let x: Shape? = Circle(radius=1)
 ";
         let d = check(src);
         assert!(!d.has_errors(), "{:?}", d.errors());
@@ -6991,7 +7412,7 @@ let ok: bool = isinstance(c, Drawable)
 class Circle:
     radius: float
 
-let c = Circle()
+let c = Circle(radius=1.0)
 let ok: bool = isinstance(c, Circle)
 ";
         let d = check(src);
@@ -7496,7 +7917,7 @@ interface Named:
 class Dog:
     name: str
 
-let d: Named = Dog()
+let d: Named = Dog(name=\"Fido\")
 ";
         let d = check(src);
         assert!(
@@ -7516,7 +7937,7 @@ interface Named:
 class Dog:
     name: int
 
-let d: Named = Dog()
+let d: Named = Dog(name=1)
 ";
         let d = check(src);
         assert!(
@@ -7540,7 +7961,7 @@ interface Named:
 class Dog:
     age: int
 
-let d: Named = Dog()
+let d: Named = Dog(age=1)
 ";
         let d = check(src);
         assert!(
@@ -7564,7 +7985,7 @@ interface Config:
 class BadConfig:
     port: str
 
-let c: Config = BadConfig()
+let c: Config = BadConfig(port=\"oops\")
 ";
         let d = check(src);
         assert!(d.has_errors(), "type-mismatched field must be rejected");
@@ -7595,7 +8016,7 @@ class Dog:
 class Person:
     pet: Dog
 
-let p: Owner = Person()
+let p: Owner = Person(pet=Dog(name=\"Fido\"))
 ";
         let d = check(src);
         assert!(

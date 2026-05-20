@@ -10,7 +10,7 @@ straight from a failed build to the corresponding documentation.
 
 ## Codes
 
-- [`tyc::arg_count`](./arg_count.md) — function called with the wrong number of positional arguments.
+- [`tyc::arg_count`](./arg_count.md) — function, method, or class constructor called with the wrong number of arguments.
 - [`tyc::async_without_await`](./async_without_await.md) — warning: `async def` body never uses `await`.
 - [`tyc::attribute_not_found`](./attribute_not_found.md) — attribute access on a type that doesn't declare it.
 - [`tyc::auto_gather_missed`](./auto_gather_missed.md) — advice: adjacent awaits look gatherable but a callee isn't `@gatherable`.

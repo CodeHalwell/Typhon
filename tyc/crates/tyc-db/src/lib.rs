@@ -876,7 +876,7 @@ class Point:
     x: int
     y: int
 
-let p: Point = Point()
+let p: Point = Point(x=1, y=2)
 ";
         let mut db = TycDatabase::new();
         let diags = check_file(&mut db, "<test>".into(), src.to_owned());
@@ -890,7 +890,7 @@ model User:
     id: int
     name: str
 
-let u: User = User()
+let u: User = User(id=1, name=\"Ada\")
 ";
         let mut db = TycDatabase::new();
         let diags = check_file(&mut db, "<test>".into(), src.to_owned());
