@@ -3807,48 +3807,7 @@ fn match_arms_always_exit_aware(c: &Checker, m: &ruff_python_ast::StmtMatch) -> 
     {
         return false;
     }
-    // (a) Catch-all check: a guardless `case _:` or capturing arm with
-    // no inner pattern matches any value.
-    let has_catchall = m.cases.iter().any(|case| {
-        case.guard.is_none()
-            && matches!(
-                &case.pattern,
-                ruff_python_ast::Pattern::MatchAs(p) if p.pattern.is_none()
-            )
-    });
-    if has_catchall {
-        return true;
-    }
-    // (b) Sealed-union exhaustiveness check: resolve the subject's
-    // type and see whether every declared variant is matched by a
-    // guardless arm. The subject must be a bare name whose declared
-    // type is a sealed-union class — same shape the
-    // `check_match_exhaustiveness` pass relies on.
-    //
-    // `Result[T, E]` is a builtin sealed union whose variants
-    // (`Ok` | `Err`) are seeded in `seed_typhon_runtime_types` rather
-    // than declared by a user `type Result = Ok | Err` alias, so
-    // resolve it explicitly here (F4).
-    if let Expr::Name(n) = m.subject.as_ref() {
-        if let Some(binding) = c.env.lookup(n.id.as_str()) {
-            let variants: Option<Vec<String>> = match &binding.declared {
-                Type::Class(union_name) => c.sealed_unions.get(union_name.as_str()).cloned(),
-                Type::Generic(head, _) if head == "Result" => Some(vec!["Ok".into(), "Err".into()]),
-                _ => None,
-            };
-            if let Some(variants) = variants {
-                let mut covered: HashSet<String> = HashSet::new();
-                for case in &m.cases {
-                    if case.guard.is_some() {
-                        continue;
-                    }
-                    collect_matched_class_names(&case.pattern, &mut covered);
-                }
-                return variants.iter().all(|v| covered.contains(v));
-            }
-        }
-    }
-    false
+    match_cases_cover_subject(c, m)
 }
 
 /// Checker-aware variant of [`body_always_exits`]. Identical to the
@@ -4026,26 +3985,64 @@ fn match_arms_exit_non_suppressible_aware(c: &Checker, m: &ruff_python_ast::Stmt
     {
         return false;
     }
-    let has_catchall = m.cases.iter().any(|case| {
+    match_cases_cover_subject(c, m)
+}
+
+/// True when the unguarded arms of `m` collectively cover every value of the
+/// subject's static type. Used by both `match_arms_always_exit_aware` and
+/// `match_arms_exit_non_suppressible_aware` so the same recognition logic
+/// drives the missing-return analysis for normal and `with`-body matches.
+///
+/// Covers:
+/// - A guardless catch-all arm (`case _:` / `case x:` / `case <wild> as x:`).
+/// - Sealed-union subjects where every variant is matched.
+/// - Single-class subjects matched by a class-wildcard arm — including
+///   `case C():`, `case C(field=name, ...):` with every field bound to a
+///   capture, and `case C() as x:` / nested `MatchOr` of the same shape.
+/// - `list` / `tuple` subjects covered by a `case [*xs]:` arm.
+/// - Aliased union subjects (e.g. `type IntTree = int | list[IntTree]`)
+///   where every variant of the unwrapped union is covered by an unguarded
+///   arm that is a class-wildcard for that variant.
+fn match_cases_cover_subject(c: &Checker, m: &ruff_python_ast::StmtMatch) -> bool {
+    if m.cases.iter().any(|case| {
         case.guard.is_none()
             && matches!(
                 &case.pattern,
                 ruff_python_ast::Pattern::MatchAs(p) if p.pattern.is_none()
             )
-    });
-    if has_catchall {
+    }) {
         return true;
     }
+    let Some(subject_type) = match_subject_type(c, m) else {
+        return false;
+    };
+    let unwrapped = c.unwrap_alias(&subject_type);
+    cases_cover_type(c, &m.cases, &unwrapped)
+}
+
+fn match_subject_type(c: &Checker, m: &ruff_python_ast::StmtMatch) -> Option<Type> {
     if let Expr::Name(n) = m.subject.as_ref() {
         if let Some(binding) = c.env.lookup(n.id.as_str()) {
-            let variants: Option<Vec<String>> = match &binding.declared {
-                Type::Class(union_name) => c.sealed_unions.get(union_name.as_str()).cloned(),
-                Type::Generic(head, _) if head == "Result" => Some(vec!["Ok".into(), "Err".into()]),
-                _ => None,
-            };
-            if let Some(variants) = variants {
+            return Some(binding.declared.clone());
+        }
+    }
+    None
+}
+
+/// Return `true` iff the unguarded patterns in `cases` cover every inhabitant
+/// of `ty`. Recurses on union variants so an aliased `int | list[...]` is
+/// satisfied by arms covering each side individually.
+fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
+    if let Type::Union(variants) = ty {
+        return variants.iter().all(|v| cases_cover_type(c, cases, v));
+    }
+    let class_name = match ty {
+        Type::Class(n) => n.clone(),
+        Type::Generic(head, _) => {
+            if head == "Result" {
+                let variants = vec!["Ok".to_string(), "Err".to_string()];
                 let mut covered: HashSet<String> = HashSet::new();
-                for case in &m.cases {
+                for case in cases {
                     if case.guard.is_some() {
                         continue;
                     }
@@ -4053,9 +4050,164 @@ fn match_arms_exit_non_suppressible_aware(c: &Checker, m: &ruff_python_ast::Stmt
                 }
                 return variants.iter().all(|v| covered.contains(v));
             }
+            head.clone()
         }
+        Type::Int => "int".to_string(),
+        Type::Str => "str".to_string(),
+        Type::Bool => "bool".to_string(),
+        Type::Float => "float".to_string(),
+        Type::Bytes => "bytes".to_string(),
+        Type::None => "NoneType".to_string(),
+        _ => return false,
+    };
+    if let Some(variants) = c.sealed_unions.get(class_name.as_str()).cloned() {
+        let mut covered: HashSet<String> = HashSet::new();
+        for case in cases {
+            if case.guard.is_some() {
+                continue;
+            }
+            if pattern_covers_class(c, &case.pattern, &class_name) {
+                return true;
+            }
+            collect_matched_class_names(&case.pattern, &mut covered);
+        }
+        return variants.iter().all(|v| covered.contains(v));
     }
-    false
+    if cases.iter().any(|case| {
+        case.guard.is_none() && pattern_covers_class(c, &case.pattern, &class_name)
+    }) {
+        return true;
+    }
+    if class_name == "list" || class_name == "tuple" {
+        sequence_cases_cover_all_lengths(cases)
+    } else {
+        false
+    }
+}
+
+/// True when the unguarded sequence patterns in `cases` collectively cover
+/// every possible length of a list/tuple subject. Recognises:
+/// - `case [a, b, c]:` — fixed-length N coverage (matches length 3 only).
+/// - `case [first, *rest]:` — tail-star coverage of length ≥ N where N is
+///   the count of fixed elements before the star.
+/// A coverage is total when there is a tail-star arm of minimum length N
+/// and every shorter length 0..N is matched by a fixed-length arm.
+fn sequence_cases_cover_all_lengths(cases: &[MatchCase]) -> bool {
+    let mut exact: HashSet<usize> = HashSet::new();
+    let mut tail_star_min: Option<usize> = None;
+    for case in cases {
+        if case.guard.is_some() {
+            continue;
+        }
+        let Pattern::MatchSequence(seq) = &case.pattern else {
+            continue;
+        };
+        let star_count = seq
+            .patterns
+            .iter()
+            .filter(|p| matches!(p, Pattern::MatchStar(_)))
+            .count();
+        if star_count == 0 {
+            if seq.patterns.iter().all(is_capture_or_underscore) {
+                exact.insert(seq.patterns.len());
+            }
+            continue;
+        }
+        if star_count != 1 {
+            continue;
+        }
+        if !matches!(seq.patterns.last(), Some(Pattern::MatchStar(_))) {
+            continue;
+        }
+        if !seq.patterns[..seq.patterns.len() - 1]
+            .iter()
+            .all(is_capture_or_underscore)
+        {
+            continue;
+        }
+        let min_len = seq.patterns.len() - 1;
+        tail_star_min = Some(match tail_star_min {
+            Some(prev) => prev.min(min_len),
+            None => min_len,
+        });
+    }
+    let Some(min) = tail_star_min else {
+        return false;
+    };
+    (0..min).all(|n| exact.contains(&n))
+}
+
+/// True if `pattern` (in an unguarded arm) matches every instance of
+/// `class_name`. Recognises:
+/// - `case _:` / `case x:` (always a wildcard for anything).
+/// - `case <wild> as name:` (recurses on the inner pattern).
+/// - `case C():` with no sub-patterns.
+/// - `case C(field=p1, ...):` where every field of `C` is bound and every
+///   sub-pattern `p_i` is itself a wildcard.
+/// - `case [*xs]:` for `class_name == "list"` / `"tuple"`.
+/// - `case <wild1> | <wild2> | ...:` where any branch matches.
+fn pattern_covers_class(c: &Checker, pattern: &Pattern, class_name: &str) -> bool {
+    match pattern {
+        Pattern::MatchAs(a) => match &a.pattern {
+            None => true,
+            Some(inner) => pattern_covers_class(c, inner, class_name),
+        },
+        Pattern::MatchOr(o) => o
+            .patterns
+            .iter()
+            .any(|p| pattern_covers_class(c, p, class_name)),
+        Pattern::MatchClass(mc) => {
+            let Expr::Name(n) = mc.cls.as_ref() else {
+                return false;
+            };
+            if n.id.as_str() != class_name {
+                return false;
+            }
+            if mc.arguments.patterns.is_empty() && mc.arguments.keywords.is_empty() {
+                return true;
+            }
+            if !mc.arguments.patterns.is_empty() {
+                return false;
+            }
+            let Some(shape) = c.class_shapes.get(class_name) else {
+                return false;
+            };
+            if mc.arguments.keywords.len() != shape.fields.len() {
+                return false;
+            }
+            let bound: HashSet<&str> = mc
+                .arguments
+                .keywords
+                .iter()
+                .map(|kw| kw.attr.as_str())
+                .collect();
+            if !shape.fields.keys().all(|f| bound.contains(f.as_str())) {
+                return false;
+            }
+            mc.arguments
+                .keywords
+                .iter()
+                .all(|kw| is_capture_or_underscore(&kw.pattern))
+        }
+        Pattern::MatchSequence(seq) => {
+            (class_name == "list" || class_name == "tuple")
+                && seq.patterns.len() == 1
+                && matches!(&seq.patterns[0], Pattern::MatchStar(_))
+        }
+        _ => false,
+    }
+}
+
+/// True if `pattern` is a pure capture or wildcard with no nested filter:
+/// `_`, `x`, or `<wild> as x` where the inner is itself such.
+fn is_capture_or_underscore(pattern: &Pattern) -> bool {
+    match pattern {
+        Pattern::MatchAs(a) => match &a.pattern {
+            None => true,
+            Some(inner) => is_capture_or_underscore(inner),
+        },
+        _ => false,
+    }
 }
 
 fn elif_else_chain_always_exits_aware(
@@ -5316,6 +5468,11 @@ fn check_match_exhaustiveness(
         if is_wildcard_pattern(&case.pattern) {
             has_wildcard = true;
             break;
+        }
+        for variant in variants {
+            if pattern_covers_class(c, &case.pattern, variant) {
+                covered.insert(variant.clone());
+            }
         }
         collect_matched_class_names(&case.pattern, &mut covered);
     }
