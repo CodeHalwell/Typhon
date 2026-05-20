@@ -1161,7 +1161,17 @@ impl Emitter {
             Expr::BytesLiteral(b) => {
                 self.write("b\"");
                 for byte in b.value.bytes() {
-                    self.write(&format!("\\x{:02x}", byte));
+                    match byte {
+                        b'\\' => self.write("\\\\"),
+                        b'"' => self.write("\\\""),
+                        b'\n' => self.write("\\n"),
+                        b'\r' => self.write("\\r"),
+                        b'\t' => self.write("\\t"),
+                        // Keep printable ASCII as-is so `b"hello"` reads as
+                        // `b"hello"` instead of `b"\x68\x65\x6c\x6c\x6f"`.
+                        0x20..=0x7e => self.write(&(byte as char).to_string()),
+                        _ => self.write(&format!("\\x{:02x}", byte)),
+                    }
                 }
                 self.write("\"");
             }

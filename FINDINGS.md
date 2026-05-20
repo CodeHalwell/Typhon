@@ -4471,3 +4471,11 @@ fix lands as its own commit.
   `ModuleNotFoundError: No module named 'pydantic'`. New helper
   `sources_use_model_keyword` in `tyc/src/commands/build.rs`.
 
+- **#116** `bytes` literal preservation — `Expr::BytesLiteral` emit in
+  `tyc-emit/src/printer.rs` no longer re-escapes every byte as
+  `\xNN`. Printable ASCII bytes (`0x20..=0x7e`) emit unchanged with
+  the conventional Python escapes for `\\`, `"`, `\n`, `\r`, `\t`;
+  non-printable / non-ASCII bytes still use the `\xNN` hex form.
+  `b"hello"` now round-trips as `b"hello"` instead of
+  `b"\x68\x65\x6c\x6c\x6f"`.
+
