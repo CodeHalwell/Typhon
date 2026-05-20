@@ -1117,21 +1117,21 @@ fn fmt_check_fails_if_any_file_needs_changes() {
 
 // ── corpus round-trip — Phase 3+ features ───────────────────────────────────
 
-/// Exercises generics (TypeVar), interface (→ Protocol), @pure, nullable
-/// narrowing, and Ok[T] together through `tyc check`.
+/// Exercises generics (PEP 695 syntax), interface (→ Protocol), @pure,
+/// nullable narrowing, and Ok[T] together through `tyc check`.
 ///
 /// Note: nullable narrowing uses `if r is not None:` (positive narrowing)
 /// which is what the checker supports; negative early-return narrowing
 /// (`if r is None: return`) is a follow-up.
+///
+/// Per FINDINGS #73 `from typing import TypeVar` is now rejected — this
+/// test was updated to use `def identity[T](x: T) -> T:` instead.
 #[test]
 fn corpus_phase3_features_check_clean() {
     let tmp = tempfile::tempdir().unwrap();
     scaffold(
         tmp.path(),
-        "from typing import TypeVar\n\
-         T = TypeVar(\"T\")\n\
-         \n\
-         interface Describable:\n\
+        "interface Describable:\n\
          \x20   def describe(self) -> str:\n\
          \x20       ...\n\
          \n\
@@ -1146,7 +1146,7 @@ fn corpus_phase3_features_check_clean() {
          \x20       return \"fail: \" + self.reason\n\
          \n\
          @pure\n\
-         def identity(x: T) -> T:\n\
+         def identity[T](x: T) -> T:\n\
          \x20   return x\n\
          \n\
          def format_opt(r: Success?) -> str:\n\

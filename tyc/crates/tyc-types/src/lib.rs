@@ -1207,6 +1207,11 @@ struct ArityInfo {
     /// True when the function declares `**kwargs`, accepting any
     /// otherwise-unmatched keyword argument.
     has_kwarg: bool,
+    /// Declared element type of the `*args` variadic parameter, when
+    /// the function has one. Used at call sites to type-check the
+    /// excess positional args (FINDINGS #86). `Type::Unknown` when
+    /// the vararg is unannotated.
+    vararg_type: Option<Type>,
 }
 
 /// Declared interface (`interface Name:` → `class Name(Protocol):`). Bundles
@@ -1745,6 +1750,31 @@ impl<'a> Checker<'a> {
             name,
             expected,
             actual,
+            &self.path,
+            self.source,
+            span.0,
+            length,
+        ));
+    }
+
+    /// Emit `tyc::unknown_kwarg` (FINDINGS #80). `suggestion` is the
+    /// fully-formatted help string — either "did you mean `<x>`?" or a
+    /// list of accepted parameter names.
+    fn unknown_kwarg(
+        &mut self,
+        fn_name: &str,
+        kwarg: &str,
+        suggestion: String,
+        span: (usize, usize),
+    ) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
+        let length = span.1.saturating_sub(span.0).max(1);
+        self.diagnostics.push_error(TycError::unknown_kwarg(
+            fn_name,
+            kwarg,
+            suggestion,
             &self.path,
             self.source,
             span.0,
@@ -2349,7 +2379,7 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
             // `**kwargs` without false positives (FINDINGS #44).
             c.function_arity_info.insert(
                 f.name.as_str().to_owned(),
-                arity_info_from_parameters(f.parameters.as_ref()),
+                arity_info_from_parameters(f.parameters.as_ref(), &classes, &tps),
             );
             // Record `async def` names so the call-site arm can emit
             // `tyc::missing_await` for sync calls (FINDINGS #49).
@@ -2533,16 +2563,113 @@ fn function_signature(
     }
 }
 
+/// Return `Some(name)` when `expr` is a bare container-type annotation
+/// — `list`, `dict`, `tuple`, `set`, or `frozenset` written without a
+/// subscript. These shapes carry an implicit `Any` element type and
+/// violate Rule 1 / `[strictness] no-implicit-any = true` (FINDINGS
+/// #72). Subscripted forms (`list[int]`, `dict[str, int]`) and bare
+/// names that aren't container types return `None`.
+fn bare_collection_name(expr: &Expr) -> Option<&'static str> {
+    match expr {
+        Expr::Name(n) => match n.id.as_str() {
+            "list" => Some("list"),
+            "dict" => Some("dict"),
+            "tuple" => Some("tuple"),
+            "set" => Some("set"),
+            "frozenset" => Some("frozenset"),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Build the `help:` string for a `tyc::unknown_kwarg` diagnostic
+/// (FINDINGS #80). If any candidate is "close enough" by character-level
+/// edit distance, suggest it; otherwise list every accepted parameter
+/// name so users see what's available.
+fn suggest_candidate(typo: &str, candidates: &[String]) -> String {
+    let best = candidates
+        .iter()
+        .filter_map(|c| {
+            let d = levenshtein(typo, c);
+            // Threshold: at most one third of the longer name, capped at 3.
+            let max_d = (typo.len().max(c.len()) / 3).clamp(1, 3);
+            if d <= max_d {
+                Some((d, c.as_str()))
+            } else {
+                None
+            }
+        })
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, name)| name);
+    match best {
+        Some(c) => format!("did you mean `{c}`?"),
+        None if candidates.is_empty() => "this function takes no keyword arguments".to_string(),
+        None => {
+            let names: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
+            format!("accepted parameters: {}", names.join(", "))
+        }
+    }
+}
+
+/// Plain Levenshtein edit distance over byte-level characters. Adequate
+/// for the short identifier strings used by `suggest_candidate`.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr: Vec<usize> = vec![0; b.len() + 1];
+    for i in 1..=a.len() {
+        curr[0] = i;
+        for j in 1..=b.len() {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+/// Outcome of an arity check against a function's [`ArityInfo`]. The
+/// specific failure mode is preserved so the caller can pick the right
+/// diagnostic — e.g. `UnknownKwarg` produces a friendlier
+/// `tyc::unknown_kwarg` instead of an arg-count miscount (FINDINGS #80).
+#[derive(Debug)]
+enum ArityCheck {
+    Ok,
+    /// A keyword argument was passed whose name doesn't match any
+    /// parameter (and the function doesn't have `**kwargs`).
+    UnknownKwarg {
+        /// The offending kwarg name (e.g. `"greetinx"`).
+        name: String,
+        /// All parameter names accepted by the function. Used to suggest
+        /// the closest match in the diagnostic.
+        candidates: Vec<String>,
+        /// The kw arg's source position.
+        span: (usize, usize),
+    },
+    /// Any other arity failure (count mismatch, double-bound name,
+    /// missing required, etc.). Falls back to `tyc::arg_count`.
+    Other,
+}
+
 /// Decide whether a call site's positional + keyword arguments are
-/// compatible with the named function's [`ArityInfo`]. Returns `true`
-/// for an OK call, `false` for an arity mismatch — the caller emits
-/// the diagnostic.
+/// compatible with the named function's [`ArityInfo`]. Returns
+/// [`ArityCheck::Ok`] for a sound call, or the specific failure mode
+/// otherwise — the caller picks the right diagnostic.
 ///
 /// Rules:
 /// 1. Every kw argument must either match a parameter name (positional
-///    or kw-only), or be absorbed by `**kwargs`. Mismatch → `false`.
+///    or kw-only), or be absorbed by `**kwargs`. Mismatch →
+///    [`ArityCheck::UnknownKwarg`].
 /// 2. A parameter can be filled by either a positional or a kw arg —
-///    not both. Conflicts → `false`.
+///    not both. Conflicts → [`ArityCheck::Other`].
 /// 3. Every required positional / kw-only param must be filled.
 /// 4. The total positional count must not exceed `max_positional`
 ///    (unless the function has `*args`, in which case `max_positional`
@@ -2551,7 +2678,7 @@ fn check_arity_with_info(
     info: &ArityInfo,
     pos_args: &[Expr],
     kw_args: &[ruff_python_ast::Keyword],
-) -> bool {
+) -> ArityCheck {
     // Filter out the `**double-star` unpacking keywords (`kw.arg == None`) — we
     // can't statically know how many keys they contain, so we treat them as
     // matching anything (kwarg sentinel).
@@ -2564,17 +2691,32 @@ fn check_arity_with_info(
     // Rule 4: positional count must fit max_positional (None → unbounded).
     if let Some(max) = info.max_positional {
         if pos_args.len() > max {
-            return false;
+            return ArityCheck::Other;
         }
     }
 
     // Rule 1: every named kw must hit a parameter (or `**kwargs`).
+    // Surface the first offender with a dedicated variant so the
+    // caller emits `tyc::unknown_kwarg` instead of a confusing
+    // `tyc::arg_count` (FINDINGS #80).
     if !info.has_kwarg {
-        for name in &named_kwargs {
+        for kw in kw_args {
+            let Some(ident) = &kw.arg else { continue };
+            let name = ident.as_str();
             let hits_pos = info.param_names.iter().any(|p| p == name);
             let hits_kwonly = info.kwonly_names.iter().any(|p| p == name);
             if !hits_pos && !hits_kwonly {
-                return false;
+                let mut candidates = info.param_names.clone();
+                candidates.extend(info.kwonly_names.iter().cloned());
+                let span = (
+                    ident.range.start().to_usize(),
+                    ident.range.start().to_usize() + name.len(),
+                );
+                return ArityCheck::UnknownKwarg {
+                    name: name.to_owned(),
+                    candidates,
+                    span,
+                };
             }
         }
     }
@@ -2586,7 +2728,7 @@ fn check_arity_with_info(
             .iter()
             .any(|p| p == name)
         {
-            return false;
+            return ArityCheck::Other;
         }
     }
 
@@ -2606,16 +2748,16 @@ fn check_arity_with_info(
             if named_kwargs.iter().any(|kw| kw == p) {
                 continue;
             }
-            return false;
+            return ArityCheck::Other;
         }
         // Rule 3b: every required kw-only must be filled.
         for required in &info.kwonly_required {
             if !named_kwargs.iter().any(|kw| kw == required) {
-                return false;
+                return ArityCheck::Other;
             }
         }
     }
-    true
+    ArityCheck::Ok
 }
 
 /// Compute the [`ArityInfo`] sidecar for a `def`'s parameter list.
@@ -2625,7 +2767,11 @@ fn check_arity_with_info(
 /// `Type::Function` (param names for keyword-arg matching, count of
 /// defaulted params for the min-arity bound, kw-only requireds, and
 /// the `**kwargs` flag).
-fn arity_info_from_parameters(parameters: &ruff_python_ast::Parameters) -> ArityInfo {
+fn arity_info_from_parameters(
+    parameters: &ruff_python_ast::Parameters,
+    classes: &[String],
+    type_params: &[String],
+) -> ArityInfo {
     let mut param_names: Vec<String> = Vec::new();
     let mut min_positional: usize = 0;
     // Walk positional-only + positional-or-keyword. A defaulted positional
@@ -2659,6 +2805,15 @@ fn arity_info_from_parameters(parameters: &ruff_python_ast::Parameters) -> Arity
             kwonly_required.push(name);
         }
     }
+    // FINDINGS #86: record the *args element type so the call-site
+    // type-check can stop misapplying the next positional-or-kw
+    // parameter's annotation to absorbed extra positional args.
+    let vararg_type = parameters.vararg.as_ref().map(|va| {
+        va.annotation
+            .as_ref()
+            .map(|ann| type_from_annotation_with_params(ann, classes, type_params))
+            .unwrap_or(Type::Unknown)
+    });
     ArityInfo {
         param_names,
         min_positional,
@@ -2666,6 +2821,7 @@ fn arity_info_from_parameters(parameters: &ruff_python_ast::Parameters) -> Arity
         kwonly_names,
         kwonly_required,
         has_kwarg: parameters.kwarg.is_some(),
+        vararg_type,
     }
 }
 
@@ -2697,6 +2853,26 @@ fn seed_env_from_scope(c: &mut Checker, scope: ScopeId) {
 fn check_stmt(c: &mut Checker, stmt: &Stmt) {
     match stmt {
         Stmt::AnnAssign(a) => {
+            // FINDINGS #72: a bare `list` / `dict` / `tuple` / `set` /
+            // `frozenset` annotation has an implicit `Any` element type
+            // and violates Rule 1. Class-body field declarations also
+            // route through `Stmt::AnnAssign` but their annotations
+            // should be checked too — `name: list` is just as opaque
+            // inside a class as outside one.
+            if let Some(bare) = bare_collection_name(&a.annotation) {
+                let span = (
+                    a.annotation.range().start().to_usize(),
+                    a.annotation.range().end().to_usize(),
+                );
+                let length = span.1.saturating_sub(span.0).max(1);
+                c.diagnostics.push_error(TycError::implicit_any(
+                    bare,
+                    c.path.clone(),
+                    c.source,
+                    span.0,
+                    length,
+                ));
+            }
             let ann_type = type_from_annotation(&a.annotation, &c.classes);
             if let Some(value) = &a.value {
                 let value_type = infer_expr_ctx(c, value, Some(&ann_type));
@@ -3129,7 +3305,7 @@ fn check_function(
         ));
     }
 
-    let saved_return = c.current_return.replace(ret_type);
+    let saved_return = c.current_return.replace(ret_type.clone());
     // Track sync-vs-async for the body's call-site check
     // (`tyc::missing_await` — FINDINGS #49). Only sync function bodies
     // trip the diagnostic; async bodies use `await` naturally and
@@ -3210,10 +3386,73 @@ fn check_function(
         check_stmt(c, stmt);
     }
 
+    // Missing-return analysis (FINDINGS #82): when the declared return
+    // type cannot accommodate `None` and the body is not a generator
+    // (yield → iterator), every path through the function must end in
+    // `return` / `raise`. Auto-synthesised compiler helpers are exempt
+    // for the same reason as Rule 1 / Rule 4. Stub bodies (`...` /
+    // `pass` / docstring-only) are also exempt because that's the
+    // canonical shape for `interface` (Protocol) methods and abstract
+    // base-class declarations — both legitimately "don't return".
+    if !name.starts_with("__typhon_")
+        && returns.is_some()
+        && return_type_requires_value(&ret_type)
+        && !body_has_yield(body)
+        && !body_is_stub(body)
+        && !body_always_exits_aware(c, body)
+    {
+        c.diagnostics.push_error(TycError::missing_return(
+            name,
+            ret_type.display(),
+            c.path.clone(),
+            c.source,
+            name_span_offset,
+            name_span_len,
+        ));
+    }
+
     c.env.leave();
     c.current_return = saved_return;
     c.active_typevar_bounds = saved_bounds;
     c.in_sync_function = saved_in_sync;
+}
+
+/// True when `body` is a stub — `...`, `pass`, or a single docstring
+/// followed by one of those. Used to exempt `interface` (Protocol)
+/// method declarations and abstract base-class methods from the
+/// missing-return check (FINDINGS #82).
+fn body_is_stub(body: &[Stmt]) -> bool {
+    let stmts: Vec<&Stmt> = body.iter().filter(|s| !is_docstring_stmt(s)).collect();
+    match stmts.as_slice() {
+        [Stmt::Pass(_)] => true,
+        [Stmt::Expr(e)] => matches!(e.value.as_ref(), Expr::EllipsisLiteral(_)),
+        [] => true, // body was nothing but docstrings
+        _ => false,
+    }
+}
+
+/// True when this statement is a bare string-literal expression — the
+/// canonical "docstring" shape that lives at the top of a function /
+/// class body.
+fn is_docstring_stmt(stmt: &Stmt) -> bool {
+    matches!(
+        stmt,
+        Stmt::Expr(e) if matches!(e.value.as_ref(), Expr::StringLiteral(_))
+    )
+}
+
+/// True when the declared return type can NOT silently accept a missing
+/// `return` (i.e. the implicit `return None` Python uses to fall off the
+/// end of a function). Anything that includes `None` in its surface
+/// (literal `None`, `T?` / `T | None`, the bare `Unknown` for unannotated
+/// returns, or `Type::Any`) is exempt — those are the cases where falling
+/// off the end is a legal value.
+fn return_type_requires_value(t: &Type) -> bool {
+    match t {
+        Type::Unknown | Type::Any | Type::None => false,
+        Type::Union(variants) => !variants.iter().any(|v| matches!(v, Type::None)),
+        _ => true,
+    }
 }
 
 fn check_if(c: &mut Checker, i: &ruff_python_ast::StmtIf) {
@@ -3291,8 +3530,119 @@ fn stmt_always_exits(stmt: &Stmt) -> bool {
         Stmt::If(s) => {
             body_always_exits(&s.body) && elif_else_chain_always_exits(&s.elif_else_clauses)
         }
+        // A `match` statement where every arm body exits, including a
+        // wildcard / capturing fallback that handles unmatched values,
+        // is itself an exit. Exhaustive sealed-union matches already
+        // have a `case _:` arm (the exhaustiveness pass would have
+        // rejected non-exhaustive ones), so this matches the user's
+        // intuition that a covered match doesn't fall through.
+        Stmt::Match(m) => match_arms_always_exit(&m.cases),
         _ => false,
     }
+}
+
+/// Structural-only check: do every arm's body end in an unconditional
+/// exit, and is there at least one arm? Used by the narrowing pass in
+/// `check_if` (where over-approximating "exit" is harmless — it just
+/// loses narrowing precision, never produces wrong types). For
+/// missing-return analysis, use [`match_arms_always_exit_aware`]
+/// instead — that variant requires either a catch-all arm or proven
+/// sealed-union exhaustiveness, since a non-exhaustive open match can
+/// legitimately fall through (Copilot review on PR #68, file
+/// tyc-types/src/lib.rs L3558).
+fn match_arms_always_exit(cases: &[ruff_python_ast::MatchCase]) -> bool {
+    !cases.is_empty() && cases.iter().all(|c| body_always_exits(&c.body))
+}
+
+/// Checker-aware variant of [`match_arms_always_exit`]: returns true only
+/// when the match definitively covers every reachable value. Used by the
+/// missing-return analysis, where falsely claiming "exits" would suppress
+/// the diagnostic on a real fall-through path.
+///
+/// A match covers everything when:
+/// 1. Every arm body always exits (necessary in either case), AND
+/// 2. Either (a) at least one arm is a guardless catch-all (`case _:`
+///    or a guardless capture like `case other:`), OR (b) the subject is
+///    a sealed union and every variant is matched by a guardless arm.
+fn match_arms_always_exit_aware(c: &Checker, m: &ruff_python_ast::StmtMatch) -> bool {
+    if m.cases.is_empty() {
+        return false;
+    }
+    if !m
+        .cases
+        .iter()
+        .all(|case| body_always_exits_aware(c, &case.body))
+    {
+        return false;
+    }
+    // (a) Catch-all check: a guardless `case _:` or capturing arm with
+    // no inner pattern matches any value.
+    let has_catchall = m.cases.iter().any(|case| {
+        case.guard.is_none()
+            && matches!(
+                &case.pattern,
+                ruff_python_ast::Pattern::MatchAs(p) if p.pattern.is_none()
+            )
+    });
+    if has_catchall {
+        return true;
+    }
+    // (b) Sealed-union exhaustiveness check: resolve the subject's
+    // type and see whether every declared variant is matched by a
+    // guardless arm. The subject must be a bare name whose declared
+    // type is a sealed-union class — same shape the
+    // `check_match_exhaustiveness` pass relies on.
+    if let Expr::Name(n) = m.subject.as_ref() {
+        if let Some(binding) = c.env.lookup(n.id.as_str()) {
+            if let Type::Class(union_name) = &binding.declared {
+                if let Some(variants) = c.sealed_unions.get(union_name.as_str()) {
+                    let mut covered: HashSet<String> = HashSet::new();
+                    for case in &m.cases {
+                        if case.guard.is_some() {
+                            continue;
+                        }
+                        collect_matched_class_names(&case.pattern, &mut covered);
+                    }
+                    return variants.iter().all(|v| covered.contains(v));
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Checker-aware variant of [`body_always_exits`]. Identical to the
+/// structural form except that [`Stmt::Match`] dispatches to
+/// [`match_arms_always_exit_aware`] so sealed-union exhaustiveness is
+/// respected and open-typed matches without a catch-all correctly
+/// report as falling-through.
+fn body_always_exits_aware(c: &Checker, stmts: &[Stmt]) -> bool {
+    stmts.last().is_some_and(|s| stmt_always_exits_aware(c, s))
+}
+
+fn stmt_always_exits_aware(c: &Checker, stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Return(_) | Stmt::Raise(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
+        Stmt::If(s) => {
+            body_always_exits_aware(c, &s.body)
+                && elif_else_chain_always_exits_aware(c, &s.elif_else_clauses)
+        }
+        Stmt::Match(m) => match_arms_always_exit_aware(c, m),
+        _ => false,
+    }
+}
+
+fn elif_else_chain_always_exits_aware(
+    c: &Checker,
+    clauses: &[ruff_python_ast::ElifElseClause],
+) -> bool {
+    let has_terminal_else = clauses.iter().any(|c| c.test.is_none());
+    if !has_terminal_else {
+        return false;
+    }
+    clauses
+        .iter()
+        .all(|cl| body_always_exits_aware(c, &cl.body))
 }
 
 /// Recursively check the `elif`/`else` cascade of a [`StmtIf`].  Each
@@ -3721,7 +4071,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         .as_deref()
                         .and_then(|n| c.function_arity_info.get(n))
                         .cloned();
-                    let count_ok = if let Some(info) = arity_info.as_ref() {
+                    let arity_outcome = if let Some(info) = arity_info.as_ref() {
                         check_arity_with_info(info, pos_args, kw_args)
                     } else {
                         // No name-keyed arity info — this is a method
@@ -3733,30 +4083,77 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         // cover the rest), and require ≥ params.len()
                         // when the function is variadic.
                         let total = pos_args.len() + kw_args.len();
-                        if variadic {
+                        let ok = if variadic {
                             total >= params.len()
                         } else {
                             total <= params.len()
+                        };
+                        if ok {
+                            ArityCheck::Ok
+                        } else {
+                            ArityCheck::Other
                         }
                     };
-                    if !count_ok {
-                        let name = fn_name.clone().unwrap_or_else(|| "<call>".to_owned());
-                        c.wrong_args(&name, params.len(), pos_args.len(), call_span);
+                    match arity_outcome {
+                        ArityCheck::Ok => {}
+                        ArityCheck::UnknownKwarg {
+                            name,
+                            candidates,
+                            span,
+                        } => {
+                            // FINDINGS #80: a typo'd kwarg surfaces a
+                            // dedicated `tyc::unknown_kwarg` with the
+                            // closest candidate, not an arg-count miscount.
+                            let suggestion = suggest_candidate(&name, &candidates);
+                            let fn_label = fn_name.clone().unwrap_or_else(|| "<call>".to_owned());
+                            c.unknown_kwarg(&fn_label, &name, suggestion, span);
+                        }
+                        ArityCheck::Other => {
+                            let name = fn_name.clone().unwrap_or_else(|| "<call>".to_owned());
+                            c.wrong_args(&name, params.len(), pos_args.len(), call_span);
+                        }
                     }
                     // Argument type checks (per-pair, ignoring excess).
                     // Each argument is inferred with the corresponding
                     // formal as its expected type so empty-collection
                     // literals (`[]`, `{}`) and nested generic calls pick
                     // up the parameter's element types.
+                    //
+                    // FINDINGS #86: when the function has `*args`, only
+                    // the first `positional_count` pos_args are paired
+                    // with the structural `params` slice (which is
+                    // `posonlyargs + args + kwonlyargs` flattened);
+                    // beyond that, the remaining positional args are
+                    // absorbed by `*args` and must be checked against
+                    // its element type instead of the kw-only
+                    // parameter that would otherwise occupy the slot.
+                    let positional_cutoff = arity_info
+                        .as_ref()
+                        .map(|info| info.param_names.len())
+                        .unwrap_or(params.len());
+                    let vararg_elem_type = arity_info
+                        .as_ref()
+                        .and_then(|info| info.vararg_type.clone());
                     let mut actuals: Vec<Type> = Vec::with_capacity(params.len());
                     if suppresses_missing_await {
                         c.inside_await = c.inside_await.saturating_add(1);
                     }
                     for (i, arg) in pos_args.iter().enumerate() {
-                        if i >= params.len() {
+                        // Pick the right expected type:
+                        // - First `positional_cutoff` pos_args fill the
+                        //   declared positional parameters in order.
+                        // - Beyond that, fall to the vararg element
+                        //   type (if any). With no vararg we just stop
+                        //   — the arity check has already flagged the
+                        //   extra positional.
+                        let expected: Type = if i < positional_cutoff && i < params.len() {
+                            params[i].clone()
+                        } else if let Some(t) = vararg_elem_type.clone() {
+                            t
+                        } else {
                             break;
-                        }
-                        let actual = infer_expr_ctx(c, arg, Some(&params[i]));
+                        };
+                        let actual = infer_expr_ctx(c, arg, Some(&expected));
                         // Check the nullable-use case first: when the actual
                         // is nullable and the parameter is not, `nullable_use`
                         // is the more helpful diagnostic — it points at the
@@ -3764,27 +4161,33 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         // Emitting `type_mismatch` alongside would just be
                         // noise on the same span (FINDINGS #8). Only emit the
                         // type_mismatch when nullable_use isn't going to fire.
-                        let nullable_into_non_nullable =
-                            !params[i].is_nullable() && actual.is_nullable();
+                        //
+                        // Unbound PEP 695 TypeVars are exempt (FINDINGS #69):
+                        // a `def f[T](x: T)` formal can absorb a `None`
+                        // actual at the call site; bidirectional inference
+                        // will bind `T = None` from the expected return.
+                        let nullable_into_non_nullable = !expected.is_nullable()
+                            && actual.is_nullable()
+                            && !matches!(expected, Type::TypeVar(_));
                         if nullable_into_non_nullable {
                             if let Expr::Name(n) = arg {
                                 let span = (
                                     n.range.start().to_usize(),
                                     n.range.start().to_usize() + n.id.as_str().len(),
                                 );
-                                c.nullable_use(n.id.as_str(), &params[i], span);
+                                c.nullable_use(n.id.as_str(), &expected, span);
                             } else {
                                 // Non-name arg (e.g. `greet(find())`) — no
                                 // identifier to point at, fall back to the
                                 // generic mismatch diagnostic.
                                 let span =
                                     (arg.range().start().to_usize(), arg.range().end().to_usize());
-                                c.mismatch(&params[i], &actual, span);
+                                c.mismatch(&expected, &actual, span);
                             }
-                        } else if !c.is_assignable(&params[i], &actual) {
+                        } else if !c.is_assignable(&expected, &actual) {
                             let span =
                                 (arg.range().start().to_usize(), arg.range().end().to_usize());
-                            c.mismatch(&params[i], &actual, span);
+                            c.mismatch(&expected, &actual, span);
                         }
                         actuals.push(actual);
                     }
@@ -3922,11 +4325,36 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     if let Some(tparams) = c.class_type_params.get(&name).cloned() {
                         let mut bindings: HashMap<String, Type> = HashMap::new();
                         // Bidirectional: pin from the surrounding annotation.
-                        if let Some(Type::Generic(exp_name, exp_args)) = expected {
-                            if exp_name == &name && exp_args.len() == tparams.len() {
-                                for (tp, arg) in tparams.iter().zip(exp_args.iter()) {
-                                    bindings.insert(tp.clone(), arg.clone());
+                        // FINDINGS #68: when the expected type is a sealed
+                        // union (or a type alias to one), look for a variant
+                        // whose head matches the class being constructed and
+                        // pin the type parameters from that variant. This
+                        // makes `unwrap(Just(value=5))` for
+                        // `unwrap(m: Maybe[int])` bind T=int from the
+                        // `Just[int]` variant inside `Maybe[int]`.
+                        let expected_unwrapped: Option<Type> = expected.map(|t| c.unwrap_alias(t));
+                        let pinned_args: Option<Vec<Type>> = match expected_unwrapped.as_ref() {
+                            Some(Type::Generic(exp_name, exp_args))
+                                if exp_name == &name && exp_args.len() == tparams.len() =>
+                            {
+                                Some(exp_args.clone())
+                            }
+                            Some(Type::Union(variants)) => variants.iter().find_map(|v| {
+                                let v = c.unwrap_alias(v);
+                                match v {
+                                    Type::Generic(exp_name, exp_args)
+                                        if exp_name == name && exp_args.len() == tparams.len() =>
+                                    {
+                                        Some(exp_args)
+                                    }
+                                    _ => None,
                                 }
+                            }),
+                            _ => None,
+                        };
+                        if let Some(args) = pinned_args {
+                            for (tp, arg) in tparams.iter().zip(args.iter()) {
+                                bindings.insert(tp.clone(), arg.clone());
                             }
                         }
                         // Forward: read each kwarg, match it to the
@@ -4652,6 +5080,406 @@ let r: int = add(1)
         assert!(d.has_errors());
         let msg = format!("{}", d.errors()[0]);
         assert!(msg.contains("wrong number of arguments"), "got {}", msg);
+    }
+
+    // ── FINDINGS #72: bare collection annotations are implicit-any ────
+
+    #[test]
+    fn bare_list_annotation_errors() {
+        let src = "def main() -> None:\n    let xs: list = [1, 2, 3]\n";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ImplicitAny { kind, .. } if kind == "list")),
+            "expected ImplicitAny for `list`; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn bare_dict_annotation_errors() {
+        let src = "def main() -> None:\n    let d: dict = {\"a\": 1}\n";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ImplicitAny { kind, .. } if kind == "dict")),
+            "expected ImplicitAny for `dict`; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn bare_tuple_annotation_errors() {
+        let src = "def main() -> None:\n    let t: tuple = (1, 2)\n";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ImplicitAny { kind, .. } if kind == "tuple")),
+            "expected ImplicitAny for `tuple`; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn parameterised_collection_annotation_is_clean() {
+        // Subscripted forms must NOT fire — they carry explicit element types.
+        let src = "def main() -> None:\n    let xs: list[int] = [1, 2, 3]\n";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ImplicitAny { .. })),
+            "list[int] must not fire implicit_any: {:?}",
+            d.errors()
+        );
+    }
+
+    // ── FINDINGS #68: generic ctor inference from sealed-union target ──
+
+    #[test]
+    fn generic_ctor_pins_tvar_from_sealed_union_target() {
+        let src = "\
+class Just[T]:
+    value: T
+class Nothing:
+    pass
+
+type Maybe[T] = Just[T] | Nothing
+
+def unwrap(m: Maybe[int]) -> int:
+    return 0
+
+let r: int = unwrap(Just(value=5))
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "Just(value=5) under Maybe[int] should pin T=int: {:?}",
+            d.errors()
+        );
+    }
+
+    // ── FINDINGS #69: None as TypeVar value ───────────────────────────
+
+    #[test]
+    fn none_arg_binds_to_typevar() {
+        // FINDINGS #69: `def f[T](x: T) -> T` should accept `None` as
+        // the argument and bind T = None. Pre-fix the call-site
+        // nullable-into-non-nullable check fired because `T` reports
+        // itself as non-nullable.
+        let src = "\
+def f[T](x: T) -> T:
+    return x
+let r: None = f(None)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "None should bind to TypeVar T: {:?}",
+            d.errors()
+        );
+    }
+
+    // ── FINDINGS #86: *args type check vs kw-only ─────────────────────
+
+    #[test]
+    fn varargs_absorb_extra_positionals_against_correct_type() {
+        // Repro: `*args: int` should absorb the trailing `2, 3, 4`
+        // positional args; `sep="-"` matches the kw-only parameter.
+        // Pre-fix, the loop checked `2` against the next listed
+        // parameter (`sep: str`) and emitted a spurious type_mismatch.
+        let src = "\
+def stars(n: int, *args: int, sep: str = \",\", **kwargs: int) -> str:
+    return sep
+let r: str = stars(1, 2, 3, 4, sep=\"-\")
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "*args absorbing positionals must not fire type_mismatch: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn varargs_check_element_type_against_extras() {
+        // When *args is `int`, passing a `str` should still error
+        // (but with the right expected type — the vararg's element type).
+        let src = "\
+def stars(n: int, *args: int) -> int:
+    return n
+let r: int = stars(1, \"bad\")
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { expected, .. } if expected == "int")),
+            "vararg type check should fire when extra arg doesn't match: {:?}",
+            d.errors()
+        );
+    }
+
+    // ── FINDINGS #82: missing-return analysis ─────────────────────────
+
+    #[test]
+    fn missing_return_on_some_paths_errors() {
+        let src = "\
+def maybe_int(x: int) -> int:
+    if x > 0:
+        return x
+";
+        let d = check(src);
+        assert!(d.has_errors(), "expected missing-return diagnostic");
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "expected MissingReturn variant, got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn return_on_every_path_is_clean() {
+        let src = "\
+def f(x: int) -> int:
+    if x > 0:
+        return x
+    return 0
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "every-path return must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn void_function_without_return_is_clean() {
+        let src = "\
+def f() -> None:
+    print(1)
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "void function must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn nullable_return_without_explicit_none_is_clean() {
+        // Declared `int | None`: falling off the end yields `None`,
+        // which is a legal value for the declared type.
+        let src = "\
+def f(x: int) -> int | None:
+    if x > 0:
+        return x
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "T | None must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn interface_stub_body_is_clean() {
+        // Protocol / interface method declarations end in `...` —
+        // missing_return must not fire on a stub body.
+        let src = "\
+interface Drawable:
+    def area(self) -> float:
+        ...
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "interface stub must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn raise_on_fallthrough_is_clean() {
+        // A function that always raises on every path satisfies the
+        // missing-return analysis even without a `return`.
+        let src = "\
+def fail() -> int:
+    raise ValueError(\"x\")
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "raise must satisfy missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn non_exhaustive_match_without_catchall_fires_missing_return() {
+        // Copilot review on PR #68 (tyc-types L3558): a `match` over an
+        // open-typed subject (`int` here) without a `case _:` arm can
+        // fall through at runtime — missing-return must fire even when
+        // every present arm exits.
+        let src = "\
+def f(n: int) -> int:
+    match n:
+        case 0:
+            return 1
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "non-exhaustive match must fire missing_return; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn match_with_catchall_satisfies_missing_return() {
+        let src = "\
+def f(n: int) -> int:
+    match n:
+        case 0:
+            return 1
+        case _:
+            return -1
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "catch-all should satisfy missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn exhaustive_sealed_match_without_wildcard_satisfies_missing_return() {
+        // Sealed-union exhaustiveness over Shape (Circle | Square) is
+        // proven by listing every variant. Missing_return must respect
+        // that and not fire even without a trailing `case _:`.
+        let src = "\
+class Circle:
+    r: float
+class Square:
+    s: float
+
+type Shape = Circle | Square
+
+def area(s: Shape) -> float:
+    match s:
+        case Circle():
+            return 1.0
+        case Square():
+            return 2.0
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "exhaustive sealed-union match should satisfy missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    // ── FINDINGS #80: typo'd kwarg surfaces tyc::unknown_kwarg ────────
+
+    #[test]
+    fn typo_kwarg_emits_unknown_kwarg_with_suggestion() {
+        let src = "\
+def greet(name: str, greeting: str = \"Hello\") -> str:
+    return greeting + \", \" + name
+
+let r: str = greet(\"Amy\", greetinx=\"Hi\")
+";
+        let d = check(src);
+        assert!(d.has_errors());
+        let err = d
+            .errors()
+            .iter()
+            .find(|e| matches!(e, TycError::UnknownKwarg { .. }))
+            .expect("expected UnknownKwarg variant");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("greetinx") && msg.contains("greet"),
+            "headline should name kwarg and function; got: {msg}"
+        );
+        // The suggestion should pick up the close match `greeting`.
+        if let TycError::UnknownKwarg { suggestion, .. } = err {
+            assert!(
+                suggestion.contains("greeting"),
+                "suggestion should propose `greeting`; got: {suggestion}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_kwarg_lists_candidates_when_no_close_match() {
+        // Random kwarg that's nowhere near any parameter should fall
+        // back to listing every accepted parameter name.
+        let src = "\
+def greet(name: str, greeting: str = \"Hello\") -> str:
+    return greeting + \", \" + name
+
+let r: str = greet(\"Amy\", xyzzy=\"Hi\")
+";
+        let d = check(src);
+        let err = d
+            .errors()
+            .iter()
+            .find(|e| matches!(e, TycError::UnknownKwarg { .. }))
+            .expect("expected UnknownKwarg variant");
+        if let TycError::UnknownKwarg { suggestion, .. } = err {
+            assert!(
+                suggestion.contains("name") && suggestion.contains("greeting"),
+                "suggestion should list accepted params; got: {suggestion}"
+            );
+        }
+    }
+
+    #[test]
+    fn function_with_double_star_kwarg_accepts_arbitrary_names() {
+        // Functions declared with `**kwargs` should never emit
+        // unknown_kwarg — anything is legal.
+        let src = "\
+def greet(name: str, **extras: str) -> str:
+    return name
+
+let r: str = greet(\"Amy\", weird_name=\"Hi\", another=\"x\")
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UnknownKwarg { .. })),
+            "**kwargs must absorb arbitrary names; got {:?}",
+            d.errors()
+        );
     }
 
     #[test]

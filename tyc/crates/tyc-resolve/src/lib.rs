@@ -14,7 +14,7 @@
 //! expressions remain stable; we use them directly.
 
 use ruff_python_ast::{self as ast, Expr, ModModule, Stmt};
-use ruff_text_size::TextRange;
+use ruff_text_size::{Ranged, TextRange};
 use tyc_diagnostics::{Diagnostics, TycError};
 
 /// Mutability of a binding.
@@ -206,6 +206,382 @@ pub struct LazyImportRemap {
 pub struct ResolvedModule {
     pub scopes: Vec<Scope>,
     pub references: Vec<Reference>,
+}
+
+/// Curated list of Python stdlib top-level module names (root names only;
+/// `os.path` is covered by the `os` entry). Used by
+/// [`check_unknown_modules`] to vet `from X import Y` / `import X` at
+/// check time so a typoed or missing-dep module surfaces before `tyc
+/// build` runs the program. This list is intentionally a static snapshot
+/// of the CPython 3.13 stdlib root-names — the LSP autocomplete table
+/// covers the depth needed for member resolution, but we only need root
+/// matches here.
+pub fn python_stdlib_modules() -> &'static [&'static str] {
+    &[
+        "__future__",
+        "_thread",
+        "abc",
+        "aifc",
+        "argparse",
+        "array",
+        "ast",
+        "asynchat",
+        "asyncio",
+        "asyncore",
+        "atexit",
+        "audioop",
+        "base64",
+        "bdb",
+        "binascii",
+        "bisect",
+        "builtins",
+        "bz2",
+        "calendar",
+        "cgi",
+        "cgitb",
+        "chunk",
+        "cmath",
+        "cmd",
+        "code",
+        "codecs",
+        "codeop",
+        "collections",
+        "colorsys",
+        "compileall",
+        "concurrent",
+        "configparser",
+        "contextlib",
+        "contextvars",
+        "copy",
+        "copyreg",
+        "crypt",
+        "csv",
+        "ctypes",
+        "curses",
+        "dataclasses",
+        "datetime",
+        "dbm",
+        "decimal",
+        "difflib",
+        "dis",
+        "distutils",
+        "doctest",
+        "email",
+        "encodings",
+        "ensurepip",
+        "enum",
+        "errno",
+        "faulthandler",
+        "fcntl",
+        "filecmp",
+        "fileinput",
+        "fnmatch",
+        "fractions",
+        "ftplib",
+        "functools",
+        "gc",
+        "genericpath",
+        "getopt",
+        "getpass",
+        "gettext",
+        "glob",
+        "graphlib",
+        "grp",
+        "gzip",
+        "hashlib",
+        "heapq",
+        "hmac",
+        "html",
+        "http",
+        "idlelib",
+        "imaplib",
+        "imghdr",
+        "imp",
+        "importlib",
+        "inspect",
+        "io",
+        "ipaddress",
+        "itertools",
+        "json",
+        "keyword",
+        "lib2to3",
+        "linecache",
+        "locale",
+        "logging",
+        "lzma",
+        "mailbox",
+        "mailcap",
+        "marshal",
+        "math",
+        "mimetypes",
+        "mmap",
+        "modulefinder",
+        "msilib",
+        "msvcrt",
+        "multiprocessing",
+        "netrc",
+        "nis",
+        "nntplib",
+        "ntpath",
+        "numbers",
+        "opcode",
+        "operator",
+        "optparse",
+        "os",
+        "ossaudiodev",
+        "parser",
+        "pathlib",
+        "pdb",
+        "pickle",
+        "pickletools",
+        "pipes",
+        "pkgutil",
+        "platform",
+        "plistlib",
+        "poplib",
+        "posix",
+        "posixpath",
+        "pprint",
+        "profile",
+        "pstats",
+        "pty",
+        "pwd",
+        "py_compile",
+        "pyclbr",
+        "pydoc",
+        "queue",
+        "quopri",
+        "random",
+        "re",
+        "readline",
+        "reprlib",
+        "resource",
+        "rlcompleter",
+        "runpy",
+        "sched",
+        "secrets",
+        "select",
+        "selectors",
+        "shelve",
+        "shlex",
+        "shutil",
+        "signal",
+        "site",
+        "smtpd",
+        "smtplib",
+        "sndhdr",
+        "socket",
+        "socketserver",
+        "spwd",
+        "sqlite3",
+        "sre_compile",
+        "sre_constants",
+        "sre_parse",
+        "ssl",
+        "stat",
+        "statistics",
+        "string",
+        "stringprep",
+        "struct",
+        "subprocess",
+        "sunau",
+        "symtable",
+        "sys",
+        "sysconfig",
+        "syslog",
+        "tabnanny",
+        "tarfile",
+        "telnetlib",
+        "tempfile",
+        "termios",
+        "test",
+        "textwrap",
+        "threading",
+        "time",
+        "timeit",
+        "tkinter",
+        "token",
+        "tokenize",
+        "tomllib",
+        "trace",
+        "traceback",
+        "tracemalloc",
+        "tty",
+        "turtle",
+        "turtledemo",
+        "types",
+        "typing",
+        "unicodedata",
+        "unittest",
+        "urllib",
+        "uu",
+        "uuid",
+        "venv",
+        "warnings",
+        "wave",
+        "weakref",
+        "webbrowser",
+        "winreg",
+        "winsound",
+        "wsgiref",
+        "xdrlib",
+        "xml",
+        "xmlrpc",
+        "zipapp",
+        "zipfile",
+        "zipimport",
+        "zlib",
+        "zoneinfo",
+    ]
+}
+
+/// Vet a module's imports against a set of resolvable module names and
+/// emit `tyc::unknown_module` warnings for any unresolvable root.
+///
+/// `project_modules` should contain the dotted-name form of every `.ty`
+/// file in the project (`src/main.ty` → `"main"`, `src/pkg/sub.ty` →
+/// `"pkg.sub"`). The function compares the *root* of each imported
+/// module against:
+///
+/// - the Python stdlib whitelist returned by [`python_stdlib_modules`],
+/// - the Typhon-bundled `typhon_runtime` package,
+/// - any project module whose dotted-name has the import's root as a
+///   prefix segment (so an `import pkg` resolves both `pkg/__init__.ty`
+///   and `pkg.sub` projects),
+/// - the optional `extra_modules` list, which `tyc check` populates from
+///   `typhon.toml` dependencies plus a permissive fallback for
+///   third-party packages (anything explicitly listed is assumed to
+///   resolve at runtime).
+///
+/// Unknown roots produce a warning (not an error) so existing programs
+/// that depend on quietly-installed sibling packages keep building;
+/// callers can promote the warning via strictness if desired. FINDINGS #79.
+pub fn check_unknown_modules(
+    path: &str,
+    source: &str,
+    module: &ruff_python_ast::ModModule,
+    project_modules: &[String],
+    extra_modules: &[String],
+) -> Diagnostics {
+    use ruff_python_ast::Stmt;
+
+    let mut diags = Diagnostics::new();
+    let stdlib: std::collections::HashSet<&str> = python_stdlib_modules().iter().copied().collect();
+    let project_roots: std::collections::HashSet<&str> = project_modules
+        .iter()
+        .map(|m| m.split('.').next().unwrap_or(m.as_str()))
+        .collect();
+    let extra_roots: std::collections::HashSet<&str> = extra_modules
+        .iter()
+        .map(|m| m.split('.').next().unwrap_or(m.as_str()))
+        .collect();
+    let is_resolvable = |module_name: &str| -> bool {
+        let root = module_name.split('.').next().unwrap_or(module_name);
+        if root.is_empty() || root.starts_with('_') {
+            // Bare `from . import sibling`, dunder names, or relative imports —
+            // not vettable here, trust the build.
+            return true;
+        }
+        root == "typhon_runtime"
+            || stdlib.contains(root)
+            || project_roots.contains(root)
+            || extra_roots.contains(root)
+    };
+
+    fn walk(
+        stmts: &[Stmt],
+        path: &str,
+        source: &str,
+        is_resolvable: &dyn Fn(&str) -> bool,
+        diags: &mut Diagnostics,
+    ) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Import(imp) => {
+                    for alias in &imp.names {
+                        let module_name = alias.name.as_str();
+                        if !is_resolvable(module_name) {
+                            let span =
+                                (alias.range.start().to_usize(), alias.range.end().to_usize());
+                            let length = span.1.saturating_sub(span.0).max(1);
+                            diags.push_warning(TycError::unknown_module(
+                                module_name,
+                                path,
+                                source,
+                                span.0,
+                                length,
+                            ));
+                        }
+                    }
+                }
+                Stmt::ImportFrom(imp) => {
+                    if imp.level > 0 {
+                        // Relative imports (`from .sibling import X`) —
+                        // skip; we don't model relative path resolution
+                        // at this layer.
+                        continue;
+                    }
+                    if let Some(module_name) = imp.module.as_ref() {
+                        let name = module_name.as_str();
+                        if !is_resolvable(name) {
+                            let span = (
+                                module_name.range.start().to_usize(),
+                                module_name.range.end().to_usize(),
+                            );
+                            let length = span.1.saturating_sub(span.0).max(1);
+                            diags.push_warning(TycError::unknown_module(
+                                name, path, source, span.0, length,
+                            ));
+                        }
+                    }
+                }
+                Stmt::FunctionDef(f) => walk(&f.body, path, source, is_resolvable, diags),
+                Stmt::ClassDef(c) => walk(&c.body, path, source, is_resolvable, diags),
+                Stmt::If(s) => {
+                    walk(&s.body, path, source, is_resolvable, diags);
+                    for c in &s.elif_else_clauses {
+                        walk(&c.body, path, source, is_resolvable, diags);
+                    }
+                }
+                Stmt::Try(s) => {
+                    walk(&s.body, path, source, is_resolvable, diags);
+                    walk(&s.orelse, path, source, is_resolvable, diags);
+                    walk(&s.finalbody, path, source, is_resolvable, diags);
+                    // Try handlers' bodies aren't otherwise reached — an
+                    // `import X` inside an `except ImportError:` block is
+                    // legitimate and must be vetted.
+                    for handler in &s.handlers {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = handler;
+                        walk(&h.body, path, source, is_resolvable, diags);
+                    }
+                }
+                // Loop / context-manager / pattern-match bodies can carry
+                // imports too — `with importlib.util.LazyLoader(...): import x`
+                // is unusual but legal Python. Walk every nested body so
+                // missed module diagnostics fire consistently regardless of
+                // surrounding statement kind. (gemini-code-assist review on
+                // PR #68, file tyc-resolve/src/lib.rs L382.)
+                Stmt::For(s) => {
+                    walk(&s.body, path, source, is_resolvable, diags);
+                    walk(&s.orelse, path, source, is_resolvable, diags);
+                }
+                Stmt::While(s) => {
+                    walk(&s.body, path, source, is_resolvable, diags);
+                    walk(&s.orelse, path, source, is_resolvable, diags);
+                }
+                Stmt::With(s) => walk(&s.body, path, source, is_resolvable, diags),
+                Stmt::Match(s) => {
+                    for case in &s.cases {
+                        walk(&case.body, path, source, is_resolvable, diags);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    walk(&module.body, path, source, &is_resolvable, &mut diags);
+    diags
 }
 
 impl ResolvedModule {
@@ -553,13 +929,28 @@ impl<'a> Resolver<'a> {
             }
             if !found && !builtins.contains(&r.name.as_str()) {
                 let length = r.span.1.saturating_sub(r.span.0).max(1);
-                self.diagnostics.push_error(TycError::unknown_name(
-                    r.name.clone(),
-                    &self.path,
-                    self.source,
-                    r.span.0,
-                    length,
-                ));
+                // `self` is special: it's only legal inside an `impl`
+                // method body, so an unresolved reference deserves a
+                // dedicated diagnostic that explains the rule rather
+                // than the generic "declare with `let`/`mut`" help
+                // (which would mislead the user — `let self = ...`
+                // does not solve the problem). FINDINGS #90.
+                if r.name == "self" {
+                    self.diagnostics.push_error(TycError::self_outside_impl(
+                        &self.path,
+                        self.source,
+                        r.span.0,
+                        length,
+                    ));
+                } else {
+                    self.diagnostics.push_error(TycError::unknown_name(
+                        r.name.clone(),
+                        &self.path,
+                        self.source,
+                        r.span.0,
+                        length,
+                    ));
+                }
             }
         }
     }
@@ -625,6 +1016,61 @@ impl<'a> Resolver<'a> {
                 }
             }
         }
+    }
+
+    /// Advice-level diagnostic for FINDINGS #92: a top-level
+    /// `def main() -> None:` is defined but `main` is never
+    /// referenced anywhere in the module. The script will compile
+    /// and run without output, which is almost always a mistake —
+    /// the canonical Python entry pattern is
+    /// `if __name__ == "__main__": main()`.
+    ///
+    /// Suppressed when `main` is referenced (even from a comment-
+    /// stripped `if` block), or when the module also defines a
+    /// classifier name like `__all__` that would suggest a library
+    /// shape (in which case the user is exporting `main` rather
+    /// than running it).
+    fn report_main_not_called(&mut self) {
+        // Find the module-level `main` binding, if any. Module scope is
+        // scope id 0.
+        let module_scope = &self.scopes[0];
+        let main_binding = match module_scope
+            .bindings
+            .iter()
+            .find(|b| b.name == "main" && b.kind == BindingKind::Function)
+        {
+            Some(b) => b.clone(),
+            None => return,
+        };
+        // Suppress when the module looks like a library (has `__all__`).
+        if module_scope.bindings.iter().any(|b| b.name == "__all__") {
+            return;
+        }
+        // Any reference to `main` other than the def site counts as a
+        // use. References track only call sites and bare-name reads,
+        // not the def site itself.
+        let has_use = self
+            .references
+            .iter()
+            .any(|r| r.name == "main" && r.span != main_binding.span);
+        if has_use {
+            return;
+        }
+        let length = main_binding
+            .span
+            .1
+            .saturating_sub(main_binding.span.0)
+            .max(1);
+        // Stored as a warning so it flows through the existing
+        // Diagnostics channels; the diagnostic itself carries
+        // `severity(Advice)` so miette renders it as advice rather
+        // than warning when displayed.
+        self.diagnostics.push_warning(TycError::main_not_called(
+            &self.path,
+            self.source,
+            main_binding.span.0,
+            length,
+        ));
     }
 
     /// Translate a preprocessed-source byte offset to a 0-based line
@@ -697,6 +1143,7 @@ pub fn resolve_module_with(
 
     r.report_unknown_names();
     r.report_unused_imports();
+    r.report_main_not_called();
 
     let resolved = ResolvedModule {
         scopes: std::mem::take(&mut r.scopes),
@@ -771,7 +1218,14 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt]) {
                 }
             }
             Stmt::AnnAssign(a) => {
-                declare_target(r, scope, &a.target, default_val, a.mutability);
+                // FINDINGS #91: an annotated declaration without an
+                // initialiser is a user error — skip the declaration
+                // so the second pass can emit `tyc::missing_initialiser`
+                // without also tripping `tyc::immutable_assign` on the
+                // user's subsequent `x = <expr>` reassignment.
+                if !(a.value.is_none() && a.mutability.is_some()) {
+                    declare_target(r, scope, &a.target, default_val, a.mutability);
+                }
             }
             _ => {}
         }
@@ -854,6 +1308,36 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt]) {
                         alias.range.start().to_usize(),
                         alias.range.start().to_usize() + name.as_str().len(),
                     );
+                    // Typhon-specific rejections for `from typing import X`:
+                    //   - TypeVar: use PEP 695 `[T]` syntax instead (FINDINGS #73).
+                    //   - List/Dict/Tuple/Set/FrozenSet/Type: use the
+                    //     lowercase built-in form (FINDINGS #74).
+                    if module.as_deref() == Some("typing") {
+                        let imported = alias.name.as_str();
+                        let imported_span = (
+                            alias.range.start().to_usize(),
+                            alias.range.start().to_usize() + imported.len(),
+                        );
+                        let length = imported_span.1.saturating_sub(imported_span.0).max(1);
+                        if imported == "TypeVar" {
+                            r.diagnostics.push_error(TycError::typevar_import_rejected(
+                                &r.path,
+                                r.source,
+                                imported_span.0,
+                                length,
+                            ));
+                        } else if let Some(lower) = lowercase_typing_alias(imported) {
+                            r.diagnostics
+                                .push_warning(TycError::typing_alias_deprecated(
+                                    imported,
+                                    lower,
+                                    &r.path,
+                                    r.source,
+                                    imported_span.0,
+                                    length,
+                                ));
+                        }
+                    }
                     r.declare_with(
                         scope,
                         name.as_str(),
@@ -886,6 +1370,34 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt]) {
             }
             _ => {}
         }
+    }
+}
+
+/// Slice `source` against a `TextRange`, returning `None` if the range
+/// falls outside the source's byte bounds. Used to recover the surface
+/// text of a node for inclusion in diagnostic messages.
+fn source_slice(source: &str, range: TextRange) -> Option<&str> {
+    let start = range.start().to_usize();
+    let end = range.end().to_usize();
+    if end > source.len() || start > end {
+        return None;
+    }
+    source.get(start..end)
+}
+
+/// Map a capitalised `typing.<Name>` alias to its lowercase built-in
+/// equivalent, when the built-in form exists. Returns `None` for typing
+/// names that aren't a direct alias of a Python built-in (e.g. `Optional`,
+/// `Union`, `Callable` — those have their own Typhon-native shapes).
+fn lowercase_typing_alias(name: &str) -> Option<&'static str> {
+    match name {
+        "List" => Some("list"),
+        "Dict" => Some("dict"),
+        "Tuple" => Some("tuple"),
+        "Set" => Some("set"),
+        "FrozenSet" => Some("frozenset"),
+        "Type" => Some("type"),
+        _ => None,
     }
 }
 
@@ -945,6 +1457,40 @@ fn declare_target(
                     n.id.as_str().len().max(1),
                 ));
             }
+            // FINDINGS #76: when the user writes a fresh `let`/`mut`
+            // binding for a name that was previously declared with an
+            // explicit `let`/`mut` in this function scope, they almost
+            // certainly mean block-scoped shadowing — which Python
+            // doesn't support (names are function-scoped). Surface a
+            // dedicated `tyc::no_block_shadow` with help that tells
+            // the user to pick a different name. Otherwise the user
+            // would get a generic `tyc::immutable_assign` whose
+            // "change `let` to `mut`" suggestion is wrong for
+            // shadowing intent.
+            //
+            // Only fire when the existing binding is also a value
+            // declaration (`BindingKind::Value`). A parameter / loop
+            // target / import / function / class re-declaration is a
+            // separate problem and not what this finding is about.
+            if ast_mutability.is_some() {
+                if let Some(existing) = r.lookup_local(scope, n.id.as_str()) {
+                    if existing.kind == BindingKind::Value {
+                        let decl_span = existing.span;
+                        if decl_span != span && r.seen_immutable_redecl.insert((decl_span, span)) {
+                            r.diagnostics.push_error(TycError::no_block_shadow(
+                                n.id.as_str(),
+                                &r.path,
+                                r.source,
+                                decl_span.0,
+                                decl_span.1.saturating_sub(decl_span.0).max(1),
+                                span.0,
+                                span.1.saturating_sub(span.0).max(1),
+                            ));
+                        }
+                        return;
+                    }
+                }
+            }
             let mutability = match ast_mutability {
                 Some(ast::Mutability::Let) => Mutability::Let,
                 Some(ast::Mutability::Mut) => Mutability::Mut,
@@ -989,6 +1535,11 @@ fn declare_target(
 /// Loop / context-manager targets aren't subject to Rule 2 (the `for`/`with`
 /// keyword itself introduces the binding), so this helper does not emit
 /// `tyc::missing_binding_kind` like `declare_target` does for bare assignments.
+///
+/// Targets are declared as `Mutability::Let` (FINDINGS #75): the loop
+/// itself rebinds the target each iteration through its own mechanism,
+/// but a user-written `i = i + 1` inside the body is a Rule 2 violation
+/// and now surfaces as `tyc::immutable_assign`.
 fn declare_loop_target(r: &mut Resolver, scope: ScopeId, target: &Expr) {
     match target {
         Expr::Name(n) => {
@@ -1000,7 +1551,7 @@ fn declare_loop_target(r: &mut Resolver, scope: ScopeId, target: &Expr) {
                 scope,
                 n.id.as_str(),
                 BindingKind::Loop,
-                Mutability::Mut,
+                Mutability::Let,
                 span,
             );
         }
@@ -1146,9 +1697,53 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
                 walk_expr(r, scope, v);
             }
             walk_expr(r, scope, &a.annotation);
+            // FINDINGS #91: `let NAME: T` (or `mut NAME: T`) without an
+            // initialiser produces a confusing immutable-assign error
+            // when the user later writes `NAME = <expr>`. Reject the
+            // declare-only form up front with a clear message that
+            // tells the user to inline the initialiser. Bare AnnAssign
+            // (no explicit `let`/`mut` keyword) is left alone because
+            // class-body field declarations (`name: str`) and dataclass
+            // attribute annotations legitimately omit initialisers.
+            let missing_init = a.value.is_none() && a.mutability.is_some();
+            if missing_init {
+                if let Expr::Name(n) = a.target.as_ref() {
+                    let keyword = match a.mutability {
+                        Some(ast::Mutability::Let) => "let",
+                        Some(ast::Mutability::Mut) => "mut",
+                        None => unreachable!(),
+                    };
+                    let annotation = source_slice(r.source, a.annotation.range())
+                        .unwrap_or("<type>")
+                        .to_owned();
+                    let span = (a.range.start().to_usize(), a.range.end().to_usize());
+                    let length = span.1.saturating_sub(span.0).max(1);
+                    r.diagnostics.push_error(TycError::missing_initialiser(
+                        keyword,
+                        n.id.as_str(),
+                        annotation,
+                        &r.path,
+                        r.source,
+                        span.0,
+                        length,
+                    ));
+                }
+            }
             if let Expr::Name(_) = a.target.as_ref() {
                 let default_val = r.scopes[scope].kind == ScopeKind::Module;
-                declare_target(r, scope, &a.target, default_val, a.mutability);
+                // When the initialiser is missing (FINDINGS #91), suppress
+                // the declaration entirely. Otherwise a later `x = 5`
+                // would either fire a redundant `tyc::immutable_assign`
+                // (the misleading cascade the finding is about) or — for
+                // `mut` — pretend the assignment was the first
+                // initialiser, masking the original mistake. The
+                // missing_initialiser error already tells the user what
+                // to do; downstream references to the un-declared name
+                // (`x` on subsequent lines) will produce the standard
+                // unknown-name flow.
+                if !missing_init {
+                    declare_target(r, scope, &a.target, default_val, a.mutability);
+                }
             }
         }
         Stmt::AugAssign(a) => {
@@ -2095,18 +2690,52 @@ def foo():
     #[test]
     fn duplicate_let_emits_one_diagnostic() {
         // The resolver double-visits each body (pre-collect + walk_stmt);
-        // a re-declaration must only be reported once.
+        // a re-declaration must only be reported once. Since FINDINGS
+        // #76, `let x = 1; let x = 2` surfaces `tyc::no_block_shadow`
+        // (a clearer diagnostic for the shadowing case) instead of the
+        // generic `tyc::immutable_assign`.
         let (_m, d) = resolve("let x = 1\nlet x = 2\n");
-        let immutable_errors: Vec<_> = d
+        let shadow_errors: Vec<_> = d
             .errors()
             .iter()
-            .filter(|e| format!("{}", e).contains("cannot assign to immutable binding 'x'"))
+            .filter(|e| matches!(e, TycError::NoBlockShadow { .. }))
             .collect();
         assert_eq!(
-            immutable_errors.len(),
+            shadow_errors.len(),
             1,
-            "expected exactly one immutable_assign diagnostic, got {}: {:?}",
-            immutable_errors.len(),
+            "expected exactly one no_block_shadow diagnostic, got {}: {:?}",
+            shadow_errors.len(),
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn block_let_shadow_uses_dedicated_diagnostic() {
+        // FINDINGS #76: a `let` declaration inside an `if`/`while`/`for`
+        // block that names an outer binding is shadowing intent, not a
+        // re-assignment. Surface `tyc::no_block_shadow` so the help text
+        // can explain Python's function-level scoping.
+        let src = "def main() -> None:\n\
+                   \x20   let x: int = 1\n\
+                   \x20   if True:\n\
+                   \x20       let x: str = \"hi\"\n\
+                   \x20       print(x)\n";
+        let (_m, d) = resolve(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NoBlockShadow { name, .. } if name == "x")),
+            "expected NoBlockShadow on inner `let x`; got {:?}",
+            d.errors()
+        );
+        // The generic immutable-assign diagnostic should NOT also fire —
+        // the no-block-shadow path returns early after recording the
+        // dedicated error.
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ImmutableAssign { .. })),
+            "shadowing must not also fire immutable_assign: {:?}",
             d.errors()
         );
     }
@@ -2117,6 +2746,330 @@ def foo():
         assert!(d.has_errors());
         let msg = format!("{}", d.errors()[0]);
         assert!(msg.contains("cannot find 'z'"), "got {}", msg);
+    }
+
+    #[test]
+    fn main_defined_but_not_called_warns() {
+        // FINDINGS #92: a top-level `def main()` with no call site
+        // should produce the `tyc::main_not_called` advice diagnostic
+        // (stored as a warning).
+        let (_m, d) = resolve("def main() -> None:\n    print(\"hi\")\n");
+        assert!(
+            d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::MainNotCalled { .. })),
+            "expected MainNotCalled warning; got {:?}",
+            d.warnings()
+        );
+    }
+
+    #[test]
+    fn main_called_at_module_level_is_clean() {
+        let src = "def main() -> None:\n\
+                   \x20   print(\"hi\")\n\
+                   \n\
+                   if __name__ == \"__main__\":\n\
+                   \x20   main()\n";
+        let (_m, d) = resolve(src);
+        assert!(
+            !d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::MainNotCalled { .. })),
+            "main() in __name__ block must suppress the diagnostic: {:?}",
+            d.warnings()
+        );
+    }
+
+    #[test]
+    fn module_with_all_export_suppresses_main_not_called() {
+        // Library shape: `__all__` lists exported names. A `main`
+        // declared for export shouldn't trigger the advice.
+        let src = "__all__ = [\"main\"]\n\
+                   def main() -> None:\n\
+                   \x20   print(\"hi\")\n";
+        let (_m, d) = resolve(src);
+        assert!(
+            !d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::MainNotCalled { .. })),
+            "module with __all__ must suppress the diagnostic: {:?}",
+            d.warnings()
+        );
+    }
+
+    fn parse_module(src: &str) -> ruff_python_ast::ModModule {
+        tyc_syntax::parse_module(src).unwrap().into_syntax()
+    }
+
+    #[test]
+    fn unknown_module_warns_when_root_not_resolvable() {
+        // FINDINGS #79: `from other import helper` where `other` is
+        // neither in stdlib, the project, nor a declared dep.
+        let module = parse_module("from other import helper\n");
+        let diags = check_unknown_modules("t.ty", "from other import helper\n", &module, &[], &[]);
+        assert!(
+            diags
+                .warnings()
+                .iter()
+                .any(|e| matches!(e, TycError::UnknownModule { module, .. } if module == "other")),
+            "expected UnknownModule warning; got {:?}",
+            diags.warnings()
+        );
+    }
+
+    #[test]
+    fn stdlib_module_is_clean() {
+        let module = parse_module("import os\nfrom collections import defaultdict\n");
+        let diags = check_unknown_modules(
+            "t.ty",
+            "import os\nfrom collections import defaultdict\n",
+            &module,
+            &[],
+            &[],
+        );
+        assert!(
+            diags.warnings().is_empty(),
+            "stdlib modules must not warn; got {:?}",
+            diags.warnings()
+        );
+    }
+
+    #[test]
+    fn project_module_is_clean() {
+        // A `from pkg.sub import foo` is OK when "pkg" appears in the
+        // project module list (the root is what we vet).
+        let module = parse_module("from pkg.sub import foo\n");
+        let diags = check_unknown_modules(
+            "t.ty",
+            "from pkg.sub import foo\n",
+            &module,
+            &["pkg.sub".to_string()],
+            &[],
+        );
+        assert!(
+            diags.warnings().is_empty(),
+            "project module must not warn; got {:?}",
+            diags.warnings()
+        );
+    }
+
+    #[test]
+    fn typhon_runtime_is_clean() {
+        let module = parse_module("from typhon_runtime.lazy import lazy_let\n");
+        let diags = check_unknown_modules(
+            "t.ty",
+            "from typhon_runtime.lazy import lazy_let\n",
+            &module,
+            &[],
+            &[],
+        );
+        assert!(diags.warnings().is_empty(), "{:?}", diags.warnings());
+    }
+
+    #[test]
+    fn declared_dependency_is_clean() {
+        let module = parse_module("from pandas import DataFrame\n");
+        let diags = check_unknown_modules(
+            "t.ty",
+            "from pandas import DataFrame\n",
+            &module,
+            &[],
+            &["pandas".to_string()],
+        );
+        assert!(diags.warnings().is_empty(), "{:?}", diags.warnings());
+    }
+
+    #[test]
+    fn relative_import_does_not_warn() {
+        // Relative imports (`from .sibling import X`) aren't vettable
+        // here — we don't model relative resolution. Just trust them.
+        let module = parse_module("from . import sibling\n");
+        let diags = check_unknown_modules("t.ty", "from . import sibling\n", &module, &[], &[]);
+        assert!(diags.warnings().is_empty(), "{:?}", diags.warnings());
+    }
+
+    #[test]
+    fn imports_in_nested_blocks_are_walked() {
+        // gemini-code-assist review on PR #68 (tyc-resolve L382): the
+        // initial walk skipped `for` / `while` / `with` / `match` /
+        // `try`-handler bodies. Verify each shape surfaces an unknown
+        // module from a nested import.
+        let cases: &[(&str, &str)] = &[
+            ("in `for`", "for x in []:\n    from notamod_for import a\n"),
+            (
+                "in `while`",
+                "while False:\n    from notamod_while import b\n",
+            ),
+            (
+                "in `with`",
+                "with open('x') as f:\n    from notamod_with import c\n",
+            ),
+            (
+                "in `match`",
+                "match 1:\n    case _:\n        from notamod_match import d\n",
+            ),
+            (
+                "in `try` handler",
+                "try:\n    pass\nexcept Exception:\n    from notamod_except import e\n",
+            ),
+        ];
+        for (label, src) in cases {
+            let module = parse_module(src);
+            let diags = check_unknown_modules("t.ty", src, &module, &[], &[]);
+            assert!(
+                diags
+                    .warnings()
+                    .iter()
+                    .any(|e| matches!(e, TycError::UnknownModule { .. })),
+                "expected UnknownModule {label}; got {:?}",
+                diags.warnings()
+            );
+        }
+    }
+
+    #[test]
+    fn typevar_import_is_rejected() {
+        // FINDINGS #73: `from typing import TypeVar` must surface a
+        // dedicated diagnostic that points users at PEP 695 syntax.
+        let (_m, d) = resolve("from typing import TypeVar\n");
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeVarImportRejected { .. })),
+            "expected TypeVarImportRejected variant; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn typing_list_alias_is_warned() {
+        // FINDINGS #74: prefer lowercase `list` over `typing.List`. The
+        // warning anchors on the imported name; the import itself still
+        // succeeds so existing code keeps compiling — projects that
+        // promote warnings to errors will catch it in CI.
+        let (_m, d) = resolve("from typing import List\nlet xs: List[int] = []\n");
+        assert!(
+            d.warnings()
+                .iter()
+                .any(|e| matches!(e, TycError::TypingAliasDeprecated { .. })),
+            "expected TypingAliasDeprecated warning; got warnings={:?} errors={:?}",
+            d.warnings(),
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn typing_optional_is_not_flagged() {
+        // `Optional` / `Union` / `Callable` are not lowercase-aliased —
+        // they have their own Typhon-native shapes (`T?`, `T | U`,
+        // `Callable[[A], B]`), but the import itself is not deprecated.
+        let (_m, d) = resolve("from typing import Optional, Callable\n");
+        assert!(
+            !d.warnings()
+                .iter()
+                .any(|e| matches!(e, TycError::TypingAliasDeprecated { .. })),
+            "Optional/Callable must not trigger the alias warning; got {:?}",
+            d.warnings()
+        );
+    }
+
+    #[test]
+    fn for_loop_target_reassignment_is_rejected() {
+        // FINDINGS #75: the for-loop target is bindable as immutable
+        // (Rule 2) — `i = i + 1` inside the body must error rather
+        // than silently shadowing the loop variable.
+        let src = "def main() -> None:\n\
+                   \x20   let xs: list[int] = [1, 2, 3]\n\
+                   \x20   for i in xs:\n\
+                   \x20       i = i + 1\n";
+        let (_m, d) = resolve(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ImmutableAssign { name, .. } if name == "i")),
+            "expected ImmutableAssign on `i` rebind; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn for_loop_iteration_itself_is_clean() {
+        // Sanity: declaring the target should not itself trip
+        // immutable_assign — only user reassignments inside the body do.
+        let src = "def main() -> None:\n\
+                   \x20   let xs: list[int] = [1, 2, 3]\n\
+                   \x20   for i in xs:\n\
+                   \x20       print(i)\n";
+        let (_m, d) = resolve(src);
+        assert!(
+            !d.has_errors(),
+            "loop without rebind should be clean: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn let_without_initialiser_errors() {
+        // FINDINGS #91: `let x: int` (no `=`) must surface
+        // tyc::missing_initialiser rather than silently accepting the
+        // declaration and then complaining about the user's first
+        // `x = …` assignment as an immutable-assign error.
+        let (_m, d) = resolve("def f() -> None:\n    let x: int\n    x = 5\n");
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingInitialiser { .. })),
+            "expected MissingInitialiser variant; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn mut_without_initialiser_errors() {
+        // Same rule applies to `mut x: int` — the binding has nothing
+        // to bind to. Subsequent `x = 5` would otherwise pass because
+        // `mut` allows re-assignment, but the type-checker treats the
+        // value-less form inconsistently.
+        let (_m, d) = resolve("def f() -> None:\n    mut x: int\n    x = 5\n");
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingInitialiser { .. })),
+            "expected MissingInitialiser for mut; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn class_field_without_initialiser_is_clean() {
+        // Dataclass-style field declarations inside a `class` body
+        // legitimately omit initialisers — the constructor produces
+        // the value, no `= <expr>` is required.
+        let (_m, d) = resolve("class Point:\n    x: int\n    y: int\n");
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingInitialiser { .. })),
+            "class field declaration must not fire missing_initialiser: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn self_outside_impl_uses_dedicated_diagnostic() {
+        // FINDINGS #90: `self` outside an `impl` method body must surface
+        // `tyc::self_outside_impl`, not the generic
+        // `tyc::unknown_name` whose help text would push the user
+        // toward `let self = …` (which doesn't fix the problem).
+        let (_m, d) = resolve("def f() -> int:\n    return self.x\n");
+        assert!(d.has_errors(), "self outside impl must be an error");
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::SelfOutsideImpl { .. })),
+            "expected SelfOutsideImpl variant; got {:?}",
+            d.errors()
+        );
     }
 
     #[test]

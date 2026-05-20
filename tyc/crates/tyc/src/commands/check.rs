@@ -14,9 +14,10 @@ use tyc_analyse::{analyse_purity, evaluate_comptime_with_functions, purity_diagn
 use tyc_db::{check_file, TycDatabase};
 use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_emit::{compare_modules, StubTestKind};
+use tyc_resolve::check_unknown_modules;
 use tyc_syntax::preprocess::{
-    expand_gather_blocks, expand_go_calls, expand_lazy_imports, expand_pipes, expand_question_ops,
-    expand_with_chains, preprocess,
+    expand_gather_blocks, expand_go_calls, expand_lazy_imports, expand_multiline_guards,
+    expand_pipes, expand_question_ops, expand_with_chains, preprocess,
 };
 
 use crate::commands::util::{apply_strictness, collect_dty_files, collect_ty_files};
@@ -67,6 +68,20 @@ pub fn run(args: CheckArgs) -> Result<()> {
     let mut file_count = 0usize;
     let mut db = TycDatabase::new();
 
+    // FINDINGS #79: build the set of dotted module names contained in the
+    // project so the per-file unknown-module check can resolve sibling
+    // imports without falsely flagging them. `extra_modules` adds
+    // typhon.toml-declared dependencies; users who manage deps directly
+    // through `uv`/`pip` can still bypass the check by listing the
+    // package in `typhon.toml`.
+    let project_modules = collect_project_modules(&args.paths, &config.project.src);
+    let extra_modules: Vec<String> = config
+        .dependencies
+        .keys()
+        .chain(config.dev_dependencies.keys())
+        .cloned()
+        .collect();
+
     for root in &args.paths {
         for path in collect_ty_files(root)? {
             file_count += 1;
@@ -90,6 +105,15 @@ pub fn run(args: CheckArgs) -> Result<()> {
             // preprocess so it's cheap on warm runs.
             let analysis_diags = run_analysis_passes(&path.display().to_string(), &source);
             diags.extend(analysis_diags);
+
+            // FINDINGS #79: vet imports against stdlib + project + deps.
+            let module_diags = run_unknown_module_check(
+                &path.display().to_string(),
+                &source,
+                &project_modules,
+                &extra_modules,
+            );
+            diags.extend(module_diags);
         }
 
         // `--stubs`: parse + type-check every `.dty` stub, then compare its
@@ -209,9 +233,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
 /// surface a second time otherwise).
 fn run_analysis_passes(path: &str, source: &str) -> Diagnostics {
     let mut diags = Diagnostics::new();
-    let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
-        &expand_gather_blocks(&expand_lazy_imports(source)),
-    ))));
+    let expanded = expand_for_check(source);
     let prep = preprocess(&expanded);
     let module = match tyc_syntax::parse_module(&prep.python_source) {
         Ok(p) => p.into_syntax(),
@@ -234,14 +256,117 @@ fn run_analysis_passes(path: &str, source: &str) -> Diagnostics {
     diags
 }
 
+/// Collect the dotted-name form of every `.ty` file under the given
+/// `paths`. Used by [`run_unknown_module_check`] to vet sibling imports.
+///
+/// Names are derived by stripping the prefix up to the configured
+/// source-root component (`project.src` in `typhon.toml`, default
+/// `"src"`) and joining the remaining segments with `.`. With the
+/// default, `src/main.ty` becomes `"main"`; `src/pkg/sub.ty` becomes
+/// `"pkg.sub"`; an `__init__.ty` collapses to its parent package name.
+/// Files outside any source-root directory fall back to their basename
+/// so single-file scripts still resolve correctly.
+///
+/// `src_root` is the basename of the configured source directory
+/// (e.g. `"src"` or `"app"`); it's matched by component-equality
+/// against the path. (Copilot review on PR #68, file check.rs:303.)
+fn collect_project_modules(paths: &[PathBuf], src_root: &str) -> Vec<String> {
+    let mut modules: Vec<String> = Vec::new();
+    for root in paths {
+        if let Ok(files) = collect_ty_files(root) {
+            for file in files {
+                let dotted = ty_path_to_dotted(&file, src_root);
+                if !modules.contains(&dotted) {
+                    modules.push(dotted);
+                }
+            }
+        }
+    }
+    modules
+}
+
+fn ty_path_to_dotted(path: &std::path::Path, src_root: &str) -> String {
+    let components: Vec<String> = path
+        .with_extension("")
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(os) => Some(os.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect();
+    // Trim leading source-root component so `<src_root>/main.ty`
+    // becomes `main`. Anything before the source root (an absolute
+    // path's leading directories) is dropped so the dotted-name
+    // reflects the package layout, not the filesystem layout.
+    let src_idx = components.iter().rposition(|c| c == src_root);
+    let tail: Vec<&str> = match src_idx {
+        Some(i) => components[i + 1..].iter().map(|s| s.as_str()).collect(),
+        None => components
+            .last()
+            .map(|s| vec![s.as_str()])
+            .unwrap_or_default(),
+    };
+    // Drop trailing `__init__` so a package directory is named by its
+    // folder, not the init module.
+    let mut tail = tail;
+    if tail.last().is_some_and(|s| *s == "__init__") {
+        tail.pop();
+    }
+    tail.join(".")
+}
+
+/// FINDINGS #79: run `check_unknown_modules` for one source file. Parses
+/// the file through the same preprocess pipeline used elsewhere so
+/// Typhon-specific keywords (`val`, `var`, `lazy import`, …) are stripped
+/// before the AST walk. Returns the warnings only — errors at the
+/// preprocess / parse layer have already been surfaced by `check_file`.
+fn run_unknown_module_check(
+    path: &str,
+    source: &str,
+    project_modules: &[String],
+    extra_modules: &[String],
+) -> Diagnostics {
+    let expanded = expand_for_check(source);
+    let prep = preprocess(&expanded);
+    let module = match tyc_syntax::parse_module(&prep.python_source) {
+        Ok(p) => p.into_syntax(),
+        Err(_) => return Diagnostics::new(),
+    };
+    // AST node ranges are offsets into the *preprocessed* Python source,
+    // so the diagnostic must render against `prep.python_source` for the
+    // span labels to line up. Rendering against the original Typhon
+    // source would print out-of-bounds labels for files that exercise
+    // preprocess rewrites (`interface`, `impl`, `guard`, `lazy import`,
+    // …). (Copilot review on PR #68, file check.rs:337.)
+    check_unknown_modules(
+        path,
+        &prep.python_source,
+        &module,
+        project_modules,
+        extra_modules,
+    )
+}
+
+/// Shared preprocess pipeline used by every "parse the .ty source for a
+/// secondary check pass" call site inside `tyc check`. Centralising the
+/// chain keeps `run_unknown_module_check`, `run_analysis_passes`, and
+/// `parse_for_diff` in sync with `tyc_db::check_file` / `tyc build` —
+/// without this the three call sites diverged on which expansion passes
+/// they ran, and a file using a feature recognised by only some of the
+/// chains would silently skip downstream diagnostics. (Copilot review
+/// on PR #68, file check.rs:332.)
+fn expand_for_check(source: &str) -> String {
+    expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
+        &expand_gather_blocks(&expand_multiline_guards(&expand_lazy_imports(source))),
+    ))))
+}
+
 /// Run the full preprocess + parse pipeline on `source` and return the
 /// resulting Python AST.  Used by the stub diff so that Typhon-specific
 /// syntax (`val`, `var`, `model`, `interface`, `extend`, sugar passes)
 /// is normalised before comparing.
 fn parse_for_diff(source: &str) -> Result<ruff_python_ast::ModModule> {
-    let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
-        &expand_gather_blocks(&expand_lazy_imports(source)),
-    ))));
+    let expanded = expand_for_check(source);
     let prep = preprocess(&expanded);
     tyc_syntax::parse_module(&prep.python_source)
         .map(|p| p.into_syntax())

@@ -350,6 +350,102 @@ bugs. Each is closed below.
 
 ---
 
+## Status as of `claude/review-findings-fixes-VRFJy`
+
+Picks up every remaining open finding and closes all of them except
+the Phase-5 `tyc fmt` deferral.
+
+**Closed in this branch:**
+
+- **#66** `?` in sub-expression — verified the existing
+  `validate_question_ops` already surfaces `tyc::invalid_question_op`
+  on the user's source with crisp help text. Took option 2
+  (documented limitation); option 1 (lift `?` to sub-expressions)
+  remains future work.
+
+- **#68** Generic-ctor inference from sealed-union target — the
+  `Type::Class(name)` arm now unwraps the expected type through
+  type aliases and walks `Type::Union` variants for one whose head
+  matches the class being constructed.
+
+- **#69** `None` as TypeVar value — added a
+  `!matches!(expected, Type::TypeVar(_))` carve-out so the
+  nullable-into-non-nullable check no longer fires for an unbound
+  generic formal.
+
+- **#72** Bare `list` / `dict` / `tuple` annotations — added
+  `tyc::implicit_any` from the `Stmt::AnnAssign` arm via
+  `bare_collection_name`.
+
+- **#73** `from typing import TypeVar` — added
+  `tyc::typevar_import_rejected` to the resolver's
+  `Stmt::ImportFrom` arm.
+
+- **#74** `typing.List` / `Dict` / `Tuple` / `Set` / `FrozenSet` /
+  `Type` — added `tyc::typing_alias_deprecated` warning.
+
+- **#75** For-loop target re-assignment — `declare_loop_target`
+  now binds the target as `Mutability::Let`.
+
+- **#76** Block-level shadowing — added `tyc::no_block_shadow`
+  with help that explains Python's function-level scoping.
+
+- **#79** Missing module at check time — added
+  `tyc::unknown_module`, a curated CPython 3.13 stdlib whitelist,
+  and a `check_unknown_modules` helper that `tyc check` calls
+  with the project module list + typhon.toml deps.
+
+- **#80** Wrong kwarg name — added `tyc::unknown_kwarg` with
+  Levenshtein-best "did you mean" suggestion via a structured
+  `ArityCheck` enum.
+
+- **#82** Missing return — added `tyc::missing_return`; the new
+  `match_arms_always_exit` helper handles exhaustive matches and
+  stub bodies (`pass`, `...`, docstring-only) are exempt for
+  `interface` (Protocol) declarations.
+
+- **#84** `lazy let` runtime emission — verified the existing
+  `is_typhon_runtime_module` fix correctly fires `needs_runtime`
+  for the `from typhon_runtime.lazy import lazy_let` header.
+
+- **#86** `*args` type check vs kw-only — the arg-type loop uses
+  `arity_info.param_names.len()` as the positional-vs-vararg
+  cutoff; pos_args beyond that are checked against the vararg's
+  declared element type.
+
+- **#87** Comptime help text — updated to list the full
+  documented surface (containers, comparisons, ternaries, str
+  methods, `comptime def` calls).
+
+- **#88** Comptime subscript — added an `Expr::Subscript` arm to
+  the evaluator; lists / tuples / strs index by integer (with
+  Python negative-from-end), dicts by any equality-comparable key.
+
+- **#89** Decorator factory typing (docs path) — documented the
+  `Callable[..., Any]` pattern with `Any` triple in
+  `docs/guides/10-advanced-features.md`. Option 1 (Decorator
+  alias) and option 2 (sugar) remain future work, both blocked
+  on PEP 612 `ParamSpec` support.
+
+- **#90** `self` outside `impl` — added `tyc::self_outside_impl`.
+
+- **#91** `let x: T` (no init) — added `tyc::missing_initialiser`
+  and suppressed the cascading `tyc::immutable_assign`.
+
+- **#92** `main()` not called — added `tyc::main_not_called`
+  advice-level diagnostic with a `__all__` carve-out for libraries.
+
+**Still open after this branch:**
+
+- **#18** / **#65** `tyc fmt` is a no-op — Phase-5 deferral,
+  unchanged. The Typhon-aware printer documented at
+  `tyc-format/src/lib.rs:17` remains future work.
+
+`cargo test --workspace --release` is green for every commit on this
+branch (1032 tests).
+
+---
+
 ## 1. `class Foo frozen:` is a parse error (bug)
 
 **Status:** **FIXED** on `claude/update-findings-IdfrH`. Mirrored the existing
@@ -3041,6 +3137,20 @@ Repro: `stress/fmt2.ty` (the file is preserved in the repo for this report).
 
 ## 66. `?` operator cannot appear inside a sub-expression (gap)
 
+**Status:** **FIXED** (documentation path) — verified on
+`claude/review-findings-fixes-VRFJy`. Took option 2 from the
+original finding: `validate_question_ops` in
+`tyc/crates/tyc-syntax/src/preprocess.rs` already calls
+`find_mid_expression_questionmarks` on the *original* Typhon
+source (not the desugared Python) and emits
+`tyc::invalid_question_op` with help text that explains the
+limitation crisply ("only works as the whole right-hand side of
+an assignment or as a standalone statement; lift the inner call
+to a `let` binding first"). Both repro shapes (`Ok(step(x)?)` and
+`step(x)? + step(x)?`) now point at the offending `?` in the
+user's source. The lift-to-sub-expression rewrite (option 1)
+remains future work.
+
 **Severity:** gap — the docs imply `?` is a sub-expression operator
 (matching Rust's `?`), but it only works as the RHS of a `let`/`mut` or as
 a standalone statement.
@@ -3112,6 +3222,18 @@ Repro: `stress/tests/49_typed_dict.ty`.
 
 ## 68. Generic class constructor inference doesn't propagate from sealed-union target (bug)
 
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. The
+`Type::Class(name)` arm of the call-site inferer (#46 generic
+class instantiation path) now unwraps the call's expected type
+through type aliases and walks `Type::Union` variants looking for
+one whose head matches the class being constructed. When found,
+its type arguments pin the class's PEP 695 type parameters before
+the forward field-walk falls back to `Unknown`. So
+`unwrap(Just(value=5))` for `unwrap(m: Maybe[int])` (with
+`type Maybe[T] = Just[T] | Nothing`) now correctly binds `T=int`
+from the `Just[int]` variant. Regression test
+`generic_ctor_pins_tvar_from_sealed_union_target`.
+
 **Severity:** bug — `Just(value=5)` for a `Maybe[int]` target doesn't bind
 `T=int`.
 
@@ -3146,6 +3268,17 @@ Repro: `stress/tests/21_pattern_match.ty`.
 ---
 
 ## 69. Generic parameter inference fails when target is `None` (bug)
+
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. The
+arg-type loop's nullable-into-non-nullable carve-out (FINDINGS #8)
+was treating any non-nullable formal — including unbound PEP 695
+`Type::TypeVar` — as a target that can't absorb `None`. Added a
+`!matches!(expected, Type::TypeVar(_))` guard so a `None` actual
+against a generic formal flows through the standard
+`is_assignable` path (which already accepts TypeVars against any
+type via the catch-all `(Type::TypeVar(_), _)` arm). Bidirectional
+inference then binds `T = None` from the expected return type as
+usual. Regression test `none_arg_binds_to_typevar`.
 
 **Severity:** bug — `None` is treated as not-bindable to a type parameter.
 
@@ -3222,6 +3355,17 @@ Repro: `stress/tests/103_dict_get_default.ty`.
 
 ## 72. Bare collection annotations (`list`, `dict`, `tuple`) accepted under `no-implicit-any = true` (bug)
 
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. Added
+`tyc::implicit_any` to `tyc-diagnostics`; the `Stmt::AnnAssign`
+arm in `tyc-types`'s `check_stmt` now calls a new
+`bare_collection_name` helper that detects bare `list` / `dict` /
+`tuple` / `set` / `frozenset` names and emits the diagnostic with
+help text pointing at the parameterised form (`list[int]`,
+`dict[K, V]`, `tuple[A, B, ...]`). Subscripted forms continue to
+type-check cleanly. Regression tests `bare_list_annotation_errors`,
+`bare_dict_annotation_errors`, `bare_tuple_annotation_errors`, and
+`parameterised_collection_annotation_is_clean`.
+
 **Severity:** bug — directly violates Rule 1 of the language and the
 documented default for `no-implicit-any`.
 
@@ -3240,6 +3384,15 @@ Repro: `stress/tests/40b_implicit_any_collection.ty`.
 ---
 
 ## 73. `from typing import TypeVar` not specifically rejected (gap)
+
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. Added
+`tyc::typevar_import_rejected` to `tyc-diagnostics`; the resolver's
+`Stmt::ImportFrom` arm in `tyc-resolve` now fires the error
+specifically when `from typing import TypeVar` is encountered, with
+help text pointing at PEP 695 `def f[T](...)` / `class Box[T]:`
+syntax. The pre-existing `corpus_phase3_features_check_clean`
+build-features test was updated to use PEP 695 syntax. Regression
+test `typevar_import_is_rejected` in `tyc-resolve`.
 
 **Severity:** gap — docs say "rejected", reality is "accepted with a
 useless downstream error".
@@ -3267,6 +3420,17 @@ Repro: `stress/tests/50_typevar_rejected.ty`.
 
 ## 74. `typing.List` / `typing.Dict` / `typing.Tuple` not aliased to lowercase (papercut)
 
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. Took
+option (a) from the original finding — added
+`tyc::typing_alias_deprecated` as a warning fired by the resolver's
+`Stmt::ImportFrom` arm when any of `List`, `Dict`, `Tuple`, `Set`,
+`FrozenSet`, or `Type` is imported from `typing`. The diagnostic
+includes the lowercase replacement in the help text. Importing
+`Optional`, `Union`, `Callable`, `Iterator`, `Protocol`, etc. is
+unaffected (those names don't have a direct lowercase built-in
+form). Regression tests `typing_list_alias_is_warned` and
+`typing_optional_is_not_flagged` in `tyc-resolve`.
+
 **Severity:** papercut — common Python idiom produces a confusing
 "expected `List[int]`, found `list[int]`" error.
 
@@ -3287,6 +3451,16 @@ Repro: `stress/tests/71_typing_imports.ty`.
 
 ## 75. Reassigning a `for`-loop target accepted (bug)
 
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`.
+`declare_loop_target` in `tyc-resolve` now declares the loop target
+with `Mutability::Let` (and likewise for `with NAME = …` bindings
+and comprehension generators). The loop itself rebinds the target
+through its own machinery on each iteration; user-written
+`i = i + 1` inside the body now fires the standard
+`tyc::immutable_assign`. Regression tests
+`for_loop_target_reassignment_is_rejected` and
+`for_loop_iteration_itself_is_clean`.
+
 **Severity:** bug — violates Rule 2 of the language.
 
 ```python
@@ -3306,6 +3480,20 @@ Repro: `stress/tests/119_let_in_for.ty`.
 ---
 
 ## 76. Block-level shadowing surfaces as "illegal re-assignment" (papercut / doc)
+
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. Added
+`tyc::no_block_shadow` to `tyc-diagnostics`; `declare_target` in
+`tyc-resolve` now detects when a fresh `let`/`mut` keyword tries to
+re-declare a name already bound by a previous `let`/`mut`
+(`BindingKind::Value`) in the same scope, and surfaces the
+dedicated diagnostic. The help text explains Python's
+function-level scoping and tells the user to pick a different name
+(or drop the keyword if the outer binding is `mut`). Parameters,
+loop targets, imports, function defs, and class defs still take
+the previous codepaths so existing shadow-like patterns
+(`def f(x): mut x = ...`) keep working. Two regression tests:
+`block_let_shadow_uses_dedicated_diagnostic` and the updated
+`duplicate_let_emits_one_diagnostic`.
 
 **Severity:** papercut — the diagnostic is wrong for what the user is
 doing.
@@ -3401,6 +3589,23 @@ Repro: `stress/tests/94_impl_unknown.ty`.
 
 ## 79. Missing module in `from X import Y` accepted at check time (gap)
 
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. Added
+`tyc::unknown_module` to `tyc-diagnostics`; `tyc-resolve` exposes a
+new `python_stdlib_modules()` whitelist (curated CPython 3.13
+stdlib root names) plus a `check_unknown_modules` free function
+that vets every `Stmt::Import` / `Stmt::ImportFrom` against the
+union of (stdlib ∪ `typhon_runtime` ∪ project modules ∪
+typhon.toml dependencies). The `tyc check` command computes the
+project-module list from the source tree (stripping `src/` and
+joining segments with `.`) and the dependency list from
+`config.dependencies` + `config.dev_dependencies`, then calls the
+helper per file. Relative imports (`from .sibling import X`) and
+dunder names are intentionally exempt. Unknown roots produce a
+warning (not an error) so users can still bypass via `typhon.toml`.
+Six regression tests in `tyc-resolve` cover the canonical
+unknown, stdlib, project, `typhon_runtime`, declared-dep, and
+relative-import shapes.
+
 **Severity:** gap — `tyc check` should resolve imports so a typo or
 missing dependency surfaces before `tyc build`.
 
@@ -3423,6 +3628,19 @@ Repro: `stress/tests/83_multiple_files.ty`.
 ---
 
 ## 80. Wrong kwarg name surfaces as "expected N, got N-1" (papercut)
+
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. Added
+`tyc::unknown_kwarg` to `tyc-diagnostics`; the arity-check path in
+`tyc-types` (`check_arity_with_info`) now returns a structured
+`ArityCheck::UnknownKwarg { name, candidates, span }` variant when
+the failure is specifically a typo'd kwarg, and the caller routes
+that into the new diagnostic with a Levenshtein-best
+"did you mean `<x>`?" suggestion (or a fallback that lists every
+accepted parameter name). The plain count/conflict failures still
+fall back to `tyc::arg_count`. Regression tests
+`typo_kwarg_emits_unknown_kwarg_with_suggestion`,
+`unknown_kwarg_lists_candidates_when_no_close_match`, and
+`function_with_double_star_kwarg_accepts_arbitrary_names`.
 
 **Severity:** papercut — typoed keyword arguments produce a confusing
 `arg_count` mismatch instead of a clear unknown-kwarg diagnostic.
@@ -3472,6 +3690,26 @@ Repro: `stress/tests/78_circular_alias.ty`.
 ---
 
 ## 82. Non-returning branch on a non-None-return function accepted (gap)
+
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. Added
+`tyc::missing_return` to `tyc-diagnostics`; `check_function` in
+`tyc-types` now runs a missing-return pass at end-of-body: when the
+declared return type can't accept `None` (i.e. anything other than
+`None`, `T?`, `T | None`, `Any`, `Unknown`) and the body neither
+yields (generator) nor always exits, the diagnostic fires. The
+existing `body_always_exits` machinery covers `return` / `raise` /
+nested if-else exhaustion; the new `match_arms_always_exit` helper
+extends that to `match` statements whose every arm body exits
+(sealed-union exhaustiveness is still checked by the separate
+`tyc::non_exhaustive_match` pass, so the two compose correctly).
+Stub bodies — `pass`, `...`, or a single docstring — are exempt so
+`interface` (Protocol) method declarations stay clean. Six
+regression tests in `tyc-types`
+(`missing_return_on_some_paths_errors`,
+`return_on_every_path_is_clean`,
+`void_function_without_return_is_clean`,
+`nullable_return_without_explicit_none_is_clean`,
+`interface_stub_body_is_clean`, `raise_on_fallthrough_is_clean`).
 
 **Severity:** gap — a function declared `-> int` with a path that doesn't
 return should error.
@@ -3525,6 +3763,17 @@ Repro: `stress/tests/57_async_no_await.ty`.
 ---
 
 ## 84. `lazy let` emits an import for `typhon_runtime` but the package isn't written (bug, severe)
+
+**Status:** **FIXED**. Verified clean on
+`claude/review-findings-fixes-VRFJy`: `is_typhon_runtime_module` in
+`tyc-desugar/src/lib.rs` (line 405) matches `typhon_runtime` *and*
+`typhon_runtime.*`, so the `from typhon_runtime.lazy import
+lazy_let as __typhon_lazy_let` header injected by
+`expand_lazy_imports` for a `lazy let` triggers `needs_runtime` →
+`tyc build` writes the full `typhon_runtime/` package. Running the
+original repro (`stress/tests/101_lazy_let_circular.ty`) now
+produces `build/typhon_runtime/{__init__,lazy,parallel,result,stdlib,tasks}.py`
+and CPython imports the program without `ModuleNotFoundError`.
 
 **Severity:** bug, severe — every program that uses `lazy let` (and not
 also `Result`) crashes with `ModuleNotFoundError` at import time.
@@ -3595,6 +3844,18 @@ Repro: `stress/builds/91_auto_gather/`.
 
 ## 86. `*args: T, sep: str = "-"` kwarg-after-varargs gets the wrong type error (bug)
 
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. The
+arg-type loop in the `Expr::Call` arm of `tyc-types` now uses
+`ArityInfo.param_names.len()` as the positional-versus-vararg
+boundary: pos_args beyond that cutoff are checked against the
+vararg's element type (a new `ArityInfo.vararg_type` field
+populated by `arity_info_from_parameters`) rather than the next
+listed `params` entry, which is a kw-only parameter the user never
+intended to fill positionally. Type-checking still fires when the
+absorbed positional doesn't match the vararg type. Regression
+tests `varargs_absorb_extra_positionals_against_correct_type` and
+`varargs_check_element_type_against_extras`.
+
 **Severity:** bug — calling `stars(1, 2, 3, sep="-")` on
 `def stars(n: int, *args: int, sep: str = ",", **kwargs: int)` fails with
 a wildly misleading diagnostic.
@@ -3618,6 +3879,15 @@ Repro: `stress/tests/24_kwargs_defaults.ty`.
 ---
 
 ## 87. `comptime` help text drifts from documented surface (doc)
+
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. The
+`tyc::comptime` diagnostic help text now lists the full supported
+surface: literals (int/float/str/bool), list/tuple/dict literals,
+arithmetic, comparisons, boolean ops, ternaries, env(),
+int()/str()/float()/len(), pure str methods (upper, lower, strip,
+lstrip, rstrip, replace, startswith, endswith, split), and calls to
+user-defined `comptime def` functions. The crate-level docs in
+`tyc-analyse/src/lib.rs` were also rewritten to match.
 
 **Severity:** doc — the diagnostic help text claims a much smaller
 surface than the language doc.
@@ -3643,6 +3913,23 @@ Repro: any failing `comptime let`, e.g. `stress/tests/61_comptime_limits.ty`.
 
 ## 88. Comptime subscript `E[0]` / `H["a"]` rejected (gap)
 
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. Added an
+`Expr::Subscript` arm to `eval_expr` in
+`tyc/crates/tyc-analyse/src/lib.rs` plus a new `eval_subscript` helper.
+Lists / tuples / strings index by `int` with Python's
+negative-from-end semantics (`xs[-1]` returns the last element);
+dicts look up by any equality-comparable key. Out-of-range indices
+and missing dict keys produce a clear comptime error rather than
+returning a default. Slicing (`E[1:3]`) is intentionally
+unsupported. Seven regression tests cover the new arms
+(`comptime_list_index_evaluates`,
+`comptime_list_negative_index_evaluates`,
+`comptime_tuple_index_evaluates`,
+`comptime_dict_lookup_evaluates`,
+`comptime_str_index_evaluates`,
+`comptime_list_index_out_of_range_errors`,
+`comptime_dict_missing_key_errors`).
+
 **Severity:** gap — comptime supports list/dict literals but not
 subscripting them.
 
@@ -3661,6 +3948,18 @@ Repro: `stress/tests/62_comptime_arith.ty`.
 ---
 
 ## 89. Decorator factory pattern (`def trace(p): def dec(f): …`) impossible to type (gap)
+
+**Status:** **FIXED (docs)** on `claude/review-findings-fixes-VRFJy`.
+Took option 3 from the original finding — documented the canonical
+typed-decorator-factory pattern in `docs/guides/10-advanced-features.md`
+("Common mistakes" section). The pattern uses
+`Callable[..., Any]` (Typhon's v1 "any callable") for every closure
+layer and `Any` for the `*args`/`**kwargs`/return triple. End-to-end
+verified clean against `tyc check`. Trade-off documented: the call
+site loses the original wrapped function's signature, which a
+future `ParamSpec` pass (PEP 612) will tighten. The `Decorator`
+type alias (option 1) and `@decorator-factory` sugar (option 2)
+remain future work — both depend on `ParamSpec` to be useful.
 
 **Severity:** gap — a common Python idiom has no usable form in Typhon.
 
@@ -3697,6 +3996,18 @@ Repro: `stress/tests/112_complex_decorator.ty`.
 
 ## 90. `self` outside `impl` produces generic `unknown_name` (papercut)
 
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. Added a
+dedicated `tyc::self_outside_impl` diagnostic in `tyc-diagnostics`;
+`report_unknown_names` in `tyc-resolve` checks for `r.name == "self"`
+before falling through to the generic `tyc::unknown_name` so the
+help text correctly points users at `impl ClassName:` instead of
+suggesting `let self = …`. Inside `impl` method bodies the synthetic
+`self` binding declared by `walk_impl_method` already prevents the
+unknown-name reference from firing, so this only triggers for the
+true "self outside impl" shape. Regression test
+`self_outside_impl_uses_dedicated_diagnostic` in
+`tyc/crates/tyc-resolve/src/lib.rs`.
+
 **Severity:** papercut — the diagnostic is correct that `self` isn't
 defined, but the help is misleading.
 
@@ -3719,6 +4030,19 @@ Repro: `stress/tests/92_self_outside_impl.ty`.
 ---
 
 ## 91. `let x: int` (no init) treated as a binding, then `x = 5` errors as re-assignment (papercut)
+
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. Took
+option 1 from the original finding — `let NAME: T` / `mut NAME: T`
+without an initialiser now surfaces a dedicated
+`tyc::missing_initialiser` diagnostic that names the keyword and
+the annotation in the help text. The resolver's `AnnAssign` arms
+(both the top-level sub-pass-1 collector and the walking pass) skip
+the declaration so the user's subsequent `NAME = <expr>` doesn't
+also fire the misleading `tyc::immutable_assign` cascade. Bare
+class-body field annotations (`name: str`) are untouched because
+they carry no `let`/`mut` keyword. Regression tests
+`let_without_initialiser_errors`, `mut_without_initialiser_errors`,
+and `class_field_without_initialiser_is_clean`.
 
 **Severity:** papercut — declare-without-init is silently accepted and
 then any later assignment is rejected.
@@ -3744,6 +4068,23 @@ Repro: `stress/tests/110_let_no_init.ty`.
 ---
 
 ## 92. No diagnostic when `def main()` is defined but never called (papercut)
+
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. Took
+option 1 (advice diagnostic) from the original finding. Added
+`tyc::main_not_called` with `severity(Advice)` so it renders as
+advice in miette output but flows through the existing warning
+channel. A new `Resolver::report_main_not_called` pass runs after
+`report_unused_imports`: it locates a module-level
+`BindingKind::Function` named `main`, checks for any reference
+(other than the def site), and suppresses the advice when the
+module also defines `__all__` (library-shape modules legitimately
+export `main` without calling it). Regression tests
+`main_defined_but_not_called_warns`,
+`main_called_at_module_level_is_clean`, and
+`module_with_all_export_suppresses_main_not_called`. Option 2
+(auto-emit the entry block) was deferred — emitting code that
+the user didn't write would surprise the half-of-users who don't
+want it, so the advice is the safer first step.
 
 **Severity:** papercut — common newcomer mistake; canonical Typhon
 programs need an explicit `if __name__ == "__main__": main()` block,

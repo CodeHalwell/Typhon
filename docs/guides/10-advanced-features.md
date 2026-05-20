@@ -364,6 +364,32 @@ lazy from numpy import array    # ❌ rejected at parse time
 
 Fix: `lazy import numpy`, then use `numpy.array(...)`.
 
+**Writing a decorator factory:**
+
+Python's classic three-layer decorator factory (`def trace(prefix): def decorator(f): def wrapper(*args, **kwargs): ...`) is impossible to fully type in v1 — Typhon doesn't yet model PEP 612 `ParamSpec`. Annotate every layer with `Callable[..., Any]` (the v1 equivalent of "any callable") to satisfy Rule 1 and let the body remain dynamic:
+
+```python
+from typing import Callable, Any
+import functools
+
+def trace(prefix: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            print(f"{prefix}: {func.__name__}")
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+@trace("LOG")
+def add(a: int, b: int) -> int:
+    return a + b
+```
+
+This passes `tyc check` cleanly. The trade-off is that the call site loses the original `add`'s signature for type-checking purposes (it widens to `Callable[..., Any]`). If you need signature preservation, use a single-decorator pattern without the factory layer; if the dynamic behaviour is critical to the operation (e.g. arbitrary `*args`/`**kwargs` passthrough), `Callable[..., Any]` is the right shape and a future `ParamSpec` pass will tighten it.
+
+For decorators that don't need access to the wrapped function (e.g. registry-style decorators), the simpler `def register(f: Callable[..., Any]) -> Callable[..., Any]:` form skips the factory entirely.
+
 **Pulling an `Unsafe[T]` value out of an `unsafe:` block:**
 
 ```python

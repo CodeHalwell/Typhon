@@ -72,6 +72,150 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// `self` was referenced outside an `impl ClassName:` method body.
+    /// Distinct from the generic `tyc::unknown_name` so the help text can
+    /// point users at the right shape (per Typhon Rule 4: methods take
+    /// explicit `self`, free functions cannot).
+    #[error("cannot find 'self' in scope")]
+    #[diagnostic(
+        code(tyc::self_outside_impl),
+        help("`self` is only available inside `impl ClassName:` method bodies. Move this function under an `impl` block, or replace `self` with an explicit parameter.")
+    )]
+    SelfOutsideImpl {
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("`self` is only valid inside an `impl` method body")]
+        span: SourceSpan,
+    },
+
+    /// `from typing import TypeVar` is rejected — Typhon uses PEP 695
+    /// type-parameter syntax (`def f[T](x: T) -> T:`) and the
+    /// `TypeVar(...)` constructor is not a supported value.
+    #[error("`from typing import TypeVar` is not supported in Typhon")]
+    #[diagnostic(
+        code(tyc::typevar_import_rejected),
+        help("Use PEP 695 syntax instead: `def f[T](x: T) -> T:` and `class Box[T]:` declare type parameters directly, no `TypeVar(...)` call needed.")
+    )]
+    TypeVarImportRejected {
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("remove this import and use `[T]` parameter syntax instead")]
+        span: SourceSpan,
+    },
+
+    /// Importing a deprecated capitalised collection alias from `typing`
+    /// (`List`, `Dict`, `Tuple`, `Set`, `FrozenSet`, `Type`) — Typhon prefers
+    /// the built-in lowercase forms (PEP 585) for consistency with the rest
+    /// of the language.
+    #[error("`from typing import {name}` is deprecated in Typhon")]
+    #[diagnostic(
+        code(tyc::typing_alias_deprecated),
+        help("Use the built-in lowercase `{lower}` instead — `{lower}[T]` works directly without importing anything.")
+    )]
+    TypingAliasDeprecated {
+        name: String,
+        lower: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("prefer `{lower}` over `typing.{name}`")]
+        span: SourceSpan,
+    },
+
+    /// A call site passed a keyword argument whose name doesn't match
+    /// any of the callee's parameters (positional or keyword-only) and
+    /// the callee has no `**kwargs`. Distinct from `tyc::arg_count`
+    /// because the user's mistake is a typo, not a count error.
+    #[error("unknown keyword argument '{kwarg}' to `{fn_name}`")]
+    #[diagnostic(code(tyc::unknown_kwarg))]
+    UnknownKwarg {
+        fn_name: String,
+        kwarg: String,
+        /// Pre-formatted help string. When a similar parameter name was
+        /// found this reads "did you mean `<candidate>`?"; otherwise it
+        /// lists every accepted parameter name.
+        #[help]
+        suggestion: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("not a parameter of `{fn_name}`")]
+        span: SourceSpan,
+    },
+
+    /// A function declared with a non-`None` return type has at least
+    /// one execution path that reaches the end of the body without
+    /// `return` / `raise`. Equivalent to mypy's `missing-return`.
+    #[error("function `{fn_name}` is missing a return on some paths (declared `-> {ret_type}`)")]
+    #[diagnostic(
+        code(tyc::missing_return),
+        help("Add an explicit `return <{ret_type}>` (or `raise`) on every path, or widen the return type to `{ret_type} | None` / `None` if the function intentionally returns nothing.")
+    )]
+    MissingReturn {
+        fn_name: String,
+        ret_type: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("this function may fall off the end without a return value")]
+        span: SourceSpan,
+    },
+
+    /// `let NAME: T` (or `mut NAME: T`) was written without an
+    /// initialiser. Typhon requires every binding to have a value at
+    /// declaration — the Rust-style "declare-then-assign-later" shape
+    /// produces a confusing `tyc::immutable_assign` on the next
+    /// assignment, so this dedicated diagnostic fires earlier.
+    #[error("`{keyword} {name}: {annotation}` is missing an initialiser")]
+    #[diagnostic(
+        code(tyc::missing_initialiser),
+        help("Typhon bindings must be initialised at the point of declaration. Write `{keyword} {name}: {annotation} = <expr>` instead.")
+    )]
+    MissingInitialiser {
+        keyword: String,
+        name: String,
+        annotation: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("missing `= <expr>` here")]
+        span: SourceSpan,
+    },
+
+    /// A bare collection annotation (`list`, `dict`, `tuple`, `set`,
+    /// `frozenset`) appears without element-type parameters. Per
+    /// Typhon Rule 1 / `[strictness] no-implicit-any = true` (the
+    /// default), every container annotation should spell out its
+    /// element types.
+    #[error("bare `{kind}` annotation has implicit `Any` element type")]
+    #[diagnostic(
+        code(tyc::implicit_any),
+        help("Spell out the element type so readers can see what the collection holds: `{kind}[<element-type>]`. For dicts use `dict[K, V]`; for tuples use `tuple[A, B, ...]` or `tuple[T, ...]` for a homogeneous tuple.")
+    )]
+    ImplicitAny {
+        kind: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("missing `[<element type>]`")]
+        span: SourceSpan,
+    },
+
+    /// A second `let`/`mut` binding tries to shadow an outer binding
+    /// of the same name in the same function. Python's name scoping
+    /// is function-level, so what looks like block-scoped shadowing
+    /// actually rebinds the outer name — Typhon rejects this rather
+    /// than silently accepting a confusing capture.
+    #[error("cannot shadow `{name}` — Typhon names are function-scoped")]
+    #[diagnostic(
+        code(tyc::no_block_shadow),
+        help("Python doesn't have block scope, so a `let {name}: ...` inside a nested block would still rebind the outer `{name}`. Pick a different name, or remove the keyword to reuse the outer binding (if it's `mut`).")
+    )]
+    NoBlockShadow {
+        name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("first declared here")]
+        decl_span: SourceSpan,
+        #[label("re-declaration would shadow the outer binding")]
+        span: SourceSpan,
+    },
+
     /// A value of one type was used where another type was expected.
     #[error("type mismatch: expected `{expected}`, found `{actual}`")]
     #[diagnostic(
@@ -253,7 +397,7 @@ pub enum TycError {
     #[error("comptime evaluation failed for '{name}': {message}")]
     #[diagnostic(
         code(tyc::comptime),
-        help("comptime expressions support: literals, env(\"NAME\"), env(\"NAME\", \"default\"), int(), str(), float(), and basic arithmetic")
+        help("comptime expressions support: int/float/str/bool literals, list/tuple/dict literals, arithmetic, comparisons, boolean ops (and/or/not), ternaries (`x if c else y`), env(\"NAME\"[, \"default\"]), int()/str()/float()/len(), pure str methods (upper, lower, strip, lstrip, rstrip, replace, startswith, endswith, split), and calls to user-defined `comptime def` functions")
     )]
     Comptime { name: String, message: String },
 
@@ -493,6 +637,43 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A top-level `def main()` is defined but is never called from
+    /// the module. Common newcomer mistake — the script's `main`
+    /// function never runs, leaving the build apparently successful
+    /// but producing no output. Surfaced as advice (not an error) so
+    /// existing library-style modules with a `main` symbol that's
+    /// imported elsewhere aren't broken.
+    #[error("`main` is defined but never called in this module")]
+    #[diagnostic(
+        severity(Advice),
+        code(tyc::main_not_called),
+        help("Add `if __name__ == \"__main__\":\\n    main()` at the end of the module (the standard Python script-entry pattern) so the script runs when invoked directly.")
+    )]
+    MainNotCalled {
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("`main()` is never invoked")]
+        span: SourceSpan,
+    },
+
+    /// An import references a module that isn't in the Python stdlib,
+    /// not the project tree, not the bundled `typhon_runtime`, and not
+    /// listed in `typhon.toml`'s dependencies. The build would later
+    /// fail at import time with `ModuleNotFoundError`; surface the
+    /// typo / missing dep at check time instead. FINDINGS #79.
+    #[error("module `{module}` is not in the stdlib, the project, or `typhon.toml` dependencies")]
+    #[diagnostic(
+        code(tyc::unknown_module),
+        help("Either fix the import name, add `{module}` to the `[dependencies]` table in `typhon.toml` (then run `tyc sync`), or create a sibling `.ty` file with the right name.")
+    )]
+    UnknownModule {
+        module: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("not resolvable at check time")]
+        span: SourceSpan,
+    },
+
     /// A `class NAME:` statement re-uses a name that has already been
     /// declared at the same scope. Python silently lets the second
     /// definition shadow the first; Typhon flags it so the user can
@@ -609,6 +790,142 @@ impl TycError {
         Self::UnknownName {
             name: name.into(),
             src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct an [`TycError::SelfOutsideImpl`] diagnostic.
+    pub fn self_outside_impl(
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::SelfOutsideImpl {
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::TypeVarImportRejected`] diagnostic.
+    pub fn typevar_import_rejected(
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::TypeVarImportRejected {
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::TypingAliasDeprecated`] diagnostic for a
+    /// capitalised `typing.<Name>` alias of a lowercase built-in.
+    pub fn typing_alias_deprecated(
+        name: impl Into<String>,
+        lower: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::TypingAliasDeprecated {
+            name: name.into(),
+            lower: lower.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::UnknownKwarg`] diagnostic. `suggestion`
+    /// should be a complete help message — typically either "did you
+    /// mean `<candidate>`?" (when a close match exists) or a listing
+    /// of every accepted parameter name.
+    pub fn unknown_kwarg(
+        fn_name: impl Into<String>,
+        kwarg: impl Into<String>,
+        suggestion: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::UnknownKwarg {
+            fn_name: fn_name.into(),
+            kwarg: kwarg.into(),
+            suggestion: suggestion.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::MissingReturn`] diagnostic.
+    pub fn missing_return(
+        fn_name: impl Into<String>,
+        ret_type: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::MissingReturn {
+            fn_name: fn_name.into(),
+            ret_type: ret_type.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::MissingInitialiser`] diagnostic.
+    pub fn missing_initialiser(
+        keyword: impl Into<String>,
+        name: impl Into<String>,
+        annotation: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::MissingInitialiser {
+            keyword: keyword.into(),
+            name: name.into(),
+            annotation: annotation.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::ImplicitAny`] diagnostic.
+    pub fn implicit_any(
+        kind: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::ImplicitAny {
+            kind: kind.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::NoBlockShadow`] diagnostic.
+    #[allow(clippy::too_many_arguments)]
+    pub fn no_block_shadow(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        decl_offset: usize,
+        decl_length: usize,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::NoBlockShadow {
+            name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            decl_span: SourceSpan::new(SourceOffset::from(decl_offset), decl_length),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }
     }
@@ -1018,6 +1335,34 @@ impl TycError {
     ) -> Self {
         Self::AutoGatherMissed {
             missing: missing.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::MainNotCalled`] advice diagnostic.
+    pub fn main_not_called(
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::MainNotCalled {
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::UnknownModule`] diagnostic.
+    pub fn unknown_module(
+        module: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::UnknownModule {
+            module: module.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }
