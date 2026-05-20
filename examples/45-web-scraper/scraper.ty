@@ -50,15 +50,19 @@ def parse_articles(html: str, base_url: str) -> list[Article]:
 
 async def scrape(urls: list[str]) -> list[Result[list[Article], ScrapeError]]:
     let limits: httpx.Limits = httpx.Limits(max_connections=4)
+    mut results: list[Result[list[Article], ScrapeError]] = []
     async with httpx.AsyncClient(limits=limits) as client:
         async def one(u: str) -> Result[list[Article], ScrapeError]:
-            match await fetch(client, u):
+            let fetched: Result[str, ScrapeError] = await fetch(client, u)
+            match fetched:
                 case Ok(html):
                     await asyncio.sleep(0.5)
                     return Ok(parse_articles(html, u))
                 case Err(e):
                     return Err(e)
-        return await asyncio.gather(*[one(u) for u in urls])
+            raise RuntimeError("unreachable")
+        results = await asyncio.gather(*[one(u) for u in urls])
+    return results
 
 
 async def main_async() -> None:

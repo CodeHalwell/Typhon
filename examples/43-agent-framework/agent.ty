@@ -28,6 +28,7 @@ def _eval_arith(node: object) -> float:
             if isinstance(node.op, ast.UAdd): return _eval_arith(node.operand)
             raise ValueError(f"forbidden unary op")
         raise ValueError(f"forbidden node: {type(node).__name__}")
+    raise RuntimeError("unreachable")
 
 
 class Tool:
@@ -78,22 +79,22 @@ impl Agent:
 
             if resp.stop_reason != "tool_use":
                 mut text_parts: list[str] = []
-                for block in resp.content:
-                    if block.type == "text":
-                        text_parts.append(block.text)
+                for text_block in resp.content:
+                    if text_block.type == "text":
+                        text_parts.append(text_block.text)
                 return Ok("".join(text_parts))
 
             mut tool_results: list[dict[str, object]] = []
-            for block in resp.content:
-                if block.type == "tool_use":
-                    let tool: Tool? = self.tools.get(block.name)
+            for tool_block in resp.content:
+                if tool_block.type == "tool_use":
+                    let tool: Tool? = self.tools.get(tool_block.name)
                     let out: str = (
-                        tool.run(dict(block.input)) if tool is not None
-                        else f'{{"error": "unknown tool {block.name}"}}'
+                        tool.run(dict(tool_block.input)) if tool is not None
+                        else f'{{"error": "unknown tool {tool_block.name}"}}'
                     )
                     tool_results.append({
                         "type": "tool_result",
-                        "tool_use_id": block.id,
+                        "tool_use_id": tool_block.id,
                         "content": out,
                     })
             self.history.append({"role": "user", "content": tool_results})

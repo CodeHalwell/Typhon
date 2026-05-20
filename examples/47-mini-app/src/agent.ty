@@ -99,9 +99,9 @@ impl Agent:
 
             if resp.stop_reason != "tool_use":
                 mut text_parts: list[str] = []
-                for block in resp.content:
-                    if block.type == "text":
-                        text_parts.append(block.text)
+                for text_block in resp.content:
+                    if text_block.type == "text":
+                        text_parts.append(text_block.text)
                 let final_text: str = "".join(text_parts)
                 events.append(FinalAnswerEvent(text=final_text))
                 return Ok(AgentRun(
@@ -112,19 +112,19 @@ impl Agent:
                 ))
 
             mut tool_results: list[dict[str, object]] = []
-            for block in resp.content:
-                if block.type == "text":
-                    events.append(ThoughtEvent(text=block.text))
-                if block.type == "tool_use":
-                    let args: dict[str, object] = dict(block.input)
-                    events.append(ToolCallEvent(name=block.name, args=args))
+            for content_block in resp.content:
+                if content_block.type == "text":
+                    events.append(ThoughtEvent(text=content_block.text))
+                if content_block.type == "tool_use":
+                    let args: dict[str, object] = dict(content_block.input)
+                    events.append(ToolCallEvent(name=content_block.name, args=args))
                     tool_calls = tool_calls + 1
-                    let (result_text, was_save) = self.dispatch(block.name, args)
+                    let (result_text, was_save) = self.dispatch(content_block.name, args)
                     if was_save:
                         saved = saved + 1
                     tool_results.append({
                         "type": "tool_result",
-                        "tool_use_id": block.id,
+                        "tool_use_id": content_block.id,
                         "content": result_text,
                     })
             messages.append({"role": "user", "content": tool_results})

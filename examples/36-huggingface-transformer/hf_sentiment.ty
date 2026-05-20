@@ -49,12 +49,12 @@ def main() -> None:
         "It works, I guess. Could be worse.",
     ]
     print("--- pipeline ---")
-    for r in run_pipeline(samples):
-        print(f"  {r.label:10s} {r.score:.3f}  {r.text}")
+    for pipe_r in run_pipeline(samples):
+        print(f"  {pipe_r.label:10s} {pipe_r.score:.3f}  {pipe_r.text}")
 
     print("--- manual ---")
-    for r in run_manual(samples):
-        print(f"  {r.label:10s} {r.score:.3f}  {r.text}")
+    for manual_r in run_manual(samples):
+        print(f"  {manual_r.label:10s} {manual_r.score:.3f}  {manual_r.text}")
 
 
 if __name__ == "__main__":
