@@ -4284,6 +4284,16 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             }
             // Conservative numeric arithmetic inference.
             match (&l_stripped, &r_stripped) {
+                _ if matches!(b.op, Operator::Div)
+                    && is_numeric(&l_stripped)
+                    && is_numeric(&r_stripped) =>
+                {
+                    // Python's `/` is always true division — the result
+                    // is `float` regardless of operand types. Returning
+                    // `Type::Float` lets `let i: int = a / b` flag via
+                    // the existing assignability check.
+                    Type::Float
+                }
                 (Type::Int, Type::Int) => Type::Int,
                 (Type::Float, _) | (_, Type::Float) => Type::Float,
                 (Type::Str, Type::Str) if matches!(b.op, Operator::Add) => Type::Str,
