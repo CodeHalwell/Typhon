@@ -25,10 +25,16 @@ The `tyc` binary is a multi-stage compiler with an embedded LSP, structured as a
 [tyc-desugar]  →  plain Python AST
         │
         ▼
-[tyc-emit]     →  .py source via ruff_python_codegen + ruff_python_formatter
+[tyc-emit]     →  .py source via hand-written printer (tracks .py.map offsets)
+        │
+        ▼
+[tyc-format]   →  in-process whitespace pass + ruff format wrap (when on PATH)
         │
         ▼
 [tyc-lsp]      →  reuses the above stages incrementally via Salsa
+
+Parallel surface:
+[tyc-vm]       →  walks the parsed Typhon AST directly (default for `tyc run`)
 ```
 
 ## Workspace layout
@@ -47,6 +53,7 @@ tyc/
 │   ├── tyc-format/             post-process emitter output through ruff format
 │   ├── tyc-diagnostics/        miette-based diagnostic rendering
 │   ├── tyc-lsp/                tower-lsp-server Backend over tyc-db
+│   ├── tyc-vm/                 tree-walking interpreter (tyc run default)
 │   └── tyc/                    thin CLI binary, clap subcommands
 └── vendor/                     Typhon's in-tree fork of Ruff (pinned via vendor/UPSTREAM)
     ├── ruff_text_size/         TextSize / TextRange newtypes

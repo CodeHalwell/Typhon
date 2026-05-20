@@ -153,6 +153,8 @@ export default defineConfig({
             { label: 'tyc migrate', slug: 'cli/migrate' },
             { label: 'tyc ty', slug: 'cli/ty' },
             { label: 'tyc stubtest', slug: 'cli/stubtest' },
+            { label: 'tyc explain', slug: 'cli/explain' },
+            { label: 'tyc cheatsheet', slug: 'cli/cheatsheet' },
             { label: 'tyc add / remove / sync', slug: 'cli/packages' },
             { label: 'Exit Codes', slug: 'cli/exit-codes' },
           ],

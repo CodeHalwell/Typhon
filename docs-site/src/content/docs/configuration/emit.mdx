@@ -9,12 +9,14 @@ sidebar:
 [emit]
 class-default = "dataclass"
 format = true
+skip-decoration-bases = []
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `class-default` | `"dataclass"` \| `"pydantic"` | `"dataclass"` | Default emission target for `class` declarations. Overridable per-class via the `model` keyword. |
 | `format` | bool | `true` | Post-process emitted `.py` through `ruff format`. |
+| `skip-decoration-bases` | list of strings | `[]` | Extra base-class names that suppress the automatic `@dataclass(slots=True)` decorator. |
 
 ## `class-default`
 
@@ -23,9 +25,24 @@ format = true
 
 You can mix both freely regardless of the default. `class` follows the default; `model` always emits Pydantic.
 
+Unknown values (`"struct"`, `"plain"`, `"regular"`, `"none"`, the empty string, …) are rejected at config load with `tyc::invalid_config_value` and the allowed-values list. They used to be silently treated as `"dataclass"`, which made typos invisible.
+
 ## `format`
 
 When `true` (default), emitted `.py` is post-processed through `ruff format` for consistent style. Off is occasionally useful when you want to see the raw printer output for debugging.
+
+## `skip-decoration-bases`
+
+The compiler already auto-skips `@dataclass(slots=True)` for the stdlib bases that conflict with it (`Enum`, `IntEnum`, `StrEnum`, `Flag`, `IntFlag`, `ABC`, `ABCMeta`), plus `Protocol`, `TypedDict`, and `NamedTuple`. `skip-decoration-bases` extends that list with project-specific bases:
+
+```toml
+[emit]
+skip-decoration-bases = ["BaseModel", "App", "TestCase"]
+```
+
+The match is on the **last identifier segment**, so `"App"` catches both `class T(App):` and `class T(textual.App):` regardless of how the base is imported. With this list set, you can write the plain `class` keyword for framework subclasses without reaching for `class!` or `plain class`.
+
+Auto-skip drops only the decorator — it does *not* synthesise an `__init__`. Reach for `class! Foo(Base):` when you also want a synthesised constructor calling `super().__init__()`, or `plain class Foo:` for "no decorator, no synthesised init, body emits verbatim."
 
 ## Always-on behaviour
 

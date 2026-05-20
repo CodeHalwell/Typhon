@@ -160,8 +160,10 @@ in `docs/roadmap.md`.
 
 Runtime failures surface as `Traceback (most recent call last):` followed
 by `KIND: MESSAGE`. The traceback is intentionally minimal in v1 — it
-names the function frame but not the source line. Source-mapped tracebacks
-are a Phase-5 item.
+names the function frame but not the source line. Source-line tracebacks
+inside the VM are a tracked follow-up; for now, programs that need full
+traceback fidelity should run under `tyc run --compile` and use
+`tyc trace` on the captured stderr.
 
 ## Talking to the VM from Rust
 

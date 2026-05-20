@@ -1,6 +1,6 @@
 ---
 title: Classes → dataclass
-description: How class, model, class!, and frozen lower to Python.
+description: How class, model, plain class, class!, and frozen lower to Python.
 sidebar:
   order: 2
 ---
@@ -113,7 +113,32 @@ Multiple `impl` blocks (across files) all merge.
 
 `extra="forbid"` is the default (Pydantic's stock `extra="ignore"` is rejected by Typhon's safety posture). The configurable `[emit] model-extra` knob is roadmapped.
 
-## `class!` — escape hatch
+## `plain class` — no-decoration escape hatch
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    plain class Bag:
+        items: list[str]
+        label: str = "unsorted"
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    class Bag:
+        items: list[str]
+        label: str = "unsorted"
+    ```
+  </TabItem>
+</Tabs>
+
+`plain class`:
+
+- **No `@dataclass` decorator.**
+- **No synthesised `__init__`.** The body emits verbatim — instances acquire attributes when user code assigns them, exactly like a hand-written Python class.
+- Reach for `plain class` when a metaclass-driven library (Textual, Django ORM, SQLAlchemy declarative) owns the attribute layout.
+
+## `class!` — escape hatch with synthesised constructor
 
 <Tabs>
   <TabItem label="Typhon">
@@ -147,9 +172,13 @@ Multiple `impl` blocks (across files) all merge.
 
 `class!`:
 
-- No `@dataclass` decorator.
-- `__init__` is synthesised — calls `super().__init__()` first, then assigns annotated fields in source order.
-- Hand-written `__init__` is preserved verbatim.
+- **No `@dataclass` decorator.**
+- **`__init__` is auto-synthesised** — calls `super().__init__()` first, then assigns annotated fields in source order. The compiler strips class-level defaults that would otherwise be evaluated twice (once at class-definition time as a shared class attribute, then again per-instance in `__init__`).
+- **Hand-written `__init__` is preserved verbatim** for cases where the base class needs configuration arguments that aren't 1:1 with declared fields.
+
+## Auto-skip for framework bases
+
+A plain `class Foo(Base):` (no marker) whose base is `Enum` / `IntEnum` / `StrEnum` / `Flag` / `IntFlag` / `ABC` / `ABCMeta` is **automatically** emitted without `@dataclass`. The same applies to `Protocol` / `TypedDict` / `NamedTuple` (which were always skipped). Project-specific bases can be added via [`[emit] skip-decoration-bases`](/Typhon/configuration/emit/#skip-decoration-bases). Auto-skip drops only the decorator; it does *not* synthesise an `__init__` — escalate to `class!` if you need one.
 
 ## Generic classes
 
@@ -182,6 +211,7 @@ PEP 695 generic syntax is preserved (Python 3.13+ default target).
 
 ## Where next
 
-- [`class`, `model`, `class!` reference](/Typhon/reference/classes/) — declaration forms.
+- [`class`, `model`, `plain class`, `class!` reference](/Typhon/reference/classes/) — declaration forms.
 - [`impl` and `extend` reference](/Typhon/reference/impl-extend/) — method merging.
 - [Class Escape Hatches](/Typhon/interop/class-escape/) — `class!` patterns by framework.
+- [`[emit] skip-decoration-bases`](/Typhon/configuration/emit/#skip-decoration-bases) — project-specific framework bases.

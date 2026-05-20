@@ -1,15 +1,15 @@
 ---
 title: tyc debug
-description: Build then launch the emitted Python under pdb. Thin v1 wrapper.
+description: Build then launch the emitted Python under pdb, with source-mapped breakpoints via --break.
 sidebar:
   order: 9
 ---
 
 ```
-tyc debug [--entry FILE] [--debugger MODULE] [--python PATH] [--no-build] [-- ARGS...]
+tyc debug [--entry FILE] [--debugger MODULE] [--python PATH] [--break TY:LINE]... [--no-build] [-- ARGS...]
 ```
 
-Builds the project, then execs `python -m pdb build/<entry>.py` (or another debugger module). Thin v1 — a Typhon-native source-mapping debugger is a Phase-5 deliverable.
+Builds the project, then execs `python -m pdb build/<entry>.py` (or another debugger module). Repeatable `--break <ty-file>:<line>` flags translate Typhon source locations through the v2 `.py.map` and inject `-c "break …"` commands into the debugger session, so you set breakpoints in `.ty` coordinates and they fire on the corresponding emitted Python lines.
 
 ## Examples
 
@@ -20,6 +20,12 @@ tyc debug --debugger pudb          # use pudb instead
 tyc debug --debugger ipdb          # ipdb if you have it
 tyc debug -- --verbose --port 8080  # forward args to the script
 tyc debug --no-build               # reuse existing build/
+
+# Set a breakpoint on a Typhon line:
+tyc debug --break src/main.ty:42
+
+# Multiple breakpoints stack:
+tyc debug --break src/main.ty:42 --break src/lib/io.ty:7
 ```
 
 ## Flags
@@ -29,32 +35,29 @@ tyc debug --no-build               # reuse existing build/
 | `--entry FILE` | `main.py` | Entry-point file relative to the build dir. |
 | `--python PATH` | `python3` | Python interpreter. |
 | `--debugger MODULE` | `pdb` | Module to launch via `python -m`. Common choices: `pdb`, `ipdb`, `pudb`, `debugpy`. |
+| `--break TY:LINE` | — | Break at `<ty-file>:<line>` (e.g. `src/main.ty:42`). Repeatable. The line number is parsed from the segment after the *last* `:`, so Windows-style drive letters (`C:\foo.ty:10`) and POSIX paths both round-trip. Lines that don't appear in the `.py.map` table surface a warning and are skipped. |
 | `--no-build` | off | Skip rebuilding; assume `build/` is current. |
 
-## Frame remapping
+## How `--break` works
 
-`tyc debug` is a thin wrapper — frames surface as `build/*.py` paths. To map a captured traceback back to `.ty` source, run `tyc trace` on the saved traceback file:
+Each `<ty-file>:<line>` is resolved by reading the `.py.map` v2 sidecar that was emitted next to the corresponding `build/*.py`, looking up the first Python line that originated from the requested Typhon line, and then composing a `-c "break build/<file>.py:<py-line>"` argument that ships into the debugger's startup. The first time you hit `c` (continue) in the debugger session, every `--break` location is already set.
+
+The mapping is one-to-many in the other direction — a single Typhon line can lower to several Python lines — so `--break` picks the *first* Python line that originated from your `.ty` line. That tends to be the most useful entry point: e.g. `gather:` blocks break before the first task is created, not somewhere inside the synthesised TaskGroup.
+
+## Frame remapping after a crash
+
+Frames in the debugger session still surface as `build/*.py` paths. To map a captured traceback back to `.ty` source, run `tyc trace` on the saved traceback file:
 
 ```bash
-tyc debug -- --bad-arg     # crashes
-# (debugger session ends)
-
-# Re-run capturing stderr:
-tyc run -- --bad-arg 2>err.log
+tyc run --compile -- --bad-arg 2>err.log
 tyc trace err.log          # remaps frames to .ty
 ```
 
-## What's coming
+## What's not implemented yet
 
-A Typhon-native source-mapping debugger that:
-
-- Sets breakpoints on `.ty` lines (translating to `build/*.py` lines via `.py.map`).
-- Displays stack frames with `.ty` source.
-- Steps `.ty` statements (one Python statement → one Typhon statement, even when `gather:` lowers to several Python lines).
-
-That work is a Phase-5 deliverable. For v1, use the thin wrapper plus `tyc trace`.
+A Typhon-native source-mapping debugger UI — one that displays stack frames with `.ty` source and steps a `.ty` statement at a time (one Python statement → one Typhon statement, even when `gather:` lowers to several Python lines) — is still on the roadmap. `--break` covers the most common workflow (set a breakpoint in `.ty`, drop into pdb at that frame) without the full source-mapped TUI.
 
 ## Where next
 
 - [`tyc trace`](/Typhon/cli/trace/) — map a Python traceback back to `.ty`.
-- [`tyc run`](/Typhon/cli/run/) — non-debugger build + exec.
+- [`tyc run`](/Typhon/cli/run/) — non-debugger build + exec, or VM-mode run.

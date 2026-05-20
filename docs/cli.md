@@ -8,19 +8,21 @@ Typhon ships a single binary, `tyc`, that handles every stage of the workflow. S
 
 | Command | Purpose |
 |---------|---------|
-| `tyc build` | Full pipeline: parse, check, analyse, desugar, emit, format. Also bootstraps the Python environment — merges the owned keys (`[project] name/version/requires-python/dependencies`, plus `[dependency-groups].dev` when `[dev-dependencies]` is non-empty) into `pyproject.toml` (preserving any user-managed `[tool.*]` / other `[project]` keys) and runs `uv sync` so `.venv` is ready. `uv sync` failure is downgraded to a warning. |
+| `tyc build` | Full pipeline: parse, check, analyse, desugar, emit, format. Also bootstraps the Python environment — merges the owned keys (`[project] name/version/requires-python/dependencies`, plus `[dependency-groups].dev` when `[dev-dependencies]` is non-empty) into `pyproject.toml` (preserving any user-managed `[tool.*]` / other `[project]` keys) and runs `uv sync` so `.venv` is ready. `uv sync` failure is downgraded to a warning. `--check` is a dry-run mode that lists every file that *would* be written without touching disk. |
 | `tyc check` | Up to analyser, no emit. Used by CI. |
-| `tyc fmt` | Format `.ty` source. The v1 pass collapses runs of interior whitespace, strips space after `(`/`[` and before `)`/`]`/`,`/`;`, and normalises trailing-whitespace / line-endings. Spacing around `:`, `=`, and `->` is left alone today — those need bracket-depth awareness (slice vs annotation) and are deferred. A full AST-based reprinter is a Phase-5 follow-up. |
+| `tyc fmt` | Format `.ty` source. The pipeline runs a Typhon-aware whitespace normaliser first (collapsing interior whitespace, tidying bracket/comma spacing, expanding leading tabs, normalising line-endings) and then, when the post-normalised buffer contains no Typhon-only tokens, pipes it through `ruff format` for the spacing rules around `:`, `=`, and `->`. If `ruff` is missing on `PATH` or fails, the in-process output is kept. |
 | `tyc lsp` | Run as a Language Server. |
-| `tyc init` | Scaffold a new project: `typhon.toml`, `src/`, `tests/`. |
+| `tyc init` | Scaffold a new project: `typhon.toml`, `src/`, `tests/`. The generated `src/main.ty` includes a frozen dataclass, an `impl` block, a `mut` binding, and a `Result`/`?`/`match` example; the generated `typhon.toml` ships every `[strictness]` / `[emit]` key with a comment. |
 | `tyc trace` | Map a Python traceback back to Typhon source via `.py.map` files. |
 | `tyc profile` | Instrument emitted code for hot-function detection (advanced, opt-in). |
 | `tyc migrate` | Convert typed Python (`.py`) to Typhon (`.ty`): rewrites `Optional[T]`/`T \| None` → `T?`, adds `let`/`mut` to module-level annotated assigns *and* function-body plain assignments, strips `@dataclass` decorators. |
 | `tyc ty` | Build the project and run Astral's `ty` checker against the emitted Python. Requires `ty` on `PATH` (`pip install ty`). Supports `--watch` for continuous feedback. |
 | `tyc stubtest` | Build the project and run `python -m mypy.stubtest` against every emitted `.pyi` stub. Complements `tyc check --stubs` (which performs an AST diff) by catching dynamically-created attributes the AST cannot see. Requires `mypy` in the chosen interpreter (`pip install mypy`). |
 | `tyc repl` | Interactive Typhon evaluator. Reads `.ty` source one block at a time, compiles it through the full pipeline, and executes the result with a Python interpreter. |
-| `tyc debug` | Build the project and launch the emitted Python under a debugger (default `pdb`). Thin v1 wrapper — a Typhon-native source-mapping debugger is a Phase-5 item. |
+| `tyc debug` | Build the project and launch the emitted Python under a debugger (default `pdb`). Repeatable `--break <ty-file>:<line>` flags translate Typhon source locations through the v2 `.py.map` and inject `-c "break …"` into the debugger session, so breakpoints set on `.ty` lines fire on the corresponding emitted Python lines. |
 | `tyc run` | Execute a Typhon program. By default uses the in-process tree-walking VM ([docs/vm.md](vm.md)) — no `.py` is written, no CPython is spawned. `--compile` (alias `--no-vm`) falls back to the legacy build-then-exec path; pair with `--temp` to build into a tempdir that is removed on exit. |
+| `tyc explain <code>` | Print the diagnostic catalog entry for a `tyc::` code (mirrors `rustc --explain`). Accepts the short form (`immutable_assign`) or the fully-qualified `tyc::immutable_assign`. Every catalog page also lives at `docs/diagnostics/<code>.md` and is linked from the `url(...)` clause on each diagnostic. |
+| `tyc cheatsheet` | Print the 30-second Typhon cheat sheet (from [docs/cheatsheet.md](cheatsheet.md)) to stdout. Handy when you need a syntax refresher without leaving the terminal. |
 | `tyc add` / `tyc remove` / `tyc sync` | Lightweight package-manager surface over `uv`: rewrite `[dependencies]` / `[dev-dependencies]` in `typhon.toml` and run `uv sync` to install. |
 
 ## Typical workflow
@@ -60,10 +62,48 @@ Python environment for the project:
    itself returns non-zero, the failure is downgraded to a warning so
    the `.py` artefacts still land — the codegen output is useful
    regardless of whether the install step resolved.
+3. **`.py` files in `src/` are copied verbatim** to the output dir
+   (skipping `__pycache__/`, `tests/`, `.venv/`, and dotfiles), so a
+   hand-written Python helper next to your `.ty` source is importable
+   from the emitted code. A relative `.py` import that resolves outside
+   `src/` fires `tyc::orphan_py_import`.
 
 The intent is that `tyc build` followed by `python build/main.py` works
 out of the box on a freshly cloned project, no separate `tyc sync`
 step required.
+
+| Flag | Effect |
+|------|--------|
+| `--out DIR` / `-o` | Override the `[project] out` directory. Relative paths resolve against the project root. |
+| `--no-format` | Skip the `ruff format` post-process. |
+| `--check` | Dry-run: list every file that *would* be created or overwritten without touching disk. The full pipeline still runs, so type errors continue to surface. |
+
+## `tyc explain`
+
+Print the catalog entry for any `tyc::` diagnostic. Useful when a
+diagnostic in the terminal isn't self-explanatory and you don't want to
+context-switch to a browser.
+
+```bash
+tyc explain immutable_assign           # short code
+tyc explain tyc::immutable_assign      # fully-qualified — both work
+```
+
+Every diagnostic emitted by `tyc` also carries a `url(https://typhon.dev/lang/diagnostics/<code>)`
+attribute (rendered inline by miette), so the same page is one click away
+in any terminal that linkifies URLs. The full catalog lives under
+[`docs/diagnostics/`](diagnostics/README.md).
+
+## `tyc cheatsheet`
+
+Print the 30-second Typhon cheat sheet ([`docs/cheatsheet.md`](cheatsheet.md))
+to stdout. Same content the `tyc init` scaffold links to, kept embedded
+in the binary so it works offline.
+
+```bash
+tyc cheatsheet                  # straight to stdout
+tyc cheatsheet | less           # paginate it
+```
 
 ## `tyc migrate`
 
@@ -171,7 +211,7 @@ tyc repl --python python3.13
 
 ## `tyc debug`
 
-Builds the project, then execs the configured Python debugger on the emitted entry-point. v1 is a deliberately thin wrapper — frames surface as `build/*.py` paths; pair with `tyc trace` to remap captured tracebacks back to `.ty` source via the `.py.map` sidecars.
+Builds the project, then execs the configured Python debugger on the emitted entry-point. Frames surface as `build/*.py` paths; pair with `tyc trace` to remap captured tracebacks back to `.ty` source via the `.py.map` sidecars.
 
 ```bash
 # Step through build/main.py under pdb:
@@ -182,6 +222,13 @@ tyc debug --entry api.py --debugger pudb
 
 # Forward args to the script:
 tyc debug -- --verbose --port 8080
+
+# Set a breakpoint on a Typhon line. `tyc` translates it through .py.map
+# and passes `-c "break build/main.py:N"` to the debugger:
+tyc debug --break src/main.ty:42
+
+# Multiple breakpoints stack:
+tyc debug --break src/main.ty:42 --break src/lib/io.ty:7
 ```
 
 | Flag | Purpose |
@@ -189,6 +236,7 @@ tyc debug -- --verbose --port 8080
 | `--entry FILE` | Entry-point file relative to the build dir (default `main.py`) |
 | `--python PATH` | Python interpreter (default `python3`) |
 | `--debugger MODULE` | Module to launch under `python -m` (default `pdb`; e.g. `pudb`, `ipdb`, `debugpy`) |
+| `--break TY:LINE` | Set a breakpoint at `<ty-file>:<line>` (Windows-style `C:\foo.ty:10` and POSIX paths both work — the line number is parsed from the segment after the last `:`). Repeatable. Lines that don't appear in the `.py.map` table surface a warning and are skipped. |
 | `--no-build` | Skip rebuilding; assume `build/` is current |
 
 ## `tyc run`

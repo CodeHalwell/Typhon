@@ -1,0 +1,50 @@
+---
+title: tyc cheatsheet
+description: Print the 30-second Typhon syntax refresher to stdout.
+sidebar:
+  order: 17
+---
+
+```
+tyc cheatsheet
+```
+
+Prints the 30-second Typhon cheat sheet to stdout — every keyword and pattern you need to write or read a `.ty` file, on one screen. Source lives at [`docs/cheatsheet.md`](https://github.com/CodeHalwell/Typhon/blob/main/docs/cheatsheet.md) and is embedded into the `tyc` binary so it works offline.
+
+## Examples
+
+```bash
+tyc cheatsheet                    # straight to stdout
+tyc cheatsheet | less             # paginate it
+tyc cheatsheet > cheatsheet.txt   # save it locally
+```
+
+## What it covers
+
+- **Bindings** — `let` / `mut`, the function-body rule, module-level default to `let`.
+- **Annotations** — Rule 1, `T?` for `T | None`, explicit `-> None`.
+- **Classes** — `class` (dataclass), `class frozen` (immutable), `plain class` (no decorator), `class!` (raw with synthesised `__init__`), `model` (Pydantic).
+- **Methods in `impl` blocks** — Rule 4.
+- **Sealed unions + exhaustive `match`** — declaration and pattern arms.
+- **`Result[T, E]` + `?`** — Ok/Err, error propagation, with-chains.
+- **Concurrency** — `gather:`, `go`, `lazy import`.
+- **Comptime** — `comptime let`, `env()`, build-time evaluation.
+- **CLI** — every common `tyc` subcommand with a one-line purpose.
+
+The full reference lives across [Language Tour](/Typhon/tour/values-bindings/) and [Language Reference](/Typhon/reference/lexical/); the cheat sheet is the rapid-lookup view.
+
+## When to reach for it
+
+- Quick keyword refresh during code review without context-switching to a browser.
+- Pair-programming or workshop scenarios where copy-pasting the syntax saves time.
+- Generating documentation snippets that need the canonical pattern shapes.
+
+## Flags
+
+`tyc cheatsheet` takes no arguments today. The content matches `docs/cheatsheet.md` byte-for-byte.
+
+## Where next
+
+- [The Five Rules of Typhon](/Typhon/tour/five-rules/) — the deeper "if you remember nothing else" tour.
+- [Language Reference](/Typhon/reference/lexical/) — the full surface, syntax-form by syntax-form.
+- [`tyc explain`](/Typhon/cli/explain/) — diagnostic-specific catalog pages.

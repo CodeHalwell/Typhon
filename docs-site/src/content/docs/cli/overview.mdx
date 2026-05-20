@@ -25,7 +25,7 @@ The `tyc` binary is the compiler, formatter, language server, REPL, migrator, de
     Format `.ty` source in place. [Reference →](/Typhon/cli/fmt/)
   </Card>
   <Card title="tyc run" icon="forward-slash">
-    Build then exec — `tsx` for Typhon. `--temp` for ephemeral builds. [Reference →](/Typhon/cli/run/)
+    Execute a Typhon program in the in-process VM (default) or via `--compile` for CPython interop. [Reference →](/Typhon/cli/run/)
   </Card>
   <Card title="tyc lsp" icon="puzzle">
     Language Server on stdio. Diagnostics, hover, completion, code actions. [Reference →](/Typhon/cli/lsp/)
@@ -34,7 +34,7 @@ The `tyc` binary is the compiler, formatter, language server, REPL, migrator, de
     Interactive evaluator. [Reference →](/Typhon/cli/repl/)
   </Card>
   <Card title="tyc debug" icon="bug">
-    Build then launch the emitted Python under pdb. [Reference →](/Typhon/cli/debug/)
+    Build then launch the emitted Python under pdb; `--break <ty>:<line>` translates source-mapped breakpoints. [Reference →](/Typhon/cli/debug/)
   </Card>
   <Card title="tyc trace" icon="external">
     Map a Python traceback back to `.ty` source via `.py.map`. [Reference →](/Typhon/cli/trace/)
@@ -51,6 +51,12 @@ The `tyc` binary is the compiler, formatter, language server, REPL, migrator, de
   <Card title="tyc stubtest" icon="warning">
     Runtime probe via `mypy --stubtest` against emitted `.pyi`. [Reference →](/Typhon/cli/stubtest/)
   </Card>
+  <Card title="tyc explain" icon="information">
+    Print the diagnostic catalog entry for a `tyc::` code. Mirrors `rustc --explain`. [Reference →](/Typhon/cli/explain/)
+  </Card>
+  <Card title="tyc cheatsheet" icon="open-book">
+    Print the 30-second Typhon syntax refresher to stdout. [Reference →](/Typhon/cli/cheatsheet/)
+  </Card>
   <Card title="tyc add / remove / sync" icon="seti:config">
     Package-manager surface over `uv`. [Reference →](/Typhon/cli/packages/)
   </Card>
@@ -66,9 +72,13 @@ cd myapp
 # Daily loop
 tyc fmt src/
 tyc check src/      # ← fast feedback
-tyc build           # ← full emit
-tyc run             # ← build + exec in one step
+tyc run             # ← in-process VM, no build dir
+tyc build           # ← when you need emitted .py on disk
 ```
+
+When your program imports CPython libraries the VM doesn't speak natively
+(`numpy`, `requests`, `pandas`, …), use `tyc run --compile` to fall back
+to the build-then-exec path.
 
 ## In CI
 
@@ -103,7 +113,7 @@ Per-command flags are documented on each command's page.
 | 2 | Compile-time error — diagnostics emitted. |
 | 130 | Interrupted (Ctrl-C). |
 
-`tyc run` propagates the child Python's exit code instead of overriding.
+`tyc run` propagates the child program's exit code instead of overriding (the VM exits with the script's terminating exit code; `--compile` mode propagates the child Python's exit code).
 
 See [Exit Codes](/Typhon/cli/exit-codes/) for the full table.
 

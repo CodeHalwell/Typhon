@@ -1,13 +1,13 @@
 ---
-title: class, model, class!
-description: The three forms of class declaration — dataclass, Pydantic, and the framework-escape hatch.
+title: class, model, plain class, class!
+description: The class declaration forms — dataclass, Pydantic, the no-decoration escape hatch, and the framework-escape hatch.
 sidebar:
   order: 4
 ---
 
 import { Tabs, TabItem } from '@astrojs/starlight/components';
 
-Typhon has three keywords for declaring class-like types, each emitting a different shape of Python.
+Typhon has four keywords for declaring class-like types, each emitting a different shape of Python.
 
 ## `class` — dataclass emission (default)
 
@@ -122,6 +122,54 @@ The type checker catches the first two at compile time; the third is a runtime c
 | Internal types | Data crossing trust boundaries |
 | Maximum performance | Runtime validation |
 | No extra constraints | `Field(min_length=1, ...)` validators available |
+
+## `plain class` — no-decoration escape hatch
+
+```python
+plain class Bag:
+    items: list[str]
+    label: str = "unsorted"
+```
+
+Emits a bare `class` with **no `@dataclass` decorator and no synthesised `__init__`**. The body emits verbatim, so attributes only exist on instances when user code assigns them — exactly like a hand-written Python class.
+
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    plain class Bag:
+        items: list[str]
+        label: str = "unsorted"
+    ```
+  </TabItem>
+  <TabItem label="Emitted">
+    ```python
+    class Bag:
+        items: list[str]
+        label: str = "unsorted"
+    ```
+  </TabItem>
+</Tabs>
+
+### When to use `plain class`
+
+Reach for `plain class` when you want stock Python class semantics:
+
+- **Metaclass-driven libraries** that set instance attributes dynamically: Textual app classes, Django ORM models with descriptor-based fields, SQLAlchemy declarative bases, custom metaclasses.
+- **Descriptors** (`@property`, `__get__` / `__set__` / `__delete__`) on class-level names where `@dataclass(slots=True)` would conflict.
+- **Public-API base classes** for downstream subclassers who expect a non-slotted, non-frozen, non-dataclass parent.
+- **Anything where `@dataclass` is the wrong fit** but `class!` over-promises by auto-synthesising `__init__`.
+
+The relationship to the other forms is best read as a 2x2 grid:
+
+| | `@dataclass` injected? | `__init__` synthesised? |
+|---|---|---|
+| `class Foo:` | yes | by `@dataclass` |
+| `class! Foo(Base):` | no | yes (calls `super().__init__()`) |
+| `plain class Foo:` | no | no (body emits verbatim) |
+
+### Auto-skip for known framework bases
+
+A plain `class Foo(Base):` (no `plain` / `class!` marker) whose base is `Enum`, `IntEnum`, `StrEnum`, `Flag`, `IntFlag`, `ABC`, `ABCMeta`, `Protocol`, `TypedDict`, or `NamedTuple` is **automatically** emitted without `@dataclass`, so the most common framework-base cases work without needing any marker. Project-specific bases can be added via [`[emit] skip-decoration-bases`](/Typhon/configuration/emit/#skip-decoration-bases) in `typhon.toml`. Auto-skip drops the decorator but does **not** synthesise an `__init__` — write the constructor yourself, or escalate to `class!` if you want one synthesised.
 
 ## `class!` — framework escape hatch
 

@@ -1,13 +1,13 @@
 ---
 title: Classes and Models
-description: class, model, class!, impl, extend, frozen, and inheritance — the full data-modelling story.
+description: class, model, plain class, class!, impl, extend, frozen, and inheritance — the full data-modelling story.
 sidebar:
   order: 5
 ---
 
 import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
-Typhon's `class` is deliberately minimal: no `__init__`, no explicit `self`-in-body. The compiler emits a `@dataclass(slots=True)` by default, a Pydantic `BaseModel` if you use the `model` keyword, or a bare class with synthesised `__init__` if you use `class!` for framework bases. Methods live in `impl` blocks, Rust-style.
+Typhon's `class` is deliberately minimal: no `__init__`, no explicit `self`-in-body. The compiler emits a `@dataclass(slots=True)` by default, a Pydantic `BaseModel` for `model`, a bare class with no decorator and no synthesised constructor for `plain class`, or a bare class with synthesised `__init__` calling `super().__init__()` for `class!`. Methods live in `impl` blocks, Rust-style.
 
 ## A first class
 
@@ -182,7 +182,23 @@ Two things to notice:
 
 You can mix both freely in one project.
 
-## `class!` — the escape hatch for framework bases
+## `plain class` — stock Python class semantics
+
+When you want a bare Python class with no decorator and no synthesised constructor — body emits verbatim, attributes only exist on instances once user code assigns them — reach for `plain class`. This is the symmetric form of `frozen class`, and the canonical Python-interop escape hatch:
+
+```python
+plain class Bag:
+    items: list[str]
+    label: str = "unsorted"
+
+# Emitted: bare `class Bag:` with no @dataclass, no __init__.
+```
+
+Use it for metaclass-driven libraries (Textual app classes, Django ORM with descriptor-based fields, SQLAlchemy declarative bases) that set instance attributes dynamically — the dataclass decorator's `slots=True` would conflict with the framework's own attribute layout, and you don't want a generated `__init__` either.
+
+For the related auto-skip rule: a plain `class Foo(Base):` whose base is `Enum`, `IntEnum`, `StrEnum`, `Flag`, `IntFlag`, `ABC`, `ABCMeta`, `Protocol`, `TypedDict`, or `NamedTuple` is automatically emitted without `@dataclass` — no `plain class` marker needed. Project-specific bases can be added via [`[emit] skip-decoration-bases`](/Typhon/configuration/emit/#skip-decoration-bases).
+
+## `class!` — the escape hatch for framework bases (with synthesised `__init__`)
 
 Some classes can't be expressed as dataclasses: `torch.nn.Module`, `enum.Enum`, `typing.NamedTuple`, `unittest.TestCase`, Django models, SQLAlchemy declarative bases — anything whose base class needs a non-trivial `__init__` to run *before* fields are assigned. For those, use `class!`:
 

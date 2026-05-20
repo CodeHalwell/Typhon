@@ -19,6 +19,7 @@ tyc/
 │   ├── tyc-format/             ruff format wrapper
 │   ├── tyc-diagnostics/        miette-based renderer
 │   ├── tyc-lsp/                LSP backend
+│   ├── tyc-vm/                 in-process tree-walking interpreter (tyc run default)
 │   └── tyc/                    CLI binary
 └── vendor/                     Typhon's fork of Ruff
     ├── ruff_text_size/
@@ -78,15 +79,19 @@ Hand-written pretty-printer. Records per-statement `(out_line → ty_line)` for 
 
 ### `tyc-format`
 
-Shells out to `ruff format`. One function, one concern.
+Composes an in-process whitespace pass with an optional `ruff format` wrap (when on `PATH` and the post-pass buffer contains no Typhon-only tokens). One function, one concern.
 
 ### `tyc-diagnostics`
 
-Every diagnostic code is registered here. Search `tyc::CODE_NAME` to find every emission site.
+Every diagnostic code is registered here. Search `tyc::CODE_NAME` to find every emission site. Each variant carries a `url(https://typhon.dev/lang/diagnostics/<code>)` clause for miette's deep-link rendering.
 
 ### `tyc-lsp`
 
 `tower-lsp-server` backend. Reuses the same Salsa DB as the CLI.
+
+### `tyc-vm`
+
+In-process tree-walking interpreter for `.ty` source. Default execution mode for `tyc run` — no `build/` directory, no CPython spawn. Reuses the preprocess + parse pipeline from `tyc-syntax` and walks the AST with a Rust environment. Native support covers core language, `Result[T, E]`, ~50 builtins, `math` / `os` / `sys` / `json` / `time` / `random` shims, and `str` / `list` / `dict` / `set` methods. Unsupported features (async, real generators, full CPython stdlib) raise `NotImplementedError` at runtime with a pointer to `--compile`.
 
 ### `tyc`
 
@@ -98,6 +103,8 @@ The clap-based CLI. Wires everything together.
 - **Bug in lowering?** `tyc-desugar`.
 - **Bug in emitted Python format?** `tyc-emit`.
 - **Bug in diagnostic wording?** `tyc-diagnostics` plus the call site.
+- **`tyc run` produces wrong result without `--compile`?** `tyc-vm`.
+- **`tyc fmt` produces wrong whitespace?** `tyc-format`.
 - **New CLI flag?** `tyc/crates/tyc`.
 - **Salsa cache invalidation?** `tyc-db`.
 

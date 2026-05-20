@@ -22,6 +22,7 @@ free-threaded = false       # opt-in; requires 3.13t/3.14t
 [emit]
 class-default = "dataclass" # or "pydantic"
 format = true               # post-process through ruff format
+skip-decoration-bases = []  # extra base classes that suppress @dataclass injection
 
 [strictness]
 no-implicit-any = true
@@ -70,8 +71,9 @@ pytest = "8.2"              # bare version → ==8.2
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `class-default` | `"dataclass"` \| `"pydantic"` | Default emit target for `class` declarations. Overridable per-class via the `model` keyword. |
+| `class-default` | `"dataclass"` \| `"pydantic"` | Default emit target for `class` declarations. Overridable per-class via the `model` keyword. Unknown values (`"struct"`, `"plain"`, `"none"`, the empty string, …) are rejected at config load with `tyc::invalid_config_value` rather than silently treated as `"dataclass"`. |
 | `format` | bool | Post-process emitted `.py` through `ruff format`. |
+| `skip-decoration-bases` | list of strings | Extra base-class names that suppress the automatic `@dataclasses.dataclass(slots=True)` decorator and trigger plain-class emission with a synthesised `__init__` calling `super().__init__()`. Matched by *last segment*, so `["BaseModel", "MyCustomBase"]` catches `pydantic.BaseModel` and `mylib.frameworks.MyCustomBase` regardless of how they're imported. Built-in entries (`Protocol`, `Enum`, `IntEnum`, `Flag`, `IntFlag`, `StrEnum`, `ABC`, `NamedTuple`, `BaseModel`, `App`) are auto-skipped without needing to be listed. |
 
 > **Always-on behaviour.** Two emit policies that used to be exposed in
 > `typhon.toml` are no longer configurable and run unconditionally:

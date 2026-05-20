@@ -19,6 +19,7 @@ error[tyc::nullable_use]: cannot pass `str | None` where `str` is required
  │           ^^^^^ check this is not `None` before passing it
  │
  = help: narrow with `if found is not None:` or use `guard found = ... else: ...`
+ = url: https://typhon.dev/lang/diagnostics/nullable_use
 ```
 
 | Part | Meaning |
@@ -29,6 +30,7 @@ error[tyc::nullable_use]: cannot pass `str | None` where `str` is required
 | `┌─ src/main.ty:9:11` | Primary source span: file, line, column. |
 | `^^^^^` underline | The exact substring at fault. |
 | `= help: ...` | Suggested fix. |
+| `= url: ...` | Catalog page deep-link, miette `url(...)` clause. Click in any terminal that linkifies URLs, or run `tyc explain <code>` to get the same content offline. |
 
 ## Severity
 
@@ -47,16 +49,16 @@ Every diagnostic has a `tyc::*` code. The catalog is enumerated across the follo
 
 <CardGrid>
   <Card title="Type & Inference Errors" icon="warning">
-    [→](/Typhon/diagnostics/type-errors/) — `missing_annotation`, `type_mismatch`, `arg_count`, `not_callable`, `unknown_name`, `attribute_not_found`, `generic`, `typevar_bound`, `generator_return_type`, `cyclic_type_alias`, `comptime`.
+    [→](/Typhon/diagnostics/type-errors/) — `missing_annotation`, `type_mismatch`, `arg_count`, `not_callable`, `unknown_name`, `attribute_not_found`, `generic`, `typevar_bound`, `generator_return_type`, `cyclic_type_alias`, `comptime`, `operator_type_mismatch`, `tuple_index_out_of_range`, `python_semantic_drift`.
   </Card>
   <Card title="Binding Errors" icon="document">
-    [→](/Typhon/diagnostics/binding-errors/) — `missing_binding_kind`, `immutable_assign`, `unused_import`.
+    [→](/Typhon/diagnostics/binding-errors/) — `missing_binding_kind`, `immutable_assign`, `unused_import`, `no_block_shadow`.
   </Card>
   <Card title="Nullability Errors" icon="puzzle">
     [→](/Typhon/diagnostics/nullability/) — `nullable_use`.
   </Card>
   <Card title="Class Errors" icon="setting">
-    [→](/Typhon/diagnostics/class-errors/) — `manual_init`, `frozen_assign`, `method_in_class_body`, `duplicate_class`, `impl_unknown_class`, `extend_builtin`.
+    [→](/Typhon/diagnostics/class-errors/) — `manual_init`, `frozen_assign`, `method_in_class_body`, `duplicate_class`, `impl_unknown_class`, `extend_builtin`, `class_attr_shadows_slot`, `self_outside_impl`.
   </Card>
   <Card title="Result Errors" icon="approve-check">
     [→](/Typhon/diagnostics/result-errors/) — `invalid_question_op`, `result_error_mismatch`.
@@ -74,7 +76,10 @@ Every diagnostic has a `tyc::*` code. The catalog is enumerated across the follo
     [→](/Typhon/diagnostics/stub-errors/) — `stub_mismatch`.
   </Card>
   <Card title="Compile & Interface Errors" icon="error">
-    [→](/Typhon/diagnostics/compile-errors/) — `io`, `parse`, `interface_not_conforming`, `lazy_usage`.
+    [→](/Typhon/diagnostics/compile-errors/) — `io`, `parse`, `interface_not_conforming`, `lazy_usage`, `unknown_module`, `unknown_kwarg`, `typevar_import_rejected`, `typing_alias_deprecated`.
+  </Card>
+  <Card title="Phase 5 Interop & Lints" icon="information">
+    Added in v0.1.6 — `orphan_py_import` (relative `.py` outside `src/`), `contains_secret_literal` (credential-named comptime literal), `invalid_config_value` (unknown `[emit] class-default` / etc.), `main_not_called` (script defines `main()` but never calls it).
   </Card>
 </CardGrid>
 
@@ -88,9 +93,11 @@ The LSP publishes diagnostics directly to your editor; the editor renders them.
 
 When you hit `error[tyc::some_code]`:
 
-1. **Look up the page** — the catalog groups codes by what triggers them.
-2. **`rg "tyc::some_code" tyc/crates`** in the compiler source if you're hacking on `tyc` — every code is registered once.
-3. **`tyc lsp` "Remove unused import" code action** fires on the relevant diagnostics; check your editor's quick-fix menu.
+1. **`tyc explain <code>`** — print the catalog entry directly to your terminal (mirrors `rustc --explain`). Accepts short (`nullable_use`) or fully-qualified (`tyc::nullable_use`) forms.
+2. **Click the `url:` deep-link** on the diagnostic — every `tyc::` diagnostic carries a `url(https://typhon.dev/lang/diagnostics/<code>)` clause that linkifies in modern terminals.
+3. **Look up the page** in the sidebar — the catalog groups codes by what triggers them.
+4. **`rg "tyc::some_code" tyc/crates`** in the compiler source if you're hacking on `tyc` — every code is registered once.
+5. **`tyc lsp` "Remove unused import" code action** fires on the relevant diagnostics; check your editor's quick-fix menu.
 
 ## What if the diagnostic is wrong?
 

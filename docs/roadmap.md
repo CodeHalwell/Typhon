@@ -333,7 +333,9 @@ The minimum-viable Typhon is **non-null types + sealed unions + `Result` + datac
 
 ## Concrete next steps
 
-Phases 0–3 are complete. The current frontier is Phase 4+:
+Phases 0–3 are complete. Phase 5 — interop and developer experience —
+shipped in v0.1.6. Phase 4+ work (everything not on the headline path)
+remains the open frontier:
 
 1. Corpus round-trip sweep: run `tyc build` over a representative set of
    third-party Python projects and compare the emitted `.py` against the
@@ -345,5 +347,10 @@ Phases 0–3 are complete. The current frontier is Phase 4+:
    Salsa-tracked queries so the LSP second-check latency drops to near-zero
    for unchanged files.
 4. Loop parallelisation for pure comprehensions on free-threaded Python.
-5. Runtime `stubtest` probe via `mypy --stubtest` as a complement to the
-   AST-level `tyc check --stubs` diff.
+5. Broaden the Phase-5.2 `tyc::python_semantic_drift` audit: catalogue
+   every accepted-by-Python shape the checker still rejects (beyond `or`
+   /`and` and `Generator → Iterable` which already landed) and either fix
+   it or downgrade to a warning.
+6. A Typhon-native source-mapping debugger that drives breakpoints
+   directly against `.ty` source instead of through `--break TY:LINE`
+   translation on top of `pdb`.

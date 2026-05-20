@@ -380,7 +380,10 @@ Single binary, `clap` subcommands:
 | `tyc migrate` | Convert typed Python (`.py`) into Typhon (`.ty`): `Optional[T]`/`T \| None` → `T?`, module-level annotated assigns gain `let`/`mut`, `@dataclass` decorators are dropped. |
 | `tyc ty` | Build the project and run Astral's `ty` checker against the emitted Python (subprocess, opt-in). |
 | `tyc repl` | Interactive Typhon evaluator — pipes each block through the full compile pipeline and a Python interpreter. |
-| `tyc debug` | Build the project and launch the emitted Python under a debugger (default `pdb`). Thin v1; a source-mapping Typhon-native debugger is a Phase-5 deliverable. |
+| `tyc debug` | Build the project and launch the emitted Python under a debugger (default `pdb`). Repeatable `--break <ty-file>:<line>` flags translate Typhon source locations through `.py.map` and forward them into the debugger session. A full Typhon-native source-mapping debugger UI is still a follow-up. |
+| `tyc run` | Execute a Typhon program. Defaults to the in-process `tyc-vm` tree-walking interpreter — no `.py` written, no CPython spawn. `--compile` falls back to build-then-exec for programs that import CPython libraries the VM doesn't speak natively. |
+| `tyc explain <code>` | Print the catalog entry for a diagnostic code (mirrors `rustc --explain`). |
+| `tyc cheatsheet` | Print the 30-second Typhon cheat sheet to stdout. |
 | `tyc add` / `tyc remove` / `tyc sync` | Lightweight package-manager surface over `uv`: rewrite `[dependencies]` / `[dev-dependencies]` in `typhon.toml` and run `uv sync`. |
 
 ### `typhon.toml`
@@ -425,7 +428,21 @@ pytest = "8.2"
 
 Realistic milestones for one person plus AI assistance. The headline target is a useful subset shippable in twelve months.
 
-> **Status (May 2026):** Phases 0–3 are complete. Phase 4+ work has begun — auto-gather, auto-parallel, PGO, LSP completions and code actions, cross-file go-to-definition, the package-manager surface, REPL, debugger, and `tyc migrate` have all landed. See [docs/roadmap.md](roadmap.md) for the canonical per-feature status.
+> **Status (May 2026):** Phases 0–3 are complete. Phase 5 — interop and
+> developer experience — shipped in [v0.1.6](https://github.com/CodeHalwell/Typhon/releases/tag/v0.1.6):
+> `plain class`, auto-skip for `Enum`/`Flag`/`ABC` parents plus a user-
+> configurable `[emit] skip-decoration-bases` list, `class-default`
+> validation, `or`/`and` truthy-union typing, generator→`Iterable`
+> conformance, `tyc explain` / `tyc cheatsheet`, an upgraded `tyc init`
+> scaffold, `.py`-in-`src/` copy-through, `tyc build --check`,
+> `tyc::contains_secret_literal`, miette `url(...)` deep-links on every
+> diagnostic with 50+ catalog pages, `tyc fmt` wrapping `ruff format`, and
+> `tyc debug --break TY:LINE` source mapping. Phase 4+ work is also
+> landed: auto-gather, auto-parallel, PGO, LSP completions and code
+> actions, cross-file go-to-definition, the package-manager surface,
+> REPL, debugger, the `tyc-vm` tree-walking interpreter (default for
+> `tyc run`), and `tyc migrate`. See [docs/roadmap.md](roadmap.md) for
+> the canonical per-feature status.
 
 ### Phase 0 — Foundation (months 1–2) ✅ complete
 
@@ -474,10 +491,12 @@ At the end of Phase 3 — roughly month twelve — Typhon is useful for a real b
 - ✅ PGO via `tyc profile` (opt-in via `[strictness] pgo-memoise`): promotes hot pure functions to `@functools.cache` from `typhon-profile.json`.
 - ✅ LSP completions (visible bindings + Typhon keywords + common builtins) and a "Remove unused import" code-action quick-fix; cross-file go-to-definition across `.ty`/`.py` boundaries via the resolver's Salsa `resolved_module` query and the v2 `.py.map` source maps.
 - ✅ Migration tooling from typed `.py` to `.ty` (`Optional[T]` → `T?`, `let`/`mut` on annotated assigns, `@dataclass` decorators dropped) via `tyc migrate`.
-- ✅ Interactive REPL (`tyc repl`) and a thin pdb-launcher debugger (`tyc debug`).
+- ✅ Interactive REPL (`tyc repl`) and a pdb-launcher debugger (`tyc debug`) with `--break TY:LINE` source-mapped breakpoints.
 - ✅ Package-manager surface over `uv` (`tyc add` / `tyc remove` / `tyc sync`).
-- Runtime `stubtest` probe (mypy-style introspection) as a complement to the AST-level `tyc check --stubs` diff. (Deferred.)
-- `ty` integration as a complementary second-stage checker over the desugared Python — see [docs/ty-integration.md](ty-integration.md). (Deferred.)
+- ✅ `tyc run` defaults to the in-process `tyc-vm` tree-walking interpreter — no `build/`, no CPython spawn. `--compile` (alias `--no-vm`) falls back to the legacy build-then-exec path for programs that import CPython libraries the VM doesn't speak natively. See [docs/vm.md](vm.md).
+- ✅ Phase 5 interop + DX bundle (v0.1.6): `plain class`, `[emit] skip-decoration-bases`, `class-default` validation, `or`/`and` truthy-union typing, generator→`Iterable` conformance, `tyc explain` / `tyc cheatsheet`, `tyc build --check`, `.py`-in-`src/` copy-through with `tyc::orphan_py_import`, `tyc::contains_secret_literal`, miette `url(...)` deep-links on every diagnostic, `tyc fmt` wrapping `ruff format`. See [docs/roadmap.md](roadmap.md#phase-5--interop-and-developer-experience--complete-v016).
+- ✅ Runtime `stubtest` probe via `tyc stubtest` (shells out to `python -m mypy.stubtest`) — complements the AST-level `tyc check --stubs` diff.
+- `ty` integration as a complementary second-stage checker over the desugared Python — see [docs/ty-integration.md](ty-integration.md). (Subprocess form landed as `tyc ty`; the embedded-library form is deferred.)
 
 ## Risks and how to manage them
 

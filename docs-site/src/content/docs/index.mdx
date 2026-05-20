@@ -120,7 +120,7 @@ The match on `LoadError` is statically exhaustive — add a third variant to the
     Emits idiomatic Python you can read, debug, and ship. The handful of helpers (`Result`, `lazy`, task registry) is generated locally as `typhon_runtime/`. No PyPI install.
   </Card>
   <Card title="One binary, full pipeline" icon="terminal">
-    `tyc` is the compiler, formatter, language server, REPL, migrator, debugger launcher, and package-manager surface — sub-100ms incremental feedback via Salsa.
+    `tyc` is the compiler, formatter, language server, REPL, in-process VM, migrator, debugger launcher, and package-manager surface — sub-100ms incremental feedback via Salsa.
   </Card>
 </CardGrid>
 
@@ -137,6 +137,6 @@ The match on `LoadError` is statically exhaustive — add a third variant to the
 
 ## Status
 
-Phases 0 through 3 of the [roadmap](/Typhon/project/roadmap/) are complete. Phase 4+ is in progress: auto-gather, auto-parallel for free-threaded Python, PGO, LSP completions, cross-file go-to-definition, REPL, debugger, `tyc migrate`, and a package-manager surface over `uv` have all landed. The minimum-viable language — non-null types, sealed unions, `Result`, dataclass emit — is shippable today.
+Phases 0 through 3 of the [roadmap](/Typhon/project/roadmap/) are complete. **Phase 5 — interop and developer experience — shipped in [v0.1.6](https://github.com/CodeHalwell/Typhon/releases/tag/v0.1.6)**: `plain class`, auto-skip for framework parents, Python-semantic alignment for `or`/`and` and generators, `tyc explain` / `tyc cheatsheet`, diagnostic deep-links with 50+ catalog pages, `tyc build --check`, `tyc fmt` wrapping `ruff format`, and `tyc debug --break <ty>:<line>` source mapping. Phase 4+ items continue to land: auto-gather, auto-parallel for free-threaded Python, PGO, LSP completions with venv-driven introspection, cross-file go-to-definition, REPL, `tyc migrate`, a package-manager surface over `uv`, and the `tyc-vm` tree-walking interpreter that `tyc run` now defaults to (no `build/`, no CPython spawn). The minimum-viable language — non-null types, sealed unions, `Result`, dataclass emit — is shippable today.
 
 Typhon targets CPython 3.13+ (and the free-threaded 3.13t/3.14t builds when you opt in). It is not a new runtime, not a Mojo-style separate language, and not a replacement for the Python you already write. It is the language you reach for when you want Python's libraries with Rust-flavoured static safety and ergonomics.
