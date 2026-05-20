@@ -10,4 +10,6 @@ fi
 file="${1:?Usage: $0 <file.ty>}"
 echo "=== $file ==="
 "$TYC" check "$file" 2>&1
-echo "(exit: $?)"
+check_exit=$?
+echo "(exit: $check_exit)"
+exit "$check_exit"

@@ -36,10 +36,13 @@ echo "=== build: $file ==="
 (cd "$work" && "$TYC" build 2>&1)
 build_exit=$?
 echo "(build exit: $build_exit)"
-if [ $build_exit -eq 0 ]; then
-  echo "=== emitted: $work/build/main.py ==="
-  cat "$work/build/main.py"
-  echo "=== run ==="
-  (cd "$work" && "$PY" build/main.py 2>&1)
-  echo "(run exit: $?)"
+if [ $build_exit -ne 0 ]; then
+  exit "$build_exit"
 fi
+echo "=== emitted: $work/build/main.py ==="
+cat "$work/build/main.py"
+echo "=== run ==="
+(cd "$work" && "$PY" build/main.py 2>&1)
+run_exit=$?
+echo "(run exit: $run_exit)"
+exit "$run_exit"
