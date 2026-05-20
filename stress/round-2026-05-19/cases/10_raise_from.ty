@@ -1,0 +1,15 @@
+def parse(s: str) -> int:
+    try:
+        return int(s)
+    except ValueError as e:
+        raise RuntimeError(f"bad input: {s}") from e
+
+def main() -> None:
+    try:
+        let n: int = parse("not a number")
+        print(n)
+    except RuntimeError as e:
+        print(f"got: {e}")
+        print(f"cause: {e.__cause__}")
+
+main()

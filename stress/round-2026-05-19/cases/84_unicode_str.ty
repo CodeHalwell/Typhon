@@ -1,0 +1,8 @@
+def main() -> None:
+    let héllo: str = "Hëllo, 世界 🚀"
+    print(héllo)
+    print(len(héllo))
+    let греет: str = "Привет"
+    print(греет.upper())
+
+main()

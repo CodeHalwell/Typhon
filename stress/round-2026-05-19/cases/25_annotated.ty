@@ -1,0 +1,12 @@
+from typing import Annotated
+
+Positive = Annotated[int, "must be > 0"]
+
+def double(x: Positive) -> Positive:
+    return x * 2
+
+def main() -> None:
+    let n: Positive = 5
+    print(double(n))
+
+main()

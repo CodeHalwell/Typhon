@@ -1,0 +1,11 @@
+lazy let SLOW: int = expensive()
+
+def expensive() -> int:
+    print("computing SLOW...")
+    return 42
+
+def main() -> None:
+    print(SLOW)
+    print(SLOW)
+
+main()

@@ -1,0 +1,11 @@
+class User:
+    name: str
+
+    def __init__(self, n: str) -> None:
+        self.name = n
+
+def main() -> None:
+    let u: User = User("alice")
+    print(u.name)
+
+main()

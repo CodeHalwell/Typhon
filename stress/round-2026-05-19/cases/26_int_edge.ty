@@ -1,0 +1,14 @@
+def main() -> None:
+    let big: int = 10 ** 100
+    print(big)
+    print(big.bit_length())
+    let neg_mod: int = -7 % 3
+    print(neg_mod)
+    let q, r = divmod(-7, 3)
+    print(q, r)
+    let shift: int = 1 << 64
+    print(shift)
+    let mask: int = 0xFF & 0xF0
+    print(mask)
+
+main()

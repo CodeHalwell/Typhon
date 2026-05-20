@@ -1,0 +1,15 @@
+def lookup(d: dict[str, int]) -> str:
+    match d:
+        case {"x": x, "y": y}:
+            return f"point({x},{y})"
+        case {"name": n}:
+            return f"named {n}"
+        case _:
+            return "unknown"
+
+def main() -> None:
+    print(lookup({"x": 1, "y": 2}))
+    print(lookup({"name": 42}))
+    print(lookup({}))
+
+main()

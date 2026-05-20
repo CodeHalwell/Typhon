@@ -1,0 +1,15 @@
+def main() -> None:
+    let s: str = "  Hello, World!  "
+    print(s.strip().lower())
+    print(s.replace("l", "L"))
+    print(s.split(","))
+    print(s.startswith("  H"))
+    print(s.endswith("!  "))
+    print(s.partition(","))
+    print(s.rsplit(" ", 1))
+    print("a-b-c-d".split("-", 2))
+    print(",".join(["a", "b", "c"]))
+    print("abc".encode("utf-8"))
+    print(s.casefold())
+
+main()

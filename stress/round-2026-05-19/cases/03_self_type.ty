@@ -1,0 +1,17 @@
+from typing import Self
+
+class Builder:
+    name: str
+    parts: list[str]
+
+impl Builder:
+    def add(self, s: str) -> Self:
+        self.parts.append(s)
+        return self
+
+def main() -> None:
+    let b: Builder = Builder(name="x", parts=[])
+    let b2: Builder = b.add("a").add("b")
+    print(b2.parts)
+
+main()

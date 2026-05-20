@@ -1,0 +1,18 @@
+def head_tail(xs: list[int]) -> str:
+    match xs:
+        case []:
+            return "empty"
+        case [x]:
+            return f"single {x}"
+        case [x, y]:
+            return f"pair {x}, {y}"
+        case [x, *rest]:
+            return f"head {x}, rest {rest}"
+
+def main() -> None:
+    print(head_tail([]))
+    print(head_tail([7]))
+    print(head_tail([1, 2]))
+    print(head_tail([1, 2, 3, 4]))
+
+main()

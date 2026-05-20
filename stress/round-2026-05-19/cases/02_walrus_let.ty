@@ -1,0 +1,7 @@
+def main() -> None:
+    let xs: list[int] = [1, 2, 3]
+    let total: int = 0
+    if (let n := len(xs)) > 0:
+        print(n)
+
+main()

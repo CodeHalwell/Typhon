@@ -1,0 +1,24 @@
+from typing import Callable
+
+def f0(x: int) -> int: return x + 0
+def f1(x: int) -> int: return x + 1
+def f2(x: int) -> int: return x + 2
+def f3(x: int) -> int: return x + 3
+def f4(x: int) -> int: return x + 4
+def f5(x: int) -> int: return x + 5
+def f6(x: int) -> int: return x + 6
+def f7(x: int) -> int: return x + 7
+def f8(x: int) -> int: return x + 8
+def f9(x: int) -> int: return x + 9
+
+def compose(fns: list[Callable[[int], int]], x: int) -> int:
+    mut acc: int = x
+    for f in fns:
+        acc = f(acc)
+    return acc
+
+def main() -> None:
+    let fns: list[Callable[[int], int]] = [f0, f1, f2, f3, f4, f5, f6, f7, f8, f9]
+    print(compose(fns, 0))
+
+main()

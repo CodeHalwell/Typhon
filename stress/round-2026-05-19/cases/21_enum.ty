@@ -1,0 +1,20 @@
+from enum import Enum, IntEnum, StrEnum
+
+class Color(Enum):
+    RED = "red"
+    GREEN = "green"
+    BLUE = "blue"
+
+class Status(IntEnum):
+    OK = 200
+    NOT_FOUND = 404
+    SERVER_ERROR = 500
+
+def main() -> None:
+    let c: Color = Color.RED
+    let s: Status = Status.OK
+    print(c.value, s.value)
+    if s == Status.OK:
+        print("ok")
+
+main()

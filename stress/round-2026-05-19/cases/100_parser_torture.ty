@@ -1,0 +1,13 @@
+def main() -> None:
+    let x: int = ((((((((((1))))))))))
+    print(x)
+    let y: list[int] = [[1][0], [2][0]]
+    print(y)
+    let z: dict[str, dict[str, int]] = {"a": {"b": {"c": 1}["c"]}}
+    print(z)
+    let f: int = (1 + 2) * (3 - 4) // (5 % 2) | 0xff & 0x0f ^ 0xa0
+    print(f)
+    let g: bool = not (True and not (False or True))
+    print(g)
+
+main()

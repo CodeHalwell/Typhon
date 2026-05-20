@@ -1,0 +1,10 @@
+def add3(a: int, b: int, c: int) -> int:
+    return a + b + c
+
+def main() -> None:
+    let xs: list[int] = [1, 2, 3]
+    print(add3(*xs))
+    let kwargs: dict[str, int] = {"a": 1, "b": 2, "c": 3}
+    print(add3(**kwargs))
+
+main()

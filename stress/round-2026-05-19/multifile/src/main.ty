@@ -1,0 +1,6 @@
+from util import double
+
+def main() -> None:
+    print(double(21))
+
+main()

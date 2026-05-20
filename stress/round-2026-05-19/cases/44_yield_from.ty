@@ -1,0 +1,17 @@
+from typing import Iterator
+
+def inner() -> Iterator[int]:
+    yield 1
+    yield 2
+    yield 3
+
+def outer() -> Iterator[int]:
+    yield 0
+    yield from inner()
+    yield 4
+
+def main() -> None:
+    for x in outer():
+        print(x)
+
+main()

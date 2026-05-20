@@ -1,0 +1,13 @@
+from dataclasses import field
+
+class Bag:
+    items: list[str] = field(default_factory=list)
+    counts: dict[str, int] = field(default_factory=dict)
+
+def main() -> None:
+    let b1: Bag = Bag()
+    let b2: Bag = Bag()
+    b1.items.append("x")
+    print(b1.items, b2.items)
+
+main()

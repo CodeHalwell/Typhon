@@ -1,0 +1,15 @@
+def safe_parse(s: str) -> int:
+    try:
+        let n: int = int(s)
+    except ValueError:
+        return -1
+    else:
+        return n
+    finally:
+        print("done")
+
+def main() -> None:
+    print(safe_parse("42"))
+    print(safe_parse("oops"))
+
+main()

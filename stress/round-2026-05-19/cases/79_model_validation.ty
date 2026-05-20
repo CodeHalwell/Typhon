@@ -1,0 +1,14 @@
+model ApiUser:
+    id: int
+    name: str
+    age: int
+
+def main() -> None:
+    let u: ApiUser = ApiUser(id=1, name="alice", age=30)
+    print(u)
+    try:
+        let bad: ApiUser = ApiUser(id="not-int", name="x", age=10)
+    except Exception as e:
+        print(f"validation error: {type(e).__name__}")
+
+main()

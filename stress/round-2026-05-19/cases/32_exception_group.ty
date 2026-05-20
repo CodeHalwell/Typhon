@@ -1,0 +1,9 @@
+def main() -> None:
+    try:
+        raise ExceptionGroup("oops", [ValueError("a"), TypeError("b")])
+    except* ValueError as eg:
+        print(f"got value errors: {eg.exceptions}")
+    except* TypeError as eg:
+        print(f"got type errors: {eg.exceptions}")
+
+main()

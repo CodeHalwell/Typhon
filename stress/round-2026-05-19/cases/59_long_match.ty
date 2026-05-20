@@ -1,0 +1,14 @@
+def classify(n: int) -> str:
+    match n:
+        case 0: return "zero"
+        case 1 | 2 | 3 | 4 | 5: return "small"
+        case 6 | 7 | 8 | 9 | 10: return "medium"
+        case x if x < 100: return f"two-digit {x}"
+        case x if x < 1000: return f"three-digit {x}"
+        case _: return "huge"
+
+def main() -> None:
+    for n in [0, 3, 8, 42, 500, 12345]:
+        print(classify(n))
+
+main()

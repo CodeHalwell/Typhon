@@ -1,0 +1,14 @@
+def weekday(name: str) -> bool:
+    match name:
+        case "mon" | "tue" | "wed" | "thu" | "fri":
+            return True
+        case "sat" | "sun":
+            return False
+        case _:
+            return False
+
+def main() -> None:
+    print(weekday("mon"))
+    print(weekday("sat"))
+
+main()

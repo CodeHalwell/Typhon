@@ -1,0 +1,32 @@
+class Big:
+    f00: int
+    f01: int
+    f02: int
+    f03: int
+    f04: int
+    f05: int
+    f06: int
+    f07: int
+    f08: int
+    f09: int
+    f10: int
+    f11: int
+    f12: int
+    f13: int
+    f14: int
+    f15: int
+    f16: int
+    f17: int
+    f18: int
+    f19: int
+    f20: int
+
+impl Big:
+    def total(self) -> int:
+        return self.f00 + self.f01 + self.f02 + self.f03 + self.f04 + self.f05 + self.f06 + self.f07 + self.f08 + self.f09 + self.f10 + self.f11 + self.f12 + self.f13 + self.f14 + self.f15 + self.f16 + self.f17 + self.f18 + self.f19 + self.f20
+
+def main() -> None:
+    let b: Big = Big(f00=0, f01=1, f02=2, f03=3, f04=4, f05=5, f06=6, f07=7, f08=8, f09=9, f10=10, f11=11, f12=12, f13=13, f14=14, f15=15, f16=16, f17=17, f18=18, f19=19, f20=20)
+    print(b.total())
+
+main()

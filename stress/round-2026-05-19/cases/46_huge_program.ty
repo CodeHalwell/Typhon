@@ -1,0 +1,45 @@
+# A larger, realistic program: typed event-bus with publish/subscribe.
+from typing import Callable
+
+type Event = LoginEvent | LogoutEvent | ErrorEvent
+
+class LoginEvent:
+    user: str
+    at: int
+
+class LogoutEvent:
+    user: str
+    at: int
+
+class ErrorEvent:
+    code: int
+    msg: str
+
+class Bus:
+    handlers: list[Callable[[Event], None]]
+
+impl Bus:
+    def subscribe(self, h: Callable[[Event], None]) -> None:
+        self.handlers.append(h)
+
+    def publish(self, e: Event) -> None:
+        for h in self.handlers:
+            h(e)
+
+def describe(e: Event) -> str:
+    match e:
+        case LoginEvent(user, at):
+            return f"login {user} @ {at}"
+        case LogoutEvent(user, at):
+            return f"logout {user} @ {at}"
+        case ErrorEvent(code, msg):
+            return f"err {code}: {msg}"
+
+def main() -> None:
+    let bus: Bus = Bus(handlers=[])
+    bus.subscribe(lambda e: print(describe(e)))
+    bus.publish(LoginEvent(user="alice", at=100))
+    bus.publish(ErrorEvent(code=500, msg="boom"))
+    bus.publish(LogoutEvent(user="alice", at=200))
+
+main()

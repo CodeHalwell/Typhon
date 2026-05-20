@@ -1,0 +1,15 @@
+class Container[T]:
+    items: list[T]
+
+impl[T] Container[T]:
+    def map[U](self, f: Callable[[T], U]) -> Container[U]:
+        return Container(items=[f(i) for i in self.items])
+
+from typing import Callable
+
+def main() -> None:
+    let c: Container[int] = Container(items=[1, 2, 3])
+    let c2: Container[str] = c.map(lambda x: str(x))
+    print(c2.items)
+
+main()

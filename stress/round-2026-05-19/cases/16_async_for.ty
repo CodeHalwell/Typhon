@@ -1,0 +1,15 @@
+import asyncio
+from typing import AsyncIterator
+
+async def ticks(n: int) -> AsyncIterator[int]:
+    mut i: int = 0
+    while i < n:
+        await asyncio.sleep(0)
+        yield i
+        i = i + 1
+
+async def main() -> None:
+    async for t in ticks(3):
+        print(t)
+
+asyncio.run(main())

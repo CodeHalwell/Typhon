@@ -1,0 +1,2 @@
+def f(x: int) -> int:
+    return f(f(f(f(f(f(f(f(f(f(x))))))))))

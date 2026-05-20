@@ -1,0 +1,20 @@
+interface Drawable:
+    def draw() -> None
+    def width() -> float
+
+class Button:
+    label: str
+
+impl Button:
+    def draw(self) -> None:
+        print(self.label)
+    def width(self) -> float:
+        return 10.0
+
+def render(d: Drawable) -> None:
+    d.draw()
+
+def main() -> None:
+    render(Button(label="x"))
+
+main()

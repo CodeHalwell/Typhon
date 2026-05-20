@@ -1,0 +1,18 @@
+def main() -> None:
+    let pi: float = 3.14159265
+    print(f"{pi:.2f}")
+    print(f"{pi:>10.3f}")
+    print(f"{42:05d}")
+    print(f"{255:08b}")
+    print(f"{255:04x}")
+    let name: str = "world"
+    print(f"{name!r}")
+    print(f"{name!s}")
+    print(f"{name!a}")
+    print(f"{{escaped}}")
+    let nested: int = 5
+    print(f"value is {f'inner {nested}'}")
+    print(f"{'qux' if nested > 0 else 'none'}")
+    print(f"line\ncontinues")
+
+main()

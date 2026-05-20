@@ -1,0 +1,13 @@
+from typing import Callable
+
+def main() -> None:
+    let inc: Callable[[int], int] = lambda x: x + 1
+    print(inc(5))
+    let nums: list[int] = [3, 1, 4, 1, 5, 9, 2, 6]
+    let sorted_nums: list[int] = sorted(nums, key=lambda x: -x)
+    print(sorted_nums)
+    let pairs: list[tuple[str, int]] = [("a", 2), ("b", 1)]
+    let by_val: list[tuple[str, int]] = sorted(pairs, key=lambda p: p[1])
+    print(by_val)
+
+main()

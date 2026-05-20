@@ -1,0 +1,13 @@
+def partition(xs: list[int], pred: Callable[[int], bool]) -> tuple[list[int], list[int]]:
+    let yes: list[int] = [x for x in xs if pred(x)]
+    let no: list[int] = [x for x in xs if not pred(x)]
+    return (yes, no)
+
+from typing import Callable
+
+def main() -> None:
+    let xs: list[int] = list(range(10))
+    let evens, odds = partition(xs, lambda x: x % 2 == 0)
+    print(evens, odds)
+
+main()

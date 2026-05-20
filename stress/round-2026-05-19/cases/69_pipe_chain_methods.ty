@@ -1,0 +1,17 @@
+class S:
+    val: int
+
+impl S:
+    def add(self, n: int) -> "S":
+        return S(val=self.val + n)
+    def mul(self, n: int) -> "S":
+        return S(val=self.val * n)
+
+def main() -> None:
+    let s: S = S(val=1)
+    let r: S = s.add(2).mul(3).add(4)
+    print(r.val)
+    let r2: int = s |> S.add(5) |> S.mul(2)
+    print(r2)
+
+main()

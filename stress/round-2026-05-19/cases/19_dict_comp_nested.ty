@@ -1,0 +1,12 @@
+def main() -> None:
+    let matrix: list[list[int]] = [[1, 2, 3], [4, 5, 6], [7, 8, 9]]
+    let transposed: list[list[int]] = [[row[i] for row in matrix] for i in range(3)]
+    print(transposed)
+
+    let pairs: dict[str, int] = {f"k{i}": i * i for i in range(5) if i % 2 == 0}
+    print(pairs)
+
+    let flat: list[int] = [x for row in matrix for x in row if x > 4]
+    print(flat)
+
+main()

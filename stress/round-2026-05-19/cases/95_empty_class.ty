@@ -1,0 +1,12 @@
+class Empty:
+    pass
+
+class Singleton:
+    name: str = "default"
+
+def main() -> None:
+    let e: Empty = Empty()
+    let s: Singleton = Singleton()
+    print(s.name)
+
+main()

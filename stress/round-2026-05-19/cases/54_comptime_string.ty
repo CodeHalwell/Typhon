@@ -1,0 +1,8 @@
+comptime let GREETING: str = "hello".upper() + ", " + "world".lower()
+comptime let LEN: int = len(GREETING)
+comptime let WORDS: list[str] = "a b c".split(" ")
+
+def main() -> None:
+    print(GREETING, LEN, WORDS)
+
+main()

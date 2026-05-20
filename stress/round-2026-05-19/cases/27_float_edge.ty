@@ -1,0 +1,11 @@
+import math
+
+def main() -> None:
+    let inf: float = math.inf
+    let nan: float = math.nan
+    print(inf, nan)
+    print(math.isnan(nan), math.isinf(inf))
+    let zero_div: float = 1.0 / 0.0
+    print(zero_div)
+
+main()

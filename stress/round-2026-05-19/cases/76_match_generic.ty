@@ -1,0 +1,15 @@
+class Box[T]:
+    value: T
+
+def get_or_zero(b: Box[int]) -> int:
+    match b:
+        case Box(value=0):
+            return 0
+        case Box(value=v):
+            return v
+
+def main() -> None:
+    print(get_or_zero(Box(value=42)))
+    print(get_or_zero(Box(value=0)))
+
+main()

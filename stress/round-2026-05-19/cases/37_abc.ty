@@ -1,0 +1,21 @@
+from abc import ABC, abstractmethod
+
+class Shape(ABC):
+    name: str
+
+impl Shape:
+    @abstractmethod
+    def area(self) -> float: ...
+
+class Circle(Shape):
+    radius: float
+
+impl Circle:
+    def area(self) -> float:
+        return 3.14159 * self.radius * self.radius
+
+def main() -> None:
+    let c: Circle = Circle(name="c", radius=2.0)
+    print(c.area())
+
+main()

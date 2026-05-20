@@ -1,0 +1,21 @@
+class Tree:
+    value: int
+    left: "Tree?"
+    right: "Tree?"
+
+impl Tree:
+    def sum(self) -> int:
+        mut total: int = self.value
+        if self.left is not None:
+            total = total + self.left.sum()
+        if self.right is not None:
+            total = total + self.right.sum()
+        return total
+
+def main() -> None:
+    let leaf1: Tree = Tree(value=1, left=None, right=None)
+    let leaf2: Tree = Tree(value=2, left=None, right=None)
+    let root: Tree = Tree(value=3, left=leaf1, right=leaf2)
+    print(root.sum())
+
+main()

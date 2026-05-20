@@ -1,0 +1,11 @@
+from typing import Literal
+
+def set_mode(mode: Literal["r", "w", "rw"]) -> str:
+    return mode
+
+def main() -> None:
+    let m: str = set_mode("r")
+    let bad: str = set_mode("x")
+    print(m, bad)
+
+main()

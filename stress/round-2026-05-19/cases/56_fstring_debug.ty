@@ -1,0 +1,9 @@
+def main() -> None:
+    let x: int = 42
+    let name: str = "world"
+    print(f"{x=}")
+    print(f"{x = }")
+    print(f"{name=!r}")
+    print(f"{x*2=}")
+
+main()

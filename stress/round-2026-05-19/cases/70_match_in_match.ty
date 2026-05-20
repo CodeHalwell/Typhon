@@ -1,0 +1,32 @@
+type Shape = Circle | Square
+type Color = Red | Green | Blue
+
+class Circle:
+    r: float
+class Square:
+    s: float
+class Red:
+    pass
+class Green:
+    pass
+class Blue:
+    pass
+
+def describe(shape: Shape, color: Color) -> str:
+    match shape:
+        case Circle(r):
+            match color:
+                case Red(): return f"red circle {r}"
+                case Green(): return f"green circle {r}"
+                case Blue(): return f"blue circle {r}"
+        case Square(s):
+            match color:
+                case Red(): return f"red square {s}"
+                case Green(): return f"green square {s}"
+                case Blue(): return f"blue square {s}"
+
+def main() -> None:
+    print(describe(Circle(r=1.0), Red()))
+    print(describe(Square(s=2.0), Blue()))
+
+main()
