@@ -646,6 +646,10 @@ impl ResolvedModule {
 
     /// Walk the scope chain starting at `scope` and return the first
     /// binding matching `name`, plus the scope it was found in.
+    ///
+    /// Returns `None` when `scope` is out of bounds (e.g. querying an
+    /// empty `ResolvedModule` on parse failure) so the LSP completion
+    /// path doesn't crash mid-keystroke.
     pub fn lookup<'a>(&'a self, scope: ScopeId, name: &str) -> Option<(&'a Binding, ScopeId)> {
         let mut current = Some(scope);
         while let Some(id) = current {

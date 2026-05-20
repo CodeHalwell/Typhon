@@ -2031,17 +2031,19 @@ def greet():
     fn completion_on_empty_resolved_module_returns_keywords_and_builtins() {
         // When the buffer is mid-edit and doesn't parse, the Salsa
         // `resolved_module_arc` query returns a default `ResolvedModule`
-        // with no scopes. Indexing into that vec used to panic, which
-        // crashed the completion handler and surfaced as "No suggestions."
-        // in the editor. The path must now return the keyword + builtin
-        // menu so the user still gets useful completion while typing.
+        // with no scopes. Indexing into that vec used to panic, crashing
+        // the completion handler and surfacing as a "No suggestions"
+        // popup in the editor. The path must now return the keyword +
+        // builtin menu so the user still gets useful completion while
+        // typing.
         let empty = tyc_resolve::ResolvedModule::default();
-        let src = "from agent_framework import \n";
+        let prefix = "from agent_framework import ";
+        let src = format!("{prefix}\n");
         let pos = Position {
             line: 0,
-            character: 28,
+            character: prefix.len() as u32,
         };
-        let items = compute_completion_items(&empty, src, pos);
+        let items = compute_completion_items(&empty, &src, pos);
         let labels: std::collections::HashSet<String> =
             items.iter().map(|i| i.label.clone()).collect();
         assert!(!items.is_empty(), "completion must not return empty");
