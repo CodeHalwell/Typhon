@@ -4864,6 +4864,10 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             match &recv {
                 Type::Class(class_name) => {
                     let class_name = class_name.clone();
+                    let receiver_is_class_name = matches!(
+                        a.value.as_ref(),
+                        Expr::Name(n) if c.classes.iter().any(|cn| cn == n.id.as_str())
+                    );
                     if let Some(sig) = c.find_method(class_name.as_str(), attr_name) {
                         // `@property` methods are read as attributes — return
                         // the underlying type directly instead of a bound-
@@ -4871,7 +4875,10 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         if sig.is_property {
                             return sig.return_type.clone();
                         }
-                        let arity = sig.arity;
+                        let mut arity = sig.arity;
+                        if receiver_is_class_name {
+                            arity = arity.saturating_add(1);
+                        }
                         let ret = sig.return_type.clone();
                         return Type::Function {
                             params: vec![Type::Unknown; arity],
