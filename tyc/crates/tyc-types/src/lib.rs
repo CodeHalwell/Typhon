@@ -3537,6 +3537,24 @@ fn stmt_always_exits(stmt: &Stmt) -> bool {
         // rejected non-exhaustive ones), so this matches the user's
         // intuition that a covered match doesn't fall through.
         Stmt::Match(m) => match_arms_always_exit(&m.cases),
+        // A `try/except` always exits when:
+        //   (a) the `finally` body is non-empty and always exits (finally runs
+        //       on every path), OR
+        //   (b) the `try` body always exits AND every exception handler always
+        //       exits AND the `else` clause (if present) always exits.
+        // Case (b) is the common `try: return Ok(x) except E: return Err(e)`
+        // pattern that must not be flagged as a missing-return false positive.
+        Stmt::Try(t) => {
+            let finally_exits =
+                !t.finalbody.is_empty() && body_always_exits(&t.finalbody);
+            let try_and_handlers_exit = body_always_exits(&t.body)
+                && t.handlers.iter().all(|h| {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    body_always_exits(&h.body)
+                })
+                && (t.orelse.is_empty() || body_always_exits(&t.orelse));
+            finally_exits || try_and_handlers_exit
+        }
         _ => false,
     }
 }
@@ -3628,6 +3646,17 @@ fn stmt_always_exits_aware(c: &Checker, stmt: &Stmt) -> bool {
                 && elif_else_chain_always_exits_aware(c, &s.elif_else_clauses)
         }
         Stmt::Match(m) => match_arms_always_exit_aware(c, m),
+        Stmt::Try(t) => {
+            let finally_exits =
+                !t.finalbody.is_empty() && body_always_exits_aware(c, &t.finalbody);
+            let try_and_handlers_exit = body_always_exits_aware(c, &t.body)
+                && t.handlers.iter().all(|h| {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    body_always_exits_aware(c, &h.body)
+                })
+                && (t.orelse.is_empty() || body_always_exits_aware(c, &t.orelse));
+            finally_exits || try_and_handlers_exit
+        }
         _ => false,
     }
 }
@@ -5294,6 +5323,70 @@ def f(x: int) -> int | None:
                 .iter()
                 .any(|e| matches!(e, TycError::MissingReturn { .. })),
             "T | None must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn try_except_both_return_is_clean() {
+        // `try: return Ok(...) except E: return Err(...)` — both the try body
+        // and the exception handler return unconditionally, so the function
+        // always exits and must NOT fire missing_return.
+        let src = "\
+def parse(raw: str) -> Result[int, str]:
+    try:
+        return Ok(int(raw))
+    except ValueError as e:
+        return Err(str(e))
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "try/except with returns in both branches must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn try_without_handler_return_fires_missing_return() {
+        // The try body returns but the handler does NOT — missing_return must fire.
+        let src = "\
+def parse(raw: str) -> int:
+    try:
+        return int(raw)
+    except ValueError as e:
+        print(str(e))
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "try with non-exiting handler must fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn try_finally_always_exits_is_clean() {
+        // A `finally` block that always returns exits on every path.
+        let src = "\
+def load() -> int:
+    try:
+        return 1
+    except Exception:
+        print(\"err\")
+    finally:
+        return 0
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "try/finally with returning finally must not fire missing_return: {:?}",
             d.errors()
         );
     }

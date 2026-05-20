@@ -123,6 +123,67 @@ unsafe impl salsa::Update for ArcResolvedModule {
     }
 }
 
+/// Newtype wrapper around `Arc<Diagnostics>` for use as a `#[salsa::tracked]`
+/// query return type.
+///
+/// Mirrors the design of [`ArcResolvedModule`]: Salsa requires `Update` on
+/// return types, and `Diagnostics` does not implement it.  Pointer equality
+/// is used as a conservative proxy — every re-run allocates a fresh `Arc`, so
+/// this reports "changed" on every input change, which is sound.
+#[derive(Clone)]
+pub struct ArcDiagnostics(pub Arc<Diagnostics>);
+
+impl ArcDiagnostics {
+    fn new(d: Diagnostics) -> Self {
+        Self(Arc::new(d))
+    }
+}
+
+impl PartialEq for ArcDiagnostics {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ArcDiagnostics {}
+
+impl std::ops::Deref for ArcDiagnostics {
+    type Target = Diagnostics;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+// SAFETY: same argument as for `ArcResolvedModule`.
+unsafe impl salsa::Update for ArcDiagnostics {
+    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
+        if Arc::ptr_eq(&(*old_pointer).0, &new_value.0) {
+            false
+        } else {
+            *old_pointer = new_value;
+            true
+        }
+    }
+}
+
+/// Salsa-tracked query: run the full check pipeline for a file and return
+/// the cached [`Diagnostics`].
+///
+/// Salsa re-evaluates this only when `file.text` changes — so subsequent
+/// calls on an unchanged file are instant cache hits.  This makes the LSP
+/// path (`check_source_file`) incremental: a `did_open` event populates the
+/// cache; a `hover` or `definition` request that triggers a re-check on the
+/// same unchanged source returns immediately.
+///
+/// The public [`check_source_file`] function unwraps the `Arc` so callers
+/// continue to receive a plain [`Diagnostics`] value.
+#[salsa::tracked]
+fn check_diagnostics(db: &dyn salsa::Database, file: SourceFile) -> ArcDiagnostics {
+    let path = file.path(db).clone();
+    let text = file.text(db).clone();
+    ArcDiagnostics::new(check_impl(&path, &text))
+}
+
 /// Tracked query: parse and resolve the preprocessed source of a file.
 ///
 /// Salsa re-evaluates this only when `preprocessed_text` changes, so LSP
@@ -296,13 +357,15 @@ impl TycDatabase {
 /// End-to-end check pipeline for a single file. Returns parse, resolve,
 /// and type-check diagnostics merged in source order (parse first).
 ///
-/// Uses the salsa db for the cacheable preprocess step. The resolve and
-/// type-check passes run directly because their outputs don't yet
-/// implement `salsa::Update`; they will be moved under salsa in later
-/// phases.
+/// Run the full check pipeline for `(path, text)` and return diagnostics.
+///
+/// Creates a temporary [`SourceFile`] entry in `db` so the Salsa-tracked
+/// `check_diagnostics` query can cache the result.  Subsequent calls with the
+/// same path and text are instant cache hits; calls after a text change
+/// invalidate the cache and re-run the pipeline.
 pub fn check_file(db: &mut TycDatabase, path: String, text: String) -> Diagnostics {
-    let _ = SourceFile::new(db, path.clone(), text.clone());
-    check_impl(&path, &text)
+    let file = SourceFile::new(db, path, text);
+    (*check_diagnostics(db, file).0).clone()
 }
 
 /// Like [`check_file`] but uses a caller-supplied [`SourceFile`] handle.
@@ -310,16 +373,17 @@ pub fn check_file(db: &mut TycDatabase, path: String, text: String) -> Diagnosti
 /// The handle must already exist in `db` (created via [`SourceFile::new`] or
 /// updated via `source_file.set_text(&mut db).to(text)`).  The LSP uses this
 /// variant so it can retain the handle across `did_open`/`did_change` events
-/// and then call [`preprocessed_text`] from hover/definition handlers; Salsa
-/// serves the preprocessed source from cache when the file has not changed.
+/// and then call [`preprocessed_text`] from hover/definition handlers.
+///
+/// The full check pipeline is now Salsa-tracked via [`check_diagnostics`]:
+/// repeated calls on an unchanged source file return the cached result
+/// immediately, making incremental LSP re-checks near-zero cost.
 pub fn check_source_file(db: &mut TycDatabase, source_file: SourceFile) -> Diagnostics {
-    let path = source_file.path(db).clone();
-    let text = source_file.text(db).clone();
-    check_impl(&path, &text)
+    (*check_diagnostics(db, source_file).0).clone()
 }
 
-/// Shared check implementation used by both [`check_file`] and
-/// [`check_source_file`].
+/// Shared check implementation used by [`check_diagnostics`] (and transitively
+/// by [`check_file`] and [`check_source_file`]).
 fn check_impl(path: &str, text: &str) -> Diagnostics {
     // The resolver and type-checker need the full PreprocessResult (including
     // `stripped` and `optionals` metadata), which doesn't yet implement
@@ -930,5 +994,40 @@ def f(x: str?) -> None:
                 .any(|b| b.name == "x"),
             "resolved_module should expose the let binding"
         );
+    }
+
+    // ── check_diagnostics Salsa cache ────────────────────────────────────────
+
+    #[test]
+    fn check_diagnostics_cached_on_unchanged_source() {
+        // Calling `check_diagnostics` twice on the same `SourceFile` with the
+        // same text must return the same `Arc` (pointer equality) — i.e. the
+        // Salsa cache was hit and the pipeline was not re-executed.
+        let mut db = TycDatabase::new();
+        let sf = SourceFile::new(&db, "<test>".to_owned(), "let x: int = 1\n".to_owned());
+        let d1 = check_diagnostics(&mut db, sf);
+        let d2 = check_diagnostics(&mut db, sf);
+        assert!(
+            std::sync::Arc::ptr_eq(&d1.0, &d2.0),
+            "second call must be a Salsa cache hit (same Arc pointer)"
+        );
+    }
+
+    #[test]
+    fn check_diagnostics_invalidated_after_set_text() {
+        // After `set_text`, Salsa invalidates the cached entry and the next
+        // call re-runs the pipeline, returning a new `Arc`.
+        use salsa::Setter;
+        let mut db = TycDatabase::new();
+        let sf = SourceFile::new(&db, "<test>".to_owned(), "let x: int = 1\n".to_owned());
+        let d1 = check_diagnostics(&mut db, sf);
+        sf.set_text(&mut db)
+            .to("let y: str = \"hello\"\n".to_owned());
+        let d2 = check_diagnostics(&mut db, sf);
+        assert!(
+            !std::sync::Arc::ptr_eq(&d1.0, &d2.0),
+            "Arc must differ after set_text (cache was invalidated)"
+        );
+        assert!(!d2.has_errors(), "new content should be clean");
     }
 }
