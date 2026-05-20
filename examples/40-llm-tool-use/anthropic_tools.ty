@@ -76,6 +76,7 @@ def _eval_arith(node: object) -> float:
             if isinstance(node.op, ast.UAdd): return _eval_arith(node.operand)
             raise ValueError(f"forbidden unary op")
         raise ValueError(f"forbidden node: {type(node).__name__}")
+    raise RuntimeError("unreachable")
 
 
 def calculate(expression: str) -> str:
@@ -110,18 +111,18 @@ def run_loop(client: Anthropic, question: str, max_turns: int = 5) -> str:
 
         if resp.stop_reason != "tool_use":
             mut text_parts: list[str] = []
-            for block in resp.content:
-                if block.type == "text":
-                    text_parts.append(block.text)
+            for text_block in resp.content:
+                if text_block.type == "text":
+                    text_parts.append(text_block.text)
             return "".join(text_parts)
 
         mut tool_results: list[dict[str, object]] = []
-        for block in resp.content:
-            if block.type == "tool_use":
-                let result_text: str = dispatch(block.name, dict(block.input))
+        for tool_block in resp.content:
+            if tool_block.type == "tool_use":
+                let result_text: str = dispatch(tool_block.name, dict(tool_block.input))
                 tool_results.append({
                     "type": "tool_result",
-                    "tool_use_id": block.id,
+                    "tool_use_id": tool_block.id,
                     "content": result_text,
                 })
         messages.append({"role": "user", "content": tool_results})

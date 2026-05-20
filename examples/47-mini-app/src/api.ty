@@ -52,6 +52,7 @@ def ask(req: AskRequest, a: Agent = Depends(get_agent)) -> AskResponse:
             )
         case Err(e):
             raise HTTPException(status_code=502, detail=f"{e.stage}: {e.message}")
+    raise RuntimeError("unreachable")
 
 
 @app.get("/notes", response_model=list[NoteOut])

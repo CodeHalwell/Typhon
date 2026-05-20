@@ -52,6 +52,7 @@ impl NoteStore:
             return Err(StoreError(op="save", reason=str(e)))
 
     def search(self, needle: str, limit: int = 10) -> list[Note]:
+        mut rows: list[Note] = []
         with self._connect() as conn:
             let cur = conn.execute(
                 "SELECT id, title, body, created_at FROM notes "
@@ -59,7 +60,7 @@ impl NoteStore:
                 "ORDER BY id DESC LIMIT ?",
                 (f"%{needle}%", f"%{needle}%", limit),
             )
-            return [
+            rows = [
                 Note(
                     id=int(row[0]),
                     title=str(row[1]),
@@ -68,14 +69,16 @@ impl NoteStore:
                 )
                 for row in cur.fetchall()
             ]
+        return rows
 
     def list_recent(self, limit: int = 20) -> list[Note]:
+        mut rows: list[Note] = []
         with self._connect() as conn:
             let cur = conn.execute(
                 "SELECT id, title, body, created_at FROM notes ORDER BY id DESC LIMIT ?",
                 (limit,),
             )
-            return [
+            rows = [
                 Note(
                     id=int(row[0]),
                     title=str(row[1]),
@@ -84,6 +87,7 @@ impl NoteStore:
                 )
                 for row in cur.fetchall()
             ]
+        return rows
 
 
 def open_store(path: Path) -> NoteStore:
