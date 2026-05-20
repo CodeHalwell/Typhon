@@ -614,6 +614,32 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A `class NAME:` body contains only annotated assignments with
+    /// defaults (`NAME: T = literal`) and no methods or per-instance
+    /// fields, so it reads like a namespace of constants. The class will
+    /// emit as `@dataclass(slots=True)`, which turns each name into a
+    /// slot descriptor: `Klass.NAME` at runtime returns the descriptor
+    /// rather than the literal. Surfaced as a warning so the existing
+    /// pattern keeps building; the recommended fix is annotating each
+    /// field as `ClassVar[T]` (which `@dataclass` excludes from slots).
+    /// Promotion to error is a v0.2 follow-up.
+    #[error(
+        "class `{class}` has only defaulted fields — `{class}.{field}` will be a slot descriptor at runtime, not `{field_value_hint}`"
+    )]
+    #[diagnostic(
+        code(tyc::class_attr_shadows_slot),
+        help("annotate each field as `ClassVar[T]` (from `typing`) so `@dataclass(slots=True)` excludes them from `__slots__`")
+    )]
+    ClassAttrShadowsSlot {
+        class: String,
+        field: String,
+        field_value_hint: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("class `{class}` reads like a namespace of constants")]
+        span: SourceSpan,
+    },
+
     /// A function parameter or return type is missing its annotation. Rule 1
     /// of the Typhon language: every parameter and return type is annotated.
     /// Defaults on (`[strictness] no-implicit-any = true`) — turning it off
@@ -1360,6 +1386,25 @@ impl TycError {
         Self::MethodInClassBody {
             class: class.into(),
             method: method.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::ClassAttrShadowsSlot`] diagnostic.
+    pub fn class_attr_shadows_slot(
+        class: impl Into<String>,
+        field: impl Into<String>,
+        field_value_hint: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::ClassAttrShadowsSlot {
+            class: class.into(),
+            field: field.into(),
+            field_value_hint: field_value_hint.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

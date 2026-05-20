@@ -3096,6 +3096,75 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 _ => false,
             });
             if !is_pseudo && !is_protocol && !is_pydantic {
+                let merged_methods_empty = c
+                    .class_shapes
+                    .get(class_name)
+                    .map(|s| s.methods.is_empty())
+                    .unwrap_or(true);
+                let body_has_function = cd
+                    .body
+                    .iter()
+                    .any(|s| matches!(s, Stmt::FunctionDef(_)));
+                let mut has_ann_assign = false;
+                let mut all_ann_assigns_defaulted = true;
+                let mut only_ann_assigns = true;
+                let mut first_defaulted: Option<(&ruff_python_ast::StmtAnnAssign, String)> = None;
+                for s in &cd.body {
+                    match s {
+                        Stmt::AnnAssign(a) => {
+                            has_ann_assign = true;
+                            if a.value.is_none() {
+                                all_ann_assigns_defaulted = false;
+                            } else if first_defaulted.is_none() {
+                                if let Expr::Name(n) = a.target.as_ref() {
+                                    first_defaulted =
+                                        Some((a, n.id.as_str().to_owned()));
+                                }
+                            }
+                        }
+                        Stmt::Pass(_) | Stmt::Expr(_) => {}
+                        _ => only_ann_assigns = false,
+                    }
+                }
+                if has_ann_assign
+                    && all_ann_assigns_defaulted
+                    && only_ann_assigns
+                    && !body_has_function
+                    && merged_methods_empty
+                {
+                    if let Some((ann, field_name)) = first_defaulted {
+                        let value_hint = ann
+                            .value
+                            .as_deref()
+                            .map(|v| match v {
+                                Expr::StringLiteral(s) => {
+                                    format!("\"{}\"", s.value.to_str())
+                                }
+                                Expr::NumberLiteral(n) => match &n.value {
+                                    ruff_python_ast::Number::Int(i) => i.to_string(),
+                                    ruff_python_ast::Number::Float(f) => f.to_string(),
+                                    ruff_python_ast::Number::Complex { real, imag } => {
+                                        format!("{}+{}j", real, imag)
+                                    }
+                                },
+                                Expr::BooleanLiteral(b) => {
+                                    if b.value { "True".to_owned() } else { "False".to_owned() }
+                                }
+                                _ => "its literal value".to_owned(),
+                            })
+                            .unwrap_or_else(|| "its literal value".to_owned());
+                        let class_range = cd.name.range;
+                        c.diagnostics.push_warning(TycError::class_attr_shadows_slot(
+                            class_name.to_owned(),
+                            field_name,
+                            value_hint,
+                            c.path.clone(),
+                            c.source,
+                            class_range.start().to_usize(),
+                            class_name.len().max(1),
+                        ));
+                    }
+                }
                 for s in &cd.body {
                     if let Stmt::FunctionDef(f) = s {
                         let method = f.name.as_str();
