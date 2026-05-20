@@ -2001,6 +2001,7 @@ dependencies = [
  "tyc-resolve",
  "tyc-syntax",
  "tyc-types",
+ "tyc-vm",
 ]
 
 [[package]]
@@ -2110,6 +2111,17 @@ dependencies = [
  "ruff_text_size",
  "tyc-diagnostics",
  "tyc-resolve",
+ "tyc-syntax",
+]
+
+[[package]]
+name = "tyc-vm"
+version = "0.1.4"
+dependencies = [
+ "ruff_python_ast",
+ "ruff_python_parser",
+ "tempfile",
+ "thiserror",
  "tyc-syntax",
 ]
 

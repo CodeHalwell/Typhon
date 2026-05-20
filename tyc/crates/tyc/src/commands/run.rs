@@ -1,10 +1,16 @@
-//! `tyc run` — build the project and execute the emitted Python.
+//! `tyc run` — execute a Typhon program.
 //!
-//! Hides the `tyc build && python build/main.py` two-step behind a single
-//! command, mirroring how `tsx`/`ts-node` hide the TypeScript→JavaScript
-//! compile step.
+//! Default mode: the in-process tree-walking VM from `tyc-vm`. No `.py` is
+//! ever written; the runtime is the same Rust binary that hosts the
+//! compiler. This is the path you want for scripts, tests, and any program
+//! that stays inside Typhon's native semantics.
 //!
-//! Two output modes:
+//! `--compile` mode: the legacy "build then exec CPython" path. Use this
+//! when the program reaches into CPython libraries (`numpy`, `requests`,
+//! `pydantic`, …) that the VM cannot evaluate natively, or when you want
+//! the exact output `tyc build` would produce.
+//!
+//! When `--compile` is passed:
 //!
 //! * **Persistent (default).** Builds into the configured `out` dir
 //!   (default `build/`).  Subsequent runs hit the incremental Salsa
@@ -15,13 +21,10 @@
 //!   project pollution, ideal for quick one-shot iteration.  Trades the
 //!   incremental cache and on-disk source map for a clean tree.
 //!
-//! Typhon does not have a separate VM: every `.ty` file lowers to clean
-//! CPython.  `tyc run` is a UX shortcut, not a new execution model.
-//!
-//! Exit-code semantics: when the build succeeds and the script launches,
-//! `tyc run` exits with the script's own exit code (via `process::exit`)
-//! so shell pipelines see the child's status verbatim.  Build failures
-//! and spawn failures surface as normal miette errors with exit code 1.
+//! Exit-code semantics: `tyc run` exits with the program's own exit code
+//! (via `process::exit`) so shell pipelines see the child's status verbatim.
+//! Build failures, parse errors, and spawn failures surface as normal miette
+//! errors with exit code 1.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -36,38 +39,59 @@ use crate::config::TyphonConfig;
 /// Arguments for `tyc run`.
 #[derive(Args, Debug)]
 pub struct RunArgs {
-    /// Project directory (defaults to the current directory).
+    /// Project directory, or a single `.ty` source file when using the VM
+    /// (the default). For `--compile` mode this is always the project
+    /// directory.
     #[arg(value_name = "PATH", default_value = ".")]
     pub path: PathBuf,
 
-    /// Entry-point `.py` (relative to the build dir) to execute.
-    /// Defaults to `main.py`.
-    #[arg(long, value_name = "FILE", default_value = "main.py")]
+    /// Build then exec CPython instead of running the in-process VM.
+    /// Use this when your program imports CPython libraries the VM
+    /// doesn't speak natively (numpy, requests, …).
+    #[arg(long, alias = "no-vm")]
+    pub compile: bool,
+
+    /// Entry-point `.py` (relative to the build dir) for `--compile` mode.
+    /// Defaults to `main.py`. Requires `--compile`.
+    #[arg(
+        long,
+        value_name = "FILE",
+        default_value = "main.py",
+        requires = "compile"
+    )]
     pub entry: PathBuf,
 
-    /// Python interpreter to use (defaults to `python3`).
-    #[arg(long, value_name = "PATH", default_value = "python3")]
+    /// Python interpreter to use in `--compile` mode (defaults to `python3`).
+    /// Requires `--compile`.
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = "python3",
+        requires = "compile"
+    )]
     pub python: String,
 
     /// Build into a temporary directory that is deleted when the process
-    /// exits, instead of the configured `out` dir.  No build artifacts
-    /// persist on disk — the "tyx in-memory" mode.  Implies a fresh
-    /// build every invocation, so the incremental cache and on-disk
-    /// `.py.map` sidecars are unavailable.
-    #[arg(long, short = 't', conflicts_with = "no_build")]
+    /// exits, instead of the configured `out` dir. No build artifacts
+    /// persist on disk — the "tyx in-memory" mode. Implies a fresh build
+    /// every invocation. Requires `--compile`.
+    #[arg(long, short = 't', conflicts_with = "no_build", requires = "compile")]
     pub temp: bool,
 
     /// Skip rebuilding; assume the `build/` directory is already current.
-    /// Incompatible with `--temp`.
-    #[arg(long)]
+    /// Incompatible with `--temp`. Requires `--compile`.
+    #[arg(long, requires = "compile")]
     pub no_build: bool,
 
-    /// Extra arguments forwarded to the entry-point script after `--`.
+    /// Extra arguments forwarded to the program after `--`.
     #[arg(last = true, value_name = "ARGS")]
     pub script_args: Vec<String>,
 }
 
 pub fn run(args: RunArgs) -> Result<()> {
+    if !args.compile {
+        return run_vm(args);
+    }
     // 1. Decide where build outputs go.  In `--temp` mode we own a
     //    TempDir guard whose Drop removes the directory; we keep it
     //    alive across the child process by binding it to a local.
@@ -140,6 +164,50 @@ pub fn run(args: RunArgs) -> Result<()> {
     std::process::exit(code);
 }
 
+/// Default execution path — the in-process tree-walking VM. Resolves the
+/// entry-point source file from `args.path` (a `.ty` file directly, or the
+/// project root containing `src/main.ty`), then evaluates it. The script's
+/// `sys.argv` is populated from `args.script_args`, with `argv[0]` set to
+/// the entry-point path.
+fn run_vm(args: RunArgs) -> Result<()> {
+    let entry = resolve_vm_entry(&args.path)?;
+    let code = tyc_vm::run_file(&entry, &args.script_args).map_err(|e| miette!("{e}"))?;
+    std::process::exit(code);
+}
+
+/// Resolve a Typhon entry point from a user-supplied path. If the path is a
+/// file, use it directly. Otherwise treat it as a project directory and look
+/// up `[project] src` in `typhon.toml` (defaulting to `src/`) to find
+/// `main.ty`. `.dty` files are stubs, not runnable code, so we never pick one.
+fn resolve_vm_entry(path: &std::path::Path) -> Result<PathBuf> {
+    if path.is_file() {
+        return Ok(path.to_path_buf());
+    }
+    // Consult typhon.toml to honour a custom `[project] src` directory.
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let src_dir = match TyphonConfig::load(&canonical) {
+        Ok(Some((toml_path, cfg))) => {
+            let project_root = toml_path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| canonical.clone());
+            project_root.join(&cfg.project.src)
+        }
+        _ => canonical.join("src"),
+    };
+    let candidates = [src_dir.join("main.ty"), path.join("main.ty")];
+    for c in &candidates {
+        if c.exists() {
+            return Ok(c.clone());
+        }
+    }
+    Err(miette!(
+        "no Typhon entry point found under '{}': pass a .ty file directly, \
+         or run inside a project whose [project] src directory contains main.ty",
+        path.display()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,17 +247,31 @@ mod tests {
 
     #[test]
     fn temp_flag_parses_with_short_alias() {
-        let parsed = <WrapRun as clap::Parser>::try_parse_from(["run", "-t"]).unwrap();
+        // --temp is a compile-mode flag and requires --compile.
+        let parsed = <WrapRun as clap::Parser>::try_parse_from(["run", "--compile", "-t"]).unwrap();
         assert!(parsed.args.temp);
 
-        let parsed = <WrapRun as clap::Parser>::try_parse_from(["run", "--temp"]).unwrap();
+        let parsed =
+            <WrapRun as clap::Parser>::try_parse_from(["run", "--compile", "--temp"]).unwrap();
         assert!(parsed.args.temp);
     }
 
     #[test]
+    fn temp_requires_compile() {
+        let err = <WrapRun as clap::Parser>::try_parse_from(["run", "--temp"])
+            .expect_err("--temp without --compile must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("requires") || msg.contains("required"),
+            "expected a 'requires' error, got: {msg}"
+        );
+    }
+
+    #[test]
     fn temp_and_no_build_are_mutually_exclusive() {
-        let err = <WrapRun as clap::Parser>::try_parse_from(["run", "--temp", "--no-build"])
-            .expect_err("--temp + --no-build must be rejected");
+        let err =
+            <WrapRun as clap::Parser>::try_parse_from(["run", "--compile", "--temp", "--no-build"])
+                .expect_err("--temp + --no-build must be rejected");
         let msg = err.to_string();
         assert!(
             msg.contains("cannot be used with") || msg.contains("conflicts"),
@@ -202,6 +284,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let args = RunArgs {
             path: tmp.path().to_path_buf(),
+            compile: true,
             entry: PathBuf::from("main.py"),
             python: "python3".into(),
             temp: false,

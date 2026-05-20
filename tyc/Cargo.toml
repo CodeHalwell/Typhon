@@ -11,6 +11,7 @@ members = [
     "crates/tyc-analyse",
     "crates/tyc-desugar",
     "crates/tyc-lsp",
+    "crates/tyc-vm",
     # Vendored Ruff parser/AST — Typhon's in-tree fork.
     # See `vendor/README.md` for the migration plan.
     "vendor/ruff_text_size",
@@ -67,6 +68,7 @@ tyc-types       = { path = "crates/tyc-types" }
 tyc-analyse     = { path = "crates/tyc-analyse" }
 tyc-desugar     = { path = "crates/tyc-desugar" }
 tyc-lsp         = { path = "crates/tyc-lsp" }
+tyc-vm          = { path = "crates/tyc-vm" }
 
 # Vendored Ruff fork — see vendor/README.md
 ruff_text_size     = { path = "vendor/ruff_text_size" }

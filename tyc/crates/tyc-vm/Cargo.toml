@@ -1,0 +1,15 @@
+[package]
+name = "tyc-vm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Typhon tree-walking interpreter — runs .ty source directly without compiling to Python"
+
+[dependencies]
+ruff_python_ast    = { workspace = true }
+ruff_python_parser = { workspace = true }
+tyc-syntax         = { workspace = true }
+thiserror          = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
