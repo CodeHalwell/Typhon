@@ -104,6 +104,11 @@ def demo() -> None:
 
 Module-level bindings default to `let` if you skip the keyword — but a *local* `name = "x"` with no keyword is `tyc::missing_binding_kind`. Reach for `mut` only when you actually rebind.
 
+Carve-outs (no keyword required):
+- `global NAME` / `nonlocal NAME` declarations bind the outer-scope variable; the bareword assignment that follows refers to that binding.
+- `gather:` block bindings (`gather: a = fetch_a(); b = fetch_b()`) — the keyword itself introduces immutable single-assignment names.
+- Walrus operator: `if (n := len(xs)) > 3:` introduces `n` as an implicit `let` binding; rebinding `n` later requires `mut`.
+
 ### Rule 3 — `T` cannot hold `None`
 
 ```python

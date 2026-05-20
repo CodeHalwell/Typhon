@@ -4592,3 +4592,11 @@ fix lands as its own commit.
   debug-marker support (#127) is covered by the #106 fix; no
   separate doc change needed.
 
+- **#124** walrus-binding doc — added a "carve-outs (no keyword
+  required)" subsection to Rule 2 in `.claude/skills/typhon/SKILL.md`
+  and `docs/language.md` that lists the three known exceptions to
+  the local-binding-kind rule: `global` / `nonlocal` declarations,
+  `gather:` block bindings, and the walrus operator. Documents
+  that walrus introduces an implicit-`let` binding and requires
+  `mut` to rebind.
+
