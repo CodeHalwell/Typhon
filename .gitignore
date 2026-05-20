@@ -2,3 +2,9 @@
 *.pyc
 __pycache__/
 .claude/worktrees/
+
+# tyc / uv build artefacts
+examples/*/build/
+examples/*/pyproject.toml
+examples/*/uv.lock
+examples/*/.venv/
