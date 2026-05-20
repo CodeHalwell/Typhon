@@ -1,0 +1,23 @@
+import re
+
+class Hit:
+    line: int
+    text: str
+
+def find_emails(text: str) -> list[Hit]:
+    let pattern: str = r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"
+    mut hits: list[Hit] = []
+    for i, line in enumerate(text.split("\n")):
+        for m in re.finditer(pattern, line):
+            hits.append(Hit(line=i + 1, text=m.group(0)))
+    return hits
+
+def main() -> None:
+    let blob: str = "Contact: alice@x.com\nbob@example.org or carol+work@sub.co.uk\nNo emails here"
+    let hits: list[Hit] = find_emails(blob)
+    print(f"found {len(hits)}")
+    for h in hits:
+        print(f"  line {h.line}: {h.text}")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,30 @@
+import numpy
+
+class Sample:
+    x: float
+    y: float
+
+def fit_linear(samples: list[Sample]) -> tuple[float, float]:
+    unsafe:
+        let xs = numpy.array([s.x for s in samples])
+        let ys = numpy.array([s.y for s in samples])
+        let xm = float(xs.mean())
+        let ym = float(ys.mean())
+        let dx = xs - xm
+        let dy = ys - ym
+        let slope: float = float((dx * dy).sum() / (dx * dx).sum())
+        let intercept: float = ym - slope * xm
+    return (slope, intercept)
+
+def main() -> None:
+    let samples: list[Sample] = [
+        Sample(x=1.0, y=2.1),
+        Sample(x=2.0, y=4.0),
+        Sample(x=3.0, y=6.1),
+        Sample(x=4.0, y=8.0),
+    ]
+    let pair: tuple[float, float] = fit_linear(samples)
+    print(f"slope={pair[0]:.3f} intercept={pair[1]:.3f}")
+
+if __name__ == "__main__":
+    main()

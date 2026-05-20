@@ -1,0 +1,9 @@
+def main() -> None:
+    let s: str = "hi"
+    let n: int = 3
+    # Without unsafe — should be caught
+    let bad: object = s + n
+    print(bad)
+
+if __name__ == "__main__":
+    main()

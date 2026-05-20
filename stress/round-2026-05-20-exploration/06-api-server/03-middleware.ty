@@ -1,0 +1,45 @@
+from typing import Callable
+
+class Request:
+    path: str
+    headers: dict[str, str]
+    user: str?
+
+class Response:
+    status: int
+    body: str
+
+type Handler = Callable[[Request], Response]
+
+def with_auth(next: Handler) -> Handler:
+    def wrapped(req: Request) -> Response:
+        if "Authorization" not in req.headers:
+            return Response(status=401, body="unauthorized")
+        req.user = req.headers["Authorization"].replace("Bearer ", "")
+        return next(req)
+    return wrapped
+
+def with_logging(name: str, next: Handler) -> Handler:
+    def wrapped(req: Request) -> Response:
+        print(f"[{name}] {req.path}")
+        let r: Response = next(req)
+        print(f"[{name}] {req.path} -> {r.status}")
+        return r
+    return wrapped
+
+def hello(req: Request) -> Response:
+    guard u = req.user else:
+        return Response(status=400, body="no user")
+    return Response(status=200, body=f"hello {u}")
+
+def main() -> None:
+    let chain: Handler = with_logging("svc", with_auth(hello))
+    let req1: Request = Request(path="/hello", headers={"Authorization": "Bearer alice"}, user=None)
+    let req2: Request = Request(path="/hello", headers={}, user=None)
+    let r1: Response = chain(req1)
+    let r2: Response = chain(req2)
+    print(f"r1: {r1.status} {r1.body}")
+    print(f"r2: {r2.status} {r2.body}")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,51 @@
+import json
+import os
+import tempfile
+
+class Record:
+    name: str
+    age: int
+    tags: list[str]
+
+def write_records(path: str, records: list[Record]) -> Result[int, str]:
+    try:
+        let data: list[dict[str, object]] = [
+            {"name": r.name, "age": r.age, "tags": r.tags} for r in records
+        ]
+        with open(path, "w") as f:
+            json.dump(data, f)
+        return Ok(len(records))
+    except OSError as e:
+        return Err(f"write failed: {e}")
+
+def read_records(path: str) -> Result[list[Record], str]:
+    try:
+        with open(path) as f:
+            let raw: object = json.load(f)
+        if not isinstance(raw, list):
+            return Err("expected list")
+        mut out: list[Record] = []
+        for item in raw:
+            unsafe:
+                let r: Record = Record(name=item["name"], age=item["age"], tags=item["tags"])
+            out.append(r)
+        return Ok(out)
+    except OSError as e:
+        return Err(f"read failed: {e}")
+
+def main() -> None:
+    let path: str = os.path.join(tempfile.gettempdir(), "ty_test_records.json")
+    let records: list[Record] = [
+        Record(name="alice", age=30, tags=["admin"]),
+        Record(name="bob", age=25, tags=["user", "beta"]),
+    ]
+    match write_records(path, records):
+        case Ok(n):  print(f"wrote {n}")
+        case Err(e): print(f"write err: {e}"); return
+    match read_records(path):
+        case Ok(rs): print(f"read {len(rs)}: {[r.name for r in rs]}")
+        case Err(e): print(f"read err: {e}")
+    os.remove(path)
+
+if __name__ == "__main__":
+    main()

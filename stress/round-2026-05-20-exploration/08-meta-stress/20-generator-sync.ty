@@ -1,0 +1,29 @@
+from typing import Iterator
+
+def squares(n: int) -> Iterator[int]:
+    for i in range(n):
+        yield i * i
+
+def fibs() -> Iterator[int]:
+    mut a: int = 0
+    mut b: int = 1
+    while True:
+        yield a
+        let temp: int = a + b
+        a = b
+        b = temp
+
+def main() -> None:
+    let sq: list[int] = list(squares(5))
+    print(sq)
+    mut count: int = 0
+    mut first10: list[int] = []
+    for n in fibs():
+        if count >= 10:
+            break
+        first10.append(n)
+        count = count + 1
+    print(first10)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,26 @@
+class Leaf:
+    value: int
+
+class Branch:
+    left: Tree
+    right: Tree
+
+type Tree = Leaf | Branch
+
+def sum_tree(t: Tree) -> int:
+    match t:
+        case Leaf(value):
+            return value
+        case Branch(left, right):
+            return sum_tree(left) + sum_tree(right)
+
+def main() -> None:
+    let l1: Leaf = Leaf(value=1)
+    let l2: Leaf = Leaf(value=2)
+    let l3: Leaf = Leaf(value=3)
+    let b1: Branch = Branch(left=l1, right=l2)
+    let root: Branch = Branch(left=b1, right=l3)
+    print(f"sum={sum_tree(root)}")
+
+if __name__ == "__main__":
+    main()

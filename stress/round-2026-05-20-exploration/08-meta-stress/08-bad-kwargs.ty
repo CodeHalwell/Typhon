@@ -1,0 +1,13 @@
+class User:
+    id: int
+    name: str
+
+def main() -> None:
+    # R3.7 — typo'd kwarg should be caught
+    let u: User = User(id=1, nmae="alice")
+    print(u.name)
+    let v: User = User(id=2, name="bob", role="admin")  # extra kwarg
+    print(v.name)
+
+if __name__ == "__main__":
+    main()

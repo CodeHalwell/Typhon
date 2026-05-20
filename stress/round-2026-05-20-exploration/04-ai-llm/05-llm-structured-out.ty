@@ -1,0 +1,35 @@
+import json
+
+model Person:
+    name: str
+    age: int
+    interests: list[str]
+
+def parse_llm_output(raw: str) -> Result[Person, str]:
+    try:
+        let data: object = json.loads(raw)
+    except json.JSONDecodeError as e:
+        return Err(f"bad json: {e}")
+    try:
+        unsafe:
+            let p: Person = Person(
+                name=data["name"],
+                age=data["age"],
+                interests=data["interests"],
+            )
+        return Ok(p)
+    except Exception as e:
+        return Err(f"validation: {e}")
+
+def main() -> None:
+    let good: str = '{"name": "alice", "age": 30, "interests": ["typhon", "rust"]}'
+    let bad1: str = "not json"
+    let bad2: str = '{"name": "bob"}'
+    let bad3: str = '{"name": 123, "age": "thirty", "interests": []}'
+    for raw in [good, bad1, bad2, bad3]:
+        match parse_llm_output(raw):
+            case Ok(p):  print(f"ok: {p.name} age {p.age}")
+            case Err(e): print(f"err: {e}")
+
+if __name__ == "__main__":
+    main()

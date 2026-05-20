@@ -1,0 +1,14 @@
+def compute_config() -> dict[str, int]:
+    print("computing config...")
+    return {"workers": 4, "port": 8080}
+
+lazy let CONFIG: dict[str, int] = compute_config()
+
+def main() -> None:
+    print("before access")
+    print(CONFIG)
+    print("second access (should not re-compute)")
+    print(CONFIG)
+
+if __name__ == "__main__":
+    main()

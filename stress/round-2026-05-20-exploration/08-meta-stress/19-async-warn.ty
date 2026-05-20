@@ -1,0 +1,15 @@
+import asyncio
+
+# This async fn has NO awaits in its body.
+# Per tyc::async_without_await this should warn.
+async def pure_async() -> int:
+    let x: int = 1
+    let y: int = 2
+    return x + y
+
+async def main() -> None:
+    let v: int = await pure_async()
+    print(v)
+
+if __name__ == "__main__":
+    asyncio.run(main())

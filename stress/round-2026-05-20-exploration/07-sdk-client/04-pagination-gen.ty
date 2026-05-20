@@ -1,0 +1,38 @@
+from typing import Iterator
+
+class Page:
+    items: list[int]
+    next_cursor: str?
+
+class API:
+    pages: dict[str, Page]
+
+impl API:
+    def fetch(self, cursor: str?) -> Page:
+        let key: str = cursor if cursor is not None else "start"
+        return self.pages.get(key, Page(items=[], next_cursor=None))
+
+def paginate(api: API) -> Iterator[int]:
+    mut cursor: str? = None
+    while True:
+        let page: Page = api.fetch(cursor)
+        for item in page.items:
+            yield item
+        if page.next_cursor is None:
+            break
+        cursor = page.next_cursor
+
+def main() -> None:
+    let api: API = API(pages={
+        "start": Page(items=[1, 2, 3], next_cursor="c1"),
+        "c1": Page(items=[4, 5, 6], next_cursor="c2"),
+        "c2": Page(items=[7, 8], next_cursor=None),
+    })
+    mut total: int = 0
+    for n in paginate(api):
+        total = total + n
+        print(f"got {n}")
+    print(f"total={total}")
+
+if __name__ == "__main__":
+    main()

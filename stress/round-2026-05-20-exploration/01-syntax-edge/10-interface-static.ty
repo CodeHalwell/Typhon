@@ -1,0 +1,33 @@
+interface Shape:
+    def area(self) -> float
+    def name(self) -> str
+
+class Circle:
+    r: float
+
+impl Circle:
+    def area(self) -> float:
+        return 3.14159 * self.r * self.r
+    def name(self) -> str:
+        return "circle"
+
+class Square:
+    side: float
+
+impl Square:
+    def area(self) -> float:
+        return self.side * self.side
+    def name(self) -> str:
+        return "square"
+
+def describe(s: Shape) -> str:
+    return f"{s.name()}: {s.area():.2f}"
+
+def main() -> None:
+    let c: Circle = Circle(r=5.0)
+    let s: Square = Square(side=4.0)
+    print(describe(c))
+    print(describe(s))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,26 @@
+class Page:
+    next_cursor: str?
+
+class API:
+    pages: dict[str, Page]
+
+impl API:
+    def fetch(self, cursor: str?) -> Page:
+        let key: str = cursor if cursor is not None else "start"
+        return self.pages.get(key, Page(next_cursor=None))
+
+def paginate(api: API) -> None:
+    mut cursor: str? = None
+    while True:
+        let page: Page = api.fetch(cursor)
+        if page.next_cursor is None:
+            break
+        cursor = page.next_cursor
+
+def main() -> None:
+    let api: API = API(pages={"start": Page(next_cursor=None)})
+    paginate(api)
+    print("done")
+
+if __name__ == "__main__":
+    main()

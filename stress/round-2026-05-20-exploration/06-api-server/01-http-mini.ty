@@ -1,0 +1,37 @@
+model Request:
+    method: str
+    path: str
+    body: str?
+
+model Response:
+    status: int
+    body: str
+
+class Router:
+    routes: dict[str, str]
+
+impl Router:
+    def handle(self, req: Request) -> Response:
+        let key: str = f"{req.method} {req.path}"
+        if key not in self.routes:
+            return Response(status=404, body=f"not found: {req.path}")
+        let body: str = self.routes[key]
+        return Response(status=200, body=body)
+
+def main() -> None:
+    let r: Router = Router(routes={
+        "GET /": "Hello world",
+        "GET /about": "About page",
+        "POST /api": "OK",
+    })
+    let reqs: list[Request] = [
+        Request(method="GET", path="/", body=None),
+        Request(method="GET", path="/missing", body=None),
+        Request(method="POST", path="/api", body='{"x":1}'),
+    ]
+    for req in reqs:
+        let resp: Response = r.handle(req)
+        print(f"{req.method} {req.path} -> {resp.status} {resp.body}")
+
+if __name__ == "__main__":
+    main()

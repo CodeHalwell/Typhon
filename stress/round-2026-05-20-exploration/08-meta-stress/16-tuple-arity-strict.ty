@@ -1,0 +1,7 @@
+def main() -> None:
+    let t: tuple[int, str] = (1, "x")
+    let z: bool = t[2]
+    print(z)
+
+if __name__ == "__main__":
+    main()

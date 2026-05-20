@@ -1,0 +1,10 @@
+def main() -> None:
+    mut data: list[int] = [1, 2, 3, 4, 5, 6, 7]
+    if (n := len(data)) > 3:
+        print(f"n is {n}")
+    while (chunk := data[:3]) and len(chunk) > 0:
+        print(chunk)
+        data = data[3:]
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,41 @@
+import time
+import random
+
+class RetryConfig:
+    max_attempts: int
+    base_delay_ms: int
+    max_delay_ms: int
+
+def with_retry[T](f: object, cfg: RetryConfig) -> Result[T, str]:
+    mut attempt: int = 0
+    while attempt < cfg.max_attempts:
+        attempt = attempt + 1
+        try:
+            unsafe:
+                let v: T = f()
+            return Ok(v)
+        except Exception as e:
+            if attempt >= cfg.max_attempts:
+                return Err(f"after {attempt} attempts: {e}")
+            let delay_ms: int = min(cfg.base_delay_ms * (2 ** (attempt - 1)), cfg.max_delay_ms)
+            print(f"  attempt {attempt} failed: {e}; retry in {delay_ms}ms")
+            time.sleep(delay_ms / 1000.0)
+    return Err("unreachable")
+
+mut counter: int = 0
+
+def flaky() -> str:
+    global counter
+    counter = counter + 1
+    if counter < 3:
+        raise RuntimeError(f"flake #{counter}")
+    return f"success on attempt {counter}"
+
+def main() -> None:
+    let cfg: RetryConfig = RetryConfig(max_attempts=5, base_delay_ms=10, max_delay_ms=100)
+    match with_retry(flaky, cfg):
+        case Ok(v):  print(f"got: {v}")
+        case Err(e): print(f"failed: {e}")
+
+if __name__ == "__main__":
+    main()

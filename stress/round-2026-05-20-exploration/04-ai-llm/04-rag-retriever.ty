@@ -1,0 +1,44 @@
+import math
+
+class Doc:
+    id: int
+    text: str
+    embedding: list[float]
+
+def cosine(a: list[float], b: list[float]) -> float:
+    mut dot: float = 0.0
+    mut a2: float = 0.0
+    mut b2: float = 0.0
+    for i in range(len(a)):
+        dot = dot + a[i] * b[i]
+        a2 = a2 + a[i] * a[i]
+        b2 = b2 + b[i] * b[i]
+    if a2 == 0.0 or b2 == 0.0:
+        return 0.0
+    return dot / (math.sqrt(a2) * math.sqrt(b2))
+
+class Retriever:
+    docs: list[Doc]
+
+impl Retriever:
+    def top_k(self, query: list[float], k: int) -> list[tuple[float, Doc]]:
+        mut scored: list[tuple[float, Doc]] = []
+        for d in self.docs:
+            scored.append((cosine(query, d.embedding), d))
+        let sorted_scored: list[tuple[float, Doc]] = sorted(scored, key=lambda p: -p[0])
+        return sorted_scored[:k]
+
+def main() -> None:
+    let r: Retriever = Retriever(docs=[
+        Doc(id=1, text="cats are mammals", embedding=[1.0, 0.0, 0.0]),
+        Doc(id=2, text="dogs are mammals", embedding=[0.9, 0.1, 0.0]),
+        Doc(id=3, text="snakes are reptiles", embedding=[0.0, 1.0, 0.0]),
+        Doc(id=4, text="rust is fast", embedding=[0.0, 0.0, 1.0]),
+    ])
+    let query: list[float] = [1.0, 0.0, 0.0]
+    let results: list[tuple[float, Doc]] = r.top_k(query, 2)
+    for score, d in results:
+        print(f"{score:.3f} #{d.id}: {d.text}")
+
+if __name__ == "__main__":
+    main()

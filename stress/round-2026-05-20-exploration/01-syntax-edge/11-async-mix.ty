@@ -1,0 +1,30 @@
+import asyncio
+
+@gatherable
+async def fetch_a() -> int:
+    await asyncio.sleep(0.01)
+    return 1
+
+@gatherable
+async def fetch_b() -> int:
+    await asyncio.sleep(0.01)
+    return 2
+
+@gatherable
+async def fetch_c() -> int:
+    await asyncio.sleep(0.01)
+    return 3
+
+async def run() -> int:
+    gather:
+        a = fetch_a()
+        b = fetch_b()
+        c = fetch_c()
+    return a + b + c
+
+async def main() -> None:
+    let total: int = await run()
+    print(f"total={total}")
+
+if __name__ == "__main__":
+    asyncio.run(main())

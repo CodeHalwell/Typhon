@@ -1,0 +1,52 @@
+model Todo:
+    id: int
+    title: str
+    done: bool
+
+class TodoStore:
+    items: dict[int, Todo]
+    next_id: int
+
+impl TodoStore:
+    def create(self, title: str) -> Todo:
+        let todo: Todo = Todo(id=self.next_id, title=title, done=False)
+        self.items[self.next_id] = todo
+        self.next_id = self.next_id + 1
+        return todo
+
+    def list(self) -> list[Todo]:
+        return list(self.items.values())
+
+    def get(self, id: int) -> Todo?:
+        return self.items.get(id)
+
+    def update(self, id: int, done: bool) -> Result[Todo, str]:
+        if id not in self.items:
+            return Err(f"no todo with id {id}")
+        let existing: Todo = self.items[id]
+        let updated: Todo = Todo(id=existing.id, title=existing.title, done=done)
+        self.items[id] = updated
+        return Ok(updated)
+
+    def delete(self, id: int) -> bool:
+        if id not in self.items:
+            return False
+        del self.items[id]
+        return True
+
+def main() -> None:
+    let store: TodoStore = TodoStore(items={}, next_id=1)
+    let a: Todo = store.create("buy milk")
+    let b: Todo = store.create("write code")
+    let c: Todo = store.create("test typhon")
+    print(f"created {len(store.list())} todos")
+    match store.update(b.id, True):
+        case Ok(t):  print(f"updated id={t.id} done={t.done}")
+        case Err(e): print(f"update err: {e}")
+    let removed: bool = store.delete(a.id)
+    print(f"deleted={removed}, now {len(store.list())} todos")
+    guard found = store.get(c.id) else: return
+    print(f"found {found.title}")
+
+if __name__ == "__main__":
+    main()

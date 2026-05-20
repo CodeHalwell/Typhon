@@ -1,0 +1,32 @@
+def parse_int(s: str) -> Result[int, str]:
+    try:
+        return Ok(int(s))
+    except ValueError:
+        return Err(f"bad int: {s}")
+
+def divide(a: int, b: int) -> Result[float, str]:
+    if b == 0:
+        return Err("div by zero")
+    return Ok(a / b)
+
+def process(astr: str, bstr: str) -> Result[float, str]:
+    with a = parse_int(astr)?,
+         b = parse_int(bstr)?,
+         q = divide(a, b)?:
+        return Ok(q)
+    else err:
+        return Err(f"failed: {err}")
+
+def main() -> None:
+    match process("10", "2"):
+        case Ok(v):  print(f"ok: {v}")
+        case Err(e): print(f"err: {e}")
+    match process("x", "2"):
+        case Ok(v):  print(f"ok: {v}")
+        case Err(e): print(f"err: {e}")
+    match process("10", "0"):
+        case Ok(v):  print(f"ok: {v}")
+        case Err(e): print(f"err: {e}")
+
+if __name__ == "__main__":
+    main()

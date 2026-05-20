@@ -1,0 +1,15 @@
+def main() -> None:
+    # R3.9 — int / int produces float but might be accepted in int slot
+    let a: int = 10
+    let b: int = 3
+    let bad: int = a / b  # should be a flagged or use //
+    print(f"bad={bad} type={type(bad).__name__}")
+
+    let good: int = a // b
+    print(f"good={good} type={type(good).__name__}")
+
+    let okf: float = a / b
+    print(f"okf={okf}")
+
+if __name__ == "__main__":
+    main()

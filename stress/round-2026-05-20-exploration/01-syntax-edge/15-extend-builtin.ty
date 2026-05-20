@@ -1,0 +1,13 @@
+extend str:
+    def slug(self) -> str:
+        return self.lower().replace(" ", "-")
+    def shout(self) -> str:
+        return self.upper() + "!"
+
+def main() -> None:
+    let title: str = "Hello World Of Typhon"
+    print(title.slug())
+    print(title.shout())
+
+if __name__ == "__main__":
+    main()

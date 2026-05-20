@@ -1,0 +1,19 @@
+class User:
+    name: str
+    age: int
+
+extend User:
+    def greet(self) -> str:
+        return f"Hi {self.name} ({self.age})"
+
+extend User:
+    def is_adult(self) -> bool:
+        return self.age >= 18
+
+def main() -> None:
+    let u: User = User(name="alice", age=25)
+    print(u.greet())
+    print(u.is_adult())
+
+if __name__ == "__main__":
+    main()

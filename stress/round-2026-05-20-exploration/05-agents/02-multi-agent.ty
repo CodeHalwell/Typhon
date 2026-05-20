@@ -1,0 +1,48 @@
+import asyncio
+
+class Msg:
+    sender: str
+    text: str
+
+class Inbox:
+    name: str
+    messages: list[Msg]
+
+impl Inbox:
+    def post(self, m: Msg) -> None:
+        self.messages.append(m)
+    def pop_all(self) -> list[Msg]:
+        let out: list[Msg] = self.messages[:]
+        self.messages.clear()
+        return out
+
+async def agent_loop(name: str, mailbox: Inbox, others: list[Inbox], rounds: int) -> list[str]:
+    mut log: list[str] = []
+    for r in range(rounds):
+        await asyncio.sleep(0.001)
+        let pending: list[Msg] = mailbox.pop_all()
+        for m in pending:
+            log.append(f"[{name}] got '{m.text}' from {m.sender}")
+        if r == 0:
+            for o in others:
+                o.post(Msg(sender=name, text=f"hello-round{r}"))
+        else:
+            for o in others:
+                o.post(Msg(sender=name, text=f"reply-{r}"))
+    return log
+
+async def main() -> None:
+    let alice: Inbox = Inbox(name="alice", messages=[])
+    let bob: Inbox = Inbox(name="bob", messages=[])
+    let carol: Inbox = Inbox(name="carol", messages=[])
+
+    gather:
+        la = agent_loop("alice", alice, [bob, carol], 3)
+        lb = agent_loop("bob", bob, [alice, carol], 3)
+        lc = agent_loop("carol", carol, [alice, bob], 3)
+
+    for line in la + lb + lc:
+        print(line)
+
+if __name__ == "__main__":
+    asyncio.run(main())

@@ -1,0 +1,28 @@
+import math
+
+def mean(xs: list[float]) -> float:
+    if len(xs) == 0:
+        return 0.0
+    mut total: float = 0.0
+    for x in xs:
+        total = total + x
+    return total / len(xs)
+
+def variance(xs: list[float]) -> float:
+    let m: float = mean(xs)
+    mut total: float = 0.0
+    for x in xs:
+        total = total + (x - m) * (x - m)
+    return total / len(xs) if len(xs) > 0 else 0.0
+
+def stddev(xs: list[float]) -> float:
+    return math.sqrt(variance(xs))
+
+def main() -> None:
+    let data: list[float] = [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]
+    print(f"mean={mean(data):.3f}")
+    print(f"variance={variance(data):.3f}")
+    print(f"stddev={stddev(data):.3f}")
+
+if __name__ == "__main__":
+    main()

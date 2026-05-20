@@ -1,0 +1,40 @@
+from typing import Callable
+
+class Event:
+    name: str
+    payload: dict[str, str]
+
+type Handler = Callable[[Event], None]
+
+class EventBus:
+    subs: dict[str, list[Handler]]
+
+impl EventBus:
+    def on(self, name: str, h: Handler) -> None:
+        if name not in self.subs:
+            self.subs[name] = []
+        self.subs[name].append(h)
+
+    def emit(self, e: Event) -> None:
+        if e.name not in self.subs:
+            return
+        for h in self.subs[e.name]:
+            h(e)
+
+def main() -> None:
+    let bus: EventBus = EventBus(subs={})
+    mut log: list[str] = []
+    def on_login(e: Event) -> None:
+        log.append(f"login: {e.payload.get('user', '?')}")
+    def on_purchase(e: Event) -> None:
+        log.append(f"purchase: {e.payload.get('item', '?')} for {e.payload.get('amt', '0')}")
+    bus.on("login", on_login)
+    bus.on("purchase", on_purchase)
+    bus.emit(Event(name="login", payload={"user": "alice"}))
+    bus.emit(Event(name="purchase", payload={"item": "tea", "amt": "3.50"}))
+    bus.emit(Event(name="unknown", payload={}))
+    for line in log:
+        print(line)
+
+if __name__ == "__main__":
+    main()

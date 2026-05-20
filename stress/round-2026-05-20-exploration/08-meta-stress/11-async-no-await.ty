@@ -1,0 +1,12 @@
+import asyncio
+
+# R3.14 — async def with no await should warn
+async def unused_async() -> int:
+    return 42
+
+async def main() -> None:
+    let v: int = await unused_async()
+    print(v)
+
+if __name__ == "__main__":
+    asyncio.run(main())

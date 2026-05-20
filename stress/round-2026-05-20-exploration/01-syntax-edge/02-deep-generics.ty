@@ -1,0 +1,25 @@
+class Node[T]:
+    value: T
+    children: list[Node[T]]
+
+impl[T] Node[T]:
+    def is_leaf(self) -> bool:
+        return len(self.children) == 0
+
+    def count(self) -> int:
+        mut total: int = 1
+        for child in self.children:
+            total = total + child.count()
+        return total
+
+def build_tree() -> Node[int]:
+    let leaf1: Node[int] = Node(value=1, children=[])
+    let leaf2: Node[int] = Node(value=2, children=[])
+    return Node(value=0, children=[leaf1, leaf2])
+
+def main() -> None:
+    let tree: Node[int] = build_tree()
+    print(f"count={tree.count()}")
+
+if __name__ == "__main__":
+    main()

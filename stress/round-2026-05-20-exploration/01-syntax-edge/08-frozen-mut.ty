@@ -1,0 +1,17 @@
+class Config frozen:
+    debug: bool
+    port: int
+    name: str
+
+def main() -> None:
+    let cfg: Config = Config(debug=True, port=8080, name="prod")
+    print(f"{cfg.name}:{cfg.port}")
+    # Try to mutate — should fail at runtime, ideally at compile time
+    try:
+        cfg.port = 9000
+        print("WARN: mutation allowed")
+    except Exception as e:
+        print(f"correctly blocked: {e}")
+
+if __name__ == "__main__":
+    main()

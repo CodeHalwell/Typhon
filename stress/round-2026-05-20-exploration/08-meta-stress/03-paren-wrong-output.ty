@@ -1,0 +1,22 @@
+def main() -> None:
+    # In Python: ([1,2] if False else [3,4])[0:1] == [3] (slice of [3,4])
+    # If parens dropped: [1,2] if False else [3,4][0:1] == [3,4][0:1] == [3]
+    # ... both happen to be same here. Try a case where they differ:
+
+    # (a + b) * 2   vs   a + b * 2
+    let x: int = (3 + 4) * 2
+    # Expected: 14. If parens stripped: 3 + 4*2 = 11.
+    print(f"x={x} expected=14")
+
+    # ("a" + "b").upper()  vs  "a" + "b".upper()
+    let s: str = ("a" + "b").upper()
+    # Expected "AB". If parens stripped: "a" + "b".upper() = "aB"
+    print(f"s={s} expected=AB")
+
+    # (True or False) and False  vs  True or False and False
+    let b: bool = (True or False) and False
+    # Expected False. If stripped: True or (False and False) = True
+    print(f"b={b} expected=False")
+
+if __name__ == "__main__":
+    main()

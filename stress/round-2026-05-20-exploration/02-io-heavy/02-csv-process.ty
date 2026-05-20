@@ -1,0 +1,39 @@
+import csv
+import io
+
+class Row:
+    name: str
+    score: int
+
+def parse_csv(text: str) -> Result[list[Row], str]:
+    try:
+        let reader: object = csv.DictReader(io.StringIO(text))
+        mut rows: list[Row] = []
+        for r in reader:
+            unsafe:
+                let row: Row = Row(name=r["name"], score=int(r["score"]))
+            rows.append(row)
+        return Ok(rows)
+    except Exception as e:
+        return Err(f"csv parse: {e}")
+
+def average(rows: list[Row]) -> float:
+    if len(rows) == 0:
+        return 0.0
+    mut total: int = 0
+    for r in rows:
+        total = total + r.score
+    return total / len(rows)
+
+def main() -> None:
+    let data: str = "name,score\nalice,90\nbob,75\ncarol,88\n"
+    match parse_csv(data):
+        case Ok(rs):
+            print(f"parsed {len(rs)} rows")
+            print(f"avg={average(rs):.2f}")
+            for r in rs:
+                print(f"  {r.name}: {r.score}")
+        case Err(e): print(f"err: {e}")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,61 @@
+class Field:
+    name: str
+    error: str
+
+def require(d: dict[str, str], key: str) -> Result[str, Field]:
+    if key not in d:
+        return Err(Field(name=key, error="missing"))
+    let v: str = d[key]
+    if v == "":
+        return Err(Field(name=key, error="empty"))
+    return Ok(v)
+
+def parse_int(name: str, s: str) -> Result[int, Field]:
+    try:
+        return Ok(int(s))
+    except ValueError:
+        return Err(Field(name=name, error=f"not int: {s}"))
+
+class Signup:
+    email: str
+    age: int
+    role: str
+
+def validate(data: dict[str, str]) -> Result[Signup, list[Field]]:
+    let r_email: Result[str, Field] = require(data, "email")
+    let r_age_str: Result[str, Field] = require(data, "age")
+    let r_role: Result[str, Field] = require(data, "role")
+    mut errs: list[Field] = []
+    match r_email:
+        case Err(f): errs.append(f)
+        case Ok(_):  pass
+    match r_age_str:
+        case Err(f): errs.append(f)
+        case Ok(_):  pass
+    match r_role:
+        case Err(f): errs.append(f)
+        case Ok(_):  pass
+    if len(errs) > 0:
+        return Err(errs)
+    # Past the guard, all values are present
+    with email = r_email?,
+         age_str = r_age_str?,
+         role = r_role?,
+         age = parse_int("age", age_str)?:
+        return Ok(Signup(email=email, age=age, role=role))
+    else err:
+        return Err([err])
+
+def main() -> None:
+    let good: dict[str, str] = {"email": "a@x.com", "age": "25", "role": "user"}
+    let bad: dict[str, str] = {"email": "", "age": "x", "role": ""}
+    for d in [good, bad]:
+        match validate(d):
+            case Ok(s):  print(f"ok: {s.email} ({s.age}) [{s.role}]")
+            case Err(fs):
+                print(f"err: {len(fs)} fields")
+                for f in fs:
+                    print(f"  {f.name}: {f.error}")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,41 @@
+def step1(s: str) -> Result[int, str]:
+    try:
+        return Ok(int(s))
+    except ValueError:
+        return Err(f"step1: {s}")
+
+def step2(n: int) -> Result[float, str]:
+    if n < 0:
+        return Err(f"step2: negative")
+    return Ok(float(n) * 1.5)
+
+def step3(f: float) -> Result[str, str]:
+    return Ok(f"{f:.2f}")
+
+def pipeline(input: str) -> Result[str, str]:
+    let n: int = step1(input)?
+    let f: float = step2(n)?
+    let s: str = step3(f)?
+    return Ok(s)
+
+# Same thing with with-chain
+def pipeline_with(input: str) -> Result[str, str]:
+    with n = step1(input)?,
+         f = step2(n)?,
+         s = step3(f)?:
+        return Ok(s)
+    else err:
+        return Err(f"chain failed: {err}")
+
+def main() -> None:
+    for v in ["42", "-1", "abc"]:
+        match pipeline(v):
+            case Ok(s):  print(f"chain1 ok: {s}")
+            case Err(e): print(f"chain1 err: {e}")
+    for v in ["42", "-1", "abc"]:
+        match pipeline_with(v):
+            case Ok(s):  print(f"chain2 ok: {s}")
+            case Err(e): print(f"chain2 err: {e}")
+
+if __name__ == "__main__":
+    main()

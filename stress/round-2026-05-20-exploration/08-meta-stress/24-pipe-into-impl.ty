@@ -1,0 +1,15 @@
+class Counter:
+    n: int
+
+impl Counter:
+    def add(self, v: int) -> Counter:
+        return Counter(n=self.n + v)
+
+def main() -> None:
+    let c: Counter = Counter(n=0)
+    # R3.11 — c |> Counter.add(5) lookup confusion
+    let c2: Counter = c |> Counter.add(5)
+    print(c2.n)
+
+if __name__ == "__main__":
+    main()

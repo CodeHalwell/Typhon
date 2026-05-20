@@ -1,0 +1,9 @@
+def main() -> None:
+    # R3.10 — out-of-range tuple index should be flagged
+    let t: tuple[int, str] = (1, "x")
+    unsafe:
+        let z: bool = t[2]
+    print(z)
+
+if __name__ == "__main__":
+    main()

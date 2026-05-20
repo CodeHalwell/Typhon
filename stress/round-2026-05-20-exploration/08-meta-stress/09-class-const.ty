@@ -1,0 +1,16 @@
+class HTTP:
+    GET: str = "GET"
+    POST: str = "POST"
+    PUT: str = "PUT"
+    DELETE: str = "DELETE"
+
+def main() -> None:
+    # R3.2 — class-level constants destroyed by @dataclass(slots=True)
+    print(HTTP.GET)
+    print(HTTP.POST)
+    # When dataclass(slots=True), HTTP.GET should resolve to the slot descriptor,
+    # not the string. Confirm:
+    print(type(HTTP.GET).__name__)
+
+if __name__ == "__main__":
+    main()

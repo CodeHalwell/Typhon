@@ -1,0 +1,24 @@
+import time
+
+class Timer:
+    name: str
+    start: float
+    elapsed: float
+
+impl Timer:
+    def __enter__(self) -> Timer:
+        self.start = time.monotonic()
+        return self
+    def __exit__(self, et: object, ev: object, tb: object) -> None:
+        self.elapsed = time.monotonic() - self.start
+        print(f"{self.name}: {self.elapsed:.3f}s")
+
+def main() -> None:
+    with Timer(name="loop", start=0.0, elapsed=0.0) as t:
+        mut acc: int = 0
+        for i in range(100000):
+            acc = acc + i
+        print(f"acc={acc}")
+
+if __name__ == "__main__":
+    main()

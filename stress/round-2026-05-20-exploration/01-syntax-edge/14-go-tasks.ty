@@ -1,0 +1,15 @@
+import asyncio
+
+async def background(name: str, delay: float) -> str:
+    await asyncio.sleep(delay)
+    return f"{name} done"
+
+async def main() -> None:
+    go background("task1", 0.01) -> t1
+    go background("task2", 0.01) -> t2
+    let r1: str = await t1
+    let r2: str = await t2
+    print(r1, r2)
+
+if __name__ == "__main__":
+    asyncio.run(main())

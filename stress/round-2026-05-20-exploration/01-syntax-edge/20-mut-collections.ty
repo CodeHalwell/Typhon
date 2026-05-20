@@ -1,0 +1,17 @@
+def main() -> None:
+    mut counters: dict[str, int] = {}
+    let words: list[str] = ["the", "quick", "the", "brown", "the", "fox"]
+    for w in words:
+        if w in counters:
+            counters[w] = counters[w] + 1
+        else:
+            counters[w] = 1
+    print(counters)
+
+    mut nums: list[int] = []
+    for i in range(5):
+        nums.append(i * i)
+    print(nums)
+
+if __name__ == "__main__":
+    main()

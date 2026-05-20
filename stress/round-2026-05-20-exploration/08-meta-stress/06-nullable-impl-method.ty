@@ -1,0 +1,23 @@
+class API:
+    name: str
+
+impl API:
+    def fetch(self, cursor: str?) -> int:
+        return 0 if cursor is None else len(cursor)
+
+# Free function with same signature
+def free_fetch(cursor: str?) -> int:
+    return 0 if cursor is None else len(cursor)
+
+def main() -> None:
+    let api: API = API(name="x")
+    let v: str? = None
+    # Free fn — works
+    print(free_fetch(v))
+    # Impl method — does this fail?
+    print(api.fetch(v))
+    print(api.fetch(None))
+    print(api.fetch("hi"))
+
+if __name__ == "__main__":
+    main()

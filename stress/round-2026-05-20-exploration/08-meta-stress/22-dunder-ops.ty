@@ -1,0 +1,22 @@
+class Vec2:
+    x: float
+    y: float
+
+impl Vec2:
+    def __add__(self, other: Vec2) -> Vec2:
+        return Vec2(x=self.x + other.x, y=self.y + other.y)
+    def __mul__(self, scalar: float) -> Vec2:
+        return Vec2(x=self.x * scalar, y=self.y * scalar)
+    def __repr__(self) -> str:
+        return f"Vec2({self.x}, {self.y})"
+
+def main() -> None:
+    let a: Vec2 = Vec2(x=1.0, y=2.0)
+    let b: Vec2 = Vec2(x=3.0, y=4.0)
+    let c: Vec2 = a + b
+    let d: Vec2 = a * 5.0
+    print(c)
+    print(d)
+
+if __name__ == "__main__":
+    main()

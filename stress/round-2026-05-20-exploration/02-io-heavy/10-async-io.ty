@@ -1,0 +1,28 @@
+import asyncio
+
+async def producer(q: asyncio.Queue, n: int) -> None:
+    for i in range(n):
+        await q.put(i)
+        await asyncio.sleep(0.001)
+    await q.put(None)
+
+async def consumer(q: asyncio.Queue) -> int:
+    mut total: int = 0
+    while True:
+        let item: object = await q.get()
+        if item is None:
+            break
+        unsafe:
+            let v: int = item
+        total = total + v
+    return total
+
+async def main() -> None:
+    let q: asyncio.Queue = asyncio.Queue()
+    go producer(q, 10) -> p
+    let total: int = await consumer(q)
+    await p
+    print(f"sum=0..9 -> {total}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
