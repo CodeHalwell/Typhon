@@ -98,6 +98,41 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 At the end of Phase 3, Typhon is useful for a real backend or CLI project.
 Everything beyond is polish and ambition.
 
+## Phase 5.5 — Constructor / method arity safety ✅ complete (v0.2.0)
+
+Shipped in [v0.2.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.2.0):
+
+- **Constructor arity (`tyc::arg_count`):** the auto-generated
+  `__init__` of `class` / `model` declarations is now arity-checked at
+  every call site. `ApiClient(base_url="…")` for a class with a
+  required `api_key: str` field is rejected at `tyc check` / `tyc
+  build` time instead of failing at runtime with `TypeError: missing
+  1 required positional argument`.
+- **Method arity (`tyc::arg_count`):** `impl` methods now carry full
+  `ArityInfo` on their `MethodSig`, so `u.greet()` is flagged when
+  `greet` declares a required `prefix: str` parameter. Previously
+  method calls fell into the permissive arity shape.
+- **Cross-module shape propagation:** `from foo import ApiClient` and
+  `import foo as f; f.ApiClient(…)` both flow through the new arity
+  checks. `.ty` source and `.dty` stubs participate on equal footing,
+  with stubs winning on name collisions. Works in `tyc check`, `tyc
+  build`, and the LSP (which caches per-file shape extraction via a
+  new salsa-tracked `module_shapes_query`).
+- **Post-construction field-init audit (`tyc::missing_field_init`):**
+  catches the `X.__new__(X)` / `object.__new__(X)` bypass patterns.
+  If the constructed instance escapes the function (return / call
+  argument) with required fields unassigned, the audit fires. Dropped
+  conservatively on `setattr`, method calls, and inside `unsafe:`.
+
+Limitations carried forward (tracked in
+`docs/follow-ups-2026-05-17.md`):
+
+- Dotted-attribute annotations (`let c: f.Cls = …`) don't resolve to
+  the foreign class shape; use `from foo import Cls` or drop the
+  annotation for now.
+- The post-construction audit doesn't track container-literal escapes
+  or outer-scope assignment escapes, and is intra-procedural.
+
 ## Phase 5 — Interop and developer experience ✅ complete (v0.1.6)
 
 Shipped in [v0.1.6](https://github.com/CodeHalwell/Typhon/releases/tag/v0.1.6):

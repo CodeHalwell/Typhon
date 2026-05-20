@@ -409,6 +409,56 @@ pub fn extract_shapes_for_path(_path: &str, text: &str) -> ModuleShapes {
     extract_module_shapes(&module)
 }
 
+/// Newtype wrapper around `Arc<ModuleShapes>` so the Salsa-tracked
+/// `module_shapes_query` can satisfy `salsa::Update`. Mirrors
+/// [`ArcResolvedModule`] / [`ArcDiagnostics`] for the same orphan-rule
+/// reason. Pointer-equality is the equivalence relation (a fresh
+/// extraction allocates a new `Arc`, so "different `Arc` = changed").
+#[derive(Clone)]
+pub struct ArcModuleShapes(pub Arc<ModuleShapes>);
+
+impl PartialEq for ArcModuleShapes {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ArcModuleShapes {}
+
+impl std::ops::Deref for ArcModuleShapes {
+    type Target = ModuleShapes;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+// SAFETY: same argument as for `ArcResolvedModule`.
+unsafe impl salsa::Update for ArcModuleShapes {
+    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
+        if Arc::ptr_eq(&(*old_pointer).0, &new_value.0) {
+            false
+        } else {
+            *old_pointer = new_value;
+            true
+        }
+    }
+}
+
+/// Salsa-tracked variant of [`extract_shapes_for_path`]. The LSP
+/// backend keeps a `HashMap<dotted_name, SourceFile>` per project
+/// root and queries this for each file — Salsa re-runs the
+/// extraction only on the file whose text changed, so a keystroke
+/// in `src/main.ty` doesn't re-parse `src/clients.ty`.
+///
+/// The result is wrapped in [`ArcModuleShapes`]; callers typically
+/// unwrap via `.0.clone()` to drop the wrapper.
+#[salsa::tracked]
+pub fn module_shapes_query(db: &dyn salsa::Database, file: SourceFile) -> ArcModuleShapes {
+    let text = file.text(db).clone();
+    let shapes = extract_shapes_for_path(&file.path(db).clone(), &text);
+    ArcModuleShapes(Arc::new(shapes))
+}
+
 /// Variant of [`check_file`] that consults a pre-built project-wide
 /// shape registry so cross-module constructor / method arity checks
 /// fire when an imported class is called.
@@ -520,30 +570,41 @@ fn check_impl_with_imports(
 /// [`ExternalShapes`] snapshot that
 /// [`tyc_types::check_module_with_imports`] consumes.
 ///
-/// Today we wire two import shapes through:
+/// Both import shapes are now wired:
 ///
 /// - `from M import X` (with or without `as Y`) → the local name `X`
 ///   (or `Y`) gets the class shape / function arity that module `M`
-///   exports for `X`. This is the common `from foo import ApiClient`
-///   pattern.
-/// - Bare `import M` / `import M as N` is intentionally left for a
-///   follow-up — its useful resolution requires modelling the module
-///   object so `m.SomeClass(...)` dotted access can locate the
-///   class, which is more invasive than the symbol-table seed used
-///   here. Bare imports still flow through normally; they just don't
-///   yet unlock cross-module arity checks for dotted access.
+///   exports for `X`. Flat by-name seeding so the local name lands
+///   as `Type::Class("X")` and constructor / arity checks fire
+///   transparently.
+/// - `import M` / `import M as N` → the local name binds to
+///   `Type::Module("M")`; attribute access (`N.SomeClass(...)`)
+///   resolves through `by_module` and registers the foreign class
+///   shape on-demand so the constructor call site arity-checks
+///   normally. The full `shapes_by_module` registry is cloned into
+///   `by_module` so the checker can satisfy any attribute access on
+///   any imported module without further callbacks.
 fn build_external_shapes(
     resolved: &ResolvedModule,
     shapes_by_module: &std::collections::HashMap<String, ModuleShapes>,
 ) -> ExternalShapes {
-    let mut external = ExternalShapes::default();
+    let mut external = ExternalShapes {
+        by_module: shapes_by_module.clone(),
+        ..ExternalShapes::default()
+    };
     // Module-scope bindings live in scope 0.
     let bindings = &resolved.scopes[0].bindings;
     for b in bindings {
         let Some(info) = &b.import_info else { continue };
-        // Only `from M import X` (member is Some) is wired — bare
-        // `import M` would need module-object modelling.
         let Some(member) = info.member.as_ref() else {
+            // Bare `import M as N` — record the alias mapping so the
+            // checker can render `N.SomeClass(...)` via the module
+            // registry. The shape lookup at attribute-access time
+            // uses `info.module` (the original dotted name), not the
+            // local alias.
+            external
+                .bare_imports
+                .insert(b.name.clone(), info.module.clone());
             continue;
         };
         let Some(module_shapes) = shapes_by_module.get(&info.module) else {
@@ -1203,6 +1264,78 @@ from nonexistent import Thing
 
 unsafe:
     let t = Thing()
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn bare_import_dotted_ctor_missing_required_errors() {
+        // `import M as N; N.Cls(...)` — the dotted constructor call
+        // now arity-checks against `M`'s shape registry entry. The
+        // local `N` binds to `Type::Module("M")`; attribute access
+        // resolves `N.Cls` to `Type::Class("Cls")` with the foreign
+        // shape installed lazily into the checker's class table.
+        let lib = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+";
+        let registry = build_registry(&[("clients", lib)]);
+        let main = "\
+import clients
+
+def f() -> None:
+    let c = clients.ApiClient(base_url=\"x\")
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
+        assert!(diags.has_errors(), "bare-import dotted ctor must error");
+        let msg = format!("{}", diags.errors()[0]);
+        assert!(
+            msg.contains("ApiClient") && msg.contains("wrong number of arguments"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn bare_import_aliased_dotted_method_missing_arg_errors() {
+        let lib = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+impl ApiClient:
+    def url(self, path: str) -> str:
+        return self.base_url + path
+";
+        let registry = build_registry(&[("clients", lib)]);
+        let main = "\
+import clients as c_mod
+
+def f() -> None:
+    let c = c_mod.ApiClient(api_key=\"k\", base_url=\"u\")
+    let s: str = c.url()
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
+        assert!(diags.has_errors(), "aliased dotted method arity must error");
+    }
+
+    #[test]
+    fn bare_import_dotted_ctor_correct_passes() {
+        let lib = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+";
+        let registry = build_registry(&[("clients", lib)]);
+        let main = "\
+import clients
+
+def f() -> None:
+    let c = clients.ApiClient(api_key=\"k\", base_url=\"u\")
 ";
         let mut db = TycDatabase::new();
         let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);

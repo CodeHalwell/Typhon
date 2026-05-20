@@ -36,17 +36,27 @@ stubs flow through the same project-wide shape registry. The CLI
 the LSP rebuilds it on every check so the editor reacts to changes in
 sibling files within one keystroke.
 
-Limitations of the current implementation, tracked for a follow-up:
+Both originally-listed limitations have been resolved in v0.2.0:
 
 - Bare `import M as N` followed by `N.SomeClass(...)` dotted access
-  isn't yet wired; the local alias `N` lands as `Type::Unknown` and
-  the constructor call bypasses the check. The CLI catches this via
-  the unknown-module pass; the type-level fix needs module-object
-  modelling.
-- The LSP rebuilds the registry on every check (parse-only walk of
-  the project's `.ty` / `.dty` tree). For large projects this could
-  become noticeable; a Salsa-tracked cache keyed on file-text would
-  be the natural follow-up.
+  is now wired via a new `Type::Module(name)` plus a per-checker
+  module registry that's consulted at attribute access. `from M
+  import X` and `import M [as N]; N.X(...)` both flow through the
+  same `tyc::arg_count` constructor / method arity checks.
+- The LSP no longer rebuilds the project shape registry from
+  scratch. A new salsa-tracked `module_shapes_query(file)` caches
+  shape extraction by file text, and the LSP backend keeps a
+  per-project-root `HashMap<dotted_name, SourceFile>` so cached
+  `SourceFile` handles survive across keystrokes. A keystroke in
+  one file only re-runs shape extraction for that file.
+
+Remaining limitations (smaller scope, tracked for future PRs):
+
+- Dotted-attribute annotations (`let c: f.Cls = …`) don't resolve to
+  the foreign class shape. The constructor call itself
+  arity-checks, but the binding lands as `Type::Unknown`, which
+  weakens downstream method-arity checks on that binding. Workaround:
+  use `from foo import Cls` or drop the annotation entirely.
 
 ### Post-construction field-init audit — ✅ landed (tight scope)
 

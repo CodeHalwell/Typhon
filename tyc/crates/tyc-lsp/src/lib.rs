@@ -24,7 +24,7 @@ use tower_lsp_server::ls_types::{
 };
 use tower_lsp_server::{jsonrpc, Client, LanguageServer, LspService, Server};
 use tyc_db::{
-    check_file_with_imports, check_source_file, extract_shapes_for_path, preprocessed_text,
+    check_file_with_imports, check_source_file, module_shapes_query, preprocessed_text,
     resolved_module_arc, ModuleShapes, SourceFile, TycDatabase,
 };
 use tyc_diagnostics::TycError;
@@ -92,6 +92,20 @@ pub struct Backend {
     /// request. Same locking shape as `introspection`: tokio outer,
     /// std inner because refresh + parse runs inside `spawn_blocking`.
     project_indexes: Arc<Mutex<HashMap<std::path::PathBuf, Arc<std::sync::Mutex<ProjectIndex>>>>>,
+    /// Per-project-root index of project source files registered with
+    /// the Salsa database. Used by the cross-module shape lookup so
+    /// `module_shapes_query` can cache extraction on file-text basis:
+    /// a keystroke in `src/main.ty` doesn't re-parse `src/clients.ty`.
+    ///
+    /// Outer key: project root path (the directory containing
+    /// `typhon.toml`). Inner: dotted module name (e.g. `"foo.bar"`)
+    /// → Salsa `SourceFile` handle.
+    ///
+    /// Entries are refreshed lazily inside `check_and_publish`: every
+    /// `.ty` / `.dty` file under the project's src tree is registered
+    /// (or its text re-uploaded via `set_text`) before the cross-
+    /// module shape map is assembled.
+    project_files: Arc<Mutex<HashMap<std::path::PathBuf, HashMap<String, SourceFile>>>>,
 }
 
 impl std::fmt::Debug for Backend {
@@ -169,21 +183,46 @@ impl Backend {
             docs.insert(uri_str.clone(), source_file);
         }
 
-        // Build a project-wide shape registry so cross-module
-        // constructor / method arity checks fire as the user types.
-        // We rebuild on every check rather than caching across calls:
-        // the work is parse-only (no resolve, no type-check) and
-        // the project file count is small enough that this stays
-        // responsive in practice. Editor performance regressions
-        // here would justify a Salsa-tracked cache as a follow-up.
+        // Resolve the project root once on the async side so the
+        // blocking closure (which holds the salsa db lock) only needs
+        // the cheap filesystem walk + cached queries below.
         let path_for_root = std::path::PathBuf::from(uri.path().as_str());
-        let project_shapes = build_project_shapes_for_path(&path_for_root, &uri_str, &text);
+        let workspace = find_workspace_layout(&path_for_root);
+        let project_files_arc = Arc::clone(&self.project_files);
 
         let text_for_check = text.clone();
         let uri_str_for_check = uri_str.clone();
         let result = tokio::task::spawn_blocking(move || {
             // Hold the mutex only for the duration of the salsa call.
             let mut db = db.blocking_lock();
+            // Build the project-wide shape registry inside the
+            // blocking closure so the salsa-cached
+            // `module_shapes_query` does the heavy lifting: only the
+            // file whose text actually changed re-runs the parse.
+            // `set_text` on a salsa input is a no-op when the new
+            // value matches, so re-uploading every file's on-disk
+            // text per check doesn't churn the cache. The currently-
+            // edited document uses its in-flight buffer text, not
+            // the on-disk content, so cross-module diagnostics
+            // update within one keystroke.
+            let project_shapes = if let Some((_root, src_dir)) = workspace.as_ref() {
+                let src_root_name = src_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("src")
+                    .to_owned();
+                #[allow(clippy::explicit_auto_deref)]
+                build_project_shapes_salsa(
+                    &mut *db,
+                    &project_files_arc,
+                    src_dir,
+                    &src_root_name,
+                    &uri_str_for_check,
+                    &text_for_check,
+                )
+            } else {
+                std::collections::HashMap::new()
+            };
             #[allow(clippy::explicit_auto_deref)]
             let diags = if project_shapes.is_empty() {
                 // No workspace layout discovered — fall back to the
@@ -191,10 +230,10 @@ impl Backend {
                 // the LSP cache warm.
                 check_source_file(&mut *db, source_file)
             } else {
-                // Cross-module-aware check: not cached by Salsa
-                // (the shape registry would be hard to model as a
-                // tracked input), but the parse+resolve+check is
-                // still cheap enough for incremental editing.
+                // Cross-module-aware check, backed by the Salsa
+                // `module_shapes_query` cache: unchanged sibling
+                // files reuse the cached extraction, so a keystroke
+                // in the open file only re-parses that one file.
                 check_file_with_imports(
                     &mut *db,
                     uri_str_for_check,
@@ -922,77 +961,111 @@ fn from_hex(b: u8) -> Option<u8> {
     }
 }
 
-/// Build the dotted-name → public-shape registry for the project
-/// containing `file_path`. Walks the project's source root and pulls
-/// shapes out of every `.ty` and `.dty` file. Mirrors the
-/// `collect_project_shapes` helper in `tyc/commands/check.rs` so a
-/// `tyc check` warm-up and an LSP keystroke see the same set of
-/// cross-module shapes.
+/// Salsa-backed project shape registry builder.
 ///
-/// The currently-open file's shapes come straight from the editor
-/// buffer (`current_text`) rather than from disk — without this the
-/// LSP would lag a keystroke behind on edits that change the local
-/// class surface and the next-cross-module-call diagnostic would
-/// flicker.
+/// Walks every `.ty` / `.dty` file under `src_dir`, ensures each one
+/// is registered as a [`SourceFile`] input in the Salsa database, and
+/// then queries [`module_shapes_query`] for each. Salsa's input
+/// equality check means re-uploading on-disk text that hasn't changed
+/// is a no-op; the per-file `module_shapes_query` cache then returns
+/// immediately. Net result: a keystroke in `main.ty` only triggers
+/// shape extraction for `main.ty`, not every sibling.
 ///
-/// Returns an empty map when no `typhon.toml` ancestor exists.
-fn build_project_shapes_for_path(
-    file_path: &std::path::Path,
+/// `current_uri` + `current_text` carry the in-flight editor buffer
+/// for the document currently being checked. That text is uploaded
+/// via `set_text` (or used to create a fresh `SourceFile`) so
+/// cross-module diagnostics react to unsaved changes within one
+/// keystroke.
+///
+/// `project_files` is the per-project handle table that survives
+/// across calls — without it we'd create a new `SourceFile` on every
+/// keystroke and the per-file salsa cache would never hit.
+///
+/// `.dty` stubs are registered first; the second pass over `.ty`
+/// files skips dotted names already in the map so authored stubs
+/// remain the authoritative surface for any module.
+fn build_project_shapes_salsa(
+    db: &mut TycDatabase,
+    project_files: &Arc<Mutex<HashMap<std::path::PathBuf, HashMap<String, SourceFile>>>>,
+    src_dir: &std::path::Path,
+    src_root_name: &str,
     current_uri: &str,
     current_text: &str,
 ) -> std::collections::HashMap<String, ModuleShapes> {
-    let Some((_project_root, src_dir)) = find_workspace_layout(file_path) else {
-        return std::collections::HashMap::new();
-    };
-    let src_root_name = src_dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("src")
-        .to_owned();
+    let project_root = src_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| src_dir.to_path_buf());
 
     let mut shapes: std::collections::HashMap<String, ModuleShapes> =
         std::collections::HashMap::new();
 
-    // `.dty` stubs first so `.ty` insertions later skip them — stubs
-    // are the authored Typhon surface for foreign packages.
-    let dty_files = collect_files_with_ext(&src_dir, "dty");
-    for file in &dty_files {
-        let dotted = path_to_dotted(file, &src_root_name);
-        if let Ok(text) = std::fs::read_to_string(file) {
-            shapes
-                .entry(dotted)
-                .or_insert_with(|| extract_shapes_for_path(&file.display().to_string(), &text));
-        }
-    }
+    let mut per_project = project_files.blocking_lock();
+    let entries = per_project.entry(project_root.clone()).or_default();
 
-    let ty_files = collect_files_with_ext(&src_dir, "ty");
-    for file in &ty_files {
-        let dotted = path_to_dotted(file, &src_root_name);
+    // `.dty` stubs first, so `.ty` insertions skip them on
+    // collisions — authored stubs are the source of truth.
+    let dty_files = collect_files_with_ext(src_dir, "dty");
+    for file in &dty_files {
+        let dotted = path_to_dotted(file, src_root_name);
         if shapes.contains_key(&dotted) {
             continue;
         }
-        // For the file the user is currently editing, prefer the
-        // in-flight buffer over the on-disk content — otherwise the
-        // cross-module check would lag a keystroke behind on edits
-        // that change this module's class surface.
-        let text_owned;
+        // Prefer the editor buffer for the currently-edited file,
+        // disk for everything else. Skip files we can't read.
         let text = if uri_matches_path(current_uri, file) {
-            current_text
+            current_text.to_owned()
         } else {
             match std::fs::read_to_string(file) {
-                Ok(t) => {
-                    text_owned = t;
-                    text_owned.as_str()
-                }
+                Ok(t) => t,
                 Err(_) => continue,
             }
         };
-        shapes.insert(
-            dotted,
-            extract_shapes_for_path(&file.display().to_string(), text),
-        );
+        let source_file = upsert_source_file(db, entries, &dotted, file, text);
+        shapes.insert(dotted, (*module_shapes_query(db, source_file).0).clone());
     }
+
+    let ty_files = collect_files_with_ext(src_dir, "ty");
+    for file in &ty_files {
+        let dotted = path_to_dotted(file, src_root_name);
+        if shapes.contains_key(&dotted) {
+            continue;
+        }
+        let text = if uri_matches_path(current_uri, file) {
+            current_text.to_owned()
+        } else {
+            match std::fs::read_to_string(file) {
+                Ok(t) => t,
+                Err(_) => continue,
+            }
+        };
+        let source_file = upsert_source_file(db, entries, &dotted, file, text);
+        shapes.insert(dotted, (*module_shapes_query(db, source_file).0).clone());
+    }
+
     shapes
+}
+
+/// Locate or create the Salsa `SourceFile` handle for a project
+/// module. If we already have a handle, push the new text through
+/// `set_text` (a no-op when content matches); otherwise allocate one
+/// via `SourceFile::new`. Either way, returns a handle that
+/// `module_shapes_query` can consume.
+fn upsert_source_file(
+    db: &mut TycDatabase,
+    entries: &mut HashMap<String, SourceFile>,
+    dotted: &str,
+    path: &std::path::Path,
+    text: String,
+) -> SourceFile {
+    if let Some(&sf) = entries.get(dotted) {
+        sf.set_text(db).to(text);
+        sf
+    } else {
+        let sf = SourceFile::new(db, path.display().to_string(), text);
+        entries.insert(dotted.to_owned(), sf);
+        sf
+    }
 }
 
 /// Recursive file collection that mirrors the CLI's
@@ -1563,6 +1636,7 @@ pub fn run_stdio(log_level: LogLevel) {
             resolved_cache: Arc::new(Mutex::new(HashMap::new())),
             introspection: Arc::new(Mutex::new(HashMap::new())),
             project_indexes: Arc::new(Mutex::new(HashMap::new())),
+            project_files: Arc::new(Mutex::new(HashMap::new())),
         });
         Server::new(stdin, stdout, socket).serve(service).await;
     });

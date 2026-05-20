@@ -71,6 +71,14 @@ pub enum Type {
     /// the call-site inference pass substitutes it with a concrete type.
     /// The string is the type-parameter name as declared in the source.
     TypeVar(String),
+    /// An imported Python module reference. Carries the dotted module
+    /// name (e.g. `"foo.bar"`) so attribute access (`f.Cls(...)`) can
+    /// look the target class up in a project-wide module shape
+    /// registry. Bare `import M` / `import M as N` bindings land
+    /// here; the seeded `from M import X` form continues to land
+    /// directly as `Type::Class("X")` because the local name *is*
+    /// the class. FINDINGS #163.
+    Module(String),
 }
 
 impl Type {
@@ -156,6 +164,7 @@ impl Type {
             Type::Any => "Any".into(),
             Type::TypeVar(name) => name.clone(),
             Type::Unknown => "?".into(),
+            Type::Module(name) => format!("<module {name}>"),
         }
     }
 }
@@ -1297,6 +1306,13 @@ struct Checker<'a> {
     /// (e.g. `c.configure(...)` which might assign fields). Skipped
     /// entirely inside `unsafe:` regions.
     uninit_instances: HashMap<String, UninitInstance>,
+    /// Dotted-name keyed registry of every project module's shapes,
+    /// used for attribute access on `Type::Module(name)` bindings. A
+    /// bare `import foo as f` plus `f.ApiClient(...)` looks `f` up in
+    /// the env → `Type::Module("foo")` → consults this registry for
+    /// `foo`'s `ApiClient` class, returning a `Type::Class("ApiClient")`
+    /// the constructor-call site can arity-check.
+    module_registry: HashMap<String, ModuleShapes>,
     /// Byte offsets of the `if True:` statements that correspond to
     /// `unsafe:` blocks.  Computed from the preprocessor's `unsafe_lines`
     /// metadata; queried by [`check_stmt`] when entering an `if` body to
@@ -1468,6 +1484,7 @@ impl<'a> Checker<'a> {
             current_return: None,
             current_class: None,
             uninit_instances: HashMap::new(),
+            module_registry: HashMap::new(),
         }
     }
 
@@ -2143,17 +2160,34 @@ pub struct ModuleShapes {
 /// the dotted module path to a `ModuleShapes` snapshot, then keying
 /// every brought-in symbol under its local alias.
 ///
-/// Today only `from M import X` and `from M import X as Y` are wired:
-/// the consumer sees `X` (or `Y`) as a `Type::Class` with the foreign
-/// class shape attached. Bare `import M` / `import M as N` is honoured
-/// for free-function arity lookup but does not yet thread shape info
-/// through dotted-attribute access (`m.SomeClass(...)`). Tracked as a
-/// follow-up.
+/// Two forms are wired:
+///
+/// - `from M import X` (with or without `as Y`) → the local name `X`
+///   (or `Y`) gets the class shape / function arity that module `M`
+///   exports for `X`. Class shapes also land in `class_shapes` so
+///   constructor arity checking fires immediately.
+/// - `import M` / `import M as N` → the local name `M` (or `N`) is
+///   bound to `Type::Module(M)`; attribute access (`M.SomeClass(...)`)
+///   looks the target up in `by_module`. The dotted module name
+///   stored on `Type::Module` is the *original* import path, not the
+///   local alias, so the same module imported under different aliases
+///   resolves consistently.
 #[derive(Debug, Clone, Default)]
 pub struct ExternalShapes {
     pub class_shapes: HashMap<String, InterfaceShape>,
     pub class_type_params: HashMap<String, Vec<String>>,
     pub function_arities: HashMap<String, ArityInfo>,
+    /// Bare imports that need attribute-access resolution. Keyed by
+    /// the *local* binding name; the value is the dotted module path
+    /// the import refers to (e.g. `("np", "numpy")` for
+    /// `import numpy as np`). Looked up by `seed_env_from_scope` to
+    /// give the binding `Type::Module(...)`.
+    pub bare_imports: HashMap<String, String>,
+    /// Dotted-name keyed registry of every project module's shapes,
+    /// for `Type::Module(name)` attribute access. Cloned into the
+    /// checker so attribute access on a module-typed binding can find
+    /// the foreign class shape without re-walking imports.
+    pub by_module: HashMap<String, ModuleShapes>,
 }
 
 /// Light-weight first-pass extractor that walks a parsed module and
@@ -2312,6 +2346,18 @@ pub fn check_module_with_imports(
                 .entry(name.clone())
                 .or_insert_with(|| info.clone());
         }
+        // Stash the by-module registry for attribute access on
+        // `Type::Module(name)` (bare `import M` form). Clone here
+        // (cheap because shapes are usually small per module) so the
+        // checker owns its lookup table independent of the caller's
+        // lifetime.
+        c.module_registry = ext.by_module.clone();
+        // Bare imports: `bare_imports[local_name] = dotted_module`.
+        // Seed `class_shapes` is NOT done here — the binding will
+        // resolve via `Type::Module(...)` at attribute-access time,
+        // not by name shadowing. The local name itself lands in the
+        // env via `seed_env_from_scope` reading the resolver's
+        // bindings; the type comes from the lookup below.
     }
 
     // First pass: collect class names + function signatures so forward
@@ -3600,6 +3646,12 @@ fn seed_env_from_scope(c: &mut Checker, scope: ScopeId) {
             // `from foo import ApiClient` would land as
             // `Type::Unknown` and `ApiClient(...)` calls would
             // bypass the new arity check.
+            //
+            // For bare `import M as N` (no `member`), the binding is
+            // given `Type::Module(dotted)` so attribute access
+            // (`N.SomeClass(...)`) can consult `module_registry` for
+            // the foreign class shape. The dotted module name comes
+            // straight from the resolver's `ImportInfo`.
             BindingKind::Import => {
                 if c.class_shapes.contains_key(&b.name) {
                     Type::Class(b.name.clone())
@@ -3612,6 +3664,12 @@ fn seed_env_from_scope(c: &mut Checker, scope: ScopeId) {
                         params,
                         ret: Box::new(Type::Unknown),
                         variadic: info.max_positional.is_none(),
+                    }
+                } else if let Some(info) = &b.import_info {
+                    if info.member.is_none() && c.module_registry.contains_key(&info.module) {
+                        Type::Module(info.module.clone())
+                    } else {
+                        Type::Unknown
                     }
                 } else {
                     Type::Unknown
@@ -5836,6 +5894,48 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             if let Some(method_type) = builtin_generic_method(&recv, attr_name) {
                 return method_type;
             }
+            // Bare-import dotted access: when the receiver resolves
+            // to `Type::Module(name)`, look the attribute up in the
+            // project shape registry. A matching class returns
+            // `Type::Class(<attr_name>)` so the constructor call
+            // site flows through the arity check; a free function
+            // returns the corresponding `Type::Function`. The
+            // foreign class's shape is also lazily folded into
+            // `class_shapes` so the constructor call's
+            // `Type::Class(name)` arm can find it.
+            if let Type::Module(mod_name) = &recv {
+                if let Some(shapes) = c.module_registry.get(mod_name).cloned() {
+                    if let Some(shape) = shapes.class_shapes.get(attr_name).cloned() {
+                        c.class_shapes.entry(attr_name.to_owned()).or_insert(shape);
+                        if let Some(tps) = shapes.class_type_params.get(attr_name).cloned() {
+                            c.class_type_params
+                                .entry(attr_name.to_owned())
+                                .or_insert(tps);
+                        }
+                        return Type::Class(attr_name.to_owned());
+                    }
+                    if let Some(info) = shapes.function_arities.get(attr_name).cloned() {
+                        let params = vec![Type::Unknown; info.param_names.len()];
+                        let variadic = info.max_positional.is_none();
+                        // Stash the arity so the call site can pick
+                        // it up via `function_arity_info[attr_name]`.
+                        c.function_arity_info
+                            .entry(attr_name.to_owned())
+                            .or_insert(info);
+                        return Type::Function {
+                            params,
+                            ret: Box::new(Type::Unknown),
+                            variadic,
+                        };
+                    }
+                }
+                // Attribute not found in the registry — degrade to
+                // `Unknown` rather than emitting a diagnostic. The
+                // registry intentionally omits private names; this
+                // mirrors how an unannotated Python module attribute
+                // would land in `unsafe:`-style territory.
+                return Type::Unknown;
+            }
             match &recv {
                 Type::Class(class_name) => {
                     let class_name = class_name.clone();
@@ -6148,6 +6248,11 @@ fn operand_is_unflaggable(t: &Type) -> bool {
         Type::Union(_) => true,
         Type::Generic(_, args) => args.iter().any(operand_is_unflaggable),
         Type::Int | Type::Str | Type::Bool | Type::Float | Type::Bytes | Type::None => false,
+        // Module references can't be operands of arithmetic / comparison.
+        // Producing the diagnostic here would surprise users; downstream
+        // arithmetic on a `Type::Module` value is already nonsense and
+        // the existing type-mismatch check at the call site fires.
+        Type::Module(_) => true,
     }
 }
 
