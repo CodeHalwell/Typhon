@@ -352,64 +352,64 @@ impl LanguageServer for Backend {
             (None, Some(m)) => vec![m.clone()],
             (None, None) => Vec::new(),
         };
-        // Project-source pre-fetch: when a candidate module resolves to
-        // a sibling `.ty` (or `<pkg>/__init__.ty`) in the user's own
-        // project, surface that file's top-level public bindings. Takes
-        // priority over venv introspection — first-party files win when
-        // both exist, mirroring Python's PYTHONPATH semantics.
-        let project_prefetch: HashMap<String, Vec<CompletionItem>> = {
-            let src_dir = uri_to_path(&uri)
-                .and_then(|p| find_workspace_layout(&p))
-                .map(|(_, src)| src);
-            match src_dir {
-                Some(src) if !candidates.is_empty() => candidates
-                    .iter()
-                    .filter_map(|m| project_module_members(&src, m).map(|items| (m.clone(), items)))
-                    .collect(),
-                _ => HashMap::new(),
-            }
-        };
-        let mut prefetched: HashMap<String, Vec<CompletionItem>> = {
-            let cache_handle = self.introspection_cache_for(&uri).await;
-            // Skip the venv lookup for modules we already resolved from
-            // the project — saves a `.venv/bin/python` shell per
-            // first-party module.
-            let venv_candidates: Vec<String> = candidates
-                .iter()
-                .filter(|m| !project_prefetch.contains_key(m.as_str()))
-                .cloned()
-                .collect();
-            match cache_handle {
-                Some((root, cache)) if !venv_candidates.is_empty() => {
-                    tokio::task::spawn_blocking(move || {
-                        let mut map: HashMap<String, Vec<CompletionItem>> = HashMap::new();
-                        // `lock()` on a poisoned std::Mutex returns `Err`;
-                        // recover the data anyway — poisoning came from a
-                        // panic in an earlier completion, which we
-                        // recorded as a `None` cache entry, so the next
-                        // request just re-runs the lookup.
-                        let mut guard = match cache.lock() {
-                            Ok(g) => g,
-                            Err(p) => p.into_inner(),
-                        };
-                        for module in venv_candidates {
-                            if let Some(members) = guard.members(&root, &module) {
-                                map.insert(module, introspected_members_to_completion(&members));
-                            }
+        // Resolve project src_dir + the venv introspection cache up
+        // front (both need async locks), then hand the resulting handles
+        // to a single `spawn_blocking` task that does *all* the
+        // blocking work — file reads + parse + resolve for project
+        // modules, and the `.venv/bin/python` shell for venv ones.
+        // Doing both in one task keeps the LSP runtime responsive and
+        // avoids running synchronous compiler work on the async
+        // executor.
+        let project_src_dir = uri_to_path(&uri)
+            .and_then(|p| find_workspace_layout(&p))
+            .map(|(_, src)| src);
+        let venv_cache = self.introspection_cache_for(&uri).await;
+        let prefetched: HashMap<String, Vec<CompletionItem>> = if candidates.is_empty() {
+            HashMap::new()
+        } else {
+            let candidates_for_task = candidates.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut map: HashMap<String, Vec<CompletionItem>> = HashMap::new();
+                // Pass 1: project files. First-party `.ty`s win over
+                // venv-installed packages with the same import name
+                // (PYTHONPATH semantics) — we resolve them first and
+                // skip the venv pass for anything already populated.
+                if let Some(src_dir) = project_src_dir.as_ref() {
+                    for module in &candidates_for_task {
+                        if let Some(items) = project_module_members(src_dir, module) {
+                            map.insert(module.clone(), items);
                         }
-                        map
-                    })
-                    .await
-                    .unwrap_or_default()
+                    }
                 }
-                _ => HashMap::new(),
-            }
+                // Pass 2: venv introspection for whatever the project
+                // didn't cover.
+                if let Some((root, cache)) = venv_cache {
+                    // `lock()` on a poisoned std::Mutex returns `Err`;
+                    // recover the data anyway — poisoning came from a
+                    // panic in an earlier completion, which we recorded
+                    // as a `None` cache entry, so the next request just
+                    // re-runs the lookup.
+                    let mut guard = match cache.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    for module in &candidates_for_task {
+                        if map.contains_key(module) {
+                            continue;
+                        }
+                        if let Some(members) = guard.members(&root, module) {
+                            map.insert(
+                                module.clone(),
+                                introspected_members_to_completion(&members),
+                            );
+                        }
+                    }
+                }
+                map
+            })
+            .await
+            .unwrap_or_default()
         };
-        // Merge project results on top of venv results. Project wins on
-        // collision (we filtered above, but be defensive).
-        for (k, v) in project_prefetch {
-            prefetched.insert(k, v);
-        }
         let introspect_closure =
             |module: &str| -> Option<Vec<CompletionItem>> { prefetched.get(module).cloned() };
         let introspect_ref: Option<&IntrospectFn<'_>> = if prefetched.is_empty() {
@@ -1193,9 +1193,16 @@ fn extract_top_level_publics(source: &str) -> Vec<(String, BindingKind)> {
 
 /// Compute the [`TextEdit`] that an auto-import completion attaches
 /// via `additionalTextEdits`. Inserts a fresh `from <module> import
-/// <name>\n` line at the start of the line *after* the last existing
-/// `import` / `from … import …` statement, or at line 0 when no
-/// imports exist yet.
+/// <name>\n` at the start of the line *after* the last existing
+/// top-level `import` / `from … import …` statement. When the file
+/// has no top-level imports yet, the insert lands after any leading
+/// shebang and / or module docstring so we don't slip a fresh import
+/// above `#!` or split a docstring open.
+///
+/// Indented imports (e.g. `import foo` inside a function body) are
+/// ignored — anchoring on those would let the auto-import drop a
+/// top-level statement into the middle of a block, producing
+/// syntactically broken code.
 ///
 /// Doesn't try to merge into an existing `from <module> import …` for
 /// the same module — that would need real lexer state to handle
@@ -1204,19 +1211,12 @@ fn extract_top_level_publics(source: &str) -> Vec<(String, BindingKind)> {
 /// already surfaced by `tyc check` as a `duplicate_binding` error, so
 /// the user sees the redundancy immediately.
 fn auto_import_text_edit(raw_source: &str, module: &str, name: &str) -> TextEdit {
-    let mut insert_line: u32 = 0;
-    for (i, line) in raw_source.lines().enumerate() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("import ") || trimmed.starts_with("from ") {
-            insert_line = (i + 1) as u32;
-        } else if !trimmed.is_empty() && insert_line > 0 {
-            // First non-import, non-blank line after some imports —
-            // stop scanning. Later imports buried deep in the file
-            // (rare, usually inside a function) shouldn't anchor the
-            // insert.
-            break;
-        }
-    }
+    let lines: Vec<&str> = raw_source.lines().collect();
+    let after_last_import = scan_last_top_level_import(&lines);
+    let insert_line = match after_last_import {
+        Some(n) => n,
+        None => scan_past_shebang_and_docstring(&lines),
+    };
     TextEdit {
         range: Range {
             start: Position {
@@ -1230,6 +1230,74 @@ fn auto_import_text_edit(raw_source: &str, module: &str, name: &str) -> TextEdit
         },
         new_text: format!("from {module} import {name}\n"),
     }
+}
+
+/// Return the line index *after* the last top-level `import` /
+/// `from … import …` statement, or `None` when the file has no
+/// top-level imports. Lines that begin with whitespace before the
+/// keyword are nested inside another block and don't count.
+fn scan_last_top_level_import(lines: &[&str]) -> Option<u32> {
+    let mut last: Option<u32> = None;
+    for (i, line) in lines.iter().enumerate() {
+        if line.starts_with("import ") || line.starts_with("from ") {
+            last = Some((i + 1) as u32);
+        }
+    }
+    last
+}
+
+/// Skip a leading `#!` shebang and any module docstring, returning
+/// the first line index that's safe to insert a top-level statement
+/// at. Conservative: anything we can't classify cleanly stops the
+/// scan and the insert lands above it.
+fn scan_past_shebang_and_docstring(lines: &[&str]) -> u32 {
+    let mut idx: usize = 0;
+    if lines.first().is_some_and(|l| l.starts_with("#!")) {
+        idx += 1;
+    }
+    // Skip blank lines / comments between shebang and docstring.
+    while let Some(line) = lines.get(idx) {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            idx += 1;
+        } else {
+            break;
+        }
+    }
+    // Module docstring: triple-quoted string literal at top level.
+    // Handles both `"""..."""` and `'''...'''`, single-line and
+    // multi-line, with an optional `r`, `b`, or `u` prefix.
+    if let Some(line) = lines.get(idx) {
+        let trimmed = line.trim_start();
+        let stripped = trimmed
+            .strip_prefix(|c: char| matches!(c, 'r' | 'R' | 'b' | 'B' | 'u' | 'U'))
+            .unwrap_or(trimmed);
+        let opener = if stripped.starts_with("\"\"\"") {
+            Some("\"\"\"")
+        } else if stripped.starts_with("'''") {
+            Some("'''")
+        } else {
+            None
+        };
+        if let Some(q) = opener {
+            // Single-line docstring (closer on the same line, after
+            // the opener) — advance one line and we're done.
+            let body = &stripped[q.len()..];
+            if body.contains(q) {
+                idx += 1;
+            } else {
+                // Multi-line: walk forward until the closer.
+                idx += 1;
+                while let Some(line) = lines.get(idx) {
+                    idx += 1;
+                    if line.contains(q) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    idx as u32
 }
 
 fn binding_kind_to_completion_kind(kind: BindingKind) -> CompletionItemKind {
@@ -2494,6 +2562,50 @@ mod tests {
         let edit = auto_import_text_edit(src, "utils", "helper");
         assert_eq!(edit.range.start.line, 0);
         assert_eq!(edit.range.start.character, 0);
+    }
+
+    #[test]
+    fn auto_import_text_edit_skips_shebang() {
+        let src = "#!/usr/bin/env tyc\ndef main() -> None:\n    pass\n";
+        let edit = auto_import_text_edit(src, "utils", "helper");
+        // Lands on the line *after* the shebang.
+        assert_eq!(edit.range.start.line, 1);
+    }
+
+    #[test]
+    fn auto_import_text_edit_skips_module_docstring() {
+        let src = "\"\"\"Module that does things.\"\"\"\n\ndef main() -> None:\n    pass\n";
+        let edit = auto_import_text_edit(src, "utils", "helper");
+        // Inserted on the line right after the (single-line) docstring.
+        assert_eq!(edit.range.start.line, 1);
+    }
+
+    #[test]
+    fn auto_import_text_edit_skips_multiline_docstring() {
+        let src =
+            "\"\"\"\nLong docstring\nspanning lines.\n\"\"\"\ndef main() -> None:\n    pass\n";
+        let edit = auto_import_text_edit(src, "utils", "helper");
+        // The docstring ends on line 3 (0-indexed); insert lands at line 4.
+        assert_eq!(edit.range.start.line, 4);
+    }
+
+    #[test]
+    fn auto_import_text_edit_skips_shebang_then_docstring() {
+        let src = "#!/usr/bin/env tyc\n\"\"\"doc\"\"\"\ndef main() -> None:\n    pass\n";
+        let edit = auto_import_text_edit(src, "utils", "helper");
+        // Past shebang (line 0) and docstring (line 1) → line 2.
+        assert_eq!(edit.range.start.line, 2);
+    }
+
+    #[test]
+    fn auto_import_text_edit_ignores_nested_imports() {
+        // No top-level imports — the indented `import sys` inside the
+        // function body must NOT anchor the auto-import (that would
+        // drop a top-level statement into the function).
+        let src = "def main() -> None:\n    import sys\n    pass\n";
+        let edit = auto_import_text_edit(src, "utils", "helper");
+        // Falls through to the no-imports path → line 0.
+        assert_eq!(edit.range.start.line, 0);
     }
 
     #[test]
