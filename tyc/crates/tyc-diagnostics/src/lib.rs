@@ -656,6 +656,24 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// An import references a module that isn't in the Python stdlib,
+    /// not the project tree, not the bundled `typhon_runtime`, and not
+    /// listed in `typhon.toml`'s dependencies. The build would later
+    /// fail at import time with `ModuleNotFoundError`; surface the
+    /// typo / missing dep at check time instead. FINDINGS #79.
+    #[error("module `{module}` is not in the stdlib, the project, or `typhon.toml` dependencies")]
+    #[diagnostic(
+        code(tyc::unknown_module),
+        help("Either fix the import name, add `{module}` to `[tool.uv.dependencies]` in `typhon.toml` (then run `tyc sync`), or create a sibling `.ty` file with the right name.")
+    )]
+    UnknownModule {
+        module: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("not resolvable at check time")]
+        span: SourceSpan,
+    },
+
     /// A `class NAME:` statement re-uses a name that has already been
     /// declared at the same scope. Python silently lets the second
     /// definition shadow the first; Typhon flags it so the user can
@@ -1330,6 +1348,21 @@ impl TycError {
         length: usize,
     ) -> Self {
         Self::MainNotCalled {
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::UnknownModule`] diagnostic.
+    pub fn unknown_module(
+        module: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::UnknownModule {
+            module: module.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

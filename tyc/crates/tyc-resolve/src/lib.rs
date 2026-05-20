@@ -208,6 +208,183 @@ pub struct ResolvedModule {
     pub references: Vec<Reference>,
 }
 
+/// Curated list of Python stdlib top-level module names (root names only;
+/// `os.path` is covered by the `os` entry). Used by
+/// [`check_unknown_modules`] to vet `from X import Y` / `import X` at
+/// check time so a typoed or missing-dep module surfaces before `tyc
+/// build` runs the program. This list is intentionally a static snapshot
+/// of the CPython 3.13 stdlib root-names — the LSP autocomplete table
+/// covers the depth needed for member resolution, but we only need root
+/// matches here.
+pub fn python_stdlib_modules() -> &'static [&'static str] {
+    &[
+        "__future__", "_thread", "abc", "aifc", "argparse", "array", "ast",
+        "asynchat", "asyncio", "asyncore", "atexit", "audioop", "base64",
+        "bdb", "binascii", "bisect", "builtins", "bz2", "calendar", "cgi",
+        "cgitb", "chunk", "cmath", "cmd", "code", "codecs", "codeop",
+        "collections", "colorsys", "compileall", "concurrent", "configparser",
+        "contextlib", "contextvars", "copy", "copyreg", "crypt", "csv",
+        "ctypes", "curses", "dataclasses", "datetime", "dbm", "decimal",
+        "difflib", "dis", "distutils", "doctest", "email", "encodings",
+        "ensurepip", "enum", "errno", "faulthandler", "fcntl", "filecmp",
+        "fileinput", "fnmatch", "fractions", "ftplib", "functools", "gc",
+        "genericpath", "getopt", "getpass", "gettext", "glob", "graphlib",
+        "grp", "gzip", "hashlib", "heapq", "hmac", "html", "http",
+        "idlelib", "imaplib", "imghdr", "imp", "importlib", "inspect", "io",
+        "ipaddress", "itertools", "json", "keyword", "lib2to3", "linecache",
+        "locale", "logging", "lzma", "mailbox", "mailcap", "marshal",
+        "math", "mimetypes", "mmap", "modulefinder", "msilib", "msvcrt",
+        "multiprocessing", "netrc", "nis", "nntplib", "ntpath", "numbers",
+        "opcode", "operator", "optparse", "os", "ossaudiodev", "parser",
+        "pathlib", "pdb", "pickle", "pickletools", "pipes", "pkgutil",
+        "platform", "plistlib", "poplib", "posix", "posixpath", "pprint",
+        "profile", "pstats", "pty", "pwd", "py_compile", "pyclbr", "pydoc",
+        "queue", "quopri", "random", "re", "readline", "reprlib", "resource",
+        "rlcompleter", "runpy", "sched", "secrets", "select", "selectors",
+        "shelve", "shlex", "shutil", "signal", "site", "smtpd", "smtplib",
+        "sndhdr", "socket", "socketserver", "spwd", "sqlite3", "sre_compile",
+        "sre_constants", "sre_parse", "ssl", "stat", "statistics", "string",
+        "stringprep", "struct", "subprocess", "sunau", "symtable", "sys",
+        "sysconfig", "syslog", "tabnanny", "tarfile", "telnetlib", "tempfile",
+        "termios", "test", "textwrap", "threading", "time", "timeit",
+        "tkinter", "token", "tokenize", "tomllib", "trace", "traceback",
+        "tracemalloc", "tty", "turtle", "turtledemo", "types", "typing",
+        "unicodedata", "unittest", "urllib", "uu", "uuid", "venv",
+        "warnings", "wave", "weakref", "webbrowser", "winreg", "winsound",
+        "wsgiref", "xdrlib", "xml", "xmlrpc", "zipapp", "zipfile", "zipimport",
+        "zlib", "zoneinfo",
+    ]
+}
+
+/// Vet a module's imports against a set of resolvable module names and
+/// emit `tyc::unknown_module` warnings for any unresolvable root.
+///
+/// `project_modules` should contain the dotted-name form of every `.ty`
+/// file in the project (`src/main.ty` → `"main"`, `src/pkg/sub.ty` →
+/// `"pkg.sub"`). The function compares the *root* of each imported
+/// module against:
+///
+/// - the Python stdlib whitelist returned by [`python_stdlib_modules`],
+/// - the Typhon-bundled `typhon_runtime` package,
+/// - any project module whose dotted-name has the import's root as a
+///   prefix segment (so an `import pkg` resolves both `pkg/__init__.ty`
+///   and `pkg.sub` projects),
+/// - the optional `extra_modules` list, which `tyc check` populates from
+///   `typhon.toml` dependencies plus a permissive fallback for
+///   third-party packages (anything explicitly listed is assumed to
+///   resolve at runtime).
+///
+/// Unknown roots produce a warning (not an error) so existing programs
+/// that depend on quietly-installed sibling packages keep building;
+/// callers can promote the warning via strictness if desired. FINDINGS #79.
+pub fn check_unknown_modules(
+    path: &str,
+    source: &str,
+    module: &ruff_python_ast::ModModule,
+    project_modules: &[String],
+    extra_modules: &[String],
+) -> Diagnostics {
+    use ruff_python_ast::Stmt;
+
+    let mut diags = Diagnostics::new();
+    let stdlib: std::collections::HashSet<&str> =
+        python_stdlib_modules().iter().copied().collect();
+    let project_roots: std::collections::HashSet<&str> = project_modules
+        .iter()
+        .map(|m| m.split('.').next().unwrap_or(m.as_str()))
+        .collect();
+    let extra_roots: std::collections::HashSet<&str> = extra_modules
+        .iter()
+        .map(|m| m.split('.').next().unwrap_or(m.as_str()))
+        .collect();
+    let is_resolvable = |module_name: &str| -> bool {
+        let root = module_name.split('.').next().unwrap_or(module_name);
+        if root.is_empty() || root.starts_with('_') {
+            // Bare `from . import sibling`, dunder names, or relative imports —
+            // not vettable here, trust the build.
+            return true;
+        }
+        root == "typhon_runtime"
+            || stdlib.contains(root)
+            || project_roots.contains(root)
+            || extra_roots.contains(root)
+    };
+
+    fn walk(
+        stmts: &[Stmt],
+        path: &str,
+        source: &str,
+        is_resolvable: &dyn Fn(&str) -> bool,
+        diags: &mut Diagnostics,
+    ) {
+        for stmt in stmts {
+            match stmt {
+                Stmt::Import(imp) => {
+                    for alias in &imp.names {
+                        let module_name = alias.name.as_str();
+                        if !is_resolvable(module_name) {
+                            let span = (
+                                alias.range.start().to_usize(),
+                                alias.range.end().to_usize(),
+                            );
+                            let length = span.1.saturating_sub(span.0).max(1);
+                            diags.push_warning(TycError::unknown_module(
+                                module_name,
+                                path,
+                                source,
+                                span.0,
+                                length,
+                            ));
+                        }
+                    }
+                }
+                Stmt::ImportFrom(imp) => {
+                    if imp.level > 0 {
+                        // Relative imports (`from .sibling import X`) —
+                        // skip; we don't model relative path resolution
+                        // at this layer.
+                        continue;
+                    }
+                    if let Some(module_name) = imp.module.as_ref() {
+                        let name = module_name.as_str();
+                        if !is_resolvable(name) {
+                            let span = (
+                                module_name.range.start().to_usize(),
+                                module_name.range.end().to_usize(),
+                            );
+                            let length = span.1.saturating_sub(span.0).max(1);
+                            diags.push_warning(TycError::unknown_module(
+                                name,
+                                path,
+                                source,
+                                span.0,
+                                length,
+                            ));
+                        }
+                    }
+                }
+                Stmt::FunctionDef(f) => walk(&f.body, path, source, is_resolvable, diags),
+                Stmt::ClassDef(c) => walk(&c.body, path, source, is_resolvable, diags),
+                Stmt::If(s) => {
+                    walk(&s.body, path, source, is_resolvable, diags);
+                    for c in &s.elif_else_clauses {
+                        walk(&c.body, path, source, is_resolvable, diags);
+                    }
+                }
+                Stmt::Try(s) => {
+                    walk(&s.body, path, source, is_resolvable, diags);
+                    walk(&s.orelse, path, source, is_resolvable, diags);
+                    walk(&s.finalbody, path, source, is_resolvable, diags);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    walk(&module.body, path, source, &is_resolvable, &mut diags);
+    diags
+}
+
 impl ResolvedModule {
     pub fn module_scope(&self) -> &Scope {
         &self.scopes[0]
@@ -2423,6 +2600,108 @@ def foo():
             "module with __all__ must suppress the diagnostic: {:?}",
             d.warnings()
         );
+    }
+
+    fn parse_module(src: &str) -> ruff_python_ast::ModModule {
+        tyc_syntax::parse_module(src).unwrap().into_syntax()
+    }
+
+    #[test]
+    fn unknown_module_warns_when_root_not_resolvable() {
+        // FINDINGS #79: `from other import helper` where `other` is
+        // neither in stdlib, the project, nor a declared dep.
+        let module = parse_module("from other import helper\n");
+        let diags = check_unknown_modules(
+            "t.ty",
+            "from other import helper\n",
+            &module,
+            &[],
+            &[],
+        );
+        assert!(
+            diags.warnings()
+                .iter()
+                .any(|e| matches!(e, TycError::UnknownModule { module, .. } if module == "other")),
+            "expected UnknownModule warning; got {:?}",
+            diags.warnings()
+        );
+    }
+
+    #[test]
+    fn stdlib_module_is_clean() {
+        let module = parse_module("import os\nfrom collections import defaultdict\n");
+        let diags = check_unknown_modules(
+            "t.ty",
+            "import os\nfrom collections import defaultdict\n",
+            &module,
+            &[],
+            &[],
+        );
+        assert!(
+            diags.warnings().is_empty(),
+            "stdlib modules must not warn; got {:?}",
+            diags.warnings()
+        );
+    }
+
+    #[test]
+    fn project_module_is_clean() {
+        // A `from pkg.sub import foo` is OK when "pkg" appears in the
+        // project module list (the root is what we vet).
+        let module = parse_module("from pkg.sub import foo\n");
+        let diags = check_unknown_modules(
+            "t.ty",
+            "from pkg.sub import foo\n",
+            &module,
+            &["pkg.sub".to_string()],
+            &[],
+        );
+        assert!(
+            diags.warnings().is_empty(),
+            "project module must not warn; got {:?}",
+            diags.warnings()
+        );
+    }
+
+    #[test]
+    fn typhon_runtime_is_clean() {
+        let module = parse_module("from typhon_runtime.lazy import lazy_let\n");
+        let diags = check_unknown_modules(
+            "t.ty",
+            "from typhon_runtime.lazy import lazy_let\n",
+            &module,
+            &[],
+            &[],
+        );
+        assert!(diags.warnings().is_empty(), "{:?}", diags.warnings());
+    }
+
+    #[test]
+    fn declared_dependency_is_clean() {
+        let module = parse_module("from pandas import DataFrame\n");
+        let diags = check_unknown_modules(
+            "t.ty",
+            "from pandas import DataFrame\n",
+            &module,
+            &[],
+            &["pandas".to_string()],
+        );
+        assert!(diags.warnings().is_empty(), "{:?}", diags.warnings());
+    }
+
+    #[test]
+    fn relative_import_does_not_warn() {
+        // Relative imports (`from .sibling import X`) aren't vettable
+        // here — we don't model relative resolution. Just trust them.
+        let module = parse_module("from . import sibling\n");
+        let diags = check_unknown_modules(
+            "t.ty",
+            "from . import sibling\n",
+            &module,
+            &[],
+            &[],
+        );
+        assert!(diags.warnings().is_empty(), "{:?}", diags.warnings());
     }
 
     #[test]

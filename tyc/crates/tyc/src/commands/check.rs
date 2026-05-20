@@ -14,9 +14,10 @@ use tyc_analyse::{analyse_purity, evaluate_comptime_with_functions, purity_diagn
 use tyc_db::{check_file, TycDatabase};
 use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_emit::{compare_modules, StubTestKind};
+use tyc_resolve::check_unknown_modules;
 use tyc_syntax::preprocess::{
-    expand_gather_blocks, expand_go_calls, expand_lazy_imports, expand_pipes, expand_question_ops,
-    expand_with_chains, preprocess,
+    expand_gather_blocks, expand_go_calls, expand_lazy_imports, expand_multiline_guards,
+    expand_pipes, expand_question_ops, expand_with_chains, preprocess,
 };
 
 use crate::commands::util::{apply_strictness, collect_dty_files, collect_ty_files};
@@ -67,6 +68,20 @@ pub fn run(args: CheckArgs) -> Result<()> {
     let mut file_count = 0usize;
     let mut db = TycDatabase::new();
 
+    // FINDINGS #79: build the set of dotted module names contained in the
+    // project so the per-file unknown-module check can resolve sibling
+    // imports without falsely flagging them. `extra_modules` adds
+    // typhon.toml-declared dependencies; users who manage deps directly
+    // through `uv`/`pip` can still bypass the check by listing the
+    // package in `typhon.toml`.
+    let project_modules = collect_project_modules(&args.paths, &config_start);
+    let extra_modules: Vec<String> = config
+        .dependencies
+        .keys()
+        .chain(config.dev_dependencies.keys())
+        .cloned()
+        .collect();
+
     for root in &args.paths {
         for path in collect_ty_files(root)? {
             file_count += 1;
@@ -90,6 +105,15 @@ pub fn run(args: CheckArgs) -> Result<()> {
             // preprocess so it's cheap on warm runs.
             let analysis_diags = run_analysis_passes(&path.display().to_string(), &source);
             diags.extend(analysis_diags);
+
+            // FINDINGS #79: vet imports against stdlib + project + deps.
+            let module_diags = run_unknown_module_check(
+                &path.display().to_string(),
+                &source,
+                &project_modules,
+                &extra_modules,
+            );
+            diags.extend(module_diags);
         }
 
         // `--stubs`: parse + type-check every `.dty` stub, then compare its
@@ -232,6 +256,85 @@ fn run_analysis_passes(path: &str, source: &str) -> Diagnostics {
     diags.extend(purity_diags);
 
     diags
+}
+
+/// Collect the dotted-name form of every `.ty` file under the given
+/// `paths`, relative to `config_start` (which is typically the project
+/// root). Used by [`run_unknown_module_check`] to vet sibling imports.
+///
+/// Names are derived by stripping the path prefix up to the first `src/`
+/// component (matching Typhon's standard layout) and joining the remaining
+/// segments with `.`. `src/main.ty` becomes `"main"`; `src/pkg/sub.ty`
+/// becomes `"pkg.sub"`; an `__init__.ty` collapses to its parent package
+/// name. Files outside any `src/` directory fall back to their basename
+/// so single-file scripts still resolve correctly.
+fn collect_project_modules(
+    paths: &[PathBuf],
+    _config_start: &std::path::Path,
+) -> Vec<String> {
+    let mut modules: Vec<String> = Vec::new();
+    for root in paths {
+        if let Ok(files) = collect_ty_files(root) {
+            for file in files {
+                let dotted = ty_path_to_dotted(&file);
+                if !modules.contains(&dotted) {
+                    modules.push(dotted);
+                }
+            }
+        }
+    }
+    modules
+}
+
+fn ty_path_to_dotted(path: &std::path::Path) -> String {
+    let components: Vec<String> = path
+        .with_extension("")
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(os) => Some(os.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect();
+    // Trim leading "src" so `src/main.ty` becomes `main`. Anything before
+    // `src` (an absolute path's leading directories) is dropped so the
+    // dotted-name reflects the package layout, not the filesystem layout.
+    let src_idx = components.iter().rposition(|c| c == "src");
+    let tail: Vec<&str> = match src_idx {
+        Some(i) => components[i + 1..].iter().map(|s| s.as_str()).collect(),
+        None => components
+            .last()
+            .map(|s| vec![s.as_str()])
+            .unwrap_or_default(),
+    };
+    // Drop trailing `__init__` so a package directory is named by its
+    // folder, not the init module.
+    let mut tail = tail;
+    if tail.last().is_some_and(|s| *s == "__init__") {
+        tail.pop();
+    }
+    tail.join(".")
+}
+
+/// FINDINGS #79: run `check_unknown_modules` for one source file. Parses
+/// the file through the same preprocess pipeline used elsewhere so
+/// Typhon-specific keywords (`val`, `var`, `lazy import`, …) are stripped
+/// before the AST walk. Returns the warnings only — errors at the
+/// preprocess / parse layer have already been surfaced by `check_file`.
+fn run_unknown_module_check(
+    path: &str,
+    source: &str,
+    project_modules: &[String],
+    extra_modules: &[String],
+) -> Diagnostics {
+    let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
+        &expand_gather_blocks(&expand_multiline_guards(&expand_lazy_imports(source))),
+    ))));
+    let prep = preprocess(&expanded);
+    let module = match tyc_syntax::parse_module(&prep.python_source) {
+        Ok(p) => p.into_syntax(),
+        Err(_) => return Diagnostics::new(),
+    };
+    check_unknown_modules(path, source, &module, project_modules, extra_modules)
 }
 
 /// Run the full preprocess + parse pipeline on `source` and return the

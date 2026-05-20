@@ -4234,11 +4234,37 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     if let Some(tparams) = c.class_type_params.get(&name).cloned() {
                         let mut bindings: HashMap<String, Type> = HashMap::new();
                         // Bidirectional: pin from the surrounding annotation.
-                        if let Some(Type::Generic(exp_name, exp_args)) = expected {
-                            if exp_name == &name && exp_args.len() == tparams.len() {
-                                for (tp, arg) in tparams.iter().zip(exp_args.iter()) {
-                                    bindings.insert(tp.clone(), arg.clone());
+                        // FINDINGS #68: when the expected type is a sealed
+                        // union (or a type alias to one), look for a variant
+                        // whose head matches the class being constructed and
+                        // pin the type parameters from that variant. This
+                        // makes `unwrap(Just(value=5))` for
+                        // `unwrap(m: Maybe[int])` bind T=int from the
+                        // `Just[int]` variant inside `Maybe[int]`.
+                        let expected_unwrapped: Option<Type> =
+                            expected.map(|t| c.unwrap_alias(t));
+                        let pinned_args: Option<Vec<Type>> = match expected_unwrapped.as_ref() {
+                            Some(Type::Generic(exp_name, exp_args))
+                                if exp_name == &name && exp_args.len() == tparams.len() =>
+                            {
+                                Some(exp_args.clone())
+                            }
+                            Some(Type::Union(variants)) => variants.iter().find_map(|v| {
+                                let v = c.unwrap_alias(v);
+                                match v {
+                                    Type::Generic(exp_name, exp_args)
+                                        if exp_name == name && exp_args.len() == tparams.len() =>
+                                    {
+                                        Some(exp_args)
+                                    }
+                                    _ => None,
                                 }
+                            }),
+                            _ => None,
+                        };
+                        if let Some(args) = pinned_args {
+                            for (tp, arg) in tparams.iter().zip(args.iter()) {
+                                bindings.insert(tp.clone(), arg.clone());
                             }
                         }
                         // Forward: read each kwarg, match it to the
@@ -5017,6 +5043,31 @@ let r: int = add(1)
                 .iter()
                 .any(|e| matches!(e, TycError::ImplicitAny { .. })),
             "list[int] must not fire implicit_any: {:?}",
+            d.errors()
+        );
+    }
+
+    // ── FINDINGS #68: generic ctor inference from sealed-union target ──
+
+    #[test]
+    fn generic_ctor_pins_tvar_from_sealed_union_target() {
+        let src = "\
+class Just[T]:
+    value: T
+class Nothing:
+    pass
+
+type Maybe[T] = Just[T] | Nothing
+
+def unwrap(m: Maybe[int]) -> int:
+    return 0
+
+let r: int = unwrap(Just(value=5))
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "Just(value=5) under Maybe[int] should pin T=int: {:?}",
             d.errors()
         );
     }

@@ -3041,6 +3041,20 @@ Repro: `stress/fmt2.ty` (the file is preserved in the repo for this report).
 
 ## 66. `?` operator cannot appear inside a sub-expression (gap)
 
+**Status:** **FIXED** (documentation path) — verified on
+`claude/review-findings-fixes-VRFJy`. Took option 2 from the
+original finding: `validate_question_ops` in
+`tyc/crates/tyc-syntax/src/preprocess.rs` already calls
+`find_mid_expression_questionmarks` on the *original* Typhon
+source (not the desugared Python) and emits
+`tyc::invalid_question_op` with help text that explains the
+limitation crisply ("only works as the whole right-hand side of
+an assignment or as a standalone statement; lift the inner call
+to a `let` binding first"). Both repro shapes (`Ok(step(x)?)` and
+`step(x)? + step(x)?`) now point at the offending `?` in the
+user's source. The lift-to-sub-expression rewrite (option 1)
+remains future work.
+
 **Severity:** gap — the docs imply `?` is a sub-expression operator
 (matching Rust's `?`), but it only works as the RHS of a `let`/`mut` or as
 a standalone statement.
@@ -3111,6 +3125,18 @@ Repro: `stress/tests/49_typed_dict.ty`.
 ---
 
 ## 68. Generic class constructor inference doesn't propagate from sealed-union target (bug)
+
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. The
+`Type::Class(name)` arm of the call-site inferer (#46 generic
+class instantiation path) now unwraps the call's expected type
+through type aliases and walks `Type::Union` variants looking for
+one whose head matches the class being constructed. When found,
+its type arguments pin the class's PEP 695 type parameters before
+the forward field-walk falls back to `Unknown`. So
+`unwrap(Just(value=5))` for `unwrap(m: Maybe[int])` (with
+`type Maybe[T] = Just[T] | Nothing`) now correctly binds `T=int`
+from the `Just[int]` variant. Regression test
+`generic_ctor_pins_tvar_from_sealed_union_target`.
 
 **Severity:** bug — `Just(value=5)` for a `Maybe[int]` target doesn't bind
 `T=int`.
@@ -3466,6 +3492,23 @@ Repro: `stress/tests/94_impl_unknown.ty`.
 ---
 
 ## 79. Missing module in `from X import Y` accepted at check time (gap)
+
+**Status:** **FIXED** on `claude/review-findings-fixes-VRFJy`. Added
+`tyc::unknown_module` to `tyc-diagnostics`; `tyc-resolve` exposes a
+new `python_stdlib_modules()` whitelist (curated CPython 3.13
+stdlib root names) plus a `check_unknown_modules` free function
+that vets every `Stmt::Import` / `Stmt::ImportFrom` against the
+union of (stdlib ∪ `typhon_runtime` ∪ project modules ∪
+typhon.toml dependencies). The `tyc check` command computes the
+project-module list from the source tree (stripping `src/` and
+joining segments with `.`) and the dependency list from
+`config.dependencies` + `config.dev_dependencies`, then calls the
+helper per file. Relative imports (`from .sibling import X`) and
+dunder names are intentionally exempt. Unknown roots produce a
+warning (not an error) so users can still bypass via `typhon.toml`.
+Six regression tests in `tyc-resolve` cover the canonical
+unknown, stdlib, project, `typhon_runtime`, declared-dep, and
+relative-import shapes.
 
 **Severity:** gap — `tyc check` should resolve imports so a typo or
 missing dependency surfaces before `tyc build`.
