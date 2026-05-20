@@ -1,0 +1,48 @@
+---
+title: tyc explain
+description: Print the catalog entry for a tyc:: diagnostic code. Mirrors rustc --explain.
+sidebar:
+  order: 16
+---
+
+```
+tyc explain <code>
+```
+
+Prints the catalog page for a diagnostic code. Mirrors `rustc --explain`: when a diagnostic fires in your terminal and the inline help isn't enough, `tyc explain <code>` is the answer.
+
+## Examples
+
+```bash
+tyc explain immutable_assign           # short code
+tyc explain tyc::immutable_assign      # fully-qualified — both work
+tyc explain frozen_assign              # any catalog page
+tyc explain orphan_py_import           # Phase 5 diagnostic
+```
+
+## How it works
+
+Every Markdown file under `docs/diagnostics/` is embedded into the `tyc` binary at build time. `tyc explain <code>` looks up the page by short code (the part after `tyc::`) and writes it to stdout. The catalog pages also live on the docs site under `/lang/diagnostics/<code>/` and are linked from each diagnostic via miette's `url(...)` attribute, so the same content is one click away in any terminal that linkifies URLs.
+
+When a code is misspelled or doesn't yet have a catalog page, `tyc explain` exits non-zero with a pointer to <https://typhon.dev/lang/diagnostics> for the full catalog.
+
+## The catalog
+
+The catalog covers every `tyc::` diagnostic shipping today: ~50+ pages spanning binding rules (`immutable_assign`, `missing_binding_kind`), type errors (`type_mismatch`, `nullable_use`, `operator_type_mismatch`), class rules (`manual_init`, `frozen_assign`, `class_attr_shadows_slot`, `method_in_class_body`), match exhaustiveness (`non_exhaustive_match`), async (`missing_await`, `async_without_await`), Result (`result_error_mismatch`, `invalid_question_op`), interop (`orphan_py_import`, `python_semantic_drift`, `contains_secret_literal`, `invalid_config_value`), stubs (`stub_mismatch`), and the everyday parse/resolve diagnostics.
+
+Each page follows the same shape: **what it means**, **a minimal failing example**, **why Typhon flags it**, and **how to fix it**.
+
+## When to reach for it
+
+- A diagnostic shows up in your terminal and you want the *context* — what the rule is for, what the canonical fix looks like, what edge cases trip it.
+- You're learning Typhon and the message has a code you don't recognise: `tyc explain` is the fastest way to learn what a specific rule does.
+- You're writing a tutorial / linter / docs and want the source-of-truth catalog text.
+
+## Flags
+
+`tyc explain` takes a single positional argument: the code. No other flags today.
+
+## Where next
+
+- [Reading Diagnostics](/Typhon/diagnostics/reading/) — how miette diagnostics are laid out.
+- [`tyc cheatsheet`](/Typhon/cli/cheatsheet/) — the 30-second syntax refresher.

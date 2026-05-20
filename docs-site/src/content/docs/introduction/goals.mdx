@@ -72,7 +72,7 @@ If most of your program is dynamic, Typhon will fight you. That is intentional. 
 
 ### Not a debugger replacement
 
-`tyc debug` is a thin v1 wrapper around `python -m pdb build/main.py`. Frames surface as `build/*.py` paths; pair with [`tyc trace`](/Typhon/cli/trace/) to remap a captured traceback back to `.ty` source via the `.py.map` sidecar. A Typhon-native source-mapping debugger is a Phase-5 deliverable. For now, the Python tooling you already have works.
+`tyc debug` wraps `python -m pdb build/main.py` and adds `--break <ty-file>:<line>` flags that translate Typhon source locations via the `.py.map` sidecar so breakpoints set in `.ty` coordinates fire on the corresponding emitted Python lines. Frames in the debugger session still surface as `build/*.py` paths; pair with [`tyc trace`](/Typhon/cli/trace/) to remap a captured traceback back to `.ty` source. A full Typhon-native source-mapping debugger UI — one that displays `.ty` source in stack frames and steps `.ty` statements directly — is still on the roadmap. For now, the Python tooling you already have works.
 
 ### Not a documentation generator (yet)
 

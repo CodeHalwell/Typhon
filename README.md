@@ -68,9 +68,11 @@ Focused references:
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | Compiler pipeline, crate layout, toolchain choices |
 | [docs/language.md](docs/language.md) | Type system, error handling, async, `let`/`mut`, comptime |
+| [docs/cheatsheet.md](docs/cheatsheet.md) | 30-second syntax refresher (also `tyc cheatsheet`) |
 | [docs/vm.md](docs/vm.md) | The in-process tree-walking VM (default execution mode for `tyc run`) |
 | [docs/cli.md](docs/cli.md) | The `tyc` binary and its subcommands |
 | [docs/configuration.md](docs/configuration.md) | `typhon.toml` reference |
+| [docs/diagnostics/](docs/diagnostics/) | One page per `tyc::` code — also surfaced via `tyc explain <code>` |
 | [docs/roadmap.md](docs/roadmap.md) | Phased delivery plan |
 | [docs/risks.md](docs/risks.md) | Risks and mitigations |
 | [docs/prior-art.md](docs/prior-art.md) | TypeScript, rust-analyzer, ty, Pyrefly, oxc, Ruff |
@@ -95,18 +97,21 @@ cargo build --release
 
 | Command | Purpose |
 |---------|---------|
-| `tyc build` | Full pipeline: parse, check, analyse, desugar, emit, format |
+| `tyc build` | Full pipeline: parse, check, analyse, desugar, emit, format. `--check` dry-runs the pipeline and lists every would-be-written file without touching disk |
 | `tyc check` | Parse and type-check only — no emission. For CI use |
-| `tyc fmt` | Format `.ty` source files in place |
+| `tyc fmt` | Format `.ty` source files in place. Runs the in-process whitespace normaliser and then pipes through `ruff format` when on `PATH` |
 | `tyc lsp` | Run as a Language Server on stdio |
-| `tyc init` | Scaffold a new project: `typhon.toml`, `src/`, `tests/` |
+| `tyc init` | Scaffold a new project: `typhon.toml`, `src/`, `tests/`. The generated `src/main.ty` ships a frozen class + `impl` block + `Result`/`?`/`match` example |
 | `tyc trace` | Map a Python traceback back to Typhon source via `.py.map` v2 source maps (per-statement `(out_line → ty_line)` table emitted by the printer) |
 | `tyc profile` | Build then instrument every top-level function with call-count + wall-clock sampling; writes `typhon-profile.json` on interpreter exit |
 | `tyc migrate` | Convert typed Python (`.py`) into Typhon (`.ty`): `Optional[T]`/`T \| None` → `T?`, module-level annotated assigns gain `let`/`mut`, `@dataclass` decorators and `from dataclasses import dataclass` are dropped |
 | `tyc ty`      | Build the project and run Astral's `ty` checker against the emitted Python. Requires `ty` to be installed separately (`pip install ty`). |
 | `tyc stubtest` | Build the project and run `python -m mypy.stubtest` against every emitted `.pyi`. Complements `tyc check --stubs` (AST diff) by catching dynamically-created members via runtime introspection. Requires `mypy` (`pip install mypy`). |
 | `tyc repl`    | Interactive Typhon evaluator. Compiles each block through the full pipeline and executes against a Python interpreter |
-| `tyc debug`   | Build the project and launch the emitted Python under a debugger (default `pdb`). Thin v1 — a Typhon-native source-mapping debugger is a Phase-5 item |
+| `tyc run`     | Execute a Typhon program. Defaults to the in-process `tyc-vm` tree-walking interpreter ([docs/vm.md](docs/vm.md)) — no `.py` is written, no CPython is spawned. `--compile` (alias `--no-vm`) falls back to the legacy build-then-exec path |
+| `tyc debug`   | Build the project and launch the emitted Python under a debugger (default `pdb`). Repeatable `--break <ty-file>:<line>` translates Typhon source locations through `.py.map` and forwards them to the debugger |
+| `tyc explain` | Print the diagnostic catalog entry for a `tyc::` code (mirrors `rustc --explain`). Catalog pages live under `docs/diagnostics/` and are linked from the `url(...)` clause on every diagnostic |
+| `tyc cheatsheet` | Print the 30-second Typhon cheat sheet ([docs/cheatsheet.md](docs/cheatsheet.md)) to stdout |
 | `tyc add` / `tyc remove` / `tyc sync` | Lightweight package-manager surface over `uv`: rewrite `[dependencies]` / `[dev-dependencies]` in `typhon.toml` and run `uv sync` to install |
 
 See [docs/cli.md](docs/cli.md) for the full reference.
@@ -162,16 +167,31 @@ See [docs/cli.md](docs/cli.md) for the full reference.
 - ✅ `extend ClassName:` (alias for `impl` on user-defined classes); `extend BUILTIN:` for `str`/`list`/`dict`/… extracts each method to a module-level free function and rewrites call sites whose receiver carries a matching static annotation. No monkey-patching of built-ins.
 - ✅ `.dty` stub files compile to PEP 561 `.pyi`. `tyc check --stubs` parses every `.dty` and diffs its surface API (functions, classes, methods, annotated fields, parameter shapes) against the sibling `.ty`/`.py` implementation, emitting `tyc::stub_mismatch` diagnostics for missing-in-impl / missing-in-stub / signature-mismatch findings. A runtime introspection probe (mypy's `stubtest` proper) is still a follow-up.
 
-**Phase 4+ — Beyond v1** in progress:
+**Phase 5 — Interop and developer experience** complete ([v0.1.6](https://github.com/CodeHalwell/Typhon/releases/tag/v0.1.6)):
+
+- ✅ `plain class X:` keyword for "regular Python class, no `@dataclass`, no synthesised `__init__`" — the symmetric escape hatch alongside `frozen class` and `class!`.
+- ✅ Auto-skip `@dataclass` injection for `Enum` / `IntEnum` / `StrEnum` / `Flag` / `IntFlag` / `ABC` / `ABCMeta` subclasses; project-specific bases via `[emit] skip-decoration-bases`.
+- ✅ `[emit] class-default` rejects unknown values at config load (`tyc::invalid_config_value`) instead of silently falling back to `"dataclass"`.
+- ✅ Python-semantic alignment: `or`/`and` typed as `Union[truthy(lhs), rhs]` (and the falsy dual), generator functions structurally assignable to `Iterable[T]` / `Iterator[T]` / `AsyncIterable[T]` / `AsyncIterator[T]`.
+- ✅ `tyc explain <code>` prints diagnostic catalog entries (mirrors `rustc --explain`); `tyc cheatsheet` prints the 30-second syntax refresher.
+- ✅ `tyc init` scaffold ships a frozen-dataclass + `impl` block + `Result`/`?`/`match` example, plus a fully-commented `typhon.toml`.
+- ✅ `.py` files in `src/` are copied verbatim into the build output; a relative `.py` import that resolves outside `src/` fires `tyc::orphan_py_import`.
+- ✅ Diagnostic deep-links: every `tyc::` diagnostic carries a miette `url(https://typhon.dev/lang/diagnostics/<code>)` clause and the 50+ catalog pages under [docs/diagnostics/](docs/diagnostics/) are embedded into the binary for `tyc explain`.
+- ✅ `tyc build --check` dry-run mode lists every file that would be written without touching disk; `tyc::contains_secret_literal` flags inlined env values whose binding name matches a credential suffix.
+- ✅ `tyc fmt` wraps `ruff format` after the in-process whitespace pass (when `ruff` is on `PATH` and the buffer contains no Typhon-only tokens).
+- ✅ `tyc debug --break <ty-file>:<line>` translates Typhon source locations through `.py.map` and injects `-c "break …"` into the chosen debugger session.
+
+**Phase 4+ — Beyond v1** also landed:
 
 - ✅ Automatic `asyncio.gather` inference (opt-in via `[strictness] auto-gather`): straight-line runs of two-or-more independent `await` calls inside an `async def` are folded into a `TaskGroup`.
 - ✅ Loop parallelisation for pure list comprehensions on free-threaded Python (opt-in via `[strictness] auto-parallel`, threshold `parallel-min-size`).
 - ✅ PGO via `tyc profile` (opt-in via `[strictness] pgo-memoise`): `tyc build` reads `typhon-profile.json` and promotes pure functions whose call counts meet `pgo-min-calls` to `@functools.cache`.
-- ✅ LSP completions (visible bindings + Typhon keywords + common builtins) and a "Remove unused import" code-action quick-fix.
+- ✅ LSP completions (visible bindings + Typhon keywords + common builtins + venv-driven member-access introspection + from-import members from sibling files) and a "Remove unused import" code-action quick-fix.
 - ✅ Cross-file go-to-definition across `.ty`/`.py` boundaries via the resolver's Salsa-tracked `resolved_module` query.
 - ✅ Attribute resolution against class definitions (`obj.method`, `Class.field`) and re-export-aware import resolution.
-- ✅ `tyc migrate` (typed Python → Typhon), `tyc repl` (interactive evaluator), `tyc debug` (pdb launcher), and `tyc add`/`remove`/`sync` (uv-backed package manager).
-- ✅ Source-map line accuracy: `.py.map` records a per-statement `(out_line → ty_line)` table consumed by `tyc trace`.
+- ✅ `tyc migrate` (typed Python → Typhon), `tyc repl` (interactive evaluator), `tyc debug` (pdb launcher with `--break`), and `tyc add`/`remove`/`sync` (uv-backed package manager).
+- ✅ `tyc-vm`: in-process tree-walking interpreter that runs `.ty` source directly. `tyc run` uses it by default — no `build/`, no CPython process spawn. See [docs/vm.md](docs/vm.md) for the supported feature surface; programs that import CPython-only libraries fall back via `tyc run --compile`.
+- ✅ Source-map line accuracy: `.py.map` records a per-statement `(out_line → ty_line)` table consumed by `tyc trace` and `tyc debug --break`.
 
 See [docs/roadmap.md](docs/roadmap.md) for the phased plan and [docs/follow-ups-2026-05-17.md](docs/follow-ups-2026-05-17.md) for the remaining tracked follow-ups.
 
@@ -215,9 +235,10 @@ tyc/
 │   ├── tyc-analyse/            Purity, async, comptime (Phase 2+)
 │   ├── tyc-desugar/            Typhon AST → Python AST (Phase 2+)
 │   ├── tyc-emit/               Python codegen
-│   ├── tyc-format/             Source formatter
+│   ├── tyc-format/             Source formatter (in-process pass + `ruff format` wrap)
 │   ├── tyc-diagnostics/        miette-based diagnostics
-│   ├── tyc-lsp/                LSP backend (Phase 2+)
+│   ├── tyc-lsp/                LSP backend
+│   ├── tyc-vm/                 In-process tree-walking interpreter (default for `tyc run`)
 │   └── tyc/                    CLI binary
 └── vendor/                     Vendored crates — Typhon's fork of Ruff
     ├── ruff_text_size/         TextSize/TextRange newtypes

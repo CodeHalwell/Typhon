@@ -9,11 +9,9 @@ sidebar:
 tyc fmt [PATHS]... [--check]
 ```
 
-Parses `.ty` files, validates the syntax, normalises a small set of whitespace rules, and writes the result back to disk.
+Parses `.ty` files, runs the in-process whitespace normaliser, then — when `ruff` is on `PATH` and the post-normalised buffer contains no Typhon-only tokens — pipes the result through `ruff format` for spacing around `:`, `=`, `->`, line wrapping, and quote normalisation. If `ruff` is missing or fails, the in-process output is kept.
 
-:::caution[v1 scope]
-The v1 formatter is a line-level whitespace pass, not yet a full AST-based reprinter. It collapses interior whitespace and tidies bracket/comma spacing, but leaves spacing around `:`, `=`, and `->` alone (those rules need bracket-depth awareness for slices vs annotations). A Typhon-aware AST-based reprinter wrapping `ruff format` is a Phase-5 follow-up.
-:::
+The composition is deliberate: the in-process pass strips every Typhon-only keyword (`let`, `mut`, `interface`, `model`, `gather`, `go`, `lazy`, `comptime`, `unsafe`, `extend`, `frozen`, `class!`, `plain class`, `?` operator, etc.) before ruff sees the buffer, so ruff never encounters syntax it can't parse.
 
 ## Examples
 
@@ -23,7 +21,7 @@ tyc fmt src/main.ty           # format one file
 tyc fmt --check src/          # exit 1 if anything would change (CI mode)
 ```
 
-## What it changes today
+## What the in-process pass changes
 
 - **Interior whitespace** — runs of 2+ spaces past the leading indent are collapsed to one (`def    main` → `def main`).
 - **Bracket adjacency** — `(  x` → `(x`, `x  )` → `x)`, `x   ,` → `x,`.
@@ -36,12 +34,20 @@ tyc fmt --check src/          # exit 1 if anything would change (CI mode)
 
 These rules all skip text inside `'…'`, `"…"`, and triple-quoted regions, so docstrings and embedded code stay verbatim.
 
+## What the `ruff format` wrap adds
+
+When `ruff` is on `PATH` and the post-normalised buffer contains no Typhon-only tokens, the buffer is piped through `ruff format --stdin-filename <path>`. This brings ruff's standard formatter rules to Typhon source for free:
+
+- Spacing around `:`, `=`, `->` with bracket-depth awareness (slice vs annotation distinction).
+- Long-line wrapping with consistent break points.
+- Quote normalisation per `ruff format`'s configured style.
+
+If `ruff` is absent, returns non-zero, or the buffer still contains a Typhon-only token after the in-process pass, the in-process output is kept and a single warning is printed. The wrap is best-effort by design — `tyc fmt` always produces a valid, parseable result.
+
 ## What it preserves
 
 - **Indentation depth** — the leading run of spaces is kept; only the *characters* change (tab → four spaces).
-- **Spacing around `:`, `=`, `->`** — left as-is (needs slice/annotation disambiguation; deferred).
-- **String quotes** — left as-is (Typhon doesn't take a side between `"` and `'`).
-- **`let` / `mut`** placement.
+- **Typhon-only syntax** — `let` / `mut` / `?` / `class!` / `plain class` / `frozen` / `gather` / `go` / `lazy` / `comptime` / `unsafe` / `extend` / `impl` / `interface` / `model` are recognised and round-tripped unchanged.
 - **Comment text** — content after the normalised `# ` prefix is kept verbatim; shebangs and `## …` lines are passed through unchanged.
 
 ## Flags

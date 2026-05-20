@@ -23,11 +23,13 @@ free-threaded = false
 [emit]
 class-default = "dataclass"
 format = true
+skip-decoration-bases = []
 
 [strictness]
 no-implicit-any = true
 unused-import = "error"
 exhaustive-match = "error"
+methods-in-class-body = "warn"
 auto-memoise = false
 auto-gather = false
 auto-parallel = false
@@ -51,7 +53,7 @@ pytest = "8.2"
 |---------|---------|------|
 | `[project]` | Name, version, src/out dirs | [→](/Typhon/configuration/project/) |
 | `[python]` | Target version, free-threaded mode | [→](/Typhon/configuration/python/) |
-| `[emit]` | Class default, format toggle | [→](/Typhon/configuration/emit/) |
+| `[emit]` | Class default, format toggle, framework-base skip list | [→](/Typhon/configuration/emit/) |
 | `[strictness]` | Every strictness knob | [→](/Typhon/configuration/strictness/) |
 | `[env]` | Required build-time env vars | [→](/Typhon/configuration/env/) |
 | `[dependencies]` / `[dev-dependencies]` | Package manifest | [→](/Typhon/configuration/dependencies/) |

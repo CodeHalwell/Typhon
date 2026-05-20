@@ -99,7 +99,7 @@ Missing variants without a wildcard arm: `tyc::non_exhaustive_match`.
     tyc build                 # parse, check, desugar, emit, format
     tyc check                 # parse + type-check only (CI-friendly)
     tyc fmt                   # format .ty files in place
-    tyc run                   # build then exec the emitted Python
+    tyc run                   # default: in-process VM; --compile for CPython interop
     tyc migrate <path.py>     # rewrite typed Python into Typhon
     tyc explain <code>        # describe a diagnostic (tyc::immutable_assign, ...)
     tyc lsp                   # speak LSP on stdio

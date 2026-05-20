@@ -6,7 +6,7 @@ sidebar:
 ---
 
 ```
-tyc build [--out DIR] [--no-format]
+tyc build [--out DIR] [--no-format] [--check]
 ```
 
 Runs the full compilation pipeline and writes the emitted Python to the output directory (default `build/`, configurable via `[project] out`).
@@ -17,6 +17,7 @@ Runs the full compilation pipeline and writes the emitted Python to the output d
 tyc build                       # full project → build/
 tyc build --out dist/           # → dist/ instead
 tyc build --no-format           # skip the ruff format post-process
+tyc build --check               # dry-run: list every file that would be written
 ```
 
 ## What it produces
@@ -62,6 +63,11 @@ Each stage is a Salsa query; on incremental rebuilds, only invalidated outputs a
 |------|--------|
 | `--out DIR` (`-o`) | Override the `[project] out` directory. Relative paths resolve against the project root. |
 | `--no-format` | Skip the `ruff format` post-process. |
+| `--check` | Dry-run mode. The full pipeline still runs (so type errors continue to surface), but no files are written — instead, every file that *would* be created or overwritten is listed. Useful for previewing the effect of a `class-default` or `skip-decoration-bases` change before committing to disk. |
+
+## `.py` files alongside `.ty`
+
+Plain `.py` files in `src/` are copied verbatim into the build output (skipping `__pycache__/`, `tests/`, `.venv/`, and dotfiles). This is the recommended escape hatch when a class can't be expressed cleanly in Typhon — write it in Python, drop it next to your `.ty` files, and the relative import keeps working at runtime. A relative `.py` import that resolves to a file outside `src/` fires `tyc::orphan_py_import` so the missing-at-runtime case is caught at build time.
 
 ## When the build fails
 
@@ -83,6 +89,6 @@ Salsa caches every stage's output. If you change one function in one file, the r
 
 ## Where next
 
-- [`tyc run`](/Typhon/cli/run/) — build then exec in one step.
+- [`tyc run`](/Typhon/cli/run/) — execute a Typhon program (in-process VM by default, `--compile` for build-then-exec).
 - [`tyc check`](/Typhon/cli/check/) — type-check without emit.
 - [Lowering Overview](/Typhon/lowering/overview/) — what each construct compiles to.

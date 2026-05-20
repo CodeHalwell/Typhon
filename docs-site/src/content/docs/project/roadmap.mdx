@@ -5,7 +5,7 @@ sidebar:
   order: 1
 ---
 
-Phases 0–3 are complete. Phase 4+ is in progress. The minimum-viable Typhon — non-null types + sealed unions + `Result` + dataclass emit — is shippable today.
+Phases 0–3 are complete. Phase 5 (interop and developer experience) shipped in v0.1.6. Phase 4+ items continue to land as they prove their value. The minimum-viable Typhon — non-null types + sealed unions + `Result` + dataclass emit — is shippable today.
 
 ## Phase 0 — Foundation ✅
 
@@ -46,26 +46,42 @@ Phases 0–3 are complete. Phase 4+ is in progress. The minimum-viable Typhon �
 - `extend ClassName:` and `extend BUILTIN:`.
 - `.dty` stub files → `.pyi` emission; `tyc check --stubs` AST diff.
 
-## Phase 4+ — Beyond v1 (in progress)
+## Phase 5 — Interop and developer experience ✅ (v0.1.6)
+
+Real-world adopters were landing on Typhon and hitting the same handful of papercuts in the same order. Phase 5 was the **friction list** — fix the friction before adding more features.
+
+- ✅ **`plain class X:`** keyword — symmetric with `frozen class X:`. Emits a bare Python class with no `@dataclass` decoration and no synthesised `__init__`. The canonical Python-interop escape hatch.
+- ✅ **Auto-skip `@dataclass`** for `Enum` / `IntEnum` / `StrEnum` / `Flag` / `IntFlag` / `ABC` / `ABCMeta` subclasses (in addition to the always-skipped `Protocol` / `TypedDict` / `NamedTuple`); project-specific bases via `[emit] skip-decoration-bases` matched on last identifier segment.
+- ✅ **`[emit] class-default` validation.** Unknown values (`"struct"`, `"plain"`, `"none"`, …) now fail config load with `tyc::invalid_config_value` instead of silently falling back to `"dataclass"`.
+- ✅ **Python-semantic alignment.** `or` / `and` typed as `Union[truthy(lhs), rhs]` (and the falsy dual); generator functions structurally assignable to `Iterable[T]` / `Iterator[T]` / `AsyncIterable[T]` / `AsyncIterator[T]`. Tracked via the `tyc::python_semantic_drift` audit warning.
+- ✅ **Discoverability.** `tyc explain <code>` for the diagnostic catalog (mirrors `rustc --explain`); `tyc cheatsheet` for the 30-second syntax refresher; `tyc init` scaffold ships a frozen dataclass + `impl` block + `Result`/`?`/`match` example, plus a fully-commented `typhon.toml`; `tyc --help` footer links docs, language reference, migrate, lsp, cheatsheet, and explain.
+- ✅ **`.py` interop in build output.** Stray `.py` files in `src/` copy verbatim into the build dir (honouring `__pycache__/` / `tests/` / `.venv/` / dotfile exclusions); `tyc::orphan_py_import` warns when a relative `.py` import resolves outside `src/`.
+- ✅ **Diagnostic deep-links.** Every `tyc::` diagnostic carries a `url(https://typhon.dev/lang/diagnostics/<code>)` clause renderable by miette and surfaced by `tyc explain`; 50+ catalog pages under `docs/diagnostics/` embedded into the binary.
+- ✅ **Build UX.** `tyc build --check` dry-runs the pipeline and lists every file that would be written without touching disk; `tyc::contains_secret_literal` flags inlined env values whose binding name matches a credential suffix (`KEY`, `TOKEN`, `PASSWORD`, …).
+- ✅ **`tyc fmt` wraps `ruff format`** after the in-process whitespace pass, with a guarded check for residual Typhon-only tokens.
+- ✅ **`tyc debug --break <ty-file>:<line>`** translates Typhon source locations via `.py.map` and forwards them to the chosen debugger via `-c "break …"`. Repeatable.
+
+## Phase 4+ — Beyond v1 (landing as they prove value)
 
 Shipped:
 
 - ✅ Automatic `asyncio.gather` inference (`[strictness] auto-gather`).
 - ✅ Loop parallelisation for pure list comprehensions on free-threaded Python (`[strictness] auto-parallel`).
 - ✅ PGO via `tyc profile` (`[strictness] pgo-memoise`).
-- ✅ LSP completions and "Remove unused import" code action.
+- ✅ LSP completions (visible bindings + keywords + builtins + venv-driven member-access introspection + from-import members from sibling files) and "Remove unused import" code action.
 - ✅ Cross-file go-to-definition across `.ty` / `.py`.
 - ✅ `tyc migrate` (typed `.py` → `.ty`).
-- ✅ `tyc repl`, `tyc debug`, `tyc run`.
+- ✅ `tyc repl`; `tyc debug` (with `--break` source mapping); `tyc run` (defaulting to the in-process `tyc-vm` tree-walking interpreter — no build/, no CPython spawn).
 - ✅ `tyc add` / `remove` / `sync` over `uv`.
+- ✅ Runtime `stubtest` probe via `tyc stubtest` (shells out to `python -m mypy.stubtest`).
 
 Deferred:
 
-- ⏳ Richer comptime (container literals, string methods, loops in `comptime def`).
+- ⏳ Richer comptime: broader stdlib in the sandbox, `for` loops in `comptime def`, types as values.
 - ⏳ Full structural subtyping with proper variance and bounded higher-kinded forms.
 - ⏳ `ty` integration as an embedded library (today: subprocess via `tyc ty`).
-- ⏳ Runtime `stubtest` introspection (today: shells out to `mypy.stubtest`).
-- ⏳ A Typhon-native source-mapping debugger (today: thin `pdb` launcher).
+- ⏳ A Typhon-native source-mapping debugger UI (today: `pdb` launcher with `--break TY:LINE` translation).
+- ⏳ Broader `tyc::python_semantic_drift` audit beyond the `or`/`and` and generator → `Iterable` cases already fixed.
 - ⏳ Corpus round-trip sweep across third-party Python projects.
 - ⏳ `[emit] model-extra` knob to relax Pydantic `extra="forbid"`.
 - ⏳ Async public-API stability rules if async inference is ever added.

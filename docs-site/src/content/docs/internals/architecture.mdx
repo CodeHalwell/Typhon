@@ -30,13 +30,16 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 [tyc-desugar]  →  plain Python AST
         │
         ▼
-[tyc-emit]     →  .py source via hand-written printer
+[tyc-emit]     →  .py source via hand-written printer (tracks .py.map offsets)
         │
         ▼
-[tyc-format]   →  post-process through ruff format
+[tyc-format]   →  in-process whitespace pass + `ruff format` wrap (when on PATH)
         │
         ▼
 [tyc-lsp]      →  reuses the above stages incrementally via Salsa
+
+Parallel surface:
+[tyc-vm]       →  walks the parsed Typhon AST directly (default for `tyc run`)
 ```
 
 This is the same crate-per-stage layout used by [oxc](https://github.com/oxc-project/oxc) and [rust-analyzer](https://rust-analyzer.github.io/). The single most important meta-rule: every external crate gets wrapped behind a one-function-wide module of our own, so when Salsa changes its API or Ruff renames a node, the blast radius stays small.

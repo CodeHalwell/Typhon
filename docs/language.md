@@ -10,6 +10,10 @@ Each section covers what the feature does, how it desugars to Python, and what t
 
 A plain `T` forbids `None`; `T?` is the optional form. Internally `T?` is represented as a `Nullable[T]` wrapper but emits as `T | None` in Python annotations. The checker uses flow-sensitive analysis to narrow `T?` to `T` inside guards and null-checks. Attempting to call a method on a `T?` without a check is a compile error.
 
+### Python-semantic alignment
+
+The checker treats `or`/`and` the way CPython does: the expression yields one of the operands, not a `bool`. `let chunk: str = update.text or ""` therefore type-checks — the result type is `Union[truthy(typeof(lhs)), typeof(rhs)]` (and the falsy dual for `and`). Generator functions are structurally assignable to `Iterable[T]` / `Iterator[T]` / `AsyncIterable[T]` / `AsyncIterator[T]`, so `def compose() -> ComposeResult: yield ...` flows into a parameter annotated `Iterable[Widget]` without needing a manual list materialisation. Both checks fixed real-world adopter rejections — the broader audit is tracked under the `tyc::python_semantic_drift` warning.
+
 ### Generics
 
 PEP 695 bracket syntax (`def f[T](x: T) -> T`, `type Vec[T] = list[T]`) — chosen at Phase 3 entry because `ruff_python_parser` already accepts it and it stays in lockstep with CPython grammar. Type parameters declare into the function/class scope as `Type::TypeVar(name)` and survive through signatures.
@@ -172,13 +176,64 @@ What `class!` changes versus a plain `class`:
 - **Class-level field defaults are stripped from the body** when `__init__` is synthesised — the default is carried only in the generated parameter list. Leaving the literal at class scope would evaluate it twice (once at class-definition time as a shared class attribute, then again per-instance in `__init__`), which silently breaks libraries that introspect class attributes — e.g. PyTorch parameter registration would see a dead class-level `Linear(10, 5)` instance. Annotations survive so type checkers still see the field shape.
 - **A hand-written `__init__` is preserved verbatim.** Use this when the base class needs configuration arguments that aren't 1:1 with your declared fields.
 
+### `plain class` (raw Python class)
+
+`plain class X:` is the small-step escape hatch for "I want a plain Python
+class — no decorator, no synthesised constructor, no slots." It is the
+symmetric form of `frozen class X:` and reads at a glance: anyone scanning
+the file sees that this type follows Python's stock semantics, not
+Typhon's dataclass-by-default rule.
+
+```python
+# Typhon
+plain class Bag:
+    items: list[str]
+    label: str = "unsorted"
+
+# Emitted Python (no decorator at all)
+class Bag:
+    items: list[str]
+    label: str = "unsorted"
+```
+
+`plain class` differs from `class!` in one key way: it does **not**
+synthesise an `__init__`. The body emits verbatim, so attributes only
+exist on instances once user code assigns them — exactly like a hand-
+written Python class. Reach for `plain class` when you want Python's
+permissive semantics for metaclass-driven libraries (Textual, Django ORM
+descriptors, SQLAlchemy declarative models) that set instance attributes
+dynamically. Reach for `class!` when you're subclassing a framework base
+that needs `super().__init__()` to fire before fields are wired up.
+
+Two related auto-skip rules tighten the safety net:
+
+- **Auto-skip on framework-base inheritance.** A plain `class Foo(Base):`
+  whose base is one of `Enum` / `IntEnum` / `StrEnum` / `Flag` /
+  `IntFlag` / `ABC` / `ABCMeta` is emitted without `@dataclass`, so
+  enum subclasses and abstract bases work without needing the `class!`
+  or `plain class` marker. `Protocol`, `TypedDict`, and `NamedTuple`
+  subclasses have always been skipped. Project-specific framework bases
+  can be added via `[emit] skip-decoration-bases` in `typhon.toml` —
+  matched by last identifier segment so `"App"` catches both
+  `class T(App):` and `class T(textual.App):`. Auto-skip drops only the
+  decorator; it does not synthesise an `__init__`. Use `class!` when
+  you need both the dropped decorator *and* a generated constructor
+  that calls `super().__init__()`.
+- **`class-default` validation.** `class-default = "struct"` /
+  `"regular"` / `"none"` used to be silently identical to `"dataclass"`.
+  They are now rejected at config load with
+  `tyc::invalid_config_value` and the allowed-values list
+  (`"dataclass"`, `"pydantic"`).
+
 When to reach for which class form:
 
 | Form | Emits | Use when |
 |---|---|---|
 | `class Foo:` | `@dataclass(slots=True)` | Plain value type. Default for new code. |
+| `class Foo frozen:` | `@dataclass(slots=True, frozen=True)` | Immutable value type — field reassignment is a hard error. |
 | `model Foo:` | `BaseModel` (Pydantic, `extra='forbid'`) | Validated input at a system boundary. |
 | `interface Foo:` | `Protocol` | Structural contract you check against, not a concrete type. |
+| `plain class Foo:` | bare `class Foo:` (no decorator, no synthesised `__init__`) | Metaclass-driven libraries, descriptor-based models, anything that owns its own attribute layout. |
 | `class! Foo(Base):` | bare `class Foo(Base):` + synthesised or hand-written `__init__` | Subclassing a framework base that owns its own `__init__`. |
 
 ## Error handling

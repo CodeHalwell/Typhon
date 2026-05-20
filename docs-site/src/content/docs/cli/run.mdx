@@ -1,44 +1,53 @@
 ---
 title: tyc run
-description: Build then exec the emitted Python in one step. Like tsx for Typhon.
+description: Execute a Typhon program — in-process VM by default, build-then-exec with --compile.
 sidebar:
   order: 6
 ---
 
 ```
-tyc run [--entry FILE] [--temp] [--no-build] [--python PATH] [-- ARGS...]
+tyc run [PATH] [--compile] [--entry FILE] [--temp] [--no-build] [--python PATH] [-- ARGS...]
 ```
 
-Builds the project and execs `python build/<entry>.py`. Two output modes — persistent (default) or ephemeral (`--temp`).
+Runs a Typhon program. Two execution modes:
+
+- **VM (default).** Walks the parsed `.ty` source directly using the in-process [`tyc-vm`](/Typhon/cli/run/#the-vm-mode) tree-walking interpreter. No `.py` is written, no `build/` directory is created, no CPython process is spawned.
+- **`--compile`** (alias **`--no-vm`**). Falls back to the legacy "build then exec CPython" path. Required when your program imports CPython libraries the VM doesn't speak natively (`numpy`, `requests`, `pandas`, `pydantic`, …).
 
 ## Examples
 
 ```bash
-tyc run                            # build into build/, exec main.py
-tyc run -- --port 8080             # forward args to the script
-tyc run --temp -- --port 8080      # ephemeral build, deleted on exit
-tyc run --entry api.py             # different entry point
-tyc run --no-build                 # reuse existing build/
+# VM mode (default)
+tyc run                              # resolve src/main.ty from typhon.toml
+tyc run src/cli.ty                   # run a specific .ty file
+tyc run -- --port 8080 ./input.csv   # forward args to the script
+
+# Compile-and-exec mode
+tyc run --compile                    # build into the configured out dir, exec build/main.py
+tyc run --compile --temp             # ephemeral build, deleted on exit
+tyc run --compile --entry api.py     # different entry point
+tyc run --compile --no-build         # reuse existing build/
 ```
 
-## Output modes
+## The VM mode
 
-### Persistent (default)
+The VM is in-process and tree-walking — every iteration of the inner loop touches Typhon AST nodes the parser already produced, no codegen or subprocess overhead in between. Native support covers the bulk of Typhon's surface:
 
-Builds into the configured `out` dir (default `build/`). Subsequent runs reuse the incremental Salsa cache, and `.py.map` sidecars remain on disk so a post-crash `tyc trace` can map frames back to `.ty`.
+- Core language: `let` / `mut` bindings, control flow, functions and closures, classes (with `impl`-block method merging), comprehensions, `try` / `except`, `match`, `with`.
+- `Result[T, E]` as a native ADT: `Ok` / `Err` are intercepted on import from `typhon_runtime`; the `?` operator works because preprocess already lowers it to an `isinstance` check against `__typhon_Err__`.
+- ~50 builtins (`print`, `range`, `sorted`, `zip`, `enumerate`, …).
+- A small native stdlib (`math`, `os`, `sys`, `json`, `time`, `random`).
+- `str` / `list` / `dict` / `set` methods dispatched through a Rust registry.
 
-```bash
-tyc run                            # build/ persists
-ls build/                          # main.py, main.py.map, ...
-```
+Features the VM doesn't yet support — `async`, real generators, bigint, `with` on arbitrary context managers, mapping/class-keyword `match` patterns, the full CPython stdlib — raise `NotImplementedError` at runtime with a pointer to the responsible feature. The error message also tells you to re-run with `--compile`.
 
-### `--temp` (`-t`)
+See [The Typhon VM](https://github.com/CodeHalwell/Typhon/blob/main/docs/vm.md) for the full feature table.
 
-Builds into a fresh `tempfile::tempdir()` that is deleted when `tyc run` exits. No project artefacts persist. Trades the incremental cache and on-disk source map for a clean tree — ideal for one-shot iteration.
+### Why two modes?
 
-```bash
-tyc run --temp                     # nothing left behind after exit
-```
+The VM is the fast path for iterating on pure-Typhon code: stack traces land on `.ty` lines directly, no `tyc trace` remapping needed, and you skip the build + `uv sync` round-trip every time you tweak a line of code. `--compile` is the wide-compatibility path: any third-party Python library, any free-threaded extension, the full Python ecosystem.
+
+For pure-Typhon work the VM is the default. The moment your program does `import numpy`, switch to `--compile`.
 
 ## Exit code propagation
 
@@ -49,34 +58,56 @@ tyc run -- --check; echo "exit=$?"
 # Whatever the script exited with
 ```
 
-Build failures and spawn failures surface as the usual miette errors with exit code 1.
+Build failures and spawn failures surface as the usual miette errors with exit code 1. Parse errors with exit code 2.
 
 ## Forwarding args
 
-Pass `--` to mark the start of args for the Python script:
+Pass `--` to mark the start of args for the program (works in both modes):
 
 ```bash
 tyc run -- --port 8080 ./input.csv
-# Python receives: ['build/main.py', '--port', '8080', './input.csv']
+# sys.argv inside the program: ['<entry>', '--port', '8080', './input.csv']
+```
+
+## Output modes for `--compile`
+
+### Persistent (default)
+
+`--compile` builds into the configured `out` dir (default `build/`). Subsequent runs reuse the incremental Salsa cache, and `.py.map` sidecars remain on disk so a post-crash `tyc trace` can map frames back to `.ty`.
+
+```bash
+tyc run --compile                  # build/ persists
+ls build/                          # main.py, main.py.map, ...
+```
+
+### `--temp` (`-t`)
+
+Builds into a fresh `tempfile::tempdir()` that is deleted when the process exits. No project artefacts persist on disk. Trades the incremental cache and on-disk source map for a clean tree — ideal for one-shot iteration.
+
+```bash
+tyc run --compile --temp           # nothing left behind after exit
 ```
 
 ## Flags
 
-| Flag | Default | Effect |
-|------|---------|--------|
-| `--entry FILE` | `main.py` | Entry-point file relative to the build dir. |
-| `--python PATH` | `python3` | Python interpreter. |
-| `--temp` / `-t` | off | Ephemeral tempdir build. Mutually exclusive with `--no-build`. |
-| `--no-build` | off | Skip rebuilding; assume the persistent `build/` is current. |
+| Flag | Mode | Effect |
+|------|------|--------|
+| `--compile` (alias `--no-vm`) | switch | Build to `.py` and exec CPython instead of using the VM. |
+| `--entry FILE` | compile only | Entry-point file relative to the build dir. Default `main.py`. |
+| `--python PATH` | compile only | Python interpreter. Default `python3`. |
+| `--temp` / `-t` | compile only | Build into a tempdir that is deleted on exit. Mutually exclusive with `--no-build`. |
+| `--no-build` | compile only | Skip rebuilding; assume the persistent `build/` is current. |
+
+The compile-only flags (`--entry`, `--python`, `--temp`, `--no-build`) are rejected by clap unless `--compile` is also given, so a mistaken combination fails fast at the CLI rather than being silently ignored.
 
 ## What `tyc run` is not
 
-- **Not a new VM.** It is a UX shortcut around `tyc build && python build/main.py`. The execution model is unchanged.
-- **Not an interpreter.** For interactive evaluation use [`tyc repl`](/Typhon/cli/repl/).
+- **Not an interactive shell.** For interactive evaluation use [`tyc repl`](/Typhon/cli/repl/).
 - **Not a debugger.** For pdb-style stepping use [`tyc debug`](/Typhon/cli/debug/).
+- **Not a build artifact pipeline.** The VM path doesn't write `.py`; use [`tyc build`](/Typhon/cli/build/) when you want emitted Python on disk.
 
 ## Where next
 
-- [`tyc build`](/Typhon/cli/build/) — the build step `tyc run` wraps.
+- [`tyc build`](/Typhon/cli/build/) — the build step `--compile` mode wraps.
 - [`tyc repl`](/Typhon/cli/repl/) — interactive evaluation.
-- [`tyc debug`](/Typhon/cli/debug/) — launch under pdb.
+- [`tyc debug`](/Typhon/cli/debug/) — launch under pdb with `--break` for `.ty`-line breakpoints.
