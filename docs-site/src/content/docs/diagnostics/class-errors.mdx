@@ -97,6 +97,42 @@ The methods would otherwise lower into a free-floating `__typhon_impl_NAME` pseu
 
 **Fix:** declare `class Account:` first, or fix the name to match an existing class in this module. `extend Account:` (the alias for user-defined classes) reports the same diagnostic.
 
+## `tyc::missing_field_init`
+
+An instance constructed via `X.__new__(X)` / `object.__new__(X)` (bypassing the auto-generated `__init__`) escapes the function — returned, passed as an argument — without every required field having been assigned:
+
+```python
+class ApiClient:
+    api_key: str
+    base_url: str
+
+def make() -> ApiClient:
+    let c: ApiClient = ApiClient.__new__(ApiClient)
+    c.base_url = "https://api.example.com"
+    return c
+    # ❌ tyc::missing_field_init — instance escapes without all required
+    #    fields set; missing: api_key
+```
+
+Without this audit the emitted Python would crash with `AttributeError: 'ApiClient' object has no attribute 'api_key'` the first time the missing field is read.
+
+**Fix:** either assign every required field before the instance escapes, or — preferably — use the normal constructor, which is arity-checked at compile time by [`tyc::arg_count`](/Typhon/diagnostics/type-errors/#tycarg_count) and flags the forgotten field at the call site rather than the escape site:
+
+```python
+def make() -> ApiClient:
+    let c: ApiClient = ApiClient(api_key="…", base_url="https://api.example.com")
+    return c
+```
+
+**What's tracked.** Only two construction shapes engage the audit: `<ClassName>.__new__(<ClassName>)` and `object.__new__(<ClassName>)`. Tracking is dropped (conservatively, to avoid false positives) when any of the following happen before the escape:
+
+- `setattr(c, ...)` — dynamic attribute assignment defeats static field tracking.
+- `c.method(...)` — a method call may initialise fields internally.
+- The binding is reassigned to anything other than another bypass call.
+- The binding's enclosing scope is wrapped in `unsafe:` — the user opted out of the static-type discipline.
+
+**Limitations.** Only return statements and call arguments count as escapes; container-literal storage (`return [c]`) and outer-scope assignment aren't tracked. The audit is intra-procedural. Subclass field requirements aren't tracked separately.
+
 ## `tyc::extend_builtin`
 
 An `extend` declaration targets a Python built-in type (`str`, `list`, `dict`, …) that cannot be modified at runtime. Typhon handles this safely by extracting each method to a module-level free function and rewriting call sites whose receiver carries a matching static annotation; this diagnostic fires when the rewrite is impossible (e.g. unsupported builtin, conflict with a stdlib method).

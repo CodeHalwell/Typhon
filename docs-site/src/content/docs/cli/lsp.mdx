@@ -47,6 +47,12 @@ You usually do not run this by hand — the editor extension does. See [Editor S
 
 Median latency for a single-file edit in a 100-module project is well under 100ms.
 
+### Cross-module shape extraction
+
+For the constructor / method arity checks introduced in v0.2.0, the LSP backend maintains a per-project-root registry of `dotted_name → SourceFile` handles so they survive across keystrokes. On each `check_and_publish` it `set_text`-uploads every project file once (a no-op when content matches) and then asks the salsa-tracked `tyc_db::module_shapes_query` for each file's shape. A keystroke in one file only re-runs shape extraction for that file; the current editor buffer is preferred over disk for the file being edited.
+
+`.dty` stubs participate on equal footing with `.ty` source — both flow through the same `ExternalShapes` registry — and stubs win on name collisions. When no `typhon.toml` ancestor is found, the LSP falls back to the per-file salsa-cached check path with no cross-module shape propagation.
+
 ## Trace logs
 
 To debug LSP traffic, set the trace level in your editor. For VS Code, settings:

@@ -58,7 +58,7 @@ Every diagnostic has a `tyc::*` code. The catalog is enumerated across the follo
     [→](/Typhon/diagnostics/nullability/) — `nullable_use`.
   </Card>
   <Card title="Class Errors" icon="setting">
-    [→](/Typhon/diagnostics/class-errors/) — `manual_init`, `frozen_assign`, `method_in_class_body`, `duplicate_class`, `impl_unknown_class`, `extend_builtin`, `class_attr_shadows_slot`, `self_outside_impl`.
+    [→](/Typhon/diagnostics/class-errors/) — `manual_init`, `frozen_assign`, `method_in_class_body`, `duplicate_class`, `impl_unknown_class`, `extend_builtin`, `class_attr_shadows_slot`, `self_outside_impl`, `missing_field_init`.
   </Card>
   <Card title="Result Errors" icon="approve-check">
     [→](/Typhon/diagnostics/result-errors/) — `invalid_question_op`, `result_error_mismatch`.
@@ -80,6 +80,9 @@ Every diagnostic has a `tyc::*` code. The catalog is enumerated across the follo
   </Card>
   <Card title="Phase 5 Interop & Lints" icon="information">
     Added in v0.1.6 — `orphan_py_import` (relative `.py` outside `src/`), `contains_secret_literal` (credential-named comptime literal), `invalid_config_value` (unknown `[emit] class-default` / etc.), `main_not_called` (script defines `main()` but never calls it).
+  </Card>
+  <Card title="Phase 5.5 Arity Safety" icon="approve-check">
+    Added in v0.2.0 — `tyc::arg_count` now fires on auto-generated **class constructors** and **`impl` methods**, including cross-module via `from foo import Cls` and `import foo as f; f.Cls(…)`. New `tyc::missing_field_init` post-construction audit catches `X.__new__(X)` bypass patterns when required fields escape uninitialised.
   </Card>
 </CardGrid>
 

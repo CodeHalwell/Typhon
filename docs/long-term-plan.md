@@ -437,7 +437,14 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 > scaffold, `.py`-in-`src/` copy-through, `tyc build --check`,
 > `tyc::contains_secret_literal`, miette `url(...)` deep-links on every
 > diagnostic with 50+ catalog pages, `tyc fmt` wrapping `ruff format`, and
-> `tyc debug --break TY:LINE` source mapping. Phase 4+ work is also
+> `tyc debug --break TY:LINE` source mapping. Phase 5.5 — constructor /
+> method arity safety — shipped in
+> [v0.2.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.2.0):
+> `tyc::arg_count` now fires on auto-generated class constructors and
+> `impl` methods; cross-module shape propagation arity-checks
+> `from foo import Cls` and `import foo as f; f.Cls(…)` alike (both `.ty`
+> source and `.dty` stubs); `tyc::missing_field_init` audits
+> `X.__new__(X)` bypass construction patterns. Phase 4+ work is also
 > landed: auto-gather, auto-parallel, PGO, LSP completions and code
 > actions, cross-file go-to-definition, the package-manager surface,
 > REPL, debugger, the `tyc-vm` tree-walking interpreter (default for
@@ -495,6 +502,7 @@ At the end of Phase 3 — roughly month twelve — Typhon is useful for a real b
 - ✅ Package-manager surface over `uv` (`tyc add` / `tyc remove` / `tyc sync`).
 - ✅ `tyc run` defaults to the in-process `tyc-vm` tree-walking interpreter — no `build/`, no CPython spawn. `--compile` (alias `--no-vm`) falls back to the legacy build-then-exec path for programs that import CPython libraries the VM doesn't speak natively. See [docs/vm.md](vm.md).
 - ✅ Phase 5 interop + DX bundle (v0.1.6): `plain class`, `[emit] skip-decoration-bases`, `class-default` validation, `or`/`and` truthy-union typing, generator→`Iterable` conformance, `tyc explain` / `tyc cheatsheet`, `tyc build --check`, `.py`-in-`src/` copy-through with `tyc::orphan_py_import`, `tyc::contains_secret_literal`, miette `url(...)` deep-links on every diagnostic, `tyc fmt` wrapping `ruff format`. See [docs/roadmap.md](roadmap.md#phase-5--interop-and-developer-experience--complete-v016).
+- ✅ Phase 5.5 constructor / method arity safety (v0.2.0): `tyc::arg_count` now fires on auto-generated `__init__` of `class` / `model` declarations and on `impl` methods; cross-module shape propagation arity-checks `from foo import Cls` and `import foo as f; f.Cls(…)` alike; `.ty` source and `.dty` stubs participate on equal footing through a project-wide `ExternalShapes` registry; the LSP caches per-file extraction via a Salsa-tracked `module_shapes_query`; a new `tyc::missing_field_init` post-construction audit catches `X.__new__(X)` bypass patterns where the instance escapes without required fields assigned. See [docs/roadmap.md](roadmap.md#phase-55--constructor--method-arity-safety--complete-v020).
 - ✅ Runtime `stubtest` probe via `tyc stubtest` (shells out to `python -m mypy.stubtest`) — complements the AST-level `tyc check --stubs` diff.
 - `ty` integration as a complementary second-stage checker over the desugared Python — see [docs/ty-integration.md](ty-integration.md). (Subprocess form landed as `tyc ty`; the embedded-library form is deferred.)
 
