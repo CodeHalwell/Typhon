@@ -642,7 +642,7 @@ return f"({t}, {u})"
 A `.pyi` consumed *by* Typhon is treated as an `unsafe` boundary unless overridden by an authored `.dty`.
 
 ```python
-# stubs/redis.dty
+# src/stubs/redis.dty
 class Redis:
     host: str
     port: int

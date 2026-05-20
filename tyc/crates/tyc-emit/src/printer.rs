@@ -813,9 +813,11 @@ impl Emitter {
 
             // Ruff renamed `NamedExpr` → `Named` (walrus operator).
             Expr::Named(n) => {
+                self.write("(");
                 self.emit_expr(&n.target);
                 self.write(" := ");
                 self.emit_expr(&n.value);
+                self.write(")");
             }
 
             Expr::BinOp(b) => {

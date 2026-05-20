@@ -738,6 +738,12 @@ fn expr_uses_asyncio_qualified(expr: &Expr) -> bool {
 
 fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule {
     let multi_base_parents = collect_multi_base_parents(&m.body);
+    // Classes whose impl-stub body contains a `cached_property` method (or
+    // the aliased `_typhon_cached_property` form emitted by `lazy let` in
+    // an impl block) need `__dict__` to back the property cache; treat them
+    // as multi-base parents so the dataclass decorator drops `slots=True`.
+    let mut multi_base_parents = multi_base_parents;
+    collect_cached_property_targets_into(&m.body, &mut multi_base_parents);
     let markers = ClassMarkers {
         raw_starts: &options.raw_class_line_starts,
         frozen_starts: &options.frozen_class_line_starts,
@@ -1451,6 +1457,52 @@ fn class_inherits_protocol(c: &ruff_python_ast::StmtClassDef) -> bool {
 /// Those classes can't carry `slots=True` because two slotted bases
 /// trigger `TypeError: multiple bases have instance lay-out conflict`
 /// at class-definition time. FINDINGS #102.
+/// Walk the module body looking for `__typhon_impl_X` stubs that contain a
+/// method decorated with `cached_property` (or its aliased import name) or a
+/// plain class with such a method, and record the underlying class names.
+/// `cached_property` requires `__dict__`, which conflicts with `slots=True`.
+fn collect_cached_property_targets_into(
+    body: &[Stmt],
+    parents: &mut std::collections::HashSet<String>,
+) {
+    for stmt in body {
+        if let Stmt::ClassDef(c) = stmt {
+            let target = c
+                .name
+                .as_str()
+                .strip_prefix("__typhon_impl_")
+                .unwrap_or(c.name.as_str())
+                .to_owned();
+            if class_body_has_cached_property(&c.body) {
+                parents.insert(target);
+            }
+        }
+    }
+}
+
+fn class_body_has_cached_property(body: &[Stmt]) -> bool {
+    for stmt in body {
+        if let Stmt::FunctionDef(f) = stmt {
+            for d in &f.decorator_list {
+                let name = match &d.expression {
+                    Expr::Name(n) => n.id.as_str(),
+                    Expr::Attribute(a) => a.attr.as_str(),
+                    Expr::Call(c) => match c.func.as_ref() {
+                        Expr::Name(n) => n.id.as_str(),
+                        Expr::Attribute(a) => a.attr.as_str(),
+                        _ => continue,
+                    },
+                    _ => continue,
+                };
+                if matches!(name, "cached_property" | "_typhon_cached_property") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn collect_multi_base_parents(body: &[Stmt]) -> std::collections::HashSet<String> {
     let mut parents: std::collections::HashSet<String> = std::collections::HashSet::new();
     collect_multi_base_parents_into(body, &mut parents);

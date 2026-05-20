@@ -355,6 +355,25 @@ fn is_async_protocol_dunder(name: &str) -> bool {
     matches!(name, "__aenter__" | "__aexit__" | "__aiter__" | "__anext__")
 }
 
+/// Return `true` when `body` is structurally a declaration-only body —
+/// any combination of `pass`, ellipsis expression statements, and
+/// docstrings (string literal expression statements). These bodies are
+/// typical of Protocol / interface method declarations and should not
+/// trigger `tyc::async_without_await`.
+fn body_is_declaration_only(body: &[Stmt]) -> bool {
+    if body.is_empty() {
+        return true;
+    }
+    body.iter().all(|s| match s {
+        Stmt::Pass(_) => true,
+        Stmt::Expr(e) => matches!(
+            e.value.as_ref(),
+            Expr::EllipsisLiteral(_) | Expr::StringLiteral(_)
+        ),
+        _ => false,
+    })
+}
+
 /// `async with` headers. Nested function and class bodies are skipped
 /// so an `await` in an inner async lambda or nested coroutine doesn't
 /// satisfy the outer function. FINDINGS #83.
@@ -1313,6 +1332,17 @@ struct MethodSig {
     /// of producing a `() -> return_type` bound-method handle.
     /// FINDINGS #63.
     is_property: bool,
+    /// `true` when the method was decorated with `@staticmethod`. Static
+    /// methods have no implicit receiver, so `arity` records every listed
+    /// parameter and the class-qualified call path does not add one for
+    /// `self` (FINDINGS R3.16).
+    is_static: bool,
+    /// `true` when the method was decorated with `@classmethod`. Class
+    /// methods take `cls` as the first parameter, but Python binds it
+    /// automatically at every call site (instance- or class-qualified),
+    /// so `arity` excludes `cls` and the class-qualified call path does
+    /// not add an implicit receiver.
+    is_classmethod: bool,
 }
 
 /// Member shape recorded for an interface or class — methods are recorded as
@@ -1799,6 +1829,39 @@ impl<'a> Checker<'a> {
             span.0,
             length,
         ));
+    }
+
+    fn operator_type_mismatch(&mut self, op: &str, lhs: &Type, rhs: &Type, span: (usize, usize)) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
+        let length = span.1.saturating_sub(span.0).max(1);
+        self.diagnostics
+            .push_error(TycError::operator_type_mismatch(
+                op,
+                lhs.display(),
+                rhs.display(),
+                &self.path,
+                self.source,
+                span.0,
+                length,
+            ));
+    }
+
+    fn tuple_index_out_of_range(&mut self, arity: usize, index: i64, span: (usize, usize)) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
+        let length = span.1.saturating_sub(span.0).max(1);
+        self.diagnostics
+            .push_error(TycError::tuple_index_out_of_range(
+                arity,
+                index,
+                &self.path,
+                self.source,
+                span.0,
+                length,
+            ));
     }
 
     fn nullable_use(&mut self, name: &str, expected: &Type, span: (usize, usize)) {
@@ -2457,32 +2520,13 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                 arity_info_from_parameters(f.parameters.as_ref(), &classes, &tps),
             );
             // Record `async def` names so the call-site arm can emit
-            // `tyc::missing_await` for sync calls (FINDINGS #49).
+            // `tyc::missing_await` for sync calls (FINDINGS #49). The
+            // `async_without_await` warning is emitted from
+            // `check_function` so the carve-outs (declaration-only
+            // bodies, async generators, async-protocol dunders) live
+            // alongside the body walk.
             if f.is_async {
                 c.async_functions.insert(f.name.as_str().to_owned());
-                // FINDINGS #83: warn when an `async def` body has no
-                // `await`. The skill documents this as
-                // `tyc::async_without_await` (warning). Coroutine semantics
-                // are wasted on a body that never suspends — most often a
-                // leftover from a half-finished refactor or a forgotten
-                // `await` on an internal call.
-                if !body_has_await(&f.body) && !is_async_protocol_dunder(f.name.as_str()) {
-                    let span_start = f.name.range.start().to_usize();
-                    let span_len = f
-                        .name
-                        .range
-                        .end()
-                        .to_usize()
-                        .saturating_sub(span_start)
-                        .max(1);
-                    c.diagnostics.push_warning(TycError::async_without_await(
-                        f.name.as_str(),
-                        &c.path,
-                        c.source,
-                        span_start,
-                        span_len,
-                    ));
-                }
             }
             // Also extract any declared TypeVar bounds so they can be checked
             // at call sites.
@@ -2567,21 +2611,39 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
         match stmt {
             // Ruff folds `async def` into `Stmt::FunctionDef` with `is_async = true`.
             Stmt::FunctionDef(f) => {
-                let arity = method_arity_excluding_receiver(f.parameters.as_ref());
+                let is_static = f.decorator_list.iter().any(
+                    |d| matches!(&d.expression, Expr::Name(n) if n.id.as_str() == "staticmethod"),
+                );
+                let is_classmethod = f.decorator_list.iter().any(
+                    |d| matches!(&d.expression, Expr::Name(n) if n.id.as_str() == "classmethod"),
+                );
+                let arity = if is_static {
+                    f.parameters.posonlyargs.len()
+                        + f.parameters.args.len()
+                        + f.parameters.kwonlyargs.len()
+                } else {
+                    method_arity_excluding_receiver(f.parameters.as_ref())
+                };
                 let return_type = match f.returns.as_deref() {
                     Some(r) => type_from_annotation(r, classes),
                     None => Type::Unknown,
                 };
-                let is_property = f
-                    .decorator_list
-                    .iter()
-                    .any(|d| matches!(&d.expression, Expr::Name(n) if n.id.as_str() == "property"));
+                let is_property = f.decorator_list.iter().any(|d| match &d.expression {
+                    Expr::Name(n) => matches!(
+                        n.id.as_str(),
+                        "property" | "cached_property" | "_typhon_cached_property"
+                    ),
+                    Expr::Attribute(a) => matches!(a.attr.as_str(), "property" | "cached_property"),
+                    _ => false,
+                });
                 shape.methods.insert(
                     f.name.as_str().to_owned(),
                     MethodSig {
                         arity,
                         return_type,
                         is_property,
+                        is_static,
+                        is_classmethod,
                     },
                 );
             }
@@ -3065,6 +3127,81 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 _ => false,
             });
             if !is_pseudo && !is_protocol && !is_pydantic {
+                let merged_methods_empty = c
+                    .class_shapes
+                    .get(class_name)
+                    .map(|s| s.methods.is_empty())
+                    .unwrap_or(true);
+                let body_has_function = cd.body.iter().any(|s| matches!(s, Stmt::FunctionDef(_)));
+                let mut has_ann_assign = false;
+                let mut all_ann_assigns_defaulted = true;
+                let mut only_ann_assigns = true;
+                let mut first_defaulted: Option<(&ruff_python_ast::StmtAnnAssign, String)> = None;
+                for s in &cd.body {
+                    match s {
+                        Stmt::AnnAssign(a) => {
+                            has_ann_assign = true;
+                            if a.value.is_none() {
+                                all_ann_assigns_defaulted = false;
+                            } else if first_defaulted.is_none() {
+                                if let Expr::Name(n) = a.target.as_ref() {
+                                    first_defaulted = Some((a, n.id.as_str().to_owned()));
+                                }
+                            }
+                        }
+                        Stmt::Pass(_) => {}
+                        Stmt::Expr(e)
+                            if matches!(
+                                e.value.as_ref(),
+                                Expr::StringLiteral(_) | Expr::EllipsisLiteral(_)
+                            ) => {}
+                        _ => only_ann_assigns = false,
+                    }
+                }
+                if has_ann_assign
+                    && all_ann_assigns_defaulted
+                    && only_ann_assigns
+                    && !body_has_function
+                    && merged_methods_empty
+                {
+                    if let Some((ann, field_name)) = first_defaulted {
+                        let value_hint = ann
+                            .value
+                            .as_deref()
+                            .map(|v| match v {
+                                Expr::StringLiteral(s) => {
+                                    format!("\"{}\"", s.value.to_str())
+                                }
+                                Expr::NumberLiteral(n) => match &n.value {
+                                    ruff_python_ast::Number::Int(i) => i.to_string(),
+                                    ruff_python_ast::Number::Float(f) => f.to_string(),
+                                    ruff_python_ast::Number::Complex { real, imag } => {
+                                        format!("{}+{}j", real, imag)
+                                    }
+                                },
+                                Expr::BooleanLiteral(b) => {
+                                    if b.value {
+                                        "True".to_owned()
+                                    } else {
+                                        "False".to_owned()
+                                    }
+                                }
+                                _ => "its literal value".to_owned(),
+                            })
+                            .unwrap_or_else(|| "its literal value".to_owned());
+                        let class_range = cd.name.range;
+                        c.diagnostics
+                            .push_warning(TycError::class_attr_shadows_slot(
+                                class_name.to_owned(),
+                                field_name,
+                                value_hint,
+                                c.path.clone(),
+                                c.source,
+                                class_range.start().to_usize(),
+                                class_name.len().max(1),
+                            ));
+                    }
+                }
                 for s in &cd.body {
                     if let Stmt::FunctionDef(f) = s {
                         let method = f.name.as_str();
@@ -3216,6 +3353,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
         Stmt::Match(m) => {
             let subject_type = infer_expr(c, &m.subject);
             for case in &m.cases {
+                check_pattern_class_fields(c, &case.pattern);
                 // Enter scope and bind pattern names FIRST so guard expressions
                 // (e.g. `case Circle(radius=r) if r > 0:`) can reference them.
                 c.env.enter();
@@ -3375,11 +3513,16 @@ fn check_function(
 
     // `async def` with no `await` — warn per tyc::async_without_await (FINDINGS #83).
     // Only fires for user-authored async functions, not compiler-synthesised helpers
-    // (prefixed with `__typhon_`).
+    // (prefixed with `__typhon_`). Carve-outs: async-protocol dunders
+    // (`__aenter__`/`__aexit__`/`__aiter__`/`__anext__`), declaration-only
+    // bodies (`...` / `pass` / docstring) that look like Protocol/interface
+    // signatures, and async generators (bodies that `yield`).
     if is_async
         && !name.starts_with("__typhon_")
         && !is_async_protocol_dunder(name)
         && !body_has_await(body)
+        && !body_is_declaration_only(body)
+        && !body_has_yield(body)
     {
         c.diagnostics.push_warning(TycError::async_without_await(
             name,
@@ -3690,48 +3833,7 @@ fn match_arms_always_exit_aware(c: &Checker, m: &ruff_python_ast::StmtMatch) -> 
     {
         return false;
     }
-    // (a) Catch-all check: a guardless `case _:` or capturing arm with
-    // no inner pattern matches any value.
-    let has_catchall = m.cases.iter().any(|case| {
-        case.guard.is_none()
-            && matches!(
-                &case.pattern,
-                ruff_python_ast::Pattern::MatchAs(p) if p.pattern.is_none()
-            )
-    });
-    if has_catchall {
-        return true;
-    }
-    // (b) Sealed-union exhaustiveness check: resolve the subject's
-    // type and see whether every declared variant is matched by a
-    // guardless arm. The subject must be a bare name whose declared
-    // type is a sealed-union class — same shape the
-    // `check_match_exhaustiveness` pass relies on.
-    //
-    // `Result[T, E]` is a builtin sealed union whose variants
-    // (`Ok` | `Err`) are seeded in `seed_typhon_runtime_types` rather
-    // than declared by a user `type Result = Ok | Err` alias, so
-    // resolve it explicitly here (F4).
-    if let Expr::Name(n) = m.subject.as_ref() {
-        if let Some(binding) = c.env.lookup(n.id.as_str()) {
-            let variants: Option<Vec<String>> = match &binding.declared {
-                Type::Class(union_name) => c.sealed_unions.get(union_name.as_str()).cloned(),
-                Type::Generic(head, _) if head == "Result" => Some(vec!["Ok".into(), "Err".into()]),
-                _ => None,
-            };
-            if let Some(variants) = variants {
-                let mut covered: HashSet<String> = HashSet::new();
-                for case in &m.cases {
-                    if case.guard.is_some() {
-                        continue;
-                    }
-                    collect_matched_class_names(&case.pattern, &mut covered);
-                }
-                return variants.iter().all(|v| covered.contains(v));
-            }
-        }
-    }
-    false
+    match_cases_cover_subject(c, m)
 }
 
 /// Checker-aware variant of [`body_always_exits`]. Identical to the
@@ -3909,26 +4011,64 @@ fn match_arms_exit_non_suppressible_aware(c: &Checker, m: &ruff_python_ast::Stmt
     {
         return false;
     }
-    let has_catchall = m.cases.iter().any(|case| {
+    match_cases_cover_subject(c, m)
+}
+
+/// True when the unguarded arms of `m` collectively cover every value of the
+/// subject's static type. Used by both `match_arms_always_exit_aware` and
+/// `match_arms_exit_non_suppressible_aware` so the same recognition logic
+/// drives the missing-return analysis for normal and `with`-body matches.
+///
+/// Covers:
+/// - A guardless catch-all arm (`case _:` / `case x:` / `case <wild> as x:`).
+/// - Sealed-union subjects where every variant is matched.
+/// - Single-class subjects matched by a class-wildcard arm — including
+///   `case C():`, `case C(field=name, ...):` with every field bound to a
+///   capture, and `case C() as x:` / nested `MatchOr` of the same shape.
+/// - `list` / `tuple` subjects covered by a `case [*xs]:` arm.
+/// - Aliased union subjects (e.g. `type IntTree = int | list[IntTree]`)
+///   where every variant of the unwrapped union is covered by an unguarded
+///   arm that is a class-wildcard for that variant.
+fn match_cases_cover_subject(c: &Checker, m: &ruff_python_ast::StmtMatch) -> bool {
+    if m.cases.iter().any(|case| {
         case.guard.is_none()
             && matches!(
                 &case.pattern,
                 ruff_python_ast::Pattern::MatchAs(p) if p.pattern.is_none()
             )
-    });
-    if has_catchall {
+    }) {
         return true;
     }
+    let Some(subject_type) = match_subject_type(c, m) else {
+        return false;
+    };
+    let unwrapped = c.unwrap_alias(&subject_type);
+    cases_cover_type(c, &m.cases, &unwrapped)
+}
+
+fn match_subject_type(c: &Checker, m: &ruff_python_ast::StmtMatch) -> Option<Type> {
     if let Expr::Name(n) = m.subject.as_ref() {
         if let Some(binding) = c.env.lookup(n.id.as_str()) {
-            let variants: Option<Vec<String>> = match &binding.declared {
-                Type::Class(union_name) => c.sealed_unions.get(union_name.as_str()).cloned(),
-                Type::Generic(head, _) if head == "Result" => Some(vec!["Ok".into(), "Err".into()]),
-                _ => None,
-            };
-            if let Some(variants) = variants {
+            return Some(binding.declared.clone());
+        }
+    }
+    None
+}
+
+/// Return `true` iff the unguarded patterns in `cases` cover every inhabitant
+/// of `ty`. Recurses on union variants so an aliased `int | list[...]` is
+/// satisfied by arms covering each side individually.
+fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
+    if let Type::Union(variants) = ty {
+        return variants.iter().all(|v| cases_cover_type(c, cases, v));
+    }
+    let class_name = match ty {
+        Type::Class(n) => n.clone(),
+        Type::Generic(head, _) => {
+            if head == "Result" {
+                let variants = ["Ok".to_string(), "Err".to_string()];
                 let mut covered: HashSet<String> = HashSet::new();
-                for case in &m.cases {
+                for case in cases {
                     if case.guard.is_some() {
                         continue;
                     }
@@ -3936,9 +4076,166 @@ fn match_arms_exit_non_suppressible_aware(c: &Checker, m: &ruff_python_ast::Stmt
                 }
                 return variants.iter().all(|v| covered.contains(v));
             }
+            head.clone()
         }
+        Type::Int => "int".to_string(),
+        Type::Str => "str".to_string(),
+        Type::Bool => "bool".to_string(),
+        Type::Float => "float".to_string(),
+        Type::Bytes => "bytes".to_string(),
+        Type::None => "NoneType".to_string(),
+        _ => return false,
+    };
+    if let Some(variants) = c.sealed_unions.get(class_name.as_str()).cloned() {
+        let mut covered: HashSet<String> = HashSet::new();
+        for case in cases {
+            if case.guard.is_some() {
+                continue;
+            }
+            if pattern_covers_class(c, &case.pattern, &class_name) {
+                return true;
+            }
+            collect_matched_class_names(&case.pattern, &mut covered);
+        }
+        return variants.iter().all(|v| covered.contains(v));
     }
-    false
+    if cases
+        .iter()
+        .any(|case| case.guard.is_none() && pattern_covers_class(c, &case.pattern, &class_name))
+    {
+        return true;
+    }
+    if class_name == "list" || class_name == "tuple" {
+        sequence_cases_cover_all_lengths(cases)
+    } else {
+        false
+    }
+}
+
+/// True when the unguarded sequence patterns in `cases` collectively cover
+/// every possible length of a list/tuple subject. Recognises:
+/// - `case [a, b, c]:` — fixed-length N coverage (matches length 3 only).
+/// - `case [first, *rest]:` — tail-star coverage of length ≥ N where N is
+///   the count of fixed elements before the star.
+///
+/// A coverage is total when there is a tail-star arm of minimum length N
+/// and every shorter length 0..N is matched by a fixed-length arm.
+fn sequence_cases_cover_all_lengths(cases: &[MatchCase]) -> bool {
+    let mut exact: HashSet<usize> = HashSet::new();
+    let mut tail_star_min: Option<usize> = None;
+    for case in cases {
+        if case.guard.is_some() {
+            continue;
+        }
+        let Pattern::MatchSequence(seq) = &case.pattern else {
+            continue;
+        };
+        let star_count = seq
+            .patterns
+            .iter()
+            .filter(|p| matches!(p, Pattern::MatchStar(_)))
+            .count();
+        if star_count == 0 {
+            if seq.patterns.iter().all(is_capture_or_underscore) {
+                exact.insert(seq.patterns.len());
+            }
+            continue;
+        }
+        if star_count != 1 {
+            continue;
+        }
+        if !matches!(seq.patterns.last(), Some(Pattern::MatchStar(_))) {
+            continue;
+        }
+        if !seq.patterns[..seq.patterns.len() - 1]
+            .iter()
+            .all(is_capture_or_underscore)
+        {
+            continue;
+        }
+        let min_len = seq.patterns.len() - 1;
+        tail_star_min = Some(match tail_star_min {
+            Some(prev) => prev.min(min_len),
+            None => min_len,
+        });
+    }
+    let Some(min) = tail_star_min else {
+        return false;
+    };
+    (0..min).all(|n| exact.contains(&n))
+}
+
+/// True if `pattern` (in an unguarded arm) matches every instance of
+/// `class_name`. Recognises:
+/// - `case _:` / `case x:` (always a wildcard for anything).
+/// - `case <wild> as name:` (recurses on the inner pattern).
+/// - `case C():` with no sub-patterns.
+/// - `case C(field=p1, ...):` where every field of `C` is bound and every
+///   sub-pattern `p_i` is itself a wildcard.
+/// - `case [*xs]:` for `class_name == "list"` / `"tuple"`.
+/// - `case <wild1> | <wild2> | ...:` where any branch matches.
+fn pattern_covers_class(c: &Checker, pattern: &Pattern, class_name: &str) -> bool {
+    match pattern {
+        Pattern::MatchAs(a) => match &a.pattern {
+            None => true,
+            Some(inner) => pattern_covers_class(c, inner, class_name),
+        },
+        Pattern::MatchOr(o) => o
+            .patterns
+            .iter()
+            .any(|p| pattern_covers_class(c, p, class_name)),
+        Pattern::MatchClass(mc) => {
+            let Expr::Name(n) = mc.cls.as_ref() else {
+                return false;
+            };
+            if n.id.as_str() != class_name {
+                return false;
+            }
+            if mc.arguments.patterns.is_empty() && mc.arguments.keywords.is_empty() {
+                return true;
+            }
+            if !mc.arguments.patterns.is_empty() {
+                return false;
+            }
+            let Some(shape) = c.class_shapes.get(class_name) else {
+                return false;
+            };
+            if mc.arguments.keywords.len() != shape.fields.len() {
+                return false;
+            }
+            let bound: HashSet<&str> = mc
+                .arguments
+                .keywords
+                .iter()
+                .map(|kw| kw.attr.as_str())
+                .collect();
+            if !shape.fields.keys().all(|f| bound.contains(f.as_str())) {
+                return false;
+            }
+            mc.arguments
+                .keywords
+                .iter()
+                .all(|kw| is_capture_or_underscore(&kw.pattern))
+        }
+        Pattern::MatchSequence(seq) => {
+            (class_name == "list" || class_name == "tuple")
+                && seq.patterns.len() == 1
+                && matches!(&seq.patterns[0], Pattern::MatchStar(_))
+        }
+        _ => false,
+    }
+}
+
+/// True if `pattern` is a pure capture or wildcard with no nested filter:
+/// `_`, `x`, or `<wild> as x` where the inner is itself such.
+fn is_capture_or_underscore(pattern: &Pattern) -> bool {
+    match pattern {
+        Pattern::MatchAs(a) => match &a.pattern {
+            None => true,
+            Some(inner) => is_capture_or_underscore(inner),
+        },
+        _ => false,
+    }
 }
 
 fn elif_else_chain_always_exits_aware(
@@ -4255,8 +4552,26 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     }
                 }
             }
+            let l_stripped = l.strip_none();
+            let r_stripped = r.strip_none();
+            if let Some(op_str) = arithmetic_op_str(b.op) {
+                if !operator_operands_compatible(b.op, &l_stripped, &r_stripped) {
+                    let span = (b.range.start().to_usize(), b.range.end().to_usize());
+                    c.operator_type_mismatch(op_str, &l_stripped, &r_stripped, span);
+                }
+            }
             // Conservative numeric arithmetic inference.
-            match (&l.strip_none(), &r.strip_none()) {
+            match (&l_stripped, &r_stripped) {
+                _ if matches!(b.op, Operator::Div)
+                    && is_numeric(&l_stripped)
+                    && is_numeric(&r_stripped) =>
+                {
+                    // Python's `/` is always true division — the result
+                    // is `float` regardless of operand types. Returning
+                    // `Type::Float` lets `let i: int = a / b` flag via
+                    // the existing assignability check.
+                    Type::Float
+                }
                 (Type::Int, Type::Int) => Type::Int,
                 (Type::Float, _) | (_, Type::Float) => Type::Float,
                 (Type::Str, Type::Str) if matches!(b.op, Operator::Add) => Type::Str,
@@ -4628,14 +4943,21 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     result
                 }
                 Type::Class(name) => {
-                    // Generic class instantiation (FINDINGS #46) — when
-                    // the class declares PEP 695 type parameters, try
-                    // bidirectional inference from the call's expected
-                    // return type so `let b: Box[int] = Box(value=42)`
-                    // produces `Type::Generic("Box", [Int])` rather than
-                    // `Type::Class("Box")`. Falls back to a forward pass
-                    // that reads field annotations and binds each
-                    // declared TypeVar from the matching kwarg.
+                    if let Some(shape) = c.class_shapes.get(&name).cloned() {
+                        let candidates: Vec<String> = shape.fields.keys().cloned().collect();
+                        for kw in kw_args {
+                            let Some(ident) = &kw.arg else { continue };
+                            let kw_name = ident.as_str();
+                            if !shape.fields.contains_key(kw_name) {
+                                let suggestion = suggest_candidate(kw_name, &candidates);
+                                let span = (
+                                    ident.range.start().to_usize(),
+                                    ident.range.start().to_usize() + kw_name.len(),
+                                );
+                                c.unknown_kwarg(&name, kw_name, suggestion, span);
+                            }
+                        }
+                    }
                     if let Some(tparams) = c.class_type_params.get(&name).cloned() {
                         let mut bindings: HashMap<String, Type> = HashMap::new();
                         // Bidirectional: pin from the surrounding annotation.
@@ -4734,6 +5056,10 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             match &recv {
                 Type::Class(class_name) => {
                     let class_name = class_name.clone();
+                    let receiver_is_class_name = matches!(
+                        a.value.as_ref(),
+                        Expr::Name(n) if c.classes.iter().any(|cn| cn == n.id.as_str())
+                    );
                     if let Some(sig) = c.find_method(class_name.as_str(), attr_name) {
                         // `@property` methods are read as attributes — return
                         // the underlying type directly instead of a bound-
@@ -4741,7 +5067,10 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         if sig.is_property {
                             return sig.return_type.clone();
                         }
-                        let arity = sig.arity;
+                        let mut arity = sig.arity;
+                        if receiver_is_class_name && !sig.is_static && !sig.is_classmethod {
+                            arity = arity.saturating_add(1);
+                        }
                         let ret = sig.return_type.clone();
                         return Type::Function {
                             params: vec![Type::Unknown; arity],
@@ -4803,8 +5132,31 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             }
         }
         Expr::Subscript(s) => {
-            let _ = infer_expr(c, &s.value);
+            let value_ty = infer_expr(c, &s.value);
             let _ = infer_expr(c, &s.slice);
+            if let Type::Generic(head, elts) = &value_ty {
+                if head == "tuple" && !elts.is_empty() {
+                    if let Some(idx) = const_int_index(&s.slice) {
+                        let arity = elts.len();
+                        let arity_i = arity as i64;
+                        let resolved = if idx >= 0 && idx < arity_i {
+                            Some(idx as usize)
+                        } else if idx < 0 && idx >= -arity_i {
+                            Some((arity_i + idx) as usize)
+                        } else {
+                            None
+                        };
+                        match resolved {
+                            Some(i) => return elts[i].clone(),
+                            None => {
+                                let span = (s.range.start().to_usize(), s.range.end().to_usize());
+                                c.tuple_index_out_of_range(arity, idx, span);
+                                return Type::Unknown;
+                            }
+                        }
+                    }
+                }
+            }
             Type::Unknown
         }
         Expr::List(l) => {
@@ -4982,6 +5334,111 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
     }
 }
 
+/// Operators whose operand-type compatibility is checked by
+/// `operator_operands_compatible`. Returns the operator's Python source
+/// form for diagnostic text, or `None` for ops we don't yet check
+/// (bitwise / shifts, MatMult).
+fn arithmetic_op_str(op: Operator) -> Option<&'static str> {
+    match op {
+        Operator::Add => Some("+"),
+        Operator::Sub => Some("-"),
+        Operator::Mult => Some("*"),
+        Operator::Div => Some("/"),
+        Operator::FloorDiv => Some("//"),
+        Operator::Mod => Some("%"),
+        Operator::Pow => Some("**"),
+        _ => None,
+    }
+}
+
+/// True if either side is something we shouldn't flag at all — values
+/// of `Any`/`Unknown`/`TypeVar`, a user-defined class (which might
+/// implement `__add__` / `__mul__` / …), any composite type that
+/// embeds one of those, or any union (we don't know which variant the
+/// value actually holds at this point, and even all-primitive unions
+/// like `int | str` may be valid for some variant).
+fn operand_is_unflaggable(t: &Type) -> bool {
+    match t {
+        Type::Any | Type::Unknown | Type::TypeVar(_) => true,
+        Type::Class(_) => true,
+        Type::Function { .. } => true,
+        Type::Union(_) => true,
+        Type::Generic(_, args) => args.iter().any(operand_is_unflaggable),
+        Type::Int | Type::Str | Type::Bool | Type::Float | Type::Bytes | Type::None => false,
+    }
+}
+
+fn is_numeric(t: &Type) -> bool {
+    matches!(t, Type::Int | Type::Float | Type::Bool)
+}
+
+/// Conservative compatibility check for the arithmetic / concat
+/// operators in [`arithmetic_op_str`]. Returns `false` only for pairs
+/// that are clearly wrong by Python's runtime semantics on built-in
+/// types; anything involving an unknown or user class is treated as
+/// possibly-compatible.
+fn operator_operands_compatible(op: Operator, l: &Type, r: &Type) -> bool {
+    if operand_is_unflaggable(l) || operand_is_unflaggable(r) {
+        return true;
+    }
+    match op {
+        Operator::Add => {
+            if is_numeric(l) && is_numeric(r) {
+                return true;
+            }
+            if matches!(l, Type::Str) && matches!(r, Type::Str) {
+                return true;
+            }
+            if matches!(l, Type::Bytes) && matches!(r, Type::Bytes) {
+                return true;
+            }
+            if let (Type::Generic(ln, _), Type::Generic(rn, _)) = (l, r) {
+                if ln == rn && (ln == "list" || ln == "tuple") {
+                    return true;
+                }
+            }
+            false
+        }
+        Operator::Sub | Operator::Mod | Operator::Pow | Operator::FloorDiv | Operator::Div => {
+            is_numeric(l) && is_numeric(r)
+        }
+        Operator::Mult => {
+            if is_numeric(l) && is_numeric(r) {
+                return true;
+            }
+            // Repetition: str/bytes/list/tuple * int (either order).
+            let is_repeatable = |t: &Type| {
+                matches!(t, Type::Str | Type::Bytes)
+                    || matches!(t, Type::Generic(n, _) if n == "list" || n == "tuple")
+            };
+            (is_repeatable(l) && matches!(r, Type::Int | Type::Bool))
+                || (is_repeatable(r) && matches!(l, Type::Int | Type::Bool))
+        }
+        _ => true,
+    }
+}
+
+/// Extract a constant integer index from an expression used in
+/// `Expr::Subscript`. Supports `Number::Int` literals and the unary
+/// negation of one. Anything else returns `None`.
+fn const_int_index(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::NumberLiteral(n) => match &n.value {
+            Number::Int(i) => i.as_i64(),
+            _ => None,
+        },
+        Expr::UnaryOp(u) if matches!(u.op, ruff_python_ast::UnaryOp::USub) => {
+            if let Expr::NumberLiteral(n) = u.operand.as_ref() {
+                if let Number::Int(i) = &n.value {
+                    return i.as_i64().and_then(|v| v.checked_neg());
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 // ── sealed union helpers ──────────────────────────────────────────────────────
 
 /// Extract the list of variant class names from a `type Foo = A | B | C`
@@ -5034,6 +5491,11 @@ fn check_match_exhaustiveness(
         if is_wildcard_pattern(&case.pattern) {
             has_wildcard = true;
             break;
+        }
+        for variant in variants {
+            if pattern_covers_class(c, &case.pattern, variant) {
+                covered.insert(variant.clone());
+            }
         }
         collect_matched_class_names(&case.pattern, &mut covered);
     }
@@ -5090,6 +5552,65 @@ fn collect_matched_class_names(pattern: &Pattern, covered: &mut HashSet<String>)
         Pattern::MatchOr(o) => {
             for p in &o.patterns {
                 collect_matched_class_names(p, covered);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Walk a `case` pattern and emit `tyc::unknown_kwarg` / `tyc::arg_count`
+/// for `MatchClass` patterns that reference fields or positional slots the
+/// class doesn't have (FINDINGS R3.8 / R3.12.f).
+fn check_pattern_class_fields(c: &mut Checker, pattern: &Pattern) {
+    match pattern {
+        Pattern::MatchClass(mc) => {
+            if let Expr::Name(cls_name) = mc.cls.as_ref() {
+                let name = cls_name.id.as_str().to_owned();
+                if let Some(shape) = c.class_shapes.get(&name).cloned() {
+                    let candidates: Vec<String> = shape.fields.keys().cloned().collect();
+                    for kw in &mc.arguments.keywords {
+                        let kw_name = kw.attr.as_str();
+                        if !shape.fields.contains_key(kw_name) {
+                            let suggestion = suggest_candidate(kw_name, &candidates);
+                            let span = (
+                                kw.attr.range.start().to_usize(),
+                                kw.attr.range.start().to_usize() + kw_name.len(),
+                            );
+                            c.unknown_kwarg(&name, kw_name, suggestion, span);
+                        }
+                    }
+                    let pos = mc.arguments.patterns.len();
+                    if pos > shape.fields.len() {
+                        let span = (mc.range.start().to_usize(), mc.range.end().to_usize());
+                        c.wrong_args(&name, shape.fields.len(), pos, span);
+                    }
+                }
+            }
+            for p in &mc.arguments.patterns {
+                check_pattern_class_fields(c, p);
+            }
+            for kw in &mc.arguments.keywords {
+                check_pattern_class_fields(c, &kw.pattern);
+            }
+        }
+        Pattern::MatchAs(a) => {
+            if let Some(inner) = &a.pattern {
+                check_pattern_class_fields(c, inner);
+            }
+        }
+        Pattern::MatchOr(o) => {
+            for p in &o.patterns {
+                check_pattern_class_fields(c, p);
+            }
+        }
+        Pattern::MatchSequence(seq) => {
+            for p in &seq.patterns {
+                check_pattern_class_fields(c, p);
+            }
+        }
+        Pattern::MatchMapping(m) => {
+            for p in &m.patterns {
+                check_pattern_class_fields(c, p);
             }
         }
         _ => {}

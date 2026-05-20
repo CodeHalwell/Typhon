@@ -263,6 +263,44 @@ pub enum TycError {
         decl_span: SourceSpan,
     },
 
+    /// A binary operator was applied to operands whose types are
+    /// incompatible per Python's runtime semantics — e.g. `str + int`
+    /// or `list + dict`. The check is conservative: it fires only on
+    /// clearly-wrong pairs whose operand types are both fully known and
+    /// neither side is a user-defined `class` (which might define a
+    /// custom `__add__` / `__mul__` / etc.).
+    #[error("unsupported operand types for `{op}`: `{lhs}` and `{rhs}`")]
+    #[diagnostic(
+        code(tyc::operator_type_mismatch),
+        help("convert one operand so the types match (e.g. `str(n)` / `int(s)`)")
+    )]
+    OperatorTypeMismatch {
+        op: String,
+        lhs: String,
+        rhs: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("operator `{op}` does not apply to `{lhs}` and `{rhs}`")]
+        span: SourceSpan,
+    },
+
+    /// A constant integer index into a fixed-arity tuple is out of
+    /// range — the tuple type carries its element count statically so
+    /// the lookup can be flagged at type-check time. FINDINGS R3.10.
+    #[error("tuple has {arity} element(s); index {index} is out of range")]
+    #[diagnostic(
+        code(tyc::tuple_index_out_of_range),
+        help("use an index in `0..{arity}` (or `-{arity}..0` for negative indexing)")
+    )]
+    TupleIndexOutOfRange {
+        arity: usize,
+        index: i64,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("index `{index}` is out of range for `tuple` of arity {arity}")]
+        span: SourceSpan,
+    },
+
     /// A nullable value (`T | None`) was used in a position requiring `T`.
     #[error("possibly-None value used where `{expected}` is required")]
     #[diagnostic(
@@ -573,6 +611,32 @@ pub enum TycError {
         #[source_code]
         src: NamedSource<String>,
         #[label("`def` here belongs in `impl {class}:`")]
+        span: SourceSpan,
+    },
+
+    /// A `class NAME:` body contains only annotated assignments with
+    /// defaults (`NAME: T = literal`) and no methods or per-instance
+    /// fields, so it reads like a namespace of constants. The class will
+    /// emit as `@dataclass(slots=True)`, which turns each name into a
+    /// slot descriptor: `Klass.NAME` at runtime returns the descriptor
+    /// rather than the literal. Surfaced as a warning so the existing
+    /// pattern keeps building; the recommended fix is annotating each
+    /// field as `ClassVar[T]` (which `@dataclass` excludes from slots).
+    /// Promotion to error is a v0.2 follow-up.
+    #[error(
+        "class `{class}` has only defaulted fields — `{class}.{field}` will be a slot descriptor at runtime, not `{field_value_hint}`"
+    )]
+    #[diagnostic(
+        code(tyc::class_attr_shadows_slot),
+        help("annotate each field as `ClassVar[T]` (from `typing`) so `@dataclass(slots=True)` excludes them from `__slots__`")
+    )]
+    ClassAttrShadowsSlot {
+        class: String,
+        field: String,
+        field_value_hint: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("class `{class}` reads like a namespace of constants")]
         span: SourceSpan,
     },
 
@@ -972,6 +1036,42 @@ impl TycError {
         }
     }
 
+    /// Construct a [`TycError::OperatorTypeMismatch`] diagnostic.
+    pub fn operator_type_mismatch(
+        op: impl Into<String>,
+        lhs: impl Into<String>,
+        rhs: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::OperatorTypeMismatch {
+            op: op.into(),
+            lhs: lhs.into(),
+            rhs: rhs.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::TupleIndexOutOfRange`] diagnostic.
+    pub fn tuple_index_out_of_range(
+        arity: usize,
+        index: i64,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::TupleIndexOutOfRange {
+            arity,
+            index,
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
     /// Construct a [`TycError::NullableUse`] diagnostic.
     pub fn nullable_use(
         name: impl Into<String>,
@@ -1286,6 +1386,25 @@ impl TycError {
         Self::MethodInClassBody {
             class: class.into(),
             method: method.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::ClassAttrShadowsSlot`] diagnostic.
+    pub fn class_attr_shadows_slot(
+        class: impl Into<String>,
+        field: impl Into<String>,
+        field_value_hint: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::ClassAttrShadowsSlot {
+            class: class.into(),
+            field: field.into(),
+            field_value_hint: field_value_hint.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

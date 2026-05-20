@@ -839,20 +839,43 @@ from typing import Callable, TypeVar
 _T = TypeVar(\"_T\")
 
 
-def lazy_import(name: str) -> ModuleType:
+class _LazyModule:
+    \"\"\"Attribute-proxy that imports its underlying module on first access.\"\"\"
+
+    __slots__ = (\"_name\", \"_module\")
+
+    def __init__(self, name: str) -> None:
+        object.__setattr__(self, \"_name\", name)
+        object.__setattr__(self, \"_module\", None)
+
+    def _load(self) -> ModuleType:
+        module = object.__getattribute__(self, \"_module\")
+        if module is None:
+            module = importlib.import_module(object.__getattribute__(self, \"_name\"))
+            object.__setattr__(self, \"_module\", module)
+        return module
+
+    def __getattr__(self, attr: str) -> object:
+        return getattr(self._load(), attr)
+
+    def __dir__(self) -> list[str]:
+        return dir(self._load())
+
+    def __repr__(self) -> str:
+        module = object.__getattribute__(self, \"_module\")
+        if module is None:
+            name = object.__getattribute__(self, \"_name\")
+            return f\"<lazy module {name!r}: unloaded>\"
+        return repr(module)
+
+
+def lazy_import(name: str) -> _LazyModule:
     \"\"\"Return a module proxy that defers loading until first attribute access.
 
-    Built on `importlib.util.LazyLoader`, which installs a deferred-loader
-    spec so the first attribute lookup triggers the real import.
-    \"\"\"
-    spec = importlib.util.find_spec(name)
-    if spec is None or spec.loader is None:
-        raise ImportError(f\"cannot resolve lazy import {name!r}\")
-    loader = importlib.util.LazyLoader(spec.loader)
-    spec.loader = loader
-    module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
-    return module
+    The return value is a `_LazyModule` proxy, not a real `ModuleType` —
+    `isinstance(lazy_import(...), ModuleType)` is `False`. Attribute access
+    transparently forwards to the loaded module via `__getattr__`.\"\"\"
+    return _LazyModule(name)
 
 
 class _LazyValue:

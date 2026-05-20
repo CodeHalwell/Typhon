@@ -1642,6 +1642,18 @@ fn find_mid_expression_questionmarks(code: &str) -> Vec<usize> {
     } else {
         trimmed_end
     };
+    // Inline `with`-chains can carry multiple `expr?,` bindings and one
+    // trailing `expr?:` on the same line. Those are recognised later by
+    // `expand_with_chains` and must not be flagged here. Strip trailing
+    // comments (string-aware) before the `?:` end-check so a chain with
+    // `# comment` after it is still recognised.
+    let is_with_chain_line = {
+        let trimmed_start = code.trim_start();
+        trimmed_start.starts_with("with ")
+            && strip_trailing_comment(code)
+                .trim_end_matches([' ', '\t'])
+                .ends_with("?:")
+    };
     let mut in_str: Option<u8> = None;
     let mut i = 0;
     while i < scan_end {
@@ -1663,6 +1675,15 @@ fn find_mid_expression_questionmarks(code: &str) -> Vec<usize> {
             continue;
         }
         if b == b'?' && i > 0 && bytes[i - 1] == b')' {
+            // Inside a single-line `with`-chain, `)?,` and `)?:` are
+            // binding terminators handled by `expand_with_chains`.
+            if is_with_chain_line
+                && i + 1 < bytes.len()
+                && (bytes[i + 1] == b',' || bytes[i + 1] == b':')
+            {
+                i += 1;
+                continue;
+            }
             out.push(i);
         }
         i += 1;
@@ -1798,7 +1819,19 @@ fn extract_return_type_text(def_line: &str) -> Option<String> {
 /// This function is called **before** [`preprocess`] in the build pipeline.
 /// It is deliberately *not* called by `tyc fmt` or the check pipeline (which
 /// use [`preprocess`]'s simpler `import MODULE as ALIAS` conversion instead).
+/// Like [`expand_lazy_imports`] but only rewrites `lazy let` bindings; `lazy
+/// import` lines are left untouched so that downstream passes (notably
+/// [`preprocess`]) can still recognise them and populate the lazy-import
+/// metadata used by the unused-import diagnostic.
+pub fn expand_lazy_lets(source: &str) -> String {
+    expand_lazy_imports_with(source, false)
+}
+
 pub fn expand_lazy_imports(source: &str) -> String {
+    expand_lazy_imports_with(source, true)
+}
+
+fn expand_lazy_imports_with(source: &str, rewrite_imports: bool) -> String {
     let mut result = String::with_capacity(source.len() + 256);
     // Track triple-quoted string state so that a `lazy import` that appears
     // inside a docstring or multiline string is never mistakenly rewritten.
@@ -1843,9 +1876,20 @@ pub fn expand_lazy_imports(source: &str) -> String {
         }
 
         // Push a new entry when we enter a `class …:` or `def …:` block.
+        // `impl …:` and `extend …:` are Typhon-only forms that lower to a
+        // class body later in the pipeline; treat them as class-bodies here
+        // so a `lazy let` inside is recognised as a class-body binding.
         // The body of the block sits at a deeper indent than `indent_len`,
         // so subsequent lines compare against `indent_len`.
         if let Some(rest) = trimmed.strip_prefix("class ") {
+            if rest.contains(':') {
+                block_stack.push((indent_len, true));
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("impl ") {
+            if rest.contains(':') {
+                block_stack.push((indent_len, true));
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("extend ") {
             if rest.contains(':') {
                 block_stack.push((indent_len, true));
             }
@@ -1860,7 +1904,7 @@ pub fn expand_lazy_imports(source: &str) -> String {
         }
 
         // ── `lazy import ALIAS = MODULE` ───────────────────────────────────
-        if indent_len == 0 {
+        if rewrite_imports && indent_len == 0 {
             if let Some(after) = trimmed.strip_prefix("lazy import ") {
                 if let Some((alias, module)) = parse_lazy_import(after) {
                     let mut proxy = String::new();
@@ -1937,7 +1981,7 @@ pub fn expand_lazy_imports(source: &str) -> String {
         header.push_str("from typhon_runtime.lazy import lazy_let as __typhon_lazy_let\n");
     }
     if needs_cached_property_import {
-        header.push_str("from functools import cached_property as __typhon_cached_property\n");
+        header.push_str("from functools import cached_property as _typhon_cached_property\n");
     }
 
     if header.is_empty() {
@@ -2151,7 +2195,7 @@ fn render_cached_property(indent: &str, binding: &LazyLetBinding) -> String {
         .map(|t| format!(" -> {}", t))
         .unwrap_or_default();
     format!(
-        "{indent}@__typhon_cached_property\n{indent}def {name}(self){ret}:\n{indent}    return {expr}\n",
+        "{indent}@_typhon_cached_property\n{indent}def {name}(self){ret}:\n{indent}    return {expr}\n",
         indent = indent,
         name = binding.name,
         ret = ret,
@@ -2720,7 +2764,7 @@ pub fn expand_with_chains(source: &str) -> String {
         let body = &raw[indent_len..];
 
         if let Some(rest) = body.strip_prefix("with ") {
-            if let Some((first_binding, first_term)) = parse_with_binding(rest) {
+            if let Some((inline_bindings, first_term)) = parse_inline_with_bindings(rest) {
                 // Re-scan the binding line's string state so the continuation
                 // scanner picks up unfinished triple-quoted strings correctly.
                 let mut state_for_chain = pre_string;
@@ -2730,7 +2774,7 @@ pub fn expand_with_chains(source: &str) -> String {
                     &lines,
                     i,
                     chain_indent,
-                    first_binding,
+                    inline_bindings,
                     first_term,
                     state_for_chain,
                 ) {
@@ -2780,6 +2824,87 @@ struct WithChain {
     else_body: Vec<String>,
 }
 
+/// Parse one or more inline `name = expr?,` bindings followed by a final
+/// `name = expr?:` binding on a single `with` line. Returns the collected
+/// bindings and the terminator character of the *last* binding, which will
+/// be `:` for a complete inline chain and `,` when the chain continues onto
+/// the next line.
+fn parse_inline_with_bindings(s: &str) -> Option<(Vec<WithBinding>, char)> {
+    // Strip any trailing `# comment` (string-aware) before slicing so a
+    // chain like `with a = f()?: # ok` parses the same as without the
+    // comment.
+    let without_comment = strip_trailing_comment(s);
+    let trimmed = without_comment.trim_end();
+    // Walk top-level (`?,` or `?:`) terminators, slicing each binding segment.
+    let bytes = trimmed.as_bytes();
+    let mut bindings = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i32;
+    let mut in_str: Option<u8> = None;
+    let mut i = 0usize;
+    let mut last_term: Option<char> = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => in_str = Some(b),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'?' if depth == 0 && i + 1 < bytes.len() => {
+                let next = bytes[i + 1];
+                if next == b',' || next == b':' {
+                    let term = if next == b',' { ',' } else { ':' };
+                    let segment = &trimmed[start..=i + 1];
+                    let (binding, t) = parse_with_binding(segment)?;
+                    if t != term {
+                        return None;
+                    }
+                    bindings.push(binding);
+                    last_term = Some(term);
+                    i += 2;
+                    // Skip whitespace before the next binding.
+                    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                        i += 1;
+                    }
+                    start = i;
+                    if term == ':' {
+                        // Inline head ended; anything trailing means malformed.
+                        if i != bytes.len() {
+                            return None;
+                        }
+                        break;
+                    }
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if bindings.is_empty() {
+        return None;
+    }
+    // If we exited without seeing a final `?:`, the chain continues on the
+    // next line — require the trailing terminator on the last binding to be
+    // `,` so the multi-line scanner can resume.
+    let term = last_term?;
+    if term == ',' && start != bytes.len() {
+        // There's trailing junk after the last `?,` on this line.
+        return None;
+    }
+    Some((bindings, term))
+}
+
 /// Parse one `name = expr?(,|:)` segment from the tail of a binding line.
 ///
 /// Returns the binding plus the terminator character (`,` or `:`).
@@ -2819,11 +2944,11 @@ fn collect_chain(
     lines: &[&str],
     start: usize,
     chain_indent: &str,
-    first_binding: WithBinding,
+    inline_bindings: Vec<WithBinding>,
     first_term: char,
     initial_string_state: Option<StringMode>,
 ) -> Option<(WithChain, usize, Option<StringMode>)> {
-    let mut bindings = vec![first_binding];
+    let mut bindings = inline_bindings;
     let mut idx = start + 1;
     let mut term = first_term;
     let mut in_string = initial_string_state;
@@ -5509,11 +5634,11 @@ def run() -> Result[str, str]:
         let src = "class Foo:\n    lazy let expensive: int = compute()\n";
         let out = expand_lazy_imports(src);
         assert!(
-            out.contains("from functools import cached_property as __typhon_cached_property"),
+            out.contains("from functools import cached_property as _typhon_cached_property"),
             "class-body lazy let should inject cached_property import; got:\n{out}"
         );
         assert!(
-            out.contains("@__typhon_cached_property"),
+            out.contains("@_typhon_cached_property"),
             "class-body lazy let should emit the @cached_property decorator; got:\n{out}"
         );
         assert!(
@@ -5523,6 +5648,24 @@ def run() -> Result[str, str]:
         assert!(
             out.contains("return compute()"),
             "class-body lazy let body should return the expr; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn expand_lazy_let_inside_impl_block_lowers_to_cached_property() {
+        let src = "class Service:\n    base: int\n\nimpl Service:\n    lazy let derived: int = self.base * 10\n";
+        let out = expand_lazy_imports(src);
+        assert!(
+            out.contains("@_typhon_cached_property"),
+            "impl-block lazy let should emit the @cached_property decorator; got:\n{out}"
+        );
+        assert!(
+            out.contains("def derived(self) -> int:"),
+            "impl-block lazy let should emit a method signature; got:\n{out}"
+        );
+        assert!(
+            !out.contains("lazy let derived"),
+            "impl-block lazy let must be rewritten; got:\n{out}"
         );
     }
 

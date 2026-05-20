@@ -12,12 +12,12 @@ A `.dty` stub describes a Python module's API in Typhon's strict dialect (`T?`, 
 
 ## File location
 
-Place `.dty` files anywhere in the project tree (commonly `stubs/<module>.dty`). `tyc check --stubs` walks the project tree to find them.
+Place `.dty` files inside your configured `src/` directory (commonly `src/stubs/<module>.dty`). `tyc build` and `tyc check --stubs` pick up every `.dty` under `src/`; files outside that directory are not scanned.
 
 ## Example
 
 ```python
-# stubs/redis.dty
+# src/stubs/redis.dty
 class Redis:
     host: str
     port: int
@@ -60,7 +60,7 @@ Standard PEP 561 stub. Method bodies become `...`.
 
 If you're stubbing a module you don't own (e.g. `redis-py`):
 
-1. Write `stubs/redis.dty`.
+1. Write `src/stubs/redis.dty`.
 2. Run `tyc check --stubs` to confirm the stub matches the runtime module's surface.
 3. Update the stub when the library upgrades and `tyc check --stubs` complains.
 
@@ -78,7 +78,7 @@ You'd write a `.dty` only if you want to expose a stricter API surface in Typhon
 ### Optional return that's also nullable
 
 ```python
-# stubs/db.dty
+# src/stubs/db.dty
 impl Database:
     def find_user(self, id: int) -> User?      # may be None
 ```
@@ -86,7 +86,7 @@ impl Database:
 ### Generic methods
 
 ```python
-# stubs/cache.dty
+# src/stubs/cache.dty
 class Cache[K, V]:
     def get(self, key: K) -> V?
     def put(self, key: K, value: V) -> None
@@ -95,7 +95,7 @@ class Cache[K, V]:
 ### Class hierarchies
 
 ```python
-# stubs/orm.dty
+# src/stubs/orm.dty
 class Model:
     id: int
 

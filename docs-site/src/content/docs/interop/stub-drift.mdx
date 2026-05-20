@@ -70,7 +70,7 @@ The runtime probe is slower (it imports the module), so consider nightly rather 
 
 ## Recommended workflow
 
-1. **Write the stub.** `stubs/<library>.dty`.
+1. **Write the stub.** `src/stubs/<library>.dty` (anywhere under your configured `src/` directory).
 2. **Run `tyc check --stubs`** to verify the AST surface matches.
 3. **Run `tyc stubtest`** to catch dynamic mismatches.
 4. **Add both to CI** so library upgrades surface drift immediately.

@@ -252,7 +252,7 @@ For anything long-lived, write a `.dty` stub instead.
 - Emit a `.pyi` companion next to the `.py` so mypy/pyright/etc. also benefit.
 
 ```python
-# stubs/redis.dty
+# src/stubs/redis.dty
 class Redis:
     host: str
     port: int

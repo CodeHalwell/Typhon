@@ -134,6 +134,10 @@ Roughly 140 cases run through `tyc build`. Of those:
 
 ### R3.1 — Walrus parens dropped at emission (CRITICAL, silent)
 
+**Status: FIXED** on `claude/resolve-open-findings-v6t65`. `Expr::Named`
+in `tyc-emit/src/printer.rs` now wraps the binding expression in
+`(...)`, so `if (n := len(xs)) > 3:` round-trips correctly.
+
 ```python
 def main() -> None:
     let xs: list[int] = [1, 2, 3, 4, 5]
@@ -171,6 +175,13 @@ Fix lives in the printer; binding-expression printing needs to retain the
 parentheses (or know it needs them based on surrounding precedence).
 
 ### R3.2 — Class field defaults destroyed by `slots=True` (CRITICAL, silent)
+
+**Status: FIXED** on `claude/resolve-open-findings-v6t65`. New warning
+`tyc::class_attr_shadows_slot` fires when a class body holds only
+defaulted `NAME: T = literal` fields, no methods, and no impl extension.
+Help text points users at `ClassVar[T]`. Promotion to error left as a
+v0.2 follow-up.
+
 
 ```python
 class HTTP:
@@ -211,6 +222,12 @@ Suggested fix surface (one of):
 
 ### R3.3 — Inline `with`-chain without `else err:` mis-parses
 
+**Status: FIXED** on `claude/resolve-open-findings-v6t65`.
+`expand_with_chains` accepts comma-separated bindings on a single line
+and the question-op validator carves out trailing `?:` / `?,` on `with`
+lines, so the bodyless form lowers through the normal `?` propagation.
+
+
 ```python
 def runner(x: int) -> Result[int, str]:
     with a = f(x)?, b = g(a)?:
@@ -236,6 +253,12 @@ prefer the Result-chain reading if any binding contains `?`.
 
 ### R3.4 — Aliased `lazy import` blows up at runtime (severe)
 
+**Status: FIXED** on `claude/resolve-open-findings-v6t65`. Replaced the
+`importlib.util.LazyLoader`-backed proxy with a plain `__getattr__`-style
+`_LazyModule` that delegates via `importlib.import_module`. No
+`sys.modules` substitution, so aliased and bare lazy imports both run.
+
+
 ```python
 lazy import np = json
 
@@ -258,6 +281,14 @@ Likely cause: the bespoke proxy class is registering itself under the
 so `importlib`'s reverse lookup detects the substitution and refuses.
 
 ### R3.5 — `lazy let` inside `impl` block doesn't lower to `@cached_property`
+
+**Status: FIXED** on `claude/resolve-open-findings-v6t65`. The
+`expand_lazy_lets` pass now recognises `impl`/`extend` headers as
+class-body contexts and lowers `lazy let X: T = ...` to a `cached_property`
+method. Also drops `slots=True` for classes containing one (slots
+conflict with `__dict__`) and teaches `tyc-types` that `cached_property`
+is a property-style decorator.
+
 
 ```python
 class Service:
@@ -303,7 +334,20 @@ Repro: `cases/130_string_concat.ty`, `cases/131_binop_type_mismatch.ty`.
 `tyc check`; users running CI won't catch operator-type mistakes until
 the test suite runs the line.
 
+**Status: FIXED** on `claude/resolve-open-findings-v6t65`. The
+`Expr::BinOp` arm of `infer_expr_ctx` in `tyc-types` now emits a new
+`tyc::operator_type_mismatch` diagnostic for clearly-incompatible
+operand pairs on `+`, `-`, `*`, `/`, `//`, `%`, `**`. The check is
+conservative: anything involving `Any` / `Unknown` / a TypeVar / a
+user-defined class (custom `__add__` / `__mul__`) is treated as
+possibly-compatible. Both repros now fail `tyc check`.
+
 ### R3.7 — Unknown kwarg to a constructor
+
+**Status: FIXED** on `claude/resolve-open-findings-v6t65`. Constructor
+kwargs are validated against the class field set, reusing the existing
+Levenshtein-best "did you mean" suggestion from #80.
+
 
 ```python
 class User:
@@ -321,6 +365,12 @@ unexpected keyword argument 'nmae'`. Since constructor signatures are
 statically known, the kwarg name typo should be flagged.
 
 ### R3.8 — Unknown field name in match pattern
+
+**Status: FIXED** on `claude/resolve-open-findings-v6t65`. Match-class
+patterns validate keyword field names against the class. Also closes
+the R3.12.f case (wrong positional arity) by routing it through
+`tyc::arg_count` instead of `tyc::missing_return`.
+
 
 ```python
 class Point:
@@ -363,6 +413,12 @@ truediv result `float`. Either:
 Either way the current behaviour silently produces a float in an int
 binding.
 
+**Status: FIXED** on `claude/resolve-open-findings-v6t65`. The
+BinOp result-type inference now always yields `Type::Float` for any
+numeric `/`, so `let i: int = a / b` for `a, b: int` fails the
+existing `tyc::type_mismatch` assignability check. Floor division
+(`//`) is unchanged and still preserves `int // int -> int`.
+
 ### R3.10 — Tuple index out of bounds at static type
 
 ```python
@@ -376,7 +432,20 @@ Repro: `cases/134_index_out_of_typed.ty`.
 Accepted at check time. Runtime: `IndexError`. The tuple arity is in
 the type — a constant-index lookup should be checkable.
 
+**Status: FIXED** on `claude/resolve-open-findings-v6t65`. The
+`Expr::Subscript` arm of `infer_expr_ctx` now bounds-checks constant
+integer indices into `Type::Generic("tuple", elts)` receivers. New
+diagnostic `tyc::tuple_index_out_of_range`. In-bounds constant
+indices resolve to the corresponding element type from the tuple
+type (used to be `Unknown`); negative indices in `-N..0` are accepted
+and resolve modulo arity.
+
 ### R3.11 — Pipe into method confuses arg-count check
+
+**Status: FIXED** on `claude/resolve-open-findings-v6t65`. Pipe-into-
+method calls now count `self` again. Fix lives in the attribute-resolution
+site rather than via preprocessor bookkeeping; composes with R3.16.
+
 
 ```python
 class Counter:
@@ -405,6 +474,14 @@ both `c.add(5)` and `Counter.add(c, 5)`). Two ways to fix:
 - Impl-method type metadata records both `(self, n)` and `(n)` shapes.
 
 ### R3.12 — Match exhaustiveness gaps (five concrete shapes)
+
+**Status: FIXED** on `claude/resolve-open-findings-v6t65`. Shapes (a)–
+(e) all recognised: kw-bind class wildcards, `[*xs]`-only sequences,
+guarded+unguarded same-class pairs, nested-match arm coverage, and
+`int() as n` / `list() as xs` bind patterns over recursive aliases.
+Shape (f) (wrong positional arity in class pattern) routed via the
+R3.8 fix to `tyc::arg_count`.
+
 
 Each of these surfaces as `tyc::missing_return` even though the function
 is actually total:
@@ -441,6 +518,13 @@ addressed — `?` in argument position is the natural style.
 
 ### R3.14 — `async def` without `await` still no warning (open: #83)
 
+**Status: FIXED** on `claude/resolve-open-findings-v6t65`.
+`tyc::async_without_await` now fires once per qualifying body. Carve-outs
+for declaration-only bodies (interfaces / Protocols), async generators
+(`yield`), and the existing async-protocol dunder list (`__aenter__`,
+`__aexit__`, `__aiter__`, `__anext__`).
+
+
 ```python
 async def fake() -> int:
     return 42
@@ -475,6 +559,11 @@ format`. Reality: it's near-identity.
 
 ### R3.16 — `@staticmethod` in `impl` mis-counts args
 
+**Status: FIXED** on `claude/resolve-open-findings-v6t65`.
+`@staticmethod` keeps its full param count; `@classmethod` drops only
+`cls`.
+
+
 ```python
 class Counter:
     value: int
@@ -496,12 +585,23 @@ stripped along with `self`.
 
 ### R3.17 — `stubs/` directory ignored (doc drift)
 
+**Status: FIXED (docs)** on `claude/resolve-open-findings-v6t65`. Every
+`stubs/<lib>.dty` example path in guides, skill, and docs site rewritten
+to `src/stubs/<lib>.dty` to match the actual compiler scan root.
+
+
 The guide shows `stubs/redis.dty` as the canonical location. In
 practice, only `.dty` files inside the configured `src/` directory are
 picked up by `tyc build`. Either the docs need to point at
 `src/stubs/foo.dty` or the compiler needs a configurable stubs root.
 
 ### R3.18 — Emitted `.pyi` carries `@dataclasses.dataclass(slots=True)`
+
+**Status: FIXED** on `claude/resolve-open-findings-v6t65`. `.pyi` emit
+strips `@dataclasses.dataclass(...)` decorators, drops field defaults,
+and prunes the `import dataclasses` line when nothing else references
+it.
+
 
 ```python
 # stubs.dty

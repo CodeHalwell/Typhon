@@ -14,7 +14,9 @@
 //! consume directly. The `.dty` source remains the authoritative document for
 //! Typhon-internal use; `.pyi` is for the outside world.
 
-use ruff_python_ast::{AtomicNodeIndex, Expr, ExprEllipsisLiteral, ModModule, Stmt, StmtExpr};
+use ruff_python_ast::{
+    AtomicNodeIndex, Decorator, Expr, ExprEllipsisLiteral, ModModule, Stmt, StmtExpr,
+};
 use ruff_text_size::TextRange;
 
 use crate::printer::Emitter;
@@ -39,14 +41,19 @@ fn strip_to_stubs(body: &[Stmt]) -> Vec<Stmt> {
             out.push(stripped);
         }
     }
+    prune_unused_dataclasses_import(&mut out);
     out
 }
 
 fn stub_stmt(stmt: &Stmt) -> Option<Stmt> {
     match stmt {
-        // Pass-through statements that carry public-API information.
-        Stmt::Import(_) | Stmt::ImportFrom(_) | Stmt::AnnAssign(_) | Stmt::TypeAlias(_) => {
-            Some(stmt.clone())
+        Stmt::Import(_) | Stmt::ImportFrom(_) | Stmt::TypeAlias(_) => Some(stmt.clone()),
+        Stmt::AnnAssign(a) => {
+            // Drop any `= default` — stubs annotate types, they don't
+            // carry implementation-supplied defaults.
+            let mut new_a = a.clone();
+            new_a.value = None;
+            Some(Stmt::AnnAssign(new_a))
         }
         // `StmtFunctionDef` now covers both sync and async functions via
         // `is_async`; the body-rewrite is identical in both cases.
@@ -57,6 +64,12 @@ fn stub_stmt(stmt: &Stmt) -> Option<Stmt> {
         }
         Stmt::ClassDef(c) => {
             let mut new_c = c.clone();
+            // Strip `@dataclasses.dataclass(...)` / `@dataclass(...)`
+            // decorators — they're an implementation choice that doesn't
+            // belong on the stub surface. Other decorators
+            // (`@functools.cached_property`, user-authored ones) stay
+            // because they're part of the consumer-visible API.
+            new_c.decorator_list.retain(|d| !is_dataclass_decorator(d));
             let mut body = Vec::new();
             for s in &c.body {
                 if let Some(kept) = stub_stmt(s) {
@@ -72,6 +85,67 @@ fn stub_stmt(stmt: &Stmt) -> Option<Stmt> {
         // Plain `Assign` is dropped — without an annotation we can't infer the
         // consumer-visible type, so it's not stub material.
         _ => None,
+    }
+}
+
+fn is_dataclass_decorator(d: &Decorator) -> bool {
+    // Accept the call form `@dataclasses.dataclass(...)` /
+    // `@dataclass(...)` and the bare-reference form
+    // `@dataclasses.dataclass` / `@dataclass`.
+    let target = match &d.expression {
+        Expr::Call(call) => call.func.as_ref(),
+        other => other,
+    };
+    match target {
+        Expr::Attribute(attr) => {
+            let head_is_dataclasses = matches!(
+                attr.value.as_ref(),
+                Expr::Name(n) if n.id.as_str() == "dataclasses"
+            );
+            head_is_dataclasses && attr.attr.as_str() == "dataclass"
+        }
+        Expr::Name(n) => n.id.as_str() == "dataclass",
+        _ => false,
+    }
+}
+
+fn import_uses_dataclasses(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Import(imp) => imp.names.iter().any(|a| a.name.as_str() == "dataclasses"),
+        _ => false,
+    }
+}
+
+fn stmt_references_dataclasses(stmt: &Stmt) -> bool {
+    struct Walker {
+        found: bool,
+    }
+    impl<'a> ruff_python_ast::visitor::source_order::SourceOrderVisitor<'a> for Walker {
+        fn visit_expr(&mut self, e: &'a Expr) {
+            if self.found {
+                return;
+            }
+            if let Expr::Name(n) = e {
+                if n.id.as_str() == "dataclasses" {
+                    self.found = true;
+                    return;
+                }
+            }
+            ruff_python_ast::visitor::source_order::walk_expr(self, e);
+        }
+    }
+    let mut w = Walker { found: false };
+    use ruff_python_ast::visitor::source_order::SourceOrderVisitor;
+    w.visit_stmt(stmt);
+    w.found
+}
+
+fn prune_unused_dataclasses_import(body: &mut Vec<Stmt>) {
+    let referenced = body
+        .iter()
+        .any(|s| !import_uses_dataclasses(s) && stmt_references_dataclasses(s));
+    if !referenced {
+        body.retain(|s| !import_uses_dataclasses(s));
     }
 }
 
@@ -158,5 +232,30 @@ mod tests {
         let s = stub("async def fetch(url: str) -> str:\n    return url\n");
         assert!(s.contains("async def fetch(url: str) -> str:"), "got: {s}");
         assert!(s.contains("..."), "got: {s}");
+    }
+
+    #[test]
+    fn dataclass_decorator_stripped() {
+        let s =
+            stub("import dataclasses\n@dataclasses.dataclass(slots=True)\nclass C:\n    x: int\n");
+        assert!(!s.contains("@dataclasses.dataclass"), "got: {s}");
+        assert!(!s.contains("import dataclasses"), "got: {s}");
+        assert!(s.contains("class C:"), "got: {s}");
+        assert!(s.contains("x: int"), "got: {s}");
+    }
+
+    #[test]
+    fn defaulted_field_default_dropped() {
+        let s = stub("class C:\n    x: int = 5\n");
+        assert!(s.contains("x: int"), "got: {s}");
+        assert!(!s.contains("= 5"), "default must be dropped: {s}");
+    }
+
+    #[test]
+    fn dataclasses_import_kept_when_referenced_elsewhere() {
+        let s = stub(
+            "import dataclasses\nFACTORY: dataclasses.Field = dataclasses.field()\nclass C:\n    x: int\n",
+        );
+        assert!(s.contains("import dataclasses"), "got: {s}");
     }
 }
