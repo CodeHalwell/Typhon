@@ -303,6 +303,14 @@ Repro: `cases/130_string_concat.ty`, `cases/131_binop_type_mismatch.ty`.
 `tyc check`; users running CI won't catch operator-type mistakes until
 the test suite runs the line.
 
+**Status: FIXED** on `claude/resolve-open-findings-v6t65`. The
+`Expr::BinOp` arm of `infer_expr_ctx` in `tyc-types` now emits a new
+`tyc::operator_type_mismatch` diagnostic for clearly-incompatible
+operand pairs on `+`, `-`, `*`, `/`, `//`, `%`, `**`. The check is
+conservative: anything involving `Any` / `Unknown` / a TypeVar / a
+user-defined class (custom `__add__` / `__mul__`) is treated as
+possibly-compatible. Both repros now fail `tyc check`.
+
 ### R3.7 — Unknown kwarg to a constructor
 
 ```python
@@ -363,6 +371,12 @@ truediv result `float`. Either:
 Either way the current behaviour silently produces a float in an int
 binding.
 
+**Status: FIXED** on `claude/resolve-open-findings-v6t65`. The
+BinOp result-type inference now always yields `Type::Float` for any
+numeric `/`, so `let i: int = a / b` for `a, b: int` fails the
+existing `tyc::type_mismatch` assignability check. Floor division
+(`//`) is unchanged and still preserves `int // int -> int`.
+
 ### R3.10 — Tuple index out of bounds at static type
 
 ```python
@@ -375,6 +389,14 @@ Repro: `cases/134_index_out_of_typed.ty`.
 
 Accepted at check time. Runtime: `IndexError`. The tuple arity is in
 the type — a constant-index lookup should be checkable.
+
+**Status: FIXED** on `claude/resolve-open-findings-v6t65`. The
+`Expr::Subscript` arm of `infer_expr_ctx` now bounds-checks constant
+integer indices into `Type::Generic("tuple", elts)` receivers. New
+diagnostic `tyc::tuple_index_out_of_range`. In-bounds constant
+indices resolve to the corresponding element type from the tuple
+type (used to be `Unknown`); negative indices in `-N..0` are accepted
+and resolve modulo arity.
 
 ### R3.11 — Pipe into method confuses arg-count check
 

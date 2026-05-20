@@ -4686,13 +4686,28 @@ silent / runtime-only bugs surfaced. Read in full at
   resolver then errors on `self`.
 - **R3.6** — operator type-checking is largely absent: `s: str + n: int`,
   `list + dict` etc. accepted at check time, runtime `TypeError`.
+  **Status: FIXED** on `claude/resolve-open-findings-v6t65`. The
+  `Expr::BinOp` arm in `tyc-types` now emits a new
+  `tyc::operator_type_mismatch` for clearly-incompatible operand pairs
+  on `+`, `-`, `*`, `/`, `//`, `%`, `**`; conservative — `Any` /
+  `Unknown` / TypeVars / user classes are treated as
+  possibly-compatible. Both repros now fail `tyc check`.
 - **R3.7** — wrong-kwarg constructor calls (`User(id=1, nmae="alice")`)
   not caught.
 - **R3.8** — wrong field name in match (`case Point(z=z):`) not caught.
 - **R3.9** — `int / int` assigned to an `int`-annotated binding accepted;
   runtime is `float`.
+  **Status: FIXED** on `claude/resolve-open-findings-v6t65`. The
+  BinOp result-type inference now always yields `Type::Float` for any
+  numeric `/`, so the assignability check flags the mismatch. Floor
+  division (`//`) is unchanged.
 - **R3.10** — `tuple[int, str][2]` (out-of-arity index) accepted at check
   time.
+  **Status: FIXED** on `claude/resolve-open-findings-v6t65`. The
+  `Expr::Subscript` arm bounds-checks constant integer indices into
+  `tuple[T1, T2, …]` receivers and emits a new
+  `tyc::tuple_index_out_of_range`. In-bounds constant indices now
+  resolve to the element type from the tuple type.
 - **R3.11** — `c |> Counter.add(5)` lowers to `Counter.add(c, 5)` but the
   type checker counts impl-method args without `self`, so it sees a 1-arg
   target and reports "got 2".
