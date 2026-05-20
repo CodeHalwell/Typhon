@@ -27,6 +27,55 @@ all pass.
 
 ## Deliberately deferred
 
+### Cross-module constructor / method arity checks — ✅ landed
+
+Cross-module constructor + method arity checks now fire for
+`from foo import Bar` style imports — both `.ty` source and `.dty`
+stubs flow through the same project-wide shape registry. The CLI
+(`tyc check` / `tyc build`) builds the registry once per invocation;
+the LSP rebuilds it on every check so the editor reacts to changes in
+sibling files within one keystroke.
+
+Both originally-listed limitations have been resolved in v0.2.0:
+
+- Bare `import M as N` followed by `N.SomeClass(...)` dotted access
+  is now wired via a new `Type::Module(name)` plus a per-checker
+  module registry that's consulted at attribute access. `from M
+  import X` and `import M [as N]; N.X(...)` both flow through the
+  same `tyc::arg_count` constructor / method arity checks.
+- The LSP no longer rebuilds the project shape registry from
+  scratch. A new salsa-tracked `module_shapes_query(file)` caches
+  shape extraction by file text, and the LSP backend keeps a
+  per-project-root `HashMap<dotted_name, SourceFile>` so cached
+  `SourceFile` handles survive across keystrokes. A keystroke in
+  one file only re-runs shape extraction for that file.
+
+Remaining limitations (smaller scope, tracked for future PRs):
+
+- Dotted-attribute annotations (`let c: f.Cls = …`) don't resolve to
+  the foreign class shape. The constructor call itself
+  arity-checks, but the binding lands as `Type::Unknown`, which
+  weakens downstream method-arity checks on that binding. Workaround:
+  use `from foo import Cls` or drop the annotation entirely.
+
+### Post-construction field-init audit — ✅ landed (tight scope)
+
+A new `tyc::missing_field_init` diagnostic catches the
+`X.__new__(X)` / `object.__new__(X)` bypass-construction patterns: if
+the instance escapes the function (return / call argument) without
+every required field assigned, the audit fires. Skipped inside
+`unsafe:` blocks. Dropped conservatively on `setattr`, on method
+calls, and on rebinding — false negatives are preferred to false
+positives.
+
+Out of scope (documented in the diagnostic's help text):
+
+- Container-literal escapes (`return [c]`, `return {"x": c}`).
+- Outer-scope assignment escapes.
+- Interprocedural reasoning (a method that does initialise fields
+  suppresses the audit; the audit can't tell which).
+- Subclass field tracking.
+
 ### Ruff parser fork — ✅ landed since this sprint
 
 This follow-up has been resolved. `ruff_python_parser`,

@@ -52,6 +52,35 @@ pub fn apply_strictness(diags: Diagnostics, config: &TyphonConfig) -> Diagnostic
     new_diags
 }
 
+/// Map a project-relative source file path to its dotted Python
+/// module name (e.g. `src/foo/bar.ty` with `src_root = "src"` →
+/// `foo.bar`). Used by the cross-module shape registry and by the
+/// unknown-import vetting pass so both keys match the resolver's
+/// `ImportInfo::module` value.
+pub fn path_to_dotted(path: &Path, src_root: &str) -> String {
+    let components: Vec<String> = path
+        .with_extension("")
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(os) => Some(os.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect();
+    let src_idx = components.iter().rposition(|c| c == src_root);
+    let tail: Vec<&str> = match src_idx {
+        Some(i) => components[i + 1..].iter().map(|s| s.as_str()).collect(),
+        None => components
+            .last()
+            .map(|s| vec![s.as_str()])
+            .unwrap_or_default(),
+    };
+    let mut tail = tail;
+    if tail.last().is_some_and(|s| *s == "__init__") {
+        tail.pop();
+    }
+    tail.join(".")
+}
+
 /// Recursively collect all `.ty` files under `root` in sorted order.
 ///
 /// Returns an error if `root` does not exist or cannot be read. Non-`.ty`

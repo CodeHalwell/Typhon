@@ -64,6 +64,28 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// An instance constructed via `X.__new__(X)` or
+    /// `object.__new__(X)` (bypassing the auto-generated `__init__`)
+    /// escapes — returned, passed as an argument — without every
+    /// required field having been assigned. Without this check, the
+    /// emitted Python would crash with `AttributeError` the first
+    /// time the missing field is read.
+    #[error("instance of `{class}` escapes without all required fields set; missing: {missing}")]
+    #[diagnostic(
+        code(tyc::missing_field_init),
+        url("https://typhon.dev/lang/diagnostics/missing_field_init"),
+        help("either assign every required field (`{first_missing} = …`) before this point, or use the normal `{class}(...)` constructor which enforces field initialisation at compile time.")
+    )]
+    MissingFieldInit {
+        class: String,
+        missing: String,
+        first_missing: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("instance escapes here with uninitialised field(s)")]
+        span: SourceSpan,
+    },
+
     /// A name is used but never declared in any enclosing scope.
     #[error("cannot find '{name}' in scope")]
     #[diagnostic(
@@ -1621,6 +1643,28 @@ impl TycError {
         Self::FrozenAssign {
             class: class.into(),
             field: field.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::MissingFieldInit`] diagnostic. `missing`
+    /// is the comma-separated list of unassigned required field
+    /// names; `first_missing` is the first one (also surfaced in the
+    /// help text so the user sees an actionable fix).
+    pub fn missing_field_init(
+        class: impl Into<String>,
+        missing: impl Into<String>,
+        first_missing: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::MissingFieldInit {
+            class: class.into(),
+            missing: missing.into(),
+            first_missing: first_missing.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

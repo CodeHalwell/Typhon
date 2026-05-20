@@ -23,7 +23,10 @@ use tower_lsp_server::ls_types::{
     TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
 };
 use tower_lsp_server::{jsonrpc, Client, LanguageServer, LspService, Server};
-use tyc_db::{check_source_file, preprocessed_text, resolved_module_arc, SourceFile, TycDatabase};
+use tyc_db::{
+    check_file_with_imports, check_source_file, module_shapes_query, preprocessed_text,
+    resolved_module_arc, ModuleShapes, SourceFile, TycDatabase,
+};
 use tyc_diagnostics::TycError;
 use tyc_resolve::{
     BindingKind, ClassKind, ImportInfo, Mutability, ResolveOptions, ResolvedModule, SymbolAtOffset,
@@ -89,6 +92,20 @@ pub struct Backend {
     /// request. Same locking shape as `introspection`: tokio outer,
     /// std inner because refresh + parse runs inside `spawn_blocking`.
     project_indexes: Arc<Mutex<HashMap<std::path::PathBuf, Arc<std::sync::Mutex<ProjectIndex>>>>>,
+    /// Per-project-root index of project source files registered with
+    /// the Salsa database. Used by the cross-module shape lookup so
+    /// `module_shapes_query` can cache extraction on file-text basis:
+    /// a keystroke in `src/main.ty` doesn't re-parse `src/clients.ty`.
+    ///
+    /// Outer key: project root path (the directory containing
+    /// `typhon.toml`). Inner: dotted module name (e.g. `"foo.bar"`)
+    /// → Salsa `SourceFile` handle.
+    ///
+    /// Entries are refreshed lazily inside `check_and_publish`: every
+    /// `.ty` / `.dty` file under the project's src tree is registered
+    /// (or its text re-uploaded via `set_text`) before the cross-
+    /// module shape map is assembled.
+    project_files: Arc<Mutex<HashMap<std::path::PathBuf, HashMap<String, SourceFile>>>>,
 }
 
 impl std::fmt::Debug for Backend {
@@ -163,14 +180,67 @@ impl Backend {
         // retrieved via `source_file.text(db)` when needed.
         {
             let mut docs = self.documents.lock().await;
-            docs.insert(uri_str, source_file);
+            docs.insert(uri_str.clone(), source_file);
         }
 
+        // Resolve the project root once on the async side so the
+        // blocking closure (which holds the salsa db lock) only needs
+        // the cheap filesystem walk + cached queries below.
+        let path_for_root = std::path::PathBuf::from(uri.path().as_str());
+        let workspace = find_workspace_layout(&path_for_root);
+        let project_files_arc = Arc::clone(&self.project_files);
+
+        let text_for_check = text.clone();
+        let uri_str_for_check = uri_str.clone();
         let result = tokio::task::spawn_blocking(move || {
             // Hold the mutex only for the duration of the salsa call.
             let mut db = db.blocking_lock();
+            // Build the project-wide shape registry inside the
+            // blocking closure so the salsa-cached
+            // `module_shapes_query` does the heavy lifting: only the
+            // file whose text actually changed re-runs the parse.
+            // `set_text` on a salsa input is a no-op when the new
+            // value matches, so re-uploading every file's on-disk
+            // text per check doesn't churn the cache. The currently-
+            // edited document uses its in-flight buffer text, not
+            // the on-disk content, so cross-module diagnostics
+            // update within one keystroke.
+            let project_shapes = if let Some((_root, src_dir)) = workspace.as_ref() {
+                let src_root_name = src_dir
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("src")
+                    .to_owned();
+                #[allow(clippy::explicit_auto_deref)]
+                std::sync::Arc::new(build_project_shapes_salsa(
+                    &mut *db,
+                    &project_files_arc,
+                    src_dir,
+                    &src_root_name,
+                    &uri_str_for_check,
+                    &text_for_check,
+                ))
+            } else {
+                std::sync::Arc::new(std::collections::HashMap::new())
+            };
             #[allow(clippy::explicit_auto_deref)]
-            let diags = check_source_file(&mut *db, source_file);
+            let diags = if project_shapes.is_empty() {
+                // No workspace layout discovered — fall back to the
+                // Salsa-cached per-file check so isolated edits keep
+                // the LSP cache warm.
+                check_source_file(&mut *db, source_file)
+            } else {
+                // Cross-module-aware check, backed by the Salsa
+                // `module_shapes_query` cache: unchanged sibling
+                // files reuse the cached extraction, so a keystroke
+                // in the open file only re-parses that one file.
+                check_file_with_imports(
+                    &mut *db,
+                    uri_str_for_check,
+                    text_for_check,
+                    &project_shapes,
+                )
+            };
             // Retrieve the preprocessed source for diagnostic position
             // mapping.  After `check_source_file` runs the full pipeline the
             // Salsa `preprocessed_text` query is populated; hover/definition
@@ -891,6 +961,189 @@ fn from_hex(b: u8) -> Option<u8> {
     }
 }
 
+/// Salsa-backed project shape registry builder.
+///
+/// Walks every `.ty` / `.dty` file under `src_dir`, ensures each one
+/// is registered as a [`SourceFile`] input in the Salsa database, and
+/// then queries [`module_shapes_query`] for each. Salsa's input
+/// equality check means re-uploading on-disk text that hasn't changed
+/// is a no-op; the per-file `module_shapes_query` cache then returns
+/// immediately. Net result: a keystroke in `main.ty` only triggers
+/// shape extraction for `main.ty`, not every sibling.
+///
+/// `current_uri` + `current_text` carry the in-flight editor buffer
+/// for the document currently being checked. That text is uploaded
+/// via `set_text` (or used to create a fresh `SourceFile`) so
+/// cross-module diagnostics react to unsaved changes within one
+/// keystroke.
+///
+/// `project_files` is the per-project handle table that survives
+/// across calls — without it we'd create a new `SourceFile` on every
+/// keystroke and the per-file salsa cache would never hit.
+///
+/// `.dty` stubs are registered first; the second pass over `.ty`
+/// files skips dotted names already in the map so authored stubs
+/// remain the authoritative surface for any module.
+fn build_project_shapes_salsa(
+    db: &mut TycDatabase,
+    project_files: &Arc<Mutex<HashMap<std::path::PathBuf, HashMap<String, SourceFile>>>>,
+    src_dir: &std::path::Path,
+    src_root_name: &str,
+    current_uri: &str,
+    current_text: &str,
+) -> std::collections::HashMap<String, ModuleShapes> {
+    let project_root = src_dir
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| src_dir.to_path_buf());
+
+    let mut shapes: std::collections::HashMap<String, ModuleShapes> =
+        std::collections::HashMap::new();
+
+    let mut per_project = project_files.blocking_lock();
+    let entries = per_project.entry(project_root.clone()).or_default();
+
+    // `.dty` stubs first, so `.ty` insertions skip them on
+    // collisions — authored stubs are the source of truth.
+    let dty_files = collect_files_with_ext(src_dir, "dty");
+    for file in &dty_files {
+        let dotted = path_to_dotted(file, src_root_name);
+        if shapes.contains_key(&dotted) {
+            continue;
+        }
+        // Prefer the editor buffer for the currently-edited file,
+        // disk for everything else. Skip files we can't read.
+        let text = if uri_matches_path(current_uri, file) {
+            current_text.to_owned()
+        } else {
+            match std::fs::read_to_string(file) {
+                Ok(t) => t,
+                Err(_) => continue,
+            }
+        };
+        let source_file = upsert_source_file(db, entries, &dotted, file, text);
+        shapes.insert(dotted, (*module_shapes_query(db, source_file).0).clone());
+    }
+
+    let ty_files = collect_files_with_ext(src_dir, "ty");
+    for file in &ty_files {
+        let dotted = path_to_dotted(file, src_root_name);
+        if shapes.contains_key(&dotted) {
+            continue;
+        }
+        let text = if uri_matches_path(current_uri, file) {
+            current_text.to_owned()
+        } else {
+            match std::fs::read_to_string(file) {
+                Ok(t) => t,
+                Err(_) => continue,
+            }
+        };
+        let source_file = upsert_source_file(db, entries, &dotted, file, text);
+        shapes.insert(dotted, (*module_shapes_query(db, source_file).0).clone());
+    }
+
+    shapes
+}
+
+/// Locate or create the Salsa `SourceFile` handle for a project
+/// module. If we already have a handle, push the new text through
+/// `set_text` (a no-op when content matches); otherwise allocate one
+/// via `SourceFile::new`. Either way, returns a handle that
+/// `module_shapes_query` can consume.
+fn upsert_source_file(
+    db: &mut TycDatabase,
+    entries: &mut HashMap<String, SourceFile>,
+    dotted: &str,
+    path: &std::path::Path,
+    text: String,
+) -> SourceFile {
+    if let Some(&sf) = entries.get(dotted) {
+        sf.set_text(db).to(text);
+        sf
+    } else {
+        let sf = SourceFile::new(db, path.display().to_string(), text);
+        entries.insert(dotted.to_owned(), sf);
+        sf
+    }
+}
+
+/// Recursive file collection that mirrors the CLI's
+/// `collect_with_ext` — copied here so this crate stays free of a
+/// reverse dependency on the CLI binary crate.
+fn collect_files_with_ext(root: &std::path::Path, ext: &str) -> Vec<std::path::PathBuf> {
+    let mut acc = Vec::new();
+    collect_files_inner(root, ext, &mut acc);
+    acc.sort();
+    acc
+}
+
+fn collect_files_inner(root: &std::path::Path, ext: &str, acc: &mut Vec<std::path::PathBuf>) {
+    if root.is_file() {
+        if root.extension().and_then(|e| e.to_str()) == Some(ext) {
+            acc.push(root.to_path_buf());
+        }
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with('.') || name == "__pycache__" {
+                    continue;
+                }
+            }
+        }
+        collect_files_inner(&path, ext, acc);
+    }
+}
+
+/// Map a file path to its dotted Python module name. Identical
+/// semantics to `tyc::commands::util::path_to_dotted` (kept private
+/// here so the LSP crate doesn't need to depend on the CLI binary
+/// crate).
+fn path_to_dotted(path: &std::path::Path, src_root: &str) -> String {
+    let components: Vec<String> = path
+        .with_extension("")
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(os) => Some(os.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect();
+    let src_idx = components.iter().rposition(|c| c == src_root);
+    let tail: Vec<&str> = match src_idx {
+        Some(i) => components[i + 1..].iter().map(|s| s.as_str()).collect(),
+        None => components
+            .last()
+            .map(|s| vec![s.as_str()])
+            .unwrap_or_default(),
+    };
+    let mut tail = tail;
+    if tail.last().is_some_and(|s| *s == "__init__") {
+        tail.pop();
+    }
+    tail.join(".")
+}
+
+/// Best-effort check that an editor URI refers to the same file as
+/// `path`. Compares canonicalised forms so symlinks and `..` segments
+/// don't fool the equality check; falls back to suffix matching when
+/// canonicalisation fails (paths that don't exist yet, network FS).
+fn uri_matches_path(uri: &str, path: &std::path::Path) -> bool {
+    let Some(uri_path_str) = uri.strip_prefix("file://") else {
+        return false;
+    };
+    let uri_path = std::path::PathBuf::from(uri_path_str);
+    match (uri_path.canonicalize(), path.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => uri_path == path,
+    }
+}
+
 /// Walk up from `file_path` looking for a `typhon.toml`.  Returns
 /// `(project_root, src_dir)` — `src_dir` defaults to `project_root/src`
 /// when the toml does not specify, matching `tyc init`'s scaffolding.
@@ -1383,6 +1636,7 @@ pub fn run_stdio(log_level: LogLevel) {
             resolved_cache: Arc::new(Mutex::new(HashMap::new())),
             introspection: Arc::new(Mutex::new(HashMap::new())),
             project_indexes: Arc::new(Mutex::new(HashMap::new())),
+            project_files: Arc::new(Mutex::new(HashMap::new())),
         });
         Server::new(stdin, stdout, socket).serve(service).await;
     });

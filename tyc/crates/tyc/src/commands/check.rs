@@ -11,7 +11,7 @@ use clap::Args;
 use miette::{miette, Result};
 
 use tyc_analyse::{analyse_purity, evaluate_comptime_with_functions, purity_diagnostics};
-use tyc_db::{check_file, TycDatabase};
+use tyc_db::{check_file_with_imports, extract_shapes_for_path, TycDatabase};
 use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_emit::{compare_modules, StubTestKind};
 #[cfg(test)]
@@ -128,6 +128,29 @@ pub fn run(args: CheckArgs) -> Result<()> {
     // unknown-module pass reuses them via `check_unknown_modules_with`.
     let vetting_ctx = tyc_resolve::ImportVettingContext::new(&project_modules, &extra_modules);
 
+    // Project-wide shape registry: dotted module name → public class /
+    // function shapes the module exports. Built once before the per-file
+    // check loop so cross-module constructor / method arity validation
+    // can resolve a `from foo import ApiClient` against the `foo`
+    // module's `class ApiClient: api_key: str` declaration.
+    //
+    // `.dty` stubs and `.ty` source contribute on equal footing — both
+    // declare the Typhon-level surface, and the stub is the source of
+    // truth when both forms exist (the latter inserted second by
+    // iteration loses the `or_insert` race intentionally).
+    // `path_to_dotted` matches `src_root` by single-component
+    // equality, so pass the *basename* of the configured src
+    // directory. A `[project] src = "app/src"` setting would
+    // otherwise fall back to a basename-only dotted name and break
+    // cross-module shape lookup. FINDINGS — copilot review of
+    // v0.2.0.
+    let src_root_name = std::path::Path::new(&config.project.src)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&config.project.src)
+        .to_owned();
+    let project_shapes = std::sync::Arc::new(collect_project_shapes(&args.paths, &src_root_name));
+
     for root in &args.paths {
         for path in collect_ty_files(root)? {
             file_count += 1;
@@ -140,7 +163,12 @@ pub fn run(args: CheckArgs) -> Result<()> {
                 }
             };
 
-            let file_diags = check_file(&mut db, path.display().to_string(), source.clone());
+            let file_diags = check_file_with_imports(
+                &mut db,
+                path.display().to_string(),
+                source.clone(),
+                &project_shapes,
+            );
             diags.extend(file_diags);
 
             // Run comptime + purity analysis to match what `tyc build` would
@@ -177,7 +205,12 @@ pub fn run(args: CheckArgs) -> Result<()> {
                         continue;
                     }
                 };
-                let file_diags = check_file(&mut db, path.display().to_string(), source.clone());
+                let file_diags = check_file_with_imports(
+                    &mut db,
+                    path.display().to_string(),
+                    source.clone(),
+                    &project_shapes,
+                );
                 diags.extend(file_diags);
 
                 // Find the implementation module by stem.  Prefer a sibling
@@ -493,6 +526,50 @@ fn top_level_imports_from_venv(
 /// `src_root` is the basename of the configured source directory
 /// (e.g. `"src"` or `"app"`); it's matched by component-equality
 /// against the path. (Copilot review on PR #68, file check.rs:303.)
+/// Walk every `.ty` and `.dty` file under each search root and build
+/// the dotted-name → public-shape registry that
+/// [`check_file_with_imports`] consults. The dotted name uses the same
+/// `ty_path_to_dotted` helper as the unknown-import vetting pass, so a
+/// `from foo.bar import X` import lookup hits the file at
+/// `<src_root>/foo/bar.{ty,dty}`. `.dty` stubs win on duplicates
+/// (preferred since they're the authored Typhon surface).
+fn collect_project_shapes(
+    paths: &[PathBuf],
+    src_root: &str,
+) -> std::collections::HashMap<String, tyc_db::ModuleShapes> {
+    let mut shapes: std::collections::HashMap<String, tyc_db::ModuleShapes> =
+        std::collections::HashMap::new();
+    // Stubs first so the `.ty` insertion below skips them — `.dty`
+    // is the source of truth for the public Typhon surface.
+    for root in paths {
+        if let Ok(files) = collect_dty_files(root) {
+            for file in files {
+                let dotted = ty_path_to_dotted(&file, src_root);
+                if let Ok(text) = std::fs::read_to_string(&file) {
+                    shapes.entry(dotted).or_insert_with(|| {
+                        extract_shapes_for_path(&file.display().to_string(), &text)
+                    });
+                }
+            }
+        }
+        if let Ok(files) = collect_ty_files(root) {
+            for file in files {
+                let dotted = ty_path_to_dotted(&file, src_root);
+                if shapes.contains_key(&dotted) {
+                    continue;
+                }
+                if let Ok(text) = std::fs::read_to_string(&file) {
+                    shapes.insert(
+                        dotted,
+                        extract_shapes_for_path(&file.display().to_string(), &text),
+                    );
+                }
+            }
+        }
+    }
+    shapes
+}
+
 fn collect_project_modules(paths: &[PathBuf], src_root: &str) -> Vec<String> {
     let mut modules: Vec<String> = Vec::new();
     for root in paths {
@@ -509,33 +586,7 @@ fn collect_project_modules(paths: &[PathBuf], src_root: &str) -> Vec<String> {
 }
 
 fn ty_path_to_dotted(path: &std::path::Path, src_root: &str) -> String {
-    let components: Vec<String> = path
-        .with_extension("")
-        .components()
-        .filter_map(|c| match c {
-            std::path::Component::Normal(os) => Some(os.to_string_lossy().to_string()),
-            _ => None,
-        })
-        .collect();
-    // Trim leading source-root component so `<src_root>/main.ty`
-    // becomes `main`. Anything before the source root (an absolute
-    // path's leading directories) is dropped so the dotted-name
-    // reflects the package layout, not the filesystem layout.
-    let src_idx = components.iter().rposition(|c| c == src_root);
-    let tail: Vec<&str> = match src_idx {
-        Some(i) => components[i + 1..].iter().map(|s| s.as_str()).collect(),
-        None => components
-            .last()
-            .map(|s| vec![s.as_str()])
-            .unwrap_or_default(),
-    };
-    // Drop trailing `__init__` so a package directory is named by its
-    // folder, not the init module.
-    let mut tail = tail;
-    if tail.last().is_some_and(|s| *s == "__init__") {
-        tail.pop();
-    }
-    tail.join(".")
+    crate::commands::util::path_to_dotted(path, src_root)
 }
 
 /// FINDINGS #79: run `check_unknown_modules` for one source file. Parses
