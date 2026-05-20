@@ -98,6 +98,191 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 At the end of Phase 3, Typhon is useful for a real backend or CLI project.
 Everything beyond is polish and ambition.
 
+## Phase 5 — Interop and developer experience
+
+Phase 4+ is the "beyond v1" feature list. Phase 5 is the **friction
+list**: real adopters land on Typhon, hit the same handful of papercuts
+in the same order, and route around them. The pre-existing Phase-5
+deferrals (the AST-based reprinter and the source-mapping debugger)
+fold in here. Items are roughly ordered by how much they hurt; severity
+shown as `pain`, `gap`, `dx`, `dx-doc`.
+
+### 5.1 Class-emission reform — `pain`
+
+`class-default = "dataclass"` slaps `@dataclasses.dataclass(slots=True)`
+on every class. This breaks any framework that sets attributes
+dynamically (Textual, Pydantic v1, ORMs, metaclass-driven libraries)
+and silently breaks cooperative `__init__` chains because the generated
+`__init__` never calls `super().__init__()`. The only escape today is
+to write a counter-intuitive `@dataclasses.dataclass(init=False,
+slots=False, repr=False, eq=False)` decorator that *suppresses* tyc's
+own decorator. The semantics read as "I want this to be a dataclass"
+but mean "leave my class alone."
+
+Deliverables:
+
+- **Plain-class marker.** Reserve `plain class X:` (preferred —
+  symmetric with `frozen class X:`) *or* `@plain` (rejected as
+  unknown name today) for "regular Python class semantics, no
+  dataclass decoration." Document as the canonical Python-interop
+  escape hatch.
+- **Auto-skip when subclass isn't dataclass-friendly.** When a class
+  inherits from a known non-dataclass parent (`Protocol`, `Enum`,
+  `BaseModel`, `App`, `NamedTuple` already handled, plus user-marked
+  base classes), emit a plain class instead of a dataclass. Pair with
+  a list of "skip-decoration" base classes in `typhon.toml`.
+- **Validate `class-default` values.** Today `class-default = "plain"`,
+  `"regular"`, `"struct"`, `"none"` are silently identical to
+  `"dataclass"`. Reject unknown values with `tyc::invalid_config_value`
+  and validate at load time.
+- **Document the existing escape hatch.** The
+  `@dataclasses.dataclass(init=False, slots=False, ...)` no-op pattern
+  goes in `docs/guides/05-classes-and-models.md` as a transition
+  recipe, then is superseded by the plain-class marker.
+- **Together with strict typing**, `class-default = "dataclass"` makes
+  Python interop painful out of the box. The pitch "stricter superset
+  of Python" should hold for the standard Python idioms in the top-100
+  PyPI packages without ceremony — track this as the project-level
+  success metric for Phase 5.
+
+### 5.2 Python-semantic alignment in the type checker — `pain`
+
+The "stricter superset" promise breaks when the type checker rejects
+expressions that CPython evaluates without complaint. Two confirmed
+cases:
+
+- **`x or y` typed as `bool`.** Python's `or` returns the truthy
+  operand, not a bool. `let chunk: str = update.text or ""` rejects
+  with `expected str, found bool`. The fix is to type `or` / `and`
+  results as `Union[lhs_truthy_type, rhs_type]` (and the falsy dual
+  for `and`). Same for `not x` returning a structural bool. Diagnostic
+  message also needs softening — current text claims a mismatch that
+  doesn't exist at runtime.
+- **`Generator[T, None, None]` ↔ `Iterable[T]`.** A generator function
+  satisfies `Iterable[T]` at runtime. Refusing the conformance forces
+  users to rewrite `def compose(self) -> ComposeResult: yield ...`
+  into `-> list[Widget]: return [...]`. Teach the conformance check
+  that any generator type is structurally assignable to
+  `Iterable[T]` / `Iterator[T]` / `AsyncIterable[T]` / `AsyncIterator[T]`.
+
+These are the two found so far; the broader audit (a *Python-semantic
+regression sweep*) is the Phase 5 deliverable. Each accepted-by-Python
+shape that Typhon rejects becomes a `tyc::python_semantic_drift`
+warning during the audit and a `pain`-level fix afterward.
+
+### 5.3 Discoverability — `dx`
+
+Adopters today learn `mut`, `impl`, `interface`, and the class-default
+opt-out by running `tyc migrate` on hand-written Python, by brute-forcing
+class-declaration keywords, by reading diagnostic bodies, or — worst
+case — by `strings tyc | grep`. `tyc init` scaffolds a 5-line hello-
+world with no class, no methods, no `impl`, no `mut`. There is no
+`tyc explain`, no built-in cheat sheet, no docs link in `tyc --help`.
+
+Deliverables:
+
+- **`tyc init` scaffold upgrade.** The generated `src/main.ty` includes
+  a class with methods in an `impl` block, a `mut` binding, and a
+  `Result` example. The generated `typhon.toml` has every `[strictness]`
+  / `[emit]` key present with comments (especially `class-default`).
+- **`tyc explain <code>`** subcommand prints the catalog entry for a
+  diagnostic code with a short example and the canonical fix. Mirrors
+  `rustc --explain`.
+- **`tyc cheatsheet`** (or `tyc lang`) prints the 30-second cheat sheet
+  from the skill / docs to stdout.
+- **`tyc --help` footer** links the docs site, the language reference,
+  and explicitly mentions `tyc lsp` (most users will discover the LSP
+  via an editor plugin and never know the underlying binary).
+- **Promote `tyc migrate`.** It's the single best documentation tool
+  Typhon has — every keyword surfaces by example on real Python input.
+  Mention it in `tyc --help`, in the README quickstart, and in the
+  scaffolded `typhon.toml` comment block.
+
+### 5.4 `.py` interop in build output — `gap`
+
+Today, dropping a `helper.py` into `src/` lets `.ty` files import it
+for type-checking, but `tyc build` doesn't copy it to the output
+directory. The runtime then can't find it. This closes off the
+obvious escape hatch — "write the troublesome class in plain Python
+and import it" — exactly when class-emission reform (5.1) isn't done
+yet.
+
+Deliverables:
+
+- **Copy stray `.py` files in `src/`** to the build output verbatim.
+  Honour the same exclusion rules as `tyc check` (skip `tests/`,
+  `__pycache__/`, etc.).
+- **Diagnostic when the import points at a sibling `.py` that won't
+  be copied** (e.g. a relative import in a non-standard layout).
+  `tyc::orphan_py_import` warning.
+
+### 5.5 Diagnostic deep-links — `dx-doc`
+
+The Rust-style diagnostics are the project's strongest UX. The gap is
+that the *first* time a user sees `impl ChatApp:` referenced inside a
+warning, they have nothing to read about what `impl` is. Adding a
+diagnostic-specific docs URL to every `tyc::CODE` (via `miette`'s
+`url(...)` attribute or a CLI footer) closes the loop:
+
+```
+warning[tyc::method_in_class_body]: method 'compose' defined inside …
+  see https://typhon.dev/lang/impl for the full pattern
+```
+
+Deliverables:
+
+- Per-diagnostic URL in the diagnostics catalog, surfaced in the
+  rendered miette report and in `tyc explain <code>`.
+- One-page-per-code docs site section (or anchored sections in the
+  language reference).
+
+### 5.6 Build UX papercuts — `dx`
+
+- **`tyc build --check`** dry-run, mirroring `tyc fmt --check`. Lists
+  which output files would be created or overwritten; no writes.
+- **`class-default` validation.** Covered in 5.1 but worth restating —
+  any unknown value should fail config load, not silently behave like
+  `"dataclass"`.
+- **Comptime env-var template substitution.** Today `env("NAME")`
+  resolves at build time; extend `comptime let` to allow string
+  interpolation against env so secrets/config can be marked obviously
+  at the source level (e.g. `comptime let API_KEY: str = env("API_KEY")`
+  with build-time substitution and a `tyc::contains_secret_literal`
+  lint that flags emitted plain-text occurrences).
+
+### 5.7 The two existing Phase-5 deferrals — `gap`
+
+These were called out as "Phase-5" in earlier docs and remain here for
+completeness:
+
+- **`tyc fmt` — AST-based reprinter** (`tyc/crates/tyc-format/src/lib.rs:17`,
+  FINDINGS #18 / #65 / R3.15). The v1 formatter is whitespace and
+  bracket spacing only. Spacing around `:`, `=`, `->` is left alone
+  because it needs bracket-depth awareness (slice vs annotation). The
+  Phase-5 version is a Typhon-aware printer wrapped in `ruff format`,
+  with the configuration and the `--check` flag plumbed through.
+- **`tyc debug` — Typhon-native source-mapping debugger.** The v1
+  command is a thin wrapper around `pdb` over the emitted Python. The
+  Phase-5 version reads `.py.map` to map breakpoints and steps back
+  through to `.ty` source so users debug in Typhon, not in lowered
+  Python.
+
+### What's already great — keep it
+
+Crediting the parts of the experience that buy goodwill, so they don't
+regress under the Phase 5 churn:
+
+- The build pipeline is fast — parse → check → desugar → emit → format
+  in <100 ms for a real project.
+- The source-map (`.py.map`) story for tracebacks is well thought out
+  and `tyc trace` lands traceback frames on the original `.ty` lines.
+- Diagnostic prose: `cannot assign to immutable binding 'x'`,
+  `method 'compose' defined inside 'class Foo:' body — methods live
+  in 'impl Foo:'`, parse errors with exact byte ranges. The Rust-
+  influenced style is unambiguously better than mypy / ruff / pyright
+  in places. Phase 5 should layer documentation links on top of these,
+  not rewrite them.
+
 ## Phase 4+ — Beyond v1
 
 - ✅ **Automatic `asyncio.gather` inference** (conservative). Runs of two or
