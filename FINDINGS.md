@@ -4513,3 +4513,11 @@ fix lands as its own commit.
   be unslotted for the child to load. `class C(A, B)` with simple
   `class A` / `class B` now builds and runs.
 
+- **#105** `lazy let` print no longer shows `<lazy: unmaterialised>`
+  — added `__str__`, `__bool__`, `__eq__`, `__hash__`, and `__len__`
+  to `_LazyValue` in `typhon_runtime/lazy.py`. Each materialises the
+  underlying value before delegating, so `print(CFG)`,
+  `f"{CFG}"`, `if CFG:`, and `len(CFG)` all behave as if the user
+  had written the underlying value directly. `__repr__` keeps the
+  deliberate "don't materialise" debug behaviour.
+

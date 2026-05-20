@@ -832,6 +832,24 @@ class _LazyValue:
             return \"<lazy: unmaterialised>\"
         return repr(value)
 
+    def __str__(self) -> str:
+        # Materialise on `str(...)` / `print(...)` so the value is
+        # readable instead of the proxy's `<lazy: unmaterialised>`
+        # debug repr. FINDINGS #105.
+        return str(self._materialise())
+
+    def __bool__(self) -> bool:
+        return bool(self._materialise())
+
+    def __eq__(self, other: object) -> bool:
+        return self._materialise() == other
+
+    def __hash__(self) -> int:
+        return hash(self._materialise())
+
+    def __len__(self) -> int:
+        return len(self._materialise())
+
 
 _UNSET = object()
 
