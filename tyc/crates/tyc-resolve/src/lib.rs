@@ -218,41 +218,220 @@ pub struct ResolvedModule {
 /// matches here.
 pub fn python_stdlib_modules() -> &'static [&'static str] {
     &[
-        "__future__", "_thread", "abc", "aifc", "argparse", "array", "ast",
-        "asynchat", "asyncio", "asyncore", "atexit", "audioop", "base64",
-        "bdb", "binascii", "bisect", "builtins", "bz2", "calendar", "cgi",
-        "cgitb", "chunk", "cmath", "cmd", "code", "codecs", "codeop",
-        "collections", "colorsys", "compileall", "concurrent", "configparser",
-        "contextlib", "contextvars", "copy", "copyreg", "crypt", "csv",
-        "ctypes", "curses", "dataclasses", "datetime", "dbm", "decimal",
-        "difflib", "dis", "distutils", "doctest", "email", "encodings",
-        "ensurepip", "enum", "errno", "faulthandler", "fcntl", "filecmp",
-        "fileinput", "fnmatch", "fractions", "ftplib", "functools", "gc",
-        "genericpath", "getopt", "getpass", "gettext", "glob", "graphlib",
-        "grp", "gzip", "hashlib", "heapq", "hmac", "html", "http",
-        "idlelib", "imaplib", "imghdr", "imp", "importlib", "inspect", "io",
-        "ipaddress", "itertools", "json", "keyword", "lib2to3", "linecache",
-        "locale", "logging", "lzma", "mailbox", "mailcap", "marshal",
-        "math", "mimetypes", "mmap", "modulefinder", "msilib", "msvcrt",
-        "multiprocessing", "netrc", "nis", "nntplib", "ntpath", "numbers",
-        "opcode", "operator", "optparse", "os", "ossaudiodev", "parser",
-        "pathlib", "pdb", "pickle", "pickletools", "pipes", "pkgutil",
-        "platform", "plistlib", "poplib", "posix", "posixpath", "pprint",
-        "profile", "pstats", "pty", "pwd", "py_compile", "pyclbr", "pydoc",
-        "queue", "quopri", "random", "re", "readline", "reprlib", "resource",
-        "rlcompleter", "runpy", "sched", "secrets", "select", "selectors",
-        "shelve", "shlex", "shutil", "signal", "site", "smtpd", "smtplib",
-        "sndhdr", "socket", "socketserver", "spwd", "sqlite3", "sre_compile",
-        "sre_constants", "sre_parse", "ssl", "stat", "statistics", "string",
-        "stringprep", "struct", "subprocess", "sunau", "symtable", "sys",
-        "sysconfig", "syslog", "tabnanny", "tarfile", "telnetlib", "tempfile",
-        "termios", "test", "textwrap", "threading", "time", "timeit",
-        "tkinter", "token", "tokenize", "tomllib", "trace", "traceback",
-        "tracemalloc", "tty", "turtle", "turtledemo", "types", "typing",
-        "unicodedata", "unittest", "urllib", "uu", "uuid", "venv",
-        "warnings", "wave", "weakref", "webbrowser", "winreg", "winsound",
-        "wsgiref", "xdrlib", "xml", "xmlrpc", "zipapp", "zipfile", "zipimport",
-        "zlib", "zoneinfo",
+        "__future__",
+        "_thread",
+        "abc",
+        "aifc",
+        "argparse",
+        "array",
+        "ast",
+        "asynchat",
+        "asyncio",
+        "asyncore",
+        "atexit",
+        "audioop",
+        "base64",
+        "bdb",
+        "binascii",
+        "bisect",
+        "builtins",
+        "bz2",
+        "calendar",
+        "cgi",
+        "cgitb",
+        "chunk",
+        "cmath",
+        "cmd",
+        "code",
+        "codecs",
+        "codeop",
+        "collections",
+        "colorsys",
+        "compileall",
+        "concurrent",
+        "configparser",
+        "contextlib",
+        "contextvars",
+        "copy",
+        "copyreg",
+        "crypt",
+        "csv",
+        "ctypes",
+        "curses",
+        "dataclasses",
+        "datetime",
+        "dbm",
+        "decimal",
+        "difflib",
+        "dis",
+        "distutils",
+        "doctest",
+        "email",
+        "encodings",
+        "ensurepip",
+        "enum",
+        "errno",
+        "faulthandler",
+        "fcntl",
+        "filecmp",
+        "fileinput",
+        "fnmatch",
+        "fractions",
+        "ftplib",
+        "functools",
+        "gc",
+        "genericpath",
+        "getopt",
+        "getpass",
+        "gettext",
+        "glob",
+        "graphlib",
+        "grp",
+        "gzip",
+        "hashlib",
+        "heapq",
+        "hmac",
+        "html",
+        "http",
+        "idlelib",
+        "imaplib",
+        "imghdr",
+        "imp",
+        "importlib",
+        "inspect",
+        "io",
+        "ipaddress",
+        "itertools",
+        "json",
+        "keyword",
+        "lib2to3",
+        "linecache",
+        "locale",
+        "logging",
+        "lzma",
+        "mailbox",
+        "mailcap",
+        "marshal",
+        "math",
+        "mimetypes",
+        "mmap",
+        "modulefinder",
+        "msilib",
+        "msvcrt",
+        "multiprocessing",
+        "netrc",
+        "nis",
+        "nntplib",
+        "ntpath",
+        "numbers",
+        "opcode",
+        "operator",
+        "optparse",
+        "os",
+        "ossaudiodev",
+        "parser",
+        "pathlib",
+        "pdb",
+        "pickle",
+        "pickletools",
+        "pipes",
+        "pkgutil",
+        "platform",
+        "plistlib",
+        "poplib",
+        "posix",
+        "posixpath",
+        "pprint",
+        "profile",
+        "pstats",
+        "pty",
+        "pwd",
+        "py_compile",
+        "pyclbr",
+        "pydoc",
+        "queue",
+        "quopri",
+        "random",
+        "re",
+        "readline",
+        "reprlib",
+        "resource",
+        "rlcompleter",
+        "runpy",
+        "sched",
+        "secrets",
+        "select",
+        "selectors",
+        "shelve",
+        "shlex",
+        "shutil",
+        "signal",
+        "site",
+        "smtpd",
+        "smtplib",
+        "sndhdr",
+        "socket",
+        "socketserver",
+        "spwd",
+        "sqlite3",
+        "sre_compile",
+        "sre_constants",
+        "sre_parse",
+        "ssl",
+        "stat",
+        "statistics",
+        "string",
+        "stringprep",
+        "struct",
+        "subprocess",
+        "sunau",
+        "symtable",
+        "sys",
+        "sysconfig",
+        "syslog",
+        "tabnanny",
+        "tarfile",
+        "telnetlib",
+        "tempfile",
+        "termios",
+        "test",
+        "textwrap",
+        "threading",
+        "time",
+        "timeit",
+        "tkinter",
+        "token",
+        "tokenize",
+        "tomllib",
+        "trace",
+        "traceback",
+        "tracemalloc",
+        "tty",
+        "turtle",
+        "turtledemo",
+        "types",
+        "typing",
+        "unicodedata",
+        "unittest",
+        "urllib",
+        "uu",
+        "uuid",
+        "venv",
+        "warnings",
+        "wave",
+        "weakref",
+        "webbrowser",
+        "winreg",
+        "winsound",
+        "wsgiref",
+        "xdrlib",
+        "xml",
+        "xmlrpc",
+        "zipapp",
+        "zipfile",
+        "zipimport",
+        "zlib",
+        "zoneinfo",
     ]
 }
 
@@ -287,8 +466,7 @@ pub fn check_unknown_modules(
     use ruff_python_ast::Stmt;
 
     let mut diags = Diagnostics::new();
-    let stdlib: std::collections::HashSet<&str> =
-        python_stdlib_modules().iter().copied().collect();
+    let stdlib: std::collections::HashSet<&str> = python_stdlib_modules().iter().copied().collect();
     let project_roots: std::collections::HashSet<&str> = project_modules
         .iter()
         .map(|m| m.split('.').next().unwrap_or(m.as_str()))
@@ -323,10 +501,8 @@ pub fn check_unknown_modules(
                     for alias in &imp.names {
                         let module_name = alias.name.as_str();
                         if !is_resolvable(module_name) {
-                            let span = (
-                                alias.range.start().to_usize(),
-                                alias.range.end().to_usize(),
-                            );
+                            let span =
+                                (alias.range.start().to_usize(), alias.range.end().to_usize());
                             let length = span.1.saturating_sub(span.0).max(1);
                             diags.push_warning(TycError::unknown_module(
                                 module_name,
@@ -354,11 +530,7 @@ pub fn check_unknown_modules(
                             );
                             let length = span.1.saturating_sub(span.0).max(1);
                             diags.push_warning(TycError::unknown_module(
-                                name,
-                                path,
-                                source,
-                                span.0,
-                                length,
+                                name, path, source, span.0, length,
                             ));
                         }
                     }
@@ -1121,24 +1293,22 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt]) {
                         );
                         let length = imported_span.1.saturating_sub(imported_span.0).max(1);
                         if imported == "TypeVar" {
-                            r.diagnostics
-                                .push_error(TycError::typevar_import_rejected(
-                                    &r.path,
-                                    r.source,
-                                    imported_span.0,
-                                    length,
-                                ));
+                            r.diagnostics.push_error(TycError::typevar_import_rejected(
+                                &r.path,
+                                r.source,
+                                imported_span.0,
+                                length,
+                            ));
                         } else if let Some(lower) = lowercase_typing_alias(imported) {
-                            r.diagnostics.push_warning(
-                                TycError::typing_alias_deprecated(
+                            r.diagnostics
+                                .push_warning(TycError::typing_alias_deprecated(
                                     imported,
                                     lower,
                                     &r.path,
                                     r.source,
                                     imported_span.0,
                                     length,
-                                ),
-                            );
+                                ));
                         }
                     }
                     r.declare_with(
@@ -1279,9 +1449,7 @@ fn declare_target(
                 if let Some(existing) = r.lookup_local(scope, n.id.as_str()) {
                     if existing.kind == BindingKind::Value {
                         let decl_span = existing.span;
-                        if decl_span != span
-                            && r.seen_immutable_redecl.insert((decl_span, span))
-                        {
+                        if decl_span != span && r.seen_immutable_redecl.insert((decl_span, span)) {
                             r.diagnostics.push_error(TycError::no_block_shadow(
                                 n.id.as_str(),
                                 &r.path,
@@ -2611,15 +2779,10 @@ def foo():
         // FINDINGS #79: `from other import helper` where `other` is
         // neither in stdlib, the project, nor a declared dep.
         let module = parse_module("from other import helper\n");
-        let diags = check_unknown_modules(
-            "t.ty",
-            "from other import helper\n",
-            &module,
-            &[],
-            &[],
-        );
+        let diags = check_unknown_modules("t.ty", "from other import helper\n", &module, &[], &[]);
         assert!(
-            diags.warnings()
+            diags
+                .warnings()
                 .iter()
                 .any(|e| matches!(e, TycError::UnknownModule { module, .. } if module == "other")),
             "expected UnknownModule warning; got {:?}",
@@ -2694,13 +2857,7 @@ def foo():
         // Relative imports (`from .sibling import X`) aren't vettable
         // here — we don't model relative resolution. Just trust them.
         let module = parse_module("from . import sibling\n");
-        let diags = check_unknown_modules(
-            "t.ty",
-            "from . import sibling\n",
-            &module,
-            &[],
-            &[],
-        );
+        let diags = check_unknown_modules("t.ty", "from . import sibling\n", &module, &[], &[]);
         assert!(diags.warnings().is_empty(), "{:?}", diags.warnings());
     }
 

@@ -268,10 +268,7 @@ fn run_analysis_passes(path: &str, source: &str) -> Diagnostics {
 /// becomes `"pkg.sub"`; an `__init__.ty` collapses to its parent package
 /// name. Files outside any `src/` directory fall back to their basename
 /// so single-file scripts still resolve correctly.
-fn collect_project_modules(
-    paths: &[PathBuf],
-    _config_start: &std::path::Path,
-) -> Vec<String> {
+fn collect_project_modules(paths: &[PathBuf], _config_start: &std::path::Path) -> Vec<String> {
     let mut modules: Vec<String> = Vec::new();
     for root in paths {
         if let Ok(files) = collect_ty_files(root) {

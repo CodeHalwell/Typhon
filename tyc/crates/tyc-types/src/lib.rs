@@ -2629,9 +2629,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
         curr[0] = i;
         for j in 1..=b.len() {
             let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            curr[j] = (prev[j] + 1)
-                .min(curr[j - 1] + 1)
-                .min(prev[j - 1] + cost);
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -3424,10 +3422,7 @@ fn check_function(
 /// method declarations and abstract base-class methods from the
 /// missing-return check (FINDINGS #82).
 fn body_is_stub(body: &[Stmt]) -> bool {
-    let stmts: Vec<&Stmt> = body
-        .iter()
-        .filter(|s| !is_docstring_stmt(s))
-        .collect();
+    let stmts: Vec<&Stmt> = body.iter().filter(|s| !is_docstring_stmt(s)).collect();
     match stmts.as_slice() {
         [Stmt::Pass(_)] => true,
         [Stmt::Expr(e)] => matches!(e.value.as_ref(), Expr::EllipsisLiteral(_)),
@@ -4000,7 +3995,11 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         } else {
                             total <= params.len()
                         };
-                        if ok { ArityCheck::Ok } else { ArityCheck::Other }
+                        if ok {
+                            ArityCheck::Ok
+                        } else {
+                            ArityCheck::Other
+                        }
                     };
                     match arity_outcome {
                         ArityCheck::Ok => {}
@@ -4013,8 +4012,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                             // dedicated `tyc::unknown_kwarg` with the
                             // closest candidate, not an arg-count miscount.
                             let suggestion = suggest_candidate(&name, &candidates);
-                            let fn_label =
-                                fn_name.clone().unwrap_or_else(|| "<call>".to_owned());
+                            let fn_label = fn_name.clone().unwrap_or_else(|| "<call>".to_owned());
                             c.unknown_kwarg(&fn_label, &name, suggestion, span);
                         }
                         ArityCheck::Other => {
@@ -4241,8 +4239,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         // makes `unwrap(Just(value=5))` for
                         // `unwrap(m: Maybe[int])` bind T=int from the
                         // `Just[int]` variant inside `Maybe[int]`.
-                        let expected_unwrapped: Option<Type> =
-                            expected.map(|t| c.unwrap_alias(t));
+                        let expected_unwrapped: Option<Type> = expected.map(|t| c.unwrap_alias(t));
                         let pinned_args: Option<Vec<Type>> = match expected_unwrapped.as_ref() {
                             Some(Type::Generic(exp_name, exp_args))
                                 if exp_name == &name && exp_args.len() == tparams.len() =>
