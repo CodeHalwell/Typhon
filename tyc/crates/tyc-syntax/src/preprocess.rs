@@ -2361,6 +2361,15 @@ fn prepend_typhon_err_alias_import(body: String) -> String {
 
         if in_docstring.is_none() && (is_blank || is_comment || is_future || is_typhon_alias_import)
         {
+            // If the import we're about to inject is already present in
+            // the header, mark `inserted` so the trailing fallback
+            // doesn't append a duplicate. This keeps the generated
+            // Python tidy when both `expand_question_ops` and
+            // `expand_with_chains` produce `__typhon_Err__` references
+            // (each pipeline pass independently calls this helper).
+            if is_typhon_alias_import && trimmed == IMPORT_LINE.trim_end() {
+                inserted = true;
+            }
             out.push_str(line);
             idx = line_end;
             continue;
@@ -2387,9 +2396,14 @@ fn prepend_typhon_err_alias_import(body: String) -> String {
             continue;
         }
 
-        out.push_str(IMPORT_LINE);
+        // Found the first real code line. Inject the import here
+        // unless an identical line was already seen during the header
+        // scan (in which case `inserted` is already `true`).
+        if !inserted {
+            out.push_str(IMPORT_LINE);
+            inserted = true;
+        }
         out.push_str(&body[idx..]);
-        inserted = true;
         break;
     }
 

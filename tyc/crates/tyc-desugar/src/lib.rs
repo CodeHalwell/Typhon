@@ -1476,12 +1476,33 @@ fn collect_multi_base_parents_into(body: &[Stmt], parents: &mut std::collections
                 collect_multi_base_parents_into(&c.body, parents);
             }
             Stmt::FunctionDef(f) => {
+                // Ruff folds `async def` into the same `FunctionDef`
+                // node (with `is_async = true`), so this arm covers
+                // both sync and async function bodies.
                 collect_multi_base_parents_into(&f.body, parents);
             }
             Stmt::If(i) => {
                 collect_multi_base_parents_into(&i.body, parents);
                 for clause in &i.elif_else_clauses {
                     collect_multi_base_parents_into(&clause.body, parents);
+                }
+            }
+            Stmt::For(f) => {
+                // Ruff also folds `async for` into `For` (`is_async`).
+                collect_multi_base_parents_into(&f.body, parents);
+                collect_multi_base_parents_into(&f.orelse, parents);
+            }
+            Stmt::While(w) => {
+                collect_multi_base_parents_into(&w.body, parents);
+                collect_multi_base_parents_into(&w.orelse, parents);
+            }
+            Stmt::With(w) => {
+                // Ruff folds `async with` into `With` (`is_async`).
+                collect_multi_base_parents_into(&w.body, parents);
+            }
+            Stmt::Match(m) => {
+                for case in m.cases.iter() {
+                    collect_multi_base_parents_into(&case.body, parents);
                 }
             }
             Stmt::Try(t) => {
@@ -1549,7 +1570,10 @@ fn is_layout_neutral_base(base: &Expr) -> bool {
             _ => None,
         }
     }
-    matches!(last_name(base), Some("Protocol") | Some("Generic"))
+    matches!(
+        last_name(base),
+        Some("Protocol") | Some("Generic") | Some("object")
+    )
 }
 
 /// Return `true` if `c` inherits directly from `TypedDict`.

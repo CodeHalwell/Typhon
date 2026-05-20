@@ -532,21 +532,85 @@ fn sources_use_model_keyword(sources: &[(PathBuf, String)]) -> bool {
 }
 
 fn source_uses_model(text: &str) -> bool {
+    // Track triple-quoted string state so a docstring or SQL string
+    // containing a line starting with `model ` doesn't falsely flag
+    // the source as needing pydantic.
+    let mut in_triple: Option<&'static str> = None;
     for line in text.lines() {
         let trimmed = line.trim_start();
+
+        // Update triple-quote tracking before deciding whether this line
+        // is code: a `"""…"""` opener that doesn't close on the same line
+        // puts us into multi-line-string mode for subsequent lines.
+        let (next_state, line_starts_in_string) = update_triple_quote_state(line, in_triple);
+        let was_in_string = in_triple.is_some();
+        in_triple = next_state;
+        if was_in_string || line_starts_in_string {
+            continue;
+        }
+
         if !trimmed.starts_with("model ") {
             continue;
         }
+        // A line starting with `model ` only signals a model class when
+        // the next non-space char is an identifier character (so we
+        // reject `model "X":` and similar). Comments are already
+        // filtered out because `trim_start` leaves `#` in place.
         let after = &trimmed["model ".len()..];
-        // `model X:` starts with an identifier character — distinguish
-        // from a stray comment like `# model TODO:` (already stripped by
-        // trim_start of whitespace, not '#') and from a string literal.
         let first = after.chars().next();
         if matches!(first, Some(c) if c.is_ascii_alphabetic() || c == '_') {
             return true;
         }
     }
     false
+}
+
+/// Walk `line` and update the triple-quoted-string state. Returns the
+/// state at the end of the line plus a flag indicating whether the
+/// line *started* inside a string (in which case the caller treats it
+/// as pure string content). Handles both `"""` and `'''` delimiters
+/// and counts opener/closer pairs per line so a single-line
+/// `"""...""".format(...)` doesn't leave the scanner stuck.
+fn update_triple_quote_state(
+    line: &str,
+    mut state: Option<&'static str>,
+) -> (Option<&'static str>, bool) {
+    let started_in_string = state.is_some();
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    while i + 2 < bytes.len() + 1 {
+        let three = bytes.get(i..i + 3);
+        match (state, three) {
+            (None, Some(b"\"\"\"")) => {
+                state = Some("\"\"\"");
+                i += 3;
+                continue;
+            }
+            (None, Some(b"'''")) => {
+                state = Some("'''");
+                i += 3;
+                continue;
+            }
+            (Some("\"\"\""), Some(b"\"\"\"")) => {
+                state = None;
+                i += 3;
+                continue;
+            }
+            (Some("'''"), Some(b"'''")) => {
+                state = None;
+                i += 3;
+                continue;
+            }
+            _ => {}
+        }
+        // When outside a string, stop scanning at a `#` comment start so
+        // a `# """foo"""` comment doesn't toggle state.
+        if state.is_none() && bytes[i] == b'#' {
+            break;
+        }
+        i += 1;
+    }
+    (state, started_in_string)
 }
 
 /// Parse a `[python] target = "3.X"` string into its minor version.
