@@ -83,6 +83,12 @@ pub struct Backend {
             HashMap<std::path::PathBuf, Arc<std::sync::Mutex<venv_introspect::IntrospectionCache>>>,
         >,
     >,
+    /// Per-project-root auto-import index. Keyed on the directory
+    /// containing the project's `typhon.toml`; value is a Mutex-guarded
+    /// `ProjectIndex` that's refreshed lazily on every completion
+    /// request. Same locking shape as `introspection`: tokio outer,
+    /// std inner because refresh + parse runs inside `spawn_blocking`.
+    project_indexes: Arc<Mutex<HashMap<std::path::PathBuf, Arc<std::sync::Mutex<ProjectIndex>>>>>,
 }
 
 impl std::fmt::Debug for Backend {
@@ -335,44 +341,84 @@ impl LanguageServer for Backend {
         // `tokio::Mutex::blocking_lock` shape panicked outright.
         // `spawn_blocking` parks the work on Tokio's blocking thread
         // pool while the runtime keeps serving other requests.
-        let prefetched: HashMap<String, Vec<CompletionItem>> = {
-            let cache_handle = self.introspection_cache_for(&uri).await;
-            let cursor_offset = position_to_byte(&preprocessed, position);
-            let receiver = extract_member_access_receiver(&preprocessed, cursor_offset);
-            let from_import = extract_from_import_module(&preprocessed, cursor_offset);
-            // `candidate_module_paths` already returns unique paths, and
-            // the other two branches yield at most one element each — no
-            // dedup pass is needed.
-            let candidates: Vec<String> = match (&receiver, &from_import) {
-                (Some(r), _) => candidate_module_paths(&resolved, r, cursor_offset),
-                (None, Some(m)) => vec![m.clone()],
-                (None, None) => Vec::new(),
-            };
-            match cache_handle {
-                Some((root, cache)) if !candidates.is_empty() => {
-                    tokio::task::spawn_blocking(move || {
-                        let mut map: HashMap<String, Vec<CompletionItem>> = HashMap::new();
-                        // `lock()` on a poisoned std::Mutex returns `Err`;
-                        // recover the data anyway — poisoning came from a
-                        // panic in an earlier completion, which we
-                        // recorded as a `None` cache entry, so the next
-                        // request just re-runs the lookup.
-                        let mut guard = match cache.lock() {
-                            Ok(g) => g,
-                            Err(p) => p.into_inner(),
-                        };
-                        for module in candidates {
-                            if let Some(members) = guard.members(&root, &module) {
-                                map.insert(module, introspected_members_to_completion(&members));
-                            }
+        let cursor_offset = position_to_byte(&preprocessed, position);
+        let receiver = extract_member_access_receiver(&preprocessed, cursor_offset);
+        let from_import = extract_from_import_module(&preprocessed, cursor_offset);
+        // `candidate_module_paths` already returns unique paths, and the
+        // other two branches yield at most one element each — no dedup
+        // pass is needed.
+        let candidates: Vec<String> = match (&receiver, &from_import) {
+            (Some(r), _) => candidate_module_paths(&resolved, r, cursor_offset),
+            (None, Some(m)) => vec![m.clone()],
+            (None, None) => Vec::new(),
+        };
+        // Resolve project src_dir + the venv introspection cache up
+        // front (both need async locks), then hand the resulting handles
+        // to a single `spawn_blocking` task that does *all* the
+        // blocking work — file reads + parse + resolve for project
+        // modules, and the `.venv/bin/python` shell for venv ones.
+        // Doing both in one task keeps the LSP runtime responsive and
+        // avoids running synchronous compiler work on the async
+        // executor.
+        let project_src_dir = uri_to_path(&uri)
+            .and_then(|p| find_workspace_layout(&p))
+            .map(|(_, src)| src);
+        let venv_cache = self.introspection_cache_for(&uri).await;
+        let prefetched: HashMap<String, Vec<CompletionItem>> = if candidates.is_empty() {
+            HashMap::new()
+        } else {
+            let candidates_for_task = candidates.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut map: HashMap<String, Vec<CompletionItem>> = HashMap::new();
+                // Pass 1: project files. First-party `.ty`s win over
+                // venv-installed packages with the same import name
+                // (PYTHONPATH semantics) — we resolve them first and
+                // skip the venv pass for anything already populated.
+                //
+                // When the file *exists* but parse/resolve fails (a
+                // common mid-keystroke state on the file you're
+                // editing), claim the module for the project anyway
+                // by inserting an empty list. Falling through to venv
+                // would surface a *different* third-party package
+                // with the same import name — better to show "no
+                // suggestions" until the file parses again than to
+                // mislead with unrelated symbols.
+                if let Some(src_dir) = project_src_dir.as_ref() {
+                    for module in &candidates_for_task {
+                        if resolve_module_to_file(src_dir, module).is_some() {
+                            let items = project_module_members(src_dir, module).unwrap_or_default();
+                            map.insert(module.clone(), items);
                         }
-                        map
-                    })
-                    .await
-                    .unwrap_or_default()
+                    }
                 }
-                _ => HashMap::new(),
-            }
+                // Pass 2: venv introspection for whatever the project
+                // didn't cover.
+                if let Some((root, cache)) = venv_cache {
+                    // `lock()` on a poisoned std::Mutex returns `Err`;
+                    // recover the data anyway — poisoning came from a
+                    // panic in an earlier completion, which we recorded
+                    // as a `None` cache entry, so the next request just
+                    // re-runs the lookup.
+                    let mut guard = match cache.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    for module in &candidates_for_task {
+                        if map.contains_key(module) {
+                            continue;
+                        }
+                        if let Some(members) = guard.members(&root, module) {
+                            map.insert(
+                                module.clone(),
+                                introspected_members_to_completion(&members),
+                            );
+                        }
+                    }
+                }
+                map
+            })
+            .await
+            .unwrap_or_default()
         };
         let introspect_closure =
             |module: &str| -> Option<Vec<CompletionItem>> { prefetched.get(module).cloned() };
@@ -381,12 +427,76 @@ impl LanguageServer for Backend {
         } else {
             Some(&introspect_closure)
         };
-        let items = compute_completion_items_with_introspection(
+        let mut items = compute_completion_items_with_introspection(
             &resolved,
             &preprocessed,
             position,
             introspect_ref,
         );
+
+        // Auto-import suggestions: only meaningful in open-completion
+        // context (the receiver / from-import branches already return
+        // their own focused menus). For each top-level public symbol
+        // declared in some sibling `.ty` we don't currently have in
+        // scope, append a `CompletionItem` whose `additionalTextEdits`
+        // inserts the corresponding import when the user accepts.
+        if receiver.is_none() && from_import.is_none() {
+            if let Some((src_dir, index)) = self.project_index_for(&uri).await {
+                let raw_source = self.document_text(&uri).await.unwrap_or_default();
+                let current_module =
+                    uri_to_path(&uri).and_then(|p| compute_module_path(&src_dir, &p));
+                let in_scope: std::collections::HashSet<String> =
+                    items.iter().map(|i| i.label.clone()).collect();
+                // Scan the file *once* for the import-insertion anchor;
+                // every suggested symbol reuses the same range, just
+                // with a different `new_text`. Without this each
+                // suggestion would re-scan the entire file, making
+                // open-completion in large projects O(symbols × lines).
+                let insertion_range = auto_import_insertion_range(&raw_source);
+                let auto_import_items = tokio::task::spawn_blocking(move || {
+                    let mut guard = match index.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    guard.refresh(&src_dir);
+                    let mut out: Vec<CompletionItem> = Vec::new();
+                    for (name, entries) in &guard.by_name {
+                        if in_scope.contains(name) {
+                            continue;
+                        }
+                        for entry in entries {
+                            // Don't suggest importing from the file we
+                            // are editing — the user can just write the
+                            // name directly.
+                            if Some(&entry.module) == current_module.as_ref() {
+                                continue;
+                            }
+                            out.push(CompletionItem {
+                                label: name.clone(),
+                                kind: Some(binding_kind_to_completion_kind(entry.kind)),
+                                detail: Some(format!("from {}", entry.module)),
+                                additional_text_edits: Some(vec![auto_import_text_edit_at(
+                                    insertion_range,
+                                    &entry.module,
+                                    name,
+                                )]),
+                                // Sort auto-import items below the
+                                // in-scope / keyword / builtin menu so
+                                // the editor prefers names the user has
+                                // already imported.
+                                sort_text: Some(format!("z{name}")),
+                                ..Default::default()
+                            });
+                        }
+                    }
+                    out
+                })
+                .await
+                .unwrap_or_default();
+                items.extend(auto_import_items);
+            }
+        }
+
         Ok(Some(CompletionResponse::Array(items)))
     }
 
@@ -504,6 +614,26 @@ impl Backend {
             })
             .clone();
         Some((root, cache))
+    }
+
+    /// Return the auto-import index for `uri`'s project root, plus the
+    /// `src` directory the index should scan. Creates an empty index
+    /// on first access; subsequent calls reuse the cached entry so
+    /// refresh sees the per-file mtime state from earlier runs.
+    /// Returns `None` when `uri` isn't a real file path or no
+    /// `typhon.toml` ancestor exists.
+    async fn project_index_for(
+        &self,
+        uri: &Uri,
+    ) -> Option<(std::path::PathBuf, Arc<std::sync::Mutex<ProjectIndex>>)> {
+        let path = uri_to_path(uri)?;
+        let (root, src_dir) = find_workspace_layout(&path)?;
+        let mut guard = self.project_indexes.lock().await;
+        let index = guard
+            .entry(root)
+            .or_insert_with(|| Arc::new(std::sync::Mutex::new(ProjectIndex::default())))
+            .clone();
+        Some((src_dir, index))
     }
 
     /// Return a [`ResolvedModule`] for a cross-file target URI, caching the
@@ -843,6 +973,368 @@ fn resolve_in_preprocessed(preprocessed: &str, options: ResolveOptions) -> Optio
     Some(resolved)
 }
 
+/// Look up a dotted module name against the project's `src` directory
+/// and return its top-level public bindings as completion items.
+///
+/// Reuses [`resolve_module_to_file`] for the `.ty` / `__init__.ty`
+/// search and the standard preprocess + parse + resolve pipeline for
+/// the file's contents. Returns `None` when the module doesn't map to
+/// a file we can read, parse, and resolve.
+///
+/// Used by the LSP completion handler to surface cross-file imports —
+/// typing `from utils import <cursor>` against the user's own
+/// `src/utils.ty` now produces the same menu as `import os` would.
+/// Underscore-prefixed names and `import`-bound re-exports are
+/// excluded; only the symbols the file genuinely defines surface.
+fn project_module_members(src_dir: &std::path::Path, module: &str) -> Option<Vec<CompletionItem>> {
+    let file = resolve_module_to_file(src_dir, module)?;
+    let source = std::fs::read_to_string(&file).ok()?;
+    let prep = tyc_syntax::preprocess::preprocess(&source);
+    let raw_class_byte_starts =
+        tyc_syntax::preprocess::line_byte_starts(&prep.python_source, &prep.raw_class_lines);
+    let resolved = resolve_in_preprocessed(
+        &prep.python_source,
+        ResolveOptions {
+            raw_class_byte_starts,
+            lazy_import_remaps: Vec::new(),
+            original_source: None,
+        },
+    )?;
+    let module_scope = resolved.scopes.first()?;
+    let items: Vec<CompletionItem> = module_scope
+        .bindings
+        .iter()
+        .filter(|b| !b.name.starts_with('_'))
+        // Drop bindings introduced by `import` statements: surfacing
+        // them would mean re-exporting every helper the module
+        // imports, which isn't what the user means by "show me what
+        // this module exports."
+        .filter(|b| b.kind != BindingKind::Import)
+        .map(binding_to_completion)
+        .collect();
+    Some(items)
+}
+
+/// One entry in the project-wide symbol index: a top-level public
+/// binding declared in some `.ty` file of the user's project, along
+/// with the dotted module path it lives in. Used to drive auto-import
+/// suggestions on open-completion.
+#[derive(Clone, Debug)]
+struct AutoImportEntry {
+    module: String,
+    kind: BindingKind,
+}
+
+/// Cached per-file index state. Keyed in [`ProjectIndex::files`] by
+/// the file's absolute path. The `(mtime, len)` stamp lets refresh
+/// skip parse + resolve work when the file hasn't changed — pairing
+/// length with mtime catches edits that land within a single
+/// filesystem tick (some macOS / Linux filesystems only have
+/// 1-second mtime resolution, so a fast save sequence can keep the
+/// same timestamp).
+#[derive(Debug)]
+struct IndexedFile {
+    mtime: std::time::SystemTime,
+    len: u64,
+    module: String,
+    symbols: Vec<(String, BindingKind)>,
+}
+
+/// Per-project index of top-level public symbols across every `.ty`
+/// file under `src_dir`. Drives auto-import suggestions on
+/// open-completion: typing `Agent<Ctrl+Space>` looks up `Agent` in
+/// `by_name`, and each matching `(module, kind)` becomes a
+/// `CompletionItem` whose `additionalTextEdits` insert
+/// `from <module> import Agent` at the top of the current file.
+///
+/// The index is *lazy*: `refresh` runs on demand from the completion
+/// handler, statting every `.ty` file once per call and re-parsing
+/// only files whose mtime advanced. Empty projects + steady-state
+/// editing are cheap (just stat calls); a cold cache pays one parse
+/// per file.
+#[derive(Debug, Default)]
+struct ProjectIndex {
+    files: HashMap<std::path::PathBuf, IndexedFile>,
+    by_name: HashMap<String, Vec<AutoImportEntry>>,
+}
+
+impl ProjectIndex {
+    /// Walk `src_dir` for `.ty` files, refresh changed entries, drop
+    /// stale ones, and rebuild [`by_name`] when anything changed.
+    fn refresh(&mut self, src_dir: &std::path::Path) {
+        let live = collect_ty_files(src_dir);
+        let mut dirty = false;
+
+        // Drop entries whose files no longer exist.
+        let stale: Vec<std::path::PathBuf> = self
+            .files
+            .keys()
+            .filter(|p| !live.contains(*p))
+            .cloned()
+            .collect();
+        for p in stale {
+            self.files.remove(&p);
+            dirty = true;
+        }
+
+        // Add or refresh entries.
+        for path in live {
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            let Ok(mtime) = meta.modified() else { continue };
+            let len = meta.len();
+            let unchanged = self
+                .files
+                .get(&path)
+                .is_some_and(|entry| entry.mtime == mtime && entry.len == len);
+            if unchanged {
+                continue;
+            }
+            let Some(module) = compute_module_path(src_dir, &path) else {
+                continue;
+            };
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let symbols = extract_top_level_publics(&source);
+            self.files.insert(
+                path,
+                IndexedFile {
+                    mtime,
+                    len,
+                    module,
+                    symbols,
+                },
+            );
+            dirty = true;
+        }
+
+        if dirty {
+            self.rebuild_by_name();
+        }
+    }
+
+    fn rebuild_by_name(&mut self) {
+        self.by_name.clear();
+        for entry in self.files.values() {
+            for (name, kind) in &entry.symbols {
+                self.by_name
+                    .entry(name.clone())
+                    .or_default()
+                    .push(AutoImportEntry {
+                        module: entry.module.clone(),
+                        kind: *kind,
+                    });
+            }
+        }
+    }
+}
+
+/// Recursively collect every `.ty` file under `dir`, skipping common
+/// vendor directories (`.venv`, `node_modules`, dot-prefixed hidden
+/// folders) so we don't accidentally parse the user's installed
+/// dependencies.
+fn collect_ty_files(dir: &std::path::Path) -> std::collections::HashSet<std::path::PathBuf> {
+    let mut out = std::collections::HashSet::new();
+    walk_ty(dir, &mut out);
+    out
+}
+
+fn walk_ty(dir: &std::path::Path, out: &mut std::collections::HashSet<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if file_type.is_dir() {
+            let skip = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with('.') || n == "node_modules" || n == "target");
+            if !skip {
+                walk_ty(&path, out);
+            }
+        } else if file_type.is_file() && path.extension().and_then(|e| e.to_str()) == Some("ty") {
+            out.insert(path);
+        }
+    }
+}
+
+/// Convert a `.ty` file path under `src_dir` into the dotted module
+/// path that imports would use. `src/tools/web_tools.ty` →
+/// `"tools.web_tools"`; `src/pkg/__init__.ty` → `"pkg"` (the
+/// `__init__` segment is implicit, matching Python's package model).
+fn compute_module_path(src_dir: &std::path::Path, file: &std::path::Path) -> Option<String> {
+    let rel = file.strip_prefix(src_dir).ok()?;
+    let no_ext = rel.with_extension("");
+    let mut parts: Vec<String> = no_ext
+        .iter()
+        .filter_map(|c| c.to_str().map(|s| s.to_owned()))
+        .collect();
+    if parts.last().map(String::as_str) == Some("__init__") {
+        parts.pop();
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("."))
+}
+
+/// Parse + resolve `source` and return its top-level public symbols
+/// suitable for the project index. Underscore-prefixed names and
+/// `import`-bound re-exports are filtered, matching the from-import
+/// completion path's notion of "what this module exports".
+fn extract_top_level_publics(source: &str) -> Vec<(String, BindingKind)> {
+    let prep = tyc_syntax::preprocess::preprocess(source);
+    let raw_class_byte_starts =
+        tyc_syntax::preprocess::line_byte_starts(&prep.python_source, &prep.raw_class_lines);
+    let Some(resolved) = resolve_in_preprocessed(
+        &prep.python_source,
+        ResolveOptions {
+            raw_class_byte_starts,
+            lazy_import_remaps: Vec::new(),
+            original_source: None,
+        },
+    ) else {
+        return Vec::new();
+    };
+    let Some(module_scope) = resolved.scopes.first() else {
+        return Vec::new();
+    };
+    module_scope
+        .bindings
+        .iter()
+        .filter(|b| !b.name.starts_with('_'))
+        .filter(|b| b.kind != BindingKind::Import)
+        .map(|b| (b.name.clone(), b.kind))
+        .collect()
+}
+
+/// Compute the (zero-width) insertion [`Range`] for an auto-import
+/// statement in `raw_source`. Lands after the last top-level `import`
+/// / `from … import …` statement; falls through to a position past
+/// any leading shebang / module docstring when no imports exist yet.
+///
+/// Indented imports (e.g. `import foo` inside a function body) are
+/// ignored — anchoring on those would let the auto-import drop a
+/// top-level statement into the middle of a block, producing
+/// syntactically broken code.
+///
+/// Doesn't try to merge into an existing `from <module> import …` for
+/// the same module — that would need real lexer state to handle
+/// parenthesised multi-line forms safely. The duplicate import that
+/// results from picking auto-import twice for the same name is
+/// already surfaced by `tyc check` as a `duplicate_binding` error, so
+/// the user sees the redundancy immediately.
+fn auto_import_insertion_range(raw_source: &str) -> Range {
+    let lines: Vec<&str> = raw_source.lines().collect();
+    let insert_line = scan_last_top_level_import(&lines)
+        .unwrap_or_else(|| scan_past_shebang_and_docstring(&lines));
+    let pos = Position {
+        line: insert_line,
+        character: 0,
+    };
+    Range {
+        start: pos,
+        end: pos,
+    }
+}
+
+/// Build the `additionalTextEdits` payload for a single auto-import
+/// suggestion. The expensive line-scan happens once per completion
+/// request (in [`auto_import_insertion_range`]); this just stamps the
+/// resulting `Range` with the per-symbol `from <module> import <name>`
+/// text so the cost is O(symbols) instead of O(symbols × lines).
+fn auto_import_text_edit_at(range: Range, module: &str, name: &str) -> TextEdit {
+    TextEdit {
+        range,
+        new_text: format!("from {module} import {name}\n"),
+    }
+}
+
+/// Return the line index *after* the last top-level `import` /
+/// `from … import …` statement, or `None` when the file has no
+/// top-level imports. Lines that begin with whitespace before the
+/// keyword are nested inside another block and don't count.
+fn scan_last_top_level_import(lines: &[&str]) -> Option<u32> {
+    let mut last: Option<u32> = None;
+    for (i, line) in lines.iter().enumerate() {
+        if line.starts_with("import ") || line.starts_with("from ") {
+            last = Some((i + 1) as u32);
+        }
+    }
+    last
+}
+
+/// Skip a leading `#!` shebang and any module docstring, returning
+/// the first line index that's safe to insert a top-level statement
+/// at. Conservative: anything we can't classify cleanly stops the
+/// scan and the insert lands above it.
+fn scan_past_shebang_and_docstring(lines: &[&str]) -> u32 {
+    let mut idx: usize = 0;
+    if lines.first().is_some_and(|l| l.starts_with("#!")) {
+        idx += 1;
+    }
+    // Skip blank lines / comments between shebang and docstring.
+    while let Some(line) = lines.get(idx) {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            idx += 1;
+        } else {
+            break;
+        }
+    }
+    // Module docstring: triple-quoted string literal at top level.
+    // Handles both `"""..."""` and `'''...'''`, single-line and
+    // multi-line, with an optional `r`, `b`, or `u` prefix.
+    if let Some(line) = lines.get(idx) {
+        let trimmed = line.trim_start();
+        let stripped = trimmed
+            .strip_prefix(|c: char| matches!(c, 'r' | 'R' | 'b' | 'B' | 'u' | 'U'))
+            .unwrap_or(trimmed);
+        let opener = if stripped.starts_with("\"\"\"") {
+            Some("\"\"\"")
+        } else if stripped.starts_with("'''") {
+            Some("'''")
+        } else {
+            None
+        };
+        if let Some(q) = opener {
+            // Single-line docstring (closer on the same line, after
+            // the opener) — advance one line and we're done.
+            let body = &stripped[q.len()..];
+            if body.contains(q) {
+                idx += 1;
+            } else {
+                // Multi-line: walk forward until the closer.
+                idx += 1;
+                while let Some(line) = lines.get(idx) {
+                    idx += 1;
+                    if line.contains(q) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    idx as u32
+}
+
+fn binding_kind_to_completion_kind(kind: BindingKind) -> CompletionItemKind {
+    match kind {
+        BindingKind::Function => CompletionItemKind::FUNCTION,
+        BindingKind::Class => CompletionItemKind::CLASS,
+        BindingKind::Parameter => CompletionItemKind::VARIABLE,
+        BindingKind::Import => CompletionItemKind::MODULE,
+        BindingKind::Loop => CompletionItemKind::VARIABLE,
+        BindingKind::Value => CompletionItemKind::VARIABLE,
+    }
+}
+
 /// Log-message level for the LSP backend. Maps the user-facing `--log-level`
 /// flag onto the subset of severities the `client.log_message` channel
 /// supports. `Info` is the default; `Error` suppresses all but errors.
@@ -890,6 +1382,7 @@ pub fn run_stdio(log_level: LogLevel) {
             documents: Arc::new(Mutex::new(HashMap::new())),
             resolved_cache: Arc::new(Mutex::new(HashMap::new())),
             introspection: Arc::new(Mutex::new(HashMap::new())),
+            project_indexes: Arc::new(Mutex::new(HashMap::new())),
         });
         Server::new(stdin, stdout, socket).serve(service).await;
     });
@@ -1931,6 +2424,212 @@ mod tests {
         let pkg = resolve_module_to_file(&src, "pkg").expect("pkg/__init__.ty must resolve");
         assert_eq!(pkg.file_name().unwrap(), "__init__.ty");
         assert!(pkg.parent().unwrap().ends_with("pkg"));
+    }
+
+    #[test]
+    fn project_module_members_surfaces_public_top_level_bindings() {
+        // src/utils.ty exposes `helper` (def), `MAX` (let), `_private`
+        // (def), and re-exports `path` from `os`. The completion menu
+        // for `from utils import <cursor>` should include `helper` and
+        // `MAX` only — underscore-prefixed names and import re-exports
+        // shouldn't surface.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("utils.ty"),
+            "import os\n\
+             from os import path\n\
+             \n\
+             let MAX: int = 10\n\
+             \n\
+             def helper() -> None:\n    \
+                 pass\n\
+             \n\
+             def _private() -> None:\n    \
+                 pass\n",
+        )
+        .unwrap();
+
+        let items = project_module_members(&src, "utils").expect("utils.ty must resolve");
+        let labels: std::collections::HashSet<String> =
+            items.iter().map(|i| i.label.clone()).collect();
+
+        assert!(
+            labels.contains("helper"),
+            "expected `helper`, got {labels:?}"
+        );
+        assert!(labels.contains("MAX"), "expected `MAX`, got {labels:?}");
+        assert!(
+            !labels.contains("_private"),
+            "underscore-prefixed names must not surface: {labels:?}"
+        );
+        assert!(
+            !labels.contains("os") && !labels.contains("path"),
+            "import bindings must not surface as re-exports: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn project_module_members_resolves_package_init_file() {
+        // `from pkg import <cursor>` should resolve through
+        // `src/pkg/__init__.ty` — same as Python's package model.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("pkg")).unwrap();
+        std::fs::write(
+            src.join("pkg").join("__init__.ty"),
+            "def greet() -> None:\n    pass\n",
+        )
+        .unwrap();
+
+        let items = project_module_members(&src, "pkg").expect("pkg/__init__.ty must resolve");
+        assert!(
+            items.iter().any(|i| i.label == "greet"),
+            "expected `greet` from pkg/__init__.ty"
+        );
+    }
+
+    #[test]
+    fn project_module_members_returns_none_for_missing_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        assert!(project_module_members(&src, "nope").is_none());
+    }
+
+    #[test]
+    fn compute_module_path_maps_files_to_dotted_modules() {
+        let src = std::path::Path::new("/proj/src");
+        assert_eq!(
+            compute_module_path(src, std::path::Path::new("/proj/src/utils.ty")).as_deref(),
+            Some("utils")
+        );
+        assert_eq!(
+            compute_module_path(src, std::path::Path::new("/proj/src/tools/web_tools.ty"))
+                .as_deref(),
+            Some("tools.web_tools")
+        );
+        assert_eq!(
+            compute_module_path(src, std::path::Path::new("/proj/src/pkg/__init__.ty")).as_deref(),
+            Some("pkg")
+        );
+        assert_eq!(
+            compute_module_path(src, std::path::Path::new("/proj/src/pkg/sub/__init__.ty"))
+                .as_deref(),
+            Some("pkg.sub")
+        );
+    }
+
+    #[test]
+    fn project_index_indexes_top_level_publics_across_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("tools")).unwrap();
+        std::fs::write(src.join("utils.ty"), "def helper() -> None:\n    pass\n").unwrap();
+        std::fs::write(
+            src.join("tools").join("web_tools.ty"),
+            "def web_search() -> None:\n    pass\n\nlet TIMEOUT: int = 30\n",
+        )
+        .unwrap();
+
+        let mut index = ProjectIndex::default();
+        index.refresh(&src);
+
+        // `helper` is exported by `utils`.
+        let helper = index.by_name.get("helper").expect("helper indexed");
+        assert_eq!(helper.len(), 1);
+        assert_eq!(helper[0].module, "utils");
+        assert_eq!(helper[0].kind, BindingKind::Function);
+
+        // `web_search` lives in the nested module.
+        let web_search = index.by_name.get("web_search").expect("web_search indexed");
+        assert_eq!(web_search[0].module, "tools.web_tools");
+
+        // Top-level `let` constants also surface.
+        assert!(index.by_name.contains_key("TIMEOUT"));
+    }
+
+    #[test]
+    fn project_index_drops_stale_entries_on_refresh() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        let file = src.join("utils.ty");
+        std::fs::write(&file, "def helper() -> None:\n    pass\n").unwrap();
+
+        let mut index = ProjectIndex::default();
+        index.refresh(&src);
+        assert!(index.by_name.contains_key("helper"));
+
+        std::fs::remove_file(&file).unwrap();
+        index.refresh(&src);
+        assert!(
+            !index.by_name.contains_key("helper"),
+            "stale entry should be dropped"
+        );
+    }
+
+    #[test]
+    fn auto_import_text_edit_inserts_after_existing_imports() {
+        let src = "import os\nfrom math import pi\n\ndef main() -> None:\n    pass\n";
+        let edit = auto_import_text_edit_at(auto_import_insertion_range(src), "utils", "helper");
+        // Insert on the line *after* the last import (index 2 = the blank line).
+        assert_eq!(edit.range.start.line, 2);
+        assert_eq!(edit.range.start.character, 0);
+        assert_eq!(edit.new_text, "from utils import helper\n");
+    }
+
+    #[test]
+    fn auto_import_text_edit_inserts_at_top_when_no_imports() {
+        let src = "def main() -> None:\n    pass\n";
+        let edit = auto_import_text_edit_at(auto_import_insertion_range(src), "utils", "helper");
+        assert_eq!(edit.range.start.line, 0);
+        assert_eq!(edit.range.start.character, 0);
+    }
+
+    #[test]
+    fn auto_import_text_edit_skips_shebang() {
+        let src = "#!/usr/bin/env tyc\ndef main() -> None:\n    pass\n";
+        let edit = auto_import_text_edit_at(auto_import_insertion_range(src), "utils", "helper");
+        // Lands on the line *after* the shebang.
+        assert_eq!(edit.range.start.line, 1);
+    }
+
+    #[test]
+    fn auto_import_text_edit_skips_module_docstring() {
+        let src = "\"\"\"Module that does things.\"\"\"\n\ndef main() -> None:\n    pass\n";
+        let edit = auto_import_text_edit_at(auto_import_insertion_range(src), "utils", "helper");
+        // Inserted on the line right after the (single-line) docstring.
+        assert_eq!(edit.range.start.line, 1);
+    }
+
+    #[test]
+    fn auto_import_text_edit_skips_multiline_docstring() {
+        let src =
+            "\"\"\"\nLong docstring\nspanning lines.\n\"\"\"\ndef main() -> None:\n    pass\n";
+        let edit = auto_import_text_edit_at(auto_import_insertion_range(src), "utils", "helper");
+        // The docstring ends on line 3 (0-indexed); insert lands at line 4.
+        assert_eq!(edit.range.start.line, 4);
+    }
+
+    #[test]
+    fn auto_import_text_edit_skips_shebang_then_docstring() {
+        let src = "#!/usr/bin/env tyc\n\"\"\"doc\"\"\"\ndef main() -> None:\n    pass\n";
+        let edit = auto_import_text_edit_at(auto_import_insertion_range(src), "utils", "helper");
+        // Past shebang (line 0) and docstring (line 1) → line 2.
+        assert_eq!(edit.range.start.line, 2);
+    }
+
+    #[test]
+    fn auto_import_text_edit_ignores_nested_imports() {
+        // No top-level imports — the indented `import sys` inside the
+        // function body must NOT anchor the auto-import (that would
+        // drop a top-level statement into the function).
+        let src = "def main() -> None:\n    import sys\n    pass\n";
+        let edit = auto_import_text_edit_at(auto_import_insertion_range(src), "utils", "helper");
+        // Falls through to the no-imports path → line 0.
+        assert_eq!(edit.range.start.line, 0);
     }
 
     #[test]
