@@ -4497,3 +4497,19 @@ fix lands as its own commit.
   `async def __aenter__(self) -> Self: return self` without the
   noise.
 
+- **#101** `class X(NamedTuple):` no longer crashes at runtime — the
+  desugarer's class walk now checks `class_inherits_named_tuple(c)`
+  and skips the `@dataclasses.dataclass(slots=True)` decorator for
+  NamedTuple subclasses, mirroring the existing TypedDict carve-out.
+  `class Point(NamedTuple): x: int; y: int` builds and runs cleanly.
+
+- **#102** multi-inheritance no longer triggers `multiple bases have
+  instance lay-out conflict` — `class_has_multiple_concrete_bases`
+  identifies a class with 2+ concrete (non-`Protocol` / non-`Generic`)
+  bases and emits `@dataclasses.dataclass()` (no `slots=True`) for
+  it. A pre-scan in `desugar_mod_module_with` also collects every
+  class referenced as a base of such a multi-inheritance child, and
+  emits `slots=False` for those parents too — both parents need to
+  be unslotted for the child to load. `class C(A, B)` with simple
+  `class A` / `class B` now builds and runs.
+
