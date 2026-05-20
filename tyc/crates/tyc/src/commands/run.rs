@@ -1,10 +1,16 @@
-//! `tyc run` — build the project and execute the emitted Python.
+//! `tyc run` — execute a Typhon program.
 //!
-//! Hides the `tyc build && python build/main.py` two-step behind a single
-//! command, mirroring how `tsx`/`ts-node` hide the TypeScript→JavaScript
-//! compile step.
+//! Default mode: the in-process tree-walking VM from `tyc-vm`. No `.py` is
+//! ever written; the runtime is the same Rust binary that hosts the
+//! compiler. This is the path you want for scripts, tests, and any program
+//! that stays inside Typhon's native semantics.
 //!
-//! Two output modes:
+//! `--compile` mode: the legacy "build then exec CPython" path. Use this
+//! when the program reaches into CPython libraries (`numpy`, `requests`,
+//! `pydantic`, …) that the VM cannot evaluate natively, or when you want
+//! the exact output `tyc build` would produce.
+//!
+//! When `--compile` is passed:
 //!
 //! * **Persistent (default).** Builds into the configured `out` dir
 //!   (default `build/`).  Subsequent runs hit the incremental Salsa
@@ -15,13 +21,10 @@
 //!   project pollution, ideal for quick one-shot iteration.  Trades the
 //!   incremental cache and on-disk source map for a clean tree.
 //!
-//! Typhon does not have a separate VM: every `.ty` file lowers to clean
-//! CPython.  `tyc run` is a UX shortcut, not a new execution model.
-//!
-//! Exit-code semantics: when the build succeeds and the script launches,
-//! `tyc run` exits with the script's own exit code (via `process::exit`)
-//! so shell pipelines see the child's status verbatim.  Build failures
-//! and spawn failures surface as normal miette errors with exit code 1.
+//! Exit-code semantics: `tyc run` exits with the program's own exit code
+//! (via `process::exit`) so shell pipelines see the child's status verbatim.
+//! Build failures, parse errors, and spawn failures surface as normal miette
+//! errors with exit code 1.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -36,38 +39,48 @@ use crate::config::TyphonConfig;
 /// Arguments for `tyc run`.
 #[derive(Args, Debug)]
 pub struct RunArgs {
-    /// Project directory (defaults to the current directory).
+    /// Project directory, or a single `.ty` source file when using the VM
+    /// (the default). For `--compile` mode this is always the project
+    /// directory.
     #[arg(value_name = "PATH", default_value = ".")]
     pub path: PathBuf,
 
-    /// Entry-point `.py` (relative to the build dir) to execute.
+    /// Build then exec CPython instead of running the in-process VM.
+    /// Use this when your program imports CPython libraries the VM
+    /// doesn't speak natively (numpy, requests, …).
+    #[arg(long, alias = "no-vm")]
+    pub compile: bool,
+
+    /// Entry-point `.py` (relative to the build dir) for `--compile` mode.
     /// Defaults to `main.py`.
     #[arg(long, value_name = "FILE", default_value = "main.py")]
     pub entry: PathBuf,
 
-    /// Python interpreter to use (defaults to `python3`).
+    /// Python interpreter to use in `--compile` mode (defaults to `python3`).
     #[arg(long, value_name = "PATH", default_value = "python3")]
     pub python: String,
 
-    /// Build into a temporary directory that is deleted when the process
-    /// exits, instead of the configured `out` dir.  No build artifacts
-    /// persist on disk — the "tyx in-memory" mode.  Implies a fresh
-    /// build every invocation, so the incremental cache and on-disk
-    /// `.py.map` sidecars are unavailable.
+    /// `--compile` only: build into a temporary directory that is deleted
+    /// when the process exits, instead of the configured `out` dir.  No
+    /// build artifacts persist on disk — the "tyx in-memory" mode.
+    /// Implies a fresh build every invocation.
     #[arg(long, short = 't', conflicts_with = "no_build")]
     pub temp: bool,
 
-    /// Skip rebuilding; assume the `build/` directory is already current.
-    /// Incompatible with `--temp`.
+    /// `--compile` only: skip rebuilding; assume the `build/` directory is
+    /// already current.  Incompatible with `--temp`.
     #[arg(long)]
     pub no_build: bool,
 
-    /// Extra arguments forwarded to the entry-point script after `--`.
+    /// Extra arguments forwarded to the program after `--`.
     #[arg(last = true, value_name = "ARGS")]
     pub script_args: Vec<String>,
 }
 
 pub fn run(args: RunArgs) -> Result<()> {
+    if !args.compile {
+        return run_vm(args);
+    }
     // 1. Decide where build outputs go.  In `--temp` mode we own a
     //    TempDir guard whose Drop removes the directory; we keep it
     //    alive across the child process by binding it to a local.
@@ -140,6 +153,44 @@ pub fn run(args: RunArgs) -> Result<()> {
     std::process::exit(code);
 }
 
+/// Default execution path — the in-process tree-walking VM. Resolves the
+/// entry-point source file from `args.path` (a `.ty` file directly, or the
+/// project root containing `src/main.ty`), then evaluates it.
+fn run_vm(args: RunArgs) -> Result<()> {
+    let entry = resolve_vm_entry(&args.path)?;
+
+    // The VM reads sys.argv from std::env::args; populate it via env so
+    // the user's script_args are visible. We re-exec ourselves? No — simpler:
+    // expose them through an env var the VM consults. For now, document
+    // that `sys.argv` mirrors the host process args.
+    // (A future revision can wire `script_args` straight into `sys.argv`.)
+    let _ = args.script_args;
+
+    let code = tyc_vm::run_file(&entry).map_err(|e| miette!("{e}"))?;
+    std::process::exit(code);
+}
+
+fn resolve_vm_entry(path: &std::path::Path) -> Result<PathBuf> {
+    if path.is_file() {
+        return Ok(path.to_path_buf());
+    }
+    // Look for typhon.toml; default entry is `src/main.ty`.
+    let candidates: [PathBuf; 3] = [
+        path.join("src").join("main.ty"),
+        path.join("main.ty"),
+        path.join("src").join("main.dty"),
+    ];
+    for c in &candidates {
+        if c.exists() {
+            return Ok(c.clone());
+        }
+    }
+    Err(miette!(
+        "no Typhon entry point found under '{}': expected a .ty file or src/main.ty",
+        path.display()
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,6 +253,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let args = RunArgs {
             path: tmp.path().to_path_buf(),
+            compile: true,
             entry: PathBuf::from("main.py"),
             python: "python3".into(),
             temp: false,

@@ -20,7 +20,7 @@ Typhon ships a single binary, `tyc`, that handles every stage of the workflow. S
 | `tyc stubtest` | Build the project and run `python -m mypy.stubtest` against every emitted `.pyi` stub. Complements `tyc check --stubs` (which performs an AST diff) by catching dynamically-created attributes the AST cannot see. Requires `mypy` in the chosen interpreter (`pip install mypy`). |
 | `tyc repl` | Interactive Typhon evaluator. Reads `.ty` source one block at a time, compiles it through the full pipeline, and executes the result with a Python interpreter. |
 | `tyc debug` | Build the project and launch the emitted Python under a debugger (default `pdb`). Thin v1 wrapper — a Typhon-native source-mapping debugger is a Phase-5 item. |
-| `tyc run` | Build the project and execute the emitted Python in one step. `--temp` builds into a tempdir that is removed on exit — the "tyx in-memory" mode for quick iteration. |
+| `tyc run` | Execute a Typhon program. By default uses the in-process tree-walking VM ([docs/vm.md](vm.md)) — no `.py` is written, no CPython is spawned. `--compile` (alias `--no-vm`) falls back to the legacy build-then-exec path; pair with `--temp` to build into a tempdir that is removed on exit. |
 | `tyc add` / `tyc remove` / `tyc sync` | Lightweight package-manager surface over `uv`: rewrite `[dependencies]` / `[dev-dependencies]` in `typhon.toml` and run `uv sync` to install. |
 
 ## Typical workflow

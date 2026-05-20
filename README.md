@@ -68,6 +68,7 @@ Focused references:
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | Compiler pipeline, crate layout, toolchain choices |
 | [docs/language.md](docs/language.md) | Type system, error handling, async, `let`/`mut`, comptime |
+| [docs/vm.md](docs/vm.md) | The in-process tree-walking VM (default execution mode for `tyc run`) |
 | [docs/cli.md](docs/cli.md) | The `tyc` binary and its subcommands |
 | [docs/configuration.md](docs/configuration.md) | `typhon.toml` reference |
 | [docs/roadmap.md](docs/roadmap.md) | Phased delivery plan |
