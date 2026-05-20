@@ -4521,3 +4521,15 @@ fix lands as its own commit.
   had written the underlying value directly. `__repr__` keeps the
   deliberate "don't materialise" debug behaviour.
 
+- **#104** `type Err = …` no longer shadows the `?` operator's
+  runtime `Err` — `expand_question_ops` and `expand_with_chains`
+  now emit `isinstance(_t, __typhon_Err__)` instead of
+  `isinstance(_t, Err)`, and both passes inject
+  `from typhon_runtime import Err as __typhon_Err__` at the top
+  of the source when any rewrite was made. `type_from_annotation`
+  in `tyc-types` maps the synthetic name back to
+  `Type::Class("Err")` so post-`?` narrowing and the
+  `result_error_mismatch` check continue to work. A user's
+  `type Err = str` can now coexist with `Result[T, str]` and the
+  `?` propagation routes through the runtime constructor.
+

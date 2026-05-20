@@ -445,6 +445,7 @@ fn make_typhon_runtime_import() -> Stmt {
     })
 }
 
+
 /// Build `import typhon_runtime`.
 fn make_bare_typhon_runtime_import() -> Stmt {
     Stmt::Import(StmtImport {

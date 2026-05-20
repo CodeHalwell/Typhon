@@ -647,6 +647,13 @@ pub fn type_from_annotation_with_params(
             "bytes" => Type::Bytes,
             "None" => Type::None,
             "Any" => Type::Any,
+            // Synthetic shadow-resistant alias for the runtime `Err`,
+            // injected by `?` and `with`-chain lowerings. Treat as
+            // `Class("Err")` for type-checking purposes so post-`?`
+            // narrowing and `result_error_mismatch` continue to work
+            // even when the user shadowed `Err` with a type alias.
+            // FINDINGS #104.
+            "__typhon_Err__" => Type::Class("Err".into()),
             // A type parameter (PEP 695) — preserved as `Type::TypeVar` so
             // call-site inference can substitute it with the concrete
             // argument type.  Assignability still treats it as `Any` until

@@ -2233,6 +2233,7 @@ pub fn expand_question_ops(source: &str) -> String {
     let mut result = String::with_capacity(source.len() + 64);
     let mut counter = 0usize;
     let mut in_string: Option<StringMode> = None;
+    let mut needs_err_alias_import = false;
 
     for line in source.split_inclusive('\n') {
         let raw = line.trim_end_matches(['\n', '\r']);
@@ -2300,11 +2301,15 @@ pub fn expand_question_ops(source: &str) -> String {
         result.push_str(&rhs);
         result.push('\n');
 
-        // 2. Short-circuit on Err.
+        // 2. Short-circuit on Err. Use the shadow-resistant
+        // `__typhon_Err__` alias so a user-declared `type Err = …`
+        // can't redirect the isinstance check away from
+        // `typhon_runtime.Err`. FINDINGS #104.
         result.push_str(indent);
         result.push_str("if isinstance(");
         result.push_str(&tmp);
-        result.push_str(", Err):\n");
+        result.push_str(", __typhon_Err__):\n");
+        needs_err_alias_import = true;
         result.push_str(indent);
         result.push_str("    return ");
         result.push_str(&tmp);
@@ -2321,7 +2326,77 @@ pub fn expand_question_ops(source: &str) -> String {
         }
     }
 
-    result
+    if needs_err_alias_import {
+        prepend_typhon_err_alias_import(result)
+    } else {
+        result
+    }
+}
+
+/// Prepend `from typhon_runtime import Err as __typhon_Err__` to `source`
+/// in a way that preserves Python's "future imports must be first" rule
+/// and that doesn't demote a module docstring. Used by the `?` and
+/// `with`-chain lowerings when they introduced a `__typhon_Err__`
+/// reference. FINDINGS #104.
+fn prepend_typhon_err_alias_import(body: String) -> String {
+    const IMPORT_LINE: &str = "from typhon_runtime import Err as __typhon_Err__\n";
+
+    let mut out = String::with_capacity(body.len() + IMPORT_LINE.len());
+    let mut inserted = false;
+    let mut idx = 0usize;
+    let mut in_docstring: Option<&'static str> = None;
+    while idx < body.len() {
+        let line_end = body[idx..]
+            .find('\n')
+            .map(|n| idx + n + 1)
+            .unwrap_or(body.len());
+        let line = &body[idx..line_end];
+        let trimmed = line.trim_start();
+
+        let is_blank = trimmed.is_empty() || trimmed == "\n" || trimmed == "\r\n";
+        let is_comment = trimmed.starts_with('#');
+        let is_future = trimmed.starts_with("from __future__ import");
+        let is_typhon_alias_import =
+            trimmed.starts_with("from typhon_runtime") && trimmed.contains(" as __typhon_");
+
+        if in_docstring.is_none() && (is_blank || is_comment || is_future || is_typhon_alias_import)
+        {
+            out.push_str(line);
+            idx = line_end;
+            continue;
+        }
+        if in_docstring.is_none() {
+            if let Some(q) = docstring_open_quote(trimmed) {
+                let rest = &trimmed[3..];
+                if rest.contains(q) {
+                    out.push_str(line);
+                    idx = line_end;
+                    continue;
+                }
+                in_docstring = Some(q);
+                out.push_str(line);
+                idx = line_end;
+                continue;
+            }
+        } else if let Some(q) = in_docstring {
+            out.push_str(line);
+            idx = line_end;
+            if trimmed.contains(q) {
+                in_docstring = None;
+            }
+            continue;
+        }
+
+        out.push_str(IMPORT_LINE);
+        out.push_str(&body[idx..]);
+        inserted = true;
+        break;
+    }
+
+    if !inserted {
+        out.push_str(IMPORT_LINE);
+    }
+    out
 }
 
 // ── multi-line `guard` expansion ───────────────────────────────────────────────
@@ -2658,7 +2733,14 @@ pub fn expand_with_chains(source: &str) -> String {
         i += 1;
     }
 
-    out
+    // `with`-chain lowering uses the shadow-resistant `__typhon_Err__`
+    // alias for the isinstance check (FINDINGS #104). Inject the
+    // aliasing import once if any rewrite was made.
+    if out.contains("__typhon_Err__") {
+        prepend_typhon_err_alias_import(out)
+    } else {
+        out
+    }
 }
 
 /// One unwrap step inside a `with`-chain.
@@ -3123,7 +3205,8 @@ fn render_chain(chain: &WithChain, chain_indent: &str, counter: &mut usize) -> S
         out.push_str(chain_indent);
         out.push_str("if isinstance(");
         out.push_str(&tmp);
-        out.push_str(", Err):\n");
+        // Shadow-resistant alias — see FINDINGS #104.
+        out.push_str(", __typhon_Err__):\n");
 
         match (&chain.err_var, !chain.else_body.is_empty()) {
             (Some(name), true) => {
@@ -4525,7 +4608,7 @@ mod tests {
         let out = expand_question_ops(src);
         assert!(out.contains("__typhon_q_0__ = f()"), "out: {out}");
         assert!(
-            out.contains("if isinstance(__typhon_q_0__, Err):"),
+            out.contains("if isinstance(__typhon_q_0__, __typhon_Err__):"),
             "out: {out}"
         );
         assert!(out.contains("return __typhon_q_0__"), "out: {out}");
@@ -4538,7 +4621,7 @@ mod tests {
         let out = expand_question_ops(src);
         assert!(out.contains("__typhon_q_0__ = save(record)"), "out: {out}");
         assert!(
-            out.contains("if isinstance(__typhon_q_0__, Err):"),
+            out.contains("if isinstance(__typhon_q_0__, __typhon_Err__):"),
             "out: {out}"
         );
         // No binding assignment for a bare expression.
@@ -4986,7 +5069,7 @@ def run() -> Result[str, str]:
         let out = expand_with_chains(src);
         assert!(out.contains("__typhon_with_0__ = f()"), "out:\n{out}");
         assert!(
-            out.contains("if isinstance(__typhon_with_0__, Err):"),
+            out.contains("if isinstance(__typhon_with_0__, __typhon_Err__):"),
             "out:\n{out}"
         );
         // The user-visible `err` name is uniquified to
