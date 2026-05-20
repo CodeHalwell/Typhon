@@ -389,13 +389,16 @@ pub fn run(args: BuildArgs) -> Result<()> {
         let raw_class_line_starts = line_byte_starts(&prep.python_source, &prep.raw_class_lines);
         let frozen_class_line_starts =
             line_byte_starts(&prep.python_source, &prep.frozen_class_lines);
+        let plain_class_line_starts =
+            line_byte_starts(&prep.python_source, &prep.plain_class_lines);
         let desugar_output = desugar_module_with(
             &module,
             DesugarOptions {
                 memoise_functions: memoise_targets,
                 raw_class_line_starts,
                 frozen_class_line_starts,
-                ..Default::default()
+                plain_class_line_starts,
+                skip_decoration_bases: config.emit.skip_decoration_bases.clone(),
             },
         );
         if desugar_output.needs_typhon_runtime {
@@ -558,13 +561,16 @@ pub fn run(args: BuildArgs) -> Result<()> {
         let raw_class_line_starts = line_byte_starts(&prep.python_source, &prep.raw_class_lines);
         let frozen_class_line_starts =
             line_byte_starts(&prep.python_source, &prep.frozen_class_lines);
+        let plain_class_line_starts =
+            line_byte_starts(&prep.python_source, &prep.plain_class_lines);
         let desugar = desugar_module_with(
             &module,
             DesugarOptions {
                 memoise_functions: Vec::new(),
                 raw_class_line_starts,
                 frozen_class_line_starts,
-                ..Default::default()
+                plain_class_line_starts,
+                skip_decoration_bases: config.emit.skip_decoration_bases.clone(),
             },
         );
         let stub_text = emit_stub(&desugar.module);
