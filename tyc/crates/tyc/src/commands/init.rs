@@ -97,7 +97,8 @@ def main() -> None:
     print(greeting)
 
 
-main()
+if __name__ == "__main__":
+    main()
 "#,
         name = name
     );

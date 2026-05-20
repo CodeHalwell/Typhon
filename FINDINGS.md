@@ -4545,3 +4545,14 @@ fix lands as its own commit.
   - `Annotated[T, meta...]` — unwrapped to `T`; the metadata tail
     is ignored.
 
+- **#113** `ExceptionGroup` / `BaseExceptionGroup` added to the
+  resolver's builtin whitelist — PEP 654 exception groups, in
+  CPython since 3.11, are now recognised as in-scope names.
+  `raise ExceptionGroup("oops", [...])` no longer fires
+  `tyc::unknown_name`.
+
+- **#123** `tyc init` scaffold now emits the canonical entry
+  block `if __name__ == "__main__": main()` instead of a bare
+  `main()` call. Scripts run identically; importing the module
+  no longer triggers `main()` as a side effect.
+
