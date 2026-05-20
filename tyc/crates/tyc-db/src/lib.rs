@@ -1003,10 +1003,10 @@ def f(x: str?) -> None:
         // Calling `check_diagnostics` twice on the same `SourceFile` with the
         // same text must return the same `Arc` (pointer equality) — i.e. the
         // Salsa cache was hit and the pipeline was not re-executed.
-        let mut db = TycDatabase::new();
+        let db = TycDatabase::new();
         let sf = SourceFile::new(&db, "<test>".to_owned(), "let x: int = 1\n".to_owned());
-        let d1 = check_diagnostics(&mut db, sf);
-        let d2 = check_diagnostics(&mut db, sf);
+        let d1 = check_diagnostics(&db, sf);
+        let d2 = check_diagnostics(&db, sf);
         assert!(
             std::sync::Arc::ptr_eq(&d1.0, &d2.0),
             "second call must be a Salsa cache hit (same Arc pointer)"
@@ -1020,10 +1020,10 @@ def f(x: str?) -> None:
         use salsa::Setter;
         let mut db = TycDatabase::new();
         let sf = SourceFile::new(&db, "<test>".to_owned(), "let x: int = 1\n".to_owned());
-        let d1 = check_diagnostics(&mut db, sf);
+        let d1 = check_diagnostics(&db, sf);
         sf.set_text(&mut db)
             .to("let y: str = \"hello\"\n".to_owned());
-        let d2 = check_diagnostics(&mut db, sf);
+        let d2 = check_diagnostics(&db, sf);
         assert!(
             !std::sync::Arc::ptr_eq(&d1.0, &d2.0),
             "Arc must differ after set_text (cache was invalidated)"
