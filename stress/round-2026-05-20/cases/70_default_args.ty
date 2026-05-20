@@ -1,0 +1,14 @@
+# Default arguments.
+
+def greet(name: str = "world", excited: bool = False) -> str:
+    let suffix: str = "!" if excited else "."
+    return f"Hello, {name}{suffix}"
+
+def main() -> None:
+    print(greet())
+    print(greet("Alice"))
+    print(greet("Bob", True))
+    print(greet(excited=True))
+
+if __name__ == "__main__":
+    main()

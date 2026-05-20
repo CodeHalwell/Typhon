@@ -1,0 +1,19 @@
+# `?` used in attribute access chain.
+
+class Inner:
+    x: int
+
+def make() -> Result[Inner, str]:
+    return Ok(Inner(x=10))
+
+def go() -> Result[int, str]:
+    let i: Inner = make()?
+    return Ok(i.x + 1)
+
+def main() -> None:
+    match go():
+        case Ok(v): print(v)
+        case Err(e): print(e)
+
+if __name__ == "__main__":
+    main()

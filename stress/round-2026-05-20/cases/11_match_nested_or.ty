@@ -1,0 +1,25 @@
+# Nested OR-patterns in match. Per spec these should bind compatible names.
+
+class A:
+    x: int
+class B:
+    x: int
+class C:
+    x: int
+
+type Three = A | B | C
+
+def first_two(t: Three) -> int:
+    match t:
+        case A(x) | B(x):
+            return x
+        case C(x):
+            return x * 10
+
+def main() -> None:
+    print(first_two(A(x=1)))
+    print(first_two(B(x=2)))
+    print(first_two(C(x=3)))
+
+if __name__ == "__main__":
+    main()

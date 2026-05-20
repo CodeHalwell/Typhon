@@ -1,0 +1,23 @@
+# Match-in-match. Nested match.
+
+class Outer:
+    inner: int?
+
+def describe(o: Outer) -> str:
+    match o:
+        case Outer(inner=None):
+            return "none"
+        case Outer(inner=n):
+            match n:
+                case 0:
+                    return "zero"
+                case _:
+                    return f"some:{n}"
+
+def main() -> None:
+    print(describe(Outer(inner=None)))
+    print(describe(Outer(inner=0)))
+    print(describe(Outer(inner=5)))
+
+if __name__ == "__main__":
+    main()

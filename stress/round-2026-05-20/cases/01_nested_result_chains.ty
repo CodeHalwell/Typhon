@@ -1,0 +1,33 @@
+# Deeply nested Result chains — does `?` propagate through 3+ levels?
+
+def parse_int(s: str) -> Result[int, str]:
+    if not s.isdigit():
+        return Err(f"not int: {s}")
+    return Ok(int(s))
+
+def parse_pair(s: str) -> Result[tuple[int, int], str]:
+    let parts: list[str] = s.split(",")
+    if len(parts) != 2:
+        return Err("expected 'a,b'")
+    let a: int = parse_int(parts[0])?
+    let b: int = parse_int(parts[1])?
+    return Ok((a, b))
+
+def parse_triple(s: str) -> Result[tuple[int, int, int], str]:
+    let head: list[str] = s.split(";")
+    if len(head) != 2:
+        return Err("expected 'a,b;c'")
+    let pair: tuple[int, int] = parse_pair(head[0])?
+    let c: int = parse_int(head[1])?
+    return Ok((pair[0], pair[1], c))
+
+def main() -> None:
+    let r: Result[tuple[int, int, int], str] = parse_triple("1,2;3")
+    match r:
+        case Ok(v):
+            print(v)
+        case Err(e):
+            print(f"err: {e}")
+
+if __name__ == "__main__":
+    main()

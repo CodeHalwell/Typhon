@@ -1,0 +1,12 @@
+# `async def` without await - finding #83 was a gap.
+
+async def fake() -> int:
+    return 42
+
+import asyncio
+
+def main() -> None:
+    print(asyncio.run(fake()))
+
+if __name__ == "__main__":
+    main()

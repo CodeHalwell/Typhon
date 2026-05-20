@@ -1,0 +1,15 @@
+# Default field values.
+
+class Settings:
+    debug: bool = False
+    name: str = "default"
+    limit: int = 100
+
+def main() -> None:
+    let s: Settings = Settings()
+    print(s.debug, s.name, s.limit)
+    let s2: Settings = Settings(debug=True)
+    print(s2.debug, s2.name)
+
+if __name__ == "__main__":
+    main()

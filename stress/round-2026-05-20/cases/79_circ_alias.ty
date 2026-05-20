@@ -1,0 +1,11 @@
+# Circular type alias - finding #81.
+
+type A = B
+type B = A
+
+def main() -> None:
+    let x: A = 5
+    print(x)
+
+if __name__ == "__main__":
+    main()

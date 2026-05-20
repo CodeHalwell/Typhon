@@ -1,0 +1,18 @@
+# @pure and @memo decorators
+
+@pure
+def normalize(s: str) -> str:
+    return s.strip().lower()
+
+@memo
+def fib(n: int) -> int:
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+def main() -> None:
+    print(normalize("  HELLO  "))
+    print(fib(20))
+
+if __name__ == "__main__":
+    main()

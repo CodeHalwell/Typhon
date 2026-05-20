@@ -1,0 +1,11 @@
+# Lambdas — type annotations? returns?
+
+def apply(f: Callable[[int], int], x: int) -> int:
+    return f(x)
+
+def main() -> None:
+    let r: int = apply(lambda x: x * 2, 5)
+    print(r)
+
+if __name__ == "__main__":
+    main()

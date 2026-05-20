@@ -1,0 +1,9 @@
+# Walrus introduces let, so reassigning should error.
+
+def main() -> None:
+    if (n := 5) > 3:
+        n = 10
+        print(n)
+
+if __name__ == "__main__":
+    main()

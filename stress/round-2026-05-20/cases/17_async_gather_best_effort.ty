@@ -1,0 +1,21 @@
+# Best-effort gather, with exceptions
+
+import asyncio
+
+async def ok_fn() -> int:
+    return 42
+
+async def fail_fn() -> int:
+    raise RuntimeError("boom")
+
+async def both() -> str:
+    gather(strategy="best-effort"):
+        a = ok_fn()
+        b = fail_fn()
+    return f"a={a} b={type(b).__name__}"
+
+def main() -> None:
+    print(asyncio.run(both()))
+
+if __name__ == "__main__":
+    main()

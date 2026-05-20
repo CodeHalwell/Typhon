@@ -1,0 +1,9 @@
+# Dict[k] returns V (raises KeyError) — should be int, not int?
+
+def main() -> None:
+    let d: dict[str, int] = {"a": 1}
+    let v: int = d["a"]
+    print(v)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,25 @@
+# Match `case ... if cond:` — does match exhaustiveness handle guards?
+
+class Circle:
+    r: float
+class Square:
+    side: float
+
+type Shape = Circle | Square
+
+def area(s: Shape) -> float:
+    match s:
+        case Circle(r) if r > 0.0:
+            return 3.14159 * r * r
+        case Circle(r):
+            return 0.0
+        case Square(side):
+            return side * side
+
+def main() -> None:
+    print(area(Circle(r=2.0)))
+    print(area(Circle(r=-1.0)))
+    print(area(Square(side=3.0)))
+
+if __name__ == "__main__":
+    main()

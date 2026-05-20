@@ -1,0 +1,13 @@
+# Frozen class with field assign — must fail (tyc::frozen_assign)
+
+class Point frozen:
+    x: float
+    y: float
+
+def main() -> None:
+    let p: Point = Point(x=1.0, y=2.0)
+    p.x = 5.0
+    print(p.x)
+
+if __name__ == "__main__":
+    main()

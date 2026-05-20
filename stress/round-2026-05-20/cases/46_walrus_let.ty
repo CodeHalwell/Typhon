@@ -1,0 +1,9 @@
+# Walrus operator should introduce implicit let binding.
+
+def main() -> None:
+    let xs: list[int] = [1, 2, 3, 4, 5]
+    if (n := len(xs)) > 3:
+        print(f"n={n}")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,13 @@
+# comptime def — function evaluated at build time.
+
+comptime def feature(name: str) -> bool:
+    return name == "auth"
+
+comptime let HAS_AUTH: bool = feature("auth")
+comptime let HAS_BILL: bool = feature("billing")
+
+def main() -> None:
+    print(HAS_AUTH, HAS_BILL)
+
+if __name__ == "__main__":
+    main()

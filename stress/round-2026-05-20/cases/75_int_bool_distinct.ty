@@ -1,0 +1,11 @@
+# Docs say bool is NOT a subtype of int. Test mixing.
+
+def needs_int(x: int) -> int:
+    return x + 1
+
+def main() -> None:
+    let b: bool = True
+    print(needs_int(b))
+
+if __name__ == "__main__":
+    main()

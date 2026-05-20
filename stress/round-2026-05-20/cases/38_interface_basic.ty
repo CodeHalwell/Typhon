@@ -1,0 +1,28 @@
+# Interface with impl block — finding #26 was a critical bug.
+
+interface Greeter:
+    def greet(self) -> str
+
+class English:
+    name: str
+
+impl English:
+    def greet(self) -> str:
+        return f"Hello, {self.name}"
+
+class French:
+    name: str
+
+impl French:
+    def greet(self) -> str:
+        return f"Bonjour, {self.name}"
+
+def call(g: Greeter) -> None:
+    print(g.greet())
+
+def main() -> None:
+    call(English(name="alice"))
+    call(French(name="bob"))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,14 @@
+# Pipes into a user-defined function with multiple args
+
+def add(a: int, b: int) -> int:
+    return a + b
+
+def square(x: int) -> int:
+    return x * x
+
+def main() -> None:
+    let v: int = 3 |> add(4) |> square()
+    print(v)
+
+if __name__ == "__main__":
+    main()

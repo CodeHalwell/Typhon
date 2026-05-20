@@ -1,0 +1,12 @@
+# Big ints — Python is arbitrary precision but does tyc respect it?
+
+def main() -> None:
+    let huge: int = 2 ** 100
+    let neg: int = -(2 ** 50)
+    let zero: int = 0
+    print(huge)
+    print(neg)
+    print(zero + huge)
+
+if __name__ == "__main__":
+    main()

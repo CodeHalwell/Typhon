@@ -1,0 +1,12 @@
+# Compare different types — Python permits but type checker?
+
+def main() -> None:
+    let a: int = 5
+    let s: str = "hello"
+    if a == s:
+        print("eq")
+    else:
+        print("neq")
+
+if __name__ == "__main__":
+    main()

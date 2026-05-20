@@ -1,0 +1,11 @@
+# Empty function body with `pass`.
+
+def nothing() -> None:
+    pass
+
+def main() -> None:
+    nothing()
+    print("ok")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,10 @@
+# Unicode identifiers.
+
+def main() -> None:
+    let π: float = 3.14159
+    let café: str = "expresso"
+    let 数: int = 42
+    print(π, café, 数)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,15 @@
+# @pure on a function that transitively calls print().
+
+def log(msg: str) -> None:
+    print(msg)
+
+@pure
+def doubled(x: int) -> int:
+    log(f"computing {x}")
+    return x * 2
+
+def main() -> None:
+    print(doubled(3))
+
+if __name__ == "__main__":
+    main()

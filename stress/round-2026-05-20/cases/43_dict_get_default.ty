@@ -1,0 +1,10 @@
+# dict.get(k, default) — should it return V (not V?) when default provided?
+
+def main() -> None:
+    let d: dict[str, int] = {"a": 1}
+    let v: int = d.get("a", 0)
+    let w: int = d.get("missing", 99)
+    print(v, w)
+
+if __name__ == "__main__":
+    main()

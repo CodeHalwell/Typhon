@@ -1,0 +1,19 @@
+# `go f() -> task` form, await later.
+
+import asyncio
+
+async def compute() -> int:
+    await asyncio.sleep(0.01)
+    return 100
+
+async def main_a() -> None:
+    go compute() -> t1
+    go compute() -> t2
+    let s: int = await t1 + await t2
+    print(s)
+
+def main() -> None:
+    asyncio.run(main_a())
+
+if __name__ == "__main__":
+    main()

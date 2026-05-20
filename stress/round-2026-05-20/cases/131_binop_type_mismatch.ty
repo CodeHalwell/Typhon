@@ -1,0 +1,10 @@
+# Mixed binop types — should errors fire?
+
+def main() -> None:
+    let a: list[int] = [1, 2]
+    let b: dict[str, int] = {"a": 1}
+    let r = a + b
+    print(r)
+
+if __name__ == "__main__":
+    main()

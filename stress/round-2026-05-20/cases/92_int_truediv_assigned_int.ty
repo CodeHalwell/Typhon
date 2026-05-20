@@ -1,0 +1,10 @@
+# Truediv result assigned to int — should fail.
+
+def main() -> None:
+    let a: int = 10
+    let b: int = 3
+    let i: int = a / b
+    print(i)
+
+if __name__ == "__main__":
+    main()

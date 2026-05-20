@@ -1,0 +1,10 @@
+# for loop target — should be auto-bound, no `let`/`mut` needed.
+
+def main() -> None:
+    mut total: int = 0
+    for i in [1, 2, 3]:
+        total = total + i
+    print(total)
+
+if __name__ == "__main__":
+    main()

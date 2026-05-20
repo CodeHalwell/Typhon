@@ -1,0 +1,10 @@
+# Confirm the walrus paren-strip bug.
+
+def main() -> None:
+    mut total: int = 0
+    while (chunk := input()) != "":
+        total = total + len(chunk)
+    print(total)
+
+if __name__ == "__main__":
+    main()

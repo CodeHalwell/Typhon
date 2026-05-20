@@ -1,0 +1,15 @@
+# lazy let — module level should sentinel-cache
+
+def expensive() -> int:
+    print("computing...")
+    return 42
+
+lazy let CACHED: int = expensive()
+
+def main() -> None:
+    print(CACHED)
+    print(CACHED)
+    print(CACHED)
+
+if __name__ == "__main__":
+    main()

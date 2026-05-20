@@ -1,0 +1,21 @@
+# A class that does NOT fully satisfy an interface — should fail.
+
+interface Drawable:
+    def draw(self) -> None
+    def width(self) -> float
+
+class Button:
+    label: str
+
+impl Button:
+    def draw(self) -> None:
+        print(self.label)
+
+def render(d: Drawable) -> None:
+    d.draw()
+
+def main() -> None:
+    render(Button(label="x"))
+
+if __name__ == "__main__":
+    main()

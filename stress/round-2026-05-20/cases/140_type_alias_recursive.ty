@@ -1,0 +1,19 @@
+# Type alias that includes itself.
+
+type IntTree = int | list["IntTree"]
+
+def total(t: IntTree) -> int:
+    match t:
+        case int() as n:
+            return n
+        case list() as xs:
+            mut s: int = 0
+            for x in xs:
+                s = s + total(x)
+            return s
+
+def main() -> None:
+    print(total([1, [2, [3, 4]], 5]))
+
+if __name__ == "__main__":
+    main()

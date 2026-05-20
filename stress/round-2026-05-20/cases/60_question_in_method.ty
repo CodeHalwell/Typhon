@@ -1,0 +1,31 @@
+# `?` inside an impl method.
+
+class Validator:
+    threshold: int
+
+impl Validator:
+    def check(self, n: int) -> Result[int, str]:
+        if n < 0:
+            return Err("negative")
+        return Ok(n)
+
+    def chain(self, n: int) -> Result[int, str]:
+        let v: int = self.check(n)?
+        if v > self.threshold:
+            return Err("too big")
+        return Ok(v)
+
+def main() -> None:
+    let v: Validator = Validator(threshold=10)
+    match v.chain(5):
+        case Ok(n): print(n)
+        case Err(e): print(e)
+    match v.chain(-1):
+        case Ok(n): print(n)
+        case Err(e): print(e)
+    match v.chain(99):
+        case Ok(n): print(n)
+        case Err(e): print(e)
+
+if __name__ == "__main__":
+    main()

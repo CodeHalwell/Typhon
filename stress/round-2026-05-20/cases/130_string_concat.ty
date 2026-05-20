@@ -1,0 +1,10 @@
+# String + with mismatched types — should error.
+
+def main() -> None:
+    let n: int = 5
+    let s: str = "hello"
+    let r: str = s + n
+    print(r)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,17 @@
+# lazy let in class body — should become @cached_property
+
+class Service:
+    base: int
+
+impl Service:
+    lazy let derived: int = self.base * 10
+    def get(self) -> int:
+        return self.derived
+
+def main() -> None:
+    let s: Service = Service(base=4)
+    print(s.get())
+    print(s.derived)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,9 @@
+# Missing module - finding #79.
+
+from doesnotexist import foo
+
+def main() -> None:
+    print(foo)
+
+if __name__ == "__main__":
+    main()

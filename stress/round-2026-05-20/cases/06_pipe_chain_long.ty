@@ -1,0 +1,8 @@
+# Very long pipe chain
+
+def main() -> None:
+    let result: str = "  Hello, World!  " |> str.strip() |> str.lower() |> str.replace(",", "") |> str.replace("!", "") |> str.replace(" ", "_")
+    print(result)
+
+if __name__ == "__main__":
+    main()

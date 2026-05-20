@@ -1,0 +1,18 @@
+# Mapping patterns in match.
+
+def describe(d: dict[str, int]) -> str:
+    match d:
+        case {"x": x, "y": y}:
+            return f"pt {x},{y}"
+        case {"name": n}:
+            return f"name:{n}"
+        case _:
+            return "?"
+
+def main() -> None:
+    print(describe({"x": 1, "y": 2}))
+    print(describe({"name": "alice"}))
+    print(describe({"foo": 99}))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,12 @@
+# extend a builtin int.
+
+extend int:
+    def squared(self) -> int:
+        return self * self
+
+def main() -> None:
+    let n: int = 5
+    print(n.squared())
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,18 @@
+# Long nullable narrowing chain — multiple levels of guard
+
+class User:
+    id: int
+    email: str?
+
+def find_user(id: int) -> User?:
+    if id == 1:
+        return User(id=1, email="a@b.com")
+    return None
+
+def main() -> None:
+    guard u = find_user(1) else: return
+    guard e = u.email else: return
+    print(f"id={u.id} email={e}")
+
+if __name__ == "__main__":
+    main()

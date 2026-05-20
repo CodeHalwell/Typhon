@@ -1,0 +1,15 @@
+# Demonstrate that defaulted class fields are NOT class constants.
+
+class Status:
+    OK: int = 200
+    NOT_FOUND: int = 404
+
+def main() -> None:
+    print(Status.OK)
+    if Status.OK == 200:
+        print("ok")
+    else:
+        print("broken")
+
+if __name__ == "__main__":
+    main()

@@ -4649,3 +4649,71 @@ and noted here so future readers don't chase them again.
   (same as the historical #18 / #65). The Typhon-aware printer
   documented at `tyc-format/src/lib.rs:17` remains future work.
 
+
+---
+
+## Status as of `claude/test-typhon-library-ejNr5` (fresh round, 2026-05-20)
+
+Ran ~140 hand-written `.ty` programs through `tyc check` / `tyc build` /
+`tyc fmt` / `tyc migrate` / `tyc trace` / `tyc repl` / `tyc init`, plus a
+multi-file project test. Repro corpus + full notes at
+`stress/round-2026-05-20/`. Numbered R3.1–R3.18 to avoid colliding with
+the global list; each one references the relevant `cases/*.ty` file.
+
+Top-line: many prior findings are confirmed fixed (#7, #11, #13, #14,
+#22, #26, #31, #32, #62, #79, #84, #92) but a fresh cluster of
+silent / runtime-only bugs surfaced. Read in full at
+[stress/round-2026-05-20/FINDINGS.md](stress/round-2026-05-20/FINDINGS.md).
+
+### Highlights (full detail in the round file)
+
+- **R3.1 (CRITICAL silent miscompile)** — walrus parens are stripped at
+  emission. `if (n := len(xs)) > 3:` lowers to `if n := len(xs) > 3:`;
+  `n` ends up bound to a `bool` because of Python's `:=` precedence. Every
+  `while (x := …) != "":` loop is wrong.
+- **R3.2 (CRITICAL silent footgun)** — `class HTTP: GET: str = "GET"`
+  makes `HTTP.GET` a slot descriptor (because of
+  `@dataclass(slots=True)`), not the string `"GET"`. `match s:
+  case HTTP.GET:` silently never fires.
+- **R3.3** — single-line `with` chain (`with a = f(x)?, b = g(a)?:`)
+  without an `else err:` block is parsed as a regular Python `with` and
+  rejects the `?`. Multi-line form with `else err:` works.
+- **R3.4** — aliased `lazy import` (`lazy import np = json`) crashes at
+  runtime with "module object substituted in sys.modules during a lazy
+  load". Un-aliased form works.
+- **R3.5** — `lazy let X: T` inside an `impl` block doesn't lower to
+  `@cached_property`; the desugarer drops it into the class body and the
+  resolver then errors on `self`.
+- **R3.6** — operator type-checking is largely absent: `s: str + n: int`,
+  `list + dict` etc. accepted at check time, runtime `TypeError`.
+- **R3.7** — wrong-kwarg constructor calls (`User(id=1, nmae="alice")`)
+  not caught.
+- **R3.8** — wrong field name in match (`case Point(z=z):`) not caught.
+- **R3.9** — `int / int` assigned to an `int`-annotated binding accepted;
+  runtime is `float`.
+- **R3.10** — `tuple[int, str][2]` (out-of-arity index) accepted at check
+  time.
+- **R3.11** — `c |> Counter.add(5)` lowers to `Counter.add(c, 5)` but the
+  type checker counts impl-method args without `self`, so it sees a 1-arg
+  target and reports "got 2".
+- **R3.12** — five concrete match-exhaustiveness shapes surface as
+  `missing_return` even though the function is total: kw-bind wildcards,
+  `[*xs]`, guarded-then-unguarded same-class pairs, nested matches, and
+  bind patterns (`int() as n`, `list() as xs`) on recursive aliases. A
+  sixth (wrong positional arity in a class pattern) surfaces as
+  `missing_return` instead of an arity-specific diagnostic.
+- **R3.13 / R3.14 / R3.15** — confirmed STILL OPEN: #66 (`?` in
+  sub-expression), #83 (`async def` w/o await warning), #65 (`tyc fmt`
+  near-no-op).
+- **R3.16** — `@staticmethod` in `impl` blocks: arg count drops `n`
+  alongside `self`; `Counter.make(5)` reports `expected 0, got 1`.
+- **R3.17 / R3.18** — doc drift: guides show `stubs/*.dty` but the
+  compiler only picks up `.dty` inside `src/`; emitted `.pyi` carries
+  `@dataclasses.dataclass(slots=True)` implementation decorators that
+  don't belong in stub surface.
+
+Suggested fix order (highest-impact first): R3.1 (one printer fix,
+silent correctness) → R3.2 (design call: auto-`ClassVar` vs diagnostic)
+→ R3.3 (parser disambiguation) → R3.6 (operator type-check, big surface
+of silent runtime errors) → R3.7/R3.8 (kwarg & field validity) →
+R3.12 (match exhaustiveness shapes).

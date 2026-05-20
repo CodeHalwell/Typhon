@@ -1,0 +1,8 @@
+# Bare collection annotation - finding #72: should be rejected under no-implicit-any.
+
+def main() -> None:
+    let xs: list = [1, 2, 3]
+    print(xs)
+
+if __name__ == "__main__":
+    main()

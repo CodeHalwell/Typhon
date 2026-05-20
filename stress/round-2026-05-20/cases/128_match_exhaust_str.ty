@@ -1,0 +1,14 @@
+# match on str — typically not exhaustive, but with _ should be.
+
+def status(s: str) -> int:
+    match s:
+        case "ok": return 200
+        case "missing": return 404
+        case _: return 500
+
+def main() -> None:
+    print(status("ok"))
+    print(status("???"))
+
+if __name__ == "__main__":
+    main()

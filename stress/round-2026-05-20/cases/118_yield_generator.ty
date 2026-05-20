@@ -1,0 +1,15 @@
+# Generator function with yield — return type?
+
+from typing import Iterator
+
+def odds(n: int) -> Iterator[int]:
+    for i in range(n):
+        if i % 2 == 1:
+            yield i
+
+def main() -> None:
+    let total: int = sum(odds(10))
+    print(total)
+
+if __name__ == "__main__":
+    main()

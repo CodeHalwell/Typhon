@@ -1,0 +1,16 @@
+# Compile-time computation. Skill says supports arithmetic, ternaries, list literals.
+
+comptime let A: int = 2 + 3 * 4
+comptime let B: int = (1 + 2) * (3 - 4)
+comptime let C: str = "hi" + " " + "there"
+comptime let D: bool = (5 > 3) and ("a" < "b")
+comptime let E: list[int] = [1, 2, 3]
+comptime let F: tuple[int, int] = (1, 2)
+comptime let G: dict[str, int] = {"a": 1}
+comptime let H: str = "PROD" if True else "DEV"
+
+def main() -> None:
+    print(A, B, C, D, E, F, G, H)
+
+if __name__ == "__main__":
+    main()

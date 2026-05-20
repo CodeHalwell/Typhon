@@ -1,0 +1,25 @@
+# Recursive sealed unions (a linked list / tree)
+
+class Leaf:
+    value: int
+
+class Node:
+    value: int
+    left: "Tree"
+    right: "Tree"
+
+type Tree = Leaf | Node
+
+def sum_tree(t: Tree) -> int:
+    match t:
+        case Leaf(value):
+            return value
+        case Node(value, left, right):
+            return value + sum_tree(left) + sum_tree(right)
+
+def main() -> None:
+    let t: Tree = Node(value=1, left=Leaf(value=2), right=Node(value=3, left=Leaf(value=4), right=Leaf(value=5)))
+    print(sum_tree(t))
+
+if __name__ == "__main__":
+    main()

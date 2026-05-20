@@ -1,0 +1,9 @@
+# lazy let — does it have the typhon_runtime import bug from #84?
+
+lazy let CONFIG: dict[str, int] = {"a": 1, "b": 2}
+
+def main() -> None:
+    print(CONFIG)
+
+if __name__ == "__main__":
+    main()

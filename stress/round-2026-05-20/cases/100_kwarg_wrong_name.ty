@@ -1,0 +1,12 @@
+# Wrong kwarg name — should report a clear error.
+
+class User:
+    id: int
+    name: str
+
+def main() -> None:
+    let u: User = User(id=1, nmae="alice")
+    print(u.name)
+
+if __name__ == "__main__":
+    main()

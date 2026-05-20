@@ -1,0 +1,11 @@
+# Sync calling async without await - should be tyc::missing_await.
+
+async def fetch() -> int:
+    return 42
+
+def main() -> None:
+    let x: int = fetch()
+    print(x)
+
+if __name__ == "__main__":
+    main()

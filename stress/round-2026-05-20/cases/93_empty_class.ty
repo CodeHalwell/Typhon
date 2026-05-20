@@ -1,0 +1,11 @@
+# Empty class with `pass`.
+
+class Empty:
+    pass
+
+def main() -> None:
+    let e: Empty = Empty()
+    print(type(e).__name__)
+
+if __name__ == "__main__":
+    main()

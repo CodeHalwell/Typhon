@@ -1,0 +1,19 @@
+# Generic Result chains. Does ? unify error types across generic boundaries?
+
+def first[T](xs: list[T]) -> Result[T, str]:
+    if len(xs) == 0:
+        return Err("empty")
+    return Ok(xs[0])
+
+def double_first(xs: list[int]) -> Result[int, str]:
+    let f: int = first(xs)?
+    return Ok(f * 2)
+
+def main() -> None:
+    let r: Result[int, str] = double_first([10, 20])
+    match r:
+        case Ok(v): print(v)
+        case Err(e): print(e)
+
+if __name__ == "__main__":
+    main()

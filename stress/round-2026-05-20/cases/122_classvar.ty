@@ -1,0 +1,14 @@
+# Class attribute via ClassVar — the standard Python escape.
+
+from typing import ClassVar
+
+class HTTP:
+    GET: ClassVar[str] = "GET"
+    POST: ClassVar[str] = "POST"
+
+def main() -> None:
+    print(HTTP.GET)
+    print(HTTP.POST)
+
+if __name__ == "__main__":
+    main()

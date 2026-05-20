@@ -1,0 +1,10 @@
+# Unused import - should be an error per strictness default.
+
+import json
+import sys
+
+def main() -> None:
+    print(sys.argv[0])
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,11 @@
+# Deeply nested type annotations — does the parser cope?
+
+def f(x: dict[str, list[tuple[int, dict[str, Result[int, str]?]?]?]]) -> int:
+    return len(x)
+
+def main() -> None:
+    let v: dict[str, list[tuple[int, dict[str, Result[int, str]?]?]?]] = {}
+    print(f(v))
+
+if __name__ == "__main__":
+    main()

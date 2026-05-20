@@ -1,0 +1,10 @@
+# Let-destructure — what's the right syntax?
+
+def main() -> None:
+    let t: tuple[int, str] = (1, "hi")
+    let x, y = t
+    x = 5  # should fail — x is let
+    print(x, y)
+
+if __name__ == "__main__":
+    main()

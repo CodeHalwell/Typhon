@@ -1,0 +1,11 @@
+# Index out of typed tuple — does the type checker see it?
+
+def main() -> None:
+    let t: tuple[int, str] = (1, "hi")
+    let x: int = t[0]
+    let y: str = t[1]
+    let z: bool = t[2]
+    print(x, y, z)
+
+if __name__ == "__main__":
+    main()

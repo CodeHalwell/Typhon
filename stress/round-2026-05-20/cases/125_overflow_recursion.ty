@@ -1,0 +1,12 @@
+# Test deep recursion — make sure Typhon doesn't blow the parser.
+
+def deep(n: int) -> int:
+    if n == 0:
+        return 0
+    return deep(n - 1) + 1
+
+def main() -> None:
+    print(deep(500))
+
+if __name__ == "__main__":
+    main()

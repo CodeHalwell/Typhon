@@ -1,0 +1,9 @@
+# Tuple destructuring assignment.
+
+def main() -> None:
+    let t: tuple[int, str, bool] = (1, "hi", True)
+    let a, b, c = t
+    print(a, b, c)
+
+if __name__ == "__main__":
+    main()

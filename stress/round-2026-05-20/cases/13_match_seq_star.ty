@@ -1,0 +1,21 @@
+# Sequence patterns with star.
+
+def describe(xs: list[int]) -> str:
+    match xs:
+        case []:
+            return "empty"
+        case [x]:
+            return f"one:{x}"
+        case [x, y]:
+            return f"two:{x},{y}"
+        case [first, *rest]:
+            return f"first={first} rest_len={len(rest)}"
+
+def main() -> None:
+    print(describe([]))
+    print(describe([1]))
+    print(describe([1, 2]))
+    print(describe([1, 2, 3, 4]))
+
+if __name__ == "__main__":
+    main()

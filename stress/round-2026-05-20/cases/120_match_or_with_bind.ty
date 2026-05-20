@@ -1,0 +1,21 @@
+# Or-pattern with bindings that must be compatible.
+
+class Cat:
+    name: str
+class Dog:
+    name: str
+    age: int
+
+type Animal = Cat | Dog
+
+def title(a: Animal) -> str:
+    match a:
+        case Cat(name=n) | Dog(name=n):
+            return f"Animal {n}"
+
+def main() -> None:
+    print(title(Cat(name="Whiskers")))
+    print(title(Dog(name="Rex", age=5)))
+
+if __name__ == "__main__":
+    main()

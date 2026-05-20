@@ -1,0 +1,10 @@
+# lazy import with alias
+
+lazy import np = json
+
+def main() -> None:
+    let s: str = np.dumps([1, 2, 3])
+    print(s)
+
+if __name__ == "__main__":
+    main()

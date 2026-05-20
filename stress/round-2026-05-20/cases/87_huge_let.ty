@@ -1,0 +1,28 @@
+# 100 let bindings — sanity check on memory/parsing.
+
+def main() -> None:
+    let a01: int = 1
+    let a02: int = 2
+    let a03: int = 3
+    let a04: int = 4
+    let a05: int = 5
+    let a06: int = 6
+    let a07: int = 7
+    let a08: int = 8
+    let a09: int = 9
+    let a10: int = 10
+    let a11: int = 11
+    let a12: int = 12
+    let a13: int = 13
+    let a14: int = 14
+    let a15: int = 15
+    let a16: int = 16
+    let a17: int = 17
+    let a18: int = 18
+    let a19: int = 19
+    let a20: int = 20
+    let total: int = a01 + a02 + a03 + a04 + a05 + a06 + a07 + a08 + a09 + a10 + a11 + a12 + a13 + a14 + a15 + a16 + a17 + a18 + a19 + a20
+    print(total)
+
+if __name__ == "__main__":
+    main()

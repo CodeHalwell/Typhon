@@ -1,0 +1,12 @@
+# Mutable default values in class fields - finding #62.
+
+class Config:
+    tags: list[str] = []
+    flags: dict[str, bool] = {}
+
+def main() -> None:
+    let c: Config = Config()
+    print(c.tags, c.flags)
+
+if __name__ == "__main__":
+    main()

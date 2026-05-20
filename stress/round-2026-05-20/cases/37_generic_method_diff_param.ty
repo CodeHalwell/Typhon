@@ -1,0 +1,16 @@
+# Method-level generic param distinct from class-level.
+
+class Box[T]:
+    value: T
+
+impl[T] Box[T]:
+    def map[U](self, f: Callable[[T], U]) -> Box[U]:
+        return Box(value=f(self.value))
+
+def main() -> None:
+    let b: Box[int] = Box(value=10)
+    let s: Box[str] = b.map(lambda x: f"v={x}")
+    print(s.value)
+
+if __name__ == "__main__":
+    main()

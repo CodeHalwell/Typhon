@@ -1,0 +1,12 @@
+# F-string with format specs and self-doc.
+
+def main() -> None:
+    let x: float = 3.14159
+    let n: int = 42
+    print(f"{x:.2f}")
+    print(f"{n:05d}")
+    print(f"{x=:.3f}")  # debug f-string
+    print(f"{n=}")
+
+if __name__ == "__main__":
+    main()

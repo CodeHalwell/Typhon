@@ -1,0 +1,25 @@
+# Match using keyword patterns (case Class(field=name))
+
+class Point:
+    x: int
+    y: int
+
+def describe(p: Point) -> str:
+    match p:
+        case Point(x=0, y=0):
+            return "origin"
+        case Point(x=0, y=y):
+            return f"y-axis at {y}"
+        case Point(x=x, y=0):
+            return f"x-axis at {x}"
+        case Point(x=x, y=y):
+            return f"({x}, {y})"
+
+def main() -> None:
+    print(describe(Point(x=0, y=0)))
+    print(describe(Point(x=0, y=5)))
+    print(describe(Point(x=3, y=0)))
+    print(describe(Point(x=1, y=2)))
+
+if __name__ == "__main__":
+    main()
