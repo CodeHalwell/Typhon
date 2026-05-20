@@ -1,0 +1,12 @@
+# A single `case [*xs]:` pattern is exhaustive — should not flag missing_return.
+
+def describe(xs: list[int]) -> int:
+    match xs:
+        case [*ys]:
+            return len(ys)
+
+def main() -> None:
+    print(describe([1, 2, 3]))
+
+if __name__ == "__main__":
+    main()

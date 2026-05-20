@@ -1,0 +1,14 @@
+# Unicode literals and escapes.
+
+def main() -> None:
+    let emoji: str = "🦀 ⚡ 🐍"
+    let escapes: str = "tab\there\né"
+    let raw: str = r"\n is not newline"
+    let bytes_lit: bytes = b"hello"
+    print(emoji)
+    print(escapes)
+    print(raw)
+    print(bytes_lit)
+
+if __name__ == "__main__":
+    main()

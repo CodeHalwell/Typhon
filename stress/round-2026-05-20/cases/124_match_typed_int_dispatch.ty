@@ -1,0 +1,18 @@
+# Match using typed dispatch (`x: int` annotation in case).
+
+class Box:
+    v: int
+
+def go(b: Box) -> int:
+    match b:
+        case Box(v=n) if n > 0:
+            return n
+        case Box(v=n):
+            return -n
+
+def main() -> None:
+    print(go(Box(v=5)))
+    print(go(Box(v=-3)))
+
+if __name__ == "__main__":
+    main()

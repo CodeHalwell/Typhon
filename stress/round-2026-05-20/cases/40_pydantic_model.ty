@@ -1,0 +1,13 @@
+# `model` keyword — emits BaseModel with extra="forbid"
+
+model ApiUser:
+    id: int
+    name: str
+    email: str?
+
+def main() -> None:
+    let u: ApiUser = ApiUser(id=1, name="alice", email=None)
+    print(u.id, u.name, u.email)
+
+if __name__ == "__main__":
+    main()

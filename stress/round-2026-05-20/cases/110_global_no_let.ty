@@ -1,0 +1,15 @@
+# global declaration without prior let/mut - finding #61.
+
+def inc() -> None:
+    global counter
+    counter = counter + 1
+
+mut counter: int = 0
+
+def main() -> None:
+    inc()
+    inc()
+    print(counter)
+
+if __name__ == "__main__":
+    main()

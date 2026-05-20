@@ -1,0 +1,12 @@
+# extend a builtin — str.slug
+
+extend str:
+    def slug(self) -> str:
+        return self.lower().replace(" ", "-")
+
+def main() -> None:
+    let s: str = "Hello World Example"
+    print(s.slug())
+
+if __name__ == "__main__":
+    main()

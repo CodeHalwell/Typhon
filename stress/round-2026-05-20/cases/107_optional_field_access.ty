@@ -1,0 +1,16 @@
+# Accessing field on a nullable — should fail.
+
+class User:
+    name: str
+
+def find(id: int) -> User?:
+    if id == 1:
+        return User(name="alice")
+    return None
+
+def main() -> None:
+    let u: User? = find(1)
+    print(u.name)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,33 @@
+# with-chain with else err: clause
+
+def step1(x: int) -> Result[int, str]:
+    if x < 0:
+        return Err("neg")
+    return Ok(x + 1)
+
+def step2(x: int) -> Result[int, str]:
+    return Ok(x * 2)
+
+def step3(x: int) -> Result[int, str]:
+    if x > 100:
+        return Err("too big")
+    return Ok(x + 10)
+
+def chain(x: int) -> Result[int, str]:
+    with a = step1(x)?,
+         b = step2(a)?,
+         c = step3(b)?:
+        return Ok(c)
+    else err:
+        return Err(f"chain failed: {err}")
+
+def main() -> None:
+    match chain(5):
+        case Ok(v): print(v)
+        case Err(e): print(e)
+    match chain(-1):
+        case Ok(v): print(v)
+        case Err(e): print(e)
+
+if __name__ == "__main__":
+    main()

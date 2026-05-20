@@ -1,0 +1,16 @@
+# Match with too many fields in positional pattern.
+
+class Point:
+    x: int
+    y: int
+
+def describe(p: Point) -> str:
+    match p:
+        case Point(x, y, z):
+            return f"{x},{y},{z}"
+
+def main() -> None:
+    print(describe(Point(x=1, y=2)))
+
+if __name__ == "__main__":
+    main()

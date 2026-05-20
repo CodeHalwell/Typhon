@@ -1,0 +1,13 @@
+# Match on int with literal cases — is exhaustiveness checked?
+
+def describe(n: int) -> str:
+    match n:
+        case 0: return "zero"
+        case 1: return "one"
+        case 2: return "two"
+
+def main() -> None:
+    print(describe(0))
+
+if __name__ == "__main__":
+    main()

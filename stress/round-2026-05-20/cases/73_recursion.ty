@@ -1,0 +1,18 @@
+# Recursion + mutual recursion.
+
+def is_even(n: int) -> bool:
+    if n == 0:
+        return True
+    return is_odd(n - 1)
+
+def is_odd(n: int) -> bool:
+    if n == 0:
+        return False
+    return is_even(n - 1)
+
+def main() -> None:
+    print(is_even(8), is_odd(8))
+    print(is_even(7), is_odd(7))
+
+if __name__ == "__main__":
+    main()

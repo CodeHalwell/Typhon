@@ -1,0 +1,20 @@
+# @classmethod / @staticmethod inside impl?
+
+class Counter:
+    value: int
+
+impl Counter:
+    @classmethod
+    def zero(cls) -> "Counter":
+        return Counter(value=0)
+    @staticmethod
+    def make(n: int) -> "Counter":
+        return Counter(value=n)
+
+def main() -> None:
+    let a: Counter = Counter.zero()
+    let b: Counter = Counter.make(5)
+    print(a.value, b.value)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,18 @@
+# Decorator factory (param decorator) - finding #89.
+
+def tag(name: str) -> Callable[[Callable[[int], int]], Callable[[int], int]]:
+    def dec(f: Callable[[int], int]) -> Callable[[int], int]:
+        def inner(x: int) -> int:
+            return f(x) + 1
+        return inner
+    return dec
+
+@tag("foo")
+def square(x: int) -> int:
+    return x * x
+
+def main() -> None:
+    print(square(3))
+
+if __name__ == "__main__":
+    main()

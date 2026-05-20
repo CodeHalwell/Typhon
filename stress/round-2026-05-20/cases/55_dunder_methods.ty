@@ -1,0 +1,20 @@
+# Dunder methods (__add__, __str__) in impl.
+
+class Vec:
+    x: float
+    y: float
+
+impl Vec:
+    def __add__(self, other: "Vec") -> "Vec":
+        return Vec(x=self.x + other.x, y=self.y + other.y)
+    def __str__(self) -> str:
+        return f"<{self.x}, {self.y}>"
+
+def main() -> None:
+    let a: Vec = Vec(x=1.0, y=2.0)
+    let b: Vec = Vec(x=3.0, y=4.0)
+    let c: Vec = a + b
+    print(c)
+
+if __name__ == "__main__":
+    main()

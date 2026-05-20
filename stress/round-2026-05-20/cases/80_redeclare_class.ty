@@ -1,0 +1,14 @@
+# Class redeclaration - finding #77.
+
+class User:
+    id: int
+
+class User:
+    name: str
+
+def main() -> None:
+    let u: User = User(name="x")
+    print(u.name)
+
+if __name__ == "__main__":
+    main()

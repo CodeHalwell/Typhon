@@ -1,0 +1,14 @@
+# @pure calling random.* — should error.
+
+import random
+
+@pure
+def random_double(x: int) -> int:
+    let r: float = random.random()
+    return x * 2
+
+def main() -> None:
+    print(random_double(5))
+
+if __name__ == "__main__":
+    main()

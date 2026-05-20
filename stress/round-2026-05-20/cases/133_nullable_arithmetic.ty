@@ -1,0 +1,12 @@
+# Arithmetic with nullable — should fail.
+
+def get() -> int?:
+    return 5
+
+def main() -> None:
+    let n: int? = get()
+    let r: int = n + 1
+    print(r)
+
+if __name__ == "__main__":
+    main()

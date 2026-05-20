@@ -1,0 +1,14 @@
+# Truthy narrowing — `if x:` should narrow T? to T. Finding #14 said it didn't.
+
+def find(id: int) -> str?:
+    if id == 1:
+        return "alice"
+    return None
+
+def main() -> None:
+    let n: str? = find(1)
+    if n:
+        print(n.upper())
+
+if __name__ == "__main__":
+    main()

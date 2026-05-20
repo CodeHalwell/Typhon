@@ -1,0 +1,10 @@
+# lazy import — bespoke proxy class
+
+lazy import json
+
+def main() -> None:
+    let s: str = json.dumps({"a": 1, "b": 2})
+    print(s)
+
+if __name__ == "__main__":
+    main()

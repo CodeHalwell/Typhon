@@ -1,0 +1,11 @@
+# @pure marked on function that does I/O — should be rejected (tyc::impure_pure_fn).
+
+@pure
+def bad(s: str) -> None:
+    print(s)
+
+def main() -> None:
+    bad("x")
+
+if __name__ == "__main__":
+    main()

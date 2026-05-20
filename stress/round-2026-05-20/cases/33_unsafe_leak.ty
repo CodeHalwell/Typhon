@@ -1,0 +1,14 @@
+# Unsafe Any flowing out without re-assertion. Should this be caught?
+
+import json
+
+def get_val() -> int:
+    unsafe:
+        let raw = json.loads('{"x": 5}')
+    return raw["x"]
+
+def main() -> None:
+    print(get_val())
+
+if __name__ == "__main__":
+    main()

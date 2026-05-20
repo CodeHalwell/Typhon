@@ -1,0 +1,10 @@
+# Too few args.
+
+def needs_two(a: int, b: int) -> int:
+    return a + b
+
+def main() -> None:
+    print(needs_two(1))
+
+if __name__ == "__main__":
+    main()

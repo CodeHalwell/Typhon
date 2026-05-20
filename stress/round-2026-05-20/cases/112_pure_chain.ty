@@ -1,0 +1,15 @@
+# @pure on a chain - if any callee is impure, fail.
+
+@pure
+def double(x: int) -> int:
+    return x * 2
+
+@pure
+def quadruple(x: int) -> int:
+    return double(double(x))
+
+def main() -> None:
+    print(quadruple(5))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,9 @@
+# for-loop target reassign inside body - finding #75.
+
+def main() -> None:
+    for i in [1, 2, 3]:
+        i = i + 100
+        print(i)
+
+if __name__ == "__main__":
+    main()

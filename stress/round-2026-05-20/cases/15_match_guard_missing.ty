@@ -1,0 +1,21 @@
+# Match where ALL cases are guarded — should this be flagged non-exhaustive?
+
+class Circle:
+    r: float
+class Square:
+    side: float
+
+type Shape = Circle | Square
+
+def area(s: Shape) -> float:
+    match s:
+        case Circle(r) if r > 0.0:
+            return 3.14 * r * r
+        case Square(side) if side > 0.0:
+            return side * side
+
+def main() -> None:
+    print(area(Circle(r=-1.0)))
+
+if __name__ == "__main__":
+    main()

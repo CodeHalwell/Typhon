@@ -1,0 +1,25 @@
+# nonlocal / global should not require let/mut
+
+mut counter: int = 0
+
+def inc() -> None:
+    global counter
+    counter = counter + 1
+
+def make_counter() -> Callable[[], int]:
+    mut n: int = 0
+    def inner() -> int:
+        nonlocal n
+        n = n + 1
+        return n
+    return inner
+
+def main() -> None:
+    inc()
+    inc()
+    print(counter)
+    let c: Callable[[], int] = make_counter()
+    print(c(), c(), c())
+
+if __name__ == "__main__":
+    main()

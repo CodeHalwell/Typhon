@@ -1,0 +1,12 @@
+# Frozen class with `frozen` modifier (finding #1 was originally a parse error)
+
+class Point frozen:
+    x: float
+    y: float
+
+def main() -> None:
+    let p: Point = Point(x=1.0, y=2.0)
+    print(p.x, p.y)
+
+if __name__ == "__main__":
+    main()

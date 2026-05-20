@@ -1,0 +1,16 @@
+# Extend list[T] — is this even supported?
+
+extend list:
+    def first_or_none[T](self: list[T]) -> T?:
+        if len(self) == 0:
+            return None
+        return self[0]
+
+def main() -> None:
+    let xs: list[int] = [1, 2, 3]
+    let ys: list[int] = []
+    print(xs.first_or_none())
+    print(ys.first_or_none())
+
+if __name__ == "__main__":
+    main()

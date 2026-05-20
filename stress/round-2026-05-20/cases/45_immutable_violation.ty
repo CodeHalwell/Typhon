@@ -1,0 +1,9 @@
+# Mutate a let binding — should fail (tyc::immutable_assign)
+
+def main() -> None:
+    let n: int = 1
+    n = 2
+    print(n)
+
+if __name__ == "__main__":
+    main()

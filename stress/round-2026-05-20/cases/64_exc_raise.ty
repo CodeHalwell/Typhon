@@ -1,0 +1,16 @@
+# raise + try/except — basic.
+
+def safe_div(a: int, b: int) -> int:
+    if b == 0:
+        raise ValueError("zero")
+    return a // b
+
+def main() -> None:
+    try:
+        print(safe_div(10, 2))
+        print(safe_div(10, 0))
+    except ValueError as e:
+        print(f"err: {e}")
+
+if __name__ == "__main__":
+    main()

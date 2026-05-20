@@ -1,0 +1,11 @@
+# impl on a class that does not exist - finding #78.
+
+impl NotARealClass:
+    def hi(self) -> str:
+        return "hi"
+
+def main() -> None:
+    print("ok")
+
+if __name__ == "__main__":
+    main()

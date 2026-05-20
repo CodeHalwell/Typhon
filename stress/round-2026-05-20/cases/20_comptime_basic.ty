@@ -1,0 +1,12 @@
+# comptime constants — basic cases
+
+comptime let PORT: int = 8080
+comptime let NAME: str = "service"
+comptime let LIMIT: float = 3.14
+comptime let DEBUG: bool = False
+
+def main() -> None:
+    print(f"{NAME} on :{PORT} debug={DEBUG} pi~={LIMIT}")
+
+if __name__ == "__main__":
+    main()

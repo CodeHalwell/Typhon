@@ -1,0 +1,10 @@
+# let without explicit type — should be inferred.
+
+def main() -> None:
+    let x = 42
+    let s = "hello"
+    let xs = [1, 2, 3]
+    print(x, s, xs)
+
+if __name__ == "__main__":
+    main()

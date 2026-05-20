@@ -1,0 +1,18 @@
+# *args and **kwargs.
+
+def show_all(*args: int) -> int:
+    mut total: int = 0
+    for x in args:
+        total = total + x
+    return total
+
+def kw_print(**kwargs: str) -> str:
+    let parts: list[str] = [f"{k}={v}" for k, v in kwargs.items()]
+    return " ".join(parts)
+
+def main() -> None:
+    print(show_all(1, 2, 3, 4))
+    print(kw_print(a="x", b="y"))
+
+if __name__ == "__main__":
+    main()

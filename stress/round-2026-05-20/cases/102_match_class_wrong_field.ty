@@ -1,0 +1,18 @@
+# Match with wrong field name (kw pattern).
+
+class Point:
+    x: int
+    y: int
+
+def describe(p: Point) -> str:
+    match p:
+        case Point(z=z):
+            return f"{z}"
+        case _:
+            return "?"
+
+def main() -> None:
+    print(describe(Point(x=1, y=2)))
+
+if __name__ == "__main__":
+    main()

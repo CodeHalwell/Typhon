@@ -1,0 +1,10 @@
+# `*args: T, sep: str = "-"` form (finding #86)
+
+def join(sep: str, *parts: str) -> str:
+    return sep.join(parts)
+
+def main() -> None:
+    print(join("-", "a", "b", "c"))
+
+if __name__ == "__main__":
+    main()

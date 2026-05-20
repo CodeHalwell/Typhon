@@ -1,0 +1,11 @@
+# Comprehensions — list, dict, set, generator.
+
+def main() -> None:
+    let xs: list[int] = [i * i for i in range(5)]
+    let ds: dict[int, int] = {i: i * 2 for i in range(3)}
+    let ss: set[int] = {i % 3 for i in range(10)}
+    let gen: list[int] = list(i + 1 for i in range(3))
+    print(xs, ds, ss, gen)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,16 @@
+# Generic class Box[T] + impl methods.
+
+class Box[T]:
+    value: T
+
+impl[T] Box[T]:
+    def get(self) -> T:
+        return self.value
+
+def main() -> None:
+    let b: Box[int] = Box(value=10)
+    let s: Box[str] = Box(value="hi")
+    print(b.get(), s.get())
+
+if __name__ == "__main__":
+    main()

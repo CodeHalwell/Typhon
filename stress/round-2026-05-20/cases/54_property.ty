@@ -1,0 +1,16 @@
+# @property decorator inside impl.
+
+class Box:
+    items: list[int]
+
+impl Box:
+    @property
+    def count(self) -> int:
+        return len(self.items)
+
+def main() -> None:
+    let b: Box = Box(items=[1, 2, 3])
+    print(b.count)
+
+if __name__ == "__main__":
+    main()

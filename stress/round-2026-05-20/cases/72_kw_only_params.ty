@@ -1,0 +1,12 @@
+# Keyword-only parameters.
+
+def make(name: str, *, age: int = 0, city: str = "?") -> str:
+    return f"{name},{age},{city}"
+
+def main() -> None:
+    print(make("a"))
+    print(make("b", age=10))
+    print(make("c", city="x", age=20))
+
+if __name__ == "__main__":
+    main()

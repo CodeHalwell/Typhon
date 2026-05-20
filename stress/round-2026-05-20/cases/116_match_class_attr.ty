@@ -1,0 +1,22 @@
+# Match using attribute lookup (not class pattern).
+
+class State:
+    GO: int = 1
+    STOP: int = 0
+
+def describe(n: int) -> str:
+    match n:
+        case State.GO:
+            return "go"
+        case State.STOP:
+            return "stop"
+        case _:
+            return "?"
+
+def main() -> None:
+    print(describe(1))
+    print(describe(0))
+    print(describe(99))
+
+if __name__ == "__main__":
+    main()

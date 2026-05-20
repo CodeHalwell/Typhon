@@ -1,0 +1,11 @@
+# Type of `/` (truediv) - should be float regardless of operand types.
+
+def main() -> None:
+    let a: int = 10
+    let b: int = 3
+    let f: float = a / b
+    let i: int = a // b
+    print(f, i)
+
+if __name__ == "__main__":
+    main()

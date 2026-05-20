@@ -1,0 +1,13 @@
+# Class attribute constants — does Typhon support them?
+
+class HTTP:
+    GET: str = "GET"
+    POST: str = "POST"
+    PUT: str = "PUT"
+
+def main() -> None:
+    print(HTTP.GET)
+    print(HTTP.POST)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,9 @@
+# dict.get(k) without default — must return V?, must require narrowing.
+
+def main() -> None:
+    let d: dict[str, int] = {"a": 1}
+    let v: int = d.get("a")
+    print(v)
+
+if __name__ == "__main__":
+    main()

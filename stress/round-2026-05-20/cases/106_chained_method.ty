@@ -1,0 +1,17 @@
+# Chained method calls.
+
+class Counter:
+    value: int
+
+impl Counter:
+    def inc(self) -> "Counter":
+        return Counter(value=self.value + 1)
+    def double(self) -> "Counter":
+        return Counter(value=self.value * 2)
+
+def main() -> None:
+    let result: Counter = Counter(value=1).inc().inc().double()
+    print(result.value)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,14 @@
+# @pure calling time.* — should error (entropy).
+
+import time
+
+@pure
+def time_double(x: int) -> int:
+    let t: float = time.time()
+    return x * 2
+
+def main() -> None:
+    print(time_double(5))
+
+if __name__ == "__main__":
+    main()

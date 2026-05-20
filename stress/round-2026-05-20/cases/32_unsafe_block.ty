@@ -1,0 +1,12 @@
+# unsafe: block letting Any flow inside, re-assert at boundary.
+
+import json
+
+def main() -> None:
+    unsafe:
+        let raw = json.loads('{"x": 1, "y": 2}')
+        let x_val: int = raw["x"]
+    print(x_val)
+
+if __name__ == "__main__":
+    main()

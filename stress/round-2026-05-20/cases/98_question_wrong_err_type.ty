@@ -1,0 +1,16 @@
+# `?` propagating Err[int] into Result[T, str] - finding #13 was a gap.
+
+def inner() -> Result[int, int]:
+    return Err(99)
+
+def outer() -> Result[int, str]:
+    let v: int = inner()?
+    return Ok(v)
+
+def main() -> None:
+    match outer():
+        case Ok(v): print(v)
+        case Err(e): print(e)
+
+if __name__ == "__main__":
+    main()

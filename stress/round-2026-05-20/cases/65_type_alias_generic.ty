@@ -1,0 +1,16 @@
+# type alias with generic param
+
+type Vec[T] = list[T]
+
+def head[T](xs: Vec[T]) -> T?:
+    if len(xs) == 0:
+        return None
+    return xs[0]
+
+def main() -> None:
+    let v: Vec[int] = [1, 2, 3]
+    print(head(v))
+    print(head([]))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,16 @@
+# Pipe into a method on a user class.
+
+class Counter:
+    value: int
+
+impl Counter:
+    def add(self, n: int) -> int:
+        return self.value + n
+
+def main() -> None:
+    let c: Counter = Counter(value=10)
+    let v: int = c |> Counter.add(5)
+    print(v)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,18 @@
+# `go f()` no handle — should fire-and-forget.
+
+import asyncio
+
+async def background(name: str) -> None:
+    await asyncio.sleep(0.001)
+    print(f"bg:{name}")
+
+async def main_a() -> None:
+    go background("one")
+    go background("two")
+    await asyncio.sleep(0.05)
+
+def main() -> None:
+    asyncio.run(main_a())
+
+if __name__ == "__main__":
+    main()

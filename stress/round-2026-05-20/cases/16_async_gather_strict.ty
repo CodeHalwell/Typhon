@@ -1,0 +1,28 @@
+# Strict gather: with three calls
+
+import asyncio
+
+async def fetch_a() -> int:
+    await asyncio.sleep(0.01)
+    return 1
+
+async def fetch_b() -> int:
+    await asyncio.sleep(0.01)
+    return 2
+
+async def fetch_c() -> int:
+    await asyncio.sleep(0.01)
+    return 3
+
+async def all_three() -> int:
+    gather:
+        a = fetch_a()
+        b = fetch_b()
+        c = fetch_c()
+    return a + b + c
+
+def main() -> None:
+    print(asyncio.run(all_three()))
+
+if __name__ == "__main__":
+    main()

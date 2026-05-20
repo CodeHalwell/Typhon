@@ -1,0 +1,19 @@
+# Self-referencing class (finding #32). Should work with __future__ annotations.
+
+class Counter:
+    value: int
+
+impl Counter:
+    def add(self, other: "Counter") -> "Counter":
+        return Counter(value=self.value + other.value)
+    def __lt__(self, other: "Counter") -> bool:
+        return self.value < other.value
+
+def main() -> None:
+    let a: Counter = Counter(value=3)
+    let b: Counter = Counter(value=5)
+    print(a.add(b).value)
+    print(a < b)
+
+if __name__ == "__main__":
+    main()

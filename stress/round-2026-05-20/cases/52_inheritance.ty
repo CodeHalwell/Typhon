@@ -1,0 +1,18 @@
+# Inheritance from class — base + derived fields.
+
+class Animal:
+    name: str
+
+class Dog(Animal):
+    breed: str
+
+impl Dog:
+    def describe(self) -> str:
+        return f"{self.name} the {self.breed}"
+
+def main() -> None:
+    let d: Dog = Dog(name="Rex", breed="poodle")
+    print(d.describe())
+
+if __name__ == "__main__":
+    main()

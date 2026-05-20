@@ -1,0 +1,22 @@
+# Can `?` appear as an argument to a function call?
+# Per finding #66, this is a gap — verify status.
+
+def parse_int(s: str) -> Result[int, str]:
+    if not s.isdigit():
+        return Err("nope")
+    return Ok(int(s))
+
+def add(a: int, b: int) -> int:
+    return a + b
+
+def go(s: str, t: str) -> Result[int, str]:
+    return Ok(add(parse_int(s)?, parse_int(t)?))
+
+def main() -> None:
+    let r: Result[int, str] = go("1", "2")
+    match r:
+        case Ok(v): print(v)
+        case Err(e): print(e)
+
+if __name__ == "__main__":
+    main()

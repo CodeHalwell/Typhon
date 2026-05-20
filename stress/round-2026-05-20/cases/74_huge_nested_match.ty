@@ -1,0 +1,24 @@
+# Heavily nested match cases.
+
+class Tag:
+    name: str
+    children: list["Tag"]
+
+def depth(t: Tag) -> int:
+    if len(t.children) == 0:
+        return 1
+    mut best: int = 0
+    for c in t.children:
+        let d: int = depth(c)
+        if d > best:
+            best = d
+    return best + 1
+
+def main() -> None:
+    let leaf: Tag = Tag(name="leaf", children=[])
+    let mid: Tag = Tag(name="mid", children=[leaf, leaf])
+    let root: Tag = Tag(name="root", children=[mid, leaf])
+    print(depth(root))
+
+if __name__ == "__main__":
+    main()

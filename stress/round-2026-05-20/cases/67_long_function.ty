@@ -1,0 +1,20 @@
+# Function with many let bindings + control flow.
+
+def compute(n: int) -> int:
+    let a: int = n + 1
+    let b: int = a * 2
+    let c: int = b - 3
+    let d: int = c * c
+    let e: int = d % 17
+    if e == 0:
+        return 0
+    let f: int = e + 1
+    let g: int = f - 1
+    let h: int = g + a + b + c + d
+    return h
+
+def main() -> None:
+    print(compute(5))
+
+if __name__ == "__main__":
+    main()

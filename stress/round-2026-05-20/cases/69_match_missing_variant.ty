@@ -1,0 +1,21 @@
+# Missing a variant in match — should error.
+
+class A:
+    x: int
+class B:
+    x: int
+class C:
+    x: int
+
+type Three = A | B | C
+
+def fn(t: Three) -> int:
+    match t:
+        case A(x): return x
+        case B(x): return x * 2
+
+def main() -> None:
+    print(fn(A(x=1)))
+
+if __name__ == "__main__":
+    main()

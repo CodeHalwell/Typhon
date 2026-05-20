@@ -1,0 +1,15 @@
+# impl method without explicit self — docs say it's "optional", let's see.
+
+class Counter:
+    value: int
+
+impl Counter:
+    def show() -> str:
+        return "hi"
+
+def main() -> None:
+    let c: Counter = Counter(value=1)
+    print(c.show())
+
+if __name__ == "__main__":
+    main()

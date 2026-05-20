@@ -1,0 +1,13 @@
+# @pure that raises — should fail (condition 6).
+
+@pure
+def bad(x: int) -> int:
+    if x < 0:
+        raise ValueError("neg")
+    return x
+
+def main() -> None:
+    print(bad(5))
+
+if __name__ == "__main__":
+    main()

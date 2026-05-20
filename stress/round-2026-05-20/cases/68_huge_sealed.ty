@@ -1,0 +1,43 @@
+# Big sealed union — 10 variants.
+
+class V01:
+    n: int
+class V02:
+    n: int
+class V03:
+    n: int
+class V04:
+    n: int
+class V05:
+    n: int
+class V06:
+    n: int
+class V07:
+    n: int
+class V08:
+    n: int
+class V09:
+    n: int
+class V10:
+    n: int
+
+type V = V01 | V02 | V03 | V04 | V05 | V06 | V07 | V08 | V09 | V10
+
+def total(v: V) -> int:
+    match v:
+        case V01(n): return n * 1
+        case V02(n): return n * 2
+        case V03(n): return n * 3
+        case V04(n): return n * 4
+        case V05(n): return n * 5
+        case V06(n): return n * 6
+        case V07(n): return n * 7
+        case V08(n): return n * 8
+        case V09(n): return n * 9
+        case V10(n): return n * 10
+
+def main() -> None:
+    print(total(V05(n=2)))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,21 @@
+# async with — context manager
+
+import asyncio
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
+
+@asynccontextmanager
+async def ctx(name: str) -> AsyncIterator[str]:
+    print(f"enter:{name}")
+    yield name
+    print(f"exit:{name}")
+
+async def main_a() -> None:
+    async with ctx("test") as v:
+        print(f"using:{v}")
+
+def main() -> None:
+    asyncio.run(main_a())
+
+if __name__ == "__main__":
+    main()
