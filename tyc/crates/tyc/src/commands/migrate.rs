@@ -305,7 +305,13 @@ fn rewrite_line(
 /// (`List` → `list`, `Dict` → `dict`, etc.). Removing them from the
 /// `from typing import …` line drops the now-dead names.
 const TYPING_NAMES_TO_REWRITE: &[&str] = &[
-    "Optional", "List", "Dict", "Tuple", "Set", "FrozenSet", "Type",
+    "Optional",
+    "List",
+    "Dict",
+    "Tuple",
+    "Set",
+    "FrozenSet",
+    "Type",
 ];
 
 /// Rewrite `from typing import …, Optional, …` by dropping any name in
@@ -333,9 +339,7 @@ fn strip_optional_from_typing_import(trimmed_line: &str) -> Option<String> {
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
-    let has_rewritten = names
-        .iter()
-        .any(|n| TYPING_NAMES_TO_REWRITE.contains(n));
+    let has_rewritten = names.iter().any(|n| TYPING_NAMES_TO_REWRITE.contains(n));
     if !has_rewritten {
         return None;
     }

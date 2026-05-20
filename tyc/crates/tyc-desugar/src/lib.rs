@@ -445,7 +445,6 @@ fn make_typhon_runtime_import() -> Stmt {
     })
 }
 
-
 /// Build `import typhon_runtime`.
 fn make_bare_typhon_runtime_import() -> Stmt {
     Stmt::Import(StmtImport {
@@ -1458,10 +1457,7 @@ fn collect_multi_base_parents(body: &[Stmt]) -> std::collections::HashSet<String
     parents
 }
 
-fn collect_multi_base_parents_into(
-    body: &[Stmt],
-    parents: &mut std::collections::HashSet<String>,
-) {
+fn collect_multi_base_parents_into(body: &[Stmt], parents: &mut std::collections::HashSet<String>) {
     for stmt in body {
         match stmt {
             Stmt::ClassDef(c) => {

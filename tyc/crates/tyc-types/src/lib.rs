@@ -738,10 +738,7 @@ pub fn type_from_annotation_with_params(
                     Expr::Tuple(t) => t.elts.iter().collect(),
                     other => vec![other],
                 };
-                let widened: Vec<Type> = variants
-                    .into_iter()
-                    .map(literal_widened_type)
-                    .collect();
+                let widened: Vec<Type> = variants.into_iter().map(literal_widened_type).collect();
                 if widened.is_empty() {
                     return Type::Unknown;
                 }
@@ -4285,8 +4282,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         // `type JSON = int | str | None | ...` annotation
                         // is nullable once unwrapped even though the bare
                         // `Class("JSON")` doesn't look like it. FINDINGS #121.
-                        let expected_unwrapped_nullable =
-                            c.unwrap_alias(&expected).is_nullable();
+                        let expected_unwrapped_nullable = c.unwrap_alias(&expected).is_nullable();
                         let nullable_into_non_nullable = !expected_unwrapped_nullable
                             && actual.is_nullable()
                             && !matches!(expected, Type::TypeVar(_));

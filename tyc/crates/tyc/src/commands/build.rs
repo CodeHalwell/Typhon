@@ -133,9 +133,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // time with ModuleNotFoundError when the user hasn't declared pydantic
     // explicitly.
     let mut config = config;
-    if sources_use_model_keyword(&sources)
-        && !config.dependencies.contains_key("pydantic")
-    {
+    if sources_use_model_keyword(&sources) && !config.dependencies.contains_key("pydantic") {
         config
             .dependencies
             .insert("pydantic".to_string(), "*".to_string());
