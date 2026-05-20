@@ -4600,3 +4600,52 @@ fix lands as its own commit.
   that walrus introduces an implicit-`let` binding and requires
   `mut` to rebind.
 
+### Verified already-fixed on a prior branch
+
+The following findings from the `rNIYC` campaign turned out to
+already be addressed by an earlier fix; re-verified on this branch
+and noted here so future readers don't chase them again.
+
+- **#110** `gather:` with dependent bindings — covered by the #60
+  fix on `claude/test-typhon-library-rNIYC` (the desugarer now
+  detects an inter-binding dependency and falls back to sequential
+  awaits instead of an `asyncio.TaskGroup`). Re-tested with
+  `gather: a = fetch_a(); b = fetch_b(a)` — emits sequential
+  `await`s as expected.
+- **#120** comptime container subscript — covered by the #88 fix
+  on `claude/review-findings-fixes-VRFJy`. `comptime let A: list[int]
+  = [1, 2, 3]; comptime let B: int = A[0]` now type-checks and
+  inlines correctly.
+- **#125** `let q: int` (no init) + tuple destructure — covered by
+  the #91 fix on `claude/review-findings-fixes-VRFJy`. The
+  uninitialised declaration is now rejected at the `let` site with
+  `tyc::missing_initialiser`, with help that suggests
+  `let q: int = <expr>`. Reassignment-via-destructure is not
+  separately accepted, but the diagnostic now clearly explains why.
+
+### Still open after this branch
+
+- **#107** `unsafe:` value leak detection — requires a real
+  `Unsafe[T]` marker type in `tyc-types` and a flow-sensitive
+  pass through the block boundary. Not in this branch's scope.
+- **#108** TypedDict dict-literal inference — requires the
+  type-checker to register TypedDict-derived class shapes and
+  match dict literals against the expected field set. Not in
+  this branch's scope.
+- **#111** sequence pattern `[a, b]` vs `(a, b)` round-trip —
+  PEP 634 makes these semantically identical and the runtime
+  behaviour is correct. Round-tripping the original bracket
+  choice requires source-range tracking on the pattern node and
+  is purely cosmetic.
+- **#112** Protocol structural conformance against built-ins —
+  requires the type-checker to know which built-in types
+  implement which dunder methods (`__len__`, `__iter__`, etc.).
+  Not in this branch's scope.
+- **#117 / #118 / #119** pipe corner cases (lambda RHS, impl
+  method self, parenthesised sub-expression) — pipe expansion is
+  a top-of-statement-line pre-pass; lifting it into general
+  expression position needs a lexer-aware rewrite.
+- **#122** `tyc fmt` is a no-op — Phase-5 deferral, unchanged
+  (same as the historical #18 / #65). The Typhon-aware printer
+  documented at `tyc-format/src/lib.rs:17` remains future work.
+
