@@ -3545,8 +3545,7 @@ fn stmt_always_exits(stmt: &Stmt) -> bool {
         // Case (b) is the common `try: return Ok(x) except E: return Err(e)`
         // pattern that must not be flagged as a missing-return false positive.
         Stmt::Try(t) => {
-            let finally_exits =
-                !t.finalbody.is_empty() && body_always_exits(&t.finalbody);
+            let finally_exits = !t.finalbody.is_empty() && body_always_exits(&t.finalbody);
             let try_and_handlers_exit = body_always_exits(&t.body)
                 && t.handlers.iter().all(|h| {
                     let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
@@ -3647,8 +3646,7 @@ fn stmt_always_exits_aware(c: &Checker, stmt: &Stmt) -> bool {
         }
         Stmt::Match(m) => match_arms_always_exit_aware(c, m),
         Stmt::Try(t) => {
-            let finally_exits =
-                !t.finalbody.is_empty() && body_always_exits_aware(c, &t.finalbody);
+            let finally_exits = !t.finalbody.is_empty() && body_always_exits_aware(c, &t.finalbody);
             let try_and_handlers_exit = body_always_exits_aware(c, &t.body)
                 && t.handlers.iter().all(|h| {
                     let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
