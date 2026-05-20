@@ -16,7 +16,7 @@ on:
         required: true
         type: string
       ref:
-        description: "Branch, tag, or commit SHA to build from. Defaults to the default branch. If the tag above does not yet exist, it will be created at this ref."
+        description: "Branch, tag, or commit SHA to build from. Leave empty to build from `tag` itself (re-release an existing tag). Set this when `tag` does not yet exist — the tag will be created at this ref."
         required: false
         type: string
         default: ""
