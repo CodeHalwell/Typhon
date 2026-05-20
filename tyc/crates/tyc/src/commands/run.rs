@@ -52,24 +52,35 @@ pub struct RunArgs {
     pub compile: bool,
 
     /// Entry-point `.py` (relative to the build dir) for `--compile` mode.
-    /// Defaults to `main.py`.
-    #[arg(long, value_name = "FILE", default_value = "main.py")]
+    /// Defaults to `main.py`. Requires `--compile`.
+    #[arg(
+        long,
+        value_name = "FILE",
+        default_value = "main.py",
+        requires = "compile"
+    )]
     pub entry: PathBuf,
 
     /// Python interpreter to use in `--compile` mode (defaults to `python3`).
-    #[arg(long, value_name = "PATH", default_value = "python3")]
+    /// Requires `--compile`.
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = "python3",
+        requires = "compile"
+    )]
     pub python: String,
 
-    /// `--compile` only: build into a temporary directory that is deleted
-    /// when the process exits, instead of the configured `out` dir.  No
-    /// build artifacts persist on disk — the "tyx in-memory" mode.
-    /// Implies a fresh build every invocation.
-    #[arg(long, short = 't', conflicts_with = "no_build")]
+    /// Build into a temporary directory that is deleted when the process
+    /// exits, instead of the configured `out` dir. No build artifacts
+    /// persist on disk — the "tyx in-memory" mode. Implies a fresh build
+    /// every invocation. Requires `--compile`.
+    #[arg(long, short = 't', conflicts_with = "no_build", requires = "compile")]
     pub temp: bool,
 
-    /// `--compile` only: skip rebuilding; assume the `build/` directory is
-    /// already current.  Incompatible with `--temp`.
-    #[arg(long)]
+    /// Skip rebuilding; assume the `build/` directory is already current.
+    /// Incompatible with `--temp`. Requires `--compile`.
+    #[arg(long, requires = "compile")]
     pub no_build: bool,
 
     /// Extra arguments forwarded to the program after `--`.
@@ -155,38 +166,44 @@ pub fn run(args: RunArgs) -> Result<()> {
 
 /// Default execution path — the in-process tree-walking VM. Resolves the
 /// entry-point source file from `args.path` (a `.ty` file directly, or the
-/// project root containing `src/main.ty`), then evaluates it.
+/// project root containing `src/main.ty`), then evaluates it. The script's
+/// `sys.argv` is populated from `args.script_args`, with `argv[0]` set to
+/// the entry-point path.
 fn run_vm(args: RunArgs) -> Result<()> {
     let entry = resolve_vm_entry(&args.path)?;
-
-    // The VM reads sys.argv from std::env::args; populate it via env so
-    // the user's script_args are visible. We re-exec ourselves? No — simpler:
-    // expose them through an env var the VM consults. For now, document
-    // that `sys.argv` mirrors the host process args.
-    // (A future revision can wire `script_args` straight into `sys.argv`.)
-    let _ = args.script_args;
-
-    let code = tyc_vm::run_file(&entry).map_err(|e| miette!("{e}"))?;
+    let code = tyc_vm::run_file(&entry, &args.script_args).map_err(|e| miette!("{e}"))?;
     std::process::exit(code);
 }
 
+/// Resolve a Typhon entry point from a user-supplied path. If the path is a
+/// file, use it directly. Otherwise treat it as a project directory and look
+/// up `[project] src` in `typhon.toml` (defaulting to `src/`) to find
+/// `main.ty`. `.dty` files are stubs, not runnable code, so we never pick one.
 fn resolve_vm_entry(path: &std::path::Path) -> Result<PathBuf> {
     if path.is_file() {
         return Ok(path.to_path_buf());
     }
-    // Look for typhon.toml; default entry is `src/main.ty`.
-    let candidates: [PathBuf; 3] = [
-        path.join("src").join("main.ty"),
-        path.join("main.ty"),
-        path.join("src").join("main.dty"),
-    ];
+    // Consult typhon.toml to honour a custom `[project] src` directory.
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let src_dir = match TyphonConfig::load(&canonical) {
+        Ok(Some((toml_path, cfg))) => {
+            let project_root = toml_path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| canonical.clone());
+            project_root.join(&cfg.project.src)
+        }
+        _ => canonical.join("src"),
+    };
+    let candidates = [src_dir.join("main.ty"), path.join("main.ty")];
     for c in &candidates {
         if c.exists() {
             return Ok(c.clone());
         }
     }
     Err(miette!(
-        "no Typhon entry point found under '{}': expected a .ty file or src/main.ty",
+        "no Typhon entry point found under '{}': pass a .ty file directly, \
+         or run inside a project whose [project] src directory contains main.ty",
         path.display()
     ))
 }
@@ -230,17 +247,31 @@ mod tests {
 
     #[test]
     fn temp_flag_parses_with_short_alias() {
-        let parsed = <WrapRun as clap::Parser>::try_parse_from(["run", "-t"]).unwrap();
+        // --temp is a compile-mode flag and requires --compile.
+        let parsed = <WrapRun as clap::Parser>::try_parse_from(["run", "--compile", "-t"]).unwrap();
         assert!(parsed.args.temp);
 
-        let parsed = <WrapRun as clap::Parser>::try_parse_from(["run", "--temp"]).unwrap();
+        let parsed =
+            <WrapRun as clap::Parser>::try_parse_from(["run", "--compile", "--temp"]).unwrap();
         assert!(parsed.args.temp);
     }
 
     #[test]
+    fn temp_requires_compile() {
+        let err = <WrapRun as clap::Parser>::try_parse_from(["run", "--temp"])
+            .expect_err("--temp without --compile must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("requires") || msg.contains("required"),
+            "expected a 'requires' error, got: {msg}"
+        );
+    }
+
+    #[test]
     fn temp_and_no_build_are_mutually_exclusive() {
-        let err = <WrapRun as clap::Parser>::try_parse_from(["run", "--temp", "--no-build"])
-            .expect_err("--temp + --no-build must be rejected");
+        let err =
+            <WrapRun as clap::Parser>::try_parse_from(["run", "--compile", "--temp", "--no-build"])
+                .expect_err("--temp + --no-build must be rejected");
         let msg = err.to_string();
         assert!(
             msg.contains("cannot be used with") || msg.contains("conflicts"),

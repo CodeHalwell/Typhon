@@ -77,7 +77,10 @@ impl Env {
     /// declarations.
     pub fn set(&self, name: &str, value: Value) {
         if self.globals.borrow().contains(name) {
-            self.module_scope().bindings.borrow_mut().insert(name.into(), value);
+            self.module_scope()
+                .bindings
+                .borrow_mut()
+                .insert(name.into(), value);
             return;
         }
         if self.nonlocals.borrow().contains(name) {

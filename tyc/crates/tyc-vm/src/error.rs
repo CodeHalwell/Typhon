@@ -93,10 +93,7 @@ pub fn index_error(msg: impl Into<String>) -> Unwind {
     Unwind::Exception(VmException::new("IndexError", msg))
 }
 pub fn zero_division() -> Unwind {
-    Unwind::Exception(VmException::new(
-        "ZeroDivisionError",
-        "division by zero",
-    ))
+    Unwind::Exception(VmException::new("ZeroDivisionError", "division by zero"))
 }
 pub fn not_implemented(feature: &str) -> Unwind {
     Unwind::Exception(VmException::new(

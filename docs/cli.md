@@ -193,38 +193,42 @@ tyc debug -- --verbose --port 8080
 
 ## `tyc run`
 
-Builds the project and execs the emitted Python in a single step — the same shape as `tsx`/`ts-node` for TypeScript. Typhon has no separate VM: this is a UX shortcut around the standard `tyc build && python build/main.py` flow, not a new execution model.
+Executes a Typhon program. Two execution modes:
 
-Two output modes:
+- **VM (default).** Runs the source in the in-process tree-walking interpreter from `tyc-vm`. No `.py` is written, no CPython is spawned. See [docs/vm.md](vm.md) for the supported feature surface.
+- **`--compile`** (alias `--no-vm`). Falls back to the legacy "build then exec CPython" path — required when your program imports CPython libraries the VM doesn't speak natively (`numpy`, `requests`, `pandas`, …).
 
-- **Persistent (default).** Builds into the configured `out` dir (default `build/`). Subsequent runs reuse the incremental Salsa cache, and `.py.map` sidecars remain on disk so a post-crash `tyc trace` can map frames back to `.ty`.
-- **`--temp` (`-t`).** Builds into a fresh `tempfile::tempdir()` that is deleted when `tyc run` exits. No project artifacts persist. Trades the incremental cache and on-disk source map for a clean tree — ideal for one-shot iteration.
-
-The script's exit code propagates verbatim, so shell pipelines see the child's status unchanged. Build failures and spawn failures surface as the usual miette errors with exit code 1.
+The script's exit code propagates verbatim, so shell pipelines see the child's status unchanged. Parse, build, and spawn failures surface as the usual miette errors with exit code 1.
 
 ```bash
-# Compile-and-go, persistent build/:
+# Default (VM) — resolve src/main.ty under typhon.toml's [project] src:
 tyc run
 
-# Forward args to the script after `--`:
+# Run a specific .ty file directly:
+tyc run src/cli.ty
+
+# Forward args to the script after `--` (populates sys.argv):
 tyc run -- --port 8080 ./input.csv
 
-# Ephemeral build — leaves no artifacts behind:
-tyc run --temp -- --port 8080
+# Fall back to compile-and-exec when the VM can't handle an import:
+tyc run --compile
 
-# Different entry point in a multi-binary project:
-tyc run --entry api.py
+# Compile mode with an ephemeral build dir:
+tyc run --compile --temp -- --port 8080
 
-# Reuse the existing build/ without rebuilding:
-tyc run --no-build
+# Compile mode against a non-default entry point:
+tyc run --compile --entry api.py
 ```
 
-| Flag | Purpose |
-|------|---------|
-| `--entry FILE` | Entry-point file relative to the build dir (default `main.py`) |
-| `--python PATH` | Python interpreter (default `python3`) |
-| `--temp` / `-t` | Build into a tempdir that is deleted on exit; mutually exclusive with `--no-build` |
-| `--no-build` | Skip rebuilding; assume the persistent `build/` is current |
+| Flag | Mode | Purpose |
+|------|------|---------|
+| `--compile` (alias `--no-vm`) | switch | Build to `.py` and exec CPython instead of using the VM |
+| `--entry FILE` | compile | Entry-point file relative to the build dir (default `main.py`) |
+| `--python PATH` | compile | Python interpreter (default `python3`) |
+| `--temp` / `-t` | compile | Build into a tempdir that is deleted on exit; mutually exclusive with `--no-build` |
+| `--no-build` | compile | Skip rebuilding; assume the persistent `build/` is current |
+
+The compile-only flags (`--entry`, `--python`, `--temp`, `--no-build`) are rejected by clap unless `--compile` is also given, so a mistaken combination fails fast at the CLI rather than being silently ignored.
 
 ## `tyc add` / `tyc remove` / `tyc sync`
 

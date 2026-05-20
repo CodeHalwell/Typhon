@@ -125,9 +125,12 @@ pub enum Value {
     Iter(Rc<RefCell<IterState>>),
 }
 
+pub type NativeFnImpl =
+    dyn Fn(&mut crate::interp::Interpreter, Vec<Value>) -> Result<Value, Unwind>;
+
 pub struct NativeFn {
     pub name: &'static str,
-    pub func: Box<dyn Fn(&mut crate::interp::Interpreter, Vec<Value>) -> Result<Value, Unwind>>,
+    pub func: Box<NativeFnImpl>,
 }
 
 impl NativeFn {
@@ -185,16 +188,46 @@ pub struct Module {
 }
 
 pub enum IterState {
-    Range { current: i64, stop: i64, step: i64 },
-    List { items: RcList, index: usize },
-    Tuple { items: Rc<Vec<Value>>, index: usize },
-    Str { chars: Vec<char>, index: usize },
-    Dict { keys: Vec<HashKey>, index: usize },
-    Set { keys: Vec<HashKey>, index: usize },
-    Enumerate { inner: Rc<RefCell<IterState>>, index: i64 },
-    Zip { inners: Vec<Rc<RefCell<IterState>>> },
-    Map { func: Value, inner: Rc<RefCell<IterState>> },
-    Filter { func: Value, inner: Rc<RefCell<IterState>> },
+    Range {
+        current: i64,
+        stop: i64,
+        step: i64,
+    },
+    List {
+        items: RcList,
+        index: usize,
+    },
+    Tuple {
+        items: Rc<Vec<Value>>,
+        index: usize,
+    },
+    Str {
+        chars: Vec<char>,
+        index: usize,
+    },
+    Dict {
+        keys: Vec<HashKey>,
+        index: usize,
+    },
+    Set {
+        keys: Vec<HashKey>,
+        index: usize,
+    },
+    Enumerate {
+        inner: Rc<RefCell<IterState>>,
+        index: i64,
+    },
+    Zip {
+        inners: Vec<Rc<RefCell<IterState>>>,
+    },
+    Map {
+        func: Value,
+        inner: Rc<RefCell<IterState>>,
+    },
+    Filter {
+        func: Value,
+        inner: Rc<RefCell<IterState>>,
+    },
 }
 
 // ── Debug / display ────────────────────────────────────────────────────────
@@ -265,7 +298,11 @@ impl Value {
             Value::Range { .. } => "range",
             Value::Native(_) | Value::Function(_) | Value::BoundMethod { .. } => "function",
             Value::Class(_) => "type",
-            Value::Instance(i) => Box::leak(i.class.name.clone().into_boxed_str()),
+            // Don't leak the class name into a `'static str`. Callers that
+            // need the specific class name read `instance.class.name`
+            // directly; everywhere else `"instance"` is descriptive enough
+            // for an error message.
+            Value::Instance(_) => "instance",
             Value::ResultOk(_) => "Ok",
             Value::ResultErr(_) => "Err",
             Value::Module(_) => "module",
@@ -315,7 +352,10 @@ impl Value {
                 }
                 Ok(HashKey::Tuple(Rc::new(keys)))
             }
-            other => Err(type_error(format!("unhashable type: '{}'", other.type_name()))),
+            other => Err(type_error(format!(
+                "unhashable type: '{}'",
+                other.type_name()
+            ))),
         }
     }
 
@@ -347,7 +387,7 @@ impl Value {
                 if a.len() != b.len() {
                     return false;
                 }
-                a.iter().all(|(k, v)| b.get(k).map_or(false, |w| v.py_eq(w)))
+                a.iter().all(|(k, v)| b.get(k).is_some_and(|w| v.py_eq(w)))
             }
             (ResultOk(a), ResultOk(b)) => a.py_eq(b),
             (ResultErr(a), ResultErr(b)) => a.py_eq(b),
@@ -413,10 +453,12 @@ impl Value {
             Value::Float(x) => Ok(*x),
             Value::Int(i) => Ok(*i as f64),
             Value::Bool(b) => Ok(*b as i64 as f64),
-            Value::Str(s) => s
-                .trim()
-                .parse::<f64>()
-                .map_err(|_| value_error(format!("could not convert string to float: {:?}", s.as_str()))),
+            Value::Str(s) => s.trim().parse::<f64>().map_err(|_| {
+                value_error(format!(
+                    "could not convert string to float: {:?}",
+                    s.as_str()
+                ))
+            }),
             _ => Err(type_error(format!(
                 "float() argument must be a string or a number, not '{}'",
                 self.type_name()

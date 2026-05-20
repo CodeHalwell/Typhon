@@ -28,16 +28,22 @@ pub use value::Value;
 
 use tyc_syntax::preprocess;
 
-/// Run a Typhon source file with the VM. Returns the process exit code that
-/// `tyc run` should propagate.
-pub fn run_file(path: &Path) -> Result<i32, VmError> {
+/// Run a Typhon source file with the VM. `script_args` populates `sys.argv`
+/// after the script path. Returns the process exit code that `tyc run`
+/// should propagate.
+pub fn run_file(path: &Path, script_args: &[String]) -> Result<i32, VmError> {
     let source = std::fs::read_to_string(path)
         .map_err(|e| VmError::Io(format!("cannot read '{}': {e}", path.display())))?;
-    run_source(&source, Some(path))
+    run_source(&source, Some(path), script_args)
 }
 
-/// Run a Typhon source string. `origin` is used only for diagnostic messages.
-pub fn run_source(source: &str, origin: Option<&Path>) -> Result<i32, VmError> {
+/// Run a Typhon source string. `origin` seeds `__file__` and `sys.argv[0]`
+/// and is used in diagnostic messages.
+pub fn run_source(
+    source: &str,
+    origin: Option<&Path>,
+    script_args: &[String],
+) -> Result<i32, VmError> {
     // Apply the same surface-syntax expansions as `tyc build` so the parser
     // sees identical input. `lazy import`, `gather:`, `go`, `with`-chains,
     // pipes and `?` all get lowered to plain Python before parsing.
@@ -59,6 +65,13 @@ pub fn run_source(source: &str, origin: Option<&Path>) -> Result<i32, VmError> {
     let module = parsed.into_syntax();
 
     let mut interp = Interpreter::new();
+    // Seed sys.argv before any user code (or import sys) can observe it.
+    let argv0 = origin
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "-".to_string());
+    interp.script_argv = std::iter::once(argv0)
+        .chain(script_args.iter().cloned())
+        .collect();
     // Bind `__name__ = "__main__"` so the standard idiom works.
     interp.root.set(
         "__name__",
@@ -97,7 +110,7 @@ mod tests {
     use super::*;
 
     fn run_capturing(source: &str) -> Result<i32, VmError> {
-        run_source(source, None)
+        run_source(source, None, &[])
     }
 
     #[test]

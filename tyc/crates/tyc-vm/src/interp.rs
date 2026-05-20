@@ -11,25 +11,31 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use ruff_python_ast::{
-    self as ast, BoolOp, CmpOp, ExceptHandler, Expr, FStringPart,
-    InterpolatedStringElement, ModModule, Mutability, Number, Operator, Parameters, Pattern, Stmt,
-    UnaryOp,
+    self as ast, BoolOp, CmpOp, ExceptHandler, Expr, FStringPart, InterpolatedStringElement,
+    ModModule, Mutability, Number, Operator, Parameters, Pattern, Stmt, UnaryOp,
 };
 
 use crate::env::{Env, EnvRef};
 use crate::error::{
-    attribute_error, index_error, key_error, name_error, not_implemented,
-    type_error, value_error, zero_division, Unwind, VmException,
+    attribute_error, index_error, key_error, name_error, not_implemented, type_error, value_error,
+    zero_division, Unwind, VmException,
 };
-use crate::value::{
-    Class, ClassField, Function, HashKey, Instance, IterState, NativeFn, Value,
-};
+use crate::value::{Class, ClassField, Function, HashKey, Instance, IterState, NativeFn, Value};
 
 pub struct Interpreter {
     pub root: EnvRef,
-    /// Cached single instance of common singletons for `is` semantics.
     pub stack_depth: usize,
     pub max_stack_depth: usize,
+    /// `sys.argv` for the running script. `argv[0]` is conventionally the
+    /// script path; `argv[1..]` are the user-supplied arguments. Populated
+    /// by `lib::run_*`, not by the host process's own argv.
+    pub script_argv: Vec<String>,
+}
+
+impl Default for Interpreter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Interpreter {
@@ -39,6 +45,7 @@ impl Interpreter {
             root: root.clone(),
             stack_depth: 0,
             max_stack_depth: 256,
+            script_argv: Vec::new(),
         };
         crate::builtins::install(&mut interp);
         interp
@@ -267,7 +274,12 @@ impl Interpreter {
             Stmt::Raise(r) => {
                 let exc = match &r.exc {
                     Some(e) => self.eval_expr(e, env)?,
-                    None => return Err(Unwind::Exception(VmException::new("RuntimeError", "No active exception to re-raise"))),
+                    None => {
+                        return Err(Unwind::Exception(VmException::new(
+                            "RuntimeError",
+                            "No active exception to re-raise",
+                        )))
+                    }
                 };
                 Err(self.value_to_exception(exc))
             }
@@ -344,11 +356,7 @@ impl Interpreter {
         })
     }
 
-    fn build_class(
-        &mut self,
-        c: &ast::StmtClassDef,
-        env: &EnvRef,
-    ) -> Result<Rc<Class>, Unwind> {
+    fn build_class(&mut self, c: &ast::StmtClassDef, env: &EnvRef) -> Result<Rc<Class>, Unwind> {
         // Resolve base classes.
         let mut bases = Vec::new();
         if let Some(args) = &c.arguments {
@@ -421,9 +429,7 @@ impl Interpreter {
                 methods.entry(name.clone()).or_insert_with(|| m.clone());
             }
             for (name, v) in base.class_attrs.borrow().iter() {
-                class_attrs
-                    .entry(name.clone())
-                    .or_insert_with(|| v.clone());
+                class_attrs.entry(name.clone()).or_insert_with(|| v.clone());
             }
         }
 
@@ -779,11 +785,13 @@ impl Interpreter {
             CmpOp::Lt => match l.py_cmp(r) {
                 Some(Less) => true,
                 Some(_) => false,
-                None => return Err(type_error(format!(
-                    "'<' not supported between '{}' and '{}'",
-                    l.type_name(),
-                    r.type_name()
-                ))),
+                None => {
+                    return Err(type_error(format!(
+                        "'<' not supported between '{}' and '{}'",
+                        l.type_name(),
+                        r.type_name()
+                    )))
+                }
             },
             CmpOp::LtE => match l.py_cmp(r) {
                 Some(Less | Equal) => true,
@@ -925,13 +933,17 @@ impl Interpreter {
             )));
         }
         self.stack_depth += 1;
+        // Wrap the body in a closure so every early `return` decrements the
+        // counter on the way out — including a failure in `bind_args`.
         let call_env = Env::new_child(&f.closure);
-        self.bind_args(f, args, kwargs, receiver, &call_env)?;
-        let result = match self.exec_block(&f.body, &call_env) {
-            Ok(()) => Ok(Value::None),
-            Err(Unwind::Return(v)) => Ok(v),
-            Err(other) => Err(other),
-        };
+        let result = (|| -> Result<Value, Unwind> {
+            self.bind_args(f, args, kwargs, receiver, &call_env)?;
+            match self.exec_block(&f.body, &call_env) {
+                Ok(()) => Ok(Value::None),
+                Err(Unwind::Return(v)) => Ok(v),
+                Err(other) => Err(other),
+            }
+        })();
         self.stack_depth -= 1;
         result
     }
@@ -962,15 +974,22 @@ impl Interpreter {
         let mut kwargs_left: HashMap<String, Value> =
             kwargs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
+        // `f.defaults` was evaluated once at def-time and is indexed by
+        // `iter_non_variadic_params`: posonly, then args, then kwonlyargs.
+        // We consume it in lockstep so each parameter's default fires
+        // exactly once across all calls (matching Python's "default value
+        // computed at def time" semantics, including the classic mutable-
+        // default gotcha).
         let mut pos_iter = all_pos.into_iter();
+        let mut defaults_iter = f.defaults.iter();
         for p in &positional {
             let name = p.parameter.name.as_str();
+            let default = defaults_iter.next().and_then(|d| d.clone());
             if let Some(v) = pos_iter.next() {
                 env.set(name, v);
             } else if let Some(v) = kwargs_left.remove(name) {
                 env.set(name, v);
-            } else if let Some(d) = p.default() {
-                let v = self.eval_expr(d, &f.closure)?;
+            } else if let Some(v) = default {
                 env.set(name, v);
             } else {
                 return Err(type_error(format!(
@@ -983,10 +1002,7 @@ impl Interpreter {
         // Remaining positionals → *args, else error.
         let remaining: Vec<Value> = pos_iter.collect();
         if let Some(va) = &params.vararg {
-            env.set(
-                va.name.as_str(),
-                Value::Tuple(Rc::new(remaining)),
-            );
+            env.set(va.name.as_str(), Value::Tuple(Rc::new(remaining)));
         } else if !remaining.is_empty() {
             return Err(type_error(format!(
                 "{}() takes {} positional arguments but {} were given",
@@ -996,13 +1012,14 @@ impl Interpreter {
             )));
         }
 
-        // Keyword-only params.
+        // Keyword-only params — defaults continue from the same iterator
+        // since `iter_non_variadic_params` puts kwonlyargs after args.
         for p in &params.kwonlyargs {
             let name = p.parameter.name.as_str();
+            let default = defaults_iter.next().and_then(|d| d.clone());
             if let Some(v) = kwargs_left.remove(name) {
                 env.set(name, v);
-            } else if let Some(d) = p.default() {
-                let v = self.eval_expr(d, &f.closure)?;
+            } else if let Some(v) = default {
                 env.set(name, v);
             } else {
                 return Err(type_error(format!(
@@ -1117,13 +1134,30 @@ impl Interpreter {
                 if *b < 0 {
                     return Ok(Float((*a as f64).powf(*b as f64)));
                 }
-                return Ok(Int((*a).pow(*b as u32)));
+                let exp = u32::try_from(*b).map_err(|_| overflow())?;
+                return a.checked_pow(exp).map(Int).ok_or_else(overflow);
             }
             (Int(a), BitOr, Int(b)) => return Ok(Int(a | b)),
             (Int(a), BitAnd, Int(b)) => return Ok(Int(a & b)),
             (Int(a), BitXor, Int(b)) => return Ok(Int(a ^ b)),
-            (Int(a), LShift, Int(b)) => return Ok(Int(a << b)),
-            (Int(a), RShift, Int(b)) => return Ok(Int(a >> b)),
+            (Int(a), LShift, Int(b)) => {
+                if *b < 0 {
+                    return Err(value_error("negative shift count"));
+                }
+                let shift = u32::try_from(*b).map_err(|_| overflow())?;
+                return a.checked_shl(shift).map(Int).ok_or_else(overflow);
+            }
+            (Int(a), RShift, Int(b)) => {
+                if *b < 0 {
+                    return Err(value_error("negative shift count"));
+                }
+                // Python's int >> N for very large N saturates toward 0 (or
+                // -1 for negatives). i64 only has 64 bits, so anything >= 64
+                // is equivalent to a full sign-extension.
+                let shift = u32::try_from(*b).unwrap_or(64);
+                let sat = if *a >= 0 { 0 } else { -1 };
+                return Ok(Int(a.checked_shr(shift).unwrap_or(sat)));
+            }
 
             (Float(a), Add, Float(b)) => return Ok(Float(a + b)),
             (Float(a), Sub, Float(b)) => return Ok(Float(a - b)),
@@ -1141,7 +1175,10 @@ impl Interpreter {
         }
 
         // Mixed int/float — promote to float.
-        if matches!((l, r), (Int(_) | Bool(_), Float(_)) | (Float(_), Int(_) | Bool(_))) {
+        if matches!(
+            (l, r),
+            (Int(_) | Bool(_), Float(_)) | (Float(_), Int(_) | Bool(_))
+        ) {
             let a = l.to_float()?;
             let b = r.to_float()?;
             return self.binop(&Float(a), op, &Float(b));
@@ -1264,8 +1301,8 @@ impl Interpreter {
             }
             Value::Tuple(t) => {
                 let i = key.to_int()?;
-                let idx =
-                    normalize_index(i, t.len()).ok_or_else(|| index_error("tuple index out of range"))?;
+                let idx = normalize_index(i, t.len())
+                    .ok_or_else(|| index_error("tuple index out of range"))?;
                 Ok(t[idx].clone())
             }
             Value::Str(s) => {
@@ -1280,7 +1317,7 @@ impl Interpreter {
                 d.borrow()
                     .get(&k)
                     .cloned()
-                    .ok_or_else(|| key_error(format!("{}", key.py_repr())))
+                    .ok_or_else(|| key_error(key.py_repr()))
             }
             Value::Bytes(b) => {
                 let i = key.to_int()?;
@@ -1321,31 +1358,39 @@ impl Interpreter {
         if step_i == 0 {
             return Err(value_error("slice step cannot be zero"));
         }
-        let (start, end) = compute_slice(lower, upper, step_i, len)?;
-        let collect = |idx: Box<dyn Iterator<Item = usize>>| -> Vec<usize> { idx.collect() };
-        let indices: Vec<usize> = if step_i > 0 {
-            collect(Box::new(
-                (start..end).step_by(step_i as usize),
-            ))
-        } else {
-            // Negative step — descending.
-            let mut idx = start as isize;
-            let end = end as isize;
-            let mut out = Vec::new();
-            while idx > end {
-                out.push(idx as usize);
-                idx += step_i as isize;
+        let (start, stop, step_i) = compute_slice(lower, upper, step_i, len)?;
+        let mut indices: Vec<usize> = Vec::new();
+        if step_i > 0 {
+            let mut idx = start;
+            while idx < stop {
+                if idx >= 0 {
+                    indices.push(idx as usize);
+                }
+                idx += step_i;
             }
-            out
-        };
+        } else {
+            let mut idx = start;
+            while idx > stop {
+                if idx >= 0 {
+                    indices.push(idx as usize);
+                }
+                idx += step_i;
+            }
+        }
         match target {
             Value::List(l) => {
                 let l = l.borrow();
-                let v: Vec<Value> = indices.into_iter().filter_map(|i| l.get(i).cloned()).collect();
+                let v: Vec<Value> = indices
+                    .into_iter()
+                    .filter_map(|i| l.get(i).cloned())
+                    .collect();
                 Ok(Value::List(Rc::new(RefCell::new(v))))
             }
             Value::Tuple(t) => {
-                let v: Vec<Value> = indices.into_iter().filter_map(|i| t.get(i).cloned()).collect();
+                let v: Vec<Value> = indices
+                    .into_iter()
+                    .filter_map(|i| t.get(i).cloned())
+                    .collect();
                 Ok(Value::Tuple(Rc::new(v)))
             }
             Value::Str(s) => {
@@ -1354,7 +1399,10 @@ impl Interpreter {
                 Ok(Value::Str(Rc::new(out)))
             }
             Value::Bytes(b) => {
-                let out: Vec<u8> = indices.into_iter().filter_map(|i| b.get(i).copied()).collect();
+                let out: Vec<u8> = indices
+                    .into_iter()
+                    .filter_map(|i| b.get(i).copied())
+                    .collect();
                 Ok(Value::Bytes(Rc::new(out)))
             }
             _ => unreachable!(),
@@ -1376,7 +1424,7 @@ impl Interpreter {
                 d.borrow_mut()
                     .remove(&k)
                     .map(|_| ())
-                    .ok_or_else(|| key_error(format!("{}", key.py_repr())))
+                    .ok_or_else(|| key_error(key.py_repr()))
             }
             _ => Err(type_error("delete on unsupported target")),
         }
@@ -1412,15 +1460,9 @@ impl Interpreter {
                     class.name, attr
                 )))
             }
-            Value::Module(m) => m
-                .members
-                .borrow()
-                .get(attr)
-                .cloned()
-                .ok_or_else(|| attribute_error(format!(
-                    "module '{}' has no attribute '{}'",
-                    m.name, attr
-                ))),
+            Value::Module(m) => m.members.borrow().get(attr).cloned().ok_or_else(|| {
+                attribute_error(format!("module '{}' has no attribute '{}'", m.name, attr))
+            }),
             Value::ResultOk(v) => match attr {
                 "value" => Ok((**v).clone()),
                 _ => Err(attribute_error(format!("Ok has no attribute '{}'", attr))),
@@ -1492,12 +1534,7 @@ impl Interpreter {
         }
     }
 
-    fn assign_unpack(
-        &mut self,
-        elts: &[Expr],
-        value: Value,
-        env: &EnvRef,
-    ) -> Result<(), Unwind> {
+    fn assign_unpack(&mut self, elts: &[Expr], value: Value, env: &EnvRef) -> Result<(), Unwind> {
         let mut items: Vec<Value> = match value {
             Value::Tuple(t) => t.as_ref().clone(),
             Value::List(l) => l.borrow().clone(),
@@ -1593,7 +1630,11 @@ impl Interpreter {
 
     pub fn make_iter(&mut self, v: Value) -> Result<Value, Unwind> {
         let state = match v {
-            Value::Range { start, stop, step } => IterState::Range { current: start, stop, step },
+            Value::Range { start, stop, step } => IterState::Range {
+                current: start,
+                stop,
+                step,
+            },
             Value::List(l) => IterState::List { items: l, index: 0 },
             Value::Tuple(t) => IterState::Tuple { items: t, index: 0 },
             Value::Str(s) => {
@@ -1609,10 +1650,12 @@ impl Interpreter {
                 IterState::Set { keys, index: 0 }
             }
             Value::Iter(it) => return Ok(Value::Iter(it)),
-            other => return Err(type_error(format!(
-                "'{}' object is not iterable",
-                other.type_name()
-            ))),
+            other => {
+                return Err(type_error(format!(
+                    "'{}' object is not iterable",
+                    other.type_name()
+                )))
+            }
         };
         Ok(Value::Iter(Rc::new(RefCell::new(state))))
     }
@@ -1622,8 +1665,16 @@ impl Interpreter {
             return Err(type_error("not an iterator"));
         };
         let next: Result<Option<Value>, Unwind> = match &mut *state.borrow_mut() {
-            IterState::Range { current, stop, step } => {
-                let done = if *step > 0 { *current >= *stop } else { *current <= *stop };
+            IterState::Range {
+                current,
+                stop,
+                step,
+            } => {
+                let done = if *step > 0 {
+                    *current >= *stop
+                } else {
+                    *current <= *stop
+                };
                 if done {
                     Ok(None)
                 } else {
@@ -1725,7 +1776,9 @@ impl Interpreter {
                 loop {
                     match self.iter_next(&Value::Iter(inner.clone()))? {
                         Some(v) => {
-                            let keep = self.call_value(func.clone(), vec![v.clone()], &[])?.truthy();
+                            let keep = self
+                                .call_value(func.clone(), vec![v.clone()], &[])?
+                                .truthy();
                             if keep {
                                 return Ok(Some(v));
                             }
@@ -1912,24 +1965,28 @@ impl Interpreter {
 
     fn value_to_exception(&self, v: Value) -> Unwind {
         match v {
-            Value::Exception { kind, message } => Unwind::Exception(VmException::new(
-                (*kind).clone(),
-                (*message).clone(),
-            )),
-            Value::Instance(i) => {
-                let msg = i
-                    .fields
-                    .borrow()
-                    .get("args")
-                    .or_else(|| i.fields.borrow().get("message").cloned().as_ref().map(|_| panic!()))
-                    .cloned()
-                    .map(|v| v.py_str())
-                    .unwrap_or_default();
-                Unwind::Exception(VmException::new(i.class.name.clone(), msg).with_value(Value::Instance(i)))
+            Value::Exception { kind, message } => {
+                Unwind::Exception(VmException::new((*kind).clone(), (*message).clone()))
             }
-            other => Unwind::Exception(
-                VmException::new("Exception", other.py_str()).with_value(other),
-            ),
+            Value::Instance(i) => {
+                // Prefer `args` (Python convention), fall back to `message`,
+                // else stringify nothing. Never panic — this is the error
+                // path we hit during a `raise`.
+                let msg = {
+                    let fields = i.fields.borrow();
+                    fields
+                        .get("args")
+                        .or_else(|| fields.get("message"))
+                        .map(|v| v.py_str())
+                        .unwrap_or_default()
+                };
+                Unwind::Exception(
+                    VmException::new(i.class.name.clone(), msg).with_value(Value::Instance(i)),
+                )
+            }
+            other => {
+                Unwind::Exception(VmException::new("Exception", other.py_str()).with_value(other))
+            }
         }
     }
 
@@ -1945,7 +2002,11 @@ impl Interpreter {
         let mut entered: Vec<Value> = Vec::with_capacity(w.items.len());
         for item in &w.items {
             let cm = self.eval_expr(&item.context_expr, env)?;
-            let enter = self.get_attr(&cm, "__enter__").or_else(|_| Ok::<_, Unwind>(cm.clone()))?;
+            // Strict context-manager protocol: __enter__ must exist. The
+            // file shim in `ffi.rs` returns the file object itself from
+            // __enter__, so a `with open(...) as f:` block binds `f` to
+            // the file.
+            let enter = self.get_attr(&cm, "__enter__")?;
             let val = self.call_value(enter, vec![], &[])?;
             if let Some(t) = &item.optional_vars {
                 self.assign_target(t, val, env, None)?;
@@ -1993,12 +2054,12 @@ impl Interpreter {
                 let target = self.eval_expr(&v.value, env)?;
                 Ok(subject.py_eq(&target))
             }
-            MatchSingleton(s) => Ok(match (&s.value, subject) {
-                (ast::Singleton::None, Value::None) => true,
-                (ast::Singleton::True, Value::Bool(true)) => true,
-                (ast::Singleton::False, Value::Bool(false)) => true,
-                _ => false,
-            }),
+            MatchSingleton(s) => Ok(matches!(
+                (&s.value, subject),
+                (ast::Singleton::None, Value::None)
+                    | (ast::Singleton::True, Value::Bool(true))
+                    | (ast::Singleton::False, Value::Bool(false))
+            )),
             MatchAs(a) => {
                 let inner_ok = match &a.pattern {
                     Some(inner) => self.pattern_matches(inner, subject, env)?,
@@ -2134,12 +2195,9 @@ impl Interpreter {
                 } else {
                     None
                 };
-                let matches = match (name, want_ok) {
-                    (Some("Ok"), true) => true,
-                    (Some("Err"), false) => true,
-                    _ => false,
-                };
-                if !matches {
+                let pattern_matches =
+                    matches!((name, want_ok), (Some("Ok"), true) | (Some("Err"), false));
+                if !pattern_matches {
                     return Ok(false);
                 }
                 if let Some(p) = c.arguments.patterns.first() {
@@ -2187,31 +2245,55 @@ pub fn normalize_index(i: i64, len: usize) -> Option<usize> {
     }
 }
 
+/// Normalise a slice's `start`, `stop`, `step` for a sequence of length `len`
+/// using CPython's algorithm (see `PySlice_AdjustIndices`). Returns signed
+/// indices because negative-step slices need `stop` to be able to reach `-1`
+/// (one before index 0). The caller iterates `idx += step` from `start` until
+/// the appropriate boundary.
 fn compute_slice(
     lower: &Value,
     upper: &Value,
     step: i64,
     len: usize,
-) -> Result<(usize, usize), Unwind> {
+) -> Result<(i64, i64, i64), Unwind> {
     let len_i = len as i64;
-    let default_lo: i64 = if step > 0 { 0 } else { len_i - 1 };
-    let default_hi: i64 = if step > 0 { len_i } else { -1 };
-    let normalise = |x: i64| -> i64 {
-        if x < 0 {
-            (x + len_i).max(if step > 0 { 0 } else { -1 })
+    let clamp_start = |x: i64| -> i64 {
+        let x = if x < 0 { x + len_i } else { x };
+        if step > 0 {
+            x.clamp(0, len_i)
         } else {
-            x.min(len_i)
+            x.clamp(-1, len_i - 1)
         }
     };
-    let lo = match lower {
-        Value::None => default_lo,
-        v => normalise(v.to_int()?),
+    let clamp_stop = |x: i64| -> i64 {
+        let x = if x < 0 { x + len_i } else { x };
+        if step > 0 {
+            x.clamp(0, len_i)
+        } else {
+            x.clamp(-1, len_i - 1)
+        }
     };
-    let hi = match upper {
-        Value::None => default_hi,
-        v => normalise(v.to_int()?),
+    let start = match lower {
+        Value::None => {
+            if step > 0 {
+                0
+            } else {
+                len_i - 1
+            }
+        }
+        v => clamp_start(v.to_int()?),
     };
-    Ok((lo as usize, hi.max(0) as usize))
+    let stop = match upper {
+        Value::None => {
+            if step > 0 {
+                len_i
+            } else {
+                -1
+            }
+        }
+        v => clamp_stop(v.to_int()?),
+    };
+    Ok((start, stop, step))
 }
 
 fn values_identical(a: &Value, b: &Value) -> bool {
@@ -2363,4 +2445,3 @@ fn format_with_commas(i: i64) -> String {
     }
     out.chars().rev().collect()
 }
-

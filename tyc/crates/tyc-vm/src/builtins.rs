@@ -178,7 +178,11 @@ pub fn install(interp: &mut Interpreter) {
     native!("max", |i, args| reduce_minmax(i, args, false));
 
     native!("sum", |i, args| {
-        let it = i.make_iter(args.into_iter().next().ok_or_else(|| type_error("sum() requires an iterable"))?)?;
+        let it = i.make_iter(
+            args.into_iter()
+                .next()
+                .ok_or_else(|| type_error("sum() requires an iterable"))?,
+        )?;
         let mut acc = Value::Int(0);
         while let Some(v) = i.iter_next(&it)? {
             acc = i.binop(&acc, ruff_python_ast::Operator::Add, &v)?;
@@ -187,7 +191,11 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("sorted", |i, args| {
-        let it = i.make_iter(args.into_iter().next().ok_or_else(|| type_error("sorted() requires an iterable"))?)?;
+        let it = i.make_iter(
+            args.into_iter()
+                .next()
+                .ok_or_else(|| type_error("sorted() requires an iterable"))?,
+        )?;
         let mut out: Vec<Value> = Vec::new();
         while let Some(v) = i.iter_next(&it)? {
             out.push(v);
@@ -197,7 +205,11 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("reversed", |i, args| {
-        let it = i.make_iter(args.into_iter().next().ok_or_else(|| type_error("reversed() requires an iterable"))?)?;
+        let it = i.make_iter(
+            args.into_iter()
+                .next()
+                .ok_or_else(|| type_error("reversed() requires an iterable"))?,
+        )?;
         let mut out: Vec<Value> = Vec::new();
         while let Some(v) = i.iter_next(&it)? {
             out.push(v);
@@ -207,7 +219,10 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("enumerate", |i, args| {
-        let iterable = args.into_iter().next().ok_or_else(|| type_error("enumerate() requires an iterable"))?;
+        let iterable = args
+            .into_iter()
+            .next()
+            .ok_or_else(|| type_error("enumerate() requires an iterable"))?;
         let inner = i.make_iter(iterable)?;
         if let Value::Iter(it) = inner {
             Ok(Value::Iter(Rc::new(RefCell::new(IterState::Enumerate {
@@ -227,7 +242,9 @@ pub fn install(interp: &mut Interpreter) {
                 inners.push(it);
             }
         }
-        Ok(Value::Iter(Rc::new(RefCell::new(IterState::Zip { inners }))))
+        Ok(Value::Iter(Rc::new(RefCell::new(IterState::Zip {
+            inners,
+        }))))
     });
 
     native!("map", |i, mut args| {
@@ -263,7 +280,11 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("all", |i, args| {
-        let it = i.make_iter(args.into_iter().next().ok_or_else(|| type_error("all() requires an iterable"))?)?;
+        let it = i.make_iter(
+            args.into_iter()
+                .next()
+                .ok_or_else(|| type_error("all() requires an iterable"))?,
+        )?;
         while let Some(v) = i.iter_next(&it)? {
             if !v.truthy() {
                 return Ok(Value::Bool(false));
@@ -272,7 +293,11 @@ pub fn install(interp: &mut Interpreter) {
         Ok(Value::Bool(true))
     });
     native!("any", |i, args| {
-        let it = i.make_iter(args.into_iter().next().ok_or_else(|| type_error("any() requires an iterable"))?)?;
+        let it = i.make_iter(
+            args.into_iter()
+                .next()
+                .ok_or_else(|| type_error("any() requires an iterable"))?,
+        )?;
         while let Some(v) = i.iter_next(&it)? {
             if v.truthy() {
                 return Ok(Value::Bool(true));
@@ -282,7 +307,10 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("next", |i, args| {
-        let it = args.into_iter().next().ok_or_else(|| type_error("next() requires an iterator"))?;
+        let it = args
+            .into_iter()
+            .next()
+            .ok_or_else(|| type_error("next() requires an iterator"))?;
         match i.iter_next(&it)? {
             Some(v) => Ok(v),
             None => Err(stop_iteration()),
@@ -290,7 +318,11 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("iter", |i, args| {
-        i.make_iter(args.into_iter().next().ok_or_else(|| type_error("iter() requires an iterable"))?)
+        i.make_iter(
+            args.into_iter()
+                .next()
+                .ok_or_else(|| type_error("iter() requires an iterable"))?,
+        )
     });
 
     native!("hex", |_i, args| Ok(Value::Str(Rc::new(format!(
@@ -372,9 +404,29 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("id", |_i, args| {
+        // Stable per-object identity for heap-allocated values: the address
+        // of the underlying `Rc` payload. Immutable scalars (int, float,
+        // bool, None) hash to the address of the temporary `&Value` instead,
+        // which is fine because they have value equality, not reference
+        // identity — CPython behaves similarly (every freshly-boxed int gets
+        // a different id).
         let v = single(&args, "id")?;
-        let p: *const _ = v;
-        Ok(Value::Int(p as i64))
+        let addr: usize = match v {
+            Value::List(l) => Rc::as_ptr(l) as usize,
+            Value::Tuple(t) => Rc::as_ptr(t) as usize,
+            Value::Dict(d) => Rc::as_ptr(d) as usize,
+            Value::Set(s) => Rc::as_ptr(s) as usize,
+            Value::Str(s) => Rc::as_ptr(s) as usize,
+            Value::Bytes(b) => Rc::as_ptr(b) as usize,
+            Value::Class(c) => Rc::as_ptr(c) as usize,
+            Value::Instance(i) => Rc::as_ptr(i) as usize,
+            Value::Module(m) => Rc::as_ptr(m) as usize,
+            Value::Function(f) => Rc::as_ptr(f) as usize,
+            Value::Native(n) => Rc::as_ptr(n) as usize,
+            Value::Iter(it) => Rc::as_ptr(it) as usize,
+            other => other as *const _ as usize,
+        };
+        Ok(Value::Int(addr as i64))
     });
 
     native!("callable", |_i, args| {
@@ -466,10 +518,7 @@ pub fn install(interp: &mut Interpreter) {
     ] {
         let n = name.to_owned();
         let ctor = NativeFn::new(Box::leak(n.clone().into_boxed_str()), move |_i, args| {
-            let msg = args
-                .first()
-                .map(|v| v.py_str())
-                .unwrap_or_default();
+            let msg = args.first().map(|v| v.py_str()).unwrap_or_default();
             Ok(Value::Exception {
                 kind: Rc::new(n.clone()),
                 message: Rc::new(msg),
@@ -494,9 +543,9 @@ fn value_len(v: &Value) -> Result<usize, Unwind> {
         Value::Set(s) => s.borrow().len(),
         Value::Range { start, stop, step } => {
             if *step > 0 {
-                ((stop - start).max(0) as usize + (*step as usize - 1)) / *step as usize
+                ((stop - start).max(0) as usize).div_ceil(*step as usize)
             } else if *step < 0 {
-                ((start - stop).max(0) as usize + (-*step as usize - 1)) / (-*step) as usize
+                ((start - stop).max(0) as usize).div_ceil((-*step) as usize)
             } else {
                 0
             }
@@ -557,10 +606,7 @@ fn class_in_chain(c: &Rc<crate::value::Class>, name: &str) -> bool {
     c.bases.iter().any(|b| class_in_chain(b, name))
 }
 
-fn class_in_chain_rc(
-    c: &Rc<crate::value::Class>,
-    target: &Rc<crate::value::Class>,
-) -> bool {
+fn class_in_chain_rc(c: &Rc<crate::value::Class>, target: &Rc<crate::value::Class>) -> bool {
     if Rc::ptr_eq(c, target) {
         return true;
     }
@@ -583,9 +629,12 @@ fn reduce_minmax(
         args
     };
     let mut iter = candidates.into_iter();
-    let mut best = iter
-        .next()
-        .ok_or_else(|| value_error(format!("{}() arg is an empty sequence", if want_min { "min" } else { "max" })))?;
+    let mut best = iter.next().ok_or_else(|| {
+        value_error(format!(
+            "{}() arg is an empty sequence",
+            if want_min { "min" } else { "max" }
+        ))
+    })?;
     for v in iter {
         let cmp = v.py_cmp(&best).unwrap_or(std::cmp::Ordering::Equal);
         if (want_min && cmp == std::cmp::Ordering::Less)
@@ -633,7 +682,10 @@ fn make_module(name: &str, entries: Vec<(&str, Value)>) -> Value {
     }))
 }
 
-fn nf(name: &'static str, f: impl Fn(&mut Interpreter, Vec<Value>) -> Result<Value, Unwind> + 'static) -> Value {
+fn nf(
+    name: &'static str,
+    f: impl Fn(&mut Interpreter, Vec<Value>) -> Result<Value, Unwind> + 'static,
+) -> Value {
     Value::Native(Rc::new(NativeFn::new(name, f)))
 }
 
@@ -641,58 +693,139 @@ fn make_typhon_runtime_module(interp: &Interpreter) -> Value {
     let ok = interp.root.get("Ok").unwrap();
     let err = interp.root.get("Err").unwrap();
     // Submodules.
-    let tasks = make_module("typhon_runtime.tasks", vec![
-        ("spawn", nf("spawn", |i, args| {
-            // Synchronous "spawn" — just call the value immediately.
-            let f = args.into_iter().next().unwrap_or(Value::None);
-            i.call_value(f, vec![], &[])
-        })),
-    ]);
-    let lazy = make_module("typhon_runtime.lazy", vec![
-        ("lazy_let", nf("lazy_let", |i, args| {
-            let f = args.into_iter().next().unwrap_or(Value::None);
-            i.call_value(f, vec![], &[])
-        })),
-        ("lazy_import", nf("lazy_import", |_i, _args| Ok(Value::None))),
-    ]);
-    make_module("typhon_runtime", vec![
-        ("Ok", ok),
-        ("Err", err),
-        ("tasks", tasks),
-        ("lazy", lazy),
-    ])
+    let tasks = make_module(
+        "typhon_runtime.tasks",
+        vec![(
+            "spawn",
+            nf("spawn", |i, args| {
+                // Synchronous "spawn" — just call the value immediately.
+                let f = args.into_iter().next().unwrap_or(Value::None);
+                i.call_value(f, vec![], &[])
+            }),
+        )],
+    );
+    let lazy = make_module(
+        "typhon_runtime.lazy",
+        vec![
+            (
+                "lazy_let",
+                nf("lazy_let", |i, args| {
+                    let f = args.into_iter().next().unwrap_or(Value::None);
+                    i.call_value(f, vec![], &[])
+                }),
+            ),
+            (
+                "lazy_import",
+                nf("lazy_import", |_i, _args| Ok(Value::None)),
+            ),
+        ],
+    );
+    make_module(
+        "typhon_runtime",
+        vec![("Ok", ok), ("Err", err), ("tasks", tasks), ("lazy", lazy)],
+    )
 }
 
 fn make_math_module() -> Value {
-    make_module("math", vec![
-        ("pi", Value::Float(std::f64::consts::PI)),
-        ("e", Value::Float(std::f64::consts::E)),
-        ("inf", Value::Float(f64::INFINITY)),
-        ("nan", Value::Float(f64::NAN)),
-        ("sqrt", nf("sqrt", |_i, args| Ok(Value::Float(single(&args, "sqrt")?.to_float()?.sqrt())))),
-        ("floor", nf("floor", |_i, args| Ok(Value::Int(single(&args, "floor")?.to_float()?.floor() as i64)))),
-        ("ceil", nf("ceil", |_i, args| Ok(Value::Int(single(&args, "ceil")?.to_float()?.ceil() as i64)))),
-        ("log", nf("log", |_i, args| {
-            let x = args.first().ok_or_else(|| type_error("log() needs an arg"))?.to_float()?;
-            let base = match args.get(1) {
-                Some(b) => b.to_float()?,
-                None => std::f64::consts::E,
-            };
-            Ok(Value::Float(x.log(base)))
-        })),
-        ("log2", nf("log2", |_i, args| Ok(Value::Float(single(&args, "log2")?.to_float()?.log2())))),
-        ("log10", nf("log10", |_i, args| Ok(Value::Float(single(&args, "log10")?.to_float()?.log10())))),
-        ("exp", nf("exp", |_i, args| Ok(Value::Float(single(&args, "exp")?.to_float()?.exp())))),
-        ("sin", nf("sin", |_i, args| Ok(Value::Float(single(&args, "sin")?.to_float()?.sin())))),
-        ("cos", nf("cos", |_i, args| Ok(Value::Float(single(&args, "cos")?.to_float()?.cos())))),
-        ("tan", nf("tan", |_i, args| Ok(Value::Float(single(&args, "tan")?.to_float()?.tan())))),
-        ("pow", nf("pow", |_i, args| {
-            let a = args.first().ok_or_else(|| type_error("pow() needs args"))?.to_float()?;
-            let b = args.get(1).ok_or_else(|| type_error("pow() needs args"))?.to_float()?;
-            Ok(Value::Float(a.powf(b)))
-        })),
-        ("fabs", nf("fabs", |_i, args| Ok(Value::Float(single(&args, "fabs")?.to_float()?.abs())))),
-    ])
+    make_module(
+        "math",
+        vec![
+            ("pi", Value::Float(std::f64::consts::PI)),
+            ("e", Value::Float(std::f64::consts::E)),
+            ("inf", Value::Float(f64::INFINITY)),
+            ("nan", Value::Float(f64::NAN)),
+            (
+                "sqrt",
+                nf("sqrt", |_i, args| {
+                    Ok(Value::Float(single(&args, "sqrt")?.to_float()?.sqrt()))
+                }),
+            ),
+            (
+                "floor",
+                nf("floor", |_i, args| {
+                    Ok(Value::Int(
+                        single(&args, "floor")?.to_float()?.floor() as i64
+                    ))
+                }),
+            ),
+            (
+                "ceil",
+                nf("ceil", |_i, args| {
+                    Ok(Value::Int(single(&args, "ceil")?.to_float()?.ceil() as i64))
+                }),
+            ),
+            (
+                "log",
+                nf("log", |_i, args| {
+                    let x = args
+                        .first()
+                        .ok_or_else(|| type_error("log() needs an arg"))?
+                        .to_float()?;
+                    let base = match args.get(1) {
+                        Some(b) => b.to_float()?,
+                        None => std::f64::consts::E,
+                    };
+                    Ok(Value::Float(x.log(base)))
+                }),
+            ),
+            (
+                "log2",
+                nf("log2", |_i, args| {
+                    Ok(Value::Float(single(&args, "log2")?.to_float()?.log2()))
+                }),
+            ),
+            (
+                "log10",
+                nf("log10", |_i, args| {
+                    Ok(Value::Float(single(&args, "log10")?.to_float()?.log10()))
+                }),
+            ),
+            (
+                "exp",
+                nf("exp", |_i, args| {
+                    Ok(Value::Float(single(&args, "exp")?.to_float()?.exp()))
+                }),
+            ),
+            (
+                "sin",
+                nf("sin", |_i, args| {
+                    Ok(Value::Float(single(&args, "sin")?.to_float()?.sin()))
+                }),
+            ),
+            (
+                "cos",
+                nf("cos", |_i, args| {
+                    Ok(Value::Float(single(&args, "cos")?.to_float()?.cos()))
+                }),
+            ),
+            (
+                "tan",
+                nf("tan", |_i, args| {
+                    Ok(Value::Float(single(&args, "tan")?.to_float()?.tan()))
+                }),
+            ),
+            (
+                "pow",
+                nf("pow", |_i, args| {
+                    let a = args
+                        .first()
+                        .ok_or_else(|| type_error("pow() needs args"))?
+                        .to_float()?;
+                    let b = args
+                        .get(1)
+                        .ok_or_else(|| type_error("pow() needs args"))?
+                        .to_float()?;
+                    Ok(Value::Float(a.powf(b)))
+                }),
+            ),
+            (
+                "fabs",
+                nf("fabs", |_i, args| {
+                    Ok(Value::Float(single(&args, "fabs")?.to_float()?.abs()))
+                }),
+            ),
+        ],
+    )
 }
 
 fn make_os_module() -> Value {
@@ -705,81 +838,145 @@ fn make_os_module() -> Value {
         }
         Value::Dict(Rc::new(RefCell::new(m)))
     };
-    make_module("os", vec![
-        ("getenv", nf("getenv", |_i, args| {
-            let key = single(&args, "getenv")?.py_str();
-            Ok(std::env::var(&key)
-                .map(|v| Value::Str(Rc::new(v)))
-                .unwrap_or_else(|_| args.get(1).cloned().unwrap_or(Value::None)))
-        })),
-        ("environ", env_dict),
-        ("path", make_module("os.path", vec![
-            ("exists", nf("exists", |_i, args| {
-                let path = single(&args, "exists")?.py_str();
-                Ok(Value::Bool(std::path::Path::new(&path).exists()))
-            })),
-            ("isfile", nf("isfile", |_i, args| {
-                let path = single(&args, "isfile")?.py_str();
-                Ok(Value::Bool(std::path::Path::new(&path).is_file()))
-            })),
-            ("isdir", nf("isdir", |_i, args| {
-                let path = single(&args, "isdir")?.py_str();
-                Ok(Value::Bool(std::path::Path::new(&path).is_dir()))
-            })),
-        ])),
-    ])
+    make_module(
+        "os",
+        vec![
+            (
+                "getenv",
+                nf("getenv", |_i, args| {
+                    let key = single(&args, "getenv")?.py_str();
+                    Ok(std::env::var(&key)
+                        .map(|v| Value::Str(Rc::new(v)))
+                        .unwrap_or_else(|_| args.get(1).cloned().unwrap_or(Value::None)))
+                }),
+            ),
+            ("environ", env_dict),
+            (
+                "path",
+                make_module(
+                    "os.path",
+                    vec![
+                        (
+                            "exists",
+                            nf("exists", |_i, args| {
+                                let path = single(&args, "exists")?.py_str();
+                                Ok(Value::Bool(std::path::Path::new(&path).exists()))
+                            }),
+                        ),
+                        (
+                            "isfile",
+                            nf("isfile", |_i, args| {
+                                let path = single(&args, "isfile")?.py_str();
+                                Ok(Value::Bool(std::path::Path::new(&path).is_file()))
+                            }),
+                        ),
+                        (
+                            "isdir",
+                            nf("isdir", |_i, args| {
+                                let path = single(&args, "isdir")?.py_str();
+                                Ok(Value::Bool(std::path::Path::new(&path).is_dir()))
+                            }),
+                        ),
+                    ],
+                ),
+            ),
+        ],
+    )
 }
 
-fn make_sys_module(_interp: &Interpreter) -> Value {
-    let argv = std::env::args().map(|a| Value::Str(Rc::new(a))).collect();
-    make_module("sys", vec![
-        ("argv", Value::List(Rc::new(RefCell::new(argv)))),
-        ("platform", Value::Str(Rc::new(std::env::consts::OS.to_owned()))),
-        ("version", Value::Str(Rc::new(format!(
-            "tyc-vm {} (Typhon)",
-            env!("CARGO_PKG_VERSION")
-        )))),
-        ("exit", nf("exit", |_i, args| {
-            let code = args.first().map(|v| v.to_int().unwrap_or(0)).unwrap_or(0);
-            std::process::exit(code as i32);
-        })),
-    ])
+fn make_sys_module(interp: &Interpreter) -> Value {
+    // sys.argv reflects the user's script + its arguments, not the host
+    // `tyc` process's own argv. Populated via `Interpreter.script_argv`.
+    let argv: Vec<Value> = interp
+        .script_argv
+        .iter()
+        .map(|a| Value::Str(Rc::new(a.clone())))
+        .collect();
+    make_module(
+        "sys",
+        vec![
+            ("argv", Value::List(Rc::new(RefCell::new(argv)))),
+            (
+                "platform",
+                Value::Str(Rc::new(std::env::consts::OS.to_owned())),
+            ),
+            (
+                "version",
+                Value::Str(Rc::new(format!(
+                    "tyc-vm {} (Typhon)",
+                    env!("CARGO_PKG_VERSION")
+                ))),
+            ),
+            (
+                "exit",
+                nf("exit", |_i, args| {
+                    let code = args.first().map(|v| v.to_int().unwrap_or(0)).unwrap_or(0);
+                    std::process::exit(code as i32);
+                }),
+            ),
+        ],
+    )
 }
 
 fn make_json_module() -> Value {
-    make_module("json", vec![
-        ("dumps", nf("dumps", |_i, args| Ok(Value::Str(Rc::new(json_dumps(single(&args, "dumps")?)))))),
-        ("loads", nf("loads", |_i, args| json_loads(&single(&args, "loads")?.py_str()))),
-    ])
+    make_module(
+        "json",
+        vec![
+            (
+                "dumps",
+                nf("dumps", |_i, args| {
+                    Ok(Value::Str(Rc::new(json_dumps(single(&args, "dumps")?))))
+                }),
+            ),
+            (
+                "loads",
+                nf("loads", |_i, args| {
+                    json_loads(&single(&args, "loads")?.py_str())
+                }),
+            ),
+        ],
+    )
 }
 
 fn make_time_module() -> Value {
-    make_module("time", vec![
-        ("time", nf("time", |_i, _args| {
-            let t = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs_f64())
-                .unwrap_or(0.0);
-            Ok(Value::Float(t))
-        })),
-        ("sleep", nf("sleep", |_i, args| {
-            let secs = single(&args, "sleep")?.to_float()?;
-            if secs > 0.0 {
-                std::thread::sleep(std::time::Duration::from_secs_f64(secs));
-            }
-            Ok(Value::None)
-        })),
-        ("monotonic", nf("monotonic", |_i, _args| {
-            let t = std::time::Instant::now().elapsed().as_secs_f64();
-            Ok(Value::Float(t))
-        })),
-    ])
+    make_module(
+        "time",
+        vec![
+            (
+                "time",
+                nf("time", |_i, _args| {
+                    let t = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs_f64())
+                        .unwrap_or(0.0);
+                    Ok(Value::Float(t))
+                }),
+            ),
+            (
+                "sleep",
+                nf("sleep", |_i, args| {
+                    let secs = single(&args, "sleep")?.to_float()?;
+                    if secs > 0.0 {
+                        std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+                    }
+                    Ok(Value::None)
+                }),
+            ),
+            (
+                "monotonic",
+                nf("monotonic", |_i, _args| {
+                    let t = std::time::Instant::now().elapsed().as_secs_f64();
+                    Ok(Value::Float(t))
+                }),
+            ),
+        ],
+    )
 }
 
 fn make_random_module() -> Value {
     use std::cell::Cell;
     thread_local! {
-        static SEED: Cell<u64> = Cell::new(0x_2545_F491_4F6C_DD1D);
+        static SEED: Cell<u64> = const { Cell::new(0x_2545_F491_4F6C_DD1D) };
     }
     fn next_u64() -> u64 {
         SEED.with(|s| {
@@ -791,25 +988,43 @@ fn make_random_module() -> Value {
             x
         })
     }
-    make_module("random", vec![
-        ("random", nf("random", |_i, _args| {
-            Ok(Value::Float((next_u64() as f64) / (u64::MAX as f64)))
-        })),
-        ("randint", nf("randint", |_i, args| {
-            let a = args.first().ok_or_else(|| type_error("randint() needs args"))?.to_int()?;
-            let b = args.get(1).ok_or_else(|| type_error("randint() needs args"))?.to_int()?;
-            if b < a {
-                return Err(value_error("randint(a, b): b must be >= a"));
-            }
-            let span = (b - a + 1) as u64;
-            Ok(Value::Int(a + (next_u64() % span) as i64))
-        })),
-        ("seed", nf("seed", |_i, args| {
-            let s = args.first().and_then(|v| v.to_int().ok()).unwrap_or(0);
-            SEED.with(|c| c.set(s as u64 ^ 0x_2545_F491_4F6C_DD1D));
-            Ok(Value::None)
-        })),
-    ])
+    make_module(
+        "random",
+        vec![
+            (
+                "random",
+                nf("random", |_i, _args| {
+                    Ok(Value::Float((next_u64() as f64) / (u64::MAX as f64)))
+                }),
+            ),
+            (
+                "randint",
+                nf("randint", |_i, args| {
+                    let a = args
+                        .first()
+                        .ok_or_else(|| type_error("randint() needs args"))?
+                        .to_int()?;
+                    let b = args
+                        .get(1)
+                        .ok_or_else(|| type_error("randint() needs args"))?
+                        .to_int()?;
+                    if b < a {
+                        return Err(value_error("randint(a, b): b must be >= a"));
+                    }
+                    let span = (b - a + 1) as u64;
+                    Ok(Value::Int(a + (next_u64() % span) as i64))
+                }),
+            ),
+            (
+                "seed",
+                nf("seed", |_i, args| {
+                    let s = args.first().and_then(|v| v.to_int().ok()).unwrap_or(0);
+                    SEED.with(|c| c.set(s as u64 ^ 0x_2545_F491_4F6C_DD1D));
+                    Ok(Value::None)
+                }),
+            ),
+        ],
+    )
 }
 
 // ── Method dispatch on built-in types ──────────────────────────────────────
@@ -824,7 +1039,10 @@ pub fn dispatch_method(
     name: &str,
     args: Vec<Value>,
 ) -> Result<Value, Unwind> {
-    let receiver = args.first().cloned().ok_or_else(|| type_error("method called without receiver"))?;
+    let receiver = args
+        .first()
+        .cloned()
+        .ok_or_else(|| type_error("method called without receiver"))?;
     match (&receiver, name) {
         // ── str methods ────────────────────────────────────────────────────
         (Value::Str(s), m) => str_method(interp, s, m, &args[1..]),
@@ -848,7 +1066,12 @@ pub fn dispatch_method(
     }
 }
 
-fn str_method(_interp: &mut Interpreter, s: &Rc<String>, name: &str, args: &[Value]) -> Result<Value, Unwind> {
+fn str_method(
+    _interp: &mut Interpreter,
+    s: &Rc<String>,
+    name: &str,
+    args: &[Value],
+) -> Result<Value, Unwind> {
     Ok(match name {
         "upper" => Value::Str(Rc::new(s.to_uppercase())),
         "lower" => Value::Str(Rc::new(s.to_lowercase())),
@@ -871,7 +1094,9 @@ fn str_method(_interp: &mut Interpreter, s: &Rc<String>, name: &str, args: &[Val
             Value::List(Rc::new(RefCell::new(parts)))
         }
         "splitlines" => Value::List(Rc::new(RefCell::new(
-            s.lines().map(|l| Value::Str(Rc::new(l.to_owned()))).collect(),
+            s.lines()
+                .map(|l| Value::Str(Rc::new(l.to_owned())))
+                .collect(),
         ))),
         "join" => {
             let iterable = args
@@ -926,11 +1151,17 @@ fn str_method(_interp: &mut Interpreter, s: &Rc<String>, name: &str, args: &[Val
         "title" => Value::Str(Rc::new(title_case(s))),
         "capitalize" => Value::Str(Rc::new(capitalize(s))),
         "swapcase" => Value::Str(Rc::new(
-            s.chars().map(|c| {
-                if c.is_uppercase() { c.to_lowercase().next().unwrap_or(c) }
-                else if c.is_lowercase() { c.to_uppercase().next().unwrap_or(c) }
-                else { c }
-            }).collect(),
+            s.chars()
+                .map(|c| {
+                    if c.is_uppercase() {
+                        c.to_lowercase().next().unwrap_or(c)
+                    } else if c.is_lowercase() {
+                        c.to_uppercase().next().unwrap_or(c)
+                    } else {
+                        c
+                    }
+                })
+                .collect(),
         )),
         "format" => return Err(not_implemented("str.format (use f-strings)")),
         "encode" => Value::Bytes(Rc::new(s.as_bytes().to_vec())),
@@ -982,8 +1213,8 @@ fn list_method(
                 .map(|v| v.to_int())
                 .transpose()?
                 .unwrap_or(l.len() as i64 - 1);
-            let i =
-                normalize_index(idx, l.len()).ok_or_else(|| index_error("pop index out of range"))?;
+            let i = normalize_index(idx, l.len())
+                .ok_or_else(|| index_error("pop index out of range"))?;
             Ok(l.remove(i))
         }
         "remove" => {
@@ -1043,7 +1274,11 @@ fn dict_method(
             Ok(d.borrow().get(&k).cloned().unwrap_or(default))
         }
         "keys" => Ok(Value::List(Rc::new(RefCell::new(
-            d.borrow().keys().cloned().map(HashKey::into_value).collect(),
+            d.borrow()
+                .keys()
+                .cloned()
+                .map(HashKey::into_value)
+                .collect(),
         )))),
         "values" => Ok(Value::List(Rc::new(RefCell::new(
             d.borrow().values().cloned().collect(),
@@ -1051,9 +1286,7 @@ fn dict_method(
         "items" => Ok(Value::List(Rc::new(RefCell::new(
             d.borrow()
                 .iter()
-                .map(|(k, v)| {
-                    Value::Tuple(Rc::new(vec![k.clone().into_value(), v.clone()]))
-                })
+                .map(|(k, v)| Value::Tuple(Rc::new(vec![k.clone().into_value(), v.clone()])))
                 .collect(),
         )))),
         "pop" => {
@@ -1130,11 +1363,7 @@ fn set_method(
     }
 }
 
-fn tuple_method(
-    t: &Rc<Vec<Value>>,
-    name: &str,
-    args: &[Value],
-) -> Result<Value, Unwind> {
+fn tuple_method(t: &Rc<Vec<Value>>, name: &str, args: &[Value]) -> Result<Value, Unwind> {
     match name {
         "count" => {
             let target = single(args, "count")?;
@@ -1213,7 +1442,10 @@ fn json_string(s: &str) -> String {
 }
 
 fn json_loads(s: &str) -> Result<Value, Unwind> {
-    let mut p = JsonParser { src: s.as_bytes(), pos: 0 };
+    let mut p = JsonParser {
+        src: s.as_bytes(),
+        pos: 0,
+    };
     p.skip_ws();
     let v = p.parse()?;
     p.skip_ws();
@@ -1246,7 +1478,10 @@ impl<'a> JsonParser<'a> {
             b't' | b'f' => self.parse_bool(),
             b'n' => self.parse_null(),
             c if c == b'-' || c.is_ascii_digit() => self.parse_number(),
-            c => Err(value_error(format!("unexpected char '{}' in JSON", c as char))),
+            c => Err(value_error(format!(
+                "unexpected char '{}' in JSON",
+                c as char
+            ))),
         }
     }
     fn parse_object(&mut self) -> Result<Value, Unwind> {
@@ -1372,9 +1607,13 @@ impl<'a> JsonParser<'a> {
         let slice = std::str::from_utf8(&self.src[start..self.pos])
             .map_err(|_| value_error("invalid number"))?;
         if is_float {
-            Ok(Value::Float(slice.parse().map_err(|_| value_error("bad number"))?))
+            Ok(Value::Float(
+                slice.parse().map_err(|_| value_error("bad number"))?,
+            ))
         } else {
-            Ok(Value::Int(slice.parse().map_err(|_| value_error("bad number"))?))
+            Ok(Value::Int(
+                slice.parse().map_err(|_| value_error("bad number"))?,
+            ))
         }
     }
     fn peek(&self) -> Option<u8> {
@@ -1401,7 +1640,11 @@ pub fn call_with_kwargs(
     match n.name {
         "sorted" => {
             let mut out = Vec::new();
-            let it = interp.make_iter(args.into_iter().next().ok_or_else(|| type_error("sorted() requires an iterable"))?)?;
+            let it = interp.make_iter(
+                args.into_iter()
+                    .next()
+                    .ok_or_else(|| type_error("sorted() requires an iterable"))?,
+            )?;
             while let Some(v) = interp.iter_next(&it)? {
                 out.push(v);
             }
@@ -1411,7 +1654,12 @@ pub fn call_with_kwargs(
                 match k.as_str() {
                     "reverse" => reverse = v.truthy(),
                     "key" => key_fn = Some(v.clone()),
-                    _ => return Err(type_error(format!("sorted() got unexpected keyword: '{}'", k))),
+                    _ => {
+                        return Err(type_error(format!(
+                            "sorted() got unexpected keyword: '{}'",
+                            k
+                        )))
+                    }
                 }
             }
             if let Some(key) = key_fn {
@@ -1420,9 +1668,7 @@ pub fn call_with_kwargs(
                     let k = interp.call_value(key.clone(), vec![v.clone()], &[])?;
                     keyed.push((k, v));
                 }
-                keyed.sort_by(|a, b| {
-                    a.0.py_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal)
-                });
+                keyed.sort_by(|a, b| a.0.py_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
                 if reverse {
                     keyed.reverse();
                 }

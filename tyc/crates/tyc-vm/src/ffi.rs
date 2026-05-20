@@ -44,7 +44,11 @@ pub fn open_file(path: &str, mode: &str) -> Result<Value, Unwind> {
         let lines = lines.clone();
         NativeFn::new("readlines", move |_i, _args| {
             Ok(Value::List(Rc::new(RefCell::new(
-                lines.iter().cloned().map(|l| Value::Str(Rc::new(l))).collect(),
+                lines
+                    .iter()
+                    .cloned()
+                    .map(|l| Value::Str(Rc::new(l)))
+                    .collect(),
             ))))
         })
     };
@@ -64,21 +68,15 @@ pub fn open_file(path: &str, mode: &str) -> Result<Value, Unwind> {
     };
 
     let close = NativeFn::new("close", |_i, _args| Ok(Value::None));
-    let enter = NativeFn::new("__enter__", |_i, _args| {
-        // The interpreter calls __enter__ on the value already returned by
-        // `open()` — we cannot easily return `self` from here, so the caller
-        // path treats the missing __enter__ as identity. Return None as a
-        // sentinel; the with-stmt body uses the file object directly.
-        Ok(Value::None)
-    });
-    let exit = NativeFn::new("__exit__", |_i, _args| Ok(Value::None));
 
     members.insert("read".into(), Value::Native(Rc::new(read)));
     members.insert("readlines".into(), Value::Native(Rc::new(readlines)));
     members.insert("readline".into(), Value::Native(Rc::new(readline)));
     members.insert("close".into(), Value::Native(Rc::new(close)));
-    members.insert("__enter__".into(), Value::Native(Rc::new(enter)));
-    members.insert("__exit__".into(), Value::Native(Rc::new(exit)));
+    // The v1 file shim deliberately omits `__enter__`/`__exit__`. Returning
+    // a self-reference from `__enter__` would need a back-fill pattern this
+    // crate doesn't have today. Until then `with open(p) as f:` raises an
+    // `AttributeError` and users should call `f = open(p); f.read(); f.close()`.
 
     Ok(Value::Module(Rc::new(Module {
         name: format!("<file {path}>"),
