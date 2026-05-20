@@ -664,7 +664,7 @@ pub enum TycError {
     #[error("module `{module}` is not in the stdlib, the project, or `typhon.toml` dependencies")]
     #[diagnostic(
         code(tyc::unknown_module),
-        help("Either fix the import name, add `{module}` to `[tool.uv.dependencies]` in `typhon.toml` (then run `tyc sync`), or create a sibling `.ty` file with the right name.")
+        help("Either fix the import name, add `{module}` to the `[dependencies]` table in `typhon.toml` (then run `tyc sync`), or create a sibling `.ty` file with the right name.")
     )]
     UnknownModule {
         module: String,

@@ -74,7 +74,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
     // typhon.toml-declared dependencies; users who manage deps directly
     // through `uv`/`pip` can still bypass the check by listing the
     // package in `typhon.toml`.
-    let project_modules = collect_project_modules(&args.paths, &config_start);
+    let project_modules = collect_project_modules(&args.paths, &config.project.src);
     let extra_modules: Vec<String> = config
         .dependencies
         .keys()
@@ -233,9 +233,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
 /// surface a second time otherwise).
 fn run_analysis_passes(path: &str, source: &str) -> Diagnostics {
     let mut diags = Diagnostics::new();
-    let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
-        &expand_gather_blocks(&expand_lazy_imports(source)),
-    ))));
+    let expanded = expand_for_check(source);
     let prep = preprocess(&expanded);
     let module = match tyc_syntax::parse_module(&prep.python_source) {
         Ok(p) => p.into_syntax(),
@@ -259,21 +257,25 @@ fn run_analysis_passes(path: &str, source: &str) -> Diagnostics {
 }
 
 /// Collect the dotted-name form of every `.ty` file under the given
-/// `paths`, relative to `config_start` (which is typically the project
-/// root). Used by [`run_unknown_module_check`] to vet sibling imports.
+/// `paths`. Used by [`run_unknown_module_check`] to vet sibling imports.
 ///
-/// Names are derived by stripping the path prefix up to the first `src/`
-/// component (matching Typhon's standard layout) and joining the remaining
-/// segments with `.`. `src/main.ty` becomes `"main"`; `src/pkg/sub.ty`
-/// becomes `"pkg.sub"`; an `__init__.ty` collapses to its parent package
-/// name. Files outside any `src/` directory fall back to their basename
+/// Names are derived by stripping the prefix up to the configured
+/// source-root component (`project.src` in `typhon.toml`, default
+/// `"src"`) and joining the remaining segments with `.`. With the
+/// default, `src/main.ty` becomes `"main"`; `src/pkg/sub.ty` becomes
+/// `"pkg.sub"`; an `__init__.ty` collapses to its parent package name.
+/// Files outside any source-root directory fall back to their basename
 /// so single-file scripts still resolve correctly.
-fn collect_project_modules(paths: &[PathBuf], _config_start: &std::path::Path) -> Vec<String> {
+///
+/// `src_root` is the basename of the configured source directory
+/// (e.g. `"src"` or `"app"`); it's matched by component-equality
+/// against the path. (Copilot review on PR #68, file check.rs:303.)
+fn collect_project_modules(paths: &[PathBuf], src_root: &str) -> Vec<String> {
     let mut modules: Vec<String> = Vec::new();
     for root in paths {
         if let Ok(files) = collect_ty_files(root) {
             for file in files {
-                let dotted = ty_path_to_dotted(&file);
+                let dotted = ty_path_to_dotted(&file, src_root);
                 if !modules.contains(&dotted) {
                     modules.push(dotted);
                 }
@@ -283,7 +285,7 @@ fn collect_project_modules(paths: &[PathBuf], _config_start: &std::path::Path) -
     modules
 }
 
-fn ty_path_to_dotted(path: &std::path::Path) -> String {
+fn ty_path_to_dotted(path: &std::path::Path, src_root: &str) -> String {
     let components: Vec<String> = path
         .with_extension("")
         .components()
@@ -292,10 +294,11 @@ fn ty_path_to_dotted(path: &std::path::Path) -> String {
             _ => None,
         })
         .collect();
-    // Trim leading "src" so `src/main.ty` becomes `main`. Anything before
-    // `src` (an absolute path's leading directories) is dropped so the
-    // dotted-name reflects the package layout, not the filesystem layout.
-    let src_idx = components.iter().rposition(|c| c == "src");
+    // Trim leading source-root component so `<src_root>/main.ty`
+    // becomes `main`. Anything before the source root (an absolute
+    // path's leading directories) is dropped so the dotted-name
+    // reflects the package layout, not the filesystem layout.
+    let src_idx = components.iter().rposition(|c| c == src_root);
     let tail: Vec<&str> = match src_idx {
         Some(i) => components[i + 1..].iter().map(|s| s.as_str()).collect(),
         None => components
@@ -323,15 +326,39 @@ fn run_unknown_module_check(
     project_modules: &[String],
     extra_modules: &[String],
 ) -> Diagnostics {
-    let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
-        &expand_gather_blocks(&expand_multiline_guards(&expand_lazy_imports(source))),
-    ))));
+    let expanded = expand_for_check(source);
     let prep = preprocess(&expanded);
     let module = match tyc_syntax::parse_module(&prep.python_source) {
         Ok(p) => p.into_syntax(),
         Err(_) => return Diagnostics::new(),
     };
-    check_unknown_modules(path, source, &module, project_modules, extra_modules)
+    // AST node ranges are offsets into the *preprocessed* Python source,
+    // so the diagnostic must render against `prep.python_source` for the
+    // span labels to line up. Rendering against the original Typhon
+    // source would print out-of-bounds labels for files that exercise
+    // preprocess rewrites (`interface`, `impl`, `guard`, `lazy import`,
+    // …). (Copilot review on PR #68, file check.rs:337.)
+    check_unknown_modules(
+        path,
+        &prep.python_source,
+        &module,
+        project_modules,
+        extra_modules,
+    )
+}
+
+/// Shared preprocess pipeline used by every "parse the .ty source for a
+/// secondary check pass" call site inside `tyc check`. Centralising the
+/// chain keeps `run_unknown_module_check`, `run_analysis_passes`, and
+/// `parse_for_diff` in sync with `tyc_db::check_file` / `tyc build` —
+/// without this the three call sites diverged on which expansion passes
+/// they ran, and a file using a feature recognised by only some of the
+/// chains would silently skip downstream diagnostics. (Copilot review
+/// on PR #68, file check.rs:332.)
+fn expand_for_check(source: &str) -> String {
+    expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
+        &expand_gather_blocks(&expand_multiline_guards(&expand_lazy_imports(source))),
+    ))))
 }
 
 /// Run the full preprocess + parse pipeline on `source` and return the
@@ -339,9 +366,7 @@ fn run_unknown_module_check(
 /// syntax (`val`, `var`, `model`, `interface`, `extend`, sugar passes)
 /// is normalised before comparing.
 fn parse_for_diff(source: &str) -> Result<ruff_python_ast::ModModule> {
-    let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
-        &expand_gather_blocks(&expand_lazy_imports(source)),
-    ))));
+    let expanded = expand_for_check(source);
     let prep = preprocess(&expanded);
     tyc_syntax::parse_module(&prep.python_source)
         .map(|p| p.into_syntax())

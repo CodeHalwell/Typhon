@@ -547,6 +547,33 @@ pub fn check_unknown_modules(
                     walk(&s.body, path, source, is_resolvable, diags);
                     walk(&s.orelse, path, source, is_resolvable, diags);
                     walk(&s.finalbody, path, source, is_resolvable, diags);
+                    // Try handlers' bodies aren't otherwise reached — an
+                    // `import X` inside an `except ImportError:` block is
+                    // legitimate and must be vetted.
+                    for handler in &s.handlers {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = handler;
+                        walk(&h.body, path, source, is_resolvable, diags);
+                    }
+                }
+                // Loop / context-manager / pattern-match bodies can carry
+                // imports too — `with importlib.util.LazyLoader(...): import x`
+                // is unusual but legal Python. Walk every nested body so
+                // missed module diagnostics fire consistently regardless of
+                // surrounding statement kind. (gemini-code-assist review on
+                // PR #68, file tyc-resolve/src/lib.rs L382.)
+                Stmt::For(s) => {
+                    walk(&s.body, path, source, is_resolvable, diags);
+                    walk(&s.orelse, path, source, is_resolvable, diags);
+                }
+                Stmt::While(s) => {
+                    walk(&s.body, path, source, is_resolvable, diags);
+                    walk(&s.orelse, path, source, is_resolvable, diags);
+                }
+                Stmt::With(s) => walk(&s.body, path, source, is_resolvable, diags),
+                Stmt::Match(s) => {
+                    for case in &s.cases {
+                        walk(&case.body, path, source, is_resolvable, diags);
+                    }
                 }
                 _ => {}
             }
@@ -2859,6 +2886,45 @@ def foo():
         let module = parse_module("from . import sibling\n");
         let diags = check_unknown_modules("t.ty", "from . import sibling\n", &module, &[], &[]);
         assert!(diags.warnings().is_empty(), "{:?}", diags.warnings());
+    }
+
+    #[test]
+    fn imports_in_nested_blocks_are_walked() {
+        // gemini-code-assist review on PR #68 (tyc-resolve L382): the
+        // initial walk skipped `for` / `while` / `with` / `match` /
+        // `try`-handler bodies. Verify each shape surfaces an unknown
+        // module from a nested import.
+        let cases: &[(&str, &str)] = &[
+            ("in `for`", "for x in []:\n    from notamod_for import a\n"),
+            (
+                "in `while`",
+                "while False:\n    from notamod_while import b\n",
+            ),
+            (
+                "in `with`",
+                "with open('x') as f:\n    from notamod_with import c\n",
+            ),
+            (
+                "in `match`",
+                "match 1:\n    case _:\n        from notamod_match import d\n",
+            ),
+            (
+                "in `try` handler",
+                "try:\n    pass\nexcept Exception:\n    from notamod_except import e\n",
+            ),
+        ];
+        for (label, src) in cases {
+            let module = parse_module(src);
+            let diags = check_unknown_modules("t.ty", src, &module, &[], &[]);
+            assert!(
+                diags
+                    .warnings()
+                    .iter()
+                    .any(|e| matches!(e, TycError::UnknownModule { .. })),
+                "expected UnknownModule {label}; got {:?}",
+                diags.warnings()
+            );
+        }
     }
 
     #[test]

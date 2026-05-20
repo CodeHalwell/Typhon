@@ -2593,7 +2593,7 @@ fn suggest_candidate(typo: &str, candidates: &[String]) -> String {
         .filter_map(|c| {
             let d = levenshtein(typo, c);
             // Threshold: at most one third of the longer name, capped at 3.
-            let max_d = (typo.len().max(c.len()) / 3).max(1).min(3);
+            let max_d = (typo.len().max(c.len()) / 3).clamp(1, 3);
             if d <= max_d {
                 Some((d, c.as_str()))
             } else {
@@ -3399,7 +3399,7 @@ fn check_function(
         && return_type_requires_value(&ret_type)
         && !body_has_yield(body)
         && !body_is_stub(body)
-        && !body_always_exits(body)
+        && !body_always_exits_aware(c, body)
     {
         c.diagnostics.push_error(TycError::missing_return(
             name,
@@ -3541,15 +3541,108 @@ fn stmt_always_exits(stmt: &Stmt) -> bool {
     }
 }
 
-/// True when a `match` statement's arms each end in an unconditional
-/// exit. Exhaustiveness over sealed unions is enforced separately by
-/// `tyc::non_exhaustive_match`, so this only checks the arms' bodies —
-/// a non-exhaustive sealed match would have been rejected before
-/// missing-return analysis ran. Open-typed subjects (`int`, `Any`, …)
-/// where every arm exits are also treated as exiting, matching the
-/// shape that mypy / pyright accept.
+/// Structural-only check: do every arm's body end in an unconditional
+/// exit, and is there at least one arm? Used by the narrowing pass in
+/// `check_if` (where over-approximating "exit" is harmless — it just
+/// loses narrowing precision, never produces wrong types). For
+/// missing-return analysis, use [`match_arms_always_exit_aware`]
+/// instead — that variant requires either a catch-all arm or proven
+/// sealed-union exhaustiveness, since a non-exhaustive open match can
+/// legitimately fall through (Copilot review on PR #68, file
+/// tyc-types/src/lib.rs L3558).
 fn match_arms_always_exit(cases: &[ruff_python_ast::MatchCase]) -> bool {
     !cases.is_empty() && cases.iter().all(|c| body_always_exits(&c.body))
+}
+
+/// Checker-aware variant of [`match_arms_always_exit`]: returns true only
+/// when the match definitively covers every reachable value. Used by the
+/// missing-return analysis, where falsely claiming "exits" would suppress
+/// the diagnostic on a real fall-through path.
+///
+/// A match covers everything when:
+/// 1. Every arm body always exits (necessary in either case), AND
+/// 2. Either (a) at least one arm is a guardless catch-all (`case _:`
+///    or a guardless capture like `case other:`), OR (b) the subject is
+///    a sealed union and every variant is matched by a guardless arm.
+fn match_arms_always_exit_aware(c: &Checker, m: &ruff_python_ast::StmtMatch) -> bool {
+    if m.cases.is_empty() {
+        return false;
+    }
+    if !m
+        .cases
+        .iter()
+        .all(|case| body_always_exits_aware(c, &case.body))
+    {
+        return false;
+    }
+    // (a) Catch-all check: a guardless `case _:` or capturing arm with
+    // no inner pattern matches any value.
+    let has_catchall = m.cases.iter().any(|case| {
+        case.guard.is_none()
+            && matches!(
+                &case.pattern,
+                ruff_python_ast::Pattern::MatchAs(p) if p.pattern.is_none()
+            )
+    });
+    if has_catchall {
+        return true;
+    }
+    // (b) Sealed-union exhaustiveness check: resolve the subject's
+    // type and see whether every declared variant is matched by a
+    // guardless arm. The subject must be a bare name whose declared
+    // type is a sealed-union class — same shape the
+    // `check_match_exhaustiveness` pass relies on.
+    if let Expr::Name(n) = m.subject.as_ref() {
+        if let Some(binding) = c.env.lookup(n.id.as_str()) {
+            if let Type::Class(union_name) = &binding.declared {
+                if let Some(variants) = c.sealed_unions.get(union_name.as_str()) {
+                    let mut covered: HashSet<String> = HashSet::new();
+                    for case in &m.cases {
+                        if case.guard.is_some() {
+                            continue;
+                        }
+                        collect_matched_class_names(&case.pattern, &mut covered);
+                    }
+                    return variants.iter().all(|v| covered.contains(v));
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Checker-aware variant of [`body_always_exits`]. Identical to the
+/// structural form except that [`Stmt::Match`] dispatches to
+/// [`match_arms_always_exit_aware`] so sealed-union exhaustiveness is
+/// respected and open-typed matches without a catch-all correctly
+/// report as falling-through.
+fn body_always_exits_aware(c: &Checker, stmts: &[Stmt]) -> bool {
+    stmts.last().is_some_and(|s| stmt_always_exits_aware(c, s))
+}
+
+fn stmt_always_exits_aware(c: &Checker, stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Return(_) | Stmt::Raise(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
+        Stmt::If(s) => {
+            body_always_exits_aware(c, &s.body)
+                && elif_else_chain_always_exits_aware(c, &s.elif_else_clauses)
+        }
+        Stmt::Match(m) => match_arms_always_exit_aware(c, m),
+        _ => false,
+    }
+}
+
+fn elif_else_chain_always_exits_aware(
+    c: &Checker,
+    clauses: &[ruff_python_ast::ElifElseClause],
+) -> bool {
+    let has_terminal_else = clauses.iter().any(|c| c.test.is_none());
+    if !has_terminal_else {
+        return false;
+    }
+    clauses
+        .iter()
+        .all(|cl| body_always_exits_aware(c, &cl.body))
 }
 
 /// Recursively check the `elif`/`else` cascade of a [`StmtIf`].  Each
@@ -5238,6 +5331,78 @@ def fail() -> int:
                 .iter()
                 .any(|e| matches!(e, TycError::MissingReturn { .. })),
             "raise must satisfy missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn non_exhaustive_match_without_catchall_fires_missing_return() {
+        // Copilot review on PR #68 (tyc-types L3558): a `match` over an
+        // open-typed subject (`int` here) without a `case _:` arm can
+        // fall through at runtime — missing-return must fire even when
+        // every present arm exits.
+        let src = "\
+def f(n: int) -> int:
+    match n:
+        case 0:
+            return 1
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "non-exhaustive match must fire missing_return; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn match_with_catchall_satisfies_missing_return() {
+        let src = "\
+def f(n: int) -> int:
+    match n:
+        case 0:
+            return 1
+        case _:
+            return -1
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "catch-all should satisfy missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn exhaustive_sealed_match_without_wildcard_satisfies_missing_return() {
+        // Sealed-union exhaustiveness over Shape (Circle | Square) is
+        // proven by listing every variant. Missing_return must respect
+        // that and not fire even without a trailing `case _:`.
+        let src = "\
+class Circle:
+    r: float
+class Square:
+    s: float
+
+type Shape = Circle | Square
+
+def area(s: Shape) -> float:
+    match s:
+        case Circle():
+            return 1.0
+        case Square():
+            return 2.0
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "exhaustive sealed-union match should satisfy missing_return: {:?}",
             d.errors()
         );
     }
