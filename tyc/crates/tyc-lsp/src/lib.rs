@@ -337,15 +337,18 @@ impl LanguageServer for Backend {
         // pool while the runtime keeps serving other requests.
         let prefetched: HashMap<String, Vec<CompletionItem>> = {
             let cache_handle = self.introspection_cache_for(&uri).await;
-            let receiver = extract_member_access_receiver(
-                &preprocessed,
-                position_to_byte(&preprocessed, position),
-            );
-            match (cache_handle, receiver) {
-                (Some((root, cache)), Some(receiver)) => {
-                    let candidates = candidate_module_paths(&resolved, &receiver, {
-                        position_to_byte(&preprocessed, position)
-                    });
+            let cursor_offset = position_to_byte(&preprocessed, position);
+            let receiver = extract_member_access_receiver(&preprocessed, cursor_offset);
+            let from_import = extract_from_import_module(&preprocessed, cursor_offset);
+            let mut candidates: Vec<String> = match (&receiver, &from_import) {
+                (Some(r), _) => candidate_module_paths(&resolved, r, cursor_offset),
+                (None, Some(m)) => vec![m.clone()],
+                (None, None) => Vec::new(),
+            };
+            // Drop duplicates while preserving priority order.
+            candidates.dedup();
+            match cache_handle {
+                Some((root, cache)) if !candidates.is_empty() => {
                     tokio::task::spawn_blocking(move || {
                         let mut map: HashMap<String, Vec<CompletionItem>> = HashMap::new();
                         // `lock()` on a poisoned std::Mutex returns `Err`;
@@ -1006,6 +1009,24 @@ pub fn compute_completion_items_with_introspection(
         // on the next keystroke once more context is typed.
         return Vec::new();
     }
+    // From-import path: cursor sits inside the import list of a
+    // `from <module> import <cursor>` statement. Surface the module's
+    // exported members so the user can pick from real names instead of
+    // typing them blind.
+    if let Some(module) = extract_from_import_module(preprocessed, offset) {
+        if let Some(cb) = introspect {
+            if let Some(items) = cb(&module) {
+                return items;
+            }
+        }
+        if let Some(members) = stdlib_stubs::lookup(&module) {
+            return stub_members_to_completion(members);
+        }
+        // No introspection available for this module (no venv, no
+        // stdlib stub). Returning empty keeps the editor quiet rather
+        // than offering keywords/builtins that aren't legal here.
+        return Vec::new();
+    }
     let scope_id = resolved.scope_at_offset(offset);
     let mut items: Vec<CompletionItem> = Vec::new();
     for b in resolved.visible_bindings(scope_id) {
@@ -1154,6 +1175,77 @@ pub fn extract_member_access_receiver(text: &str, offset: usize) -> Option<Strin
         return None;
     }
     Some(receiver.to_owned())
+}
+
+/// Detect that the cursor sits inside the import list of a
+/// `from <module> import <cursor>` statement and return `<module>` —
+/// the dotted module name whose exported members the editor should
+/// surface as completions.
+///
+/// Returns `None` when the cursor isn't in such a position (regular
+/// code, plain `import X`, or a `from X import …` that hasn't reached
+/// the `import` keyword yet).
+///
+/// Like [`extract_member_access_receiver`], this operates on raw text
+/// rather than the AST: completion fires while the user is typing and
+/// the source very often doesn't parse, so an AST-based detector would
+/// miss the most common case. We restrict ourselves to the same line
+/// as the cursor for v1; parenthesised multi-line imports
+/// (`from x import (\n    <cursor>\n)`) fall through and return `None`.
+pub fn extract_from_import_module(text: &str, offset: usize) -> Option<String> {
+    if offset > text.len() {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    // Find the start of the current logical line.
+    let mut line_start = offset;
+    while line_start > 0 && bytes[line_start - 1] != b'\n' {
+        line_start -= 1;
+    }
+    let prefix = &text[line_start..offset];
+    let trimmed = prefix.trim_start();
+    // Must literally start with "from " — we don't try to handle
+    // `\timport-as-expression` or other oddities.
+    let after_from = trimmed.strip_prefix("from ")?.trim_start();
+    // Scan the dotted module name greedily.
+    let mut module_end = 0;
+    for (i, c) in after_from.char_indices() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
+            module_end = i + c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if module_end == 0 {
+        return None;
+    }
+    let module = &after_from[..module_end];
+    // Module mustn't start or end with `.` — `from .foo` is a relative
+    // import we don't introspect, and `from foo.` is mid-typing the
+    // module path (the user hasn't reached `import` yet).
+    if module.starts_with('.') || module.ends_with('.') {
+        return None;
+    }
+    // After the module there must be whitespace, then `import`, then
+    // a separator (space, paren, or end of slice — the partial import
+    // list starts here).
+    let after_module = &after_from[module_end..];
+    let after_ws = after_module.trim_start();
+    if after_ws.len() == after_module.len() {
+        // No whitespace between module and the next token → still
+        // typing the module name.
+        return None;
+    }
+    let rest = after_ws.strip_prefix("import")?;
+    // The character following "import" determines whether we're in
+    // the import list. We accept the cursor sitting *exactly* at
+    // "import|" (empty `rest`) so completion fires as soon as the
+    // user finishes typing the keyword.
+    match rest.chars().next() {
+        None => Some(module.to_owned()),
+        Some(c) if c.is_whitespace() || c == '(' => Some(module.to_owned()),
+        _ => None,
+    }
 }
 
 /// Signature for the per-completion-request introspection callback.
@@ -2019,6 +2111,79 @@ def greet():
     }
 
     #[test]
+    fn extract_from_import_module_after_import_keyword() {
+        // `from os import |` — cursor right after the space following `import`.
+        let text = "from os import ";
+        let r = extract_from_import_module(text, text.len());
+        assert_eq!(r.as_deref(), Some("os"));
+    }
+
+    #[test]
+    fn extract_from_import_module_partial_member() {
+        // `from os import get|` — cursor mid-typing the first member.
+        let text = "from os import get";
+        let r = extract_from_import_module(text, text.len());
+        assert_eq!(r.as_deref(), Some("os"));
+    }
+
+    #[test]
+    fn extract_from_import_module_after_comma() {
+        // `from os import path, |` — additional member after a comma.
+        let text = "from os import path, ";
+        let r = extract_from_import_module(text, text.len());
+        assert_eq!(r.as_deref(), Some("os"));
+    }
+
+    #[test]
+    fn extract_from_import_module_dotted_module() {
+        // Dotted module names like `urllib.parse` resolve correctly.
+        let text = "from urllib.parse import ";
+        let r = extract_from_import_module(text, text.len());
+        assert_eq!(r.as_deref(), Some("urllib.parse"));
+    }
+
+    #[test]
+    fn extract_from_import_module_immediately_after_import() {
+        // `from os import|` — cursor flush against `import` (no trailing space).
+        let text = "from os import";
+        let r = extract_from_import_module(text, text.len());
+        assert_eq!(r.as_deref(), Some("os"));
+    }
+
+    #[test]
+    fn extract_from_import_module_returns_none_before_import_keyword() {
+        // Cursor still inside the module name; the `import` keyword
+        // hasn't been typed yet.
+        let text = "from os ";
+        let r = extract_from_import_module(text, text.len());
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn extract_from_import_module_returns_none_for_plain_import() {
+        // `import os` is not a from-import — no member completion to surface.
+        let text = "import os";
+        let r = extract_from_import_module(text, text.len());
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn extract_from_import_module_returns_none_for_relative_import() {
+        // `from .foo import …` is a relative import; we can't introspect it.
+        let text = "from .foo import ";
+        let r = extract_from_import_module(text, text.len());
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn extract_from_import_module_returns_none_outside_import() {
+        // Plain code — cursor isn't inside a from-import.
+        let text = "def f() -> None:\n    pass\n";
+        let r = extract_from_import_module(text, text.len());
+        assert_eq!(r, None);
+    }
+
+    #[test]
     fn extract_receiver_rejects_leading_dot() {
         // `.foo` — no receiver to complete against.
         let text = "def f() -> None:\n    .";
@@ -2028,29 +2193,47 @@ def greet():
     }
 
     #[test]
-    fn completion_on_empty_resolved_module_returns_keywords_and_builtins() {
+    fn completion_on_empty_resolved_module_does_not_panic() {
         // When the buffer is mid-edit and doesn't parse, the Salsa
         // `resolved_module_arc` query returns a default `ResolvedModule`
         // with no scopes. Indexing into that vec used to panic, crashing
         // the completion handler and surfacing as a "No suggestions"
-        // popup in the editor. The path must now return the keyword +
-        // builtin menu so the user still gets useful completion while
-        // typing.
+        // popup in the editor. The path must now return cleanly — what
+        // gets returned depends on the cursor context:
+        //
+        //   * In open code (no member access, no from-import): keywords
+        //     + builtins so the user has something useful to pick from.
+        //   * Inside a `from <unknown> import …`: empty, because
+        //     suggesting `let` or `print` here would be misleading.
         let empty = tyc_resolve::ResolvedModule::default();
-        let prefix = "from agent_framework import ";
-        let src = format!("{prefix}\n");
-        let pos = Position {
-            line: 0,
-            character: prefix.len() as u32,
-        };
-        let items = compute_completion_items(&empty, &src, pos);
+        // Open-code mid-keystroke — still gets keywords + builtins.
+        let items = compute_completion_items(
+            &empty,
+            "def foo() -> \n",
+            Position {
+                line: 0,
+                character: 13,
+            },
+        );
         let labels: std::collections::HashSet<String> =
             items.iter().map(|i| i.label.clone()).collect();
-        assert!(!items.is_empty(), "completion must not return empty");
         assert!(labels.contains("let"), "missing `let` keyword: {labels:?}");
         assert!(
             labels.contains("print"),
             "missing `print` builtin: {labels:?}"
+        );
+
+        // In a from-import with no introspection available — empty is
+        // correct, the important guarantee is *no panic*.
+        let prefix = "from agent_framework import ";
+        let src = format!("{prefix}\n");
+        let _ = compute_completion_items(
+            &empty,
+            &src,
+            Position {
+                line: 0,
+                character: prefix.len() as u32,
+            },
         );
     }
 
@@ -2161,6 +2344,43 @@ def f() -> None:
             items.is_empty(),
             "expected empty completion, got: {labels:?}",
             labels = items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn completion_inside_from_import_surfaces_module_members() {
+        // `from os import <cursor>` should surface `os`'s members
+        // (e.g. `getcwd`) — exactly the case the user reported with
+        // `from agent_framework import <cursor>`. Mid-edit the source
+        // doesn't parse (Python's grammar requires at least one
+        // imported name), so the LSP receives a default
+        // `ResolvedModule` — the from-import detector reads from the
+        // raw preprocessed text, not the AST, so it still fires.
+        // Introspect is `None` here, so completion falls back to the
+        // curated stdlib stubs (which include `os`).
+        let preprocessed = "from os import \n";
+        let resolved = tyc_resolve::ResolvedModule::default();
+        let prefix = "from os import ";
+        let pos = Position {
+            line: 0,
+            character: prefix.len() as u32,
+        };
+        let items = compute_completion_items(&resolved, preprocessed, pos);
+        let labels: std::collections::HashSet<String> =
+            items.iter().map(|i| i.label.clone()).collect();
+        assert!(
+            labels.contains("getcwd"),
+            "from-import completion should surface `getcwd` from `os` stubs; got {labels:?}"
+        );
+        // Keywords / builtins must NOT leak into the import list —
+        // they aren't valid imports.
+        assert!(
+            !labels.contains("let"),
+            "Typhon keyword `let` should not appear in a from-import list"
+        );
+        assert!(
+            !labels.contains("print"),
+            "builtin `print` should not appear in a from-import list"
         );
     }
 
