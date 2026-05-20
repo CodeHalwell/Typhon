@@ -15,6 +15,14 @@ pub struct LspArgs {
     /// `debug`. Defaults to `info`.
     #[arg(long, default_value = "info")]
     pub log_level: String,
+
+    /// Accepted for compatibility with `vscode-languageclient`, which
+    /// unconditionally appends `--stdio` when started with
+    /// `TransportKind.stdio`. We only support stdio today, so the flag
+    /// is a no-op — rejecting it would make the language client fail to
+    /// start with `unexpected argument '--stdio'`.
+    #[arg(long, hide = true)]
+    pub stdio: bool,
 }
 
 pub fn run(args: LspArgs) -> Result<()> {
