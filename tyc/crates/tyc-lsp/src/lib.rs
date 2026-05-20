@@ -340,13 +340,14 @@ impl LanguageServer for Backend {
             let cursor_offset = position_to_byte(&preprocessed, position);
             let receiver = extract_member_access_receiver(&preprocessed, cursor_offset);
             let from_import = extract_from_import_module(&preprocessed, cursor_offset);
-            let mut candidates: Vec<String> = match (&receiver, &from_import) {
+            // `candidate_module_paths` already returns unique paths, and
+            // the other two branches yield at most one element each — no
+            // dedup pass is needed.
+            let candidates: Vec<String> = match (&receiver, &from_import) {
                 (Some(r), _) => candidate_module_paths(&resolved, r, cursor_offset),
                 (None, Some(m)) => vec![m.clone()],
                 (None, None) => Vec::new(),
             };
-            // Drop duplicates while preserving priority order.
-            candidates.dedup();
             match cache_handle {
                 Some((root, cache)) if !candidates.is_empty() => {
                     tokio::task::spawn_blocking(move || {
@@ -1012,20 +1013,11 @@ pub fn compute_completion_items_with_introspection(
     // From-import path: cursor sits inside the import list of a
     // `from <module> import <cursor>` statement. Surface the module's
     // exported members so the user can pick from real names instead of
-    // typing them blind.
+    // typing them blind. When neither venv introspection nor the
+    // curated stubs know the module, return empty — keywords/builtins
+    // would be misleading here, they aren't valid as imported names.
     if let Some(module) = extract_from_import_module(preprocessed, offset) {
-        if let Some(cb) = introspect {
-            if let Some(items) = cb(&module) {
-                return items;
-            }
-        }
-        if let Some(members) = stdlib_stubs::lookup(&module) {
-            return stub_members_to_completion(members);
-        }
-        // No introspection available for this module (no venv, no
-        // stdlib stub). Returning empty keeps the editor quiet rather
-        // than offering keywords/builtins that aren't legal here.
-        return Vec::new();
+        return module_member_items(&module, introspect).unwrap_or_default();
     }
     let scope_id = resolved.scope_at_offset(offset);
     let mut items: Vec<CompletionItem> = Vec::new();
@@ -1308,26 +1300,34 @@ fn candidate_module_paths(resolved: &ResolvedModule, receiver: &str, offset: usi
 /// Resolve `receiver` against the scope visible at `offset` and, if it
 /// bottoms out at a known import, return the matching stub members.
 /// Calls [`candidate_module_paths`] to enumerate interpretations and
-/// then asks the optional `introspect` callback (which is itself
-/// backed by venv-driven Python introspection in the production
-/// handler) before falling back to the curated [`stdlib_stubs`] table.
+/// then delegates to [`module_member_items`] for the introspect/stub
+/// lookup applied to each candidate.
 fn member_completion_items(
     resolved: &ResolvedModule,
     receiver: &str,
     offset: usize,
     introspect: Option<&IntrospectFn<'_>>,
 ) -> Option<Vec<CompletionItem>> {
-    for module in candidate_module_paths(resolved, receiver, offset) {
-        if let Some(cb) = introspect {
-            if let Some(items) = cb(&module) {
-                return Some(items);
-            }
-        }
-        if let Some(members) = stdlib_stubs::lookup(&module) {
-            return Some(stub_members_to_completion(members));
+    candidate_module_paths(resolved, receiver, offset)
+        .iter()
+        .find_map(|module| module_member_items(module, introspect))
+}
+
+/// Look up the completion items for a single dotted module path:
+/// ask the venv-driven introspection callback first, then fall back
+/// to the curated [`stdlib_stubs`] table. Returns `None` when neither
+/// source knows the module — letting the caller decide whether to
+/// surface a fallback menu or stay quiet.
+fn module_member_items(
+    module: &str,
+    introspect: Option<&IntrospectFn<'_>>,
+) -> Option<Vec<CompletionItem>> {
+    if let Some(cb) = introspect {
+        if let Some(items) = cb(module) {
+            return Some(items);
         }
     }
-    None
+    stdlib_stubs::lookup(module).map(stub_members_to_completion)
 }
 
 /// Convert a venv-introspected [`venv_introspect::MemberInfo`] list
