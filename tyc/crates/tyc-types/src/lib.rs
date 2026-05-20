@@ -4281,7 +4281,13 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         // a `def f[T](x: T)` formal can absorb a `None`
                         // actual at the call site; bidirectional inference
                         // will bind `T = None` from the expected return.
-                        let nullable_into_non_nullable = !expected.is_nullable()
+                        // Transparent type aliases are also exempt — a
+                        // `type JSON = int | str | None | ...` annotation
+                        // is nullable once unwrapped even though the bare
+                        // `Class("JSON")` doesn't look like it. FINDINGS #121.
+                        let expected_unwrapped_nullable =
+                            c.unwrap_alias(&expected).is_nullable();
+                        let nullable_into_non_nullable = !expected_unwrapped_nullable
                             && actual.is_nullable()
                             && !matches!(expected, Type::TypeVar(_));
                         if nullable_into_non_nullable {
@@ -4333,7 +4339,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                             }
                             let actual = infer_expr_ctx(c, &kw.value, Some(&params[idx]));
                             let nullable_into_non_nullable =
-                                !params[idx].is_nullable() && actual.is_nullable();
+                                !c.unwrap_alias(&params[idx]).is_nullable() && actual.is_nullable();
                             if nullable_into_non_nullable {
                                 if let Expr::Name(n) = &kw.value {
                                     let span = (

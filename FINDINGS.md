@@ -4572,3 +4572,12 @@ fix lands as its own commit.
   helper handles both bare and `typing.<Name>[…]` forms; the
   `TYPING_NAMES_TO_REWRITE` list keys the import-strip pass.
 
+- **#121** Recursive / union-bearing type aliases now accept
+  `None` literal at the call site. The arg-type loop's
+  `nullable_into_non_nullable` shortcut was firing on
+  `Class("JSON")` (the bare alias name) because `is_nullable` on a
+  Class returns false. Now we check `c.unwrap_alias(&expected)
+  .is_nullable()` so a `type JSON = int | str | None | ...` alias
+  is recognised as nullable on the parameter side. The kwarg arm
+  was updated the same way.
+
