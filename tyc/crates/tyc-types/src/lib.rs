@@ -3316,6 +3316,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
         Stmt::Match(m) => {
             let subject_type = infer_expr(c, &m.subject);
             for case in &m.cases {
+                check_pattern_class_fields(c, &case.pattern);
                 // Enter scope and bind pattern names FIRST so guard expressions
                 // (e.g. `case Circle(radius=r) if r > 0:`) can reference them.
                 c.env.enter();
@@ -5348,6 +5349,68 @@ fn collect_matched_class_names(pattern: &Pattern, covered: &mut HashSet<String>)
         Pattern::MatchOr(o) => {
             for p in &o.patterns {
                 collect_matched_class_names(p, covered);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Walk a `case` pattern and emit `tyc::unknown_kwarg` / `tyc::arg_count`
+/// for `MatchClass` patterns that reference fields or positional slots the
+/// class doesn't have (FINDINGS R3.8 / R3.12.f).
+fn check_pattern_class_fields(c: &mut Checker, pattern: &Pattern) {
+    match pattern {
+        Pattern::MatchClass(mc) => {
+            if let Expr::Name(cls_name) = mc.cls.as_ref() {
+                let name = cls_name.id.as_str().to_owned();
+                if let Some(shape) = c.class_shapes.get(&name).cloned() {
+                    let candidates: Vec<String> = shape.fields.keys().cloned().collect();
+                    for kw in &mc.arguments.keywords {
+                        let kw_name = kw.attr.as_str();
+                        if !shape.fields.contains_key(kw_name) {
+                            let suggestion = suggest_candidate(kw_name, &candidates);
+                            let span = (
+                                kw.attr.range.start().to_usize(),
+                                kw.attr.range.start().to_usize() + kw_name.len(),
+                            );
+                            c.unknown_kwarg(&name, kw_name, suggestion, span);
+                        }
+                    }
+                    let pos = mc.arguments.patterns.len();
+                    if pos > shape.fields.len() {
+                        let span = (
+                            mc.range.start().to_usize(),
+                            mc.range.end().to_usize(),
+                        );
+                        c.wrong_args(&name, shape.fields.len(), pos, span);
+                    }
+                }
+            }
+            for p in &mc.arguments.patterns {
+                check_pattern_class_fields(c, p);
+            }
+            for kw in &mc.arguments.keywords {
+                check_pattern_class_fields(c, &kw.pattern);
+            }
+        }
+        Pattern::MatchAs(a) => {
+            if let Some(inner) = &a.pattern {
+                check_pattern_class_fields(c, inner);
+            }
+        }
+        Pattern::MatchOr(o) => {
+            for p in &o.patterns {
+                check_pattern_class_fields(c, p);
+            }
+        }
+        Pattern::MatchSequence(seq) => {
+            for p in &seq.patterns {
+                check_pattern_class_fields(c, p);
+            }
+        }
+        Pattern::MatchMapping(m) => {
+            for p in &m.patterns {
+                check_pattern_class_fields(c, p);
             }
         }
         _ => {}
