@@ -2618,10 +2618,19 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
                     Some(r) => type_from_annotation(r, classes),
                     None => Type::Unknown,
                 };
-                let is_property = f
-                    .decorator_list
-                    .iter()
-                    .any(|d| matches!(&d.expression, Expr::Name(n) if n.id.as_str() == "property"));
+                let is_property = f.decorator_list.iter().any(|d| match &d.expression {
+                    Expr::Name(n) => matches!(
+                        n.id.as_str(),
+                        "property"
+                            | "cached_property"
+                            | "_typhon_cached_property"
+                    ),
+                    Expr::Attribute(a) => matches!(
+                        a.attr.as_str(),
+                        "property" | "cached_property"
+                    ),
+                    _ => false,
+                });
                 shape.methods.insert(
                     f.name.as_str().to_owned(),
                     MethodSig {

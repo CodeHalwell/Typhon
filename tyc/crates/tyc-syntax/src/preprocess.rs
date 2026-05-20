@@ -1817,7 +1817,19 @@ fn extract_return_type_text(def_line: &str) -> Option<String> {
 /// This function is called **before** [`preprocess`] in the build pipeline.
 /// It is deliberately *not* called by `tyc fmt` or the check pipeline (which
 /// use [`preprocess`]'s simpler `import MODULE as ALIAS` conversion instead).
+/// Like [`expand_lazy_imports`] but only rewrites `lazy let` bindings; `lazy
+/// import` lines are left untouched so that downstream passes (notably
+/// [`preprocess`]) can still recognise them and populate the lazy-import
+/// metadata used by the unused-import diagnostic.
+pub fn expand_lazy_lets(source: &str) -> String {
+    expand_lazy_imports_with(source, false)
+}
+
 pub fn expand_lazy_imports(source: &str) -> String {
+    expand_lazy_imports_with(source, true)
+}
+
+fn expand_lazy_imports_with(source: &str, rewrite_imports: bool) -> String {
     let mut result = String::with_capacity(source.len() + 256);
     // Track triple-quoted string state so that a `lazy import` that appears
     // inside a docstring or multiline string is never mistakenly rewritten.
@@ -1862,9 +1874,20 @@ pub fn expand_lazy_imports(source: &str) -> String {
         }
 
         // Push a new entry when we enter a `class …:` or `def …:` block.
+        // `impl …:` and `extend …:` are Typhon-only forms that lower to a
+        // class body later in the pipeline; treat them as class-bodies here
+        // so a `lazy let` inside is recognised as a class-body binding.
         // The body of the block sits at a deeper indent than `indent_len`,
         // so subsequent lines compare against `indent_len`.
         if let Some(rest) = trimmed.strip_prefix("class ") {
+            if rest.contains(':') {
+                block_stack.push((indent_len, true));
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("impl ") {
+            if rest.contains(':') {
+                block_stack.push((indent_len, true));
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("extend ") {
             if rest.contains(':') {
                 block_stack.push((indent_len, true));
             }
@@ -1879,7 +1902,7 @@ pub fn expand_lazy_imports(source: &str) -> String {
         }
 
         // ── `lazy import ALIAS = MODULE` ───────────────────────────────────
-        if indent_len == 0 {
+        if rewrite_imports && indent_len == 0 {
             if let Some(after) = trimmed.strip_prefix("lazy import ") {
                 if let Some((alias, module)) = parse_lazy_import(after) {
                     let mut proxy = String::new();
@@ -1956,7 +1979,7 @@ pub fn expand_lazy_imports(source: &str) -> String {
         header.push_str("from typhon_runtime.lazy import lazy_let as __typhon_lazy_let\n");
     }
     if needs_cached_property_import {
-        header.push_str("from functools import cached_property as __typhon_cached_property\n");
+        header.push_str("from functools import cached_property as _typhon_cached_property\n");
     }
 
     if header.is_empty() {
@@ -2170,7 +2193,7 @@ fn render_cached_property(indent: &str, binding: &LazyLetBinding) -> String {
         .map(|t| format!(" -> {}", t))
         .unwrap_or_default();
     format!(
-        "{indent}@__typhon_cached_property\n{indent}def {name}(self){ret}:\n{indent}    return {expr}\n",
+        "{indent}@_typhon_cached_property\n{indent}def {name}(self){ret}:\n{indent}    return {expr}\n",
         indent = indent,
         name = binding.name,
         ret = ret,
@@ -5605,11 +5628,11 @@ def run() -> Result[str, str]:
         let src = "class Foo:\n    lazy let expensive: int = compute()\n";
         let out = expand_lazy_imports(src);
         assert!(
-            out.contains("from functools import cached_property as __typhon_cached_property"),
+            out.contains("from functools import cached_property as _typhon_cached_property"),
             "class-body lazy let should inject cached_property import; got:\n{out}"
         );
         assert!(
-            out.contains("@__typhon_cached_property"),
+            out.contains("@_typhon_cached_property"),
             "class-body lazy let should emit the @cached_property decorator; got:\n{out}"
         );
         assert!(
@@ -5619,6 +5642,24 @@ def run() -> Result[str, str]:
         assert!(
             out.contains("return compute()"),
             "class-body lazy let body should return the expr; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn expand_lazy_let_inside_impl_block_lowers_to_cached_property() {
+        let src = "class Service:\n    base: int\n\nimpl Service:\n    lazy let derived: int = self.base * 10\n";
+        let out = expand_lazy_imports(src);
+        assert!(
+            out.contains("@_typhon_cached_property"),
+            "impl-block lazy let should emit the @cached_property decorator; got:\n{out}"
+        );
+        assert!(
+            out.contains("def derived(self) -> int:"),
+            "impl-block lazy let should emit a method signature; got:\n{out}"
+        );
+        assert!(
+            !out.contains("lazy let derived"),
+            "impl-block lazy let must be rewritten; got:\n{out}"
         );
     }
 
