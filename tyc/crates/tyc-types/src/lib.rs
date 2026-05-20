@@ -1313,6 +1313,11 @@ struct MethodSig {
     /// of producing a `() -> return_type` bound-method handle.
     /// FINDINGS #63.
     is_property: bool,
+    /// `true` when the method was decorated with `@staticmethod`. Static
+    /// methods have no implicit receiver, so `arity` records every listed
+    /// parameter and the class-qualified call path does not add one for
+    /// `self` (FINDINGS R3.16).
+    is_static: bool,
 }
 
 /// Member shape recorded for an interface or class — methods are recorded as
@@ -2598,7 +2603,17 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
         match stmt {
             // Ruff folds `async def` into `Stmt::FunctionDef` with `is_async = true`.
             Stmt::FunctionDef(f) => {
-                let arity = method_arity_excluding_receiver(f.parameters.as_ref());
+                let is_static = f
+                    .decorator_list
+                    .iter()
+                    .any(|d| matches!(&d.expression, Expr::Name(n) if n.id.as_str() == "staticmethod"));
+                let arity = if is_static {
+                    f.parameters.posonlyargs.len()
+                        + f.parameters.args.len()
+                        + f.parameters.kwonlyargs.len()
+                } else {
+                    method_arity_excluding_receiver(f.parameters.as_ref())
+                };
                 let return_type = match f.returns.as_deref() {
                     Some(r) => type_from_annotation(r, classes),
                     None => Type::Unknown,
@@ -2613,6 +2628,7 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
                         arity,
                         return_type,
                         is_property,
+                        is_static,
                     },
                 );
             }
@@ -4876,7 +4892,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                             return sig.return_type.clone();
                         }
                         let mut arity = sig.arity;
-                        if receiver_is_class_name {
+                        if receiver_is_class_name && !sig.is_static {
                             arity = arity.saturating_add(1);
                         }
                         let ret = sig.return_type.clone();
