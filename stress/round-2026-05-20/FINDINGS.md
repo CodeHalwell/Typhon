@@ -19,8 +19,10 @@ referenced without renumbering the global list.
 
 Roughly 140 cases run through `tyc build`. Of those:
 - ~95 build and run correctly (happy paths).
-- 5 verify previously-reported findings were genuinely fixed (#7, #11, #13,
-  #14, #22, #26, #31, #32, #62, #67, #72, #79, #84, #93 all good).
+- 16 verify previously-reported findings were genuinely fixed (#7, #11,
+  #13, #14, #22, #26, #31, #32, #61, #62, #72, #77, #78, #79, #84, #92 —
+  see the table below for case references). #67, #74, #93 are not
+  retested in this round.
 - ~25 surface fresh failures or regressions documented below.
 
 **The new high-severity finds:**
