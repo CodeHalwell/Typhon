@@ -4453,3 +4453,21 @@ unit-of-pain wins are:
 12. **`bytes` literal preservation** (#116). Skip the `\xNN`
     re-escape when every byte is printable ASCII.
 
+---
+
+## Status as of `claude/resolve-open-findings-UDZfv`
+
+Picks up the open findings from the `rNIYC` campaign (#97–#127). Each
+fix lands as its own commit.
+
+### Closed in this branch
+
+- **#103** `model X:` auto-adds `pydantic` to `[dependencies]` —
+  `tyc build` now scans the source files for `model NAME:` declarations
+  before bootstrapping `pyproject.toml`. When any are present and
+  `pydantic` is not already a declared dependency, it is auto-injected
+  as `pydantic = "*"` so `uv sync` pulls it into the venv. Without the
+  fix, `model`-using artefacts crashed at import time with
+  `ModuleNotFoundError: No module named 'pydantic'`. New helper
+  `sources_use_model_keyword` in `tyc/src/commands/build.rs`.
+
