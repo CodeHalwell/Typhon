@@ -1817,6 +1817,21 @@ impl<'a> Checker<'a> {
         ));
     }
 
+    fn tuple_index_out_of_range(&mut self, arity: usize, index: i64, span: (usize, usize)) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
+        let length = span.1.saturating_sub(span.0).max(1);
+        self.diagnostics.push_error(TycError::tuple_index_out_of_range(
+            arity,
+            index,
+            &self.path,
+            self.source,
+            span.0,
+            length,
+        ));
+    }
+
     fn nullable_use(&mut self, name: &str, expected: &Type, span: (usize, usize)) {
         if self.unsafe_depth > 0 {
             return;
@@ -4840,8 +4855,34 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             }
         }
         Expr::Subscript(s) => {
-            let _ = infer_expr(c, &s.value);
+            let value_ty = infer_expr(c, &s.value);
             let _ = infer_expr(c, &s.slice);
+            if let Type::Generic(head, elts) = &value_ty {
+                if head == "tuple" && !elts.is_empty() {
+                    if let Some(idx) = const_int_index(&s.slice) {
+                        let arity = elts.len();
+                        let arity_i = arity as i64;
+                        let resolved = if idx >= 0 && idx < arity_i {
+                            Some(idx as usize)
+                        } else if idx < 0 && idx >= -arity_i {
+                            Some((arity_i + idx) as usize)
+                        } else {
+                            None
+                        };
+                        match resolved {
+                            Some(i) => return elts[i].clone(),
+                            None => {
+                                let span = (
+                                    s.range.start().to_usize(),
+                                    s.range.end().to_usize(),
+                                );
+                                c.tuple_index_out_of_range(arity, idx, span);
+                                return Type::Unknown;
+                            }
+                        }
+                    }
+                }
+            }
             Type::Unknown
         }
         Expr::List(l) => {
@@ -5098,6 +5139,27 @@ fn operator_operands_compatible(op: Operator, l: &Type, r: &Type) -> bool {
                 || (is_repeatable(r) && matches!(l, Type::Int | Type::Bool))
         }
         _ => true,
+    }
+}
+
+/// Extract a constant integer index from an expression used in
+/// `Expr::Subscript`. Supports `Number::Int` literals and the unary
+/// negation of one. Anything else returns `None`.
+fn const_int_index(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::NumberLiteral(n) => match &n.value {
+            Number::Int(i) => i.as_i64(),
+            _ => None,
+        },
+        Expr::UnaryOp(u) if matches!(u.op, ruff_python_ast::UnaryOp::USub) => {
+            if let Expr::NumberLiteral(n) = u.operand.as_ref() {
+                if let Number::Int(i) = &n.value {
+                    return i.as_i64().and_then(|v| v.checked_neg());
+                }
+            }
+            None
+        }
+        _ => None,
     }
 }
 

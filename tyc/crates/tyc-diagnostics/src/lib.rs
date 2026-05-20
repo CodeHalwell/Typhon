@@ -284,6 +284,23 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A constant integer index into a fixed-arity tuple is out of
+    /// range — the tuple type carries its element count statically so
+    /// the lookup can be flagged at type-check time. FINDINGS R3.10.
+    #[error("tuple has {arity} element(s); index {index} is out of range")]
+    #[diagnostic(
+        code(tyc::tuple_index_out_of_range),
+        help("use an index in `0..{arity}` (or `-{arity}..0` for negative indexing)")
+    )]
+    TupleIndexOutOfRange {
+        arity: usize,
+        index: i64,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("index `{index}` is out of range for `tuple` of arity {arity}")]
+        span: SourceSpan,
+    },
+
     /// A nullable value (`T | None`) was used in a position requiring `T`.
     #[error("possibly-None value used where `{expected}` is required")]
     #[diagnostic(
@@ -1007,6 +1024,23 @@ impl TycError {
             op: op.into(),
             lhs: lhs.into(),
             rhs: rhs.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::TupleIndexOutOfRange`] diagnostic.
+    pub fn tuple_index_out_of_range(
+        arity: usize,
+        index: i64,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::TupleIndexOutOfRange {
+            arity,
+            index,
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
         }
