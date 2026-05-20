@@ -435,6 +435,49 @@ pub fn python_stdlib_modules() -> &'static [&'static str] {
     ]
 }
 
+/// Precomputed import-vetting context — built once per `tyc check`
+/// invocation and shared across every file. Hoisting the HashSet
+/// construction out of [`check_unknown_modules`] keeps per-file cost
+/// proportional to the number of imports in the file, not the number
+/// of dependencies in the project.
+pub struct ImportVettingContext {
+    project_roots: std::collections::HashSet<String>,
+    extra_roots: std::collections::HashSet<String>,
+}
+
+impl ImportVettingContext {
+    /// Build the context from raw inputs. `project_modules` is the
+    /// dotted-name form of every `.ty` file in the project;
+    /// `extra_modules` is the list of dependency names (PyPI dist
+    /// names and/or top-level import names already resolved by the
+    /// caller). Both are normalised to their root segment for
+    /// fast lookup, and `extra_modules` additionally seeds the
+    /// hyphen->underscore variant so a `[dependencies]` entry of
+    /// `agent-framework-openai` resolves `agent_framework_openai`.
+    pub fn new(project_modules: &[String], extra_modules: &[String]) -> Self {
+        let project_roots: std::collections::HashSet<String> = project_modules
+            .iter()
+            .map(|m| m.split('.').next().unwrap_or(m.as_str()).to_owned())
+            .collect();
+        let mut extra_roots: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(extra_modules.len() * 2);
+        for m in extra_modules {
+            let raw = m.split('.').next().unwrap_or(m.as_str()).to_owned();
+            let underscored = raw.replace('-', "_");
+            if underscored != raw {
+                extra_roots.insert(raw);
+                extra_roots.insert(underscored);
+            } else {
+                extra_roots.insert(raw);
+            }
+        }
+        Self {
+            project_roots,
+            extra_roots,
+        }
+    }
+}
+
 /// Vet a module's imports against a set of resolvable module names and
 /// emit `tyc::unknown_module` warnings for any unresolvable root.
 ///
@@ -456,6 +499,11 @@ pub fn python_stdlib_modules() -> &'static [&'static str] {
 /// Unknown roots produce a warning (not an error) so existing programs
 /// that depend on quietly-installed sibling packages keep building;
 /// callers can promote the warning via strictness if desired. FINDINGS #79.
+///
+/// Callers that vet many files in a row should prefer
+/// [`check_unknown_modules_with`] and reuse a single
+/// [`ImportVettingContext`] across the batch — building the context's
+/// HashSets has cost proportional to the dependency count.
 pub fn check_unknown_modules(
     path: &str,
     source: &str,
@@ -463,35 +511,25 @@ pub fn check_unknown_modules(
     project_modules: &[String],
     extra_modules: &[String],
 ) -> Diagnostics {
+    let ctx = ImportVettingContext::new(project_modules, extra_modules);
+    check_unknown_modules_with(path, source, module, &ctx)
+}
+
+/// Batched variant of [`check_unknown_modules`]. Identical semantics
+/// but reuses a caller-built [`ImportVettingContext`] so the project
+/// and dependency HashSets aren't reconstructed per file.
+pub fn check_unknown_modules_with(
+    path: &str,
+    source: &str,
+    module: &ruff_python_ast::ModModule,
+    ctx: &ImportVettingContext,
+) -> Diagnostics {
     use ruff_python_ast::Stmt;
 
     let mut diags = Diagnostics::new();
     let stdlib: std::collections::HashSet<&str> = python_stdlib_modules().iter().copied().collect();
-    let project_roots: std::collections::HashSet<&str> = project_modules
-        .iter()
-        .map(|m| m.split('.').next().unwrap_or(m.as_str()))
-        .collect();
-    // PyPI distribution names are hyphenated (`agent-framework-openai`)
-    // while Python import names are underscored (`agent_framework_openai`).
-    // Normalize hyphens to underscores so a `[dependencies]` entry of the
-    // dist-name shape resolves the corresponding import-name shape — the
-    // most common dist/import mapping. (The harder case — one
-    // distribution providing a top-level package whose name doesn't
-    // match either form, e.g. `agent-framework-core` providing
-    // `agent_framework` — is handled separately by the `tyc check`
-    // venv-introspection pass.)
-    let extra_roots: std::collections::HashSet<String> = extra_modules
-        .iter()
-        .flat_map(|m| {
-            let raw = m.split('.').next().unwrap_or(m.as_str()).to_owned();
-            let underscored = raw.replace('-', "_");
-            if underscored != raw {
-                vec![raw, underscored]
-            } else {
-                vec![raw]
-            }
-        })
-        .collect();
+    let project_roots = &ctx.project_roots;
+    let extra_roots = &ctx.extra_roots;
     let is_resolvable = |module_name: &str| -> bool {
         let root = module_name.split('.').next().unwrap_or(module_name);
         if root.is_empty() || root.starts_with('_') {

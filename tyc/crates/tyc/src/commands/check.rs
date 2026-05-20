@@ -14,7 +14,9 @@ use tyc_analyse::{analyse_purity, evaluate_comptime_with_functions, purity_diagn
 use tyc_db::{check_file, TycDatabase};
 use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_emit::{compare_modules, StubTestKind};
+#[cfg(test)]
 use tyc_resolve::check_unknown_modules;
+use tyc_resolve::{check_unknown_modules_with, ImportVettingContext};
 use tyc_syntax::preprocess::{
     expand_gather_blocks, expand_go_calls, expand_lazy_imports, expand_multiline_guards,
     expand_pipes, expand_question_ops, expand_with_chains, preprocess,
@@ -58,9 +60,20 @@ pub fn run(args: CheckArgs) -> Result<()> {
             }
         })
         .unwrap_or_else(|| PathBuf::from("."));
-    let (config, has_project_config) = match TyphonConfig::load(&config_start) {
-        Ok(Some((_, cfg))) => (cfg, true),
-        Ok(None) => (TyphonConfig::default(), false),
+    let (config, has_project_config, project_root) = match TyphonConfig::load(&config_start) {
+        // `TyphonConfig::load` walks ancestors searching for `typhon.toml`,
+        // so the returned path may live in a parent of `config_start`. The
+        // venv-introspection step below needs the *project root* (the
+        // directory containing `typhon.toml`), not the subdir the user ran
+        // `tyc check` against.
+        Ok(Some((path, cfg))) => {
+            let root = path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("."));
+            (cfg, true, root)
+        }
+        Ok(None) => (TyphonConfig::default(), false, PathBuf::from(".")),
         Err(e) => return Err(miette!("{e}")),
     };
 
@@ -88,19 +101,32 @@ pub fn run(args: CheckArgs) -> Result<()> {
         .collect();
     // Venv-aware fallback: read top-level import names from each
     // installed distribution's `.dist-info/top_level.txt` (and `RECORD`
-    // as a backup). This catches the dist/import mismatch case where
-    // hyphen->underscore normalisation isn't enough — e.g. the PyPI
-    // dist `agent-framework-core` exposes the top-level Python module
-    // `agent_framework`, which neither the literal key nor the
-    // underscored key matches. Silently skipped when no venv exists
-    // (so `tyc check` on a fresh project before `tyc sync` still works
-    // — only the literal/normalised keys resolve, which matches what
-    // we documented).
+    // as a backup) and add ONLY the top-level packages that belong to a
+    // distribution declared in `[dependencies]` / `[dev-dependencies]`.
+    //
+    // This catches the dist/import mismatch case where hyphen->underscore
+    // normalisation isn't enough — e.g. the PyPI dist
+    // `agent-framework-core` exposes the top-level Python module
+    // `agent_framework`, `beautifulsoup4` exposes `bs4` — without
+    // letting any *undeclared* locally-installed package quietly pass
+    // `tyc check`. Reproducibility wins: if a colleague clones the
+    // repo, `tyc check` reports the same set of unknown_module
+    // diagnostics regardless of what extra packages happen to be in
+    // their venv.
     if has_project_config {
-        extra_modules.extend(top_level_imports_from_venv(&config_start));
+        let declared: std::collections::HashSet<String> = config
+            .dependencies
+            .keys()
+            .chain(config.dev_dependencies.keys())
+            .map(|k| pep503_normalise(k))
+            .collect();
+        extra_modules.extend(top_level_imports_from_venv(&project_root, &declared));
     }
     extra_modules.sort();
     extra_modules.dedup();
+    // Build the import-vetting HashSets exactly once; the per-file
+    // unknown-module pass reuses them via `check_unknown_modules_with`.
+    let vetting_ctx = tyc_resolve::ImportVettingContext::new(&project_modules, &extra_modules);
 
     for root in &args.paths {
         for path in collect_ty_files(root)? {
@@ -131,12 +157,8 @@ pub fn run(args: CheckArgs) -> Result<()> {
             // outside a project context should not be penalised for importing
             // third-party packages that are not listed in any config.
             if has_project_config {
-                let module_diags = run_unknown_module_check(
-                    &path.display().to_string(),
-                    &source,
-                    &project_modules,
-                    &extra_modules,
-                );
+                let module_diags =
+                    run_unknown_module_check(&path.display().to_string(), &source, &vetting_ctx);
                 diags.extend(module_diags);
             }
         }
@@ -281,25 +303,61 @@ fn run_analysis_passes(path: &str, source: &str) -> Diagnostics {
     diags
 }
 
+/// Normalise a PyPI distribution name per PEP 503: replace runs of
+/// `[-_.]+` with a single `-` and lowercase. `tyc` uses this to match
+/// `[dependencies]` keys against `.dist-info` directory names regardless
+/// of casing or separator drift (`Agent-Framework-Core`,
+/// `agent_framework_core`, `agent.framework.core` all normalise the
+/// same).
+fn pep503_normalise(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_sep = false;
+    for ch in name.chars() {
+        if ch == '-' || ch == '_' || ch == '.' {
+            if !prev_sep && !out.is_empty() {
+                out.push('-');
+                prev_sep = true;
+            }
+        } else {
+            out.push(ch.to_ascii_lowercase());
+            prev_sep = false;
+        }
+    }
+    if out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
 /// Scan the project's local virtualenv for installed Python
 /// distributions and return the top-level import names each one
-/// provides. Used by `tyc check` to vet imports whose package name
-/// differs from the PyPI distribution name (e.g.
-/// `agent-framework-core` -> `agent_framework`,
+/// provides — restricted to distributions actually declared in
+/// `[dependencies]` / `[dev-dependencies]`. Used by `tyc check` to vet
+/// imports whose package name differs from the PyPI distribution name
+/// (e.g. `agent-framework-core` -> `agent_framework`,
 /// `beautifulsoup4` -> `bs4`).
 ///
 /// Looks for a venv at `<project_root>/.venv` — the default `uv` /
 /// `tyc sync` location — and reads `<dist>-<ver>.dist-info/top_level.txt`
-/// from each installed distribution's metadata. If `top_level.txt` is
+/// from each declared distribution's metadata. If `top_level.txt` is
 /// absent (newer wheels often omit it) we fall back to scanning the
 /// `RECORD` manifest for top-level `<pkg>/__init__.py` paths.
 ///
-/// Returns an empty list when no venv exists — the caller's literal
-/// `[dependencies]` keys (with hyphen->underscore normalisation in
-/// `tyc-resolve`) are still consulted, so a fresh project before
-/// `tyc sync` still gets resolution on the common cases.
-fn top_level_imports_from_venv(project_root: &std::path::Path) -> Vec<String> {
+/// `declared` is a set of PEP 503-normalised distribution names; only
+/// `.dist-info` directories whose dist-name normalises into that set
+/// contribute import roots. This keeps `tyc check` reproducible across
+/// machines: a developer with extra packages in their local venv
+/// won't accidentally pass imports that would fail on a fresh clone.
+///
+/// Returns an empty list when no venv exists.
+fn top_level_imports_from_venv(
+    project_root: &std::path::Path,
+    declared: &std::collections::HashSet<String>,
+) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
+    if declared.is_empty() {
+        return out;
+    }
     let venv_root = project_root.join(".venv");
     if !venv_root.is_dir() {
         return out;
@@ -328,11 +386,20 @@ fn top_level_imports_from_venv(project_root: &std::path::Path) -> Vec<String> {
             if !path.is_dir() {
                 continue;
             }
-            let name = path
+            let dir_name = path
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or_default();
-            if !name.ends_with(".dist-info") {
+            let Some(stem) = dir_name.strip_suffix(".dist-info") else {
+                continue;
+            };
+            // `<dist>-<version>.dist-info` — the dist-name is the part
+            // before the LAST `-<version>` segment. Strip the trailing
+            // `-…` component (versions are PEP 440 and don't contain `/`
+            // or whitespace, so trimming the rightmost `-` block is safe).
+            let dist_name = stem.rsplit_once('-').map(|(d, _)| d).unwrap_or(stem);
+            let normalised = pep503_normalise(dist_name);
+            if !declared.contains(&normalised) {
                 continue;
             }
             // Prefer top_level.txt — one package name per line.
@@ -355,24 +422,47 @@ fn top_level_imports_from_venv(project_root: &std::path::Path) -> Vec<String> {
                 continue;
             }
             // Fallback: derive top-level packages from RECORD.
-            // Each non-metadata path of the form `<name>/__init__.py`
-            // (or a bare `<name>.py` file) is a top-level export.
+            // Each entry is `<path>,<hash>,<size>`; the path may be
+            // double-quoted (PEP 376) if it contains commas, may be a
+            // relative `../bin/script` for installed-outside-site
+            // files, or absolute. We accept only paths that point at
+            // a Python module (`<name>.py`) or at a Python source file
+            // inside a top-level directory (`<name>/.../*.py(i)`) — the
+            // narrower filter avoids picking up shipped `bin/`,
+            // `docs/`, or `tests/` directories.
             if let Ok(record) = std::fs::read_to_string(path.join("RECORD")) {
                 for line in record.lines() {
-                    let path_field = line.split(',').next().unwrap_or("").trim();
+                    let raw = line.split(',').next().unwrap_or("").trim();
+                    let path_field = raw.trim_matches('"');
                     if path_field.is_empty()
-                        || path_field.starts_with(".. ")
+                        || path_field.starts_with("../")
+                        || path_field.starts_with("..\\")
                         || path_field.starts_with('/')
+                        || path_field.starts_with('\\')
                     {
                         continue;
                     }
                     let head = path_field.split('/').next().unwrap_or(path_field);
-                    if head.ends_with(".dist-info") || head.ends_with(".data") {
+                    if head.is_empty()
+                        || head == "."
+                        || head == ".."
+                        || head.starts_with('_')
+                        || head.ends_with(".dist-info")
+                        || head.ends_with(".data")
+                    {
                         continue;
                     }
                     let import_name = if let Some(stem) = head.strip_suffix(".py") {
+                        // Top-level single-file module (`foo.py`).
                         stem
-                    } else if path_field.contains('/') {
+                    } else if head.ends_with(".pyi") {
+                        // Pure-stub package — uncommon but valid.
+                        head.strip_suffix(".pyi").unwrap_or(head)
+                    } else if path_field.contains('/')
+                        && (path_field.ends_with(".py") || path_field.ends_with(".pyi"))
+                    {
+                        // Python source nested under a top-level
+                        // directory — treat the directory as a package.
                         head
                     } else {
                         continue;
@@ -453,12 +543,7 @@ fn ty_path_to_dotted(path: &std::path::Path, src_root: &str) -> String {
 /// Typhon-specific keywords (`val`, `var`, `lazy import`, …) are stripped
 /// before the AST walk. Returns the warnings only — errors at the
 /// preprocess / parse layer have already been surfaced by `check_file`.
-fn run_unknown_module_check(
-    path: &str,
-    source: &str,
-    project_modules: &[String],
-    extra_modules: &[String],
-) -> Diagnostics {
+fn run_unknown_module_check(path: &str, source: &str, ctx: &ImportVettingContext) -> Diagnostics {
     let expanded = expand_for_check(source);
     let prep = preprocess(&expanded);
     let module = match tyc_syntax::parse_module(&prep.python_source) {
@@ -471,13 +556,7 @@ fn run_unknown_module_check(
     // source would print out-of-bounds labels for files that exercise
     // preprocess rewrites (`interface`, `impl`, `guard`, `lazy import`,
     // …). (Copilot review on PR #68, file check.rs:337.)
-    check_unknown_modules(
-        path,
-        &prep.python_source,
-        &module,
-        project_modules,
-        extra_modules,
-    )
+    check_unknown_modules_with(path, &prep.python_source, &module, ctx)
 }
 
 /// Shared preprocess pipeline used by every "parse the .ty source for a
@@ -523,6 +602,34 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(&path, content).unwrap();
         path
+    }
+
+    #[test]
+    fn pep503_normalisation_matches_spec() {
+        // Confirms the dist-name normalisation used to filter venv
+        // distributions against `[dependencies]` keys agrees with
+        // PEP 503: replace runs of `[-_.]+` with `-`, lowercase the
+        // result. Same shape PyPA / pip / uv apply, so a key of
+        // `Agent_Framework.Core` matches a wheel filed under
+        // `agent-framework-core`.
+        assert_eq!(
+            pep503_normalise("Agent-Framework-Core"),
+            "agent-framework-core"
+        );
+        assert_eq!(
+            pep503_normalise("agent_framework_core"),
+            "agent-framework-core"
+        );
+        assert_eq!(
+            pep503_normalise("agent.framework.core"),
+            "agent-framework-core"
+        );
+        assert_eq!(
+            pep503_normalise("Agent_Framework.Core"),
+            "agent-framework-core"
+        );
+        assert_eq!(pep503_normalise("beautifulsoup4"), "beautifulsoup4");
+        assert_eq!(pep503_normalise("__leading"), "leading");
     }
 
     #[test]

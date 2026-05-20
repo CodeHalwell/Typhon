@@ -3620,9 +3620,14 @@ fn stmt_always_exits(stmt: &Stmt) -> bool {
             }
             body_always_exits(&s.body) && elif_else_chain_always_exits(&s.elif_else_clauses)
         }
-        // A `with` / `async with` block runs its body unconditionally;
-        // it exits iff the body exits.
-        Stmt::With(w) => body_always_exits(&w.body),
+        // A `with` / `async with` block exits the enclosing function only
+        // when every terminal in its body is *non-suppressible* —
+        // `return` / `break` / `continue`. Bare `raise` is suppressible
+        // by the context manager's `__exit__` (e.g.
+        // `contextlib.suppress(Exception)`), so a `with: raise` body
+        // is not a definite function exit even though the statement
+        // itself "exits" the with-block.
+        Stmt::With(w) => body_exits_non_suppressible(&w.body),
         // A `match` statement where every arm body exits, including a
         // wildcard / capturing fallback that handles unmatched values,
         // is itself an exit. Exhaustive sealed-union matches already
@@ -3754,11 +3759,14 @@ fn stmt_always_exits_aware(c: &Checker, stmt: &Stmt) -> bool {
                 && elif_else_chain_always_exits_aware(c, &s.elif_else_clauses)
         }
         Stmt::Match(m) => match_arms_always_exit_aware(c, m),
-        // A `with` / `async with` block runs its body unconditionally
-        // (modulo exceptions in `__enter__`, which would propagate and
-        // are themselves an exit). So the statement exits iff its body
-        // exits — same shape as straight-line flow (F3).
-        Stmt::With(w) => body_always_exits_aware(c, &w.body),
+        // A `with` / `async with` block exits the enclosing function
+        // only when every terminal in its body is *non-suppressible*
+        // — `return` / `break` / `continue`. Bare `raise` is
+        // suppressible by the context manager's `__exit__`
+        // (e.g. `contextlib.suppress(Exception)`), so a `with: raise`
+        // is not a definite function exit. F3 examples end the with
+        // body in `return`, which is non-suppressible.
+        Stmt::With(w) => body_exits_non_suppressible_aware(c, &w.body),
         Stmt::Try(t) => {
             let finally_exits = !t.finalbody.is_empty() && body_always_exits_aware(c, &t.finalbody);
             let try_and_handlers_exit = body_always_exits_aware(c, &t.body)
@@ -3781,6 +3789,156 @@ fn is_constant_true(expr: &Expr) -> bool {
         expr,
         Expr::BooleanLiteral(lit) if lit.value
     )
+}
+
+/// True when `stmts` always exits the enclosing function via a
+/// *non-suppressible* terminal — `return` / `break` / `continue` (or a
+/// composite whose every branch satisfies the same predicate).
+///
+/// Used for `with` / `async with` bodies in the missing-return
+/// analysis: a context manager's `__exit__` can swallow `raise`
+/// (`contextlib.suppress(Exception)`, custom managers returning
+/// truthy from `__exit__`), so a body whose only terminal is `raise`
+/// is not a definite function exit even though it locally exits the
+/// statement. `return` / `break` / `continue` are not exceptions and
+/// cannot be suppressed by `__exit__`.
+fn body_exits_non_suppressible(stmts: &[Stmt]) -> bool {
+    stmts.last().is_some_and(stmt_exits_non_suppressible)
+}
+
+fn stmt_exits_non_suppressible(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
+        // `raise` IS suppressible by the enclosing context manager.
+        Stmt::Raise(_) => false,
+        Stmt::If(s) => {
+            if is_constant_true(&s.test) {
+                return body_exits_non_suppressible(&s.body);
+            }
+            body_exits_non_suppressible(&s.body)
+                && elif_else_chain_exits_non_suppressible(&s.elif_else_clauses)
+        }
+        Stmt::With(w) => body_exits_non_suppressible(&w.body),
+        Stmt::Match(m) => {
+            !m.cases.is_empty() && m.cases.iter().all(|c| body_exits_non_suppressible(&c.body))
+        }
+        Stmt::Try(t) => {
+            let finally_exits =
+                !t.finalbody.is_empty() && body_exits_non_suppressible(&t.finalbody);
+            let try_and_handlers_exit = body_exits_non_suppressible(&t.body)
+                && t.handlers.iter().all(|h| {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    body_exits_non_suppressible(&h.body)
+                })
+                && (t.orelse.is_empty() || body_exits_non_suppressible(&t.orelse));
+            finally_exits || try_and_handlers_exit
+        }
+        _ => false,
+    }
+}
+
+fn elif_else_chain_exits_non_suppressible(clauses: &[ruff_python_ast::ElifElseClause]) -> bool {
+    let has_terminal_else = clauses.iter().any(|c| c.test.is_none());
+    if !has_terminal_else {
+        return false;
+    }
+    clauses.iter().all(|c| body_exits_non_suppressible(&c.body))
+}
+
+/// Checker-aware mirror of [`body_exits_non_suppressible`]. Identical
+/// shape, but recurses into [`Stmt::Match`] through the exhaustiveness
+/// pass so a sealed-union match whose arms each end in
+/// `return`/`break`/`continue` counts as a non-suppressible exit.
+fn body_exits_non_suppressible_aware(c: &Checker, stmts: &[Stmt]) -> bool {
+    stmts
+        .last()
+        .is_some_and(|s| stmt_exits_non_suppressible_aware(c, s))
+}
+
+fn stmt_exits_non_suppressible_aware(c: &Checker, stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
+        Stmt::Raise(_) => false,
+        Stmt::If(s) => {
+            if is_constant_true(&s.test) {
+                return body_exits_non_suppressible_aware(c, &s.body);
+            }
+            body_exits_non_suppressible_aware(c, &s.body)
+                && elif_else_chain_exits_non_suppressible_aware(c, &s.elif_else_clauses)
+        }
+        Stmt::With(w) => body_exits_non_suppressible_aware(c, &w.body),
+        Stmt::Match(m) => match_arms_exit_non_suppressible_aware(c, m),
+        Stmt::Try(t) => {
+            let finally_exits =
+                !t.finalbody.is_empty() && body_exits_non_suppressible_aware(c, &t.finalbody);
+            let try_and_handlers_exit = body_exits_non_suppressible_aware(c, &t.body)
+                && t.handlers.iter().all(|h| {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    body_exits_non_suppressible_aware(c, &h.body)
+                })
+                && (t.orelse.is_empty() || body_exits_non_suppressible_aware(c, &t.orelse));
+            finally_exits || try_and_handlers_exit
+        }
+        _ => false,
+    }
+}
+
+fn elif_else_chain_exits_non_suppressible_aware(
+    c: &Checker,
+    clauses: &[ruff_python_ast::ElifElseClause],
+) -> bool {
+    let has_terminal_else = clauses.iter().any(|c| c.test.is_none());
+    if !has_terminal_else {
+        return false;
+    }
+    clauses
+        .iter()
+        .all(|cl| body_exits_non_suppressible_aware(c, &cl.body))
+}
+
+fn match_arms_exit_non_suppressible_aware(c: &Checker, m: &ruff_python_ast::StmtMatch) -> bool {
+    // Mirror of `match_arms_always_exit_aware` but requiring every
+    // arm body to exit via a non-suppressible terminal.
+    if m.cases.is_empty() {
+        return false;
+    }
+    if !m
+        .cases
+        .iter()
+        .all(|case| body_exits_non_suppressible_aware(c, &case.body))
+    {
+        return false;
+    }
+    let has_catchall = m.cases.iter().any(|case| {
+        case.guard.is_none()
+            && matches!(
+                &case.pattern,
+                ruff_python_ast::Pattern::MatchAs(p) if p.pattern.is_none()
+            )
+    });
+    if has_catchall {
+        return true;
+    }
+    if let Expr::Name(n) = m.subject.as_ref() {
+        if let Some(binding) = c.env.lookup(n.id.as_str()) {
+            let variants: Option<Vec<String>> = match &binding.declared {
+                Type::Class(union_name) => c.sealed_unions.get(union_name.as_str()).cloned(),
+                Type::Generic(head, _) if head == "Result" => Some(vec!["Ok".into(), "Err".into()]),
+                _ => None,
+            };
+            if let Some(variants) = variants {
+                let mut covered: HashSet<String> = HashSet::new();
+                for case in &m.cases {
+                    if case.guard.is_some() {
+                        continue;
+                    }
+                    collect_matched_class_names(&case.pattern, &mut covered);
+                }
+                return variants.iter().all(|v| covered.contains(v));
+            }
+        }
+    }
+    false
 }
 
 fn elif_else_chain_always_exits_aware(
@@ -5664,6 +5822,30 @@ def f() -> int:
                 .iter()
                 .any(|e| matches!(e, TycError::MissingReturn { .. })),
             "with block ending in return must satisfy missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn with_block_raising_body_still_fires_missing_return() {
+        // Codex PR #73 review: a `with` body that ends in `raise`
+        // is NOT a definite function exit because the context
+        // manager's `__exit__` can suppress the exception
+        // (`contextlib.suppress(Exception)`, custom managers
+        // returning truthy). Missing-return must still fire.
+        let src = "\
+from contextlib import suppress
+
+def f() -> int:
+    with suppress(Exception):
+        raise ValueError(\"x\")
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "with+raise must still fire missing_return: {:?}",
             d.errors()
         );
     }
