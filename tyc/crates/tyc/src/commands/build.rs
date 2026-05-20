@@ -180,7 +180,17 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // Same machinery as `tyc check` — see `collect_project_shapes`
     // there for the dual `.dty`-then-`.ty` walk that gives stubs
     // priority.
-    let src_root = config.project.src.as_str();
+    // Basename of the source directory — `path_to_dotted` matches
+    // by single-component equality, so a `src = "app/src"` config
+    // would otherwise fall through to basename-only dotted names
+    // and break cross-module shape lookups. FINDINGS — copilot
+    // review of v0.2.0.
+    let src_root_owned = std::path::Path::new(&config.project.src)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&config.project.src)
+        .to_owned();
+    let src_root = src_root_owned.as_str();
     let mut project_shapes: std::collections::HashMap<String, tyc_db::ModuleShapes> =
         std::collections::HashMap::new();
     // `.dty` stubs alongside the source tree should win on name
@@ -201,6 +211,10 @@ pub fn run(args: BuildArgs) -> Result<()> {
             .entry(dotted)
             .or_insert_with(|| extract_shapes_for_path(&path.display().to_string(), source));
     }
+    // Wrap the registry in `Arc` so each per-file `ExternalShapes`
+    // snapshot is a cheap refcount bump instead of an O(modules)
+    // clone. FINDINGS — copilot review of v0.2.0.
+    let project_shapes = std::sync::Arc::new(project_shapes);
 
     for (path, source) in &sources {
         let file_diags = check_file_with_imports(

@@ -212,16 +212,16 @@ impl Backend {
                     .unwrap_or("src")
                     .to_owned();
                 #[allow(clippy::explicit_auto_deref)]
-                build_project_shapes_salsa(
+                std::sync::Arc::new(build_project_shapes_salsa(
                     &mut *db,
                     &project_files_arc,
                     src_dir,
                     &src_root_name,
                     &uri_str_for_check,
                     &text_for_check,
-                )
+                ))
             } else {
-                std::collections::HashMap::new()
+                std::sync::Arc::new(std::collections::HashMap::new())
             };
             #[allow(clippy::explicit_auto_deref)]
             let diags = if project_shapes.is_empty() {

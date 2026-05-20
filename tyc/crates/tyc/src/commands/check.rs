@@ -138,7 +138,18 @@ pub fn run(args: CheckArgs) -> Result<()> {
     // declare the Typhon-level surface, and the stub is the source of
     // truth when both forms exist (the latter inserted second by
     // iteration loses the `or_insert` race intentionally).
-    let project_shapes = collect_project_shapes(&args.paths, &config.project.src);
+    // `path_to_dotted` matches `src_root` by single-component
+    // equality, so pass the *basename* of the configured src
+    // directory. A `[project] src = "app/src"` setting would
+    // otherwise fall back to a basename-only dotted name and break
+    // cross-module shape lookup. FINDINGS — copilot review of
+    // v0.2.0.
+    let src_root_name = std::path::Path::new(&config.project.src)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&config.project.src)
+        .to_owned();
+    let project_shapes = std::sync::Arc::new(collect_project_shapes(&args.paths, &src_root_name));
 
     for root in &args.paths {
         for path in collect_ty_files(root)? {

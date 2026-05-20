@@ -13,6 +13,37 @@ check` and `tyc build` in 0.1.6, crashing at runtime with `TypeError:
 missing 1 required positional argument`. v0.2.0 surfaces the same
 bug at check time, before the build ever runs.
 
+### Review-driven fixes (post initial v0.2.0 RC)
+
+- Bare-import dotted access now uses qualified `module.class` names
+  internally, so two imports exporting the same class don't collide
+  in the lookup table. Diagnostics also surface the qualified name
+  (`clients.ApiClient`) for disambiguation.
+- Same fix applied to imported free functions.
+- `model X:` declarations correctly require every non-defaulted
+  field at construction even when defaults appear earlier in the
+  body — `ArityInfo` now carries a per-param `required_positional`
+  flag rather than relying on the "all required come first" Python
+  convention.
+- `impl X:` / `extend X:` blocks contributing fields with defaults
+  now merge `field_defaults` correctly; previously they were treated
+  as required at construction.
+- `[project] src = "app/src"` (nested src) now derives dotted names
+  correctly — the basename of the configured src dir is what
+  `path_to_dotted` actually needs.
+- The post-construction audit no longer fires on `return c.field` or
+  `f(c.field)` (receiver-of-attribute-access isn't an instance
+  escape) and no longer emits duplicate diagnostics for repeated
+  names like `return c if cond else c`.
+- `setattr(obj=c, name=…, value=…)` (kwarg form) now drops audit
+  tracking like the positional form does.
+- `infer_expr_readonly` handles `Expr::Call` so chained calls like
+  `clients.ApiClient(…).url(…)` resolve the receiver type for
+  method arity checks.
+- The project shape registry is now `Arc<HashMap<…>>` end-to-end so
+  per-file `ExternalShapes` snapshots are O(1) refcount bumps
+  instead of O(modules) deep clones.
+
 ### Added
 
 - **`tyc::arg_count` now fires on class constructors.** The

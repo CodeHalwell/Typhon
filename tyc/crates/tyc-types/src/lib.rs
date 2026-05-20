@@ -1312,7 +1312,7 @@ struct Checker<'a> {
     /// the env → `Type::Module("foo")` → consults this registry for
     /// `foo`'s `ApiClient` class, returning a `Type::Class("ApiClient")`
     /// the constructor-call site can arity-check.
-    module_registry: HashMap<String, ModuleShapes>,
+    module_registry: std::sync::Arc<HashMap<String, ModuleShapes>>,
     /// Byte offsets of the `if True:` statements that correspond to
     /// `unsafe:` blocks.  Computed from the preprocessor's `unsafe_lines`
     /// metadata; queried by [`check_stmt`] when entering an `if` body to
@@ -1339,7 +1339,26 @@ pub struct ArityInfo {
     /// Minimum number of positional arguments the caller must supply
     /// (i.e. count of params without default values, excluding kw-only).
     /// `def f(a, b=10) -> ...` → `min_positional = 1`.
+    ///
+    /// For free functions this equals the count of leading non-default
+    /// params (Python enforces "no required after default"). For
+    /// synthesised class constructors with `[strictness]
+    /// model-required-anywhere` semantics (Pydantic-style), the
+    /// per-param `required_positional` vector below is the source of
+    /// truth — `min_positional` stays for callers that haven't
+    /// migrated.
     pub min_positional: usize,
+    /// Per-positional-parameter required flag, parallel to
+    /// `param_names`. `true` means the caller must fill this slot
+    /// either positionally or by matching kwarg; `false` means a
+    /// default value covers it. For `def f(a, b=10)` this is
+    /// `[true, false]`. For a Pydantic-style synthesised constructor
+    /// like `model User: id: int = 1; name: str`, this is
+    /// `[false, true]` — `name` is required even though it follows a
+    /// defaulted field. Allows `check_arity_with_info` to honour the
+    /// full "non-defaulted is required" rule regardless of parameter
+    /// ordering. FINDINGS — codex review of v0.2.0.
+    pub required_positional: Vec<bool>,
     /// Maximum number of positional arguments — the total count of
     /// posonlyargs + args. Kw-only params don't count. `None` for
     /// `*args` functions, which accept unbounded positionals.
@@ -1484,7 +1503,7 @@ impl<'a> Checker<'a> {
             current_return: None,
             current_class: None,
             uninit_instances: HashMap::new(),
-            module_registry: HashMap::new(),
+            module_registry: std::sync::Arc::new(HashMap::new()),
         }
     }
 
@@ -2187,7 +2206,11 @@ pub struct ExternalShapes {
     /// for `Type::Module(name)` attribute access. Cloned into the
     /// checker so attribute access on a module-typed binding can find
     /// the foreign class shape without re-walking imports.
-    pub by_module: HashMap<String, ModuleShapes>,
+    /// Wrapped in [`Arc`] so cross-module callers can share the
+    /// registry between many per-file `ExternalShapes` snapshots
+    /// without paying an O(modules) clone per file. FINDINGS —
+    /// copilot review of v0.2.0.
+    pub by_module: std::sync::Arc<HashMap<String, ModuleShapes>>,
 }
 
 /// Light-weight first-pass extractor that walks a parsed module and
@@ -2244,9 +2267,20 @@ pub fn extract_module_shapes(module: &ModModule) -> ModuleShapes {
                     for (m, sig) in impl_shape.methods {
                         target_shape.methods.entry(m).or_insert(sig);
                     }
+                    // Move `field_defaults` out before the consuming
+                    // `fields` iteration so we can re-key it under the
+                    // same names we're inserting. Without this merge,
+                    // an `impl X: y: int = 1` field would be (wrongly)
+                    // treated as required at construction.
+                    // FINDINGS — copilot review of v0.2.0.
+                    let impl_defaults = impl_shape.field_defaults;
                     for (f, ty) in impl_shape.fields {
-                        if !target_shape.fields.contains_key(&f) {
+                        let is_new = !target_shape.fields.contains_key(&f);
+                        if is_new {
                             target_shape.field_order.push(f.clone());
+                            if impl_defaults.contains(&f) {
+                                target_shape.field_defaults.insert(f.clone());
+                            }
                         }
                         target_shape.fields.entry(f).or_insert(ty);
                     }
@@ -2347,11 +2381,11 @@ pub fn check_module_with_imports(
                 .or_insert_with(|| info.clone());
         }
         // Stash the by-module registry for attribute access on
-        // `Type::Module(name)` (bare `import M` form). Clone here
-        // (cheap because shapes are usually small per module) so the
-        // checker owns its lookup table independent of the caller's
-        // lifetime.
-        c.module_registry = ext.by_module.clone();
+        // `Type::Module(name)` (bare `import M` form). The clone
+        // here is just an `Arc::clone` (O(1) refcount bump) thanks
+        // to the wrapper in `ExternalShapes::by_module`, so this
+        // doesn't pay an O(modules) cost per file.
+        c.module_registry = std::sync::Arc::clone(&ext.by_module);
         // Bare imports: `bare_imports[local_name] = dotted_module`.
         // Seed `class_shapes` is NOT done here — the binding will
         // resolve via `Type::Module(...)` at attribute-access time,
@@ -2562,11 +2596,28 @@ fn audit_clear_binding(c: &mut Checker, binding: &str) {
 /// after a likely-initialising helper. Erring on the side of
 /// false-negatives matches the agent's design recommendation.
 fn audit_observe_call(c: &mut Checker, call: &ruff_python_ast::ExprCall) {
-    // setattr(c, ...) — drop c from tracking.
+    // setattr(c, ...) — drop c from tracking. The target binding may
+    // be the first positional argument OR the `obj=` keyword (the
+    // builtin's parameter name). Without the kwarg form, a call like
+    // `setattr(obj=c, name="x", value=1)` would still trigger
+    // false-positive `missing_field_init` diagnostics downstream.
+    // FINDINGS — gemini review of v0.2.0.
     if let Expr::Name(fn_name) = call.func.as_ref() {
         if fn_name.id.as_str() == "setattr" {
-            if let Some(Expr::Name(first)) = call.arguments.args.first() {
-                audit_clear_binding(c, first.id.as_str());
+            let obj_arg = call.arguments.args.first().or_else(|| {
+                call.arguments
+                    .keywords
+                    .iter()
+                    .find(|kw| {
+                        kw.arg
+                            .as_ref()
+                            .map(|a| a.as_str() == "obj")
+                            .unwrap_or(false)
+                    })
+                    .map(|kw| &kw.value)
+            });
+            if let Some(Expr::Name(n)) = obj_arg {
+                audit_clear_binding(c, n.id.as_str());
             }
         }
     }
@@ -2632,24 +2683,57 @@ fn audit_check_escape(c: &mut Checker, expr: &Expr) {
     }
 }
 
-/// Collect all `Name` ids occurring in an expression, including those
-/// nested inside calls, attribute access, container literals, etc.
-/// Used by the escape audit to find any tracked binding that flows
-/// through `expr`.
-fn collect_names_in_expr(expr: &Expr) -> Vec<String> {
+/// Collect the set of `Name` ids occurring in an expression that
+/// represent the *instance itself escaping* (as opposed to having a
+/// field read off them). `return c` yields `{"c"}`; `return c.field`
+/// yields `{}` because only the field value flows out, not the
+/// instance. `f(c)` yields `{"c"}`; `f(c.field)` yields `{}`.
+///
+/// The set is deduplicated so the same binding can't fire two
+/// diagnostics for one escape site (e.g. `return c if cond else c`).
+///
+/// FINDINGS — gemini + copilot review of v0.2.0.
+fn collect_names_in_expr(expr: &Expr) -> std::collections::HashSet<String> {
     use ruff_python_ast::visitor::source_order::{walk_expr, SourceOrderVisitor};
     struct V {
-        names: Vec<String>,
+        names: std::collections::HashSet<String>,
     }
     impl<'a> SourceOrderVisitor<'a> for V {
         fn visit_expr(&mut self, e: &'a Expr) {
-            if let Expr::Name(n) = e {
-                self.names.push(n.id.as_str().to_owned());
+            match e {
+                Expr::Name(n) => {
+                    self.names.insert(n.id.as_str().to_owned());
+                }
+                // Skip the receiver of `recv.attr` — `c.field` reads
+                // off `c`, it doesn't escape `c` itself. The other
+                // sub-expressions (e.g. arguments to `c.attr` if it
+                // were called — but that's an `Expr::Call` parent
+                // that walks the receiver separately for the audit)
+                // still get visited via `walk_expr` so nested
+                // captures aren't missed.
+                Expr::Attribute(a) => {
+                    // Only short-circuit when the receiver is a
+                    // bare name. For deeper chains like
+                    // `f(c).field`, the inner `Expr::Call` still
+                    // visits `c` (via its own arguments). Treating
+                    // any `recv.attr` as non-escape would wrongly
+                    // suppress audit on `(c if cond else d).field`,
+                    // so we walk subexpressions when the receiver
+                    // isn't a bare Name.
+                    if matches!(a.value.as_ref(), Expr::Name(_)) {
+                        // Skip — receiver-of-attribute access is a
+                        // field read, not an instance escape.
+                    } else {
+                        walk_expr(self, &a.value);
+                    }
+                }
+                _ => walk_expr(self, e),
             }
-            walk_expr(self, e);
         }
     }
-    let mut v = V { names: Vec::new() };
+    let mut v = V {
+        names: std::collections::HashSet::new(),
+    };
     v.visit_expr(expr);
     v.names
 }
@@ -2979,7 +3063,20 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                     for (m, sig) in impl_shape.methods {
                         target_shape.methods.entry(m).or_insert(sig);
                     }
+                    // Mirror `extract_module_shapes`: also merge
+                    // `field_order` and `field_defaults` for newly
+                    // contributed fields so an `impl X: y: int = 1`
+                    // declaration is correctly recognised as
+                    // defaulted at the constructor call site.
+                    let impl_defaults = impl_shape.field_defaults;
                     for (f, ty) in impl_shape.fields {
+                        let is_new = !target_shape.fields.contains_key(&f);
+                        if is_new {
+                            target_shape.field_order.push(f.clone());
+                            if impl_defaults.contains(&f) {
+                                target_shape.field_defaults.insert(f.clone());
+                            }
+                        }
                         target_shape.fields.entry(f).or_insert(ty);
                     }
                 } else {
@@ -3185,6 +3282,9 @@ fn strip_receiver_from_arity(mut info: ArityInfo) -> ArityInfo {
         return info;
     }
     info.param_names.remove(0);
+    if !info.required_positional.is_empty() {
+        info.required_positional.remove(0);
+    }
     info.min_positional = info.min_positional.saturating_sub(1);
     info.max_positional = info.max_positional.map(|n| n.saturating_sub(1));
     info
@@ -3196,29 +3296,30 @@ fn strip_receiver_from_arity(mut info: ArityInfo) -> ArityInfo {
 /// to fields in declaration order, treating fields with an `= default`
 /// as optional. Nullable fields (`T?`) without an explicit default are
 /// NOT defaulted — Typhon does not auto-inject `= None`, matching the
-/// emitted dataclass's runtime behaviour. Returns `None` when the class
-/// has no fields recorded (zero-arg constructor accepts any call shape).
+/// emitted dataclass's runtime behaviour.
+///
+/// The returned `required_positional` records, per field, whether it is
+/// required at construction — `true` for any field without an explicit
+/// `= default`, regardless of declaration order. This is essential for
+/// `model X:` (Pydantic) where a required field can legally follow a
+/// defaulted one; the `@dataclass` form would already have failed at
+/// class-definition time on the same shape, so the rule is conservative
+/// in both directions.
+///
+/// An empty `param_names` (zero-field class) means the call site
+/// short-circuits the arity check entirely.
 fn class_constructor_arity(shape: &InterfaceShape) -> ArityInfo {
-    let mut min_positional = 0usize;
     let max_positional = shape.field_order.len();
-    // A defaulted positional forces every subsequent positional to also
-    // be defaulted in Python (`SyntaxError` otherwise), but the equivalent
-    // is not enforced for `@dataclass` fields — `init` still places the
-    // non-defaulted ones first. Be conservative: count every leading
-    // non-defaulted field toward `min_positional`. If a non-defaulted
-    // field appears AFTER a defaulted one, dataclass init actually fails
-    // at class-definition time, so we'd be flagging that elsewhere.
-    let mut hit_default = false;
-    for name in &shape.field_order {
-        if shape.field_defaults.contains(name) {
-            hit_default = true;
-        } else if !hit_default {
-            min_positional += 1;
-        }
-    }
+    let required_positional: Vec<bool> = shape
+        .field_order
+        .iter()
+        .map(|name| !shape.field_defaults.contains(name))
+        .collect();
+    let min_positional = required_positional.iter().filter(|r| **r).count();
     ArityInfo {
         param_names: shape.field_order.clone(),
         min_positional,
+        required_positional,
         max_positional: Some(max_positional),
         kwonly_names: Vec::new(),
         kwonly_required: Vec::new(),
@@ -3394,10 +3495,11 @@ fn method_arity_info_for_attribute(
 /// match arms but avoids emitting diagnostics. Used by
 /// [`method_arity_info_for_attribute`] to peek at the receiver's static
 /// type before the surrounding call-site machinery walks it for real.
-/// Limited to the cases we actually need (`Name` and `Attribute` chains);
-/// anything else degrades to `Type::Unknown`, which the caller treats as
-/// "no method arity info available" and falls back to the legacy
-/// permissive shape.
+/// Covers `Name`, `Attribute`, and `Call` so chained shapes like
+/// `get_client().method(...)` correctly resolve the method's arity;
+/// without the `Expr::Call` arm, the chained-call receiver would fall
+/// back to `Type::Unknown` and the method arity check would silently
+/// skip. FINDINGS — gemini review of v0.2.0.
 fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
     match e {
         Expr::Name(n) => c
@@ -3421,6 +3523,36 @@ fn infer_expr_readonly(c: &Checker, e: &Expr) -> Type {
                         Type::Unknown
                     }
                 }
+                Type::Module(mod_name) => {
+                    // Foreign module attribute access — consult the
+                    // module registry so a chained
+                    // `clients.ApiClient(...).url(...)` can see the
+                    // return type of the constructor (the class) and
+                    // then resolve `url` on it.
+                    if let Some(shapes) = c.module_registry.get(mod_name) {
+                        if shapes.class_shapes.contains_key(a.attr.as_str()) {
+                            Type::Class(format!("{}.{}", mod_name, a.attr.as_str()))
+                        } else {
+                            Type::Unknown
+                        }
+                    } else {
+                        Type::Unknown
+                    }
+                }
+                _ => Type::Unknown,
+            }
+        }
+        Expr::Call(call) => {
+            // Resolve the callee's return type so chained call
+            // expressions (`get_client().method(...)`) can walk
+            // through. A constructor call returning `Type::Class(_)`
+            // is what we usually care about here; free-function
+            // calls returning `Type::Unknown` simply fall through
+            // and the outer caller uses the permissive shape.
+            let func_ty = infer_expr_readonly(c, &call.func);
+            match func_ty {
+                Type::Class(name) => Type::Class(name),
+                Type::Function { ret, .. } => *ret,
                 _ => Type::Unknown,
             }
         }
@@ -3533,20 +3665,50 @@ fn check_arity_with_info(
     // present — in that case we trust the user. A `*positional` unpack
     // also expands to an unknown number of args, so skip the count
     // check there too (FINDINGS #109).
+    //
+    // When the caller populated `required_positional` (per-param
+    // required flags, parallel to `param_names`) we honour it directly
+    // so a `model X: id: int = 1; name: str` constructor correctly
+    // requires `name` even though it follows a defaulted field
+    // (FINDINGS — codex review of v0.2.0). Free-function arity
+    // construction populates `required_positional` such that the
+    // result is identical to "first `min_positional` are required",
+    // so the new path subsumes the old one. The
+    // `required_positional.is_empty()` fallback preserves behaviour
+    // when an external caller built an `ArityInfo` without the new
+    // field — only the per-class synthesis and `arity_info_from_parameters`
+    // ever populate it in-tree.
     if !has_double_star && !has_starred_positional {
-        for (i, p) in info
-            .param_names
-            .iter()
-            .enumerate()
-            .take(info.min_positional)
-        {
-            if i < pos_args.len() {
-                continue;
+        let use_per_param = info.required_positional.len() == info.param_names.len()
+            && !info.required_positional.is_empty();
+        if use_per_param {
+            for (i, p) in info.param_names.iter().enumerate() {
+                if !info.required_positional[i] {
+                    continue;
+                }
+                if i < pos_args.len() {
+                    continue;
+                }
+                if named_kwargs.iter().any(|kw| kw == p) {
+                    continue;
+                }
+                return ArityCheck::Other;
             }
-            if named_kwargs.iter().any(|kw| kw == p) {
-                continue;
+        } else {
+            for (i, p) in info
+                .param_names
+                .iter()
+                .enumerate()
+                .take(info.min_positional)
+            {
+                if i < pos_args.len() {
+                    continue;
+                }
+                if named_kwargs.iter().any(|kw| kw == p) {
+                    continue;
+                }
+                return ArityCheck::Other;
             }
-            return ArityCheck::Other;
         }
         // Rule 3b: every required kw-only must be filled.
         for required in &info.kwonly_required {
@@ -3571,22 +3733,29 @@ fn arity_info_from_parameters(
     type_params: &[String],
 ) -> ArityInfo {
     let mut param_names: Vec<String> = Vec::new();
+    let mut required_positional: Vec<bool> = Vec::new();
     let mut min_positional: usize = 0;
     // Walk positional-only + positional-or-keyword. A defaulted positional
     // doesn't count toward `min_positional`; once we see the first
     // defaulted param all subsequent positionals must also be defaulted
     // (Python grammar enforces this), so we can stop incrementing once
-    // we encounter a default.
+    // we encounter a default. `required_positional` records the same
+    // information per-param so the call-site arity check can honour
+    // shapes whose defaults aren't all trailing (e.g. synthesised
+    // Pydantic-model constructors).
     let positional_chain = parameters.posonlyargs.iter().chain(parameters.args.iter());
     let mut hit_default = false;
     let mut max_positional_count: usize = 0;
     for pwd in positional_chain {
         param_names.push(pwd.parameter.name.as_str().to_owned());
         max_positional_count += 1;
-        if pwd.default.is_none() && !hit_default {
+        let has_default = pwd.default.is_some();
+        if !has_default && !hit_default {
             min_positional += 1;
+            required_positional.push(true);
         } else {
             hit_default = true;
+            required_positional.push(false);
         }
     }
     let max_positional = if parameters.vararg.is_some() {
@@ -3615,6 +3784,7 @@ fn arity_info_from_parameters(
     ArityInfo {
         param_names,
         min_positional,
+        required_positional,
         max_positional,
         kwonly_names,
         kwonly_required,
@@ -5481,7 +5651,22 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // structural type spelled `*args` / `**kwargs`.
                     let fn_name: Option<String> = match call.func.as_ref() {
                         Expr::Name(n) => Some(n.id.as_str().to_owned()),
-                        Expr::Attribute(a) => Some(a.attr.as_str().to_owned()),
+                        Expr::Attribute(a) => {
+                            // For `module.fn(...)` callees (bare-import
+                            // dotted access) the arity was stashed
+                            // under the qualified `module.attr` key to
+                            // avoid collisions between modules that
+                            // export the same name. Mirror that
+                            // qualification here so the lookup hits
+                            // the right entry. The plain attribute
+                            // name still covers method-call /
+                            // instance-attribute callees.
+                            let recv = infer_expr_readonly(c, &a.value);
+                            match recv {
+                                Type::Module(m) => Some(format!("{}.{}", m, a.attr.as_str())),
+                                _ => Some(a.attr.as_str().to_owned()),
+                            }
+                        }
                         _ => None,
                     };
                     // Clone arity info so the mutable Checker borrows
@@ -5904,24 +6089,34 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             // `class_shapes` so the constructor call's
             // `Type::Class(name)` arm can find it.
             if let Type::Module(mod_name) = &recv {
-                if let Some(shapes) = c.module_registry.get(mod_name).cloned() {
-                    if let Some(shape) = shapes.class_shapes.get(attr_name).cloned() {
-                        c.class_shapes.entry(attr_name.to_owned()).or_insert(shape);
-                        if let Some(tps) = shapes.class_type_params.get(attr_name).cloned() {
-                            c.class_type_params
-                                .entry(attr_name.to_owned())
-                                .or_insert(tps);
+                // Bump the Arc instead of cloning the whole registry
+                // so the cost stays O(1) regardless of project size.
+                let registry = std::sync::Arc::clone(&c.module_registry);
+                if let Some(shapes) = registry.get(mod_name) {
+                    // Qualify the stashed name with the module so two
+                    // imports that both expose `Client` don't collide
+                    // in `class_shapes` / `function_arity_info` — the
+                    // first-seen shape would otherwise win for both
+                    // call sites. The qualified name is also what
+                    // the user sees in the diagnostic
+                    // ("`clients.ApiClient`"), which is more
+                    // informative than the unqualified form.
+                    // FINDINGS — gemini + codex review of v0.2.0.
+                    let qualified = format!("{}.{}", mod_name, attr_name);
+                    if let Some(shape) = shapes.class_shapes.get(attr_name) {
+                        let shape = shape.clone();
+                        c.class_shapes.entry(qualified.clone()).or_insert(shape);
+                        if let Some(tps) = shapes.class_type_params.get(attr_name) {
+                            let tps = tps.clone();
+                            c.class_type_params.entry(qualified.clone()).or_insert(tps);
                         }
-                        return Type::Class(attr_name.to_owned());
+                        return Type::Class(qualified);
                     }
-                    if let Some(info) = shapes.function_arities.get(attr_name).cloned() {
+                    if let Some(info) = shapes.function_arities.get(attr_name) {
+                        let info = info.clone();
                         let params = vec![Type::Unknown; info.param_names.len()];
                         let variadic = info.max_positional.is_none();
-                        // Stash the arity so the call site can pick
-                        // it up via `function_arity_info[attr_name]`.
-                        c.function_arity_info
-                            .entry(attr_name.to_owned())
-                            .or_insert(info);
+                        c.function_arity_info.entry(qualified).or_insert(info);
                         return Type::Function {
                             params,
                             ret: Box::new(Type::Unknown),
@@ -7190,6 +7385,105 @@ def make() -> ApiClient:
 ";
         let d = check(src);
         assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    // ── PR-review-driven audit regressions ────────────────────────
+
+    #[test]
+    fn audit_return_attribute_access_no_false_positive() {
+        // `return c.base_url` reads off the instance, doesn't escape
+        // it. Previously the audit collected `c` from the attribute
+        // receiver and fired even though only the field flows out.
+        // FINDINGS — gemini medium review of v0.2.0.
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+def get_url() -> str:
+    let c: ApiClient = ApiClient.__new__(ApiClient)
+    c.base_url = \"x\"
+    return c.base_url
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "return c.field must not flag c as escaping: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn audit_call_arg_attribute_access_no_false_positive() {
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+def consume(s: str) -> None:
+    pass
+
+def f() -> None:
+    let c: ApiClient = ApiClient.__new__(ApiClient)
+    c.base_url = \"x\"
+    consume(c.base_url)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "f(c.field) must not flag c as escaping: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn audit_setattr_kwarg_form_drops_tracking() {
+        // `setattr(obj=c, name=..., value=...)` — the binding `c` is
+        // bound by name, not position. FINDINGS — gemini medium
+        // review of v0.2.0.
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+def make() -> ApiClient:
+    let c: ApiClient = ApiClient.__new__(ApiClient)
+    setattr(obj=c, name=\"api_key\", value=\"x\")
+    setattr(obj=c, name=\"base_url\", value=\"y\")
+    return c
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "setattr(obj=...) must drop audit tracking: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn audit_no_duplicate_diagnostic_for_repeated_name() {
+        // `return c if cond else c` — the binding name appears twice
+        // in the escape expression. Should emit ONE diagnostic, not
+        // two. FINDINGS — copilot review of v0.2.0.
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+def f(cond: bool) -> ApiClient:
+    let c: ApiClient = ApiClient.__new__(ApiClient)
+    return c if cond else c
+";
+        let d = check(src);
+        let missing_count = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::MissingFieldInit { .. }))
+            .count();
+        assert_eq!(
+            missing_count, 1,
+            "exactly one diagnostic expected; got {missing_count}"
+        );
     }
 
     // ── FINDINGS #72: bare collection annotations are implicit-any ────

@@ -72,11 +72,45 @@ defaults where applicable — and rejects call sites whose argument shape
 can't be matched. Catching the mismatch at check time avoids `TypeError`
 at runtime.
 
+## Cross-module imports
+
+Both import shapes flow through the same arity check:
+
+```ty
+# src/clients.ty
+class ApiClient:
+    api_key: str
+    base_url: str
+
+# src/main.ty
+from clients import ApiClient
+
+def main() -> None:
+    let c: ApiClient = ApiClient(base_url="x")
+    # error: wrong number of arguments to `ApiClient`: expected 2, got 1
+```
+
+The bare-import dotted form is also checked; the diagnostic name is
+module-qualified so two imports exporting the same class name remain
+disambiguated:
+
+```ty
+import clients
+
+def main() -> None:
+    let c = clients.ApiClient(base_url="x")
+    # error: wrong number of arguments to `clients.ApiClient`: expected 2, got 1
+```
+
+`.dty` stubs participate on equal footing with `.ty` source; stubs win
+on name collisions.
+
 ## Limitations
 
-The constructor check fires for classes the current module can see. Classes
-imported from another module today land as `Type::Class` without a member
-shape, so cross-module constructor calls are not yet checked. Stubs and
-cross-module shape propagation are tracked as a follow-up.
+Dotted-attribute *annotations* (`let c: f.Cls = …`) don't yet resolve to
+the foreign class shape — the constructor call itself arity-checks
+correctly, but the local binding lands as `Type::Unknown`, which weakens
+downstream method-arity checks on it. Workaround: use `from foo import
+Cls` or drop the annotation.
 
 See https://typhon.dev/lang/diagnostics/arg_count

@@ -477,7 +477,7 @@ pub fn check_file_with_imports(
     _db: &mut TycDatabase,
     path: String,
     text: String,
-    shapes_by_module: &std::collections::HashMap<String, ModuleShapes>,
+    shapes_by_module: &std::sync::Arc<std::collections::HashMap<String, ModuleShapes>>,
 ) -> Diagnostics {
     check_impl_with_imports(&path, &text, shapes_by_module)
 }
@@ -490,7 +490,7 @@ pub fn check_file_with_imports(
 fn check_impl_with_imports(
     path: &str,
     text: &str,
-    shapes_by_module: &std::collections::HashMap<String, ModuleShapes>,
+    shapes_by_module: &std::sync::Arc<std::collections::HashMap<String, ModuleShapes>>,
 ) -> Diagnostics {
     let mut diags = Diagnostics::new();
 
@@ -586,10 +586,14 @@ fn check_impl_with_imports(
 ///   any imported module without further callbacks.
 fn build_external_shapes(
     resolved: &ResolvedModule,
-    shapes_by_module: &std::collections::HashMap<String, ModuleShapes>,
+    shapes_by_module: &std::sync::Arc<std::collections::HashMap<String, ModuleShapes>>,
 ) -> ExternalShapes {
+    // Just bump the refcount — the caller (`tyc check` / `tyc
+    // build` / the LSP) constructs the registry once per
+    // invocation and the per-file `ExternalShapes` snapshots
+    // share it. FINDINGS — copilot review of v0.2.0.
     let mut external = ExternalShapes {
-        by_module: shapes_by_module.clone(),
+        by_module: std::sync::Arc::clone(shapes_by_module),
         ..ExternalShapes::default()
     };
     // Module-scope bindings live in scope 0.
@@ -1149,7 +1153,9 @@ let u: User = User(id=1, name=\"Ada\")
     // result: constructor / method arity checks fire on imported
     // symbols, not just locally-declared ones.
 
-    fn build_registry(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, ModuleShapes> {
+    fn build_registry(
+        pairs: &[(&str, &str)],
+    ) -> std::sync::Arc<std::collections::HashMap<String, ModuleShapes>> {
         let mut shapes = std::collections::HashMap::new();
         for (dotted, text) in pairs {
             shapes.insert(
@@ -1157,7 +1163,7 @@ let u: User = User(id=1, name=\"Ada\")
                 extract_shapes_for_path("<test>", text),
             );
         }
-        shapes
+        std::sync::Arc::new(shapes)
     }
 
     #[test]
@@ -1257,8 +1263,8 @@ def f() -> None:
         // check is a no-op, matching the per-file semantics
         // (`tyc::implicit_any` and friends would still flag misuse if
         // the user tried to consume the imported value).
-        let registry: std::collections::HashMap<String, ModuleShapes> =
-            std::collections::HashMap::new();
+        let registry: std::sync::Arc<std::collections::HashMap<String, ModuleShapes>> =
+            std::sync::Arc::new(std::collections::HashMap::new());
         let main = "\
 from nonexistent import Thing
 
@@ -1357,6 +1363,132 @@ let r: int = add(1)
         let mut db = TycDatabase::new();
         let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
         assert!(diags.has_errors(), "cross-module function arity must error");
+    }
+
+    // ── PR-review-driven regression tests ──────────────────────────────
+
+    #[test]
+    fn bare_imports_with_same_class_name_dont_collide() {
+        // Both `a` and `b` export a class named `Client` with
+        // *different* required-field sets. The first-resolved should
+        // not "win" for the second module's call site — each call
+        // arity-checks against its own shape. FINDINGS — gemini high
+        // + codex P1 review of v0.2.0.
+        let mod_a = "\
+class Client:
+    api_key: str
+";
+        let mod_b = "\
+class Client:
+    api_key: str
+    base_url: str
+";
+        let registry = build_registry(&[("a", mod_a), ("b", mod_b)]);
+        // `a.Client(api_key="k")` is OK (one required field).
+        // `b.Client(api_key="k")` is missing `base_url`.
+        let main = "\
+import a
+import b
+
+def f() -> None:
+    let ca = a.Client(api_key=\"k\")
+    let cb = b.Client(api_key=\"k\")
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
+        assert!(diags.has_errors(), "b.Client missing base_url must error");
+        let msg = format!("{}", diags.errors()[0]);
+        assert!(
+            msg.contains("b.Client"),
+            "diagnostic should name `b.Client`, not bare `Client`; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn bare_imports_with_same_function_name_dont_collide() {
+        // Same as above for free functions: `a.parse(s)` has one
+        // arg, `b.parse(s, n)` has two. The lookup must dispatch on
+        // the qualified module path. FINDINGS — codex P1 review.
+        let mod_a = "\
+def parse(s: str) -> int:
+    return 1
+";
+        let mod_b = "\
+def parse(s: str, n: int) -> int:
+    return n
+";
+        let registry = build_registry(&[("a", mod_a), ("b", mod_b)]);
+        let main = "\
+import a
+import b
+
+def f() -> None:
+    let x: int = a.parse(\"x\")
+    let y: int = b.parse(\"y\")
+";
+        let mut db = TycDatabase::new();
+        let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
+        assert!(diags.has_errors(), "b.parse missing second arg must error");
+    }
+
+    #[test]
+    fn model_required_field_after_default_is_required() {
+        // Pydantic-style: `id: int = 1; name: str` — `name` is
+        // required even though it follows a defaulted field. The
+        // emitted `BaseModel` validates this at runtime; check time
+        // should match. FINDINGS — codex P1 review of v0.2.0.
+        let main = "\
+model User:
+    id: int = 1
+    name: str
+
+let u: User = User(id=2)
+";
+        let mut db = TycDatabase::new();
+        let registry: std::sync::Arc<std::collections::HashMap<String, ModuleShapes>> =
+            std::sync::Arc::new(std::collections::HashMap::new());
+        let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
+        assert!(
+            diags.has_errors(),
+            "required field after default must be flagged"
+        );
+    }
+
+    #[test]
+    fn model_required_after_default_filled_by_kw_passes() {
+        let main = "\
+model User:
+    id: int = 1
+    name: str
+
+let u: User = User(name=\"Ada\")
+";
+        let mut db = TycDatabase::new();
+        let registry: std::sync::Arc<std::collections::HashMap<String, ModuleShapes>> =
+            std::sync::Arc::new(std::collections::HashMap::new());
+        let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+    }
+
+    #[test]
+    fn impl_field_with_default_treated_as_optional() {
+        // `impl X: y: int = 1` should be merged with field_defaults
+        // intact so `X()` doesn't (wrongly) error on `y` being
+        // missing. FINDINGS — copilot review of v0.2.0.
+        let main = "\
+class X:
+    x: int
+
+impl X:
+    y: int = 1
+
+let v: X = X(x=1)
+";
+        let mut db = TycDatabase::new();
+        let registry: std::sync::Arc<std::collections::HashMap<String, ModuleShapes>> =
+            std::sync::Arc::new(std::collections::HashMap::new());
+        let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
     }
 
     #[test]
