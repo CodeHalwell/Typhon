@@ -4749,14 +4749,22 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     result
                 }
                 Type::Class(name) => {
-                    // Generic class instantiation (FINDINGS #46) — when
-                    // the class declares PEP 695 type parameters, try
-                    // bidirectional inference from the call's expected
-                    // return type so `let b: Box[int] = Box(value=42)`
-                    // produces `Type::Generic("Box", [Int])` rather than
-                    // `Type::Class("Box")`. Falls back to a forward pass
-                    // that reads field annotations and binds each
-                    // declared TypeVar from the matching kwarg.
+                    if let Some(shape) = c.class_shapes.get(&name).cloned() {
+                        let candidates: Vec<String> =
+                            shape.fields.keys().cloned().collect();
+                        for kw in kw_args {
+                            let Some(ident) = &kw.arg else { continue };
+                            let kw_name = ident.as_str();
+                            if !shape.fields.contains_key(kw_name) {
+                                let suggestion = suggest_candidate(kw_name, &candidates);
+                                let span = (
+                                    ident.range.start().to_usize(),
+                                    ident.range.start().to_usize() + kw_name.len(),
+                                );
+                                c.unknown_kwarg(&name, kw_name, suggestion, span);
+                            }
+                        }
+                    }
                     if let Some(tparams) = c.class_type_params.get(&name).cloned() {
                         let mut bindings: HashMap<String, Type> = HashMap::new();
                         // Bidirectional: pin from the surrounding annotation.
