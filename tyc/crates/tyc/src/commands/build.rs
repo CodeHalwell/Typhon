@@ -32,7 +32,7 @@ use tyc_syntax::preprocess::{
     expand_pipes, expand_question_ops, expand_with_chains, line_byte_starts, preprocess,
 };
 
-use crate::commands::util::{apply_strictness, collect_dty_files, collect_ty_files};
+use crate::commands::util::{apply_strictness, collect_dty_files, collect_py_files, collect_ty_files};
 use crate::config::TyphonConfig;
 
 /// Arguments for `tyc build`.
@@ -50,6 +50,12 @@ pub struct BuildArgs {
     /// Skip formatting the emitted Python.
     #[arg(long)]
     pub no_format: bool,
+
+    /// Dry run: list which output files would be created or overwritten
+    /// without writing anything. The full pipeline still runs so type
+    /// errors continue to surface.
+    #[arg(long)]
+    pub check: bool,
 }
 
 pub fn run(args: BuildArgs) -> Result<()> {
@@ -91,6 +97,9 @@ pub fn run(args: BuildArgs) -> Result<()> {
     };
 
     let do_format = config.emit.format && !args.no_format;
+    let check_mode = args.check;
+    // Counter for `would write …` lines so the final summary is honest.
+    let mut would_write_count: usize = 0;
 
     // Fail fast if any required env vars are missing (declared in [env] required).
     for var in &config.env.required {
@@ -221,6 +230,27 @@ pub fn run(args: BuildArgs) -> Result<()> {
             &prep.comptime_bindings,
             &prep.comptime_functions,
         );
+
+        // Phase 5.6 secret-literal lint: flag any comptime binding whose
+        // name looks like a credential (KEY / TOKEN / PASSWORD / SECRET /
+        // PASS / PWD, case-insensitive). The substituted value lands in
+        // the emitted Python as a raw string literal — committing such
+        // build output to a repository leaks the secret.
+        //
+        // Suppression knob: a `[strictness] allow-secret-comptime = true`
+        // toggle in `typhon.toml` should silence this warning. The
+        // current TyphonConfig is owned by another agent and does not yet
+        // expose the field, so this implementation always prints the
+        // warning. Once the field exists, gate the `eprintln!` on
+        // `!config.strictness.allow_secret_comptime`.
+        for name in comptime_values.keys() {
+            if let Some(matched) = secret_suffix(name) {
+                eprintln!(
+                    "warning[tyc::contains_secret_literal]: comptime let `{name}` (matched '{matched}' suffix) inlines its env value at build time;\n  emitted Python will contain the raw secret as a string literal.\n  Consider reading the env var at runtime (`os.environ[\"{name}\"]`) instead."
+                );
+            }
+        }
+
         if comptime_diags.has_errors() {
             for err in comptime_diags.errors() {
                 eprintln!("{:?}", miette::Report::new_boxed(Box::new(err.clone())));
@@ -365,6 +395,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 memoise_functions: memoise_targets,
                 raw_class_line_starts,
                 frozen_class_line_starts,
+                ..Default::default()
             },
         );
         if desugar_output.needs_typhon_runtime {
@@ -396,13 +427,18 @@ pub fn run(args: BuildArgs) -> Result<()> {
             .map_err(|_| miette!("'{}' is outside the source directory", path.display()))?;
         let out_file = out_dir.join(rel).with_extension("py");
 
-        if let Some(parent) = out_file.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| miette!("cannot create '{}': {e}", parent.display()))?;
-        }
+        if check_mode {
+            println!("would write {}", display_relative(&out_file, &project_root));
+            would_write_count += 1;
+        } else {
+            if let Some(parent) = out_file.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| miette!("cannot create '{}': {e}", parent.display()))?;
+            }
 
-        std::fs::write(&out_file, &python_src)
-            .map_err(|e| miette!("cannot write '{}': {e}", out_file.display()))?;
+            std::fs::write(&out_file, &python_src)
+                .map_err(|e| miette!("cannot write '{}': {e}", out_file.display()))?;
+        }
 
         // Emit a v2 `.py.map` sidecar alongside the emitted `.py`.
         //
@@ -420,10 +456,84 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 .to_string(),
         );
         let map_body = build_source_map_v2(&source_rel, &prep.python_source, &line_offsets);
-        std::fs::write(&map_path, map_body)
-            .map_err(|e| miette!("cannot write '{}': {e}", map_path.display()))?;
+        if check_mode {
+            println!("would write {}", display_relative(&map_path, &project_root));
+            would_write_count += 1;
+            let _ = map_body;
+        } else {
+            std::fs::write(&map_path, map_body)
+                .map_err(|e| miette!("cannot write '{}': {e}", map_path.display()))?;
+        }
 
         emitted += 1;
+    }
+
+    // Phase 5.4: copy stray `.py` files in `src/` to the build output
+    // verbatim so emitted Python that does `from .helper import foo` finds
+    // its hand-written sibling at runtime. Excludes `__pycache__/`,
+    // `tests/`, `.venv/`, and hidden `.X/` directories (handled inside
+    // `collect_py_files`).
+    let py_files = collect_py_files(&src_dir)?;
+    let mut py_copied = 0usize;
+    for path in &py_files {
+        let rel = path
+            .strip_prefix(&src_dir)
+            .map_err(|_| miette!("'{}' is outside the source directory", path.display()))?;
+        let dest = out_dir.join(rel);
+        if check_mode {
+            println!("would write {}", display_relative(&dest, &project_root));
+            would_write_count += 1;
+        } else {
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| miette!("cannot create '{}': {e}", parent.display()))?;
+            }
+            std::fs::copy(path, &dest).map_err(|e| {
+                miette!("cannot copy '{}' → '{}': {e}", path.display(), dest.display())
+            })?;
+        }
+        py_copied += 1;
+    }
+    if py_copied > 0 && !check_mode {
+        println!("copied {} .py file(s)", py_copied);
+    }
+
+    // Phase 5.4 orphan-import warning: scan every `.ty` source for
+    // `from .NAME import …` lines whose referenced `NAME.py` does NOT
+    // exist anywhere under `src/`. Such relative imports compile fine
+    // (the user's intent is clear) but the build won't copy the
+    // referenced module — typically because `helper.py` lives in a
+    // parent of `src/`. Best-effort textual scan; module-level
+    // unknown-import diagnostics already cover the case where the file
+    // is missing outright.
+    let mut copied_py_module_names: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    for path in &py_files {
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            copied_py_module_names.insert(stem.to_owned());
+        }
+    }
+    for (path, source) in &sources {
+        for (module_name, snippet) in scan_relative_py_imports(source) {
+            if copied_py_module_names.contains(&module_name) {
+                continue;
+            }
+            let mut found_orphan_parent = false;
+            let mut walker: Option<&std::path::Path> = src_dir.parent();
+            while let Some(dir) = walker {
+                if dir.join(format!("{module_name}.py")).exists() {
+                    found_orphan_parent = true;
+                    break;
+                }
+                walker = dir.parent();
+            }
+            if found_orphan_parent {
+                eprintln!(
+                    "warning[tyc::orphan_py_import]: `{snippet}` references {module_name}.py outside src/ — the build will not copy it (in {})",
+                    path.display()
+                );
+            }
+        }
     }
 
     // Phase 3 stub emission: every `.dty` next to the project is compiled to a
@@ -454,6 +564,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 memoise_functions: Vec::new(),
                 raw_class_line_starts,
                 frozen_class_line_starts,
+                ..Default::default()
             },
         );
         let stub_text = emit_stub(&desugar.module);
@@ -462,15 +573,21 @@ pub fn run(args: BuildArgs) -> Result<()> {
             .strip_prefix(&src_dir)
             .map_err(|_| miette!("'{}' is outside the source directory", path.display()))?;
         let out_file = out_dir.join(rel).with_extension("pyi");
-        if let Some(parent) = out_file.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| miette!("cannot create '{}': {e}", parent.display()))?;
+        if check_mode {
+            println!("would write {}", display_relative(&out_file, &project_root));
+            would_write_count += 1;
+            let _ = stub_text;
+        } else {
+            if let Some(parent) = out_file.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| miette!("cannot create '{}': {e}", parent.display()))?;
+            }
+            std::fs::write(&out_file, &stub_text)
+                .map_err(|e| miette!("cannot write '{}': {e}", out_file.display()))?;
         }
-        std::fs::write(&out_file, &stub_text)
-            .map_err(|e| miette!("cannot write '{}': {e}", out_file.display()))?;
         stubs_emitted += 1;
     }
-    if stubs_emitted > 0 {
+    if stubs_emitted > 0 && !check_mode {
         println!("emitted {} stub(s) (.pyi)", stubs_emitted);
     }
 
@@ -479,11 +596,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // generated package the build owns; users do not need to install a
     // separate PyPI package.
     if needs_runtime {
-        std::fs::create_dir_all(&out_dir)
-            .map_err(|e| miette!("cannot create output dir '{}': {e}", out_dir.display()))?;
         let runtime_dir = out_dir.join("typhon_runtime");
-        std::fs::create_dir_all(&runtime_dir)
-            .map_err(|e| miette!("cannot create '{}': {e}", runtime_dir.display()))?;
         let files = [
             ("__init__.py", TYPHON_RUNTIME_INIT_PY),
             ("tasks.py", TYPHON_RUNTIME_TASKS_PY),
@@ -492,16 +605,94 @@ pub fn run(args: BuildArgs) -> Result<()> {
             ("result.py", TYPHON_RUNTIME_RESULT_PY),
             ("parallel.py", TYPHON_RUNTIME_PARALLEL_PY),
         ];
-        for (name, body) in files {
-            let path = runtime_dir.join(name);
-            std::fs::write(&path, body)
-                .map_err(|e| miette!("cannot write '{}': {e}", path.display()))?;
+        if check_mode {
+            for (name, _body) in files {
+                let path = runtime_dir.join(name);
+                println!("would write {}", display_relative(&path, &project_root));
+                would_write_count += 1;
+            }
+        } else {
+            std::fs::create_dir_all(&out_dir)
+                .map_err(|e| miette!("cannot create output dir '{}': {e}", out_dir.display()))?;
+            std::fs::create_dir_all(&runtime_dir)
+                .map_err(|e| miette!("cannot create '{}': {e}", runtime_dir.display()))?;
+            for (name, body) in files {
+                let path = runtime_dir.join(name);
+                std::fs::write(&path, body)
+                    .map_err(|e| miette!("cannot write '{}': {e}", path.display()))?;
+            }
+            println!("wrote typhon_runtime/ → '{}'", runtime_dir.display());
         }
-        println!("wrote typhon_runtime/ → '{}'", runtime_dir.display());
     }
 
-    println!("built {} file(s) → '{}'", emitted, out_dir.display());
+    if check_mode {
+        println!("would write {} file(s) (no changes made)", would_write_count);
+    } else {
+        println!("built {} file(s) → '{}'", emitted, out_dir.display());
+    }
     Ok(())
+}
+
+/// Render `path` as a project-root-relative display string when possible,
+/// falling back to the absolute path. Used by the `--check` dry-run mode
+/// to keep `would write …` lines readable.
+fn display_relative(path: &std::path::Path, project_root: &std::path::Path) -> String {
+    path.strip_prefix(project_root)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| path.display().to_string())
+}
+
+/// Return `Some(suffix)` if `name` looks like a credential identifier.
+/// The match is case-insensitive on the trailing token and is suffix-only.
+/// Used by the secret-comptime lint.
+fn secret_suffix(name: &str) -> Option<&'static str> {
+    let upper = name.to_ascii_uppercase();
+    // Order matters: check the longest/most specific suffixes first so
+    // `MY_PASSWORD` reports `PASSWORD` rather than the shorter `PASS`.
+    for candidate in [
+        "PASSWORD", "SECRET", "TOKEN", "API_KEY", "KEY", "PWD", "PASS",
+    ] {
+        if upper.ends_with(candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Scan `source` for `from .NAME import …` lines and return
+/// `(NAME, snippet)` pairs. Single-dot relative imports only — this
+/// lint targets sibling-file imports, not parent-package `from ..pkg
+/// import …` references. Lightweight textual scan; works even before
+/// the file successfully parses.
+fn scan_relative_py_imports(source: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        let rest = match trimmed.strip_prefix("from .") {
+            Some(r) => r,
+            None => continue,
+        };
+        if rest.starts_with('.') {
+            continue;
+        }
+        let mut name = String::new();
+        for ch in rest.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '_' {
+                name.push(ch);
+            } else {
+                break;
+            }
+        }
+        if name.is_empty() {
+            continue;
+        }
+        let after = &rest[name.len()..];
+        if !after.trim_start().starts_with("import") {
+            continue;
+        }
+        out.push((name, trimmed.trim_end().to_owned()));
+    }
+    out
 }
 
 /// Derive the dotted Python module name that the runtime profiler
@@ -1361,6 +1552,7 @@ mod tests {
             path: tmp.path().to_path_buf(),
             out: None,
             no_format: true,
+            check: false,
         })
         .unwrap();
         assert!(
@@ -1378,6 +1570,7 @@ mod tests {
             path: tmp.path().to_path_buf(),
             out: Some(custom_out.clone()),
             no_format: true,
+            check: false,
         })
         .unwrap();
         assert!(
@@ -1394,6 +1587,7 @@ mod tests {
             path: tmp.path().to_path_buf(),
             out: None,
             no_format: true,
+            check: false,
         });
         assert!(result.is_err(), "build should fail on type mismatch");
     }
@@ -1406,6 +1600,7 @@ mod tests {
             path: tmp.path().to_path_buf(),
             out: None,
             no_format: true,
+            check: false,
         })
         .unwrap();
         // Phase 3 made `typhon_runtime` a package (with submodules `tasks`
@@ -1448,6 +1643,7 @@ async def load(id: int) -> None:
             path: tmp.path().to_path_buf(),
             out: None,
             no_format: true,
+            check: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -1478,6 +1674,7 @@ let result: int = 3 |> double |> inc
             path: tmp.path().to_path_buf(),
             out: None,
             no_format: true,
+            check: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -1503,6 +1700,7 @@ let result: int = 3 |> double |> inc
             path: tmp.path().to_path_buf(),
             out: None,
             no_format: true,
+            check: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -1536,6 +1734,7 @@ class Foo:
             path: tmp.path().to_path_buf(),
             out: None,
             no_format: true,
+            check: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -1559,6 +1758,7 @@ class Foo:
             path: tmp.path().to_path_buf(),
             out: None,
             no_format: true,
+            check: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -1616,6 +1816,7 @@ def area(s: Shape) -> float:
             path: tmp.path().to_path_buf(),
             out: None,
             no_format: true,
+            check: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -1647,6 +1848,7 @@ def area(s: Shape) -> float:
             path: tmp.path().to_path_buf(),
             out: None,
             no_format: true,
+            check: false,
         });
         // Verify the failure is specifically a type-checking error, not a
         // configuration or I/O error, by checking the returned error message.
@@ -1671,6 +1873,7 @@ def fib(n: int) -> int:
             path: tmp.path().to_path_buf(),
             out: None,
             no_format: true,
+            check: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -1703,6 +1906,7 @@ let pet: Animal = Dog(name=\"Rex\")
             path: tmp.path().to_path_buf(),
             out: None,
             no_format: true,
+            check: false,
         });
         // Verify the failure is specifically a type-checking error (structural
         // conformance failure), not a configuration or I/O error.
@@ -1730,6 +1934,7 @@ def hot(n: int) -> int:
             path: tmp.path().to_path_buf(),
             out: None,
             no_format: true,
+            check: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -1759,6 +1964,7 @@ def cold(n: int) -> int:
             path: tmp.path().to_path_buf(),
             out: None,
             no_format: true,
+            check: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -1796,6 +2002,7 @@ def cold(n: int) -> int:
             path: tmp.path().to_path_buf(),
             out: None,
             no_format: true,
+            check: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -1827,6 +2034,7 @@ async def load() -> int:
             path: tmp.path().to_path_buf(),
             out: None,
             no_format: true,
+            check: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -1859,6 +2067,7 @@ async def load() -> int:
             path: tmp.path().to_path_buf(),
             out: None,
             no_format: true,
+            check: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -1893,6 +2102,7 @@ async def load() -> int:
             path: tmp.path().to_path_buf(),
             out: None,
             no_format: true,
+            check: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -1933,6 +2143,7 @@ async def load() -> int:
             path: tmp.path().to_path_buf(),
             out: None,
             no_format: true,
+            check: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -1997,6 +2208,7 @@ async def load() -> int:
             path: tmp.path().to_path_buf(),
             out: None,
             no_format: true,
+            check: false,
         })
         .unwrap();
         let map_path = out_dir.join("main.py.map");
@@ -2039,12 +2251,195 @@ let pet: Animal = Dog(name=\"Rex\")
             path: tmp.path().to_path_buf(),
             out: None,
             no_format: true,
+            check: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
         assert!(
             py.contains("speak"),
             "speak method should appear in emitted Python; got:\n{py}"
+        );
+    }
+
+    // ── Phase 5.4: .py interop in build output ──────────────────────────────
+
+    #[test]
+    fn build_copies_stray_py_files_to_output_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src_dir, out_dir) =
+            scaffold(tmp.path(), "from .helper import foo\nlet x: int = foo()\n");
+        std::fs::write(
+            src_dir.join("helper.py"),
+            "def foo() -> int:\n    return 7\n",
+        )
+        .unwrap();
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+            check: false,
+        })
+        .unwrap();
+        assert!(
+            out_dir.join("main.py").exists(),
+            "main.py should be emitted"
+        );
+        let helper_py = out_dir.join("helper.py");
+        assert!(
+            helper_py.exists(),
+            "helper.py should be copied to the output directory"
+        );
+        let copied = std::fs::read_to_string(&helper_py).unwrap();
+        assert!(
+            copied.contains("def foo() -> int:"),
+            "copied helper.py should preserve its contents; got:\n{copied}"
+        );
+    }
+
+    #[test]
+    fn build_skips_pycache_directory_when_copying_py_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src_dir, out_dir) = scaffold(tmp.path(), "let x: int = 1\n");
+        let pycache = src_dir.join("__pycache__");
+        std::fs::create_dir_all(&pycache).unwrap();
+        std::fs::write(pycache.join("stale.cpython-313.pyc"), "binary").unwrap();
+        std::fs::write(pycache.join("stale.py"), "x = 1\n").unwrap();
+        let tests_dir = src_dir.join("tests");
+        std::fs::create_dir_all(&tests_dir).unwrap();
+        std::fs::write(tests_dir.join("test_foo.py"), "x = 1\n").unwrap();
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+            check: false,
+        })
+        .unwrap();
+        assert!(
+            !out_dir.join("__pycache__").exists(),
+            "__pycache__ contents must not be copied"
+        );
+        assert!(
+            !out_dir.join("tests").exists(),
+            "tests/ contents must not be copied"
+        );
+    }
+
+    // ── Phase 5.6: --check dry-run ─────────────────────────────────────────
+
+    #[test]
+    fn build_check_does_not_create_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, out_dir) = scaffold(tmp.path(), "let x: int = 1\n");
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+            check: true,
+        })
+        .unwrap();
+        assert!(
+            !out_dir.join("main.py").exists(),
+            "--check must not write main.py"
+        );
+        assert!(
+            !out_dir.join("main.py.map").exists(),
+            "--check must not write .py.map sidecar"
+        );
+    }
+
+    #[test]
+    fn build_check_reports_intended_outputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, out_dir) = scaffold(tmp.path(), "def f() -> Ok[int]:\n    return Ok(1)\n");
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+            check: true,
+        })
+        .unwrap();
+        assert!(!out_dir.join("main.py").exists());
+        assert!(!out_dir.join("typhon_runtime").exists());
+    }
+
+    #[test]
+    fn build_check_still_reports_type_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        scaffold(tmp.path(), "let x: int = \"wrong type\"\n");
+        let result = run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+            check: true,
+        });
+        assert!(
+            result.is_err(),
+            "type errors must still fail the build under --check"
+        );
+    }
+
+    // ── Phase 5.6: comptime secret-literal lint ────────────────────────────
+
+    #[test]
+    fn build_warns_on_comptime_secret_binding() {
+        std::env::set_var("FAKE_API_KEY", "secret");
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, out_dir) = scaffold(
+            tmp.path(),
+            "comptime let API_KEY: str = env(\"FAKE_API_KEY\", \"test-value\")\nlet x: str = API_KEY\n",
+        );
+        let result = run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+            check: false,
+        });
+        std::env::remove_var("FAKE_API_KEY");
+        assert!(
+            result.is_ok(),
+            "secret lint is a warning, not an error: {result:?}"
+        );
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        assert!(
+            py.contains("secret"),
+            "comptime value should be inlined; got:\n{py}"
+        );
+    }
+
+    // ── Pure helpers ───────────────────────────────────────────────────────
+
+    #[test]
+    fn secret_suffix_matches_credential_names() {
+        assert_eq!(secret_suffix("API_KEY"), Some("API_KEY"));
+        assert_eq!(secret_suffix("MyToken"), Some("TOKEN"));
+        assert_eq!(secret_suffix("DB_PASSWORD"), Some("PASSWORD"));
+        assert_eq!(secret_suffix("client_secret"), Some("SECRET"));
+        assert_eq!(secret_suffix("PWD"), Some("PWD"));
+    }
+
+    #[test]
+    fn secret_suffix_ignores_unrelated_names() {
+        assert_eq!(secret_suffix("PORT"), None);
+        assert_eq!(secret_suffix("MAX_RETRIES"), None);
+        assert_eq!(secret_suffix("USER"), None);
+    }
+
+    #[test]
+    fn scan_relative_py_imports_picks_up_sibling_imports() {
+        let src = "from .helper import foo\nfrom .other import bar, baz\n";
+        let imports = scan_relative_py_imports(src);
+        let names: Vec<&str> = imports.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"helper"));
+        assert!(names.contains(&"other"));
+    }
+
+    #[test]
+    fn scan_relative_py_imports_skips_parent_package_form() {
+        let src = "from ..pkg import x\nfrom . import y\n";
+        let imports = scan_relative_py_imports(src);
+        assert!(
+            imports.is_empty(),
+            "two-dot and bare-dot imports should be ignored: {imports:?}"
         );
     }
 }

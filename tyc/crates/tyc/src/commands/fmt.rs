@@ -137,4 +137,32 @@ mod tests {
         };
         run(args).unwrap();
     }
+
+    #[test]
+    fn fmt_check_exits_nonzero_on_differences() {
+        // `--check` against an unformatted file must surface an Err so the
+        // process exits non-zero (CI gating uses this).
+        let tmp = tempfile::tempdir().unwrap();
+        // Trailing whitespace on the line is normalised away by the
+        // in-process pipeline, regardless of whether ruff is installed.
+        write_ty(tmp.path(), "e.ty", "let x: int = 1   \n");
+        let args = FmtArgs {
+            paths: vec![tmp.path().to_path_buf()],
+            check: true,
+        };
+        assert!(run(args).is_err());
+    }
+
+    #[test]
+    fn fmt_check_returns_ok_for_clean_input() {
+        // Already-formatted source must round-trip cleanly under --check
+        // (no Err, no diff messages, exit 0).
+        let tmp = tempfile::tempdir().unwrap();
+        write_ty(tmp.path(), "f.ty", "let x: int = 1\n");
+        let args = FmtArgs {
+            paths: vec![tmp.path().to_path_buf()],
+            check: true,
+        };
+        assert!(run(args).is_ok());
+    }
 }

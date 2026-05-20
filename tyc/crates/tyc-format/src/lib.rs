@@ -11,13 +11,28 @@
 //! 3. Normalise: apply lightweight whitespace normalisation to the
 //!    pre-processed source (trailing spaces, final newline). Comments and
 //!    blank lines are preserved.
-//! 4. Post-process: restore the keywords that *were* stripped (model /
+//! 4. (Optional) `ruff format` wrapping: when the `ruff` binary is found
+//!    on `$PATH`, the normalised pure-Python source is piped through
+//!    `ruff format --stdin-filename <path> -`.  Because step 1 has already
+//!    stripped every Typhon-only keyword from the buffer ruff sees, ruff
+//!    never encounters syntax it can't parse.  If ruff is absent we
+//!    silently fall back to the in-process normaliser; if it exits non-zero
+//!    we emit a one-line stderr warning and keep the in-process output.
+//! 5. Post-process: restore the keywords that *were* stripped (model /
 //!    impl / extend / interface / unsafe / comptime / lazy / gather / go).
 //!
-//! Full AST-based reformatting (which would drop comments) is deferred to
-//! a later phase when a comment-preserving CST emitter is available.
+//! ## Deferred work
+//!
+//! The Phase-5 roadmap entry calls for a Typhon-aware AST printer wrapped
+//! in `ruff format`.  That printer requires a comment-preserving CST and
+//! a dedicated emitter — both substantial undertakings — so the present
+//! implementation ships the practical halfway point: the existing
+//! whitespace normaliser composed with optional `ruff format` post-
+//! processing.  See `docs/roadmap/phase-5.md` for the longer-term plan.
 
+use std::io::Write;
 use std::path::Path;
+use std::process::{Command, Stdio};
 
 use tyc_diagnostics::TycError;
 use tyc_syntax::{
@@ -70,9 +85,38 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
     //   • Expand tabs to 4 spaces.
     let normalised = normalise_whitespace(&prep.python_source);
 
+    // Step 3b: (optional) pipe the pure-Python buffer through `ruff format`
+    // when the binary is on $PATH AND the buffer contains nothing that the
+    // stock ruff Python parser would reject.  Two preconditions:
+    //   1. No `prep.stripped` / `prep.optionals` / `prep.lazy_imports` —
+    //      these mean `postprocess_full` rewrites lines by index, so any
+    //      reformatting that shifts line numbers would corrupt the
+    //      restoration.
+    //   2. The buffer doesn't contain Typhon-specific tokens that the
+    //      preprocessor leaves in place (notably `let `/`mut `: the
+    //      vendored ruff parser recognises them, but the stock ruff
+    //      binary on `$PATH` does not).
+    // The Phase-5 vision will replace this with an AST printer that
+    // round-trips Typhon sugar end-to-end.
+    let can_run_ruff = prep.stripped.is_empty()
+        && prep.optionals.is_empty()
+        && prep.lazy_imports.is_empty()
+        && !contains_typhon_only_tokens(&normalised);
+    let after_ruff = if can_run_ruff && ruff_available() {
+        match run_ruff_format(&normalised, path) {
+            Ok(reformatted) => reformatted,
+            Err(msg) => {
+                eprintln!("tyc fmt: ruff format failed ({msg}); using in-process output");
+                normalised
+            }
+        }
+    } else {
+        normalised
+    };
+
     // Step 4: post-process — restore let/mut keywords, `?` sugar, and lazy imports.
     let output = postprocess_full(
-        &normalised,
+        &after_ruff,
         &prep.stripped,
         &prep.optionals,
         &prep.lazy_imports,
@@ -351,6 +395,95 @@ fn line_closes_triple_quote(line: &str, q: char) -> bool {
     line.contains(&triple)
 }
 
+/// Heuristic check for Typhon-only tokens that the stock `ruff` binary
+/// cannot parse.  The vendored ruff parser used by `tyc check` accepts
+/// `let`/`mut` natively, but the user's own `ruff` install — which is
+/// what runs in `run_ruff_format` — does not.  When this returns true
+/// we skip the external `ruff format` pass and keep the in-process
+/// output.
+///
+/// The scan only looks at line-leading tokens (after whitespace), so a
+/// `let` appearing inside a string or comment does not trigger a false
+/// positive.  It's intentionally a string scan rather than a full
+/// tokenisation: precision is unnecessary because the worst case is
+/// "skip ruff and use in-process output", which is always safe.
+fn contains_typhon_only_tokens(source: &str) -> bool {
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("let ")
+            || trimmed.starts_with("mut ")
+            || trimmed.starts_with("comptime ")
+            || trimmed.starts_with("gather:")
+            || trimmed.starts_with("go ")
+        {
+            return true;
+        }
+        // Pipe operator (`|>`) and postfix `?` survive preprocessing but the
+        // stock ruff parser will reject either.  A line-internal `|>` or a
+        // bare `?` that's not inside a string is good enough as a heuristic.
+        if line.contains("|>") || line.contains("?:") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Locate `ruff` on `$PATH`.  Returns `None` when the binary cannot be
+/// found, allowing the formatter to fall back to the in-process pipeline
+/// silently.  The `TYC_FMT_DISABLE_RUFF=1` env var forces this to `None`
+/// — useful for tests and for users who want deterministic local output.
+fn ruff_available() -> bool {
+    if std::env::var_os("TYC_FMT_DISABLE_RUFF").is_some_and(|v| v == "1") {
+        return false;
+    }
+    which_on_path("ruff").is_some()
+}
+
+/// A minimal `which`: scan `$PATH` for an executable named `name`.
+/// Falls back to `None` when `$PATH` is unset or the binary is missing.
+fn which_on_path(name: &str) -> Option<std::path::PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Pipe `source` through `ruff format --stdin-filename <path> -` and return
+/// its stdout.  stderr is captured and discarded (ruff prints a "reformatted"
+/// summary there by default).  A non-zero exit yields `Err`.
+fn run_ruff_format(source: &str, path: &str) -> Result<String, String> {
+    let mut child = Command::new("ruff")
+        .arg("format")
+        .arg("--stdin-filename")
+        .arg(path)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn: {e}"))?;
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "stdin not piped".to_owned())?;
+        stdin
+            .write_all(source.as_bytes())
+            .map_err(|e| format!("write stdin: {e}"))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("wait: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("exit {}", output.status));
+    }
+    String::from_utf8(output.stdout).map_err(|e| format!("utf-8: {e}"))
+}
+
 /// Format the `.ty` file at `path` in place.
 ///
 /// Returns `true` if the file was changed.
@@ -611,6 +744,49 @@ def run() -> Result[int, str]:
         assert_eq!(detect_triple_quote_open("x = '\"\"\"'"), None);
         // But a real triple-quote opener still produces Some.
         assert_eq!(detect_triple_quote_open("x = \"\"\"hi"), Some('"'));
+    }
+
+    #[test]
+    fn format_falls_back_when_ruff_missing() {
+        // When ruff is disabled via the env knob, the in-process pipeline
+        // must still complete cleanly.  This guards against a regression
+        // where the formatter started requiring ruff to be present.
+        // SAFETY: tests run in-process; toggling the env briefly is fine
+        // because we restore it before exiting the test.
+        let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
+        unsafe {
+            std::env::set_var("TYC_FMT_DISABLE_RUFF", "1");
+        }
+        let src = "let x: int = 1\n";
+        let result = format_source(src, "<test>").unwrap();
+        assert!(result.output.contains("let x"));
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TYC_FMT_DISABLE_RUFF", v),
+                None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
+            }
+        }
+    }
+
+    #[test]
+    fn format_check_returns_unchanged_for_idempotent_input() {
+        // A pre-formatted snippet must round-trip without flipping the
+        // `changed` flag — otherwise `tyc fmt --check` would report
+        // false-positive diffs on already-clean files.
+        let src = "x: int = 1\n";
+        let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
+        unsafe {
+            std::env::set_var("TYC_FMT_DISABLE_RUFF", "1");
+        }
+        let result = format_source(src, "<test>").unwrap();
+        assert_eq!(result.output, src);
+        assert!(!result.changed);
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TYC_FMT_DISABLE_RUFF", v),
+                None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
+            }
+        }
     }
 
     #[test]

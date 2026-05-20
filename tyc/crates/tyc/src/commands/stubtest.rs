@@ -120,6 +120,7 @@ pub fn run(args: StubtestArgs) -> Result<()> {
             path: project_root.clone(),
             out: Some(out_dir.clone()),
             no_format: false,
+            check: false,
         })?;
     }
 
