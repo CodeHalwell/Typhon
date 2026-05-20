@@ -6,14 +6,7 @@ src/**
 tsconfig.json
 **/*.map
 **/*.ts
-node_modules/**
-!node_modules/vscode-languageclient/**
-!node_modules/vscode-jsonrpc/**
-!node_modules/vscode-languageserver-protocol/**
-!node_modules/vscode-languageserver-types/**
-!node_modules/semver/**
-# vscode-languageclient pulls these in transitively; without them the
-# extension fails to activate with `Cannot find module 'minimatch'`.
-!node_modules/minimatch/**
-!node_modules/brace-expansion/**
-!node_modules/balanced-match/**
+# Don't blanket-exclude node_modules — vsce reads `npm ls --omit=dev`
+# and packs the production tree on its own. Listing transitive deps
+# here is brittle (see PR #75): every upstream change to
+# `vscode-languageclient` risks breaking activation again.
