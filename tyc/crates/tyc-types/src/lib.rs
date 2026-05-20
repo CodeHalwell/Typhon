@@ -346,6 +346,15 @@ fn body_has_yield(body: &[Stmt]) -> bool {
 
 /// Return `true` when `body` (recursively) contains an `await`
 /// expression — including the implicit awaits inside `async for` and
+/// Mandatory async-protocol dunders — these are legitimately allowed to
+/// have an `async def` body with no `await` (e.g. `__aenter__` that
+/// returns `self`, `__aexit__` that just records cleanup state, or an
+/// `__anext__` that immediately raises `StopAsyncIteration`). Suppress
+/// `tyc::async_without_await` for them. FINDINGS #114.
+fn is_async_protocol_dunder(name: &str) -> bool {
+    matches!(name, "__aenter__" | "__aexit__" | "__aiter__" | "__anext__")
+}
+
 /// `async with` headers. Nested function and class bodies are skipped
 /// so an `await` in an inner async lambda or nested coroutine doesn't
 /// satisfy the outer function. FINDINGS #83.
@@ -2391,7 +2400,7 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                 // are wasted on a body that never suspends — most often a
                 // leftover from a half-finished refactor or a forgotten
                 // `await` on an internal call.
-                if !body_has_await(&f.body) {
+                if !body_has_await(&f.body) && !is_async_protocol_dunder(f.name.as_str()) {
                     let span_start = f.name.range.start().to_usize();
                     let span_len = f
                         .name
@@ -3295,7 +3304,11 @@ fn check_function(
     // `async def` with no `await` — warn per tyc::async_without_await (FINDINGS #83).
     // Only fires for user-authored async functions, not compiler-synthesised helpers
     // (prefixed with `__typhon_`).
-    if is_async && !name.starts_with("__typhon_") && !body_has_await(body) {
+    if is_async
+        && !name.starts_with("__typhon_")
+        && !is_async_protocol_dunder(name)
+        && !body_has_await(body)
+    {
         c.diagnostics.push_warning(TycError::async_without_await(
             name,
             c.path.clone(),

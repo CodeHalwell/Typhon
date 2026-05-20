@@ -4488,3 +4488,12 @@ fix lands as its own commit.
   round-trip with the `=` debug marker preserved. Verified
   end-to-end via `tyc build` + CPython 3.13.
 
+- **#114** `tyc::async_without_await` carve-out for async-protocol
+  dunders — added `is_async_protocol_dunder` helper in
+  `tyc-types/src/lib.rs` that recognises `__aenter__`, `__aexit__`,
+  `__aiter__`, `__anext__`. The two warning sites (the impl-block
+  class walk and the top-level `check_function`) skip the warning
+  for those names, so users can legitimately write
+  `async def __aenter__(self) -> Self: return self` without the
+  noise.
+
