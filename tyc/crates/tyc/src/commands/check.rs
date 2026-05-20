@@ -80,12 +80,27 @@ pub fn run(args: CheckArgs) -> Result<()> {
     // not be penalised for importing third-party packages that happen not to
     // be listed anywhere.
     let project_modules = collect_project_modules(&args.paths, &config.project.src);
-    let extra_modules: Vec<String> = config
+    let mut extra_modules: Vec<String> = config
         .dependencies
         .keys()
         .chain(config.dev_dependencies.keys())
         .cloned()
         .collect();
+    // Venv-aware fallback: read top-level import names from each
+    // installed distribution's `.dist-info/top_level.txt` (and `RECORD`
+    // as a backup). This catches the dist/import mismatch case where
+    // hyphen->underscore normalisation isn't enough — e.g. the PyPI
+    // dist `agent-framework-core` exposes the top-level Python module
+    // `agent_framework`, which neither the literal key nor the
+    // underscored key matches. Silently skipped when no venv exists
+    // (so `tyc check` on a fresh project before `tyc sync` still works
+    // — only the literal/normalised keys resolve, which matches what
+    // we documented).
+    if has_project_config {
+        extra_modules.extend(top_level_imports_from_venv(&config_start));
+    }
+    extra_modules.sort();
+    extra_modules.dedup();
 
     for root in &args.paths {
         for path in collect_ty_files(root)? {
@@ -264,6 +279,114 @@ fn run_analysis_passes(path: &str, source: &str) -> Diagnostics {
     diags.extend(purity_diags);
 
     diags
+}
+
+/// Scan the project's local virtualenv for installed Python
+/// distributions and return the top-level import names each one
+/// provides. Used by `tyc check` to vet imports whose package name
+/// differs from the PyPI distribution name (e.g.
+/// `agent-framework-core` -> `agent_framework`,
+/// `beautifulsoup4` -> `bs4`).
+///
+/// Looks for a venv at `<project_root>/.venv` — the default `uv` /
+/// `tyc sync` location — and reads `<dist>-<ver>.dist-info/top_level.txt`
+/// from each installed distribution's metadata. If `top_level.txt` is
+/// absent (newer wheels often omit it) we fall back to scanning the
+/// `RECORD` manifest for top-level `<pkg>/__init__.py` paths.
+///
+/// Returns an empty list when no venv exists — the caller's literal
+/// `[dependencies]` keys (with hyphen->underscore normalisation in
+/// `tyc-resolve`) are still consulted, so a fresh project before
+/// `tyc sync` still gets resolution on the common cases.
+fn top_level_imports_from_venv(project_root: &std::path::Path) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let venv_root = project_root.join(".venv");
+    if !venv_root.is_dir() {
+        return out;
+    }
+    // `site-packages` lives under `lib/pythonX.Y` on POSIX,
+    // `Lib/site-packages` on Windows. Probe both.
+    let mut site_dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(venv_root.join("lib")) {
+        for entry in entries.flatten() {
+            let p = entry.path().join("site-packages");
+            if p.is_dir() {
+                site_dirs.push(p);
+            }
+        }
+    }
+    let win_site = venv_root.join("Lib").join("site-packages");
+    if win_site.is_dir() {
+        site_dirs.push(win_site);
+    }
+    for site in site_dirs {
+        let Ok(entries) = std::fs::read_dir(&site) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            if !name.ends_with(".dist-info") {
+                continue;
+            }
+            // Prefer top_level.txt — one package name per line.
+            let tlt = path.join("top_level.txt");
+            if let Ok(content) = std::fs::read_to_string(&tlt) {
+                for line in content.lines() {
+                    let line = line.trim();
+                    // Filter out empty lines and namespace-package markers.
+                    // top_level.txt may also list dotted paths for
+                    // sub-packages; we only need the root component.
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let root = line.split('/').next().unwrap_or(line);
+                    let root = root.split('.').next().unwrap_or(root);
+                    if !root.is_empty() && !root.starts_with('_') {
+                        out.push(root.to_owned());
+                    }
+                }
+                continue;
+            }
+            // Fallback: derive top-level packages from RECORD.
+            // Each non-metadata path of the form `<name>/__init__.py`
+            // (or a bare `<name>.py` file) is a top-level export.
+            if let Ok(record) = std::fs::read_to_string(path.join("RECORD")) {
+                for line in record.lines() {
+                    let path_field = line.split(',').next().unwrap_or("").trim();
+                    if path_field.is_empty()
+                        || path_field.starts_with(".. ")
+                        || path_field.starts_with('/')
+                    {
+                        continue;
+                    }
+                    let head = path_field.split('/').next().unwrap_or(path_field);
+                    if head.ends_with(".dist-info") || head.ends_with(".data") {
+                        continue;
+                    }
+                    let import_name = if let Some(stem) = head.strip_suffix(".py") {
+                        stem
+                    } else if path_field.contains('/') {
+                        head
+                    } else {
+                        continue;
+                    };
+                    if !import_name.is_empty() && !import_name.starts_with('_') {
+                        out.push(import_name.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Collect the dotted-name form of every `.ty` file under the given

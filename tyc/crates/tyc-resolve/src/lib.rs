@@ -471,9 +471,26 @@ pub fn check_unknown_modules(
         .iter()
         .map(|m| m.split('.').next().unwrap_or(m.as_str()))
         .collect();
-    let extra_roots: std::collections::HashSet<&str> = extra_modules
+    // PyPI distribution names are hyphenated (`agent-framework-openai`)
+    // while Python import names are underscored (`agent_framework_openai`).
+    // Normalize hyphens to underscores so a `[dependencies]` entry of the
+    // dist-name shape resolves the corresponding import-name shape — the
+    // most common dist/import mapping. (The harder case — one
+    // distribution providing a top-level package whose name doesn't
+    // match either form, e.g. `agent-framework-core` providing
+    // `agent_framework` — is handled separately by the `tyc check`
+    // venv-introspection pass.)
+    let extra_roots: std::collections::HashSet<String> = extra_modules
         .iter()
-        .map(|m| m.split('.').next().unwrap_or(m.as_str()))
+        .flat_map(|m| {
+            let raw = m.split('.').next().unwrap_or(m.as_str()).to_owned();
+            let underscored = raw.replace('-', "_");
+            if underscored != raw {
+                vec![raw, underscored]
+            } else {
+                vec![raw]
+            }
+        })
         .collect();
     let is_resolvable = |module_name: &str| -> bool {
         let root = module_name.split('.').next().unwrap_or(module_name);
@@ -2890,6 +2907,27 @@ def foo():
             &["pandas".to_string()],
         );
         assert!(diags.warnings().is_empty(), "{:?}", diags.warnings());
+    }
+
+    #[test]
+    fn hyphenated_dependency_resolves_underscored_import() {
+        // PyPI distribution names use hyphens; Python import names use
+        // underscores. A `[dependencies]` entry of `agent-framework-openai`
+        // must resolve `from agent_framework_openai import …`.
+        let src = "from agent_framework_openai import Agent\n";
+        let module = parse_module(src);
+        let diags = check_unknown_modules(
+            "t.ty",
+            src,
+            &module,
+            &[],
+            &["agent-framework-openai".to_string()],
+        );
+        assert!(
+            diags.warnings().is_empty(),
+            "hyphenated dep must resolve underscored import: {:?}",
+            diags.warnings()
+        );
     }
 
     #[test]
