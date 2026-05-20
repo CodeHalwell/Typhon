@@ -374,9 +374,19 @@ impl LanguageServer for Backend {
                 // venv-installed packages with the same import name
                 // (PYTHONPATH semantics) — we resolve them first and
                 // skip the venv pass for anything already populated.
+                //
+                // When the file *exists* but parse/resolve fails (a
+                // common mid-keystroke state on the file you're
+                // editing), claim the module for the project anyway
+                // by inserting an empty list. Falling through to venv
+                // would surface a *different* third-party package
+                // with the same import name — better to show "no
+                // suggestions" until the file parses again than to
+                // mislead with unrelated symbols.
                 if let Some(src_dir) = project_src_dir.as_ref() {
                     for module in &candidates_for_task {
-                        if let Some(items) = project_module_members(src_dir, module) {
+                        if resolve_module_to_file(src_dir, module).is_some() {
+                            let items = project_module_members(src_dir, module).unwrap_or_default();
                             map.insert(module.clone(), items);
                         }
                     }
@@ -437,6 +447,12 @@ impl LanguageServer for Backend {
                     uri_to_path(&uri).and_then(|p| compute_module_path(&src_dir, &p));
                 let in_scope: std::collections::HashSet<String> =
                     items.iter().map(|i| i.label.clone()).collect();
+                // Scan the file *once* for the import-insertion anchor;
+                // every suggested symbol reuses the same range, just
+                // with a different `new_text`. Without this each
+                // suggestion would re-scan the entire file, making
+                // open-completion in large projects O(symbols × lines).
+                let insertion_range = auto_import_insertion_range(&raw_source);
                 let auto_import_items = tokio::task::spawn_blocking(move || {
                     let mut guard = match index.lock() {
                         Ok(g) => g,
@@ -459,8 +475,8 @@ impl LanguageServer for Backend {
                                 label: name.clone(),
                                 kind: Some(binding_kind_to_completion_kind(entry.kind)),
                                 detail: Some(format!("from {}", entry.module)),
-                                additional_text_edits: Some(vec![auto_import_text_edit(
-                                    &raw_source,
+                                additional_text_edits: Some(vec![auto_import_text_edit_at(
+                                    insertion_range,
                                     &entry.module,
                                     name,
                                 )]),
@@ -1010,11 +1026,16 @@ struct AutoImportEntry {
 }
 
 /// Cached per-file index state. Keyed in [`ProjectIndex::files`] by
-/// the file's absolute path. The `mtime` lets a refresh skip parse +
-/// resolve work when the file hasn't changed since the last walk.
+/// the file's absolute path. The `(mtime, len)` stamp lets refresh
+/// skip parse + resolve work when the file hasn't changed — pairing
+/// length with mtime catches edits that land within a single
+/// filesystem tick (some macOS / Linux filesystems only have
+/// 1-second mtime resolution, so a fast save sequence can keep the
+/// same timestamp).
 #[derive(Debug)]
 struct IndexedFile {
     mtime: std::time::SystemTime,
+    len: u64,
     module: String,
     symbols: Vec<(String, BindingKind)>,
 }
@@ -1062,10 +1083,11 @@ impl ProjectIndex {
                 continue;
             };
             let Ok(mtime) = meta.modified() else { continue };
+            let len = meta.len();
             let unchanged = self
                 .files
                 .get(&path)
-                .is_some_and(|entry| entry.mtime == mtime);
+                .is_some_and(|entry| entry.mtime == mtime && entry.len == len);
             if unchanged {
                 continue;
             }
@@ -1080,6 +1102,7 @@ impl ProjectIndex {
                 path,
                 IndexedFile {
                     mtime,
+                    len,
                     module,
                     symbols,
                 },
@@ -1191,13 +1214,10 @@ fn extract_top_level_publics(source: &str) -> Vec<(String, BindingKind)> {
         .collect()
 }
 
-/// Compute the [`TextEdit`] that an auto-import completion attaches
-/// via `additionalTextEdits`. Inserts a fresh `from <module> import
-/// <name>\n` at the start of the line *after* the last existing
-/// top-level `import` / `from … import …` statement. When the file
-/// has no top-level imports yet, the insert lands after any leading
-/// shebang and / or module docstring so we don't slip a fresh import
-/// above `#!` or split a docstring open.
+/// Compute the (zero-width) insertion [`Range`] for an auto-import
+/// statement in `raw_source`. Lands after the last top-level `import`
+/// / `from … import …` statement; falls through to a position past
+/// any leading shebang / module docstring when no imports exist yet.
 ///
 /// Indented imports (e.g. `import foo` inside a function body) are
 /// ignored — anchoring on those would let the auto-import drop a
@@ -1210,24 +1230,28 @@ fn extract_top_level_publics(source: &str) -> Vec<(String, BindingKind)> {
 /// results from picking auto-import twice for the same name is
 /// already surfaced by `tyc check` as a `duplicate_binding` error, so
 /// the user sees the redundancy immediately.
-fn auto_import_text_edit(raw_source: &str, module: &str, name: &str) -> TextEdit {
+fn auto_import_insertion_range(raw_source: &str) -> Range {
     let lines: Vec<&str> = raw_source.lines().collect();
-    let after_last_import = scan_last_top_level_import(&lines);
-    let insert_line = match after_last_import {
-        Some(n) => n,
-        None => scan_past_shebang_and_docstring(&lines),
+    let insert_line = scan_last_top_level_import(&lines)
+        .unwrap_or_else(|| scan_past_shebang_and_docstring(&lines));
+    let pos = Position {
+        line: insert_line,
+        character: 0,
     };
+    Range {
+        start: pos,
+        end: pos,
+    }
+}
+
+/// Build the `additionalTextEdits` payload for a single auto-import
+/// suggestion. The expensive line-scan happens once per completion
+/// request (in [`auto_import_insertion_range`]); this just stamps the
+/// resulting `Range` with the per-symbol `from <module> import <name>`
+/// text so the cost is O(symbols) instead of O(symbols × lines).
+fn auto_import_text_edit_at(range: Range, module: &str, name: &str) -> TextEdit {
     TextEdit {
-        range: Range {
-            start: Position {
-                line: insert_line,
-                character: 0,
-            },
-            end: Position {
-                line: insert_line,
-                character: 0,
-            },
-        },
+        range,
         new_text: format!("from {module} import {name}\n"),
     }
 }
@@ -2549,7 +2573,7 @@ mod tests {
     #[test]
     fn auto_import_text_edit_inserts_after_existing_imports() {
         let src = "import os\nfrom math import pi\n\ndef main() -> None:\n    pass\n";
-        let edit = auto_import_text_edit(src, "utils", "helper");
+        let edit = auto_import_text_edit_at(auto_import_insertion_range(src), "utils", "helper");
         // Insert on the line *after* the last import (index 2 = the blank line).
         assert_eq!(edit.range.start.line, 2);
         assert_eq!(edit.range.start.character, 0);
@@ -2559,7 +2583,7 @@ mod tests {
     #[test]
     fn auto_import_text_edit_inserts_at_top_when_no_imports() {
         let src = "def main() -> None:\n    pass\n";
-        let edit = auto_import_text_edit(src, "utils", "helper");
+        let edit = auto_import_text_edit_at(auto_import_insertion_range(src), "utils", "helper");
         assert_eq!(edit.range.start.line, 0);
         assert_eq!(edit.range.start.character, 0);
     }
@@ -2567,7 +2591,7 @@ mod tests {
     #[test]
     fn auto_import_text_edit_skips_shebang() {
         let src = "#!/usr/bin/env tyc\ndef main() -> None:\n    pass\n";
-        let edit = auto_import_text_edit(src, "utils", "helper");
+        let edit = auto_import_text_edit_at(auto_import_insertion_range(src), "utils", "helper");
         // Lands on the line *after* the shebang.
         assert_eq!(edit.range.start.line, 1);
     }
@@ -2575,7 +2599,7 @@ mod tests {
     #[test]
     fn auto_import_text_edit_skips_module_docstring() {
         let src = "\"\"\"Module that does things.\"\"\"\n\ndef main() -> None:\n    pass\n";
-        let edit = auto_import_text_edit(src, "utils", "helper");
+        let edit = auto_import_text_edit_at(auto_import_insertion_range(src), "utils", "helper");
         // Inserted on the line right after the (single-line) docstring.
         assert_eq!(edit.range.start.line, 1);
     }
@@ -2584,7 +2608,7 @@ mod tests {
     fn auto_import_text_edit_skips_multiline_docstring() {
         let src =
             "\"\"\"\nLong docstring\nspanning lines.\n\"\"\"\ndef main() -> None:\n    pass\n";
-        let edit = auto_import_text_edit(src, "utils", "helper");
+        let edit = auto_import_text_edit_at(auto_import_insertion_range(src), "utils", "helper");
         // The docstring ends on line 3 (0-indexed); insert lands at line 4.
         assert_eq!(edit.range.start.line, 4);
     }
@@ -2592,7 +2616,7 @@ mod tests {
     #[test]
     fn auto_import_text_edit_skips_shebang_then_docstring() {
         let src = "#!/usr/bin/env tyc\n\"\"\"doc\"\"\"\ndef main() -> None:\n    pass\n";
-        let edit = auto_import_text_edit(src, "utils", "helper");
+        let edit = auto_import_text_edit_at(auto_import_insertion_range(src), "utils", "helper");
         // Past shebang (line 0) and docstring (line 1) → line 2.
         assert_eq!(edit.range.start.line, 2);
     }
@@ -2603,7 +2627,7 @@ mod tests {
         // function body must NOT anchor the auto-import (that would
         // drop a top-level statement into the function).
         let src = "def main() -> None:\n    import sys\n    pass\n";
-        let edit = auto_import_text_edit(src, "utils", "helper");
+        let edit = auto_import_text_edit_at(auto_import_insertion_range(src), "utils", "helper");
         // Falls through to the no-imports path → line 0.
         assert_eq!(edit.range.start.line, 0);
     }
