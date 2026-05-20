@@ -3612,9 +3612,17 @@ fn stmt_always_exits(stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Return(_) | Stmt::Raise(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
         // An if/elif/else where every branch exits is itself an exit.
+        // `if True:` (which is what `unsafe:` lowers to) collapses to
+        // "body always runs", so it exits iff the body exits.
         Stmt::If(s) => {
+            if is_constant_true(&s.test) {
+                return body_always_exits(&s.body);
+            }
             body_always_exits(&s.body) && elif_else_chain_always_exits(&s.elif_else_clauses)
         }
+        // A `with` / `async with` block runs its body unconditionally;
+        // it exits iff the body exits.
+        Stmt::With(w) => body_always_exits(&w.body),
         // A `match` statement where every arm body exits, including a
         // wildcard / capturing fallback that handles unmatched values,
         // is itself an exit. Exhaustive sealed-union matches already
@@ -3694,19 +3702,27 @@ fn match_arms_always_exit_aware(c: &Checker, m: &ruff_python_ast::StmtMatch) -> 
     // guardless arm. The subject must be a bare name whose declared
     // type is a sealed-union class — same shape the
     // `check_match_exhaustiveness` pass relies on.
+    //
+    // `Result[T, E]` is a builtin sealed union whose variants
+    // (`Ok` | `Err`) are seeded in `seed_typhon_runtime_types` rather
+    // than declared by a user `type Result = Ok | Err` alias, so
+    // resolve it explicitly here (F4).
     if let Expr::Name(n) = m.subject.as_ref() {
         if let Some(binding) = c.env.lookup(n.id.as_str()) {
-            if let Type::Class(union_name) = &binding.declared {
-                if let Some(variants) = c.sealed_unions.get(union_name.as_str()) {
-                    let mut covered: HashSet<String> = HashSet::new();
-                    for case in &m.cases {
-                        if case.guard.is_some() {
-                            continue;
-                        }
-                        collect_matched_class_names(&case.pattern, &mut covered);
+            let variants: Option<Vec<String>> = match &binding.declared {
+                Type::Class(union_name) => c.sealed_unions.get(union_name.as_str()).cloned(),
+                Type::Generic(head, _) if head == "Result" => Some(vec!["Ok".into(), "Err".into()]),
+                _ => None,
+            };
+            if let Some(variants) = variants {
+                let mut covered: HashSet<String> = HashSet::new();
+                for case in &m.cases {
+                    if case.guard.is_some() {
+                        continue;
                     }
-                    return variants.iter().all(|v| covered.contains(v));
+                    collect_matched_class_names(&case.pattern, &mut covered);
                 }
+                return variants.iter().all(|v| covered.contains(v));
             }
         }
     }
@@ -3726,10 +3742,23 @@ fn stmt_always_exits_aware(c: &Checker, stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Return(_) | Stmt::Raise(_) | Stmt::Break(_) | Stmt::Continue(_) => true,
         Stmt::If(s) => {
+            // `if True:` (constant-True test) is unconditional flow —
+            // the body always runs, so it exits iff the body exits. The
+            // `unsafe:` preprocessor lowers to exactly this shape, so
+            // teaching the analysis about it lets `unsafe: ... return`
+            // count as a definite return (F2).
+            if is_constant_true(&s.test) {
+                return body_always_exits_aware(c, &s.body);
+            }
             body_always_exits_aware(c, &s.body)
                 && elif_else_chain_always_exits_aware(c, &s.elif_else_clauses)
         }
         Stmt::Match(m) => match_arms_always_exit_aware(c, m),
+        // A `with` / `async with` block runs its body unconditionally
+        // (modulo exceptions in `__enter__`, which would propagate and
+        // are themselves an exit). So the statement exits iff its body
+        // exits — same shape as straight-line flow (F3).
+        Stmt::With(w) => body_always_exits_aware(c, &w.body),
         Stmt::Try(t) => {
             let finally_exits = !t.finalbody.is_empty() && body_always_exits_aware(c, &t.finalbody);
             let try_and_handlers_exit = body_always_exits_aware(c, &t.body)
@@ -3742,6 +3771,16 @@ fn stmt_always_exits_aware(c: &Checker, stmt: &Stmt) -> bool {
         }
         _ => false,
     }
+}
+
+/// True when `expr` is a literal `True`. Used to recognise the
+/// `if True:` shape that the `unsafe:` preprocessor lowers to, so the
+/// missing-return analysis can treat it as unconditional flow.
+fn is_constant_true(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::BooleanLiteral(lit) if lit.value
+    )
 }
 
 fn elif_else_chain_always_exits_aware(
@@ -5584,6 +5623,69 @@ def area(s: Shape) -> float:
                 .iter()
                 .any(|e| matches!(e, TycError::MissingReturn { .. })),
             "exhaustive sealed-union match should satisfy missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn unsafe_block_with_inner_returns_satisfies_missing_return() {
+        // F2: `unsafe:` lowers to `if True:`, which is unconditional
+        // flow — when every path inside the block returns/raises, the
+        // function returns. Missing_return must not fire.
+        let src = "\
+def f(x: object) -> int:
+    unsafe:
+        if isinstance(x, int):
+            return x
+        raise ValueError(\"bad\")
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "unsafe block with terminal raise must satisfy missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn with_block_returning_body_satisfies_missing_return() {
+        // F3: a `with` block whose body's last statement is a return
+        // is a definite return of the enclosing function.
+        let src = "\
+def f() -> int:
+    with open(\"x\") as g:
+        return 1
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "with block ending in return must satisfy missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn exhaustive_result_match_satisfies_missing_return() {
+        // F4: `match` over `Result[T, E]` covering both `Ok` and `Err`
+        // arms (each ending in a return) is a definite return.
+        let src = "\
+def f(r: Result[int, str]) -> int:
+    match r:
+        case Ok(v):
+            return v
+        case Err(_):
+            return -1
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "exhaustive Result match must satisfy missing_return: {:?}",
             d.errors()
         );
     }

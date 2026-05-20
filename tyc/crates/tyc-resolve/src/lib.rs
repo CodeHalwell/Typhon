@@ -875,6 +875,16 @@ impl<'a> Resolver<'a> {
             // side is `val`, regardless of binding kind: rebinding a `val`
             // via `def`, `class`, a for-loop target, or another assignment
             // all violate immutability.
+            //
+            // Exception: two sibling `for x in ...:` loops in the same
+            // scope are idiomatic Python — each loop "rebinds" the
+            // target, but neither was an authored `let`. Allow the
+            // second loop to silently reuse the same name when both
+            // bindings are `Loop` (for / with / except / comprehension
+            // targets).
+            if existing.kind == BindingKind::Loop && kind == BindingKind::Loop {
+                return;
+            }
             let _ = kind;
             if existing.mutability == Mutability::Let || mutability == Mutability::Let {
                 let decl_span = existing.span;
@@ -3007,6 +3017,29 @@ def foo():
         assert!(
             !d.has_errors(),
             "loop without rebind should be clean: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn sibling_for_loops_can_reuse_target_name() {
+        // F1: two sibling `for x in ...:` loops in the same scope must
+        // not fire `tyc::immutable_assign` on the second loop — Python
+        // users reflexively reuse loop variable names across sibling
+        // loops, and the for-target is not a user-authored `let`.
+        let src = "def main() -> None:\n\
+                   \x20   let xs: list[int] = [1, 2, 3]\n\
+                   \x20   let ys: list[int] = [4, 5, 6]\n\
+                   \x20   for i in xs:\n\
+                   \x20       print(i)\n\
+                   \x20   for i in ys:\n\
+                   \x20       print(i)\n";
+        let (_m, d) = resolve(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ImmutableAssign { .. })),
+            "sibling for-loops must not fire immutable_assign: {:?}",
             d.errors()
         );
     }

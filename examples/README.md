@@ -23,6 +23,15 @@ tyc build
 python build/main.py
 ```
 
+> **Heads-up on third-party imports.** `tyc check` resolves every
+> imported module against `[dependencies]` in `typhon.toml` and rejects
+> unknown names — that's correct behaviour, but it bites if you only
+> copy the `.ty` file into a fresh `tyc init` playground. Add the
+> example's imports to `[dependencies]` (e.g. `tyc add httpx`,
+> `tyc add anthropic`) before running `tyc check` / `tyc build`. Name
+> resolution is enough to satisfy `tyc check`; you only need
+> `tyc sync` / a `pip install` to *run* the emitted Python.
+
 Example 47 ships as a real multi-file project with its own
 `typhon.toml`; see `47-mini-app/README.md` for build/run steps.
 
