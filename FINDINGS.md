@@ -4581,3 +4581,14 @@ fix lands as its own commit.
   is recognised as nullable on the parameter side. The kwarg arm
   was updated the same way.
 
+- **#126 / #127** doc drift — replaced every `lazy_val(...)` /
+  `lazy_val(lambda:` mention across `README.md`, `docs/roadmap.md`,
+  `docs/follow-ups-2026-05-17.md`,
+  `docs/guides/10-advanced-features.md`,
+  `.claude/skills/typhon/SKILL.md`, and
+  `.claude/skills/typhon/REFERENCE.md` with the actual emitted
+  `lazy_let(...)` call. The REFERENCE.md emitted-Python sketch
+  now mirrors the real preprocessor lowering. F-string `=`
+  debug-marker support (#127) is covered by the #106 fix; no
+  separate doc change needed.
+

@@ -133,7 +133,7 @@ numpy.array(...)
 lazy let CONFIG: Config = load_config_from_disk()
 ```
 
-This lowers to a sentinel-cached `lazy_val(lambda: load_config_from_disk())` helper emitted into `typhon_runtime`. First access pays the load cost; subsequent accesses are a memory read. Unlike `functools.cached_property` (which is instance-scoped, race-prone, and writable after first evaluation), the module-level helper is robust under concurrency and one-shot. Inside a class body, `lazy let` lowers to `@cached_property` because the per-instance scope is the intended semantics there.
+This lowers to a sentinel-cached `lazy_let(lambda: load_config_from_disk())` helper emitted into `typhon_runtime`. First access pays the load cost; subsequent accesses are a memory read. Unlike `functools.cached_property` (which is instance-scoped, race-prone, and writable after first evaluation), the module-level helper is robust under concurrency and one-shot. Inside a class body, `lazy let` lowers to `@cached_property` because the per-instance scope is the intended semantics there.
 
 ### `lazy` return types
 
