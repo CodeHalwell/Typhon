@@ -31,7 +31,7 @@ compiler behaviour is worth a follow-up.
 Hit in `36-huggingface-transformer`, `40-llm-tool-use`,
 `43-agent-framework`, and `47-mini-app/agent.ty`. Pattern:
 
-```python
+```ty
 mut text_parts: list[str] = []
 for block in resp.content:        # introduces `block` as a let
     ...
@@ -52,7 +52,7 @@ body only, or (b) accept the rebind silently when the body completes.
 Hit in `40-llm-tool-use` and `43-agent-framework`. `_eval_arith` is
 written as:
 
-```python
+```ty
 def _eval_arith(node: object) -> float:
     unsafe:
         if isinstance(...): return ...
