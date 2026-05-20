@@ -121,6 +121,13 @@ pub struct PreprocessResult {
     /// `@dataclasses.dataclass(slots=True, frozen=True)` instead of the
     /// default decorator.
     pub frozen_class_lines: Vec<usize>,
+    /// 0-based line indices on which a `plain class NAME(...):`
+    /// declaration appears.  The preprocessor strips the leading
+    /// `plain ` so the Python parser sees an ordinary
+    /// `class NAME(...):`; downstream passes consult this list to know
+    /// the class should NOT receive a `@dataclass` decorator and that no
+    /// `__init__` should be synthesised — the body is emitted verbatim.
+    pub plain_class_lines: Vec<usize>,
 }
 
 /// Convert a list of 0-based line indices into byte offsets pointing at
@@ -166,6 +173,7 @@ pub fn preprocess(source: &str) -> PreprocessResult {
     let mut unsafe_lines: Vec<usize> = Vec::new();
     let mut raw_class_lines: Vec<usize> = Vec::new();
     let mut frozen_class_lines: Vec<usize> = Vec::new();
+    let mut plain_class_lines: Vec<usize> = Vec::new();
     // String state carried across lines (triple-quoted strings may span them).
     let mut in_string: Option<StringMode> = None;
 
@@ -345,6 +353,34 @@ pub fn preprocess(source: &str) -> PreprocessResult {
                     python_source.push_str(&rewritten);
                     continue;
                 }
+            }
+
+            // ── `plain class ClassName(...):` → `class ClassName(...):` ─────
+            // The `plain ` prefix is stripped and the line index is recorded
+            // so the desugar pass knows to skip its automatic `@dataclass`
+            // injection on this class.  Unlike `class!`, the body is left
+            // exactly as written — no `__init__` is synthesised.
+            if rest.starts_with("plain class ")
+                && rest.len() > "plain class ".len()
+                && (rest.as_bytes()["plain class ".len()].is_ascii_alphanumeric()
+                    || rest.as_bytes()["plain class ".len()] == b'_')
+            {
+                stripped.push(StrippedKeyword {
+                    line_index,
+                    keyword: TyphonKeyword::PlainClass,
+                });
+                plain_class_lines.push(line_index);
+                let after_marker = &rest["plain ".len()..]; // "class NAME(...):\n"
+                let new_line = format!("{}{}", indent, after_marker);
+                let (rewritten, marks) = rewrite_optionals(&new_line, &mut in_string);
+                for col in marks {
+                    optionals.push(StrippedOptional {
+                        line_index,
+                        python_col: col,
+                    });
+                }
+                python_source.push_str(&rewritten);
+                continue;
             }
 
             // ── `class! ClassName(...):` → `class ClassName(...):` ──────────
@@ -556,6 +592,7 @@ pub fn preprocess(source: &str) -> PreprocessResult {
         unsafe_lines,
         raw_class_lines,
         frozen_class_lines,
+        plain_class_lines,
     }
 }
 
@@ -1343,6 +1380,21 @@ pub fn postprocess_full(
                 let content = &line[indent_len..];
                 let restored = if let Some(tail) = content.strip_prefix("class ") {
                     format!("class! {}", tail)
+                } else {
+                    content.to_owned()
+                };
+                lines[line_idx] = format!("{}{}", &line[..indent_len], restored);
+            }
+            TyphonKeyword::PlainClass => {
+                // Restore `class Foo(...):` → `plain class Foo(...):` by
+                // prepending the stripped `plain ` modifier.
+                let line = &lines[line_idx];
+                let indent_len = line
+                    .find(|c: char| !c.is_whitespace())
+                    .unwrap_or(line.len());
+                let content = &line[indent_len..];
+                let restored = if content.starts_with("class ") {
+                    format!("plain {}", content)
                 } else {
                     content.to_owned()
                 };
@@ -4696,6 +4748,60 @@ mod tests {
             .stripped
             .iter()
             .any(|k| matches!(k.keyword, TyphonKeyword::RawClass)));
+    }
+
+    // ── plain class keyword ─────────────────────────────────────────────────
+
+    #[test]
+    fn plain_class_strips_prefix_and_records_line() {
+        let result = preprocess("plain class App:\n    pass\n");
+        assert!(
+            result.python_source.contains("class App:"),
+            "output: {}",
+            result.python_source
+        );
+        assert!(
+            !result.python_source.contains("plain class"),
+            "plain prefix should be stripped: {}",
+            result.python_source
+        );
+        assert_eq!(result.plain_class_lines, vec![0]);
+        assert!(result
+            .stripped
+            .iter()
+            .any(|k| matches!(k.keyword, TyphonKeyword::PlainClass)));
+    }
+
+    #[test]
+    fn plain_class_round_trips_via_postprocess() {
+        let src = "plain class App:\n    pass\n";
+        let prep = preprocess(src);
+        let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn plain_class_with_bases() {
+        let src = "plain class Widget(textual.App):\n    pass\n";
+        let prep = preprocess(src);
+        assert!(
+            prep.python_source.contains("class Widget(textual.App):"),
+            "output: {}",
+            prep.python_source
+        );
+        assert_eq!(prep.plain_class_lines, vec![0]);
+        let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn regular_class_is_not_marked_plain() {
+        let result = preprocess("class Foo:\n    pass\n");
+        assert!(result.plain_class_lines.is_empty());
+        assert!(!result
+            .stripped
+            .iter()
+            .any(|k| matches!(k.keyword, TyphonKeyword::PlainClass)));
     }
 
     #[test]

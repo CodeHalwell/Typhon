@@ -55,6 +55,20 @@ pub enum TyphonKeyword {
     /// then assigns each annotated field through `self`; otherwise the
     /// author's `__init__` is preserved verbatim.
     RawClass,
+    /// `plain class` — the canonical Python-interop escape hatch.
+    ///
+    /// A multi-word, **line-prefix** keyword: detected by the preprocessor
+    /// when a line begins with the literal text `"plain class "`. It is
+    /// deliberately not registered in [`Self::keyword_of`], which handles
+    /// single-token soft keywords; the multi-word form lives in the
+    /// preprocessor's line-prefix branch instead.
+    ///
+    /// The preprocessor strips the leading `plain ` so the Python parser
+    /// sees an ordinary `class NAME(...):` header. The desugar pass treats
+    /// the class like a `class!` raw class for the purpose of skipping the
+    /// `@dataclass` decorator, but — unlike `class!` — it never synthesises
+    /// an `__init__`. The body is emitted exactly as written.
+    PlainClass,
 }
 
 impl TyphonKeyword {
@@ -73,6 +87,7 @@ impl TyphonKeyword {
             Self::Go => "go",
             Self::Lazy => "lazy",
             Self::RawClass => "class!",
+            Self::PlainClass => "plain class",
         }
     }
 
