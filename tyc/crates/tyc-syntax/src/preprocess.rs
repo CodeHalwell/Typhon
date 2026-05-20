@@ -1644,11 +1644,13 @@ fn find_mid_expression_questionmarks(code: &str) -> Vec<usize> {
     };
     // Inline `with`-chains can carry multiple `expr?,` bindings and one
     // trailing `expr?:` on the same line. Those are recognised later by
-    // `expand_with_chains` and must not be flagged here.
+    // `expand_with_chains` and must not be flagged here. Strip trailing
+    // comments (string-aware) before the `?:` end-check so a chain with
+    // `# comment` after it is still recognised.
     let is_with_chain_line = {
-        let trimmed = code.trim_start();
-        trimmed.starts_with("with ")
-            && code
+        let trimmed_start = code.trim_start();
+        trimmed_start.starts_with("with ")
+            && strip_trailing_comment(code)
                 .trim_end_matches([' ', '\t'])
                 .ends_with("?:")
     };
@@ -2828,7 +2830,11 @@ struct WithChain {
 /// be `:` for a complete inline chain and `,` when the chain continues onto
 /// the next line.
 fn parse_inline_with_bindings(s: &str) -> Option<(Vec<WithBinding>, char)> {
-    let trimmed = s.trim_end();
+    // Strip any trailing `# comment` (string-aware) before slicing so a
+    // chain like `with a = f()?: # ok` parses the same as without the
+    // comment.
+    let without_comment = strip_trailing_comment(s);
+    let trimmed = without_comment.trim_end();
     // Walk top-level (`?,` or `?:`) terminators, slicing each binding segment.
     let bytes = trimmed.as_bytes();
     let mut bindings = Vec::new();

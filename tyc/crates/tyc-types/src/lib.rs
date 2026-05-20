@@ -1337,6 +1337,12 @@ struct MethodSig {
     /// parameter and the class-qualified call path does not add one for
     /// `self` (FINDINGS R3.16).
     is_static: bool,
+    /// `true` when the method was decorated with `@classmethod`. Class
+    /// methods take `cls` as the first parameter, but Python binds it
+    /// automatically at every call site (instance- or class-qualified),
+    /// so `arity` excludes `cls` and the class-qualified call path does
+    /// not add an implicit receiver.
+    is_classmethod: bool,
 }
 
 /// Member shape recorded for an interface or class — methods are recorded as
@@ -1830,15 +1836,16 @@ impl<'a> Checker<'a> {
             return;
         }
         let length = span.1.saturating_sub(span.0).max(1);
-        self.diagnostics.push_error(TycError::operator_type_mismatch(
-            op,
-            lhs.display(),
-            rhs.display(),
-            &self.path,
-            self.source,
-            span.0,
-            length,
-        ));
+        self.diagnostics
+            .push_error(TycError::operator_type_mismatch(
+                op,
+                lhs.display(),
+                rhs.display(),
+                &self.path,
+                self.source,
+                span.0,
+                length,
+            ));
     }
 
     fn tuple_index_out_of_range(&mut self, arity: usize, index: i64, span: (usize, usize)) {
@@ -1846,14 +1853,15 @@ impl<'a> Checker<'a> {
             return;
         }
         let length = span.1.saturating_sub(span.0).max(1);
-        self.diagnostics.push_error(TycError::tuple_index_out_of_range(
-            arity,
-            index,
-            &self.path,
-            self.source,
-            span.0,
-            length,
-        ));
+        self.diagnostics
+            .push_error(TycError::tuple_index_out_of_range(
+                arity,
+                index,
+                &self.path,
+                self.source,
+                span.0,
+                length,
+            ));
     }
 
     fn nullable_use(&mut self, name: &str, expected: &Type, span: (usize, usize)) {
@@ -2603,10 +2611,12 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
         match stmt {
             // Ruff folds `async def` into `Stmt::FunctionDef` with `is_async = true`.
             Stmt::FunctionDef(f) => {
-                let is_static = f
-                    .decorator_list
-                    .iter()
-                    .any(|d| matches!(&d.expression, Expr::Name(n) if n.id.as_str() == "staticmethod"));
+                let is_static = f.decorator_list.iter().any(
+                    |d| matches!(&d.expression, Expr::Name(n) if n.id.as_str() == "staticmethod"),
+                );
+                let is_classmethod = f.decorator_list.iter().any(
+                    |d| matches!(&d.expression, Expr::Name(n) if n.id.as_str() == "classmethod"),
+                );
                 let arity = if is_static {
                     f.parameters.posonlyargs.len()
                         + f.parameters.args.len()
@@ -2621,14 +2631,9 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
                 let is_property = f.decorator_list.iter().any(|d| match &d.expression {
                     Expr::Name(n) => matches!(
                         n.id.as_str(),
-                        "property"
-                            | "cached_property"
-                            | "_typhon_cached_property"
+                        "property" | "cached_property" | "_typhon_cached_property"
                     ),
-                    Expr::Attribute(a) => matches!(
-                        a.attr.as_str(),
-                        "property" | "cached_property"
-                    ),
+                    Expr::Attribute(a) => matches!(a.attr.as_str(), "property" | "cached_property"),
                     _ => false,
                 });
                 shape.methods.insert(
@@ -2638,6 +2643,7 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
                         return_type,
                         is_property,
                         is_static,
+                        is_classmethod,
                     },
                 );
             }
@@ -3126,10 +3132,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     .get(class_name)
                     .map(|s| s.methods.is_empty())
                     .unwrap_or(true);
-                let body_has_function = cd
-                    .body
-                    .iter()
-                    .any(|s| matches!(s, Stmt::FunctionDef(_)));
+                let body_has_function = cd.body.iter().any(|s| matches!(s, Stmt::FunctionDef(_)));
                 let mut has_ann_assign = false;
                 let mut all_ann_assigns_defaulted = true;
                 let mut only_ann_assigns = true;
@@ -3142,12 +3145,16 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                                 all_ann_assigns_defaulted = false;
                             } else if first_defaulted.is_none() {
                                 if let Expr::Name(n) = a.target.as_ref() {
-                                    first_defaulted =
-                                        Some((a, n.id.as_str().to_owned()));
+                                    first_defaulted = Some((a, n.id.as_str().to_owned()));
                                 }
                             }
                         }
-                        Stmt::Pass(_) | Stmt::Expr(_) => {}
+                        Stmt::Pass(_) => {}
+                        Stmt::Expr(e)
+                            if matches!(
+                                e.value.as_ref(),
+                                Expr::StringLiteral(_) | Expr::EllipsisLiteral(_)
+                            ) => {}
                         _ => only_ann_assigns = false,
                     }
                 }
@@ -3173,21 +3180,26 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                                     }
                                 },
                                 Expr::BooleanLiteral(b) => {
-                                    if b.value { "True".to_owned() } else { "False".to_owned() }
+                                    if b.value {
+                                        "True".to_owned()
+                                    } else {
+                                        "False".to_owned()
+                                    }
                                 }
                                 _ => "its literal value".to_owned(),
                             })
                             .unwrap_or_else(|| "its literal value".to_owned());
                         let class_range = cd.name.range;
-                        c.diagnostics.push_warning(TycError::class_attr_shadows_slot(
-                            class_name.to_owned(),
-                            field_name,
-                            value_hint,
-                            c.path.clone(),
-                            c.source,
-                            class_range.start().to_usize(),
-                            class_name.len().max(1),
-                        ));
+                        c.diagnostics
+                            .push_warning(TycError::class_attr_shadows_slot(
+                                class_name.to_owned(),
+                                field_name,
+                                value_hint,
+                                c.path.clone(),
+                                c.source,
+                                class_range.start().to_usize(),
+                                class_name.len().max(1),
+                            ));
                     }
                 }
                 for s in &cd.body {
@@ -4054,7 +4066,7 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
         Type::Class(n) => n.clone(),
         Type::Generic(head, _) => {
             if head == "Result" {
-                let variants = vec!["Ok".to_string(), "Err".to_string()];
+                let variants = ["Ok".to_string(), "Err".to_string()];
                 let mut covered: HashSet<String> = HashSet::new();
                 for case in cases {
                     if case.guard.is_some() {
@@ -4087,9 +4099,10 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
         }
         return variants.iter().all(|v| covered.contains(v));
     }
-    if cases.iter().any(|case| {
-        case.guard.is_none() && pattern_covers_class(c, &case.pattern, &class_name)
-    }) {
+    if cases
+        .iter()
+        .any(|case| case.guard.is_none() && pattern_covers_class(c, &case.pattern, &class_name))
+    {
         return true;
     }
     if class_name == "list" || class_name == "tuple" {
@@ -4104,6 +4117,7 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
 /// - `case [a, b, c]:` — fixed-length N coverage (matches length 3 only).
 /// - `case [first, *rest]:` — tail-star coverage of length ≥ N where N is
 ///   the count of fixed elements before the star.
+///
 /// A coverage is total when there is a tail-star arm of minimum length N
 /// and every shorter length 0..N is matched by a fixed-length arm.
 fn sequence_cases_cover_all_lengths(cases: &[MatchCase]) -> bool {
@@ -4542,10 +4556,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             let r_stripped = r.strip_none();
             if let Some(op_str) = arithmetic_op_str(b.op) {
                 if !operator_operands_compatible(b.op, &l_stripped, &r_stripped) {
-                    let span = (
-                        b.range.start().to_usize(),
-                        b.range.end().to_usize(),
-                    );
+                    let span = (b.range.start().to_usize(), b.range.end().to_usize());
                     c.operator_type_mismatch(op_str, &l_stripped, &r_stripped, span);
                 }
             }
@@ -4933,8 +4944,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                 }
                 Type::Class(name) => {
                     if let Some(shape) = c.class_shapes.get(&name).cloned() {
-                        let candidates: Vec<String> =
-                            shape.fields.keys().cloned().collect();
+                        let candidates: Vec<String> = shape.fields.keys().cloned().collect();
                         for kw in kw_args {
                             let Some(ident) = &kw.arg else { continue };
                             let kw_name = ident.as_str();
@@ -5058,7 +5068,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                             return sig.return_type.clone();
                         }
                         let mut arity = sig.arity;
-                        if receiver_is_class_name && !sig.is_static {
+                        if receiver_is_class_name && !sig.is_static && !sig.is_classmethod {
                             arity = arity.saturating_add(1);
                         }
                         let ret = sig.return_type.clone();
@@ -5139,10 +5149,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         match resolved {
                             Some(i) => return elts[i].clone(),
                             None => {
-                                let span = (
-                                    s.range.start().to_usize(),
-                                    s.range.end().to_usize(),
-                                );
+                                let span = (s.range.start().to_usize(), s.range.end().to_usize());
                                 c.tuple_index_out_of_range(arity, idx, span);
                                 return Type::Unknown;
                             }
@@ -5346,14 +5353,16 @@ fn arithmetic_op_str(op: Operator) -> Option<&'static str> {
 
 /// True if either side is something we shouldn't flag at all — values
 /// of `Any`/`Unknown`/`TypeVar`, a user-defined class (which might
-/// implement `__add__` / `__mul__` / …), or any composite type that
-/// embeds one of those.
+/// implement `__add__` / `__mul__` / …), any composite type that
+/// embeds one of those, or any union (we don't know which variant the
+/// value actually holds at this point, and even all-primitive unions
+/// like `int | str` may be valid for some variant).
 fn operand_is_unflaggable(t: &Type) -> bool {
     match t {
         Type::Any | Type::Unknown | Type::TypeVar(_) => true,
         Type::Class(_) => true,
         Type::Function { .. } => true,
-        Type::Union(xs) => xs.iter().any(operand_is_unflaggable),
+        Type::Union(_) => true,
         Type::Generic(_, args) => args.iter().any(operand_is_unflaggable),
         Type::Int | Type::Str | Type::Bool | Type::Float | Type::Bytes | Type::None => false,
     }
@@ -5572,10 +5581,7 @@ fn check_pattern_class_fields(c: &mut Checker, pattern: &Pattern) {
                     }
                     let pos = mc.arguments.patterns.len();
                     if pos > shape.fields.len() {
-                        let span = (
-                            mc.range.start().to_usize(),
-                            mc.range.end().to_usize(),
-                        );
+                        let span = (mc.range.start().to_usize(), mc.range.end().to_usize());
                         c.wrong_args(&name, shape.fields.len(), pos, span);
                     }
                 }

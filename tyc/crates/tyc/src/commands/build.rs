@@ -869,9 +869,13 @@ class _LazyModule:
         return repr(module)
 
 
-def lazy_import(name: str) -> ModuleType:
-    \"\"\"Return a module proxy that defers loading until first attribute access.\"\"\"
-    return _LazyModule(name)  # type: ignore[return-value]
+def lazy_import(name: str) -> _LazyModule:
+    \"\"\"Return a module proxy that defers loading until first attribute access.
+
+    The return value is a `_LazyModule` proxy, not a real `ModuleType` —
+    `isinstance(lazy_import(...), ModuleType)` is `False`. Attribute access
+    transparently forwards to the loaded module via `__getattr__`.\"\"\"
+    return _LazyModule(name)
 
 
 class _LazyValue:

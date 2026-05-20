@@ -69,9 +69,7 @@ fn stub_stmt(stmt: &Stmt) -> Option<Stmt> {
             // belong on the stub surface. Other decorators
             // (`@functools.cached_property`, user-authored ones) stay
             // because they're part of the consumer-visible API.
-            new_c
-                .decorator_list
-                .retain(|d| !is_dataclass_decorator(d));
+            new_c.decorator_list.retain(|d| !is_dataclass_decorator(d));
             let mut body = Vec::new();
             for s in &c.body {
                 if let Some(kept) = stub_stmt(s) {
@@ -113,14 +111,7 @@ fn is_dataclass_decorator(d: &Decorator) -> bool {
 
 fn import_uses_dataclasses(stmt: &Stmt) -> bool {
     match stmt {
-        Stmt::Import(imp) => imp
-            .names
-            .iter()
-            .any(|a| a.name.as_str() == "dataclasses"),
-        Stmt::ImportFrom(imp) => imp
-            .module
-            .as_ref()
-            .is_some_and(|m| m.as_str() == "dataclasses"),
+        Stmt::Import(imp) => imp.names.iter().any(|a| a.name.as_str() == "dataclasses"),
         _ => false,
     }
 }
@@ -245,9 +236,8 @@ mod tests {
 
     #[test]
     fn dataclass_decorator_stripped() {
-        let s = stub(
-            "import dataclasses\n@dataclasses.dataclass(slots=True)\nclass C:\n    x: int\n",
-        );
+        let s =
+            stub("import dataclasses\n@dataclasses.dataclass(slots=True)\nclass C:\n    x: int\n");
         assert!(!s.contains("@dataclasses.dataclass"), "got: {s}");
         assert!(!s.contains("import dataclasses"), "got: {s}");
         assert!(s.contains("class C:"), "got: {s}");
