@@ -350,6 +350,102 @@ bugs. Each is closed below.
 
 ---
 
+## Status as of `claude/review-findings-fixes-VRFJy`
+
+Picks up every remaining open finding and closes all of them except
+the Phase-5 `tyc fmt` deferral.
+
+**Closed in this branch:**
+
+- **#66** `?` in sub-expression — verified the existing
+  `validate_question_ops` already surfaces `tyc::invalid_question_op`
+  on the user's source with crisp help text. Took option 2
+  (documented limitation); option 1 (lift `?` to sub-expressions)
+  remains future work.
+
+- **#68** Generic-ctor inference from sealed-union target — the
+  `Type::Class(name)` arm now unwraps the expected type through
+  type aliases and walks `Type::Union` variants for one whose head
+  matches the class being constructed.
+
+- **#69** `None` as TypeVar value — added a
+  `!matches!(expected, Type::TypeVar(_))` carve-out so the
+  nullable-into-non-nullable check no longer fires for an unbound
+  generic formal.
+
+- **#72** Bare `list` / `dict` / `tuple` annotations — added
+  `tyc::implicit_any` from the `Stmt::AnnAssign` arm via
+  `bare_collection_name`.
+
+- **#73** `from typing import TypeVar` — added
+  `tyc::typevar_import_rejected` to the resolver's
+  `Stmt::ImportFrom` arm.
+
+- **#74** `typing.List` / `Dict` / `Tuple` / `Set` / `FrozenSet` /
+  `Type` — added `tyc::typing_alias_deprecated` warning.
+
+- **#75** For-loop target re-assignment — `declare_loop_target`
+  now binds the target as `Mutability::Let`.
+
+- **#76** Block-level shadowing — added `tyc::no_block_shadow`
+  with help that explains Python's function-level scoping.
+
+- **#79** Missing module at check time — added
+  `tyc::unknown_module`, a curated CPython 3.13 stdlib whitelist,
+  and a `check_unknown_modules` helper that `tyc check` calls
+  with the project module list + typhon.toml deps.
+
+- **#80** Wrong kwarg name — added `tyc::unknown_kwarg` with
+  Levenshtein-best "did you mean" suggestion via a structured
+  `ArityCheck` enum.
+
+- **#82** Missing return — added `tyc::missing_return`; the new
+  `match_arms_always_exit` helper handles exhaustive matches and
+  stub bodies (`pass`, `...`, docstring-only) are exempt for
+  `interface` (Protocol) declarations.
+
+- **#84** `lazy let` runtime emission — verified the existing
+  `is_typhon_runtime_module` fix correctly fires `needs_runtime`
+  for the `from typhon_runtime.lazy import lazy_let` header.
+
+- **#86** `*args` type check vs kw-only — the arg-type loop uses
+  `arity_info.param_names.len()` as the positional-vs-vararg
+  cutoff; pos_args beyond that are checked against the vararg's
+  declared element type.
+
+- **#87** Comptime help text — updated to list the full
+  documented surface (containers, comparisons, ternaries, str
+  methods, `comptime def` calls).
+
+- **#88** Comptime subscript — added an `Expr::Subscript` arm to
+  the evaluator; lists / tuples / strs index by integer (with
+  Python negative-from-end), dicts by any equality-comparable key.
+
+- **#89** Decorator factory typing (docs path) — documented the
+  `Callable[..., Any]` pattern with `Any` triple in
+  `docs/guides/10-advanced-features.md`. Option 1 (Decorator
+  alias) and option 2 (sugar) remain future work, both blocked
+  on PEP 612 `ParamSpec` support.
+
+- **#90** `self` outside `impl` — added `tyc::self_outside_impl`.
+
+- **#91** `let x: T` (no init) — added `tyc::missing_initialiser`
+  and suppressed the cascading `tyc::immutable_assign`.
+
+- **#92** `main()` not called — added `tyc::main_not_called`
+  advice-level diagnostic with a `__all__` carve-out for libraries.
+
+**Still open after this branch:**
+
+- **#18** / **#65** `tyc fmt` is a no-op — Phase-5 deferral,
+  unchanged. The Typhon-aware printer documented at
+  `tyc-format/src/lib.rs:17` remains future work.
+
+`cargo test --workspace --release` is green for every commit on this
+branch (1032 tests).
+
+---
+
 ## 1. `class Foo frozen:` is a parse error (bug)
 
 **Status:** **FIXED** on `claude/update-findings-IdfrH`. Mirrored the existing
@@ -3852,6 +3948,18 @@ Repro: `stress/tests/62_comptime_arith.ty`.
 ---
 
 ## 89. Decorator factory pattern (`def trace(p): def dec(f): …`) impossible to type (gap)
+
+**Status:** **FIXED (docs)** on `claude/review-findings-fixes-VRFJy`.
+Took option 3 from the original finding — documented the canonical
+typed-decorator-factory pattern in `docs/guides/10-advanced-features.md`
+("Common mistakes" section). The pattern uses
+`Callable[..., Any]` (Typhon's v1 "any callable") for every closure
+layer and `Any` for the `*args`/`**kwargs`/return triple. End-to-end
+verified clean against `tyc check`. Trade-off documented: the call
+site loses the original wrapped function's signature, which a
+future `ParamSpec` pass (PEP 612) will tighten. The `Decorator`
+type alias (option 1) and `@decorator-factory` sugar (option 2)
+remain future work — both depend on `ParamSpec` to be useful.
 
 **Severity:** gap — a common Python idiom has no usable form in Typhon.
 
