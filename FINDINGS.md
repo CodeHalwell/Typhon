@@ -4732,3 +4732,85 @@ silent correctness) → R3.2 (design call: auto-`ClassVar` vs diagnostic)
 → R3.3 (parser disambiguation) → R3.6 (operator type-check, big surface
 of silent runtime errors) → R3.7/R3.8 (kwarg & field validity) →
 R3.12 (match exhaustiveness shapes).
+
+---
+
+## Status as of `claude/resolve-open-findings-v6t65`
+
+Picks up every actionable open finding from the `ejNr5` round (R3.1
+through R3.18) and closes all of them except the explicitly-deferred
+items (R3.13 = #66, R3.15 = #65 / #18). Each fix lands as its own
+commit; `cargo build --release` and `cargo test --workspace --release`
+are green throughout.
+
+**Closed in this branch:**
+
+- **R3.1** walrus parens preserved at emission. `tyc-emit/src/printer.rs`
+  `Expr::Named` arm now wraps the binding expression in `(...)`. The
+  precedence trap on every `if (n := f()) > k:` / `while (x := …) != "":`
+  is gone.
+- **R3.2** new `tyc::class_attr_shadows_slot` warning fires when a class
+  body holds only defaulted `NAME: T = literal` fields, no methods, and
+  no `impl` extension. Help text points users at `ClassVar[T]`.
+  Promotion to error left as a v0.2 follow-up.
+- **R3.3** inline `with`-chain without `else err:` now lowers correctly.
+  `expand_with_chains` accepts comma-separated bindings on a single
+  line and the question-op validator carves out the trailing `?:` /
+  `?,` pattern on `with` lines.
+- **R3.4** aliased `lazy import np = json` runtime crash fixed.
+  Replaced the `importlib.util.LazyLoader`-backed proxy with a plain
+  `__getattr__`-based `_LazyModule` that defers via
+  `importlib.import_module`. The emission shape is unchanged so the
+  existing tests still pass.
+- **R3.5** `lazy let` inside `impl`/`extend` blocks now lowers to
+  `@cached_property`. Required four coordinated changes: recognising
+  class-body context in `expand_lazy_imports`, renaming the imported
+  decorator to a non-mangled alias, teaching `tyc-types` that
+  `cached_property` is a property-style decorator, and dropping
+  `slots=True` for classes containing one.
+- **R3.6** new `tyc::operator_type_mismatch` flags clearly-wrong
+  operand pairs on `+ - * / // % **`. Conservative: `Any` / `Unknown` /
+  TypeVar / user-class operands are treated as possibly-compatible so
+  the existing dunder-overload story stays intact.
+- **R3.7** constructor kwargs validated against class field set.
+  Reuses the existing Levenshtein-best "did you mean" suggestion from
+  #80; calibration unchanged (distance 2 falls back to the field
+  list).
+- **R3.8** match-class patterns validate keyword field names against
+  the class. Also closes the R3.12.f case (wrong positional arity) by
+  routing it through `tyc::arg_count` instead of `tyc::missing_return`.
+- **R3.9** `int / int` typed as `float` to match Python truediv
+  semantics. `let i: int = a / b` now fails check via the standard
+  assignability path. `//` is unchanged.
+- **R3.10** new `tyc::tuple_index_out_of_range` flags constant integer
+  indices into fixed-arity `tuple[T1, T2, …]` receivers when out of
+  bounds; in-bounds indices now resolve to the corresponding element
+  type rather than `Unknown`.
+- **R3.11** pipe-into-method arity counts `self` again. The fix lives
+  in the attribute-resolution site rather than via preprocessor
+  bookkeeping; composes naturally with the R3.16 staticmethod check.
+- **R3.12** match exhaustiveness recognises five wildcard shapes
+  (kw-bind class wildcards, `[*xs]`-only sequences, guarded+unguarded
+  same-class pairs, nested-match arms, `int() as n` / `list() as xs`
+  bind patterns over recursive aliases). Shape (f) routed via R3.8.
+- **R3.14 / #83** `tyc::async_without_await` warning fires once per
+  `async def` body that has no `await`. Carve-outs for declaration-only
+  bodies, async-generator functions (`yield`), and the existing async-
+  protocol dunder list (`__aenter__`, `__aexit__`, `__aiter__`,
+  `__anext__`).
+- **R3.16** `@staticmethod` inside `impl` keeps its full param count.
+  `@classmethod` also handled (drops only `cls`).
+- **R3.17** docs path fixed: every `stubs/<lib>.dty` reference in the
+  guides, the skill, and the docs site rewritten to `src/stubs/<lib>.dty`
+  to match the actual compiler scan root.
+- **R3.18** `.pyi` stub emit strips `@dataclasses.dataclass(...)`
+  decorators, drops field defaults, and prunes the `import dataclasses`
+  line when nothing else references it.
+
+**Still open after this branch:**
+
+- **R3.13 / #66** `?` operator in sub-expression position — known
+  limitation; documented carve-out, no fix in this branch.
+- **R3.15 / #65 / #18** `tyc fmt` near-no-op — Phase-5 deferral, still
+  unchanged. The Typhon-aware printer documented at
+  `tyc-format/src/lib.rs:17` remains future work.
