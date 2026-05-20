@@ -4533,3 +4533,15 @@ fix lands as its own commit.
   `type Err = str` can now coexist with `Result[T, str]` and the
   `?` propagation routes through the runtime constructor.
 
+- **#97 / #98 / #99 / #100** typing-module bridge types now
+  transparent in `type_from_annotation`:
+  - `Self` — treated as `Type::Any` (builder-pattern methods that
+    return `Self` no longer trip `tyc::type_mismatch`).
+  - `Literal["a", "b"]` / `Literal[42, 0]` — widened to the
+    enclosing primitive (or union of primitives) via the new
+    `literal_widened_type` helper.
+  - `Final[T]` / `ClassVar[T]` — unwrapped to `T` since neither
+    affects runtime assignability.
+  - `Annotated[T, meta...]` — unwrapped to `T`; the metadata tail
+    is ignored.
+

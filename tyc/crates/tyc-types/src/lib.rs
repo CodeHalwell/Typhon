@@ -630,6 +630,29 @@ pub fn type_from_annotation(expr: &Expr, classes: &[String]) -> Type {
     type_from_annotation_with_params(expr, classes, &[])
 }
 
+/// Widen a `Literal[...]` element expression to its underlying type.
+/// `Literal["a"]` → `str`, `Literal[42]` → `int`, `Literal[True]` → `bool`,
+/// `Literal[b"x"]` → `bytes`, `Literal[None]` → `None`. Anything else
+/// (an identifier, a nested expression) falls back to `Type::Unknown`.
+/// FINDINGS #98.
+fn literal_widened_type(expr: &Expr) -> Type {
+    match expr {
+        Expr::StringLiteral(_) => Type::Str,
+        Expr::NumberLiteral(n) => match &n.value {
+            ruff_python_ast::Number::Int(_) => Type::Int,
+            ruff_python_ast::Number::Float(_) => Type::Float,
+            ruff_python_ast::Number::Complex { .. } => Type::Unknown,
+        },
+        Expr::BooleanLiteral(_) => Type::Bool,
+        Expr::BytesLiteral(_) => Type::Bytes,
+        Expr::NoneLiteral(_) => Type::None,
+        Expr::UnaryOp(u) if matches!(u.op, ruff_python_ast::UnaryOp::USub) => {
+            literal_widened_type(&u.operand)
+        }
+        _ => Type::Unknown,
+    }
+}
+
 /// Same as [`type_from_annotation`] but treats every name in `type_params`
 /// as `Type::Any` so that PEP 695 generic functions don't trip the
 /// assignability check before we have a real inference engine.
@@ -654,6 +677,12 @@ pub fn type_from_annotation_with_params(
             // even when the user shadowed `Err` with a type alias.
             // FINDINGS #104.
             "__typhon_Err__" => Type::Class("Err".into()),
+            // `typing.Self` — represents "the current class". Without a
+            // surrounding class context we treat it permissively as
+            // `Type::Any` so builder-pattern methods that return
+            // `Self` don't trip `tyc::type_mismatch` against the
+            // implementation class. FINDINGS #97.
+            "Self" => Type::Any,
             // A type parameter (PEP 695) — preserved as `Type::TypeVar` so
             // call-site inference can substitute it with the concrete
             // argument type.  Assignability still treats it as `Any` until
@@ -684,6 +713,39 @@ pub fn type_from_annotation_with_params(
                     classes,
                     type_params,
                 ));
+            }
+            // Final[T], ClassVar[T] — both are transparent wrappers
+            // that don't affect runtime types or assignability rules.
+            // FINDINGS #99.
+            if head == "Final" || head == "ClassVar" {
+                return type_from_annotation_with_params(&s.slice, classes, type_params);
+            }
+            // Annotated[T, ...] — first slice arg is the real type;
+            // the rest are runtime metadata that doesn't affect
+            // assignability. FINDINGS #100.
+            if head == "Annotated" {
+                let real = match s.slice.as_ref() {
+                    Expr::Tuple(t) if !t.elts.is_empty() => &t.elts[0],
+                    other => other,
+                };
+                return type_from_annotation_with_params(real, classes, type_params);
+            }
+            // Literal["a", "b"] / Literal[1, 2] — narrow to the
+            // widened literal type (str / int / bool / bytes / None).
+            // FINDINGS #98.
+            if head == "Literal" {
+                let variants: Vec<&Expr> = match s.slice.as_ref() {
+                    Expr::Tuple(t) => t.elts.iter().collect(),
+                    other => vec![other],
+                };
+                let widened: Vec<Type> = variants
+                    .into_iter()
+                    .map(literal_widened_type)
+                    .collect();
+                if widened.is_empty() {
+                    return Type::Unknown;
+                }
+                return Type::union_of(widened);
             }
             // Union[A, B, ...] / typing.Union[...]
             if head == "Union" {
