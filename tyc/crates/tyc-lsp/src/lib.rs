@@ -335,21 +335,46 @@ impl LanguageServer for Backend {
         // `tokio::Mutex::blocking_lock` shape panicked outright.
         // `spawn_blocking` parks the work on Tokio's blocking thread
         // pool while the runtime keeps serving other requests.
-        let prefetched: HashMap<String, Vec<CompletionItem>> = {
+        let cursor_offset = position_to_byte(&preprocessed, position);
+        let receiver = extract_member_access_receiver(&preprocessed, cursor_offset);
+        let from_import = extract_from_import_module(&preprocessed, cursor_offset);
+        // `candidate_module_paths` already returns unique paths, and the
+        // other two branches yield at most one element each — no dedup
+        // pass is needed.
+        let candidates: Vec<String> = match (&receiver, &from_import) {
+            (Some(r), _) => candidate_module_paths(&resolved, r, cursor_offset),
+            (None, Some(m)) => vec![m.clone()],
+            (None, None) => Vec::new(),
+        };
+        // Project-source pre-fetch: when a candidate module resolves to
+        // a sibling `.ty` (or `<pkg>/__init__.ty`) in the user's own
+        // project, surface that file's top-level public bindings. Takes
+        // priority over venv introspection — first-party files win when
+        // both exist, mirroring Python's PYTHONPATH semantics.
+        let project_prefetch: HashMap<String, Vec<CompletionItem>> = {
+            let src_dir = uri_to_path(&uri)
+                .and_then(|p| find_workspace_layout(&p))
+                .map(|(_, src)| src);
+            match src_dir {
+                Some(src) if !candidates.is_empty() => candidates
+                    .iter()
+                    .filter_map(|m| project_module_members(&src, m).map(|items| (m.clone(), items)))
+                    .collect(),
+                _ => HashMap::new(),
+            }
+        };
+        let mut prefetched: HashMap<String, Vec<CompletionItem>> = {
             let cache_handle = self.introspection_cache_for(&uri).await;
-            let cursor_offset = position_to_byte(&preprocessed, position);
-            let receiver = extract_member_access_receiver(&preprocessed, cursor_offset);
-            let from_import = extract_from_import_module(&preprocessed, cursor_offset);
-            // `candidate_module_paths` already returns unique paths, and
-            // the other two branches yield at most one element each — no
-            // dedup pass is needed.
-            let candidates: Vec<String> = match (&receiver, &from_import) {
-                (Some(r), _) => candidate_module_paths(&resolved, r, cursor_offset),
-                (None, Some(m)) => vec![m.clone()],
-                (None, None) => Vec::new(),
-            };
+            // Skip the venv lookup for modules we already resolved from
+            // the project — saves a `.venv/bin/python` shell per
+            // first-party module.
+            let venv_candidates: Vec<String> = candidates
+                .iter()
+                .filter(|m| !project_prefetch.contains_key(m.as_str()))
+                .cloned()
+                .collect();
             match cache_handle {
-                Some((root, cache)) if !candidates.is_empty() => {
+                Some((root, cache)) if !venv_candidates.is_empty() => {
                     tokio::task::spawn_blocking(move || {
                         let mut map: HashMap<String, Vec<CompletionItem>> = HashMap::new();
                         // `lock()` on a poisoned std::Mutex returns `Err`;
@@ -361,7 +386,7 @@ impl LanguageServer for Backend {
                             Ok(g) => g,
                             Err(p) => p.into_inner(),
                         };
-                        for module in candidates {
+                        for module in venv_candidates {
                             if let Some(members) = guard.members(&root, &module) {
                                 map.insert(module, introspected_members_to_completion(&members));
                             }
@@ -374,6 +399,11 @@ impl LanguageServer for Backend {
                 _ => HashMap::new(),
             }
         };
+        // Merge project results on top of venv results. Project wins on
+        // collision (we filtered above, but be defensive).
+        for (k, v) in project_prefetch {
+            prefetched.insert(k, v);
+        }
         let introspect_closure =
             |module: &str| -> Option<Vec<CompletionItem>> { prefetched.get(module).cloned() };
         let introspect_ref: Option<&IntrospectFn<'_>> = if prefetched.is_empty() {
@@ -841,6 +871,51 @@ fn resolve_in_preprocessed(preprocessed: &str, options: ResolveOptions) -> Optio
     let (resolved, _) =
         tyc_resolve::resolve_module_with("<lsp>".to_owned(), preprocessed, &module, options);
     Some(resolved)
+}
+
+/// Look up a dotted module name against the project's `src` directory
+/// and return its top-level public bindings as completion items.
+///
+/// Reuses [`resolve_module_to_file`] for the `.ty` / `__init__.ty`
+/// search and the standard preprocess + parse + resolve pipeline for
+/// the file's contents. Returns `None` when the module doesn't map to
+/// a file we can read, parse, and resolve.
+///
+/// Used by the LSP completion handler to surface cross-file imports —
+/// typing `from utils import <cursor>` against the user's own
+/// `src/utils.ty` now produces the same menu as `import os` would.
+/// Underscore-prefixed names and `import`-bound re-exports are
+/// excluded; only the symbols the file genuinely defines surface.
+fn project_module_members(
+    src_dir: &std::path::Path,
+    module: &str,
+) -> Option<Vec<CompletionItem>> {
+    let file = resolve_module_to_file(src_dir, module)?;
+    let source = std::fs::read_to_string(&file).ok()?;
+    let prep = tyc_syntax::preprocess::preprocess(&source);
+    let raw_class_byte_starts =
+        tyc_syntax::preprocess::line_byte_starts(&prep.python_source, &prep.raw_class_lines);
+    let resolved = resolve_in_preprocessed(
+        &prep.python_source,
+        ResolveOptions {
+            raw_class_byte_starts,
+            lazy_import_remaps: Vec::new(),
+            original_source: None,
+        },
+    )?;
+    let module_scope = resolved.scopes.first()?;
+    let items: Vec<CompletionItem> = module_scope
+        .bindings
+        .iter()
+        .filter(|b| !b.name.starts_with('_'))
+        // Drop bindings introduced by `import` statements: surfacing
+        // them would mean re-exporting every helper the module
+        // imports, which isn't what the user means by "show me what
+        // this module exports."
+        .filter(|b| b.kind != BindingKind::Import)
+        .map(binding_to_completion)
+        .collect();
+    Some(items)
 }
 
 /// Log-message level for the LSP backend. Maps the user-facing `--log-level`
@@ -1931,6 +2006,78 @@ mod tests {
         let pkg = resolve_module_to_file(&src, "pkg").expect("pkg/__init__.ty must resolve");
         assert_eq!(pkg.file_name().unwrap(), "__init__.ty");
         assert!(pkg.parent().unwrap().ends_with("pkg"));
+    }
+
+    #[test]
+    fn project_module_members_surfaces_public_top_level_bindings() {
+        // src/utils.ty exposes `helper` (def), `MAX` (let), `_private`
+        // (def), and re-exports `path` from `os`. The completion menu
+        // for `from utils import <cursor>` should include `helper` and
+        // `MAX` only — underscore-prefixed names and import re-exports
+        // shouldn't surface.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("utils.ty"),
+            "import os\n\
+             from os import path\n\
+             \n\
+             let MAX: int = 10\n\
+             \n\
+             def helper() -> None:\n    \
+                 pass\n\
+             \n\
+             def _private() -> None:\n    \
+                 pass\n",
+        )
+        .unwrap();
+
+        let items = project_module_members(&src, "utils").expect("utils.ty must resolve");
+        let labels: std::collections::HashSet<String> =
+            items.iter().map(|i| i.label.clone()).collect();
+
+        assert!(
+            labels.contains("helper"),
+            "expected `helper`, got {labels:?}"
+        );
+        assert!(labels.contains("MAX"), "expected `MAX`, got {labels:?}");
+        assert!(
+            !labels.contains("_private"),
+            "underscore-prefixed names must not surface: {labels:?}"
+        );
+        assert!(
+            !labels.contains("os") && !labels.contains("path"),
+            "import bindings must not surface as re-exports: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn project_module_members_resolves_package_init_file() {
+        // `from pkg import <cursor>` should resolve through
+        // `src/pkg/__init__.ty` — same as Python's package model.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("pkg")).unwrap();
+        std::fs::write(
+            src.join("pkg").join("__init__.ty"),
+            "def greet() -> None:\n    pass\n",
+        )
+        .unwrap();
+
+        let items = project_module_members(&src, "pkg").expect("pkg/__init__.ty must resolve");
+        assert!(
+            items.iter().any(|i| i.label == "greet"),
+            "expected `greet` from pkg/__init__.ty"
+        );
+    }
+
+    #[test]
+    fn project_module_members_returns_none_for_missing_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        assert!(project_module_members(&src, "nope").is_none());
     }
 
     #[test]
