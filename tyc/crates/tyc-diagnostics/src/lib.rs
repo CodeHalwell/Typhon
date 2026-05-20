@@ -263,6 +263,27 @@ pub enum TycError {
         decl_span: SourceSpan,
     },
 
+    /// A binary operator was applied to operands whose types are
+    /// incompatible per Python's runtime semantics — e.g. `str + int`
+    /// or `list + dict`. The check is conservative: it fires only on
+    /// clearly-wrong pairs whose operand types are both fully known and
+    /// neither side is a user-defined `class` (which might define a
+    /// custom `__add__` / `__mul__` / etc.).
+    #[error("unsupported operand types for `{op}`: `{lhs}` and `{rhs}`")]
+    #[diagnostic(
+        code(tyc::operator_type_mismatch),
+        help("convert one operand so the types match (e.g. `str(n)` / `int(s)`)")
+    )]
+    OperatorTypeMismatch {
+        op: String,
+        lhs: String,
+        rhs: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("operator `{op}` does not apply to `{lhs}` and `{rhs}`")]
+        span: SourceSpan,
+    },
+
     /// A nullable value (`T | None`) was used in a position requiring `T`.
     #[error("possibly-None value used where `{expected}` is required")]
     #[diagnostic(
@@ -969,6 +990,25 @@ impl TycError {
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
             decl_span: SourceSpan::new(SourceOffset::from(decl_offset), decl_length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::OperatorTypeMismatch`] diagnostic.
+    pub fn operator_type_mismatch(
+        op: impl Into<String>,
+        lhs: impl Into<String>,
+        rhs: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::OperatorTypeMismatch {
+            op: op.into(),
+            lhs: lhs.into(),
+            rhs: rhs.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
         }
     }
 

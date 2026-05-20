@@ -1801,6 +1801,22 @@ impl<'a> Checker<'a> {
         ));
     }
 
+    fn operator_type_mismatch(&mut self, op: &str, lhs: &Type, rhs: &Type, span: (usize, usize)) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
+        let length = span.1.saturating_sub(span.0).max(1);
+        self.diagnostics.push_error(TycError::operator_type_mismatch(
+            op,
+            lhs.display(),
+            rhs.display(),
+            &self.path,
+            self.source,
+            span.0,
+            length,
+        ));
+    }
+
     fn nullable_use(&mut self, name: &str, expected: &Type, span: (usize, usize)) {
         if self.unsafe_depth > 0 {
             return;
@@ -4255,8 +4271,19 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     }
                 }
             }
+            let l_stripped = l.strip_none();
+            let r_stripped = r.strip_none();
+            if let Some(op_str) = arithmetic_op_str(b.op) {
+                if !operator_operands_compatible(b.op, &l_stripped, &r_stripped) {
+                    let span = (
+                        b.range.start().to_usize(),
+                        b.range.end().to_usize(),
+                    );
+                    c.operator_type_mismatch(op_str, &l_stripped, &r_stripped, span);
+                }
+            }
             // Conservative numeric arithmetic inference.
-            match (&l.strip_none(), &r.strip_none()) {
+            match (&l_stripped, &r_stripped) {
                 (Type::Int, Type::Int) => Type::Int,
                 (Type::Float, _) | (_, Type::Float) => Type::Float,
                 (Type::Str, Type::Str) if matches!(b.op, Operator::Add) => Type::Str,
@@ -4979,6 +5006,88 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             inner
         }
         _ => Type::Unknown,
+    }
+}
+
+/// Operators whose operand-type compatibility is checked by
+/// `operator_operands_compatible`. Returns the operator's Python source
+/// form for diagnostic text, or `None` for ops we don't yet check
+/// (bitwise / shifts, MatMult).
+fn arithmetic_op_str(op: Operator) -> Option<&'static str> {
+    match op {
+        Operator::Add => Some("+"),
+        Operator::Sub => Some("-"),
+        Operator::Mult => Some("*"),
+        Operator::Div => Some("/"),
+        Operator::FloorDiv => Some("//"),
+        Operator::Mod => Some("%"),
+        Operator::Pow => Some("**"),
+        _ => None,
+    }
+}
+
+/// True if either side is something we shouldn't flag at all — values
+/// of `Any`/`Unknown`/`TypeVar`, a user-defined class (which might
+/// implement `__add__` / `__mul__` / …), or any composite type that
+/// embeds one of those.
+fn operand_is_unflaggable(t: &Type) -> bool {
+    match t {
+        Type::Any | Type::Unknown | Type::TypeVar(_) => true,
+        Type::Class(_) => true,
+        Type::Function { .. } => true,
+        Type::Union(xs) => xs.iter().any(operand_is_unflaggable),
+        Type::Generic(_, args) => args.iter().any(operand_is_unflaggable),
+        Type::Int | Type::Str | Type::Bool | Type::Float | Type::Bytes | Type::None => false,
+    }
+}
+
+fn is_numeric(t: &Type) -> bool {
+    matches!(t, Type::Int | Type::Float | Type::Bool)
+}
+
+/// Conservative compatibility check for the arithmetic / concat
+/// operators in [`arithmetic_op_str`]. Returns `false` only for pairs
+/// that are clearly wrong by Python's runtime semantics on built-in
+/// types; anything involving an unknown or user class is treated as
+/// possibly-compatible.
+fn operator_operands_compatible(op: Operator, l: &Type, r: &Type) -> bool {
+    if operand_is_unflaggable(l) || operand_is_unflaggable(r) {
+        return true;
+    }
+    match op {
+        Operator::Add => {
+            if is_numeric(l) && is_numeric(r) {
+                return true;
+            }
+            if matches!(l, Type::Str) && matches!(r, Type::Str) {
+                return true;
+            }
+            if matches!(l, Type::Bytes) && matches!(r, Type::Bytes) {
+                return true;
+            }
+            if let (Type::Generic(ln, _), Type::Generic(rn, _)) = (l, r) {
+                if ln == rn && (ln == "list" || ln == "tuple") {
+                    return true;
+                }
+            }
+            false
+        }
+        Operator::Sub | Operator::Mod | Operator::Pow | Operator::FloorDiv | Operator::Div => {
+            is_numeric(l) && is_numeric(r)
+        }
+        Operator::Mult => {
+            if is_numeric(l) && is_numeric(r) {
+                return true;
+            }
+            // Repetition: str/bytes/list/tuple * int (either order).
+            let is_repeatable = |t: &Type| {
+                matches!(t, Type::Str | Type::Bytes)
+                    || matches!(t, Type::Generic(n, _) if n == "list" || n == "tuple")
+            };
+            (is_repeatable(l) && matches!(r, Type::Int | Type::Bool))
+                || (is_repeatable(r) && matches!(l, Type::Int | Type::Bool))
+        }
+        _ => true,
     }
 }
 
