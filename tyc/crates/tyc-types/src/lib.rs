@@ -3540,20 +3540,22 @@ fn stmt_always_exits(stmt: &Stmt) -> bool {
         // A `try/except` always exits when:
         //   (a) the `finally` body is non-empty and always exits (finally runs
         //       on every path), OR
-        //   (b) the `try` body always exits AND every exception handler always
-        //       exits AND the `else` clause (if present) always exits.
-        // Case (b) is the common `try: return Ok(x) except E: return Err(e)`
-        // pattern that must not be flagged as a missing-return false positive.
+        //   (b) every exception handler always exits AND the non-exception path
+        //       exits — i.e. the `try` body always exits (return/raise before
+        //       `else` can run) OR the `else` clause always exits (reached when
+        //       `try` body completes normally without raising).
+        // Case (b) covers both `try: return Ok(x) except E: return Err(e)` and
+        // `try: pass except E: return 1 else: return 2`.
         Stmt::Try(t) => {
             let finally_exits =
                 !t.finalbody.is_empty() && body_always_exits(&t.finalbody);
-            let try_and_handlers_exit = body_always_exits(&t.body)
-                && t.handlers.iter().all(|h| {
-                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
-                    body_always_exits(&h.body)
-                })
-                && (t.orelse.is_empty() || body_always_exits(&t.orelse));
-            finally_exits || try_and_handlers_exit
+            let try_or_else_exits =
+                body_always_exits(&t.body) || body_always_exits(&t.orelse);
+            let handlers_exit = t.handlers.iter().all(|h| {
+                let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                body_always_exits(&h.body)
+            });
+            finally_exits || (try_or_else_exits && handlers_exit)
         }
         _ => false,
     }
@@ -3649,13 +3651,13 @@ fn stmt_always_exits_aware(c: &Checker, stmt: &Stmt) -> bool {
         Stmt::Try(t) => {
             let finally_exits =
                 !t.finalbody.is_empty() && body_always_exits_aware(c, &t.finalbody);
-            let try_and_handlers_exit = body_always_exits_aware(c, &t.body)
-                && t.handlers.iter().all(|h| {
-                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
-                    body_always_exits_aware(c, &h.body)
-                })
-                && (t.orelse.is_empty() || body_always_exits_aware(c, &t.orelse));
-            finally_exits || try_and_handlers_exit
+            let try_or_else_exits = body_always_exits_aware(c, &t.body)
+                || body_always_exits_aware(c, &t.orelse);
+            let handlers_exit = t.handlers.iter().all(|h| {
+                let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                body_always_exits_aware(c, &h.body)
+            });
+            finally_exits || (try_or_else_exits && handlers_exit)
         }
         _ => false,
     }
@@ -5387,6 +5389,29 @@ def load() -> int:
                 .iter()
                 .any(|e| matches!(e, TycError::MissingReturn { .. })),
             "try/finally with returning finally must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn try_else_always_exits_is_clean() {
+        // `try: pass except E: return 1 else: return 2` — the else clause
+        // exits when try completes normally; the handler exits on exception.
+        let src = "\
+def parse(raw: str) -> int:
+    try:
+        x: int = int(raw)
+    except ValueError:
+        return -1
+    else:
+        return x
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "try/else where else always exits must not fire missing_return: {:?}",
             d.errors()
         );
     }

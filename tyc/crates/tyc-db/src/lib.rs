@@ -179,9 +179,9 @@ unsafe impl salsa::Update for ArcDiagnostics {
 /// continue to receive a plain [`Diagnostics`] value.
 #[salsa::tracked]
 fn check_diagnostics(db: &dyn salsa::Database, file: SourceFile) -> ArcDiagnostics {
-    let path = file.path(db).clone();
-    let text = file.text(db).clone();
-    ArcDiagnostics::new(check_impl(&path, &text))
+    let path = file.path(db);
+    let text = file.text(db);
+    ArcDiagnostics::new(check_impl(path, text))
 }
 
 /// Tracked query: parse and resolve the preprocessed source of a file.
