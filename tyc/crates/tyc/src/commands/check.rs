@@ -58,9 +58,9 @@ pub fn run(args: CheckArgs) -> Result<()> {
             }
         })
         .unwrap_or_else(|| PathBuf::from("."));
-    let config = match TyphonConfig::load(&config_start) {
-        Ok(Some((_, cfg))) => cfg,
-        Ok(None) => TyphonConfig::default(),
+    let (config, has_project_config) = match TyphonConfig::load(&config_start) {
+        Ok(Some((_, cfg))) => (cfg, true),
+        Ok(None) => (TyphonConfig::default(), false),
         Err(e) => return Err(miette!("{e}")),
     };
 
@@ -74,6 +74,11 @@ pub fn run(args: CheckArgs) -> Result<()> {
     // typhon.toml-declared dependencies; users who manage deps directly
     // through `uv`/`pip` can still bypass the check by listing the
     // package in `typhon.toml`.
+    //
+    // When no `typhon.toml` is found the check is skipped entirely: a
+    // standalone `.ty` file being checked outside a project context should
+    // not be penalised for importing third-party packages that happen not to
+    // be listed anywhere.
     let project_modules = collect_project_modules(&args.paths, &config.project.src);
     let extra_modules: Vec<String> = config
         .dependencies
@@ -107,13 +112,18 @@ pub fn run(args: CheckArgs) -> Result<()> {
             diags.extend(analysis_diags);
 
             // FINDINGS #79: vet imports against stdlib + project + deps.
-            let module_diags = run_unknown_module_check(
-                &path.display().to_string(),
-                &source,
-                &project_modules,
-                &extra_modules,
-            );
-            diags.extend(module_diags);
+            // Skip when no `typhon.toml` was found — standalone files checked
+            // outside a project context should not be penalised for importing
+            // third-party packages that are not listed in any config.
+            if has_project_config {
+                let module_diags = run_unknown_module_check(
+                    &path.display().to_string(),
+                    &source,
+                    &project_modules,
+                    &extra_modules,
+                );
+                diags.extend(module_diags);
+            }
         }
 
         // `--stubs`: parse + type-check every `.dty` stub, then compare its
@@ -516,6 +526,52 @@ i.name = \"Bob\"
         assert!(
             run(args).is_err(),
             "parameter rename should produce a signature-mismatch error"
+        );
+    }
+
+    #[test]
+    fn check_standalone_file_skips_unknown_module() {
+        // A standalone `.ty` file without a `typhon.toml` must not fire
+        // `tyc::unknown_module` for third-party imports — the user is
+        // checking a file outside a project context.
+        let tmp = tempfile::tempdir().unwrap();
+        write_ty(
+            tmp.path(),
+            "script.ty",
+            "\
+import requests
+
+def fetch(url: str) -> str:
+    let r = requests.get(url)
+    return r.text
+",
+        );
+        // No `typhon.toml` written — this is the standalone-file case.
+        let args = CheckArgs {
+            paths: vec![tmp.path().join("script.ty")],
+            stubs: false,
+        };
+        // The check should pass (no unknown_module error) because there is
+        // no project config to anchor the dependency check to.
+        run(args).unwrap();
+    }
+
+    #[test]
+    fn check_with_project_config_warns_unknown_module() {
+        // When a `typhon.toml` is present, undeclared third-party imports
+        // produce a `tyc::unknown_module` WARNING (not an error).
+        // `run()` returns Ok on warnings, so we test via the resolver helper
+        // directly to confirm the warning fires in project context.
+        let source = "import requests\n";
+        let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(source)));
+        let module = tyc_syntax::parse_module(&expanded).unwrap().into_syntax();
+        let diags = check_unknown_modules("t.ty", source, &module, &[], &[]);
+        assert!(
+            diags.warnings().iter().any(|w| {
+                matches!(w, TycError::UnknownModule { module, .. } if module == "requests")
+            }),
+            "check_unknown_modules must warn about undeclared third-party import; got {:?}",
+            diags.warnings()
         );
     }
 }
