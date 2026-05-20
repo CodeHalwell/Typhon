@@ -252,7 +252,7 @@ impl TyphonConfig {
         // `"regular"`, `"none"`) all surface here rather than silently
         // falling back to dataclass at emit time.
         let cd = self.emit.class_default.trim();
-        if !ALLOWED_CLASS_DEFAULTS.iter().any(|allowed| *allowed == cd) {
+        if !ALLOWED_CLASS_DEFAULTS.contains(&cd) {
             return Err(ConfigError::InvalidClassDefault {
                 path: source_path.display().to_string(),
                 value: self.emit.class_default.clone(),

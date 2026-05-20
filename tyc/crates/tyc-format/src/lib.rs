@@ -475,9 +475,7 @@ fn run_ruff_format(source: &str, path: &str) -> Result<String, String> {
             .write_all(source.as_bytes())
             .map_err(|e| format!("write stdin: {e}"))?;
     }
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("wait: {e}"))?;
+    let output = child.wait_with_output().map_err(|e| format!("wait: {e}"))?;
     if !output.status.success() {
         return Err(format!("exit {}", output.status));
     }
@@ -746,13 +744,28 @@ def run() -> Result[int, str]:
         assert_eq!(detect_triple_quote_open("x = \"\"\"hi"), Some('"'));
     }
 
+    /// Serialises every test that mutates `TYC_FMT_DISABLE_RUFF`. Rust
+    /// tests run in parallel by default and the env var is process-wide,
+    /// so concurrent toggles would race. Holding this mutex for the
+    /// duration of the test guarantees one toggle at a time.
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn format_falls_back_when_ruff_missing() {
         // When ruff is disabled via the env knob, the in-process pipeline
         // must still complete cleanly.  This guards against a regression
         // where the formatter started requiring ruff to be present.
         // SAFETY: tests run in-process; toggling the env briefly is fine
-        // because we restore it before exiting the test.
+        // because we restore it before exiting the test and hold the env
+        // lock for the duration to serialise with peers.
+        let _guard = lock_env();
         let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
         unsafe {
             std::env::set_var("TYC_FMT_DISABLE_RUFF", "1");
@@ -773,6 +786,7 @@ def run() -> Result[int, str]:
         // A pre-formatted snippet must round-trip without flipping the
         // `changed` flag — otherwise `tyc fmt --check` would report
         // false-positive diffs on already-clean files.
+        let _guard = lock_env();
         let src = "x: int = 1\n";
         let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
         unsafe {

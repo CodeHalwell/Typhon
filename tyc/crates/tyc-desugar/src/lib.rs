@@ -73,7 +73,7 @@ pub struct DesugarOptions {
     /// the auto-`@dataclass` decoration.  Matched by *last* identifier
     /// segment, so an entry of `"App"` matches both `class T(App):` and
     /// `class T(textual.App):`.  Plumbed in from `typhon.toml`
-    /// (`[strictness] skip-decoration-bases`).
+    /// (`[emit] skip-decoration-bases`).
     pub skip_decoration_bases: Vec<String>,
 }
 

@@ -4554,24 +4554,33 @@ fn infer_bool_op(c: &mut Checker, b: &ruff_python_ast::ExprBoolOp) -> Type {
     for next in &b.values[1..] {
         let rhs = infer_expr(c, next);
         acc = match b.op {
-            ruff_python_ast::BoolOp::Or => Type::union_of(vec![truthy(&acc), rhs]),
+            // `a or b` evaluates to `a` when `a` is truthy, otherwise `b`.
+            // `truthy(&acc)` is `None` when `a` can never be truthy (e.g.
+            // a bare `None` literal); in that case the result is just `rhs`.
+            ruff_python_ast::BoolOp::Or => match truthy(&acc) {
+                Some(t) => Type::union_of(vec![t, rhs]),
+                None => rhs,
+            },
             ruff_python_ast::BoolOp::And => Type::union_of(vec![acc, rhs]),
         };
     }
     acc
 }
 
-/// Return the type a value can have *when it is truthy*. For a nullable
-/// `T | None` this strips the `None` (because `None` is always falsy);
-/// for `Bool` we keep `Bool` (the truthy value is `True : bool`); for
-/// everything else the type is unchanged (we do not try to enumerate
-/// falsy literals like `0`, `""`, or empty containers — that level of
-/// refinement is out of scope for the operator typer).
-fn truthy(t: &Type) -> Type {
+/// Return the type a value can have *when it is truthy*, or `None` if the
+/// type has no truthy inhabitant. For a nullable `T | None` this strips the
+/// `None` (because `None` is always falsy); for bare `Type::None` returns
+/// `None` (the literal is unconditionally falsy, so the truthy branch is
+/// impossible); for `Bool` we keep `Bool` (the truthy value is `True :
+/// bool`); for everything else the type is unchanged (we do not try to
+/// enumerate falsy literals like `0`, `""`, or empty containers — that
+/// level of refinement is out of scope for the operator typer).
+fn truthy(t: &Type) -> Option<Type> {
     match t {
-        Type::Bool => Type::Bool,
-        Type::Union(_) if t.is_nullable() => t.strip_none(),
-        other => other.clone(),
+        Type::None => None,
+        Type::Bool => Some(Type::Bool),
+        Type::Union(_) if t.is_nullable() => Some(t.strip_none()),
+        other => Some(other.clone()),
     }
 }
 

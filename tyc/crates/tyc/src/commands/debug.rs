@@ -238,10 +238,7 @@ pub fn run(args: DebugArgs) -> Result<()> {
                     "tyc debug: {} -> {} ({})",
                     raw,
                     cmd,
-                    py_path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("?")
+                    py_path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
                 );
                 pdb_cmds.push(cmd);
             }
@@ -362,7 +359,8 @@ mod tests {
         // lines=[1,1,5,5,5] means py lines 1-2 came from ty line 1 and py
         // lines 3-5 came from ty line 5.  Looking up ty line 5 returns the
         // first matching py line (3, 1-indexed).
-        let body = r#"{"version":2,"source":"main.ty","line_strategy":"table","lines":[1,1,5,5,5]}"#;
+        let body =
+            r#"{"version":2,"source":"main.ty","line_strategy":"table","lines":[1,1,5,5,5]}"#;
         assert_eq!(lookup_py_line_in_map(body, 1), Some(1));
         assert_eq!(lookup_py_line_in_map(body, 5), Some(3));
         assert_eq!(lookup_py_line_in_map(body, 9), None);

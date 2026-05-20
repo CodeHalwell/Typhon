@@ -32,7 +32,9 @@ use tyc_syntax::preprocess::{
     expand_pipes, expand_question_ops, expand_with_chains, line_byte_starts, preprocess,
 };
 
-use crate::commands::util::{apply_strictness, collect_dty_files, collect_py_files, collect_ty_files};
+use crate::commands::util::{
+    apply_strictness, collect_dty_files, collect_py_files, collect_ty_files,
+};
 use crate::config::TyphonConfig;
 
 /// Arguments for `tyc build`.
@@ -77,6 +79,19 @@ pub fn run(args: BuildArgs) -> Result<()> {
         Ok(None) => {
             eprintln!("warning: no typhon.toml found; using defaults");
             (project_root.clone(), TyphonConfig::default())
+        }
+        // Lift typed `ConfigError` variants into the structured
+        // `TycError` catalog so config-load failures render the same
+        // code/url/help styling as every other compiler diagnostic and
+        // are discoverable via `tyc explain`. Anything we don't have a
+        // dedicated variant for falls through to a plain miette message.
+        Err(crate::config::ConfigError::InvalidClassDefault {
+            path,
+            value,
+            allowed,
+        }) => {
+            let err = TycError::invalid_config_value("emit.class-default", value, allowed, path);
+            return Err(miette::Report::new_boxed(Box::new(err)));
         }
         Err(e) => return Err(miette!("{e}")),
     };
@@ -244,10 +259,18 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // warning. Once the field exists, gate the `eprintln!` on
         // `!config.strictness.allow_secret_comptime`.
         for name in comptime_values.keys() {
-            if let Some(matched) = secret_suffix(name) {
-                eprintln!(
-                    "warning[tyc::contains_secret_literal]: comptime let `{name}` (matched '{matched}' suffix) inlines its env value at build time;\n  emitted Python will contain the raw secret as a string literal.\n  Consider reading the env var at runtime (`os.environ[\"{name}\"]`) instead."
-                );
+            if secret_suffix(name).is_none() {
+                continue;
+            }
+            // Only fire when the RHS actually pulls from `env(...)` — a
+            // hard-coded `comptime let API_KEY = "test"` isn't reading a
+            // secret, just labelling a literal. Pull the actual env-var
+            // key out of the source so the help text points at the right
+            // identifier (the binding name and the env key often differ:
+            // `comptime let API_KEY = env("MY_SERVICE_API_KEY")`).
+            if let Some(env_key) = find_env_key_for_comptime_binding(source, name) {
+                let warn = TycError::contains_secret_literal(name.clone(), env_key);
+                eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn)));
             }
         }
 
@@ -476,7 +499,20 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // its hand-written sibling at runtime. Excludes `__pycache__/`,
     // `tests/`, `.venv/`, and hidden `.X/` directories (handled inside
     // `collect_py_files`).
-    let py_files = collect_py_files(&src_dir)?;
+    //
+    // When `[project] out` is configured inside `[project] src` (e.g.
+    // `out = "src/build"`), the scan would otherwise re-discover the
+    // previously emitted Python and copy it into ever-nested
+    // `build/build/...` paths on each run. Filter the output subtree
+    // explicitly to keep the operation idempotent.
+    let canonical_out_dir = out_dir.canonicalize().unwrap_or_else(|_| out_dir.clone());
+    let py_files: Vec<_> = collect_py_files(&src_dir)?
+        .into_iter()
+        .filter(|path| {
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+            !canonical.starts_with(&canonical_out_dir)
+        })
+        .collect();
     let mut py_copied = 0usize;
     for path in &py_files {
         let rel = path
@@ -492,7 +528,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
                     .map_err(|e| miette!("cannot create '{}': {e}", parent.display()))?;
             }
             std::fs::copy(path, &dest).map_err(|e| {
-                miette!("cannot copy '{}' → '{}': {e}", path.display(), dest.display())
+                miette!(
+                    "cannot copy '{}' → '{}': {e}",
+                    path.display(),
+                    dest.display()
+                )
             })?;
         }
         py_copied += 1;
@@ -517,7 +557,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
         }
     }
     for (path, source) in &sources {
-        for (module_name, snippet) in scan_relative_py_imports(source) {
+        for (module_name, snippet, offset, length) in scan_relative_py_imports(source) {
             if copied_py_module_names.contains(&module_name) {
                 continue;
             }
@@ -531,10 +571,14 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 walker = dir.parent();
             }
             if found_orphan_parent {
-                eprintln!(
-                    "warning[tyc::orphan_py_import]: `{snippet}` references {module_name}.py outside src/ — the build will not copy it (in {})",
-                    path.display()
+                let warn = TycError::orphan_py_import(
+                    snippet,
+                    path.display().to_string(),
+                    source.clone(),
+                    offset,
+                    length,
                 );
+                eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn)));
             }
         }
     }
@@ -632,7 +676,10 @@ pub fn run(args: BuildArgs) -> Result<()> {
     }
 
     if check_mode {
-        println!("would write {} file(s) (no changes made)", would_write_count);
+        println!(
+            "would write {} file(s) (no changes made)",
+            would_write_count
+        );
     } else {
         println!("built {} file(s) → '{}'", emitted, out_dir.display());
     }
@@ -655,30 +702,42 @@ fn secret_suffix(name: &str) -> Option<&'static str> {
     let upper = name.to_ascii_uppercase();
     // Order matters: check the longest/most specific suffixes first so
     // `MY_PASSWORD` reports `PASSWORD` rather than the shorter `PASS`.
-    for candidate in [
+    [
         "PASSWORD", "SECRET", "TOKEN", "API_KEY", "KEY", "PWD", "PASS",
-    ] {
-        if upper.ends_with(candidate) {
-            return Some(candidate);
-        }
-    }
-    None
+    ]
+    .into_iter()
+    .find(|candidate| upper.ends_with(candidate))
 }
 
 /// Scan `source` for `from .NAME import …` lines and return
 /// `(NAME, snippet)` pairs. Single-dot relative imports only — this
 /// lint targets sibling-file imports, not parent-package `from ..pkg
 /// import …` references. Lightweight textual scan; works even before
-/// the file successfully parses.
-fn scan_relative_py_imports(source: &str) -> Vec<(String, String)> {
+/// the file successfully parses. Returns `(name, snippet, offset, length)`
+/// where `offset`/`length` describe the byte-range of the trimmed import
+/// line in `source` — used to build a `TycError::OrphanPyImport`
+/// diagnostic with a source span pointing at the actual import.
+fn scan_relative_py_imports(source: &str) -> Vec<(String, String, usize, usize)> {
     let mut out = Vec::new();
-    for line in source.lines() {
+    let mut line_start = 0usize;
+    for line in source.split_inclusive('\n') {
+        let line_len = line.len();
+        let trimmed_start = line_start
+            + line
+                .as_bytes()
+                .iter()
+                .take_while(|&&b| b == b' ' || b == b'\t')
+                .count();
         let trimmed = line.trim_start();
         let rest = match trimmed.strip_prefix("from .") {
             Some(r) => r,
-            None => continue,
+            None => {
+                line_start += line_len;
+                continue;
+            }
         };
         if rest.starts_with('.') {
+            line_start += line_len;
             continue;
         }
         let mut name = String::new();
@@ -690,15 +749,64 @@ fn scan_relative_py_imports(source: &str) -> Vec<(String, String)> {
             }
         }
         if name.is_empty() {
+            line_start += line_len;
             continue;
         }
         let after = &rest[name.len()..];
         if !after.trim_start().starts_with("import") {
+            line_start += line_len;
             continue;
         }
-        out.push((name, trimmed.trim_end().to_owned()));
+        let snippet = trimmed.trim_end().to_owned();
+        out.push((name, snippet.clone(), trimmed_start, snippet.len()));
+        line_start += line_len;
     }
     out
+}
+
+/// Find the env-var key in a `comptime let NAME ... = env("KEY"...)`
+/// declaration by scanning `source` for the binding's line. Returns the
+/// first quoted string immediately following `env(` on a line that mentions
+/// `NAME`. Returns `None` when the binding's RHS doesn't use `env(...)` —
+/// e.g. `comptime let X = 42`, where the secret lint shouldn't fire.
+fn find_env_key_for_comptime_binding(source: &str, binding_name: &str) -> Option<String> {
+    let needle = "comptime ";
+    for line in source.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with(needle) {
+            continue;
+        }
+        // Match either `comptime let NAME` or `comptime mut NAME` or
+        // bare `comptime NAME` (legacy). Cheaply check the binding name
+        // appears before the `=`.
+        let lhs = trimmed.split('=').next().unwrap_or("");
+        let lhs_has_name = lhs.split_whitespace().any(|tok| {
+            tok.trim_end_matches(':')
+                .trim_end_matches(',')
+                .eq(binding_name)
+        });
+        if !lhs_has_name {
+            continue;
+        }
+        // Locate the first `env(` after the `=` and lift the first quoted
+        // string out of its argument list.
+        let after_eq = match trimmed.split_once('=') {
+            Some((_, r)) => r,
+            None => continue,
+        };
+        let env_idx = after_eq.find("env(")?;
+        let after_open = &after_eq[env_idx + "env(".len()..];
+        // Strip optional whitespace and grab the leading `"..."` or `'...'`.
+        let after_ws = after_open.trim_start();
+        let quote = after_ws.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        let rest = &after_ws[1..];
+        let end = rest.find(quote)?;
+        return Some(rest[..end].to_owned());
+    }
+    None
 }
 
 /// Derive the dotted Python module name that the runtime profiler
@@ -2386,8 +2494,23 @@ let pet: Animal = Dog(name=\"Rex\")
 
     // ── Phase 5.6: comptime secret-literal lint ────────────────────────────
 
+    /// Serialises every test that mutates process environment variables.
+    /// Rust tests run in parallel by default, and `std::env::set_var` /
+    /// `remove_var` mutate global state — concurrent test threads racing
+    /// on the same variable produce flaky failures. Holding this mutex
+    /// for the duration of an env-mutating test serialises those threads.
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn build_warns_on_comptime_secret_binding() {
+        let _guard = lock_env();
         std::env::set_var("FAKE_API_KEY", "secret");
         let tmp = tempfile::tempdir().unwrap();
         let (_, out_dir) = scaffold(
@@ -2434,7 +2557,7 @@ let pet: Animal = Dog(name=\"Rex\")
     fn scan_relative_py_imports_picks_up_sibling_imports() {
         let src = "from .helper import foo\nfrom .other import bar, baz\n";
         let imports = scan_relative_py_imports(src);
-        let names: Vec<&str> = imports.iter().map(|(n, _)| n.as_str()).collect();
+        let names: Vec<&str> = imports.iter().map(|(n, _, _, _)| n.as_str()).collect();
         assert!(names.contains(&"helper"));
         assert!(names.contains(&"other"));
     }

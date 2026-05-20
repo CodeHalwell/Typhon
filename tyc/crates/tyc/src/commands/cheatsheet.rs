@@ -19,7 +19,10 @@ mod tests {
 
     #[test]
     fn cheatsheet_starts_with_typhon_header() {
-        assert!(!CHEATSHEET.trim().is_empty(), "cheatsheet must not be empty");
+        assert!(
+            !CHEATSHEET.trim().is_empty(),
+            "cheatsheet must not be empty"
+        );
         assert!(
             CHEATSHEET.contains("Typhon"),
             "cheatsheet must mention Typhon"

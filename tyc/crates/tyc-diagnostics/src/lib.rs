@@ -21,10 +21,7 @@ pub enum TycError {
 
     /// The source file could not be parsed as a valid Typhon/Python program.
     #[error("parse error in '{path}'")]
-    #[diagnostic(
-        code(tyc::parse),
-        url("https://typhon.dev/lang/diagnostics/parse")
-    )]
+    #[diagnostic(code(tyc::parse), url("https://typhon.dev/lang/diagnostics/parse"))]
     Parse {
         path: String,
         message: String,
@@ -478,10 +475,7 @@ pub enum TycError {
 
     /// Generic error with a human-readable message (used during early phases).
     #[error("{message}")]
-    #[diagnostic(
-        code(tyc::generic),
-        url("https://typhon.dev/lang/diagnostics/generic")
-    )]
+    #[diagnostic(code(tyc::generic), url("https://typhon.dev/lang/diagnostics/generic"))]
     Generic { message: String },
 
     /// The `?` error-propagation operator was used outside a `Result`-returning function.
@@ -933,10 +927,7 @@ pub enum TycError {
         url("https://typhon.dev/lang/diagnostics/contains_secret_literal"),
         help("Replace `comptime let {name} = env(...)` with a runtime lookup such as `os.environ[\"{env_key}\"]`.")
     )]
-    ContainsSecretLiteral {
-        name: String,
-        env_key: String,
-    },
+    ContainsSecretLiteral { name: String, env_key: String },
 }
 
 impl TycError {
@@ -1767,10 +1758,7 @@ impl TycError {
 
     /// Construct a [`TycError::ContainsSecretLiteral`] warning for a
     /// `comptime` binding whose name matches the secret-suffix heuristic.
-    pub fn contains_secret_literal(
-        name: impl Into<String>,
-        env_key: impl Into<String>,
-    ) -> Self {
+    pub fn contains_secret_literal(name: impl Into<String>, env_key: impl Into<String>) -> Self {
         Self::ContainsSecretLiteral {
             name: name.into(),
             env_key: env_key.into(),
@@ -2203,13 +2191,8 @@ mod tests {
 
     #[test]
     fn orphan_py_import_contains_import_path() {
-        let e = TycError::orphan_py_import(
-            ".helper",
-            "src/main.ty",
-            "from .helper import foo",
-            0,
-            17,
-        );
+        let e =
+            TycError::orphan_py_import(".helper", "src/main.ty", "from .helper import foo", 0, 17);
         assert!(matches!(e, TycError::OrphanPyImport { .. }));
         assert!(e.to_string().contains(".helper"));
     }

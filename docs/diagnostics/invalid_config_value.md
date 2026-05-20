@@ -9,7 +9,7 @@ silently does the wrong thing with a misspelled or unsupported setting.
 ```toml
 # typhon.toml
 [emit]
-class-default = "plain"   # error: expected one of `dataclass` | `frozen`
+class-default = "plain"   # error: expected one of `dataclass` | `pydantic`
 ```
 
 ## Why
