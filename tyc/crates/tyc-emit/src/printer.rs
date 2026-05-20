@@ -1053,7 +1053,16 @@ impl Emitter {
                                     }
                                     InterpolatedStringElement::Interpolation(interp) => {
                                         self.write("{");
-                                        self.emit_expr(&interp.expression);
+                                        // PEP 501 debug f-string: `f"{x=}"` carries
+                                        // the verbatim `x=` text on `debug_text`,
+                                        // including the surrounding whitespace
+                                        // (`f"{x = }"`). Emit it as-is so the
+                                        // `=` marker survives the round-trip.
+                                        if let Some(dt) = &interp.debug_text {
+                                            self.write(dt.as_str());
+                                        } else {
+                                            self.emit_expr(&interp.expression);
+                                        }
                                         // Emit `!r` / `!s` / `!a` conversion flags
                                         // — these are stripped by default by the
                                         // AST but carried on the `conversion`

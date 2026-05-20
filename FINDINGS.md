@@ -4479,3 +4479,12 @@ fix lands as its own commit.
   `b"hello"` now round-trips as `b"hello"` instead of
   `b"\x68\x65\x6c\x6c\x6f"`.
 
+- **#106** `f"{x=}"` debug-repr emission — the printer's `FString`
+  arm now checks `InterpolatedElement.debug_text` and emits its
+  verbatim contents (including the `=` and any surrounding
+  whitespace) in place of the parsed expression when present.
+  Conversion (`!r/!s/!a`) and format-spec emission continue to layer
+  on top, so `f"{name=!r}"`, `f"{x*2=}"`, and `f"{x = }"` all
+  round-trip with the `=` debug marker preserved. Verified
+  end-to-end via `tyc build` + CPython 3.13.
+
