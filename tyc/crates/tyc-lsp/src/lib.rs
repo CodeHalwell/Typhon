@@ -2736,9 +2736,16 @@ fn format_docstring_sections(lines: &[&str]) -> String {
         let line = lines[i];
         let trimmed = line.trim_start();
         // NumPy section: `Header\n------` shape (the underline must
-        // be at least 3 dashes long).
+        // be at least 3 dashes long). When the header maps to a
+        // recognised section name (`Parameters`, `Returns`, …) the
+        // canonical form is used so themes can target it. Unknown
+        // headers fall back to the *original* text — better than
+        // collapsing every section the author invented into a
+        // single `**Section**` bucket.
         if i + 1 < lines.len() && is_numpy_underline(lines[i + 1]) && !trimmed.is_empty() {
-            let title = canonical_section_title(trimmed);
+            let title = canonical_section_title_opt(trimmed)
+                .map(str::to_owned)
+                .unwrap_or_else(|| trimmed.to_owned());
             out.push(format!("**{title}**"));
             out.push(String::new());
             i += 2;
@@ -2775,6 +2782,10 @@ fn format_docstring_sections(lines: &[&str]) -> String {
         }
         // Sphinx / reST `:param X: desc`. We collect runs into a
         // synthetic Parameters heading so the user gets a list.
+        // Continuation lines (indented body under a `:param`) are
+        // appended to the current bullet so multi-line parameter
+        // descriptions survive the re-render — dropping them would
+        // silently lose docstring content.
         if trimmed.starts_with(":param ") || trimmed.starts_with(":parameter ") {
             let block_start = i;
             while i < lines.len()
@@ -2786,10 +2797,61 @@ fn format_docstring_sections(lines: &[&str]) -> String {
             }
             out.push("**Parameters**".to_owned());
             out.push(String::new());
+            let mut current_bullet: Option<String> = None;
             for sphinx_line in &lines[block_start..i] {
-                if let Some(bullet) = sphinx_param_to_bullet(sphinx_line.trim_start()) {
-                    out.push(bullet);
+                let stripped = sphinx_line.trim_start();
+                if let Some(bullet) = sphinx_param_to_bullet(stripped) {
+                    if let Some(prev) = current_bullet.take() {
+                        out.push(prev);
+                    }
+                    current_bullet = Some(bullet);
+                } else if !stripped.is_empty() {
+                    if let Some(b) = current_bullet.as_mut() {
+                        b.push(' ');
+                        b.push_str(stripped);
+                    }
                 }
+            }
+            if let Some(b) = current_bullet.take() {
+                out.push(b);
+            }
+            continue;
+        }
+        // Sphinx `:raises Exc: desc` (and the singular `:raise`).
+        // Collected like `:param` so a run of consecutive raises
+        // directives produces a single **Raises** section.
+        if trimmed.starts_with(":raises ")
+            || trimmed.starts_with(":raise ")
+            || trimmed.starts_with(":except ")
+        {
+            let block_start = i;
+            while i < lines.len()
+                && (lines[i].trim_start().starts_with(":raises ")
+                    || lines[i].trim_start().starts_with(":raise ")
+                    || lines[i].trim_start().starts_with(":except ")
+                    || (i > block_start && (lines[i].starts_with(' ') || lines[i].is_empty())))
+            {
+                i += 1;
+            }
+            out.push("**Raises**".to_owned());
+            out.push(String::new());
+            let mut current_bullet: Option<String> = None;
+            for sphinx_line in &lines[block_start..i] {
+                let stripped = sphinx_line.trim_start();
+                if let Some(bullet) = sphinx_raises_to_bullet(stripped) {
+                    if let Some(prev) = current_bullet.take() {
+                        out.push(prev);
+                    }
+                    current_bullet = Some(bullet);
+                } else if !stripped.is_empty() {
+                    if let Some(b) = current_bullet.as_mut() {
+                        b.push(' ');
+                        b.push_str(stripped);
+                    }
+                }
+            }
+            if let Some(b) = current_bullet.take() {
+                out.push(b);
             }
             continue;
         }
@@ -2858,11 +2920,6 @@ fn canonical_section_title_opt(name: &str) -> Option<&'static str> {
     })
 }
 
-/// Wrapper around `canonical_section_title_opt` for call sites that
-/// already verified the title belongs to a known section.
-fn canonical_section_title(name: &str) -> &'static str {
-    canonical_section_title_opt(name).unwrap_or("Section")
-}
 
 /// Render the contents of a parameter block (Google `Args:` body or
 /// NumPy `Parameters` body) as Markdown bullets. Lines that don't
@@ -2933,6 +2990,18 @@ fn sphinx_param_to_bullet(line: &str) -> Option<String> {
         .or_else(|| line.strip_prefix(":parameter "))?;
     let (name, desc) = rest.split_once(':')?;
     Some(format!("- **{}** — {}", name.trim(), desc.trim()))
+}
+
+/// `:raises ValueError: description` → `- **ValueError** — description`.
+/// Accepts the singular `:raise` and the obscure `:except` variants
+/// the older docutils dialect used.
+fn sphinx_raises_to_bullet(line: &str) -> Option<String> {
+    let rest = line
+        .strip_prefix(":raises ")
+        .or_else(|| line.strip_prefix(":raise "))
+        .or_else(|| line.strip_prefix(":except "))?;
+    let (exc, desc) = rest.split_once(':')?;
+    Some(format!("- **{}** — {}", exc.trim(), desc.trim()))
 }
 
 /// `inspect.signature(obj)` returns the pretty form `(arg1, arg2=…)`,
@@ -3249,6 +3318,62 @@ mod tests {
         let doc = "Simple one-liner with no structure.";
         let out = render_docstring(doc);
         assert_eq!(out, "Simple one-liner with no structure.");
+    }
+
+    #[test]
+    fn render_docstring_formats_sphinx_raises_directive() {
+        // `:raises Exc: desc` was advertised in the PR but the
+        // original implementation had no handler — the directive
+        // would have fallen through verbatim. Regression: collect
+        // a run of `:raises` lines under a synthesised **Raises**
+        // heading with bullets.
+        let doc = "Connect.\n\n:raises ConnectionError: dial failed.\n:raises TimeoutError: server didn't respond.\n";
+        let out = render_docstring(doc);
+        assert!(out.contains("**Raises**"), "header: {out}");
+        assert!(
+            out.contains("- **ConnectionError** — dial failed."),
+            "first bullet: {out}"
+        );
+        assert!(
+            out.contains("- **TimeoutError** — server didn't respond."),
+            "second bullet: {out}"
+        );
+    }
+
+    #[test]
+    fn render_docstring_folds_sphinx_param_continuations() {
+        // Multi-line `:param` descriptions used to get dropped:
+        // the block collector grabbed the continuation lines but
+        // the renderer only emitted bullets for `:param` directives.
+        // Continuation text now folds into the prior bullet so no
+        // docstring content is lost.
+        let doc = "Open.\n\n:param host: hostname to dial,\n    accepts IPv4 and IPv6 addresses.\n:param port: TCP port.\n";
+        let out = render_docstring(doc);
+        let host_bullet = out
+            .lines()
+            .find(|l| l.starts_with("- **host**"))
+            .expect("host bullet present");
+        assert!(
+            host_bullet.contains("accepts IPv4 and IPv6 addresses."),
+            "continuation folded in: {host_bullet}"
+        );
+    }
+
+    #[test]
+    fn render_docstring_preserves_unknown_numpy_header_text() {
+        // NumPy underlines can sit under any header the author
+        // wrote. When the title doesn't match one of the curated
+        // sections (`Parameters`, `Returns`, …) the original text
+        // is preserved instead of being collapsed to a generic
+        // **Section** stub.
+        let doc = "Compute.\n\nGotchas\n-------\nWatch out for division by zero.\n";
+        let out = render_docstring(doc);
+        assert!(
+            out.contains("**Gotchas**"),
+            "original header preserved: {out}"
+        );
+        assert!(!out.contains("**Section**"), "no Section stub: {out}");
+        assert!(out.contains("Watch out for division by zero."));
     }
 
     #[test]

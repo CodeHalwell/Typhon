@@ -169,7 +169,7 @@ fn emit_reference_tokens(
             continue;
         };
         if let Some((line, col)) = byte_to_line_col(source, reference.span.0) {
-            let length = (reference.span.1 - reference.span.0) as u32;
+            let length = utf16_len_of_span(source, reference.span.0, reference.span.1);
             if let Some(mut tok) = token_for_binding(binding, source, stdlib_modules, false) {
                 tok.line = line;
                 tok.col = col;
@@ -237,7 +237,7 @@ impl<'a> Visitor<'a> for AttributeWalker<'a> {
                     self.tokens.push(AbsoluteToken {
                         line,
                         col,
-                        length: attr.attr.as_str().len() as u32,
+                        length: utf16_len_of_span(self.source, ident_start, ident_end),
                         token_type,
                         modifiers: 0,
                     });
@@ -282,7 +282,7 @@ fn token_for_binding(
     is_declaration: bool,
 ) -> Option<AbsoluteToken> {
     let (line, col) = byte_to_line_col(source, binding.span.0)?;
-    let length = (binding.span.1 - binding.span.0) as u32;
+    let length = utf16_len_of_span(source, binding.span.0, binding.span.1);
     let mut modifiers: u32 = 0;
     if is_declaration {
         modifiers |= MOD_DECLARATION;
@@ -349,6 +349,27 @@ fn lookup_binding<'a>(
         current = scope.parent;
     }
     None
+}
+
+/// Width of a `[start, end)` byte slice measured in UTF-16 code
+/// units. LSP semantic-tokens `length` is specified in UTF-16, same
+/// unit as `Position.character` — using a byte length here would
+/// over- or under-shoot the highlight range for any non-ASCII
+/// identifier (an `é`, a CJK ideograph, an emoji-as-identifier in
+/// a docstring). Typhon doesn't permit non-ASCII identifiers today,
+/// but the LSP serves docstrings + comments in semantic-tokens
+/// neighbouring spans, and getting this right by construction is
+/// cheaper than chasing a desync bug later.
+///
+/// Clamps `end` to the source length; out-of-range spans return 0
+/// rather than panicking.
+fn utf16_len_of_span(source: &str, start: usize, end: usize) -> u32 {
+    if start >= source.len() || end <= start {
+        return 0;
+    }
+    let end = end.min(source.len());
+    let slice = &source[start..end];
+    slice.chars().map(|c| c.len_utf16() as u32).sum()
 }
 
 /// Convert a byte offset into LSP `(line, character)` coordinates.
@@ -510,6 +531,26 @@ mod tests {
         let (ref_ty, ref_mods) = token_at(&source, "add(1", &result.data).expect("add ref token");
         assert_eq!(ref_ty, TOKEN_FUNCTION);
         assert_eq!(ref_mods & MOD_DECLARATION, 0);
+    }
+
+    #[test]
+    fn utf16_length_helper_counts_surrogate_pairs_correctly() {
+        // Ascii: each byte is one UTF-16 code unit.
+        assert_eq!(utf16_len_of_span("hello", 0, 5), 5);
+        // BMP non-ascii (`é` is 2 bytes UTF-8 / 1 unit UTF-16): the
+        // byte-derived length we used to ship would have reported
+        // 4 here, mis-aligning every token after it.
+        let s = "éé";
+        assert_eq!(utf16_len_of_span(s, 0, s.len()), 2);
+        // Astral plane (`🦀` is 4 bytes UTF-8 / 2 units UTF-16,
+        // i.e. a UTF-16 surrogate pair): the LSP client expects 2,
+        // not 1 and not 4.
+        let crab = "🦀";
+        assert_eq!(utf16_len_of_span(crab, 0, crab.len()), 2);
+        // Out-of-range spans clamp rather than panicking — defensive
+        // against AST / resolver divergence.
+        assert_eq!(utf16_len_of_span("abc", 1, 99), 2);
+        assert_eq!(utf16_len_of_span("abc", 5, 6), 0);
     }
 
     #[test]
