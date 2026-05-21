@@ -4,6 +4,46 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.2.4
+
+LSP hover developer-UX polish on top of the 0.2.3 introspection
+docs. Three adjacent fixes targeting the "hover an imported class
+and learn what it does" path:
+
+### Added
+
+- **Pre-warming on document open / change.** `check_and_publish`
+  now spawns a detached task that introspects every third-party
+  import in the open buffer the moment the file is parsed, so the
+  cache is hot by the time the user hovers. The first hover used
+  to wait on the subprocess (30–100 ms typical); subsequent hovers
+  hit the same `HashMap` entry. The prewarm itself never blocks
+  diagnostics publishing — it's spawned through
+  `tokio::task::spawn_blocking` and discarded.
+- **Markdown rendering for hover.** Hover now publishes
+  `MarkupContent { kind: Markdown, … }` instead of the older
+  `MarkedString::String` shape, so signatures appear in fenced
+  `python` code blocks and docstrings render as proper paragraphs
+  with whatever Markdown the upstream library wrote.
+- **Multi-line docstrings.** The Python introspection script now
+  returns the full docstring (up to 4 KB) instead of the first
+  line; the LSP strips PEP 257 indentation and trims surrounding
+  blanks before rendering. Caps the visible body at 40 lines with
+  an explicit truncation marker so module-level docstrings (numpy,
+  pandas, sklearn) don't flood the popover.
+- **Off-runtime introspection in hover.** The hover handler runs
+  the (potentially cold) `cache.members()` call through
+  `tokio::task::spawn_blocking` so a worst-case 5-second timeout
+  can never stall the async runtime. The prewarm makes cold hits
+  rare; this is the safety net for the case where the prewarm
+  hasn't completed yet (large project, slow venv import).
+
+### Tests
+
+- 5 new tests in `tyc-lsp` covering `render_docstring` (PEP 257
+  strip, blank-line trim, 40-line cap, empty input) and `sig_tail`
+  (prefix strip, unknown-shape pass-through).
+
 ## 0.2.3
 
 UX polish on the arity diagnostic landed in 0.2.2, plus library
