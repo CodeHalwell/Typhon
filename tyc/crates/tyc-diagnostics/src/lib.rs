@@ -882,12 +882,23 @@ pub enum TycError {
 
     /// A `type` alias chain forms a cycle (`type A = B; type B = A`).
     /// The runtime never crashes because Python evaluates aliases
-    /// lazily, but no caller can ever resolve the type. FINDINGS #81.
+    /// lazily, but no caller can ever resolve the type. FINDINGS #81,
+    /// O4.
+    ///
+    /// Self-referential aliases through generic containers — the
+    /// canonical recursive-JSON / AST / tree shape
+    /// `type JSON = None | bool | int | str | list[JSON] | dict[str, JSON]`
+    /// — are not yet supported and trigger this diagnostic for the
+    /// same reason: `unwrap_alias` is bounded to eight hops and a
+    /// chain that re-enters itself never resolves to a concrete type.
+    /// Today's workaround is to use `dict[str, object]` /
+    /// `list[object]` at the recursion boundary; full recursive-type
+    /// support is tracked in `docs/findings.md`.
     #[error("type alias `{name}` is part of a cycle")]
     #[diagnostic(
         code(tyc::cyclic_type_alias),
         url("https://typhon.dev/lang/diagnostics/cyclic_type_alias"),
-        help("break the cycle by pointing at a concrete type or removing one of the alias declarations")
+        help("recursive type aliases are not yet supported (including the canonical `list[Self]` / `dict[str, Self]` shape). Break the cycle by pointing at a concrete type, splitting the alias into named classes, or falling back to `object` at the recursion boundary.")
     )]
     CyclicTypeAlias {
         name: String,
