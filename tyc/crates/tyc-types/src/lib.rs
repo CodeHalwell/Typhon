@@ -5274,6 +5274,33 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
                 }
             }
         }
+        Expr::BoolOp(b) => {
+            match b.op {
+                ruff_python_ast::BoolOp::And => {
+                    // `A and B`: in the true branch both hold simultaneously,
+                    // so collect narrowings from every operand.
+                    // `not (A and B)` = `not A or not B` — only one needs to
+                    // fail, so we can't safely narrow any single name.
+                    if !negate {
+                        for operand in &b.values {
+                            collect_narrowings_inner(c, operand, false, out);
+                        }
+                    }
+                }
+                ruff_python_ast::BoolOp::Or => {
+                    // `not (A or B)` = `not A and not B` (De Morgan): when
+                    // the if-body always exits, the negated condition applies
+                    // to the post-if scope, so every sub-narrowing holds.
+                    // `A or B` alone — only one needs to hold, so we can't
+                    // safely narrow any single name.
+                    if negate {
+                        for operand in &b.values {
+                            collect_narrowings_inner(c, operand, true, out);
+                        }
+                    }
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -6981,6 +7008,49 @@ def f(x: int | str) -> int:
     if isinstance(x, int):
         return x
     return 0
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn or_condition_early_exit_narrows_post_if() {
+        // `not (A or B)` = `not A and not B` — after `if x is None or y is None: return`,
+        // both x and y should be narrowed to non-None.
+        let src = "\
+def f(x: int | None, y: str | None) -> int:
+    if x is None or y is None:
+        return 0
+    let _s: str = y
+    return x
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn and_condition_narrows_true_branch() {
+        // `A and B`: both conditions hold inside the if-body.
+        let src = "\
+def f(x: int | None, y: str | None) -> int:
+    if x is not None and y is not None:
+        let _s: str = y
+        return x
+    return 0
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn or_with_isinstance_early_exit_narrows() {
+        // isinstance in an or-condition: after `if not isinstance(x, int) or x is None: return`,
+        // x is narrowed to int (non-None) in the continuation.
+        let src = "\
+def f(x: int | None) -> int:
+    if x is None or not isinstance(x, int):
+        return 0
+    return x
 ";
         let d = check(src);
         assert!(!d.has_errors(), "{:?}", d.errors());
