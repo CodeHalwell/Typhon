@@ -362,7 +362,19 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        let body = render_hover(&symbol);
+        // Build the base hover body (kind + name + declaration-site
+        // marker) from the resolver's view of the symbol. When the
+        // symbol points at a third-party import, enrich it with the
+        // package's real signature + first-line docstring recovered
+        // through the venv introspection cache — this is the "what
+        // is this thing?" preview the user expects when hovering a
+        // foreign class or function. Project / stdlib symbols fall
+        // through to the base body unchanged.
+        let mut body = render_hover(&symbol);
+        if let Some(import_extras) = self.hover_import_extras(&uri, &symbol).await {
+            body.push_str("\n\n");
+            body.push_str(&import_extras);
+        }
         let range = Some(Range {
             start: byte_to_position(&preprocessed, symbol.span.0),
             end: byte_to_position(&preprocessed, symbol.span.1),
@@ -652,6 +664,62 @@ impl Backend {
     async fn source_file_for(&self, uri: &Uri) -> Option<SourceFile> {
         let docs = self.documents.lock().await;
         docs.get(uri.as_str()).copied()
+    }
+
+    /// Render the import-specific addition to a hover body: the
+    /// declared module path, the recovered signature (when the symbol
+    /// is a class / function), and the first line of the runtime
+    /// docstring. Returns `None` when the symbol isn't an import,
+    /// when no `typhon.toml` ancestor anchors a venv, or when
+    /// introspection failed (no Python on PATH, import-time error,
+    /// timeout) — the hover falls back to the base body in those
+    /// cases.
+    ///
+    /// The lookup runs the same introspection cache that powers
+    /// completion (`venv_introspect`), so the data is shared and the
+    /// per-module subprocess fires at most once per session.
+    async fn hover_import_extras(
+        &self,
+        uri: &Uri,
+        symbol: &tyc_resolve::SymbolAtOffset<'_>,
+    ) -> Option<String> {
+        let def = symbol.definition?;
+        let import_info = def.import_info.as_ref()?;
+        let (root, cache) = self.introspection_cache_for(uri).await?;
+        // `from M import N` → look up member `N` on module `M`.
+        // `import M as N` → look up the module itself; we surface a
+        //   short summary plus the first public class it exports so
+        //   the hover isn't empty.
+        let lookup_name = import_info
+            .member
+            .clone()
+            .unwrap_or_else(|| import_info.module.clone());
+        let members = {
+            let mut guard = cache.lock().ok()?;
+            guard.members(&root, &import_info.module)?
+        };
+        let target_name = import_info.member.as_deref().unwrap_or("");
+        let mut out = String::new();
+        out.push_str(&format!("from `{}`", import_info.module));
+        if let Some(member) = &import_info.member {
+            if member != &lookup_name {
+                // Keep the renamed-import surface honest: the local
+                // name on the line above is the alias, but the lookup
+                // happened against the source member.
+                out.push_str(&format!(" (imports `{member}`)"));
+            }
+        }
+        if !target_name.is_empty() {
+            if let Some(member) = members.iter().find(|m| m.name == target_name) {
+                if let Some(sig) = &member.signature {
+                    out.push_str(&format!("\n\n```\n{sig}\n```"));
+                }
+                if let Some(doc) = &member.documentation {
+                    out.push_str(&format!("\n\n{doc}"));
+                }
+            }
+        }
+        Some(out)
     }
 
     /// Locate `uri`'s project root (walking upward for `typhon.toml`)

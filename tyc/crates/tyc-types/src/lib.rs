@@ -2011,6 +2011,32 @@ impl<'a> Checker<'a> {
         ));
     }
 
+    /// Emit `tyc::missing_argument` when we can identify *which*
+    /// parameters weren't filled. Preferred over [`Self::wrong_args`]
+    /// for the "you forgot the required `client` kwarg" case — the
+    /// caller sees the name they need to add instead of a count
+    /// that buries the actionable detail. `missing` is the list of
+    /// missing parameter names in declaration order; callers that
+    /// can't enumerate the missing names (e.g. too many positionals)
+    /// should keep using `wrong_args`.
+    fn missing_argument(&mut self, name: &str, missing: Vec<String>, span: (usize, usize)) {
+        if self.unsafe_depth > 0 {
+            return;
+        }
+        if missing.is_empty() {
+            return;
+        }
+        let length = span.1.saturating_sub(span.0).max(1);
+        self.diagnostics.push_error(TycError::missing_argument(
+            name,
+            missing,
+            &self.path,
+            self.source,
+            span.0,
+            length,
+        ));
+    }
+
     /// Emit `tyc::unknown_kwarg` (FINDINGS #80). `suggestion` is the
     /// fully-formatted help string — either "did you mean `<x>`?" or a
     /// list of accepted parameter names.
@@ -3336,6 +3362,94 @@ fn strip_receiver_from_arity(mut info: ArityInfo) -> ArityInfo {
 ///
 /// An empty `param_names` (zero-field class) means the call site
 /// short-circuits the arity check entirely.
+/// Identify the constructor's required fields (no `= default`) that
+/// weren't filled by the call site. Returns names in declaration
+/// order — matches what the user sees scrolling the class definition.
+///
+/// A field is "filled" when it's either:
+/// - Covered positionally (the call's `pos_args.len()`-th index in
+///   `field_order` and below).
+/// - Named in a kwarg.
+///
+/// Powers the `tyc::missing_argument` diagnostic. Returning an empty
+/// vec means the arity violation isn't reducible to "missing names"
+/// (too many positionals, positional+kwarg conflict on the same
+/// parameter, …) and the caller should fall back to `tyc::arg_count`.
+fn missing_required_fields(
+    shape: &InterfaceShape,
+    pos_args: &[Expr],
+    kw_args: &[ruff_python_ast::Keyword],
+) -> Vec<String> {
+    let filled_positionally = pos_args.len().min(shape.field_order.len());
+    let supplied_kwargs: std::collections::HashSet<&str> = kw_args
+        .iter()
+        .filter_map(|k| k.arg.as_ref().map(|i| i.as_str()))
+        .collect();
+    shape
+        .field_order
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| !shape.field_defaults.contains(name.as_str()))
+        .filter(|(idx, name)| {
+            *idx >= filled_positionally && !supplied_kwargs.contains(name.as_str())
+        })
+        .map(|(_, name)| name.clone())
+        .collect()
+}
+
+/// Free-function counterpart of [`missing_required_fields`]. Names
+/// the required parameters (positional-without-default plus
+/// kw-only-without-default) that weren't filled by the call.
+///
+/// Returns names in declaration order — positional params first,
+/// then kw-only — so the diagnostic message reads in the same order
+/// the user sees in the signature.
+fn missing_required_params(
+    info: &ArityInfo,
+    pos_args: &[Expr],
+    kw_args: &[ruff_python_ast::Keyword],
+) -> Vec<String> {
+    let has_starred_pos = pos_args.iter().any(|e| matches!(e, Expr::Starred(_)));
+    let has_double_star = kw_args.iter().any(|k| k.arg.is_none());
+    // A `*iter` positional or `**dict` keyword unpack expands to an
+    // unknown number of arguments; we can't reason about specific
+    // missing names so don't emit a misleading list. The caller falls
+    // through to `wrong_args` in that case.
+    if has_starred_pos || has_double_star {
+        return Vec::new();
+    }
+    let supplied_kwargs: std::collections::HashSet<&str> = kw_args
+        .iter()
+        .filter_map(|k| k.arg.as_ref().map(|i| i.as_str()))
+        .collect();
+    let use_per_param = info.required_positional.len() == info.param_names.len()
+        && !info.required_positional.is_empty();
+    let mut missing: Vec<String> = Vec::new();
+    for (i, name) in info.param_names.iter().enumerate() {
+        let required = if use_per_param {
+            info.required_positional[i]
+        } else {
+            i < info.min_positional
+        };
+        if !required {
+            continue;
+        }
+        if i < pos_args.len() {
+            continue;
+        }
+        if supplied_kwargs.contains(name.as_str()) {
+            continue;
+        }
+        missing.push(name.clone());
+    }
+    for name in &info.kwonly_required {
+        if !supplied_kwargs.contains(name.as_str()) {
+            missing.push(name.clone());
+        }
+    }
+    missing
+}
+
 fn class_constructor_arity(shape: &InterfaceShape) -> ArityInfo {
     let max_positional = shape.field_order.len();
     let required_positional: Vec<bool> = shape
@@ -5850,7 +5964,22 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         }
                         ArityCheck::Other => {
                             let name = fn_name.clone().unwrap_or_else(|| "<call>".to_owned());
-                            c.wrong_args(&name, params.len(), pos_args.len(), call_span);
+                            // Prefer naming the missing parameter(s) when
+                            // we can — the "expected N, got M" wording buries
+                            // the actionable detail whenever the caller
+                            // supplied some args by keyword but missed
+                            // others. Falls back to `wrong_args` when no
+                            // rich `ArityInfo` is available (callable
+                            // values, method calls without a known sig).
+                            let missing: Vec<String> = arity_info
+                                .as_ref()
+                                .map(|info| missing_required_params(info, pos_args, kw_args))
+                                .unwrap_or_default();
+                            if !missing.is_empty() {
+                                c.missing_argument(&name, missing, call_span);
+                            } else {
+                                c.wrong_args(&name, params.len(), pos_args.len(), call_span);
+                            }
                         }
                     }
                     // Argument type checks (per-pair, ignoring excess).
@@ -6118,9 +6247,31 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                                     // unknown-kwarg loop above.
                                 }
                                 ArityCheck::Other => {
-                                    let supplied = pos_args.len()
-                                        + kw_args.iter().filter(|k| k.arg.is_some()).count();
-                                    c.wrong_args(&name, info.min_positional, supplied, call_span);
+                                    // Prefer the named-missing diagnostic
+                                    // (`missing required argument: `client``)
+                                    // when we can pinpoint which required
+                                    // field(s) weren't filled — the call
+                                    // already supplied some kwargs, so
+                                    // "expected 1, got 4" buries the lede.
+                                    // Falls back to `wrong_args` when the
+                                    // arity violation isn't reducible to a
+                                    // missing-name list (too many positionals,
+                                    // positional/kwarg conflict on the same
+                                    // parameter, etc.).
+                                    let missing =
+                                        missing_required_fields(&shape, pos_args, kw_args);
+                                    if !missing.is_empty() {
+                                        c.missing_argument(&name, missing, call_span);
+                                    } else {
+                                        let supplied = pos_args.len()
+                                            + kw_args.iter().filter(|k| k.arg.is_some()).count();
+                                        c.wrong_args(
+                                            &name,
+                                            info.min_positional,
+                                            supplied,
+                                            call_span,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -7204,7 +7355,16 @@ let r: int = add(1)
         let d = check(src);
         assert!(d.has_errors());
         let msg = format!("{}", d.errors()[0]);
-        assert!(msg.contains("wrong number of arguments"), "got {}", msg);
+        // 0.2.2: when we can pin down which parameter wasn't filled
+        // (here `b`), the more actionable `missing_argument` diagnostic
+        // fires in place of the count-based form. Either wording is
+        // accepted to keep the test future-proof against further
+        // diagnostic refinements.
+        assert!(
+            msg.contains("missing required argument") || msg.contains("wrong number of arguments"),
+            "got {}",
+            msg
+        );
     }
 
     // ── constructor-arity checks ───────────────────────────────────────
@@ -7228,8 +7388,13 @@ let c: ApiClient = ApiClient(base_url=\"https://api.example.com\")
         let d = check(src);
         assert!(d.has_errors(), "missing required field must error");
         let msg = format!("{}", d.errors()[0]);
+        // 0.2.2: when the call already supplied `base_url`, the
+        // dedicated `missing_argument` diagnostic names the missing
+        // `api_key` instead of the count-based form.
         assert!(
-            msg.contains("ApiClient") && msg.contains("wrong number of arguments"),
+            msg.contains("ApiClient")
+                && msg.contains("missing required argument")
+                && msg.contains("api_key"),
             "got: {msg}"
         );
     }
@@ -7365,8 +7530,11 @@ let g: str = u.greet()
             "method call missing required arg must error"
         );
         let msg = format!("{}", d.errors()[0]);
+        // 0.2.2: named-missing wording.
         assert!(
-            msg.contains("greet") && msg.contains("wrong number of arguments"),
+            msg.contains("greet")
+                && msg.contains("missing required argument")
+                && msg.contains("prefix"),
             "got: {msg}"
         );
     }

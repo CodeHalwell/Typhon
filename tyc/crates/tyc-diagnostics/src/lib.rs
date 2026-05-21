@@ -396,6 +396,38 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A function or constructor was called without filling a required
+    /// parameter — the caller can name *which* argument is missing,
+    /// unlike [`WrongArgCount`] which only reports counts. Surfaces
+    /// the field name in the error message so the fix is immediate
+    /// ("add `client=...`" rather than "expected 1, got 4 — but the
+    /// 4 you gave are all fine, you just missed the one required
+    /// one").
+    #[error("missing required argument{plural} to `{name}`: {missing_list}")]
+    #[diagnostic(
+        code(tyc::missing_argument),
+        url("https://typhon.dev/lang/diagnostics/missing_argument"),
+        help("supply {missing_list} when calling `{name}`")
+    )]
+    MissingArgument {
+        name: String,
+        /// Names of the required parameters that weren't supplied,
+        /// in declaration order. Always non-empty when this variant
+        /// fires.
+        missing: Vec<String>,
+        /// Pre-rendered comma-separated list (with backticks) for
+        /// inclusion in `#[error]` / `#[help]`. Built once at
+        /// construction so the `Display` impl stays straightforward.
+        missing_list: String,
+        /// `""` for one missing name, `"s"` for many — drops the
+        /// plural conditional out of the format string.
+        plural: &'static str,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("missing here")]
+        span: SourceSpan,
+    },
+
     /// Something that is not callable was called.
     #[error("`{typ}` is not callable")]
     #[diagnostic(
@@ -1264,6 +1296,33 @@ impl TycError {
             name: name.into(),
             expected,
             actual,
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::MissingArgument`] diagnostic. `missing`
+    /// must be non-empty — callers that can't identify a specific
+    /// missing name should use [`TycError::wrong_arg_count`] instead.
+    pub fn missing_argument(
+        name: impl Into<String>,
+        missing: Vec<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        let plural = if missing.len() == 1 { "" } else { "s" };
+        let missing_list = missing
+            .iter()
+            .map(|n| format!("`{n}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Self::MissingArgument {
+            name: name.into(),
+            missing,
+            missing_list,
+            plural,
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

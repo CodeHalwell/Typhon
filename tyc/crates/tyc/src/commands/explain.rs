@@ -86,6 +86,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         "missing_annotation" => {
             include_str!("../../../../../docs/diagnostics/missing_annotation.md")
         }
+        "missing_argument" => {
+            include_str!("../../../../../docs/diagnostics/missing_argument.md")
+        }
         "missing_await" => include_str!("../../../../../docs/diagnostics/missing_await.md"),
         "missing_binding_kind" => {
             include_str!("../../../../../docs/diagnostics/missing_binding_kind.md")

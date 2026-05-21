@@ -4,6 +4,39 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.2.3
+
+UX polish on the arity diagnostic landed in 0.2.2, plus library
+docstring previews in the LSP. Two adjacent fixes:
+
+### Added
+
+- **`tyc::missing_argument` diagnostic.** When the checker can
+  pinpoint *which* parameter wasn't supplied (constructor or
+  free function), the new code fires instead of the count-based
+  `tyc::arg_count` — so `Agent(name=..., tools=...)` now reads
+  `missing required argument to 'Agent': 'client'` and a one-line
+  `help: supply 'client' when calling 'Agent'`, instead of the
+  misleading "expected 1, got 4". Multiple missing names render as
+  ``` `a`, `b` ``` with the plural form. `tyc::arg_count` still
+  fires for shape mismatches that can't be reduced to a missing-name
+  list (too many positionals, positional+kwarg conflict).
+- **LSP hover docs for third-party imports.** Hovering an imported
+  class or function in VS Code (or any LSP-aware editor) now shows
+  the source module, the recovered signature, and the first line of
+  the runtime docstring — pulled from the same venv-introspection
+  cache that already powers completion. Project / stdlib symbols
+  fall through to the existing kind-only hover.
+
+### Tests
+
+- The three `tyc-db` cross-module tests and the four `tyc-types`
+  arity tests that asserted on "wrong number of arguments" now
+  match the new wording (and assert on the specific missing name).
+- One `tyc-types` arity test on `def add(a, b)` accepts either
+  wording to stay forward-compatible with future diagnostic
+  refinements.
+
 ## 0.2.2
 
 Third-party signature recovery via venv introspection. The flagship
