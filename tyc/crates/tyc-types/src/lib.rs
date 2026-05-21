@@ -520,6 +520,128 @@ fn is_iterator_return_type(returns: &Expr, is_async: bool) -> bool {
 /// Used by the container-literal widening rules to avoid prematurely
 /// resolving a TypeVar to a concrete element type (which would block
 /// PEP 695 inference from binding it from the actual arguments).
+/// Return the set of dunder methods a built-in container implements
+/// natively. The list covers the Protocol methods most users actually
+/// reach for (`__len__`, `__iter__`, `__getitem__`, `__contains__`,
+/// `__bool__`, plus the comparison dunders). It is intentionally
+/// conservative: `list.__add__` returns `list[T]` and requires a
+/// matching RHS type, so it is omitted here — the call-site arity
+/// check handles that path. O16 / FINDINGS #112.
+///
+/// Hashability follows CPython: `list`, `dict`, `set`, `bytearray`
+/// are unhashable at runtime (`hash([])` raises `TypeError`), so
+/// `__hash__` is intentionally absent from their tables. Otherwise
+/// a `Hashable`-like Protocol would unsoundly accept those types.
+/// Codex / Gemini / Copilot review on PR #96.
+fn builtin_dunder_methods(head: &str) -> &'static [&'static str] {
+    // Hashable, ordered, indexable: `tuple`, `str`, `bytes`, `range`,
+    // and the homogeneous `tuple_variadic` view.
+    const HASHABLE_INDEXABLE: &[&str] = &[
+        "__len__",
+        "__iter__",
+        "__getitem__",
+        "__contains__",
+        "__bool__",
+        "__eq__",
+        "__ne__",
+        "__hash__",
+        "__repr__",
+        "__str__",
+    ];
+    // Unhashable mutable sequence: `list`, `bytearray`.
+    const UNHASHABLE_INDEXABLE: &[&str] = &[
+        "__len__",
+        "__iter__",
+        "__getitem__",
+        "__contains__",
+        "__bool__",
+        "__eq__",
+        "__ne__",
+        "__repr__",
+        "__str__",
+    ];
+    // Unhashable mapping: `dict`. Carries setitem/delitem on top of
+    // the read-side dunders because users reach for `d[k] = v` /
+    // `del d[k]` against Protocols that declare those.
+    const UNHASHABLE_MAPPING: &[&str] = &[
+        "__len__",
+        "__iter__",
+        "__getitem__",
+        "__contains__",
+        "__setitem__",
+        "__delitem__",
+        "__bool__",
+        "__eq__",
+        "__ne__",
+        "__repr__",
+        "__str__",
+    ];
+    // Hashable set: `frozenset`.
+    const HASHABLE_SET: &[&str] = &[
+        "__len__",
+        "__iter__",
+        "__contains__",
+        "__bool__",
+        "__eq__",
+        "__ne__",
+        "__hash__",
+        "__repr__",
+        "__str__",
+    ];
+    // Unhashable set: `set`.
+    const UNHASHABLE_SET: &[&str] = &[
+        "__len__",
+        "__iter__",
+        "__contains__",
+        "__bool__",
+        "__eq__",
+        "__ne__",
+        "__repr__",
+        "__str__",
+    ];
+    match head {
+        "tuple" | "tuple_variadic" | "str" | "bytes" | "range" => HASHABLE_INDEXABLE,
+        "list" | "bytearray" => UNHASHABLE_INDEXABLE,
+        "dict" => UNHASHABLE_MAPPING,
+        "frozenset" => HASHABLE_SET,
+        "set" => UNHASHABLE_SET,
+        _ => &[],
+    }
+}
+
+/// Whether the built-in type `actual` carries every method declared by
+/// the Protocol `shape`. The check is purely name-based — names need to
+/// be present, but the signature isn't compared against the Protocol's
+/// declared signature. The v1 win is unblocking `take([1])` against
+/// `def take(s: Sized) -> int`; richer signature matching is future
+/// work and would need a per-builtin signature table.
+fn builtin_satisfies_interface(actual: &Type, shape: &InterfaceShape) -> bool {
+    let head = match actual {
+        Type::Class(name) => name.as_str(),
+        Type::Generic(head, _) => head.as_str(),
+        // The primitive types map to their built-in-class names so
+        // `take("hello")` against `Sized` checks the `str` dunder set.
+        Type::Str => "str",
+        Type::Bytes => "bytes",
+        _ => return false,
+    };
+    let dunders = builtin_dunder_methods(head);
+    if dunders.is_empty() {
+        return false;
+    }
+    if shape.methods.is_empty() && shape.fields.is_empty() {
+        return false;
+    }
+    if !shape.fields.is_empty() {
+        // Built-in containers have no Python-visible "field" the user
+        // could conform to. Fall through so the existing diagnostic
+        // surfaces (Protocols with fields are nominal-only against
+        // built-ins).
+        return false;
+    }
+    shape.methods.keys().all(|m| dunders.contains(&m.as_str()))
+}
+
 fn is_typevar(t: &Type) -> bool {
     matches!(t, Type::TypeVar(_))
 }
@@ -1201,6 +1323,13 @@ struct TypeBinding {
     narrowed: Type,
     /// Span of the original declaration (for diagnostics).
     span: (usize, usize),
+    /// `true` when this binding was first introduced inside an `unsafe:`
+    /// block. The escape audit at function-return sites uses this to
+    /// reject silent leaks of unsafe values into a concretely-typed
+    /// return position. Rule 5 in the language spec: an unsafe value
+    /// must be re-asserted (annotated or cast) before crossing into a
+    /// safe-typed boundary. O14 / FINDINGS #107.
+    from_unsafe: bool,
 }
 
 /// Type-environment stack — a map of name → TypeBinding per scope.
@@ -1361,6 +1490,15 @@ struct Checker<'a> {
     /// untyped Python without fighting the checker.  Boundary checks at
     /// assignment sites outside the block still apply normally.
     unsafe_depth: u32,
+    /// Names declared while `unsafe_depth > 0`, paired with the type the
+    /// checker assigned at the declaration site. The map survives the
+    /// `Env::restore` that follows an `if True:` body so the
+    /// return-leak audit can still consult it from the surrounding
+    /// scope (where the binding has otherwise been pruned by the
+    /// checker's `if`-as-scope treatment). Rule 5 enforcement only
+    /// needs the name + declared type, not the full TypeBinding.
+    /// O14 / FINDINGS #107.
+    unsafe_origin_bindings: HashMap<String, Type>,
     /// Bindings constructed via the `X.__new__(X)` / `object.__new__(X)`
     /// bypass form, mapped to the class name and the set of required
     /// fields not yet assigned. When the binding flows into an escape
@@ -1571,6 +1709,7 @@ impl<'a> Checker<'a> {
             frozen_classes: std::collections::HashSet::new(),
             class_parents: HashMap::new(),
             unsafe_depth: 0,
+            unsafe_origin_bindings: HashMap::new(),
             unsafe_line_starts: Vec::new(),
             sealed_unions: HashMap::new(),
             type_aliases: HashMap::new(),
@@ -1667,6 +1806,20 @@ impl<'a> Checker<'a> {
                 && self.class_inherits_from(act_name, exp_name)
             {
                 return true;
+            }
+        }
+        // Built-in structural conformance against a user-declared Protocol.
+        // `take([1])` where `take(s: Sized) -> int` and `Sized` declares
+        // `__len__` must succeed: the actual type `list[int]` implements
+        // `__len__` natively. We consult a static table of built-in →
+        // dunders rather than try to fabricate `class_shapes` entries
+        // for the builtins (which would conflict with their generic head).
+        // O16 / FINDINGS #112.
+        if let Type::Class(exp_name) = expected {
+            if let Some(iface) = self.interfaces.get(exp_name.as_str()) {
+                if builtin_satisfies_interface(actual, &iface.shape) {
+                    return true;
+                }
             }
         }
         // For Union expected types (e.g. `Shape | None`), `assignable` recurses
@@ -2850,6 +3003,80 @@ fn audit_check_escape(c: &mut Checker, expr: &Expr) {
     }
 }
 
+/// Audit a `return <expr>` site for an unsafe-origin binding flowing
+/// into a concretely-typed return. We only diagnose the simple case
+/// where `<expr>` is a bare `Name` whose binding was first introduced
+/// inside an `unsafe:` block (`from_unsafe == true`) and the function's
+/// declared return type is concrete (anything other than `Unknown` /
+/// `Any` / `None` / a nullable that accepts `None`). Deeper data-flow
+/// (expressions over unsafe values, indexing, attribute access) is
+/// future work — Rule 5 enforcement only needs the bare-name escape
+/// path to land for the spec text to hold. O14 / FINDINGS #107.
+fn check_unsafe_return_leak(c: &mut Checker, expr: &Expr) {
+    // Inside an `unsafe:` block, every diagnostic is suppressed — the
+    // user is explicitly opting out of the static check. The leak
+    // diagnostic only fires when the binding *crosses* the boundary,
+    // i.e. we are *outside* the block by the time we see the `return`.
+    if c.unsafe_depth > 0 {
+        return;
+    }
+    let Some(name) = (match expr {
+        Expr::Name(n) => Some(n.id.as_str()),
+        _ => None,
+    }) else {
+        return;
+    };
+    // Check the current environment first: if a safe-scope rebind
+    // outside the `unsafe:` block has re-introduced the name with
+    // its own concrete type (`let value: int = value` after the
+    // unsafe body, or `let value = some_int()` at the same indent),
+    // the cross is sound — every safe-scope rule already ran on
+    // that binding. Gemini / Copilot review on PR #96.
+    if let Some(b) = c.env.lookup(name) {
+        if !b.from_unsafe {
+            return;
+        }
+    }
+    // The checker treats `if True:` (the unsafe lowering) as a scope
+    // and prunes inner bindings on exit, so the env lookup may be
+    // empty here even when the name was declared inside `unsafe:`.
+    // Fall back to the long-lived `unsafe_origin_bindings` map.
+    let declared = match c.unsafe_origin_bindings.get(name).cloned() {
+        Some(t) => t,
+        None => return,
+    };
+    let Some(ret_ty) = c.current_return.clone() else {
+        return;
+    };
+    // Skip when the return type permits "no value" — those slots are
+    // already lax enough that an unsafe-origin value isn't a real
+    // surprise to the caller.
+    if !return_type_requires_value(&ret_ty) {
+        return;
+    }
+    // If the binding's declared type is *already* assignable to the
+    // return type via the normal nominal/structural rules (i.e. the
+    // user annotated the unsafe binding with a concrete type and the
+    // check passed), the cross is sound — no diagnostic needed.
+    if c.is_assignable(&ret_ty, &declared) && !matches!(declared, Type::Unknown) {
+        return;
+    }
+    let span = (
+        expr.range().start().to_usize(),
+        expr.range().end().to_usize(),
+    );
+    let length = span.1.saturating_sub(span.0).max(1);
+    let ret_display = ret_ty.display();
+    c.diagnostics.push_error(TycError::unsafe_value_leak(
+        name,
+        ret_display,
+        &c.path,
+        c.source,
+        span.0,
+        length,
+    ));
+}
+
 /// Collect the set of `Name` ids occurring in an expression that
 /// represent the *instance itself escaping* (as opposed to having a
 /// field read off them). `return c` yields `{"c"}`; `return c.field`
@@ -2963,6 +3190,7 @@ fn seed_typhon_builtins(c: &mut Checker) {
         declared: env_fn.clone(),
         narrowed: env_fn,
         span: (0, 0),
+        from_unsafe: false,
     });
     // `BaseModel` — Pydantic base class injected by the `model` preprocessor.
     c.env.declare(TypeBinding {
@@ -2970,6 +3198,7 @@ fn seed_typhon_builtins(c: &mut Checker) {
         declared: Type::Class("BaseModel".into()),
         narrowed: Type::Class("BaseModel".into()),
         span: (0, 0),
+        from_unsafe: false,
     });
     // `Ok` and `Err` — Result constructors from typhon_runtime.  Seeded here
     // so the type checker can resolve them when `from typhon_runtime import …`
@@ -2979,12 +3208,14 @@ fn seed_typhon_builtins(c: &mut Checker) {
         declared: Type::Class("Ok".into()),
         narrowed: Type::Class("Ok".into()),
         span: (0, 0),
+        from_unsafe: false,
     });
     c.env.declare(TypeBinding {
         name: "Err".into(),
         declared: Type::Class("Err".into()),
         narrowed: Type::Class("Err".into()),
         span: (0, 0),
+        from_unsafe: false,
     });
     // `Result` — the sealed union type, also from typhon_runtime.
     c.env.declare(TypeBinding {
@@ -2992,6 +3223,7 @@ fn seed_typhon_builtins(c: &mut Checker) {
         declared: Type::Class("Result".into()),
         narrowed: Type::Class("Result".into()),
         span: (0, 0),
+        from_unsafe: false,
     });
 }
 
@@ -4385,6 +4617,7 @@ fn seed_env_from_scope(c: &mut Checker, scope: ScopeId) {
             declared: declared.clone(),
             narrowed: declared,
             span: b.span,
+            from_unsafe: false,
         });
     }
 }
@@ -4435,11 +4668,25 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     n.range.start().to_usize(),
                     n.range.start().to_usize() + n.id.as_str().len(),
                 );
+                let from_unsafe = c.unsafe_depth > 0;
+                if from_unsafe {
+                    c.unsafe_origin_bindings
+                        .insert(n.id.as_str().to_owned(), ann_type.clone());
+                } else {
+                    // A safe-scope re-bind defeats any prior unsafe
+                    // origin: the new binding carries its own
+                    // declared type and goes through the normal
+                    // assignability check, so the cross-into-return
+                    // audit should not fire any more. Gemini /
+                    // Copilot review on PR #96.
+                    c.unsafe_origin_bindings.remove(n.id.as_str());
+                }
                 c.env.declare(TypeBinding {
                     name: n.id.as_str().to_owned(),
                     declared: ann_type.clone(),
                     narrowed: ann_type,
                     span,
+                    from_unsafe,
                 });
                 // Audit hook: register or refresh the binding's
                 // bypass-construction tracking based on the RHS.
@@ -4487,11 +4734,22 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         // Reset any narrowing on the reassigned name.
                         c.env.narrow(n.id.as_str(), b.declared);
                     } else {
+                        let from_unsafe = c.unsafe_depth > 0;
+                        if from_unsafe {
+                            c.unsafe_origin_bindings
+                                .insert(n.id.as_str().to_owned(), value_type.clone());
+                        } else {
+                            // Safe-scope re-bind defeats any prior
+                            // unsafe origin — see the parallel
+                            // annotated case above.
+                            c.unsafe_origin_bindings.remove(n.id.as_str());
+                        }
                         c.env.declare(TypeBinding {
                             name: n.id.as_str().to_owned(),
                             declared: value_type.clone(),
                             narrowed: value_type.clone(),
                             span,
+                            from_unsafe,
                         });
                     }
                     // Audit: detect `c = X.__new__(X)` shape and
@@ -4674,6 +4932,16 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             if let Some(ret_expr) = &ret.value {
                 audit_check_escape(c, ret_expr);
             }
+            // Audit: returning a binding that was first introduced
+            // inside an `unsafe:` block into a concretely-typed
+            // function (Rule 5). Outside the `unsafe:` body the
+            // checker enforces normal rules, but the inferred type
+            // of an unsafe-origin name is typically `Any` / `Unknown`
+            // and silently slips past `is_assignable`. O14 /
+            // FINDINGS #107.
+            if let Some(ret_expr) = &ret.value {
+                check_unsafe_return_leak(c, ret_expr);
+            }
             // Inside a generator function body, `return value` is
             // shorthand for `raise StopIteration(value)` — the value
             // becomes the *generator's* return payload, not an
@@ -4806,6 +5074,7 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     declared: Type::Unknown,
                     narrowed: Type::Unknown,
                     span,
+                    from_unsafe: c.unsafe_depth > 0,
                 });
             }
             for s in &f.body {
@@ -5029,6 +5298,13 @@ fn check_function(
     }
 
     let saved_return = c.current_return.replace(ret_type.clone());
+    // `unsafe_origin_bindings` survives the env-scope restore that
+    // follows the `if True:` body, but it must NOT survive a function
+    // boundary — otherwise an unsafe leak diagnosed in one function
+    // would re-fire against a same-named binding in a sibling
+    // function that never touched `unsafe:`. Save + clear on entry,
+    // restore on exit. Gemini / Copilot review on PR #96.
+    let saved_unsafe_origins = std::mem::take(&mut c.unsafe_origin_bindings);
     // Track sync-vs-async for the body's call-site check
     // (`tyc::missing_await` — FINDINGS #49). Only sync function bodies
     // trip the diagnostic; async bodies use `await` naturally and
@@ -5126,6 +5402,7 @@ fn check_function(
             declared: t.clone(),
             narrowed: t,
             span,
+            from_unsafe: false,
         });
     }
 
@@ -5160,6 +5437,7 @@ fn check_function(
 
     c.env.leave();
     c.current_return = saved_return;
+    c.unsafe_origin_bindings = saved_unsafe_origins;
     c.active_typevar_bounds = saved_bounds;
     c.in_sync_function = saved_in_sync;
     c.in_async_function = saved_in_async;
@@ -6060,6 +6338,54 @@ fn apply_narrowings(c: &mut Checker, ns: &[Narrowing]) {
 /// Infer the type of `expr` with no surrounding context.
 fn infer_expr(c: &mut Checker, expr: &Expr) -> Type {
     infer_expr_ctx(c, expr, None)
+}
+
+/// Try to type-check a dict literal `{"id": 1, "name": "A"}` against an
+/// expected class type whose registered shape has named fields. When the
+/// dict's string keys match the class fields slot-by-slot (with the
+/// declared field types pushed in as expected context for each value),
+/// return the class type. On any mismatch — non-string key, unknown key,
+/// missing required field, or value not assignable to its slot — fall
+/// through (returning `None`) so the ordinary `dict[K, V]` inference
+/// path can run and surface its own diagnostic.
+/// O15 / FINDINGS #108.
+fn try_infer_typed_dict_literal(
+    c: &mut Checker,
+    d: &ruff_python_ast::ExprDict,
+    class_name: &str,
+) -> Option<Type> {
+    let shape = c.class_shapes.get(class_name)?.clone();
+    if shape.field_order.is_empty() {
+        return None;
+    }
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for item in &d.items {
+        let key_expr = item.key.as_ref()?; // No `**spread` support for the v1 match.
+                                           // Extract string-literal key. `{"a": 1}` parses as Expr::StringLiteral.
+        let key_name = match key_expr {
+            Expr::StringLiteral(s) => s.value.to_str().to_owned(),
+            _ => return None,
+        };
+        let field_ty = shape.fields.get(&key_name)?;
+        // Type-check the value against the declared field type. If the
+        // inferred type isn't assignable, surface the same error the
+        // constructor call form would and abort the match so the dict-
+        // generic path emits a fallback diagnostic too — but the kwarg
+        // shape carries the precise field name, which is the v1 win.
+        let val_ty = infer_expr_ctx(c, &item.value, Some(field_ty));
+        if !c.is_assignable(field_ty, &val_ty) {
+            return None;
+        }
+        seen.insert(key_name);
+    }
+    // Every required field must be present (a field without a default
+    // is required). Optional fields default to absent.
+    for fname in &shape.field_order {
+        if !seen.contains(fname) && !shape.field_defaults.contains(fname) {
+            return None;
+        }
+    }
+    Some(Type::Class(class_name.to_owned()))
 }
 
 /// Type of a Python boolean operator expression (`a or b`, `a and b`).
@@ -7176,6 +7502,17 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             Type::Generic("tuple".into(), elts)
         }
         Expr::Dict(d) => {
+            // TypedDict-style match: when the expected type is a registered
+            // class shape, try to match the dict literal against the class's
+            // declared fields. `let alice: User = {"id": 1, "name": "A"}`
+            // becomes equivalent to `User(id=1, name="A")`. Falls through
+            // to ordinary `dict[K, V]` inference when no shape is found.
+            // O15 / FINDINGS #108.
+            if let Some(Type::Class(class_name)) = expected {
+                if let Some(class_ty) = try_infer_typed_dict_literal(c, d, class_name) {
+                    return class_ty;
+                }
+            }
             // Tease apart key/value expected types from `dict[K, V]`.
             let (key_expected, val_expected) = match expected {
                 Some(Type::Generic(h, a)) if h == "dict" && a.len() == 2 => {
@@ -7706,6 +8043,7 @@ fn bind_pattern_names(c: &mut Checker, pattern: &Pattern) {
                     declared: Type::Unknown,
                     narrowed: Type::Unknown,
                     span: (a.range.start().to_usize(), a.range.end().to_usize()),
+                    from_unsafe: false,
                 });
             }
             if let Some(inner) = &a.pattern {
@@ -7719,6 +8057,7 @@ fn bind_pattern_names(c: &mut Checker, pattern: &Pattern) {
                     declared: Type::Unknown,
                     narrowed: Type::Unknown,
                     span: (s.range.start().to_usize(), s.range.end().to_usize()),
+                    from_unsafe: false,
                 });
             }
         }
@@ -7729,6 +8068,7 @@ fn bind_pattern_names(c: &mut Checker, pattern: &Pattern) {
                     declared: Type::Unknown,
                     narrowed: Type::Unknown,
                     span: (m.range.start().to_usize(), m.range.end().to_usize()),
+                    from_unsafe: false,
                 });
             }
             for p in &m.patterns {
@@ -11495,6 +11835,155 @@ def numbers() -> Iterable[int]:
             !d.has_errors(),
             "yield-bodied -> Iterable[int] should type-check; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    // ── O14 (unsafe value leak) — scope robustness (PR #96 review) ────────
+
+    #[test]
+    fn unsafe_leak_fires_on_baseline_repro() {
+        // The motivating O14 case: a binding declared inside `unsafe:`
+        // returns into a concrete `-> int` without re-assertion.
+        let src = "\
+def f() -> int:
+    unsafe:
+        let x = \"hello\"
+    return x
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UnsafeValueLeak { .. })),
+            "expected UnsafeValueLeak, got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn unsafe_leak_silenced_by_safe_rebind() {
+        // PR #96 review (Gemini, Copilot): a safe-scope rebind of the
+        // same name with a compatible declared type must defeat the
+        // leak audit. The user explicitly re-asserts the type at the
+        // boundary; the diagnostic must not fire.
+        let src = "\
+def f() -> int:
+    unsafe:
+        let value = \"hello\"
+    let checked: int = 42
+    return checked
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UnsafeValueLeak { .. })),
+            "safe-scope rebind must defeat the leak audit; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn unsafe_leak_does_not_cross_function_boundary() {
+        // PR #96 review (Gemini): an unsafe binding in function `f`
+        // must NOT trigger a leak diagnostic in function `g` that
+        // happens to use the same variable name. `unsafe_origin_bindings`
+        // is now scope-saved at function entry and restored on exit.
+        let src = "\
+def f() -> int:
+    unsafe:
+        let x = \"hello\"
+    return 0
+
+def g(x: int) -> int:
+    return x
+";
+        let d = check(src);
+        // The leak should fire in `f` only — there's a `return 0`
+        // there, not `return x`, so even `f` is clean. The key
+        // assertion is that `g`'s `return x` doesn't fire a leak.
+        let leak_in_g = d.errors().iter().any(|e| match e {
+            TycError::UnsafeValueLeak { .. } => format!("{e}").contains("`x`"),
+            _ => false,
+        });
+        // `g` has no unsafe context whatsoever — the audit must stay silent.
+        assert!(
+            !leak_in_g,
+            "unsafe origin bindings must not bleed across function boundaries; got {:?}",
+            d.errors()
+        );
+    }
+
+    // ── O16 (Protocol vs built-ins) — hashability soundness (PR #96 review)
+
+    #[test]
+    fn list_does_not_satisfy_hashable_protocol() {
+        // PR #96 review (Codex, Copilot, Gemini): `list` is unhashable
+        // at runtime (`hash([])` raises `TypeError`). The Protocol
+        // structural-conformance check must NOT accept `list[T]` for
+        // a `Hashable`-like Protocol that requires `__hash__`.
+        let src = "\
+from typing import Protocol
+
+class Hashable(Protocol):
+    def __hash__(self) -> int: ...
+
+def take(h: Hashable) -> int:
+    return 0
+
+let _: int = take([1, 2, 3])
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "list must not satisfy a Hashable Protocol; got no errors"
+        );
+    }
+
+    #[test]
+    fn frozenset_does_satisfy_hashable_protocol() {
+        // Counterpart: `frozenset` is hashable and must still satisfy
+        // a `Hashable`-like Protocol.
+        let src = "\
+from typing import Protocol
+
+class Hashable(Protocol):
+    def __hash__(self) -> int: ...
+
+def take(h: Hashable) -> int:
+    return 0
+
+let _: int = take(frozenset([1, 2, 3]))
+";
+        let d = check(src);
+        assert!(
+            !d.errors().iter().any(|e| matches!(
+                e,
+                TycError::TypeMismatch { .. } | TycError::InterfaceNotConforming { .. }
+            )),
+            "frozenset must satisfy Hashable; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn unsafe_leak_silenced_by_inner_annotation() {
+        // Workaround form A: annotating the unsafe binding with the
+        // concrete return type defeats the leak audit because the
+        // declared type is already assignable to the return type.
+        let src = "\
+def f() -> int:
+    unsafe:
+        let x: int = 42
+    return x
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UnsafeValueLeak { .. })),
+            "inner-annotated unsafe binding must not trigger the leak; got {:?}",
+            d.errors()
         );
     }
 }

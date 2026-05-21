@@ -332,9 +332,21 @@ fn materialise_pyproject(project_root: &Path, config: &TyphonConfig) -> Result<(
 ///
 /// Every other key is left untouched, including any tables added by
 /// the user under `[project]` itself.
-pub fn bootstrap_python_env(project_root: &Path, config: &TyphonConfig) -> Result<()> {
+/// Merge `pyproject.toml` and (optionally) run `uv sync`. With
+/// `skip_sync = true` we only merge the manifest and leave `.venv`
+/// alone — used by `tyc build --no-sync` / `TYC_NO_SYNC=1` so
+/// iterating on `.ty` files in a tmp project doesn't pay the
+/// per-invocation `uv sync` reprovision cost. The manifest still
+/// updates so the next regular build picks any new dependencies up.
+pub fn bootstrap_python_env_with(
+    project_root: &Path,
+    config: &TyphonConfig,
+    skip_sync: bool,
+) -> Result<()> {
     merge_pyproject(project_root, config)?;
-    run_uv_sync_warning(project_root);
+    if !skip_sync {
+        run_uv_sync_warning(project_root);
+    }
     Ok(())
 }
 
@@ -665,6 +677,30 @@ lint = [\"ruff\"]
         assert!(
             out.contains("lint") && out.contains("ruff"),
             "user's `lint` group must survive; got:\n{out}",
+        );
+    }
+
+    #[test]
+    fn bootstrap_with_skip_sync_still_merges_pyproject() {
+        // `tyc build --no-sync` / `TYC_NO_SYNC=1` must still update
+        // pyproject.toml on disk — only the `uv sync` step is skipped.
+        // This guards against a regression where the flag short-circuits
+        // the merge and the next regular build doesn't see new deps.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = TyphonConfig::default();
+        cfg.project.name = "skip-sync-demo".into();
+        cfg.dependencies.insert("rich".into(), ">=13".into());
+        bootstrap_python_env_with(tmp.path(), &cfg, /* skip_sync */ true)
+            .expect("bootstrap with skip_sync should still merge pyproject");
+        let pyproject =
+            std::fs::read_to_string(tmp.path().join("pyproject.toml")).expect("pyproject written");
+        assert!(
+            pyproject.contains("name = \"skip-sync-demo\""),
+            "manifest should still merge with skip_sync=true; got:\n{pyproject}",
+        );
+        assert!(
+            pyproject.contains("rich>=13"),
+            "dependencies should still merge with skip_sync=true; got:\n{pyproject}",
         );
     }
 

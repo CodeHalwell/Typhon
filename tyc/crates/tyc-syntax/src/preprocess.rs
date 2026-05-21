@@ -2051,21 +2051,36 @@ pub fn validate_question_ops(source: &str) -> Vec<QuestionOpError> {
             }
         }
 
-        // Detect mid-expression `?` — the lowering only handles `expr?` at
-        // statement / RHS end. `Ok(step(x)?)` and `step(x)? + step(x)?` get
-        // through this validator silently today and produce a useless parse
-        // error against the *desugared* Python with span "Got unexpected
-        // token ? …". Emit a targeted diagnostic instead. FINDINGS #66.
+        // Detect mid-expression `?` — `expand_inline_question_ops` now
+        // lifts `Ok(step(x)?)` shapes into temps automatically, so the
+        // syntactic carve-out is no longer needed. Validate the same
+        // scope rules as the end-of-line case (`?` only valid inside a
+        // function returning `Result[T, E]`). O17 / FINDINGS #66.
         for offset in find_mid_expression_questionmarks(code) {
-            errors.push(QuestionOpError {
-                line_index,
-                offset: byte_offset + offset,
-                message: "`?` operator only works as the whole right-hand \
-                         side of an assignment or as a standalone statement \
-                         (Rust-style mid-expression `?` is not yet supported); \
-                         lift the inner call to a `let` binding first"
-                    .to_owned(),
-            });
+            let q_offset = byte_offset + offset;
+            match fn_stack.last() {
+                None => {
+                    errors.push(QuestionOpError {
+                        line_index,
+                        offset: q_offset,
+                        message: "`?` operator used at module level; \
+                                 it is only valid inside a function returning `Result[T, E]`"
+                            .to_owned(),
+                    });
+                }
+                Some((_, Some(ret))) if !is_result_type(ret) => {
+                    errors.push(QuestionOpError {
+                        line_index,
+                        offset: q_offset,
+                        message: format!(
+                            "`?` operator used in a function returning `{ret}`; \
+                             it is only valid in functions returning `Result[T, E]`"
+                        ),
+                    });
+                }
+                // Return type is Result-family (valid) or unknown (skip FP).
+                Some(_) => {}
+            }
         }
         // Detect `)?` — the `?` error-propagation operator.  The same pattern
         // `expand_question_ops` uses: last code char is `?`, char before is `)`.
@@ -2865,6 +2880,319 @@ pub fn expand_question_ops(source: &str) -> String {
     } else {
         result
     }
+}
+
+/// Lift inline `?` propagation operators (`)?` appearing inside a larger
+/// expression on the same line) into temp bindings that
+/// [`expand_question_ops`] can then process as ordinary top-of-statement
+/// `?` operators. Used to support the natural Rust-style form
+/// `Ok(add(parse(s)?, parse(t)?))` — O17 / FINDINGS #66 / R3.13 / E9.
+///
+/// # Example
+///
+/// Input (Typhon):
+/// ```text
+///     return Ok(add(parse(s)?, parse(t)?))
+/// ```
+///
+/// Output (valid Python after this pass; `expand_question_ops` is then a no-op):
+/// ```text
+///     __typhon_qi_0__ = parse(s)
+///     if isinstance(__typhon_qi_0__, __typhon_Err__):
+///         return __typhon_qi_0__
+///     __typhon_qi_1__ = parse(t)
+///     if isinstance(__typhon_qi_1__, __typhon_Err__):
+///         return __typhon_qi_1__
+///     return Ok(add(__typhon_qi_0__.value, __typhon_qi_1__.value))
+/// ```
+///
+/// This pass runs **before** [`expand_question_ops`], which handles the
+/// end-of-line case (`let x = f()?`). After this pass, every remaining
+/// `?` on a line is either at the line-end position or is nullable-type
+/// sugar (`T?` after an identifier or `]`), so the existing logic in
+/// `expand_question_ops` handles it unchanged.
+///
+/// # Limitations
+///
+/// - Only handles callables whose receiver is a bare identifier, a
+///   dotted path (`mod.f`, `obj.attr.f`), or a method chain ending in
+///   `(...)` or `[...]` (`obj.f().g`, `obj[i].g`). Calls with a
+///   parenthesised receiver like `(a + b)()?` are skipped.
+/// - The `?` inside a string literal on the line is preserved verbatim.
+pub fn expand_inline_question_ops(source: &str) -> String {
+    let mut out = String::with_capacity(source.len() + 64);
+    let mut counter = 0usize;
+    let mut in_string: Option<StringMode> = None;
+    let mut needs_err_alias_import = false;
+
+    for line in source.split_inclusive('\n') {
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let pre_string = in_string;
+        let code_end = scan_line_code_end(raw, &mut in_string);
+
+        // Lines that begin inside a triple-quoted string have no
+        // executable code on this row — emit verbatim.
+        if pre_string.is_some() {
+            out.push_str(line);
+            continue;
+        }
+
+        let content = &raw[..code_end];
+        let comment = &raw[code_end..];
+        let nl = if line.ends_with('\n') { "\n" } else { "" };
+
+        match rewrite_inline_question_ops_one_line(content, &mut counter) {
+            Some((rewritten, lifted)) => {
+                for l in lifted {
+                    out.push_str(&l);
+                    out.push('\n');
+                }
+                out.push_str(&rewritten);
+                out.push_str(comment);
+                out.push_str(nl);
+                needs_err_alias_import = true;
+            }
+            None => {
+                out.push_str(line);
+            }
+        }
+    }
+
+    if needs_err_alias_import {
+        prepend_typhon_err_alias_import(out)
+    } else {
+        out
+    }
+}
+
+/// Lift every inline `)?` on a single line. Returns `None` when the line
+/// contains no inline propagation operator (so the caller can emit it
+/// verbatim and avoid the overhead of building a new buffer). When `Some`,
+/// the returned tuple is `(rewritten_line_without_newline, lifted_lines)`.
+fn rewrite_inline_question_ops_one_line(
+    content: &str,
+    counter: &mut usize,
+) -> Option<(String, Vec<String>)> {
+    let indent_len = content
+        .find(|c: char| !c.is_whitespace())
+        .unwrap_or(content.len());
+    let indent = content[..indent_len].to_owned();
+
+    let mut lifted: Vec<String> = Vec::new();
+    let mut current = content.to_owned();
+
+    while let Some(q_pos) = find_first_inline_propagation_q(&current) {
+        let close_paren = q_pos - 1;
+        let open = match find_matching_open_paren(&current, close_paren) {
+            Some(o) => o,
+            None => break,
+        };
+        let call_start = find_callable_start(&current, open);
+        if call_start == open {
+            // The `(` has no callable to its left — this is a
+            // parenthesised expression like `(a + b)?`, not a call.
+            // Skipping keeps the diagnostic crisp instead of emitting
+            // a `(a + b).value` that runs but means the wrong thing.
+            break;
+        }
+        let call_text = current[call_start..q_pos].to_owned();
+
+        // Use a distinct prefix from the end-of-line pass's
+        // `__typhon_q_N__` so the two rewrites can compose without
+        // counter collisions when a single line carries both shapes
+        // (e.g. `let x = Ok(f()?)?`).
+        let tmp = format!("__typhon_qi_{}__", *counter);
+        *counter += 1;
+
+        lifted.push(format!("{indent}{tmp} = {call_text}"));
+        lifted.push(format!("{indent}if isinstance({tmp}, __typhon_Err__):"));
+        lifted.push(format!("{indent}    return {tmp}"));
+
+        let mut new_content = String::with_capacity(current.len() + tmp.len());
+        new_content.push_str(&current[..call_start]);
+        new_content.push_str(&tmp);
+        new_content.push_str(".value");
+        new_content.push_str(&current[q_pos + 1..]);
+        current = new_content;
+    }
+
+    if lifted.is_empty() {
+        return None;
+    }
+    Some((current, lifted))
+}
+
+/// Find the position of the first `?` in `s` that is an inline
+/// propagation operator (`)?` *not* at the end-of-code position).
+/// Skips chars inside string literals. The end-of-code case is owned by
+/// [`expand_question_ops`], so we deliberately skip it here.
+fn find_first_inline_propagation_q(s: &str) -> Option<usize> {
+    let trimmed_end = s.trim_end().len();
+    let bytes = s.as_bytes();
+    // Reuse the central in-string mask so triple-quoted strings (`"""…"""`,
+    // `'''…'''`) inside the line don't accidentally toggle the in-string
+    // state on each individual quote and unmask a `?` that lives inside
+    // the literal. Gemini review on PR #96.
+    let in_str_mask = compute_in_string_mask(s);
+    for i in 0..bytes.len() {
+        if in_str_mask[i] {
+            continue;
+        }
+        if bytes[i] == b'?'
+            && i > 0
+            && bytes[i - 1] == b')'
+            && !in_str_mask[i - 1]
+            && i + 1 < trimmed_end
+        {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Walk backwards from `close_pos` (position of `)`) to find the matching
+/// `(`. Skips parens inside string literals (scanned forwards once to
+/// build a string-range mask).
+fn find_matching_open_paren(s: &str, close_pos: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    // Mark every byte that's inside a string literal so the depth
+    // counter doesn't count parens inside `"f(("`.
+    let in_str_mask = compute_in_string_mask(s);
+    let mut depth: i32 = 0;
+    let mut i = close_pos;
+    loop {
+        if !in_str_mask[i] {
+            match bytes[i] {
+                b')' => depth += 1,
+                b'(' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if i == 0 {
+            return None;
+        }
+        i -= 1;
+    }
+}
+
+/// Walk backwards from `(`'s position (exclusive) to find the start of
+/// the callable expression. Accepts identifier characters, `.` (for
+/// dotted paths), and balanced `(...)` / `[...]` segments (for method
+/// chains like `obj.f().g(x)` or `obj[i].g(x)`). Returns the position
+/// where the callable starts; if no callable precedes the `(`, returns
+/// `open_pos` itself.
+fn find_callable_start(s: &str, open_pos: usize) -> usize {
+    let bytes = s.as_bytes();
+    let in_str_mask = compute_in_string_mask(s);
+    let mut i = open_pos;
+    while i > 0 {
+        let b = bytes[i - 1];
+        if in_str_mask[i - 1] {
+            break;
+        }
+        if b.is_ascii_alphanumeric() || b == b'_' || b == b'.' {
+            i -= 1;
+            continue;
+        }
+        if b == b')' || b == b']' {
+            // Walk back through a balanced bracket pair.
+            let (open_byte, close_byte) = if b == b')' {
+                (b'(', b')')
+            } else {
+                (b'[', b']')
+            };
+            let mut depth: i32 = 1;
+            let mut j = i - 1;
+            while j > 0 && depth > 0 {
+                j -= 1;
+                if in_str_mask[j] {
+                    continue;
+                }
+                let c = bytes[j];
+                if c == close_byte {
+                    depth += 1;
+                } else if c == open_byte {
+                    depth -= 1;
+                }
+            }
+            if depth != 0 {
+                // Unmatched bracket to the left — abort the walk and
+                // return the position immediately after the bracket so
+                // the lift doesn't grab a half-balanced fragment.
+                return i;
+            }
+            i = j;
+            continue;
+        }
+        break;
+    }
+    i
+}
+
+/// Build a parallel byte-mask `mask[i] = true` iff `s.as_bytes()[i]` is
+/// inside a `"..."` / `'...'` string literal. Triple-quoted strings on a
+/// single line are treated as ordinary literals (they're rare on a
+/// single line and the only safety property we need is "don't match
+/// parens inside any string").
+fn compute_in_string_mask(s: &str) -> Vec<bool> {
+    let bytes = s.as_bytes();
+    let mut mask = vec![false; bytes.len()];
+    // `None` outside any string; `Some((quote, triple))` inside one. A
+    // triple-quoted region (`"""` / `'''`) only ends on a matching
+    // triple; bare quotes inside it are ordinary content. Single-line
+    // strings continue to honour `\`-escapes; triple-quoted strings
+    // do too (Python allows `\` continuation inside them).
+    let mut in_str: Option<(u8, bool)> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some((q, triple)) = in_str {
+            mask[i] = true;
+            if b == b'\\' && i + 1 < bytes.len() {
+                mask[i + 1] = true;
+                i += 2;
+                continue;
+            }
+            if b == q {
+                if triple {
+                    if i + 2 < bytes.len() && bytes[i + 1] == q && bytes[i + 2] == q {
+                        mask[i + 1] = true;
+                        mask[i + 2] = true;
+                        in_str = None;
+                        i += 3;
+                        continue;
+                    }
+                } else {
+                    in_str = None;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            // Detect `"""` / `'''` triple openers and consume all three
+            // quotes at once so the in-string state for a triple region
+            // isn't toggled off by the second quote of the opener.
+            // Gemini review on PR #96.
+            if i + 2 < bytes.len() && bytes[i + 1] == b && bytes[i + 2] == b {
+                mask[i] = true;
+                mask[i + 1] = true;
+                mask[i + 2] = true;
+                in_str = Some((b, true));
+                i += 3;
+                continue;
+            }
+            in_str = Some((b, false));
+            mask[i] = true;
+        }
+        i += 1;
+    }
+    mask
 }
 
 /// Prepend `from typhon_runtime import Err as __typhon_Err__` to `source`
@@ -4393,13 +4721,33 @@ fn expand_pipes_line_by_line(source: &str) -> String {
         }
 
         let code = &raw[..code_end];
-        let pipes = find_top_level_pipes(code);
+        // First, expand any `|>` that lives inside a parenthesised
+        // sub-expression — the original line-only pass only looked at
+        // depth-0 pipes, which left shapes like
+        // `(1 |> add(2)) |> add(3)` un-rewritten on the inner pipe
+        // and produced a parser error against the still-Typhon-only
+        // `|>` token. The nested helper recurses into each balanced
+        // `(...)` group so inner pipes are rewritten before the
+        // outer pipe pass sees them. O28 / FINDINGS #117–#119.
+        let nested_expanded = expand_pipes_in_subexpressions(code);
+        let code_for_top: &str = &nested_expanded;
+        let pipes = find_top_level_pipes(code_for_top);
         if pipes.is_empty() {
-            result.push_str(line);
+            // The nested pass may still have rewritten parenthesised
+            // sub-expressions even when no top-level pipe remained.
+            // Stream the rewritten code (plus the original trailing
+            // comment) into the buffer so that progress is preserved.
+            if nested_expanded != code {
+                result.push_str(&nested_expanded);
+                result.push_str(&raw[code_end..]);
+                result.push_str(terminator);
+            } else {
+                result.push_str(line);
+            }
             continue;
         }
 
-        let rewritten = match rewrite_pipe_line(code, &pipes) {
+        let rewritten = match rewrite_pipe_line(code_for_top, &pipes) {
             Some(s) => s,
             None => {
                 // Bail out — pass the line through unchanged so the regular
@@ -4417,6 +4765,103 @@ fn expand_pipes_line_by_line(source: &str) -> String {
     }
 
     result
+}
+
+/// Recursively expand `|>` operators inside balanced `(...)` groups.
+/// Walks `code` left-to-right, treating top-level `(` / `)` pairs as
+/// independent sub-expressions; each pair's body is processed first
+/// (so nested pipes are rewritten innermost-first), then any pipes
+/// still present at the body's top level are rewritten via the same
+/// machinery the line-level pass uses. Triple-quoted and ordinary
+/// string literals are passed through verbatim.
+///
+/// This pass is a no-op when the input contains no `|>` token at all.
+/// O28 / FINDINGS #119.
+fn expand_pipes_in_subexpressions(code: &str) -> String {
+    if !code.contains("|>") {
+        return code.to_owned();
+    }
+    let bytes = code.as_bytes();
+    let mut out = String::with_capacity(code.len());
+    let mut in_str: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            out.push(b as char);
+            if b == b'\\' && i + 1 < bytes.len() {
+                out.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            in_str = Some(b);
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        if b == b'(' {
+            // Find the matching `)`, tracking string state inside.
+            let mut depth: i32 = 1;
+            let mut j = i + 1;
+            let mut local_str: Option<u8> = None;
+            while j < bytes.len() && depth > 0 {
+                let c = bytes[j];
+                if let Some(q) = local_str {
+                    if c == b'\\' && j + 1 < bytes.len() {
+                        j += 2;
+                        continue;
+                    }
+                    if c == q {
+                        local_str = None;
+                    }
+                    j += 1;
+                    continue;
+                }
+                match c {
+                    b'"' | b'\'' => local_str = Some(c),
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            if depth != 0 {
+                // Unmatched paren — give up and emit verbatim. The
+                // downstream parser will produce a coherent diagnostic.
+                out.push('(');
+                i += 1;
+                continue;
+            }
+            let inner_bytes = &bytes[i + 1..j - 1];
+            let inner = std::str::from_utf8(inner_bytes).unwrap_or("");
+            // Recurse: rewrite any deeper-nested parens first, then
+            // run the top-level pass on the result.
+            let processed_inner = {
+                let nested = expand_pipes_in_subexpressions(inner);
+                let pipes = find_top_level_pipes(&nested);
+                if pipes.is_empty() {
+                    nested
+                } else {
+                    rewrite_pipe_line(&nested, &pipes).unwrap_or(nested)
+                }
+            };
+            out.push('(');
+            out.push_str(&processed_inner);
+            out.push(')');
+            i = j;
+            continue;
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    out
 }
 
 /// Fold multi-line pipe segments back onto their preceding line so the
@@ -4779,18 +5224,51 @@ fn apply_pipe_call(acc: &str, rhs: &str) -> Option<String> {
         return None;
     }
 
-    // Find the first `(` at depth 0 in the RHS (or `None` for bare callable).
-    // Uses the shared scanner so triple-quoted strings are handled correctly.
+    // The RHS is either a bare callable (no parens) or a call shape
+    // `<callable>(<args>)`. When parens are present we identify the
+    // call by walking back from the trailing `)` to its matching
+    // `(`, NOT by taking the first `(` — that lets a parenthesised
+    // callable like `(lambda x: x * 2)()` be recognised. The
+    // `<callable>` text before the matching `(` may itself be:
+    //   * a dotted identifier chain (`mod.f.g`),
+    //   * a literal-receiver method head (`", ".join`,
+    //     `(a + b).method`), or
+    //   * a parenthesised expression (`(lambda x: x * 2)`,
+    //     `(f if c else g)`) — i.e. anything starting with `(` and
+    //     balanced.
+    // O28 / FINDINGS #117.
     let bytes = rhs.as_bytes();
     let mut paren_at: Option<usize> = None;
-    scan_inline_code(rhs, |i, depth, in_string| {
-        if in_string.is_none() && depth == 0 && bytes[i] == b'(' {
-            paren_at = Some(i);
-            // Signal "stop scanning" by skipping to end.
-            return Some(bytes.len() - i);
+    if rhs.ends_with(')') {
+        // Walk back from the trailing `)` to find its match. A forward
+        // scan tags every byte as in-string-or-not; the reverse walk
+        // then ignores parens that landed inside a string literal.
+        // Without this mask, an RHS like `f(")")` would corrupt the
+        // depth counter on the embedded `)` and either pick the wrong
+        // matching `(` or fail to find one — leaving `|>` in the
+        // emitted source for the downstream parser to choke on.
+        // Codex / Copilot review on PR #96.
+        let in_str_mask = compute_in_string_mask(rhs);
+        let mut depth: i32 = 0;
+        let mut k = bytes.len();
+        while k > 0 {
+            k -= 1;
+            if in_str_mask[k] {
+                continue;
+            }
+            match bytes[k] {
+                b')' => depth += 1,
+                b'(' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        paren_at = Some(k);
+                        break;
+                    }
+                }
+                _ => {}
+            }
         }
-        None
-    });
+    }
 
     match paren_at {
         None => {
@@ -4803,20 +5281,15 @@ fn apply_pipe_call(acc: &str, rhs: &str) -> Option<String> {
         }
         Some(open) => {
             let func = rhs[..open].trim_end();
-            // Accept either a plain identifier chain (`a.b.c`) or a
-            // bound method on a literal receiver (`", ".join`,
-            // `(a + b).method`). The latter shape is common in pipe
-            // chains that feed into stdlib container methods.
-            if !is_dotted_callable(func) && !is_method_call_head(func) {
+            if !is_dotted_callable(func)
+                && !is_method_call_head(func)
+                && !is_parenthesised_expr(func)
+            {
                 return None;
             }
-            // Validate the RHS is exactly `func(...)` — i.e. parens span to
-            // end of segment. This avoids accidentally rewriting expressions
-            // like `f(x) + 1`.
-            if !rhs.ends_with(')') {
-                return None;
-            }
-            // Inner args (with no surrounding parens).
+            // Inner args (with no surrounding parens). The matching
+            // walk above guarantees `func(...)` spans to end of `rhs`,
+            // so `inner` is everything between the matching parens.
             let inner = rhs[open + 1..rhs.len() - 1].trim();
             if inner.is_empty() {
                 Some(format!("{}({})", func, acc))
@@ -4825,6 +5298,46 @@ fn apply_pipe_call(acc: &str, rhs: &str) -> Option<String> {
             }
         }
     }
+}
+
+/// `true` when `s` is a parenthesised expression — starts with `(`,
+/// ends with `)`, and the two are balanced. Used to accept shapes
+/// like `(lambda x: x * 2)` and `(f if c else g)` as the head of a
+/// pipe RHS so `5 |> (lambda x: x * 2)()` rewrites to
+/// `(lambda x: x * 2)(5)`. O28 / FINDINGS #117.
+fn is_parenthesised_expr(s: &str) -> bool {
+    let s = s.trim();
+    if !s.starts_with('(') || !s.ends_with(')') {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_str: Option<u8> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if let Some(q) = in_str {
+            if b == b'\\' && i + 1 < bytes.len() {
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            continue;
+        }
+        match b {
+            b'"' | b'\'' => in_str = Some(b),
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 && i + 1 != bytes.len() {
+                    // Closing before the end means the outer parens
+                    // don't span the whole string.
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 /// True if `s` looks like a *bound method* call head — anything that
@@ -5551,6 +6064,135 @@ mod tests {
         assert_eq!(out, src, "triple-string content must not be expanded");
     }
 
+    // ── inline `?` propagation in sub-expressions (O17) ─────────────────────
+
+    #[test]
+    fn inline_question_op_lifts_inner_call_in_ok_wrapper() {
+        // The motivating O17 case: `Ok(f(x)?)`. The inner `?` is inside
+        // a sub-expression so the end-of-line rewriter doesn't pick it
+        // up — the inline pass must lift it to a temp first.
+        let src = "    return Ok(parse(s)?)\n";
+        let out = expand_inline_question_ops(src);
+        assert!(out.contains("__typhon_qi_0__ = parse(s)"), "out: {out}");
+        assert!(
+            out.contains("if isinstance(__typhon_qi_0__, __typhon_Err__):"),
+            "out: {out}"
+        );
+        assert!(out.contains("return __typhon_qi_0__"), "out: {out}");
+        assert!(
+            out.contains("return Ok(__typhon_qi_0__.value)"),
+            "out: {out}"
+        );
+        // The auto-injected alias import must appear at module top.
+        assert!(
+            out.starts_with("from typhon_runtime import Err as __typhon_Err__\n"),
+            "out: {out}"
+        );
+    }
+
+    #[test]
+    fn inline_question_op_handles_multiple_inner_calls() {
+        // Two `?` ops on the same line — both get lifted, in order,
+        // and the final expression substitutes both temps.
+        let src = "    return Ok(add(parse(s)?, parse(t)?))\n";
+        let out = expand_inline_question_ops(src);
+        assert!(out.contains("__typhon_qi_0__ = parse(s)"), "out: {out}");
+        assert!(out.contains("__typhon_qi_1__ = parse(t)"), "out: {out}");
+        assert!(
+            out.contains("return Ok(add(__typhon_qi_0__.value, __typhon_qi_1__.value))"),
+            "out: {out}"
+        );
+    }
+
+    #[test]
+    fn inline_question_op_preserves_end_of_line_case() {
+        // `let x = f()?` (top-of-statement position) is NOT touched by
+        // the inline pass — the existing end-of-line rewriter owns it.
+        let src = "    let x = f()?\n";
+        let out = expand_inline_question_ops(src);
+        assert_eq!(
+            out, src,
+            "end-of-line `?` must be left for `expand_question_ops`"
+        );
+    }
+
+    #[test]
+    fn inline_question_op_handles_dotted_callable() {
+        // The callable receiver is a dotted name (`mod.f`). The lifted
+        // expression must include the dotted prefix, not just the
+        // final identifier.
+        let src = "    return Ok(mod.f(x)?)\n";
+        let out = expand_inline_question_ops(src);
+        assert!(out.contains("__typhon_qi_0__ = mod.f(x)"), "out: {out}");
+        assert!(
+            out.contains("return Ok(__typhon_qi_0__.value)"),
+            "out: {out}"
+        );
+    }
+
+    #[test]
+    fn inline_question_op_preserves_indent_inside_block() {
+        // Lifted temps must inherit the line's leading indent so they
+        // remain inside the enclosing block.
+        let src = "    if cond:\n        return Ok(parse(s)?)\n";
+        let out = expand_inline_question_ops(src);
+        assert!(
+            out.contains("        __typhon_qi_0__ = parse(s)"),
+            "out: {out}"
+        );
+        assert!(
+            out.contains("        return Ok(__typhon_qi_0__.value)"),
+            "out: {out}"
+        );
+    }
+
+    #[test]
+    fn inline_question_op_ignores_string_contents() {
+        // A `)?` inside a string literal must not trigger expansion.
+        let src = "    log(\"missing f()?\")\n";
+        let out = expand_inline_question_ops(src);
+        assert_eq!(out, src, "string content must not be expanded");
+    }
+
+    #[test]
+    fn inline_question_op_ignores_triple_quoted_string_contents() {
+        // PR #96 review: a `)?` inside a triple-quoted string on a
+        // single line must not trigger expansion either. The
+        // string-state tracker previously only handled single-char
+        // quotes and would toggle off the in-string state on the
+        // second `"` of `"""`, leaving the `?` exposed.
+        let src = "    log(\"\"\"missing f()?\"\"\")\n";
+        let out = expand_inline_question_ops(src);
+        assert_eq!(
+            out, src,
+            "triple-quoted string content must not be expanded"
+        );
+    }
+
+    #[test]
+    fn inline_then_outer_question_op_compose() {
+        // Pipeline-shaped: `let x = Ok(f()?)?` — the inner `?` is
+        // lifted by the inline pass, the outer `?` is then a normal
+        // end-of-line case the standard pass handles.
+        let src = "    let x = Ok(f()?)?\n";
+        let after_inline = expand_inline_question_ops(src);
+        assert!(
+            after_inline.contains("__typhon_qi_0__ = f()"),
+            "out: {after_inline}"
+        );
+        assert!(
+            after_inline.contains("let x = Ok(__typhon_qi_0__.value)?"),
+            "out: {after_inline}"
+        );
+        // Now the standard pass picks up the remaining trailing `?`.
+        let out = expand_question_ops(&after_inline);
+        assert!(
+            out.contains("__typhon_q_0__ = Ok(__typhon_qi_0__.value)"),
+            "out: {out}"
+        );
+        assert!(out.contains("let x = __typhon_q_0__.value"), "out: {out}");
+    }
+
     #[test]
     fn model_keyword_with_existing_base_merges_basemodel() {
         // `model User(Timestamped):` → `class User(Timestamped, BaseModel):`
@@ -5897,11 +6539,63 @@ mod tests {
 
     #[test]
     fn pipe_inside_parens_is_left_alone() {
-        // At parenthesis depth > 0, the rewriter declines to act. The Python
-        // parser will surface a clear error for the unsupported form.
+        // Pipes inside `[...]` brackets (list/set/dict comprehensions or
+        // index syntax) are NOT rewritten — Python's `|` already has a
+        // meaning in those positions and we leave the parser to surface
+        // the error. The matching recursion in `expand_pipes_in_sub-
+        // expressions` only walks `(...)` groups.
         let src = "y = sum([a |> f for a in xs])\n";
         let out = expand_pipes(src);
         assert_eq!(out, src);
+    }
+
+    #[test]
+    fn pipe_inside_round_parens_now_expanded() {
+        // O28 / FINDINGS #119: pipes inside a `(...)` sub-expression are
+        // expanded by the nested-paren pre-pass before the outer pipe
+        // pass runs. `(1 |> add(2)) |> add(3)` rewrites end-to-end.
+        let src = "y = (1 |> add(2)) |> add(3)\n";
+        let out = expand_pipes(src);
+        assert_eq!(out, "y = add((add(1, 2)), 3)\n");
+    }
+
+    #[test]
+    fn pipe_into_parenthesised_lambda_call() {
+        // O28 / FINDINGS #117: a `(lambda x: x * 2)()` RHS — i.e. a
+        // parenthesised expression followed by an empty call — is now
+        // accepted as a pipe callable head.
+        let src = "y = 5 |> (lambda x: x * 2)()\n";
+        let out = expand_pipes(src);
+        assert_eq!(out, "y = (lambda x: x * 2)(5)\n");
+    }
+
+    #[test]
+    fn pipe_into_parenthesised_lambda_call_with_extra_args() {
+        // The lambda call may already carry extra positional args; the
+        // pipe value goes first.
+        let src = "y = 5 |> (lambda x, k: x * k)(2)\n";
+        let out = expand_pipes(src);
+        assert_eq!(out, "y = (lambda x, k: x * k)(5, 2)\n");
+    }
+
+    #[test]
+    fn pipe_rhs_with_paren_inside_string_arg() {
+        // PR #96 review: the reverse paren-walk in `apply_pipe_call`
+        // must skip parens that live inside a string literal. Without
+        // a string-aware mask, the `)` inside `f(")")` corrupts the
+        // depth counter and the rewriter either picks the wrong `(`
+        // or fails entirely, leaving `|>` in the source.
+        let src = "y = 5 |> f(\")\")\n";
+        let out = expand_pipes(src);
+        assert_eq!(out, "y = f(5, \")\")\n");
+    }
+
+    #[test]
+    fn pipe_rhs_with_open_paren_inside_string_arg() {
+        // Mirror of the above for `(` inside a string literal.
+        let src = "y = 5 |> f(\"(\")\n";
+        let out = expand_pipes(src);
+        assert_eq!(out, "y = f(5, \"(\")\n");
     }
 
     #[test]

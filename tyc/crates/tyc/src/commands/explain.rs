@@ -106,6 +106,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "unknown_kwarg",
         "unknown_module",
         "unknown_name",
+        "unsafe_value_leak",
         "unused_import",
     ]
 }
@@ -228,6 +229,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         "unknown_kwarg" => include_str!("../../../../../docs/diagnostics/unknown_kwarg.md"),
         "unknown_module" => include_str!("../../../../../docs/diagnostics/unknown_module.md"),
         "unknown_name" => include_str!("../../../../../docs/diagnostics/unknown_name.md"),
+        "unsafe_value_leak" => {
+            include_str!("../../../../../docs/diagnostics/unsafe_value_leak.md")
+        }
         "unused_import" => include_str!("../../../../../docs/diagnostics/unused_import.md"),
         _ => return None,
     })

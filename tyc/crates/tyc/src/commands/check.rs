@@ -18,8 +18,8 @@ use tyc_emit::{compare_modules, StubTestKind};
 use tyc_resolve::check_unknown_modules;
 use tyc_resolve::{check_unknown_modules_with, ImportVettingContext};
 use tyc_syntax::preprocess::{
-    expand_gather_blocks, expand_go_calls, expand_lazy_imports, expand_multiline_guards,
-    expand_pipes, expand_question_ops, expand_with_chains, preprocess,
+    expand_gather_blocks, expand_go_calls, expand_inline_question_ops, expand_lazy_imports,
+    expand_multiline_guards, expand_pipes, expand_question_ops, expand_with_chains, preprocess,
 };
 
 use crate::commands::util::{apply_strictness, collect_dty_files, collect_ty_files};
@@ -653,9 +653,11 @@ fn run_unknown_module_check(path: &str, source: &str, ctx: &ImportVettingContext
 /// chains would silently skip downstream diagnostics. (Copilot review
 /// on PR #68, file check.rs:332.)
 fn expand_for_check(source: &str) -> String {
-    expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
-        &expand_gather_blocks(&expand_multiline_guards(&expand_lazy_imports(source))),
-    ))))
+    expand_question_ops(&expand_inline_question_ops(&expand_pipes(
+        &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
+            &expand_multiline_guards(&expand_lazy_imports(source)),
+        ))),
+    )))
 }
 
 /// Run the full preprocess + parse pipeline on `source` and return the
@@ -958,7 +960,9 @@ class Agent:
         // `run()` returns Ok on warnings, so we test via the resolver helper
         // directly to confirm the warning fires in project context.
         let source = "import requests\n";
-        let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(source)));
+        let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
+            &expand_with_chains(source),
+        )));
         let module = tyc_syntax::parse_module(&expanded).unwrap().into_syntax();
         let diags = check_unknown_modules("t.ty", source, &module, &[], &[]);
         assert!(

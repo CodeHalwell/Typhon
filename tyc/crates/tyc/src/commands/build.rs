@@ -25,11 +25,12 @@ use tyc_analyse::{
 use tyc_db::{check_file_with_imports, extract_shapes_for_path, TycDatabase};
 use tyc_desugar::{desugar_module_with, DesugarOptions};
 use tyc_diagnostics::{Diagnostics, TycError};
-use tyc_emit::{emit_python_with_line_offsets_for_target, emit_stub};
+use tyc_emit::{emit_python_with_source_for_target, emit_stub};
 use tyc_format::format_source;
 use tyc_syntax::preprocess::{
-    expand_gather_blocks, expand_go_calls, expand_lazy_imports, expand_multiline_guards,
-    expand_pipes, expand_question_ops, expand_with_chains, line_byte_starts, preprocess,
+    expand_gather_blocks, expand_go_calls, expand_inline_question_ops, expand_lazy_imports,
+    expand_multiline_guards, expand_pipes, expand_question_ops, expand_with_chains,
+    line_byte_starts, preprocess,
 };
 
 use crate::commands::util::{
@@ -58,6 +59,13 @@ pub struct BuildArgs {
     /// errors continue to surface.
     #[arg(long)]
     pub check: bool,
+
+    /// Skip the `uv sync` step. `pyproject.toml` is still merged so the
+    /// next regular build picks the manifest up. Useful for fast
+    /// iteration on `.ty` files when the project's `.venv` is already
+    /// provisioned. Also honoured via `TYC_NO_SYNC=1`.
+    #[arg(long)]
+    pub no_sync: bool,
 }
 
 pub fn run(args: BuildArgs) -> Result<()> {
@@ -169,7 +177,12 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // `.py`. Failure of `uv sync` is downgraded to a warning — the
     // codegen output is useful regardless of whether the install
     // step resolved.
-    crate::commands::deps::bootstrap_python_env(&config_dir, &config)?;
+    //
+    // `--no-sync` (or `TYC_NO_SYNC=1`) skips the `uv sync` step while
+    // still merging the manifest, so stress harnesses and REPL-like
+    // iteration don't pay the per-invocation reprovision cost.
+    let skip_sync = args.no_sync || std::env::var_os("TYC_NO_SYNC").is_some_and(|v| v == "1");
+    crate::commands::deps::bootstrap_python_env_with(&config_dir, &config, skip_sync)?;
 
     // Phase 1: type-check all files first and fail fast on errors.
     let mut db = TycDatabase::new();
@@ -302,9 +315,14 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // Note `expand_lazy_imports` runs first so that `lazy import` lines
         // become a full inline proxy class before the other sugar passes see
         // them.
-        let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
-            &expand_gather_blocks(&expand_multiline_guards(&expand_lazy_imports(source))),
-        ))));
+        // The inline `?` pass runs before the end-of-line `?` pass so
+        // `Ok(f(x)?)`-shaped sub-expressions get lifted into temps
+        // first. O17 / FINDINGS #66 / R3.13 / E9.
+        let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
+            &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
+                &expand_multiline_guards(&expand_lazy_imports(source)),
+            ))),
+        )));
         let prep = preprocess(&expanded);
 
         let module = tyc_syntax::parse_module(&prep.python_source)
@@ -510,8 +528,17 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // Anything we can't parse falls back to `0` (no lowering),
         // matching the previous default.
         let target_minor = parse_python_minor(&config.python.target);
-        let (mut python_src, line_offsets) =
-            emit_python_with_line_offsets_for_target(&desugar_output.module, target_minor);
+        // Pass the preprocessed source so the printer can recover
+        // stylistic choices the AST collapses — currently the bracket
+        // style on sequence patterns (`case [a, b]:` vs `case (a, b):`).
+        // The AST's TextRange offsets land in `prep.python_source`, not
+        // the user's `.ty` text, so the printer needs the preprocessed
+        // buffer. O27 / FINDINGS #111.
+        let (mut python_src, line_offsets) = emit_python_with_source_for_target(
+            &desugar_output.module,
+            target_minor,
+            Some(&prep.python_source),
+        );
 
         // Optionally normalise whitespace in the emitted Python (tabs → spaces,
         // trailing whitespace, final newline).  Full ruff-style reformatting
@@ -670,9 +697,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // .dty files use the same syntax as .ty but typically contain only
         // declarations.  Run the preprocessor so `val`/`var`/`model` stripping
         // works, then desugar to plain Python so the printer can emit it.
-        let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
-            &expand_gather_blocks(&expand_multiline_guards(&expand_lazy_imports(&source))),
-        ))));
+        let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
+            &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
+                &expand_multiline_guards(&expand_lazy_imports(&source)),
+            ))),
+        )));
         let prep = preprocess(&expanded);
         let module = tyc_syntax::parse_module(&prep.python_source)
             .map(|p| p.into_syntax())
@@ -1858,6 +1887,7 @@ mod tests {
             out: None,
             no_format: true,
             check: false,
+            no_sync: false,
         })
         .unwrap();
         assert!(
@@ -1876,6 +1906,7 @@ mod tests {
             out: Some(custom_out.clone()),
             no_format: true,
             check: false,
+            no_sync: false,
         })
         .unwrap();
         assert!(
@@ -1893,6 +1924,7 @@ mod tests {
             out: None,
             no_format: true,
             check: false,
+            no_sync: false,
         });
         assert!(result.is_err(), "build should fail on type mismatch");
     }
@@ -1906,6 +1938,7 @@ mod tests {
             out: None,
             no_format: true,
             check: false,
+            no_sync: false,
         })
         .unwrap();
         // Phase 3 made `typhon_runtime` a package (with submodules `tasks`
@@ -1949,6 +1982,7 @@ async def load(id: int) -> None:
             out: None,
             no_format: true,
             check: false,
+            no_sync: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -1980,6 +2014,7 @@ let result: int = 3 |> double |> inc
             out: None,
             no_format: true,
             check: false,
+            no_sync: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -2006,6 +2041,7 @@ let result: int = 3 |> double |> inc
             out: None,
             no_format: true,
             check: false,
+            no_sync: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -2040,6 +2076,7 @@ class Foo:
             out: None,
             no_format: true,
             check: false,
+            no_sync: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -2064,6 +2101,7 @@ class Foo:
             out: None,
             no_format: true,
             check: false,
+            no_sync: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -2122,6 +2160,7 @@ def area(s: Shape) -> float:
             out: None,
             no_format: true,
             check: false,
+            no_sync: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -2154,6 +2193,7 @@ def area(s: Shape) -> float:
             out: None,
             no_format: true,
             check: false,
+            no_sync: false,
         });
         // Verify the failure is specifically a type-checking error, not a
         // configuration or I/O error, by checking the returned error message.
@@ -2179,6 +2219,7 @@ def fib(n: int) -> int:
             out: None,
             no_format: true,
             check: false,
+            no_sync: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -2212,6 +2253,7 @@ let pet: Animal = Dog(name=\"Rex\")
             out: None,
             no_format: true,
             check: false,
+            no_sync: false,
         });
         // Verify the failure is specifically a type-checking error (structural
         // conformance failure), not a configuration or I/O error.
@@ -2240,6 +2282,7 @@ def hot(n: int) -> int:
             out: None,
             no_format: true,
             check: false,
+            no_sync: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -2270,6 +2313,7 @@ def cold(n: int) -> int:
             out: None,
             no_format: true,
             check: false,
+            no_sync: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -2308,6 +2352,7 @@ def cold(n: int) -> int:
             out: None,
             no_format: true,
             check: false,
+            no_sync: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -2340,6 +2385,7 @@ async def load() -> int:
             out: None,
             no_format: true,
             check: false,
+            no_sync: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -2373,6 +2419,7 @@ async def load() -> int:
             out: None,
             no_format: true,
             check: false,
+            no_sync: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -2408,6 +2455,7 @@ async def load() -> int:
             out: None,
             no_format: true,
             check: false,
+            no_sync: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -2449,6 +2497,7 @@ async def load() -> int:
             out: None,
             no_format: true,
             check: false,
+            no_sync: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -2514,6 +2563,7 @@ async def load() -> int:
             out: None,
             no_format: true,
             check: false,
+            no_sync: false,
         })
         .unwrap();
         let map_path = out_dir.join("main.py.map");
@@ -2557,6 +2607,7 @@ let pet: Animal = Dog(name=\"Rex\")
             out: None,
             no_format: true,
             check: false,
+            no_sync: false,
         })
         .unwrap();
         let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
@@ -2583,6 +2634,7 @@ let pet: Animal = Dog(name=\"Rex\")
             out: None,
             no_format: true,
             check: false,
+            no_sync: false,
         })
         .unwrap();
         assert!(
@@ -2617,6 +2669,7 @@ let pet: Animal = Dog(name=\"Rex\")
             out: None,
             no_format: true,
             check: false,
+            no_sync: false,
         })
         .unwrap();
         assert!(
@@ -2640,6 +2693,7 @@ let pet: Animal = Dog(name=\"Rex\")
             out: None,
             no_format: true,
             check: true,
+            no_sync: false,
         })
         .unwrap();
         assert!(
@@ -2661,6 +2715,7 @@ let pet: Animal = Dog(name=\"Rex\")
             out: None,
             no_format: true,
             check: true,
+            no_sync: false,
         })
         .unwrap();
         assert!(!out_dir.join("main.py").exists());
@@ -2676,6 +2731,7 @@ let pet: Animal = Dog(name=\"Rex\")
             out: None,
             no_format: true,
             check: true,
+            no_sync: false,
         });
         assert!(
             result.is_err(),
@@ -2713,6 +2769,7 @@ let pet: Animal = Dog(name=\"Rex\")
             out: None,
             no_format: true,
             check: false,
+            no_sync: false,
         });
         std::env::remove_var("FAKE_API_KEY");
         assert!(
