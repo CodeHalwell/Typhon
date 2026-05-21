@@ -34,8 +34,8 @@ SDK patterns, perf, and intentionally-broken diagnostic probes. Roughly
 | 2026-05-19 | `claude/test-typhon-library-rNIYC` | #57–#127 | all but the deferred items closed in `review-findings-fixes-VRFJy` / `resolve-open-findings-UDZfv` |
 | 2026-05-20 | `claude/test-typhon-library-ejNr5` | R3.1–R3.18 | closed in `resolve-open-findings-v6t65` except `tyc fmt` and `?` in sub-expr |
 | 2026-05-20 exploration | `claude/typhon-exploration-testing-LZezp` | E1–E11 | closed except E6, E9, E11 |
-| 2026-05-21 | `claude/tender-hawking-LLhuR` | B1–B14 | closed B1–B7, B10–B13; B8, B9, B14 still open |
-| 2026-05-21 findings sweep | `claude/findings-documentation-review-HhuVH` | — | closed O2/O3/O4/O5/O6/O10/O21/O22/O24/O25/O26; verified-fixed O1/O7/O8/O9/O11/O18/O20 |
+| 2026-05-21 | `claude/tender-hawking-LLhuR` | B1–B14 | closed B1–B8, B10–B13; B9, B14 still open |
+| 2026-05-21 findings sweep | `claude/findings-documentation-review-HhuVH` | — | closed O2/O3/O4/O5/O6/O10/O21/O22/O23/O24/O25/O26; verified-fixed O1/O7/O8/O9/O11/O18/O20 |
 
 **Pass rate trend** on the canonical example suite (`examples/01-…46-…`):
 20/47 → 39/47 → 46/46 → 46/46. The examples now build and run end-to-end
@@ -152,20 +152,6 @@ Workaround `case _:` works but defeats the safety property.
 
 ### LOW — DX / cosmetic
 
-#### O23 — `extend list[int]:` (parametric) mis-targets `list` *(B8)*
-
-Repro: `stress/round-2026-05-21/01-language-edge/16-extend-builtin.ty`
-(initial form).
-
-```python
-extend list[int]:
-    def total(self) -> int: ...
-```
-
-Diagnostic claims the user wrote `impl list:`. Either accept
-parametric extends or surface a
-`extend on parameterised types is not supported yet` error.
-
 #### O27 — Sequence pattern `[a, b]` emits as tuple pattern `(a, b)` *(#111)*
 
 PEP 634 makes these semantically identical (both match any sequence)
@@ -227,9 +213,6 @@ items:
    position is a lexer-aware rewrite; tractable but invasive.
 8. **O13 (Pydantic auto-inject)** — tighten the detection path so
    it fires even on bare `typhon.toml` projects.
-9. **O23 (parametric `extend`)** — at minimum a clearer
-   "parameterised extends not yet supported" diagnostic than the
-   current `impl_unknown_class` cascade.
 
 The remaining open items are smaller papercuts.
 
@@ -301,6 +284,13 @@ Branch: `claude/findings-documentation-review-HhuVH`.
   single quotes the same way Python's `repr` does. `tyc run` and
   `tyc run --compile` produce byte-identical stdout for Result-
   bearing programs.
+- **O23** — `extend list[int]:` (parametric target) now fires a
+  dedicated `tyc::extend_builtin` diagnostic that names the
+  parametric shape and tells the user to drop the `[…]` (or wait
+  for the per-element-type dispatch the rewriter is tracked to
+  gain). The previous behaviour was a confusing downstream
+  `tyc::impl_unknown_class` cascade from the silently-stripped
+  `__typhon_impl_list` pseudo-class.
 
 **Verified-already-fixed against their repros:**
 
@@ -459,10 +449,9 @@ f-string), E10 (O11, for-rebind). Still open: E6 → **O19**, E9 →
 
 Filed B1–B14 (81 fresh `.ty` programs, 65/81 build + run clean; 7 real
 bugs surfaced). The May 21 findings sweep closed B1 (O3), B2 (O4),
-B3 (O6), B4 (O5), B5 (O2), B6 (O21), B7 (O22), B10 (O10), B11 (O24),
-B12 (O25), B13 (O26). Still open:
+B3 (O6), B4 (O5), B5 (O2), B6 (O21), B7 (O22), B8 (O23), B10 (O10),
+B11 (O24), B12 (O25), B13 (O26). Still open:
 
-- B8 → **O23** (parametric `extend`)
 - B9 → **O12** (`tyc fmt`)
 - B14 → **O13** (Pydantic dep auto-inject)
 
