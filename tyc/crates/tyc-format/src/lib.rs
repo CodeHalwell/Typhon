@@ -38,8 +38,9 @@ use tyc_diagnostics::TycError;
 use tyc_syntax::{
     parse_module,
     preprocess::{
-        expand_gather_blocks, expand_go_calls, expand_multiline_guards, expand_pipes,
-        expand_question_ops, expand_with_chains, postprocess_full, preprocess,
+        expand_gather_blocks, expand_go_calls, expand_inline_question_ops,
+        expand_multiline_guards, expand_pipes, expand_question_ops, expand_with_chains,
+        postprocess_full, preprocess,
     },
 };
 
@@ -69,8 +70,10 @@ pub fn format_source(source: &str, path: &str) -> Result<FormatResult, TycError>
     // output below is still derived from `prep.python_source` so the Typhon
     // sugar is preserved when the file is rewritten.
     let validation_input =
-        expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
-            &expand_gather_blocks(&expand_multiline_guards(&prep.python_source)),
+        expand_question_ops(&expand_inline_question_ops(&expand_pipes(&expand_with_chains(
+            &expand_go_calls(&expand_gather_blocks(&expand_multiline_guards(
+                &prep.python_source,
+            ))),
         ))));
     parse_module(&validation_input).map_err(|e| {
         let offset = usize::from(e.location.start());
@@ -145,6 +148,10 @@ fn normalise_whitespace(source: &str) -> String {
     let mut result = String::with_capacity(source.len());
     let mut consecutive_blank = 0u32;
     let mut in_triple: Option<char> = None;
+    // Track whether any real (non-blank, non-shebang, non-comment) line
+    // has been emitted yet so the "two blank lines before top-level
+    // def/class" rule doesn't fire at the file head. PEP 8.
+    let mut emitted_any_code = false;
     for raw_line in source.lines() {
         // Triple-quoted block: keep raw, but still strip trailing spaces and
         // expand the leading tabs so indentation matches the file style.
@@ -177,6 +184,28 @@ fn normalise_whitespace(source: &str) -> String {
             }
             continue;
         }
+
+        // PEP 8 §3 — top-level `def`/`class`/`async def` definitions must
+        // be preceded by two blank lines (i.e. three newlines tail). Apply
+        // only when:
+        //   - we've already emitted at least one code line (no leading
+        //     blank gap at the file head), and
+        //   - the line is at indent 0 (top-level), not nested inside a
+        //     class or function body, and
+        //   - the prior line was code (consecutive_blank < 2). When the
+        //     user already provided ≥2 blanks the existing branch above
+        //     handles it; we only INSERT blanks here when too few exist.
+        let is_top_level_block = leading.is_empty()
+            && in_triple.is_none()
+            && (rest.starts_with("def ")
+                || rest.starts_with("class ")
+                || rest.starts_with("async def ")
+                || rest.starts_with("@"));
+        if is_top_level_block && emitted_any_code && consecutive_blank < 2 {
+            for _ in consecutive_blank..2 {
+                result.push('\n');
+            }
+        }
         consecutive_blank = 0;
 
         for ch in leading.chars() {
@@ -188,6 +217,7 @@ fn normalise_whitespace(source: &str) -> String {
         }
         result.push_str(rest);
         result.push('\n');
+        emitted_any_code = true;
     }
     result
 }
@@ -199,6 +229,19 @@ fn normalise_whitespace(source: &str) -> String {
 /// rejects backslash-escaped quotes, raw strings (the prefix is invisible
 /// at this point — quotes still bracket the literal), and f-strings (same
 /// reasoning).
+///
+/// Beyond the existing whitespace-collapse rules, the pass now adds three
+/// PEP 8-style spacing fixes (O12 / FINDINGS #65 / #122 / R3.15 / B9):
+///
+/// - Insert a space after `,` when followed directly by a non-whitespace
+///   token (`(x,y)` → `(x, y)`).
+/// - Insert a space after `:` outside slice context (`x:int` → `x: int`,
+///   `{"a":1}` → `{"a": 1}`; `xs[1:2]` stays untouched).
+/// - Insert spaces around `->` so `()->int:` becomes `() -> int:`.
+///
+/// PEP 8's two-blank-lines-around-top-level-defs rule lives in
+/// [`normalise_whitespace`] (file-level pass) so this per-line helper
+/// stays local in scope.
 fn apply_simple_style_rules(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
@@ -206,6 +249,14 @@ fn apply_simple_style_rules(line: &str) -> String {
     // Track when we've just emitted an opening bracket/paren so the next
     // run of spaces is stripped (`(   x` → `(x`). FINDINGS #65.
     let mut just_opened_bracket = false;
+    // Track `[` nesting so `:` inside a slice (`xs[1:2]`) is recognised
+    // and NOT given a trailing space. `(` / `{` do not turn slice mode
+    // on; only `[` does. Reset on the matching `]`.
+    let mut bracket_depth: i32 = 0;
+    // Track `(` nesting so `=` inside a call (kwarg) is left tight as
+    // PEP 8 §arguments prescribes. The kwarg-vs-default distinction is
+    // not tracked — both forms keep `=` tight inside parens.
+    let mut paren_depth: i32 = 0;
     while let Some(c) = chars.next() {
         if let Some(q) = quote {
             out.push(c);
@@ -263,9 +314,160 @@ fn apply_simple_style_rules(line: &str) -> String {
                 just_opened_bracket = false;
             }
             '(' | '[' => {
+                if c == '[' {
+                    bracket_depth += 1;
+                } else {
+                    paren_depth += 1;
+                }
                 out.push(c);
                 just_opened_bracket = true;
                 continue;
+            }
+            ']' => {
+                if bracket_depth > 0 {
+                    bracket_depth -= 1;
+                }
+                out.push(']');
+                just_opened_bracket = false;
+            }
+            ')' => {
+                if paren_depth > 0 {
+                    paren_depth -= 1;
+                }
+                out.push(')');
+                just_opened_bracket = false;
+            }
+            '=' => {
+                // `=` is the most context-sensitive token to space. Cases:
+                //   `==` (comparison) — never split, keep tight if user
+                //       wrote `==`, add spaces only when user already
+                //       spaced one side. Leave alone here.
+                //   `:=` (walrus) — handled by the `:` branch swallowing
+                //       the `=` chain; we never see a leading `:`.
+                //   `+=` / `-=` / `*=` / `/=` / etc. — augmented assign
+                //       must stay glued to its operator. Detected by
+                //       looking at the previously-emitted char.
+                //   `=` inside `(...)` — kwarg / default, PEP 8 keeps it
+                //       tight (`f(x=1)`, not `f(x = 1)`).
+                //   `=` at the top of a statement — assignment, PEP 8
+                //       wants single spaces on each side.
+                let next = chars.peek().copied();
+                let prev = out.chars().last();
+                let is_double_eq = matches!(next, Some('='));
+                let is_augmented = matches!(
+                    prev,
+                    Some('+')
+                        | Some('-')
+                        | Some('*')
+                        | Some('/')
+                        | Some('%')
+                        | Some('&')
+                        | Some('|')
+                        | Some('^')
+                        | Some('<')
+                        | Some('>')
+                        | Some('!')
+                        | Some('=')
+                        | Some('@')
+                );
+                let is_kwarg = paren_depth > 0;
+                if is_double_eq || is_augmented || is_kwarg {
+                    out.push('=');
+                    just_opened_bracket = false;
+                    continue;
+                }
+                // Plain assignment — single space on each side. The left
+                // side first: trim the existing trailing whitespace run
+                // back to a single space if any whitespace is present,
+                // otherwise insert exactly one space.
+                if !matches!(prev, Some(' ') | Some('\t') | None) {
+                    out.push(' ');
+                }
+                out.push('=');
+                // Right side: insert a space if not already followed by
+                // whitespace; this handles `z:int=x` → `z: int = x`.
+                if !matches!(next, Some(' ') | Some('\t') | Some('\n') | None) {
+                    out.push(' ');
+                }
+                just_opened_bracket = false;
+            }
+            ':' => {
+                out.push(':');
+                // Inside `[ ]`, `:` is a slice separator — leave it
+                // alone. Otherwise (annotation, dict key, block end)
+                // insert a space if the next char isn't already one or
+                // another `:` (walrus operator handled separately below
+                // since `:=` is read by the caller before us — `:` then
+                // `=` arrive as two chars and we'd emit `: =` which is
+                // wrong, so explicitly skip in that case).
+                if bracket_depth == 0 {
+                    let next = chars.peek().copied();
+                    let needs_space = matches!(next, Some(c) if c != ' ' && c != '\t'
+                        && c != ':' && c != '=' && c != '\n' && c != '\r');
+                    if needs_space {
+                        out.push(' ');
+                    }
+                }
+                just_opened_bracket = false;
+            }
+            '-' => {
+                // `->` return-type arrow. Ensure a single space on each
+                // side: `)->int` → `) -> int`, `)  ->int` → `) -> int`.
+                // The trailing space is added if the next char isn't
+                // already whitespace.
+                if let Some(&'>') = chars.peek() {
+                    chars.next();
+                    if !matches!(out.chars().last(), Some(' ') | Some('\t') | None) {
+                        out.push(' ');
+                    }
+                    out.push_str("->");
+                    let next = chars.peek().copied();
+                    if !matches!(next, Some(' ') | Some('\t') | Some('\n') | None) {
+                        out.push(' ');
+                    }
+                    just_opened_bracket = false;
+                    continue;
+                }
+                // Binary `-`: insert spaces when prev is an identifier
+                // / number / `)` / `]` AND next is an identifier /
+                // number / `(` / `[`. Otherwise leave alone (unary
+                // `-x`, `[-1]`, `f(-1)` etc.).
+                let prev = out.chars().last();
+                let next = chars.peek().copied();
+                if is_binary_operand_lhs(prev) && is_binary_operand_rhs(next) {
+                    if !matches!(prev, Some(' ') | Some('\t')) {
+                        out.push(' ');
+                    }
+                    out.push('-');
+                    if !matches!(next, Some(' ') | Some('\t')) {
+                        out.push(' ');
+                    }
+                    just_opened_bracket = false;
+                    continue;
+                }
+                out.push('-');
+                just_opened_bracket = false;
+            }
+            '+' => {
+                // Binary `+`: same heuristic as `-`. Unary `+x` (rare
+                // but legal Python) and `+=` (compound assignment, the
+                // `=` is consumed by its own handler so we never see
+                // both characters together here) leave the `+` tight.
+                let prev = out.chars().last();
+                let next = chars.peek().copied();
+                if is_binary_operand_lhs(prev) && is_binary_operand_rhs(next) {
+                    if !matches!(prev, Some(' ') | Some('\t')) {
+                        out.push(' ');
+                    }
+                    out.push('+');
+                    if !matches!(next, Some(' ') | Some('\t')) {
+                        out.push(' ');
+                    }
+                    just_opened_bracket = false;
+                    continue;
+                }
+                out.push('+');
+                just_opened_bracket = false;
             }
             '#' => {
                 // Normalise `#foo` → `# foo`, but leave shebangs and
@@ -286,8 +488,11 @@ fn apply_simple_style_rules(line: &str) -> String {
             }
             ',' => {
                 out.push(',');
-                // Collapse multi-space `,    ` to `, ` but only when the
-                // next character is whitespace; `,)` (last arg) stays as-is.
+                // Collapse runs of whitespace after `,` to a single space.
+                // When no whitespace at all follows AND the next char is
+                // not a closing bracket (`,)` last-arg stays untouched —
+                // PEP 8 allows a trailing comma without trailing space),
+                // insert exactly one space (`(x,y)` → `(x, y)`).
                 let mut peek_iter = chars.clone();
                 let mut saw_space = false;
                 while let Some(&n) = peek_iter.peek() {
@@ -298,9 +503,14 @@ fn apply_simple_style_rules(line: &str) -> String {
                         break;
                     }
                 }
+                let next_non_ws = peek_iter.peek().copied();
+                let at_eol = next_non_ws.is_none()
+                    || matches!(next_non_ws, Some('\n') | Some('\r'));
+                let before_close = matches!(next_non_ws, Some(')') | Some(']') | Some('}'));
                 if saw_space {
-                    // Consume the whitespace run from the real iterator
-                    // and emit a single space.
+                    // Consume the whitespace run; emit a single space
+                    // unless we're at end-of-line or about to hit a
+                    // closing bracket (avoid `, )` artefacts).
                     while let Some(&n) = chars.peek() {
                         if n == ' ' || n == '\t' {
                             chars.next();
@@ -308,6 +518,12 @@ fn apply_simple_style_rules(line: &str) -> String {
                             break;
                         }
                     }
+                    if !at_eol && !before_close {
+                        out.push(' ');
+                    }
+                } else if !at_eol && !before_close {
+                    // No whitespace after `,` and the next token is real
+                    // code — insert the missing PEP 8 space.
                     out.push(' ');
                 }
                 just_opened_bracket = false;
@@ -325,6 +541,28 @@ fn apply_simple_style_rules(line: &str) -> String {
         }
     }
     out
+}
+
+/// Whether the previously-emitted character looks like the right side of
+/// a binary-operator left operand (i.e. an expression-yielding token).
+/// Used by the `+` / `-` handlers to decide whether to insert PEP 8
+/// spacing or leave the operator tight (unary form).
+fn is_binary_operand_lhs(prev: Option<char>) -> bool {
+    matches!(
+        prev,
+        Some(c)
+            if c.is_ascii_alphanumeric() || c == '_' || c == ')' || c == ']'
+    )
+}
+
+/// Whether the next character begins an expression-yielding token —
+/// counterpart to [`is_binary_operand_lhs`].
+fn is_binary_operand_rhs(next: Option<char>) -> bool {
+    matches!(
+        next,
+        Some(c)
+            if c.is_ascii_alphanumeric() || c == '_' || c == '(' || c == '['
+    )
 }
 
 /// Returns the quote character that opens an *unterminated* triple-quoted
@@ -795,6 +1033,280 @@ def run() -> Result[int, str]:
         let result = format_source(src, "<test>").unwrap();
         assert_eq!(result.output, src);
         assert!(!result.changed);
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TYC_FMT_DISABLE_RUFF", v),
+                None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
+            }
+        }
+    }
+
+    // ── O12 / FINDINGS #65 / #122 / R3.15 / B9 — three new PEP 8 rules ─────
+
+    #[test]
+    fn format_inserts_space_after_colon_in_annotation() {
+        // `x:int` → `x: int` outside slice context. The on-PATH ruff
+        // could already do this, but the in-process pass guards the
+        // result when the user's ruff is missing or disabled.
+        let _guard = lock_env();
+        let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
+        unsafe {
+            std::env::set_var("TYC_FMT_DISABLE_RUFF", "1");
+        }
+        let src = "let z:int = 1\n";
+        let result = format_source(src, "<test>").unwrap();
+        assert!(
+            result.output.contains("let z: int = 1"),
+            "expected space after `:`, got: {:?}",
+            result.output
+        );
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TYC_FMT_DISABLE_RUFF", v),
+                None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
+            }
+        }
+    }
+
+    #[test]
+    fn format_leaves_slice_colons_unspaced() {
+        // `xs[1:2]` is a slice — `:` inside `[]` must stay tight.
+        let _guard = lock_env();
+        let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
+        unsafe {
+            std::env::set_var("TYC_FMT_DISABLE_RUFF", "1");
+        }
+        let src = "y = xs[1:2]\n";
+        let result = format_source(src, "<test>").unwrap();
+        assert!(
+            result.output.contains("xs[1:2]"),
+            "slice colons must stay tight, got: {:?}",
+            result.output
+        );
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TYC_FMT_DISABLE_RUFF", v),
+                None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
+            }
+        }
+    }
+
+    #[test]
+    fn format_inserts_spaces_around_return_arrow() {
+        // `)->int:` → `) -> int:` is a top-three eyesore from O12's repro.
+        let _guard = lock_env();
+        let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
+        unsafe {
+            std::env::set_var("TYC_FMT_DISABLE_RUFF", "1");
+        }
+        let src = "def f()->int:\n    return 1\n";
+        let result = format_source(src, "<test>").unwrap();
+        assert!(
+            result.output.contains(") -> int:"),
+            "expected spaces around `->`, got: {:?}",
+            result.output
+        );
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TYC_FMT_DISABLE_RUFF", v),
+                None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
+            }
+        }
+    }
+
+    #[test]
+    fn format_inserts_space_after_missing_comma() {
+        // `f(x,y)` → `f(x, y)` even when no whitespace follows the comma.
+        let _guard = lock_env();
+        let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
+        unsafe {
+            std::env::set_var("TYC_FMT_DISABLE_RUFF", "1");
+        }
+        let src = "x = f(1,2,3)\n";
+        let result = format_source(src, "<test>").unwrap();
+        assert!(
+            result.output.contains("f(1, 2, 3)"),
+            "expected space after each comma, got: {:?}",
+            result.output
+        );
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TYC_FMT_DISABLE_RUFF", v),
+                None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
+            }
+        }
+    }
+
+    #[test]
+    fn format_inserts_two_blank_lines_before_top_level_def() {
+        // PEP 8 §3: two blank lines between top-level definitions. The
+        // formatter inserts the missing blanks; an already-correct file
+        // is left alone.
+        let _guard = lock_env();
+        let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
+        unsafe {
+            std::env::set_var("TYC_FMT_DISABLE_RUFF", "1");
+        }
+        let src = "x: int = 1\ndef f() -> int:\n    return 1\n";
+        let result = format_source(src, "<test>").unwrap();
+        assert!(
+            result.output.contains("\n\n\ndef f()"),
+            "expected two blank lines before top-level def, got: {:?}",
+            result.output
+        );
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TYC_FMT_DISABLE_RUFF", v),
+                None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
+            }
+        }
+    }
+
+    #[test]
+    fn format_leaves_method_bodies_with_single_blank() {
+        // Methods nested inside a class are NOT preceded by two blanks
+        // — only the top-level def/class is. Verifies the indent-0 gate.
+        let _guard = lock_env();
+        let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
+        unsafe {
+            std::env::set_var("TYC_FMT_DISABLE_RUFF", "1");
+        }
+        let src =
+            "class Foo:\n    def a(self) -> int:\n        return 1\n    def b(self) -> int:\n        return 2\n";
+        let result = format_source(src, "<test>").unwrap();
+        assert!(
+            !result.output.contains("\n\n\n    def b"),
+            "nested methods must not get two blank lines, got: {:?}",
+            result.output
+        );
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TYC_FMT_DISABLE_RUFF", v),
+                None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
+            }
+        }
+    }
+
+    #[test]
+    fn format_o12_full_repro() {
+        // The exact repro in docs/findings.md O12 — every PEP 8 nit on
+        // a single line should be corrected by the in-process pass.
+        let _guard = lock_env();
+        let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
+        unsafe {
+            std::env::set_var("TYC_FMT_DISABLE_RUFF", "1");
+        }
+        let src = "def    f(  x:int,y:int)->int:\n    let    z:int=x+y\n";
+        let result = format_source(src, "<test>").unwrap();
+        assert!(
+            result.output.contains("def f(x: int, y: int) -> int:"),
+            "header should be fully normalised, got: {:?}",
+            result.output
+        );
+        assert!(
+            result.output.contains("let z: int = x + y"),
+            "body should normalise `z:int=x+y` shape, got: {:?}",
+            result.output
+        );
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TYC_FMT_DISABLE_RUFF", v),
+                None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
+            }
+        }
+    }
+
+    #[test]
+    fn format_leaves_kwarg_eq_tight() {
+        // Inside parens, `=` is a kwarg/default — PEP 8 keeps it tight.
+        let _guard = lock_env();
+        let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
+        unsafe {
+            std::env::set_var("TYC_FMT_DISABLE_RUFF", "1");
+        }
+        let src = "x = f(name=\"Alice\", age=30)\n";
+        let result = format_source(src, "<test>").unwrap();
+        assert!(
+            result.output.contains("f(name=\"Alice\", age=30)"),
+            "kwarg `=` should stay tight, got: {:?}",
+            result.output
+        );
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TYC_FMT_DISABLE_RUFF", v),
+                None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
+            }
+        }
+    }
+
+    #[test]
+    fn format_leaves_unary_minus_tight() {
+        // `-1` (unary) must not gain spaces; `x - 1` (binary) should.
+        let _guard = lock_env();
+        let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
+        unsafe {
+            std::env::set_var("TYC_FMT_DISABLE_RUFF", "1");
+        }
+        let src = "x = -1\ny = x-1\n";
+        let result = format_source(src, "<test>").unwrap();
+        assert!(
+            result.output.contains("x = -1"),
+            "unary minus must stay tight, got: {:?}",
+            result.output
+        );
+        assert!(
+            result.output.contains("y = x - 1"),
+            "binary minus must gain spaces, got: {:?}",
+            result.output
+        );
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TYC_FMT_DISABLE_RUFF", v),
+                None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
+            }
+        }
+    }
+
+    #[test]
+    fn format_leaves_double_eq_alone() {
+        // `==` must not be split into `= =`. Comparison ops are out of
+        // scope for this pass.
+        let _guard = lock_env();
+        let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
+        unsafe {
+            std::env::set_var("TYC_FMT_DISABLE_RUFF", "1");
+        }
+        let src = "if a==b:\n    pass\n";
+        let result = format_source(src, "<test>").unwrap();
+        assert!(
+            result.output.contains("a==b") || result.output.contains("a == b"),
+            "double-eq must not split, got: {:?}",
+            result.output
+        );
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TYC_FMT_DISABLE_RUFF", v),
+                None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
+            }
+        }
+    }
+
+    #[test]
+    fn format_leaves_augmented_assignment_alone() {
+        // `+=` must not get spaces around `=`. The augmented operators
+        // are atomic two-char tokens.
+        let _guard = lock_env();
+        let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
+        unsafe {
+            std::env::set_var("TYC_FMT_DISABLE_RUFF", "1");
+        }
+        let src = "x += 1\n";
+        let result = format_source(src, "<test>").unwrap();
+        assert!(
+            result.output.contains("x += 1"),
+            "augmented assignment must stay tight, got: {:?}",
+            result.output
+        );
         unsafe {
             match prior {
                 Some(v) => std::env::set_var("TYC_FMT_DISABLE_RUFF", v),

@@ -136,6 +136,7 @@ pub fn run(args: RunArgs) -> Result<()> {
             },
             no_format: false,
             check: false,
+            no_sync: false,
         })?;
     }
 

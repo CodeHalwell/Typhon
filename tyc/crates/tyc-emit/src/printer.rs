@@ -49,6 +49,13 @@ pub struct Emitter {
     /// so the emitted module parses on 3.10 / 3.11 (FINDINGS #47).
     /// `0` means "unset" and disables lowering.
     target_minor: u8,
+    /// Optional reference to the original (pre-parse) source. When
+    /// present, the printer can peek at a node's source range to
+    /// recover purely-syntactic choices that the AST collapses —
+    /// notably the bracket style on `MatchSequence` patterns where
+    /// `[a, b]` and `(a, b)` are semantically identical but users
+    /// have a stylistic preference (O27 / FINDINGS #111).
+    source: Option<String>,
 }
 
 const INDENT_WIDTH: usize = 4;
@@ -64,7 +71,17 @@ impl Emitter {
             prev_top_level_was_block: false,
             fstring_quote_stack: Vec::new(),
             target_minor: 0,
+            source: None,
         }
+    }
+
+    /// Attach the original source text so the printer can recover
+    /// stylistic choices from node `TextRange`s. Currently used by
+    /// `tyc fmt` to round-trip `[a, b]` vs `(a, b)` sequence patterns
+    /// (O27 / FINDINGS #111) — when the source is absent the printer
+    /// falls back to the default bracket choice.
+    pub fn set_source(&mut self, source: String) {
+        self.source = Some(source);
     }
 
     /// Configure this emitter to drop Typhon's `let`/`mut` soft keywords.
@@ -124,6 +141,16 @@ impl Emitter {
         for _ in trailing..count {
             self.newline();
         }
+    }
+
+    /// When the printer has the original source attached, return the
+    /// first byte of `range` in that buffer. Returns `None` when no
+    /// source is attached, when the range starts past the end of the
+    /// buffer, or when the range is synthesised (zero start).
+    fn original_first_byte(&self, range: ruff_text_size::TextRange) -> Option<u8> {
+        let source = self.source.as_deref()?;
+        let start = usize::from(range.start());
+        source.as_bytes().get(start).copied()
     }
 
     fn indent_str(&self) -> String {
@@ -1510,13 +1537,20 @@ impl Emitter {
             Pattern::MatchSequence(seq) => {
                 // Python's sequence patterns accept both `[a, b]` and
                 // `(a, b)` (PEP 634); they're semantically identical and
-                // both match list *or* tuple instances. We default to
-                // parens for 2+ elements because it reads better in
-                // emitted Python ("destructure this pair"), but keep
-                // brackets for 0/1 elements where parens would be
-                // ambiguous (`()` is invalid in pattern position; `(a)`
-                // would parse as a capture, not a 1-tuple).
-                let use_parens = seq.patterns.len() >= 2;
+                // both match list *or* tuple instances. When the source
+                // is available we peek at the first byte of the
+                // pattern's `TextRange` to recover the user's original
+                // bracket choice (O27 / FINDINGS #111). When unavailable
+                // we default to parens for 2+ elements (reads better in
+                // emitted Python — "destructure this pair") and brackets
+                // for 0/1 elements where parens would be ambiguous
+                // (`()` is invalid in pattern position; `(a)` would
+                // parse as a capture, not a 1-tuple).
+                let use_parens = match self.original_first_byte(seq.range()) {
+                    Some(b'[') => false,
+                    Some(b'(') => true,
+                    _ => seq.patterns.len() >= 2,
+                };
                 let (open, close) = if use_parens { ("(", ")") } else { ("[", "]") };
                 self.write(open);
                 let mut first = true;
@@ -2200,6 +2234,52 @@ mod tests {
             !out.contains("\n\n\n    def bar"),
             "methods must not get two blank lines between them, got: {:?}",
             out
+        );
+    }
+
+    #[test]
+    fn match_sequence_bracket_pattern_round_trips() {
+        // O27 / FINDINGS #111: when the printer has the original source,
+        // `case [a, b]:` should re-emit as `[a, b]` rather than the
+        // default `(a, b)`. The bracket choice is preserved verbatim.
+        let src = "match xs:\n    case [a, b]:\n        pass\n";
+        let parsed = parse_module(src).expect("parse failed");
+        let mut emitter = crate::Emitter::new();
+        emitter.set_source(src.to_owned());
+        emitter.emit_mod(parsed.syntax());
+        let out = emitter.finish();
+        assert!(
+            out.contains("case [a, b]"),
+            "bracket pattern should round-trip when source is attached, got: {out}",
+        );
+    }
+
+    #[test]
+    fn match_sequence_paren_pattern_round_trips() {
+        // Same as above but the original was `case (a, b):` —
+        // parens should still emit as parens.
+        let src = "match xs:\n    case (a, b):\n        pass\n";
+        let parsed = parse_module(src).expect("parse failed");
+        let mut emitter = crate::Emitter::new();
+        emitter.set_source(src.to_owned());
+        emitter.emit_mod(parsed.syntax());
+        let out = emitter.finish();
+        assert!(
+            out.contains("case (a, b)"),
+            "paren pattern should round-trip when source is attached, got: {out}",
+        );
+    }
+
+    #[test]
+    fn match_sequence_without_source_uses_default() {
+        // Without `set_source`, the printer falls back to the default
+        // bracket choice — parens for 2+ elements. This guards against
+        // regressions in callers that don't (or can't) attach source.
+        let src = "match xs:\n    case [a, b]:\n        pass\n";
+        let out = round_trip(src);
+        assert!(
+            out.contains("case (a, b)"),
+            "default bracket choice should be parens for 2-elem, got: {out}",
         );
     }
 

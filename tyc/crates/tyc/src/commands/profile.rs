@@ -38,6 +38,7 @@ pub fn run(args: ProfileArgs) -> Result<()> {
         out: args.out.clone(),
         no_format: false,
         check: false,
+        no_sync: false,
     })?;
 
     // Discover the build directory.  We mirror the resolution rules from

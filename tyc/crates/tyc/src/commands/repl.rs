@@ -40,8 +40,8 @@ use tyc_db::{check_file, TycDatabase};
 use tyc_desugar::{desugar_module_with, DesugarOptions};
 use tyc_emit::emit_python_with_line_offsets;
 use tyc_syntax::preprocess::{
-    expand_gather_blocks, expand_go_calls, expand_lazy_imports, expand_multiline_guards,
-    expand_pipes, expand_question_ops, expand_with_chains, preprocess,
+    expand_gather_blocks, expand_go_calls, expand_inline_question_ops, expand_lazy_imports,
+    expand_multiline_guards, expand_pipes, expand_question_ops, expand_with_chains, preprocess,
 };
 
 /// Arguments for `tyc repl`.
@@ -484,9 +484,11 @@ fn is_none_returning_top_level_call(expr: &str) -> bool {
 }
 
 pub(crate) fn compile_to_python(source: &str) -> Result<String> {
-    let expanded = expand_question_ops(&expand_pipes(&expand_with_chains(&expand_go_calls(
-        &expand_gather_blocks(&expand_multiline_guards(&expand_lazy_imports(source))),
-    ))));
+    let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
+        &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
+            &expand_multiline_guards(&expand_lazy_imports(source)),
+        ))),
+    )));
     let prep = preprocess(&expanded);
 
     let mut db = TycDatabase::new();

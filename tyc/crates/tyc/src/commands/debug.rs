@@ -190,6 +190,7 @@ pub fn run(args: DebugArgs) -> Result<()> {
             out: None,
             no_format: false,
             check: false,
+            no_sync: false,
         })?;
     }
 

@@ -121,6 +121,7 @@ pub fn run(args: StubtestArgs) -> Result<()> {
             out: Some(out_dir.clone()),
             no_format: false,
             check: false,
+            no_sync: false,
         })?;
     }
 
