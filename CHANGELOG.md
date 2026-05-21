@@ -4,50 +4,12 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## 0.2.4
-
-LSP hover developer-UX polish on top of the 0.2.3 introspection
-docs. Three adjacent fixes targeting the "hover an imported class
-and learn what it does" path:
-
-### Added
-
-- **Pre-warming on document open / change.** `check_and_publish`
-  now spawns a detached task that introspects every third-party
-  import in the open buffer the moment the file is parsed, so the
-  cache is hot by the time the user hovers. The first hover used
-  to wait on the subprocess (30–100 ms typical); subsequent hovers
-  hit the same `HashMap` entry. The prewarm itself never blocks
-  diagnostics publishing — it's spawned through
-  `tokio::task::spawn_blocking` and discarded.
-- **Markdown rendering for hover.** Hover now publishes
-  `MarkupContent { kind: Markdown, … }` instead of the older
-  `MarkedString::String` shape, so signatures appear in fenced
-  `python` code blocks and docstrings render as proper paragraphs
-  with whatever Markdown the upstream library wrote.
-- **Multi-line docstrings.** The Python introspection script now
-  returns the full docstring (up to 4 KB) instead of the first
-  line; the LSP strips PEP 257 indentation and trims surrounding
-  blanks before rendering. Caps the visible body at 40 lines with
-  an explicit truncation marker so module-level docstrings (numpy,
-  pandas, sklearn) don't flood the popover.
-- **Off-runtime introspection in hover.** The hover handler runs
-  the (potentially cold) `cache.members()` call through
-  `tokio::task::spawn_blocking` so a worst-case 5-second timeout
-  can never stall the async runtime. The prewarm makes cold hits
-  rare; this is the safety net for the case where the prewarm
-  hasn't completed yet (large project, slow venv import).
-
-### Tests
-
-- 5 new tests in `tyc-lsp` covering `render_docstring` (PEP 257
-  strip, blank-line trim, 40-line cap, empty input) and `sig_tail`
-  (prefix strip, unknown-shape pass-through).
-
 ## 0.2.3
 
-UX polish on the arity diagnostic landed in 0.2.2, plus library
-docstring previews in the LSP. Two adjacent fixes:
+UX polish on the arity diagnostic landed in 0.2.2 plus full hover
+developer-UX for third-party imports in the LSP. Lands as one
+release: the diagnostic naming and the hover preview are the same
+"tell me what's wrong / tell me what this thing is" story.
 
 ### Added
 
@@ -60,19 +22,59 @@ docstring previews in the LSP. Two adjacent fixes:
   misleading "expected 1, got 4". Multiple missing names render as
   ``` `a`, `b` ``` with the plural form. `tyc::arg_count` still
   fires for shape mismatches that can't be reduced to a missing-name
-  list (too many positionals, positional+kwarg conflict).
+  list — `missing_required_fields` and `missing_required_params`
+  detect positional+kwarg double-binding, too-many-positionals, and
+  `*iter` / `**dict` unpacks and return empty so the count-based
+  diagnostic stays the source of truth for those cases.
 - **LSP hover docs for third-party imports.** Hovering an imported
   class or function in VS Code (or any LSP-aware editor) now shows
-  the source module, the recovered signature, and the first line of
-  the runtime docstring — pulled from the same venv-introspection
-  cache that already powers completion. Project / stdlib symbols
-  fall through to the existing kind-only hover.
+  the source module, the recovered signature in a fenced `python`
+  code block, and the runtime docstring rendered as proper Markdown
+  — pulled from the same venv-introspection cache that already
+  powers completion. Project / stdlib symbols fall through to the
+  existing kind-only hover.
+- **Responsive prewarm on document open / change.**
+  `check_and_publish` spawns a detached task that introspects every
+  third-party import in the open buffer the moment the file is
+  parsed, so the cache is hot by the time the user hovers. The
+  first hover used to wait on the subprocess (30–100 ms typical);
+  subsequent hovers hit the cache. The prewarm never blocks
+  diagnostics publishing, and is debounced by document version so
+  rapid typing doesn't queue redundant blocking-thread work.
+- **Markdown rendering for hover.** Hover now publishes
+  `MarkupContent { kind: Markdown, … }` instead of the older
+  `MarkedString::String` shape so signatures appear in fenced
+  code blocks and docstrings render as paragraphs.
+- **Multi-line docstrings.** The Python introspection script now
+  returns the full docstring (up to 4 KB) instead of the first
+  line; the LSP strips PEP 257 indentation and trims surrounding
+  blanks before rendering. Caps the visible body at 40 lines with
+  an explicit truncation marker so module-level docstrings (numpy,
+  pandas, sklearn) don't flood the popover.
+- **Off-runtime introspection in hover.** The hover handler runs
+  the cold-path `cache.members()` call through
+  `tokio::task::spawn_blocking` so a worst-case 5-second timeout
+  can never stall the async runtime. The prewarm makes cold hits
+  rare; this is the safety net for the case where the prewarm
+  hasn't completed yet.
+- **Poisoned-mutex recovery on hover + prewarm.** Both paths now
+  recover poisoned `IntrospectionCache` mutexes via
+  `into_inner()`, matching the completion path. A prior panic no
+  longer permanently disables hover / prewarm for the rest of the
+  session.
 
 ### Tests
 
 - The three `tyc-db` cross-module tests and the four `tyc-types`
   arity tests that asserted on "wrong number of arguments" now
   match the new wording (and assert on the specific missing name).
+- 4 new regression tests in `tyc-types` covering the
+  `missing_argument` guards: positional+kwarg double-binding (ctor
+  + free fn), too-many-positionals (ctor + free fn with kw-only
+  required).
+- 5 new tests in `tyc-lsp` covering `render_docstring` (PEP 257
+  strip, blank-line trim, 40-line cap, empty input) and `sig_tail`
+  (prefix strip, unknown-shape pass-through).
 - One `tyc-types` arity test on `def add(a, b)` accepts either
   wording to stay forward-compatible with future diagnostic
   refinements.
