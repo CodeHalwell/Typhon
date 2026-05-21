@@ -84,9 +84,11 @@ distinguish public surface from internal helpers.
     let me: UserId = UserId(7)         # explicit construction
     let raw: int = me                  # escape upward is free
 
-Bare `int` flowing into a `UserId` slot is rejected
-(`tyc::newtype_violation`). Use `type` instead of `newtype` when you
-want a transparent, bidirectional alias.
+Bare `int` flowing into a `UserId` slot is rejected as
+`tyc::type_mismatch`; passing the wrong-typed argument to the
+constructor (`UserId("seven")`) fires `tyc::newtype_violation`. Use
+`type` instead of `newtype` when you want a transparent,
+bidirectional alias.
 
 ## Sealed unions + exhaustive `match`
 

@@ -76,9 +76,16 @@ Current registry of blocking callees:
 - **requests** — `get`, `post`, `put`, `delete`, `patch`, `head`,
   `options`, `request`
 - **urllib** — `urllib.request.urlopen`
-- **socket** — `recv`, `send`, `recvfrom`, `sendto`, `accept`,
-  `connect`
 - **subprocess** — `run`, `call`, `check_call`, `check_output`
+
+### Not yet covered
+
+Instance-method calls like `sock.recv(1024)`, `conn.execute(...)`,
+or `cursor.fetchone()` are **not** flagged, because the matcher
+only sees the syntactic callee (`sock.recv`, not
+`socket.socket.recv`) and the registry is keyed on the dotted
+module path. Adding receiver-aware blocking detection is a
+Phase-E follow-up.
 
 ## Configuration
 

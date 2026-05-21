@@ -1,9 +1,15 @@
 # tyc::newtype_violation
 
-Fires when a bare value of the base type is passed into a `newtype`
-constructor without satisfying the base contract, or when a bare base
-value is supplied where the newtype is expected without going through
-the explicit constructor.
+Fires when a value of the wrong type is passed into a `newtype`
+constructor — e.g. `Email("alice")` where the declared base is
+`int`. Catches the argument-type mismatch at the wrapper call site
+itself, where it is easiest to localise the fix.
+
+Cross-type assignment between newtypes (passing a `PostId` where a
+`UserId` is expected) and bare base-to-newtype flow (passing an
+`int` where a `UserId` is expected) are also rejected, but those
+land under the regular `tyc::type_mismatch` code because the
+diagnostic shape is the same as any other annotation mismatch.
 
 ## Example
 
@@ -15,12 +21,16 @@ def greet(uid: UserId) -> str:
     return f"hi {uid}"
 
 def main() -> None:
-    # error: `UserId(str)` — newtype expects an argument of type `int`
+    # tyc::newtype_violation — argument is `str`, declared base is `int`
     let bad: UserId = UserId("seven")
 
     let post: PostId = PostId(42)
-    # error: type mismatch — expected `UserId`, found `PostId`
+    # tyc::type_mismatch — expected `UserId`, found `PostId`
     greet(post)
+
+    # tyc::type_mismatch — expected `UserId`, found `int` (no construction)
+    let raw: int = 7
+    greet(raw)
 ```
 
 ## Why

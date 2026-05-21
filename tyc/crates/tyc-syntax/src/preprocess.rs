@@ -696,7 +696,18 @@ pub fn preprocess(source: &str) -> PreprocessResult {
 ///   pub plain class NAME...      pub model NAME:              pub interface NAME:
 ///   pub let NAME[: T] = EXPR     pub mut NAME[: T] = EXPR
 ///   pub newtype NAME = BASE      pub type NAME = ...
-///   pub async def NAME(...)      pub @decorator-line (the next decl carries pub forward)
+///   pub async def NAME(...)
+///
+/// Carry-forward over a `@decorator` line (so the next decl picks up
+/// the `pub` marker) is **not** supported in v1 — the pre-pass is
+/// stateless, one line at a time. Users wanting to decorate a `pub`
+/// function should write the decorator on the line above and place
+/// `pub` directly on the `def` itself:
+///
+/// ```text
+/// @cached
+/// pub def fetch(...) -> ...:
+/// ```
 ///
 /// `pub` inside a function body (`indent_len > 0`), inside a string,
 /// or on an unrecognised form is left untouched so the Python parser
@@ -757,7 +768,14 @@ fn pub_decl_name(body: &str) -> Option<String> {
     }
     // Single-word keywords.
     let single_keyword_forms = [
-        "def ", "class ", "model ", "interface ", "newtype ", "type ", "let ", "mut ",
+        "def ",
+        "class ",
+        "model ",
+        "interface ",
+        "newtype ",
+        "type ",
+        "let ",
+        "mut ",
     ];
     for kw in &single_keyword_forms {
         if let Some(rest) = body.strip_prefix(kw) {
@@ -790,13 +808,25 @@ fn ident_prefix(s: &str) -> Option<String> {
 /// `freeze let X = EXPR` shape. Returns the line content with the
 /// wrapper removed (the `freeze ` prefix is prepended by the
 /// caller); `None` if the wrapper isn't present.
+///
+/// Handles a trailing `# comment` symmetrically with [`wrap_freeze_let`]
+/// so a round-trip on `freeze let X = [1, 2]  # note` is exact.
 fn unwrap_freeze_let(content: &str) -> Option<String> {
-    let eq = content.find('=')?;
-    let lhs = content[..eq].trim_end();
-    let rhs = content[eq + 1..].trim();
+    let (code, comment) = match content.find('#') {
+        Some(i) => (&content[..i], &content[i..]),
+        None => (content, ""),
+    };
+    let eq = code.find('=')?;
+    let lhs = code[..eq].trim_end();
+    let rhs = code[eq + 1..].trim();
     let inner = rhs.strip_prefix("__typhon_freeze__(")?;
     let inner = inner.strip_suffix(')')?;
-    Some(format!("{} = {}", lhs, inner))
+    let suffix = if comment.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", comment.trim_end())
+    };
+    Some(format!("{} = {}{}", lhs, inner, suffix))
 }
 
 /// Wrap the RHS of a `freeze let` binding in `__typhon_freeze__(...)`.
@@ -805,11 +835,23 @@ fn unwrap_freeze_let(content: &str) -> Option<String> {
 /// top-level `=` and inserts the wrapper around what follows.
 /// Returns `None` if no `=` is found (the parser will then surface
 /// the user's syntax error verbatim).
+///
+/// A trailing `# comment` is split off before wrapping and
+/// reattached after the closing `)` so
+/// `freeze let X = [1, 2]  # tags` still lowers to valid Python
+/// (`let X = __typhon_freeze__([1, 2])  # tags`) rather than
+/// burying the comment inside the call expression. Mirrors the
+/// simple split-on-first-`#` convention used by
+/// [`parse_newtype_decl`] and [`parse_lazy_import`].
 fn wrap_freeze_let(tail: &str) -> Option<String> {
+    let (code, comment) = match tail.find('#') {
+        Some(i) => (&tail[..i], &tail[i..]),
+        None => (tail, ""),
+    };
     // We need the FIRST `=` that isn't inside square brackets or
     // parens (so a default-value annotation like `Dict[str, int]`
     // doesn't confuse us). Track depth.
-    let bytes = tail.as_bytes();
+    let bytes = code.as_bytes();
     let mut depth: i32 = 0;
     let mut eq_idx: Option<usize> = None;
     for (i, &b) in bytes.iter().enumerate() {
@@ -817,11 +859,29 @@ fn wrap_freeze_let(tail: &str) -> Option<String> {
             b'(' | b'[' | b'{' => depth += 1,
             b')' | b']' | b'}' => depth -= 1,
             b'=' if depth == 0 => {
-                // Skip `==`, `>=`, `<=`, `!=`, `:=`, `+=`, `-=`, `*=`,
-                // `/=`. We just need a bare `=`.
+                // Skip every augmented-assignment form (`==`, `>=`, `<=`,
+                // `!=`, `:=`, `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`,
+                // `^=`, `@=`) — we just need a bare `=`.
                 let prev = if i == 0 { 0u8 } else { bytes[i - 1] };
                 let next = bytes.get(i + 1).copied().unwrap_or(0);
-                if next == b'=' || matches!(prev, b'=' | b'>' | b'<' | b'!' | b':' | b'+' | b'-' | b'*' | b'/') {
+                if next == b'='
+                    || matches!(
+                        prev,
+                        b'=' | b'>'
+                            | b'<'
+                            | b'!'
+                            | b':'
+                            | b'+'
+                            | b'-'
+                            | b'*'
+                            | b'/'
+                            | b'%'
+                            | b'&'
+                            | b'|'
+                            | b'^'
+                            | b'@'
+                    )
+                {
                     continue;
                 }
                 eq_idx = Some(i);
@@ -831,12 +891,17 @@ fn wrap_freeze_let(tail: &str) -> Option<String> {
         }
     }
     let eq = eq_idx?;
-    let lhs = tail[..eq].trim_end();
-    let rhs = tail[eq + 1..].trim();
+    let lhs = code[..eq].trim_end();
+    let rhs = code[eq + 1..].trim();
     if rhs.is_empty() {
         return None;
     }
-    Some(format!("{} = __typhon_freeze__({})", lhs, rhs))
+    let suffix = if comment.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", comment.trim_end())
+    };
+    Some(format!("{} = __typhon_freeze__({}){}", lhs, rhs, suffix))
 }
 
 /// Parse the tail of a `newtype` line: `Name = Base`.
@@ -5247,6 +5312,42 @@ mod tests {
             .stripped
             .iter()
             .any(|k| matches!(k.keyword, TyphonKeyword::Freeze)));
+    }
+
+    #[test]
+    fn freeze_let_preserves_trailing_comment() {
+        // PR #95 reviewer feedback: a trailing `# comment` must not be
+        // swallowed by the `__typhon_freeze__(...)` call. Verify the
+        // wrapper closes BEFORE the comment so the emitted Python is
+        // syntactically valid.
+        let result = preprocess("freeze let TAGS = [1, 2]  # ids\n");
+        assert_eq!(
+            result.python_source,
+            "let TAGS = __typhon_freeze__([1, 2])  # ids\n"
+        );
+    }
+
+    #[test]
+    fn freeze_let_with_comment_round_trips_via_postprocess() {
+        let src = "freeze let TAGS = [1, 2]  # ids\n";
+        let prep = preprocess(src);
+        let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn freeze_let_does_not_match_augmented_assign() {
+        // PR #95 reviewer feedback: `%=`, `&=`, `|=`, `^=`, `@=`
+        // augmented-assignment operators must not be mistaken for the
+        // bare `=` that anchors the RHS. None of these are valid
+        // module-level statements after `freeze let`, but the helper
+        // still has to fall through cleanly rather than wrap the LHS.
+        // (We exercise the helper directly to keep the test focused.)
+        assert_eq!(wrap_freeze_let("X %= 1"), None);
+        assert_eq!(wrap_freeze_let("X &= 1"), None);
+        assert_eq!(wrap_freeze_let("X |= 1"), None);
+        assert_eq!(wrap_freeze_let("X ^= 1"), None);
+        assert_eq!(wrap_freeze_let("X @= 1"), None);
     }
 
     // ── pub keyword (Phase D) ───────────────────────────────────────────

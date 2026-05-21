@@ -1653,24 +1653,61 @@ def deep_freeze(value: Any) -> Any:
     containers are returned as-is. Raises `TypeError` when *value*
     holds something with no clean immutable equivalent so users find
     out at startup rather than via a subtle aliasing bug later.
+
+    Cycles (a list that contains itself, mutual references between
+    dicts) are rejected with `TypeError` rather than recursing to a
+    stack overflow.
     \"\"\"
+    return _deep_freeze(value, set())
+
+
+def _deep_freeze(value: Any, seen: set[int]) -> Any:
     if isinstance(value, _FROZEN_PRIMITIVES):
         return value
+    # Cycle guard: only mutable containers (list, dict, set) and the
+    # immutable containers we descend into can form cycles, so track
+    # `id(value)` for those branches. Primitives are skipped above.
+    value_id = id(value)
+    if value_id in seen:
+        raise TypeError(
+            f\"deep_freeze cannot freeze {type(value).__name__}; \"
+            \"the value contains a reference cycle\"
+        )
     if isinstance(value, _FROZEN_CONTAINERS):
         # Even though the container itself is immutable, its contents may
         # not be — descend into tuples and frozensets so a tuple of lists
         # really is deeply immutable after one call.
         if isinstance(value, tuple):
-            return tuple(deep_freeze(v) for v in value)
+            seen.add(value_id)
+            try:
+                return tuple(_deep_freeze(v, seen) for v in value)
+            finally:
+                seen.discard(value_id)
         if isinstance(value, frozenset):
-            return frozenset(deep_freeze(v) for v in value)
+            seen.add(value_id)
+            try:
+                return frozenset(_deep_freeze(v, seen) for v in value)
+            finally:
+                seen.discard(value_id)
         return value
     if isinstance(value, list):
-        return tuple(deep_freeze(v) for v in value)
+        seen.add(value_id)
+        try:
+            return tuple(_deep_freeze(v, seen) for v in value)
+        finally:
+            seen.discard(value_id)
     if isinstance(value, dict):
-        return MappingProxyType({k: deep_freeze(v) for k, v in value.items()})
+        seen.add(value_id)
+        try:
+            return MappingProxyType({k: _deep_freeze(v, seen) for k, v in value.items()})
+        finally:
+            seen.discard(value_id)
     if isinstance(value, set):
-        return frozenset(deep_freeze(v) for v in value)
+        seen.add(value_id)
+        try:
+            return frozenset(_deep_freeze(v, seen) for v in value)
+        finally:
+            seen.discard(value_id)
     # `@dataclass(frozen=True)` instances already block field reassignment
     # at the dataclass level. We can't deep-freeze their nested fields
     # without rebuilding the instance, which would defeat identity. Accept

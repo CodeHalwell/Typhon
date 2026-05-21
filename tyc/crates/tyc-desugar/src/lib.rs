@@ -132,10 +132,8 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
     // flag here so `tyc build` emits the typhon_runtime/ package even
     // when no other runtime feature is used.
     let needs_freeze_runtime = stmts_use_freeze_call(&desugared_mod.body);
-    let needs_typhon_runtime = has_result_usage
-        || has_any_runtime_import
-        || has_runtime_qualified
-        || needs_freeze_runtime;
+    let needs_typhon_runtime =
+        has_result_usage || has_any_runtime_import || has_runtime_qualified || needs_freeze_runtime;
     // Only skip injection when an existing `from typhon_runtime
     // import …` already covers all three names. A partial import
     // (e.g. just `Ok`) would leave `Err`/`Result` undefined, so we
@@ -183,42 +181,67 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
     let mut body = desugared_mod.body;
     let insert_at = import_insert_pos(&body);
 
-    // Insert imports in reverse order so later `insert_at` calls don't
-    // shift indices of earlier insertions.
-    if inject_runtime_module {
-        body.insert(insert_at, make_bare_typhon_runtime_import());
-    }
-    if inject_asyncio {
-        body.insert(insert_at, make_asyncio_import());
-    }
-    if inject_protocol {
-        body.insert(insert_at, make_protocol_import());
-    }
-    if inject_newtype {
-        body.insert(insert_at, make_newtype_import());
-    }
-    if inject_freeze {
-        body.insert(insert_at, make_freeze_import());
-    }
     // `pub` synthesis: when the source declared at least one `pub`
     // name, emit `__all__ = ["a", "b", …]` right after the import
     // block so re-exporters and `import *` consumers see the public
     // surface. Skipped if the module already provides its own
-    // `__all__` so handwritten lists win.
-    if !options.pub_names.is_empty() && !body.iter().any(is_dunder_all_assignment) {
-        body.insert(insert_at, make_dunder_all(&options.pub_names));
+    // `__all__` so handwritten lists win. Compute the insertion
+    // need now — but defer the actual insert until AFTER every
+    // injected import has landed (otherwise repeated `Vec::insert`
+    // at the same index would splice `__all__` into the middle of
+    // the import block).
+    let inject_dunder_all =
+        !options.pub_names.is_empty() && !body.iter().any(is_dunder_all_assignment);
+
+    // Insert imports in reverse order so later `insert_at` calls don't
+    // shift indices of earlier insertions. The relative order ends up
+    // pydantic → result → freeze → newtype → protocol → asyncio →
+    // runtime_module at the top of the file.
+    let mut imports_inserted: usize = 0;
+    let mut inject = |body: &mut Vec<Stmt>, stmt: Stmt| {
+        body.insert(insert_at, stmt);
+        imports_inserted += 1;
+    };
+    if inject_runtime_module {
+        inject(&mut body, make_bare_typhon_runtime_import());
+    }
+    if inject_asyncio {
+        inject(&mut body, make_asyncio_import());
+    }
+    if inject_protocol {
+        inject(&mut body, make_protocol_import());
+    }
+    if inject_newtype {
+        inject(&mut body, make_newtype_import());
+    }
+    if inject_freeze {
+        inject(&mut body, make_freeze_import());
     }
     if inject_result_import {
-        body.insert(insert_at, make_typhon_runtime_import());
+        inject(&mut body, make_typhon_runtime_import());
     }
     // Emit the fewest imports possible: combine into one statement when
     // both are needed, otherwise emit just the missing one.
     if inject_basemodel && inject_config_dict {
-        body.insert(insert_at, make_pydantic_basemodel_import()); // includes both
+        inject(&mut body, make_pydantic_basemodel_import()); // includes both
     } else if inject_basemodel {
-        body.insert(insert_at, make_pydantic_basemodel_only_import());
+        inject(&mut body, make_pydantic_basemodel_only_import());
     } else if inject_config_dict {
-        body.insert(insert_at, make_config_dict_only_import());
+        inject(&mut body, make_config_dict_only_import());
+    }
+    // Drop the closure so `body` is owned solely again before the
+    // `__all__` insert below — the borrow-checker would otherwise
+    // complain about overlapping mutable borrows.
+    drop(inject);
+
+    if inject_dunder_all {
+        // Place `__all__` AFTER the last injected import so it never
+        // splits the import block. `insert_at + imports_inserted` is
+        // the index right after the run of imports that landed above.
+        body.insert(
+            insert_at + imports_inserted,
+            make_dunder_all(&options.pub_names),
+        );
     }
 
     DesugarOutput {
@@ -638,9 +661,10 @@ fn make_dunder_all(names: &[String]) -> Stmt {
 /// even when `pub` declarations are present.
 fn is_dunder_all_assignment(stmt: &Stmt) -> bool {
     match stmt {
-        Stmt::Assign(a) => a.targets.iter().any(|t| {
-            matches!(t, Expr::Name(n) if n.id.as_str() == "__all__")
-        }),
+        Stmt::Assign(a) => a
+            .targets
+            .iter()
+            .any(|t| matches!(t, Expr::Name(n) if n.id.as_str() == "__all__")),
         Stmt::AnnAssign(a) => {
             matches!(a.target.as_ref(), Expr::Name(n) if n.id.as_str() == "__all__")
         }

@@ -1613,32 +1613,21 @@ impl<'a> Checker<'a> {
         if assignable(expected, actual) {
             return true;
         }
-        // Nominal newtype: `Email → str` is allowed (escape upward),
-        // `Email → Email` is allowed (same name), but `str → Email` is
-        // not — the caller must construct via `Email(x)`. The "escape
-        // upward" rule lives here so a `UserId` flows freely into an
-        // `int`-typed slot; the rejection direction is the default (we
-        // fall through to `false`).
-        if let Type::Class(expected_name) = expected {
-            if let Type::Class(actual_name) = actual {
-                if expected_name == actual_name {
-                    return true;
-                }
-            }
-            // Expected is not a newtype, but actual might be — unwrap and
-            // retry. `Email → str` reaches this branch with `expected=str`
-            // (a primitive) and `actual=Class("Email")`.
-            if let Type::Class(actual_name) = actual {
-                if let Some(base) = self.newtypes.get(actual_name.as_str()) {
-                    if self.is_assignable(expected, base) {
-                        return true;
-                    }
-                }
-            }
-        }
+        // Nominal newtype escape upward: `Email → str` is allowed
+        // because the runtime value of `Email` *is* a `str`. The
+        // reverse direction is the default `false` so a bare `str`
+        // never satisfies an `Email`-typed slot without going
+        // through the explicit `Email(x)` constructor. Same-name
+        // newtypes (`Email → Email`) are already handled by the
+        // base `assignable` call above.
+        //
+        // The unwrap chain is bounded by `unwrap_newtype_base` so a
+        // self-referential or cyclic newtype (`newtype A = A`, or
+        // `newtype A = B; newtype B = A`) returns a fallback type
+        // instead of recursing indefinitely.
         if let Type::Class(actual_name) = actual {
-            if let Some(base) = self.newtypes.get(actual_name.as_str()) {
-                if self.is_assignable(expected, base) {
+            if let Some(base) = self.unwrap_newtype_base(actual_name.as_str()) {
+                if self.is_assignable(expected, &base) {
                     return true;
                 }
             }
@@ -1749,6 +1738,32 @@ impl<'a> Checker<'a> {
     /// as follow-up).
     fn unwrap_alias(&self, ty: &Type) -> Type {
         self.unwrap_alias_inner(ty, 0)
+    }
+
+    /// Unwrap a chain of `newtype Foo = …` declarations until a non-
+    /// newtype base type is reached, or until the chain length hits the
+    /// guard limit (a cycle like `newtype A = A` or `A → B → A`). The
+    /// guard returns `None` so the caller falls through to the normal
+    /// "no escape upward" path and the user sees a `tyc::type_mismatch`
+    /// instead of `tyc check` overflowing the stack.
+    fn unwrap_newtype_base(&self, name: &str) -> Option<Type> {
+        let mut current = name.to_owned();
+        for _ in 0..8 {
+            let base = self.newtypes.get(current.as_str())?.clone();
+            // Follow chains of newtypes (`newtype A = B; newtype B = int`).
+            if let Type::Class(next) = &base {
+                if self.newtypes.contains_key(next.as_str()) {
+                    if next.as_str() == current {
+                        // Trivial self-cycle (`newtype A = A`).
+                        return None;
+                    }
+                    current = next.clone();
+                    continue;
+                }
+            }
+            return Some(base);
+        }
+        None
     }
 
     fn unwrap_alias_inner(&self, ty: &Type, depth: u8) -> Type {
@@ -2982,18 +2997,26 @@ fn seed_typhon_builtins(c: &mut Checker) {
 
 /// Stdlib calls that block the event loop when invoked from inside an
 /// `async def` body. Matched against the dotted callee path returned
-/// by [`dotted_callee_path`], so `time.sleep`, `socket.recv`, and a
-/// bare `input` all flow through the same lookup. Direct calls fire
+/// by [`dotted_name_of`], so `time.sleep` and bare `input` flow
+/// through the same lookup. Direct calls fire
 /// `tyc::blocking_in_async`; the user can wrap them in `await
 /// asyncio.to_thread(...)` (which the wrapper-detection below
 /// excludes) or `loop.run_in_executor(...)` to silence the
 /// diagnostic. Conservative — only the most common offenders.
+///
+/// **Module-level calls only.** Instance-method calls like
+/// `sock.recv(1024)` cannot be matched by syntactic callee path
+/// without flow-sensitive receiver tracking, so blocking socket
+/// methods (`recv`, `send`, `accept`, …) are intentionally **not**
+/// in this list — they would never trigger and would mislead users
+/// into thinking the check covers them. Tracking instance-method
+/// receivers is a Phase-E follow-up.
 const BLOCKING_CALLEES: &[&str] = &[
     // time
     "time.sleep",
     // I/O
     "input",
-    // requests
+    // requests (module-level convenience functions)
     "requests.get",
     "requests.post",
     "requests.put",
@@ -3004,14 +3027,7 @@ const BLOCKING_CALLEES: &[&str] = &[
     "requests.request",
     // urllib
     "urllib.request.urlopen",
-    // socket (blocking sync ops)
-    "socket.recv",
-    "socket.send",
-    "socket.recvfrom",
-    "socket.sendto",
-    "socket.accept",
-    "socket.connect",
-    // subprocess
+    // subprocess (module-level convenience functions)
     "subprocess.run",
     "subprocess.call",
     "subprocess.check_call",
@@ -3078,14 +3094,13 @@ fn check_resource_discipline_stmt(c: &mut Checker, stmt: &Stmt) {
                         a.value.range().start().to_usize(),
                         a.value.range().end().to_usize(),
                     );
-                    c.diagnostics
-                        .push_warning(TycError::resource_not_managed(
-                            &name,
-                            &c.path,
-                            c.source,
-                            span.0,
-                            span.1.saturating_sub(span.0).max(1),
-                        ));
+                    c.diagnostics.push_warning(TycError::resource_not_managed(
+                        &name,
+                        &c.path,
+                        c.source,
+                        span.0,
+                        span.1.saturating_sub(span.0).max(1),
+                    ));
                 }
             }
         }
@@ -3093,18 +3108,14 @@ fn check_resource_discipline_stmt(c: &mut Checker, stmt: &Stmt) {
             if let Some(v) = a.value.as_ref() {
                 if let Some(name) = dotted_callee_path(v.as_ref()) {
                     if REQUIRE_WITH_CALLEES.iter().any(|p| *p == name) {
-                        let span = (
-                            v.range().start().to_usize(),
-                            v.range().end().to_usize(),
-                        );
-                        c.diagnostics
-                            .push_warning(TycError::resource_not_managed(
-                                &name,
-                                &c.path,
-                                c.source,
-                                span.0,
-                                span.1.saturating_sub(span.0).max(1),
-                            ));
+                        let span = (v.range().start().to_usize(), v.range().end().to_usize());
+                        c.diagnostics.push_warning(TycError::resource_not_managed(
+                            &name,
+                            &c.path,
+                            c.source,
+                            span.0,
+                            span.1.saturating_sub(span.0).max(1),
+                        ));
                     }
                 }
             }
@@ -9133,7 +9144,10 @@ let raw: int = 7
 let _msg: str = greet(raw)
 ";
         let d = check(src);
-        assert!(d.has_errors(), "expected type mismatch on bare int → UserId");
+        assert!(
+            d.has_errors(),
+            "expected type mismatch on bare int → UserId"
+        );
     }
 
     #[test]
@@ -9171,6 +9185,36 @@ let bad: UserId = UserId(\"seven\")
 ";
         let d = check(src);
         assert!(d.has_errors(), "expected newtype_violation for str arg");
+    }
+
+    #[test]
+    fn newtype_self_cycle_does_not_overflow() {
+        // PR #95 reviewer feedback: `newtype A = A` (and longer
+        // chains like `A → B → A`) must not stack-overflow the
+        // checker. The unwrap helper bounds the chain length so the
+        // checker just rejects the assignment with a regular
+        // `tyc::type_mismatch` instead of running away.
+        let src = "\
+newtype A = A
+let x: A = 1
+";
+        let d = check(src);
+        // We don't care WHICH diagnostic fires, only that the checker
+        // finishes — the bug under repair was a stack overflow, not a
+        // misclassification.
+        let _ = d.errors();
+    }
+
+    #[test]
+    fn newtype_mutual_cycle_does_not_overflow() {
+        // Same guarantee for a two-step cycle.
+        let src = "\
+newtype A = B
+newtype B = A
+let x: A = 1
+";
+        let d = check(src);
+        let _ = d.errors();
     }
 
     // ── blocking in async (Phase E) ─────────────────────────────────────
