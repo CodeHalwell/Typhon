@@ -93,9 +93,12 @@ corpus shook out:
 
 ### Tests
 
-- 7 new regression tests in `tyc-types` covering E2, E3, E4, E5, E6.
-- 2 new regression tests in `tyc-analyse` covering E7 (the happy path
-  plus the format-spec rejection).
+- 7 new regression tests in `tyc-types` covering E2, E3, E4, E5,
+  E6 (positional / shorter-positional class patterns), and the
+  dunder-rejects-arg-type-mismatch case added during PR-#87 review.
+- 3 new regression tests in `tyc-analyse` covering E7 (the happy
+  path, the format-spec rejection, and the
+  list/tuple/dict-interpolation rejection added in PR-#87 review).
 - 6 new emit round-trip tests in `tyc-emit` covering the
   paren-stripping shapes (`(BinOp).attr`, `(BinOp)[idx]`,
   `(ternary).attr`, `(lambda)(arg)`, `(Or).And`,

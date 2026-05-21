@@ -515,7 +515,7 @@ fn eval_expr(expr: &Expr, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue, St
                                         );
                                     }
                                     let v = eval_expr(&interp.expression, ctx)?;
-                                    out.push_str(&comptime_str(&v));
+                                    out.push_str(&comptime_str(&v)?);
                                 }
                             }
                         }
@@ -539,27 +539,35 @@ fn eval_expr(expr: &Expr, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue, St
 }
 
 /// String form of a comptime value as it would appear inside an
-/// f-string interpolation — matches Python's `str(...)` for the
-/// supported primitives. Unquoted, since the surrounding f-string
-/// already provides the quotes.
-fn comptime_str(v: &ComptimeValue) -> String {
+/// f-string interpolation. Best-effort match for Python's
+/// `str(int)` / `str(bool)` / `str(str)`; for `str(float)` we use
+/// Rust's default float formatting, which agrees with Python on the
+/// common cases but diverges on a few pathological shapes
+/// (exponent rendering, `inf` / `nan` casing). Container values
+/// (`list`, `tuple`, `dict`) are explicitly rejected — Python's
+/// `str([1, 2, 3])` matches our literal form, but a list containing
+/// strings would emit double-quoted literals here while Python emits
+/// single-quoted, so we'd produce a divergent constant. Unquoted,
+/// since the surrounding f-string already provides the quotes
+/// (codex / copilot reviews on PR #87).
+fn comptime_str(v: &ComptimeValue) -> Result<String, String> {
     match v {
-        ComptimeValue::Int(n) => n.to_string(),
+        ComptimeValue::Int(n) => Ok(n.to_string()),
         ComptimeValue::Float(f) => {
             if f.is_finite() && f.fract() == 0.0 {
-                format!("{:.1}", f)
+                Ok(format!("{:.1}", f))
             } else {
-                format!("{}", f)
+                Ok(format!("{}", f))
             }
         }
-        ComptimeValue::Str(s) => s.clone(),
-        ComptimeValue::Bool(b) => if *b { "True" } else { "False" }.to_owned(),
-        // For lists / tuples / dicts, fall back to the literal form
-        // (with brackets / parens / braces). Matches Python's
-        // `str([1, 2, 3])` → `"[1, 2, 3]"` shape.
-        ComptimeValue::List(_) | ComptimeValue::Tuple(_) | ComptimeValue::Dict(_) => {
-            v.to_python_literal()
-        }
+        ComptimeValue::Str(s) => Ok(s.clone()),
+        ComptimeValue::Bool(b) => Ok(if *b { "True" } else { "False" }.to_owned()),
+        ComptimeValue::List(_) | ComptimeValue::Tuple(_) | ComptimeValue::Dict(_) => Err(
+            "f-string interpolation of list/tuple/dict values is not supported at comptime — \
+             Python's `str([...])` uses single-quoted string repr internally and the comptime \
+             literal form uses double quotes, so the two would produce different constants"
+                .to_owned(),
+        ),
     }
 }
 
@@ -1453,6 +1461,20 @@ comptime let TITLE: str = f\"{APP} v{MAJOR}.{MINOR}\"
             matches!(values.get("TITLE"), Some(ComptimeValue::Str(s)) if s == "MyApp v2.5"),
             "TITLE should be \"MyApp v2.5\", got {:?}",
             values.get("TITLE")
+        );
+    }
+
+    #[test]
+    fn fstring_container_interpolation_rejected_in_comptime() {
+        // Python's `str(['x'])` -> "['x']" with single-quoted strings,
+        // but our literal form uses double quotes. To avoid silently
+        // emitting a divergent constant, we reject container values in
+        // f-string interpolation outright (codex review on PR #87).
+        let src = "comptime let X: str = f\"{['x']}\"\n";
+        let (_, diags) = eval(src);
+        assert!(
+            diags.has_errors(),
+            "list interpolation should be rejected at comptime"
         );
     }
 

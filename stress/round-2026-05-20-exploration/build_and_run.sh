@@ -3,9 +3,31 @@
 #   build status (BUILD_OK / BUILD_FAIL)
 #   if BUILD_OK: run status (RUN_OK / RUN_FAIL exit=N)
 #   if requested: emitted python on stdout
+#
+# Override via env:
+#   TYC=/path/to/tyc        — default: <repo>/tyc/target/release/tyc
+#   PYTHON=python3.13       — default: first python3.13 on PATH,
+#                             else python3, else python.
+#   SHOW_EMIT=1             — also dump emitted Python on stdout.
 set -u
-TYC="${TYC:-/home/user/Typhon/tyc/target/release/tyc}"
-PY="${PYTHON:-/usr/bin/python3.13}"
+repo_root=$(git rev-parse --show-toplevel 2>/dev/null)
+if [ -z "$repo_root" ]; then
+    repo_root=$(cd "$(dirname "$0")/../.." && pwd)
+fi
+TYC="${TYC:-$repo_root/tyc/target/release/tyc}"
+if [ ! -x "$TYC" ]; then
+    echo "tyc binary not found at $TYC — set TYC=… or build with 'cargo build --release' in tyc/" >&2
+    exit 1
+fi
+if [ -n "${PYTHON:-}" ]; then
+    PY="$PYTHON"
+elif command -v python3.13 >/dev/null 2>&1; then
+    PY=python3.13
+elif command -v python3 >/dev/null 2>&1; then
+    PY=python3
+else
+    PY=python
+fi
 SHOW_EMIT="${SHOW_EMIT:-0}"
 file="${1:?Usage: $0 <file.ty>}"
 name=$(basename "$file" .ty)

@@ -5132,14 +5132,19 @@ fn pattern_covers_class(c: &Checker, pattern: &Pattern, class_name: &str) -> boo
             };
             // Positional class pattern — `case Leaf(value):` /
             // `case Branch(left, right):`. Counts as a total match for
-            // `class_name` when every declared field has a positional
-            // capture (or wildcard) AND there are no keyword args
-            // adding further filters (FINDINGS E6).
+            // `class_name` when every supplied subpattern is a capture
+            // (or wildcard) AND there are no keyword args adding
+            // further filters. A pattern shorter than the declared
+            // field count is still total: the omitted positionals are
+            // unconstrained, the parser already accepts that shape, and
+            // the runtime `match` will still select this arm for every
+            // instance of the class (FINDINGS E6 + copilot review on
+            // PR #87).
             if !mc.arguments.patterns.is_empty() {
                 if !mc.arguments.keywords.is_empty() {
                     return false;
                 }
-                if mc.arguments.patterns.len() != shape.field_order.len() {
+                if mc.arguments.patterns.len() > shape.field_order.len() {
                     return false;
                 }
                 return mc.arguments.patterns.iter().all(is_capture_or_underscore);
@@ -5567,9 +5572,26 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             // via the `(_, Type::Float) => Type::Float` rule and the
             // `__mul__` return type recorded on `Vec2` would be ignored
             // (FINDINGS E5).
+            //
+            // The arg type IS checked against the dunder's first formal
+            // — otherwise `v * "bad"` for
+            // `def __mul__(self, scalar: float) -> Vec2` would silently
+            // infer `Vec2` instead of emitting a type-mismatch (codex
+            // review on PR #87). When a dunder exists on the LHS class
+            // but its formal rejects the RHS, surface the operator
+            // mismatch directly instead of falling through to the
+            // permissive `Unknown` arm below — otherwise the bad call
+            // would slip past as `let r: V = Unknown`.
             if let Some(dunder) = binop_dunder(b.op) {
                 if let Type::Class(cls) | Type::Generic(cls, _) = &l_stripped {
-                    if let Some(sig) = c.find_method(cls, dunder) {
+                    if let Some(sig) = c.find_method(cls, dunder).cloned() {
+                        if dunder_accepts(c, &sig, &r_stripped) {
+                            return sig.return_type.clone();
+                        }
+                        if let Some(op_str) = arithmetic_op_str(b.op) {
+                            let span = (b.range.start().to_usize(), b.range.end().to_usize());
+                            c.operator_type_mismatch(op_str, &l_stripped, &r_stripped, span);
+                        }
                         return sig.return_type.clone();
                     }
                 }
@@ -5578,7 +5600,14 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                 // user class — `5.0 * Vec2(...)`.
                 if let Some(rdunder) = binop_rdunder(b.op) {
                     if let Type::Class(cls) | Type::Generic(cls, _) = &r_stripped {
-                        if let Some(sig) = c.find_method(cls, rdunder) {
+                        if let Some(sig) = c.find_method(cls, rdunder).cloned() {
+                            if dunder_accepts(c, &sig, &l_stripped) {
+                                return sig.return_type.clone();
+                            }
+                            if let Some(op_str) = arithmetic_op_str(b.op) {
+                                let span = (b.range.start().to_usize(), b.range.end().to_usize());
+                                c.operator_type_mismatch(op_str, &l_stripped, &r_stripped, span);
+                            }
                             return sig.return_type.clone();
                         }
                     }
@@ -6536,6 +6565,22 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
 /// `operator_operands_compatible`. Returns the operator's Python source
 /// form for diagnostic text, or `None` for ops we don't yet check
 /// (bitwise / shifts, MatMult).
+/// Does the dunder method's first declared formal accept `arg_type`?
+/// Used before adopting a dunder's return type as the operator's
+/// result type — without it, `v * "bad"` for `def __mul__(self,
+/// scalar: float) -> Vec2` would silently infer `Vec2` instead of
+/// surfacing the type mismatch. A dunder with no recorded param type
+/// (older shape / unannotated formal) is treated as permissive.
+fn dunder_accepts(c: &Checker, sig: &MethodSig, arg_type: &Type) -> bool {
+    let Some(first) = sig.param_types.first() else {
+        return true;
+    };
+    if matches!(first, Type::Unknown | Type::Any) {
+        return true;
+    }
+    c.is_assignable(first, arg_type)
+}
+
 /// Python dunder name for the binary operator `op`. Returned by
 /// `BinOp` inference so a user class with `def __mul__(self, ...) -> R`
 /// resolves the call to `R` rather than falling through to the
@@ -9568,6 +9613,33 @@ def go() -> None:
         );
     }
 
+    #[test]
+    fn binop_dunder_rejects_arg_type_mismatch() {
+        // codex review on PR #87: previously, the dunder return type
+        // was adopted whenever the dunder method existed, even if the
+        // RHS didn't match the dunder's declared formal. `v * "bad"`
+        // for `def __mul__(self, scalar: float) -> Vec2` must surface
+        // an operator type mismatch, not silently infer `Vec2`.
+        let src = "\
+class V:
+    x: float
+
+impl V:
+    def __mul__(self, scalar: float) -> V:
+        return V(x=self.x * scalar)
+
+def main() -> None:
+    let v: V = V(x=1.0)
+    let r: V = v * \"bad\"
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "v * \"bad\" must surface a diagnostic when __mul__ expects a float, got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
     // ── E6: exhaustiveness recognises positional class patterns ──────────────
 
     #[test]
@@ -9597,6 +9669,38 @@ def first(t: Tree) -> int:
         assert!(
             !d.has_errors(),
             "positional class pattern must count as a total match for that variant: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn shorter_positional_pattern_still_covers_variant() {
+        // copilot review on PR #87: `case Branch(left):` (one
+        // positional capture for a class with two declared fields)
+        // is a valid pattern at parse time and should count as a
+        // total match for the Branch variant of a sealed union —
+        // the omitted positional is unconstrained at runtime.
+        let src = "\
+class Leaf:
+    value: int
+
+class Branch:
+    left: Leaf
+    right: Leaf
+
+type Tree = Leaf | Branch
+
+def go(t: Tree) -> int:
+    match t:
+        case Leaf(value):
+            return value
+        case Branch(left):
+            return left.value
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "shorter positional pattern must count as a total match: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
     }
