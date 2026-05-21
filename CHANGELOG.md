@@ -4,6 +4,50 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.2.4
+
+Editor developer-UX pass: semantic-token colouring for the LSP and
+structured docstring rendering in hover. The two together close the
+gap users hit on their first day with Typhon — "which of these
+imports is from my project vs the library?" and "what arguments
+does this take and what do they mean?".
+
+### Added
+
+- **LSP semantic tokens.** `textDocument/semanticTokens/full` is now
+  served. Walks the resolved module and parsed AST to emit a token
+  stream tagged with LSP-standard types (`class`, `function`,
+  `method`, `property`, `parameter`, `variable`, `namespace`) and
+  modifiers (`declaration`, `defaultLibrary`). VS Code themes apply
+  colours automatically — stdlib imports get the `defaultLibrary`
+  shade (Python convention: muted blue), third-party / project
+  imports get the usual class/function colours, and method calls
+  (`agent.run()`) are coloured distinctly from property reads
+  (`agent.name`). The legend is published in the server capabilities
+  so the indices stay stable across releases.
+- **Structured docstring sections in hover.** `render_docstring` now
+  detects Google / NumPy / Sphinx-style sections (`Args:`,
+  `Parameters\n----------`, `:param name:`) and re-renders them as
+  Markdown headers + bullets. Parameter lines (`name: desc`,
+  `name (type): desc`, `name : type\n    desc`) become
+  `- **name** — desc` bullets, so the hover popover shows the
+  parameter list with descriptions instead of a wall of indented
+  text. Free prose, examples, and unrecognised sections are
+  preserved verbatim.
+
+### Tests
+
+- 7 new tests in `tyc-lsp::semantic` covering stdlib /
+  third-party / project token classification, declaration-modifier
+  emission on class + function decl sites, method-vs-property
+  detection in `Expr::Attribute`, and LSP delta-encoding
+  correctness.
+- 5 new tests in `tyc-lsp` for `render_docstring`: Google `Args:`,
+  NumPy `Parameters\n----------`, Sphinx `:param X:`, recognised
+  `Examples:` section, and the pass-through for unstructured
+  prose. The existing PEP 257 indent-strip test is updated to
+  assert on the new structured output.
+
 ## 0.2.3
 
 UX polish on the arity diagnostic landed in 0.2.2 plus full hover
