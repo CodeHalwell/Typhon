@@ -29,17 +29,25 @@
 
 The compiler and language server live in a single Rust binary called `tyc`.
 
-## Install on macOS
+## Install
 
-One-line install (Apple Silicon and Intel both supported):
+Pre-built binaries ship on every release for **macOS (Apple Silicon + Intel)**, **Linux (x86_64 + aarch64, glibc)**, and **Windows (x86_64)**.
+
+**macOS / Linux:**
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh | sh
 ```
 
-This downloads the latest signed release tarball, verifies its SHA-256, and installs `tyc` to `$HOME/.local/bin`. If that directory isn't already on your `PATH`, the installer prints the exact `export PATH=…` line to add to `~/.zshrc` or `~/.bashrc`.
+**Windows (PowerShell):**
 
-If you download the tarball manually (rather than via the script), clear the macOS Gatekeeper quarantine attribute once before the first run:
+```powershell
+iwr -useb https://raw.githubusercontent.com/codehalwell/typhon/main/install.ps1 | iex
+```
+
+The installers detect your platform, resolve the latest release from the GitHub API, verify the SHA-256 checksum, and drop `tyc` into a per-user directory (`$HOME/.local/bin` on macOS/Linux; `%LOCALAPPDATA%\Programs\Typhon` on Windows). On macOS the Gatekeeper quarantine attribute is cleared automatically; on Windows the install directory is added to the user-level `PATH`.
+
+If you download an archive manually on macOS, clear the Gatekeeper quarantine attribute once before the first run:
 
 ```bash
 xattr -d com.apple.quarantine ~/.local/bin/tyc
@@ -47,7 +55,7 @@ xattr -d com.apple.quarantine ~/.local/bin/tyc
 
 `tyc` itself runs anywhere a modern Rust toolchain produces a binary; the emitted Python **requires CPython 3.13 or newer** at runtime. Older targets are rejected at `typhon.toml` load time so projects can't accidentally build code their interpreter won't run.
 
-For a longer-form guide (custom install dir, pinned version, uninstall, troubleshooting) see [docs/install.md](docs/install.md).
+For a longer-form guide (custom install dir, pinned version, uninstall, manual download, troubleshooting), see [docs/install.md](docs/install.md).
 
 ## Why
 
@@ -166,6 +174,17 @@ See [docs/cli.md](docs/cli.md) for the full reference.
 - ✅ Pipe operator `a |> f |> g(arg)` desugars to `g(f(a), arg)`.
 - ✅ `extend ClassName:` (alias for `impl` on user-defined classes); `extend BUILTIN:` for `str`/`list`/`dict`/… extracts each method to a module-level free function and rewrites call sites whose receiver carries a matching static annotation. No monkey-patching of built-ins.
 - ✅ `.dty` stub files compile to PEP 561 `.pyi`. `tyc check --stubs` parses every `.dty` and diffs its surface API (functions, classes, methods, annotated fields, parameter shapes) against the sibling `.ty`/`.py` implementation, emitting `tyc::stub_mismatch` diagnostics for missing-in-impl / missing-in-stub / signature-mismatch findings. A runtime introspection probe (mypy's `stubtest` proper) is still a follow-up.
+
+**Phase 6 — Python-annoyances surface** complete ([v0.3.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.0)):
+
+- ✅ **`newtype Name = Base`** — TypeScript-style nominal aliases over primitives. `UserId` flows freely into an `int` slot, but a bare `int` requires explicit `UserId(x)` construction to satisfy a `UserId`-typed target. Compiles to a zero-cost `typing.NewType` call. New `tyc::newtype_violation` diagnostic.
+- ✅ **`freeze let X = expr`** — deep-immutable bindings. Wraps the RHS in `typhon_runtime.freeze.deep_freeze`, recursively replacing `list → tuple`, `dict → MappingProxyType`, `set → frozenset` so the value (not just the name) is locked.
+- ✅ **`pub` modifier** — module-level visibility marker. When any name is `pub`, desugar synthesises a top-of-file `__all__ = [...]` list so `from foo import *`, Sphinx autoapi, and IDE re-export filters all see the public surface.
+- ✅ **`tyc::blocking_in_async`** — flags direct calls to known-blocking stdlib functions (`time.sleep`, `requests.get`, `subprocess.run`, `input`, …) inside `async def` bodies.
+- ✅ **`tyc::resource_not_managed`** — flags bare assignments of `open` / `socket.socket` / `sqlite3.connect` / `tempfile.*` calls that aren't wrapped in a `with` statement.
+- ✅ **`tyc::div_by_zero_literal`** — catches `x / 0`, `x // 0`, `x % 0` at compile time when the divisor is a literal.
+- ✅ **Cross-platform install** — pre-built `tyc` binaries for Linux (x86_64 + aarch64) and Windows (x86_64) join the macOS matrix. New `install.ps1` PowerShell installer for Windows; the existing `install.sh` now detects Linux and chooses the matching tarball.
+- ✅ **Findings sweep** — every open finding from the May 2026 stress campaigns (O2–O29) closed or verified-fixed. `tyc fmt` gains five PEP 8 rules, TypedDict-style dict literals type-check against class shapes, inline `?` works (`Ok(add(parse(s)?, parse(t)?))`), `Sized`-style Protocols match built-in containers, `tyc migrate` rewrites `Union[T, None]` → `T?`, VM Result repr matches CPython, and more — see [CHANGELOG.md](CHANGELOG.md) for the full list.
 
 **Phase 5.5 — Constructor / method arity safety** complete ([v0.2.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.2.0)):
 

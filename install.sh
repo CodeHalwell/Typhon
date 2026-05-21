@@ -1,5 +1,5 @@
 #!/bin/sh
-# install.sh — macOS installer for the Typhon compiler (`tyc`).
+# install.sh — macOS / Linux installer for the Typhon compiler (`tyc`).
 #
 # Usage:
 #   curl -sSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh | sh
@@ -30,11 +30,18 @@ install_dir="${TYPHON_INSTALL_DIR:-$DEFAULT_DIR}"
 
 print_help() {
     cat <<'EOF'
-install.sh — install the Typhon compiler (`tyc`) on macOS.
+install.sh — install the Typhon compiler (`tyc`) on macOS or Linux.
 
 Usage:
   curl -sSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh | sh
   ./install.sh [--version=vX.Y.Z] [--dir=/path]
+
+Supported platforms:
+  - macOS:  arm64 (Apple Silicon) and x86_64 (Intel)
+  - Linux:  x86_64 and aarch64, glibc-based distros (Ubuntu, Debian,
+            Fedora, RHEL, Arch, Alpine via gcompat, etc.)
+
+For Windows, use install.ps1 from PowerShell — see docs/install.md.
 
 Options:
   --help               Show this help and exit
@@ -50,7 +57,7 @@ Examples:
   curl -sSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh | sh
 
   # Install a specific version into a custom directory
-  TYPHON_VERSION=v0.1.0 TYPHON_INSTALL_DIR=/opt/typhon/bin sh install.sh
+  TYPHON_VERSION=v0.3.0 TYPHON_INSTALL_DIR=/opt/typhon/bin sh install.sh
 EOF
 }
 
@@ -100,25 +107,50 @@ need_cmd() {
 say "Detecting platform"
 
 os="$(uname -s)"
-if [ "$os" != "Darwin" ]; then
-    die "this installer only supports macOS (Darwin). Detected: $os.
-For other platforms, build from source: https://github.com/$REPO"
-fi
-
 raw_arch="$(uname -m)"
-case "$raw_arch" in
-    arm64|aarch64)
-        arch="aarch64"
+
+case "$os" in
+    Darwin)
+        case "$raw_arch" in
+            arm64|aarch64)
+                arch="aarch64"
+                ;;
+            x86_64|amd64)
+                arch="x86_64"
+                ;;
+            *)
+                die "unsupported macOS architecture: $raw_arch (expected arm64 or x86_64)"
+                ;;
+        esac
+        target="${arch}-apple-darwin"
+        is_linux=0
         ;;
-    x86_64|amd64)
-        arch="x86_64"
+    Linux)
+        case "$raw_arch" in
+            aarch64|arm64)
+                arch="aarch64"
+                ;;
+            x86_64|amd64)
+                arch="x86_64"
+                ;;
+            *)
+                die "unsupported Linux architecture: $raw_arch (expected x86_64 or aarch64)"
+                ;;
+        esac
+        target="${arch}-unknown-linux-gnu"
+        is_linux=1
+        ;;
+    MINGW*|MSYS*|CYGWIN*)
+        die "this is a POSIX installer; on Windows, use install.ps1 from PowerShell.
+See https://github.com/$REPO/blob/main/docs/install.md for instructions."
         ;;
     *)
-        die "unsupported architecture: $raw_arch (expected arm64 or x86_64)"
+        die "unsupported OS: $os (supported: Darwin, Linux).
+For other platforms, build from source: https://github.com/$REPO"
         ;;
 esac
-target="${arch}-apple-darwin"
-say "Platform: macOS / $raw_arch -> target triple $target"
+
+say "Platform: $os / $raw_arch -> target triple $target"
 
 # ---------------------------------------------------------------------------
 # Tool checks
@@ -126,9 +158,20 @@ say "Platform: macOS / $raw_arch -> target triple $target"
 
 need_cmd curl
 need_cmd tar
-need_cmd shasum
 need_cmd mktemp
 need_cmd uname
+
+# `shasum` ships on macOS by default. On Linux it's typically not
+# installed and the equivalent is `sha256sum` (coreutils). Pick whichever
+# is present; both produce the same `<hash>  <file>` line shape that the
+# combined SHA256SUMS file uses.
+if command -v shasum >/dev/null 2>&1; then
+    sha_cmd="shasum -a 256"
+elif command -v sha256sum >/dev/null 2>&1; then
+    sha_cmd="sha256sum"
+else
+    die "required command not found: shasum or sha256sum"
+fi
 
 # ---------------------------------------------------------------------------
 # Resolve version
@@ -183,16 +226,15 @@ fi
 say "Verifying SHA-256 checksum"
 (
     cd "$tmpdir"
-    # `shasum -c` will fail loudly on mismatch / missing file; we filter
-    # the combined SHA256SUMS to just our tarball line to keep output
-    # clean. `grep -F` so the `.` in the filename is matched literally
-    # rather than as a regex metachar, and the leading two spaces
-    # match `shasum`'s two-space-separated format (`<hash>  <file>`)
-    # exactly — avoids accidentally matching a substring within a
-    # longer filename.
+    # Filter the combined SHA256SUMS to just our tarball line to keep
+    # output clean. `grep -F` so the `.` in the filename is matched
+    # literally rather than as a regex metachar, and the leading two
+    # spaces match the `<hash>  <file>` format both `shasum` and
+    # `sha256sum` emit.
     grep -F "  $tarball_name" "$checksums_name" > "$tarball_name.sha256" \
         || die "no checksum entry for $tarball_name in $checksums_name"
-    shasum -a 256 -c "$tarball_name.sha256"
+    # shellcheck disable=SC2086
+    $sha_cmd -c "$tarball_name.sha256"
 )
 
 say "Extracting archive"
@@ -222,11 +264,13 @@ cp "$extracted_bin" "$tmp_dest"
 chmod 0755 "$tmp_dest"
 mv -f "$tmp_dest" "$dest"
 
-# Clear the macOS Gatekeeper quarantine attribute so the user is not
-# prompted on first run. Ignore failure: the xattr may not be set if the
-# tarball was downloaded via curl rather than a browser.
-say "Clearing Gatekeeper quarantine attribute (best-effort)"
-xattr -d com.apple.quarantine "$dest" 2>/dev/null || true
+if [ "$is_linux" = "0" ]; then
+    # Clear the macOS Gatekeeper quarantine attribute so the user is not
+    # prompted on first run. Ignore failure: the xattr may not be set if
+    # the tarball was downloaded via curl rather than a browser.
+    say "Clearing Gatekeeper quarantine attribute (best-effort)"
+    xattr -d com.apple.quarantine "$dest" 2>/dev/null || true
+fi
 
 # ---------------------------------------------------------------------------
 # Smoke-test + PATH hint

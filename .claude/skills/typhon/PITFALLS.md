@@ -462,14 +462,27 @@ error[tyc::missing_await]: cannot use a coroutine where `str` is required
 ## 24. Blocking I/O inside `async def`
 
 ```python
-async def load() -> bytes:
-    with open("data.bin", "rb") as f:
-        return f.read()
+import time
+import requests
+
+async def fetch(url: str) -> bytes:
+    time.sleep(1)
+    return requests.get(url).content
 ```
 
-Typhon does **not** catch this (it's a Python-wide hazard). Use `aiofiles` or wrap with `asyncio.to_thread(...)`.
+As of v0.3.0 Typhon catches the common direct-call shapes:
 
-This is in the catalogue so you remember to check it during code review.
+```
+warning[tyc::blocking_in_async]: `time.sleep` blocks the event loop
+                                  ┌─ src/main.ty:5:5
+                                  │
+                                5 │     time.sleep(1)
+                                  │     ^^^^^^^^^^^^^ wrap in asyncio.to_thread(...)
+```
+
+The check covers `time.sleep`, `requests.*`, `socket.recv`, `subprocess.run`, `input`, `urllib.request.urlopen`, and the rest of the stdlib's well-known blocking surface. Suppressed inside `unsafe:`.
+
+**Fix:** wrap with `asyncio.to_thread(...)`, use an async-native client (`aiohttp`, `httpx.AsyncClient`, `asyncio.sleep`), or move the call out of the coroutine.
 
 ---
 
@@ -567,7 +580,113 @@ Not a correctness issue — a perf hint.
 
 ---
 
-## 30. Missing required env var at build time
+## 30. Bare `open(...)` outside a `with` block (v0.3.0)
+
+```python
+def load(path: str) -> dict[str, int]:
+    let f = open(path)
+    return json.load(f)
+```
+
+```
+warning[tyc::resource_not_managed]: `open(...)` result is not wrapped in `with`
+                                      ┌─ src/main.ty:2:13
+                                      │
+                                    2 │     let f = open(path)
+                                      │             ^^^^^^^^^^ use `with open(path) as f:`
+                                      │
+                                      = help: deterministic cleanup matters for file handles
+```
+
+Covers `open`, `socket.socket`, `sqlite3.connect`, `tempfile.NamedTemporaryFile`, `tempfile.TemporaryDirectory`, and the other stdlib resources where teardown order matters. Severity is `warn` by default; bump to `error` via `[strictness] resource-not-managed = "error"` if you want CI to enforce it.
+
+**Fix:** rewrite as `with open(path) as f:`, or accept the warning if you're managing cleanup explicitly (e.g. handing the handle off to another function that closes it).
+
+---
+
+## 31. Bare `int` flowing into a `newtype` slot (v0.3.0)
+
+```python
+newtype UserId = int
+
+def fetch_user(id: UserId) -> User: ...
+
+fetch_user(42)
+```
+
+```
+error[tyc::newtype_violation]: `int` is not assignable to `UserId`
+                                ┌─ src/main.ty:5:12
+                                │
+                              5 │ fetch_user(42)
+                                │            ^^ wrap with `UserId(...)` at the boundary
+```
+
+**Fix:** `fetch_user(UserId(42))`. The reverse direction (`let raw: int = uid` where `uid: UserId`) is allowed — that's the asymmetric-by-design part of `newtype`.
+
+If you find yourself wrapping at every call site, the boundary is in the wrong place: either lift the wrap into the function that produces the value, or relax the parameter type back to `int`.
+
+---
+
+## 32. `case value:` shadowing an outer `let value` (v0.3.0)
+
+```python
+let value: int = 1
+match thing:
+    case Wrap(value):              # bare name → fresh binding in match patterns
+        print(value)
+```
+
+```
+error[tyc::pattern_shadows_outer]: pattern capture `value` shadows outer `let value`
+                                    ┌─ src/main.ty:3:18
+                                    │
+                                  3 │     case Wrap(value):
+                                    │                ^^^^^ rename the capture
+```
+
+This used to fire as the misleading `tyc::immutable_assign` (which suggested changing `let` to `mut`); v0.3.0 catches the case explicitly and gives the right advice.
+
+**Fix:** rename the capture (`case Wrap(inner): ...`). The Python `match` spec defines bare names in class patterns as *fresh* bindings, not references to outer variables — this is one of the cases where the syntax doesn't match the Rust/OCaml/Scala intuition.
+
+---
+
+## 33. Literal divide-by-zero (v0.3.0)
+
+```python
+def half(x: int) -> float:
+    return x / 0
+```
+
+```
+error[tyc::div_by_zero_literal]: division by literal zero always raises
+                                  ┌─ src/main.ty:2:12
+                                  │
+                                2 │     return x / 0
+                                  │            ^^^^^ fix the divisor
+```
+
+Catches `/`, `//`, `%` against `0`, `0.0`, `-0`, `-0.0`, and any unary-negated zero. Pure constant-fold; flow-sensitive analysis (`if d != 0:` guards on runtime values) is deliberately out of scope.
+
+**Fix:** the divisor is the bug — there is no "right answer" to fish back. If you're testing the error path itself, wrap in `unsafe:`.
+
+---
+
+## 34. Mutating a `freeze let` value (v0.3.0)
+
+```python
+freeze let CONFIG = {"port": 8080, "hosts": ["a", "b"]}
+CONFIG["port"] = 9000
+CONFIG["hosts"].append("c")
+```
+
+Both runtime errors. `freeze let` lowers through `typhon_runtime.freeze.deep_freeze`, which converts `dict → MappingProxyType`, `list → tuple`, `set → frozenset` recursively. The first line raises `TypeError: 'mappingproxy' object does not support item assignment`; the second raises `AttributeError: 'tuple' object has no attribute 'append'`.
+
+**Fix:** if you need to "mutate", build a new frozen value. If you genuinely need a mutable shared config, drop `freeze` and use `mut` (and accept the safety trade-off).
+
+---
+
+## 35. Missing required env var at build time
 
 ```toml
 [env]

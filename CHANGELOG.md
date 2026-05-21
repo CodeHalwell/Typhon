@@ -4,6 +4,189 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.3.0
+
+Six new language features for everyday Python annoyances, a coordinated
+sweep that closes every remaining open finding from the May 2026 stress
+campaigns (O2–O29), and cross-platform install support: pre-built `tyc`
+binaries for **Linux (x86_64 + aarch64)** and **Windows (x86_64)** join
+the existing **macOS (Apple Silicon + Intel)** matrix.
+
+### Added — language
+
+- **`newtype Name = Base` — nominal aliases over base types.**
+  TypeScript-style nominal aliasing that keeps same-shaped primitives
+  (`UserId` vs `PostId`, `USD` vs `EUR`, internal vs external IDs)
+  from being silently swapped. Asymmetric by design: a `UserId` flows
+  into an `int`-typed slot (the runtime value *is* an `int`), but a
+  bare `int` requires an explicit `UserId(x)` constructor call to
+  satisfy a `UserId`-typed target. Compiles to a zero-cost
+  `typing.NewType` call. New `tyc::newtype_violation` diagnostic.
+- **`freeze let X = expr` — deep-immutable bindings.** Closes the gap
+  left by `let`, which only locks the binding name and not the
+  underlying value. `freeze let` wraps the RHS in
+  `__typhon_freeze__(...)` from `typhon_runtime.freeze`, which
+  recursively converts `list → tuple`, `dict → MappingProxyType`,
+  `set → frozenset`, and descends into nested values. Anything without
+  a clean immutable equivalent (file handles, sockets, generators,
+  non-frozen dataclasses) raises `TypeError` at startup rather than
+  via a confusing downstream mutation.
+- **`pub` modifier for module-level visibility.** When a module
+  declares at least one `pub` name, desugar synthesises a top-of-file
+  `__all__ = [...]` list so `from foo import *`, Sphinx autoapi, IDE
+  re-export filters, and the checker's re-export inference all see
+  the public surface — no hand-maintained `__all__` lists required.
+  Composes with the existing keyword stack (`pub let`,
+  `pub frozen class`, `pub model`).
+
+### Added — diagnostics
+
+- **`tyc::blocking_in_async`.** Catches direct calls to known-blocking
+  stdlib functions (`time.sleep`, `requests.get`, `socket.recv`,
+  `subprocess.run`, `input`, `urllib.request.urlopen`, …) inside an
+  `async def` body. A blocking call halts the entire event loop until
+  it returns; the diagnostic suggests `asyncio.to_thread(...)` /
+  `loop.run_in_executor(...)`. Suppressed inside `unsafe:` regions.
+- **`tyc::resource_not_managed`.** Flags bare assignments of
+  context-manager-returning calls (`open`, `socket.socket`,
+  `sqlite3.connect`, `tempfile.*`) that aren't wrapped in a `with`
+  statement, where deterministic cleanup matters and the runtime
+  would otherwise leave teardown to the garbage collector. Severity
+  defaults to `warn`; controlled by `[strictness] resource-not-managed`.
+- **`tyc::div_by_zero_literal`.** Catches `x / 0`, `x // 0`, and
+  `x % 0` at compile time when the divisor is a literal — `0`, `0.0`,
+  `-0`, `-0.0`, or any unary-negated form. Pure constant-fold lint
+  with zero false positives. Flow-sensitive analysis (`if d != 0:`
+  guards on runtime values) is deliberately out of scope.
+- **`tyc::unsafe_value_leak`** (O14). A `return x` outside the
+  `unsafe:` block where `x` was declared, against a function with a
+  concrete annotated return type, now fires a dedicated diagnostic
+  with help text pointing at both workaround forms (`let x: T = …`
+  inside the block, or `let typed: T = x` outside).
+- **`tyc::pattern_shadows_outer`** (O10). `case Wrap(value):` against
+  an outer `let value` now fires a dedicated diagnostic instead of
+  the misleading `tyc::immutable_assign`. Suggests renaming the
+  capture — the right advice for the Rust/OCaml/Scala intuition every
+  newcomer brings to `match`.
+- **`tyc::extend_builtin`** (O23). `extend list[int]:` (parametric
+  target) now fires a dedicated diagnostic naming the parametric
+  shape, rather than the confusing downstream
+  `tyc::impl_unknown_class` cascade.
+
+### Added — install + release
+
+- **Linux pre-built binaries.** `tyc-<version>-x86_64-unknown-linux-gnu.tar.gz`
+  and `tyc-<version>-aarch64-unknown-linux-gnu.tar.gz` ship on every
+  release tag. The same `install.sh` now detects `Linux` from
+  `uname -s` and resolves the matching tarball; the macOS path is
+  unchanged (Gatekeeper quarantine xattr clearing is skipped on
+  Linux). Built on `ubuntu-22.04` for broad glibc compatibility.
+- **Windows pre-built binaries.** `tyc-<version>-x86_64-pc-windows-msvc.zip`
+  ships on every release tag, alongside a new `install.ps1`
+  PowerShell installer. The script downloads the zip, verifies its
+  SHA-256, extracts to `%LOCALAPPDATA%\Programs\Typhon` by default,
+  and adds the directory to the user-level `PATH` via
+  `[Environment]::SetEnvironmentVariable`. Supports `--Version` and
+  `--InstallDir` flags + `TYPHON_VERSION` / `TYPHON_INSTALL_DIR`
+  env vars.
+- **Release workflow.** `.github/workflows/release.yml` now runs a
+  five-job matrix (macOS Apple Silicon + Intel, Linux x86_64 +
+  aarch64, Windows x86_64) and uploads tarballs + the Windows zip +
+  a combined `SHA256SUMS` file to the GitHub Release. Linux
+  aarch64 cross-compiles from Ubuntu via the `aarch64-linux-gnu-gcc`
+  toolchain.
+
+### Findings sweep — every open finding closed (O2–O29)
+
+This release coordinates the two final findings-closure branches
+(`claude/findings-documentation-review-HhuVH` and
+`claude/finish-open-findings-dmLv6`). Across nine stress campaigns
+(May 17–21 2026, ~600 hand-written `.ty` programs, ~120 distinct
+findings) the **Open** column on `docs/findings.md` is now empty
+for the first time since campaign tracking began.
+
+- **`tyc fmt`** (O12, B9) — five new PEP 8 rules wired into the
+  in-process pass: space after `:`, spaces around `->`, space after
+  `,`, single-space around binary `+` / `-` and top-level `=`, two
+  blank lines before top-level `def` / `class` / `async def`. The
+  O12 repro `def    f(  x:int,y:int)->int:` reformats end-to-end.
+- **TypedDict-style dict literals** (O15). `let alice: User = {"id":
+  1, "name": "Alice"}` against a registered class shape now matches
+  keys against fields and flows each value under the declared field
+  type before falling through to the ordinary `dict[K, V]` path.
+- **Sized-style Protocols on built-ins** (O16). `list`, `dict`,
+  `tuple`, `set`, `str`, `bytes`, `range`, `frozenset`, `bytearray`
+  now satisfy a user-declared Protocol whose declared methods are
+  all common dunders (`__len__`, `__iter__`, `__getitem__`,
+  `__contains__`, `__eq__`, `__bool__`, …).
+- **Inline `?`** (O17). `Ok(add(parse(s)?, parse(t)?))` compiles. A
+  new `expand_inline_question_ops` pre-pass lifts every mid-line `)?`
+  into a `__typhon_qi_N__` temp + propagation guard before the
+  existing end-of-line pass runs.
+- **`while` narrowing** (O2). `Stmt::While` now applies test-implied
+  narrowings to the body via the same path the `if` checker uses;
+  the linked-list iterator idiom
+  `while cur is not None: total += cur.value; cur = cur.next`
+  type-checks.
+- **`tuple[T, ...]`** (O3) — resolves to an internal
+  `tuple_variadic[T]` head that the unifier accepts against any
+  fixed-length tuple literal whose elements are all assignable to
+  `T`, including `()`.
+- **Cyclic type aliases** (O4) — surface `tyc::cyclic_type_alias`
+  once, then rewrite the alias body to `Any` so subsequent uses fall
+  through silently instead of cascading into `type_mismatch` errors.
+- **`class! Foo(Exception)`** (O5) — synthesises
+  `def __init__(self, *args, **kwargs)` calling `super().__init__`
+  when the body has no annotated fields, so `raise AppError("boom")`
+  reaches the parent constructor.
+- **Generator `return`** (O6) — `return` and `return value` inside a
+  generator function body type-check against the declared
+  `Iterator[T]` / `Generator[Y, S, R]` return type.
+- **`tyc migrate` nullable forward-refs** (O21) — `Optional["Item"]`
+  now becomes `"Item?"`, not the previously unparseable `"Item"?`.
+- **`tyc migrate` Union → `T?`** (O22) — rewrites `Union[T, None]`
+  (and `Union[None, T]`, and the `typing.Union[...]` qualified form)
+  to `T?` and drops the import; PEP 604 pipe-union fallback for
+  multi-arm unions so imports are never left dangling.
+- **`tyc explain --list`** (O25) — now prints every diagnostic code
+  the binary knows about; the "not yet implemented" message for
+  unknown codes is gone.
+- **VM `Result` repr** (O24) — `Value::ResultOk` / `Value::ResultErr`
+  match CPython's dataclass default (`Ok(value=20)` /
+  `Err(error='oops')`); single-quote preference matches Python's
+  `repr`. `tyc run` and `tyc run --compile` now produce
+  byte-identical stdout for Result-bearing programs.
+- **REPL prompts when piped** (O26) — `tyc repl` checks
+  `stdin.is_terminal()` and skips the `>>> ` / `... ` prompts when
+  stdin is piped.
+- **`tyc build --no-sync`** (O29) — new flag (and `TYC_NO_SYNC=1`
+  env var) skips the `uv sync` step while still merging
+  `pyproject.toml`. Stress harnesses and REPL-like iteration on
+  tmp projects no longer pay the per-invocation reprovision cost.
+- **`MatchSequence` bracket recovery** (O27) — `case [a, b]:`
+  re-emits as `[a, b]` rather than the default `(a, b)` by peeking
+  at the original `TextRange` to recover the bracket choice.
+- **Pipe corner cases** (O28) — `5 |> (lambda x: x * 2)()` and
+  `(1 |> add(2)) |> add(3)` both compile. New
+  `expand_pipes_in_subexpressions` pre-pass recursively expands
+  pipes inside every balanced `(...)` group before the line-level
+  pass runs.
+
+### Tests
+
+- 4 new preprocess unit tests for `newtype` lowering (`Name =
+  NewType(...)` round-trip, generic bases, fmt round-trip,
+  indented-form rejection).
+- 7 new unit tests for `tyc::div_by_zero_literal` covering `/`,
+  `//`, `%`, float zero, negated zero, and `unsafe:` suppression.
+- New regression tests for `tyc::blocking_in_async`,
+  `tyc::resource_not_managed`, `tyc::unsafe_value_leak`,
+  `tyc::pattern_shadows_outer`, and `tyc::extend_builtin`.
+- `tyc fmt` regression suite covers each of the five new PEP 8
+  rules end-to-end.
+- All B9-bucket pre-existing-bug repros under
+  `stress/round-2026-05-21/` build clean.
+
 ## 0.2.5
 
 Second editor-UX pass on the 0.2.4 LSP work. Closes the three

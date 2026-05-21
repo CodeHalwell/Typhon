@@ -1,11 +1,13 @@
 ---
 name: typhon
-description: Write, check, build, and migrate code in the Typhon language — a statically-typed, stricter superset of Python that compiles to clean CPython 3.13+ via the `tyc` binary. Use this skill whenever you are editing `.ty` or `.dty` source, modifying `typhon.toml`, invoking any `tyc` subcommand (`build`, `check`, `fmt`, `lsp`, `init`, `migrate`, `repl`, `run`, `debug`, `trace`, `profile`, `explain`, `cheatsheet`, `stubtest`, `add`, `remove`, `sync`, `ty`), translating Python to Typhon, debugging Typhon-specific diagnostics, or answering questions about the language, the compiler pipeline, or the project's docs/architecture. Triggers include: any file with a `.ty` / `.dty` / `typhon.toml` extension, the words "Typhon", "tyc", "let/mut binding", "Result[T, E]", "sealed union", "gather:" / "go f(x)", "comptime", "interface", "impl block", "extend", `T?`, `plain class`, `class!`, `.py.map`, `typhon_runtime`, `tyc-vm`, and any error code matching `tyc::...`.
+description: Write, check, build, and migrate code in the Typhon language — a statically-typed, stricter superset of Python that compiles to clean CPython 3.13+ via the `tyc` binary. Use this skill whenever you are editing `.ty` or `.dty` source, modifying `typhon.toml`, invoking any `tyc` subcommand (`build`, `check`, `fmt`, `lsp`, `init`, `migrate`, `repl`, `run`, `debug`, `trace`, `profile`, `explain`, `cheatsheet`, `stubtest`, `add`, `remove`, `sync`, `ty`), translating Python to Typhon, debugging Typhon-specific diagnostics, or answering questions about the language, the compiler pipeline, or the project's docs/architecture. Triggers include: any file with a `.ty` / `.dty` / `typhon.toml` extension, the words "Typhon", "tyc", "let/mut binding", "freeze let", "newtype", "pub", "Result[T, E]", "sealed union", "gather:" / "go f(x)", "comptime", "interface", "impl block", "extend", `T?`, `plain class`, `class!`, `.py.map`, `typhon_runtime`, `tyc-vm`, and any error code matching `tyc::...`.
 ---
 
 # Typhon — Language, Compiler, and Project Skill
 
 Typhon is **a statically-typed, stricter superset of Python that emits clean CPython 3.13+** with zero runtime dependency on the toolchain. The compiler and language server are a single Rust binary called `tyc`. Every `.ty` file emits valid, idiomatic `.py`. Not all `.py` is valid Typhon.
+
+The current release is **v0.3.0** (Phase 6 — Python-annoyances surface). New since 0.2.5: `newtype`, `freeze let`, `pub`, three new safety/effect diagnostics (`blocking_in_async`, `resource_not_managed`, `div_by_zero_literal`), and pre-built install artifacts for **Linux** and **Windows** alongside macOS. Every finding from the May 2026 stress campaigns (O2–O29) is closed.
 
 This skill is the on-the-ground reference for working in this repo: how to write `.ty` correctly, how to read/extend the compiler crates under `tyc/crates/`, how to invoke `tyc`, and how to debug the diagnostics users will hit.
 
@@ -49,6 +51,9 @@ The 30-second mental model. Everything else in this skill is detail under one of
 |---|---|---|
 | Local binding | `let x: int = 1` / `mut x: int = 1` | `x: int = 1` |
 | Module binding | `X: int = 1` (implicit `let`) or `mut X: int = 1` | `X: int = 1` |
+| Deep-immutable binding (0.3.0) | `freeze let CFG = {"port": 8080, "hosts": ["a", "b"]}` | `CFG = __typhon_freeze__({"port": 8080, "hosts": ["a", "b"]})` (deep-freezes value, not just name) |
+| Public name (0.3.0) | `pub let API_VERSION: str = "v1"` / `pub class Foo: ...` | adds `Foo` to a synthesised `__all__ = [...]` at top of module |
+| Nominal alias (0.3.0) | `newtype UserId = int` | `UserId = NewType("UserId", int)` — asymmetric: `UserId → int` flows, `int → UserId` needs `UserId(x)` |
 | Nullable | `name: str?` | `name: str \| None` |
 | Optional default | `name: str? = None` (no auto-default) | `name: str \| None = None` |
 | Class | `class User: id: int` | `@dataclass(slots=True) class User: id: int` |
@@ -169,7 +174,11 @@ let parsed: dict[str, int] = ... # re-assert at the boundary
 The shortest realistic flow. Pair with `docs/guides/01-hello-world.md`.
 
 ```bash
-# 1. Build the compiler (one-time; from repo root)
+# 1a. Install a pre-built binary (macOS / Linux):
+#     curl -sSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh | sh
+# 1b. Windows (PowerShell):
+#     iwr -useb https://raw.githubusercontent.com/codehalwell/typhon/main/install.ps1 | iex
+# 1c. Or build from source (from repo root)
 cd tyc && cargo build --release && cd ..
 alias tyc="$PWD/tyc/target/release/tyc"
 
@@ -345,6 +354,59 @@ def parse() -> int:
 Inside `unsafe:`, expressions that would otherwise infer `Any` bind freely. Values acquire a hidden `Unsafe[T]` marker that cannot flow into a concrete `T` context outside the block. Block lowers to `if True:` for scope preservation; the checker tracks an `unsafe_depth` counter.
 
 For long-lived dependencies, write a `.dty` stub instead.
+
+---
+
+## v0.3.0 — annoyance-killing language features
+
+### `newtype Name = Base` — nominal aliases over primitives
+
+Lifts a primitive into its own nominal type so two same-shaped values cannot be silently swapped:
+
+```python
+newtype UserId = int
+newtype PostId = int
+
+def fetch_user(id: UserId) -> User: ...
+
+let uid: UserId = UserId(42)
+fetch_user(uid)                  # ✅
+fetch_user(42)                   # ❌ tyc::newtype_violation — wrap as UserId(42)
+
+let raw: int = uid               # ✅ asymmetric: UserId flows freely into int
+```
+
+Compiles to a zero-cost `typing.NewType` call (`UserId = NewType("UserId", int)`). The relationship is deliberately asymmetric so the wrapper doesn't infect every downstream consumer that legitimately treats the value as the base. The constructor (`UserId(x)`) type-checks its argument against the base.
+
+Use it for ID kinds, currency tags, internal-vs-external markers — anywhere "an `int` is an `int`" loses you minutes of debugging.
+
+### `freeze let X = expr` — deep-immutable bindings
+
+`let` only locks the binding name; `freeze let` locks the value too:
+
+```python
+freeze let CONFIG = {"port": 8080, "hosts": ["a", "b"]}
+
+# CONFIG = {...}                 # ❌ tyc::immutable_assign (binding locked)
+# CONFIG["port"] = 9000          # ❌ TypeError at runtime — MappingProxyType
+# CONFIG["hosts"].append("c")    # ❌ AttributeError at runtime — tuple, not list
+```
+
+Module-level only in v1. Lowers to a `__typhon_freeze__(...)` call against `typhon_runtime.freeze.deep_freeze`, which recursively converts `list → tuple`, `dict → MappingProxyType`, `set → frozenset`, descends into nested values, and raises `TypeError` at startup on anything without a clean immutable equivalent (file handles, sockets, generators, non-frozen dataclasses). Frozen dataclasses pass through unchanged.
+
+### `pub` — module visibility marker
+
+```python
+pub let API_VERSION: str = "v1"
+pub class Client: ...
+pub def connect(host: str) -> Client: ...
+
+let _internal_default_port: int = 8080   # not exported
+```
+
+When a module declares at least one `pub` name, desugar synthesises a top-of-file `__all__ = [...]` so `from foo import *`, Sphinx autoapi, IDE re-export filters, and the type checker's re-export inference all see the public surface. No hand-maintained `__all__` lists required.
+
+Stacks with the other keyword modifiers — `pub frozen class`, `pub model`, `pub let`, etc.
 
 ---
 
@@ -827,6 +889,13 @@ The recurring diagnostic codes and what they actually mean. All are documented i
 | `tyc::unused_import` | Severity controlled by `[strictness] unused-import` | Remove the import (LSP "Remove unused import" code-action exists) |
 | `tyc::method_in_class_body` (warn by default) | A `def` inside `class Name:` instead of `impl Name:` (Rule 4) | Move into an `impl Name:` block. Severity controlled by `[strictness] methods-in-class-body` (`warn` / `error` / `off`). |
 | `tyc::auto_gather_missed` (advice) | Adjacent awaits look gather-able but a callee lacks `@gatherable` | Decorate the named callee. Fires from `tyc build` only when `[strictness] auto-gather = true`. |
+| `tyc::newtype_violation` (0.3.0) | Bare base-type value flowing into a `newtype` slot | Wrap with the constructor: `UserId(raw_int)` |
+| `tyc::blocking_in_async` (0.3.0, warn) | Direct call to a known-blocking stdlib (`time.sleep`, `requests.get`, `subprocess.run`, `input`, …) inside `async def` | Wrap in `asyncio.to_thread(...)` / `loop.run_in_executor(...)`, or use an async-native client. Suppressed inside `unsafe:`. |
+| `tyc::resource_not_managed` (0.3.0, warn) | Bare assignment of `open` / `socket.socket` / `sqlite3.connect` / `tempfile.*` without a `with` | Wrap in `with` or move into an explicit `try/finally`. Severity controlled by `[strictness] resource-not-managed`. |
+| `tyc::div_by_zero_literal` (0.3.0) | Literal-divisor `/ 0`, `// 0`, `% 0` (including `-0.0` and unary-negated zero) | The expression always raises `ZeroDivisionError` — fix the divisor or guard the call site. |
+| `tyc::unsafe_value_leak` (0.3.0) | A `return x` outside the `unsafe:` block where `x` was declared, against a function whose return type is concrete | Re-assert inside (`let x: T = …`) or re-bind at the boundary (`let typed: T = x`). |
+| `tyc::pattern_shadows_outer` (0.3.0) | `case Wrap(value):` against an outer `let value` binding | Rename the capture (the bare name in a class pattern is always a fresh binding in Python's `match`). |
+| `tyc::extend_builtin` (0.3.0) | `extend list[int]:` (parametric target) | Drop the `[…]`; `extend list:` is the supported form. |
 
 When in doubt about a diagnostic, `rg "TYC_CODE_NAME" tyc/crates` — every code is registered once in source.
 
@@ -847,8 +916,12 @@ When in doubt about a diagnostic, `rg "TYC_CODE_NAME" tyc/crates` — every code
 11. **Returning early from a `with`-chain without an `else err:`.** Fine — but only if the enclosing function returns a compatible `Result`.
 12. **`dict.get(k)` typed as `V`.** It's `V?`. Either narrow or use `d[k]`.
 13. **Empty list with no annotation.** `let xs: list = []` is `tyc::implicit_any`. Write `list[int]` or similar.
-14. **Putting blocking I/O inside `async def`.** Typhon doesn't catch this (Python-wide hazard). Use `aiofiles` or `asyncio.to_thread(...)`.
+14. **Putting blocking I/O inside `async def`.** As of v0.3.0 the checker catches the common cases (`time.sleep`, `requests.get`, `subprocess.run`, `input`, `urllib.request.urlopen`, …) via `tyc::blocking_in_async`. Wrap in `asyncio.to_thread(...)` or use an async-native client.
 15. **Expecting `bool` to be `int`.** The checker treats them as distinct. Cast explicitly with `int(b)` / `bool(n)`.
+16. **`f = open("x")` without `with`.** As of v0.3.0, `tyc::resource_not_managed` flags bare assignments of `open` / `socket.socket` / `sqlite3.connect` / `tempfile.*`. Wrap in `with` or accept the warning if you're managing cleanup elsewhere.
+17. **`x / 0` literal divisor.** Always raises `ZeroDivisionError`; v0.3.0 catches it with `tyc::div_by_zero_literal`.
+18. **`fetch_user(42)` against `def fetch_user(id: UserId)` where `newtype UserId = int`.** v0.3.0's `tyc::newtype_violation` requires explicit `UserId(42)` wrapping at the boundary. The reverse direction (`let raw: int = uid`) is allowed.
+19. **`case value:` shadowing an outer `let value`.** v0.3.0's `tyc::pattern_shadows_outer` flags this with the right hint — rename the capture, not the binding.
 
 ---
 
