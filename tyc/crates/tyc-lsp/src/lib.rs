@@ -858,7 +858,25 @@ impl Backend {
         let Some((root, cache)) = self.introspection_cache_for(uri).await else {
             return out;
         };
-        let mut wanted: Vec<(String, String, String)> = Vec::new();
+        // Two shapes of import the kwarg classifier handles:
+        //
+        // 1. `from X import Y` — the binding name `Y` is the callee
+        //    name we want to colour kwargs for. Lookup key in the
+        //    final map is just `Y`.
+        // 2. `import X` (and `import X as Z`) — the binding alone
+        //    isn't callable; the call site is `X.Foo(…)` /
+        //    `Z.Foo(…)`. We fetch the *entire* member list for
+        //    module X and emit one map entry per public member,
+        //    keyed `Z.Foo` so the attribute-callee path in
+        //    `AstWalker::callee_signature_for` can construct the
+        //    same key from the AST.
+        //
+        // Bare-import expansion makes the map a bit bigger (a
+        // module with 50 public symbols → 50 entries), but the
+        // venv cache is already warm by the time semantic-tokens
+        // requests come in, so this is just memcpy work.
+        let mut named_wanted: Vec<(String, String, String)> = Vec::new();
+        let mut bare_wanted: Vec<(String, String)> = Vec::new();
         if let Some(module_scope) = resolved.scopes.first() {
             for binding in &module_scope.bindings {
                 if !matches!(binding.kind, tyc_resolve::BindingKind::Import) {
@@ -867,23 +885,37 @@ impl Backend {
                 let Some(info) = &binding.import_info else {
                     continue;
                 };
-                let Some(member) = &info.member else {
-                    continue;
-                };
-                wanted.push((binding.name.clone(), info.module.clone(), member.clone()));
+                match &info.member {
+                    Some(member) => {
+                        named_wanted.push((
+                            binding.name.clone(),
+                            info.module.clone(),
+                            member.clone(),
+                        ));
+                    }
+                    None => {
+                        bare_wanted.push((binding.name.clone(), info.module.clone()));
+                    }
+                }
             }
         }
-        if wanted.is_empty() {
+        if named_wanted.is_empty() && bare_wanted.is_empty() {
             return out;
         }
         let mut by_module: std::collections::HashMap<String, Vec<(String, String)>> =
             std::collections::HashMap::new();
-        for (binding_name, module, member) in wanted {
+        for (binding_name, module, member) in named_wanted {
             by_module
                 .entry(module)
                 .or_default()
                 .push((binding_name, member));
         }
+        let bare_by_module: std::collections::HashMap<String, Vec<String>> = bare_wanted
+            .into_iter()
+            .fold(std::collections::HashMap::new(), |mut acc, (bn, mod_)| {
+                acc.entry(mod_).or_default().push(bn);
+                acc
+            });
         let root = root.clone();
         let pairs = tokio::task::spawn_blocking(move || {
             let mut guard = match cache.lock() {
@@ -903,6 +935,23 @@ impl Backend {
                         continue;
                     };
                     signatures.push((binding_name, semantic::parse_signature(sig)));
+                }
+            }
+            // Bare imports: emit `binding.Foo` keys so attribute
+            // callees (`agent_framework.Agent(client=…)`) can match
+            // the same lookup path.
+            for (module, binding_names) in bare_by_module {
+                let Some(members) = guard.members(&root, &module) else {
+                    continue;
+                };
+                for m in members.iter() {
+                    let Some(sig) = m.signature.as_deref() else {
+                        continue;
+                    };
+                    let parsed = semantic::parse_signature(sig);
+                    for binding_name in &binding_names {
+                        signatures.push((format!("{}.{}", binding_name, m.name), parsed.clone()));
+                    }
                 }
             }
             signatures
@@ -2820,7 +2869,25 @@ fn clean_rst_inline(text: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         // ``\`\`code\`\``` → ``\`code\```
+        //
+        // But NOT triple-backtick Markdown code fences (``` ```python
+        // … ``` ```): if we see three or more consecutive backticks,
+        // skip past the whole fenced run untouched. Greedily eating
+        // a `` `` `` pair out of a fence would collapse the fence
+        // marker into malformed inline code and destroy the block.
         if bytes.get(i) == Some(&b'`') && bytes.get(i + 1) == Some(&b'`') {
+            if bytes.get(i + 2) == Some(&b'`') {
+                // Triple-backtick fence — copy the entire run of
+                // consecutive backticks verbatim and continue.
+                let run_end = bytes[i..]
+                    .iter()
+                    .position(|&b| b != b'`')
+                    .map(|n| i + n)
+                    .unwrap_or(bytes.len());
+                out.push_str(&text[i..run_end]);
+                i = run_end;
+                continue;
+            }
             if let Some(rel) = text[i + 2..].find("``") {
                 let inner = &text[i + 2..i + 2 + rel];
                 out.push('`');
@@ -3530,6 +3597,23 @@ mod tests {
         );
         assert!(!out.contains("**Section**"), "no Section stub: {out}");
         assert!(out.contains("Watch out for division by zero."));
+    }
+
+    #[test]
+    fn render_docstring_preserves_markdown_code_fences() {
+        // ` ```python … ``` ` is a Markdown code fence and must
+        // pass through the RST inline cleanup intact. The earlier
+        // pass searched for the next `` `` `` globally, which would
+        // eat the fence opener and collapse the block into
+        // malformed inline backticks.
+        let doc = "Build it.\n\n```python\nfoo()\n```\n";
+        let out = render_docstring(doc);
+        assert!(out.contains("```python"), "fence opener preserved: {out}");
+        assert!(
+            out.trim_end().ends_with("```"),
+            "fence closer preserved: {out:?}"
+        );
+        assert!(out.contains("foo()"), "fenced body preserved: {out}");
     }
 
     #[test]

@@ -308,7 +308,22 @@ impl<'a> AstWalker<'a> {
     fn callee_signature_for(&self, func: &Expr) -> Option<&'a CalleeSignature> {
         match func {
             Expr::Name(name) => self.callee_signatures.get(name.id.as_str()),
-            Expr::Attribute(_) => None,
+            Expr::Attribute(attr) => {
+                // `module.Foo(...)` — the receiver must be a bare
+                // name (the binding from `import module`); the attr
+                // is the member. We build the lookup key as
+                // `binding.member` to match what
+                // `build_callee_signatures` populates for bare
+                // imports. Chained receivers
+                // (`config.client.factory`) need full type inference
+                // and stay unclassified.
+                let receiver = match attr.value.as_ref() {
+                    Expr::Name(n) => n.id.as_str(),
+                    _ => return None,
+                };
+                let key = format!("{}.{}", receiver, attr.attr.as_str());
+                self.callee_signatures.get(key.as_str())
+            }
             _ => None,
         }
     }
@@ -397,27 +412,57 @@ fn emit_module_path_tokens(
     module: &ModModule,
     stdlib_modules: &[&str],
 ) {
+    // Walk the *entire* AST, not just `module.body`. Python lets
+    // `import` / `from X import Y` appear inside any function or
+    // class body (the lazy-import pattern + conditional imports
+    // are both common), and skipping nested cases would leave the
+    // most-used Python shapes uncoloured.
+    let mut walker = ModulePathWalker {
+        tokens,
+        source,
+        stdlib_modules,
+    };
     for stmt in &module.body {
+        walker.visit_stmt(stmt);
+    }
+}
+
+struct ModulePathWalker<'a> {
+    tokens: &'a mut Vec<AbsoluteToken>,
+    source: &'a str,
+    stdlib_modules: &'a [&'a str],
+}
+
+impl<'a> Visitor<'a> for ModulePathWalker<'a> {
+    fn visit_stmt(&mut self, stmt: &'a Stmt) {
         match stmt {
             Stmt::ImportFrom(import_from) => {
-                let Some(module_ident) = &import_from.module else {
-                    continue;
-                };
-                let dotted = module_ident.id.as_str();
-                let start = module_ident.range.start().to_usize();
-                let is_stdlib = is_stdlib_module(dotted, stdlib_modules);
-                emit_dotted_path(tokens, source, start, dotted, is_stdlib);
+                if let Some(module_ident) = &import_from.module {
+                    let dotted = module_ident.id.as_str();
+                    let start = module_ident.range.start().to_usize();
+                    // Relative imports (`from .foo import bar` —
+                    // any level > 0) are always project-local, so
+                    // they must not get the stdlib `defaultLibrary`
+                    // modifier even when the module name happens to
+                    // collide with a stdlib root (`from .os import x`
+                    // is a project's own `os.ty`, not CPython's
+                    // `os`).
+                    let is_stdlib =
+                        import_from.level == 0 && is_stdlib_module(dotted, self.stdlib_modules);
+                    emit_dotted_path(self.tokens, self.source, start, dotted, is_stdlib);
+                }
             }
             Stmt::Import(import) => {
                 for alias in &import.names {
                     let dotted = alias.name.id.as_str();
                     let start = alias.name.range.start().to_usize();
-                    let is_stdlib = is_stdlib_module(dotted, stdlib_modules);
-                    emit_dotted_path(tokens, source, start, dotted, is_stdlib);
+                    let is_stdlib = is_stdlib_module(dotted, self.stdlib_modules);
+                    emit_dotted_path(self.tokens, self.source, start, dotted, is_stdlib);
                 }
             }
             _ => {}
         }
+        ruff_python_ast::visitor::walk_stmt(self, stmt);
     }
 }
 
@@ -482,11 +527,26 @@ fn emit_dotted_path(
 /// still net positive.
 pub fn parse_signature(sig: &str) -> CalleeSignature {
     let mut out = CalleeSignature::default();
-    let body = sig
-        .trim()
-        .strip_prefix('(')
-        .and_then(|s| s.rsplit_once(')').map(|(a, _)| a))
-        .unwrap_or(sig);
+    // The introspection helper feeds us `f"{name}{inspect.signature(obj)}"`
+    // — e.g. `Agent(name, client, model='gpt-4')` — not the bare
+    // parenthesised tail. The old shape (trim → `strip_prefix('(')`)
+    // bailed out on the leading identifier and treated the whole
+    // input as one giant param, silently disabling kwarg colouring
+    // for every introspected signature in the wild.
+    //
+    // Robust extraction: find the *first* `(` and the *matching*
+    // closing `)` (which we approximate as the last `)` in the
+    // string — `inspect.signature` never appends trailing characters,
+    // so the last `)` is the closing one for the whole signature
+    // even if the body contains nested parens for default values).
+    let trimmed = sig.trim();
+    let body = match (trimmed.find('('), trimmed.rfind(')')) {
+        (Some(open), Some(close)) if close > open => &trimmed[open + 1..close],
+        // Already bare `name, client` style (used by tests / future
+        // callers passing pre-extracted bodies): treat the whole
+        // string as the parameter list.
+        _ => trimmed,
+    };
     for raw in split_top_level_commas(body) {
         let trimmed = raw.trim();
         if trimmed.is_empty() || trimmed == "/" || trimmed == "*" {
@@ -527,18 +587,32 @@ fn split_top_level_commas(body: &str) -> Vec<&str> {
     let mut out: Vec<&str> = Vec::new();
     let mut depth: i32 = 0;
     let mut in_str: Option<char> = None;
+    // Stateful escape tracking: `"\\\\"` is a string containing one
+    // backslash, terminated by `"` — the second backslash escapes
+    // the first, so the closing quote is *not* preceded by an
+    // unescaped backslash. The earlier "look at the prior byte" check
+    // got this wrong (treated the closing quote as escaped) and
+    // would have swallowed the whole rest of the signature as if
+    // still inside the string.
+    let mut escaped = false;
     let mut last_split: usize = 0;
     let bytes = body.as_bytes();
     for (i, &b) in bytes.iter().enumerate() {
         let c = b as char;
         if let Some(quote) = in_str {
-            if c == quote && bytes.get(i.saturating_sub(1)).copied() != Some(b'\\') {
+            if c == quote && !escaped {
                 in_str = None;
+                escaped = false;
+                continue;
             }
+            escaped = c == '\\' && !escaped;
             continue;
         }
         match c {
-            '\'' | '"' => in_str = Some(c),
+            '\'' | '"' => {
+                in_str = Some(c);
+                escaped = false;
+            }
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth -= 1,
             ',' if depth == 0 => {
@@ -1076,5 +1150,114 @@ mod tests {
         assert!(!sig.param_names.contains("self"));
         assert!(sig.param_names.contains("name"));
         assert!(sig.param_names.contains("value"));
+    }
+
+    #[test]
+    fn parse_signature_strips_leading_callable_name() {
+        // The introspection helper emits `f"{name}{inspect.signature(obj)}"`
+        // — `Agent(name, client, **kwargs)`, not `(name, client, **kwargs)`.
+        // The 0.2.5 parser bailed on the leading identifier and
+        // returned an empty param set, silently disabling kwarg
+        // colouring for every real introspected signature.
+        let sig = parse_signature("Agent(name, client, model='gpt-4', **kwargs)");
+        assert!(
+            sig.param_names.contains("name"),
+            "name extracted from prefixed sig: {:?}",
+            sig.param_names
+        );
+        assert!(sig.param_names.contains("client"));
+        assert!(sig.param_names.contains("model"));
+        assert!(
+            sig.accepts_kwargs,
+            "**kwargs detected from prefixed sig: {:?}",
+            sig
+        );
+    }
+
+    #[test]
+    fn parse_signature_handles_escaped_backslash_in_default() {
+        // `sep='\\\\'` is a string containing one backslash. The
+        // earlier "look at the prior byte" check treated the
+        // closing quote as escaped and swallowed the rest of the
+        // signature; subsequent param names were lost.
+        let sig = parse_signature(r#"(sep='\\', end='\n', flush)"#);
+        assert!(sig.param_names.contains("sep"));
+        assert!(sig.param_names.contains("end"));
+        assert!(
+            sig.param_names.contains("flush"),
+            "flush survived escape: {:?}",
+            sig.param_names
+        );
+    }
+
+    #[test]
+    fn kwarg_classifies_attribute_callee_against_bare_import() {
+        // `import agent_framework` + `agent_framework.Agent(client=…)`
+        // — the lookup map is keyed `agent_framework.Agent` for the
+        // attribute-callee path. Without the fix `callee_signature_for`
+        // returned `None` for any `Expr::Attribute` and the kwarg
+        // pass emitted nothing.
+        let src = "import agent_framework\nagent_framework.Agent(client=1)\n";
+        let (source, resolved, module) = parse_and_resolve(src);
+        let mut sigs = CalleeSignatures::new();
+        sigs.insert(
+            "agent_framework.Agent".to_owned(),
+            parse_signature("Agent(name, client)"),
+        );
+        let stdlib_refs: Vec<&str> = Vec::new();
+        let result = compute(&source, &resolved, &module, &stdlib_refs, &sigs);
+        let (client_ty, _) =
+            token_at(&source, "client=", &result.data).expect("client kwarg via attribute callee");
+        assert_eq!(client_ty, TOKEN_PROPERTY);
+    }
+
+    #[test]
+    fn relative_import_does_not_get_default_library_modifier() {
+        // `from .os import path` — a project-local module named
+        // `os` should NOT inherit the stdlib modifier just because
+        // its top segment collides with a stdlib root name. The
+        // `level > 0` flag is the disambiguator.
+        let src = "from .os import path\n";
+        let (source, resolved, module) = parse_and_resolve(src);
+        let stdlib = stdlib();
+        let stdlib_refs: Vec<&str> = stdlib.to_vec();
+        let result = compute(
+            &source,
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &CalleeSignatures::new(),
+        );
+        let (_, os_mods) = token_at(&source, "os", &result.data).expect("os in relative import");
+        assert_eq!(
+            os_mods & MOD_DEFAULT_LIBRARY,
+            0,
+            "relative import must not be tagged defaultLibrary: {os_mods}"
+        );
+    }
+
+    #[test]
+    fn nested_import_inside_function_gets_module_path_tokens() {
+        // Lazy / conditional imports live inside function bodies
+        // all over real Python. The module-path walker must
+        // descend into nested scopes, not just `module.body`.
+        let src = "def f():\n    from os.path import join\n    return join('a', 'b')\n";
+        let (source, resolved, module) = parse_and_resolve(src);
+        let stdlib = stdlib();
+        let stdlib_refs: Vec<&str> = stdlib.to_vec();
+        let result = compute(
+            &source,
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &CalleeSignatures::new(),
+        );
+        let (os_ty, os_mods) = token_at(&source, "os", &result.data).expect("nested os token");
+        let (path_ty, path_mods) =
+            token_at(&source, "path", &result.data).expect("nested path token");
+        assert_eq!(os_ty, TOKEN_NAMESPACE);
+        assert_eq!(path_ty, TOKEN_NAMESPACE);
+        assert!(os_mods & MOD_DEFAULT_LIBRARY != 0);
+        assert!(path_mods & MOD_DEFAULT_LIBRARY != 0);
     }
 }
