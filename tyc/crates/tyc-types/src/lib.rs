@@ -1234,6 +1234,12 @@ struct Checker<'a> {
     /// (warn-level, not yet wired). Module scope is also exempt so
     /// the canonical `asyncio.run(coro())` entry-point pattern passes.
     in_sync_function: bool,
+    /// True while we are checking the body of an `async def`. Used by
+    /// the Phase-E blocking-in-async check (`tyc::blocking_in_async`)
+    /// to fire on direct calls to known-blocking stdlib functions
+    /// (`time.sleep`, `requests.get`, `socket.recv`, …) that should
+    /// be wrapped in `await asyncio.to_thread(...)` instead.
+    in_async_function: bool,
     /// Bounds declared on PEP 695 type parameters, keyed by function name.
     /// E.g. `def f[T: Interface](x: T)` populates `{"f": {"T": Class("Interface")}}`.
     /// Checked at call sites via `Checker::check_call_typevar_bounds`.
@@ -1503,6 +1509,7 @@ impl<'a> Checker<'a> {
             async_functions: std::collections::HashSet::new(),
             inside_await: 0,
             in_sync_function: false,
+            in_async_function: false,
             function_type_bounds: HashMap::new(),
             active_typevar_bounds: HashMap::new(),
             interfaces: HashMap::new(),
@@ -2909,6 +2916,44 @@ fn seed_typhon_builtins(c: &mut Checker) {
         span: (0, 0),
     });
 }
+
+/// Stdlib calls that block the event loop when invoked from inside an
+/// `async def` body. Matched against the dotted callee path returned
+/// by [`dotted_callee_path`], so `time.sleep`, `socket.recv`, and a
+/// bare `input` all flow through the same lookup. Direct calls fire
+/// `tyc::blocking_in_async`; the user can wrap them in `await
+/// asyncio.to_thread(...)` (which the wrapper-detection below
+/// excludes) or `loop.run_in_executor(...)` to silence the
+/// diagnostic. Conservative — only the most common offenders.
+const BLOCKING_CALLEES: &[&str] = &[
+    // time
+    "time.sleep",
+    // I/O
+    "input",
+    // requests
+    "requests.get",
+    "requests.post",
+    "requests.put",
+    "requests.delete",
+    "requests.patch",
+    "requests.head",
+    "requests.options",
+    "requests.request",
+    // urllib
+    "urllib.request.urlopen",
+    // socket (blocking sync ops)
+    "socket.recv",
+    "socket.send",
+    "socket.recvfrom",
+    "socket.sendto",
+    "socket.accept",
+    "socket.connect",
+    // subprocess
+    "subprocess.run",
+    "subprocess.call",
+    "subprocess.check_call",
+    "subprocess.check_output",
+];
 
 /// The curated set of stdlib calls that return an unmanaged resource
 /// (a file handle, socket, connection, …) which **must** be wrapped in
@@ -4830,6 +4875,8 @@ fn check_function(
     // pattern free of false positives.
     let saved_in_sync = c.in_sync_function;
     c.in_sync_function = !is_async;
+    let saved_in_async = c.in_async_function;
+    c.in_async_function = is_async;
     // Load the TypeVar bounds for this function so the body's attribute
     // accesses (e.g. `x.greet()` where `x: T` and `T: Greeter`) can resolve
     // against the bound's interface shape.
@@ -4948,6 +4995,7 @@ fn check_function(
     c.current_return = saved_return;
     c.active_typevar_bounds = saved_bounds;
     c.in_sync_function = saved_in_sync;
+    c.in_async_function = saved_in_async;
 }
 
 /// True when `body` is a stub — `...`, `pass`, or a single docstring
@@ -6120,6 +6168,28 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                 }
             }
 
+            // Phase E: blocking-in-async call detection. When the
+            // call sits directly inside an `async def` body and its
+            // callee resolves to a known-blocking stdlib path, fire
+            // `tyc::blocking_in_async` so the user wraps it in
+            // `await asyncio.to_thread(...)` (or `run_in_executor`)
+            // instead. The dotted-callee match excludes wrapper forms
+            // because `asyncio.to_thread(time.sleep, 1)` itself is
+            // `asyncio.to_thread(...)` — not in the registry.
+            if c.in_async_function && c.unsafe_depth == 0 {
+                if let Some(callee_path) = dotted_name_of(&call.func) {
+                    if BLOCKING_CALLEES.iter().any(|p| *p == callee_path) {
+                        let span = (call.range.start().to_usize(), call.range.end().to_usize());
+                        c.diagnostics.push_warning(TycError::blocking_in_async(
+                            &callee_path,
+                            &c.path,
+                            c.source,
+                            span.0,
+                            span.1.saturating_sub(span.0).max(1),
+                        ));
+                    }
+                }
+            }
             let func_type_raw = infer_expr(c, &call.func);
             // Unwrap transparent type aliases (`type Handler = Callable[..., R]`)
             // so that calls through the alias resolve to the underlying
@@ -8915,6 +8985,98 @@ let bad: UserId = UserId(\"seven\")
 ";
         let d = check(src);
         assert!(d.has_errors(), "expected newtype_violation for str arg");
+    }
+
+    // ── blocking in async (Phase E) ─────────────────────────────────────
+
+    #[test]
+    fn blocking_call_in_async_def_warns() {
+        let src = "\
+import time
+async def bad() -> None:
+    time.sleep(1)
+    return
+";
+        let d = check(src);
+        assert!(
+            d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::BlockingInAsync { .. })),
+            "expected blocking_in_async for time.sleep"
+        );
+    }
+
+    #[test]
+    fn requests_get_in_async_def_warns() {
+        let src = "\
+import requests
+async def fetch() -> str:
+    let r = requests.get(\"http://x\")
+    return \"ok\"
+";
+        let d = check(src);
+        assert!(
+            d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::BlockingInAsync { .. })),
+            "expected blocking_in_async for requests.get"
+        );
+    }
+
+    #[test]
+    fn asyncio_to_thread_wrapper_does_not_warn() {
+        // `asyncio.to_thread(time.sleep, 1)` itself is the wrapper;
+        // the dotted-callee match only sees `asyncio.to_thread`,
+        // which isn't in BLOCKING_CALLEES, so no warning fires.
+        let src = "\
+import asyncio
+import time
+async def good() -> None:
+    await asyncio.to_thread(time.sleep, 1)
+";
+        let d = check(src);
+        assert!(
+            !d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::BlockingInAsync { .. })),
+            "asyncio.to_thread wrapper should not trip blocking_in_async"
+        );
+    }
+
+    #[test]
+    fn blocking_call_in_sync_def_does_not_warn() {
+        // The blocking-in-async check only fires inside `async def`;
+        // sync functions can call `time.sleep` freely.
+        let src = "\
+import time
+def sync_caller() -> None:
+    time.sleep(1)
+";
+        let d = check(src);
+        assert!(
+            !d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::BlockingInAsync { .. })),
+            "sync function should not trip blocking_in_async"
+        );
+    }
+
+    #[test]
+    fn unsafe_block_suppresses_blocking_warning() {
+        let src = "\
+import time
+async def escape_hatch() -> None:
+    unsafe:
+        time.sleep(1)
+    return
+";
+        let d = check(src);
+        assert!(
+            !d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::BlockingInAsync { .. })),
+            "unsafe: should suppress blocking_in_async"
+        );
     }
 
     // ── resource discipline (Phase C) ───────────────────────────────────

@@ -897,6 +897,30 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A direct call to a known-blocking stdlib function (`time.sleep`,
+    /// `requests.get`, `socket.recv`, `subprocess.run`, …) appears
+    /// inside an `async def` body. The call halts the entire event
+    /// loop until it returns, defeating the point of `async`. Wrap
+    /// the call in `await asyncio.to_thread(...)` (or
+    /// `loop.run_in_executor(...)`) to run it on a worker thread
+    /// without blocking the loop. Default severity is **warn**;
+    /// promote to error via `[strictness] blocking-in-async =
+    /// "error"` in `typhon.toml`.
+    #[error("`{name}(...)` blocks the event loop when called from an `async def`")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::blocking_in_async),
+        url("https://typhon.dev/lang/diagnostics/blocking_in_async"),
+        help("wrap the call: `await asyncio.to_thread({name}, ...)`")
+    )]
+    BlockingInAsync {
+        name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("blocking call inside `async def`")]
+        span: SourceSpan,
+    },
+
     /// A call to a known resource-returning function (`open`,
     /// `socket.socket`, `sqlite3.connect`, …) was bound to a
     /// variable without a surrounding `with` statement. Without
@@ -1833,6 +1857,21 @@ impl TycError {
         length: usize,
     ) -> Self {
         Self::CyclicTypeAlias {
+            name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::BlockingInAsync`] diagnostic.
+    pub fn blocking_in_async(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::BlockingInAsync {
             name: name.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),

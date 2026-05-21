@@ -43,6 +43,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         "auto_gather_missed" => {
             include_str!("../../../../../docs/diagnostics/auto_gather_missed.md")
         }
+        "blocking_in_async" => {
+            include_str!("../../../../../docs/diagnostics/blocking_in_async.md")
+        }
         "class_attr_shadows_slot" => {
             include_str!("../../../../../docs/diagnostics/class_attr_shadows_slot.md")
         }

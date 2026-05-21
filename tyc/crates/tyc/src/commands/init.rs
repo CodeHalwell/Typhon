@@ -163,6 +163,7 @@ auto-memoise = false            # cache every pure function via @functools.cache
 auto-gather = false             # fold consecutive awaits into asyncio.TaskGroup
 pgo-memoise = false             # promote hot pure fns from typhon-profile.json
 require-with = "warn"           # "error" / "off" — open()/socket()/connect() outside `with` is a leak
+blocking-in-async = "warn"      # "error" / "off" — time.sleep / requests.get inside async def
 
 # Run `tyc migrate path/to/foo.py` to convert typed Python to Typhon.
 "#,

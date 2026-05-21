@@ -28,9 +28,12 @@ pub fn apply_strictness(diags: Diagnostics, config: &TyphonConfig) -> Diagnostic
     let methods_in_class_body = config.strictness.methods_in_class_body.as_str();
     let require_with = config.strictness.require_with.as_str();
     let require_with_default = require_with == "warn" || require_with.is_empty();
+    let blocking_in_async = config.strictness.blocking_in_async.as_str();
+    let blocking_in_async_default = blocking_in_async == "warn" || blocking_in_async.is_empty();
     if !promote_unused_import
         && (methods_in_class_body == "warn" || methods_in_class_body.is_empty())
         && require_with_default
+        && blocking_in_async_default
     {
         return diags;
     }
@@ -50,6 +53,12 @@ pub fn apply_strictness(diags: Diagnostics, config: &TyphonConfig) -> Diagnostic
             }
         } else if matches!(warn, TycError::ResourceNotManaged { .. }) {
             match require_with {
+                "off" => {} // drop the diagnostic entirely
+                "error" => new_diags.push_error(warn),
+                _ => new_diags.push_warning(warn),
+            }
+        } else if matches!(warn, TycError::BlockingInAsync { .. }) {
+            match blocking_in_async {
                 "off" => {} // drop the diagnostic entirely
                 "error" => new_diags.push_error(warn),
                 _ => new_diags.push_warning(warn),

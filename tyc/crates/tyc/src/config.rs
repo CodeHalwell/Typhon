@@ -157,6 +157,15 @@ pub struct StrictnessConfig {
     /// it for codebases that have already paid down the migration
     /// cost; `"off"` drops the diagnostic entirely.
     pub require_with: String,
+    /// Severity for `tyc::blocking_in_async`. A direct call to a
+    /// known-blocking stdlib function (`time.sleep`, `requests.get`,
+    /// `socket.recv`, `subprocess.run`, …) from inside an `async def`
+    /// halts the event loop. `"warn"` (default) surfaces the issue
+    /// without breaking CI; `"error"` promotes for codebases that
+    /// have finished migrating to async-aware libraries (`httpx`
+    /// instead of `requests`, `aiofiles` instead of bare `open`,
+    /// `asyncio.sleep` instead of `time.sleep`); `"off"` suppresses.
+    pub blocking_in_async: String,
 }
 
 impl Default for StrictnessConfig {
@@ -173,6 +182,7 @@ impl Default for StrictnessConfig {
             auto_parallel: false,
             parallel_min_size: 64,
             require_with: "warn".into(),
+            blocking_in_async: "warn".into(),
         }
     }
 }
