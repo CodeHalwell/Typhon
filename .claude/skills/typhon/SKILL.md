@@ -21,7 +21,7 @@ The repo's canonical sources are:
 - **`docs/architecture.md`** — pipeline + crate layout.
 - **`docs/diagnostics/`** — one page per `tyc::` code (also surfaced via `tyc explain`).
 - **`docs/guides/01..10-*.md`** — the teaching surface; read in order the first time.
-- **`docs/roadmap.md`**, **`docs/risks.md`**, **`docs/prior-art.md`**, **`docs/follow-ups-2026-05-17.md`** — context for *why* design calls were made.
+- **`docs/roadmap.md`**, **`docs/risks.md`**, **`docs/prior-art.md`**, **`docs/findings.md`** — context for *why* design calls were made, plus the consolidated stress-test findings.
 
 Whenever this skill and a doc disagree, **the doc wins.** When the docs and an unrelated `.py.map`/emitted-Python detail disagree, the compiler wins — verify with `tyc check`.
 
@@ -940,7 +940,7 @@ When you edit the Rust compiler:
 - **`docs/prior-art.md`** — TypeScript, rust-analyzer, ty, Pyrefly, oxc, Ruff influence.
 - **`docs/risks.md`** — what we expect to bite us.
 - **`docs/roadmap.md`** — phased delivery; Phase 0–3 complete, Phase 4+ in progress.
-- **`docs/follow-ups-2026-05-17.md`** — tracked follow-ups.
+- **`docs/findings.md`** — consolidated stress-test findings and open follow-ups.
 - **`docs/ty-integration.md`** — how `tyc ty` cooperates with Astral's checker.
 - **`docs/performance-baseline.md`** — measured numbers we don't want to regress.
 - **`tyc/vendor/README.md`** — Ruff fork rationale.

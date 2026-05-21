@@ -1,0 +1,11 @@
+class! AppError(Exception):
+    pass
+
+def main() -> None:
+    try:
+        raise AppError("hello")
+    except AppError as e:
+        print(e)
+
+if __name__ == "__main__":
+    main()

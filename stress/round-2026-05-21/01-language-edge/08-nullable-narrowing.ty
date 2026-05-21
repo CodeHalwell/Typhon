@@ -1,0 +1,30 @@
+def lookup(d: dict[str, int], k: str) -> int?:
+    return d.get(k)
+
+def double_or_zero(d: dict[str, int], k: str) -> int:
+    let v: int? = lookup(d, k)
+    if v is None:
+        return 0
+    return v * 2
+
+def with_guard(d: dict[str, int], k: str) -> int:
+    guard v = lookup(d, k) else:
+        return -1
+    return v + 100
+
+def chained(d: dict[str, int], a: str, b: str) -> int:
+    guard va = lookup(d, a) else: return 0
+    guard vb = lookup(d, b) else: return va
+    return va + vb
+
+def main() -> None:
+    let d: dict[str, int] = {"a": 1, "b": 2}
+    print(double_or_zero(d, "a"))
+    print(double_or_zero(d, "missing"))
+    print(with_guard(d, "b"))
+    print(with_guard(d, "missing"))
+    print(chained(d, "a", "b"))
+    print(chained(d, "a", "missing"))
+
+if __name__ == "__main__":
+    main()

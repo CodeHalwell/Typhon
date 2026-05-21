@@ -1,0 +1,27 @@
+def depth(j: object) -> int:
+    if j is None:
+        return 1
+    if isinstance(j, bool):
+        return 1
+    if isinstance(j, int):
+        return 1
+    if isinstance(j, float):
+        return 1
+    if isinstance(j, str):
+        return 1
+    if isinstance(j, list):
+        if len(j) == 0:
+            return 1
+        return 1 + max(depth(x) for x in j)
+    if isinstance(j, dict):
+        if len(j) == 0:
+            return 1
+        return 1 + max(depth(v) for v in j.values())
+    return 0
+
+def main() -> None:
+    let example: dict[str, object] = {"a": [1, {"b": [2, 3, {"c": "leaf"}]}, 4], "z": None}
+    print(depth(example))
+
+if __name__ == "__main__":
+    main()

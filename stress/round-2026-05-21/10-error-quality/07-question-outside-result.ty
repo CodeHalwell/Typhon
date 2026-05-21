@@ -1,0 +1,11 @@
+def parse(s: str) -> Result[int, str]:
+    if s == "":
+        return Err("empty")
+    return Ok(int(s))
+
+def main() -> None:
+    let n: int = parse("10")?
+    print(n)
+
+if __name__ == "__main__":
+    main()

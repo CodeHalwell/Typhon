@@ -1,0 +1,39 @@
+model ChatMessage:
+    role: str
+    content: str
+
+model ChatRequest:
+    model: str
+    messages: list[ChatMessage]
+    temperature: float = 0.7
+
+model ChatResponse:
+    id: str
+    content: str
+    tokens_used: int
+
+class MockLLM:
+    api_key: str
+    counter: int = 0
+
+impl MockLLM:
+    def chat(self, req: ChatRequest) -> ChatResponse:
+        self.counter = self.counter + 1
+        let last: ChatMessage = req.messages[-1]
+        let reply: str = f"[{req.model}] echo: {last.content[:40]}"
+        return ChatResponse(id=f"resp_{self.counter}", content=reply, tokens_used=len(last.content))
+
+def main() -> None:
+    let client: MockLLM = MockLLM(api_key="sk-fake")
+    let req: ChatRequest = ChatRequest(
+        model="claude-opus-4-7",
+        messages=[
+            ChatMessage(role="user", content="hello, please summarize Typhon in one sentence"),
+        ],
+    )
+    let resp: ChatResponse = client.chat(req)
+    print(resp.id, resp.tokens_used)
+    print(resp.content)
+
+if __name__ == "__main__":
+    main()

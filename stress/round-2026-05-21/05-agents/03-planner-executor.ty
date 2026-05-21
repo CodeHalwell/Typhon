@@ -1,0 +1,47 @@
+class Task frozen:
+    id: str
+    description: str
+    dependencies: tuple[str, ...]
+
+def topological(tasks: list[Task]) -> Result[list[str], str]:
+    mut order: list[str] = []
+    mut done: set[str] = set()
+    mut remaining: list[Task] = list(tasks)
+    while len(remaining) > 0:
+        mut progressed: bool = False
+        mut next_remaining: list[Task] = []
+        for t in remaining:
+            mut ready: bool = True
+            for dep in t.dependencies:
+                if dep not in done:
+                    ready = False
+                    break
+            if ready:
+                order.append(t.id)
+                done.add(t.id)
+                progressed = True
+            else:
+                next_remaining.append(t)
+        if not progressed:
+            return Err(f"cycle or missing dep among: {[t.id for t in next_remaining]}")
+        remaining = next_remaining
+    return Ok(order)
+
+def main() -> None:
+    let plan: list[Task] = [
+        Task(id="ship", description="ship", dependencies=("test", "build")),
+        Task(id="build", description="build", dependencies=("compile",)),
+        Task(id="compile", description="compile", dependencies=()),
+        Task(id="test", description="test", dependencies=("compile",)),
+    ]
+    let order: Result[list[str], str] = topological(plan)
+    print(order)
+
+    let cyclic: list[Task] = [
+        Task(id="a", description="a", dependencies=("b",)),
+        Task(id="b", description="b", dependencies=("a",)),
+    ]
+    print(topological(cyclic))
+
+if __name__ == "__main__":
+    main()

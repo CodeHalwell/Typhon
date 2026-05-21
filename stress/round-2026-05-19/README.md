@@ -1,7 +1,8 @@
 # Stress-test corpus — 2026-05-19 fresh round
 
-Repro artifacts for the FINDINGS.md "2026-05-19 fresh round" section
-(findings #97–#127).
+Repro artifacts for the May 19 fresh round (originally findings
+#97–#127, now consolidated under
+[`docs/findings.md`](../../docs/findings.md)).
 
 - `cases/` — 107 hand-written `.ty` programs targeting underexplored
   surface: `typing` bridge types (Self/Literal/Final/ClassVar/

@@ -1,0 +1,28 @@
+import asyncio
+
+async def producer(q: asyncio.Queue[int], n: int) -> None:
+    for i in range(n):
+        await q.put(i)
+    await q.put(-1)
+
+async def consumer(q: asyncio.Queue[int]) -> int:
+    mut total: int = 0
+    while True:
+        let v: int = await q.get()
+        if v == -1:
+            break
+        total = total + v
+    return total
+
+async def main_async() -> int:
+    let q: asyncio.Queue[int] = asyncio.Queue()
+    gather:
+        _ = producer(q, 100)
+        total = consumer(q)
+    return total
+
+def main() -> None:
+    print(asyncio.run(main_async()))
+
+if __name__ == "__main__":
+    main()

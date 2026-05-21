@@ -1,0 +1,17 @@
+class Node:
+    value: int
+    next: "Node?"
+
+def sum_list(head: Node?) -> int:
+    if head is None:
+        return 0
+    return head.value + sum_list(head.next)
+
+def main() -> None:
+    let c: Node = Node(value=3, next=None)
+    let b: Node = Node(value=2, next=c)
+    let a: Node = Node(value=1, next=b)
+    print(sum_list(a))
+
+if __name__ == "__main__":
+    main()

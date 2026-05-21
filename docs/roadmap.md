@@ -125,7 +125,7 @@ Shipped in [v0.2.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.2.0):
   conservatively on `setattr`, method calls, and inside `unsafe:`.
 
 Limitations carried forward (tracked in
-`docs/follow-ups-2026-05-17.md`):
+[`docs/findings.md`](findings.md)):
 
 - Dotted-attribute annotations (`let c: f.Cls = …`) don't resolve to
   the foreign class shape; use `from foo import Cls` or drop the

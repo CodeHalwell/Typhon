@@ -1,0 +1,12 @@
+def main() -> None:
+    let xs: list[int] = []
+    let ys: dict[str, int] = {}
+    let zs: set[int] = set()
+    let t: tuple[int, ...] = tuple([])
+    print(xs, ys, zs, t)
+
+    let xs2: list[int] = [x for x in range(0)]
+    print(xs2)
+
+if __name__ == "__main__":
+    main()

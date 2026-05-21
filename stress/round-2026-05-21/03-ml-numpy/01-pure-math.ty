@@ -1,0 +1,33 @@
+import math
+
+def mean(xs: list[float]) -> float:
+    if len(xs) == 0:
+        return 0.0
+    mut s: float = 0.0
+    for x in xs:
+        s = s + x
+    return s / len(xs)
+
+def stdev(xs: list[float]) -> float:
+    if len(xs) < 2:
+        return 0.0
+    let m: float = mean(xs)
+    mut acc: float = 0.0
+    for x in xs:
+        acc = acc + (x - m) * (x - m)
+    return math.sqrt(acc / (len(xs) - 1))
+
+def dot(a: list[float], b: list[float]) -> float:
+    mut s: float = 0.0
+    for i in range(len(a)):
+        s = s + a[i] * b[i]
+    return s
+
+def main() -> None:
+    let xs: list[float] = [1.0, 2.0, 3.0, 4.0, 5.0]
+    print(f"mean = {mean(xs):.3f}")
+    print(f"stdev = {stdev(xs):.3f}")
+    print(f"dot = {dot(xs, xs):.3f}")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,24 @@
+from typing import Union
+import asyncio
+
+
+class Item:
+    id: int
+    tags: list[str]
+    meta: dict[str, int]
+    parent: "Item"? = None
+
+def doubled(xs: list[int]) -> list[int]:
+    let result = []
+    for x in xs:
+        result.append(x * 2)
+    return result
+
+def maybe(name: Union[str, None]) -> str:
+    if name is None:
+        return "anon"
+    return name
+
+async def fetch() -> int:
+    await asyncio.sleep(0)
+    return 1

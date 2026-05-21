@@ -1,0 +1,13 @@
+from collections.abc import Iterator
+
+def early_stop(n: int) -> Iterator[int]:
+    for i in range(n):
+        if i > 5:
+            return
+        yield i
+
+def main() -> None:
+    print(list(early_stop(10)))
+
+if __name__ == "__main__":
+    main()

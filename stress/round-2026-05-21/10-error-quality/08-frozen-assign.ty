@@ -1,0 +1,11 @@
+class P frozen:
+    x: float
+    y: float
+
+def main() -> None:
+    let p: P = P(x=1.0, y=2.0)
+    p.x = 99.0
+    print(p)
+
+if __name__ == "__main__":
+    main()

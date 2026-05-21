@@ -1,0 +1,18 @@
+comptime let APP_NAME: str = "stress21"
+comptime let VERSION: str = "0.1.0"
+comptime let PORT: int = int("8080")
+comptime let GREETING: str = APP_NAME.upper() + " v" + VERSION
+
+comptime def feature(name: str) -> bool:
+    return name.startswith("ok-")
+
+comptime let HAS_AUTH: bool = feature("ok-auth")
+comptime let HAS_FOO: bool = feature("foo")
+
+def main() -> None:
+    print(APP_NAME, VERSION, PORT)
+    print(GREETING)
+    print(HAS_AUTH, HAS_FOO)
+
+if __name__ == "__main__":
+    main()

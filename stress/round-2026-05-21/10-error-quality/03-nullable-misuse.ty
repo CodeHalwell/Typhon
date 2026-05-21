@@ -1,0 +1,14 @@
+def find(k: str) -> int?:
+    if k == "":
+        return None
+    return 42
+
+def use(x: int) -> int:
+    return x * 2
+
+def main() -> None:
+    let v: int? = find("k")
+    print(use(v))
+
+if __name__ == "__main__":
+    main()

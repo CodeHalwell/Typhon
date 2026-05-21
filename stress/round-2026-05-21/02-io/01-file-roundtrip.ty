@@ -1,0 +1,20 @@
+import tempfile
+import os
+
+def main() -> None:
+    let tmp: str = tempfile.mkstemp(suffix=".txt")[1]
+    let payload: str = "hello\nworld\nfrom typhon\n"
+
+    with open(tmp, "w") as f:
+        f.write(payload)
+
+    with open(tmp, "r") as f:
+        let content: str = f.read()
+
+    print(content == payload)
+    print(content.count("\n"))
+
+    os.remove(tmp)
+
+if __name__ == "__main__":
+    main()

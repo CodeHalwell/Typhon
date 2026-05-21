@@ -1,0 +1,18 @@
+import json
+
+class Config:
+    name: str
+    port: int
+    debug: bool
+
+def main() -> None:
+    let cfg: Config = Config(name="api", port=8080, debug=True)
+    let payload: dict[str, object] = {"name": cfg.name, "port": cfg.port, "debug": cfg.debug}
+    let s: str = json.dumps(payload)
+    print(s)
+
+    let parsed: dict[str, object] = json.loads(s)
+    print(parsed["name"], parsed["port"], parsed["debug"])
+
+if __name__ == "__main__":
+    main()

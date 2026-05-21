@@ -1,0 +1,23 @@
+def first[T](xs: list[T]) -> T?:
+    if len(xs) == 0:
+        return None
+    return xs[0]
+
+def map_first[T, U](xs: list[T], f: Callable[[T], U]) -> U?:
+    let head: T? = first(xs)
+    if head is None:
+        return None
+    return f(head)
+
+def double(n: int) -> int:
+    return n * 2
+
+def main() -> None:
+    let xs: list[int] = [10, 20, 30]
+    let result: int? = map_first(xs, double)
+    print(result)
+    let empty: list[int] = []
+    print(map_first(empty, double))
+
+if __name__ == "__main__":
+    main()

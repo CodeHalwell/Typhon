@@ -1,0 +1,19 @@
+class Trace:
+    name: str
+
+impl Trace:
+    def __enter__(self) -> "Trace":
+        print(f"enter {self.name}")
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+        print(f"exit {self.name}")
+        return False
+
+def main() -> None:
+    with Trace(name="outer"):
+        with Trace(name="inner"):
+            print("work")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,67 @@
+type Op = Add | Sub | Mul | Div | Mod | Pow | Neg | Abs
+
+class Add:
+    a: float
+    b: float
+
+class Sub:
+    a: float
+    b: float
+
+class Mul:
+    a: float
+    b: float
+
+class Div:
+    a: float
+    b: float
+
+class Mod:
+    a: float
+    b: float
+
+class Pow:
+    a: float
+    b: float
+
+class Neg:
+    a: float
+
+class Abs:
+    a: float
+
+def eval_op(o: Op) -> float:
+    match o:
+        case Add(a, b):
+            return a + b
+        case Sub(a, b):
+            return a - b
+        case Mul(a, b):
+            return a * b
+        case Div(a, b):
+            return a / b
+        case Mod(a, b):
+            return a % b
+        case Pow(a, b):
+            return a ** b
+        case Neg(a):
+            return -a
+        case Abs(a):
+            return abs(a)
+
+def main() -> None:
+    let ops: list[Op] = [
+        Add(a=1.0, b=2.0),
+        Sub(a=5.0, b=3.0),
+        Mul(a=4.0, b=2.5),
+        Div(a=10.0, b=4.0),
+        Mod(a=10.0, b=3.0),
+        Pow(a=2.0, b=8.0),
+        Neg(a=5.0),
+        Abs(a=-7.5),
+    ]
+    for o in ops:
+        print(eval_op(o))
+
+if __name__ == "__main__":
+    main()

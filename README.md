@@ -201,7 +201,7 @@ See [docs/cli.md](docs/cli.md) for the full reference.
 - ✅ `tyc-vm`: in-process tree-walking interpreter that runs `.ty` source directly. `tyc run` uses it by default — no `build/`, no CPython process spawn. See [docs/vm.md](docs/vm.md) for the supported feature surface; programs that import CPython-only libraries fall back via `tyc run --compile`.
 - ✅ Source-map line accuracy: `.py.map` records a per-statement `(out_line → ty_line)` table consumed by `tyc trace` and `tyc debug --break`.
 
-See [docs/roadmap.md](docs/roadmap.md) for the phased plan, [CHANGELOG.md](CHANGELOG.md) for release-by-release notes, and [docs/follow-ups-2026-05-17.md](docs/follow-ups-2026-05-17.md) for the remaining tracked follow-ups.
+See [docs/roadmap.md](docs/roadmap.md) for the phased plan, [CHANGELOG.md](CHANGELOG.md) for release-by-release notes, and [docs/findings.md](docs/findings.md) for the consolidated stress-test findings and open follow-ups.
 
 ## Configuration
 

@@ -1,0 +1,20 @@
+from pathlib import Path
+import tempfile
+
+def main() -> None:
+    let tmp: str = tempfile.mkdtemp()
+    let root: Path = Path(tmp)
+    (root / "a.txt").write_text("alpha")
+    (root / "b.txt").write_text("bravo")
+    (root / "nested").mkdir()
+    (root / "nested" / "c.txt").write_text("charlie")
+
+    mut total: int = 0
+    for p in sorted(root.rglob("*.txt")):
+        let content: str = p.read_text()
+        print(p.name, "=>", content)
+        total = total + len(content)
+    print(total)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,26 @@
+type Op = Plus | Minus | Times
+
+class Plus:
+    a: int
+    b: int
+
+class Minus:
+    a: int
+    b: int
+
+class Times:
+    a: int
+    b: int
+
+def eval_op(o: Op) -> int:
+    match o:
+        case Plus(a, b):
+            return a + b
+        case Minus(a, b):
+            return a - b
+
+def main() -> None:
+    print(eval_op(Plus(a=1, b=2)))
+
+if __name__ == "__main__":
+    main()

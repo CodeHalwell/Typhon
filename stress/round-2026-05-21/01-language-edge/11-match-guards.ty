@@ -1,0 +1,38 @@
+type Msg = Ping | Pong | Data
+
+class Ping:
+    seq: int
+
+class Pong:
+    seq: int
+
+class Data:
+    payload: bytes
+    seq: int
+
+def reply(m: Msg) -> str:
+    match m:
+        case Ping(seq) if seq < 0:
+            return f"bad-ping {seq}"
+        case Ping(seq):
+            return f"ping {seq}"
+        case Pong(seq) if seq % 2 == 0:
+            return f"pong-even {seq}"
+        case Pong(seq):
+            return f"pong {seq}"
+        case Data(payload, seq):
+            return f"data {seq} ({len(payload)} bytes)"
+
+def main() -> None:
+    let msgs: list[Msg] = [
+        Ping(seq=1),
+        Ping(seq=-1),
+        Pong(seq=4),
+        Pong(seq=5),
+        Data(payload=b"hello", seq=10),
+    ]
+    for m in msgs:
+        print(reply(m))
+
+if __name__ == "__main__":
+    main()

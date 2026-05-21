@@ -1,0 +1,35 @@
+type Tree = Leaf | Node
+
+class Leaf:
+    value: int
+
+class Node:
+    left: Tree
+    right: Tree
+
+def total(t: Tree) -> int:
+    match t:
+        case Leaf(value):
+            return value
+        case Node(left, right):
+            return total(left) + total(right)
+
+def depth(t: Tree) -> int:
+    match t:
+        case Leaf(_):
+            return 1
+        case Node(left, right):
+            let dl: int = depth(left)
+            let dr: int = depth(right)
+            return 1 + (dl if dl > dr else dr)
+
+def main() -> None:
+    let t: Tree = Node(
+        left=Node(left=Leaf(value=1), right=Leaf(value=2)),
+        right=Node(left=Leaf(value=3), right=Node(left=Leaf(value=4), right=Leaf(value=5))),
+    )
+    print(total(t))
+    print(depth(t))
+
+if __name__ == "__main__":
+    main()

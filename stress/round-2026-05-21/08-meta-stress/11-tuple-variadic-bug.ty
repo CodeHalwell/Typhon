@@ -1,0 +1,8 @@
+def main() -> None:
+    let xs: tuple[float, ...] = (1.0, 2.0, 3.0)
+    let ys: tuple[float, ...] = ()
+    let zs: tuple[float, ...] = tuple([1.0, 2.0, 3.0])
+    print(xs, ys, zs)
+
+if __name__ == "__main__":
+    main()

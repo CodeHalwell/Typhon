@@ -1,0 +1,6 @@
+def f(x: int,y:int) -> int:
+    let z:int=x+y
+    return z
+
+def main()->None:
+    print(f(1,2))

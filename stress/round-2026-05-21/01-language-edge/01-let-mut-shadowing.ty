@@ -1,0 +1,18 @@
+def reassign() -> int:
+    mut x: int = 1
+    x = 2
+    x = x + 10
+    return x
+
+def consts() -> tuple[int, int, int]:
+    let a: int = 1
+    let b: int = 2
+    let c: int = a + b
+    return (a, b, c)
+
+def main() -> None:
+    print(reassign())
+    print(consts())
+
+if __name__ == "__main__":
+    main()

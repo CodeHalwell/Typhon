@@ -1,0 +1,17 @@
+import re
+
+def main() -> None:
+    let text: str = "log: 2026-05-21 INFO startup; 2026-05-21 ERROR boom; 2026-05-22 INFO ok"
+    let pat = re.compile(r"(\d{4}-\d{2}-\d{2})\s+(INFO|ERROR)\s+(\w+)")
+    let matches = pat.findall(text)
+    print(matches)
+
+    let cleaned: str = re.sub(r"\d{4}-\d{2}-\d{2}", "<DATE>", text)
+    print(cleaned)
+
+    let groups = re.search(r"(?P<level>INFO|ERROR)", text)
+    if groups is not None:
+        print(groups.group("level"))
+
+if __name__ == "__main__":
+    main()

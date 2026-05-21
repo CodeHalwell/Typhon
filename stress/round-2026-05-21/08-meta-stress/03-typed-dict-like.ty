@@ -1,0 +1,19 @@
+class Row:
+    id: int
+    label: str
+    score: float
+
+def make_rows(n: int) -> list[Row]:
+    return [Row(id=i, label=f"r{i}", score=float(i) * 0.5) for i in range(n)]
+
+def to_dicts(rows: list[Row]) -> list[dict[str, object]]:
+    return [{"id": r.id, "label": r.label, "score": r.score} for r in rows]
+
+def main() -> None:
+    let rs: list[Row] = make_rows(5)
+    let ds: list[dict[str, object]] = to_dicts(rs)
+    for d in ds:
+        print(d)
+
+if __name__ == "__main__":
+    main()

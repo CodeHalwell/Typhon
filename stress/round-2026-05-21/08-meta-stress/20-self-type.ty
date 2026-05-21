@@ -1,0 +1,28 @@
+class LinkedList:
+    head: "Node?"
+
+class Node:
+    value: int
+    next: "Node?"
+
+impl LinkedList:
+    def push(self, v: int) -> None:
+        self.head = Node(value=v, next=self.head)
+
+    def to_list(self) -> list[int]:
+        mut out: list[int] = []
+        mut cur: Node? = self.head
+        while cur is not None:
+            out.append(cur.value)
+            cur = cur.next
+        return out
+
+def main() -> None:
+    let ll: LinkedList = LinkedList(head=None)
+    ll.push(1)
+    ll.push(2)
+    ll.push(3)
+    print(ll.to_list())
+
+if __name__ == "__main__":
+    main()

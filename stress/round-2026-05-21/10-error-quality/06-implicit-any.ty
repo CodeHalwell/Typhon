@@ -1,0 +1,8 @@
+import os
+
+def main() -> None:
+    let xs = os.listdir(".")
+    print(xs)
+
+if __name__ == "__main__":
+    main()

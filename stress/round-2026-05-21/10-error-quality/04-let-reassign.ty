@@ -1,0 +1,7 @@
+def main() -> None:
+    let x: int = 1
+    x = 2
+    print(x)
+
+if __name__ == "__main__":
+    main()

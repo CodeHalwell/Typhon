@@ -1,0 +1,22 @@
+import numpy as np
+
+def main() -> None:
+    unsafe:
+        let rng = np.random.default_rng(42)
+        let true_w = np.array([2.0, -1.0, 0.5])
+        let X = rng.standard_normal((200, 3))
+        let y = X @ true_w + rng.standard_normal(200) * 0.1
+
+        mut w = np.zeros(3)
+        let lr: float = 0.05
+        for _ in range(500):
+            let pred = X @ w
+            let grad = X.T @ (pred - y) / 200.0
+            w = w - lr * grad
+
+        print("fit:", w)
+        print("true:", true_w)
+        print("err:", float(np.linalg.norm(w - true_w)))
+
+if __name__ == "__main__":
+    main()
