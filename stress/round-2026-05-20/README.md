@@ -1,7 +1,7 @@
 # Stress-test corpus — 2026-05-20 fresh round
 
-Repro artifacts for the FINDINGS.md "Status as of
-claude/test-typhon-library-ejNr5" section (findings R3.1–R3.18).
+Repro artifacts for the May 20 round (originally findings R3.1–R3.18,
+now consolidated under [`docs/findings.md`](../../docs/findings.md)).
 
 - `cases/` — 140 hand-written `.ty` programs targeting:
   - Result / `?` propagation depth and edge positions (cases 01–05, 60, 97, 111).

@@ -1,7 +1,8 @@
 # Stress-test corpus — 2026-05-19 campaign
 
-Repro artifacts for the FINDINGS.md "2026-05-19 stress-test campaign"
-section (findings #57–#96).
+Repro artifacts for the May 19 stress-test campaign (originally findings
+#57–#96, now consolidated under [`docs/findings.md`](../docs/findings.md)
+in the "Sprint history" section).
 
 - `tests/` — 127 hand-written `.ty` programs that exercise documented
   language surface and edge cases. Top numeric prefix is 120; the

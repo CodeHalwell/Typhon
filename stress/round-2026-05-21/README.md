@@ -1,8 +1,10 @@
 # Stress Round 2026-05-21
 
 Fresh round of `.ty` stress probes spanning 10 categories. The
-deliverable is **FINDINGS.md** in this directory — see it for the bug
-catalogue and recommendations.
+write-up (findings B1–B14) is consolidated under
+[`docs/findings.md`](../../docs/findings.md) — see the "Open
+findings" section (O1–O29) for the full catalogue and the "Sprint
+history → May 21 round" section for the per-finding mapping.
 
 ## Run
 
@@ -18,8 +20,8 @@ etc.
 
 ## Summary
 
-- 76 cases authored, 65 build + run clean.
-- 8 of the 11 failures are deliberate diagnostic probes in
+- 81 cases authored, 65 build + run clean.
+- 8 of the 16 failures are deliberate diagnostic probes in
   `10-error-quality/`.
-- 8 real findings (B1–B14, see FINDINGS.md), ranging from a critical
-  narrowing bug (B5) to a UX nit on the REPL (B13).
+- 7 real compiler bugs surfaced, all tracked as open findings in
+  `docs/findings.md` (B1–B14 maps to O1–O29 as listed in that doc).
