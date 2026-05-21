@@ -580,8 +580,7 @@ fn rewrite_union_optional(line: &str) -> String {
             } else {
                 // Multi-arm: rewrite to a PEP 604 pipe-union so at
                 // least the `typing.Union` import isn't dangling.
-                let pieces: Vec<String> =
-                    trimmed_parts.iter().map(|p| p.to_string()).collect();
+                let pieces: Vec<String> = trimmed_parts.iter().map(|p| p.to_string()).collect();
                 let replacement = pieces.join(" | ");
                 s.replace_range(start..=close, &replacement);
                 search_from = start + replacement.len();
@@ -970,11 +969,20 @@ mod tests {
         // `Union[T, None]` and `Union[None, T]` are equivalent to
         // `Optional[T]` and should collapse to `T?` (FINDINGS O22).
         let out = migrate_source("x: Union[int, None] = None\n");
-        assert!(out.contains("int?"), "Union[int, None] should rewrite; got: {out}");
-        assert!(!out.contains("Union"), "Union name should be dropped; got: {out}");
+        assert!(
+            out.contains("int?"),
+            "Union[int, None] should rewrite; got: {out}"
+        );
+        assert!(
+            !out.contains("Union"),
+            "Union name should be dropped; got: {out}"
+        );
 
         let out = migrate_source("x: Union[None, int] = None\n");
-        assert!(out.contains("int?"), "Union[None, int] should rewrite; got: {out}");
+        assert!(
+            out.contains("int?"),
+            "Union[None, int] should rewrite; got: {out}"
+        );
     }
 
     #[test]
@@ -1005,14 +1013,15 @@ mod tests {
             out.contains("int | str | None"),
             "multi-arm Union should rewrite to pipe-union; got: {out}",
         );
-        assert!(!out.contains("Union"), "Union name should be gone; got: {out}");
+        assert!(
+            !out.contains("Union"),
+            "Union name should be gone; got: {out}"
+        );
     }
 
     #[test]
     fn drops_union_from_typing_import_after_rewrite() {
-        let out = migrate_source(
-            "from typing import Union\n\nx: Union[int, None] = None\n",
-        );
+        let out = migrate_source("from typing import Union\n\nx: Union[int, None] = None\n");
         assert!(
             !out.contains("import Union"),
             "stale Union import must be dropped; got: {out}",

@@ -1563,15 +1563,14 @@ pub fn validate_extend_usage(source: &str) -> Vec<ExtendUsageError> {
                     out.push(ExtendUsageError {
                         line_index,
                         offset: byte_offset + start,
-                        message:
-                            "`extend NAME[T, …]:` (parameterised target) is \
+                        message: "`extend NAME[T, …]:` (parameterised target) is \
                              not yet supported. Drop the `[…]` to extend the \
                              unparameterised type (the methods see the \
                              concrete element type at the call site through \
                              the receiver's annotation), or wait for the \
                              per-element-type dispatch the rewriter is \
                              tracked to gain in a later release."
-                                .to_owned(),
+                            .to_owned(),
                     });
                 }
             }

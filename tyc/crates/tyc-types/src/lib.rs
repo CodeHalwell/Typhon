@@ -262,11 +262,7 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
             // `tuple_variadic[T1]` assignable from `tuple_variadic[T2]`
             // covariantly — tuples are immutable so the read-only
             // direction is sound.
-            if an == "tuple_variadic"
-                && bn == "tuple_variadic"
-                && aa.len() == 1
-                && bb.len() == 1
-            {
+            if an == "tuple_variadic" && bn == "tuple_variadic" && aa.len() == 1 && bb.len() == 1 {
                 return assignable(&aa[0], &bb[0]);
             }
             if an != bn || aa.len() != bb.len() {
@@ -1672,11 +1668,7 @@ impl<'a> Checker<'a> {
             if an == "tuple_variadic" && aa.len() == 1 && bn == "tuple" {
                 return bb.iter().all(|t| self.is_assignable(&aa[0], t));
             }
-            if an == "tuple_variadic"
-                && bn == "tuple_variadic"
-                && aa.len() == 1
-                && bb.len() == 1
-            {
+            if an == "tuple_variadic" && bn == "tuple_variadic" && aa.len() == 1 && bb.len() == 1 {
                 return self.is_assignable(&aa[0], &bb[0]);
             }
             if an == bn && aa.len() == bb.len() {
@@ -3029,8 +3021,7 @@ fn detect_cyclic_type_aliases(c: &mut Checker, body: &[Stmt]) {
             // silences the cascade so the rest of the file is
             // still checkable. FINDINGS O4.
             if let Some((params, _)) = c.type_aliases.get(start.as_str()).cloned() {
-                c.type_aliases
-                    .insert(start.clone(), (params, Type::Any));
+                c.type_aliases.insert(start.clone(), (params, Type::Any));
             }
         }
     }
