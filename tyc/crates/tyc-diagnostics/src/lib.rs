@@ -617,6 +617,26 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A binding declared inside an `unsafe:` block flows into a
+    /// concretely-typed `return` site without being re-asserted (cast
+    /// or re-annotated). Rule 5 in the Typhon language spec: an unsafe
+    /// value carries `Unknown` and must cross the safety boundary
+    /// via a deliberate re-typing.  O14 / FINDINGS #107.
+    #[error("`{name}` was introduced inside `unsafe:` and escapes into a concrete `{return_ty}` return")]
+    #[diagnostic(
+        code(tyc::unsafe_value_leak),
+        url("https://typhon.dev/lang/diagnostics/unsafe_value_leak"),
+        help("re-assert the type before returning, e.g. `let typed: {return_ty} = {name}` outside the unsafe block, or annotate the assignment inside `unsafe:` with `let {name}: {return_ty} = …` so the compiler can verify the cross")
+    )]
+    UnsafeValueLeak {
+        name: String,
+        return_ty: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("unsafe value crosses into safe-typed return")]
+        span: SourceSpan,
+    },
+
     /// `tyc check --stubs` found a mismatch between a `.dty` stub and its
     /// implementation module.
     #[error("{message}")]
@@ -1610,6 +1630,23 @@ impl TycError {
     ) -> Self {
         Self::ExtendBuiltin {
             message: message.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::UnsafeValueLeak`] diagnostic. O14 / FINDINGS #107.
+    pub fn unsafe_value_leak(
+        name: impl Into<String>,
+        return_ty: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::UnsafeValueLeak {
+            name: name.into(),
+            return_ty: return_ty.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }
