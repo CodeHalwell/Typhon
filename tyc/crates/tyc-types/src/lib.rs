@@ -6322,8 +6322,8 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         );
                         c.diagnostics.push_error(TycError::newtype_violation(
                             &name,
-                            &base.display(),
-                            &arg_ty.display(),
+                            base.display(),
+                            arg_ty.display(),
                             &c.path,
                             c.source,
                             span.0,

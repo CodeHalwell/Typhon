@@ -229,10 +229,10 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
     } else if inject_config_dict {
         inject(&mut body, make_config_dict_only_import());
     }
-    // Drop the closure so `body` is owned solely again before the
-    // `__all__` insert below — the borrow-checker would otherwise
-    // complain about overlapping mutable borrows.
-    drop(inject);
+    // `inject` borrows `imports_inserted`; the closure's last call
+    // sits above, so its borrow ends here naturally and `__all__`
+    // can read `imports_inserted` again.
+    let _ = inject;
 
     if inject_dunder_all {
         // Place `__all__` AFTER the last injected import so it never
