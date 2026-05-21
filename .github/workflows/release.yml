@@ -1,9 +1,12 @@
 name: Release
 
-# Build pre-built `tyc` binaries for macOS (Apple Silicon + Intel) on every
-# `v*` tag and attach the tarballs + checksums to a GitHub Release.
+# Build pre-built `tyc` binaries for macOS, Linux, and Windows on every
+# `v*` tag and attach the archives + checksums to a GitHub Release.
 #
-# Linux/Windows are intentionally out of scope here — Mac-only for now.
+# Matrix:
+#   macOS:    aarch64-apple-darwin, x86_64-apple-darwin
+#   Linux:    x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu (cross-built)
+#   Windows:  x86_64-pc-windows-msvc
 
 on:
   push:
@@ -28,15 +31,35 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-macos:
+  build:
     name: Build (${{ matrix.target }})
-    runs-on: macos-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: aarch64-apple-darwin
+            runner: macos-latest
+            os: macos
+            archive: tar.gz
           - target: x86_64-apple-darwin
+            runner: macos-latest
+            os: macos
+            archive: tar.gz
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            os: linux
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            os: linux
+            archive: tar.gz
+            linker: aarch64-linux-gnu-gcc
+            apt: gcc-aarch64-linux-gnu
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            os: windows
+            archive: zip
 
     steps:
       # On a tag push, build the tag itself. On workflow_dispatch, build
@@ -81,12 +104,31 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-cargo-
 
+      - name: Install cross-compile toolchain (Linux aarch64)
+        if: matrix.apt != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt }}
+
+      - name: Configure cross-linker (Linux aarch64)
+        if: matrix.linker != ''
+        run: |
+          mkdir -p ~/.cargo
+          target_upper="$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')"
+          {
+            echo "[target.${{ matrix.target }}]"
+            echo "linker = \"${{ matrix.linker }}\""
+          } >> ~/.cargo/config.toml
+          echo "CARGO_TARGET_${target_upper}_LINKER=${{ matrix.linker }}" >> "$GITHUB_ENV"
+
       - name: Build tyc (release, ${{ matrix.target }})
         working-directory: tyc
+        shell: bash
         run: |
           cargo build --release -p tyc --target ${{ matrix.target }}
 
-      - name: Ad-hoc codesign
+      - name: Ad-hoc codesign (macOS)
+        if: matrix.os == 'macos'
         # No paid Apple Developer cert — use ad-hoc signature (`-`).
         # This avoids the silent "killed: 9" Gatekeeper failure on macOS;
         # users will still see a one-time "downloaded from internet"
@@ -97,8 +139,9 @@ jobs:
           codesign --sign - --force --timestamp=none "$bin"
           codesign --verify --verbose "$bin"
 
-      - name: Package tarball + checksum
-        id: package
+      - name: Package archive + checksum (POSIX)
+        if: matrix.archive == 'tar.gz'
+        id: package_posix
         shell: bash
         run: |
           set -euo pipefail
@@ -109,30 +152,69 @@ jobs:
           mkdir -p "$stage/$name"
           cp "tyc/target/${target}/release/tyc" "$stage/$name/tyc"
           cp README.md "$stage/$name/README.md" 2>/dev/null || true
-          # LICENSE may not exist at repo root; tolerate either way.
           cp LICENSE "$stage/$name/LICENSE" 2>/dev/null || true
 
           mkdir -p dist
           tar -C "$stage" -czf "dist/${name}.tar.gz" "$name"
-          (cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256")
+          # Pick whichever sha256 tool exists on the runner. macOS ships
+          # `shasum`; Ubuntu ships `sha256sum`. Both emit the same
+          # `<hash>  <file>` line shape that the combined SHA256SUMS
+          # file expects.
+          if command -v shasum >/dev/null 2>&1; then
+            (cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256")
+          else
+            (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
+          fi
           ls -la dist/
-          echo "tarball=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "asset=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
           echo "checksum=dist/${name}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
           echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      - name: Package archive + checksum (Windows)
+        if: matrix.archive == 'zip'
+        id: package_windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '${{ steps.tag.outputs.version }}'
+          $target  = '${{ matrix.target }}'
+          $name    = "tyc-$version-$target"
+          $stage   = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP $name) -Force
+          Copy-Item "tyc/target/$target/release/tyc.exe" (Join-Path $stage.FullName 'tyc.exe')
+          if (Test-Path 'README.md') { Copy-Item 'README.md' (Join-Path $stage.FullName 'README.md') }
+          if (Test-Path 'LICENSE')   { Copy-Item 'LICENSE'   (Join-Path $stage.FullName 'LICENSE') }
+
+          New-Item -ItemType Directory -Path 'dist' -Force | Out-Null
+          $zipPath = "dist/$name.zip"
+          # Pass the stage directory itself (not its parent) to
+          # Compress-Archive. Because the stage directory is named
+          # `$name` (`tyc-X.Y.Z-target`), the zip's top-level entry
+          # ends up as `$name\` — the same shape the POSIX `tar.gz`
+          # path produces, and what install.ps1 expects when it looks
+          # for `tyc.exe` under `tyc-$version-$target/`.
+          Compress-Archive -Path $stage.FullName -DestinationPath $zipPath -Force
+          $hash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          # `<hash>  <file>` — two spaces, matching the POSIX
+          # `shasum -c` / `sha256sum -c` line format.
+          Set-Content -Path "$zipPath.sha256" -Value "$hash  $name.zip"
+          Get-ChildItem dist
+          "asset=$zipPath"            | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "checksum=$zipPath.sha256"  | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "name=$name"                | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.package.outputs.name }}
+          name: ${{ matrix.archive == 'zip' && steps.package_windows.outputs.name || steps.package_posix.outputs.name }}
           path: |
-            ${{ steps.package.outputs.tarball }}
-            ${{ steps.package.outputs.checksum }}
+            ${{ matrix.archive == 'zip' && steps.package_windows.outputs.asset || steps.package_posix.outputs.asset }}
+            ${{ matrix.archive == 'zip' && steps.package_windows.outputs.checksum || steps.package_posix.outputs.checksum }}
           if-no-files-found: error
           retention-days: 7
 
   release:
     name: Publish GitHub Release
-    needs: build-macos
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -166,11 +248,14 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release
-          # Each artifact lives under artifacts/<name>/dist/<name>.tar.gz
+          # Each artifact lives under artifacts/<name>/dist/<archive>
           # (and .sha256). Flatten and recompute the combined SHA256SUMS.
-          find artifacts -type f \( -name '*.tar.gz' -o -name '*.sha256' \) \
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.sha256' \) \
             -exec cp {} release/ \;
-          (cd release && shasum -a 256 *.tar.gz > SHA256SUMS)
+          # Combined SHA256SUMS covers both .tar.gz and .zip assets;
+          # `install.sh` and `install.ps1` both grep their target asset
+          # out of this file by exact filename match.
+          (cd release && sha256sum *.tar.gz *.zip > SHA256SUMS)
           ls -la release/
           cat release/SHA256SUMS
 
@@ -186,4 +271,5 @@ jobs:
           generate_release_notes: true
           files: |
             release/*.tar.gz
+            release/*.zip
             release/SHA256SUMS

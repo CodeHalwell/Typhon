@@ -44,6 +44,84 @@ FEATURE_FLAG: bool = False
 
 Inside a function, the kind is always explicit. At module top level, it defaults to `let` unless declared `mut`.
 
+### `freeze let` — deep-immutable bindings (v0.3.0)
+
+```python
+# Typhon (module level)
+freeze let CONFIG = {"port": 8080, "hosts": ["a", "b"]}
+```
+
+```python
+# Emitted Python
+from typhon_runtime.freeze import deep_freeze as __typhon_freeze__
+
+CONFIG = __typhon_freeze__({"port": 8080, "hosts": ["a", "b"]})
+```
+
+`deep_freeze(value)` recursively converts `list → tuple`, `dict → MappingProxyType`, `set → frozenset`; descends into existing immutable containers for nested values; passes through primitives and frozen dataclasses; raises `TypeError` on file handles, sockets, generators, and non-frozen dataclasses. The binding name itself is `let`-locked as well.
+
+### `pub` — module visibility marker (v0.3.0)
+
+```python
+# Typhon
+pub let API_VERSION: str = "v1"
+pub class Client:
+    host: str
+pub def connect(host: str) -> Client: ...
+
+let _internal_default_port: int = 8080
+```
+
+```python
+# Emitted Python
+__all__ = ["API_VERSION", "Client", "connect"]
+
+from dataclasses import dataclass
+
+API_VERSION: str = "v1"
+
+@dataclass(slots=True)
+class Client:
+    host: str
+
+def connect(host: str) -> Client: ...
+
+_internal_default_port: int = 8080
+```
+
+The synthesised `__all__` is emitted once at the top of the file (after imports). `pub` stacks with the other modifier keywords: `pub frozen class`, `pub model`, `pub let`, `pub mut`, etc.
+
+### `newtype` — nominal aliases (v0.3.0)
+
+```python
+# Typhon
+newtype UserId = int
+newtype PostId = int
+
+def fetch_user(id: UserId) -> User: ...
+
+let uid: UserId = UserId(42)
+fetch_user(uid)
+let raw: int = uid             # ✅ UserId → int flows
+# fetch_user(42)               # ❌ tyc::newtype_violation
+```
+
+```python
+# Emitted Python
+from typing import NewType
+
+UserId = NewType("UserId", int)
+PostId = NewType("PostId", int)
+
+def fetch_user(id: UserId) -> User: ...
+
+uid: UserId = UserId(42)
+fetch_user(uid)
+raw: int = uid
+```
+
+`NewType` is a zero-cost wrapper at runtime (the call returns its argument unchanged); the asymmetric assignability is a Typhon-checker rule. The constructor type-checks its argument against the base — `UserId("forty-two")` is `tyc::type_mismatch`.
+
 ---
 
 ## Optional types
