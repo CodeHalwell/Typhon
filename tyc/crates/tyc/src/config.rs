@@ -149,6 +149,23 @@ pub struct StrictnessConfig {
     /// arbitrary function call), the threshold is treated as zero —
     /// users opting into `auto-parallel` accept that contract.
     pub parallel_min_size: u64,
+    /// Severity for `tyc::resource_not_managed`. A call to a known
+    /// resource-returning function (`open`, `socket.socket`, …) bound
+    /// to a variable outside a `with` statement leaves cleanup at
+    /// the mercy of the garbage collector. `"warn"` (default) keeps
+    /// the diagnostic visible without breaking CI; `"error"` promotes
+    /// it for codebases that have already paid down the migration
+    /// cost; `"off"` drops the diagnostic entirely.
+    pub require_with: String,
+    /// Severity for `tyc::blocking_in_async`. A direct call to a
+    /// known-blocking stdlib function (`time.sleep`, `requests.get`,
+    /// `socket.recv`, `subprocess.run`, …) from inside an `async def`
+    /// halts the event loop. `"warn"` (default) surfaces the issue
+    /// without breaking CI; `"error"` promotes for codebases that
+    /// have finished migrating to async-aware libraries (`httpx`
+    /// instead of `requests`, `aiofiles` instead of bare `open`,
+    /// `asyncio.sleep` instead of `time.sleep`); `"off"` suppresses.
+    pub blocking_in_async: String,
 }
 
 impl Default for StrictnessConfig {
@@ -164,6 +181,8 @@ impl Default for StrictnessConfig {
             pgo_min_calls: 100,
             auto_parallel: false,
             parallel_min_size: 64,
+            require_with: "warn".into(),
+            blocking_in_async: "warn".into(),
         }
     }
 }

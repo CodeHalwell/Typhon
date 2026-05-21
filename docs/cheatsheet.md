@@ -54,6 +54,42 @@ Every parameter and every return type carries an annotation:
 
 Methods inside the `class` body trigger `tyc::method_in_class_body`.
 
+## Deep-immutable bindings (`freeze let`)
+
+    freeze let TAGS: list[str] = ["a", "b"]
+    freeze let CONFIG: dict[str, int] = {"port": 8080}
+
+Recursively wraps `list → tuple`, `dict → MappingProxyType`,
+`set → frozenset` at binding time so the value cannot be mutated
+through any reference. Module-level only for v1.
+
+## Public API (`pub`)
+
+    pub def greet(name: str) -> str: ...
+    pub class User: ...
+    pub let API_VERSION: str = "v1"
+
+Modules with at least one `pub` declaration emit a synthesised
+`__all__ = [...]` listing every `pub` name in source order. Use to
+distinguish public surface from internal helpers.
+
+## Newtype (nominal alias)
+
+    newtype UserId = int
+    newtype Email = str
+
+    def greet(uid: UserId) -> str:
+        return f"hi {uid}"
+
+    let me: UserId = UserId(7)         # explicit construction
+    let raw: int = me                  # escape upward is free
+
+Bare `int` flowing into a `UserId` slot is rejected as
+`tyc::type_mismatch`; passing the wrong-typed argument to the
+constructor (`UserId("seven")`) fires `tyc::newtype_violation`. Use
+`type` instead of `newtype` when you want a transparent,
+bidirectional alias.
+
 ## Sealed unions + exhaustive `match`
 
     sealed union Shape:

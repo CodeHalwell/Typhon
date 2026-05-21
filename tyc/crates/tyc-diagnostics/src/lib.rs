@@ -933,6 +933,95 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A direct call to a known-blocking stdlib function (`time.sleep`,
+    /// `requests.get`, `socket.recv`, `subprocess.run`, …) appears
+    /// inside an `async def` body. The call halts the entire event
+    /// loop until it returns, defeating the point of `async`. Wrap
+    /// the call in `await asyncio.to_thread(...)` (or
+    /// `loop.run_in_executor(...)`) to run it on a worker thread
+    /// without blocking the loop. Default severity is **warn**;
+    /// promote to error via `[strictness] blocking-in-async =
+    /// "error"` in `typhon.toml`.
+    #[error("`{name}(...)` blocks the event loop when called from an `async def`")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::blocking_in_async),
+        url("https://typhon.dev/lang/diagnostics/blocking_in_async"),
+        help("wrap the call: `await asyncio.to_thread({name}, ...)`")
+    )]
+    BlockingInAsync {
+        name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("blocking call inside `async def`")]
+        span: SourceSpan,
+    },
+
+    /// A call to a known resource-returning function (`open`,
+    /// `socket.socket`, `sqlite3.connect`, …) was bound to a
+    /// variable without a surrounding `with` statement. Without
+    /// `with`, the handle is only released when the GC collects
+    /// the binding — at best non-deterministically, at worst not
+    /// at all if the function raises mid-way. Default severity is
+    /// **warn**; promote to error via `[strictness] require-with
+    /// = "error"` in `typhon.toml` for CI enforcement.
+    #[error("`{name}(...)` returns a resource that should be managed by `with`")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::resource_not_managed),
+        url("https://typhon.dev/lang/diagnostics/resource_not_managed"),
+        help("wrap the call in a `with` block: `with {name}(...) as handle: ...`")
+    )]
+    ResourceNotManaged {
+        name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("not consumed by a `with` statement")]
+        span: SourceSpan,
+    },
+
+    /// A division-style operator (`/`, `//`, `%`) has a literal zero
+    /// on the right-hand side. The runtime will raise
+    /// `ZeroDivisionError` unconditionally; catching it at compile
+    /// time is a free win because the expression has no other
+    /// behaviour. The check is constant-fold only — runtime values
+    /// that *could* be zero are not flagged.
+    #[error("division by literal zero — `x {op} 0` always raises `ZeroDivisionError`")]
+    #[diagnostic(
+        code(tyc::div_by_zero_literal),
+        url("https://typhon.dev/lang/diagnostics/div_by_zero_literal"),
+        help("change the divisor to a non-zero value, or guard the expression behind an `if d != 0:` check")
+    )]
+    DivByZeroLiteral {
+        op: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("literal zero divisor")]
+        span: SourceSpan,
+    },
+
+    /// A bare value of the base type was passed where a `newtype` is
+    /// expected, without going through the explicit constructor.
+    /// `newtype UserId = int` makes `UserId` nominally distinct: a
+    /// `UserId` flows into an `int` slot freely (the runtime values
+    /// are identical), but the reverse requires `UserId(x)` so the
+    /// boundary is explicit at the call site.
+    #[error("`{name}({arg_type})` — newtype expects an argument of type `{base}`")]
+    #[diagnostic(
+        code(tyc::newtype_violation),
+        url("https://typhon.dev/lang/diagnostics/newtype_violation"),
+        help("wrap the value in `{name}(...)` only when it really is a `{name}`; the base type is `{base}`")
+    )]
+    NewtypeViolation {
+        name: String,
+        base: String,
+        arg_type: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("type `{arg_type}` is not a `{base}`")]
+        span: SourceSpan,
+    },
+
     /// An `async def` function body never `await`s. The function still
     /// returns a coroutine, but the `async` keyword is functionally a
     /// no-op — usually a sign of a half-finished refactor or a missing
@@ -1805,6 +1894,70 @@ impl TycError {
     ) -> Self {
         Self::CyclicTypeAlias {
             name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::BlockingInAsync`] diagnostic.
+    pub fn blocking_in_async(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::BlockingInAsync {
+            name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::ResourceNotManaged`] diagnostic.
+    pub fn resource_not_managed(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::ResourceNotManaged {
+            name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::DivByZeroLiteral`] diagnostic.
+    pub fn div_by_zero_literal(
+        op: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::DivByZeroLiteral {
+            op: op.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::NewtypeViolation`] diagnostic.
+    pub fn newtype_violation(
+        name: impl Into<String>,
+        base: impl Into<String>,
+        arg_type: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::NewtypeViolation {
+            name: name.into(),
+            base: base.into(),
+            arg_type: arg_type.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

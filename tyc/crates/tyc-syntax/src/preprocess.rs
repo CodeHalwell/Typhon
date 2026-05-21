@@ -128,6 +128,12 @@ pub struct PreprocessResult {
     /// the class should NOT receive a `@dataclass` decorator and that no
     /// `__init__` should be synthesised — the body is emitted verbatim.
     pub plain_class_lines: Vec<usize>,
+    /// Names of module-level declarations annotated with `pub`.  Drives
+    /// `__all__` synthesis in the desugar pass: modules with at least
+    /// one `pub` symbol get an `__all__ = [...]` list emitted at the
+    /// top; modules with none are left alone, preserving the current
+    /// `from foo import *` semantics for legacy `.ty` files.
+    pub pub_names: Vec<String>,
 }
 
 /// Convert a list of 0-based line indices into byte offsets pointing at
@@ -164,6 +170,17 @@ pub fn line_byte_starts(source: &str, lines: &[usize]) -> Vec<u32> {
 /// Strip Typhon-specific syntax from `source` and return the Python-
 /// compatible string together with restoration metadata.
 pub fn preprocess(source: &str) -> PreprocessResult {
+    // Pre-pass: walk every line, strip a leading `pub ` modifier (at
+    // module level — i.e. zero indentation), record the declared name,
+    // and feed the rest of the pipeline a source string with `pub ` no
+    // longer present. The line indices stay aligned because we only
+    // mutate the leading prefix. A StrippedKeyword::Pub entry is
+    // emitted so `postprocess` restores `pub ` for `tyc fmt`.
+    let mut pub_names: Vec<String> = Vec::new();
+    let mut pub_lines: Vec<usize> = Vec::new();
+    let source_owned = strip_pub_prefixes(source, &mut pub_names, &mut pub_lines);
+    let source = source_owned.as_str();
+
     let mut python_source = String::with_capacity(source.len());
     let mut stripped = Vec::new();
     let mut optionals = Vec::new();
@@ -185,6 +202,65 @@ pub fn preprocess(source: &str) -> PreprocessResult {
                 .unwrap_or(line.len());
             let indent = &line[..indent_len];
             let rest = &line[indent_len..];
+
+            // ── `freeze let NAME[: T] = EXPR` → `let NAME[: T] = __typhon_freeze__(EXPR)` ─
+            // Wraps the RHS in a runtime deep-freeze call. Module-level
+            // only for v1; in-function uses fall through to the Python
+            // parser (which rejects `freeze let` as a syntax error).
+            // The `let` keyword is preserved so the existing
+            // binding-immutability machinery still fires; `freeze` adds
+            // the recursive value-immutability layer on top.
+            if indent_len == 0 {
+                if let Some(after_raw) = rest.strip_prefix("freeze let ") {
+                    let after = after_raw.trim_end_matches(['\n', '\r']);
+                    if let Some(rewritten) = wrap_freeze_let(after) {
+                        stripped.push(StrippedKeyword {
+                            line_index,
+                            keyword: TyphonKeyword::Freeze,
+                        });
+                        let new_line = format!("{}let {}\n", indent, rewritten);
+                        let (rewritten, marks) = rewrite_optionals(&new_line, &mut in_string);
+                        for col in marks {
+                            optionals.push(StrippedOptional {
+                                line_index,
+                                python_col: col,
+                            });
+                        }
+                        python_source.push_str(&rewritten);
+                        continue;
+                    }
+                }
+            }
+
+            // ── `newtype Name = Base` → `Name = NewType("Name", Base)` ───────
+            // Module-level only. The desugar pass injects
+            // `from typing import NewType` when at least one such
+            // declaration is detected in the emitted AST. The type
+            // checker recognises the pattern directly and registers
+            // `Name` as a nominal newtype distinct from `Base`.
+            if indent_len == 0 {
+                if let Some(after_raw) = rest.strip_prefix("newtype ") {
+                    let after = after_raw.trim_end_matches(['\n', '\r']);
+                    if let Some((name, base)) = parse_newtype_decl(after) {
+                        stripped.push(StrippedKeyword {
+                            line_index,
+                            keyword: TyphonKeyword::Newtype,
+                        });
+                        let new_line = format!("{} = NewType(\"{}\", {})\n", name, name, base);
+                        let (rewritten, marks) = rewrite_optionals(&new_line, &mut in_string);
+                        for col in marks {
+                            optionals.push(StrippedOptional {
+                                line_index,
+                                python_col: col,
+                            });
+                        }
+                        python_source.push_str(&rewritten);
+                        continue;
+                    }
+                    // Unrecognised `newtype` form — fall through to produce
+                    // a parse error from the Python parser.
+                }
+            }
 
             // ── `lazy import ALIAS = MODULE` → `import MODULE as ALIAS` ─────
             // Only recognised at module level (indent_len == 0) so that
@@ -582,6 +658,18 @@ pub fn preprocess(source: &str) -> PreprocessResult {
         python_source.push_str(&rewritten);
     }
 
+    // Pub entries are appended LAST so postprocess restores them on top
+    // of any other prefix that lives on the same line (e.g. `pub let X`
+    // first becomes `let X`, then `pub let X`). The postprocess loop
+    // sorts insertions descending by line_index with a stable sort, so
+    // same-line entries execute in insertion order — last pushed runs
+    // last → prefix appears at the front of the final restored line.
+    for &line_idx in &pub_lines {
+        stripped.push(StrippedKeyword {
+            line_index: line_idx,
+            keyword: TyphonKeyword::Pub,
+        });
+    }
     PreprocessResult {
         python_source,
         stripped,
@@ -593,7 +681,264 @@ pub fn preprocess(source: &str) -> PreprocessResult {
         raw_class_lines,
         frozen_class_lines,
         plain_class_lines,
+        pub_names,
     }
+}
+
+/// Pre-pass that walks every line of `source`, strips a leading
+/// `pub ` modifier on module-level declarations, and records the
+/// declared name. Returns the rewritten source with `pub ` removed
+/// from each affected line; `pub_names` is appended with the names in
+/// source order, and `pub_lines` gets the 0-based line index for each.
+///
+/// Recognised forms (zero indent only):
+///   pub def NAME(...)            pub class NAME...            pub class! NAME...
+///   pub plain class NAME...      pub model NAME:              pub interface NAME:
+///   pub let NAME[: T] = EXPR     pub mut NAME[: T] = EXPR
+///   pub newtype NAME = BASE      pub type NAME = ...
+///   pub async def NAME(...)
+///
+/// Carry-forward over a `@decorator` line (so the next decl picks up
+/// the `pub` marker) is **not** supported in v1 — the pre-pass is
+/// stateless, one line at a time. Users wanting to decorate a `pub`
+/// function should write the decorator on the line above and place
+/// `pub` directly on the `def` itself:
+///
+/// ```text
+/// @cached
+/// pub def fetch(...) -> ...:
+/// ```
+///
+/// `pub` inside a function body (`indent_len > 0`), inside a string,
+/// or on an unrecognised form is left untouched so the Python parser
+/// surfaces the syntax error the user wrote.
+fn strip_pub_prefixes(
+    source: &str,
+    pub_names: &mut Vec<String>,
+    pub_lines: &mut Vec<usize>,
+) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut in_string: Option<StringMode> = None;
+    for (line_index, line) in source.split_inclusive('\n').enumerate() {
+        if in_string.is_some() {
+            // Track string state without touching content.
+            let _ = rewrite_optionals(line, &mut in_string);
+            out.push_str(line);
+            continue;
+        }
+        let indent_len = line
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(line.len());
+        if indent_len != 0 {
+            let _ = rewrite_optionals(line, &mut in_string);
+            out.push_str(line);
+            continue;
+        }
+        let rest = &line[indent_len..];
+        if let Some(after_pub) = rest.strip_prefix("pub ") {
+            if let Some(name) = pub_decl_name(after_pub) {
+                pub_names.push(name);
+                pub_lines.push(line_index);
+                out.push_str(after_pub);
+                // Track string state for the rewritten line.
+                let _ = rewrite_optionals(after_pub, &mut in_string);
+                continue;
+            }
+        }
+        let _ = rewrite_optionals(line, &mut in_string);
+        out.push_str(line);
+    }
+    out
+}
+
+/// Given a line that originally followed `pub ` (so `def foo(...)`,
+/// `class Foo:`, `let X = ...`, etc.), return the declared name. Used
+/// by [`strip_pub_prefixes`] to populate the `pub_names` registry.
+fn pub_decl_name(body: &str) -> Option<String> {
+    let body = body.trim_end_matches(['\n', '\r']);
+    // Skip a leading `async ` for `pub async def f(...)`.
+    let body = body.strip_prefix("async ").unwrap_or(body);
+    let body = body.trim_start();
+    // Multi-word keywords first.
+    if let Some(rest) = body.strip_prefix("plain class ") {
+        return ident_prefix(rest);
+    }
+    if let Some(rest) = body.strip_prefix("class! ") {
+        return ident_prefix(rest);
+    }
+    // Single-word keywords.
+    let single_keyword_forms = [
+        "def ",
+        "class ",
+        "model ",
+        "interface ",
+        "newtype ",
+        "type ",
+        "let ",
+        "mut ",
+    ];
+    for kw in &single_keyword_forms {
+        if let Some(rest) = body.strip_prefix(kw) {
+            return ident_prefix(rest);
+        }
+    }
+    None
+}
+
+/// Extract the leading Python identifier from `s`, ignoring whatever
+/// follows (parameter list, base classes, type annotation, `=` RHS).
+fn ident_prefix(s: &str) -> Option<String> {
+    let s = s.trim_start();
+    let end = s
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(s.len());
+    if end == 0 {
+        return None;
+    }
+    let name = &s[..end];
+    if is_python_ident(name) {
+        Some(name.to_owned())
+    } else {
+        None
+    }
+}
+
+/// Reverse [`wrap_freeze_let`]: strip the `__typhon_freeze__(...)`
+/// wrapper from the RHS so `tyc fmt` restores the original
+/// `freeze let X = EXPR` shape. Returns the line content with the
+/// wrapper removed (the `freeze ` prefix is prepended by the
+/// caller); `None` if the wrapper isn't present.
+///
+/// Handles a trailing `# comment` symmetrically with [`wrap_freeze_let`]
+/// so a round-trip on `freeze let X = [1, 2]  # note` is exact.
+fn unwrap_freeze_let(content: &str) -> Option<String> {
+    let (code, comment) = match content.find('#') {
+        Some(i) => (&content[..i], &content[i..]),
+        None => (content, ""),
+    };
+    let eq = code.find('=')?;
+    let lhs = code[..eq].trim_end();
+    let rhs = code[eq + 1..].trim();
+    let inner = rhs.strip_prefix("__typhon_freeze__(")?;
+    let inner = inner.strip_suffix(')')?;
+    let suffix = if comment.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", comment.trim_end())
+    };
+    Some(format!("{} = {}{}", lhs, inner, suffix))
+}
+
+/// Wrap the RHS of a `freeze let` binding in `__typhon_freeze__(...)`.
+/// `tail` is the part of the line after `freeze let ` — typically
+/// `NAME = EXPR` or `NAME: T = EXPR`. The function locates the
+/// top-level `=` and inserts the wrapper around what follows.
+/// Returns `None` if no `=` is found (the parser will then surface
+/// the user's syntax error verbatim).
+///
+/// A trailing `# comment` is split off before wrapping and
+/// reattached after the closing `)` so
+/// `freeze let X = [1, 2]  # tags` still lowers to valid Python
+/// (`let X = __typhon_freeze__([1, 2])  # tags`) rather than
+/// burying the comment inside the call expression. Mirrors the
+/// simple split-on-first-`#` convention used by
+/// [`parse_newtype_decl`] and [`parse_lazy_import`].
+fn wrap_freeze_let(tail: &str) -> Option<String> {
+    let (code, comment) = match tail.find('#') {
+        Some(i) => (&tail[..i], &tail[i..]),
+        None => (tail, ""),
+    };
+    // We need the FIRST `=` that isn't inside square brackets or
+    // parens (so a default-value annotation like `Dict[str, int]`
+    // doesn't confuse us). Track depth.
+    let bytes = code.as_bytes();
+    let mut depth: i32 = 0;
+    let mut eq_idx: Option<usize> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'=' if depth == 0 => {
+                // Skip every augmented-assignment form (`==`, `>=`, `<=`,
+                // `!=`, `:=`, `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`,
+                // `^=`, `@=`) — we just need a bare `=`.
+                let prev = if i == 0 { 0u8 } else { bytes[i - 1] };
+                let next = bytes.get(i + 1).copied().unwrap_or(0);
+                if next == b'='
+                    || matches!(
+                        prev,
+                        b'=' | b'>'
+                            | b'<'
+                            | b'!'
+                            | b':'
+                            | b'+'
+                            | b'-'
+                            | b'*'
+                            | b'/'
+                            | b'%'
+                            | b'&'
+                            | b'|'
+                            | b'^'
+                            | b'@'
+                    )
+                {
+                    continue;
+                }
+                eq_idx = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let eq = eq_idx?;
+    let lhs = code[..eq].trim_end();
+    let rhs = code[eq + 1..].trim();
+    if rhs.is_empty() {
+        return None;
+    }
+    let suffix = if comment.is_empty() {
+        String::new()
+    } else {
+        format!("  {}", comment.trim_end())
+    };
+    Some(format!("{} = __typhon_freeze__({}){}", lhs, rhs, suffix))
+}
+
+/// Parse the tail of a `newtype` line: `Name = Base`.
+///
+/// Returns `(name, base)` on success, `None` if the syntax is malformed.
+/// `Name` must be a valid Python identifier; `Base` is forwarded verbatim
+/// as the inner type expression so generic forms (`list[int]`,
+/// `dict[str, int]`, `Result[int, str]`) are supported.
+fn parse_newtype_decl(tail: &str) -> Option<(String, String)> {
+    let code = tail.split('#').next().unwrap_or("").trim();
+    let eq = code.find('=')?;
+    let name = code[..eq].trim().to_owned();
+    let base = code[eq + 1..].trim().to_owned();
+    if !is_python_ident(&name) || base.is_empty() {
+        return None;
+    }
+    Some((name, base))
+}
+
+/// Reverse [`parse_newtype_decl`]'s emission: take the preprocessed
+/// `Name = NewType("Name", Base)` form and restore `newtype Name = Base`.
+/// Returns `None` if the line doesn't match the expected shape (in which
+/// case the postprocessor leaves the line unchanged).
+fn restore_newtype_decl(content: &str) -> Option<String> {
+    let eq = content.find('=')?;
+    let name = content[..eq].trim();
+    let rhs = content[eq + 1..].trim();
+    let rhs = rhs.strip_prefix("NewType(")?;
+    let rhs = rhs.strip_suffix(')')?;
+    let comma = rhs.find(',')?;
+    let quoted = rhs[..comma].trim();
+    let base = rhs[comma + 1..].trim();
+    let qname = quoted.strip_prefix('"')?.strip_suffix('"')?;
+    if qname != name || !is_python_ident(name) || base.is_empty() {
+        return None;
+    }
+    Some(format!("newtype {} = {}", name, base))
 }
 
 /// Parse the tail of a `lazy import` line: `ALIAS = MODULE`.
@@ -1399,6 +1744,39 @@ pub fn postprocess_full(
                     content.to_owned()
                 };
                 lines[line_idx] = format!("{}{}", &line[..indent_len], restored);
+            }
+            TyphonKeyword::Newtype => {
+                // Restore `Name = NewType("Name", Base)` → `newtype Name = Base`.
+                let line = &lines[line_idx];
+                let indent_len = line
+                    .find(|c: char| !c.is_whitespace())
+                    .unwrap_or(line.len());
+                let content = &line[indent_len..];
+                let restored = restore_newtype_decl(content).unwrap_or_else(|| content.to_owned());
+                lines[line_idx] = format!("{}{}", &line[..indent_len], restored);
+            }
+            TyphonKeyword::Pub => {
+                // Prepend `pub ` to whatever the line currently starts
+                // with. `pub` lives at module level (zero-indent) by
+                // construction, so the prefix slot is empty.
+                let line = &lines[line_idx];
+                let indent_len = line
+                    .find(|c: char| !c.is_whitespace())
+                    .unwrap_or(line.len());
+                lines[line_idx] = format!("{}pub {}", &line[..indent_len], &line[indent_len..]);
+            }
+            TyphonKeyword::Freeze => {
+                // Restore `let NAME = __typhon_freeze__(EXPR)` to
+                // `freeze let NAME = EXPR`. The `let` keyword (or its
+                // annotation form) sits unchanged in the middle; we
+                // strip the wrapper around the RHS and prepend `freeze `.
+                let line = &lines[line_idx];
+                let indent_len = line
+                    .find(|c: char| !c.is_whitespace())
+                    .unwrap_or(line.len());
+                let content = &line[indent_len..];
+                let restored = unwrap_freeze_let(content).unwrap_or_else(|| content.to_owned());
+                lines[line_idx] = format!("{}freeze {}", &line[..indent_len], restored);
             }
         }
     }
@@ -4862,6 +5240,188 @@ mod tests {
             .stripped
             .iter()
             .any(|k| matches!(k.keyword, TyphonKeyword::PlainClass)));
+    }
+
+    // ── newtype keyword ─────────────────────────────────────────────────────
+
+    #[test]
+    fn newtype_lowers_to_newtype_call() {
+        let result = preprocess("newtype UserId = int\n");
+        assert_eq!(result.python_source, "UserId = NewType(\"UserId\", int)\n");
+        assert!(result
+            .stripped
+            .iter()
+            .any(|k| matches!(k.keyword, TyphonKeyword::Newtype)));
+    }
+
+    #[test]
+    fn newtype_handles_generic_base_type() {
+        let result = preprocess("newtype Tags = list[str]\n");
+        assert_eq!(
+            result.python_source,
+            "Tags = NewType(\"Tags\", list[str])\n"
+        );
+    }
+
+    #[test]
+    fn newtype_round_trips_via_postprocess() {
+        let src = "newtype UserId = int\n";
+        let prep = preprocess(src);
+        let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
+        assert_eq!(out, src);
+    }
+
+    // ── freeze let (Phase F) ────────────────────────────────────────────
+
+    #[test]
+    fn freeze_let_wraps_rhs_in_runtime_call() {
+        let result = preprocess("freeze let TAGS = [\"a\", \"b\"]\n");
+        assert_eq!(
+            result.python_source,
+            "let TAGS = __typhon_freeze__([\"a\", \"b\"])\n"
+        );
+        assert!(result
+            .stripped
+            .iter()
+            .any(|k| matches!(k.keyword, TyphonKeyword::Freeze)));
+    }
+
+    #[test]
+    fn freeze_let_with_annotation_preserves_annotation() {
+        let result = preprocess("freeze let CONFIG: dict[str, int] = {\"port\": 8080}\n");
+        assert_eq!(
+            result.python_source,
+            "let CONFIG: dict[str, int] = __typhon_freeze__({\"port\": 8080})\n"
+        );
+    }
+
+    #[test]
+    fn freeze_let_round_trips_via_postprocess() {
+        let src = "freeze let TAGS: list[str] = [\"a\", \"b\"]\n";
+        let prep = preprocess(src);
+        let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn freeze_let_indented_is_left_alone() {
+        // `freeze let` is module-level only in v1.
+        let result = preprocess("    freeze let X = 1\n");
+        assert!(result.python_source.contains("freeze let"));
+        assert!(!result
+            .stripped
+            .iter()
+            .any(|k| matches!(k.keyword, TyphonKeyword::Freeze)));
+    }
+
+    #[test]
+    fn freeze_let_preserves_trailing_comment() {
+        // PR #95 reviewer feedback: a trailing `# comment` must not be
+        // swallowed by the `__typhon_freeze__(...)` call. Verify the
+        // wrapper closes BEFORE the comment so the emitted Python is
+        // syntactically valid.
+        let result = preprocess("freeze let TAGS = [1, 2]  # ids\n");
+        assert_eq!(
+            result.python_source,
+            "let TAGS = __typhon_freeze__([1, 2])  # ids\n"
+        );
+    }
+
+    #[test]
+    fn freeze_let_with_comment_round_trips_via_postprocess() {
+        let src = "freeze let TAGS = [1, 2]  # ids\n";
+        let prep = preprocess(src);
+        let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn freeze_let_does_not_match_augmented_assign() {
+        // PR #95 reviewer feedback: `%=`, `&=`, `|=`, `^=`, `@=`
+        // augmented-assignment operators must not be mistaken for the
+        // bare `=` that anchors the RHS. None of these are valid
+        // module-level statements after `freeze let`, but the helper
+        // still has to fall through cleanly rather than wrap the LHS.
+        // (We exercise the helper directly to keep the test focused.)
+        assert_eq!(wrap_freeze_let("X %= 1"), None);
+        assert_eq!(wrap_freeze_let("X &= 1"), None);
+        assert_eq!(wrap_freeze_let("X |= 1"), None);
+        assert_eq!(wrap_freeze_let("X ^= 1"), None);
+        assert_eq!(wrap_freeze_let("X @= 1"), None);
+    }
+
+    // ── pub keyword (Phase D) ───────────────────────────────────────────
+
+    #[test]
+    fn pub_def_records_name_and_strips_keyword() {
+        let result = preprocess("pub def greet(name: str) -> str:\n    return name\n");
+        assert_eq!(result.pub_names, vec!["greet".to_owned()]);
+        assert!(!result.python_source.contains("pub def"));
+        assert!(result.python_source.contains("def greet"));
+    }
+
+    #[test]
+    fn pub_class_records_name() {
+        let result = preprocess("pub class User:\n    name: str\n");
+        assert_eq!(result.pub_names, vec!["User".to_owned()]);
+    }
+
+    #[test]
+    fn pub_let_records_name() {
+        let result = preprocess("pub let API: str = \"v1\"\n");
+        assert_eq!(result.pub_names, vec!["API".to_owned()]);
+    }
+
+    #[test]
+    fn pub_newtype_records_name() {
+        let result = preprocess("pub newtype UserId = int\n");
+        assert_eq!(result.pub_names, vec!["UserId".to_owned()]);
+    }
+
+    #[test]
+    fn pub_round_trips_via_postprocess() {
+        let src = "pub def greet(name: str) -> str:\n    return name\n";
+        let prep = preprocess(src);
+        let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn pub_let_round_trips_via_postprocess() {
+        let src = "pub let API: str = \"v1\"\n";
+        let prep = preprocess(src);
+        let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn indented_pub_is_left_alone() {
+        // `pub` only applies at module scope. An indented occurrence
+        // is treated as a regular identifier (which the type checker
+        // will then reject), not as a visibility modifier.
+        let result = preprocess("    pub = 1\n");
+        assert!(result.pub_names.is_empty());
+        assert!(result.python_source.contains("pub = 1"));
+    }
+
+    #[test]
+    fn pub_with_async_def_records_name() {
+        let result = preprocess("pub async def fetch() -> int:\n    return 0\n");
+        assert_eq!(result.pub_names, vec!["fetch".to_owned()]);
+    }
+
+    #[test]
+    fn newtype_does_not_match_indented_form() {
+        // `newtype` only applies at module level. An indented occurrence
+        // should be passed through verbatim (the Python parser will reject
+        // it, which is the right behaviour: nominal aliases inside a
+        // function body don't compose with type checking).
+        let result = preprocess("    newtype UserId = int\n");
+        assert!(result.python_source.contains("newtype UserId"));
+        assert!(!result
+            .stripped
+            .iter()
+            .any(|k| matches!(k.keyword, TyphonKeyword::Newtype)));
     }
 
     #[test]

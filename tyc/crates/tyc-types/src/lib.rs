@@ -22,7 +22,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ruff_python_ast::{Expr, MatchCase, ModModule, Number, Operator, Pattern, Stmt};
+use ruff_python_ast::{Expr, MatchCase, ModModule, Number, Operator, Pattern, Stmt, StmtAssign};
 use ruff_text_size::{Ranged, TextRange};
 use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_resolve::{Binding, BindingKind, ResolvedModule, ScopeId};
@@ -1276,6 +1276,12 @@ struct Checker<'a> {
     /// (warn-level, not yet wired). Module scope is also exempt so
     /// the canonical `asyncio.run(coro())` entry-point pattern passes.
     in_sync_function: bool,
+    /// True while we are checking the body of an `async def`. Used by
+    /// the Phase-E blocking-in-async check (`tyc::blocking_in_async`)
+    /// to fire on direct calls to known-blocking stdlib functions
+    /// (`time.sleep`, `requests.get`, …) that should be wrapped in
+    /// `await asyncio.to_thread(...)` instead.
+    in_async_function: bool,
     /// True while we are checking the body of a generator function
     /// (any `def f() -> Iterator[T]` / `Generator[Y, S, R]` whose body
     /// contains `yield` / `yield from`). Inside a generator, `return`
@@ -1307,6 +1313,14 @@ struct Checker<'a> {
     /// `type B = int | str` accepts an `int` literal where `B` is required.
     /// FINDINGS #57, #58, #70.
     type_aliases: HashMap<String, (Vec<String>, Type)>,
+    /// Nominal newtype declarations: name → base type. Populated from
+    /// `newtype Name = Base` (preprocessed to `Name = NewType("Name",
+    /// Base)`). Unlike `type_aliases`, newtypes are **asymmetric**:
+    /// a `Name` flows freely into a `Base`-typed slot (escape upward),
+    /// but a bare `Base` requires explicit construction via `Name(x)`
+    /// before it satisfies a `Name`-typed target. The construction call
+    /// itself type-checks the argument against `Base`.
+    newtypes: HashMap<String, Type>,
     /// Interfaces (Typhon `interface Name:` → `class Name(Protocol):`).
     /// Maps the interface name to its required member shape and whether it
     /// opted in to runtime checking via `@runtime_checkable`. In v1 we
@@ -1547,6 +1561,7 @@ impl<'a> Checker<'a> {
             async_functions: std::collections::HashSet::new(),
             inside_await: 0,
             in_sync_function: false,
+            in_async_function: false,
             in_generator: false,
             function_type_bounds: HashMap::new(),
             active_typevar_bounds: HashMap::new(),
@@ -1559,6 +1574,7 @@ impl<'a> Checker<'a> {
             unsafe_line_starts: Vec::new(),
             sealed_unions: HashMap::new(),
             type_aliases: HashMap::new(),
+            newtypes: HashMap::new(),
             env: TypeEnv::default(),
             diagnostics: Diagnostics::new(),
             current_return: None,
@@ -1596,6 +1612,25 @@ impl<'a> Checker<'a> {
     fn is_assignable(&self, expected: &Type, actual: &Type) -> bool {
         if assignable(expected, actual) {
             return true;
+        }
+        // Nominal newtype escape upward: `Email → str` is allowed
+        // because the runtime value of `Email` *is* a `str`. The
+        // reverse direction is the default `false` so a bare `str`
+        // never satisfies an `Email`-typed slot without going
+        // through the explicit `Email(x)` constructor. Same-name
+        // newtypes (`Email → Email`) are already handled by the
+        // base `assignable` call above.
+        //
+        // The unwrap chain is bounded by `unwrap_newtype_base` so a
+        // self-referential or cyclic newtype (`newtype A = A`, or
+        // `newtype A = B; newtype B = A`) returns a fallback type
+        // instead of recursing indefinitely.
+        if let Type::Class(actual_name) = actual {
+            if let Some(base) = self.unwrap_newtype_base(actual_name.as_str()) {
+                if self.is_assignable(expected, &base) {
+                    return true;
+                }
+            }
         }
         // Transparent type-alias unwrap. `type Report = ReportData` and
         // `type B = int | str` should let `Class("ReportData")` flow into
@@ -1703,6 +1738,32 @@ impl<'a> Checker<'a> {
     /// as follow-up).
     fn unwrap_alias(&self, ty: &Type) -> Type {
         self.unwrap_alias_inner(ty, 0)
+    }
+
+    /// Unwrap a chain of `newtype Foo = …` declarations until a non-
+    /// newtype base type is reached, or until the chain length hits the
+    /// guard limit (a cycle like `newtype A = A` or `A → B → A`). The
+    /// guard returns `None` so the caller falls through to the normal
+    /// "no escape upward" path and the user sees a `tyc::type_mismatch`
+    /// instead of `tyc check` overflowing the stack.
+    fn unwrap_newtype_base(&self, name: &str) -> Option<Type> {
+        let mut current = name.to_owned();
+        for _ in 0..8 {
+            let base = self.newtypes.get(current.as_str())?.clone();
+            // Follow chains of newtypes (`newtype A = B; newtype B = int`).
+            if let Type::Class(next) = &base {
+                if self.newtypes.contains_key(next.as_str()) {
+                    if next.as_str() == current {
+                        // Trivial self-cycle (`newtype A = A`).
+                        return None;
+                    }
+                    current = next.clone();
+                    continue;
+                }
+            }
+            return Some(base);
+        }
+        None
     }
 
     fn unwrap_alias_inner(&self, ty: &Type, depth: u8) -> Type {
@@ -2510,6 +2571,15 @@ pub fn check_module_with_imports(
     }
     c.env.leave();
 
+    // Phase C: resource discipline. Walk the body for bound
+    // `Stmt::Assign` / `Stmt::AnnAssign` whose RHS is a known
+    // context-manager-returning call (`open`, `socket.socket`, …)
+    // that wasn't consumed by a `with` statement. Fires
+    // `tyc::resource_not_managed` as a warning; the strictness
+    // filter promotes/demotes/drops based on `[strictness]
+    // require-with` in `typhon.toml`.
+    check_resource_discipline(&mut c, &module.body);
+
     c.diagnostics
 }
 
@@ -2925,6 +2995,177 @@ fn seed_typhon_builtins(c: &mut Checker) {
     });
 }
 
+/// Stdlib calls that block the event loop when invoked from inside an
+/// `async def` body. Matched against the dotted callee path returned
+/// by [`dotted_name_of`], so `time.sleep` and bare `input` flow
+/// through the same lookup. Direct calls fire
+/// `tyc::blocking_in_async`; the user can wrap them in `await
+/// asyncio.to_thread(...)` (which the wrapper-detection below
+/// excludes) or `loop.run_in_executor(...)` to silence the
+/// diagnostic. Conservative — only the most common offenders.
+///
+/// **Module-level calls only.** Instance-method calls like
+/// `sock.recv(1024)` cannot be matched by syntactic callee path
+/// without flow-sensitive receiver tracking, so blocking socket
+/// methods (`recv`, `send`, `accept`, …) are intentionally **not**
+/// in this list — they would never trigger and would mislead users
+/// into thinking the check covers them. Tracking instance-method
+/// receivers is a Phase-E follow-up.
+const BLOCKING_CALLEES: &[&str] = &[
+    // time
+    "time.sleep",
+    // I/O
+    "input",
+    // requests (module-level convenience functions)
+    "requests.get",
+    "requests.post",
+    "requests.put",
+    "requests.delete",
+    "requests.patch",
+    "requests.head",
+    "requests.options",
+    "requests.request",
+    // urllib
+    "urllib.request.urlopen",
+    // subprocess (module-level convenience functions)
+    "subprocess.run",
+    "subprocess.call",
+    "subprocess.check_call",
+    "subprocess.check_output",
+];
+
+/// The curated set of stdlib calls that return an unmanaged resource
+/// (a file handle, socket, connection, …) which **must** be wrapped in
+/// a `with` statement to guarantee cleanup. Matched as either a bare
+/// name (`open(...)`) or a dotted suffix (`socket.socket(...)`,
+/// `tempfile.NamedTemporaryFile(...)`). Conservative: only the entries
+/// where missing-`with` is a real bug make the cut. Project-specific
+/// classes can opt in via a future `@must_with` decorator or `.dty`
+/// annotation.
+const REQUIRE_WITH_CALLEES: &[&str] = &[
+    "open",
+    "socket.socket",
+    "sqlite3.connect",
+    "tempfile.NamedTemporaryFile",
+    "tempfile.TemporaryDirectory",
+    "tempfile.TemporaryFile",
+];
+
+/// Return the dotted callee path of `expr` if it is a `Call` whose
+/// callee is a bare or dotted name; otherwise `None`. Used to match
+/// against [`REQUIRE_WITH_CALLEES`] without false positives on
+/// arbitrary expressions.
+fn dotted_callee_path(expr: &Expr) -> Option<String> {
+    let call = match expr {
+        Expr::Call(c) => c,
+        _ => return None,
+    };
+    dotted_name_of(&call.func)
+}
+
+fn dotted_name_of(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Name(n) => Some(n.id.as_str().to_owned()),
+        Expr::Attribute(a) => {
+            let prefix = dotted_name_of(a.value.as_ref())?;
+            Some(format!("{}.{}", prefix, a.attr.as_str()))
+        }
+        _ => None,
+    }
+}
+
+/// Walk `body` recursively, firing `tyc::resource_not_managed` for any
+/// assignment whose RHS is a known resource-returning call. A
+/// `with`-statement's `items[].context_expr` is *not* a child of
+/// `Stmt::Assign`, so legitimate `with open(...) as f:` forms never
+/// trip the check — only bare assignments do.
+fn check_resource_discipline(c: &mut Checker, body: &[Stmt]) {
+    for stmt in body {
+        check_resource_discipline_stmt(c, stmt);
+    }
+}
+
+fn check_resource_discipline_stmt(c: &mut Checker, stmt: &Stmt) {
+    match stmt {
+        Stmt::Assign(a) => {
+            if let Some(name) = dotted_callee_path(a.value.as_ref()) {
+                if REQUIRE_WITH_CALLEES.iter().any(|p| *p == name) {
+                    let span = (
+                        a.value.range().start().to_usize(),
+                        a.value.range().end().to_usize(),
+                    );
+                    c.diagnostics.push_warning(TycError::resource_not_managed(
+                        &name,
+                        &c.path,
+                        c.source,
+                        span.0,
+                        span.1.saturating_sub(span.0).max(1),
+                    ));
+                }
+            }
+        }
+        Stmt::AnnAssign(a) => {
+            if let Some(v) = a.value.as_ref() {
+                if let Some(name) = dotted_callee_path(v.as_ref()) {
+                    if REQUIRE_WITH_CALLEES.iter().any(|p| *p == name) {
+                        let span = (v.range().start().to_usize(), v.range().end().to_usize());
+                        c.diagnostics.push_warning(TycError::resource_not_managed(
+                            &name,
+                            &c.path,
+                            c.source,
+                            span.0,
+                            span.1.saturating_sub(span.0).max(1),
+                        ));
+                    }
+                }
+            }
+        }
+        Stmt::FunctionDef(f) => check_resource_discipline(c, &f.body),
+        Stmt::ClassDef(cd) => check_resource_discipline(c, &cd.body),
+        Stmt::If(s) => {
+            // `unsafe:` lowers to `if True:  # __typhon_unsafe__` at
+            // preprocess time. Skip its body so deliberate
+            // resource-leak escape hatches (`unsafe: let f =
+            // open(...)`) don't trip the diagnostic.
+            if c.is_unsafe_marker(s.range) {
+                return;
+            }
+            check_resource_discipline(c, &s.body);
+            for clause in &s.elif_else_clauses {
+                check_resource_discipline(c, &clause.body);
+            }
+        }
+        Stmt::For(s) => {
+            check_resource_discipline(c, &s.body);
+            check_resource_discipline(c, &s.orelse);
+        }
+        Stmt::While(s) => {
+            check_resource_discipline(c, &s.body);
+            check_resource_discipline(c, &s.orelse);
+        }
+        Stmt::With(s) => {
+            // The items themselves are managed by definition.
+            // Only walk the body.
+            check_resource_discipline(c, &s.body);
+        }
+        Stmt::Try(s) => {
+            check_resource_discipline(c, &s.body);
+            for h in &s.handlers {
+                let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                check_resource_discipline(c, &h.body);
+            }
+            check_resource_discipline(c, &s.orelse);
+            check_resource_discipline(c, &s.finalbody);
+        }
+        Stmt::Match(s) => {
+            for case in &s.cases {
+                check_resource_discipline(c, &case.body);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Walk the type-alias graph and emit `tyc::cyclic_type_alias` for any
 /// alias whose chain returns to itself. FINDINGS #81. Operates on the
 /// raw `Stmt::TypeAlias` declarations (not the resolved `type_aliases`
@@ -3103,10 +3344,30 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                     c.type_aliases.insert(union_name, (params, Type::Unknown));
                 }
             }
+            // `newtype Name = Base` (preprocessed to `Name = NewType("Name",
+            // Base)`) registers `Name` as a nominal type distinct from `Base`.
+            // The classes list gets the name too so annotations referring to
+            // it resolve to `Type::Class(name)`; the asymmetric base
+            // relationship lives in `c.newtypes`.
+            Stmt::Assign(a) if extract_newtype_decl(a).is_some() => {
+                let (name, _base_expr) = extract_newtype_decl(a).expect("checked by guard");
+                c.classes.push(name);
+            }
             _ => {}
         }
     }
     let classes = c.classes.clone();
+    // Resolve every newtype's base expression now that the class list is
+    // populated. Done in this dedicated pass so a `newtype UserId = int`
+    // that appears before its referenced class still resolves correctly.
+    for stmt in body {
+        if let Stmt::Assign(a) = stmt {
+            if let Some((name, base_expr)) = extract_newtype_decl(a) {
+                let base_ty = type_from_annotation_with_params(&base_expr, &classes, &[]);
+                c.newtypes.insert(name, base_ty);
+            }
+        }
+    }
     // Second pass: now that every class name is known, resolve each type
     // alias's RHS into a concrete `Type`. Doing this in pass 1 would
     // mis-translate forward references (e.g. `type Maybe[T] = Just[T] |
@@ -4775,6 +5036,8 @@ fn check_function(
     // pattern free of false positives.
     let saved_in_sync = c.in_sync_function;
     c.in_sync_function = !is_async;
+    let saved_in_async = c.in_async_function;
+    c.in_async_function = is_async;
     // Track whether the current function body is a generator so the
     // return-statement validator can skip the usual assignability
     // check (FINDINGS O6): inside a generator, `return` raises
@@ -4899,6 +5162,7 @@ fn check_function(
     c.current_return = saved_return;
     c.active_typevar_bounds = saved_bounds;
     c.in_sync_function = saved_in_sync;
+    c.in_async_function = saved_in_async;
     c.in_generator = saved_in_generator;
 }
 
@@ -5907,6 +6171,26 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     c.operator_type_mismatch(op_str, &l_stripped, &r_stripped, span);
                 }
             }
+            // Constant-fold safety lint: literal-zero RHS on `/`, `//`, `%`
+            // is always a runtime `ZeroDivisionError`. Only the
+            // literal-only case fires here so the check has zero false
+            // positives — flow-sensitive analysis (`if d == 0` guards
+            // narrowing the value) is out of scope. Skipped inside an
+            // `unsafe:` region like every other diagnostic.
+            if c.unsafe_depth == 0
+                && matches!(b.op, Operator::Div | Operator::FloorDiv | Operator::Mod)
+                && is_literal_zero(b.right.as_ref())
+            {
+                let span = (b.range.start().to_usize(), b.range.end().to_usize());
+                let op_str = arithmetic_op_str(b.op).unwrap_or("/");
+                c.diagnostics.push_error(TycError::div_by_zero_literal(
+                    op_str,
+                    &c.path,
+                    c.source,
+                    span.0,
+                    span.1.saturating_sub(span.0).max(1),
+                ));
+            }
             // User-defined operator overloads on the LHS class take
             // precedence over the conservative numeric inference below.
             // Without this, `Vec2(...) * 5.0` would resolve to `Float`
@@ -6019,6 +6303,35 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     let arg_type = infer_expr(c, &pos_args[0]);
                     return Type::Generic(ctor.to_owned(), vec![arg_type]);
                 }
+                // `Email("alice@example.com")` — newtype constructor
+                // call. Type-check the single positional argument
+                // against the declared base type, then return
+                // `Type::Class(name)` so the caller sees the nominal
+                // value, not the underlying primitive.
+                if pos_args.len() == 1
+                    && kw_args.is_empty()
+                    && c.newtypes.contains_key(fn_name.id.as_str())
+                {
+                    let name = fn_name.id.as_str().to_owned();
+                    let base = c.newtypes.get(&name).cloned().unwrap_or(Type::Unknown);
+                    let arg_ty = infer_expr(c, &pos_args[0]);
+                    if !c.is_assignable(&base, &arg_ty) {
+                        let span = (
+                            pos_args[0].range().start().to_usize(),
+                            pos_args[0].range().end().to_usize(),
+                        );
+                        c.diagnostics.push_error(TycError::newtype_violation(
+                            &name,
+                            base.display(),
+                            arg_ty.display(),
+                            &c.path,
+                            c.source,
+                            span.0,
+                            span.1.saturating_sub(span.0).max(1),
+                        ));
+                    }
+                    return Type::Class(name);
+                }
                 // isinstance(x, Interface) is rejected unless the interface
                 // explicitly opts in via @runtime_checkable. Runtime Protocol
                 // isinstance only checks attribute *presence*, not signature,
@@ -6040,6 +6353,28 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                 }
             }
 
+            // Phase E: blocking-in-async call detection. When the
+            // call sits directly inside an `async def` body and its
+            // callee resolves to a known-blocking stdlib path, fire
+            // `tyc::blocking_in_async` so the user wraps it in
+            // `await asyncio.to_thread(...)` (or `run_in_executor`)
+            // instead. The dotted-callee match excludes wrapper forms
+            // because `asyncio.to_thread(time.sleep, 1)` itself is
+            // `asyncio.to_thread(...)` — not in the registry.
+            if c.in_async_function && c.unsafe_depth == 0 {
+                if let Some(callee_path) = dotted_name_of(&call.func) {
+                    if BLOCKING_CALLEES.iter().any(|p| *p == callee_path) {
+                        let span = (call.range.start().to_usize(), call.range.end().to_usize());
+                        c.diagnostics.push_warning(TycError::blocking_in_async(
+                            &callee_path,
+                            &c.path,
+                            c.source,
+                            span.0,
+                            span.1.saturating_sub(span.0).max(1),
+                        ));
+                    }
+                }
+            }
             let func_type_raw = infer_expr(c, &call.func);
             // Unwrap transparent type aliases (`type Handler = Callable[..., R]`)
             // so that calls through the alias resolve to the underlying
@@ -7098,6 +7433,25 @@ fn operator_operands_compatible(op: Operator, l: &Type, r: &Type) -> bool {
     }
 }
 
+/// Recognise a literal zero on the RHS of a division-style operator.
+/// Catches both `int` (`0`) and `float` (`0.0`, `-0.0`) literals, plus
+/// the unary-minus form of either (`-0`, `-0.0`). Any non-literal
+/// expression returns `false` — we intentionally don't do flow
+/// analysis here; this is the constant-fold-only safety lint.
+fn is_literal_zero(expr: &Expr) -> bool {
+    match expr {
+        Expr::NumberLiteral(n) => match &n.value {
+            Number::Int(i) => i.as_i64() == Some(0),
+            Number::Float(f) => *f == 0.0,
+            _ => false,
+        },
+        Expr::UnaryOp(u) if matches!(u.op, ruff_python_ast::UnaryOp::USub) => {
+            is_literal_zero(u.operand.as_ref())
+        }
+        _ => false,
+    }
+}
+
 /// Extract a constant integer index from an expression used in
 /// `Expr::Subscript`. Supports `Number::Int` literals and the unary
 /// negation of one. Anything else returns `None`.
@@ -7127,6 +7481,48 @@ fn const_int_index(expr: &Expr) -> Option<i64> {
 ///
 /// Uses an explicit stack rather than recursion to avoid stack overflow on
 /// deeply nested union expressions (e.g. `A | B | C | ... | Z`).
+/// If `assign` has the exact shape `Name = NewType("Name", Base)`, return
+/// `(name, base_expr)`. Used to recognise the preprocessed form of
+/// `newtype Name = Base` in the module body and register `Name` as a
+/// nominal newtype.
+///
+/// The string literal in the first argument must match the LHS target
+/// name exactly — any deviation rejects the pattern and falls through to
+/// regular assignment handling.
+fn extract_newtype_decl(assign: &StmtAssign) -> Option<(String, Expr)> {
+    if assign.targets.len() != 1 {
+        return None;
+    }
+    let target = match &assign.targets[0] {
+        Expr::Name(n) => n,
+        _ => return None,
+    };
+    let call = match assign.value.as_ref() {
+        Expr::Call(c) => c,
+        _ => return None,
+    };
+    let callee = match call.func.as_ref() {
+        Expr::Name(n) => n,
+        _ => return None,
+    };
+    if callee.id.as_str() != "NewType" {
+        return None;
+    }
+    if call.arguments.args.len() != 2 || !call.arguments.keywords.is_empty() {
+        return None;
+    }
+    let first = call.arguments.args.first()?;
+    let s = match first {
+        Expr::StringLiteral(s) => s,
+        _ => return None,
+    };
+    if s.value.to_str() != target.id.as_str() {
+        return None;
+    }
+    let base = call.arguments.args.get(1)?.clone();
+    Some((target.id.as_str().to_owned(), base))
+}
+
 fn extract_sealed_union_variants(expr: &Expr) -> Option<Vec<String>> {
     let mut names = Vec::new();
     let mut stack = vec![expr];
@@ -8721,6 +9117,337 @@ let r: str = greet(\"Amy\", weird_name=\"Hi\", another=\"x\")
             "**kwargs must absorb arbitrary names; got {:?}",
             d.errors()
         );
+    }
+
+    // ── newtype (Phase A) ───────────────────────────────────────────────
+
+    #[test]
+    fn newtype_accepts_explicit_construction() {
+        let src = "\
+newtype UserId = int
+def greet(uid: UserId) -> str:
+    return \"hi\"
+let me: UserId = UserId(7)
+let _msg: str = greet(me)
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn newtype_rejects_bare_base_value() {
+        let src = "\
+newtype UserId = int
+def greet(uid: UserId) -> str:
+    return \"hi\"
+let raw: int = 7
+let _msg: str = greet(raw)
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "expected type mismatch on bare int → UserId"
+        );
+    }
+
+    #[test]
+    fn newtype_allows_escape_upward_to_base() {
+        let src = "\
+newtype UserId = int
+def double(n: int) -> int:
+    return n * 2
+let me: UserId = UserId(7)
+let _twice: int = double(me)
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn newtype_rejects_cross_newtype_assignment() {
+        let src = "\
+newtype UserId = int
+newtype PostId = int
+def greet(uid: UserId) -> str:
+    return \"hi\"
+let post: PostId = PostId(42)
+let _msg: str = greet(post)
+";
+        let d = check(src);
+        assert!(d.has_errors(), "expected type mismatch on PostId → UserId");
+    }
+
+    #[test]
+    fn newtype_constructor_arg_type_checked() {
+        let src = "\
+newtype UserId = int
+let bad: UserId = UserId(\"seven\")
+";
+        let d = check(src);
+        assert!(d.has_errors(), "expected newtype_violation for str arg");
+    }
+
+    #[test]
+    fn newtype_self_cycle_does_not_overflow() {
+        // PR #95 reviewer feedback: `newtype A = A` (and longer
+        // chains like `A → B → A`) must not stack-overflow the
+        // checker. The unwrap helper bounds the chain length so the
+        // checker just rejects the assignment with a regular
+        // `tyc::type_mismatch` instead of running away.
+        let src = "\
+newtype A = A
+let x: A = 1
+";
+        let d = check(src);
+        // We don't care WHICH diagnostic fires, only that the checker
+        // finishes — the bug under repair was a stack overflow, not a
+        // misclassification.
+        let _ = d.errors();
+    }
+
+    #[test]
+    fn newtype_mutual_cycle_does_not_overflow() {
+        // Same guarantee for a two-step cycle.
+        let src = "\
+newtype A = B
+newtype B = A
+let x: A = 1
+";
+        let d = check(src);
+        let _ = d.errors();
+    }
+
+    // ── blocking in async (Phase E) ─────────────────────────────────────
+
+    #[test]
+    fn blocking_call_in_async_def_warns() {
+        let src = "\
+import time
+async def bad() -> None:
+    time.sleep(1)
+    return
+";
+        let d = check(src);
+        assert!(
+            d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::BlockingInAsync { .. })),
+            "expected blocking_in_async for time.sleep"
+        );
+    }
+
+    #[test]
+    fn requests_get_in_async_def_warns() {
+        let src = "\
+import requests
+async def fetch() -> str:
+    let r = requests.get(\"http://x\")
+    return \"ok\"
+";
+        let d = check(src);
+        assert!(
+            d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::BlockingInAsync { .. })),
+            "expected blocking_in_async for requests.get"
+        );
+    }
+
+    #[test]
+    fn asyncio_to_thread_wrapper_does_not_warn() {
+        // `asyncio.to_thread(time.sleep, 1)` itself is the wrapper;
+        // the dotted-callee match only sees `asyncio.to_thread`,
+        // which isn't in BLOCKING_CALLEES, so no warning fires.
+        let src = "\
+import asyncio
+import time
+async def good() -> None:
+    await asyncio.to_thread(time.sleep, 1)
+";
+        let d = check(src);
+        assert!(
+            !d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::BlockingInAsync { .. })),
+            "asyncio.to_thread wrapper should not trip blocking_in_async"
+        );
+    }
+
+    #[test]
+    fn blocking_call_in_sync_def_does_not_warn() {
+        // The blocking-in-async check only fires inside `async def`;
+        // sync functions can call `time.sleep` freely.
+        let src = "\
+import time
+def sync_caller() -> None:
+    time.sleep(1)
+";
+        let d = check(src);
+        assert!(
+            !d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::BlockingInAsync { .. })),
+            "sync function should not trip blocking_in_async"
+        );
+    }
+
+    #[test]
+    fn unsafe_block_suppresses_blocking_warning() {
+        let src = "\
+import time
+async def escape_hatch() -> None:
+    unsafe:
+        time.sleep(1)
+    return
+";
+        let d = check(src);
+        assert!(
+            !d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::BlockingInAsync { .. })),
+            "unsafe: should suppress blocking_in_async"
+        );
+    }
+
+    // ── resource discipline (Phase C) ───────────────────────────────────
+
+    #[test]
+    fn bare_open_assignment_warns() {
+        let src = "\
+def read_file(path: str) -> str:
+    let f = open(path)
+    return f.read()
+";
+        let d = check(src);
+        assert!(
+            d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::ResourceNotManaged { .. })),
+            "expected resource_not_managed warning"
+        );
+    }
+
+    #[test]
+    fn with_open_does_not_warn() {
+        let src = "\
+def read_file(path: str) -> str:
+    with open(path) as f:
+        return f.read()
+";
+        let d = check(src);
+        assert!(
+            !d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::ResourceNotManaged { .. })),
+            "with-statement should not trip resource discipline"
+        );
+    }
+
+    #[test]
+    fn socket_socket_assignment_warns() {
+        let src = "\
+import socket
+def listen() -> None:
+    let s = socket.socket()
+    s.close()
+";
+        let d = check(src);
+        assert!(
+            d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::ResourceNotManaged { .. })),
+            "expected resource_not_managed for socket.socket"
+        );
+    }
+
+    #[test]
+    fn unsafe_block_suppresses_resource_warning() {
+        let src = "\
+def escape_hatch(path: str) -> None:
+    unsafe:
+        let f = open(path)
+        f.close()
+";
+        let d = check(src);
+        assert!(
+            !d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::ResourceNotManaged { .. })),
+            "unsafe: should suppress resource discipline"
+        );
+    }
+
+    #[test]
+    fn annotated_resource_assignment_warns() {
+        let src = "\
+def read_file(path: str) -> str:
+    let f: object = open(path)
+    return \"\"
+";
+        let d = check(src);
+        assert!(
+            d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::ResourceNotManaged { .. })),
+            "expected resource_not_managed for annotated assign"
+        );
+    }
+
+    // ── div-by-zero literal (Phase B) ───────────────────────────────────
+
+    #[test]
+    fn div_by_literal_zero_errors() {
+        let src = "let r: float = 1 / 0\n";
+        let d = check(src);
+        assert!(d.has_errors(), "expected div_by_zero_literal");
+    }
+
+    #[test]
+    fn floor_div_by_literal_zero_errors() {
+        let src = "let r: int = 7 // 0\n";
+        let d = check(src);
+        assert!(d.has_errors(), "expected div_by_zero_literal for //");
+    }
+
+    #[test]
+    fn mod_by_literal_zero_errors() {
+        let src = "let r: int = 7 % 0\n";
+        let d = check(src);
+        assert!(d.has_errors(), "expected div_by_zero_literal for %");
+    }
+
+    #[test]
+    fn div_by_negative_zero_literal_errors() {
+        let src = "let r: float = 1 / -0\n";
+        let d = check(src);
+        assert!(d.has_errors(), "expected div_by_zero_literal for -0");
+    }
+
+    #[test]
+    fn div_by_float_zero_literal_errors() {
+        let src = "let r: float = 1.0 / 0.0\n";
+        let d = check(src);
+        assert!(d.has_errors(), "expected div_by_zero_literal for 0.0");
+    }
+
+    #[test]
+    fn div_by_nonzero_literal_ok() {
+        let src = "let r: float = 1 / 2\n";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn div_by_runtime_value_ok() {
+        // Flow-sensitive analysis is out of scope: a runtime value
+        // that could be zero is *not* flagged. Keeps the check
+        // false-positive-free.
+        let src = "\
+def f(d: int) -> float:
+    return 1 / d
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
     }
 
     #[test]

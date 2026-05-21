@@ -52,12 +52,15 @@ fn catalog_codes() -> &'static [&'static str] {
         "async_without_await",
         "attribute_not_found",
         "auto_gather_missed",
+        "blocking_in_async",
         "class_attr_shadows_slot",
         "comptime",
         "contains_secret_literal",
         "cyclic_type_alias",
+        "div_by_zero_literal",
         "duplicate_class",
         "extend_builtin",
+        "freeze",
         "frozen_assign",
         "generator_return_type",
         "generic",
@@ -80,6 +83,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "missing_binding_kind",
         "missing_initialiser",
         "missing_return",
+        "newtype_violation",
         "no_block_shadow",
         "non_exhaustive_match",
         "not_callable",
@@ -88,7 +92,9 @@ fn catalog_codes() -> &'static [&'static str] {
         "orphan_py_import",
         "parse",
         "pattern_shadows_outer",
+        "pub",
         "python_semantic_drift",
+        "resource_not_managed",
         "result_error_mismatch",
         "self_outside_impl",
         "stub_mismatch",
@@ -118,6 +124,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         "auto_gather_missed" => {
             include_str!("../../../../../docs/diagnostics/auto_gather_missed.md")
         }
+        "blocking_in_async" => {
+            include_str!("../../../../../docs/diagnostics/blocking_in_async.md")
+        }
         "class_attr_shadows_slot" => {
             include_str!("../../../../../docs/diagnostics/class_attr_shadows_slot.md")
         }
@@ -126,8 +135,12 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
             include_str!("../../../../../docs/diagnostics/contains_secret_literal.md")
         }
         "cyclic_type_alias" => include_str!("../../../../../docs/diagnostics/cyclic_type_alias.md"),
+        "div_by_zero_literal" => {
+            include_str!("../../../../../docs/diagnostics/div_by_zero_literal.md")
+        }
         "duplicate_class" => include_str!("../../../../../docs/diagnostics/duplicate_class.md"),
         "extend_builtin" => include_str!("../../../../../docs/diagnostics/extend_builtin.md"),
+        "freeze" => include_str!("../../../../../docs/diagnostics/freeze.md"),
         "frozen_assign" => include_str!("../../../../../docs/diagnostics/frozen_assign.md"),
         "generator_return_type" => {
             include_str!("../../../../../docs/diagnostics/generator_return_type.md")
@@ -172,6 +185,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
             include_str!("../../../../../docs/diagnostics/missing_initialiser.md")
         }
         "missing_return" => include_str!("../../../../../docs/diagnostics/missing_return.md"),
+        "newtype_violation" => {
+            include_str!("../../../../../docs/diagnostics/newtype_violation.md")
+        }
         "no_block_shadow" => include_str!("../../../../../docs/diagnostics/no_block_shadow.md"),
         "non_exhaustive_match" => {
             include_str!("../../../../../docs/diagnostics/non_exhaustive_match.md")
@@ -186,8 +202,12 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         "pattern_shadows_outer" => {
             include_str!("../../../../../docs/diagnostics/pattern_shadows_outer.md")
         }
+        "pub" => include_str!("../../../../../docs/diagnostics/pub.md"),
         "python_semantic_drift" => {
             include_str!("../../../../../docs/diagnostics/python_semantic_drift.md")
+        }
+        "resource_not_managed" => {
+            include_str!("../../../../../docs/diagnostics/resource_not_managed.md")
         }
         "result_error_mismatch" => {
             include_str!("../../../../../docs/diagnostics/result_error_mismatch.md")

@@ -69,6 +69,34 @@ pub enum TyphonKeyword {
     /// `@dataclass` decorator, but — unlike `class!` — it never synthesises
     /// an `__init__`. The body is emitted exactly as written.
     PlainClass,
+    /// `newtype` — declares a nominal alias over a base type.
+    ///
+    /// `newtype UserId = int` lowers to `UserId = NewType("UserId", int)`
+    /// (Python `typing.NewType`) at preprocess time. The type checker
+    /// treats `UserId` as nominally distinct from `int`: a bare `int`
+    /// flowing into a `UserId`-typed slot is rejected, while a `UserId`
+    /// flows into an `int` slot freely. Construction goes through
+    /// `UserId(x)`, which type-checks the argument against `int` and
+    /// yields a `UserId`-typed value.
+    Newtype,
+    /// `pub` — marks a module-level declaration as part of the public
+    /// API surface. The preprocessor strips the prefix and records the
+    /// line so the desugar pass can synthesise `__all__ = [...]` from
+    /// every `pub`-marked name. Modules with at least one `pub` symbol
+    /// get an `__all__` list emitted at the top; modules with none get
+    /// no `__all__` (preserves current `from foo import *` behaviour).
+    /// May appear before `def`, `class`, `let`, `mut`, `model`,
+    /// `interface`, `class!`, `plain class`, `newtype`, and `type`.
+    Pub,
+    /// `freeze` — modifier on a `let` binding that deep-freezes the
+    /// bound value. `freeze let users = […]` lowers to `users =
+    /// __typhon_freeze__(…)`, where the runtime helper recursively
+    /// wraps `list → tuple`, `dict → MappingProxyType`, `set →
+    /// frozenset`, walks `@dataclass(frozen=True)` instances, and
+    /// raises on anything that can't be frozen. Stronger than
+    /// `let`'s binding-only immutability — the wrapped value cannot
+    /// be mutated through any reference.
+    Freeze,
 }
 
 impl TyphonKeyword {
@@ -88,6 +116,9 @@ impl TyphonKeyword {
             Self::Lazy => "lazy",
             Self::RawClass => "class!",
             Self::PlainClass => "plain class",
+            Self::Newtype => "newtype",
+            Self::Pub => "pub",
+            Self::Freeze => "freeze",
         }
     }
 
@@ -106,6 +137,9 @@ impl TyphonKeyword {
             "go" => Some(Self::Go),
             "lazy" => Some(Self::Lazy),
             "class!" => Some(Self::RawClass),
+            "newtype" => Some(Self::Newtype),
+            "pub" => Some(Self::Pub),
+            "freeze" => Some(Self::Freeze),
             _ => None,
         }
     }

@@ -75,6 +75,15 @@ pub struct DesugarOptions {
     /// `class T(textual.App):`.  Plumbed in from `typhon.toml`
     /// (`[emit] skip-decoration-bases`).
     pub skip_decoration_bases: Vec<String>,
+    /// Names declared with the `pub` modifier in this module, in source
+    /// order. When non-empty, the desugar pass injects an
+    /// `__all__ = [...]` list at the top of the emitted module so
+    /// `from foo import *` brings in exactly the marked surface and
+    /// downstream tooling (Sphinx autoapi, pyright re-export tracking,
+    /// IDE auto-import filters) sees the public API. An empty
+    /// `pub_names` is intentionally a no-op so legacy `.ty` files
+    /// that pre-date the `pub` keyword keep their current behaviour.
+    pub pub_names: Vec<String>,
 }
 
 /// Desugar a Typhon module AST into a plain Python AST.
@@ -119,7 +128,12 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
     // module will reference it — either because we detected an Ok/
     // Err/Result name, because the user explicitly imported it, or
     // because a `go`/`lazy` lowering produced a qualified reference.
-    let needs_typhon_runtime = has_result_usage || has_any_runtime_import || has_runtime_qualified;
+    // Freeze references will need the runtime helper too — set the
+    // flag here so `tyc build` emits the typhon_runtime/ package even
+    // when no other runtime feature is used.
+    let needs_freeze_runtime = stmts_use_freeze_call(&desugared_mod.body);
+    let needs_typhon_runtime =
+        has_result_usage || has_any_runtime_import || has_runtime_qualified || needs_freeze_runtime;
     // Only skip injection when an existing `from typhon_runtime
     // import …` already covers all three names. A partial import
     // (e.g. just `Ok`) would leave `Err`/`Result` undefined, so we
@@ -141,6 +155,18 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
     let needs_protocol = stmts_use_protocol_base(&desugared_mod.body);
     let inject_protocol = needs_protocol && !has_protocol_import(&desugared_mod.body);
 
+    // `newtype Name = Base` lowers to `Name = NewType("Name", Base)` —
+    // ensure `from typing import NewType` is in scope.
+    let needs_newtype = stmts_use_newtype_call(&desugared_mod.body);
+    let inject_newtype = needs_newtype && !has_newtype_import(&desugared_mod.body);
+
+    // `freeze let X = expr` lowers to `let X = __typhon_freeze__(expr)`
+    // — ensure `from typhon_runtime.freeze import deep_freeze as
+    // __typhon_freeze__` is in scope and the typhon_runtime package
+    // gets emitted alongside the output.
+    let needs_freeze = stmts_use_freeze_call(&desugared_mod.body);
+    let inject_freeze = needs_freeze && !has_freeze_import(&desugared_mod.body);
+
     // `gather:` lowers to `asyncio.TaskGroup` and best-effort to
     // `asyncio.gather(...)` — ensure `import asyncio` is in scope.
     let needs_asyncio = stmts_use_asyncio_qualified(&desugared_mod.body);
@@ -155,28 +181,67 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
     let mut body = desugared_mod.body;
     let insert_at = import_insert_pos(&body);
 
+    // `pub` synthesis: when the source declared at least one `pub`
+    // name, emit `__all__ = ["a", "b", …]` right after the import
+    // block so re-exporters and `import *` consumers see the public
+    // surface. Skipped if the module already provides its own
+    // `__all__` so handwritten lists win. Compute the insertion
+    // need now — but defer the actual insert until AFTER every
+    // injected import has landed (otherwise repeated `Vec::insert`
+    // at the same index would splice `__all__` into the middle of
+    // the import block).
+    let inject_dunder_all =
+        !options.pub_names.is_empty() && !body.iter().any(is_dunder_all_assignment);
+
     // Insert imports in reverse order so later `insert_at` calls don't
-    // shift indices of earlier insertions.
+    // shift indices of earlier insertions. The relative order ends up
+    // pydantic → result → freeze → newtype → protocol → asyncio →
+    // runtime_module at the top of the file.
+    let mut imports_inserted: usize = 0;
+    let mut inject = |body: &mut Vec<Stmt>, stmt: Stmt| {
+        body.insert(insert_at, stmt);
+        imports_inserted += 1;
+    };
     if inject_runtime_module {
-        body.insert(insert_at, make_bare_typhon_runtime_import());
+        inject(&mut body, make_bare_typhon_runtime_import());
     }
     if inject_asyncio {
-        body.insert(insert_at, make_asyncio_import());
+        inject(&mut body, make_asyncio_import());
     }
     if inject_protocol {
-        body.insert(insert_at, make_protocol_import());
+        inject(&mut body, make_protocol_import());
+    }
+    if inject_newtype {
+        inject(&mut body, make_newtype_import());
+    }
+    if inject_freeze {
+        inject(&mut body, make_freeze_import());
     }
     if inject_result_import {
-        body.insert(insert_at, make_typhon_runtime_import());
+        inject(&mut body, make_typhon_runtime_import());
     }
     // Emit the fewest imports possible: combine into one statement when
     // both are needed, otherwise emit just the missing one.
     if inject_basemodel && inject_config_dict {
-        body.insert(insert_at, make_pydantic_basemodel_import()); // includes both
+        inject(&mut body, make_pydantic_basemodel_import()); // includes both
     } else if inject_basemodel {
-        body.insert(insert_at, make_pydantic_basemodel_only_import());
+        inject(&mut body, make_pydantic_basemodel_only_import());
     } else if inject_config_dict {
-        body.insert(insert_at, make_config_dict_only_import());
+        inject(&mut body, make_config_dict_only_import());
+    }
+    // `inject` borrows `imports_inserted`; the closure's last call
+    // sits above, so its borrow ends here naturally and `__all__`
+    // can read `imports_inserted` again.
+    let _ = inject;
+
+    if inject_dunder_all {
+        // Place `__all__` AFTER the last injected import so it never
+        // splits the import block. `insert_at + imports_inserted` is
+        // the index right after the run of imports that landed above.
+        body.insert(
+            insert_at + imports_inserted,
+            make_dunder_all(&options.pub_names),
+        );
     }
 
     DesugarOutput {
@@ -488,6 +553,173 @@ fn make_protocol_import() -> Stmt {
         names: vec![make_alias("Protocol")],
         level: 0,
         is_lazy: false,
+    })
+}
+
+fn make_newtype_import() -> Stmt {
+    Stmt::ImportFrom(StmtImportFrom {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        module: Some(make_identifier("typing")),
+        names: vec![make_alias("NewType")],
+        level: 0,
+        is_lazy: false,
+    })
+}
+
+fn make_freeze_import() -> Stmt {
+    Stmt::ImportFrom(StmtImportFrom {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        module: Some(make_identifier("typhon_runtime.freeze")),
+        names: vec![ruff_python_ast::Alias {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            name: make_identifier("deep_freeze"),
+            asname: Some(make_identifier("__typhon_freeze__")),
+        }],
+        level: 0,
+        is_lazy: false,
+    })
+}
+
+/// `true` when `body` already binds `__typhon_freeze__` as an alias of
+/// `typhon_runtime.freeze.deep_freeze`.
+fn has_freeze_import(body: &[Stmt]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::ImportFrom(i) => {
+            i.module.as_ref().map(|m| m.as_str()) == Some("typhon_runtime.freeze")
+                && i.names.iter().any(|a| {
+                    a.name.as_str() == "deep_freeze"
+                        && a.asname.as_ref().map(|n| n.as_str()) == Some("__typhon_freeze__")
+                })
+        }
+        _ => false,
+    })
+}
+
+/// `true` when `body` has at least one expression of the form
+/// `__typhon_freeze__(...)` — the desugared shape of `freeze let`.
+fn stmts_use_freeze_call(body: &[Stmt]) -> bool {
+    body.iter().any(stmt_uses_freeze_call)
+}
+
+fn stmt_uses_freeze_call(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Assign(a) => expr_uses_freeze_call(&a.value),
+        Stmt::AnnAssign(a) => a.value.as_ref().is_some_and(|v| expr_uses_freeze_call(v)),
+        Stmt::FunctionDef(f) => stmts_use_freeze_call(&f.body),
+        Stmt::ClassDef(c) => stmts_use_freeze_call(&c.body),
+        Stmt::If(s) => {
+            stmts_use_freeze_call(&s.body)
+                || s.elif_else_clauses
+                    .iter()
+                    .any(|c| stmts_use_freeze_call(&c.body))
+        }
+        _ => false,
+    }
+}
+
+fn expr_uses_freeze_call(expr: &Expr) -> bool {
+    if let Expr::Call(c) = expr {
+        if let Expr::Name(n) = c.func.as_ref() {
+            if n.id.as_str() == "__typhon_freeze__" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Synthesise `__all__ = ["a", "b", ...]` from the list of `pub`
+/// names. Emitted as a regular module-level assignment so downstream
+/// tooling sees a plain Python `__all__` declaration.
+fn make_dunder_all(names: &[String]) -> Stmt {
+    let elts: Vec<Expr> = names.iter().map(|n| make_string_literal_expr(n)).collect();
+    let list_expr = Expr::List(ruff_python_ast::ExprList {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        elts,
+        ctx: ExprContext::Load,
+    });
+    Stmt::Assign(StmtAssign {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        targets: vec![Expr::Name(ExprName {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            id: ruff_python_ast::name::Name::new_static("__all__"),
+            ctx: ExprContext::Store,
+        })],
+        value: Box::new(list_expr),
+        mutability: None,
+    })
+}
+
+/// `true` when `stmt` is a hand-written `__all__ = ...` assignment.
+/// Used by the desugar pass to keep author-supplied lists untouched
+/// even when `pub` declarations are present.
+fn is_dunder_all_assignment(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Assign(a) => a
+            .targets
+            .iter()
+            .any(|t| matches!(t, Expr::Name(n) if n.id.as_str() == "__all__")),
+        Stmt::AnnAssign(a) => {
+            matches!(a.target.as_ref(), Expr::Name(n) if n.id.as_str() == "__all__")
+        }
+        _ => false,
+    }
+}
+
+/// `true` when `body` already binds the bare name `NewType` from `typing`.
+fn has_newtype_import(body: &[Stmt]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::ImportFrom(i) => {
+            i.module.as_ref().map(|m| m.as_str()) == Some("typing")
+                && i.names.iter().any(|a| match a.name.as_str() {
+                    "NewType" => matches!(
+                        a.asname.as_ref().map(|n| n.as_str()),
+                        None | Some("NewType")
+                    ),
+                    "*" => true,
+                    _ => false,
+                })
+        }
+        _ => false,
+    })
+}
+
+/// `true` when `body` has at least one module-level assignment of the form
+/// `Name = NewType("Name", Base)`. The desugar pass uses this to decide
+/// whether `from typing import NewType` needs to be injected.
+fn stmts_use_newtype_call(body: &[Stmt]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::Assign(a) => {
+            if a.targets.len() != 1 {
+                return false;
+            }
+            let Expr::Name(target_name) = &a.targets[0] else {
+                return false;
+            };
+            let Expr::Call(call) = a.value.as_ref() else {
+                return false;
+            };
+            let Expr::Name(callee) = call.func.as_ref() else {
+                return false;
+            };
+            if callee.id.as_str() != "NewType" {
+                return false;
+            }
+            let Some(first_arg) = call.arguments.args.first() else {
+                return false;
+            };
+            let Expr::StringLiteral(s) = first_arg else {
+                return false;
+            };
+            s.value.to_str() == target_name.id.as_str()
+        }
+        _ => false,
     })
 }
 
