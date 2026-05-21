@@ -186,10 +186,12 @@ jobs:
 
           New-Item -ItemType Directory -Path 'dist' -Force | Out-Null
           $zipPath = "dist/$name.zip"
-          # Compress-Archive expects the parent layout to match what we
-          # want inside the zip — Compress-Archive of $stage produces a
-          # zip whose top-level entry is "$name\". We pass the parent
-          # directory so the resulting layout is `tyc-X.Y.Z-target/...`.
+          # Pass the stage directory itself (not its parent) to
+          # Compress-Archive. Because the stage directory is named
+          # `$name` (`tyc-X.Y.Z-target`), the zip's top-level entry
+          # ends up as `$name\` — the same shape the POSIX `tar.gz`
+          # path produces, and what install.ps1 expects when it looks
+          # for `tyc.exe` under `tyc-$version-$target/`.
           Compress-Archive -Path $stage.FullName -DestinationPath $zipPath -Force
           $hash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
           # `<hash>  <file>` — two spaces, matching the POSIX

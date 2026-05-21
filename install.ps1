@@ -105,6 +105,15 @@ if (-not $InstallDir -or $InstallDir.Trim() -eq '') {
 # which GitHub long since dropped.
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
+# `-UseBasicParsing` is only meaningful on Windows PowerShell 5.1 — on
+# PowerShell 6+ basic parsing is the only mode and the flag is a no-op
+# (still accepted, but flagged as obsolete). Build a splat once so each
+# call site stays clean and we don't pass a useless flag on modern PS.
+$WebRequestExtra = @{}
+if ($PSVersionTable.PSVersion.Major -lt 6) {
+    $WebRequestExtra['UseBasicParsing'] = $true
+}
+
 # ---------------------------------------------------------------------------
 # Resolve version
 # ---------------------------------------------------------------------------
@@ -113,9 +122,9 @@ if (-not $Version -or $Version.Trim() -eq '') {
     Write-Step "Resolving latest release from GitHub API"
     $apiUrl = "https://api.github.com/repos/$Repo/releases/latest"
     try {
-        $release = Invoke-RestMethod -Uri $apiUrl -UseBasicParsing -Headers @{
+        $release = Invoke-RestMethod -Uri $apiUrl -Headers @{
             'User-Agent' = 'typhon-install-ps1'
-        }
+        } @WebRequestExtra
     } catch {
         Stop-WithError "Could not query GitHub Releases: $_"
     }
@@ -150,7 +159,7 @@ try {
     Write-Step "Downloading $ZipName"
     Write-Step "  from $ZipUrl"
     try {
-        Invoke-WebRequest -Uri $ZipUrl -OutFile $ZipPath -UseBasicParsing
+        Invoke-WebRequest -Uri $ZipUrl -OutFile $ZipPath @WebRequestExtra
     } catch {
         Stop-WithError "Failed to download ${ZipUrl}: $_
 Check that the release exists: https://github.com/$Repo/releases/tag/$Version"
@@ -159,13 +168,17 @@ Check that the release exists: https://github.com/$Repo/releases/tag/$Version"
     Write-Step "Downloading $ChecksumsName"
     Write-Step "  from $ChecksumsUrl"
     try {
-        Invoke-WebRequest -Uri $ChecksumsUrl -OutFile $ChecksumsPath -UseBasicParsing
+        Invoke-WebRequest -Uri $ChecksumsUrl -OutFile $ChecksumsPath @WebRequestExtra
     } catch {
         Stop-WithError "Failed to download ${ChecksumsUrl}: $_"
     }
 
     Write-Step "Verifying SHA-256 checksum"
-    $expectedLine = Get-Content -LiteralPath $ChecksumsPath | Where-Object { $_ -match "\s$([regex]::Escape($ZipName))\s*$" } | Select-Object -First 1
+    # `sha256sum` writes `<hash>  <file>` in text mode (two spaces) and
+    # `<hash> *<file>` in binary mode. Our own release workflow emits the
+    # text form, but accept both shapes so a hand-rolled SHA256SUMS
+    # (`sha256sum -b`) still verifies correctly.
+    $expectedLine = Get-Content -LiteralPath $ChecksumsPath | Where-Object { $_ -match "[\s\*]$([regex]::Escape($ZipName))\s*$" } | Select-Object -First 1
     if (-not $expectedLine) {
         Stop-WithError "No checksum entry for $ZipName in $ChecksumsName"
     }
@@ -243,7 +256,10 @@ If tyc.exe is currently running, close all sessions and retry."
             Write-Step "$InstallDir is already on your user PATH."
         } else {
             Write-Step "Adding $InstallDir to your user PATH"
-            $newUserPath = if ($userPath) { "$userPath;$InstallDir" } else { $InstallDir }
+            # TrimEnd(';') so we don't end up with `a;b;;C:\…` when the
+            # existing user PATH already has a trailing semicolon (common
+            # leftover from previous tooling).
+            $newUserPath = if ($userPath) { "$($userPath.TrimEnd(';'));$InstallDir" } else { $InstallDir }
             [Environment]::SetEnvironmentVariable('PATH', $newUserPath, 'User')
             # Also expose it in the current session so the smoke test
             # below (and any follow-up command the user runs in this
