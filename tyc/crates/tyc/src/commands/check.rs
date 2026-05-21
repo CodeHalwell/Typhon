@@ -67,9 +67,16 @@ pub fn run(args: CheckArgs) -> Result<()> {
         // directory containing `typhon.toml`), not the subdir the user ran
         // `tyc check` against.
         Ok(Some((path, cfg))) => {
+            // `path.parent()` returns `Some("")` for a bare
+            // `"typhon.toml"` (the relative case when `tyc check` is
+            // invoked from the project root). An empty PathBuf is a
+            // valid Rust value but downstream subprocess spawns that
+            // pass it as `current_dir` fail with ENOENT — degrade to
+            // `"."` so the parent's CWD is inherited instead.
             let root = path
                 .parent()
                 .map(|p| p.to_path_buf())
+                .filter(|p| !p.as_os_str().is_empty())
                 .unwrap_or_else(|| PathBuf::from("."));
             (cfg, true, root)
         }
@@ -149,7 +156,34 @@ pub fn run(args: CheckArgs) -> Result<()> {
         .and_then(|n| n.to_str())
         .unwrap_or(&config.project.src)
         .to_owned();
-    let project_shapes = std::sync::Arc::new(collect_project_shapes(&args.paths, &src_root_name));
+    let mut shape_map = collect_project_shapes(&args.paths, &src_root_name);
+
+    // Venv-introspection enrichment: shell to the project's
+    // `.venv/bin/python` and ask `inspect.signature` for the real
+    // parameter list of every third-party class / free function the
+    // project imports. Without this, `from agent_framework import
+    // Agent; Agent(name="x")` would silently pass `tyc check` even
+    // when `Agent.__init__` requires a `client` kwarg — the runtime
+    // would catch it with `TypeError: missing 1 required positional
+    // argument: 'client'`. Skipped when no `typhon.toml` is found
+    // (standalone-file mode) or when no allow-listed top-level
+    // packages exist.
+    if has_project_config {
+        let project_module_set: std::collections::HashSet<String> =
+            project_modules.iter().cloned().collect();
+        let allowed_top_level: std::collections::HashSet<String> = extra_modules
+            .iter()
+            .map(|m| m.split('.').next().unwrap_or(m).to_owned())
+            .collect();
+        crate::venv_signatures::enrich_project_shapes_with_venv(
+            &args.paths,
+            &project_root,
+            &project_module_set,
+            allowed_top_level,
+            &mut shape_map,
+        );
+    }
+    let project_shapes = std::sync::Arc::new(shape_map);
 
     for root in &args.paths {
         for path in collect_ty_files(root)? {
@@ -835,6 +869,86 @@ def fetch(url: str) -> str:
         // The check should pass (no unknown_module error) because there is
         // no project config to anchor the dependency check to.
         run(args).unwrap();
+    }
+
+    #[test]
+    fn check_introspects_third_party_class_constructor_arity() {
+        // Reproduces the original bug: `from agent_framework import
+        // Agent; Agent(name="x", tools=[])` passed `tyc check`
+        // because `agent_framework` had no `.dty` stub. With venv
+        // introspection on, the checker recovers `Agent.__init__`'s
+        // real signature from the installed package and the
+        // missing required `client` kwarg fires `tyc::arg_count`.
+        //
+        // Requires a Python 3 on PATH; skip silently otherwise so CI
+        // runners without Python don't fail the suite.
+        if crate::venv_signatures::which_python3_for_test().is_none() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        // Fake third-party package, importable via Python's CWD-based
+        // sys.path[0] entry. Lives at the project root so the
+        // subprocess Python spawned by `enrich_project_shapes_with_venv`
+        // finds it. The package name must match a [dependencies] key.
+        let pkg = tmp.path().join("fake_introspect_pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("__init__.py"),
+            "\
+class Agent:
+    def __init__(self, *, name, client, tools=None):
+        pass
+",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\n\
+             name = \"t\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out\"\n\
+             [python]\ntarget = \"3.13\"\n\
+             [dependencies]\nfake_introspect_pkg = \"*\"\n",
+        )
+        .unwrap();
+        write_ty(
+            &src,
+            "main.ty",
+            "from fake_introspect_pkg import Agent\n\
+             let a: Agent = Agent(name=\"x\", tools=[])\n",
+        );
+        // The introspection helper sets its own subprocess CWD to
+        // `project_root`, so Python's `sys.path[0]` picks up
+        // `fake_introspect_pkg` without touching the process-global
+        // CWD that other parallel tests share.
+        let project_root = tmp.path();
+        let mut shape_map: std::collections::HashMap<String, tyc_db::ModuleShapes> =
+            std::collections::HashMap::new();
+        let project_module_set: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let allowed: std::collections::HashSet<String> =
+            ["fake_introspect_pkg".to_owned()].into_iter().collect();
+        crate::venv_signatures::enrich_project_shapes_with_venv(
+            std::slice::from_ref(&src),
+            project_root,
+            &project_module_set,
+            allowed,
+            &mut shape_map,
+        );
+        // The fake_introspect_pkg shape must now carry `Agent` with
+        // field_order = ["name", "client", "tools"] and
+        // field_defaults = {"tools"}.
+        let shapes = shape_map
+            .get("fake_introspect_pkg")
+            .expect("introspection should produce shapes for the fake package");
+        let agent_shape = shapes
+            .class_shapes
+            .get("Agent")
+            .expect("Agent class should be introspected");
+        assert_eq!(agent_shape.field_order, vec!["name", "client", "tools"]);
+        assert!(!agent_shape.field_defaults.contains("name"));
+        assert!(!agent_shape.field_defaults.contains("client"));
+        assert!(agent_shape.field_defaults.contains("tools"));
     }
 
     #[test]
