@@ -29,7 +29,7 @@
 //!     (`let`, `def`, `if`, ...) are left untouched.
 //!   - No readline support; arrow keys insert escape sequences.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -87,6 +87,11 @@ pub fn run(args: ReplArgs) -> Result<()> {
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
+    // Skip the `>>> ` / `... ` prompts when stdin is piped (not a TTY).
+    // A user typing into a terminal expects each prompt to overwrite a
+    // blank line; a piped stream has no such opportunity and the
+    // prompts stack into nonsense like `>>> >>> >>> 6` (FINDINGS O26).
+    let interactive = stdin.is_terminal();
     let mut stdin = stdin.lock();
     let mut stdout = stdout.lock();
 
@@ -99,15 +104,19 @@ pub fn run(args: ReplArgs) -> Result<()> {
         let line_owned: String = if let Some(p) = pending.take() {
             p
         } else {
-            write!(stdout, ">>> ").ok();
-            stdout.flush().ok();
+            if interactive {
+                write!(stdout, ">>> ").ok();
+                stdout.flush().ok();
+            }
             buf.clear();
             let n = stdin
                 .read_line(&mut buf)
                 .map_err(|e| miette!("read failed: {e}"))?;
             if n == 0 {
                 // EOF — exit cleanly.
-                writeln!(stdout).ok();
+                if interactive {
+                    writeln!(stdout).ok();
+                }
                 break;
             }
             buf.trim_end_matches(['\r', '\n']).to_owned()
@@ -148,8 +157,10 @@ pub fn run(args: ReplArgs) -> Result<()> {
         let colon_opened = line.trim_end().ends_with(':');
         if needs_continuation(line) {
             loop {
-                write!(stdout, "... ").ok();
-                stdout.flush().ok();
+                if interactive {
+                    write!(stdout, "... ").ok();
+                    stdout.flush().ok();
+                }
                 buf.clear();
                 let n = stdin
                     .read_line(&mut buf)
