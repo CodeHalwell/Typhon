@@ -87,6 +87,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "operator_type_mismatch",
         "orphan_py_import",
         "parse",
+        "pattern_shadows_outer",
         "python_semantic_drift",
         "result_error_mismatch",
         "self_outside_impl",
@@ -182,6 +183,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         }
         "orphan_py_import" => include_str!("../../../../../docs/diagnostics/orphan_py_import.md"),
         "parse" => include_str!("../../../../../docs/diagnostics/parse.md"),
+        "pattern_shadows_outer" => {
+            include_str!("../../../../../docs/diagnostics/pattern_shadows_outer.md")
+        }
         "python_semantic_drift" => {
             include_str!("../../../../../docs/diagnostics/python_semantic_drift.md")
         }

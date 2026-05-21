@@ -48,6 +48,31 @@ pub enum TycError {
         assignment: SourceSpan,
     },
 
+    /// A `case Foo(name):` pattern binds a name that already exists as
+    /// an immutable `let` in an enclosing scope. Python semantics make
+    /// the pattern binding a real rebinding (visible after the `match`),
+    /// so under Rule 2 it would trip `tyc::immutable_assign` — but
+    /// Rust/OCaml/Scala programmers reach for pattern captures
+    /// reflexively and `change \`let\` to \`mut\`` is the wrong advice
+    /// (the user wants a fresh binding, not a mutation site). This
+    /// diagnostic surfaces the same shape with rename-the-capture as
+    /// the actionable hint. FINDINGS O10.
+    #[error("pattern capture `{name}` shadows an outer immutable `let {name}`")]
+    #[diagnostic(
+        code(tyc::pattern_shadows_outer),
+        url("https://typhon.dev/lang/diagnostics/pattern_shadows_outer"),
+        help("rename the pattern capture (e.g. `case Wrap({name}_inner):`) — pattern bindings are real rebindings under Python's `match` semantics, so reusing an outer immutable name is rejected. If you genuinely want to overwrite the outer binding, change its declaration to `mut`.")
+    )]
+    PatternShadowsOuter {
+        name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("outer `let` declared here")]
+        declaration: SourceSpan,
+        #[label("pattern capture here")]
+        capture: SourceSpan,
+    },
+
     /// A field on a `frozen` class was assigned outside the constructor.
     #[error("cannot assign to field '{field}' on frozen class `{class}`")]
     #[diagnostic(
@@ -1817,6 +1842,26 @@ impl TycError {
             src: NamedSource::new(path, source),
             declaration: SourceSpan::new(SourceOffset::from(declaration_offset), declaration_len),
             assignment: SourceSpan::new(SourceOffset::from(assignment_offset), assignment_len),
+        }
+    }
+
+    /// Construct a [`TycError::PatternShadowsOuter`] diagnostic.
+    pub fn pattern_shadows_outer(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        declaration_offset: usize,
+        declaration_len: usize,
+        capture_offset: usize,
+        capture_len: usize,
+    ) -> Self {
+        let path = path.into();
+        let source = source.into();
+        Self::PatternShadowsOuter {
+            name: name.into(),
+            src: NamedSource::new(path, source),
+            declaration: SourceSpan::new(SourceOffset::from(declaration_offset), declaration_len),
+            capture: SourceSpan::new(SourceOffset::from(capture_offset), capture_len),
         }
     }
 
