@@ -3371,20 +3371,50 @@ fn strip_receiver_from_arity(mut info: ArityInfo) -> ArityInfo {
 ///   `field_order` and below).
 /// - Named in a kwarg.
 ///
-/// Powers the `tyc::missing_argument` diagnostic. Returning an empty
-/// vec means the arity violation isn't reducible to "missing names"
-/// (too many positionals, positional+kwarg conflict on the same
-/// parameter, …) and the caller should fall back to `tyc::arg_count`.
+/// Powers the `tyc::missing_argument` diagnostic. Returns an empty
+/// vec — forcing the caller to fall back to `tyc::arg_count` — in
+/// every case where the arity failure *isn't* reducible to "you
+/// forgot field X":
+///
+/// - **Too many positionals** (`Point(1, 2, 3)` for a 2-field
+///   class): the surplus arguments are the bug, not a missing
+///   field.
+/// - **Positional+kwarg double-binding** (`Point(1, x=2)`): the
+///   conflict is the bug; saying "missing `y`" sends the user the
+///   wrong fix.
+/// - **`*iter` positional unpack** or **`**dict` kwarg unpack**:
+///   the call's effective shape is unknowable statically, so any
+///   missing-field guess could be wrong.
 fn missing_required_fields(
     shape: &InterfaceShape,
     pos_args: &[Expr],
     kw_args: &[ruff_python_ast::Keyword],
 ) -> Vec<String> {
+    let has_starred_pos = pos_args.iter().any(|e| matches!(e, Expr::Starred(_)));
+    let has_double_star = kw_args.iter().any(|k| k.arg.is_none());
+    if has_starred_pos || has_double_star {
+        return Vec::new();
+    }
+    if pos_args.len() > shape.field_order.len() {
+        // Too many positionals — surplus is the bug, not a missing
+        // field. Fall back to the count-based diagnostic.
+        return Vec::new();
+    }
     let filled_positionally = pos_args.len().min(shape.field_order.len());
     let supplied_kwargs: std::collections::HashSet<&str> = kw_args
         .iter()
         .filter_map(|k| k.arg.as_ref().map(|i| i.as_str()))
         .collect();
+    // Positional+kwarg double-binding: a kwarg names a field that
+    // the positional args already filled. `check_arity_with_info`
+    // flags this as `ArityCheck::Other`, but the *real* error is the
+    // conflict — listing other unfilled fields as "missing" would
+    // suggest the wrong fix.
+    for (idx, name) in shape.field_order.iter().enumerate() {
+        if idx < filled_positionally && supplied_kwargs.contains(name.as_str()) {
+            return Vec::new();
+        }
+    }
     shape
         .field_order
         .iter()
@@ -3404,6 +3434,12 @@ fn missing_required_fields(
 /// Returns names in declaration order — positional params first,
 /// then kw-only — so the diagnostic message reads in the same order
 /// the user sees in the signature.
+///
+/// Returns an empty vec in the same set of "not really a
+/// missing-field error" cases [`missing_required_fields`] handles
+/// (too many positionals, positional+kwarg double-binding,
+/// `*iter` / `**dict` unpacks) so the caller falls back to the
+/// count-based `tyc::arg_count` diagnostic.
 fn missing_required_params(
     info: &ArityInfo,
     pos_args: &[Expr],
@@ -3418,10 +3454,27 @@ fn missing_required_params(
     if has_starred_pos || has_double_star {
         return Vec::new();
     }
+    // Too many positionals (only meaningful when the function isn't
+    // variadic; `*args` uncaps `max_positional` to `None`).
+    if let Some(max_pos) = info.max_positional {
+        if pos_args.len() > max_pos {
+            return Vec::new();
+        }
+    }
     let supplied_kwargs: std::collections::HashSet<&str> = kw_args
         .iter()
         .filter_map(|k| k.arg.as_ref().map(|i| i.as_str()))
         .collect();
+    // Positional+kwarg double-binding: a kwarg names a positional
+    // parameter that the positional args already filled. The real
+    // error is the conflict; suggesting another name as "missing"
+    // would be misleading.
+    let filled_positionally = pos_args.len().min(info.param_names.len());
+    for name in info.param_names.iter().take(filled_positionally) {
+        if supplied_kwargs.contains(name.as_str()) {
+            return Vec::new();
+        }
+    }
     let use_per_param = info.required_positional.len() == info.param_names.len()
         && !info.required_positional.is_empty();
     let mut missing: Vec<String> = Vec::new();
@@ -7355,7 +7408,7 @@ let r: int = add(1)
         let d = check(src);
         assert!(d.has_errors());
         let msg = format!("{}", d.errors()[0]);
-        // 0.2.2: when we can pin down which parameter wasn't filled
+        // 0.2.3: when we can pin down which parameter wasn't filled
         // (here `b`), the more actionable `missing_argument` diagnostic
         // fires in place of the count-based form. Either wording is
         // accepted to keep the test future-proof against further
@@ -7388,7 +7441,7 @@ let c: ApiClient = ApiClient(base_url=\"https://api.example.com\")
         let d = check(src);
         assert!(d.has_errors(), "missing required field must error");
         let msg = format!("{}", d.errors()[0]);
-        // 0.2.2: when the call already supplied `base_url`, the
+        // 0.2.3: when the call already supplied `base_url`, the
         // dedicated `missing_argument` diagnostic names the missing
         // `api_key` instead of the count-based form.
         assert!(
@@ -7503,6 +7556,78 @@ let p: Point = Point(1, 2, 3)
 ";
         let d = check(src);
         assert!(d.has_errors(), "extra positional must error");
+        let msg = format!("{}", d.errors()[0]);
+        // The "missing_argument" path is wrong here — every required
+        // field is filled positionally; the surplus arg is the real
+        // bug. PR-#90 review: we must fall back to the count-based
+        // `arg_count` diagnostic in this case.
+        assert!(
+            !msg.contains("missing required argument"),
+            "too-many-positionals must not fire missing_argument: {msg}"
+        );
+        assert!(msg.contains("wrong number of arguments"), "got: {msg}");
+    }
+
+    #[test]
+    fn ctor_positional_kwarg_conflict_falls_back_to_arg_count() {
+        // `Point(1, x=2)` double-binds `x` (positionally + by kwarg);
+        // `check_arity_with_info` returns `ArityCheck::Other`, but
+        // suggesting "missing `y`" would send the user the wrong
+        // fix. The named-missing diagnostic must defer to
+        // `wrong_args` here. PR-#90 codex review.
+        let src = "\
+class Point:
+    x: int
+    y: int
+
+let p: Point = Point(1, x=2)
+";
+        let d = check(src);
+        assert!(d.has_errors(), "double-bound positional must error");
+        let msg = format!("{}", d.errors()[0]);
+        assert!(
+            !msg.contains("missing required argument"),
+            "conflict must not be reported as missing-field: {msg}"
+        );
+    }
+
+    #[test]
+    fn fn_positional_kwarg_conflict_falls_back_to_arg_count() {
+        // Same shape as the ctor case but for a free function:
+        // `f(1, a=2)` for `def f(a, b)`.
+        let src = "\
+def f(a: int, b: int) -> int:
+    return a + b
+
+let r: int = f(1, a=2)
+";
+        let d = check(src);
+        assert!(d.has_errors(), "double-bound positional must error");
+        let msg = format!("{}", d.errors()[0]);
+        assert!(
+            !msg.contains("missing required argument"),
+            "conflict must not be reported as missing-arg: {msg}"
+        );
+    }
+
+    #[test]
+    fn fn_too_many_positionals_falls_back_to_arg_count() {
+        // `def f(a, *, b)` with `f(1, 2)` — `b` is required but
+        // the *real* error is the second positional arg, not a
+        // missing `b`. PR-#90 codex review.
+        let src = "\
+def f(a: int, *, b: int) -> int:
+    return a + b
+
+let r: int = f(1, 2)
+";
+        let d = check(src);
+        assert!(d.has_errors(), "too-many-positionals must error");
+        let msg = format!("{}", d.errors()[0]);
+        assert!(
+            !msg.contains("missing required argument"),
+            "too-many-positionals must not fire missing_argument: {msg}"
+        );
     }
 
     // ── method-arity checks ─────────────────────────────────────────
@@ -7530,7 +7655,7 @@ let g: str = u.greet()
             "method call missing required arg must error"
         );
         let msg = format!("{}", d.errors()[0]);
-        // 0.2.2: named-missing wording.
+        // 0.2.3: named-missing wording.
         assert!(
             msg.contains("greet")
                 && msg.contains("missing required argument")

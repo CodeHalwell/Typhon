@@ -107,6 +107,19 @@ pub struct Backend {
     /// (or its text re-uploaded via `set_text`) before the cross-
     /// module shape map is assembled.
     project_files: Arc<Mutex<HashMap<std::path::PathBuf, HashMap<String, SourceFile>>>>,
+    /// Last document version we've already kicked off a venv-
+    /// introspection prewarm for, keyed by URI. Used to debounce
+    /// the per-keystroke prewarm: when the editor sends ten
+    /// `did_change` events in a row, only the first spawns the
+    /// background introspection task. Subsequent calls bail out as
+    /// soon as the version matches.
+    ///
+    /// Keyed by full URI string so two files in the same project
+    /// don't share state. `None` version is treated as "always run"
+    /// because `tower-lsp-server` reserves the unversioned shape
+    /// for the synthetic-open form (`source_file_for` injecting an
+    /// untracked file).
+    prewarmed_versions: Arc<Mutex<HashMap<String, i32>>>,
 }
 
 impl std::fmt::Debug for Backend {
@@ -288,22 +301,36 @@ impl Backend {
         // a populated entry and returns in microseconds instead of
         // shelling to Python.
         //
-        // Tolerance for races: did_change fires this on every
-        // keystroke. The `HashMap`-backed cache is idempotent — once
-        // an entry exists, repeat `members()` calls short-circuit.
-        // The worst case is many overlapping subprocess spawns for
-        // the *first* keystroke after opening, capped at one per
-        // unique module (subsequent overlapping spawns just race
-        // through the lookup and lose the insert race).
-        self.spawn_introspection_prewarm(uri_for_prewarm).await;
+        // Debounced per-URI by the document version: the LSP fires
+        // a `did_change` on every keystroke, but we only need to
+        // re-walk the imports once per *content* change, and even
+        // then the cache lookups are idempotent. Without this gate
+        // a fast typist would queue dozens of `spawn_blocking` tasks
+        // before the first one had a chance to populate the cache.
+        self.spawn_introspection_prewarm(uri_for_prewarm, version)
+            .await;
     }
 
     /// Spawn a detached task that introspects every third-party
     /// import in the document at `uri`, populating the cache so
-    /// later hover requests don't have to wait on a subprocess. Safe
-    /// to call repeatedly; each invocation is cheap once the cache
-    /// is warm.
-    async fn spawn_introspection_prewarm(&self, uri: Uri) {
+    /// later hover requests don't have to wait on a subprocess.
+    ///
+    /// Debounced via `prewarmed_versions`: when the editor sends
+    /// many `did_change` events in rapid succession, only the first
+    /// for each unique version spawns a new task. Subsequent calls
+    /// at the same version short-circuit at the version check.
+    async fn spawn_introspection_prewarm(&self, uri: Uri, version: Option<i32>) {
+        // Version-based debounce. `None` means an untracked open
+        // (rare; the synthetic-document path), in which case we run
+        // unconditionally — there's no version to dedupe against.
+        if let Some(v) = version {
+            let uri_str = uri.as_str().to_owned();
+            let mut versions = self.prewarmed_versions.lock().await;
+            if versions.get(&uri_str) == Some(&v) {
+                return;
+            }
+            versions.insert(uri_str, v);
+        }
         let Some(sf) = self.source_file_for(&uri).await else {
             return;
         };
@@ -340,8 +367,13 @@ impl Backend {
             let mut modules: Vec<String> = modules.into_iter().collect();
             modules.sort();
             for module in modules {
-                let Ok(mut guard) = cache.lock() else {
-                    return;
+                // Recover from a poisoned cache rather than aborting
+                // the rest of the warmup. A panic during a previous
+                // introspection shouldn't permanently disable
+                // hover-extras for every subsequent module.
+                let mut guard = match cache.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
                 };
                 // `members()` is idempotent — already-cached entries
                 // (success *or* failure) short-circuit; only the
@@ -412,6 +444,13 @@ impl LanguageServer for Backend {
         {
             let mut docs = self.documents.lock().await;
             docs.remove(&uri_str);
+        }
+        {
+            // Drop the per-document debounce entry so reopening the
+            // file re-runs the prewarm (the venv may have changed
+            // between open / close / reopen via `uv sync`).
+            let mut versions = self.prewarmed_versions.lock().await;
+            versions.remove(&uri_str);
         }
         self.evict_resolved_cache(&uri_str).await;
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
@@ -784,7 +823,15 @@ impl Backend {
             let module = import_info.module.clone();
             let root = root.clone();
             tokio::task::spawn_blocking(move || {
-                let mut guard = cache.lock().ok()?;
+                // Recover from a poisoned mutex rather than silently
+                // disabling hover extras for the rest of the session.
+                // A poisoned cache still has valid `MemberInfo`
+                // entries from any prior successful introspection;
+                // the completion path uses the same recovery shape.
+                let mut guard = match cache.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
                 guard.members(&root, &module)
             })
             .await
@@ -1807,6 +1854,7 @@ pub fn run_stdio(log_level: LogLevel) {
             introspection: Arc::new(Mutex::new(HashMap::new())),
             project_indexes: Arc::new(Mutex::new(HashMap::new())),
             project_files: Arc::new(Mutex::new(HashMap::new())),
+            prewarmed_versions: Arc::new(Mutex::new(HashMap::new())),
         });
         Server::new(stdin, stdout, socket).serve(service).await;
     });
