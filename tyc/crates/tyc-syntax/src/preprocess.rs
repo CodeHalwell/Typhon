@@ -3029,30 +3029,23 @@ fn rewrite_inline_question_ops_one_line(
 fn find_first_inline_propagation_q(s: &str) -> Option<usize> {
     let trimmed_end = s.trim_end().len();
     let bytes = s.as_bytes();
-    let mut in_str: Option<u8> = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if let Some(q) = in_str {
-            if b == b'\\' && i + 1 < bytes.len() {
-                i += 2;
-                continue;
-            }
-            if b == q {
-                in_str = None;
-            }
-            i += 1;
+    // Reuse the central in-string mask so triple-quoted strings (`"""…"""`,
+    // `'''…'''`) inside the line don't accidentally toggle the in-string
+    // state on each individual quote and unmask a `?` that lives inside
+    // the literal. Gemini review on PR #96.
+    let in_str_mask = compute_in_string_mask(s);
+    for i in 0..bytes.len() {
+        if in_str_mask[i] {
             continue;
         }
-        if b == b'"' || b == b'\'' {
-            in_str = Some(b);
-            i += 1;
-            continue;
-        }
-        if b == b'?' && i > 0 && bytes[i - 1] == b')' && i + 1 < trimmed_end {
+        if bytes[i] == b'?'
+            && i > 0
+            && bytes[i - 1] == b')'
+            && !in_str_mask[i - 1]
+            && i + 1 < trimmed_end
+        {
             return Some(i);
         }
-        i += 1;
     }
     None
 }
@@ -3149,11 +3142,16 @@ fn find_callable_start(s: &str, open_pos: usize) -> usize {
 fn compute_in_string_mask(s: &str) -> Vec<bool> {
     let bytes = s.as_bytes();
     let mut mask = vec![false; bytes.len()];
-    let mut in_str: Option<u8> = None;
+    // `None` outside any string; `Some((quote, triple))` inside one. A
+    // triple-quoted region (`"""` / `'''`) only ends on a matching
+    // triple; bare quotes inside it are ordinary content. Single-line
+    // strings continue to honour `\`-escapes; triple-quoted strings
+    // do too (Python allows `\` continuation inside them).
+    let mut in_str: Option<(u8, bool)> = None;
     let mut i = 0;
     while i < bytes.len() {
         let b = bytes[i];
-        if let Some(q) = in_str {
+        if let Some((q, triple)) = in_str {
             mask[i] = true;
             if b == b'\\' && i + 1 < bytes.len() {
                 mask[i + 1] = true;
@@ -3161,13 +3159,35 @@ fn compute_in_string_mask(s: &str) -> Vec<bool> {
                 continue;
             }
             if b == q {
-                in_str = None;
+                if triple {
+                    if i + 2 < bytes.len() && bytes[i + 1] == q && bytes[i + 2] == q {
+                        mask[i + 1] = true;
+                        mask[i + 2] = true;
+                        in_str = None;
+                        i += 3;
+                        continue;
+                    }
+                } else {
+                    in_str = None;
+                }
             }
             i += 1;
             continue;
         }
         if b == b'"' || b == b'\'' {
-            in_str = Some(b);
+            // Detect `"""` / `'''` triple openers and consume all three
+            // quotes at once so the in-string state for a triple region
+            // isn't toggled off by the second quote of the opener.
+            // Gemini review on PR #96.
+            if i + 2 < bytes.len() && bytes[i + 1] == b && bytes[i + 2] == b {
+                mask[i] = true;
+                mask[i + 1] = true;
+                mask[i + 2] = true;
+                in_str = Some((b, true));
+                i += 3;
+                continue;
+            }
+            in_str = Some((b, false));
             mask[i] = true;
         }
         i += 1;
@@ -5220,16 +5240,22 @@ fn apply_pipe_call(acc: &str, rhs: &str) -> Option<String> {
     let bytes = rhs.as_bytes();
     let mut paren_at: Option<usize> = None;
     if rhs.ends_with(')') {
-        // Walk back from the trailing `)` to find its match. Track
-        // string state forward (a forward scan tags every byte as
-        // in-string-or-not, then we can ignore tagged parens). For a
-        // small per-line scan the simpler depth-from-right walk is
-        // fine because strings inside the segment are well-formed
-        // (the scanner that produced `rhs` already validated this).
+        // Walk back from the trailing `)` to find its match. A forward
+        // scan tags every byte as in-string-or-not; the reverse walk
+        // then ignores parens that landed inside a string literal.
+        // Without this mask, an RHS like `f(")")` would corrupt the
+        // depth counter on the embedded `)` and either pick the wrong
+        // matching `(` or fail to find one — leaving `|>` in the
+        // emitted source for the downstream parser to choke on.
+        // Codex / Copilot review on PR #96.
+        let in_str_mask = compute_in_string_mask(rhs);
         let mut depth: i32 = 0;
         let mut k = bytes.len();
         while k > 0 {
             k -= 1;
+            if in_str_mask[k] {
+                continue;
+            }
             match bytes[k] {
                 b')' => depth += 1,
                 b'(' => {
@@ -6129,6 +6155,21 @@ mod tests {
     }
 
     #[test]
+    fn inline_question_op_ignores_triple_quoted_string_contents() {
+        // PR #96 review: a `)?` inside a triple-quoted string on a
+        // single line must not trigger expansion either. The
+        // string-state tracker previously only handled single-char
+        // quotes and would toggle off the in-string state on the
+        // second `"` of `"""`, leaving the `?` exposed.
+        let src = "    log(\"\"\"missing f()?\"\"\")\n";
+        let out = expand_inline_question_ops(src);
+        assert_eq!(
+            out, src,
+            "triple-quoted string content must not be expanded"
+        );
+    }
+
+    #[test]
     fn inline_then_outer_question_op_compose() {
         // Pipeline-shaped: `let x = Ok(f()?)?` — the inner `?` is
         // lifted by the inline pass, the outer `?` is then a normal
@@ -6535,6 +6576,26 @@ mod tests {
         let src = "y = 5 |> (lambda x, k: x * k)(2)\n";
         let out = expand_pipes(src);
         assert_eq!(out, "y = (lambda x, k: x * k)(5, 2)\n");
+    }
+
+    #[test]
+    fn pipe_rhs_with_paren_inside_string_arg() {
+        // PR #96 review: the reverse paren-walk in `apply_pipe_call`
+        // must skip parens that live inside a string literal. Without
+        // a string-aware mask, the `)` inside `f(")")` corrupts the
+        // depth counter and the rewriter either picks the wrong `(`
+        // or fails entirely, leaving `|>` in the source.
+        let src = "y = 5 |> f(\")\")\n";
+        let out = expand_pipes(src);
+        assert_eq!(out, "y = f(5, \")\")\n");
+    }
+
+    #[test]
+    fn pipe_rhs_with_open_paren_inside_string_arg() {
+        // Mirror of the above for `(` inside a string literal.
+        let src = "y = 5 |> f(\"(\")\n";
+        let out = expand_pipes(src);
+        assert_eq!(out, "y = f(5, \"(\")\n");
     }
 
     #[test]

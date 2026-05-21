@@ -49,13 +49,18 @@ pub struct Emitter {
     /// so the emitted module parses on 3.10 / 3.11 (FINDINGS #47).
     /// `0` means "unset" and disables lowering.
     target_minor: u8,
-    /// Optional reference to the original (pre-parse) source. When
-    /// present, the printer can peek at a node's source range to
-    /// recover purely-syntactic choices that the AST collapses —
-    /// notably the bracket style on `MatchSequence` patterns where
-    /// `[a, b]` and `(a, b)` are semantically identical but users
-    /// have a stylistic preference (O27 / FINDINGS #111).
-    source: Option<String>,
+    /// Optional reference-counted handle to the original (pre-parse)
+    /// source. When present, the printer can peek at a node's source
+    /// range to recover purely-syntactic choices that the AST
+    /// collapses — notably the bracket style on `MatchSequence`
+    /// patterns where `[a, b]` and `(a, b)` are semantically identical
+    /// but users have a stylistic preference (O27 / FINDINGS #111).
+    ///
+    /// `Arc<str>` rather than `String` so the build pipeline (which
+    /// already holds the preprocessed source via `prep.python_source`)
+    /// can share a single allocation across the type-checker, the
+    /// printer, and the source-map builder. Copilot review on PR #96.
+    source: Option<std::sync::Arc<str>>,
 }
 
 const INDENT_WIDTH: usize = 4;
@@ -77,10 +82,13 @@ impl Emitter {
 
     /// Attach the original source text so the printer can recover
     /// stylistic choices from node `TextRange`s. Currently used by
-    /// `tyc fmt` to round-trip `[a, b]` vs `(a, b)` sequence patterns
+    /// `tyc build` to round-trip `[a, b]` vs `(a, b)` sequence patterns
     /// (O27 / FINDINGS #111) — when the source is absent the printer
-    /// falls back to the default bracket choice.
-    pub fn set_source(&mut self, source: String) {
+    /// falls back to the default bracket choice. The source is held
+    /// behind an `Arc<str>` so callers that already have a shared
+    /// handle (e.g. the build pipeline keeping the preprocessed text
+    /// around) don't pay a full copy.
+    pub fn set_source(&mut self, source: std::sync::Arc<str>) {
         self.source = Some(source);
     }
 
@@ -2245,7 +2253,7 @@ mod tests {
         let src = "match xs:\n    case [a, b]:\n        pass\n";
         let parsed = parse_module(src).expect("parse failed");
         let mut emitter = crate::Emitter::new();
-        emitter.set_source(src.to_owned());
+        emitter.set_source(std::sync::Arc::from(src));
         emitter.emit_mod(parsed.syntax());
         let out = emitter.finish();
         assert!(
@@ -2261,7 +2269,7 @@ mod tests {
         let src = "match xs:\n    case (a, b):\n        pass\n";
         let parsed = parse_module(src).expect("parse failed");
         let mut emitter = crate::Emitter::new();
-        emitter.set_source(src.to_owned());
+        emitter.set_source(std::sync::Arc::from(src));
         emitter.emit_mod(parsed.syntax());
         let out = emitter.finish();
         assert!(

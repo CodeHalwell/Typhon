@@ -150,6 +150,13 @@ fn normalise_whitespace(source: &str) -> String {
     // has been emitted yet so the "two blank lines before top-level
     // def/class" rule doesn't fire at the file head. PEP 8.
     let mut emitted_any_code = false;
+    // Track whether the previous emitted code line was a top-level
+    // decorator (`@something`). A decorator stack glues to its target
+    // `def`/`class`, so we MUST NOT insert two blank lines between
+    // `@a` and the next `@b` / `def f` in the stack — that would
+    // split the stack into separate orphaned statements and break
+    // `tyc fmt` output for any decorated definition. PR #96 P1.
+    let mut prev_top_level_was_decorator = false;
     for raw_line in source.lines() {
         // Triple-quoted block: keep raw, but still strip trailing spaces and
         // expand the leading tabs so indentation matches the file style.
@@ -192,14 +199,26 @@ fn normalise_whitespace(source: &str) -> String {
         //     class or function body, and
         //   - the prior line was code (consecutive_blank < 2). When the
         //     user already provided ≥2 blanks the existing branch above
-        //     handles it; we only INSERT blanks here when too few exist.
-        let is_top_level_block = leading.is_empty()
+        //     handles it; we only INSERT blanks here when too few exist,
+        //     AND
+        //   - the prior line was NOT itself a top-level decorator: a
+        //     decorator stack belongs to the next `def`/`class`, so
+        //     `@cached_property\ndef f(...)` and `@a\n@b\ndef f(...)`
+        //     must stay glued (otherwise the formatter splits the
+        //     decorator from its target). PR #96 P1.
+        let is_top_level_decorator =
+            leading.is_empty() && in_triple.is_none() && rest.starts_with('@');
+        let is_top_level_def_or_class = leading.is_empty()
             && in_triple.is_none()
             && (rest.starts_with("def ")
                 || rest.starts_with("class ")
-                || rest.starts_with("async def ")
-                || rest.starts_with("@"));
-        if is_top_level_block && emitted_any_code && consecutive_blank < 2 {
+                || rest.starts_with("async def "));
+        let is_top_level_block = is_top_level_decorator || is_top_level_def_or_class;
+        if is_top_level_block
+            && emitted_any_code
+            && consecutive_blank < 2
+            && !prev_top_level_was_decorator
+        {
             for _ in consecutive_blank..2 {
                 result.push('\n');
             }
@@ -216,6 +235,7 @@ fn normalise_whitespace(source: &str) -> String {
         result.push_str(rest);
         result.push('\n');
         emitted_any_code = true;
+        prev_top_level_was_decorator = is_top_level_decorator;
     }
     result
 }
@@ -1175,6 +1195,46 @@ def run() -> Result[int, str]:
         assert!(
             !result.output.contains("\n\n\n    def b"),
             "nested methods must not get two blank lines, got: {:?}",
+            result.output
+        );
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TYC_FMT_DISABLE_RUFF", v),
+                None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
+            }
+        }
+    }
+
+    #[test]
+    fn format_glues_decorator_stack_to_target() {
+        // PR #96 P1: the two-blank-lines rule must NOT split a decorator
+        // stack from its target `def`/`class`. `@a\n@b\ndef f(...)` and
+        // `@cached_property\ndef f(...)` must stay glued in the
+        // emitted Python; otherwise the formatter rewrites valid code
+        // into orphaned decorators that no longer apply.
+        let _guard = lock_env();
+        let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
+        unsafe {
+            std::env::set_var("TYC_FMT_DISABLE_RUFF", "1");
+        }
+        let src = "x = 1\n@a\n@b\ndef f() -> int:\n    return 1\n";
+        let result = format_source(src, "<test>").unwrap();
+        // Two blank lines before the first `@a` (top-level boundary).
+        assert!(
+            result.output.contains("\n\n\n@a\n"),
+            "top-level decorator stack should start after two blanks; got: {:?}",
+            result.output
+        );
+        // No blanks between `@a` and `@b`.
+        assert!(
+            result.output.contains("@a\n@b\n"),
+            "stacked decorators must stay glued; got: {:?}",
+            result.output
+        );
+        // No blanks between the last decorator and the `def`.
+        assert!(
+            result.output.contains("@b\ndef f"),
+            "decorator must stay glued to its target def; got: {:?}",
             result.output
         );
         unsafe {

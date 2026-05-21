@@ -527,43 +527,84 @@ fn is_iterator_return_type(returns: &Expr, is_async: bool) -> bool {
 /// conservative: `list.__add__` returns `list[T]` and requires a
 /// matching RHS type, so it is omitted here — the call-site arity
 /// check handles that path. O16 / FINDINGS #112.
+///
+/// Hashability follows CPython: `list`, `dict`, `set`, `bytearray`
+/// are unhashable at runtime (`hash([])` raises `TypeError`), so
+/// `__hash__` is intentionally absent from their tables. Otherwise
+/// a `Hashable`-like Protocol would unsoundly accept those types.
+/// Codex / Gemini / Copilot review on PR #96.
 fn builtin_dunder_methods(head: &str) -> &'static [&'static str] {
+    // Hashable, ordered, indexable: `tuple`, `str`, `bytes`, `range`,
+    // and the homogeneous `tuple_variadic` view.
+    const HASHABLE_INDEXABLE: &[&str] = &[
+        "__len__",
+        "__iter__",
+        "__getitem__",
+        "__contains__",
+        "__bool__",
+        "__eq__",
+        "__ne__",
+        "__hash__",
+        "__repr__",
+        "__str__",
+    ];
+    // Unhashable mutable sequence: `list`, `bytearray`.
+    const UNHASHABLE_INDEXABLE: &[&str] = &[
+        "__len__",
+        "__iter__",
+        "__getitem__",
+        "__contains__",
+        "__bool__",
+        "__eq__",
+        "__ne__",
+        "__repr__",
+        "__str__",
+    ];
+    // Unhashable mapping: `dict`. Carries setitem/delitem on top of
+    // the read-side dunders because users reach for `d[k] = v` /
+    // `del d[k]` against Protocols that declare those.
+    const UNHASHABLE_MAPPING: &[&str] = &[
+        "__len__",
+        "__iter__",
+        "__getitem__",
+        "__contains__",
+        "__setitem__",
+        "__delitem__",
+        "__bool__",
+        "__eq__",
+        "__ne__",
+        "__repr__",
+        "__str__",
+    ];
+    // Hashable set: `frozenset`.
+    const HASHABLE_SET: &[&str] = &[
+        "__len__",
+        "__iter__",
+        "__contains__",
+        "__bool__",
+        "__eq__",
+        "__ne__",
+        "__hash__",
+        "__repr__",
+        "__str__",
+    ];
+    // Unhashable set: `set`.
+    const UNHASHABLE_SET: &[&str] = &[
+        "__len__",
+        "__iter__",
+        "__contains__",
+        "__bool__",
+        "__eq__",
+        "__ne__",
+        "__repr__",
+        "__str__",
+    ];
     match head {
-        "list" | "tuple" | "tuple_variadic" | "str" | "bytes" | "bytearray" | "range" => &[
-            "__len__",
-            "__iter__",
-            "__getitem__",
-            "__contains__",
-            "__bool__",
-            "__eq__",
-            "__ne__",
-            "__hash__",
-            "__repr__",
-            "__str__",
-        ],
-        "dict" => &[
-            "__len__",
-            "__iter__",
-            "__getitem__",
-            "__contains__",
-            "__setitem__",
-            "__delitem__",
-            "__bool__",
-            "__eq__",
-            "__ne__",
-            "__repr__",
-            "__str__",
-        ],
-        "set" | "frozenset" => &[
-            "__len__",
-            "__iter__",
-            "__contains__",
-            "__bool__",
-            "__eq__",
-            "__ne__",
-            "__repr__",
-            "__str__",
-        ],
+        "tuple" | "tuple_variadic" | "str" | "bytes" | "range" => HASHABLE_INDEXABLE,
+        "list" | "bytearray" => UNHASHABLE_INDEXABLE,
+        "dict" => UNHASHABLE_MAPPING,
+        "frozenset" => HASHABLE_SET,
+        "set" => UNHASHABLE_SET,
         _ => &[],
     }
 }
@@ -2985,13 +3026,21 @@ fn check_unsafe_return_leak(c: &mut Checker, expr: &Expr) {
     }) else {
         return;
     };
+    // Check the current environment first: if a safe-scope rebind
+    // outside the `unsafe:` block has re-introduced the name with
+    // its own concrete type (`let value: int = value` after the
+    // unsafe body, or `let value = some_int()` at the same indent),
+    // the cross is sound — every safe-scope rule already ran on
+    // that binding. Gemini / Copilot review on PR #96.
+    if let Some(b) = c.env.lookup(name) {
+        if !b.from_unsafe {
+            return;
+        }
+    }
     // The checker treats `if True:` (the unsafe lowering) as a scope
-    // and prunes inner bindings on exit, so the env lookup is empty
-    // here. Consult the long-lived `unsafe_origin_bindings` map for
-    // the declared type. We deliberately use the surviving map even
-    // when the env still carries the name (e.g. a top-level
-    // `unsafe:` whose body didn't go through `if`-scope restore) so
-    // the diagnostic shape is uniform.
+    // and prunes inner bindings on exit, so the env lookup may be
+    // empty here even when the name was declared inside `unsafe:`.
+    // Fall back to the long-lived `unsafe_origin_bindings` map.
     let declared = match c.unsafe_origin_bindings.get(name).cloned() {
         Some(t) => t,
         None => return,
@@ -4623,6 +4672,14 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 if from_unsafe {
                     c.unsafe_origin_bindings
                         .insert(n.id.as_str().to_owned(), ann_type.clone());
+                } else {
+                    // A safe-scope re-bind defeats any prior unsafe
+                    // origin: the new binding carries its own
+                    // declared type and goes through the normal
+                    // assignability check, so the cross-into-return
+                    // audit should not fire any more. Gemini /
+                    // Copilot review on PR #96.
+                    c.unsafe_origin_bindings.remove(n.id.as_str());
                 }
                 c.env.declare(TypeBinding {
                     name: n.id.as_str().to_owned(),
@@ -4681,6 +4738,11 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         if from_unsafe {
                             c.unsafe_origin_bindings
                                 .insert(n.id.as_str().to_owned(), value_type.clone());
+                        } else {
+                            // Safe-scope re-bind defeats any prior
+                            // unsafe origin — see the parallel
+                            // annotated case above.
+                            c.unsafe_origin_bindings.remove(n.id.as_str());
                         }
                         c.env.declare(TypeBinding {
                             name: n.id.as_str().to_owned(),
@@ -5236,6 +5298,13 @@ fn check_function(
     }
 
     let saved_return = c.current_return.replace(ret_type.clone());
+    // `unsafe_origin_bindings` survives the env-scope restore that
+    // follows the `if True:` body, but it must NOT survive a function
+    // boundary — otherwise an unsafe leak diagnosed in one function
+    // would re-fire against a same-named binding in a sibling
+    // function that never touched `unsafe:`. Save + clear on entry,
+    // restore on exit. Gemini / Copilot review on PR #96.
+    let saved_unsafe_origins = std::mem::take(&mut c.unsafe_origin_bindings);
     // Track sync-vs-async for the body's call-site check
     // (`tyc::missing_await` — FINDINGS #49). Only sync function bodies
     // trip the diagnostic; async bodies use `await` naturally and
@@ -5368,6 +5437,7 @@ fn check_function(
 
     c.env.leave();
     c.current_return = saved_return;
+    c.unsafe_origin_bindings = saved_unsafe_origins;
     c.active_typevar_bounds = saved_bounds;
     c.in_sync_function = saved_in_sync;
     c.in_async_function = saved_in_async;
@@ -11765,6 +11835,155 @@ def numbers() -> Iterable[int]:
             !d.has_errors(),
             "yield-bodied -> Iterable[int] should type-check; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    // ── O14 (unsafe value leak) — scope robustness (PR #96 review) ────────
+
+    #[test]
+    fn unsafe_leak_fires_on_baseline_repro() {
+        // The motivating O14 case: a binding declared inside `unsafe:`
+        // returns into a concrete `-> int` without re-assertion.
+        let src = "\
+def f() -> int:
+    unsafe:
+        let x = \"hello\"
+    return x
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UnsafeValueLeak { .. })),
+            "expected UnsafeValueLeak, got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn unsafe_leak_silenced_by_safe_rebind() {
+        // PR #96 review (Gemini, Copilot): a safe-scope rebind of the
+        // same name with a compatible declared type must defeat the
+        // leak audit. The user explicitly re-asserts the type at the
+        // boundary; the diagnostic must not fire.
+        let src = "\
+def f() -> int:
+    unsafe:
+        let value = \"hello\"
+    let checked: int = 42
+    return checked
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UnsafeValueLeak { .. })),
+            "safe-scope rebind must defeat the leak audit; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn unsafe_leak_does_not_cross_function_boundary() {
+        // PR #96 review (Gemini): an unsafe binding in function `f`
+        // must NOT trigger a leak diagnostic in function `g` that
+        // happens to use the same variable name. `unsafe_origin_bindings`
+        // is now scope-saved at function entry and restored on exit.
+        let src = "\
+def f() -> int:
+    unsafe:
+        let x = \"hello\"
+    return 0
+
+def g(x: int) -> int:
+    return x
+";
+        let d = check(src);
+        // The leak should fire in `f` only — there's a `return 0`
+        // there, not `return x`, so even `f` is clean. The key
+        // assertion is that `g`'s `return x` doesn't fire a leak.
+        let leak_in_g = d.errors().iter().any(|e| match e {
+            TycError::UnsafeValueLeak { .. } => format!("{e}").contains("`x`"),
+            _ => false,
+        });
+        // `g` has no unsafe context whatsoever — the audit must stay silent.
+        assert!(
+            !leak_in_g,
+            "unsafe origin bindings must not bleed across function boundaries; got {:?}",
+            d.errors()
+        );
+    }
+
+    // ── O16 (Protocol vs built-ins) — hashability soundness (PR #96 review)
+
+    #[test]
+    fn list_does_not_satisfy_hashable_protocol() {
+        // PR #96 review (Codex, Copilot, Gemini): `list` is unhashable
+        // at runtime (`hash([])` raises `TypeError`). The Protocol
+        // structural-conformance check must NOT accept `list[T]` for
+        // a `Hashable`-like Protocol that requires `__hash__`.
+        let src = "\
+from typing import Protocol
+
+class Hashable(Protocol):
+    def __hash__(self) -> int: ...
+
+def take(h: Hashable) -> int:
+    return 0
+
+let _: int = take([1, 2, 3])
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "list must not satisfy a Hashable Protocol; got no errors"
+        );
+    }
+
+    #[test]
+    fn frozenset_does_satisfy_hashable_protocol() {
+        // Counterpart: `frozenset` is hashable and must still satisfy
+        // a `Hashable`-like Protocol.
+        let src = "\
+from typing import Protocol
+
+class Hashable(Protocol):
+    def __hash__(self) -> int: ...
+
+def take(h: Hashable) -> int:
+    return 0
+
+let _: int = take(frozenset([1, 2, 3]))
+";
+        let d = check(src);
+        assert!(
+            !d.errors().iter().any(|e| matches!(
+                e,
+                TycError::TypeMismatch { .. } | TycError::InterfaceNotConforming { .. }
+            )),
+            "frozenset must satisfy Hashable; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn unsafe_leak_silenced_by_inner_annotation() {
+        // Workaround form A: annotating the unsafe binding with the
+        // concrete return type defeats the leak audit because the
+        // declared type is already assignable to the return type.
+        let src = "\
+def f() -> int:
+    unsafe:
+        let x: int = 42
+    return x
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UnsafeValueLeak { .. })),
+            "inner-annotated unsafe binding must not trigger the leak; got {:?}",
+            d.errors()
         );
     }
 }
