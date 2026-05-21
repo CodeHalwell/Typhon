@@ -79,6 +79,15 @@ pub enum TyphonKeyword {
     /// `UserId(x)`, which type-checks the argument against `int` and
     /// yields a `UserId`-typed value.
     Newtype,
+    /// `pub` — marks a module-level declaration as part of the public
+    /// API surface. The preprocessor strips the prefix and records the
+    /// line so the desugar pass can synthesise `__all__ = [...]` from
+    /// every `pub`-marked name. Modules with at least one `pub` symbol
+    /// get an `__all__` list emitted at the top; modules with none get
+    /// no `__all__` (preserves current `from foo import *` behaviour).
+    /// May appear before `def`, `class`, `let`, `mut`, `model`,
+    /// `interface`, `class!`, `plain class`, `newtype`, and `type`.
+    Pub,
 }
 
 impl TyphonKeyword {
@@ -99,6 +108,7 @@ impl TyphonKeyword {
             Self::RawClass => "class!",
             Self::PlainClass => "plain class",
             Self::Newtype => "newtype",
+            Self::Pub => "pub",
         }
     }
 
@@ -118,6 +128,7 @@ impl TyphonKeyword {
             "lazy" => Some(Self::Lazy),
             "class!" => Some(Self::RawClass),
             "newtype" => Some(Self::Newtype),
+            "pub" => Some(Self::Pub),
             _ => None,
         }
     }

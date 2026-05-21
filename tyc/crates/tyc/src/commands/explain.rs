@@ -114,6 +114,7 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         }
         "orphan_py_import" => include_str!("../../../../../docs/diagnostics/orphan_py_import.md"),
         "parse" => include_str!("../../../../../docs/diagnostics/parse.md"),
+        "pub" => include_str!("../../../../../docs/diagnostics/pub.md"),
         "python_semantic_drift" => {
             include_str!("../../../../../docs/diagnostics/python_semantic_drift.md")
         }

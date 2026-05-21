@@ -75,6 +75,15 @@ pub struct DesugarOptions {
     /// `class T(textual.App):`.  Plumbed in from `typhon.toml`
     /// (`[emit] skip-decoration-bases`).
     pub skip_decoration_bases: Vec<String>,
+    /// Names declared with the `pub` modifier in this module, in source
+    /// order. When non-empty, the desugar pass injects an
+    /// `__all__ = [...]` list at the top of the emitted module so
+    /// `from foo import *` brings in exactly the marked surface and
+    /// downstream tooling (Sphinx autoapi, pyright re-export tracking,
+    /// IDE auto-import filters) sees the public API. An empty
+    /// `pub_names` is intentionally a no-op so legacy `.ty` files
+    /// that pre-date the `pub` keyword keep their current behaviour.
+    pub pub_names: Vec<String>,
 }
 
 /// Desugar a Typhon module AST into a plain Python AST.
@@ -173,6 +182,14 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
     }
     if inject_newtype {
         body.insert(insert_at, make_newtype_import());
+    }
+    // `pub` synthesis: when the source declared at least one `pub`
+    // name, emit `__all__ = ["a", "b", …]` right after the import
+    // block so re-exporters and `import *` consumers see the public
+    // surface. Skipped if the module already provides its own
+    // `__all__` so handwritten lists win.
+    if !options.pub_names.is_empty() && !body.iter().any(is_dunder_all_assignment) {
+        body.insert(insert_at, make_dunder_all(&options.pub_names));
     }
     if inject_result_import {
         body.insert(insert_at, make_typhon_runtime_import());
@@ -508,6 +525,46 @@ fn make_newtype_import() -> Stmt {
         level: 0,
         is_lazy: false,
     })
+}
+
+/// Synthesise `__all__ = ["a", "b", ...]` from the list of `pub`
+/// names. Emitted as a regular module-level assignment so downstream
+/// tooling sees a plain Python `__all__` declaration.
+fn make_dunder_all(names: &[String]) -> Stmt {
+    let elts: Vec<Expr> = names.iter().map(|n| make_string_literal_expr(n)).collect();
+    let list_expr = Expr::List(ruff_python_ast::ExprList {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        elts,
+        ctx: ExprContext::Load,
+    });
+    Stmt::Assign(StmtAssign {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        targets: vec![Expr::Name(ExprName {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            id: ruff_python_ast::name::Name::new_static("__all__"),
+            ctx: ExprContext::Store,
+        })],
+        value: Box::new(list_expr),
+        mutability: None,
+    })
+}
+
+/// `true` when `stmt` is a hand-written `__all__ = ...` assignment.
+/// Used by the desugar pass to keep author-supplied lists untouched
+/// even when `pub` declarations are present.
+fn is_dunder_all_assignment(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Assign(a) => a.targets.iter().any(|t| {
+            matches!(t, Expr::Name(n) if n.id.as_str() == "__all__")
+        }),
+        Stmt::AnnAssign(a) => {
+            matches!(a.target.as_ref(), Expr::Name(n) if n.id.as_str() == "__all__")
+        }
+        _ => false,
+    }
 }
 
 /// `true` when `body` already binds the bare name `NewType` from `typing`.

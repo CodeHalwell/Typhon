@@ -496,6 +496,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 frozen_class_line_starts,
                 plain_class_line_starts,
                 skip_decoration_bases: config.emit.skip_decoration_bases.clone(),
+                pub_names: prep.pub_names.clone(),
             },
         );
         if desugar_output.needs_typhon_runtime {
@@ -689,6 +690,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 frozen_class_line_starts,
                 plain_class_line_starts,
                 skip_decoration_bases: config.emit.skip_decoration_bases.clone(),
+                pub_names: prep.pub_names.clone(),
             },
         );
         let stub_text = emit_stub(&desugar.module);

@@ -54,6 +54,16 @@ Every parameter and every return type carries an annotation:
 
 Methods inside the `class` body trigger `tyc::method_in_class_body`.
 
+## Public API (`pub`)
+
+    pub def greet(name: str) -> str: ...
+    pub class User: ...
+    pub let API_VERSION: str = "v1"
+
+Modules with at least one `pub` declaration emit a synthesised
+`__all__ = [...]` listing every `pub` name in source order. Use to
+distinguish public surface from internal helpers.
+
 ## Newtype (nominal alias)
 
     newtype UserId = int

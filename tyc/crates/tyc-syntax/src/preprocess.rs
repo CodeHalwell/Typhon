@@ -128,6 +128,12 @@ pub struct PreprocessResult {
     /// the class should NOT receive a `@dataclass` decorator and that no
     /// `__init__` should be synthesised — the body is emitted verbatim.
     pub plain_class_lines: Vec<usize>,
+    /// Names of module-level declarations annotated with `pub`.  Drives
+    /// `__all__` synthesis in the desugar pass: modules with at least
+    /// one `pub` symbol get an `__all__ = [...]` list emitted at the
+    /// top; modules with none are left alone, preserving the current
+    /// `from foo import *` semantics for legacy `.ty` files.
+    pub pub_names: Vec<String>,
 }
 
 /// Convert a list of 0-based line indices into byte offsets pointing at
@@ -164,6 +170,17 @@ pub fn line_byte_starts(source: &str, lines: &[usize]) -> Vec<u32> {
 /// Strip Typhon-specific syntax from `source` and return the Python-
 /// compatible string together with restoration metadata.
 pub fn preprocess(source: &str) -> PreprocessResult {
+    // Pre-pass: walk every line, strip a leading `pub ` modifier (at
+    // module level — i.e. zero indentation), record the declared name,
+    // and feed the rest of the pipeline a source string with `pub ` no
+    // longer present. The line indices stay aligned because we only
+    // mutate the leading prefix. A StrippedKeyword::Pub entry is
+    // emitted so `postprocess` restores `pub ` for `tyc fmt`.
+    let mut pub_names: Vec<String> = Vec::new();
+    let mut pub_lines: Vec<usize> = Vec::new();
+    let source_owned = strip_pub_prefixes(source, &mut pub_names, &mut pub_lines);
+    let source = source_owned.as_str();
+
     let mut python_source = String::with_capacity(source.len());
     let mut stripped = Vec::new();
     let mut optionals = Vec::new();
@@ -612,6 +629,18 @@ pub fn preprocess(source: &str) -> PreprocessResult {
         python_source.push_str(&rewritten);
     }
 
+    // Pub entries are appended LAST so postprocess restores them on top
+    // of any other prefix that lives on the same line (e.g. `pub let X`
+    // first becomes `let X`, then `pub let X`). The postprocess loop
+    // sorts insertions descending by line_index with a stable sort, so
+    // same-line entries execute in insertion order — last pushed runs
+    // last → prefix appears at the front of the final restored line.
+    for &line_idx in &pub_lines {
+        stripped.push(StrippedKeyword {
+            line_index: line_idx,
+            keyword: TyphonKeyword::Pub,
+        });
+    }
     PreprocessResult {
         python_source,
         stripped,
@@ -623,6 +652,107 @@ pub fn preprocess(source: &str) -> PreprocessResult {
         raw_class_lines,
         frozen_class_lines,
         plain_class_lines,
+        pub_names,
+    }
+}
+
+/// Pre-pass that walks every line of `source`, strips a leading
+/// `pub ` modifier on module-level declarations, and records the
+/// declared name. Returns the rewritten source with `pub ` removed
+/// from each affected line; `pub_names` is appended with the names in
+/// source order, and `pub_lines` gets the 0-based line index for each.
+///
+/// Recognised forms (zero indent only):
+///   pub def NAME(...)            pub class NAME...            pub class! NAME...
+///   pub plain class NAME...      pub model NAME:              pub interface NAME:
+///   pub let NAME[: T] = EXPR     pub mut NAME[: T] = EXPR
+///   pub newtype NAME = BASE      pub type NAME = ...
+///   pub async def NAME(...)      pub @decorator-line (the next decl carries pub forward)
+///
+/// `pub` inside a function body (`indent_len > 0`), inside a string,
+/// or on an unrecognised form is left untouched so the Python parser
+/// surfaces the syntax error the user wrote.
+fn strip_pub_prefixes(
+    source: &str,
+    pub_names: &mut Vec<String>,
+    pub_lines: &mut Vec<usize>,
+) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut in_string: Option<StringMode> = None;
+    for (line_index, line) in source.split_inclusive('\n').enumerate() {
+        if in_string.is_some() {
+            // Track string state without touching content.
+            let _ = rewrite_optionals(line, &mut in_string);
+            out.push_str(line);
+            continue;
+        }
+        let indent_len = line
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(line.len());
+        if indent_len != 0 {
+            let _ = rewrite_optionals(line, &mut in_string);
+            out.push_str(line);
+            continue;
+        }
+        let rest = &line[indent_len..];
+        if let Some(after_pub) = rest.strip_prefix("pub ") {
+            if let Some(name) = pub_decl_name(after_pub) {
+                pub_names.push(name);
+                pub_lines.push(line_index);
+                out.push_str(after_pub);
+                // Track string state for the rewritten line.
+                let _ = rewrite_optionals(after_pub, &mut in_string);
+                continue;
+            }
+        }
+        let _ = rewrite_optionals(line, &mut in_string);
+        out.push_str(line);
+    }
+    out
+}
+
+/// Given a line that originally followed `pub ` (so `def foo(...)`,
+/// `class Foo:`, `let X = ...`, etc.), return the declared name. Used
+/// by [`strip_pub_prefixes`] to populate the `pub_names` registry.
+fn pub_decl_name(body: &str) -> Option<String> {
+    let body = body.trim_end_matches(['\n', '\r']);
+    // Skip a leading `async ` for `pub async def f(...)`.
+    let body = body.strip_prefix("async ").unwrap_or(body);
+    let body = body.trim_start();
+    // Multi-word keywords first.
+    if let Some(rest) = body.strip_prefix("plain class ") {
+        return ident_prefix(rest);
+    }
+    if let Some(rest) = body.strip_prefix("class! ") {
+        return ident_prefix(rest);
+    }
+    // Single-word keywords.
+    let single_keyword_forms = [
+        "def ", "class ", "model ", "interface ", "newtype ", "type ", "let ", "mut ",
+    ];
+    for kw in &single_keyword_forms {
+        if let Some(rest) = body.strip_prefix(kw) {
+            return ident_prefix(rest);
+        }
+    }
+    None
+}
+
+/// Extract the leading Python identifier from `s`, ignoring whatever
+/// follows (parameter list, base classes, type annotation, `=` RHS).
+fn ident_prefix(s: &str) -> Option<String> {
+    let s = s.trim_start();
+    let end = s
+        .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .unwrap_or(s.len());
+    if end == 0 {
+        return None;
+    }
+    let name = &s[..end];
+    if is_python_ident(name) {
+        Some(name.to_owned())
+    } else {
+        None
     }
 }
 
@@ -1476,6 +1606,16 @@ pub fn postprocess_full(
                 let content = &line[indent_len..];
                 let restored = restore_newtype_decl(content).unwrap_or_else(|| content.to_owned());
                 lines[line_idx] = format!("{}{}", &line[..indent_len], restored);
+            }
+            TyphonKeyword::Pub => {
+                // Prepend `pub ` to whatever the line currently starts
+                // with. `pub` lives at module level (zero-indent) by
+                // construction, so the prefix slot is empty.
+                let line = &lines[line_idx];
+                let indent_len = line
+                    .find(|c: char| !c.is_whitespace())
+                    .unwrap_or(line.len());
+                lines[line_idx] = format!("{}pub {}", &line[..indent_len], &line[indent_len..]);
             }
         }
     }
@@ -4908,6 +5048,66 @@ mod tests {
         let prep = preprocess(src);
         let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
         assert_eq!(out, src);
+    }
+
+    // ── pub keyword (Phase D) ───────────────────────────────────────────
+
+    #[test]
+    fn pub_def_records_name_and_strips_keyword() {
+        let result = preprocess("pub def greet(name: str) -> str:\n    return name\n");
+        assert_eq!(result.pub_names, vec!["greet".to_owned()]);
+        assert!(!result.python_source.contains("pub def"));
+        assert!(result.python_source.contains("def greet"));
+    }
+
+    #[test]
+    fn pub_class_records_name() {
+        let result = preprocess("pub class User:\n    name: str\n");
+        assert_eq!(result.pub_names, vec!["User".to_owned()]);
+    }
+
+    #[test]
+    fn pub_let_records_name() {
+        let result = preprocess("pub let API: str = \"v1\"\n");
+        assert_eq!(result.pub_names, vec!["API".to_owned()]);
+    }
+
+    #[test]
+    fn pub_newtype_records_name() {
+        let result = preprocess("pub newtype UserId = int\n");
+        assert_eq!(result.pub_names, vec!["UserId".to_owned()]);
+    }
+
+    #[test]
+    fn pub_round_trips_via_postprocess() {
+        let src = "pub def greet(name: str) -> str:\n    return name\n";
+        let prep = preprocess(src);
+        let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn pub_let_round_trips_via_postprocess() {
+        let src = "pub let API: str = \"v1\"\n";
+        let prep = preprocess(src);
+        let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn indented_pub_is_left_alone() {
+        // `pub` only applies at module scope. An indented occurrence
+        // is treated as a regular identifier (which the type checker
+        // will then reject), not as a visibility modifier.
+        let result = preprocess("    pub = 1\n");
+        assert!(result.pub_names.is_empty());
+        assert!(result.python_source.contains("pub = 1"));
+    }
+
+    #[test]
+    fn pub_with_async_def_records_name() {
+        let result = preprocess("pub async def fetch() -> int:\n    return 0\n");
+        assert_eq!(result.pub_names, vec!["fetch".to_owned()]);
     }
 
     #[test]
