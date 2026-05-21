@@ -508,9 +508,7 @@ pub fn parse_signature(sig: &str) -> CalleeSignature {
         }
         // Extract the identifier portion: everything up to `:` (type
         // annotation) or `=` (default value) or end-of-string.
-        let name_end = trimmed
-            .find([':', '='])
-            .unwrap_or(trimmed.len());
+        let name_end = trimmed.find([':', '=']).unwrap_or(trimmed.len());
         let name = trimmed[..name_end].trim();
         if name.is_empty() || name == "self" || name == "cls" {
             continue;
