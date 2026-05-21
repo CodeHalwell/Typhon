@@ -2920,7 +2920,6 @@ fn canonical_section_title_opt(name: &str) -> Option<&'static str> {
     })
 }
 
-
 /// Render the contents of a parameter block (Google `Args:` body or
 /// NumPy `Parameters` body) as Markdown bullets. Lines that don't
 /// look like `name: description` are preserved verbatim so prose
