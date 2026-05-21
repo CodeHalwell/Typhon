@@ -4413,17 +4413,46 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             if let Some(ret_expr) = &ret.value {
                 audit_check_escape(c, ret_expr);
             }
-            // Inside a generator function body, `return` is shorthand for
-            // `raise StopIteration(value)` and never produces an
-            // `Iterator[T]`. Walk the return expression so name uses are
-            // still validated, but skip the assignability check against
-            // the declared `Iterator[T]` return type. The companion
-            // `tyc::generator_return_type` warning (in check_function)
-            // catches the opposite shape — `yield` in a non-iterator
-            // function — so any genuinely-wrong generator signature is
-            // still caught elsewhere.
+            // Inside a generator function body, `return value` is
+            // shorthand for `raise StopIteration(value)` — the value
+            // becomes the *generator's* return payload, not an
+            // `Iterator[T]`. The check has three shapes (FINDINGS O6
+            // + Codex review feedback on PR #94):
+            //
+            //   * `-> Iterator[T]` / `-> Iterable[T]` / async variants
+            //     don't expose a return-type parameter at all, so we
+            //     accept any `return value` — the payload is
+            //     effectively `None` from the user's perspective.
+            //   * `-> Generator[Y, S, R]` carries the return payload's
+            //     declared type as the third parameter; check the
+            //     return value against `R` instead of skipping. This
+            //     restores the type-safety the early-return shortcut
+            //     would otherwise lose.
+            //   * Bare `return` (no value) is always fine — it
+            //     produces `StopIteration()` with no payload, which
+            //     is the standard `break-out-of-generator` shape.
             if c.in_generator {
-                if let Some(ret_expr) = &ret.value {
+                let generator_return_type = c
+                    .current_return
+                    .as_ref()
+                    .and_then(extract_generator_return_type);
+                if let (Some(ret_expr), Some(expected_r)) =
+                    (&ret.value, generator_return_type.clone())
+                {
+                    let value_type = infer_expr_ctx(c, ret_expr, Some(&expected_r));
+                    if !matches!(expected_r, Type::Unknown)
+                        && !c.is_assignable(&expected_r, &value_type)
+                    {
+                        let span = (
+                            ret_expr.range().start().to_usize(),
+                            ret_expr.range().end().to_usize(),
+                        );
+                        c.mismatch(&expected_r, &value_type, span);
+                    }
+                } else if let Some(ret_expr) = &ret.value {
+                    // `Iterator[T]` / `Iterable[T]` / async variants —
+                    // no R parameter to check against. Still walk the
+                    // expression so name uses are validated.
                     let _ = infer_expr(c, ret_expr);
                 }
                 return;
@@ -4491,9 +4520,18 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 check_stmt(c, s);
             }
             c.env.restore(snap_pre);
+            // `while ... else:` runs exactly when the loop test became
+            // false without a `break`, so the negated narrowing holds
+            // at the top of the orelse block — the dual of the
+            // positive narrowing applied to the body. Mirrors the
+            // `if` checker's else-branch handling.
+            let neg = collect_narrowings(c, &w.test, /*negate=*/ true);
+            let snap_pre = c.env.snapshot();
+            apply_narrowings(c, &neg);
             for s in &w.orelse {
                 check_stmt(c, s);
             }
+            c.env.restore(snap_pre);
         }
         Stmt::For(f) => {
             let _ = infer_expr(c, &f.iter);
@@ -5695,6 +5733,23 @@ fn extract_err_generic_param(typ: &Type) -> Option<Type> {
     if let Type::Generic(name, args) = typ {
         if name == "Err" && args.len() == 1 {
             return Some(args[0].clone());
+        }
+    }
+    None
+}
+
+/// Extract `R` from a `Generator[Y, S, R]` annotation so the
+/// return-statement validator can check `return value` against the
+/// declared return-payload type when the user has spelled out all
+/// three parameters. Returns `None` for `Iterator[T]` / `Iterable[T]`
+/// / async variants — those don't expose a return-type parameter and
+/// `return value` payloads are accepted unchecked. Used by the
+/// `c.in_generator` early-return in `check_stmt::Return` (FINDINGS
+/// O6, refined per Codex review on PR #94).
+fn extract_generator_return_type(typ: &Type) -> Option<Type> {
+    if let Type::Generic(name, args) = typ {
+        if name == "Generator" && args.len() == 3 {
+            return Some(args[2].clone());
         }
     }
     None
@@ -9446,6 +9501,72 @@ def stop_early() -> Iterator[int]:
         assert!(
             !d.has_errors(),
             "`return value` inside a generator must skip the value-against-Iterator check; got: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn generator_return_value_checked_against_generator_r_param() {
+        // `Generator[Y, S, R]` *does* carry a declared return-payload
+        // type; a `return value` inside one must be assignable to R.
+        // The Iterator-shaped relaxation must not silently accept
+        // mismatched payloads when the user spelled out all three
+        // parameters (Codex review on PR #94).
+        let ok = check(
+            "\
+from typing import Generator
+
+def g() -> Generator[int, None, str]:
+    yield 1
+    return \"done\"
+",
+        );
+        assert!(
+            !ok.has_errors(),
+            "matching `return value` against R should be accepted; got: {:?}",
+            ok.errors()
+        );
+
+        let bad = check(
+            "\
+from typing import Generator
+
+def g() -> Generator[int, None, str]:
+    yield 1
+    return 42
+",
+        );
+        assert!(
+            bad.has_errors(),
+            "mismatched `return value` against R should be rejected"
+        );
+        let msg = format!("{}", bad.errors()[0]);
+        assert!(
+            msg.contains("expected `str`"),
+            "diagnostic should reference R (= str); got: {}",
+            msg,
+        );
+    }
+
+    #[test]
+    fn while_else_branch_has_negated_narrowing() {
+        // `while x is not None: ... else: <here>` runs exactly when
+        // the test became false — i.e. `x is None`. The else block
+        // should see `x` narrowed to `None`, the dual of the body's
+        // positive narrowing (Gemini review on PR #94).
+        let src = "\
+def f(x: int?) -> None:
+    mut cur: int? = x
+    while cur is not None:
+        cur = None
+    else:
+        let n: None = cur
+        return
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "negated narrowing should flow into the `while … else:` block; got: {:?}",
             d.errors()
         );
     }

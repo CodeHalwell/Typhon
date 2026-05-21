@@ -452,6 +452,75 @@ fn collect_bang_class_lines(source: &str) -> HashSet<usize> {
     out
 }
 
+/// Walk `line` once and return the set of byte offsets that fall inside
+/// a single- or double-quoted single-line string literal. Multi-line
+/// triple-quoted strings on the same line are also tracked. Used by
+/// the type-annotation rewrites so they don't munge values like
+/// `x = "Optional[int]"` or `y = "Union[int, None]"` whose contents
+/// look like the patterns we rewrite but aren't actually annotations.
+fn string_literal_byte_ranges(line: &str) -> Vec<(usize, usize)> {
+    let bytes = line.as_bytes();
+    let mut ranges = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        // Triple-quote check first so `"""abc"""` doesn't read as two
+        // adjacent empty strings.
+        if (c == b'"' || c == b'\'')
+            && i + 2 < bytes.len()
+            && bytes[i + 1] == c
+            && bytes[i + 2] == c
+        {
+            let start = i;
+            i += 3;
+            while i + 2 < bytes.len() && !(bytes[i] == c && bytes[i + 1] == c && bytes[i + 2] == c)
+            {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            // Include the closing triple-quote (or the rest of the
+            // line if the string is unterminated).
+            i = (i + 3).min(bytes.len());
+            ranges.push((start, i));
+            continue;
+        }
+        if c == b'"' || c == b'\'' {
+            let quote = c;
+            let start = i;
+            i += 1;
+            while i < bytes.len() && bytes[i] != quote {
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if i < bytes.len() {
+                i += 1; // consume closing quote
+            }
+            ranges.push((start, i));
+            continue;
+        }
+        if c == b'#' {
+            // Rest of the line is a comment — treat as off-limits to
+            // rewrites (a comment talking about `Optional[int]` shouldn't
+            // be edited either).
+            ranges.push((i, bytes.len()));
+            break;
+        }
+        i += 1;
+    }
+    ranges
+}
+
+/// True when `pos` falls inside one of the byte ranges in `ranges`.
+fn pos_in_ranges(pos: usize, ranges: &[(usize, usize)]) -> bool {
+    ranges.iter().any(|(s, e)| pos >= *s && pos < *e)
+}
+
 /// Rewrite every `Optional[T]` (including `typing.Optional[T]`) to `T?`
 /// and every `T | None` to `T?`.
 ///
@@ -461,9 +530,17 @@ fn collect_bang_class_lines(source: &str) -> HashSet<usize> {
 fn rewrite_optional(line: &str) -> String {
     let mut s = line.to_owned();
 
-    // Replace fully-qualified first to avoid double rewriting.
+    // Replace fully-qualified first to avoid double rewriting. Skip
+    // matches that fall inside a string literal on the same line so we
+    // don't munge `x = "Optional[int]"` into `x = "int?"` (FINDINGS —
+    // Codex review on PR #94).
     for prefix in &["typing.Optional[", "Optional["] {
-        while let Some(start) = s.find(prefix) {
+        while let Some(start) = {
+            let string_ranges = string_literal_byte_ranges(&s);
+            s.match_indices(prefix)
+                .map(|(i, _)| i)
+                .find(|&i| !pos_in_ranges(i, &string_ranges))
+        } {
             let open = start + prefix.len() - 1;
             // Find the matching `]` honouring nested brackets.
             let mut depth: i32 = 0;
@@ -488,10 +565,16 @@ fn rewrite_optional(line: &str) -> String {
             // `"Foo?"` (a single forward-ref containing the trailing
             // `?`), not `"Foo"?` which is a syntax error (FINDINGS
             // O21). Handles both double- and single-quoted forms.
+            //
+            // The `len() >= 2` guard rules out a malformed
+            // `Optional["]` whose inner would slice as `1..0` and
+            // panic — leave those untouched so the parser surfaces
+            // a regular Python error rather than crashing migrate.
             let trimmed = inner.trim();
-            let replacement = if (trimmed.starts_with('"') && trimmed.ends_with('"'))
-                || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
-            {
+            let is_quoted_forward_ref = trimmed.len() >= 2
+                && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+                    || (trimmed.starts_with('\'') && trimmed.ends_with('\'')));
+            let replacement = if is_quoted_forward_ref {
                 let q = trimmed.chars().next().unwrap();
                 let body = &trimmed[1..trimmed.len() - 1];
                 format!("{q}{body}?{q}")
@@ -530,8 +613,13 @@ fn rewrite_union_optional(line: &str) -> String {
     let mut s = line.to_owned();
     for prefix in &["typing.Union[", "Union["] {
         let mut search_from = 0usize;
-        while let Some(rel) = s[search_from..].find(prefix) {
-            let start = search_from + rel;
+        while let Some((start, _)) = {
+            let string_ranges = string_literal_byte_ranges(&s);
+            s[search_from..]
+                .match_indices(prefix)
+                .map(|(rel, m)| (search_from + rel, m))
+                .find(|(i, _)| !pos_in_ranges(*i, &string_ranges))
+        } {
             let open = start + prefix.len() - 1;
             // Find the matching `]` honouring nested brackets.
             let mut depth: i32 = 0;
@@ -566,9 +654,14 @@ fn rewrite_union_optional(line: &str) -> String {
                     .find(|p| **p != "None")
                     .copied()
                     .unwrap_or("");
-                let replacement = if (other.starts_with('"') && other.ends_with('"'))
-                    || (other.starts_with('\'') && other.ends_with('\''))
-                {
+                // Length guard: a malformed `Union["]` would otherwise
+                // try to slice `1..0` and panic. Treat that as a
+                // non-forward-ref and emit the plain `?` form so the
+                // resulting Typhon still parses recognisably.
+                let is_quoted_forward_ref = other.len() >= 2
+                    && ((other.starts_with('"') && other.ends_with('"'))
+                        || (other.starts_with('\'') && other.ends_with('\'')));
+                let replacement = if is_quoted_forward_ref {
                     let q = other.chars().next().unwrap();
                     let body = &other[1..other.len() - 1];
                     format!("{q}{body}?{q}")

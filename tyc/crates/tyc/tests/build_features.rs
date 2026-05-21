@@ -1382,9 +1382,19 @@ fn raw_class_with_base_no_fields_synthesises_passthrough_init() {
          \x20   try:\n\
          \x20       raise AppError(\"boom\")\n\
          \x20   except AppError as e:\n\
-         \x20       assert str(e) == \"boom\", f\"got: {e!r}\"\n",
+         \x20       assert str(e) == \"boom\", f\"got: {e!r}\"\n\
+         \n\
+         if __name__ == \"__main__\":\n\
+         \x20   main()\n",
     );
-    build(tmp.path());
+    // `build_and_run_main` skips cleanly on hosts without a 3.12+
+    // Python on PATH (which is how every other test in this file
+    // guards its execution step) and uses the resolved interpreter
+    // rather than hard-coded `python`, so CI on systems where only
+    // `python3` exists still passes.
+    let Some(_) = build_and_run_main(tmp.path()) else {
+        return;
+    };
     let out = std::fs::read_to_string(tmp.path().join("build/main.py")).unwrap();
     assert!(
         out.contains("def __init__(self, *args, **kwargs) -> None:"),
@@ -1393,15 +1403,6 @@ fn raw_class_with_base_no_fields_synthesises_passthrough_init() {
     assert!(
         out.contains("super().__init__(*args, **kwargs)"),
         "synthesised passthrough init must forward to super; got:\n{out}",
-    );
-    // The whole program should run cleanly end-to-end.
-    let status = std::process::Command::new("python")
-        .arg(tmp.path().join("build/main.py"))
-        .status()
-        .expect("python should execute the emitted module");
-    assert!(
-        status.success(),
-        "emitted Python should run cleanly: {status:?}",
     );
 }
 
