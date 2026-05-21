@@ -265,8 +265,16 @@ impl fmt::Debug for Value {
             }
             Value::Class(c) => write!(f, "<class {}>", c.name),
             Value::Instance(i) => write!(f, "<{} instance>", i.class.name),
-            Value::ResultOk(v) => write!(f, "Ok({:?})", v),
-            Value::ResultErr(v) => write!(f, "Err({:?})", v),
+            // Match the dataclass-default `repr` shape that
+            // `typhon_runtime`'s `Ok` / `Err` produce under CPython
+            // (`@dataclass(frozen=True)` generates `Foo(value=42)` and
+            // `Foo(error=...)` reprs). Without this the VM prints
+            // `Ok(42)` and the CPython exec prints `Ok(value=42)`,
+            // which makes `tyc run` vs `tyc run --compile` stdout
+            // diverge for screenshot-driven docs and test fixtures
+            // (FINDINGS O24).
+            Value::ResultOk(v) => write!(f, "Ok(value={:?})", v),
+            Value::ResultErr(v) => write!(f, "Err(error={:?})", v),
             Value::Module(m) => write!(f, "<module {}>", m.name),
             Value::Exception { kind, message } => {
                 if message.is_empty() {
@@ -543,8 +551,14 @@ impl Value {
             Value::BoundMethod { function, .. } => format!("<bound method {}>", function.name),
             Value::Class(c) => format!("<class '{}'>", c.name),
             Value::Instance(i) => format!("<{} instance>", i.class.name),
-            Value::ResultOk(v) => format!("Ok({})", v.py_repr()),
-            Value::ResultErr(v) => format!("Err({})", v.py_repr()),
+            // Match the dataclass-default `repr` shape that
+            // `typhon_runtime`'s `Ok` / `Err` produce under CPython
+            // (`Foo(value=42)` / `Foo(error=...)`). The Debug-impl
+            // arm above already carries the same comment — keeping
+            // these in sync prevents `tyc run` vs `tyc run --compile`
+            // stdout from diverging on Result printing (FINDINGS O24).
+            Value::ResultOk(v) => format!("Ok(value={})", v.py_repr()),
+            Value::ResultErr(v) => format!("Err(error={})", v.py_repr()),
             Value::Module(m) => format!("<module '{}'>", m.name),
             Value::Exception { kind, message } => {
                 if message.is_empty() {
@@ -558,12 +572,49 @@ impl Value {
     }
 
     /// Python-style `repr(x)`. Differs from `py_str` for strings — adds quotes.
+    /// CPython's repr prefers single quotes (`'hello'`) and falls back to
+    /// double quotes only when the string itself contains a single quote
+    /// but no double quote; matching that shape keeps `tyc run` and
+    /// `tyc run --compile` byte-equal for collections of strings, which
+    /// the docs and test fixtures rely on (FINDINGS O24, companion to
+    /// the `Ok(value=...)` / `Err(error=...)` rename).
     pub fn py_repr(&self) -> String {
         match self {
-            Value::Str(s) => format!("{:?}", s.as_str()),
+            Value::Str(s) => python_repr_str(s.as_str()),
             other => other.py_str(),
         }
     }
+}
+
+/// CPython-style `repr` for a string: prefer single quotes, escape the
+/// active quote and backslashes, and fall back to double quotes when
+/// the string itself contains a `'` but no `"`. The escape set matches
+/// CPython's reprlib: `\\`, `\n`, `\r`, `\t`, and `\x..` for other
+/// ASCII control characters.
+fn python_repr_str(s: &str) -> String {
+    let has_single = s.contains('\'');
+    let has_double = s.contains('"');
+    let quote = if has_single && !has_double { '"' } else { '\'' };
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push(quote);
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            c if c == quote => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
+                out.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push(quote);
+    out
 }
 
 fn format_float(x: f64) -> String {
@@ -582,5 +633,41 @@ fn format_float(x: f64) -> String {
         s
     } else {
         format!("{}.0", s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::rc::Rc;
+
+    #[test]
+    fn py_repr_string_uses_single_quotes_by_default() {
+        let v = Value::Str(Rc::new("hello".to_owned()));
+        assert_eq!(v.py_repr(), "'hello'");
+    }
+
+    #[test]
+    fn py_repr_string_falls_back_to_double_quotes_when_single_present() {
+        let v = Value::Str(Rc::new("it's".to_owned()));
+        assert_eq!(v.py_repr(), "\"it's\"");
+    }
+
+    #[test]
+    fn py_repr_string_escapes_active_quote_when_both_present() {
+        let v = Value::Str(Rc::new("it's \"hard\"".to_owned()));
+        assert_eq!(v.py_repr(), "'it\\'s \"hard\"'");
+    }
+
+    #[test]
+    fn py_repr_ok_uses_dataclass_shape() {
+        // FINDINGS O24: VM repr of `Ok(20)` was diverging from the
+        // CPython dataclass default `Ok(value=20)`. The two must match
+        // so `tyc run` and `tyc run --compile` produce byte-identical
+        // stdout for documented Result programs.
+        let v = Value::ResultOk(Box::new(Value::Int(20)));
+        assert_eq!(v.py_repr(), "Ok(value=20)");
+        let e = Value::ResultErr(Box::new(Value::Str(Rc::new("oops".to_owned()))));
+        assert_eq!(e.py_repr(), "Err(error='oops')");
     }
 }

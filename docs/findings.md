@@ -34,8 +34,8 @@ SDK patterns, perf, and intentionally-broken diagnostic probes. Roughly
 | 2026-05-19 | `claude/test-typhon-library-rNIYC` | #57–#127 | all but the deferred items closed in `review-findings-fixes-VRFJy` / `resolve-open-findings-UDZfv` |
 | 2026-05-20 | `claude/test-typhon-library-ejNr5` | R3.1–R3.18 | closed in `resolve-open-findings-v6t65` except `tyc fmt` and `?` in sub-expr |
 | 2026-05-20 exploration | `claude/typhon-exploration-testing-LZezp` | E1–E11 | closed except E6, E9, E11 |
-| 2026-05-21 | `claude/tender-hawking-LLhuR` | B1–B14 | closed B1–B7, B10, B12, B13; B8, B9, B11, B14 still open |
-| 2026-05-21 findings sweep | `claude/findings-documentation-review-HhuVH` | — | closed O2/O3/O4/O5/O6/O10/O21/O22/O25/O26; verified-fixed O1/O7/O8/O9/O11/O18/O20 |
+| 2026-05-21 | `claude/tender-hawking-LLhuR` | B1–B14 | closed B1–B7, B10–B13; B8, B9, B14 still open |
+| 2026-05-21 findings sweep | `claude/findings-documentation-review-HhuVH` | — | closed O2/O3/O4/O5/O6/O10/O21/O22/O24/O25/O26; verified-fixed O1/O7/O8/O9/O11/O18/O20 |
 
 **Pass rate trend** on the canonical example suite (`examples/01-…46-…`):
 20/47 → 39/47 → 46/46 → 46/46. The examples now build and run end-to-end
@@ -166,13 +166,6 @@ Diagnostic claims the user wrote `impl list:`. Either accept
 parametric extends or surface a
 `extend on parameterised types is not supported yet` error.
 
-#### O24 — VM repr disagrees with CPython repr for `Result` *(B11)*
-
-VM prints `Ok(20)`; CPython prints `Ok(value=20)`. Causes `tyc run`
-and `tyc run --compile` to diverge in stdout, which the `tyc-vm` doc
-explicitly warns about, but worth surfacing for screenshot-driven
-docs and test fixtures.
-
 #### O27 — Sequence pattern `[a, b]` emits as tuple pattern `(a, b)` *(#111)*
 
 PEP 634 makes these semantically identical (both match any sequence)
@@ -302,6 +295,12 @@ Branch: `claude/findings-documentation-review-HhuVH`.
   the `>>> ` / `... ` prompts when stdin is piped. Interactive
   sessions on a TTY are unchanged; scripted input no longer
   produces the `>>> >>> >>> 6` shape the finding reported.
+- **O24** — The VM's `Value::ResultOk` / `Value::ResultErr` repr now
+  matches the CPython dataclass default
+  (`Ok(value=20)` / `Err(error='oops')`), and string repr prefers
+  single quotes the same way Python's `repr` does. `tyc run` and
+  `tyc run --compile` produce byte-identical stdout for Result-
+  bearing programs.
 
 **Verified-already-fixed against their repros:**
 
@@ -460,12 +459,11 @@ f-string), E10 (O11, for-rebind). Still open: E6 → **O19**, E9 →
 
 Filed B1–B14 (81 fresh `.ty` programs, 65/81 build + run clean; 7 real
 bugs surfaced). The May 21 findings sweep closed B1 (O3), B2 (O4),
-B3 (O6), B4 (O5), B5 (O2), B6 (O21), B7 (O22), B10 (O10), B12 (O25),
-B13 (O26). Still open:
+B3 (O6), B4 (O5), B5 (O2), B6 (O21), B7 (O22), B10 (O10), B11 (O24),
+B12 (O25), B13 (O26). Still open:
 
 - B8 → **O23** (parametric `extend`)
 - B9 → **O12** (`tyc fmt`)
-- B11 → **O24** (VM repr)
 - B14 → **O13** (Pydantic dep auto-inject)
 
 Repro corpus + run script at `stress/round-2026-05-21/`. The
