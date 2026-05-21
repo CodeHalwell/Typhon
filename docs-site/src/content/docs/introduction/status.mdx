@@ -7,7 +7,7 @@ sidebar:
 
 import { Aside } from '@astrojs/starlight/components';
 
-Typhon is in **active development**. The minimum-viable language — non-null types, sealed unions, `Result[T, E]`, dataclass-emit classes — is shippable today. Phase 5 (interop and developer experience) shipped in [v0.1.6](https://github.com/CodeHalwell/Typhon/releases/tag/v0.1.6), bringing `plain class`, auto-skip for framework parents, Python-semantic alignment for `or`/`and` and generators, `tyc explain` / `tyc cheatsheet`, diagnostic deep-links, and the `tyc-vm` tree-walking interpreter as the default for `tyc run`. Most of the more advanced features (interfaces, comptime, lazy loading, automatic gather, free-threaded parallelism, the package-manager surface, the REPL, the debugger launcher, the migrator) are also landed; what remains is polish.
+Typhon is in **active development**. The minimum-viable language — non-null types, sealed unions, `Result[T, E]`, dataclass-emit classes — is shippable today. Phase 5 (interop and developer experience) shipped in [v0.1.6](https://github.com/CodeHalwell/Typhon/releases/tag/v0.1.6), bringing `plain class`, auto-skip for framework parents, Python-semantic alignment for `or`/`and` and generators, `tyc explain` / `tyc cheatsheet`, diagnostic deep-links, and the `tyc-vm` tree-walking interpreter as the default for `tyc run`. Phase 5.5 (constructor / method arity safety) shipped in [v0.2.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.2.0): `tyc::arg_count` now fires on auto-generated class constructors and `impl` methods, cross-module shape propagation arity-checks both `from foo import Cls` and `import foo as f; f.Cls(…)`, and a new `tyc::missing_field_init` audit catches `X.__new__(X)` bypass patterns where required fields escape uninitialised. Most of the more advanced features (interfaces, comptime, lazy loading, automatic gather, free-threaded parallelism, the package-manager surface, the REPL, the debugger launcher, the migrator) are also landed; what remains is polish.
 
 The canonical per-feature status lives in the [Roadmap](/Typhon/project/roadmap/). This page is a quick summary.
 
@@ -55,6 +55,14 @@ The canonical per-feature status lives in the [Roadmap](/Typhon/project/roadmap/
 
 - ✅ CI (`cargo fmt`, `clippy -D warnings`, `cargo test --workspace`, `cargo-deny`).
 - ✅ Generated `typhon_runtime/` ships as local source — no PyPI dependency.
+
+## Landed in Phase 5.5 (constructor / method arity safety) — v0.2.0
+
+- ✅ **`tyc::arg_count` on constructors.** The auto-generated `__init__` of `class` and `model` declarations is now arity-checked at every call site. `ApiClient(base_url="…")` for a class with a required `api_key: str` field is rejected at `tyc check` / `tyc build` time instead of crashing with `TypeError: missing 1 required positional argument` at runtime. `T?` without an explicit `= None` is still required.
+- ✅ **`tyc::arg_count` on `impl` methods.** Method signatures carry full `ArityInfo` (param names, defaults, `*args` / `**kwargs`) rather than a single arity count. `u.greet()` is flagged when `greet` declares a required `prefix: str` parameter.
+- ✅ **Cross-module shape propagation.** `from foo import ApiClient; ApiClient(…)` and `import foo as f; f.ApiClient(…)` both flow through the new arity checks via a project-wide shape registry built once per invocation. `.ty` source and `.dty` stubs participate on equal footing — stubs win on collisions. Works in `tyc check`, `tyc build`, and the LSP.
+- ✅ **Salsa-cached LSP shape extraction.** A `tyc_db::module_shapes_query` salsa-tracked query caches per-file shape extraction; a keystroke in one file only re-runs extraction for that file.
+- ✅ **`tyc::missing_field_init` post-construction audit.** Catches `X.__new__(X)` / `object.__new__(X)` bypass patterns where the instance escapes the function (return / call argument) with required fields unassigned. Dropped conservatively on `setattr`, on `obj.method(…)` calls, and inside `unsafe:` regions.
 
 ## Landed in Phase 5 (interop & DX) — v0.1.6
 

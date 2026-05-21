@@ -18,6 +18,8 @@ tyc explain immutable_assign           # short code
 tyc explain tyc::immutable_assign      # fully-qualified — both work
 tyc explain frozen_assign              # any catalog page
 tyc explain orphan_py_import           # Phase 5 diagnostic
+tyc explain arg_count                  # constructor / method arity (v0.2.0)
+tyc explain missing_field_init         # __new__ bypass audit (v0.2.0)
 ```
 
 ## How it works
@@ -28,7 +30,7 @@ When a code is misspelled or doesn't yet have a catalog page, `tyc explain` exit
 
 ## The catalog
 
-The catalog covers every `tyc::` diagnostic shipping today: ~50+ pages spanning binding rules (`immutable_assign`, `missing_binding_kind`), type errors (`type_mismatch`, `nullable_use`, `operator_type_mismatch`), class rules (`manual_init`, `frozen_assign`, `class_attr_shadows_slot`, `method_in_class_body`), match exhaustiveness (`non_exhaustive_match`), async (`missing_await`, `async_without_await`), Result (`result_error_mismatch`, `invalid_question_op`), interop (`orphan_py_import`, `python_semantic_drift`, `contains_secret_literal`, `invalid_config_value`), stubs (`stub_mismatch`), and the everyday parse/resolve diagnostics.
+The catalog covers every `tyc::` diagnostic shipping today: ~50+ pages spanning binding rules (`immutable_assign`, `missing_binding_kind`), type errors (`type_mismatch`, `nullable_use`, `operator_type_mismatch`, `arg_count`), class rules (`manual_init`, `frozen_assign`, `class_attr_shadows_slot`, `method_in_class_body`, `missing_field_init`), match exhaustiveness (`non_exhaustive_match`), async (`missing_await`, `async_without_await`), Result (`result_error_mismatch`, `invalid_question_op`), interop (`orphan_py_import`, `python_semantic_drift`, `contains_secret_literal`, `invalid_config_value`), stubs (`stub_mismatch`), and the everyday parse/resolve diagnostics.
 
 Each page follows the same shape: **what it means**, **a minimal failing example**, **why Typhon flags it**, and **how to fix it**.
 

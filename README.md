@@ -167,6 +167,14 @@ See [docs/cli.md](docs/cli.md) for the full reference.
 - ✅ `extend ClassName:` (alias for `impl` on user-defined classes); `extend BUILTIN:` for `str`/`list`/`dict`/… extracts each method to a module-level free function and rewrites call sites whose receiver carries a matching static annotation. No monkey-patching of built-ins.
 - ✅ `.dty` stub files compile to PEP 561 `.pyi`. `tyc check --stubs` parses every `.dty` and diffs its surface API (functions, classes, methods, annotated fields, parameter shapes) against the sibling `.ty`/`.py` implementation, emitting `tyc::stub_mismatch` diagnostics for missing-in-impl / missing-in-stub / signature-mismatch findings. A runtime introspection probe (mypy's `stubtest` proper) is still a follow-up.
 
+**Phase 5.5 — Constructor / method arity safety** complete ([v0.2.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.2.0)):
+
+- ✅ `tyc::arg_count` now fires on **class constructors**: a `class ApiClient: api_key: str` instantiated as `ApiClient(base_url="…")` is rejected at `tyc check` / `tyc build` time instead of crashing at runtime with `TypeError: missing 1 required positional argument`. Required fields, `T?` without `= None`, and `model` (Pydantic) classes are all checked.
+- ✅ `tyc::arg_count` now fires on **`impl` methods**: `u.greet()` is flagged when `greet` declares a required `prefix: str` parameter. Previously method calls fell into the permissive arity shape.
+- ✅ **Cross-module arity propagation:** `from foo import ApiClient` and `import foo as f; f.ApiClient(…)` both flow through the new arity checks. `.ty` source and `.dty` stubs participate on equal footing (stubs win on collisions). Works in `tyc check`, `tyc build`, and the LSP.
+- ✅ **Salsa-cached LSP shape extraction:** a new `tyc_db::module_shapes_query(file)` salsa-tracked query caches per-file shape extraction. A keystroke in one file only re-runs extraction for that file.
+- ✅ **`tyc::missing_field_init`** post-construction audit: catches the `X.__new__(X)` / `object.__new__(X)` bypass pattern when the instance escapes the function (return / call argument) without every required field assigned. Dropped conservatively on `setattr`, on method calls, and inside `unsafe:` regions.
+
 **Phase 5 — Interop and developer experience** complete ([v0.1.6](https://github.com/CodeHalwell/Typhon/releases/tag/v0.1.6)):
 
 - ✅ `plain class X:` keyword for "regular Python class, no `@dataclass`, no synthesised `__init__`" — the symmetric escape hatch alongside `frozen class` and `class!`.
@@ -193,7 +201,7 @@ See [docs/cli.md](docs/cli.md) for the full reference.
 - ✅ `tyc-vm`: in-process tree-walking interpreter that runs `.ty` source directly. `tyc run` uses it by default — no `build/`, no CPython process spawn. See [docs/vm.md](docs/vm.md) for the supported feature surface; programs that import CPython-only libraries fall back via `tyc run --compile`.
 - ✅ Source-map line accuracy: `.py.map` records a per-statement `(out_line → ty_line)` table consumed by `tyc trace` and `tyc debug --break`.
 
-See [docs/roadmap.md](docs/roadmap.md) for the phased plan and [docs/follow-ups-2026-05-17.md](docs/follow-ups-2026-05-17.md) for the remaining tracked follow-ups.
+See [docs/roadmap.md](docs/roadmap.md) for the phased plan, [CHANGELOG.md](CHANGELOG.md) for release-by-release notes, and [docs/follow-ups-2026-05-17.md](docs/follow-ups-2026-05-17.md) for the remaining tracked follow-ups.
 
 ## Configuration
 
