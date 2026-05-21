@@ -4707,13 +4707,33 @@ fn expand_pipes_line_by_line(source: &str) -> String {
         }
 
         let code = &raw[..code_end];
-        let pipes = find_top_level_pipes(code);
+        // First, expand any `|>` that lives inside a parenthesised
+        // sub-expression — the original line-only pass only looked at
+        // depth-0 pipes, which left shapes like
+        // `(1 |> add(2)) |> add(3)` un-rewritten on the inner pipe
+        // and produced a parser error against the still-Typhon-only
+        // `|>` token. The nested helper recurses into each balanced
+        // `(...)` group so inner pipes are rewritten before the
+        // outer pipe pass sees them. O28 / FINDINGS #117–#119.
+        let nested_expanded = expand_pipes_in_subexpressions(code);
+        let code_for_top: &str = &nested_expanded;
+        let pipes = find_top_level_pipes(code_for_top);
         if pipes.is_empty() {
-            result.push_str(line);
+            // The nested pass may still have rewritten parenthesised
+            // sub-expressions even when no top-level pipe remained.
+            // Stream the rewritten code (plus the original trailing
+            // comment) into the buffer so that progress is preserved.
+            if nested_expanded != code {
+                result.push_str(&nested_expanded);
+                result.push_str(&raw[code_end..]);
+                result.push_str(terminator);
+            } else {
+                result.push_str(line);
+            }
             continue;
         }
 
-        let rewritten = match rewrite_pipe_line(code, &pipes) {
+        let rewritten = match rewrite_pipe_line(code_for_top, &pipes) {
             Some(s) => s,
             None => {
                 // Bail out — pass the line through unchanged so the regular
@@ -4731,6 +4751,103 @@ fn expand_pipes_line_by_line(source: &str) -> String {
     }
 
     result
+}
+
+/// Recursively expand `|>` operators inside balanced `(...)` groups.
+/// Walks `code` left-to-right, treating top-level `(` / `)` pairs as
+/// independent sub-expressions; each pair's body is processed first
+/// (so nested pipes are rewritten innermost-first), then any pipes
+/// still present at the body's top level are rewritten via the same
+/// machinery the line-level pass uses. Triple-quoted and ordinary
+/// string literals are passed through verbatim.
+///
+/// This pass is a no-op when the input contains no `|>` token at all.
+/// O28 / FINDINGS #119.
+fn expand_pipes_in_subexpressions(code: &str) -> String {
+    if !code.contains("|>") {
+        return code.to_owned();
+    }
+    let bytes = code.as_bytes();
+    let mut out = String::with_capacity(code.len());
+    let mut in_str: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            out.push(b as char);
+            if b == b'\\' && i + 1 < bytes.len() {
+                out.push(bytes[i + 1] as char);
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            in_str = Some(b);
+            out.push(b as char);
+            i += 1;
+            continue;
+        }
+        if b == b'(' {
+            // Find the matching `)`, tracking string state inside.
+            let mut depth: i32 = 1;
+            let mut j = i + 1;
+            let mut local_str: Option<u8> = None;
+            while j < bytes.len() && depth > 0 {
+                let c = bytes[j];
+                if let Some(q) = local_str {
+                    if c == b'\\' && j + 1 < bytes.len() {
+                        j += 2;
+                        continue;
+                    }
+                    if c == q {
+                        local_str = None;
+                    }
+                    j += 1;
+                    continue;
+                }
+                match c {
+                    b'"' | b'\'' => local_str = Some(c),
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            if depth != 0 {
+                // Unmatched paren — give up and emit verbatim. The
+                // downstream parser will produce a coherent diagnostic.
+                out.push('(');
+                i += 1;
+                continue;
+            }
+            let inner_bytes = &bytes[i + 1..j - 1];
+            let inner = std::str::from_utf8(inner_bytes).unwrap_or("");
+            // Recurse: rewrite any deeper-nested parens first, then
+            // run the top-level pass on the result.
+            let processed_inner = {
+                let nested = expand_pipes_in_subexpressions(inner);
+                let pipes = find_top_level_pipes(&nested);
+                if pipes.is_empty() {
+                    nested
+                } else {
+                    rewrite_pipe_line(&nested, &pipes).unwrap_or(nested)
+                }
+            };
+            out.push('(');
+            out.push_str(&processed_inner);
+            out.push(')');
+            i = j;
+            continue;
+        }
+        out.push(b as char);
+        i += 1;
+    }
+    out
 }
 
 /// Fold multi-line pipe segments back onto their preceding line so the
@@ -5093,18 +5210,45 @@ fn apply_pipe_call(acc: &str, rhs: &str) -> Option<String> {
         return None;
     }
 
-    // Find the first `(` at depth 0 in the RHS (or `None` for bare callable).
-    // Uses the shared scanner so triple-quoted strings are handled correctly.
+    // The RHS is either a bare callable (no parens) or a call shape
+    // `<callable>(<args>)`. When parens are present we identify the
+    // call by walking back from the trailing `)` to its matching
+    // `(`, NOT by taking the first `(` — that lets a parenthesised
+    // callable like `(lambda x: x * 2)()` be recognised. The
+    // `<callable>` text before the matching `(` may itself be:
+    //   * a dotted identifier chain (`mod.f.g`),
+    //   * a literal-receiver method head (`", ".join`,
+    //     `(a + b).method`), or
+    //   * a parenthesised expression (`(lambda x: x * 2)`,
+    //     `(f if c else g)`) — i.e. anything starting with `(` and
+    //     balanced.
+    // O28 / FINDINGS #117.
     let bytes = rhs.as_bytes();
     let mut paren_at: Option<usize> = None;
-    scan_inline_code(rhs, |i, depth, in_string| {
-        if in_string.is_none() && depth == 0 && bytes[i] == b'(' {
-            paren_at = Some(i);
-            // Signal "stop scanning" by skipping to end.
-            return Some(bytes.len() - i);
+    if rhs.ends_with(')') {
+        // Walk back from the trailing `)` to find its match. Track
+        // string state forward (a forward scan tags every byte as
+        // in-string-or-not, then we can ignore tagged parens). For a
+        // small per-line scan the simpler depth-from-right walk is
+        // fine because strings inside the segment are well-formed
+        // (the scanner that produced `rhs` already validated this).
+        let mut depth: i32 = 0;
+        let mut k = bytes.len();
+        while k > 0 {
+            k -= 1;
+            match bytes[k] {
+                b')' => depth += 1,
+                b'(' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        paren_at = Some(k);
+                        break;
+                    }
+                }
+                _ => {}
+            }
         }
-        None
-    });
+    }
 
     match paren_at {
         None => {
@@ -5117,20 +5261,15 @@ fn apply_pipe_call(acc: &str, rhs: &str) -> Option<String> {
         }
         Some(open) => {
             let func = rhs[..open].trim_end();
-            // Accept either a plain identifier chain (`a.b.c`) or a
-            // bound method on a literal receiver (`", ".join`,
-            // `(a + b).method`). The latter shape is common in pipe
-            // chains that feed into stdlib container methods.
-            if !is_dotted_callable(func) && !is_method_call_head(func) {
+            if !is_dotted_callable(func)
+                && !is_method_call_head(func)
+                && !is_parenthesised_expr(func)
+            {
                 return None;
             }
-            // Validate the RHS is exactly `func(...)` — i.e. parens span to
-            // end of segment. This avoids accidentally rewriting expressions
-            // like `f(x) + 1`.
-            if !rhs.ends_with(')') {
-                return None;
-            }
-            // Inner args (with no surrounding parens).
+            // Inner args (with no surrounding parens). The matching
+            // walk above guarantees `func(...)` spans to end of `rhs`,
+            // so `inner` is everything between the matching parens.
             let inner = rhs[open + 1..rhs.len() - 1].trim();
             if inner.is_empty() {
                 Some(format!("{}({})", func, acc))
@@ -5139,6 +5278,46 @@ fn apply_pipe_call(acc: &str, rhs: &str) -> Option<String> {
             }
         }
     }
+}
+
+/// `true` when `s` is a parenthesised expression — starts with `(`,
+/// ends with `)`, and the two are balanced. Used to accept shapes
+/// like `(lambda x: x * 2)` and `(f if c else g)` as the head of a
+/// pipe RHS so `5 |> (lambda x: x * 2)()` rewrites to
+/// `(lambda x: x * 2)(5)`. O28 / FINDINGS #117.
+fn is_parenthesised_expr(s: &str) -> bool {
+    let s = s.trim();
+    if !s.starts_with('(') || !s.ends_with(')') {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_str: Option<u8> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        if let Some(q) = in_str {
+            if b == b'\\' && i + 1 < bytes.len() {
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            continue;
+        }
+        match b {
+            b'"' | b'\'' => in_str = Some(b),
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 && i + 1 != bytes.len() {
+                    // Closing before the end means the outer parens
+                    // don't span the whole string.
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 /// True if `s` looks like a *bound method* call head — anything that
@@ -6325,11 +6504,43 @@ mod tests {
 
     #[test]
     fn pipe_inside_parens_is_left_alone() {
-        // At parenthesis depth > 0, the rewriter declines to act. The Python
-        // parser will surface a clear error for the unsupported form.
+        // Pipes inside `[...]` brackets (list/set/dict comprehensions or
+        // index syntax) are NOT rewritten — Python's `|` already has a
+        // meaning in those positions and we leave the parser to surface
+        // the error. The matching recursion in `expand_pipes_in_sub-
+        // expressions` only walks `(...)` groups.
         let src = "y = sum([a |> f for a in xs])\n";
         let out = expand_pipes(src);
         assert_eq!(out, src);
+    }
+
+    #[test]
+    fn pipe_inside_round_parens_now_expanded() {
+        // O28 / FINDINGS #119: pipes inside a `(...)` sub-expression are
+        // expanded by the nested-paren pre-pass before the outer pipe
+        // pass runs. `(1 |> add(2)) |> add(3)` rewrites end-to-end.
+        let src = "y = (1 |> add(2)) |> add(3)\n";
+        let out = expand_pipes(src);
+        assert_eq!(out, "y = add((add(1, 2)), 3)\n");
+    }
+
+    #[test]
+    fn pipe_into_parenthesised_lambda_call() {
+        // O28 / FINDINGS #117: a `(lambda x: x * 2)()` RHS — i.e. a
+        // parenthesised expression followed by an empty call — is now
+        // accepted as a pipe callable head.
+        let src = "y = 5 |> (lambda x: x * 2)()\n";
+        let out = expand_pipes(src);
+        assert_eq!(out, "y = (lambda x: x * 2)(5)\n");
+    }
+
+    #[test]
+    fn pipe_into_parenthesised_lambda_call_with_extra_args() {
+        // The lambda call may already carry extra positional args; the
+        // pipe value goes first.
+        let src = "y = 5 |> (lambda x, k: x * k)(2)\n";
+        let out = expand_pipes(src);
+        assert_eq!(out, "y = (lambda x, k: x * k)(5, 2)\n");
     }
 
     #[test]
