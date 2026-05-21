@@ -24,7 +24,15 @@ pub fn run(args: InitArgs) -> Result<()> {
             std::fs::create_dir_all(&target)
                 .map_err(|e| miette!("cannot create {}: {}", target.display(), e))?;
             let canonical = target.canonicalize().unwrap_or(target);
-            (canonical, name)
+            // Use only the final path component as the project name so that
+            // `tyc init path/to/myapp` doesn't write `name = "path/to/myapp"`
+            // into typhon.toml — it should write `name = "myapp"`.
+            let project_name = canonical
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_else(|| name.as_str())
+                .to_owned();
+            (canonical, project_name)
         }
         None => {
             let base = args.dir.canonicalize().unwrap_or(args.dir.clone());
@@ -267,6 +275,29 @@ mod tests {
         };
         run(args).unwrap();
         assert!(tmp.path().join("typhon.toml").exists());
+    }
+
+    #[test]
+    fn init_basename_sanitised_when_name_contains_slashes() {
+        // `tyc init path/to/myapp` should create the directory tree and write
+        // `name = "myapp"` — not `name = "path/to/myapp"` — into typhon.toml.
+        let tmp = tempfile::tempdir().unwrap();
+        let args = InitArgs {
+            name: Some("nested/path/myapp".into()),
+            dir: tmp.path().to_path_buf(),
+        };
+        run(args).unwrap();
+        let project_dir = tmp.path().join("nested/path/myapp");
+        assert!(project_dir.join("typhon.toml").exists(), "typhon.toml missing");
+        let toml = std::fs::read_to_string(project_dir.join("typhon.toml")).unwrap();
+        assert!(
+            toml.contains("name = \"myapp\""),
+            "expected name = \"myapp\" but got:\n{toml}"
+        );
+        assert!(
+            !toml.contains("nested/path"),
+            "full path leaked into typhon.toml:\n{toml}"
+        );
     }
 
     #[test]
