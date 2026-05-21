@@ -34,8 +34,8 @@ SDK patterns, perf, and intentionally-broken diagnostic probes. Roughly
 | 2026-05-19 | `claude/test-typhon-library-rNIYC` | #57–#127 | all but the deferred items closed in `review-findings-fixes-VRFJy` / `resolve-open-findings-UDZfv` |
 | 2026-05-20 | `claude/test-typhon-library-ejNr5` | R3.1–R3.18 | closed in `resolve-open-findings-v6t65` except `tyc fmt` and `?` in sub-expr |
 | 2026-05-20 exploration | `claude/typhon-exploration-testing-LZezp` | E1–E11 | closed except E6, E9, E11 |
-| 2026-05-21 | `claude/tender-hawking-LLhuR` | B1–B14 | closed B1–B8, B10–B13; B9, B14 still open |
-| 2026-05-21 findings sweep | `claude/findings-documentation-review-HhuVH` | — | closed O2/O3/O4/O5/O6/O10/O21/O22/O23/O24/O25/O26; verified-fixed O1/O7/O8/O9/O11/O18/O20 |
+| 2026-05-21 | `claude/tender-hawking-LLhuR` | B1–B14 | closed B1–B8, B10–B14; only B9 (`tyc fmt`) still open |
+| 2026-05-21 findings sweep | `claude/findings-documentation-review-HhuVH` | — | closed O2/O3/O4/O5/O6/O10/O21/O22/O23/O24/O25/O26; verified-fixed O1/O7/O8/O9/O11/O13/O18/O20 |
 
 **Pass rate trend** on the canonical example suite (`examples/01-…46-…`):
 20/47 → 39/47 → 46/46 → 46/46. The examples now build and run end-to-end
@@ -77,17 +77,6 @@ partial whitespace pass.
 
 `tyc build` *does* run `ruff format` over the emitted Python (correctly,
 end-to-end). The deliverable is clean; the source isn't.
-
-#### O13 — Pydantic dep not auto-injected when project lacks `[dependencies]` *(B14)*
-
-The fix from `#103` adds `pydantic = "*"` to a project's synthesised
-`pyproject.toml` when any source file contains `model X:`. However when
-a project's `typhon.toml` has no `[dependencies]` section at all, the
-auto-inject can fail to surface (depends on the bootstrapping path
-taken). Reproduced in the round-2026-05-21 stress harness, which
-synthesises a fresh `typhon.toml` per case. Either tighten the detection
-path or document the requirement to declare at least an empty
-`[dependencies]` table for the auto-inject to fire.
 
 #### O14 — `unsafe:` value leak isn't caught *(#107)*
 
@@ -211,8 +200,6 @@ items:
    patterns; partial-fix machinery from R3.12 already in place.
 7. **O28 (pipe corner cases)** — lifting `|>` into expression
    position is a lexer-aware rewrite; tractable but invasive.
-8. **O13 (Pydantic auto-inject)** — tighten the detection path so
-   it fires even on bare `typhon.toml` projects.
 
 The remaining open items are smaller papercuts.
 
@@ -305,6 +292,14 @@ Branch: `claude/findings-documentation-review-HhuVH`.
 - **O9** — `type Handler = Callable[[Req], Resp]` is transparent
   on call.
 - **O11** — for-target rebind across loops in the same scope works.
+- **O13** — pydantic is auto-injected into the synthesised
+  pyproject.toml even when `typhon.toml` lacks an explicit
+  `[dependencies]` section. Re-ran every `model`-using fixture in
+  `stress/round-2026-05-21/` (06-api/{01,02,03}.ty,
+  04-ai-llm/{01,04}.ty) end-to-end through `uv sync` and CPython;
+  all five build and run cleanly. The original
+  "bootstrapping-path-dependent" failure isn't reproducible
+  against the current code.
 - **O18** — `__mul__(self, scalar: float)` resolves correctly
   against `a * 5.0`.
 - **O20** — comptime f-strings evaluate end-to-end
@@ -450,10 +445,8 @@ f-string), E10 (O11, for-rebind). Still open: E6 → **O19**, E9 →
 Filed B1–B14 (81 fresh `.ty` programs, 65/81 build + run clean; 7 real
 bugs surfaced). The May 21 findings sweep closed B1 (O3), B2 (O4),
 B3 (O6), B4 (O5), B5 (O2), B6 (O21), B7 (O22), B8 (O23), B10 (O10),
-B11 (O24), B12 (O25), B13 (O26). Still open:
-
-- B9 → **O12** (`tyc fmt`)
-- B14 → **O13** (Pydantic dep auto-inject)
+B11 (O24), B12 (O25), B13 (O26), and B14 (O13 — already-fixed). Only
+B9 (`tyc fmt`, **O12**) is still open from this round.
 
 Repro corpus + run script at `stress/round-2026-05-21/`. The
 intentionally-broken probes under `10-error-quality/` exist to validate
