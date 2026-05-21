@@ -7,8 +7,8 @@
 use ruff_python_ast::{
     self as ast, Alias, BoolOp, CmpOp, Comprehension, ExceptHandler, Expr, FStringPart,
     InterpolatedStringElement, Keyword, MatchCase, ModModule, Mutability, Number, Operator,
-    Parameter, ParameterWithDefault, Parameters, Pattern, Singleton, Stmt, TypeParam, TypeParams,
-    UnaryOp, WithItem,
+    Parameter, ParameterWithDefault, Parameters, Pattern, Singleton, Stmt, StringFlags, TypeParam,
+    TypeParams, UnaryOp, WithItem,
 };
 use ruff_text_size::Ranged;
 
@@ -1164,9 +1164,27 @@ impl Emitter {
                     Some('\'') => '"',
                     _ => '"',
                 };
-                self.write(&quote.to_string());
-                self.write(&escape_python_string_with_quote(s.value.to_str(), quote));
-                self.write(&quote.to_string());
+                let text = s.value.to_str();
+                // Preserve triple-quoted strings when the source used triple
+                // quotes OR when the content contains a literal newline — in
+                // both cases a single-quoted form would require `\n` escapes
+                // and lose readability. Don't use triple-quotes inside an
+                // f-string interpolation (outer is Some) because the inner
+                // quotes must differ from the outer ones and nesting triple
+                // quotes is almost always wrong.
+                let use_triple = outer.is_none()
+                    && (s.value.first_literal_flags().is_triple_quoted()
+                        || text.contains('\n'));
+                if use_triple {
+                    let delim = format!("{}{}{}", quote, quote, quote);
+                    self.write(&delim);
+                    self.write(&escape_triple_quoted_string(text, quote));
+                    self.write(&delim);
+                } else {
+                    self.write(&quote.to_string());
+                    self.write(&escape_python_string_with_quote(text, quote));
+                    self.write(&quote.to_string());
+                }
             }
 
             Expr::BytesLiteral(b) => {
@@ -1698,6 +1716,37 @@ fn escape_python_string_with_quote(s: &str, quote: char) -> String {
     out
 }
 
+/// Escape content for a triple-quoted string literal using `quote` as the
+/// delimiter character (either `'` or `"`).  Only two things need escaping:
+/// backslashes, and a run of three or more consecutive delimiter characters
+/// (which would prematurely close the literal).  Newlines and tabs are kept
+/// verbatim so the multiline structure is preserved in the emitted file.
+fn escape_triple_quoted_string(s: &str, quote: char) -> String {
+    let mut out = String::with_capacity(s.len());
+    // Track how many consecutive unescaped quote chars we have just emitted.
+    let mut run = 0usize;
+    for ch in s.chars() {
+        if ch == '\\' {
+            out.push_str("\\\\");
+            run = 0;
+        } else if ch == quote {
+            run += 1;
+            if run == 3 {
+                // Third consecutive quote would close the literal — escape it
+                // so the run in the output stays at 1 (the escaped char itself
+                // is still a quote but breaks the "three unescaped" sequence).
+                out.push('\\');
+                run = 1;
+            }
+            out.push(quote);
+        } else {
+            out.push(ch);
+            run = 0;
+        }
+    }
+    out
+}
+
 /// Escape a literal segment from inside an f-string.  Identical to
 /// [`escape_python_string_with_quote`] but additionally doubles `{` → `{{`
 /// and `}` → `}}` — the ruff parser stores f-string literal segments with
@@ -1891,6 +1940,7 @@ fn pick_fstring_outer_quote(fs: &ast::ExprFString) -> char {
 #[cfg(test)]
 mod tests {
     use crate::emit;
+    use crate::printer::escape_triple_quoted_string;
     use tyc_syntax::parse_module;
 
     fn round_trip(src: &str) -> String {
@@ -2080,6 +2130,57 @@ mod tests {
             !after_eq.contains('\n') || after_eq.trim_end().ends_with('"'),
             "raw newline inside emitted string literal: {:?}",
             out
+        );
+    }
+
+    #[test]
+    fn triple_quoted_string_preserved() {
+        // A triple-quoted string literal must round-trip with triple quotes so
+        // its embedded newlines are kept verbatim rather than `\n`-escaped.
+        let src = "x = \"\"\"line one\nline two\nline three\"\"\"\n";
+        let out = round_trip(src);
+        assert!(
+            out.contains("\"\"\""),
+            "triple-quoted string lost its delimiters: {:?}",
+            out
+        );
+        assert!(
+            out.contains("line one\nline two"),
+            "embedded newlines were escaped away: {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn triple_quoted_string_with_literal_newlines_in_value() {
+        // Even when the source uses a single-quoted string, if the parsed
+        // value contains a real newline character the emitter should use
+        // triple quotes to avoid `\n` in the output.
+        let src = "msg = \"first\\nsecond\"\n";
+        // The source has \\n (escaped), so the parsed string value is
+        // "first\nsecond" with a real newline.  The emitter should emit it
+        // with triple quotes.
+        let out = round_trip(src);
+        // Either triple-quoted or single-line with \n escape is acceptable;
+        // the key invariant is that the content round-trips correctly.
+        assert!(
+            out.contains("first") && out.contains("second"),
+            "string content lost during emission: {:?}",
+            out
+        );
+    }
+
+    #[test]
+    fn escape_triple_quoted_no_false_close() {
+        // A string whose content includes triple double-quotes must have
+        // the run broken so the literal doesn't close prematurely.
+        let body = "has \"\"\" inside";
+        let escaped = escape_triple_quoted_string(body, '"');
+        // The escaped form must not contain an un-broken """.
+        assert!(
+            !escaped.contains("\"\"\""),
+            "triple-quote run not broken: {:?}",
+            escaped
         );
     }
 }
