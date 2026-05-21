@@ -1463,7 +1463,10 @@ comptime let TITLE: str = f\"{APP} v{MAJOR}.{MINOR}\"
         // emit a string that disagrees with the runtime form.
         let src = "comptime let X: str = f\"{42:>5}\"\n";
         let (_, diags) = eval(src);
-        assert!(diags.has_errors(), "format spec should be rejected at comptime");
+        assert!(
+            diags.has_errors(),
+            "format spec should be rejected at comptime"
+        );
     }
 
     #[test]

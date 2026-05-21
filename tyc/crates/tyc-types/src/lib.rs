@@ -4519,10 +4519,8 @@ fn check_function(
                             // receiver carries the user-facing class
                             // name from the start.
                             Some(cls) => {
-                                let real = cls
-                                    .strip_prefix("__typhon_impl_")
-                                    .unwrap_or(cls)
-                                    .to_owned();
+                                let real =
+                                    cls.strip_prefix("__typhon_impl_").unwrap_or(cls).to_owned();
                                 Type::Class(real)
                             }
                             None => Type::Unknown,
@@ -5144,11 +5142,7 @@ fn pattern_covers_class(c: &Checker, pattern: &Pattern, class_name: &str) -> boo
                 if mc.arguments.patterns.len() != shape.field_order.len() {
                     return false;
                 }
-                return mc
-                    .arguments
-                    .patterns
-                    .iter()
-                    .all(is_capture_or_underscore);
+                return mc.arguments.patterns.iter().all(is_capture_or_underscore);
             }
             // Keyword-only class pattern — every field must be bound by
             // a pattern that is itself a capture / wildcard.
@@ -6046,8 +6040,8 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // and let the surrounding annotation drive
                     // assignability. The constructor arm below remains
                     // for project-local classes whose shape we know.
-                    let is_project_class = c.classes.iter().any(|n| n == &name)
-                        || c.class_shapes.contains_key(&name);
+                    let is_project_class =
+                        c.classes.iter().any(|n| n == &name) || c.class_shapes.contains_key(&name);
                     let func_is_class_name = matches!(
                         call.func.as_ref(),
                         Expr::Name(n) if c.classes.iter().any(|cn| cn == n.id.as_str())
