@@ -1173,8 +1173,7 @@ impl Emitter {
                 // quotes must differ from the outer ones and nesting triple
                 // quotes is almost always wrong.
                 let use_triple = outer.is_none()
-                    && (s.value.first_literal_flags().is_triple_quoted()
-                        || text.contains('\n'));
+                    && (s.value.first_literal_flags().is_triple_quoted() || text.contains('\n'));
                 if use_triple {
                     let delim = format!("{}{}{}", quote, quote, quote);
                     self.write(&delim);

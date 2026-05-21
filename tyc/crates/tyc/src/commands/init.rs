@@ -30,7 +30,7 @@ pub fn run(args: InitArgs) -> Result<()> {
             let project_name = canonical
                 .file_name()
                 .and_then(|n| n.to_str())
-                .unwrap_or_else(|| name.as_str())
+                .unwrap_or(name.as_str())
                 .to_owned();
             (canonical, project_name)
         }
@@ -288,7 +288,10 @@ mod tests {
         };
         run(args).unwrap();
         let project_dir = tmp.path().join("nested/path/myapp");
-        assert!(project_dir.join("typhon.toml").exists(), "typhon.toml missing");
+        assert!(
+            project_dir.join("typhon.toml").exists(),
+            "typhon.toml missing"
+        );
         let toml = std::fs::read_to_string(project_dir.join("typhon.toml")).unwrap();
         assert!(
             toml.contains("name = \"myapp\""),
