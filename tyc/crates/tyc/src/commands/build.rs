@@ -211,6 +211,34 @@ pub fn run(args: BuildArgs) -> Result<()> {
             .entry(dotted)
             .or_insert_with(|| extract_shapes_for_path(&path.display().to_string(), source));
     }
+    // Venv-introspection enrichment: shell to the project's Python
+    // and recover real signatures for every third-party class /
+    // function the project imports. Without this, calls like
+    // `Agent(name="x")` for a `class Agent(*, name, client, …)`
+    // would build clean and crash at runtime with `TypeError:
+    // missing 1 required positional argument: 'client'`. See
+    // `crate::venv_signatures` for the implementation and the
+    // allow-list rules. Skipped silently when no Python / venv is
+    // reachable — the worst case is the existing behaviour.
+    {
+        let project_module_set: std::collections::HashSet<String> = sources
+            .iter()
+            .map(|(path, _)| crate::commands::util::path_to_dotted(path, src_root))
+            .collect();
+        let allowed_top_level: std::collections::HashSet<String> = config
+            .dependencies
+            .keys()
+            .chain(config.dev_dependencies.keys())
+            .cloned()
+            .collect();
+        crate::venv_signatures::enrich_project_shapes_with_venv(
+            std::slice::from_ref(&src_dir),
+            &config_dir,
+            &project_module_set,
+            allowed_top_level,
+            &mut project_shapes,
+        );
+    }
     // Wrap the registry in `Arc` so each per-file `ExternalShapes`
     // snapshot is a cheap refcount bump instead of an O(modules)
     // clone. FINDINGS — copilot review of v0.2.0.
