@@ -1,0 +1,39 @@
+import math
+
+class Doc:
+    id: str
+    text: str
+    embedding: list[float]
+
+def cosine(a: list[float], b: list[float]) -> float:
+    mut dot: float = 0.0
+    mut na: float = 0.0
+    mut nb: float = 0.0
+    for i in range(len(a)):
+        dot = dot + a[i] * b[i]
+        na = na + a[i] * a[i]
+        nb = nb + b[i] * b[i]
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / (math.sqrt(na) * math.sqrt(nb))
+
+def search(docs: list[Doc], q: list[float], k: int) -> list[Doc]:
+    let scored: list[tuple[float, Doc]] = sorted(
+        [(cosine(q, d.embedding), d) for d in docs],
+        key=lambda x: -x[0],
+    )
+    return [s[1] for s in scored[:k]]
+
+def main() -> None:
+    let docs: list[Doc] = [
+        Doc(id="a", text="cats are lovely", embedding=[1.0, 0.0, 0.0]),
+        Doc(id="b", text="dogs are loyal", embedding=[0.0, 1.0, 0.0]),
+        Doc(id="c", text="cats and dogs", embedding=[0.7, 0.7, 0.0]),
+        Doc(id="d", text="fish swim", embedding=[0.0, 0.0, 1.0]),
+    ]
+    let q: list[float] = [0.9, 0.4, 0.1]
+    for d in search(docs, q, 2):
+        print(d.id, "::", d.text)
+
+if __name__ == "__main__":
+    main()

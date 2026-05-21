@@ -1,0 +1,56 @@
+type ValidationError = MissingField | BadType | OutOfRange
+
+class MissingField:
+    field: str
+
+class BadType:
+    field: str
+    expected: str
+
+class OutOfRange:
+    field: str
+    detail: str
+
+def validate_name(d: dict[str, object]) -> Result[str, ValidationError]:
+    let v: object? = d.get("name")
+    if v is None:
+        return Err(MissingField(field="name"))
+    if not isinstance(v, str):
+        return Err(BadType(field="name", expected="str"))
+    let s: str = v
+    if len(s) < 2 or len(s) > 30:
+        return Err(OutOfRange(field="name", detail="2-30 chars"))
+    return Ok(s)
+
+def validate_age(d: dict[str, object]) -> Result[int, ValidationError]:
+    let v: object? = d.get("age")
+    if v is None:
+        return Err(MissingField(field="age"))
+    if not isinstance(v, int):
+        return Err(BadType(field="age", expected="int"))
+    let n: int = v
+    if n < 0 or n > 130:
+        return Err(OutOfRange(field="age", detail="0-130"))
+    return Ok(n)
+
+model User:
+    name: str
+    age: int
+
+def build(d: dict[str, object]) -> Result[User, ValidationError]:
+    let name: str = validate_name(d)?
+    let age: int = validate_age(d)?
+    return Ok(User(name=name, age=age))
+
+def main() -> None:
+    let payloads: list[dict[str, object]] = [
+        {"name": "alice", "age": 30},
+        {"name": "x", "age": 30},
+        {"name": "bob", "age": "old"},
+        {"age": 25},
+    ]
+    for p in payloads:
+        print(build(p))
+
+if __name__ == "__main__":
+    main()

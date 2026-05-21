@@ -1,0 +1,15 @@
+def main() -> None:
+    let raw: bytes = b"hello"
+    let dec: str = raw.decode("utf-8")
+    let enc: bytes = dec.encode("utf-8")
+    print(dec, enc, raw == enc)
+
+    let big: bytes = bytes([0xDE, 0xAD, 0xBE, 0xEF])
+    print(big.hex())
+    print(int.from_bytes(big, byteorder="big"))
+
+    let parts: list[bytes] = raw.split(b"l")
+    print(parts)
+
+if __name__ == "__main__":
+    main()

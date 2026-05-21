@@ -1,0 +1,44 @@
+import math
+
+class Point frozen:
+    x: float
+    y: float
+    label: str
+
+@pure
+def distance(a: Point, b: Point) -> float:
+    let dx: float = a.x - b.x
+    let dy: float = a.y - b.y
+    return math.sqrt(dx * dx + dy * dy)
+
+def knn(train: list[Point], query: Point, k: int) -> str:
+    let dists: list[tuple[float, str]] = sorted(
+        [(distance(query, p), p.label) for p in train],
+        key=lambda t: t[0],
+    )
+    let nearest: list[str] = [d[1] for d in dists[:k]]
+    mut counts: dict[str, int] = {}
+    for lab in nearest:
+        counts[lab] = counts.get(lab, 0) + 1
+    mut best: str = ""
+    mut best_n: int = -1
+    for lab, n in counts.items():
+        if n > best_n:
+            best = lab
+            best_n = n
+    return best
+
+def main() -> None:
+    let train: list[Point] = [
+        Point(x=0.0, y=0.0, label="A"),
+        Point(x=0.2, y=0.1, label="A"),
+        Point(x=0.1, y=0.3, label="A"),
+        Point(x=5.0, y=5.0, label="B"),
+        Point(x=5.2, y=5.1, label="B"),
+        Point(x=4.8, y=4.9, label="B"),
+    ]
+    print(knn(train, Point(x=0.3, y=0.2, label="?"), 3))
+    print(knn(train, Point(x=5.1, y=5.0, label="?"), 3))
+
+if __name__ == "__main__":
+    main()

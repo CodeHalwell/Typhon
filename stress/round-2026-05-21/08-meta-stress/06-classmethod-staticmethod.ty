@@ -1,0 +1,26 @@
+class Counter:
+    count: int = 0
+    label: str = ""
+
+impl Counter:
+    @classmethod
+    def from_label(cls, label: str) -> "Counter":
+        return Counter(count=0, label=label)
+
+    @staticmethod
+    def banner() -> str:
+        return "==COUNTER=="
+
+    def tick(self) -> None:
+        self.count = self.count + 1
+
+def main() -> None:
+    let c: Counter = Counter.from_label("hello")
+    c.tick()
+    c.tick()
+    c.tick()
+    print(c.label, c.count)
+    print(Counter.banner())
+
+if __name__ == "__main__":
+    main()

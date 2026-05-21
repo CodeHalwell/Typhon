@@ -1,0 +1,32 @@
+import asyncio
+
+class Agent frozen:
+    name: str
+    skill: str
+
+impl Agent:
+    async def respond(self, prompt: str) -> str:
+        await asyncio.sleep(0.005)
+        return f"[{self.name}/{self.skill}] {prompt[:40]}"
+
+async def fan_out(agents: list[Agent], prompt: str) -> list[str]:
+    let tasks: list[object] = [a.respond(prompt) for a in agents]
+    let results: list[object] = await asyncio.gather(*tasks)
+    return [str(r) for r in results]
+
+async def main_async() -> None:
+    let agents: list[Agent] = [
+        Agent(name="alpha", skill="planning"),
+        Agent(name="beta", skill="research"),
+        Agent(name="gamma", skill="coding"),
+    ]
+    let prompt: str = "describe yourself in one phrase"
+    let replies: list[str] = await fan_out(agents, prompt)
+    for r in replies:
+        print(r)
+
+def main() -> None:
+    asyncio.run(main_async())
+
+if __name__ == "__main__":
+    main()

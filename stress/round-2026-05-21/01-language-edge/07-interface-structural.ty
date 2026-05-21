@@ -1,0 +1,34 @@
+interface Shape:
+    def area(self) -> float
+    def name(self) -> str
+
+class Circle:
+    radius: float
+
+impl Circle:
+    def area(self) -> float:
+        return 3.14159 * self.radius * self.radius
+
+    def name(self) -> str:
+        return "circle"
+
+class Square:
+    side: float
+
+impl Square:
+    def area(self) -> float:
+        return self.side * self.side
+
+    def name(self) -> str:
+        return "square"
+
+def describe(s: Shape) -> str:
+    return f"{s.name()}: {s.area():.2f}"
+
+def main() -> None:
+    let shapes: list[Shape] = [Circle(radius=3.0), Square(side=4.0)]
+    for sh in shapes:
+        print(describe(sh))
+
+if __name__ == "__main__":
+    main()

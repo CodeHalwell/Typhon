@@ -1,0 +1,21 @@
+import asyncio
+
+mut log: list[str] = []
+
+async def background_job(name: str, delay: float) -> None:
+    await asyncio.sleep(delay)
+    log.append(f"done {name}")
+
+async def main_async() -> None:
+    go background_job("a", 0.005)
+    go background_job("b", 0.005)
+    go background_job("c", 0.005) -> t
+    await t
+    await asyncio.sleep(0.05)
+    print(sorted(log))
+
+def main() -> None:
+    asyncio.run(main_async())
+
+if __name__ == "__main__":
+    main()

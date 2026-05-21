@@ -1,0 +1,42 @@
+model Request:
+    method: str
+    path: str
+
+model Response:
+    status: int
+    headers: dict[str, str]
+    body: str
+
+class Stack:
+    middlewares: list[Callable[[Request, Callable[[Request], Response]], Response]]
+    handler: Callable[[Request], Response]
+
+impl Stack:
+    def serve(self, req: Request) -> Response:
+        def chain(i: int, r: Request) -> Response:
+            if i >= len(self.middlewares):
+                return self.handler(r)
+            return self.middlewares[i](r, lambda nxt: chain(i + 1, nxt))
+        return chain(0, req)
+
+def cors(req: Request, nxt: Callable[[Request], Response]) -> Response:
+    let resp: Response = nxt(req)
+    resp.headers["access-control-allow-origin"] = "*"
+    return resp
+
+def logger(req: Request, nxt: Callable[[Request], Response]) -> Response:
+    print(f"[req] {req.method} {req.path}")
+    let resp: Response = nxt(req)
+    print(f"[res] {resp.status}")
+    return resp
+
+def root(req: Request) -> Response:
+    return Response(status=200, headers={"content-type": "text/plain"}, body=f"got {req.path}")
+
+def main() -> None:
+    let stack: Stack = Stack(middlewares=[logger, cors], handler=root)
+    let resp: Response = stack.serve(Request(method="GET", path="/hello"))
+    print(resp.status, resp.headers, resp.body)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,14 @@
+def main() -> None:
+    let pi: float = 3.14159265
+    let n: int = 42
+    print(f"{pi:.2f}")
+    print(f"{pi:>10.3f}")
+    print(f"{n:05d}")
+    print(f"{n:#x}")
+    print(f"{'left':<10}|{'right':>10}")
+    let name: str = "Typhon"
+    print(f"hello, {name=}")
+    print(f"pi = {pi=:.4f}")
+
+if __name__ == "__main__":
+    main()

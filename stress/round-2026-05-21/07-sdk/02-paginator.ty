@@ -1,0 +1,41 @@
+from collections.abc import Iterator
+
+class Page frozen:
+    items: tuple[int, ...]
+    cursor: str?
+
+class FakeApi:
+    pages: list[Page]
+    idx: dict[str, int]
+
+impl FakeApi:
+    def list(self, cursor: str?) -> Page:
+        let i: int = 0 if cursor is None else self.idx[cursor]
+        return self.pages[i]
+
+def paginate(api: FakeApi) -> Iterator[int]:
+    mut cursor: str? = None
+    mut done: bool = False
+    while not done:
+        let page: Page = api.list(cursor)
+        for item in page.items:
+            yield item
+        if page.cursor is None:
+            done = True
+        else:
+            cursor = page.cursor
+
+def main() -> None:
+    let api: FakeApi = FakeApi(
+        pages=[
+            Page(items=(1, 2, 3), cursor="a"),
+            Page(items=(4, 5, 6), cursor="b"),
+            Page(items=(7, 8, 9), cursor=None),
+        ],
+        idx={"a": 1, "b": 2},
+    )
+    let total: int = sum(paginate(api))
+    print(total)
+
+if __name__ == "__main__":
+    main()

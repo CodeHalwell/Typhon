@@ -1,0 +1,47 @@
+type ToolResult = Success | ToolError
+
+class Success:
+    output: str
+
+class ToolError:
+    message: str
+
+def tool_search(query: str) -> ToolResult:
+    if query == "":
+        return ToolError(message="empty query")
+    return Success(output=f"results for '{query}': [a, b, c]")
+
+def tool_calc(expr: str) -> ToolResult:
+    try:
+        let result: int = eval(expr, {"__builtins__": {}}, {})
+        return Success(output=str(result))
+    except Exception as e:
+        return ToolError(message=f"calc error: {e}")
+
+def dispatch(name: str, arg: str) -> ToolResult:
+    match name:
+        case "search":
+            return tool_search(arg)
+        case "calc":
+            return tool_calc(arg)
+        case _:
+            return ToolError(message=f"unknown tool {name}")
+
+def main() -> None:
+    let calls: list[tuple[str, str]] = [
+        ("search", "typhon"),
+        ("search", ""),
+        ("calc", "1+2*3"),
+        ("calc", "1/0"),
+        ("nope", "x"),
+    ]
+    for name, arg in calls:
+        let result: ToolResult = dispatch(name, arg)
+        match result:
+            case Success(output):
+                print(f"OK  {name}({arg}) => {output}")
+            case ToolError(message):
+                print(f"ERR {name}({arg}) => {message}")
+
+if __name__ == "__main__":
+    main()

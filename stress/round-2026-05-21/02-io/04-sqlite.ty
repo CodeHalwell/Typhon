@@ -1,0 +1,24 @@
+import sqlite3
+import tempfile
+import os
+
+def main() -> None:
+    let path: str = tempfile.mkstemp(suffix=".db")[1]
+    let conn = sqlite3.connect(path)
+    let cur = conn.cursor()
+    cur.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, score REAL)")
+    cur.executemany(
+        "INSERT INTO users(name, score) VALUES (?, ?)",
+        [("alice", 9.5), ("bob", 7.0), ("carol", 8.4)],
+    )
+    conn.commit()
+
+    cur.execute("SELECT name, score FROM users ORDER BY score DESC")
+    for row in cur.fetchall():
+        print(row)
+
+    conn.close()
+    os.remove(path)
+
+if __name__ == "__main__":
+    main()

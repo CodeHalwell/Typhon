@@ -1,0 +1,33 @@
+import asyncio
+
+async def fetch_a() -> int:
+    await asyncio.sleep(0.01)
+    return 1
+
+async def fetch_b() -> int:
+    await asyncio.sleep(0.01)
+    return 2
+
+async def fetch_c() -> int:
+    await asyncio.sleep(0.01)
+    return 3
+
+async def total() -> int:
+    gather:
+        a = fetch_a()
+        b = fetch_b()
+        c = fetch_c()
+    return a + b + c
+
+async def best_effort() -> str:
+    gather(strategy="best-effort"):
+        a = fetch_a()
+        b = fetch_b()
+    return f"{a} {b}"
+
+def main() -> None:
+    print(asyncio.run(total()))
+    print(asyncio.run(best_effort()))
+
+if __name__ == "__main__":
+    main()

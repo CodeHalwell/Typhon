@@ -1,0 +1,28 @@
+class Point:
+    x: float
+    y: float
+
+impl Point:
+    def magnitude(self) -> float:
+        return (self.x * self.x + self.y * self.y) ** 0.5
+
+impl Point:
+    def manhattan(self) -> float:
+        return abs(self.x) + abs(self.y)
+
+    def scale(self, k: float) -> "Point":
+        return Point(x=self.x * k, y=self.y * k)
+
+extend Point:
+    def origin_distance(self) -> float:
+        return self.magnitude()
+
+def main() -> None:
+    let p: Point = Point(x=3.0, y=4.0)
+    print(p.magnitude())
+    print(p.manhattan())
+    print(p.scale(2.0).magnitude())
+    print(p.origin_distance())
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,35 @@
+import time
+
+class! RateLimitError(Exception):
+    message: str
+
+class FlakyService:
+    calls: int = 0
+    fail_until: int = 3
+
+impl FlakyService:
+    def get(self, key: str) -> str:
+        self.calls = self.calls + 1
+        if self.calls < self.fail_until:
+            raise RateLimitError(message=f"rate limit on call {self.calls}")
+        return f"value-for-{key}"
+
+def fetch_with_retry(svc: FlakyService, key: str, max_retries: int) -> Result[str, str]:
+    mut attempt: int = 0
+    while attempt < max_retries:
+        try:
+            let v: str = svc.get(key)
+            return Ok(v)
+        except RateLimitError as e:
+            attempt = attempt + 1
+            time.sleep(0.001 * (2 ** attempt))
+    return Err(f"exhausted {max_retries} retries")
+
+def main() -> None:
+    let svc: FlakyService = FlakyService()
+    let r: Result[str, str] = fetch_with_retry(svc, "foo", 5)
+    print(r)
+    print("calls:", svc.calls)
+
+if __name__ == "__main__":
+    main()

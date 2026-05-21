@@ -1,0 +1,8 @@
+type JSON = None | bool | int | float | str | list[JSON] | dict[str, JSON]
+
+def main() -> None:
+    let v: JSON = {"a": 1, "b": [1, 2, 3]}
+    print(v)
+
+if __name__ == "__main__":
+    main()

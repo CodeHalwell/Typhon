@@ -1,0 +1,17 @@
+import time
+
+@memo
+def fib(n: int) -> int:
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+def main() -> None:
+    let t0: float = time.perf_counter()
+    let v: int = fib(100)
+    let t1: float = time.perf_counter()
+    print(v)
+    print(f"elapsed {(t1 - t0) * 1000:.2f} ms")
+
+if __name__ == "__main__":
+    main()

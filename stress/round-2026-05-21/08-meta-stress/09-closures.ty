@@ -1,0 +1,20 @@
+def make_counter() -> Callable[[], int]:
+    mut n: int = 0
+    def inc() -> int:
+        nonlocal n
+        n = n + 1
+        return n
+    return inc
+
+def make_adder(k: int) -> Callable[[int], int]:
+    return lambda x: x + k
+
+def main() -> None:
+    let c = make_counter()
+    print(c(), c(), c())
+
+    let add5 = make_adder(5)
+    print(add5(10), add5(100))
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,23 @@
+def f(n: int) -> int:
+    if n <= 0:
+        return 0
+    if n == 1:
+        return 1
+    if n < 5:
+        if n == 2:
+            return 2
+        if n == 3:
+            if True:
+                if True:
+                    return 3
+            return -1
+        return 4
+    let result: int = (((((n + 1) * 2) - 3) * 4) // 5) + 6
+    return result
+
+def main() -> None:
+    for i in range(10):
+        print(i, "=>", f(i))
+
+if __name__ == "__main__":
+    main()

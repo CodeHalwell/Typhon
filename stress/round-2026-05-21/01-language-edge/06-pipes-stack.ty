@@ -1,0 +1,23 @@
+def clean(s: str) -> str:
+    return s.strip().lower()
+
+def cap(s: str) -> str:
+    return s.upper()
+
+def banner(s: str) -> str:
+    return f"[{s}]"
+
+def main() -> None:
+    let r: str = "  hello world  " |> clean() |> cap() |> banner()
+    print(r)
+
+    let nums: list[int] = [1, 2, 3, 4, 5]
+    let total: int = nums |> sum()
+    print(total)
+
+    let pieces: list[str] = "a,b,c,d".split(",")
+    let joined: str = pieces |> ",".join()
+    print(joined)
+
+if __name__ == "__main__":
+    main()

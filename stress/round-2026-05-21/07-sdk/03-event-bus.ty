@@ -1,0 +1,40 @@
+class Event frozen:
+    name: str
+    payload: dict[str, object]
+
+class Bus:
+    subs: dict[str, list[Callable[[Event], None]]]
+
+impl Bus:
+    def on(self, name: str, handler: Callable[[Event], None]) -> None:
+        if name not in self.subs:
+            self.subs[name] = []
+        self.subs[name].append(handler)
+
+    def emit(self, ev: Event) -> int:
+        let hs: list[Callable[[Event], None]]? = self.subs.get(ev.name)
+        if hs is None:
+            return 0
+        for h in hs:
+            h(ev)
+        return len(hs)
+
+mut counter: int = 0
+
+def bump(ev: Event) -> None:
+    global counter
+    counter = counter + 1
+
+def main() -> None:
+    let bus: Bus = Bus(subs={})
+    bus.on("click", bump)
+    bus.on("click", lambda ev: print(f"click: {ev.payload}"))
+    bus.on("hover", bump)
+    bus.emit(Event(name="click", payload={"x": 1, "y": 2}))
+    bus.emit(Event(name="click", payload={"x": 9, "y": 9}))
+    bus.emit(Event(name="hover", payload={}))
+    bus.emit(Event(name="unknown", payload={}))
+    print("count:", counter)
+
+if __name__ == "__main__":
+    main()

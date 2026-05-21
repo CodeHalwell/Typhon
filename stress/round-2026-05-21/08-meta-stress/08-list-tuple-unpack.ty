@@ -1,0 +1,22 @@
+def split_pairs(xs: list[tuple[int, str]]) -> tuple[list[int], list[str]]:
+    mut ns: list[int] = []
+    mut ss: list[str] = []
+    for n, s in xs:
+        ns.append(n)
+        ss.append(s)
+    return (ns, ss)
+
+def head_tail(xs: list[int]) -> tuple[int, list[int]]:
+    let head, *tail = xs
+    return (head, list(tail))
+
+def main() -> None:
+    let pairs: list[tuple[int, str]] = [(1, "a"), (2, "b"), (3, "c")]
+    let ns, ss = split_pairs(pairs)
+    print(ns, ss)
+
+    let h, t = head_tail([10, 20, 30, 40])
+    print(h, t)
+
+if __name__ == "__main__":
+    main()

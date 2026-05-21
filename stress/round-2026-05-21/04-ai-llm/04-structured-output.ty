@@ -1,0 +1,33 @@
+import json
+
+model UserExtract:
+    name: str
+    age: int
+    interests: list[str]
+
+def parse(raw: str) -> Result[UserExtract, str]:
+    try:
+        let data: dict[str, object] = json.loads(raw)
+    except json.JSONDecodeError as e:
+        return Err(f"json: {e}")
+
+    unsafe:
+        let name: str = data["name"]
+        let age: int = data["age"]
+        let interests: list[str] = data["interests"]
+
+    try:
+        return Ok(UserExtract(name=name, age=age, interests=interests))
+    except Exception as e:
+        return Err(f"validation: {e}")
+
+def main() -> None:
+    let good: str = '{"name": "alice", "age": 30, "interests": ["python", "rust"]}'
+    let bad: str = '{"name": "bob", "age": "thirty", "interests": []}'
+    let busted: str = "not json"
+    for s in [good, bad, busted]:
+        let r: Result[UserExtract, str] = parse(s)
+        print(r)
+
+if __name__ == "__main__":
+    main()

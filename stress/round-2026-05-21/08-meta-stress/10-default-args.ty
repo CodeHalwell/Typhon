@@ -1,0 +1,25 @@
+def greet(name: str, greeting: str = "hello", punct: str = "!") -> str:
+    return f"{greeting}, {name}{punct}"
+
+def collect(*xs: int, scale: int = 1) -> int:
+    mut s: int = 0
+    for x in xs:
+        s = s + x
+    return s * scale
+
+def make_obj(name: str, **kwargs: object) -> dict[str, object]:
+    let d: dict[str, object] = {"name": name}
+    for k, v in kwargs.items():
+        d[k] = v
+    return d
+
+def main() -> None:
+    print(greet("world"))
+    print(greet("typhon", greeting="hi"))
+    print(greet("rust", greeting="hey", punct="?"))
+    print(collect(1, 2, 3, 4))
+    print(collect(1, 2, 3, 4, scale=10))
+    print(make_obj("x", a=1, b="two"))
+
+if __name__ == "__main__":
+    main()

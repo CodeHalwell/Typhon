@@ -1,0 +1,20 @@
+from collections.abc import Iterable, Iterator
+
+class Counter:
+    n: int
+
+impl Counter:
+    def __iter__(self) -> Iterator[int]:
+        mut i: int = 0
+        while i < self.n:
+            yield i
+            i = i + 1
+
+def main() -> None:
+    let c: Counter = Counter(n=5)
+    let xs: list[int] = list(c)
+    print(xs)
+    print(sum(c))
+
+if __name__ == "__main__":
+    main()

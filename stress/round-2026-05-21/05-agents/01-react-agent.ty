@@ -1,0 +1,50 @@
+type AgentEvent = Think | Act | Observe | Finish
+
+class Think:
+    thought: str
+
+class Act:
+    tool: str
+    arg: str
+
+class Observe:
+    result: str
+
+class Finish:
+    answer: str
+
+class Agent:
+    steps: list[AgentEvent]
+    max_steps: int
+
+impl Agent:
+    def run(self, goal: str) -> str:
+        mut current: str = goal
+        for i in range(self.max_steps):
+            self.steps.append(Think(thought=f"step {i}: working on {current}"))
+            if "sum" in current:
+                self.steps.append(Act(tool="calc", arg="1+2+3"))
+                self.steps.append(Observe(result="6"))
+                self.steps.append(Finish(answer="6"))
+                return "6"
+            current = current + "!"
+        self.steps.append(Finish(answer="give up"))
+        return "give up"
+
+def main() -> None:
+    let agent: Agent = Agent(steps=[], max_steps=5)
+    let answer: str = agent.run("sum 1 to 3")
+    print("final:", answer)
+    for ev in agent.steps:
+        match ev:
+            case Think(thought):
+                print("T:", thought)
+            case Act(tool, arg):
+                print(f"A: {tool}({arg})")
+            case Observe(result):
+                print("O:", result)
+            case Finish(answer=fa):
+                print("F:", fa)
+
+if __name__ == "__main__":
+    main()

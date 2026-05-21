@@ -1,0 +1,15 @@
+def main() -> None:
+    let lines: list[str] = ["1 2 3", "", "4 5", "  ", "6"]
+    mut total: int = 0
+    for line in lines:
+        if (s := line.strip()) != "":
+            for tok in s.split():
+                total = total + int(tok)
+    print(total)
+
+    let xs: list[int] = [1, 2, 3, 4, 5]
+    if (n := len(xs)) > 3:
+        print(f"len {n}")
+
+if __name__ == "__main__":
+    main()

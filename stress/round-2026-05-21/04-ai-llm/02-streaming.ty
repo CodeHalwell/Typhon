@@ -1,0 +1,19 @@
+from collections.abc import Iterator
+
+def stream_tokens(prompt: str) -> Iterator[str]:
+    let words: list[str] = prompt.split()
+    for w in words:
+        yield w + " "
+
+def consume(prompt: str) -> str:
+    mut out: str = ""
+    for tok in stream_tokens(prompt):
+        out = out + tok
+    return out.rstrip()
+
+def main() -> None:
+    let result: str = consume("the quick brown fox jumps over the lazy dog")
+    print(result)
+
+if __name__ == "__main__":
+    main()

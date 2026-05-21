@@ -1,0 +1,10 @@
+class Point:
+    x: float
+    y: float
+
+def main() -> None:
+    let p: Point = Point(x=1.0, y=2.0, z=3.0)
+    print(p)
+
+if __name__ == "__main__":
+    main()

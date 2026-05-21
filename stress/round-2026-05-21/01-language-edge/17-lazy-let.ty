@@ -1,0 +1,10 @@
+lazy let HEAVY: dict[str, int] = {f"k{i}": i * i for i in range(1000)}
+
+def main() -> None:
+    print("before access")
+    print(len(HEAVY))
+    print(HEAVY["k5"])
+    print("after access")
+
+if __name__ == "__main__":
+    main()

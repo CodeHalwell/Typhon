@@ -1,0 +1,21 @@
+class Node:
+    value: int
+    next: "Node?"
+
+def sum_list(head: Node?) -> int:
+    mut total: int = 0
+    mut cur: Node? = head
+    while cur is not None:
+        let n: Node = cur
+        total = total + n.value
+        cur = n.next
+    return total
+
+def main() -> None:
+    let c: Node = Node(value=3, next=None)
+    let b: Node = Node(value=2, next=c)
+    let a: Node = Node(value=1, next=b)
+    print(sum_list(a))
+
+if __name__ == "__main__":
+    main()

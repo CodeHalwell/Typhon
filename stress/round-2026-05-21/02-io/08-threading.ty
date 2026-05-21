@@ -1,0 +1,23 @@
+import threading
+
+mut counter: int = 0
+let lock: threading.Lock = threading.Lock()
+
+def worker(n: int) -> None:
+    global counter
+    for _ in range(n):
+        with lock:
+            counter = counter + 1
+
+def main() -> None:
+    let threads: list[threading.Thread] = [
+        threading.Thread(target=worker, args=(1000,)) for _ in range(4)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    print(counter)
+
+if __name__ == "__main__":
+    main()

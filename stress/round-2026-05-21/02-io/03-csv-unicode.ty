@@ -1,0 +1,23 @@
+import csv
+import io
+
+def main() -> None:
+    let rows: list[list[str]] = [
+        ["name", "city", "score"],
+        ["Aña", "São Paulo", "9.5"],
+        ["北京", "Beijing", "8.2"],
+        ["Müller", "Zürich", "7.7"],
+    ]
+    let buf: io.StringIO = io.StringIO()
+    let w = csv.writer(buf)
+    for r in rows:
+        w.writerow(r)
+    let blob: str = buf.getvalue()
+    print(blob)
+
+    let reader = csv.reader(io.StringIO(blob))
+    for row in reader:
+        print(row)
+
+if __name__ == "__main__":
+    main()

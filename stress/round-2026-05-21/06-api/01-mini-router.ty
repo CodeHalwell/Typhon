@@ -1,0 +1,39 @@
+model Request:
+    method: str
+    path: str
+    body: str = ""
+
+model Response:
+    status: int
+    body: str
+
+class Router:
+    routes: dict[str, Callable[[Request], Response]]
+
+impl Router:
+    def add(self, key: str, handler: Callable[[Request], Response]) -> None:
+        self.routes[key] = handler
+
+    def dispatch(self, req: Request) -> Response:
+        let key: str = f"{req.method} {req.path}"
+        let h: Callable[[Request], Response]? = self.routes.get(key)
+        if h is None:
+            return Response(status=404, body=f"no route: {key}")
+        return h(req)
+
+def hello(req: Request) -> Response:
+    return Response(status=200, body=f"hello {req.body}")
+
+def health(req: Request) -> Response:
+    return Response(status=200, body="ok")
+
+def main() -> None:
+    let r: Router = Router(routes={})
+    r.add("GET /hello", hello)
+    r.add("GET /health", health)
+    print(r.dispatch(Request(method="GET", path="/hello", body="world")))
+    print(r.dispatch(Request(method="GET", path="/health")))
+    print(r.dispatch(Request(method="POST", path="/missing")))
+
+if __name__ == "__main__":
+    main()
