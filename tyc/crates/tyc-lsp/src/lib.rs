@@ -19,8 +19,9 @@ use tower_lsp_server::ls_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     Documentation, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
     HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, Location,
-    MarkedString, MessageType, NumberOrString, OneOf, Position, Range, ServerCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
+    MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf, Position, Range,
+    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri,
+    WorkspaceEdit,
 };
 use tower_lsp_server::{jsonrpc, Client, LanguageServer, LspService, Server};
 use tyc_db::{
@@ -106,6 +107,19 @@ pub struct Backend {
     /// (or its text re-uploaded via `set_text`) before the cross-
     /// module shape map is assembled.
     project_files: Arc<Mutex<HashMap<std::path::PathBuf, HashMap<String, SourceFile>>>>,
+    /// Last document version we've already kicked off a venv-
+    /// introspection prewarm for, keyed by URI. Used to debounce
+    /// the per-keystroke prewarm: when the editor sends ten
+    /// `did_change` events in a row, only the first spawns the
+    /// background introspection task. Subsequent calls bail out as
+    /// soon as the version matches.
+    ///
+    /// Keyed by full URI string so two files in the same project
+    /// don't share state. `None` version is treated as "always run"
+    /// because `tower-lsp-server` reserves the unversioned shape
+    /// for the synthetic-open form (`source_file_for` injecting an
+    /// untracked file).
+    prewarmed_versions: Arc<Mutex<HashMap<String, i32>>>,
 }
 
 impl std::fmt::Debug for Backend {
@@ -276,7 +290,98 @@ impl Backend {
             }
         }
 
+        let uri_for_prewarm = uri.clone();
         self.client.publish_diagnostics(uri, out, version).await;
+
+        // Pre-warm the venv-introspection cache for every third-party
+        // import in the open document. Runs as a detached background
+        // task so it never blocks diagnostics publishing — by the
+        // time the user hovers a third-party symbol, the
+        // `cache.members(...)` call inside `hover_import_extras` hits
+        // a populated entry and returns in microseconds instead of
+        // shelling to Python.
+        //
+        // Debounced per-URI by the document version: the LSP fires
+        // a `did_change` on every keystroke, but we only need to
+        // re-walk the imports once per *content* change, and even
+        // then the cache lookups are idempotent. Without this gate
+        // a fast typist would queue dozens of `spawn_blocking` tasks
+        // before the first one had a chance to populate the cache.
+        self.spawn_introspection_prewarm(uri_for_prewarm, version)
+            .await;
+    }
+
+    /// Spawn a detached task that introspects every third-party
+    /// import in the document at `uri`, populating the cache so
+    /// later hover requests don't have to wait on a subprocess.
+    ///
+    /// Debounced via `prewarmed_versions`: when the editor sends
+    /// many `did_change` events in rapid succession, only the first
+    /// for each unique version spawns a new task. Subsequent calls
+    /// at the same version short-circuit at the version check.
+    async fn spawn_introspection_prewarm(&self, uri: Uri, version: Option<i32>) {
+        // Version-based debounce. `None` means an untracked open
+        // (rare; the synthetic-document path), in which case we run
+        // unconditionally — there's no version to dedupe against.
+        if let Some(v) = version {
+            let uri_str = uri.as_str().to_owned();
+            let mut versions = self.prewarmed_versions.lock().await;
+            if versions.get(&uri_str) == Some(&v) {
+                return;
+            }
+            versions.insert(uri_str, v);
+        }
+        let Some(sf) = self.source_file_for(&uri).await else {
+            return;
+        };
+        let resolved = {
+            let db = self.db.lock().await;
+            resolved_module_arc(&*db, sf)
+        };
+        // Collect dotted module names referenced through import
+        // bindings in the module's top-level scope. Skip relative
+        // imports (resolver writes them as `.` / `..foo`) — those are
+        // project-local and don't go through venv introspection.
+        let mut modules: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Some(scope0) = resolved.scopes.first() {
+            for binding in &scope0.bindings {
+                if let Some(info) = &binding.import_info {
+                    if info.module.starts_with('.') || info.module.is_empty() {
+                        continue;
+                    }
+                    modules.insert(info.module.clone());
+                }
+            }
+        }
+        if modules.is_empty() {
+            return;
+        }
+        let Some((root, cache)) = self.introspection_cache_for(&uri).await else {
+            return;
+        };
+        tokio::task::spawn_blocking(move || {
+            // Sort for determinism — same warm order on every open
+            // makes log output easier to read when debugging cold
+            // hovers, and stable cache-insert order pins cross-test
+            // expectations.
+            let mut modules: Vec<String> = modules.into_iter().collect();
+            modules.sort();
+            for module in modules {
+                // Recover from a poisoned cache rather than aborting
+                // the rest of the warmup. A panic during a previous
+                // introspection shouldn't permanently disable
+                // hover-extras for every subsequent module.
+                let mut guard = match cache.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                // `members()` is idempotent — already-cached entries
+                // (success *or* failure) short-circuit; only the
+                // first call per module per session pays the
+                // subprocess cost.
+                let _ = guard.members(&root, &module);
+            }
+        });
     }
 }
 
@@ -340,6 +445,13 @@ impl LanguageServer for Backend {
             let mut docs = self.documents.lock().await;
             docs.remove(&uri_str);
         }
+        {
+            // Drop the per-document debounce entry so reopening the
+            // file re-runs the prewarm (the venv may have changed
+            // between open / close / reopen via `uv sync`).
+            let mut versions = self.prewarmed_versions.lock().await;
+            versions.remove(&uri_str);
+        }
         self.evict_resolved_cache(&uri_str).await;
         self.client.publish_diagnostics(uri, Vec::new(), None).await;
     }
@@ -362,13 +474,33 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        let body = render_hover(&symbol);
+        // Build the base hover body (kind + name + declaration-site
+        // marker) from the resolver's view of the symbol. When the
+        // symbol points at a third-party import, enrich it with the
+        // package's real signature + docstring recovered through the
+        // venv introspection cache — this is the "what is this
+        // thing?" preview the user expects when hovering a foreign
+        // class or function. Project / stdlib symbols fall through to
+        // the base body unchanged.
+        //
+        // Rendered as `MarkupContent { kind: Markdown, … }` so the
+        // editor formats fenced code blocks, italics, and headings
+        // properly. `MarkedString::String` (the older shape) is
+        // treated as plain text by most clients including VS Code.
+        let mut body = render_hover(&symbol);
+        if let Some(import_extras) = self.hover_import_extras(&uri, &symbol).await {
+            body.push_str("\n\n");
+            body.push_str(&import_extras);
+        }
         let range = Some(Range {
             start: byte_to_position(&preprocessed, symbol.span.0),
             end: byte_to_position(&preprocessed, symbol.span.1),
         });
         Ok(Some(Hover {
-            contents: HoverContents::Scalar(MarkedString::String(body)),
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: body,
+            }),
             range,
         }))
     }
@@ -652,6 +784,91 @@ impl Backend {
     async fn source_file_for(&self, uri: &Uri) -> Option<SourceFile> {
         let docs = self.documents.lock().await;
         docs.get(uri.as_str()).copied()
+    }
+
+    /// Render the import-specific addition to a hover body: the
+    /// declared module path, the recovered signature (in a fenced
+    /// `python` code block), and the runtime docstring. Returns
+    /// `None` when the symbol isn't an import, when no `typhon.toml`
+    /// ancestor anchors a venv, or when introspection failed (no
+    /// Python on PATH, import-time error, timeout) — the hover falls
+    /// back to the base body in those cases.
+    ///
+    /// The lookup runs the same introspection cache that powers
+    /// completion (`venv_introspect`), so the data is shared and the
+    /// per-module subprocess fires at most once per session.
+    /// `check_and_publish` pre-warms the cache for every third-party
+    /// import in the open document, so the typical hover hits a
+    /// fully-populated entry without spawning a subprocess.
+    async fn hover_import_extras(
+        &self,
+        uri: &Uri,
+        symbol: &tyc_resolve::SymbolAtOffset<'_>,
+    ) -> Option<String> {
+        let def = symbol.definition?;
+        let import_info = def.import_info.as_ref()?;
+        let (root, cache) = self.introspection_cache_for(uri).await?;
+        // `from M import N` → look up member `N` on module `M`.
+        // `import M` / `import M as N` → no specific member; we just
+        //   surface the module path so the hover still has *some*
+        //   context. Fetching the module's full member list for the
+        //   bare-import case isn't useful without a name to look up.
+        let members = if import_info.member.is_some() {
+            // Move the blocking introspection off the async runtime —
+            // the sync `Mutex::lock` + potential subprocess spawn
+            // inside `members()` would otherwise stall the LSP if the
+            // cache happened to be cold (the prewarm pass mostly
+            // prevents this, but we keep the off-runtime hop as a
+            // safety net).
+            let module = import_info.module.clone();
+            let root = root.clone();
+            tokio::task::spawn_blocking(move || {
+                // Recover from a poisoned mutex rather than silently
+                // disabling hover extras for the rest of the session.
+                // A poisoned cache still has valid `MemberInfo`
+                // entries from any prior successful introspection;
+                // the completion path uses the same recovery shape.
+                let mut guard = match cache.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+                guard.members(&root, &module)
+            })
+            .await
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+        let target_name = import_info.member.as_deref().unwrap_or("");
+        let mut out = String::new();
+        out.push_str(&format!("📦 from `{}`", import_info.module));
+        if !target_name.is_empty() {
+            if let Some(member) = members
+                .as_ref()
+                .and_then(|ms| ms.iter().find(|m| m.name == target_name))
+            {
+                let kind_label = match member.kind.as_str() {
+                    "class" => "class",
+                    "function" => "function",
+                    "module" => "submodule",
+                    _ => "value",
+                };
+                out.push_str(&format!(" — *{}*", kind_label));
+                if let Some(sig) = &member.signature {
+                    out.push_str(&format!(
+                        "\n\n```python\n{}{}\n```",
+                        target_name,
+                        sig_tail(sig, target_name)
+                    ));
+                }
+                if let Some(doc) = &member.documentation {
+                    out.push_str("\n\n");
+                    out.push_str(&render_docstring(doc));
+                }
+            }
+        }
+        Some(out)
     }
 
     /// Locate `uri`'s project root (walking upward for `typhon.toml`)
@@ -1637,6 +1854,7 @@ pub fn run_stdio(log_level: LogLevel) {
             introspection: Arc::new(Mutex::new(HashMap::new())),
             project_indexes: Arc::new(Mutex::new(HashMap::new())),
             project_files: Arc::new(Mutex::new(HashMap::new())),
+            prewarmed_versions: Arc::new(Mutex::new(HashMap::new())),
         });
         Server::new(stdin, stdout, socket).serve(service).await;
     });
@@ -2373,6 +2591,73 @@ fn render_hover(symbol: &SymbolAtOffset<'_>) -> String {
     format!("**{}** — *{}*{}", def.name, kind, suffix)
 }
 
+/// Render a Python docstring for inclusion in an LSP hover. Strips
+/// the common leading-whitespace indent (PEP 257), trims surrounding
+/// blank lines, and caps the result so a 500-line module-level
+/// docstring doesn't blow up the hover popover. Markdown-renders
+/// naturally because the LSP client treats the value as Markdown.
+fn render_docstring(doc: &str) -> String {
+    // Compute the minimum leading-whitespace indent across non-blank
+    // lines (skipping the first line, which is conventionally on the
+    // opening triple-quote and has zero leading indent regardless).
+    let common_indent: usize = doc
+        .lines()
+        .skip(1)
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.chars().take_while(|c| *c == ' ' || *c == '\t').count())
+        .min()
+        .unwrap_or(0);
+    let stripped: Vec<String> = doc
+        .lines()
+        .enumerate()
+        .map(|(i, line)| {
+            if i == 0 {
+                line.trim_end().to_owned()
+            } else if line.len() >= common_indent {
+                line[common_indent..].trim_end().to_owned()
+            } else {
+                line.trim_end().to_owned()
+            }
+        })
+        .collect();
+    let trimmed: Vec<&str> = {
+        let first = stripped.iter().position(|line| !line.is_empty());
+        let last = stripped.iter().rposition(|line| !line.is_empty());
+        // When there's no non-blank line, return the empty slice
+        // (rather than the full all-blank one) — caller treats the
+        // docstring as effectively absent.
+        match (first, last) {
+            (Some(start), Some(end)) => stripped[start..=end].iter().map(|s| s.as_str()).collect(),
+            _ => Vec::new(),
+        }
+    };
+    // Cap the docstring so a multi-thousand-line module-level docstring
+    // (numpy.array has one of these) doesn't flood the popover. 40
+    // lines + a `…` continuation marker is enough for the use-case
+    // (a quick "what does this do" preview).
+    const MAX_LINES: usize = 40;
+    if trimmed.len() <= MAX_LINES {
+        trimmed.join("\n")
+    } else {
+        let mut out = trimmed[..MAX_LINES].join("\n");
+        out.push_str("\n\n*…(docstring truncated; run `help()` for full text)*");
+        out
+    }
+}
+
+/// `inspect.signature(obj)` returns the pretty form `(arg1, arg2=…)`,
+/// which the Python helper script prepends with `name`. When the name
+/// has been stitched on for completion / hover purposes but we want
+/// the parenthesised tail on its own (so the code-block reads as a
+/// proper Python signature), peel off the leading identifier.
+///
+/// Defensive: if the signature doesn't start with the target name,
+/// return it unchanged — the script may have returned an unfamiliar
+/// shape for C extensions or stub-less builtins.
+fn sig_tail<'a>(sig: &'a str, name: &str) -> &'a str {
+    sig.strip_prefix(name).unwrap_or(sig)
+}
+
 /// Convert an LSP `Position` (line + UTF-16 column) to a byte offset.
 /// Out-of-range positions clamp to the end of the document.
 fn position_to_byte(source: &str, position: Position) -> usize {
@@ -2578,6 +2863,76 @@ mod tests {
             character: 0,
         };
         assert_eq!(position_to_byte(src, pos), 6);
+    }
+
+    #[test]
+    fn render_docstring_strips_pep257_indent() {
+        // Python docstring with the typical 4-space indent on
+        // continuation lines. Renderer should produce a flat
+        // multi-line string with the indent removed and surrounding
+        // blank lines trimmed.
+        let doc = "Build a new Agent.\n\n    Args:\n        name: human-readable label.\n        client: the LLM client to call.\n    ";
+        let out = render_docstring(doc);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "Build a new Agent.");
+        assert_eq!(lines[1], "");
+        assert_eq!(lines[2], "Args:");
+        assert_eq!(lines[3], "    name: human-readable label.");
+        assert_eq!(lines[4], "    client: the LLM client to call.");
+        // Trailing blank line trimmed.
+        assert_eq!(lines.len(), 5);
+    }
+
+    #[test]
+    fn render_docstring_truncates_at_40_lines() {
+        // A pathological multi-thousand-line docstring (numpy.array
+        // ships one of these) must not flood the hover popover.
+        let mut doc = String::new();
+        for i in 0..200 {
+            doc.push_str(&format!("line {i}\n"));
+        }
+        let out = render_docstring(&doc);
+        assert!(out.contains("line 0"), "first line preserved");
+        assert!(out.contains("line 39"), "last kept line preserved");
+        assert!(!out.contains("line 40"), "first dropped line absent");
+        assert!(
+            out.contains("docstring truncated"),
+            "truncation marker present: {out}"
+        );
+    }
+
+    #[test]
+    fn render_docstring_handles_first_line_only() {
+        let out = render_docstring("Add two numbers.");
+        assert_eq!(out, "Add two numbers.");
+    }
+
+    #[test]
+    fn render_docstring_empty_input_is_empty() {
+        // The Python script returns `None` for empty docstrings, but
+        // the helper has to be defensive against an explicit empty
+        // string sneaking through (e.g. `__doc__ = ""`).
+        assert_eq!(render_docstring(""), "");
+        assert_eq!(render_docstring("   \n  \n  "), "");
+    }
+
+    #[test]
+    fn sig_tail_strips_leading_name() {
+        // `inspect.signature(Cls)` returns `(arg1, arg2=…)`; the
+        // Python script prefixes the class name so completions read
+        // as a full signature. For the code-block in hover we want
+        // the parenthesised tail alone.
+        assert_eq!(
+            sig_tail("Agent(*, name, client)", "Agent"),
+            "(*, name, client)"
+        );
+    }
+
+    #[test]
+    fn sig_tail_passes_through_unknown_shape() {
+        // C extensions with unusual signature pretty-printing
+        // shouldn't be mangled by the prefix strip.
+        assert_eq!(sig_tail("[built-in]", "Agent"), "[built-in]");
     }
 
     #[test]

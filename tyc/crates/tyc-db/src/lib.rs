@@ -1183,8 +1183,12 @@ let c: ApiClient = ApiClient(base_url=\"https://api.example.com\")
         let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
         assert!(diags.has_errors(), "cross-module ctor must error");
         let msg = format!("{}", diags.errors()[0]);
+        // 0.2.3 swapped the count-based message for the named-missing
+        // diagnostic when we can identify which field wasn't filled.
         assert!(
-            msg.contains("ApiClient") && msg.contains("wrong number of arguments"),
+            msg.contains("ApiClient")
+                && msg.contains("missing required argument")
+                && msg.contains("api_key"),
             "got: {msg}"
         );
     }
@@ -1230,7 +1234,15 @@ def f() -> None:
         let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
         assert!(diags.has_errors(), "cross-module method arity must error");
         let msg = format!("{}", diags.errors()[0]);
-        assert!(msg.contains("url") && msg.contains("wrong number of arguments"));
+        // 0.2.3: when we can name the missing parameter (here `path`),
+        // the dedicated `missing_argument` diagnostic fires instead of
+        // the count-based `arg_count` form.
+        assert!(
+            msg.contains("url")
+                && msg.contains("missing required argument")
+                && msg.contains("path"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -1299,8 +1311,13 @@ def f() -> None:
         let diags = check_file_with_imports(&mut db, "main.ty".into(), main.into(), &registry);
         assert!(diags.has_errors(), "bare-import dotted ctor must error");
         let msg = format!("{}", diags.errors()[0]);
+        // 0.2.3: named-missing diagnostic. The class name is
+        // module-qualified (`clients.ApiClient`) so multiple imports
+        // exposing `ApiClient` remain disambiguated.
         assert!(
-            msg.contains("ApiClient") && msg.contains("wrong number of arguments"),
+            msg.contains("ApiClient")
+                && msg.contains("missing required argument")
+                && msg.contains("api_key"),
             "got: {msg}"
         );
     }

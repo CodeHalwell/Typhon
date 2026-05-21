@@ -168,12 +168,22 @@ def kind_of(obj):
         return "function"
     return "value"
 
-def first_doc_line(obj):
+def doc_of(obj):
+    """Return the object's full docstring, capped at 4 KB so the LSP
+    payload stays small. The Rust side strips PEP 257 indentation
+    and renders it as Markdown — we don't pre-process here so future
+    UI work (e.g. linking back to the source line) has the raw
+    text to work with.
+    """
     doc = getattr(obj, "__doc__", None)
     if not doc:
         return None
-    line = doc.strip().split("\n", 1)[0].strip()
-    return line[:200] if line else None
+    doc = doc.strip("\n")
+    if not doc:
+        return None
+    if len(doc) > 4096:
+        doc = doc[:4096] + "\n…(truncated)"
+    return doc
 
 def signature_of(name, obj):
     try:
@@ -181,7 +191,7 @@ def signature_of(name, obj):
     except (TypeError, ValueError):
         return None
     text = f"{name}{sig}"
-    return text if len(text) <= 200 else None
+    return text if len(text) <= 400 else None
 
 def main():
     if len(sys.argv) < 2:
@@ -205,7 +215,7 @@ def main():
             "name": name,
             "kind": kind_of(obj),
             "signature": signature_of(name, obj),
-            "documentation": first_doc_line(obj),
+            "documentation": doc_of(obj),
         })
     print(json.dumps(out))
 
