@@ -1995,6 +1995,13 @@ fn strip_field_defaults(body: &mut [Stmt]) {
 /// positional parameter from preceding a non-default one, so we
 /// stable-partition the field list to keep the generated signature
 /// valid. Relative order within each group is preserved.
+///
+/// When the body has *no* annotated fields (e.g. `class! AppError(Exception):
+/// pass`), the generated signature is `def __init__(self, *args, **kwargs)
+/// -> None: super().__init__(*args, **kwargs)`. This is the conventional
+/// shape for `Exception` subclasses — `raise AppError("oops")` must reach
+/// `Exception.__init__("oops")` — and works for any other framework base
+/// whose constructor accepts positional or keyword arguments.
 fn synthesise_raw_class_init(body: &[Stmt]) -> Stmt {
     use ruff_python_ast::{StmtAnnAssign, StmtFunctionDef};
     // Collect (name, annotation, optional default) for each top-level
@@ -2017,6 +2024,51 @@ fn synthesise_raw_class_init(body: &[Stmt]) -> Stmt {
             None
         })
         .collect();
+
+    // No annotated fields → emit a `super()`-passthrough so positional and
+    // keyword arguments reach the parent constructor unchanged.
+    if raw_fields.is_empty() {
+        return Stmt::FunctionDef(StmtFunctionDef {
+            node_index: AtomicNodeIndex::NONE,
+            range: TextRange::default(),
+            is_async: false,
+            decorator_list: Vec::new(),
+            name: make_identifier("__init__"),
+            type_params: None,
+            parameters: Box::new(Parameters {
+                range: TextRange::default(),
+                node_index: AtomicNodeIndex::NONE,
+                posonlyargs: Vec::new(),
+                args: vec![ParameterWithDefault {
+                    range: TextRange::default(),
+                    node_index: AtomicNodeIndex::NONE,
+                    parameter: Parameter {
+                        range: TextRange::default(),
+                        node_index: AtomicNodeIndex::NONE,
+                        name: make_identifier("self"),
+                        annotation: None,
+                    },
+                    default: None,
+                }],
+                vararg: Some(Box::new(Parameter {
+                    range: TextRange::default(),
+                    node_index: AtomicNodeIndex::NONE,
+                    name: make_identifier("args"),
+                    annotation: None,
+                })),
+                kwonlyargs: Vec::new(),
+                kwarg: Some(Box::new(Parameter {
+                    range: TextRange::default(),
+                    node_index: AtomicNodeIndex::NONE,
+                    name: make_identifier("kwargs"),
+                    annotation: None,
+                })),
+            }),
+            returns: Some(Box::new(make_none_expr())),
+            body: vec![make_super_init_passthrough_stmt()],
+        });
+    }
+
     // Stable partition: non-defaulted params first, then defaulted ones.
     let (no_default, with_default): (Vec<_>, Vec<_>) = raw_fields
         .iter()
@@ -2116,6 +2168,60 @@ fn make_super_init_call_stmt() -> Stmt {
             node_index: AtomicNodeIndex::NONE,
             args: Box::new([]),
             keywords: Box::new([]),
+        },
+    });
+    Stmt::Expr(StmtExpr {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        value: Box::new(call),
+    })
+}
+
+/// `super().__init__(*args, **kwargs)` as an expression statement.
+/// Used when a `class!` body has no annotated fields, so positional and
+/// keyword arguments must reach the parent constructor unchanged — the
+/// shape `Exception("msg")` and similar framework bases rely on.
+fn make_super_init_passthrough_stmt() -> Stmt {
+    use ruff_python_ast::{ExprStarred, StmtExpr};
+    let super_call = Expr::Call(ExprCall {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        func: Box::new(make_bare_name_expr("super")),
+        arguments: Arguments {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            args: Box::new([]),
+            keywords: Box::new([]),
+        },
+    });
+    let super_init = Expr::Attribute(ExprAttribute {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        value: Box::new(super_call),
+        attr: make_identifier("__init__"),
+        ctx: ExprContext::Load,
+    });
+    let starred_args = Expr::Starred(ExprStarred {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        value: Box::new(make_bare_name_expr("args")),
+        ctx: ExprContext::Load,
+    });
+    let kwargs_kw = Keyword {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        arg: None,
+        value: make_bare_name_expr("kwargs"),
+    };
+    let call = Expr::Call(ExprCall {
+        node_index: AtomicNodeIndex::NONE,
+        range: TextRange::default(),
+        func: Box::new(super_init),
+        arguments: Arguments {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            args: Box::new([starred_args]),
+            keywords: Box::new([kwargs_kw]),
         },
     });
     Stmt::Expr(StmtExpr {

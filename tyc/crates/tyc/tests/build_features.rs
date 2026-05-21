@@ -1365,6 +1365,47 @@ fn raw_class_without_base_keeps_field_defaults() {
     );
 }
 
+#[test]
+fn raw_class_with_base_no_fields_synthesises_passthrough_init() {
+    // The conventional `class! AppError(Exception): pass` shape must
+    // synthesise a `super()`-passthrough constructor so that
+    // `raise AppError("boom")` reaches `Exception.__init__("boom")`.
+    // Without it, the generated `__init__(self)` would reject the
+    // positional argument.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "class! AppError(Exception):\n\
+         \x20   pass\n\
+         \n\
+         def main() -> None:\n\
+         \x20   try:\n\
+         \x20       raise AppError(\"boom\")\n\
+         \x20   except AppError as e:\n\
+         \x20       assert str(e) == \"boom\", f\"got: {e!r}\"\n\
+         \n\
+         if __name__ == \"__main__\":\n\
+         \x20   main()\n",
+    );
+    // `build_and_run_main` skips cleanly on hosts without a 3.12+
+    // Python on PATH (which is how every other test in this file
+    // guards its execution step) and uses the resolved interpreter
+    // rather than hard-coded `python`, so CI on systems where only
+    // `python3` exists still passes.
+    let Some(_) = build_and_run_main(tmp.path()) else {
+        return;
+    };
+    let out = std::fs::read_to_string(tmp.path().join("build/main.py")).unwrap();
+    assert!(
+        out.contains("def __init__(self, *args, **kwargs) -> None:"),
+        "fieldless `class!` with a base should synthesise a *args/**kwargs init; got:\n{out}",
+    );
+    assert!(
+        out.contains("super().__init__(*args, **kwargs)"),
+        "synthesised passthrough init must forward to super; got:\n{out}",
+    );
+}
+
 // ── pyproject.toml bootstrap on `tyc build` ────────────────────────────────
 
 #[test]
