@@ -34,8 +34,8 @@ SDK patterns, perf, and intentionally-broken diagnostic probes. Roughly
 | 2026-05-19 | `claude/test-typhon-library-rNIYC` | #57–#127 | all but the deferred items closed in `review-findings-fixes-VRFJy` / `resolve-open-findings-UDZfv` |
 | 2026-05-20 | `claude/test-typhon-library-ejNr5` | R3.1–R3.18 | closed in `resolve-open-findings-v6t65` except `tyc fmt` and `?` in sub-expr |
 | 2026-05-20 exploration | `claude/typhon-exploration-testing-LZezp` | E1–E11 | closed except E6, E9, E11 |
-| 2026-05-21 | `claude/tender-hawking-LLhuR` | B1–B14 | closed B1–B7, B12; B8–B11, B13, B14 still open |
-| 2026-05-21 findings sweep | `claude/findings-documentation-review-HhuVH` | — | closed O2/O3/O4/O5/O6/O21/O22/O25; verified-fixed O1/O7/O8/O9/O11/O18/O20 |
+| 2026-05-21 | `claude/tender-hawking-LLhuR` | B1–B14 | closed B1–B7, B10, B12, B13; B8, B9, B11, B14 still open |
+| 2026-05-21 findings sweep | `claude/findings-documentation-review-HhuVH` | — | closed O2/O3/O4/O5/O6/O10/O21/O22/O25/O26; verified-fixed O1/O7/O8/O9/O11/O18/O20 |
 
 **Pass rate trend** on the canonical example suite (`examples/01-…46-…`):
 20/47 → 39/47 → 46/46 → 46/46. The examples now build and run end-to-end
@@ -52,25 +52,6 @@ documented happy path), **HIGH** (documented feature unusable),
 docs).
 
 ### MEDIUM — workable but rough
-
-#### O10 — Pattern-binding names collide with outer `let` bindings *(B10)*
-
-Repro: `stress/round-2026-05-21/08-meta-stress/15-pattern-name-scope.ty`,
-`05-agents/01-react-agent.ty` (initial form).
-
-```python
-let value: int = 99
-match b:
-    case Wrap(value):              # tyc::immutable_assign
-        print(value)
-```
-
-Pattern variables in `case Foo(name):` are conceptually new bindings,
-not re-assignments. Treating them as the same name as an enclosing
-`let` is consistent with Rule-2 / function scope but every
-Rust/OCaml/Scala programmer expects pattern bindings to introduce fresh
-names. Either (a) introduce a per-`case` scope, or (b) upgrade the
-diagnostic to `tyc::pattern_shadows_outer` with a clear rename hint.
 
 #### O12 — `tyc fmt` is a near-no-op *(B9, R3.15, #18, #65, #122)*
 
@@ -192,15 +173,6 @@ and `tyc run --compile` to diverge in stdout, which the `tyc-vm` doc
 explicitly warns about, but worth surfacing for screenshot-driven
 docs and test fixtures.
 
-#### O26 — REPL prompt prints stacked `>>>` on empty / pasted multi-line input *(B13)*
-
-```
->>> >>> >>> 6
-```
-
-The block-end-on-blank-line behaviour is documented but the prompt
-state makes a paste look broken.
-
 #### O27 — Sequence pattern `[a, b]` emits as tuple pattern `(a, b)` *(#111)*
 
 PEP 634 makes these semantically identical (both match any sequence)
@@ -247,24 +219,24 @@ items:
 2. **O16 (Protocol vs built-ins)** — once built-ins carry their
    dunder shape in the registry, every structural-typed library
    call site benefits (`len`, `iter`, `enter`, `exit`).
-3. **O10 (pattern shadowing)** — pick one of (per-`case` scope,
-   `tyc::pattern_shadows_outer` rename hint) and commit. Per-case
-   scope is the smaller surface change.
-4. **O12 (`tyc fmt`)** — pick three rules (no-space-before-colon,
+3. **O12 (`tyc fmt`)** — pick three rules (no-space-before-colon,
    single-space-around-`=`/`+`, two-blank-lines before top-level
    defs). Anything is better than today.
-5. **O17 (`?` in sub-expression)** — lifting `Ok(f(x)?)` is the
+4. **O17 (`?` in sub-expression)** — lifting `Ok(f(x)?)` is the
    natural Rust-style form. The desugar pass already has the
-   temp-lifting machinery.
-6. **O14 (`unsafe:` value leak)** — Rule 5 in the language spec is
+   temp-lifting machinery for the top-of-statement case.
+5. **O14 (`unsafe:` value leak)** — Rule 5 in the language spec is
    not enforced today. Needs an `Unsafe[T]` marker in `tyc-types`
    and a flow-sensitive boundary check.
-7. **O19 (sealed-union exhaustiveness)** — three known repro
+6. **O19 (sealed-union exhaustiveness)** — three known repro
    patterns; partial-fix machinery from R3.12 already in place.
-8. **O28 (pipe corner cases)** — lifting `|>` into expression
+7. **O28 (pipe corner cases)** — lifting `|>` into expression
    position is a lexer-aware rewrite; tractable but invasive.
-9. **O13 (Pydantic auto-inject)** — tighten the detection path so
+8. **O13 (Pydantic auto-inject)** — tighten the detection path so
    it fires even on bare `typhon.toml` projects.
+9. **O23 (parametric `extend`)** — at minimum a clearer
+   "parameterised extends not yet supported" diagnostic than the
+   current `impl_unknown_class` cascade.
 
 The remaining open items are smaller papercuts.
 
@@ -316,6 +288,20 @@ Branch: `claude/findings-documentation-review-HhuVH`.
 - **O25** — `tyc explain --list` now prints every diagnostic code
   the binary knows about. The "not yet implemented" message is
   gone from the unknown-code error too.
+- **O10** — `case Wrap(value):` against an outer `let value` now
+  fires `tyc::pattern_shadows_outer` (a new diagnostic) instead of
+  the misleading `tyc::immutable_assign`. The new help text
+  suggests renaming the capture — the right advice for the
+  Rust/OCaml/Scala intuition every newcomer brings to `match` —
+  rather than the wrong `change \`let\` to \`mut\`` hint. The
+  resolver tracks an `in_pattern` counter around each case pattern
+  walk and consults it when deciding which diagnostic to push.
+  Python pattern semantics are unchanged; only the surface message
+  is new.
+- **O26** — `tyc repl` now checks `stdin.is_terminal()` and skips
+  the `>>> ` / `... ` prompts when stdin is piped. Interactive
+  sessions on a TTY are unchanged; scripted input no longer
+  produces the `>>> >>> >>> 6` shape the finding reported.
 
 **Verified-already-fixed against their repros:**
 
@@ -474,13 +460,12 @@ f-string), E10 (O11, for-rebind). Still open: E6 → **O19**, E9 →
 
 Filed B1–B14 (81 fresh `.ty` programs, 65/81 build + run clean; 7 real
 bugs surfaced). The May 21 findings sweep closed B1 (O3), B2 (O4),
-B3 (O6), B4 (O5), B5 (O2), B6 (O21), B7 (O22), B12 (O25). Still open:
+B3 (O6), B4 (O5), B5 (O2), B6 (O21), B7 (O22), B10 (O10), B12 (O25),
+B13 (O26). Still open:
 
 - B8 → **O23** (parametric `extend`)
 - B9 → **O12** (`tyc fmt`)
-- B10 → **O10** (pattern shadowing)
 - B11 → **O24** (VM repr)
-- B13 → **O26** (REPL prompt)
 - B14 → **O13** (Pydantic dep auto-inject)
 
 Repro corpus + run script at `stress/round-2026-05-21/`. The
