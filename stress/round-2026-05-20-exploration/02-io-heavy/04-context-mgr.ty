@@ -1,0 +1,17 @@
+import io
+import contextlib
+
+def capture(emit: str) -> str:
+    let buf: io.StringIO = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        print(emit)
+        print(f"echo: {emit}")
+    return buf.getvalue()
+
+def main() -> None:
+    let result: str = capture("hello")
+    print(f"captured {len(result)} chars:")
+    print(result.strip())
+
+if __name__ == "__main__":
+    main()

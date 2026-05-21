@@ -1,0 +1,22 @@
+def classify(v: int | str | list[int]) -> str:
+    match v:
+        case int() as n if n > 100:
+            return f"big int {n}"
+        case int() as n:
+            return f"small int {n}"
+        case str() as s if len(s) > 5:
+            return f"long str {s}"
+        case str() as s:
+            return f"short str {s}"
+        case list() as xs:
+            return f"list of {len(xs)}"
+
+def main() -> None:
+    print(classify(50))
+    print(classify(500))
+    print(classify("hi"))
+    print(classify("hello world"))
+    print(classify([1, 2, 3]))
+
+if __name__ == "__main__":
+    main()

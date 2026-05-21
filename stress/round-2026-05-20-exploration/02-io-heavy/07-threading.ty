@@ -1,0 +1,27 @@
+import threading
+import time
+
+class Counter:
+    value: int
+
+mut counter: Counter = Counter(value=0)
+let lock: threading.Lock = threading.Lock()
+
+def increment(n: int) -> None:
+    global counter
+    for _ in range(n):
+        with lock:
+            counter.value = counter.value + 1
+
+def main() -> None:
+    let threads: list[threading.Thread] = [
+        threading.Thread(target=increment, args=(100,)) for _ in range(5)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    print(f"final={counter.value}")
+
+if __name__ == "__main__":
+    main()

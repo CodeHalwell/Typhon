@@ -1,0 +1,24 @@
+class Counter:
+    n: int
+
+impl Counter:
+    @classmethod
+    def from_zero(cls) -> Counter:
+        return Counter(n=0)
+
+    @staticmethod
+    def make(n: int) -> Counter:
+        return Counter(n=n)
+
+    def add(self, v: int) -> Counter:
+        return Counter(n=self.n + v)
+
+def main() -> None:
+    let a: Counter = Counter.from_zero()
+    let b: Counter = Counter.make(5)
+    print(f"a={a.n} b={b.n}")
+    let c: Counter = b.add(3)
+    print(f"c={c.n}")
+
+if __name__ == "__main__":
+    main()

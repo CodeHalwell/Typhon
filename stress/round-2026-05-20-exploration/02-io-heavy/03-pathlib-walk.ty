@@ -1,0 +1,31 @@
+import pathlib
+import tempfile
+import os
+
+def count_files(root: pathlib.Path) -> dict[str, int]:
+    mut counts: dict[str, int] = {}
+    for p in root.rglob("*"):
+        if p.is_file():
+            let ext: str = p.suffix
+            if ext in counts:
+                counts[ext] = counts[ext] + 1
+            else:
+                counts[ext] = 1
+    return counts
+
+def main() -> None:
+    let tmp: str = tempfile.mkdtemp()
+    let root: pathlib.Path = pathlib.Path(tmp)
+    # create test fixture
+    (root / "a.txt").write_text("hello")
+    (root / "b.txt").write_text("world")
+    (root / "sub").mkdir()
+    (root / "sub" / "c.json").write_text("{}")
+    let counts: dict[str, int] = count_files(root)
+    print(counts)
+    # cleanup
+    import shutil
+    shutil.rmtree(tmp)
+
+if __name__ == "__main__":
+    main()

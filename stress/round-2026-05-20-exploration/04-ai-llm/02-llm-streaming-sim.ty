@@ -1,0 +1,19 @@
+import asyncio
+
+from typing import AsyncIterator
+
+async def stream_tokens(prompt: str) -> AsyncIterator[str]:
+    let words: list[str] = prompt.split()
+    for w in words:
+        yield w
+        await asyncio.sleep(0.001)
+
+async def main() -> None:
+    mut full: str = ""
+    let prompt: str = "Once upon a time there was a Typhon program"
+    async for tok in stream_tokens(prompt):
+        full = full + tok + " "
+    print(full.strip())
+
+if __name__ == "__main__":
+    asyncio.run(main())

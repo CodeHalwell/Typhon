@@ -1419,6 +1419,14 @@ pub struct MethodSig {
     /// permissive "unknown callable" arity rule. Excludes the implicit
     /// receiver (`self` / `cls`) for instance / classmethods.
     pub arity_info: ArityInfo,
+    /// Declared parameter types in source order, excluding the implicit
+    /// receiver (`self` / `cls`) for instance / classmethods. Used at
+    /// call sites to enforce per-arg type checks against the method's
+    /// real signature — without this, methods fall back to a
+    /// `vec![Type::Unknown; arity]` shape and the call site's
+    /// nullable-into-non-nullable guard misfires on `T?` parameters
+    /// (FINDINGS E2 / round 2026-05-20-exploration).
+    pub param_types: Vec<Type>,
 }
 
 /// Member shape recorded for an interface or class — methods are recorded as
@@ -3241,6 +3249,25 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
                 } else {
                     strip_receiver_from_arity(full_arity)
                 };
+                // Per-param types from annotations (used at call sites to
+                // enforce real argument types — FINDINGS E2). Mirrors the
+                // arity_info treatment: drop the leading `self` / `cls`
+                // for instance / classmethods so positional indices line
+                // up with `arity_info.param_names`.
+                let mut param_types: Vec<Type> = f
+                    .parameters
+                    .posonlyargs
+                    .iter()
+                    .chain(f.parameters.args.iter())
+                    .chain(f.parameters.kwonlyargs.iter())
+                    .map(|p| match &p.parameter.annotation {
+                        Some(ann) => type_from_annotation_with_params(ann, classes, &tps),
+                        None => Type::Unknown,
+                    })
+                    .collect();
+                if !is_static && !param_types.is_empty() {
+                    param_types.remove(0);
+                }
                 shape.methods.insert(
                     f.name.as_str().to_owned(),
                     MethodSig {
@@ -3250,6 +3277,7 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
                         is_static,
                         is_classmethod,
                         arity_info,
+                        param_types,
                     },
                 );
             }
@@ -4478,7 +4506,23 @@ fn check_function(
                         Type::Unknown
                     } else {
                         match c.current_class.as_deref() {
-                            Some(cls) => Type::Class(cls.to_owned()),
+                            // `impl X:` / `extend X:` desugar to a
+                            // `__typhon_impl_X` pseudo-class that the
+                            // merge pass later folds into the real `X`.
+                            // The type-checker walks the methods inside
+                            // the pseudo-class first, so `self` would
+                            // pick up the pseudo-class as its receiver
+                            // type and `return self` against a declared
+                            // `-> X` would fail with
+                            // `expected X, found __typhon_impl_X`
+                            // (FINDINGS E3). Strip the prefix so the
+                            // receiver carries the user-facing class
+                            // name from the start.
+                            Some(cls) => {
+                                let real =
+                                    cls.strip_prefix("__typhon_impl_").unwrap_or(cls).to_owned();
+                                Type::Class(real)
+                            }
                             None => Type::Unknown,
                         }
                     }
@@ -5083,12 +5127,30 @@ fn pattern_covers_class(c: &Checker, pattern: &Pattern, class_name: &str) -> boo
             if mc.arguments.patterns.is_empty() && mc.arguments.keywords.is_empty() {
                 return true;
             }
-            if !mc.arguments.patterns.is_empty() {
-                return false;
-            }
             let Some(shape) = c.class_shapes.get(class_name) else {
                 return false;
             };
+            // Positional class pattern — `case Leaf(value):` /
+            // `case Branch(left, right):`. Counts as a total match for
+            // `class_name` when every supplied subpattern is a capture
+            // (or wildcard) AND there are no keyword args adding
+            // further filters. A pattern shorter than the declared
+            // field count is still total: the omitted positionals are
+            // unconstrained, the parser already accepts that shape, and
+            // the runtime `match` will still select this arm for every
+            // instance of the class (FINDINGS E6 + copilot review on
+            // PR #87).
+            if !mc.arguments.patterns.is_empty() {
+                if !mc.arguments.keywords.is_empty() {
+                    return false;
+                }
+                if mc.arguments.patterns.len() > shape.field_order.len() {
+                    return false;
+                }
+                return mc.arguments.patterns.iter().all(is_capture_or_underscore);
+            }
+            // Keyword-only class pattern — every field must be bound by
+            // a pattern that is itself a capture / wildcard.
             if mc.arguments.keywords.len() != shape.fields.len() {
                 return false;
             }
@@ -5504,6 +5566,53 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     c.operator_type_mismatch(op_str, &l_stripped, &r_stripped, span);
                 }
             }
+            // User-defined operator overloads on the LHS class take
+            // precedence over the conservative numeric inference below.
+            // Without this, `Vec2(...) * 5.0` would resolve to `Float`
+            // via the `(_, Type::Float) => Type::Float` rule and the
+            // `__mul__` return type recorded on `Vec2` would be ignored
+            // (FINDINGS E5).
+            //
+            // The arg type IS checked against the dunder's first formal
+            // — otherwise `v * "bad"` for
+            // `def __mul__(self, scalar: float) -> Vec2` would silently
+            // infer `Vec2` instead of emitting a type-mismatch (codex
+            // review on PR #87). When a dunder exists on the LHS class
+            // but its formal rejects the RHS, surface the operator
+            // mismatch directly instead of falling through to the
+            // permissive `Unknown` arm below — otherwise the bad call
+            // would slip past as `let r: V = Unknown`.
+            if let Some(dunder) = binop_dunder(b.op) {
+                if let Type::Class(cls) | Type::Generic(cls, _) = &l_stripped {
+                    if let Some(sig) = c.find_method(cls, dunder).cloned() {
+                        if dunder_accepts(c, &sig, &r_stripped) {
+                            return sig.return_type.clone();
+                        }
+                        if let Some(op_str) = arithmetic_op_str(b.op) {
+                            let span = (b.range.start().to_usize(), b.range.end().to_usize());
+                            c.operator_type_mismatch(op_str, &l_stripped, &r_stripped, span);
+                        }
+                        return sig.return_type.clone();
+                    }
+                }
+                // Right-side reflected dunder (`__radd__`, `__rmul__`, …)
+                // when the LHS is a built-in/primitive and the RHS is a
+                // user class — `5.0 * Vec2(...)`.
+                if let Some(rdunder) = binop_rdunder(b.op) {
+                    if let Type::Class(cls) | Type::Generic(cls, _) = &r_stripped {
+                        if let Some(sig) = c.find_method(cls, rdunder).cloned() {
+                            if dunder_accepts(c, &sig, &l_stripped) {
+                                return sig.return_type.clone();
+                            }
+                            if let Some(op_str) = arithmetic_op_str(b.op) {
+                                let span = (b.range.start().to_usize(), b.range.end().to_usize());
+                                c.operator_type_mismatch(op_str, &l_stripped, &r_stripped, span);
+                            }
+                            return sig.return_type.clone();
+                        }
+                    }
+                }
+            }
             // Conservative numeric arithmetic inference.
             match (&l_stripped, &r_stripped) {
                 _ if matches!(b.op, Operator::Div)
@@ -5590,7 +5699,14 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                 }
             }
 
-            let func_type = infer_expr(c, &call.func);
+            let func_type_raw = infer_expr(c, &call.func);
+            // Unwrap transparent type aliases (`type Handler = Callable[..., R]`)
+            // so that calls through the alias resolve to the underlying
+            // `Type::Function` rather than the alias name. Without this,
+            // the call-site match would land in the `Type::Class(...)`
+            // (constructor) arm or `not_callable` and we'd lose both the
+            // arity check and the return type. FINDINGS E4.
+            let func_type = c.unwrap_alias(&func_type_raw);
             let call_span = (call.range.start().to_usize(), call.range.end().to_usize());
 
             // `tyc::missing_await` (FINDINGS #49): a *sync* function
@@ -5943,6 +6059,31 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     result
                 }
                 Type::Class(name) => {
+                    // Calling a class type whose shape we don't have
+                    // (imported third-party class accessed through a
+                    // field — `self.linear(x)` where
+                    // `linear: torch.nn.Linear`) is most likely
+                    // invoking the class's `__call__`, NOT constructing
+                    // a new instance. We don't model `__call__` on
+                    // foreign classes today, so degrade to `Unknown`
+                    // and let the surrounding annotation drive
+                    // assignability. The constructor arm below remains
+                    // for project-local classes whose shape we know.
+                    let is_project_class =
+                        c.classes.iter().any(|n| n == &name) || c.class_shapes.contains_key(&name);
+                    let func_is_class_name = matches!(
+                        call.func.as_ref(),
+                        Expr::Name(n) if c.classes.iter().any(|cn| cn == n.id.as_str())
+                    );
+                    if !is_project_class && !func_is_class_name {
+                        for a in pos_args.iter() {
+                            let _ = infer_expr(c, a);
+                        }
+                        for kw in kw_args.iter() {
+                            let _ = infer_expr(c, &kw.value);
+                        }
+                        return Type::Unknown;
+                    }
                     if let Some(shape) = c.class_shapes.get(&name).cloned() {
                         let candidates: Vec<String> = shape.fields.keys().cloned().collect();
                         for kw in kw_args {
@@ -6146,12 +6287,20 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                             return sig.return_type.clone();
                         }
                         let mut arity = sig.arity;
+                        let mut params = sig.param_types.clone();
                         if receiver_is_class_name && !sig.is_static && !sig.is_classmethod {
                             arity = arity.saturating_add(1);
+                            params.insert(0, Type::Class(class_name.clone()));
+                        }
+                        // Pad with Unknowns if the recorded param_types is
+                        // shorter than the recorded arity (defensive — both
+                        // should be derived from the same source).
+                        if params.len() < arity {
+                            params.resize(arity, Type::Unknown);
                         }
                         let ret = sig.return_type.clone();
                         return Type::Function {
-                            params: vec![Type::Unknown; arity],
+                            params,
                             ret: Box::new(ret),
                             variadic: false,
                         };
@@ -6416,6 +6565,64 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
 /// `operator_operands_compatible`. Returns the operator's Python source
 /// form for diagnostic text, or `None` for ops we don't yet check
 /// (bitwise / shifts, MatMult).
+/// Does the dunder method's first declared formal accept `arg_type`?
+/// Used before adopting a dunder's return type as the operator's
+/// result type — without it, `v * "bad"` for `def __mul__(self,
+/// scalar: float) -> Vec2` would silently infer `Vec2` instead of
+/// surfacing the type mismatch. A dunder with no recorded param type
+/// (older shape / unannotated formal) is treated as permissive.
+fn dunder_accepts(c: &Checker, sig: &MethodSig, arg_type: &Type) -> bool {
+    let Some(first) = sig.param_types.first() else {
+        return true;
+    };
+    if matches!(first, Type::Unknown | Type::Any) {
+        return true;
+    }
+    c.is_assignable(first, arg_type)
+}
+
+/// Python dunder name for the binary operator `op`. Returned by
+/// `BinOp` inference so a user class with `def __mul__(self, ...) -> R`
+/// resolves the call to `R` rather than falling through to the
+/// numeric-coercion table (FINDINGS E5).
+fn binop_dunder(op: Operator) -> Option<&'static str> {
+    match op {
+        Operator::Add => Some("__add__"),
+        Operator::Sub => Some("__sub__"),
+        Operator::Mult => Some("__mul__"),
+        Operator::MatMult => Some("__matmul__"),
+        Operator::Div => Some("__truediv__"),
+        Operator::FloorDiv => Some("__floordiv__"),
+        Operator::Mod => Some("__mod__"),
+        Operator::Pow => Some("__pow__"),
+        Operator::LShift => Some("__lshift__"),
+        Operator::RShift => Some("__rshift__"),
+        Operator::BitAnd => Some("__and__"),
+        Operator::BitOr => Some("__or__"),
+        Operator::BitXor => Some("__xor__"),
+    }
+}
+
+/// Reflected (right-side) dunder name, used when the LHS is a
+/// primitive and the RHS is a user class.
+fn binop_rdunder(op: Operator) -> Option<&'static str> {
+    match op {
+        Operator::Add => Some("__radd__"),
+        Operator::Sub => Some("__rsub__"),
+        Operator::Mult => Some("__rmul__"),
+        Operator::MatMult => Some("__rmatmul__"),
+        Operator::Div => Some("__rtruediv__"),
+        Operator::FloorDiv => Some("__rfloordiv__"),
+        Operator::Mod => Some("__rmod__"),
+        Operator::Pow => Some("__rpow__"),
+        Operator::LShift => Some("__rlshift__"),
+        Operator::RShift => Some("__rrshift__"),
+        Operator::BitAnd => Some("__rand__"),
+        Operator::BitOr => Some("__ror__"),
+        Operator::BitXor => Some("__rxor__"),
+    }
+}
+
 fn arithmetic_op_str(op: Operator) -> Option<&'static str> {
     match op {
         Operator::Add => Some("+"),
@@ -9286,6 +9493,214 @@ def get_name[T: Named](x: T) -> str:
         assert!(
             !d.has_errors(),
             "field access on T: Named should type-check: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    // ── E2: impl methods accept T? parameters ────────────────────────────────
+
+    #[test]
+    fn impl_method_accepts_nullable_arg_and_none() {
+        // FINDINGS E2: `impl X: def f(self, p: str?)` rejected `None`
+        // and `str?` arguments because the method's `param_types`
+        // weren't recorded — they fell back to `Type::Unknown`, and
+        // the call site's nullable-into-non-nullable guard misfired.
+        let src = "\
+class API:
+    name: str
+
+impl API:
+    def fetch(self, cursor: str?) -> int:
+        return 0 if cursor is None else len(cursor)
+
+def main() -> None:
+    let api: API = API(name=\"x\")
+    let v: str? = None
+    let n1: int = api.fetch(v)
+    let n2: int = api.fetch(None)
+    let n3: int = api.fetch(\"hi\")
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "impl method with `T?` param must accept `T?` / `None`: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    // ── E3: `return self` from impl `__enter__` carries the real class type ──
+
+    #[test]
+    fn impl_return_self_uses_real_class_name() {
+        // FINDINGS E3: the impl block desugars to `__typhon_impl_X`;
+        // the type checker was previously typing `self` as
+        // `__typhon_impl_X` so `return self` against `-> X` failed.
+        let src = "\
+class Stopwatch:
+    start: float
+
+impl Stopwatch:
+    def enter(self) -> Stopwatch:
+        return self
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "return self from impl method must match declared class type: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    // ── E4: type-alias of Callable unwraps on call ──────────────────────────
+
+    #[test]
+    fn callable_type_alias_call_returns_alias_target() {
+        // FINDINGS E4: `type Handler = Callable[[Req], Resp]` followed
+        // by `next(req)` typed the return as `Handler` not `Resp`.
+        let src = "\
+from typing import Callable
+
+class Req:
+    n: int
+
+class Resp:
+    s: str
+
+type Handler = Callable[[Req], Resp]
+
+def call(h: Handler, r: Req) -> Resp:
+    return h(r)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "calling a value typed as a Callable alias must return the alias target: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    // ── E5: __mul__ / __add__ overrides resolve to user-declared return ──────
+
+    #[test]
+    fn binop_resolves_user_dunder_over_numeric_fallback() {
+        // FINDINGS E5: `Vec2(...) * 5.0` resolved to `Float` via the
+        // numeric-coercion rule even though `Vec2` defined
+        // `__mul__(self, scalar: float) -> Vec2`. The dunder lookup
+        // now takes precedence over the conservative numeric
+        // inference table.
+        let src = "\
+class Vec2:
+    x: float
+    y: float
+
+impl Vec2:
+    def __mul__(self, scalar: float) -> Vec2:
+        return Vec2(x=self.x * scalar, y=self.y * scalar)
+    def __add__(self, other: Vec2) -> Vec2:
+        return Vec2(x=self.x + other.x, y=self.y + other.y)
+
+def go() -> None:
+    let a: Vec2 = Vec2(x=1.0, y=2.0)
+    let b: Vec2 = Vec2(x=3.0, y=4.0)
+    let sum: Vec2 = a + b
+    let scaled: Vec2 = a * 5.0
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "user-defined __mul__/__add__ must drive BinOp result type: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn binop_dunder_rejects_arg_type_mismatch() {
+        // codex review on PR #87: previously, the dunder return type
+        // was adopted whenever the dunder method existed, even if the
+        // RHS didn't match the dunder's declared formal. `v * "bad"`
+        // for `def __mul__(self, scalar: float) -> Vec2` must surface
+        // an operator type mismatch, not silently infer `Vec2`.
+        let src = "\
+class V:
+    x: float
+
+impl V:
+    def __mul__(self, scalar: float) -> V:
+        return V(x=self.x * scalar)
+
+def main() -> None:
+    let v: V = V(x=1.0)
+    let r: V = v * \"bad\"
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "v * \"bad\" must surface a diagnostic when __mul__ expects a float, got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    // ── E6: exhaustiveness recognises positional class patterns ──────────────
+
+    #[test]
+    fn positional_class_pattern_counts_as_total_match() {
+        // FINDINGS E6: `case Leaf(value):` (positional capture of every
+        // field) was not treated as covering the `Leaf` variant of a
+        // sealed union, so `missing_return` fired on otherwise-total
+        // matches.
+        let src = "\
+class Leaf:
+    value: int
+
+class Branch:
+    left: Leaf
+    right: Leaf
+
+type Tree = Leaf | Branch
+
+def first(t: Tree) -> int:
+    match t:
+        case Leaf(value):
+            return value
+        case Branch(left, right):
+            return left.value
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "positional class pattern must count as a total match for that variant: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn shorter_positional_pattern_still_covers_variant() {
+        // copilot review on PR #87: `case Branch(left):` (one
+        // positional capture for a class with two declared fields)
+        // is a valid pattern at parse time and should count as a
+        // total match for the Branch variant of a sealed union —
+        // the omitted positional is unconstrained at runtime.
+        let src = "\
+class Leaf:
+    value: int
+
+class Branch:
+    left: Leaf
+    right: Leaf
+
+type Tree = Leaf | Branch
+
+def go(t: Tree) -> int:
+    match t:
+        case Leaf(value):
+            return value
+        case Branch(left):
+            return left.value
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "shorter positional pattern must count as a total match: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
     }

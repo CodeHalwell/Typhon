@@ -1,0 +1,54 @@
+class Idle:
+    pass
+
+class Thinking:
+    prompt: str
+
+class Acting:
+    tool: str
+    arg: str
+
+class Done:
+    output: str
+
+class Failed:
+    reason: str
+
+type State = Idle | Thinking | Acting | Done | Failed
+
+def step(s: State, input: str) -> State:
+    match s:
+        case Idle():
+            return Thinking(prompt=input)
+        case Thinking(prompt):
+            if "calc" in prompt:
+                return Acting(tool="calc", arg=prompt.replace("calc ", ""))
+            return Done(output=f"chat: {prompt}")
+        case Acting(tool, arg):
+            try:
+                unsafe:
+                    let result: object = eval(arg)
+                return Done(output=f"{tool}({arg}) = {result}")
+            except Exception as e:
+                return Failed(reason=f"{e}")
+        case Done(output):
+            return Done(output=output)
+        case Failed(reason):
+            return Failed(reason=reason)
+        case _:
+            return Failed(reason="unreachable")
+
+def main() -> None:
+    mut s: State = Idle()
+    let inputs: list[str] = ["calc 3 + 4", "calc 10 / 0"]
+    for i in inputs:
+        s = step(s, i)
+        print(f"after 1: {s}")
+        s = step(s, "")
+        print(f"after 2: {s}")
+        s = step(s, "")
+        print(f"after 3: {s}")
+        s = Idle()
+
+if __name__ == "__main__":
+    main()

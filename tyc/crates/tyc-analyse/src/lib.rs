@@ -478,6 +478,53 @@ fn eval_expr(expr: &Expr, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue, St
             eval_subscript(receiver, key)
         }
 
+        // F-string: concatenate literal parts with the string form of
+        // each interpolation. Format specs and conversion flags are not
+        // supported — anyone reaching for `f"{x:>5}"` at comptime can
+        // build the result with `str(...)` + `+` instead. Bare values
+        // emit using the same surface as `to_python_literal` minus the
+        // outer quotes, so `f"v{1}"` → `"v1"`, `f"{True}"` → `"True"`.
+        Expr::FString(fs) => {
+            let mut out = String::new();
+            for part in fs.value.iter() {
+                match part {
+                    ruff_python_ast::FStringPart::Literal(lit) => {
+                        out.push_str(lit.as_str());
+                    }
+                    ruff_python_ast::FStringPart::FString(inner) => {
+                        for elem in &inner.elements {
+                            match elem {
+                                ruff_python_ast::InterpolatedStringElement::Literal(lit) => {
+                                    out.push_str(&lit.value);
+                                }
+                                ruff_python_ast::InterpolatedStringElement::Interpolation(
+                                    interp,
+                                ) => {
+                                    if interp.format_spec.is_some() {
+                                        return Err(
+                                            "f-string format specs are not supported in comptime \
+                                             expressions"
+                                                .into(),
+                                        );
+                                    }
+                                    if interp.conversion.to_char().is_some() {
+                                        return Err(
+                                            "f-string conversion flags (`!r`, `!s`, `!a`) are not \
+                                             supported in comptime expressions"
+                                                .into(),
+                                        );
+                                    }
+                                    let v = eval_expr(&interp.expression, ctx)?;
+                                    out.push_str(&comptime_str(&v)?);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(ComptimeValue::Str(out))
+        }
+
         // Attribute access exists only as part of a method call —
         // `"hi".upper()` parses as Call(Attribute(StringLiteral("hi"),
         // "upper"), []). The bare `Expr::Attribute` is handed off to
@@ -488,6 +535,39 @@ fn eval_expr(expr: &Expr, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue, St
             "expression is not a comptime-evaluable constant: {}",
             expr_kind_name(other)
         )),
+    }
+}
+
+/// String form of a comptime value as it would appear inside an
+/// f-string interpolation. Best-effort match for Python's
+/// `str(int)` / `str(bool)` / `str(str)`; for `str(float)` we use
+/// Rust's default float formatting, which agrees with Python on the
+/// common cases but diverges on a few pathological shapes
+/// (exponent rendering, `inf` / `nan` casing). Container values
+/// (`list`, `tuple`, `dict`) are explicitly rejected — Python's
+/// `str([1, 2, 3])` matches our literal form, but a list containing
+/// strings would emit double-quoted literals here while Python emits
+/// single-quoted, so we'd produce a divergent constant. Unquoted,
+/// since the surrounding f-string already provides the quotes
+/// (codex / copilot reviews on PR #87).
+fn comptime_str(v: &ComptimeValue) -> Result<String, String> {
+    match v {
+        ComptimeValue::Int(n) => Ok(n.to_string()),
+        ComptimeValue::Float(f) => {
+            if f.is_finite() && f.fract() == 0.0 {
+                Ok(format!("{:.1}", f))
+            } else {
+                Ok(format!("{}", f))
+            }
+        }
+        ComptimeValue::Str(s) => Ok(s.clone()),
+        ComptimeValue::Bool(b) => Ok(if *b { "True" } else { "False" }.to_owned()),
+        ComptimeValue::List(_) | ComptimeValue::Tuple(_) | ComptimeValue::Dict(_) => Err(
+            "f-string interpolation of list/tuple/dict values is not supported at comptime — \
+             Python's `str([...])` uses single-quoted string repr internally and the comptime \
+             literal form uses double quotes, so the two would produce different constants"
+                .to_owned(),
+        ),
     }
 }
 
@@ -1361,6 +1441,54 @@ mod tests {
         let (values, diags) = eval("comptime let N: int = int(\"42\")\n");
         assert!(!diags.has_errors());
         assert!(matches!(values.get("N"), Some(ComptimeValue::Int(42))));
+    }
+
+    #[test]
+    fn fstring_with_comptime_values_evaluates() {
+        // FINDINGS E7: f-string interpolation in comptime context was
+        // rejected with "expression is not a comptime-evaluable
+        // constant: FString" even though every interpolated value was
+        // itself a comptime constant.
+        let src = "\
+comptime let APP: str = \"MyApp\"
+comptime let MAJOR: int = 2
+comptime let MINOR: int = 5
+comptime let TITLE: str = f\"{APP} v{MAJOR}.{MINOR}\"
+";
+        let (values, diags) = eval(src);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(
+            matches!(values.get("TITLE"), Some(ComptimeValue::Str(s)) if s == "MyApp v2.5"),
+            "TITLE should be \"MyApp v2.5\", got {:?}",
+            values.get("TITLE")
+        );
+    }
+
+    #[test]
+    fn fstring_container_interpolation_rejected_in_comptime() {
+        // Python's `str(['x'])` -> "['x']" with single-quoted strings,
+        // but our literal form uses double quotes. To avoid silently
+        // emitting a divergent constant, we reject container values in
+        // f-string interpolation outright (codex review on PR #87).
+        let src = "comptime let X: str = f\"{['x']}\"\n";
+        let (_, diags) = eval(src);
+        assert!(
+            diags.has_errors(),
+            "list interpolation should be rejected at comptime"
+        );
+    }
+
+    #[test]
+    fn fstring_format_spec_rejected_in_comptime() {
+        // We do not (yet) emulate Python's f-string format spec at
+        // comptime — `f\"{n:>5}\"` must fail explicitly rather than
+        // emit a string that disagrees with the runtime form.
+        let src = "comptime let X: str = f\"{42:>5}\"\n";
+        let (_, diags) = eval(src);
+        assert!(
+            diags.has_errors(),
+            "format spec should be rejected at comptime"
+        );
     }
 
     #[test]

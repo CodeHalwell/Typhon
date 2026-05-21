@@ -1,0 +1,15 @@
+import numpy
+
+def main() -> None:
+    unsafe:
+        let a = numpy.array([1, 2, 3, 4, 5])
+        let b = numpy.array([10, 20, 30, 40, 50])
+        let sum = a + b
+        let dot = numpy.dot(a, b)
+        let mean: float = float(numpy.mean(a))
+    print(f"sum={sum}")
+    print(f"dot={dot}")
+    print(f"mean={mean}")
+
+if __name__ == "__main__":
+    main()

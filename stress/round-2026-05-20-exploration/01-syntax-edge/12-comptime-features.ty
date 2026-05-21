@@ -1,0 +1,19 @@
+comptime let APP_NAME: str = "explorer".upper()
+comptime let MAJOR: int = 1
+comptime let MINOR: int = 4
+comptime let VERSION: str = str(MAJOR) + "." + str(MINOR)
+comptime let TAGS: list[str] = ["alpha", "beta", "stable"]
+comptime let TIMEOUT_MS: int = 1000 * 30
+
+comptime def is_release(tag: str) -> bool:
+    return tag == "stable"
+
+comptime let IS_RELEASE: bool = is_release(TAGS[2])
+
+def main() -> None:
+    print(f"app={APP_NAME} version={VERSION}")
+    print(f"tags={TAGS}, release={IS_RELEASE}")
+    print(f"timeout={TIMEOUT_MS}ms")
+
+if __name__ == "__main__":
+    main()

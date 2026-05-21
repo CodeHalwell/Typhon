@@ -1,0 +1,11 @@
+comptime let APP: str = "MyApp"
+comptime let VERSION_MAJOR: int = 2
+comptime let VERSION_MINOR: int = 5
+# Docs say string ops are supported. Try f-string:
+comptime let TITLE: str = f"{APP} v{VERSION_MAJOR}.{VERSION_MINOR}"
+
+def main() -> None:
+    print(TITLE)
+
+if __name__ == "__main__":
+    main()

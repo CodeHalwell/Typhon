@@ -1,0 +1,18 @@
+def make_fn() -> object:
+    return lambda x: x * 2
+
+def main() -> None:
+    # (lambda x: x*2)(5) - paren around lambda then call
+    let f: object = (lambda x: x * 2)
+    unsafe:
+        let r: int = f(5)
+    print(f"r={r}")
+    # subscript after paren'd ternary
+    let chosen: list[int] = ([1, 2] if True else [3, 4])[0:2]
+    print(chosen)
+    # paren around conditional then attribute
+    let s: str = ("x" if True else "y").upper()
+    print(s)
+
+if __name__ == "__main__":
+    main()

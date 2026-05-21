@@ -801,12 +801,22 @@ impl Emitter {
                     BoolOp::And => " and ",
                     BoolOp::Or => " or ",
                 };
+                let outer_prec = match b.op {
+                    BoolOp::Or => 3u8,
+                    BoolOp::And => 4u8,
+                };
                 let mut first = true;
                 for val in &b.values {
                     if !first {
                         self.write(op);
                     }
-                    self.emit_expr(val);
+                    if expr_precedence(val) < outer_prec {
+                        self.write("(");
+                        self.emit_expr(val);
+                        self.write(")");
+                    } else {
+                        self.emit_expr(val);
+                    }
                     first = false;
                 }
             }
@@ -1007,7 +1017,13 @@ impl Emitter {
             // Ruff bundles positional args and keywords under
             // `ExprCall.arguments: Arguments`.
             Expr::Call(c) => {
-                self.emit_expr(&c.func);
+                if needs_paren_for_postfix(&c.func) {
+                    self.write("(");
+                    self.emit_expr(&c.func);
+                    self.write(")");
+                } else {
+                    self.emit_expr(&c.func);
+                }
                 self.write("(");
                 let mut first = true;
                 for arg in c.arguments.args.iter() {
@@ -1200,13 +1216,25 @@ impl Emitter {
             }
 
             Expr::Attribute(a) => {
-                self.emit_expr(&a.value);
+                if needs_paren_for_postfix(&a.value) {
+                    self.write("(");
+                    self.emit_expr(&a.value);
+                    self.write(")");
+                } else {
+                    self.emit_expr(&a.value);
+                }
                 self.write(".");
                 self.write(a.attr.as_str());
             }
 
             Expr::Subscript(s) => {
-                self.emit_expr(&s.value);
+                if needs_paren_for_postfix(&s.value) {
+                    self.write("(");
+                    self.emit_expr(&s.value);
+                    self.write(")");
+                } else {
+                    self.emit_expr(&s.value);
+                }
                 self.write("[");
                 // A tuple slice usually emits without outer parens — `X[A, B]`
                 // not `X[(A, B)]` — but a one-element tuple must keep its
@@ -1664,6 +1692,38 @@ fn expr_precedence(expr: &Expr) -> u8 {
     }
 }
 
+/// True when `expr` must be parenthesised before a Python postfix operator
+/// (attribute access `.x`, subscript `[…]`, call `(…)`) is applied to it.
+///
+/// Postfix operators in Python bind tighter than every binary, boolean, and
+/// comparison operator, and tighter than lambdas / ternaries / walrus /
+/// await / yield. Forgetting the wrap means the postfix attaches to the
+/// *rightmost* sub-expression rather than to the whole, which Python parses
+/// happily but with different semantics — e.g. `(a + b).upper()` emitted as
+/// `a + b.upper()` evaluates `b.upper()` first and concatenates.
+///
+/// This guard is the symmetric partner of `expr_precedence`: anything that
+/// would have needed parens as a `BinOp` child needs parens here too, plus
+/// a few more forms that `expr_precedence` ignores because they can't
+/// appear as a `BinOp` child without already being a syntax error.
+fn needs_paren_for_postfix(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::BoolOp(_)
+            | Expr::BinOp(_)
+            | Expr::UnaryOp(_)
+            | Expr::Lambda(_)
+            | Expr::If(_)
+            | Expr::Compare(_)
+            | Expr::Named(_)
+            | Expr::Await(_)
+            | Expr::Yield(_)
+            | Expr::YieldFrom(_)
+            | Expr::Starred(_)
+            | Expr::Generator(_)
+    )
+}
+
 /// Escape a string value for emission as a double-quoted Python literal.
 ///
 /// Covers the characters that would otherwise terminate the literal or
@@ -2008,6 +2068,78 @@ mod tests {
         assert!(
             out.contains("(-x) ** 2"),
             "unary minus left of ** must be parenthesised, got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn binop_before_attribute_parenthesised() {
+        // (a + b).upper() must NOT emit as a + b.upper() — Python parses the
+        // latter as a + (b.upper()), changing semantics silently.
+        let src = "y = (\"a\" + \"b\").upper()\n";
+        let out = round_trip(src);
+        assert!(
+            out.contains("(\"a\" + \"b\").upper()"),
+            "BinOp before attribute must keep parens, got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn binop_before_subscript_parenthesised() {
+        let src = "y = ([1, 2] + [3, 4])[1:3]\n";
+        let out = round_trip(src);
+        assert!(
+            out.contains("([1, 2] + [3, 4])[1:3]"),
+            "BinOp before subscript must keep parens, got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn ternary_before_attribute_parenthesised() {
+        let src = "y = (\"x\" if c else \"y\").upper()\n";
+        let out = round_trip(src);
+        assert!(
+            out.contains("(\"x\" if c else \"y\").upper()"),
+            "ternary before attribute must keep parens, got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn lambda_before_call_parenthesised() {
+        let src = "y = (lambda n: n * 2)(7)\n";
+        let out = round_trip(src);
+        assert!(
+            out.contains("(lambda n: n * 2)(7)"),
+            "lambda before call must keep parens, got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn or_inside_and_parenthesised() {
+        // `and` binds tighter than `or`; (a or b) and c must keep its parens
+        // so it doesn't get re-grouped to a or (b and c).
+        let src = "z = (a or b) and c\n";
+        let out = round_trip(src);
+        assert!(
+            out.contains("(a or b) and c"),
+            "or-inside-and must keep parens, got: {}",
+            out
+        );
+    }
+
+    #[test]
+    fn boolop_div_before_attribute_parenthesised() {
+        // (root / \"x\").write_text(...) — pathlib idiom; without parens
+        // becomes root / (\"x\".write_text(...)) at runtime.
+        let src = "y = (root / \"x\").write_text(\"hi\")\n";
+        let out = round_trip(src);
+        assert!(
+            out.contains("(root / \"x\").write_text"),
+            "binop before method call must keep parens, got: {}",
             out
         );
     }

@@ -1,0 +1,14 @@
+import pandas
+import io
+
+def main() -> None:
+    let csv: str = "name,score,age\nalice,90,30\nbob,75,25\ncarol,88,40\ndave,65,28\n"
+    unsafe:
+        let df = pandas.read_csv(io.StringIO(csv))
+        let above_avg = df[df["score"] > df["score"].mean()]
+        let agg = df.groupby(df["age"] > 28).agg({"score": ["mean", "count"]})
+    print(above_avg)
+    print(agg)
+
+if __name__ == "__main__":
+    main()

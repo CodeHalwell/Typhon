@@ -1,0 +1,17 @@
+def double(n: int) -> int:
+    return n * 2
+
+def add(n: int, m: int) -> int:
+    return n + m
+
+def to_str(n: int) -> str:
+    return f"v={n}"
+
+def main() -> None:
+    let result: str = 5 |> double() |> add(3) |> double() |> to_str()
+    print(result)
+    let s: str = "  Hello, World!  " |> str.strip() |> str.lower() |> str.replace(",", "")
+    print(s)
+
+if __name__ == "__main__":
+    main()

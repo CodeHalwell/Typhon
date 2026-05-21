@@ -1,0 +1,55 @@
+import time
+
+class Message:
+    role: str
+    content: str
+
+class Response:
+    id: str
+    content: str
+    tokens: int
+    elapsed_ms: int
+
+class LLMError:
+    code: str
+    detail: str
+
+class MockClient:
+    api_key: str
+    model: str
+
+impl MockClient:
+    def chat(self, messages: list[Message]) -> Result[Response, LLMError]:
+        if len(messages) == 0:
+            return Err(LLMError(code="empty", detail="no messages"))
+        if not self.api_key.startswith("sk-"):
+            return Err(LLMError(code="auth", detail="bad key"))
+        let last: Message = messages[-1]
+        let reply: str = f"echo: {last.content}"
+        return Ok(Response(
+            id="r-001",
+            content=reply,
+            tokens=len(last.content.split()),
+            elapsed_ms=42,
+        ))
+
+def main() -> None:
+    let client: MockClient = MockClient(api_key="sk-test", model="echo-1")
+    let conv: list[Message] = [
+        Message(role="system", content="You are echo."),
+        Message(role="user", content="Hello world"),
+    ]
+    match client.chat(conv):
+        case Ok(r):
+            print(f"id={r.id} tokens={r.tokens}")
+            print(f"reply: {r.content}")
+        case Err(e):
+            print(f"err {e.code}: {e.detail}")
+
+    let bad: MockClient = MockClient(api_key="x", model="echo-1")
+    match bad.chat(conv):
+        case Ok(r):  print(f"unexpected ok")
+        case Err(e): print(f"expected fail: {e.code}/{e.detail}")
+
+if __name__ == "__main__":
+    main()

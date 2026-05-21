@@ -1,0 +1,14 @@
+model User:
+    id: int
+    name: str
+    email: str?
+    tags: list[str]
+
+def main() -> None:
+    let u: User = User(id=1, name="alice", email="a@x.com", tags=["admin", "user"])
+    print(u.model_dump_json())
+    let u2: User = User(id=2, name="bob", email=None, tags=[])
+    print(u2.model_dump_json())
+
+if __name__ == "__main__":
+    main()

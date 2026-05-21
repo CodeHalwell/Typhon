@@ -1,0 +1,27 @@
+class Money:
+    amount: float
+    currency: str
+
+impl Money:
+    def add(self, other: Money) -> Money:
+        if self.currency != other.currency:
+            raise ValueError("currency mismatch")
+        return Money(amount=self.amount + other.amount, currency=self.currency)
+
+impl Money:
+    def format(self) -> str:
+        return f"{self.amount:.2f} {self.currency}"
+
+impl Money:
+    def is_zero(self) -> bool:
+        return self.amount == 0.0
+
+def main() -> None:
+    let a: Money = Money(amount=10.0, currency="USD")
+    let b: Money = Money(amount=5.5, currency="USD")
+    let c: Money = a.add(b)
+    print(c.format())
+    print(f"zero={c.is_zero()}")
+
+if __name__ == "__main__":
+    main()

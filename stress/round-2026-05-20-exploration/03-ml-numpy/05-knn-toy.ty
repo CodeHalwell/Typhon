@@ -1,0 +1,39 @@
+import math
+
+class Point:
+    x: float
+    y: float
+    label: str
+
+@pure
+def dist(a: Point, b: Point) -> float:
+    return math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2)
+
+def classify(train: list[Point], query: Point, k: int) -> str:
+    let sorted_train: list[Point] = sorted(train, key=lambda p: dist(p, query))
+    mut counts: dict[str, int] = {}
+    for i in range(min(k, len(sorted_train))):
+        let lab: str = sorted_train[i].label
+        counts[lab] = counts.get(lab, 0) + 1
+    mut best: str = ""
+    mut best_count: int = -1
+    for entry in counts.items():
+        if entry[1] > best_count:
+            best = entry[0]
+            best_count = entry[1]
+    return best
+
+def main() -> None:
+    let train: list[Point] = [
+        Point(x=1.0, y=1.0, label="a"),
+        Point(x=1.5, y=2.0, label="a"),
+        Point(x=5.0, y=5.0, label="b"),
+        Point(x=4.5, y=6.0, label="b"),
+        Point(x=8.0, y=1.0, label="c"),
+    ]
+    print(classify(train, Point(x=2.0, y=1.5, label=""), 3))
+    print(classify(train, Point(x=5.0, y=5.5, label=""), 3))
+    print(classify(train, Point(x=8.5, y=1.5, label=""), 3))
+
+if __name__ == "__main__":
+    main()

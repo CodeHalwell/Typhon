@@ -1,0 +1,68 @@
+model ListReq:
+    limit: int
+    cursor: str?
+
+model ListResp[T]:
+    items: list[T]
+    next_cursor: str?
+
+model User:
+    id: int
+    name: str
+
+class HTTPError:
+    status: int
+    body: str
+
+class SDK:
+    base_url: str
+    api_key: str
+
+impl SDK:
+    def _request(self, method: str, path: str, body: dict[str, object]?) -> Result[dict[str, object], HTTPError]:
+        # Simulated; would call real HTTP
+        if path == "/users" and method == "GET":
+            return Ok({"items": [{"id": 1, "name": "alice"}, {"id": 2, "name": "bob"}], "next_cursor": None})
+        if path.startswith("/users/") and method == "GET":
+            let id_str: str = path.replace("/users/", "")
+            return Ok({"id": int(id_str), "name": f"user-{id_str}"})
+        return Err(HTTPError(status=404, body="not found"))
+
+    def list_users(self, req: ListReq) -> Result[ListResp[User], HTTPError]:
+        let raw: Result[dict[str, object], HTTPError] = self._request("GET", "/users", None)
+        match raw:
+            case Err(e):
+                return Err(e)
+            case Ok(data):
+                unsafe:
+                    mut users: list[User] = []
+                    for item in data["items"]:
+                        users.append(User(id=item["id"], name=item["name"]))
+                    let next_c: str? = data["next_cursor"]
+                return Ok(ListResp[User](items=users, next_cursor=next_c))
+
+    def get_user(self, id: int) -> Result[User, HTTPError]:
+        let raw: Result[dict[str, object], HTTPError] = self._request("GET", f"/users/{id}", None)
+        match raw:
+            case Err(e):
+                return Err(e)
+            case Ok(data):
+                unsafe:
+                    let u: User = User(id=data["id"], name=data["name"])
+                return Ok(u)
+
+def main() -> None:
+    let sdk: SDK = SDK(base_url="https://api.example.com", api_key="sk-...")
+    match sdk.list_users(ListReq(limit=10, cursor=None)):
+        case Ok(resp):
+            print(f"got {len(resp.items)} users")
+            for u in resp.items:
+                print(f"  #{u.id} {u.name}")
+        case Err(e):
+            print(f"list err {e.status}: {e.body}")
+    match sdk.get_user(42):
+        case Ok(u):  print(f"single: #{u.id} {u.name}")
+        case Err(e): print(f"get err: {e.status}")
+
+if __name__ == "__main__":
+    main()

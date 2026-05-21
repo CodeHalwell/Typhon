@@ -1,0 +1,39 @@
+def main() -> None:
+    # All these need parens preserved in emit:
+    # 1. (binop).attribute
+    let s: str = ("a" + "b").upper()
+    assert s == "AB", f"FAIL: ('a'+'b').upper() == {s!r}"
+
+    # 2. (binop).method(...)
+    let r: list[int] = [1, 2, 3] + [4, 5]
+    let r_after: list[int] = ([1, 2, 3] + [4, 5])[1:4]
+    assert r_after == [2, 3, 4], f"FAIL: slice {r_after}"
+
+    # 3. (and-or) interaction
+    let b1: bool = (True or False) and False
+    assert b1 == False, f"FAIL: (True or False) and False == {b1}"
+
+    # 4. (ternary).method()
+    let t: str = ("x" if True else "y").upper()
+    assert t == "X", f"FAIL: ternary.upper() == {t!r}"
+
+    # 5. (lambda)(arg)
+    let lf: object = (lambda n: n * 2)
+    unsafe:
+        let v: int = lf(7)
+    assert v == 14, f"FAIL: lambda(7) == {v}"
+
+    # 6. (paren expr)[subscript]
+    let idx: list[int] = ([10, 20, 30])[0:2]
+    assert idx == [10, 20], f"FAIL: subscript {idx}"
+
+    # 7. Path-like (parent / "child").method()
+    import pathlib
+    let p: pathlib.Path = pathlib.Path("/tmp")
+    let s2: str = (p / "foo").as_posix()
+    assert s2 == "/tmp/foo", f"FAIL: pathlib {s2}"
+
+    print("all parens OK")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,29 @@
+def main() -> None:
+    # Following R3.6 — operator type-check gaps. Verify each:
+    # str + int should be rejected at compile time
+    let s: str = "hi"
+    let n: int = 3
+    unsafe:
+        let bad1: object = s + n  # mypy/pyright/ty would flag this
+    print(f"bad1={bad1}")
+
+    # list + dict
+    let xs: list[int] = [1, 2, 3]
+    let d: dict[str, int] = {"a": 1}
+    unsafe:
+        try:
+            let bad2: object = xs + d
+            print(f"bad2={bad2}")
+        except TypeError as e:
+            print(f"caught: {e}")
+
+    # bool == int interaction (Typhon says they're distinct)
+    let b: bool = True
+    let m: int = 1
+    print(f"b == m -> {b == m}")  # Python says True; Typhon distinct?
+    # bool arithmetic
+    let total: int = b + m  # would Typhon accept this?
+    print(f"total={total}")
+
+if __name__ == "__main__":
+    main()

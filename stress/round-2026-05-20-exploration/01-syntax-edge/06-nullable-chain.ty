@@ -1,0 +1,22 @@
+class Address:
+    city: str?
+    zip: str?
+
+class User:
+    name: str
+    address: Address?
+
+def city_for(u: User) -> str:
+    guard a = u.address else: return "unknown"
+    guard c = a.city else: return "unknown"
+    return c
+
+def main() -> None:
+    let a: Address = Address(city="Paris", zip=None)
+    let u: User = User(name="alice", address=a)
+    let u2: User = User(name="bob", address=None)
+    print(city_for(u))
+    print(city_for(u2))
+
+if __name__ == "__main__":
+    main()

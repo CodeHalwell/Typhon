@@ -1,0 +1,25 @@
+import time
+
+# Variant 1: context manager with self-returning __enter__
+class Stopwatch:
+    label: str
+    start: float
+
+impl Stopwatch:
+    def __enter__(self) -> Stopwatch:
+        self.start = time.monotonic()
+        return self
+
+    def __exit__(self, et: object, ev: object, tb: object) -> None:
+        let elapsed: float = time.monotonic() - self.start
+        print(f"{self.label}: {elapsed*1000:.1f}ms")
+
+def main() -> None:
+    with Stopwatch(label="loop", start=0.0) as sw:
+        mut acc: int = 0
+        for i in range(10000):
+            acc = acc + i
+        print(f"acc={acc}")
+
+if __name__ == "__main__":
+    main()

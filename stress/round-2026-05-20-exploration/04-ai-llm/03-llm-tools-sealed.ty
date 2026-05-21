@@ -1,0 +1,33 @@
+class Calculator:
+    expr: str
+
+class WebSearch:
+    query: str
+
+class WeatherLookup:
+    city: str
+
+type Tool = Calculator | WebSearch | WeatherLookup
+
+def dispatch(t: Tool) -> str:
+    match t:
+        case Calculator(expr):
+            unsafe:
+                let v: object = eval(expr)
+            return f"calc({expr}) = {v}"
+        case WebSearch(query):
+            return f"web({query}) -> [stub results]"
+        case WeatherLookup(city):
+            return f"weather({city}) -> 22C clear"
+
+def main() -> None:
+    let tools: list[Tool] = [
+        Calculator(expr="2 + 2"),
+        WebSearch(query="typhon language"),
+        WeatherLookup(city="London"),
+    ]
+    for t in tools:
+        print(dispatch(t))
+
+if __name__ == "__main__":
+    main()

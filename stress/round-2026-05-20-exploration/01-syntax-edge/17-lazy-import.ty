@@ -1,0 +1,9 @@
+lazy import json
+
+def main() -> None:
+    let data: dict[str, int] = {"a": 1, "b": 2}
+    let s: str = json.dumps(data)
+    print(s)
+
+if __name__ == "__main__":
+    main()

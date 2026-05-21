@@ -1,0 +1,24 @@
+def main() -> None:
+    # (a + b).method() — parens around binary expr followed by attribute access
+    let s1: str = (1 + 2).__class__.__name__
+    print(f"s1={s1}")
+    let s2: str = (1 + 2).__repr__()
+    print(f"s2={s2}")
+    # (a - b).method()
+    let n: int = (10 - 3).bit_length()
+    print(f"n={n}")
+    # (lst + lst).method()
+    let combined: list[int] = ([1, 2] + [3, 4])
+    print(f"combined={combined}")
+    let count: int = ([1, 2] + [3, 4]).count(1)
+    print(f"count={count}")
+    # paren around mul/div
+    let s3: str = (3 * 4).__repr__()
+    print(f"s3={s3}")
+    # (a or b).method()
+    let v: str | None = None
+    let result: str = (v or "default").upper()
+    print(f"result={result}")
+
+if __name__ == "__main__":
+    main()

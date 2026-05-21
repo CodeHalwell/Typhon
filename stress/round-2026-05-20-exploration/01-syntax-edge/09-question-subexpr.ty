@@ -1,0 +1,19 @@
+def parse(s: str) -> Result[int, str]:
+    try:
+        return Ok(int(s))
+    except ValueError:
+        return Err(f"bad: {s}")
+
+def add(a: int, b: int) -> int:
+    return a + b
+
+def both(s1: str, s2: str) -> Result[int, str]:
+    return Ok(add(parse(s1)?, parse(s2)?))
+
+def main() -> None:
+    match both("3", "4"):
+        case Ok(v):  print(f"sum={v}")
+        case Err(e): print(f"err={e}")
+
+if __name__ == "__main__":
+    main()

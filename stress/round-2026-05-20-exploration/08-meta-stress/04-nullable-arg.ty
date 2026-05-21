@@ -1,0 +1,20 @@
+def takes_optional(s: str?) -> int:
+    if s is None:
+        return 0
+    return len(s)
+
+def caller_a(x: str?) -> int:
+    # Passing T? to a parameter declared T? — should be OK
+    return takes_optional(x)
+
+def caller_b() -> int:
+    let v: str? = "hi"
+    return takes_optional(v)
+
+def main() -> None:
+    print(caller_a("hello"))
+    print(caller_a(None))
+    print(caller_b())
+
+if __name__ == "__main__":
+    main()

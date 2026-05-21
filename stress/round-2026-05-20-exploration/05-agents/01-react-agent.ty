@@ -1,0 +1,67 @@
+class Step:
+    thought: str
+    action: str
+    arg: str
+    observation: str?
+
+class Plan:
+    goal: str
+    steps: list[Step]
+
+class Tool:
+    name: str
+    description: str
+
+impl Tool:
+    def call(self, arg: str) -> str:
+        if self.name == "calc":
+            unsafe:
+                let result: object = eval(arg)
+            return str(result)
+        if self.name == "echo":
+            return arg
+        return f"unknown tool: {self.name}"
+
+class Agent:
+    tools: list[Tool]
+    plan: Plan
+
+impl Agent:
+    def execute(self) -> list[str]:
+        mut log: list[str] = []
+        for step in self.plan.steps:
+            log.append(f"think: {step.thought}")
+            log.append(f"act: {step.action}({step.arg})")
+            mut found: bool = False
+            for t in self.tools:
+                if t.name == step.action:
+                    let obs: str = t.call(step.arg)
+                    log.append(f"observe: {obs}")
+                    step.observation = obs
+                    found = True
+                    break
+            if not found:
+                log.append(f"no tool '{step.action}'")
+        return log
+
+def main() -> None:
+    let plan: Plan = Plan(
+        goal="add then echo",
+        steps=[
+            Step(thought="compute 7*6", action="calc", arg="7 * 6", observation=None),
+            Step(thought="say hi", action="echo", arg="hi", observation=None),
+            Step(thought="bogus", action="missing", arg="x", observation=None),
+        ],
+    )
+    let a: Agent = Agent(
+        tools=[Tool(name="calc", description="eval"), Tool(name="echo", description="echo")],
+        plan=plan,
+    )
+    let log: list[str] = a.execute()
+    for line in log:
+        print(line)
+    for s in plan.steps:
+        print(f"step.observation={s.observation}")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,17 @@
+class Point:
+    x: int
+    y: int
+
+def classify(p: Point) -> str:
+    match p:
+        # R3.8 — `z` isn't a Point field, should be caught
+        case Point(z=z):
+            return f"z={z}"
+        case Point(x=x):
+            return f"x={x}"
+
+def main() -> None:
+    print(classify(Point(x=1, y=2)))
+
+if __name__ == "__main__":
+    main()
