@@ -897,6 +897,26 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A division-style operator (`/`, `//`, `%`) has a literal zero
+    /// on the right-hand side. The runtime will raise
+    /// `ZeroDivisionError` unconditionally; catching it at compile
+    /// time is a free win because the expression has no other
+    /// behaviour. The check is constant-fold only — runtime values
+    /// that *could* be zero are not flagged.
+    #[error("division by literal zero — `x {op} 0` always raises `ZeroDivisionError`")]
+    #[diagnostic(
+        code(tyc::div_by_zero_literal),
+        url("https://typhon.dev/lang/diagnostics/div_by_zero_literal"),
+        help("change the divisor to a non-zero value, or guard the expression behind an `if d != 0:` check")
+    )]
+    DivByZeroLiteral {
+        op: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("literal zero divisor")]
+        span: SourceSpan,
+    },
+
     /// A bare value of the base type was passed where a `newtype` is
     /// expected, without going through the explicit constructor.
     /// `newtype UserId = int` makes `UserId` nominally distinct: a
@@ -1791,6 +1811,21 @@ impl TycError {
     ) -> Self {
         Self::CyclicTypeAlias {
             name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::DivByZeroLiteral`] diagnostic.
+    pub fn div_by_zero_literal(
+        op: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::DivByZeroLiteral {
+            op: op.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

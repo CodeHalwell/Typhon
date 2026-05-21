@@ -51,6 +51,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
             include_str!("../../../../../docs/diagnostics/contains_secret_literal.md")
         }
         "cyclic_type_alias" => include_str!("../../../../../docs/diagnostics/cyclic_type_alias.md"),
+        "div_by_zero_literal" => {
+            include_str!("../../../../../docs/diagnostics/div_by_zero_literal.md")
+        }
         "duplicate_class" => include_str!("../../../../../docs/diagnostics/duplicate_class.md"),
         "extend_builtin" => include_str!("../../../../../docs/diagnostics/extend_builtin.md"),
         "frozen_assign" => include_str!("../../../../../docs/diagnostics/frozen_assign.md"),

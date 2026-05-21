@@ -5792,6 +5792,26 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     c.operator_type_mismatch(op_str, &l_stripped, &r_stripped, span);
                 }
             }
+            // Constant-fold safety lint: literal-zero RHS on `/`, `//`, `%`
+            // is always a runtime `ZeroDivisionError`. Only the
+            // literal-only case fires here so the check has zero false
+            // positives — flow-sensitive analysis (`if d == 0` guards
+            // narrowing the value) is out of scope. Skipped inside an
+            // `unsafe:` region like every other diagnostic.
+            if c.unsafe_depth == 0
+                && matches!(b.op, Operator::Div | Operator::FloorDiv | Operator::Mod)
+                && is_literal_zero(b.right.as_ref())
+            {
+                let span = (b.range.start().to_usize(), b.range.end().to_usize());
+                let op_str = arithmetic_op_str(b.op).unwrap_or("/");
+                c.diagnostics.push_error(TycError::div_by_zero_literal(
+                    op_str,
+                    &c.path,
+                    c.source,
+                    span.0,
+                    span.1.saturating_sub(span.0).max(1),
+                ));
+            }
             // User-defined operator overloads on the LHS class take
             // precedence over the conservative numeric inference below.
             // Without this, `Vec2(...) * 5.0` would resolve to `Float`
@@ -6997,6 +7017,25 @@ fn operator_operands_compatible(op: Operator, l: &Type, r: &Type) -> bool {
                 || (is_repeatable(r) && matches!(l, Type::Int | Type::Bool))
         }
         _ => true,
+    }
+}
+
+/// Recognise a literal zero on the RHS of a division-style operator.
+/// Catches both `int` (`0`) and `float` (`0.0`, `-0.0`) literals, plus
+/// the unary-minus form of either (`-0`, `-0.0`). Any non-literal
+/// expression returns `false` — we intentionally don't do flow
+/// analysis here; this is the constant-fold-only safety lint.
+fn is_literal_zero(expr: &Expr) -> bool {
+    match expr {
+        Expr::NumberLiteral(n) => match &n.value {
+            Number::Int(i) => i.as_i64() == Some(0),
+            Number::Float(f) => *f == 0.0,
+            _ => false,
+        },
+        Expr::UnaryOp(u) if matches!(u.op, ruff_python_ast::UnaryOp::USub) => {
+            is_literal_zero(u.operand.as_ref())
+        }
+        _ => false,
     }
 }
 
@@ -8665,6 +8704,128 @@ let r: str = greet(\"Amy\", weird_name=\"Hi\", another=\"x\")
             "**kwargs must absorb arbitrary names; got {:?}",
             d.errors()
         );
+    }
+
+    // ── newtype (Phase A) ───────────────────────────────────────────────
+
+    #[test]
+    fn newtype_accepts_explicit_construction() {
+        let src = "\
+newtype UserId = int
+def greet(uid: UserId) -> str:
+    return \"hi\"
+let me: UserId = UserId(7)
+let _msg: str = greet(me)
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn newtype_rejects_bare_base_value() {
+        let src = "\
+newtype UserId = int
+def greet(uid: UserId) -> str:
+    return \"hi\"
+let raw: int = 7
+let _msg: str = greet(raw)
+";
+        let d = check(src);
+        assert!(d.has_errors(), "expected type mismatch on bare int → UserId");
+    }
+
+    #[test]
+    fn newtype_allows_escape_upward_to_base() {
+        let src = "\
+newtype UserId = int
+def double(n: int) -> int:
+    return n * 2
+let me: UserId = UserId(7)
+let _twice: int = double(me)
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn newtype_rejects_cross_newtype_assignment() {
+        let src = "\
+newtype UserId = int
+newtype PostId = int
+def greet(uid: UserId) -> str:
+    return \"hi\"
+let post: PostId = PostId(42)
+let _msg: str = greet(post)
+";
+        let d = check(src);
+        assert!(d.has_errors(), "expected type mismatch on PostId → UserId");
+    }
+
+    #[test]
+    fn newtype_constructor_arg_type_checked() {
+        let src = "\
+newtype UserId = int
+let bad: UserId = UserId(\"seven\")
+";
+        let d = check(src);
+        assert!(d.has_errors(), "expected newtype_violation for str arg");
+    }
+
+    // ── div-by-zero literal (Phase B) ───────────────────────────────────
+
+    #[test]
+    fn div_by_literal_zero_errors() {
+        let src = "let r: float = 1 / 0\n";
+        let d = check(src);
+        assert!(d.has_errors(), "expected div_by_zero_literal");
+    }
+
+    #[test]
+    fn floor_div_by_literal_zero_errors() {
+        let src = "let r: int = 7 // 0\n";
+        let d = check(src);
+        assert!(d.has_errors(), "expected div_by_zero_literal for //");
+    }
+
+    #[test]
+    fn mod_by_literal_zero_errors() {
+        let src = "let r: int = 7 % 0\n";
+        let d = check(src);
+        assert!(d.has_errors(), "expected div_by_zero_literal for %");
+    }
+
+    #[test]
+    fn div_by_negative_zero_literal_errors() {
+        let src = "let r: float = 1 / -0\n";
+        let d = check(src);
+        assert!(d.has_errors(), "expected div_by_zero_literal for -0");
+    }
+
+    #[test]
+    fn div_by_float_zero_literal_errors() {
+        let src = "let r: float = 1.0 / 0.0\n";
+        let d = check(src);
+        assert!(d.has_errors(), "expected div_by_zero_literal for 0.0");
+    }
+
+    #[test]
+    fn div_by_nonzero_literal_ok() {
+        let src = "let r: float = 1 / 2\n";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn div_by_runtime_value_ok() {
+        // Flow-sensitive analysis is out of scope: a runtime value
+        // that could be zero is *not* flagged. Keeps the check
+        // false-positive-free.
+        let src = "\
+def f(d: int) -> float:
+    return 1 / d
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "{:?}", d.errors());
     }
 
     #[test]
