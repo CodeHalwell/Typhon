@@ -20,8 +20,9 @@ use tower_lsp_server::ls_types::{
     Documentation, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
     HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, Location,
     MarkupContent, MarkupKind, MessageType, NumberOrString, OneOf, Position, Range,
-    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri,
-    WorkspaceEdit,
+    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
 };
 use tower_lsp_server::{jsonrpc, Client, LanguageServer, LspService, Server};
 use tyc_db::{
@@ -33,6 +34,7 @@ use tyc_resolve::{
     BindingKind, ClassKind, ImportInfo, Mutability, ResolveOptions, ResolvedModule, SymbolAtOffset,
 };
 
+mod semantic;
 mod stdlib_stubs;
 mod venv_introspect;
 
@@ -402,6 +404,20 @@ impl LanguageServer for Backend {
                     ..Default::default()
                 }),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                // Advertise semantic tokens with the legend declared in
+                // `semantic::legend()`. Indices into that legend are
+                // baked into the token stream, so changing the order
+                // would force every theme to re-bind colours — keep
+                // it stable across releases.
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(
+                        SemanticTokensOptions {
+                            legend: semantic::legend(),
+                            full: Some(SemanticTokensFullOptions::Bool(true)),
+                            ..Default::default()
+                        },
+                    ),
+                ),
                 ..Default::default()
             },
             ..Default::default()
@@ -503,6 +519,45 @@ impl LanguageServer for Backend {
             }),
             range,
         }))
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> jsonrpc::Result<Option<SemanticTokensResult>> {
+        let uri = params.text_document.uri;
+        let Some(sf) = self.source_file_for(&uri).await else {
+            return Ok(None);
+        };
+        // Pull the preprocessed source + resolved bindings out of
+        // Salsa — both are tracked queries, so the second call on an
+        // unchanged file is a cache hit. Cloning the `Arc` is cheap.
+        let (preprocessed, resolved) = {
+            let db = self.db.lock().await;
+            (preprocessed_text(&*db, sf), resolved_module_arc(&*db, sf))
+        };
+        // Parse the preprocessed source for the AST walk
+        // (attribute-access tokens). `parse_module` is fast — the
+        // type checker already does it on every check pass — but the
+        // result isn't currently Salsa-cached for the LSP, so we
+        // re-parse here. Cheap enough at the file sizes we expect;
+        // can be promoted to a tracked query later if profiling
+        // says it matters.
+        let module = match tyc_syntax::parse_module(&preprocessed) {
+            Ok(p) => p.into_syntax(),
+            Err(_) => {
+                // Parse errors are surfaced through diagnostics
+                // already; the semantic-tokens stream stays empty so
+                // the editor falls back to the TextMate grammar
+                // without a confusing partial colouring.
+                return Ok(Some(SemanticTokensResult::Tokens(
+                    tower_lsp_server::ls_types::SemanticTokens::default(),
+                )));
+            }
+        };
+        let stdlib = tyc_resolve::python_stdlib_modules();
+        let tokens = semantic::compute(&preprocessed, &resolved, &module, stdlib);
+        Ok(Some(SemanticTokensResult::Tokens(tokens)))
     }
 
     async fn completion(
@@ -2631,18 +2686,321 @@ fn render_docstring(doc: &str) -> String {
             _ => Vec::new(),
         }
     };
+    let formatted = format_docstring_sections(&trimmed);
     // Cap the docstring so a multi-thousand-line module-level docstring
     // (numpy.array has one of these) doesn't flood the popover. 40
     // lines + a `…` continuation marker is enough for the use-case
     // (a quick "what does this do" preview).
     const MAX_LINES: usize = 40;
-    if trimmed.len() <= MAX_LINES {
-        trimmed.join("\n")
+    let line_count = formatted.lines().count();
+    if line_count <= MAX_LINES {
+        formatted
     } else {
-        let mut out = trimmed[..MAX_LINES].join("\n");
+        let mut out: String = formatted
+            .lines()
+            .take(MAX_LINES)
+            .collect::<Vec<_>>()
+            .join("\n");
         out.push_str("\n\n*…(docstring truncated; run `help()` for full text)*");
         out
     }
+}
+
+/// Detect and re-render structured sections of a Python docstring
+/// (Google / NumPy / Sphinx flavour) as proper Markdown so the LSP
+/// hover popover shows headings and parameter lists instead of a
+/// wall of indented text.
+///
+/// Supported shapes:
+///
+/// - **Google.** `Args:` / `Arguments:` / `Returns:` / `Raises:` /
+///   `Yields:` / `Examples:` / `Attributes:` / `Note:` / `Warning:`
+///   followed by an indented block. Param lines (`name: desc` or
+///   `name (type): desc`) become `- **name** — desc` bullets.
+/// - **NumPy.** A header line followed by a row of `---` underlines.
+///   Parameters use `name : type\n    desc`; we collapse to a
+///   single bullet per name.
+/// - **Sphinx / reST.** `:param NAME: desc` and `:returns: desc` /
+///   `:raises Exc: desc` become bullets under synthesised headings.
+///
+/// Unknown / unrecognised content is preserved verbatim — falling
+/// back to the upstream library's wording is always safer than
+/// guessing structure.
+fn format_docstring_sections(lines: &[&str]) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+    let mut out: Vec<String> = Vec::with_capacity(lines.len());
+    let mut i = 0usize;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim_start();
+        // NumPy section: `Header\n------` shape (the underline must
+        // be at least 3 dashes long). When the header maps to a
+        // recognised section name (`Parameters`, `Returns`, …) the
+        // canonical form is used so themes can target it. Unknown
+        // headers fall back to the *original* text — better than
+        // collapsing every section the author invented into a
+        // single `**Section**` bucket.
+        if i + 1 < lines.len() && is_numpy_underline(lines[i + 1]) && !trimmed.is_empty() {
+            let title = canonical_section_title_opt(trimmed)
+                .map(str::to_owned)
+                .unwrap_or_else(|| trimmed.to_owned());
+            out.push(format!("**{title}**"));
+            out.push(String::new());
+            i += 2;
+            // Collect the body lines for this section until the next
+            // header (NumPy underline detection) or end of doc.
+            let body_start = i;
+            while i < lines.len()
+                && !(i + 1 < lines.len()
+                    && is_numpy_underline(lines[i + 1])
+                    && !lines[i].trim().is_empty())
+            {
+                i += 1;
+            }
+            render_param_block(&lines[body_start..i], &mut out);
+            continue;
+        }
+        // Google-style header: a section name followed by `:` on a
+        // line by itself.
+        if let Some(title) = google_section_header(line) {
+            out.push(format!("**{title}**"));
+            out.push(String::new());
+            i += 1;
+            // The Google block is bounded by the next non-indented
+            // line. Headers themselves are flush-left after the
+            // PEP 257 strip; the block is one indent level deeper.
+            let body_start = i;
+            while i < lines.len()
+                && (lines[i].starts_with(' ') || lines[i].starts_with('\t') || lines[i].is_empty())
+            {
+                i += 1;
+            }
+            render_param_block(&lines[body_start..i], &mut out);
+            continue;
+        }
+        // Sphinx / reST `:param X: desc`. We collect runs into a
+        // synthetic Parameters heading so the user gets a list.
+        // Continuation lines (indented body under a `:param`) are
+        // appended to the current bullet so multi-line parameter
+        // descriptions survive the re-render — dropping them would
+        // silently lose docstring content.
+        if trimmed.starts_with(":param ") || trimmed.starts_with(":parameter ") {
+            let block_start = i;
+            while i < lines.len()
+                && (lines[i].trim_start().starts_with(":param ")
+                    || lines[i].trim_start().starts_with(":parameter ")
+                    || (i > block_start && (lines[i].starts_with(' ') || lines[i].is_empty())))
+            {
+                i += 1;
+            }
+            out.push("**Parameters**".to_owned());
+            out.push(String::new());
+            let mut current_bullet: Option<String> = None;
+            for sphinx_line in &lines[block_start..i] {
+                let stripped = sphinx_line.trim_start();
+                if let Some(bullet) = sphinx_param_to_bullet(stripped) {
+                    if let Some(prev) = current_bullet.take() {
+                        out.push(prev);
+                    }
+                    current_bullet = Some(bullet);
+                } else if !stripped.is_empty() {
+                    if let Some(b) = current_bullet.as_mut() {
+                        b.push(' ');
+                        b.push_str(stripped);
+                    }
+                }
+            }
+            if let Some(b) = current_bullet.take() {
+                out.push(b);
+            }
+            continue;
+        }
+        // Sphinx `:raises Exc: desc` (and the singular `:raise`).
+        // Collected like `:param` so a run of consecutive raises
+        // directives produces a single **Raises** section.
+        if trimmed.starts_with(":raises ")
+            || trimmed.starts_with(":raise ")
+            || trimmed.starts_with(":except ")
+        {
+            let block_start = i;
+            while i < lines.len()
+                && (lines[i].trim_start().starts_with(":raises ")
+                    || lines[i].trim_start().starts_with(":raise ")
+                    || lines[i].trim_start().starts_with(":except ")
+                    || (i > block_start && (lines[i].starts_with(' ') || lines[i].is_empty())))
+            {
+                i += 1;
+            }
+            out.push("**Raises**".to_owned());
+            out.push(String::new());
+            let mut current_bullet: Option<String> = None;
+            for sphinx_line in &lines[block_start..i] {
+                let stripped = sphinx_line.trim_start();
+                if let Some(bullet) = sphinx_raises_to_bullet(stripped) {
+                    if let Some(prev) = current_bullet.take() {
+                        out.push(prev);
+                    }
+                    current_bullet = Some(bullet);
+                } else if !stripped.is_empty() {
+                    if let Some(b) = current_bullet.as_mut() {
+                        b.push(' ');
+                        b.push_str(stripped);
+                    }
+                }
+            }
+            if let Some(b) = current_bullet.take() {
+                out.push(b);
+            }
+            continue;
+        }
+        if trimmed.starts_with(":returns:") || trimmed.starts_with(":return:") {
+            let desc = trimmed
+                .trim_start_matches(":returns:")
+                .trim_start_matches(":return:")
+                .trim();
+            out.push("**Returns**".to_owned());
+            out.push(String::new());
+            if !desc.is_empty() {
+                out.push(desc.to_owned());
+            }
+            i += 1;
+            continue;
+        }
+        // Fallback — preserve the line verbatim.
+        out.push(line.to_owned());
+        i += 1;
+    }
+    // Collapse runs of more than one blank line — the re-rendering
+    // can leave empty entries where source had a single blank.
+    let mut collapsed: Vec<String> = Vec::with_capacity(out.len());
+    let mut prev_blank = false;
+    for line in out {
+        let is_blank = line.is_empty();
+        if is_blank && prev_blank {
+            continue;
+        }
+        prev_blank = is_blank;
+        collapsed.push(line);
+    }
+    collapsed.join("\n")
+}
+
+/// `Args:` → `Args`. `args:` and `Args :` are also accepted (tolerant
+/// to author typos). Returns `None` when the line isn't a Google-style
+/// section header.
+fn google_section_header(line: &str) -> Option<&'static str> {
+    let trimmed = line.trim();
+    let body = trimmed.strip_suffix(':')?;
+    canonical_section_title_opt(body.trim())
+}
+
+/// NumPy underline: a line of only `-` / `=` / `~` characters, at
+/// least 3 long. NumPy itself uses `-`; some authors use `=`.
+fn is_numpy_underline(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.len() >= 3 && trimmed.chars().all(|c| c == '-' || c == '=' || c == '~')
+}
+
+/// Map a section name to its canonical capitalised form. Returns
+/// `None` for unrecognised names.
+fn canonical_section_title_opt(name: &str) -> Option<&'static str> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "args" | "arguments" | "params" | "parameters" => "Parameters",
+        "returns" | "return" => "Returns",
+        "yields" | "yield" => "Yields",
+        "raises" | "raise" | "except" | "exceptions" => "Raises",
+        "examples" | "example" => "Examples",
+        "attributes" => "Attributes",
+        "note" | "notes" => "Note",
+        "warning" | "warnings" => "Warning",
+        "see also" => "See Also",
+        _ => return None,
+    })
+}
+
+/// Render the contents of a parameter block (Google `Args:` body or
+/// NumPy `Parameters` body) as Markdown bullets. Lines that don't
+/// look like `name: description` are preserved verbatim so prose
+/// inside a section doesn't get mangled.
+fn render_param_block(body: &[&str], out: &mut Vec<String>) {
+    // Detect the indent the block's first param line uses; subsequent
+    // continuation lines that share or exceed that indent are folded
+    // into the same bullet.
+    let mut current_bullet: Option<String> = None;
+    for line in body {
+        if line.trim().is_empty() {
+            if let Some(b) = current_bullet.take() {
+                out.push(b);
+            }
+            continue;
+        }
+        let stripped = line.trim_start();
+        // Detect `name: description` (Google) or `name : type` (NumPy).
+        if let Some((name, rest)) = split_param_line(stripped) {
+            if let Some(b) = current_bullet.take() {
+                out.push(b);
+            }
+            let bullet = if rest.is_empty() {
+                format!("- **{name}**")
+            } else {
+                format!("- **{name}** — {rest}")
+            };
+            current_bullet = Some(bullet);
+        } else if current_bullet.is_some() {
+            // Continuation of the previous bullet.
+            if let Some(b) = current_bullet.as_mut() {
+                b.push(' ');
+                b.push_str(stripped);
+            }
+        } else {
+            // Free prose inside the section.
+            if let Some(b) = current_bullet.take() {
+                out.push(b);
+            }
+            out.push(line.to_string());
+        }
+    }
+    if let Some(b) = current_bullet.take() {
+        out.push(b);
+    }
+}
+
+/// Split `name: description` (Google) or `name (type): description`
+/// or `name : type` (NumPy first line) into `(name, description)`.
+/// Returns `None` when the line doesn't fit any of those shapes.
+fn split_param_line(line: &str) -> Option<(String, String)> {
+    let (head, tail) = line.split_once(':')?;
+    let head = head.trim();
+    // Names must look like Python identifiers (possibly with a
+    // trailing `(type)` annotation, which we strip).
+    let name = head.split_whitespace().next()?.trim();
+    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return None;
+    }
+    Some((name.to_owned(), tail.trim().to_owned()))
+}
+
+/// `:param name: description` → `- **name** — description`.
+fn sphinx_param_to_bullet(line: &str) -> Option<String> {
+    let rest = line
+        .strip_prefix(":param ")
+        .or_else(|| line.strip_prefix(":parameter "))?;
+    let (name, desc) = rest.split_once(':')?;
+    Some(format!("- **{}** — {}", name.trim(), desc.trim()))
+}
+
+/// `:raises ValueError: description` → `- **ValueError** — description`.
+/// Accepts the singular `:raise` and the obscure `:except` variants
+/// the older docutils dialect used.
+fn sphinx_raises_to_bullet(line: &str) -> Option<String> {
+    let rest = line
+        .strip_prefix(":raises ")
+        .or_else(|| line.strip_prefix(":raise "))
+        .or_else(|| line.strip_prefix(":except "))?;
+    let (exc, desc) = rest.split_once(':')?;
+    Some(format!("- **{}** — {}", exc.trim(), desc.trim()))
 }
 
 /// `inspect.signature(obj)` returns the pretty form `(arg1, arg2=…)`,
@@ -2868,19 +3226,21 @@ mod tests {
     #[test]
     fn render_docstring_strips_pep257_indent() {
         // Python docstring with the typical 4-space indent on
-        // continuation lines. Renderer should produce a flat
-        // multi-line string with the indent removed and surrounding
-        // blank lines trimmed.
+        // continuation lines. Renderer must strip the common indent
+        // before delegating to the section formatter. Without the
+        // PEP 257 pass, every body line would still be indented and
+        // the `Args:` header detection would miss the section.
         let doc = "Build a new Agent.\n\n    Args:\n        name: human-readable label.\n        client: the LLM client to call.\n    ";
         let out = render_docstring(doc);
-        let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines[0], "Build a new Agent.");
-        assert_eq!(lines[1], "");
-        assert_eq!(lines[2], "Args:");
-        assert_eq!(lines[3], "    name: human-readable label.");
-        assert_eq!(lines[4], "    client: the LLM client to call.");
-        // Trailing blank line trimmed.
-        assert_eq!(lines.len(), 5);
+        // First line preserved as the docstring intro.
+        assert!(out.starts_with("Build a new Agent."), "intro: {out}");
+        // PEP 257 indent stripped: the section formatter would only
+        // match `Args:` flush-left, which it does in this output.
+        assert!(out.contains("**Parameters**"), "section header: {out}");
+        assert!(
+            out.contains("- **name** — human-readable label."),
+            "name bullet: {out}"
+        );
     }
 
     #[test]
@@ -2905,6 +3265,122 @@ mod tests {
     fn render_docstring_handles_first_line_only() {
         let out = render_docstring("Add two numbers.");
         assert_eq!(out, "Add two numbers.");
+    }
+
+    #[test]
+    fn render_docstring_formats_google_style_args() {
+        // Google-style `Args:` block — the most common shape in
+        // modern Python. The renderer must produce a bold section
+        // header and bullet each parameter so the hover popover
+        // reads as structured text.
+        let doc = "Build a new Agent.\n\n    Args:\n        name: human-readable label.\n        client: the LLM client to call.\n        tools: list of tool callables.\n\n    Returns:\n        A configured Agent instance.\n";
+        let out = render_docstring(doc);
+        assert!(out.contains("**Parameters**"), "Args header: {out}");
+        assert!(
+            out.contains("- **name** — human-readable label."),
+            "name bullet: {out}"
+        );
+        assert!(
+            out.contains("- **client** — the LLM client to call."),
+            "client bullet: {out}"
+        );
+        assert!(out.contains("**Returns**"), "Returns header: {out}");
+    }
+
+    #[test]
+    fn render_docstring_formats_numpy_style_parameters() {
+        // NumPy's `Parameters\n----------` underline shape.
+        let doc = "Compute the dot product.\n\nParameters\n----------\na : ndarray\n    First operand.\nb : ndarray\n    Second operand.\n\nReturns\n-------\nfloat\n    The scalar dot product.\n";
+        let out = render_docstring(doc);
+        assert!(out.contains("**Parameters**"));
+        assert!(out.contains("- **a**"), "a bullet: {out}");
+        assert!(out.contains("- **b**"), "b bullet: {out}");
+        assert!(out.contains("**Returns**"));
+    }
+
+    #[test]
+    fn render_docstring_formats_sphinx_param_directives() {
+        // Sphinx / reST `:param name: desc` directives.
+        let doc = "Connect to the server.\n\n:param host: hostname to dial.\n:param port: TCP port.\n:returns: a Connection.\n";
+        let out = render_docstring(doc);
+        assert!(out.contains("**Parameters**"));
+        assert!(out.contains("- **host** — hostname to dial."));
+        assert!(out.contains("- **port** — TCP port."));
+        assert!(out.contains("**Returns**"));
+        assert!(out.contains("a Connection."));
+    }
+
+    #[test]
+    fn render_docstring_preserves_unrecognised_sections() {
+        // Free prose without any section headers passes through
+        // unchanged — better to be conservative than to mangle.
+        let doc = "Simple one-liner with no structure.";
+        let out = render_docstring(doc);
+        assert_eq!(out, "Simple one-liner with no structure.");
+    }
+
+    #[test]
+    fn render_docstring_formats_sphinx_raises_directive() {
+        // `:raises Exc: desc` was advertised in the PR but the
+        // original implementation had no handler — the directive
+        // would have fallen through verbatim. Regression: collect
+        // a run of `:raises` lines under a synthesised **Raises**
+        // heading with bullets.
+        let doc = "Connect.\n\n:raises ConnectionError: dial failed.\n:raises TimeoutError: server didn't respond.\n";
+        let out = render_docstring(doc);
+        assert!(out.contains("**Raises**"), "header: {out}");
+        assert!(
+            out.contains("- **ConnectionError** — dial failed."),
+            "first bullet: {out}"
+        );
+        assert!(
+            out.contains("- **TimeoutError** — server didn't respond."),
+            "second bullet: {out}"
+        );
+    }
+
+    #[test]
+    fn render_docstring_folds_sphinx_param_continuations() {
+        // Multi-line `:param` descriptions used to get dropped:
+        // the block collector grabbed the continuation lines but
+        // the renderer only emitted bullets for `:param` directives.
+        // Continuation text now folds into the prior bullet so no
+        // docstring content is lost.
+        let doc = "Open.\n\n:param host: hostname to dial,\n    accepts IPv4 and IPv6 addresses.\n:param port: TCP port.\n";
+        let out = render_docstring(doc);
+        let host_bullet = out
+            .lines()
+            .find(|l| l.starts_with("- **host**"))
+            .expect("host bullet present");
+        assert!(
+            host_bullet.contains("accepts IPv4 and IPv6 addresses."),
+            "continuation folded in: {host_bullet}"
+        );
+    }
+
+    #[test]
+    fn render_docstring_preserves_unknown_numpy_header_text() {
+        // NumPy underlines can sit under any header the author
+        // wrote. When the title doesn't match one of the curated
+        // sections (`Parameters`, `Returns`, …) the original text
+        // is preserved instead of being collapsed to a generic
+        // **Section** stub.
+        let doc = "Compute.\n\nGotchas\n-------\nWatch out for division by zero.\n";
+        let out = render_docstring(doc);
+        assert!(
+            out.contains("**Gotchas**"),
+            "original header preserved: {out}"
+        );
+        assert!(!out.contains("**Section**"), "no Section stub: {out}");
+        assert!(out.contains("Watch out for division by zero."));
+    }
+
+    #[test]
+    fn render_docstring_handles_examples_section() {
+        let doc = "Do the thing.\n\n    Examples:\n        >>> do_the_thing()\n        42\n";
+        let out = render_docstring(doc);
+        assert!(out.contains("**Examples**"), "header: {out}");
+        assert!(out.contains(">>> do_the_thing()"), "code line: {out}");
     }
 
     #[test]
