@@ -432,7 +432,7 @@ mod tests {
         let src = "import os\n";
         let (source, resolved, module) = parse_and_resolve(src);
         let stdlib = stdlib();
-        let stdlib_refs: Vec<&str> = stdlib.iter().copied().collect();
+        let stdlib_refs: Vec<&str> = stdlib.to_vec();
         let result = compute(&source, &resolved, &module, &stdlib_refs);
         let (ty, modifiers) = token_at(&source, "os", &result.data).expect("os token");
         assert_eq!(ty, TOKEN_NAMESPACE, "bare `import os` is a namespace");
@@ -447,7 +447,7 @@ mod tests {
         let src = "from agent_framework import Agent\n";
         let (source, resolved, module) = parse_and_resolve(src);
         let stdlib = stdlib();
-        let stdlib_refs: Vec<&str> = stdlib.iter().copied().collect();
+        let stdlib_refs: Vec<&str> = stdlib.to_vec();
         let result = compute(&source, &resolved, &module, &stdlib_refs);
         let (ty, modifiers) = token_at(&source, "Agent", &result.data).expect("Agent token");
         assert_eq!(ty, TOKEN_CLASS, "from-imports are tagged as class");
@@ -477,7 +477,7 @@ mod tests {
         let src = "import os\nx = os.getcwd()\n";
         let (source, resolved, module) = parse_and_resolve(src);
         let stdlib = stdlib();
-        let stdlib_refs: Vec<&str> = stdlib.iter().copied().collect();
+        let stdlib_refs: Vec<&str> = stdlib.to_vec();
         let result = compute(&source, &resolved, &module, &stdlib_refs);
         let (ty, _) = token_at(&source, "getcwd", &result.data).expect("getcwd token");
         assert_eq!(ty, TOKEN_METHOD, "`os.getcwd()` is a method call");
@@ -488,7 +488,7 @@ mod tests {
         let src = "import os\np = os.sep\n";
         let (source, resolved, module) = parse_and_resolve(src);
         let stdlib = stdlib();
-        let stdlib_refs: Vec<&str> = stdlib.iter().copied().collect();
+        let stdlib_refs: Vec<&str> = stdlib.to_vec();
         let result = compute(&source, &resolved, &module, &stdlib_refs);
         let (ty, _) = token_at(&source, "sep", &result.data).expect("sep token");
         assert_eq!(ty, TOKEN_PROPERTY, "`os.sep` is a property read");
