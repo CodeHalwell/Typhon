@@ -69,6 +69,16 @@ pub enum TyphonKeyword {
     /// `@dataclass` decorator, but — unlike `class!` — it never synthesises
     /// an `__init__`. The body is emitted exactly as written.
     PlainClass,
+    /// `newtype` — declares a nominal alias over a base type.
+    ///
+    /// `newtype UserId = int` lowers to `UserId = NewType("UserId", int)`
+    /// (Python `typing.NewType`) at preprocess time. The type checker
+    /// treats `UserId` as nominally distinct from `int`: a bare `int`
+    /// flowing into a `UserId`-typed slot is rejected, while a `UserId`
+    /// flows into an `int` slot freely. Construction goes through
+    /// `UserId(x)`, which type-checks the argument against `int` and
+    /// yields a `UserId`-typed value.
+    Newtype,
 }
 
 impl TyphonKeyword {
@@ -88,6 +98,7 @@ impl TyphonKeyword {
             Self::Lazy => "lazy",
             Self::RawClass => "class!",
             Self::PlainClass => "plain class",
+            Self::Newtype => "newtype",
         }
     }
 
@@ -106,6 +117,7 @@ impl TyphonKeyword {
             "go" => Some(Self::Go),
             "lazy" => Some(Self::Lazy),
             "class!" => Some(Self::RawClass),
+            "newtype" => Some(Self::Newtype),
             _ => None,
         }
     }

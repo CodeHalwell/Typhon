@@ -97,6 +97,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
             include_str!("../../../../../docs/diagnostics/missing_initialiser.md")
         }
         "missing_return" => include_str!("../../../../../docs/diagnostics/missing_return.md"),
+        "newtype_violation" => {
+            include_str!("../../../../../docs/diagnostics/newtype_violation.md")
+        }
         "no_block_shadow" => include_str!("../../../../../docs/diagnostics/no_block_shadow.md"),
         "non_exhaustive_match" => {
             include_str!("../../../../../docs/diagnostics/non_exhaustive_match.md")

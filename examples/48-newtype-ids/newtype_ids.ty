@@ -1,0 +1,50 @@
+newtype UserId = int
+newtype PostId = int
+newtype Email = str
+
+
+def greet(uid: UserId, email: Email) -> str:
+    return f"hi user#{uid} ({email})"
+
+
+def double(n: int) -> int:
+    return n * 2
+
+
+def demo_construct_and_use() -> None:
+    let me: UserId = UserId(7)
+    let address: Email = Email("ada@example.com")
+    print(greet(me, address))
+
+
+def demo_escape_upward() -> None:
+    # A newtype value flows freely into a slot typed as its base.
+    # `UserId` is nominally distinct from `int`, but the runtime
+    # value *is* an `int`, so passing it to a function that takes
+    # `int` is allowed without an explicit unwrap.
+    let me: UserId = UserId(21)
+    let twice: int = double(me)
+    print(f"21 doubled = {twice}")
+
+
+def demo_cross_newtype_rejected() -> None:
+    # The next two lines would fail `tyc check`:
+    #
+    #     let post: PostId = PostId(42)
+    #     greet(post, Email("x@y.z"))
+    #     # tyc::type_mismatch — expected `UserId`, found `PostId`
+    #
+    # The two newtypes share a base (`int`), but they are nominally
+    # distinct: a `PostId` cannot satisfy a `UserId`-typed parameter
+    # without going through the explicit constructor.
+    pass
+
+
+def main() -> None:
+    demo_construct_and_use()
+    demo_escape_upward()
+    demo_cross_newtype_rejected()
+
+
+if __name__ == "__main__":
+    main()

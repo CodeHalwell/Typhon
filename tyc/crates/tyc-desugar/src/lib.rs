@@ -141,6 +141,11 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
     let needs_protocol = stmts_use_protocol_base(&desugared_mod.body);
     let inject_protocol = needs_protocol && !has_protocol_import(&desugared_mod.body);
 
+    // `newtype Name = Base` lowers to `Name = NewType("Name", Base)` —
+    // ensure `from typing import NewType` is in scope.
+    let needs_newtype = stmts_use_newtype_call(&desugared_mod.body);
+    let inject_newtype = needs_newtype && !has_newtype_import(&desugared_mod.body);
+
     // `gather:` lowers to `asyncio.TaskGroup` and best-effort to
     // `asyncio.gather(...)` — ensure `import asyncio` is in scope.
     let needs_asyncio = stmts_use_asyncio_qualified(&desugared_mod.body);
@@ -165,6 +170,9 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
     }
     if inject_protocol {
         body.insert(insert_at, make_protocol_import());
+    }
+    if inject_newtype {
+        body.insert(insert_at, make_newtype_import());
     }
     if inject_result_import {
         body.insert(insert_at, make_typhon_runtime_import());
@@ -488,6 +496,68 @@ fn make_protocol_import() -> Stmt {
         names: vec![make_alias("Protocol")],
         level: 0,
         is_lazy: false,
+    })
+}
+
+fn make_newtype_import() -> Stmt {
+    Stmt::ImportFrom(StmtImportFrom {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        module: Some(make_identifier("typing")),
+        names: vec![make_alias("NewType")],
+        level: 0,
+        is_lazy: false,
+    })
+}
+
+/// `true` when `body` already binds the bare name `NewType` from `typing`.
+fn has_newtype_import(body: &[Stmt]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::ImportFrom(i) => {
+            i.module.as_ref().map(|m| m.as_str()) == Some("typing")
+                && i.names.iter().any(|a| match a.name.as_str() {
+                    "NewType" => matches!(
+                        a.asname.as_ref().map(|n| n.as_str()),
+                        None | Some("NewType")
+                    ),
+                    "*" => true,
+                    _ => false,
+                })
+        }
+        _ => false,
+    })
+}
+
+/// `true` when `body` has at least one module-level assignment of the form
+/// `Name = NewType("Name", Base)`. The desugar pass uses this to decide
+/// whether `from typing import NewType` needs to be injected.
+fn stmts_use_newtype_call(body: &[Stmt]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::Assign(a) => {
+            if a.targets.len() != 1 {
+                return false;
+            }
+            let Expr::Name(target_name) = &a.targets[0] else {
+                return false;
+            };
+            let Expr::Call(call) = a.value.as_ref() else {
+                return false;
+            };
+            let Expr::Name(callee) = call.func.as_ref() else {
+                return false;
+            };
+            if callee.id.as_str() != "NewType" {
+                return false;
+            }
+            let Some(first_arg) = call.arguments.args.first() else {
+                return false;
+            };
+            let Expr::StringLiteral(s) = first_arg else {
+                return false;
+            };
+            s.value.to_str() == target_name.id.as_str()
+        }
+        _ => false,
     })
 }
 

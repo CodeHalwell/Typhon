@@ -186,6 +186,36 @@ pub fn preprocess(source: &str) -> PreprocessResult {
             let indent = &line[..indent_len];
             let rest = &line[indent_len..];
 
+            // ── `newtype Name = Base` → `Name = NewType("Name", Base)` ───────
+            // Module-level only. The desugar pass injects
+            // `from typing import NewType` when at least one such
+            // declaration is detected in the emitted AST. The type
+            // checker recognises the pattern directly and registers
+            // `Name` as a nominal newtype distinct from `Base`.
+            if indent_len == 0 {
+                if let Some(after_raw) = rest.strip_prefix("newtype ") {
+                    let after = after_raw.trim_end_matches(['\n', '\r']);
+                    if let Some((name, base)) = parse_newtype_decl(after) {
+                        stripped.push(StrippedKeyword {
+                            line_index,
+                            keyword: TyphonKeyword::Newtype,
+                        });
+                        let new_line = format!("{} = NewType(\"{}\", {})\n", name, name, base);
+                        let (rewritten, marks) = rewrite_optionals(&new_line, &mut in_string);
+                        for col in marks {
+                            optionals.push(StrippedOptional {
+                                line_index,
+                                python_col: col,
+                            });
+                        }
+                        python_source.push_str(&rewritten);
+                        continue;
+                    }
+                    // Unrecognised `newtype` form — fall through to produce
+                    // a parse error from the Python parser.
+                }
+            }
+
             // ── `lazy import ALIAS = MODULE` → `import MODULE as ALIAS` ─────
             // Only recognised at module level (indent_len == 0) so that
             // indented `lazy` expressions (rare but valid Python identifiers)
@@ -594,6 +624,43 @@ pub fn preprocess(source: &str) -> PreprocessResult {
         frozen_class_lines,
         plain_class_lines,
     }
+}
+
+/// Parse the tail of a `newtype` line: `Name = Base`.
+///
+/// Returns `(name, base)` on success, `None` if the syntax is malformed.
+/// `Name` must be a valid Python identifier; `Base` is forwarded verbatim
+/// as the inner type expression so generic forms (`list[int]`,
+/// `dict[str, int]`, `Result[int, str]`) are supported.
+fn parse_newtype_decl(tail: &str) -> Option<(String, String)> {
+    let code = tail.split('#').next().unwrap_or("").trim();
+    let eq = code.find('=')?;
+    let name = code[..eq].trim().to_owned();
+    let base = code[eq + 1..].trim().to_owned();
+    if !is_python_ident(&name) || base.is_empty() {
+        return None;
+    }
+    Some((name, base))
+}
+
+/// Reverse [`parse_newtype_decl`]'s emission: take the preprocessed
+/// `Name = NewType("Name", Base)` form and restore `newtype Name = Base`.
+/// Returns `None` if the line doesn't match the expected shape (in which
+/// case the postprocessor leaves the line unchanged).
+fn restore_newtype_decl(content: &str) -> Option<String> {
+    let eq = content.find('=')?;
+    let name = content[..eq].trim();
+    let rhs = content[eq + 1..].trim();
+    let rhs = rhs.strip_prefix("NewType(")?;
+    let rhs = rhs.strip_suffix(')')?;
+    let comma = rhs.find(',')?;
+    let quoted = rhs[..comma].trim();
+    let base = rhs[comma + 1..].trim();
+    let qname = quoted.strip_prefix('"')?.strip_suffix('"')?;
+    if qname != name || !is_python_ident(name) || base.is_empty() {
+        return None;
+    }
+    Some(format!("newtype {} = {}", name, base))
 }
 
 /// Parse the tail of a `lazy import` line: `ALIAS = MODULE`.
@@ -1398,6 +1465,16 @@ pub fn postprocess_full(
                 } else {
                     content.to_owned()
                 };
+                lines[line_idx] = format!("{}{}", &line[..indent_len], restored);
+            }
+            TyphonKeyword::Newtype => {
+                // Restore `Name = NewType("Name", Base)` → `newtype Name = Base`.
+                let line = &lines[line_idx];
+                let indent_len = line
+                    .find(|c: char| !c.is_whitespace())
+                    .unwrap_or(line.len());
+                let content = &line[indent_len..];
+                let restored = restore_newtype_decl(content).unwrap_or_else(|| content.to_owned());
                 lines[line_idx] = format!("{}{}", &line[..indent_len], restored);
             }
         }
@@ -4802,6 +4879,49 @@ mod tests {
             .stripped
             .iter()
             .any(|k| matches!(k.keyword, TyphonKeyword::PlainClass)));
+    }
+
+    // ── newtype keyword ─────────────────────────────────────────────────────
+
+    #[test]
+    fn newtype_lowers_to_newtype_call() {
+        let result = preprocess("newtype UserId = int\n");
+        assert_eq!(result.python_source, "UserId = NewType(\"UserId\", int)\n");
+        assert!(result
+            .stripped
+            .iter()
+            .any(|k| matches!(k.keyword, TyphonKeyword::Newtype)));
+    }
+
+    #[test]
+    fn newtype_handles_generic_base_type() {
+        let result = preprocess("newtype Tags = list[str]\n");
+        assert_eq!(
+            result.python_source,
+            "Tags = NewType(\"Tags\", list[str])\n"
+        );
+    }
+
+    #[test]
+    fn newtype_round_trips_via_postprocess() {
+        let src = "newtype UserId = int\n";
+        let prep = preprocess(src);
+        let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn newtype_does_not_match_indented_form() {
+        // `newtype` only applies at module level. An indented occurrence
+        // should be passed through verbatim (the Python parser will reject
+        // it, which is the right behaviour: nominal aliases inside a
+        // function body don't compose with type checking).
+        let result = preprocess("    newtype UserId = int\n");
+        assert!(result.python_source.contains("newtype UserId"));
+        assert!(!result
+            .stripped
+            .iter()
+            .any(|k| matches!(k.keyword, TyphonKeyword::Newtype)));
     }
 
     #[test]

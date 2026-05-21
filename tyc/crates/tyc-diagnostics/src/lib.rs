@@ -897,6 +897,28 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A bare value of the base type was passed where a `newtype` is
+    /// expected, without going through the explicit constructor.
+    /// `newtype UserId = int` makes `UserId` nominally distinct: a
+    /// `UserId` flows into an `int` slot freely (the runtime values
+    /// are identical), but the reverse requires `UserId(x)` so the
+    /// boundary is explicit at the call site.
+    #[error("`{name}({arg_type})` — newtype expects an argument of type `{base}`")]
+    #[diagnostic(
+        code(tyc::newtype_violation),
+        url("https://typhon.dev/lang/diagnostics/newtype_violation"),
+        help("wrap the value in `{name}(...)` only when it really is a `{name}`; the base type is `{base}`")
+    )]
+    NewtypeViolation {
+        name: String,
+        base: String,
+        arg_type: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("type `{arg_type}` is not a `{base}`")]
+        span: SourceSpan,
+    },
+
     /// An `async def` function body never `await`s. The function still
     /// returns a coroutine, but the `async` keyword is functionally a
     /// no-op — usually a sign of a half-finished refactor or a missing
@@ -1769,6 +1791,25 @@ impl TycError {
     ) -> Self {
         Self::CyclicTypeAlias {
             name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::NewtypeViolation`] diagnostic.
+    pub fn newtype_violation(
+        name: impl Into<String>,
+        base: impl Into<String>,
+        arg_type: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::NewtypeViolation {
+            name: name.into(),
+            base: base.into(),
+            arg_type: arg_type.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

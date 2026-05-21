@@ -54,6 +54,21 @@ Every parameter and every return type carries an annotation:
 
 Methods inside the `class` body trigger `tyc::method_in_class_body`.
 
+## Newtype (nominal alias)
+
+    newtype UserId = int
+    newtype Email = str
+
+    def greet(uid: UserId) -> str:
+        return f"hi {uid}"
+
+    let me: UserId = UserId(7)         # explicit construction
+    let raw: int = me                  # escape upward is free
+
+Bare `int` flowing into a `UserId` slot is rejected
+(`tyc::newtype_violation`). Use `type` instead of `newtype` when you
+want a transparent, bidirectional alias.
+
 ## Sealed unions + exhaustive `match`
 
     sealed union Shape:

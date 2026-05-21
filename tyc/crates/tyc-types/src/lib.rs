@@ -22,7 +22,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ruff_python_ast::{Expr, MatchCase, ModModule, Number, Operator, Pattern, Stmt};
+use ruff_python_ast::{Expr, MatchCase, ModModule, Number, Operator, Pattern, Stmt, StmtAssign};
 use ruff_text_size::{Ranged, TextRange};
 use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_resolve::{Binding, BindingKind, ResolvedModule, ScopeId};
@@ -1255,6 +1255,14 @@ struct Checker<'a> {
     /// `type B = int | str` accepts an `int` literal where `B` is required.
     /// FINDINGS #57, #58, #70.
     type_aliases: HashMap<String, (Vec<String>, Type)>,
+    /// Nominal newtype declarations: name → base type. Populated from
+    /// `newtype Name = Base` (preprocessed to `Name = NewType("Name",
+    /// Base)`). Unlike `type_aliases`, newtypes are **asymmetric**:
+    /// a `Name` flows freely into a `Base`-typed slot (escape upward),
+    /// but a bare `Base` requires explicit construction via `Name(x)`
+    /// before it satisfies a `Name`-typed target. The construction call
+    /// itself type-checks the argument against `Base`.
+    newtypes: HashMap<String, Type>,
     /// Interfaces (Typhon `interface Name:` → `class Name(Protocol):`).
     /// Maps the interface name to its required member shape and whether it
     /// opted in to runtime checking via `@runtime_checkable`. In v1 we
@@ -1506,6 +1514,7 @@ impl<'a> Checker<'a> {
             unsafe_line_starts: Vec::new(),
             sealed_unions: HashMap::new(),
             type_aliases: HashMap::new(),
+            newtypes: HashMap::new(),
             env: TypeEnv::default(),
             diagnostics: Diagnostics::new(),
             current_return: None,
@@ -1543,6 +1552,36 @@ impl<'a> Checker<'a> {
     fn is_assignable(&self, expected: &Type, actual: &Type) -> bool {
         if assignable(expected, actual) {
             return true;
+        }
+        // Nominal newtype: `Email → str` is allowed (escape upward),
+        // `Email → Email` is allowed (same name), but `str → Email` is
+        // not — the caller must construct via `Email(x)`. The "escape
+        // upward" rule lives here so a `UserId` flows freely into an
+        // `int`-typed slot; the rejection direction is the default (we
+        // fall through to `false`).
+        if let Type::Class(expected_name) = expected {
+            if let Type::Class(actual_name) = actual {
+                if expected_name == actual_name {
+                    return true;
+                }
+            }
+            // Expected is not a newtype, but actual might be — unwrap and
+            // retry. `Email → str` reaches this branch with `expected=str`
+            // (a primitive) and `actual=Class("Email")`.
+            if let Type::Class(actual_name) = actual {
+                if let Some(base) = self.newtypes.get(actual_name.as_str()) {
+                    if self.is_assignable(expected, base) {
+                        return true;
+                    }
+                }
+            }
+        }
+        if let Type::Class(actual_name) = actual {
+            if let Some(base) = self.newtypes.get(actual_name.as_str()) {
+                if self.is_assignable(expected, base) {
+                    return true;
+                }
+            }
         }
         // Transparent type-alias unwrap. `type Report = ReportData` and
         // `type B = int | str` should let `Class("ReportData")` flow into
@@ -3026,10 +3065,30 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                     c.type_aliases.insert(union_name, (params, Type::Unknown));
                 }
             }
+            // `newtype Name = Base` (preprocessed to `Name = NewType("Name",
+            // Base)`) registers `Name` as a nominal type distinct from `Base`.
+            // The classes list gets the name too so annotations referring to
+            // it resolve to `Type::Class(name)`; the asymmetric base
+            // relationship lives in `c.newtypes`.
+            Stmt::Assign(a) if extract_newtype_decl(a).is_some() => {
+                let (name, _base_expr) = extract_newtype_decl(a).expect("checked by guard");
+                c.classes.push(name);
+            }
             _ => {}
         }
     }
     let classes = c.classes.clone();
+    // Resolve every newtype's base expression now that the class list is
+    // populated. Done in this dedicated pass so a `newtype UserId = int`
+    // that appears before its referenced class still resolves correctly.
+    for stmt in body {
+        if let Stmt::Assign(a) = stmt {
+            if let Some((name, base_expr)) = extract_newtype_decl(a) {
+                let base_ty = type_from_annotation_with_params(&base_expr, &classes, &[]);
+                c.newtypes.insert(name, base_ty);
+            }
+        }
+    }
     // Second pass: now that every class name is known, resolve each type
     // alias's RHS into a concrete `Type`. Doing this in pass 1 would
     // mis-translate forward references (e.g. `type Maybe[T] = Just[T] |
@@ -5845,6 +5904,35 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     let arg_type = infer_expr(c, &pos_args[0]);
                     return Type::Generic(ctor.to_owned(), vec![arg_type]);
                 }
+                // `Email("alice@example.com")` — newtype constructor
+                // call. Type-check the single positional argument
+                // against the declared base type, then return
+                // `Type::Class(name)` so the caller sees the nominal
+                // value, not the underlying primitive.
+                if pos_args.len() == 1
+                    && kw_args.is_empty()
+                    && c.newtypes.contains_key(fn_name.id.as_str())
+                {
+                    let name = fn_name.id.as_str().to_owned();
+                    let base = c.newtypes.get(&name).cloned().unwrap_or(Type::Unknown);
+                    let arg_ty = infer_expr(c, &pos_args[0]);
+                    if !c.is_assignable(&base, &arg_ty) {
+                        let span = (
+                            pos_args[0].range().start().to_usize(),
+                            pos_args[0].range().end().to_usize(),
+                        );
+                        c.diagnostics.push_error(TycError::newtype_violation(
+                            &name,
+                            &base.display(),
+                            &arg_ty.display(),
+                            &c.path,
+                            c.source,
+                            span.0,
+                            span.1.saturating_sub(span.0).max(1),
+                        ));
+                    }
+                    return Type::Class(name);
+                }
                 // isinstance(x, Interface) is rejected unless the interface
                 // explicitly opts in via @runtime_checkable. Runtime Protocol
                 // isinstance only checks attribute *presence*, not signature,
@@ -6941,6 +7029,48 @@ fn const_int_index(expr: &Expr) -> Option<i64> {
 ///
 /// Uses an explicit stack rather than recursion to avoid stack overflow on
 /// deeply nested union expressions (e.g. `A | B | C | ... | Z`).
+/// If `assign` has the exact shape `Name = NewType("Name", Base)`, return
+/// `(name, base_expr)`. Used to recognise the preprocessed form of
+/// `newtype Name = Base` in the module body and register `Name` as a
+/// nominal newtype.
+///
+/// The string literal in the first argument must match the LHS target
+/// name exactly — any deviation rejects the pattern and falls through to
+/// regular assignment handling.
+fn extract_newtype_decl(assign: &StmtAssign) -> Option<(String, Expr)> {
+    if assign.targets.len() != 1 {
+        return None;
+    }
+    let target = match &assign.targets[0] {
+        Expr::Name(n) => n,
+        _ => return None,
+    };
+    let call = match assign.value.as_ref() {
+        Expr::Call(c) => c,
+        _ => return None,
+    };
+    let callee = match call.func.as_ref() {
+        Expr::Name(n) => n,
+        _ => return None,
+    };
+    if callee.id.as_str() != "NewType" {
+        return None;
+    }
+    if call.arguments.args.len() != 2 || !call.arguments.keywords.is_empty() {
+        return None;
+    }
+    let first = call.arguments.args.first()?;
+    let s = match first {
+        Expr::StringLiteral(s) => s,
+        _ => return None,
+    };
+    if s.value.to_str() != target.id.as_str() {
+        return None;
+    }
+    let base = call.arguments.args.get(1)?.clone();
+    Some((target.id.as_str().to_owned(), base))
+}
+
 fn extract_sealed_union_variants(expr: &Expr) -> Option<Vec<String>> {
     let mut names = Vec::new();
     let mut stack = vec![expr];
