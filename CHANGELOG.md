@@ -4,7 +4,7 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## 0.3.0
+## 0.2.2
 
 Third-party signature recovery via venv introspection. The flagship
 gap this release closes: a project that imports a class from an
@@ -19,7 +19,7 @@ because no `.dty` stub was authored, so the callable degraded to
 `tyc/crates/tyc-types/src/lib.rs:6061` (which only fires for
 project-local classes) was skipped.
 
-0.3.0 closes the loop by shelling to the project's
+0.2.2 closes the loop by shelling to the project's
 `.venv/bin/python` (or a fallback `python3` on PATH), asking
 `inspect.signature` for the real parameter list of every public
 class and free function in each declared dependency, and folding
