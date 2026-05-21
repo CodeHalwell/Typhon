@@ -804,6 +804,14 @@ struct Resolver<'a> {
     /// computed the first time the unused-import emitter needs to
     /// translate a preprocessed byte offset to a line index.
     preprocessed_line_starts: std::cell::OnceCell<Vec<usize>>,
+    /// True while [`walk_pattern`] is recursing into a `case` pattern.
+    /// Pattern captures (`case Wrap(value):`) declare names in the
+    /// enclosing scope, which under Rule 2 would trip
+    /// `tyc::immutable_assign` against an outer `let value` and offer
+    /// the misleading `change \`let\` to \`mut\`` hint. While this
+    /// flag is set, the declare path emits the pattern-aware
+    /// `tyc::pattern_shadows_outer` instead (FINDINGS O10).
+    in_pattern: u32,
 }
 
 impl<'a> Resolver<'a> {
@@ -828,6 +836,7 @@ impl<'a> Resolver<'a> {
             lazy_import_remaps: options.lazy_import_remaps,
             original_source: options.original_source,
             preprocessed_line_starts: std::cell::OnceCell::new(),
+            in_pattern: 0,
         }
     }
 
@@ -953,15 +962,32 @@ impl<'a> Resolver<'a> {
             if existing.mutability == Mutability::Let || mutability == Mutability::Let {
                 let decl_span = existing.span;
                 if self.seen_immutable_redecl.insert((decl_span, span)) {
-                    self.diagnostics.push_error(TycError::immutable_assign(
-                        name,
-                        &self.path,
-                        self.source,
-                        decl_span.0,
-                        decl_span.1.saturating_sub(decl_span.0).max(1),
-                        span.0,
-                        span.1.saturating_sub(span.0).max(1),
-                    ));
+                    // Pattern captures (`case Wrap(value):`) take a
+                    // dedicated diagnostic because the actionable advice
+                    // is rename-the-capture, not flip-the-outer-let to
+                    // `mut`. FINDINGS O10.
+                    let err = if self.in_pattern > 0 {
+                        TycError::pattern_shadows_outer(
+                            name,
+                            &self.path,
+                            self.source,
+                            decl_span.0,
+                            decl_span.1.saturating_sub(decl_span.0).max(1),
+                            span.0,
+                            span.1.saturating_sub(span.0).max(1),
+                        )
+                    } else {
+                        TycError::immutable_assign(
+                            name,
+                            &self.path,
+                            self.source,
+                            decl_span.0,
+                            decl_span.1.saturating_sub(decl_span.0).max(1),
+                            span.0,
+                            span.1.saturating_sub(span.0).max(1),
+                        )
+                    };
+                    self.diagnostics.push_error(err);
                 }
                 return;
             }
@@ -1949,7 +1975,12 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
         Stmt::Match(m) => {
             walk_expr(r, scope, &m.subject);
             for case in &m.cases {
+                // Mark the case pattern so the declare path knows
+                // shadowing trips `pattern_shadows_outer`, not the
+                // misleading `immutable_assign` (FINDINGS O10).
+                r.in_pattern = r.in_pattern.saturating_add(1);
                 walk_pattern(r, scope, &case.pattern);
+                r.in_pattern = r.in_pattern.saturating_sub(1);
                 if let Some(g) = &case.guard {
                     walk_expr(r, scope, g);
                 }

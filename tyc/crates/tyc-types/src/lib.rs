@@ -154,6 +154,13 @@ impl Type {
                 format!("({}) -> {}", p.join(", "), ret.display())
             }
             Type::Generic(name, args) => {
+                // `tuple_variadic[T]` is the internal name for the
+                // homogeneous-variadic tuple type written `tuple[T, ...]`
+                // in source. Render it back as the source form so
+                // diagnostics quote what the user wrote.
+                if name == "tuple_variadic" && args.len() == 1 {
+                    return format!("tuple[{}, ...]", args[0].display());
+                }
                 let a: Vec<String> = args.iter().map(|t| t.display()).collect();
                 format!("{}[{}]", name, a.join(", "))
             }
@@ -241,6 +248,21 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
                 && aa.len() == 1
                 && !bb.is_empty()
             {
+                return assignable(&aa[0], &bb[0]);
+            }
+            // `tuple[T, ...]` (homogeneous variadic) accepts any
+            // fixed-length `tuple[T1, …, Tn]` whose elements are all
+            // assignable to `T`, plus the empty tuple `tuple[]`. The
+            // reverse direction (`tuple[T1, T2]` accepting a
+            // `tuple_variadic`) is not allowed — the consumer asked for
+            // a specific arity, the producer can't promise it.
+            if an == "tuple_variadic" && aa.len() == 1 && bn == "tuple" {
+                return bb.iter().all(|t| assignable(&aa[0], t));
+            }
+            // `tuple_variadic[T1]` assignable from `tuple_variadic[T2]`
+            // covariantly — tuples are immutable so the read-only
+            // direction is sound.
+            if an == "tuple_variadic" && bn == "tuple_variadic" && aa.len() == 1 && bb.len() == 1 {
                 return assignable(&aa[0], &bb[0]);
             }
             if an != bn || aa.len() != bb.len() {
@@ -869,6 +891,26 @@ pub fn type_from_annotation_with_params(
                 return Type::Generic("Result".into(), vec![Type::Unknown, Type::Unknown]);
             }
             // list[int], dict[str, int], tuple[int, str, ...]
+            //
+            // Special case: `tuple[T, ...]` is the homogeneous-variadic
+            // tuple type — same element type at every position, length
+            // unconstrained. The trailing `...` is not a fixed slot, so
+            // we collapse it to a one-argument `tuple_variadic[T]`
+            // internal head. The assignability rules then accept any
+            // fixed-length `tuple[T1, …, Tn]` whose elements are all
+            // assignable to `T`. Display renders it back as
+            // `tuple[T, ...]`. Without this carve-out the unifier would
+            // see `tuple[T, ?]` (length 2) versus a 3-tuple literal
+            // (length 3) and reject the assignment.
+            if head == "tuple" {
+                if let Expr::Tuple(t) = s.slice.as_ref() {
+                    if t.elts.len() == 2 && matches!(t.elts[1], Expr::EllipsisLiteral(_)) {
+                        let elem =
+                            type_from_annotation_with_params(&t.elts[0], classes, type_params);
+                        return Type::Generic("tuple_variadic".into(), vec![elem]);
+                    }
+                }
+            }
             let args: Vec<Type> = match s.slice.as_ref() {
                 Expr::Tuple(t) => t
                     .elts
@@ -1237,9 +1279,19 @@ struct Checker<'a> {
     /// True while we are checking the body of an `async def`. Used by
     /// the Phase-E blocking-in-async check (`tyc::blocking_in_async`)
     /// to fire on direct calls to known-blocking stdlib functions
-    /// (`time.sleep`, `requests.get`, `socket.recv`, …) that should
-    /// be wrapped in `await asyncio.to_thread(...)` instead.
+    /// (`time.sleep`, `requests.get`, …) that should be wrapped in
+    /// `await asyncio.to_thread(...)` instead.
     in_async_function: bool,
+    /// True while we are checking the body of a generator function
+    /// (any `def f() -> Iterator[T]` / `Generator[Y, S, R]` whose body
+    /// contains `yield` / `yield from`). Inside a generator, `return`
+    /// is `raise StopIteration(...)` — the value (if any) becomes the
+    /// generator's `Return[R]` payload, *not* an `Iterator[T]`. The
+    /// return-statement validator skips its usual assignability check
+    /// while this flag is on, so that
+    /// `def f() -> Iterator[int]: ... return` is accepted instead of
+    /// being flagged as `expected Iterator[int], found None`.
+    in_generator: bool,
     /// Bounds declared on PEP 695 type parameters, keyed by function name.
     /// E.g. `def f[T: Interface](x: T)` populates `{"f": {"T": Class("Interface")}}`.
     /// Checked at call sites via `Checker::check_call_typevar_bounds`.
@@ -1510,6 +1562,7 @@ impl<'a> Checker<'a> {
             inside_await: 0,
             in_sync_function: false,
             in_async_function: false,
+            in_generator: false,
             function_type_bounds: HashMap::new(),
             active_typevar_bounds: HashMap::new(),
             interfaces: HashMap::new(),
@@ -1653,6 +1706,16 @@ impl<'a> Checker<'a> {
                     ("Err", 1) => return self.is_assignable(&aa[1], &bb[0]),
                     _ => {}
                 }
+            }
+            // Variadic-tuple coercion mirrors the rule in the free
+            // `assignable` but recurses through `is_assignable` so
+            // alias / sealed-union / interface conformance works for
+            // the element type.
+            if an == "tuple_variadic" && aa.len() == 1 && bn == "tuple" {
+                return bb.iter().all(|t| self.is_assignable(&aa[0], t));
+            }
+            if an == "tuple_variadic" && bn == "tuple_variadic" && aa.len() == 1 && bb.len() == 1 {
+                return self.is_assignable(&aa[0], &bb[0]);
             }
             if an == bn && aa.len() == bb.len() {
                 return aa
@@ -3176,6 +3239,20 @@ fn detect_cyclic_type_aliases(c: &mut Checker, body: &[Stmt]) {
                 *span_start,
                 *span_len,
             ));
+            // The chain has no concrete type to resolve to, but the
+            // alias is still referenced from value-position
+            // annotations (`let x: JSON = ...`). Without this
+            // override every such use cascades into a flood of
+            // `tyc::type_mismatch` errors as the unifier compares
+            // the recursive `Union[..., list[JSON], ...]` shape
+            // against literal values it can never structurally
+            // match. Replacing the alias body with `Any` keeps the
+            // single, actionable `tyc::cyclic_type_alias` error and
+            // silences the cascade so the rest of the file is
+            // still checkable. FINDINGS O4.
+            if let Some((params, _)) = c.type_aliases.get(start.as_str()).cloned() {
+                c.type_aliases.insert(start.clone(), (params, Type::Any));
+            }
         }
     }
 }
@@ -4586,6 +4663,50 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
             if let Some(ret_expr) = &ret.value {
                 audit_check_escape(c, ret_expr);
             }
+            // Inside a generator function body, `return value` is
+            // shorthand for `raise StopIteration(value)` — the value
+            // becomes the *generator's* return payload, not an
+            // `Iterator[T]`. The check has three shapes (FINDINGS O6
+            // + Codex review feedback on PR #94):
+            //
+            //   * `-> Iterator[T]` / `-> Iterable[T]` / async variants
+            //     don't expose a return-type parameter at all, so we
+            //     accept any `return value` — the payload is
+            //     effectively `None` from the user's perspective.
+            //   * `-> Generator[Y, S, R]` carries the return payload's
+            //     declared type as the third parameter; check the
+            //     return value against `R` instead of skipping. This
+            //     restores the type-safety the early-return shortcut
+            //     would otherwise lose.
+            //   * Bare `return` (no value) is always fine — it
+            //     produces `StopIteration()` with no payload, which
+            //     is the standard `break-out-of-generator` shape.
+            if c.in_generator {
+                let generator_return_type = c
+                    .current_return
+                    .as_ref()
+                    .and_then(extract_generator_return_type);
+                if let (Some(ret_expr), Some(expected_r)) =
+                    (&ret.value, generator_return_type.clone())
+                {
+                    let value_type = infer_expr_ctx(c, ret_expr, Some(&expected_r));
+                    if !matches!(expected_r, Type::Unknown)
+                        && !c.is_assignable(&expected_r, &value_type)
+                    {
+                        let span = (
+                            ret_expr.range().start().to_usize(),
+                            ret_expr.range().end().to_usize(),
+                        );
+                        c.mismatch(&expected_r, &value_type, span);
+                    }
+                } else if let Some(ret_expr) = &ret.value {
+                    // `Iterator[T]` / `Iterable[T]` / async variants —
+                    // no R parameter to check against. Still walk the
+                    // expression so name uses are validated.
+                    let _ = infer_expr(c, ret_expr);
+                }
+                return;
+            }
             if let (Some(ret_expr), Some(expected)) = (&ret.value, c.current_return.clone()) {
                 let value_type = infer_expr_ctx(c, ret_expr, Some(&expected));
                 if !matches!(expected, Type::Unknown) && !c.is_assignable(&expected, &value_type) {
@@ -4626,12 +4747,41 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
         Stmt::If(i) => check_if(c, i),
         Stmt::While(w) => {
             let _ = infer_expr(c, &w.test);
+            // Flow narrowing inside the loop body: the test is known to
+            // hold on every iteration that *enters* the body, so the
+            // narrowing it implies is sound at the top of each pass
+            // through the body (FINDINGS O2). The pattern that matters
+            // is the linked-list iterator
+            //   while cur is not None:
+            //       total += cur.value
+            //       cur = cur.next
+            // — without this, `cur.value` would trip `tyc::nullable_use`
+            // even though the loop test guarantees the value is non-null
+            // at the read site. A subsequent `cur = cur.next` reassignment
+            // resets narrowing at the assignment site (see the bareword
+            // assignment arm above), so a later iteration that reads the
+            // *new* value with the *old* narrowing is impossible — by
+            // the time control flows back to the head of the loop the
+            // narrowing snapshot has been restored.
+            let narrowings = collect_narrowings(c, &w.test, /*negate=*/ false);
+            let snap_pre = c.env.snapshot();
+            apply_narrowings(c, &narrowings);
             for s in &w.body {
                 check_stmt(c, s);
             }
+            c.env.restore(snap_pre);
+            // `while ... else:` runs exactly when the loop test became
+            // false without a `break`, so the negated narrowing holds
+            // at the top of the orelse block — the dual of the
+            // positive narrowing applied to the body. Mirrors the
+            // `if` checker's else-branch handling.
+            let neg = collect_narrowings(c, &w.test, /*negate=*/ true);
+            let snap_pre = c.env.snapshot();
+            apply_narrowings(c, &neg);
             for s in &w.orelse {
                 check_stmt(c, s);
             }
+            c.env.restore(snap_pre);
         }
         Stmt::For(f) => {
             let _ = infer_expr(c, &f.iter);
@@ -4877,6 +5027,12 @@ fn check_function(
     c.in_sync_function = !is_async;
     let saved_in_async = c.in_async_function;
     c.in_async_function = is_async;
+    // Track whether the current function body is a generator so the
+    // return-statement validator can skip the usual assignability
+    // check (FINDINGS O6): inside a generator, `return` raises
+    // `StopIteration`, not a value against the declared `Iterator[T]`.
+    let saved_in_generator = c.in_generator;
+    c.in_generator = body_has_yield(body);
     // Load the TypeVar bounds for this function so the body's attribute
     // accesses (e.g. `x.greet()` where `x: T` and `T: Greeter`) can resolve
     // against the bound's interface shape.
@@ -4996,6 +5152,7 @@ fn check_function(
     c.active_typevar_bounds = saved_bounds;
     c.in_sync_function = saved_in_sync;
     c.in_async_function = saved_in_async;
+    c.in_generator = saved_in_generator;
 }
 
 /// True when `body` is a stub — `...`, `pass`, or a single docstring
@@ -5829,6 +5986,23 @@ fn extract_err_generic_param(typ: &Type) -> Option<Type> {
     if let Type::Generic(name, args) = typ {
         if name == "Err" && args.len() == 1 {
             return Some(args[0].clone());
+        }
+    }
+    None
+}
+
+/// Extract `R` from a `Generator[Y, S, R]` annotation so the
+/// return-statement validator can check `return value` against the
+/// declared return-payload type when the user has spelled out all
+/// three parameters. Returns `None` for `Iterator[T]` / `Iterable[T]`
+/// / async variants — those don't expose a return-type parameter and
+/// `return value` payloads are accepted unchecked. Used by the
+/// `c.in_generator` early-return in `check_stmt::Return` (FINDINGS
+/// O6, refined per Codex review on PR #94).
+fn extract_generator_return_type(typ: &Type) -> Option<Type> {
+    if let Type::Generic(name, args) = typ {
+        if name == "Generator" && args.len() == 3 {
+            return Some(args[2].clone());
         }
     }
     None
@@ -6970,11 +7144,23 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                 Some(Type::Generic(h, a)) if h == "tuple" && a.len() == t.elts.len() => Some(a),
                 _ => None,
             };
+            // Homogeneous variadic tuple expected: every slot inherits
+            // the same element type. Lets `let xs: tuple[float, ...] =
+            // (1, 2, 3)` widen the int literals to float at inference,
+            // and propagates through nested generic calls the same way
+            // a fixed-arity tuple expectation does.
+            let variadic_elem: Option<&Type> = match expected {
+                Some(Type::Generic(h, a)) if h == "tuple_variadic" && a.len() == 1 => Some(&a[0]),
+                _ => None,
+            };
             let elts: Vec<Type> = t
                 .elts
                 .iter()
                 .enumerate()
-                .map(|(i, e)| infer_expr_ctx(c, e, per_slot.map(|a| &a[i])))
+                .map(|(i, e)| {
+                    let hint = per_slot.map(|a| &a[i]).or(variadic_elem);
+                    infer_expr_ctx(c, e, hint)
+                })
                 .collect();
             Type::Generic("tuple".into(), elts)
         }
@@ -9819,6 +10005,252 @@ let s: str = id(3)
             !widened,
             "expected type must not widen the forward-bound TypeVar; errors: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn variadic_tuple_accepts_fixed_length_literals() {
+        // `tuple[T, ...]` is the homogeneous-variadic tuple type — same
+        // element type at every position, length unconstrained. The
+        // unifier must accept any fixed-length tuple literal whose
+        // elements are all assignable to T (FINDINGS O3).
+        let d = check("let xs: tuple[float, ...] = (1.0, 2.0, 3.0)\n");
+        assert!(!d.has_errors(), "{:?}", d.errors());
+        let d = check("let ys: tuple[float, ...] = ()\n");
+        assert!(!d.has_errors(), "empty tuple should fit: {:?}", d.errors());
+        let d = check("let zs: tuple[int, ...] = (1, 2, 3, 4, 5)\n");
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn variadic_tuple_widens_int_literals_to_float() {
+        // The element-type hint flows into the tuple literal's slots
+        // exactly like a fixed-arity expectation would, so int literals
+        // widen to float when the target is `tuple[float, ...]`.
+        let d = check("let xs: tuple[float, ...] = (1, 2, 3)\n");
+        assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn variadic_tuple_rejects_mismatched_element() {
+        // A wrong element type must still surface — the variadic
+        // marker only relaxes arity, not the per-element type check.
+        let d = check("let xs: tuple[float, ...] = (1.0, \"oops\", 3.0)\n");
+        assert!(d.has_errors(), "expected str-vs-float to be rejected");
+        // The diagnostic should render the expected type in its source
+        // form (`tuple[T, ...]`), not the internal head name.
+        let msg = format!("{}", d.errors()[0]);
+        assert!(
+            msg.contains("tuple[float, ...]"),
+            "diagnostic should render variadic tuple as `tuple[float, ...]`; got: {}",
+            msg,
+        );
+    }
+
+    #[test]
+    fn generator_return_no_value_accepted_against_iterator() {
+        // Inside a generator, `return` is `raise StopIteration` and
+        // produces no `Iterator[T]` value — the return-statement
+        // validator must skip its usual assignability check
+        // (FINDINGS O6).
+        let src = "\
+from typing import Iterator
+
+def stop_early(n: int) -> Iterator[int]:
+    for i in range(n):
+        if i > 5:
+            return
+        yield i
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "bare `return` inside an Iterator[T] generator must be accepted; got: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn while_loop_test_narrows_body_for_iterator_idiom() {
+        // The linked-list iterator pattern relies on `while cur is not
+        // None:` narrowing `cur` to non-null at every read site inside
+        // the body — including the `cur = cur.next` reassignment
+        // (which reads .next on the *currently narrowed* value, then
+        // resets narrowing for the new value). Without while-test
+        // narrowing this is `tyc::nullable_use` on the very first
+        // `cur.value` and `cur.next` read (FINDINGS O2).
+        let src = "\
+class Node:
+    value: int
+    next: Node?
+
+def sum_list(head: Node?) -> int:
+    mut total: int = 0
+    mut cur: Node? = head
+    while cur is not None:
+        total = total + cur.value
+        cur = cur.next
+    return total
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "while-test narrowing must let the linked-list idiom check; got: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn while_loop_narrowing_resets_after_reassignment() {
+        // Narrowing inside the body is sound only *until* the narrowed
+        // name is reassigned. After `cur = None` the next read must
+        // see `cur` as nullable again — the assignment site resets
+        // narrowing exactly the way a plain `if`-narrowed branch does.
+        let src = "\
+class Node:
+    value: int
+    next: Node?
+
+def f(head: Node?) -> int:
+    mut total: int = 0
+    mut cur: Node? = head
+    while cur is not None:
+        cur = None
+        total = total + cur.value
+    return total
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "post-reassignment read should still trip nullable_use"
+        );
+    }
+
+    #[test]
+    fn recursive_type_alias_emits_one_cycle_error_no_cascade() {
+        // Self-referential aliases through `list[Self]` / `dict[str, Self]`
+        // are the canonical recursive-JSON / AST / tree shape and aren't
+        // yet supported (FINDINGS O4). The diagnostic must fire once
+        // for the cycle itself, and every subsequent use of the alias
+        // must *not* cascade into a flood of `tyc::type_mismatch`
+        // errors — the alias body is rewritten to `Any` so downstream
+        // assignments fall through silently.
+        let src = "\
+type JSON = None | bool | int | float | str | list[JSON] | dict[str, JSON]
+
+def main() -> None:
+    let x: JSON = {\"a\": [1, 2, \"three\"]}
+    let y: JSON = None
+    let z: JSON = [1, 2, 3]
+    print(x, y, z)
+";
+        let d = check(src);
+        let errs = d.errors();
+        // Exactly one error: the cycle. Cascading type_mismatch errors
+        // on every alias use are not acceptable — they bury the real
+        // problem.
+        let cycle_errs = errs
+            .iter()
+            .filter(|e| format!("{e}").contains("cycle"))
+            .count();
+        assert_eq!(
+            cycle_errs, 1,
+            "expected exactly one cyclic_type_alias error; got: {errs:?}",
+        );
+        let mismatch_errs = errs
+            .iter()
+            .filter(|e| format!("{e}").contains("type mismatch"))
+            .count();
+        assert_eq!(
+            mismatch_errs, 0,
+            "recursive alias must not cascade into type_mismatch errors; got: {errs:?}",
+        );
+    }
+
+    #[test]
+    fn generator_return_with_value_accepted_against_iterator() {
+        // PEP 380: `return value` inside a generator sets
+        // StopIteration.value. The body is still a generator, so the
+        // declared `Iterator[int]` return type is correct — the value
+        // is *not* required to match that type.
+        let src = "\
+from typing import Iterator
+
+def stop_early() -> Iterator[int]:
+    yield 1
+    return \"done\"
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "`return value` inside a generator must skip the value-against-Iterator check; got: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn generator_return_value_checked_against_generator_r_param() {
+        // `Generator[Y, S, R]` *does* carry a declared return-payload
+        // type; a `return value` inside one must be assignable to R.
+        // The Iterator-shaped relaxation must not silently accept
+        // mismatched payloads when the user spelled out all three
+        // parameters (Codex review on PR #94).
+        let ok = check(
+            "\
+from typing import Generator
+
+def g() -> Generator[int, None, str]:
+    yield 1
+    return \"done\"
+",
+        );
+        assert!(
+            !ok.has_errors(),
+            "matching `return value` against R should be accepted; got: {:?}",
+            ok.errors()
+        );
+
+        let bad = check(
+            "\
+from typing import Generator
+
+def g() -> Generator[int, None, str]:
+    yield 1
+    return 42
+",
+        );
+        assert!(
+            bad.has_errors(),
+            "mismatched `return value` against R should be rejected"
+        );
+        let msg = format!("{}", bad.errors()[0]);
+        assert!(
+            msg.contains("expected `str`"),
+            "diagnostic should reference R (= str); got: {}",
+            msg,
+        );
+    }
+
+    #[test]
+    fn while_else_branch_has_negated_narrowing() {
+        // `while x is not None: ... else: <here>` runs exactly when
+        // the test became false — i.e. `x is None`. The else block
+        // should see `x` narrowed to `None`, the dual of the body's
+        // positive narrowing (Gemini review on PR #94).
+        let src = "\
+def f(x: int?) -> None:
+    mut cur: int? = x
+    while cur is not None:
+        cur = None
+    else:
+        let n: None = cur
+        return
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "negated narrowing should flow into the `while … else:` block; got: {:?}",
+            d.errors()
         );
     }
 

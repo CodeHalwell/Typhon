@@ -48,6 +48,31 @@ pub enum TycError {
         assignment: SourceSpan,
     },
 
+    /// A `case Foo(name):` pattern binds a name that already exists as
+    /// an immutable `let` in an enclosing scope. Python semantics make
+    /// the pattern binding a real rebinding (visible after the `match`),
+    /// so under Rule 2 it would trip `tyc::immutable_assign` — but
+    /// Rust/OCaml/Scala programmers reach for pattern captures
+    /// reflexively and `change \`let\` to \`mut\`` is the wrong advice
+    /// (the user wants a fresh binding, not a mutation site). This
+    /// diagnostic surfaces the same shape with rename-the-capture as
+    /// the actionable hint. FINDINGS O10.
+    #[error("pattern capture `{name}` shadows an outer immutable `let {name}`")]
+    #[diagnostic(
+        code(tyc::pattern_shadows_outer),
+        url("https://typhon.dev/lang/diagnostics/pattern_shadows_outer"),
+        help("rename the pattern capture (e.g. `case Wrap({name}_inner):`) — pattern bindings are real rebindings under Python's `match` semantics, so reusing an outer immutable name is rejected. If you genuinely want to overwrite the outer binding, change its declaration to `mut`.")
+    )]
+    PatternShadowsOuter {
+        name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("outer `let` declared here")]
+        declaration: SourceSpan,
+        #[label("pattern capture here")]
+        capture: SourceSpan,
+    },
+
     /// A field on a `frozen` class was assigned outside the constructor.
     #[error("cannot assign to field '{field}' on frozen class `{class}`")]
     #[diagnostic(
@@ -882,12 +907,23 @@ pub enum TycError {
 
     /// A `type` alias chain forms a cycle (`type A = B; type B = A`).
     /// The runtime never crashes because Python evaluates aliases
-    /// lazily, but no caller can ever resolve the type. FINDINGS #81.
+    /// lazily, but no caller can ever resolve the type. FINDINGS #81,
+    /// O4.
+    ///
+    /// Self-referential aliases through generic containers — the
+    /// canonical recursive-JSON / AST / tree shape
+    /// `type JSON = None | bool | int | str | list[JSON] | dict[str, JSON]`
+    /// — are not yet supported and trigger this diagnostic for the
+    /// same reason: `unwrap_alias` is bounded to eight hops and a
+    /// chain that re-enters itself never resolves to a concrete type.
+    /// Today's workaround is to use `dict[str, object]` /
+    /// `list[object]` at the recursion boundary; full recursive-type
+    /// support is tracked in `docs/findings.md`.
     #[error("type alias `{name}` is part of a cycle")]
     #[diagnostic(
         code(tyc::cyclic_type_alias),
         url("https://typhon.dev/lang/diagnostics/cyclic_type_alias"),
-        help("break the cycle by pointing at a concrete type or removing one of the alias declarations")
+        help("recursive type aliases are not yet supported (including the canonical `list[Self]` / `dict[str, Self]` shape). Break the cycle by pointing at a concrete type, splitting the alias into named classes, or falling back to `object` at the recursion boundary.")
     )]
     CyclicTypeAlias {
         name: String,
@@ -1959,6 +1995,26 @@ impl TycError {
             src: NamedSource::new(path, source),
             declaration: SourceSpan::new(SourceOffset::from(declaration_offset), declaration_len),
             assignment: SourceSpan::new(SourceOffset::from(assignment_offset), assignment_len),
+        }
+    }
+
+    /// Construct a [`TycError::PatternShadowsOuter`] diagnostic.
+    pub fn pattern_shadows_outer(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        declaration_offset: usize,
+        declaration_len: usize,
+        capture_offset: usize,
+        capture_len: usize,
+    ) -> Self {
+        let path = path.into();
+        let source = source.into();
+        Self::PatternShadowsOuter {
+            name: name.into(),
+            src: NamedSource::new(path, source),
+            declaration: SourceSpan::new(SourceOffset::from(declaration_offset), declaration_len),
+            capture: SourceSpan::new(SourceOffset::from(capture_offset), capture_len),
         }
     }
 

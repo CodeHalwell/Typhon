@@ -1821,16 +1821,76 @@ const BUILTIN_TYPES_REJECTED_BY_EXTEND: &[&str] = &[
     "type",
 ];
 
-/// Scan `source` for `extend BUILTIN:` declarations.
+/// Scan `source` for `extend NAME:` declarations whose target carries a
+/// generic argument list (`extend list[int]:`, `extend dict[str, int]:`).
 ///
-/// In Typhon ≥ 0.2 these are *not* rejected — the preprocess pass lowers
-/// `extend BUILTIN:` blocks to a sentinel `class __typhon_builtin_ext_BUILTIN:`
-/// stub that a downstream analyse pass extracts to module-level free
-/// functions plus a call-site rewriter.  This validator is retained as a
-/// no-op so existing wiring (and the diagnostic enum) keep compiling; it
-/// will go away once every caller switches to the rewriter directly.
-pub fn validate_extend_usage(_source: &str) -> Vec<ExtendUsageError> {
-    Vec::new()
+/// In Typhon ≥ 0.2, `extend BUILTIN:` itself is permitted — the
+/// preprocess pass lowers each block to a sentinel
+/// `class __typhon_builtin_ext_BUILTIN:` stub that an analyse pass
+/// extracts to module-level free functions plus a call-site rewriter.
+/// Parametric extends, however, would need per-element-type method
+/// dispatch the call-site rewriter doesn't yet support, so the
+/// preprocessor silently treats `extend list[int]:` as `impl list:` and
+/// the user gets a confusing downstream `tyc::impl_unknown_class`. This
+/// validator surfaces a dedicated message earlier in the pipeline so
+/// the user knows to drop the type-parameter list — or, with the
+/// generic-aware rewriter in place, that the feature isn't yet
+/// supported (FINDINGS O23).
+pub fn validate_extend_usage(source: &str) -> Vec<ExtendUsageError> {
+    let mut out = Vec::new();
+    let mut byte_offset: usize = 0;
+    let mut in_string: Option<StringMode> = None;
+    for (line_index, line) in source.split_inclusive('\n').enumerate() {
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let pre_string = in_string;
+        let code_end = scan_line_code_end(raw, &mut in_string);
+        if pre_string.is_some() {
+            byte_offset += line.len();
+            continue;
+        }
+        let code = &raw[..code_end];
+        let trimmed_start = code.find(|c: char| !c.is_whitespace());
+        if let Some(start) = trimmed_start {
+            let trimmed = &code[start..];
+            if let Some(after) = trimmed.strip_prefix("extend ") {
+                // The first `[` before any `:` or `(` marks a generic
+                // parameter list. We surface the diagnostic on the
+                // `extend` token itself so the highlight matches what
+                // the user wrote rather than the synthesised
+                // pseudo-class name downstream passes would use.
+                let mut depth = 0i32;
+                let mut found_bracket = false;
+                for c in after.chars() {
+                    match c {
+                        '[' if depth == 0 => {
+                            found_bracket = true;
+                            break;
+                        }
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        ':' if depth == 0 => break,
+                        _ => {}
+                    }
+                }
+                if found_bracket {
+                    out.push(ExtendUsageError {
+                        line_index,
+                        offset: byte_offset + start,
+                        message: "`extend NAME[T, …]:` (parameterised target) is \
+                             not yet supported. Drop the `[…]` to extend the \
+                             unparameterised type (the methods see the \
+                             concrete element type at the call site through \
+                             the receiver's annotation), or wait for the \
+                             per-element-type dispatch the rewriter is \
+                             tracked to gain in a later release."
+                            .to_owned(),
+                    });
+                }
+            }
+        }
+        byte_offset += line.len();
+    }
+    out
 }
 
 // ── `?` operator validation ───────────────────────────────────────────────────
