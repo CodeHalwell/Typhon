@@ -88,6 +88,15 @@ pub enum TyphonKeyword {
     /// May appear before `def`, `class`, `let`, `mut`, `model`,
     /// `interface`, `class!`, `plain class`, `newtype`, and `type`.
     Pub,
+    /// `freeze` — modifier on a `let` binding that deep-freezes the
+    /// bound value. `freeze let users = […]` lowers to `users =
+    /// __typhon_freeze__(…)`, where the runtime helper recursively
+    /// wraps `list → tuple`, `dict → MappingProxyType`, `set →
+    /// frozenset`, walks `@dataclass(frozen=True)` instances, and
+    /// raises on anything that can't be frozen. Stronger than
+    /// `let`'s binding-only immutability — the wrapped value cannot
+    /// be mutated through any reference.
+    Freeze,
 }
 
 impl TyphonKeyword {
@@ -109,6 +118,7 @@ impl TyphonKeyword {
             Self::PlainClass => "plain class",
             Self::Newtype => "newtype",
             Self::Pub => "pub",
+            Self::Freeze => "freeze",
         }
     }
 
@@ -129,6 +139,7 @@ impl TyphonKeyword {
             "class!" => Some(Self::RawClass),
             "newtype" => Some(Self::Newtype),
             "pub" => Some(Self::Pub),
+            "freeze" => Some(Self::Freeze),
             _ => None,
         }
     }

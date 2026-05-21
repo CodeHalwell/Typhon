@@ -59,6 +59,7 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         }
         "duplicate_class" => include_str!("../../../../../docs/diagnostics/duplicate_class.md"),
         "extend_builtin" => include_str!("../../../../../docs/diagnostics/extend_builtin.md"),
+        "freeze" => include_str!("../../../../../docs/diagnostics/freeze.md"),
         "frozen_assign" => include_str!("../../../../../docs/diagnostics/frozen_assign.md"),
         "generator_return_type" => {
             include_str!("../../../../../docs/diagnostics/generator_return_type.md")

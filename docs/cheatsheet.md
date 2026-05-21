@@ -54,6 +54,15 @@ Every parameter and every return type carries an annotation:
 
 Methods inside the `class` body trigger `tyc::method_in_class_body`.
 
+## Deep-immutable bindings (`freeze let`)
+
+    freeze let TAGS: list[str] = ["a", "b"]
+    freeze let CONFIG: dict[str, int] = {"port": 8080}
+
+Recursively wraps `list → tuple`, `dict → MappingProxyType`,
+`set → frozenset` at binding time so the value cannot be mutated
+through any reference. Module-level only for v1.
+
 ## Public API (`pub`)
 
     pub def greet(name: str) -> str: ...

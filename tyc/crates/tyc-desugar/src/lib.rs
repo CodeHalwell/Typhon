@@ -128,7 +128,14 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
     // module will reference it — either because we detected an Ok/
     // Err/Result name, because the user explicitly imported it, or
     // because a `go`/`lazy` lowering produced a qualified reference.
-    let needs_typhon_runtime = has_result_usage || has_any_runtime_import || has_runtime_qualified;
+    // Freeze references will need the runtime helper too — set the
+    // flag here so `tyc build` emits the typhon_runtime/ package even
+    // when no other runtime feature is used.
+    let needs_freeze_runtime = stmts_use_freeze_call(&desugared_mod.body);
+    let needs_typhon_runtime = has_result_usage
+        || has_any_runtime_import
+        || has_runtime_qualified
+        || needs_freeze_runtime;
     // Only skip injection when an existing `from typhon_runtime
     // import …` already covers all three names. A partial import
     // (e.g. just `Ok`) would leave `Err`/`Result` undefined, so we
@@ -154,6 +161,13 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
     // ensure `from typing import NewType` is in scope.
     let needs_newtype = stmts_use_newtype_call(&desugared_mod.body);
     let inject_newtype = needs_newtype && !has_newtype_import(&desugared_mod.body);
+
+    // `freeze let X = expr` lowers to `let X = __typhon_freeze__(expr)`
+    // — ensure `from typhon_runtime.freeze import deep_freeze as
+    // __typhon_freeze__` is in scope and the typhon_runtime package
+    // gets emitted alongside the output.
+    let needs_freeze = stmts_use_freeze_call(&desugared_mod.body);
+    let inject_freeze = needs_freeze && !has_freeze_import(&desugared_mod.body);
 
     // `gather:` lowers to `asyncio.TaskGroup` and best-effort to
     // `asyncio.gather(...)` — ensure `import asyncio` is in scope.
@@ -182,6 +196,9 @@ pub fn desugar_module_with(module: &ModModule, options: DesugarOptions) -> Desug
     }
     if inject_newtype {
         body.insert(insert_at, make_newtype_import());
+    }
+    if inject_freeze {
+        body.insert(insert_at, make_freeze_import());
     }
     // `pub` synthesis: when the source declared at least one `pub`
     // name, emit `__all__ = ["a", "b", …]` right after the import
@@ -525,6 +542,70 @@ fn make_newtype_import() -> Stmt {
         level: 0,
         is_lazy: false,
     })
+}
+
+fn make_freeze_import() -> Stmt {
+    Stmt::ImportFrom(StmtImportFrom {
+        range: TextRange::default(),
+        node_index: AtomicNodeIndex::NONE,
+        module: Some(make_identifier("typhon_runtime.freeze")),
+        names: vec![ruff_python_ast::Alias {
+            range: TextRange::default(),
+            node_index: AtomicNodeIndex::NONE,
+            name: make_identifier("deep_freeze"),
+            asname: Some(make_identifier("__typhon_freeze__")),
+        }],
+        level: 0,
+        is_lazy: false,
+    })
+}
+
+/// `true` when `body` already binds `__typhon_freeze__` as an alias of
+/// `typhon_runtime.freeze.deep_freeze`.
+fn has_freeze_import(body: &[Stmt]) -> bool {
+    body.iter().any(|stmt| match stmt {
+        Stmt::ImportFrom(i) => {
+            i.module.as_ref().map(|m| m.as_str()) == Some("typhon_runtime.freeze")
+                && i.names.iter().any(|a| {
+                    a.name.as_str() == "deep_freeze"
+                        && a.asname.as_ref().map(|n| n.as_str()) == Some("__typhon_freeze__")
+                })
+        }
+        _ => false,
+    })
+}
+
+/// `true` when `body` has at least one expression of the form
+/// `__typhon_freeze__(...)` — the desugared shape of `freeze let`.
+fn stmts_use_freeze_call(body: &[Stmt]) -> bool {
+    body.iter().any(stmt_uses_freeze_call)
+}
+
+fn stmt_uses_freeze_call(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Assign(a) => expr_uses_freeze_call(&a.value),
+        Stmt::AnnAssign(a) => a.value.as_ref().is_some_and(|v| expr_uses_freeze_call(v)),
+        Stmt::FunctionDef(f) => stmts_use_freeze_call(&f.body),
+        Stmt::ClassDef(c) => stmts_use_freeze_call(&c.body),
+        Stmt::If(s) => {
+            stmts_use_freeze_call(&s.body)
+                || s.elif_else_clauses
+                    .iter()
+                    .any(|c| stmts_use_freeze_call(&c.body))
+        }
+        _ => false,
+    }
+}
+
+fn expr_uses_freeze_call(expr: &Expr) -> bool {
+    if let Expr::Call(c) = expr {
+        if let Expr::Name(n) = c.func.as_ref() {
+            if n.id.as_str() == "__typhon_freeze__" {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Synthesise `__all__ = ["a", "b", ...]` from the list of `pub`

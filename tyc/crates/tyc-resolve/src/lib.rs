@@ -2564,6 +2564,10 @@ fn builtin_names() -> std::collections::HashSet<&'static str> {
         // `typing.NewType` — referenced by the desugared `newtype` form
         // before the desugar pass injects `from typing import NewType`.
         "NewType",
+        // `typhon_runtime.freeze.deep_freeze` — referenced by the
+        // desugared `freeze let` form before the desugar pass
+        // injects the import.
+        "__typhon_freeze__",
         // Typhon comptime built-in function.
         "env",
         // Pydantic BaseModel — injected by the `model` keyword preprocessor.

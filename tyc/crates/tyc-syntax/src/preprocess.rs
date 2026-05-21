@@ -203,6 +203,35 @@ pub fn preprocess(source: &str) -> PreprocessResult {
             let indent = &line[..indent_len];
             let rest = &line[indent_len..];
 
+            // ── `freeze let NAME[: T] = EXPR` → `let NAME[: T] = __typhon_freeze__(EXPR)` ─
+            // Wraps the RHS in a runtime deep-freeze call. Module-level
+            // only for v1; in-function uses fall through to the Python
+            // parser (which rejects `freeze let` as a syntax error).
+            // The `let` keyword is preserved so the existing
+            // binding-immutability machinery still fires; `freeze` adds
+            // the recursive value-immutability layer on top.
+            if indent_len == 0 {
+                if let Some(after_raw) = rest.strip_prefix("freeze let ") {
+                    let after = after_raw.trim_end_matches(['\n', '\r']);
+                    if let Some(rewritten) = wrap_freeze_let(after) {
+                        stripped.push(StrippedKeyword {
+                            line_index,
+                            keyword: TyphonKeyword::Freeze,
+                        });
+                        let new_line = format!("{}let {}\n", indent, rewritten);
+                        let (rewritten, marks) = rewrite_optionals(&new_line, &mut in_string);
+                        for col in marks {
+                            optionals.push(StrippedOptional {
+                                line_index,
+                                python_col: col,
+                            });
+                        }
+                        python_source.push_str(&rewritten);
+                        continue;
+                    }
+                }
+            }
+
             // ── `newtype Name = Base` → `Name = NewType("Name", Base)` ───────
             // Module-level only. The desugar pass injects
             // `from typing import NewType` when at least one such
@@ -754,6 +783,60 @@ fn ident_prefix(s: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Reverse [`wrap_freeze_let`]: strip the `__typhon_freeze__(...)`
+/// wrapper from the RHS so `tyc fmt` restores the original
+/// `freeze let X = EXPR` shape. Returns the line content with the
+/// wrapper removed (the `freeze ` prefix is prepended by the
+/// caller); `None` if the wrapper isn't present.
+fn unwrap_freeze_let(content: &str) -> Option<String> {
+    let eq = content.find('=')?;
+    let lhs = content[..eq].trim_end();
+    let rhs = content[eq + 1..].trim();
+    let inner = rhs.strip_prefix("__typhon_freeze__(")?;
+    let inner = inner.strip_suffix(')')?;
+    Some(format!("{} = {}", lhs, inner))
+}
+
+/// Wrap the RHS of a `freeze let` binding in `__typhon_freeze__(...)`.
+/// `tail` is the part of the line after `freeze let ` — typically
+/// `NAME = EXPR` or `NAME: T = EXPR`. The function locates the
+/// top-level `=` and inserts the wrapper around what follows.
+/// Returns `None` if no `=` is found (the parser will then surface
+/// the user's syntax error verbatim).
+fn wrap_freeze_let(tail: &str) -> Option<String> {
+    // We need the FIRST `=` that isn't inside square brackets or
+    // parens (so a default-value annotation like `Dict[str, int]`
+    // doesn't confuse us). Track depth.
+    let bytes = tail.as_bytes();
+    let mut depth: i32 = 0;
+    let mut eq_idx: Option<usize> = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'=' if depth == 0 => {
+                // Skip `==`, `>=`, `<=`, `!=`, `:=`, `+=`, `-=`, `*=`,
+                // `/=`. We just need a bare `=`.
+                let prev = if i == 0 { 0u8 } else { bytes[i - 1] };
+                let next = bytes.get(i + 1).copied().unwrap_or(0);
+                if next == b'=' || matches!(prev, b'=' | b'>' | b'<' | b'!' | b':' | b'+' | b'-' | b'*' | b'/') {
+                    continue;
+                }
+                eq_idx = Some(i);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let eq = eq_idx?;
+    let lhs = tail[..eq].trim_end();
+    let rhs = tail[eq + 1..].trim();
+    if rhs.is_empty() {
+        return None;
+    }
+    Some(format!("{} = __typhon_freeze__({})", lhs, rhs))
 }
 
 /// Parse the tail of a `newtype` line: `Name = Base`.
@@ -1616,6 +1699,19 @@ pub fn postprocess_full(
                     .find(|c: char| !c.is_whitespace())
                     .unwrap_or(line.len());
                 lines[line_idx] = format!("{}pub {}", &line[..indent_len], &line[indent_len..]);
+            }
+            TyphonKeyword::Freeze => {
+                // Restore `let NAME = __typhon_freeze__(EXPR)` to
+                // `freeze let NAME = EXPR`. The `let` keyword (or its
+                // annotation form) sits unchanged in the middle; we
+                // strip the wrapper around the RHS and prepend `freeze `.
+                let line = &lines[line_idx];
+                let indent_len = line
+                    .find(|c: char| !c.is_whitespace())
+                    .unwrap_or(line.len());
+                let content = &line[indent_len..];
+                let restored = unwrap_freeze_let(content).unwrap_or_else(|| content.to_owned());
+                lines[line_idx] = format!("{}freeze {}", &line[..indent_len], restored);
             }
         }
     }
@@ -5048,6 +5144,49 @@ mod tests {
         let prep = preprocess(src);
         let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
         assert_eq!(out, src);
+    }
+
+    // ── freeze let (Phase F) ────────────────────────────────────────────
+
+    #[test]
+    fn freeze_let_wraps_rhs_in_runtime_call() {
+        let result = preprocess("freeze let TAGS = [\"a\", \"b\"]\n");
+        assert_eq!(
+            result.python_source,
+            "let TAGS = __typhon_freeze__([\"a\", \"b\"])\n"
+        );
+        assert!(result
+            .stripped
+            .iter()
+            .any(|k| matches!(k.keyword, TyphonKeyword::Freeze)));
+    }
+
+    #[test]
+    fn freeze_let_with_annotation_preserves_annotation() {
+        let result = preprocess("freeze let CONFIG: dict[str, int] = {\"port\": 8080}\n");
+        assert_eq!(
+            result.python_source,
+            "let CONFIG: dict[str, int] = __typhon_freeze__({\"port\": 8080})\n"
+        );
+    }
+
+    #[test]
+    fn freeze_let_round_trips_via_postprocess() {
+        let src = "freeze let TAGS: list[str] = [\"a\", \"b\"]\n";
+        let prep = preprocess(src);
+        let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn freeze_let_indented_is_left_alone() {
+        // `freeze let` is module-level only in v1.
+        let result = preprocess("    freeze let X = 1\n");
+        assert!(result.python_source.contains("freeze let"));
+        assert!(!result
+            .stripped
+            .iter()
+            .any(|k| matches!(k.keyword, TyphonKeyword::Freeze)));
     }
 
     // ── pub keyword (Phase D) ───────────────────────────────────────────
