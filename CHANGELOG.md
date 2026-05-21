@@ -4,6 +4,98 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.3.0
+
+Third-party signature recovery via venv introspection. The flagship
+gap this release closes: a project that imports a class from an
+unstubbed PyPI package (`from agent_framework import Agent`) and
+calls it missing a required argument (`Agent(name="x", tools=[])`
+without the required `client` kwarg) passed `tyc check` and
+`tyc build` clean in 0.2.1, then crashed at runtime with
+`TypeError: Agent.__init__() missing 1 required positional
+argument: 'client'`. The checker had no signature for `Agent`
+because no `.dty` stub was authored, so the callable degraded to
+`Type::Unknown` and the arity check at
+`tyc/crates/tyc-types/src/lib.rs:6061` (which only fires for
+project-local classes) was skipped.
+
+0.3.0 closes the loop by shelling to the project's
+`.venv/bin/python` (or a fallback `python3` on PATH), asking
+`inspect.signature` for the real parameter list of every public
+class and free function in each declared dependency, and folding
+the result into the same `ModuleShapes` registry that
+`tyc-db::build_external_shapes` already consumes. No changes to the
+checker itself — once the shape is in the registry, the existing
+cross-module constructor / function arity path fires identically
+to in-project calls.
+
+### Added
+
+- **`tyc/src/venv_signatures.rs`: venv-driven signature
+  introspection for the type checker.** Walks every `.ty` file's
+  `import` / `from ... import ...` / `lazy import` statements to
+  collect dotted module names, then runs an embedded Python helper
+  in the project venv that emits structured per-parameter info
+  (name, kind, has-default) for every public class and free
+  function. The Rust side converts that into an `InterfaceShape`
+  (for classes — each `__init__` param becomes a field, with
+  defaulted params populating `field_defaults`) or an `ArityInfo`
+  (for free functions — kw-only / positional / `*args` / `**kwargs`
+  preserved), and merges the result into the project shape
+  registry. `tyc check` and `tyc build` consume the enriched
+  registry; no changes were needed in `tyc-types` or `tyc-db`.
+
+### Safety rails
+
+- Only modules whose top-level package is listed in
+  `[dependencies]` / `[dev-dependencies]` (or maps to a declared
+  distribution via `.dist-info/top_level.txt`) are introspected.
+  Stdlib (`os`, `json`, `collections`) and project modules stay on
+  their existing resolution paths — no Python subprocesses for
+  ordinary stdlib usage.
+- Classes whose `__init__` declares `*args` or `**kwargs` are
+  deliberately skipped. False positives on permissive Python APIs
+  (every extra kwarg firing `tyc::unknown_kwarg`) would be worse
+  than the existing miss.
+- All failures (no venv, no Python on PATH, import-time exception,
+  5-second introspection timeout) silently no-op. Worst case is the
+  prior 0.2.1 behaviour — the runtime catches what the checker
+  couldn't.
+- Subprocess `current_dir` is pinned to the project root so the
+  same `tyc check` from any subdirectory produces the same shape
+  registry. Same reproducibility contract that already applies to
+  `tyc::unknown_module`.
+- The introspection result is cached per `VenvSignatures` instance
+  keyed by dotted module name; one subprocess per module per
+  `tyc check` invocation.
+
+### Tests
+
+- 10 new unit tests in `tyc::venv_signatures` covering the
+  shape-conversion logic (required kw-only params, `**kwargs`
+  bail-out, `*args` bail-out, positional+kw-only mix, `*args` /
+  `**kwargs` on free functions, dotted-name validation, allow-list
+  gating, and import-statement extraction across every Typhon /
+  Python form).
+- One new integration test in `tyc::commands::check::tests`
+  (`check_introspects_third_party_class_constructor_arity`) that
+  builds a fake third-party package, runs the introspection
+  helper, and asserts the recovered shape models the original bug.
+  Skips silently when no Python 3 is on PATH so CI runners without
+  Python don't fail the suite.
+
+### Caveats
+
+- An author who genuinely needs the missing-arity check on a
+  class with `**kwargs` should write a `.dty` stub — the stub
+  declares the real surface and the arity check fires normally.
+  See `docs/guides/08-…-stubs` (TBD).
+- Python imports can have side effects. Modules that touch the
+  network or sleep at import time would now do so during
+  `tyc check`. The 5-second timeout caps the cost; users on
+  pathological packages can declare the dep out of
+  `[dependencies]` to skip introspection.
+
 ## 0.2.1
 
 Correctness fixes surfaced by the
