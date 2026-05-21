@@ -2486,6 +2486,15 @@ pub fn check_module_with_imports(
     }
     c.env.leave();
 
+    // Phase C: resource discipline. Walk the body for bound
+    // `Stmt::Assign` / `Stmt::AnnAssign` whose RHS is a known
+    // context-manager-returning call (`open`, `socket.socket`, …)
+    // that wasn't consumed by a `with` statement. Fires
+    // `tyc::resource_not_managed` as a warning; the strictness
+    // filter promotes/demotes/drops based on `[strictness]
+    // require-with` in `typhon.toml`.
+    check_resource_discipline(&mut c, &module.body);
+
     c.diagnostics
 }
 
@@ -2899,6 +2908,143 @@ fn seed_typhon_builtins(c: &mut Checker) {
         narrowed: Type::Class("Result".into()),
         span: (0, 0),
     });
+}
+
+/// The curated set of stdlib calls that return an unmanaged resource
+/// (a file handle, socket, connection, …) which **must** be wrapped in
+/// a `with` statement to guarantee cleanup. Matched as either a bare
+/// name (`open(...)`) or a dotted suffix (`socket.socket(...)`,
+/// `tempfile.NamedTemporaryFile(...)`). Conservative: only the entries
+/// where missing-`with` is a real bug make the cut. Project-specific
+/// classes can opt in via a future `@must_with` decorator or `.dty`
+/// annotation.
+const REQUIRE_WITH_CALLEES: &[&str] = &[
+    "open",
+    "socket.socket",
+    "sqlite3.connect",
+    "tempfile.NamedTemporaryFile",
+    "tempfile.TemporaryDirectory",
+    "tempfile.TemporaryFile",
+];
+
+/// Return the dotted callee path of `expr` if it is a `Call` whose
+/// callee is a bare or dotted name; otherwise `None`. Used to match
+/// against [`REQUIRE_WITH_CALLEES`] without false positives on
+/// arbitrary expressions.
+fn dotted_callee_path(expr: &Expr) -> Option<String> {
+    let call = match expr {
+        Expr::Call(c) => c,
+        _ => return None,
+    };
+    dotted_name_of(&call.func)
+}
+
+fn dotted_name_of(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Name(n) => Some(n.id.as_str().to_owned()),
+        Expr::Attribute(a) => {
+            let prefix = dotted_name_of(a.value.as_ref())?;
+            Some(format!("{}.{}", prefix, a.attr.as_str()))
+        }
+        _ => None,
+    }
+}
+
+/// Walk `body` recursively, firing `tyc::resource_not_managed` for any
+/// assignment whose RHS is a known resource-returning call. A
+/// `with`-statement's `items[].context_expr` is *not* a child of
+/// `Stmt::Assign`, so legitimate `with open(...) as f:` forms never
+/// trip the check — only bare assignments do.
+fn check_resource_discipline(c: &mut Checker, body: &[Stmt]) {
+    for stmt in body {
+        check_resource_discipline_stmt(c, stmt);
+    }
+}
+
+fn check_resource_discipline_stmt(c: &mut Checker, stmt: &Stmt) {
+    match stmt {
+        Stmt::Assign(a) => {
+            if let Some(name) = dotted_callee_path(a.value.as_ref()) {
+                if REQUIRE_WITH_CALLEES.iter().any(|p| *p == name) {
+                    let span = (
+                        a.value.range().start().to_usize(),
+                        a.value.range().end().to_usize(),
+                    );
+                    c.diagnostics
+                        .push_warning(TycError::resource_not_managed(
+                            &name,
+                            &c.path,
+                            c.source,
+                            span.0,
+                            span.1.saturating_sub(span.0).max(1),
+                        ));
+                }
+            }
+        }
+        Stmt::AnnAssign(a) => {
+            if let Some(v) = a.value.as_ref() {
+                if let Some(name) = dotted_callee_path(v.as_ref()) {
+                    if REQUIRE_WITH_CALLEES.iter().any(|p| *p == name) {
+                        let span = (
+                            v.range().start().to_usize(),
+                            v.range().end().to_usize(),
+                        );
+                        c.diagnostics
+                            .push_warning(TycError::resource_not_managed(
+                                &name,
+                                &c.path,
+                                c.source,
+                                span.0,
+                                span.1.saturating_sub(span.0).max(1),
+                            ));
+                    }
+                }
+            }
+        }
+        Stmt::FunctionDef(f) => check_resource_discipline(c, &f.body),
+        Stmt::ClassDef(cd) => check_resource_discipline(c, &cd.body),
+        Stmt::If(s) => {
+            // `unsafe:` lowers to `if True:  # __typhon_unsafe__` at
+            // preprocess time. Skip its body so deliberate
+            // resource-leak escape hatches (`unsafe: let f =
+            // open(...)`) don't trip the diagnostic.
+            if c.is_unsafe_marker(s.range) {
+                return;
+            }
+            check_resource_discipline(c, &s.body);
+            for clause in &s.elif_else_clauses {
+                check_resource_discipline(c, &clause.body);
+            }
+        }
+        Stmt::For(s) => {
+            check_resource_discipline(c, &s.body);
+            check_resource_discipline(c, &s.orelse);
+        }
+        Stmt::While(s) => {
+            check_resource_discipline(c, &s.body);
+            check_resource_discipline(c, &s.orelse);
+        }
+        Stmt::With(s) => {
+            // The items themselves are managed by definition.
+            // Only walk the body.
+            check_resource_discipline(c, &s.body);
+        }
+        Stmt::Try(s) => {
+            check_resource_discipline(c, &s.body);
+            for h in &s.handlers {
+                let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                check_resource_discipline(c, &h.body);
+            }
+            check_resource_discipline(c, &s.orelse);
+            check_resource_discipline(c, &s.finalbody);
+        }
+        Stmt::Match(s) => {
+            for case in &s.cases {
+                check_resource_discipline(c, &case.body);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Walk the type-alias graph and emit `tyc::cyclic_type_alias` for any
@@ -8769,6 +8915,90 @@ let bad: UserId = UserId(\"seven\")
 ";
         let d = check(src);
         assert!(d.has_errors(), "expected newtype_violation for str arg");
+    }
+
+    // ── resource discipline (Phase C) ───────────────────────────────────
+
+    #[test]
+    fn bare_open_assignment_warns() {
+        let src = "\
+def read_file(path: str) -> str:
+    let f = open(path)
+    return f.read()
+";
+        let d = check(src);
+        assert!(
+            d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::ResourceNotManaged { .. })),
+            "expected resource_not_managed warning"
+        );
+    }
+
+    #[test]
+    fn with_open_does_not_warn() {
+        let src = "\
+def read_file(path: str) -> str:
+    with open(path) as f:
+        return f.read()
+";
+        let d = check(src);
+        assert!(
+            !d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::ResourceNotManaged { .. })),
+            "with-statement should not trip resource discipline"
+        );
+    }
+
+    #[test]
+    fn socket_socket_assignment_warns() {
+        let src = "\
+import socket
+def listen() -> None:
+    let s = socket.socket()
+    s.close()
+";
+        let d = check(src);
+        assert!(
+            d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::ResourceNotManaged { .. })),
+            "expected resource_not_managed for socket.socket"
+        );
+    }
+
+    #[test]
+    fn unsafe_block_suppresses_resource_warning() {
+        let src = "\
+def escape_hatch(path: str) -> None:
+    unsafe:
+        let f = open(path)
+        f.close()
+";
+        let d = check(src);
+        assert!(
+            !d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::ResourceNotManaged { .. })),
+            "unsafe: should suppress resource discipline"
+        );
+    }
+
+    #[test]
+    fn annotated_resource_assignment_warns() {
+        let src = "\
+def read_file(path: str) -> str:
+    let f: object = open(path)
+    return \"\"
+";
+        let d = check(src);
+        assert!(
+            d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::ResourceNotManaged { .. })),
+            "expected resource_not_managed for annotated assign"
+        );
     }
 
     // ── div-by-zero literal (Phase B) ───────────────────────────────────

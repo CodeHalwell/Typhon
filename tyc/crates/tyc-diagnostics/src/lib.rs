@@ -897,6 +897,29 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A call to a known resource-returning function (`open`,
+    /// `socket.socket`, `sqlite3.connect`, …) was bound to a
+    /// variable without a surrounding `with` statement. Without
+    /// `with`, the handle is only released when the GC collects
+    /// the binding — at best non-deterministically, at worst not
+    /// at all if the function raises mid-way. Default severity is
+    /// **warn**; promote to error via `[strictness] require-with
+    /// = "error"` in `typhon.toml` for CI enforcement.
+    #[error("`{name}(...)` returns a resource that should be managed by `with`")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::resource_not_managed),
+        url("https://typhon.dev/lang/diagnostics/resource_not_managed"),
+        help("wrap the call in a `with` block: `with {name}(...) as handle: ...`")
+    )]
+    ResourceNotManaged {
+        name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("not consumed by a `with` statement")]
+        span: SourceSpan,
+    },
+
     /// A division-style operator (`/`, `//`, `%`) has a literal zero
     /// on the right-hand side. The runtime will raise
     /// `ZeroDivisionError` unconditionally; catching it at compile
@@ -1810,6 +1833,21 @@ impl TycError {
         length: usize,
     ) -> Self {
         Self::CyclicTypeAlias {
+            name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::ResourceNotManaged`] diagnostic.
+    pub fn resource_not_managed(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::ResourceNotManaged {
             name: name.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),

@@ -117,6 +117,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
         "python_semantic_drift" => {
             include_str!("../../../../../docs/diagnostics/python_semantic_drift.md")
         }
+        "resource_not_managed" => {
+            include_str!("../../../../../docs/diagnostics/resource_not_managed.md")
+        }
         "result_error_mismatch" => {
             include_str!("../../../../../docs/diagnostics/result_error_mismatch.md")
         }
