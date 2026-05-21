@@ -4,6 +4,71 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.2.5
+
+Second editor-UX pass on the 0.2.4 LSP work. Closes the three
+remaining "doesn't match what VS Code does for Python" gaps in
+the original report:
+
+### Added
+
+- **Module-path tokens in `from X.Y import Z`.** Dotted module
+  paths in both `from` and bare `import` statements now emit a
+  `namespace` token per segment, with `defaultLibrary` applied for
+  stdlib roots. Previously the resolver only emitted a token for
+  `Z` (the binding), leaving `X.Y` uncoloured — visually the most
+  prominent part of every import line. Each segment is its own
+  token so themes (and future "go to import" code actions) can
+  target sub-segments.
+- **Shape-aware kwarg colouring.** Call sites like
+  `Agent(client=…, model=…)` now classify each kwarg name against
+  the callee's real signature:
+  - `property` (orange) when the kwarg names a declared parameter.
+  - `parameter` (yellow) when the callee declares `**kwargs` and
+    the kwarg isn't on the explicit list.
+  - No token (white) when the kwarg is unrecognised and the callee
+    has no catch-all — a visible cue that something's off without
+    us claiming a hard diagnostic.
+
+  The LSP pre-resolves callee signatures by batch-querying the
+  introspection cache for every top-level imported class /
+  function in the open buffer. Signature parsing is tolerant of
+  nested-tuple defaults (`a=(1, 2)`), quoted commas
+  (`sep=', '`), positional-only `/`, kw-only `*`, and the
+  conventional `self` / `cls` first parameter.
+- **Class docstring fallback to `__init__`.** When a class body
+  carries no docstring (common pattern when the author wrote the
+  documentation on `__init__` instead), hover now falls back to
+  `__init__.__doc__` so the popover still shows parameter
+  documentation. Without the fallback the hover for classes like
+  `agent_framework.Agent` degraded to "📦 from …" with no Markdown
+  body.
+- **RST inline cleanup in hover docstrings.** Two of the most
+  common Sphinx markup shapes are normalised to Markdown before
+  rendering: ``\`\`code\`\``` (RST double-backtick) becomes
+  ``\`code\``` (Markdown), and Sphinx role markup like
+  `:class:\`Foo\``, `:func:\`bar\``, `:meth:\`baz\`` has the role
+  stripped, leaving just the backticked symbol. Pylance does the
+  full Sphinx → HTML render; this is the 80/20 that catches the
+  shapes appearing in most third-party docstrings.
+- **Signature truncation cap raised** from 400 → 1024 characters
+  so Pydantic / SQLAlchemy / Django model constructors with 20+
+  typed parameters render their full signature instead of being
+  dropped entirely.
+
+### Tests
+
+- 10 new tests in `tyc-lsp::semantic`:
+  - Module-path emission: `from foo.bar import Baz`,
+    `from os.path import join` (stdlib modifier), dotted
+    `import foo.bar.baz`.
+  - Kwarg classification: real-param → `property`,
+    `**kwargs` catch-all → `parameter`, unknown → no token.
+  - Signature parser: basic param names, `**kwargs` detection,
+    nested-default commas, `self` / `cls` skip.
+- 2 new tests in `tyc-lsp` for `render_docstring`: RST
+  double-backtick code, Sphinx role directive stripping.
+
 ## 0.2.4
 
 Editor developer-UX pass: semantic-token colouring for the LSP and

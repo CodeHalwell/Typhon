@@ -174,8 +174,20 @@ def doc_of(obj):
     and renders it as Markdown — we don't pre-process here so future
     UI work (e.g. linking back to the source line) has the raw
     text to work with.
+
+    For classes whose body carries no docstring (a common pattern when
+    the author hung the documentation on `__init__` instead), fall
+    back to `__init__.__doc__` so the hover popover still shows
+    parameter docs. Without this fallback, the hover for a class
+    like agent_framework.Agent would degrade to "📦 from …" with no
+    Markdown body — visibly less useful than the same hover in
+    Pylance.
     """
     doc = getattr(obj, "__doc__", None)
+    if (not doc) and inspect.isclass(obj):
+        init = getattr(obj, "__init__", None)
+        if init is not None:
+            doc = getattr(init, "__doc__", None)
     if not doc:
         return None
     doc = doc.strip("\n")
@@ -191,7 +203,12 @@ def signature_of(name, obj):
     except (TypeError, ValueError):
         return None
     text = f"{name}{sig}"
-    return text if len(text) <= 400 else None
+    # Bumped from 400 → 1024: a Pydantic / SQLAlchemy / Django model
+    # constructor can carry 20+ typed parameters and overflow the
+    # tighter cap. The LSP payload stays well under wire-protocol
+    # limits at this size; hover renders the full signature in a
+    # code block where horizontal scroll is acceptable.
+    return text if len(text) <= 1024 else None
 
 def main():
     if len(sys.argv) < 2:

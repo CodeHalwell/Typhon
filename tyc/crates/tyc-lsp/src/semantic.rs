@@ -22,6 +22,8 @@
 //! token_modifiers_bitmask)` — packed in order so the client can
 //! reconstruct absolute positions by accumulating deltas.
 
+use std::collections::{HashMap, HashSet};
+
 use ruff_python_ast::{visitor::Visitor, Expr, ModModule, Stmt};
 use ruff_text_size::Ranged;
 use tower_lsp_server::ls_types::{
@@ -84,6 +86,31 @@ struct AbsoluteToken {
     modifiers: u32,
 }
 
+/// Structured signature info for a single callable, derived from the
+/// venv-introspection cache and parsed once per `semantic_tokens_full`
+/// request. The kwarg classifier uses it to colour `Agent(client=...)`
+/// argument names by whether they hit a real parameter, a `**kwargs`
+/// catch-all, or nothing.
+#[derive(Debug, Default, Clone)]
+pub struct CalleeSignature {
+    /// Set of named parameters declared on the callable, excluding
+    /// `self`. Membership test runs per kwarg, so a hash set keeps
+    /// the inner loop O(1) regardless of arity.
+    pub param_names: HashSet<String>,
+    /// True when the callable declares `**kwargs`. Unknown kwargs
+    /// fall through to the catch-all in that case (yellow), versus
+    /// being silently invalid (white / no token).
+    pub accepts_kwargs: bool,
+}
+
+/// Lookup table the kwarg pass consults. Key is the bare binding
+/// name as it appears in source (`Agent`, `Client`) — the resolver
+/// gives the same key when walking `Expr::Name` callees. Built once
+/// per request by `semantic_tokens_full` after batch-querying the
+/// introspection cache; cheap to clone since the inner sets are
+/// small.
+pub type CalleeSignatures = HashMap<String, CalleeSignature>;
+
 /// Walk the resolved module + parsed AST and return the LSP-encoded
 /// semantic tokens stream. Caller is responsible for the
 /// preprocessed `source` lining up with the resolver / AST byte
@@ -94,16 +121,25 @@ struct AbsoluteToken {
 /// whose top-level matches one of these get the `defaultLibrary`
 /// modifier so themes can render them distinctly from project /
 /// third-party imports.
+///
+/// `callee_signatures` lets the kwarg pass classify `client=…` in
+/// `Agent(client=…)` against the real Agent constructor signature
+/// — orange when the kwarg names a real parameter, yellow when the
+/// constructor declares `**kwargs`, no token (white) when the kwarg
+/// is unrecognised. Pass an empty map to disable kwarg colouring
+/// (used by unit tests that don't need introspection).
 pub fn compute(
     source: &str,
     resolved: &ResolvedModule,
     module: &ModModule,
     stdlib_modules: &[&str],
+    callee_signatures: &CalleeSignatures,
 ) -> SemanticTokens {
     let mut tokens: Vec<AbsoluteToken> = Vec::new();
     emit_binding_tokens(&mut tokens, source, resolved, stdlib_modules);
     emit_reference_tokens(&mut tokens, source, resolved, stdlib_modules);
-    emit_attribute_tokens(&mut tokens, source, module);
+    emit_module_path_tokens(&mut tokens, source, module, stdlib_modules);
+    emit_ast_tokens(&mut tokens, source, module, callee_signatures);
     // The LSP encoding requires tokens in document order (each
     // delta-line is non-negative; ties broken by delta-start).
     tokens.sort_by_key(|t| (t.line, t.col));
@@ -181,14 +217,19 @@ fn emit_reference_tokens(
     }
 }
 
-/// Walk the AST for `Expr::Attribute` nodes and emit `method` /
-/// `property` tokens at the attribute identifier. Method-vs-property
-/// is decided by whether the immediate parent is a call (which we
-/// detect via the visitor walking the parent expr first).
-fn emit_attribute_tokens(tokens: &mut Vec<AbsoluteToken>, source: &str, module: &ModModule) {
-    let mut walker = AttributeWalker {
+/// Walk the AST emitting tokens that the resolver can't see by
+/// itself: attribute access (`obj.attr` / `obj.method()`) and
+/// keyword arguments in calls (`Agent(client=…)`).
+fn emit_ast_tokens<'a>(
+    tokens: &mut Vec<AbsoluteToken>,
+    source: &'a str,
+    module: &'a ModModule,
+    callee_signatures: &'a CalleeSignatures,
+) {
+    let mut walker = AstWalker {
         tokens,
         source,
+        callee_signatures,
         in_call_func: false,
     };
     for stmt in &module.body {
@@ -196,9 +237,10 @@ fn emit_attribute_tokens(tokens: &mut Vec<AbsoluteToken>, source: &str, module: 
     }
 }
 
-struct AttributeWalker<'a> {
+struct AstWalker<'a> {
     tokens: &'a mut Vec<AbsoluteToken>,
     source: &'a str,
+    callee_signatures: &'a CalleeSignatures,
     /// True when the visitor is descending into the `func` slot of an
     /// `Expr::Call`. When the next `Attribute` we see is the
     /// callee, classify the attribute identifier as `method` instead
@@ -206,10 +248,96 @@ struct AttributeWalker<'a> {
     in_call_func: bool,
 }
 
-impl<'a> Visitor<'a> for AttributeWalker<'a> {
+impl<'a> AstWalker<'a> {
+    /// Emit semantic tokens for each kwarg name in a call.
+    /// Classification:
+    /// - **Real parameter** of the callee → `property` (VS Code Dark+
+    ///   renders this in the same orange-ish tone Python users get
+    ///   from Pylance for kwarg names against a known signature).
+    /// - Callee declares `**kwargs` and the name isn't a declared
+    ///   parameter → `parameter` (yellow). Communicates "valid but
+    ///   not on the explicit list".
+    /// - Callee shape isn't known or kwarg isn't recognised → no
+    ///   token, so the editor falls back to the TextMate grammar
+    ///   (white in most themes).
+    fn emit_call_kwargs(&mut self, call: &ruff_python_ast::ExprCall) {
+        let Some(sig) = self.callee_signature_for(&call.func) else {
+            return;
+        };
+        for kw in call.arguments.keywords.iter() {
+            let Some(arg) = &kw.arg else {
+                // `**unpack` — no identifier to colour.
+                continue;
+            };
+            let name = arg.id.as_str();
+            let token_type = if sig.param_names.contains(name) {
+                TOKEN_PROPERTY
+            } else if sig.accepts_kwargs {
+                TOKEN_PARAMETER
+            } else {
+                continue;
+            };
+            let start = arg.range.start().to_usize();
+            let end = arg.range.end().to_usize();
+            if let Some((line, col)) = byte_to_line_col(self.source, start) {
+                self.tokens.push(AbsoluteToken {
+                    line,
+                    col,
+                    length: utf16_len_of_span(self.source, start, end),
+                    token_type,
+                    modifiers: 0,
+                });
+            }
+        }
+    }
+
+    /// Resolve the callee of a `Call` expression to its declared
+    /// signature, if we know one. Handles the two shapes the kwarg
+    /// classifier can meaningfully colour:
+    ///
+    /// - `Foo(...)` where `Foo` is a top-level binding pointing at
+    ///   an imported class / function (most common case — direct
+    ///   `from agent_framework import Agent` followed by `Agent(...)`).
+    /// - `module.Foo(...)` where `module` is a bare-import binding
+    ///   (`import agent_framework` then `agent_framework.Agent(...)`).
+    ///
+    /// Chained / generic callees (`config.client.factory(...)`,
+    /// `make_agent()(...)`) need full type inference and aren't
+    /// classified — kwargs there fall through to the no-token
+    /// default rather than producing misleading colours.
+    fn callee_signature_for(&self, func: &Expr) -> Option<&'a CalleeSignature> {
+        match func {
+            Expr::Name(name) => self.callee_signatures.get(name.id.as_str()),
+            Expr::Attribute(attr) => {
+                // `module.Foo(...)` — the receiver must be a bare
+                // name (the binding from `import module`); the attr
+                // is the member. We build the lookup key as
+                // `binding.member` to match what
+                // `build_callee_signatures` populates for bare
+                // imports. Chained receivers
+                // (`config.client.factory`) need full type inference
+                // and stay unclassified.
+                let receiver = match attr.value.as_ref() {
+                    Expr::Name(n) => n.id.as_str(),
+                    _ => return None,
+                };
+                let key = format!("{}.{}", receiver, attr.attr.as_str());
+                self.callee_signatures.get(key.as_str())
+            }
+            _ => None,
+        }
+    }
+}
+
+impl<'a> Visitor<'a> for AstWalker<'a> {
     fn visit_expr(&mut self, expr: &'a Expr) {
         match expr {
             Expr::Call(call) => {
+                // Kwarg classification (orange / yellow / nothing)
+                // before recursing — the children include the kwarg
+                // *values*, which are normal expressions we want to
+                // descend into for nested attribute access.
+                self.emit_call_kwargs(call);
                 // Recurse into `call.func` with the call-context flag
                 // set so the leading `Attribute` (if any) is tagged
                 // as a method. Arguments are visited normally; an
@@ -266,6 +394,238 @@ impl<'a> Visitor<'a> for AttributeWalker<'a> {
         ruff_python_ast::visitor::walk_stmt(self, stmt);
         self.in_call_func = saved;
     }
+}
+
+/// Emit `namespace` tokens for the dotted module-path identifiers
+/// in `import foo.bar` and `from foo.bar import baz` statements.
+/// VS Code's Python plugin colours these distinctly from the
+/// surrounding `import` keyword (which the TextMate grammar covers);
+/// without this pass, our hover-aware highlighting was missing the
+/// most visually prominent part of every import line.
+///
+/// `defaultLibrary` modifier is applied when the root of the dotted
+/// path is in the stdlib whitelist — same treatment binding tokens
+/// already get, so stdlib `from os.path import join` stays muted.
+fn emit_module_path_tokens(
+    tokens: &mut Vec<AbsoluteToken>,
+    source: &str,
+    module: &ModModule,
+    stdlib_modules: &[&str],
+) {
+    // Walk the *entire* AST, not just `module.body`. Python lets
+    // `import` / `from X import Y` appear inside any function or
+    // class body (the lazy-import pattern + conditional imports
+    // are both common), and skipping nested cases would leave the
+    // most-used Python shapes uncoloured.
+    let mut walker = ModulePathWalker {
+        tokens,
+        source,
+        stdlib_modules,
+    };
+    for stmt in &module.body {
+        walker.visit_stmt(stmt);
+    }
+}
+
+struct ModulePathWalker<'a> {
+    tokens: &'a mut Vec<AbsoluteToken>,
+    source: &'a str,
+    stdlib_modules: &'a [&'a str],
+}
+
+impl<'a> Visitor<'a> for ModulePathWalker<'a> {
+    fn visit_stmt(&mut self, stmt: &'a Stmt) {
+        match stmt {
+            Stmt::ImportFrom(import_from) => {
+                if let Some(module_ident) = &import_from.module {
+                    let dotted = module_ident.id.as_str();
+                    let start = module_ident.range.start().to_usize();
+                    // Relative imports (`from .foo import bar` —
+                    // any level > 0) are always project-local, so
+                    // they must not get the stdlib `defaultLibrary`
+                    // modifier even when the module name happens to
+                    // collide with a stdlib root (`from .os import x`
+                    // is a project's own `os.ty`, not CPython's
+                    // `os`).
+                    let is_stdlib =
+                        import_from.level == 0 && is_stdlib_module(dotted, self.stdlib_modules);
+                    emit_dotted_path(self.tokens, self.source, start, dotted, is_stdlib);
+                }
+            }
+            Stmt::Import(import) => {
+                for alias in &import.names {
+                    let dotted = alias.name.id.as_str();
+                    let start = alias.name.range.start().to_usize();
+                    let is_stdlib = is_stdlib_module(dotted, self.stdlib_modules);
+                    emit_dotted_path(self.tokens, self.source, start, dotted, is_stdlib);
+                }
+            }
+            _ => {}
+        }
+        ruff_python_ast::visitor::walk_stmt(self, stmt);
+    }
+}
+
+fn is_stdlib_module(dotted: &str, stdlib_modules: &[&str]) -> bool {
+    let root = dotted.split('.').next().unwrap_or(dotted);
+    stdlib_modules.contains(&root)
+}
+
+/// Emit one `namespace` token per dotted segment of `path`, anchored
+/// at byte offset `start`. The `.` separators get no token; the
+/// segments are emitted with their byte positions so the LSP client
+/// sees individual ranges (so a future "go to import" code action
+/// can target sub-segments).
+fn emit_dotted_path(
+    tokens: &mut Vec<AbsoluteToken>,
+    source: &str,
+    start: usize,
+    path: &str,
+    is_stdlib: bool,
+) {
+    let mut offset = start;
+    for segment in path.split('.') {
+        if !segment.is_empty() {
+            let end = offset + segment.len();
+            if let Some((line, col)) = byte_to_line_col(source, offset) {
+                let mut modifiers: u32 = 0;
+                if is_stdlib {
+                    modifiers |= MOD_DEFAULT_LIBRARY;
+                }
+                tokens.push(AbsoluteToken {
+                    line,
+                    col,
+                    length: utf16_len_of_span(source, offset, end),
+                    token_type: TOKEN_NAMESPACE,
+                    modifiers,
+                });
+            }
+        }
+        // Step past the segment and the trailing `.`. Last iteration
+        // overshoots by one but `offset` isn't read after the loop.
+        offset += segment.len() + 1;
+    }
+}
+
+/// Parse a Python signature string (the form `inspect.signature`
+/// returns) into the set of declared parameter names and a flag
+/// for `**kwargs`. Used to classify call-site kwargs against the
+/// declared shape — orange for real params, yellow for catch-all.
+///
+/// Tolerant of:
+/// - default values containing nested tuples / dicts / lists
+///   (`(a=(1, 2), b={3: 4})`).
+/// - quoted defaults containing commas (`(sep=', ')`).
+/// - the leading `(` and trailing `)` (with or without spaces).
+/// - leading `self` / `cls` (stripped, but harmless if left in).
+/// - positional-only markers `/` and keyword-only `*` (skipped).
+///
+/// Conservative on the bail-out side: any unrecognised shape
+/// returns the partial result it parsed so far rather than
+/// throwing the whole signature away. Worst case is one kwarg gets
+/// the wrong colour for a hostile signature; the visual feedback is
+/// still net positive.
+pub fn parse_signature(sig: &str) -> CalleeSignature {
+    let mut out = CalleeSignature::default();
+    // The introspection helper feeds us `f"{name}{inspect.signature(obj)}"`
+    // — e.g. `Agent(name, client, model='gpt-4')` — not the bare
+    // parenthesised tail. The old shape (trim → `strip_prefix('(')`)
+    // bailed out on the leading identifier and treated the whole
+    // input as one giant param, silently disabling kwarg colouring
+    // for every introspected signature in the wild.
+    //
+    // Robust extraction: find the *first* `(` and the *matching*
+    // closing `)` (which we approximate as the last `)` in the
+    // string — `inspect.signature` never appends trailing characters,
+    // so the last `)` is the closing one for the whole signature
+    // even if the body contains nested parens for default values).
+    let trimmed = sig.trim();
+    let body = match (trimmed.find('('), trimmed.rfind(')')) {
+        (Some(open), Some(close)) if close > open => &trimmed[open + 1..close],
+        // Already bare `name, client` style (used by tests / future
+        // callers passing pre-extracted bodies): treat the whole
+        // string as the parameter list.
+        _ => trimmed,
+    };
+    for raw in split_top_level_commas(body) {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed == "/" || trimmed == "*" {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("**") {
+            // `**kwargs` — done. We don't need the name (and rarely
+            // does the caller care that it's called `kwargs` vs
+            // `extra`); flipping the flag is sufficient.
+            let _ = rest;
+            out.accepts_kwargs = true;
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix('*') {
+            // `*args` — positional varargs; doesn't affect kwarg
+            // classification but we still parse past it.
+            let _ = rest;
+            continue;
+        }
+        // Extract the identifier portion: everything up to `:` (type
+        // annotation) or `=` (default value) or end-of-string.
+        let name_end = trimmed.find([':', '=']).unwrap_or(trimmed.len());
+        let name = trimmed[..name_end].trim();
+        if name.is_empty() || name == "self" || name == "cls" {
+            continue;
+        }
+        if name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            out.param_names.insert(name.to_owned());
+        }
+    }
+    out
+}
+
+/// Split a parameter-list body on commas that aren't nested inside
+/// parens / brackets / braces / quotes. The naive `body.split(',')`
+/// would mangle `Tuple[int, int]` defaults.
+fn split_top_level_commas(body: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    let mut depth: i32 = 0;
+    let mut in_str: Option<char> = None;
+    // Stateful escape tracking: `"\\\\"` is a string containing one
+    // backslash, terminated by `"` — the second backslash escapes
+    // the first, so the closing quote is *not* preceded by an
+    // unescaped backslash. The earlier "look at the prior byte" check
+    // got this wrong (treated the closing quote as escaped) and
+    // would have swallowed the whole rest of the signature as if
+    // still inside the string.
+    let mut escaped = false;
+    let mut last_split: usize = 0;
+    let bytes = body.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        let c = b as char;
+        if let Some(quote) = in_str {
+            if c == quote && !escaped {
+                in_str = None;
+                escaped = false;
+                continue;
+            }
+            escaped = c == '\\' && !escaped;
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                in_str = Some(c);
+                escaped = false;
+            }
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(&body[last_split..i]);
+                last_split = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if last_split < body.len() {
+        out.push(&body[last_split..]);
+    }
+    out
 }
 
 /// Pick the token kind for a binding (used for both declaration and
@@ -454,7 +814,13 @@ mod tests {
         let (source, resolved, module) = parse_and_resolve(src);
         let stdlib = stdlib();
         let stdlib_refs: Vec<&str> = stdlib.to_vec();
-        let result = compute(&source, &resolved, &module, &stdlib_refs);
+        let result = compute(
+            &source,
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &CalleeSignatures::new(),
+        );
         let (ty, modifiers) = token_at(&source, "os", &result.data).expect("os token");
         assert_eq!(ty, TOKEN_NAMESPACE, "bare `import os` is a namespace");
         assert!(
@@ -469,7 +835,13 @@ mod tests {
         let (source, resolved, module) = parse_and_resolve(src);
         let stdlib = stdlib();
         let stdlib_refs: Vec<&str> = stdlib.to_vec();
-        let result = compute(&source, &resolved, &module, &stdlib_refs);
+        let result = compute(
+            &source,
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &CalleeSignatures::new(),
+        );
         let (ty, modifiers) = token_at(&source, "Agent", &result.data).expect("Agent token");
         assert_eq!(ty, TOKEN_CLASS, "from-imports are tagged as class");
         assert_eq!(
@@ -484,7 +856,13 @@ mod tests {
         let src = "class Foo:\n    pass\n";
         let (source, resolved, module) = parse_and_resolve(src);
         let stdlib_refs: Vec<&str> = Vec::new();
-        let result = compute(&source, &resolved, &module, &stdlib_refs);
+        let result = compute(
+            &source,
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &CalleeSignatures::new(),
+        );
         let (ty, modifiers) = token_at(&source, "Foo", &result.data).expect("Foo token");
         assert_eq!(ty, TOKEN_CLASS);
         assert!(
@@ -499,7 +877,13 @@ mod tests {
         let (source, resolved, module) = parse_and_resolve(src);
         let stdlib = stdlib();
         let stdlib_refs: Vec<&str> = stdlib.to_vec();
-        let result = compute(&source, &resolved, &module, &stdlib_refs);
+        let result = compute(
+            &source,
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &CalleeSignatures::new(),
+        );
         let (ty, _) = token_at(&source, "getcwd", &result.data).expect("getcwd token");
         assert_eq!(ty, TOKEN_METHOD, "`os.getcwd()` is a method call");
     }
@@ -510,7 +894,13 @@ mod tests {
         let (source, resolved, module) = parse_and_resolve(src);
         let stdlib = stdlib();
         let stdlib_refs: Vec<&str> = stdlib.to_vec();
-        let result = compute(&source, &resolved, &module, &stdlib_refs);
+        let result = compute(
+            &source,
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &CalleeSignatures::new(),
+        );
         let (ty, _) = token_at(&source, "sep", &result.data).expect("sep token");
         assert_eq!(ty, TOKEN_PROPERTY, "`os.sep` is a property read");
     }
@@ -520,7 +910,13 @@ mod tests {
         let src = "def add(a: int, b: int) -> int:\n    return a + b\n\nr = add(1, 2)\n";
         let (source, resolved, module) = parse_and_resolve(src);
         let stdlib_refs: Vec<&str> = Vec::new();
-        let result = compute(&source, &resolved, &module, &stdlib_refs);
+        let result = compute(
+            &source,
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &CalleeSignatures::new(),
+        );
         // Declaration carries `declaration` modifier.
         let (decl_ty, decl_mods) =
             token_at(&source, "add(a", &result.data).expect("add decl token");
@@ -563,7 +959,13 @@ mod tests {
         let src = "x = 1\ny = 2\n";
         let (source, resolved, module) = parse_and_resolve(src);
         let stdlib_refs: Vec<&str> = Vec::new();
-        let result = compute(&source, &resolved, &module, &stdlib_refs);
+        let result = compute(
+            &source,
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &CalleeSignatures::new(),
+        );
         // Walk the stream and assert every delta is non-negative.
         for tok in &result.data {
             assert!(
@@ -575,5 +977,287 @@ mod tests {
             // really check is that the encoding is consistent.
             assert!(tok.length > 0, "zero-length tokens shouldn't be emitted");
         }
+    }
+
+    #[test]
+    fn from_import_module_path_emits_namespace_tokens() {
+        // `from foo.bar import Baz` — the dotted path `foo.bar`
+        // should colour as namespace at each segment, so VS Code
+        // doesn't leave the most prominent part of every import
+        // line uncoloured (the original 0.2.4 hit only `Baz`).
+        let src = "from foo.bar import Baz\n";
+        let (source, resolved, module) = parse_and_resolve(src);
+        let stdlib_refs: Vec<&str> = Vec::new();
+        let result = compute(
+            &source,
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &CalleeSignatures::new(),
+        );
+        let (foo_ty, _) = token_at(&source, "foo", &result.data).expect("foo token");
+        let (bar_ty, _) = token_at(&source, "bar", &result.data).expect("bar token");
+        assert_eq!(foo_ty, TOKEN_NAMESPACE);
+        assert_eq!(bar_ty, TOKEN_NAMESPACE);
+    }
+
+    #[test]
+    fn from_import_stdlib_path_carries_default_library_modifier() {
+        // `from os.path import join` — the path is stdlib, so each
+        // segment should get the `defaultLibrary` modifier the same
+        // way bare `import os` already does.
+        let src = "from os.path import join\n";
+        let (source, resolved, module) = parse_and_resolve(src);
+        let stdlib = stdlib();
+        let stdlib_refs: Vec<&str> = stdlib.to_vec();
+        let result = compute(
+            &source,
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &CalleeSignatures::new(),
+        );
+        let (_, os_mods) = token_at(&source, "os", &result.data).expect("os token");
+        let (_, path_mods) = token_at(&source, "path", &result.data).expect("path token");
+        assert!(os_mods & MOD_DEFAULT_LIBRARY != 0, "os mods: {os_mods}");
+        assert!(
+            path_mods & MOD_DEFAULT_LIBRARY != 0,
+            "path mods: {path_mods}"
+        );
+    }
+
+    #[test]
+    fn dotted_import_path_emits_one_token_per_segment() {
+        // `import foo.bar.baz` — each segment is its own token,
+        // not a single span over the whole dotted path.
+        let src = "import foo.bar.baz\n";
+        let (source, resolved, module) = parse_and_resolve(src);
+        let stdlib_refs: Vec<&str> = Vec::new();
+        let result = compute(
+            &source,
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &CalleeSignatures::new(),
+        );
+        for needle in ["foo", "bar", "baz"] {
+            let (ty, _) = token_at(&source, needle, &result.data)
+                .unwrap_or_else(|| panic!("{needle} token missing"));
+            assert_eq!(ty, TOKEN_NAMESPACE);
+        }
+    }
+
+    #[test]
+    fn kwarg_real_param_emits_property_token() {
+        // `Agent(client=…)` where the `Agent` import is in scope
+        // and we've pre-resolved its signature: the kwarg name
+        // should be coloured as `property` (orange in VS Code
+        // Dark+), so the user can see at a glance which kwarg
+        // names actually match the constructor.
+        let src = "from agent_framework import Agent\nAgent(client=1, model='gpt-4')\n";
+        let (source, resolved, module) = parse_and_resolve(src);
+        let mut sigs = CalleeSignatures::new();
+        sigs.insert(
+            "Agent".to_owned(),
+            parse_signature("(name, client, model='gpt-4')"),
+        );
+        let stdlib_refs: Vec<&str> = Vec::new();
+        let result = compute(&source, &resolved, &module, &stdlib_refs, &sigs);
+        let (client_ty, _) =
+            token_at(&source, "client=", &result.data).expect("client kwarg token");
+        let (model_ty, _) = token_at(&source, "model=", &result.data).expect("model kwarg token");
+        assert_eq!(client_ty, TOKEN_PROPERTY);
+        assert_eq!(model_ty, TOKEN_PROPERTY);
+    }
+
+    #[test]
+    fn kwarg_against_kwargs_catchall_emits_parameter_token() {
+        // Callable declares `**kwargs`: an unknown kwarg name
+        // shouldn't be invisible (white), nor should it claim to
+        // be a real param (orange). `parameter` (yellow) is the
+        // honest middle.
+        let src = "from x import F\nF(client=1, weird_thing=2)\n";
+        let (source, resolved, module) = parse_and_resolve(src);
+        let mut sigs = CalleeSignatures::new();
+        sigs.insert("F".to_owned(), parse_signature("(client, **kwargs)"));
+        let stdlib_refs: Vec<&str> = Vec::new();
+        let result = compute(&source, &resolved, &module, &stdlib_refs, &sigs);
+        let (client_ty, _) = token_at(&source, "client=", &result.data).expect("client");
+        let (weird_ty, _) = token_at(&source, "weird_thing=", &result.data).expect("weird");
+        assert_eq!(client_ty, TOKEN_PROPERTY, "real param is orange");
+        assert_eq!(
+            weird_ty, TOKEN_PARAMETER,
+            "**kwargs catch-all is yellow (parameter)"
+        );
+    }
+
+    #[test]
+    fn kwarg_unrecognised_with_no_kwargs_emits_no_token() {
+        // Callable declares exact params with no `**kwargs`, kwarg
+        // name doesn't match any of them: emit no token so the
+        // editor falls back to the default (white) — a visible
+        // "this is wrong" cue without us claiming a particular
+        // diagnostic.
+        let src = "from x import F\nF(bogus=1)\n";
+        let (source, resolved, module) = parse_and_resolve(src);
+        let mut sigs = CalleeSignatures::new();
+        sigs.insert("F".to_owned(), parse_signature("(client, model)"));
+        let stdlib_refs: Vec<&str> = Vec::new();
+        let result = compute(&source, &resolved, &module, &stdlib_refs, &sigs);
+        assert!(
+            token_at(&source, "bogus=", &result.data).is_none(),
+            "unrecognised kwarg should emit no token"
+        );
+    }
+
+    #[test]
+    fn parse_signature_extracts_basic_param_names() {
+        let sig = parse_signature("(name: str, client: Client, model: str = 'gpt-4')");
+        assert!(sig.param_names.contains("name"));
+        assert!(sig.param_names.contains("client"));
+        assert!(sig.param_names.contains("model"));
+        assert!(!sig.accepts_kwargs);
+    }
+
+    #[test]
+    fn parse_signature_detects_kwargs() {
+        let sig = parse_signature("(a, *, b, **kwargs)");
+        assert!(sig.param_names.contains("a"));
+        assert!(sig.param_names.contains("b"));
+        assert!(sig.accepts_kwargs);
+    }
+
+    #[test]
+    fn parse_signature_handles_nested_defaults_with_commas() {
+        // A default value with a tuple literal must not split into
+        // bogus param names. The naive `body.split(',')` would
+        // emit `2)` as a "param".
+        let sig = parse_signature("(a=(1, 2), b={'k': 1}, c='hi, there')");
+        assert!(sig.param_names.contains("a"));
+        assert!(sig.param_names.contains("b"));
+        assert!(sig.param_names.contains("c"));
+        assert_eq!(
+            sig.param_names.len(),
+            3,
+            "no spurious params: {:?}",
+            sig.param_names
+        );
+    }
+
+    #[test]
+    fn parse_signature_skips_self_and_cls() {
+        let sig = parse_signature("(self, name, value)");
+        assert!(!sig.param_names.contains("self"));
+        assert!(sig.param_names.contains("name"));
+        assert!(sig.param_names.contains("value"));
+    }
+
+    #[test]
+    fn parse_signature_strips_leading_callable_name() {
+        // The introspection helper emits `f"{name}{inspect.signature(obj)}"`
+        // — `Agent(name, client, **kwargs)`, not `(name, client, **kwargs)`.
+        // The 0.2.5 parser bailed on the leading identifier and
+        // returned an empty param set, silently disabling kwarg
+        // colouring for every real introspected signature.
+        let sig = parse_signature("Agent(name, client, model='gpt-4', **kwargs)");
+        assert!(
+            sig.param_names.contains("name"),
+            "name extracted from prefixed sig: {:?}",
+            sig.param_names
+        );
+        assert!(sig.param_names.contains("client"));
+        assert!(sig.param_names.contains("model"));
+        assert!(
+            sig.accepts_kwargs,
+            "**kwargs detected from prefixed sig: {:?}",
+            sig
+        );
+    }
+
+    #[test]
+    fn parse_signature_handles_escaped_backslash_in_default() {
+        // `sep='\\\\'` is a string containing one backslash. The
+        // earlier "look at the prior byte" check treated the
+        // closing quote as escaped and swallowed the rest of the
+        // signature; subsequent param names were lost.
+        let sig = parse_signature(r#"(sep='\\', end='\n', flush)"#);
+        assert!(sig.param_names.contains("sep"));
+        assert!(sig.param_names.contains("end"));
+        assert!(
+            sig.param_names.contains("flush"),
+            "flush survived escape: {:?}",
+            sig.param_names
+        );
+    }
+
+    #[test]
+    fn kwarg_classifies_attribute_callee_against_bare_import() {
+        // `import agent_framework` + `agent_framework.Agent(client=…)`
+        // — the lookup map is keyed `agent_framework.Agent` for the
+        // attribute-callee path. Without the fix `callee_signature_for`
+        // returned `None` for any `Expr::Attribute` and the kwarg
+        // pass emitted nothing.
+        let src = "import agent_framework\nagent_framework.Agent(client=1)\n";
+        let (source, resolved, module) = parse_and_resolve(src);
+        let mut sigs = CalleeSignatures::new();
+        sigs.insert(
+            "agent_framework.Agent".to_owned(),
+            parse_signature("Agent(name, client)"),
+        );
+        let stdlib_refs: Vec<&str> = Vec::new();
+        let result = compute(&source, &resolved, &module, &stdlib_refs, &sigs);
+        let (client_ty, _) =
+            token_at(&source, "client=", &result.data).expect("client kwarg via attribute callee");
+        assert_eq!(client_ty, TOKEN_PROPERTY);
+    }
+
+    #[test]
+    fn relative_import_does_not_get_default_library_modifier() {
+        // `from .os import path` — a project-local module named
+        // `os` should NOT inherit the stdlib modifier just because
+        // its top segment collides with a stdlib root name. The
+        // `level > 0` flag is the disambiguator.
+        let src = "from .os import path\n";
+        let (source, resolved, module) = parse_and_resolve(src);
+        let stdlib = stdlib();
+        let stdlib_refs: Vec<&str> = stdlib.to_vec();
+        let result = compute(
+            &source,
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &CalleeSignatures::new(),
+        );
+        let (_, os_mods) = token_at(&source, "os", &result.data).expect("os in relative import");
+        assert_eq!(
+            os_mods & MOD_DEFAULT_LIBRARY,
+            0,
+            "relative import must not be tagged defaultLibrary: {os_mods}"
+        );
+    }
+
+    #[test]
+    fn nested_import_inside_function_gets_module_path_tokens() {
+        // Lazy / conditional imports live inside function bodies
+        // all over real Python. The module-path walker must
+        // descend into nested scopes, not just `module.body`.
+        let src = "def f():\n    from os.path import join\n    return join('a', 'b')\n";
+        let (source, resolved, module) = parse_and_resolve(src);
+        let stdlib = stdlib();
+        let stdlib_refs: Vec<&str> = stdlib.to_vec();
+        let result = compute(
+            &source,
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &CalleeSignatures::new(),
+        );
+        let (os_ty, os_mods) = token_at(&source, "os", &result.data).expect("nested os token");
+        let (path_ty, path_mods) =
+            token_at(&source, "path", &result.data).expect("nested path token");
+        assert_eq!(os_ty, TOKEN_NAMESPACE);
+        assert_eq!(path_ty, TOKEN_NAMESPACE);
+        assert!(os_mods & MOD_DEFAULT_LIBRARY != 0);
+        assert!(path_mods & MOD_DEFAULT_LIBRARY != 0);
     }
 }
