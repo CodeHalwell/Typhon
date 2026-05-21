@@ -4477,9 +4477,29 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
         Stmt::If(i) => check_if(c, i),
         Stmt::While(w) => {
             let _ = infer_expr(c, &w.test);
+            // Flow narrowing inside the loop body: the test is known to
+            // hold on every iteration that *enters* the body, so the
+            // narrowing it implies is sound at the top of each pass
+            // through the body (FINDINGS O2). The pattern that matters
+            // is the linked-list iterator
+            //   while cur is not None:
+            //       total += cur.value
+            //       cur = cur.next
+            // — without this, `cur.value` would trip `tyc::nullable_use`
+            // even though the loop test guarantees the value is non-null
+            // at the read site. A subsequent `cur = cur.next` reassignment
+            // resets narrowing at the assignment site (see the bareword
+            // assignment arm above), so a later iteration that reads the
+            // *new* value with the *old* narrowing is impossible — by
+            // the time control flows back to the head of the loop the
+            // narrowing snapshot has been restored.
+            let narrowings = collect_narrowings(c, &w.test, /*negate=*/ false);
+            let snap_pre = c.env.snapshot();
+            apply_narrowings(c, &narrowings);
             for s in &w.body {
                 check_stmt(c, s);
             }
+            c.env.restore(snap_pre);
             for s in &w.orelse {
                 check_stmt(c, s);
             }
@@ -9318,6 +9338,62 @@ def stop_early(n: int) -> Iterator[int]:
             !d.has_errors(),
             "bare `return` inside an Iterator[T] generator must be accepted; got: {:?}",
             d.errors()
+        );
+    }
+
+    #[test]
+    fn while_loop_test_narrows_body_for_iterator_idiom() {
+        // The linked-list iterator pattern relies on `while cur is not
+        // None:` narrowing `cur` to non-null at every read site inside
+        // the body — including the `cur = cur.next` reassignment
+        // (which reads .next on the *currently narrowed* value, then
+        // resets narrowing for the new value). Without while-test
+        // narrowing this is `tyc::nullable_use` on the very first
+        // `cur.value` and `cur.next` read (FINDINGS O2).
+        let src = "\
+class Node:
+    value: int
+    next: Node?
+
+def sum_list(head: Node?) -> int:
+    mut total: int = 0
+    mut cur: Node? = head
+    while cur is not None:
+        total = total + cur.value
+        cur = cur.next
+    return total
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "while-test narrowing must let the linked-list idiom check; got: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn while_loop_narrowing_resets_after_reassignment() {
+        // Narrowing inside the body is sound only *until* the narrowed
+        // name is reassigned. After `cur = None` the next read must
+        // see `cur` as nullable again — the assignment site resets
+        // narrowing exactly the way a plain `if`-narrowed branch does.
+        let src = "\
+class Node:
+    value: int
+    next: Node?
+
+def f(head: Node?) -> int:
+    mut total: int = 0
+    mut cur: Node? = head
+    while cur is not None:
+        cur = None
+        total = total + cur.value
+    return total
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "post-reassignment read should still trip nullable_use"
         );
     }
 

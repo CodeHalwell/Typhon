@@ -300,12 +300,14 @@ fn rewrite_line(
 }
 
 /// Names imported from `typing` that the migrator rewrites away — either
-/// because they're replaced by Typhon-native sugar (`Optional` → `T?`),
-/// or because they're deprecated capital-case aliases for built-ins
-/// (`List` → `list`, `Dict` → `dict`, etc.). Removing them from the
-/// `from typing import …` line drops the now-dead names.
+/// because they're replaced by Typhon-native sugar (`Optional` → `T?`,
+/// `Union[T, None]` → `T?`, `Union[A, B]` → `A | B`), or because
+/// they're deprecated capital-case aliases for built-ins (`List` →
+/// `list`, `Dict` → `dict`, etc.). Removing them from the `from
+/// typing import …` line drops the now-dead names.
 const TYPING_NAMES_TO_REWRITE: &[&str] = &[
     "Optional",
+    "Union",
     "List",
     "Dict",
     "Tuple",
@@ -481,10 +483,31 @@ fn rewrite_optional(line: &str) -> String {
             }
             let Some(close) = close else { break };
             let inner = &s[open + 1..close];
-            let replacement = format!("{inner}?");
+            // Forward-reference inside `Optional["Foo"]`: emit the
+            // question mark *inside* the quotes so the result is
+            // `"Foo?"` (a single forward-ref containing the trailing
+            // `?`), not `"Foo"?` which is a syntax error (FINDINGS
+            // O21). Handles both double- and single-quoted forms.
+            let trimmed = inner.trim();
+            let replacement = if (trimmed.starts_with('"') && trimmed.ends_with('"'))
+                || (trimmed.starts_with('\'') && trimmed.ends_with('\''))
+            {
+                let q = trimmed.chars().next().unwrap();
+                let body = &trimmed[1..trimmed.len() - 1];
+                format!("{q}{body}?{q}")
+            } else {
+                format!("{inner}?")
+            };
             s.replace_range(start..=close, &replacement);
         }
     }
+
+    // `Union[T, None]` and `Union[None, T]` collapse to `T?` (also the
+    // `typing.Union[...]` qualified form). PEP 604 made `T | None` the
+    // canonical spelling, but legacy code still uses `Union` and the
+    // rewrite cost is identical to the `Optional` arm above (FINDINGS
+    // O22).
+    s = rewrite_union_optional(&s);
 
     // `T | None` → `T?` (only outside strings).  Apply to the slice that
     // sits inside a type-annotation context (`: T | None` or `-> T | None`).
@@ -493,6 +516,116 @@ fn rewrite_optional(line: &str) -> String {
     s = rewrite_pipe_none(&s);
 
     s
+}
+
+/// Rewrite `Union[T, None]` / `Union[None, T]` (also the
+/// `typing.Union[...]` qualified forms) to `T?`. Multi-arm unions
+/// `Union[A, B, None]` are left as-is — they would translate to
+/// `A | B | None`, which is `(A | B)?` but the current `?` shorthand
+/// doesn't compose over arbitrary unions, so a plain pipe-union is
+/// the safer rewrite. Forward-references (quoted strings) push the
+/// trailing `?` *inside* the quotes the same way [`rewrite_optional`]
+/// does for `Optional["Foo"]` (FINDINGS O21).
+fn rewrite_union_optional(line: &str) -> String {
+    let mut s = line.to_owned();
+    for prefix in &["typing.Union[", "Union["] {
+        let mut search_from = 0usize;
+        while let Some(rel) = s[search_from..].find(prefix) {
+            let start = search_from + rel;
+            let open = start + prefix.len() - 1;
+            // Find the matching `]` honouring nested brackets.
+            let mut depth: i32 = 0;
+            let mut close = None;
+            for (i, c) in s.bytes().enumerate().skip(open) {
+                match c {
+                    b'[' => depth += 1,
+                    b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(close) = close else { break };
+            let inner = &s[open + 1..close];
+            // Split on top-level commas only (nested generics may
+            // contain their own commas inside `[ ]`).
+            let parts = split_top_level_commas(inner);
+            let trimmed_parts: Vec<&str> = parts.iter().map(|p| p.trim()).collect();
+            let none_count = trimmed_parts.iter().filter(|p| **p == "None").count();
+            // Only collapse to `T?` when exactly one non-None arm remains.
+            // `Union[A, B, None]` is left for the pipe-rewrite path so it
+            // emits as `A | B | None` (PEP 604), which the user can lift
+            // to `(A | B)?` themselves if they prefer.
+            if trimmed_parts.len() == 2 && none_count == 1 {
+                let other = trimmed_parts
+                    .iter()
+                    .find(|p| **p != "None")
+                    .copied()
+                    .unwrap_or("");
+                let replacement = if (other.starts_with('"') && other.ends_with('"'))
+                    || (other.starts_with('\'') && other.ends_with('\''))
+                {
+                    let q = other.chars().next().unwrap();
+                    let body = &other[1..other.len() - 1];
+                    format!("{q}{body}?{q}")
+                } else {
+                    format!("{other}?")
+                };
+                s.replace_range(start..=close, &replacement);
+                search_from = start + replacement.len();
+            } else {
+                // Multi-arm: rewrite to a PEP 604 pipe-union so at
+                // least the `typing.Union` import isn't dangling.
+                let pieces: Vec<String> =
+                    trimmed_parts.iter().map(|p| p.to_string()).collect();
+                let replacement = pieces.join(" | ");
+                s.replace_range(start..=close, &replacement);
+                search_from = start + replacement.len();
+            }
+        }
+    }
+    s
+}
+
+/// Split `s` on top-level commas. Commas inside `[]`, `()`, or quoted
+/// strings are ignored so `dict[str, int], None` splits into
+/// `["dict[str, int]", " None"]`, not three pieces.
+fn split_top_level_commas(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth_bracket: i32 = 0;
+    let mut depth_paren: i32 = 0;
+    let mut in_str: Option<char> = None;
+    let mut last = 0usize;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        match in_str {
+            Some(q) if c == q => in_str = None,
+            None => match c {
+                '"' | '\'' => in_str = Some(c),
+                '[' => depth_bracket += 1,
+                ']' => depth_bracket -= 1,
+                '(' => depth_paren += 1,
+                ')' => depth_paren -= 1,
+                ',' if depth_bracket == 0 && depth_paren == 0 => {
+                    out.push(&s[last..i]);
+                    last = i + 1;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        i += 1;
+    }
+    if last < s.len() {
+        out.push(&s[last..]);
+    }
+    out
 }
 
 /// Rewrite deprecated capital-case `typing` aliases to their lowercase
@@ -814,6 +947,76 @@ mod tests {
     fn rewrites_typing_optional_qualified() {
         let out = migrate_source("x: typing.Optional[list[int]] = None\n");
         assert!(out.contains("list[int]?"), "got: {out}");
+    }
+
+    #[test]
+    fn rewrites_optional_forward_reference_inside_quotes() {
+        // `Optional["Foo"]` must become `"Foo?"` (the `?` lives inside
+        // the forward-reference string), not `"Foo"?` which is a syntax
+        // error in Typhon (FINDINGS O21).
+        let out = migrate_source("x: Optional[\"Item\"] = None\n");
+        assert!(
+            out.contains("\"Item?\""),
+            "forward-ref rewrite should put `?` inside the quotes; got: {out}",
+        );
+        assert!(
+            !out.contains("\"Item\"?"),
+            "should not emit the invalid `\"Item\"?` form; got: {out}",
+        );
+    }
+
+    #[test]
+    fn rewrites_union_t_none_to_question_mark() {
+        // `Union[T, None]` and `Union[None, T]` are equivalent to
+        // `Optional[T]` and should collapse to `T?` (FINDINGS O22).
+        let out = migrate_source("x: Union[int, None] = None\n");
+        assert!(out.contains("int?"), "Union[int, None] should rewrite; got: {out}");
+        assert!(!out.contains("Union"), "Union name should be dropped; got: {out}");
+
+        let out = migrate_source("x: Union[None, int] = None\n");
+        assert!(out.contains("int?"), "Union[None, int] should rewrite; got: {out}");
+    }
+
+    #[test]
+    fn rewrites_qualified_union_t_none_to_question_mark() {
+        let out = migrate_source("x: typing.Union[list[int], None] = None\n");
+        assert!(out.contains("list[int]?"), "got: {out}");
+    }
+
+    #[test]
+    fn rewrites_union_forward_reference_inside_quotes() {
+        // Forward-references in `Union[..., None]` get the same
+        // inside-the-quotes treatment as `Optional["Foo"]`.
+        let out = migrate_source("x: Union[\"Item\", None] = None\n");
+        assert!(
+            out.contains("\"Item?\""),
+            "Union forward-ref should put `?` inside the quotes; got: {out}",
+        );
+    }
+
+    #[test]
+    fn rewrites_multi_arm_union_to_pipe_union() {
+        // `Union[A, B, None]` doesn't collapse to a single `?` — we
+        // rewrite it to a PEP 604 pipe-union so the `typing.Union`
+        // import isn't left dangling. The user can lift it to
+        // `(A | B)?` themselves if they prefer.
+        let out = migrate_source("x: Union[int, str, None] = None\n");
+        assert!(
+            out.contains("int | str | None"),
+            "multi-arm Union should rewrite to pipe-union; got: {out}",
+        );
+        assert!(!out.contains("Union"), "Union name should be gone; got: {out}");
+    }
+
+    #[test]
+    fn drops_union_from_typing_import_after_rewrite() {
+        let out = migrate_source(
+            "from typing import Union\n\nx: Union[int, None] = None\n",
+        );
+        assert!(
+            !out.contains("import Union"),
+            "stale Union import must be dropped; got: {out}",
+        );
     }
 
     #[test]

@@ -33,8 +33,9 @@ SDK patterns, perf, and intentionally-broken diagnostic probes. Roughly
 | 2026-05-18 examples sweep | `claude/review-examples-x5kgr` | F1–F5 (cross-cutting), 7 compiler bugs | compiler bugs closed; F1–F4 still open (see below) |
 | 2026-05-19 | `claude/test-typhon-library-rNIYC` | #57–#127 | all but the deferred items closed in `review-findings-fixes-VRFJy` / `resolve-open-findings-UDZfv` |
 | 2026-05-20 | `claude/test-typhon-library-ejNr5` | R3.1–R3.18 | closed in `resolve-open-findings-v6t65` except `tyc fmt` and `?` in sub-expr |
-| 2026-05-20 exploration | `claude/typhon-exploration-testing-LZezp` | E1–E11 | **most still open** (see below) |
-| 2026-05-21 | `claude/tender-hawking-LLhuR` | B1–B14 | **all open** (this is the freshest round) |
+| 2026-05-20 exploration | `claude/typhon-exploration-testing-LZezp` | E1–E11 | closed except E6, E9, E11 |
+| 2026-05-21 | `claude/tender-hawking-LLhuR` | B1–B14 | closed B1–B7, B12; B8–B11, B13, B14 still open |
+| 2026-05-21 findings sweep | `claude/findings-documentation-review-HhuVH` | — | closed O2/O3/O4/O5/O6/O21/O22/O25; verified-fixed O1/O7/O8/O9/O11/O18/O20 |
 
 **Pass rate trend** on the canonical example suite (`examples/01-…46-…`):
 20/47 → 39/47 → 46/46 → 46/46. The examples now build and run end-to-end
@@ -49,199 +50,6 @@ Severity legend: **CRITICAL** (silent wrong output / runtime crash on
 documented happy path), **HIGH** (documented feature unusable),
 **MEDIUM** (feature works with workaround), **LOW** (UX / DX nit /
 docs).
-
-### CRITICAL — silent miscompile / wrong runtime behaviour
-
-#### O1 — Emitter strips parens around binary expressions in some suffix contexts *(E1)*
-
-Repro: `stress/round-2026-05-20-exploration/08-meta-stress/25-paren-emit-suite.ty`,
-`08-meta-stress/03-paren-wrong-output.ty`.
-
-```python
-# Typhon source:
-let s: str = ("a" + "b").upper()
-# Emitted Python:
-s: str = "a" + "b".upper()         # == "aB", not "AB"
-
-# Typhon source:
-let b: bool = (True or False) and False
-# Emitted Python:
-b: bool = True or False and False  # == True, not False
-```
-
-Real-world impact also seen on `(root / "a.txt").write_text(...)`
-collapsing to `root / "a.txt".write_text(...)` and on numpy
-least-squares fits collapsing to `dx * dy.sum() / dx * dx.sum()`.
-
-The `tyc-emit` `needs_paren` table is missing the case where a
-parenthesised binary expression is followed by attribute access, method
-call, subscript, or a lower-precedence boolean op. Parens around the
-*inner* operand of a higher-precedence arithmetic op (`(3 + 4) * 2`) are
-preserved — only the suffix-context shapes regress.
-
-### HIGH — documented features unusable
-
-#### O2 — Flow narrowing fades inside `while x is not None:` loop bodies *(B5)*
-
-Repro: `stress/round-2026-05-21/08-meta-stress/21-narrowing-loop.ty`,
-`22-narrowing-while-only.ty`, `20-self-type.ty`.
-
-```python
-def sum_list(head: Node?) -> int:
-    mut total: int = 0
-    mut cur: Node? = head
-    while cur is not None:
-        total = total + cur.value     # tyc::nullable_use on cur.value
-        cur = cur.next                # tyc::nullable_use on cur.next
-    return total
-```
-
-`cur` is narrowed at the loop check but the narrowing drops the moment
-*any* body statement mutates anything. Even rebinding the value with
-`let n: Node = cur` immediately inside the loop fails — narrowing
-doesn't reach the assignment site. The recursive form (parameter that
-never rebinds) works fine; the loop form, which is the iterator idiom,
-does not.
-
-#### O3 — `tuple[T, ...]` variadic tuple type rejects tuple literals *(B1)*
-
-Repro: `stress/round-2026-05-21/08-meta-stress/11-tuple-variadic-bug.ty`.
-
-```python
-let xs: tuple[float, ...] = (1.0, 2.0, 3.0)   # tyc::type_mismatch
-let ys: tuple[float, ...] = ()                # tyc::type_mismatch
-```
-
-The diagnostic prints the expected type as `tuple[float, ?]` — the
-variadic-marker `...` is rendered as a placeholder, suggesting the
-unifier never recognises `tuple[T, ...]` as homogeneous. The cheatsheet
-documents this spelling; today users must downgrade to `list[float]`,
-losing hashability and positional indexing.
-
-#### O4 — Recursive `type` alias rejected as a cycle *(B2)*
-
-Repro: `stress/round-2026-05-21/08-meta-stress/12-recursive-type-alias-bug.ty`.
-
-```python
-type JSON = None | bool | int | float | str | list[JSON] | dict[str, JSON]
-# tyc::alias_cycle + tyc::type_mismatch on every use
-```
-
-A self-referencing alias through `list[…]` / `dict[str, …]` is the
-canonical shape for JSON, ASTs, trees, anything self-similar. Workaround
-today is `dict[str, object]`, which discards typing.
-
-Note: #57/#58/#70 made *non-recursive* aliases transparent for
-assignability. Recursive cycles still terminate cycle detection too
-eagerly. The cycle terminator at depth 8 added in the May 19 sprint does
-not help here because the rejection is at the resolve stage, not the
-assignability stage.
-
-#### O5 — `class!` Exception subclass synthesises arg-less `__init__` *(B4)*
-
-Repro: `stress/round-2026-05-21/08-meta-stress/14-exception-class-bug.ty`.
-
-```python
-class! AppError(Exception):
-    pass
-
-raise AppError("hello")        # TypeError: __init__ takes 1 positional, got 2
-```
-
-The synthesised init drops the message arg. For exceptions in
-particular — and any raw-class with a non-trivial parent more broadly —
-the emit should generate
-`def __init__(self, *args, **kwargs): super().__init__(*args, **kwargs)`
-when the body has no fields. Today's workaround forces every exception
-to declare a `message: str` field and use kwarg-only raises
-(`raise AppError(message="…")`), losing the conventional positional
-form every Python programmer expects.
-
-#### O6 — `return` inside a generator function flagged as value-return mismatch *(B3)*
-
-Repro: `stress/round-2026-05-21/08-meta-stress/13-generator-return-bug.ty`,
-`07-sdk/02-paginator.ty`.
-
-```python
-def stop_early(n: int) -> Iterator[int]:
-    for i in range(n):
-        if i > 5:
-            return        # tyc::type_mismatch: expected Iterator[int], found None
-        yield i
-```
-
-`return` inside a generator is `StopIteration`, not a value return. The
-checker reads the surrounding function as a regular
-`def Iterator[int]:` and demands the return statement produce an
-`Iterator[int]`. The `tyc::generator_return_type` warning added in
-`resolve-open-findings-d6EIV` catches the *opposite* direction (yield in
-non-iterator return); the same machinery needs to flip the
-return-statement validator inside a generator body.
-
-#### O7 — `impl X:` methods reject `T?` parameters *(E2)*
-
-Repro: `stress/round-2026-05-20-exploration/08-meta-stress/06-nullable-impl-method.ty`,
-`07-sdk-client/04-pagination-gen.ty`.
-
-```python
-class API:
-    name: str
-
-impl API:
-    def fetch(self, cursor: str?) -> int:
-        return 0 if cursor is None else len(cursor)
-
-def main() -> None:
-    let api: API = API(name="x")
-    let v: str? = None
-    print(api.fetch(v))    # tyc::nullable_use — "value is `? | None`"
-    print(api.fetch(None)) # tyc::type_mismatch  — "expected `?`, found `None`"
-```
-
-The diagnostic misrenders the parameter type as a bare `?` instead of
-`str?`, suggesting the resolver attaches `Nullable<unknown>` to
-impl-method params. A free function with the same signature works
-correctly. Every typed SDK / repository / service with an optional
-argument hits this.
-
-#### O8 — `return self` from `impl __enter__` fails type-check *(E3)*
-
-Repro: `stress/round-2026-05-20-exploration/08-meta-stress/23-context-mgr-impl.ty`,
-`02-io-heavy/09-context-manager-custom.ty`.
-
-```python
-class Stopwatch:
-    label: str
-    start: float
-
-impl Stopwatch:
-    def __enter__(self) -> Stopwatch:
-        self.start = time.monotonic()
-        return self          # tyc::type_mismatch: expected Stopwatch, found __typhon_impl_Stopwatch
-    def __exit__(self, ...) -> None: ...
-```
-
-The synthetic `__typhon_impl_Stopwatch` pseudo-class is leaking out of
-the desugarer into the type-check error surface. Blocks the most common
-context-manager shape in Python (timers, spans, locks, transactions).
-
-#### O9 — `type Handler = Callable[[Req], Resp]` doesn't unwrap on call *(E4)*
-
-Repro: `stress/round-2026-05-20-exploration/06-api-server/03-middleware.ty`.
-
-```python
-type Handler = Callable[[Request], Response]
-
-def with_auth(next: Handler) -> Handler:
-    def wrapped(req: Request) -> Response:
-        return next(req)   # tyc::type_mismatch: expected Response, found Handler
-    return wrapped
-```
-
-`Callable` aliases aren't transparent when the value is called. Inlining
-the `Callable[[Request], Response]` works but defeats the alias.
-Middleware-style typed pipelines and FP-shaped layered designs are
-painful.
 
 ### MEDIUM — workable but rough
 
@@ -263,26 +71,6 @@ not re-assignments. Treating them as the same name as an enclosing
 Rust/OCaml/Scala programmer expects pattern bindings to introduce fresh
 names. Either (a) introduce a per-`case` scope, or (b) upgrade the
 diagnostic to `tyc::pattern_shadows_outer` with a clear rename hint.
-
-#### O11 — `for x in ...` cannot rebind an outer `let x` in the same scope *(F1, E10)*
-
-Hit in `36-huggingface-transformer`, `40-llm-tool-use`,
-`43-agent-framework`, and `47-mini-app/agent.ty`. Pattern:
-
-```python
-mut text_parts: list[str] = []
-for block in resp.content:        # introduces `block` as a let
-    ...
-mut tool_results: list[dict[str, object]] = []
-for block in resp.content:        # tyc::immutable_assign — can't rebind
-    ...
-```
-
-Python users will write this pattern reflexively. The docs list walrus
-and `gather:` as exceptions to Rule 2 but not `for` targets. Either (a)
-scope the for-loop binding to the loop body, or (b) accept the rebind
-silently when the body completes, or at minimum (c) reword the
-diagnostic to match the `for`-target intuition.
 
 #### O12 — `tyc fmt` is a near-no-op *(B9, R3.15, #18, #65, #122)*
 
@@ -368,16 +156,6 @@ sprint. Lifting the limitation itself (rewriting `Ok(f(x)?)` into a
 temp + propagation) remains future work and is the natural Rust-style
 form users reach for.
 
-#### O18 — `__mul__(self, scalar: float)` ignored when right operand is a float literal *(E5)*
-
-Repro: `stress/round-2026-05-20-exploration/08-meta-stress/22-dunder-ops.ty`.
-
-`impl V: def __mul__(self, scalar: float) -> V` is rejected for
-`let d: V = a * 5.0`. The same code with
-`__mul__(self, scalar: int)` and `a * 4` works. The checker short-
-circuits to the builtin `float.__mul__` instead of consulting the
-user-defined overload.
-
 #### O19 — Exhaustiveness false negatives on sealed unions with positional captures *(E6, partial)*
 
 Several legitimate-total matches still mis-fire as
@@ -390,32 +168,6 @@ with positional captures still surface as false positives. Repros at
 `04-ai-llm/03-llm-tools-sealed.ty`.
 
 Workaround `case _:` works but defeats the safety property.
-
-#### O20 — Comptime f-strings rejected *(E7)*
-
-```python
-comptime let APP: str = "myapp"
-comptime let MAJOR: int = 1
-comptime let MINOR: int = 0
-comptime let VERSION: str = f"{APP} v{MAJOR}.{MINOR}"   # rejected
-```
-
-Workaround: `str(MAJOR) + "." + str(MINOR)` works. F-strings are the
-first thing anyone reaches for when building a comptime version
-string.
-
-#### O21 — `tyc migrate` produces unparseable `"Item"? = None` *(B6)*
-
-Feed any `.py` with `parent: Optional["Item"] = None` through
-`tyc migrate`. Emitted: `parent: "Item"? = None`. The correct rewrite
-is `parent: "Item?" = None`. The migrated `.ty` doesn't even build.
-
-#### O22 — `tyc migrate` doesn't rewrite `Union[T, None]` → `T?` *(B7)*
-
-Same input class. `Optional[T]` is rewritten but `Union[T, None]` is
-not, and `from typing import Union` is left dangling. Documented as
-"conservative" — but `Union[T, None]` is identical to `Optional[T]`
-and hits real-world code at the same rate.
 
 ### LOW — DX / cosmetic
 
@@ -439,15 +191,6 @@ VM prints `Ok(20)`; CPython prints `Ok(value=20)`. Causes `tyc run`
 and `tyc run --compile` to diverge in stdout, which the `tyc-vm` doc
 explicitly warns about, but worth surfacing for screenshot-driven
 docs and test fixtures.
-
-#### O25 — `tyc explain --list` advertised but unimplemented *(B12)*
-
-When `tyc explain not_a_real_code` fails, the help text reads:
-
-> Run `tyc explain --list` (not yet implemented) or see https://typhon.dev/lang/diagnostics
-
-"Not yet implemented" in a user-visible message is its own problem.
-Either land the subcommand or rewrite the suggestion.
 
 #### O26 — REPL prompt prints stacked `>>>` on empty / pasted multi-line input *(B13)*
 
@@ -493,39 +236,104 @@ A `--no-deps` / `--reuse-venv` flag would speed iteration.
 
 ## Recommended next steps
 
-Roughly ranked by impact per unit of work:
+Roughly ranked by impact per unit of work, restricted to the open
+items:
 
-1. **O1 (paren-stripping)** — one printer fix, silent correctness bug.
-   Lands in real ML and pathlib code.
-2. **O5 (`class!` Exception `__init__`)** — one synthesised
-   constructor; unblocks the conventional `raise Foo("msg")` form.
-3. **O2 (loop-body narrowing)** — extending narrowing to "survives
-   until the next assignment to the narrowed name" unlocks the
-   linked-list iterator pattern.
-4. **O7 (impl-method `T?` params)** — every typed SDK with an
-   optional arg trips this.
-5. **O8 (`return self` from `__enter__`)** — most common
-   context-manager shape; one synthetic-class leak to plug in the
-   type-check error surface.
-6. **O3 (`tuple[T, ...]`)** — small unifier fix, very visible doc
-   correctness win.
-7. **O9 (`Callable` alias)** — unblocks middleware / decorator
-   patterns once and for all.
-8. **O6 (generator `return`)** — flip one branch in the
-   return-statement validator when the function has any `yield`.
-9. **O4 (recursive type alias)** — at minimum surface a clear
-   `not yet supported` diagnostic instead of the cascading mismatch
-   firehose.
-10. **O10 + O11 (pattern shadowing, for-target rebind)** —
-    closely-related DX wins; pick one or the other to overhaul the
-    rule.
-11. **O12 (`tyc fmt`)** — pick three rules
-    (no-space-before-colon, single-space-around-`=`/`+`, two-blank-
-    lines before top-level defs). Anything is better than today.
-12. **O18 (`__mul__` resolution)** — operator-overload resolution
-    order needs to consult user impls before builtin scalar rules.
+1. **O15 (TypedDict dict-literal inference)** — `let alice: User =
+   {"id": 1, "name": "Alice"}` is the canonical Python idiom; users
+   reach for it first and fall back to the kwarg constructor only
+   after the diagnostic fires. Needs the type-checker to register
+   TypedDict shapes and match dict literals slot-by-slot.
+2. **O16 (Protocol vs built-ins)** — once built-ins carry their
+   dunder shape in the registry, every structural-typed library
+   call site benefits (`len`, `iter`, `enter`, `exit`).
+3. **O10 (pattern shadowing)** — pick one of (per-`case` scope,
+   `tyc::pattern_shadows_outer` rename hint) and commit. Per-case
+   scope is the smaller surface change.
+4. **O12 (`tyc fmt`)** — pick three rules (no-space-before-colon,
+   single-space-around-`=`/`+`, two-blank-lines before top-level
+   defs). Anything is better than today.
+5. **O17 (`?` in sub-expression)** — lifting `Ok(f(x)?)` is the
+   natural Rust-style form. The desugar pass already has the
+   temp-lifting machinery.
+6. **O14 (`unsafe:` value leak)** — Rule 5 in the language spec is
+   not enforced today. Needs an `Unsafe[T]` marker in `tyc-types`
+   and a flow-sensitive boundary check.
+7. **O19 (sealed-union exhaustiveness)** — three known repro
+   patterns; partial-fix machinery from R3.12 already in place.
+8. **O28 (pipe corner cases)** — lifting `|>` into expression
+   position is a lexer-aware rewrite; tractable but invasive.
+9. **O13 (Pydantic auto-inject)** — tighten the detection path so
+   it fires even on bare `typhon.toml` projects.
 
 The remaining open items are smaller papercuts.
+
+---
+
+## Recently closed (this branch)
+
+Branch: `claude/findings-documentation-review-HhuVH`.
+
+**Code-fix closures:**
+
+- **O2** — `Stmt::While` now applies test-implied narrowings to the
+  body via the same `collect_narrowings` / `apply_narrowings` path
+  the `if` checker uses; the linked-list iterator idiom
+  `while cur is not None: total += cur.value; cur = cur.next`
+  type-checks. Reassignment inside the body still resets narrowing
+  at the assignment site, so post-mutation reads continue to trip
+  `nullable_use` correctly.
+- **O3** — `tuple[T, ...]` resolves to an internal `tuple_variadic[T]`
+  head (displayed back as `tuple[T, ...]`) that the unifier accepts
+  against any fixed-length tuple literal whose elements are all
+  assignable to `T`, including `()`. Element-type hint also
+  propagates into the literal slots so int literals widen to float.
+- **O4** — Cyclic type aliases still surface
+  `tyc::cyclic_type_alias` once, but the alias body is now rewritten
+  to `Any` so subsequent uses fall through silently instead of
+  cascading into `type_mismatch` errors. The diagnostic help text
+  now names the recursive-container shape so users know what's
+  actually unsupported and what to reach for as a workaround.
+- **O5** — `class! Foo(Exception): pass` now synthesises
+  `def __init__(self, *args, **kwargs) -> None: super().__init__(*args, **kwargs)`
+  when the body has no annotated fields, so `raise AppError("boom")`
+  reaches the parent constructor. The class-with-fields path is
+  unchanged.
+- **O6** — `return` inside a generator function body is now
+  accepted against the declared `Iterator[T]` / `Generator[Y, S, R]`
+  return type (both bare `return` and `return value` forms). The
+  checker tracks an `in_generator` flag set from `body_has_yield`
+  and the return-statement validator skips its usual assignability
+  check while it's on.
+- **O21** — `tyc migrate` now puts the `?` *inside* the forward-ref
+  quotes: `Optional["Item"]` becomes `"Item?"`, not the previously
+  unparseable `"Item"?`.
+- **O22** — `tyc migrate` now rewrites `Union[T, None]` (and
+  `Union[None, T]`, including the `typing.Union[...]` qualified
+  form) to `T?`, drops the `typing.Union` import, and falls back
+  to a PEP 604 pipe-union for multi-arm unions like
+  `Union[A, B, None]` so the import is never left dangling.
+- **O25** — `tyc explain --list` now prints every diagnostic code
+  the binary knows about. The "not yet implemented" message is
+  gone from the unknown-code error too.
+
+**Verified-already-fixed against their repros:**
+
+- **O1** — paren-stripping; every shape in
+  `08-meta-stress/25-paren-emit-suite.ty` and
+  `03-paren-wrong-output.ty` now round-trips correctly.
+- **O7** — `impl X:` methods accept `T?` parameters.
+- **O8** — `return self` from `impl __enter__` type-checks (the
+  `__typhon_impl_*` pseudo-class no longer leaks into the receiver
+  type — the type-checker strips the prefix when reading `self`'s
+  receiver class).
+- **O9** — `type Handler = Callable[[Req], Resp]` is transparent
+  on call.
+- **O11** — for-target rebind across loops in the same scope works.
+- **O18** — `__mul__(self, scalar: float)` resolves correctly
+  against `a * 5.0`.
+- **O20** — comptime f-strings evaluate end-to-end
+  (`comptime let VERSION: str = f"{APP} v{MAJOR}.{MINOR}"`).
 
 ---
 
@@ -591,12 +399,12 @@ positive; format `apply_simple_style_rules` whitespace stripping;
 f-string literal brace re-escaping; comptime `def` emission. Examples
 suite ended at 39/47 build + 39/47 stdlib-runnable.
 
-Filed F1–F5 cross-cutting findings: F1 (loop-target rebind, **still
-open as O11**), F2 / F3 / F4 (missing-return analysis through `unsafe:`,
-`with`, and exhaustive `match` — the May 19 / May 20 sprints chained
-the missing-return checker into the relevant analyses), F5 (docs nit
-about declaring deps to make `tyc check` happy in a fresh
-`tyc init` project — added to `examples/README.md`).
+Filed F1–F5 cross-cutting findings: F1 (loop-target rebind, **closed
+in the May 21 sweep**), F2 / F3 / F4 (missing-return analysis through
+`unsafe:`, `with`, and exhaustive `match` — the May 19 / May 20
+sprints chained the missing-return checker into the relevant
+analyses), F5 (docs nit about declaring deps to make `tyc check` happy
+in a fresh `tyc init` project — added to `examples/README.md`).
 
 ### May 19 round (`test-typhon-library-rNIYC` → fixed in `review-findings-fixes-VRFJy`, `add-library-autocomplete-1N2iS`, `resolve-open-findings-UDZfv`)
 
@@ -654,33 +462,35 @@ method arity counts `self` (R3.11); five match exhaustiveness shapes
 
 ### May 20 exploration (`typhon-exploration-testing-LZezp`)
 
-Filed E1–E11. Verified-fixed: R3.1, R3.6, R3.7, R3.8, R3.9, R3.10,
-R3.11, R3.14, R3.16. Still open: E1 → **O1**, E2 → **O7**, E3 → **O8**,
-E4 → **O9**, E5 → **O18**, E6 → **O19**, E7 → **O20**, E9 → **O17**,
-E10 → **O11**, E11 → **O29**. (E8 was a re-statement of R3.2, closed
-in `resolve-open-findings-v6t65`.)
+Filed E1–E11. Verified-fixed at filing time: R3.1, R3.6, R3.7, R3.8,
+R3.9, R3.10, R3.11, R3.14, R3.16. The May 21 findings sweep then
+closed E1 (O1, paren-emit), E2 (O7, impl `T?`), E3 (O8, `return self`),
+E4 (O9, `Callable` alias), E5 (O18, `__mul__`), E7 (O20, comptime
+f-string), E10 (O11, for-rebind). Still open: E6 → **O19**, E9 →
+**O17**, E11 → **O29**. (E8 was a re-statement of R3.2, closed in
+`resolve-open-findings-v6t65`.)
 
-### May 21 round (`tender-hawking-LLhuR`) — this branch
+### May 21 round (`tender-hawking-LLhuR`)
 
 Filed B1–B14 (81 fresh `.ty` programs, 65/81 build + run clean; 7 real
-bugs surfaced). Every B-finding maps onto an entry in the Open list
-above:
+bugs surfaced). The May 21 findings sweep closed B1 (O3), B2 (O4),
+B3 (O6), B4 (O5), B5 (O2), B6 (O21), B7 (O22), B12 (O25). Still open:
 
-- B1 → **O3** (variadic tuple)
-- B2 → **O4** (recursive alias)
-- B3 → **O6** (generator return)
-- B4 → **O5** (`class!` exception init)
-- B5 → **O2** (loop narrowing)
-- B6 → **O21** (migrate forward-ref)
-- B7 → **O22** (migrate `Union[T, None]`)
 - B8 → **O23** (parametric `extend`)
 - B9 → **O12** (`tyc fmt`)
 - B10 → **O10** (pattern shadowing)
 - B11 → **O24** (VM repr)
-- B12 → **O25** (`tyc explain --list`)
 - B13 → **O26** (REPL prompt)
 - B14 → **O13** (Pydantic dep auto-inject)
 
 Repro corpus + run script at `stress/round-2026-05-21/`. The
 intentionally-broken probes under `10-error-quality/` exist to validate
 diagnostic message quality and are expected to fail at build time.
+
+### May 21 findings sweep (`claude/findings-documentation-review-HhuVH`) — this branch
+
+No new findings filed; this round walked every Open finding in the
+table above and either closed it with a code fix or verified it was
+already closed. See the "Recently closed" section above for the full
+list. Eight bugs closed by code; seven verified-fixed (the findings
+doc was stale on those). Compiler-wide tests at 1275+, all green.

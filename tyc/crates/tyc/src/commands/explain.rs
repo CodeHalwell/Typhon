@@ -11,22 +11,96 @@ use miette::{miette, Result};
 #[derive(Args, Debug)]
 pub struct ExplainArgs {
     /// Diagnostic code to explain (e.g. `tyc::immutable_assign` or `immutable_assign`).
-    #[arg(value_name = "CODE")]
-    pub code: String,
+    /// Optional when `--list` is given.
+    #[arg(value_name = "CODE", required_unless_present = "list")]
+    pub code: Option<String>,
+
+    /// Print every diagnostic code the explainer knows about, one per line.
+    #[arg(long)]
+    pub list: bool,
 }
 
 pub fn run(args: ExplainArgs) -> Result<()> {
-    let needle = args.code.strip_prefix("tyc::").unwrap_or(&args.code);
+    if args.list {
+        for code in catalog_codes() {
+            println!("tyc::{code}");
+        }
+        return Ok(());
+    }
+    let raw = args.code.as_deref().unwrap_or("");
+    let needle = raw.strip_prefix("tyc::").unwrap_or(raw);
     match catalog_entry(needle) {
         Some(entry) => {
             println!("{}", entry);
             Ok(())
         }
         None => Err(miette!(
-            "unknown diagnostic code `{}`. Run `tyc explain --list` (not yet implemented) or see https://typhon.dev/lang/diagnostics for the catalog.",
-            args.code
+            "unknown diagnostic code `{}`. Run `tyc explain --list` to see every code, or browse https://typhon.dev/lang/diagnostics for the catalog.",
+            raw
         )),
     }
+}
+
+/// Every short diagnostic code the explainer knows about, in
+/// alphabetical order. Backs `tyc explain --list` (FINDINGS O25).
+/// Keep this list in sync with the match in [`catalog_entry`] — the
+/// `catalog_listing_matches_entries` test asserts that every listed
+/// code resolves to a non-empty entry.
+fn catalog_codes() -> &'static [&'static str] {
+    &[
+        "arg_count",
+        "async_without_await",
+        "attribute_not_found",
+        "auto_gather_missed",
+        "class_attr_shadows_slot",
+        "comptime",
+        "contains_secret_literal",
+        "cyclic_type_alias",
+        "duplicate_class",
+        "extend_builtin",
+        "frozen_assign",
+        "generator_return_type",
+        "generic",
+        "immutable_assign",
+        "impl_unknown_class",
+        "implicit_any",
+        "impure_pure_fn",
+        "interface_isinstance",
+        "interface_not_conforming",
+        "invalid_config_value",
+        "invalid_question_op",
+        "io",
+        "lazy_usage",
+        "main_not_called",
+        "manual_init",
+        "method_in_class_body",
+        "missing_annotation",
+        "missing_argument",
+        "missing_await",
+        "missing_binding_kind",
+        "missing_initialiser",
+        "missing_return",
+        "no_block_shadow",
+        "non_exhaustive_match",
+        "not_callable",
+        "nullable_use",
+        "operator_type_mismatch",
+        "orphan_py_import",
+        "parse",
+        "python_semantic_drift",
+        "result_error_mismatch",
+        "self_outside_impl",
+        "stub_mismatch",
+        "tuple_index_out_of_range",
+        "type_mismatch",
+        "typevar_bound",
+        "typevar_import_rejected",
+        "typing_alias_deprecated",
+        "unknown_kwarg",
+        "unknown_module",
+        "unknown_name",
+        "unused_import",
+    ]
 }
 
 /// Match a short diagnostic code (the part after `tyc::`) to its catalog
@@ -142,9 +216,35 @@ mod tests {
     #[test]
     fn explain_unknown_code_returns_error() {
         let result = run(ExplainArgs {
-            code: "tyc::no_such_thing".into(),
+            code: Some("tyc::no_such_thing".into()),
+            list: false,
         });
         assert!(result.is_err(), "expected unknown code to return Err");
+    }
+
+    #[test]
+    fn catalog_listing_matches_entries() {
+        // Every code returned by `catalog_codes` must resolve to a
+        // non-empty entry — otherwise `tyc explain --list` advertises
+        // codes the user can't actually look up (FINDINGS O25).
+        for code in catalog_codes() {
+            let entry =
+                catalog_entry(code).unwrap_or_else(|| panic!("missing catalog entry for `{code}`"));
+            assert!(
+                !entry.trim().is_empty(),
+                "catalog entry for `{code}` should not be empty",
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_list_runs() {
+        // The `--list` flag must succeed without requiring CODE.
+        let result = run(ExplainArgs {
+            code: None,
+            list: true,
+        });
+        assert!(result.is_ok(), "tyc explain --list should succeed");
     }
 
     #[test]
