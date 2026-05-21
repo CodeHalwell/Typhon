@@ -653,11 +653,11 @@ fn run_unknown_module_check(path: &str, source: &str, ctx: &ImportVettingContext
 /// chains would silently skip downstream diagnostics. (Copilot review
 /// on PR #68, file check.rs:332.)
 fn expand_for_check(source: &str) -> String {
-    expand_question_ops(&expand_inline_question_ops(&expand_pipes(&expand_with_chains(
-        &expand_go_calls(&expand_gather_blocks(&expand_multiline_guards(
-            &expand_lazy_imports(source),
+    expand_question_ops(&expand_inline_question_ops(&expand_pipes(
+        &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
+            &expand_multiline_guards(&expand_lazy_imports(source)),
         ))),
-    ))))
+    )))
 }
 
 /// Run the full preprocess + parse pipeline on `source` and return the

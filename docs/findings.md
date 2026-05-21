@@ -18,7 +18,7 @@ write-ups have been consolidated here.
 
 ## Quick status
 
-**Eight stress-test campaigns** have been run between May 17 and May 21,
+**Nine stress-test campaigns** have been run between May 17 and May 21,
 2026. Across them ~600 hand-written `.ty` programs were authored
 spanning language edge cases, IO, ML/numpy, mock LLM/RAG, agents, APIs,
 SDK patterns, perf, and intentionally-broken diagnostic probes. Roughly
@@ -36,6 +36,7 @@ SDK patterns, perf, and intentionally-broken diagnostic probes. Roughly
 | 2026-05-20 exploration | `claude/typhon-exploration-testing-LZezp` | E1–E11 | closed except E6, E9, E11 |
 | 2026-05-21 | `claude/tender-hawking-LLhuR` | B1–B14 | closed B1–B8, B10–B14; only B9 (`tyc fmt`) still open |
 | 2026-05-21 findings sweep | `claude/findings-documentation-review-HhuVH` | — | closed O2/O3/O4/O5/O6/O10/O21/O22/O23/O24/O25/O26; verified-fixed O1/O7/O8/O9/O11/O13/O18/O20 |
+| 2026-05-21 follow-up sweep | `claude/finish-open-findings-dmLv6` (this branch) | — | closed O12/O14/O15/O16/O17/O27/O28/O29; verified-fixed O19 |
 
 **Pass rate trend** on the canonical example suite (`examples/01-…46-…`):
 20/47 → 39/47 → 46/46 → 46/46. The examples now build and run end-to-end
@@ -46,168 +47,104 @@ the curated examples.
 
 ## Open findings
 
+None. Every finding filed across the eight stress campaigns is now
+either closed or verified-fixed against its repro. See the
+[Recently closed](#recently-closed-this-branch) section below for the
+write-up of the latest sweep, and [Sprint history](#sprint-history)
+for the per-branch rollup.
+
 Severity legend: **CRITICAL** (silent wrong output / runtime crash on
 documented happy path), **HIGH** (documented feature unusable),
 **MEDIUM** (feature works with workaround), **LOW** (UX / DX nit /
 docs).
 
-### MEDIUM — workable but rough
-
-#### O12 — `tyc fmt` is a near-no-op *(B9, R3.15, #18, #65, #122)*
-
-Repro: feed any `.ty` with cramped spacing through `tyc fmt`. Tracked
-across every campaign since the very first.
-
-```python
-def    f(  x:int,y:int)->int:
-    let    z:int=x+y
-```
-
-After `tyc fmt`:
-
-```python
-def f(x:int,y:int)->int:    # missing spaces around : , -> = preserved
-    let z:int=x+y
-```
-
-The Phase-5 Typhon-aware printer documented at
-`tyc-format/src/lib.rs:17` remains future work. Ruff is on PATH but
-ruff doesn't speak `let`/`mut`, so the fmt wrapper can only do a
-partial whitespace pass.
-
-`tyc build` *does* run `ruff format` over the emitted Python (correctly,
-end-to-end). The deliverable is clean; the source isn't.
-
-#### O14 — `unsafe:` value leak isn't caught *(#107)*
-
-A binding declared inside `unsafe:` can be returned from a function
-whose annotated return type is concrete (e.g. `-> int`) without
-re-asserting, contradicting Rule 5 in the language spec. Needs a real
-`Unsafe[T]` marker type in `tyc-types` and a flow-sensitive pass through
-the block boundary.
-
-#### O15 — TypedDict dict-literal inference *(#108)*
-
-```python
-let alice: User = {"id": 1, "name": "Alice"}
-# tyc::type_mismatch: expected User, found dict[str, int | str]
-```
-
-The `User(id=…, name=…)` constructor form works; the dict-literal form
-doesn't. Needs the type-checker to register TypedDict-derived class
-shapes and match dict literals against the expected field set.
-
-#### O16 — `Protocol`-based structural conformance against built-ins *(#112)*
-
-```python
-class Sized(Protocol):
-    def __len__(self) -> int: ...
-
-def take(s: Sized) -> int: return len(s)
-
-take([1])      # tyc::type_mismatch: expected Sized, found list[int]
-```
-
-Built-ins don't participate in structural conformance against
-user-declared `Protocol`s. Needs the type-checker to know which
-built-in types implement which dunder methods (`__len__`, `__iter__`,
-etc.).
-
-#### O17 — `?` operator only works at the top of an assignment / statement *(#66, R3.13, E9)*
-
-```python
-def f(s: str, t: str) -> Result[int, str]:
-    return Ok(add(parse(s)?, parse(t)?))   # tyc::invalid_question_op
-```
-
-The diagnostic is now crisp ("lift the inner call to a `let` binding
-first") and points at the user's source — that landed in the May 19
-sprint. Lifting the limitation itself (rewriting `Ok(f(x)?)` into a
-temp + propagation) remains future work and is the natural Rust-style
-form users reach for.
-
-#### O19 — Exhaustiveness false negatives on sealed unions with positional captures *(E6, partial)*
-
-Several legitimate-total matches still mis-fire as
-`tyc::missing_return`. R3.12 closed five of the most common shapes;
-recursive sealed types with positional captures, multi-variant
-dataclass enums with empty variants, and three-variant tool unions
-with positional captures still surface as false positives. Repros at
-`01-syntax-edge/05-sealed-recursive.ty`,
-`05-agents/03-agent-state-machine.ty`,
-`04-ai-llm/03-llm-tools-sealed.ty`.
-
-Workaround `case _:` works but defeats the safety property.
-
-### LOW — DX / cosmetic
-
-#### O27 — Sequence pattern `[a, b]` emits as tuple pattern `(a, b)` *(#111)*
-
-PEP 634 makes these semantically identical (both match any sequence)
-and the runtime behaviour is correct. Round-tripping the original
-bracket choice requires source-range tracking on the pattern node
-and is purely cosmetic.
-
-#### O28 — Pipe corner cases *(#117, #118, #119)*
-
-- `5 |> (lambda x: x * 2)()` is a parse error — pipe RHS doesn't
-  accept a parenthesised lambda call.
-- `s |> S.add(5)` desugars to `S.add(s, 5)` and the call-site arity
-  check rejects it because `impl`-block method types don't include
-  `self` in the function arity the checker sees. (R3.11 closed the
-  basic pipe-into-impl case; the variant where `self` is the
-  receiver via class-name dispatch is still open.)
-- `(1 |> add(2)) |> add(3)` — pipe `|>` is not recognised inside a
-  parenthesised sub-expression: parser fails at the inner `>`. Pipe
-  is restricted to top-of-statement positions.
-
-Pipe expansion is a top-of-statement-line pre-pass; lifting it into
-general expression position needs a lexer-aware rewrite.
-
-#### O29 — Per-invocation `uv sync` provisioning *(E11)*
-
-Every `tyc build` invocation against a project with non-empty
-`[dependencies]` spawns `uv sync` and may reprovision `.venv` from
-scratch. For one-off `.ty` files under tmp directories (stress
-harnesses, REPL-like testing), this dominates wall-clock time.
-A `--no-deps` / `--reuse-venv` flag would speed iteration.
-
----
-
-## Recommended next steps
-
-Roughly ranked by impact per unit of work, restricted to the open
-items:
-
-1. **O15 (TypedDict dict-literal inference)** — `let alice: User =
-   {"id": 1, "name": "Alice"}` is the canonical Python idiom; users
-   reach for it first and fall back to the kwarg constructor only
-   after the diagnostic fires. Needs the type-checker to register
-   TypedDict shapes and match dict literals slot-by-slot.
-2. **O16 (Protocol vs built-ins)** — once built-ins carry their
-   dunder shape in the registry, every structural-typed library
-   call site benefits (`len`, `iter`, `enter`, `exit`).
-3. **O12 (`tyc fmt`)** — pick three rules (no-space-before-colon,
-   single-space-around-`=`/`+`, two-blank-lines before top-level
-   defs). Anything is better than today.
-4. **O17 (`?` in sub-expression)** — lifting `Ok(f(x)?)` is the
-   natural Rust-style form. The desugar pass already has the
-   temp-lifting machinery for the top-of-statement case.
-5. **O14 (`unsafe:` value leak)** — Rule 5 in the language spec is
-   not enforced today. Needs an `Unsafe[T]` marker in `tyc-types`
-   and a flow-sensitive boundary check.
-6. **O19 (sealed-union exhaustiveness)** — three known repro
-   patterns; partial-fix machinery from R3.12 already in place.
-7. **O28 (pipe corner cases)** — lifting `|>` into expression
-   position is a lexer-aware rewrite; tractable but invasive.
-
-The remaining open items are smaller papercuts.
-
 ---
 
 ## Recently closed (this branch)
 
-Branch: `claude/findings-documentation-review-HhuVH`.
+Branch: `claude/finish-open-findings-dmLv6`. Closed every Open finding
+remaining at the start of the branch: O12, O14, O15, O16, O17, O27,
+O28, O29; plus verified-fixed O19.
+
+**Code-fix closures:**
+
+- **O12** — `tyc fmt` in-process pass now applies five PEP 8 rules
+  beyond the existing whitespace pipeline:
+    * space after `:` outside slice context (`x:int` → `x: int`),
+    * spaces around `->` (`)->int:` → `) -> int:`),
+    * space after a missing `,` (`f(x,y)` → `f(x, y)`),
+    * spaces around top-level `=` (kwargs / `+=` / `==` left tight),
+    * single-space around binary `+` / `-` (unary left tight), and
+    * two blank lines before top-level `def`/`class`/`async def`.
+  The O12 repro `def    f(  x:int,y:int)->int:` + `let z:int=x+y`
+  now reformats end-to-end to `def f(x: int, y: int) -> int:` +
+  `let z: int = x + y`.
+- **O14** — new `tyc::unsafe_value_leak` diagnostic enforces Rule 5.
+  `TypeBinding` carries a `from_unsafe` flag plus a long-lived
+  `unsafe_origin_bindings` map (the env-scope restore that follows
+  the `if True:` body would otherwise drop the binding). A
+  `return x` outside the block where `x` was declared inside
+  `unsafe:` and the function's annotated return is concrete now
+  fires the diagnostic with help text pointing at both workaround
+  forms (`let x: T = …` inside, or `let typed: T = x` outside).
+- **O15** — TypedDict-style dict literal `let alice: User = {"id":
+  1, "name": "Alice"}` now type-checks. When the expected type is a
+  registered class shape, `Expr::Dict` matches keys against fields
+  and each value flows under its declared field type before falling
+  through to the ordinary `dict[K, V]` inference path.
+- **O16** — built-in containers (`list`, `dict`, `tuple`, `set`,
+  `str`, `bytes`, `range`, `frozenset`, `bytearray`) now satisfy a
+  user-declared Protocol whose declared methods are all common
+  dunders (`__len__`, `__iter__`, `__getitem__`, `__contains__`,
+  `__eq__`, `__bool__`, etc.). `take([1])` against
+  `def take(s: Sized) -> int` now type-checks across every built-in
+  container shape.
+- **O17** — new `expand_inline_question_ops` pre-pass lifts every
+  `)?` not at the line-end position into a `__typhon_qi_N__` temp +
+  propagation guard, then the existing end-of-line pass handles
+  what remains. `Ok(add(parse(s)?, parse(t)?))` now compiles. The
+  `tyc::invalid_question_op` diagnostic is repurposed to enforce
+  the same Result-return scope rule the end-of-line case carried.
+- **O27** — `Emitter::set_source()` lets the printer peek at a
+  node's original `TextRange` to recover the bracket choice on
+  `MatchSequence` patterns. `case [a, b]:` now re-emits as
+  `[a, b]` rather than the default `(a, b)`. `tyc build` threads
+  the preprocessed source through automatically.
+- **O28** — pipe rewriter now accepts:
+    * `5 |> (lambda x: x * 2)()` — `apply_pipe_call` walks back from
+      the trailing `)` to find the matching `(` (rather than taking
+      the first `(`), so a parenthesised callable head is
+      recognised.
+    * `(1 |> add(2)) |> add(3)` — new
+      `expand_pipes_in_subexpressions` pre-pass recursively expands
+      pipes inside every balanced `(...)` group before the line-level
+      pass runs, so inner pipes at depth 1+ no longer leak through
+      as parser errors.
+  The `s |> S.add(5)` class-name dispatch variant was verified-fixed
+  against the same machinery — it fell out for free when the
+  self-counting arity check from R3.11 saw the receiver via the
+  positional-arg slot.
+- **O29** — new `--no-sync` flag on `tyc build` (and
+  `TYC_NO_SYNC=1` env var) skips the `uv sync` step while still
+  merging `pyproject.toml`. Stress harnesses and REPL-like
+  iteration on tmp projects no longer pay the per-invocation
+  reprovision cost.
+
+**Verified-already-fixed against their repros:**
+
+- **O19** — sealed-union exhaustiveness for the three legacy
+  patterns (recursive sealed types with positional captures,
+  multi-variant dataclass enums with empty variants, three-variant
+  tool unions with positional captures) all type-check end-to-end
+  now. Repros at `01-syntax-edge/05-sealed-recursive.ty`,
+  `05-agents/03-agent-state-machine.ty`,
+  `04-ai-llm/03-llm-tools-sealed.ty` all pass `tyc check`
+  cleanly; the non-exhaustive form still produces
+  `tyc::non_exhaustive_match` + `tyc::missing_return` as expected.
+
+---
+
+## Closed in previous branch (claude/findings-documentation-review-HhuVH)
 
 **Code-fix closures:**
 
@@ -452,10 +389,30 @@ Repro corpus + run script at `stress/round-2026-05-21/`. The
 intentionally-broken probes under `10-error-quality/` exist to validate
 diagnostic message quality and are expected to fail at build time.
 
-### May 21 findings sweep (`claude/findings-documentation-review-HhuVH`) — this branch
+### May 21 findings sweep (`claude/findings-documentation-review-HhuVH`)
 
 No new findings filed; this round walked every Open finding in the
 table above and either closed it with a code fix or verified it was
-already closed. See the "Recently closed" section above for the full
-list. Eight bugs closed by code; seven verified-fixed (the findings
-doc was stale on those). Compiler-wide tests at 1275+, all green.
+already closed. Eight bugs closed by code; seven verified-fixed (the
+findings doc was stale on those). Compiler-wide tests at 1275+, all
+green.
+
+### May 21 follow-up sweep (`claude/finish-open-findings-dmLv6`) — this branch
+
+Closed every Open finding remaining after the May 21 sweep. Seven new
+diagnostic / desugar / type-check landings:
+
+1. **O12** — `tyc fmt` now applies five PEP 8 rules end-to-end.
+2. **O17** — inline `?` operator (`Ok(f(x)?)`) lifts to a temp.
+3. **O27** — sequence-pattern bracket style round-trips via
+   source-range peek.
+4. **O29** — `--no-sync` / `TYC_NO_SYNC=1` skips `uv sync`.
+5. **O15** — TypedDict dict-literal inference against class shapes.
+6. **O16** — built-in containers satisfy Protocol structural checks.
+7. **O14** — new `tyc::unsafe_value_leak` diagnostic enforces Rule 5.
+8. **O28** — pipe corner cases (parenthesised callable, pipes in
+   sub-expressions).
+
+O19 was verified-fixed against its three known repros — every shape
+type-checks cleanly today even though the find filed in E6 was still
+listed as Open. Compiler-wide tests at 1306+, all green.

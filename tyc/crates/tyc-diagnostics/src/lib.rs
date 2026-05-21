@@ -622,7 +622,9 @@ pub enum TycError {
     /// or re-annotated). Rule 5 in the Typhon language spec: an unsafe
     /// value carries `Unknown` and must cross the safety boundary
     /// via a deliberate re-typing.  O14 / FINDINGS #107.
-    #[error("`{name}` was introduced inside `unsafe:` and escapes into a concrete `{return_ty}` return")]
+    #[error(
+        "`{name}` was introduced inside `unsafe:` and escapes into a concrete `{return_ty}` return"
+    )]
     #[diagnostic(
         code(tyc::unsafe_value_leak),
         url("https://typhon.dev/lang/diagnostics/unsafe_value_leak"),

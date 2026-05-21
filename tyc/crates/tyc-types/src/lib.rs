@@ -598,10 +598,7 @@ fn builtin_satisfies_interface(actual: &Type, shape: &InterfaceShape) -> bool {
         // built-ins).
         return false;
     }
-    shape
-        .methods
-        .keys()
-        .all(|m| dunders.contains(&m.as_str()))
+    shape.methods.keys().all(|m| dunders.contains(&m.as_str()))
 }
 
 fn is_typevar(t: &Type) -> bool {
@@ -3143,13 +3140,17 @@ fn seed_typhon_builtins(c: &mut Checker) {
         name: "env".into(),
         declared: env_fn.clone(),
         narrowed: env_fn,
-        span: (0, 0), from_unsafe: false });
+        span: (0, 0),
+        from_unsafe: false,
+    });
     // `BaseModel` — Pydantic base class injected by the `model` preprocessor.
     c.env.declare(TypeBinding {
         name: "BaseModel".into(),
         declared: Type::Class("BaseModel".into()),
         narrowed: Type::Class("BaseModel".into()),
-        span: (0, 0), from_unsafe: false });
+        span: (0, 0),
+        from_unsafe: false,
+    });
     // `Ok` and `Err` — Result constructors from typhon_runtime.  Seeded here
     // so the type checker can resolve them when `from typhon_runtime import …`
     // hasn't been injected yet (it is injected at desugar time, not check time).
@@ -3157,18 +3158,24 @@ fn seed_typhon_builtins(c: &mut Checker) {
         name: "Ok".into(),
         declared: Type::Class("Ok".into()),
         narrowed: Type::Class("Ok".into()),
-        span: (0, 0), from_unsafe: false });
+        span: (0, 0),
+        from_unsafe: false,
+    });
     c.env.declare(TypeBinding {
         name: "Err".into(),
         declared: Type::Class("Err".into()),
         narrowed: Type::Class("Err".into()),
-        span: (0, 0), from_unsafe: false });
+        span: (0, 0),
+        from_unsafe: false,
+    });
     // `Result` — the sealed union type, also from typhon_runtime.
     c.env.declare(TypeBinding {
         name: "Result".into(),
         declared: Type::Class("Result".into()),
         narrowed: Type::Class("Result".into()),
-        span: (0, 0), from_unsafe: false });
+        span: (0, 0),
+        from_unsafe: false,
+    });
 }
 
 /// Stdlib calls that block the event loop when invoked from inside an
@@ -5325,7 +5332,9 @@ fn check_function(
             name: param_name.to_owned(),
             declared: t.clone(),
             narrowed: t,
-            span, from_unsafe: false });
+            span,
+            from_unsafe: false,
+        });
     }
 
     for stmt in body {
@@ -6282,7 +6291,7 @@ fn try_infer_typed_dict_literal(
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for item in &d.items {
         let key_expr = item.key.as_ref()?; // No `**spread` support for the v1 match.
-        // Extract string-literal key. `{"a": 1}` parses as Expr::StringLiteral.
+                                           // Extract string-literal key. `{"a": 1}` parses as Expr::StringLiteral.
         let key_name = match key_expr {
             Expr::StringLiteral(s) => s.value.to_str().to_owned(),
             _ => return None,
@@ -7430,9 +7439,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             // to ordinary `dict[K, V]` inference when no shape is found.
             // O15 / FINDINGS #108.
             if let Some(Type::Class(class_name)) = expected {
-                if let Some(class_ty) =
-                    try_infer_typed_dict_literal(c, d, class_name)
-                {
+                if let Some(class_ty) = try_infer_typed_dict_literal(c, d, class_name) {
                     return class_ty;
                 }
             }
@@ -7965,7 +7972,9 @@ fn bind_pattern_names(c: &mut Checker, pattern: &Pattern) {
                     name: name.as_str().to_owned(),
                     declared: Type::Unknown,
                     narrowed: Type::Unknown,
-                    span: (a.range.start().to_usize(), a.range.end().to_usize()), from_unsafe: false });
+                    span: (a.range.start().to_usize(), a.range.end().to_usize()),
+                    from_unsafe: false,
+                });
             }
             if let Some(inner) = &a.pattern {
                 bind_pattern_names(c, inner);
@@ -7977,7 +7986,9 @@ fn bind_pattern_names(c: &mut Checker, pattern: &Pattern) {
                     name: name.as_str().to_owned(),
                     declared: Type::Unknown,
                     narrowed: Type::Unknown,
-                    span: (s.range.start().to_usize(), s.range.end().to_usize()), from_unsafe: false });
+                    span: (s.range.start().to_usize(), s.range.end().to_usize()),
+                    from_unsafe: false,
+                });
             }
         }
         Pattern::MatchMapping(m) => {
@@ -7986,7 +7997,9 @@ fn bind_pattern_names(c: &mut Checker, pattern: &Pattern) {
                     name: rest.as_str().to_owned(),
                     declared: Type::Unknown,
                     narrowed: Type::Unknown,
-                    span: (m.range.start().to_usize(), m.range.end().to_usize()), from_unsafe: false });
+                    span: (m.range.start().to_usize(), m.range.end().to_usize()),
+                    from_unsafe: false,
+                });
             }
             for p in &m.patterns {
                 bind_pattern_names(c, p);

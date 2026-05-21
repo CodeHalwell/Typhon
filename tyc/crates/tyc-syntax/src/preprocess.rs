@@ -3009,9 +3009,7 @@ fn rewrite_inline_question_ops_one_line(
         *counter += 1;
 
         lifted.push(format!("{indent}{tmp} = {call_text}"));
-        lifted.push(format!(
-            "{indent}if isinstance({tmp}, __typhon_Err__):"
-        ));
+        lifted.push(format!("{indent}if isinstance({tmp}, __typhon_Err__):"));
         lifted.push(format!("{indent}    return {tmp}"));
 
         let mut new_content = String::with_capacity(current.len() + tmp.len());
