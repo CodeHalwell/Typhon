@@ -2981,11 +2981,7 @@ fn rewrite_inline_question_ops_one_line(
     let mut lifted: Vec<String> = Vec::new();
     let mut current = content.to_owned();
 
-    loop {
-        let q_pos = match find_first_inline_propagation_q(&current) {
-            Some(p) => p,
-            None => break,
-        };
+    while let Some(q_pos) = find_first_inline_propagation_q(&current) {
         let close_paren = q_pos - 1;
         let open = match find_matching_open_paren(&current, close_paren) {
             Some(o) => o,
