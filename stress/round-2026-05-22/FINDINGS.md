@@ -14,31 +14,36 @@ Severity legend:
 
 ## Summary
 
-| Code | Severity | Surface | One-liner |
-|---|---|---|---|
-| **N5** | CRITICAL | emit | `not (a or b)` parens stripped → wrong-output |
-| **N6** | CRITICAL | emit | `not (x if c else y)` parens stripped → wrong-output |
-| **N9** | CRITICAL | tyc-vm | `match` arm writes don't propagate to outer scope |
-| **N1** | HIGH | desugar | `freeze let` chokes on multi-line dict/list literal |
-| **N2** | HIGH | desugar | `?` inside list comprehension hoists past `for` binding |
-| **N10** | HIGH | tyc run | VM skips static checker — `NameError` instead of `tyc::unknown_name` |
-| **N11** | HIGH | tyc migrate | output for code with generics/methods doesn't build |
-| **N13** | HIGH | types | `match self.<field>:` false-positive `missing_return` |
-| **N4** | MEDIUM | resolve | no typed multi-let tuple unpacking form |
-| **N8** | MEDIUM | desugar | duplicate-method silently merged on `impl`+`extend` collision |
-| **N3** | LOW | comptime | `str.join` not in the supported method set |
-| **N7** | LOW | diagnostics | `tyc::type_mismatch` help text wrong-direction for newtypes |
-| **N12** | LOW | emit | `from __future__ import annotations` emitted twice when user wrote it |
+| Code | Severity | Surface | One-liner | Status |
+|---|---|---|---|---|
+| **N5** | CRITICAL | emit | `not (a or b)` parens stripped → wrong-output | **Closed** (9c423b9) |
+| **N6** | CRITICAL | emit | `not (x if c else y)` parens stripped → wrong-output | **Closed** (9c423b9) |
+| **N9** | CRITICAL | tyc-vm | `match` arm writes don't propagate to outer scope | **Closed** (a68d1ec) |
+| **N1** | HIGH | desugar | `freeze let` chokes on multi-line dict/list literal | **Closed** (a5b6842) |
+| **N2** | HIGH | desugar | `?` inside list comprehension hoists past `for` binding | **Closed** (89b4685) |
+| **N10** | HIGH | tyc run | VM skips static checker — `NameError` instead of `tyc::unknown_name` | **Closed** (6546184) |
+| **N11** | HIGH | tyc migrate | output for code with generics/methods doesn't build | **Closed** (4e17492) |
+| **N13** | HIGH | types | `match self.<field>:` false-positive `missing_return` | **Closed** (1069fec) |
+| **N4** | MEDIUM | resolve | no typed multi-let tuple unpacking form | **Closed** (c4214e3) |
+| **N8** | MEDIUM | desugar | duplicate-method silently merged on `impl`+`extend` collision | **Closed** (033adc7) |
+| **N3** | LOW | comptime | `str.join` not in the supported method set | **Closed** (f3c6863) |
+| **N7** | LOW | diagnostics | `tyc::type_mismatch` help text wrong-direction for newtypes | **Closed** (b73b634) |
+| **N12** | LOW | emit | `from __future__ import annotations` emitted twice when user wrote it | **Closed** (868fe63) |
 
-13 findings filed. 3 CRITICAL (two silent-wrong-output, one VM mis-scoping),
-5 HIGH, 2 MEDIUM, 3 LOW.
+All 13 findings filed in this round are now closed in this branch.
+Three CRITICAL (two silent-wrong-output, one VM mis-scoping), five
+HIGH, two MEDIUM, three LOW. Every fix landed with a regression test
+plus the original stress probe still in tree as a forward-looking
+guard.
 
-The CRITICAL findings are the most worrying: each compiles cleanly without
-any warning and produces wrong runtime output. N5 surfaced organically
-during the `05-agents/01-react-agent.ty` test — a real-world calculator-
-tool guard `not (ch.isdigit() or ch in " +-*/()")` malfunctioned. N9 broke
+The CRITICAL findings are the most worrying historically: each
+compiled cleanly without any warning and produced wrong runtime
+output. N5 surfaced organically during the
+`05-agents/01-react-agent.ty` test — a real-world calculator-tool
+guard `not (ch.isdigit() or ch in " +-*/()")` malfunctioned. N9 broke
 the VM result-accumulation path the moment any program tried to sum
-matched values.
+matched values. Both are now covered by unit tests against their
+exact repro shapes.
 
 ---
 
