@@ -193,4 +193,29 @@ print([y * 2 for y in xs if y % 2 == 1])
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
+
+    #[test]
+    fn match_arm_writes_propagate_to_outer_scope() {
+        // Regression for N9 (2026-05-22): `match` arms used to execute in a
+        // fresh child env, so `total = v` inside `case Ok(v):` never reached
+        // the function-scope `total`. The VM should keep parity with the
+        // compiled-Python output.
+        let src = r#"
+from typhon_runtime import Ok, Err
+
+def main() -> None:
+    let outcomes: list[Result[int, str]] = [Ok(1), Err("bad"), Ok(7)]
+    mut total: int = 0
+    for o in outcomes:
+        match o:
+            case Ok(v):
+                total = total + v
+            case Err(_):
+                pass
+    print(total)
+
+main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
 }
