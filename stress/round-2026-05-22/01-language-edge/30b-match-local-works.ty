@@ -1,0 +1,30 @@
+type Status = Open | Closed
+
+
+class Open:
+    since: float
+class Closed:
+    label: str
+
+
+class Foo:
+    state: Status
+
+
+impl Foo:
+    def check_local(self) -> str:
+        let s: Status = self.state
+        match s:
+            case Open(_):
+                return "open"
+            case Closed(_):
+                return "closed"
+
+
+def main() -> None:
+    let f: Foo = Foo(state=Open(since=0.0))
+    print(f.check_local())
+
+
+if __name__ == "__main__":
+    main()

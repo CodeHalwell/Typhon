@@ -1,0 +1,15 @@
+# Should FAIL with helpful diagnostic.
+import json
+
+
+def parse_json(text: str):
+    return json.loads(text)
+
+
+def main() -> None:
+    let r = parse_json('{"x":1}')
+    print(r)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,65 @@
+# IO test: async HTTP-shaped code, even without a real server.
+# Uses asyncio to simulate I/O with sleeps.
+import asyncio
+import json
+
+
+class Response:
+    status: int
+    body: str
+
+
+class ApiError:
+    code: int
+    message: str
+
+
+type Outcome = Response | ApiError
+
+
+async def fake_get(url: str, delay: float = 0.01) -> Outcome:
+    await asyncio.sleep(delay)
+    if "fail" in url:
+        return ApiError(code=500, message=f"failed: {url}")
+    return Response(status=200, body=json.dumps({"url": url}))
+
+
+@gatherable
+async def fetch_one(url: str) -> Outcome:
+    return await fake_get(url, 0.01)
+
+
+async def fetch_all(urls: list[str]) -> list[Outcome]:
+    # Manually drive via gather since we can't auto-gather inside loop body.
+    let tasks = [fetch_one(u) for u in urls]
+    return await asyncio.gather(*tasks)
+
+
+def summarise(results: list[Outcome]) -> str:
+    mut ok: int = 0
+    mut err: int = 0
+    for r in results:
+        match r:
+            case Response(_, _):
+                ok += 1
+            case ApiError(_, _):
+                err += 1
+    return f"ok={ok} err={err}"
+
+
+async def main_async() -> None:
+    let urls: list[str] = [
+        "https://example.com/a",
+        "https://example.com/fail/x",
+        "https://example.com/b",
+    ]
+    let results: list[Outcome] = await fetch_all(urls)
+    print(summarise(results))
+
+
+def main() -> None:
+    asyncio.run(main_async())
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,89 @@
+# SDK test: rate limiter + retry-with-backoff client.
+import asyncio
+import time
+
+
+class RateLimitError:
+    retry_after: float
+
+
+class TimeoutError_:
+    duration: float
+
+
+type ClientError = RateLimitError | TimeoutError_
+
+
+class RateLimiter:
+    capacity: int
+    refill_per_sec: float
+    tokens: float
+    last_refill: float
+
+
+impl RateLimiter:
+    def acquire(self) -> bool:
+        let now: float = time.monotonic()
+        let elapsed: float = now - self.last_refill
+        self.tokens = min(float(self.capacity), self.tokens + elapsed * self.refill_per_sec)
+        self.last_refill = now
+        if self.tokens >= 1.0:
+            self.tokens = self.tokens - 1.0
+            return True
+        return False
+
+
+class RetryClient:
+    base_delay: float
+    max_attempts: int
+    limiter: RateLimiter
+
+
+impl RetryClient:
+    async def call(self, op: str) -> Result[str, ClientError]:
+        mut attempt: int = 0
+        while attempt < self.max_attempts:
+            if not self.limiter.acquire():
+                return Err(RateLimitError(retry_after=1.0 / self.limiter.refill_per_sec))
+            let outcome: Result[str, ClientError] = await self._do(op, attempt)
+            match outcome:
+                case Ok(v):
+                    return Ok(v)
+                case Err(RateLimitError(retry_after=r)):
+                    await asyncio.sleep(r)
+                    attempt = attempt + 1
+                case Err(TimeoutError_(duration=d)):
+                    let backoff: float = self.base_delay * (2.0 ** attempt)
+                    await asyncio.sleep(backoff)
+                    attempt = attempt + 1
+        return Err(TimeoutError_(duration=0.0))
+
+    async def _do(self, op: str, attempt: int) -> Result[str, ClientError]:
+        # Mock: succeed on the 3rd attempt for "flaky"
+        await asyncio.sleep(0.005)
+        if op == "flaky" and attempt < 2:
+            return Err(TimeoutError_(duration=0.5))
+        if op == "blocked":
+            return Err(RateLimitError(retry_after=0.01))
+        return Ok(f"<{op}#{attempt}>")
+
+
+async def main_async() -> None:
+    let limiter: RateLimiter = RateLimiter(
+        capacity=5, refill_per_sec=10.0, tokens=5.0, last_refill=time.monotonic(),
+    )
+    let client: RetryClient = RetryClient(base_delay=0.01, max_attempts=5, limiter=limiter)
+
+    let r1: Result[str, ClientError] = await client.call("ok")
+    print(f"ok -> {r1}")
+
+    let r2: Result[str, ClientError] = await client.call("flaky")
+    print(f"flaky -> {r2}")
+
+
+def main() -> None:
+    asyncio.run(main_async())
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,56 @@
+# Same tool dispatch but WORKAROUND for N5: use intermediate variable
+# so the `not ( ... or ...)` paren-stripping doesn't bite.
+
+
+type ToolRequest = WeatherReq | CalcReq | TimeReq
+
+
+class WeatherReq:
+    city: str
+class CalcReq:
+    expression: str
+class TimeReq:
+    label: str
+
+
+type ToolResponse = CalcResp | ToolFailure
+
+
+class CalcResp:
+    result: int
+
+class ToolFailure:
+    tool_name: str
+    error: str
+
+
+def safe_calc(expr: str) -> ToolResponse:
+    # WORKAROUND: split into two checks. The bare `not (A or B)` is broken.
+    for ch in expr:
+        let is_digit: bool = ch.isdigit()
+        let is_allowed: bool = ch in " +-*/()"
+        if not is_digit and not is_allowed:
+            return ToolFailure(tool_name="calc", error=f"refused: {ch!r}")
+    try:
+        let r: int = eval(expr, {"__builtins__": {}}, {})
+        return CalcResp(result=r)
+    except Exception as e:
+        return ToolFailure(tool_name="calc", error=str(e))
+
+
+def main() -> None:
+    match safe_calc("2 + 3 * 4"):
+        case CalcResp(r):
+            print(f"OK: 2 + 3 * 4 = {r}")
+        case ToolFailure(_, e):
+            print(f"FAIL: {e}")
+
+    match safe_calc("import os"):
+        case CalcResp(r):
+            print(f"FAIL (should reject): {r}")
+        case ToolFailure(_, e):
+            print(f"OK reject: {e}")
+
+
+if __name__ == "__main__":
+    main()

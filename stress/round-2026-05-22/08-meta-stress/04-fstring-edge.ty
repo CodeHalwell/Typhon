@@ -1,0 +1,32 @@
+# Meta-stress: f-string edge cases.
+
+
+class Person:
+    name: str
+    age: int
+
+
+def main() -> None:
+    let p: Person = Person(name="Alice", age=30)
+    # Method call inside f-string
+    print(f"upper: {p.name.upper()}")
+    # Nested f-string
+    print(f"nested: {f'inner: {p.age}'}")
+    # Format spec with f-string variable
+    let width: int = 10
+    print(f"padded: {p.name:>{width}}")
+    # Conversion specifier
+    print(f"repr: {p.name!r}")
+    # Same quote nesting (only allowed in 3.12+)
+    print(f"sq: {f'inside {"deep"}' if True else 'no'}")
+    # Multi-key dict access
+    let d: dict[str, int] = {"a": 1, "b": 2}
+    print(f'lookup: {d["a"] + d["b"]}')
+    # Walrus inside f-string
+    print(f'walrus: {(x := 7)} {x*2}')
+    # Conditional inside f-string
+    print(f"cond: {'yes' if p.age >= 18 else 'no'}")
+
+
+if __name__ == "__main__":
+    main()

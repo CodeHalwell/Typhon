@@ -1,0 +1,42 @@
+# Probe: match on self.field vs local — does it affect exhaustiveness flow?
+
+type Status = Open | Closed
+
+
+class Open:
+    since: float
+class Closed:
+    label: str
+
+
+class Foo:
+    state: Status
+
+
+impl Foo:
+    # Variant A: match on self.state directly — FAILS
+    def check_self(self) -> str:
+        match self.state:
+            case Open(_):
+                return "open"
+            case Closed(_):
+                return "closed"
+
+    # Variant B: bind to local first — PASSES?
+    def check_local(self) -> str:
+        let s: Status = self.state
+        match s:
+            case Open(_):
+                return "open"
+            case Closed(_):
+                return "closed"
+
+
+def main() -> None:
+    let f: Foo = Foo(state=Open(since=0.0))
+    print(f.check_self())
+    print(f.check_local())
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,55 @@
+# AI test: simplified BPE token counter, mimicking tokenizer interfaces.
+
+class TokenCounter:
+    vocab: dict[str, int]
+    merges: list[tuple[str, str]]
+
+
+impl TokenCounter:
+    def _initial_tokens(self, text: str) -> list[str]:
+        return [c for c in text]
+
+    def tokenize(self, text: str) -> list[str]:
+        mut tokens: list[str] = self._initial_tokens(text)
+        for pair in self.merges:
+            mut i: int = 0
+            mut next_tokens: list[str] = []
+            while i < len(tokens):
+                if i + 1 < len(tokens) and tokens[i] == pair[0] and tokens[i + 1] == pair[1]:
+                    next_tokens.append(pair[0] + pair[1])
+                    i = i + 2
+                else:
+                    next_tokens.append(tokens[i])
+                    i = i + 1
+            tokens = next_tokens
+        return tokens
+
+    def count(self, text: str) -> int:
+        return len(self.tokenize(text))
+
+
+def build_counter() -> TokenCounter:
+    let vocab: dict[str, int] = {}
+    let merges: list[tuple[str, str]] = [
+        ("h", "e"),
+        ("he", "l"),
+        ("hel", "l"),
+        ("hell", "o"),
+    ]
+    mut i: int = 0
+    for m in merges:
+        vocab[m[0] + m[1]] = i
+        i = i + 1
+    return TokenCounter(vocab=vocab, merges=merges)
+
+
+def main() -> None:
+    let c: TokenCounter = build_counter()
+    let txt: str = "hellohello"
+    let tokens: list[str] = c.tokenize(txt)
+    print(f"tokens: {tokens}")
+    print(f"count: {c.count(txt)}")
+
+
+if __name__ == "__main__":
+    main()

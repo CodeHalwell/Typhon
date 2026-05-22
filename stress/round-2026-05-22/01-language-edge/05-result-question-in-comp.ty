@@ -1,0 +1,23 @@
+# Probe: `?` operator inside list / dict comprehensions.
+# Hypothesis: tyc rejects `?` inside generator-style comprehensions because
+# the implicit return-on-Err can't be hoisted out of the comp.
+
+def parse(s: str) -> Result[int, str]:
+    if not s.isdigit():
+        return Err(f"bad: {s}")
+    return Ok(int(s))
+
+
+def collect_inside_comp(items: list[str]) -> Result[list[int], str]:
+    # Can `?` be used in a comp?
+    let xs: list[int] = [parse(s)? for s in items]
+    return Ok(xs)
+
+
+def main() -> None:
+    let r: Result[list[int], str] = collect_inside_comp(["1", "2", "3"])
+    print(r)
+
+
+if __name__ == "__main__":
+    main()

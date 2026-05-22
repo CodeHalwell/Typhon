@@ -1,0 +1,94 @@
+# SDK test: circuit breaker pattern.
+import asyncio
+import time
+
+
+type CBState = Closed | Open | HalfOpen
+
+
+class Closed:
+    label: str
+class Open:
+    opened_at: float
+class HalfOpen:
+    trial_started_at: float
+
+
+class CircuitBreaker:
+    threshold: int
+    cooldown: float
+    state: CBState
+    consecutive_failures: int
+
+
+impl CircuitBreaker:
+    async def call(self, op: Callable[[], int]) -> Result[int, str]:
+        let now: float = time.monotonic()
+        # WORKAROUND for N13: bind self.state to local before matching.
+        let cur: CBState = self.state
+        match cur:
+            case Closed(_):
+                return self._try(op, now)
+            case Open(opened_at):
+                if now - opened_at >= self.cooldown:
+                    self.state = HalfOpen(trial_started_at=now)
+                    return self._try(op, now)
+                return Err(f"open (since {opened_at:.3f})")
+            case HalfOpen(_):
+                return self._try(op, now)
+
+    def _try(self, op: Callable[[], int], now: float) -> Result[int, str]:
+        try:
+            let v: int = op()
+            self.consecutive_failures = 0
+            self.state = Closed(label="ok")
+            return Ok(v)
+        except Exception as e:
+            self.consecutive_failures = self.consecutive_failures + 1
+            if self.consecutive_failures >= self.threshold:
+                self.state = Open(opened_at=now)
+            return Err(f"{type(e).__name__}: {e}")
+
+
+def flaky_factory(succeed_after: int) -> Callable[[], int]:
+    mut count: list[int] = [0]
+    def fn() -> int:
+        count[0] = count[0] + 1
+        if count[0] <= succeed_after:
+            raise RuntimeError(f"fail #{count[0]}")
+        return 42
+    return fn
+
+
+async def main_async() -> None:
+    let cb: CircuitBreaker = CircuitBreaker(
+        threshold=3,
+        cooldown=0.05,
+        state=Closed(label="initial"),
+        consecutive_failures=0,
+    )
+    let op = flaky_factory(succeed_after=5)
+    for i in range(7):
+        let r: Result[int, str] = await cb.call(op)
+        let label: str = state_label(cb.state)
+        print(f"attempt #{i}: {r}, state={label}")
+        if i == 3:
+            await asyncio.sleep(0.06)  # let cooldown pass
+
+
+def state_label(s: CBState) -> str:
+    match s:
+        case Closed(_):
+            return "closed"
+        case Open(_):
+            return "open"
+        case HalfOpen(_):
+            return "half-open"
+
+
+def main() -> None:
+    asyncio.run(main_async())
+
+
+if __name__ == "__main__":
+    main()

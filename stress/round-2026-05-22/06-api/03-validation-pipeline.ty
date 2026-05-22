@@ -1,0 +1,91 @@
+# API test: input validation pipeline with chained Result.
+
+model UserInput:
+    email: str
+    age: int
+    name: str
+
+
+type ValidationError = MissingField | BadFormat | OutOfRange | Unique
+
+
+class MissingField:
+    field: str
+class BadFormat:
+    field: str
+    reason: str
+class OutOfRange:
+    field: str
+    actual: int
+    min: int
+    max: int
+class Unique:
+    field: str
+
+
+def validate_email(value: str) -> Result[str, ValidationError]:
+    if value == "":
+        return Err(MissingField(field="email"))
+    if "@" not in value:
+        return Err(BadFormat(field="email", reason="missing @"))
+    if value.count("@") > 1:
+        return Err(BadFormat(field="email", reason="multiple @"))
+    let domain: str = value.split("@", 1)[1]
+    if "." not in domain:
+        return Err(BadFormat(field="email", reason="bad domain"))
+    return Ok(value.lower())
+
+
+def validate_age(age: int) -> Result[int, ValidationError]:
+    if age < 13:
+        return Err(OutOfRange(field="age", actual=age, min=13, max=130))
+    if age > 130:
+        return Err(OutOfRange(field="age", actual=age, min=13, max=130))
+    return Ok(age)
+
+
+def validate_name(name: str) -> Result[str, ValidationError]:
+    if name == "":
+        return Err(MissingField(field="name"))
+    let trimmed: str = name.strip()
+    if len(trimmed) < 2:
+        return Err(BadFormat(field="name", reason="too short"))
+    return Ok(trimmed)
+
+
+def validate(input_: UserInput) -> Result[UserInput, ValidationError]:
+    with email = validate_email(input_.email)?,
+         age = validate_age(input_.age)?,
+         name = validate_name(input_.name)?:
+        return Ok(UserInput(email=email, age=age, name=name))
+
+
+def render_error(e: ValidationError) -> str:
+    match e:
+        case MissingField(f):
+            return f"missing: {f}"
+        case BadFormat(f, r):
+            return f"bad format on {f}: {r}"
+        case OutOfRange(f, a, lo, hi):
+            return f"{f}={a} not in [{lo}..{hi}]"
+        case Unique(f):
+            return f"{f} must be unique"
+
+
+def main() -> None:
+    let inputs: list[UserInput] = [
+        UserInput(email="alice@example.com", age=30, name="Alice"),
+        UserInput(email="bob", age=22, name="Bob"),
+        UserInput(email="carol@example.com", age=5, name="Carol"),
+        UserInput(email="", age=22, name="Dan"),
+    ]
+    for inp in inputs:
+        match validate(inp):
+            case Ok(u):
+                print(f"OK: {u.name}/{u.email}/{u.age}")
+            case Err(e):
+                print(f"ERR ({inp.name}): {render_error(e)}")
+
+
+if __name__ == "__main__":
+    main()

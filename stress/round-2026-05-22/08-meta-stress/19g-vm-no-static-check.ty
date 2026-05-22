@@ -1,0 +1,9 @@
+# Probe: does `tyc run` (VM) run the static checker first?
+# This program has a name error that `tyc check` would catch.
+
+def main() -> None:
+    print(undefined_name)
+
+
+if __name__ == "__main__":
+    main()

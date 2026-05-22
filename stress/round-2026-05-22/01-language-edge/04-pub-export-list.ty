@@ -1,0 +1,49 @@
+# Probe: pub modifier on various declarations.
+# Hypothesis: tyc synthesises __all__ with every pub name.
+
+pub let API_VERSION: str = "v1"
+pub let SUPPORTED_VERSIONS: list[str] = ["v0", "v1"]
+
+let _internal_secret: str = "hidden"
+
+
+pub class Client:
+    name: str
+    base_url: str
+
+
+impl Client:
+    def url(self, path: str) -> str:
+        return f"{self.base_url}/{path}"
+
+
+class _PrivateHelper:
+    val: int
+
+
+pub def connect(name: str, base_url: str) -> Client:
+    return Client(name=name, base_url=base_url)
+
+
+def _internal_fn() -> str:
+    return "secret"
+
+
+pub model Config:
+    host: str
+    port: int
+
+
+def main() -> None:
+    let c: Client = connect("svc", "https://api.example.com")
+    print(c.url("status"))
+    print(f"version={API_VERSION}")
+    # Read __all__ — synthesised at module top.
+    import sys
+    let mod = sys.modules[__name__]
+    let exposed: list[str] = sorted(mod.__all__) if hasattr(mod, "__all__") else []
+    print(f"__all__={exposed}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,18 @@
+# Should fire `tyc::blocking_in_async` on the requests.get() call.
+import time
+import urllib.request
+
+
+async def fetch(url: str) -> str:
+    # Both should warn:
+    time.sleep(0.1)
+    let resp = urllib.request.urlopen(url)
+    return resp.read().decode()
+
+
+def main() -> None:
+    print("compile-only test")
+
+
+if __name__ == "__main__":
+    main()

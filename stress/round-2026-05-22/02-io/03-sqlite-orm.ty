@@ -1,0 +1,52 @@
+# IO test: SQLite with parameter binding, manual ORM.
+import sqlite3
+
+
+class Book:
+    id: int
+    title: str
+    pages: int
+
+
+def init_db(conn: sqlite3.Connection) -> None:
+    let cur = conn.cursor()
+    cur.execute("CREATE TABLE books (id INTEGER PRIMARY KEY, title TEXT, pages INTEGER)")
+    conn.commit()
+
+
+def insert(conn: sqlite3.Connection, b: Book) -> None:
+    conn.execute("INSERT INTO books VALUES (?, ?, ?)", (b.id, b.title, b.pages))
+
+
+def all_books(conn: sqlite3.Connection) -> list[Book]:
+    mut out: list[Book] = []
+    for row in conn.execute("SELECT id, title, pages FROM books ORDER BY id"):
+        out.append(Book(id=row[0], title=row[1], pages=row[2]))
+    return out
+
+
+def find_by_id(conn: sqlite3.Connection, id: int) -> Book?:
+    let row = conn.execute("SELECT id, title, pages FROM books WHERE id = ?", (id,)).fetchone()
+    if row is None:
+        return None
+    return Book(id=row[0], title=row[1], pages=row[2])
+
+
+def main() -> None:
+    with sqlite3.connect(":memory:") as conn:
+        init_db(conn)
+        insert(conn, Book(id=1, title="The Pragmatic Programmer", pages=350))
+        insert(conn, Book(id=2, title="SICP", pages=657))
+        conn.commit()
+        for b in all_books(conn):
+            print(f"#{b.id}: {b.title} ({b.pages}pp)")
+        let one: Book? = find_by_id(conn, 2)
+        if one is not None:
+            print(f"FOUND: {one.title}")
+        let missing: Book? = find_by_id(conn, 999)
+        if missing is None:
+            print("NOT FOUND")
+
+
+if __name__ == "__main__":
+    main()

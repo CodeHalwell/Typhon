@@ -1,0 +1,42 @@
+# Probe: pipe operator with various heads — bound method, lambda, partial-style.
+
+def add(a: int, b: int) -> int:
+    return a + b
+
+
+def mul(a: int, b: int) -> int:
+    return a * b
+
+
+def square(x: int) -> int:
+    return x * x
+
+
+def to_str(x: int) -> str:
+    return f"({x})"
+
+
+def trim(s: str) -> str:
+    return s.strip()
+
+
+def main() -> None:
+    # Simple pipeline of unary fns
+    let a: int = 5 |> square() |> square()  # 5^4 = 625
+    print(a)
+
+    # Mixed unary + binary (first slot)
+    let b: int = 3 |> add(4) |> mul(2)  # (3+4)*2 = 14
+    print(b)
+
+    # Pipe into method call on string
+    let c: str = "  hello  " |> str.strip() |> str.upper()
+    print(c)
+
+    # Pipe into free function with a complex transformation
+    let d: str = 100 |> square() |> to_str()
+    print(d)
+
+
+if __name__ == "__main__":
+    main()

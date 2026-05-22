@@ -1,0 +1,146 @@
+# Probe: large program — stress the emitter with lots of declarations.
+
+newtype OrderId = int
+newtype CustomerId = int
+
+
+class Customer:
+    id: CustomerId
+    name: str
+    email: str
+
+
+class Product:
+    sku: str
+    name: str
+    price: float
+    stock: int
+
+
+class Order:
+    id: OrderId
+    customer_id: CustomerId
+    items: list[tuple[str, int]]  # (sku, quantity)
+    total: float
+
+
+type Status = Pending | Paid | Shipped | Cancelled
+
+
+class Pending:
+    label: str
+class Paid:
+    paid_at: float
+class Shipped:
+    tracking: str
+class Cancelled:
+    reason: str
+
+
+type OrderError = OutOfStock | InvalidProduct | InsufficientFunds | UnknownCustomer
+
+
+class OutOfStock:
+    sku: str
+    available: int
+class InvalidProduct:
+    sku: str
+class InsufficientFunds:
+    customer_id: CustomerId
+    needed: float
+class UnknownCustomer:
+    customer_id: CustomerId
+
+
+class Store:
+    customers: dict[int, Customer]
+    products: dict[str, Product]
+    orders: list[Order]
+
+
+impl Store:
+    def add_customer(self, name: str, email: str) -> Customer:
+        let id: CustomerId = CustomerId(len(self.customers) + 1)
+        let c: Customer = Customer(id=id, name=name, email=email)
+        self.customers[int(id)] = c
+        return c
+
+    def add_product(self, sku: str, name: str, price: float, stock: int) -> Product:
+        let p: Product = Product(sku=sku, name=name, price=price, stock=stock)
+        self.products[sku] = p
+        return p
+
+    def place_order(
+        self,
+        customer_id: CustomerId,
+        items: list[tuple[str, int]],
+    ) -> Result[Order, OrderError]:
+        if int(customer_id) not in self.customers:
+            return Err(UnknownCustomer(customer_id=customer_id))
+        mut total: float = 0.0
+        for entry in items:
+            let sku: str = entry[0]
+            let qty: int = entry[1]
+            let prod: Product? = self.products.get(sku)
+            if prod is None:
+                return Err(InvalidProduct(sku=sku))
+            if prod.stock < qty:
+                return Err(OutOfStock(sku=sku, available=prod.stock))
+            total = total + prod.price * float(qty)
+        # Deduct stock
+        for entry in items:
+            let sku2: str = entry[0]
+            let qty2: int = entry[1]
+            let item_prod: Product? = self.products.get(sku2)
+            if item_prod is not None:
+                item_prod.stock = item_prod.stock - qty2
+        let order: Order = Order(
+            id=OrderId(len(self.orders) + 1),
+            customer_id=customer_id,
+            items=items,
+            total=total,
+        )
+        self.orders.append(order)
+        return Ok(order)
+
+
+def render_error(e: OrderError) -> str:
+    match e:
+        case OutOfStock(sku, n):
+            return f"out of stock: {sku} (have {n})"
+        case InvalidProduct(sku):
+            return f"unknown sku: {sku}"
+        case InsufficientFunds(_, n):
+            return f"need ${n:.2f}"
+        case UnknownCustomer(cid):
+            return f"unknown customer: {int(cid)}"
+
+
+def main() -> None:
+    let store: Store = Store(customers={}, products={}, orders=[])
+    let alice: Customer = store.add_customer("Alice", "alice@example.com")
+    let bob: Customer = store.add_customer("Bob", "bob@example.com")
+    store.add_product("WIDGET", "Widget", 9.99, 50)
+    store.add_product("GIZMO", "Gizmo", 19.99, 10)
+    store.add_product("THINGY", "Thingy", 4.95, 100)
+
+    let r1: Result[Order, OrderError] = store.place_order(
+        alice.id, [("WIDGET", 3), ("GIZMO", 1)]
+    )
+    let r2: Result[Order, OrderError] = store.place_order(
+        bob.id, [("THINGY", 1000)]
+    )
+    let r3: Result[Order, OrderError] = store.place_order(
+        bob.id, [("UNKNOWN-SKU", 1)]
+    )
+
+    for r in [r1, r2, r3]:
+        match r:
+            case Ok(o):
+                print(f"OK: order #{int(o.id)} total ${o.total:.2f}")
+            case Err(e):
+                print(f"ERR: {render_error(e)}")
+
+
+if __name__ == "__main__":
+    main()

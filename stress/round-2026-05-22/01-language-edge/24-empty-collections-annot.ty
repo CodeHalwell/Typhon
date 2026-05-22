@@ -1,0 +1,19 @@
+# Probe: empty collection literal annotation.
+
+def main() -> None:
+    let empty_list: list[int] = []
+    let empty_dict: dict[str, int] = {}
+    let empty_set: set[str] = set()
+    let empty_tuple: tuple[()] = ()       # zero-length tuple
+    let single_tuple: tuple[int] = (1,)   # one-element tuple
+
+    print(f"el={empty_list}, ed={empty_dict}, es={empty_set}")
+    print(f"et={empty_tuple}, st={single_tuple}")
+
+    # Should work with annotated comprehension over empty source
+    let xs: list[int] = [x * 2 for x in []]
+    print(xs)
+
+
+if __name__ == "__main__":
+    main()

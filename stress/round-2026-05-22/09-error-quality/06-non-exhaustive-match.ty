@@ -1,0 +1,29 @@
+# Should fire `tyc::non_exhaustive_match`.
+
+type Shape = Circle | Square | Triangle
+
+
+class Circle:
+    radius: float
+class Square:
+    side: float
+class Triangle:
+    base: float
+    height: float
+
+
+def area(s: Shape) -> float:
+    match s:
+        case Circle(r):
+            return 3.14 * r * r
+        case Square(s_):
+            return s_ * s_
+        # Triangle missing!
+
+
+def main() -> None:
+    print(area(Square(side=4.0)))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,84 @@
+# AI test: simplified RAG indexing + retrieval.
+import math
+
+
+class Document:
+    id: int
+    content: str
+    tokens: list[str]
+
+
+class Hit:
+    doc_id: int
+    score: float
+    content: str
+
+
+def tokenize(text: str) -> list[str]:
+    mut out: list[str] = []
+    mut cur: list[str] = []
+    for ch in text.lower():
+        if ch.isalnum():
+            cur.append(ch)
+        else:
+            if len(cur) > 0:
+                out.append("".join(cur))
+                cur = []
+    if len(cur) > 0:
+        out.append("".join(cur))
+    return out
+
+
+class Index:
+    docs: list[Document]
+    df: dict[str, int]
+
+
+impl Index:
+    def add(self, content: str) -> None:
+        let doc: Document = Document(
+            id=len(self.docs),
+            content=content,
+            tokens=tokenize(content),
+        )
+        self.docs.append(doc)
+        let unique: set[str] = set(doc.tokens)
+        for t in unique:
+            self.df[t] = self.df.get(t, 0) + 1
+
+    def search(self, query: str, k: int = 3) -> list[Hit]:
+        let q_tokens: list[str] = tokenize(query)
+        let n_docs: int = len(self.docs)
+        mut scores: list[tuple[int, float]] = []
+        for doc in self.docs:
+            mut score: float = 0.0
+            for t in q_tokens:
+                if t in doc.tokens:
+                    let tf: float = float(doc.tokens.count(t)) / float(len(doc.tokens))
+                    let idf: float = math.log(float(n_docs) / float(self.df.get(t, 1)))
+                    score = score + tf * idf
+            if score > 0:
+                scores.append((doc.id, score))
+        scores.sort(key=lambda p: p[1], reverse=True)
+        return [
+            Hit(doc_id=p[0], score=p[1], content=self.docs[p[0]].content)
+            for p in scores[:k]
+        ]
+
+
+def main() -> None:
+    let idx: Index = Index(docs=[], df={})
+    idx.add("Typhon compiles to Python")
+    idx.add("Python is a dynamic language")
+    idx.add("Rust is a systems language")
+    idx.add("Typhon adds static types to Python")
+    idx.add("ML models in Python are common")
+
+    for query in ["typhon", "python language", "rust"]:
+        print(f"=== {query!r} ===")
+        for h in idx.search(query, k=3):
+            print(f"  #{h.doc_id} score={h.score:.3f} {h.content!r}")
+
+
+if __name__ == "__main__":
+    main()

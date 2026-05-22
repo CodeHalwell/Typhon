@@ -1,0 +1,44 @@
+# Probe: recursive sealed union — a binary tree.
+# Hypothesis: exhaustive match works for self-referencing sealed types.
+
+type Tree = Leaf | Node
+
+
+class Leaf:
+    value: int
+
+
+class Node:
+    left: Tree
+    right: Tree
+
+
+def sum_tree(t: Tree) -> int:
+    match t:
+        case Leaf(v):
+            return v
+        case Node(l, r):
+            return sum_tree(l) + sum_tree(r)
+
+
+def depth(t: Tree) -> int:
+    match t:
+        case Leaf(_):
+            return 1
+        case Node(l, r):
+            let dl: int = depth(l)
+            let dr: int = depth(r)
+            return 1 + (dl if dl > dr else dr)
+
+
+def main() -> None:
+    let t: Tree = Node(
+        left=Node(left=Leaf(value=1), right=Leaf(value=2)),
+        right=Leaf(value=3),
+    )
+    print(f"sum={sum_tree(t)}")
+    print(f"depth={depth(t)}")
+
+
+if __name__ == "__main__":
+    main()

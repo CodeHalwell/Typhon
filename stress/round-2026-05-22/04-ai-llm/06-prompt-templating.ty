@@ -1,0 +1,65 @@
+# AI test: prompt templating with structured slots.
+
+
+class Slot:
+    name: str
+    default: str?
+    required: bool
+
+
+class Template:
+    text: str
+    slots: list[Slot]
+
+
+impl Template:
+    def render(self, values: dict[str, str]) -> Result[str, str]:
+        mut out: str = self.text
+        for s in self.slots:
+            let v: str? = values.get(s.name)
+            if v is None and s.default is None and s.required:
+                return Err(f"missing required slot: {s.name}")
+            let final: str = v if v is not None else (s.default if s.default is not None else "")
+            out = out.replace("{" + s.name + "}", final)
+        return Ok(out)
+
+
+def make_summary_template() -> Template:
+    return Template(
+        text=(
+            "Summarise the following {kind} in {sentences} sentences.\n"
+            "Style: {style}\n---\n{content}\n---"
+        ),
+        slots=[
+            Slot(name="kind", default="document", required=False),
+            Slot(name="sentences", default="3", required=False),
+            Slot(name="style", default=None, required=True),
+            Slot(name="content", default=None, required=True),
+        ],
+    )
+
+
+def main() -> None:
+    let tpl: Template = make_summary_template()
+
+    match tpl.render({
+        "style": "neutral, technical",
+        "content": "Typhon is a statically typed superset of Python.",
+    }):
+        case Ok(rendered):
+            print(rendered)
+        case Err(e):
+            print(f"err: {e}")
+
+    print("---")
+
+    # Missing required slot
+    match tpl.render({"kind": "essay"}):
+        case Ok(rendered):
+            print(rendered)
+        case Err(e):
+            print(f"err: {e}")
+
+
+if __name__ == "__main__":
+    main()

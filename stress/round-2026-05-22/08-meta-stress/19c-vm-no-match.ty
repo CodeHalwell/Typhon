@@ -1,0 +1,13 @@
+# Probe: without match (just isinstance) — does it work?
+
+def main() -> None:
+    let outcomes: list[Result[int, str]] = [Ok(1), Err("bad"), Ok(7)]
+    mut total: int = 0
+    for o in outcomes:
+        if isinstance(o, Ok):
+            total = total + o.value
+    print(f"total = {total}")
+
+
+if __name__ == "__main__":
+    main()

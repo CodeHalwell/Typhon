@@ -1,0 +1,33 @@
+# Probe: async def + match with all-arms-returning.
+import asyncio
+
+
+type Status = Open | Closed
+
+
+class Open:
+    since: float
+class Closed:
+    label: str
+
+
+async def f(s: Status, now: float, cooldown: float) -> str:
+    match s:
+        case Open(since):
+            if now - since >= cooldown:
+                return "ready"
+            return "still-cooling"
+        case Closed(label):
+            return f"closed: {label}"
+
+
+async def main_async() -> None:
+    print(await f(Open(since=0.0), 1.0, 0.5))
+
+
+def main() -> None:
+    asyncio.run(main_async())
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,15 @@
+# Probe: VM match with outer mut write, no loop.
+
+def main() -> None:
+    let r: Result[int, str] = Ok(42)
+    mut total: int = 0
+    match r:
+        case Ok(v):
+            total = v
+        case Err(_):
+            pass
+    print(f"total = {total}")
+
+
+if __name__ == "__main__":
+    main()

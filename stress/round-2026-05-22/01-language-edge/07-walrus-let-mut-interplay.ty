@@ -1,0 +1,29 @@
+# Probe: walrus operator interactions with let/mut rules.
+# Per docs: walrus introduces implicit `let`. Rebinding requires `mut`.
+
+def demo_walrus() -> int:
+    let xs: list[int] = [1, 2, 3, 4, 5]
+    if (n := len(xs)) > 3:
+        # n introduced as let; reading is fine
+        return n * 2
+    return 0
+
+
+def demo_walrus_rebind() -> int:
+    # walrus inside loop body - same identifier rebound each iteration.
+    # This should be `tyc::immutable_assign` per docs (walrus = let).
+    mut total: int = 0
+    let items: list[str] = ["1", "22", "333"]
+    for s in items:
+        if (length := len(s)) > 0:
+            total += length
+    return total
+
+
+def main() -> None:
+    print(demo_walrus())
+    print(demo_walrus_rebind())
+
+
+if __name__ == "__main__":
+    main()

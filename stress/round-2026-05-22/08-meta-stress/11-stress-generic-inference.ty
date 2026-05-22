@@ -1,0 +1,44 @@
+# Probe: bidirectional generic inference with nested constraints.
+
+
+def first[T](xs: list[T]) -> T?:
+    if len(xs) == 0:
+        return None
+    return xs[0]
+
+
+def map_list[T, U](xs: list[T], f: Callable[[T], U]) -> list[U]:
+    return [f(x) for x in xs]
+
+
+def pair[T](a: T, b: T) -> tuple[T, T]:
+    return (a, b)
+
+
+def main() -> None:
+    let ints: list[int] = [1, 2, 3]
+    let strs: list[str] = ["a", "b"]
+
+    # Should narrow T = int → returns int?
+    let x: int? = first(ints)
+    print(x)
+
+    # Should narrow T = str → returns str?
+    let y: str? = first(strs)
+    print(y)
+
+    # Map int → str
+    let z: list[str] = map_list(ints, lambda n: f"<{n}>")
+    print(z)
+
+    # Pair with mismatched T should widen
+    let p: tuple[int, int] = pair(1, 2)
+    print(p)
+
+    # Map with method-style callback
+    let upper: list[str] = map_list(strs, str.upper)
+    print(upper)
+
+
+if __name__ == "__main__":
+    main()

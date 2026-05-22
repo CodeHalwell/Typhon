@@ -1,0 +1,79 @@
+# AI test: server-sent-events style streaming parser with stateful state machine.
+
+type Event = DataEvent | DoneEvent | ErrorEvent | KeepAliveEvent
+
+
+class DataEvent:
+    payload: str
+
+
+class DoneEvent:
+    label: str
+
+
+class ErrorEvent:
+    code: int
+    message: str
+
+
+class KeepAliveEvent:
+    label: str
+
+
+class StreamParser:
+    buffer: str
+    events: list[Event]
+
+
+impl StreamParser:
+    def feed(self, chunk: str) -> None:
+        self.buffer = self.buffer + chunk
+        while "\n\n" in self.buffer:
+            let idx: int = self.buffer.index("\n\n")
+            let event_raw: str = self.buffer[:idx]
+            self.buffer = self.buffer[idx + 2:]
+            self._parse_event(event_raw)
+
+    def _parse_event(self, raw: str) -> None:
+        mut event_name: str = ""
+        mut data: str = ""
+        for line in raw.split("\n"):
+            if line.startswith("event:"):
+                event_name = line[6:].strip()
+            elif line.startswith("data:"):
+                data = data + line[5:].lstrip()
+        if event_name == "done":
+            self.events.append(DoneEvent(label="done"))
+        elif event_name == "keepalive" or event_name == "":
+            if data == "":
+                self.events.append(KeepAliveEvent(label="ping"))
+            else:
+                self.events.append(DataEvent(payload=data))
+        elif event_name == "error":
+            self.events.append(ErrorEvent(code=500, message=data))
+        else:
+            self.events.append(DataEvent(payload=data))
+
+
+def main() -> None:
+    let parser: StreamParser = StreamParser(buffer="", events=[])
+    parser.feed("event: keepalive\ndata: \n\n")
+    parser.feed("event: message\ndata: hello ")
+    parser.feed("world\n\n")
+    parser.feed("event: error\ndata: rate limit\n\n")
+    parser.feed("event: done\ndata: \n\n")
+
+    for e in parser.events:
+        match e:
+            case DataEvent(p):
+                print(f"DATA: {p!r}")
+            case DoneEvent(_):
+                print("DONE")
+            case ErrorEvent(c, m):
+                print(f"ERROR {c}: {m}")
+            case KeepAliveEvent(_):
+                print("PING")
+
+
+if __name__ == "__main__":
+    main()

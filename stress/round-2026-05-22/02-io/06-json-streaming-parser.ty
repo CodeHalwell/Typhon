@@ -1,0 +1,60 @@
+# IO test: a JSON-lines parser that reads, validates, and aggregates.
+import json
+
+
+class LogEntry:
+    timestamp: str
+    level: str
+    message: str
+    request_id: str?
+
+
+def parse_line(line: str) -> Result[LogEntry, str]:
+    if line == "":
+        return Err("empty")
+    try:
+        let raw: dict[str, str] = json.loads(line)
+    except json.JSONDecodeError as e:
+        return Err(f"json: {e}")
+    let ts: str? = raw.get("timestamp")
+    let lvl: str? = raw.get("level")
+    let msg: str? = raw.get("message")
+    if ts is None or lvl is None or msg is None:
+        return Err("missing required field")
+    let rid: str? = raw.get("request_id")
+    return Ok(LogEntry(timestamp=ts, level=lvl, message=msg, request_id=rid))
+
+
+class Aggregator:
+    counts_by_level: dict[str, int]
+    errors: list[str]
+
+
+impl Aggregator:
+    def handle(self, line: str) -> None:
+        match parse_line(line):
+            case Ok(entry):
+                self.counts_by_level[entry.level] = self.counts_by_level.get(entry.level, 0) + 1
+            case Err(reason):
+                self.errors.append(reason)
+
+
+def main() -> None:
+    let logs: str = '''
+{"timestamp":"2026-05-22T10:00:00Z","level":"INFO","message":"started"}
+{"timestamp":"2026-05-22T10:00:01Z","level":"INFO","message":"hello","request_id":"req-1"}
+{"timestamp":"2026-05-22T10:00:02Z","level":"WARN","message":"slow query"}
+not-json
+{"timestamp":"2026-05-22T10:00:03Z","level":"ERROR","message":"500"}
+{"timestamp":"2026-05-22T10:00:04Z","message":"missing level"}
+'''.strip()
+
+    let agg: Aggregator = Aggregator(counts_by_level={}, errors=[])
+    for line in logs.split("\n"):
+        agg.handle(line)
+    print(f"counts: {agg.counts_by_level}")
+    print(f"errors: {agg.errors}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,67 @@
+# Meta-stress: more paren-stripping cases beyond `not (a or b)`.
+# We need to surface every place the emitter drops needed parens.
+
+
+def t_lambda_in_not(xs: list[int]) -> bool:
+    # not (lambda) is contrived but should be preserved
+    let f = lambda x: x > 0
+    return not (f(0))
+
+
+def t_ternary_in_not(a: int) -> bool:
+    # not (x if cond else y)
+    return not (True if a > 0 else False)
+
+
+def t_compare_chain_in_not(a: int, b: int) -> bool:
+    # not (a < b < 10) chained comparison
+    return not (a < b < 10)
+
+
+def t_walrus_in_not(xs: list[int]) -> bool:
+    # not (x := len(xs))
+    return not ((n := len(xs)))
+
+
+def t_or_inside_and(a: bool, b: bool, c: bool) -> bool:
+    # a and (b or c) — must preserve parens
+    return a and (b or c)
+
+
+def t_and_inside_or(a: bool, b: bool, c: bool) -> bool:
+    # a or (b and c) — already correct (and binds tighter than or)
+    return a or (b and c)
+
+
+def t_lambda_in_call(xs: list[int]) -> list[int]:
+    # (lambda x: x * 2)(...)
+    return [(lambda x: x * 2)(v) for v in xs]
+
+
+def t_unary_neg_pow(x: int) -> int:
+    # (-x) ** 2 — must NOT become -x ** 2 (= -(x**2))
+    return (-x) ** 2
+
+
+def t_pos_neg_neg(x: int) -> int:
+    # +(-(-x)) — silly but exercises double-unary
+    return +(-(-x))
+
+
+def main() -> None:
+    print(f"t_lambda_in_not = {t_lambda_in_not([])}")
+    print(f"t_ternary_in_not(5) = {t_ternary_in_not(5)}")  # not(True if 5>0 else False) = not True = False
+    print(f"t_ternary_in_not(-5) = {t_ternary_in_not(-5)}")  # not False = True
+    print(f"t_compare_chain_in_not(1, 5) = {t_compare_chain_in_not(1, 5)}")  # not(1<5<10) = not True = False
+    print(f"t_compare_chain_in_not(11, 12) = {t_compare_chain_in_not(11, 12)}")  # not(11<12<10) = not False = True
+    print(f"t_walrus_in_not([]) = {t_walrus_in_not([])}")  # not (0) = True
+    print(f"t_walrus_in_not([1]) = {t_walrus_in_not([1])}")  # not (1) = False
+    print(f"t_or_inside_and(T,F,T) = {t_or_inside_and(True, False, True)}")  # T and (F or T) = T
+    print(f"t_or_inside_and(T,F,F) = {t_or_inside_and(True, False, False)}")  # T and (F or F) = F
+    print(f"t_lambda_in_call([1, 2, 3]) = {t_lambda_in_call([1, 2, 3])}")
+    print(f"t_unary_neg_pow(3) = {t_unary_neg_pow(3)}")  # 9 (correct), bug=-9
+    print(f"t_pos_neg_neg(5) = {t_pos_neg_neg(5)}")
+
+
+if __name__ == "__main__":
+    main()

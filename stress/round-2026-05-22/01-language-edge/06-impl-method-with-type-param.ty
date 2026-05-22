@@ -1,0 +1,22 @@
+# Probe: methods inside impl[T] with their own type param.
+
+class Box[T]:
+    value: T
+
+
+impl[T] Box[T]:
+    def map[U](self, f: Callable[[T], U]) -> "Box[U]":
+        return Box(value=f(self.value))
+
+    def get(self) -> T:
+        return self.value
+
+
+def main() -> None:
+    let b: Box[int] = Box(value=10)
+    let s: Box[str] = b.map(lambda x: f"={x}=")
+    print(s.get())
+
+
+if __name__ == "__main__":
+    main()

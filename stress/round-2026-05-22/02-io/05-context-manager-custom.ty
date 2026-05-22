@@ -1,0 +1,39 @@
+# IO test: custom context manager, returning self from __enter__.
+
+class Timer:
+    name: str
+    elapsed: float
+
+
+impl Timer:
+    def __enter__(self) -> "Timer":
+        import time
+        self.elapsed = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type: type?, exc_val: BaseException?, exc_tb: object?) -> bool:
+        import time
+        self.elapsed = time.perf_counter() - self.elapsed
+        return False
+
+
+class Logger:
+    prefix: str
+
+
+impl Logger:
+    def info(self, msg: str) -> None:
+        print(f"[{self.prefix}] {msg}")
+
+
+def main() -> None:
+    let log: Logger = Logger(prefix="benchmark")
+    with Timer(name="loop", elapsed=0.0) as t:
+        mut total: int = 0
+        for i in range(1000):
+            total += i
+    log.info(f"loop summed to {total} in {t.elapsed:.6f}s")
+
+
+if __name__ == "__main__":
+    main()

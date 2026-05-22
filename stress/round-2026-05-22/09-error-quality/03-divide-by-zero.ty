@@ -1,0 +1,28 @@
+# Should fire `tyc::div_by_zero_literal`.
+
+def t1(x: int) -> int:
+    return x / 0
+
+
+def t2(x: int) -> int:
+    return x // 0
+
+
+def t3(x: int) -> int:
+    return x % 0
+
+
+def t4(x: float) -> float:
+    return x / 0.0
+
+
+def t5(x: float) -> float:
+    return x / -0.0
+
+
+def main() -> None:
+    print("never reached")
+
+
+if __name__ == "__main__":
+    main()

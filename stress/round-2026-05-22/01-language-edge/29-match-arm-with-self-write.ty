@@ -1,0 +1,36 @@
+# Probe: match arm that writes to self.<field> before returning.
+
+type Status = Open | Closed
+
+
+class Open:
+    since: float
+class Closed:
+    label: str
+
+
+class Foo:
+    cooldown: float
+    state: Status
+
+
+impl Foo:
+    def check(self, now: float) -> str:
+        match self.state:
+            case Open(since):
+                if now - since >= self.cooldown:
+                    self.state = Closed(label="trial")  # write to self.state
+                    return "ready"
+                return "still-cooling"
+            case Closed(label):
+                return f"closed: {label}"
+
+
+def main() -> None:
+    let f: Foo = Foo(cooldown=0.5, state=Open(since=0.0))
+    print(f.check(1.0))
+    print(f.check(0.1))
+
+
+if __name__ == "__main__":
+    main()

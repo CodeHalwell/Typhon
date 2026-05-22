@@ -1,0 +1,31 @@
+# Probe: does tyc recognise match-with-every-arm-returning as terminating?
+
+type Color = Red | Green | Blue
+
+
+class Red:
+    label: str
+class Green:
+    label: str
+class Blue:
+    label: str
+
+
+def hex_code(c: Color) -> str:
+    match c:
+        case Red(_):
+            return "#FF0000"
+        case Green(_):
+            return "#00FF00"
+        case Blue(_):
+            return "#0000FF"
+
+
+def main() -> None:
+    print(hex_code(Red(label="r")))
+    print(hex_code(Green(label="g")))
+    print(hex_code(Blue(label="b")))
+
+
+if __name__ == "__main__":
+    main()
