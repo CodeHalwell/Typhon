@@ -205,24 +205,18 @@ pub fn run(args: CheckArgs) -> Result<()> {
             );
             diags.extend(file_diags);
 
-            // Run comptime + purity analysis to match what `tyc build` would
-            // reject. Without this pass, CI pipelines running only `tyc check`
-            // would silently accept `@pure` violations and unsatisfied
-            // required env vars that production builds catch. The work
-            // duplicates `tyc build`'s phase 2/3 setup; salsa caches the
-            // preprocess so it's cheap on warm runs.
-            let analysis_diags = run_analysis_passes(&path.display().to_string(), &source);
+            // Run comptime + purity + (optionally) unknown-module
+            // diagnostics in one pass so the preprocess+parse cycle is
+            // only done once per file instead of once per analysis. On
+            // 100-LOC files this is a small win, but on larger trees
+            // it adds up — each preprocess walks the full source and
+            // each `parse_module` call rebuilds the ruff AST.
+            let analysis_diags = run_secondary_passes(
+                &path.display().to_string(),
+                &source,
+                has_project_config.then_some(&vetting_ctx),
+            );
             diags.extend(analysis_diags);
-
-            // FINDINGS #79: vet imports against stdlib + project + deps.
-            // Skip when no `typhon.toml` was found — standalone files checked
-            // outside a project context should not be penalised for importing
-            // third-party packages that are not listed in any config.
-            if has_project_config {
-                let module_diags =
-                    run_unknown_module_check(&path.display().to_string(), &source, &vetting_ctx);
-                diags.extend(module_diags);
-            }
         }
 
         // `--stubs`: parse + type-check every `.dty` stub, then compare its
@@ -488,15 +482,26 @@ fn unique_code_count(items: &[TycError]) -> usize {
     codes.len()
 }
 
-/// Run comptime evaluation and purity verification on a single source file.
+/// Run the secondary check passes — comptime evaluation, purity
+/// verification, and (when a project config is present) the
+/// unknown-module import vet — over a single preprocess + parse of
+/// `source`.
 ///
-/// These passes also run inside `tyc build`; lifting them up to `tyc check`
-/// closes the documented CI hole where `@pure` violations and missing
-/// `[env] required` variables only fail at build time. Any non-comptime,
-/// non-purity error has already been reported by `check_file`, so this
-/// helper deliberately swallows preprocess / parse failures (they would
-/// surface a second time otherwise).
-fn run_analysis_passes(path: &str, source: &str) -> Diagnostics {
+/// These passes also run inside `tyc build`; lifting them up to
+/// `tyc check` closes the documented CI hole where `@pure` violations
+/// and missing `[env] required` variables only fail at build time.
+/// Any non-comptime, non-purity error has already been reported by
+/// `check_file`, so this helper deliberately swallows preprocess /
+/// parse failures (they would surface a second time otherwise).
+///
+/// Passing `vetting_ctx = None` skips the unknown-module check — the
+/// standalone-file flow (no `typhon.toml` found) suppresses that
+/// diagnostic since the user isn't in a project context.
+fn run_secondary_passes(
+    path: &str,
+    source: &str,
+    vetting_ctx: Option<&ImportVettingContext>,
+) -> Diagnostics {
     let mut diags = Diagnostics::new();
     let expanded = expand_for_check(source);
     let prep = preprocess(&expanded);
@@ -517,6 +522,18 @@ fn run_analysis_passes(path: &str, source: &str) -> Diagnostics {
     let purity_findings = analyse_purity(&module, false);
     let purity_diags = purity_diagnostics(&purity_findings, path, source);
     diags.extend(purity_diags);
+
+    if let Some(ctx) = vetting_ctx {
+        // AST node ranges are offsets into the *preprocessed* Python
+        // source, so the diagnostic must render against
+        // `prep.python_source` for the span labels to line up.
+        // Rendering against the original Typhon source would print
+        // out-of-bounds labels for files that exercise preprocess
+        // rewrites (`interface`, `impl`, `guard`, `lazy import`, …).
+        // (Copilot review on PR #68, file check.rs:337.)
+        let module_diags = check_unknown_modules_with(path, &prep.python_source, &module, ctx);
+        diags.extend(module_diags);
+    }
 
     diags
 }
@@ -774,35 +791,14 @@ fn ty_path_to_dotted(path: &std::path::Path, src_root: &str) -> String {
     crate::commands::util::path_to_dotted(path, src_root)
 }
 
-/// FINDINGS #79: run `check_unknown_modules` for one source file. Parses
-/// the file through the same preprocess pipeline used elsewhere so
-/// Typhon-specific keywords (`val`, `var`, `lazy import`, …) are stripped
-/// before the AST walk. Returns the warnings only — errors at the
-/// preprocess / parse layer have already been surfaced by `check_file`.
-fn run_unknown_module_check(path: &str, source: &str, ctx: &ImportVettingContext) -> Diagnostics {
-    let expanded = expand_for_check(source);
-    let prep = preprocess(&expanded);
-    let module = match tyc_syntax::parse_module(&prep.python_source) {
-        Ok(p) => p.into_syntax(),
-        Err(_) => return Diagnostics::new(),
-    };
-    // AST node ranges are offsets into the *preprocessed* Python source,
-    // so the diagnostic must render against `prep.python_source` for the
-    // span labels to line up. Rendering against the original Typhon
-    // source would print out-of-bounds labels for files that exercise
-    // preprocess rewrites (`interface`, `impl`, `guard`, `lazy import`,
-    // …). (Copilot review on PR #68, file check.rs:337.)
-    check_unknown_modules_with(path, &prep.python_source, &module, ctx)
-}
-
 /// Shared preprocess pipeline used by every "parse the .ty source for a
 /// secondary check pass" call site inside `tyc check`. Centralising the
-/// chain keeps `run_unknown_module_check`, `run_analysis_passes`, and
-/// `parse_for_diff` in sync with `tyc_db::check_file` / `tyc build` —
-/// without this the three call sites diverged on which expansion passes
-/// they ran, and a file using a feature recognised by only some of the
-/// chains would silently skip downstream diagnostics. (Copilot review
-/// on PR #68, file check.rs:332.)
+/// chain keeps `run_secondary_passes` and `parse_for_diff` in sync with
+/// `tyc_db::check_file` / `tyc build` — without this the call sites
+/// diverged on which expansion passes they ran, and a file using a
+/// feature recognised by only some of the chains would silently skip
+/// downstream diagnostics. (Copilot review on PR #68, file
+/// check.rs:332.)
 fn expand_for_check(source: &str) -> String {
     expand_question_ops(&expand_inline_question_ops(&expand_pipes(
         &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
