@@ -193,6 +193,13 @@ pub fn preprocess(source: &str) -> PreprocessResult {
     let mut plain_class_lines: Vec<usize> = Vec::new();
     // String state carried across lines (triple-quoted strings may span them).
     let mut in_string: Option<StringMode> = None;
+    // When a `freeze let` RHS spans multiple lines (e.g. a multi-line dict
+    // literal), the opening `__typhon_freeze__(` is emitted on the first
+    // line but the matching `)` has to land *after* the closing bracket of
+    // the RHS expression. `freeze_let_depth` tracks the residual bracket
+    // depth left over from earlier `freeze let` lines; when it returns to
+    // zero we close the call by appending `)` to the current line.
+    let mut freeze_let_depth: i32 = 0;
 
     for (line_index, line) in source.split_inclusive('\n').enumerate() {
         // Keyword stripping only applies outside of string content.
@@ -213,12 +220,30 @@ pub fn preprocess(source: &str) -> PreprocessResult {
             if indent_len == 0 {
                 if let Some(after_raw) = rest.strip_prefix("freeze let ") {
                     let after = after_raw.trim_end_matches(['\n', '\r']);
-                    if let Some(rewritten) = wrap_freeze_let(after) {
+                    if let Some(wrap) = wrap_freeze_let_with_depth(after) {
                         stripped.push(StrippedKeyword {
                             line_index,
                             keyword: TyphonKeyword::Freeze,
                         });
-                        let new_line = format!("{}let {}\n", indent, rewritten);
+                        // If the RHS opened more brackets than it closed
+                        // on this line, postpone the closing `)` and let
+                        // the residual-depth tracker emit it on the line
+                        // that brings the depth back to zero. The wrap
+                        // helper splits the rewrite into a `head`
+                        // (`X = __typhon_freeze__(rhs`) and a `tail`
+                        // (`<comment>` or empty) so we can place the
+                        // closing `)` between them on the single-line
+                        // case.
+                        let new_line = if wrap.residual > 0 {
+                            freeze_let_depth = wrap.residual;
+                            // Comment-on-open-line is rejected by
+                            // wrap_freeze_let_with_depth in the
+                            // multi-line case, so `tail` is empty here.
+                            debug_assert!(wrap.tail.is_empty());
+                            format!("{}let {}\n", indent, wrap.head)
+                        } else {
+                            format!("{}let {}){}\n", indent, wrap.head, wrap.tail)
+                        };
                         let (rewritten, marks) = rewrite_optionals(&new_line, &mut in_string);
                         for col in marks {
                             optionals.push(StrippedOptional {
@@ -230,6 +255,25 @@ pub fn preprocess(source: &str) -> PreprocessResult {
                         continue;
                     }
                 }
+            }
+            // Already inside a multi-line `freeze let` RHS — adjust the
+            // depth by this line's net brackets. When the depth hits zero
+            // we emit a closing `)` after the bracket that closed it; on
+            // earlier lines we forward the content verbatim.
+            if freeze_let_depth > 0 {
+                let line_no_nl = line.trim_end_matches(['\n', '\r']);
+                let net = bracket_delta_outside_strings(line_no_nl, &mut in_string);
+                freeze_let_depth += net;
+                if freeze_let_depth <= 0 {
+                    freeze_let_depth = 0;
+                    let trailing = &line[line_no_nl.len()..];
+                    let emitted = format!("{})", line_no_nl);
+                    python_source.push_str(&emitted);
+                    python_source.push_str(trailing);
+                } else {
+                    python_source.push_str(line);
+                }
+                continue;
             }
 
             // ── `newtype Name = Base` → `Name = NewType("Name", Base)` ───────
@@ -843,25 +887,84 @@ fn unwrap_freeze_let(content: &str) -> Option<String> {
 /// burying the comment inside the call expression. Mirrors the
 /// simple split-on-first-`#` convention used by
 /// [`parse_newtype_decl`] and [`parse_lazy_import`].
+#[cfg_attr(not(test), allow(dead_code))]
 fn wrap_freeze_let(tail: &str) -> Option<String> {
-    let (code, comment) = match tail.find('#') {
-        Some(i) => (&tail[..i], &tail[i..]),
-        None => (tail, ""),
-    };
-    // We need the FIRST `=` that isn't inside square brackets or
-    // parens (so a default-value annotation like `Dict[str, int]`
-    // doesn't confuse us). Track depth.
-    let bytes = code.as_bytes();
+    let wrap = wrap_freeze_let_with_depth(tail)?;
+    // The single-line form was: `lhs = __typhon_freeze__(rhs)<tail>` —
+    // append the closing `)` here so existing callers keep working.
+    // Refuse the multi-line case: callers of the legacy single-line
+    // helper expect a balanced expression.
+    if wrap.residual != 0 {
+        return None;
+    }
+    Some(format!("{}){}", wrap.head, wrap.tail))
+}
+
+/// Result of [`wrap_freeze_let_with_depth`].
+struct FreezeLetWrap {
+    /// The rewrite up to (but not including) the closing `)` of the
+    /// `__typhon_freeze__(` call — `"X = __typhon_freeze__(rhs"`.
+    head: String,
+    /// Anything that must follow the closing `)` on the original line —
+    /// typically a trailing comment `"  # note"`. Empty when there was
+    /// no comment, and guaranteed empty in the multi-line case (the
+    /// open-line cannot carry a comment because Python would treat the
+    /// continuation as part of it).
+    tail: String,
+    /// Bracket depth remaining at end-of-line. Zero for the single-line
+    /// case; positive when the RHS opens a multi-line container literal.
+    residual: i32,
+}
+
+/// Rewrite the tail of `freeze let X = ...` to
+/// `X = __typhon_freeze__(...` (note the *unclosed* call). Returns the
+/// rewritten text and the *residual bracket depth* of the RHS on this
+/// physical line:
+///
+/// * residual == 0 → the entire RHS fits on one line and the caller
+///   should close the wrap by appending `)`.
+/// * residual >  0 → the RHS opens a multi-line literal; the caller
+///   must track depth across subsequent lines and append `)` when the
+///   depth returns to zero.
+///
+/// The unclosed shape lets the multi-line `freeze let` case work
+/// without joining lines (which would shift line numbers and break the
+/// source map). A line-tail comment is preserved on single-line wraps;
+/// on multi-line wraps we cannot meaningfully keep it on the open line
+/// (it would be interpreted as a comment by Python and consume the rest
+/// of the source line), so we forbid that combination.
+fn wrap_freeze_let_with_depth(tail: &str) -> Option<FreezeLetWrap> {
+    // We need the FIRST `=` that isn't inside square brackets or parens
+    // — `Dict[str, int]` and similar must not confuse us. Track depth
+    // and detect comments only outside of brackets.
+    let bytes = tail.as_bytes();
     let mut depth: i32 = 0;
     let mut eq_idx: Option<usize> = None;
-    for (i, &b) in bytes.iter().enumerate() {
+    let mut comment_idx: Option<usize> = None;
+    let mut in_str: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
         match b {
+            b'#' if depth == 0 && eq_idx.is_some() => {
+                comment_idx = Some(i);
+                break;
+            }
+            b'\'' | b'"' => in_str = Some(b),
             b'(' | b'[' | b'{' => depth += 1,
             b')' | b']' | b'}' => depth -= 1,
-            b'=' if depth == 0 => {
-                // Skip every augmented-assignment form (`==`, `>=`, `<=`,
-                // `!=`, `:=`, `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`,
-                // `^=`, `@=`) — we just need a bare `=`.
+            b'=' if depth == 0 && eq_idx.is_none() => {
                 let prev = if i == 0 { 0u8 } else { bytes[i - 1] };
                 let next = bytes.get(i + 1).copied().unwrap_or(0);
                 if next == b'='
@@ -882,18 +985,37 @@ fn wrap_freeze_let(tail: &str) -> Option<String> {
                             | b'@'
                     )
                 {
+                    i += 1;
                     continue;
                 }
                 eq_idx = Some(i);
-                break;
             }
             _ => {}
         }
+        i += 1;
     }
     let eq = eq_idx?;
+    let (code, comment) = match comment_idx {
+        Some(c) => (&tail[..c], &tail[c..]),
+        None => (tail, ""),
+    };
     let lhs = code[..eq].trim_end();
     let rhs = code[eq + 1..].trim();
     if rhs.is_empty() {
+        return None;
+    }
+    // Recompute the residual depth using only the RHS (the LHS is plain
+    // names + type annotations and is balanced by construction).
+    let residual = bracket_delta_simple(rhs);
+    if residual < 0 {
+        // RHS closed more brackets than it opened — malformed; let
+        // downstream parsing surface the error verbatim.
+        return None;
+    }
+    if residual > 0 && !comment.is_empty() {
+        // Multi-line wrap can't carry a trailing comment on the open
+        // line (the `#` would consume the wrap's continuation). Fall
+        // through; let the user move the comment.
         return None;
     }
     let suffix = if comment.is_empty() {
@@ -901,7 +1023,75 @@ fn wrap_freeze_let(tail: &str) -> Option<String> {
     } else {
         format!("  {}", comment.trim_end())
     };
-    Some(format!("{} = __typhon_freeze__({}){}", lhs, rhs, suffix))
+    Some(FreezeLetWrap {
+        head: format!("{} = __typhon_freeze__({}", lhs, rhs),
+        tail: suffix,
+        residual,
+    })
+}
+
+/// Net bracket delta of `s`, ignoring brackets inside string literals.
+/// String literals use plain `'`/`"` quoting; backslash-escaped quotes
+/// are honoured. Triple-quoted strings span multiple lines — those are
+/// not handled here because the wider preprocess loop already tracks
+/// `in_string` separately.
+fn bracket_delta_simple(s: &str) -> i32 {
+    let bytes = s.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_str: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'#' => break,
+            b'\'' | b'"' => in_str = Some(b),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    depth
+}
+
+/// Net bracket delta of `line`, threading multi-line triple-string
+/// state through `in_string`. Mirrors `bracket_delta_simple` but defers
+/// to the wider preprocess loop's string tracker so brackets inside an
+/// active triple-quoted string don't count.
+fn bracket_delta_outside_strings(line: &str, in_string: &mut Option<StringMode>) -> i32 {
+    let bytes = line.as_bytes();
+    let mut depth: i32 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if in_string.is_some() {
+            // Conservatively skip — we don't try to count brackets inside
+            // a triple-quoted string. The wider loop handles entering /
+            // leaving these strings via the existing `update_string_state`
+            // path; here we just don't disturb depth counts.
+            i += 1;
+            continue;
+        }
+        let b = bytes[i];
+        match b {
+            b'#' => break,
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    depth
 }
 
 /// Parse the tail of a `newtype` line: `Name = Base`.
@@ -5846,6 +6036,43 @@ mod tests {
         let prep = preprocess(src);
         let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
         assert_eq!(out, src);
+    }
+
+    #[test]
+    fn freeze_let_multiline_dict_literal() {
+        // Regression for N1 (2026-05-22): a multi-line dict literal on the
+        // RHS used to emit `__typhon_freeze__({)` on the open line, breaking
+        // Python's parser. The wrap call must stay open until the closing
+        // bracket of the RHS expression is reached.
+        let src = "freeze let CONFIG = {\n    \"port\": 8080,\n    \"host\": \"a\",\n}\n";
+        let out = preprocess(src).python_source;
+        // First line opens the call but doesn't close it.
+        assert!(
+            out.contains("let CONFIG = __typhon_freeze__({\n"),
+            "expected open `__typhon_freeze__({{`, got:\n{out}"
+        );
+        // Closing `)` lands on the line that closes the literal.
+        assert!(
+            out.contains("})\n") || out.contains("})\r\n"),
+            "expected closing brace+paren after the literal, got:\n{out}"
+        );
+        // Original `{}` body lines are preserved verbatim so f-strings and
+        // other literal payloads round-trip unchanged.
+        assert!(out.contains("    \"port\": 8080,\n"), "got:\n{out}");
+    }
+
+    #[test]
+    fn freeze_let_multiline_list_literal() {
+        let src = "freeze let TAGS = [\n    \"a\",\n    \"b\",\n]\n";
+        let out = preprocess(src).python_source;
+        assert!(
+            out.contains("let TAGS = __typhon_freeze__([\n"),
+            "expected open `__typhon_freeze__([`, got:\n{out}"
+        );
+        assert!(
+            out.contains("])\n") || out.contains("])\r\n"),
+            "expected closing `])` after the literal, got:\n{out}"
+        );
     }
 
     #[test]
