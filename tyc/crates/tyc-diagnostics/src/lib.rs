@@ -909,6 +909,27 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// Two `impl` / `extend` blocks (or one of each) on the same class
+    /// both define a method with the same name. The desugar pass would
+    /// silently emit both `def`s in the merged class body, Python takes
+    /// the last one, and one definition is lost without any warning.
+    /// N8 (2026-05-22).
+    #[error("method `{method}` is defined more than once on `{class_name}`")]
+    #[diagnostic(
+        code(tyc::duplicate_method),
+        url("https://typhon.dev/lang/diagnostics/duplicate_method"),
+        help("rename one of the methods, or merge the body of the second \
+              `impl {class_name}:` / `extend {class_name}:` block into the first")
+    )]
+    DuplicateMethod {
+        class_name: String,
+        method: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("redefined here")]
+        span: SourceSpan,
+    },
+
     /// An `impl NAME:` block targets a class that does not exist in the
     /// current module. The methods otherwise lower into a free-floating
     /// `__typhon_impl_NAME` pseudo-class that the merge pass silently
@@ -1903,6 +1924,23 @@ impl TycError {
     ) -> Self {
         Self::DuplicateClass {
             name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::DuplicateMethod`] diagnostic.
+    pub fn duplicate_method(
+        class_name: impl Into<String>,
+        method: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::DuplicateMethod {
+            class_name: class_name.into(),
+            method: method.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

@@ -59,6 +59,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "cyclic_type_alias",
         "div_by_zero_literal",
         "duplicate_class",
+        "duplicate_method",
         "extend_builtin",
         "freeze",
         "frozen_assign",
@@ -140,6 +141,7 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
             include_str!("../../../../../docs/diagnostics/div_by_zero_literal.md")
         }
         "duplicate_class" => include_str!("../../../../../docs/diagnostics/duplicate_class.md"),
+        "duplicate_method" => include_str!("../../../../../docs/diagnostics/duplicate_method.md"),
         "extend_builtin" => include_str!("../../../../../docs/diagnostics/extend_builtin.md"),
         "freeze" => include_str!("../../../../../docs/diagnostics/freeze.md"),
         "frozen_assign" => include_str!("../../../../../docs/diagnostics/frozen_assign.md"),

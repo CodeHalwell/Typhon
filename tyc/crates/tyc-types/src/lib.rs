@@ -3663,6 +3663,35 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
             if let Some(target) = pseudo.strip_prefix("__typhon_impl_") {
                 if c.class_shapes.contains_key(target) {
                     let impl_shape = collect_class_shape(cd, &classes);
+                    // N8 (2026-05-22): an `impl ClassName:` and
+                    // `extend ClassName:` (or two `impl`s, or two
+                    // `extend`s) that both define the same method are
+                    // silently merged by `merge_impl_blocks`, producing
+                    // two `def <name>` in the emitted class body —
+                    // Python takes the last one and one definition is
+                    // lost without any diagnostic. Detect the
+                    // collision here, *before* the dedup `or_insert`
+                    // below hides it, and anchor the span on the
+                    // duplicating method's name.
+                    {
+                        let target_shape = c.class_shapes.get(target).expect("checked above");
+                        for s in &cd.body {
+                            if let Stmt::FunctionDef(f) = s {
+                                let method = f.name.as_str();
+                                if target_shape.methods.contains_key(method) {
+                                    let span_start = f.name.range.start().to_usize();
+                                    c.diagnostics.push_error(TycError::duplicate_method(
+                                        target.to_owned(),
+                                        method.to_owned(),
+                                        c.path.clone(),
+                                        c.source,
+                                        span_start,
+                                        method.len().max(1),
+                                    ));
+                                }
+                            }
+                        }
+                    }
                     let target_shape = c.class_shapes.get_mut(target).expect("checked above");
                     for (m, sig) in impl_shape.methods {
                         target_shape.methods.entry(m).or_insert(sig);
@@ -9079,6 +9108,59 @@ def maybe_int(x: int) -> int:
                 .iter()
                 .any(|e| matches!(e, TycError::MissingReturn { .. })),
             "expected MissingReturn variant, got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn duplicate_method_via_impl_and_extend_is_rejected() {
+        // Regression for N8 (2026-05-22): `impl X:` and `extend X:` both
+        // defining `get` silently produced two `def get` in the merged
+        // class body — Python took the last one and one definition was
+        // lost. The shape-merge pass dedup'd on `or_insert`, hiding it.
+        let src = "\
+class Box:
+    value: int
+
+impl Box:
+    def get(self) -> int:
+        return self.value
+
+extend Box:
+    def get(self) -> int:
+        return self.value * 2
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::DuplicateMethod { method, .. } if method == "get")),
+            "duplicate method must surface a diagnostic, got: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn duplicate_method_across_two_impl_blocks_is_rejected() {
+        // Two `impl` blocks defining the same method also collide.
+        let src = "\
+class Box:
+    value: int
+
+impl Box:
+    def get(self) -> int:
+        return self.value
+
+impl Box:
+    def get(self) -> int:
+        return 0
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::DuplicateMethod { .. })),
+            "two impl blocks defining the same method must error: {:?}",
             d.errors()
         );
     }
