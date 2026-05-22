@@ -2664,6 +2664,268 @@ pub fn expand_lazy_lets(source: &str) -> String {
     expand_lazy_imports_with(source, false)
 }
 
+/// Rewrite typed tuple-unpacking `let` declarations into a temp +
+/// per-element sequence. N4 (2026-05-22).
+///
+/// Input shape: `let (NAME: TYPE, NAME: TYPE[, …]) = EXPR` — the
+/// parenthesised LHS must contain at least one `:`-annotated capture
+/// (otherwise the existing tuple-unpacking path handles it).
+///
+/// Output:
+///
+/// ```text
+///     let __typhon_unpack_N__ = EXPR
+///     let A: TA = __typhon_unpack_N__[0]
+///     let B: TB = __typhon_unpack_N__[1]
+/// ```
+///
+/// The pass is line-based and idempotent: it scans only lines whose
+/// `code` portion (string- and comment-aware) starts with `let (`
+/// and contains the `: TYPE` pattern. Other forms (untyped tuple let,
+/// `let NAME = …`, regular Python statements) are emitted verbatim.
+///
+/// One untyped capture mixed with typed ones is allowed —
+/// `let (a: int, b) = pair()` emits `let b = __typhon_unpack_N__[1]`
+/// with the inferred type.
+///
+/// Multi-line RHS expressions (the literal spans multiple physical
+/// lines) are *not* supported in v1 — Typhon source convention is to
+/// keep the unpacking call on one line. The pass leaves multi-line
+/// shapes untouched so the parser surfaces a clean error.
+pub fn expand_typed_let_unpack(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut counter: usize = 0;
+    let mut in_string: Option<StringMode> = None;
+
+    for line in source.split_inclusive('\n') {
+        let pre_string = in_string;
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let _code_end = scan_line_code_end(raw, &mut in_string);
+
+        if pre_string.is_some() {
+            out.push_str(line);
+            continue;
+        }
+
+        let indent_len = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
+        let indent = &raw[..indent_len];
+        let body = &raw[indent_len..];
+
+        let nl = if line.ends_with("\r\n") {
+            "\r\n"
+        } else if line.ends_with('\n') {
+            "\n"
+        } else {
+            ""
+        };
+
+        match parse_typed_let_unpack(body) {
+            Some(rewrite) => {
+                let tmp = format!("__typhon_unpack_{}__", counter);
+                counter += 1;
+                out.push_str(indent);
+                out.push_str("let ");
+                out.push_str(&tmp);
+                out.push_str(" = ");
+                out.push_str(&rewrite.rhs);
+                out.push_str(nl);
+                for (i, capture) in rewrite.captures.iter().enumerate() {
+                    out.push_str(indent);
+                    out.push_str("let ");
+                    out.push_str(&capture.name);
+                    if let Some(ty) = &capture.annotation {
+                        out.push_str(": ");
+                        out.push_str(ty);
+                    }
+                    out.push_str(" = ");
+                    out.push_str(&tmp);
+                    out.push('[');
+                    out.push_str(&i.to_string());
+                    out.push(']');
+                    out.push_str(nl);
+                }
+            }
+            None => {
+                out.push_str(line);
+            }
+        }
+    }
+
+    out
+}
+
+struct TypedLetUnpack {
+    captures: Vec<TypedLetCapture>,
+    rhs: String,
+}
+
+struct TypedLetCapture {
+    name: String,
+    annotation: Option<String>,
+}
+
+/// Recognise `let (a: int, b: str) = expr` on a single physical line.
+///
+/// Returns `None` for plain untyped destructuring (`let (a, b) = expr`)
+/// so that pattern keeps flowing through `preprocess`'s existing
+/// `let `-stripping path. We only intercept when at least one capture
+/// has a `:` annotation — that's the case the existing path can't
+/// handle.
+fn parse_typed_let_unpack(body: &str) -> Option<TypedLetUnpack> {
+    let after_let = body.strip_prefix("let ")?;
+    let after_paren = after_let.strip_prefix('(')?;
+    let bytes = after_paren.as_bytes();
+    // Find the matching `)` at depth 0, ignoring brackets inside
+    // annotations (`list[int]`, `tuple[int, str]`, …) and string
+    // literals.
+    let mut depth: i32 = 0;
+    let mut close: Option<usize> = None;
+    let mut in_str: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => in_str = Some(b),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                if depth == 0 && b == b')' {
+                    close = Some(i);
+                    break;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let close = close?;
+    let inside = &after_paren[..close];
+    let after_close = after_paren[close + 1..].trim_start();
+    let rhs = after_close.strip_prefix('=')?.trim();
+    if rhs.is_empty() {
+        return None;
+    }
+    // Split captures by top-level commas (commas inside `[...]` /
+    // `(...)` stay grouped so `dict[str, int]` survives).
+    let raw_captures = split_top_level_commas_lite(inside);
+    if raw_captures.is_empty() {
+        return None;
+    }
+    let mut captures: Vec<TypedLetCapture> = Vec::with_capacity(raw_captures.len());
+    let mut saw_annotation = false;
+    for cap in raw_captures {
+        let cap = cap.trim();
+        if cap.is_empty() {
+            return None;
+        }
+        let (name, annotation) = if let Some(colon) = find_top_level_colon(cap) {
+            saw_annotation = true;
+            (cap[..colon].trim(), Some(cap[colon + 1..].trim()))
+        } else {
+            (cap, None)
+        };
+        if !is_python_ident(name) {
+            return None;
+        }
+        captures.push(TypedLetCapture {
+            name: name.to_owned(),
+            annotation: annotation.map(|s| s.to_owned()),
+        });
+    }
+    if !saw_annotation {
+        // Pure untyped destructuring — let the existing path handle
+        // it so we don't introduce gratuitous temps.
+        return None;
+    }
+    Some(TypedLetUnpack {
+        captures,
+        rhs: rhs.to_owned(),
+    })
+}
+
+/// Top-level comma split that ignores brackets and string literals.
+/// A trimmed local copy so we don't have to wire up the larger
+/// `split_top_level_commas` helper in the LSP / migrate crate.
+fn split_top_level_commas_lite(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start = 0usize;
+    let mut in_str: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => in_str = Some(b),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => {
+                out.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(&s[start..]);
+    out
+}
+
+/// Find the byte position of the first top-level `:` in `s`, ignoring
+/// `:` characters inside bracket groups (`dict[str, int]`) and string
+/// literals. Returns `None` if `s` has no top-level `:`.
+fn find_top_level_colon(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_str: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => in_str = Some(b),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b':' if depth == 0 => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 pub fn expand_lazy_imports(source: &str) -> String {
     expand_lazy_imports_with(source, true)
 }
@@ -6178,6 +6440,79 @@ mod tests {
         let prep = preprocess(src);
         let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
         assert_eq!(out, src);
+    }
+
+    #[test]
+    fn typed_let_unpack_rewrites_to_temp_plus_lets() {
+        // Regression for N4 (2026-05-22): `let (a: int, b: str) = func()`
+        // used to be rejected because the parser doesn't accept typed
+        // tuple unpacking patterns. The pre-pass should rewrite it into
+        // a single temp + per-element typed lets.
+        let src = "def f() -> None:\n    let (a: int, b: str) = pair()\n";
+        let out = expand_typed_let_unpack(src);
+        assert!(
+            out.contains("__typhon_unpack_0__ = pair()"),
+            "expected temp + RHS, got:\n{out}"
+        );
+        assert!(
+            out.contains("let a: int = __typhon_unpack_0__[0]"),
+            "expected first capture, got:\n{out}"
+        );
+        assert!(
+            out.contains("let b: str = __typhon_unpack_0__[1]"),
+            "expected second capture, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn typed_let_unpack_handles_compound_annotations() {
+        // `dict[str, int]` and `tuple[int, ...]` must round-trip
+        // intact — the top-level-comma splitter has to ignore commas
+        // inside `[]`.
+        let src = "def f() -> None:\n    let (xs: list[int], m: dict[str, int]) = build()\n";
+        let out = expand_typed_let_unpack(src);
+        assert!(
+            out.contains("let xs: list[int] = __typhon_unpack_0__[0]"),
+            "list[int] annotation got mangled, output:\n{out}"
+        );
+        assert!(
+            out.contains("let m: dict[str, int] = __typhon_unpack_0__[1]"),
+            "dict[str, int] annotation got mangled, output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn typed_let_unpack_accepts_mixed_inferred_capture() {
+        // One typed + one inferred capture is still rewritten — the
+        // inferred slot omits the annotation so the type checker picks
+        // it up from the temp's subscript type.
+        let src = "def f() -> None:\n    let (a: int, b) = pair()\n";
+        let out = expand_typed_let_unpack(src);
+        assert!(
+            out.contains("let a: int = __typhon_unpack_0__[0]"),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains("let b = __typhon_unpack_0__[1]"),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn typed_let_unpack_leaves_untyped_destructuring_alone() {
+        // Pure untyped destructuring should NOT be intercepted — the
+        // existing `let `-stripping path handles `let (a, b) = pair()`
+        // directly without a temp.
+        let src = "def f() -> None:\n    let (a, b) = pair()\n";
+        let out = expand_typed_let_unpack(src);
+        assert!(
+            !out.contains("__typhon_unpack"),
+            "untyped destructuring must not gain a temp: {out}"
+        );
+        assert!(
+            out.contains("let (a, b) = pair()"),
+            "original line must be preserved verbatim, got:\n{out}"
+        );
     }
 
     #[test]

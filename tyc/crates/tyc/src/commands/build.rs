@@ -29,6 +29,7 @@ use tyc_emit::{emit_python_with_source_for_target, emit_stub};
 use tyc_format::format_source;
 use tyc_syntax::preprocess::{
     expand_gather_blocks, expand_go_calls, expand_inline_question_ops, expand_lazy_imports,
+    expand_typed_let_unpack,
     expand_multiline_guards, expand_pipes, expand_question_ops, expand_with_chains,
     line_byte_starts, preprocess,
 };
@@ -320,7 +321,9 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // first. O17 / FINDINGS #66 / R3.13 / E9.
         let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
             &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-                &expand_multiline_guards(&expand_lazy_imports(source)),
+                &expand_multiline_guards(&expand_lazy_imports(
+                    &expand_typed_let_unpack(source),
+                )),
             ))),
         )));
         let prep = preprocess(&expanded);
@@ -699,7 +702,9 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // works, then desugar to plain Python so the printer can emit it.
         let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
             &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-                &expand_multiline_guards(&expand_lazy_imports(&source)),
+                &expand_multiline_guards(&expand_lazy_imports(
+                    &expand_typed_let_unpack(&source),
+                )),
             ))),
         )));
         let prep = preprocess(&expanded);

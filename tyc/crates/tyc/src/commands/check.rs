@@ -19,7 +19,8 @@ use tyc_resolve::check_unknown_modules;
 use tyc_resolve::{check_unknown_modules_with, ImportVettingContext};
 use tyc_syntax::preprocess::{
     expand_gather_blocks, expand_go_calls, expand_inline_question_ops, expand_lazy_imports,
-    expand_multiline_guards, expand_pipes, expand_question_ops, expand_with_chains, preprocess,
+    expand_multiline_guards, expand_pipes, expand_question_ops, expand_typed_let_unpack,
+    expand_with_chains, preprocess,
 };
 
 use crate::commands::util::{apply_strictness, collect_dty_files, collect_ty_files};
@@ -663,7 +664,9 @@ fn run_unknown_module_check(path: &str, source: &str, ctx: &ImportVettingContext
 fn expand_for_check(source: &str) -> String {
     expand_question_ops(&expand_inline_question_ops(&expand_pipes(
         &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-            &expand_multiline_guards(&expand_lazy_imports(source)),
+            &expand_multiline_guards(&expand_lazy_imports(
+                &expand_typed_let_unpack(source),
+            )),
         ))),
     )))
 }
