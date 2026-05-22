@@ -440,8 +440,8 @@ fn rewrite_generic_class_base(line: &str) -> Option<String> {
     let bytes = rest_after_keyword.as_bytes();
     let mut depth: i32 = 0;
     let mut close: Option<usize> = None;
-    for i in open..bytes.len() {
-        match bytes[i] {
+    for (i, b) in bytes.iter().enumerate().skip(open) {
+        match *b {
             b'(' | b'[' => depth += 1,
             b')' => {
                 depth -= 1;

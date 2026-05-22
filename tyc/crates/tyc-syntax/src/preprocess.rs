@@ -2490,9 +2490,13 @@ fn questionmark_is_in_comprehension(code: &str, q_idx: usize) -> bool {
             b'(' | b'[' | b'{' => depth += 1,
             b')' | b']' | b'}' => {
                 if depth == 0 {
-                    // We've closed the enclosing bracket without seeing
-                    // a `for` — not a comprehension.
-                    return b == close_ch && false;
+                    // We've left the enclosing bracket without seeing
+                    // a `for` keyword — not a comprehension. The byte
+                    // *should* match `close_ch` for a well-formed
+                    // expression, but mismatched brackets would already
+                    // have failed parsing upstream, so we just bail.
+                    let _ = close_ch;
+                    return false;
                 }
                 depth -= 1;
             }
