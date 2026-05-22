@@ -1049,19 +1049,32 @@ pub enum TycError {
     /// `UserId` flows into an `int` slot freely (the runtime values
     /// are identical), but the reverse requires `UserId(x)` so the
     /// boundary is explicit at the call site.
-    #[error("`{name}({arg_type})` — newtype expects an argument of type `{base}`")]
+    ///
+    /// Two emit sites:
+    ///
+    /// - Constructor-arg mismatch: `UserId("seven")` against
+    ///   `newtype UserId = int` — argument fails to satisfy the base.
+    ///   `arg_type` is the wrong-typed argument; the label reads
+    ///   "type `str` is not a `int`".
+    /// - Boundary-passing mismatch: `fetch_user(42)` against
+    ///   `def fetch_user(uid: UserId): …` — a bare base-typed value
+    ///   flowing into a newtype slot. The label reads "wrap with
+    ///   `UserId(42)`".
+    #[error("expected `{name}`, found bare `{arg_type}`")]
     #[diagnostic(
         code(tyc::newtype_violation),
         url("https://typhon.dev/lang/diagnostics/newtype_violation"),
-        help("wrap the value in `{name}(...)` only when it really is a `{name}`; the base type is `{base}`")
+        help("wrap with `{name}({arg_type_short})` to satisfy the nominal newtype, \
+              or change the annotation to `{base}` if the nominal type isn't needed here")
     )]
     NewtypeViolation {
         name: String,
         base: String,
         arg_type: String,
+        arg_type_short: String,
         #[source_code]
         src: NamedSource<String>,
-        #[label("type `{arg_type}` is not a `{base}`")]
+        #[label("wrap with `{name}(...)`")]
         span: SourceSpan,
     },
 
@@ -2031,10 +2044,25 @@ impl TycError {
         offset: usize,
         length: usize,
     ) -> Self {
+        let arg_type = arg_type.into();
+        // Help text shows `{name}({arg_type_short})` — when the actual
+        // is the same name as the base (e.g. `int` against an `int`-
+        // newtype, the boundary case), drop the verbose type and just
+        // suggest the bare wrap call so the help reads cleanly.
+        let arg_type_short = if arg_type.contains(['[', '|', '<']) {
+            // Compound type — keep as-is so the hint is at least
+            // unambiguous, even if verbose.
+            arg_type.clone()
+        } else {
+            // Primitive / single-identifier — use a placeholder so the
+            // help doesn't read `UserId(int)` as if `int` were a value.
+            "value".to_owned()
+        };
         Self::NewtypeViolation {
             name: name.into(),
             base: base.into(),
-            arg_type: arg_type.into(),
+            arg_type,
+            arg_type_short,
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

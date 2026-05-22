@@ -2178,6 +2178,29 @@ impl<'a> Checker<'a> {
                 return;
             }
         }
+        // N7 (2026-05-22): when `expected` is a `newtype` whose base
+        // *would* accept `actual`, the generic "change the value, or
+        // update the annotation to `int`" help text points the user at
+        // the wrong fix — dropping the nominal type. The cheat-sheet
+        // promised `tyc::newtype_violation` for this case; surface the
+        // dedicated diagnostic instead so the help reads "wrap with
+        // `UserId(...)`".
+        if let Type::Class(exp_name) = expected {
+            if let Some(base) = self.newtypes.get(exp_name.as_str()).cloned() {
+                if self.is_assignable(&base, actual) {
+                    self.diagnostics.push_error(TycError::newtype_violation(
+                        exp_name,
+                        base.display(),
+                        actual.display(),
+                        &self.path,
+                        self.source,
+                        span.0,
+                        length,
+                    ));
+                    return;
+                }
+            }
+        }
         self.diagnostics.push_error(TycError::type_mismatch(
             expected.display(),
             actual.display(),
