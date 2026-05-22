@@ -34,6 +34,7 @@ use miette::{miette, Result};
 use tempfile::TempDir;
 
 use crate::commands::build::{self, BuildArgs};
+use crate::commands::check::{self, CheckArgs};
 use crate::config::TyphonConfig;
 
 /// Arguments for `tyc run`.
@@ -171,8 +172,24 @@ pub fn run(args: RunArgs) -> Result<()> {
 /// project root containing `src/main.ty`), then evaluates it. The script's
 /// `sys.argv` is populated from `args.script_args`, with `argv[0]` set to
 /// the entry-point path.
+///
+/// Before stepping the VM we run the same static checker `tyc check`
+/// would run, so Typhon-specific diagnostics (`unknown_name`,
+/// `pattern_shadows_outer`, `unsafe_value_leak`, `blocking_in_async`, …)
+/// surface consistently with `tyc build` instead of crashing the VM
+/// with a runtime `NameError` later. The `TYC_SKIP_CHECK=1` env var
+/// disables this for the rare case where you want the legacy
+/// run-only-the-VM behaviour (mostly: probing the VM against
+/// deliberately-broken inputs in stress harnesses).
 fn run_vm(args: RunArgs) -> Result<()> {
     let entry = resolve_vm_entry(&args.path)?;
+    if std::env::var_os("TYC_SKIP_CHECK").is_none() {
+        check::run(CheckArgs {
+            paths: vec![entry.clone()],
+            stubs: false,
+            quiet_success: true,
+        })?;
+    }
     let code = tyc_vm::run_file(&entry, &args.script_args).map_err(|e| miette!("{e}"))?;
     std::process::exit(code);
 }
