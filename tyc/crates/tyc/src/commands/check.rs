@@ -303,19 +303,26 @@ pub fn run(args: CheckArgs) -> Result<()> {
     // an error root (e.g. a repeated definition across passes).
     diags.dedup();
 
-    // Emit warnings regardless of whether there are errors.
-    for warn in diags.warnings() {
-        eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn.clone())));
-    }
+    render_diagnostics(&diags);
 
     if diags.has_errors() {
-        for err in diags.errors() {
-            eprintln!("{:?}", miette::Report::new_boxed(Box::new(err.clone())));
-        }
         return Err(miette!(
-            "{} error(s) in {} file(s)",
+            "{} error{} ({} unique code{}) in {} file{}{}",
             diags.error_count(),
-            file_count
+            if diags.error_count() == 1 { "" } else { "s" },
+            unique_code_count(diags.errors()),
+            if unique_code_count(diags.errors()) == 1 {
+                ""
+            } else {
+                "s"
+            },
+            file_count,
+            if file_count == 1 { "" } else { "s" },
+            if diags.warning_count() > 0 {
+                format!(" and {} warning(s)", diags.warning_count())
+            } else {
+                String::new()
+            },
         ));
     }
 
@@ -329,6 +336,150 @@ pub fn run(args: CheckArgs) -> Result<()> {
         println!("checked {} file(s) — no errors", file_count);
     }
     Ok(())
+}
+
+/// Render every diagnostic in `diags`, grouping by source file (so CI
+/// logs cluster related errors instead of interleaving by phase) and
+/// printing a per-code tally + `tyc explain` hint at the end. The
+/// previous renderer fired errors in the order they were collected,
+/// which scattered findings across files on multi-file projects.
+fn render_diagnostics(diags: &Diagnostics) {
+    use miette::Diagnostic;
+
+    // Group by `(severity, file)` so a warning in foo.ty doesn't get
+    // sandwiched between errors in bar.ty. Severity buckets stay in
+    // a fixed order: warnings first (advisory, easy to skim past),
+    // errors last (immediately visible above the summary line).
+    let warnings_by_file = group_by_file(diags.warnings());
+    let errors_by_file = group_by_file(diags.errors());
+
+    for (file, items) in &warnings_by_file {
+        eprintln!("── warnings in {} ──", file);
+        for w in items {
+            eprintln!("{:?}", miette::Report::new_boxed(Box::new((*w).clone())));
+        }
+    }
+    for (file, items) in &errors_by_file {
+        eprintln!("── errors in {} ──", file);
+        for e in items {
+            eprintln!("{:?}", miette::Report::new_boxed(Box::new((*e).clone())));
+        }
+    }
+
+    // Per-code tally + `tyc explain` hint. Only emitted when the file
+    // produced at least one diagnostic — silence on clean runs.
+    if diags.error_count() + diags.warning_count() == 0 {
+        return;
+    }
+    let mut counts: std::collections::BTreeMap<String, (usize, usize)> =
+        std::collections::BTreeMap::new();
+    for e in diags.errors() {
+        let code = e.code().map(|c| c.to_string()).unwrap_or_default();
+        counts.entry(code).or_default().0 += 1;
+    }
+    for w in diags.warnings() {
+        let code = w.code().map(|c| c.to_string()).unwrap_or_default();
+        counts.entry(code).or_default().1 += 1;
+    }
+    eprintln!();
+    eprintln!("── summary ──");
+    for (code, (errs, warns)) in &counts {
+        let display_code = if code.is_empty() {
+            "(uncoded)"
+        } else {
+            code.as_str()
+        };
+        match (errs, warns) {
+            (0, w) => eprintln!("  {} warning(s): {}", w, display_code),
+            (e, 0) => eprintln!("  {} error(s):   {}", e, display_code),
+            (e, w) => eprintln!("  {} error(s) + {} warning(s): {}", e, w, display_code),
+        }
+    }
+    // Surface the `tyc explain` workflow: most users don't realise the
+    // CLI bundles the docs catalogue, so the URL in the rendered
+    // miette output goes unclicked.
+    let first_code = counts
+        .keys()
+        .find(|c| !c.is_empty())
+        .map(|c| c.trim_start_matches("tyc::").to_owned());
+    if let Some(code) = first_code {
+        eprintln!();
+        eprintln!(
+            "  hint: run `tyc explain {}` for a full explanation (and try `tyc explain --list` to browse all codes).",
+            code
+        );
+    }
+}
+
+/// Group a diagnostic slice by primary file path, preserving the
+/// first-seen order so the output keeps a deterministic shape.
+/// Diagnostics whose file path can't be recovered (a few of the older
+/// path-less variants, like the generic shape used by `Comptime`)
+/// fall into a synthetic "(no location)" bucket so they still
+/// surface instead of being silently dropped.
+fn group_by_file(items: &[TycError]) -> Vec<(String, Vec<&TycError>)> {
+    let mut order: Vec<String> = Vec::new();
+    let mut buckets: std::collections::HashMap<String, Vec<&TycError>> =
+        std::collections::HashMap::new();
+    for item in items {
+        let file = extract_path_hint(item).unwrap_or_else(|| "(no location)".to_owned());
+        if !buckets.contains_key(&file) {
+            order.push(file.clone());
+        }
+        buckets.entry(file).or_default().push(item);
+    }
+    order
+        .into_iter()
+        .map(|f| {
+            let items = buckets.remove(&f).unwrap_or_default();
+            (f, items)
+        })
+        .collect()
+}
+
+/// Heuristic: pull a file path out of a `TycError`'s `Debug` form by
+/// looking for the `path:` field every variant embeds. Robust enough
+/// for grouping (worst case: diagnostics with the same path land in
+/// separate buckets if the Debug format changes, which only affects
+/// the visual grouping — render is unchanged).
+fn extract_path_hint(err: &TycError) -> Option<String> {
+    let dbg = format!("{:?}", err);
+    // Variants like `WrongArgCount { name: "f", src: NamedSource { name: "./src/b.ty", … } }`
+    // have a `name:` field *outside* the NamedSource that holds the
+    // callee or symbol name — picking the first match would group
+    // every WrongArgCount under "f" instead of the file path.
+    // Anchor on the prefix `NamedSource { name:` so we always pull the
+    // path embedded inside the source-code field.
+    let ns_key = "NamedSource { name: \"";
+    if let Some(start) = dbg.find(ns_key) {
+        let rest = &dbg[start + ns_key.len()..];
+        if let Some(end) = rest.find('"') {
+            return Some(rest[..end].to_owned());
+        }
+    }
+    // Fallback: `path: "..."` for variants without a NamedSource
+    // (`Io`, the generic shapes).
+    let key = "path: \"";
+    if let Some(start) = dbg.find(key) {
+        let rest = &dbg[start + key.len()..];
+        if let Some(end) = rest.find('"') {
+            return Some(rest[..end].to_owned());
+        }
+    }
+    None
+}
+
+/// Count unique diagnostic codes across an error slice — fed into the
+/// summary line so the user gets "3 errors (2 unique codes)" rather
+/// than just a raw count. Helps recognise repeated patterns.
+fn unique_code_count(items: &[TycError]) -> usize {
+    use miette::Diagnostic;
+    let mut codes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for item in items {
+        let code = item.code().map(|c| c.to_string()).unwrap_or_default();
+        codes.insert(code);
+    }
+    codes.len()
 }
 
 /// Run the secondary check passes — comptime evaluation, purity

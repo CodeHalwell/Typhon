@@ -344,6 +344,14 @@ impl Backend {
         // bindings in the module's top-level scope. Skip relative
         // imports (resolver writes them as `.` / `..foo`) — those are
         // project-local and don't go through venv introspection.
+        //
+        // For each import, prewarm BOTH the bare module path and any
+        // dotted submodule the user typed. Without the submodule
+        // pass, `import torch.nn as nn` would only prewarm `torch`
+        // (a noisy `dir(torch)` call) and the user's first `nn.<dot>`
+        // would block on the slow first-import of `torch.nn`. Pre-
+        // warming `torch.nn` directly here means the completion path
+        // hits a cached entry.
         let mut modules: std::collections::HashSet<String> = std::collections::HashSet::new();
         if let Some(scope0) = resolved.scopes.first() {
             for binding in &scope0.bindings {
@@ -351,7 +359,24 @@ impl Backend {
                     if info.module.starts_with('.') || info.module.is_empty() {
                         continue;
                     }
+                    // Always warm the full dotted module path the user
+                    // referenced (`torch.nn`, `numpy.linalg`).
                     modules.insert(info.module.clone());
+                    // `from foo.bar import baz` may also expose `baz`
+                    // as a submodule — warm `foo.bar.baz` in case it
+                    // resolves to a module rather than a class/value.
+                    // The introspection cache records the success/
+                    // failure either way, so a non-module member here
+                    // costs one subprocess and is forgotten.
+                    if let Some(member) = info.member.as_deref() {
+                        if !member.is_empty()
+                            && member
+                                .chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        {
+                            modules.insert(format!("{}.{}", info.module, member));
+                        }
+                    }
                 }
             }
         }
@@ -564,13 +589,15 @@ impl LanguageServer for Backend {
         // Cache miss / no venv / parse failure → empty entry, which
         // disables kwarg colouring for that callee (white) without
         // affecting the rest of the file.
-        let callee_signatures = self.build_callee_signatures(&uri, &resolved).await;
+        let (callee_signatures, attribute_kinds) =
+            self.build_callee_signatures(&uri, &resolved).await;
         let tokens = semantic::compute(
             &preprocessed,
             &resolved,
             &module,
             stdlib,
             &callee_signatures,
+            &attribute_kinds,
         );
         Ok(Some(SemanticTokensResult::Tokens(tokens)))
     }
@@ -852,11 +879,12 @@ impl Backend {
         &self,
         uri: &Uri,
         resolved: &tyc_resolve::ResolvedModule,
-    ) -> semantic::CalleeSignatures {
-        use semantic::CalleeSignatures;
+    ) -> (semantic::CalleeSignatures, semantic::AttributeKinds) {
+        use semantic::{AttributeKinds, CalleeSignatures};
         let mut out = CalleeSignatures::new();
+        let mut attr_kinds = AttributeKinds::new();
         let Some((root, cache)) = self.introspection_cache_for(uri).await else {
-            return out;
+            return (out, attr_kinds);
         };
         // Two shapes of import the kwarg classifier handles:
         //
@@ -900,7 +928,7 @@ impl Backend {
             }
         }
         if named_wanted.is_empty() && bare_wanted.is_empty() {
-            return out;
+            return (out, attr_kinds);
         }
         let mut by_module: std::collections::HashMap<String, Vec<(String, String)>> =
             std::collections::HashMap::new();
@@ -917,12 +945,13 @@ impl Backend {
                 acc
             });
         let root = root.clone();
-        let pairs = tokio::task::spawn_blocking(move || {
+        let (signature_pairs, attr_pairs) = tokio::task::spawn_blocking(move || {
             let mut guard = match cache.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
             let mut signatures: Vec<(String, semantic::CalleeSignature)> = Vec::new();
+            let mut attrs: Vec<(String, String)> = Vec::new();
             for (module, members_wanted) in by_module {
                 let Some(members) = guard.members(&root, &module) else {
                     continue;
@@ -931,37 +960,49 @@ impl Backend {
                     let Some(m) = members.iter().find(|m| m.name == member_name) else {
                         continue;
                     };
-                    let Some(sig) = m.signature.as_deref() else {
-                        continue;
-                    };
-                    signatures.push((binding_name, semantic::parse_signature(sig)));
+                    if let Some(sig) = m.signature.as_deref() {
+                        signatures.push((binding_name.clone(), semantic::parse_signature(sig)));
+                    }
+                    // `from M import N` exposes N directly; future
+                    // chained attribute access (`N.something`) would
+                    // need a second introspection on N, which we
+                    // don't do here. Recording the kind for N alone
+                    // is unused by the attribute walker (which only
+                    // keys `<receiver>.<attr>` shapes), so we skip
+                    // the entry for the named case.
                 }
             }
             // Bare imports: emit `binding.Foo` keys so attribute
             // callees (`agent_framework.Agent(client=…)`) can match
-            // the same lookup path.
+            // the same lookup path, AND record each member's kind so
+            // the semantic-token pass can paint `nn.Module` as a
+            // class instead of a generic property.
             for (module, binding_names) in bare_by_module {
                 let Some(members) = guard.members(&root, &module) else {
                     continue;
                 };
                 for m in members.iter() {
-                    let Some(sig) = m.signature.as_deref() else {
-                        continue;
-                    };
-                    let parsed = semantic::parse_signature(sig);
+                    let parsed = m.signature.as_deref().map(semantic::parse_signature);
                     for binding_name in &binding_names {
-                        signatures.push((format!("{}.{}", binding_name, m.name), parsed.clone()));
+                        let key = format!("{}.{}", binding_name, m.name);
+                        if let Some(sig) = &parsed {
+                            signatures.push((key.clone(), sig.clone()));
+                        }
+                        attrs.push((key, m.kind.clone()));
                     }
                 }
             }
-            signatures
+            (signatures, attrs)
         })
         .await
         .unwrap_or_default();
-        for (name, sig) in pairs {
+        for (name, sig) in signature_pairs {
             out.insert(name, sig);
         }
-        out
+        for (key, kind) in attr_pairs {
+            attr_kinds.insert(key, kind);
+        }
+        (out, attr_kinds)
     }
 }
 
@@ -1007,39 +1048,35 @@ impl Backend {
         let def = symbol.definition?;
         let import_info = def.import_info.as_ref()?;
         let (root, cache) = self.introspection_cache_for(uri).await?;
-        // `from M import N` → look up member `N` on module `M`.
-        // `import M` / `import M as N` → no specific member; we just
-        //   surface the module path so the hover still has *some*
-        //   context. Fetching the module's full member list for the
-        //   bare-import case isn't useful without a name to look up.
-        let members = if import_info.member.is_some() {
-            // Move the blocking introspection off the async runtime —
-            // the sync `Mutex::lock` + potential subprocess spawn
-            // inside `members()` would otherwise stall the LSP if the
-            // cache happened to be cold (the prewarm pass mostly
-            // prevents this, but we keep the off-runtime hop as a
-            // safety net).
-            let module = import_info.module.clone();
-            let root = root.clone();
-            tokio::task::spawn_blocking(move || {
-                // Recover from a poisoned mutex rather than silently
-                // disabling hover extras for the rest of the session.
-                // A poisoned cache still has valid `MemberInfo`
-                // entries from any prior successful introspection;
-                // the completion path uses the same recovery shape.
-                let mut guard = match cache.lock() {
-                    Ok(g) => g,
-                    Err(p) => p.into_inner(),
-                };
-                guard.members(&root, &module)
-            })
-            .await
-            .ok()
-            .flatten()
-        } else {
-            None
-        };
-        let target_name = import_info.member.as_deref().unwrap_or("");
+        // Run the cache lookup off the async runtime. The lookup can
+        // shell to `python` on a cold miss; doing it on the LSP's
+        // single-threaded runtime would stall every other request.
+        let module = import_info.module.clone();
+        let member_name = import_info.member.clone();
+        let root_for_task = root.clone();
+        let lookup_result: (
+            Option<Arc<Vec<venv_introspect::MemberInfo>>>,
+            Option<venv_introspect::IntrospectionFailure>,
+            Option<std::path::PathBuf>,
+        ) = tokio::task::spawn_blocking(move || {
+            // Recover from a poisoned mutex rather than silently
+            // disabling hover extras for the rest of the session.
+            // A poisoned cache still has valid `MemberInfo` entries
+            // from any prior successful introspection; the
+            // completion path uses the same recovery shape.
+            let mut guard = match cache.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let members = guard.members(&root_for_task, &module);
+            let failure = guard.last_failure(&module).cloned();
+            let python = guard.python_bin().map(|p| p.to_path_buf());
+            (members, failure, python)
+        })
+        .await
+        .ok()?;
+        let (members, failure, python_bin) = lookup_result;
+        let target_name = member_name.as_deref().unwrap_or("");
         let mut out = String::new();
         out.push_str(&format!("📦 from `{}`", import_info.module));
         if !target_name.is_empty() {
@@ -1061,11 +1098,47 @@ impl Backend {
                         sig_tail(sig, target_name)
                     ));
                 }
+                if let Some(bases) = member.bases.as_ref().filter(|b| !b.is_empty()) {
+                    out.push_str("\n\n*inherits:* ");
+                    for (i, base) in bases.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(" → ");
+                        }
+                        out.push('`');
+                        out.push_str(base);
+                        out.push('`');
+                    }
+                }
+                if let Some(methods) = member.methods.as_ref().filter(|m| !m.is_empty()) {
+                    out.push_str("\n\n*methods:* ");
+                    for (i, m) in methods.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        out.push('`');
+                        out.push_str(m);
+                        out.push_str("()`");
+                    }
+                }
                 if let Some(doc) = &member.documentation {
                     out.push_str("\n\n");
                     out.push_str(&render_docstring(doc));
                 }
+            } else if let Some(reason) =
+                render_introspection_failure(&failure, python_bin.as_deref(), &import_info.module)
+            {
+                out.push_str("\n\n");
+                out.push_str(&reason);
             }
+        } else if let Some(reason) =
+            render_introspection_failure(&failure, python_bin.as_deref(), &import_info.module)
+        {
+            // Bare `import torch` — no member to look up, but if the
+            // module itself failed to introspect we still surface the
+            // hint so the user can fix the install / venv before
+            // they get to completion.
+            out.push_str("\n\n");
+            out.push_str(&reason);
         }
         Some(out)
     }
@@ -2759,6 +2832,67 @@ fn diagnostic_code_matches(diag: &Diagnostic, wanted: &str) -> bool {
         Some(NumberOrString::String(s)) => s == wanted,
         _ => false,
     }
+}
+
+/// Render the human-friendly explanation for a failed venv
+/// introspection so the hover popover surfaces actionable next steps
+/// instead of silently omitting the body. Common cases:
+///
+/// - `NoPython` — no `.venv/bin/python` and no `python3` on `PATH`.
+///   Suggest running `tyc sync` (creates the venv) or installing
+///   Python.
+/// - `ImportFailed` — the chosen interpreter ran but couldn't import
+///   the module. Almost always means the package isn't installed in
+///   *that* interpreter, even though it may be installed elsewhere.
+/// - `Timeout` — exceeded the 10-second cap. Rare; usually points at
+///   a misbehaving import-time side effect.
+/// - `SpawnFailed` — `python` couldn't be launched at all.
+///
+/// Returns `None` when there's nothing actionable to surface (no
+/// failure recorded — meaning introspection just hasn't been
+/// attempted yet for this name).
+fn render_introspection_failure(
+    failure: &Option<venv_introspect::IntrospectionFailure>,
+    python_bin: Option<&std::path::Path>,
+    module: &str,
+) -> Option<String> {
+    let failure = failure.as_ref()?;
+    let interp_hint = |p: &std::path::Path| format!("`{}`", p.display());
+    let body = match failure {
+        venv_introspect::IntrospectionFailure::NoPython => {
+            "⚠️ no Python interpreter found — autocomplete is disabled. \
+             Create a venv with `tyc sync` or install Python and ensure \
+             `python3` is on your `PATH`."
+                .to_owned()
+        }
+        venv_introspect::IntrospectionFailure::ImportFailed { python_bin } => format!(
+            "⚠️ `{module}` is not importable in {bin}. \
+             Install it with `tyc add {root}` (or `uv pip install {root}` \
+             from your project root).",
+            module = module,
+            bin = interp_hint(python_bin),
+            root = module.split('.').next().unwrap_or(module),
+        ),
+        venv_introspect::IntrospectionFailure::Timeout { python_bin } => format!(
+            "⚠️ importing `{module}` in {bin} timed out after 10s — \
+             the package may have an expensive import-time side effect. \
+             Try `python -c 'import {module}'` directly to reproduce.",
+            module = module,
+            bin = interp_hint(python_bin),
+        ),
+        venv_introspect::IntrospectionFailure::SpawnFailed { python_bin } => format!(
+            "⚠️ could not launch {bin} to introspect `{module}` — \
+             check that the interpreter is executable.",
+            bin = interp_hint(python_bin),
+            module = module,
+        ),
+    };
+    // `python_bin` arg is passed through but the per-variant data already
+    // carries the path on the variants that need it; the outer arg is
+    // available for future extensions (e.g. listing which interpreter
+    // the cache fell back to).
+    let _ = python_bin;
+    Some(body)
 }
 
 /// Render the hover body for a resolved symbol.  Uses GitHub-flavoured

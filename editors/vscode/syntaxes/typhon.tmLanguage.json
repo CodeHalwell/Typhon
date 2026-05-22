@@ -13,6 +13,7 @@
       "patterns": [
         { "include": "#import" },
         { "include": "#class-declaration" },
+        { "include": "#newtype-declaration" },
         { "include": "#function-declaration" },
         { "include": "#impl-declaration" },
         { "include": "#interface-declaration" },
@@ -61,6 +62,19 @@
     "decorators": {
       "patterns": [
         {
+          "comment": "Typhon-specific decorators (@pure / @memo / @gatherable) get a distinct scope so themes can colour them like the language keywords they really are, rather than as generic library decorators. Pattern matches the standalone keyword name; @pure(memo=True) and @memo(max=128) keep the parenthesised arguments highlighted by the trailing expression include.",
+          "name": "meta.decorator.builtin.typhon",
+          "begin": "^\\s*(@)\\s*(pure|memo|gatherable)\\b",
+          "beginCaptures": {
+            "1": { "name": "punctuation.definition.decorator.typhon" },
+            "2": { "name": "storage.modifier.decorator.builtin.typhon" }
+          },
+          "end": "$",
+          "patterns": [
+            { "include": "#expression" }
+          ]
+        },
+        {
           "name": "meta.decorator.typhon",
           "begin": "^\\s*(@)\\s*([A-Za-z_][\\w.]*)",
           "beginCaptures": {
@@ -98,10 +112,15 @@
     },
 
     "class-declaration": {
-      "begin": "\\b(class|model)\\s+([A-Za-z_]\\w*)",
+      "comment": "Matches every supported class form: bare `class Foo`, `pub class Foo`, `plain class Bag`, `class! MyModel` (raw / framework-base marker), `model ApiUser`, with an optional trailing `frozen` modifier (`class P frozen:` -> dataclass(frozen=True)). Capture group 5 picks up the name; capture group 6 catches the `frozen` keyword after the name.",
+      "begin": "\\b(?:(pub)\\s+)?(?:(plain)\\s+)?(class|model)(!)?\\s+([A-Za-z_]\\w*)(?:\\s+(frozen))?",
       "beginCaptures": {
-        "1": { "name": "storage.type.class.typhon" },
-        "2": { "name": "entity.name.type.class.typhon" }
+        "1": { "name": "storage.modifier.pub.typhon" },
+        "2": { "name": "storage.modifier.plain.typhon" },
+        "3": { "name": "storage.type.class.typhon" },
+        "4": { "name": "keyword.operator.raw-class.typhon" },
+        "5": { "name": "entity.name.type.class.typhon" },
+        "6": { "name": "storage.modifier.frozen.typhon" }
       },
       "end": ":|$",
       "endCaptures": {
@@ -110,6 +129,15 @@
       "patterns": [
         { "include": "#expression" }
       ]
+    },
+
+    "newtype-declaration": {
+      "comment": "`newtype Name = Base` introduces a nominal alias over a primitive. Highlighting the keyword distinctly and tagging the LHS as an entity.name.type makes the intent obvious at a glance.",
+      "match": "\\b(newtype)\\s+([A-Za-z_]\\w*)\\s*=",
+      "captures": {
+        "1": { "name": "storage.type.newtype.typhon" },
+        "2": { "name": "entity.name.type.newtype.typhon" }
+      }
     },
 
     "interface-declaration": {
@@ -217,13 +245,15 @@
     },
 
     "binding-declaration": {
-      "match": "\\b(?:(comptime|lazy)\\s+)?(?:(comptime|lazy)\\s+)?(let|mut|val|var)\\s+(?:(mut)\\s+)?([A-Za-z_]\\w*)",
+      "comment": "Supports the v0.3.0 surface: `pub let X`, `freeze let X`, `pub freeze let X`, `comptime let X`, `lazy let X`, and any pair-wise combo. The leading-modifier slot accepts up to three modifiers so users don't see grammar fall-through on stacked keywords like `pub comptime let`.",
+      "match": "\\b(?:(pub|freeze|comptime|lazy)\\s+)?(?:(pub|freeze|comptime|lazy)\\s+)?(?:(pub|freeze|comptime|lazy)\\s+)?(let|mut|val|var)\\s+(?:(mut)\\s+)?([A-Za-z_]\\w*)",
       "captures": {
         "1": { "name": "storage.modifier.typhon" },
         "2": { "name": "storage.modifier.typhon" },
-        "3": { "name": "storage.type.binding.typhon" },
-        "4": { "name": "storage.modifier.mut.typhon" },
-        "5": { "name": "variable.other.declaration.typhon" }
+        "3": { "name": "storage.modifier.typhon" },
+        "4": { "name": "storage.type.binding.typhon" },
+        "5": { "name": "storage.modifier.mut.typhon" },
+        "6": { "name": "variable.other.declaration.typhon" }
       }
     },
 
@@ -243,7 +273,11 @@
         },
         {
           "name": "storage.modifier.typhon",
-          "match": "\\b(comptime|lazy|unsafe|pure|memo)\\b"
+          "match": "\\b(comptime|lazy|unsafe|pure|memo|pub|freeze|frozen|plain)\\b"
+        },
+        {
+          "name": "storage.type.newtype.typhon",
+          "match": "\\b(newtype)\\b"
         },
         {
           "name": "keyword.control.typhon.typhon",
