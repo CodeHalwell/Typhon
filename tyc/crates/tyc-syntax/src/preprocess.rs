@@ -2248,6 +2248,22 @@ pub fn validate_question_ops(source: &str) -> Vec<QuestionOpError> {
         // function returning `Result[T, E]`). O17 / FINDINGS #66.
         for offset in find_mid_expression_questionmarks(code) {
             let q_offset = byte_offset + offset;
+            // N2 (2026-05-22): `?` inside a comprehension body would lift
+            // the call out to a temp *before* the comprehension's `for`
+            // binding came into scope, which produced a misleading
+            // "name not in scope" error against rewritten code the user
+            // didn't write. Reject up front with a targeted message.
+            if questionmark_is_in_comprehension(code, offset) {
+                errors.push(QuestionOpError {
+                    line_index,
+                    offset: q_offset,
+                    message: "`?` operator cannot appear inside a list / dict / set / \
+                             generator comprehension; rewrite the comprehension as an explicit \
+                             `for` loop that threads the `Err` short-circuit through"
+                        .to_owned(),
+                });
+                continue;
+            }
             match fn_stack.last() {
                 None => {
                     errors.push(QuestionOpError {
@@ -2384,6 +2400,132 @@ fn find_mid_expression_questionmarks(code: &str) -> Vec<usize> {
         i += 1;
     }
     out
+}
+
+/// Return `true` when the `?` at byte position `q_idx` in `code` sits
+/// inside the *expression* portion of a comprehension — i.e. there is
+/// an unbalanced opening bracket `[` / `(` / `{` to its left, and the
+/// next `for` keyword at that bracket depth appears to its right
+/// before the closing bracket.
+///
+/// Used by [`validate_question_ops`] to surface a targeted error for
+/// `[parse(s)? for s in items]` (N2). The `?` lifter would otherwise
+/// hoist the call out *above* the `for s in items` binding and produce
+/// a misleading "name `s` not in scope" against text the user didn't
+/// write. We could rewrite the comprehension into a manual loop, but
+/// the resulting code lays out very differently from what the user
+/// wrote, so rejecting up-front with a clear message is the cleaner
+/// behaviour.
+fn questionmark_is_in_comprehension(code: &str, q_idx: usize) -> bool {
+    let bytes = code.as_bytes();
+    if q_idx >= bytes.len() {
+        return false;
+    }
+    // Track bracket depth from the start of the line up to the `?`.
+    // We record the (depth, position) of the most recent unbalanced
+    // opening bracket so we can know which group to scan for `for`.
+    let mut stack: Vec<usize> = Vec::new();
+    let mut in_str: Option<u8> = None;
+    let mut i = 0;
+    while i < q_idx {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'#' => return false, // `?` after a comment makes no sense, but be safe.
+            b'\'' | b'"' => in_str = Some(b),
+            b'(' | b'[' | b'{' => stack.push(i),
+            b')' | b']' | b'}' => {
+                stack.pop();
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    // No enclosing open bracket → can't be in a comprehension.
+    let open_pos = match stack.last().copied() {
+        Some(p) => p,
+        None => return false,
+    };
+    let open_ch = bytes[open_pos];
+    let close_ch = match open_ch {
+        b'(' => b')',
+        b'[' => b']',
+        b'{' => b'}',
+        _ => return false,
+    };
+    // Now scan forward from `?` looking for the matching close. While
+    // we're at the *outermost* bracket level we entered, we look for
+    // the `for ` token: a whole word `for` (with a space / paren on
+    // either side). The first `for` we see at that depth flags the
+    // enclosing bracket pair as a comprehension.
+    let mut depth: i32 = 0;
+    let mut in_str: Option<u8> = None;
+    let mut j = q_idx + 1;
+    while j < bytes.len() {
+        let b = bytes[j];
+        if let Some(q) = in_str {
+            if b == b'\\' && j + 1 < bytes.len() {
+                j += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            j += 1;
+            continue;
+        }
+        match b {
+            b'#' => break,
+            b'\'' | b'"' => in_str = Some(b),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                if depth == 0 {
+                    // We've closed the enclosing bracket without seeing
+                    // a `for` — not a comprehension.
+                    return b == close_ch && false;
+                }
+                depth -= 1;
+            }
+            // `for` token at our outer depth (depth == 0 inside the
+            // enclosing bracket means we're at the body level of the
+            // bracket group, not inside a nested call).
+            b'f' if depth == 0 && is_word_for(bytes, j) => return true,
+            _ => {}
+        }
+        j += 1;
+    }
+    false
+}
+
+/// `true` when bytes `[i..i+3]` spells `for` *and* `for` is a whole
+/// word (the byte before is non-identifier-continuation, the byte after
+/// is non-identifier-continuation). Used by
+/// [`questionmark_is_in_comprehension`] so we don't misfire on
+/// substrings like `format(...)` or `before` inside a bracket group.
+fn is_word_for(bytes: &[u8], i: usize) -> bool {
+    if i + 3 > bytes.len() {
+        return false;
+    }
+    if &bytes[i..i + 3] != b"for" {
+        return false;
+    }
+    let prev_ok = i == 0 || !is_ident_byte(bytes[i - 1]);
+    let next_ok = i + 3 >= bytes.len() || !is_ident_byte(bytes[i + 3]);
+    prev_ok && next_ok
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b == b'_' || b.is_ascii_alphanumeric()
 }
 
 /// Return `true` when `ret` is the `Result` identifier (bare or subscripted).
@@ -6036,6 +6178,54 @@ mod tests {
         let prep = preprocess(src);
         let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
         assert_eq!(out, src);
+    }
+
+    #[test]
+    fn questionmark_in_list_comprehension_is_rejected() {
+        // Regression for N2 (2026-05-22): the inline `?` lifter used to
+        // hoist `parse(s)?` *above* the comprehension's `for s in items`
+        // binding, then complained that `s` wasn't in scope. Reject it
+        // here with a targeted message instead.
+        let src = "def f(xs: list[str]) -> Result[list[int], str]:\n    \
+                   let ys: list[int] = [parse(s)? for s in xs]\n    \
+                   return Ok(ys)\n";
+        let errors = validate_question_ops(src);
+        assert_eq!(
+            errors.len(),
+            1,
+            "expected one comprehension error, got {errors:?}"
+        );
+        assert!(
+            errors[0].message.contains("comprehension"),
+            "expected comprehension-specific message, got: {}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn questionmark_in_dict_comprehension_is_rejected() {
+        let src = "def f(xs: list[str]) -> Result[dict[str, int], str]:\n    \
+                   let m: dict[str, int] = {s: parse(s)? for s in xs}\n    \
+                   return Ok(m)\n";
+        let errors = validate_question_ops(src);
+        assert!(
+            errors.iter().any(|e| e.message.contains("comprehension")),
+            "expected comprehension error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn questionmark_in_argument_position_still_works() {
+        // The argument-position case must NOT be flagged as a
+        // comprehension. (Same line shape — `( ... )` brackets — but
+        // no `for` keyword inside.)
+        let src = "def f(a: str, b: str) -> Result[int, str]:\n    \
+                   return Ok(add(parse(a)?, parse(b)?))\n";
+        let errors = validate_question_ops(src);
+        assert!(
+            errors.is_empty(),
+            "expected no errors for arg-position `?`, got {errors:?}"
+        );
     }
 
     #[test]
