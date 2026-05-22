@@ -337,7 +337,11 @@ regress under the Phase 5 churn:
   is a same-module `async def` and the awaits are statically independent.
   Opt-in via `[strictness] auto-gather = true`. The desugar pass injects
   `import asyncio` if missing.
-- Loop parallelisation for pure comprehensions on free-threaded Python.
+- ✅ **Loop parallelisation for pure comprehensions on free-threaded Python.**
+  `[strictness] auto-parallel = true` rewrites qualifying
+  `[f(x) for x in xs]` comprehensions into `typhon_runtime.parallel.map_pure`
+  calls; the pass is in `tyc-analyse/src/parallel.rs` and is gated on the
+  callee appearing in the proved-pure set from the six-condition check.
 - Richer comptime: `comptime` functions, types as values.
 - ✅ **PGO via `tyc profile`**. When `[strictness] pgo-memoise = true`,
   `tyc build` loads `typhon-profile.json` from the project root and
@@ -354,13 +358,13 @@ regress under the Phase 5 churn:
   for every `tyc::unused_import` diagnostic in range. Cross-file
   go-to-definition across `.ty` / `.py` boundaries via source maps is
   still pending the v2 source-map format.
-- Migration tooling from typed `.py` to `.ty` (`Optional[T]` → `T?`, dataclasses → Typhon classes, etc.).
-- **`ty` integration** as a complementary second-stage checker over the
-  desugared Python. Planned in two phases: first as a subprocess
-  invocation of `ty check` with diagnostic attribution via the source
-  maps (no dependency on the Ruff vendor), later as an embedded
-  library sharing the Salsa db. See [docs/ty-integration.md](ty-integration.md)
-  for the full plan.
+- ✅ **Migration tooling** (`tyc migrate`): rewrites `Optional[T]` → `T?`,
+  adds `let`/`mut`, drops `@dataclass` decorators + import, with `--check`
+  for CI preview mode.
+- ✅ **`ty` integration (Phase 1)**: `tyc ty` invokes Astral's `ty check`
+  as a subprocess over the emitted Python, attributing diagnostics back
+  through the `.py.map` source maps. See [ty-integration.md](ty-integration.md).
+  Phase 2 (embedded library sharing the Salsa db) is still outstanding.
 
 ## Scope-cutting rule
 
@@ -369,23 +373,29 @@ The minimum-viable Typhon is **non-null types + sealed unions + `Result` + datac
 ## Concrete next steps
 
 Phases 0–3 are complete. Phase 5 — interop and developer experience —
-shipped in v0.1.6. Phase 4+ work (everything not on the headline path)
-remains the open frontier:
+shipped in v0.1.6. Phase 5.5 (constructor/method arity) shipped in v0.2.0.
+v0.3.0 added `newtype`, `freeze let`, `pub`, and five new diagnostics.
 
-1. Corpus round-trip sweep: run `tyc build` over a representative set of
-   third-party Python projects and compare the emitted `.py` against the
-   source semantically. Not a blocker (the test suite is green), but
-   hardens confidence.
-2. Promote `bind_typevars_and_substitute` into a proper structural
-   sub-type checker that handles variance and bounded higher-kinded forms.
-3. Expand the Salsa boundary: make `resolve_module` and `check_module` into
-   Salsa-tracked queries so the LSP second-check latency drops to near-zero
-   for unchanged files.
-4. Loop parallelisation for pure comprehensions on free-threaded Python.
-5. Broaden the Phase-5.2 `tyc::python_semantic_drift` audit: catalogue
-   every accepted-by-Python shape the checker still rejects (beyond `or`
-   /`and` and `Generator → Iterable` which already landed) and either fix
-   it or downgrade to a warning.
-6. A Typhon-native source-mapping debugger that drives breakpoints
-   directly against `.ty` source instead of through `--break TY:LINE`
-   translation on top of `pdb`.
+Items marked ✅ are implemented; open items are the active work queue.
+
+1. ✅ **Corpus round-trip sweep**: `tyc check` over all 48 `.ty` examples
+   runs as a CI-enforced integration test (`tests/pipeline.rs` →
+   `corpus_examples_all_check_clean`). Every commit must keep all examples
+   clean. A broader sweep over third-party Python projects is a future
+   hardening task.
+2. ✅ **Variance and bounded typevar checking**: the `Variance` enum with a
+   hand-curated map (`generic_param_variance`) and `active_typevar_bounds`
+   in `Checker` are live. True higher-kinded forms (`T[_]` type-constructor
+   params) remain unimplemented and are a follow-up.
+3. ✅ **Salsa boundary**: `resolved_module` and `check_diagnostics` are
+   `#[salsa::tracked]` queries in `tyc-db`; incremental re-checks skip
+   unchanged files.
+4. ✅ **Loop parallelisation**: implemented in `tyc-analyse/src/parallel.rs`;
+   opt-in via `[strictness] auto-parallel = true`.
+5. **Broaden the `tyc::python_semantic_drift` audit**: `bool ⊆ int` is now
+   fixed in `assignable()` and BinOp/UnaryOp type inference. Continue
+   cataloguing every accepted-by-Python shape the checker still rejects
+   and either fix it or emit `python_semantic_drift` as a warning.
+6. **Typhon-native source-mapping debugger**: drive breakpoints directly
+   against `.ty` source instead of translating through `--break TY:LINE`
+   on top of `pdb`.

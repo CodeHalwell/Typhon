@@ -28,7 +28,7 @@
 //! a dedicated emitter — both substantial undertakings — so the present
 //! implementation ships the practical halfway point: the existing
 //! whitespace normaliser composed with optional `ruff format` post-
-//! processing.  See `docs/roadmap/phase-5.md` for the longer-term plan.
+//! processing.  See `docs/roadmap.md` §5.7 for the longer-term plan.
 
 use std::io::Write;
 use std::path::Path;

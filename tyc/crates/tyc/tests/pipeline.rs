@@ -1032,3 +1032,93 @@ async def load() -> int:
          got {gather_expansion_count}"
     );
 }
+
+// ── corpus round-trip sweep ───────────────────────────────────────────────────
+
+/// Run `tyc check` over every `.ty` file in `examples/` and assert that all
+/// pass cleanly.  This is the "corpus round-trip sweep" from the roadmap's
+/// concrete-next-steps list.  Having it as a CI-enforced test means that any
+/// change to the type checker, resolver, or analyser that breaks a previously-
+/// working example is caught immediately rather than discovered during a manual
+/// sweep campaign.
+///
+/// Each example is a standalone `.ty` file (no `typhon.toml` project).  We
+/// invoke `tyc check <file>` on each one and collect failures rather than
+/// stopping at the first, so a single run surfaces the complete breakage list.
+///
+/// Files under `examples/testing/test_calculator.ty` test intentional failures
+/// and are excluded from the pass-required set.
+#[test]
+fn corpus_examples_all_check_clean() {
+    // Locate `examples/` relative to this crate's manifest directory
+    // (tyc/crates/tyc/), three levels up to the repo root.
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let examples_dir = manifest_dir.join("../../../examples");
+    let examples_dir = examples_dir.canonicalize().unwrap_or_else(|e| {
+        panic!("could not resolve examples dir at {}: {e}", examples_dir.display())
+    });
+
+    // Gather all .ty files, excluding test fixtures that are *expected* to fail.
+    let mut ty_files: Vec<std::path::PathBuf> = Vec::new();
+    fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("ty") {
+                // Skip test_*.ty files — they contain intentional type errors
+                // used to verify diagnostic quality, not happy-path code.
+                let stem = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default();
+                if !stem.starts_with("test_") {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    collect(&examples_dir, &mut ty_files);
+
+    assert!(
+        !ty_files.is_empty(),
+        "no .ty files found under {}",
+        examples_dir.display()
+    );
+
+    ty_files.sort();
+
+    let mut failures: Vec<(std::path::PathBuf, std::process::Output)> = Vec::new();
+
+    for path in &ty_files {
+        let output = tyc()
+            .arg("check")
+            .arg(path)
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn tyc for {}: {e}", path.display()));
+
+        if !output.status.success() {
+            failures.push((path.clone(), output));
+        }
+    }
+
+    if !failures.is_empty() {
+        let mut msg = format!(
+            "{}/{} examples failed `tyc check`:\n",
+            failures.len(),
+            ty_files.len()
+        );
+        for (path, out) in &failures {
+            let rel = path.strip_prefix(&examples_dir).unwrap_or(path);
+            msg.push_str(&format!(
+                "\n  {} (exit {:?}):\n    stderr: {}\n    stdout: {}",
+                rel.display(),
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim(),
+                String::from_utf8_lossy(&out.stdout).trim(),
+            ));
+        }
+        panic!("{msg}");
+    }
+}

@@ -206,6 +206,13 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
         (Type::TypeVar(_), _) | (_, Type::TypeVar(_)) => true,
         (Type::Unknown, _) | (_, Type::Unknown) => true,
         (Type::Float, Type::Int) => true,
+        // CPython: `bool` is a subtype of `int` (`True == 1`, `False == 0`).
+        // Without this arm, `let x: int = True` and `let x: int = 1 + True`
+        // both fail even though they are well-typed in every Python type
+        // checker and at runtime.  The assignability is one-way: `int` does
+        // NOT flow into `bool` (a narrowing, not a widening).
+        (Type::Int, Type::Bool) => true,
+        (Type::Float, Type::Bool) => true,
         // Union/Union must come before the single-Union arms: every actual
         // variant has to be assignable to *some* expected variant. Falling
         // through to `(Union, other)` then `(other, Union)` recursively
@@ -6576,7 +6583,10 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // the existing assignability check.
                     Type::Float
                 }
-                (Type::Int, Type::Int) => Type::Int,
+                // Bool is a subtype of int; any non-division numeric op on
+                // Int/Bool operands yields Int.  Float wins if either side
+                // is Float (already handled by the guard above for Div).
+                (Type::Int | Type::Bool, Type::Int | Type::Bool) => Type::Int,
                 (Type::Float, _) | (_, Type::Float) => Type::Float,
                 (Type::Str, Type::Str) if matches!(b.op, Operator::Add) => Type::Str,
                 _ => Type::Unknown,
@@ -6590,7 +6600,9 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                 // Boolean negation always produces a bool, regardless of
                 // operand type (Python: `not x` returns a bool).
                 ruff_python_ast::UnaryOp::Not => Type::Bool,
-                // Bitwise / arithmetic unary ops preserve the operand type.
+                // Arithmetic/bitwise unary ops on `bool` produce `int`:
+                // `-True == -1`, `~True == -2`.  Preserves other types.
+                _ if operand == Type::Bool => Type::Int,
                 _ => operand,
             }
         }
@@ -11962,6 +11974,78 @@ let _: int = take(frozenset([1, 2, 3]))
                 TycError::TypeMismatch { .. } | TycError::InterfaceNotConforming { .. }
             )),
             "frozenset must satisfy Hashable; got {:?}",
+            d.errors()
+        );
+    }
+
+    // ── bool ⊆ int subtype widening ──────────────────────────────────────
+
+    #[test]
+    fn bool_assignable_to_int() {
+        // CPython: bool is a strict subclass of int.
+        let d = check("let x: int = True\n");
+        assert!(!d.has_errors(), "bool must be assignable to int; got {:?}", d.errors());
+    }
+
+    #[test]
+    fn bool_assignable_to_float() {
+        // bool → int → float (transitive via widening chain).
+        let d = check("let x: float = False\n");
+        assert!(!d.has_errors(), "bool must be assignable to float; got {:?}", d.errors());
+    }
+
+    #[test]
+    fn bool_arithmetic_with_int_yields_int() {
+        // `1 + True` produces int (not Unknown).
+        let d = check("let x: int = 1 + True\n");
+        assert!(
+            !d.has_errors(),
+            "1 + True must type-check as int; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn bool_arithmetic_both_bools_yields_int() {
+        // `True + False` has type int (Python: evaluates to 1).
+        let d = check("let x: int = True + False\n");
+        assert!(
+            !d.has_errors(),
+            "True + False must type-check as int; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn bool_unary_minus_yields_int() {
+        // `-True == -1` in CPython; result type is int, not bool.
+        let d = check("let x: int = -True\n");
+        assert!(
+            !d.has_errors(),
+            "-True must type-check as int; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn bool_multiplication_with_float_yields_float() {
+        // `True * 1.5 == 1.5` in CPython; float wins over bool.
+        let d = check("let x: float = True * 1.5\n");
+        assert!(
+            !d.has_errors(),
+            "True * 1.5 must type-check as float; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn bool_not_assignable_from_int() {
+        // The widening is one-way: a bare int must not satisfy a bool
+        // annotation (that would undermine narrowing elsewhere).
+        let d = check("let x: bool = 1\n");
+        assert!(
+            d.has_errors(),
+            "int must not be assignable to bool without a cast; got {:?}",
             d.errors()
         );
     }
