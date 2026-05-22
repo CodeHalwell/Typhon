@@ -126,7 +126,9 @@ impl VenvSignatures {
     /// single Python subprocess and populate the cache with the
     /// results. Modules already in the cache are skipped; modules
     /// whose top-level package isn't in the allow-list are skipped
-    /// without contacting Python.
+    /// without contacting Python. Duplicate names in `dotted_names`
+    /// are deduplicated so a caller that passed the same module
+    /// twice doesn't widen the subprocess argument list pointlessly.
     ///
     /// Batching matters: a project with 10 imported dependency
     /// modules used to pay a fresh Python startup (~80–150 ms each)
@@ -134,32 +136,62 @@ impl VenvSignatures {
     /// cost to roughly the import itself, and Python's `sys.modules`
     /// cache means sub-packages of the same root (`requests.adapters`,
     /// `requests.sessions`, …) only pay the import cost once.
+    ///
+    /// On batch failure (timeout, non-zero exit, malformed stdout)
+    /// the method falls back to introspecting each module in its
+    /// own subprocess. One pathological import — e.g. a package
+    /// whose `__init__.py` deadlocks — would otherwise poison every
+    /// unrelated module in the batch by recording them all as
+    /// misses, regressing checker accuracy versus the prior
+    /// per-module flow. (See codex review of PR #98.)
     pub fn preload(&mut self, dotted_names: &[String]) {
         let Some(python) = self.python_bin.as_ref() else {
             return;
         };
-        let to_fetch: Vec<String> = dotted_names
-            .iter()
-            .filter(|d| {
-                let top = d.split('.').next().unwrap_or(d.as_str());
-                self.allowed_top_level.contains(top) && !self.cache.contains_key(d.as_str())
-            })
-            .cloned()
-            .collect();
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut to_fetch: Vec<String> = Vec::with_capacity(dotted_names.len());
+        for d in dotted_names {
+            let top = d.split('.').next().unwrap_or(d.as_str());
+            if !self.allowed_top_level.contains(top) {
+                continue;
+            }
+            if self.cache.contains_key(d.as_str()) {
+                continue;
+            }
+            if seen.insert(d.as_str()) {
+                to_fetch.push(d.clone());
+            }
+        }
         if to_fetch.is_empty() {
             return;
         }
-        let results = introspect_batch_via_python(python, &self.cwd, &to_fetch);
-        // Record an entry for *every* requested module, including the
-        // ones Python couldn't import — caching the miss keeps a later
-        // single-module lookup from re-spawning Python for the same
-        // broken name.
-        for name in &to_fetch {
-            let shapes = results
-                .as_ref()
-                .and_then(|r| r.get(name.as_str()))
-                .map(shapes_from_introspected);
-            self.cache.insert(name.clone(), shapes);
+        match introspect_batch_via_python(python, &self.cwd, &to_fetch) {
+            Some(mut results) => {
+                // Consume `to_fetch` so the cache moves the owned
+                // module names rather than re-cloning each one, and
+                // pull each entry out of `results` with `remove`
+                // (single hash probe, no clone). (Gemini review #2.)
+                for name in to_fetch {
+                    let shapes = results.remove(name.as_str()).map(|intro| shapes_from_introspected(&intro));
+                    self.cache.insert(name, shapes);
+                }
+            }
+            None => {
+                // Batch round-trip failed (timeout, non-zero exit,
+                // malformed JSON). Retry each module on its own so
+                // an unrelated heavyweight import doesn't take the
+                // whole project down with it.
+                for name in to_fetch {
+                    let shapes = introspect_batch_via_python(
+                        python,
+                        &self.cwd,
+                        std::slice::from_ref(&name),
+                    )
+                    .and_then(|mut r| r.remove(name.as_str()))
+                    .map(|intro| shapes_from_introspected(&intro));
+                    self.cache.insert(name, shapes);
+                }
+            }
         }
     }
 
@@ -287,9 +319,9 @@ main()
 /// `{module_name: IntrospectedModule}` map on success.
 ///
 /// Bounded by a per-module timeout budget (5 s baseline + 1 s per
-/// extra module) so a package whose import-time side-effects hang
-/// doesn't wedge `tyc check` regardless of how many modules are in
-/// the batch.
+/// module in the batch) so a package whose import-time side-effects
+/// hang doesn't wedge `tyc check` regardless of how many modules
+/// are in the batch.
 fn introspect_batch_via_python(
     python: &Path,
     cwd: &Path,
@@ -326,10 +358,11 @@ fn introspect_batch_via_python(
         let _ = stdout.read_to_end(&mut buf);
         buf
     });
-    // 5 s startup + 1 s per module. Generous enough that even a
-    // ten-module batch with a slow `pydantic`-style import has
-    // headroom; tight enough that a wedged interpreter still
-    // bails before `tyc check` looks frozen.
+    // 5 s startup baseline + 1 s per module in the batch. Generous
+    // enough that even a ten-module batch with a slow
+    // `pydantic`-style import has headroom; tight enough that a
+    // wedged interpreter still bails before `tyc check` looks
+    // frozen.
     let timeout = Duration::from_secs(5 + modules.len() as u64);
     let deadline = std::time::Instant::now() + timeout;
     let success = loop {
@@ -806,47 +839,156 @@ lazy import np = numpy
     }
 
     #[test]
+    #[cfg(unix)]
     fn preload_batches_all_modules_into_one_subprocess() {
-        // The performance fix relies on Python being spawned once per
-        // `tyc check` invocation. Time a preload of 5 stdlib modules
-        // and assert it stays well under 5 × the per-process startup
-        // budget — if a regression reintroduced the per-module fork
-        // this would balloon past the threshold.
-        if which_python3().is_none() {
-            return; // CI runners without Python skip silently.
-        }
+        // The performance fix relies on Python being spawned once
+        // per `tyc check` invocation. Rather than time the call and
+        // hope CI is fast enough (the original timing-based check
+        // was flagged as flaky in PR #98 review), point
+        // `VenvSignatures` at a stub script that appends one line
+        // per invocation to a counter file and emits the JSON shape
+        // the Rust side expects. Asserting `wc -l == 1` is
+        // deterministic regardless of host speed.
+        use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().unwrap();
-        // The allow-list gating must permit each name, otherwise
-        // `preload` skips it before calling Python at all.
-        let allowed: HashSet<String> = ["json", "csv", "math", "os", "pathlib"]
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect();
-        let mut cache = VenvSignatures::for_project_root(tmp.path(), allowed);
-        let modules: Vec<String> = ["json", "csv", "math", "os", "pathlib"]
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect();
-        let start = std::time::Instant::now();
+        let counter = tmp.path().join("invocations.log");
+        let stub = tmp.path().join("fake-python");
+        // The Rust side feeds the embedded INTROSPECT_SCRIPT on
+        // stdin (because `python -` was the original interpreter
+        // invocation), so discard stdin and just emit the expected
+        // batched-output envelope. The script also records each
+        // invocation so the test can count spawns precisely.
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n\
+                 echo invoked >> {log}\n\
+                 cat > /dev/null\n\
+                 # Echo back an empty members object for every module argument.\n\
+                 printf '{{'\n\
+                 first=1\n\
+                 for arg in \"$@\"; do\n\
+                 case \"$arg\" in -) continue;; esac\n\
+                 if [ $first -eq 1 ]; then first=0; else printf ','; fi\n\
+                 printf '\"%s\": {{\"members\": []}}' \"$arg\"\n\
+                 done\n\
+                 printf '}}'\n",
+                log = counter.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let allowed: HashSet<String> =
+            ["pkg_a", "pkg_b", "pkg_c", "pkg_d", "pkg_e"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect();
+        let mut cache = VenvSignatures {
+            python_bin: Some(stub),
+            cwd: tmp.path().to_path_buf(),
+            allowed_top_level: allowed,
+            cache: HashMap::new(),
+        };
+        let modules: Vec<String> =
+            ["pkg_a", "pkg_b", "pkg_c", "pkg_d", "pkg_e"]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect();
         cache.preload(&modules);
-        let elapsed = start.elapsed();
-        // Every requested name should have an entry in the cache
-        // (success or recorded miss), proving the batch round-trip
-        // happened rather than each module falling through to a
-        // per-call subprocess.
+        // Every requested name lands in the cache, proving the
+        // batched call wired the JSON back out correctly.
         for m in &modules {
             assert!(
                 cache.cache.contains_key(m),
                 "preload should populate cache for `{m}`"
             );
         }
-        // Five sequential subprocesses on a typical box take 400+ ms;
-        // one batched call should land well under 1.5 s even on
-        // slow CI hardware. The wide tolerance avoids flakes while
-        // still catching a true per-module regression.
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "batched preload of 5 modules took {elapsed:?} — expected one subprocess, suspect per-module regression"
+        // Exactly one subprocess spawn — a per-module regression
+        // would write five lines into the counter file.
+        let log = std::fs::read_to_string(&counter).unwrap_or_default();
+        let invocations = log.lines().count();
+        assert_eq!(
+            invocations, 1,
+            "expected one batched subprocess; got {invocations} (log: {log:?})"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn preload_falls_back_to_per_module_on_batch_failure() {
+        // If the batched subprocess fails (timeout, malformed
+        // stdout, …), each module should be retried in isolation
+        // so one pathological import doesn't poison every
+        // unrelated dependency in the run. (Codex P1 review of
+        // PR #98.) The stub here errors on multi-module argv but
+        // succeeds for any single module, mirroring the
+        // "one heavy import broke the batch" scenario.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let counter = tmp.path().join("invocations.log");
+        let stub = tmp.path().join("fake-python");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n\
+                 echo invoked >> {log}\n\
+                 cat > /dev/null\n\
+                 # Count positional args, skipping the leading '-' that\n\
+                 # marks 'read script from stdin'.\n\
+                 mods=0\n\
+                 for arg in \"$@\"; do\n\
+                 case \"$arg\" in -) continue;; esac\n\
+                 mods=$((mods + 1))\n\
+                 done\n\
+                 if [ $mods -gt 1 ]; then\n\
+                 # Simulate a broken batch run.\n\
+                 exit 1\n\
+                 fi\n\
+                 printf '{{'\n\
+                 first=1\n\
+                 for arg in \"$@\"; do\n\
+                 case \"$arg\" in -) continue;; esac\n\
+                 if [ $first -eq 1 ]; then first=0; else printf ','; fi\n\
+                 printf '\"%s\": {{\"members\": []}}' \"$arg\"\n\
+                 done\n\
+                 printf '}}'\n",
+                log = counter.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let allowed: HashSet<String> = ["pkg_a", "pkg_b", "pkg_c"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let mut cache = VenvSignatures {
+            python_bin: Some(stub),
+            cwd: tmp.path().to_path_buf(),
+            allowed_top_level: allowed,
+            cache: HashMap::new(),
+        };
+        let modules: Vec<String> =
+            ["pkg_a", "pkg_b", "pkg_c"].iter().map(|s| (*s).to_owned()).collect();
+        cache.preload(&modules);
+        // All three modules end up in the cache because the
+        // per-module fallback succeeded for each.
+        for m in &modules {
+            assert!(
+                cache.cache.contains_key(m),
+                "fallback should populate cache for `{m}`"
+            );
+        }
+        // One batched attempt + three single-module retries = 4
+        // invocations. If the fallback regressed (e.g. someone
+        // reverted to caching every module as a miss on batch
+        // failure), only one invocation would appear.
+        let log = std::fs::read_to_string(&counter).unwrap_or_default();
+        let invocations = log.lines().count();
+        assert_eq!(
+            invocations, 4,
+            "expected 1 batched + 3 per-module fallback spawns; got {invocations} (log: {log:?})"
         );
     }
 
