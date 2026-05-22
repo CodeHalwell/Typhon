@@ -14,10 +14,12 @@ comptime let SIZE: int = square(4)
 comptime let FACT5: int = factorial(5)
 comptime let GREETING: str = f"size={SIZE}, fact5={FACT5}"
 comptime let TAGS: list[str] = ["alpha", "beta", "gamma"]
+comptime let JOINED: str = ",".join(TAGS)
 
 
 def main() -> None:
     print(GREETING)
+    print(JOINED)
     print(f"runtime tags={TAGS}")
 
 
