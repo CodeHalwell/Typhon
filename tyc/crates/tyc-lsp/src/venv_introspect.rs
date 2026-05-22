@@ -43,6 +43,43 @@ pub struct MemberInfo {
     pub signature: Option<String>,
     /// One-liner pulled from the object's first docstring line.
     pub documentation: Option<String>,
+    /// For class members: the dotted base-class names (sans `object`),
+    /// in MRO order. `None` for non-classes and for classes whose MRO
+    /// probe raised. Used by the hover renderer to surface inheritance
+    /// (`Module → torch.nn.Module → object`) — a noticeable upgrade
+    /// over Pylance's defaults for ML packages.
+    #[serde(default)]
+    pub bases: Option<Vec<String>>,
+    /// For class members: a short list of the public methods declared
+    /// on the class (capped server-side). `None` for non-classes; an
+    /// empty list when the class has no public methods. Lets the
+    /// hover popover hint at the API surface without forcing the user
+    /// to navigate to the source.
+    #[serde(default)]
+    pub methods: Option<Vec<String>>,
+}
+
+/// Why a particular module introspection failed. Surfaced through
+/// [`IntrospectionCache::last_failure`] so the LSP can offer the user
+/// a hint ("install torch in `.venv`", "`.venv/bin/python` not found")
+/// instead of silently returning an empty completion list.
+#[derive(Debug, Clone)]
+pub enum IntrospectionFailure {
+    /// No Python interpreter was discovered — no `.venv/bin/python`
+    /// and no `python3` on `PATH`.
+    NoPython,
+    /// The subprocess ran but reported an empty member list, which
+    /// the script uses as the universal "couldn't import" signal
+    /// (caught at `import`-time, attribute-error during `dir`, etc).
+    /// `python_bin` is captured so the hint can name the offending
+    /// interpreter.
+    ImportFailed { python_bin: PathBuf },
+    /// The subprocess exceeded the per-call timeout. Rare but real
+    /// for packages with slow C-extension init.
+    Timeout { python_bin: PathBuf },
+    /// The subprocess failed to spawn or exited with a non-zero
+    /// status before producing JSON.
+    SpawnFailed { python_bin: PathBuf },
 }
 
 /// Single-project introspection cache. Holds a chosen Python binary
@@ -60,6 +97,11 @@ pub struct IntrospectionCache {
     /// failure so we don't re-launch Python for the same broken
     /// module-name within one session.
     cache: HashMap<String, Option<Arc<Vec<MemberInfo>>>>,
+    /// Per-module failure reason (kept only for cache entries whose
+    /// value is `None`). Lets the LSP surface "torch.nn import
+    /// failed in <python>" diagnostics instead of silently showing
+    /// zero completions.
+    failures: HashMap<String, IntrospectionFailure>,
 }
 
 impl IntrospectionCache {
@@ -78,7 +120,22 @@ impl IntrospectionCache {
             python_bin,
             venv_stamp,
             cache: HashMap::new(),
+            failures: HashMap::new(),
         }
+    }
+
+    /// Latest known failure reason for `module`, if introspection has
+    /// been attempted and missed. Returns `None` when introspection
+    /// succeeded or has not been attempted. Used by the LSP hover to
+    /// explain why a third-party import yields no completions.
+    pub fn last_failure(&self, module: &str) -> Option<&IntrospectionFailure> {
+        self.failures.get(module)
+    }
+
+    /// Return the chosen Python binary, if any. Useful for failure
+    /// messages ("install torch into `<path>`").
+    pub fn python_bin(&self) -> Option<&Path> {
+        self.python_bin.as_deref()
     }
 
     /// Look up `module` — returns cached members if present, otherwise
@@ -101,6 +158,7 @@ impl IntrospectionCache {
         let current_stamp = stat_pyvenv_cfg(project_root);
         if current_stamp != self.venv_stamp {
             self.cache.clear();
+            self.failures.clear();
             self.venv_stamp = current_stamp;
             // Also re-discover the venv: a new `uv sync` may have
             // materialised one where there wasn't before.
@@ -116,9 +174,21 @@ impl IntrospectionCache {
         if let Some(entry) = self.cache.get(module) {
             return entry.clone();
         }
-        let python = self.python_bin.clone()?;
-        let result = introspect_via_python(&python, module);
+        let Some(python) = self.python_bin.clone() else {
+            self.failures
+                .insert(module.to_owned(), IntrospectionFailure::NoPython);
+            self.cache.insert(module.to_owned(), None);
+            return None;
+        };
+        let (result, failure) = introspect_via_python(&python, module);
         let result_arc = result.map(Arc::new);
+        if result_arc.is_none() {
+            if let Some(reason) = failure {
+                self.failures.insert(module.to_owned(), reason);
+            }
+        } else {
+            self.failures.remove(module);
+        }
         self.cache.insert(module.to_owned(), result_arc.clone());
         result_arc
     }
@@ -210,6 +280,49 @@ def signature_of(name, obj):
     # code block where horizontal scroll is acceptable.
     return text if len(text) <= 1024 else None
 
+def bases_of(cls):
+    """Return the dotted base-class names in MRO order, skipping the
+    class itself and skipping `object` (the universal base adds no
+    information). Capped at 5 entries so the hover doesn't get a
+    massive multi-line inheritance trail for Pydantic-style mixin
+    chains. Returns None on any failure so the hover renderer can
+    omit the section cleanly."""
+    try:
+        mro = inspect.getmro(cls)
+    except BaseException:
+        return None
+    out = []
+    for base in mro[1:]:
+        if base is object:
+            continue
+        mod = getattr(base, "__module__", "") or ""
+        qualname = getattr(base, "__qualname__", "") or getattr(base, "__name__", "") or ""
+        if not qualname:
+            continue
+        # Hide builtins ('builtins.Exception' is noisier than just
+        # 'Exception'); keep the dotted form for third-party so the
+        # user can tell `torch.nn.Module` from `tensorflow.Module`.
+        if mod and mod != "builtins":
+            out.append(f"{mod}.{qualname}")
+        else:
+            out.append(qualname)
+        if len(out) >= 5:
+            break
+    return out
+
+def methods_of(cls):
+    """Return up to 12 public method names declared on `cls` (skipping
+    inherited methods and dunders). Stable-ordered as Python sees
+    them so repeated hovers show the same list. Returns None on
+    failure so the hover renderer omits the section."""
+    try:
+        own = [n for n in vars(cls)
+               if not n.startswith("_") and callable(vars(cls).get(n))]
+    except BaseException:
+        return None
+    own.sort()
+    return own[:12]
+
 def main():
     if len(sys.argv) < 2:
         print("[]")
@@ -228,12 +341,16 @@ def main():
             obj = getattr(m, name)
         except BaseException:
             continue
-        out.append({
+        entry = {
             "name": name,
             "kind": kind_of(obj),
             "signature": signature_of(name, obj),
             "documentation": doc_of(obj),
-        })
+        }
+        if inspect.isclass(obj):
+            entry["bases"] = bases_of(obj)
+            entry["methods"] = methods_of(obj)
+        out.append(entry)
     print(json.dumps(out))
 
 main()
@@ -242,25 +359,41 @@ main()
 /// Shell to `python` with [`INTROSPECT_SCRIPT`] and the requested
 /// module name. Returns the parsed member list on success.
 ///
-/// Aggressive timeout (3 seconds): a misbehaving package's import-time
-/// side effects (network call, sleep) can't be allowed to wedge the
-/// LSP. The cache records the failure either way, so a slow module
-/// won't re-block on the next keystroke.
-fn introspect_via_python(python: &Path, module: &str) -> Option<Vec<MemberInfo>> {
+/// Timeout (10 seconds): heavy packages with non-trivial import-time
+/// initialisation (`torch.nn` triggers C extension loading and CUDA
+/// probing in the multi-hundred-millisecond range) routinely exceeded
+/// the previous 3 s ceiling on the first call, leaving the user with
+/// no completions for the most common ML/scientific imports. The
+/// cache records the failure either way, so a slow module won't
+/// re-block on the next keystroke.
+fn introspect_via_python(
+    python: &Path,
+    module: &str,
+) -> (Option<Vec<MemberInfo>>, Option<IntrospectionFailure>) {
     // We feed the script over stdin rather than `-c "<code>"` to avoid
     // quoting hell across platforms; `python -` reads from stdin.
     use std::io::{Read, Write};
-    let mut child = Command::new(python)
+    let spawn_failure = || IntrospectionFailure::SpawnFailed {
+        python_bin: python.to_path_buf(),
+    };
+    let mut child = match Command::new(python)
         .arg("-")
         .arg(module)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .ok()?;
     {
-        let mut stdin = child.stdin.take()?;
-        stdin.write_all(INTROSPECT_SCRIPT.as_bytes()).ok()?;
+        Ok(c) => c,
+        Err(_) => return (None, Some(spawn_failure())),
+    };
+    {
+        let Some(mut stdin) = child.stdin.take() else {
+            return (None, Some(spawn_failure()));
+        };
+        if stdin.write_all(INTROSPECT_SCRIPT.as_bytes()).is_err() {
+            return (None, Some(spawn_failure()));
+        }
         // Explicit close (drop) so the child's `sys.stdin.read()` sees
         // EOF and exits the import loop; otherwise the script blocks
         // forever waiting for more input.
@@ -270,42 +403,69 @@ fn introspect_via_python(python: &Path, module: &str) -> Option<Vec<MemberInfo>>
     // fill the stdout pipe buffer (typically 64 KB on macOS/Linux) and
     // the child blocks on `print()`, never reaching `sys.exit(0)`;
     // the timeout below would kill it but the result is always None.
-    let mut stdout = child.stdout.take()?;
+    let Some(mut stdout) = child.stdout.take() else {
+        return (None, Some(spawn_failure()));
+    };
     let drainer = std::thread::spawn(move || -> Vec<u8> {
         let mut buf = Vec::with_capacity(64 * 1024);
         let _ = stdout.read_to_end(&mut buf);
         buf
     });
     // Wait with a timeout. `Child::wait` blocks indefinitely, so we
-    // poll. Coarse 50 ms polling is fine for the 3 s ceiling and
+    // poll. Coarse 50 ms polling is fine for the 10 s ceiling and
     // happens to be the granularity at which a hung import becomes
     // user-visible anyway.
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut timed_out = false;
     let success = loop {
-        match child.try_wait().ok()? {
-            Some(status) => break status.success(),
-            None => {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
+                    timed_out = true;
                     break false;
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
+            Err(_) => return (None, Some(spawn_failure())),
         }
     };
-    let stdout_bytes = drainer.join().ok()?;
-    if !success {
-        return None;
+    let stdout_bytes = drainer.join().unwrap_or_default();
+    if timed_out {
+        return (
+            None,
+            Some(IntrospectionFailure::Timeout {
+                python_bin: python.to_path_buf(),
+            }),
+        );
     }
-    let stdout_str = std::str::from_utf8(&stdout_bytes).ok()?;
-    let parsed: Vec<MemberInfo> = serde_json::from_str(stdout_str.trim()).ok()?;
+    if !success {
+        return (None, Some(spawn_failure()));
+    }
+    let stdout_str = match std::str::from_utf8(&stdout_bytes) {
+        Ok(s) => s,
+        Err(_) => return (None, Some(spawn_failure())),
+    };
+    let parsed: Vec<MemberInfo> = match serde_json::from_str(stdout_str.trim()) {
+        Ok(p) => p,
+        Err(_) => return (None, Some(spawn_failure())),
+    };
     if parsed.is_empty() {
         // An empty result is the script's "couldn't import" signal —
-        // record it as a miss so we don't retry.
-        return None;
+        // record it as a miss so we don't retry. The typical cause is
+        // the package being absent from the chosen interpreter; the
+        // LSP surfaces this through the hover hint so the user can
+        // install it.
+        return (
+            None,
+            Some(IntrospectionFailure::ImportFailed {
+                python_bin: python.to_path_buf(),
+            }),
+        );
     }
-    Some(parsed)
+    (Some(parsed), None)
 }
 
 /// Walk upward from `start` looking for a `typhon.toml` and return the
@@ -379,14 +539,33 @@ mod tests {
         let Some(python) = which_python3() else {
             return;
         };
-        let members = match introspect_via_python(&python, "os") {
+        let (members, failure) = introspect_via_python(&python, "os");
+        let members = match members {
             Some(m) => m,
             None => return,
         };
+        assert!(failure.is_none(), "expected no failure on success");
         let getcwd = members
             .iter()
             .find(|m| m.name == "getcwd")
             .expect("os should expose getcwd");
         assert_eq!(getcwd.kind, "function");
+    }
+
+    #[test]
+    fn records_failure_for_nonexistent_module() {
+        // Sanity check: failed introspection captures a reason instead
+        // of silently returning a bare `None`, so the LSP can offer
+        // the user a useful "did you mean to install …?" hint.
+        let Some(python) = which_python3() else {
+            return;
+        };
+        let (members, failure) =
+            introspect_via_python(&python, "definitely_not_a_real_module_xyz_typhon");
+        assert!(members.is_none());
+        assert!(matches!(
+            failure,
+            Some(IntrospectionFailure::ImportFailed { .. })
+        ));
     }
 }

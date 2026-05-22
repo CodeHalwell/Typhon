@@ -111,6 +111,21 @@ pub struct CalleeSignature {
 /// small.
 pub type CalleeSignatures = HashMap<String, CalleeSignature>;
 
+/// Map from attribute access path → semantic kind, used to upgrade
+/// `nn.Module` from a generic `property` token to a `class` token
+/// when introspection knows the attribute is a class.
+///
+/// Keys are the receiver-binding name plus the attribute identifier
+/// joined by `.` (`"nn.Module"`, `"np.ndarray"`). The receiver must
+/// be a bare-imported module — chained attribute receivers
+/// (`config.client.factory`) would need real type inference and stay
+/// uncoloured.
+///
+/// Values are the same string kinds the introspector returns:
+/// `"class"`, `"function"`, `"module"`. Anything else falls through
+/// to the syntactic default (`property` / `method`).
+pub type AttributeKinds = HashMap<String, String>;
+
 /// Walk the resolved module + parsed AST and return the LSP-encoded
 /// semantic tokens stream. Caller is responsible for the
 /// preprocessed `source` lining up with the resolver / AST byte
@@ -134,12 +149,13 @@ pub fn compute(
     module: &ModModule,
     stdlib_modules: &[&str],
     callee_signatures: &CalleeSignatures,
+    attribute_kinds: &AttributeKinds,
 ) -> SemanticTokens {
     let mut tokens: Vec<AbsoluteToken> = Vec::new();
     emit_binding_tokens(&mut tokens, source, resolved, stdlib_modules);
     emit_reference_tokens(&mut tokens, source, resolved, stdlib_modules);
     emit_module_path_tokens(&mut tokens, source, module, stdlib_modules);
-    emit_ast_tokens(&mut tokens, source, module, callee_signatures);
+    emit_ast_tokens(&mut tokens, source, module, callee_signatures, attribute_kinds);
     // The LSP encoding requires tokens in document order (each
     // delta-line is non-negative; ties broken by delta-start).
     tokens.sort_by_key(|t| (t.line, t.col));
@@ -225,11 +241,13 @@ fn emit_ast_tokens<'a>(
     source: &'a str,
     module: &'a ModModule,
     callee_signatures: &'a CalleeSignatures,
+    attribute_kinds: &'a AttributeKinds,
 ) {
     let mut walker = AstWalker {
         tokens,
         source,
         callee_signatures,
+        attribute_kinds,
         in_call_func: false,
     };
     for stmt in &module.body {
@@ -241,6 +259,14 @@ struct AstWalker<'a> {
     tokens: &'a mut Vec<AbsoluteToken>,
     source: &'a str,
     callee_signatures: &'a CalleeSignatures,
+    /// Lookup populated from venv introspection so a bare-import
+    /// attribute access (`nn.Module`) can be coloured by its true
+    /// kind — `class` for `Module`, `function` for `relu`, etc. —
+    /// instead of the syntactic-position default that paints every
+    /// attribute as `property` / `method`. The `attribute_kinds`
+    /// map is empty in unit tests so the fallback path stays
+    /// exercised without venv access.
+    attribute_kinds: &'a AttributeKinds,
     /// True when the visitor is descending into the `func` slot of an
     /// `Expr::Call`. When the next `Attribute` we see is the
     /// callee, classify the attribute identifier as `method` instead
@@ -354,11 +380,29 @@ impl<'a> Visitor<'a> for AstWalker<'a> {
                 }
             }
             Expr::Attribute(attr) => {
-                let token_type = if self.in_call_func {
+                // Prefer the introspection-derived kind when we can
+                // build a `<receiver>.<attr>` lookup key — `nn.Module`
+                // becomes `class` instead of the generic `property`
+                // when the venv knows `torch.nn.Module` is a class.
+                // Falls back to the syntactic default when the
+                // receiver isn't a bare name (chained access) or the
+                // kind isn't in the map.
+                let introspected_kind = if let Expr::Name(name) = attr.value.as_ref() {
+                    let key = format!("{}.{}", name.id.as_str(), attr.attr.as_str());
+                    self.attribute_kinds.get(&key).and_then(|kind| match kind.as_str() {
+                        "class" => Some(TOKEN_CLASS),
+                        "function" => Some(TOKEN_FUNCTION),
+                        "module" => Some(TOKEN_NAMESPACE),
+                        _ => None,
+                    })
+                } else {
+                    None
+                };
+                let token_type = introspected_kind.unwrap_or(if self.in_call_func {
                     TOKEN_METHOD
                 } else {
                     TOKEN_PROPERTY
-                };
+                });
                 let ident_end = attr.range().end().to_usize();
                 let ident_start = ident_end - attr.attr.as_str().len();
                 if let Some((line, col)) = byte_to_line_col(self.source, ident_start) {
@@ -820,6 +864,7 @@ mod tests {
             &module,
             &stdlib_refs,
             &CalleeSignatures::new(),
+            &AttributeKinds::new(),
         );
         let (ty, modifiers) = token_at(&source, "os", &result.data).expect("os token");
         assert_eq!(ty, TOKEN_NAMESPACE, "bare `import os` is a namespace");
@@ -841,6 +886,7 @@ mod tests {
             &module,
             &stdlib_refs,
             &CalleeSignatures::new(),
+            &AttributeKinds::new(),
         );
         let (ty, modifiers) = token_at(&source, "Agent", &result.data).expect("Agent token");
         assert_eq!(ty, TOKEN_CLASS, "from-imports are tagged as class");
@@ -862,6 +908,7 @@ mod tests {
             &module,
             &stdlib_refs,
             &CalleeSignatures::new(),
+            &AttributeKinds::new(),
         );
         let (ty, modifiers) = token_at(&source, "Foo", &result.data).expect("Foo token");
         assert_eq!(ty, TOKEN_CLASS);
@@ -883,6 +930,7 @@ mod tests {
             &module,
             &stdlib_refs,
             &CalleeSignatures::new(),
+            &AttributeKinds::new(),
         );
         let (ty, _) = token_at(&source, "getcwd", &result.data).expect("getcwd token");
         assert_eq!(ty, TOKEN_METHOD, "`os.getcwd()` is a method call");
@@ -900,6 +948,7 @@ mod tests {
             &module,
             &stdlib_refs,
             &CalleeSignatures::new(),
+            &AttributeKinds::new(),
         );
         let (ty, _) = token_at(&source, "sep", &result.data).expect("sep token");
         assert_eq!(ty, TOKEN_PROPERTY, "`os.sep` is a property read");
@@ -916,6 +965,7 @@ mod tests {
             &module,
             &stdlib_refs,
             &CalleeSignatures::new(),
+            &AttributeKinds::new(),
         );
         // Declaration carries `declaration` modifier.
         let (decl_ty, decl_mods) =
@@ -965,6 +1015,7 @@ mod tests {
             &module,
             &stdlib_refs,
             &CalleeSignatures::new(),
+            &AttributeKinds::new(),
         );
         // Walk the stream and assert every delta is non-negative.
         for tok in &result.data {
@@ -994,6 +1045,7 @@ mod tests {
             &module,
             &stdlib_refs,
             &CalleeSignatures::new(),
+            &AttributeKinds::new(),
         );
         let (foo_ty, _) = token_at(&source, "foo", &result.data).expect("foo token");
         let (bar_ty, _) = token_at(&source, "bar", &result.data).expect("bar token");
@@ -1016,6 +1068,7 @@ mod tests {
             &module,
             &stdlib_refs,
             &CalleeSignatures::new(),
+            &AttributeKinds::new(),
         );
         let (_, os_mods) = token_at(&source, "os", &result.data).expect("os token");
         let (_, path_mods) = token_at(&source, "path", &result.data).expect("path token");
@@ -1039,6 +1092,7 @@ mod tests {
             &module,
             &stdlib_refs,
             &CalleeSignatures::new(),
+            &AttributeKinds::new(),
         );
         for needle in ["foo", "bar", "baz"] {
             let (ty, _) = token_at(&source, needle, &result.data)
@@ -1062,7 +1116,7 @@ mod tests {
             parse_signature("(name, client, model='gpt-4')"),
         );
         let stdlib_refs: Vec<&str> = Vec::new();
-        let result = compute(&source, &resolved, &module, &stdlib_refs, &sigs);
+        let result = compute(&source, &resolved, &module, &stdlib_refs, &sigs, &AttributeKinds::new());
         let (client_ty, _) =
             token_at(&source, "client=", &result.data).expect("client kwarg token");
         let (model_ty, _) = token_at(&source, "model=", &result.data).expect("model kwarg token");
@@ -1081,7 +1135,7 @@ mod tests {
         let mut sigs = CalleeSignatures::new();
         sigs.insert("F".to_owned(), parse_signature("(client, **kwargs)"));
         let stdlib_refs: Vec<&str> = Vec::new();
-        let result = compute(&source, &resolved, &module, &stdlib_refs, &sigs);
+        let result = compute(&source, &resolved, &module, &stdlib_refs, &sigs, &AttributeKinds::new());
         let (client_ty, _) = token_at(&source, "client=", &result.data).expect("client");
         let (weird_ty, _) = token_at(&source, "weird_thing=", &result.data).expect("weird");
         assert_eq!(client_ty, TOKEN_PROPERTY, "real param is orange");
@@ -1103,7 +1157,7 @@ mod tests {
         let mut sigs = CalleeSignatures::new();
         sigs.insert("F".to_owned(), parse_signature("(client, model)"));
         let stdlib_refs: Vec<&str> = Vec::new();
-        let result = compute(&source, &resolved, &module, &stdlib_refs, &sigs);
+        let result = compute(&source, &resolved, &module, &stdlib_refs, &sigs, &AttributeKinds::new());
         assert!(
             token_at(&source, "bogus=", &result.data).is_none(),
             "unrecognised kwarg should emit no token"
@@ -1205,7 +1259,7 @@ mod tests {
             parse_signature("Agent(name, client)"),
         );
         let stdlib_refs: Vec<&str> = Vec::new();
-        let result = compute(&source, &resolved, &module, &stdlib_refs, &sigs);
+        let result = compute(&source, &resolved, &module, &stdlib_refs, &sigs, &AttributeKinds::new());
         let (client_ty, _) =
             token_at(&source, "client=", &result.data).expect("client kwarg via attribute callee");
         assert_eq!(client_ty, TOKEN_PROPERTY);
@@ -1227,6 +1281,7 @@ mod tests {
             &module,
             &stdlib_refs,
             &CalleeSignatures::new(),
+            &AttributeKinds::new(),
         );
         let (_, os_mods) = token_at(&source, "os", &result.data).expect("os in relative import");
         assert_eq!(
@@ -1251,6 +1306,7 @@ mod tests {
             &module,
             &stdlib_refs,
             &CalleeSignatures::new(),
+            &AttributeKinds::new(),
         );
         let (os_ty, os_mods) = token_at(&source, "os", &result.data).expect("nested os token");
         let (path_ty, path_mods) =
@@ -1259,5 +1315,70 @@ mod tests {
         assert_eq!(path_ty, TOKEN_NAMESPACE);
         assert!(os_mods & MOD_DEFAULT_LIBRARY != 0);
         assert!(path_mods & MOD_DEFAULT_LIBRARY != 0);
+    }
+
+    #[test]
+    fn attribute_class_kind_paints_member_as_class() {
+        // The torch.nn use case: `import torch.nn as nn` + reference
+        // to `nn.Module` should colour `Module` with the CLASS token
+        // (not the syntactic-default PROPERTY) when the introspection
+        // cache reports `Module`'s kind as "class". Without this
+        // upgrade, themes paint nn.Module the same as any field
+        // access, masking the distinction between a class and an
+        // instance attribute in real ML code.
+        let src = "import torch.nn as nn\n\nlet m: nn.Module = nn.Module()\n";
+        let (source, resolved, module) = parse_and_resolve(src);
+        let stdlib_refs: Vec<&str> = Vec::new();
+        let mut kinds = AttributeKinds::new();
+        kinds.insert("nn.Module".to_owned(), "class".to_owned());
+        let result = compute(
+            &source,
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &CalleeSignatures::new(),
+            &kinds,
+        );
+        // Both occurrences should be CLASS — the annotation `nn.Module`
+        // (property position) and the constructor call `nn.Module()`
+        // (method position) both refer to the same class.
+        let module_tokens: Vec<u32> = collect_token_types_for(&source, "Module", &result.data);
+        assert!(
+            !module_tokens.is_empty(),
+            "expected at least one Module token"
+        );
+        assert!(
+            module_tokens.iter().all(|ty| *ty == TOKEN_CLASS),
+            "expected all Module tokens to be TOKEN_CLASS, got {:?}",
+            module_tokens
+        );
+    }
+
+    /// Helper: collect every token type for every occurrence of
+    /// `needle` in `source`, decoded against the LSP delta-encoded
+    /// stream. Used by the attribute-kind test to assert every
+    /// occurrence of `Module` is classified consistently.
+    fn collect_token_types_for(source: &str, needle: &str, data: &[SemanticToken]) -> Vec<u32> {
+        let mut out: Vec<u32> = Vec::new();
+        let mut line: u32 = 0;
+        let mut col: u32 = 0;
+        let lines: Vec<&str> = source.lines().collect();
+        for tok in data {
+            if tok.delta_line == 0 {
+                col += tok.delta_start;
+            } else {
+                line += tok.delta_line;
+                col = tok.delta_start;
+            }
+            if (line as usize) < lines.len() {
+                let line_text = lines[line as usize];
+                let start = col as usize;
+                let end = start + tok.length as usize;
+                if end <= line_text.len() && &line_text[start..end] == needle {
+                    out.push(tok.token_type);
+                }
+            }
+        }
+        out
     }
 }
