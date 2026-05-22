@@ -1,0 +1,33 @@
+# Probe: non-exhaustive `match self.field:` must still fire missing_return.
+
+type Status = Open | Closed | Pending
+
+
+class Open:
+    label: str
+class Closed:
+    label: str
+class Pending:
+    label: str
+
+
+class Foo:
+    state: Status
+
+
+impl Foo:
+    # Missing Pending — non-exhaustive
+    def label(self) -> str:
+        match self.state:
+            case Open(_):
+                return "open"
+            case Closed(_):
+                return "closed"
+
+
+def main() -> None:
+    pass
+
+
+if __name__ == "__main__":
+    main()

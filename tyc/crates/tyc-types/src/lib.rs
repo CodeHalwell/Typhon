@@ -5851,6 +5851,18 @@ fn match_subject_type(c: &Checker, m: &ruff_python_ast::StmtMatch) -> Option<Typ
             return Some(binding.declared.clone());
         }
     }
+    // N13 (2026-05-22): `match self.<field>:` is the canonical
+    // state-machine pattern — a class with a sealed-union field, plus
+    // an `impl` method that dispatches on it. Restricting subjects to
+    // bare names made the exhaustiveness pass skip these matches and
+    // gave false-positive `tyc::missing_return` diagnostics. Allow
+    // attribute access against a typed class receiver too.
+    if let Expr::Attribute(_) = m.subject.as_ref() {
+        let ty = infer_expr_readonly(c, m.subject.as_ref());
+        if !matches!(ty, Type::Unknown) {
+            return Some(ty);
+        }
+    }
     None
 }
 
@@ -9067,6 +9079,74 @@ def maybe_int(x: int) -> int:
                 .iter()
                 .any(|e| matches!(e, TycError::MissingReturn { .. })),
             "expected MissingReturn variant, got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn match_on_self_field_exhaustive_is_clean() {
+        // Regression for N13 (2026-05-22): the exhaustiveness pass only
+        // looked at bare-name subjects (`match s:`), so a class with a
+        // sealed-union state field doing `match self.state:` falsely
+        // tripped missing_return even when every variant was handled.
+        let src = "\
+type Status = Open | Closed
+class Open:
+    since: float
+class Closed:
+    label: str
+
+class Foo:
+    state: Status
+
+impl Foo:
+    def check(self) -> str:
+        match self.state:
+            case Open(_):
+                return \"open\"
+            case Closed(_):
+                return \"closed\"
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "exhaustive match on `self.<field>` must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn match_on_self_field_non_exhaustive_still_fires() {
+        // Sanity check: non-exhaustive `match self.<field>:` must STILL
+        // surface the missing_return / non_exhaustive_match diagnostics.
+        let src = "\
+type Status = Open | Closed | Pending
+class Open:
+    label: str
+class Closed:
+    label: str
+class Pending:
+    label: str
+
+class Foo:
+    state: Status
+
+impl Foo:
+    def check(self) -> str:
+        match self.state:
+            case Open(_):
+                return \"open\"
+            case Closed(_):
+                return \"closed\"
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "non-exhaustive match on `self.<field>` must still fire missing_return: {:?}",
             d.errors()
         );
     }
