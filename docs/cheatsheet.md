@@ -12,6 +12,12 @@ clean CPython 3.13+. The CLI is `tyc`.
 Module-level assignments default to `let` and don't need the keyword.
 Inside a function body the keyword is mandatory (`tyc::missing_binding_kind`).
 
+Tuple unpacking carries annotations per element:
+
+    let (a: int, b: str) = func(x, y)         # both elements typed
+    let (a: int, b)      = pair()             # b's type inferred from RHS
+    let (a, b)           = pair()             # both inferred
+
 ## Annotations (Rule 1)
 
 Every parameter and every return type carries an annotation:

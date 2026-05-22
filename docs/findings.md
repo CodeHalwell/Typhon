@@ -18,11 +18,11 @@ write-ups have been consolidated here.
 
 ## Quick status
 
-**Nine stress-test campaigns** have been run between May 17 and May 21,
-2026. Across them ~600 hand-written `.ty` programs were authored
+**Ten stress-test campaigns** have been run between May 17 and May 22,
+2026. Across them ~700 hand-written `.ty` programs were authored
 spanning language edge cases, IO, ML/numpy, mock LLM/RAG, agents, APIs,
 SDK patterns, perf, and intentionally-broken diagnostic probes. Roughly
-**120 distinct findings** were filed.
+**130 distinct findings** were filed.
 
 | Round | Branch | New findings | Verdict |
 |---|---|---|---|
@@ -36,7 +36,8 @@ SDK patterns, perf, and intentionally-broken diagnostic probes. Roughly
 | 2026-05-20 exploration | `claude/typhon-exploration-testing-LZezp` | E1–E11 | closed except E6, E9, E11 |
 | 2026-05-21 | `claude/tender-hawking-LLhuR` | B1–B14 | closed B1–B8, B10–B14; only B9 (`tyc fmt`) still open |
 | 2026-05-21 findings sweep | `claude/findings-documentation-review-HhuVH` | — | closed O2/O3/O4/O5/O6/O10/O21/O22/O23/O24/O25/O26; verified-fixed O1/O7/O8/O9/O11/O13/O18/O20 |
-| 2026-05-21 follow-up sweep | `claude/finish-open-findings-dmLv6` (this branch) | — | closed O12/O14/O15/O16/O17/O27/O28/O29; verified-fixed O19 |
+| 2026-05-21 follow-up sweep | `claude/finish-open-findings-dmLv6` | — | closed O12/O14/O15/O16/O17/O27/O28/O29; verified-fixed O19 |
+| 2026-05-22 | `claude/typhon-library-testing-ch1yz` | N1–N13 (3 CRITICAL) | all 13 closed before merge (shipped in v0.3.1) |
 
 **Pass rate trend** on the canonical example suite (`examples/01-…46-…`):
 20/47 → 39/47 → 46/46 → 46/46. The examples now build and run end-to-end
@@ -47,11 +48,11 @@ the curated examples.
 
 ## Open findings
 
-None. Every finding filed across the eight stress campaigns is now
-either closed or verified-fixed against its repro. See the
-[Recently closed](#recently-closed-this-branch) section below for the
-write-up of the latest sweep, and [Sprint history](#sprint-history)
-for the per-branch rollup.
+None. Every finding filed across the ten stress campaigns is now
+either closed or verified-fixed against its repro. The
+"Recently closed" sections below carry the write-ups of the latest
+sweeps, and [Sprint history](#sprint-history) records the per-branch
+rollup.
 
 Severity legend: **CRITICAL** (silent wrong output / runtime crash on
 documented happy path), **HIGH** (documented feature unusable),
@@ -60,7 +61,88 @@ docs).
 
 ---
 
-## Recently closed (this branch)
+## Recently closed: 2026-05-22 stress round (N1–N13)
+
+Branch: `claude/typhon-library-testing-ch1yz`. Released as
+[v0.3.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.1).
+A second stress campaign (93 fresh `.ty` programs across nine domain
+buckets) filed thirteen new findings — three CRITICAL silent-wrong-
+output, five HIGH, two MEDIUM, three LOW. Every one closed in this
+release.
+
+**CRITICAL closures (silent wrong output):**
+
+- **N5 / N6** (`9c423b9`) — `Expr::UnaryOp` printer arm now consults
+  `expr_precedence` on the operand and wraps when the operand's
+  precedence is lower than `Not`'s. Without the fix, `not (a or b)`
+  round-tripped as `not a or b` (De Morgan violation) and
+  `not (x if c else y)` as `not x if c else y` (associativity flip).
+  Surfaced organically against `05-agents/01-react-agent.ty` — a
+  calculator-tool guard
+  `not (ch.isdigit() or ch in " +-*/()")` was being emitted wrong.
+- **N9** (`a68d1ec`) — VM `match` arm body now shares the enclosing
+  env. The arm body used to push a fresh frame, so writes to
+  outer-scoped bindings inside `case Ok(v): total = v` were
+  discarded on arm exit; only the pattern's introduced names
+  (`v`) stay scoped to the arm. Every accumulator / state machine /
+  Result walker run via `tyc run` (default) used to produce a
+  different answer from `tyc run --compile`.
+
+**HIGH closures:**
+
+- **N1** (`a5b6842`) — `freeze let` multi-line RHS. The
+  `__typhon_freeze__(...)` wrap is now AST-level rather than a
+  text-level fix-up on the binding's first line, so a multi-line
+  dict / list literal no longer leaks out of the synthesised call.
+- **N2** (`89b4685`) — `?` inside a comprehension is now rejected
+  with a targeted diagnostic ("`?` cannot be lifted out of a
+  comprehension — rebind the result and unwrap it"). The previous
+  behaviour silently hoisted past the `for`-binding into a top-level
+  `try`/early-return.
+- **N10** (`6546184`) — `tyc run` now runs a static check before
+  the VM, so unresolved names surface as `tyc::unknown_name`
+  instead of a Python-style `NameError` at VM time.
+- **N11** (`4e17492`) — `tyc migrate` rewrites
+  `class X(Generic[T]):` → `class X[T]:` and drops
+  `T = TypeVar("T")` / `from typing import TypeVar, Generic`
+  declarations. Output now passes a clean `tyc build` on pre-3.12
+  generic idioms.
+- **N13** (`1069fec`) — `match self.<field>:` exhaustiveness.
+  `match_subject_type` now delegates `Expr::Attribute` subjects to
+  `infer_expr_readonly`, so a class with a sealed-union field can
+  match it directly without binding to a local. Non-exhaustive
+  variants still surface both `tyc::non_exhaustive_match` and
+  `tyc::missing_return`.
+
+**MEDIUM closures:**
+
+- **N4** (`c4214e3`) — typed tuple-unpacking `let`.
+  `let (a: int, b: str) = func(x, y)` parses and desugars to a
+  hidden `__typhon_unpack_N__` temp + per-element `let`s carrying
+  user-supplied annotations. Compound annotations (`list[int]`,
+  `tuple[float, ...]`), mixed captures (`let (a: int, b) =
+  pair()`), and the existing un-annotated form all covered.
+- **N8** (`033adc7`) — new `tyc::duplicate_method` diagnostic. Two
+  `impl Foo:` / `extend Foo:` blocks both defining `def get(self)`
+  used to merge silently with Python keeping the last one. Now
+  anchored at the second `def` with rename / delete / merge advice.
+
+**LOW closures:**
+
+- **N3** (`f3c6863`) — comptime `str.join(...)` joins the existing
+  comptime sandbox alongside `str` / `int` / `float` / arithmetic /
+  `env` surface.
+- **N7** (`b73b634`) — newtype boundary mismatches now route
+  through `tyc::newtype_violation` (with help text pointing at the
+  constructor call) instead of `tyc::type_mismatch` (whose
+  wrong-direction advice told users to widen rather than wrap).
+- **N12** (`868fe63`) — a user-authored
+  `from __future__ import annotations` is no longer duplicated by
+  the emit pass.
+
+---
+
+## Closed in previous branch (claude/finish-open-findings-dmLv6)
 
 Branch: `claude/finish-open-findings-dmLv6`. Closed every Open finding
 remaining at the start of the branch: O12, O14, O15, O16, O17, O27,
@@ -397,7 +479,7 @@ already closed. Eight bugs closed by code; seven verified-fixed (the
 findings doc was stale on those). Compiler-wide tests at 1275+, all
 green.
 
-### May 21 follow-up sweep (`claude/finish-open-findings-dmLv6`) — this branch
+### May 21 follow-up sweep (`claude/finish-open-findings-dmLv6`)
 
 Closed every Open finding remaining after the May 21 sweep. Seven new
 diagnostic / desugar / type-check landings:
@@ -415,4 +497,22 @@ diagnostic / desugar / type-check landings:
 
 O19 was verified-fixed against its three known repros — every shape
 type-checks cleanly today even though the find filed in E6 was still
-listed as Open. Compiler-wide tests at 1306+, all green.
+listed as Open. Compiler-wide tests at 1306+, all green. Shipped as
+[v0.3.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.0).
+
+### May 22 round (`claude/typhon-library-testing-ch1yz`) — v0.3.1
+
+A second 0.3-series stress campaign against the v0.3.0 release —
+93 fresh `.ty` programs across nine domain buckets (`01-language-edge`
+through `09-error-quality`). Repro corpus at
+`stress/round-2026-05-22/`. Filed N1–N13: three CRITICAL (silent
+wrong output on `not (X or Y)` / `not (X if C else Y)` emit, VM
+`match`-arm scope loss), five HIGH (multi-line `freeze let`, `?` in
+comprehension, `tyc run` skipping the static check, `tyc migrate`
+output for `Generic[T]` not building, `match self.<field>:` false-
+positive `missing_return`), two MEDIUM (no typed tuple-unpacking
+`let`, silent `impl`/`extend` method merge), three LOW (comptime
+`str.join`, wrong-direction newtype diagnostic, duplicated future-
+import). All 13 closed before the v0.3.1 tag; see
+[Recently closed: 2026-05-22 stress round](#recently-closed-2026-05-22-stress-round-n1n13)
+for the per-finding write-up.

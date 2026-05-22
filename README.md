@@ -126,6 +126,20 @@ See [docs/cli.md](docs/cli.md) for the full reference.
 
 ## Project status
 
+**Current release: [v0.3.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.1)** — a correctness-focused point release on top of [v0.3.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.0)'s "Python-annoyances surface" headline. Highlights since v0.3.0:
+
+- 🔴 **Three CRITICAL silent-wrong-output fixes.** `not (a or b)` no longer round-trips as `not a or b` (De Morgan violation); `not (x if c else y)` keeps its parens; the in-process VM's `match` arm writes now propagate back to the enclosing scope instead of being discarded (every `Result` walker / sealed-union aggregator / state machine used to read `0` from `tyc run` and the right value from `tyc run --compile`).
+- 🟠 **`tyc run` now type-checks first.** The VM used to evaluate programs with unresolved names and crash with a Python-style `NameError`, hiding what should have been a clean `tyc::unknown_name` diagnostic.
+- 🟠 **`tyc migrate` rewrites `Generic[T]` → PEP 695.** Pre-3.12 generic idiom (`T = TypeVar("T")`, `class Box(Generic[T]):`) used to land in the output `.ty` unchanged and trip two errors on the next `tyc build`.
+- 🟢 **New language sugar: typed tuple-unpacking `let`.** `let (a: int, b: str) = func(x, y)` desugars to a temp + per-element `let`s, carrying user-supplied annotations through. Compound annotations and mixed-capture forms covered.
+- 🟢 **New diagnostic: `tyc::duplicate_method`.** Two `impl Foo:` / `extend Foo:` blocks defining the same method used to merge silently — Python kept the last one. Now anchored at the second `def` with a rename / delete / merge suggestion.
+- 🟢 **LSP polish.** Bare-import attribute access (`nn.Module`, `pd.DataFrame`) now paints as a class; venv-introspection failures surface in hover instead of falling through silently; `import torch.nn as nn` prewarms `torch.nn` and not just `torch`. `tyc check` groups errors by file with a per-code summary tally.
+- 🟢 **Performance.** Batched venv signature recovery + a Salsa-shared preprocess across the resolver / type-checker / analyser / desugar passes drops `tyc check` end-to-end cost on every project that touches more than a couple of dependencies.
+
+Full release notes: [CHANGELOG.md](CHANGELOG.md#031). A second stress round (`stress/round-2026-05-22/`, 93 fresh `.ty` programs) drove most of the above; the per-finding write-up is in [docs/findings.md](docs/findings.md).
+
+---
+
 **Phase 0 — Foundation** substantially complete:
 
 - ✅ Cargo workspace skeleton with `crates/` directories
@@ -175,7 +189,7 @@ See [docs/cli.md](docs/cli.md) for the full reference.
 - ✅ `extend ClassName:` (alias for `impl` on user-defined classes); `extend BUILTIN:` for `str`/`list`/`dict`/… extracts each method to a module-level free function and rewrites call sites whose receiver carries a matching static annotation. No monkey-patching of built-ins.
 - ✅ `.dty` stub files compile to PEP 561 `.pyi`. `tyc check --stubs` parses every `.dty` and diffs its surface API (functions, classes, methods, annotated fields, parameter shapes) against the sibling `.ty`/`.py` implementation, emitting `tyc::stub_mismatch` diagnostics for missing-in-impl / missing-in-stub / signature-mismatch findings. A runtime introspection probe (mypy's `stubtest` proper) is still a follow-up.
 
-**Phase 6 — Python-annoyances surface** complete ([v0.3.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.0)):
+**Phase 6 — Python-annoyances surface** complete ([v0.3.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.0), correctness follow-ups in [v0.3.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.1)):
 
 - ✅ **`newtype Name = Base`** — TypeScript-style nominal aliases over primitives. `UserId` flows freely into an `int` slot, but a bare `int` requires explicit `UserId(x)` construction to satisfy a `UserId`-typed target. Compiles to a zero-cost `typing.NewType` call. New `tyc::newtype_violation` diagnostic.
 - ✅ **`freeze let X = expr`** — deep-immutable bindings. Wraps the RHS in `typhon_runtime.freeze.deep_freeze`, recursively replacing `list → tuple`, `dict → MappingProxyType`, `set → frozenset` so the value (not just the name) is locked.

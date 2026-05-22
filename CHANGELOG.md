@@ -4,6 +4,182 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.3.1
+
+A second stress campaign (`stress/round-2026-05-22/`, 93 fresh `.ty`
+programs across nine domain buckets) filed thirteen new findings
+(N1–N13, three of them silent-wrong-output CRITICAL). Every one of
+them is closed in this release. Alongside that sweep: a new
+`tyc::duplicate_method` diagnostic, typed tuple-unpacking on `let`,
+a `tyc migrate` rewrite for the pre-PEP-695 `Generic[T]` idiom, a
+`tyc run` correctness fix that gates VM execution behind a real
+static check, and an LSP / `tyc check` polish pass.
+
+This is a correctness-focused point release. No new headline language
+features; the three CRITICAL fixes (N5, N6 emit parens, N9 VM `match`
+scope) are the reason every adopter on 0.3.0 should upgrade.
+
+### Added — language
+
+- **Typed tuple-unpacking `let` (N4).**
+  `let (a: int, b: str) = func(x, y)` now parses and desugars into a
+  hidden `__typhon_unpack_N__` temp plus per-element `let` lines
+  carrying the user-supplied annotations. Compound annotations
+  (`list[int]`, `dict[str, int]`, `tuple[float, ...]`) survive the
+  top-level-comma split, mixed captures (`let (a: int, b) = pair()`)
+  emit the un-annotated leg with no type so inference fills it in,
+  and the existing un-annotated `let (a, b) = pair()` form flows
+  through unchanged.
+
+### Added — diagnostics
+
+- **`tyc::duplicate_method` (N8).** Two `impl Foo:` / `extend Foo:`
+  blocks both defining `def get(self) -> …` used to merge silently,
+  with Python keeping whichever definition desugar visited last. The
+  new diagnostic anchors the second `def`, suggests rename / delete /
+  merge, and runs after the type checker's class-shape merge so it
+  doesn't double-report against `tyc::impl_unknown_class` for
+  spurious `__typhon_impl_X` pseudo-classes.
+
+### Fixed — emit / VM correctness (the three silent-wrong-output
+finds)
+
+- **`UnaryOp` paren wrap (N5, N6).** `not (a or b)` and
+  `not (x if c else y)` no longer round-trip to the
+  De-Morgan-violating `not a or b` / `not x if c else y` shapes.
+  The `Expr::UnaryOp` printer arm now consults `expr_precedence` on
+  the operand and wraps when the operand is lower-precedence
+  (`Not` = 5, `Or` = 3, `And` = 4, `If` = 2, etc.). Surfaced
+  organically against `05-agents/01-react-agent.ty` — a calculator-
+  tool guard `not (ch.isdigit() or ch in " +-*/()")` was being
+  emitted wrong.
+- **VM `match` arm writes propagate to the outer scope (N9).** The
+  tree-walking VM in `tyc-vm` ran each `case` arm in a fresh
+  environment frame and discarded writes when the arm exited. Any
+  `match` + accumulator pattern — every Result walker, every sealed-
+  union aggregator, every state machine — saw `total = 0` from the
+  VM and `total = 42` from `tyc run --compile`. The arm body now
+  shares the parent env; only the *pattern's* introduced names
+  (`case Ok(v):` introducing `v`) stay scoped to the arm.
+
+### Fixed — `tyc run` / `tyc migrate`
+
+- **`tyc run` gates the VM behind a static check (N10).** Previously
+  the VM would happily evaluate a program with an unresolved name and
+  crash with a Python-style `NameError`, hiding what would have been
+  a clean `tyc::unknown_name` diagnostic. `tyc run` now runs
+  `tyc check` first; only programs that type-check clean reach the
+  VM.
+- **`tyc migrate` rewrites `Generic[T]` → PEP 695 (N11).**
+  Pre-3.12 generic idiom (`from typing import TypeVar, Generic`,
+  `T = TypeVar("T")`, `class Box(Generic[T]):`) used to land in the
+  output `.ty` unchanged, then trip
+  `tyc::typevar_import_rejected` and the `Generic[T]` rejection on
+  the very next `tyc build`. The rewriter now drops module-level
+  `T = TypeVar(...)` declarations (including bounded /
+  `constraints=` forms), rewrites `class X(Generic[T]):` into
+  `class X[T]:` (multi-parameter, mixed-base, and qualified
+  `typing.Generic` forms covered), and elides the now-dead `TypeVar`
+  / `Generic` imports.
+
+### Fixed — type-checker / desugar / emit
+
+- **`freeze let` multi-line RHS (N1).** Multi-line dict and list
+  literals on a `freeze let` no longer leak out of the synthesised
+  `__typhon_freeze__(...)` call; the wrap now happens at the AST
+  level, not as a text-level fix-up on the binding's first line.
+- **`?` inside a comprehension fires a targeted diagnostic (N2).**
+  `[parse(s)? for s in items]` used to silently hoist past the
+  `for`-binding into a top-level `try`/early-return — semantics that
+  no user wanted. The pre-pass now rejects `?` inside any kind of
+  comprehension with a dedicated message ("`?` cannot be lifted out
+  of a comprehension — rebind the result and unwrap it"); the
+  outside-comprehension inline-`?` work (O17) keeps working.
+- **Exhaustiveness on `match self.<field>:` (N13).** The
+  exhaustiveness pass only inspected `Expr::Name` subjects when
+  resolving the static type of a `match` subject. A class with a
+  sealed-union field doing `match self.state:` therefore landed in
+  the "subject type unknown" branch and the missing-return analysis
+  treated the whole match as a potential fall-through (false-
+  positive `tyc::missing_return` over a total match). The subject-
+  type resolver now delegates `Expr::Attribute` to
+  `infer_expr_readonly`. Non-exhaustive variants still surface both
+  `tyc::non_exhaustive_match` and `tyc::missing_return`, as before.
+- **`tyc::newtype_violation` covers boundary mismatches (N7).** A
+  bare `int` flowing into a `UserId`-typed parameter used to fire
+  `tyc::type_mismatch` with help text saying "expected UserId, found
+  int" — the wrong-direction advice for a nominal alias, since the
+  fix is `UserId(x)`, not "annotate as int." The newtype boundary is
+  now routed through `tyc::newtype_violation` with help text that
+  names the constructor call.
+- **`from __future__ import annotations` not duplicated (N12).** A
+  user who hand-wrote `from __future__ import annotations` at the
+  top of a `.ty` file used to get a second one inserted by the emit
+  pass, which Python's compiler then warned about and tools like
+  `ruff format` would re-collapse on every save.
+- **Comptime `str.join(...)` (N3).** Added to the comptime sandbox
+  alongside the existing `str` / `int` / `float` / arithmetic /
+  ternary / `env` surface. `comptime let URL: str = "/".join([host,
+  path])` now evaluates at build time.
+
+### Performance / tooling
+
+- **Batched venv introspection + shared preprocess across check
+  passes.** The third-party signature recovery introduced in 0.2.2
+  used to fire one Python subprocess per module per `tyc check`
+  invocation. The new batch path collects every public class /
+  function across every imported module in one round-trip, and the
+  preprocess output (rewrites for `let`, `pub`, `freeze`, …) is now
+  shared across the resolver, the type-checker, the analyser, and
+  the desugar pass via a Salsa-tracked query — a meaningful drop in
+  end-to-end check time on every project that touches more than a
+  couple of dependencies.
+
+### LSP / `tyc check`
+
+- **Semantic-token kinds for attribute access.** Bare-import access
+  on a third-party class — `nn.Module`, `pd.DataFrame`,
+  `torch.optim.Adam` — now paints as a class instead of falling
+  through to the generic `property` / `method` token. The LSP
+  introspects the receiver module's `dir(...)` once via the existing
+  venv-signature cache and consults a `(receiver, attr) → kind` map
+  before emitting each `Attribute` token.
+- **Grouped `tyc check` diagnostics.** Errors are now grouped by
+  source file (`-- errors in ./src/a.ty --`) instead of interleaved
+  by analysis phase, with a per-code summary tally at the bottom
+  (`1 error(s): tyc::arg_count`, `2 error(s): tyc::type_mismatch`)
+  and an `tyc explain <code>` suggestion. CI logs cluster related
+  errors instead of scattering them across files.
+- **Surface introspection failure reasons in hover.** Hovering a
+  third-party import whose subprocess introspection failed used to
+  silently fall through to "no docs available." Hover now renders
+  the actual reason (`NoPython`, `ImportFailed`, `Timeout`,
+  `SpawnFailed`) and the recovery hint (`Install it with
+  \`tyc add torch\`.`).
+- **Per-module introspection timeout 3 s → 10 s** so heavy ML
+  packages (`torch.nn` triggers C-extension init in the multi-
+  hundred-ms range) complete on cold first-import instead of
+  timing out.
+- **Prewarm the actual dotted module path.** `import torch.nn as nn`
+  now warms `torch.nn`, not just `torch`, so the first `nn.<dot>`
+  doesn't block on the subprocess.
+- **VS Code grammar.** The bundled TextMate grammar gains the v0.3.0
+  keywords (`freeze`, `newtype`, `pub`, `frozen`, `plain`, `class!`),
+  highlights `newtype X = Base` declarations alongside the existing
+  type-alias rule, and accepts stacked modifier chains (`pub freeze
+  let`, `pub comptime let`).
+
+### Stress round 2026-05-22 (recorded in `docs/findings.md`)
+
+- 93 fresh `.ty` programs across `01-language-edge` (incl. paren-
+  precedence + freeze + match), `02-io`, `03-ml-numpy`,
+  `04-ai-llm`, `05-agents`, `06-api`, `07-sdk`, `08-meta-stress`,
+  `09-error-quality`.
+- 13 findings filed (3 CRITICAL silent-wrong-output, 5 HIGH,
+  2 MEDIUM, 3 LOW). All closed in this revision with a regression
+  test plus the original stress probe retained as a forward-looking
+  guard.
+
 ## 0.3.0
 
 Six new language features for everyday Python annoyances, a coordinated
