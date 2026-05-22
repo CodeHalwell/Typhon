@@ -172,7 +172,9 @@ impl VenvSignatures {
                 // pull each entry out of `results` with `remove`
                 // (single hash probe, no clone). (Gemini review #2.)
                 for name in to_fetch {
-                    let shapes = results.remove(name.as_str()).map(|intro| shapes_from_introspected(&intro));
+                    let shapes = results
+                        .remove(name.as_str())
+                        .map(|intro| shapes_from_introspected(&intro));
                     self.cache.insert(name, shapes);
                 }
             }
@@ -182,13 +184,10 @@ impl VenvSignatures {
                 // an unrelated heavyweight import doesn't take the
                 // whole project down with it.
                 for name in to_fetch {
-                    let shapes = introspect_batch_via_python(
-                        python,
-                        &self.cwd,
-                        std::slice::from_ref(&name),
-                    )
-                    .and_then(|mut r| r.remove(name.as_str()))
-                    .map(|intro| shapes_from_introspected(&intro));
+                    let shapes =
+                        introspect_batch_via_python(python, &self.cwd, std::slice::from_ref(&name))
+                            .and_then(|mut r| r.remove(name.as_str()))
+                            .map(|intro| shapes_from_introspected(&intro));
                     self.cache.insert(name, shapes);
                 }
             }
@@ -879,22 +878,20 @@ lazy import np = numpy
         .unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let allowed: HashSet<String> =
-            ["pkg_a", "pkg_b", "pkg_c", "pkg_d", "pkg_e"]
-                .iter()
-                .map(|s| (*s).to_owned())
-                .collect();
+        let allowed: HashSet<String> = ["pkg_a", "pkg_b", "pkg_c", "pkg_d", "pkg_e"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
         let mut cache = VenvSignatures {
             python_bin: Some(stub),
             cwd: tmp.path().to_path_buf(),
             allowed_top_level: allowed,
             cache: HashMap::new(),
         };
-        let modules: Vec<String> =
-            ["pkg_a", "pkg_b", "pkg_c", "pkg_d", "pkg_e"]
-                .iter()
-                .map(|s| (*s).to_owned())
-                .collect();
+        let modules: Vec<String> = ["pkg_a", "pkg_b", "pkg_c", "pkg_d", "pkg_e"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
         cache.preload(&modules);
         // Every requested name lands in the cache, proving the
         // batched call wired the JSON back out correctly.
@@ -969,8 +966,10 @@ lazy import np = numpy
             allowed_top_level: allowed,
             cache: HashMap::new(),
         };
-        let modules: Vec<String> =
-            ["pkg_a", "pkg_b", "pkg_c"].iter().map(|s| (*s).to_owned()).collect();
+        let modules: Vec<String> = ["pkg_a", "pkg_b", "pkg_c"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
         cache.preload(&modules);
         // All three modules end up in the cache because the
         // per-module fallback succeeded for each.
