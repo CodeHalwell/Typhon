@@ -7,7 +7,7 @@ sidebar:
 
 import { Aside } from '@astrojs/starlight/components';
 
-Typhon is in **active development**. The minimum-viable language — non-null types, sealed unions, `Result[T, E]`, dataclass-emit classes — is shippable today. Phase 5 (interop and developer experience) shipped in [v0.1.6](https://github.com/CodeHalwell/Typhon/releases/tag/v0.1.6); Phase 5.5 (constructor / method arity safety) shipped in [v0.2.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.2.0); Phase 6 (Python-annoyances surface) shipped in [v0.3.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.0) with `newtype`, `freeze let`, `pub`, three new effect/safety diagnostics (`blocking_in_async`, `resource_not_managed`, `div_by_zero_literal`), every open finding from the May 2026 stress campaigns closed, and pre-built install artifacts for **Linux** and **Windows** alongside the existing **macOS** binaries. Most of the more advanced features (interfaces, comptime, lazy loading, automatic gather, free-threaded parallelism, the package-manager surface, the REPL, the debugger launcher, the migrator) are also landed; what remains is polish.
+Typhon is in **active development**. The minimum-viable language — non-null types, sealed unions, `Result[T, E]`, dataclass-emit classes — is shippable today. Phase 5 (interop and developer experience) shipped in [v0.1.6](https://github.com/CodeHalwell/Typhon/releases/tag/v0.1.6); Phase 5.5 (constructor / method arity safety) shipped in [v0.2.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.2.0); Phase 6 (Python-annoyances surface) shipped in [v0.3.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.0) with `newtype`, `freeze let`, `pub`, three new effect/safety diagnostics (`blocking_in_async`, `resource_not_managed`, `div_by_zero_literal`), every open finding from the May 2026 stress campaigns closed, and pre-built install artifacts for **Linux** and **Windows** alongside the existing **macOS** binaries. [v0.3.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.1) is a correctness point release that closes the 2026-05-22 stress round (N1–N13: three CRITICAL silent-wrong-output bugs in emit / VM, five HIGH, two MEDIUM, three LOW), adds the `tyc::duplicate_method` diagnostic plus typed tuple-unpacking `let`, rewrites `Generic[T]` → PEP 695 in `tyc migrate`, gates `tyc run` behind a real static check, and lands an LSP / `tyc check` polish pass (semantic class kinds, grouped diagnostics, surfaced introspection failures, batched venv signatures). Most of the more advanced features (interfaces, comptime, lazy loading, automatic gather, free-threaded parallelism, the package-manager surface, the REPL, the debugger launcher, the migrator) are also landed; what remains is polish.
 
 The canonical per-feature status lives in the [Roadmap](/Typhon/project/roadmap/). This page is a quick summary.
 
@@ -55,6 +55,22 @@ The canonical per-feature status lives in the [Roadmap](/Typhon/project/roadmap/
 
 - ✅ CI (`cargo fmt`, `clippy -D warnings`, `cargo test --workspace`, `cargo-deny`).
 - ✅ Generated `typhon_runtime/` ships as local source — no PyPI dependency.
+
+## Landed in v0.3.1 (correctness follow-up)
+
+- ✅ **Three CRITICAL silent-wrong-output fixes.** `not (a or b)` no longer round-trips as `not a or b` (De Morgan violation); `not (x if c else y)` keeps its parens; the in-process VM's `match` arm writes propagate back to the enclosing scope instead of being discarded (every `Result` walker / sealed-union aggregator / state machine used to read `0` from `tyc run` and the right value from `tyc run --compile`).
+- ✅ **`tyc run` gates the VM behind a real static check.** Programs with unresolved names now surface `tyc::unknown_name` at check time instead of crashing with a Python-style `NameError` at VM time.
+- ✅ **`tyc migrate` rewrites `Generic[T]` → PEP 695.** Pre-3.12 generic idiom (`T = TypeVar("T")`, `class Box(Generic[T]):`) is rewritten to `class Box[T]:` and the dead `TypeVar` / `Generic` imports are elided; multi-parameter, mixed-base, and qualified `typing.Generic` forms covered.
+- ✅ **Typed tuple-unpacking `let`.** `let (a: int, b: str) = func(x, y)` desugars to a hidden temp plus per-element `let`s carrying user-supplied annotations. Compound annotations and mixed-capture forms covered.
+- ✅ **`tyc::duplicate_method`.** Two `impl Foo:` / `extend Foo:` blocks defining `def get(self) -> …` used to merge silently with Python keeping whichever came last. Now anchored at the second `def` with rename / delete / merge advice.
+- ✅ **`tyc::newtype_violation` covers boundary mismatches.** A bare `int` flowing into a `UserId`-typed parameter now routes through the newtype diagnostic instead of `type_mismatch` with wrong-direction advice.
+- ✅ **`?` inside a comprehension → targeted diagnostic.** The previous behaviour silently hoisted past the `for`-binding; now rejected at desugar.
+- ✅ **`match self.<field>:` exhaustiveness.** Subject-type resolver now delegates `Expr::Attribute` to `infer_expr_readonly`, so a class with a sealed-union field can match it directly without binding to a local.
+- ✅ **`from __future__ import annotations` not duplicated** when the user authored their own.
+- ✅ **Comptime `str.join(...)`** added to the sandbox.
+- ✅ **LSP polish.** Bare-import attribute access (`nn.Module`, `pd.DataFrame`) paints as a class via a `(receiver, attr) → kind` map fed from the venv-introspection cache; introspection failures surface in hover with a recovery hint; `import torch.nn as nn` prewarms `torch.nn` (not just `torch`); per-module timeout 3 s → 10 s; VS Code TextMate grammar gains v0.3.0 keywords (`freeze`, `newtype`, `pub`, `frozen`, `plain`, `class!`) and stacked-modifier (`pub freeze let`) support.
+- ✅ **`tyc check` groups errors by source file** with a per-code summary tally (`1 error(s): tyc::arg_count`, …) and an `tyc explain <code>` suggestion footer.
+- ✅ **Batched venv signature recovery + Salsa-shared preprocess** across the resolver / type-checker / analyser / desugar passes.
 
 ## Landed in Phase 6 (Python-annoyances surface) — v0.3.0
 

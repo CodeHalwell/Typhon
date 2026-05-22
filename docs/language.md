@@ -326,6 +326,10 @@ def inc() -> None:
 
 Deep immutability for class instances is an emit-time concern: pass `frozen=True` to the underlying dataclass / Pydantic config. A `freeze` modifier with stronger recursive guarantees may land later; `let` itself stays scoped to bindings.
 
+### Tuple-unpacking `let` (with per-element types)
+
+`let (a: int, b: str) = func(x, y)` is sugar for "bind the result of `func(x, y)` to a hidden temp, then introduce `a: int` and `b: str` from the temp's first and second elements." Compound annotations survive the top-level-comma split (`let (xs: list[int], m: dict[str, int]) = …`), and mixed forms emit the un-annotated leg without a type so the checker fills it in (`let (a: int, b) = pair()`). The un-annotated tuple form (`let (a, b) = pair()`) continues to flow through unchanged with no synthetic temp.
+
 ## Lazy loading
 
 - `lazy import np = numpy` → defers module loading until first attribute access via a generated `__TyphonLazy_<alias>_` proxy class (thread-safe, double-checked locking).

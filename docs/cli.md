@@ -110,6 +110,8 @@ tyc cheatsheet | less           # paginate it
 Converts typed Python (`.py`) to Typhon (`.ty`) in one pass:
 
 - `Optional[T]` / `T | None` → `T?`
+- `Union[T, None]` (and `Union[None, T]`, including the `typing.Union[...]` qualified form) → `T?`; multi-arm unions fall through to PEP 604 pipe syntax, and the now-dead `typing.Union` import is elided.
+- `class X(Generic[T]):` → `class X[T]:` (PEP 695). Multi-parameter generics (`Generic[T, U]` → `[T, U]`), mixed bases (`class X(Generic[T], OtherBase):` → `class X[T](OtherBase):`), and qualified `typing.Generic` forms are all covered. Module-level `T = TypeVar("T")` declarations (including bounded / `constraints=` forms) are dropped because Typhon's PEP 695 syntax expresses bounds inline; the `TypeVar` / `Generic` imports are elided when no longer referenced.
 - Module-level annotated assignments (`x: int = 1`) gain `let` (or `mut` when later reassigned).
 - Function-body plain assignments (`user = find_user(1)`, `total = 0`) gain `let` on first occurrence per function, promoted to `mut` if the same name is reassigned anywhere else in the file (the reassignment flag is file-wide, so an accumulator named `total` in one function will also tag a one-shot `total = 0` in another function as `mut` — a deliberate over-approximation, since `mut` on an unmutated binding still type-checks). Subsequent assignments to the same name in the same scope are left bare (correct re-binding). Class-body annotated assignments are left untouched — those are field declarations, not locals.
 - `@dataclass` decorators and their `from dataclasses import dataclass` are dropped.
@@ -245,6 +247,8 @@ Executes a Typhon program. Two execution modes:
 
 - **VM (default).** Runs the source in the in-process tree-walking interpreter from `tyc-vm`. No `.py` is written, no CPython is spawned. See [docs/vm.md](vm.md) for the supported feature surface.
 - **`--compile`** (alias `--no-vm`). Falls back to the legacy "build then exec CPython" path — required when your program imports CPython libraries the VM doesn't speak natively (`numpy`, `requests`, `pandas`, …).
+
+Both modes type-check before executing. VM mode runs `tyc check` directly; `--compile` mode runs the full `tyc build` pipeline (which includes the check). The VM used to skip the static pass and crash with a Python-style `NameError` on programs that should have surfaced `tyc::unknown_name`; v0.3.1 gates VM execution behind the check pipeline, so unresolved names / type errors / arity mismatches fail the same way they would under `tyc check` or `tyc build`. The `TYC_SKIP_CHECK=1` env var disables the pre-VM check for the rare case where you want the legacy run-only-the-VM behaviour (mostly: probing the VM against deliberately-broken inputs in stress harnesses). `--compile` has no equivalent bypass — the build pipeline always type-checks.
 
 The script's exit code propagates verbatim, so shell pipelines see the child's status unchanged. Parse, build, and spawn failures surface as the usual miette errors with exit code 1.
 
