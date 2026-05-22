@@ -932,8 +932,39 @@ fn eval_method_call(
                 .collect();
             Ok(ComptimeValue::List(parts))
         }
+        // N3 (2026-05-22): pair `split` with `join`. Common pattern:
+        // a comptime-derived list of tags from an env var, then a
+        // canonical comma-joined string to embed in a banner.
+        (ComptimeValue::Str(sep), "join") => {
+            expect_arity(method, 1, &args)?;
+            // Accept a list or tuple of strings.
+            let items: Vec<&str> = match &args[0] {
+                ComptimeValue::List(xs) | ComptimeValue::Tuple(xs) => {
+                    let mut strs: Vec<&str> = Vec::with_capacity(xs.len());
+                    for x in xs {
+                        match x {
+                            ComptimeValue::Str(s) => strs.push(s.as_str()),
+                            _ => {
+                                return Err(
+                                    "comptime str.join() requires an iterable of str — \
+                                     a non-string element appeared"
+                                        .into(),
+                                )
+                            }
+                        }
+                    }
+                    strs
+                }
+                _ => {
+                    return Err(
+                        "comptime str.join() requires a list / tuple of str".into(),
+                    )
+                }
+            };
+            Ok(ComptimeValue::Str(items.join(sep)))
+        }
         (ComptimeValue::Str(_), other) => Err(format!(
-            "comptime str method '{other}' is not supported; available: upper, lower, strip, lstrip, rstrip, replace, startswith, endswith, split"
+            "comptime str method '{other}' is not supported; available: upper, lower, strip, lstrip, rstrip, replace, startswith, endswith, split, join"
         )),
 
         // ── unsupported receiver ─────────────────────────────────────
@@ -1933,6 +1964,27 @@ comptime let Y: int = use_outer()
             values.get("PARTS").map(|v| v.to_python_literal()),
             Some("[\"a\", \"b\", \"c\"]".into())
         );
+    }
+
+    #[test]
+    fn comptime_str_join_returns_string() {
+        // Regression for N3 (2026-05-22): the natural pair of `split`
+        // was missing from the comptime sandbox.
+        let (values, diags) = eval(
+            "comptime let TAGS: list[str] = [\"a\", \"b\", \"c\"]\n\
+             comptime let CSV: str = \",\".join(TAGS)\n",
+        );
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        assert!(matches!(
+            values.get("CSV"),
+            Some(ComptimeValue::Str(s)) if s == "a,b,c"
+        ));
+    }
+
+    #[test]
+    fn comptime_str_join_rejects_non_string_element() {
+        let (_, diags) = eval("comptime let BAD: str = \",\".join([1, 2, 3])\n");
+        assert!(diags.has_errors(), "expected an error for non-str join arg");
     }
 
     #[test]

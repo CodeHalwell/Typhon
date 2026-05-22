@@ -1,0 +1,32 @@
+# Probe: multi-line pipe expressions across multiple stages.
+
+
+def add5(x: int) -> int:
+    return x + 5
+
+
+def double(x: int) -> int:
+    return x * 2
+
+
+def to_str(x: int) -> str:
+    return f"<{x}>"
+
+
+def main() -> None:
+    # Multi-line pipe (line continuation via parens)
+    let r1: str = (
+        1
+        |> add5()
+        |> double()
+        |> add5()
+        |> to_str()
+    )
+    print(r1)
+
+    # Pipe with line continuation via trailing `|>` — not supported,
+    # but pipe inside an explicit ( ... ) group is.
+
+
+if __name__ == "__main__":
+    main()

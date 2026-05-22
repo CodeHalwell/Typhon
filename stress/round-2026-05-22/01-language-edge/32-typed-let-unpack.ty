@@ -1,0 +1,28 @@
+# Probe: typed tuple-unpacking let.
+# N4 fix (2026-05-22): `let (a: int, b: str) = func()` now works.
+
+
+def returns_pair() -> tuple[int, str]:
+    return (42, "hello")
+
+
+def returns_triple() -> tuple[int, int, str]:
+    return (1, 2, "three")
+
+
+def main() -> None:
+    # Typed unpacking — both annotated.
+    let (a: int, b: str) = returns_pair()
+    print(f"{a}: {b}")
+
+    # Three captures.
+    let (x: int, y: int, z: str) = returns_triple()
+    print(f"{x} + {y} = {x + y}; tag={z}")
+
+    # Mixed: one typed, one inferred.
+    let (m: int, n) = returns_pair()
+    print(f"{m} / {n}")
+
+
+if __name__ == "__main__":
+    main()

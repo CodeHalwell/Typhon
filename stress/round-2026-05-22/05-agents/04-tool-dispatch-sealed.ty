@@ -1,0 +1,82 @@
+# Agent test: typed tool dispatch with sealed-union request/response.
+
+
+# === Tool request types ===
+type ToolRequest = WeatherReq | CalcReq | TimeReq
+
+
+class WeatherReq:
+    city: str
+
+class CalcReq:
+    expression: str
+
+class TimeReq:
+    label: str
+
+
+# === Tool response types ===
+type ToolResponse = WeatherResp | CalcResp | TimeResp | ToolFailure
+
+
+class WeatherResp:
+    city: str
+    forecast: str
+
+class CalcResp:
+    result: int
+
+class TimeResp:
+    iso: str
+
+class ToolFailure:
+    tool_name: str
+    error: str
+
+
+def dispatch(req: ToolRequest) -> ToolResponse:
+    match req:
+        case WeatherReq(c):
+            if c.lower() == "moonbase":
+                return ToolFailure(tool_name="weather", error="unknown city")
+            return WeatherResp(city=c, forecast="sunny, 22°C")
+        case CalcReq(expr):
+            # only digits, +, -, *, /, ()
+            for ch in expr:
+                if not (ch.isdigit() or ch in " +-*/()"):
+                    return ToolFailure(tool_name="calc", error=f"refused: {ch!r}")
+            try:
+                let r: int = eval(expr, {"__builtins__": {}}, {})
+                return CalcResp(result=r)
+            except Exception as e:
+                return ToolFailure(tool_name="calc", error=str(e))
+        case TimeReq(_):
+            return TimeResp(iso="2026-05-22T12:00:00Z")
+
+
+def render(r: ToolResponse) -> str:
+    match r:
+        case WeatherResp(c, f):
+            return f"weather({c}) = {f}"
+        case CalcResp(v):
+            return f"calc = {v}"
+        case TimeResp(t):
+            return f"time = {t}"
+        case ToolFailure(name, err):
+            return f"FAIL({name}): {err}"
+
+
+def main() -> None:
+    let reqs: list[ToolRequest] = [
+        WeatherReq(city="London"),
+        WeatherReq(city="Moonbase"),
+        CalcReq(expression="2 + 3 * 4"),
+        CalcReq(expression="import os"),
+        TimeReq(label="now"),
+    ]
+    for r in reqs:
+        print(render(dispatch(r)))
+
+
+if __name__ == "__main__":
+    main()

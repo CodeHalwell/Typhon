@@ -1,0 +1,113 @@
+# AI test: message thread with sealed-union role and content blocks.
+
+type Role = SystemRole | UserRole | AssistantRole | ToolRole
+
+
+class SystemRole:
+    label: str
+
+
+class UserRole:
+    label: str
+
+
+class AssistantRole:
+    label: str
+
+
+class ToolRole:
+    tool_call_id: str
+
+
+# Content blocks as a sealed union
+type Block = TextBlock | ToolCallBlock | ToolResultBlock
+
+
+class TextBlock:
+    text: str
+
+
+class ToolCallBlock:
+    id: str
+    name: str
+    arguments: dict[str, str]
+
+
+class ToolResultBlock:
+    call_id: str
+    output: str
+    is_error: bool
+
+
+class Message:
+    role: Role
+    blocks: list[Block]
+
+
+class Thread:
+    messages: list[Message]
+    system: str?
+
+
+impl Thread:
+    def add_user(self, text: str) -> None:
+        self.messages.append(Message(role=UserRole(label="user"), blocks=[TextBlock(text=text)]))
+
+    def add_assistant_text(self, text: str) -> None:
+        self.messages.append(Message(role=AssistantRole(label="assistant"), blocks=[TextBlock(text=text)]))
+
+    def add_tool_call(self, name: str, args: dict[str, str]) -> str:
+        let call_id: str = f"call_{len(self.messages)}"
+        let block: ToolCallBlock = ToolCallBlock(id=call_id, name=name, arguments=args)
+        self.messages.append(Message(role=AssistantRole(label="assistant"), blocks=[block]))
+        return call_id
+
+    def add_tool_result(self, call_id: str, output: str, is_error: bool = False) -> None:
+        let block: ToolResultBlock = ToolResultBlock(call_id=call_id, output=output, is_error=is_error)
+        self.messages.append(Message(role=ToolRole(tool_call_id=call_id), blocks=[block]))
+
+    def render(self) -> str:
+        mut lines: list[str] = []
+        if self.system is not None:
+            lines.append(f"[system] {self.system}")
+        for m in self.messages:
+            let role_str: str = role_name(m.role)
+            for b in m.blocks:
+                lines.append(f"[{role_str}] {render_block(b)}")
+        return "\n".join(lines)
+
+
+def role_name(r: Role) -> str:
+    match r:
+        case SystemRole(l):
+            return l
+        case UserRole(l):
+            return l
+        case AssistantRole(l):
+            return l
+        case ToolRole(_):
+            return "tool"
+
+
+def render_block(b: Block) -> str:
+    match b:
+        case TextBlock(t):
+            return t
+        case ToolCallBlock(_, name, args):
+            return f"call {name}({args})"
+        case ToolResultBlock(_, out, is_err):
+            let prefix: str = "ERROR" if is_err else "RESULT"
+            return f"{prefix}: {out}"
+
+
+def main() -> None:
+    let thread: Thread = Thread(messages=[], system="You are a helpful assistant.")
+    thread.add_user("What's 7 * 8?")
+    let call_id: str = thread.add_tool_call("multiply", {"a": "7", "b": "8"})
+    thread.add_tool_result(call_id, "56")
+    thread.add_assistant_text("Seven times eight equals fifty-six.")
+    print(thread.render())
+
+
+if __name__ == "__main__":
+    main()

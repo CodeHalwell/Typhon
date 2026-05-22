@@ -1,0 +1,25 @@
+# Probe: frozen class behaviour.
+
+class Point frozen:
+    x: float
+    y: float
+
+
+impl Point:
+    def magnitude(self) -> float:
+        return (self.x * self.x + self.y * self.y) ** 0.5
+
+    def translate(self, dx: float, dy: float) -> "Point":
+        # Frozen: must build new instance
+        return Point(x=self.x + dx, y=self.y + dy)
+
+
+def main() -> None:
+    let p: Point = Point(x=3.0, y=4.0)
+    print(f"|p|={p.magnitude()}")
+    let q: Point = p.translate(1.0, 1.0)
+    print(f"q=({q.x}, {q.y})")
+
+
+if __name__ == "__main__":
+    main()

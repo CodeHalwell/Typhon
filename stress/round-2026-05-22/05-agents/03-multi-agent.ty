@@ -1,0 +1,77 @@
+# Agent test: multi-agent coordination using async + gather + go.
+import asyncio
+
+
+class Task:
+    id: int
+    description: str
+    answer: str?
+
+
+class AgentResult:
+    agent_name: str
+    output: str
+    elapsed_ms: float
+
+
+@gatherable
+async def planner(t: Task) -> AgentResult:
+    await asyncio.sleep(0.01)
+    return AgentResult(
+        agent_name="planner",
+        output=f"plan for #{t.id}: investigate, draft, review",
+        elapsed_ms=10.0,
+    )
+
+
+@gatherable
+async def researcher(t: Task) -> AgentResult:
+    await asyncio.sleep(0.02)
+    return AgentResult(
+        agent_name="researcher",
+        output=f"research findings for #{t.id}: ...",
+        elapsed_ms=20.0,
+    )
+
+
+@gatherable
+async def critic(t: Task) -> AgentResult:
+    await asyncio.sleep(0.015)
+    return AgentResult(
+        agent_name="critic",
+        output=f"critique #{t.id}: needs more depth",
+        elapsed_ms=15.0,
+    )
+
+
+async def workflow(t: Task) -> list[AgentResult]:
+    # Run planner first (sequential), then researcher and critic in parallel.
+    let plan: AgentResult = await planner(t)
+    gather:
+        r = researcher(t)
+        c = critic(t)
+    return [plan, r, c]
+
+
+async def main_async() -> None:
+    let tasks: list[Task] = [
+        Task(id=1, description="A", answer=None),
+        Task(id=2, description="B", answer=None),
+        Task(id=3, description="C", answer=None),
+    ]
+    # Run workflows for all tasks concurrently — manual TaskGroup since
+    # imported `workflow` won't auto-gather inside loop body anyway.
+    let coroutines = [workflow(t) for t in tasks]
+    let all_results: list[list[AgentResult]] = await asyncio.gather(*coroutines)
+    for i, results in enumerate(all_results):
+        print(f"=== task #{tasks[i].id} ===")
+        for r in results:
+            print(f"  [{r.agent_name}] {r.output}")
+
+
+def main() -> None:
+    asyncio.run(main_async())
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,63 @@
+# IO test: write a CSV, read it back, parse JSON, validate.
+import csv
+import json
+import os
+import tempfile
+
+
+class Record:
+    id: int
+    name: str
+    score: float
+
+
+def write_csv(path: str, rows: list[Record]) -> None:
+    with open(path, "w", newline="") as f:
+        let w = csv.writer(f)
+        w.writerow(["id", "name", "score"])
+        for r in rows:
+            w.writerow([r.id, r.name, r.score])
+
+
+def read_csv(path: str) -> Result[list[Record], str]:
+    try:
+        mut out: list[Record] = []
+        with open(path, newline="") as f:
+            let r = csv.DictReader(f)
+            for row in r:
+                out.append(Record(
+                    id=int(row["id"]),
+                    name=row["name"],
+                    score=float(row["score"]),
+                ))
+        return Ok(out)
+    except (OSError, ValueError, KeyError) as e:
+        return Err(f"read: {e}")
+
+
+def to_json(records: list[Record]) -> str:
+    return json.dumps([{"id": r.id, "name": r.name, "score": r.score} for r in records])
+
+
+def main() -> None:
+    let records: list[Record] = [
+        Record(id=1, name="Ada", score=99.5),
+        Record(id=2, name="Bob", score=87.0),
+        Record(id=3, name="Carol", score=76.5),
+    ]
+    let tmp = tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".csv", newline="")
+    tmp.close()
+    let path: str = tmp.name
+    try:
+        write_csv(path, records)
+        match read_csv(path):
+            case Ok(rows):
+                print(to_json(rows))
+            case Err(e):
+                print(f"ERR: {e}")
+    finally:
+        os.unlink(path)
+
+
+if __name__ == "__main__":
+    main()

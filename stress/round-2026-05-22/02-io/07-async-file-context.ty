@@ -1,0 +1,59 @@
+# IO test: async file ops via asyncio.to_thread + Result handling.
+import asyncio
+import tempfile
+import os
+
+
+async def write_lines(path: str, lines: list[str]) -> Result[int, str]:
+    def _write() -> int:
+        with open(path, "w") as f:
+            mut n: int = 0
+            for line in lines:
+                f.write(line + "\n")
+                n = n + 1
+            return n
+    try:
+        let n: int = await asyncio.to_thread(_write)
+        return Ok(n)
+    except OSError as e:
+        return Err(str(e))
+
+
+async def read_lines(path: str) -> Result[list[str], str]:
+    def _read() -> list[str]:
+        with open(path) as f:
+            return [line.rstrip("\n") for line in f]
+    try:
+        let lines: list[str] = await asyncio.to_thread(_read)
+        return Ok(lines)
+    except OSError as e:
+        return Err(str(e))
+
+
+async def main_async() -> None:
+    let tmp = tempfile.NamedTemporaryFile(mode="w", delete=False)
+    tmp.close()
+    let path: str = tmp.name
+    try:
+        let wr: Result[int, str] = await write_lines(path, ["alpha", "beta", "gamma"])
+        match wr:
+            case Ok(n):
+                print(f"wrote {n} lines")
+            case Err(e):
+                print(f"write err: {e}")
+        let rd: Result[list[str], str] = await read_lines(path)
+        match rd:
+            case Ok(lines):
+                print(f"read: {lines}")
+            case Err(e):
+                print(f"read err: {e}")
+    finally:
+        os.unlink(path)
+
+
+def main() -> None:
+    asyncio.run(main_async())
+
+
+if __name__ == "__main__":
+    main()

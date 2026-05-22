@@ -1,0 +1,75 @@
+# SDK test: typed event bus with sealed-union events + subscribers.
+
+type Event = UserCreated | UserDeleted | OrderPlaced | OrderRefunded
+
+
+class UserCreated:
+    user_id: int
+    email: str
+class UserDeleted:
+    user_id: int
+class OrderPlaced:
+    order_id: int
+    amount: float
+class OrderRefunded:
+    order_id: int
+    reason: str
+
+
+type Handler = Callable[[Event], None]
+
+
+class EventBus:
+    subscribers: list[Handler]
+    log: list[str]
+
+
+impl EventBus:
+    def subscribe(self, h: Handler) -> None:
+        self.subscribers.append(h)
+
+    def emit(self, e: Event) -> None:
+        self.log.append(describe(e))
+        for h in self.subscribers:
+            h(e)
+
+
+def describe(e: Event) -> str:
+    match e:
+        case UserCreated(uid, email):
+            return f"user_created: #{uid} <{email}>"
+        case UserDeleted(uid):
+            return f"user_deleted: #{uid}"
+        case OrderPlaced(oid, amt):
+            return f"order_placed: #{oid} ${amt:.2f}"
+        case OrderRefunded(oid, reason):
+            return f"order_refunded: #{oid} ({reason})"
+
+
+class Audit:
+    entries: list[str]
+
+
+impl Audit:
+    def handle(self, e: Event) -> None:
+        self.entries.append(describe(e))
+
+
+def main() -> None:
+    let bus: EventBus = EventBus(subscribers=[], log=[])
+    let audit: Audit = Audit(entries=[])
+    bus.subscribe(audit.handle)
+    bus.subscribe(lambda e: print(f"[live] {describe(e)}"))
+
+    bus.emit(UserCreated(user_id=1, email="alice@example.com"))
+    bus.emit(OrderPlaced(order_id=42, amount=19.99))
+    bus.emit(OrderRefunded(order_id=42, reason="customer request"))
+    bus.emit(UserDeleted(user_id=1))
+
+    print("---")
+    for entry in audit.entries:
+        print(f"AUDIT: {entry}")
+
+
+if __name__ == "__main__":
+    main()

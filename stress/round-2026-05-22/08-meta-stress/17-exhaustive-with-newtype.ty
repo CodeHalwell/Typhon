@@ -1,0 +1,40 @@
+# Probe: pattern matching with newtype-wrapped fields.
+
+newtype UserId = int
+newtype OrderId = int
+
+
+class CreateUser:
+    name: str
+class DeleteUser:
+    uid: UserId
+class PlaceOrder:
+    uid: UserId
+    items: list[str]
+
+
+type Cmd = CreateUser | DeleteUser | PlaceOrder
+
+
+def run(c: Cmd) -> str:
+    match c:
+        case CreateUser(name):
+            return f"create: {name}"
+        case DeleteUser(uid):
+            return f"delete: #{int(uid)}"
+        case PlaceOrder(uid, items):
+            return f"order from #{int(uid)}: {items}"
+
+
+def main() -> None:
+    let cmds: list[Cmd] = [
+        CreateUser(name="Alice"),
+        PlaceOrder(uid=UserId(42), items=["a", "b"]),
+        DeleteUser(uid=UserId(7)),
+    ]
+    for c in cmds:
+        print(run(c))
+
+
+if __name__ == "__main__":
+    main()

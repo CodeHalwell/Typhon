@@ -1,0 +1,51 @@
+# SDK test: cursor-based paginator with generic page item type.
+
+class Page[T]:
+    items: list[T]
+    next_cursor: str?
+
+
+class Paginator[T]:
+    fetch: Callable[[str?], Page[T]]
+    cursor: str?
+    exhausted: bool
+
+
+impl[T] Paginator[T]:
+    def next_page(self) -> Page[T]?:
+        if self.exhausted:
+            return None
+        let p: Page[T] = self.fetch(self.cursor)
+        self.cursor = p.next_cursor
+        if p.next_cursor is None:
+            self.exhausted = True
+        return p
+
+    def all(self) -> list[T]:
+        mut out: list[T] = []
+        while True:
+            let p: Page[T]? = self.next_page()
+            if p is None:
+                break
+            for item in p.items:
+                out.append(item)
+        return out
+
+
+def fake_fetcher(cursor: str?) -> Page[int]:
+    if cursor is None:
+        return Page(items=[1, 2, 3], next_cursor="c1")
+    if cursor == "c1":
+        return Page(items=[4, 5, 6], next_cursor="c2")
+    if cursor == "c2":
+        return Page(items=[7, 8, 9], next_cursor=None)
+    return Page(items=[], next_cursor=None)
+
+
+def main() -> None:
+    let p: Paginator[int] = Paginator(fetch=fake_fetcher, cursor=None, exhausted=False)
+    print(p.all())
+
+
+if __name__ == "__main__":
+    main()

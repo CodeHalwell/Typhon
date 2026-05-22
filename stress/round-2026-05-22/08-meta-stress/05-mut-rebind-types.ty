@@ -1,0 +1,17 @@
+# Meta-stress: mut binding type policies.
+
+def changing_type() -> None:
+    mut x: int = 5
+    # Reassign to same type — OK
+    x = 6
+    # Reassign to different concrete type — should be tyc::type_mismatch
+    x = "hello"
+    print(x)
+
+
+def main() -> None:
+    changing_type()
+
+
+if __name__ == "__main__":
+    main()

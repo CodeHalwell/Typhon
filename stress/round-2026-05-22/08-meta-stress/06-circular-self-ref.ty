@@ -1,0 +1,50 @@
+# Meta-stress: self-referential / circular types.
+
+class Node:
+    value: int
+    next: "Node?"
+
+
+impl Node:
+    def sum_list(self) -> int:
+        mut total: int = 0
+        mut cur: Node? = self
+        while cur is not None:
+            total += cur.value
+            cur = cur.next
+        return total
+
+    def length(self) -> int:
+        mut n: int = 0
+        mut cur: Node? = self
+        while cur is not None:
+            n = n + 1
+            cur = cur.next
+        return n
+
+
+def build_list(values: list[int]) -> Node?:
+    if len(values) == 0:
+        return None
+    let head: Node = Node(value=values[0], next=None)
+    mut cur: Node = head
+    mut i: int = 1
+    while i < len(values):
+        let new_node: Node = Node(value=values[i], next=None)
+        cur.next = new_node
+        cur = new_node
+        i = i + 1
+    return head
+
+
+def main() -> None:
+    let head: Node? = build_list([10, 20, 30, 40])
+    if head is None:
+        print("empty")
+        return
+    print(f"length = {head.length()}")
+    print(f"sum    = {head.sum_list()}")
+
+
+if __name__ == "__main__":
+    main()

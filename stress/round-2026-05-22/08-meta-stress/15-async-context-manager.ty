@@ -1,0 +1,39 @@
+# Probe: async context manager + async iterator.
+import asyncio
+
+
+class AsyncCounter:
+    n: int
+
+
+impl AsyncCounter:
+    async def __aenter__(self) -> "AsyncCounter":
+        self.n = 0
+        return self
+
+    async def __aexit__(self, exc_type: type?, exc: BaseException?, tb: object?) -> bool:
+        return False
+
+    def __aiter__(self) -> "AsyncCounter":
+        return self
+
+    async def __anext__(self) -> int:
+        if self.n >= 3:
+            raise StopAsyncIteration
+        self.n = self.n + 1
+        await asyncio.sleep(0.001)
+        return self.n
+
+
+async def main_async() -> None:
+    async with AsyncCounter(n=0) as c:
+        async for v in c:
+            print(f"v={v}")
+
+
+def main() -> None:
+    asyncio.run(main_async())
+
+
+if __name__ == "__main__":
+    main()

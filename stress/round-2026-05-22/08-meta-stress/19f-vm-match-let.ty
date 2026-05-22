@@ -1,0 +1,15 @@
+# Probe: VM match with `let` first-assignment inside arm — write to NEW name.
+
+def main() -> None:
+    let v: int = 42
+    match v:
+        case 42:
+            let result: str = "matched"
+        case _:
+            let result: str = "no match"
+    # Try to print result — note Python's match doesn't introduce new scope
+    print(f"result = {result}")
+
+
+if __name__ == "__main__":
+    main()

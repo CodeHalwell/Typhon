@@ -1,0 +1,38 @@
+# Probe: `?` inside non-trivial expression contexts.
+# Per O17 closure: `?` mid-expression should work now via __typhon_qi_N__ rewrites.
+
+
+def parse(s: str) -> Result[int, str]:
+    if not s.isdigit():
+        return Err(f"bad: {s}")
+    return Ok(int(s))
+
+
+def add_three(a: int, b: int, c: int) -> int:
+    return a + b + c
+
+
+def chain(a: str, b: str, c: str) -> Result[int, str]:
+    return Ok(add_three(parse(a)?, parse(b)?, parse(c)?))
+
+
+def in_tuple(a: str, b: str) -> Result[tuple[int, int], str]:
+    return Ok((parse(a)?, parse(b)?))
+
+
+def in_list(items: list[str]) -> Result[int, str]:
+    # ? inside a list literal that's then summed.
+    # Probably hard to lower correctly because of evaluation order.
+    let xs: list[int] = [parse(items[0])?, parse(items[1])?]
+    return Ok(sum(xs))
+
+
+def main() -> None:
+    print(chain("1", "2", "3"))
+    print(chain("1", "x", "3"))
+    print(in_tuple("10", "20"))
+    print(in_list(["7", "8"]))
+
+
+if __name__ == "__main__":
+    main()

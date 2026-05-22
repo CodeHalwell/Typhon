@@ -1,0 +1,55 @@
+# Probe: freeze let with deeply nested mutable structures.
+# Hypothesis: runtime deep-freeze prevents nested mutation through MappingProxyType
+# and tuple conversion.
+
+freeze let CONFIG = {
+    "ports": [8080, 8081, 8082],
+    "hosts": {"primary": "a.example.com", "secondary": "b.example.com"},
+    "tags": {"alpha", "beta"},
+    "nested": {"deep": {"deeper": [1, 2, 3]}},
+}
+
+
+def try_mutate_top() -> str:
+    try:
+        # Should fail: dict is wrapped in MappingProxyType
+        CONFIG["new_key"] = "x"  # type: ignore
+        return "FAIL: top-level mutation allowed"
+    except TypeError as e:
+        return f"OK top: {type(e).__name__}"
+
+
+def try_mutate_list() -> str:
+    try:
+        # CONFIG["ports"] is a tuple after deep-freeze; .append should fail.
+        CONFIG["ports"].append(9999)  # type: ignore
+        return "FAIL: list mutation allowed"
+    except AttributeError as e:
+        return f"OK list: {type(e).__name__}"
+
+
+def try_mutate_set() -> str:
+    try:
+        CONFIG["tags"].add("gamma")  # type: ignore
+        return "FAIL: set mutation allowed"
+    except AttributeError as e:
+        return f"OK set: {type(e).__name__}"
+
+
+def try_mutate_deep() -> str:
+    try:
+        CONFIG["nested"]["deep"]["deeper"].append(4)  # type: ignore
+        return "FAIL: deep mutation allowed"
+    except AttributeError as e:
+        return f"OK deep: {type(e).__name__}"
+
+
+def main() -> None:
+    print(try_mutate_top())
+    print(try_mutate_list())
+    print(try_mutate_set())
+    print(try_mutate_deep())
+
+
+if __name__ == "__main__":
+    main()

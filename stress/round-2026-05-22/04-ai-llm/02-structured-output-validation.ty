@@ -1,0 +1,62 @@
+# AI test: structured-output style with Pydantic models + Result-typed validation.
+from pydantic import ValidationError
+import json
+
+
+model Sentiment:
+    label: str
+    confidence: float
+    rationale: str
+
+
+model EntityExtraction:
+    entities: list[str]
+    types: list[str]
+    counts: dict[str, int]
+
+
+def parse_sentiment(raw: str) -> Result[Sentiment, str]:
+    try:
+        return Ok(Sentiment.model_validate_json(raw))
+    except ValidationError as e:
+        return Err(f"validation: {e}")
+    except json.JSONDecodeError as e:
+        return Err(f"json: {e}")
+
+
+def parse_entities(raw: str) -> Result[EntityExtraction, str]:
+    try:
+        return Ok(EntityExtraction.model_validate_json(raw))
+    except ValidationError as e:
+        return Err(f"validation: {e}")
+    except json.JSONDecodeError as e:
+        return Err(f"json: {e}")
+
+
+def main() -> None:
+    let good_sentiment: str = '{"label": "positive", "confidence": 0.92, "rationale": "very enthusiastic phrasing"}'
+    let bad_sentiment: str = '{"label": "positive", "confidence": "very", "rationale": "x"}'
+
+    match parse_sentiment(good_sentiment):
+        case Ok(s):
+            print(f"OK: {s.label} @ {s.confidence}")
+        case Err(e):
+            print(f"FAIL: {e}")
+
+    match parse_sentiment(bad_sentiment):
+        case Ok(s):
+            print(f"UNEXPECTED OK: {s}")
+        case Err(_):
+            print("OK: rejected bad sentiment")
+
+    let entities_json: str = '{"entities":["GPT-4","Anthropic","Claude"],"types":["model","org","model"],"counts":{"model":2,"org":1}}'
+    match parse_entities(entities_json):
+        case Ok(e):
+            print(f"entities={e.entities}")
+            print(f"counts={e.counts}")
+        case Err(err):
+            print(f"FAIL: {err}")
+
+
+if __name__ == "__main__":
+    main()

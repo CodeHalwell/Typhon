@@ -1,0 +1,43 @@
+# Probe: structural interface conformance through impl blocks.
+
+interface Stringify:
+    def to_str(self) -> str
+
+
+interface Sortable:
+    def sort_key(self) -> int
+
+
+# A class satisfying both interfaces via separate impl blocks.
+class User:
+    id: int
+    name: str
+
+
+impl User:
+    def to_str(self) -> str:
+        return f"<User #{self.id} {self.name}>"
+
+
+impl User:
+    def sort_key(self) -> int:
+        return self.id
+
+
+def emit(x: Stringify) -> str:
+    return x.to_str()
+
+
+def rank(xs: list[Sortable]) -> list[int]:
+    return sorted([x.sort_key() for x in xs])
+
+
+def main() -> None:
+    let alice: User = User(id=2, name="Alice")
+    let bob: User = User(id=1, name="Bob")
+    print(emit(alice))
+    print(rank([alice, bob]))
+
+
+if __name__ == "__main__":
+    main()

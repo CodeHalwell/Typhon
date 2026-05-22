@@ -1,0 +1,20 @@
+# Probe: freeze let with single-line dict — does this round-trip?
+
+freeze let CONFIG = {"ports": [8080, 8081], "tags": {"alpha", "beta"}, "deep": {"x": [1, 2]}}
+
+
+def main() -> None:
+    try:
+        CONFIG["ports"].append(9999)
+        print("FAIL: list mutation allowed")
+    except AttributeError:
+        print("OK list mutation blocked")
+    try:
+        CONFIG["new"] = "x"
+        print("FAIL: dict mutation allowed")
+    except TypeError:
+        print("OK dict mutation blocked")
+
+
+if __name__ == "__main__":
+    main()

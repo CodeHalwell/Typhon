@@ -1,0 +1,47 @@
+# ML test: numpy batched operations, einsum, masking.
+import numpy as np
+
+
+def softmax(logits: np.ndarray, axis: int = -1) -> np.ndarray:
+    let shifted: np.ndarray = logits - np.max(logits, axis=axis, keepdims=True)
+    let ex: np.ndarray = np.exp(shifted)
+    return ex / np.sum(ex, axis=axis, keepdims=True)
+
+
+def attention(q: np.ndarray, k: np.ndarray, v: np.ndarray) -> np.ndarray:
+    # q: [batch, seq_q, d]
+    # k: [batch, seq_k, d]
+    # v: [batch, seq_k, d]
+    let dim: int = q.shape[-1]
+    let scores: np.ndarray = np.einsum("bqd,bkd->bqk", q, k) / float(dim ** 0.5)
+    let attn: np.ndarray = softmax(scores, axis=-1)
+    return np.einsum("bqk,bkd->bqd", attn, v)
+
+
+def masked_loss(preds: np.ndarray, targets: np.ndarray, mask: np.ndarray) -> float:
+    let diff: np.ndarray = preds - targets
+    let sq: np.ndarray = diff * diff
+    let masked: np.ndarray = sq * mask
+    let denom: float = float(mask.sum())
+    if denom == 0:
+        return 0.0
+    return float(masked.sum() / denom)
+
+
+def main() -> None:
+    let rng = np.random.default_rng(0)
+    let q: np.ndarray = rng.normal(size=(2, 3, 4))
+    let k: np.ndarray = rng.normal(size=(2, 3, 4))
+    let v: np.ndarray = rng.normal(size=(2, 3, 4))
+    let out: np.ndarray = attention(q, k, v)
+    print(f"attention out shape: {out.shape}")
+    print(f"row sum check (softmax along K): {np.einsum('bqd->bqd', out).shape}")
+
+    let preds: np.ndarray = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    let targets: np.ndarray = np.array([[1.0, 2.5, 3.0], [4.0, 4.0, 6.0]])
+    let mask: np.ndarray = np.array([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0]])
+    print(f"masked loss: {masked_loss(preds, targets, mask):.4f}")
+
+
+if __name__ == "__main__":
+    main()

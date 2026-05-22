@@ -1,0 +1,42 @@
+# Probe: tyc run (in-process VM) vs tyc run --compile parity.
+
+class Counter:
+    n: int
+
+
+impl Counter:
+    def inc(self) -> None:
+        self.n = self.n + 1
+
+    def value(self) -> int:
+        return self.n
+
+
+def fib(n: int) -> int:
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+
+def main() -> None:
+    let c: Counter = Counter(n=0)
+    c.inc()
+    c.inc()
+    c.inc()
+    print(f"counter: {c.value()}")
+    print(f"fib(10): {fib(10)}")
+
+    # Result + match
+    let outcomes: list[Result[int, str]] = [Ok(1), Err("bad"), Ok(7)]
+    mut total: int = 0
+    for o in outcomes:
+        match o:
+            case Ok(v):
+                total += v
+            case Err(_):
+                pass
+    print(f"total Ok: {total}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,40 @@
+# Probe: newtype interactions with generics, containers, and Result.
+# Hypothesis: nominal newtypes should NOT silently widen in container element
+# positions; tyc should treat list[UserId] != list[int].
+
+newtype UserId = int
+newtype OrgId = int
+newtype Email = str
+
+
+def parse_uid(raw: str) -> Result[UserId, str]:
+    if not raw.isdigit():
+        return Err(f"bad uid: {raw}")
+    return Ok(UserId(int(raw)))
+
+
+def parse_oid(raw: str) -> Result[OrgId, str]:
+    if not raw.isdigit():
+        return Err(f"bad oid: {raw}")
+    return Ok(OrgId(int(raw)))
+
+
+def all_ids(raws: list[str]) -> Result[list[UserId], str]:
+    mut acc: list[UserId] = []
+    for r in raws:
+        let uid: UserId = parse_uid(r)?
+        acc.append(uid)
+    return Ok(acc)
+
+
+def main() -> None:
+    let r: Result[list[UserId], str] = all_ids(["1", "2", "3"])
+    match r:
+        case Ok(xs):
+            print(f"ok: {[int(x) for x in xs]}")
+        case Err(e):
+            print(f"err: {e}")
+
+
+if __name__ == "__main__":
+    main()

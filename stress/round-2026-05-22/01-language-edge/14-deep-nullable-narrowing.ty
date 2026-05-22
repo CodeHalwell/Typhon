@@ -1,0 +1,53 @@
+# Probe: complex narrowing chains, T?? collapse, mixed narrows.
+
+def find(id: int) -> str?:
+    if id < 0:
+        return None
+    return f"value-{id}"
+
+
+def find_optional(id: int) -> int?:
+    if id == 0:
+        return None
+    return id * 2
+
+
+def greet(name: str) -> str:
+    return f"hi {name}"
+
+
+def chain_narrows(a: int, b: int) -> str:
+    let x: str? = find(a)
+    let y: int? = find_optional(b)
+    if x is None:
+        return "no-x"
+    if y is None:
+        return "no-y"
+    # Both narrowed to non-None here.
+    return f"{greet(x)} {y}"
+
+
+def guard_form(a: int) -> str:
+    guard v = find(a) else:
+        return "missing"
+    return greet(v)
+
+
+def short_circuit_or(a: int) -> str:
+    # T? with `or` default — narrowing pattern.
+    let x: str? = find(a)
+    let resolved: str = x if x is not None else "fallback"
+    return greet(resolved)
+
+
+def main() -> None:
+    print(chain_narrows(1, 2))
+    print(chain_narrows(-1, 2))
+    print(chain_narrows(1, 0))
+    print(guard_form(5))
+    print(guard_form(-5))
+    print(short_circuit_or(-99))
+
+
+if __name__ == "__main__":
+    main()

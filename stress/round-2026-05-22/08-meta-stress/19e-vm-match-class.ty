@@ -1,0 +1,26 @@
+# Probe: VM match on user class (not Result) — does scope propagation work?
+
+class A:
+    x: int
+
+
+class B:
+    y: int
+
+
+type AB = A | B
+
+
+def main() -> None:
+    let v: AB = A(x=42)
+    mut out: int = 0
+    match v:
+        case A(x):
+            out = x
+        case B(y):
+            out = y
+    print(f"out = {out}")
+
+
+if __name__ == "__main__":
+    main()

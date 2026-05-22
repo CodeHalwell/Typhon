@@ -235,6 +235,24 @@ fn rewrite_line(
     body = rewrite_optional(&body);
     body = rewrite_typing_aliases(&body);
 
+    // N11 (2026-05-22): `T = TypeVar("T")` (or `TypeVar("T", bound=...)`)
+    // at module level is dead weight in Typhon — PEP 695 generic params
+    // are introduced inline on the `class`/`def` that uses them.
+    if indent.is_empty() && body.contains("TypeVar(") && is_typevar_declaration(&body) {
+        return String::new();
+    }
+
+    // N11 (2026-05-22): rewrite `class X(Generic[T]):` (and `class!`)
+    // to `class X[T]:` so the emitted code uses PEP 695 syntax instead
+    // of the legacy Generic[T] base that Typhon rejects. Multiple type
+    // params (`Generic[T, U]`) are preserved verbatim inside the new
+    // bracket form.
+    if body.starts_with("class ") || body.starts_with("class!") {
+        if let Some(rewritten) = rewrite_generic_class_base(&body) {
+            body = rewritten;
+        }
+    }
+
     // Rule 6: `class Name(...):` with a hand-rolled `__init__` and no
     // `@dataclass` decorator becomes `class! Name(...):` so the Typhon
     // dataclass injection does not clash with the custom constructor.
@@ -314,6 +332,11 @@ const TYPING_NAMES_TO_REWRITE: &[&str] = &[
     "Set",
     "FrozenSet",
     "Type",
+    // N11 (2026-05-22): `Generic[T]` bases are rewritten to PEP 695
+    // `class X[T]:`, and `T = TypeVar("T")` definitions are dropped.
+    // After the rewrite both names are dead imports.
+    "Generic",
+    "TypeVar",
 ];
 
 /// Rewrite `from typing import …, Optional, …` by dropping any name in
@@ -367,6 +390,109 @@ fn strip_optional_from_typing_import(trimmed_line: &str) -> Option<String> {
 /// decorator on the contiguous decorator stack above the `class`
 /// keyword. The returned set holds 0-based source line indices pointing
 /// at the `class` declaration line itself.
+/// `true` when `line` is a module-level `NAME = TypeVar("NAME", ...)`
+/// declaration that the migrate pass should drop entirely (N11). Used
+/// after the textual rewrites have already converted any PEP 695 forms
+/// — what's left is genuinely dead in Typhon because `class Foo[T]:`
+/// introduces its own type parameter.
+///
+/// Matches `T = TypeVar("T")`, `T = TypeVar("T", bound=int)`, and the
+/// `typing.TypeVar(...)` qualified form. The name on the LHS must be
+/// a single identifier so `pair = TypeVar(...)` (unusual but legal
+/// Python) is not accidentally dropped.
+fn is_typevar_declaration(line: &str) -> bool {
+    let code = line.split('#').next().unwrap_or("").trim();
+    let eq = match code.find('=') {
+        Some(i) => i,
+        None => return false,
+    };
+    let lhs = code[..eq].trim();
+    if lhs.is_empty()
+        || !lhs.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        || lhs.starts_with(|c: char| c.is_ascii_digit())
+    {
+        return false;
+    }
+    let rhs = code[eq + 1..].trim();
+    rhs.starts_with("TypeVar(") || rhs.starts_with("typing.TypeVar(")
+}
+
+/// Rewrite `class X(Generic[T]):` and `class X(Generic[T, U], OtherBase):`
+/// to PEP 695 form `class X[T]:` / `class X[T, U](OtherBase):` (N11).
+/// Returns `None` when the line does not contain a `Generic[...]` base.
+///
+/// Also handles the `class!` modifier so a hand-rolled `__init__` class
+/// keeps its raw-class status post-rewrite.
+fn rewrite_generic_class_base(line: &str) -> Option<String> {
+    let (keyword, rest_after_keyword) = if let Some(r) = line.strip_prefix("class!") {
+        ("class!", r)
+    } else if let Some(r) = line.strip_prefix("class ") {
+        ("class ", r)
+    } else {
+        return None;
+    };
+    let open = rest_after_keyword.find('(')?;
+    let name = rest_after_keyword[..open].trim();
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    // Find the matching `)` at depth 0.
+    let bytes = rest_after_keyword.as_bytes();
+    let mut depth: i32 = 0;
+    let mut close: Option<usize> = None;
+    for (i, b) in bytes.iter().enumerate().skip(open) {
+        match *b {
+            b'(' | b'[' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            b']' => depth -= 1,
+            _ => {}
+        }
+    }
+    let close = close?;
+    let inside = &rest_after_keyword[open + 1..close];
+    let trailer = &rest_after_keyword[close + 1..];
+
+    // Split the bases by top-level commas (commas inside [...] stay
+    // grouped — `dict[str, int]` and `Generic[T, U]` must not split).
+    let bases: Vec<&str> = split_top_level_commas(inside)
+        .into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut type_params: Option<String> = None;
+    let mut remaining_bases: Vec<&str> = Vec::new();
+    for b in bases {
+        if let Some(params) = b
+            .strip_prefix("Generic[")
+            .or_else(|| b.strip_prefix("typing.Generic["))
+            .and_then(|s| s.strip_suffix(']'))
+        {
+            type_params = Some(params.trim().to_owned());
+        } else {
+            remaining_bases.push(b);
+        }
+    }
+
+    let type_params = type_params?;
+    let new_name_part = format!("{}[{}]", name, type_params);
+    let new_bases = if remaining_bases.is_empty() {
+        String::new()
+    } else {
+        format!("({})", remaining_bases.join(", "))
+    };
+    Some(format!(
+        "{}{}{}{}",
+        keyword, new_name_part, new_bases, trailer
+    ))
+}
+
 fn collect_bang_class_lines(source: &str) -> HashSet<usize> {
     let lines: Vec<&str> = source.lines().collect();
     let mut out: HashSet<usize> = HashSet::new();
@@ -1223,5 +1349,54 @@ mod tests {
         assert!(out.contains("class! Inner:"), "got: {out}");
         // Outer has no __init__ of its own, must stay plain.
         assert!(out.contains("class Outer:"), "got: {out}");
+    }
+
+    #[test]
+    fn typevar_declaration_is_dropped() {
+        // Regression for N11 (2026-05-22): `T = TypeVar("T")` at module
+        // level is dead in Typhon once `Generic[T]` rewrites to PEP 695
+        // — drop the line so the migrate output stops importing
+        // `TypeVar` (and stops tripping `tyc::typevar_import_rejected`).
+        let src = "from typing import TypeVar\nT = TypeVar(\"T\")\n";
+        let out = migrate_source(src);
+        assert!(
+            !out.contains("TypeVar"),
+            "TypeVar import and declaration must both be dropped, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn class_generic_base_rewrites_to_pep695() {
+        // `class Box(Generic[T]):` → `class Box[T]:`
+        let src =
+            "from typing import Generic, TypeVar\nT = TypeVar(\"T\")\nclass Box(Generic[T]):\n    value: T\n";
+        let out = migrate_source(src);
+        assert!(
+            out.contains("class Box[T]:"),
+            "expected PEP 695 form, got:\n{out}"
+        );
+        assert!(!out.contains("Generic"), "got:\n{out}");
+        assert!(!out.contains("TypeVar"), "got:\n{out}");
+    }
+
+    #[test]
+    fn class_with_generic_and_other_bases_preserved() {
+        // `class C(Generic[T], OtherBase):` → `class C[T](OtherBase):`
+        let src = "from typing import Generic, TypeVar\nT = TypeVar(\"T\")\nclass C(Generic[T], OtherBase):\n    x: T\n";
+        let out = migrate_source(src);
+        assert!(
+            out.contains("class C[T](OtherBase):"),
+            "expected `class C[T](OtherBase):`, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn multi_param_generic_class_rewrites() {
+        let src = "from typing import Generic, TypeVar\nT = TypeVar(\"T\")\nU = TypeVar(\"U\")\nclass Pair(Generic[T, U]):\n    a: T\n    b: U\n";
+        let out = migrate_source(src);
+        assert!(
+            out.contains("class Pair[T, U]:"),
+            "expected `class Pair[T, U]:`, got:\n{out}"
+        );
     }
 }

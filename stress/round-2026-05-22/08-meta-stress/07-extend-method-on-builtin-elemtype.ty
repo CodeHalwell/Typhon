@@ -1,0 +1,18 @@
+# Meta-stress: extend list — should be accepted (non-parametric form).
+
+extend list:
+    def sum_squares(self) -> int:
+        # type-bound to list of int by user, but tyc can't enforce element type.
+        mut total: int = 0
+        for x in self:
+            total += int(x) * int(x)
+        return total
+
+
+def main() -> None:
+    let xs: list[int] = [1, 2, 3, 4]
+    print(xs.sum_squares())
+
+
+if __name__ == "__main__":
+    main()

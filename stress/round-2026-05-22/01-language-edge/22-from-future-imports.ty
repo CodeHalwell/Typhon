@@ -1,0 +1,14 @@
+# Probe: `from __future__ import` handling.
+from __future__ import annotations
+
+
+def f(x: int) -> str:
+    return str(x)
+
+
+def main() -> None:
+    print(f(42))
+
+
+if __name__ == "__main__":
+    main()

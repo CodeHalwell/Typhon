@@ -1,0 +1,32 @@
+# Meta-stress: attribute / call on complex expressions.
+
+def t1(a: int, b: int) -> str:
+    # (a + b).bit_length() — parens needed for postfix
+    return str((a + b).bit_length())
+
+
+def t2(xs: list[int]) -> int:
+    # (xs + xs)[0] — subscript on a BinOp result
+    return (xs + xs)[0]
+
+
+def t3(a: int) -> int:
+    # (-a).bit_length() — postfix on unary
+    return (-a).bit_length()
+
+
+def t4(a: int, b: int) -> int:
+    # (a if a > b else b).bit_length() — postfix on ternary
+    return (a if a > b else b).bit_length()
+
+
+def main() -> None:
+    print(t1(3, 5))       # 8 → bit_length = 4
+    print(t2([1, 2, 3]))  # 1
+    print(t3(-8))         # 8 → bit_length 4
+    print(t4(7, 3))       # 7 → bit_length 3
+    print(t4(3, 9))       # 9 → bit_length 4
+
+
+if __name__ == "__main__":
+    main()

@@ -2178,6 +2178,29 @@ impl<'a> Checker<'a> {
                 return;
             }
         }
+        // N7 (2026-05-22): when `expected` is a `newtype` whose base
+        // *would* accept `actual`, the generic "change the value, or
+        // update the annotation to `int`" help text points the user at
+        // the wrong fix — dropping the nominal type. The cheat-sheet
+        // promised `tyc::newtype_violation` for this case; surface the
+        // dedicated diagnostic instead so the help reads "wrap with
+        // `UserId(...)`".
+        if let Type::Class(exp_name) = expected {
+            if let Some(base) = self.newtypes.get(exp_name.as_str()).cloned() {
+                if self.is_assignable(&base, actual) {
+                    self.diagnostics.push_error(TycError::newtype_violation(
+                        exp_name,
+                        base.display(),
+                        actual.display(),
+                        &self.path,
+                        self.source,
+                        span.0,
+                        length,
+                    ));
+                    return;
+                }
+            }
+        }
         self.diagnostics.push_error(TycError::type_mismatch(
             expected.display(),
             actual.display(),
@@ -3663,6 +3686,35 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
             if let Some(target) = pseudo.strip_prefix("__typhon_impl_") {
                 if c.class_shapes.contains_key(target) {
                     let impl_shape = collect_class_shape(cd, &classes);
+                    // N8 (2026-05-22): an `impl ClassName:` and
+                    // `extend ClassName:` (or two `impl`s, or two
+                    // `extend`s) that both define the same method are
+                    // silently merged by `merge_impl_blocks`, producing
+                    // two `def <name>` in the emitted class body —
+                    // Python takes the last one and one definition is
+                    // lost without any diagnostic. Detect the
+                    // collision here, *before* the dedup `or_insert`
+                    // below hides it, and anchor the span on the
+                    // duplicating method's name.
+                    {
+                        let target_shape = c.class_shapes.get(target).expect("checked above");
+                        for s in &cd.body {
+                            if let Stmt::FunctionDef(f) = s {
+                                let method = f.name.as_str();
+                                if target_shape.methods.contains_key(method) {
+                                    let span_start = f.name.range.start().to_usize();
+                                    c.diagnostics.push_error(TycError::duplicate_method(
+                                        target.to_owned(),
+                                        method.to_owned(),
+                                        c.path.clone(),
+                                        c.source,
+                                        span_start,
+                                        method.len().max(1),
+                                    ));
+                                }
+                            }
+                        }
+                    }
                     let target_shape = c.class_shapes.get_mut(target).expect("checked above");
                     for (m, sig) in impl_shape.methods {
                         target_shape.methods.entry(m).or_insert(sig);
@@ -5849,6 +5901,18 @@ fn match_subject_type(c: &Checker, m: &ruff_python_ast::StmtMatch) -> Option<Typ
     if let Expr::Name(n) = m.subject.as_ref() {
         if let Some(binding) = c.env.lookup(n.id.as_str()) {
             return Some(binding.declared.clone());
+        }
+    }
+    // N13 (2026-05-22): `match self.<field>:` is the canonical
+    // state-machine pattern — a class with a sealed-union field, plus
+    // an `impl` method that dispatches on it. Restricting subjects to
+    // bare names made the exhaustiveness pass skip these matches and
+    // gave false-positive `tyc::missing_return` diagnostics. Allow
+    // attribute access against a typed class receiver too.
+    if let Expr::Attribute(_) = m.subject.as_ref() {
+        let ty = infer_expr_readonly(c, m.subject.as_ref());
+        if !matches!(ty, Type::Unknown) {
+            return Some(ty);
         }
     }
     None
@@ -9067,6 +9131,127 @@ def maybe_int(x: int) -> int:
                 .iter()
                 .any(|e| matches!(e, TycError::MissingReturn { .. })),
             "expected MissingReturn variant, got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn duplicate_method_via_impl_and_extend_is_rejected() {
+        // Regression for N8 (2026-05-22): `impl X:` and `extend X:` both
+        // defining `get` silently produced two `def get` in the merged
+        // class body — Python took the last one and one definition was
+        // lost. The shape-merge pass dedup'd on `or_insert`, hiding it.
+        let src = "\
+class Box:
+    value: int
+
+impl Box:
+    def get(self) -> int:
+        return self.value
+
+extend Box:
+    def get(self) -> int:
+        return self.value * 2
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::DuplicateMethod { method, .. } if method == "get")),
+            "duplicate method must surface a diagnostic, got: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn duplicate_method_across_two_impl_blocks_is_rejected() {
+        // Two `impl` blocks defining the same method also collide.
+        let src = "\
+class Box:
+    value: int
+
+impl Box:
+    def get(self) -> int:
+        return self.value
+
+impl Box:
+    def get(self) -> int:
+        return 0
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::DuplicateMethod { .. })),
+            "two impl blocks defining the same method must error: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn match_on_self_field_exhaustive_is_clean() {
+        // Regression for N13 (2026-05-22): the exhaustiveness pass only
+        // looked at bare-name subjects (`match s:`), so a class with a
+        // sealed-union state field doing `match self.state:` falsely
+        // tripped missing_return even when every variant was handled.
+        let src = "\
+type Status = Open | Closed
+class Open:
+    since: float
+class Closed:
+    label: str
+
+class Foo:
+    state: Status
+
+impl Foo:
+    def check(self) -> str:
+        match self.state:
+            case Open(_):
+                return \"open\"
+            case Closed(_):
+                return \"closed\"
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "exhaustive match on `self.<field>` must not fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn match_on_self_field_non_exhaustive_still_fires() {
+        // Sanity check: non-exhaustive `match self.<field>:` must STILL
+        // surface the missing_return / non_exhaustive_match diagnostics.
+        let src = "\
+type Status = Open | Closed | Pending
+class Open:
+    label: str
+class Closed:
+    label: str
+class Pending:
+    label: str
+
+class Foo:
+    state: Status
+
+impl Foo:
+    def check(self) -> str:
+        match self.state:
+            case Open(_):
+                return \"open\"
+            case Closed(_):
+                return \"closed\"
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "non-exhaustive match on `self.<field>` must still fire missing_return: {:?}",
             d.errors()
         );
     }

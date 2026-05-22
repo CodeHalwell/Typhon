@@ -1,0 +1,64 @@
+# Probe: gather inside gather, go inside async fn, multiple awaits.
+import asyncio
+
+
+@gatherable
+async def fetch_a(n: int) -> int:
+    await asyncio.sleep(0.001)
+    return n * 2
+
+
+@gatherable
+async def fetch_b(n: int) -> int:
+    await asyncio.sleep(0.001)
+    return n * 3
+
+
+@gatherable
+async def fetch_c(n: int) -> str:
+    await asyncio.sleep(0.001)
+    return f"<{n}>"
+
+
+async def combo(n: int) -> tuple[int, int, str]:
+    gather:
+        a = fetch_a(n)
+        b = fetch_b(n)
+        c = fetch_c(n)
+    return (a, b, c)
+
+
+async def nested(n: int) -> list[tuple[int, int, str]]:
+    # gather of combos — each combo itself does parallel awaits
+    gather:
+        x = combo(n)
+        y = combo(n + 1)
+        z = combo(n + 2)
+    return [x, y, z]
+
+
+async def with_best_effort() -> list[str]:
+    gather(strategy="best-effort"):
+        ra = fetch_a(10)
+        rb = fetch_b(20)
+        rc = fetch_c(30)
+    mut out: list[str] = []
+    for v in [ra, rb, rc]:
+        out.append(f"{v!r}")
+    return out
+
+
+async def main_async() -> None:
+    let res: list[tuple[int, int, str]] = await nested(1)
+    for t in res:
+        print(t)
+    let xs: list[str] = await with_best_effort()
+    print(xs)
+
+
+def main() -> None:
+    asyncio.run(main_async())
+
+
+if __name__ == "__main__":
+    main()

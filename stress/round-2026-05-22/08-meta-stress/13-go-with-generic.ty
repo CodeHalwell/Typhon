@@ -1,0 +1,47 @@
+# Probe: `go` spawn with various function shapes.
+import asyncio
+
+
+async def add_one(n: int) -> int:
+    await asyncio.sleep(0.001)
+    return n + 1
+
+
+async def make_str(prefix: str, n: int) -> str:
+    await asyncio.sleep(0.001)
+    return f"{prefix}{n}"
+
+
+async def side_effect(label: str) -> None:
+    await asyncio.sleep(0.001)
+    print(f"side: {label}")
+
+
+async def main_async() -> None:
+    # Capture handle
+    go add_one(10) -> t1
+    let v: int = await t1
+    print(f"add_one: {v}")
+
+    # Fire and forget
+    go side_effect("a")
+    go side_effect("b")
+    go side_effect("c")
+
+    # Capture multiple
+    go make_str("x:", 1) -> t2
+    go make_str("y:", 2) -> t3
+    let s1: str = await t2
+    let s2: str = await t3
+    print(f"strings: {s1!r} {s2!r}")
+
+    # Give fire-and-forget tasks a chance to run
+    await asyncio.sleep(0.05)
+
+
+def main() -> None:
+    asyncio.run(main_async())
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,21 @@
+# Probe: extending built-in `str` with a new method.
+
+extend str:
+    def slug(self) -> str:
+        return self.lower().replace(" ", "-").strip()
+
+    def shouting(self) -> str:
+        return self.upper() + "!"
+
+
+def main() -> None:
+    let s: str = "Hello World"
+    print(s.slug())
+    print(s.shouting())
+    # Through a variable annotated as str
+    let t: str = "  fooo bar  "
+    print(t.slug())
+
+
+if __name__ == "__main__":
+    main()

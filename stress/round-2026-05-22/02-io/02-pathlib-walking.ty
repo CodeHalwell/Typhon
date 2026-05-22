@@ -1,0 +1,40 @@
+# IO test: pathlib operations, file walking, counting.
+from pathlib import Path
+import tempfile
+
+
+class FileStats:
+    path: str
+    size: int
+    is_dir: bool
+
+
+def collect_stats(root: Path) -> list[FileStats]:
+    mut out: list[FileStats] = []
+    for entry in sorted(root.iterdir()):
+        out.append(FileStats(
+            path=entry.name,
+            size=entry.stat().st_size,
+            is_dir=entry.is_dir(),
+        ))
+    return out
+
+
+def main() -> None:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        let root: Path = Path(tmpdir)
+        (root / "a.txt").write_text("hello")
+        (root / "b.txt").write_text("world!")
+        (root / "subdir").mkdir()
+        (root / "subdir" / "c.txt").write_text("nested")
+
+        let stats: list[FileStats] = collect_stats(root)
+        for s in stats:
+            print(f"{s.path}: size={s.size} dir={s.is_dir}")
+
+        let total: int = sum(s.size for s in stats if not s.is_dir)
+        print(f"total bytes (top-level): {total}")
+
+
+if __name__ == "__main__":
+    main()

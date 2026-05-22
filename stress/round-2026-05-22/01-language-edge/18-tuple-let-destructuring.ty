@@ -1,0 +1,19 @@
+# Probe: tuple destructuring with let.
+
+def returns_pair() -> tuple[int, str]:
+    return (1, "hello")
+
+
+def main() -> None:
+    let pair = returns_pair()
+    print(pair)
+    # Attempt direct destructuring forms — what does tyc accept?
+    let (a, b) = returns_pair()
+    print(f"{a}, {b}")
+    # Bareword tuple form (matches Python)
+    let c, d = returns_pair()
+    print(f"{c}, {d}")
+
+
+if __name__ == "__main__":
+    main()

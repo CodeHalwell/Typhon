@@ -1,0 +1,75 @@
+# Agent test: workflow state machine — orchestrate planning → tool → review.
+
+type State = Planning | Acting | Reviewing | Done
+
+
+class Planning:
+    goal: str
+class Acting:
+    plan: list[str]
+    step_idx: int
+class Reviewing:
+    plan: list[str]
+    actions_done: list[str]
+class Done:
+    summary: str
+
+
+class Workflow:
+    state: State
+    history: list[str]
+
+
+impl Workflow:
+    def step(self) -> None:
+        let cur: State = self.state
+        match cur:
+            case Planning(goal):
+                let new_plan: list[str] = self._plan(goal)
+                self.history.append(f"planned: {new_plan}")
+                self.state = Acting(plan=new_plan, step_idx=0)
+            case Acting(cur_plan, idx):
+                if idx >= len(cur_plan):
+                    self.state = Reviewing(plan=cur_plan, actions_done=cur_plan)
+                    self.history.append("→ review")
+                else:
+                    let action: str = cur_plan[idx]
+                    self.history.append(f"do: {action}")
+                    self.state = Acting(plan=cur_plan, step_idx=idx + 1)
+            case Reviewing(_, actions):
+                let summary: str = "review ok: " + ", ".join(actions)
+                self.history.append(summary)
+                self.state = Done(summary=summary)
+            case Done(_):
+                self.history.append("(already done)")
+
+    def _plan(self, goal: str) -> list[str]:
+        if "deploy" in goal.lower():
+            return ["build", "test", "ship"]
+        if "report" in goal.lower():
+            return ["query", "format", "publish"]
+        return ["explore", "summarise"]
+
+    def run(self) -> State:
+        mut iters: int = 0
+        while not isinstance(self.state, Done) and iters < 100:
+            self.step()
+            iters = iters + 1
+        return self.state
+
+
+def main() -> None:
+    let w: Workflow = Workflow(state=Planning(goal="Deploy v2"), history=[])
+    let final: State = w.run()
+    for h in w.history:
+        print(h)
+    print("---")
+    match final:
+        case Done(s):
+            print(f"FINAL: {s}")
+        case _:
+            print(f"unexpected non-Done: {final}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,44 @@
+# Probe family: do parens survive various precedence-flipping contexts?
+
+def t1(a: int, b: int, c: int) -> int:
+    # source: a * (b + c)   ; if parens stripped → a * b + c
+    return a * (b + c)
+
+
+def t2(a: bool, b: bool, c: bool) -> bool:
+    # source: not (a and b) — if stripped → not a and b ≡ (not a) and b
+    return not (a and b)
+
+
+def t3(a: bool, b: bool, c: bool) -> bool:
+    # source: (a or b) and c — if stripped → a or b and c ≡ a or (b and c)
+    return (a or b) and c
+
+
+def t4(xs: list[int]) -> int:
+    # source: -(sum(xs))  ; if stripped → -sum(xs) — semantically equal
+    return -(sum(xs))
+
+
+def t5(a: int, b: int) -> int:
+    # source: (a + b) ** 2  ; if stripped → a + b ** 2
+    return (a + b) ** 2
+
+
+def t6(a: int, b: int) -> int:
+    # source: a - (b - 1)   ; if stripped → a - b - 1
+    return a - (b - 1)
+
+
+def main() -> None:
+    print(f"t1(2, 3, 4) = {t1(2, 3, 4)}    expect 14, broken=10")
+    print(f"t2(F, T, _) = {t2(False, True, False)}    expect True, broken=True")
+    print(f"t2(T, T, _) = {t2(True, True, False)}    expect False, broken=False")
+    print(f"t3(T, F, F) = {t3(True, False, False)}    expect False, broken=True")
+    print(f"t4([1, 2, 3]) = {t4([1, 2, 3])}    expect -6")
+    print(f"t5(2, 3) = {t5(2, 3)}    expect 25, broken=11")
+    print(f"t6(10, 3) = {t6(10, 3)}    expect 8, broken=6")
+
+
+if __name__ == "__main__":
+    main()

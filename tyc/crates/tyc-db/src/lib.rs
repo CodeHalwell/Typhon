@@ -18,9 +18,9 @@ use tyc_syntax::{
     parse_module,
     preprocess::{
         expand_gather_blocks, expand_go_calls, expand_inline_question_ops, expand_lazy_lets,
-        expand_multiline_guards, expand_pipes, expand_question_ops, expand_with_chains,
-        line_byte_starts, preprocess, validate_extend_usage, validate_lazy_usage,
-        validate_question_ops,
+        expand_multiline_guards, expand_pipes, expand_question_ops, expand_typed_let_unpack,
+        expand_with_chains, line_byte_starts, preprocess, validate_extend_usage,
+        validate_lazy_usage, validate_question_ops,
     },
 };
 use tyc_types::{
@@ -58,7 +58,7 @@ pub fn preprocessed_text(db: &dyn salsa::Database, file: SourceFile) -> String {
     // any of the later forms (`gather:`, `?`, pipes, etc.).
     let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
         &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-            &expand_multiline_guards(&expand_lazy_lets(text)),
+            &expand_multiline_guards(&expand_lazy_lets(&expand_typed_let_unpack(text))),
         ))),
     )));
     preprocess(&expanded).python_source
@@ -215,7 +215,7 @@ pub fn resolved_module(db: &dyn salsa::Database, file: SourceFile) -> ArcResolve
     // source change, which is bounded by file size and cheap.
     let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
         &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-            &expand_multiline_guards(&expand_lazy_lets(&raw_text)),
+            &expand_multiline_guards(&expand_lazy_lets(&expand_typed_let_unpack(&raw_text))),
         ))),
     )));
     let prep = preprocess(&expanded);
@@ -405,7 +405,7 @@ pub fn check_source_file(db: &mut TycDatabase, source_file: SourceFile) -> Diagn
 pub fn extract_shapes_for_path(_path: &str, text: &str) -> ModuleShapes {
     let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
         &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-            &expand_multiline_guards(&expand_lazy_lets(text)),
+            &expand_multiline_guards(&expand_lazy_lets(&expand_typed_let_unpack(text))),
         ))),
     )));
     let prep = preprocess(&expanded);
@@ -528,7 +528,7 @@ fn check_impl_with_imports(
 
     let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
         &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-            &expand_multiline_guards(&expand_lazy_lets(text)),
+            &expand_multiline_guards(&expand_lazy_lets(&expand_typed_let_unpack(text))),
         ))),
     )));
     let prep = preprocess(&expanded);
@@ -696,7 +696,7 @@ fn check_impl(path: &str, text: &str) -> Diagnostics {
     // preserve Typhon syntax in the formatter's round trip.
     let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
         &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-            &expand_multiline_guards(&expand_lazy_lets(text)),
+            &expand_multiline_guards(&expand_lazy_lets(&expand_typed_let_unpack(text))),
         ))),
     )));
     let prep = preprocess(&expanded);

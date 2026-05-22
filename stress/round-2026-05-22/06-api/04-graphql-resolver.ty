@@ -1,0 +1,84 @@
+# API test: GraphQL-style nested resolvers.
+
+class Author:
+    id: int
+    name: str
+
+
+class Post:
+    id: int
+    title: str
+    author_id: int
+    body: str
+
+
+class Comment:
+    id: int
+    post_id: int
+    text: str
+
+
+class DB:
+    authors: dict[int, Author]
+    posts: dict[int, Post]
+    comments: dict[int, Comment]
+
+
+type FieldName = str
+
+
+class GraphResolver:
+    db: DB
+
+
+impl GraphResolver:
+    def author_by_id(self, aid: int) -> Author?:
+        return self.db.authors.get(aid)
+
+    def posts_by_author(self, aid: int) -> list[Post]:
+        return sorted(
+            [p for p in self.db.posts.values() if p.author_id == aid],
+            key=lambda p: p.id,
+        )
+
+    def comments_for(self, pid: int) -> list[Comment]:
+        return [c for c in self.db.comments.values() if c.post_id == pid]
+
+    def render_author_with_posts(self, aid: int) -> dict[str, str]:
+        let a: Author? = self.author_by_id(aid)
+        if a is None:
+            return {"error": f"author #{aid} not found"}
+        let posts: list[Post] = self.posts_by_author(aid)
+        let titles: list[str] = [p.title for p in posts]
+        return {
+            "name": a.name,
+            "post_count": str(len(posts)),
+            "titles": ", ".join(titles),
+        }
+
+
+def main() -> None:
+    let db: DB = DB(
+        authors={
+            1: Author(id=1, name="Alice"),
+            2: Author(id=2, name="Bob"),
+        },
+        posts={
+            10: Post(id=10, title="Hello", author_id=1, body="..."),
+            11: Post(id=11, title="World", author_id=1, body="..."),
+            12: Post(id=12, title="Other", author_id=2, body="..."),
+        },
+        comments={
+            100: Comment(id=100, post_id=10, text="nice"),
+            101: Comment(id=101, post_id=10, text="agreed"),
+        },
+    )
+    let r: GraphResolver = GraphResolver(db=db)
+    print(r.render_author_with_posts(1))
+    print(r.render_author_with_posts(2))
+    print(r.render_author_with_posts(99))
+    print(f"comments for #10: {[c.text for c in r.comments_for(10)]}")
+
+
+if __name__ == "__main__":
+    main()

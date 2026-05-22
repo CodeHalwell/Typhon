@@ -19,7 +19,8 @@ use tyc_resolve::check_unknown_modules;
 use tyc_resolve::{check_unknown_modules_with, ImportVettingContext};
 use tyc_syntax::preprocess::{
     expand_gather_blocks, expand_go_calls, expand_inline_question_ops, expand_lazy_imports,
-    expand_multiline_guards, expand_pipes, expand_question_ops, expand_with_chains, preprocess,
+    expand_multiline_guards, expand_pipes, expand_question_ops, expand_typed_let_unpack,
+    expand_with_chains, preprocess,
 };
 
 use crate::commands::util::{apply_strictness, collect_dty_files, collect_ty_files};
@@ -41,6 +42,12 @@ pub struct CheckArgs {
     /// forward-compatible.
     #[arg(long)]
     pub stubs: bool,
+
+    /// Suppress the trailing "checked N file(s)" success line. Errors and
+    /// warnings still surface verbatim. Internal — used by `tyc run` to
+    /// gate VM execution behind a successful check without spamming stdout.
+    #[arg(skip)]
+    pub quiet_success: bool,
 }
 
 pub fn run(args: CheckArgs) -> Result<()> {
@@ -326,14 +333,16 @@ pub fn run(args: CheckArgs) -> Result<()> {
         ));
     }
 
-    if diags.warning_count() > 0 {
-        println!(
-            "checked {} file(s) — {} warning(s)",
-            file_count,
-            diags.warning_count()
-        );
-    } else {
-        println!("checked {} file(s) — no errors", file_count);
+    if !args.quiet_success {
+        if diags.warning_count() > 0 {
+            println!(
+                "checked {} file(s) — {} warning(s)",
+                file_count,
+                diags.warning_count()
+            );
+        } else {
+            println!("checked {} file(s) — no errors", file_count);
+        }
     }
     Ok(())
 }
@@ -802,7 +811,7 @@ fn ty_path_to_dotted(path: &std::path::Path, src_root: &str) -> String {
 fn expand_for_check(source: &str) -> String {
     expand_question_ops(&expand_inline_question_ops(&expand_pipes(
         &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-            &expand_multiline_guards(&expand_lazy_imports(source)),
+            &expand_multiline_guards(&expand_lazy_imports(&expand_typed_let_unpack(source))),
         ))),
     )))
 }
@@ -873,6 +882,7 @@ mod tests {
         let args = CheckArgs {
             paths: vec![tmp.path().to_path_buf()],
             stubs: false,
+            quiet_success: false,
         };
         run(args).unwrap();
     }
@@ -884,6 +894,7 @@ mod tests {
         let args = CheckArgs {
             paths: vec![tmp.path().to_path_buf()],
             stubs: false,
+            quiet_success: false,
         };
         assert!(run(args).is_err(), "type mismatch should be an error");
     }
@@ -895,6 +906,7 @@ mod tests {
         let args = CheckArgs {
             paths: vec![tmp.path().to_path_buf()],
             stubs: false,
+            quiet_success: false,
         };
         run(args).unwrap();
     }
@@ -906,6 +918,7 @@ mod tests {
         let args = CheckArgs {
             paths: vec![tmp.path().to_path_buf()],
             stubs: false,
+            quiet_success: false,
         };
         assert!(run(args).is_err(), "val reassignment should be an error");
     }
@@ -930,6 +943,7 @@ i.name = \"Bob\"
         let args = CheckArgs {
             paths: vec![tmp.path().to_path_buf()],
             stubs: false,
+            quiet_success: false,
         };
         assert!(
             run(args).is_err(),
@@ -951,6 +965,7 @@ i.name = \"Bob\"
         let args = CheckArgs {
             paths: vec![tmp.path().to_path_buf()],
             stubs: true,
+            quiet_success: false,
         };
         run(args).unwrap();
     }
@@ -967,6 +982,7 @@ i.name = \"Bob\"
         let args = CheckArgs {
             paths: vec![tmp.path().to_path_buf()],
             stubs: true,
+            quiet_success: false,
         };
         assert!(
             run(args).is_err(),
@@ -986,6 +1002,7 @@ i.name = \"Bob\"
         let args = CheckArgs {
             paths: vec![tmp.path().to_path_buf()],
             stubs: true,
+            quiet_success: false,
         };
         assert!(
             run(args).is_err(),
@@ -1014,6 +1031,7 @@ def fetch(url: str) -> str:
         let args = CheckArgs {
             paths: vec![tmp.path().join("script.ty")],
             stubs: false,
+            quiet_success: false,
         };
         // The check should pass (no unknown_module error) because there is
         // no project config to anchor the dependency check to.

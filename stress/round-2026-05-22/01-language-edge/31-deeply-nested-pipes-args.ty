@@ -1,0 +1,37 @@
+# Probe: pipe + ? + match in same expression.
+
+
+def parse(s: str) -> Result[int, str]:
+    if not s.isdigit():
+        return Err(s)
+    return Ok(int(s))
+
+
+def add5(x: int) -> int:
+    return x + 5
+
+
+def stringy(x: int) -> str:
+    return f"<{x}>"
+
+
+def chain(a: str) -> Result[str, str]:
+    # parse string → add5 → stringy
+    let v: int = parse(a)?
+    return Ok(v |> add5() |> stringy())
+
+
+def main() -> None:
+    print(chain("10"))   # Ok(value='<15>')
+    print(chain("xx"))   # Err
+    # Pipe inside an Ok constructor
+    let r: Result[str, str] = chain("3")
+    match r:
+        case Ok(s):
+            print(f"got: {s}")
+        case Err(e):
+            print(f"err: {e}")
+
+
+if __name__ == "__main__":
+    main()

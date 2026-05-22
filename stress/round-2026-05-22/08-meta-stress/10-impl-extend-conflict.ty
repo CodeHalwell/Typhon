@@ -1,0 +1,23 @@
+# Probe: impl and extend defining the same method name — which wins?
+
+class Box:
+    value: int
+
+
+impl Box:
+    def get(self) -> int:
+        return self.value
+
+
+extend Box:
+    def get(self) -> int:
+        return self.value * 2
+
+
+def main() -> None:
+    let b: Box = Box(value=5)
+    print(b.get())
+
+
+if __name__ == "__main__":
+    main()

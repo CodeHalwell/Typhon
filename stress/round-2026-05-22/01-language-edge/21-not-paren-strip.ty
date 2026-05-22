@@ -1,0 +1,30 @@
+# MINIMAL REPRO 2: `not (...)` parens stripped → wrong precedence.
+
+def t_or(a: bool, b: bool) -> bool:
+    return not (a or b)
+
+
+def t_and(a: bool, b: bool) -> bool:
+    return not (a and b)
+
+
+def t_compare(x: int, y: int) -> bool:
+    # `not (x == 0 and y == 0)` should be True iff at least one is nonzero
+    return not (x == 0 and y == 0)
+
+
+def main() -> None:
+    # not (a or b) = !a AND !b
+    # WRONG: not a or b = (!a) OR b
+    print(f"not (T or F) = {t_or(True, False)}   expect False")  # source: !T=F. wrong: !T or F = F or F = F. lucky match
+    print(f"not (F or T) = {t_or(False, True)}   expect False")  # source: !T=F. wrong: !F or T = T or T = T. WRONG!
+    print(f"not (F or F) = {t_or(False, False)}  expect True")
+    print(f"not (T and F) = {t_and(True, False)} expect True")   # source: !F=T. wrong: !T and F = F and F = F. WRONG!
+    print(f"not (T and T) = {t_and(True, True)}  expect False")
+    print(f"t_compare(1, 0) = {t_compare(1, 0)}  expect True")
+    print(f"t_compare(0, 1) = {t_compare(0, 1)}  expect True (wrong if parens dropped)")
+    print(f"t_compare(0, 0) = {t_compare(0, 0)}  expect False")
+
+
+if __name__ == "__main__":
+    main()

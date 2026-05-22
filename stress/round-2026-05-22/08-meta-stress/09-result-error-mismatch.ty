@@ -1,0 +1,30 @@
+# Probe: `?` with mismatched error type.
+
+class FileError:
+    path: str
+
+class ParseError:
+    reason: str
+
+
+def read(path: str) -> Result[str, FileError]:
+    return Err(FileError(path=path))
+
+
+def parse(text: str) -> Result[int, ParseError]:
+    return Err(ParseError(reason="not implemented"))
+
+
+# Mismatched: cannot `?` a Result[_, ParseError] in fn returning Result[_, FileError].
+def both(path: str) -> Result[int, FileError]:
+    let raw: str = read(path)?
+    let n: int = parse(raw)?  # ← should fire tyc::result_error_mismatch
+    return Ok(n)
+
+
+def main() -> None:
+    print(both("/tmp/x"))
+
+
+if __name__ == "__main__":
+    main()

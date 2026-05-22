@@ -1,0 +1,118 @@
+# Agent test: simplified ReAct agent loop with tool dispatch + sealed-union steps.
+
+type Step = ThoughtStep | ActionStep | ObservationStep | FinalStep
+
+
+class ThoughtStep:
+    text: str
+
+
+class ActionStep:
+    tool: str
+    input: str
+
+
+class ObservationStep:
+    output: str
+
+
+class FinalStep:
+    answer: str
+
+
+type ToolResult = ToolOk | ToolErr
+
+
+class ToolOk:
+    value: str
+
+
+class ToolErr:
+    error: str
+
+
+class Agent:
+    name: str
+    max_iters: int
+    trace: list[Step]
+
+
+impl Agent:
+    def think(self, text: str) -> None:
+        self.trace.append(ThoughtStep(text=text))
+
+    def act(self, tool: str, inp: str) -> ToolResult:
+        let action: ActionStep = ActionStep(tool=tool, input=inp)
+        self.trace.append(action)
+        let result: ToolResult = dispatch_tool(tool, inp)
+        match result:
+            case ToolOk(v):
+                self.trace.append(ObservationStep(output=v))
+            case ToolErr(e):
+                self.trace.append(ObservationStep(output=f"<error: {e}>"))
+        return result
+
+    def finish(self, ans: str) -> None:
+        self.trace.append(FinalStep(answer=ans))
+
+
+def dispatch_tool(name: str, inp: str) -> ToolResult:
+    if name == "calc":
+        return run_calc(inp)
+    if name == "lookup":
+        return run_lookup(inp)
+    return ToolErr(error=f"no such tool: {name}")
+
+
+def run_calc(expr: str) -> ToolResult:
+    # Allow only ASCII digits, spaces, +, -, *, /
+    for ch in expr:
+        if not (ch.isdigit() or ch in " +-*/()"):
+            return ToolErr(error=f"refused char: {ch!r}")
+    try:
+        # In a real agent we'd compile a tiny expression evaluator;
+        # here we use restricted eval.
+        let v: int = eval(expr, {"__builtins__": {}}, {})
+        return ToolOk(value=str(v))
+    except Exception as e:
+        return ToolErr(error=str(e))
+
+
+def run_lookup(key: str) -> ToolResult:
+    let kb: dict[str, str] = {
+        "ada": "Ada Lovelace, 1815-1852, first computer programmer.",
+        "alan": "Alan Turing, 1912-1954, foundational computer scientist.",
+    }
+    let v: str? = kb.get(key.lower())
+    if v is None:
+        return ToolErr(error=f"no entry: {key}")
+    return ToolOk(value=v)
+
+
+def render_trace(steps: list[Step]) -> str:
+    mut lines: list[str] = []
+    for s in steps:
+        match s:
+            case ThoughtStep(t):
+                lines.append(f"Thought: {t}")
+            case ActionStep(tool, inp):
+                lines.append(f"Action: {tool}({inp!r})")
+            case ObservationStep(o):
+                lines.append(f"Observation: {o}")
+            case FinalStep(ans):
+                lines.append(f"Final: {ans}")
+    return "\n".join(lines)
+
+
+def main() -> None:
+    let agent: Agent = Agent(name="ReAct-mini", max_iters=8, trace=[])
+    agent.think("User asked for 17 + 25, then a fact about Ada.")
+    agent.act("calc", "17+25")
+    agent.act("lookup", "ada")
+    agent.act("lookup", "nonsuch")
+    agent.finish("17 + 25 = 42. Ada Lovelace, born 1815, was the first computer programmer.")
+    print(render_trace(agent.trace))
+
+
+if __name__ == "__main__":
+    main()

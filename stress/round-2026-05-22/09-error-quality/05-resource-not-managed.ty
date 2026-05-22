@@ -1,0 +1,15 @@
+# Should fire `tyc::resource_not_managed`.
+
+def leaky() -> str:
+    let f = open("/etc/hostname")
+    let data: str = f.read()
+    f.close()
+    return data
+
+
+def main() -> None:
+    print(leaky().strip())
+
+
+if __name__ == "__main__":
+    main()

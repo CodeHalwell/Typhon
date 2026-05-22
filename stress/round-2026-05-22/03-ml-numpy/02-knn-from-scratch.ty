@@ -1,0 +1,59 @@
+# ML test: a tiny k-NN classifier implementation.
+import numpy as np
+
+
+class KNN:
+    k: int
+    X: np.ndarray
+    y: np.ndarray
+
+
+impl KNN:
+    def predict_one(self, x: np.ndarray) -> int:
+        let dists: np.ndarray = np.linalg.norm(self.X - x, axis=1)
+        let idx: np.ndarray = np.argsort(dists)[:self.k]
+        let votes: np.ndarray = self.y[idx]
+        let pair = np.unique(votes, return_counts=True)
+        let values: np.ndarray = pair[0]
+        let counts: np.ndarray = pair[1]
+        return int(values[np.argmax(counts)])
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        return np.array([self.predict_one(row) for row in X])
+
+
+def train_test_split(X: np.ndarray, y: np.ndarray, ratio: float = 0.8) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    let n: int = X.shape[0]
+    let cut: int = int(n * ratio)
+    return (X[:cut], y[:cut], X[cut:], y[cut:])
+
+
+def accuracy(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    return float((y_true == y_pred).mean())
+
+
+def main() -> None:
+    let rng = np.random.default_rng(42)
+    # Three clusters in 2D
+    let n: int = 30
+    let c0: np.ndarray = rng.normal(loc=(0.0, 0.0), scale=0.5, size=(n, 2))
+    let c1: np.ndarray = rng.normal(loc=(3.0, 3.0), scale=0.5, size=(n, 2))
+    let c2: np.ndarray = rng.normal(loc=(0.0, 3.0), scale=0.5, size=(n, 2))
+    let X: np.ndarray = np.vstack([c0, c1, c2])
+    let y: np.ndarray = np.concatenate([np.zeros(n), np.ones(n), np.full(n, 2)]).astype(int)
+    let perm: np.ndarray = rng.permutation(X.shape[0])
+    let Xs: np.ndarray = X[perm]
+    let ys: np.ndarray = y[perm]
+    let split = train_test_split(Xs, ys)
+    let Xtr: np.ndarray = split[0]
+    let ytr: np.ndarray = split[1]
+    let Xte: np.ndarray = split[2]
+    let yte: np.ndarray = split[3]
+    let model: KNN = KNN(k=3, X=Xtr, y=ytr)
+    let preds: np.ndarray = model.predict(Xte)
+    let acc: float = accuracy(yte, preds)
+    print(f"k-NN accuracy = {acc:.3f}")
+
+
+if __name__ == "__main__":
+    main()

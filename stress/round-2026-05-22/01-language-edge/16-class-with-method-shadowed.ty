@@ -1,0 +1,34 @@
+# Probe: edge case — methods sharing names with field types or globals.
+# Hypothesis: should compile cleanly.
+
+class Counter:
+    count: int
+
+
+impl Counter:
+    def inc(self) -> None:
+        self.count = self.count + 1
+
+    def dec(self) -> None:
+        self.count = self.count - 1
+
+    def reset(self) -> None:
+        self.count = 0
+
+    def __repr__(self) -> str:
+        return f"Counter({self.count})"
+
+
+def main() -> None:
+    mut c: Counter = Counter(count=0)
+    c.inc()
+    c.inc()
+    c.inc()
+    c.dec()
+    print(c)
+    c.reset()
+    print(c)
+
+
+if __name__ == "__main__":
+    main()

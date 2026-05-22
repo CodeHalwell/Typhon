@@ -2028,6 +2028,13 @@ impl Interpreter {
     fn exec_match(&mut self, m: &ast::StmtMatch, env: &EnvRef) -> Result<(), Unwind> {
         let subject = self.eval_expr(&m.subject, env)?;
         for case in &m.cases {
+            // Pattern captures bind tentatively into a child scope so a
+            // *failed* pattern can't leak partial captures into `env`.
+            // Once the pattern (and its guard) accept, we lift those
+            // captures into the surrounding scope and execute the body
+            // there — Python's `match` doesn't introduce a new scope per
+            // arm, so writes inside the body must reach the outer
+            // function's bindings.
             let scope = Env::new_child(env);
             if self.pattern_matches(&case.pattern, &subject, &scope)? {
                 let ok = match &case.guard {
@@ -2035,7 +2042,10 @@ impl Interpreter {
                     None => true,
                 };
                 if ok {
-                    return self.exec_block(&case.body, &scope);
+                    for (name, value) in scope.snapshot() {
+                        env.assign_or_create(&name, value);
+                    }
+                    return self.exec_block(&case.body, env);
                 }
             }
         }

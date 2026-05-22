@@ -1,0 +1,34 @@
+# Meta-stress: @pure and @memo combinations.
+
+@pure
+def normalise(s: str) -> str:
+    return s.strip().lower()
+
+
+@memo
+def fib(n: int) -> int:
+    if n < 2:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+
+@pure(memo=True)
+def hash_pw(salt: str, pw: str) -> str:
+    return f"{salt}:{pw[::-1]}"
+
+
+# This should be rejected: pure function with side effect.
+# @pure
+# def print_hi() -> None:
+#     print("hi")
+
+
+def main() -> None:
+    print(normalise("  Hello  "))
+    print(fib(30))
+    print(hash_pw("salt", "topsecret"))
+    print(hash_pw("salt", "topsecret"))  # cache hit
+
+
+if __name__ == "__main__":
+    main()

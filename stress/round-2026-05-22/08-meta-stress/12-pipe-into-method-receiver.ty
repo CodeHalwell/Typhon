@@ -1,0 +1,27 @@
+# Probe: pipe into instance-method receiver.
+
+
+class Stringer:
+    suffix: str
+
+
+impl Stringer:
+    def stamp(self, x: int) -> str:
+        return f"{x}{self.suffix}"
+
+    def double_stamp(self, x: int, n: int) -> str:
+        return f"{x * n}{self.suffix}"
+
+
+def main() -> None:
+    let s: Stringer = Stringer(suffix="!")
+    # Pipe int through s.stamp(...)? Pipe operator fills first slot.
+    let r: str = 42 |> s.stamp()
+    print(r)
+
+    let r2: str = 5 |> s.double_stamp(3)
+    print(r2)
+
+
+if __name__ == "__main__":
+    main()

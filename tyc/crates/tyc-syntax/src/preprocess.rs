@@ -193,6 +193,13 @@ pub fn preprocess(source: &str) -> PreprocessResult {
     let mut plain_class_lines: Vec<usize> = Vec::new();
     // String state carried across lines (triple-quoted strings may span them).
     let mut in_string: Option<StringMode> = None;
+    // When a `freeze let` RHS spans multiple lines (e.g. a multi-line dict
+    // literal), the opening `__typhon_freeze__(` is emitted on the first
+    // line but the matching `)` has to land *after* the closing bracket of
+    // the RHS expression. `freeze_let_depth` tracks the residual bracket
+    // depth left over from earlier `freeze let` lines; when it returns to
+    // zero we close the call by appending `)` to the current line.
+    let mut freeze_let_depth: i32 = 0;
 
     for (line_index, line) in source.split_inclusive('\n').enumerate() {
         // Keyword stripping only applies outside of string content.
@@ -213,12 +220,30 @@ pub fn preprocess(source: &str) -> PreprocessResult {
             if indent_len == 0 {
                 if let Some(after_raw) = rest.strip_prefix("freeze let ") {
                     let after = after_raw.trim_end_matches(['\n', '\r']);
-                    if let Some(rewritten) = wrap_freeze_let(after) {
+                    if let Some(wrap) = wrap_freeze_let_with_depth(after) {
                         stripped.push(StrippedKeyword {
                             line_index,
                             keyword: TyphonKeyword::Freeze,
                         });
-                        let new_line = format!("{}let {}\n", indent, rewritten);
+                        // If the RHS opened more brackets than it closed
+                        // on this line, postpone the closing `)` and let
+                        // the residual-depth tracker emit it on the line
+                        // that brings the depth back to zero. The wrap
+                        // helper splits the rewrite into a `head`
+                        // (`X = __typhon_freeze__(rhs`) and a `tail`
+                        // (`<comment>` or empty) so we can place the
+                        // closing `)` between them on the single-line
+                        // case.
+                        let new_line = if wrap.residual > 0 {
+                            freeze_let_depth = wrap.residual;
+                            // Comment-on-open-line is rejected by
+                            // wrap_freeze_let_with_depth in the
+                            // multi-line case, so `tail` is empty here.
+                            debug_assert!(wrap.tail.is_empty());
+                            format!("{}let {}\n", indent, wrap.head)
+                        } else {
+                            format!("{}let {}){}\n", indent, wrap.head, wrap.tail)
+                        };
                         let (rewritten, marks) = rewrite_optionals(&new_line, &mut in_string);
                         for col in marks {
                             optionals.push(StrippedOptional {
@@ -230,6 +255,25 @@ pub fn preprocess(source: &str) -> PreprocessResult {
                         continue;
                     }
                 }
+            }
+            // Already inside a multi-line `freeze let` RHS — adjust the
+            // depth by this line's net brackets. When the depth hits zero
+            // we emit a closing `)` after the bracket that closed it; on
+            // earlier lines we forward the content verbatim.
+            if freeze_let_depth > 0 {
+                let line_no_nl = line.trim_end_matches(['\n', '\r']);
+                let net = bracket_delta_outside_strings(line_no_nl, &mut in_string);
+                freeze_let_depth += net;
+                if freeze_let_depth <= 0 {
+                    freeze_let_depth = 0;
+                    let trailing = &line[line_no_nl.len()..];
+                    let emitted = format!("{})", line_no_nl);
+                    python_source.push_str(&emitted);
+                    python_source.push_str(trailing);
+                } else {
+                    python_source.push_str(line);
+                }
+                continue;
             }
 
             // ── `newtype Name = Base` → `Name = NewType("Name", Base)` ───────
@@ -843,25 +887,84 @@ fn unwrap_freeze_let(content: &str) -> Option<String> {
 /// burying the comment inside the call expression. Mirrors the
 /// simple split-on-first-`#` convention used by
 /// [`parse_newtype_decl`] and [`parse_lazy_import`].
+#[cfg_attr(not(test), allow(dead_code))]
 fn wrap_freeze_let(tail: &str) -> Option<String> {
-    let (code, comment) = match tail.find('#') {
-        Some(i) => (&tail[..i], &tail[i..]),
-        None => (tail, ""),
-    };
-    // We need the FIRST `=` that isn't inside square brackets or
-    // parens (so a default-value annotation like `Dict[str, int]`
-    // doesn't confuse us). Track depth.
-    let bytes = code.as_bytes();
+    let wrap = wrap_freeze_let_with_depth(tail)?;
+    // The single-line form was: `lhs = __typhon_freeze__(rhs)<tail>` —
+    // append the closing `)` here so existing callers keep working.
+    // Refuse the multi-line case: callers of the legacy single-line
+    // helper expect a balanced expression.
+    if wrap.residual != 0 {
+        return None;
+    }
+    Some(format!("{}){}", wrap.head, wrap.tail))
+}
+
+/// Result of [`wrap_freeze_let_with_depth`].
+struct FreezeLetWrap {
+    /// The rewrite up to (but not including) the closing `)` of the
+    /// `__typhon_freeze__(` call — `"X = __typhon_freeze__(rhs"`.
+    head: String,
+    /// Anything that must follow the closing `)` on the original line —
+    /// typically a trailing comment `"  # note"`. Empty when there was
+    /// no comment, and guaranteed empty in the multi-line case (the
+    /// open-line cannot carry a comment because Python would treat the
+    /// continuation as part of it).
+    tail: String,
+    /// Bracket depth remaining at end-of-line. Zero for the single-line
+    /// case; positive when the RHS opens a multi-line container literal.
+    residual: i32,
+}
+
+/// Rewrite the tail of `freeze let X = ...` to
+/// `X = __typhon_freeze__(...` (note the *unclosed* call). Returns the
+/// rewritten text and the *residual bracket depth* of the RHS on this
+/// physical line:
+///
+/// * residual == 0 → the entire RHS fits on one line and the caller
+///   should close the wrap by appending `)`.
+/// * residual >  0 → the RHS opens a multi-line literal; the caller
+///   must track depth across subsequent lines and append `)` when the
+///   depth returns to zero.
+///
+/// The unclosed shape lets the multi-line `freeze let` case work
+/// without joining lines (which would shift line numbers and break the
+/// source map). A line-tail comment is preserved on single-line wraps;
+/// on multi-line wraps we cannot meaningfully keep it on the open line
+/// (it would be interpreted as a comment by Python and consume the rest
+/// of the source line), so we forbid that combination.
+fn wrap_freeze_let_with_depth(tail: &str) -> Option<FreezeLetWrap> {
+    // We need the FIRST `=` that isn't inside square brackets or parens
+    // — `Dict[str, int]` and similar must not confuse us. Track depth
+    // and detect comments only outside of brackets.
+    let bytes = tail.as_bytes();
     let mut depth: i32 = 0;
     let mut eq_idx: Option<usize> = None;
-    for (i, &b) in bytes.iter().enumerate() {
+    let mut comment_idx: Option<usize> = None;
+    let mut in_str: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
         match b {
+            b'#' if depth == 0 && eq_idx.is_some() => {
+                comment_idx = Some(i);
+                break;
+            }
+            b'\'' | b'"' => in_str = Some(b),
             b'(' | b'[' | b'{' => depth += 1,
             b')' | b']' | b'}' => depth -= 1,
-            b'=' if depth == 0 => {
-                // Skip every augmented-assignment form (`==`, `>=`, `<=`,
-                // `!=`, `:=`, `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`,
-                // `^=`, `@=`) — we just need a bare `=`.
+            b'=' if depth == 0 && eq_idx.is_none() => {
                 let prev = if i == 0 { 0u8 } else { bytes[i - 1] };
                 let next = bytes.get(i + 1).copied().unwrap_or(0);
                 if next == b'='
@@ -882,18 +985,37 @@ fn wrap_freeze_let(tail: &str) -> Option<String> {
                             | b'@'
                     )
                 {
+                    i += 1;
                     continue;
                 }
                 eq_idx = Some(i);
-                break;
             }
             _ => {}
         }
+        i += 1;
     }
     let eq = eq_idx?;
+    let (code, comment) = match comment_idx {
+        Some(c) => (&tail[..c], &tail[c..]),
+        None => (tail, ""),
+    };
     let lhs = code[..eq].trim_end();
     let rhs = code[eq + 1..].trim();
     if rhs.is_empty() {
+        return None;
+    }
+    // Recompute the residual depth using only the RHS (the LHS is plain
+    // names + type annotations and is balanced by construction).
+    let residual = bracket_delta_simple(rhs);
+    if residual < 0 {
+        // RHS closed more brackets than it opened — malformed; let
+        // downstream parsing surface the error verbatim.
+        return None;
+    }
+    if residual > 0 && !comment.is_empty() {
+        // Multi-line wrap can't carry a trailing comment on the open
+        // line (the `#` would consume the wrap's continuation). Fall
+        // through; let the user move the comment.
         return None;
     }
     let suffix = if comment.is_empty() {
@@ -901,7 +1023,75 @@ fn wrap_freeze_let(tail: &str) -> Option<String> {
     } else {
         format!("  {}", comment.trim_end())
     };
-    Some(format!("{} = __typhon_freeze__({}){}", lhs, rhs, suffix))
+    Some(FreezeLetWrap {
+        head: format!("{} = __typhon_freeze__({}", lhs, rhs),
+        tail: suffix,
+        residual,
+    })
+}
+
+/// Net bracket delta of `s`, ignoring brackets inside string literals.
+/// String literals use plain `'`/`"` quoting; backslash-escaped quotes
+/// are honoured. Triple-quoted strings span multiple lines — those are
+/// not handled here because the wider preprocess loop already tracks
+/// `in_string` separately.
+fn bracket_delta_simple(s: &str) -> i32 {
+    let bytes = s.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_str: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'#' => break,
+            b'\'' | b'"' => in_str = Some(b),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    depth
+}
+
+/// Net bracket delta of `line`, threading multi-line triple-string
+/// state through `in_string`. Mirrors `bracket_delta_simple` but defers
+/// to the wider preprocess loop's string tracker so brackets inside an
+/// active triple-quoted string don't count.
+fn bracket_delta_outside_strings(line: &str, in_string: &mut Option<StringMode>) -> i32 {
+    let bytes = line.as_bytes();
+    let mut depth: i32 = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if in_string.is_some() {
+            // Conservatively skip — we don't try to count brackets inside
+            // a triple-quoted string. The wider loop handles entering /
+            // leaving these strings via the existing `update_string_state`
+            // path; here we just don't disturb depth counts.
+            i += 1;
+            continue;
+        }
+        let b = bytes[i];
+        match b {
+            b'#' => break,
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    depth
 }
 
 /// Parse the tail of a `newtype` line: `Name = Base`.
@@ -2058,6 +2248,22 @@ pub fn validate_question_ops(source: &str) -> Vec<QuestionOpError> {
         // function returning `Result[T, E]`). O17 / FINDINGS #66.
         for offset in find_mid_expression_questionmarks(code) {
             let q_offset = byte_offset + offset;
+            // N2 (2026-05-22): `?` inside a comprehension body would lift
+            // the call out to a temp *before* the comprehension's `for`
+            // binding came into scope, which produced a misleading
+            // "name not in scope" error against rewritten code the user
+            // didn't write. Reject up front with a targeted message.
+            if questionmark_is_in_comprehension(code, offset) {
+                errors.push(QuestionOpError {
+                    line_index,
+                    offset: q_offset,
+                    message: "`?` operator cannot appear inside a list / dict / set / \
+                             generator comprehension; rewrite the comprehension as an explicit \
+                             `for` loop that threads the `Err` short-circuit through"
+                        .to_owned(),
+                });
+                continue;
+            }
             match fn_stack.last() {
                 None => {
                     errors.push(QuestionOpError {
@@ -2196,6 +2402,136 @@ fn find_mid_expression_questionmarks(code: &str) -> Vec<usize> {
     out
 }
 
+/// Return `true` when the `?` at byte position `q_idx` in `code` sits
+/// inside the *expression* portion of a comprehension — i.e. there is
+/// an unbalanced opening bracket `[` / `(` / `{` to its left, and the
+/// next `for` keyword at that bracket depth appears to its right
+/// before the closing bracket.
+///
+/// Used by [`validate_question_ops`] to surface a targeted error for
+/// `[parse(s)? for s in items]` (N2). The `?` lifter would otherwise
+/// hoist the call out *above* the `for s in items` binding and produce
+/// a misleading "name `s` not in scope" against text the user didn't
+/// write. We could rewrite the comprehension into a manual loop, but
+/// the resulting code lays out very differently from what the user
+/// wrote, so rejecting up-front with a clear message is the cleaner
+/// behaviour.
+fn questionmark_is_in_comprehension(code: &str, q_idx: usize) -> bool {
+    let bytes = code.as_bytes();
+    if q_idx >= bytes.len() {
+        return false;
+    }
+    // Track bracket depth from the start of the line up to the `?`.
+    // We record the (depth, position) of the most recent unbalanced
+    // opening bracket so we can know which group to scan for `for`.
+    let mut stack: Vec<usize> = Vec::new();
+    let mut in_str: Option<u8> = None;
+    let mut i = 0;
+    while i < q_idx {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'#' => return false, // `?` after a comment makes no sense, but be safe.
+            b'\'' | b'"' => in_str = Some(b),
+            b'(' | b'[' | b'{' => stack.push(i),
+            b')' | b']' | b'}' => {
+                stack.pop();
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    // No enclosing open bracket → can't be in a comprehension.
+    let open_pos = match stack.last().copied() {
+        Some(p) => p,
+        None => return false,
+    };
+    let open_ch = bytes[open_pos];
+    let close_ch = match open_ch {
+        b'(' => b')',
+        b'[' => b']',
+        b'{' => b'}',
+        _ => return false,
+    };
+    // Now scan forward from `?` looking for the matching close. While
+    // we're at the *outermost* bracket level we entered, we look for
+    // the `for ` token: a whole word `for` (with a space / paren on
+    // either side). The first `for` we see at that depth flags the
+    // enclosing bracket pair as a comprehension.
+    let mut depth: i32 = 0;
+    let mut in_str: Option<u8> = None;
+    let mut j = q_idx + 1;
+    while j < bytes.len() {
+        let b = bytes[j];
+        if let Some(q) = in_str {
+            if b == b'\\' && j + 1 < bytes.len() {
+                j += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            j += 1;
+            continue;
+        }
+        match b {
+            b'#' => break,
+            b'\'' | b'"' => in_str = Some(b),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                if depth == 0 {
+                    // We've left the enclosing bracket without seeing
+                    // a `for` keyword — not a comprehension. The byte
+                    // *should* match `close_ch` for a well-formed
+                    // expression, but mismatched brackets would already
+                    // have failed parsing upstream, so we just bail.
+                    let _ = close_ch;
+                    return false;
+                }
+                depth -= 1;
+            }
+            // `for` token at our outer depth (depth == 0 inside the
+            // enclosing bracket means we're at the body level of the
+            // bracket group, not inside a nested call).
+            b'f' if depth == 0 && is_word_for(bytes, j) => return true,
+            _ => {}
+        }
+        j += 1;
+    }
+    false
+}
+
+/// `true` when bytes `[i..i+3]` spells `for` *and* `for` is a whole
+/// word (the byte before is non-identifier-continuation, the byte after
+/// is non-identifier-continuation). Used by
+/// [`questionmark_is_in_comprehension`] so we don't misfire on
+/// substrings like `format(...)` or `before` inside a bracket group.
+fn is_word_for(bytes: &[u8], i: usize) -> bool {
+    if i + 3 > bytes.len() {
+        return false;
+    }
+    if &bytes[i..i + 3] != b"for" {
+        return false;
+    }
+    let prev_ok = i == 0 || !is_ident_byte(bytes[i - 1]);
+    let next_ok = i + 3 >= bytes.len() || !is_ident_byte(bytes[i + 3]);
+    prev_ok && next_ok
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b == b'_' || b.is_ascii_alphanumeric()
+}
+
 /// Return `true` when `ret` is the `Result` identifier (bare or subscripted).
 ///
 /// Checks for a whole-word match so that `MyResult` / `NotAResult` are not
@@ -2330,6 +2666,268 @@ fn extract_return_type_text(def_line: &str) -> Option<String> {
 /// metadata used by the unused-import diagnostic.
 pub fn expand_lazy_lets(source: &str) -> String {
     expand_lazy_imports_with(source, false)
+}
+
+/// Rewrite typed tuple-unpacking `let` declarations into a temp +
+/// per-element sequence. N4 (2026-05-22).
+///
+/// Input shape: `let (NAME: TYPE, NAME: TYPE[, …]) = EXPR` — the
+/// parenthesised LHS must contain at least one `:`-annotated capture
+/// (otherwise the existing tuple-unpacking path handles it).
+///
+/// Output:
+///
+/// ```text
+///     let __typhon_unpack_N__ = EXPR
+///     let A: TA = __typhon_unpack_N__[0]
+///     let B: TB = __typhon_unpack_N__[1]
+/// ```
+///
+/// The pass is line-based and idempotent: it scans only lines whose
+/// `code` portion (string- and comment-aware) starts with `let (`
+/// and contains the `: TYPE` pattern. Other forms (untyped tuple let,
+/// `let NAME = …`, regular Python statements) are emitted verbatim.
+///
+/// One untyped capture mixed with typed ones is allowed —
+/// `let (a: int, b) = pair()` emits `let b = __typhon_unpack_N__[1]`
+/// with the inferred type.
+///
+/// Multi-line RHS expressions (the literal spans multiple physical
+/// lines) are *not* supported in v1 — Typhon source convention is to
+/// keep the unpacking call on one line. The pass leaves multi-line
+/// shapes untouched so the parser surfaces a clean error.
+pub fn expand_typed_let_unpack(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut counter: usize = 0;
+    let mut in_string: Option<StringMode> = None;
+
+    for line in source.split_inclusive('\n') {
+        let pre_string = in_string;
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let _code_end = scan_line_code_end(raw, &mut in_string);
+
+        if pre_string.is_some() {
+            out.push_str(line);
+            continue;
+        }
+
+        let indent_len = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
+        let indent = &raw[..indent_len];
+        let body = &raw[indent_len..];
+
+        let nl = if line.ends_with("\r\n") {
+            "\r\n"
+        } else if line.ends_with('\n') {
+            "\n"
+        } else {
+            ""
+        };
+
+        match parse_typed_let_unpack(body) {
+            Some(rewrite) => {
+                let tmp = format!("__typhon_unpack_{}__", counter);
+                counter += 1;
+                out.push_str(indent);
+                out.push_str("let ");
+                out.push_str(&tmp);
+                out.push_str(" = ");
+                out.push_str(&rewrite.rhs);
+                out.push_str(nl);
+                for (i, capture) in rewrite.captures.iter().enumerate() {
+                    out.push_str(indent);
+                    out.push_str("let ");
+                    out.push_str(&capture.name);
+                    if let Some(ty) = &capture.annotation {
+                        out.push_str(": ");
+                        out.push_str(ty);
+                    }
+                    out.push_str(" = ");
+                    out.push_str(&tmp);
+                    out.push('[');
+                    out.push_str(&i.to_string());
+                    out.push(']');
+                    out.push_str(nl);
+                }
+            }
+            None => {
+                out.push_str(line);
+            }
+        }
+    }
+
+    out
+}
+
+struct TypedLetUnpack {
+    captures: Vec<TypedLetCapture>,
+    rhs: String,
+}
+
+struct TypedLetCapture {
+    name: String,
+    annotation: Option<String>,
+}
+
+/// Recognise `let (a: int, b: str) = expr` on a single physical line.
+///
+/// Returns `None` for plain untyped destructuring (`let (a, b) = expr`)
+/// so that pattern keeps flowing through `preprocess`'s existing
+/// `let `-stripping path. We only intercept when at least one capture
+/// has a `:` annotation — that's the case the existing path can't
+/// handle.
+fn parse_typed_let_unpack(body: &str) -> Option<TypedLetUnpack> {
+    let after_let = body.strip_prefix("let ")?;
+    let after_paren = after_let.strip_prefix('(')?;
+    let bytes = after_paren.as_bytes();
+    // Find the matching `)` at depth 0, ignoring brackets inside
+    // annotations (`list[int]`, `tuple[int, str]`, …) and string
+    // literals.
+    let mut depth: i32 = 0;
+    let mut close: Option<usize> = None;
+    let mut in_str: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => in_str = Some(b),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                if depth == 0 && b == b')' {
+                    close = Some(i);
+                    break;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let close = close?;
+    let inside = &after_paren[..close];
+    let after_close = after_paren[close + 1..].trim_start();
+    let rhs = after_close.strip_prefix('=')?.trim();
+    if rhs.is_empty() {
+        return None;
+    }
+    // Split captures by top-level commas (commas inside `[...]` /
+    // `(...)` stay grouped so `dict[str, int]` survives).
+    let raw_captures = split_top_level_commas_lite(inside);
+    if raw_captures.is_empty() {
+        return None;
+    }
+    let mut captures: Vec<TypedLetCapture> = Vec::with_capacity(raw_captures.len());
+    let mut saw_annotation = false;
+    for cap in raw_captures {
+        let cap = cap.trim();
+        if cap.is_empty() {
+            return None;
+        }
+        let (name, annotation) = if let Some(colon) = find_top_level_colon(cap) {
+            saw_annotation = true;
+            (cap[..colon].trim(), Some(cap[colon + 1..].trim()))
+        } else {
+            (cap, None)
+        };
+        if !is_python_ident(name) {
+            return None;
+        }
+        captures.push(TypedLetCapture {
+            name: name.to_owned(),
+            annotation: annotation.map(|s| s.to_owned()),
+        });
+    }
+    if !saw_annotation {
+        // Pure untyped destructuring — let the existing path handle
+        // it so we don't introduce gratuitous temps.
+        return None;
+    }
+    Some(TypedLetUnpack {
+        captures,
+        rhs: rhs.to_owned(),
+    })
+}
+
+/// Top-level comma split that ignores brackets and string literals.
+/// A trimmed local copy so we don't have to wire up the larger
+/// `split_top_level_commas` helper in the LSP / migrate crate.
+fn split_top_level_commas_lite(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start = 0usize;
+    let mut in_str: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => in_str = Some(b),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => {
+                out.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(&s[start..]);
+    out
+}
+
+/// Find the byte position of the first top-level `:` in `s`, ignoring
+/// `:` characters inside bracket groups (`dict[str, int]`) and string
+/// literals. Returns `None` if `s` has no top-level `:`.
+fn find_top_level_colon(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_str: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == q {
+                in_str = None;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\'' | b'"' => in_str = Some(b),
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b':' if depth == 0 => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 pub fn expand_lazy_imports(source: &str) -> String {
@@ -5846,6 +6444,164 @@ mod tests {
         let prep = preprocess(src);
         let out = postprocess(&prep.python_source, &prep.stripped, &prep.optionals);
         assert_eq!(out, src);
+    }
+
+    #[test]
+    fn typed_let_unpack_rewrites_to_temp_plus_lets() {
+        // Regression for N4 (2026-05-22): `let (a: int, b: str) = func()`
+        // used to be rejected because the parser doesn't accept typed
+        // tuple unpacking patterns. The pre-pass should rewrite it into
+        // a single temp + per-element typed lets.
+        let src = "def f() -> None:\n    let (a: int, b: str) = pair()\n";
+        let out = expand_typed_let_unpack(src);
+        assert!(
+            out.contains("__typhon_unpack_0__ = pair()"),
+            "expected temp + RHS, got:\n{out}"
+        );
+        assert!(
+            out.contains("let a: int = __typhon_unpack_0__[0]"),
+            "expected first capture, got:\n{out}"
+        );
+        assert!(
+            out.contains("let b: str = __typhon_unpack_0__[1]"),
+            "expected second capture, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn typed_let_unpack_handles_compound_annotations() {
+        // `dict[str, int]` and `tuple[int, ...]` must round-trip
+        // intact — the top-level-comma splitter has to ignore commas
+        // inside `[]`.
+        let src = "def f() -> None:\n    let (xs: list[int], m: dict[str, int]) = build()\n";
+        let out = expand_typed_let_unpack(src);
+        assert!(
+            out.contains("let xs: list[int] = __typhon_unpack_0__[0]"),
+            "list[int] annotation got mangled, output:\n{out}"
+        );
+        assert!(
+            out.contains("let m: dict[str, int] = __typhon_unpack_0__[1]"),
+            "dict[str, int] annotation got mangled, output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn typed_let_unpack_accepts_mixed_inferred_capture() {
+        // One typed + one inferred capture is still rewritten — the
+        // inferred slot omits the annotation so the type checker picks
+        // it up from the temp's subscript type.
+        let src = "def f() -> None:\n    let (a: int, b) = pair()\n";
+        let out = expand_typed_let_unpack(src);
+        assert!(
+            out.contains("let a: int = __typhon_unpack_0__[0]"),
+            "got:\n{out}"
+        );
+        assert!(
+            out.contains("let b = __typhon_unpack_0__[1]"),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn typed_let_unpack_leaves_untyped_destructuring_alone() {
+        // Pure untyped destructuring should NOT be intercepted — the
+        // existing `let `-stripping path handles `let (a, b) = pair()`
+        // directly without a temp.
+        let src = "def f() -> None:\n    let (a, b) = pair()\n";
+        let out = expand_typed_let_unpack(src);
+        assert!(
+            !out.contains("__typhon_unpack"),
+            "untyped destructuring must not gain a temp: {out}"
+        );
+        assert!(
+            out.contains("let (a, b) = pair()"),
+            "original line must be preserved verbatim, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn questionmark_in_list_comprehension_is_rejected() {
+        // Regression for N2 (2026-05-22): the inline `?` lifter used to
+        // hoist `parse(s)?` *above* the comprehension's `for s in items`
+        // binding, then complained that `s` wasn't in scope. Reject it
+        // here with a targeted message instead.
+        let src = "def f(xs: list[str]) -> Result[list[int], str]:\n    \
+                   let ys: list[int] = [parse(s)? for s in xs]\n    \
+                   return Ok(ys)\n";
+        let errors = validate_question_ops(src);
+        assert_eq!(
+            errors.len(),
+            1,
+            "expected one comprehension error, got {errors:?}"
+        );
+        assert!(
+            errors[0].message.contains("comprehension"),
+            "expected comprehension-specific message, got: {}",
+            errors[0].message
+        );
+    }
+
+    #[test]
+    fn questionmark_in_dict_comprehension_is_rejected() {
+        let src = "def f(xs: list[str]) -> Result[dict[str, int], str]:\n    \
+                   let m: dict[str, int] = {s: parse(s)? for s in xs}\n    \
+                   return Ok(m)\n";
+        let errors = validate_question_ops(src);
+        assert!(
+            errors.iter().any(|e| e.message.contains("comprehension")),
+            "expected comprehension error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn questionmark_in_argument_position_still_works() {
+        // The argument-position case must NOT be flagged as a
+        // comprehension. (Same line shape — `( ... )` brackets — but
+        // no `for` keyword inside.)
+        let src = "def f(a: str, b: str) -> Result[int, str]:\n    \
+                   return Ok(add(parse(a)?, parse(b)?))\n";
+        let errors = validate_question_ops(src);
+        assert!(
+            errors.is_empty(),
+            "expected no errors for arg-position `?`, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn freeze_let_multiline_dict_literal() {
+        // Regression for N1 (2026-05-22): a multi-line dict literal on the
+        // RHS used to emit `__typhon_freeze__({)` on the open line, breaking
+        // Python's parser. The wrap call must stay open until the closing
+        // bracket of the RHS expression is reached.
+        let src = "freeze let CONFIG = {\n    \"port\": 8080,\n    \"host\": \"a\",\n}\n";
+        let out = preprocess(src).python_source;
+        // First line opens the call but doesn't close it.
+        assert!(
+            out.contains("let CONFIG = __typhon_freeze__({\n"),
+            "expected open `__typhon_freeze__({{`, got:\n{out}"
+        );
+        // Closing `)` lands on the line that closes the literal.
+        assert!(
+            out.contains("})\n") || out.contains("})\r\n"),
+            "expected closing brace+paren after the literal, got:\n{out}"
+        );
+        // Original `{}` body lines are preserved verbatim so f-strings and
+        // other literal payloads round-trip unchanged.
+        assert!(out.contains("    \"port\": 8080,\n"), "got:\n{out}");
+    }
+
+    #[test]
+    fn freeze_let_multiline_list_literal() {
+        let src = "freeze let TAGS = [\n    \"a\",\n    \"b\",\n]\n";
+        let out = preprocess(src).python_source;
+        assert!(
+            out.contains("let TAGS = __typhon_freeze__([\n"),
+            "expected open `__typhon_freeze__([`, got:\n{out}"
+        );
+        assert!(
+            out.contains("])\n") || out.contains("])\r\n"),
+            "expected closing `])` after the literal, got:\n{out}"
+        );
     }
 
     #[test]

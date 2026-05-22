@@ -1,0 +1,19 @@
+# MINIMAL REPRO: in-process VM (`tyc run` default) miscomputes `total += v`
+# inside a `match` Ok-capture arm. Compiled Python is correct.
+
+def main() -> None:
+    let outcomes: list[Result[int, str]] = [Ok(1), Err("bad"), Ok(7)]
+    mut total: int = 0
+    for o in outcomes:
+        match o:
+            case Ok(v):
+                total += v
+            case Err(_):
+                pass
+    # Compiled Python: 8
+    # tyc run (VM):    0
+    print(f"total = {total}")
+
+
+if __name__ == "__main__":
+    main()

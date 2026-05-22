@@ -1,0 +1,29 @@
+# Probe: match arm with if/return-or-return — does tyc see both paths as terminating?
+
+type Status = Open | Closed
+
+
+class Open:
+    since: float
+class Closed:
+    label: str
+
+
+def state(s: Status, now: float, cooldown: float) -> str:
+    match s:
+        case Open(since):
+            if now - since >= cooldown:
+                return "ready"
+            return "still-cooling"
+        case Closed(label):
+            return f"closed: {label}"
+
+
+def main() -> None:
+    print(state(Open(since=0.0), 1.0, 0.5))   # "ready"
+    print(state(Open(since=0.0), 0.1, 0.5))   # "still-cooling"
+    print(state(Closed(label="ok"), 0.0, 0.5))
+
+
+if __name__ == "__main__":
+    main()

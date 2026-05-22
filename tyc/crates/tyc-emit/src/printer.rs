@@ -203,7 +203,15 @@ impl Emitter {
                     iter.next();
                 }
             }
-            self.writeln("from __future__ import annotations");
+            // N12 (2026-05-22): skip the injection when the user wrote
+            // `from __future__ import annotations` themselves. Python
+            // tolerates duplicate future-imports, but emitting two
+            // identical lines is sloppy and any tool that diffs the
+            // output will flag it.
+            let user_already_imported = module.body.iter().any(user_imports_future_annotations);
+            if !user_already_imported {
+                self.writeln("from __future__ import annotations");
+            }
             // PEP 695 lowering prelude (FINDINGS #47): for target < 3.12,
             // collect every PEP 695 type-param used in the module and
             // emit `typing.TypeVar(...)` definitions plus the required
@@ -907,8 +915,24 @@ impl Emitter {
                     UnaryOp::UAdd => "+",
                     UnaryOp::USub => "-",
                 };
+                // `not` is precedence 5; arithmetic unaries (`+`/`-`/`~`)
+                // are 13. If the operand has lower precedence than the
+                // unary itself, it must be parenthesised — otherwise
+                // `not (a or b)` re-emits as `not a or b`, which is
+                // `(not a) or b` under Python's grammar.
+                let self_prec: u8 = match u.op {
+                    UnaryOp::Not => 5,
+                    UnaryOp::UAdd | UnaryOp::USub | UnaryOp::Invert => 13,
+                };
+                let needs_parens = expr_precedence(&u.operand) < self_prec;
                 self.write(op);
-                self.emit_expr(&u.operand);
+                if needs_parens {
+                    self.write("(");
+                    self.emit_expr(&u.operand);
+                    self.write(")");
+                } else {
+                    self.emit_expr(&u.operand);
+                }
             }
 
             Expr::Lambda(l) => {
@@ -1668,6 +1692,28 @@ fn is_module_docstring(stmt: &Stmt) -> bool {
     }
 }
 
+/// `true` when `stmt` is `from __future__ import annotations` (alone or
+/// among other names — `from __future__ import annotations, division`
+/// counts too). Used by the module emitter to skip the auto-injection
+/// when the user already wrote the import themselves (N12).
+fn user_imports_future_annotations(stmt: &Stmt) -> bool {
+    let Stmt::ImportFrom(f) = stmt else {
+        return false;
+    };
+    if f.level != 0 {
+        return false;
+    }
+    let Some(module_name) = &f.module else {
+        return false;
+    };
+    if module_name.as_str() != "__future__" {
+        return false;
+    }
+    f.names
+        .iter()
+        .any(|alias| alias.name.as_str() == "annotations")
+}
+
 fn op_symbol(op: &Operator) -> &'static str {
     match op {
         Operator::Add => "+",
@@ -2300,6 +2346,64 @@ mod tests {
             !after_eq.contains('\n') || after_eq.trim_end().ends_with('"'),
             "raw newline inside emitted string literal: {:?}",
             out
+        );
+    }
+
+    #[test]
+    fn user_future_import_is_not_duplicated_in_python_emit() {
+        // Regression for N12 (2026-05-22): the Python-emit path (used by
+        // `tyc build`) unconditionally injected
+        // `from __future__ import annotations` even when the user had
+        // already written it, producing two identical lines.
+        use crate::emit_python;
+        let parsed = tyc_syntax::parse_module("from __future__ import annotations\nx: int = 1\n")
+            .expect("parse failed");
+        let out = emit_python(parsed.syntax());
+        assert_eq!(
+            out.matches("from __future__ import annotations").count(),
+            1,
+            "expected exactly one future-import line, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn future_import_still_injected_when_absent_in_python_emit() {
+        use crate::emit_python;
+        let parsed = tyc_syntax::parse_module("x: int = 1\n").expect("parse failed");
+        let out = emit_python(parsed.syntax());
+        assert!(
+            out.contains("from __future__ import annotations"),
+            "future import must still be injected when user didn't write it: {out}"
+        );
+    }
+
+    #[test]
+    fn not_over_boolop_keeps_parens() {
+        // `not (a or b)` re-emitted as `not a or b` would mean
+        // `(not a) or b` under Python's grammar. Round-trip must preserve
+        // the original semantics.
+        for src in [
+            "x = not (a or b)\n",
+            "x = not (a and b)\n",
+            "x = not (a == 0 and b == 0)\n",
+        ] {
+            let out = round_trip(src);
+            assert!(
+                out.contains("not (") && (out.contains(" or ") || out.contains(" and ")),
+                "parens stripped around BoolOp under `not`: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn not_over_ternary_keeps_parens() {
+        // `not (X if C else Y)` would re-emit as `not X if C else Y`,
+        // which parses as `(not X) if C else Y` — different semantics.
+        let src = "x = not (True if a else False)\n";
+        let out = round_trip(src);
+        assert!(
+            out.contains("not (True if a else False)"),
+            "parens stripped around ternary under `not`: {out}"
         );
     }
 }

@@ -1,0 +1,16 @@
+# Probe: same shape but with explicit assignment (not augmented).
+
+def main() -> None:
+    let outcomes: list[Result[int, str]] = [Ok(1), Err("bad"), Ok(7)]
+    mut total: int = 0
+    for o in outcomes:
+        match o:
+            case Ok(v):
+                total = total + v
+            case Err(_):
+                pass
+    print(f"total = {total}")
+
+
+if __name__ == "__main__":
+    main()

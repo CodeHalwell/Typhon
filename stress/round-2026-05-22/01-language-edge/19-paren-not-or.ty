@@ -1,0 +1,18 @@
+# MINIMAL REPRO: emit drops parens around `(a or b)` inside `not (...)`.
+
+def check(ch: str) -> bool:
+    # Per source: not (digit or in "+-")
+    return not (ch.isdigit() or ch in " +-*/()")
+
+
+def main() -> None:
+    # '5' is a digit → check should return False
+    # '+' is in the allowed set → check should return False
+    # 'A' is neither → check should return True
+    print(f"'5' -> {check('5')}")    # expect False
+    print(f"'+' -> {check('+')}")    # expect False — DROPPED PARENS: TRUE
+    print(f"'A' -> {check('A')}")    # expect True
+
+
+if __name__ == "__main__":
+    main()

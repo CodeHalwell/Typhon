@@ -1,0 +1,23 @@
+# Probe: passing wrong newtype to function expecting different newtype.
+# Hypothesis: tyc::newtype_violation or tyc::type_mismatch should fire.
+
+newtype UserId = int
+newtype OrgId = int
+
+
+def fetch_user(uid: UserId) -> str:
+    return f"user#{int(uid)}"
+
+
+def demo() -> str:
+    let oid: OrgId = OrgId(42)
+    # Should fail: OrgId is not UserId, even though both are int underneath.
+    return fetch_user(oid)
+
+
+def main() -> None:
+    print(demo())
+
+
+if __name__ == "__main__":
+    main()

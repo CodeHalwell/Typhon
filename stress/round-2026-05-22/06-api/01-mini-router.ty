@@ -1,0 +1,120 @@
+# API test: mini HTTP router with path parameters, methods, middleware.
+
+type Method = GetMethod | PostMethod | PutMethod | DeleteMethod
+
+
+class GetMethod:
+    label: str
+class PostMethod:
+    label: str
+class PutMethod:
+    label: str
+class DeleteMethod:
+    label: str
+
+
+class Request:
+    method: Method
+    path: str
+    body: str?
+
+
+class Response:
+    status: int
+    body: str
+
+
+type Handler = Callable[[Request], Response]
+
+
+class Route:
+    method_name: str
+    pattern: str
+    handler: Handler
+
+
+class Router:
+    routes: list[Route]
+    not_found: Handler
+
+
+impl Router:
+    def add(self, method_name: str, pattern: str, handler: Handler) -> None:
+        self.routes.append(Route(method_name=method_name, pattern=pattern, handler=handler))
+
+    def handle(self, req: Request) -> Response:
+        let m_name: str = method_name(req.method)
+        for r in self.routes:
+            if r.method_name == m_name and matches(r.pattern, req.path):
+                return r.handler(req)
+        return self.not_found(req)
+
+
+def method_name(m: Method) -> str:
+    match m:
+        case GetMethod(_):
+            return "GET"
+        case PostMethod(_):
+            return "POST"
+        case PutMethod(_):
+            return "PUT"
+        case DeleteMethod(_):
+            return "DELETE"
+
+
+def matches(pattern: str, path: str) -> bool:
+    let pattern_parts: list[str] = pattern.strip("/").split("/")
+    let path_parts: list[str] = path.strip("/").split("/")
+    if len(pattern_parts) != len(path_parts):
+        return False
+    mut i: int = 0
+    while i < len(pattern_parts):
+        let pp: str = pattern_parts[i]
+        if pp.startswith(":"):
+            i = i + 1
+            continue
+        if pp != path_parts[i]:
+            return False
+        i = i + 1
+    return True
+
+
+def extract_param(pattern: str, path: str, name: str) -> str?:
+    let pattern_parts: list[str] = pattern.strip("/").split("/")
+    let path_parts: list[str] = path.strip("/").split("/")
+    mut i: int = 0
+    while i < len(pattern_parts):
+        if pattern_parts[i] == ":" + name:
+            return path_parts[i]
+        i = i + 1
+    return None
+
+
+def main() -> None:
+    let router: Router = Router(
+        routes=[],
+        not_found=lambda r: Response(status=404, body=f"not found: {r.path}"),
+    )
+    router.add("GET", "/users", lambda r: Response(status=200, body="user list"))
+    router.add("GET", "/users/:id", lambda r: Response(
+        status=200,
+        body=f"user {extract_param('/users/:id', r.path, 'id')}",
+    ))
+    router.add("POST", "/users", lambda r: Response(
+        status=201,
+        body=f"created: {r.body if r.body is not None else '<empty>'}",
+    ))
+
+    let tests: list[Request] = [
+        Request(method=GetMethod(label="GET"), path="/users", body=None),
+        Request(method=GetMethod(label="GET"), path="/users/42", body=None),
+        Request(method=PostMethod(label="POST"), path="/users", body='{"name":"alice"}'),
+        Request(method=DeleteMethod(label="DELETE"), path="/admin", body=None),
+    ]
+    for r in tests:
+        let resp: Response = router.handle(r)
+        print(f"{method_name(r.method)} {r.path} -> {resp.status} {resp.body}")
+
+
+if __name__ == "__main__":
+    main()
