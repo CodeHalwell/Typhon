@@ -398,10 +398,7 @@ fn render_diagnostics(diags: &Diagnostics) {
         match (errs, warns) {
             (0, w) => eprintln!("  {} warning(s): {}", w, display_code),
             (e, 0) => eprintln!("  {} error(s):   {}", e, display_code),
-            (e, w) => eprintln!(
-                "  {} error(s) + {} warning(s): {}",
-                e, w, display_code
-            ),
+            (e, w) => eprintln!("  {} error(s) + {} warning(s): {}", e, w, display_code),
         }
     }
     // Surface the `tyc explain` workflow: most users don't realise the

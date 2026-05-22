@@ -155,7 +155,13 @@ pub fn compute(
     emit_binding_tokens(&mut tokens, source, resolved, stdlib_modules);
     emit_reference_tokens(&mut tokens, source, resolved, stdlib_modules);
     emit_module_path_tokens(&mut tokens, source, module, stdlib_modules);
-    emit_ast_tokens(&mut tokens, source, module, callee_signatures, attribute_kinds);
+    emit_ast_tokens(
+        &mut tokens,
+        source,
+        module,
+        callee_signatures,
+        attribute_kinds,
+    );
     // The LSP encoding requires tokens in document order (each
     // delta-line is non-negative; ties broken by delta-start).
     tokens.sort_by_key(|t| (t.line, t.col));
@@ -389,12 +395,14 @@ impl<'a> Visitor<'a> for AstWalker<'a> {
                 // kind isn't in the map.
                 let introspected_kind = if let Expr::Name(name) = attr.value.as_ref() {
                     let key = format!("{}.{}", name.id.as_str(), attr.attr.as_str());
-                    self.attribute_kinds.get(&key).and_then(|kind| match kind.as_str() {
-                        "class" => Some(TOKEN_CLASS),
-                        "function" => Some(TOKEN_FUNCTION),
-                        "module" => Some(TOKEN_NAMESPACE),
-                        _ => None,
-                    })
+                    self.attribute_kinds
+                        .get(&key)
+                        .and_then(|kind| match kind.as_str() {
+                            "class" => Some(TOKEN_CLASS),
+                            "function" => Some(TOKEN_FUNCTION),
+                            "module" => Some(TOKEN_NAMESPACE),
+                            _ => None,
+                        })
                 } else {
                     None
                 };
@@ -1116,7 +1124,14 @@ mod tests {
             parse_signature("(name, client, model='gpt-4')"),
         );
         let stdlib_refs: Vec<&str> = Vec::new();
-        let result = compute(&source, &resolved, &module, &stdlib_refs, &sigs, &AttributeKinds::new());
+        let result = compute(
+            &source,
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &sigs,
+            &AttributeKinds::new(),
+        );
         let (client_ty, _) =
             token_at(&source, "client=", &result.data).expect("client kwarg token");
         let (model_ty, _) = token_at(&source, "model=", &result.data).expect("model kwarg token");
@@ -1135,7 +1150,14 @@ mod tests {
         let mut sigs = CalleeSignatures::new();
         sigs.insert("F".to_owned(), parse_signature("(client, **kwargs)"));
         let stdlib_refs: Vec<&str> = Vec::new();
-        let result = compute(&source, &resolved, &module, &stdlib_refs, &sigs, &AttributeKinds::new());
+        let result = compute(
+            &source,
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &sigs,
+            &AttributeKinds::new(),
+        );
         let (client_ty, _) = token_at(&source, "client=", &result.data).expect("client");
         let (weird_ty, _) = token_at(&source, "weird_thing=", &result.data).expect("weird");
         assert_eq!(client_ty, TOKEN_PROPERTY, "real param is orange");
@@ -1157,7 +1179,14 @@ mod tests {
         let mut sigs = CalleeSignatures::new();
         sigs.insert("F".to_owned(), parse_signature("(client, model)"));
         let stdlib_refs: Vec<&str> = Vec::new();
-        let result = compute(&source, &resolved, &module, &stdlib_refs, &sigs, &AttributeKinds::new());
+        let result = compute(
+            &source,
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &sigs,
+            &AttributeKinds::new(),
+        );
         assert!(
             token_at(&source, "bogus=", &result.data).is_none(),
             "unrecognised kwarg should emit no token"
@@ -1259,7 +1288,14 @@ mod tests {
             parse_signature("Agent(name, client)"),
         );
         let stdlib_refs: Vec<&str> = Vec::new();
-        let result = compute(&source, &resolved, &module, &stdlib_refs, &sigs, &AttributeKinds::new());
+        let result = compute(
+            &source,
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &sigs,
+            &AttributeKinds::new(),
+        );
         let (client_ty, _) =
             token_at(&source, "client=", &result.data).expect("client kwarg via attribute callee");
         assert_eq!(client_ty, TOKEN_PROPERTY);
