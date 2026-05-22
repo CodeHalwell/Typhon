@@ -1983,8 +1983,7 @@ comptime let Y: int = use_outer()
 
     #[test]
     fn comptime_str_join_rejects_non_string_element() {
-        let (_, diags) =
-            eval("comptime let BAD: str = \",\".join([1, 2, 3])\n");
+        let (_, diags) = eval("comptime let BAD: str = \",\".join([1, 2, 3])\n");
         assert!(diags.has_errors(), "expected an error for non-str join arg");
     }
 

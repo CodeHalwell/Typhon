@@ -664,9 +664,7 @@ fn run_unknown_module_check(path: &str, source: &str, ctx: &ImportVettingContext
 fn expand_for_check(source: &str) -> String {
     expand_question_ops(&expand_inline_question_ops(&expand_pipes(
         &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-            &expand_multiline_guards(&expand_lazy_imports(
-                &expand_typed_let_unpack(source),
-            )),
+            &expand_multiline_guards(&expand_lazy_imports(&expand_typed_let_unpack(source))),
         ))),
     )))
 }

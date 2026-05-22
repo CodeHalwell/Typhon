@@ -2356,10 +2356,8 @@ mod tests {
         // `from __future__ import annotations` even when the user had
         // already written it, producing two identical lines.
         use crate::emit_python;
-        let parsed = tyc_syntax::parse_module(
-            "from __future__ import annotations\nx: int = 1\n",
-        )
-        .expect("parse failed");
+        let parsed = tyc_syntax::parse_module("from __future__ import annotations\nx: int = 1\n")
+            .expect("parse failed");
         let out = emit_python(parsed.syntax());
         assert_eq!(
             out.matches("from __future__ import annotations").count(),
@@ -2391,8 +2389,7 @@ mod tests {
         ] {
             let out = round_trip(src);
             assert!(
-                out.contains("not (")
-                    && (out.contains(" or ") || out.contains(" and ")),
+                out.contains("not (") && (out.contains(" or ") || out.contains(" and ")),
                 "parens stripped around BoolOp under `not`: {out}"
             );
         }

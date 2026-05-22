@@ -18,10 +18,9 @@ use tyc_syntax::{
     parse_module,
     preprocess::{
         expand_gather_blocks, expand_go_calls, expand_inline_question_ops, expand_lazy_lets,
-        expand_typed_let_unpack,
-        expand_multiline_guards, expand_pipes, expand_question_ops, expand_with_chains,
-        line_byte_starts, preprocess, validate_extend_usage, validate_lazy_usage,
-        validate_question_ops,
+        expand_multiline_guards, expand_pipes, expand_question_ops, expand_typed_let_unpack,
+        expand_with_chains, line_byte_starts, preprocess, validate_extend_usage,
+        validate_lazy_usage, validate_question_ops,
     },
 };
 use tyc_types::{

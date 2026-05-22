@@ -408,9 +408,7 @@ fn is_typevar_declaration(line: &str) -> bool {
     };
     let lhs = code[..eq].trim();
     if lhs.is_empty()
-        || !lhs
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        || !lhs.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         || lhs.starts_with(|c: char| c.is_ascii_digit())
     {
         return false;
@@ -435,11 +433,7 @@ fn rewrite_generic_class_base(line: &str) -> Option<String> {
     };
     let open = rest_after_keyword.find('(')?;
     let name = rest_after_keyword[..open].trim();
-    if name.is_empty()
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return None;
     }
     // Find the matching `)` at depth 0.
@@ -493,7 +487,10 @@ fn rewrite_generic_class_base(line: &str) -> Option<String> {
     } else {
         format!("({})", remaining_bases.join(", "))
     };
-    Some(format!("{}{}{}{}", keyword, new_name_part, new_bases, trailer))
+    Some(format!(
+        "{}{}{}{}",
+        keyword, new_name_part, new_bases, trailer
+    ))
 }
 
 fn collect_bang_class_lines(source: &str) -> HashSet<usize> {

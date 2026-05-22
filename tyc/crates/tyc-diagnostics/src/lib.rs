@@ -918,8 +918,10 @@ pub enum TycError {
     #[diagnostic(
         code(tyc::duplicate_method),
         url("https://typhon.dev/lang/diagnostics/duplicate_method"),
-        help("rename one of the methods, or merge the body of the second \
-              `impl {class_name}:` / `extend {class_name}:` block into the first")
+        help(
+            "rename one of the methods, or merge the body of the second \
+              `impl {class_name}:` / `extend {class_name}:` block into the first"
+        )
     )]
     DuplicateMethod {
         class_name: String,
@@ -1064,8 +1066,10 @@ pub enum TycError {
     #[diagnostic(
         code(tyc::newtype_violation),
         url("https://typhon.dev/lang/diagnostics/newtype_violation"),
-        help("wrap with `{name}({arg_type_short})` to satisfy the nominal newtype, \
-              or change the annotation to `{base}` if the nominal type isn't needed here")
+        help(
+            "wrap with `{name}({arg_type_short})` to satisfy the nominal newtype, \
+              or change the annotation to `{base}` if the nominal type isn't needed here"
+        )
     )]
     NewtypeViolation {
         name: String,
