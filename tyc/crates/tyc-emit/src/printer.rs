@@ -907,8 +907,24 @@ impl Emitter {
                     UnaryOp::UAdd => "+",
                     UnaryOp::USub => "-",
                 };
+                // `not` is precedence 5; arithmetic unaries (`+`/`-`/`~`)
+                // are 13. If the operand has lower precedence than the
+                // unary itself, it must be parenthesised — otherwise
+                // `not (a or b)` re-emits as `not a or b`, which is
+                // `(not a) or b` under Python's grammar.
+                let self_prec: u8 = match u.op {
+                    UnaryOp::Not => 5,
+                    UnaryOp::UAdd | UnaryOp::USub | UnaryOp::Invert => 13,
+                };
+                let needs_parens = expr_precedence(&u.operand) < self_prec;
                 self.write(op);
-                self.emit_expr(&u.operand);
+                if needs_parens {
+                    self.write("(");
+                    self.emit_expr(&u.operand);
+                    self.write(")");
+                } else {
+                    self.emit_expr(&u.operand);
+                }
             }
 
             Expr::Lambda(l) => {
@@ -2300,6 +2316,37 @@ mod tests {
             !after_eq.contains('\n') || after_eq.trim_end().ends_with('"'),
             "raw newline inside emitted string literal: {:?}",
             out
+        );
+    }
+
+    #[test]
+    fn not_over_boolop_keeps_parens() {
+        // `not (a or b)` re-emitted as `not a or b` would mean
+        // `(not a) or b` under Python's grammar. Round-trip must preserve
+        // the original semantics.
+        for src in [
+            "x = not (a or b)\n",
+            "x = not (a and b)\n",
+            "x = not (a == 0 and b == 0)\n",
+        ] {
+            let out = round_trip(src);
+            assert!(
+                out.contains("not (")
+                    && (out.contains(" or ") || out.contains(" and ")),
+                "parens stripped around BoolOp under `not`: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn not_over_ternary_keeps_parens() {
+        // `not (X if C else Y)` would re-emit as `not X if C else Y`,
+        // which parses as `(not X) if C else Y` — different semantics.
+        let src = "x = not (True if a else False)\n";
+        let out = round_trip(src);
+        assert!(
+            out.contains("not (True if a else False)"),
+            "parens stripped around ternary under `not`: {out}"
         );
     }
 }
