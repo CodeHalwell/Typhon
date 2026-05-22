@@ -59,8 +59,12 @@ finds)
   `match` + accumulator pattern — every Result walker, every sealed-
   union aggregator, every state machine — saw `total = 0` from the
   VM and `total = 42` from `tyc run --compile`. The arm body now
-  shares the parent env; only the *pattern's* introduced names
-  (`case Ok(v):` introducing `v`) stay scoped to the arm.
+  executes against the parent env, and pattern captures (`case
+  Ok(v):` introducing `v`) are lifted into the parent env once the
+  pattern + guard accept — matching CPython's `match` semantics,
+  where bindings escape the arm. A failed pattern still discards
+  any tentative captures so a partial bind on a non-matching arm
+  never leaks.
 
 ### Fixed — `tyc run` / `tyc migrate`
 
