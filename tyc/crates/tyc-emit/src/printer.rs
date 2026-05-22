@@ -203,7 +203,15 @@ impl Emitter {
                     iter.next();
                 }
             }
-            self.writeln("from __future__ import annotations");
+            // N12 (2026-05-22): skip the injection when the user wrote
+            // `from __future__ import annotations` themselves. Python
+            // tolerates duplicate future-imports, but emitting two
+            // identical lines is sloppy and any tool that diffs the
+            // output will flag it.
+            let user_already_imported = module.body.iter().any(user_imports_future_annotations);
+            if !user_already_imported {
+                self.writeln("from __future__ import annotations");
+            }
             // PEP 695 lowering prelude (FINDINGS #47): for target < 3.12,
             // collect every PEP 695 type-param used in the module and
             // emit `typing.TypeVar(...)` definitions plus the required
@@ -1684,6 +1692,28 @@ fn is_module_docstring(stmt: &Stmt) -> bool {
     }
 }
 
+/// `true` when `stmt` is `from __future__ import annotations` (alone or
+/// among other names — `from __future__ import annotations, division`
+/// counts too). Used by the module emitter to skip the auto-injection
+/// when the user already wrote the import themselves (N12).
+fn user_imports_future_annotations(stmt: &Stmt) -> bool {
+    let Stmt::ImportFrom(f) = stmt else {
+        return false;
+    };
+    if f.level != 0 {
+        return false;
+    }
+    let Some(module_name) = &f.module else {
+        return false;
+    };
+    if module_name.as_str() != "__future__" {
+        return false;
+    }
+    f.names
+        .iter()
+        .any(|alias| alias.name.as_str() == "annotations")
+}
+
 fn op_symbol(op: &Operator) -> &'static str {
     match op {
         Operator::Add => "+",
@@ -2316,6 +2346,36 @@ mod tests {
             !after_eq.contains('\n') || after_eq.trim_end().ends_with('"'),
             "raw newline inside emitted string literal: {:?}",
             out
+        );
+    }
+
+    #[test]
+    fn user_future_import_is_not_duplicated_in_python_emit() {
+        // Regression for N12 (2026-05-22): the Python-emit path (used by
+        // `tyc build`) unconditionally injected
+        // `from __future__ import annotations` even when the user had
+        // already written it, producing two identical lines.
+        use crate::emit_python;
+        let parsed = tyc_syntax::parse_module(
+            "from __future__ import annotations\nx: int = 1\n",
+        )
+        .expect("parse failed");
+        let out = emit_python(parsed.syntax());
+        assert_eq!(
+            out.matches("from __future__ import annotations").count(),
+            1,
+            "expected exactly one future-import line, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn future_import_still_injected_when_absent_in_python_emit() {
+        use crate::emit_python;
+        let parsed = tyc_syntax::parse_module("x: int = 1\n").expect("parse failed");
+        let out = emit_python(parsed.syntax());
+        assert!(
+            out.contains("from __future__ import annotations"),
+            "future import must still be injected when user didn't write it: {out}"
         );
     }
 
