@@ -8,8 +8,13 @@ Tests real third-party Python packages through the Typhon migrate→build→test
 - Creates isolated venvs for each package
 - Installs the package via pip
 - Runs a minimal smoke test to verify baseline functionality
+- Validates output against expected values
 
-**Phase 2 (Planned):** Full round-trip testing through `tyc migrate` + `tyc build` + semantic diff.
+**Phase 2 (Implemented):** Full round-trip testing through `tyc migrate` + `tyc build` + semantic diff:
+- Preserves module structure during migration
+- Builds emitted Python from migrated Typhon code
+- Executes smoke tests on both original and emitted versions
+- Compares outputs to detect semantic drift
 
 ## Package Selection
 
@@ -21,9 +26,9 @@ Packages chosen for:
 ### Current Test Suite
 
 1. **attrs** (>=23.0.0)
-   - Decorator-based class construction (`@attr.s`)
+   - Decorator-based class construction (`@attrs.define`)
    - Type-annotated attributes
-   - Smoke test: Create and validate a simple `@attr.s` class
+   - Smoke test: Create and validate a simple `@attrs.define` class
 
 2. **click** (>=8.0.0)
    - Command-line argument parsing with decorators
@@ -55,19 +60,20 @@ python3 stress/pypi-sweep/sweep.py --package attrs
 python3 stress/pypi-sweep/sweep.py --verbose
 ```
 
-## Phase 2 Roadmap
+## Phase 2 Implementation Notes
 
-Enhance `sweep.py` to:
-1. Copy selected `.py` files from the installed package to a working directory
-2. Run `tyc migrate` on each file
-3. Create a Typhon project around the migrated `.ty` files
-4. Run `tyc build` to emit Python
-5. Run the smoke test against the emitted code
-6. Diff the outputs: original vs. migrated+emitted
+The harness now implements the full round-trip pipeline:
+1. Validates baseline output against expected values
+2. Preserves package directory structure during migration (e.g., `attrs/__init__.py` → `src/attrs/__init__.ty`)
+3. Runs `tyc migrate` on each module
+4. Creates Typhon project with proper structure
+5. Runs `tyc build` to emit Python
+6. Executes smoke test on emitted code
+7. Compares outputs to detect semantic drift
 
-Exit codes:
-- **0**: All packages round-trip cleanly
-- **1**: At least one package failed migration, build, or semantic diff
+**Environment Variable Support:**
+- Set `TYC=/path/to/tyc` to override the compiler path
+- Harness uses `git rev-parse --show-toplevel` to find repo root (consistent with other stress scripts)
 
 ## CI Integration (Future)
 
@@ -104,8 +110,9 @@ PACKAGES = [
     # ... existing packages ...
     {
         "name": "your-package",
+        "import_name": "your_package",  # Explicit import name (not derived from package name)
         "version": ">=1.0.0",
-        "modules": ["your_package/__init__.py"],  # Files to migrate
+        "modules": ["your_package/__init__.py"],  # Paths relative to package root (preserves structure)
         "smoke_test": """
 # Python code that exercises the package
 import your_package
@@ -113,7 +120,7 @@ result = your_package.do_something()
 print(result)
 assert result == expected
 """,
-        "expected_output": "expected output\n",
+        "expected_output": "expected output\n",  # Optional: validates baseline and emitted outputs
     },
 ]
 ```
@@ -132,10 +139,11 @@ Criteria for new packages:
 All selected packages install and run correctly in vanilla Python:
 - ✓ attrs (23.x) - smoke test passes
 - ✓ click (8.x) - smoke test passes
+- ✓ typing-extensions (4.x) - smoke test passes
 
-### Phase 2 Results (Migrate→Build)
+### Phase 2 Observed Results (Migrate→Build→Semantic Diff)
 
-**Summary:** Migration infrastructure works, but real PyPI packages expose edge cases in `tyc migrate` and complex typing patterns that require manual fixes.
+**Summary:** Migration infrastructure works end-to-end with semantic diff validation. Real PyPI packages expose edge cases in `tyc migrate` and complex typing patterns that require manual fixes.
 
 **attrs (23.x):**
 - ✗ Migration produces `.ty` files but build fails with 28 type errors
@@ -145,7 +153,12 @@ All selected packages install and run correctly in vanilla Python:
   - Recommendation: Too complex for automated sweep; requires manual migration
 
 **click (8.x):**
-- Not yet tested in Phase 2
+- Status: Pending full Phase 2 testing
+
+**typing-extensions (4.x):**
+- Migration bug found: `tyc migrate` generates invalid syntax `mut else:` (should be `else:`)
+- Location: Line 181 of migrated `typing_extensions.ty`
+- This indicates a parser or migration issue when handling non-mut branches in conditional chains
 
 ### Key Learnings
 
@@ -161,7 +174,7 @@ All selected packages install and run correctly in vanilla Python:
    - `humanize` (simple formatting utilities)
    - Small utility packages with <1000 LOC
 
-### Migration Bug Found
+### Known Migration Bugs
 
 **typing-extensions**: `tyc migrate` generates invalid syntax `mut else:` (should be `else:`). This indicates a parser or migration issue when handling non-mut branches in conditional chains.
 

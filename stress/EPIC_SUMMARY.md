@@ -9,17 +9,23 @@ This epic tracks three independent initiatives to improve Typhon's test coverage
 
 ## Sub-Item 1: Third-Party PyPI Project Round-Trip Sweep ✅
 
-**Goal:** Test real PyPI packages through `tyc migrate` + `tyc build` to catch regressions invisible in hand-written fixtures.
+**Goal:** Test real PyPI packages through `tyc migrate` + `tyc build` + semantic diff to catch regressions invisible in hand-written fixtures.
 
 **Deliverables:**
 - ✅ PyPI sweep harness (`stress/pypi-sweep/sweep.py`)
 - ✅ Package selection criteria documented
 - ✅ Phase 1: Baseline smoke tests (packages install and run correctly)
-- ✅ Phase 2: Full migrate→build pipeline
+- ✅ Phase 2: Full migrate→build→semantic diff pipeline
+  - ✅ Preserves module structure during migration
+  - ✅ Validates baseline outputs
+  - ✅ Executes emitted code
+  - ✅ Compares original vs. emitted outputs
 - ✅ Findings documented
+- ✅ Environment variable support (TYC override)
+- ✅ Git-based repo detection
 
 **Key Findings:**
-- Migration infrastructure works end-to-end
+- Migration infrastructure works end-to-end with semantic diff
 - Real PyPI packages (attrs, typing-extensions) expose edge cases:
   - attrs: Too complex (28 type errors post-migration)
   - typing-extensions: Migration bug (`mut else:` invalid syntax)
@@ -28,7 +34,7 @@ This epic tracks three independent initiatives to improve Typhon's test coverage
 **Future Work:**
 - Refine package selection (try `python-dateutil`, `humanize`)
 - Wire into CI as opt-in nightly job
-- Implement semantic diff (compare original vs. emitted output)
+- Test remaining packages (click Phase 2)
 
 **Location:** `stress/pypi-sweep/`
 
