@@ -126,17 +126,20 @@ See [docs/cli.md](docs/cli.md) for the full reference.
 
 ## Project status
 
-**Current release: [v0.3.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.1)** — a correctness-focused point release on top of [v0.3.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.0)'s "Python-annoyances surface" headline. Highlights since v0.3.0:
+**Current release: [v0.4.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.4.0)** — a type-checker correctness sweep on top of [v0.3.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.1)'s correctness point release and [v0.3.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.0)'s "Python-annoyances surface" headline. Highlights since v0.3.1:
 
-- 🔴 **Three CRITICAL silent-wrong-output fixes.** `not (a or b)` no longer round-trips as `not a or b` (De Morgan violation); `not (x if c else y)` keeps its parens; the in-process VM's `match` arm writes now propagate back to the enclosing scope instead of being discarded (every `Result` walker / sealed-union aggregator / state machine used to read `0` from `tyc run` and the right value from `tyc run --compile`).
-- 🟠 **`tyc run` now type-checks first.** The VM used to evaluate programs with unresolved names and crash with a Python-style `NameError`, hiding what should have been a clean `tyc::unknown_name` diagnostic.
-- 🟠 **`tyc migrate` rewrites `Generic[T]` → PEP 695.** Pre-3.12 generic idiom (`T = TypeVar("T")`, `class Box(Generic[T]):`) used to land in the output `.ty` unchanged and trip two errors on the next `tyc build`.
-- 🟢 **New language sugar: typed tuple-unpacking `let`.** `let (a: int, b: str) = func(x, y)` desugars to a temp + per-element `let`s, carrying user-supplied annotations through. Compound annotations and mixed-capture forms covered.
-- 🟢 **New diagnostic: `tyc::duplicate_method`.** Two `impl Foo:` / `extend Foo:` blocks defining the same method used to merge silently — Python kept the last one. Now anchored at the second `def` with a rename / delete / merge suggestion.
-- 🟢 **LSP polish.** Bare-import attribute access (`nn.Module`, `pd.DataFrame`) now paints as a class; venv-introspection failures surface in hover instead of falling through silently; `import torch.nn as nn` prewarms `torch.nn` and not just `torch`. `tyc check` groups errors by file with a per-code summary tally.
-- 🟢 **Performance.** Batched venv signature recovery + a Salsa-shared preprocess across the resolver / type-checker / analyser / desugar passes drops `tyc check` end-to-end cost on every project that touches more than a couple of dependencies.
+- 🟠 **`bool ⊆ int` subtype widening.** `let x: int = True`, `1 + True`, and `-True` now type-check the way CPython evaluates them; the v0.3 checker rejected all three. One-way only — `let b: bool = 1` still rejects. The canonical case `tyc::python_semantic_drift` was created to flag.
+- 🟠 **Subclass constructors see inherited fields.** `Dog(name="Rex", breed="Husky")` used to fail with `unknown_kwarg 'name'` because the arity check only walked the direct field surface. New `effective_class_shape()` helper walks the inheritance chain (parent fields first, child overrides on collision, cycle guard).
+- 🟠 **Dotted-attribute annotations resolve to the foreign class shape.** `let c: foo.ApiClient = ...` used to land as `Type::Unknown`, silently dropping every downstream method-arity / kwarg check on `c`. Now produces `Class("foo.ApiClient")` matching call-site convention; `typing.<X>` permissive surface preserved.
+- 🟠 **`tyc::missing_field_init` catches container-literal + alias escapes.** Partially-initialised instances escaping via `let configs: list[Config] = [c]` or `let alias: Config = c` used to slip past the audit silently. The new escape hook also handles container self-references.
+- 🟢 **Fixed-arity tuple covariance on every slot.** `tuple[int, int]` widened slot 0 to float but rejected slot 1; both now widen uniformly. Mutable-container invariance unchanged.
+- 🟢 **De Morgan narrowing on `not (A or B)`.** `if not (x is None or y is None): use(x, y)` now correctly refines both names in the post-`if` branch. The two ambiguous shapes (a bare `or`, `not (and)`) stay conservative.
+- 🟢 **Triple-quoted strings round-trip as triple-quoted.** Multi-line docstrings stop emitting as single-line `\n`-escaped blobs that formatters fight with on save.
+- 🟢 **Corpus round-trip CI sweep.** Every `.ty` under `examples/` must `tyc check` clean on every PR — any checker change that breaks a previously-working example is caught by CI.
+- 🟢 **266 vendored Ruff insta tests re-enabled** across `ruff_python_parser` / `ruff_python_ast` / `ruff_text_size`, with zero regressions against the Typhon `Mutability` extension.
+- 🟢 **Guide 10 backfills `newtype` / `freeze let` / `pub`** end-to-end with emitted-Python comparisons and a `comptime let` vs `freeze let` decision table.
 
-Full release notes: [CHANGELOG.md](CHANGELOG.md#031). A second stress round (`stress/round-2026-05-22/`, 93 fresh `.ty` programs) drove most of the above; the per-finding write-up is in [docs/findings.md](docs/findings.md).
+Full release notes: [CHANGELOG.md](CHANGELOG.md#040). A third stress round (`stress/round-2026-05-23-drift/`, 45 probes across three audit batches) drove most of the type-checker work; the per-case write-up is in [docs/diagnostics/python_semantic_drift.md](docs/diagnostics/python_semantic_drift.md).
 
 ---
 
@@ -189,7 +192,7 @@ Full release notes: [CHANGELOG.md](CHANGELOG.md#031). A second stress round (`st
 - ✅ `extend ClassName:` (alias for `impl` on user-defined classes); `extend BUILTIN:` for `str`/`list`/`dict`/… extracts each method to a module-level free function and rewrites call sites whose receiver carries a matching static annotation. No monkey-patching of built-ins.
 - ✅ `.dty` stub files compile to PEP 561 `.pyi`. `tyc check --stubs` parses every `.dty` and diffs its surface API (functions, classes, methods, annotated fields, parameter shapes) against the sibling `.ty`/`.py` implementation, emitting `tyc::stub_mismatch` diagnostics for missing-in-impl / missing-in-stub / signature-mismatch findings. A runtime introspection probe (mypy's `stubtest` proper) is still a follow-up.
 
-**Phase 6 — Python-annoyances surface** complete ([v0.3.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.0), correctness follow-ups in [v0.3.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.1)):
+**Phase 6 — Python-annoyances surface** complete ([v0.3.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.0), correctness follow-ups in [v0.3.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.1) and [v0.4.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.4.0)):
 
 - ✅ **`newtype Name = Base`** — TypeScript-style nominal aliases over primitives. `UserId` flows freely into an `int` slot, but a bare `int` requires explicit `UserId(x)` construction to satisfy a `UserId`-typed target. Compiles to a zero-cost `typing.NewType` call. New `tyc::newtype_violation` diagnostic.
 - ✅ **`freeze let X = expr`** — deep-immutable bindings. Wraps the RHS in `typhon_runtime.freeze.deep_freeze`, recursively replacing `list → tuple`, `dict → MappingProxyType`, `set → frozenset` so the value (not just the name) is locked.
