@@ -79,6 +79,12 @@ pub enum Type {
     /// directly as `Type::Class("X")` because the local name *is*
     /// the class. FINDINGS #163.
     Module(String),
+    /// A higher-kinded type constructor with unbound type parameters.
+    /// E.g., `F[_]` in `class Functor[F[_]]:` or `def map[F[_], A, B](...)`.
+    /// The `arity` field indicates how many type parameters the constructor
+    /// expects. A `TypeConstructor("List", 1)` represents a type constructor
+    /// that takes one type argument (like `list` in `list[int]`).
+    TypeConstructor(String, usize),
 }
 
 impl Type {
@@ -172,6 +178,10 @@ impl Type {
             Type::TypeVar(name) => name.clone(),
             Type::Unknown => "?".into(),
             Type::Module(name) => format!("<module {name}>"),
+            Type::TypeConstructor(name, arity) => {
+                let placeholders = (0..*arity).map(|_| "_").collect::<Vec<_>>().join(", ");
+                format!("{}[{}]", name, placeholders)
+            }
         }
     }
 }
@@ -1077,6 +1087,28 @@ pub fn type_from_annotation_with_params(
                     }
                 }
             }
+            // Higher-kinded type parameter: `F[_]` or `F[_, _]`
+            // Only parse as TypeConstructor when the head is a declared type parameter.
+            // This prevents normal generic annotations like `list[_]` from becoming
+            // TypeConstructors and bypassing type checking.
+            let arity = match s.slice.as_ref() {
+                Expr::Name(n) if n.id.as_str() == "_" => Some(1),
+                Expr::Tuple(t) => {
+                    if t.elts.iter().all(|e| matches!(e, Expr::Name(n) if n.id.as_str() == "_")) {
+                        Some(t.elts.len())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            // Only parse X[_] as TypeConstructor if X is a declared type parameter
+            if let Some(arity_count) = arity {
+                if type_params.iter().any(|p| p == &head) {
+                    return Type::TypeConstructor(head, arity_count);
+                }
+                // Otherwise fall through to normal generic handling below
+            }
             let args: Vec<Type> = match s.slice.as_ref() {
                 Expr::Tuple(t) => t
                     .elts
@@ -1155,6 +1187,12 @@ fn walk_typevars(ty: &Type, out: &mut Vec<String>) {
                 out.push(name.clone());
             }
         }
+        // Higher-kinded type constructors also need binding, just like TypeVars
+        Type::TypeConstructor(name, _) => {
+            if !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
         Type::Union(xs) | Type::Generic(_, xs) => {
             for x in xs {
                 walk_typevars(x, out);
@@ -1210,6 +1248,14 @@ fn bind_typevars(
             for (f, a) in fa.iter().zip(aa) {
                 bind_typevars(f, a, bindings);
             }
+        }
+        // Higher-kinded type constructor binding: treat `F[_]` as a type variable
+        // that should unify with the actual type constructor head.
+        // E.g. `F[_]` against `list[int]` could bind `F → list`.
+        (Type::TypeConstructor(name, _arity), Type::Generic(head, _args)) => {
+            // For now, we bind the constructor name to the generic head.
+            // A complete implementation would validate arity matches.
+            bindings.insert(name.clone(), Type::Class(head.clone()));
         }
         (
             Type::Function {
@@ -8293,6 +8339,8 @@ fn operand_is_unflaggable(t: &Type) -> bool {
         // arithmetic on a `Type::Module` value is already nonsense and
         // the existing type-mismatch check at the call site fires.
         Type::Module(_) => true,
+        // TypeConstructor behaves like TypeVar - permissive until bound
+        Type::TypeConstructor(_, _) => true,
     }
 }
 
@@ -13298,5 +13346,93 @@ def f() -> int:
             "inner-annotated unsafe binding must not trigger the leak; got {:?}",
             d.errors()
         );
+    }
+
+    // ── Higher-Kinded Types (HKT) tests ──────────────────────────────────
+
+    #[test]
+    fn hkt_type_constructor_single_underscore() {
+        // Test that `F[_]` is recognized as a TypeConstructor when F is a type parameter
+        use crate::{type_from_annotation_with_params, Type};
+        let src = "F[_]";
+        let module = tyc_syntax::parse_module(src).unwrap().into_syntax();
+        let expr = match &module.body[0] {
+            ruff_python_ast::Stmt::Expr(e) => &e.value,
+            _ => panic!("expected Expr"),
+        };
+        // Pass "F" as a type parameter so it's recognized as HKT
+        let ty = type_from_annotation_with_params(expr, &[], &["F".to_string()]);
+        match ty {
+            Type::TypeConstructor(name, arity) => {
+                assert_eq!(name, "F");
+                assert_eq!(arity, 1);
+            }
+            other => panic!("expected TypeConstructor, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn hkt_type_constructor_multiple_underscores() {
+        // Test that `G[_, _]` is recognized as a TypeConstructor with arity 2
+        use crate::{type_from_annotation_with_params, Type};
+        let src = "G[_, _]";
+        let module = tyc_syntax::parse_module(src).unwrap().into_syntax();
+        let expr = match &module.body[0] {
+            ruff_python_ast::Stmt::Expr(e) => &e.value,
+            _ => panic!("expected Expr"),
+        };
+        // Pass "G" as a type parameter so it's recognized as HKT
+        let ty = type_from_annotation_with_params(expr, &[], &["G".to_string()]);
+        match ty {
+            Type::TypeConstructor(name, arity) => {
+                assert_eq!(name, "G");
+                assert_eq!(arity, 2);
+            }
+            other => panic!("expected TypeConstructor, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn hkt_type_constructor_display() {
+        // Test that TypeConstructor displays correctly
+        use crate::Type;
+        let tc = Type::TypeConstructor("Functor".to_string(), 1);
+        assert_eq!(tc.display(), "Functor[_]");
+
+        let tc2 = Type::TypeConstructor("Bifunctor".to_string(), 2);
+        assert_eq!(tc2.display(), "Bifunctor[_, _]");
+    }
+
+    #[test]
+    fn hkt_type_constructor_binding() {
+        // Test that TypeConstructor binds correctly in bind_typevars (HKT unification)
+        use crate::{Type, compute_bidirectional_bindings};
+
+        // Simulate a function like: def map[F[_], A, B](fa: F[A], f: A -> B) -> F[B]
+        // Test that binding works through the public API
+        let tc_a = Type::TypeConstructor("F".to_string(), 1);
+        let list_int = Type::Generic("list".to_string(), vec![Type::Int]);
+
+        // TypeConstructor should NOT be universally assignable anymore
+        // (it was removed from assignable to fix the security issue)
+        assert!(!crate::assignable(&tc_a, &list_int));
+        assert!(!crate::assignable(&list_int, &tc_a));
+
+        // Test that it works in the binding context through the public API
+        // Call as if we had: def f[F[_]](x: F[int]) -> F[str]
+        // with argument list[int]
+        let formal_params = vec![tc_a.clone()];
+        let actual_args = vec![list_int.clone()];
+        let return_type = Type::TypeConstructor("F".to_string(), 1);
+
+        let bindings = compute_bidirectional_bindings(
+            &formal_params,
+            &actual_args,
+            &return_type,
+            None,
+        );
+
+        // After binding, F should be bound to "list"
+        assert_eq!(bindings.get("F"), Some(&Type::Class("list".to_string())));
     }
 }
