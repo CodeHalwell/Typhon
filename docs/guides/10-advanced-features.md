@@ -409,6 +409,148 @@ def parse() -> int:
     return checked
 ```
 
+## v0.3.0 language additions
+
+Three new constructs shipped in v0.3.0 that remove common Python annoyances. They are designed to stack with everything you already know.
+
+### `newtype Name = Base` — nominal aliases over primitives
+
+Two values can share the same underlying type but mean completely different things. A `UserId` and a `PostId` are both `int`, yet silently swapping them is a bug.
+
+`newtype` lifts a primitive into its own **nominal type** so the mix-up is caught at `tyc check` time:
+
+```python
+newtype UserId = int
+newtype PostId = int
+
+def fetch_user(id: UserId) -> str: ...
+def fetch_post(id: PostId) -> str: ...
+
+let uid: UserId = UserId(42)
+let pid: PostId = PostId(7)
+
+fetch_user(uid)      # ✅
+fetch_user(pid)      # ❌ tyc::newtype_violation — PostId is not UserId
+fetch_user(42)       # ❌ tyc::newtype_violation — bare int is not UserId; use UserId(42)
+```
+
+The relationship is **asymmetric**: a `UserId` flows freely *into* an `int`-typed slot (the underlying value IS an int at runtime), but a bare `int` never satisfies a `UserId`-typed slot without explicit wrapping:
+
+```python
+def log_id(raw: int) -> None:
+    print(raw)
+
+log_id(uid)          # ✅ UserId escapes upward into int
+```
+
+**Emitted Python:**
+
+```python
+UserId = NewType("UserId", int)
+PostId = NewType("PostId", int)
+```
+
+At runtime the constructor `UserId(x)` is the identity function — zero overhead.
+
+**Common use cases:** ID kinds, currency tags (`Usd`, `Eur`), validated strings (`Email`, `Slug`), internal-vs-external markers.
+
+**Tip:** `newtype` works over any primitive (`int`, `str`, `float`, `bytes`). For richer ADTs with multiple fields, use a `frozen class` instead.
+
+---
+
+### `freeze let` — deep-immutable bindings
+
+`let` makes the binding immutable (you cannot rebind the name), but it does not prevent mutation of the value itself — `let cfg: dict[str, int]` lets you write `cfg["port"] = 9000`.
+
+`freeze let` locks both the binding and the value:
+
+```python
+freeze let CONFIG = {
+    "port": 8080,
+    "hosts": ["api.example.com", "api2.example.com"],
+}
+
+CONFIG = {}                       # ❌ tyc::immutable_assign — binding is locked
+CONFIG["port"] = 9000             # ❌ TypeError at runtime — MappingProxyType
+CONFIG["hosts"].append("new")     # ❌ AttributeError at runtime — tuple, not list
+```
+
+The deep-freeze is applied at module import time by `typhon_runtime.freeze.deep_freeze`:
+
+| Python value | Frozen equivalent |
+|---|---|
+| `dict` | `types.MappingProxyType` |
+| `list` | `tuple` |
+| `set` | `frozenset` |
+| `frozen` dataclass | unchanged |
+| anything else | `TypeError` at startup if not already immutable |
+
+**Emitted Python:**
+
+```python
+CONFIG = __typhon_freeze__({"port": 8080, "hosts": ["api.example.com", "api2.example.com"]})
+```
+
+**When to use `freeze let` vs `comptime let`:**
+
+| | `comptime let` | `freeze let` |
+|---|---|---|
+| Evaluated | at build time | at import time |
+| Inlined as literal | ✅ yes | ❌ no — value preserved at runtime |
+| Complex expressions | ❌ sandbox limits | ✅ any Python expression |
+| Mutable-value protection | ❌ just a name lock | ✅ deep recursion |
+
+Reach for `comptime` for build-time constants (ports, feature flags, API versions). Reach for `freeze let` for large look-up tables and configuration dicts that are expensive to build but must be immutable.
+
+**Limitation in v0.3.0:** `freeze let` is module-level only; class-body use is planned for v0.4.
+
+---
+
+### `pub` — module visibility marker
+
+Python's `__all__` is a manual list that drifts out of sync with the module. `pub` is the Typhon alternative: declare what is public at the definition site, and the compiler synthesises `__all__` for you.
+
+```python
+pub let API_VERSION: str = "v1"
+pub class Client: ...
+pub def connect(host: str) -> Client: ...
+
+let _internal_timeout: int = 30   # not exported — no `pub` keyword
+```
+
+When at least one name in a module is marked `pub`, the desugarer adds a top-of-file `__all__` that lists every `pub` name:
+
+**Emitted Python (excerpt):**
+
+```python
+__all__ = ["API_VERSION", "Client", "connect"]
+
+API_VERSION: str = "v1"
+```
+
+`pub` stacks with all other modifiers:
+
+```python
+pub frozen class Point:     # public + frozen dataclass
+    x: float
+    y: float
+
+pub newtype UserId = int    # public newtype
+
+pub model WebhookEvent:     # public Pydantic model
+    event: str
+    payload: dict[str, str]
+```
+
+**Effect on tooling:**
+- `from mymodule import *` only imports the `pub` surface.
+- Sphinx autoapi, mkdocstrings, and `ty` treat `__all__` as the re-export list.
+- IDE re-export inference (pyright, Pyrefly, pylance) respects `__all__` for completions and hover.
+
+**No `pub`? No `__all__`.** If no names are marked `pub`, Typhon does not synthesise `__all__` and the module behaves like any regular Python module (everything importable).
+
+---
+
 ## What you've learned
 
 - **Pipes** thread a value into the next call's first positional slot.
@@ -417,6 +559,9 @@ def parse() -> int:
 - **`@pure`/`@memo`** verify the six purity conditions and opt into `functools.cache`.
 - **`unsafe:`** is the lexical boundary into untyped Python; values must be re-asserted to cross out.
 - **`.dty` stubs** describe third-party APIs; `tyc check --stubs` catches drift.
+- **`newtype`** (v0.3.0) creates nominal aliases over primitives — prevents silent ID/value mix-ups.
+- **`freeze let`** (v0.3.0) deep-freezes module-level values at import time, not just the binding name.
+- **`pub`** (v0.3.0) marks names as part of the public API; the compiler synthesises `__all__` automatically.
 
 ## Where next
 

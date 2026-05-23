@@ -32,11 +32,15 @@ def demo_cross_newtype_rejected() -> None:
     #
     #     let post: PostId = PostId(42)
     #     greet(post, Email("x@y.z"))
-    #     # tyc::type_mismatch — expected `UserId`, found `PostId`
+    #     # tyc::newtype_violation — expected `UserId`, found `PostId`
+    #                                wrap with `UserId(post)` to cross the boundary
     #
     # The two newtypes share a base (`int`), but they are nominally
     # distinct: a `PostId` cannot satisfy a `UserId`-typed parameter
-    # without going through the explicit constructor.
+    # without going through the explicit `UserId(...)` constructor.
+    # Note: `tyc::newtype_violation` (not `type_mismatch`) is the
+    # dedicated diagnostic for this case — it surfaces the correct fix
+    # ("wrap with UserId(...)") rather than the generic type-mismatch help.
     pass
 
 
