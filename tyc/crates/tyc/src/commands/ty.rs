@@ -504,7 +504,7 @@ fn parse_py_ref_with_validator(line: &str, map_dir: Option<&Path>) -> Option<PyR
                 // Trim leading spaces from candidate before validation
                 let trimmed_candidate = candidate.trim_start();
                 // Validate: does this candidate have a .py.map file?
-                if map_exists_for(trimmed_candidate, map_dir) {
+                if map_exists_for(trimmed_candidate, Some(map_dir)) {
                     // Update start to exclude the leading spaces we just trimmed
                     let trim_offset = candidate.len() - trimmed_candidate.len();
                     best_candidate = trimmed_candidate;
