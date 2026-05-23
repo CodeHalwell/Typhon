@@ -4,6 +4,178 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.4.0
+
+A correctness sweep on the v0.3.0 surface (PR #103) plus a focused
+`tyc::python_semantic_drift` audit catches the highest-impact silent
+under-checks left over from the May 2026 round: `bool` is now treated
+as a subtype of `int` in assignment / arithmetic / unary contexts,
+fixed-arity tuples are covariant on every slot (not just slot 0),
+subclass constructors finally see inherited fields, and
+`tyc::missing_field_init` no longer loses tracking when a partially-
+initialised instance escapes via a container literal or annotated
+alias. Emit gains triple-quoted-string preservation so multi-line
+docstrings stop round-tripping into single-line `\n`-escaped blobs;
+types gains De Morgan narrowing so `not (A or B)` refines both names
+in the post-`if` branch. Rounded out by a corpus round-trip CI gate
+(every `.ty` under `examples/` must `tyc check` clean on every PR),
+re-enabled upstream Ruff insta tests (266 vendored tests back online),
+and a guide-10 backfill that finally documents `newtype`, `freeze let`,
+and `pub` end-to-end.
+
+This is a minor release because the type-checker behavioural changes
+(bool ⊆ int, fixed-arity tuple covariance) are observable from user
+code — programs that previously failed will now compile. No
+intentionally-rejected program is newly accepted that would change
+runtime semantics.
+
+### Added — language
+
+- **`bool ⊆ int` subtype widening.** CPython defines `bool` as a
+  strict subclass of `int`, but the v0.3 checker rejected
+  `let x: int = True`, `let x: int = 1 + True`, and `let y: int = -True`
+  as `tyc::type_mismatch`. New `(Int, Bool)` and `(Float, Bool)` arms
+  in `assignable`; the `BinOp` arithmetic case folds `Int | Bool`
+  operands into `Int`; unary arithmetic / bitwise on bool yields
+  `Int`. One-way only — `let b: bool = 1` still rejects. This was the
+  canonical case `tyc::python_semantic_drift` was created to flag.
+- **De Morgan narrowing on `not (A or B)`.** `collect_narrowings_inner`
+  grows an `Expr::BoolOp` arm: in `if A and B:` both operands narrow
+  in the true branch; in `if not (A or B): return` both operands
+  narrow in the post-`if` branch (the early-exit refinement). The two
+  ambiguous shapes (a bare `or`, `not (and)`) stay conservative since
+  no single name can be safely refined. Closes the long-standing gap
+  where `if not (x is None or y is None): use(x, y)` still rejected
+  the `Optional` unwrap.
+
+### Fixed — type checker
+
+- **Fixed-arity tuple covariance on every slot.**
+  `generic_param_variance` only declared `("tuple", 0) => Covariant`,
+  so `tuple[int, int]` widened slot 0 to float but rejected slot 1.
+  Promoted `tuple` / `Tuple` to a head-level early return so every
+  slot is uniformly covariant; soundness preserved because tuples
+  are immutable (same reason `tuple[T, ...]` was covariant already).
+  Mutable-container invariance for `list` / `dict` / `set` is
+  intentionally unchanged — the static rule guards the mutation
+  hazard CPython's duck-typing can't see.
+- **Subclass constructors accept inherited fields.**
+  `class Dog(Animal):` previously rejected `Dog(name="Rex",
+  breed="Husky")` with `tyc::unknown_kwarg 'name'` because the arity
+  check only saw `Dog`'s direct field surface. Adds `bases:
+  Vec<String>` on `InterfaceShape` and an `effective_class_shape()`
+  helper that walks the inheritance chain (parent fields first, child
+  overrides on collision, cycle guard); used at the constructor call
+  site for both the kwarg validator and `class_constructor_arity`.
+  Dotted base classes (`class Sub(pkg.Base):`) are recorded too —
+  `effective_class_shape` silently skips bases with no shape entry,
+  so foreign / unresolved bases are harmless.
+- **Dotted-attribute annotations resolve to the foreign class shape.**
+  `let c: foo.ApiClient = ...` used to land as `Type::Unknown`,
+  silently dropping every downstream method-arity / kwarg check on
+  `c`. New `Expr::Attribute` arm in `type_from_annotation` produces
+  `Class("{module}.{attr}")` matching the call-site convention; carves
+  out the permissive `typing.<X>` surface (`Any`, `Self`, `List`,
+  `Dict`, `Tuple`, `Set`, `FrozenSet`, `Sequence`, `Iterable`,
+  `Iterator`, `Mapping`, `Callable`, `Optional`, `Union`, `Final`,
+  `ClassVar`, `Annotated`, `Literal`, `Type`, `TypeVar`) so a
+  `-> typing.Self: return self` fluent-builder doesn't trip
+  `type_mismatch`. Multi-segment paths (`a.b.Cls`) still fall back to
+  `Unknown` pending full module-registry resolution.
+- **`import foo as f; let c: f.Cls` canonicalises against `foo.Cls`.**
+  The dotted-annotation arm produced `Class("f.Cls")` while the call
+  site `f.Cls(...)` produced `Class("foo.Cls")` because the env
+  resolves `f` to `Type::Module("foo")`, causing a spurious
+  `type_mismatch` on every aliased-import handoff. Added
+  `Checker::canonicalize_module_aliases` (walks `Class` / `Union` /
+  `Generic` / `Function` recursively) as a second-chance comparison
+  inside `is_assignable`.
+- **`tyc::missing_field_init` catches container-literal + alias
+  escapes.** A partially-initialised instance flowing into the RHS of
+  an annotated assignment used to slip past the audit silently
+  because the only tracked escape sites were `return` and call
+  arguments. New hook runs `audit_check_escape` on the RHS of every
+  `Stmt::AnnAssign` whose value mentions a tracked binding, covering
+  `let configs: list[Config] = [c]` (container-literal escape) and
+  `let alias: Config = c` (outer-scope alias escape). Self-reference
+  in container literals (`let xs: list[T] = [c, c]`) also fires
+  correctly. Bare `Stmt::Assign` stays intra-function aliasing and
+  is intentionally not audited.
+- **`BinOp` no longer over-promotes to float when one operand is a
+  foreign class.** The previous `(Float, _) | (_, Float) => Float`
+  arm caught `(Float, Class("torch.Tensor"))` and rejected
+  `let y: torch.Tensor = 4.0 * x.sum()` despite the runtime
+  `__rmul__` returning a Tensor. Now only fires when both sides are
+  numeric primitives; otherwise falls through to `Unknown` so the
+  surrounding annotation drives. Surfaced organically by the new
+  corpus sweep against `examples/33-pytorch-tensors/`.
+
+### Fixed — emit / VM correctness
+
+- **Triple-quoted strings round-trip as triple-quoted.**
+  `Expr::StringLiteral` in `tyc-emit` now emits triple quotes when
+  the source used triple quotes or when the literal contains a real
+  newline, instead of `\n`-escaping multi-line docstrings into
+  single-line blobs that every formatter then fights with on save.
+  New `escape_triple_quoted_string` helper breaks any internal
+  3-quote run so the literal can't close prematurely. Skipped inside
+  f-string interpolation (outer is `Some`) since nested triple quotes
+  are almost always wrong.
+
+### Internal / chore
+
+- **Corpus round-trip CI sweep (`tests/pipeline.rs`).**
+  `corpus_examples_all_check_clean` walks every `.ty` under
+  `examples/` (excluding intentional-failure probes in
+  `examples/testing/`) and asserts `tyc check` exits 0 on each. Any
+  change to the type checker that breaks a previously-working example
+  is caught in CI rather than discovered in a manual sweep. Closes
+  the long-standing roadmap concrete-next-step #1.
+- **Vendored Ruff insta tests re-enabled.** Flipped `[lib] test =
+  true` on `ruff_python_parser`, `ruff_python_ast`, `ruff_text_size`;
+  brings 266 upstream tests back online (217 + 49 + 0) with zero
+  regressions against the Typhon `Mutability` extension. Closes the
+  second of the two `tyc/vendor/README.md` deferred follow-ups.
+- **`stress/round-2026-05-23-drift/` — three audit rounds.**
+  Round 1: 15 probes targeting numeric / container variance under
+  `int → float` widening. Round 2: inheritance + dotted-attr
+  limitations. Round 3 (`45-probes-round-2-and-3.ty`): protocols,
+  decorators, async, generics, exception flow, slicing, star-args,
+  optional chaining — 30 probes, all green against the fixed
+  checker. Documented per-case in
+  `docs/diagnostics/python_semantic_drift.md`.
+
+### Docs
+
+- **Guide 10 — v0.3.0 language additions backfill.** Guide jumped
+  straight from `.dty` stubs to "Putting it together" with no
+  coverage of `newtype`, `freeze let`, or `pub`. Three new sections
+  with emitted-Python comparisons and a `comptime` vs `freeze let`
+  decision table. Salvaged from closed PR #102.
+- **Roadmap reconciled with shipped reality.** Concrete-next-steps
+  list updated: corpus round-trip sweep marked landed, loop
+  parallelisation marked shipped (`tyc-analyse/src/parallel.rs`,
+  opt-in via `[strictness] auto-parallel`), Salsa boundary entry
+  notes that `preprocessed_text` / `resolved_module` /
+  `check_diagnostics` / `module_shapes_query` are all
+  `#[salsa::tracked]` (`check_file_with_imports` remains the
+  multi-module bypass), `python_semantic_drift` "closed" set
+  expanded with this release's work, native debugger remains
+  unchanged-open.
+- **`docs/diagnostics/arg_count.md` — inheritance section.**
+  Rewrites the Limitations section to reflect the subclass-
+  constructor fix; adds an Inheritance section recording the new
+  walks-the-chain behaviour.
+- **`docs/diagnostics/missing_field_init.md` — escapes-covered
+  section.** Replaces the open-ended Limitations note with an
+  explicit "Escapes covered" enumeration (return, call arg, container
+  literal via annotated `let`, outer-scope alias via annotated
+  `let`); intra-procedural + subclass caveats carried forward.
+- **`examples/README.md`** gains a Language-additions row;
+  `examples/48-...` comment corrected to reference
+  `tyc::newtype_violation` (the dedicated diagnostic with wrap-fix
+  help) instead of the generic `tyc::type_mismatch`.
+
 ## 0.3.1
 
 A second stress campaign (`stress/round-2026-05-22/`, 93 fresh `.ty`
