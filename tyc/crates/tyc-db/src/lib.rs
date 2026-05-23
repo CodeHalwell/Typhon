@@ -130,7 +130,7 @@ pub fn module_decl_names(db: &dyn salsa::Database, file: SourceFile) -> Vec<Stri
         .collect()
 }
 
-/// Newtype wrapper around `Arc<ResolvedModule>` so we can implement
+/// Newtype wrapper around `(Arc<ResolvedModule>, Arc<Diagnostics>)` so we can implement
 /// `salsa::Update` for it without violating the orphan rule.
 ///
 /// Salsa requires the return type of a `#[salsa::tracked]` query to implement
@@ -138,12 +138,49 @@ pub fn module_decl_names(db: &dyn salsa::Database, file: SourceFile) -> Vec<Stri
 /// `PartialEq`, so we use pointer comparison.  Salsa only calls `maybe_update`
 /// after the query body has already re-run (i.e. when an input changed), so
 /// the conservative "always-changed" strategy is correct.
+///
+/// This wrapper now holds both the resolved module and the diagnostics generated
+/// during resolution as separate Arcs, eliminating the need to re-run `resolve_module_with`
+/// just to collect diagnostics while preserving the ability to extract the ResolvedModule Arc.
 #[derive(Clone)]
-pub struct ArcResolvedModule(pub Arc<ResolvedModule>);
+pub struct ArcResolvedModule(Arc<ResolvedModule>, Arc<Diagnostics>);
+
+impl ArcResolvedModule {
+    /// Construct a new `ArcResolvedModule` from a resolved module and diagnostics.
+    pub fn new(resolved: Arc<ResolvedModule>, diagnostics: Arc<Diagnostics>) -> Self {
+        Self(resolved, diagnostics)
+    }
+
+    /// Access the resolved module.
+    pub fn resolved(&self) -> &ResolvedModule {
+        &self.0
+    }
+
+    /// Access the resolution diagnostics.
+    pub fn diagnostics(&self) -> &Diagnostics {
+        &self.1
+    }
+
+    /// Get the Arc<ResolvedModule> for compatibility.
+    pub fn resolved_arc(&self) -> Arc<ResolvedModule> {
+        Arc::clone(&self.0)
+    }
+
+    /// Consume self and return the inner Arc<ResolvedModule> by move,
+    /// avoiding extra refcount operations.
+    pub fn into_resolved_arc(self) -> Arc<ResolvedModule> {
+        self.0
+    }
+
+    /// Get a reference to the diagnostics Arc.
+    pub fn diagnostics_arc(&self) -> &Arc<Diagnostics> {
+        &self.1
+    }
+}
 
 impl PartialEq for ArcResolvedModule {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.0, &other.0) && Arc::ptr_eq(&self.1, &other.1)
     }
 }
 
@@ -158,11 +195,11 @@ impl std::ops::Deref for ArcResolvedModule {
 
 // SAFETY: `old_pointer` is a valid, aligned, live pointer to an `ArcResolvedModule`
 // managed by Salsa.  The assignment `*old_pointer = new_value` drops the previous
-// Arc (decrementing its refcount) before storing the new one, which is correct.
+// Arcs (decrementing their refcounts) before storing the new ones, which is correct.
 // Pointer equality is used as a conservative proxy for value equality.
 unsafe impl salsa::Update for ArcResolvedModule {
     unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
-        if Arc::ptr_eq(&(*old_pointer).0, &new_value.0) {
+        if Arc::ptr_eq(&(*old_pointer).0, &new_value.0) && Arc::ptr_eq(&(*old_pointer).1, &new_value.1) {
             false
         } else {
             *old_pointer = new_value;
@@ -260,10 +297,10 @@ pub fn resolved_module(db: &dyn salsa::Database, file: SourceFile) -> ArcResolve
     match parse_module(&prep.python_source) {
         Ok(parsed) => {
             let module = parsed.into_syntax();
-            let (resolved, _) = resolve_module_with(path, &prep.python_source, &module, options);
-            ArcResolvedModule(Arc::new(resolved))
+            let (resolved, diags) = resolve_module_with(path, &prep.python_source, &module, options);
+            ArcResolvedModule::new(Arc::new(resolved), Arc::new(diags))
         }
-        Err(_) => ArcResolvedModule(Arc::new(ResolvedModule::default())),
+        Err(_) => ArcResolvedModule::new(Arc::new(ResolvedModule::default()), Arc::new(Diagnostics::new())),
     }
 }
 
@@ -376,9 +413,10 @@ fn collect_original_lazy_import_alias_spans(source: &str) -> Vec<OriginalLazyAli
 }
 
 /// Convenience alias — extract the inner `Arc<ResolvedModule>` from a
-/// `resolved_module` query result.
+/// `resolved_module` query result. Returns the same Arc on repeated calls
+/// for the same file (pointer equality), so LSP caching tests pass.
 pub fn resolved_module_arc(db: &dyn salsa::Database, file: SourceFile) -> Arc<ResolvedModule> {
-    resolved_module(db, file).0
+    resolved_module(db, file).into_resolved_arc()
 }
 
 /// The Typhon database — concrete carrier of salsa state.
@@ -602,19 +640,12 @@ pub fn check_source_file_with_imports(
         }
     };
 
-    // Re-run resolve once to capture the diagnostic Vec — the resolved
-    // bindings themselves come from the cached query so downstream
-    // shape-extraction sees the same data structure. The cost is one
-    // extra resolve pass; eliminating it requires moving resolve
-    // diagnostics into `ArcResolvedModule`, which is a larger refactor.
-    let resolve_options = ResolveOptions {
-        raw_class_byte_starts: line_byte_starts(&prep.python_source, &prep.raw_class_lines),
-        lazy_import_remaps: build_lazy_import_remaps(&text, &prep.lazy_imports),
-        original_source: Some(text.clone()),
-    };
-    let (_resolved_fresh, resolve_diags) =
-        resolve_module_with(path.clone(), &prep.python_source, &module, resolve_options);
-    diags.extend(resolve_diags);
+    // Collect resolve diagnostics from the cached query. The
+    // `resolved_module` query now stores both the resolved bindings
+    // and the diagnostics from resolution, so we don't need to re-run
+    // `resolve_module_with` here.
+    diags.extend(resolved_arc.diagnostics().clone());
+
 
     let external = build_external_shapes(&resolved_arc, shapes_by_module);
     let type_diags = check_module_with_imports(
