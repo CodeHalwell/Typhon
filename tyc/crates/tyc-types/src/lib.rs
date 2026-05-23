@@ -3082,6 +3082,7 @@ fn prescan_partial_returning_fns(c: &mut Checker, body: &[Stmt]) {
 ///   - `[return X.__new__(X)]`
 ///   - `[obj = X.__new__(X), return obj]` (no intervening attribute
 ///     assignments on `obj`)
+///
 /// Otherwise `None`.
 fn function_returns_partial_instance(c: &Checker, body: &[Stmt]) -> Option<UninitInstance> {
     // Case 1: single-statement `return X.__new__(X)`.
