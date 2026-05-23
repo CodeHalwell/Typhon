@@ -820,12 +820,15 @@ pub fn generic_param_variance(head: &str, idx: usize) -> Variance {
         // `type[Dog]` is assignable to `type[Animal]`. The Python
         // typing spec calls this position covariant.
         | ("Type", 0)
-        | ("type", 0)
-        // `Counter[T]` from `collections` — read-only over T at the
-        // type level (you don't put new T values in; you increment
-        // counts). Mark covariant to match how third-party stubs
-        // treat it.
-        | ("Counter", 0) => Variance::Covariant,
+        | ("type", 0) => Variance::Covariant,
+
+        // `Counter[T]` from `collections` extends `dict[T, int]`
+        // and supports `__setitem__` / `update` — a `Counter[Dog]`
+        // flowing into a `Counter[Animal]` slot could then take
+        // `Cat` keys via the parent reference, breaking key-type
+        // soundness exactly the way `dict` invariance guards
+        // against. Stays invariant.
+        ("Counter", 0) => Variance::Invariant,
 
         // ── Mapping[K, V] — invariant in K (keys are hashed/compared
         // exactly) and covariant in V (values flow out via __getitem__).
@@ -3157,6 +3160,15 @@ fn uninit_instance_for(c: &Checker, class_name: &str) -> Option<UninitInstance> 
 /// If `call` invokes a function recorded in `c.partial_returning_fns`,
 /// return the matching `UninitInstance`. Used at assignment sites to
 /// decide whether the LHS should be registered as tracked.
+///
+/// Guards against name shadowing: the pre-scan keys on the
+/// module-level function name, but the call site might bind that
+/// name to a parameter or local variable that points at a different
+/// callable. Look up the name in the current env first — if the
+/// resolved binding's declared type is not the same `Type::Function`
+/// recorded for the module-level `def`, the caller is invoking the
+/// shadow and the tracker would otherwise emit a false-positive
+/// `missing_field_init` on perfectly valid code.
 fn detect_partial_returning_call(c: &Checker, value: &Expr) -> Option<UninitInstance> {
     let Expr::Call(call) = value else {
         return None;
@@ -3164,7 +3176,23 @@ fn detect_partial_returning_call(c: &Checker, value: &Expr) -> Option<UninitInst
     let Expr::Name(fn_name) = call.func.as_ref() else {
         return None;
     };
-    c.partial_returning_fns.get(fn_name.id.as_str()).cloned()
+    let name = fn_name.id.as_str();
+    let info = c.partial_returning_fns.get(name).cloned()?;
+    // Verify the name still resolves to the same module-level
+    // function we pre-scanned. `function_signatures` is populated
+    // from the module body, so it's our ground truth for the
+    // module-level binding. The env lookup tells us what the call
+    // site actually sees — if it sees a different type (parameter,
+    // local rebind), the original `def` has been shadowed.
+    let module_sig = c.function_signatures.get(name)?;
+    match c.env.lookup(name) {
+        Some(binding) if &binding.declared == module_sig => Some(info),
+        // No env binding (rare — would mean the name is being
+        // resolved purely against `function_signatures`) → trust
+        // the pre-scan.
+        None => Some(info),
+        Some(_) => None,
+    }
 }
 
 fn audit_register_bypass(c: &mut Checker, binding: &str, class_name: &str) {
@@ -8779,7 +8807,8 @@ mod tests {
         assert_eq!(generic_param_variance("ItemsView", 1), Variance::Covariant);
         assert_eq!(generic_param_variance("Type", 0), Variance::Covariant);
         assert_eq!(generic_param_variance("type", 0), Variance::Covariant);
-        assert_eq!(generic_param_variance("Counter", 0), Variance::Covariant);
+        // Counter extends dict — mutable, so invariant.
+        assert_eq!(generic_param_variance("Counter", 0), Variance::Invariant);
     }
 
     #[test]
@@ -9595,6 +9624,43 @@ def use() -> ApiClient:
 ";
         let d = check(src);
         assert!(d.has_errors(), "two-stmt factory must also be tracked");
+    }
+
+    #[test]
+    fn audit_partial_factory_skipped_when_name_shadowed_by_parameter() {
+        // A function parameter named `make` shadows the pre-scanned
+        // module-level helper. The call `make()` invokes the parameter,
+        // not the helper, so registering the LHS as tracked would
+        // emit a false-positive `missing_field_init`.
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+def make() -> ApiClient:
+    return ApiClient.__new__(ApiClient)
+
+def use(make: object) -> ApiClient:
+    let c: ApiClient = make()
+    return c
+";
+        let d = check(src);
+        // The body of `use` calls the parameter, which has type
+        // `object` (so the call returns Unknown). No partial
+        // tracking should fire on `c`. The annotated type
+        // `ApiClient` doesn't match an `object()` call, but that
+        // diagnostic is a different code path; we only assert that
+        // the partial-init audit does not fire here.
+        let partial_init_errs: Vec<&TycError> = d
+            .errors()
+            .iter()
+            .filter(|e| matches!(e, TycError::MissingFieldInit { .. }))
+            .collect();
+        assert!(
+            partial_init_errs.is_empty(),
+            "shadowed `make` must not trigger partial-init tracking; got: {:?}",
+            partial_init_errs
+        );
     }
 
     #[test]

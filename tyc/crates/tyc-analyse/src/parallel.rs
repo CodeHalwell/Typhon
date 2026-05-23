@@ -30,8 +30,8 @@ use std::collections::HashSet;
 
 use ruff_python_ast::{
     name::Name, Arguments, AtomicNodeIndex, Comprehension, Expr, ExprAttribute, ExprCall,
-    ExprContext, ExprLambda, ExprListComp, ExprName, ExprSetComp, ModModule, Parameter,
-    ParameterWithDefault, Parameters, Stmt,
+    ExprContext, ExprLambda, ExprListComp, ExprName, ExprSet, ExprSetComp, ExprStarred, ModModule,
+    Parameter, ParameterWithDefault, Parameters, Stmt,
 };
 use ruff_text_size::TextRange;
 
@@ -300,30 +300,26 @@ fn try_rewrite_listcomp(lc: &ExprListComp, ctx: &RewriteCtx<'_>) -> Option<Expr>
 
 /// Attempt the rewrite on a set comprehension. Same eligibility rules
 /// as the list-comp path: single generator, no filter, single bare-name
-/// pure call. The output wraps the parallel map in `set(...)` so the
-/// resulting expression still has set semantics (deduplication +
-/// unordered membership).
+/// pure call. The result wraps the parallel map in a `{*<map_call>}`
+/// set-display literal — the star-unpack form is preferred over
+/// `set(map_call)` because `{...}` syntax does not depend on the
+/// `set` name being unshadowed in the caller's scope (a user-level
+/// `set = my_thing` rebind is rare but legal Python; the set literal
+/// always resolves to the language-level set type).
 fn try_rewrite_setcomp(sc: &ExprSetComp, ctx: &RewriteCtx<'_>) -> Option<Expr> {
     let (lambda_param, iter, elt_lambda) =
         analyse_comprehension(&sc.generators, &sc.elt, ctx, sc.range)?;
     let map_call = build_map_pure_call(sc.range, lambda_param, iter, elt_lambda);
-    // Wrap in `set(map_pure(...))` so the value-level semantics
-    // (uniqueness + unordered) survive the rewrite.
-    Some(Expr::Call(ExprCall {
+    let starred = Expr::Starred(ExprStarred {
         range: sc.range,
         node_index: AtomicNodeIndex::NONE,
-        func: Box::new(Expr::Name(ExprName {
-            range: sc.range,
-            node_index: AtomicNodeIndex::NONE,
-            id: Name::new("set"),
-            ctx: ExprContext::Load,
-        })),
-        arguments: Arguments {
-            range: sc.range,
-            node_index: AtomicNodeIndex::NONE,
-            args: vec![map_call].into_boxed_slice(),
-            keywords: Vec::new().into_boxed_slice(),
-        },
+        value: Box::new(map_call),
+        ctx: ExprContext::Load,
+    });
+    Some(Expr::Set(ExprSet {
+        range: sc.range,
+        node_index: AtomicNodeIndex::NONE,
+        elts: vec![starred],
     }))
 }
 
@@ -567,7 +563,7 @@ mod tests {
     // ── set comprehensions ─────────────────────────────────────────────────
 
     #[test]
-    fn rewrites_pure_setcomp_wraps_in_set_call() {
+    fn rewrites_pure_setcomp_uses_set_literal_to_avoid_shadowing() {
         let src = "ys = {f(x) for x in xs}\n";
         let mut m = parse(src);
         let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
@@ -577,9 +573,17 @@ mod tests {
             emit.contains("typhon_runtime.parallel.map_pure"),
             "expected map_pure rewrite; got: {emit}"
         );
-        // Wrapped in set(...) so the runtime value still has set
-        // semantics (uniqueness + unordered membership).
-        assert!(emit.contains("set("), "expected set() wrapper; got: {emit}");
+        // Emits `{*typhon_runtime.parallel.map_pure(...)}` rather
+        // than `set(...)` so a user-level `set = my_thing` rebind
+        // doesn't break the rewrite.
+        assert!(
+            emit.contains("{*typhon_runtime"),
+            "expected `{{*…}}` set-literal wrapper, not `set(...)`; got: {emit}"
+        );
+        assert!(
+            !emit.contains("set("),
+            "should not depend on the `set` name; got: {emit}"
+        );
     }
 
     #[test]

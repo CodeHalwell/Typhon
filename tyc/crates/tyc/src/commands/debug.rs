@@ -336,13 +336,17 @@ fn write_typhon_pdb_wrapper(
     use std::io::Write;
     let entry_str = entry.display().to_string();
     let map_dir = out_dir.display().to_string();
-    // Quoting strategy: use repr() at the Python end by emitting the
-    // path strings with `\` escaped and the value embedded between
-    // double quotes. That handles spaces and most punctuation on POSIX;
-    // on Windows the same `\` escaping keeps the literal valid.
-    let escape = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-    let entry_esc = escape(&entry_str);
-    let map_dir_esc = escape(&map_dir);
+    // Quoting strategy: emit each path as a Python double-quoted
+    // string literal via Rust's `{:?}` formatter. Rust's debug
+    // format escapes `\` and `"` per the Rust string spec, which
+    // happens to be a valid subset of Python's string-literal
+    // escaping — so a Windows path like `C:\foo\bar.py` round-trips
+    // as `"C:\\foo\\bar.py"`. The previous version used a raw
+    // `r"..."` prefix, which silently double-escaped backslashes
+    // (file lookups would then miss on Windows) and could not end
+    // in a backslash. FINDINGS — gemini review of PR #105.
+    let entry_lit = format!("{:?}", entry_str);
+    let map_dir_lit = format!("{:?}", map_dir);
     let break_cmds: String = breakpoint_cmds
         .iter()
         .map(|c| format!("    {:?},\n", c))
@@ -362,8 +366,8 @@ import sys
 import runpy
 
 
-_ENTRY = r"{entry_esc}"
-_BUILD_DIR = r"{map_dir_esc}"
+_ENTRY = {entry_lit}
+_BUILD_DIR = {map_dir_lit}
 _BREAK_CMDS = [
 {break_cmds}]
 
@@ -448,8 +452,8 @@ def _main():
 if __name__ == "__main__":
     _main()
 "#,
-        entry_esc = entry_esc,
-        map_dir_esc = map_dir_esc,
+        entry_lit = entry_lit,
+        map_dir_lit = map_dir_lit,
         break_cmds = break_cmds,
     );
 
