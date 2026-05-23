@@ -552,28 +552,32 @@ class TyphonPdb(pdb.Pdb):
             if attribution is not None:
                 self.message("  [ty] {{}}".format(attribution))
 
-    # Override the prompt to include .ty location
-    def _get_prompt(self):
-        """Build the pdb prompt with .ty location if available."""
+    def _update_prompt(self):
+        """Update the prompt to include .ty location if available."""
         # Default prompt format
         if self.curframe is None:
-            return "(Pdb) "
+            self.prompt = "(Pdb) "
+            return
 
         filename = self.curframe.f_code.co_filename
         lineno = self.curframe.f_lineno
         attribution = _attribute(filename, lineno)
 
         if attribution is not None:
-            return "([ty] {{}}) ".format(attribution)
+            self.prompt = "([ty] {{}}) ".format(attribution)
         else:
-            return "(Pdb) "
+            self.prompt = "(Pdb) "
 
-    # Override the prompt property (varies by Python version)
-    # In Python 3.x, the prompt is set via the _get_prompt method
-    # which is called by the cmdloop
-    @property
-    def prompt(self):
-        return self._get_prompt()
+    def interaction(self, frame, traceback):
+        """Override interaction to update prompt before each command loop."""
+        self._update_prompt()
+        return super().interaction(frame, traceback)
+
+    def setup(self, frame, traceback):
+        """Override setup to update prompt after setting up the stack."""
+        ret = super().setup(frame, traceback)
+        self._update_prompt()
+        return ret
 
 
 def _main():

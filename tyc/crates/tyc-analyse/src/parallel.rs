@@ -342,10 +342,9 @@ fn try_rewrite_setcomp(sc: &ExprSetComp, ctx: &RewriteCtx<'_>) -> Option<Expr> {
 /// Attempt the rewrite on a dict comprehension. The eligibility rules
 /// are similar to list/set comprehensions, but must handle both key and
 /// value expressions. Only one of `key` or `value` may be a pure call;
-/// the other must be a simple name or literal. The result wraps the
-/// parallel map in `dict(map_pure(...))` — we use the `dict()` builtin
-/// rather than a dict-display literal with unpacking because the lambda
-/// must return key-value tuples, and `{**(k, v) for ...}` is invalid syntax.
+/// the other must be a simple name or literal. The result emits a nested
+/// dict comprehension: `{k: v for (k, v) in map_pure(...)}`, avoiding
+/// any dependency on the shadowable `dict` builtin.
 fn try_rewrite_dictcomp(dc: &ExprDictComp, ctx: &RewriteCtx<'_>) -> Option<Expr> {
     // Single generator, no filters, no async
     if dc.generators.len() != 1 {
@@ -435,24 +434,55 @@ fn try_rewrite_dictcomp(dc: &ExprDictComp, ctx: &RewriteCtx<'_>) -> Option<Expr>
 
     let map_call = build_map_pure_call(dc.range, target_name, gen.iter.clone(), tuple);
 
-    // Wrap in dict(...) call
-    let dict_name = Expr::Name(ExprName {
+    // Rewrite as a dict comprehension: {k: v for (k, v) in map_pure(...)}
+    // This avoids depending on the shadowable `dict` builtin.
+    let tuple_target = Expr::Tuple(ExprTuple {
         range: dc.range,
         node_index: AtomicNodeIndex::NONE,
-        id: Name::new_static("dict"),
+        elts: vec![
+            Expr::Name(ExprName {
+                range: dc.range,
+                node_index: AtomicNodeIndex::NONE,
+                id: Name::new_static("_k"),
+                ctx: ExprContext::Store,
+            }),
+            Expr::Name(ExprName {
+                range: dc.range,
+                node_index: AtomicNodeIndex::NONE,
+                id: Name::new_static("_v"),
+                ctx: ExprContext::Store,
+            }),
+        ],
+        ctx: ExprContext::Store,
+        parenthesized: true,
+    });
+
+    let key_ref = Expr::Name(ExprName {
+        range: dc.range,
+        node_index: AtomicNodeIndex::NONE,
+        id: Name::new_static("_k"),
+        ctx: ExprContext::Load,
+    });
+    let value_ref = Expr::Name(ExprName {
+        range: dc.range,
+        node_index: AtomicNodeIndex::NONE,
+        id: Name::new_static("_v"),
         ctx: ExprContext::Load,
     });
 
-    Some(Expr::Call(ExprCall {
+    Some(Expr::DictComp(ExprDictComp {
         range: dc.range,
         node_index: AtomicNodeIndex::NONE,
-        func: Box::new(dict_name),
-        arguments: Arguments {
+        key: Some(Box::new(key_ref)),
+        value: Box::new(value_ref),
+        generators: vec![Comprehension {
             range: dc.range,
             node_index: AtomicNodeIndex::NONE,
-            args: vec![map_call].into_boxed_slice(),
-            keywords: Vec::new().into_boxed_slice(),
-        },
+            target: tuple_target,
+            iter: map_call,
+            ifs: vec![],
+            is_async: false,
+        }],
     }))
 }
 
