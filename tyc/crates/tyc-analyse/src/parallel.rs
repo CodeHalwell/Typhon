@@ -342,10 +342,9 @@ fn try_rewrite_setcomp(sc: &ExprSetComp, ctx: &RewriteCtx<'_>) -> Option<Expr> {
 /// Attempt the rewrite on a dict comprehension. The eligibility rules
 /// are similar to list/set comprehensions, but must handle both key and
 /// value expressions. Only one of `key` or `value` may be a pure call;
-/// the other must be a simple name or literal. The result wraps the
-/// parallel map in `dict(map_pure(...))` — we use the `dict()` builtin
-/// rather than a dict-display literal with unpacking because the lambda
-/// must return key-value tuples, and `{**(k, v) for ...}` is invalid syntax.
+/// the other must be a simple name or literal. The result emits a nested
+/// dict comprehension: `{k: v for (k, v) in map_pure(...)}`, avoiding
+/// any dependency on the shadowable `dict` builtin.
 fn try_rewrite_dictcomp(dc: &ExprDictComp, ctx: &RewriteCtx<'_>) -> Option<Expr> {
     // Single generator, no filters, no async
     if dc.generators.len() != 1 {
@@ -435,24 +434,55 @@ fn try_rewrite_dictcomp(dc: &ExprDictComp, ctx: &RewriteCtx<'_>) -> Option<Expr>
 
     let map_call = build_map_pure_call(dc.range, target_name, gen.iter.clone(), tuple);
 
-    // Wrap in dict(...) call
-    let dict_name = Expr::Name(ExprName {
+    // Rewrite as a dict comprehension: {k: v for (k, v) in map_pure(...)}
+    // This avoids depending on the shadowable `dict` builtin.
+    let tuple_target = Expr::Tuple(ExprTuple {
         range: dc.range,
         node_index: AtomicNodeIndex::NONE,
-        id: Name::new_static("dict"),
+        elts: vec![
+            Expr::Name(ExprName {
+                range: dc.range,
+                node_index: AtomicNodeIndex::NONE,
+                id: Name::new_static("_k"),
+                ctx: ExprContext::Store,
+            }),
+            Expr::Name(ExprName {
+                range: dc.range,
+                node_index: AtomicNodeIndex::NONE,
+                id: Name::new_static("_v"),
+                ctx: ExprContext::Store,
+            }),
+        ],
+        ctx: ExprContext::Store,
+        parenthesized: true,
+    });
+
+    let key_ref = Expr::Name(ExprName {
+        range: dc.range,
+        node_index: AtomicNodeIndex::NONE,
+        id: Name::new_static("_k"),
+        ctx: ExprContext::Load,
+    });
+    let value_ref = Expr::Name(ExprName {
+        range: dc.range,
+        node_index: AtomicNodeIndex::NONE,
+        id: Name::new_static("_v"),
         ctx: ExprContext::Load,
     });
 
-    Some(Expr::Call(ExprCall {
+    Some(Expr::DictComp(ExprDictComp {
         range: dc.range,
         node_index: AtomicNodeIndex::NONE,
-        func: Box::new(dict_name),
-        arguments: Arguments {
+        key: Some(Box::new(key_ref)),
+        value: Box::new(value_ref),
+        generators: vec![Comprehension {
             range: dc.range,
             node_index: AtomicNodeIndex::NONE,
-            args: vec![map_call].into_boxed_slice(),
-            keywords: Vec::new().into_boxed_slice(),
-        },
+            target: tuple_target,
+            iter: map_call,
+            ifs: vec![],
+            is_async: false,
+        }],
     }))
 }
 
@@ -733,5 +763,125 @@ mod tests {
         let mut m = parse(src);
         let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
         assert_eq!(stats.rewrites, 0);
+    }
+
+    // ── dict comprehensions ────────────────────────────────────────────────
+
+    #[test]
+    fn rewrites_pure_dictcomp_value_pure() {
+        // Pattern: {simple_key: f(x) for x in xs}
+        let src = "ys = {x: f(x) for x in xs}\n";
+        let mut m = parse(src);
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
+        assert_eq!(stats.rewrites, 1, "dict comprehension should rewrite");
+        let emit = tyc_emit::emit_python(&m);
+        assert!(
+            emit.contains("typhon_runtime.parallel.map_pure"),
+            "expected map_pure rewrite; got: {emit}"
+        );
+        // Should emit `{k: v for (k, v) in map_pure(...)}` not `dict(...)`
+        assert!(
+            !emit.contains("dict("),
+            "should not depend on the `dict` name; got: {emit}"
+        );
+        assert!(
+            emit.contains("for (_k, _v)") || emit.contains("for (_k,_v)"),
+            "expected tuple unpacking in comprehension; got: {emit}"
+        );
+    }
+
+    #[test]
+    fn rewrites_pure_dictcomp_key_pure() {
+        // Pattern: {f(x): simple_value for x in xs}
+        let src = "ys = {f(x): x for x in xs}\n";
+        let mut m = parse(src);
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
+        assert_eq!(stats.rewrites, 1, "dict comprehension should rewrite");
+        let emit = tyc_emit::emit_python(&m);
+        assert!(
+            emit.contains("typhon_runtime.parallel.map_pure"),
+            "expected map_pure rewrite; got: {emit}"
+        );
+        assert!(
+            !emit.contains("dict("),
+            "should not depend on the `dict` name; got: {emit}"
+        );
+    }
+
+    #[test]
+    fn rewrites_pure_dictcomp_literal_key() {
+        // Pattern: {literal: f(x) for x in xs}
+        let src = "ys = {'key': f(x) for x in xs}\n";
+        let mut m = parse(src);
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
+        assert_eq!(stats.rewrites, 1, "dict comprehension with literal key should rewrite");
+    }
+
+    #[test]
+    fn leaves_both_pure_dictcomp_alone() {
+        // Neither key nor value is simple — cannot rewrite
+        let src = "ys = {f(x): g(x) for x in xs}\n";
+        let mut m = parse(src);
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f", "g"]), 0);
+        assert_eq!(
+            stats.rewrites, 0,
+            "both key and value are pure calls — ineligible"
+        );
+    }
+
+    #[test]
+    fn leaves_both_simple_dictcomp_alone() {
+        // Both key and value are simple — no pure call
+        let src = "ys = {x: x for x in xs}\n";
+        let mut m = parse(src);
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
+        assert_eq!(stats.rewrites, 0, "no pure call present");
+    }
+
+    #[test]
+    fn leaves_filtered_dictcomp_alone() {
+        let src = "ys = {x: f(x) for x in xs if x > 0}\n";
+        let mut m = parse(src);
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
+        assert_eq!(stats.rewrites, 0, "filter must veto the rewrite");
+    }
+
+    #[test]
+    fn leaves_nested_dictcomp_alone() {
+        let src = "ys = {x: f(x) for row in rows for x in row}\n";
+        let mut m = parse(src);
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
+        assert_eq!(stats.rewrites, 0, "nested generators must veto the rewrite");
+    }
+
+    #[test]
+    fn leaves_impure_dictcomp_alone() {
+        let src = "ys = {x: g(x) for x in xs}\n";
+        let mut m = parse(src);
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
+        assert_eq!(stats.rewrites, 0, "impure callee must veto the rewrite");
+    }
+
+    #[test]
+    fn dictcomp_min_size_threshold_suppresses_short_literal_iters() {
+        let src = "ys = {x: f(x) for x in [1, 2, 3]}\n";
+        let mut m = parse(src);
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 64);
+        assert_eq!(
+            stats.rewrites, 0,
+            "literal iter shorter than threshold must not rewrite"
+        );
+    }
+
+    #[test]
+    fn dictcomp_min_size_threshold_passes_long_literal_iters() {
+        let elts = (0..64)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let src = format!("ys = {{x: f(x) for x in [{elts}]}}\n");
+        let mut m = parse(&src);
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 64);
+        assert_eq!(stats.rewrites, 1);
     }
 }

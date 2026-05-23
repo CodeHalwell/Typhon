@@ -160,8 +160,8 @@ pub fn run(args: TyArgs) -> Result<()> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let mapped_stdout = remap_ty_diagnostics(&stdout, None);
-    let mapped_stderr = remap_ty_diagnostics(&stderr, None);
+    let mapped_stdout = remap_ty_diagnostics(&stdout, Some(&out_dir));
+    let mapped_stderr = remap_ty_diagnostics(&stderr, Some(&out_dir));
     print!("{mapped_stdout}");
     eprint!("{mapped_stderr}");
 
@@ -434,6 +434,23 @@ fn parse_py_ref(line: &str) -> Option<PyRef> {
 /// When `map_dir` is provided, the parser validates candidate paths against
 /// the filesystem to support paths with spaces.
 fn parse_py_ref_with_validator(line: &str, map_dir: Option<&Path>) -> Option<PyRef> {
+    // Helper to check if a .py.map file exists without loading it
+    fn map_exists_for(py_path: &str, map_dir: Option<&Path>) -> bool {
+        let adjacent = PathBuf::from(format!("{py_path}.map"));
+        if adjacent.exists() {
+            return true;
+        }
+        if let Some(dir) = map_dir {
+            if let Some(base) = Path::new(py_path).file_name() {
+                let candidate = dir.join(format!("{}.map", base.to_string_lossy()));
+                if candidate.exists() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     // Find every `.py:` occurrence; the path is everything to the left.
     let bytes = line.as_bytes();
     let mut search_from = 0;
@@ -449,19 +466,19 @@ fn parse_py_ref_with_validator(line: &str, map_dir: Option<&Path>) -> Option<PyR
         let mut start = py_end - 3; // start at the `.` in `.py`
         while start > 0 {
             let b = bytes[start - 1];
-            // Stop at whitespace (except space if we'll validate), quotes,
-            // opening punctuation, or a newline.
+            // Stop at whitespace, quotes, opening punctuation, or a newline.
             if matches!(
                 b,
-                b'\t' | b'\n' | b'\r' | b'\'' | b'"' | b'(' | b'[' | b'<' | b'>'
+                b' ' | b'\t' | b'\n' | b'\r' | b'\'' | b'"' | b'(' | b'[' | b'<' | b'>'
             ) {
                 break;
             }
-            // For backward compatibility, also stop at space if no validator
-            if b == b' ' && map_dir.is_none() {
-                break;
-            }
             start -= 1;
+        }
+
+        // Trim any leading spaces from the start position (common in formats like "  --> path.py:line")
+        while start < py_end && bytes[start] == b' ' {
+            start += 1;
         }
 
         // Now we have a conservative start position. If we have a validator,
@@ -471,7 +488,7 @@ fn parse_py_ref_with_validator(line: &str, map_dir: Option<&Path>) -> Option<PyR
             let mut best_candidate = &line[start..py_end - 3 + 3]; // up to and incl. `.py`
             let mut best_start = start;
 
-            // Walk further back, but only through spaces
+            // Walk further back, but only through spaces and valid path characters
             let mut test_start = start;
             while test_start > 0 {
                 let b = bytes[test_start - 1];
@@ -484,10 +501,14 @@ fn parse_py_ref_with_validator(line: &str, map_dir: Option<&Path>) -> Option<PyR
                 test_start -= 1;
 
                 let candidate = &line[test_start..py_end - 3 + 3];
+                // Trim leading spaces from candidate before validation
+                let trimmed_candidate = candidate.trim_start();
                 // Validate: does this candidate have a .py.map file?
-                if load_map_for(candidate, Some(map_dir)).is_some() {
-                    best_candidate = candidate;
-                    best_start = test_start;
+                if map_exists_for(trimmed_candidate, Some(map_dir)) {
+                    // Update start to exclude the leading spaces we just trimmed
+                    let trim_offset = candidate.len() - trimmed_candidate.len();
+                    best_candidate = trimmed_candidate;
+                    best_start = test_start + trim_offset;
                 }
             }
 
