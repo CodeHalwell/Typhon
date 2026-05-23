@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 use miette::{miette, Result};
 
+use crate::commands::source_map::{load_map_for, map_py_line, parse_map, resolve_ty_path, SourceMap};
+
 /// Arguments for `tyc trace`.
 #[derive(Args, Debug)]
 pub struct TraceArgs {
@@ -93,112 +95,6 @@ fn try_rewrite_frame(line: &str, map_dir: Option<&Path>) -> String {
     format!("{indent}File \"{ty_path}\"{new_after}")
 }
 
-// ── source map parsing ────────────────────────────────────────────────────────
-
-#[derive(Debug)]
-struct SourceMap {
-    source: String,
-    strategy: LineStrategy,
-    /// v2 line table: `lines[py_line_0indexed]` = ty_line (1-indexed).
-    lines: Vec<u32>,
-}
-
-#[derive(Debug, PartialEq)]
-enum LineStrategy {
-    Identity,
-    Table,
-}
-
-/// Parse a `.py.map` JSON blob.
-///
-/// V1 format: `{"version":1,"source":"rel/path.ty","line_strategy":"identity"}`
-/// V2 format: adds `,"lines":[1,1,2,3,3,...]`
-fn parse_map(body: &str) -> Option<SourceMap> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    let obj = v.as_object()?;
-    let source = obj.get("source")?.as_str()?.to_owned();
-    let strategy_str = obj
-        .get("line_strategy")
-        .and_then(|v| v.as_str())
-        .unwrap_or("identity");
-    let strategy = if strategy_str == "table" {
-        LineStrategy::Table
-    } else {
-        LineStrategy::Identity
-    };
-    let lines = obj
-        .get("lines")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|x| x.as_u64().map(|n| n as u32))
-                .collect()
-        })
-        .unwrap_or_default();
-    Some(SourceMap {
-        source,
-        strategy,
-        lines,
-    })
-}
-
-// ── file lookup ───────────────────────────────────────────────────────────────
-
-/// Find and read the `.py.map` sidecar for `py_path`.
-///
-/// Search order:
-///   1. `<py_path>.map` adjacent to the `.py` file.
-///   2. `<map_dir>/<filename>.map` when `--map-dir` was given.
-fn load_map_for(py_path: &str, map_dir: Option<&Path>) -> Option<String> {
-    // Adjacent sidecar: foo.py → foo.py.map.
-    let adjacent = PathBuf::from(format!("{py_path}.map"));
-    if adjacent.exists() {
-        return std::fs::read_to_string(&adjacent).ok();
-    }
-
-    if let Some(dir) = map_dir {
-        if let Some(base) = Path::new(py_path).file_name() {
-            let candidate = dir.join(format!("{}.map", base.to_string_lossy()));
-            if candidate.exists() {
-                return std::fs::read_to_string(&candidate).ok();
-            }
-        }
-    }
-
-    None
-}
-
-// ── path resolution ───────────────────────────────────────────────────────────
-
-/// Resolve the Typhon source path for a given `.py` path and map `source`.
-///
-/// Walks up from the `.py` file's directory to find `typhon.toml` using the
-/// existing [`crate::config::TyphonConfig::load`] loader, then constructs
-/// `<project_root>/<src_dir>/<source>`.  Falls back to returning `source`
-/// as-is when the project root cannot be determined.
-fn resolve_ty_path(py_path: &str, source: &str) -> String {
-    let py = Path::new(py_path);
-    let start_dir = if py.is_absolute() {
-        py.parent().map(|p| p.to_path_buf())
-    } else {
-        py.canonicalize()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-    };
-
-    if let Some(dir) = start_dir {
-        if let Ok(Some((toml_path, config))) = crate::config::TyphonConfig::load(&dir) {
-            if let Some(root) = toml_path.parent() {
-                let ty = root.join(&config.project.src).join(source);
-                return ty.to_string_lossy().into_owned();
-            }
-        }
-    }
-
-    // Fallback: show the relative source path from the map.
-    source.to_owned()
-}
-
 // ── line mapping ──────────────────────────────────────────────────────────────
 
 /// Rewrite the `", line N, in func"` suffix using the map's line strategy.
@@ -207,21 +103,12 @@ fn apply_line_map(map: &SourceMap, after_path: &str) -> String {
         return after_path.to_owned();
     };
 
-    let ty_line = match map.strategy {
-        LineStrategy::Identity => py_line,
-        LineStrategy::Table => {
-            let idx = py_line.saturating_sub(1) as usize;
-            map.lines.get(idx).copied().unwrap_or(py_line)
-        }
-    };
+    let ty_line = map_py_line(map, py_line);
 
     if ty_line == py_line {
         return after_path.to_owned();
     }
 
-    // Splice the new line number into the original suffix string using the
-    // exact span from parsing so the replacement is consistent with how the
-    // number was read (avoids any leading-zero / formatting divergence).
     let before_num = &after_path[..num_offset];
     let after_num = &after_path[num_offset + digit_len..];
     format!("{before_num}{ty_line}{after_num}")
@@ -248,6 +135,7 @@ fn parse_line_suffix(s: &str) -> Option<(u32, usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::source_map::LineStrategy;
 
     // ── map parsing ──────────────────────────────────────────────────────────
 

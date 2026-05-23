@@ -178,15 +178,20 @@ Lives under a new `CheckerConfig` struct in
 `tyc/src/config.rs`. Honoured by `--with-ty` and by `tyc lsp` so the
 language server runs `ty` on save too.
 
-#### Step 1.3 — Source-map attribution
+#### Step 1.3 — Source-map attribution ✅
 
-`ty` reports diagnostics with `File "build/foo.py", line N`-style
-references. Re-use the existing `tyc trace` logic in
-`tyc/src/commands/trace.rs` (currently used for tracebacks) to
-rewrite `ty`'s diagnostics to point at `.ty` lines.
+`ty` reports diagnostics as `path/foo.py:LINE[:COL]: severity: ...`.
+`tyc ty` captures the child's stdout/stderr, scans each line for the
+`*.py:NN(:NN)?` prefix, looks up the adjacent `.py.map` sidecar, and
+rewrites the prefix to `path/foo.ty:TY_LINE[:COL]`. The shared
+loader/mapper lives in `tyc/crates/tyc/src/commands/source_map.rs`
+and is re-used by `tyc trace`. Pass `--raw` to opt out and forward
+`ty`'s output verbatim.
 
-The `.py.map` v2 line table is already shipped, so the rewriter can
-attribute at line granularity from day one.
+The `.py.map` v2 line table is already shipped, so attribution is at
+line granularity from day one. Lines without a recognisable `.py:`
+reference (summary text, blank lines, snippet excerpts) are forwarded
+unchanged.
 
 #### Step 1.4 — Diagnostic merging
 

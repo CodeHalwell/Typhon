@@ -13,6 +13,7 @@ pub mod migrate;
 pub mod profile;
 pub mod repl;
 pub mod run;
+pub mod source_map;
 pub mod stubtest;
 pub mod trace;
 pub mod ty;
