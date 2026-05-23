@@ -304,12 +304,8 @@ fn try_rewrite_listcomp(lc: &ExprListComp, ctx: &RewriteCtx<'_>) -> Option<Expr>
 /// resulting expression still has set semantics (deduplication +
 /// unordered membership).
 fn try_rewrite_setcomp(sc: &ExprSetComp, ctx: &RewriteCtx<'_>) -> Option<Expr> {
-    let (lambda_param, iter, elt_lambda) = analyse_comprehension(
-        &sc.generators,
-        &sc.elt,
-        ctx,
-        sc.range,
-    )?;
+    let (lambda_param, iter, elt_lambda) =
+        analyse_comprehension(&sc.generators, &sc.elt, ctx, sc.range)?;
     let map_call = build_map_pure_call(sc.range, lambda_param, iter, elt_lambda);
     // Wrap in `set(map_pure(...))` so the value-level semantics
     // (uniqueness + unordered) survive the rewrite.
@@ -383,12 +379,7 @@ fn analyse_comprehension(
 }
 
 /// Synthesise `typhon_runtime.parallel.map_pure(lambda <param>: <body>, <iter>)`.
-fn build_map_pure_call(
-    range: TextRange,
-    lambda_param: String,
-    iter: Expr,
-    body: Expr,
-) -> Expr {
+fn build_map_pure_call(range: TextRange, lambda_param: String, iter: Expr, body: Expr) -> Expr {
     let lambda = ExprLambda {
         range,
         node_index: AtomicNodeIndex::NONE,
@@ -588,10 +579,7 @@ mod tests {
         );
         // Wrapped in set(...) so the runtime value still has set
         // semantics (uniqueness + unordered membership).
-        assert!(
-            emit.contains("set("),
-            "expected set() wrapper; got: {emit}"
-        );
+        assert!(emit.contains("set("), "expected set() wrapper; got: {emit}");
     }
 
     #[test]

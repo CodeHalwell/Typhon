@@ -613,12 +613,8 @@ pub fn check_source_file_with_imports(
         lazy_import_remaps: build_lazy_import_remaps(&text, &prep.lazy_imports),
         original_source: Some(text.clone()),
     };
-    let (_resolved_fresh, resolve_diags) = resolve_module_with(
-        path.clone(),
-        &prep.python_source,
-        &module,
-        resolve_options,
-    );
+    let (_resolved_fresh, resolve_diags) =
+        resolve_module_with(path.clone(), &prep.python_source, &module, resolve_options);
     diags.extend(resolve_diags);
 
     let external = build_external_shapes(&resolved_arc, shapes_by_module);

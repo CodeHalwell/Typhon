@@ -3083,10 +3083,7 @@ fn prescan_partial_returning_fns(c: &mut Checker, body: &[Stmt]) {
 ///   - `[obj = X.__new__(X), return obj]` (no intervening attribute
 ///     assignments on `obj`)
 /// Otherwise `None`.
-fn function_returns_partial_instance(
-    c: &Checker,
-    body: &[Stmt],
-) -> Option<UninitInstance> {
+fn function_returns_partial_instance(c: &Checker, body: &[Stmt]) -> Option<UninitInstance> {
     // Case 1: single-statement `return X.__new__(X)`.
     if let [Stmt::Return(ret)] = body {
         let value = ret.value.as_deref()?;
@@ -3104,10 +3101,7 @@ fn function_returns_partial_instance(
             Stmt::Pass(_) => continue,
             Stmt::Expr(e) => {
                 // Docstrings (a bare `"..."`) are fine.
-                if matches!(
-                    e.value.as_ref(),
-                    Expr::StringLiteral(_) | Expr::FString(_)
-                ) {
+                if matches!(e.value.as_ref(), Expr::StringLiteral(_) | Expr::FString(_)) {
                     continue;
                 }
                 return None;

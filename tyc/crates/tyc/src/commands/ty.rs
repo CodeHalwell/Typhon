@@ -406,7 +406,7 @@ fn parse_py_ref(line: &str) -> Option<PyRef> {
     let mut search_from = 0;
     while let Some(rel) = line[search_from..].find(".py:") {
         let py_end = search_from + rel + 3; // position of `:` after `.py`
-        // Walk left to find the start of the path token.
+                                            // Walk left to find the start of the path token.
         let mut start = py_end - 3; // start at the `.` in `.py`
         while start > 0 {
             let b = bytes[start - 1];
@@ -423,12 +423,9 @@ fn parse_py_ref(line: &str) -> Option<PyRef> {
             start -= 1;
         }
         let py_path = &line[start..py_end - 3 + 3]; // up to and incl. `.py`
-        // After the `:` parse the line number.
+                                                    // After the `:` parse the line number.
         let after = &line[py_end + 1..];
-        let digit_len = after
-            .bytes()
-            .take_while(|b| b.is_ascii_digit())
-            .count();
+        let digit_len = after.bytes().take_while(|b| b.is_ascii_digit()).count();
         if digit_len == 0 {
             search_from = py_end + 1;
             continue;
@@ -565,7 +562,7 @@ mod tests {
             no_build: true,
             ty_args: vec![],
             watch: false,
-        raw: false,
+            raw: false,
         });
         assert!(result.is_err());
         let msg = format!("{:?}", result.unwrap_err());
@@ -595,7 +592,7 @@ mod tests {
             no_build: false,
             ty_args: vec![],
             watch: false,
-        raw: false,
+            raw: false,
         });
         assert!(result.is_err(), "missing ty binary should error");
 
@@ -630,7 +627,7 @@ mod tests {
             no_build: false,
             ty_args: vec![],
             watch: false,
-        raw: false,
+            raw: false,
         });
         assert!(result.is_err(), "missing binary should error");
         let msg = format!("{:?}", result.unwrap_err());

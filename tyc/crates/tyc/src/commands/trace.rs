@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 use miette::{miette, Result};
 
-use crate::commands::source_map::{load_map_for, map_py_line, parse_map, resolve_ty_path, SourceMap};
+use crate::commands::source_map::{
+    load_map_for, map_py_line, parse_map, resolve_ty_path, SourceMap,
+};
 
 /// Arguments for `tyc trace`.
 #[derive(Args, Debug)]
