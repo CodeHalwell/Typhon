@@ -32,7 +32,7 @@ python3 -c "import sys; sys.path.insert(0, 'build'); from main import test_all; 
 **17 of 17 probes pass** — all candidate idioms from the issue are accepted by `tyc check`.
 
 | # | Probe | Surface | Outcome |
-|---|---|---|---|
+|---|-------|---------|---------|
 | 1 | `probe_walrus_comprehension_basic` | `if (n := expr)` in comprehension | ✅ pass |
 | 2 | `probe_walrus_comprehension_nested` | walrus in comprehension with tuple result | ✅ pass |
 | 3 | `probe_walrus_conditional` | `if (count := len(x)) > 0` | ✅ pass |
