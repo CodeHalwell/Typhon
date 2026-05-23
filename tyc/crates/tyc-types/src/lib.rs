@@ -1571,6 +1571,21 @@ struct Checker<'a> {
     /// (e.g. `c.configure(...)` which might assign fields). Skipped
     /// entirely inside `unsafe:` regions.
     uninit_instances: HashMap<String, UninitInstance>,
+    /// Cross-function field-init audit: functions whose body is the
+    /// literal pattern `return X.__new__(X)` / `return object.__new__(X)`
+    /// (with no intervening field assignment) are recorded here. When
+    /// a call site binds the result (`let c = make_partial()`), the
+    /// LHS is registered as a tracked uninit instance — so a subsequent
+    /// escape (return / call arg) fires `tyc::missing_field_init`
+    /// just as if the user had written `X.__new__(X)` directly.
+    ///
+    /// Intentionally narrow: the pre-scan only recognises the trivial
+    /// helper-factory shape. Functions that intersperse field
+    /// assignments before the return are treated as initialising the
+    /// instance properly and are NOT recorded. Cross-module helpers
+    /// are out of scope because the per-file checker doesn't see other
+    /// modules' bodies. FINDINGS — Phase 5.5 carry-forward.
+    partial_returning_fns: HashMap<String, UninitInstance>,
     /// Dotted-name keyed registry of every project module's shapes,
     /// used for attribute access on `Type::Module(name)` bindings. A
     /// bare `import foo as f` plus `f.ApiClient(...)` looks `f` up in
@@ -1789,6 +1804,7 @@ impl<'a> Checker<'a> {
             current_return: None,
             current_class: None,
             uninit_instances: HashMap::new(),
+            partial_returning_fns: HashMap::new(),
             module_registry: std::sync::Arc::new(HashMap::new()),
         }
     }
@@ -2867,6 +2883,12 @@ pub fn check_module_with_imports(
     // references work.
     collect_classes_and_functions(&mut c, &module.body);
     populate_frozen_classes(&mut c, &module.body, &frozen_starts);
+    // Cross-function field-init audit pre-pass: identify helper
+    // functions whose body is `return X.__new__(X)` (or
+    // `obj = X.__new__(X); return obj`). At call sites, the LHS is
+    // registered as tracked so a downstream escape fires
+    // `tyc::missing_field_init` just like a direct construct.
+    prescan_partial_returning_fns(&mut c, &module.body);
 
     c.env.enter();
     // Seed module scope with collected classes/functions and resolver bindings.
@@ -3009,6 +3031,124 @@ fn detect_new_bypass(value: &Expr) -> Option<String> {
 /// (fields in `field_order` minus the ones in `field_defaults`).
 /// Skipped inside `unsafe:` blocks where the user has opted out of
 /// the static type discipline.
+/// Pre-scan every top-level function for the trivial
+/// `def f(...): return X.__new__(X)` (or `object.__new__(X)`) shape
+/// and record the (class, missing) pair under the function name in
+/// `c.partial_returning_fns`.
+///
+/// The scan is narrow on purpose: we only recognise the literal
+/// factory-helper shape. A function that performs intervening field
+/// assignments before returning is treated as having initialised the
+/// instance properly, even if some required field is still missing —
+/// detecting that case would need an inter-procedural data-flow
+/// analysis. Better to miss an obscure case than emit a false-positive
+/// on a helper that legitimately leaves some optional fields for the
+/// caller.
+fn prescan_partial_returning_fns(c: &mut Checker, body: &[Stmt]) {
+    for stmt in body {
+        let Stmt::FunctionDef(f) = stmt else { continue };
+        let fn_name = f.name.as_str();
+        if let Some(info) = function_returns_partial_instance(c, &f.body) {
+            c.partial_returning_fns.insert(fn_name.to_owned(), info);
+        }
+    }
+}
+
+/// Inspect a function body for the partial-return shape. Returns
+/// `Some(UninitInstance)` when the body is one of:
+///   - `[return X.__new__(X)]`
+///   - `[obj = X.__new__(X), return obj]` (no intervening attribute
+///     assignments on `obj`)
+/// Otherwise `None`.
+fn function_returns_partial_instance(
+    c: &Checker,
+    body: &[Stmt],
+) -> Option<UninitInstance> {
+    // Case 1: single-statement `return X.__new__(X)`.
+    if let [Stmt::Return(ret)] = body {
+        let value = ret.value.as_deref()?;
+        let class_name = detect_new_bypass(value)?;
+        return uninit_instance_for(c, &class_name);
+    }
+    // Case 2: `obj = X.__new__(X)` followed by `return obj`. We
+    // tolerate any number of intervening pass / docstring / assert
+    // statements but reject anything that touches the target binding
+    // (assignments, attribute writes, method calls).
+    let mut target: Option<&str> = None;
+    let mut class: Option<String> = None;
+    for stmt in body {
+        match stmt {
+            Stmt::Pass(_) => continue,
+            Stmt::Expr(e) => {
+                // Docstrings (a bare `"..."`) are fine.
+                if matches!(
+                    e.value.as_ref(),
+                    Expr::StringLiteral(_) | Expr::FString(_)
+                ) {
+                    continue;
+                }
+                return None;
+            }
+            Stmt::Assert(_) => continue,
+            Stmt::Assign(a) if target.is_none() => {
+                let [Expr::Name(n)] = a.targets.as_slice() else {
+                    return None;
+                };
+                let cls = detect_new_bypass(&a.value)?;
+                target = Some(n.id.as_str());
+                class = Some(cls);
+            }
+            Stmt::Return(ret) => {
+                let target = target?;
+                let class = class.as_ref()?;
+                let value = ret.value.as_deref()?;
+                let Expr::Name(n) = value else {
+                    return None;
+                };
+                if n.id.as_str() != target {
+                    return None;
+                }
+                return uninit_instance_for(c, class);
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Look up `class_name`'s required fields and return an
+/// `UninitInstance` describing the missing set, or `None` if the class
+/// shape isn't known or has no required fields.
+fn uninit_instance_for(c: &Checker, class_name: &str) -> Option<UninitInstance> {
+    let shape = c.class_shapes.get(class_name)?;
+    let required: std::collections::HashSet<String> = shape
+        .field_order
+        .iter()
+        .filter(|f| !shape.field_defaults.contains(*f))
+        .cloned()
+        .collect();
+    if required.is_empty() {
+        return None;
+    }
+    Some(UninitInstance {
+        class: class_name.to_owned(),
+        missing: required,
+    })
+}
+
+/// If `call` invokes a function recorded in `c.partial_returning_fns`,
+/// return the matching `UninitInstance`. Used at assignment sites to
+/// decide whether the LHS should be registered as tracked.
+fn detect_partial_returning_call(c: &Checker, value: &Expr) -> Option<UninitInstance> {
+    let Expr::Call(call) = value else {
+        return None;
+    };
+    let Expr::Name(fn_name) = call.func.as_ref() else {
+        return None;
+    };
+    c.partial_returning_fns.get(fn_name.id.as_str()).cloned()
+}
+
 fn audit_register_bypass(c: &mut Checker, binding: &str, class_name: &str) {
     if c.unsafe_depth > 0 {
         return;
@@ -5017,6 +5157,10 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 if let Some(value) = &a.value {
                     if let Some(class) = detect_new_bypass(value) {
                         audit_register_bypass(c, n.id.as_str(), &class);
+                    } else if let Some(info) = detect_partial_returning_call(c, value) {
+                        if c.unsafe_depth == 0 {
+                            c.uninit_instances.insert(n.id.as_str().to_owned(), info);
+                        }
                     } else {
                         audit_clear_binding(c, n.id.as_str());
                     }
@@ -5080,6 +5224,13 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     // register / clear tracking accordingly.
                     if let Some(class) = detect_new_bypass(&a.value) {
                         audit_register_bypass(c, n.id.as_str(), &class);
+                    } else if let Some(info) = detect_partial_returning_call(c, &a.value) {
+                        // `c = make_partial()` — register the LHS as
+                        // tracked using the helper's pre-scanned
+                        // missing set. Same downstream audit applies.
+                        if c.unsafe_depth == 0 {
+                            c.uninit_instances.insert(n.id.as_str().to_owned(), info);
+                        }
                     } else {
                         audit_clear_binding(c, n.id.as_str());
                     }
@@ -9337,6 +9488,110 @@ def make() -> ApiClient:
 ";
         let d = check(src);
         assert!(d.has_errors(), "`object.__new__(X)` must also be tracked");
+    }
+
+    // ── cross-function partial-return tracking ─────────────────────────────
+
+    #[test]
+    fn audit_partial_factory_helper_caught_at_caller_return() {
+        // Phase 5.5 carry-forward: a helper whose body is literally
+        // `return X.__new__(X)` is recognised by the pre-scan, and a
+        // caller that returns the result hits the same
+        // missing_field_init diagnostic as if it had constructed the
+        // partial instance inline.
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+def make() -> ApiClient:
+    return ApiClient.__new__(ApiClient)
+
+def use() -> ApiClient:
+    let c: ApiClient = make()
+    return c
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "cross-function partial return must fire missing_field_init"
+        );
+        let msg = format!("{}", d.errors()[0]);
+        assert!(
+            msg.contains("api_key") || msg.contains("base_url"),
+            "diagnostic should name a missing field, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn audit_partial_factory_caller_passes_after_fields_set() {
+        // The caller assigns every required field on the returned
+        // partial instance before escaping — no diagnostic.
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+def make() -> ApiClient:
+    return ApiClient.__new__(ApiClient)
+
+def use() -> ApiClient:
+    let c: ApiClient = make()
+    c.api_key = \"sk-x\"
+    c.base_url = \"x\"
+    return c
+";
+        let d = check(src);
+        assert!(!d.has_errors(), "all fields set → clean: {:?}", d.errors());
+    }
+
+    #[test]
+    fn audit_two_stmt_factory_helper_also_caught() {
+        // The pre-scan also accepts the `obj = X.__new__(X); return obj`
+        // form (with no intervening field writes).
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+def make() -> ApiClient:
+    let obj: ApiClient = ApiClient.__new__(ApiClient)
+    return obj
+
+def use() -> ApiClient:
+    let c: ApiClient = make()
+    return c
+";
+        let d = check(src);
+        assert!(d.has_errors(), "two-stmt factory must also be tracked");
+    }
+
+    #[test]
+    fn audit_proper_initialising_factory_not_tracked() {
+        // Helpers that actually initialise the instance must NOT be
+        // recorded as partial-returning. The pre-scan rejects any
+        // body that isn't the bare pattern.
+        let src = "\
+class ApiClient:
+    api_key: str
+    base_url: str
+
+def make() -> ApiClient:
+    let c: ApiClient = ApiClient.__new__(ApiClient)
+    c.api_key = \"k\"
+    c.base_url = \"u\"
+    return c
+
+def use() -> ApiClient:
+    let c: ApiClient = make()
+    return c
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "initialising factory must not be tracked: {:?}",
+            d.errors()
+        );
     }
 
     #[test]
