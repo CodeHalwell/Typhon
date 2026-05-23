@@ -143,9 +143,14 @@ pub fn module_decl_names(db: &dyn salsa::Database, file: SourceFile) -> Vec<Stri
 /// during resolution as separate Arcs, eliminating the need to re-run `resolve_module_with`
 /// just to collect diagnostics while preserving the ability to extract the ResolvedModule Arc.
 #[derive(Clone)]
-pub struct ArcResolvedModule(pub Arc<ResolvedModule>, pub Arc<Diagnostics>);
+pub struct ArcResolvedModule(Arc<ResolvedModule>, Arc<Diagnostics>);
 
 impl ArcResolvedModule {
+    /// Construct a new `ArcResolvedModule` from a resolved module and diagnostics.
+    pub fn new(resolved: Arc<ResolvedModule>, diagnostics: Arc<Diagnostics>) -> Self {
+        Self(resolved, diagnostics)
+    }
+
     /// Access the resolved module.
     pub fn resolved(&self) -> &ResolvedModule {
         &self.0
@@ -159,6 +164,17 @@ impl ArcResolvedModule {
     /// Get the Arc<ResolvedModule> for compatibility.
     pub fn resolved_arc(&self) -> Arc<ResolvedModule> {
         Arc::clone(&self.0)
+    }
+
+    /// Consume self and return the inner Arc<ResolvedModule> by move,
+    /// avoiding extra refcount operations.
+    pub fn into_resolved_arc(self) -> Arc<ResolvedModule> {
+        self.0
+    }
+
+    /// Get a reference to the diagnostics Arc.
+    pub fn diagnostics_arc(&self) -> &Arc<Diagnostics> {
+        &self.1
     }
 }
 
@@ -282,9 +298,9 @@ pub fn resolved_module(db: &dyn salsa::Database, file: SourceFile) -> ArcResolve
         Ok(parsed) => {
             let module = parsed.into_syntax();
             let (resolved, diags) = resolve_module_with(path, &prep.python_source, &module, options);
-            ArcResolvedModule(Arc::new(resolved), Arc::new(diags))
+            ArcResolvedModule::new(Arc::new(resolved), Arc::new(diags))
         }
-        Err(_) => ArcResolvedModule(Arc::new(ResolvedModule::default()), Arc::new(Diagnostics::new())),
+        Err(_) => ArcResolvedModule::new(Arc::new(ResolvedModule::default()), Arc::new(Diagnostics::new())),
     }
 }
 
@@ -400,7 +416,7 @@ fn collect_original_lazy_import_alias_spans(source: &str) -> Vec<OriginalLazyAli
 /// `resolved_module` query result. Returns the same Arc on repeated calls
 /// for the same file (pointer equality), so LSP caching tests pass.
 pub fn resolved_module_arc(db: &dyn salsa::Database, file: SourceFile) -> Arc<ResolvedModule> {
-    resolved_module(db, file).resolved_arc()
+    resolved_module(db, file).into_resolved_arc()
 }
 
 /// The Typhon database — concrete carrier of salsa state.
