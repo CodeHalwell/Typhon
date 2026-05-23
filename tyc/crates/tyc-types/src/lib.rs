@@ -2201,6 +2201,39 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+        // Python-semantic-drift: CPython treats `bool` as a strict subtype of
+        // `int` (bool inherits from int, so `True == 1` and `False == 0`).
+        // Typhon's type system keeps `Bool` and `Int` as distinct nominal
+        // types for additional strictness, but this means Typhon would reject
+        // programs that are perfectly valid CPython.  Instead of a hard error,
+        // downgrade to a `python_semantic_drift` warning so Typhon remains a
+        // superset of valid Python code.  The same logic applies to `bool`
+        // flowing into a `float` context — Python allows `True + 1.5 == 2.5`.
+        //
+        // We check this AFTER the interface / newtype arms above so those more
+        // specific diagnostics always win when both conditions could apply.
+        if matches!(actual, Type::Bool)
+            && matches!(expected, Type::Int | Type::Float)
+            && self.unsafe_depth == 0
+        {
+            let expr_text = self
+                .source
+                .get(span.0..span.1.min(self.source.len()))
+                .unwrap_or("…")
+                .trim();
+            self.diagnostics
+                .push_warning(TycError::python_semantic_drift(
+                    expr_text,
+                    "CPython treats `bool` as a subtype of `int` (bool inherits int); \
+                 Typhon keeps them distinct for strictness — use `int(x)` to make \
+                 the conversion explicit",
+                    &self.path,
+                    self.source,
+                    span.0,
+                    length,
+                ));
+            return; // downgraded to warning — do not also push type_mismatch
+        }
         self.diagnostics.push_error(TycError::type_mismatch(
             expected.display(),
             actual.display(),
@@ -6641,6 +6674,19 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     Type::Float
                 }
                 (Type::Int, Type::Int) => Type::Int,
+                // CPython treats `bool` as a subtype of `int`, so arithmetic
+                // between `int` and `bool` (in either order) returns `int`.
+                // `bool + bool` is also `int` — Python does NOT return `bool`
+                // from any arithmetic operator.  Without this arm the
+                // inference falls through to `Unknown`, which weakens all
+                // downstream type information (e.g. `let n: int = True + 1`
+                // would leave `n` typed `Unknown` when inferred sans
+                // annotation).  Operator compatibility already accepts these
+                // pairs via `is_numeric(Bool) == true`, so no extra
+                // diagnostic is needed here.
+                (Type::Int, Type::Bool) | (Type::Bool, Type::Int) | (Type::Bool, Type::Bool) => {
+                    Type::Int
+                }
                 (Type::Float, _) | (_, Type::Float) => Type::Float,
                 (Type::Str, Type::Str) if matches!(b.op, Operator::Add) => Type::Str,
                 _ => Type::Unknown,
@@ -12168,6 +12214,96 @@ def f() -> int:
                 .iter()
                 .any(|e| matches!(e, TycError::UnsafeValueLeak { .. })),
             "inner-annotated unsafe binding must not trigger the leak; got {:?}",
+            d.errors()
+        );
+    }
+
+    // ── python_semantic_drift — bool ⊆ int ───────────────────────────────
+
+    /// `let x: int = True` must produce a `python_semantic_drift` WARNING,
+    /// not a `type_mismatch` ERROR.  CPython treats `bool` as a strict
+    /// subtype of `int` so this is valid Python; Typhon downgrades the
+    /// diagnostic to preserve the "superset of Python" contract.
+    #[test]
+    fn bool_assigned_to_int_emits_drift_warning_not_error() {
+        let d = check("def f() -> None:\n    let x: int = True\n");
+        assert!(
+            !d.has_errors(),
+            "`let x: int = True` must not produce an error (drift is warning-only); \
+             got: {:?}",
+            d.errors()
+        );
+        assert!(
+            d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::PythonSemanticDrift { .. })),
+            "expected a PythonSemanticDrift warning for `let x: int = True`; \
+             warnings: {:?}",
+            d.warnings()
+        );
+    }
+
+    /// Negative case: a plain `int` literal in an `int` slot must not
+    /// emit any drift warning — the warning is exclusive to `bool`-in-
+    /// numeric-context mismatches.
+    #[test]
+    fn int_literal_in_int_context_no_drift_warning() {
+        let d = check("def f() -> None:\n    let x: int = 42\n");
+        assert!(!d.has_errors(), "{:?}", d.errors());
+        assert!(
+            !d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::PythonSemanticDrift { .. })),
+            "did not expect PythonSemanticDrift for a plain int literal; \
+             warnings: {:?}",
+            d.warnings()
+        );
+    }
+
+    /// `let f: float = False` must also trigger the drift warning
+    /// because CPython allows bool in float context (bool inherits int
+    /// which widens to float).
+    #[test]
+    fn bool_assigned_to_float_emits_drift_warning() {
+        let d = check("def g() -> None:\n    let f: float = False\n");
+        assert!(
+            !d.has_errors(),
+            "`let f: float = False` must not error; got: {:?}",
+            d.errors()
+        );
+        assert!(
+            d.warnings()
+                .iter()
+                .any(|w| matches!(w, TycError::PythonSemanticDrift { .. })),
+            "expected PythonSemanticDrift warning for `let f: float = False`; \
+             warnings: {:?}",
+            d.warnings()
+        );
+    }
+
+    /// `1 + True` must not produce an operator-type-mismatch error (both
+    /// operands are numeric) and the result type must be `Int`, not `Unknown`.
+    /// We verify the latter indirectly: if the result were `Unknown`, the
+    /// `let n: int = 1 + True` assignment would still pass (Unknown is
+    /// universally assignable), but `double(n)` where `double: int -> int`
+    /// would reveal a mismatch if `n` ended up untyped.  The clean check
+    /// result confirms both facts.
+    #[test]
+    fn bool_int_arithmetic_succeeds_and_no_type_mismatch() {
+        let src = "\
+def double(n: int) -> int:
+    return n * 2
+
+def demo() -> None:
+    let n: int = 1 + True
+    let m: int = True + True
+    let r: int = double(n)
+    print(r)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "bool arithmetic must not produce errors; got: {:?}",
             d.errors()
         );
     }

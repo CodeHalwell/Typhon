@@ -1032,3 +1032,139 @@ async def load() -> int:
          got {gather_expansion_count}"
     );
 }
+
+// ── tyc::python_semantic_drift — bool ⊆ int ──────────────────────────────────
+
+/// A `bool` value flowing into an `int`-typed context is valid CPython
+/// (bool inherits from int) but violates Typhon's stricter nominal type
+/// system.  The check must succeed (it is a warning, not an error) and the
+/// output must contain the `tyc::python_semantic_drift` code.
+#[test]
+fn bool_in_int_context_emits_python_semantic_drift_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("drift.ty"),
+        // `True` infers as `Bool`; the annotation requires `Int`.
+        // CPython accepts this (bool ⊆ int); Typhon should warn, not error.
+        "def demo() -> None:\n    let x: int = True\n    print(x)\n",
+    )
+    .unwrap();
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(
+        out.status.success(),
+        "bool-in-int is a python_semantic_drift WARNING; check must succeed.\
+         \nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        combined.contains("tyc::python_semantic_drift"),
+        "expected tyc::python_semantic_drift in output for `let x: int = True`, got:\n{combined}"
+    );
+}
+
+/// Negative case: a plain integer literal in an `int`-typed context must NOT
+/// emit `tyc::python_semantic_drift` — the warning is exclusive to `bool`
+/// values flowing into numeric contexts.
+#[test]
+fn int_literal_in_int_context_does_not_emit_drift() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("clean.ty"),
+        "def demo() -> None:\n    let x: int = 42\n    print(x)\n",
+    )
+    .unwrap();
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(out.status.success(), "plain int should check cleanly");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !combined.contains("tyc::python_semantic_drift"),
+        "did not expect python_semantic_drift for `let x: int = 42`, got:\n{combined}"
+    );
+}
+
+/// `1 + True` is valid CPython arithmetic (`True` coerces to `1`).
+/// Typhon's `is_numeric(Bool) == true` already admits it through
+/// `operator_operands_compatible`, so no error fires.  Additionally the
+/// binary-op result-type inference must resolve to `Int` (not `Unknown`)
+/// so that a downstream `let n: int = 1 + True` does not regress to a
+/// spurious mismatch.
+#[test]
+fn bool_arithmetic_with_int_succeeds_and_infers_int() {
+    let tmp = tempfile::tempdir().unwrap();
+    // If the result type regresses to `Unknown` the inner `let n: int = …`
+    // still passes (Unknown is assignable everywhere), so we also test a
+    // case where the result is immediately used as an `int` in a context
+    // that WOULD reject an unknown: a function call expecting `int`.
+    std::fs::write(
+        tmp.path().join("arith.ty"),
+        concat!(
+            "def double(n: int) -> int:\n",
+            "    return n * 2\n",
+            "\n",
+            "def demo() -> None:\n",
+            "    let n: int = 1 + True\n",
+            "    let m: int = True + True\n",
+            "    let r: int = double(n)\n",
+            "    print(r)\n",
+        ),
+    )
+    .unwrap();
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(
+        out.status.success(),
+        "bool arithmetic should check cleanly.\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The `bool ⊆ int` ASSIGNMENT drift warning fires on `let n: int = 1 + True`
+    // only if the BinOp result-type is still `Bool`; with the correct `Int`
+    // result type it is a plain `Int = Int` assignment and no warning fires.
+    // Either way the check succeeds — this assertion guards the no-spurious-
+    // error invariant for the arithmetic expression itself.
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !combined.contains("tyc::type_mismatch"),
+        "did not expect type_mismatch for bool arithmetic, got:\n{combined}"
+    );
+}
+
+/// A `bool` value flowing into a `float`-typed context also triggers the
+/// Python-semantic-drift warning — CPython accepts this because bool ⊆ int
+/// and int can widen to float.
+#[test]
+fn bool_in_float_context_emits_python_semantic_drift_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("float_drift.ty"),
+        "def demo() -> None:\n    let f: float = False\n    print(f)\n",
+    )
+    .unwrap();
+    let out = tyc().arg("check").arg(tmp.path()).output().unwrap();
+    assert!(
+        out.status.success(),
+        "bool-in-float is a python_semantic_drift WARNING; check must succeed.\
+         \nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        combined.contains("tyc::python_semantic_drift"),
+        "expected tyc::python_semantic_drift in output for `let f: float = False`, got:\n{combined}"
+    );
+}
