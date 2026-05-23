@@ -18,15 +18,25 @@
 //! commands are passed to pdb via `-c`, which pdb evaluates before
 //! starting execution.
 //!
+//! ## Typhon-aware presentation layer (`TyphonPdb`)
+//!
+//! When the default `pdb` debugger is used (the common case), the
+//! launcher writes a small Python wrapper that subclasses `pdb.Pdb`
+//! and overrides `print_stack_entry` to print `[ty] <src>:<line>`
+//! alongside the standard `.py` frame on every pause (entry,
+//! breakpoint, step, exception). The wrapper eagerly loads every
+//! `.py.map` sidecar in the build directory on startup so the lookup
+//! at pause time is a dict + list dereference. Pass `--raw-pdb` to
+//! opt out and launch `python -m pdb` directly.
+//!
 //! ### Still missing (deferred)
 //!
-//! - v1 maps **entry** breakpoints only; v2 (deferred) will map
-//!   step-throughs back to Typhon lines via pdb hooks (e.g. an
-//!   inheriting `Pdb` subclass that displays the `.ty` location each
-//!   time the program pauses).
 //! - When a `--break` spec cannot be resolved (missing sidecar, line
 //!   unmapped) the launcher prints a warning to stderr and continues
 //!   without that breakpoint rather than aborting.
+//! - The pdb command-line UI still shows `.py` paths in the prompt;
+//!   only the post-pause attribution line is rewritten. A future v3
+//!   layer could translate `where` / `list` output as well.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -70,6 +80,16 @@ pub struct DebugArgs {
     /// Skip rebuilding; assume the `build/` directory is already current.
     #[arg(long)]
     pub no_build: bool,
+
+    /// Disable the Typhon-aware pdb subclass. By default `tyc debug`
+    /// generates a small wrapper that surfaces the `.ty:line` location
+    /// on every pause (entry, breakpoint, step, exception). Pass
+    /// `--raw-pdb` to launch `python3 -m pdb` directly with no extra
+    /// presentation layer. The wrapper requires `--debugger pdb`
+    /// (the default); selecting a different debugger automatically
+    /// disables it.
+    #[arg(long)]
+    pub raw_pdb: bool,
 }
 
 /// A parsed `<ty-file>:<line>` breakpoint specification.
@@ -249,35 +269,197 @@ pub fn run(args: DebugArgs) -> Result<()> {
         }
     }
 
-    // 4. Launch `<python> -m <debugger> [-c "break ..."]* <entry> [args...]`.
-    //    The debugger inherits stdin/stdout/stderr so the user gets a
-    //    fully interactive session.
-    eprintln!(
-        "tyc debug: launching {} -m {} '{}'",
-        args.python,
-        args.debugger,
-        entry.display()
-    );
-    eprintln!(
-        "tyc debug: (frames show emitted .py paths; pipe tracebacks through `tyc trace` to remap)"
-    );
+    // 4. Decide whether to launch the Typhon-aware wrapper or fall
+    //    back to plain `python -m <debugger>`.
+    let use_wrapper = !args.raw_pdb && args.debugger == "pdb";
+
+    let mut wrapper_guard: Option<tempfile::NamedTempFile> = None;
 
     let mut cmd = Command::new(&args.python);
-    cmd.arg("-m").arg(&args.debugger);
-    for c in &pdb_cmds {
-        cmd.arg("-c").arg(c);
+    if use_wrapper {
+        let wrapper_path = write_typhon_pdb_wrapper(&out_dir, &entry, &pdb_cmds)
+            .map_err(|e| miette!("cannot write Typhon pdb wrapper: {e}"))?;
+        eprintln!(
+            "tyc debug: launching {} '{}' (Typhon-aware pdb)",
+            args.python,
+            wrapper_path.path().display()
+        );
+        eprintln!(
+            "tyc debug: pauses will surface as `[ty] <src>/file.ty:line` next to the `.py` frame"
+        );
+        cmd.arg(wrapper_path.path());
+        cmd.args(&args.script_args);
+        wrapper_guard = Some(wrapper_path);
+    } else {
+        eprintln!(
+            "tyc debug: launching {} -m {} '{}'",
+            args.python,
+            args.debugger,
+            entry.display()
+        );
+        eprintln!(
+            "tyc debug: (frames show emitted .py paths; pipe tracebacks through `tyc trace` to remap)"
+        );
+        cmd.arg("-m").arg(&args.debugger);
+        for c in &pdb_cmds {
+            cmd.arg("-c").arg(c);
+        }
+        cmd.arg(&entry);
+        cmd.args(&args.script_args);
     }
-    cmd.arg(&entry);
-    cmd.args(&args.script_args);
 
     let status = cmd
         .status()
         .map_err(|e| miette!("cannot spawn '{}': {e}", args.python))?;
 
+    // Keep the wrapper alive until the debugger exits.
+    drop(wrapper_guard);
+
     if !status.success() {
         return Err(miette!("{} exited with {}", args.debugger, status));
     }
     Ok(())
+}
+
+/// Write a one-shot Python wrapper script to a tempfile that subclasses
+/// `pdb.Pdb`, loads the project's `.py.map` sidecars, and prints the
+/// originating `.ty:line` next to every paused frame.
+///
+/// The wrapper returns a [`tempfile::NamedTempFile`]. Caller is
+/// responsible for keeping it alive until the child process exits —
+/// dropping the handle deletes the file.
+fn write_typhon_pdb_wrapper(
+    out_dir: &Path,
+    entry: &Path,
+    breakpoint_cmds: &[String],
+) -> std::io::Result<tempfile::NamedTempFile> {
+    use std::io::Write;
+    let entry_str = entry.display().to_string();
+    let map_dir = out_dir.display().to_string();
+    // Quoting strategy: use repr() at the Python end by emitting the
+    // path strings with `\` escaped and the value embedded between
+    // double quotes. That handles spaces and most punctuation on POSIX;
+    // on Windows the same `\` escaping keeps the literal valid.
+    let escape = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let entry_esc = escape(&entry_str);
+    let map_dir_esc = escape(&map_dir);
+    let break_cmds: String = breakpoint_cmds
+        .iter()
+        .map(|c| format!("    {:?},\n", c))
+        .collect();
+
+    let body = format!(
+        r#"# Generated by `tyc debug` — Typhon-aware pdb wrapper.
+#
+# Subclasses pdb.Pdb so every pause (entry, breakpoint, step, exception)
+# prints the originating .ty:line alongside the emitted .py frame. Maps
+# are loaded eagerly from the build directory so the lookup at pause
+# time is a dict-and-vec dereference, not a filesystem call.
+import json
+import os
+import pdb
+import sys
+import runpy
+
+
+_ENTRY = r"{entry_esc}"
+_BUILD_DIR = r"{map_dir_esc}"
+_BREAK_CMDS = [
+{break_cmds}]
+
+
+def _load_maps(build_dir):
+    """Return dict[py_path -> (ty_source, lines_table)].
+
+    Loads every `*.py.map` JSON sidecar under `build_dir` recursively.
+    Malformed sidecars are skipped silently — the worst case is that
+    a frame's `[ty]` annotation is missing, not that the debugger
+    fails to launch.
+    """
+    out = {{}}
+    for root, _dirs, files in os.walk(build_dir):
+        for name in files:
+            if not name.endswith(".py.map"):
+                continue
+            map_path = os.path.join(root, name)
+            try:
+                with open(map_path, "r", encoding="utf-8") as f:
+                    body = json.load(f)
+            except (OSError, ValueError):
+                continue
+            source = body.get("source")
+            if not isinstance(source, str):
+                continue
+            lines = body.get("lines")
+            if not isinstance(lines, list):
+                lines = []
+            py_path = map_path[:-4]  # strip ".map" → "foo.py"
+            out[os.path.abspath(py_path)] = (source, [int(x) for x in lines])
+    return out
+
+
+_MAPS = _load_maps(_BUILD_DIR)
+
+
+def _attribute(filename, lineno):
+    """Look the frame's (.py, py_line) up; return ".ty:ty_line" or None."""
+    if not filename:
+        return None
+    abs_path = os.path.abspath(filename)
+    entry = _MAPS.get(abs_path)
+    if entry is None:
+        return None
+    source, lines = entry
+    idx = lineno - 1
+    if 0 <= idx < len(lines):
+        ty_line = lines[idx]
+    else:
+        ty_line = lineno
+    return "{{}}:{{}}".format(source, ty_line)
+
+
+class TyphonPdb(pdb.Pdb):
+    """pdb.Pdb subclass that surfaces the .ty:line for the current frame."""
+
+    def print_stack_entry(self, frame_lineno, prompt_prefix=pdb.line_prefix):
+        super().print_stack_entry(frame_lineno, prompt_prefix)
+        frame, lineno = frame_lineno
+        attribution = _attribute(frame.f_code.co_filename, lineno)
+        if attribution is not None:
+            self.message("[ty] {{}}".format(attribution))
+
+
+def _main():
+    p = TyphonPdb()
+    for cmd in _BREAK_CMDS:
+        p.rcLines.append(cmd)
+    # Use runpy so the entry script behaves like `python entry.py`
+    # (its `__name__` is `__main__`, its `__file__` is `_ENTRY`, etc.).
+    sys.argv = [_ENTRY] + sys.argv[1:]
+    try:
+        p.run("runpy.run_path({{!r}}, run_name='__main__')".format(_ENTRY),
+              globals={{'runpy': runpy}}, locals=None)
+    except SystemExit:
+        raise
+    except BaseException:
+        p.interaction(None, sys.exc_info()[2])
+
+
+if __name__ == "__main__":
+    _main()
+"#,
+        entry_esc = entry_esc,
+        map_dir_esc = map_dir_esc,
+        break_cmds = break_cmds,
+    );
+
+    let mut tmp = tempfile::Builder::new()
+        .prefix("typhon-pdb-")
+        .suffix(".py")
+        .tempfile()?;
+    tmp.write_all(body.as_bytes())?;
+    tmp.flush()?;
+    Ok(tmp)
 }
 
 #[cfg(test)]
@@ -331,6 +513,7 @@ mod tests {
             breakpoints: vec![],
             script_args: vec![],
             no_build: true,
+            raw_pdb: false,
         };
         let err = run(args).expect_err("missing entry must fail");
         let msg = format!("{err:?}");
@@ -390,6 +573,55 @@ mod tests {
         // The `src/` prefix is stripped to match the emitter's layout.
         assert_eq!(py_path, out.join("foo.py"));
         assert_eq!(py_line, 3);
+    }
+
+    #[test]
+    fn typhon_pdb_wrapper_includes_entry_and_maps_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("build");
+        std::fs::create_dir_all(&out).unwrap();
+        let entry = out.join("main.py");
+        std::fs::write(&entry, "print('hi')\n").unwrap();
+        let cmds = vec!["break main.py:1".to_owned()];
+        let wrapper = write_typhon_pdb_wrapper(&out, &entry, &cmds).unwrap();
+        let body = std::fs::read_to_string(wrapper.path()).unwrap();
+        assert!(body.contains("class TyphonPdb(pdb.Pdb)"));
+        assert!(body.contains("[ty]"));
+        assert!(body.contains("break main.py:1"));
+        assert!(body.contains(entry.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn typhon_pdb_wrapper_python_parses() {
+        // The generated wrapper must be a syntactically valid Python
+        // module; run `python3 -m py_compile` on it. The test is
+        // skipped silently when no python3 is available so the
+        // workspace test suite stays portable.
+        let python3 = std::process::Command::new("python3")
+            .arg("-c")
+            .arg("import sys; sys.exit(0)")
+            .status();
+        if python3.is_err() || !python3.unwrap().success() {
+            eprintln!("skipping typhon_pdb_wrapper_python_parses: no python3 on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("build");
+        std::fs::create_dir_all(&out).unwrap();
+        let entry = out.join("main.py");
+        std::fs::write(&entry, "print('hi')\n").unwrap();
+        let wrapper = write_typhon_pdb_wrapper(&out, &entry, &[]).unwrap();
+        let status = std::process::Command::new("python3")
+            .arg("-m")
+            .arg("py_compile")
+            .arg(wrapper.path())
+            .status()
+            .expect("py_compile spawn");
+        assert!(
+            status.success(),
+            "generated wrapper failed py_compile: {}",
+            std::fs::read_to_string(wrapper.path()).unwrap_or_default()
+        );
     }
 
     #[test]
