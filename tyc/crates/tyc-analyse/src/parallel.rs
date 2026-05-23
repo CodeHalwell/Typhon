@@ -764,4 +764,124 @@ mod tests {
         let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
         assert_eq!(stats.rewrites, 0);
     }
+
+    // ── dict comprehensions ────────────────────────────────────────────────
+
+    #[test]
+    fn rewrites_pure_dictcomp_value_pure() {
+        // Pattern: {simple_key: f(x) for x in xs}
+        let src = "ys = {x: f(x) for x in xs}\n";
+        let mut m = parse(src);
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
+        assert_eq!(stats.rewrites, 1, "dict comprehension should rewrite");
+        let emit = tyc_emit::emit_python(&m);
+        assert!(
+            emit.contains("typhon_runtime.parallel.map_pure"),
+            "expected map_pure rewrite; got: {emit}"
+        );
+        // Should emit `{k: v for (k, v) in map_pure(...)}` not `dict(...)`
+        assert!(
+            !emit.contains("dict("),
+            "should not depend on the `dict` name; got: {emit}"
+        );
+        assert!(
+            emit.contains("for (_k, _v)") || emit.contains("for (_k,_v)"),
+            "expected tuple unpacking in comprehension; got: {emit}"
+        );
+    }
+
+    #[test]
+    fn rewrites_pure_dictcomp_key_pure() {
+        // Pattern: {f(x): simple_value for x in xs}
+        let src = "ys = {f(x): x for x in xs}\n";
+        let mut m = parse(src);
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
+        assert_eq!(stats.rewrites, 1, "dict comprehension should rewrite");
+        let emit = tyc_emit::emit_python(&m);
+        assert!(
+            emit.contains("typhon_runtime.parallel.map_pure"),
+            "expected map_pure rewrite; got: {emit}"
+        );
+        assert!(
+            !emit.contains("dict("),
+            "should not depend on the `dict` name; got: {emit}"
+        );
+    }
+
+    #[test]
+    fn rewrites_pure_dictcomp_literal_key() {
+        // Pattern: {literal: f(x) for x in xs}
+        let src = "ys = {'key': f(x) for x in xs}\n";
+        let mut m = parse(src);
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
+        assert_eq!(stats.rewrites, 1, "dict comprehension with literal key should rewrite");
+    }
+
+    #[test]
+    fn leaves_both_pure_dictcomp_alone() {
+        // Neither key nor value is simple — cannot rewrite
+        let src = "ys = {f(x): g(x) for x in xs}\n";
+        let mut m = parse(src);
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f", "g"]), 0);
+        assert_eq!(
+            stats.rewrites, 0,
+            "both key and value are pure calls — ineligible"
+        );
+    }
+
+    #[test]
+    fn leaves_both_simple_dictcomp_alone() {
+        // Both key and value are simple — no pure call
+        let src = "ys = {x: x for x in xs}\n";
+        let mut m = parse(src);
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
+        assert_eq!(stats.rewrites, 0, "no pure call present");
+    }
+
+    #[test]
+    fn leaves_filtered_dictcomp_alone() {
+        let src = "ys = {x: f(x) for x in xs if x > 0}\n";
+        let mut m = parse(src);
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
+        assert_eq!(stats.rewrites, 0, "filter must veto the rewrite");
+    }
+
+    #[test]
+    fn leaves_nested_dictcomp_alone() {
+        let src = "ys = {x: f(x) for row in rows for x in row}\n";
+        let mut m = parse(src);
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
+        assert_eq!(stats.rewrites, 0, "nested generators must veto the rewrite");
+    }
+
+    #[test]
+    fn leaves_impure_dictcomp_alone() {
+        let src = "ys = {x: g(x) for x in xs}\n";
+        let mut m = parse(src);
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
+        assert_eq!(stats.rewrites, 0, "impure callee must veto the rewrite");
+    }
+
+    #[test]
+    fn dictcomp_min_size_threshold_suppresses_short_literal_iters() {
+        let src = "ys = {x: f(x) for x in [1, 2, 3]}\n";
+        let mut m = parse(src);
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 64);
+        assert_eq!(
+            stats.rewrites, 0,
+            "literal iter shorter than threshold must not rewrite"
+        );
+    }
+
+    #[test]
+    fn dictcomp_min_size_threshold_passes_long_literal_iters() {
+        let elts = (0..64)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let src = format!("ys = {{x: f(x) for x in [{elts}]}}\n");
+        let mut m = parse(&src);
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 64);
+        assert_eq!(stats.rewrites, 1);
+    }
 }
