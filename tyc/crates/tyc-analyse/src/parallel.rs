@@ -30,8 +30,8 @@ use std::collections::HashSet;
 
 use ruff_python_ast::{
     name::Name, Arguments, AtomicNodeIndex, Comprehension, Expr, ExprAttribute, ExprCall,
-    ExprContext, ExprLambda, ExprListComp, ExprName, ExprSet, ExprSetComp, ExprStarred, ModModule,
-    Parameter, ParameterWithDefault, Parameters, Stmt,
+    ExprContext, ExprDictComp, ExprLambda, ExprListComp, ExprName, ExprSet, ExprSetComp,
+    ExprStarred, ExprTuple, ModModule, Parameter, ParameterWithDefault, Parameters, Stmt,
 };
 use ruff_text_size::TextRange;
 
@@ -170,6 +170,22 @@ fn rewrite_expr(expr: &mut Expr, ctx: &RewriteCtx<'_>, stats: &mut ParallelStats
             }
             rewrite_expr(&mut sc.elt, ctx, stats);
             if let Some(rewritten) = try_rewrite_setcomp(sc, ctx) {
+                *expr = rewritten;
+                stats.rewrites += 1;
+            }
+        }
+        Expr::DictComp(dc) => {
+            for gen in &mut dc.generators {
+                rewrite_expr(&mut gen.iter, ctx, stats);
+                for f in &mut gen.ifs {
+                    rewrite_expr(f, ctx, stats);
+                }
+            }
+            if let Some(ref mut key) = dc.key {
+                rewrite_expr(key, ctx, stats);
+            }
+            rewrite_expr(&mut dc.value, ctx, stats);
+            if let Some(rewritten) = try_rewrite_dictcomp(dc, ctx) {
                 *expr = rewritten;
                 stats.rewrites += 1;
             }
@@ -320,6 +336,123 @@ fn try_rewrite_setcomp(sc: &ExprSetComp, ctx: &RewriteCtx<'_>) -> Option<Expr> {
         range: sc.range,
         node_index: AtomicNodeIndex::NONE,
         elts: vec![starred],
+    }))
+}
+
+/// Attempt the rewrite on a dict comprehension. The eligibility rules
+/// are similar to list/set comprehensions, but must handle both key and
+/// value expressions. Only one of `key` or `value` may be a pure call;
+/// the other must be a simple name or literal. The result wraps the
+/// parallel map in `dict(map_pure(...))` — we use the `dict()` builtin
+/// rather than a dict-display literal with unpacking because the lambda
+/// must return key-value tuples, and `{**(k, v) for ...}` is invalid syntax.
+fn try_rewrite_dictcomp(dc: &ExprDictComp, ctx: &RewriteCtx<'_>) -> Option<Expr> {
+    // Single generator, no filters, no async
+    if dc.generators.len() != 1 {
+        return None;
+    }
+    let gen = &dc.generators[0];
+    if gen.is_async || !gen.ifs.is_empty() {
+        return None;
+    }
+    let target_name = match &gen.target {
+        Expr::Name(n) => n.id.as_str().to_owned(),
+        _ => return None,
+    };
+
+    // Check min-size threshold
+    if let Some(literal_len) = literal_iter_len(&gen.iter) {
+        if literal_len < ctx.min_size {
+            return None;
+        }
+    }
+
+    // Determine which of key/value contains the pure call
+    let key = dc.key.as_ref()?;
+    let value = dc.value.as_ref();
+
+    // Helper to check if an expression is a simple name or literal
+    let is_simple = |e: &Expr| matches!(e, Expr::Name(_) | Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::BooleanLiteral(_) | Expr::NoneLiteral(_));
+
+    // Helper to check if an expression is a pure call on the target
+    let is_pure_call_on_target = |e: &Expr| -> Option<String> {
+        let call = match e {
+            Expr::Call(c) => c,
+            _ => return None,
+        };
+        let callee_name = match call.func.as_ref() {
+            Expr::Name(n) => n.id.as_str().to_owned(),
+            _ => return None,
+        };
+        if !ctx.pure.contains(&callee_name) {
+            return None;
+        }
+        if !call.arguments.keywords.is_empty() || call.arguments.args.len() != 1 {
+            return None;
+        }
+        let arg_is_target = matches!(
+            call.arguments.args.first(),
+            Some(Expr::Name(n)) if n.id.as_str() == target_name
+        );
+        if !arg_is_target {
+            return None;
+        }
+        Some(callee_name)
+    };
+
+    // Try to determine the rewrite pattern:
+    // Case 1: {key_expr: f(x) for x in xs} where key_expr is simple
+    // Case 2: {f(x): value_expr for x in xs} where value_expr is simple
+    let (lambda_body_key, lambda_body_value) = if is_simple(key) {
+        // value must be the pure call
+        if is_pure_call_on_target(value).is_some() {
+            // Lambda returns (key_expr, f(x))
+            (key.as_ref().clone(), value.clone())
+        } else {
+            return None;
+        }
+    } else if is_simple(value) {
+        // key must be the pure call
+        if is_pure_call_on_target(key).is_some() {
+            // Lambda returns (f(x), value_expr)
+            (key.as_ref().clone(), value.clone())
+        } else {
+            return None;
+        }
+    } else {
+        // Neither pattern matches
+        return None;
+    };
+
+    // Build lambda that returns a tuple (key, value)
+    let tuple = Expr::Tuple(ExprTuple {
+        range: dc.range,
+        node_index: AtomicNodeIndex::NONE,
+        elts: vec![lambda_body_key, lambda_body_value],
+        ctx: ExprContext::Load,
+        parenthesized: false,
+    });
+
+    let map_call = build_map_pure_call(dc.range, target_name, gen.iter.clone(), tuple);
+
+    // Wrap in dict(...) call
+    let dict_name = Expr::Name(ExprName {
+        range: dc.range,
+        node_index: AtomicNodeIndex::NONE,
+        id: Name::new_static("dict"),
+        ctx: ExprContext::Load,
+    });
+
+    Some(Expr::Call(ExprCall {
+        range: dc.range,
+        node_index: AtomicNodeIndex::NONE,
+        func: Box::new(dict_name),
+        arguments: Arguments {
+            range: dc.range,
+            node_index: AtomicNodeIndex::NONE,
+            args: vec![map_call].into_boxed_slice(),
+            keywords: Vec::new().into_boxed_slice(),
+        },
     }))
 }
 

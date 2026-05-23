@@ -22,21 +22,23 @@
 //!
 //! When the default `pdb` debugger is used (the common case), the
 //! launcher writes a small Python wrapper that subclasses `pdb.Pdb`
-//! and overrides `print_stack_entry` to print `[ty] <src>:<line>`
-//! alongside the standard `.py` frame on every pause (entry,
-//! breakpoint, step, exception). The wrapper eagerly loads every
-//! `.py.map` sidecar in the build directory on startup so the lookup
-//! at pause time is a dict + list dereference. Pass `--raw-pdb` to
-//! opt out and launch `python -m pdb` directly.
+//! and overrides presentation methods to surface Typhon source
+//! locations instead of emitted `.py` paths:
+//!
+//! - `print_stack_entry` — prints `[ty] <src>:<line>` on every pause
+//! - `do_list` — shows `.ty` source code instead of `.py`
+//! - `do_where` — annotates each frame with its `.ty` location
+//! - `prompt` — displays the current `.ty:line` in the pdb prompt
+//!
+//! The wrapper eagerly loads every `.py.map` sidecar in the build
+//! directory on startup so lookups are dictionary + list dereferences.
+//! Pass `--raw-pdb` to opt out and launch `python -m pdb` directly.
 //!
 //! ### Still missing (deferred)
 //!
 //! - When a `--break` spec cannot be resolved (missing sidecar, line
 //!   unmapped) the launcher prints a warning to stderr and continues
 //!   without that breakpoint rather than aborting.
-//! - The pdb command-line UI still shows `.py` paths in the prompt;
-//!   only the post-pause attribution line is rewritten. A future v3
-//!   layer could translate `where` / `list` output as well.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -422,6 +424,52 @@ def _attribute(filename, lineno):
     return "{{}}:{{}}".format(source, ty_line)
 
 
+def _get_ty_path_and_line(filename, lineno):
+    """Return (ty_path, ty_line) or None if unmapped."""
+    if not filename:
+        return None
+    abs_path = os.path.abspath(filename)
+    entry = _MAPS.get(abs_path)
+    if entry is None:
+        return None
+    source, lines = entry
+    idx = lineno - 1
+    if 0 <= idx < len(lines):
+        ty_line = lines[idx]
+    else:
+        ty_line = lineno
+    return (source, ty_line)
+
+
+def _read_ty_source(ty_path):
+    """Read the .ty source file and return lines or None if not found."""
+    # Try resolving the path relative to _BUILD_DIR first
+    # The ty_path from the map is relative to the project source root
+    # We need to find the actual .ty file on disk
+    # Since we're in the build directory context, we walk up to find the project root
+    build_dir = os.path.abspath(_BUILD_DIR)
+    # Heuristic: project root is likely the parent or grandparent of build dir
+    candidates = []
+    # Try current directory (where the script was invoked)
+    candidates.append(os.path.join(os.getcwd(), ty_path))
+    # Try relative to build dir's parent (common case: build/ is sibling to src/)
+    if os.path.dirname(build_dir):
+        candidates.append(os.path.join(os.path.dirname(build_dir), ty_path))
+    # Try relative to build dir's grandparent
+    grandparent = os.path.dirname(os.path.dirname(build_dir))
+    if grandparent:
+        candidates.append(os.path.join(grandparent, ty_path))
+
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            try:
+                with open(candidate, 'r', encoding='utf-8') as f:
+                    return f.readlines()
+            except (OSError, UnicodeDecodeError):
+                continue
+    return None
+
+
 class TyphonPdb(pdb.Pdb):
     """pdb.Pdb subclass that surfaces the .ty:line for the current frame."""
 
@@ -431,6 +479,101 @@ class TyphonPdb(pdb.Pdb):
         attribution = _attribute(frame.f_code.co_filename, lineno)
         if attribution is not None:
             self.message("[ty] {{}}".format(attribution))
+
+    def do_list(self, arg):
+        """Override list command to show .ty source instead of .py."""
+        # Get current frame info
+        if self.curframe is None:
+            self.error("No frame selected")
+            return
+
+        filename = self.curframe.f_code.co_filename
+        lineno = self.curframe.f_lineno
+
+        # Try to map to .ty source
+        ty_info = _get_ty_path_and_line(filename, lineno)
+        if ty_info is None:
+            # Fall back to default pdb behavior for unmapped files
+            return super().do_list(arg)
+
+        ty_path, ty_line = ty_info
+        ty_lines = _read_ty_source(ty_path)
+        if ty_lines is None:
+            # Fall back if we can't read the .ty file
+            self.message("Cannot read .ty source: {{}}".format(ty_path))
+            return super().do_list(arg)
+
+        # Parse the argument to determine the range to display
+        # arg can be: empty (show around current line), line number, or range
+        first = None
+        last = None
+        if arg:
+            try:
+                if ',' in arg:
+                    # Range: "first,last"
+                    parts = arg.split(',')
+                    first = int(parts[0])
+                    last = int(parts[1])
+                else:
+                    # Single line or function name
+                    first = int(arg)
+                    last = first + 10
+            except ValueError:
+                # Function name or invalid - fall back to default
+                return super().do_list(arg)
+
+        if first is None:
+            # Show 11 lines around current line (5 before, current, 5 after)
+            first = max(1, ty_line - 5)
+            last = ty_line + 5
+
+        # Ensure bounds
+        first = max(1, first)
+        last = min(len(ty_lines), last)
+
+        # Display the lines
+        self.message("[ty] {{}}:".format(ty_path))
+        for i in range(first, last + 1):
+            if i - 1 < len(ty_lines):
+                line = ty_lines[i - 1].rstrip()
+                marker = '->' if i == ty_line else '  '
+                self.message("{{}} {{:4d}}  {{}}".format(marker, i, line))
+
+    def do_where(self, arg):
+        """Override where command to annotate frames with .ty lines."""
+        # Call the parent to print the standard stack trace
+        super().do_where(arg)
+        # Then print .ty annotations for each frame
+        self.message("\nTyphon source locations:")
+        stack, curindex = self.stack, self.curindex
+        for frame_lineno in stack:
+            frame, lineno = frame_lineno
+            attribution = _attribute(frame.f_code.co_filename, lineno)
+            if attribution is not None:
+                self.message("  [ty] {{}}".format(attribution))
+
+    # Override the prompt to include .ty location
+    def _get_prompt(self):
+        """Build the pdb prompt with .ty location if available."""
+        # Default prompt format
+        if self.curframe is None:
+            return "(Pdb) "
+
+        filename = self.curframe.f_code.co_filename
+        lineno = self.curframe.f_lineno
+        attribution = _attribute(filename, lineno)
+
+        if attribution is not None:
+            return "([ty] {{}}) ".format(attribution)
+        else:
+            return "(Pdb) "
+
+    # Override the prompt property (varies by Python version)
+    # In Python 3.x, the prompt is set via the _get_prompt method
+    # which is called by the cmdloop
+    @property
+    def prompt(self):
+        return self._get_prompt()
 
 
 def _main():
