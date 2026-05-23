@@ -7,7 +7,7 @@ sidebar:
 
 import { Aside } from '@astrojs/starlight/components';
 
-Typhon is in **active development**. The minimum-viable language — non-null types, sealed unions, `Result[T, E]`, dataclass-emit classes — is shippable today. Phase 5 (interop and developer experience) shipped in [v0.1.6](https://github.com/CodeHalwell/Typhon/releases/tag/v0.1.6); Phase 5.5 (constructor / method arity safety) shipped in [v0.2.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.2.0); Phase 6 (Python-annoyances surface) shipped in [v0.3.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.0) with `newtype`, `freeze let`, `pub`, three new effect/safety diagnostics (`blocking_in_async`, `resource_not_managed`, `div_by_zero_literal`), every open finding from the May 2026 stress campaigns closed, and pre-built install artifacts for **Linux** and **Windows** alongside the existing **macOS** binaries. [v0.3.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.1) is a correctness point release that closes the 2026-05-22 stress round (N1–N13: three CRITICAL silent-wrong-output bugs in emit / VM, five HIGH, two MEDIUM, three LOW), adds the `tyc::duplicate_method` diagnostic plus typed tuple-unpacking `let`, rewrites `Generic[T]` → PEP 695 in `tyc migrate`, gates `tyc run` behind a real static check, and lands an LSP / `tyc check` polish pass (semantic class kinds, grouped diagnostics, surfaced introspection failures, batched venv signatures). Most of the more advanced features (interfaces, comptime, lazy loading, automatic gather, free-threaded parallelism, the package-manager surface, the REPL, the debugger launcher, the migrator) are also landed; what remains is polish.
+Typhon is in **active development**. The minimum-viable language — non-null types, sealed unions, `Result[T, E]`, dataclass-emit classes — is shippable today. Phase 5 (interop and developer experience) shipped in [v0.1.6](https://github.com/CodeHalwell/Typhon/releases/tag/v0.1.6); Phase 5.5 (constructor / method arity safety) shipped in [v0.2.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.2.0); Phase 6 (Python-annoyances surface) shipped in [v0.3.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.0) with `newtype`, `freeze let`, `pub`, three new effect/safety diagnostics (`blocking_in_async`, `resource_not_managed`, `div_by_zero_literal`), every open finding from the May 2026 stress campaigns closed, and pre-built install artifacts for **Linux** and **Windows** alongside the existing **macOS** binaries. [v0.3.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.1) is a correctness point release that closes the 2026-05-22 stress round (N1–N13: three CRITICAL silent-wrong-output bugs in emit / VM, five HIGH, two MEDIUM, three LOW). [v0.4.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.4.0) is a type-checker correctness sweep (bool ⊆ int, subclass-constructor inheritance, dotted-attribute annotations, missing_field_init escapes, De Morgan narrowing, triple-quoted round-trip) on top of a third stress round. [v0.5.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.5.0) is the post-v0.4 roadmap-sweep release that closes seven Phase 4+ items plus four follow-up epics: Salsa cache shared across the LSP check path, `tyc debug` reads in full Typhon coordinates, dict-comp parallelisation, the `Type::TypeConstructor` foundation for higher-kinded types, comptime types-as-values, three new `tyc migrate` rewrites (frozen dataclasses → `class X frozen:`, Protocol → `interface`, `NewType` → `newtype`), and an opt-in PyPI corpus sweep harness. Most of the more advanced features (interfaces, comptime, lazy loading, automatic gather, free-threaded parallelism, the package-manager surface, the REPL, the debugger launcher, the migrator) are also landed; what remains is polish.
 
 The canonical per-feature status lives in the [Roadmap](/Typhon/project/roadmap/). This page is a quick summary.
 
@@ -55,6 +55,55 @@ The canonical per-feature status lives in the [Roadmap](/Typhon/project/roadmap/
 
 - ✅ CI (`cargo fmt`, `clippy -D warnings`, `cargo test --workspace`, `cargo-deny`).
 - ✅ Generated `typhon_runtime/` ships as local source — no PyPI dependency.
+
+## Landed in v0.5.0 (post-v0.4 roadmap sweep)
+
+The v0.5.0 release lands the seven Phase 4+ items shipped on PR #105 plus four follow-up epics (PRs #110, #111, #112, #113) that close the open frontier work flagged during that sweep.
+
+### Incremental compilation
+
+- ✅ **Salsa cache shared across `check_file_with_imports`.** New `preprocessed_full` tracked query returns the full `PreprocessResult` so `preprocessed_text`, `resolved_module`, `module_decl_names`, and the new `check_source_file_with_imports` entry point all share one preprocess pass per revision. The LSP now calls the SourceFile-backed entry directly so a per-keystroke cross-module check hits the cached parse + resolve on every unchanged sibling.
+- ✅ **Eliminated double-resolve in `check_source_file_with_imports`.** `ArcResolvedModule` now carries the resolver diagnostics alongside the resolved module (both behind `Arc` for pointer-equality `salsa::Update`), so the second `resolve_module_with` call that previously ran just to harvest diagnostics is gone.
+
+### `tyc debug` and `tyc ty`
+
+- ✅ **Typhon-aware pdb wrapper.** `tyc debug` writes a one-shot Python wrapper that subclasses `pdb.Pdb` and prints `[ty] <src>:<line>` after every pause; it loads every `.py.map` sidecar under the build directory at startup.
+- ✅ **Full UI translation.** The pdb subclass overrides `do_list`, `do_where`, `format_stack_entry`, and the `prompt` property so the entire debugger surface reads `.ty` coordinates. Source-snippet rendering (`list`) reads the `.ty` file slice when a `.py.map` resolves the source path.
+- ✅ **`tyc ty` diagnostic remapper handles paths with spaces.** `parse_py_ref` walks left from each `.py:` occurrence and yields successively longer candidate prefixes, taking the longest match that corresponds to a real `.py.map` sidecar.
+
+### `tyc migrate`
+
+- ✅ **Three new line-level rewrites.** `@dataclass(frozen=True[, ...])` (and `@dataclasses.dataclass`) → `class X frozen:`; `class X(Protocol):` / `class X(Protocol[T]):` → `interface X:` / `interface X[T]:`; module-level `NAME = NewType("NAME", BASE)` → `newtype NAME = BASE`. Matching `Protocol` / `NewType` `from typing import …` entries are pruned alongside.
+
+### Type checker
+
+- ✅ **Cross-function field-init audit.** A pre-scan recognises the trivial factory-helper shape `def make(): return X.__new__(X)` (and the two-statement `obj = X.__new__(X); return obj` variant). Call sites `let c = make()` register the LHS as a tracked uninit instance so a downstream escape fires `tyc::missing_field_init`.
+- ✅ **Variance table expansion.** `generic_param_variance` gains `AsyncContextManager`, `KeysView`, `ValuesView`, `ItemsView`, `Type` / `type`, and `Counter`.
+- ✅ **Higher-Kinded Types foundation.** New `Type::TypeConstructor { name, arity }` variant represents type constructors with unbound parameters. `type_from_annotation` recognises `F[_]` parameter syntax inside class / function generic parameter lists; `walk_typevars` traverses the new variant. The full unification surface is staged on this scaffold; the design doc `TYPE_SYSTEM_FRONTIER.md` records the deferred work.
+
+### Analyser
+
+- ✅ **Parallel comprehensions: set-comp and dict-comp support.** `{f(x) for x in xs}` rewrites to `set(typhon_runtime.parallel.map_pure(lambda x: f(x), xs))`; `{k_expr: f(v) for k, v in items}` rewrites to a dict-literal unpack form that avoids `dict` shadowing. Both opt-in via `[strictness] auto-parallel`.
+- ✅ **`comptime` types-as-values.** New `ComptimeValue::Type(String)` variant lets `comptime let T: type = int` round-trip through the comptime evaluator. The bare-name resolution covers the eight primitive heads (`int`, `str`, `bool`, `float`, `bytes`, `None`, `type`, `object`); `Any` is intentionally rejected unless imported.
+
+### Test infrastructure
+
+- ✅ **Third-party Python corpus round-trip sweep.** `stress/third-party-py-corpus/` ships six representative Python fixtures and the integration test `third_party_corpus_round_trips_cleanly` exercises the full `tyc migrate` → `tyc check` chain on each.
+- ✅ **PyPI sweep harness.** `stress/pypi-sweep/sweep.py` pip-installs typed packages into a tempdir, runs `tyc migrate` + `tyc build`, and semantic-diffs smoke-script output. Opt-in nightly; not wired into per-PR CI.
+- ✅ **`python_semantic_drift` audit round 4.** `stress/round-2026-05-23-drift-round-4/` ships 17 fresh probes covering walrus-in-comprehension, augmented-assignment narrowing, `yield from`, match-pattern `*` capture, string multiplication, `raise X from Y`, and `f(*args, **kwargs)` unpacking. All probes accept.
+- ✅ **Inter-procedural field-init audit design.** `stress/interprocedural-audit-design.md` records the summary-IR sketch for generalising the trivial-factory audit to multi-step factories.
+
+## Landed in v0.4.0 (type-checker correctness sweep)
+
+- ✅ **`bool ⊆ int` subtype widening.** `let x: int = True`, `1 + True`, `-True` now type-check the way CPython evaluates them. One-way only — `let b: bool = 1` still rejects.
+- ✅ **Subclass constructors see inherited fields.** `effective_class_shape()` walks the inheritance chain (parent fields first, child overrides on collision, cycle guard).
+- ✅ **Dotted-attribute annotations resolve to the foreign class shape.** `let c: foo.ApiClient = ...` produces `Class("foo.ApiClient")` matching call-site convention.
+- ✅ **`tyc::missing_field_init` catches container-literal + alias escapes.** Partially-initialised instances escaping via `let configs: list[Config] = [c]` or `let alias: Config = c` no longer slip past.
+- ✅ **Fixed-arity tuple covariance on every slot.** `tuple[int, int]` now widens slot 0 and slot 1 uniformly. Mutable-container invariance unchanged.
+- ✅ **De Morgan narrowing on `not (A or B)`.** `if not (x is None or y is None): use(x, y)` correctly refines both names in the post-`if` branch.
+- ✅ **Triple-quoted strings round-trip as triple-quoted.** Multi-line docstrings stop emitting as single-line `\n`-escaped blobs.
+- ✅ **Corpus round-trip CI sweep.** Every `.ty` under `examples/` must `tyc check` clean on every PR.
+- ✅ **266 vendored Ruff insta tests re-enabled** across `ruff_python_parser` / `ruff_python_ast` / `ruff_text_size`.
 
 ## Landed in v0.3.1 (correctness follow-up)
 
@@ -105,7 +154,7 @@ The canonical per-feature status lives in the [Roadmap](/Typhon/project/roadmap/
 ## Landed in Phase 4+
 
 - ✅ Automatic `asyncio.gather` inference (opt-in via `[strictness] auto-gather`).
-- ✅ Loop parallelisation for pure list comprehensions on free-threaded Python (opt-in via `[strictness] auto-parallel`, threshold `parallel-min-size`).
+- ✅ Loop parallelisation for pure list / set / dict comprehensions on free-threaded Python (opt-in via `[strictness] auto-parallel`, threshold `parallel-min-size`). Dict-comp coverage landed in v0.5.0.
 - ✅ PGO via `tyc profile` (opt-in via `[strictness] pgo-memoise`).
 - ✅ LSP completions (including venv-driven member-access introspection and from-import members from sibling project files) and "Remove unused import" code action.
 - ✅ Cross-file go-to-definition across `.ty` / `.py` boundaries.
@@ -113,19 +162,23 @@ The canonical per-feature status lives in the [Roadmap](/Typhon/project/roadmap/
 - ✅ `tyc repl`, `tyc debug`, `tyc run` (with the `tyc-vm` interpreter as default).
 - ✅ `tyc add` / `remove` / `sync` package-manager surface over `uv`.
 - ✅ `tyc stubtest` runtime probe via `mypy.stubtest`.
+- ✅ `comptime` types-as-values via `ComptimeValue::Type` (v0.5.0). The frontier work — types flowing into annotations through emit — is staged on this variant.
+- ✅ HKT foundation (`Type::TypeConstructor`, `F[_]` parameter syntax) shipped in v0.5.0. The unification piece is the remaining work.
+- ✅ Cross-function field-init audit (trivial factory helpers, v0.5.0).
+- ✅ Native debugger UI translation: `do_list`, `do_where`, `format_stack_entry`, prompt all read `.ty` coordinates (v0.5.0).
 
 ## Deferred
 
 These items appear on the roadmap but are not actively being worked. They will land when the value justifies the effort.
 
-- ⏳ Richer `comptime`: full `for` loops in `comptime def`, broader stdlib surface inside the sandbox, types as values.
-- ⏳ Full structural subtyping with proper variance and bounded higher-kinded forms. Current implementation handles single-argument bounds and recursive structural conformance; complex multi-argument constraint solving is partial.
-- ⏳ `ty` integration as an embedded library (currently a subprocess call via `tyc ty`).
-- ⏳ A Typhon-native source-mapping debugger UI (current `tyc debug` is a `pdb` launcher with `--break <ty>:<line>` translation; a TUI that displays `.ty` source in stack frames is still pending).
-- ⏳ Broader `tyc::python_semantic_drift` audit beyond the two cases already fixed (`or`/`and` typing, generator → `Iterable`).
-- ⏳ Corpus round-trip sweep across a representative set of third-party Python projects.
-- ⏳ `[emit] model-extra` knob to relax Pydantic `extra="forbid"`. (Currently the default is always `extra="forbid"`; the config key is documented as roadmap-only.)
-- ⏳ Async public-API stability rules if Phase 4+ ever introduces async inference. (Likely answer: inference applies to file-internal functions only; exported functions stay explicit.)
+- ⏳ **Full HKT unification.** v0.5.0 ships the `Type::TypeConstructor` variant and `F[_]` parameter-syntax recognition, but `bind_typevars_and_substitute` does not yet unify constructor application. See [`TYPE_SYSTEM_FRONTIER.md`](https://github.com/CodeHalwell/Typhon/blob/main/TYPE_SYSTEM_FRONTIER.md) for the design sketch.
+- ⏳ **Variance inference on user-declared generics.** Today's default is invariant; mypy / pyright-style classification (covariant when `T` only appears in read positions, contravariant in write positions) is the next step.
+- ⏳ **General inter-procedural field-init audit.** v0.5.0 ships the trivial-factory case and a design doc (`stress/interprocedural-audit-design.md`) for the summary-IR generalisation; the implementation is the remaining work.
+- ⏳ **`ty` Phase 2** — embedded library sharing the Salsa db (currently a subprocess call via `tyc ty`). See [docs/ty-integration.md](https://github.com/CodeHalwell/Typhon/blob/main/docs/ty-integration.md).
+- ⏳ **Cached parsed-module AST behind `salsa::Update`.** Today `check_source_file_with_imports` re-parses on every call; an `ArcParsedModule` wrapper would close that loop.
+- ⏳ **Accumulator-loop parallelisation.** `for x in xs: out.append(...)` still rewrites manually; the comprehension shape is the only auto-parallel form.
+- ⏳ **`[emit] model-extra` knob to relax Pydantic `extra="forbid"`.** Currently the default is always `extra="forbid"`; the config key is documented as roadmap-only.
+- ⏳ **Async public-API stability rules** if Phase 4+ ever introduces async inference on exported functions. (Likely answer: inference applies to file-internal functions only; exported functions stay explicit.)
 
 ## What "Phase X complete" means
 

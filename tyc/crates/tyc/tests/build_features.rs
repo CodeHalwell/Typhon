@@ -1539,6 +1539,83 @@ fn build_emits_codegen_artefact_regardless_of_bootstrap_outcome() {
     );
 }
 
+// ── comptime type values ────────────────────────────────────────────────────
+
+#[test]
+fn comptime_type_value_evaluates_and_emits() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(tmp.path(), "comptime let T: type = int\n");
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    assert!(
+        py.contains("T: type = int"),
+        "comptime type value should emit as bare type name; got:\n{py}"
+    );
+}
+
+#[test]
+fn comptime_type_value_multiple_types() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "comptime let T1: type = str\ncomptime let T2: type = int\n",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    assert!(
+        py.contains("T1: type = str"),
+        "comptime type value for str should emit; got:\n{py}"
+    );
+    assert!(
+        py.contains("T2: type = int"),
+        "comptime type value for int should emit; got:\n{py}"
+    );
+}
+
+#[test]
+fn comptime_type_value_rejects_any_without_import() {
+    // `Any` is not a runtime builtin; emitting it as a bare name would
+    // cause NameError unless the module imported it from `typing`.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(tmp.path(), "comptime let T: type = Any\n");
+    let out = tyc()
+        .args(["build", tmp.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "build must fail for comptime Any without import"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unknown name 'Any'"),
+        "error should mention 'Any'; got:\n{stderr}"
+    );
+}
+
+#[test]
+fn comptime_type_value_allows_runtime_builtins() {
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(
+        tmp.path(),
+        "comptime let T1: type = int\n\
+         comptime let T2: type = str\n\
+         comptime let T3: type = bool\n\
+         comptime let T4: type = float\n\
+         comptime let T5: type = bytes\n\
+         comptime let T6: type = type\n\
+         comptime let T7: type = object\n",
+    );
+    build(tmp.path());
+    let py = main_py(tmp.path());
+    for ty in ["int", "str", "bool", "float", "bytes", "type", "object"] {
+        assert!(
+            py.contains(&format!("type = {ty}")),
+            "comptime type value for {ty} should emit correctly; got:\n{py}"
+        );
+    }
+}
+
 // ── ensuring CARGO_BIN_EXE is set ───────────────────────────────────────────
 
 #[test]

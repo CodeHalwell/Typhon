@@ -363,15 +363,19 @@ regress under the Phase 5 churn:
   is a same-module `async def` and the awaits are statically independent.
   Opt-in via `[strictness] auto-gather = true`. The desugar pass injects
   `import asyncio` if missing.
-- ✅ **Loop parallelisation for pure list / set comprehensions**.
-  `tyc/crates/tyc-analyse/src/parallel.rs` rewrites `[f(x) for x in xs]`
-  and `{f(x) for x in xs}` into `typhon_runtime.parallel.map_pure(...)`
-  (the set-comp variant wraps in `set(...)` to preserve set semantics).
-  Opt-in via `[strictness] auto-parallel`. Dict comprehensions and
-  `for x in xs: out.append(...)` loops remain future work.
-- Richer comptime: `comptime` functions ✅. Types-as-values still
-  deferred (needs a new `ComptimeValue::Type` variant + type expression
-  emission, which spans the analyser, desugar, and emit crates).
+- ✅ **Loop parallelisation for pure list / set / dict comprehensions**.
+  `tyc/crates/tyc-analyse/src/parallel.rs` rewrites `[f(x) for x in xs]`,
+  `{f(x) for x in xs}`, and `{k: f(v) for k, v in items}` into
+  `typhon_runtime.parallel.map_pure(...)` (the set-comp variant wraps
+  in `set(...)`; the dict-comp variant uses a dict-literal unpack to
+  avoid shadowing). Opt-in via `[strictness] auto-parallel`.
+  `for x in xs: out.append(...)` accumulator loops remain future work.
+- ✅ **Richer comptime**. `comptime` functions and types-as-values both
+  ship in v0.5.0. New `ComptimeValue::Type(String)` variant lets
+  `comptime let T: type = int` round-trip through the comptime
+  evaluator; bare-name resolution covers `int`, `str`, `bool`, `float`,
+  `bytes`, `None`, `type`, `object`. `Any` is rejected unless imported
+  because the emitter cannot synthesise the import.
 - ✅ **PGO via `tyc profile`**. When `[strictness] pgo-memoise = true`,
   `tyc build` loads `typhon-profile.json` from the project root and
   promotes every `@pure` function whose observed call count meets
@@ -401,9 +405,28 @@ regress under the Phase 5 churn:
   - ✅ Phase 1: subprocess invocation of `ty check` via `tyc ty`, with
     diagnostic attribution via the `.py.map` source maps so `ty`'s
     `path.py:LINE[:COL]` references render as `path.ty:LINE[:COL]`.
-    Pass `--raw` to opt out. No dependency on the Ruff vendor.
+    Pass `--raw` to opt out. No dependency on the Ruff vendor. v0.5.0
+    extends the remapper's path scanner to handle paths with spaces
+    (longest-candidate lookup against the `.py.map` registry).
   - Phase 2 (deferred): embedded library sharing the Salsa db. See
     [docs/ty-integration.md](ty-integration.md) for the full plan.
+
+- ✅ **Native debugger UI translation**. `tyc debug` overrides the
+  pdb subclass's `do_list`, `do_where`, `format_stack_entry`, and
+  `prompt` so the entire debugger surface reads `.ty` paths and
+  source slices instead of the emitted `.py`. Source-snippet
+  rendering (`list`) reads the `.ty` file slice when a `.py.map`
+  resolves the source path. Shipped in v0.5.0.
+
+- **Higher-Kinded Types (HKT)**. v0.5.0 adds the foundation:
+  `Type::TypeConstructor { name, arity }` represents type
+  constructors with unbound parameters, and `type_from_annotation`
+  recognises `F[_]` parameter syntax in class / function generic
+  parameter lists. The full unification surface (constructor
+  application, kind inference, variance under HKT) is staged on
+  this scaffold but not yet wired into `bind_typevars_and_substitute`.
+  See [`TYPE_SYSTEM_FRONTIER.md`](../TYPE_SYSTEM_FRONTIER.md) for the
+  deferred work.
 
 ## Scope-cutting rule
 
@@ -414,30 +437,36 @@ The minimum-viable Typhon is **non-null types + sealed unions + `Result` + datac
 Phases 0–3 are complete. Phase 5 — interop and developer experience —
 shipped in v0.1.6. Phase 4+ work (everything not on the headline path):
 
-1. ✅ **Corpus round-trip sweep.** Two CI-gated tests in
-   `tyc/crates/tyc/tests/pipeline.rs`:
+1. ✅ **Corpus round-trip sweep.** Three CI-gated tests in
+   `tyc/crates/tyc/tests/pipeline.rs`, plus the nightly opt-in PyPI
+   harness:
    - `corpus_examples_all_check_clean` walks every `.ty` file under
      `examples/` and asserts `tyc check` exits 0 on each.
    - `third_party_corpus_round_trips_cleanly` walks every `.py` file
      under `stress/third-party-py-corpus/` and asserts the full
      `tyc migrate` → `tyc check` chain succeeds (covering the
      dataclass, Protocol, NewType, and PEP 695 rewrites).
-
-   The larger third-party-project sweep — real PyPI projects round-
-   tripped through `tyc build` + semantic diff against `python -m
-   foo.bar` output — remains future work.
+   - `stress/pypi-sweep/sweep.py` (opt-in nightly) pip-installs a
+     curated set of typed PyPI packages into a tempdir and round-
+     trips them through `tyc migrate` + `tyc build`, then
+     semantic-diffs smoke-script output against `python -m foo.bar`.
+     Default config: `attrs`, `click`, and a small Pydantic-using
+     package; results land in the sweep's `findings.md`.
 2. **Promote `bind_typevars_and_substitute` into a proper structural
    sub-type checker that handles variance and bounded higher-kinded
-   forms.** Still open frontier for Higher-Kinded Types and full
-   variance inference on user generics. The `generic_param_variance`
-   table now covers the common heads (list / dict / Mapping /
-   Callable / tuple / Sequence / Iterable / KeysView / ValuesView /
-   ItemsView / AsyncContextManager / Type / Counter / …) and the
-   bounded type-parameter check at the call site already dispatches
-   through `is_assignable`, which honours structural conformance
-   when the bound is an interface. What remains: variance inference
-   on user-declared generics (today's default is invariant), and HKT
-   support so `class Functor[F[_]]` can be expressed.
+   forms.** v0.5.0 adds the HKT scaffolding (`Type::TypeConstructor`
+   variant + `F[_]` param syntax recognition); what remains is the
+   unification piece — wiring the constructor through
+   `bind_typevars_and_substitute` so `F[A]` against `list[int]`
+   actually binds `F = list, A = int`. Variance inference on
+   user-declared generics is still future work (today's default is
+   invariant). The `generic_param_variance` table now covers the
+   common heads (list / dict / Mapping / Callable / tuple / Sequence
+   / Iterable / KeysView / ValuesView / ItemsView /
+   AsyncContextManager / Type / Counter / …) and the bounded
+   type-parameter check at the call site already dispatches through
+   `is_assignable`, which honours structural conformance when the
+   bound is an interface.
 3. ✅ **Salsa boundary.** `preprocessed_text`, `preprocessed_full`,
    `resolved_module`, `module_decl_names`, `check_diagnostics`, and
    `module_shapes_query` are all `#[salsa::tracked]`. The
@@ -449,18 +478,24 @@ shipped in v0.1.6. Phase 4+ work (everything not on the headline path):
    on every unchanged sibling. Only the type-check (which depends on
    the per-invocation cross-module shape registry) actually runs
    again.
-4. ✅ **Loop parallelisation for pure list comprehensions.**
-   `tyc/crates/tyc-analyse/src/parallel.rs` rewrites `[f(x) for x in
-   xs]` into `typhon_runtime.parallel.map_pure(f, xs)` when `f` is
-   pure, opt-in via `[strictness] auto-parallel`. Combine with
-   `[python] free-threaded = true` for real parallelism.
-5. **Broaden the `tyc::python_semantic_drift` audit.** Closed so
-   far: `or`/`and` truthy-union, `Generator → Iterable`, `bool ⊆
-   int` (assignment + arithmetic + unary), fixed-arity tuple
-   covariance, foreign-class BinOp no-over-promote, container-literal
-   escape detection. Three audit rounds catalogued in
-   `stress/round-2026-05-23-drift/`; the larger third-party corpus
-   sweep is still future work.
+4. ✅ **Loop parallelisation for pure list / set / dict
+   comprehensions.** `tyc/crates/tyc-analyse/src/parallel.rs`
+   rewrites `[f(x) for x in xs]`, `{f(x) for x in xs}`, and
+   `{k: f(v) for k, v in items}` into
+   `typhon_runtime.parallel.map_pure(...)` when `f` is pure, opt-in
+   via `[strictness] auto-parallel`. Combine with `[python]
+   free-threaded = true` for real parallelism.
+5. ✅ **Broaden the `tyc::python_semantic_drift` audit (round 4).**
+   Closed so far: `or`/`and` truthy-union, `Generator → Iterable`,
+   `bool ⊆ int` (assignment + arithmetic + unary), fixed-arity tuple
+   covariance, foreign-class BinOp no-over-promote, container-
+   literal escape detection. Four audit rounds catalogued — three
+   in `stress/round-2026-05-23-drift/`, the fourth in
+   `stress/round-2026-05-23-drift-round-4/` (17 fresh probes
+   covering walrus-in-comp, augmented-assignment narrowing, `yield
+   from`, match `*` capture, `raise X from Y`, `f(*args, **kwargs)`
+   unpacking; all probes accept). The larger third-party corpus
+   sweep is now the opt-in nightly `stress/pypi-sweep/`.
 6. ✅ **A Typhon-native source-mapping debugger** that drives
    breakpoints directly against `.ty` source instead of through
    `--break TY:LINE` translation on top of `pdb`. `tyc debug`
