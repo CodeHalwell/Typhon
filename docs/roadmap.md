@@ -142,8 +142,17 @@ Limitations carried forward (tracked in
   `let alias: Config = c` now fires `tyc::missing_field_init` at the
   assignment site. The target name is excluded from the check so
   `let c: T = ApiClient(...)` (rebinding the tracked name) doesn't
-  false-positive on its own LHS. The audit is still intra-procedural
-  — cross-function tracking would need a richer summary IR.
+  false-positive on its own LHS. The audit is intra-procedural for
+  the general case.
+- ~~Cross-function tracking would need a richer summary IR~~ — fixed
+  for the trivial factory-helper shape. A pre-scan recognises
+  `def make(): return X.__new__(X)` (and the two-statement variant
+  `obj = X.__new__(X); return obj`); call sites `let c = make()`
+  register the LHS as tracked and a downstream escape fires
+  `tyc::missing_field_init` as if the user had constructed the
+  partial instance inline. Helpers that do any intervening field
+  assignment are treated as initialising properly and are not
+  recorded. General inter-procedural data-flow remains future work.
 - Subclass constructors used to reject inherited fields
   (`Dog(name="Rex", breed="Husky")` for `class Dog(Animal):`) — also
   fixed in the same sweep via a new `effective_class_shape` helper that
@@ -354,8 +363,15 @@ regress under the Phase 5 churn:
   is a same-module `async def` and the awaits are statically independent.
   Opt-in via `[strictness] auto-gather = true`. The desugar pass injects
   `import asyncio` if missing.
-- Loop parallelisation for pure comprehensions on free-threaded Python.
-- Richer comptime: `comptime` functions, types as values.
+- ✅ **Loop parallelisation for pure list / set comprehensions**.
+  `tyc/crates/tyc-analyse/src/parallel.rs` rewrites `[f(x) for x in xs]`
+  and `{f(x) for x in xs}` into `typhon_runtime.parallel.map_pure(...)`
+  (the set-comp variant wraps in `set(...)` to preserve set semantics).
+  Opt-in via `[strictness] auto-parallel`. Dict comprehensions and
+  `for x in xs: out.append(...)` loops remain future work.
+- Richer comptime: `comptime` functions ✅. Types-as-values still
+  deferred (needs a new `ComptimeValue::Type` variant + type expression
+  emission, which spans the analyser, desugar, and emit crates).
 - ✅ **PGO via `tyc profile`**. When `[strictness] pgo-memoise = true`,
   `tyc build` loads `typhon-profile.json` from the project root and
   promotes every `@pure` function whose observed call count meets
@@ -371,13 +387,23 @@ regress under the Phase 5 churn:
   for every `tyc::unused_import` diagnostic in range. Cross-file
   go-to-definition across `.ty` / `.py` boundaries via source maps is
   still pending the v2 source-map format.
-- Migration tooling from typed `.py` to `.ty` (`Optional[T]` → `T?`, dataclasses → Typhon classes, etc.).
+- ✅ **Migration tooling from typed `.py` to `.ty`**.
+  `Optional[T]` → `T?`, dataclasses → Typhon classes,
+  `@dataclass(frozen=True)` → `class X frozen:`, `class X(Protocol):` →
+  `interface X:`, `NewType("X", T)` → `newtype X = T`, `TypeVar` +
+  `Generic[T]` → PEP 695. See `tyc/crates/tyc/src/commands/migrate.rs`.
+  The third-party-corpus sweep at
+  `stress/third-party-py-corpus/` round-trips representative
+  fixtures through `tyc migrate` + `tyc check` in CI
+  (`third_party_corpus_round_trips_cleanly`).
 - **`ty` integration** as a complementary second-stage checker over the
-  desugared Python. Planned in two phases: first as a subprocess
-  invocation of `ty check` with diagnostic attribution via the source
-  maps (no dependency on the Ruff vendor), later as an embedded
-  library sharing the Salsa db. See [docs/ty-integration.md](ty-integration.md)
-  for the full plan.
+  desugared Python. Planned in two phases:
+  - ✅ Phase 1: subprocess invocation of `ty check` via `tyc ty`, with
+    diagnostic attribution via the `.py.map` source maps so `ty`'s
+    `path.py:LINE[:COL]` references render as `path.ty:LINE[:COL]`.
+    Pass `--raw` to opt out. No dependency on the Ruff vendor.
+  - Phase 2 (deferred): embedded library sharing the Salsa db. See
+    [docs/ty-integration.md](ty-integration.md) for the full plan.
 
 ## Scope-cutting rule
 
@@ -388,26 +414,41 @@ The minimum-viable Typhon is **non-null types + sealed unions + `Result` + datac
 Phases 0–3 are complete. Phase 5 — interop and developer experience —
 shipped in v0.1.6. Phase 4+ work (everything not on the headline path):
 
-1. ✅ **Corpus round-trip sweep.** `corpus_examples_all_check_clean`
-   in `tyc/crates/tyc/tests/pipeline.rs` walks every `.ty` file under
-   `examples/` and asserts `tyc check` exits 0 on each. CI gates on
-   it. The third-party-project sweep (real Python projects round-
-   tripped through `tyc build` + semantic diff) remains future work.
+1. ✅ **Corpus round-trip sweep.** Two CI-gated tests in
+   `tyc/crates/tyc/tests/pipeline.rs`:
+   - `corpus_examples_all_check_clean` walks every `.ty` file under
+     `examples/` and asserts `tyc check` exits 0 on each.
+   - `third_party_corpus_round_trips_cleanly` walks every `.py` file
+     under `stress/third-party-py-corpus/` and asserts the full
+     `tyc migrate` → `tyc check` chain succeeds (covering the
+     dataclass, Protocol, NewType, and PEP 695 rewrites).
+
+   The larger third-party-project sweep — real PyPI projects round-
+   tripped through `tyc build` + semantic diff against `python -m
+   foo.bar` output — remains future work.
 2. **Promote `bind_typevars_and_substitute` into a proper structural
    sub-type checker that handles variance and bounded higher-kinded
-   forms.** Still open frontier — the existing
-   `generic_param_variance` table covers the common heads (list /
-   dict / Mapping / Callable / tuple / Sequence / Iterable / …) and
-   the fixed-arity tuple covariance fix from May 23 closed the most-
-   reported variance gap, but Higher-Kinded Types are not yet
-   inferred and bounded type parameters only do an arity-level check.
-3. **Salsa boundary.** `preprocessed_text`, `resolved_module`,
-   `check_diagnostics`, and `module_shapes_query` are all
-   `#[salsa::tracked]`; single-file LSP edits hit the cache.
-   `check_file_with_imports` (the multi-module build path) is the
-   remaining bypass — it re-parses and re-resolves every imported
-   module on every call rather than reading them through the tracked
-   queries. Wiring that up is the next concrete win.
+   forms.** Still open frontier for Higher-Kinded Types and full
+   variance inference on user generics. The `generic_param_variance`
+   table now covers the common heads (list / dict / Mapping /
+   Callable / tuple / Sequence / Iterable / KeysView / ValuesView /
+   ItemsView / AsyncContextManager / Type / Counter / …) and the
+   bounded type-parameter check at the call site already dispatches
+   through `is_assignable`, which honours structural conformance
+   when the bound is an interface. What remains: variance inference
+   on user-declared generics (today's default is invariant), and HKT
+   support so `class Functor[F[_]]` can be expressed.
+3. ✅ **Salsa boundary.** `preprocessed_text`, `preprocessed_full`,
+   `resolved_module`, `module_decl_names`, `check_diagnostics`, and
+   `module_shapes_query` are all `#[salsa::tracked]`. The
+   `check_file_with_imports` path (previously the bypass) now
+   delegates to a new `check_source_file_with_imports` entry that
+   takes a `SourceFile` handle and consumes the tracked
+   `preprocessed_full` + `resolved_module` outputs, so the LSP's
+   per-keystroke cross-module check hits the parse + resolve cache
+   on every unchanged sibling. Only the type-check (which depends on
+   the per-invocation cross-module shape registry) actually runs
+   again.
 4. ✅ **Loop parallelisation for pure list comprehensions.**
    `tyc/crates/tyc-analyse/src/parallel.rs` rewrites `[f(x) for x in
    xs]` into `typhon_runtime.parallel.map_pure(f, xs)` when `f` is
@@ -420,7 +461,13 @@ shipped in v0.1.6. Phase 4+ work (everything not on the headline path):
    escape detection. Three audit rounds catalogued in
    `stress/round-2026-05-23-drift/`; the larger third-party corpus
    sweep is still future work.
-6. **A Typhon-native source-mapping debugger** that drives
+6. ✅ **A Typhon-native source-mapping debugger** that drives
    breakpoints directly against `.ty` source instead of through
-   `--break TY:LINE` translation on top of `pdb`. Still open
-   frontier.
+   `--break TY:LINE` translation on top of `pdb`. `tyc debug`
+   now writes a one-shot Python wrapper that subclasses `pdb.Pdb`,
+   loads every `.py.map` sidecar at startup, and overrides
+   `print_stack_entry` so every pause (entry, breakpoint, step,
+   exception) prints `[ty] <src>:<line>` next to the standard `.py`
+   frame. `--break TY:LINE` translation still drives the breakpoints
+   themselves. Pass `--raw-pdb` to opt out and launch
+   `python -m pdb` directly.

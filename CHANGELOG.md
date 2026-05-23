@@ -4,6 +4,91 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased
+
+A roadmap sweep landing seven of the outstanding Phase 4+ items in
+one pass. Built incrementally — each item has its own commit on
+branch `claude/typhon-roadmap-items-nCs4K` — so a regression in any
+one is bisectable.
+
+### Added — incremental compilation
+
+- **Salsa cache shared across `check_file_with_imports`.** New
+  `preprocessed_full` tracked query returns the full
+  `PreprocessResult` so `preprocessed_text`, `resolved_module`,
+  `module_decl_names`, and the new `check_source_file_with_imports`
+  entry point all share one preprocess pass per revision. The LSP
+  now calls the SourceFile-backed entry directly so a per-keystroke
+  cross-module check hits the cached parse + resolve on every
+  unchanged sibling; only the type-check (which depends on the
+  per-invocation cross-module shape registry) actually re-runs.
+
+### Added — `tyc ty` integration
+
+- **Diagnostic attribution for `ty` output.** `tyc ty` now captures
+  the `ty` subprocess output and rewrites every `path.py:LINE[:COL]:`
+  reference to the originating Typhon source via the adjacent
+  `.py.map` sidecars. Pass `--raw` to forward output verbatim. The
+  shared `commands/source_map.rs` module is consumed by both
+  `tyc trace` and `tyc ty`.
+
+### Added — `tyc debug`
+
+- **Typhon-aware pdb wrapper.** `tyc debug` writes a one-shot
+  Python wrapper that subclasses `pdb.Pdb` and prints
+  `[ty] <src>:<line>` after every pause (entry, breakpoint, step,
+  exception). The wrapper loads every `.py.map` sidecar under the
+  build directory at startup so per-pause lookup is a dict + list
+  dereference. Default-on; pass `--raw-pdb` to launch
+  `python -m pdb` directly.
+
+### Added — `tyc migrate`
+
+- **Three new line-level rewrites.**
+  - `@dataclass(frozen=True[, ...])` (and `@dataclasses.dataclass`)
+    drops the decorator and the following class header gains a
+    trailing `frozen` modifier (`class Vec frozen:`).
+  - `class X(Protocol):` and `class X(Protocol[T]):` become
+    `interface X:` / `interface X[T]:`. Multi-base forms are left
+    untouched.
+  - `NAME = NewType("NAME", BASE)` at module level becomes
+    `newtype NAME = BASE`. The matching `Protocol` and `NewType`
+    `from typing import …` entries are pruned alongside.
+
+### Added — type checker
+
+- **Cross-function field-init audit.** A pre-scan recognises the
+  trivial factory-helper shape `def make(): return X.__new__(X)`
+  (and the two-statement `obj = X.__new__(X); return obj` variant).
+  Call sites `let c = make()` register the LHS as a tracked uninit
+  instance using the helper's missing field set, so a downstream
+  escape fires `tyc::missing_field_init` exactly as if the user
+  had constructed the partial instance inline. Helpers that do any
+  intervening field assignment are treated as initialising the
+  instance properly and are not recorded.
+- **Variance table expansion.** `generic_param_variance` gains
+  `AsyncContextManager`, `KeysView`, `ValuesView`, `ItemsView`,
+  `Type` / `type`, and `Counter`.
+
+### Added — analyser
+
+- **Parallel comprehensions: set-comp support.**
+  `{f(x) for x in xs}` now also rewrites to
+  `set(typhon_runtime.parallel.map_pure(lambda x: f(x), xs))` under
+  `[strictness] auto-parallel`. Same eligibility rules as the
+  list-comp path; the `set(...)` wrapper preserves the runtime set
+  semantics (uniqueness + unordered).
+
+### Added — test infrastructure
+
+- **Third-party Python corpus round-trip sweep.** New
+  `stress/third-party-py-corpus/` ships six representative Python
+  fixtures (dataclass, frozen dataclass, Protocol, NewType, PEP 695
+  generic, legacy `Generic[T]`) and the integration test
+  `third_party_corpus_round_trips_cleanly` exercises the full
+  `tyc migrate` → `tyc check` chain on each. Failures are collected
+  so a single run surfaces the complete regression list.
+
 ## 0.4.0
 
 A correctness sweep on the v0.3.0 surface (PR #103) plus a focused
