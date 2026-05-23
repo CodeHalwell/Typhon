@@ -199,7 +199,9 @@ impl std::ops::Deref for ArcResolvedModule {
 // Pointer equality is used as a conservative proxy for value equality.
 unsafe impl salsa::Update for ArcResolvedModule {
     unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
-        if Arc::ptr_eq(&(*old_pointer).0, &new_value.0) && Arc::ptr_eq(&(*old_pointer).1, &new_value.1) {
+        if Arc::ptr_eq(&(*old_pointer).0, &new_value.0)
+            && Arc::ptr_eq(&(*old_pointer).1, &new_value.1)
+        {
             false
         } else {
             *old_pointer = new_value;
@@ -297,10 +299,14 @@ pub fn resolved_module(db: &dyn salsa::Database, file: SourceFile) -> ArcResolve
     match parse_module(&prep.python_source) {
         Ok(parsed) => {
             let module = parsed.into_syntax();
-            let (resolved, diags) = resolve_module_with(path, &prep.python_source, &module, options);
+            let (resolved, diags) =
+                resolve_module_with(path, &prep.python_source, &module, options);
             ArcResolvedModule::new(Arc::new(resolved), Arc::new(diags))
         }
-        Err(_) => ArcResolvedModule::new(Arc::new(ResolvedModule::default()), Arc::new(Diagnostics::new())),
+        Err(_) => ArcResolvedModule::new(
+            Arc::new(ResolvedModule::default()),
+            Arc::new(Diagnostics::new()),
+        ),
     }
 }
 
@@ -645,7 +651,6 @@ pub fn check_source_file_with_imports(
     // and the diagnostics from resolution, so we don't need to re-run
     // `resolve_module_with` here.
     diags.extend(resolved_arc.diagnostics().clone());
-
 
     let external = build_external_shapes(&resolved_arc, shapes_by_module);
     let type_diags = check_module_with_imports(

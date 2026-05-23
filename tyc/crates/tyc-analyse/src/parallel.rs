@@ -371,7 +371,16 @@ fn try_rewrite_dictcomp(dc: &ExprDictComp, ctx: &RewriteCtx<'_>) -> Option<Expr>
     let value = dc.value.as_ref();
 
     // Helper to check if an expression is a simple name or literal
-    let is_simple = |e: &Expr| matches!(e, Expr::Name(_) | Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::BooleanLiteral(_) | Expr::NoneLiteral(_));
+    let is_simple = |e: &Expr| {
+        matches!(
+            e,
+            Expr::Name(_)
+                | Expr::NumberLiteral(_)
+                | Expr::StringLiteral(_)
+                | Expr::BooleanLiteral(_)
+                | Expr::NoneLiteral(_)
+        )
+    };
 
     // Helper to check if an expression is a pure call on the target
     let is_pure_call_on_target = |e: &Expr| -> Option<String> {
@@ -814,7 +823,10 @@ mod tests {
         let src = "ys = {'key': f(x) for x in xs}\n";
         let mut m = parse(src);
         let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
-        assert_eq!(stats.rewrites, 1, "dict comprehension with literal key should rewrite");
+        assert_eq!(
+            stats.rewrites, 1,
+            "dict comprehension with literal key should rewrite"
+        );
     }
 
     #[test]

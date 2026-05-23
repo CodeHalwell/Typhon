@@ -1094,7 +1094,10 @@ pub fn type_from_annotation_with_params(
             let arity = match s.slice.as_ref() {
                 Expr::Name(n) if n.id.as_str() == "_" => Some(1),
                 Expr::Tuple(t) => {
-                    if t.elts.iter().all(|e| matches!(e, Expr::Name(n) if n.id.as_str() == "_")) {
+                    if t.elts
+                        .iter()
+                        .all(|e| matches!(e, Expr::Name(n) if n.id.as_str() == "_"))
+                    {
                         Some(t.elts.len())
                     } else {
                         None
@@ -13406,7 +13409,7 @@ def f() -> int:
     #[test]
     fn hkt_type_constructor_binding() {
         // Test that TypeConstructor binds correctly in bind_typevars (HKT unification)
-        use crate::{Type, compute_bidirectional_bindings};
+        use crate::{compute_bidirectional_bindings, Type};
 
         // Simulate a function like: def map[F[_], A, B](fa: F[A], f: A -> B) -> F[B]
         // Test that binding works through the public API
@@ -13425,12 +13428,8 @@ def f() -> int:
         let actual_args = vec![list_int.clone()];
         let return_type = Type::TypeConstructor("F".to_string(), 1);
 
-        let bindings = compute_bidirectional_bindings(
-            &formal_params,
-            &actual_args,
-            &return_type,
-            None,
-        );
+        let bindings =
+            compute_bidirectional_bindings(&formal_params, &actual_args, &return_type, None);
 
         // After binding, F should be bound to "list"
         assert_eq!(bindings.get("F"), Some(&Type::Class("list".to_string())));

@@ -391,9 +391,9 @@ fn eval_expr(expr: &Expr, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue, St
                      (int, str, bool, float, bytes, None, type, object) are in scope \
                      (comptime evaluation is hermetic)",
                     n.id
-                ))
+                )),
             }
-        },
+        }
 
         // Unary operators: `-x`, `+x`, `not x`.
         Expr::UnaryOp(u) => {

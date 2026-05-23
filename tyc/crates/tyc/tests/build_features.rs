@@ -1544,10 +1544,7 @@ fn build_emits_codegen_artefact_regardless_of_bootstrap_outcome() {
 #[test]
 fn comptime_type_value_evaluates_and_emits() {
     let tmp = tempfile::tempdir().unwrap();
-    scaffold(
-        tmp.path(),
-        "comptime let T: type = int\n",
-    );
+    scaffold(tmp.path(), "comptime let T: type = int\n");
     build(tmp.path());
     let py = main_py(tmp.path());
     assert!(
@@ -1581,7 +1578,10 @@ fn comptime_type_value_rejects_any_without_import() {
     // cause NameError unless the module imported it from `typing`.
     let tmp = tempfile::tempdir().unwrap();
     scaffold(tmp.path(), "comptime let T: type = Any\n");
-    let out = tyc().args(["build", tmp.path().to_str().unwrap()]).output().unwrap();
+    let out = tyc()
+        .args(["build", tmp.path().to_str().unwrap()])
+        .output()
+        .unwrap();
     assert!(
         !out.status.success(),
         "build must fail for comptime Any without import"
