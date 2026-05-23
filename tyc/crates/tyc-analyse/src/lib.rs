@@ -97,6 +97,11 @@ pub enum ComptimeValue {
     /// stable (Python dicts preserve insertion order from 3.7+, and
     /// reproducible emit is important for build determinism).
     Dict(Vec<(ComptimeValue, ComptimeValue)>),
+    /// A type value — `comptime let T: type = int`.
+    /// Stored as the type's display name (e.g., "int", "str", "list[int]").
+    /// When used in an annotation slot, this round-trips as a type expression
+    /// rather than a literal string.
+    Type(String),
 }
 
 impl ComptimeValue {
@@ -153,6 +158,11 @@ impl ComptimeValue {
                 }
                 s.push('}');
                 s
+            }
+            ComptimeValue::Type(type_name) => {
+                // Type values are emitted as their type expression, not as string literals.
+                // e.g., `int` not `"int"`, `list[str]` not `"list[str]"`.
+                type_name.clone()
             }
         }
     }
@@ -360,13 +370,26 @@ fn eval_expr(expr: &Expr, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue, St
         // (module-level names, including other `comptime let` bindings)
         // are intentionally rejected — comptime evaluation is hermetic,
         // so call sites must pass everything in as arguments.
-        Expr::Name(n) => ctx.locals.get(n.id.as_str()).cloned().ok_or_else(|| {
-            format!(
-                "unknown name '{}' in comptime expression — only the enclosing function's \
-                 parameters and locally-bound names are in scope (comptime evaluation is hermetic)",
-                n.id
-            )
-        }),
+        // Exception: bare type names (int, str, bool, float, bytes, etc.)
+        // are recognized as `ComptimeValue::Type` values for comptime
+        // types-as-values support.
+        Expr::Name(n) => {
+            // Check if it's a local binding first
+            if let Some(val) = ctx.locals.get(n.id.as_str()) {
+                return Ok(val.clone());
+            }
+            // Check if it's a bare type name
+            match n.id.as_str() {
+                "int" | "str" | "bool" | "float" | "bytes" | "None" | "Any" => {
+                    Ok(ComptimeValue::Type(n.id.to_string()))
+                }
+                _ => Err(format!(
+                    "unknown name '{}' in comptime expression — only the enclosing function's \
+                     parameters and locally-bound names are in scope (comptime evaluation is hermetic)",
+                    n.id
+                ))
+            }
+        },
 
         // Unary operators: `-x`, `+x`, `not x`.
         Expr::UnaryOp(u) => {
@@ -562,6 +585,7 @@ fn comptime_str(v: &ComptimeValue) -> Result<String, String> {
         }
         ComptimeValue::Str(s) => Ok(s.clone()),
         ComptimeValue::Bool(b) => Ok(if *b { "True" } else { "False" }.to_owned()),
+        ComptimeValue::Type(t) => Ok(t.clone()),
         ComptimeValue::List(_) | ComptimeValue::Tuple(_) | ComptimeValue::Dict(_) => Err(
             "f-string interpolation of list/tuple/dict values is not supported at comptime — \
              Python's `str([...])` uses single-quoted string repr internally and the comptime \
@@ -689,6 +713,7 @@ fn comptime_value_kind(v: &ComptimeValue) -> &'static str {
         ComptimeValue::List(_) => "list",
         ComptimeValue::Tuple(_) => "tuple",
         ComptimeValue::Dict(_) => "dict",
+        ComptimeValue::Type(_) => "type",
     }
 }
 
@@ -700,6 +725,7 @@ fn values_equal(a: &ComptimeValue, b: &ComptimeValue) -> bool {
         (ComptimeValue::Float(x), ComptimeValue::Int(y)) => *x == (*y as f64),
         (ComptimeValue::Str(x), ComptimeValue::Str(y)) => x == y,
         (ComptimeValue::Bool(x), ComptimeValue::Bool(y)) => x == y,
+        (ComptimeValue::Type(x), ComptimeValue::Type(y)) => x == y,
         _ => false,
     }
 }
@@ -771,8 +797,9 @@ fn eval_call(call: &ExprCall, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue
                 ComptimeValue::Bool(b) => Ok(ComptimeValue::Int(if b { 1 } else { 0 })),
                 ComptimeValue::List(_)
                 | ComptimeValue::Tuple(_)
-                | ComptimeValue::Dict(_) => {
-                    Err("int() in comptime context cannot accept a container".into())
+                | ComptimeValue::Dict(_)
+                | ComptimeValue::Type(_) => {
+                    Err("int() in comptime context cannot accept a container or type".into())
                 }
             }
         }
@@ -791,8 +818,9 @@ fn eval_call(call: &ExprCall, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue
                 ComptimeValue::Bool(b) => Ok(ComptimeValue::Float(if b { 1.0 } else { 0.0 })),
                 ComptimeValue::List(_)
                 | ComptimeValue::Tuple(_)
-                | ComptimeValue::Dict(_) => {
-                    Err("float() in comptime context cannot accept a container".into())
+                | ComptimeValue::Dict(_)
+                | ComptimeValue::Type(_) => {
+                    Err("float() in comptime context cannot accept a container or type".into())
                 }
             }
         }
@@ -806,6 +834,7 @@ fn eval_call(call: &ExprCall, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue
                 ComptimeValue::Int(n) => n.to_string(),
                 ComptimeValue::Float(f) => f.to_string(),
                 ComptimeValue::Bool(b) => if b { "True" } else { "False" }.into(),
+                ComptimeValue::Type(t) => t,
                 // Reject `str(container)` at comptime: matching Python's
                 // `str(["a"])` -> `"['a']"` (single-quoted nested
                 // strings) would require a separate Python-flavoured

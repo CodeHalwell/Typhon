@@ -79,6 +79,12 @@ pub enum Type {
     /// directly as `Type::Class("X")` because the local name *is*
     /// the class. FINDINGS #163.
     Module(String),
+    /// A higher-kinded type constructor with unbound type parameters.
+    /// E.g., `F[_]` in `class Functor[F[_]]:` or `def map[F[_], A, B](...)`.
+    /// The `arity` field indicates how many type parameters the constructor
+    /// expects. A `TypeConstructor("List", 1)` represents a type constructor
+    /// that takes one type argument (like `list` in `list[int]`).
+    TypeConstructor(String, usize),
 }
 
 impl Type {
@@ -172,6 +178,10 @@ impl Type {
             Type::TypeVar(name) => name.clone(),
             Type::Unknown => "?".into(),
             Type::Module(name) => format!("<module {name}>"),
+            Type::TypeConstructor(name, arity) => {
+                let placeholders = (0..*arity).map(|_| "_").collect::<Vec<_>>().join(", ");
+                format!("{}[{}]", name, placeholders)
+            }
         }
     }
 }
@@ -350,6 +360,11 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
         // `Generic("list", [Unknown])` but the annotation is
         // `Class("list")`.
         (Type::Class(en), Type::Generic(an, _)) if en == an && is_bare_container_name(en) => true,
+        // Higher-kinded type constructors behave like TypeVar during
+        // assignability checking — permissive in both directions until
+        // bound at a call site. This allows `F[_]` to unify with concrete
+        // type constructors later.
+        (Type::TypeConstructor(_, _), _) | (_, Type::TypeConstructor(_, _)) => true,
         (a, b) => a == b,
     }
 }
@@ -1076,6 +1091,23 @@ pub fn type_from_annotation_with_params(
                         return Type::Generic("tuple_variadic".into(), vec![elem]);
                     }
                 }
+            }
+            // Higher-kinded type parameter: `F[_]` or `F[_, _]`
+            // Detect subscripts where all slice elements are `_` (Name with id "_").
+            // The arity is the count of underscores.
+            let arity = match s.slice.as_ref() {
+                Expr::Name(n) if n.id.as_str() == "_" => Some(1),
+                Expr::Tuple(t) => {
+                    if t.elts.iter().all(|e| matches!(e, Expr::Name(n) if n.id.as_str() == "_")) {
+                        Some(t.elts.len())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(arity_count) = arity {
+                return Type::TypeConstructor(head, arity_count);
             }
             let args: Vec<Type> = match s.slice.as_ref() {
                 Expr::Tuple(t) => t
@@ -8293,6 +8325,8 @@ fn operand_is_unflaggable(t: &Type) -> bool {
         // arithmetic on a `Type::Module` value is already nonsense and
         // the existing type-mismatch check at the call site fires.
         Type::Module(_) => true,
+        // TypeConstructor behaves like TypeVar - permissive until bound
+        Type::TypeConstructor(_, _) => true,
     }
 }
 
@@ -13298,5 +13332,70 @@ def f() -> int:
             "inner-annotated unsafe binding must not trigger the leak; got {:?}",
             d.errors()
         );
+    }
+
+    // ── Higher-Kinded Types (HKT) tests ──────────────────────────────────
+
+    #[test]
+    fn hkt_type_constructor_single_underscore() {
+        // Test that `F[_]` is recognized as a TypeConstructor with arity 1
+        use crate::{type_from_annotation, Type};
+        let src = "F[_]";
+        let module = tyc_syntax::parse_module(src).unwrap().into_syntax();
+        let expr = match &module.body[0] {
+            ruff_python_ast::Stmt::Expr(e) => &e.value,
+            _ => panic!("expected Expr"),
+        };
+        let ty = type_from_annotation(expr, &[]);
+        match ty {
+            Type::TypeConstructor(name, arity) => {
+                assert_eq!(name, "F");
+                assert_eq!(arity, 1);
+            }
+            other => panic!("expected TypeConstructor, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn hkt_type_constructor_multiple_underscores() {
+        // Test that `G[_, _]` is recognized as a TypeConstructor with arity 2
+        use crate::{type_from_annotation, Type};
+        let src = "G[_, _]";
+        let module = tyc_syntax::parse_module(src).unwrap().into_syntax();
+        let expr = match &module.body[0] {
+            ruff_python_ast::Stmt::Expr(e) => &e.value,
+            _ => panic!("expected Expr"),
+        };
+        let ty = type_from_annotation(expr, &[]);
+        match ty {
+            Type::TypeConstructor(name, arity) => {
+                assert_eq!(name, "G");
+                assert_eq!(arity, 2);
+            }
+            other => panic!("expected TypeConstructor, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn hkt_type_constructor_display() {
+        // Test that TypeConstructor displays correctly
+        use crate::Type;
+        let tc = Type::TypeConstructor("Functor".to_string(), 1);
+        assert_eq!(tc.display(), "Functor[_]");
+
+        let tc2 = Type::TypeConstructor("Bifunctor".to_string(), 2);
+        assert_eq!(tc2.display(), "Bifunctor[_, _]");
+    }
+
+    #[test]
+    fn hkt_type_constructor_is_assignable() {
+        // Test that TypeConstructor is permissive in assignability (like TypeVar)
+        use crate::{assignable, Type};
+        let tc = Type::TypeConstructor("F".to_string(), 1);
+        let list_int = Type::Generic("list".to_string(), vec![Type::Int]);
+
+        // TypeConstructor should accept anything
+        assert!(assignable(&tc, &list_int));
+        assert!(assignable(&list_int, &tc));
     }
 }
