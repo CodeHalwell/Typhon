@@ -360,11 +360,6 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
         // `Generic("list", [Unknown])` but the annotation is
         // `Class("list")`.
         (Type::Class(en), Type::Generic(an, _)) if en == an && is_bare_container_name(en) => true,
-        // Higher-kinded type constructors behave like TypeVar during
-        // assignability checking — permissive in both directions until
-        // bound at a call site. This allows `F[_]` to unify with concrete
-        // type constructors later.
-        (Type::TypeConstructor(_, _), _) | (_, Type::TypeConstructor(_, _)) => true,
         (a, b) => a == b,
     }
 }
@@ -1093,8 +1088,9 @@ pub fn type_from_annotation_with_params(
                 }
             }
             // Higher-kinded type parameter: `F[_]` or `F[_, _]`
-            // Detect subscripts where all slice elements are `_` (Name with id "_").
-            // The arity is the count of underscores.
+            // Only parse as TypeConstructor when the head is a declared type parameter.
+            // This prevents normal generic annotations like `list[_]` from becoming
+            // TypeConstructors and bypassing type checking.
             let arity = match s.slice.as_ref() {
                 Expr::Name(n) if n.id.as_str() == "_" => Some(1),
                 Expr::Tuple(t) => {
@@ -1106,8 +1102,12 @@ pub fn type_from_annotation_with_params(
                 }
                 _ => None,
             };
+            // Only parse X[_] as TypeConstructor if X is a declared type parameter
             if let Some(arity_count) = arity {
-                return Type::TypeConstructor(head, arity_count);
+                if type_params.iter().any(|p| p == &head) {
+                    return Type::TypeConstructor(head, arity_count);
+                }
+                // Otherwise fall through to normal generic handling below
             }
             let args: Vec<Type> = match s.slice.as_ref() {
                 Expr::Tuple(t) => t
@@ -1242,6 +1242,14 @@ fn bind_typevars(
             for (f, a) in fa.iter().zip(aa) {
                 bind_typevars(f, a, bindings);
             }
+        }
+        // Higher-kinded type constructor binding: treat `F[_]` as a type variable
+        // that should unify with the actual type constructor head.
+        // E.g. `F[_]` against `list[int]` could bind `F → list`.
+        (Type::TypeConstructor(name, _arity), Type::Generic(head, _args)) => {
+            // For now, we bind the constructor name to the generic head.
+            // A complete implementation would validate arity matches.
+            bindings.insert(name.clone(), Type::Class(head.clone()));
         }
         (
             Type::Function {
