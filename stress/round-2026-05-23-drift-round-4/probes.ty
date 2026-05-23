@@ -1,0 +1,158 @@
+# Python semantic-drift audit — round 4
+# Probes for edge-case Python idioms that should pass `tyc check`
+# Each probe represents a pattern accepted by CPython 3.13 at runtime
+
+from typing import Generator
+
+# Probe 1: Walrus operator in comprehensions (simple)
+def probe_walrus_comprehension_basic() -> list[int]:
+    let data: list[str] = ["1", "22", "333"]
+    return [length for item in data if (length := len(item)) > 1]
+
+# Probe 2: Walrus operator in comprehensions (nested)
+def probe_walrus_comprehension_nested() -> list[tuple[str, int]]:
+    let data: list[str] = ["hello", "world", "test"]
+    return [(item, n) for item in data if (n := len(item)) > 4]
+
+# Probe 3: Walrus operator in conditional
+def probe_walrus_conditional(items: list[str]) -> str:
+    if (count := len(items)) > 0:
+        return f"Found {count} items"
+    return "Empty"
+
+# Probe 4: Augmented assignment narrowing (or pattern)
+def probe_augmented_or_narrowing(value: str?) -> str:
+    let result: str = value or "default"
+    return result
+
+# Probe 5: Augmented assignment narrowing (addition)
+def probe_augmented_add_narrowing() -> int:
+    let x: int = 5
+    x += 10
+    return x
+
+# Probe 6: Augmented assignment with type preservation
+def probe_augmented_string_add() -> str:
+    let s: str = "hello"
+    s += " world"
+    return s
+
+# Probe 7: yield from generator delegation (simple)
+def probe_yield_from_simple() -> list[int]:
+    def inner() -> list[int]:
+        return [1, 2, 3]
+
+    def outer() -> Generator[int, None, None]:
+        yield from inner()
+
+    return list(outer())
+
+# Probe 8: yield from with generator
+def probe_yield_from_generator() -> list[int]:
+    def numbers() -> Generator[int, None, None]:
+        yield 1
+        yield 2
+        yield 3
+
+    def delegator() -> Generator[int, None, None]:
+        yield from numbers()
+        yield 4
+
+    return list(delegator())
+
+# Probe 9: Match pattern with star capture (list)
+def probe_match_star_list(items: list[int]) -> int:
+    match items:
+        case [first, *rest]:
+            return first + len(rest)
+        case _:
+            return 0
+
+# Probe 10: Match pattern with star capture (middle)
+def probe_match_star_middle(items: list[str]) -> str:
+    match items:
+        case [first, *middle, last]:
+            return f"{first}...{last}"
+        case _:
+            return "Empty"
+
+# Probe 11: String multiplication type preservation
+def probe_string_multiplication() -> str:
+    let s: str = "ab"
+    let repeated: str = s * 3
+    return repeated
+
+# Probe 12: String concatenation type preservation
+def probe_string_concat() -> str:
+    let a: str = "hello"
+    let b: str = " "
+    let c: str = "world"
+    let result: str = a + b + c
+    return result
+
+# Probe 13: raise from clause
+def probe_raise_from() -> None:
+    try:
+        let x: int = int("not a number")
+    except ValueError as e:
+        raise RuntimeError("Conversion failed") from e
+
+# Probe 14: Dict unpacking in function call
+def probe_dict_unpack_call() -> int:
+    def add(a: int, b: int, c: int) -> int:
+        return a + b + c
+
+    let kwargs: dict[str, int] = {"a": 1, "b": 2, "c": 3}
+    return add(**kwargs)
+
+# Probe 15: List unpacking in function call
+def probe_list_unpack_call() -> int:
+    def add(a: int, b: int, c: int) -> int:
+        return a + b + c
+
+    let args: list[int] = [1, 2, 3]
+    return add(*args)
+
+# Probe 16: Combined *args and **kwargs
+def probe_mixed_unpack_call() -> str:
+    def format_msg(prefix: str, msg: str, suffix: str) -> str:
+        return f"{prefix}{msg}{suffix}"
+
+    let args: list[str] = ["[", "hello"]
+    let kwargs: dict[str, str] = {"suffix": "]"}
+    return format_msg(*args, **kwargs)
+
+# Probe 17: Walrus in while condition
+def probe_walrus_while() -> list[str]:
+    let items: list[str] = ["a", "bb", "ccc", "dddd"]
+    let result: list[str] = []
+    let i: int = 0
+    while (item := items[i] if i < len(items) else "") and len(item) < 4:
+        result.append(item)
+        i += 1
+    return result
+
+# Smoke test - ensure all probes are callable
+def test_all() -> None:
+    probe_walrus_comprehension_basic()
+    probe_walrus_comprehension_nested()
+    probe_walrus_conditional(["test"])
+    probe_augmented_or_narrowing("value")
+    probe_augmented_or_narrowing(None)
+    probe_augmented_add_narrowing()
+    probe_augmented_string_add()
+    probe_yield_from_simple()
+    probe_yield_from_generator()
+    probe_match_star_list([1, 2, 3])
+    probe_match_star_middle(["a", "b", "c", "d"])
+    probe_string_multiplication()
+    probe_string_concat()
+    probe_dict_unpack_call()
+    probe_list_unpack_call()
+    probe_mixed_unpack_call()
+    probe_walrus_while()
+
+    try:
+        probe_raise_from()
+    except RuntimeError:
+        pass  # Expected
