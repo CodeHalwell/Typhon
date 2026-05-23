@@ -160,8 +160,8 @@ pub fn run(args: TyArgs) -> Result<()> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let mapped_stdout = remap_ty_diagnostics(&stdout, None);
-    let mapped_stderr = remap_ty_diagnostics(&stderr, None);
+    let mapped_stdout = remap_ty_diagnostics(&stdout, Some(&out_dir));
+    let mapped_stderr = remap_ty_diagnostics(&stderr, Some(&out_dir));
     print!("{mapped_stdout}");
     eprint!("{mapped_stderr}");
 
@@ -371,7 +371,7 @@ fn remap_one_diagnostic_line(
     if !line.contains(".py:") {
         return line.to_owned();
     }
-    let Some(parsed) = parse_py_ref(line) else {
+    let Some(parsed) = parse_py_ref_with_validator(line, map_dir) else {
         return line.to_owned();
     };
 
@@ -418,25 +418,55 @@ struct PyRef {
 
 /// Locate a `path.py:LINE(:COL)?` reference in `line`.
 ///
-/// The path can include directory separators, spaces are rejected
-/// (so the parser doesn't gobble human-readable prose), and the
-/// match must be a contiguous substring. Returns `None` when no
-/// candidate is present.
+/// The path can include directory separators and spaces. When a `.py:`
+/// pattern is found, the parser walks backward to determine the longest
+/// valid path prefix by checking against the filesystem + `.py.map` lookup.
+/// Returns `None` when no candidate is present.
+///
+/// This is a convenience wrapper for tests; production code should use
+/// `parse_py_ref_with_validator` with a map_dir for space support.
+#[cfg(test)]
 fn parse_py_ref(line: &str) -> Option<PyRef> {
-    // Find every `.py:` occurrence; the path is everything to the
-    // left up to the first whitespace / control character / quote.
+    parse_py_ref_with_validator(line, None)
+}
+
+/// Internal implementation that accepts an optional map_dir for validation.
+/// When `map_dir` is provided, the parser validates candidate paths against
+/// the filesystem to support paths with spaces.
+fn parse_py_ref_with_validator(line: &str, map_dir: Option<&Path>) -> Option<PyRef> {
+    // Helper to check if a .py.map file exists without loading it
+    fn map_exists_for(py_path: &str, map_dir: Option<&Path>) -> bool {
+        let adjacent = PathBuf::from(format!("{py_path}.map"));
+        if adjacent.exists() {
+            return true;
+        }
+        if let Some(dir) = map_dir {
+            if let Some(base) = Path::new(py_path).file_name() {
+                let candidate = dir.join(format!("{}.map", base.to_string_lossy()));
+                if candidate.exists() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    // Find every `.py:` occurrence; the path is everything to the left.
     let bytes = line.as_bytes();
     let mut search_from = 0;
     while let Some(rel) = line[search_from..].find(".py:") {
         let py_end = search_from + rel + 3; // position of `:` after `.py`
-                                            // Walk left to find the start of the path token.
+
+        // Strategy for paths with spaces:
+        // 1. Find the start using the old heuristic (stop at delimiters)
+        // 2. If map_dir is provided, try longer prefixes and validate against filesystem
+        // 3. Use the longest valid match
+
+        // Old heuristic: walk left to find start of path token
         let mut start = py_end - 3; // start at the `.` in `.py`
         while start > 0 {
             let b = bytes[start - 1];
-            // Stop at whitespace, quotes, opening punctuation, or a
-            // newline. `ty`'s output can prefix the path with `  --> `,
-            // `error[ty: ...] -->`, or just leave it at the start of the
-            // line.
+            // Stop at whitespace, quotes, opening punctuation, or a newline.
             if matches!(
                 b,
                 b' ' | b'\t' | b'\n' | b'\r' | b'\'' | b'"' | b'(' | b'[' | b'<' | b'>'
@@ -445,8 +475,50 @@ fn parse_py_ref(line: &str) -> Option<PyRef> {
             }
             start -= 1;
         }
-        let py_path = &line[start..py_end - 3 + 3]; // up to and incl. `.py`
-                                                    // After the `:` parse the line number.
+
+        // Trim any leading spaces from the start position (common in formats like "  --> path.py:line")
+        while start < py_end && bytes[start] == b' ' {
+            start += 1;
+        }
+
+        // Now we have a conservative start position. If we have a validator,
+        // try extending backward through spaces by validating against the filesystem.
+        let py_path = if let Some(map_dir) = map_dir {
+            // Try successively longer candidate prefixes
+            let mut best_candidate = &line[start..py_end - 3 + 3]; // up to and incl. `.py`
+            let mut best_start = start;
+
+            // Walk further back, but only through spaces and valid path characters
+            let mut test_start = start;
+            while test_start > 0 {
+                let b = bytes[test_start - 1];
+                // Only extend through alphanumeric, path separators, and spaces
+                if !matches!(b, b' ' | b'/' | b'\\' | b'.' | b'-' | b'_')
+                    && !b.is_ascii_alphanumeric()
+                {
+                    break;
+                }
+                test_start -= 1;
+
+                let candidate = &line[test_start..py_end - 3 + 3];
+                // Trim leading spaces from candidate before validation
+                let trimmed_candidate = candidate.trim_start();
+                // Validate: does this candidate have a .py.map file?
+                if map_exists_for(trimmed_candidate, Some(map_dir)) {
+                    // Update start to exclude the leading spaces we just trimmed
+                    let trim_offset = candidate.len() - trimmed_candidate.len();
+                    best_candidate = trimmed_candidate;
+                    best_start = test_start + trim_offset;
+                }
+            }
+
+            start = best_start;
+            best_candidate
+        } else {
+            &line[start..py_end - 3 + 3]
+        };
+
+        // After the `:` parse the line number.
         let after = &line[py_end + 1..];
         let digit_len = after.bytes().take_while(|b| b.is_ascii_digit()).count();
         if digit_len == 0 {
