@@ -757,6 +757,14 @@ pub enum Variance {
 /// flows covariantly silently accepts unsound programs. The former is
 /// fixable by writing the obvious cast; the latter is a real bug source.
 pub fn generic_param_variance(head: &str, idx: usize) -> Variance {
+    // Fixed-arity tuples are immutable, so every slot is covariant — not
+    // just position 0. Encoded outside the match so a `tuple[T1, T2, ..,
+    // Tn]` of any arity widens uniformly (the `("tuple", 0)` arm below
+    // would only catch position 0 and leave positions 1+ falling through
+    // to the invariant default).
+    if head == "tuple" || head == "Tuple" {
+        return Variance::Covariant;
+    }
     match (head, idx) {
         // ── Mutable containers — invariant in every position. ─────────
         ("list", 0)
@@ -782,8 +790,9 @@ pub fn generic_param_variance(head: &str, idx: usize) -> Variance {
         | ("AbstractSet", 0)
         | ("FrozenSet", 0)
         | ("frozenset", 0)
-        | ("tuple", 0)
-        | ("Tuple", 0)
+        // `tuple` / `Tuple` are handled by the early-return above so every
+        // fixed-arity slot is covariant; they remain documented here for
+        // discoverability.
         | ("Awaitable", 0)
         | ("Coroutine", 0)
         | ("AsyncIterable", 0)
@@ -10598,6 +10607,39 @@ let s: str = id(3)
         // widen to float when the target is `tuple[float, ...]`.
         let d = check("let xs: tuple[float, ...] = (1, 2, 3)\n");
         assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn fixed_arity_tuple_widens_every_position() {
+        // Every slot of a fixed-arity tuple is covariant, not just the
+        // first — `tuple[int, int]` must flow into a `tuple[float, float]`
+        // parameter exactly as it does into `tuple[float, ...]`. The
+        // earlier `("tuple", 0) => Covariant` arm only relaxed position
+        // 0, so a `tuple[int, int]` argument tripped invariance at
+        // position 1 and rejected.
+        let d = check(
+            "def takes(p: tuple[float, float]) -> float: return p[0] + p[1]\n\
+             def main() -> float: return takes((1, 2))\n",
+        );
+        assert!(
+            !d.has_errors(),
+            "tuple[int, int] must flow into tuple[float, float]; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn fixed_arity_tuple_rejects_unsound_widening() {
+        // Covariance is one-way: `tuple[float, float]` does NOT flow into
+        // `tuple[int, int]` (a float-typed value cannot be read as int).
+        let d = check(
+            "def takes(p: tuple[int, int]) -> int: return p[0] + p[1]\n\
+             def main() -> int: return takes((1.0, 2.0))\n",
+        );
+        assert!(
+            d.has_errors(),
+            "tuple[float, float] must NOT flow into tuple[int, int]",
+        );
     }
 
     #[test]
