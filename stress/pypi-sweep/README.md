@@ -127,9 +127,43 @@ Criteria for new packages:
 
 ## Findings
 
-None yet — Phase 2 (full round-trip) is not implemented.
+### Phase 1 Results (Baseline)
 
-Once Phase 2 lands, findings will be catalogued here:
-- Migration failures (patterns `tyc migrate` can't handle)
-- Build failures (type-check errors post-migration)
-- Semantic drift (different output between original and emitted code)
+All selected packages install and run correctly in vanilla Python:
+- ✓ attrs (23.x) - smoke test passes
+- ✓ click (8.x) - smoke test passes
+
+### Phase 2 Results (Migrate→Build)
+
+**Summary:** Migration infrastructure works, but real PyPI packages expose edge cases in `tyc migrate` and complex typing patterns that require manual fixes.
+
+**attrs (23.x):**
+- ✗ Migration produces `.ty` files but build fails with 28 type errors
+- Issues:
+  - Unused imports (filters, setters, validators) - low severity, could be auto-fixed
+  - Complex internal APIs with dynamic patterns
+  - Recommendation: Too complex for automated sweep; requires manual migration
+
+**click (8.x):**
+- Not yet tested in Phase 2
+
+### Key Learnings
+
+1. **Package selection is critical**: Real-world packages like attrs use patterns (metaclasses, runtime introspection, complex generics) that are challenging for automated migration.
+
+2. **Better candidate profile**: Need packages that are:
+   - Primarily type-annotated (not @dataclass-heavy or dynamic)
+   - Simple module structure (few imports, limited cross-module dependencies)
+   - Representative but not framework-level complexity
+
+3. **Suggested next packages to try**:
+   - `python-dateutil` (date/time utilities, well-typed)
+   - `humanize` (simple formatting utilities)
+   - Small utility packages with <1000 LOC
+
+### Migration Bug Found
+
+**typing-extensions**: `tyc migrate` generates invalid syntax `mut else:` (should be `else:`). This indicates a parser or migration issue when handling non-mut branches in conditional chains.
+
+Location: Line 181 of migrated `typing_extensions.ty`
+

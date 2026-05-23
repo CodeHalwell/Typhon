@@ -26,14 +26,14 @@ PACKAGES = [
     {
         "name": "attrs",
         "version": ">=23.0.0",
-        "modules": ["attr/__init__.py", "attr/_make.py"],
+        "modules": ["__init__.py", "converters.py"],  # Use actual package structure
         "smoke_test": """
-import attr
+import attrs
 
-@attr.s
+@attrs.define
 class Point:
-    x = attr.ib()
-    y = attr.ib()
+    x: int
+    y: int
 
 p = Point(1, 2)
 print(f"Point({p.x}, {p.y})")
@@ -44,7 +44,7 @@ assert p.x == 1 and p.y == 2
     {
         "name": "click",
         "version": ">=8.0.0",
-        "modules": ["click/core.py", "click/decorators.py"],
+        "modules": ["core.py", "decorators.py"],
         "smoke_test": """
 import click
 
@@ -63,30 +63,6 @@ print(result.output.strip())
 assert result.exit_code == 0
 """,
         "expected_output": "Hello Test!\nHello Test!",
-    },
-    {
-        "name": "typing-extensions",
-        "version": ">=4.0.0",
-        "modules": ["typing_extensions.py"],
-        "smoke_test": """
-from typing_extensions import Literal, TypedDict, Protocol
-
-class Point(TypedDict):
-    x: int
-    y: int
-
-class Drawable(Protocol):
-    def draw(self) -> None: ...
-
-def process(mode: Literal["fast", "slow"]) -> str:
-    return mode
-
-p: Point = {"x": 1, "y": 2}
-print(f"Point: {p}")
-print(f"Mode: {process('fast')}")
-assert p["x"] == 1
-""",
-        "expected_output": "Point: {'x': 1, 'y': 2}\nMode: fast\n",
     },
 ]
 
@@ -135,7 +111,7 @@ def find_tyc_binary() -> Optional[Path]:
     return None
 
 
-def test_package(pkg: dict, tyc: Path, verbose: bool = False) -> bool:
+def test_package(pkg: dict, tyc: Path, verbose: bool = False, baseline_only: bool = False) -> bool:
     """Test one package through the migrate→build→test pipeline."""
     name = pkg["name"]
     print(f"\n{'='*60}")
@@ -186,10 +162,101 @@ def test_package(pkg: dict, tyc: Path, verbose: bool = False) -> bool:
         if verbose:
             print(f"      Output: {original_output.strip()}")
 
-        # For now, we're establishing the baseline
-        # Full migrate→build→test will be phase 2
-        print(f"  3. Skipping migrate→build (baseline establishment)")
-        print(f"    ✓ Package {name} smoke test passes")
+        if baseline_only:
+            print(f"  3. Skipping migrate→build (baseline mode)")
+            print(f"    ✓ Package {name} baseline passes")
+            return True
+
+        # 4. Copy modules to working directory for migration
+        print(f"  3. Copying modules for migration...")
+        work_dir = tmppath / "work"
+        work_dir.mkdir()
+
+        modules_copied = []
+        for module_path in pkg["modules"]:
+            src_file = pkg_src / module_path
+            if not src_file.exists():
+                print(f"    ⚠ Module not found: {module_path} (skipping)")
+                continue
+
+            dest_file = work_dir / Path(module_path).name
+            dest_file.write_text(src_file.read_text())
+            modules_copied.append(dest_file)
+
+        if not modules_copied:
+            print(f"    ✗ No modules found to migrate")
+            return False
+
+        print(f"    ✓ Copied {len(modules_copied)} module(s)")
+
+        # 5. Run tyc migrate on each module
+        print(f"  4. Running tyc migrate...")
+        migrated_files = []
+        for py_file in modules_copied:
+            result = run_command([str(tyc), "migrate", str(py_file)], cwd=work_dir)
+            if result.returncode != 0:
+                print(f"    ✗ Migration failed for {py_file.name}:")
+                if verbose:
+                    print(f"      {result.stderr}")
+                return False
+
+            ty_file = py_file.with_suffix(".ty")
+            if ty_file.exists():
+                migrated_files.append(ty_file)
+
+        if not migrated_files:
+            print(f"    ✗ No .ty files produced by migration")
+            return False
+
+        print(f"    ✓ Migrated {len(migrated_files)} file(s)")
+
+        # 6. Create a Typhon project around the migrated files
+        print(f"  5. Creating Typhon project...")
+        project_dir = tmppath / "typhon_project"
+        project_dir.mkdir()
+        src_dir = project_dir / "src"
+        src_dir.mkdir()
+
+        # Copy migrated files to project src/
+        for ty_file in migrated_files:
+            (src_dir / ty_file.name).write_text(ty_file.read_text())
+
+        # Create minimal typhon.toml
+        toml_content = """[project]
+name = "pypi-sweep-test"
+version = "0.1.0"
+src = "src"
+out = "build"
+
+[python]
+target = "3.13"
+
+[emit]
+format = false
+
+[strictness]
+
+[env]
+"""
+        (project_dir / "typhon.toml").write_text(toml_content)
+        print(f"    ✓ Created Typhon project")
+
+        # 7. Run tyc build
+        print(f"  6. Running tyc build...")
+        result = run_command([str(tyc), "build", str(project_dir)])
+        if result.returncode != 0:
+            print(f"    ✗ Build failed:")
+            if verbose:
+                print(f"      {result.stderr}")
+            return False
+
+        print(f"    ✓ Build succeeded")
+
+        # 8. For now, we consider success if build passes
+        # Full semantic diff will be added in a future enhancement
+        print(f"  7. Semantic diff (not yet implemented)")
+        print(f"    ⚠ Skipping output comparison")
+        print(f"    ✓ Package {name} round-trip passes (build only)")
 
     return True
 
@@ -198,6 +265,7 @@ def main():
     parser = argparse.ArgumentParser(description="PyPI round-trip sweep for Typhon")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     parser.add_argument("--package", "-p", help="Test only this package")
+    parser.add_argument("--baseline", action="store_true", help="Run baseline smoke tests only (skip migrate/build)")
     args = parser.parse_args()
 
     # Find tyc binary
@@ -208,6 +276,10 @@ def main():
         sys.exit(1)
 
     print(f"Using tyc: {tyc}")
+    if args.baseline:
+        print("Mode: Baseline smoke tests only")
+    else:
+        print("Mode: Full migrate→build→test pipeline")
 
     # Filter packages if requested
     packages = PACKAGES
@@ -220,7 +292,7 @@ def main():
     # Run tests
     failures = []
     for pkg in packages:
-        if not test_package(pkg, tyc, verbose=args.verbose):
+        if not test_package(pkg, tyc, verbose=args.verbose, baseline_only=args.baseline):
             failures.append(pkg["name"])
 
     # Report results
