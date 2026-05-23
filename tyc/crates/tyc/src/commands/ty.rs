@@ -11,7 +11,7 @@
 //! can be selected with `--ty-bin`.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,9 @@ use miette::{miette, Result};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 
 use crate::commands::build::{self, BuildArgs};
+use crate::commands::source_map::{
+    load_map_for, map_py_line, parse_map, resolve_ty_path, SourceMap,
+};
 use crate::config::TyphonConfig;
 
 /// Arguments for `tyc ty`.
@@ -56,6 +59,15 @@ pub struct TyArgs {
     /// "save" events triggers a single re-run. Press Ctrl+C to stop.
     #[arg(long)]
     pub watch: bool,
+
+    /// Disable diagnostic attribution. By default `tyc ty` captures
+    /// `ty`'s stdout/stderr and rewrites `path.py:line[:col]` prefixes
+    /// to the originating `.ty` source via the `.py.map` sidecars
+    /// emitted by `tyc build`. Pass `--raw` to forward `ty`'s output
+    /// verbatim (useful when piping into other tools that expect the
+    /// Python file paths, or when debugging the map itself).
+    #[arg(long)]
+    pub raw: bool,
 }
 
 pub fn run(args: TyArgs) -> Result<()> {
@@ -120,23 +132,55 @@ pub fn run(args: TyArgs) -> Result<()> {
         cmd.arg(extra);
     }
 
-    let status = cmd.status().map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => miette!(
-            "`{}` not found on PATH — install Astral's `ty` (e.g. `pip install ty` \
-             or `uv tool install ty`) or pass --ty-bin to point at your install",
-            args.ty_bin,
-        ),
+    if args.raw {
+        // Forward verbatim — no capture, no remapping.
+        let status = cmd.status().map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => missing_ty_binary_error(&args.ty_bin),
+            _ => miette!("failed to run `{} check`: {e}", args.ty_bin),
+        })?;
+        if !status.success() {
+            return Err(miette!(
+                "`{}` reported type errors (exit {})",
+                args.ty_bin,
+                status.code().unwrap_or(-1)
+            ));
+        }
+        return Ok(());
+    }
+
+    // Capture stdout + stderr so `path.py:line[:col]` references can be
+    // rewritten to the originating Typhon source via the `.py.map`
+    // sidecars next to each emitted `.py`.
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let output = cmd.output().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => missing_ty_binary_error(&args.ty_bin),
         _ => miette!("failed to run `{} check`: {e}", args.ty_bin),
     })?;
 
-    if !status.success() {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mapped_stdout = remap_ty_diagnostics(&stdout, None);
+    let mapped_stderr = remap_ty_diagnostics(&stderr, None);
+    print!("{mapped_stdout}");
+    eprint!("{mapped_stderr}");
+
+    if !output.status.success() {
         return Err(miette!(
             "`{}` reported type errors (exit {})",
             args.ty_bin,
-            status.code().unwrap_or(-1)
+            output.status.code().unwrap_or(-1)
         ));
     }
     Ok(())
+}
+
+fn missing_ty_binary_error(bin: &str) -> miette::Report {
+    miette!(
+        "`{}` not found on PATH — install Astral's `ty` (e.g. `pip install ty` \
+         or `uv tool install ty`) or pass --ty-bin to point at your install",
+        bin,
+    )
 }
 
 /// Debounce window: a burst of filesystem events (a typical editor save
@@ -252,6 +296,7 @@ fn run_once(args: &TyArgs) -> Result<()> {
         no_build: false,
         ty_args: args.ty_args.clone(),
         watch: false,
+        raw: false,
     };
     run(cloned)
 }
@@ -277,6 +322,283 @@ fn has_typhon_extension(path: &Path) -> bool {
     )
 }
 
+// ── ty diagnostic remapping ───────────────────────────────────────────────────
+
+/// Rewrite every `path.py:LINE[:COL]:` prefix in `text` to point at the
+/// originating `.ty` source via the adjacent `.py.map` sidecar.
+///
+/// `ty` (and most Python tooling) prints diagnostics as
+/// `path.py:line:col: severity: message`. We scan each output line for a
+/// leading `*.py:NN(:NN)?` reference, load the matching map, and emit
+/// `path.ty:LINE[:COL]:` with the table-mapped line. Lines without a
+/// recognisable `.py` reference are forwarded verbatim, so summary text,
+/// blank lines, and unrelated tool output round-trip unchanged.
+pub fn remap_ty_diagnostics(text: &str, map_dir: Option<&Path>) -> String {
+    use std::collections::HashMap;
+
+    let mut out = String::with_capacity(text.len());
+    // Cache of parsed maps keyed by `.py` path. `ty`'s default
+    // `--output-format full` can emit many lines for a single
+    // diagnostic (header, `-->` location, snippet, secondary
+    // notes), and each one can reference the same `.py` file.
+    // Loading + parsing the sidecar once per file across the whole
+    // output keeps the cost O(unique-files) instead of O(lines).
+    // `None` is cached so a missing or malformed sidecar isn't
+    // re-discovered on every subsequent line that references the
+    // same file.
+    let mut cache: HashMap<String, Option<SourceMap>> = HashMap::new();
+    for line in text.split_inclusive('\n') {
+        out.push_str(&remap_one_diagnostic_line(line, map_dir, &mut cache));
+    }
+    out
+}
+
+/// Rewrite one output line if it carries a `path.py:line[:col]` prefix.
+///
+/// Handles both `--output-format concise` and the default
+/// `--output-format full` (Rust-like multi-line) — only the line that
+/// contains the path:line:col span needs rewriting; surrounding context
+/// lines are forwarded verbatim because the `ty` output already paints
+/// snippet excerpts from the Python file, which would be confusing to
+/// rewrite mid-stream. Users who want full attribution should fix the
+/// Typhon source and re-run.
+fn remap_one_diagnostic_line(
+    line: &str,
+    map_dir: Option<&Path>,
+    cache: &mut std::collections::HashMap<String, Option<SourceMap>>,
+) -> String {
+    // Cheap reject: the line must contain ".py:" to be a candidate.
+    if !line.contains(".py:") {
+        return line.to_owned();
+    }
+    let Some(parsed) = parse_py_ref(line) else {
+        return line.to_owned();
+    };
+
+    let map = match cache.get(&parsed.py_path) {
+        Some(slot) => slot.as_ref(),
+        None => {
+            let parsed_map = load_map_for(&parsed.py_path, map_dir)
+                .as_deref()
+                .and_then(parse_map);
+            cache.insert(parsed.py_path.clone(), parsed_map);
+            cache.get(&parsed.py_path).and_then(|s| s.as_ref())
+        }
+    };
+    let Some(map) = map else {
+        return line.to_owned();
+    };
+
+    let ty_line = map_py_line(map, parsed.line);
+    let ty_path = resolve_ty_path(&parsed.py_path, &map.source);
+
+    let mut new_ref = format!("{ty_path}:{ty_line}");
+    if let Some(col) = parsed.col {
+        new_ref.push(':');
+        new_ref.push_str(&col.to_string());
+    }
+
+    // Splice replacement into the original line so suffix formatting
+    // (severity tag, message, ANSI codes, etc.) is preserved.
+    let before = &line[..parsed.start];
+    let after = &line[parsed.end..];
+    format!("{before}{new_ref}{after}")
+}
+
+#[derive(Debug, PartialEq)]
+struct PyRef {
+    py_path: String,
+    line: u32,
+    col: Option<u32>,
+    /// Byte offset of the full `path.py:line[:col]` substring in the
+    /// containing line.
+    start: usize,
+    end: usize,
+}
+
+/// Locate a `path.py:LINE(:COL)?` reference in `line`.
+///
+/// The path can include directory separators, spaces are rejected
+/// (so the parser doesn't gobble human-readable prose), and the
+/// match must be a contiguous substring. Returns `None` when no
+/// candidate is present.
+fn parse_py_ref(line: &str) -> Option<PyRef> {
+    // Find every `.py:` occurrence; the path is everything to the
+    // left up to the first whitespace / control character / quote.
+    let bytes = line.as_bytes();
+    let mut search_from = 0;
+    while let Some(rel) = line[search_from..].find(".py:") {
+        let py_end = search_from + rel + 3; // position of `:` after `.py`
+                                            // Walk left to find the start of the path token.
+        let mut start = py_end - 3; // start at the `.` in `.py`
+        while start > 0 {
+            let b = bytes[start - 1];
+            // Stop at whitespace, quotes, opening punctuation, or a
+            // newline. `ty`'s output can prefix the path with `  --> `,
+            // `error[ty: ...] -->`, or just leave it at the start of the
+            // line.
+            if matches!(
+                b,
+                b' ' | b'\t' | b'\n' | b'\r' | b'\'' | b'"' | b'(' | b'[' | b'<' | b'>'
+            ) {
+                break;
+            }
+            start -= 1;
+        }
+        let py_path = &line[start..py_end - 3 + 3]; // up to and incl. `.py`
+                                                    // After the `:` parse the line number.
+        let after = &line[py_end + 1..];
+        let digit_len = after.bytes().take_while(|b| b.is_ascii_digit()).count();
+        if digit_len == 0 {
+            search_from = py_end + 1;
+            continue;
+        }
+        let line_num: u32 = after[..digit_len].parse().ok()?;
+        // Optional `:col` suffix.
+        let after_line = &after[digit_len..];
+        let (col, col_consumed) = if let Some(rest) = after_line.strip_prefix(':') {
+            let col_digits = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+            if col_digits > 0 {
+                let col_val: Option<u32> = rest[..col_digits].parse().ok();
+                (col_val, 1 + col_digits)
+            } else {
+                (None, 0)
+            }
+        } else {
+            (None, 0)
+        };
+
+        let end = py_end + 1 + digit_len + col_consumed;
+        return Some(PyRef {
+            py_path: py_path.to_owned(),
+            line: line_num,
+            col,
+            start,
+            end,
+        });
+    }
+    None
+}
+
+#[cfg(test)]
+mod ty_remap_tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Plant a `.py` + `.py.map` pair in a tempdir and assert the
+    /// reference is rewritten.
+    fn with_planted_map<R>(
+        py_rel: &str,
+        ty_source: &str,
+        lines: &[u32],
+        f: impl FnOnce(&Path) -> R,
+    ) -> R {
+        let tmp = tempfile::tempdir().unwrap();
+        let py_path = tmp.path().join(py_rel);
+        std::fs::create_dir_all(py_path.parent().unwrap()).unwrap();
+        let mut f_py = std::fs::File::create(&py_path).unwrap();
+        writeln!(f_py, "# emitted").unwrap();
+        let map_path = tmp.path().join(format!("{py_rel}.map"));
+        let lines_json = serde_json::to_string(lines).unwrap();
+        std::fs::write(
+            &map_path,
+            format!(
+                "{{\"version\":2,\"source\":\"{ty_source}\",\"line_strategy\":\"table\",\"lines\":{lines_json}}}"
+            ),
+        )
+        .unwrap();
+        f(tmp.path())
+    }
+
+    #[test]
+    fn parse_py_ref_simple() {
+        let r = parse_py_ref("foo.py:42:3: error: x").unwrap();
+        assert_eq!(r.py_path, "foo.py");
+        assert_eq!(r.line, 42);
+        assert_eq!(r.col, Some(3));
+    }
+
+    #[test]
+    fn parse_py_ref_no_col() {
+        let r = parse_py_ref("a/b.py:7: warning: y").unwrap();
+        assert_eq!(r.py_path, "a/b.py");
+        assert_eq!(r.line, 7);
+        assert_eq!(r.col, None);
+    }
+
+    #[test]
+    fn parse_py_ref_with_arrow_prefix() {
+        // `ty`'s `--output-format full` style: `  --> path.py:LINE:COL`.
+        let r = parse_py_ref("  --> src/main.py:12:5").unwrap();
+        assert_eq!(r.py_path, "src/main.py");
+        assert_eq!(r.line, 12);
+        assert_eq!(r.col, Some(5));
+    }
+
+    #[test]
+    fn parse_py_ref_no_match() {
+        assert!(parse_py_ref("just some prose without a file ref").is_none());
+        // No digits after `.py:`.
+        assert!(parse_py_ref("a.py:not-a-line").is_none());
+    }
+
+    #[test]
+    fn remap_one_line_rewrites_path_and_line() {
+        with_planted_map("main.py", "main.ty", &[1, 1, 2, 3, 3], |dir| {
+            let py = dir.join("main.py").to_string_lossy().into_owned();
+            let input = format!("{py}:3:1: error: type mismatch");
+            let mut cache = std::collections::HashMap::new();
+            let out = remap_one_diagnostic_line(&input, None, &mut cache);
+            // Line 3 → ty 2 per the table; path resolves to "main.ty"
+            // (no typhon.toml planted, so the fallback returns the
+            // map's `source` field verbatim).
+            assert!(out.contains("main.ty:2:1"), "got: {out}");
+            assert!(out.ends_with("error: type mismatch"));
+        });
+    }
+
+    #[test]
+    fn remap_diagnostics_preserves_unrelated_lines() {
+        let text = "Hello world\nFound 0 errors\n";
+        let out = remap_ty_diagnostics(text, None);
+        assert_eq!(out, text);
+    }
+
+    #[test]
+    fn remap_diagnostics_skips_when_no_map_exists() {
+        // A .py reference but no sidecar: forward verbatim.
+        let text = "ghost.py:5:1: error: x\n";
+        let out = remap_ty_diagnostics(text, None);
+        assert_eq!(out, text);
+    }
+
+    #[test]
+    fn remap_diagnostics_handles_multi_line_per_file_input() {
+        // `ty --output-format full` emits several lines per
+        // diagnostic, many of which reference the same `.py:line:col`.
+        // The per-file map cache means each file is loaded + parsed
+        // exactly once — we exercise the path with a multi-line
+        // input here so a regression that re-parses per line would
+        // still produce the right output but visibly stress the
+        // hot path.
+        with_planted_map("multi.py", "multi.ty", &[1, 1, 2, 3, 3, 4], |dir| {
+            let py = dir.join("multi.py").to_string_lossy().into_owned();
+            let input = format!("{py}:3:1: error: foo\n  --> {py}:3:1\n{py}:5:2: warning: bar\n");
+            let out = remap_ty_diagnostics(&input, None);
+            // Every `.py:line[:col]` got rewritten via the table.
+            assert!(
+                out.contains("multi.ty:2:1"),
+                "first line rewrite missing: {out}"
+            );
+            assert!(
+                out.contains("multi.ty:3:2"),
+                "third line rewrite missing: {out}"
+            );
+            assert!(!out.contains("multi.py"), "raw .py refs leaked: {out}");
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +612,7 @@ mod tests {
             no_build: true,
             ty_args: vec![],
             watch: false,
+            raw: false,
         });
         assert!(result.is_err());
         let msg = format!("{:?}", result.unwrap_err());
@@ -319,6 +642,7 @@ mod tests {
             no_build: false,
             ty_args: vec![],
             watch: false,
+            raw: false,
         });
         assert!(result.is_err(), "missing ty binary should error");
 
@@ -353,6 +677,7 @@ mod tests {
             no_build: false,
             ty_args: vec![],
             watch: false,
+            raw: false,
         });
         assert!(result.is_err(), "missing binary should error");
         let msg = format!("{:?}", result.unwrap_err());
@@ -373,6 +698,7 @@ mod tests {
             no_build: true,
             ty_args: vec![],
             watch: true,
+            raw: false,
         });
         assert!(result.is_err());
         let msg = format!("{:?}", result.unwrap_err());
@@ -391,6 +717,7 @@ mod tests {
             no_build: false,
             ty_args: vec![],
             watch: true,
+            raw: false,
         });
         assert!(result.is_err());
         let msg = format!("{:?}", result.unwrap_err());

@@ -22,6 +22,19 @@
 //!    are rewritten as `class! Name(...):` — the dataclass-default of
 //!    `class` would clash with a custom constructor, so the raw-class form
 //!    is the safe target.
+//! 7. `@dataclass(frozen=True)` / `@dataclasses.dataclass(frozen=True)`
+//!    decorators are dropped and the class header gains a trailing
+//!    `frozen` modifier (`class Vec frozen:`). Mixed-keyword decorators
+//!    like `@dataclass(frozen=True, slots=True)` are also recognised.
+//! 8. `class X(Protocol):` is rewritten to `interface X:`. The lone
+//!    `Protocol` base is dropped because Typhon's `interface` keyword
+//!    already emits `class X(Protocol):` at desugar time. Multi-base
+//!    forms (`class X(Protocol, Foo):`) are left untouched because
+//!    they need manual review. `Protocol` is also stripped from any
+//!    `from typing import …` line.
+//! 9. `NAME = NewType("NAME", BASE)` at module level becomes
+//!    `newtype NAME = BASE`. The matching `from typing import NewType`
+//!    entry is dropped.
 //!
 //! Output is written next to the input with the `.ty` extension; `--check`
 //! emits to stdout without touching the disk so the user can preview.
@@ -82,6 +95,8 @@ pub fn run(args: MigrateArgs) -> Result<()> {
 pub fn migrate_source(source: &str) -> String {
     let reassigned = collect_reassigned_names(source);
     let bang_class_lines = collect_bang_class_lines(source);
+    let frozen_class_lines = collect_frozen_class_lines(source);
+    let frozen_decorator_lines = collect_frozen_decorator_lines(source);
 
     // Scope stack so the line rewriter knows whether we're currently
     // inside a `class` body (skip `let`/`mut` prepending — those are
@@ -136,6 +151,8 @@ pub fn migrate_source(source: &str) -> String {
                 &reassigned,
                 line_index,
                 &bang_class_lines,
+                &frozen_class_lines,
+                &frozen_decorator_lines,
                 in_class_body,
                 already_declared_here,
             )
@@ -187,11 +204,14 @@ pub fn migrate_source(source: &str) -> String {
 
 /// Walk every line and apply rewrite rules in order.  Returns the
 /// transformed line (without its terminator).
+#[allow(clippy::too_many_arguments)]
 fn rewrite_line(
     line: &str,
     reassigned: &HashSet<String>,
     line_index: usize,
     bang_class_lines: &HashSet<usize>,
+    frozen_class_lines: &HashSet<usize>,
+    frozen_decorator_lines: &HashSet<usize>,
     in_class_body: bool,
     already_declared_here: Option<(bool, &HashSet<String>)>,
 ) -> String {
@@ -220,12 +240,29 @@ fn rewrite_line(
         return format!("{indent}{rewritten}");
     }
 
-    // Rule 4: drop a `@dataclass` decorator line (with or without args).
+    // Rule 4 / 7: drop a `@dataclass` (with or without args) decorator
+    // line — also covers `@dataclass(frozen=True[, ...])` and the
+    // qualified `@dataclasses.dataclass(...)` form. The frozen variant
+    // has already been recorded in `frozen_decorator_lines` so the
+    // class header below can append the `frozen` modifier. The
+    // qualified prefix is checked first because it's a superset of the
+    // bare `@dataclass` form.
+    if let Some(rest) = trimmed.strip_prefix("@dataclasses.dataclass") {
+        let after = rest.trim();
+        if after.is_empty() || after.starts_with('(') {
+            return String::new();
+        }
+    }
     if let Some(rest) = trimmed.strip_prefix("@dataclass") {
         let after = rest.trim();
         if after.is_empty() || after.starts_with('(') {
             return String::new();
         }
+    }
+    // Drop a recorded frozen decorator that didn't match the prefix
+    // strip above (shouldn't happen — defensive).
+    if frozen_decorator_lines.contains(&line_index) {
+        return String::new();
     }
 
     let indent_len = line.len() - trimmed.len();
@@ -258,6 +295,31 @@ fn rewrite_line(
     // dataclass injection does not clash with the custom constructor.
     if bang_class_lines.contains(&line_index) && (body.starts_with("class ") || body == "class") {
         body = format!("class!{}", &body["class".len()..]);
+    }
+
+    // Rule 8: rewrite `class X(Protocol):` to `interface X:`. Single-
+    // base only — multi-base (Protocol + something else) needs a
+    // judgement call and is left for the user.
+    if body.starts_with("class ") {
+        if let Some(rewritten) = rewrite_protocol_class(&body) {
+            body = rewritten;
+        }
+    }
+
+    // Rule 9: rewrite a module-level `X = NewType("X", Base)` to
+    // `newtype X = Base`. Indented occurrences (inside class bodies or
+    // function bodies) are untouched — that pattern is exotic enough
+    // that automatic rewriting would surprise.
+    if indent.is_empty() {
+        if let Some(rewritten) = rewrite_newtype_declaration(&body) {
+            body = rewritten;
+        }
+    }
+
+    // Rule 7: append a trailing `frozen` modifier to a class header
+    // whose `@dataclass(frozen=True[, ...])` decorator was just dropped.
+    if frozen_class_lines.contains(&line_index) {
+        body = append_frozen_modifier(&body);
     }
 
     // Module-level annotated assignment: prepend let/mut.
@@ -337,6 +399,10 @@ const TYPING_NAMES_TO_REWRITE: &[&str] = &[
     // After the rewrite both names are dead imports.
     "Generic",
     "TypeVar",
+    // Rules 8 / 9: Protocol → `interface`, NewType → `newtype = ` —
+    // after the rewrites both names are dead imports.
+    "Protocol",
+    "NewType",
 ];
 
 /// Rewrite `from typing import …, Optional, …` by dropping any name in
@@ -576,6 +642,323 @@ fn collect_bang_class_lines(source: &str) -> HashSet<usize> {
     }
 
     out
+}
+
+/// Find every `@dataclass(frozen=True[, ...])` (and qualified-form)
+/// decorator line. The decorator itself is dropped at rewrite time;
+/// the immediately-following class header gets a `frozen` suffix
+/// (see [`collect_frozen_class_lines`]).
+fn collect_frozen_decorator_lines(source: &str) -> HashSet<usize> {
+    let mut out: HashSet<usize> = HashSet::new();
+    for (idx, raw) in source.lines().enumerate() {
+        let trimmed = raw.trim_start();
+        // Check the qualified form first because `@dataclass` is a
+        // strict prefix of `@dataclasses.dataclass`.
+        let args = if let Some(rest) = trimmed.strip_prefix("@dataclasses.dataclass") {
+            rest.trim()
+        } else if let Some(rest) = trimmed.strip_prefix("@dataclass") {
+            rest.trim()
+        } else {
+            continue;
+        };
+        // Empty args (`@dataclass`) cannot be frozen.
+        if !args.starts_with('(') {
+            continue;
+        }
+        // Find the matching `)`, skipping over string literals so
+        // a stray `)` inside a string (e.g. `@dataclass(msg="done)")`)
+        // doesn't fool the scanner. FINDINGS — gemini review of
+        // PR #105.
+        let Some(close) = find_matching_close_paren(args) else {
+            continue;
+        };
+        let inside = &args[1..close];
+        // Look for `frozen=True` as a top-level kwarg. Reject the
+        // `frozen=False` and bare `True` (positional) cases — both are
+        // unusual and we don't want surprises.
+        if args_contain_frozen_true(inside) {
+            out.insert(idx);
+        }
+    }
+    out
+}
+
+/// Find the byte offset of the `)` that closes the leading `(` in `s`.
+///
+/// `s` must start with `(`. Walks the bytes tracking paren / bracket
+/// depth and the inside-a-string state so a `)` inside a single-line
+/// quoted string is skipped. Triple-quoted strings and the rare
+/// embedded-newline-in-single-quoted-string-via-backslash case are
+/// out of scope — the migrator is best-effort and the input here is
+/// always a single source line. Returns `None` if no matching close
+/// is found within the slice.
+fn find_matching_close_paren(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut i = 0;
+    let mut in_str: Option<u8> = None; // Some(quote_char) when inside a string
+    let mut escape_next = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if escape_next {
+                escape_next = false;
+            } else if b == b'\\' {
+                escape_next = true;
+            } else if b == q {
+                in_str = None;
+            }
+        } else {
+            match b {
+                b'"' | b'\'' => in_str = Some(b),
+                b'(' | b'[' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                b']' => depth -= 1,
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Find the byte offset of the first `#` in `line` that begins a
+/// comment — i.e. the first `#` that is outside any string literal.
+/// Returns `None` if no comment is present.
+///
+/// Uses the same single-line string scanner as `find_matching_close_paren`:
+/// triple-quoted strings and backslash-continued strings are out of
+/// scope, but the input here is always a single source line so neither
+/// case applies in practice.
+fn find_comment_start(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut in_str: Option<u8> = None;
+    let mut escape_next = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if let Some(q) = in_str {
+            if escape_next {
+                escape_next = false;
+            } else if b == b'\\' {
+                escape_next = true;
+            } else if b == q {
+                in_str = None;
+            }
+        } else {
+            match b {
+                b'"' | b'\'' => in_str = Some(b),
+                b'#' => return Some(i),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// `true` when `args` (the contents between `@dataclass(` and `)`) has
+/// a top-level `frozen=True` keyword argument. Walks the comma-
+/// separated list at top-level depth so nested parens/brackets stay
+/// grouped.
+fn args_contain_frozen_true(args: &str) -> bool {
+    for piece in split_top_level_commas(args) {
+        let p = piece.trim();
+        if p == "frozen=True" || p.starts_with("frozen = True") || p.starts_with("frozen=True ") {
+            return true;
+        }
+        // Tolerate whitespace variants like `frozen = True`.
+        if let Some(rest) = p.strip_prefix("frozen") {
+            let rest = rest.trim_start();
+            if let Some(rest) = rest.strip_prefix('=') {
+                if rest.trim() == "True" {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Find every class header line whose `@dataclass(frozen=True[, ...])`
+/// decorator (recorded by [`collect_frozen_decorator_lines`]) sits
+/// directly above it (possibly with blank lines or other decorators in
+/// between, as long as they sit at the same indent).
+fn collect_frozen_class_lines(source: &str) -> HashSet<usize> {
+    let frozen_decorators = collect_frozen_decorator_lines(source);
+    let lines: Vec<&str> = source.lines().collect();
+    let mut out: HashSet<usize> = HashSet::new();
+    for (idx, raw) in lines.iter().enumerate() {
+        let trimmed = raw.trim_start();
+        if !trimmed.starts_with("class ") && trimmed != "class" {
+            continue;
+        }
+        let indent_len = raw.len() - trimmed.len();
+        let mut probe = idx;
+        while probe > 0 {
+            probe -= 1;
+            let prev = lines[probe];
+            let prev_trim = prev.trim_start();
+            if prev_trim.is_empty() {
+                continue;
+            }
+            let prev_indent = prev.len() - prev_trim.len();
+            if prev_indent != indent_len {
+                break;
+            }
+            if !prev_trim.starts_with('@') {
+                break;
+            }
+            if frozen_decorators.contains(&probe) {
+                out.insert(idx);
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Append a trailing `frozen` modifier to a class header.
+///
+/// `class Vec:` → `class Vec frozen:`
+/// `class Vec(Base):` → `class Vec(Base) frozen:`
+/// `class! Counter:` → left alone (unsupported combination)
+fn append_frozen_modifier(header: &str) -> String {
+    if !header.starts_with("class ") {
+        return header.to_owned();
+    }
+    let Some(colon_idx) = header.rfind(':') else {
+        return header.to_owned();
+    };
+    let before = &header[..colon_idx];
+    let after = &header[colon_idx..];
+    format!("{before} frozen{after}")
+}
+
+/// Rewrite `class X(Protocol):` to `interface X:`.
+///
+/// Only single-base `Protocol` is recognised — combined bases need
+/// human judgement and are left untouched. The trailing colon /
+/// comment / continuation is preserved verbatim. `Protocol[T]`
+/// (generic Protocol) is also recognised and the type parameters are
+/// kept: `class X(Protocol[T]):` → `interface X[T]:`.
+fn rewrite_protocol_class(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("class ")?;
+    let open = rest.find('(')?;
+    let name = rest[..open].trim();
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    // Find matching `)` at depth 0.
+    let bytes = rest.as_bytes();
+    let mut depth = 0i32;
+    let mut close: Option<usize> = None;
+    for (i, b) in bytes.iter().enumerate().skip(open) {
+        match *b {
+            b'(' | b'[' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(i);
+                    break;
+                }
+            }
+            b']' => depth -= 1,
+            _ => {}
+        }
+    }
+    let close = close?;
+    let inside = rest[open + 1..close].trim();
+    let trailer = &rest[close + 1..];
+
+    let bases: Vec<&str> = split_top_level_commas(inside)
+        .into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if bases.len() != 1 {
+        return None;
+    }
+    let base = bases[0];
+    // Accept `Protocol`, `typing.Protocol`, `Protocol[T, U]`,
+    // `typing.Protocol[T, U]`. The `[...]` suffix becomes the type
+    // params on the `interface` form.
+    let stripped = base
+        .strip_prefix("typing.Protocol")
+        .or_else(|| base.strip_prefix("Protocol"))?;
+    let type_params: Option<&str> = if stripped.is_empty() {
+        None
+    } else if let Some(inner) = stripped.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        Some(inner.trim())
+    } else {
+        // Suffix that isn't `[...]` — not a Protocol base.
+        return None;
+    };
+    let head = match type_params {
+        Some(params) => format!("interface {}[{}]", name, params),
+        None => format!("interface {}", name),
+    };
+    Some(format!("{head}{trailer}"))
+}
+
+/// Rewrite `NAME = NewType("NAME", BASE)` to `newtype NAME = BASE`.
+///
+/// Returns `None` when the line isn't a NewType binding, when the LHS
+/// name doesn't match the string literal, or when the second argument
+/// isn't a parseable type expression.
+fn rewrite_newtype_declaration(line: &str) -> Option<String> {
+    // Strip a trailing comment, but only at a `#` that's outside any
+    // string literal — `UserId = NewType("X#Y", int)` is legal and
+    // must round-trip. FINDINGS — gemini review of PR #105.
+    let comment_start = find_comment_start(line);
+    let code = match comment_start {
+        Some(i) => line[..i].trim(),
+        None => line.trim(),
+    };
+    let eq = code.find('=')?;
+    let lhs = code[..eq].trim();
+    if lhs.is_empty()
+        || !lhs.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        || lhs.starts_with(|c: char| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let rhs = code[eq + 1..].trim();
+    let inner = rhs
+        .strip_prefix("NewType(")
+        .or_else(|| rhs.strip_prefix("typing.NewType("))?
+        .strip_suffix(')')?;
+    let args: Vec<&str> = split_top_level_commas(inner)
+        .into_iter()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if args.len() != 2 {
+        return None;
+    }
+    // Accept `"NAME"` or `'NAME'`.
+    let name_arg = args[0];
+    let name_in_str = name_arg
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| {
+            name_arg
+                .strip_prefix('\'')
+                .and_then(|s| s.strip_suffix('\''))
+        })?;
+    if name_in_str != lhs {
+        return None;
+    }
+    let base = args[1];
+    if base.is_empty() {
+        return None;
+    }
+    Some(format!("newtype {lhs} = {base}"))
 }
 
 /// Walk `line` once and return the set of byte offsets that fall inside
@@ -1397,6 +1780,205 @@ mod tests {
         assert!(
             out.contains("class Pair[T, U]:"),
             "expected `class Pair[T, U]:`, got:\n{out}"
+        );
+    }
+
+    // ── Rule 7: frozen dataclass → `class X frozen:` ────────────────────────
+
+    #[test]
+    fn dataclass_frozen_true_becomes_frozen_class() {
+        let src = "\
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Vec:
+    x: int
+    y: int
+";
+        let out = migrate_source(src);
+        assert!(
+            out.contains("class Vec frozen:"),
+            "expected frozen modifier, got:\n{out}"
+        );
+        assert!(
+            !out.contains("@dataclass(frozen=True)"),
+            "decorator must be dropped, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn dataclass_qualified_frozen_true_becomes_frozen_class() {
+        let src = "\
+import dataclasses
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class Vec:
+    x: int
+";
+        let out = migrate_source(src);
+        assert!(out.contains("class Vec frozen:"), "got:\n{out}");
+        assert!(
+            !out.contains("@dataclasses.dataclass"),
+            "decorator must be dropped, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn dataclass_without_frozen_kw_unchanged_class_header() {
+        let src = "\
+@dataclass(slots=True)
+class Point:
+    x: int
+";
+        let out = migrate_source(src);
+        assert!(!out.contains("frozen"), "must not add frozen, got:\n{out}");
+    }
+
+    #[test]
+    fn dataclass_frozen_with_base_keeps_base() {
+        let src = "\
+@dataclass(frozen=True)
+class Vec(Base):
+    x: int
+";
+        let out = migrate_source(src);
+        assert!(out.contains("class Vec(Base) frozen:"), "got:\n{out}");
+    }
+
+    // ── Rule 8: Protocol → interface ────────────────────────────────────────
+
+    #[test]
+    fn protocol_base_becomes_interface() {
+        let src = "\
+from typing import Protocol
+
+class Drawable(Protocol):
+    def draw(self) -> None: ...
+";
+        let out = migrate_source(src);
+        assert!(
+            out.contains("interface Drawable:"),
+            "expected interface decl, got:\n{out}"
+        );
+        assert!(
+            !out.contains("from typing import Protocol"),
+            "Protocol import must be dropped, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn generic_protocol_becomes_interface_with_params() {
+        let src = "\
+from typing import Protocol, TypeVar
+T = TypeVar(\"T\")
+class Box(Protocol[T]):
+    def get(self) -> T: ...
+";
+        let out = migrate_source(src);
+        assert!(
+            out.contains("interface Box[T]:"),
+            "expected `interface Box[T]:`, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn protocol_with_extra_base_left_alone() {
+        // Combined bases need human judgement.
+        let src = "\
+from typing import Protocol
+
+class Drawable(Protocol, ABC):
+    def draw(self) -> None: ...
+";
+        let out = migrate_source(src);
+        assert!(
+            !out.contains("interface Drawable"),
+            "multi-base Protocol must be left alone, got:\n{out}"
+        );
+    }
+
+    // ── Rule 9: NewType → newtype ───────────────────────────────────────────
+
+    #[test]
+    fn newtype_declaration_rewrites_to_newtype_keyword() {
+        let src = "\
+from typing import NewType
+
+UserId = NewType(\"UserId\", int)
+Email = NewType(\"Email\", str)
+";
+        let out = migrate_source(src);
+        assert!(
+            out.contains("newtype UserId = int"),
+            "expected newtype UserId, got:\n{out}"
+        );
+        assert!(
+            out.contains("newtype Email = str"),
+            "expected newtype Email, got:\n{out}"
+        );
+        assert!(
+            !out.contains("from typing import NewType"),
+            "NewType import must be dropped, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn newtype_with_mismatched_name_left_alone() {
+        // `UserId = NewType("user_id", int)` — the string doesn't match
+        // the LHS, so the rewrite skips it (likely a copy-paste bug).
+        let src = "UserId = NewType(\"user_id\", int)\n";
+        let out = migrate_source(src);
+        assert!(
+            !out.contains("newtype"),
+            "name mismatch must skip rewrite, got:\n{out}"
+        );
+    }
+
+    // ── string-aware scanners (gemini PR #105 review) ───────────────────────
+
+    #[test]
+    fn frozen_decorator_paren_scan_skips_paren_inside_string() {
+        // `@dataclass(metadata="done)")` — the closing paren inside
+        // the string must NOT be mistaken for the decorator's
+        // closing `)`, which would truncate the decorator scan and
+        // miss the `frozen=True` kwarg later on the same line.
+        let src = "\
+@dataclass(metadata=\"done)\", frozen=True)
+class Vec:
+    x: int
+";
+        let out = migrate_source(src);
+        assert!(
+            out.contains("class Vec frozen:"),
+            "string-embedded `)` must not break the paren scan; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn newtype_hash_inside_string_not_treated_as_comment() {
+        // `UserId = NewType("User#ID", int)` — the `#` is inside the
+        // string literal and must not be stripped as a comment.
+        let src = "UserId = NewType(\"User#ID\", int)\n";
+        let out = migrate_source(src);
+        // String contents differ from LHS name (`User#ID` ≠ `UserId`)
+        // so the rewrite still skips — that's the correct behaviour.
+        // The important assertion is that the scan didn't panic / mis-
+        // strip; verify the original line survives intact.
+        assert!(
+            out.contains("NewType(\"User#ID\", int)"),
+            "string-embedded `#` must not be stripped; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn newtype_hash_inside_string_matches_lhs_rewrites() {
+        // Same name on both sides — the `#`-inside-string handling
+        // means the rewrite proceeds even with an unusual literal.
+        let src = "User_ID = NewType(\"User_ID\", int)  # the canonical id\n";
+        let out = migrate_source(src);
+        assert!(
+            out.contains("newtype User_ID = int"),
+            "rewrite must work with a trailing real comment; got:\n{out}"
         );
     }
 }

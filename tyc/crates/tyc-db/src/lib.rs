@@ -20,7 +20,7 @@ use tyc_syntax::{
         expand_gather_blocks, expand_go_calls, expand_inline_question_ops, expand_lazy_lets,
         expand_multiline_guards, expand_pipes, expand_question_ops, expand_typed_let_unpack,
         expand_with_chains, line_byte_starts, preprocess, validate_extend_usage,
-        validate_lazy_usage, validate_question_ops,
+        validate_lazy_usage, validate_question_ops, PreprocessResult,
     },
 };
 use tyc_types::{
@@ -51,17 +51,64 @@ pub struct SourceFile {
 /// preprocess pass.
 #[salsa::tracked]
 pub fn preprocessed_text(db: &dyn salsa::Database, file: SourceFile) -> String {
+    // Delegate to the full-result query so the expand+preprocess work is
+    // shared with `resolved_module` and the check pipeline. Salsa caches
+    // both queries independently: if only the text query is consumed,
+    // the per-revision cost is still one preprocess pass.
+    preprocessed_full(db, file).python_source.clone()
+}
+
+/// Newtype wrapper around `Arc<PreprocessResult>` so we can satisfy
+/// `salsa::Update` without violating the orphan rule. Mirrors
+/// [`ArcResolvedModule`] / [`ArcDiagnostics`] — pointer equality is the
+/// equivalence relation, which is conservative but sound (Salsa only
+/// calls `maybe_update` after the query body has re-run).
+#[derive(Clone)]
+pub struct ArcPreprocessResult(pub Arc<PreprocessResult>);
+
+impl PartialEq for ArcPreprocessResult {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ArcPreprocessResult {}
+
+impl std::ops::Deref for ArcPreprocessResult {
+    type Target = PreprocessResult;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+// SAFETY: same argument as for `ArcResolvedModule`.
+unsafe impl salsa::Update for ArcPreprocessResult {
+    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
+        if Arc::ptr_eq(&(*old_pointer).0, &new_value.0) {
+            false
+        } else {
+            *old_pointer = new_value;
+            true
+        }
+    }
+}
+
+/// Tracked query: run sugar-expansion + the preprocessor and cache the
+/// full [`PreprocessResult`].
+///
+/// Both [`preprocessed_text`] and [`resolved_module`] need the same
+/// expand-then-preprocess pipeline; sharing it through this query means
+/// each source-text change runs the work exactly once instead of three
+/// times (preprocessed_text, resolved_module, and the check pipeline).
+#[salsa::tracked]
+pub fn preprocessed_full(db: &dyn salsa::Database, file: SourceFile) -> ArcPreprocessResult {
     let text = file.text(db);
-    // Apply Typhon sugar expansion in the same order as `check_file` and the
-    // build pipeline: multi-line guard → gather → go → with-chains → pipes → `?`.
-    // The multi-line guard pre-pass runs first so its body can still contain
-    // any of the later forms (`gather:`, `?`, pipes, etc.).
     let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
         &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
             &expand_multiline_guards(&expand_lazy_lets(&expand_typed_let_unpack(text))),
         ))),
     )));
-    preprocess(&expanded).python_source
+    ArcPreprocessResult(Arc::new(preprocess(&expanded)))
 }
 
 /// Tracked query: the names declared at the top level of the module.
@@ -73,17 +120,9 @@ pub fn preprocessed_text(db: &dyn salsa::Database, file: SourceFile) -> String {
 /// that's salsa-cacheable today.
 #[salsa::tracked]
 pub fn module_decl_names(db: &dyn salsa::Database, file: SourceFile) -> Vec<String> {
-    let source = preprocessed_text(db, file);
-    let path = file.path(db).clone();
-    let parsed = match parse_module(&source) {
-        Ok(p) => p,
-        Err(_) => return Vec::new(),
-    };
-    let module = parsed.into_syntax();
-    // This query only reads names, so the default options are fine — no
-    // call site walks the bindings for raw-class kind from here.
-    let (resolved, _) = resolve_module_with(path, &source, &module, ResolveOptions::default());
-    resolved
+    // Reuse the cached resolved module so a hover / completion path
+    // doesn't trigger an independent parse+resolve cycle.
+    resolved_module(db, file)
         .module_scope()
         .bindings
         .iter()
@@ -207,18 +246,11 @@ fn check_diagnostics(db: &dyn salsa::Database, file: SourceFile) -> ArcDiagnosti
 pub fn resolved_module(db: &dyn salsa::Database, file: SourceFile) -> ArcResolvedModule {
     let raw_text = file.text(db).clone();
     let path = file.path(db).clone();
-    // Re-run the sugar-expand + preprocess pipeline here so the resolver
-    // has access to the full preprocess metadata (raw class lines, …).
-    // `preprocessed_text` caches the same expansion, so the Salsa cache
-    // hit on subsequent reads still avoids double work for callers that
-    // only need the text. The cost here is one extra preprocess per
-    // source change, which is bounded by file size and cheap.
-    let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
-        &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-            &expand_multiline_guards(&expand_lazy_lets(&expand_typed_let_unpack(&raw_text))),
-        ))),
-    )));
-    let prep = preprocess(&expanded);
+    // Pull the cached preprocess result instead of running the sugar
+    // pipeline again. After the first consumer in a revision triggers
+    // `preprocessed_full`, subsequent calls (this query, the type-check
+    // pipeline, the LSP hover path) are cache hits.
+    let prep = preprocessed_full(db, file);
     let lazy_import_remaps = build_lazy_import_remaps(&raw_text, &prep.lazy_imports);
     let options = ResolveOptions {
         raw_class_byte_starts: line_byte_starts(&prep.python_source, &prep.raw_class_lines),
@@ -481,43 +513,62 @@ pub fn module_shapes_query(db: &dyn salsa::Database, file: SourceFile) -> ArcMod
 /// which couldn't be represented as a Salsa input without dragging
 /// the whole project's source state into the cache.
 pub fn check_file_with_imports(
-    _db: &mut TycDatabase,
+    db: &mut TycDatabase,
     path: String,
     text: String,
     shapes_by_module: &std::sync::Arc<std::collections::HashMap<String, ModuleShapes>>,
 ) -> Diagnostics {
-    check_impl_with_imports(&path, &text, shapes_by_module)
+    let file = SourceFile::new(db, path, text);
+    check_source_file_with_imports(db, file, shapes_by_module)
 }
 
-/// Cross-module variant of [`check_impl`] used by
-/// [`check_file_with_imports`]. Runs the same parse + resolve +
-/// type-check pipeline but pre-walks the resolved module's import
-/// bindings to assemble an [`ExternalShapes`] snapshot that the
-/// checker seeds before walking the body.
-fn check_impl_with_imports(
-    path: &str,
-    text: &str,
+/// Cross-module variant of [`check_source_file`] that consults a pre-
+/// built project-wide shape registry.
+///
+/// Like [`check_source_file`] this takes a [`SourceFile`] handle —
+/// callers (LSP, watch-mode build drivers) hold one per file across
+/// invocations and update its `text` via `set_text`. The Salsa-tracked
+/// `preprocessed_full` and `resolved_module` queries make the parse +
+/// resolve cycle a cache hit when the file's text hasn't changed; only
+/// the type-check (which depends on the per-invocation
+/// `shapes_by_module` registry, not a Salsa input) actually runs again.
+pub fn check_source_file_with_imports(
+    db: &mut TycDatabase,
+    file: SourceFile,
     shapes_by_module: &std::sync::Arc<std::collections::HashMap<String, ModuleShapes>>,
 ) -> Diagnostics {
+    let path = file.path(db).clone();
+    let text = file.text(db).clone();
+
     let mut diags = Diagnostics::new();
 
-    for err in validate_question_ops(text) {
+    // The validation passes run on the raw source — cheap regex-ish
+    // scans, no AST. We keep them outside the cached pipeline because
+    // their diagnostics depend on column/offset detail that the
+    // preprocess pass discards.
+    for err in validate_question_ops(&text) {
         diags.push_error(TycError::invalid_question_op(
             err.message,
-            path,
-            text,
+            &path,
+            &text,
             err.offset,
             1,
         ));
     }
-    for err in validate_lazy_usage(text) {
-        diags.push_error(TycError::lazy_usage(err.message, path, text, err.offset, 4));
+    for err in validate_lazy_usage(&text) {
+        diags.push_error(TycError::lazy_usage(
+            err.message,
+            &path,
+            &text,
+            err.offset,
+            4,
+        ));
     }
-    for err in validate_extend_usage(text) {
+    for err in validate_extend_usage(&text) {
         diags.push_error(TycError::extend_builtin(
             err.message,
-            path,
-            text,
+            &path,
+            &text,
             err.offset,
             6,
         ));
@@ -526,19 +577,24 @@ fn check_impl_with_imports(
         return diags;
     }
 
-    let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
-        &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
-            &expand_multiline_guards(&expand_lazy_lets(&expand_typed_let_unpack(text))),
-        ))),
-    )));
-    let prep = preprocess(&expanded);
+    // Tracked queries: this is the cache win — these two return the
+    // same Arc when `file.text` hasn't changed since the last call.
+    let prep = preprocessed_full(db, file);
+    let resolved_arc = resolved_module(db, file);
 
+    // Parse the module body for the type checker. The parse output
+    // isn't cached as its own Salsa value because the `ModModule`
+    // AST is huge and doesn't implement `salsa::Update`; instead we
+    // re-parse from the cached preprocessed source. The cost is one
+    // O(file) parse per check call; the bigger win — skipping the
+    // expand + preprocess pipeline — is already realised by the
+    // tracked `preprocessed_full` above.
     let module = match parse_module(&prep.python_source) {
         Ok(p) => p.into_syntax(),
         Err(e) => {
             diags.push_error(TycError::parse(
-                path.to_owned(),
-                prep.python_source,
+                path,
+                prep.python_source.clone(),
                 e.to_string(),
                 usize::from(e.location.start()),
             ));
@@ -546,24 +602,25 @@ fn check_impl_with_imports(
         }
     };
 
+    // Re-run resolve once to capture the diagnostic Vec — the resolved
+    // bindings themselves come from the cached query so downstream
+    // shape-extraction sees the same data structure. The cost is one
+    // extra resolve pass; eliminating it requires moving resolve
+    // diagnostics into `ArcResolvedModule`, which is a larger refactor.
     let resolve_options = ResolveOptions {
         raw_class_byte_starts: line_byte_starts(&prep.python_source, &prep.raw_class_lines),
-        lazy_import_remaps: build_lazy_import_remaps(text, &prep.lazy_imports),
-        original_source: Some(text.to_owned()),
+        lazy_import_remaps: build_lazy_import_remaps(&text, &prep.lazy_imports),
+        original_source: Some(text.clone()),
     };
-    let (resolved, resolve_diags) = resolve_module_with(
-        path.to_owned(),
-        &prep.python_source,
-        &module,
-        resolve_options,
-    );
+    let (_resolved_fresh, resolve_diags) =
+        resolve_module_with(path.clone(), &prep.python_source, &module, resolve_options);
     diags.extend(resolve_diags);
 
-    let external = build_external_shapes(&resolved, shapes_by_module);
+    let external = build_external_shapes(&resolved_arc, shapes_by_module);
     let type_diags = check_module_with_imports(
-        path.to_owned(),
+        path,
         &prep.python_source,
-        &resolved,
+        &resolved_arc,
         &module,
         &prep.unsafe_lines,
         &prep.frozen_class_lines,
@@ -1632,6 +1689,55 @@ def f(x: str?) -> None:
         assert!(
             std::sync::Arc::ptr_eq(&d1.0, &d2.0),
             "second call must be a Salsa cache hit (same Arc pointer)"
+        );
+    }
+
+    #[test]
+    fn preprocessed_full_shared_across_queries() {
+        // The whole point of `preprocessed_full` is that downstream
+        // tracked queries (`preprocessed_text`, `resolved_module`,
+        // `module_decl_names`) share its result. After a single
+        // revision, each subsequent call returns identical data with
+        // no extra preprocess pass.
+        let db = TycDatabase::new();
+        let sf = SourceFile::new(
+            &db,
+            "<test>".to_owned(),
+            "let x: int = 1\ndef f() -> None:\n    pass\n".to_owned(),
+        );
+        let p1 = preprocessed_full(&db, sf);
+        let p2 = preprocessed_full(&db, sf);
+        assert!(
+            std::sync::Arc::ptr_eq(&p1.0, &p2.0),
+            "second call must hit the Salsa cache"
+        );
+        // Downstream queries should produce consistent results.
+        let text = preprocessed_text(&db, sf);
+        assert_eq!(text, p1.python_source);
+        let names = module_decl_names(&db, sf);
+        assert!(names.contains(&"x".to_owned()));
+        assert!(names.contains(&"f".to_owned()));
+    }
+
+    #[test]
+    fn check_source_file_with_imports_uses_cache() {
+        // `check_source_file_with_imports` should benefit from the
+        // tracked preprocess + resolve queries — calling it twice
+        // with the same SourceFile (no `set_text`) should return
+        // structurally equivalent diagnostics without re-running the
+        // expensive preprocess pass.
+        let mut db = TycDatabase::new();
+        let sf = SourceFile::new(&db, "<test>".to_owned(), "let x: int = 1\n".to_owned());
+        let registry: std::sync::Arc<std::collections::HashMap<String, ModuleShapes>> =
+            std::sync::Arc::new(std::collections::HashMap::new());
+        let p_before = preprocessed_full(&db, sf);
+        let diags = check_source_file_with_imports(&mut db, sf, &registry);
+        assert!(!diags.has_errors(), "{:?}", diags.errors());
+        let p_after = preprocessed_full(&db, sf);
+        assert!(
+            std::sync::Arc::ptr_eq(&p_before.0, &p_after.0),
+            "the imports-aware check must consume the cached \
+             preprocess result, not allocate a new one"
         );
     }
 

@@ -26,7 +26,7 @@ use tower_lsp_server::ls_types::{
 };
 use tower_lsp_server::{jsonrpc, Client, LanguageServer, LspService, Server};
 use tyc_db::{
-    check_file_with_imports, check_source_file, module_shapes_query, preprocessed_text,
+    check_source_file, check_source_file_with_imports, module_shapes_query, preprocessed_text,
     resolved_module_arc, ModuleShapes, SourceFile, TycDatabase,
 };
 use tyc_diagnostics::TycError;
@@ -250,12 +250,15 @@ impl Backend {
                 // `module_shapes_query` cache: unchanged sibling
                 // files reuse the cached extraction, so a keystroke
                 // in the open file only re-parses that one file.
-                check_file_with_imports(
-                    &mut *db,
-                    uri_str_for_check,
-                    text_for_check,
-                    &project_shapes,
-                )
+                // Use the SourceFile-backed entry point so the
+                // tracked `preprocessed_full` / `resolved_module`
+                // queries can return cached values for unchanged
+                // files. The LSP already holds `source_file` across
+                // edits, which is the input that gates the cache.
+                // (`uri_str_for_check` / `text_for_check` are
+                // consumed in the `build_project_shapes_salsa` call
+                // above so we don't need to thread them again here.)
+                check_source_file_with_imports(&mut *db, source_file, &project_shapes)
             };
             // Retrieve the preprocessed source for diagnostic position
             // mapping.  After `check_source_file` runs the full pipeline the
