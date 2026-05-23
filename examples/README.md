@@ -120,7 +120,7 @@ Example 47 ships as a real multi-file project with its own
 |---|---|---|
 | 48 | `newtype` IDs | nominal aliases, `UserId`/`PostId`/`Email`, escape-upward rule, `tyc::newtype_violation` |
 
-These examples demonstrate v0.3.0 language features (`newtype`, `freeze let`, `pub`) that are covered in depth in [guide 10](../docs/guides/10-advanced-features.md).
+Example 48 demonstrates `newtype`; the companion v0.3.0 features (`freeze let`, `pub`) are covered in depth in [guide 10](../docs/guides/10-advanced-features.md) and don't yet have dedicated example dirs.
 
 ### Bonus
 

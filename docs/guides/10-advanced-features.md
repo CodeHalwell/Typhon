@@ -502,7 +502,7 @@ CONFIG = __typhon_freeze__({"port": 8080, "hosts": ["api.example.com", "api2.exa
 
 Reach for `comptime` for build-time constants (ports, feature flags, API versions). Reach for `freeze let` for large look-up tables and configuration dicts that are expensive to build but must be immutable.
 
-**Limitation in v0.3.0:** `freeze let` is module-level only; class-body use is planned for v0.4.
+**Current limitation:** `freeze let` is module-level only; class-body use is planned for a future release.
 
 ---
 
