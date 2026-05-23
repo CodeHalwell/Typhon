@@ -1,9 +1,15 @@
-# Stress round 2026-05-23 — Python semantic-drift audit (mini)
+# Stress round 2026-05-23 — Python semantic-drift audit (3 rounds)
 
-A small audit run as part of the Phase-5.2 broadening called out in
-`docs/roadmap.md`. Fifteen probes, each one an idiom CPython 3.13
-accepts at runtime; `tyc check` flags any that the type checker
-over-rejects.
+A focused audit run as part of the Phase-5.2 broadening called out in
+`docs/roadmap.md`. Three rounds of fifteen probes each (45 total),
+each probe an idiom CPython 3.13 accepts at runtime; `tyc check`
+flags any that the type checker over-rejects.
+
+- `15-probes.ty` — round 1: bool/int/float, containers, comprehensions,
+  generic functions, tuple unpacking.
+- `45-probes-round-2-and-3.ty` — rounds 2 & 3: inheritance,
+  protocols, decorators, async, generics, exception flow, slicing,
+  star-args, optional chaining.
 
 ## How to re-run
 

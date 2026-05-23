@@ -30,8 +30,25 @@ adjusted to match CPython's semantics.
 
 Cases closed:
 
-- `bool ⊆ int` in arithmetic and assignment — landed in `2225099`, surfaced
-  by this diagnostic in `d46a1aa`. `let x: int = 1 + True` type-checks.
+- `bool ⊆ int` in arithmetic and assignment. `assignable` accepts
+  `(Int, Bool)` and `(Float, Bool)` so `let x: int = True` /
+  `let x: float = False` type-check; the BinOp arm folds
+  `Int | Bool` operands into Int so `let x: int = 1 + True` works;
+  unary `-True` / `~True` yield Int. The widening is one-way — `int`
+  does NOT flow into `bool`. Regression tests
+  `bool_assignable_to_int`, `bool_assignable_to_float`,
+  `bool_arithmetic_with_int_yields_int`,
+  `bool_arithmetic_both_bools_yields_int`,
+  `bool_unary_arithmetic_yields_int`, `int_not_assignable_to_bool`
+  in `tyc-types`.
+- BinOp with a foreign-class operand no longer over-promotes to
+  `float` (`4.0 * tensor + ...` used to reject because the
+  `(Float, _)` arm caught `(Float, Class("Tensor"))` and returned
+  `Float`; now only matches when both sides are numeric primitives
+  and falls through to `Unknown` otherwise, letting the surrounding
+  annotation drive). Found by the new corpus CI sweep against
+  `examples/33-pytorch-tensors/pytorch_tensors.ty`. Test:
+  `binop_with_class_operand_stays_unknown_not_float`.
 - `or` / `and` truthy-union typing — `let chunk: str = update.text or ""`
   now flows through. See `docs/language.md` Python-semantics section.
 - Generator function → `Iterable[T]` / `Iterator[T]` / async variants —

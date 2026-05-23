@@ -206,6 +206,15 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
         (Type::TypeVar(_), _) | (_, Type::TypeVar(_)) => true,
         (Type::Unknown, _) | (_, Type::Unknown) => true,
         (Type::Float, Type::Int) => true,
+        // CPython: `bool` is a subtype of `int` (`True == 1`, `False == 0`),
+        // and `int` is widening-compatible with `float`. Both rules are
+        // one-way: `int` does NOT flow into `bool` (a narrowing, not a
+        // widening). Without these arms, `let x: int = True` and
+        // `let total: int = 1 + True` would over-reject — the canonical
+        // case the `tyc::python_semantic_drift` diagnostic was created
+        // to flag.
+        (Type::Int, Type::Bool) => true,
+        (Type::Float, Type::Bool) => true,
         // Union/Union must come before the single-Union arms: every actual
         // variant has to be assignable to *some* expected variant. Falling
         // through to `(Union, other)` then `(other, Union)` recursively
@@ -6798,8 +6807,18 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // the existing assignability check.
                     Type::Float
                 }
-                (Type::Int, Type::Int) => Type::Int,
-                (Type::Float, _) | (_, Type::Float) => Type::Float,
+                // Bool is a subtype of int; any non-division numeric op on
+                // Int/Bool operands yields Int. Float wins only when BOTH
+                // sides are numeric primitives — if one side is a foreign
+                // class (e.g. `torch.Tensor`), the result type is whatever
+                // that class's `__add__` / `__mul__` returns, which we
+                // can't see without stubs. Conservatively fall through to
+                // Unknown so the surrounding annotation drives assignability
+                // instead of mis-promoting to Float and rejecting valid
+                // numpy/torch code.
+                (Type::Int | Type::Bool, Type::Int | Type::Bool) => Type::Int,
+                (Type::Float, Type::Float | Type::Int | Type::Bool)
+                | (Type::Int | Type::Bool, Type::Float) => Type::Float,
                 (Type::Str, Type::Str) if matches!(b.op, Operator::Add) => Type::Str,
                 _ => Type::Unknown,
             }
@@ -6812,6 +6831,10 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                 // Boolean negation always produces a bool, regardless of
                 // operand type (Python: `not x` returns a bool).
                 ruff_python_ast::UnaryOp::Not => Type::Bool,
+                // Arithmetic / bitwise unary ops on `bool` produce `int`:
+                // `-True == -1`, `~True == -2`. Preserves other operand
+                // types unchanged.
+                _ if operand == Type::Bool => Type::Int,
                 // Bitwise / arithmetic unary ops preserve the operand type.
                 _ => operand,
             }
@@ -10929,6 +10952,95 @@ let s: str = id(3)
         // widen to float when the target is `tuple[float, ...]`.
         let d = check("let xs: tuple[float, ...] = (1, 2, 3)\n");
         assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    // ── bool ⊆ int subtype widening ──────────────────────────────────────
+
+    #[test]
+    fn bool_assignable_to_int() {
+        // CPython: bool is a strict subclass of int.
+        let d = check("let x: int = True\n");
+        assert!(
+            !d.has_errors(),
+            "bool must be assignable to int; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn bool_assignable_to_float() {
+        // bool → int → float (transitive via widening chain).
+        let d = check("let x: float = False\n");
+        assert!(
+            !d.has_errors(),
+            "bool must be assignable to float; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn bool_arithmetic_with_int_yields_int() {
+        // `1 + True` produces int (not Unknown).
+        let d = check("let x: int = 1 + True\n");
+        assert!(
+            !d.has_errors(),
+            "1 + True must type-check as int; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn bool_arithmetic_both_bools_yields_int() {
+        // `True + False` has type int (Python: evaluates to 1).
+        let d = check("let x: int = True + False\n");
+        assert!(
+            !d.has_errors(),
+            "True + False must type-check as int; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn bool_unary_arithmetic_yields_int() {
+        // `-True` produces int (`== -1`), `~True` produces int (`== -2`).
+        let d = check("let x: int = -True\nlet y: int = ~True\n");
+        assert!(
+            !d.has_errors(),
+            "unary -/~ on bool must yield int; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn int_not_assignable_to_bool() {
+        // The widening is one-way: `let b: bool = 1` must still reject.
+        let d = check("let b: bool = 1\n");
+        assert!(
+            d.has_errors(),
+            "int must NOT flow into bool — the widening is one-way"
+        );
+    }
+
+    #[test]
+    fn binop_with_class_operand_stays_unknown_not_float() {
+        // Regression: `4.0 * tensor_value + ...` must not over-promote
+        // the result to `float` when one operand is a foreign class.
+        // The previous `(Float, _) | (_, Float) => Float` arm rejected
+        // valid numpy/torch code where the user annotated the result as
+        // the foreign class (`let y: torch.Tensor = 4.0 * x.sum()`).
+        let d = check(
+            "class Tensor: dummy: int\n\
+             def f(t: Tensor) -> Tensor:\n\
+             \x20   return 4.0 * t\n",
+        );
+        // The call site `4.0 * t` should infer to Unknown (we don't
+        // know Tensor.__rmul__), letting the surrounding `-> Tensor`
+        // annotation drive assignability via the (Unknown, _) arm.
+        assert!(
+            !d.has_errors(),
+            "binop with a foreign class operand must not over-promote to float; got {:?}",
+            d.errors()
+        );
     }
 
     #[test]
