@@ -255,7 +255,9 @@ impl Backend {
                 // queries can return cached values for unchanged
                 // files. The LSP already holds `source_file` across
                 // edits, which is the input that gates the cache.
-                let _ = (uri_str_for_check, text_for_check);
+                // (`uri_str_for_check` / `text_for_check` are
+                // consumed in the `build_project_shapes_salsa` call
+                // above so we don't need to thread them again here.)
                 check_source_file_with_imports(&mut *db, source_file, &project_shapes)
             };
             // Retrieve the preprocessed source for diagnostic position

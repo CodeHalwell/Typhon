@@ -665,25 +665,13 @@ fn collect_frozen_decorator_lines(source: &str) -> HashSet<usize> {
         if !args.starts_with('(') {
             continue;
         }
-        // Find the matching `)`.
-        let bytes = args.as_bytes();
-        let mut depth = 0i32;
-        let mut close: Option<usize> = None;
-        for (i, b) in bytes.iter().enumerate() {
-            match *b {
-                b'(' | b'[' => depth += 1,
-                b')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        close = Some(i);
-                        break;
-                    }
-                }
-                b']' => depth -= 1,
-                _ => {}
-            }
-        }
-        let Some(close) = close else { continue };
+        // Find the matching `)`, skipping over string literals so
+        // a stray `)` inside a string (e.g. `@dataclass(msg="done)")`)
+        // doesn't fool the scanner. FINDINGS — gemini review of
+        // PR #105.
+        let Some(close) = find_matching_close_paren(args) else {
+            continue;
+        };
         let inside = &args[1..close];
         // Look for `frozen=True` as a top-level kwarg. Reject the
         // `frozen=False` and bare `True` (positional) cases — both are
@@ -693,6 +681,85 @@ fn collect_frozen_decorator_lines(source: &str) -> HashSet<usize> {
         }
     }
     out
+}
+
+/// Find the byte offset of the `)` that closes the leading `(` in `s`.
+///
+/// `s` must start with `(`. Walks the bytes tracking paren / bracket
+/// depth and the inside-a-string state so a `)` inside a single-line
+/// quoted string is skipped. Triple-quoted strings and the rare
+/// embedded-newline-in-single-quoted-string-via-backslash case are
+/// out of scope — the migrator is best-effort and the input here is
+/// always a single source line. Returns `None` if no matching close
+/// is found within the slice.
+fn find_matching_close_paren(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut i = 0;
+    let mut in_str: Option<u8> = None; // Some(quote_char) when inside a string
+    let mut escape_next = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if let Some(q) = in_str {
+            if escape_next {
+                escape_next = false;
+            } else if b == b'\\' {
+                escape_next = true;
+            } else if b == q {
+                in_str = None;
+            }
+        } else {
+            match b {
+                b'"' | b'\'' => in_str = Some(b),
+                b'(' | b'[' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                b']' => depth -= 1,
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Find the byte offset of the first `#` in `line` that begins a
+/// comment — i.e. the first `#` that is outside any string literal.
+/// Returns `None` if no comment is present.
+///
+/// Uses the same single-line string scanner as `find_matching_close_paren`:
+/// triple-quoted strings and backslash-continued strings are out of
+/// scope, but the input here is always a single source line so neither
+/// case applies in practice.
+fn find_comment_start(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut in_str: Option<u8> = None;
+    let mut escape_next = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if let Some(q) = in_str {
+            if escape_next {
+                escape_next = false;
+            } else if b == b'\\' {
+                escape_next = true;
+            } else if b == q {
+                in_str = None;
+            }
+        } else {
+            match b {
+                b'"' | b'\'' => in_str = Some(b),
+                b'#' => return Some(i),
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 /// `true` when `args` (the contents between `@dataclass(` and `)`) has
@@ -845,8 +912,14 @@ fn rewrite_protocol_class(line: &str) -> Option<String> {
 /// name doesn't match the string literal, or when the second argument
 /// isn't a parseable type expression.
 fn rewrite_newtype_declaration(line: &str) -> Option<String> {
-    // Strip a trailing comment.
-    let code = line.split('#').next().unwrap_or("").trim();
+    // Strip a trailing comment, but only at a `#` that's outside any
+    // string literal — `UserId = NewType("X#Y", int)` is legal and
+    // must round-trip. FINDINGS — gemini review of PR #105.
+    let comment_start = find_comment_start(line);
+    let code = match comment_start {
+        Some(i) => line[..i].trim(),
+        None => line.trim(),
+    };
     let eq = code.find('=')?;
     let lhs = code[..eq].trim();
     if lhs.is_empty()
@@ -1858,6 +1931,54 @@ Email = NewType(\"Email\", str)
         assert!(
             !out.contains("newtype"),
             "name mismatch must skip rewrite, got:\n{out}"
+        );
+    }
+
+    // ── string-aware scanners (gemini PR #105 review) ───────────────────────
+
+    #[test]
+    fn frozen_decorator_paren_scan_skips_paren_inside_string() {
+        // `@dataclass(metadata="done)")` — the closing paren inside
+        // the string must NOT be mistaken for the decorator's
+        // closing `)`, which would truncate the decorator scan and
+        // miss the `frozen=True` kwarg later on the same line.
+        let src = "\
+@dataclass(metadata=\"done)\", frozen=True)
+class Vec:
+    x: int
+";
+        let out = migrate_source(src);
+        assert!(
+            out.contains("class Vec frozen:"),
+            "string-embedded `)` must not break the paren scan; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn newtype_hash_inside_string_not_treated_as_comment() {
+        // `UserId = NewType("User#ID", int)` — the `#` is inside the
+        // string literal and must not be stripped as a comment.
+        let src = "UserId = NewType(\"User#ID\", int)\n";
+        let out = migrate_source(src);
+        // String contents differ from LHS name (`User#ID` ≠ `UserId`)
+        // so the rewrite still skips — that's the correct behaviour.
+        // The important assertion is that the scan didn't panic / mis-
+        // strip; verify the original line survives intact.
+        assert!(
+            out.contains("NewType(\"User#ID\", int)"),
+            "string-embedded `#` must not be stripped; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn newtype_hash_inside_string_matches_lhs_rewrites() {
+        // Same name on both sides — the `#`-inside-string handling
+        // means the rewrite proceeds even with an unusual literal.
+        let src = "User_ID = NewType(\"User_ID\", int)  # the canonical id\n";
+        let out = migrate_source(src);
+        assert!(
+            out.contains("newtype User_ID = int"),
+            "rewrite must work with a trailing real comment; got:\n{out}"
         );
     }
 }

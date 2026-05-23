@@ -20,7 +20,9 @@ use miette::{miette, Result};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 
 use crate::commands::build::{self, BuildArgs};
-use crate::commands::source_map::{load_map_for, map_py_line, parse_map, resolve_ty_path};
+use crate::commands::source_map::{
+    load_map_for, map_py_line, parse_map, resolve_ty_path, SourceMap,
+};
 use crate::config::TyphonConfig;
 
 /// Arguments for `tyc ty`.
@@ -332,13 +334,21 @@ fn has_typhon_extension(path: &Path) -> bool {
 /// recognisable `.py` reference are forwarded verbatim, so summary text,
 /// blank lines, and unrelated tool output round-trip unchanged.
 pub fn remap_ty_diagnostics(text: &str, map_dir: Option<&Path>) -> String {
+    use std::collections::HashMap;
+
     let mut out = String::with_capacity(text.len());
-    let mut first = true;
+    // Cache of parsed maps keyed by `.py` path. `ty`'s default
+    // `--output-format full` can emit many lines for a single
+    // diagnostic (header, `-->` location, snippet, secondary
+    // notes), and each one can reference the same `.py` file.
+    // Loading + parsing the sidecar once per file across the whole
+    // output keeps the cost O(unique-files) instead of O(lines).
+    // `None` is cached so a missing or malformed sidecar isn't
+    // re-discovered on every subsequent line that references the
+    // same file.
+    let mut cache: HashMap<String, Option<SourceMap>> = HashMap::new();
     for line in text.split_inclusive('\n') {
-        if first {
-            first = false;
-        }
-        out.push_str(&remap_one_diagnostic_line(line, map_dir));
+        out.push_str(&remap_one_diagnostic_line(line, map_dir, &mut cache));
     }
     out
 }
@@ -352,7 +362,11 @@ pub fn remap_ty_diagnostics(text: &str, map_dir: Option<&Path>) -> String {
 /// snippet excerpts from the Python file, which would be confusing to
 /// rewrite mid-stream. Users who want full attribution should fix the
 /// Typhon source and re-run.
-fn remap_one_diagnostic_line(line: &str, map_dir: Option<&Path>) -> String {
+fn remap_one_diagnostic_line(
+    line: &str,
+    map_dir: Option<&Path>,
+    cache: &mut std::collections::HashMap<String, Option<SourceMap>>,
+) -> String {
     // Cheap reject: the line must contain ".py:" to be a candidate.
     if !line.contains(".py:") {
         return line.to_owned();
@@ -361,12 +375,21 @@ fn remap_one_diagnostic_line(line: &str, map_dir: Option<&Path>) -> String {
         return line.to_owned();
     };
 
-    let map_body = load_map_for(&parsed.py_path, map_dir);
-    let Some(map) = map_body.as_deref().and_then(parse_map) else {
+    let map = match cache.get(&parsed.py_path) {
+        Some(slot) => slot.as_ref(),
+        None => {
+            let parsed_map = load_map_for(&parsed.py_path, map_dir)
+                .as_deref()
+                .and_then(parse_map);
+            cache.insert(parsed.py_path.clone(), parsed_map);
+            cache.get(&parsed.py_path).and_then(|s| s.as_ref())
+        }
+    };
+    let Some(map) = map else {
         return line.to_owned();
     };
 
-    let ty_line = map_py_line(&map, parsed.line);
+    let ty_line = map_py_line(map, parsed.line);
     let ty_path = resolve_ty_path(&parsed.py_path, &map.source);
 
     let mut new_ref = format!("{ty_path}:{ty_line}");
@@ -524,7 +547,8 @@ mod ty_remap_tests {
         with_planted_map("main.py", "main.ty", &[1, 1, 2, 3, 3], |dir| {
             let py = dir.join("main.py").to_string_lossy().into_owned();
             let input = format!("{py}:3:1: error: type mismatch");
-            let out = remap_one_diagnostic_line(&input, None);
+            let mut cache = std::collections::HashMap::new();
+            let out = remap_one_diagnostic_line(&input, None, &mut cache);
             // Line 3 → ty 2 per the table; path resolves to "main.ty"
             // (no typhon.toml planted, so the fallback returns the
             // map's `source` field verbatim).
@@ -546,6 +570,32 @@ mod ty_remap_tests {
         let text = "ghost.py:5:1: error: x\n";
         let out = remap_ty_diagnostics(text, None);
         assert_eq!(out, text);
+    }
+
+    #[test]
+    fn remap_diagnostics_handles_multi_line_per_file_input() {
+        // `ty --output-format full` emits several lines per
+        // diagnostic, many of which reference the same `.py:line:col`.
+        // The per-file map cache means each file is loaded + parsed
+        // exactly once — we exercise the path with a multi-line
+        // input here so a regression that re-parses per line would
+        // still produce the right output but visibly stress the
+        // hot path.
+        with_planted_map("multi.py", "multi.ty", &[1, 1, 2, 3, 3, 4], |dir| {
+            let py = dir.join("multi.py").to_string_lossy().into_owned();
+            let input = format!("{py}:3:1: error: foo\n  --> {py}:3:1\n{py}:5:2: warning: bar\n");
+            let out = remap_ty_diagnostics(&input, None);
+            // Every `.py:line[:col]` got rewritten via the table.
+            assert!(
+                out.contains("multi.ty:2:1"),
+                "first line rewrite missing: {out}"
+            );
+            assert!(
+                out.contains("multi.ty:3:2"),
+                "third line rewrite missing: {out}"
+            );
+            assert!(!out.contains("multi.py"), "raw .py refs leaked: {out}");
+        });
     }
 }
 

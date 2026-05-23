@@ -582,14 +582,13 @@ pub fn check_source_file_with_imports(
     let prep = preprocessed_full(db, file);
     let resolved_arc = resolved_module(db, file);
 
-    // The resolver records its own diagnostics inside the Arc'd
-    // `ResolvedModule`, but `resolve_module_with` also returns a
-    // standalone Vec. To avoid losing them we re-parse cheaply and
-    // re-resolve only when there's a parse error to surface; otherwise
-    // the resolver diagnostics we want are absorbed by the type-check
-    // step's call into the same data. Reparse the module body for the
-    // type checker (parse output isn't cached because the AST is huge
-    // and not `salsa::Update`-friendly).
+    // Parse the module body for the type checker. The parse output
+    // isn't cached as its own Salsa value because the `ModModule`
+    // AST is huge and doesn't implement `salsa::Update`; instead we
+    // re-parse from the cached preprocessed source. The cost is one
+    // O(file) parse per check call; the bigger win — skipping the
+    // expand + preprocess pipeline — is already realised by the
+    // tracked `preprocessed_full` above.
     let module = match parse_module(&prep.python_source) {
         Ok(p) => p.into_syntax(),
         Err(e) => {
