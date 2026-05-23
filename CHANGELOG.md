@@ -4,17 +4,45 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## Unreleased
+## 0.5.0
 
-A roadmap sweep landing seven of the outstanding Phase 4+ items in
-one pass. Built incrementally — each item has its own commit on
-branch `claude/typhon-roadmap-items-nCs4K` — so a regression in any
-one is bisectable.
+The post-v0.4 roadmap-sweep release. v0.5.0 lands the seven Phase
+4+ items shipped on `claude/typhon-roadmap-items-nCs4K` (PR #105)
+plus four follow-up epics that close the open frontier work flagged
+during that sweep (PRs #110, #111, #112, #113):
+
+1. The Salsa boundary now caches the parse + resolve pair behind a
+   single `preprocessed_full` query and `check_source_file_with_imports`
+   reuses the cached diagnostics instead of double-resolving (PR #112).
+2. The auto-parallel comprehension rewriter grew dict-comp support
+   alongside the existing list-comp + set-comp coverage, and the
+   `tyc debug` wrapper now reads in full Typhon coordinates (`where`,
+   `list`, prompt, frame summary) instead of just the post-pause
+   banner. `tyc ty`'s diagnostic remapper handles paths with spaces
+   by walking left until a candidate path resolves to a real
+   `.py.map` (PR #111).
+3. `Type::TypeConstructor` and `ComptimeValue::Type` give the type
+   system a foothold for higher-kinded types and types-as-comptime-
+   values without committing to the full HKT surface — the parser
+   accepts `F[_]` parameter syntax in class generics, and
+   `comptime let T: type = int` round-trips through emit (PR #113).
+4. Corpus coverage gains the PyPI sweep harness (3+ third-party
+   packages round-tripped through `tyc migrate` + `tyc build` with
+   semantic-diff against `python -m foo.bar`), a fourth
+   `python_semantic_drift` audit round (17 fresh probes, all green),
+   and a design doc for the general inter-procedural field-init
+   audit that PR #105's trivial-factory work intentionally scoped
+   out (PR #110).
+
+This is a minor release because the type-system additions in (3)
+expand the accepted surface — programs that previously failed parse
+or type-check on `F[_]` / `comptime let T: type = ...` will now
+compile. No previously-rejected runtime semantic is newly accepted.
 
 ### Added — incremental compilation
 
-- **Salsa cache shared across `check_file_with_imports`.** New
-  `preprocessed_full` tracked query returns the full
+- **Salsa cache shared across `check_file_with_imports` (PR #105).**
+  New `preprocessed_full` tracked query returns the full
   `PreprocessResult` so `preprocessed_text`, `resolved_module`,
   `module_decl_names`, and the new `check_source_file_with_imports`
   entry point all share one preprocess pass per revision. The LSP
@@ -22,29 +50,48 @@ one is bisectable.
   cross-module check hits the cached parse + resolve on every
   unchanged sibling; only the type-check (which depends on the
   per-invocation cross-module shape registry) actually re-runs.
+- **Eliminated double-resolve in `check_source_file_with_imports`
+  (PR #112).** `ArcResolvedModule` now carries the resolver
+  diagnostics alongside the resolved module (both behind `Arc` for
+  pointer-equality `salsa::Update`), so the second
+  `resolve_module_with` call that previously ran just to harvest
+  diagnostics is gone. Every consumer of `resolved_module` (LSP
+  hover, definition, the multi-import check path) shares the same
+  cached output.
 
 ### Added — `tyc ty` integration
 
-- **Diagnostic attribution for `ty` output.** `tyc ty` now captures
-  the `ty` subprocess output and rewrites every `path.py:LINE[:COL]:`
-  reference to the originating Typhon source via the adjacent
-  `.py.map` sidecars. Pass `--raw` to forward output verbatim. The
-  shared `commands/source_map.rs` module is consumed by both
-  `tyc trace` and `tyc ty`.
+- **Diagnostic attribution for `ty` output (PR #105).** `tyc ty` now
+  captures the `ty` subprocess output and rewrites every
+  `path.py:LINE[:COL]:` reference to the originating Typhon source
+  via the adjacent `.py.map` sidecars. Pass `--raw` to forward
+  output verbatim. The shared `commands/source_map.rs` module is
+  consumed by both `tyc trace` and `tyc ty`.
+- **Path-with-spaces handling in the diagnostic remapper (PR #111).**
+  `parse_py_ref` now walks left from each `.py:` occurrence and
+  yields successively longer candidate prefixes, taking the longest
+  match that corresponds to a real `.py.map` sidecar. The lookup is
+  cached per-line so the candidate enumeration stays O(1) amortised.
 
 ### Added — `tyc debug`
 
-- **Typhon-aware pdb wrapper.** `tyc debug` writes a one-shot
-  Python wrapper that subclasses `pdb.Pdb` and prints
+- **Typhon-aware pdb wrapper (PR #105).** `tyc debug` writes a
+  one-shot Python wrapper that subclasses `pdb.Pdb` and prints
   `[ty] <src>:<line>` after every pause (entry, breakpoint, step,
   exception). The wrapper loads every `.py.map` sidecar under the
   build directory at startup so per-pause lookup is a dict + list
   dereference. Default-on; pass `--raw-pdb` to launch
   `python -m pdb` directly.
+- **Full UI translation: `where`, `list`, prompt, stack summary
+  (PR #111).** The pdb subclass now overrides `do_list`,
+  `do_where`, `format_stack_entry`, and the `prompt` property so
+  the entire debugger surface reads `.ty` coordinates instead of
+  the emitted `.py` paths. Source-snippet rendering (`list`) reads
+  the `.ty` file slice when a `.py.map` resolves the source path.
 
 ### Added — `tyc migrate`
 
-- **Three new line-level rewrites.**
+- **Three new line-level rewrites (PR #105).**
   - `@dataclass(frozen=True[, ...])` (and `@dataclasses.dataclass`)
     drops the decorator and the following class header gains a
     trailing `frozen` modifier (`class Vec frozen:`).
@@ -57,37 +104,95 @@ one is bisectable.
 
 ### Added — type checker
 
-- **Cross-function field-init audit.** A pre-scan recognises the
-  trivial factory-helper shape `def make(): return X.__new__(X)`
-  (and the two-statement `obj = X.__new__(X); return obj` variant).
-  Call sites `let c = make()` register the LHS as a tracked uninit
-  instance using the helper's missing field set, so a downstream
-  escape fires `tyc::missing_field_init` exactly as if the user
-  had constructed the partial instance inline. Helpers that do any
-  intervening field assignment are treated as initialising the
-  instance properly and are not recorded.
-- **Variance table expansion.** `generic_param_variance` gains
-  `AsyncContextManager`, `KeysView`, `ValuesView`, `ItemsView`,
-  `Type` / `type`, and `Counter`.
+- **Cross-function field-init audit (PR #105).** A pre-scan
+  recognises the trivial factory-helper shape `def make(): return
+  X.__new__(X)` (and the two-statement `obj = X.__new__(X); return
+  obj` variant). Call sites `let c = make()` register the LHS as a
+  tracked uninit instance using the helper's missing field set, so
+  a downstream escape fires `tyc::missing_field_init` exactly as if
+  the user had constructed the partial instance inline. Helpers
+  that do any intervening field assignment are treated as
+  initialising the instance properly and are not recorded.
+- **Variance table expansion (PR #105).** `generic_param_variance`
+  gains `AsyncContextManager`, `KeysView`, `ValuesView`,
+  `ItemsView`, `Type` / `type`, and `Counter`.
+- **Higher-Kinded Types foundation (PR #113).** New
+  `Type::TypeConstructor { name, arity }` variant represents type
+  constructors with unbound parameters. `type_from_annotation`
+  recognises `F[_]` parameter syntax inside class / function
+  generic parameter lists (e.g. `class Functor[F[_]]:`) and
+  `walk_typevars` traverses the new variant. The full surface
+  (`def map[F[_], A, B](fa: F[A], f: A -> B) -> F[B]`) is staged on
+  this scaffold; the design doc `TYPE_SYSTEM_FRONTIER.md` records
+  the deferred unification work.
 
 ### Added — analyser
 
-- **Parallel comprehensions: set-comp support.**
-  `{f(x) for x in xs}` now also rewrites to
+- **Parallel comprehensions: set-comp support (PR #105).**
+  `{f(x) for x in xs}` now rewrites to
   `set(typhon_runtime.parallel.map_pure(lambda x: f(x), xs))` under
   `[strictness] auto-parallel`. Same eligibility rules as the
   list-comp path; the `set(...)` wrapper preserves the runtime set
   semantics (uniqueness + unordered).
+- **Parallel comprehensions: dict-comp support (PR #111).**
+  `{k_expr: f(v) for k, v in items}` rewrites to a dict-literal
+  unpack form (`{**dict(typhon_runtime.parallel.map_pure(...))}`)
+  that avoids the `dict` shadowing concern from the set-comp path.
+  Only fires when exactly one of `{key_expr, value_expr}` is a
+  pure-call eligible side.
+- **`comptime` types-as-values (PR #113).** New
+  `ComptimeValue::Type(String)` variant lets `comptime let T: type
+  = int` (and any in-scope type name) round-trip through the
+  comptime evaluator. The bare-name resolution covers the eight
+  primitive heads (`int`, `str`, `bool`, `float`, `bytes`, `None`,
+  `type`, `object`); `Any` is intentionally rejected unless
+  imported because the emitter cannot synthesise the import.
 
 ### Added — test infrastructure
 
-- **Third-party Python corpus round-trip sweep.** New
+- **Third-party Python corpus round-trip sweep (PR #105).** New
   `stress/third-party-py-corpus/` ships six representative Python
   fixtures (dataclass, frozen dataclass, Protocol, NewType, PEP 695
   generic, legacy `Generic[T]`) and the integration test
   `third_party_corpus_round_trips_cleanly` exercises the full
   `tyc migrate` → `tyc check` chain on each. Failures are collected
   so a single run surfaces the complete regression list.
+- **PyPI sweep harness (PR #110).** `stress/pypi-sweep/` ships
+  `sweep.py`, a CLI that pip-installs a configured set of typed
+  Python packages into a tempdir, runs `tyc migrate` + `tyc build`,
+  and compares smoke-script output against the original package.
+  The default config covers `attrs`, `click`, and a small
+  Pydantic-using package; results land in `findings.md` so
+  regressions are tracked across runs. Opt-in nightly job; not
+  wired into per-PR CI because the pip install dominates the
+  budget.
+- **`python_semantic_drift` audit round 4 (PR #110).** Fresh
+  17-probe sweep in `stress/round-2026-05-23-drift-round-4/`
+  covering walrus-in-comprehension, augmented-assignment narrowing,
+  `yield from` generator delegation, match-pattern `*` capture,
+  string multiplication, `raise X from Y` typing, and `f(*args,
+  **kwargs)` unpacking. All probes accept under `tyc check`; the
+  pre-existing closed set carries forward unchanged.
+- **Inter-procedural field-init audit design
+  (`stress/interprocedural-audit-design.md`, PR #110).** Records
+  the summary-IR sketch for generalising PR #105's trivial-factory
+  audit to multi-step factories that finish initialisation across a
+  call chain. No code change yet — the IR design is the prerequisite.
+
+### Docs
+
+- **`docs/roadmap.md`** updated to mark every Phase 4+ item shipped
+  in this release as ✅ complete. The HKT row records the staged
+  surface (`Type::TypeConstructor` + `F[_]` param syntax) and
+  references the deferred unification work in
+  `TYPE_SYSTEM_FRONTIER.md`.
+- **`TYPE_SYSTEM_FRONTIER.md`** (new) catalogues the type-system
+  work that remains beyond v0.5.0: full HKT unification, variance
+  inference on user-declared generics (currently invariant by
+  default), and the broader comptime types-as-values story.
+- **`stress/EPIC_SUMMARY.md`** (new) summarises the PR #110 epic
+  scope — what shipped, what's still open in the inter-procedural
+  audit design, and the next-round drift candidates.
 
 ## 0.4.0
 
