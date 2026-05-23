@@ -59,15 +59,27 @@ any of the following happen before the escape:
 - The binding's enclosing scope was wrapped in `unsafe:` — the user
   opted out of the static-type discipline.
 
+## Escapes covered
+
+- `return c` from a function with required fields unassigned.
+- `c` as a call argument to any function (`do_something(c)`).
+- `let xs: list[Cls] = [c]` — container-literal escape via an
+  annotated assignment. Generalises to dict / tuple / set literals
+  and to any RHS that mentions the partial binding.
+- `let alias: Cls = c` — outer-scope assignment escape via an
+  annotated binding.
+
+The audit fires only on annotated assignments (`Stmt::AnnAssign`)
+because the explicit type commitment is what marks the value as
+"leaving construction." A bare `c = something` is treated as
+intra-function mutation, not an escape.
+
 ## Limitations
 
-- Only return statements and call arguments count as escapes; storing
-  the instance in a container literal or assigning it to an
-  outer-scope variable is not yet flagged.
 - The audit is intra-procedural: a helper method (`c.configure()`)
   that genuinely assigns required fields will (correctly) suppress
   the diagnostic, but a helper that doesn't will also (incorrectly)
-  suppress it.
+  suppress it. Cross-function tracking would need a summary IR.
 - Subclass field requirements are not tracked separately; the audit
   uses the fields declared on the class named in
   `<ClassName>.__new__(<ClassName>)`.

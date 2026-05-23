@@ -4837,6 +4837,34 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                     );
                     c.mismatch(&ann_type, &value_type, span);
                 }
+                // Audit hook: an annotated assignment with a bypass-
+                // constructed instance on the RHS counts as an escape
+                // — the value is being stored under an explicit type
+                // commitment (list[T], dict[K, V], alias, etc.) that
+                // moves it past where the field-init audit can follow.
+                // Closes the documented "container-literal escapes /
+                // outer-scope assignment escapes" gap in
+                // `docs/roadmap.md`. Bare reassignment without
+                // annotation is intentionally not audited here — that
+                // path is intra-function aliasing covered by
+                // `audit_clear_binding` below.  The target itself is
+                // excluded so a rebind `let c: T = ApiClient(...)`
+                // doesn't fire on its own LHS name.
+                if let Expr::Name(n) = a.target.as_ref() {
+                    let target_name = n.id.as_str().to_owned();
+                    let mut names_in_value = collect_names_in_expr(value);
+                    names_in_value.remove(&target_name);
+                    if names_in_value
+                        .iter()
+                        .any(|n| c.uninit_instances.contains_key(n))
+                    {
+                        audit_check_escape(c, value);
+                    }
+                } else {
+                    // Attribute / subscript target — not a binding alias,
+                    // audit unconditionally.
+                    audit_check_escape(c, value);
+                }
                 // `a.b: T = ...` — uncommon, but still a write to `a.b`.
                 // Field declarations inside a class body have no value
                 // and a bare-name target, so they don't hit this branch.
@@ -9165,6 +9193,86 @@ def make() -> ApiClient:
         assert!(
             !d.has_errors(),
             "setattr(obj=...) must drop audit tracking: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn audit_container_literal_escape_via_annotated_let_errors() {
+        // Closes the documented "container-literal escapes" gap from
+        // `docs/roadmap.md`. A partial instance stored inside a list /
+        // dict / tuple literal that gets committed to an annotated
+        // binding is no longer auditable past the assignment site, so
+        // the audit fires there.
+        let src = "\
+class Config:
+    host: str
+    port: int
+
+def make() -> list[Config]:
+    mut c = Config.__new__(Config)
+    c.host = \"localhost\"
+    let configs: list[Config] = [c]
+    return configs
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingFieldInit { .. })),
+            "container-literal escape must fire missing_field_init; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn audit_annotated_alias_escape_errors() {
+        // Outer-scope assignment escape: `let other: Config = c` stores
+        // the partial instance under an explicit type commitment.
+        let src = "\
+class Config:
+    host: str
+    port: int
+
+def make() -> Config:
+    mut c = Config.__new__(Config)
+    c.host = \"localhost\"
+    let alias: Config = c
+    return alias
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingFieldInit { .. })),
+            "annotated-alias escape must fire missing_field_init; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn audit_annotated_rebinding_no_false_positive() {
+        // A `let c: T = X(...)` that rebinds the tracked name itself
+        // (RHS does not reference `c`) must not fire the new
+        // container-escape audit — the target name is excluded by the
+        // implementation.
+        let src = "\
+class ApiClient:
+    api_key: str
+
+def make() -> ApiClient:
+    let c: ApiClient = ApiClient.__new__(ApiClient)
+    let c: ApiClient = ApiClient(api_key=\"x\")
+    return c
+";
+        let d = check(src);
+        let any_missing = d
+            .errors()
+            .iter()
+            .any(|e| matches!(e, TycError::MissingFieldInit { .. }));
+        assert!(
+            !any_missing,
+            "rebinding the same tracked name must NOT fire; got {:?}",
             d.errors()
         );
     }

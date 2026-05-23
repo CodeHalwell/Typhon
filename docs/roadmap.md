@@ -134,8 +134,16 @@ Limitations carried forward (tracked in
   `import foo as f; f.Cls(...)` inference; downstream method-arity and
   kwarg checks fire correctly. See test
   `annotation_dotted_attribute_resolves_to_class` in `tyc-types`.
-- The post-construction audit doesn't track container-literal escapes
-  or outer-scope assignment escapes, and is intra-procedural.
+- ~~The post-construction audit doesn't track container-literal escapes
+  or outer-scope assignment escapes~~ — fixed by adding an
+  `audit_check_escape` hook on the RHS of every annotated assignment
+  (`Stmt::AnnAssign`). A partial instance flowing into
+  `let configs: list[Config] = [c]` or
+  `let alias: Config = c` now fires `tyc::missing_field_init` at the
+  assignment site. The target name is excluded from the check so
+  `let c: T = ApiClient(...)` (rebinding the tracked name) doesn't
+  false-positive on its own LHS. The audit is still intra-procedural
+  — cross-function tracking would need a richer summary IR.
 - Subclass constructors used to reject inherited fields
   (`Dog(name="Rex", breed="Husky")` for `class Dog(Animal):`) — also
   fixed in the same sweep via a new `effective_class_shape` helper that
