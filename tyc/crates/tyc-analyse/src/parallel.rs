@@ -30,8 +30,8 @@ use std::collections::HashSet;
 
 use ruff_python_ast::{
     name::Name, Arguments, AtomicNodeIndex, Comprehension, Expr, ExprAttribute, ExprCall,
-    ExprContext, ExprLambda, ExprListComp, ExprName, ModModule, Parameter, ParameterWithDefault,
-    Parameters, Stmt,
+    ExprContext, ExprLambda, ExprListComp, ExprName, ExprSetComp, ModModule, Parameter,
+    ParameterWithDefault, Parameters, Stmt,
 };
 use ruff_text_size::TextRange;
 
@@ -161,6 +161,19 @@ fn rewrite_expr(expr: &mut Expr, ctx: &RewriteCtx<'_>, stats: &mut ParallelStats
                 stats.rewrites += 1;
             }
         }
+        Expr::SetComp(sc) => {
+            for gen in &mut sc.generators {
+                rewrite_expr(&mut gen.iter, ctx, stats);
+                for f in &mut gen.ifs {
+                    rewrite_expr(f, ctx, stats);
+                }
+            }
+            rewrite_expr(&mut sc.elt, ctx, stats);
+            if let Some(rewritten) = try_rewrite_setcomp(sc, ctx) {
+                *expr = rewritten;
+                stats.rewrites += 1;
+            }
+        }
         Expr::Call(c) => {
             rewrite_expr(&mut c.func, ctx, stats);
             for arg in &mut c.arguments.args {
@@ -283,6 +296,152 @@ fn try_rewrite_listcomp(lc: &ExprListComp, ctx: &RewriteCtx<'_>) -> Option<Expr>
         },
     });
     Some(call)
+}
+
+/// Attempt the rewrite on a set comprehension. Same eligibility rules
+/// as the list-comp path: single generator, no filter, single bare-name
+/// pure call. The output wraps the parallel map in `set(...)` so the
+/// resulting expression still has set semantics (deduplication +
+/// unordered membership).
+fn try_rewrite_setcomp(sc: &ExprSetComp, ctx: &RewriteCtx<'_>) -> Option<Expr> {
+    let (lambda_param, iter, elt_lambda) = analyse_comprehension(
+        &sc.generators,
+        &sc.elt,
+        ctx,
+        sc.range,
+    )?;
+    let map_call = build_map_pure_call(sc.range, lambda_param, iter, elt_lambda);
+    // Wrap in `set(map_pure(...))` so the value-level semantics
+    // (uniqueness + unordered) survive the rewrite.
+    Some(Expr::Call(ExprCall {
+        range: sc.range,
+        node_index: AtomicNodeIndex::NONE,
+        func: Box::new(Expr::Name(ExprName {
+            range: sc.range,
+            node_index: AtomicNodeIndex::NONE,
+            id: Name::new("set"),
+            ctx: ExprContext::Load,
+        })),
+        arguments: Arguments {
+            range: sc.range,
+            node_index: AtomicNodeIndex::NONE,
+            args: vec![map_call].into_boxed_slice(),
+            keywords: Vec::new().into_boxed_slice(),
+        },
+    }))
+}
+
+/// Shared eligibility check for list / set comprehensions.
+///
+/// Returns `(target_name, iterable_expr, body_expr)` on a match. Both
+/// `try_rewrite_listcomp` and `try_rewrite_setcomp` consume the same
+/// shape, so factoring this prevents drift between them.
+fn analyse_comprehension(
+    generators: &[Comprehension],
+    elt: &Expr,
+    ctx: &RewriteCtx<'_>,
+    _range: TextRange,
+) -> Option<(String, Expr, Expr)> {
+    if generators.len() != 1 {
+        return None;
+    }
+    let gen = &generators[0];
+    if gen.is_async || !gen.ifs.is_empty() {
+        return None;
+    }
+    let target_name = match &gen.target {
+        Expr::Name(n) => n.id.as_str().to_owned(),
+        _ => return None,
+    };
+    let call = match elt {
+        Expr::Call(c) => c,
+        _ => return None,
+    };
+    let callee_name = match call.func.as_ref() {
+        Expr::Name(n) => n.id.as_str().to_owned(),
+        _ => return None,
+    };
+    if !ctx.pure.contains(&callee_name) {
+        return None;
+    }
+    if let Some(literal_len) = literal_iter_len(&gen.iter) {
+        if literal_len < ctx.min_size {
+            return None;
+        }
+    }
+    if !call.arguments.keywords.is_empty() || call.arguments.args.len() != 1 {
+        return None;
+    }
+    let arg_is_target = matches!(
+        call.arguments.args.first(),
+        Some(Expr::Name(n)) if n.id.as_str() == target_name
+    );
+    if !arg_is_target {
+        return None;
+    }
+    Some((target_name, gen.iter.clone(), elt.clone()))
+}
+
+/// Synthesise `typhon_runtime.parallel.map_pure(lambda <param>: <body>, <iter>)`.
+fn build_map_pure_call(
+    range: TextRange,
+    lambda_param: String,
+    iter: Expr,
+    body: Expr,
+) -> Expr {
+    let lambda = ExprLambda {
+        range,
+        node_index: AtomicNodeIndex::NONE,
+        parameters: Some(Box::new(Parameters {
+            range,
+            node_index: AtomicNodeIndex::NONE,
+            posonlyargs: Vec::new(),
+            args: vec![ParameterWithDefault {
+                range,
+                node_index: AtomicNodeIndex::NONE,
+                parameter: Parameter {
+                    range,
+                    node_index: AtomicNodeIndex::NONE,
+                    name: ident(&lambda_param, range),
+                    annotation: None,
+                },
+                default: None,
+            }],
+            vararg: None,
+            kwonlyargs: Vec::new(),
+            kwarg: None,
+        })),
+        body: Box::new(body),
+    };
+    let map_pure = Expr::Attribute(ExprAttribute {
+        range,
+        node_index: AtomicNodeIndex::NONE,
+        value: Box::new(Expr::Attribute(ExprAttribute {
+            range,
+            node_index: AtomicNodeIndex::NONE,
+            value: Box::new(Expr::Name(ExprName {
+                range,
+                node_index: AtomicNodeIndex::NONE,
+                id: Name::new("typhon_runtime"),
+                ctx: ExprContext::Load,
+            })),
+            attr: ident("parallel", range),
+            ctx: ExprContext::Load,
+        })),
+        attr: ident("map_pure", range),
+        ctx: ExprContext::Load,
+    });
+    Expr::Call(ExprCall {
+        range,
+        node_index: AtomicNodeIndex::NONE,
+        func: Box::new(map_pure),
+        arguments: Arguments {
+            range,
+            node_index: AtomicNodeIndex::NONE,
+            args: vec![Expr::Lambda(lambda), iter].into_boxed_slice(),
+            keywords: Vec::new().into_boxed_slice(),
+        },
+    })
 }
 
 fn ident(name: &str, range: TextRange) -> ruff_python_ast::Identifier {
@@ -412,5 +571,42 @@ mod tests {
             stats.rewrites, 1,
             "unknown iter size should fall through the threshold"
         );
+    }
+
+    // ── set comprehensions ─────────────────────────────────────────────────
+
+    #[test]
+    fn rewrites_pure_setcomp_wraps_in_set_call() {
+        let src = "ys = {f(x) for x in xs}\n";
+        let mut m = parse(src);
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
+        assert_eq!(stats.rewrites, 1, "set comprehension should rewrite");
+        let emit = tyc_emit::emit_python(&m);
+        assert!(
+            emit.contains("typhon_runtime.parallel.map_pure"),
+            "expected map_pure rewrite; got: {emit}"
+        );
+        // Wrapped in set(...) so the runtime value still has set
+        // semantics (uniqueness + unordered membership).
+        assert!(
+            emit.contains("set("),
+            "expected set() wrapper; got: {emit}"
+        );
+    }
+
+    #[test]
+    fn leaves_filtered_setcomp_alone() {
+        let src = "ys = {f(x) for x in xs if x > 0}\n";
+        let mut m = parse(src);
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
+        assert_eq!(stats.rewrites, 0);
+    }
+
+    #[test]
+    fn leaves_impure_setcomp_alone() {
+        let src = "ys = {g(x) for x in xs}\n";
+        let mut m = parse(src);
+        let stats = rewrite_parallel_comprehensions(&mut m, &pure_set(&["f"]), 0);
+        assert_eq!(stats.rewrites, 0);
     }
 }

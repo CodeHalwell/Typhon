@@ -808,12 +808,35 @@ pub fn generic_param_variance(head: &str, idx: usize) -> Variance {
         | ("AsyncIterator", 0)
         | ("Generator", 0)
         | ("AsyncGenerator", 0)
-        | ("ContextManager", 0) => Variance::Covariant,
+        | ("ContextManager", 0)
+        // Added 2026-05-23 — read-only mapping views and the
+        // async context-manager mirror. All produce values out
+        // (covariant in T) and never accept new T inputs.
+        | ("AsyncContextManager", 0)
+        | ("KeysView", 0)
+        | ("ValuesView", 0)
+        // `type[X]` (and the typing alias `Type[X]`) — a class
+        // object accepts subclass instances when called, so
+        // `type[Dog]` is assignable to `type[Animal]`. The Python
+        // typing spec calls this position covariant.
+        | ("Type", 0)
+        | ("type", 0)
+        // `Counter[T]` from `collections` — read-only over T at the
+        // type level (you don't put new T values in; you increment
+        // counts). Mark covariant to match how third-party stubs
+        // treat it.
+        | ("Counter", 0) => Variance::Covariant,
 
         // ── Mapping[K, V] — invariant in K (keys are hashed/compared
         // exactly) and covariant in V (values flow out via __getitem__).
         ("Mapping", 0) => Variance::Invariant,
         ("Mapping", 1) => Variance::Covariant,
+        // ── ItemsView[K, V] — same variance as Mapping: K is keyed,
+        // V flows out. Read-only view, so the keys-invariant rule
+        // still applies (an `ItemsView[int, str]` consumer might call
+        // `__contains__((k, v))` which hashes k).
+        ("ItemsView", 0) => Variance::Invariant,
+        ("ItemsView", 1) => Variance::Covariant,
 
         // ── Optional[T] / Union flattening — covariant. ───────────────
         ("Optional", 0) => Variance::Covariant,
@@ -8749,6 +8772,19 @@ mod tests {
         assert_eq!(generic_param_variance("Callable", 1), Variance::Covariant);
         // Unknown head defaults to invariant — safest for user generics.
         assert_eq!(generic_param_variance("MyBox", 0), Variance::Invariant);
+
+        // Added 2026-05-23 — extended head coverage.
+        assert_eq!(
+            generic_param_variance("AsyncContextManager", 0),
+            Variance::Covariant
+        );
+        assert_eq!(generic_param_variance("KeysView", 0), Variance::Covariant);
+        assert_eq!(generic_param_variance("ValuesView", 0), Variance::Covariant);
+        assert_eq!(generic_param_variance("ItemsView", 0), Variance::Invariant);
+        assert_eq!(generic_param_variance("ItemsView", 1), Variance::Covariant);
+        assert_eq!(generic_param_variance("Type", 0), Variance::Covariant);
+        assert_eq!(generic_param_variance("type", 0), Variance::Covariant);
+        assert_eq!(generic_param_variance("Counter", 0), Variance::Covariant);
     }
 
     #[test]
