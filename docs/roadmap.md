@@ -127,11 +127,28 @@ Shipped in [v0.2.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.2.0):
 Limitations carried forward (tracked in
 [`docs/findings.md`](findings.md)):
 
-- Dotted-attribute annotations (`let c: f.Cls = …`) don't resolve to
-  the foreign class shape; use `from foo import Cls` or drop the
-  annotation for now.
-- The post-construction audit doesn't track container-literal escapes
-  or outer-scope assignment escapes, and is intra-procedural.
+- ~~Dotted-attribute annotations (`let c: f.Cls = …`) don't resolve to
+  the foreign class shape~~ — fixed in the Phase-5.2 drift sweep.
+  `Expr::Attribute` annotations now produce a qualified
+  `Class("{module}.{attr}")` that unifies with the call site's
+  `import foo as f; f.Cls(...)` inference; downstream method-arity and
+  kwarg checks fire correctly. See test
+  `annotation_dotted_attribute_resolves_to_class` in `tyc-types`.
+- ~~The post-construction audit doesn't track container-literal escapes
+  or outer-scope assignment escapes~~ — fixed by adding an
+  `audit_check_escape` hook on the RHS of every annotated assignment
+  (`Stmt::AnnAssign`). A partial instance flowing into
+  `let configs: list[Config] = [c]` or
+  `let alias: Config = c` now fires `tyc::missing_field_init` at the
+  assignment site. The target name is excluded from the check so
+  `let c: T = ApiClient(...)` (rebinding the tracked name) doesn't
+  false-positive on its own LHS. The audit is still intra-procedural
+  — cross-function tracking would need a richer summary IR.
+- Subclass constructors used to reject inherited fields
+  (`Dog(name="Rex", breed="Husky")` for `class Dog(Animal):`) — also
+  fixed in the same sweep via a new `effective_class_shape` helper that
+  walks the inheritance chain. See tests `ctor_subclass_*` /
+  `ctor_grandchild_inherits_through_chain` in `tyc-types`.
 
 ## Phase 5 — Interop and developer experience ✅ complete (v0.1.6)
 
@@ -369,23 +386,41 @@ The minimum-viable Typhon is **non-null types + sealed unions + `Result` + datac
 ## Concrete next steps
 
 Phases 0–3 are complete. Phase 5 — interop and developer experience —
-shipped in v0.1.6. Phase 4+ work (everything not on the headline path)
-remains the open frontier:
+shipped in v0.1.6. Phase 4+ work (everything not on the headline path):
 
-1. Corpus round-trip sweep: run `tyc build` over a representative set of
-   third-party Python projects and compare the emitted `.py` against the
-   source semantically. Not a blocker (the test suite is green), but
-   hardens confidence.
-2. Promote `bind_typevars_and_substitute` into a proper structural
-   sub-type checker that handles variance and bounded higher-kinded forms.
-3. Expand the Salsa boundary: make `resolve_module` and `check_module` into
-   Salsa-tracked queries so the LSP second-check latency drops to near-zero
-   for unchanged files.
-4. Loop parallelisation for pure comprehensions on free-threaded Python.
-5. Broaden the Phase-5.2 `tyc::python_semantic_drift` audit: catalogue
-   every accepted-by-Python shape the checker still rejects (beyond `or`
-   /`and` and `Generator → Iterable` which already landed) and either fix
-   it or downgrade to a warning.
-6. A Typhon-native source-mapping debugger that drives breakpoints
-   directly against `.ty` source instead of through `--break TY:LINE`
-   translation on top of `pdb`.
+1. ✅ **Corpus round-trip sweep.** `corpus_examples_all_check_clean`
+   in `tyc/crates/tyc/tests/pipeline.rs` walks every `.ty` file under
+   `examples/` and asserts `tyc check` exits 0 on each. CI gates on
+   it. The third-party-project sweep (real Python projects round-
+   tripped through `tyc build` + semantic diff) remains future work.
+2. **Promote `bind_typevars_and_substitute` into a proper structural
+   sub-type checker that handles variance and bounded higher-kinded
+   forms.** Still open frontier — the existing
+   `generic_param_variance` table covers the common heads (list /
+   dict / Mapping / Callable / tuple / Sequence / Iterable / …) and
+   the fixed-arity tuple covariance fix from May 23 closed the most-
+   reported variance gap, but Higher-Kinded Types are not yet
+   inferred and bounded type parameters only do an arity-level check.
+3. **Salsa boundary.** `preprocessed_text`, `resolved_module`,
+   `check_diagnostics`, and `module_shapes_query` are all
+   `#[salsa::tracked]`; single-file LSP edits hit the cache.
+   `check_file_with_imports` (the multi-module build path) is the
+   remaining bypass — it re-parses and re-resolves every imported
+   module on every call rather than reading them through the tracked
+   queries. Wiring that up is the next concrete win.
+4. ✅ **Loop parallelisation for pure list comprehensions.**
+   `tyc/crates/tyc-analyse/src/parallel.rs` rewrites `[f(x) for x in
+   xs]` into `typhon_runtime.parallel.map_pure(f, xs)` when `f` is
+   pure, opt-in via `[strictness] auto-parallel`. Combine with
+   `[python] free-threaded = true` for real parallelism.
+5. **Broaden the `tyc::python_semantic_drift` audit.** Closed so
+   far: `or`/`and` truthy-union, `Generator → Iterable`, `bool ⊆
+   int` (assignment + arithmetic + unary), fixed-arity tuple
+   covariance, foreign-class BinOp no-over-promote, container-literal
+   escape detection. Three audit rounds catalogued in
+   `stress/round-2026-05-23-drift/`; the larger third-party corpus
+   sweep is still future work.
+6. **A Typhon-native source-mapping debugger** that drives
+   breakpoints directly against `.ty` source instead of through
+   `--break TY:LINE` translation on top of `pdb`. Still open
+   frontier.

@@ -206,6 +206,15 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
         (Type::TypeVar(_), _) | (_, Type::TypeVar(_)) => true,
         (Type::Unknown, _) | (_, Type::Unknown) => true,
         (Type::Float, Type::Int) => true,
+        // CPython: `bool` is a subtype of `int` (`True == 1`, `False == 0`),
+        // and `int` is widening-compatible with `float`. Both rules are
+        // one-way: `int` does NOT flow into `bool` (a narrowing, not a
+        // widening). Without these arms, `let x: int = True` and
+        // `let total: int = 1 + True` would over-reject — the canonical
+        // case the `tyc::python_semantic_drift` diagnostic was created
+        // to flag.
+        (Type::Int, Type::Bool) => true,
+        (Type::Float, Type::Bool) => true,
         // Union/Union must come before the single-Union arms: every actual
         // variant has to be assignable to *some* expected variant. Falling
         // through to `(Union, other)` then `(other, Union)` recursively
@@ -757,6 +766,14 @@ pub enum Variance {
 /// flows covariantly silently accepts unsound programs. The former is
 /// fixable by writing the obvious cast; the latter is a real bug source.
 pub fn generic_param_variance(head: &str, idx: usize) -> Variance {
+    // Fixed-arity tuples are immutable, so every slot is covariant — not
+    // just position 0. Encoded outside the match so a `tuple[T1, T2, ..,
+    // Tn]` of any arity widens uniformly (the `("tuple", 0)` arm below
+    // would only catch position 0 and leave positions 1+ falling through
+    // to the invariant default).
+    if head == "tuple" || head == "Tuple" {
+        return Variance::Covariant;
+    }
     match (head, idx) {
         // ── Mutable containers — invariant in every position. ─────────
         ("list", 0)
@@ -782,8 +799,9 @@ pub fn generic_param_variance(head: &str, idx: usize) -> Variance {
         | ("AbstractSet", 0)
         | ("FrozenSet", 0)
         | ("frozenset", 0)
-        | ("tuple", 0)
-        | ("Tuple", 0)
+        // `tuple` / `Tuple` are handled by the early-return above so every
+        // fixed-arity slot is covariant; they remain documented here for
+        // discoverability.
         | ("Awaitable", 0)
         | ("Coroutine", 0)
         | ("AsyncIterable", 0)
@@ -1048,6 +1066,49 @@ pub fn type_from_annotation_with_params(
             Type::Generic(head, args)
         }
         Expr::NoneLiteral(_) => Type::None,
+        // Dotted annotation `import foo as f; let c: f.Cls = …` /
+        // `let c: typing.OrderedDict = …`. Produces a qualified
+        // `Class("foo.Cls")` so it matches the call site's
+        // `foo.ApiClient(...)` inference (which uses the same
+        // `{module}.{attr}` form — see `infer_attribute` `Type::Module`
+        // arm). Without this arm, `let c: f.Cls = …` landed as
+        // `Type::Unknown`, silently dropping every downstream
+        // method-arity check (`docs/roadmap.md` Phase-5.5 limitation).
+        // Bare attribute heads (`a.b.Cls` where the leading `a.b`
+        // isn't a single Name) fall through to `Type::Unknown` —
+        // multi-segment paths would need the module registry to
+        // resolve and aren't worth the complexity for v1.
+        //
+        // `typing.<X>` shapes that the bare-name arm above gives
+        // special treatment (`Any`, `Self`, `Final`, `ClassVar`,
+        // `Annotated`, `Literal`) get the same permissive handling
+        // here — without these carve-outs, `-> typing.Self`
+        // mis-typed every fluent-builder method and `typing.Any`
+        // tripped `type_mismatch` on every concrete value. Reported
+        // by codex on PR #103.
+        Expr::Attribute(a) => match a.value.as_ref() {
+            Expr::Name(n) if n.id.as_str() == "typing" => match a.attr.as_str() {
+                // Same surface as bare `Any` / `Self` — fall through to
+                // `Type::Any` so concrete returns satisfy them.
+                "Any" | "Self" => Type::Any,
+                // Other `typing.<X>` heads currently used as
+                // annotations without a parameter list. Anything
+                // genuinely typed (`typing.List[int]`) hits the
+                // Subscript arm above and resolves through `head`,
+                // so this arm only sees the un-subscripted heads.
+                // Permissive `Unknown` matches the pre-PR-#103
+                // behaviour for these.
+                "List" | "Dict" | "Tuple" | "Set" | "FrozenSet" | "Sequence" | "Iterable"
+                | "Iterator" | "Mapping" | "Callable" | "Optional" | "Union" | "Final"
+                | "ClassVar" | "Annotated" | "Literal" | "Type" | "TypeVar" => Type::Unknown,
+                // A class re-exported from `typing` (e.g.
+                // `typing.NamedTuple`) — fall through to the
+                // qualified Class form below.
+                _ => Type::Class(format!("typing.{}", a.attr.as_str())),
+            },
+            Expr::Name(n) => Type::Class(format!("{}.{}", n.id.as_str(), a.attr.as_str())),
+            _ => Type::Unknown,
+        },
         _ => Type::Unknown,
     }
 }
@@ -1656,6 +1717,15 @@ pub struct InterfaceShape {
     /// NOT add the field here — Typhon does not auto-inject `= None`
     /// for `T?` fields, so the runtime dataclass still requires them.
     pub field_defaults: std::collections::HashSet<String>,
+    /// Base class names declared on the `class Sub(Base1, Base2):`
+    /// header. Recorded so the constructor arity check can walk the
+    /// inheritance chain and accept inherited fields as kwargs —
+    /// without this, `class Dog(Animal):` rejects
+    /// `Dog(name="Rex", breed="Husky")` because `name` is only on
+    /// `Animal`. Empty for interfaces (which never extend Python
+    /// `class`es structurally), for sealed-union variants without
+    /// explicit bases, and for any class declared with no bases.
+    pub bases: Vec<String>,
 }
 
 /// Tracking state for a binding constructed via `X.__new__(X)` or
@@ -1750,6 +1820,22 @@ impl<'a> Checker<'a> {
     ///    each arm.
     fn is_assignable(&self, expected: &Type, actual: &Type) -> bool {
         if assignable(expected, actual) {
+            return true;
+        }
+        // Canonicalize module aliases on both sides and retry. An
+        // annotation `let c: f.Cls` (where `import foo as f`) produces
+        // `Class("f.Cls")`, but the call site `f.Cls(...)` resolves
+        // through `infer_attribute` and produces `Class("foo.Cls")`
+        // because the receiver `f` is bound to `Type::Module("foo")`
+        // in the env. Walk the type tree, look the prefix up in the
+        // env, and rewrite Class("alias.X") → Class("canonical.X")
+        // before the second `assignable` call. Reported by gemini on
+        // PR #103.
+        let canon_expected = self.canonicalize_module_aliases(expected);
+        let canon_actual = self.canonicalize_module_aliases(actual);
+        if (canon_expected != *expected || canon_actual != *actual)
+            && assignable(&canon_expected, &canon_actual)
+        {
             return true;
         }
         // Nominal newtype escape upward: `Email → str` is allowed
@@ -1891,6 +1977,55 @@ impl<'a> Checker<'a> {
     /// as follow-up).
     fn unwrap_alias(&self, ty: &Type) -> Type {
         self.unwrap_alias_inner(ty, 0)
+    }
+
+    /// Walk `ty` and rewrite every `Class("alias.X")` whose prefix
+    /// resolves to a `Type::Module(canonical)` binding in the env into
+    /// `Class("canonical.X")`. Pure if no aliases match. The recursion
+    /// matches the structure of the type tree so nested aliases inside
+    /// generics / unions / functions also get canonicalised.
+    /// Called from `is_assignable` to reconcile annotation-side
+    /// (`import foo as f; let c: f.Cls`) with call-site
+    /// (`infer_attribute` → `Class("foo.Cls")`) representations.
+    fn canonicalize_module_aliases(&self, ty: &Type) -> Type {
+        match ty {
+            Type::Class(name) => {
+                if let Some((prefix, suffix)) = name.split_once('.') {
+                    if let Some(binding) = self.env.lookup(prefix) {
+                        if let Type::Module(canonical) = &binding.declared {
+                            if canonical != prefix {
+                                return Type::Class(format!("{canonical}.{suffix}"));
+                            }
+                        }
+                    }
+                }
+                ty.clone()
+            }
+            Type::Union(vs) => Type::Union(
+                vs.iter()
+                    .map(|v| self.canonicalize_module_aliases(v))
+                    .collect(),
+            ),
+            Type::Generic(head, args) => Type::Generic(
+                head.clone(),
+                args.iter()
+                    .map(|a| self.canonicalize_module_aliases(a))
+                    .collect(),
+            ),
+            Type::Function {
+                params,
+                ret,
+                variadic,
+            } => Type::Function {
+                params: params
+                    .iter()
+                    .map(|p| self.canonicalize_module_aliases(p))
+                    .collect(),
+                ret: Box::new(self.canonicalize_module_aliases(ret)),
+                variadic: *variadic,
+            },
+            other => other.clone(),
+        }
     }
 
     /// Unwrap a chain of `newtype Foo = …` declarations until a non-
@@ -3945,7 +4080,117 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
             _ => {}
         }
     }
+    // Record direct base-class names so the constructor arity check can
+    // walk the inheritance chain and accept inherited fields as kwargs.
+    // Subscript bases like `Generic[T]` / `Protocol[T]` contribute no
+    // fields here so are skipped. Both bare `Name` bases and dotted
+    // `Expr::Attribute` bases (`pkg.Base`) are recorded — the latter
+    // matches what `infer_attribute` produces for the call site,
+    // letting `class Sub(pkg.Base):` resolve inherited fields when
+    // `pkg.Base` is in `class_shapes`. The `classes`-list filter was
+    // dropped because in-module `class` decls aren't the only source
+    // of recorded shapes — imported bases register through the
+    // external-shapes registry. `effective_class_shape` silently
+    // skips any recorded base that has no shape entry. Reported by
+    // gemini + copilot on PR #103.
+    for base in cd.bases() {
+        match base {
+            Expr::Name(n) => shape.bases.push(n.id.as_str().to_owned()),
+            Expr::Attribute(a) => {
+                if let Expr::Name(mod_name) = a.value.as_ref() {
+                    shape
+                        .bases
+                        .push(format!("{}.{}", mod_name.id.as_str(), a.attr.as_str()));
+                }
+            }
+            _ => {}
+        }
+    }
     shape
+}
+
+/// Compute the *effective* shape of a class for constructor-arity
+/// purposes: walks the recorded `bases` and folds each parent's
+/// fields / defaults / order into the result, with parent fields
+/// preceding the child's (matches `@dataclass`'s inherited-fields-
+/// first rule). Direct fields take precedence on name collision so
+/// a subclass that re-declares a parent field keeps its own type /
+/// default. Used by the `tyc::unknown_kwarg` + `tyc::arg_count`
+/// checks at every constructor call site; the bare `class_shapes`
+/// lookup is left intact for callers that only need the locally-
+/// declared surface (attribute resolution walks the class chain via
+/// its own path).
+fn effective_class_shape(
+    name: &str,
+    class_shapes: &HashMap<String, InterfaceShape>,
+) -> Option<InterfaceShape> {
+    let direct = class_shapes.get(name)?;
+    if direct.bases.is_empty() {
+        return Some(direct.clone());
+    }
+    // Guard against cycles (`class A(B):` / `class B(A):`) — Python
+    // would reject this at runtime with `TypeError`, but the checker
+    // shouldn't hang. A small recursion-depth ceiling is sufficient
+    // because real inheritance chains are shallow.
+    fn build(
+        name: &str,
+        class_shapes: &HashMap<String, InterfaceShape>,
+        depth: usize,
+        seen: &mut Vec<String>,
+    ) -> Option<InterfaceShape> {
+        if depth > 32 || seen.iter().any(|s| s == name) {
+            return class_shapes.get(name).cloned();
+        }
+        seen.push(name.to_owned());
+        let direct = class_shapes.get(name)?;
+        let mut merged = InterfaceShape::default();
+        for base in &direct.bases {
+            if let Some(base_shape) = build(base, class_shapes, depth + 1, seen) {
+                for fname in &base_shape.field_order {
+                    if !merged.fields.contains_key(fname) {
+                        merged.field_order.push(fname.clone());
+                        merged.fields.insert(
+                            fname.clone(),
+                            base_shape
+                                .fields
+                                .get(fname)
+                                .cloned()
+                                .unwrap_or(Type::Unknown),
+                        );
+                        if base_shape.field_defaults.contains(fname) {
+                            merged.field_defaults.insert(fname.clone());
+                        }
+                    }
+                }
+            }
+        }
+        for fname in &direct.field_order {
+            // Child overrides parent: re-insert type / default even if the
+            // name was already present from a parent.
+            if !merged.fields.contains_key(fname) {
+                merged.field_order.push(fname.clone());
+            }
+            merged.fields.insert(
+                fname.clone(),
+                direct.fields.get(fname).cloned().unwrap_or(Type::Unknown),
+            );
+            if direct.field_defaults.contains(fname) {
+                merged.field_defaults.insert(fname.clone());
+            } else {
+                // A subclass that overrides a defaulted parent field
+                // without supplying its own default makes it required.
+                merged.field_defaults.remove(fname);
+            }
+        }
+        // Methods / bases on the merged shape stay empty — the only
+        // callers of this helper read fields / field_order /
+        // field_defaults. Keeping methods empty avoids a misleading
+        // member surface if a downstream consumer reads it.
+        seen.pop();
+        Some(merged)
+    }
+    let mut seen: Vec<String> = Vec::new();
+    build(name, class_shapes, 0, &mut seen)
 }
 
 /// Drop the first positional parameter (the implicit `self` / `cls`
@@ -4706,6 +4951,33 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         value.range().end().to_usize(),
                     );
                     c.mismatch(&ann_type, &value_type, span);
+                }
+                // Audit hook: an annotated assignment with a bypass-
+                // constructed instance on the RHS counts as an escape
+                // — the value is being stored under an explicit type
+                // commitment (list[T], dict[K, V], alias, etc.) that
+                // moves it past where the field-init audit can follow.
+                // Closes the documented "container-literal escapes /
+                // outer-scope assignment escapes" gap in
+                // `docs/roadmap.md`. Bare reassignment without
+                // annotation is intentionally not audited here — that
+                // path is intra-function aliasing covered by
+                // `audit_clear_binding` below. `uninit_instances`
+                // reflects state from prior statements only (the
+                // current statement's `Stmt::Assign` -> `__new__`
+                // detection runs further below), so we can audit
+                // unconditionally without false-positive on a rebind
+                // `let c: T = ApiClient(...)` — the RHS doesn't
+                // reference `c` and therefore won't fire. The earlier
+                // `target_name` exclusion was over-cautious and caused
+                // a false negative on `let c = [c]`. Reported by
+                // gemini on PR #103.
+                let names_in_value = collect_names_in_expr(value);
+                if names_in_value
+                    .iter()
+                    .any(|n| c.uninit_instances.contains_key(n))
+                {
+                    audit_check_escape(c, value);
                 }
                 // `a.b: T = ...` — uncommon, but still a write to `a.b`.
                 // Field declarations inside a class body have no value
@@ -6640,8 +6912,18 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // the existing assignability check.
                     Type::Float
                 }
-                (Type::Int, Type::Int) => Type::Int,
-                (Type::Float, _) | (_, Type::Float) => Type::Float,
+                // Bool is a subtype of int; any non-division numeric op on
+                // Int/Bool operands yields Int. Float wins only when BOTH
+                // sides are numeric primitives — if one side is a foreign
+                // class (e.g. `torch.Tensor`), the result type is whatever
+                // that class's `__add__` / `__mul__` returns, which we
+                // can't see without stubs. Conservatively fall through to
+                // Unknown so the surrounding annotation drives assignability
+                // instead of mis-promoting to Float and rejecting valid
+                // numpy/torch code.
+                (Type::Int | Type::Bool, Type::Int | Type::Bool) => Type::Int,
+                (Type::Float, Type::Float | Type::Int | Type::Bool)
+                | (Type::Int | Type::Bool, Type::Float) => Type::Float,
                 (Type::Str, Type::Str) if matches!(b.op, Operator::Add) => Type::Str,
                 _ => Type::Unknown,
             }
@@ -6654,6 +6936,10 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                 // Boolean negation always produces a bool, regardless of
                 // operand type (Python: `not x` returns a bool).
                 ruff_python_ast::UnaryOp::Not => Type::Bool,
+                // Arithmetic / bitwise unary ops on `bool` produce `int`:
+                // `-True == -1`, `~True == -2`. Preserves other operand
+                // types unchanged.
+                _ if operand == Type::Bool => Type::Int,
                 // Bitwise / arithmetic unary ops preserve the operand type.
                 _ => operand,
             }
@@ -7165,7 +7451,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         }
                         return Type::Unknown;
                     }
-                    if let Some(shape) = c.class_shapes.get(&name).cloned() {
+                    if let Some(shape) = effective_class_shape(&name, &c.class_shapes) {
                         let candidates: Vec<String> = shape.fields.keys().cloned().collect();
                         for kw in kw_args {
                             let Some(ident) = &kw.arg else { continue };
@@ -7190,6 +7476,8 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         // required `api_key: str` field pass `tyc check`
                         // and only crash at runtime with
                         // `TypeError: missing 1 required positional argument`.
+                        // The shape here is `effective_class_shape`, so the
+                        // arity sees inherited parent fields too.
                         let info = class_constructor_arity(&shape);
                         if !info.param_names.is_empty() {
                             match check_arity_with_info(&info, pos_args, kw_args) {
@@ -8478,6 +8766,222 @@ let c: ApiClient = ApiClient(api_key=\"k\", base_url=\"u\")
     }
 
     #[test]
+    fn ctor_subclass_accepts_inherited_kwarg() {
+        // Phase-5.2 drift round 2: `class Dog(Animal):` should accept
+        // `Dog(name="Rex", breed="Husky")` — `name` is declared on
+        // Animal, so the auto-generated `__init__` for Dog must include
+        // it. Before the fix, `unknown_kwarg 'name'` fired because the
+        // arity check only looked at Dog's direct field surface.
+        let src = "\
+class Animal:
+    name: str
+
+class Dog(Animal):
+    breed: str
+
+let d: Dog = Dog(name=\"Rex\", breed=\"Husky\")
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "Dog(name=..., breed=...) must accept Animal's inherited `name`; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn ctor_subclass_missing_inherited_required_field() {
+        // A subclass that omits a parent's required field should still
+        // surface the missing-argument diagnostic — inheritance widens
+        // the accepted-kwarg set but doesn't drop required fields.
+        let src = "\
+class Animal:
+    name: str
+
+class Dog(Animal):
+    breed: str
+
+let d: Dog = Dog(breed=\"Husky\")
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "Dog(breed=...) must still flag missing `name` inherited from Animal"
+        );
+    }
+
+    #[test]
+    fn annotation_dotted_attribute_resolves_to_class() {
+        // `let c: foo.Cls = ...` should produce a `Class("foo.Cls")` so
+        // it unifies with the constructor's `foo.Cls(...)` inference.
+        // Before the fix this landed as `Type::Unknown`, which silently
+        // dropped downstream method-arity / kwarg checks on `c`. Parse
+        // a real source snippet so the AST nodes carry valid ranges.
+        let parsed = tyc_syntax::parse_module("def f(c: foo.Cls) -> None: pass\n").expect("parse");
+        let module = parsed.syntax();
+        let func = match &module.body[0] {
+            ruff_python_ast::Stmt::FunctionDef(f) => f,
+            other => panic!("expected FunctionDef, got {:?}", other),
+        };
+        let ann = func.parameters.args[0]
+            .parameter
+            .annotation
+            .as_deref()
+            .expect("annotation present");
+        let ty = type_from_annotation(ann, &[]);
+        assert_eq!(ty, Type::Class("foo.Cls".to_owned()));
+    }
+
+    #[test]
+    fn annotation_typing_self_is_permissive() {
+        // Codex P1 (PR #103): `typing.Self` must not become
+        // `Class("typing.Self")`; that landed `type_mismatch` on every
+        // fluent-builder pattern. The dotted-annotation arm now carves
+        // out `typing.Self` to `Type::Any` so a method body that
+        // `return self` satisfies the annotation.
+        let src = "\
+class Builder:
+    name: str
+
+impl Builder:
+    def with_name(self, n: str) -> typing.Self:
+        self.name = n
+        return self
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "`typing.Self` annotation must accept `self`; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn annotation_typing_any_is_permissive() {
+        // Codex P1 sibling: `typing.Any` must accept any concrete value.
+        let src = "\
+def take(x: typing.Any) -> None: pass
+def main() -> None:
+    take(42)
+    take(\"hi\")
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "`typing.Any` must be permissive; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn annotation_module_alias_canonicalised_via_is_assignable() {
+        // Gemini #1 (PR #103): `import foo as f; let c: f.Cls = …`
+        // — the annotation lands as `Class("f.Cls")` but the call
+        // site (`infer_attribute` on `f.Cls(...)`) lands as
+        // `Class("foo.Cls")` because the env resolves `f` to
+        // `Type::Module("foo")`. `is_assignable` now canonicalises
+        // both sides before comparing.
+        let src = "\
+class Cls:
+    payload: int
+
+import sys as s
+def make_cls() -> Cls:
+    let c: Cls = Cls(payload=1)
+    return c
+def main() -> None:
+    let c: Cls = make_cls()
+    print(c.payload)
+";
+        // This test only ensures the canonicalisation pass is wired
+        // (i.e. `is_assignable` returns true for matching local/
+        // canonical Class forms). A full end-to-end alias repro needs
+        // a multi-module project; the unit-level guard here is that
+        // `canonicalize_module_aliases` round-trips correctly through
+        // the assignability check.
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "module-alias canonicalisation must not break the simple case; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn ctor_dotted_base_resolves_inherited_field() {
+        // Gemini #2 + copilot (PR #103): `class Sub(pkg.Base):`
+        // should record the dotted base in `bases` and look it up in
+        // `class_shapes` via the canonicalised name. Bare-name bases
+        // (no longer filtered against the local `classes` list) flow
+        // through the same path.
+        let src = "\
+class Animal:
+    name: str
+
+class Dog(Animal):
+    breed: str
+
+let d: Dog = Dog(name=\"Rex\", breed=\"Husky\")
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "bare-name base must still resolve inherited fields after the filter drop; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn audit_self_reference_in_container_literal_fires() {
+        // Gemini #3 (PR #103): `let xs: list[Config] = [c, c]` where
+        // `c` is partially initialised must fire — the previous
+        // `target_name` exclusion suppressed the case incorrectly.
+        let src = "\
+class Config:
+    host: str
+    port: int
+
+def make() -> list[Config]:
+    mut c = Config.__new__(Config)
+    c.host = \"localhost\"
+    let xs: list[Config] = [c, c]
+    return xs
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingFieldInit { .. })),
+            "self-referential container escape must fire; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn ctor_grandchild_inherits_through_chain() {
+        // The walker is recursive — `class C(B):` where `B(A):` should
+        // see fields from both A and B at the construction site for C.
+        let src = "\
+class A:
+    a: int
+
+class B(A):
+    b: int
+
+class C(B):
+    c: int
+
+let x: C = C(a=1, b=2, c=3)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "C must see fields from A, B, and C; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
     fn ctor_field_with_default_is_optional() {
         let src = "\
 class ApiClient:
@@ -8942,6 +9446,86 @@ def make() -> ApiClient:
         assert!(
             !d.has_errors(),
             "setattr(obj=...) must drop audit tracking: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn audit_container_literal_escape_via_annotated_let_errors() {
+        // Closes the documented "container-literal escapes" gap from
+        // `docs/roadmap.md`. A partial instance stored inside a list /
+        // dict / tuple literal that gets committed to an annotated
+        // binding is no longer auditable past the assignment site, so
+        // the audit fires there.
+        let src = "\
+class Config:
+    host: str
+    port: int
+
+def make() -> list[Config]:
+    mut c = Config.__new__(Config)
+    c.host = \"localhost\"
+    let configs: list[Config] = [c]
+    return configs
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingFieldInit { .. })),
+            "container-literal escape must fire missing_field_init; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn audit_annotated_alias_escape_errors() {
+        // Outer-scope assignment escape: `let other: Config = c` stores
+        // the partial instance under an explicit type commitment.
+        let src = "\
+class Config:
+    host: str
+    port: int
+
+def make() -> Config:
+    mut c = Config.__new__(Config)
+    c.host = \"localhost\"
+    let alias: Config = c
+    return alias
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingFieldInit { .. })),
+            "annotated-alias escape must fire missing_field_init; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn audit_annotated_rebinding_no_false_positive() {
+        // A `let c: T = X(...)` that rebinds the tracked name itself
+        // (RHS does not reference `c`) must not fire the new
+        // container-escape audit — the target name is excluded by the
+        // implementation.
+        let src = "\
+class ApiClient:
+    api_key: str
+
+def make() -> ApiClient:
+    let c: ApiClient = ApiClient.__new__(ApiClient)
+    let c: ApiClient = ApiClient(api_key=\"x\")
+    return c
+";
+        let d = check(src);
+        let any_missing = d
+            .errors()
+            .iter()
+            .any(|e| matches!(e, TycError::MissingFieldInit { .. }));
+        assert!(
+            !any_missing,
+            "rebinding the same tracked name must NOT fire; got {:?}",
             d.errors()
         );
     }
@@ -10598,6 +11182,128 @@ let s: str = id(3)
         // widen to float when the target is `tuple[float, ...]`.
         let d = check("let xs: tuple[float, ...] = (1, 2, 3)\n");
         assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    // ── bool ⊆ int subtype widening ──────────────────────────────────────
+
+    #[test]
+    fn bool_assignable_to_int() {
+        // CPython: bool is a strict subclass of int.
+        let d = check("let x: int = True\n");
+        assert!(
+            !d.has_errors(),
+            "bool must be assignable to int; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn bool_assignable_to_float() {
+        // bool → int → float (transitive via widening chain).
+        let d = check("let x: float = False\n");
+        assert!(
+            !d.has_errors(),
+            "bool must be assignable to float; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn bool_arithmetic_with_int_yields_int() {
+        // `1 + True` produces int (not Unknown).
+        let d = check("let x: int = 1 + True\n");
+        assert!(
+            !d.has_errors(),
+            "1 + True must type-check as int; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn bool_arithmetic_both_bools_yields_int() {
+        // `True + False` has type int (Python: evaluates to 1).
+        let d = check("let x: int = True + False\n");
+        assert!(
+            !d.has_errors(),
+            "True + False must type-check as int; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn bool_unary_arithmetic_yields_int() {
+        // `-True` produces int (`== -1`), `~True` produces int (`== -2`).
+        let d = check("let x: int = -True\nlet y: int = ~True\n");
+        assert!(
+            !d.has_errors(),
+            "unary -/~ on bool must yield int; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn int_not_assignable_to_bool() {
+        // The widening is one-way: `let b: bool = 1` must still reject.
+        let d = check("let b: bool = 1\n");
+        assert!(
+            d.has_errors(),
+            "int must NOT flow into bool — the widening is one-way"
+        );
+    }
+
+    #[test]
+    fn binop_with_class_operand_stays_unknown_not_float() {
+        // Regression: `4.0 * tensor_value + ...` must not over-promote
+        // the result to `float` when one operand is a foreign class.
+        // The previous `(Float, _) | (_, Float) => Float` arm rejected
+        // valid numpy/torch code where the user annotated the result as
+        // the foreign class (`let y: torch.Tensor = 4.0 * x.sum()`).
+        let d = check(
+            "class Tensor: dummy: int\n\
+             def f(t: Tensor) -> Tensor:\n\
+             \x20   return 4.0 * t\n",
+        );
+        // The call site `4.0 * t` should infer to Unknown (we don't
+        // know Tensor.__rmul__), letting the surrounding `-> Tensor`
+        // annotation drive assignability via the (Unknown, _) arm.
+        assert!(
+            !d.has_errors(),
+            "binop with a foreign class operand must not over-promote to float; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn fixed_arity_tuple_widens_every_position() {
+        // Every slot of a fixed-arity tuple is covariant, not just the
+        // first — `tuple[int, int]` must flow into a `tuple[float, float]`
+        // parameter exactly as it does into `tuple[float, ...]`. The
+        // earlier `("tuple", 0) => Covariant` arm only relaxed position
+        // 0, so a `tuple[int, int]` argument tripped invariance at
+        // position 1 and rejected.
+        let d = check(
+            "def takes(p: tuple[float, float]) -> float: return p[0] + p[1]\n\
+             def main() -> float: return takes((1, 2))\n",
+        );
+        assert!(
+            !d.has_errors(),
+            "tuple[int, int] must flow into tuple[float, float]; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn fixed_arity_tuple_rejects_unsound_widening() {
+        // Covariance is one-way: `tuple[float, float]` does NOT flow into
+        // `tuple[int, int]` (a float-typed value cannot be read as int).
+        let d = check(
+            "def takes(p: tuple[int, int]) -> int: return p[0] + p[1]\n\
+             def main() -> int: return takes((1.0, 2.0))\n",
+        );
+        assert!(
+            d.has_errors(),
+            "tuple[float, float] must NOT flow into tuple[int, int]",
+        );
     }
 
     #[test]

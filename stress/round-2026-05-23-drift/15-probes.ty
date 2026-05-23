@@ -1,0 +1,112 @@
+"""Smoke probes — every form below is accepted by CPython 3.13.
+Each one tests whether tyc rejects valid CPython semantics."""
+
+# 1. bool ⊆ int arithmetic (the case wired in d46a1aa)
+def probe_bool_int() -> int:
+    let a: int = 1 + True
+    let b: int = sum([True, False, True])
+    return a + b
+
+# 2. int ⊆ float promotion in arithmetic
+def probe_int_float() -> float:
+    let x: float = 1 + 2.0
+    let y: float = 3
+    return x + y
+
+# 3. Container assignment widening — list[int] passed where list[float] expected
+def takes_floats(xs: list[float]) -> float:
+    return sum(xs)
+
+def probe_list_widen() -> float:
+    let ints: list[int] = [1, 2, 3]
+    return takes_floats(ints)
+
+# 4. Tuple covariance — tuple[int, int] where tuple[float, float] expected
+def takes_pair(p: tuple[float, float]) -> float:
+    return p[0] + p[1]
+
+def probe_tuple_widen() -> float:
+    let p: tuple[int, int] = (1, 2)
+    return takes_pair(p)
+
+# 5. dict-key widening — dict[int, str] where dict[float, str] expected
+def takes_fdict(d: dict[float, str]) -> str:
+    return d.get(0.0, "missing")
+
+def probe_dict_widen() -> str:
+    let d: dict[int, str] = {1: "one"}
+    return takes_fdict(d)
+
+# 6. Empty container literal type inference
+def probe_empty_list() -> list[int]:
+    let xs: list[int] = []
+    xs.append(1)
+    return xs
+
+# 7. Conditional expression with narrowing (None vs T)
+def probe_cond_narrow(x: int | None) -> int:
+    return x if x is not None else 0
+
+# 8. String * int repetition (Python: `"a" * 3 == "aaa"`)
+def probe_str_mul() -> str:
+    return "x" * 3
+
+# 9. List concat with mixed-int homogeneous list literal
+def probe_list_concat() -> list[int]:
+    return [1, 2] + [3, 4]
+
+# 10. enumerate() iterating over typed list
+def probe_enumerate() -> int:
+    mut total: int = 0
+    for i, v in enumerate([10, 20, 30]):
+        total = total + i + v
+    return total
+
+# 11. zip() over two typed lists
+def probe_zip() -> int:
+    mut total: int = 0
+    for a, b in zip([1, 2, 3], [4, 5, 6]):
+        total = total + a + b
+    return total
+
+# 12. comprehension with conditional
+def probe_comprehension() -> list[int]:
+    return [x * 2 for x in range(10) if x % 2 == 0]
+
+# 13. ternary type unification
+def probe_ternary(flag: bool) -> float:
+    return 1 if flag else 2.0
+
+# 14. tuple unpacking with mixed types
+def probe_tuple_unpack() -> int:
+    let pair: tuple[int, str] = (1, "x")
+    let (a, b) = pair
+    return a + len(b)
+
+# 15. dict.items() iteration
+def probe_dict_items() -> int:
+    let d: dict[str, int] = {"a": 1, "b": 2}
+    mut total: int = 0
+    for k, v in d.items():
+        total = total + v + len(k)
+    return total
+
+def main() -> None:
+    print(probe_bool_int())
+    print(probe_int_float())
+    print(probe_list_widen())
+    print(probe_tuple_widen())
+    print(probe_dict_widen())
+    print(probe_empty_list())
+    print(probe_cond_narrow(5))
+    print(probe_str_mul())
+    print(probe_list_concat())
+    print(probe_enumerate())
+    print(probe_zip())
+    print(probe_comprehension())
+    print(probe_ternary(True))
+    print(probe_tuple_unpack())
+    print(probe_dict_items())
+
+if __name__ == "__main__":
+    main()

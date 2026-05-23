@@ -1032,3 +1032,90 @@ async def load() -> int:
          got {gather_expansion_count}"
     );
 }
+
+// ── corpus round-trip sweep ───────────────────────────────────────────────────
+
+/// Walk `examples/` and assert that `tyc check` succeeds on every
+/// `.ty` source file. Closes roadmap concrete-next-step #1 ("Corpus
+/// round-trip sweep") — any change to the type checker, resolver,
+/// or analyser that breaks a previously-working example now fails CI
+/// immediately rather than being discovered in a manual sweep
+/// campaign.
+///
+/// Failures are collected rather than short-circuited so a single
+/// run surfaces the complete breakage list. Files under
+/// `examples/testing/` are intentional failure probes and are
+/// excluded.
+#[test]
+fn corpus_examples_all_check_clean() {
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let examples_dir = manifest_dir.join("../../../examples");
+    let examples_dir = match examples_dir.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            // `examples/` doesn't exist relative to the manifest in
+            // some checkout layouts; skip rather than fail loudly.
+            eprintln!(
+                "skipping corpus sweep: examples dir not found at {}",
+                examples_dir.display()
+            );
+            return;
+        }
+    };
+    fn collect(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .is_some_and(|n| n == "testing")
+                {
+                    continue;
+                }
+                collect(&path, out);
+            } else if path.extension().is_some_and(|e| e == "ty") {
+                out.push(path);
+            }
+        }
+    }
+    let mut ty_files: Vec<std::path::PathBuf> = Vec::new();
+    collect(&examples_dir, &mut ty_files);
+    ty_files.sort();
+    assert!(
+        !ty_files.is_empty(),
+        "expected at least one .ty file under {}",
+        examples_dir.display()
+    );
+
+    let mut failures: Vec<(std::path::PathBuf, std::process::Output)> = Vec::new();
+    for file in &ty_files {
+        let out = tyc()
+            .arg("check")
+            .arg(file)
+            .output()
+            .expect("tyc check spawn");
+        if !out.status.success() {
+            failures.push((file.clone(), out));
+        }
+    }
+    if !failures.is_empty() {
+        let mut msg = format!(
+            "{} of {} corpus example(s) failed `tyc check`:\n",
+            failures.len(),
+            ty_files.len()
+        );
+        for (path, out) in &failures {
+            msg.push_str(&format!(
+                "── {} ──\n{}\n{}\n",
+                path.display(),
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+            ));
+        }
+        panic!("{msg}");
+    }
+}

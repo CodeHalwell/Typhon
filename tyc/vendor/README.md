@@ -82,9 +82,7 @@ them on output.
 
 ## Deferred follow-ups
 
-Two stretch items called out in the original plan were deliberately
-deferred — they're independent of the back-end swap and can land on
-separate branches:
+One stretch item from the original plan remains; the other has landed:
 
 1. **Vendor `ruff_python_codegen`** to replace the hand-written
    `tyc-emit/src/printer.rs` (~1550 LOC). The tricky part is
@@ -95,12 +93,17 @@ separate branches:
    `range()` of each node as it's printed. The `let` / `mut`
    prefix emission (already implemented in the hand-written
    printer) would move into that shim.
-2. **Restore upstream Ruff's `insta` snapshot tests** by
-   vendoring the `crates/ruff_python_parser/resources/test/*`
-   fixtures and flipping `test = true` on the vendored libraries.
+2. ✅ **Upstream Ruff `insta` snapshot tests restored.** The vendored
+   snapshots in `ruff_python_parser/src/snapshots/` (194 files)
+   already cover the inline `#[cfg(test)]` blocks in
+   `src/lexer.rs`, `src/string.rs`, and `src/parser/tests.rs`. The
+   only thing gating execution was `[lib] test = false` on three of
+   the vendored crates; flipping that to `true` brings
+   217 + 49 + 0 = 266 upstream tests back online
+   (`ruff_python_parser`, `ruff_python_ast`, `ruff_text_size`).
    The Typhon `Mutability` extension doesn't appear in any of the
-   upstream fixtures so they should pass unchanged; the win is
-   confidence when bumping the `UPSTREAM` SHA.
+   upstream fixtures, so every snapshot passes unchanged. The win
+   is confidence when bumping the `UPSTREAM` SHA.
 
 The hard part of the consumer swap is the AST shape diff. Significant
 differences from `rustpython_ast`:

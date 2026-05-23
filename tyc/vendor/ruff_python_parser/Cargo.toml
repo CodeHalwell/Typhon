@@ -8,14 +8,13 @@ description = "Vendored copy of ruff_python_parser for Typhon (with val/var toke
 publish = false
 
 [lib]
-test = false
+test = true
 doctest = false
 
 [dev-dependencies]
-# `insta` is referenced by upstream's inline `#[cfg(test)]` snapshot blocks
-# in `src/string.rs`. The tests aren't run (lib has `test = false`) but
-# `cargo clippy --all-targets` still type-checks them, so the dependency
-# must resolve.
+# `insta` is used by upstream's inline `#[cfg(test)]` snapshot blocks in
+# `src/lexer.rs` and `src/string.rs`. The snapshots themselves live in
+# `src/snapshots/` (vendored verbatim from upstream).
 insta = "1"
 
 [[test]]

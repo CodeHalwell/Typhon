@@ -8,7 +8,7 @@ description = "Vendored copy of ruff_text_size for Typhon"
 publish = false
 
 [lib]
-test = false
+test = true
 
 [dependencies]
 get-size2 = { version = "0.8.0", features = ["derive"], optional = true }

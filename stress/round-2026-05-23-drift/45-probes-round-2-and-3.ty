@@ -1,0 +1,117 @@
+"""Round 3 — typing edge cases, builtins, slice/index, exception flow."""
+
+# 31. typed dict-pattern coverage via .get with default
+def probe_dict_get_default(d: dict[str, int]) -> int:
+    return d.get("missing", 0)
+
+# 32. callable accepting subtypes (covariant return for Callable)
+def make_int_provider() -> int:
+    return 42
+
+def probe_callable() -> int:
+    let provider: int = make_int_provider()
+    return provider
+
+# 33. slicing
+def probe_slice() -> list[int]:
+    let xs: list[int] = [1, 2, 3, 4, 5]
+    return xs[1:4]
+
+# 34. negative index
+def probe_neg_index() -> int:
+    let xs: list[int] = [10, 20, 30]
+    return xs[-1]
+
+# 35. try/except: name bound in except handler
+def probe_except_var() -> str:
+    try:
+        return str(int("not a number"))
+    except ValueError as e:
+        return f"got error: {e}"
+
+# 36. multi-line list literal
+def probe_multiline_list() -> list[int]:
+    return [
+        1,
+        2,
+        3,
+    ]
+
+# 37. f-string with method call
+def probe_fstring_method() -> str:
+    let name: str = "world"
+    return f"hello, {name.upper()}!"
+
+# 38. None as default value
+def probe_none_default(x: int | None = None) -> int:
+    if x is None:
+        return 0
+    return x
+
+# 39. iter() and next() with default
+def probe_iter_next() -> int:
+    let xs: list[int] = [42]
+    return next(iter(xs), 0)
+
+# 40. dataclass-style field with default factory pattern
+class Config:
+    name: str = "default"
+    tags: list[str]
+
+def probe_config_field_default() -> Config:
+    return Config(tags=["a", "b"])
+
+# 41. Optional chaining via guard
+def probe_optional_chain(x: str | None) -> int:
+    guard parsed = (int(x) if x is not None else None) else:
+        return 0
+    return parsed
+
+# 42. Tuple of mixed types via destructure
+def probe_mixed_tuple() -> str:
+    let pair: tuple[int, str] = (5, "hello")
+    let (count, label) = pair
+    return f"{count}x {label}"
+
+# 43. Generic function with constraint
+def biggest[T: int](xs: list[T]) -> T:
+    mut best: T = xs[0]
+    for x in xs:
+        if x > best:
+            best = x
+    return best
+
+def probe_bounded_generic() -> int:
+    return biggest([3, 1, 4, 1, 5, 9, 2, 6])
+
+# 44. List of dicts comprehension
+def probe_list_of_dicts() -> list[dict[str, int]]:
+    return [{"i": i, "sq": i * i} for i in range(3)]
+
+# 45. star-args pass-through
+def fmt_many(*args: int) -> str:
+    return ",".join(str(a) for a in args)
+
+def probe_star_pass() -> str:
+    return fmt_many(1, 2, 3)
+
+def main() -> None:
+    let d: dict[str, int] = {"a": 1}
+    print(probe_dict_get_default(d))
+    print(probe_callable())
+    print(probe_slice())
+    print(probe_neg_index())
+    print(probe_except_var())
+    print(probe_multiline_list())
+    print(probe_fstring_method())
+    print(probe_none_default())
+    print(probe_iter_next())
+    print(probe_config_field_default())
+    print(probe_optional_chain("42"))
+    print(probe_mixed_tuple())
+    print(probe_bounded_generic())
+    print(probe_list_of_dicts())
+    print(probe_star_pass())
+
+if __name__ == "__main__":
+    main()

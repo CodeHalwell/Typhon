@@ -105,12 +105,24 @@ def main() -> None:
 `.dty` stubs participate on equal footing with `.ty` source; stubs win
 on name collisions.
 
+## Inheritance
+
+Subclass constructors accept inherited fields end-to-end —
+`class Dog(Animal):` exposes `Dog(name="Rex", breed="Husky")` where
+`name` is declared on `Animal`. The check walks the recorded base
+chain via `effective_class_shape`, so a grandchild
+`class C(B):` (with `B(A):`) sees fields from `A`, `B`, and `C` at
+its construction site. A child override of a defaulted parent field
+correctly re-marks the field as required.
+
 ## Limitations
 
-Dotted-attribute *annotations* (`let c: f.Cls = …`) don't yet resolve to
-the foreign class shape — the constructor call itself arity-checks
-correctly, but the local binding lands as `Type::Unknown`, which weakens
-downstream method-arity checks on it. Workaround: use `from foo import
-Cls` or drop the annotation.
+Dotted-attribute *annotations* (`let c: f.Cls = …`) now resolve to
+the foreign class shape end-to-end: a `Class("{module}.{attr}")` is
+produced by `type_from_annotation`, which unifies with the call site's
+`f.Cls(...)` inference. Downstream method-arity / kwarg checks on `c`
+fire correctly. Only multi-segment paths (`a.b.Cls`) still fall back
+to `Type::Unknown` because they need full module-registry resolution
+that is out of scope for the annotation pass.
 
 See https://typhon.dev/lang/diagnostics/arg_count
