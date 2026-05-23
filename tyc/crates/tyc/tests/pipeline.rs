@@ -1046,6 +1046,122 @@ async def load() -> int:
 /// run surfaces the complete breakage list. Files under
 /// `examples/testing/` are intentional failure probes and are
 /// excluded.
+/// Round-trip the curated third-party-Python corpus through `tyc
+/// migrate` + `tyc check`. Catches regressions in the migrator's
+/// rewrite catalogue (dataclass, Protocol, NewType, generics) and in
+/// the checker's handling of the migrator's output. Failures are
+/// collected so a single run surfaces the complete list.
+///
+/// The corpus lives at `stress/third-party-py-corpus/*.py`. Adding a
+/// file there automatically extends this sweep — no test-side wiring
+/// required.
+#[test]
+fn third_party_corpus_round_trips_cleanly() {
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let corpus_dir = manifest_dir.join("../../../stress/third-party-py-corpus");
+    let corpus_dir = match corpus_dir.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!(
+                "skipping third-party corpus sweep: dir not found at {}",
+                corpus_dir.display()
+            );
+            return;
+        }
+    };
+    let mut py_files: Vec<std::path::PathBuf> = std::fs::read_dir(&corpus_dir)
+        .expect("read corpus dir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "py"))
+        .collect();
+    py_files.sort();
+    assert!(
+        !py_files.is_empty(),
+        "expected at least one .py file under {}",
+        corpus_dir.display()
+    );
+
+    let mut failures: Vec<(std::path::PathBuf, String, String)> = Vec::new();
+    for py in &py_files {
+        // Each fixture goes in its own tempdir so the migrator's
+        // sibling `.ty` output and the subsequent `tyc check` run
+        // can't cross-contaminate. The `--check` flag prints to
+        // stdout so we capture the migrated source explicitly.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target_py = tmp.path().join(py.file_name().unwrap());
+        std::fs::copy(py, &target_py).expect("copy fixture");
+
+        let migrate_out = tyc()
+            .arg("migrate")
+            .arg(&target_py)
+            .output()
+            .expect("migrate spawn");
+        if !migrate_out.status.success() {
+            failures.push((
+                py.clone(),
+                "migrate".into(),
+                String::from_utf8_lossy(&migrate_out.stderr).into_owned(),
+            ));
+            continue;
+        }
+
+        // `tyc migrate` writes `foo.ty` next to `foo.py`. Set up a
+        // small Typhon project around it so `tyc check` has a typhon.toml
+        // anchor (the corpus dir itself is not a project root).
+        let ty_path = target_py.with_extension("ty");
+        if !ty_path.exists() {
+            failures.push((
+                py.clone(),
+                "migrate-output".into(),
+                format!("expected migrated file at {}", ty_path.display()),
+            ));
+            continue;
+        }
+
+        let project_root = tempfile::tempdir().expect("project tempdir");
+        let src_dir = project_root.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::copy(&ty_path, src_dir.join("main.ty")).unwrap();
+        std::fs::write(
+            project_root.path().join("typhon.toml"),
+            "[project]\nname = \"corpus\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"build\"\n\
+             [python]\ntarget = \"3.13\"\n[emit]\nformat = false\n[strictness]\n[env]\n",
+        )
+        .unwrap();
+
+        let check_out = tyc()
+            .arg("check")
+            .arg(project_root.path())
+            .output()
+            .expect("check spawn");
+        if !check_out.status.success() {
+            failures.push((
+                py.clone(),
+                "check".into(),
+                format!(
+                    "{}\n{}\n--- migrated source ---\n{}",
+                    String::from_utf8_lossy(&check_out.stdout),
+                    String::from_utf8_lossy(&check_out.stderr),
+                    std::fs::read_to_string(&ty_path).unwrap_or_default(),
+                ),
+            ));
+        }
+    }
+
+    if !failures.is_empty() {
+        let mut msg = format!(
+            "{} of {} third-party fixture(s) failed migrate→check:\n",
+            failures.len(),
+            py_files.len()
+        );
+        for (path, stage, out) in &failures {
+            msg.push_str(&format!("── {} [{stage}] ──\n{out}\n", path.display()));
+        }
+        panic!("{msg}");
+    }
+}
+
 #[test]
 fn corpus_examples_all_check_clean() {
     let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
