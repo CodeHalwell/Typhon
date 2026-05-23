@@ -1187,6 +1187,12 @@ fn walk_typevars(ty: &Type, out: &mut Vec<String>) {
                 out.push(name.clone());
             }
         }
+        // Higher-kinded type constructors also need binding, just like TypeVars
+        Type::TypeConstructor(name, _) => {
+            if !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
         Type::Union(xs) | Type::Generic(_, xs) => {
             for x in xs {
                 walk_typevars(x, out);
@@ -13346,15 +13352,16 @@ def f() -> int:
 
     #[test]
     fn hkt_type_constructor_single_underscore() {
-        // Test that `F[_]` is recognized as a TypeConstructor with arity 1
-        use crate::{type_from_annotation, Type};
+        // Test that `F[_]` is recognized as a TypeConstructor when F is a type parameter
+        use crate::{type_from_annotation_with_params, Type};
         let src = "F[_]";
         let module = tyc_syntax::parse_module(src).unwrap().into_syntax();
         let expr = match &module.body[0] {
             ruff_python_ast::Stmt::Expr(e) => &e.value,
             _ => panic!("expected Expr"),
         };
-        let ty = type_from_annotation(expr, &[]);
+        // Pass "F" as a type parameter so it's recognized as HKT
+        let ty = type_from_annotation_with_params(expr, &[], &["F".to_string()]);
         match ty {
             Type::TypeConstructor(name, arity) => {
                 assert_eq!(name, "F");
@@ -13367,14 +13374,15 @@ def f() -> int:
     #[test]
     fn hkt_type_constructor_multiple_underscores() {
         // Test that `G[_, _]` is recognized as a TypeConstructor with arity 2
-        use crate::{type_from_annotation, Type};
+        use crate::{type_from_annotation_with_params, Type};
         let src = "G[_, _]";
         let module = tyc_syntax::parse_module(src).unwrap().into_syntax();
         let expr = match &module.body[0] {
             ruff_python_ast::Stmt::Expr(e) => &e.value,
             _ => panic!("expected Expr"),
         };
-        let ty = type_from_annotation(expr, &[]);
+        // Pass "G" as a type parameter so it's recognized as HKT
+        let ty = type_from_annotation_with_params(expr, &[], &["G".to_string()]);
         match ty {
             Type::TypeConstructor(name, arity) => {
                 assert_eq!(name, "G");
@@ -13396,14 +13404,35 @@ def f() -> int:
     }
 
     #[test]
-    fn hkt_type_constructor_is_assignable() {
-        // Test that TypeConstructor is permissive in assignability (like TypeVar)
-        use crate::{assignable, Type};
-        let tc = Type::TypeConstructor("F".to_string(), 1);
+    fn hkt_type_constructor_binding() {
+        // Test that TypeConstructor binds correctly in bind_typevars (HKT unification)
+        use crate::{Type, compute_bidirectional_bindings};
+
+        // Simulate a function like: def map[F[_], A, B](fa: F[A], f: A -> B) -> F[B]
+        // Test that binding works through the public API
+        let tc_a = Type::TypeConstructor("F".to_string(), 1);
         let list_int = Type::Generic("list".to_string(), vec![Type::Int]);
 
-        // TypeConstructor should accept anything
-        assert!(assignable(&tc, &list_int));
-        assert!(assignable(&list_int, &tc));
+        // TypeConstructor should NOT be universally assignable anymore
+        // (it was removed from assignable to fix the security issue)
+        assert!(!crate::assignable(&tc_a, &list_int));
+        assert!(!crate::assignable(&list_int, &tc_a));
+
+        // Test that it works in the binding context through the public API
+        // Call as if we had: def f[F[_]](x: F[int]) -> F[str]
+        // with argument list[int]
+        let formal_params = vec![tc_a.clone()];
+        let actual_args = vec![list_int.clone()];
+        let return_type = Type::TypeConstructor("F".to_string(), 1);
+
+        let bindings = compute_bidirectional_bindings(
+            &formal_params,
+            &actual_args,
+            &return_type,
+            None,
+        );
+
+        // After binding, F should be bound to "list"
+        assert_eq!(bindings.get("F"), Some(&Type::Class("list".to_string())));
     }
 }
