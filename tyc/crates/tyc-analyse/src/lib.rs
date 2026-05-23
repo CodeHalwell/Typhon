@@ -378,14 +378,18 @@ fn eval_expr(expr: &Expr, ctx: &mut EvalContext<'_>) -> Result<ComptimeValue, St
             if let Some(val) = ctx.locals.get(n.id.as_str()) {
                 return Ok(val.clone());
             }
-            // Check if it's a bare type name
+            // Check if it's a bare type name (runtime-resolvable built-in types only).
+            // `Any` is excluded because it's not a runtime builtin — emitting it without
+            // importing from `typing` would cause NameError at runtime.
             match n.id.as_str() {
-                "int" | "str" | "bool" | "float" | "bytes" | "None" | "Any" => {
+                "int" | "str" | "bool" | "float" | "bytes" | "None" | "type" | "object" => {
                     Ok(ComptimeValue::Type(n.id.to_string()))
                 }
                 _ => Err(format!(
                     "unknown name '{}' in comptime expression — only the enclosing function's \
-                     parameters and locally-bound names are in scope (comptime evaluation is hermetic)",
+                     parameters, locally-bound names, and runtime-resolvable built-in type names \
+                     (int, str, bool, float, bytes, None, type, object) are in scope \
+                     (comptime evaluation is hermetic)",
                     n.id
                 ))
             }
