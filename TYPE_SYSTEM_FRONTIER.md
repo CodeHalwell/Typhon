@@ -1,22 +1,22 @@
 # Type System Frontier - Implementation Summary
 
 This document summarizes the implementation of three independent type system enhancements
-from [Epic: type-system frontier — HKT, full variance inference, comptime types-as-values](https://github.com/CodeHalwell/Typhon/issues/XXX).
+from [Epic: type-system frontier — HKT, full variance inference, comptime types-as-values](https://github.com/CodeHalwell/Typhon/pull/113).
 
 ## 1. Higher-Kinded Types (HKT) - Foundation ✅
 
 ### What was implemented
 
 - **New `Type::TypeConstructor` variant**: Represents type constructors with unbound parameters
-- **`F[_]` syntax recognition**: Parser now recognizes higher-kinded type parameters
-- **Assignability support**: TypeConstructor behaves like TypeVar (permissive until bound)
+- **`F[_]` syntax recognition**: Parser recognizes higher-kinded type parameters (only when F is a declared type parameter)
+- **HKT binding support**: TypeConstructor unification in `bind_typevars` for proper HKT inference
 - **Display support**: `Functor[_]`, `Bifunctor[_, _]` display correctly
 
 ### Code locations
 
 - Type enum: `tyc/crates/tyc-types/src/lib.rs:87`
-- Parser support: `tyc/crates/tyc-types/src/lib.rs:1095-1111`
-- Assignability: `tyc/crates/tyc-types/src/lib.rs:363-367`
+- Parser support: `tyc/crates/tyc-types/src/lib.rs:1090-1111` (restricted to type parameters)
+- HKT binding: `tyc/crates/tyc-types/src/lib.rs:1241-1248`
 - Display: `tyc/crates/tyc-types/src/lib.rs:181-184`
 
 ### Example usage
@@ -41,15 +41,17 @@ Four comprehensive tests added:
 ### What was implemented
 
 - **New `ComptimeValue::Type` variant**: Types can now be comptime values
-- **Type name recognition**: `int`, `str`, `bool`, `float`, `bytes`, `None`, `Any` recognized
+- **Type name recognition**: Runtime-resolvable built-in types only: `int`, `str`, `bool`, `float`, `bytes`, `None`, `type`, `object`
+- **`Any` excluded**: Not a runtime builtin; would cause NameError without importing from `typing`
 - **Emission strategy**: Type values emit as type expressions, not string literals
 - **Full integration**: Works with all existing comptime operations
 
 ### Code locations
 
 - ComptimeValue enum: `tyc/crates/tyc-analyse/src/lib.rs:104`
-- Type recognition: `tyc/crates/tyc-analyse/src/lib.rs:376-392`
+- Type recognition: `tyc/crates/tyc-analyse/src/lib.rs:381-395`
 - Display: `tyc/crates/tyc-analyse/src/lib.rs:162-166`
+- Tests: `tyc/crates/tyc/tests/build_features.rs:1542-1621`
 
 ### Example usage
 
@@ -144,6 +146,6 @@ See `docs/roadmap.md` Phase 4+ "Richer comptime".
 
 ## References
 
-- Issue: Epic: type-system frontier — HKT, full variance inference, comptime types-as-values
+- Epic PR: [type-system frontier — HKT, full variance inference, comptime types-as-values](https://github.com/CodeHalwell/Typhon/pull/113)
 - Roadmap: `docs/roadmap.md` Concrete next step #2 and Phase 4+
-- Implementation PR: #XXX (to be filled in)
+- Implementation PR: [#113](https://github.com/CodeHalwell/Typhon/pull/113)
