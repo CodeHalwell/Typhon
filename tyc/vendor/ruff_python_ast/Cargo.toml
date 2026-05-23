@@ -8,7 +8,7 @@ description = "Vendored copy of ruff_python_ast for Typhon (with val/var mutabil
 publish = false
 
 [lib]
-test = false
+test = true
 doctest = false
 
 [dependencies]
