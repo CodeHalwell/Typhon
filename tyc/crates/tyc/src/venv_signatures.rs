@@ -464,6 +464,11 @@ fn class_shape_from_params(params: &[IntrospectedParam]) -> Option<InterfaceShap
         fields,
         field_order,
         field_defaults,
+        // Introspected venv classes don't carry inheritance info here;
+        // the constructor check falls back to direct fields, which is
+        // the pre-effective-shape behaviour. Foreign-class inheritance
+        // chains land via the typeshed stub path.
+        bases: Vec::new(),
     })
 }
 

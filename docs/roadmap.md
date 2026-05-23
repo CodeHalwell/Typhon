@@ -127,11 +127,20 @@ Shipped in [v0.2.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.2.0):
 Limitations carried forward (tracked in
 [`docs/findings.md`](findings.md)):
 
-- Dotted-attribute annotations (`let c: f.Cls = …`) don't resolve to
-  the foreign class shape; use `from foo import Cls` or drop the
-  annotation for now.
+- ~~Dotted-attribute annotations (`let c: f.Cls = …`) don't resolve to
+  the foreign class shape~~ — fixed in the Phase-5.2 drift sweep.
+  `Expr::Attribute` annotations now produce a qualified
+  `Class("{module}.{attr}")` that unifies with the call site's
+  `import foo as f; f.Cls(...)` inference; downstream method-arity and
+  kwarg checks fire correctly. See test
+  `annotation_dotted_attribute_resolves_to_class` in `tyc-types`.
 - The post-construction audit doesn't track container-literal escapes
   or outer-scope assignment escapes, and is intra-procedural.
+- Subclass constructors used to reject inherited fields
+  (`Dog(name="Rex", breed="Husky")` for `class Dog(Animal):`) — also
+  fixed in the same sweep via a new `effective_class_shape` helper that
+  walks the inheritance chain. See tests `ctor_subclass_*` /
+  `ctor_grandchild_inherits_through_chain` in `tyc-types`.
 
 ## Phase 5 — Interop and developer experience ✅ complete (v0.1.6)
 

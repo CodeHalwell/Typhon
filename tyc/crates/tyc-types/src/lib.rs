@@ -1057,6 +1057,22 @@ pub fn type_from_annotation_with_params(
             Type::Generic(head, args)
         }
         Expr::NoneLiteral(_) => Type::None,
+        // Dotted annotation `import foo as f; let c: f.Cls = …` /
+        // `let c: typing.OrderedDict = …`. Produces a qualified
+        // `Class("foo.Cls")` so it matches the call site's
+        // `foo.ApiClient(...)` inference (which uses the same
+        // `{module}.{attr}` form — see `infer_attribute` `Type::Module`
+        // arm). Without this arm, `let c: f.Cls = …` landed as
+        // `Type::Unknown`, silently dropping every downstream
+        // method-arity check (`docs/roadmap.md` Phase-5.5 limitation).
+        // Bare attribute heads (`a.b.Cls` where the leading `a.b`
+        // isn't a single Name) fall through to `Type::Unknown` —
+        // multi-segment paths would need the module registry to
+        // resolve and aren't worth the complexity for v1.
+        Expr::Attribute(a) => match a.value.as_ref() {
+            Expr::Name(n) => Type::Class(format!("{}.{}", n.id.as_str(), a.attr.as_str())),
+            _ => Type::Unknown,
+        },
         _ => Type::Unknown,
     }
 }
@@ -1665,6 +1681,15 @@ pub struct InterfaceShape {
     /// NOT add the field here — Typhon does not auto-inject `= None`
     /// for `T?` fields, so the runtime dataclass still requires them.
     pub field_defaults: std::collections::HashSet<String>,
+    /// Base class names declared on the `class Sub(Base1, Base2):`
+    /// header. Recorded so the constructor arity check can walk the
+    /// inheritance chain and accept inherited fields as kwargs —
+    /// without this, `class Dog(Animal):` rejects
+    /// `Dog(name="Rex", breed="Husky")` because `name` is only on
+    /// `Animal`. Empty for interfaces (which never extend Python
+    /// `class`es structurally), for sealed-union variants without
+    /// explicit bases, and for any class declared with no bases.
+    pub bases: Vec<String>,
 }
 
 /// Tracking state for a binding constructed via `X.__new__(X)` or
@@ -3954,7 +3979,103 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
             _ => {}
         }
     }
+    // Record direct base-class names so the constructor arity check can
+    // walk the inheritance chain and accept inherited fields as kwargs.
+    // Subscript bases like `Generic[T]` / `Protocol[T]` contribute no
+    // fields here so are skipped; only bare `Name` bases survive.
+    for base in cd.bases() {
+        if let Expr::Name(n) = base {
+            let bn = n.id.as_str();
+            if classes.iter().any(|c| c == bn) {
+                shape.bases.push(bn.to_owned());
+            }
+        }
+    }
     shape
+}
+
+/// Compute the *effective* shape of a class for constructor-arity
+/// purposes: walks the recorded `bases` and folds each parent's
+/// fields / defaults / order into the result, with parent fields
+/// preceding the child's (matches `@dataclass`'s inherited-fields-
+/// first rule). Direct fields take precedence on name collision so
+/// a subclass that re-declares a parent field keeps its own type /
+/// default. Used by the `tyc::unknown_kwarg` + `tyc::arg_count`
+/// checks at every constructor call site; the bare `class_shapes`
+/// lookup is left intact for callers that only need the locally-
+/// declared surface (attribute resolution walks the class chain via
+/// its own path).
+fn effective_class_shape(
+    name: &str,
+    class_shapes: &HashMap<String, InterfaceShape>,
+) -> Option<InterfaceShape> {
+    let direct = class_shapes.get(name)?;
+    if direct.bases.is_empty() {
+        return Some(direct.clone());
+    }
+    // Guard against cycles (`class A(B):` / `class B(A):`) — Python
+    // would reject this at runtime with `TypeError`, but the checker
+    // shouldn't hang. A small recursion-depth ceiling is sufficient
+    // because real inheritance chains are shallow.
+    fn build(
+        name: &str,
+        class_shapes: &HashMap<String, InterfaceShape>,
+        depth: usize,
+        seen: &mut Vec<String>,
+    ) -> Option<InterfaceShape> {
+        if depth > 32 || seen.iter().any(|s| s == name) {
+            return class_shapes.get(name).cloned();
+        }
+        seen.push(name.to_owned());
+        let direct = class_shapes.get(name)?;
+        let mut merged = InterfaceShape::default();
+        for base in &direct.bases {
+            if let Some(base_shape) = build(base, class_shapes, depth + 1, seen) {
+                for fname in &base_shape.field_order {
+                    if !merged.fields.contains_key(fname) {
+                        merged.field_order.push(fname.clone());
+                        merged.fields.insert(
+                            fname.clone(),
+                            base_shape
+                                .fields
+                                .get(fname)
+                                .cloned()
+                                .unwrap_or(Type::Unknown),
+                        );
+                        if base_shape.field_defaults.contains(fname) {
+                            merged.field_defaults.insert(fname.clone());
+                        }
+                    }
+                }
+            }
+        }
+        for fname in &direct.field_order {
+            // Child overrides parent: re-insert type / default even if the
+            // name was already present from a parent.
+            if !merged.fields.contains_key(fname) {
+                merged.field_order.push(fname.clone());
+            }
+            merged.fields.insert(
+                fname.clone(),
+                direct.fields.get(fname).cloned().unwrap_or(Type::Unknown),
+            );
+            if direct.field_defaults.contains(fname) {
+                merged.field_defaults.insert(fname.clone());
+            } else {
+                // A subclass that overrides a defaulted parent field
+                // without supplying its own default makes it required.
+                merged.field_defaults.remove(fname);
+            }
+        }
+        // Methods / bases on the merged shape stay empty — the only
+        // callers of this helper read fields / field_order /
+        // field_defaults. Keeping methods empty avoids a misleading
+        // member surface if a downstream consumer reads it.
+        seen.pop();
+        Some(merged)
+    }
+    let mut seen: Vec<String> = Vec::new();
+    build(name, class_shapes, 0, &mut seen)
 }
 
 /// Drop the first positional parameter (the implicit `self` / `cls`
@@ -7174,7 +7295,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         }
                         return Type::Unknown;
                     }
-                    if let Some(shape) = c.class_shapes.get(&name).cloned() {
+                    if let Some(shape) = effective_class_shape(&name, &c.class_shapes) {
                         let candidates: Vec<String> = shape.fields.keys().cloned().collect();
                         for kw in kw_args {
                             let Some(ident) = &kw.arg else { continue };
@@ -7199,6 +7320,8 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                         // required `api_key: str` field pass `tyc check`
                         // and only crash at runtime with
                         // `TypeError: missing 1 required positional argument`.
+                        // The shape here is `effective_class_shape`, so the
+                        // arity sees inherited parent fields too.
                         let info = class_constructor_arity(&shape);
                         if !info.param_names.is_empty() {
                             match check_arity_with_info(&info, pos_args, kw_args) {
@@ -8484,6 +8607,97 @@ let c: ApiClient = ApiClient(api_key=\"k\", base_url=\"u\")
 ";
         let d = check(src);
         assert!(!d.has_errors(), "{:?}", d.errors());
+    }
+
+    #[test]
+    fn ctor_subclass_accepts_inherited_kwarg() {
+        // Phase-5.2 drift round 2: `class Dog(Animal):` should accept
+        // `Dog(name="Rex", breed="Husky")` — `name` is declared on
+        // Animal, so the auto-generated `__init__` for Dog must include
+        // it. Before the fix, `unknown_kwarg 'name'` fired because the
+        // arity check only looked at Dog's direct field surface.
+        let src = "\
+class Animal:
+    name: str
+
+class Dog(Animal):
+    breed: str
+
+let d: Dog = Dog(name=\"Rex\", breed=\"Husky\")
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "Dog(name=..., breed=...) must accept Animal's inherited `name`; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn ctor_subclass_missing_inherited_required_field() {
+        // A subclass that omits a parent's required field should still
+        // surface the missing-argument diagnostic — inheritance widens
+        // the accepted-kwarg set but doesn't drop required fields.
+        let src = "\
+class Animal:
+    name: str
+
+class Dog(Animal):
+    breed: str
+
+let d: Dog = Dog(breed=\"Husky\")
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "Dog(breed=...) must still flag missing `name` inherited from Animal"
+        );
+    }
+
+    #[test]
+    fn annotation_dotted_attribute_resolves_to_class() {
+        // `let c: foo.Cls = ...` should produce a `Class("foo.Cls")` so
+        // it unifies with the constructor's `foo.Cls(...)` inference.
+        // Before the fix this landed as `Type::Unknown`, which silently
+        // dropped downstream method-arity / kwarg checks on `c`. Parse
+        // a real source snippet so the AST nodes carry valid ranges.
+        let parsed = tyc_syntax::parse_module("def f(c: foo.Cls) -> None: pass\n").expect("parse");
+        let module = parsed.syntax();
+        let func = match &module.body[0] {
+            ruff_python_ast::Stmt::FunctionDef(f) => f,
+            other => panic!("expected FunctionDef, got {:?}", other),
+        };
+        let ann = func.parameters.args[0]
+            .parameter
+            .annotation
+            .as_deref()
+            .expect("annotation present");
+        let ty = type_from_annotation(ann, &[]);
+        assert_eq!(ty, Type::Class("foo.Cls".to_owned()));
+    }
+
+    #[test]
+    fn ctor_grandchild_inherits_through_chain() {
+        // The walker is recursive — `class C(B):` where `B(A):` should
+        // see fields from both A and B at the construction site for C.
+        let src = "\
+class A:
+    a: int
+
+class B(A):
+    b: int
+
+class C(B):
+    c: int
+
+let x: C = C(a=1, b=2, c=3)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "C must see fields from A, B, and C; got {:?}",
+            d.errors()
+        );
     }
 
     #[test]
