@@ -4,6 +4,106 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.5.2
+
+A correctness + documentation point release on top of v0.5.1. Two
+compiler bugs surfaced during a comprehensive audit of the
+`docs-site/` example corpus are fixed; the docs site itself gets a
+~40-file sweep adding side-by-side Typhon / Emitted-Python tabs to
+every complete-program example; and a re-runnable audit harness lands
+under `docs-site/scripts/` so the same sweep can run in CI.
+
+No language semantics change beyond accepting two previously-rejected
+forms (`set - set` and `<ident>?` propagation), and no
+previously-accepted program changes behaviour.
+
+### Fixed — compiler
+
+- **`tyc-syntax`: `<ident>?` propagation lowered to `<ident> | None`.**
+  `let x: T = a?` after a `gather:` block (or any time the operand
+  was a bare identifier rather than a paren-prefixed call `f()?`) was
+  silently rewritten as `x: T = a | None`, then crashed at runtime
+  with `TypeError: unsupported operand type(s) for |: 'Ok' and
+  'NoneType'`. The propagation pass only recognised `f()?` because it
+  required the character before `?` to be `)`. It now disambiguates
+  by RHS position: when the line has an `=` and the identifier-then-`?`
+  sits on the RHS, or when the line begins with `return` / `yield` /
+  `raise`, treat the trailing `?` as the propagation operator and
+  emit the standard `__typhon_q_N__` ladder. Pure annotation forms
+  (`let x: int?`, `let x: list[int]?`) are unchanged. Unblocks the
+  natural `gather:` → `?` → `Ok(...)` shape used across the tour,
+  first-program, and recipes docs.
+- **`tyc-types`: `set - set` rejected as `tyc::operator_type_mismatch`.**
+  The operator-compatibility check for `-` accepted only numeric
+  operands. The Python set-difference form (`{1, 2, 3} - {2, 3, 4}`)
+  was rejected even though the sibling bitwise operators `&`, `|`,
+  `^` (which fall through to the permissive arm) worked. Added an
+  explicit carve-out for `Operator::Sub` between two `set` /
+  `frozenset` operands, matching the existing carve-outs for `+` on
+  `list` / `list` and `tuple` / `tuple`. Closes the
+  `types/collections.mdx` set-operations example.
+
+### Changed — documentation
+
+A comprehensive audit of the `docs-site/` example corpus rolled out
+across roughly 40 `.mdx` files. Every complete, runnable Typhon
+example in the tour, types, reference, recipes, getting-started, and
+lowering sections is now presented as a side-by-side
+`<Tabs><TabItem label="Typhon"/><TabItem label="Emitted Python"/></Tabs>`
+pair, with the Python side produced by running the example through
+the actual `tyc build` pipeline rather than written by hand. Partial
+illustrative snippets and intentional negative examples are left as
+plain `python` fences.
+
+Stale or incorrect doc claims that the audit surfaced were also
+fixed:
+
+- **`lazy let X: T:` colon-block form (`reference/lazy.mdx`,
+  `lowering/lazy.mdx`)** was shown for class-level `lazy let` but
+  doesn't parse. The correct form is `lazy let X: T = expr`. The
+  generator-style `lazy[T]` return-type form is documented as
+  designed-but-not-yet-implemented, since the parser doesn't
+  recognise `lazy` in return-type position today.
+- **Multi-line `|>` pipes without wrapping parens
+  (`reference/pipes.mdx`)** fail parsing the same way any multi-line
+  Python expression does. Updated to use the working
+  `let slug: str = (...)` parens-wrapped shape and noted the
+  requirement.
+- **`model X frozen:` (`interop/pydantic.mdx`)** isn't parsed — the
+  `frozen` modifier is recognised on `class` only. Replaced with a
+  `.py` escape-hatch example and a roadmap note.
+- **`let`-shadowing (`reference/let-mut.mdx`,
+  `diagnostics/binding-errors.mdx`, `tour/five-rules.mdx`)** was
+  documented in two places as a supported fix for `tyc::no_block_shadow`,
+  but the checker rejects every form of `let`-shadowing because
+  Python is function-scoped and a nested `let x` would silently
+  rebind the outer binding. Corrected to recommend `mut` or a fresh
+  name.
+- **`tour/control-flow.mdx`** said static fall-through analysis was
+  "reserved for a future release". It isn't — the checker enforces
+  `tyc::missing_return` today. Converted the example to a clearly-
+  marked negative case.
+- **`lowering/runtime.mdx`** was rewritten to show the exact
+  emitted-runtime source as of this release: `__init__.py`,
+  `tasks.py`, `lazy.py`, `freeze.py`, plus the `parallel.py` /
+  `stdlib.py` / `result.py` siblings. The earlier excerpts were
+  simplified and out of date.
+- **`diagnostics/compile-errors.mdx`**: the lazy-let example was
+  written inside the `class` body (which fires
+  `tyc::method_in_class_body`); moved into an `impl` block where the
+  feature actually belongs.
+
+### Added — tooling
+
+`docs-site/scripts/verify_examples.py` walks every `.mdx` under
+`src/content/docs/`, extracts python / typhon / ty code blocks,
+classifies each one (partial snippet / intentional negative /
+complete program / emitted-Python block), and tries to compile every
+complete-program block via `tyc build` in a temporary project.
+`--real-only` filters out the partial-snippet noise that fires when a
+small example references a class defined earlier on the same page.
+Exits non-zero when real issues remain so this can wire into CI.
+
 ## 0.5.1
 
 A correctness + tooling point release on top of v0.5.0. Two compiler
