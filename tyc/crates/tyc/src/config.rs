@@ -166,6 +166,10 @@ pub struct StrictnessConfig {
     /// instead of `requests`, `aiofiles` instead of bare `open`,
     /// `asyncio.sleep` instead of `time.sleep`); `"off"` suppresses.
     pub blocking_in_async: String,
+    /// When true, silence the warning for `tyc::contains_secret_literal`
+    /// which checks for sensitive environmental variables mapped using
+    /// `comptime let API_KEY = env("API_KEY")`.
+    pub allow_secret_comptime: bool,
 }
 
 impl Default for StrictnessConfig {
@@ -183,6 +187,7 @@ impl Default for StrictnessConfig {
             parallel_min_size: 64,
             require_with: "warn".into(),
             blocking_in_async: "warn".into(),
+            allow_secret_comptime: false,
         }
     }
 }
