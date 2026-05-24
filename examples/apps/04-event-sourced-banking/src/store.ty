@@ -1,4 +1,4 @@
-from events import Event, EventEnvelope, event_account_id
+from events import Event, EventEnvelope, event_account_ids
 from ids import AccountId, EventId
 
 
@@ -33,9 +33,10 @@ impl EventStore:
         let target: str = str(account_id)
         mut out: list[Event] = []
         for env in self.events:
-            let aid: AccountId? = event_account_id(env.payload)
-            if aid is not None and str(aid) == target:
-                out.append(env.payload)
+            for aid in event_account_ids(env.payload):
+                if str(aid) == target:
+                    out.append(env.payload)
+                    break
         return out
 
     def since(self, after_seq: int) -> list[EventEnvelope]:

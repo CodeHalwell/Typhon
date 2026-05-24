@@ -34,6 +34,9 @@ pub class CrawlerState:
     shutdown: asyncio.Event
     processed: int
     processed_lock: asyncio.Lock
+    in_flight: int
+    in_flight_lock: asyncio.Lock
+    idle_cv: asyncio.Condition
 
 
 async def _process_item(state: CrawlerState, item: FrontierItem) -> None:
@@ -62,9 +65,11 @@ async def _process_item(state: CrawlerState, item: FrontierItem) -> None:
         case RobotsBlocked(_):
             pass
         case RateLimited(_, retry_after):
-            # Re-enqueue once after the rate-limit delay
+            # Re-enqueue after the rate-limit delay. `submit` would no-op
+            # because the URL is already in `seen`; use `requeue` to bypass
+            # the dedup gate for this retry.
             await asyncio.sleep(retry_after if retry_after < 5.0 else 5.0)
-            await state.frontier.submit(item.url, item.depth, priority=item.priority + 1)
+            await state.frontier.requeue(item.url, item.depth, priority=item.priority + 1)
         case TransientError(_, _, _):
             pass
         case PermanentError(_, _, _):
@@ -94,24 +99,47 @@ pub async def worker_loop(state: CrawlerState, worker_idx: int) -> None:
     while not state.shutdown.is_set():
         async with state.processed_lock:
             if state.processed >= state.config.max_pages:
+                async with state.idle_cv:
+                    state.idle_cv.notify_all()
                 return
         let item: FrontierItem? = await state.frontier.claim()
         if item is None:
-            let remaining: int = await state.frontier.remaining()
-            if remaining == 0:
-                await asyncio.sleep(0.2)
-                let still: int = await state.frontier.remaining()
-                if still == 0:
-                    return
+            # Nothing to claim. If no peer worker is mid-process and the
+            # frontier is still empty, the crawl is genuinely done.
+            async with state.idle_cv:
+                while True:
+                    let remaining: int = await state.frontier.remaining()
+                    async with state.in_flight_lock:
+                        let busy: int = state.in_flight
+                    if remaining == 0 and busy == 0:
+                        state.idle_cv.notify_all()
+                        return
+                    if remaining > 0:
+                        break
+                    # Some peer is still working — wait for them to finish
+                    # and either feed the frontier or signal idle.
+                    try:
+                        await asyncio.wait_for(state.idle_cv.wait(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        pass
             continue
         async with state.processed_lock:
             if state.processed >= state.config.max_pages:
+                async with state.idle_cv:
+                    state.idle_cv.notify_all()
                 return
             state.processed = state.processed + 1
+        async with state.in_flight_lock:
+            state.in_flight = state.in_flight + 1
         try:
             await _process_item(state, item)
         except Exception as e:
             print(f"[worker-{worker_idx}] uncaught: {type(e).__name__}: {e}")
+        finally:
+            async with state.in_flight_lock:
+                state.in_flight = state.in_flight - 1
+            async with state.idle_cv:
+                state.idle_cv.notify_all()
 
 
 pub async def run_crawl(
@@ -155,6 +183,9 @@ pub async def run_crawl(
         shutdown=asyncio.Event(),
         processed=0,
         processed_lock=asyncio.Lock(),
+        in_flight=0,
+        in_flight_lock=asyncio.Lock(),
+        idle_cv=asyncio.Condition(),
     )
 
     for seed in seeds:

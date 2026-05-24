@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 from book import OrderBook, crosses, new_book
 from ids import FillId, OrderId, Symbol
-from money import Price, Qty, min_qty, sub_qty
+from money import Price, Qty, sub_qty
 from orders import (
     Buy,
     FillOrKill,
@@ -120,17 +120,17 @@ impl Engine:
             if taker_price is not None:
                 if not crosses(order.side, taker_price, top.price):
                     break
-            if len(top.orders) == 0:
-                resting_levels.pop(0)
-                continue
-            let maker_id: OrderId = top.orders[0]
-            let trade_qty: Qty = min_qty(remaining, top.qty)
+            let top_price: Price = top.price
+            let drained: tuple[OrderId, Qty]? = book.drain_top(resting_side, remaining)
+            if drained is None:
+                break
+            let (maker_id, trade_qty) = drained
             let fill: Fill = Fill(
                 id=FillId(self.next_fill_id),
                 taker=order.id,
                 maker=maker_id,
                 symbol=order.symbol,
-                price=top.price,
+                price=top_price,
                 qty=trade_qty,
                 at=datetime.now(timezone.utc),
             )
@@ -143,10 +143,9 @@ impl Engine:
                 order.symbol,
                 isinstance(order.side, Buy),
                 trade_qty,
-                top.price,
+                top_price,
             )
 
-            book.drain_top(resting_side, trade_qty)
             remaining = sub_qty(remaining, trade_qty)
 
         if int(remaining) > 0:

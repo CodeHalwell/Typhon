@@ -1,17 +1,17 @@
 import asyncio
 import random
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 from config import RetryPolicy, SchedulerConfig
 from ids import JobName, TaskId
 from models import (
     SchedulerEvent,
+    StatusReady,
     StatusRunning,
     Task,
     TaskStatus,
     make_status_failed,
-    make_status_ready,
     make_status_succeeded,
     make_task_completed,
     make_task_failed,
@@ -92,17 +92,19 @@ impl Scheduler:
                     task_id=task.id, job=task.job, at=task.created_at
                 ))
                 match task.status:
-                    case StatusRunning(_, _, _):
-                        pass
-                    case _:
+                    case StatusReady(_):
                         self.emit(make_task_ready(task_id=task.id, at=task.updated_at))
+                    case _:
+                        pass
                 return Ok(task)
             case Err(e):
                 return Err(e)
         raise RuntimeError("unreachable")
 
     def compute_backoff(self, policy: RetryPolicy, attempt: int) -> float:
-        let raw: float = policy.base_delay_seconds * float(2 ** (attempt - 1))
+        let raw_exp: int = attempt - 1
+        let exponent: int = raw_exp if raw_exp < 60 else 60
+        let raw: float = policy.base_delay_seconds * float(2 ** exponent)
         let bounded: float = raw if raw < policy.max_delay_seconds else policy.max_delay_seconds
         let jitter: float = bounded * policy.jitter_ratio * (random.random() - 0.5) * 2.0
         let total: float = bounded + jitter
@@ -165,8 +167,8 @@ impl Scheduler:
 
         if can_retry:
             let delay: float = self.compute_backoff(policy, attempt)
-            let next_ready: TaskStatus = make_status_ready(enqueued_at=now)
-            match self.store.update_status(task.id, next_ready, attempt, message):
+            let not_before: datetime = now + timedelta(seconds=delay)
+            match self.store.schedule_retry(task.id, attempt, message, not_before):
                 case Ok(_):
                     pass
                 case Err(e):

@@ -6,7 +6,7 @@ from orders import Buy, Order, Sell, Side, side_label
 pub class BookLevel:
     price: Price
     qty: Qty
-    orders: list[OrderId]
+    orders: list[tuple[OrderId, Qty]]
 
 
 pub class OrderBook:
@@ -51,35 +51,51 @@ impl OrderBook:
         for level in levels:
             if int(level.price) == int(price):
                 level.qty = add_qty(level.qty, remaining)
-                level.orders.append(order.id)
+                level.orders.append((order.id, remaining))
                 placed = True
                 break
         if not placed:
             let lvl: BookLevel = BookLevel(
                 price=price,
                 qty=remaining,
-                orders=[order.id],
+                orders=[(order.id, remaining)],
             )
             _insert_sorted(levels, lvl, descending)
 
-    def drain_top(self, side: Side, fill: Qty) -> Qty:
+    def drain_top(self, side: Side, fill: Qty) -> tuple[OrderId, Qty]?:
         let levels: list[BookLevel] = self.bids if isinstance(side, Buy) else self.asks
         if len(levels) == 0:
-            return Qty(0)
+            return None
         let level: BookLevel = levels[0]
-        let drained: Qty = fill if int(fill) < int(level.qty) else level.qty
-        level.qty = sub_qty(level.qty, drained)
-        if int(level.qty) <= 0:
+        if len(level.orders) == 0:
             levels.pop(0)
-        return drained
+            return None
+        let (maker_id, maker_qty) = level.orders[0]
+        let drained_int: int = int(fill) if int(fill) < int(maker_qty) else int(maker_qty)
+        let drained: Qty = Qty(drained_int)
+        let remaining_maker: int = int(maker_qty) - drained_int
+        if remaining_maker <= 0:
+            level.orders.pop(0)
+        else:
+            level.orders[0] = (maker_id, Qty(remaining_maker))
+        level.qty = sub_qty(level.qty, drained)
+        if int(level.qty) <= 0 or len(level.orders) == 0:
+            levels.pop(0)
+        return (maker_id, drained)
 
     def remove_order(self, order_id: OrderId, side: Side) -> bool:
         let levels: list[BookLevel] = self.bids if isinstance(side, Buy) else self.asks
         mut found: bool = False
         for level in levels:
-            if order_id in level.orders:
-                level.orders.remove(order_id)
-                found = True
+            mut idx: int = 0
+            while idx < len(level.orders):
+                let (oid, oqty) = level.orders[idx]
+                if int(oid) == int(order_id):
+                    level.qty = sub_qty(level.qty, oqty)
+                    level.orders.pop(idx)
+                    found = True
+                else:
+                    idx = idx + 1
         return found
 
     def render(self) -> str:

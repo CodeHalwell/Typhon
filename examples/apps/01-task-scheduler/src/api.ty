@@ -104,15 +104,8 @@ def get_task(task_id: int) -> TaskView:
 def list_events(since: int = 0, limit: int = 100) -> list[EventView]:
     let rows = STATE.store.events_since(since, limit)
     return [
-        EventView(
-            seq=row[0],
-            kind=row[1],
-            task_id=row[2],
-            worker_id=row[3],
-            message=row[4],
-            at=row[5],
-        )
-        for row in rows
+        EventView(seq=seq, kind=kind, task_id=tid, worker_id=wid, message=msg, at=at)
+        for (seq, kind, tid, wid, msg, at) in rows
     ]
 
 

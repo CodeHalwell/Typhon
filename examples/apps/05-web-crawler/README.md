@@ -32,15 +32,14 @@ stress async/await, `gather`, and `go` patterns.
 
 ## Features exercised
 
-- `async def` + `await` everywhere
-- `gather(strategy="best-effort"):` for fanout fetches
-- `go fetch(...)` for spawning workers via the runtime registry
-- `lazy import` for heavy optional deps
-- `newtype` for `Url`, `Host`, `DocumentId`
+- `async def` + `await` everywhere; workers spawned with `go worker_loop(...) -> task`
+- `newtype` for `Url`, `Host`, `DocumentId`, `ContentHash`
 - `freeze let` config + `comptime let` user-agent
-- Sealed-union fetch outcomes: `Fetched | NotModified | RobotsBlocked | RateLimited | TransientError | PermanentError`
-- `Result[Document, FetchError]` from every fetcher
-- `with`-chained `?` for fetch → extract → dedup → store
+- Sealed-union fetch outcomes — `Fetched | NotModified | RobotsBlocked | RateLimited | TransientError | PermanentError` — fed through an explicit `match` in `_process_item`
+- `Result[Document, ExtractError]` returned by the HTML extractor; the
+  rest of the pipeline switches on the sealed union directly
+- Per-host token-bucket rate limiter, in-flight-counter termination
+  (no fixed-duration sleep races), robots.txt caching with per-host async lock
 - `pub` markers throughout
 
 ## Running

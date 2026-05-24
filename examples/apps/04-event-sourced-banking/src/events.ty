@@ -110,6 +110,20 @@ pub def event_account_id(event: Event) -> AccountId?:
         case AccountUnfrozen(aid, _):           return aid
         case AccountClosed(aid, _):             return aid
         case InterestAccrued(aid, _, _, _):     return aid
+    raise RuntimeError("unreachable")
+
+
+pub def event_account_ids(event: Event) -> list[AccountId]:
+    match event:
+        case AccountOpened(aid, _, _, _):       return [aid]
+        case MoneyDeposited(aid, _, _, _, _):   return [aid]
+        case MoneyWithdrawn(aid, _, _, _, _):   return [aid]
+        case TransferRecorded(from_acc, to_acc, _, _, _, _, _): return [from_acc, to_acc]
+        case AccountFrozen(aid, _, _):          return [aid]
+        case AccountUnfrozen(aid, _):           return [aid]
+        case AccountClosed(aid, _):             return [aid]
+        case InterestAccrued(aid, _, _, _):     return [aid]
+    raise RuntimeError("unreachable")
 
 
 pub def event_kind(event: Event) -> str:

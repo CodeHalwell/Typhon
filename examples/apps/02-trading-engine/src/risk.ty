@@ -119,4 +119,4 @@ impl RiskGate:
         let prior_notional: int = pos.qty * pos.average_price
         let added_notional: int = signed * int(fill_price)
         pos.qty = new_qty
-        pos.average_price = int((prior_notional + added_notional) / new_qty)
+        pos.average_price = (prior_notional + added_notional) // new_qty

@@ -3,7 +3,7 @@ import os
 from ids import WorkerId
 
 
-comptime let BUILD_TAG: str = os.environ.get("BUILD_TAG", "dev") if False else "dev"
+comptime let BUILD_TAG: str = env("BUILD_TAG", "dev")
 comptime let DEFAULT_PORT: int = 8000
 comptime let DEFAULT_DB_PATH: str = "/tmp/typhon-scheduler.db"
 

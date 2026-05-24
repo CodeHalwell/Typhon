@@ -11,7 +11,7 @@ pub class FrontierItem frozen:
 
 
 pub class Frontier:
-    queue: list[tuple[int, int, str]]
+    queue: list[tuple[int, int, int, str]]
     seen: dict[str, bool]
     counter: int
     lock: asyncio.Lock
@@ -25,8 +25,14 @@ impl Frontier:
                 return False
             self.seen[key] = True
             self.counter = self.counter + 1
-            heapq.heappush(self.queue, (priority, self.counter, key))
+            heapq.heappush(self.queue, (priority, self.counter, depth, key))
             return True
+
+    async def requeue(self, url: Url, depth: int, priority: int = 5) -> None:
+        async with self.lock:
+            let key: str = str(url)
+            self.counter = self.counter + 1
+            heapq.heappush(self.queue, (priority, self.counter, depth, key))
 
     async def claim(self) -> FrontierItem?:
         async with self.lock:
@@ -35,8 +41,8 @@ impl Frontier:
             let item = heapq.heappop(self.queue)
             return FrontierItem(
                 priority=int(item[0]),
-                depth=int(item[1]),
-                url=Url(str(item[2])),
+                depth=int(item[2]),
+                url=Url(str(item[3])),
             )
 
     async def remaining(self) -> int:

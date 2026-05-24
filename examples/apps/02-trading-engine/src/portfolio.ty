@@ -49,7 +49,7 @@ impl TraderAccount:
             # Same-direction accumulation
             let prior_notional: int = pos.qty * pos.cost_basis
             let added_notional: int = signed * int(price)
-            pos.cost_basis = int((prior_notional + added_notional) / new_qty) if new_qty != 0 else 0
+            pos.cost_basis = (prior_notional + added_notional) // new_qty if new_qty != 0 else 0
 
         pos.qty = new_qty
 

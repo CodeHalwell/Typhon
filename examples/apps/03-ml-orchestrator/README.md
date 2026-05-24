@@ -7,7 +7,13 @@ On top of that sits a **registry**, an **experiment tracker**, and a
 **model store** — the production-shaped scaffolding that surrounds
 the algorithms.
 
-- **Generic typed stages** — `interface Stage[I, O]` + impl blocks
+- **Generic typed stages** — `Stage[I, O]` is a generic class whose
+  `fn` field is a `Callable[[Batch[I]], Result[Batch[O], PipelineError]]`,
+  built by per-stage factory functions (e.g. `standardise() -> Stage[...]`).
+  An earlier draft used an `interface Stage[I, O]`, but cross-module
+  interface conformance isn't accepted by tyc 0.5.2 (see
+  `examples/apps/TYPHON_FEEDBACK.md` §2); the class-of-Callable form
+  preserves the same typed-pipeline shape and composes the same way.
 - **Sealed-union job states** — `Pending | Running | Succeeded | Failed`
 - **Hyperparameter sweep** — grid + random search runners over a job spec
 - **Dataset registry** — versioned datasets, content-hashed
