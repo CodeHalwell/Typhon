@@ -1,0 +1,50 @@
+import heapq
+
+
+class Empty:
+    pass
+
+
+class PriorityQueue[T]:
+    items: list[tuple[int, int, T]] = []
+    counter: int = 0
+
+
+impl[T] PriorityQueue[T]:
+    def push(self, priority: int, value: T) -> None:
+        heapq.heappush(self.items, (priority, self.counter, value))
+        self.counter = self.counter + 1
+
+    def pop(self) -> Result[T, Empty]:
+        if len(self.items) == 0:
+            return Err(Empty())
+        let triple: tuple[int, int, T] = heapq.heappop(self.items)
+        return Ok(triple[2])
+
+    @property
+    def size(self) -> int:
+        return len(self.items)
+
+
+class Task:
+    name: str
+
+
+def main() -> None:
+    let pq: PriorityQueue[Task] = PriorityQueue()
+    pq.push(2, Task(name="write report"))
+    pq.push(0, Task(name="fix outage"))
+    pq.push(1, Task(name="reply to email"))
+    pq.push(0, Task(name="call boss"))
+
+    print("draining queue (lowest priority first):")
+    while pq.size > 0:
+        match pq.pop():
+            case Ok(task):
+                print(f"  -> {task.name}")
+            case Err(_):
+                pass
+
+
+if __name__ == "__main__":
+    main()

@@ -22,9 +22,9 @@ use std::collections::{HashMap, HashSet};
 
 use ruff_python_ast::name::Name;
 use ruff_python_ast::{
-    Alias, Arguments, AtomicNodeIndex, Decorator, ExceptHandler, Expr, ExprAttribute,
+    self as ast, Alias, Arguments, AtomicNodeIndex, Decorator, ExceptHandler, Expr, ExprAttribute,
     ExprBooleanLiteral, ExprCall, ExprContext, ExprName, ExprStringLiteral, Identifier, Keyword,
-    ModModule, Parameter, ParameterWithDefault, Parameters, Stmt, StmtAssign, StmtImport,
+    ModModule, Parameter, ParameterWithDefault, Parameters, Pattern, Stmt, StmtAssign, StmtImport,
     StmtImportFrom, StringLiteral, StringLiteralFlags, StringLiteralValue, WithItem,
 };
 use ruff_text_size::TextRange;
@@ -325,6 +325,7 @@ fn stmt_uses_result_names(stmt: &Stmt) -> bool {
                     case.guard
                         .as_ref()
                         .is_some_and(|g| expr_uses_result_names(g))
+                        || pattern_uses_result_names(&case.pattern)
                         || stmts_use_result_names(&case.body)
                 })
         }
@@ -376,6 +377,40 @@ fn except_handler_uses_result_names(handler: &ExceptHandler) -> bool {
 
 fn decorator_uses_result_names(d: &Decorator) -> bool {
     expr_uses_result_names(&d.expression)
+}
+
+/// Walks every sub-pattern in `pattern`, returning `true` when any
+/// `case Ok(...)` / `case Err(...)` / `case Result(...)` reference is
+/// found.  Without this, a file that only ever matches on a `Result`
+/// (never constructs one or returns one) would skip the auto-import
+/// injection and the emitted Python would `NameError` at runtime.
+fn pattern_uses_result_names(pattern: &Pattern) -> bool {
+    match pattern {
+        Pattern::MatchValue(ast::PatternMatchValue { value, .. }) => expr_uses_result_names(value),
+        Pattern::MatchSingleton(_) => false,
+        Pattern::MatchSequence(ast::PatternMatchSequence { patterns, .. }) => {
+            patterns.iter().any(pattern_uses_result_names)
+        }
+        Pattern::MatchMapping(ast::PatternMatchMapping { keys, patterns, .. }) => {
+            keys.iter().any(expr_uses_result_names)
+                || patterns.iter().any(pattern_uses_result_names)
+        }
+        Pattern::MatchClass(ast::PatternMatchClass { cls, arguments, .. }) => {
+            expr_uses_result_names(cls)
+                || arguments.patterns.iter().any(pattern_uses_result_names)
+                || arguments
+                    .keywords
+                    .iter()
+                    .any(|kw| pattern_uses_result_names(&kw.pattern))
+        }
+        Pattern::MatchStar(_) => false,
+        Pattern::MatchAs(ast::PatternMatchAs { pattern, .. }) => pattern
+            .as_ref()
+            .is_some_and(|p| pattern_uses_result_names(p)),
+        Pattern::MatchOr(ast::PatternMatchOr { patterns, .. }) => {
+            patterns.iter().any(pattern_uses_result_names)
+        }
+    }
 }
 
 fn expr_uses_result_names(expr: &Expr) -> bool {
@@ -3139,6 +3174,26 @@ mod tests {
             out.matches("@dataclasses.dataclass").count(),
             1,
             "output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn match_pattern_only_triggers_result_import() {
+        // PR #120 follow-up: a module that only ever matches on a Result
+        // (never returns / constructs one) used to skip the auto-import,
+        // so the emitted Python NameError'd at runtime on `case Ok(...)`.
+        // The fix walks each case pattern, not just the case body.
+        let src = "def handle() -> None:\n    \
+                   value = lookup()\n    \
+                   match value:\n        \
+                   case Ok(v):\n            \
+                   print(v)\n        \
+                   case Err(e):\n            \
+                   print(e)\n";
+        let out = parse_and_desugar(src);
+        assert!(
+            out.contains("from typhon_runtime import Ok, Err, Result"),
+            "match-only Ok/Err reference must inject the runtime import:\n{out}"
         );
     }
 

@@ -1,0 +1,67 @@
+from __future__ import annotations
+from typhon_runtime import Ok, Err, Result
+import dataclasses
+from pathlib import Path
+import pypdf
+
+
+@dataclasses.dataclass(slots=True)
+class PdfDoc:
+    path: Path
+    page_count: int
+    text: list[str]
+
+
+def load_pdf(path: Path) -> Result[PdfDoc, str]:
+    try:
+        reader = pypdf.PdfReader(str(path))
+        pages: list[str] = [page.extract_text() or "" for page in reader.pages]
+        return Ok(PdfDoc(path=path, page_count=len(pages), text=pages))
+    except FileNotFoundError:
+        return Err(f"missing: {path}")
+    except Exception as e:
+        return Err(f"could not parse pdf: {e}")
+
+
+def summarise(doc: PdfDoc) -> str:
+    total_chars: int = sum((len(p) for p in doc.text))
+    words: int = sum((len(p.split()) for p in doc.text))
+    return (
+        f"{doc.path.name}: {doc.page_count} pages, {words} words, {total_chars} chars"
+    )
+
+
+def search(doc: PdfDoc, needle: str) -> list[tuple[int, str]]:
+    hits: list[tuple[int, str]] = []
+    lower: str = needle.lower()
+    for i, page in enumerate(doc.text):
+        for line in page.splitlines():
+            if lower in line.lower():
+                hits.append((i + 1, line.strip()))
+    return hits
+
+
+def extract_page_range(doc: PdfDoc, start: int, end: int) -> str:
+    lo: int = max(0, start - 1)
+    hi: int = min(doc.page_count, end)
+    return """
+
+""".join(doc.text[lo:hi])
+
+
+def main() -> None:
+    path: Path = Path("sample.pdf")
+    match load_pdf(path):
+        case Ok(doc):
+            print(summarise(doc))
+            for page, line in search(doc, "introduction"):
+                print(f"  p.{page}: {line[:80]}")
+            print("--- first page excerpt ---")
+            print(extract_page_range(doc, 1, 1)[:300])
+        case Err(msg):
+            print(f"could not open pdf: {msg}")
+            print("(provide a file at ./sample.pdf to run this example)")
+
+
+if __name__ == "__main__":
+    main()

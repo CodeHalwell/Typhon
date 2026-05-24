@@ -1,0 +1,72 @@
+from collections import deque
+
+
+class Graph:
+    adj: dict[str, list[str]] = {}
+
+
+impl Graph:
+    def add_edge(self, u: str, v: str) -> None:
+        if u not in self.adj:
+            self.adj[u] = []
+        if v not in self.adj:
+            self.adj[v] = []
+        self.adj[u].append(v)
+        self.adj[v].append(u)
+
+    def neighbours(self, node: str) -> list[str]:
+        if node in self.adj:
+            return self.adj[node]
+        return []
+
+
+def bfs(g: Graph, start: str) -> list[str]:
+    mut order: list[str] = []
+    mut seen: set[str] = {start}
+    let q: deque[str] = deque([start])
+    while len(q) > 0:
+        let node: str = q.popleft()
+        order.append(node)
+        for nb in g.neighbours(node):
+            if nb not in seen:
+                seen.add(nb)
+                q.append(nb)
+    return order
+
+
+def dfs(g: Graph, start: str) -> list[str]:
+    mut order: list[str] = []
+    mut seen: set[str] = set()
+    let stack: list[str] = [start]
+    while len(stack) > 0:
+        let node: str = stack.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        order.append(node)
+        for nb in g.neighbours(node):
+            if nb not in seen:
+                stack.append(nb)
+    return order
+
+
+def main() -> None:
+    let g: Graph = Graph()
+    let edges: list[tuple[str, str]] = [
+        ("A", "B"),
+        ("A", "C"),
+        ("B", "D"),
+        ("C", "D"),
+        ("C", "E"),
+        ("D", "F"),
+        ("E", "F"),
+    ]
+    for u, v in edges:
+        g.add_edge(u, v)
+
+    print("BFS from A:", bfs(g, "A"))
+    print("DFS from A:", dfs(g, "A"))
+
+
+if __name__ == "__main__":
+    main()

@@ -264,6 +264,11 @@ fn apply_simple_style_rules(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
     let mut quote: Option<char> = None;
+    // Triple-quote state.  `Some(q)` means we are inside a `qqq`-bounded
+    // string region opened earlier on this same line and the next `qqq` run
+    // closes it.  Inside that region everything is passed through verbatim
+    // — no `-` spacing, no `=` spacing, nothing.
+    let mut triple_quote: Option<char> = None;
     // Track when we've just emitted an opening bracket/paren so the next
     // run of spaces is stripped (`(   x` → `(x`). FINDINGS #65.
     let mut just_opened_bracket = false;
@@ -276,6 +281,30 @@ fn apply_simple_style_rules(line: &str) -> String {
     // not tracked — both forms keep `=` tight inside parens.
     let mut paren_depth: i32 = 0;
     while let Some(c) = chars.next() {
+        // Inside a triple-quoted region: emit verbatim until the matching
+        // `qqq` closer.  Triple quotes that open *and* close on the same
+        // line as the surrounding code must be passed through whole, or
+        // the inner contents get re-formatted as if they were Python
+        // tokens.  Without this, `"""…"""` followed by more code on the
+        // same line breaks subsequent string literals (PR #120 follow-up:
+        // `encoding="utf-8"` was being rewritten to `"utf - 8"`).
+        if let Some(q) = triple_quote {
+            out.push(c);
+            if c == q && chars.peek().copied() == Some(q) {
+                // Look one more ahead for the third quote.  Use a clone so
+                // we don't consume the iterator until we're sure.
+                let mut lookahead = chars.clone();
+                lookahead.next();
+                if lookahead.peek().copied() == Some(q) {
+                    out.push(q);
+                    out.push(q);
+                    chars.next();
+                    chars.next();
+                    triple_quote = None;
+                }
+            }
+            continue;
+        }
         if let Some(q) = quote {
             out.push(c);
             if c == '\\' {
@@ -327,6 +356,30 @@ fn apply_simple_style_rules(line: &str) -> String {
         }
         match c {
             '"' | '\'' => {
+                // Detect a triple-quote opener (`"""` / `'''`) before
+                // falling back to single-quote handling.  Without this,
+                // each `"` in `"""` toggles `quote` independently and the
+                // formatter ends up out of sync with the actual string
+                // boundaries — see the `triple_quote` branch above for
+                // the failure mode this prevents.
+                let next1 = chars.peek().copied();
+                if next1 == Some(c) {
+                    let mut lookahead = chars.clone();
+                    lookahead.next();
+                    if lookahead.peek().copied() == Some(c) {
+                        out.push(c);
+                        out.push(c);
+                        out.push(c);
+                        chars.next();
+                        chars.next();
+                        // `"""..."""` fully closed on one line is rare in
+                        // emitted code but stays correct: the triple_quote
+                        // branch above will consume up to the closer.
+                        triple_quote = Some(c);
+                        just_opened_bracket = false;
+                        continue;
+                    }
+                }
                 quote = Some(c);
                 out.push(c);
                 just_opened_bracket = false;
@@ -1287,6 +1340,40 @@ def run() -> Result[int, str]:
         assert!(
             result.output.contains("f(name=\"Alice\", age=30)"),
             "kwarg `=` should stay tight, got: {:?}",
+            result.output
+        );
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TYC_FMT_DISABLE_RUFF", v),
+                None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
+            }
+        }
+    }
+
+    #[test]
+    fn format_preserves_string_after_inline_triple_quote() {
+        // PR #120 follow-up: when ruff format reflows `"\n"` to a
+        // triple-quoted form on the same line as other code, the third
+        // `"` used to flip `apply_simple_style_rules`'s quote tracker into
+        // "outside string" state for everything after the triple opener.
+        // That made the formatter treat the `-` in a later `"utf-8"` as a
+        // binary operator and insert spaces — producing `"utf - 8"`, a
+        // codec name Python rejects with LookupError at runtime.
+        let _guard = lock_env();
+        let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
+        unsafe {
+            std::env::set_var("TYC_FMT_DISABLE_RUFF", "1");
+        }
+        let src = "f(\"\"\"\n\"\"\".join(xs) + \"\"\"\n\"\"\", encoding=\"utf-8\")\n";
+        let result = format_source(src, "<test>").unwrap();
+        assert!(
+            result.output.contains("\"utf-8\""),
+            "string contents after a triple quote must stay verbatim, got: {:?}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("\"utf - 8\""),
+            "`-` inside string must not gain spaces, got: {:?}",
             result.output
         );
         unsafe {

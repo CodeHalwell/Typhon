@@ -1,0 +1,32 @@
+from __future__ import annotations
+from typhon_runtime import Ok, Err, Result
+import dataclasses
+
+
+@dataclasses.dataclass(slots=True)
+class DivideByZero:
+    pass
+
+
+def add(a: float, b: float) -> float:
+    return a + b
+
+
+def sub(a: float, b: float) -> float:
+    return a - b
+
+
+def mul(a: float, b: float) -> float:
+    return a * b
+
+
+def div(a: float, b: float) -> Result[float, DivideByZero]:
+    if b == 0.0:
+        return Err(DivideByZero())
+    return Ok(a / b)
+
+
+def average(xs: list[float]) -> Result[float, str]:
+    if len(xs) == 0:
+        return Err("cannot average empty list")
+    return Ok(sum(xs) / float(len(xs)))

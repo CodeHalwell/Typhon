@@ -1,0 +1,52 @@
+from __future__ import annotations
+from typing import Iterator
+
+
+def take[T](src: Iterator[T], n: int) -> list[T]:
+    out: list[T] = []
+    left: int = n
+    for x in src:
+        if left <= 0:
+            break
+        out.append(x)
+        left = left - 1
+    return out
+
+
+def naturals() -> Iterator[int]:
+    n: int = 1
+    while True:
+        yield n
+        n = n + 1
+
+
+def evens() -> Iterator[int]:
+    for n in naturals():
+        if n % 2 == 0:
+            yield n
+
+
+def windowed[T](xs: list[T], size: int) -> Iterator[list[T]]:
+    i: int = 0
+    while i + size <= len(xs):
+        yield xs[i : i + size]
+        i = i + 1
+
+
+def chunked[T](xs: list[T], size: int) -> Iterator[list[T]]:
+    i: int = 0
+    while i < len(xs):
+        yield xs[i : i + size]
+        i = i + size
+
+
+def main() -> None:
+    print("first 5 naturals:", take(naturals(), 5))
+    print("first 5 evens:   ", take(evens(), 5))
+    data: list[int] = [1, 2, 3, 4, 5, 6, 7]
+    print("windowed(3):     ", list(windowed(data, 3)))
+    print("chunked(3):      ", list(chunked(data, 3)))
+
+
+if __name__ == "__main__":
+    main()

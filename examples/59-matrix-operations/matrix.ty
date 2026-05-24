@@ -1,0 +1,75 @@
+type Matrix = list[list[float]]
+
+
+class ShapeError:
+    msg: str
+
+
+def zeros(rows: int, cols: int) -> Matrix:
+    return [[0.0 for _ in range(cols)] for _ in range(rows)]
+
+
+def identity(n: int) -> Matrix:
+    let m: Matrix = zeros(n, n)
+    for i in range(n):
+        m[i][i] = 1.0
+    return m
+
+
+def shape(a: Matrix) -> tuple[int, int]:
+    if len(a) == 0:
+        return (0, 0)
+    return (len(a), len(a[0]))
+
+
+def transpose(a: Matrix) -> Matrix:
+    let (r, c) = shape(a)
+    let out: Matrix = zeros(c, r)
+    for i in range(r):
+        for j in range(c):
+            out[j][i] = a[i][j]
+    return out
+
+
+def matmul(a: Matrix, b: Matrix) -> Result[Matrix, ShapeError]:
+    let (ar, ac) = shape(a)
+    let (br, bc) = shape(b)
+    if ac != br:
+        return Err(ShapeError(msg=f"cannot multiply {ar}x{ac} by {br}x{bc}"))
+    let out: Matrix = zeros(ar, bc)
+    for i in range(ar):
+        for j in range(bc):
+            mut s: float = 0.0
+            for k in range(ac):
+                s = s + a[i][k] * b[k][j]
+            out[i][j] = s
+    return Ok(out)
+
+
+def format_matrix(a: Matrix) -> str:
+    return "\n".join(" ".join(f"{x:6.2f}" for x in row) for row in a)
+
+
+def main() -> None:
+    let a: Matrix = [
+        [1.0, 2.0, 3.0],
+        [4.0, 5.0, 6.0],
+    ]
+    let b: Matrix = [
+        [7.0, 8.0],
+        [9.0, 10.0],
+        [11.0, 12.0],
+    ]
+    print("A:"); print(format_matrix(a))
+    print("B:"); print(format_matrix(b))
+    print("A^T:"); print(format_matrix(transpose(a)))
+    match matmul(a, b):
+        case Ok(prod):
+            print("A * B:"); print(format_matrix(prod))
+        case Err(e):
+            print(f"error: {e.msg}")
+    print("I(3):"); print(format_matrix(identity(3)))
+
+
+if __name__ == "__main__":
+    main()
