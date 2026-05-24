@@ -164,23 +164,14 @@ This lowers to a sentinel-cached `lazy_val(lambda: load_config_from_disk())` hel
 
 Inside a class body, `lazy let` lowers to `@cached_property` because the per-instance scope is the intended semantics there.
 
-### `lazy` return types
+### `lazy` return types (roadmap)
 
-```python
-def primes_up_to(n: int) -> lazy[list[int]]:
-    let sieve: list[bool] = [True] * (n + 1)
-    mut p: int = 2
-    while p * p <= n:
-        if sieve[p]:
-            mut k: int = p * p
-            while k <= n:
-                sieve[k] = False
-                k = k + p
-        p = p + 1
-    return [i for i in range(2, n + 1) if sieve[i]]
-```
-
-`lazy[list[T]]` emits as a generator function instead of materialising the list — useful when the caller may only need a prefix.
+`def f(...) -> lazy[list[T]]:` is the designed-but-not-yet-implemented
+sibling of `lazy let`. The intent is for the body's `return [...]` to
+emit as a generator instead of materialising the list — useful when the
+caller may only need a prefix. Today the parser rejects the form; write
+a plain generator function (`-> Iterator[int]:` with `yield`) instead
+until the lowering lands.
 
 ## `@pure` and `@memo`
 

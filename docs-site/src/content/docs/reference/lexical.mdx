@@ -68,7 +68,7 @@ These are recognised as keywords only in syntactically distinguishing positions:
 | `let` | Local binding declarations. |
 | `mut` | Local binding declarations. |
 | `comptime` | Before `let`, `mut`, or `def` at module level. |
-| `lazy` | Before `import`, `let`, or in return type position (`-> lazy[T]`). |
+| `lazy` | Before `import` or `let`. The return-type form (`-> lazy[T]`) is roadmapped. |
 | `unsafe` | At the start of a statement, introducing a colon-block. |
 | `gather` | At the start of a statement, introducing a colon-block; or with `(strategy="...")` for best-effort. |
 | `go` | At the start of an expression statement: `go f(x)` or `go f(x) -> handle`. |

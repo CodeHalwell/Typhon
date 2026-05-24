@@ -43,7 +43,7 @@ See [Architecture Overview](/Typhon/internals/architecture/) for the compiler in
     `go f(x)` lowers to `typhon_runtime.tasks.spawn(f(x))` — strong-ref registry prevents GC mid-flight. [Details →](/Typhon/lowering/go/)
   </Card>
   <Card title="lazy → proxies" icon="setting">
-    `lazy import np = numpy` → bespoke `__TyphonLazy_np_` proxy class. `lazy let X` → sentinel-cached `lazy_val`. `lazy[T]` return → generator. [Details →](/Typhon/lowering/lazy/)
+    `lazy import np = numpy` → bespoke `__TyphonLazy_np_` proxy class. `lazy let X` → sentinel-cached `lazy_val` at module scope; `@cached_property` at class scope. The `lazy[T]` return-type form is roadmapped. [Details →](/Typhon/lowering/lazy/)
   </Card>
   <Card title="comptime → inlined literals" icon="document">
     `comptime let PORT = int(env("PORT", "8080"))` → `PORT: int = 8080` after sandbox evaluation. [Details →](/Typhon/lowering/comptime/)

@@ -24,7 +24,7 @@ Typhon's type system is intentionally close to Python's, with a small set of str
 | Generics | `def first[T](xs: list[T]) -> T?` | [Generics (PEP 695)](/Typhon/types/generics/) |
 | Type aliases | `type Vec[T] = list[T]` | [Type Aliases](/Typhon/types/aliases/) |
 | Results | `Result[T, E]`, `Ok`, `Err` | [Result reference](/Typhon/reference/result/) |
-| Lazy | `lazy[list[T]]` (return type) | [`lazy` reference](/Typhon/reference/lazy/) |
+| Lazy (roadmap) | `lazy[list[T]]` return-type sugar | [`lazy` reference](/Typhon/reference/lazy/) |
 | Unsafe | `unsafe:` block introduces hidden `Unsafe[T]` | [The Unsafe Boundary](/Typhon/types/unsafe/) |
 
 Top type: `object`. Bottom type: not surfaced (an unreachable branch). `Any` exists but is reachable only through `unsafe:` or `.dty` stubs — it cannot be inferred outside those regions.

@@ -116,30 +116,32 @@ the result is cached on the instance:
 
 Per-instance caching is the intended semantics inside classes.
 
-## `lazy[T]` return type
+## `lazy[T]` return type (roadmap)
 
-<Tabs>
-  <TabItem label="Typhon">
-    ```python
-    def primes_up_to(n: int) -> lazy[list[int]]:
-        let sieve: list[bool] = [True] * (n + 1)
-        # ... compute ...
-        return [i for i in range(2, n + 1) if sieve[i]]
-    ```
-  </TabItem>
-  <TabItem label="Emitted Python">
-    ```python
-    def primes_up_to(n: int) -> Iterator[int]:
-        sieve: list[bool] = [True] * (n + 1)
-        # ... compute ...
-        for i in range(2, n + 1):
-            if sieve[i]:
-                yield i
-    ```
-  </TabItem>
-</Tabs>
+`def f(...) -> lazy[list[T]]: ...` is a designed-but-not-yet-implemented
+form. The intent is to emit a generator function so a caller that only
+takes a prefix doesn't pay for materialising the whole list:
 
-Emits as a generator function — useful when the caller may only need a prefix and doesn't need the full list materialised in memory.
+```python
+# Designed form (not parsed today):
+def primes_up_to(n: int) -> lazy[list[int]]:
+    let sieve: list[bool] = [True] * (n + 1)
+    # ... compute ...
+    return [i for i in range(2, n + 1) if sieve[i]]
+```
+
+Until the compiler grows this, write a plain generator by hand:
+
+```python
+from collections.abc import Iterator
+
+def primes_up_to(n: int) -> Iterator[int]:
+    let sieve: list[bool] = [True] * (n + 1)
+    # ... compute ...
+    for i in range(2, n + 1):
+        if sieve[i]:
+            yield i
+```
 
 ## When to use which
 

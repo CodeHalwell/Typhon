@@ -126,10 +126,13 @@ Why not `functools.cached_property`? Because `cached_property` is instance-scope
 
 Per-instance caching is the intended semantics inside classes; `cached_property` is the right primitive.
 
-## `lazy[T]` return type → generator
+## `lazy[T]` return type → generator (roadmap)
+
+This form is designed but not yet wired through the parser. The
+intended lowering is below; for now, hand-write the generator.
 
 <Tabs>
-  <TabItem label="Typhon">
+  <TabItem label="Typhon (planned)">
     ```python
     def primes_up_to(n: int) -> lazy[list[int]]:
         let sieve: list[bool] = [True] * (n + 1)
@@ -137,7 +140,7 @@ Per-instance caching is the intended semantics inside classes; `cached_property`
         return [i for i in range(2, n + 1) if sieve[i]]
     ```
   </TabItem>
-  <TabItem label="Emitted">
+  <TabItem label="Emitted (planned)">
     ```python
     from collections.abc import Iterator
 
