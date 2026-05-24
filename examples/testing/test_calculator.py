@@ -4,10 +4,6 @@ import pytest
 from calculator import DivideByZero, add, average, div, mul, sub
 
 
-def _force_result_import() -> Result[float, DivideByZero]:
-    return Ok(0.0)
-
-
 def test_add() -> None:
     assert add(2.0, 3.0) == 5.0
 

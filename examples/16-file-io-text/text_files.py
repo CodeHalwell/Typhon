@@ -11,7 +11,7 @@ def write_lines(path: Path, lines: list[str]) -> Result[None, str]:
 """.join(lines)
             + """
 """,
-            encoding="utf - 8",
+            encoding="utf-8",
         )
         return Ok(None)
     except OSError as e:

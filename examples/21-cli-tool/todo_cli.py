@@ -60,7 +60,7 @@ def save_items(items: list[str]) -> None:
 """.join(items)
         + """
 """,
-        encoding="utf - 8",
+        encoding="utf-8",
     )
 
 

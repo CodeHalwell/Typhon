@@ -1,4 +1,5 @@
 from __future__ import annotations
+from typhon_runtime import Ok, Err, Result
 import os
 from pathlib import Path
 from anthropic import Anthropic

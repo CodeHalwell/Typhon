@@ -10,6 +10,10 @@ A small multi-file project that ties most of the earlier examples together:
 - **`src/api.ty`** — FastAPI endpoints: ask a question, list saved notes.
 - **`src/main.ty`** — uvicorn entry point.
 
+The `python/` sibling directory holds the emitted Python (`tyc build`
+output) checked in for inspection. The build target is still `build/` —
+those files are regenerated on every `tyc build` and gitignored.
+
 ## Run
 
 `tyc build` resolves the project from `typhon.toml` and emits relative to
