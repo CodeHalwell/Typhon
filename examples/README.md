@@ -5,7 +5,20 @@ system. Every example is a real-world-shaped snippet, not a contrived demo. Each
 file is standalone — read top-to-bottom, or jump to the topic you care about.
 
 Each numbered directory contains one descriptively-named `.ty` file (e.g.
-`01-hello-world/hello.ty`, `33-pytorch-tensors/pytorch_tensors.ty`).
+`01-hello-world/hello.ty`, `33-pytorch-tensors/pytorch_tensors.ty`) **and its
+emitted `.py` companion** (`01-hello-world/hello.py`,
+`33-pytorch-tensors/pytorch_tensors.py`). The `.py` files are checked in so
+you can see exactly what each Typhon construct lowers to without running
+`tyc build` yourself. They were generated with `tyc build`; if you edit the
+`.ty` and rebuild, the matching `.py` is the artefact you should diff
+against.
+
+> Tip: stdlib-only examples (01–14, 16–18, 20, 23–25, 48–67) run with a
+> bare `python build/main.py` after `tyc build`, because Typhon emits a
+> `typhon_runtime/` package next to the build output. The checked-in `.py`
+> alongside each `.ty` needs that same runtime on its `sys.path` — copy
+> the example into a `tyc init` playground and rebuild for the cleanest
+> way to actually execute it.
 
 The suite is **not** a single buildable Typhon project — each example has
 its own dependency footprint (one needs `pytorch`, the next needs `redis`,
@@ -121,6 +134,35 @@ Example 47 ships as a real multi-file project with its own
 | 48 | `newtype` IDs | nominal aliases, `UserId`/`PostId`/`Email`, escape-upward rule, `tyc::newtype_violation` |
 
 Example 48 demonstrates `newtype`; the companion v0.3.0 features (`freeze let`, `pub`) are covered in depth in [guide 10](../docs/guides/10-advanced-features.md) and don't yet have dedicated example dirs.
+
+### Algorithms & patterns (49–68) — stdlib-only programming exercises
+
+Twenty additional examples that exercise the Typhon language across a
+broader set of common coding patterns. Every one of these compiles, builds,
+and runs against the standard library — no third-party install needed.
+
+| # | Topic | Highlights |
+|---|---|---|
+| 49 | Fibonacci & memoisation | `@memo`, `@pure`, recursive closures |
+| 50 | Linked list | generic sealed union (`Cons[T] \| Nil`), exhaustive `match`, `while` loops |
+| 51 | Binary search tree | recursive sealed-union tree, `insert`/`contains`/`in_order` |
+| 52 | Stack & queue | generic classes, `Result[T, Empty]`, `collections.deque` |
+| 53 | Sorting algorithms | quicksort, mergesort, insertion sort with comprehensions |
+| 54 | Graph traversal | adjacency map, BFS via deque, DFS via stack |
+| 55 | Word frequency | regex tokenise, `Counter`, `@pure` predicate |
+| 56 | State machine | sealed-union `State`, transition function, exhaustive matching |
+| 57 | Iterators & generators | `yield`, generic `take[T]`, infinite naturals, windowed/chunked |
+| 58 | Context managers | `@contextmanager`, `Iterator[T]`, timing & indentation blocks |
+| 59 | Matrix operations | type aliases, `Result[Matrix, ShapeError]`, transpose & matmul |
+| 60 | Caesar cipher | `@pure` cipher, brute-force breaker, scoring |
+| 61 | Tic-tac-toe | nested sealed unions, board rendering, winner detection |
+| 62 | Priority queue | generic class wrapping `heapq`, `Result` returns |
+| 63 | Event bus | `Callable[[Event], None]`, closures over mutable state |
+| 64 | URL router | pattern matching with `:param`, `Result[str, NoMatch]` |
+| 65 | INI parser | line-by-line parsing with `Result[Ini, ParseError]` |
+| 66 | Rate limiter | token bucket with monotonic clock |
+| 67 | Trie | prefix tree, recursive collect, `words_with_prefix` |
+| 68 | JSON-RPC builder | `newtype RequestId`, `unsafe:` boundary, sealed `Response` union |
 
 ### Bonus
 

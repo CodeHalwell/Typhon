@@ -1,0 +1,61 @@
+from __future__ import annotations
+import os
+from pathlib import Path
+from anthropic import Anthropic
+from fastapi import FastAPI, HTTPException, Depends
+from agent import Agent
+from models import AskRequest, AskResponse, NoteOut
+from store import NoteStore, open_store
+
+DB_PATH: Path = Path(os.environ.get("NOTES_DB", "/tmp/typhon-notes.db"))
+
+
+def _require_api_key() -> str:
+    key: str | None = os.environ.get("ANTHROPIC_API_KEY")
+    if key is None:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY is not set — refusing to start without a real API key"
+        )
+    if len(key) == 0:
+        raise RuntimeError(
+            "ANTHROPIC_API_KEY is empty — refusing to start without a real API key"
+        )
+    return key
+
+
+store: NoteStore = open_store(DB_PATH)
+client: Anthropic = Anthropic(api_key=_require_api_key())
+agent: Agent = Agent(client=client, store=store)
+app: FastAPI = FastAPI(title="Typhon Research Assistant")
+
+
+def get_agent() -> Agent:
+    return agent
+
+
+def get_store() -> NoteStore:
+    return store
+
+
+@app.post("/ask", response_model=AskResponse)
+def ask(req: AskRequest, a: Agent = Depends(get_agent)) -> AskResponse:
+    match a.run(req.question):
+        case Ok(result):
+            return AskResponse(
+                answer=result.answer,
+                notes_saved=result.notes_saved,
+                tool_calls=result.tool_calls,
+            )
+        case Err(e):
+            raise HTTPException(status_code=502, detail=f"{e.stage}: {e.message}")
+    raise RuntimeError("unreachable")
+
+
+@app.get("/notes", response_model=list[NoteOut])
+def list_notes(s: NoteStore = Depends(get_store)) -> list[NoteOut]:
+    return [n.to_out() for n in s.list_recent()]
+
+
+@app.get("/notes/search", response_model=list[NoteOut])
+def search_notes(q: str, s: NoteStore = Depends(get_store)) -> list[NoteOut]:
+    return [n.to_out() for n in s.search(q)]

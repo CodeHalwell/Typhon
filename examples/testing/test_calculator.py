@@ -1,10 +1,9 @@
+from __future__ import annotations
+from typhon_runtime import Ok, Err, Result
 import pytest
-
 from calculator import DivideByZero, add, average, div, mul, sub
 
 
-# This helper exists so the desugarer notices we use `Result`/`Ok`/`Err` in
-# this module and auto-imports them. Patterns alone don't yet trigger that.
 def _force_result_import() -> Result[float, DivideByZero]:
     return Ok(0.0)
 
@@ -45,11 +44,9 @@ def test_average_empty() -> None:
             pytest.fail("expected Err on empty list")
 
 
-@pytest.mark.parametrize("xs,expected", [
-    ([1.0], 1.0),
-    ([1.0, 3.0], 2.0),
-    ([2.0, 2.0, 2.0, 2.0], 2.0),
-])
+@pytest.mark.parametrize(
+    "xs,expected", [([1.0], 1.0), ([1.0, 3.0], 2.0), ([2.0, 2.0, 2.0, 2.0], 2.0)]
+)
 def test_average_parametrised(xs: list[float], expected: float) -> None:
     match average(xs):
         case Ok(v):

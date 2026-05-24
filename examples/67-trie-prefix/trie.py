@@ -1,0 +1,65 @@
+from __future__ import annotations
+import dataclasses
+
+
+@dataclasses.dataclass(slots=True)
+class Trie:
+    children: dict[str, Trie] = dataclasses.field(default_factory=dict)
+    terminal: bool = False
+
+    def insert(self, word: str) -> None:
+        node: Trie = self
+        for ch in word:
+            if ch not in node.children:
+                node.children[ch] = Trie()
+            node = node.children[ch]
+        node.terminal = True
+
+    def contains(self, word: str) -> bool:
+        node: Trie = self
+        for ch in word:
+            if ch not in node.children:
+                return False
+            node = node.children[ch]
+        return node.terminal
+
+    def has_prefix(self, prefix: str) -> bool:
+        node: Trie = self
+        for ch in prefix:
+            if ch not in node.children:
+                return False
+            node = node.children[ch]
+        return True
+
+    def words_with_prefix(self, prefix: str) -> list[str]:
+        node: Trie = self
+        for ch in prefix:
+            if ch not in node.children:
+                return []
+            node = node.children[ch]
+        out: list[str] = []
+        collect(node, prefix, out)
+        return sorted(out)
+
+
+def collect(node: Trie, prefix: str, out: list[str]) -> None:
+    if node.terminal:
+        out.append(prefix)
+    for ch, child in node.children.items():
+        collect(child, prefix + ch, out)
+
+
+def main() -> None:
+    t: Trie = Trie()
+    for word in ["apple", "app", "apply", "apt", "bat", "batch", "bath"]:
+        t.insert(word)
+    print("contains 'app':       ", t.contains("app"))
+    print("contains 'appl':      ", t.contains("appl"))
+    print("has_prefix 'ba':      ", t.has_prefix("ba"))
+    print("has_prefix 'cat':     ", t.has_prefix("cat"))
+    print("words with 'ap':      ", t.words_with_prefix("ap"))
+    print("words with 'bat':     ", t.words_with_prefix("bat"))
+
+
+if __name__ == "__main__":
+    main()

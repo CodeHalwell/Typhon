@@ -1,0 +1,66 @@
+from __future__ import annotations
+from typhon_runtime import Ok, Err, Result
+from datetime import datetime, timedelta, timezone
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def parse_iso(raw: str) -> Result[datetime, str]:
+    try:
+        return Ok(datetime.fromisoformat(raw))
+    except ValueError as e:
+        return Err(f"bad iso datetime: {raw} ({e})")
+
+
+def days_between(a: datetime, b: datetime) -> int:
+    delta: timedelta = b - a
+    return delta.days
+
+
+def add_business_days(start: datetime, days: int) -> datetime:
+    current: datetime = start
+    remaining: int = days
+    while remaining > 0:
+        current = current + timedelta(days=1)
+        if current.weekday() < 5:
+            remaining = remaining - 1
+    return current
+
+
+def fmt_human(dt: datetime) -> str:
+    return dt.strftime("%A, %d %B %Y at %H:%M")
+
+
+def group_by_month(timestamps: list[datetime]) -> dict[str, int]:
+    buckets: dict[str, int] = {}
+    for ts in timestamps:
+        key: str = ts.strftime("%Y-%m")
+        buckets[key] = buckets.get(key, 0) + 1
+    return buckets
+
+
+def main() -> None:
+    now: datetime = now_utc()
+    print(f"now: {fmt_human(now)}")
+    match parse_iso("2026-05-18T12:30:00+00:00"):
+        case Ok(when):
+            print(f"parsed: {fmt_human(when)}")
+            print(f"days from now: {days_between(now, when)}")
+        case Err(msg):
+            print(msg)
+    monday: datetime = datetime(2026, 5, 18, tzinfo=timezone.utc)
+    later: datetime = add_business_days(monday, 7)
+    print(f"7 business days after Mon: {fmt_human(later)}")
+    events: list[datetime] = [
+        datetime(2026, 1, 4, tzinfo=timezone.utc),
+        datetime(2026, 1, 12, tzinfo=timezone.utc),
+        datetime(2026, 2, 3, tzinfo=timezone.utc),
+        datetime(2026, 3, 17, tzinfo=timezone.utc),
+    ]
+    print(group_by_month(events))
+
+
+if __name__ == "__main__":
+    main()
