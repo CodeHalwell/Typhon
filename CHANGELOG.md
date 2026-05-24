@@ -4,6 +4,100 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.5.1
+
+A correctness + tooling point release on top of v0.5.0. Two compiler
+bugs that PR #120 reviewers caught on the new examples corpus are
+fixed; the VS Code TextMate grammar gets a deep audit (PRs #119, #121)
+that closes ~18 miscolorings across real Typhon code; and the
+examples directory grows by 22 stdlib-only exercises (47–68) plus
+emitted `.py` companions for every example shipped to date.
+
+No language semantics change — every previously-accepted program
+still compiles, and the three compiler fixes only narrow the set of
+*emitted-Python* bugs the toolchain produces.
+
+### Fixed — compiler
+
+- **`tyc-format`: triple-quote tracker desync (PR #120).** The
+  in-process whitespace pass treated `"""` as three independent
+  toggles of its single-quote tracker. On a line like
+  `""", encoding="utf-8")` (which `ruff format` produces when it
+  reflows `"\n".join(xs) + "\n"` into triple-quoted form), the
+  tracker came out of sync and rewrote `"utf-8"` as `"utf - 8"` —
+  an encoding name Python rejects with `LookupError` at runtime.
+  Added a triple-quote state machine that consumes everything up to
+  the matching `qqq` closer verbatim, plus a regression test. Two
+  PR reviewers flagged this on examples 16 and 21.
+- **`tyc-desugar`: pattern-walk skipped `case Ok(...)` / `case Err(...)`
+  (PR #120).** `stmts_use_result_names` walked match-case bodies and
+  guards but skipped the patterns themselves, so a file that only
+  ever pattern-matched on `Ok` / `Err` (without returning or
+  constructing a `Result` anywhere) didn't trigger the
+  `from typhon_runtime import Ok, Err, Result` auto-injection. The
+  emitted `.py` then `NameError`'d at runtime — caught on
+  `examples/47-mini-app/src/api.py` and previously worked around in
+  `examples/testing/test_calculator.ty`. Added
+  `pattern_uses_result_names` that walks every `Pattern` variant
+  (`MatchValue`, `MatchSequence`, `MatchMapping`, `MatchClass`,
+  `MatchAs`, `MatchOr`, `MatchStar`, `MatchSingleton`).
+- **`tyc-syntax`: duplicate `__typhon_Err__` alias imports (PR #120).**
+  `prepend_typhon_err_alias_import` runs once per pipeline pass that
+  introduces `?` propagation or `with`-chain lowering, with a
+  header-scan check meant to suppress duplicates when an earlier pass
+  already injected the alias. The check compared `trimmed` (still
+  carrying its trailing newline) against `IMPORT_LINE.trim_end()` (no
+  newline), so equality never matched and pass 2 injected a second
+  copy directly above pass 1's. Strip the trailing newline before
+  comparing; added a regression test; rebuilt
+  `examples/07-error-handling/error_handling.py` to confirm only one
+  alias line ships.
+
+### Changed — VS Code extension (PRs #119, #121)
+
+The TextMate grammar got a deep audit against ~19k lines of real
+Typhon code from `examples/` and `stress/` plus a hand-built corpus
+exercising every language construct. Tokenisation was driven through
+`vscode-textmate` + `vscode-oniguruma` and every flagged span fixed.
+The extension version bumps `0.1.5 → 0.1.7`.
+
+- **Split `expression` into `expression` + `expression-inner`.**
+  Subscripts `[...]`, dict / set literals `{...}`, and lambda bodies
+  now route through `expression-inner` and handle their own `:` so it
+  stops being eaten as a spurious type annotation. Fixes
+  `xs[1:4:2]`, `{k: v for k, v in xs}` (the comprehension `for` was
+  being scoped as a type-expression identifier), and
+  `lambda x: x + 1` (the body was parsed as a type).
+- **Balanced `#parens` matcher in expression-inner** so nested parens
+  in parameter defaults (`s: T = Depends(get_store)`) consume their
+  own `)` instead of letting it close the outer parameter list.
+- **Tightened type-annotation lookahead.** The colon in single-line
+  statements like `if isinstance(...): return left + right` and
+  `case Foo(x): bar()` no longer fires as a type annotation. The
+  check now requires an uppercase identifier, a builtin type name, a
+  dotted lowercase name (`pd.DataFrame`), or a type-shaping
+  punctuation (`[`, `(`, quote, …) to follow.
+- **~18 additional miscoloring fixes** across keyword spans
+  (`pub` / `freeze` / `extend` / `unsafe`), f-string nesting, regex
+  literals, `match` arms, and decorator argument lists. See PR #121
+  for the full list.
+
+### Added — examples (PRs #119, #120)
+
+- **22 new stdlib-only exercises (examples 47–68).** Practical Typhon
+  programs that emit valid Python without any third-party
+  dependencies: a mini-app (47), `newtype` IDs (48), Fibonacci memo
+  (49), linked list (50), BST (51), stack & queue (52), sorting (53),
+  graph traversal (54), word frequency (55), state machine (56),
+  iterators / generators (57), context managers (58), matrix ops
+  (59), Caesar cipher (60), tic-tac-toe (61), priority queue (62),
+  event bus (63), URL router (64), INI parser (65), rate limiter
+  (66), trie (67), JSON-RPC builder (68).
+- **Emitted `.py` companions** for every example 01–46 so readers can
+  see the lowering without running `tyc build`.
+- **`examples/testing/`** gains a calculator + pytest companion that
+  exercises the `Result`-in-tests pattern.
+
 ## 0.5.0
 
 The post-v0.4 roadmap-sweep release. v0.5.0 lands the seven Phase
