@@ -79,27 +79,36 @@ For one-step transformations, plain `f(x)` is fine.
 ### String pipelines
 
 ```python
-let slug: str = title
+let slug: str = (
+    title
     |> str.lower()
     |> str.strip()
     |> str.replace(" ", "-")
+)
 ```
+
+Multi-line pipe chains must sit inside parentheses — Typhon's lexer is
+otherwise indentation-sensitive on `|>`, the same way Python is for any
+multi-line expression.
 
 ### List pipelines
 
 ```python
-let total: int = items
+let total: int = sum(
+    items
     |> filter(lambda i: i.active)
     |> map(lambda i: i.weight)
-    |> sum()
+)
 ```
 
-(Note: `filter` and `map` return iterators; you may need `list(...)` at the end.)
+(`filter` and `map` return iterators; either pipe into `sum()` / `list()` /
+`tuple()` as the terminal step, or wrap the chain in `list(...)` if you
+need a materialised list.)
 
 ### Numerical pipelines
 
 ```python
-let smoothed = signal |> np.convolve(kernel, mode="same") |> np.clip(0, 1)
+let smoothed: np.ndarray = signal |> np.convolve(kernel, mode="same") |> np.clip(0, 1)
 ```
 
 ## What pipes are *not*
