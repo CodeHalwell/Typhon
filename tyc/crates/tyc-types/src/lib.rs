@@ -1695,9 +1695,12 @@ struct Checker<'a> {
 /// - `f(name="x")` keyword-arg matching against `param_names`
 #[derive(Debug, Clone)]
 pub struct ArityInfo {
-    /// Names of the positional / pos-or-kw / kw-only parameters declared
-    /// on the function, in source order. Used to match keyword arguments
-    /// at call sites (`f(name="x")`).
+    /// Names of the positional / pos-or-kw parameters declared on the
+    /// function, in source order. Used to match keyword arguments at
+    /// call sites (`f(name="x")`). Kw-only parameters are tracked
+    /// separately on [`kwonly_names`](Self::kwonly_names); this
+    /// vector stays parallel with [`param_types`](Self::param_types)
+    /// and [`required_positional`](Self::required_positional).
     pub param_names: Vec<String>,
     /// Minimum number of positional arguments the caller must supply
     /// (i.e. count of params without default values, excluding kw-only).
@@ -2758,12 +2761,16 @@ pub struct ModuleShapes {
     /// declared in module A flows into a `Type::Class(Union)` slot
     /// without needing a factory wrapper at the call site.
     pub sealed_unions: HashMap<String, Vec<String>>,
-    /// Names of classes inheriting `typing.Protocol` (Typhon's
-    /// `interface` keyword desugars to this). Seeded so cross-module
-    /// structural conformance — `Friend` declared in module A
-    /// satisfies `Greeter` declared in module A when used from module
-    /// B — matches the in-module checker's behaviour.
-    pub interfaces: HashSet<String>,
+    /// Classes inheriting `typing.Protocol` (Typhon's `interface`
+    /// keyword desugars to this), mapped to whether they carry
+    /// `@runtime_checkable`. Seeded so cross-module structural
+    /// conformance — `Friend` declared in module A satisfies
+    /// `Greeter` declared in module A when used from module B —
+    /// matches the in-module checker's behaviour, and so an imported
+    /// `@runtime_checkable` interface still permits `isinstance(x,
+    /// Greeter)` rather than firing `tyc::interface_isinstance` on a
+    /// pattern that the source module legitimately authored.
+    pub interfaces: HashMap<String, bool>,
 }
 
 /// Imports resolved to their source modules' [`ModuleShapes`], keyed
@@ -2797,10 +2804,13 @@ pub struct ExternalShapes {
     /// is also re-keyed under the local import names by the CLI / LSP.
     pub sealed_unions: HashMap<String, Vec<String>>,
     /// Local import names that refer to a Protocol-shaped class in a
-    /// different module. Cross-module structural conformance consults
-    /// this set the same way the in-module checker consults
-    /// `c.interfaces`.
-    pub interfaces: HashSet<String>,
+    /// different module, mapped to whether the source-module
+    /// declaration carried `@runtime_checkable`. Cross-module
+    /// structural conformance consults this map the same way the
+    /// in-module checker consults `c.interfaces`; the flag is
+    /// re-keyed under the local import name so the `isinstance`
+    /// check sees the source module's opt-in.
+    pub interfaces: HashMap<String, bool>,
     /// Bare imports that need attribute-access resolution. Keyed by
     /// the *local* binding name; the value is the dotted module path
     /// the import refers to (e.g. `("np", "numpy")` for
@@ -2928,15 +2938,18 @@ pub fn extract_module_shapes(module: &ModModule) -> ModuleShapes {
     }
 
     // Interface declarations (`class X(Protocol):` after desugar of
-    // `interface X:`). Names only — the shape is already on
-    // `class_shapes` so cross-module structural conformance can fall
-    // back to the same `class_conforms_to_interface` path the
-    // in-module checker uses.
-    let mut interfaces: HashSet<String> = HashSet::new();
+    // `interface X:`). Names map to the `@runtime_checkable` flag —
+    // the shape is already on `class_shapes` so cross-module
+    // structural conformance can fall back to the same
+    // `class_conforms_to_interface` path the in-module checker uses;
+    // the flag is what makes `isinstance(x, ImportedInterface)`
+    // legal when the source module opted in.
+    let mut interfaces: HashMap<String, bool> = HashMap::new();
     for stmt in &module.body {
         if let Stmt::ClassDef(cd) = stmt {
             if class_inherits_protocol(cd) {
-                interfaces.insert(cd.name.as_str().to_owned());
+                let runtime_checkable = has_runtime_checkable_decorator(&cd.decorator_list);
+                interfaces.insert(cd.name.as_str().to_owned(), runtime_checkable);
             }
         }
     }
@@ -3037,12 +3050,15 @@ pub fn check_module_with_imports(
         // Protocol-shaped type so `is_assignable` consults the
         // structural-conformance path. The shape itself is already in
         // `class_shapes` (re-keyed by the CLI / LSP), so we just need
-        // an entry in `c.interfaces` keyed under the same name.
-        for name in &ext.interfaces {
+        // an entry in `c.interfaces` keyed under the same name —
+        // preserving the source module's `@runtime_checkable` opt-in
+        // so `isinstance(x, ImportedInterface)` doesn't get
+        // false-positive-rejected by `tyc::interface_isinstance`.
+        for (name, runtime_checkable) in &ext.interfaces {
             if let Some(shape) = c.class_shapes.get(name).cloned() {
                 c.interfaces.entry(name.clone()).or_insert(InterfaceDecl {
                     shape,
-                    runtime_checkable: false,
+                    runtime_checkable: *runtime_checkable,
                 });
             }
         }
@@ -4580,6 +4596,15 @@ fn strip_receiver_from_arity(mut info: ArityInfo) -> ArityInfo {
     if !info.required_positional.is_empty() {
         info.required_positional.remove(0);
     }
+    // Keep `param_types` parallel with `param_names` — the
+    // cross-module call-site machinery indexes both by the same
+    // position. Letting them drift would either misalign argument
+    // type-checking (off-by-one against the receiver slot) or panic
+    // on out-of-bounds access in a downstream caller. Reported by
+    // copilot on PR #127.
+    if !info.param_types.is_empty() {
+        info.param_types.remove(0);
+    }
     info.min_positional = info.min_positional.saturating_sub(1);
     info.max_positional = info.max_positional.map(|n| n.saturating_sub(1));
     info
@@ -4745,6 +4770,13 @@ fn missing_required_params(
 }
 
 fn class_constructor_arity(shape: &InterfaceShape) -> ArityInfo {
+    class_constructor_arity_for(shape, None)
+}
+
+/// Variant of [`class_constructor_arity`] that records the
+/// constructor's return type as `Type::Class(class_name)` when the
+/// caller knows it. Otherwise behaves identically.
+fn class_constructor_arity_for(shape: &InterfaceShape, class_name: Option<&str>) -> ArityInfo {
     let max_positional = shape.field_order.len();
     let required_positional: Vec<bool> = shape
         .field_order
@@ -4757,6 +4789,10 @@ fn class_constructor_arity(shape: &InterfaceShape) -> ArityInfo {
         .iter()
         .map(|name| shape.fields.get(name).cloned().unwrap_or(Type::Unknown))
         .collect();
+    let return_type = match class_name {
+        Some(name) => Type::Class(name.to_owned()),
+        None => Type::Unknown,
+    };
     ArityInfo {
         param_names: shape.field_order.clone(),
         min_positional,
@@ -4768,7 +4804,7 @@ fn class_constructor_arity(shape: &InterfaceShape) -> ArityInfo {
         vararg_type: None,
         param_types,
         kwonly_types: Vec::new(),
-        return_type: Type::Unknown,
+        return_type,
     }
 }
 
@@ -5299,10 +5335,12 @@ fn seed_env_from_scope(c: &mut Checker, scope: ScopeId) {
                     // and newtypes) — `Type::Unknown` placeholders
                     // would otherwise widen to "accept anything" and,
                     // worse, render as `?` in `tyc::nullable_use`
-                    // diagnostics.
-                    let params = if info.param_types.len() == info.param_names.len()
-                        && !info.param_types.is_empty()
-                    {
+                    // diagnostics. Fall back to all-`Unknown` only
+                    // when the two parallel vectors have drifted out
+                    // of length (legacy `ArityInfo` shapes from
+                    // venv-introspected stubs that haven't been
+                    // updated to carry `param_types` yet).
+                    let params = if info.param_types.len() == info.param_names.len() {
                         info.param_types.clone()
                     } else {
                         vec![Type::Unknown; info.param_names.len()]

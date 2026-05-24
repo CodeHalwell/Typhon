@@ -423,7 +423,7 @@ fn shapes_from_introspected(intro: &IntrospectedModule) -> ModuleShapes {
         class_type_params: HashMap::new(),
         function_arities,
         sealed_unions: HashMap::new(),
-        interfaces: std::collections::HashSet::new(),
+        interfaces: HashMap::new(),
     }
 }
 

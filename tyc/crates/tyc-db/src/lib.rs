@@ -742,12 +742,16 @@ fn build_external_shapes(
                     .insert(b.name.clone(), tps.clone());
             }
             // If the foreign module declared `Foo` as an interface
-            // (Protocol-shaped), record that fact under the local
-            // import name so cross-module structural conformance
-            // matches the in-module checker. The shape is already in
-            // `class_shapes` so the checker can resolve it.
-            if module_shapes.interfaces.contains(member) {
-                external.interfaces.insert(b.name.clone());
+            // (Protocol-shaped), record that fact — together with
+            // the source's `@runtime_checkable` opt-in — under the
+            // local import name so cross-module structural
+            // conformance matches the in-module checker and
+            // `isinstance(x, ImportedInterface)` is allowed when
+            // the source author opted in.
+            if let Some(runtime_checkable) = module_shapes.interfaces.get(member) {
+                external
+                    .interfaces
+                    .insert(b.name.clone(), *runtime_checkable);
             }
         } else if let Some(arity) = module_shapes.function_arities.get(member) {
             external
