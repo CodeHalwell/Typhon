@@ -8379,7 +8379,24 @@ fn operator_operands_compatible(op: Operator, l: &Type, r: &Type) -> bool {
             false
         }
         Operator::Sub | Operator::Mod | Operator::Pow | Operator::FloorDiv | Operator::Div => {
-            is_numeric(l) && is_numeric(r)
+            if is_numeric(l) && is_numeric(r) {
+                return true;
+            }
+            // `set - set` and `frozenset - frozenset` are Python set
+            // difference (and the symmetric forms across set/frozenset).
+            // The bitwise ops `&`, `|`, `^` already fall through to the
+            // permissive `_ => true` arm; the `-` arm needs an explicit
+            // carve-out because it shares this match with the
+            // numeric-only operators above.
+            if let (Type::Generic(ln, _), Type::Generic(rn, _)) = (l, r) {
+                let ls = ln.as_str();
+                let rs = rn.as_str();
+                let set_like = |n: &str| n == "set" || n == "frozenset";
+                if matches!(op, Operator::Sub) && set_like(ls) && set_like(rs) {
+                    return true;
+                }
+            }
+            false
         }
         Operator::Mult => {
             if is_numeric(l) && is_numeric(r) {

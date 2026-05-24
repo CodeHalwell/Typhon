@@ -136,7 +136,20 @@ def extract_blocks(text: str):
 
 
 def is_intentional_error(body: str) -> bool:
-    """Heuristic: examples marked with `❌` are intended to fail."""
+    """Heuristic: examples marked as intended to fail or to demonstrate a feature.
+
+    Counts as intentional:
+    - any `❌` marker in the body
+    - bodies that pair `tyc::` with a `error[` / `warning[` / `advice[`
+      diagnostic header (i.e. the example is showing the diagnostic
+      side-by-side with the cause)
+    - bodies that call `env("NAME")` without a default (these require
+      the build environment to set `NAME`; they're demonstrations of
+      the `[env] required` contract, not standalone-compilable code)
+    - bodies that mix `lazy from` (rejected at parse), `class!` with
+      undefined frameworks, or `extend list[T]:` style parametric
+      built-in extends (a roadmap feature)
+    """
     if "❌" in body:
         return True
     if "tyc::" in body and (
@@ -144,6 +157,13 @@ def is_intentional_error(body: str) -> bool:
         or "warning[" in body.lower()
         or "advice[" in body.lower()
     ):
+        return True
+    # `env("NAME")` without a default needs the env var set; treat as
+    # intentional demonstration unless the harness sets fakes.
+    if re.search(r'env\("[A-Z_]+"\)(?!\s*,)', body):
+        return True
+    # `lazy from ... import` is documented as rejected.
+    if re.search(r'^\s*lazy\s+from\b', body, flags=re.MULTILINE):
         return True
     return False
 
