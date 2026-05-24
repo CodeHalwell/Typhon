@@ -2,7 +2,6 @@ from __future__ import annotations
 from typhon_runtime import Ok, Err, Result
 import dataclasses
 from typhon_runtime import Err as __typhon_Err__
-from typhon_runtime import Err as __typhon_Err__
 
 
 @dataclasses.dataclass(slots=True)

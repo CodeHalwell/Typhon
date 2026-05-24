@@ -3827,7 +3827,13 @@ fn prepend_typhon_err_alias_import(body: String) -> String {
             // Python tidy when both `expand_question_ops` and
             // `expand_with_chains` produce `__typhon_Err__` references
             // (each pipeline pass independently calls this helper).
-            if is_typhon_alias_import && trimmed == IMPORT_LINE.trim_end() {
+            // `trimmed` is the line from `trim_start()`, which leaves the
+            // trailing newline intact.  Strip both sides before comparing
+            // against the import-line literal, otherwise a duplicate
+            // injected by an earlier pass slips through and produces back-
+            // to-back identical `from typhon_runtime import Err as ...`
+            // lines in the emitted Python (caught by PR #120 review).
+            if is_typhon_alias_import && trimmed.trim_end() == IMPORT_LINE.trim_end() {
                 inserted = true;
             }
             out.push_str(line);
@@ -6138,6 +6144,28 @@ fn find_assignment_eq(s: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepend_err_alias_dedupes_existing_line() {
+        // The body already carries a `from typhon_runtime import Err as
+        // __typhon_Err__` line in its header (left there by a prior
+        // pipeline pass). Calling the helper again must NOT produce a
+        // second identical line — PR #120 caught the duplicate in the
+        // emitted Python because the comparison forgot to strip the
+        // trailing newline before matching against IMPORT_LINE.
+        let body =
+            "from __future__ import annotations\n\
+             from typhon_runtime import Err as __typhon_Err__\n\
+             import dataclasses\n\
+             pass\n";
+        let out = prepend_typhon_err_alias_import(body.to_owned());
+        assert_eq!(
+            out.matches("from typhon_runtime import Err as __typhon_Err__")
+                .count(),
+            1,
+            "duplicate alias import must be deduped:\n{out}"
+        );
+    }
 
     #[test]
     fn preserves_let_keyword() {
