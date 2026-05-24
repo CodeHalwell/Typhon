@@ -5,6 +5,8 @@ sidebar:
   order: 2
 ---
 
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
 When you `import` from a plain `.py`, three outcomes are possible:
 
 1. **The module is typed** (PEP 484 / 526 annotations everywhere). The checker accepts the types and treats the import like a Typhon module.
@@ -77,13 +79,18 @@ let parsed: dict[str, int] = ...    # re-assert at the boundary
 
 Typhon's `import` lowers to a plain Python `import`. The imported name's runtime behaviour is unchanged:
 
-```python
-# Typhon
-import messy_lib
-
-# Emitted
-import messy_lib
-```
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    import messy_lib
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    import messy_lib
+    ```
+  </TabItem>
+</Tabs>
 
 The strictness is *compile-time only*. At runtime, the import resolves the same way Python always has.
 

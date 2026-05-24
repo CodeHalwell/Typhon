@@ -5,7 +5,7 @@ sidebar:
   order: 8
 ---
 
-import { Aside } from '@astrojs/starlight/components';
+import { Aside, TabItem, Tabs } from '@astrojs/starlight/components';
 
 Two tools for writing code that works across many types: **generics** (one definition, many parameter types) and **interfaces** (structural contracts — anything with the right shape satisfies them). Both erase at emit time — Python's duck typing carries the runtime; Typhon checks at compile time.
 
@@ -108,21 +108,26 @@ The checker verifies, at the call site, that `Button` provides `draw`, `width`, 
 
 ### Interfaces emit as `typing.Protocol`
 
-```python
-# Typhon
-interface Drawable:
-    def draw(self) -> None
-    def width(self) -> float
-    def height(self) -> float
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    interface Drawable:
+        def draw(self) -> None
+        def width(self) -> float
+        def height(self) -> float
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    from typing import Protocol
 
-# Emitted Python
-from typing import Protocol
-
-class Drawable(Protocol):
-    def draw(self) -> None: ...
-    def width(self) -> float: ...
-    def height(self) -> float: ...
-```
+    class Drawable(Protocol):
+        def draw(self) -> None: ...
+        def width(self) -> float: ...
+        def height(self) -> float: ...
+    ```
+  </TabItem>
+</Tabs>
 
 Mypy, pyright, and IDEs all understand `Protocol` the same way Typhon does.
 
@@ -177,19 +182,24 @@ def smallest[T: Ordered](xs: list[T]) -> T?:
 
 Typhon erases generics at emit time. The runtime sees plain `list`, `dict`, and untyped classes; type safety is a compile-time property only.
 
-```python
-# Typhon
-def first[T](xs: list[T]) -> T?:
-    if len(xs) == 0:
-        return None
-    return xs[0]
-
-# Emitted Python (PEP 695 preserved on the 3.13+ target)
-def first[T](xs: list[T]) -> T | None:
-    if len(xs) == 0:
-        return None
-    return xs[0]
-```
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    def first[T](xs: list[T]) -> T?:
+        if len(xs) == 0:
+            return None
+        return xs[0]
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    def first[T](xs: list[T]) -> T | None:
+        if len(xs) == 0:
+            return None
+        return xs[0]
+    ```
+  </TabItem>
+</Tabs>
 
 PEP 695 syntax is preserved (Python 3.12+ supports it natively). Older targets would need a `TypeVar` rewrite — for 3.13+ (Typhon's default), the syntax goes through unchanged.
 

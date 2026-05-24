@@ -5,6 +5,8 @@ sidebar:
   order: 15
 ---
 
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
 `a |> f(arg)` is exactly `f(a, arg)`. Left-associative; the pipe argument fills the *first* positional slot of the next call.
 
 ## Syntax
@@ -21,13 +23,18 @@ let cleaned: str = raw |> str.strip() |> str.lower() |> str.replace(",", "")
 
 ## Desugaring
 
-```python
-# Typhon
-result = x |> normalise() |> scale(2.0) |> clamp(0.0, 1.0)
-
-# Emitted Python
-result = clamp(scale(normalise(x), 2.0), 0.0, 1.0)
-```
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    result = x |> normalise() |> scale(2.0) |> clamp(0.0, 1.0)
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    result = clamp(scale(normalise(x), 2.0), 0.0, 1.0)
+    ```
+  </TabItem>
+</Tabs>
 
 No partial application, no curry, no special placeholder. Just first-positional threading.
 

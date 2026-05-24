@@ -5,26 +5,32 @@ sidebar:
   order: 6
 ---
 
-import { Aside } from '@astrojs/starlight/components';
+import { Aside, TabItem, Tabs } from '@astrojs/starlight/components';
 
 `model Foo:` emits a Pydantic `BaseModel(extra="forbid")`. Use it for data crossing a trust boundary — HTTP requests, JSON files, env-derived structures, message-queue payloads — where you want runtime validation in addition to compile-time types.
 
 ## A worked example
 
-```python
-model UserInput:
-    email: str
-    name: str = "anon"
-    age: int? = None
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    model UserInput:
+        email: str
+        name: str = "anon"
+        age: int? = None
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    class UserInput(BaseModel):
+        model_config = ConfigDict(extra="forbid")
 
-# Emitted Python
-class UserInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    email: str
-    name: str = "anon"
-    age: int | None = None
-```
+        email: str
+        name: str = "anon"
+        age: int | None = None
+    ```
+  </TabItem>
+</Tabs>
 
 ## What you get
 

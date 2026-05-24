@@ -5,7 +5,7 @@ sidebar:
   order: 10
 ---
 
-import { Aside } from '@astrojs/starlight/components';
+import { Aside, TabItem, Tabs } from '@astrojs/starlight/components';
 
 The features in this page are the ones you'll reach for once Typhon is part of your everyday workflow: composing transformations with pipes, computing values at build time with `comptime`, deferring expensive imports with `lazy`, opting into caching with `@pure`/`@memo`, and crossing the boundary into untyped Python with `unsafe` and `.dty` stubs.
 
@@ -31,13 +31,18 @@ let cleaned: str = str.replace(str.lower(str.strip(raw)), ",", "")
 
 `a |> f(arg)` is exactly `f(a, arg)`. Left-associative, the pipe argument fills the *first* positional slot:
 
-```python
-# Typhon
-result = x |> normalise() |> scale(2.0) |> clamp(0.0, 1.0)
-
-# Emitted Python
-result = clamp(scale(normalise(x), 2.0), 0.0, 1.0)
-```
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    result = x |> normalise() |> scale(2.0) |> clamp(0.0, 1.0)
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    result = clamp(scale(normalise(x), 2.0), 0.0, 1.0)
+    ```
+  </TabItem>
+</Tabs>
 
 No partial application, no curry — just position-1 threading.
 
@@ -221,17 +226,22 @@ With this on, any function the analyser infers as pure gets `@functools.cache` a
 
 ### What `@memo` emits
 
-```python
-# Typhon
-@memo
-def fib(n: int) -> int: ...
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    @memo
+    def fib(n: int) -> int: ...
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    import functools
 
-# Emitted Python
-import functools
-
-@functools.cache
-def fib(n: int) -> int: ...
-```
+    @functools.cache
+    def fib(n: int) -> int: ...
+    ```
+  </TabItem>
+</Tabs>
 
 For bounded caches, use `@memo(max=128)`, which lowers to `@functools.lru_cache(maxsize=128)`.
 

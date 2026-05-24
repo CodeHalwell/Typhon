@@ -5,7 +5,7 @@ sidebar:
   order: 8
 ---
 
-import { Aside } from '@astrojs/starlight/components';
+import { Aside, TabItem, Tabs } from '@astrojs/starlight/components';
 
 An `interface` is a *structural* contract: any type that provides the listed members with compatible signatures satisfies the interface, without an explicit `implements` clause. Interfaces emit as `typing.Protocol` subclasses, so mypy / pyright / IDEs see them the same way.
 
@@ -42,19 +42,24 @@ render(Button(label="click me"))    # ✅ Button satisfies Drawable
 
 ## Lowering
 
-```python
-# Typhon
-interface Drawable:
-    def draw(self) -> None
-    def width(self) -> float
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    interface Drawable:
+        def draw(self) -> None
+        def width(self) -> float
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    from typing import Protocol
 
-# Emitted Python
-from typing import Protocol
-
-class Drawable(Protocol):
-    def draw(self) -> None: ...
-    def width(self) -> float: ...
-```
+    class Drawable(Protocol):
+        def draw(self) -> None: ...
+        def width(self) -> float: ...
+    ```
+  </TabItem>
+</Tabs>
 
 `Protocol` is part of the typing stdlib (PEP 544). Every Python tool already understands it.
 

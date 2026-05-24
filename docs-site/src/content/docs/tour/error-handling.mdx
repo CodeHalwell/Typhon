@@ -5,7 +5,7 @@ sidebar:
   order: 6
 ---
 
-import { Aside } from '@astrojs/starlight/components';
+import { Aside, TabItem, Tabs } from '@astrojs/starlight/components';
 
 Exceptions exist in Python, and Typhon doesn't remove them. But for *expected* failures — parse errors, missing records, validation rejections — Typhon uses a typed `Result[T, E]`. The compiler tracks errors as values, the `?` operator propagates them, and `with`-chains sequence them like Elixir.
 
@@ -84,16 +84,21 @@ The "compatible" check is structural: the error types must match (or unify, for 
 
 `?` does **not** lower to `try/except`. It's a plain inline check, keeping stack traces clean and predictable:
 
-```python
-# Typhon
-let port: int = parse_port(port_str)?
-
-# Emitted Python
-_tmp_0 = parse_port(port_str)
-if isinstance(_tmp_0, Err):
-    return _tmp_0
-port: int = _tmp_0.value
-```
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    let port: int = parse_port(port_str)?
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    _tmp_0 = parse_port(port_str)
+    if isinstance(_tmp_0, Err):
+        return _tmp_0
+    port: int = _tmp_0.value
+    ```
+  </TabItem>
+</Tabs>
 
 No hidden exception flow. Every short-circuit is visible in the emitted source.
 

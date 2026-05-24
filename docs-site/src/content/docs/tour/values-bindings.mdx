@@ -42,15 +42,20 @@ Inside a function, the kind is always explicit. At module top level, it's `let` 
 
 ### What gets emitted
 
-```python
-# Typhon
-let pi: float = 3.14159
-mut counter: int = 0
-
-# Emitted Python
-pi: float = 3.14159
-counter: int = 0
-```
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    let pi: float = 3.14159
+    mut counter: int = 0
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    pi: float = 3.14159
+    counter: int = 0
+    ```
+  </TabItem>
+</Tabs>
 
 `let` / `mut` are erased at emit time — they're compile-time markers. The emitted Python looks exactly like what an experienced Pythonista would write.
 
