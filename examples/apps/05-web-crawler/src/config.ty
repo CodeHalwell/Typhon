@@ -1,0 +1,39 @@
+comptime let USER_AGENT: str = "TyphonCrawler/0.1 (+https://typhon.dev)"
+comptime let DEFAULT_TIMEOUT: float = 10.0
+
+
+pub class RetryPolicy frozen:
+    max_attempts: int
+    base_delay_seconds: float
+    max_delay_seconds: float
+
+
+pub class CrawlConfig frozen:
+    max_pages: int
+    concurrent_workers: int
+    requests_per_host_per_second: float
+    per_host_burst: int
+    fetch_timeout_seconds: float
+    user_agent: str
+    follow_external: bool
+    retry: RetryPolicy
+
+
+freeze let DEFAULT_RETRY: RetryPolicy = RetryPolicy(
+    max_attempts=3,
+    base_delay_seconds=0.5,
+    max_delay_seconds=8.0,
+)
+
+
+pub def default_config(max_pages: int) -> CrawlConfig:
+    return CrawlConfig(
+        max_pages=max_pages,
+        concurrent_workers=4,
+        requests_per_host_per_second=2.0,
+        per_host_burst=4,
+        fetch_timeout_seconds=DEFAULT_TIMEOUT,
+        user_agent=USER_AGENT,
+        follow_external=False,
+        retry=DEFAULT_RETRY,
+    )

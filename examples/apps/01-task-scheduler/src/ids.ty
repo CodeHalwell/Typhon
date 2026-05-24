@@ -1,0 +1,4 @@
+pub newtype TaskId = int
+pub newtype RunId = int
+pub newtype JobName = str
+pub newtype WorkerId = str

@@ -1,0 +1,191 @@
+import asyncio
+import random
+from datetime import datetime, timedelta, timezone
+from typing import Callable
+
+from config import RetryPolicy, SchedulerConfig
+from ids import JobName, TaskId
+from models import (
+    SchedulerEvent,
+    StatusReady,
+    StatusRunning,
+    Task,
+    TaskStatus,
+    make_status_failed,
+    make_status_succeeded,
+    make_task_completed,
+    make_task_failed,
+    make_task_ready,
+    make_task_retry,
+    make_task_submitted,
+)
+from store import Store, StoreError
+
+
+pub class HandlerError:
+    message: str
+
+
+pub type HandlerResult = HandlerOk | HandlerFailure
+
+
+pub class HandlerOk:
+    summary: str
+
+
+pub class HandlerFailure:
+    message: str
+    retryable: bool
+
+
+pub def ok_result(summary: str) -> HandlerResult:
+    return HandlerOk(summary=summary)
+
+
+pub def failure_result(message: str, retryable: bool) -> HandlerResult:
+    return HandlerFailure(message=message, retryable=retryable)
+
+
+pub class Handler:
+    name: str
+    fn: Callable[[dict[str, object]], HandlerResult]
+
+
+pub class Registry:
+    handlers: dict[str, Handler]
+
+
+impl Registry:
+    def register(self, handler: Handler) -> None:
+        self.handlers[handler.name] = handler
+
+    def lookup(self, name: JobName) -> Handler?:
+        return self.handlers.get(str(name))
+
+
+pub class Scheduler:
+    config: SchedulerConfig
+    store: Store
+    registry: Registry
+    shutdown: asyncio.Event
+    inflight: dict[int, TaskId]
+
+
+impl Scheduler:
+    def emit(self, event: SchedulerEvent) -> None:
+        match self.store.append_event(event):
+            case Ok(_):
+                pass
+            case Err(e):
+                print(f"[scheduler] failed to persist event: {e.reason}")
+
+    def submit(
+        self,
+        job: JobName,
+        args: dict[str, object],
+        priority: int,
+        depends_on: list[TaskId],
+    ) -> Result[Task, StoreError]:
+        match self.store.insert_task(job, args, priority, depends_on):
+            case Ok(task):
+                self.emit(make_task_submitted(
+                    task_id=task.id, job=task.job, at=task.created_at
+                ))
+                match task.status:
+                    case StatusReady(_):
+                        self.emit(make_task_ready(task_id=task.id, at=task.updated_at))
+                    case _:
+                        pass
+                return Ok(task)
+            case Err(e):
+                return Err(e)
+        raise RuntimeError("unreachable")
+
+    def compute_backoff(self, policy: RetryPolicy, attempt: int) -> float:
+        let raw_exp: int = attempt - 1
+        let exponent: int = raw_exp if raw_exp < 60 else 60
+        let raw: float = policy.base_delay_seconds * float(2 ** exponent)
+        let bounded: float = raw if raw < policy.max_delay_seconds else policy.max_delay_seconds
+        let jitter: float = bounded * policy.jitter_ratio * (random.random() - 0.5) * 2.0
+        let total: float = bounded + jitter
+        return total if total > 0.0 else 0.0
+
+    async def promote_pending(self) -> None:
+        while not self.shutdown.is_set():
+            match self.store.promote_ready():
+                case Ok(_):
+                    pass
+                case Err(e):
+                    print(f"[promoter] {e.reason}")
+            try:
+                await asyncio.wait_for(
+                    self.shutdown.wait(), timeout=self.config.poll_interval_seconds
+                )
+            except asyncio.TimeoutError:
+                pass
+
+    def record_success(self, task: Task, summary: str, duration_ms: int) -> None:
+        let now: datetime = datetime.now(timezone.utc)
+        let status: TaskStatus = make_status_succeeded(
+            finished_at=now, result_summary=summary
+        )
+        match self.store.update_status(task.id, status, task.attempts + 1, None):
+            case Ok(_):
+                pass
+            case Err(e):
+                print(f"[scheduler] failed to record success: {e.reason}")
+        match task.status:
+            case StatusRunning(worker, _, _):
+                self.emit(make_task_completed(
+                    task_id=task.id, worker=worker, duration_ms=duration_ms, at=now
+                ))
+            case _:
+                pass
+
+    def record_failure(
+        self,
+        task: Task,
+        message: str,
+        attempt: int,
+        retryable: bool,
+    ) -> None:
+        let now: datetime = datetime.now(timezone.utc)
+        let policy: RetryPolicy = self.config.retry
+        let can_retry: bool = retryable and attempt < policy.max_attempts
+
+        match task.status:
+            case StatusRunning(worker, _, _):
+                self.emit(make_task_failed(
+                    task_id=task.id,
+                    worker=worker,
+                    error=message,
+                    attempt=attempt,
+                    at=now,
+                ))
+            case _:
+                pass
+
+        if can_retry:
+            let delay: float = self.compute_backoff(policy, attempt)
+            let not_before: datetime = now + timedelta(seconds=delay)
+            match self.store.schedule_retry(task.id, attempt, message, not_before):
+                case Ok(_):
+                    pass
+                case Err(e):
+                    print(f"[scheduler] could not requeue: {e.reason}")
+            self.emit(make_task_retry(
+                task_id=task.id,
+                delay_seconds=delay,
+                next_attempt=attempt + 1,
+                at=now,
+            ))
+            return
+
+        let terminal: TaskStatus = make_status_failed(
+            finished_at=now, last_error=message, attempts=attempt
+        )
+        match self.store.update_status(task.id, terminal, attempt, message):
+            case Ok(_):
+                pass
+            case Err(e):
+                print(f"[scheduler] could not mark failed: {e.reason}")

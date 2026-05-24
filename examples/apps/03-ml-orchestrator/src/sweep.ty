@@ -1,0 +1,121 @@
+import random
+from typing import Iterator
+
+from datatypes import Dataset
+from ids import JobId, ModelName, ModelVersion, RunId
+from model import TrainConfig
+from pipeline import JobSpec, JobState, JobSucceeded, Orchestrator
+
+
+pub class SweepGrid frozen:
+    learning_rates: list[float]
+    epochs: list[int]
+    l2s: list[float]
+
+
+pub class SweepRandom frozen:
+    n_trials: int
+    learning_rate_range: tuple[float, float]
+    epochs_range: tuple[int, int]
+    l2_range: tuple[float, float]
+    seed: int
+
+
+pub class SweepResult:
+    spec: JobSpec
+    state: JobState
+
+
+def _expand_grid(grid: SweepGrid) -> Iterator[TrainConfig]:
+    for lr in grid.learning_rates:
+        for ep in grid.epochs:
+            for l2 in grid.l2s:
+                yield TrainConfig(learning_rate=lr, epochs=ep, l2=l2)
+
+
+def _random_configs(spec: SweepRandom) -> list[TrainConfig]:
+    let rng: random.Random = random.Random(spec.seed)
+    mut out: list[TrainConfig] = []
+    for _ in range(spec.n_trials):
+        let lr: float = rng.uniform(spec.learning_rate_range[0], spec.learning_rate_range[1])
+        let ep: int = rng.randint(spec.epochs_range[0], spec.epochs_range[1])
+        let l2: float = rng.uniform(spec.l2_range[0], spec.l2_range[1])
+        out.append(TrainConfig(learning_rate=lr, epochs=ep, l2=l2))
+    return out
+
+
+pub def run_grid_sweep(
+    orch: Orchestrator,
+    ds: Dataset[list[float]],
+    model_name: ModelName,
+    grid: SweepGrid,
+    base_run_id: str,
+) -> list[SweepResult]:
+    mut results: list[SweepResult] = []
+    mut idx: int = 0
+    for cfg in _expand_grid(grid):
+        let version: ModelVersion = ModelVersion(f"grid-{idx:03d}")
+        let spec: JobSpec = JobSpec(
+            job_id=JobId(f"job-grid-{idx:03d}"),
+            run_id=RunId(f"{base_run_id}-{idx:03d}"),
+            model_name=model_name,
+            model_version=version,
+            train_cfg=cfg,
+        )
+        let state: JobState = orch.run(ds, spec)
+        results.append(SweepResult(spec=spec, state=state))
+        idx = idx + 1
+    return results
+
+
+pub def run_random_sweep(
+    orch: Orchestrator,
+    ds: Dataset[list[float]],
+    model_name: ModelName,
+    sweep: SweepRandom,
+    base_run_id: str,
+) -> list[SweepResult]:
+    mut results: list[SweepResult] = []
+    let configs: list[TrainConfig] = _random_configs(sweep)
+    for (idx, cfg) in enumerate(configs):
+        let version: ModelVersion = ModelVersion(f"rand-{idx:03d}")
+        let spec: JobSpec = JobSpec(
+            job_id=JobId(f"job-rand-{idx:03d}"),
+            run_id=RunId(f"{base_run_id}-{idx:03d}"),
+            model_name=model_name,
+            model_version=version,
+            train_cfg=cfg,
+        )
+        let state: JobState = orch.run(ds, spec)
+        results.append(SweepResult(spec=spec, state=state))
+    return results
+
+
+pub def best_by_metric(
+    results: list[SweepResult],
+    metric: str,
+    lower_is_better: bool,
+) -> SweepResult?:
+    mut winner: SweepResult? = None
+    mut best_value: float? = None
+    for r in results:
+        match r.state:
+            case JobSucceeded(_, _, metrics):
+                let value: float? = metrics.get(metric)
+                if value is None:
+                    continue
+                if best_value is None:
+                    winner = r
+                    best_value = value
+                    continue
+                if lower_is_better:
+                    if value < best_value:
+                        winner = r
+                        best_value = value
+                else:
+                    if value > best_value:
+                        winner = r
+                        best_value = value
+            case _:
+                pass
+    return winner

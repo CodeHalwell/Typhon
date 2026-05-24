@@ -1,0 +1,87 @@
+import asyncio
+
+from fetcher import (
+    Fetched,
+    FetchOutcome,
+    NotModified,
+    PermanentError,
+    RateLimited,
+    RobotsBlocked,
+    TransientError,
+)
+
+
+pub class CrawlReport:
+    fetched_ok: int
+    not_modified: int
+    robots_blocked: int
+    rate_limited: int
+    transient_errors: int
+    permanent_errors: int
+    total_bytes: int
+    documents_unique: int
+    documents_duplicate: int
+    samples: list[str]
+    lock: asyncio.Lock
+
+
+impl CrawlReport:
+    async def record_robots_blocked(self) -> None:
+        async with self.lock:
+            self.robots_blocked = self.robots_blocked + 1
+
+    async def record(self, outcome: FetchOutcome) -> None:
+        async with self.lock:
+            match outcome:
+                case Fetched(url, _, body, _, _):
+                    self.fetched_ok = self.fetched_ok + 1
+                    self.total_bytes = self.total_bytes + len(body)
+                    if len(self.samples) < 5:
+                        self.samples.append(str(url))
+                case NotModified(_):
+                    self.not_modified = self.not_modified + 1
+                case RobotsBlocked(_):
+                    self.robots_blocked = self.robots_blocked + 1
+                case RateLimited(_, _):
+                    self.rate_limited = self.rate_limited + 1
+                case TransientError(_, _, _):
+                    self.transient_errors = self.transient_errors + 1
+                case PermanentError(_, _, _):
+                    self.permanent_errors = self.permanent_errors + 1
+
+    async def record_unique(self) -> None:
+        async with self.lock:
+            self.documents_unique = self.documents_unique + 1
+
+    async def record_duplicate(self) -> None:
+        async with self.lock:
+            self.documents_duplicate = self.documents_duplicate + 1
+
+    def render(self) -> str:
+        return (
+            f"Fetched OK:        {self.fetched_ok}\n"
+            f"Not modified:      {self.not_modified}\n"
+            f"Robots blocked:    {self.robots_blocked}\n"
+            f"Rate limited:      {self.rate_limited}\n"
+            f"Transient errors:  {self.transient_errors}\n"
+            f"Permanent errors:  {self.permanent_errors}\n"
+            f"Bytes downloaded:  {self.total_bytes}\n"
+            f"Unique docs:       {self.documents_unique}\n"
+            f"Duplicate docs:    {self.documents_duplicate}"
+        )
+
+
+pub def new_report() -> CrawlReport:
+    return CrawlReport(
+        fetched_ok=0,
+        not_modified=0,
+        robots_blocked=0,
+        rate_limited=0,
+        transient_errors=0,
+        permanent_errors=0,
+        total_bytes=0,
+        documents_unique=0,
+        documents_duplicate=0,
+        samples=[],
+        lock=asyncio.Lock(),
+    )

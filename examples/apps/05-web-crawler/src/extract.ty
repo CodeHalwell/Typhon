@@ -1,0 +1,79 @@
+from urllib.parse import urljoin, urlparse
+
+from bs4 import BeautifulSoup
+
+from ids import Url
+
+
+pub class ExtractError:
+    reason: str
+
+
+pub class Document:
+    url: Url
+    title: str
+    text: str
+    links: list[Url]
+    length: int
+
+
+pub def extract(html: str, base_url: Url) -> Result[Document, ExtractError]:
+    try:
+        let soup: BeautifulSoup = BeautifulSoup(html, "html.parser")
+    except Exception as e:
+        return Err(ExtractError(reason=f"parse_error: {e}"))
+
+    let title_node = soup.find("title")
+    let title: str = title_node.get_text(strip=True) if title_node is not None else ""
+
+    let body_node = soup.find("body")
+    let text: str = body_node.get_text(separator=" ", strip=True) if body_node is not None else ""
+
+    mut links: list[Url] = []
+    for a in soup.find_all("a"):
+        let href = a.get("href")
+        if href is None:
+            continue
+        let href_str: str = str(href).strip()
+        if len(href_str) == 0 or href_str.startswith("#") or href_str.startswith("mailto:") or href_str.startswith("javascript:"):
+            continue
+        let absolute: str = urljoin(str(base_url), href_str)
+        let canonical: str = _canonicalise(absolute)
+        if len(canonical) > 0:
+            links.append(Url(canonical))
+
+    return Ok(Document(
+        url=base_url,
+        title=title,
+        text=text,
+        links=_dedupe_links(links),
+        length=len(text),
+    ))
+
+
+def _canonicalise(url: str) -> str:
+    if "://" not in url:
+        return ""
+    let parsed = urlparse(url)
+    if parsed.netloc == "":
+        return ""
+    let scheme: str = parsed.scheme if parsed.scheme in ("http", "https") else ""
+    if scheme == "":
+        return ""
+    let path: str = parsed.path if len(parsed.path) > 0 else "/"
+    let no_frag: str = f"{scheme}://{parsed.netloc}{path}"
+    if len(parsed.query) > 0:
+        return f"{no_frag}?{parsed.query}"
+    return no_frag
+
+
+def _dedupe_links(links: list[Url]) -> list[Url]:
+    mut seen: dict[str, bool] = {}
+    mut out: list[Url] = []
+    for url in links:
+        let key: str = str(url)
+        if seen.get(key) is True:
+            continue
+        seen[key] = True
+        out.append(url)
+    return out

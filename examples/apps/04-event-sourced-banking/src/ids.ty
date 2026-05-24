@@ -1,0 +1,5 @@
+pub newtype AccountId = str
+pub newtype CustomerId = str
+pub newtype TransactionId = str
+pub newtype Currency = str
+pub newtype EventId = int

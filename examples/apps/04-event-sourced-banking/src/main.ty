@@ -1,0 +1,179 @@
+from aggregate import Account, replay, state_label
+from aml import AmlContext, empty_context, large_amount_rule, sanctions_rule, daily_outflow_rule
+from commands import (
+    Command,
+    make_deposit,
+    make_freeze_account,
+    make_open_account,
+    make_transfer,
+    make_unfreeze_account,
+    make_withdraw,
+    rejection_message,
+)
+from events import EventEnvelope, event_kind
+from handlers import Handlers
+from ids import AccountId, CustomerId, Currency, TransactionId
+from money import Money, format_money
+from projections import (
+    apply_to_audit,
+    apply_to_balances,
+    apply_to_ledger,
+    new_audit,
+    new_balances,
+    new_ledger,
+)
+from store import EventStore, new_event_store
+
+
+def _run(handlers: Handlers, cmd: Command, label: str) -> list[EventEnvelope]:
+    print(f"\n> {label}")
+    match handlers.handle(cmd):
+        case Ok(envs):
+            for env in envs:
+                print(f"  + #{int(env.seq):03d} {event_kind(env.payload)}")
+            return envs
+        case Err(r):
+            print(f"  x rejected: {rejection_message(r)}")
+            return []
+    raise RuntimeError("unreachable")
+
+
+def main() -> None:
+    let store: EventStore = new_event_store()
+    let aml_ctx: AmlContext = empty_context()
+    aml_ctx.sanctions_list.append("Sanctioned Bank Ltd")
+
+    let handlers: Handlers = Handlers(
+        store=store,
+        aml_rules=[
+            large_amount_rule(threshold_cents=1_000_000_00),
+            sanctions_rule(),
+            daily_outflow_rule(daily_cap_cents=500_000_00),
+        ],
+        aml_ctx=aml_ctx,
+    )
+
+    let alice: AccountId = AccountId("acct-alice-usd")
+    let bob: AccountId = AccountId("acct-bob-eur")
+    let carol: AccountId = AccountId("acct-carol-usd")
+
+    _run(handlers, make_open_account(
+        account_id=alice,
+        customer_id=CustomerId("cust-001"),
+        currency=Currency("USD"),
+    ), "Open Alice (USD)")
+
+    _run(handlers, make_open_account(
+        account_id=bob,
+        customer_id=CustomerId("cust-002"),
+        currency=Currency("EUR"),
+    ), "Open Bob (EUR)")
+
+    _run(handlers, make_open_account(
+        account_id=carol,
+        customer_id=CustomerId("cust-003"),
+        currency=Currency("USD"),
+    ), "Open Carol (USD)")
+
+    _run(handlers, make_deposit(
+        account_id=alice,
+        amount=Money(100_000_00),
+        source="payroll",
+        transaction_id=TransactionId("tx-001"),
+    ), "Deposit $100k to Alice")
+
+    _run(handlers, make_deposit(
+        account_id=bob,
+        amount=Money(50_000_00),
+        source="payroll",
+        transaction_id=TransactionId("tx-002"),
+    ), "Deposit EUR50k to Bob")
+
+    _run(handlers, make_transfer(
+        from_account=alice,
+        to_account=bob,
+        amount=Money(10_000_00),
+        transaction_id=TransactionId("tx-003"),
+    ), "Transfer $10k Alice -> Bob (USD->EUR)")
+
+    _run(handlers, make_deposit(
+        account_id=carol,
+        amount=Money(2_000_000_00),
+        source="unknown",
+        transaction_id=TransactionId("tx-004"),
+    ), "Deposit $2M to Carol (expect AML hit)")
+
+    _run(handlers, make_deposit(
+        account_id=carol,
+        amount=Money(20_000_00),
+        source="Sanctioned Bank Ltd",
+        transaction_id=TransactionId("tx-005"),
+    ), "Deposit from sanctioned source (expect AML hit)")
+
+    _run(handlers, make_freeze_account(
+        account_id=carol,
+        reason="suspicious activity",
+    ), "Freeze Carol")
+
+    _run(handlers, make_deposit(
+        account_id=carol,
+        amount=Money(100_00),
+        source="payroll",
+        transaction_id=TransactionId("tx-006"),
+    ), "Deposit to frozen Carol (expect rejection)")
+
+    _run(handlers, make_unfreeze_account(account_id=carol), "Unfreeze Carol")
+
+    _run(handlers, make_deposit(
+        account_id=carol,
+        amount=Money(5_000_00),
+        source="payroll",
+        transaction_id=TransactionId("tx-007"),
+    ), "Deposit $5k to Carol")
+
+    _run(handlers, make_withdraw(
+        account_id=alice,
+        amount=Money(200_000_00),
+        destination="cash",
+        transaction_id=TransactionId("tx-008"),
+    ), "Withdraw $200k from Alice (expect insufficient funds)")
+
+    print("\n=== Projections ===")
+    let ledger = new_ledger()
+    let balances = new_balances()
+    let audit = new_audit()
+    for env in store.all():
+        apply_to_ledger(ledger, env)
+        apply_to_balances(balances, env)
+        apply_to_audit(audit, env)
+
+    print("\nBalances:")
+    for (aid, bal) in balances.balances.items():
+        let ccy_opt: Currency? = balances.currencies.get(aid)
+        let ccy: Currency = ccy_opt if ccy_opt is not None else Currency("?")
+        print(f"  {aid:<22}  {format_money(bal, ccy)}")
+
+    print("\nLedger (last 8 lines):")
+    for line in ledger.lines[-8:]:
+        print(
+            f"  #{line.seq:>3} {str(line.account_id):<22} "
+            f"{int(line.delta):>+12} {line.kind:>14}  via {line.counterparty}"
+        )
+
+    print("\nAudit trail (last 6 events):")
+    for entry in audit.entries[-6:]:
+        let aid_str: str = str(entry.account_id) if entry.account_id is not None else "-"
+        print(f"  #{entry.seq:>3} {entry.kind:<18} {aid_str}")
+
+    print("\nAccount states (replayed):")
+    for aid in [alice, bob, carol]:
+        let account: Account = replay(aid, store.for_account(aid))
+        print(
+            f"  {str(aid):<22} "
+            f"state={state_label(account.state):<22} "
+            f"balance={format_money(account.balance, account.currency)}"
+        )
+
+
+if __name__ == "__main__":
+    main()

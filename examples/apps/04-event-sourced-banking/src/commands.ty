@@ -1,0 +1,178 @@
+from ids import AccountId, CustomerId, Currency, TransactionId
+from money import Money
+
+
+pub type Command = OpenAccount | Deposit | Withdraw | Transfer | FreezeAccount | UnfreezeAccount | CloseAccount | AccrueInterest
+
+
+pub class OpenAccount:
+    account_id: AccountId
+    customer_id: CustomerId
+    currency: Currency
+
+
+pub class Deposit:
+    account_id: AccountId
+    amount: Money
+    source: str
+    transaction_id: TransactionId
+
+
+pub class Withdraw:
+    account_id: AccountId
+    amount: Money
+    destination: str
+    transaction_id: TransactionId
+
+
+pub class Transfer:
+    from_account: AccountId
+    to_account: AccountId
+    amount: Money
+    transaction_id: TransactionId
+
+
+pub class FreezeAccount:
+    account_id: AccountId
+    reason: str
+
+
+pub class UnfreezeAccount:
+    account_id: AccountId
+
+
+pub class CloseAccount:
+    account_id: AccountId
+
+
+pub class AccrueInterest:
+    account_id: AccountId
+    rate: float
+
+
+pub type RejectionReason = NoSuchAccount | AccountIsFrozen | AccountAlreadyExists | InsufficientFunds | NegativeAmount | CurrencyMismatch | AccountClosedAlready | AmlRejection
+
+
+pub class NoSuchAccount:
+    account_id: AccountId
+
+
+pub class AccountIsFrozen:
+    account_id: AccountId
+    reason: str
+
+
+pub class AccountAlreadyExists:
+    account_id: AccountId
+
+
+pub class InsufficientFunds:
+    account_id: AccountId
+    available: Money
+    requested: Money
+
+
+pub class NegativeAmount:
+    field: str
+    value: Money
+
+
+pub class CurrencyMismatch:
+    expected: Currency
+    found: Currency
+
+
+pub class AccountClosedAlready:
+    account_id: AccountId
+
+
+pub class AmlRejection:
+    rule: str
+    detail: str
+
+
+pub def make_open_account(account_id: AccountId, customer_id: CustomerId, currency: Currency) -> Command:
+    return OpenAccount(account_id=account_id, customer_id=customer_id, currency=currency)
+
+
+pub def make_deposit(account_id: AccountId, amount: Money, source: str, transaction_id: TransactionId) -> Command:
+    return Deposit(account_id=account_id, amount=amount, source=source, transaction_id=transaction_id)
+
+
+pub def make_withdraw(account_id: AccountId, amount: Money, destination: str, transaction_id: TransactionId) -> Command:
+    return Withdraw(account_id=account_id, amount=amount, destination=destination, transaction_id=transaction_id)
+
+
+pub def make_transfer(from_account: AccountId, to_account: AccountId, amount: Money, transaction_id: TransactionId) -> Command:
+    return Transfer(from_account=from_account, to_account=to_account, amount=amount, transaction_id=transaction_id)
+
+
+pub def make_freeze_account(account_id: AccountId, reason: str) -> Command:
+    return FreezeAccount(account_id=account_id, reason=reason)
+
+
+pub def make_unfreeze_account(account_id: AccountId) -> Command:
+    return UnfreezeAccount(account_id=account_id)
+
+
+pub def make_close_account(account_id: AccountId) -> Command:
+    return CloseAccount(account_id=account_id)
+
+
+pub def make_accrue_interest(account_id: AccountId, rate: float) -> Command:
+    return AccrueInterest(account_id=account_id, rate=rate)
+
+
+pub def reject_no_such_account(account_id: AccountId) -> RejectionReason:
+    return NoSuchAccount(account_id=account_id)
+
+
+pub def reject_account_frozen(account_id: AccountId, reason: str) -> RejectionReason:
+    return AccountIsFrozen(account_id=account_id, reason=reason)
+
+
+pub def reject_account_exists(account_id: AccountId) -> RejectionReason:
+    return AccountAlreadyExists(account_id=account_id)
+
+
+pub def reject_insufficient(account_id: AccountId, available: Money, requested: Money) -> RejectionReason:
+    return InsufficientFunds(account_id=account_id, available=available, requested=requested)
+
+
+pub def reject_negative(field: str, value: Money) -> RejectionReason:
+    return NegativeAmount(field=field, value=value)
+
+
+pub def reject_currency_mismatch(expected: Currency, found: Currency) -> RejectionReason:
+    return CurrencyMismatch(expected=expected, found=found)
+
+
+pub def reject_closed(account_id: AccountId) -> RejectionReason:
+    return AccountClosedAlready(account_id=account_id)
+
+
+pub def reject_aml(rule: str, detail: str) -> RejectionReason:
+    return AmlRejection(rule=rule, detail=detail)
+
+
+pub def rejection_message(r: RejectionReason) -> str:
+    match r:
+        case NoSuchAccount(aid):
+            return f"no such account: {str(aid)}"
+        case AccountIsFrozen(aid, reason):
+            return f"account {str(aid)} is frozen ({reason})"
+        case AccountAlreadyExists(aid):
+            return f"account {str(aid)} already exists"
+        case InsufficientFunds(aid, avail, req):
+            return (
+                f"account {str(aid)}: insufficient funds "
+                f"(have {int(avail)}, want {int(req)})"
+            )
+        case NegativeAmount(field, val):
+            return f"negative amount on {field}: {int(val)}"
+        case CurrencyMismatch(expected, found):
+            return f"currency mismatch: expected {str(expected)}, found {str(found)}"
+        case AccountClosedAlready(aid):
+            return f"account {str(aid)} already closed"
+        case AmlRejection(rule, detail):
+            return f"AML rejection by {rule}: {detail}"

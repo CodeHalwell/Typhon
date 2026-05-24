@@ -1,0 +1,39 @@
+import asyncio
+import sys
+
+import uvicorn
+
+from api import STATE, app
+from worker import Worker
+
+
+async def _serve() -> None:
+    let cfg = uvicorn.Config(
+        app, host="127.0.0.1", port=STATE.config.http_port, log_level="info"
+    )
+    let server: uvicorn.Server = uvicorn.Server(cfg)
+    await server.serve()
+
+
+async def _amain() -> None:
+    for wid in STATE.worker_ids:
+        let w: Worker = Worker(
+            id=wid,
+            scheduler=STATE.scheduler,
+            registry=STATE.registry,
+        )
+        go w.loop()
+    go STATE.scheduler.promote_pending()
+    await _serve()
+
+
+def main() -> None:
+    try:
+        asyncio.run(_amain())
+    except KeyboardInterrupt:
+        STATE.scheduler.shutdown.set()
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

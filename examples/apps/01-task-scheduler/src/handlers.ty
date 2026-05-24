@@ -1,0 +1,49 @@
+import random
+import time
+
+from scheduler import Handler, HandlerResult, failure_result, ok_result
+
+
+def _hello_run(args: dict[str, object]) -> HandlerResult:
+    let raw: object? = args.get("name")
+    let who: str = str(raw) if raw is not None else "world"
+    return ok_result(f"hello, {who}")
+
+
+def _slow_run(args: dict[str, object]) -> HandlerResult:
+    let raw: object? = args.get("seconds")
+    let seconds: float = float(str(raw)) if raw is not None else 1.0
+    time.sleep(seconds)
+    return ok_result(f"slept {seconds:.2f}s")
+
+
+def _flaky_run(args: dict[str, object]) -> HandlerResult:
+    let raw: object? = args.get("fail_rate")
+    let fail_rate: float = float(str(raw)) if raw is not None else 0.5
+    if random.random() < fail_rate:
+        return failure_result("flaked", retryable=True)
+    return ok_result("flaky succeeded")
+
+
+def _always_fail_run(args: dict[str, object]) -> HandlerResult:
+    let retry_raw: object? = args.get("retryable")
+    let retryable: bool = bool(retry_raw) if retry_raw is not None else False
+    let msg_raw: object? = args.get("message")
+    let message: str = str(msg_raw) if msg_raw is not None else "boom"
+    return failure_result(message=message, retryable=retryable)
+
+
+pub def hello_handler() -> Handler:
+    return Handler(name="hello", fn=_hello_run)
+
+
+pub def slow_handler() -> Handler:
+    return Handler(name="slow", fn=_slow_run)
+
+
+pub def flaky_handler() -> Handler:
+    return Handler(name="flaky", fn=_flaky_run)
+
+
+pub def always_fail_handler() -> Handler:
+    return Handler(name="always_fail", fn=_always_fail_run)
