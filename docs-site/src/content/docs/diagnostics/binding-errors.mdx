@@ -33,7 +33,7 @@ def f() -> None:
     x = 2    # ❌
 ```
 
-**Fix:** declare `mut` instead, or shadow with a new `let`:
+**Fix:** declare `mut` instead, or pick a different name for the second binding:
 
 ```python
 def f() -> None:
@@ -46,8 +46,10 @@ Or:
 ```python
 def f() -> None:
     let x: int = 1
-    let x: int = 2   # shadows
+    let x2: int = 2   # fresh name; Typhon rejects shadowing within a function
 ```
+
+(Note: unlike Rust, Typhon does not allow let-shadowing. Python is function-scoped, so a `let x` inside a nested `if` / `for` / `with` would still rebind the outer `x`. The checker fires `tyc::no_block_shadow` for both the same-scope and nested-scope cases.)
 
 ## `tyc::unused_import`
 

@@ -96,13 +96,21 @@ let head, *rest = [1, 2, 3, 4]      # head: int, rest: list[int]
 
 ## Shadowing
 
+Typhon does **not** allow shadowing a binding with another `let` /
+`mut`. Python is function-scoped, so a re-declaration would silently
+rebind the outer binding rather than introduce a new one in a block —
+and the checker fires `tyc::no_block_shadow` on attempts to do so:
+
 ```python
 def f() -> None:
     let x: int = 1
-    let x: str = "two"    # ✅ new binding shadows the old one
+    let x: str = "two"    # ❌ tyc::no_block_shadow
 ```
 
-Same-block shadowing is allowed; the new binding fully replaces the old (including the kind — you can shadow a `let` with a `mut` or vice versa).
+Pick a fresh name (`x2`, `result`, …) or declare the original as `mut`
+and reassign it if the type stays the same. This is the conservative
+default — Rust-style block-scoped shadowing may return once the
+language has block scopes of its own, but it is not in v0.5.1.
 
 ## Emit
 

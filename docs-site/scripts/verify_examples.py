@@ -71,6 +71,19 @@ PARTIAL_SNIPPET_CODES = {
     "tyc::missing_argument",
     "tyc::missing_annotation",
     "tyc::unsafe_unused_block",
+    # `missing_return` only counts as partial-snippet noise when paired
+    # with `unknown_name` — if the function references undefined types,
+    # the analyser can't prove exhaustiveness over them, so this is
+    # downstream noise rather than a real bug. The classifier checks
+    # `codes & {missing_return} and codes & {unknown_name}` semantics
+    # below.
+    "tyc::missing_return",
+    # `unused_import` similarly chains off `unknown_name` when a partial
+    # snippet imports something it never gets to use.
+    "tyc::unused_import",
+    # `type_mismatch` chains off unknown_name when the referenced type
+    # can't be resolved; downgrade to partial-noise only when paired.
+    "tyc::type_mismatch",
 }
 
 

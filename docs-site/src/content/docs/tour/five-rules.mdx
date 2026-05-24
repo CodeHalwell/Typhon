@@ -135,14 +135,22 @@ error[tyc::manual_init]: classes do not declare `__init__`; the constructor is g
 
 Typhon's intent is that `Any` only enters the program through an explicit `unsafe:` region or via a typed `.dty` stub. Today the type system *allows* `Any` to flow freely (it's the top type), so an unconstrained import binds silently; the recommended convention is to wrap untyped boundaries in `unsafe:` so reviewers can see where the dynamism lives.
 
+Two alternative shapes — pick the second:
+
 ```python
+# Option A (discouraged): silently binds to `Any` ───────────
 import messy
 
-let data = messy.fetch()         # binds to Any silently — opaque to the checker
+let data = messy.fetch()        # binds to Any silently — opaque to the checker
+```
+
+```python
+# Option B (recommended): wrap the dynamic boundary ────────
+import messy
 
 unsafe:
-    let data = messy.fetch()     # convention: wrap the boundary
-let parsed: dict[str, int] = ... # re-assert when leaving the region
+    let raw = messy.fetch()
+let parsed: dict[str, int] = dict(raw)   # re-assert when leaving the region
 ```
 
 `unsafe:` is a **lexical region**, not a per-value annotation. Values inside acquire a hidden `Unsafe[T]` marker that cannot cross out into a concrete-typed context without re-assertion (annotation, narrowing, or cast). The block lowers to `if True:` so scope rules are unchanged.
