@@ -5,7 +5,7 @@ sidebar:
   order: 16
 ---
 
-import { Aside } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
 `@pure` asserts a function meets six conditions. `@memo` adds `@functools.cache` after the check. `@pure(memo=True)` is the combined form.
 
@@ -36,25 +36,36 @@ def normalise(s: str) -> str:
 
 Inserts `@functools.cache`. The function must qualify as pure.
 
-```python
-@memo
-def fib(n: int) -> int:
-    if n < 2:
-        return n
-    return fib(n - 1) + fib(n - 2)
-```
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    @memo
+    def fib(n: int) -> int:
+        if n < 2:
+            return n
+        return fib(n - 1) + fib(n - 2)
 
-Emits:
+    def main() -> None:
+        print(fib(10))
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    import functools
 
-```python
-import functools
 
-@functools.cache
-def fib(n: int) -> int:
-    if n < 2:
-        return n
-    return fib(n - 1) + fib(n - 2)
-```
+    @functools.cache
+    def fib(n: int) -> int:
+        if n < 2:
+            return n
+        return fib(n - 1) + fib(n - 2)
+
+
+    def main() -> None:
+        print(fib(10))
+    ```
+  </TabItem>
+</Tabs>
 
 `import functools` is auto-injected if needed.
 

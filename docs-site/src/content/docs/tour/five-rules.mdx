@@ -5,7 +5,7 @@ sidebar:
   order: 1
 ---
 
-import { Aside } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
 Typhon's syntax is *close* to Python — close enough that most code transfers over with minor rewrites. Five rules quietly diverge from Python's defaults, and every "but the same code works in Python!" surprise traces back to one of them. Internalise these five and the checker stops surprising you.
 
@@ -159,29 +159,62 @@ Long-lived production code should not have `unsafe:` blocks scattered through it
 
 A tiny program that touches all five rules:
 
-```python
-def find_user(id: int) -> str?:           # Rule 1: return type required
-    if id == 1:
-        return "Alice"
-    return None
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    def find_user(id: int) -> str?:           # Rule 1: return type required
+        if id == 1:
+            return "Alice"
+        return None
 
-class Greeter:                            # Rule 4: class is shape only
-    style: str
+    class Greeter:                            # Rule 4: class is shape only
+        style: str
 
-impl Greeter:                             # Rule 4: methods in impl
-    def hello(self, name: str) -> str:
-        return f"{self.style}, {name}"
+    impl Greeter:                             # Rule 4: methods in impl
+        def hello(self, name: str) -> str:
+            return f"{self.style}, {name}"
 
-def main() -> None:                       # Rule 1
-    let g: Greeter = Greeter(style="Hi")  # Rule 2: `let` for the binding
-    let found: str? = find_user(1)        # Rule 3: `?` because it may be None
-    if found is None:                     # Rule 3: narrow before use
-        print("anonymous")
-        return
-    print(g.hello(found))                 # narrowed to str
-```
+    def main() -> None:                       # Rule 1
+        let g: Greeter = Greeter(style="Hi")  # Rule 2: `let` for the binding
+        let found: str? = find_user(1)        # Rule 3: `?` because it may be None
+        if found is None:                     # Rule 3: narrow before use
+            print("anonymous")
+            return
+        print(g.hello(found))                 # narrowed to str
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    from __future__ import annotations
+    import dataclasses
 
-Every line follows one or more rules. Once you see the pattern, you stop fighting the checker.
+
+    def find_user(id: int) -> str | None:
+        if id == 1:
+            return "Alice"
+        return None
+
+
+    @dataclasses.dataclass(slots=True)
+    class Greeter:
+        style: str
+
+        def hello(self, name: str) -> str:
+            return f"{self.style}, {name}"
+
+
+    def main() -> None:
+        g: Greeter = Greeter(style="Hi")
+        found: str | None = find_user(1)
+        if found is None:
+            print("anonymous")
+            return
+        print(g.hello(found))
+    ```
+  </TabItem>
+</Tabs>
+
+Every line follows one or more rules. `let` / `mut` and the `?` suffix erase at emit time; the `class` + `impl` pair fuses into a single `@dataclass(slots=True)`. Once you see the pattern, you stop fighting the checker.
 
 ## Cheat sheet
 

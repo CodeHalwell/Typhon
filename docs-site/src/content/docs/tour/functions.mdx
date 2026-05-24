@@ -5,7 +5,7 @@ sidebar:
   order: 3
 ---
 
-import { Aside } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
 Functions in Typhon look like typed Python functions, with two extra rules: every parameter and return type must be annotated, and the checker enforces those annotations at every call site.
 
@@ -260,25 +260,55 @@ This is a hard error in Typhon — not a runtime warning. See [Async and Concurr
 
 A small CLI-style example:
 
-```python
-import sys
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    import sys
 
-def parse_args(argv: list[str]) -> tuple[str, int]:
-    let name: str = argv[1] if len(argv) > 1 else "world"
-    let times: int = int(argv[2]) if len(argv) > 2 else 1
-    return name, times
+    def parse_args(argv: list[str]) -> tuple[str, int]:
+        let name: str = argv[1] if len(argv) > 1 else "world"
+        let times: int = int(argv[2]) if len(argv) > 2 else 1
+        return name, times
 
-def greet(name: str, times: int = 1) -> None:
-    for _ in range(times):
-        print(f"Hello, {name}")
+    def greet(name: str, times: int = 1) -> None:
+        for _ in range(times):
+            print(f"Hello, {name}")
 
-def main() -> None:
-    let name, times = parse_args(sys.argv)
-    greet(name, times)
+    def main() -> None:
+        let name, times = parse_args(sys.argv)
+        greet(name, times)
 
-if __name__ == "__main__":
-    main()
-```
+    if __name__ == "__main__":
+        main()
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    from __future__ import annotations
+    import sys
+
+
+    def parse_args(argv: list[str]) -> tuple[str, int]:
+        name: str = argv[1] if len(argv) > 1 else "world"
+        times: int = int(argv[2]) if len(argv) > 2 else 1
+        return (name, times)
+
+
+    def greet(name: str, times: int = 1) -> None:
+        for _ in range(times):
+            print(f"Hello, {name}")
+
+
+    def main() -> None:
+        (name, times) = parse_args(sys.argv)
+        greet(name, times)
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+  </TabItem>
+</Tabs>
 
 Run it:
 

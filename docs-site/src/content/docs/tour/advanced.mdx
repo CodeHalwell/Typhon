@@ -313,44 +313,98 @@ Drift surfaces as `tyc::stub_mismatch` diagnostics with the standard severity wi
 
 A small but realistic module: a CLI that loads config at build time, lazily imports a heavy dependency, and memoises a hot lookup.
 
-```python
-import sys
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    import sys
 
-lazy import np = numpy
+    lazy import np = numpy
 
-comptime let DB_URL:    str = env("DATABASE_URL")
-comptime let MAX_BATCH: int = int(env("MAX_BATCH", "100"))
+    comptime let DB_URL:    str = env("DATABASE_URL")
+    comptime let MAX_BATCH: int = int(env("MAX_BATCH", "100"))
 
-class Config:
-    db: str
-    batch: int
+    class Config:
+        db: str
+        batch: int
 
-@pure
-def parse_arg(raw: str) -> Result[int, str]:
-    if raw.isdigit():
-        return Ok(int(raw))
-    return Err(f"not a number: {raw}")
+    @pure
+    def parse_arg(raw: str) -> Result[int, str]:
+        if raw.isdigit():
+            return Ok(int(raw))
+        return Err(f"not a number: {raw}")
 
-@memo
-def fib(n: int) -> int:
-    if n < 2:
-        return n
-    return fib(n - 1) + fib(n - 2)
+    @memo
+    def fib(n: int) -> int:
+        if n < 2:
+            return n
+        return fib(n - 1) + fib(n - 2)
 
-def main() -> None:
-    let cfg: Config = Config(db=DB_URL, batch=MAX_BATCH)
+    def main() -> None:
+        let cfg: Config = Config(db=DB_URL, batch=MAX_BATCH)
 
-    match parse_arg(sys.argv[1] if len(sys.argv) > 1 else "10"):
-        case Ok(n):
-            let series: list[int] = [fib(i) for i in range(n)]
-            let arr: np.ndarray = np.array(series)
-            print(arr |> np.diff() |> np.max())
-        case Err(msg):
-            print(f"bad input: {msg}")
+        match parse_arg(sys.argv[1] if len(sys.argv) > 1 else "10"):
+            case Ok(n):
+                let series: list[int] = [fib(i) for i in range(n)]
+                let arr: np.ndarray = np.array(series)
+                print(arr |> np.diff() |> np.max())
+            case Err(msg):
+                print(f"bad input: {msg}")
 
-if __name__ == "__main__":
-    main()
-```
+    if __name__ == "__main__":
+        main()
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    from __future__ import annotations
+    from typhon_runtime import Ok, Err, Result
+    import dataclasses
+    import functools
+    from typhon_runtime.lazy import lazy_import as __typhon_lazy_import
+    import sys
+
+    np = __typhon_lazy_import("numpy")
+    DB_URL: str = "postgresql://localhost/app"   # inlined from $DATABASE_URL at build
+    MAX_BATCH: int = 100                          # inlined from env("MAX_BATCH", "100")
+
+
+    @dataclasses.dataclass(slots=True)
+    class Config:
+        db: str
+        batch: int
+
+
+    def parse_arg(raw: str) -> Result[int, str]:
+        if raw.isdigit():
+            return Ok(int(raw))
+        return Err(f"not a number: {raw}")
+
+
+    @functools.cache
+    def fib(n: int) -> int:
+        if n < 2:
+            return n
+        return fib(n - 1) + fib(n - 2)
+
+
+    def main() -> None:
+        cfg: Config = Config(db=DB_URL, batch=MAX_BATCH)
+        match parse_arg(sys.argv[1] if len(sys.argv) > 1 else "10"):
+            case Ok(n):
+                series: list[int] = [fib(i) for i in range(n)]
+                arr: np.ndarray = np.array(series)
+                print(np.max(np.diff(arr)))
+            case Err(msg):
+                print(f"bad input: {msg}")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+  </TabItem>
+</Tabs>
+
+Every Typhon-specific feature on the page is visible in the lowering: `comptime let` becomes an inlined literal, `lazy import` rewrites to a `__typhon_lazy_import` proxy, `@pure` disappears (the verdict lives in the checker), `@memo` becomes `@functools.cache`, and the pipe chain `arr |> np.diff() |> np.max()` folds to `np.max(np.diff(arr))`.
 
 What this brings together:
 

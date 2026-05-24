@@ -328,35 +328,71 @@ For most domain modelling, prefer **sealed unions** ([Sealed Unions and Match](/
 
 A worked example: a tiny user system that mixes a `model` (for the API), a `class` (for internal state), and `impl` blocks for methods.
 
-```python
-# src/users.ty
-from datetime import datetime
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    # src/users.ty
+    from datetime import datetime
 
-model UserInput:
-    email: str
-    name: str = "anon"
+    model UserInput:
+        email: str
+        name: str = "anon"
 
-class User:
-    id: int
-    email: str
-    name: str
-    created_at: datetime
+    class User:
+        id: int
+        email: str
+        name: str
+        created_at: datetime
 
-impl User:
-    def display(self) -> str:
-        return f"{self.name} <{self.email}>"
+    impl User:
+        def display(self) -> str:
+            return f"{self.name} <{self.email}>"
 
-    def age_seconds(self, now: datetime) -> float:
-        return (now - self.created_at).total_seconds()
+        def age_seconds(self, now: datetime) -> float:
+            return (now - self.created_at).total_seconds()
 
-def create(input: UserInput, id: int) -> User:
-    return User(
-        id=id,
-        email=input.email,
-        name=input.name,
-        created_at=datetime.now(),
-    )
-```
+    def create(input: UserInput, id: int) -> User:
+        return User(
+            id=id,
+            email=input.email,
+            name=input.name,
+            created_at=datetime.now(),
+        )
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    from __future__ import annotations
+    from pydantic import BaseModel, ConfigDict
+    import dataclasses
+    from datetime import datetime
+
+
+    class UserInput(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+        email: str
+        name: str = "anon"
+
+
+    @dataclasses.dataclass(slots=True)
+    class User:
+        id: int
+        email: str
+        name: str
+        created_at: datetime
+
+        def display(self) -> str:
+            return f"{self.name} <{self.email}>"
+
+        def age_seconds(self, now: datetime) -> float:
+            return (now - self.created_at).total_seconds()
+
+
+    def create(input: UserInput, id: int) -> User:
+        return User(id=id, email=input.email, name=input.name, created_at=datetime.now())
+    ```
+  </TabItem>
+</Tabs>
 
 Notes:
 

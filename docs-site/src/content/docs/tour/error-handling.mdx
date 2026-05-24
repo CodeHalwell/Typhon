@@ -216,58 +216,140 @@ The point: there is no PyPI dependency. Production servers run the emitted Pytho
 
 A small worked example: read a config file, parse a port number, and report errors clearly.
 
-```python
-import json
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    import json
 
-type ConfigError = NotFound | InvalidJson | MissingKey | BadPort
+    type ConfigError = NotFound | InvalidJson | MissingKey | BadPort
 
-class NotFound:
-    path: str
+    class NotFound:
+        path: str
 
-class InvalidJson:
-    detail: str
+    class InvalidJson:
+        detail: str
 
-class MissingKey:
-    key: str
+    class MissingKey:
+        key: str
 
-class BadPort:
-    raw: str
+    class BadPort:
+        raw: str
 
-def load(path: str) -> Result[dict[str, str], ConfigError]:
-    try:
-        with open(path) as f:
-            return Ok(json.load(f))
-    except FileNotFoundError:
-        return Err(NotFound(path=path))
-    except json.JSONDecodeError as e:
-        return Err(InvalidJson(detail=str(e)))
+    def load(path: str) -> Result[dict[str, str], ConfigError]:
+        try:
+            with open(path) as f:
+                return Ok(json.load(f))
+        except FileNotFoundError:
+            return Err(NotFound(path=path))
+        except json.JSONDecodeError as e:
+            return Err(InvalidJson(detail=str(e)))
 
-def get_port(cfg: dict[str, str]) -> Result[int, ConfigError]:
-    let raw: str? = cfg.get("port")
-    guard r = raw else:
-        return Err(MissingKey(key="port"))
-    if not r.isdigit():
-        return Err(BadPort(raw=r))
-    return Ok(int(r))
+    def get_port(cfg: dict[str, str]) -> Result[int, ConfigError]:
+        let raw: str? = cfg.get("port")
+        guard r = raw else:
+            return Err(MissingKey(key="port"))
+        if not r.isdigit():
+            return Err(BadPort(raw=r))
+        return Ok(int(r))
 
-def boot(path: str) -> Result[int, ConfigError]:
-    with cfg  = load(path)?,
-         port = get_port(cfg)?:
+    def boot(path: str) -> Result[int, ConfigError]:
+        with cfg  = load(path)?,
+             port = get_port(cfg)?:
+            return Ok(port)
+
+    def main() -> None:
+        match boot("config.json"):
+            case Ok(port):
+                print(f"listening on {port}")
+            case Err(NotFound(path)):
+                print(f"missing: {path}")
+            case Err(InvalidJson(detail)):
+                print(f"corrupt: {detail}")
+            case Err(MissingKey(key)):
+                print(f"config missing `{key}`")
+            case Err(BadPort(raw)):
+                print(f"`{raw}` is not a valid port")
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    from __future__ import annotations
+    from typhon_runtime import Ok, Err, Result
+    import dataclasses
+    from typhon_runtime import Err as __typhon_Err__
+    import json
+
+    type ConfigError = NotFound | InvalidJson | MissingKey | BadPort
+
+
+    @dataclasses.dataclass(slots=True)
+    class NotFound:
+        path: str
+
+
+    @dataclasses.dataclass(slots=True)
+    class InvalidJson:
+        detail: str
+
+
+    @dataclasses.dataclass(slots=True)
+    class MissingKey:
+        key: str
+
+
+    @dataclasses.dataclass(slots=True)
+    class BadPort:
+        raw: str
+
+
+    def load(path: str) -> Result[dict[str, str], ConfigError]:
+        try:
+            with open(path) as f:
+                return Ok(json.load(f))
+        except FileNotFoundError:
+            return Err(NotFound(path=path))
+        except json.JSONDecodeError as e:
+            return Err(InvalidJson(detail=str(e)))
+
+
+    def get_port(cfg: dict[str, str]) -> Result[int, ConfigError]:
+        raw: str | None = cfg.get("port")
+        __typhon_mguard_0 = raw
+        if __typhon_mguard_0 is None:
+            return Err(MissingKey(key="port"))
+        r = __typhon_mguard_0
+        if not r.isdigit():
+            return Err(BadPort(raw=r))
+        return Ok(int(r))
+
+
+    def boot(path: str) -> Result[int, ConfigError]:
+        __typhon_with_0__ = load(path)
+        if isinstance(__typhon_with_0__, __typhon_Err__):
+            return __typhon_with_0__
+        cfg = __typhon_with_0__.value
+        __typhon_with_1__ = get_port(cfg)
+        if isinstance(__typhon_with_1__, __typhon_Err__):
+            return __typhon_with_1__
+        port = __typhon_with_1__.value
         return Ok(port)
 
-def main() -> None:
-    match boot("config.json"):
-        case Ok(port):
-            print(f"listening on {port}")
-        case Err(NotFound(path)):
-            print(f"missing: {path}")
-        case Err(InvalidJson(detail)):
-            print(f"corrupt: {detail}")
-        case Err(MissingKey(key)):
-            print(f"config missing `{key}`")
-        case Err(BadPort(raw)):
-            print(f"`{raw}` is not a valid port")
-```
+
+    def main() -> None:
+        match boot("config.json"):
+            case Ok(port):
+                print(f"listening on {port}")
+            case Err(NotFound(path)):
+                print(f"missing: {path}")
+            case Err(InvalidJson(detail)):
+                print(f"corrupt: {detail}")
+            case Err(MissingKey(key)):
+                print(f"config missing `{key}`")
+            case Err(BadPort(raw)):
+                print(f"`{raw}` is not a valid port")
+    ```
+  </TabItem>
+</Tabs>
 
 The whole error-handling story shows up here:
 

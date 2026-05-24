@@ -51,26 +51,41 @@ Re-assert via annotation, narrowing, or cast:
 <Tabs>
   <TabItem label="Typhon">
     ```python
+    def mystery() -> int:
+        return 42
+
     def parse() -> int:
         unsafe:
             let v = mystery()
             let checked: int = int(v)
         return checked
+
+    def main() -> None:
+        print(parse())
     ```
   </TabItem>
   <TabItem label="Emitted Python">
     ```python
-    if True:
-        data = some_untyped_lib.fetch()
-        first = data[0]
-        tag = first.get("tag")
+    def mystery() -> int:
+        return 42
+
+
+    def parse() -> int:
+        if True:
+            v = mystery()
+            checked: int = int(v)
+        return checked
+
+
+    def main() -> None:
+        print(parse())
     ```
   </TabItem>
 </Tabs>
 
 ## Lowering
 
-`unsafe:` lowers to `if True:` so scope rules are preserved:
+`unsafe:` lowers to `if True:` so scope rules are preserved.
 
 ## When to use
 
