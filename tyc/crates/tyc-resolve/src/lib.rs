@@ -1974,6 +1974,25 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
         }
         Stmt::Match(m) => {
             walk_expr(r, scope, &m.subject);
+            // Apps-feedback 2026-05: at most one case arm runs at
+            // runtime, so a `let key: ...` in arm A must not shadow a
+            // `let key: ...` in arm B. The type checker already enters
+            // a fresh `env` scope per arm (tyc-types `Stmt::Match`
+            // handler), but the resolver was sharing one scope across
+            // every arm, so sibling-arm `let`s fired
+            // `tyc::no_block_shadow` (and same-named pattern captures
+            // fired `tyc::pattern_shadows_outer`).
+            //
+            // Drain bindings added during each arm into a side buffer
+            // so the next arm starts from the pre-match snapshot.
+            // After every arm has walked, splice the drained bindings
+            // back into the scope so downstream reference resolution
+            // (`report_unknown_names`) still finds them. Each arm
+            // declares its own names — they coexist in the final
+            // bindings vec, but the shadow check only sees the
+            // pre-match snapshot while a given arm is walking.
+            let pre_match_len = r.scopes[scope].bindings.len();
+            let mut arm_local_bindings: Vec<Binding> = Vec::new();
             for case in &m.cases {
                 // Mark the case pattern so the declare path knows
                 // shadowing trips `pattern_shadows_outer`, not the
@@ -1987,7 +2006,11 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
                 for s in &case.body {
                     walk_stmt(r, scope, s);
                 }
+                let drained: Vec<Binding> =
+                    r.scopes[scope].bindings.drain(pre_match_len..).collect();
+                arm_local_bindings.extend(drained);
             }
+            r.scopes[scope].bindings.extend(arm_local_bindings);
         }
         _ => {}
     }

@@ -700,6 +700,24 @@ fn build_external_shapes(
     };
     // Module-scope bindings live in scope 0.
     let bindings = &resolved.scopes[0].bindings;
+    // Per-source-module reverse map: original exported name → local
+    // import name, so a `from foo import A as MyA` translates the
+    // variants list of an imported sealed union into the same local
+    // names the consumer's `class_shapes` is keyed under.
+    let mut local_by_module: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, String>,
+    > = std::collections::HashMap::new();
+    for b in bindings {
+        if let Some(info) = &b.import_info {
+            if let Some(member) = info.member.as_ref() {
+                local_by_module
+                    .entry(info.module.clone())
+                    .or_default()
+                    .insert(member.clone(), b.name.clone());
+            }
+        }
+    }
     for b in bindings {
         let Some(info) = &b.import_info else { continue };
         let Some(member) = info.member.as_ref() else {
@@ -723,10 +741,39 @@ fn build_external_shapes(
                     .class_type_params
                     .insert(b.name.clone(), tps.clone());
             }
+            // If the foreign module declared `Foo` as an interface
+            // (Protocol-shaped), record that fact — together with
+            // the source's `@runtime_checkable` opt-in — under the
+            // local import name so cross-module structural
+            // conformance matches the in-module checker and
+            // `isinstance(x, ImportedInterface)` is allowed when
+            // the source author opted in.
+            if let Some(runtime_checkable) = module_shapes.interfaces.get(member) {
+                external
+                    .interfaces
+                    .insert(b.name.clone(), *runtime_checkable);
+            }
         } else if let Some(arity) = module_shapes.function_arities.get(member) {
             external
                 .function_arities
                 .insert(b.name.clone(), arity.clone());
+        } else if let Some(variants) = module_shapes.sealed_unions.get(member) {
+            // Sealed-union alias imported by name. Re-key under the
+            // local import name *and* translate each variant name
+            // through the per-module local-name map so
+            // `from foo import A as MyA, Event` is seen as
+            // `Event = MyA | …` by the consumer's checker.
+            let remap = local_by_module.get(&info.module);
+            let mapped: Vec<String> = variants
+                .iter()
+                .map(|v| {
+                    remap
+                        .and_then(|m| m.get(v))
+                        .cloned()
+                        .unwrap_or_else(|| v.clone())
+                })
+                .collect();
+            external.sealed_unions.insert(b.name.clone(), mapped);
         }
     }
     external

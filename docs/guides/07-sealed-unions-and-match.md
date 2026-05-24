@@ -104,6 +104,26 @@ def classify(s: Shape) -> str:
 
 Guards do not relax exhaustiveness — you still need a case for every variant that *isn't* covered by a guard.
 
+### Positional vs. keyword patterns
+
+Positional patterns must match the declared field count exactly:
+
+```python
+case Triangle(base, height): ...    # ✅ Triangle has 2 fields, 2 patterns
+case Triangle(base, _, height): ... # ❌ tyc::arg_count
+```
+
+This is sometimes noisy: when a dataclass grows a new field, every `case Foo(a, b, c)` site has to add an underscore. Use **keyword patterns** instead — they bind only the fields you name, in any order:
+
+```python
+case TaskStarted(task_id=tid, worker=w):     # ✅ ignores `attempt` and `at`
+    return f"task {tid} on {w}"
+case TaskStarted(task_id=tid):               # ✅ binds just `task_id`
+    return f"task {tid}"
+```
+
+Python's `match` supports the keyword form natively (no `__match_args__` workaround required), and Typhon parses and type-checks it directly. Prefer the keyword form for any variant with more than two or three fields — it survives field additions without churn at every match site.
+
 ## Variants with shared methods
 
 `impl` blocks attach to individual variants:
