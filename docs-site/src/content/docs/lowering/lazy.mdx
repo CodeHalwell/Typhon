@@ -104,20 +104,20 @@ Why not `functools.cached_property`? Because `cached_property` is instance-scope
         config_path: str
 
     impl Server:
-        lazy let parsed_config: Config:
-            return load_config(self.config_path)
+        lazy let parsed_config: Config = load_config(self.config_path)
     ```
   </TabItem>
   <TabItem label="Emitted">
     ```python
-    from functools import cached_property
-    from dataclasses import dataclass
+    import dataclasses
+    from functools import cached_property as _typhon_cached_property
 
-    @dataclass(slots=True)
+
+    @dataclasses.dataclass()
     class Server:
         config_path: str
 
-        @cached_property
+        @_typhon_cached_property
         def parsed_config(self) -> Config:
             return load_config(self.config_path)
     ```

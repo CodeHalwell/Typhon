@@ -55,21 +55,50 @@ let anon: User = User(id=2)               # name defaults to "anon", email to No
 
 ## Adding methods with `impl`
 
-Methods live in a separate `impl` block. Take an explicit `self` parameter and access fields as `self.NAME`:
+Methods live in a separate `impl` block. Take an explicit `self` parameter and access fields as `self.NAME`. The desugarer **merges every `impl` block back into the class** at compile time:
 
-```python
-class User:
-    id: int
-    name: str
-    email: str?
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    class User:
+        id: int
+        name: str
+        email: str?
 
-impl User:
-    def display(self) -> str:
-        return f"{self.name} <{self.email}>" if self.email is not None else self.name
+    impl User:
+        def display(self) -> str:
+            return f"{self.name} <{self.email}>" if self.email is not None else self.name
 
-    def is_admin(self) -> bool:
-        return self.id == 0
-```
+        def is_admin(self) -> bool:
+            return self.id == 0
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    from __future__ import annotations
+    import dataclasses
+
+
+    @dataclasses.dataclass(slots=True)
+    class User:
+        id: int
+        name: str
+        email: str | None
+
+        def display(self) -> str:
+            return (
+                f"{self.name} <{self.email}>"
+                if self.email is not None
+                else self.name
+            )
+
+        def is_admin(self) -> bool:
+            return self.id == 0
+    ```
+  </TabItem>
+</Tabs>
+
+(`email: str?` lowers to `str | None`; it does **not** auto-default to `None` — callers must pass an explicit `email=` argument. Use `email: str? = None` if you want the default.)
 
 Calls look normal:
 
@@ -77,23 +106,6 @@ Calls look normal:
 let u: User = User(id=1, name="Alice", email="alice@example.com")
 print(u.display())            # Alice <alice@example.com>
 print(u.is_admin())           # False
-```
-
-The desugarer **merges the `impl` block into the class**:
-
-```python
-# Emitted
-@dataclass(slots=True)
-class User:
-    id: int
-    name: str
-    email: str | None = None
-
-    def display(self) -> str:
-        return f"{self.name} <{self.email}>" if self.email is not None else self.name
-
-    def is_admin(self) -> bool:
-        return self.id == 0
 ```
 
 You can split `impl` blocks across files (e.g. keep `User` in `models.ty` and add domain methods from `auth.ty`). The desugarer collects them all.

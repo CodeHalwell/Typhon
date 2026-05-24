@@ -5,25 +5,39 @@ sidebar:
   order: 9
 ---
 
-import { Aside } from '@astrojs/starlight/components';
+import { Aside, TabItem, Tabs } from '@astrojs/starlight/components';
 
 `unsafe:` is Typhon's escape hatch for talking to code the type system can't reason about — typically untyped third-party libraries or genuinely dynamic Python. It is a **lexical region**, not a per-value cast, with a hidden marker that prevents `Any` from leaking into typed code.
 
 ## The shape
 
-```python
-import some_untyped_lib
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    import some_untyped_lib
 
-def f() -> int:
-    unsafe:
-        let raw = some_untyped_lib.fetch()       # would be implicit_any outside
-        let first = raw[0]
-        let value = first.get("count")
-    # `value` carries an `Unsafe[T]` marker — must re-assert before crossing out
+    def f() -> int:
+        unsafe:
+            let raw = some_untyped_lib.fetch()       # would be implicit_any outside
+            let first = raw[0]
+            let value = first.get("count")
+        # `value` carries an `Unsafe[T]` marker — must re-assert before crossing out
 
-    let count: int = int(value)                  # re-assertion
+        let count: int = int(value)                  # re-assertion
+        return count
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    if True:
+        raw = some_untyped_lib.fetch()
+        first = raw[0]
+        value = first.get("count")
+    count: int = int(value)
     return count
-```
+    ```
+  </TabItem>
+</Tabs>
 
 What happens:
 
@@ -32,16 +46,6 @@ What happens:
 3. **Crossing out of the block** into a non-`unsafe` context requires re-assertion: an annotation, a narrowing check, or an explicit cast.
 
 The block lowers to `if True:` so scope rules are preserved:
-
-```python
-# Emitted Python
-if True:
-    raw = some_untyped_lib.fetch()
-    first = raw[0]
-    value = first.get("count")
-count: int = int(value)
-return count
-```
 
 ## Why a lexical region, not a per-value cast?
 

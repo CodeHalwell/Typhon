@@ -59,35 +59,39 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 ## The runtime helper
 
-```python
-# build/typhon_runtime/tasks.py
-import asyncio
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    # build/typhon_runtime/tasks.py
+    import asyncio
 
-_BACKGROUND: set[asyncio.Task] = set()
+    _BACKGROUND: set[asyncio.Task] = set()
 
-def spawn(coro):
-    task = asyncio.create_task(coro)
-    _BACKGROUND.add(task)
-    task.add_done_callback(_BACKGROUND.discard)
-    return task
-```
+    def spawn(coro):
+        task = asyncio.create_task(coro)
+        _BACKGROUND.add(task)
+        task.add_done_callback(_BACKGROUND.discard)
+        return task
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    from typhon_runtime import tasks_threaded as tasks
+
+    def heavy_work(): ...
+
+    def run() -> None:
+        fut = tasks.spawn(heavy_work)
+        # ...
+    ```
+  </TabItem>
+</Tabs>
 
 10 lines, generated into your `build/` tree. Solves the well-known footgun: Python's event loop holds only **weak references** to tasks. A fire-and-forget `asyncio.create_task(...)` whose handle is dropped can be garbage-collected mid-flight. The `_BACKGROUND` set holds strong references; the done-callback clears entries on completion.
 
 ## Free-threaded variant
 
 When `[python] free-threaded = true`, `go` on a CPU-bound function lowers to `ThreadPoolExecutor.submit` instead of `asyncio.Task`. The runtime helper has a parallel `Future` registry. The emitter inserts `sys._is_gil_enabled()` runtime checks to fall back to sequential execution if run under a GIL build.
-
-```python
-# Emitted (free-threaded variant)
-from typhon_runtime import tasks_threaded as tasks
-
-def heavy_work(): ...
-
-def run() -> None:
-    fut = tasks.spawn(heavy_work)
-    # ...
-```
 
 ## Why never `asyncio.create_task` directly?
 

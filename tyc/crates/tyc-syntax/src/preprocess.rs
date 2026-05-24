@@ -3409,15 +3409,6 @@ pub fn expand_question_ops(source: &str) -> String {
             continue;
         }
 
-        // The character before the `?` must be `)` for it to be the propagation
-        // operator.  `T?` (nullable sugar) follows an alphanumeric/`_`/`]` char
-        // and is left alone.
-        let before_q = &content[..content.len() - 1];
-        if !matches!(before_q.chars().last(), Some(')')) {
-            result.push_str(line);
-            continue;
-        }
-
         // Compute indentation to reproduce the correct nesting.
         let indent_len = content.find(|c: char| !c.is_whitespace()).unwrap_or(0);
         let indent = &content[..indent_len];
@@ -3434,6 +3425,49 @@ pub fn expand_question_ops(source: &str) -> String {
             }
             None => (None, expr_part.to_owned()),
         };
+
+        // The character before the `?` must be `)` for it to be unambiguously
+        // the propagation operator (`f()?`). `T?` (nullable type sugar)
+        // follows an alphanumeric / `_` / `]` char. Disambiguate the
+        // alphanumeric / `]` case by RHS context:
+        //
+        // - `let x: int = a?`     — `a?` is in value-position (after `=`),
+        //                           so the trailing `?` is propagation.
+        // - `let x: int? = a`     — `int?` is in the annotation (before `=`),
+        //                           so the trailing `?` would never reach here
+        //                           (it's not at end of line in that shape).
+        // - `let x: list[int]?`   — no `=`, ends with `]?`, treated as nullable.
+        // - `return user_r?`      — no `=`; allow bare-identifier propagation.
+        //
+        // Keep `T?` annotations as a no-op when there is no assignment AND the
+        // expression looks like a type rather than a value.
+        let before_q = &content[..content.len() - 1];
+        let last_ch = before_q.chars().last();
+        let trailing_is_close_paren = matches!(last_ch, Some(')'));
+        if !trailing_is_close_paren {
+            // We're at `<expr>?` where <expr> ends with an identifier, `]`,
+            // or `_`. Decide whether this is value-position propagation or
+            // type-position nullable sugar.
+            let is_value_position = match (&lhs, rhs.as_str()) {
+                // assignment: `a = X?` → X is value position
+                (Some(_), _) => true,
+                // bare statement: `return X?`, `yield X?`, `Ok(X)?`, etc.
+                // Detect common value-position prefixes.
+                (None, r) => {
+                    let trimmed = r.trim_start();
+                    trimmed.starts_with("return ")
+                        || trimmed.starts_with("yield ")
+                        || trimmed.starts_with("raise ")
+                }
+            };
+            if !is_value_position {
+                // No assignment AND no value-position keyword → leave alone
+                // (annotation form like `let x: list[int]?` or a bare type
+                // alias position).
+                result.push_str(line);
+                continue;
+            }
+        }
 
         // Generate a unique temporary variable name.
         let tmp = format!("__typhon_q_{counter}__");

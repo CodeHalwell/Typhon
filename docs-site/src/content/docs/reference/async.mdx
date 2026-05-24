@@ -5,6 +5,8 @@ sidebar:
   order: 12
 ---
 
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
 Typhon's async story is **explicit, not inferred**. A function is async because you said so. The keywords:
 
 - `async def` / `await` — Python's standard coroutine machinery.
@@ -28,29 +30,33 @@ Static checks:
 
 A block that awaits multiple expressions in parallel:
 
-```python
-async def f(uid: int) -> Dashboard:
-    gather:
-        user   = fetch_user(uid)
-        posts  = fetch_posts(uid)
-        notifs = fetch_notifs(uid)
-    return Dashboard(user=user, posts=posts, notifs=notifs)
-```
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    async def f(uid: int) -> Dashboard:
+        gather:
+            user   = fetch_user(uid)
+            posts  = fetch_posts(uid)
+            notifs = fetch_notifs(uid)
+        return Dashboard(user=user, posts=posts, notifs=notifs)
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    async with asyncio.TaskGroup() as _tg:
+        _t_user   = _tg.create_task(fetch_user(uid))
+        _t_posts  = _tg.create_task(fetch_posts(uid))
+        _t_notifs = _tg.create_task(fetch_notifs(uid))
+    user   = _t_user.result()
+    posts  = _t_posts.result()
+    notifs = _t_notifs.result()
+    ```
+  </TabItem>
+</Tabs>
 
 Bindings inside `gather:` are single-assignment (no `let`/`mut` required — desugarer wraps the whole block as a fresh scope).
 
 ### Lowering
-
-```python
-# Emitted (default)
-async with asyncio.TaskGroup() as _tg:
-    _t_user   = _tg.create_task(fetch_user(uid))
-    _t_posts  = _tg.create_task(fetch_posts(uid))
-    _t_notifs = _tg.create_task(fetch_notifs(uid))
-user   = _t_user.result()
-posts  = _t_posts.result()
-notifs = _t_notifs.result()
-```
 
 `TaskGroup` is the safe default: any task's failure cancels the siblings.
 
