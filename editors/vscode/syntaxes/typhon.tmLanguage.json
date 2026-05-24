@@ -20,15 +20,25 @@
         { "include": "#extend-declaration" },
         { "include": "#binding-declaration" },
         { "include": "#type-alias" },
+        { "include": "#field-declaration" },
         { "include": "#expression" }
       ]
     },
     "expression": {
+      "comment": "Top-level expression context. Tries type-annotation first so `:` after a word is treated as `name: Type` before `expression-inner` falls back to a plain colon. Inside subscripts (`xs[1:4]`), dict literals (`{k: v}`), and lambda bodies (`lambda x: x+1`) we deliberately switch to `expression-inner`, which omits type-annotation so the colon keeps its real meaning.",
+      "patterns": [
+        { "include": "#type-annotation" },
+        { "include": "#expression-inner" }
+      ]
+    },
+
+    "expression-inner": {
       "patterns": [
         { "include": "#comments" },
         { "include": "#strings" },
         { "include": "#fstrings" },
         { "include": "#numbers" },
+        { "include": "#lambda" },
         { "include": "#typhon-keywords" },
         { "include": "#python-keywords" },
         { "include": "#control-keywords" },
@@ -40,10 +50,86 @@
         { "include": "#try-operator" },
         { "include": "#pipe-operator" },
         { "include": "#operators" },
+        { "include": "#subscript" },
+        { "include": "#dict-or-set-literal" },
+        { "include": "#parens" },
         { "include": "#function-call" },
-        { "include": "#type-annotation" },
         { "include": "#identifiers" },
         { "include": "#punctuation" }
+      ]
+    },
+
+    "parens": {
+      "comment": "Balanced `( ... )` in expression contexts: function-call argument lists, parenthesised expressions, tuples. Must run before `#punctuation` so that nested parens inside a parameter list default (e.g. `s: T = Depends(x)`) consume their own `)` rather than letting it terminate the outer parameter-list.",
+      "begin": "\\(",
+      "beginCaptures": {
+        "0": { "name": "punctuation.section.parens.begin.typhon" }
+      },
+      "end": "\\)",
+      "endCaptures": {
+        "0": { "name": "punctuation.section.parens.end.typhon" }
+      },
+      "patterns": [
+        { "include": "#expression-inner" }
+      ]
+    },
+
+    "subscript": {
+      "comment": "`[ ... ]` after a value: subscript, slice, or list literal. Colons inside are slice separators, never type annotations, so we handle `:` explicitly before recursing.",
+      "begin": "\\[",
+      "beginCaptures": {
+        "0": { "name": "punctuation.section.brackets.begin.typhon" }
+      },
+      "end": "\\]",
+      "endCaptures": {
+        "0": { "name": "punctuation.section.brackets.end.typhon" }
+      },
+      "patterns": [
+        {
+          "name": "keyword.operator.slice.typhon",
+          "match": ":"
+        },
+        { "include": "#expression-inner" }
+      ]
+    },
+
+    "dict-or-set-literal": {
+      "comment": "`{ ... }`: dict, set, dict-comprehension, or set-comprehension. The `:` between a dict key and value is a separator, not a type annotation, so we capture it before falling through to expression-inner.",
+      "begin": "\\{",
+      "beginCaptures": {
+        "0": { "name": "punctuation.section.braces.begin.typhon" }
+      },
+      "end": "\\}",
+      "endCaptures": {
+        "0": { "name": "punctuation.section.braces.end.typhon" }
+      },
+      "patterns": [
+        {
+          "name": "punctuation.separator.dict.typhon",
+          "match": ":"
+        },
+        { "include": "#expression-inner" }
+      ]
+    },
+
+    "lambda": {
+      "comment": "Lambda head: `lambda params: body`. The trailing `:` is a body separator, NOT a type annotation, so the lambda begin/end consumes the head and ends right at the `:` — the body afterwards is parsed by the surrounding expression context. Param names are only matched when they appear in a real parameter position: immediately after `lambda` or after `,`, and followed by `,`/`=`/`:`. Anything else in the head (default-value expressions like `lambda x=foo(a): ...` or constants like `lambda x=True: ...`) falls through to `#expression-inner` so it gets normal expression scoping rather than being mis-tagged as a parameter.",
+      "begin": "\\b(lambda)\\b",
+      "beginCaptures": {
+        "1": { "name": "storage.type.function.lambda.typhon" }
+      },
+      "end": "(:)|$|(?=[)\\]}])",
+      "endCaptures": {
+        "1": { "name": "punctuation.separator.lambda.typhon" }
+      },
+      "patterns": [
+        {
+          "match": "(?<=\\blambda|,)\\s*([\\p{L}_][\\p{L}\\p{N}_]*)(?=\\s*[,=:])",
+          "captures": {
+            "1": { "name": "variable.parameter.lambda.typhon" }
+          }
+        },
+        { "include": "#expression-inner" }
       ]
     },
 
@@ -76,7 +162,7 @@
         },
         {
           "name": "meta.decorator.typhon",
-          "begin": "^\\s*(@)\\s*([A-Za-z_][\\w.]*)",
+          "begin": "^\\s*(@)\\s*([\\p{L}_][\\p{L}\\p{N}_]*(?:\\.[\\p{L}_][\\p{L}\\p{N}_]*)*)",
           "beginCaptures": {
             "1": { "name": "punctuation.definition.decorator.typhon" },
             "2": { "name": "entity.name.function.decorator.typhon" }
@@ -90,7 +176,38 @@
     },
 
     "import": {
+      "comment": "Whole `import X`, `import X as Y`, `from X.Y import a, b as c, *`, and the `lazy` variants live here. Module paths and imported names take `entity.name.namespace` so themes colour them distinctly instead of bleeding into the plain identifier scope. A separate multi-line form is tried first so that `from X import (\\n  a,\\n  b,\\n)` keeps the import meta-scope and namespace highlighting across continuation lines.",
       "patterns": [
+        {
+          "name": "meta.import.typhon",
+          "begin": "\\b(?:(lazy)\\s+)?(from)\\s+([\\p{L}_][\\p{L}\\p{N}_]*(?:\\.[\\p{L}_][\\p{L}\\p{N}_]*)*)\\s+(import)\\s*(\\()",
+          "beginCaptures": {
+            "1": { "name": "keyword.other.lazy.typhon" },
+            "2": { "name": "keyword.control.import.typhon" },
+            "3": { "name": "entity.name.namespace.typhon" },
+            "4": { "name": "keyword.control.import.typhon" },
+            "5": { "name": "punctuation.section.parens.begin.typhon" }
+          },
+          "end": "(\\))",
+          "endCaptures": {
+            "1": { "name": "punctuation.section.parens.end.typhon" }
+          },
+          "patterns": [
+            { "include": "#comments" },
+            {
+              "name": "keyword.control.import.typhon",
+              "match": "\\b(as)\\b"
+            },
+            {
+              "name": "entity.name.namespace.typhon",
+              "match": "\\b[\\p{L}_][\\p{L}\\p{N}_]*\\b"
+            },
+            {
+              "name": "punctuation.separator.comma.typhon",
+              "match": ","
+            }
+          ]
+        },
         {
           "name": "meta.import.typhon",
           "begin": "\\b(?:(lazy)\\s+)?(from|import)\\b",
@@ -104,7 +221,14 @@
               "name": "keyword.control.import.typhon",
               "match": "\\b(import|as|from)\\b"
             },
-            { "include": "#identifiers" },
+            {
+              "name": "keyword.operator.wildcard.typhon",
+              "match": "\\*"
+            },
+            {
+              "name": "entity.name.namespace.typhon",
+              "match": "\\b[\\p{L}_][\\p{L}\\p{N}_]*(?:\\.[\\p{L}_][\\p{L}\\p{N}_]*)*\\b"
+            },
             { "include": "#punctuation" }
           ]
         }
@@ -112,8 +236,8 @@
     },
 
     "class-declaration": {
-      "comment": "Matches every supported class form: bare `class Foo`, `pub class Foo`, `plain class Bag`, `class! MyModel` (raw / framework-base marker), `model ApiUser`, with an optional trailing `frozen` modifier (`class P frozen:` -> dataclass(frozen=True)). Capture group 5 picks up the name; capture group 6 catches the `frozen` keyword after the name.",
-      "begin": "\\b(?:(pub)\\s+)?(?:(plain)\\s+)?(class|model)(!)?\\s+([A-Za-z_]\\w*)(?:\\s+(frozen))?",
+      "comment": "Matches every supported class form: bare `class Foo`, `pub class Foo`, `plain class Bag`, `class! MyModel` (raw / framework-base marker), `model ApiUser`, with optional `[T, U]` generics after the name and an optional trailing `frozen` modifier (`class P frozen:` -> dataclass(frozen=True)). Capture group 5 picks up the name; capture group 6 catches the `frozen` keyword.",
+      "begin": "\\b(?:(pub)\\s+)?(?:(plain)\\s+)?(class|model)(!)?\\s+([\\p{L}_][\\p{L}\\p{N}_]*)(?:\\s+(frozen))?",
       "beginCaptures": {
         "1": { "name": "storage.modifier.pub.typhon" },
         "2": { "name": "storage.modifier.plain.typhon" },
@@ -122,68 +246,91 @@
         "5": { "name": "entity.name.type.class.typhon" },
         "6": { "name": "storage.modifier.frozen.typhon" }
       },
-      "end": ":|$",
+      "end": "(:)|$",
       "endCaptures": {
-        "0": { "name": "punctuation.section.class.begin.typhon" }
+        "1": { "name": "punctuation.section.class.begin.typhon" }
       },
       "patterns": [
+        { "include": "#generic-parameters" },
         { "include": "#expression" }
       ]
     },
 
     "newtype-declaration": {
-      "comment": "`newtype Name = Base` introduces a nominal alias over a primitive. Highlighting the keyword distinctly and tagging the LHS as an entity.name.type makes the intent obvious at a glance.",
-      "match": "\\b(newtype)\\s+([A-Za-z_]\\w*)\\s*=",
-      "captures": {
+      "comment": "`newtype Name = Base` introduces a nominal alias over a primitive. The RHS is a type, so it's parsed in type-expression so `|` reads as a type union and brackets read as typeparameters rather than slice/subscript.",
+      "begin": "\\b(newtype)\\s+([\\p{L}_][\\p{L}\\p{N}_]*)\\s*(=)",
+      "beginCaptures": {
         "1": { "name": "storage.type.newtype.typhon" },
-        "2": { "name": "entity.name.type.newtype.typhon" }
-      }
+        "2": { "name": "entity.name.type.newtype.typhon" },
+        "3": { "name": "keyword.operator.assignment.typhon" }
+      },
+      "end": "$|(?=#)",
+      "patterns": [
+        { "include": "#type-expression" }
+      ]
     },
 
     "interface-declaration": {
-      "begin": "\\b(interface)\\s+([A-Za-z_]\\w*)",
+      "begin": "\\b(interface)\\s+([\\p{L}_][\\p{L}\\p{N}_]*)",
       "beginCaptures": {
         "1": { "name": "storage.type.interface.typhon" },
         "2": { "name": "entity.name.type.interface.typhon" }
       },
-      "end": ":|$",
+      "end": "(:)|$",
+      "endCaptures": {
+        "1": { "name": "punctuation.section.interface.begin.typhon" }
+      },
       "patterns": [
+        { "include": "#generic-parameters" },
         { "include": "#expression" }
       ]
     },
 
     "impl-declaration": {
-      "begin": "\\b(impl)\\s+([A-Za-z_]\\w*)",
+      "comment": "`impl Foo:` or `impl[T] Box[T]:`. The optional `[T, ...]` immediately after `impl` is the impl's own generic parameter list; the `[T]` on the target type is part of the type reference and is handled by the type-expression include.",
+      "begin": "\\b(impl)(?:\\s*(\\[)([^\\]]*)(\\]))?\\s+([\\p{L}_][\\p{L}\\p{N}_]*)",
       "beginCaptures": {
         "1": { "name": "storage.type.impl.typhon" },
-        "2": { "name": "entity.name.type.class.typhon" }
+        "2": { "name": "punctuation.definition.typeparameters.begin.typhon" },
+        "3": { "name": "entity.name.type.parameter.typhon" },
+        "4": { "name": "punctuation.definition.typeparameters.end.typhon" },
+        "5": { "name": "entity.name.type.class.typhon" }
       },
-      "end": ":|$",
+      "end": "(:)|$",
+      "endCaptures": {
+        "1": { "name": "punctuation.section.impl.begin.typhon" }
+      },
       "patterns": [
-        { "include": "#expression" }
+        { "include": "#type-expression" }
       ]
     },
 
     "extend-declaration": {
-      "begin": "\\b(extend)\\s+([A-Za-z_]\\w*)",
+      "begin": "\\b(extend)\\s+([\\p{L}_][\\p{L}\\p{N}_]*)",
       "beginCaptures": {
         "1": { "name": "storage.type.extend.typhon" },
         "2": { "name": "entity.name.type.class.typhon" }
       },
-      "end": ":|$",
+      "end": "(:)|$",
+      "endCaptures": {
+        "1": { "name": "punctuation.section.extend.begin.typhon" }
+      },
       "patterns": [
-        { "include": "#expression" }
+        { "include": "#type-expression" }
       ]
     },
 
     "function-declaration": {
-      "begin": "\\b(?:(async)\\s+)?(def)\\s+([A-Za-z_]\\w*)",
+      "begin": "\\b(?:(async)\\s+)?(def)\\s+([\\p{L}_][\\p{L}\\p{N}_]*)",
       "beginCaptures": {
         "1": { "name": "storage.type.function.async.typhon" },
         "2": { "name": "storage.type.function.typhon" },
         "3": { "name": "entity.name.function.typhon" }
       },
-      "end": ":|$",
+      "end": "(:)|$",
+      "endCaptures": {
+        "1": { "name": "punctuation.section.function.begin.typhon" }
+      },
       "patterns": [
         { "include": "#generic-parameters" },
         { "include": "#parameter-list" },
@@ -192,20 +339,29 @@
     },
 
     "generic-parameters": {
-      "begin": "<",
+      "comment": "PEP-695 / Typhon generic parameter list: `def foo[T, U](...)`, `class Box[T]:`, `impl[T] Box[T]:`, `type Map[K, V] = dict[K, V]`. Also handles type-var bounds: `def largest[T: int](xs)` — the `:` after a type parameter is a bound separator, and the bound itself is parsed as a type-expression.",
+      "begin": "\\[",
       "beginCaptures": {
-        "0": { "name": "punctuation.definition.generic.begin.typhon" }
+        "0": { "name": "punctuation.definition.typeparameters.begin.typhon" }
       },
-      "end": ">",
+      "end": "\\]",
       "endCaptures": {
-        "0": { "name": "punctuation.definition.generic.end.typhon" }
+        "0": { "name": "punctuation.definition.typeparameters.end.typhon" }
       },
       "patterns": [
         {
           "name": "entity.name.type.parameter.typhon",
           "match": "\\b[A-Z]\\w*\\b"
         },
-        { "include": "#expression" }
+        {
+          "name": "punctuation.separator.bound.typhon",
+          "match": ":"
+        },
+        {
+          "name": "punctuation.separator.comma.typhon",
+          "match": ","
+        },
+        { "include": "#type-expression" }
       ]
     },
 
@@ -224,7 +380,7 @@
           "name": "variable.language.special.self.typhon"
         },
         {
-          "match": "([A-Za-z_]\\w*)\\s*(?=[:=,)])",
+          "match": "([\\p{L}_][\\p{L}\\p{N}_]*)\\s*(?=[:=,)])",
           "captures": {
             "1": { "name": "variable.parameter.typhon" }
           }
@@ -234,19 +390,21 @@
     },
 
     "return-arrow": {
+      "comment": "`-> ReturnType` after a function signature. The body is a type, not a general expression, so we feed it through type-expression — that way `Box[U]` gets `typeparameters` scopes rather than the `subscript` scopes used in value expressions.",
       "begin": "->",
       "beginCaptures": {
         "0": { "name": "keyword.operator.return-type.typhon" }
       },
       "end": "(?=:|$)",
       "patterns": [
-        { "include": "#expression" }
+        { "include": "#nullable-suffix" },
+        { "include": "#type-expression" }
       ]
     },
 
     "binding-declaration": {
-      "comment": "Supports the v0.3.0 surface: `pub let X`, `freeze let X`, `pub freeze let X`, `comptime let X`, `lazy let X`, and any pair-wise combo. The leading-modifier slot accepts up to three modifiers so users don't see grammar fall-through on stacked keywords like `pub comptime let`.",
-      "match": "\\b(?:(pub|freeze|comptime|lazy)\\s+)?(?:(pub|freeze|comptime|lazy)\\s+)?(?:(pub|freeze|comptime|lazy)\\s+)?(let|mut|val|var)\\s+(?:(mut)\\s+)?([A-Za-z_]\\w*)",
+      "comment": "Supports the v0.3.0 surface: `pub let X`, `freeze let X`, `pub freeze let X`, `comptime let X`, `lazy let X`, and any pair-wise combo. The leading-modifier slot accepts up to three modifiers so users don't see grammar fall-through on stacked keywords like `pub comptime let`. The name uses `\\p{L}` so Unicode identifiers like `let π` and `let греет` are recognised.",
+      "match": "\\b(?:(pub|freeze|comptime|lazy)\\s+)?(?:(pub|freeze|comptime|lazy)\\s+)?(?:(pub|freeze|comptime|lazy)\\s+)?(let|mut|val|var)\\s+(?:(mut)\\s+)?([\\p{L}_][\\p{L}\\p{N}_]*)",
       "captures": {
         "1": { "name": "storage.modifier.typhon" },
         "2": { "name": "storage.modifier.typhon" },
@@ -258,11 +416,20 @@
     },
 
     "type-alias": {
-      "match": "\\b(type)\\s+([A-Za-z_]\\w*)\\s*=",
-      "captures": {
+      "comment": "`type Name = RHS` and `type Name[T, U] = RHS`. RHS is parsed as a type-expression so `|` is a union, `[...]` is typeparameters, and dotted names get their accessor scope.",
+      "begin": "\\b(type)\\s+([\\p{L}_][\\p{L}\\p{N}_]*)(?:\\s*(\\[)([^\\]]*)(\\]))?\\s*(=)",
+      "beginCaptures": {
         "1": { "name": "storage.type.alias.typhon" },
-        "2": { "name": "entity.name.type.alias.typhon" }
-      }
+        "2": { "name": "entity.name.type.alias.typhon" },
+        "3": { "name": "punctuation.definition.typeparameters.begin.typhon" },
+        "4": { "name": "entity.name.type.parameter.typhon" },
+        "5": { "name": "punctuation.definition.typeparameters.end.typhon" },
+        "6": { "name": "keyword.operator.assignment.typhon" }
+      },
+      "end": "$|(?=#)",
+      "patterns": [
+        { "include": "#type-expression" }
+      ]
     },
 
     "typhon-keywords": {
@@ -314,7 +481,7 @@
         },
         {
           "name": "storage.type.function.typhon",
-          "match": "\\b(def|lambda)\\b"
+          "match": "\\b(def)\\b"
         },
         {
           "name": "storage.type.class.typhon",
@@ -366,11 +533,13 @@
     },
 
     "nullable-suffix": {
+      "comment": "`T?` in type position. Lookbehind allows word, `]`, `)`, and closing quotes so string forward-references stay nullable (`field: \"Model\"? = None`).",
       "name": "keyword.operator.nullable.typhon",
-      "match": "(?<=[A-Za-z_\\w\\]\\)])\\?"
+      "match": "(?<=[\\w\\]\\)\"\\'])\\?"
     },
 
     "try-operator": {
+      "comment": "`expr?` in value position — Result/Option short-circuit. Restricted to expression-shaped contexts so it doesn't double up with `nullable-suffix` inside type-expression.",
       "name": "keyword.operator.try.typhon",
       "match": "(?<=[\\w\\)\\]])\\?(?=\\s*(?:[,;:)\\]\\.]|$|\\s))"
     },
@@ -381,14 +550,23 @@
     },
 
     "operators": {
+      "comment": "Operators ordered by specificity. Multi-char ops are tried before their single-char prefixes so `>>` becomes a shift, not two `>` comparisons; `**` becomes power, not two `*`; `//` becomes floor-div, not two `/`. Augmented assignments come first because they end in `=` and would otherwise be split by `=`.",
       "patterns": [
         {
           "name": "keyword.operator.assignment.augmented.typhon",
-          "match": "\\+=|-=|\\*=|/=|//=|%=|\\*\\*=|&=|\\|=|\\^=|>>=|<<=|@="
+          "match": "\\+=|-=|\\*\\*=|\\*=|//=|/=|%=|&=|\\|=|\\^=|>>=|<<=|@="
         },
         {
           "name": "keyword.operator.comparison.typhon",
-          "match": "==|!=|<=|>=|<>|<|>"
+          "match": "==|!=|<=|>=|<>"
+        },
+        {
+          "name": "keyword.operator.bitwise.typhon",
+          "match": "<<|>>"
+        },
+        {
+          "name": "keyword.operator.comparison.typhon",
+          "match": "<|>"
         },
         {
           "name": "keyword.operator.assignment.walrus.typhon",
@@ -400,11 +578,11 @@
         },
         {
           "name": "keyword.operator.arithmetic.typhon",
-          "match": "\\+|-|\\*\\*|\\*|//|/|%|@"
+          "match": "\\*\\*|//|\\+|-|\\*|/|%|@"
         },
         {
           "name": "keyword.operator.bitwise.typhon",
-          "match": "&|\\||\\^|~|<<|>>"
+          "match": "&|\\||\\^|~"
         },
         {
           "name": "keyword.operator.arrow.typhon",
@@ -414,7 +592,8 @@
     },
 
     "type-annotation": {
-      "begin": "(?<=[\\w\\)\\]])\\s*(:)\\s*(?!=)",
+      "comment": "Type annotation `: Type`. The lookahead is deliberately narrow: an uppercase identifier, a builtin type name, a dotted lowercase name (`pd.DataFrame`), or a type-shaping punctuation (`[`, `(`, quote, digit, `*`). Plain lowercase identifiers are rejected so that single-line statements like `if cond: return x` and `case Foo(x): bar()` don't get their statement colon mis-scoped as a type annotation, which used to swallow the rest of the line into a type-expression. The trade-off is that ad-hoc lowercase type aliases (`x: my_alias`) lose annotation styling — but those are rare; uppercase-style and builtin types cover essentially all real Typhon code.",
+      "begin": "(?<=[\\w\\)\\]])\\s*(:)(?!=)\\s*(?=(?:\\p{Lu}|(?:int|str|float|bool|list|dict|set|tuple|bytes|frozenset|complex|object|type|None|Any|Self|Never|Optional|Union|Literal|Final|ClassVar|Protocol|Callable|Iterable|Iterator|Generator|AsyncIterable|AsyncIterator|Sequence|Mapping|MutableMapping)\\b|[\\p{L}_][\\p{L}\\p{N}_]*\\.|[\\[\\(\"\\'\\d\\*]))",
       "beginCaptures": {
         "1": { "name": "punctuation.separator.annotation.typhon" }
       },
@@ -422,6 +601,14 @@
       "patterns": [
         { "include": "#type-expression" }
       ]
+    },
+
+    "field-declaration": {
+      "comment": "Class/model body fields: an indented identifier directly followed by `: Type`. Typhon requires `let`/`mut` for plain bindings, so this only fires inside class/model bodies where bare `name: Type` appears. Captured separately so themes can colour field names distinctly from generic locals.",
+      "match": "^(\\s+)([\\p{Ll}_][\\p{L}\\p{N}_]*)(?=\\s*:\\s*[\\p{L}_\\[\\(\"\\'\\d])",
+      "captures": {
+        "2": { "name": "variable.other.property.declaration.typhon" }
+      }
     },
 
     "type-expression": {
@@ -436,6 +623,14 @@
         {
           "name": "keyword.operator.type.union.typhon",
           "match": "\\|"
+        },
+        {
+          "name": "punctuation.accessor.typhon",
+          "match": "\\."
+        },
+        {
+          "name": "punctuation.separator.comma.typhon",
+          "match": ","
         },
         {
           "name": "entity.name.type.typhon",
@@ -454,18 +649,32 @@
             { "include": "#type-expression" }
           ]
         },
+        {
+          "begin": "\\(",
+          "beginCaptures": {
+            "0": { "name": "punctuation.section.parens.begin.typhon" }
+          },
+          "end": "\\)",
+          "endCaptures": {
+            "0": { "name": "punctuation.section.parens.end.typhon" }
+          },
+          "patterns": [
+            { "include": "#type-expression" }
+          ]
+        },
         { "include": "#identifiers" }
       ]
     },
 
     "function-call": {
-      "match": "\\b([A-Za-z_]\\w*)\\s*(?=\\()",
+      "match": "\\b([\\p{L}_][\\p{L}\\p{N}_]*)\\s*(?=\\()",
       "captures": {
         "1": { "name": "entity.name.function.call.typhon" }
       }
     },
 
     "identifiers": {
+      "comment": "Bare identifiers in expressions. Order: `self`/`cls` first; then ALL_CAPS constants; then PascalCase/uppercase-leading types; then lowercase variables. The lowercase fallback uses `\\p{L}` so Unicode identifiers (`греет`, `π`, `数`) get the regular variable scope instead of falling through to no-scope.",
       "patterns": [
         {
           "name": "variable.language.self.typhon",
@@ -481,7 +690,7 @@
         },
         {
           "name": "variable.other.typhon",
-          "match": "\\b[a-z_]\\w*\\b"
+          "match": "[\\p{L}_][\\p{L}\\p{N}_]*"
         }
       ]
     },
@@ -531,10 +740,31 @@
     },
 
     "strings": {
+      "comment": "Raw strings (`r\"...\"`, `rb\"...\"`, `br\"...\"`) are split out and do NOT include `#string-escapes` — `\\n` inside `r\"\\n\"` is a literal backslash + n, so highlighting it as an escape would be a lie. Regular strings (`\"...\"`, `b\"...\"`, `u\"...\"`) keep escape highlighting.",
       "patterns": [
         {
+          "name": "string.quoted.triple.double.raw.typhon",
+          "begin": "(?:[bB][rR]|[rR][bB]?)\"\"\"",
+          "end": "\"\"\""
+        },
+        {
+          "name": "string.quoted.triple.single.raw.typhon",
+          "begin": "(?:[bB][rR]|[rR][bB]?)'''",
+          "end": "'''"
+        },
+        {
+          "name": "string.quoted.double.raw.typhon",
+          "begin": "(?:[bB][rR]|[rR][bB]?)\"",
+          "end": "\"|(?<!\\\\)$"
+        },
+        {
+          "name": "string.quoted.single.raw.typhon",
+          "begin": "(?:[bB][rR]|[rR][bB]?)'",
+          "end": "'|(?<!\\\\)$"
+        },
+        {
           "name": "string.quoted.triple.double.typhon",
-          "begin": "(?:[rRbBuU]|[rR][bB]|[bB][rR])?\"\"\"",
+          "begin": "(?:[bBuU])?\"\"\"",
           "end": "\"\"\"",
           "patterns": [
             { "include": "#string-escapes" }
@@ -542,7 +772,7 @@
         },
         {
           "name": "string.quoted.triple.single.typhon",
-          "begin": "(?:[rRbBuU]|[rR][bB]|[bB][rR])?'''",
+          "begin": "(?:[bBuU])?'''",
           "end": "'''",
           "patterns": [
             { "include": "#string-escapes" }
@@ -550,7 +780,7 @@
         },
         {
           "name": "string.quoted.double.typhon",
-          "begin": "(?:[rRbBuU]|[rR][bB]|[bB][rR])?\"",
+          "begin": "(?:[bBuU])?\"",
           "end": "\"|(?<!\\\\)$",
           "patterns": [
             { "include": "#string-escapes" }
@@ -558,7 +788,7 @@
         },
         {
           "name": "string.quoted.single.typhon",
-          "begin": "(?:[rRbBuU]|[rR][bB]|[bB][rR])?'",
+          "begin": "(?:[bBuU])?'",
           "end": "'|(?<!\\\\)$",
           "patterns": [
             { "include": "#string-escapes" }
@@ -568,10 +798,43 @@
     },
 
     "fstrings": {
+      "comment": "F-strings, split into raw (`rf\"...\"` / `fr\"...\"`) and regular (`f\"...\"`). Only the regular form includes `#string-escapes`; in raw f-strings `\\n` is literal backslash + n. Both forms include `#fstring-interpolation` for `{expr}` and self-doc `{x=}`.",
       "patterns": [
         {
+          "name": "string.quoted.triple.double.fstring.raw.typhon",
+          "begin": "(?:[fF][rR]|[rR][fF])\"\"\"",
+          "end": "\"\"\"",
+          "patterns": [
+            { "include": "#fstring-interpolation" }
+          ]
+        },
+        {
+          "name": "string.quoted.triple.single.fstring.raw.typhon",
+          "begin": "(?:[fF][rR]|[rR][fF])'''",
+          "end": "'''",
+          "patterns": [
+            { "include": "#fstring-interpolation" }
+          ]
+        },
+        {
+          "name": "string.quoted.double.fstring.raw.typhon",
+          "begin": "(?:[fF][rR]|[rR][fF])\"",
+          "end": "\"|(?<!\\\\)$",
+          "patterns": [
+            { "include": "#fstring-interpolation" }
+          ]
+        },
+        {
+          "name": "string.quoted.single.fstring.raw.typhon",
+          "begin": "(?:[fF][rR]|[rR][fF])'",
+          "end": "'|(?<!\\\\)$",
+          "patterns": [
+            { "include": "#fstring-interpolation" }
+          ]
+        },
+        {
           "name": "string.quoted.triple.double.fstring.typhon",
-          "begin": "(?:[fF][rR]?|[rR][fF])\"\"\"",
+          "begin": "[fF]\"\"\"",
           "end": "\"\"\"",
           "patterns": [
             { "include": "#fstring-interpolation" },
@@ -580,7 +843,7 @@
         },
         {
           "name": "string.quoted.triple.single.fstring.typhon",
-          "begin": "(?:[fF][rR]?|[rR][fF])'''",
+          "begin": "[fF]'''",
           "end": "'''",
           "patterns": [
             { "include": "#fstring-interpolation" },
@@ -589,7 +852,7 @@
         },
         {
           "name": "string.quoted.double.fstring.typhon",
-          "begin": "(?:[fF][rR]?|[rR][fF])\"",
+          "begin": "[fF]\"",
           "end": "\"|(?<!\\\\)$",
           "patterns": [
             { "include": "#fstring-interpolation" },
@@ -598,7 +861,7 @@
         },
         {
           "name": "string.quoted.single.fstring.typhon",
-          "begin": "(?:[fF][rR]?|[rR][fF])'",
+          "begin": "[fF]'",
           "end": "'|(?<!\\\\)$",
           "patterns": [
             { "include": "#fstring-interpolation" },
