@@ -204,52 +204,95 @@ The `await` is sequential and order-dependent — `gather:` won't help here. If 
 
 A small example: fetch user data from three independent endpoints in parallel, spawn a fire-and-forget metrics call, and surface a typed error if any fetch fails.
 
-```python
-import asyncio
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    import asyncio
 
-class User:
-    id: int
-    name: str
-class Post:
-    id: int
-    title: str
-class Notif:
-    id: int
-    text: str
+    class User:
+        id: int
+        name: str
+    class Post:
+        id: int
+        title: str
+    class Notif:
+        id: int
+        text: str
 
-type LoadError = NotFound | Timeout
-class NotFound:
-    what: str
-class Timeout:
-    after_ms: int
+    type LoadError = NotFound | Timeout
+    class NotFound:
+        what: str
+    class Timeout:
+        after_ms: int
 
-async def fetch_user(id: int) -> Result[User, LoadError]: ...
-async def fetch_posts(id: int) -> Result[list[Post], LoadError]: ...
-async def fetch_notifs(id: int) -> Result[list[Notif], LoadError]: ...
-async def record_load(id: int, ms: int) -> None: ...
+    async def fetch_user(id: int) -> Result[User, LoadError]: ...
+    async def fetch_posts(id: int) -> Result[list[Post], LoadError]: ...
+    async def fetch_notifs(id: int) -> Result[list[Notif], LoadError]: ...
+    async def record_load(id: int, ms: int) -> None: ...
 
-class Dashboard:
-    user: User
-    posts: list[Post]
-    notifs: list[Notif]
+    class Dashboard:
+        user: User
+        posts: list[Post]
+        notifs: list[Notif]
 
-async def load_dashboard(user_id: int) -> Result[Dashboard, LoadError]:
-    let started: float = asyncio.get_event_loop().time()
+    async def load_dashboard(user_id: int) -> Result[Dashboard, LoadError]:
+        let started: float = asyncio.get_event_loop().time()
 
-    gather:
-        user_r   = fetch_user(user_id)
-        posts_r  = fetch_posts(user_id)
-        notifs_r = fetch_notifs(user_id)
+        gather:
+            user_r   = fetch_user(user_id)
+            posts_r  = fetch_posts(user_id)
+            notifs_r = fetch_notifs(user_id)
 
-    let user: User = user_r?
-    let posts: list[Post] = posts_r?
-    let notifs: list[Notif] = notifs_r?
+        let user: User = user_r?
+        let posts: list[Post] = posts_r?
+        let notifs: list[Notif] = notifs_r?
 
-    let elapsed_ms: int = int((asyncio.get_event_loop().time() - started) * 1000)
-    go record_load(user_id, elapsed_ms)
+        let elapsed_ms: int = int((asyncio.get_event_loop().time() - started) * 1000)
+        go record_load(user_id, elapsed_ms)
 
-    return Ok(Dashboard(user=user, posts=posts, notifs=notifs))
-```
+        return Ok(Dashboard(user=user, posts=posts, notifs=notifs))
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    from __future__ import annotations
+    from typhon_runtime import Ok, Err, Result
+    import typhon_runtime
+    import dataclasses
+    from typhon_runtime import Err as __typhon_Err__
+    import asyncio
+
+    # ... class declarations elided — each becomes @dataclasses.dataclass(slots=True) ...
+
+    async def load_dashboard(user_id: int) -> Result[Dashboard, LoadError]:
+        started: float = asyncio.get_event_loop().time()
+        async with asyncio.TaskGroup() as __typhon_tg_0__:
+            __typhon_gather_1__ = __typhon_tg_0__.create_task(fetch_user(user_id))
+            __typhon_gather_2__ = __typhon_tg_0__.create_task(fetch_posts(user_id))
+            __typhon_gather_3__ = __typhon_tg_0__.create_task(fetch_notifs(user_id))
+        user_r = __typhon_gather_1__.result()
+        posts_r = __typhon_gather_2__.result()
+        notifs_r = __typhon_gather_3__.result()
+        __typhon_q_0__ = user_r
+        if isinstance(__typhon_q_0__, __typhon_Err__):
+            return __typhon_q_0__
+        user: User = __typhon_q_0__.value
+        __typhon_q_1__ = posts_r
+        if isinstance(__typhon_q_1__, __typhon_Err__):
+            return __typhon_q_1__
+        posts: list[Post] = __typhon_q_1__.value
+        __typhon_q_2__ = notifs_r
+        if isinstance(__typhon_q_2__, __typhon_Err__):
+            return __typhon_q_2__
+        notifs: list[Notif] = __typhon_q_2__.value
+        elapsed_ms: int = int((asyncio.get_event_loop().time() - started) * 1000)
+        typhon_runtime.tasks.spawn(record_load(user_id, elapsed_ms))
+        return Ok(Dashboard(user=user, posts=posts, notifs=notifs))
+    ```
+  </TabItem>
+</Tabs>
+
+Three Typhon-only lowerings are all visible here: `gather:` wraps the three coroutines in an `asyncio.TaskGroup` and pulls their results out via `.result()`, each `?` becomes a `typhon_q` temp + `isinstance(_, Err)` early-return, and `go` calls into `typhon_runtime.tasks.spawn` (the strong-ref registry — never bare `asyncio.create_task`).
 
 Walk-through:
 
