@@ -21,7 +21,7 @@ Typhon ships a single binary, `tyc`, that handles every stage of the workflow. S
 | `tyc repl` | Interactive Typhon evaluator. Reads `.ty` source one block at a time, compiles it through the full pipeline, and executes the result with a Python interpreter. |
 | `tyc debug` | Build the project and launch the emitted Python under a debugger (default `pdb`). Repeatable `--break <ty-file>:<line>` flags translate Typhon source locations through the v2 `.py.map` and inject `-c "break …"` into the debugger session, so breakpoints set on `.ty` lines fire on the corresponding emitted Python lines. |
 | `tyc run` | Execute a Typhon program. By default uses the in-process tree-walking VM ([docs/vm.md](vm.md)) — no `.py` is written, no CPython is spawned. `--compile` (alias `--no-vm`) falls back to the legacy build-then-exec path; pair with `--temp` to build into a tempdir that is removed on exit. |
-| `tyc explain <code>` | Print the diagnostic catalog entry for a `tyc::` code (mirrors `rustc --explain`). Accepts the short form (`immutable_assign`) or the fully-qualified `tyc::immutable_assign`. Every catalog page also lives at `docs/diagnostics/<code>.md` and is linked from the `url(...)` clause on each diagnostic. |
+| `tyc explain <code>` | Print the diagnostic catalog entry for a `tyc::` code (mirrors `rustc --explain`). Accepts the short form (`immutable_assign`) or the fully-qualified `tyc::immutable_assign`. Use `tyc explain --list` to print every code the explainer knows about. Every catalog page also lives at `docs/diagnostics/<code>.md` and is linked from the `url(...)` clause on each diagnostic. |
 | `tyc cheatsheet` | Print the 30-second Typhon cheat sheet (from [docs/cheatsheet.md](cheatsheet.md)) to stdout. Handy when you need a syntax refresher without leaving the terminal. |
 | `tyc add` / `tyc remove` / `tyc sync` | Lightweight package-manager surface over `uv`: rewrite `[dependencies]` / `[dev-dependencies]` in `typhon.toml` and run `uv sync` to install. |
 
@@ -87,7 +87,11 @@ context-switch to a browser.
 ```bash
 tyc explain immutable_assign           # short code
 tyc explain tyc::immutable_assign      # fully-qualified — both work
+tyc explain --list                     # print every code the explainer knows about, one per line
 ```
+
+The `--list` flag prints one fully-qualified code per line, suitable for piping
+to `grep` or `fzf` (`tyc explain --list | fzf | xargs tyc explain`).
 
 Every diagnostic emitted by `tyc` also carries a `url(https://typhon.dev/lang/diagnostics/<code>)`
 attribute (rendered inline by miette), so the same page is one click away

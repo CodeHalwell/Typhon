@@ -422,6 +422,8 @@ fn shapes_from_introspected(intro: &IntrospectedModule) -> ModuleShapes {
         class_shapes,
         class_type_params: HashMap::new(),
         function_arities,
+        sealed_unions: HashMap::new(),
+        interfaces: std::collections::HashSet::new(),
     }
 }
 
@@ -502,6 +504,8 @@ fn arity_info_from_params(params: &[IntrospectedParam]) -> Option<ArityInfo> {
         Some(param_names.len())
     };
     let min_positional = required_positional.iter().filter(|r| **r).count();
+    let param_types = vec![tyc_types::Type::Unknown; param_names.len()];
+    let kwonly_types = vec![tyc_types::Type::Unknown; kwonly_names.len()];
     Some(ArityInfo {
         param_names,
         min_positional,
@@ -511,6 +515,9 @@ fn arity_info_from_params(params: &[IntrospectedParam]) -> Option<ArityInfo> {
         kwonly_required,
         has_kwarg,
         vararg_type: None,
+        param_types,
+        kwonly_types,
+        return_type: tyc_types::Type::Unknown,
     })
 }
 

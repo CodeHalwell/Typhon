@@ -684,11 +684,19 @@ fn call_targets_coro_acceptor(call: &ruff_python_ast::ExprCall) -> bool {
             | "wait_for"
             | "as_completed"
             | "spawn"
+            | "run_until_complete"
     );
     if !is_coro_method {
         return false;
     }
-    // Accept exactly two shapes:
+    // `run_until_complete` is unambiguously an `AbstractEventLoop` method
+    // — the canonical pattern is `loop.run_until_complete(coro())` where
+    // `loop` is a local binding. Accept any receiver shape; the method
+    // name itself is the carve-out.
+    if method == "run_until_complete" {
+        return true;
+    }
+    // Accept exactly two shapes for the other methods:
     //   1. `asyncio.<method>(coro())`
     //   2. `typhon_runtime.tasks.<method>(coro())`
     // (Plus aliased forms `<X>.asyncio.<method>(...)` are accepted too —
@@ -1685,7 +1693,7 @@ struct Checker<'a> {
 /// - `def f(a, b=10)` → 1 required, 2 optional
 /// - `def variadic(*args)` → 0 required, no fixed max, accepts kwargs only via `**kw`
 /// - `f(name="x")` keyword-arg matching against `param_names`
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ArityInfo {
     /// Names of the positional / pos-or-kw / kw-only parameters declared
     /// on the function, in source order. Used to match keyword arguments
@@ -1730,6 +1738,20 @@ pub struct ArityInfo {
     /// excess positional args (FINDINGS #86). `Type::Unknown` when
     /// the vararg is unannotated.
     pub vararg_type: Option<Type>,
+    /// Declared types of the positional / pos-or-kw parameters, in
+    /// source order parallel to `param_names`. `Type::Unknown` slots
+    /// are emitted when a parameter is unannotated. Threaded across
+    /// module boundaries so cross-module callers see nullable /
+    /// newtype / sealed-union parameter types instead of `Unknown`,
+    /// which the consumer's checker would otherwise widen to "accept
+    /// anything" and (worse, in the nullable case) render as `?` in
+    /// `tyc::nullable_use` diagnostics.
+    pub param_types: Vec<Type>,
+    /// Declared types of the kw-only parameters, in source order
+    /// parallel to `kwonly_names`.
+    pub kwonly_types: Vec<Type>,
+    /// Declared return type. `Type::Unknown` when unannotated.
+    pub return_type: Type,
 }
 
 /// Declared interface (`interface Name:` → `class Name(Protocol):`). Bundles
@@ -2406,9 +2428,9 @@ impl<'a> Checker<'a> {
         }
         // N7 (2026-05-22): when `expected` is a `newtype` whose base
         // *would* accept `actual`, the generic "change the value, or
-        // update the annotation to `int`" help text points the user at
-        // the wrong fix — dropping the nominal type. The cheat-sheet
-        // promised `tyc::newtype_violation` for this case; surface the
+        // widen the annotation" help text points the user at the wrong
+        // fix — dropping the nominal type. The cheat-sheet promised
+        // `tyc::newtype_violation` for this case; surface the
         // dedicated diagnostic instead so the help reads "wrap with
         // `UserId(...)`".
         if let Type::Class(exp_name) = expected {
@@ -2730,6 +2752,18 @@ pub struct ModuleShapes {
     /// so `from foo import bar; bar(1)` triggers the same
     /// `tyc::arg_count` check that an in-module `def bar` would.
     pub function_arities: HashMap<String, ArityInfo>,
+    /// Sealed-union aliases declared via `type Name = A | B | ...`,
+    /// keyed by the union name and valued by the variant class names.
+    /// Seeded into the consumer's `sealed_unions` table so a variant
+    /// declared in module A flows into a `Type::Class(Union)` slot
+    /// without needing a factory wrapper at the call site.
+    pub sealed_unions: HashMap<String, Vec<String>>,
+    /// Names of classes inheriting `typing.Protocol` (Typhon's
+    /// `interface` keyword desugars to this). Seeded so cross-module
+    /// structural conformance — `Friend` declared in module A
+    /// satisfies `Greeter` declared in module A when used from module
+    /// B — matches the in-module checker's behaviour.
+    pub interfaces: HashSet<String>,
 }
 
 /// Imports resolved to their source modules' [`ModuleShapes`], keyed
@@ -2756,6 +2790,17 @@ pub struct ExternalShapes {
     pub class_shapes: HashMap<String, InterfaceShape>,
     pub class_type_params: HashMap<String, Vec<String>>,
     pub function_arities: HashMap<String, ArityInfo>,
+    /// Sealed-union aliases re-keyed under the local import name of the
+    /// alias (`from foo import Event` → `"Event" → ["A", "B", ...]`).
+    /// The variant names are kept as published by the source module
+    /// because the checker resolves them through `class_shapes`, which
+    /// is also re-keyed under the local import names by the CLI / LSP.
+    pub sealed_unions: HashMap<String, Vec<String>>,
+    /// Local import names that refer to a Protocol-shaped class in a
+    /// different module. Cross-module structural conformance consults
+    /// this set the same way the in-module checker consults
+    /// `c.interfaces`.
+    pub interfaces: HashSet<String>,
     /// Bare imports that need attribute-access resolution. Keyed by
     /// the *local* binding name; the value is the dotted module path
     /// the import refers to (e.g. `("np", "numpy")` for
@@ -2858,8 +2903,41 @@ pub fn extract_module_shapes(module: &ModModule) -> ModuleShapes {
             let tps = type_param_names_from(f.type_params.as_deref());
             function_arities.insert(
                 f.name.as_str().to_owned(),
-                arity_info_from_parameters(f.parameters.as_ref(), &classes, &tps),
+                arity_info_from_parameters_with_returns(
+                    f.parameters.as_ref(),
+                    f.returns.as_deref(),
+                    &classes,
+                    &tps,
+                ),
             );
+        }
+    }
+
+    // Sealed-union aliases (`type Name = A | B | ...`) so a variant
+    // imported from module A flows into a `Name`-typed parameter in
+    // module B without needing a factory wrapper.
+    let mut sealed_unions: HashMap<String, Vec<String>> = HashMap::new();
+    for stmt in &module.body {
+        if let Stmt::TypeAlias(ta) = stmt {
+            if let Expr::Name(n) = ta.name.as_ref() {
+                if let Some(variants) = extract_sealed_union_variants(&ta.value) {
+                    sealed_unions.insert(n.id.as_str().to_owned(), variants);
+                }
+            }
+        }
+    }
+
+    // Interface declarations (`class X(Protocol):` after desugar of
+    // `interface X:`). Names only — the shape is already on
+    // `class_shapes` so cross-module structural conformance can fall
+    // back to the same `class_conforms_to_interface` path the
+    // in-module checker uses.
+    let mut interfaces: HashSet<String> = HashSet::new();
+    for stmt in &module.body {
+        if let Stmt::ClassDef(cd) = stmt {
+            if class_inherits_protocol(cd) {
+                interfaces.insert(cd.name.as_str().to_owned());
+            }
         }
     }
 
@@ -2867,6 +2945,8 @@ pub fn extract_module_shapes(module: &ModModule) -> ModuleShapes {
         class_shapes,
         class_type_params,
         function_arities,
+        sealed_unions,
+        interfaces,
     }
 }
 
@@ -2939,6 +3019,32 @@ pub fn check_module_with_imports(
             c.function_arity_info
                 .entry(name.clone())
                 .or_insert_with(|| info.clone());
+        }
+        // Cross-module sealed unions: an imported `type Event = A | B`
+        // must allow variant→union flow at this module's call sites,
+        // same as if the alias had been declared locally.
+        for (name, variants) in &ext.sealed_unions {
+            c.sealed_unions
+                .entry(name.clone())
+                .or_insert_with(|| variants.clone());
+            // The classes registry also needs the union name so
+            // annotations referring to it resolve to `Type::Class(union)`.
+            if !c.classes.iter().any(|n| n == name) {
+                c.classes.push(name.clone());
+            }
+        }
+        // Cross-module interfaces: register the local import name as a
+        // Protocol-shaped type so `is_assignable` consults the
+        // structural-conformance path. The shape itself is already in
+        // `class_shapes` (re-keyed by the CLI / LSP), so we just need
+        // an entry in `c.interfaces` keyed under the same name.
+        for name in &ext.interfaces {
+            if let Some(shape) = c.class_shapes.get(name).cloned() {
+                c.interfaces.entry(name.clone()).or_insert(InterfaceDecl {
+                    shape,
+                    runtime_checkable: false,
+                });
+            }
         }
         // Stash the by-module registry for attribute access on
         // `Type::Module(name)` (bare `import M` form). The clone
@@ -3745,7 +3851,17 @@ fn check_resource_discipline_stmt(c: &mut Checker, stmt: &Stmt) {
                 }
             }
         }
-        Stmt::FunctionDef(f) => check_resource_discipline(c, &f.body),
+        Stmt::FunctionDef(f) => {
+            // Apps-feedback 2026-05: a function decorated with
+            // `@contextmanager` IS the manager — its body legitimately
+            // opens the resource and yields it. Firing
+            // `tyc::resource_not_managed` on the `open(...)` inside is
+            // a false positive. Skip the body of these wrappers.
+            if has_contextmanager_decorator(&f.decorator_list) {
+                return;
+            }
+            check_resource_discipline(c, &f.body);
+        }
         Stmt::ClassDef(cd) => check_resource_discipline(c, &cd.body),
         Stmt::If(s) => {
             // `unsafe:` lowers to `if True:  # __typhon_unsafe__` at
@@ -4219,6 +4335,29 @@ fn has_runtime_checkable_decorator(decorators: &[ruff_python_ast::Decorator]) ->
     })
 }
 
+/// True when a function carries `@contextmanager` /
+/// `@asynccontextmanager` (bare name, `contextlib.contextmanager`, or
+/// aliased). Used by [`check_resource_discipline_stmt`] to skip the
+/// body of a context-manager factory whose `open(...)` / `socket(...)`
+/// call IS the resource-acquisition step the caller will manage.
+fn has_contextmanager_decorator(decorators: &[ruff_python_ast::Decorator]) -> bool {
+    decorators.iter().any(|d| {
+        let name = match &d.expression {
+            Expr::Name(n) => Some(n.id.as_str()),
+            Expr::Attribute(a) => Some(a.attr.as_str()),
+            // `@contextlib.contextmanager()` (with parens) is unusual
+            // but allowed; the callee is the decorator factory.
+            Expr::Call(call) => match call.func.as_ref() {
+                Expr::Name(n) => Some(n.id.as_str()),
+                Expr::Attribute(a) => Some(a.attr.as_str()),
+                _ => None,
+            },
+            _ => None,
+        };
+        matches!(name, Some("contextmanager") | Some("asynccontextmanager"))
+    })
+}
+
 /// Walk a class body and record its methods and annotated fields into an
 /// [`InterfaceShape`]. The receiver parameter (first positional, conventionally
 /// `self` or `cls`) is excluded from the arity count.
@@ -4613,6 +4752,11 @@ fn class_constructor_arity(shape: &InterfaceShape) -> ArityInfo {
         .map(|name| !shape.field_defaults.contains(name))
         .collect();
     let min_positional = required_positional.iter().filter(|r| **r).count();
+    let param_types: Vec<Type> = shape
+        .field_order
+        .iter()
+        .map(|name| shape.fields.get(name).cloned().unwrap_or(Type::Unknown))
+        .collect();
     ArityInfo {
         param_names: shape.field_order.clone(),
         min_positional,
@@ -4622,6 +4766,9 @@ fn class_constructor_arity(shape: &InterfaceShape) -> ArityInfo {
         kwonly_required: Vec::new(),
         has_kwarg: false,
         vararg_type: None,
+        param_types,
+        kwonly_types: Vec::new(),
+        return_type: Type::Unknown,
     }
 }
 
@@ -5029,22 +5176,33 @@ fn arity_info_from_parameters(
     classes: &[String],
     type_params: &[String],
 ) -> ArityInfo {
+    arity_info_from_parameters_with_returns(parameters, None, classes, type_params)
+}
+
+/// Variant of [`arity_info_from_parameters`] that also records the
+/// declared parameter / return types on the resulting [`ArityInfo`].
+/// Used by the cross-module shape extractor so consumers see real
+/// types (including `T?` nullables and `newtype` wrappers) instead of
+/// `Type::Unknown` placeholders.
+fn arity_info_from_parameters_with_returns(
+    parameters: &ruff_python_ast::Parameters,
+    returns: Option<&Expr>,
+    classes: &[String],
+    type_params: &[String],
+) -> ArityInfo {
     let mut param_names: Vec<String> = Vec::new();
+    let mut param_types: Vec<Type> = Vec::new();
     let mut required_positional: Vec<bool> = Vec::new();
     let mut min_positional: usize = 0;
-    // Walk positional-only + positional-or-keyword. A defaulted positional
-    // doesn't count toward `min_positional`; once we see the first
-    // defaulted param all subsequent positionals must also be defaulted
-    // (Python grammar enforces this), so we can stop incrementing once
-    // we encounter a default. `required_positional` records the same
-    // information per-param so the call-site arity check can honour
-    // shapes whose defaults aren't all trailing (e.g. synthesised
-    // Pydantic-model constructors).
     let positional_chain = parameters.posonlyargs.iter().chain(parameters.args.iter());
     let mut hit_default = false;
     let mut max_positional_count: usize = 0;
     for pwd in positional_chain {
         param_names.push(pwd.parameter.name.as_str().to_owned());
+        param_types.push(match &pwd.parameter.annotation {
+            Some(ann) => type_from_annotation_with_params(ann, classes, type_params),
+            None => Type::Unknown,
+        });
         max_positional_count += 1;
         let has_default = pwd.default.is_some();
         if !has_default && !hit_default {
@@ -5062,13 +5220,22 @@ fn arity_info_from_parameters(
     };
     let mut kwonly_names: Vec<String> = Vec::new();
     let mut kwonly_required: Vec<String> = Vec::new();
+    let mut kwonly_types: Vec<Type> = Vec::new();
     for pwd in &parameters.kwonlyargs {
         let name = pwd.parameter.name.as_str().to_owned();
         kwonly_names.push(name.clone());
+        kwonly_types.push(match &pwd.parameter.annotation {
+            Some(ann) => type_from_annotation_with_params(ann, classes, type_params),
+            None => Type::Unknown,
+        });
         if pwd.default.is_none() {
             kwonly_required.push(name);
         }
     }
+    let return_type = match returns {
+        Some(r) => type_from_annotation_with_params(r, classes, type_params),
+        None => Type::Unknown,
+    };
     // FINDINGS #86: record the *args element type so the call-site
     // type-check can stop misapplying the next positional-or-kw
     // parameter's annotation to absorbed extra positional args.
@@ -5087,6 +5254,9 @@ fn arity_info_from_parameters(
         kwonly_required,
         has_kwarg: parameters.kwarg.is_some(),
         vararg_type,
+        param_types,
+        kwonly_types,
+        return_type,
     }
 }
 
@@ -5124,12 +5294,22 @@ fn seed_env_from_scope(c: &mut Checker, scope: ScopeId) {
                     Type::Class(b.name.clone())
                 } else if let Some(info) = c.function_arity_info.get(&b.name) {
                     // Build a `Type::Function` from the cross-module
-                    // arity so the call-site machinery can pick it
-                    // up the same way it picks up local `def`s.
-                    let params = vec![Type::Unknown; info.param_names.len()];
+                    // arity so the call-site machinery sees real
+                    // parameter / return annotations (including `T?`
+                    // and newtypes) — `Type::Unknown` placeholders
+                    // would otherwise widen to "accept anything" and,
+                    // worse, render as `?` in `tyc::nullable_use`
+                    // diagnostics.
+                    let params = if info.param_types.len() == info.param_names.len()
+                        && !info.param_types.is_empty()
+                    {
+                        info.param_types.clone()
+                    } else {
+                        vec![Type::Unknown; info.param_names.len()]
+                    };
                     Type::Function {
                         params,
-                        ret: Box::new(Type::Unknown),
+                        ret: Box::new(info.return_type.clone()),
                         variadic: info.max_positional.is_none(),
                     }
                 } else if let Some(info) = &b.import_info {
@@ -6425,13 +6605,16 @@ fn match_subject_type(c: &Checker, m: &ruff_python_ast::StmtMatch) -> Option<Typ
     // state-machine pattern — a class with a sealed-union field, plus
     // an `impl` method that dispatches on it. Restricting subjects to
     // bare names made the exhaustiveness pass skip these matches and
-    // gave false-positive `tyc::missing_return` diagnostics. Allow
-    // attribute access against a typed class receiver too.
-    if let Expr::Attribute(_) = m.subject.as_ref() {
-        let ty = infer_expr_readonly(c, m.subject.as_ref());
-        if !matches!(ty, Type::Unknown) {
-            return Some(ty);
-        }
+    // gave false-positive `tyc::missing_return` diagnostics.
+    //
+    // Apps-feedback 2026-05: the same false positive appeared on
+    // function-call subjects (`match get_state(): case A(): … case B(): …`)
+    // because the analyser had no way to infer a sealed-union type
+    // from a call. Fall back to expression inference for any subject
+    // shape we don't recognise via the Name / Attribute fast paths.
+    let ty = infer_expr_readonly(c, m.subject.as_ref());
+    if !matches!(ty, Type::Unknown) {
+        return Some(ty);
     }
     None
 }

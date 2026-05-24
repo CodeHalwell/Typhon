@@ -285,7 +285,7 @@ pub enum TycError {
     #[diagnostic(
         code(tyc::type_mismatch),
         url("https://typhon.dev/lang/diagnostics/type_mismatch"),
-        help("change the value, or update the annotation to `{actual}`")
+        help("change the value so it produces `{expected}`, or widen the annotation to `{expected} | {actual}` if both are intended")
     )]
     TypeMismatch {
         expected: String,

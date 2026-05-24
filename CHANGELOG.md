@@ -4,6 +4,94 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased
+
+Apps-feedback pass: a batch of correctness + ergonomics fixes informed
+by a stress campaign that built five multi-file production-shaped apps
+on top of v0.5.2 (banking-style event sourcing, task scheduler, ML
+orchestrator, web crawler, trading engine). Every issue surfaced by
+that campaign is addressed below.
+
+### Fixed — compiler
+
+- **`tyc-types`: variant→sealed-union flow now works across module boundaries.**
+  A `pub type Event = A | B` declared in `lib.ty` would let a variant
+  `A(...)` flow into an `Event`-typed slot within `lib.ty`, but a
+  consumer module that imported both the variants and the alias hit
+  `tyc::type_mismatch` on the same construction. Sealed-union variant
+  tables, like interface declarations, weren't included in the
+  cross-module shape extractor. Both `ModuleShapes` and
+  `ExternalShapes` now carry `sealed_unions` and `interfaces` maps;
+  the CLI / LSP re-key them under each local import name (including
+  alias renames) so the consumer's checker sees the same
+  union→variant relationship the source module sees.
+- **`tyc-types`: cross-module function signatures preserve parameter and return types.**
+  Functions imported via `from foo import f` were registered with
+  `Type::Unknown` placeholders for every parameter and the return
+  type — the `ArityInfo` sidecar carried names + counts but no types.
+  A nullable parameter `def takes(p: Price?) -> int:` consumed from
+  another module would render in `tyc::nullable_use` diagnostics as
+  the literal placeholder `?` ("value is `? | None`, where `?` is
+  required"), and silently accept any value the caller passed.
+  `ArityInfo` now records `param_types`, `kwonly_types`, and
+  `return_type`; the cross-module binding seed reads them so an
+  imported function looks identical to a local `def` at call sites.
+- **`tyc-types`: exhaustive `match` on a sealed union now satisfies missing-return analysis for any subject expression.**
+  `match get_state(): case A(): ...; case B(): ...` against a sealed
+  union returned by a function fired a false-positive
+  `tyc::missing_return` because the analyser only inferred match
+  subject types for bare names and attribute access. It now falls
+  back to expression inference for any subject shape, so function
+  calls, subscript expressions, and arbitrary expressions all flow
+  through the exhaustiveness path.
+- **`tyc-resolve`: `let` declarations in sibling `case` arms no longer shadow each other.**
+  `case A(): let key = ...; case B(): let key = ...` fired
+  `tyc::no_block_shadow` even though at most one arm runs at runtime.
+  The resolver now drains arm-local bindings into a side buffer
+  between cases (and splices them back after the match for
+  `report_unknown_names`), mirroring the per-arm `env.enter()` /
+  `env.leave()` the type checker already does.
+- **`tyc-syntax`: `pub freeze let X = …` now parses.**
+  `pub` stacks with every other module-level binding modifier per the
+  diagnostic docs, but the `pub`-prefix stripper didn't recognise
+  `freeze let` as a multi-word keyword form. `pub freeze let
+  DEFAULT: dict[str, int] = {...}` now lowers correctly and
+  round-trips through `tyc fmt`.
+- **`tyc-types`: `loop.run_until_complete(coro())` no longer fires `tyc::missing_await`.**
+  The asyncio event-loop method is a legitimate consumer of
+  coroutines — same family as `asyncio.run(...)`, which the analyser
+  already excluded. Added to the coro-acceptor whitelist; the receiver
+  shape is unconstrained because the method name itself is the
+  carve-out.
+- **`tyc-types`: `@contextmanager` factory bodies are exempt from `tyc::resource_not_managed`.**
+  A `@contextmanager`-decorated function whose body opens a file or
+  socket *is* the resource manager — flagging `let f = open(path)`
+  inside is a false positive. The check now skips function bodies
+  carrying `@contextmanager` or `@asynccontextmanager` (bare or
+  dotted-module form).
+
+### Improved — diagnostics
+
+- **`tyc::type_mismatch` help text now suggests widening the annotation, not narrowing it to the found type.**
+  The previous help text — "change the value, or update the
+  annotation to `<found>`" — implicitly suggested dropping the
+  expected type, which is almost never what the user wants. Now reads
+  "change the value so it produces `<expected>`, or widen the
+  annotation to `<expected> | <found>` if both are intended", which
+  matches typed Python's culture and the way users actually fix the
+  error.
+
+### Improved — docs
+
+- **`docs/guides/07-sealed-unions-and-match.md`** now documents
+  keyword patterns (`case TaskStarted(task_id=tid):`) as the
+  recommended form for variants with more than two or three fields —
+  positional patterns must match field count exactly, keyword
+  patterns don't, and Python's `match` supports the latter natively.
+- **`docs/cli.md`** documents `tyc explain --list` (which the
+  diagnostic hint footers have always advertised but the command
+  table never mentioned).
+
 ## 0.5.2
 
 A correctness + documentation point release on top of v0.5.1. Two

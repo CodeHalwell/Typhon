@@ -810,6 +810,9 @@ fn pub_decl_name(body: &str) -> Option<String> {
     if let Some(rest) = body.strip_prefix("class! ") {
         return ident_prefix(rest);
     }
+    if let Some(rest) = body.strip_prefix("freeze let ") {
+        return ident_prefix(rest);
+    }
     // Single-word keywords.
     let single_keyword_forms = [
         "def ",
