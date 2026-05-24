@@ -5,6 +5,8 @@ sidebar:
   order: 9
 ---
 
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
 A `with`-chain sequences several `Result`-producing expressions, binding each success value, with an optional `else err:` block for the first `Err`. Modelled on Elixir.
 
 ## Syntax
@@ -70,26 +72,31 @@ The chain reads top-down as a sequence; on first `Err`, the function returns.
 
 ## How `with`-chains desugar
 
-```python
-# Typhon
-with a = f()?, b = g(a)?:
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    with a = f()?, b = g(a)?:
+        return Ok(a + b)
+    else err:
+        return Err(err)
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    _tmp_0 = f()
+    if isinstance(_tmp_0, Err):
+        err = _tmp_0.error
+        return Err(err)
+    a = _tmp_0.value
+    _tmp_1 = g(a)
+    if isinstance(_tmp_1, Err):
+        err = _tmp_1.error
+        return Err(err)
+    b = _tmp_1.value
     return Ok(a + b)
-else err:
-    return Err(err)
-
-# Emitted Python
-_tmp_0 = f()
-if isinstance(_tmp_0, Err):
-    err = _tmp_0.error
-    return Err(err)
-a = _tmp_0.value
-_tmp_1 = g(a)
-if isinstance(_tmp_1, Err):
-    err = _tmp_1.error
-    return Err(err)
-b = _tmp_1.value
-return Ok(a + b)
-```
+    ```
+  </TabItem>
+</Tabs>
 
 No nested `try` blocks, no exception machinery. Stack traces stay clean.
 

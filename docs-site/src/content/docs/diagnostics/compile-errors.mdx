@@ -64,9 +64,15 @@ Supported forms today:
 ```python
 lazy import np = numpy                            # module-level
 lazy let SETTINGS: Settings = load_settings()     # module-level value
+
 class Cache:
-    lazy let entries: dict[str, int] = {}         # class-body (becomes @cached_property)
+    name: str
+
+impl Cache:
+    lazy let entries: dict[str, int] = {}         # class-level (becomes @cached_property)
 ```
+
+Note the class-level form lives in an **`impl` block**, not in the class body itself — methods (including `lazy let` properties) belong in `impl` per [Rule 4](/Typhon/tour/five-rules/). Putting it inside the `class` body fires the standard `tyc::method_in_class_body` diagnostic.
 
 Unsupported forms (rejected with `tyc::lazy_usage`):
 

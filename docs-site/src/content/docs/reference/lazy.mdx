@@ -5,48 +5,48 @@ sidebar:
   order: 13
 ---
 
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
 `lazy` is Typhon's deferred-evaluation keyword. It comes in three forms: `lazy import`, `lazy let`, and `lazy[T]` return type.
 
 ## `lazy import`
 
 Defer module loading until first attribute access:
 
-```python
-lazy import np = numpy
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    lazy import np = numpy
 
-def main() -> None:
-    if len(sys.argv) > 1:
-        let arr: np.ndarray = np.array([1, 2, 3])   # numpy loaded here
-```
+    def main() -> None:
+        if len(sys.argv) > 1:
+            let arr: np.ndarray = np.array([1, 2, 3])   # numpy loaded here
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    class __TyphonLazy_np_:
+        _module = None
+        _lock = threading.Lock()
 
-`np` is a proxy until first access. Subsequent accesses pass through to the loaded module.
+        @classmethod
+        def _load(cls):
+            if cls._module is None:
+                with cls._lock:
+                    if cls._module is None:
+                        import numpy
+                        cls._module = numpy
+            return cls._module
 
-### Lowering
+        def __getattr__(self, name):
+            return getattr(self._load(), name)
 
-The desugarer generates a per-module proxy class with double-checked locking:
+    np = __TyphonLazy_np_()
+    ```
+  </TabItem>
+</Tabs>
 
-```python
-# Emitted (roughly)
-class __TyphonLazy_np_:
-    _module = None
-    _lock = threading.Lock()
-
-    @classmethod
-    def _load(cls):
-        if cls._module is None:
-            with cls._lock:
-                if cls._module is None:
-                    import numpy
-                    cls._module = numpy
-        return cls._module
-
-    def __getattr__(self, name):
-        return getattr(self._load(), name)
-
-np = __TyphonLazy_np_()
-```
-
-Thread-safe, one-shot. No runtime dependency required (the proxy class is inlined).
+`np` is a proxy until first access. Subsequent accesses pass through to the loaded module. The desugarer generates a per-module proxy class with double-checked locking — thread-safe, one-shot, and no runtime dependency required (the proxy is inlined).
 
 ### `lazy from` is rejected
 
@@ -64,63 +64,79 @@ PEP 690 explains why: `from`-imports eagerly resolve attributes, defeating defer
 
 ## `lazy let` (module-level)
 
-```python
-lazy let CONFIG: Config = load_config_from_disk()
-```
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    lazy let CONFIG: Config = load_config_from_disk()
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    from typhon_runtime.lazy import lazy_let as __typhon_lazy_let
 
-Defers the initialiser until first access. Lowers to a sentinel-cached `lazy_val(lambda: ...)` helper in `typhon_runtime`:
+    CONFIG: Config = __typhon_lazy_let(lambda: load_config_from_disk())
+    ```
+  </TabItem>
+</Tabs>
 
-```python
-# Emitted
-from typhon_runtime import lazy_val
-
-CONFIG = lazy_val(lambda: load_config_from_disk())
-```
-
-Unlike `functools.cached_property` (instance-scoped, race-prone, writable after first eval), `lazy_val` is thread-safe and one-shot.
+Defers the initialiser until first access. Lowers to a sentinel-cached `lazy_let(lambda: ...)` helper in `typhon_runtime.lazy`. Unlike `functools.cached_property` (instance-scoped, race-prone, writable after first eval), `lazy_let` is thread-safe and one-shot — the factory runs at most once across all threads, the result is cached, and the alias name (`__typhon_lazy_let`) keeps the helper out of the way of any user `lazy_let` binding.
 
 ## `lazy let` (class-level)
 
-Inside a class body, `lazy let` lowers to `@cached_property`:
+Inside a class body, `lazy let` lowers to `@cached_property`. The right-hand
+side is an expression — it runs once per instance, on first access, and
+the result is cached on the instance:
 
-```python
-class Server:
-    config_path: str
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    class Server:
+        config_path: str
 
-impl Server:
-    lazy let parsed_config: Config:
-        return load_config(self.config_path)
-```
+    impl Server:
+        lazy let parsed_config: Config = load_config(self.config_path)
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    import dataclasses
+    from functools import cached_property as _typhon_cached_property
 
-Emits:
 
-```python
-@dataclass(slots=True)
-class Server:
-    config_path: str
+    @dataclasses.dataclass()
+    class Server:
+        config_path: str
 
-    @cached_property
-    def parsed_config(self) -> Config:
-        return load_config(self.config_path)
-```
+        @_typhon_cached_property
+        def parsed_config(self) -> Config:
+            return load_config(self.config_path)
+    ```
+  </TabItem>
+</Tabs>
 
 Per-instance caching is the intended semantics inside classes.
 
-## `lazy[T]` return type
+## `lazy[T]` return type (roadmap)
+
+`def f(...) -> lazy[list[T]]: ...` is a designed-but-not-yet-implemented
+form. The intent is to emit a generator function so a caller that only
+takes a prefix doesn't pay for materialising the whole list:
 
 ```python
+# Designed form (not parsed today):
 def primes_up_to(n: int) -> lazy[list[int]]:
     let sieve: list[bool] = [True] * (n + 1)
     # ... compute ...
     return [i for i in range(2, n + 1) if sieve[i]]
 ```
 
-Emits as a generator function — useful when the caller may only need a prefix:
+Until the compiler grows this, write a plain generator by hand:
 
 ```python
-# Emitted (roughly)
+from collections.abc import Iterator
+
 def primes_up_to(n: int) -> Iterator[int]:
-    sieve: list[bool] = [True] * (n + 1)
+    let sieve: list[bool] = [True] * (n + 1)
     # ... compute ...
     for i in range(2, n + 1):
         if sieve[i]:
@@ -153,10 +169,10 @@ lazy let CONFIG: Config = load_config()
 CONFIG = Config(...)    # ❌ tyc::immutable_assign — lazy let is implicitly immutable
 ```
 
-Use a `lazy_val` plus an explicit `mut` wrapper if you genuinely need re-evaluation.
+Use `typhon_runtime.lazy.lazy_let` directly plus an explicit `mut` wrapper if you genuinely need re-evaluation.
 
 ## Where next
 
 - [`lazy` → proxies (lowering)](/Typhon/lowering/lazy/) — implementation details.
 - [Advanced Features (tour)](/Typhon/tour/advanced/) — teaching page.
-- [The typhon_runtime module](/Typhon/lowering/runtime/) — `lazy_val` and friends.
+- [The typhon_runtime module](/Typhon/lowering/runtime/) — `lazy_let` and the `_LazyValue` proxy.

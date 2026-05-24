@@ -5,7 +5,7 @@ sidebar:
   order: 10
 ---
 
-import { Aside } from '@astrojs/starlight/components';
+import { Aside, TabItem, Tabs } from '@astrojs/starlight/components';
 
 The features in this page are the ones you'll reach for once Typhon is part of your everyday workflow: composing transformations with pipes, computing values at build time with `comptime`, deferring expensive imports with `lazy`, opting into caching with `@pure`/`@memo`, and crossing the boundary into untyped Python with `unsafe` and `.dty` stubs.
 
@@ -31,13 +31,18 @@ let cleaned: str = str.replace(str.lower(str.strip(raw)), ",", "")
 
 `a |> f(arg)` is exactly `f(a, arg)`. Left-associative, the pipe argument fills the *first* positional slot:
 
-```python
-# Typhon
-result = x |> normalise() |> scale(2.0) |> clamp(0.0, 1.0)
-
-# Emitted Python
-result = clamp(scale(normalise(x), 2.0), 0.0, 1.0)
-```
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    result = x |> normalise() |> scale(2.0) |> clamp(0.0, 1.0)
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    result = clamp(scale(normalise(x), 2.0), 0.0, 1.0)
+    ```
+  </TabItem>
+</Tabs>
 
 No partial application, no curry — just position-1 threading.
 
@@ -155,27 +160,18 @@ numpy.array(...)
 lazy let CONFIG: Config = load_config_from_disk()
 ```
 
-This lowers to a sentinel-cached `lazy_val(lambda: load_config_from_disk())` helper emitted into `typhon_runtime`. First access pays the load cost; subsequent accesses are a memory read. Unlike `functools.cached_property` (which is instance-scoped, race-prone, and writable after first evaluation), the module-level helper is robust under concurrency and one-shot.
+This lowers to a sentinel-cached `lazy_let(lambda: load_config_from_disk())` helper emitted into `typhon_runtime`. First access pays the load cost; subsequent accesses are a memory read. Unlike `functools.cached_property` (which is instance-scoped, race-prone, and writable after first evaluation), the module-level helper is robust under concurrency and one-shot.
 
 Inside a class body, `lazy let` lowers to `@cached_property` because the per-instance scope is the intended semantics there.
 
-### `lazy` return types
+### `lazy` return types (roadmap)
 
-```python
-def primes_up_to(n: int) -> lazy[list[int]]:
-    let sieve: list[bool] = [True] * (n + 1)
-    mut p: int = 2
-    while p * p <= n:
-        if sieve[p]:
-            mut k: int = p * p
-            while k <= n:
-                sieve[k] = False
-                k = k + p
-        p = p + 1
-    return [i for i in range(2, n + 1) if sieve[i]]
-```
-
-`lazy[list[T]]` emits as a generator function instead of materialising the list — useful when the caller may only need a prefix.
+`def f(...) -> lazy[list[T]]:` is the designed-but-not-yet-implemented
+sibling of `lazy let`. The intent is for the body's `return [...]` to
+emit as a generator instead of materialising the list — useful when the
+caller may only need a prefix. Today the parser rejects the form; write
+a plain generator function (`-> Iterator[int]:` with `yield`) instead
+until the lowering lands.
 
 ## `@pure` and `@memo`
 
@@ -221,17 +217,22 @@ With this on, any function the analyser infers as pure gets `@functools.cache` a
 
 ### What `@memo` emits
 
-```python
-# Typhon
-@memo
-def fib(n: int) -> int: ...
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    @memo
+    def fib(n: int) -> int: ...
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    import functools
 
-# Emitted Python
-import functools
-
-@functools.cache
-def fib(n: int) -> int: ...
-```
+    @functools.cache
+    def fib(n: int) -> int: ...
+    ```
+  </TabItem>
+</Tabs>
 
 For bounded caches, use `@memo(max=128)`, which lowers to `@functools.lru_cache(maxsize=128)`.
 
@@ -303,44 +304,98 @@ Drift surfaces as `tyc::stub_mismatch` diagnostics with the standard severity wi
 
 A small but realistic module: a CLI that loads config at build time, lazily imports a heavy dependency, and memoises a hot lookup.
 
-```python
-import sys
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    import sys
 
-lazy import np = numpy
+    lazy import np = numpy
 
-comptime let DB_URL:    str = env("DATABASE_URL")
-comptime let MAX_BATCH: int = int(env("MAX_BATCH", "100"))
+    comptime let DB_URL:    str = env("DATABASE_URL")
+    comptime let MAX_BATCH: int = int(env("MAX_BATCH", "100"))
 
-class Config:
-    db: str
-    batch: int
+    class Config:
+        db: str
+        batch: int
 
-@pure
-def parse_arg(raw: str) -> Result[int, str]:
-    if raw.isdigit():
-        return Ok(int(raw))
-    return Err(f"not a number: {raw}")
+    @pure
+    def parse_arg(raw: str) -> Result[int, str]:
+        if raw.isdigit():
+            return Ok(int(raw))
+        return Err(f"not a number: {raw}")
 
-@memo
-def fib(n: int) -> int:
-    if n < 2:
-        return n
-    return fib(n - 1) + fib(n - 2)
+    @memo
+    def fib(n: int) -> int:
+        if n < 2:
+            return n
+        return fib(n - 1) + fib(n - 2)
 
-def main() -> None:
-    let cfg: Config = Config(db=DB_URL, batch=MAX_BATCH)
+    def main() -> None:
+        let cfg: Config = Config(db=DB_URL, batch=MAX_BATCH)
 
-    match parse_arg(sys.argv[1] if len(sys.argv) > 1 else "10"):
-        case Ok(n):
-            let series: list[int] = [fib(i) for i in range(n)]
-            let arr: np.ndarray = np.array(series)
-            print(arr |> np.diff() |> np.max())
-        case Err(msg):
-            print(f"bad input: {msg}")
+        match parse_arg(sys.argv[1] if len(sys.argv) > 1 else "10"):
+            case Ok(n):
+                let series: list[int] = [fib(i) for i in range(n)]
+                let arr: np.ndarray = np.array(series)
+                print(arr |> np.diff() |> np.max())
+            case Err(msg):
+                print(f"bad input: {msg}")
 
-if __name__ == "__main__":
-    main()
-```
+    if __name__ == "__main__":
+        main()
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    from __future__ import annotations
+    from typhon_runtime import Ok, Err, Result
+    import dataclasses
+    import functools
+    from typhon_runtime.lazy import lazy_import as __typhon_lazy_import
+    import sys
+
+    np = __typhon_lazy_import("numpy")
+    DB_URL: str = "postgresql://localhost/app"   # inlined from $DATABASE_URL at build
+    MAX_BATCH: int = 100                          # inlined from env("MAX_BATCH", "100")
+
+
+    @dataclasses.dataclass(slots=True)
+    class Config:
+        db: str
+        batch: int
+
+
+    def parse_arg(raw: str) -> Result[int, str]:
+        if raw.isdigit():
+            return Ok(int(raw))
+        return Err(f"not a number: {raw}")
+
+
+    @functools.cache
+    def fib(n: int) -> int:
+        if n < 2:
+            return n
+        return fib(n - 1) + fib(n - 2)
+
+
+    def main() -> None:
+        cfg: Config = Config(db=DB_URL, batch=MAX_BATCH)
+        match parse_arg(sys.argv[1] if len(sys.argv) > 1 else "10"):
+            case Ok(n):
+                series: list[int] = [fib(i) for i in range(n)]
+                arr: np.ndarray = np.array(series)
+                print(np.max(np.diff(arr)))
+            case Err(msg):
+                print(f"bad input: {msg}")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+  </TabItem>
+</Tabs>
+
+Every Typhon-specific feature on the page is visible in the lowering: `comptime let` becomes an inlined literal, `lazy import` rewrites to a `__typhon_lazy_import` proxy, `@pure` disappears (the verdict lives in the checker), `@memo` becomes `@functools.cache`, and the pipe chain `arr |> np.diff() |> np.max()` folds to `np.max(np.diff(arr))`.
 
 What this brings together:
 

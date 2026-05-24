@@ -5,6 +5,8 @@ sidebar:
   order: 4
 ---
 
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
 `T?` is sugar for `T | None`. Plain `T` cannot hold `None` — that is the core of Typhon's non-nullable-by-default rule. The checker tracks nullability flow-sensitively and narrows `T?` to `T` after the usual checks.
 
 ## Spelling
@@ -103,13 +105,18 @@ let name: str = maybe_name or "anonymous"
 
 ## How `T?` emits
 
-```python
-# Typhon
-def greet(name: str?) -> str: ...
-
-# Emitted Python
-def greet(name: str | None) -> str: ...
-```
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    def greet(name: str?) -> str: ...
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    def greet(name: str | None) -> str: ...
+    ```
+  </TabItem>
+</Tabs>
 
 Existing Python type checkers (mypy, pyright, IDEs) handle `T | None` natively. There is no Typhon-specific type to learn at the interop boundary.
 

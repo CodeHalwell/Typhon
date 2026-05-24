@@ -82,26 +82,30 @@ It may *not* contain:
 
 ## `model` — Pydantic emission
 
-```python
-model ApiUser:
-    id: int
-    email: str
-    name: str = "anon"
-```
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    model ApiUser:
+        id: int
+        email: str
+        name: str = "anon"
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    from pydantic import BaseModel, ConfigDict
+
+    class ApiUser(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
+        id: int
+        email: str
+        name: str = "anon"
+    ```
+  </TabItem>
+</Tabs>
 
 Emits a Pydantic `BaseModel` with `extra="forbid"`:
-
-```python
-# Emitted
-from pydantic import BaseModel, ConfigDict
-
-class ApiUser(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    id: int
-    email: str
-    name: str = "anon"
-```
 
 ### Validation
 

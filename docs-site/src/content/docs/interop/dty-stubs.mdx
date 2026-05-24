@@ -5,6 +5,8 @@ sidebar:
   order: 3
 ---
 
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
 A `.dty` stub describes a Python module's API in Typhon's strict dialect (`T?`, `Result[T, E]`, sealed unions, interfaces). The compiler:
 
 - Checks your code against the stub at build time.
@@ -16,20 +18,38 @@ Place `.dty` files inside your configured `src/` directory (commonly `src/stubs/
 
 ## Example
 
-```python
-# src/stubs/redis.dty
-class Redis:
-    host: str
-    port: int
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    # src/stubs/redis.dty
+    class Redis:
+        host: str
+        port: int
 
-impl Redis:
-    def get(self, key: str) -> str?
-    def set(self, key: str, value: str) -> bool
-    def delete(self, *keys: str) -> int
-    def keys(self, pattern: str) -> list[str]
+    impl Redis:
+        def get(self, key: str) -> str?
+        def set(self, key: str, value: str) -> bool
+        def delete(self, *keys: str) -> int
+        def keys(self, pattern: str) -> list[str]
 
-def from_url(url: str) -> Redis
-```
+    def from_url(url: str) -> Redis
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    class Redis:
+        host: str
+        port: int
+
+        def get(self, key: str) -> str | None: ...
+        def set(self, key: str, value: str) -> bool: ...
+        def delete(self, *keys: str) -> int: ...
+        def keys(self, pattern: str) -> list[str]: ...
+
+    def from_url(url: str) -> Redis: ...
+    ```
+  </TabItem>
+</Tabs>
 
 Notes:
 
@@ -39,20 +59,6 @@ Notes:
 - Free functions sit at module level.
 
 ## What emits as `.pyi`
-
-```python
-# Emitted alongside build/redis.py (or, for an external module, build/redis.pyi)
-class Redis:
-    host: str
-    port: int
-
-    def get(self, key: str) -> str | None: ...
-    def set(self, key: str, value: str) -> bool: ...
-    def delete(self, *keys: str) -> int: ...
-    def keys(self, pattern: str) -> list[str]: ...
-
-def from_url(url: str) -> Redis: ...
-```
 
 Standard PEP 561 stub. Method bodies become `...`.
 

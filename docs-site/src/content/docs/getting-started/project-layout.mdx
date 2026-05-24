@@ -109,13 +109,13 @@ The output directory (configurable via `[project] out`). Created by `tyc build`;
     - __init__.py
     - tasks.py                  Strong-ref task registry for `go`
     - result.py                 Ok / Err / Result classes
-    - lazy.py                   `lazy_val` helper
+    - lazy.py                   `lazy_let` helper
 
 </FileTree>
 
 ### `typhon_runtime/`
 
-A small, generated Python module with the helpers Typhon programs need: the `Result` ADT (`Ok` / `Err`), the `lazy_val` thread-safe one-shot helper, the `tasks.spawn` strong-ref registry. **It is not on PyPI** — it is generated source the build owns. If you don't use `Result`, `lazy let`, or `go`, the module isn't emitted at all.
+A small, generated Python module with the helpers Typhon programs need: the `Result` ADT (`Ok` / `Err`), the `lazy_let` thread-safe one-shot helper, the `tasks.spawn` strong-ref registry. **It is not on PyPI** — it is generated source the build owns. If you don't use `Result`, `lazy let`, or `go`, the module isn't emitted at all.
 
 This is by design: production servers run the emitted Python plus this small helper. There is no Typhon package to install anywhere.
 
