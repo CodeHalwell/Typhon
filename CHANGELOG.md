@@ -19,28 +19,28 @@ previously-accepted program changes behaviour.
 
 ### Fixed — compiler
 
-- **`tyc-syntax`: `<ident>?` propagation lowered to `<ident> | None`.**
+- **`tyc-syntax`: `<ident>?` in value position now lowers to the standard `__typhon_q_N__` ladder.**
   `let x: T = a?` after a `gather:` block (or any time the operand
-  was a bare identifier rather than a paren-prefixed call `f()?`) was
-  silently rewritten as `x: T = a | None`, then crashed at runtime
-  with `TypeError: unsupported operand type(s) for |: 'Ok' and
-  'NoneType'`. The propagation pass only recognised `f()?` because it
-  required the character before `?` to be `)`. It now disambiguates
-  by RHS position: when the line has an `=` and the identifier-then-`?`
-  sits on the RHS, or when the line begins with `return` / `yield` /
-  `raise`, treat the trailing `?` as the propagation operator and
-  emit the standard `__typhon_q_N__` ladder. Pure annotation forms
-  (`let x: int?`, `let x: list[int]?`) are unchanged. Unblocks the
-  natural `gather:` → `?` → `Ok(...)` shape used across the tour,
-  first-program, and recipes docs.
-- **`tyc-types`: `set - set` rejected as `tyc::operator_type_mismatch`.**
+  was a bare identifier rather than a paren-prefixed call `f()?`)
+  used to be silently rewritten as `x: T = a | None`, then crash at
+  runtime with `TypeError: unsupported operand type(s) for |: 'Ok'
+  and 'NoneType'`. The propagation pass only recognised `f()?`
+  because it required the character before `?` to be `)`. It now
+  disambiguates by RHS position: when the line has an `=` and the
+  identifier-then-`?` sits on the RHS, treat the trailing `?` as
+  propagation and emit the standard `__typhon_q_N__` ladder. Pure
+  annotation forms (`let x: int?`, `let x: list[int]?`) and type
+  aliases (`type X = T?`, `newtype Y = T?`) are unchanged. Unblocks
+  the natural `gather:` → `?` → `Ok(...)` shape used across the
+  tour, first-program, and recipes docs.
+- **`tyc-types`: `set - set` and `frozenset - frozenset` now type-check as Python set difference.**
   The operator-compatibility check for `-` accepted only numeric
-  operands. The Python set-difference form (`{1, 2, 3} - {2, 3, 4}`)
-  was rejected even though the sibling bitwise operators `&`, `|`,
-  `^` (which fall through to the permissive arm) worked. Added an
-  explicit carve-out for `Operator::Sub` between two `set` /
-  `frozenset` operands, matching the existing carve-outs for `+` on
-  `list` / `list` and `tuple` / `tuple`. Closes the
+  operands; the Python set-difference form (`{1, 2, 3} - {2, 3, 4}`)
+  fired `tyc::operator_type_mismatch` even though the sibling bitwise
+  operators `&`, `|`, `^` (which fall through to the permissive arm)
+  worked. Added an explicit carve-out for `Operator::Sub` between two
+  `set` / `frozenset` operands, matching the existing carve-outs for
+  `+` on `list` / `list` and `tuple` / `tuple`. Closes the
   `types/collections.mdx` set-operations example.
 
 ### Changed — documentation

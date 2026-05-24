@@ -152,7 +152,7 @@ def lazy_let(factory: Callable[[], _T]) -> _T:
     return _LazyValue(factory)  # type: ignore[return-value]
 ```
 
-The proxy intentionally implements `__str__` / `__bool__` / `__eq__` / `__len__` etc. so plain `print(CFG)` and `if CFG:` work as you'd expect against the materialised value — FINDINGS #105.
+The proxy intentionally implements `__str__` / `__bool__` / `__eq__` / `__len__` etc. so plain `print(CFG)` and `if CFG:` work as you'd expect against the materialised value rather than landing on the proxy's `<lazy: unmaterialised>` debug repr.
 
 ## `typhon_runtime/result.py`
 
@@ -185,4 +185,4 @@ You can't. `typhon_runtime/` is generated; it gets overwritten on every `tyc bui
 
 - [Result → typhon_runtime](/Typhon/lowering/result/) — `Ok`, `Err`, and the `?` operator.
 - [go → spawn registry](/Typhon/lowering/go/) — task registry details.
-- [lazy → proxies](/Typhon/lowering/lazy/) — `lazy_val` and the proxy classes.
+- [lazy → proxies](/Typhon/lowering/lazy/) — `lazy_let` and the proxy classes.

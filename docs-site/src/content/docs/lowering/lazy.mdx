@@ -50,7 +50,7 @@ import { Tabs, TabItem } from '@astrojs/starlight/components';
 
 Thread-safe (double-checked locking), one-shot. No `typhon_runtime` dependency — the proxy is inlined.
 
-## `lazy let` (module-level) → `lazy_val`
+## `lazy let` (module-level) → `lazy_let`
 
 <Tabs>
   <TabItem label="Typhon">
@@ -60,40 +60,57 @@ Thread-safe (double-checked locking), one-shot. No `typhon_runtime` dependency �
   </TabItem>
   <TabItem label="Emitted">
     ```python
-    from typhon_runtime import lazy_val
+    from typhon_runtime.lazy import lazy_let as __typhon_lazy_let
 
-    CONFIG = lazy_val(lambda: load_config_from_disk())
+    CONFIG: Config = __typhon_lazy_let(lambda: load_config_from_disk())
     ```
   </TabItem>
 </Tabs>
 
-The runtime helper:
+The runtime helper is `typhon_runtime.lazy.lazy_let`, which returns a `_LazyValue` proxy that materialises on first attribute access (or call, subscript, iteration, `str`, `bool`, …). The aliased import name `__typhon_lazy_let` keeps the helper out of the way of any user binding called `lazy_let`. Excerpt:
 
 ```python
 # build/typhon_runtime/lazy.py
 import threading
+from typing import Callable, TypeVar
 
-_SENTINEL = object()
+_T = TypeVar("_T")
+_UNSET = object()
 
-class lazy_val:
+class _LazyValue:
     __slots__ = ("_factory", "_value", "_lock")
 
-    def __init__(self, factory):
-        self._factory = factory
-        self._value = _SENTINEL
-        self._lock = threading.Lock()
+    def __init__(self, factory: Callable[[], _T]) -> None:
+        object.__setattr__(self, "_factory", factory)
+        object.__setattr__(self, "_value", _UNSET)
+        object.__setattr__(self, "_lock", threading.Lock())
 
-    def __call__(self):
-        if self._value is _SENTINEL:
-            with self._lock:
-                if self._value is _SENTINEL:
-                    self._value = self._factory()
-        return self._value
+    def _materialise(self) -> object:
+        value = object.__getattribute__(self, "_value")
+        if value is _UNSET:
+            with object.__getattribute__(self, "_lock"):
+                value = object.__getattribute__(self, "_value")
+                if value is _UNSET:
+                    factory = object.__getattribute__(self, "_factory")
+                    value = factory()
+                    object.__setattr__(self, "_value", value)
+        return value
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._materialise(), name)
+
+    # __call__, __getitem__, __iter__, __str__, __bool__, __eq__, __hash__,
+    # __len__ all forward to the materialised value as well, so the proxy
+    # is mostly transparent.
+
+
+def lazy_let(factory: Callable[[], _T]) -> _T:
+    return _LazyValue(factory)  # type: ignore[return-value]
 ```
 
-Access with `CONFIG()` (callable). Subsequent calls are a memory read.
+Access is transparent: write `CONFIG.host`, `CONFIG["port"]`, `print(CONFIG)` and the proxy materialises on first use, then forwards every subsequent operation.
 
-Why not `functools.cached_property`? Because `cached_property` is instance-scoped, writable after first evaluation, and not robust under concurrency. `lazy_val` is the module-level equivalent that gets all three right.
+Why not `functools.cached_property`? Because `cached_property` is instance-scoped, writable after first evaluation, and not robust under concurrency. `lazy_let` is the module-level equivalent that gets all three right.
 
 ## `lazy let` (class-level) → `@cached_property`
 
@@ -167,4 +184,4 @@ PEP 690's analysis: `from`-imports eagerly resolve attributes, defeating deferra
 ## Where next
 
 - [`lazy` reference](/Typhon/reference/lazy/) — the full surface.
-- [The typhon_runtime module](/Typhon/lowering/runtime/) — `lazy_val` details.
+- [The typhon_runtime module](/Typhon/lowering/runtime/) — `lazy_let` and `_LazyValue` details.

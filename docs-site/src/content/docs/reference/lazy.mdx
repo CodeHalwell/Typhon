@@ -72,14 +72,14 @@ PEP 690 explains why: `from`-imports eagerly resolve attributes, defeating defer
   </TabItem>
   <TabItem label="Emitted Python">
     ```python
-    from typhon_runtime import lazy_val
+    from typhon_runtime.lazy import lazy_let as __typhon_lazy_let
 
-    CONFIG = lazy_val(lambda: load_config_from_disk())
+    CONFIG: Config = __typhon_lazy_let(lambda: load_config_from_disk())
     ```
   </TabItem>
 </Tabs>
 
-Defers the initialiser until first access. Lowers to a sentinel-cached `lazy_val(lambda: ...)` helper in `typhon_runtime`. Unlike `functools.cached_property` (instance-scoped, race-prone, writable after first eval), `lazy_val` is thread-safe and one-shot.
+Defers the initialiser until first access. Lowers to a sentinel-cached `lazy_let(lambda: ...)` helper in `typhon_runtime.lazy`. Unlike `functools.cached_property` (instance-scoped, race-prone, writable after first eval), `lazy_let` is thread-safe and one-shot — the factory runs at most once across all threads, the result is cached, and the alias name (`__typhon_lazy_let`) keeps the helper out of the way of any user `lazy_let` binding.
 
 ## `lazy let` (class-level)
 
@@ -169,10 +169,10 @@ lazy let CONFIG: Config = load_config()
 CONFIG = Config(...)    # ❌ tyc::immutable_assign — lazy let is implicitly immutable
 ```
 
-Use a `lazy_val` plus an explicit `mut` wrapper if you genuinely need re-evaluation.
+Use `typhon_runtime.lazy.lazy_let` directly plus an explicit `mut` wrapper if you genuinely need re-evaluation.
 
 ## Where next
 
 - [`lazy` → proxies (lowering)](/Typhon/lowering/lazy/) — implementation details.
 - [Advanced Features (tour)](/Typhon/tour/advanced/) — teaching page.
-- [The typhon_runtime module](/Typhon/lowering/runtime/) — `lazy_val` and friends.
+- [The typhon_runtime module](/Typhon/lowering/runtime/) — `lazy_let` and the `_LazyValue` proxy.

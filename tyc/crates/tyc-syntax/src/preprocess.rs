@@ -3437,10 +3437,16 @@ pub fn expand_question_ops(source: &str) -> String {
         //                           so the trailing `?` would never reach here
         //                           (it's not at end of line in that shape).
         // - `let x: list[int]?`   — no `=`, ends with `]?`, treated as nullable.
-        // - `return user_r?`      — no `=`; allow bare-identifier propagation.
+        // - `type X = T?`         — `T?` is type-position despite the `=`;
+        //                           the keyword introduces a type alias, not
+        //                           a value binding. Same for `newtype X = T?`.
+        // - `return f()?` / `Ok(f()?)` — handled by the inline-`?` pass
+        //                           (expand_inline_question_ops) running
+        //                           earlier in the pipeline; this pass only
+        //                           processes the end-of-line statement form.
         //
-        // Keep `T?` annotations as a no-op when there is no assignment AND the
-        // expression looks like a type rather than a value.
+        // Keep `T?` annotations as a no-op when there is no assignment, or
+        // when the assignment is a type-alias declaration.
         let before_q = &content[..content.len() - 1];
         let last_ch = before_q.chars().last();
         let trailing_is_close_paren = matches!(last_ch, Some(')'));
@@ -3448,17 +3454,21 @@ pub fn expand_question_ops(source: &str) -> String {
             // We're at `<expr>?` where <expr> ends with an identifier, `]`,
             // or `_`. Decide whether this is value-position propagation or
             // type-position nullable sugar.
-            let is_value_position = match (&lhs, rhs.as_str()) {
-                // assignment: `a = X?` → X is value position
-                (Some(_), _) => true,
-                // bare statement: `return X?`, `yield X?`, `Ok(X)?`, etc.
-                // Detect common value-position prefixes.
-                (None, r) => {
-                    let trimmed = r.trim_start();
-                    trimmed.starts_with("return ")
-                        || trimmed.starts_with("yield ")
-                        || trimmed.starts_with("raise ")
+            let first_word = |s: &str| s.split_whitespace().next().map(|w| w.to_owned());
+            let is_value_position = match &lhs {
+                // assignment: `a = X?` → X is value position, EXCEPT when the
+                // LHS starts with `type` or `newtype` — those introduce a
+                // type alias / nominal alias and the RHS is a type expression
+                // where `?` is nullable-type sugar (`type Maybe = int?` ⇒
+                // `type Maybe = int | None`).
+                Some(l) => {
+                    let first = first_word(l);
+                    first.as_deref() != Some("type") && first.as_deref() != Some("newtype")
                 }
+                // No assignment → either a type annotation (`let x: T?`) on
+                // its own line, or a bare statement form the inline-`?` pass
+                // should have handled. Leave the line untouched.
+                None => false,
             };
             if !is_value_position {
                 // No assignment AND no value-position keyword → leave alone
@@ -6879,6 +6889,54 @@ mod tests {
         let src = "msg = \"\"\"\ncall f()?\n\"\"\"\n";
         let out = expand_question_ops(src);
         assert_eq!(out, src, "triple-string content must not be expanded");
+    }
+
+    #[test]
+    fn question_op_preserves_value_position_bare_identifier() {
+        // `let x: T = a?` is value-position propagation: the trailing `?`
+        // applies to the value `a` and must lower to the standard
+        // `__typhon_q_N__` ladder. The old behaviour silently rewrote it
+        // to `x: T = a | None` via the nullable-type pass, which crashed
+        // at runtime with `TypeError`.
+        let src = "    let av: int = a?\n";
+        let out = expand_question_ops(src);
+        assert!(out.contains("__typhon_q_0__ = a"), "out: {out}");
+        assert!(
+            out.contains("if isinstance(__typhon_q_0__, __typhon_Err__):"),
+            "out: {out}"
+        );
+        assert!(
+            out.contains("let av: int = __typhon_q_0__.value"),
+            "out: {out}"
+        );
+    }
+
+    #[test]
+    fn question_op_preserves_type_alias_nullable() {
+        // `type X = T?` is a type alias; the trailing `?` is nullable
+        // type sugar, not the propagation operator. Must not be rewritten
+        // into a `__typhon_q_N__` ladder.
+        let src = "type Maybe = int?\n";
+        let out = expand_question_ops(src);
+        assert_eq!(out, src, "type alias must be copied verbatim");
+    }
+
+    #[test]
+    fn question_op_preserves_generic_type_alias_nullable() {
+        // `type X[T] = T?` is also a type alias even though the RHS is a
+        // bare identifier.
+        let src = "type Maybe[T] = T?\n";
+        let out = expand_question_ops(src);
+        assert_eq!(out, src, "generic type alias must be copied verbatim");
+    }
+
+    #[test]
+    fn question_op_preserves_newtype_nullable() {
+        // `newtype X = T?` is a nominal alias; the trailing `?` is
+        // nullable type sugar and the RHS is a type expression.
+        let src = "newtype MyOpt = int?\n";
+        let out = expand_question_ops(src);
+        assert_eq!(out, src, "newtype declaration must be copied verbatim");
     }
 
     // ── inline `?` propagation in sub-expressions (O17) ─────────────────────

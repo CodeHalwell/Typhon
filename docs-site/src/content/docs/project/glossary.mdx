@@ -22,7 +22,7 @@ sidebar:
 | **`impl`** | Method block attached to a class. Methods take `self` explicitly; merged into the class at desugar. |
 | **`interface`** | Structural contract. Lowers to `class Name(Protocol):`. |
 | **`lazy import`** | Deferred module import via a proxy class. Thread-safe with double-checked locking. |
-| **`lazy let`** | Deferred binding. Module-level → `lazy_val(lambda: ...)`. Class-level → `@cached_property`. |
+| **`lazy let`** | Deferred binding. Module-level → `lazy_let(lambda: ...)`. Class-level → `@cached_property`. |
 | **`let`** | Immutable local binding. Reassignment is `tyc::immutable_assign`. |
 | **`miette`** | The Rust crate Typhon uses for diagnostic rendering. |
 | **`model`** | Class form for Pydantic `BaseModel` emission. Always `extra="forbid"` in v1. |

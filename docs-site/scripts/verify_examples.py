@@ -30,9 +30,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
-import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -65,26 +63,50 @@ unused-import = "warn"
 exhaustive-match = "error"
 """
 
+# Diagnostics that *always* indicate a partial-snippet false positive.
+# Standalone failures with only these codes are downgraded to noise.
 PARTIAL_SNIPPET_CODES = {
     "tyc::unknown_name",
     "tyc::main_not_called",
     "tyc::missing_argument",
     "tyc::missing_annotation",
     "tyc::unsafe_unused_block",
-    # `missing_return` only counts as partial-snippet noise when paired
-    # with `unknown_name` — if the function references undefined types,
-    # the analyser can't prove exhaustiveness over them, so this is
-    # downstream noise rather than a real bug. The classifier checks
-    # `codes & {missing_return} and codes & {unknown_name}` semantics
-    # below.
+}
+
+# Diagnostics that are *sometimes* partial-snippet noise — only when they
+# co-occur with `tyc::unknown_name`, which is the strong "this snippet
+# references something defined earlier on the page" signal. A standalone
+# `missing_return` / `unused_import` / `type_mismatch` is a real bug that
+# must surface in `--real-only` output and counts.
+PAIRED_NOISE_CODES = {
+    # `missing_return` chains off `unknown_name` when the function
+    # references undefined return-type variants and the analyser can't
+    # prove the match is exhaustive over them.
     "tyc::missing_return",
-    # `unused_import` similarly chains off `unknown_name` when a partial
-    # snippet imports something it never gets to use.
+    # `unused_import` chains off `unknown_name` when a partial snippet
+    # imports something it never gets to use because the use is in code
+    # that didn't make it into the snippet.
     "tyc::unused_import",
-    # `type_mismatch` chains off unknown_name when the referenced type
-    # can't be resolved; downgrade to partial-noise only when paired.
+    # `type_mismatch` chains off `unknown_name` when the referenced type
+    # can't be resolved.
     "tyc::type_mismatch",
 }
+
+
+def is_partial_snippet_noise(codes: set[str]) -> bool:
+    """True when the failure's diagnostics look like partial-snippet noise."""
+    if not codes:
+        return False
+    # Pure partial-snippet codes only?
+    if codes <= PARTIAL_SNIPPET_CODES:
+        return True
+    # Mixed with paired-noise codes, BUT only when `unknown_name` is also
+    # present — that's the signal that "the snippet references names
+    # defined earlier in the page". Otherwise the paired-noise codes
+    # represent real bugs.
+    if "tyc::unknown_name" in codes and codes <= (PARTIAL_SNIPPET_CODES | PAIRED_NOISE_CODES):
+        return True
+    return False
 
 
 def find_tyc() -> str:
@@ -210,27 +232,25 @@ def looks_like_emitted_python(body: str) -> bool:
 
 
 def compile_typhon(tyc: str, body: str) -> dict:
-    tmp = tempfile.mkdtemp(prefix="tyc_audit_")
     try:
-        (Path(tmp) / "typhon.toml").write_text(DEFAULT_TYPHON_TOML)
-        src = Path(tmp) / "src"
-        src.mkdir()
-        (src / "main.ty").write_text(body)
-        proc = subprocess.run(
-            [tyc, "build"],
-            cwd=tmp,
-            capture_output=True,
-            text=True,
-            timeout=TIMEOUT_SECS,
-        )
-        return {
-            "build_ok": proc.returncode == 0,
-            "build_output": proc.stdout + "\n" + proc.stderr,
-        }
+        with tempfile.TemporaryDirectory(prefix="tyc_audit_") as tmp:
+            (Path(tmp) / "typhon.toml").write_text(DEFAULT_TYPHON_TOML)
+            src = Path(tmp) / "src"
+            src.mkdir()
+            (src / "main.ty").write_text(body)
+            proc = subprocess.run(
+                [tyc, "build"],
+                cwd=tmp,
+                capture_output=True,
+                text=True,
+                timeout=TIMEOUT_SECS,
+            )
+            return {
+                "build_ok": proc.returncode == 0,
+                "build_output": proc.stdout + "\n" + proc.stderr,
+            }
     except subprocess.TimeoutExpired:
         return {"build_ok": False, "build_output": "TIMEOUT"}
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def process_file(tyc: str, path: Path):
@@ -301,7 +321,7 @@ def main() -> int:
             if r["ok"]:
                 continue
             codes = set(re.findall(r"tyc::\w+", r.get("output", "")))
-            if codes and codes <= PARTIAL_SNIPPET_CODES:
+            if is_partial_snippet_noise(codes):
                 partial_fails += 1
             else:
                 real_fails += 1
@@ -319,7 +339,7 @@ def main() -> int:
                 if r["ok"]:
                     continue
                 codes = set(re.findall(r"tyc::\w+", r.get("output", "")))
-                if codes and codes <= PARTIAL_SNIPPET_CODES:
+                if is_partial_snippet_noise(codes):
                     continue
                 keep.append(r)
             if keep:

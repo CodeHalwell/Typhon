@@ -36,7 +36,7 @@ The canonical per-feature status lives in the [Roadmap](/Typhon/project/roadmap/
 - ✅ `@pure` / `@memo` / `@pure(memo=True)` decorators with the six-condition purity check.
 - ✅ `gather:` blocks lowering to `asyncio.TaskGroup` (default) or `asyncio.gather(return_exceptions=True)` (`strategy="best-effort"`).
 - ✅ `go f(x)` lowered through `typhon_runtime.tasks.spawn` with a strong-ref registry.
-- ✅ `lazy import np = numpy` with a thread-safe proxy class (`__TyphonLazy_np_`); `lazy from x import …` rejected at parse time. Module-level `lazy let` → `lazy_val(lambda: ...)`; class-body `lazy let` → `@cached_property`.
+- ✅ `lazy import np = numpy` with a thread-safe proxy class (`__TyphonLazy_np_`); `lazy from x import …` rejected at parse time. Module-level `lazy let` → `lazy_let(lambda: ...)`; class-body `lazy let` → `@cached_property`.
 - ✅ Pipes (`a |> f() |> g(arg)` → `g(f(a), arg)`); guards (`guard x = expr else: ...`).
 - ✅ `comptime let` bindings with `env(name, default?)` lookup and the sandboxed evaluator (literals, arithmetic, comparisons, boolean ops, ternaries, `int() / str() / float()` casts, `if/elif/else`, `return`, local bindings). `comptime def` user-defined functions usable from initialisers.
 - ✅ `.dty` stub files compiling to PEP 561 `.pyi`; `tyc check --stubs` AST diff against runtime modules.
