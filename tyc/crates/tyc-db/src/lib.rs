@@ -704,8 +704,10 @@ fn build_external_shapes(
     // import name, so a `from foo import A as MyA` translates the
     // variants list of an imported sealed union into the same local
     // names the consumer's `class_shapes` is keyed under.
-    let mut local_by_module: std::collections::HashMap<String, std::collections::HashMap<String, String>> =
-        std::collections::HashMap::new();
+    let mut local_by_module: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, String>,
+    > = std::collections::HashMap::new();
     for b in bindings {
         if let Some(info) = &b.import_info {
             if let Some(member) = info.member.as_ref() {
