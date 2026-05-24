@@ -6153,8 +6153,7 @@ mod tests {
         // second identical line — PR #120 caught the duplicate in the
         // emitted Python because the comparison forgot to strip the
         // trailing newline before matching against IMPORT_LINE.
-        let body =
-            "from __future__ import annotations\n\
+        let body = "from __future__ import annotations\n\
              from typhon_runtime import Err as __typhon_Err__\n\
              import dataclasses\n\
              pass\n";
