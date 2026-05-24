@@ -12,6 +12,14 @@ use ruff_python_ast::{
 };
 use ruff_text_size::Ranged;
 
+const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+
+fn push_hex_escape(out: &mut String, byte: u8) {
+    out.push_str("\\x");
+    out.push(HEX_CHARS[(byte >> 4) as usize] as char);
+    out.push(HEX_CHARS[(byte & 0x0f) as usize] as char);
+}
+
 /// Internal state for the Python pretty-printer.
 pub struct Emitter {
     output: String,
@@ -120,6 +128,10 @@ impl Emitter {
 
     fn write(&mut self, s: &str) {
         self.output.push_str(s);
+    }
+
+    fn write_hex_escape(&mut self, byte: u8) {
+        push_hex_escape(&mut self.output, byte);
     }
 
     fn writeln(&mut self, s: &str) {
@@ -1263,6 +1275,7 @@ impl Emitter {
 
             Expr::BytesLiteral(b) => {
                 self.write("b\"");
+                let mut buf = [0; 4];
                 for byte in b.value.bytes() {
                     match byte {
                         b'\\' => self.write("\\\\"),
@@ -1272,8 +1285,8 @@ impl Emitter {
                         b'\t' => self.write("\\t"),
                         // Keep printable ASCII as-is so `b"hello"` reads as
                         // `b"hello"` instead of `b"\x68\x65\x6c\x6c\x6f"`.
-                        0x20..=0x7e => self.write(&(byte as char).to_string()),
-                        _ => self.write(&format!("\\x{:02x}", byte)),
+                        0x20..=0x7e => self.write((byte as char).encode_utf8(&mut buf)),
+                        _ => self.write_hex_escape(byte),
                     }
                 }
                 self.write("\"");
@@ -1855,7 +1868,7 @@ fn escape_python_string_with_quote(s: &str, quote: char) -> String {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             '\x00'..='\x1f' | '\x7f' => {
-                out.push_str(&format!("\\x{:02x}", ch as u32));
+                push_hex_escape(&mut out, ch as u8);
             }
             c => out.push(c),
         }
@@ -1916,7 +1929,7 @@ fn escape_python_fstring_literal(s: &str, quote: char) -> String {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             '\x00'..='\x1f' | '\x7f' => {
-                out.push_str(&format!("\\x{:02x}", ch as u32));
+                push_hex_escape(&mut out, ch as u8);
             }
             c => out.push(c),
         }
