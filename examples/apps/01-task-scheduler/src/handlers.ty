@@ -1,0 +1,62 @@
+import random
+import time
+
+from scheduler import HandlerFailure, HandlerOk, HandlerResult
+
+
+pub class HelloHandler:
+    pass
+
+
+impl HelloHandler:
+    def name(self) -> str:
+        return "hello"
+
+    def run(self, args: dict[str, object]) -> HandlerResult:
+        let who: str = str(args.get("name") or "world")
+        return HandlerOk(summary=f"hello, {who}")
+
+
+pub class SlowHandler:
+    pass
+
+
+impl SlowHandler:
+    def name(self) -> str:
+        return "slow"
+
+    def run(self, args: dict[str, object]) -> HandlerResult:
+        let seconds: float = float(args.get("seconds") or 1.0)
+        time.sleep(seconds)
+        return HandlerOk(summary=f"slept {seconds:.2f}s")
+
+
+pub class FlakyHandler:
+    pass
+
+
+impl FlakyHandler:
+    def name(self) -> str:
+        return "flaky"
+
+    def run(self, args: dict[str, object]) -> HandlerResult:
+        let fail_rate: float = float(args.get("fail_rate") or 0.5)
+        if random.random() < fail_rate:
+            return HandlerFailure(message="flaked", retryable=True)
+        return HandlerOk(summary="flaky succeeded")
+
+
+pub class AlwaysFailHandler:
+    pass
+
+
+impl AlwaysFailHandler:
+    def name(self) -> str:
+        return "always_fail"
+
+    def run(self, args: dict[str, object]) -> HandlerResult:
+        let retryable: bool = bool(args.get("retryable") or False)
+        return HandlerFailure(
+            message=str(args.get("message") or "boom"),
+            retryable=retryable,
+        )

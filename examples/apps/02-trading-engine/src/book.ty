@@ -1,0 +1,108 @@
+from ids import OrderId, Symbol
+from money import Price, Qty, add_qty, sub_qty
+from orders import Buy, Order, Sell, Side, side_label
+
+
+pub class BookLevel:
+    price: Price
+    qty: Qty
+    orders: list[OrderId]
+
+
+pub class OrderBook:
+    symbol: Symbol
+    bids: list[BookLevel]
+    asks: list[BookLevel]
+
+
+def _insert_sorted(levels: list[BookLevel], level: BookLevel, descending: bool) -> None:
+    mut idx: int = 0
+    while idx < len(levels):
+        let p: int = int(levels[idx].price)
+        let target: int = int(level.price)
+        if descending:
+            if target > p:
+                break
+        else:
+            if target < p:
+                break
+        idx = idx + 1
+    levels.insert(idx, level)
+
+
+impl OrderBook:
+    def best_bid(self) -> BookLevel?:
+        return self.bids[0] if len(self.bids) > 0 else None
+
+    def best_ask(self) -> BookLevel?:
+        return self.asks[0] if len(self.asks) > 0 else None
+
+    def spread(self) -> int?:
+        let b: BookLevel? = self.best_bid()
+        let a: BookLevel? = self.best_ask()
+        if b is None or a is None:
+            return None
+        return int(a.price) - int(b.price)
+
+    def add_resting(self, order: Order, price: Price, remaining: Qty) -> None:
+        let levels: list[BookLevel] = self.bids if isinstance(order.side, Buy) else self.asks
+        let descending: bool = isinstance(order.side, Buy)
+        mut placed: bool = False
+        for level in levels:
+            if int(level.price) == int(price):
+                level.qty = add_qty(level.qty, remaining)
+                level.orders.append(order.id)
+                placed = True
+                break
+        if not placed:
+            let lvl: BookLevel = BookLevel(
+                price=price,
+                qty=remaining,
+                orders=[order.id],
+            )
+            _insert_sorted(levels, lvl, descending)
+
+    def drain_top(self, side: Side, fill: Qty) -> Qty:
+        let levels: list[BookLevel] = self.bids if isinstance(side, Buy) else self.asks
+        if len(levels) == 0:
+            return Qty(0)
+        let level: BookLevel = levels[0]
+        let drained: Qty = fill if int(fill) < int(level.qty) else level.qty
+        level.qty = sub_qty(level.qty, drained)
+        if int(level.qty) <= 0:
+            levels.pop(0)
+        return drained
+
+    def remove_order(self, order_id: OrderId, side: Side) -> bool:
+        let levels: list[BookLevel] = self.bids if isinstance(side, Buy) else self.asks
+        mut found: bool = False
+        for level in levels:
+            if order_id in level.orders:
+                level.orders.remove(order_id)
+                found = True
+        return found
+
+    def render(self) -> str:
+        mut out: list[str] = [f"=== {self.symbol} ==="]
+        for lvl in self.asks[:5][::-1]:
+            out.append(f"  ASK {int(lvl.price):>6}  x{int(lvl.qty):>4}")
+        out.append("  -----")
+        for lvl in self.bids[:5]:
+            out.append(f"  BID {int(lvl.price):>6}  x{int(lvl.qty):>4}")
+        return "\n".join(out)
+
+
+pub def new_book(symbol: Symbol) -> OrderBook:
+    return OrderBook(symbol=symbol, bids=[], asks=[])
+
+
+pub def crosses(side: Side, taker_price: Price?, level_price: Price) -> bool:
+    if taker_price is None:
+        return True
+    match side:
+        case Buy():  return int(taker_price) >= int(level_price)
+        case Sell(): return int(taker_price) <= int(level_price)
+
+
+pub def book_side_label(side: Side) -> str:
+    return side_label(side)

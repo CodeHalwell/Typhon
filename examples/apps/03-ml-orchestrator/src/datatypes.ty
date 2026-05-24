@@ -1,0 +1,35 @@
+from ids import DatasetId, DatasetVersion
+
+
+pub class Sample[T]:
+    features: T
+    label: float
+
+
+pub class Batch[T]:
+    samples: list[Sample[T]]
+
+
+pub class Dataset[T]:
+    id: DatasetId
+    version: DatasetVersion
+    samples: list[Sample[T]]
+
+
+impl[T] Dataset[T]:
+    def size(self) -> int:
+        return len(self.samples)
+
+    def batch(self, size: int) -> list[Batch[T]]:
+        mut out: list[Batch[T]] = []
+        mut idx: int = 0
+        while idx < len(self.samples):
+            let end: int = idx + size if idx + size < len(self.samples) else len(self.samples)
+            out.append(Batch(samples=self.samples[idx:end]))
+            idx = idx + size
+        return out
+
+
+pub class SplitDataset[T]:
+    train: Dataset[T]
+    test: Dataset[T]

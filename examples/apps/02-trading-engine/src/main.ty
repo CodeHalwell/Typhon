@@ -1,0 +1,104 @@
+from book import OrderBook
+from engine import (
+    Engine,
+    Fill,
+    MarketEvent,
+    OrderAccepted,
+    OrderCancelled,
+    OrderFilled,
+    OrderRejected,
+    OrderResting,
+    new_engine,
+)
+from feed import generate_tape
+from ids import Symbol, TraderId
+from money import Notional, Qty
+from portfolio import TraderAccount, new_account
+from risk import RiskGate, RiskLimits
+
+
+pub class PrintingSink:
+    verbose: bool
+
+
+impl PrintingSink:
+    def on_event(self, event: MarketEvent) -> None:
+        if not self.verbose:
+            match event:
+                case OrderFilled(fill):
+                    print(
+                        f"FILL  taker={int(fill.taker):>4} maker={int(fill.maker):>4} "
+                        f"qty={int(fill.qty):>3} @ {int(fill.price)}"
+                    )
+                case _:
+                    pass
+            return
+        match event:
+            case OrderAccepted(oid):
+                print(f"ACC   id={int(oid)}")
+            case OrderRejected(oid, reason, detail):
+                print(f"REJ   id={int(oid)} {reason}: {detail}")
+            case OrderFilled(fill):
+                print(
+                    f"FILL  taker={int(fill.taker)} maker={int(fill.maker)} "
+                    f"qty={int(fill.qty)} @ {int(fill.price)}"
+                )
+            case OrderResting(oid, price, qty):
+                print(f"REST  id={int(oid)} @ {int(price)} x{int(qty)}")
+            case OrderCancelled(oid, reason):
+                print(f"CXL   id={int(oid)} {reason}")
+
+
+def main() -> None:
+    let symbol: Symbol = Symbol("TYPH")
+    let traders: list[TraderId] = [
+        TraderId("alice"),
+        TraderId("bob"),
+        TraderId("carol"),
+    ]
+
+    let risk_gate: RiskGate = RiskGate(
+        limits={
+            "TYPH": RiskLimits(
+                max_order_qty=Qty(500),
+                max_position_qty=Qty(2000),
+                max_order_notional=Notional(10_000_000),
+            ),
+        },
+        positions={},
+    )
+
+    let accounts: dict[str, TraderAccount] = {
+        str(t): new_account(t, starting_cash_cents=1_000_000) for t in traders
+    }
+
+    let engine: Engine = new_engine(risk_gate)
+    engine.sinks.append(PrintingSink(verbose=False))
+
+    let tape = generate_tape(symbol, traders, n=200, base_price=10_000, seed=7)
+    mut total_fills: int = 0
+    for event in tape:
+        let fills: list[Fill] = engine.submit(event.order, event.tif)
+        for fill in fills:
+            total_fills = total_fills + 1
+            let acct: TraderAccount = accounts[str(event.order.trader)]
+            acct.apply_fill(symbol, event.order.side, fill.qty, fill.price)
+
+    let book: OrderBook = engine.book_for(symbol)
+    print()
+    print(book.render())
+    print()
+    print(f"Total fills: {total_fills}")
+    print()
+    print("Trader summary:")
+    for (tid, acct) in accounts.items():
+        let pos = acct.position_for(symbol)
+        print(
+            f"  {tid:<8} cash={acct.cash_cents:>10}  "
+            f"realised={acct.realised_pnl:>8}  "
+            f"qty={pos.qty:>5}  basis={pos.cost_basis:>6}"
+        )
+
+
+if __name__ == "__main__":
+    main()

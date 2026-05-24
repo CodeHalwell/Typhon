@@ -1,0 +1,151 @@
+from datetime import datetime
+
+from events import (
+    AccountClosed,
+    AccountFrozen,
+    AccountOpened,
+    AccountUnfrozen,
+    Event,
+    EventEnvelope,
+    InterestAccrued,
+    MoneyDeposited,
+    MoneyWithdrawn,
+    TransferRecorded,
+    event_kind,
+)
+from ids import AccountId, Currency
+from money import Money, add_money, sub_money
+
+
+pub class LedgerLine:
+    seq: int
+    account_id: AccountId
+    delta: Money
+    counterparty: str
+    kind: str
+    at: datetime
+
+
+pub class LedgerProjection:
+    lines: list[LedgerLine]
+
+
+pub class BalanceProjection:
+    balances: dict[str, Money]
+    currencies: dict[str, Currency]
+
+
+pub class AuditEntry:
+    seq: int
+    kind: str
+    account_id: AccountId?
+    at: datetime
+
+
+pub class AuditProjection:
+    entries: list[AuditEntry]
+
+
+pub def apply_to_ledger(proj: LedgerProjection, env: EventEnvelope) -> None:
+    let seq: int = int(env.seq)
+    let at: datetime = datetime.now()
+    match env.payload:
+        case MoneyDeposited(aid, amount, source, _, at_):
+            proj.lines.append(LedgerLine(
+                seq=seq, account_id=aid, delta=amount,
+                counterparty=source, kind="deposit", at=at_,
+            ))
+        case MoneyWithdrawn(aid, amount, dest, _, at_):
+            proj.lines.append(LedgerLine(
+                seq=seq, account_id=aid, delta=Money(-int(amount)),
+                counterparty=dest, kind="withdraw", at=at_,
+            ))
+        case TransferRecorded(from_acc, to_acc, amount_from, amount_to, _, _, at_):
+            proj.lines.append(LedgerLine(
+                seq=seq, account_id=from_acc, delta=Money(-int(amount_from)),
+                counterparty=str(to_acc), kind="transfer_out", at=at_,
+            ))
+            proj.lines.append(LedgerLine(
+                seq=seq, account_id=to_acc, delta=amount_to,
+                counterparty=str(from_acc), kind="transfer_in", at=at_,
+            ))
+        case InterestAccrued(aid, amount, _, at_):
+            proj.lines.append(LedgerLine(
+                seq=seq, account_id=aid, delta=amount,
+                counterparty="bank", kind="interest", at=at_,
+            ))
+        case AccountOpened(_, _, _, _):
+            pass
+        case AccountFrozen(_, _, _):
+            pass
+        case AccountUnfrozen(_, _):
+            pass
+        case AccountClosed(_, _):
+            pass
+
+
+pub def apply_to_balances(proj: BalanceProjection, env: EventEnvelope) -> None:
+    let event: Event = env.payload
+    match event:
+        case AccountOpened(aid, _, ccy, _):
+            proj.balances[str(aid)] = Money(0)
+            proj.currencies[str(aid)] = ccy
+        case MoneyDeposited(aid, amount, _, _, _):
+            let key: str = str(aid)
+            proj.balances[key] = add_money(_balance_or_zero(proj, key), amount)
+        case MoneyWithdrawn(aid, amount, _, _, _):
+            let key: str = str(aid)
+            proj.balances[key] = sub_money(_balance_or_zero(proj, key), amount)
+        case TransferRecorded(from_acc, to_acc, amount_from, amount_to, _, _, _):
+            let fk: str = str(from_acc)
+            let tk: str = str(to_acc)
+            proj.balances[fk] = sub_money(_balance_or_zero(proj, fk), amount_from)
+            proj.balances[tk] = add_money(_balance_or_zero(proj, tk), amount_to)
+        case InterestAccrued(aid, amount, _, _):
+            let key: str = str(aid)
+            proj.balances[key] = add_money(_balance_or_zero(proj, key), amount)
+        case AccountFrozen(_, _, _):
+            pass
+        case AccountUnfrozen(_, _):
+            pass
+        case AccountClosed(_, _):
+            pass
+
+
+pub def apply_to_audit(proj: AuditProjection, env: EventEnvelope) -> None:
+    let seq: int = int(env.seq)
+    let event: Event = env.payload
+    match event:
+        case AccountOpened(aid, _, _, at):
+            proj.entries.append(AuditEntry(seq=seq, kind="AccountOpened", account_id=aid, at=at))
+        case MoneyDeposited(aid, _, _, _, at):
+            proj.entries.append(AuditEntry(seq=seq, kind="MoneyDeposited", account_id=aid, at=at))
+        case MoneyWithdrawn(aid, _, _, _, at):
+            proj.entries.append(AuditEntry(seq=seq, kind="MoneyWithdrawn", account_id=aid, at=at))
+        case TransferRecorded(from_acc, _, _, _, _, _, at):
+            proj.entries.append(AuditEntry(seq=seq, kind="TransferRecorded", account_id=from_acc, at=at))
+        case AccountFrozen(aid, _, at):
+            proj.entries.append(AuditEntry(seq=seq, kind="AccountFrozen", account_id=aid, at=at))
+        case AccountUnfrozen(aid, at):
+            proj.entries.append(AuditEntry(seq=seq, kind="AccountUnfrozen", account_id=aid, at=at))
+        case AccountClosed(aid, at):
+            proj.entries.append(AuditEntry(seq=seq, kind="AccountClosed", account_id=aid, at=at))
+        case InterestAccrued(aid, _, _, at):
+            proj.entries.append(AuditEntry(seq=seq, kind="InterestAccrued", account_id=aid, at=at))
+
+
+def _balance_or_zero(proj: BalanceProjection, key: str) -> Money:
+    let existing: Money? = proj.balances.get(key)
+    return existing if existing is not None else Money(0)
+
+
+pub def new_ledger() -> LedgerProjection:
+    return LedgerProjection(lines=[])
+
+
+pub def new_balances() -> BalanceProjection:
+    return BalanceProjection(balances={}, currencies={})
+
+
+pub def new_audit() -> AuditProjection:
+    return AuditProjection(entries=[])

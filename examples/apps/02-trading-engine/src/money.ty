@@ -1,0 +1,49 @@
+pub newtype Price = int
+pub newtype Qty = int
+pub newtype Notional = int
+
+
+pub freeze let TICK: int = 1
+pub freeze let LOT: int = 1
+
+
+pub def add_qty(a: Qty, b: Qty) -> Qty:
+    return Qty(int(a) + int(b))
+
+
+pub def sub_qty(a: Qty, b: Qty) -> Qty:
+    return Qty(int(a) - int(b))
+
+
+pub def min_qty(a: Qty, b: Qty) -> Qty:
+    let ia: int = int(a)
+    let ib: int = int(b)
+    return Qty(ia if ia < ib else ib)
+
+
+pub def notional_for(price: Price, qty: Qty) -> Notional:
+    return Notional(int(price) * int(qty))
+
+
+pub def add_notional(a: Notional, b: Notional) -> Notional:
+    return Notional(int(a) + int(b))
+
+
+pub def sub_notional(a: Notional, b: Notional) -> Notional:
+    return Notional(int(a) - int(b))
+
+
+pub def is_valid_tick(price: Price) -> bool:
+    return (int(price) % TICK) == 0
+
+
+pub def is_valid_lot(qty: Qty) -> bool:
+    return (int(qty) % LOT) == 0
+
+
+pub def format_price(price: Price) -> str:
+    return f"${int(price) / 100:.2f}"
+
+
+pub def format_qty(qty: Qty) -> str:
+    return str(int(qty))

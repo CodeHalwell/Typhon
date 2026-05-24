@@ -1,0 +1,201 @@
+from datetime import datetime
+
+from ids import JobName, RunId, TaskId, WorkerId
+
+
+pub model SubmitTaskRequest:
+    job: str
+    args: dict[str, object]
+    priority: int
+    depends_on: list[int]
+
+
+pub model SubmitTaskResponse:
+    task_id: int
+
+
+pub model TaskView:
+    id: int
+    job: str
+    status: str
+    priority: int
+    attempts: int
+    last_error: str?
+    created_at: str
+    updated_at: str
+
+
+pub model EventView:
+    seq: int
+    kind: str
+    task_id: int?
+    worker_id: str?
+    message: str
+    at: str
+
+
+pub type TaskStatus = StatusPending | StatusReady | StatusRunning | StatusSucceeded | StatusFailed | StatusCancelled
+
+
+pub class StatusPending:
+    waiting_on: list[TaskId]
+
+
+pub class StatusReady:
+    enqueued_at: datetime
+
+
+pub class StatusRunning:
+    worker: WorkerId
+    started_at: datetime
+    run_id: RunId
+
+
+pub class StatusSucceeded:
+    finished_at: datetime
+    result_summary: str
+
+
+pub class StatusFailed:
+    finished_at: datetime
+    last_error: str
+    attempts: int
+
+
+pub class StatusCancelled:
+    cancelled_at: datetime
+    reason: str
+
+
+pub class Task:
+    id: TaskId
+    job: JobName
+    args: dict[str, object]
+    priority: int
+    depends_on: list[TaskId]
+    status: TaskStatus
+    attempts: int
+    last_error: str?
+    created_at: datetime
+    updated_at: datetime
+
+
+impl Task:
+    def is_terminal(self) -> bool:
+        match self.status:
+            case StatusSucceeded(_, _):  return True
+            case StatusFailed(_, _, _):  return True
+            case StatusCancelled(_, _):  return True
+            case StatusPending(_):       return False
+            case StatusReady(_):         return False
+            case StatusRunning(_, _, _): return False
+
+    def status_label(self) -> str:
+        match self.status:
+            case StatusPending(_):       return "pending"
+            case StatusReady(_):         return "ready"
+            case StatusRunning(_, _, _): return "running"
+            case StatusSucceeded(_, _):  return "succeeded"
+            case StatusFailed(_, _, _):  return "failed"
+            case StatusCancelled(_, _):  return "cancelled"
+
+
+pub type SchedulerEvent = TaskSubmitted | TaskBecameReady | TaskStarted | TaskCompleted | TaskFailed | TaskRetryScheduled | WorkerStarted | WorkerStopped
+
+
+pub class TaskSubmitted:
+    task_id: TaskId
+    job: JobName
+    at: datetime
+
+
+pub class TaskBecameReady:
+    task_id: TaskId
+    at: datetime
+
+
+pub class TaskStarted:
+    task_id: TaskId
+    worker: WorkerId
+    attempt: int
+    at: datetime
+
+
+pub class TaskCompleted:
+    task_id: TaskId
+    worker: WorkerId
+    duration_ms: int
+    at: datetime
+
+
+pub class TaskFailed:
+    task_id: TaskId
+    worker: WorkerId
+    error: str
+    attempt: int
+    at: datetime
+
+
+pub class TaskRetryScheduled:
+    task_id: TaskId
+    delay_seconds: float
+    next_attempt: int
+    at: datetime
+
+
+pub class WorkerStarted:
+    worker: WorkerId
+    at: datetime
+
+
+pub class WorkerStopped:
+    worker: WorkerId
+    at: datetime
+
+
+pub def event_kind(event: SchedulerEvent) -> str:
+    match event:
+        case TaskSubmitted(_, _, _):       return "task.submitted"
+        case TaskBecameReady(_, _):        return "task.ready"
+        case TaskStarted(_, _, _, _):      return "task.started"
+        case TaskCompleted(_, _, _, _):    return "task.completed"
+        case TaskFailed(_, _, _, _, _):    return "task.failed"
+        case TaskRetryScheduled(_, _, _, _): return "task.retry_scheduled"
+        case WorkerStarted(_, _):          return "worker.started"
+        case WorkerStopped(_, _):          return "worker.stopped"
+
+
+pub def event_task_id(event: SchedulerEvent) -> TaskId?:
+    match event:
+        case TaskSubmitted(tid, _, _):       return tid
+        case TaskBecameReady(tid, _):        return tid
+        case TaskStarted(tid, _, _, _):      return tid
+        case TaskCompleted(tid, _, _, _):    return tid
+        case TaskFailed(tid, _, _, _, _):    return tid
+        case TaskRetryScheduled(tid, _, _, _): return tid
+        case WorkerStarted(_, _):            return None
+        case WorkerStopped(_, _):            return None
+
+
+pub def event_worker_id(event: SchedulerEvent) -> WorkerId?:
+    match event:
+        case TaskSubmitted(_, _, _):         return None
+        case TaskBecameReady(_, _):          return None
+        case TaskStarted(_, w, _, _):        return w
+        case TaskCompleted(_, w, _, _):      return w
+        case TaskFailed(_, w, _, _, _):      return w
+        case TaskRetryScheduled(_, _, _, _): return None
+        case WorkerStarted(w, _):            return w
+        case WorkerStopped(w, _):            return w
+
+
+pub def event_message(event: SchedulerEvent) -> str:
+    match event:
+        case TaskSubmitted(_, job, _):           return f"submitted job={job}"
+        case TaskBecameReady(_, _):              return "ready"
+        case TaskStarted(_, _, attempt, _):      return f"started attempt={attempt}"
+        case TaskCompleted(_, _, dur, _):        return f"completed in {dur}ms"
+        case TaskFailed(_, _, err, attempt, _):  return f"failed attempt={attempt}: {err}"
+        case TaskRetryScheduled(_, delay, n, _): return f"retry in {delay:.2f}s (next attempt {n})"
+        case WorkerStarted(_, _):                return "worker up"
+        case WorkerStopped(_, _):                return "worker down"

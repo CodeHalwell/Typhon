@@ -1,0 +1,71 @@
+import argparse
+import asyncio
+import sys
+
+from config import CrawlConfig, default_config
+from crawler import run_crawl
+from ids import Url
+from report import CrawlReport
+
+
+def parse_args(argv: list[str]) -> tuple[list[Url], CrawlConfig]:
+    let parser: argparse.ArgumentParser = argparse.ArgumentParser(
+        description="Typhon web crawler"
+    )
+    parser.add_argument("seeds", nargs="+", help="seed URLs")
+    parser.add_argument("--max-pages", type=int, default=20)
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument(
+        "--rate", type=float, default=2.0,
+        help="requests per host per second",
+    )
+    parser.add_argument(
+        "--follow-external", action="store_true",
+        help="follow links outside the seed host",
+    )
+    let args = parser.parse_args(argv)
+
+    let cfg: CrawlConfig = default_config(max_pages=int(args.max_pages))
+    let full_cfg: CrawlConfig = CrawlConfig(
+        max_pages=int(args.max_pages),
+        concurrent_workers=int(args.workers),
+        requests_per_host_per_second=float(args.rate),
+        per_host_burst=cfg.per_host_burst,
+        fetch_timeout_seconds=cfg.fetch_timeout_seconds,
+        user_agent=cfg.user_agent,
+        follow_external=bool(args.follow_external),
+        retry=cfg.retry,
+    )
+
+    let seeds: list[Url] = [Url(str(s)) for s in args.seeds]
+    return (seeds, full_cfg)
+
+
+async def amain(argv: list[str]) -> int:
+    let (seeds, cfg) = parse_args(argv)
+    if len(seeds) == 0:
+        print("No seeds provided", file=sys.stderr)
+        return 2
+
+    print(
+        f"Crawling {len(seeds)} seed(s) with {cfg.concurrent_workers} workers, "
+        f"max {cfg.max_pages} pages, {cfg.requests_per_host_per_second:.1f} req/s per host"
+    )
+    let report: CrawlReport = await run_crawl(seeds, cfg)
+    print()
+    print(report.render())
+    print()
+    if len(report.samples) > 0:
+        print("Sample URLs:")
+        for s in report.samples:
+            print(f"  - {s}")
+    return 0
+
+
+def main() -> None:
+    let code: int = asyncio.run(amain(sys.argv[1:]))
+    sys.exit(code)
+
+
+if __name__ == "__main__":
+    main()

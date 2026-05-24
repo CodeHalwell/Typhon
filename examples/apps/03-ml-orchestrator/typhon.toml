@@ -1,0 +1,23 @@
+[project]
+name = "typhon-ml-orchestrator"
+version = "0.1.0"
+src = "src"
+out = "build"
+
+[python]
+target = "3.13"
+
+[emit]
+class-default = "dataclass"
+format = true
+
+[strictness]
+no-implicit-any = true
+exhaustive-match = "error"
+methods-in-class-body = "warn"
+
+[env]
+required = []
+
+[dependencies]
+numpy = ">=1.26"

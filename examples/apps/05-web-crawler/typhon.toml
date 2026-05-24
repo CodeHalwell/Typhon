@@ -1,0 +1,24 @@
+[project]
+name = "typhon-web-crawler"
+version = "0.1.0"
+src = "src"
+out = "build"
+
+[python]
+target = "3.13"
+
+[emit]
+class-default = "dataclass"
+format = true
+
+[strictness]
+no-implicit-any = true
+exhaustive-match = "error"
+methods-in-class-body = "warn"
+
+[env]
+required = []
+
+[dependencies]
+httpx = ">=0.27"
+beautifulsoup4 = ">=4.12"

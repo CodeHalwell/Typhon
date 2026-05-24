@@ -1,0 +1,97 @@
+import random
+from pathlib import Path
+
+from datatypes import Dataset, Sample
+from ids import DatasetId, DatasetVersion, ModelName
+from pipeline import JobFailed, JobPending, JobRunning, JobSucceeded, Orchestrator
+from registry import new_dataset_registry, new_model_registry
+from sweep import SweepGrid, best_by_metric, run_grid_sweep
+from tracker import new_tracker
+
+
+def make_synthetic_dataset(n: int, seed: int = 13) -> Dataset[list[float]]:
+    let rng: random.Random = random.Random(seed)
+    mut samples: list[Sample[list[float]]] = []
+    let true_w: list[float] = [2.0, -1.5, 0.7]
+    let true_b: float = 0.3
+    for _ in range(n):
+        let x: list[float] = [rng.uniform(-1.0, 1.0) for _ in range(3)]
+        let noise: float = rng.gauss(0.0, 0.05)
+        let y: float = (
+            true_w[0] * x[0] + true_w[1] * x[1] + true_w[2] * x[2] + true_b + noise
+        )
+        samples.append(Sample(features=x, label=y))
+    return Dataset(
+        id=DatasetId("synthetic"),
+        version=DatasetVersion("v1"),
+        samples=samples,
+    )
+
+
+def main() -> None:
+    let tracker_path: Path = Path("/tmp/typhon-experiments.jsonl")
+    let tracker = new_tracker(tracker_path)
+    let orch: Orchestrator = Orchestrator(
+        datasets=new_dataset_registry(),
+        models=new_model_registry(),
+        tracker=tracker,
+    )
+
+    let ds: Dataset[list[float]] = make_synthetic_dataset(n=400)
+    print(f"Dataset: {ds.size()} samples, {len(ds.samples[0].features)} features")
+
+    let grid: SweepGrid = SweepGrid(
+        learning_rates=[0.01, 0.05, 0.1],
+        epochs=[50, 200],
+        l2s=[0.0, 0.001],
+    )
+
+    let results = run_grid_sweep(
+        orch, ds, ModelName("synthetic-linear"), grid, base_run_id="sweep-001",
+    )
+
+    print()
+    print(f"Completed {len(results)} jobs")
+    for r in results:
+        match r.state:
+            case JobPending():
+                print(f"  {r.spec.job_id}  pending")
+            case JobRunning(_):
+                print(f"  {r.spec.job_id}  running")
+            case JobSucceeded(_, _, metrics):
+                let mse_opt: float? = metrics.get("mse")
+                let r2_opt: float? = metrics.get("r2")
+                let mse: float = mse_opt if mse_opt is not None else 0.0
+                let r2: float = r2_opt if r2_opt is not None else 0.0
+                print(
+                    f"  {str(r.spec.job_id):<20}  "
+                    f"lr={r.spec.train_cfg.learning_rate:.3f}  "
+                    f"epochs={r.spec.train_cfg.epochs:>3}  "
+                    f"l2={r.spec.train_cfg.l2:.4f}  "
+                    f"mse={mse:.5f}  r2={r2:.4f}"
+                )
+            case JobFailed(stage, message):
+                print(f"  {r.spec.job_id}  failed at {stage}: {message}")
+
+    print()
+    let best = best_by_metric(results, "mse", lower_is_better=True)
+    if best is not None:
+        match best.state:
+            case JobSucceeded(name, version, metrics):
+                let best_mse_opt: float? = metrics.get("mse")
+                let best_r2_opt: float? = metrics.get("r2")
+                let best_mse: float = best_mse_opt if best_mse_opt is not None else 0.0
+                let best_r2: float = best_r2_opt if best_r2_opt is not None else 0.0
+                print(
+                    f"Winner: {str(name)}@{str(version)} "
+                    f"mse={best_mse:.5f} r2={best_r2:.4f}"
+                )
+            case _:
+                pass
+
+    print()
+    print(f"Tracker log: {tracker_path}")
+
+
+if __name__ == "__main__":
+    main()

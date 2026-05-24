@@ -1,0 +1,289 @@
+from datetime import datetime, timezone
+
+from aggregate import (
+    Account,
+    Closed,
+    Frozen,
+    Open,
+    Uninitialised,
+    replay,
+)
+from aml import AmlContext, AmlRule, evaluate, record_outflow
+from commands import (
+    AccountAlreadyExists,
+    AccountClosedAlready,
+    AccountIsFrozen,
+    AccrueInterest,
+    CloseAccount,
+    Command,
+    CurrencyMismatch,
+    Deposit,
+    FreezeAccount,
+    InsufficientFunds,
+    NegativeAmount,
+    NoSuchAccount,
+    OpenAccount,
+    RejectionReason,
+    Transfer,
+    UnfreezeAccount,
+    Withdraw,
+)
+from events import (
+    AccountClosed,
+    AccountFrozen,
+    AccountOpened,
+    AccountUnfrozen,
+    Event,
+    EventEnvelope,
+    InterestAccrued,
+    MoneyDeposited,
+    MoneyWithdrawn,
+    TransferRecorded,
+)
+from ids import AccountId
+from money import Money, convert, is_positive
+from store import EventStore
+
+
+pub class Handlers:
+    store: EventStore
+    aml_rules: list[AmlRule]
+    aml_ctx: AmlContext
+
+
+def _load_account(store: EventStore, id: AccountId) -> Account?:
+    let events: list[Event] = store.for_account(id)
+    if len(events) == 0:
+        return None
+    return replay(id, events)
+
+
+def _ensure_open(account: Account) -> Result[None, RejectionReason]:
+    match account.state:
+        case Open():
+            return Ok(None)
+        case Frozen(reason):
+            return Err(AccountIsFrozen(account_id=account.id, reason=reason))
+        case Closed(_):
+            return Err(AccountClosedAlready(account_id=account.id))
+        case Uninitialised():
+            return Err(NoSuchAccount(account_id=account.id))
+
+
+impl Handlers:
+    def handle(self, cmd: Command) -> Result[list[EventEnvelope], RejectionReason]:
+        match evaluate(self.aml_rules, cmd, self.aml_ctx):
+            case Err(rejection):
+                return Err(rejection)
+            case Ok(_):
+                pass
+
+        match cmd:
+            case OpenAccount(_, _, _):
+                return self._open(cmd)
+            case Deposit(_, _, _, _):
+                return self._deposit(cmd)
+            case Withdraw(_, _, _, _):
+                return self._withdraw(cmd)
+            case Transfer(_, _, _, _):
+                return self._transfer(cmd)
+            case FreezeAccount(_, _):
+                return self._freeze(cmd)
+            case UnfreezeAccount(_):
+                return self._unfreeze(cmd)
+            case CloseAccount(_):
+                return self._close(cmd)
+            case AccrueInterest(_, _):
+                return self._accrue(cmd)
+
+    def _open(self, cmd: Command) -> Result[list[EventEnvelope], RejectionReason]:
+        match cmd:
+            case OpenAccount(aid, cid, ccy):
+                let existing: Account? = _load_account(self.store, aid)
+                if existing is not None:
+                    return Err(AccountAlreadyExists(account_id=aid))
+                let event: Event = AccountOpened(
+                    account_id=aid,
+                    customer_id=cid,
+                    currency=ccy,
+                    opened_at=datetime.now(timezone.utc),
+                )
+                return Ok([self.store.append(event)])
+            case _:
+                return Err(NoSuchAccount(account_id=AccountId("")))
+
+    def _deposit(self, cmd: Command) -> Result[list[EventEnvelope], RejectionReason]:
+        match cmd:
+            case Deposit(aid, amount, source, txid):
+                if not is_positive(amount):
+                    return Err(NegativeAmount(field="amount", value=amount))
+                let account: Account? = _load_account(self.store, aid)
+                if account is None:
+                    return Err(NoSuchAccount(account_id=aid))
+                match _ensure_open(account):
+                    case Err(r): return Err(r)
+                    case Ok(_):  pass
+                let event: Event = MoneyDeposited(
+                    account_id=aid,
+                    amount=amount,
+                    source=source,
+                    transaction_id=txid,
+                    at=datetime.now(timezone.utc),
+                )
+                return Ok([self.store.append(event)])
+            case _:
+                return Err(NoSuchAccount(account_id=AccountId("")))
+
+    def _withdraw(self, cmd: Command) -> Result[list[EventEnvelope], RejectionReason]:
+        match cmd:
+            case Withdraw(aid, amount, dest, txid):
+                if not is_positive(amount):
+                    return Err(NegativeAmount(field="amount", value=amount))
+                let account: Account? = _load_account(self.store, aid)
+                if account is None:
+                    return Err(NoSuchAccount(account_id=aid))
+                match _ensure_open(account):
+                    case Err(r): return Err(r)
+                    case Ok(_):  pass
+                if int(account.balance) < int(amount):
+                    return Err(InsufficientFunds(
+                        account_id=aid,
+                        available=account.balance,
+                        requested=amount,
+                    ))
+                let event: Event = MoneyWithdrawn(
+                    account_id=aid,
+                    amount=amount,
+                    destination=dest,
+                    transaction_id=txid,
+                    at=datetime.now(timezone.utc),
+                )
+                let env: EventEnvelope = self.store.append(event)
+                record_outflow(self.aml_ctx, str(aid), int(amount))
+                return Ok([env])
+            case _:
+                return Err(NoSuchAccount(account_id=AccountId("")))
+
+    def _transfer(self, cmd: Command) -> Result[list[EventEnvelope], RejectionReason]:
+        match cmd:
+            case Transfer(from_acc, to_acc, amount, txid):
+                if not is_positive(amount):
+                    return Err(NegativeAmount(field="amount", value=amount))
+                let from_a: Account? = _load_account(self.store, from_acc)
+                let to_a: Account? = _load_account(self.store, to_acc)
+                if from_a is None:
+                    return Err(NoSuchAccount(account_id=from_acc))
+                if to_a is None:
+                    return Err(NoSuchAccount(account_id=to_acc))
+                match _ensure_open(from_a):
+                    case Err(r): return Err(r)
+                    case Ok(_):  pass
+                match _ensure_open(to_a):
+                    case Err(r): return Err(r)
+                    case Ok(_):  pass
+                if int(from_a.balance) < int(amount):
+                    return Err(InsufficientFunds(
+                        account_id=from_acc,
+                        available=from_a.balance,
+                        requested=amount,
+                    ))
+
+                mut amount_to: Money = amount
+                mut rate: float = 1.0
+                if str(from_a.currency) != str(to_a.currency):
+                    match convert(amount, from_a.currency, to_a.currency):
+                        case Ok(converted):
+                            amount_to = converted
+                            let raw_from: float = float(int(amount))
+                            let raw_to: float = float(int(converted))
+                            rate = raw_to / raw_from if raw_from > 0.0 else 1.0
+                        case Err(_):
+                            return Err(CurrencyMismatch(
+                                expected=from_a.currency,
+                                found=to_a.currency,
+                            ))
+
+                let event: Event = TransferRecorded(
+                    from_account=from_acc,
+                    to_account=to_acc,
+                    amount_from=amount,
+                    amount_to=amount_to,
+                    fx_rate=rate,
+                    transaction_id=txid,
+                    at=datetime.now(timezone.utc),
+                )
+                let env: EventEnvelope = self.store.append(event)
+                record_outflow(self.aml_ctx, str(from_acc), int(amount))
+                return Ok([env])
+            case _:
+                return Err(NoSuchAccount(account_id=AccountId("")))
+
+    def _freeze(self, cmd: Command) -> Result[list[EventEnvelope], RejectionReason]:
+        match cmd:
+            case FreezeAccount(aid, reason):
+                let account: Account? = _load_account(self.store, aid)
+                if account is None:
+                    return Err(NoSuchAccount(account_id=aid))
+                let event: Event = AccountFrozen(
+                    account_id=aid,
+                    reason=reason,
+                    at=datetime.now(timezone.utc),
+                )
+                return Ok([self.store.append(event)])
+            case _:
+                return Err(NoSuchAccount(account_id=AccountId("")))
+
+    def _unfreeze(self, cmd: Command) -> Result[list[EventEnvelope], RejectionReason]:
+        match cmd:
+            case UnfreezeAccount(aid):
+                let account: Account? = _load_account(self.store, aid)
+                if account is None:
+                    return Err(NoSuchAccount(account_id=aid))
+                let event: Event = AccountUnfrozen(
+                    account_id=aid,
+                    at=datetime.now(timezone.utc),
+                )
+                return Ok([self.store.append(event)])
+            case _:
+                return Err(NoSuchAccount(account_id=AccountId("")))
+
+    def _close(self, cmd: Command) -> Result[list[EventEnvelope], RejectionReason]:
+        match cmd:
+            case CloseAccount(aid):
+                let account: Account? = _load_account(self.store, aid)
+                if account is None:
+                    return Err(NoSuchAccount(account_id=aid))
+                match account.state:
+                    case Closed(_):
+                        return Err(AccountClosedAlready(account_id=aid))
+                    case _:
+                        pass
+                let event: Event = AccountClosed(
+                    account_id=aid,
+                    at=datetime.now(timezone.utc),
+                )
+                return Ok([self.store.append(event)])
+            case _:
+                return Err(NoSuchAccount(account_id=AccountId("")))
+
+    def _accrue(self, cmd: Command) -> Result[list[EventEnvelope], RejectionReason]:
+        match cmd:
+            case AccrueInterest(aid, rate):
+                let account: Account? = _load_account(self.store, aid)
+                if account is None:
+                    return Err(NoSuchAccount(account_id=aid))
+                match _ensure_open(account):
+                    case Err(r): return Err(r)
+                    case Ok(_):  pass
+                let earned: int = int(float(int(account.balance)) * rate)
+                if earned <= 0:
+                    return Ok([])
+                let event: Event = InterestAccrued(
+                    account_id=aid,
+                    amount=Money(earned),
+                    rate=rate,
+                    at=datetime.now(timezone.utc),
+                )
+                return Ok([self.store.append(event)])
+            case _:
+                return Err(NoSuchAccount(account_id=AccountId("")))

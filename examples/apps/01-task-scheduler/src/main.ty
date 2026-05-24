@@ -1,0 +1,53 @@
+import asyncio
+import signal
+import sys
+
+import uvicorn
+
+from api import STATE, app
+from worker import Worker
+
+
+async def _serve() -> None:
+    let cfg = uvicorn.Config(
+        app, host="127.0.0.1", port=STATE.config.http_port, log_level="info"
+    )
+    let server: uvicorn.Server = uvicorn.Server(cfg)
+    await server.serve()
+
+
+async def _amain() -> None:
+    for wid in STATE.worker_ids:
+        let w: Worker = Worker(
+            id=wid,
+            scheduler=STATE.scheduler,
+            registry=STATE.registry,
+        )
+        go w.loop()
+    go STATE.scheduler.promote_pending()
+    await _serve()
+
+
+def main() -> None:
+    let loop = asyncio.new_event_loop()
+
+    def _request_shutdown() -> None:
+        STATE.scheduler.shutdown.set()
+
+    try:
+        loop.add_signal_handler(signal.SIGINT, _request_shutdown)
+        loop.add_signal_handler(signal.SIGTERM, _request_shutdown)
+    except NotImplementedError:
+        pass
+
+    try:
+        loop.run_until_complete(_amain())
+    except KeyboardInterrupt:
+        STATE.scheduler.shutdown.set()
+    finally:
+        loop.close()
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

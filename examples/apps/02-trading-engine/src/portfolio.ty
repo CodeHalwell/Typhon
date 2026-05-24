@@ -1,0 +1,72 @@
+from ids import Symbol, TraderId
+from money import Price, Qty
+from orders import Buy, Side
+
+
+pub class Position:
+    symbol: Symbol
+    qty: int
+    cost_basis: int
+
+
+pub class TraderAccount:
+    trader: TraderId
+    cash_cents: int
+    realised_pnl: int
+    positions: dict[str, Position]
+
+
+impl TraderAccount:
+    def position_for(self, symbol: Symbol) -> Position:
+        let key: str = str(symbol)
+        let existing: Position? = self.positions.get(key)
+        if existing is not None:
+            return existing
+        let fresh: Position = Position(symbol=symbol, qty=0, cost_basis=0)
+        self.positions[key] = fresh
+        return fresh
+
+    def apply_fill(self, symbol: Symbol, side: Side, qty: Qty, price: Price) -> None:
+        let signed: int = int(qty) if isinstance(side, Buy) else -int(qty)
+        let cash_change: int = -signed * int(price)
+        self.cash_cents = self.cash_cents + cash_change
+
+        let pos: Position = self.position_for(symbol)
+        let new_qty: int = pos.qty + signed
+
+        if (pos.qty > 0 and signed < 0) or (pos.qty < 0 and signed > 0):
+            # Closing or reversing — realise P&L on the closed portion
+            let closing: int = min(abs(pos.qty), int(qty))
+            let realised: int = closing * (int(price) - pos.cost_basis) * (1 if pos.qty > 0 else -1)
+            self.realised_pnl = self.realised_pnl + realised
+
+        if new_qty == 0:
+            pos.qty = 0
+            pos.cost_basis = 0
+            return
+
+        if (pos.qty >= 0 and signed > 0) or (pos.qty <= 0 and signed < 0):
+            # Same-direction accumulation
+            let prior_notional: int = pos.qty * pos.cost_basis
+            let added_notional: int = signed * int(price)
+            pos.cost_basis = int((prior_notional + added_notional) / new_qty) if new_qty != 0 else 0
+
+        pos.qty = new_qty
+
+    def mark_to_market(self, marks: dict[str, int]) -> int:
+        mut unrealised: int = 0
+        for (sym, pos) in self.positions.items():
+            let mark: int? = marks.get(sym)
+            if mark is None:
+                continue
+            unrealised = unrealised + pos.qty * (mark - pos.cost_basis)
+        return unrealised
+
+
+pub def new_account(trader: TraderId, starting_cash_cents: int) -> TraderAccount:
+    return TraderAccount(
+        trader=trader,
+        cash_cents=starting_cash_cents,
+        realised_pnl=0,
+        positions={},
+    )

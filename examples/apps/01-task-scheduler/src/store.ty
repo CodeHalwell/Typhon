@@ -1,0 +1,393 @@
+import json
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterator
+
+from ids import JobName, RunId, TaskId, WorkerId
+from models import (
+    SchedulerEvent,
+    StatusCancelled,
+    StatusFailed,
+    StatusPending,
+    StatusReady,
+    StatusRunning,
+    StatusSucceeded,
+    Task,
+    TaskStatus,
+    event_kind,
+    event_message,
+    event_task_id,
+    event_worker_id,
+)
+
+
+pub class StoreError:
+    op: str
+    reason: str
+
+
+pub class Store:
+    db_path: Path
+
+
+impl Store:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        let conn: sqlite3.Connection = sqlite3.connect(str(self.db_path))
+        conn.execute("PRAGMA foreign_keys = ON")
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+    def init_schema(self) -> Result[None, StoreError]:
+        try:
+            with self._connect() as conn:
+                conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS tasks (
+                        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                        job         TEXT NOT NULL,
+                        args_json   TEXT NOT NULL,
+                        priority    INTEGER NOT NULL,
+                        depends_on  TEXT NOT NULL,
+                        status      TEXT NOT NULL,
+                        status_json TEXT NOT NULL,
+                        attempts    INTEGER NOT NULL DEFAULT 0,
+                        last_error  TEXT,
+                        created_at  TEXT NOT NULL,
+                        updated_at  TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_tasks_status   ON tasks(status);
+                    CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks(priority DESC);
+
+                    CREATE TABLE IF NOT EXISTS events (
+                        seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+                        kind        TEXT NOT NULL,
+                        task_id     INTEGER,
+                        worker_id   TEXT,
+                        message     TEXT NOT NULL,
+                        at          TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_events_task ON events(task_id);
+                """)
+            return Ok(None)
+        except sqlite3.Error as e:
+            return Err(StoreError(op="init", reason=str(e)))
+
+    def insert_task(
+        self,
+        job: JobName,
+        args: dict[str, object],
+        priority: int,
+        depends_on: list[TaskId],
+    ) -> Result[Task, StoreError]:
+        let now: datetime = datetime.now(timezone.utc)
+        let initial: TaskStatus = (
+            StatusReady(enqueued_at=now)
+            if len(depends_on) == 0
+            else StatusPending(waiting_on=list(depends_on))
+        )
+        let status_label: str = "ready" if len(depends_on) == 0 else "pending"
+        try:
+            with self._connect() as conn:
+                let cur = conn.execute(
+                    """
+                    INSERT INTO tasks
+                        (job, args_json, priority, depends_on, status, status_json,
+                         attempts, last_error, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)
+                    """,
+                    (
+                        str(job),
+                        json.dumps(args),
+                        priority,
+                        json.dumps([int(d) for d in depends_on]),
+                        status_label,
+                        json.dumps(_status_to_json(initial)),
+                        now.isoformat(),
+                        now.isoformat(),
+                    ),
+                )
+                let new_id: int = int(cur.lastrowid or 0)
+            return Ok(Task(
+                id=TaskId(new_id),
+                job=job,
+                args=args,
+                priority=priority,
+                depends_on=list(depends_on),
+                status=initial,
+                attempts=0,
+                last_error=None,
+                created_at=now,
+                updated_at=now,
+            ))
+        except sqlite3.Error as e:
+            return Err(StoreError(op="insert_task", reason=str(e)))
+
+    def update_status(
+        self,
+        task_id: TaskId,
+        status: TaskStatus,
+        attempts: int,
+        last_error: str?,
+    ) -> Result[None, StoreError]:
+        let now: datetime = datetime.now(timezone.utc)
+        let label: str = _status_label(status)
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE tasks
+                       SET status      = ?,
+                           status_json = ?,
+                           attempts    = ?,
+                           last_error  = ?,
+                           updated_at  = ?
+                     WHERE id = ?
+                    """,
+                    (
+                        label,
+                        json.dumps(_status_to_json(status)),
+                        attempts,
+                        last_error,
+                        now.isoformat(),
+                        int(task_id),
+                    ),
+                )
+            return Ok(None)
+        except sqlite3.Error as e:
+            return Err(StoreError(op="update_status", reason=str(e)))
+
+    def fetch_task(self, task_id: TaskId) -> Result[Task, StoreError]:
+        try:
+            with self._connect() as conn:
+                let cur = conn.execute(
+                    "SELECT id, job, args_json, priority, depends_on, status, status_json,"
+                    " attempts, last_error, created_at, updated_at"
+                    " FROM tasks WHERE id = ?",
+                    (int(task_id),),
+                )
+                let row = cur.fetchone()
+            if row is None:
+                return Err(StoreError(op="fetch_task", reason=f"task {int(task_id)} not found"))
+            return Ok(_row_to_task(row))
+        except sqlite3.Error as e:
+            return Err(StoreError(op="fetch_task", reason=str(e)))
+
+    def claim_next_ready(self, worker: WorkerId) -> Result[Task?, StoreError]:
+        let now: datetime = datetime.now(timezone.utc)
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                let cur = conn.execute(
+                    "SELECT id, job, args_json, priority, depends_on, status, status_json,"
+                    " attempts, last_error, created_at, updated_at"
+                    " FROM tasks"
+                    " WHERE status = 'ready'"
+                    " ORDER BY priority DESC, id ASC"
+                    " LIMIT 1",
+                )
+                let row = cur.fetchone()
+                if row is None:
+                    return Ok(None)
+                let task: Task = _row_to_task(row)
+                let run_id: RunId = RunId(task.attempts + 1)
+                let running: TaskStatus = StatusRunning(
+                    worker=worker, started_at=now, run_id=run_id
+                )
+                conn.execute(
+                    "UPDATE tasks SET status = ?, status_json = ?, updated_at = ? WHERE id = ?",
+                    (
+                        "running",
+                        json.dumps(_status_to_json(running)),
+                        now.isoformat(),
+                        int(task.id),
+                    ),
+                )
+            let updated: Task = Task(
+                id=task.id,
+                job=task.job,
+                args=task.args,
+                priority=task.priority,
+                depends_on=task.depends_on,
+                status=running,
+                attempts=task.attempts,
+                last_error=task.last_error,
+                created_at=task.created_at,
+                updated_at=now,
+            )
+            return Ok(updated)
+        except sqlite3.Error as e:
+            return Err(StoreError(op="claim_next_ready", reason=str(e)))
+
+    def promote_ready(self) -> Result[int, StoreError]:
+        mut promoted: int = 0
+        try:
+            with self._connect() as conn:
+                let pending = conn.execute(
+                    "SELECT id, depends_on FROM tasks WHERE status = 'pending'"
+                ).fetchall()
+                for row in pending:
+                    let tid: int = int(row[0])
+                    let deps: list[int] = json.loads(str(row[1]))
+                    if len(deps) == 0:
+                        continue
+                    let placeholders: str = ",".join(["?"] * len(deps))
+                    let q: str = (
+                        f"SELECT COUNT(*) FROM tasks WHERE id IN ({placeholders})"
+                        f" AND status = 'succeeded'"
+                    )
+                    let done_count: int = int(
+                        conn.execute(q, tuple(deps)).fetchone()[0]
+                    )
+                    if done_count == len(deps):
+                        let now: datetime = datetime.now(timezone.utc)
+                        conn.execute(
+                            "UPDATE tasks SET status = ?, status_json = ?, updated_at = ?"
+                            " WHERE id = ?",
+                            (
+                                "ready",
+                                json.dumps(_status_to_json(StatusReady(enqueued_at=now))),
+                                now.isoformat(),
+                                tid,
+                            ),
+                        )
+                        promoted = promoted + 1
+            return Ok(promoted)
+        except sqlite3.Error as e:
+            return Err(StoreError(op="promote_ready", reason=str(e)))
+
+    def append_event(self, event: SchedulerEvent) -> Result[int, StoreError]:
+        let tid: TaskId? = event_task_id(event)
+        let wid: WorkerId? = event_worker_id(event)
+        let now: datetime = datetime.now(timezone.utc)
+        try:
+            with self._connect() as conn:
+                let cur = conn.execute(
+                    "INSERT INTO events (kind, task_id, worker_id, message, at)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (
+                        event_kind(event),
+                        int(tid) if tid is not None else None,
+                        str(wid) if wid is not None else None,
+                        event_message(event),
+                        now.isoformat(),
+                    ),
+                )
+                let seq: int = int(cur.lastrowid or 0)
+            return Ok(seq)
+        except sqlite3.Error as e:
+            return Err(StoreError(op="append_event", reason=str(e)))
+
+    def events_since(self, since: int, limit: int = 100) -> list[tuple[int, str, int?, str?, str, str]]:
+        mut out: list[tuple[int, str, int?, str?, str, str]] = []
+        with self._connect() as conn:
+            let cur = conn.execute(
+                "SELECT seq, kind, task_id, worker_id, message, at FROM events"
+                " WHERE seq > ? ORDER BY seq ASC LIMIT ?",
+                (since, limit),
+            )
+            for row in cur.fetchall():
+                out.append((
+                    int(row[0]),
+                    str(row[1]),
+                    int(row[2]) if row[2] is not None else None,
+                    str(row[3]) if row[3] is not None else None,
+                    str(row[4]),
+                    str(row[5]),
+                ))
+        return out
+
+
+def _status_label(status: TaskStatus) -> str:
+    match status:
+        case StatusPending(_):       return "pending"
+        case StatusReady(_):         return "ready"
+        case StatusRunning(_, _, _): return "running"
+        case StatusSucceeded(_, _):  return "succeeded"
+        case StatusFailed(_, _, _):  return "failed"
+        case StatusCancelled(_, _):  return "cancelled"
+
+
+def _status_to_json(status: TaskStatus) -> dict[str, object]:
+    match status:
+        case StatusPending(waiting):
+            return {"kind": "pending", "waiting_on": [int(t) for t in waiting]}
+        case StatusReady(at):
+            return {"kind": "ready", "enqueued_at": at.isoformat()}
+        case StatusRunning(worker, at, run_id):
+            return {
+                "kind": "running",
+                "worker": str(worker),
+                "started_at": at.isoformat(),
+                "run_id": int(run_id),
+            }
+        case StatusSucceeded(at, summary):
+            return {"kind": "succeeded", "finished_at": at.isoformat(), "summary": summary}
+        case StatusFailed(at, err, attempts):
+            return {
+                "kind": "failed",
+                "finished_at": at.isoformat(),
+                "error": err,
+                "attempts": attempts,
+            }
+        case StatusCancelled(at, reason):
+            return {"kind": "cancelled", "cancelled_at": at.isoformat(), "reason": reason}
+
+
+def _json_to_status(blob: dict[str, object]) -> TaskStatus:
+    let kind: str = str(blob["kind"])
+    if kind == "pending":
+        let waiting_raw: list[object] = list(blob.get("waiting_on") or [])
+        return StatusPending(waiting_on=[TaskId(int(x)) for x in waiting_raw])
+    if kind == "ready":
+        return StatusReady(enqueued_at=datetime.fromisoformat(str(blob["enqueued_at"])))
+    if kind == "running":
+        return StatusRunning(
+            worker=WorkerId(str(blob["worker"])),
+            started_at=datetime.fromisoformat(str(blob["started_at"])),
+            run_id=RunId(int(blob.get("run_id") or 0)),
+        )
+    if kind == "succeeded":
+        return StatusSucceeded(
+            finished_at=datetime.fromisoformat(str(blob["finished_at"])),
+            result_summary=str(blob.get("summary") or ""),
+        )
+    if kind == "failed":
+        return StatusFailed(
+            finished_at=datetime.fromisoformat(str(blob["finished_at"])),
+            last_error=str(blob.get("error") or ""),
+            attempts=int(blob.get("attempts") or 0),
+        )
+    return StatusCancelled(
+        cancelled_at=datetime.fromisoformat(str(blob["cancelled_at"])),
+        reason=str(blob.get("reason") or ""),
+    )
+
+
+def _row_to_task(row: tuple[object, ...]) -> Task:
+    let depends_raw: list[object] = list(json.loads(str(row[4])))
+    return Task(
+        id=TaskId(int(row[0])),
+        job=JobName(str(row[1])),
+        args=dict(json.loads(str(row[2]))),
+        priority=int(row[3]),
+        depends_on=[TaskId(int(x)) for x in depends_raw],
+        status=_json_to_status(dict(json.loads(str(row[6])))),
+        attempts=int(row[7]),
+        last_error=str(row[8]) if row[8] is not None else None,
+        created_at=datetime.fromisoformat(str(row[9])),
+        updated_at=datetime.fromisoformat(str(row[10])),
+    )
+
+
+pub def open_store(path: Path) -> Result[Store, StoreError]:
+    let store: Store = Store(db_path=path)
+    match store.init_schema():
+        case Ok(_):
+            return Ok(store)
+        case Err(e):
+            return Err(e)
