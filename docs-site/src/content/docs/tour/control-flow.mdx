@@ -25,14 +25,16 @@ def classify(score: int) -> str:
         return "F"
 ```
 
-Convention is that every branch either returns or falls through to a converging `return`. Static fall-through analysis is reserved for a future release, so the example below is accepted today — but exhaustive `match` over sealed unions (covered later) gives you the same guarantee with a stronger compile-time check:
+Convention is that every branch either returns or falls through to a converging `return`. Typhon does enforce this with `tyc::missing_return` — a function that declares a non-`None` return type but has a path that falls off the end is a compile error. For example:
 
 ```python
 def classify(score: int) -> str:
     if score >= 60:
         return "pass"
-    # accepted today; prefer exhaustive match or always include an explicit else
+    # ❌ tyc::missing_return — fix with an else branch or a converging return
 ```
+
+Sealed-union `match` (covered later) gives you the same guarantee with a stronger check: even though both forms reject the missing-fallthrough case, exhaustive `match` proves it at the *variant* level, so refactors that add a variant point you straight at every handler site.
 
 ## `while`
 
