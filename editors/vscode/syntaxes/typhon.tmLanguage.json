@@ -20,6 +20,7 @@
         { "include": "#extend-declaration" },
         { "include": "#binding-declaration" },
         { "include": "#type-alias" },
+        { "include": "#field-declaration" },
         { "include": "#expression" }
       ]
     },
@@ -90,6 +91,7 @@
     },
 
     "import": {
+      "comment": "Whole `import X`, `import X as Y`, `from X.Y import a, b as c, *`, and the `lazy` variants live here. Module paths and imported names take `entity.name.namespace` so themes colour them distinctly instead of bleeding into the plain identifier scope.",
       "patterns": [
         {
           "name": "meta.import.typhon",
@@ -104,7 +106,14 @@
               "name": "keyword.control.import.typhon",
               "match": "\\b(import|as|from)\\b"
             },
-            { "include": "#identifiers" },
+            {
+              "name": "keyword.operator.wildcard.typhon",
+              "match": "\\*"
+            },
+            {
+              "name": "entity.name.namespace.typhon",
+              "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*\\b"
+            },
             { "include": "#punctuation" }
           ]
         }
@@ -414,7 +423,8 @@
     },
 
     "type-annotation": {
-      "begin": "(?<=[\\w\\)\\]])\\s*(:)\\s*(?!=)",
+      "comment": "Only fire when an actual type follows the colon — otherwise we'd grab the trailing `:` of every `if x:`, `else:`, `for x in y:`, `match x:` and miscolour it as a type-annotation separator. Requires a type-start char immediately after the colon (letter, `[`, `(`, quote, digit, or `*` for unpacked types).",
+      "begin": "(?<=[\\w\\)\\]])\\s*(:)(?!=)\\s*(?=[A-Za-z_\\[\\(\"\\'\\d\\*])",
       "beginCaptures": {
         "1": { "name": "punctuation.separator.annotation.typhon" }
       },
@@ -422,6 +432,14 @@
       "patterns": [
         { "include": "#type-expression" }
       ]
+    },
+
+    "field-declaration": {
+      "comment": "Class/model body fields: an indented identifier directly followed by `: Type`. Typhon requires `let`/`mut` for plain bindings, so this only fires inside class/model bodies where bare `name: Type` appears. Captured separately so themes can colour field names distinctly from generic locals.",
+      "match": "^(\\s+)([a-z_]\\w*)(?=\\s*:\\s*[A-Za-z_\\[\\(\"\\'\\d])",
+      "captures": {
+        "2": { "name": "variable.other.property.declaration.typhon" }
+      }
     },
 
     "type-expression": {
