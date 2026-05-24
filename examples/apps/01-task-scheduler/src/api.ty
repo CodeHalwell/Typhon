@@ -4,7 +4,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException
 
 from config import SchedulerConfig, load_config, worker_id_for
-from handlers import AlwaysFailHandler, FlakyHandler, HelloHandler, SlowHandler
+from handlers import always_fail_handler, flaky_handler, hello_handler, slow_handler
 from ids import JobName, TaskId, WorkerId
 from models import (
     EventView,
@@ -39,10 +39,10 @@ pub def build_state() -> AppState:
     let store: Store = _open_store_or_raise(Path(cfg.db_path))
 
     let registry: Registry = Registry(handlers={})
-    registry.register(HelloHandler())
-    registry.register(SlowHandler())
-    registry.register(FlakyHandler())
-    registry.register(AlwaysFailHandler())
+    registry.register(hello_handler())
+    registry.register(slow_handler())
+    registry.register(flaky_handler())
+    registry.register(always_fail_handler())
 
     let scheduler: Scheduler = Scheduler(
         config=cfg,

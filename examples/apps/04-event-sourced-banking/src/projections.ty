@@ -11,7 +11,6 @@ from events import (
     MoneyDeposited,
     MoneyWithdrawn,
     TransferRecorded,
-    event_kind,
 )
 from ids import AccountId, Currency
 from money import Money, add_money, sub_money
@@ -91,19 +90,19 @@ pub def apply_to_balances(proj: BalanceProjection, env: EventEnvelope) -> None:
             proj.balances[str(aid)] = Money(0)
             proj.currencies[str(aid)] = ccy
         case MoneyDeposited(aid, amount, _, _, _):
-            let key: str = str(aid)
-            proj.balances[key] = add_money(_balance_or_zero(proj, key), amount)
+            let deposit_key: str = str(aid)
+            proj.balances[deposit_key] = add_money(_balance_or_zero(proj, deposit_key), amount)
         case MoneyWithdrawn(aid, amount, _, _, _):
-            let key: str = str(aid)
-            proj.balances[key] = sub_money(_balance_or_zero(proj, key), amount)
+            let withdraw_key: str = str(aid)
+            proj.balances[withdraw_key] = sub_money(_balance_or_zero(proj, withdraw_key), amount)
         case TransferRecorded(from_acc, to_acc, amount_from, amount_to, _, _, _):
             let fk: str = str(from_acc)
             let tk: str = str(to_acc)
             proj.balances[fk] = sub_money(_balance_or_zero(proj, fk), amount_from)
             proj.balances[tk] = add_money(_balance_or_zero(proj, tk), amount_to)
         case InterestAccrued(aid, amount, _, _):
-            let key: str = str(aid)
-            proj.balances[key] = add_money(_balance_or_zero(proj, key), amount)
+            let interest_key: str = str(aid)
+            proj.balances[interest_key] = add_money(_balance_or_zero(proj, interest_key), amount)
         case AccountFrozen(_, _, _):
             pass
         case AccountUnfrozen(_, _):

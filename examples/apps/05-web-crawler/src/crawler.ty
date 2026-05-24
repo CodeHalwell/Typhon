@@ -41,7 +41,7 @@ async def _process_item(state: CrawlerState, item: FrontierItem) -> None:
 
     let rules = await state.robots.rules_for(state.client, host, state.config)
     if not state.robots.is_allowed(rules, item.url):
-        await state.report.record(RobotsBlocked(url=item.url))
+        await state.report.record_robots_blocked()
         return
 
     await state.limiter.acquire(host)

@@ -96,12 +96,11 @@ pub def new_book(symbol: Symbol) -> OrderBook:
     return OrderBook(symbol=symbol, bids=[], asks=[])
 
 
-pub def crosses(side: Side, taker_price: Price?, level_price: Price) -> bool:
-    if taker_price is None:
-        return True
+pub def crosses(side: Side, taker_price: Price, level_price: Price) -> bool:
     match side:
         case Buy():  return int(taker_price) >= int(level_price)
         case Sell(): return int(taker_price) <= int(level_price)
+    raise RuntimeError("unreachable")
 
 
 pub def book_side_label(side: Side) -> str:

@@ -62,6 +62,7 @@ def _normalise(
             return Ok(Dataset(id=ds.id, version=ds.version, samples=batch.samples))
         case Err(err):
             return Err(err)
+    raise RuntimeError("unreachable")
 
 
 def _split(

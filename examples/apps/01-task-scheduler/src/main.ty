@@ -1,5 +1,4 @@
 import asyncio
-import signal
 import sys
 
 import uvicorn
@@ -29,24 +28,11 @@ async def _amain() -> None:
 
 
 def main() -> None:
-    let loop = asyncio.new_event_loop()
-
-    def _request_shutdown() -> None:
-        STATE.scheduler.shutdown.set()
-
     try:
-        loop.add_signal_handler(signal.SIGINT, _request_shutdown)
-        loop.add_signal_handler(signal.SIGTERM, _request_shutdown)
-    except NotImplementedError:
-        pass
-
-    try:
-        loop.run_until_complete(_amain())
+        asyncio.run(_amain())
     except KeyboardInterrupt:
         STATE.scheduler.shutdown.set()
-    finally:
-        loop.close()
-        sys.exit(0)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
 from book import OrderBook, crosses, new_book
-from ids import FillId, OrderId, Symbol, TraderId
+from ids import FillId, OrderId, Symbol
 from money import Price, Qty, min_qty, sub_qty
 from orders import (
     Buy,
@@ -11,14 +11,13 @@ from orders import (
     Limit,
     Market,
     Order,
-    Sell,
     Side,
     TimeInForce,
     limit_price,
     opposite,
     side_label,
 )
-from risk import RiskError, RiskGate
+from risk import RiskGate
 
 
 pub class Fill frozen:
@@ -118,8 +117,9 @@ impl Engine:
 
         while int(remaining) > 0 and len(resting_levels) > 0:
             let top = resting_levels[0]
-            if not crosses(order.side, taker_price, top.price):
-                break
+            if taker_price is not None:
+                if not crosses(order.side, taker_price, top.price):
+                    break
             if len(top.orders) == 0:
                 resting_levels.pop(0)
                 continue
@@ -178,8 +178,9 @@ impl Engine:
         let levels = book.asks if isinstance(order.side, Buy) else book.bids
         mut available: int = 0
         for lvl in levels:
-            if not crosses(order.side, taker_price, lvl.price):
-                break
+            if taker_price is not None:
+                if not crosses(order.side, taker_price, lvl.price):
+                    break
             available = available + int(lvl.qty)
             if available >= int(order.qty):
                 return True

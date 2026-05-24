@@ -3,8 +3,8 @@ pub newtype Qty = int
 pub newtype Notional = int
 
 
-pub freeze let TICK: int = 1
-pub freeze let LOT: int = 1
+freeze let TICK: int = 1
+freeze let LOT: int = 1
 
 
 pub def add_qty(a: Qty, b: Qty) -> Qty:

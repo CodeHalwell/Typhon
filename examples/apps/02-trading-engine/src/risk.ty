@@ -1,6 +1,6 @@
 from ids import Symbol, TraderId
 from money import Notional, Price, Qty, notional_for
-from orders import Buy, Limit, Market, Order, Sell
+from orders import Buy, Limit, Market, Order
 
 
 pub class RiskError:

@@ -24,7 +24,7 @@ pub class SchedulerConfig frozen:
     http_port: int
 
 
-pub freeze let DEFAULT_RETRY: RetryPolicy = RetryPolicy(
+freeze let DEFAULT_RETRY: RetryPolicy = RetryPolicy(
     max_attempts=5,
     base_delay_seconds=1.0,
     max_delay_seconds=60.0,

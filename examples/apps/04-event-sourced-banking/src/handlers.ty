@@ -10,35 +10,35 @@ from aggregate import (
 )
 from aml import AmlContext, AmlRule, evaluate, record_outflow
 from commands import (
-    AccountAlreadyExists,
-    AccountClosedAlready,
-    AccountIsFrozen,
     AccrueInterest,
     CloseAccount,
     Command,
-    CurrencyMismatch,
     Deposit,
     FreezeAccount,
-    InsufficientFunds,
-    NegativeAmount,
-    NoSuchAccount,
     OpenAccount,
     RejectionReason,
     Transfer,
     UnfreezeAccount,
     Withdraw,
+    reject_account_exists,
+    reject_account_frozen,
+    reject_closed,
+    reject_currency_mismatch,
+    reject_insufficient,
+    reject_negative,
+    reject_no_such_account,
 )
 from events import (
-    AccountClosed,
-    AccountFrozen,
-    AccountOpened,
-    AccountUnfrozen,
     Event,
     EventEnvelope,
-    InterestAccrued,
-    MoneyDeposited,
-    MoneyWithdrawn,
-    TransferRecorded,
+    make_account_closed,
+    make_account_frozen,
+    make_account_opened,
+    make_account_unfrozen,
+    make_interest_accrued,
+    make_money_deposited,
+    make_money_withdrawn,
+    make_transfer_recorded,
 )
 from ids import AccountId
 from money import Money, convert, is_positive
@@ -63,11 +63,12 @@ def _ensure_open(account: Account) -> Result[None, RejectionReason]:
         case Open():
             return Ok(None)
         case Frozen(reason):
-            return Err(AccountIsFrozen(account_id=account.id, reason=reason))
+            return Err(reject_account_frozen(account.id, reason))
         case Closed(_):
-            return Err(AccountClosedAlready(account_id=account.id))
+            return Err(reject_closed(account.id))
         case Uninitialised():
-            return Err(NoSuchAccount(account_id=account.id))
+            return Err(reject_no_such_account(account.id))
+    raise RuntimeError("unreachable")
 
 
 impl Handlers:
@@ -95,14 +96,15 @@ impl Handlers:
                 return self._close(cmd)
             case AccrueInterest(_, _):
                 return self._accrue(cmd)
+        raise RuntimeError("unreachable")
 
     def _open(self, cmd: Command) -> Result[list[EventEnvelope], RejectionReason]:
         match cmd:
             case OpenAccount(aid, cid, ccy):
                 let existing: Account? = _load_account(self.store, aid)
                 if existing is not None:
-                    return Err(AccountAlreadyExists(account_id=aid))
-                let event: Event = AccountOpened(
+                    return Err(reject_account_exists(aid))
+                let event: Event = make_account_opened(
                     account_id=aid,
                     customer_id=cid,
                     currency=ccy,
@@ -110,20 +112,21 @@ impl Handlers:
                 )
                 return Ok([self.store.append(event)])
             case _:
-                return Err(NoSuchAccount(account_id=AccountId("")))
+                return Err(reject_no_such_account(AccountId("")))
+        raise RuntimeError("unreachable")
 
     def _deposit(self, cmd: Command) -> Result[list[EventEnvelope], RejectionReason]:
         match cmd:
             case Deposit(aid, amount, source, txid):
                 if not is_positive(amount):
-                    return Err(NegativeAmount(field="amount", value=amount))
+                    return Err(reject_negative("amount", amount))
                 let account: Account? = _load_account(self.store, aid)
                 if account is None:
-                    return Err(NoSuchAccount(account_id=aid))
+                    return Err(reject_no_such_account(aid))
                 match _ensure_open(account):
                     case Err(r): return Err(r)
                     case Ok(_):  pass
-                let event: Event = MoneyDeposited(
+                let event: Event = make_money_deposited(
                     account_id=aid,
                     amount=amount,
                     source=source,
@@ -132,26 +135,23 @@ impl Handlers:
                 )
                 return Ok([self.store.append(event)])
             case _:
-                return Err(NoSuchAccount(account_id=AccountId("")))
+                return Err(reject_no_such_account(AccountId("")))
+        raise RuntimeError("unreachable")
 
     def _withdraw(self, cmd: Command) -> Result[list[EventEnvelope], RejectionReason]:
         match cmd:
             case Withdraw(aid, amount, dest, txid):
                 if not is_positive(amount):
-                    return Err(NegativeAmount(field="amount", value=amount))
+                    return Err(reject_negative("amount", amount))
                 let account: Account? = _load_account(self.store, aid)
                 if account is None:
-                    return Err(NoSuchAccount(account_id=aid))
+                    return Err(reject_no_such_account(aid))
                 match _ensure_open(account):
                     case Err(r): return Err(r)
                     case Ok(_):  pass
                 if int(account.balance) < int(amount):
-                    return Err(InsufficientFunds(
-                        account_id=aid,
-                        available=account.balance,
-                        requested=amount,
-                    ))
-                let event: Event = MoneyWithdrawn(
+                    return Err(reject_insufficient(aid, account.balance, amount))
+                let event: Event = make_money_withdrawn(
                     account_id=aid,
                     amount=amount,
                     destination=dest,
@@ -162,19 +162,20 @@ impl Handlers:
                 record_outflow(self.aml_ctx, str(aid), int(amount))
                 return Ok([env])
             case _:
-                return Err(NoSuchAccount(account_id=AccountId("")))
+                return Err(reject_no_such_account(AccountId("")))
+        raise RuntimeError("unreachable")
 
     def _transfer(self, cmd: Command) -> Result[list[EventEnvelope], RejectionReason]:
         match cmd:
             case Transfer(from_acc, to_acc, amount, txid):
                 if not is_positive(amount):
-                    return Err(NegativeAmount(field="amount", value=amount))
+                    return Err(reject_negative("amount", amount))
                 let from_a: Account? = _load_account(self.store, from_acc)
                 let to_a: Account? = _load_account(self.store, to_acc)
                 if from_a is None:
-                    return Err(NoSuchAccount(account_id=from_acc))
+                    return Err(reject_no_such_account(from_acc))
                 if to_a is None:
-                    return Err(NoSuchAccount(account_id=to_acc))
+                    return Err(reject_no_such_account(to_acc))
                 match _ensure_open(from_a):
                     case Err(r): return Err(r)
                     case Ok(_):  pass
@@ -182,11 +183,7 @@ impl Handlers:
                     case Err(r): return Err(r)
                     case Ok(_):  pass
                 if int(from_a.balance) < int(amount):
-                    return Err(InsufficientFunds(
-                        account_id=from_acc,
-                        available=from_a.balance,
-                        requested=amount,
-                    ))
+                    return Err(reject_insufficient(from_acc, from_a.balance, amount))
 
                 mut amount_to: Money = amount
                 mut rate: float = 1.0
@@ -198,12 +195,11 @@ impl Handlers:
                             let raw_to: float = float(int(converted))
                             rate = raw_to / raw_from if raw_from > 0.0 else 1.0
                         case Err(_):
-                            return Err(CurrencyMismatch(
-                                expected=from_a.currency,
-                                found=to_a.currency,
+                            return Err(reject_currency_mismatch(
+                                from_a.currency, to_a.currency,
                             ))
 
-                let event: Event = TransferRecorded(
+                let event: Event = make_transfer_recorded(
                     from_account=from_acc,
                     to_account=to_acc,
                     amount_from=amount,
@@ -216,69 +212,73 @@ impl Handlers:
                 record_outflow(self.aml_ctx, str(from_acc), int(amount))
                 return Ok([env])
             case _:
-                return Err(NoSuchAccount(account_id=AccountId("")))
+                return Err(reject_no_such_account(AccountId("")))
+        raise RuntimeError("unreachable")
 
     def _freeze(self, cmd: Command) -> Result[list[EventEnvelope], RejectionReason]:
         match cmd:
             case FreezeAccount(aid, reason):
                 let account: Account? = _load_account(self.store, aid)
                 if account is None:
-                    return Err(NoSuchAccount(account_id=aid))
-                let event: Event = AccountFrozen(
+                    return Err(reject_no_such_account(aid))
+                let event: Event = make_account_frozen(
                     account_id=aid,
                     reason=reason,
                     at=datetime.now(timezone.utc),
                 )
                 return Ok([self.store.append(event)])
             case _:
-                return Err(NoSuchAccount(account_id=AccountId("")))
+                return Err(reject_no_such_account(AccountId("")))
+        raise RuntimeError("unreachable")
 
     def _unfreeze(self, cmd: Command) -> Result[list[EventEnvelope], RejectionReason]:
         match cmd:
             case UnfreezeAccount(aid):
                 let account: Account? = _load_account(self.store, aid)
                 if account is None:
-                    return Err(NoSuchAccount(account_id=aid))
-                let event: Event = AccountUnfrozen(
+                    return Err(reject_no_such_account(aid))
+                let event: Event = make_account_unfrozen(
                     account_id=aid,
                     at=datetime.now(timezone.utc),
                 )
                 return Ok([self.store.append(event)])
             case _:
-                return Err(NoSuchAccount(account_id=AccountId("")))
+                return Err(reject_no_such_account(AccountId("")))
+        raise RuntimeError("unreachable")
 
     def _close(self, cmd: Command) -> Result[list[EventEnvelope], RejectionReason]:
         match cmd:
             case CloseAccount(aid):
                 let account: Account? = _load_account(self.store, aid)
                 if account is None:
-                    return Err(NoSuchAccount(account_id=aid))
+                    return Err(reject_no_such_account(aid))
                 match account.state:
                     case Closed(_):
-                        return Err(AccountClosedAlready(account_id=aid))
+                        return Err(reject_closed(aid))
                     case _:
                         pass
-                let event: Event = AccountClosed(
+                let event: Event = make_account_closed(
                     account_id=aid,
                     at=datetime.now(timezone.utc),
                 )
                 return Ok([self.store.append(event)])
             case _:
-                return Err(NoSuchAccount(account_id=AccountId("")))
+                return Err(reject_no_such_account(AccountId("")))
+        raise RuntimeError("unreachable")
 
     def _accrue(self, cmd: Command) -> Result[list[EventEnvelope], RejectionReason]:
         match cmd:
             case AccrueInterest(aid, rate):
                 let account: Account? = _load_account(self.store, aid)
                 if account is None:
-                    return Err(NoSuchAccount(account_id=aid))
+                    return Err(reject_no_such_account(aid))
                 match _ensure_open(account):
                     case Err(r): return Err(r)
                     case Ok(_):  pass
                 let earned: int = int(float(int(account.balance)) * rate)
                 if earned <= 0:
                     return Ok([])
-                let event: Event = InterestAccrued(
+                let event: Event = make_interest_accrued(
                     account_id=aid,
                     amount=Money(earned),
                     rate=rate,
@@ -286,4 +286,5 @@ impl Handlers:
                 )
                 return Ok([self.store.append(event)])
             case _:
-                return Err(NoSuchAccount(account_id=AccountId("")))
+                return Err(reject_no_such_account(AccountId("")))
+        raise RuntimeError("unreachable")

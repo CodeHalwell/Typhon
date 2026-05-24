@@ -26,6 +26,10 @@ pub class CrawlReport:
 
 
 impl CrawlReport:
+    async def record_robots_blocked(self) -> None:
+        async with self.lock:
+            self.robots_blocked = self.robots_blocked + 1
+
     async def record(self, outcome: FetchOutcome) -> None:
         async with self.lock:
             match outcome:

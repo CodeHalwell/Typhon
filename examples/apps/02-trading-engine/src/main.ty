@@ -81,8 +81,8 @@ def main() -> None:
         let fills: list[Fill] = engine.submit(event.order, event.tif)
         for fill in fills:
             total_fills = total_fills + 1
-            let acct: TraderAccount = accounts[str(event.order.trader)]
-            acct.apply_fill(symbol, event.order.side, fill.qty, fill.price)
+            let trader_acct: TraderAccount = accounts[str(event.order.trader)]
+            trader_acct.apply_fill(symbol, event.order.side, fill.qty, fill.price)
 
     let book: OrderBook = engine.book_for(symbol)
     print()

@@ -106,6 +106,7 @@ pub def fold(account: Account, event: Event) -> Account:
                 balance=add_money(account.balance, amount),
                 last_event_at=at,
             )
+    raise RuntimeError("unreachable")
 
 
 def _with(

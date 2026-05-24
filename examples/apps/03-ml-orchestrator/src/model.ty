@@ -2,7 +2,7 @@ import json
 
 lazy import np = numpy
 
-from datatypes import Dataset, Sample
+from datatypes import Dataset
 from ids import ModelName, ModelVersion
 
 

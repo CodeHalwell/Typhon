@@ -7,7 +7,7 @@ pub newtype Money = int
 comptime let BASE_CURRENCY: str = "USD"
 
 
-pub freeze let FX_RATES: dict[str, dict[str, float]] = {
+freeze let FX_RATES: dict[str, dict[str, float]] = {
     "USD": {"USD": 1.0, "EUR": 0.92, "GBP": 0.79, "JPY": 156.20},
     "EUR": {"USD": 1.087, "EUR": 1.0, "GBP": 0.859, "JPY": 169.78},
     "GBP": {"USD": 1.266, "EUR": 1.164, "GBP": 1.0, "JPY": 197.65},

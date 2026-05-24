@@ -7,7 +7,6 @@ from commands import (
     Transfer,
     Withdraw,
 )
-from money import Money
 
 
 pub class AmlContext:

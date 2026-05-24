@@ -19,7 +19,7 @@ pub class CrawlConfig frozen:
     retry: RetryPolicy
 
 
-pub freeze let DEFAULT_RETRY: RetryPolicy = RetryPolicy(
+freeze let DEFAULT_RETRY: RetryPolicy = RetryPolicy(
     max_attempts=3,
     base_delay_seconds=0.5,
     max_delay_seconds=8.0,

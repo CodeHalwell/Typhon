@@ -20,6 +20,12 @@ from models import (
     event_message,
     event_task_id,
     event_worker_id,
+    make_status_cancelled,
+    make_status_failed,
+    make_status_pending,
+    make_status_ready,
+    make_status_running,
+    make_status_succeeded,
 )
 
 
@@ -86,9 +92,9 @@ impl Store:
     ) -> Result[Task, StoreError]:
         let now: datetime = datetime.now(timezone.utc)
         let initial: TaskStatus = (
-            StatusReady(enqueued_at=now)
+            make_status_ready(now)
             if len(depends_on) == 0
-            else StatusPending(waiting_on=list(depends_on))
+            else make_status_pending(list(depends_on))
         )
         let status_label: str = "ready" if len(depends_on) == 0 else "pending"
         try:
@@ -195,7 +201,7 @@ impl Store:
                     return Ok(None)
                 let task: Task = _row_to_task(row)
                 let run_id: RunId = RunId(task.attempts + 1)
-                let running: TaskStatus = StatusRunning(
+                let running: TaskStatus = make_status_running(
                     worker=worker, started_at=now, run_id=run_id
                 )
                 conn.execute(
@@ -250,7 +256,7 @@ impl Store:
                             " WHERE id = ?",
                             (
                                 "ready",
-                                json.dumps(_status_to_json(StatusReady(enqueued_at=now))),
+                                json.dumps(_status_to_json(make_status_ready(now))),
                                 now.isoformat(),
                                 tid,
                             ),
@@ -310,6 +316,7 @@ def _status_label(status: TaskStatus) -> str:
         case StatusSucceeded(_, _):  return "succeeded"
         case StatusFailed(_, _, _):  return "failed"
         case StatusCancelled(_, _):  return "cancelled"
+    raise RuntimeError("unreachable")
 
 
 def _status_to_json(status: TaskStatus) -> dict[str, object]:
@@ -336,36 +343,39 @@ def _status_to_json(status: TaskStatus) -> dict[str, object]:
             }
         case StatusCancelled(at, reason):
             return {"kind": "cancelled", "cancelled_at": at.isoformat(), "reason": reason}
+    raise RuntimeError("unreachable")
 
 
 def _json_to_status(blob: dict[str, object]) -> TaskStatus:
     let kind: str = str(blob["kind"])
     if kind == "pending":
         let waiting_raw: list[object] = list(blob.get("waiting_on") or [])
-        return StatusPending(waiting_on=[TaskId(int(x)) for x in waiting_raw])
+        return make_status_pending([TaskId(int(x)) for x in waiting_raw])
     if kind == "ready":
-        return StatusReady(enqueued_at=datetime.fromisoformat(str(blob["enqueued_at"])))
+        return make_status_ready(datetime.fromisoformat(str(blob["enqueued_at"])))
     if kind == "running":
-        return StatusRunning(
+        return make_status_running(
             worker=WorkerId(str(blob["worker"])),
             started_at=datetime.fromisoformat(str(blob["started_at"])),
             run_id=RunId(int(blob.get("run_id") or 0)),
         )
     if kind == "succeeded":
-        return StatusSucceeded(
+        return make_status_succeeded(
             finished_at=datetime.fromisoformat(str(blob["finished_at"])),
             result_summary=str(blob.get("summary") or ""),
         )
     if kind == "failed":
-        return StatusFailed(
+        return make_status_failed(
             finished_at=datetime.fromisoformat(str(blob["finished_at"])),
             last_error=str(blob.get("error") or ""),
             attempts=int(blob.get("attempts") or 0),
         )
-    return StatusCancelled(
+    return make_status_cancelled(
         cancelled_at=datetime.fromisoformat(str(blob["cancelled_at"])),
         reason=str(blob.get("reason") or ""),
     )
+
+
 
 
 def _row_to_task(row: tuple[object, ...]) -> Task:
@@ -391,3 +401,4 @@ pub def open_store(path: Path) -> Result[Store, StoreError]:
             return Ok(store)
         case Err(e):
             return Err(e)
+    raise RuntimeError("unreachable")

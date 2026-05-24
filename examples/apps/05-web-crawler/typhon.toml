@@ -22,3 +22,4 @@ required = []
 [dependencies]
 httpx = ">=0.27"
 beautifulsoup4 = ">=4.12"
+bs4 = "*"

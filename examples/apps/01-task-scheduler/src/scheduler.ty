@@ -1,22 +1,23 @@
 import asyncio
 import random
 from datetime import datetime, timezone
+from typing import Callable
 
 from config import RetryPolicy, SchedulerConfig
 from ids import JobName, TaskId
 from models import (
     SchedulerEvent,
-    StatusFailed,
-    StatusPending,
-    StatusReady,
     StatusRunning,
-    StatusSucceeded,
     Task,
-    TaskBecameReady,
-    TaskCompleted,
-    TaskFailed,
-    TaskRetryScheduled,
-    TaskSubmitted,
+    TaskStatus,
+    make_status_failed,
+    make_status_ready,
+    make_status_succeeded,
+    make_task_completed,
+    make_task_failed,
+    make_task_ready,
+    make_task_retry,
+    make_task_submitted,
 )
 from store import Store, StoreError
 
@@ -37,9 +38,17 @@ pub class HandlerFailure:
     retryable: bool
 
 
-pub interface Handler:
-    def name(self) -> str
-    def run(self, args: dict[str, object]) -> HandlerResult
+pub def ok_result(summary: str) -> HandlerResult:
+    return HandlerOk(summary=summary)
+
+
+pub def failure_result(message: str, retryable: bool) -> HandlerResult:
+    return HandlerFailure(message=message, retryable=retryable)
+
+
+pub class Handler:
+    name: str
+    fn: Callable[[dict[str, object]], HandlerResult]
 
 
 pub class Registry:
@@ -48,7 +57,7 @@ pub class Registry:
 
 impl Registry:
     def register(self, handler: Handler) -> None:
-        self.handlers[handler.name()] = handler
+        self.handlers[handler.name] = handler
 
     def lookup(self, name: JobName) -> Handler?:
         return self.handlers.get(str(name))
@@ -79,25 +88,18 @@ impl Scheduler:
     ) -> Result[Task, StoreError]:
         match self.store.insert_task(job, args, priority, depends_on):
             case Ok(task):
-                self.emit(TaskSubmitted(
+                self.emit(make_task_submitted(
                     task_id=task.id, job=task.job, at=task.created_at
                 ))
                 match task.status:
-                    case StatusReady(at):
-                        self.emit(TaskBecameReady(task_id=task.id, at=at))
-                    case StatusPending(_):
-                        pass
                     case StatusRunning(_, _, _):
                         pass
-                    case StatusSucceeded(_, _):
-                        pass
-                    case StatusFailed(_, _, _):
-                        pass
                     case _:
-                        pass
+                        self.emit(make_task_ready(task_id=task.id, at=task.updated_at))
                 return Ok(task)
             case Err(e):
                 return Err(e)
+        raise RuntimeError("unreachable")
 
     def compute_backoff(self, policy: RetryPolicy, attempt: int) -> float:
         let raw: float = policy.base_delay_seconds * float(2 ** (attempt - 1))
@@ -109,12 +111,8 @@ impl Scheduler:
     async def promote_pending(self) -> None:
         while not self.shutdown.is_set():
             match self.store.promote_ready():
-                case Ok(promoted):
-                    if promoted > 0:
-                        # Emit a synthetic ready event per task that flipped is
-                        # left to a follow-up; the cheap signal is enough for
-                        # the worker poll loop to pick them up.
-                        pass
+                case Ok(_):
+                    pass
                 case Err(e):
                     print(f"[promoter] {e.reason}")
             try:
@@ -126,7 +124,7 @@ impl Scheduler:
 
     def record_success(self, task: Task, summary: str, duration_ms: int) -> None:
         let now: datetime = datetime.now(timezone.utc)
-        let status: StatusSucceeded = StatusSucceeded(
+        let status: TaskStatus = make_status_succeeded(
             finished_at=now, result_summary=summary
         )
         match self.store.update_status(task.id, status, task.attempts + 1, None):
@@ -135,8 +133,8 @@ impl Scheduler:
             case Err(e):
                 print(f"[scheduler] failed to record success: {e.reason}")
         match task.status:
-            case StatusRunning(worker, started_at, _):
-                self.emit(TaskCompleted(
+            case StatusRunning(worker, _, _):
+                self.emit(make_task_completed(
                     task_id=task.id, worker=worker, duration_ms=duration_ms, at=now
                 ))
             case _:
@@ -155,7 +153,7 @@ impl Scheduler:
 
         match task.status:
             case StatusRunning(worker, _, _):
-                self.emit(TaskFailed(
+                self.emit(make_task_failed(
                     task_id=task.id,
                     worker=worker,
                     error=message,
@@ -167,13 +165,13 @@ impl Scheduler:
 
         if can_retry:
             let delay: float = self.compute_backoff(policy, attempt)
-            let next_ready: StatusReady = StatusReady(enqueued_at=now)
+            let next_ready: TaskStatus = make_status_ready(enqueued_at=now)
             match self.store.update_status(task.id, next_ready, attempt, message):
                 case Ok(_):
                     pass
                 case Err(e):
                     print(f"[scheduler] could not requeue: {e.reason}")
-            self.emit(TaskRetryScheduled(
+            self.emit(make_task_retry(
                 task_id=task.id,
                 delay_seconds=delay,
                 next_attempt=attempt + 1,
@@ -181,7 +179,7 @@ impl Scheduler:
             ))
             return
 
-        let terminal: StatusFailed = StatusFailed(
+        let terminal: TaskStatus = make_status_failed(
             finished_at=now, last_error=message, attempts=attempt
         )
         match self.store.update_status(task.id, terminal, attempt, message):
