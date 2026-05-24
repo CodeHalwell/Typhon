@@ -3,38 +3,63 @@
 This document summarizes the implementation of three independent type system enhancements
 from [Epic: type-system frontier — HKT, full variance inference, comptime types-as-values](https://github.com/CodeHalwell/Typhon/pull/113).
 
-## 1. Higher-Kinded Types (HKT) - Foundation ✅
+## 1. Higher-Kinded Types (HKT) — Full Unification ✅
 
 ### What was implemented
 
+**Foundation (v0.5.0):**
 - **New `Type::TypeConstructor` variant**: Represents type constructors with unbound parameters
 - **`F[_]` syntax recognition**: Parser recognizes higher-kinded type parameters (only when F is a declared type parameter)
-- **HKT binding support**: TypeConstructor unification in `bind_typevars` for proper HKT inference
 - **Display support**: `Functor[_]`, `Bifunctor[_, _]` display correctly
+
+**Full unification (v0.5.1):**
+- **`bind_typevars_inner`**: New function replacing `bind_typevars` that accepts an `hkt_heads: &[String]` parameter. When `fh` is in the HKT heads set and the actual head differs, it binds `fh → Class(actual_head)` and recurses on the type arguments.
+- **`collect_single_uppercase_generic_heads`**: Scans formal types for `Generic("F", ...)` occurrences where `F` is a single uppercase letter (the universal TypeVar/HKT naming convention). Complements `walk_typevars` which catches explicit `TypeConstructor` forms.
+- **`substitute_typevars`**: Now substitutes Generic heads — when processing `Generic(h, args)`, it looks up `h` in the bindings map and, if bound as `Class(new_head)`, produces `Generic(new_head, substituted_args)`. This enables `F[B]` → `list[int]` once `F → list` is in the binding map.
+- **`compute_bidirectional_bindings`**: Pre-computes `hkt_heads` by running both `walk_typevars` (for explicit `TypeConstructor` forms) and `collect_single_uppercase_generic_heads` (for `F[A]` method-sig forms) over all formal params and the return type; threads this set into all `bind_typevars_inner` calls.
 
 ### Code locations
 
-- Type enum: `tyc/crates/tyc-types/src/lib.rs:87`
-- Parser support: `tyc/crates/tyc-types/src/lib.rs:1090-1111` (restricted to type parameters)
-- HKT binding: `tyc/crates/tyc-types/src/lib.rs:1241-1248`
-- Display: `tyc/crates/tyc-types/src/lib.rs:181-184`
+- Type enum: `tyc/crates/tyc-types/src/lib.rs` (search `TypeConstructor`)
+- HKT head collection: `collect_single_uppercase_generic_heads` in `tyc-types`
+- Inner binding with HKT: `bind_typevars_inner` in `tyc-types`
+- Substitute with head rewrite: `substitute_typevars` in `tyc-types`
+- Bidirectional entry point: `compute_bidirectional_bindings` in `tyc-types`
 
 ### Example usage
 
 ```python
-# Not yet fully functional - this is the foundation
-# Future work: Update bind_typevars_and_substitute for HKT unification
+# Now fully functional — HKT unification works end-to-end
 class Functor[F[_]]:
-    def map[A, B](self, fa: F[A], f: A -> B) -> F[B]: ...
+    pass
+
+impl[F[_]] Functor[F[_]]:
+    def fmap[A, B](fa: F[A], f: Callable[[A], B]) -> F[B]:
+        ...
+
+# At a call site, F is inferred from the concrete argument:
+# fmap(some_list_int, str) → F=list, A=int, B=str → returns list[str]
 ```
 
 ### Tests
 
-Four comprehensive tests added:
+Nine tests covering HKT:
 - `hkt_type_constructor_single_underscore`
 - `hkt_type_constructor_multiple_underscores`
 - `hkt_type_constructor_display`
 - `hkt_type_constructor_is_assignable`
+- `hkt_type_constructor_binding`
+- `hkt_bind_single_uppercase_head_generic_method_sig`
+- `hkt_substitute_typevars_replaces_constructor_head`
+- `hkt_bind_and_substitute_end_to_end`
+- `hkt_bind_two_arg_constructor`
+- `hkt_explicit_type_constructor_binds_head`
+
+### Remaining open items
+
+- Multi-level HKT (type constructors applied to other type constructors)
+- Kind inference for higher-arity constructors beyond single-letter naming convention
+- Integration with bounded type parameters (`F[_]: Functor`)
 
 ## 2. Comptime Types-as-Values ✅
 
@@ -74,75 +99,83 @@ comptime let name = str(int)  # "int"
 - This allows types to be used in annotation positions
 - The `type` annotation is recognized at comptime only
 
-## 3. Full Variance Inference - Infrastructure Complete ✅
+## 3. Full Variance Inference ✅
 
 ### What was implemented
 
-The variance infrastructure is fully in place and covers all Python built-ins:
-
+**Built-in variance table (v0.5.0):**
 - **Mutable containers** (invariant): `list[0]`, `dict[0]`, `dict[1]`, `set[0]`
 - **Read-only views** (covariant): `Sequence[0]`, `Iterable[0]`, `Iterator[0]`, `tuple[*]`
 - **Mapping types**: `Mapping[0]` invariant (keys), `Mapping[1]` covariant (values)
 - **Callable**: `Callable[0]` contravariant (args), `Callable[1]` covariant (return)
 - **Result**: Both `Result[0]` and `Result[1]` are covariant
 
+**User-declared variance inference (v0.5.1):**
+- **`type_appears_in`**: Recursive helper that checks whether a named type variable appears anywhere inside a `Type`.
+- **`infer_class_variance_from_shape`**: After all `impl`/`extend` blocks are merged into the class shape, walks fields and method signatures to classify each type param's variance:
+  - Field in **non-frozen** class → Invariant (both covariant read + contravariant write)
+  - Field in **frozen** class → Covariant (read-only)
+  - Method **parameter** type → Contravariant
+  - Method **return** type → Covariant
+  - Both positions → Invariant; neither position (phantom) → Invariant (conservative)
+- **`Checker::user_class_variance`**: New `HashMap<String, Vec<Variance>>` field populated in a fourth pass at the end of `collect_classes_and_functions`.
+- **`is_assignable`**: Consults `user_class_variance` before falling back to `generic_param_variance` for the built-in table.
+
 ### Code locations
 
-- Variance enum: `tyc/crates/tyc-types/src/lib.rs:747-757`
-- Built-in mapping: `tyc/crates/tyc-types/src/lib.rs:768-862`
-- Used in assignability: `tyc/crates/tyc-types/src/lib.rs:294-316`
+- Variance enum: `tyc/crates/tyc-types/src/lib.rs` (search `enum Variance`)
+- Built-in mapping: `generic_param_variance` in `tyc-types`
+- `type_appears_in`: `tyc-types` (before `collect_classes_and_functions`)
+- `infer_class_variance_from_shape`: `tyc-types` (before `collect_classes_and_functions`)
+- Checker field: `user_class_variance` in `Checker` struct
+- Fourth pass: end of `collect_classes_and_functions`
+- Assignability dispatch: `is_assignable`, `Generic` same-head arm
 
-### What's deferred
+### Example
 
-User-declared generics (`class Box[T]: ...`) currently default to invariant.
-Full variance inference would require:
+```python
+# Inferred Covariant: T only in field of frozen class + getter return
+class Reader[T] frozen:
+    value: T
 
-1. Walking the class body to classify each type parameter's usage
-2. Storing per-class variance in `class_type_params`
-3. Consulting the inferred variance in `is_assignable`
+impl[T] Reader[T]:
+    def get(self) -> T: return self.value
 
-This is a well-scoped future enhancement, as described in the roadmap.
+let rs: Reader[str] = Reader(value="hello")
+let ro: Reader[object] = rs    # ✅ Reader[str] is a Reader[object]
+
+# Inferred Contravariant: T only in method parameter
+class Sink[T]:
+    pass
+
+impl[T] Sink[T]:
+    def push(self, value: T) -> None: print(value)
+
+let so: Sink[object] = Sink()
+let ss: Sink[str] = so    # ✅ Sink[object] is a Sink[str]
+
+# Invariant: non-frozen field (default) — no implicit subtyping
+class Box[T]:
+    value: T    # read-write → Invariant
+```
+
+### Tests
+
+Seven new variance inference tests:
+- `variance_read_only_field_and_getter_is_covariant`
+- `variance_mutable_field_is_invariant`
+- `variance_write_only_method_is_contravariant`
+- `variance_param_and_return_is_invariant`
+- `variance_multi_param_frozen_fields`
+- `variance_phantom_type_param_is_invariant`
+- `type_appears_in_nested_generic`
 
 ## Test Results
 
-All tests pass:
-- **tyc-types**: 242 tests (including 4 new HKT tests)
+All tests pass (v0.5.1):
+- **tyc-types**: 254 tests (including 10 HKT tests, 7 variance tests)
 - **tyc-analyse**: 138 tests (ComptimeValue::Type integrated)
-- **Total workspace**: 1477 tests across all packages
-
-## Next Steps
-
-### For HKT (medium effort)
-
-The foundation is complete. The remaining work is in `bind_typevars_and_substitute`:
-
-1. Extend type variable binding to handle type constructors
-2. Support unification of `F[_]` with concrete types like `list`
-3. Allow higher-kinded type parameters in function signatures
-
-See `docs/roadmap.md` Concrete next step #2.
-
-### For Variance Inference (medium effort)
-
-The classification rules are well-defined:
-
-1. Create a pass that walks `ClassDef.body`
-2. Track whether each type parameter appears in covariant, contravariant, or invariant positions
-3. Store the inferred variance alongside the type parameter names
-4. Use it in the `is_assignable` Generic arm
-
-See `docs/roadmap.md` Concrete next step #2.
-
-### For Comptime Types (design decision)
-
-The implementation is complete for the basic case. The open question is:
-
-**What is `type` at the type level?**
-- Is `type` a comptime-only marker?
-- Should it surface to the type checker as a first-class type?
-- Should `comptime let T: type = int` allow `T` to be used at runtime?
-
-See `docs/roadmap.md` Phase 4+ "Richer comptime".
+- **Total workspace**: all packages green
 
 ## References
 

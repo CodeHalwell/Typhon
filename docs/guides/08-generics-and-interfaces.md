@@ -60,6 +60,52 @@ A few notes:
 - `Box[T]` in the `class` declaration introduces `T`. Reference `Box[T]` (the concrete-but-still-generic type) inside `impl[T] Box[T]:`.
 - `map` introduces a *new* type parameter `U` because it's converting `Box[T]` to `Box[U]`. The compiler binds `U` from the return type of `f`.
 
+## Higher-kinded type parameters
+
+A **higher-kinded type parameter** (HKT) is a type parameter that is itself a *type constructor* — a parameterised type that takes another type to produce a concrete type. The Typhon syntax for this is `F[_]`:
+
+```python
+class Functor[F[_]]:
+    pass
+
+impl[F[_]] Functor[F[_]]:
+    def map[A, B](fa: F[A], f: Callable[[A], B]) -> F[B]:
+        raise NotImplementedError
+```
+
+The `F[_]` notation says "`F` is not a plain type, it is a one-argument type constructor (like `list`, `set`, or any generic class you define)." You can then apply it in method signatures — `F[A]` and `F[B]` — and the checker infers which concrete constructor `F` stands for at each call site.
+
+### How it works
+
+When the checker sees `F[A]` in a method signature with `A` a known TypeVar and `F` a single uppercase letter (the universal TypeVar naming convention for constructors), it recognises `F[A]` as a higher-kinded application. At a call site, binding `F[A]` against `list[int]` sets `F → list` and `A → int`, which is then substituted into the return type:
+
+```python
+def map_list[A, B](fa: list[A], f: Callable[[A], B]) -> list[B]:
+    return [f(x) for x in fa]
+
+# For a HKT-generic version, F is inferred from the concrete argument:
+let doubled: list[str] = map(some_list_int, str)    # F = list, A = int, B = str
+```
+
+### Example: `Functor` pattern
+
+```python
+interface Mappable[F[_]]:
+    def fmap[A, B](fa: F[A], f: Callable[[A], B]) -> F[B]
+
+class ListFunctor:
+    pass
+
+impl ListFunctor:
+    def fmap[A, B](fa: list[A], f: Callable[[A], B]) -> list[B]:
+        return [f(x) for x in fa]
+```
+
+### Current limitations
+
+- HKT inference is **one-level deep** in v0.5.1: `F[A]` patterns are recognised when `F` is a single uppercase letter. Multi-letter constructor TypeVars (e.g. `M[_]`) require explicit `TypeConstructor` form via the `F[_]` class-param syntax.
+- Constraint solving across multiple HKT parameters in a single call is partial — the checker binds what it can and falls back to `Unknown` for unresolvable positions. Annotate explicit type arguments when the checker can't infer.
+
 ## Type aliases
 
 ```python
@@ -163,6 +209,82 @@ def smallest[T: Ordered](xs: list[T]) -> T?:
 ```
 
 Bounded type vars are listed as **partial** in the current implementation — the syntax parses, but full constraint solving across multiple arguments is still landing. For now, use bounds in single-argument signatures and verify your call sites with `tyc check`.
+
+## Generic variance
+
+**Variance** describes how subtyping of a generic type `G[T]` relates to subtyping of `T`. Typhon infers variance automatically for user-defined generic classes — you do not need to annotate `TypeVar(covariant=True)`.
+
+### Covariant — read-only producers
+
+A type parameter is **covariant** when it only appears in *output* (return) positions. A `Reader[T]` that only reads values of type `T` is covariant: if `str` is a subtype of `object`, then `Reader[str]` is a subtype of `Reader[object]`.
+
+```python
+class Reader[T] frozen:
+    value: T
+
+impl[T] Reader[T]:
+    def get(self) -> T:
+        return self.value
+```
+
+Because `Reader` is frozen (fields are read-only) and `T` only appears in output positions, the checker infers `T` is **Covariant**. This means:
+
+```python
+let rs: Reader[str] = Reader(value="hello")
+let ro: Reader[object] = rs    # ✅ Reader[str] is a Reader[object]
+```
+
+### Contravariant — write-only consumers
+
+A type parameter is **contravariant** when it only appears in *input* (parameter) positions. A `Sink[T]` that only consumes values is contravariant: `Sink[object]` can safely stand in for `Sink[str]` because it accepts anything `str` does.
+
+```python
+class Sink[T]:
+    pass
+
+impl[T] Sink[T]:
+    def push(self, value: T) -> None:
+        print(value)
+```
+
+`T` only appears in parameter position → inferred **Contravariant**:
+
+```python
+let so: Sink[object] = Sink()
+let ss: Sink[str] = so    # ✅ Sink[object] is a Sink[str] (contravariant)
+```
+
+### Invariant — both readable and writable
+
+A type parameter is **invariant** when it appears in both input and output positions — the common case for a mutable container. A non-frozen `Box[T]` with a readable and assignable field is invariant: `Box[str]` is neither a subtype nor a supertype of `Box[int]`.
+
+```python
+class Box[T]:
+    value: T    # non-frozen: both read and write → Invariant
+```
+
+This matches Python's own rule: `list[str]` is not a `list[object]` because you could append an `object` to the list through the wider type.
+
+### How Typhon infers variance
+
+At the end of class collection (after all `impl` blocks are merged), the checker walks each generic class's fields and method signatures:
+
+| Position | Variance contributed |
+|---|---|
+| Field in a **non-frozen** class | Both covariant and contravariant → **Invariant** |
+| Field in a **frozen** class | Covariant only (read-only) |
+| Method **parameter** type | Contravariant |
+| Method **return** type | Covariant |
+| Type param not mentioned anywhere (phantom) | **Invariant** (conservative) |
+
+When a parameter contributes both co- and contravariant positions the result is Invariant. Built-in Python generics (`list`, `dict`, `Sequence`, `Callable`, …) use a hand-maintained variance table; user-defined classes use this inference pass.
+
+### Practical guidance
+
+- **Immutable value containers** (`frozen class`): T is automatically Covariant — free upcasting works.
+- **Event buses, callbacks, write channels** (only consume): T is automatically Contravariant.
+- **Read-write containers** (`Box[T]`, `Cache[K, V]`): T is Invariant — no implicit subtyping between different instantiations.
+- You never write `TypeVar("T", covariant=True)` in Typhon; the inference is automatic.
 
 ## Generics emit as type-erased Python
 
@@ -273,8 +395,10 @@ Either change `HasName.name()` to a field, or change `Box.name` to a method (via
 
 - Generic functions and classes use PEP 695 (`def f[T](...)`, `class Box[T]:`, `type Vec[T] = list[T]`).
 - Inference is bidirectional; annotate when it can't pin `T` down.
+- **Higher-kinded type parameters** (`F[_]`) let you write generic code over type constructors, not just concrete types — the checker unifies `F[A]` against `list[int]` to bind `F → list`.
 - Interfaces are structural — anything with the right members satisfies them; emission is `typing.Protocol`.
 - Runtime `isinstance` against interfaces is rejected; use static narrowing or sealed unions.
+- **Variance is inferred automatically**: frozen-field classes → Covariant; write-only method params → Contravariant; mutable fields or both positions → Invariant. No `TypeVar(covariant=True)` syntax needed.
 - Generics are erased at emit; the runtime is plain Python.
 
 Next: [Async and concurrency](09-async-and-concurrency.md) — `async`/`await`, `gather:` blocks, and `go` spawn.

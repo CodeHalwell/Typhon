@@ -418,15 +418,20 @@ regress under the Phase 5 churn:
   rendering (`list`) reads the `.ty` file slice when a `.py.map`
   resolves the source path. Shipped in v0.5.0.
 
-- **Higher-Kinded Types (HKT)**. v0.5.0 adds the foundation:
-  `Type::TypeConstructor { name, arity }` represents type
-  constructors with unbound parameters, and `type_from_annotation`
-  recognises `F[_]` parameter syntax in class / function generic
-  parameter lists. The full unification surface (constructor
-  application, kind inference, variance under HKT) is staged on
-  this scaffold but not yet wired into `bind_typevars_and_substitute`.
-  See [`TYPE_SYSTEM_FRONTIER.md`](../TYPE_SYSTEM_FRONTIER.md) for the
-  deferred work.
+- ✅ **Higher-Kinded Types (HKT)**. v0.5.0 added the foundation:
+  `Type::TypeConstructor { name, arity }` represents type constructors
+  with unbound parameters, and `type_from_annotation` recognises `F[_]`
+  parameter syntax in class / function generic parameter lists.
+  v0.5.1 completes the unification: `bind_typevars_inner` now recognises
+  `F[A]`-form method signatures (where `F` is a single uppercase letter —
+  the universal HKT naming convention) and binds `F → concrete_class` when
+  matched against a concrete `Generic` type. `substitute_typevars`
+  substitutes Generic heads (so `F[B]` → `list[int]` once `F → list` is
+  in the binding map). `compute_bidirectional_bindings` pre-computes the
+  HKT-heads set by walking all formal parameters and the return type.
+  See [`TYPE_SYSTEM_FRONTIER.md`](../TYPE_SYSTEM_FRONTIER.md) for
+  remaining open items (multi-level HKT, kind inference for
+  higher-arity constructors).
 
 ## Scope-cutting rule
 
@@ -452,21 +457,22 @@ shipped in v0.1.6. Phase 4+ work (everything not on the headline path):
      semantic-diffs smoke-script output against `python -m foo.bar`.
      Default config: `attrs`, `click`, and a small Pydantic-using
      package; results land in the sweep's `findings.md`.
-2. **Promote `bind_typevars_and_substitute` into a proper structural
+2. ✅ **Promote `bind_typevars_and_substitute` into a proper structural
    sub-type checker that handles variance and bounded higher-kinded
-   forms.** v0.5.0 adds the HKT scaffolding (`Type::TypeConstructor`
-   variant + `F[_]` param syntax recognition); what remains is the
-   unification piece — wiring the constructor through
-   `bind_typevars_and_substitute` so `F[A]` against `list[int]`
-   actually binds `F = list, A = int`. Variance inference on
-   user-declared generics is still future work (today's default is
-   invariant). The `generic_param_variance` table now covers the
-   common heads (list / dict / Mapping / Callable / tuple / Sequence
-   / Iterable / KeysView / ValuesView / ItemsView /
-   AsyncContextManager / Type / Counter / …) and the bounded
-   type-parameter check at the call site already dispatches through
-   `is_assignable`, which honours structural conformance when the
-   bound is an interface.
+   forms.** v0.5.0 added the HKT scaffolding (`Type::TypeConstructor`
+   variant + `F[_]` param syntax recognition) and the `generic_param_variance`
+   table for built-in heads. v0.5.1 completes the two open pieces:
+   - **HKT unification** (see item above): `bind_typevars_inner` now
+     handles `F[A]` vs `list[int]` correctly with the `hkt_heads`
+     pre-computation in `compute_bidirectional_bindings`.
+   - **User-declared generic variance inference**: `infer_class_variance_from_shape`
+     walks each generic class's fields (frozen → Covariant; mutable →
+     Invariant) and impl-block method signatures (params →
+     Contravariant, returns → Covariant) and populates a new
+     `user_class_variance` map on `Checker`. `is_assignable` consults
+     this map before falling back to the built-in `generic_param_variance`
+     table, so `Reader[str] <: Reader[object]` works for inferred-
+     covariant user classes without any annotation ceremony.
 3. ✅ **Salsa boundary.** `preprocessed_text`, `preprocessed_full`,
    `resolved_module`, `module_decl_names`, `check_diagnostics`, and
    `module_shapes_query` are all `#[salsa::tracked]`. The

@@ -1175,7 +1175,7 @@ pub fn type_from_annotation_with_params(
 }
 
 /// Walk `ty` and collect every `(name, position)` pair where a typevar
-/// appears.  The resulting structure feeds [`bind_typevars`] which walks
+/// appears.  The resulting structure feeds [`bind_typevars_inner`] which walks
 /// the same positions of an actual argument type to read off bindings.
 fn collect_typevar_positions(ty: &Type) -> Vec<String> {
     let mut out = Vec::new();
@@ -1211,6 +1211,45 @@ fn walk_typevars(ty: &Type, out: &mut Vec<String>) {
     }
 }
 
+/// Collect Generic heads from `ty` that are likely HKT type-constructor
+/// variables — specifically, heads that are a single ASCII uppercase letter
+/// (the universal TypeVar/HKT naming convention: `F`, `M`, `G`, `H`, …).
+/// These heads appear as `Generic("F", args)` in method signatures when the
+/// class declares `F[_]` as a higher-kinded type parameter.
+///
+/// A single uppercase letter is unambiguous: no concrete Python generic is
+/// named that way. Multi-letter conventional TypeVars (`T`, `KT`, `VT`)
+/// and explicit `TypeConstructor` forms are already collected by
+/// [`walk_typevars`]; this function complements it for the `F[A]` case.
+fn collect_single_uppercase_generic_heads(ty: &Type, out: &mut Vec<String>) {
+    match ty {
+        Type::Generic(head, args) => {
+            // Single uppercase ASCII letter ⟹ TypeVar by convention.
+            if head.len() == 1
+                && head.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                && !out.contains(head)
+            {
+                out.push(head.clone());
+            }
+            for arg in args {
+                collect_single_uppercase_generic_heads(arg, out);
+            }
+        }
+        Type::Union(xs) => {
+            for x in xs {
+                collect_single_uppercase_generic_heads(x, out);
+            }
+        }
+        Type::Function { params, ret, .. } => {
+            for p in params {
+                collect_single_uppercase_generic_heads(p, out);
+            }
+            collect_single_uppercase_generic_heads(ret, out);
+        }
+        _ => {}
+    }
+}
+
 /// Try to bind a `Type::TypeVar` to a concrete actual type by walking
 /// `formal` and `actual` in lockstep.  Recursive: `list[T]` against
 /// `list[int]` binds `T → int`.  Any binding conflict resolves by union
@@ -1220,10 +1259,17 @@ fn walk_typevars(ty: &Type, out: &mut Vec<String>) {
 /// - `Optional[T]` (i.e. `T | None`) against `int` binds `T → int` by
 ///   pairing the TypeVar variant with the non-None actual type.
 /// - `list[T]` against `list[int] | list[str]` binds `T → int | str`.
-fn bind_typevars(
+///
+/// `hkt_heads` is an optional set of Generic heads that are known to be
+/// higher-kinded type constructor variables (e.g. `"F"` when the class
+/// declares `F[_]`).  When `fh` ∈ `hkt_heads` and the formal head doesn't
+/// match the actual head, we bind `fh → actual_head` and recurse on the
+/// type arguments.  Pass an empty slice when HKT binding is not needed.
+fn bind_typevars_inner(
     formal: &Type,
     actual: &Type,
     bindings: &mut std::collections::HashMap<String, Type>,
+    hkt_heads: &[String],
 ) {
     match (formal, actual) {
         (Type::TypeVar(name), other) => {
@@ -1247,17 +1293,31 @@ fn bind_typevars(
                 bindings.insert(name.clone(), other.clone());
             }
         }
+        // Same-head generics: recurse on argument pairs.
         (Type::Generic(fh, fa), Type::Generic(ah, aa)) if fh == ah && fa.len() == aa.len() => {
             for (f, a) in fa.iter().zip(aa) {
-                bind_typevars(f, a, bindings);
+                bind_typevars_inner(f, a, bindings, hkt_heads);
+            }
+        }
+        // Higher-kinded Generic head: `Generic("F", [TypeVar("A")])` against
+        // `Generic("list", [Int])` when `"F"` is a known HKT constructor var.
+        // Binds `F → Class("list")` and recurses on argument pairs so that
+        // e.g. `F[A]` against `list[int]` also binds `A → int`.
+        // This handles method signatures like `def map(fa: F[A]) -> F[B]`
+        // where `F` was declared as `F[_]` in the enclosing class's type
+        // parameter list.
+        (Type::Generic(fh, fa), Type::Generic(ah, aa))
+            if fh != ah && fa.len() == aa.len() && hkt_heads.contains(fh) =>
+        {
+            bindings.insert(fh.clone(), Type::Class(ah.clone()));
+            for (f, a) in fa.iter().zip(aa) {
+                bind_typevars_inner(f, a, bindings, hkt_heads);
             }
         }
         // Higher-kinded type constructor binding: treat `F[_]` as a type variable
         // that should unify with the actual type constructor head.
-        // E.g. `F[_]` against `list[int]` could bind `F → list`.
+        // E.g. `TypeConstructor("F", 1)` against `list[int]` binds `F → list`.
         (Type::TypeConstructor(name, _arity), Type::Generic(head, _args)) => {
-            // For now, we bind the constructor name to the generic head.
-            // A complete implementation would validate arity matches.
             bindings.insert(name.clone(), Type::Class(head.clone()));
         }
         (
@@ -1273,9 +1333,9 @@ fn bind_typevars(
             },
         ) if fp.len() == ap.len() => {
             for (f, a) in fp.iter().zip(ap) {
-                bind_typevars(f, a, bindings);
+                bind_typevars_inner(f, a, bindings, hkt_heads);
             }
-            bind_typevars(fr, ar, bindings);
+            bind_typevars_inner(fr, ar, bindings, hkt_heads);
         }
         // `Optional[T]` (formal `T | None`) against a concrete actual:
         // narrow each formal variant against the non-None portion of
@@ -1286,7 +1346,7 @@ fn bind_typevars(
                 if matches!(variant, Type::None) {
                     continue;
                 }
-                bind_typevars(variant, &actual_stripped, bindings);
+                bind_typevars_inner(variant, &actual_stripped, bindings, hkt_heads);
             }
         }
         // Formal contains a TypeVar but actual is a Union — bind each
@@ -1294,7 +1354,7 @@ fn bind_typevars(
         // full set (e.g. `list[T]` against `list[int] | list[str]`).
         (f, Type::Union(av)) if !collect_typevar_positions(f).is_empty() => {
             for variant in av {
-                bind_typevars(f, variant, bindings);
+                bind_typevars_inner(f, variant, bindings, hkt_heads);
             }
         }
         _ => {}
@@ -1304,6 +1364,12 @@ fn bind_typevars(
 /// Substitute every `TypeVar` in `ty` whose name appears in `bindings`
 /// with the bound type, recursively.  Unbound type vars are left as
 /// `TypeVar` so the caller can still see them in `Display` output.
+///
+/// HKT extension: when a `Generic` head itself is bound (e.g. `F → list`
+/// after `F[_]` was inferred as `list`), the head is substituted so that
+/// `F[B]` becomes `list[B]` (after further substituting `B`).  This makes
+/// return-type rewriting work for higher-kinded functions like
+/// `def map[F[_], A, B](fa: F[A], …) -> F[B]`.
 fn substitute_typevars(ty: &Type, bindings: &std::collections::HashMap<String, Type>) -> Type {
     match ty {
         Type::TypeVar(name) => bindings.get(name).cloned().unwrap_or_else(|| ty.clone()),
@@ -1312,12 +1378,21 @@ fn substitute_typevars(ty: &Type, bindings: &std::collections::HashMap<String, T
                 .map(|x| substitute_typevars(x, bindings))
                 .collect(),
         ),
-        Type::Generic(h, args) => Type::Generic(
-            h.clone(),
-            args.iter()
+        Type::Generic(h, args) => {
+            // Substitute all argument types first.
+            let new_args: Vec<Type> = args
+                .iter()
                 .map(|x| substitute_typevars(x, bindings))
-                .collect(),
-        ),
+                .collect();
+            // HKT: if the Generic head is itself bound to a concrete class
+            // (e.g. `F → list` from a prior `TypeConstructor("F",_)` or
+            // `Generic("F",…)` binding), substitute the head too so that
+            // `F[B]` becomes `list[int]` rather than `F[int]`.
+            match bindings.get(h) {
+                Some(Type::Class(new_head)) => Type::Generic(new_head.clone(), new_args),
+                _ => Type::Generic(h.clone(), new_args),
+            }
+        }
         Type::Function {
             params,
             ret,
@@ -1381,6 +1456,19 @@ pub fn bind_typevars_and_substitute_bidirectional(
 /// bindings the substitution will use — otherwise TypeVars pinned only
 /// by the backward (expected-return) pass would bypass their declared
 /// bounds.
+///
+/// HKT support: before the main forward pass, this function pre-computes
+/// the set of likely higher-kinded constructor variable heads by scanning
+/// all formal params and the return type for:
+/// 1. `TypeConstructor("F", _)` forms (explicit `F[_]` class params) — already
+///    collected by [`walk_typevars`].
+/// 2. Single-uppercase-letter `Generic("F", …)` heads — collected by
+///    [`collect_single_uppercase_generic_heads`] to handle the `F[A]`
+///    method-signature form where `F` was declared as `F[_]`.
+///
+/// This set is threaded into [`bind_typevars_inner`] so that
+/// `Generic("F", args)` against `Generic("list", args)` correctly binds
+/// `F → list` and propagates the argument bindings.
 pub fn compute_bidirectional_bindings(
     formal_params: &[Type],
     actual_args: &[Type],
@@ -1400,8 +1488,24 @@ pub fn compute_bidirectional_bindings(
     if !has_typevar {
         return bindings;
     }
+    // Pre-compute HKT constructor variable heads from the formals and return
+    // type.  Two sources:
+    // 1. `TypeConstructor("F", _)` — collected by `walk_typevars`.
+    // 2. Single-uppercase `Generic("F", …)` heads — from method signatures
+    //    where `F[A]` was written with `F` as a declared type-constructor param.
+    let mut hkt_heads: Vec<String> = Vec::new();
+    for t in formal_params
+        .iter()
+        .chain(std::iter::once(return_type))
+    {
+        walk_typevars(t, &mut hkt_heads);
+        collect_single_uppercase_generic_heads(t, &mut hkt_heads);
+    }
+    hkt_heads.sort();
+    hkt_heads.dedup();
+
     for (formal, actual) in formal_params.iter().zip(actual_args.iter()) {
-        bind_typevars(formal, actual, &mut bindings);
+        bind_typevars_inner(formal, actual, &mut bindings, &hkt_heads);
     }
     // Backward pass: pin any TypeVars in the return type that the
     // arguments left unbound, using the call-site expected type.
@@ -1414,11 +1518,12 @@ pub fn compute_bidirectional_bindings(
     if let Some(expected) = expected_return {
         let mut return_tvs = Vec::new();
         walk_typevars(return_type, &mut return_tvs);
+        collect_single_uppercase_generic_heads(return_type, &mut return_tvs);
         let any_unbound = return_tvs.iter().any(|n| !bindings.contains_key(n));
         if any_unbound {
             let mut backward: std::collections::HashMap<String, Type> =
                 std::collections::HashMap::new();
-            bind_typevars(return_type, expected, &mut backward);
+            bind_typevars_inner(return_type, expected, &mut backward, &hkt_heads);
             for (name, ty) in backward {
                 bindings.entry(name).or_insert(ty);
             }
@@ -1601,6 +1706,15 @@ struct Checker<'a> {
     /// `Type::Generic("Box", [Int])` rather than `Type::Class("Box")`
     /// (FINDINGS #46).
     class_type_params: HashMap<String, Vec<String>>,
+    /// Inferred variance for each type parameter of every user-declared generic
+    /// class.  Keyed by class name; the `Vec` is parallel to
+    /// `class_type_params[name]` — index 0 is the first type param's variance,
+    /// etc.  Computed by `infer_class_variance_from_shape` after the full
+    /// two-pass class collection (so impl-block methods are included).
+    /// Consulted by `is_assignable` before falling back to the built-in
+    /// `generic_param_variance` table so that user classes with read-only
+    /// interfaces can enjoy covariant subtyping automatically.
+    user_class_variance: HashMap<String, Vec<Variance>>,
     /// Classes declared with the `frozen` modifier (`class Foo frozen:`).
     /// Used to reject attribute writes to instances of these classes at
     /// check time — matches the runtime behaviour of the emitted
@@ -1866,6 +1980,7 @@ impl<'a> Checker<'a> {
             interfaces: HashMap::new(),
             class_shapes: HashMap::new(),
             class_type_params: HashMap::new(),
+            user_class_variance: HashMap::new(),
             frozen_classes: std::collections::HashSet::new(),
             class_parents: HashMap::new(),
             unsafe_depth: 0,
@@ -2042,12 +2157,23 @@ impl<'a> Checker<'a> {
                     .zip(bb)
                     .enumerate()
                     .all(
-                        |(idx, (formal, actual_arg))| match generic_param_variance(an, idx) {
-                            Variance::Covariant => self.is_assignable(formal, actual_arg),
-                            Variance::Contravariant => self.is_assignable(actual_arg, formal),
-                            Variance::Invariant => {
-                                self.is_assignable(formal, actual_arg)
-                                    && self.is_assignable(actual_arg, formal)
+                        |(idx, (formal, actual_arg))| {
+                            // Consult the user-declared variance table first so
+                            // that inferred covariant/contravariant user classes
+                            // enjoy proper subtyping.  Fall back to the built-in
+                            // table for known Python generics (list, dict, …).
+                            let variance = self
+                                .user_class_variance
+                                .get(an)
+                                .and_then(|v| v.get(idx).copied())
+                                .unwrap_or_else(|| generic_param_variance(an, idx));
+                            match variance {
+                                Variance::Covariant => self.is_assignable(formal, actual_arg),
+                                Variance::Contravariant => self.is_assignable(actual_arg, formal),
+                                Variance::Invariant => {
+                                    self.is_assignable(formal, actual_arg)
+                                        && self.is_assignable(actual_arg, formal)
+                                }
                             }
                         },
                     );
@@ -3893,6 +4019,83 @@ fn detect_cyclic_type_aliases(c: &mut Checker, body: &[Stmt]) {
     }
 }
 
+/// Check whether the type variable named `tp_name` appears anywhere inside
+/// `ty` (recursively).  Used by [`infer_class_variance_from_shape`] to decide
+/// which positions a given type parameter occupies.
+fn type_appears_in(tp_name: &str, ty: &Type) -> bool {
+    match ty {
+        Type::TypeVar(name) => name == tp_name,
+        Type::Generic(_, args) => args.iter().any(|a| type_appears_in(tp_name, a)),
+        Type::Union(xs) => xs.iter().any(|x| type_appears_in(tp_name, x)),
+        Type::Function { params, ret, .. } => {
+            params.iter().any(|p| type_appears_in(tp_name, p))
+                || type_appears_in(tp_name, ret)
+        }
+        _ => false,
+    }
+}
+
+/// Infer the variance of each type parameter for a user-declared generic class
+/// by examining how the parameter appears in the class's fields and method
+/// signatures.
+///
+/// **Variance rules applied**:
+/// - A type param `T` that appears in a **field** of a *non-frozen* class
+///   occupies both covariant (read) and contravariant (write) positions →
+///   Invariant.
+/// - A type param `T` that appears in a **field** of a *frozen* class is
+///   read-only after construction → Covariant.
+/// - `T` in a **method parameter type** (excluding the implicit `self`) →
+///   Contravariant position.
+/// - `T` in a **method return type** → Covariant position.
+/// - A param appearing in both covariant and contravariant positions →
+///   Invariant.
+/// - A param appearing in neither position (phantom type) → Invariant
+///   (conservative: safe if the class is later made concrete).
+fn infer_class_variance_from_shape(
+    class_name: &str,
+    type_params: &[String],
+    shape: &InterfaceShape,
+    frozen_classes: &std::collections::HashSet<String>,
+) -> Vec<Variance> {
+    let is_frozen = frozen_classes.contains(class_name);
+    type_params
+        .iter()
+        .map(|tp| {
+            let mut covariant = false;
+            let mut contravariant = false;
+
+            // Fields: read-write unless frozen.
+            for field_ty in shape.fields.values() {
+                if type_appears_in(tp, field_ty) {
+                    covariant = true;
+                    if !is_frozen {
+                        contravariant = true; // writable → also contravariant
+                    }
+                }
+            }
+
+            // Method signatures from `impl` blocks (already merged into shape).
+            for method_sig in shape.methods.values() {
+                for param_ty in &method_sig.param_types {
+                    if type_appears_in(tp, param_ty) {
+                        contravariant = true;
+                    }
+                }
+                if type_appears_in(tp, &method_sig.return_type) {
+                    covariant = true;
+                }
+            }
+
+            match (covariant, contravariant) {
+                (true, false) => Variance::Covariant,
+                (false, true) => Variance::Contravariant,
+                _ => Variance::Invariant, // both, or neither (phantom)
+            }
+        })
+        .collect()
+}
+
 fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
     // First pass: collect every class and type-alias *name* into `c.classes`
     // so the subsequent shape and signature passes can resolve nominal
@@ -4156,6 +4359,26 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                 c.function_type_bounds
                     .insert(f.name.as_str().to_owned(), bounds);
             }
+        }
+    }
+    // Fourth pass: infer variance for user-declared generic classes now that
+    // all class shapes (including merged `impl`/`extend` blocks) are final.
+    // We clone the map to avoid a simultaneous borrow of `c.class_type_params`
+    // and `c.user_class_variance`.
+    let generic_classes: Vec<(String, Vec<String>)> = c
+        .class_type_params
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    for (class_name, type_params) in generic_classes {
+        if let Some(shape) = c.class_shapes.get(&class_name).cloned() {
+            let variances = infer_class_variance_from_shape(
+                &class_name,
+                &type_params,
+                &shape,
+                &c.frozen_classes,
+            );
+            c.user_class_variance.insert(class_name, variances);
         }
     }
 }
@@ -13433,5 +13656,243 @@ def f() -> int:
 
         // After binding, F should be bound to "list"
         assert_eq!(bindings.get("F"), Some(&Type::Class("list".to_string())));
+    }
+
+    // ------------------------------------------------------------------
+    // HKT unification: bind_typevars_inner + substitute_typevars
+    // ------------------------------------------------------------------
+
+    /// `F[A]` in a method signature against a concrete `list[int]` should
+    /// bind `F → Class("list")` and `A → Int`.
+    #[test]
+    fn hkt_bind_single_uppercase_head_generic_method_sig() {
+        use crate::{compute_bidirectional_bindings, Type};
+
+        // def map[F, A, B](fa: F[A]) -> F[B]
+        // Call: map(some_list_int)  where F[A] = list[int]
+        let formal = Type::Generic("F".to_string(), vec![Type::TypeVar("A".to_string())]);
+        let actual = Type::Generic("list".to_string(), vec![Type::Int]);
+
+        let formals = vec![formal];
+        let actuals = vec![actual];
+        // return type uses both F and B
+        let ret = Type::Generic("F".to_string(), vec![Type::TypeVar("B".to_string())]);
+
+        let bindings = compute_bidirectional_bindings(&formals, &actuals, &ret, None);
+
+        assert_eq!(bindings.get("F"), Some(&Type::Class("list".to_string())));
+        assert_eq!(bindings.get("A"), Some(&Type::Int));
+    }
+
+    /// After binding `F → Class("list")`, `substitute_typevars` must rewrite
+    /// `F[B]` → `list[str]` when `B → Str` is also in the map.
+    #[test]
+    fn hkt_substitute_typevars_replaces_constructor_head() {
+        use crate::{substitute_typevars, Type};
+        use std::collections::HashMap;
+
+        let mut bindings: HashMap<String, Type> = HashMap::new();
+        bindings.insert("F".to_string(), Type::Class("list".to_string()));
+        bindings.insert("B".to_string(), Type::Str);
+
+        let ty = Type::Generic("F".to_string(), vec![Type::TypeVar("B".to_string())]);
+        let result = substitute_typevars(&ty, &bindings);
+
+        assert_eq!(result, Type::Generic("list".to_string(), vec![Type::Str]));
+    }
+
+    /// End-to-end: `bind_typevars_and_substitute` should return the fully
+    /// substituted return type for a HKT method.
+    #[test]
+    fn hkt_bind_and_substitute_end_to_end() {
+        use crate::{bind_typevars_and_substitute, Type};
+
+        // def map[F, A, B](fa: F[A], f: Callable[[A], B]) -> F[B]
+        // called as map(list[int], int_to_str) → expected F[B] = list[str]
+        let fa_param = Type::Generic("F".to_string(), vec![Type::TypeVar("A".to_string())]);
+        let f_param = Type::Function {
+            params: vec![Type::TypeVar("A".to_string())],
+            ret: Box::new(Type::TypeVar("B".to_string())),
+            variadic: false,
+        };
+        let formal_params = vec![fa_param, f_param];
+
+        let actual_fa = Type::Generic("list".to_string(), vec![Type::Int]);
+        let actual_f = Type::Function {
+            params: vec![Type::Int],
+            ret: Box::new(Type::Str),
+            variadic: false,
+        };
+        let actual_args = vec![actual_fa, actual_f];
+
+        let return_type = Type::Generic("F".to_string(), vec![Type::TypeVar("B".to_string())]);
+
+        let result = bind_typevars_and_substitute(&formal_params, &actual_args, &return_type);
+
+        assert_eq!(result, Type::Generic("list".to_string(), vec![Type::Str]));
+    }
+
+    /// Two-arg HKT: `Either[A, B]` against `Either[int, str]` should bind
+    /// the head and both type args.
+    #[test]
+    fn hkt_bind_two_arg_constructor() {
+        use crate::{compute_bidirectional_bindings, Type};
+
+        // def bimap[F, A, B](fab: F[A, B]) -> F[str, int]
+        let formal = Type::Generic(
+            "F".to_string(),
+            vec![Type::TypeVar("A".to_string()), Type::TypeVar("B".to_string())],
+        );
+        let actual = Type::Generic(
+            "Either".to_string(),
+            vec![Type::Int, Type::Str],
+        );
+        let formals = vec![formal];
+        let actuals = vec![actual];
+        let ret = Type::Generic(
+            "F".to_string(),
+            vec![Type::Str, Type::Int],
+        );
+
+        let bindings = compute_bidirectional_bindings(&formals, &actuals, &ret, None);
+
+        assert_eq!(bindings.get("F"), Some(&Type::Class("Either".to_string())));
+        assert_eq!(bindings.get("A"), Some(&Type::Int));
+        assert_eq!(bindings.get("B"), Some(&Type::Str));
+    }
+
+    /// `TypeConstructor("F", 1)` form (explicit `F[_]` class param) should
+    /// still bind to a concrete class via `compute_bidirectional_bindings`.
+    #[test]
+    fn hkt_explicit_type_constructor_binds_head() {
+        use crate::{compute_bidirectional_bindings, Type};
+
+        let tc = Type::TypeConstructor("F".to_string(), 1);
+        let list_int = Type::Generic("list".to_string(), vec![Type::Int]);
+
+        let bindings = compute_bidirectional_bindings(&[tc], &[list_int], &Type::None, None);
+        assert_eq!(bindings.get("F"), Some(&Type::Class("list".to_string())));
+    }
+
+    // ------------------------------------------------------------------
+    // User-declared generic variance inference
+    // ------------------------------------------------------------------
+
+    use crate::{infer_class_variance_from_shape, type_appears_in, InterfaceShape, MethodSig, ArityInfo};
+
+    fn make_method_sig(param_types: Vec<Type>, return_type: Type) -> MethodSig {
+        MethodSig {
+            arity: param_types.len(),
+            return_type,
+            is_property: false,
+            is_static: false,
+            is_classmethod: false,
+            arity_info: ArityInfo::default(),
+            param_types,
+        }
+    }
+
+    /// A read-only container (`Box[T]` with a single field `value: T` and
+    /// only `def get(self) -> T`) should be inferred Covariant in T.
+    #[test]
+    fn variance_read_only_field_and_getter_is_covariant() {
+        use std::collections::HashSet;
+        let mut shape = InterfaceShape::default();
+        // frozen so field is read-only
+        shape.fields.insert("value".to_string(), Type::TypeVar("T".to_string()));
+        shape.methods.insert(
+            "get".to_string(),
+            make_method_sig(vec![], Type::TypeVar("T".to_string())),
+        );
+        let frozen: HashSet<String> = ["Box".to_string()].into();
+        let result = infer_class_variance_from_shape("Box", &["T".to_string()], &shape, &frozen);
+        assert_eq!(result, vec![Variance::Covariant]);
+    }
+
+    /// A mutable container (`Box[T]` with a single field `value: T` — non-frozen)
+    /// should be Invariant in T because the field can be both read and written.
+    #[test]
+    fn variance_mutable_field_is_invariant() {
+        use std::collections::HashSet;
+        let mut shape = InterfaceShape::default();
+        shape.fields.insert("value".to_string(), Type::TypeVar("T".to_string()));
+        let frozen: HashSet<String> = HashSet::new();
+        let result = infer_class_variance_from_shape("Box", &["T".to_string()], &shape, &frozen);
+        assert_eq!(result, vec![Variance::Invariant]);
+    }
+
+    /// A write-only sink (`Sink[T]` with `def push(self, value: T) -> None` only)
+    /// should be Contravariant in T.
+    #[test]
+    fn variance_write_only_method_is_contravariant() {
+        use std::collections::HashSet;
+        let mut shape = InterfaceShape::default();
+        shape.methods.insert(
+            "push".to_string(),
+            make_method_sig(vec![Type::TypeVar("T".to_string())], Type::None),
+        );
+        let frozen: HashSet<String> = HashSet::new();
+        let result = infer_class_variance_from_shape("Sink", &["T".to_string()], &shape, &frozen);
+        assert_eq!(result, vec![Variance::Contravariant]);
+    }
+
+    /// A class with T in both param and return positions should be Invariant.
+    #[test]
+    fn variance_param_and_return_is_invariant() {
+        use std::collections::HashSet;
+        let mut shape = InterfaceShape::default();
+        // def transform(self, input: T) -> T
+        shape.methods.insert(
+            "transform".to_string(),
+            make_method_sig(
+                vec![Type::TypeVar("T".to_string())],
+                Type::TypeVar("T".to_string()),
+            ),
+        );
+        let frozen: HashSet<String> = HashSet::new();
+        let result =
+            infer_class_variance_from_shape("Transform", &["T".to_string()], &shape, &frozen);
+        assert_eq!(result, vec![Variance::Invariant]);
+    }
+
+    /// Multi-param class: `Pair[A, B]` with fields `first: A` (frozen) and
+    /// `second: B` (frozen) should be Covariant in both.
+    #[test]
+    fn variance_multi_param_frozen_fields() {
+        use std::collections::HashSet;
+        let mut shape = InterfaceShape::default();
+        shape.fields.insert("first".to_string(), Type::TypeVar("A".to_string()));
+        shape.fields.insert("second".to_string(), Type::TypeVar("B".to_string()));
+        let frozen: HashSet<String> = ["Pair".to_string()].into();
+        let result = infer_class_variance_from_shape(
+            "Pair",
+            &["A".to_string(), "B".to_string()],
+            &shape,
+            &frozen,
+        );
+        assert_eq!(result, vec![Variance::Covariant, Variance::Covariant]);
+    }
+
+    /// Phantom type param (not used anywhere) → Invariant (conservative).
+    #[test]
+    fn variance_phantom_type_param_is_invariant() {
+        use std::collections::HashSet;
+        let shape = InterfaceShape::default(); // no fields, no methods
+        let frozen: HashSet<String> = HashSet::new();
+        let result =
+            infer_class_variance_from_shape("Tag", &["T".to_string()], &shape, &frozen);
+        assert_eq!(result, vec![Variance::Invariant]);
+    }
+
+    /// `type_appears_in` correctly identifies TypeVar occurrences nested
+    /// inside Generic and Union types.
+    #[test]
+    fn type_appears_in_nested_generic() {
+        let ty = Type::Generic(
+            "list".to_string(),
+            vec![Type::Union(vec![Type::TypeVar("T".to_string()), Type::None])],
+        );
+        assert!(type_appears_in("T", &ty));
+        assert!(!type_appears_in("U", &ty));
     }
 }
