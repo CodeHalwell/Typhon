@@ -658,11 +658,19 @@ fn is_binary_operand_rhs(next: Option<char>) -> bool {
 /// True when a `+` / `-` at the current cursor is the sign of a
 /// scientific-notation exponent (`1e-12`, `2.5E+7`) rather than a
 /// binary or unary arithmetic operator. The previously-emitted run
-/// must end with `<digit>e` or `<digit>E` and the next character must
-/// be an ASCII digit. We deliberately do NOT count an `e`/`E`
-/// preceded by `.` (`.e-1` is not valid Python) but we DO accept the
-/// `<digit>.<digit>e` and `.<digit>e` forms by looking past a single
-/// `.` when scanning the trailing digit-run.
+/// must end with a valid float-literal mantissa followed by `e`/`E`
+/// and the next character must be an ASCII digit. We deliberately do
+/// NOT count an `e`/`E` preceded by `.` (`.e-1` is not valid Python)
+/// but we DO accept the `<digit>.<digit>e` and `.<digit>e` forms by
+/// looking past a single `.` when scanning the trailing digit-run.
+///
+/// A valid Python float-literal mantissa:
+/// - must contain at least one digit;
+/// - must NOT start with `_` (PEP 515 forbids leading separators);
+/// - must NOT be immediately preceded by an identifier character
+///   (otherwise the run is the trailing `<digits>e` of an identifier
+///   like `value1e` or `_1e`, and the `-` IS a binary operator that
+///   still wants PEP 8 spacing).
 fn is_scientific_exponent_sign(out: &str, next: Option<char>) -> bool {
     let Some(n) = next else {
         return false;
@@ -679,16 +687,19 @@ fn is_scientific_exponent_sign(out: &str, next: Option<char>) -> bool {
     if last != b'e' && last != b'E' {
         return false;
     }
-    // Look back over a run of digits / dots that would form the
-    // mantissa. At least one digit must immediately precede the `e`.
-    let mut i = len - 1;
+    // Walk back from the `e`/`E` over digits / a single `.` / `_`
+    // separators. `i` always points at the candidate-mantissa byte we
+    // just consumed (or, after a `break`, at the first byte of the
+    // mantissa run — the byte AT position `i - 1` is the token
+    // boundary if any).
+    let mut i = len - 1; // position of `e`/`E`
     let mut saw_digit = false;
     let mut saw_dot = false;
     while i > 0 {
-        i -= 1;
-        let c = bytes[i];
+        let c = bytes[i - 1];
         if c.is_ascii_digit() {
             saw_digit = true;
+            i -= 1;
             continue;
         }
         if c == b'.' {
@@ -696,15 +707,38 @@ fn is_scientific_exponent_sign(out: &str, next: Option<char>) -> bool {
                 break;
             }
             saw_dot = true;
+            i -= 1;
             continue;
         }
         if c == b'_' {
             // `1_000e-3` — PEP 515 numeric separators.
+            i -= 1;
             continue;
         }
         break;
     }
-    saw_digit
+    if !saw_digit {
+        return false;
+    }
+    // `i` is now the start of the mantissa run. A leading `_` would
+    // make this an identifier (`_1e-3`), not a float literal.
+    if bytes[i] == b'_' {
+        return false;
+    }
+    // The byte immediately before the mantissa must NOT be an
+    // identifier-continuation character — otherwise the
+    // `<digits><e>` run is the trailing slice of an identifier
+    // (`abc1e-12`, `value1e-3`) and the `-` is a real binary minus
+    // that still wants PEP 8 spacing. Non-ASCII (UTF-8 continuation /
+    // start) bytes are conservatively treated as identifier chars
+    // since Python identifiers admit Unicode `XID_Continue`.
+    if i > 0 {
+        let prev = bytes[i - 1];
+        if prev.is_ascii_alphanumeric() || prev == b'_' || prev >= 128 {
+            return false;
+        }
+    }
+    true
 }
 
 /// Returns the quote character that opens an *unterminated* triple-quoted
@@ -1514,12 +1548,27 @@ def run() -> Result[int, str]:
             );
         }
         // Sanity: binary minus on a non-scientific identifier still
-        // gains spaces.
-        let src2 = "let x = e-1\n";
+        // gains spaces. Three sub-cases that all looked like
+        // scientific notation to the original heuristic (each ends in
+        // `<digit>e` — but the run is the trailing slice of an
+        // identifier, not a float literal): bare `e-1`, an identifier
+        // ending in `<digit>e`, and an underscore-prefixed
+        // identifier with the same shape.
+        let src2 = "let x = e-1\nlet y = abc1e-12\nlet z = _1e-12\n";
         let r2 = format_source(src2, "<test>").unwrap();
         assert!(
             r2.output.contains("e - 1"),
             "binary minus after a bare identifier must space, got: {:?}",
+            r2.output
+        );
+        assert!(
+            r2.output.contains("abc1e - 12"),
+            "binary minus after `<ident-with-digits>e` must space, got: {:?}",
+            r2.output
+        );
+        assert!(
+            r2.output.contains("_1e - 12"),
+            "binary minus after `_<digit>e` (identifier, not literal) must space, got: {:?}",
             r2.output
         );
         unsafe {

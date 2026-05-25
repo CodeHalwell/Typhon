@@ -216,14 +216,20 @@ keeps compiling to the same Python.
   `u = 1e - 12` (Python rejects with `SyntaxError: invalid decimal
   literal`). Adds a carve-out that recognises an exponent sign by
   walking back over the trailing digit-run (`<digit>+e` or
-  `<digit>+.<digit>+e`, including PEP 515 `_` separators) immediately
-  preceding the operator, and emits the sign tight. Three new
-  regression tests in `tyc-format` cover `1e-12`, `2.5E+7`,
-  `1.0e-12`, `1_000e-3`, and the binary-minus case
-  (`e - 1` after a bare identifier still spaces). Surfaced by the
-  v0.7.0 reorganisation of `examples/apps/13-vector-db/` — the
-  `1.0e-12` clamp in HNSW's `_random_level` would otherwise emit as
-  `1e - 12` and crash at import time.
+  `<digit>+.<digit>+e`, including PEP 515 `_` separators) and
+  verifying token-boundary preconditions before classifying the
+  trailing `e`/`E` as an exponent marker: the mantissa run must
+  contain at least one digit, must not start with `_` (which would
+  make it an identifier like `_1e-12`), and must not be preceded by
+  an identifier-continuation byte (alphanumeric / `_` / non-ASCII —
+  so `value1e-3` correctly keeps the binary-minus spacing). Five
+  regression cases in `tyc-format` cover `1e-12`, `2.5E+7`,
+  `1.0e-12`, `1_000e-3`, the bare-identifier case (`e - 1`), the
+  `<ident>e-N` case (`abc1e - 12`), and the `_<digit>e-N` case
+  (`_1e - 12`). Surfaced by the v0.7.0 reorganisation of
+  `examples/apps/13-vector-db/` — the `1.0e-12` clamp in HNSW's
+  `_random_level` would otherwise emit as `1e - 12` and crash at
+  import time.
 
 ### Fixed — checker
 
@@ -231,10 +237,21 @@ keeps compiling to the same Python.
   sub-package.** A `src/indexer/tokenize.ty` lowers to
   `build/indexer/tokenize.py`, which is *not* on `sys.path` when
   `python build/main.py` runs — the file cannot intercept stdlib
-  `import tokenize` from anywhere. The warning now only fires when the
-  file sits at the top of the configured source directory (the
-  `parent.file_name == src_root` check). One new regression test
-  guards the nested-file case.
+  `import tokenize` from anywhere. The warning now only fires when
+  the file sits AT the top of the configured source directory, gated
+  via a canonicalised-path comparison: the caller pre-canonicalises
+  `project_root.join(config.project.src)` once, and the per-file
+  check canonicalises `path.parent()` and compares for equality. The
+  canonical-path form correctly handles both edge cases the original
+  basename comparison missed: `[project] src = "."` projects fire
+  the warning for top-level `.ty` files (which the basename form
+  silently suppressed because `parent.file_name()` resolves to the
+  project directory name, never `"."`); and a nested
+  `src/indexer/src/tokenize.ty` does NOT false-positive against
+  the configured src root just because its parent dir happens to
+  be named `src`. Three new regression tests guard the nested-file
+  case, the `src = "."` case, and the false-positive same-named-
+  nested-dir case.
 
 ### Added — examples & tooling
 
