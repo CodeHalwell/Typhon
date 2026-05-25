@@ -1884,8 +1884,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             for s in &i.body {
                 walk_stmt(r, scope, s);
             }
-            let drained: Vec<Binding> =
-                r.scopes[scope].bindings.drain(pre_if_len..).collect();
+            let drained: Vec<Binding> = r.scopes[scope].bindings.drain(pre_if_len..).collect();
             branch_local_bindings.extend(drained);
             for clause in &i.elif_else_clauses {
                 if let Some(test) = &clause.test {
@@ -1894,8 +1893,7 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
                 for s in &clause.body {
                     walk_stmt(r, scope, s);
                 }
-                let drained: Vec<Binding> =
-                    r.scopes[scope].bindings.drain(pre_if_len..).collect();
+                let drained: Vec<Binding> = r.scopes[scope].bindings.drain(pre_if_len..).collect();
                 branch_local_bindings.extend(drained);
             }
             r.scopes[scope].bindings.extend(branch_local_bindings);

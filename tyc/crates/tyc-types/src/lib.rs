@@ -6066,8 +6066,8 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 // (`as self.field`) are left for a follow-up.
                 if let Some(var) = &item.optional_vars {
                     if let Expr::Name(n) = var.as_ref() {
-                        let bound_type = with_item_bound_type(c, &ctx_type, w.is_async)
-                            .unwrap_or(Type::Unknown);
+                        let bound_type =
+                            with_item_bound_type(c, &ctx_type, w.is_async).unwrap_or(Type::Unknown);
                         let span = (
                             n.range.start().to_usize(),
                             n.range.start().to_usize() + n.id.as_str().len(),

@@ -307,10 +307,8 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // `pub` markers) are skipped — there's nothing to re-export.
     // Sub-packages contribute via their own `__init__.ty` if the
     // user opts in there too, so aggregation cascades naturally.
-    let mut pkg_pub_aggregation: std::collections::HashMap<
-        PathBuf,
-        Vec<(String, Vec<String>)>,
-    > = std::collections::HashMap::new();
+    let mut pkg_pub_aggregation: std::collections::HashMap<PathBuf, Vec<(String, Vec<String>)>> =
+        std::collections::HashMap::new();
     for (path, source) in &sources {
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         if stem == "__init__" {
@@ -409,9 +407,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                                      `{}` is exported by `{}` and `{}` — keeping the {} \
                                      definition. Rename one of them or remove `pub *` and \
                                      write explicit re-exports.",
-                                    dir.file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or("<pkg>"),
+                                    dir.file_name().and_then(|n| n.to_str()).unwrap_or("<pkg>"),
                                     n,
                                     first_owner,
                                     mod_name,
@@ -2160,7 +2156,9 @@ mod tests {
             "expected __all__ to be synthesised; got:\n{init_py}"
         );
         // Deterministic ordering: util sorts before widget.
-        let util_at = init_py.find(".util import").expect("util re-export present");
+        let util_at = init_py
+            .find(".util import")
+            .expect("util re-export present");
         let widget_at = init_py
             .find(".widget import")
             .expect("widget re-export present");
