@@ -1184,10 +1184,36 @@ _E = TypeVar(\"_E\")
 class Ok(Generic[_T]):
     value: _T
 
+    def map(self, f):
+        return Ok(f(self.value))
+
+    def map_err(self, f):
+        # Ok is unchanged by map_err — the error transform is irrelevant.
+        return self
+
+    def and_then(self, f):
+        return f(self.value)
+
+    def or_else(self, f):
+        return self
+
 
 @dataclass(slots=True, frozen=True)
 class Err(Generic[_E]):
     error: _E
+
+    def map(self, f):
+        # Err is unchanged by map — the value transform is irrelevant.
+        return self
+
+    def map_err(self, f):
+        return Err(f(self.error))
+
+    def and_then(self, f):
+        return self
+
+    def or_else(self, f):
+        return f(self.error)
 
 
 # Use `typing.Union` rather than PEP 695 `type Result[T, E] = …` so the

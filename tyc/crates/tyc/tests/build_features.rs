@@ -984,6 +984,60 @@ fn typhon_runtime_init_reexports_result_and_stdlib() {
     assert!(init.contains("result"), "result should be re-exported");
 }
 
+#[test]
+fn ok_and_err_expose_map_and_map_err_methods() {
+    // R2-6: heterogeneous-error with-chains were forced into a 4-deep
+    // match tower because the `?` operator demands a single error type
+    // across every callee. Surfacing `.map_err(f)` (and the symmetric
+    // `.map(f)`, `.and_then(f)`, `.or_else(f)`) as methods on Ok/Err
+    // lets users normalise the error at each step in chain form:
+    //
+    //   tokenize(src).map_err(_lex_to_pipeline)?
+    //   parse(toks).map_err(_parse_to_pipeline)?
+    //
+    // Verify the generated runtime exposes these methods and that
+    // they behave per the algebra.
+    let tmp = tempfile::tempdir().unwrap();
+    scaffold(tmp.path(), "def f() -> Ok[int]:\n    return Ok(1)\n");
+    build(tmp.path());
+    let init =
+        std::fs::read_to_string(tmp.path().join("build/typhon_runtime/__init__.py")).unwrap();
+    for method in &["def map(", "def map_err(", "def and_then(", "def or_else("] {
+        assert!(
+            init.contains(method),
+            "Ok / Err must expose `{method}…` method; got:\n{init}"
+        );
+    }
+
+    // Algebraic round-trip: Ok.map_err is identity, Err.map_err transforms.
+    let Some(py) = python() else { return };
+    let build_dir = tmp.path().join("build");
+    let script = format!(
+        "\
+import sys
+sys.path.insert(0, {build_dir:?})
+from typhon_runtime import Ok, Err
+assert Ok(1).map_err(str) == Ok(1), 'Ok.map_err should be identity'
+assert Err('oops').map_err(lambda e: e.upper()) == Err('OOPS'), 'Err.map_err must transform'
+assert Ok(2).map(lambda x: x + 1) == Ok(3), 'Ok.map must transform'
+assert Err('x').map(lambda v: v) == Err('x'), 'Err.map should be identity'
+assert Ok(5).and_then(lambda x: Ok(x * 2)) == Ok(10), 'Ok.and_then must chain'
+assert Err('e').and_then(lambda v: Ok(v)) == Err('e'), 'Err.and_then short-circuits'
+assert Err('e').or_else(lambda e: Ok(len(e))) == Ok(1), 'Err.or_else recovers'
+assert Ok(7).or_else(lambda e: Err('unused')) == Ok(7), 'Ok.or_else short-circuits'
+print('OK')
+",
+        build_dir = build_dir.display().to_string()
+    );
+    let out = Command::new(py).arg("-c").arg(&script).output().unwrap();
+    assert!(
+        out.status.success(),
+        "Result method algebra failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 // ── init command — argument coverage ────────────────────────────────────────
 
 #[test]
