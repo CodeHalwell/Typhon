@@ -8747,7 +8747,32 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             c.inside_await = c.inside_await.saturating_add(1);
             let inner = infer_expr_ctx(c, &a.value, expected);
             c.inside_await = c.inside_await.saturating_sub(1);
-            inner
+            // Unwrap `typing.Awaitable[T]` and `typing.Coroutine[Y, S, T]`
+            // R3-1: a `Callable[..., Awaitable[T]]` call site infers to
+            // `Awaitable[T]` from the Callable's return position, but
+            // `await` consumes the awaitable and produces the inner
+            // value — so the await expression's type must be `T`, not
+            // the wrapper. Without this unwrap, the natural async-
+            // middleware shape (`async def call(nxt: Callable[[Req],
+            // Awaitable[Resp]]) -> Resp: let r = await nxt(req); …`)
+            // fails with `tyc::type_mismatch: expected Resp, found
+            // Awaitable[Resp]` even though the runtime behaviour is
+            // perfectly valid. `Coroutine[Y, S, T]` carries the result
+            // in its third position per the typing-spec — mypy /
+            // pyright unwrap the same way. The canonical `async def f()
+            // -> T:` path is unaffected because the checker already
+            // tracks async functions as returning `T` directly
+            // (the call site sees `T`, not `Awaitable[T]`), so the
+            // fall-through arm preserves today's behaviour.
+            match &inner {
+                Type::Generic(head, args) if head == "Awaitable" && args.len() == 1 => {
+                    args[0].clone()
+                }
+                Type::Generic(head, args) if head == "Coroutine" && args.len() == 3 => {
+                    args[2].clone()
+                }
+                _ => inner,
+            }
         }
         _ => Type::Unknown,
     }
@@ -12498,6 +12523,69 @@ let s: str = id(3)
         assert!(
             !d.has_errors(),
             "binop with a foreign class operand must not over-promote to float; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn await_unwraps_awaitable_in_callable_return() {
+        // R3-1: `Callable[..., Awaitable[T]]` is the canonical async-
+        // middleware shape (FastAPI/Starlette/aiohttp). Calling the
+        // callable returns `Awaitable[T]`; awaiting it must produce
+        // `T`, not `Awaitable[T]`. Without the unwrap, the `let r: T =
+        // await nxt(x)` line at the heart of every middleware chain
+        // fires a spurious `type_mismatch: expected T, found
+        // Awaitable[T]`.
+        let d = check(
+            "from typing import Callable, Awaitable\n\
+             type NextFn = Callable[[int], Awaitable[int]]\n\
+             async def caller(nxt: NextFn) -> int:\n\
+             \x20   let r: int = await nxt(42)\n\
+             \x20   return r\n",
+        );
+        assert!(
+            !d.has_errors(),
+            "await on Callable[..., Awaitable[T]] must produce T; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn await_unwraps_coroutine_third_param() {
+        // R3-1: `Coroutine[Y, S, T]` carries the awaited result in its
+        // third type parameter (typing-spec contract). mypy / pyright
+        // unwrap the same way; Typhon must too.
+        let d = check(
+            "from typing import Callable, Coroutine\n\
+             type ProcFn = Callable[[int], Coroutine[None, None, str]]\n\
+             async def caller(p: ProcFn) -> str:\n\
+             \x20   let r: str = await p(42)\n\
+             \x20   return r\n",
+        );
+        assert!(
+            !d.has_errors(),
+            "await on Callable[..., Coroutine[Y,S,T]] must produce T; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn await_on_async_def_still_returns_declared_type() {
+        // Regression: the unwrap added for R3-1 must not change the
+        // canonical `async def f() -> int: ...; await f()` path. The
+        // checker tracks `async def` as returning `int` directly (not
+        // `Awaitable[int]`), so the unwrap arms shouldn't fire and the
+        // result must stay `int`.
+        let d = check(
+            "async def fetch() -> int:\n\
+             \x20   return 1\n\
+             async def main() -> int:\n\
+             \x20   let v: int = await fetch()\n\
+             \x20   return v\n",
+        );
+        assert!(
+            !d.has_errors(),
+            "regression: await on async def f() -> int must still be int; got {:?}",
             d.errors()
         );
     }

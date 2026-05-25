@@ -11,6 +11,23 @@ remaining ergonomics gaps that survived v0.6.0 / v0.6.1.
 
 ### Fixed — compiler
 
+- **`tyc-types`: `await` on a `Callable[..., Awaitable[T]]` /
+  `Callable[..., Coroutine[Y, S, T]]` call now unwraps to `T`
+  (R3-1).** The canonical async-middleware shape across
+  FastAPI / Starlette / aiohttp is `next: Callable[[Req],
+  Awaitable[Resp]]`; calling `next(req)` infers to `Awaitable[Resp]`
+  from the `Callable` return position, and `await next(req)` should
+  consume the awaitable and produce `Resp`. Without the unwrap, the
+  natural shape `let r: Resp = await next(req)` failed with a spurious
+  `tyc::type_mismatch: expected Resp, found Awaitable[Resp]` even
+  though the runtime behaviour is correct — and the 14-api-gateway
+  app had to abandon the recursive `next`-style middleware chain in
+  favour of a sync `pre_hook` / `post_hook` pipeline, losing the
+  ability to wrap async sections around inner handlers. The single
+  biggest Round-3 finding. The canonical `async def f() -> T:` path
+  is unaffected: the checker already tracks async functions as
+  returning `T` directly (not `Awaitable[T]`), so the new
+  unwrap-on-await arms only fire when the wrapper actually appears.
 - **`tyc-types`: same-newtype arithmetic preserves the newtype, and
   one-sided literal arithmetic likewise (R2-12).** `newtype LogIndex
   = int` previously inferred `last_idx + 1` and `LogIndex + LogIndex`
