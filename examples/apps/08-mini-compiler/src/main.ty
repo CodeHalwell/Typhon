@@ -1,10 +1,10 @@
-from eval import EvalError, eval_program
-from lexer import LexError, tokenize
-from parser import ParseError, parse
-from source import Source, span_label
-from tokens import Token, token_label
-from lang_types import TypeError, check, empty_type_env, ty_label
-from values import value_to_str
+from runtime import EvalError, eval_program
+from frontend import LexError, tokenize
+from frontend import ParseError, parse
+from frontend import Source, span_label
+from frontend import Token, token_label
+from middle import TypeError, check, empty_type_env, ty_label
+from runtime import value_to_str
 
 
 pub class StageReport:

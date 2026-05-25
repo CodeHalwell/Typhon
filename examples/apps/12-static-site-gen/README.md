@@ -16,19 +16,19 @@ A Markdown → HTML static site generator built end-to-end in Typhon, with:
 
 | File | Responsibility |
 |---|---|
-| `src/ids.ty` | `newtype` wrappers (`PageId`, `AssetHash`, `TemplateName`, `SlugStr`, `SourceHash`) |
-| `src/models.ty` | Sealed-union AST nodes (`Block`/`Inline`/`TplNode`), `FrontMatter` model, `StageError` variants, factory functions |
-| `src/config.ty` | `freeze let` escape tables, `comptime let` build version, `SiteConfig` |
-| `src/frontmatter.ty` | YAML-lite frontmatter parser → `Result[FrontMatter, FrontMatterError]` |
-| `src/md_lex.ty` | Line-level Markdown lexer (`MdLine` sealed union) |
-| `src/md_parse.ty` | Inline + block Markdown parser, recursive HTML renderer |
-| `src/tpl_lex.ty` | Template tokenizer (`{{ ... }}` / `{% ... %}` / text) |
-| `src/tpl_parse.ty` | Template parser → `Template` AST |
-| `src/tpl_render.ty` | Context-driven template renderer with block inheritance |
-| `src/manifest.ty` | SQLite-backed incremental-build manifest with transactions |
-| `src/assets.ty` | Asset hashing + copy pipeline |
-| `src/feed.ty` | RSS (Atom) + sitemap.xml + robots.txt emission |
-| `src/pipeline.ty` | Multi-stage Result-chained build pass |
+| `src/domain/ids.ty` | `newtype` wrappers (`PageId`, `AssetHash`, `TemplateName`, `SlugStr`, `SourceHash`) |
+| `src/domain/models.ty` | Sealed-union AST nodes (`Block`/`Inline`/`TplNode`), `FrontMatter` model, `StageError` variants, factory functions |
+| `src/conf.ty` | `freeze let` escape tables, `comptime let` build version, `SiteConfig` |
+| `src/markdown/frontmatter.ty` | YAML-lite frontmatter parser → `Result[FrontMatter, FrontMatterError]` |
+| `src/markdown/md_lex.ty` | Line-level Markdown lexer (`MdLine` sealed union) |
+| `src/markdown/md_parse.ty` | Inline + block Markdown parser, recursive HTML renderer |
+| `src/template/tpl_lex.ty` | Template tokenizer (`{{ ... }}` / `{% ... %}` / text) |
+| `src/template/tpl_parse.ty` | Template parser → `Template` AST |
+| `src/template/tpl_render.ty` | Context-driven template renderer with block inheritance |
+| `src/pipeline/manifest.ty` | SQLite-backed incremental-build manifest with transactions |
+| `src/pipeline/assets.ty` | Asset hashing + copy pipeline |
+| `src/pipeline/feed.ty` | RSS (Atom) + sitemap.xml + robots.txt emission |
+| `src/pipeline/pipeline.ty` | Multi-stage Result-chained build pass |
 | `src/cli.ty` | `argparse` subcommand dispatcher |
 | `src/main.ty` | Entry point |
 

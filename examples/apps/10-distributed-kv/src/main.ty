@@ -1,7 +1,7 @@
-from cluster import Cluster, new_cluster
-from ids import ClientReqId, NodeId
-from node import Node
-from rpc import (
+from consensus import Cluster, new_cluster
+from domain import ClientReqId, NodeId
+from consensus import Node
+from consensus import (
     Message,
     MsgClientGet,
     MsgClientPut,

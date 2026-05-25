@@ -3,8 +3,8 @@ import sys
 
 import uvicorn
 
-from api import STATE, app, warm_state
-from config import game_version
+from transport import STATE, app, warm_state
+from boot import game_version
 
 
 async def _serve() -> None:

@@ -4,11 +4,13 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-<<<<<<< HEAD
-## Unreleased
+## 0.7.0 — 2026-05-25
 
-Carry-over sweep from the Round-3 apps-feedback campaign. Targets the
-remaining ergonomics gaps that survived v0.6.0 / v0.6.1.
+Carry-over sweep from the Round-3 apps-feedback campaign. Closes the
+ergonomics and correctness gaps that survived v0.6.0 / v0.6.1, and
+ships the third stress round's findings as compiler features rather
+than open issues. Strictly additive: every previously-accepted program
+keeps compiling to the same Python.
 
 ### Added — language & runtime
 
@@ -202,6 +204,66 @@ remaining ergonomics gaps that survived v0.6.0 / v0.6.1.
 - **R3-12: nested `def` and nested `from X import Y` sanctioned.**
 - **R3-13: nullary sealed-union variants documented as
   `class Foo frozen: pass` with `case Foo():` matching.**
+
+### Fixed — formatter
+
+- **`tyc fmt`: scientific-notation literals (`1e-12`, `2.5E+7`,
+  `1.0e-12`) stop being split into a syntax error.** The in-process
+  whitespace pass already inserted PEP 8 spaces around binary `+` /
+  `-` when the previous and next characters both looked like
+  expression operands; the `e` in `1e-12` is alphanumeric, so the
+  heuristic fired on every scientific literal and produced
+  `u = 1e - 12` (Python rejects with `SyntaxError: invalid decimal
+  literal`). Adds a carve-out that recognises an exponent sign by
+  walking back over the trailing digit-run (`<digit>+e` or
+  `<digit>+.<digit>+e`, including PEP 515 `_` separators) immediately
+  preceding the operator, and emits the sign tight. Three new
+  regression tests in `tyc-format` cover `1e-12`, `2.5E+7`,
+  `1.0e-12`, `1_000e-3`, and the binary-minus case
+  (`e - 1` after a bare identifier still spaces). Surfaced by the
+  v0.7.0 reorganisation of `examples/apps/13-vector-db/` — the
+  `1.0e-12` clamp in HNSW's `_random_level` would otherwise emit as
+  `1e - 12` and crash at import time.
+
+### Fixed — checker
+
+- **`tyc::stdlib_module_shadow` no longer fires for files nested in a
+  sub-package.** A `src/indexer/tokenize.ty` lowers to
+  `build/indexer/tokenize.py`, which is *not* on `sys.path` when
+  `python build/main.py` runs — the file cannot intercept stdlib
+  `import tokenize` from anywhere. The warning now only fires when the
+  file sits at the top of the configured source directory (the
+  `parent.file_name == src_root` check). One new regression test
+  guards the nested-file case.
+
+### Added — examples & tooling
+
+- **Every `examples/apps/` project re-organised into grouped
+  subdirectories.** The flat-`src/` layout used by all fifteen apps
+  through v0.6.x is replaced with 2–6 grouped subdirectories per app
+  (`domain/`, `runtime/`, `storage/`, `transport/`, `middleware/`,
+  `consensus/`, …) keyed on responsibility, with each package opting
+  into `pub *` re-export aggregation via a one-line `__init__.ty`.
+  Cross-package imports stay short (`from domain import EntityId`),
+  intra-package imports use the relative form (`from .ids import
+  EntityId`), and the underlying file count per app is unchanged.
+  Every reorganised app still `tyc check`s clean, `tyc build`s, and
+  exercises end-to-end through CPython 3.13.
+- **VS Code extension `0.1.9 → 0.2.0`.** Grammar catches up to the
+  v0.7.0 language surface:
+  - `pub def` / `pub async def` now highlight `pub` as
+    `storage.modifier.pub.typhon` and the function name as
+    `entity.name.function.typhon`; previously `pub` fell through to a
+    generic keyword fallback and the `def` rule started one token
+    later, producing a different colour for `pub def foo` vs `def
+    foo` in some themes.
+  - `pub *` at module level (in `__init__.ty`) is now recognised as a
+    single re-export construct — the `pub` paints as the visibility
+    modifier and the `*` as `keyword.operator.wildcard.typhon`, so
+    the marker pops visually instead of falling through to two
+    independent keywords.
+  - `editors/vscode/README.md` adds `pub` to the modifier list and
+    documents the `pub *` re-export and `newtype` constructs.
 
 ## 0.6.1 — 2026-05-25
 

@@ -14,14 +14,14 @@ A production-shaped task scheduler with:
 
 | File | Responsibility |
 |---|---|
-| `src/ids.ty` | `newtype` wrappers for the ID kinds in the system |
-| `src/models.ty` | `model` types at the HTTP boundary, internal `class` types |
-| `src/config.ty` | `freeze let` + `comptime let` for runtime constants |
-| `src/store.ty` | SQLite-backed durable storage with `Result[T, E]` returns |
-| `src/scheduler.ty` | DAG resolution + ready-queue management |
-| `src/worker.ty` | Async worker loop with retry/backoff |
-| `src/handlers.ty` | Sample task handlers registered with the scheduler |
-| `src/api.ty` | FastAPI control-plane endpoints |
+| `src/domain/ids.ty` | `newtype` wrappers for the ID kinds in the system |
+| `src/domain/models.ty` | `model` types at the HTTP boundary, internal `class` types |
+| `src/runtime/config.ty` | `freeze let` + `comptime let` for runtime constants |
+| `src/storage/store.ty` | SQLite-backed durable storage with `Result[T, E]` returns |
+| `src/runtime/scheduler.ty` | DAG resolution + ready-queue management |
+| `src/runtime/worker.ty` | Async worker loop with retry/backoff |
+| `src/runtime/handlers.ty` | Sample task handlers registered with the scheduler |
+| `src/transport/api.ty` | FastAPI control-plane endpoints |
 | `src/main.ty` | Wires everything together, owns the lifecycle |
 
 ## Features exercised

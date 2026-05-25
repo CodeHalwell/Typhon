@@ -23,6 +23,7 @@ straight from a failed build to the corresponding documentation.
 - [`tyc::duplicate_class`](./duplicate_class.md) — same class name declared more than once at the same scope.
 - [`tyc::duplicate_method`](./duplicate_method.md) — two `impl` / `extend` blocks on the same class both define a method with the same name.
 - [`tyc::extend_builtin`](./extend_builtin.md) — `extend` targets a Python built-in type.
+- [`tyc::field_default_ordering`](./field_default_ordering.md) — class declares a non-defaulted field after a defaulted one; the synthesised `__init__` would raise at import time.
 - [`tyc::frozen_assign`](./frozen_assign.md) — field assignment on a `frozen` class outside its constructor.
 - [`tyc::generator_return_type`](./generator_return_type.md) — body contains `yield` but the return type isn't iterator-shaped.
 - [`tyc::generic`](./generic.md) — catch-all early-phase diagnostic.
@@ -55,10 +56,13 @@ straight from a failed build to the corresponding documentation.
 - [`tyc::orphan_py_import`](./orphan_py_import.md) — warning: relative `.py` import resolves outside `src/`.
 - [`tyc::parse`](./parse.md) — source file failed to parse.
 - [`tyc::pattern_shadows_outer`](./pattern_shadows_outer.md) — `case` pattern captures a name that already exists as an immutable `let` in an enclosing scope.
+- [`tyc::pub_name_collision`](./pub_name_collision.md) — `pub *` aggregation in `__init__.ty` finds two siblings exporting the same name.
+- [`tyc::pub_star_outside_init`](./pub_star_outside_init.md) — advice: `pub *` outside `__init__.ty` is a no-op and the marker should be removed.
 - [`tyc::python_semantic_drift`](./python_semantic_drift.md) — warning: Typhon rejects an expression CPython accepts.
 - [`tyc::resource_not_managed`](./resource_not_managed.md) — bare assignment of a context-manager-returning call (`open`, `socket.socket`, `sqlite3.connect`, `tempfile.*`) not wrapped in `with`.
 - [`tyc::result_error_mismatch`](./result_error_mismatch.md) — `?` forwards an `Err` whose type doesn't match the enclosing `Result`.
 - [`tyc::self_outside_impl`](./self_outside_impl.md) — `self` referenced outside an `impl` method body.
+- [`tyc::stdlib_module_shadow`](./stdlib_module_shadow.md) — warning: project `.ty` file's stem matches a Python 3.13 stdlib top-level module name (`types`, `json`, `io`, …) and would intercept stdlib imports on `sys.path`.
 - [`tyc::stub_mismatch`](./stub_mismatch.md) — `.dty` stub disagrees with the implementation module.
 - [`tyc::tuple_index_out_of_range`](./tuple_index_out_of_range.md) — constant index out of range for a fixed-arity tuple.
 - [`tyc::type_mismatch`](./type_mismatch.md) — value of one type used where another was expected.
@@ -70,6 +74,7 @@ straight from a failed build to the corresponding documentation.
 - [`tyc::unknown_name`](./unknown_name.md) — name used but never declared in any enclosing scope.
 - [`tyc::unsafe_value_leak`](./unsafe_value_leak.md) — value introduced inside an `unsafe:` block returned from a function whose annotated return is concrete, without re-asserting the type at the boundary.
 - [`tyc::unused_import`](./unused_import.md) — imported name is never used in the module.
+- [`tyc::use_of_uninitialised`](./use_of_uninitialised.md) — read on a declare-only `let NAME: T` binding via a control-flow path that didn't assign it.
 
 Language-level reference pages (no `tyc::` code):
 

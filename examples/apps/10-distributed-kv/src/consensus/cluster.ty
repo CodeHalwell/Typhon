@@ -1,0 +1,121 @@
+from domain import NodeId
+from .node import CLIENT_RECIPIENT, Node, new_node
+from .rpc import Message, message_label
+from domain import RoleCandidate, RoleFollower, RoleLeader, role_label
+
+
+pub class Cluster:
+    nodes: dict[int, Node]
+    clock: float
+    inbox: list[tuple[int, Message]]
+    delivered: list[tuple[int, int, Message]]
+    client_log: list[Message]
+
+
+pub def new_cluster(size: int, now: float) -> Cluster:
+    mut peers: list[NodeId] = []
+    mut i: int = 0
+    while i < size:
+        peers.append(NodeId(i))
+        i = i + 1
+
+    mut nodes: dict[int, Node] = {}
+    mut j: int = 0
+    while j < size:
+        let n: Node = new_node(NodeId(j), list(peers), now)
+        nodes[j] = n
+        j = j + 1
+
+    return Cluster(
+        nodes=nodes,
+        clock=now,
+        inbox=[],
+        delivered=[],
+        client_log=[],
+    )
+
+
+impl Cluster:
+    def step(self, dt: float) -> None:
+        self.clock = self.clock + dt
+        let now: float = self.clock
+
+        # Deliver all currently-queued messages, gathering outputs.
+        let to_deliver: list[tuple[int, Message]] = list(self.inbox)
+        self.inbox = []
+        for delivery in to_deliver:
+            let (recipient, msg) = delivery
+            if recipient == CLIENT_RECIPIENT:
+                # Client reply — capture for inspection.
+                self.client_log.append(msg)
+                continue
+            if recipient not in self.nodes:
+                continue
+            let node: Node = self.nodes[recipient]
+            let outs: list[tuple[int, Message]] = node.handle(msg, now)
+            for o in outs:
+                self.inbox.append(o)
+
+        # Tick each node (election timeouts, heartbeats).
+        for tick_node_id in self.nodes:
+            let tn: Node = self.nodes[tick_node_id]
+            let tick_outs: list[tuple[int, Message]] = tn.tick(now)
+            for o in tick_outs:
+                self.inbox.append(o)
+
+        # Apply committed entries on each node.
+        for apply_node_id in self.nodes:
+            let an: Node = self.nodes[apply_node_id]
+            let applied_outs: list[tuple[int, Message]] = an.apply_committed()
+            for o in applied_outs:
+                self.inbox.append(o)
+
+    def find_leader(self) -> NodeId?:
+        for node_id in self.nodes:
+            let n: Node = self.nodes[node_id]
+            match n.role:
+                case RoleLeader(_, _, _):
+                    return n.id
+                case RoleFollower(_, _):
+                    pass
+                case RoleCandidate(_, _):
+                    pass
+        return None
+
+    def submit(self, msg: Message) -> None:
+        let leader_opt: NodeId? = self.find_leader()
+        let target_id: int = (
+            int(leader_opt) if leader_opt is not None else self._any_node_id()
+        )
+        self.inbox.append((target_id, msg))
+
+    def _any_node_id(self) -> int:
+        mut found: int = 0
+        for node_id in self.nodes:
+            found = node_id
+            break
+        return found
+
+    def snapshot(self) -> str:
+        mut lines: list[str] = []
+        lines.append(f"clock={self.clock:.3f}s inbox={len(self.inbox)} replies={len(self.client_log)}")
+        mut keys: list[int] = []
+        for node_id in self.nodes:
+            keys.append(node_id)
+        keys.sort()
+        for k in keys:
+            let n: Node = self.nodes[k]
+            let role_str: str = role_label(n.role)
+            let line: str = (
+                f"  node {int(n.id)}: role={role_str} term={int(n.current_term)} "
+                f"log_len={len(n.log.entries)} commit={int(n.commit_index)} "
+                f"applied={int(n.last_applied)}"
+            )
+            lines.append(line)
+        return "\n".join(lines)
+
+    def dump_client_replies(self) -> str:
+        mut lines: list[str] = []
+        for m in self.client_log:
+            lines.append("  " + message_label(m))
+        return "\n".join(lines)

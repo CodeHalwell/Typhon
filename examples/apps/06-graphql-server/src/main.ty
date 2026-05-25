@@ -1,6 +1,6 @@
-from executor import execute
-from ids import Token
-from schema import (
+from runtime import execute
+from domain import Token
+from domain import (
     Comment,
     FieldComment,
     FieldCommentList,
@@ -15,7 +15,7 @@ from schema import (
     ResolvedField,
     User,
 )
-from store import Store, seed_store
+from storage import Store, seed_store
 
 
 def _indent(level: int) -> str:

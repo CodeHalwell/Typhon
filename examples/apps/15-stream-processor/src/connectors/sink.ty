@@ -1,0 +1,102 @@
+from typing import Callable
+
+from domain import Envelope, is_record
+from domain import OperatorId
+
+
+# A Sink is a concrete-class-with-Callable rather than a cross-module interface
+# (TYPHON_FEEDBACK round-1 #2 — cross-module interface conformance is rejected).
+# `accept(env)` is called once per envelope.
+pub class Sink:
+    id: OperatorId
+    name: str
+    accept: Callable[[Envelope], None]
+
+
+# Stateful concrete implementations whose methods are wired into the Sink's
+# `accept` callable.
+
+pub class PrintSink:
+    name: str
+    prefix: str
+    records_seen: int
+
+
+impl PrintSink:
+    def accept_one(self, env: Envelope) -> None:
+        if not is_record(env):
+            return
+        self.records_seen = self.records_seen + 1
+        print(f"[{self.prefix}] ts={env.timestamp_ms} key={env.key} payload={env.record_payload}")
+
+
+pub def new_print_sink(id: OperatorId, name: str, prefix: str) -> Sink:
+    let inner: PrintSink = PrintSink(name=name, prefix=prefix, records_seen=0)
+    return Sink(id=id, name=name, accept=inner.accept_one)
+
+
+pub class BufferSink:
+    name: str
+    buffer: list[object]
+
+
+impl BufferSink:
+    def accept_one(self, env: Envelope) -> None:
+        if not is_record(env):
+            return
+        self.buffer.append(env.record_payload)
+
+    def items(self) -> list[object]:
+        return self.buffer
+
+    def clear(self) -> None:
+        self.buffer = []
+
+
+pub def new_buffer_sink(id: OperatorId, name: str) -> tuple[Sink, BufferSink]:
+    let inner: BufferSink = BufferSink(name=name, buffer=[])
+    let s: Sink = Sink(id=id, name=name, accept=inner.accept_one)
+    return (s, inner)
+
+
+pub class CallbackSink:
+    name: str
+    callback: Callable[[object], None]
+
+
+impl CallbackSink:
+    def accept_one(self, env: Envelope) -> None:
+        if not is_record(env):
+            return
+        self.callback(env.record_payload)
+
+
+pub def new_callback_sink(
+    id: OperatorId, name: str, fn: Callable[[object], None],
+) -> Sink:
+    let inner: CallbackSink = CallbackSink(name=name, callback=fn)
+    return Sink(id=id, name=name, accept=inner.accept_one)
+
+
+# Side-output sink. Captures late events that arrive after the watermark passes
+# them.
+pub class LateSideOutput:
+    name: str
+    items: list[Envelope]
+
+
+pub def new_late_side_output(name: str) -> LateSideOutput:
+    return LateSideOutput(name=name, items=[])
+
+
+impl LateSideOutput:
+    def push(self, env: Envelope) -> None:
+        self.items.append(env)
+
+    def drain(self) -> list[Envelope]:
+        let out: list[Envelope] = self.items
+        self.items = []
+        return out
+
+    def count(self) -> int:
+        return len(self.items)

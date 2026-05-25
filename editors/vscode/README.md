@@ -6,8 +6,9 @@ Language support for [Typhon](https://github.com/codehalwell/typhon) — a stati
 
 - **Syntax highlighting** for `.ty` and `.dty` files, including Typhon-specific keywords:
   - Bindings: `let`, `mut`, `val`, `var`
-  - Modifiers: `comptime`, `lazy`, `unsafe`, `pure`, `memo`
-  - Constructs: `impl`, `interface`, `model`, `extend`, `gather`, `go`, `guard`, `with`-chains
+  - Modifiers: `pub`, `comptime`, `lazy`, `unsafe`, `pure`, `memo`, `freeze`, `frozen`, `plain`
+  - Constructs: `impl`, `interface`, `model`, `extend`, `gather`, `go`, `guard`, `newtype`, `with`-chains
+  - Visibility: `pub` on `let` / `def` / `class` / `model` / `class!`, plus `pub *` wildcard re-export in `__init__.ty`
   - Sugar: `T?` nullable, `?` try operator, `|>` pipe
   - Result types: `Result`, `Ok`, `Err`
 - **Language server integration** via `tyc lsp`:

@@ -1,0 +1,96 @@
+import asyncio
+from urllib.parse import urlparse
+
+import httpx
+
+from runtime import CrawlConfig
+from domain import Host, Url
+
+
+pub class RobotsRules:
+    host: Host
+    disallows: list[str]
+    fetched: bool
+
+
+pub class RobotsCache:
+    rules: dict[str, RobotsRules]
+    lock: asyncio.Lock
+
+
+def _parse_robots(text: str, user_agent: str) -> list[str]:
+    mut disallows: list[str] = []
+    mut applies: bool = False
+    for raw in text.splitlines():
+        let line: str = raw.strip()
+        if line.startswith("#") or len(line) == 0:
+            continue
+        let lower: str = line.lower()
+        if lower.startswith("user-agent:"):
+            let target: str = line.split(":", 1)[1].strip()
+            applies = target == "*" or target.lower() == user_agent.lower()
+            continue
+        if applies and lower.startswith("disallow:"):
+            let path: str = line.split(":", 1)[1].strip()
+            if len(path) > 0:
+                disallows.append(path)
+    return disallows
+
+
+pub def host_of(url: Url) -> Host:
+    let parsed = urlparse(str(url))
+    return Host(parsed.netloc)
+
+
+pub def path_of(url: Url) -> str:
+    let parsed = urlparse(str(url))
+    let p: str = parsed.path
+    return p if len(p) > 0 else "/"
+
+
+impl RobotsCache:
+    async def rules_for(
+        self,
+        client: httpx.AsyncClient,
+        host: Host,
+        config: CrawlConfig,
+    ) -> RobotsRules:
+        let key: str = str(host)
+        async with self.lock:
+            let existing: RobotsRules? = self.rules.get(key)
+            if existing is not None:
+                return existing
+
+        # Fetch outside the lock so other hosts can proceed in parallel.
+        let robots_url: str = f"https://{key}/robots.txt"
+        mut disallows: list[str] = []
+        try:
+            let resp: httpx.Response = await client.get(
+                robots_url,
+                headers={"User-Agent": config.user_agent},
+                timeout=config.fetch_timeout_seconds,
+            )
+            if resp.status_code == 200:
+                disallows = _parse_robots(resp.text, config.user_agent)
+        except Exception:
+            pass
+
+        let rules: RobotsRules = RobotsRules(
+            host=host,
+            disallows=disallows,
+            fetched=True,
+        )
+        async with self.lock:
+            self.rules[key] = rules
+        return rules
+
+    def is_allowed(self, rules: RobotsRules, url: Url) -> bool:
+        let path: str = path_of(url)
+        for pattern in rules.disallows:
+            if path.startswith(pattern):
+                return False
+        return True
+
+
+pub def new_robots_cache() -> RobotsCache:
+    return RobotsCache(rules={}, lock=asyncio.Lock())

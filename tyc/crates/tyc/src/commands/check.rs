@@ -215,9 +215,13 @@ pub fn run(args: CheckArgs) -> Result<()> {
             // R2-4: warn if the module name collides with a Python
             // stdlib module. Only fires when a `typhon.toml` is present —
             // standalone-file checks skip the warning (no `build/` will
-            // be emitted, so the runtime collision can't happen).
+            // be emitted, so the runtime collision can't happen). The
+            // check also only fires for files at the top of the source
+            // tree — nested files lower into a sub-package whose
+            // emitted `.py` is not on `sys.path` and so cannot
+            // intercept stdlib imports.
             if has_project_config {
-                if let Some(warning) = check_stdlib_module_shadow(&path, &source) {
+                if let Some(warning) = check_stdlib_module_shadow(&path, &source, &src_root_name) {
                     diags.push_warning(warning);
                 }
             }
@@ -266,7 +270,9 @@ pub fn run(args: CheckArgs) -> Result<()> {
                 // project context emits no `build/` so the runtime
                 // collision can't happen. PR #129 copilot review.
                 if has_project_config {
-                    if let Some(warning) = check_stdlib_module_shadow(&path, &source) {
+                    if let Some(warning) =
+                        check_stdlib_module_shadow(&path, &source, &src_root_name)
+                    {
                         diags.push_warning(warning);
                     }
                 }
@@ -745,19 +751,33 @@ fn pub_star_line_offset(source: &str, line_idx: usize) -> usize {
     offset
 }
 
-fn check_stdlib_module_shadow(path: &std::path::Path, source: &str) -> Option<TycError> {
+fn check_stdlib_module_shadow(
+    path: &std::path::Path,
+    source: &str,
+    src_root: &str,
+) -> Option<TycError> {
     let stem = path.file_stem()?.to_str()?;
-    if stdlib_top_level_contains(stem) {
-        Some(TycError::stdlib_module_shadow(
-            stem.to_owned(),
-            path.display().to_string(),
-            source.to_owned(),
-            0,
-            0,
-        ))
-    } else {
-        None
+    if !stdlib_top_level_contains(stem) {
+        return None;
     }
+    // Only fire when the file sits at the top of the source tree —
+    // a nested `src/indexer/tokenize.ty` lowers to
+    // `build/indexer/tokenize.py`, which is not on `sys.path` and so
+    // cannot intercept `import tokenize` from stdlib callers. The
+    // shadow risk is real only when the emitted `build/tokenize.py`
+    // would sit alongside `build/main.py`.
+    let parent = path.parent()?;
+    let parent_name = parent.file_name().and_then(|n| n.to_str())?;
+    if parent_name != src_root {
+        return None;
+    }
+    Some(TycError::stdlib_module_shadow(
+        stem.to_owned(),
+        path.display().to_string(),
+        source.to_owned(),
+        0,
+        0,
+    ))
 }
 
 /// Run the secondary check passes — comptime evaluation, purity
@@ -1166,20 +1186,42 @@ mod tests {
     #[test]
     fn stdlib_module_shadow_emits_warning_on_colliding_filename() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = write_ty(tmp.path(), "types.ty", "pub class Foo:\n    x: int\n");
-        let diag = check_stdlib_module_shadow(&path, "pub class Foo:\n    x: int\n");
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        let path = write_ty(&src, "types.ty", "pub class Foo:\n    x: int\n");
+        let diag = check_stdlib_module_shadow(&path, "pub class Foo:\n    x: int\n", "src");
         assert!(
             diag.is_some(),
-            "expected a warning for a project module named `types`"
+            "expected a warning for a project module named `types` at the top of src/"
         );
     }
 
     #[test]
     fn stdlib_module_shadow_skips_disjoint_filename() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = write_ty(tmp.path(), "lang_types.ty", "");
-        let diag = check_stdlib_module_shadow(&path, "");
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        let path = write_ty(&src, "lang_types.ty", "");
+        let diag = check_stdlib_module_shadow(&path, "", "src");
         assert!(diag.is_none());
+    }
+
+    #[test]
+    fn stdlib_module_shadow_skips_nested_subpackage_file() {
+        // `src/indexer/tokenize.ty` lowers to
+        // `build/indexer/tokenize.py`, which is NOT on `sys.path` —
+        // so it cannot intercept `import tokenize` from stdlib
+        // callers. The shadow risk is real only for top-level files.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let sub = src.join("indexer");
+        std::fs::create_dir_all(&sub).unwrap();
+        let path = write_ty(&sub, "tokenize.ty", "");
+        let diag = check_stdlib_module_shadow(&path, "", "src");
+        assert!(
+            diag.is_none(),
+            "nested file's emitted .py is not on sys.path; no shadow risk"
+        );
     }
 
     #[test]

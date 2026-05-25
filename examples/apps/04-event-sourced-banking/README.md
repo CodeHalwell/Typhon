@@ -18,15 +18,15 @@ card, transactional transfers, and a tiny AML rule pipeline.
 
 | File | Responsibility |
 |---|---|
-| `src/ids.ty` | `newtype` IDs: `AccountId`, `CustomerId`, `TransactionId`, `Currency` |
-| `src/money.ty` | `newtype Money = int` (minor units) + FX rate card |
-| `src/events.ty` | Sealed-union event log + envelope |
-| `src/commands.ty` | Sealed-union of accepted commands |
-| `src/aggregate.ty` | `Account` rebuilt by folding events |
-| `src/projections.ty` | Balance + ledger + audit projections |
-| `src/aml.ty` | Composable AML rules over `Result` |
-| `src/handlers.ty` | Command handlers: command → event(s) (or rejection) |
-| `src/store.ty` | In-memory append-only event store + snapshots |
+| `src/domain/ids.ty` | `newtype` IDs: `AccountId`, `CustomerId`, `TransactionId`, `Currency` |
+| `src/domain/money.ty` | `newtype Money = int` (minor units) + FX rate card |
+| `src/domain/events.ty` | Sealed-union event log + envelope |
+| `src/domain/commands.ty` | Sealed-union of accepted commands |
+| `src/aggregate/aggregate.ty` | `Account` rebuilt by folding events |
+| `src/application/projections.ty` | Balance + ledger + audit projections |
+| `src/aggregate/aml.ty` | Composable AML rules over `Result` |
+| `src/application/handlers.ty` | Command handlers: command → event(s) (or rejection) |
+| `src/storage/store.ty` | In-memory append-only event store + snapshots |
 | `src/main.ty` | Worked sample: open accounts → fund → transfer → query |
 
 ## Features exercised

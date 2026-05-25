@@ -1,0 +1,270 @@
+import math
+import random
+
+from runtime import HnswParams
+from domain import VectorId
+from vector import Metric, score
+
+
+# A node in the HNSW graph. We key everything by `int` (the underlying
+# `VectorId` representation) — see R2-11; using `dict[VectorId, ...]`
+# leads to constant wrap/unwrap pain across this module's hot path.
+pub class HnswNode:
+    id: int
+    level: int
+    vector: list[float]
+    # neighbours[level] is a list of neighbour ids at that level.
+    neighbours: list[list[int]]
+
+
+pub class Hnsw:
+    params: HnswParams
+    metric: Metric
+    nodes: dict[int, HnswNode]
+    entry_point: int  # -1 when empty
+    current_max_level: int
+    rng: random.Random
+
+
+pub def new_hnsw(params: HnswParams, metric: Metric, seed: int = 1) -> Hnsw:
+    return Hnsw(
+        params=params,
+        metric=metric,
+        nodes={},
+        entry_point=-1,
+        current_max_level=-1,
+        rng=random.Random(seed),
+    )
+
+
+# A candidate during search: distance and id. Pure data class.
+pub class Candidate frozen:
+    distance: float
+    id: int
+
+
+def _random_level(rng: random.Random, mult: float, max_level: int) -> int:
+    # Standard HNSW level sampling: floor(-ln(uniform) * mult).
+    mut u: float = rng.random()
+    if u <= 0.0:
+        u = 1.0e-12
+    let lvl_raw: float = -math.log(u) * mult
+    let lvl: int = int(lvl_raw)
+    if lvl > max_level:
+        return max_level
+    return lvl
+
+
+def _insert_sorted(buf: list[Candidate], c: Candidate, cap: int) -> list[Candidate]:
+    # Keep `buf` sorted by ascending distance, capped at `cap`.
+    mut out: list[Candidate] = list(buf)
+    mut inserted: bool = False
+    mut i: int = 0
+    while i < len(out):
+        if c.distance < out[i].distance:
+            out.insert(i, c)
+            inserted = True
+            break
+        i = i + 1
+    if not inserted:
+        out.append(c)
+    if len(out) > cap:
+        return out[:cap]
+    return out
+
+
+impl Hnsw:
+    def size(self) -> int:
+        return len(self.nodes)
+
+    def has(self, vid: VectorId) -> bool:
+        return int(vid) in self.nodes
+
+    def get_vector(self, vid: VectorId) -> list[float]?:
+        let node_opt: HnswNode? = self.nodes.get(int(vid))
+        if node_opt is None:
+            return None
+        let node: HnswNode = node_opt
+        return node.vector
+
+    def delete(self, vid: VectorId) -> bool:
+        let key: int = int(vid)
+        if key not in self.nodes:
+            return False
+        # Drop the node and prune any incoming edges. Edges are stored
+        # per-level on the neighbour itself, so we scan every node.
+        del self.nodes[key]
+        for (_other_id, other) in self.nodes.items():
+            mut new_levels: list[list[int]] = []
+            for layer in other.neighbours:
+                mut new_layer: list[int] = []
+                for nid in layer:
+                    if nid != key:
+                        new_layer.append(nid)
+                new_levels.append(new_layer)
+            other.neighbours = new_levels
+        if self.entry_point == key:
+            # Pick the highest-level remaining node as the new entry point.
+            mut new_ep: int = -1
+            mut new_max: int = -1
+            for (rid, rnode) in self.nodes.items():
+                if rnode.level > new_max:
+                    new_max = rnode.level
+                    new_ep = rid
+            self.entry_point = new_ep
+            self.current_max_level = new_max
+        return True
+
+    def _distance_to(self, vector: list[float], other_id: int) -> float:
+        let n_opt: HnswNode? = self.nodes.get(other_id)
+        if n_opt is None:
+            return float("inf")
+        let n: HnswNode = n_opt
+        return score(self.metric, vector, n.vector)
+
+    def _greedy_search_layer(
+        self,
+        query: list[float],
+        entry: int,
+        ef: int,
+        layer: int,
+    ) -> list[Candidate]:
+        # Best-known nearest and dynamic candidate frontier.
+        let start_dist: float = self._distance_to(query, entry)
+        let start: Candidate = Candidate(distance=start_dist, id=entry)
+        mut visited: dict[int, bool] = {entry: True}
+        mut nearest: list[Candidate] = [start]
+        mut frontier: list[Candidate] = [start]
+        while len(frontier) > 0:
+            # Pop nearest from frontier.
+            let cur: Candidate = frontier[0]
+            frontier = frontier[1:]
+            let worst_nearest: Candidate = nearest[len(nearest) - 1]
+            if cur.distance > worst_nearest.distance and len(nearest) >= ef:
+                break
+            let cur_node_opt: HnswNode? = self.nodes.get(cur.id)
+            if cur_node_opt is None:
+                continue
+            let cur_node: HnswNode = cur_node_opt
+            if layer >= len(cur_node.neighbours):
+                continue
+            for nb in cur_node.neighbours[layer]:
+                if nb in visited:
+                    continue
+                visited[nb] = True
+                let d: float = self._distance_to(query, nb)
+                let cand: Candidate = Candidate(distance=d, id=nb)
+                let worst_now: Candidate = nearest[len(nearest) - 1]
+                if d < worst_now.distance or len(nearest) < ef:
+                    nearest = _insert_sorted(nearest, cand, ef)
+                    frontier = _insert_sorted(frontier, cand, ef)
+        return nearest
+
+    def _select_neighbours(self, candidates: list[Candidate], m: int) -> list[int]:
+        # Simple "take the m nearest". The original HNSW paper has a
+        # heuristic; this is the simpler variant.
+        mut out: list[int] = []
+        mut i: int = 0
+        while i < len(candidates) and i < m:
+            out.append(candidates[i].id)
+            i = i + 1
+        return out
+
+    def insert(self, vid: VectorId, vector: list[float]) -> None:
+        let key: int = int(vid)
+        if key in self.nodes:
+            # Treat as update: replace vector but keep edges.
+            let existing_opt: HnswNode? = self.nodes.get(key)
+            if existing_opt is not None:
+                let existing: HnswNode = existing_opt
+                existing.vector = vector
+            return
+
+        let lvl: int = _random_level(self.rng, self.params.level_mult, self.params.max_level)
+        mut layers: list[list[int]] = []
+        for _ in range(lvl + 1):
+            layers.append([])
+        let node: HnswNode = HnswNode(
+            id=key, level=lvl, vector=vector, neighbours=layers,
+        )
+        self.nodes[key] = node
+
+        if self.entry_point == -1:
+            self.entry_point = key
+            self.current_max_level = lvl
+            return
+
+        # Descend from current_max_level down to lvl+1 greedily (ef=1).
+        mut ep: int = self.entry_point
+        mut layer_idx: int = self.current_max_level
+        while layer_idx > lvl:
+            let res: list[Candidate] = self._greedy_search_layer(vector, ep, 1, layer_idx)
+            if len(res) > 0:
+                ep = res[0].id
+            layer_idx = layer_idx - 1
+
+        # From lvl down to 0, search with ef_construction, connect.
+        mut layer2: int = lvl if lvl < self.current_max_level else self.current_max_level
+        while layer2 >= 0:
+            let neighbours: list[Candidate] = self._greedy_search_layer(
+                vector, ep, self.params.ef_construction, layer2,
+            )
+            let m_for_layer: int = (
+                self.params.m_max0 if layer2 == 0 else self.params.m
+            )
+            let chosen: list[int] = self._select_neighbours(neighbours, m_for_layer)
+            # Wire bidirectional edges.
+            let node_layers: list[list[int]] = node.neighbours
+            mut new_self_layer: list[int] = list(node_layers[layer2])
+            for cid in chosen:
+                new_self_layer.append(cid)
+            node.neighbours[layer2] = new_self_layer
+            for cid2 in chosen:
+                let other_opt: HnswNode? = self.nodes.get(cid2)
+                if other_opt is None:
+                    continue
+                let other: HnswNode = other_opt
+                if layer2 >= len(other.neighbours):
+                    continue
+                mut other_layer: list[int] = list(other.neighbours[layer2])
+                other_layer.append(key)
+                # Prune if over cap.
+                let cap: int = m_for_layer
+                if len(other_layer) > cap:
+                    other_layer = self._prune_neighbours(other.vector, other_layer, cap)
+                other.neighbours[layer2] = other_layer
+            if len(neighbours) > 0:
+                ep = neighbours[0].id
+            layer2 = layer2 - 1
+
+        if lvl > self.current_max_level:
+            self.entry_point = key
+            self.current_max_level = lvl
+
+    def _prune_neighbours(
+        self, owner_vector: list[float], candidates: list[int], cap: int,
+    ) -> list[int]:
+        mut scored: list[Candidate] = []
+        for cid in candidates:
+            let d: float = self._distance_to(owner_vector, cid)
+            scored = _insert_sorted(scored, Candidate(distance=d, id=cid), cap)
+        mut out: list[int] = []
+        for c in scored:
+            out.append(c.id)
+        return out
+
+    def search(self, query: list[float], k: int, ef_search: int) -> list[Candidate]:
+        if self.entry_point == -1:
+            return []
+        mut ep: int = self.entry_point
+        mut layer_idx: int = self.current_max_level
+        while layer_idx > 0:
+            let res: list[Candidate] = self._greedy_search_layer(query, ep, 1, layer_idx)
+            if len(res) > 0:
+                ep = res[0].id
+            layer_idx = layer_idx - 1
+        let ef: int = ef_search if ef_search > k else k
+        let top: list[Candidate] = self._greedy_search_layer(query, ep, ef, 0)
+        if len(top) <= k:
+            return top
+        return top[:k]

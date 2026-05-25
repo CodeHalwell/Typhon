@@ -56,6 +56,107 @@ The canonical per-feature status lives in the [Roadmap](/Typhon/project/roadmap/
 - ✅ CI (`cargo fmt`, `clippy -D warnings`, `cargo test --workspace`, `cargo-deny`).
 - ✅ Generated `typhon_runtime/` ships as local source — no PyPI dependency.
 
+## Landed in v0.7.0 (Round-3 carry-over)
+
+The carry-over minor release that closes the Round-3 apps-feedback
+campaign. A third stress round built five additional production-shaped
+apps on top of the original ten (real-time game server, static site
+generator, vector DB, API gateway, stream processor — under
+`examples/apps/11-…` through `examples/apps/15-…`). Every remaining
+ergonomics gap from that round is turned into a compiler feature here.
+
+The release is strictly additive on the language surface — every
+previously-accepted program continues to compile to identical Python.
+
+### Added — language & runtime
+
+- ✅ **`pub *` wildcard re-export aggregation in `__init__.ty`,
+  including transitive aggregation through sub-packages.** A single
+  `pub *` at the top of a package's `__init__.ty` re-exports every
+  direct-sibling module's `pub` names. Direct sub-packages contribute
+  their own effective public surface — their `pub` names plus,
+  recursively, whatever their own `pub *` aggregates one level
+  deeper, cycle-safe via a `visited` set. Two new diagnostics:
+  `tyc::pub_name_collision` (sibling-export name clash) and
+  `tyc::pub_star_outside_init` (advice: marker outside `__init__.ty`).
+- ✅ **Declare-only `let NAME: T` with arm-assignment.** The
+  `let loaded: Cfg; match _load(): case Ok(v): loaded = v;
+  case Err(e): return Err(e)` shape no longer fires
+  `tyc::missing_initialiser`. Sibling `match`/`if`/`elif`/`else`
+  arms each count as a separate first-assignment path. Companion
+  `tyc::use_of_uninitialised` definite-assignment analysis covers
+  reads on paths that didn't assign.
+- ✅ **`with cm() as r:` types `r` from `__enter__` / `__aenter__`
+  and from `@contextmanager` / `@asynccontextmanager` factories.**
+  Three lookup paths in priority order: decorator-aware yield-type
+  inference, concrete-class `__enter__` / `__aenter__` returns,
+  fall-through to `Unknown`. The canonical
+  `@asynccontextmanager async def session() -> AsyncIterator[Session]:
+  yield Session(...)` factory shape now types as-targets correctly.
+- ✅ **`await` on a `Callable[..., Awaitable[T]]` /
+  `Coroutine[Y, S, T]` unwraps to `T`.** The canonical async-middleware
+  shape `next: Callable[[Req], Awaitable[Resp]]` followed by
+  `let r: Resp = await next(req)` now type-checks without a spurious
+  `tyc::type_mismatch`. The biggest single Round-3 finding.
+- ✅ **Same-newtype arithmetic preserves the newtype.**
+  `newtype LogIndex = int` followed by `last_idx + 1` or
+  `LogIndex + LogIndex` no longer widens to `Unknown` across
+  `+ - * // % **`. Two distinct newtypes with the same base
+  (`LogIndex + Term`) still fire `tyc::operator_type_mismatch`.
+- ✅ **Cross-module generic method dispatch propagates class
+  TypeVars.** `s: Stream[int].map(f)` records
+  `Callable[[int], U]` as the expected parameter and returns
+  `Stream[U]` bound at the call site. Same fix benefits field access.
+
+### Fixed — resolver, syntax, and checker
+
+- ✅ **Nested `from X import Y` in `if`/`for`/`while`/`with`/`try`/
+  `match` arms now binds** (parser already accepted; resolver
+  silently skipped).
+- ✅ **Sibling `if`/`elif` branches no longer trip
+  `no_block_shadow` for same-named `let` bindings.**
+- ✅ **Multi-line `go expr(...)` calls parse.** Implicit line
+  continuation inside parens now works for `go` everywhere.
+- ✅ **Ternary `body if test else orelse` narrows.**
+  `isinstance(x, T)` and `x is not None` refine `x` on the truthy
+  side (and the negated form on the falsy side) inside the
+  expression form, matching the statement-level behaviour.
+- ✅ **`tyc::field_default_ordering` catches non-default-after-default
+  class fields at check time** — Python would otherwise reject the
+  synthesised `__init__` at import time with a misleading
+  `TypeError`.
+
+### Added — examples & tooling
+
+- ✅ **Five new reference apps (11–15).** Real-time game server,
+  static site generator, vector DB, API gateway, stream processor.
+  Each `tyc check`s clean, `tyc build`s, runs through CPython, and
+  carries a README of the friction surfaced during the build.
+- ✅ **All fifteen apps re-organised into grouped subdirectories.**
+  No more flat `src/` — every app now has 2-5 grouped subdirectories
+  (`domain/`, `storage/`, `runtime/`, `transport/`, …) with `pub *`
+  `__init__.ty` facades so import paths stay short.
+- ✅ **VS Code extension `0.1.9 → 0.2.0`.** Grammar updates: `pub def`
+  / `pub async def` highlight `pub` as a storage modifier;
+  `pub *` re-export in `__init__.ty` highlights as a single
+  construct; the modifier slot accepts every combination of `pub` /
+  `freeze` / `comptime` / `lazy` in front of bindings.
+
+## Landed in v0.6.1 (polish)
+
+A polish release on top of v0.6.0. No previously-accepted program
+changes behaviour.
+
+- ✅ **`let name: lowercase_type = …` highlights as a type annotation.**
+  The standalone `binding-declaration` rule was a one-shot `match`
+  that stopped at the binding name; it now owns the `: Type` slot.
+- ✅ **`.py.map` sidecars now live under `<out>/.sourcemaps/`.**
+  Mirrors the emitted Python tree
+  (`build/foo.py` → `build/.sourcemaps/foo.py.map`,
+  `build/pkg/bar.py` → `build/.sourcemaps/pkg/bar.py.map`). Map
+  resolvers fall back to the legacy adjacent layout for existing
+  build directories.
+
 ## Landed in v0.6.0 (apps-feedback minor release)
 
 An apps-feedback minor release on top of v0.5.2. A two-round stress

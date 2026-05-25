@@ -1,0 +1,74 @@
+import os
+
+from domain import StreamError, ConfigError
+
+
+comptime let BUILD_TAG: str = env("BUILD_TAG", "dev")
+comptime let DEFAULT_QUEUE_CAPACITY: int = 256
+comptime let DEFAULT_DEMO_TICKS: int = 200
+
+
+# Inter-operator queue capacity. Read by the runner.
+pub freeze let QUEUE_CAPACITY: int = DEFAULT_QUEUE_CAPACITY
+
+
+# Default tumbling window size (milliseconds of event time).
+pub freeze let DEFAULT_WINDOW_MS: int = 1000
+
+
+# Default slide for sliding windows.
+pub freeze let DEFAULT_SLIDE_MS: int = 250
+
+
+# Maximum out-of-orderness the watermark generator will tolerate.
+pub freeze let DEFAULT_LATENESS_MS: int = 500
+
+
+# Hard cap on the demo job's runtime (in event-time ms).
+pub freeze let DEMO_HORIZON_MS: int = 60000
+
+
+pub class JobConfig frozen:
+    queue_capacity: int
+    window_ms: int
+    slide_ms: int
+    lateness_ms: int
+    print_events: bool
+
+
+pub def default_config() -> JobConfig:
+    let print_raw: str = os.environ.get("STREAM_PRINT", "0")
+    return JobConfig(
+        queue_capacity=QUEUE_CAPACITY,
+        window_ms=DEFAULT_WINDOW_MS,
+        slide_ms=DEFAULT_SLIDE_MS,
+        lateness_ms=DEFAULT_LATENESS_MS,
+        print_events=print_raw == "1",
+    )
+
+
+pub def build_tag() -> str:
+    return BUILD_TAG
+
+
+# Validate a JobConfig — returns a Result so callers can short-circuit with `?`.
+pub def validate_config(cfg: JobConfig) -> Result[JobConfig, StreamError]:
+    if cfg.queue_capacity <= 0:
+        return Err(ConfigError("queue_capacity", "must be positive"))
+    if cfg.window_ms <= 0:
+        return Err(ConfigError("window_ms", "must be positive"))
+    if cfg.slide_ms <= 0:
+        return Err(ConfigError("slide_ms", "must be positive"))
+    if cfg.slide_ms > cfg.window_ms:
+        return Err(ConfigError("slide_ms", "must be <= window_ms"))
+    if cfg.lateness_ms < 0:
+        return Err(ConfigError("lateness_ms", "must be non-negative"))
+    return Ok(cfg)
+
+
+# Build a validated config (loads defaults then validates). Returns Result so
+# callers exercise `?` propagation.
+pub def loaded_config() -> Result[JobConfig, StreamError]:
+    let cfg: JobConfig = default_config()
+    let validated: JobConfig = validate_config(cfg)?
+    return Ok(validated)

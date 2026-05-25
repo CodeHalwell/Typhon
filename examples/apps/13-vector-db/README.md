@@ -17,17 +17,17 @@ A production-shaped in-memory vector database with:
 
 | File | Responsibility |
 |---|---|
-| `src/ids.ty` | `newtype` wrappers (`VectorId`, `CollectionId`, `Dim`, `SnapshotSeq`) |
-| `src/dbmodels.ty` | HTTP `model` types + internal `class` types + sealed `Metric` union |
-| `src/config.ty` | `freeze let` HNSW defaults + `comptime let` build constants |
-| `src/vector_ops.ty` | Pure list-of-float vector operations (cosine, l2, dot, norm) |
-| `src/metric.ty` | Metric dispatch (`score(metric, a, b)`) over the sealed union |
-| `src/hnsw.ty` | Layered HNSW graph: insert + search |
-| `src/filter_ast.ty` | Sealed `FilterExpr` AST + factories + evaluator |
-| `src/filter_parse.ty` | Tokenizer + parser for the filter mini-language |
-| `src/collection.ty` | Generic `Collection[D]` — insert/upsert/delete/get/search |
-| `src/snapshot.ty` | Write / load snapshot (binary vectors + JSON metadata) |
-| `src/api.ty` | FastAPI control plane |
+| `src/domain/ids.ty` | `newtype` wrappers (`VectorId`, `CollectionId`, `Dim`, `SnapshotSeq`) |
+| `src/domain/dbmodels.ty` | HTTP `model` types + internal `class` types + sealed `Metric` union |
+| `src/runtime/config.ty` | `freeze let` HNSW defaults + `comptime let` build constants |
+| `src/vector/vector_ops.ty` | Pure list-of-float vector operations (cosine, l2, dot, norm) |
+| `src/vector/metric.ty` | Metric dispatch (`score(metric, a, b)`) over the sealed union |
+| `src/indexes/hnsw.ty` | Layered HNSW graph: insert + search |
+| `src/filters/filter_ast.ty` | Sealed `FilterExpr` AST + factories + evaluator |
+| `src/filters/filter_parse.ty` | Tokenizer + parser for the filter mini-language |
+| `src/indexes/collection.ty` | Generic `Collection[D]` — insert/upsert/delete/get/search |
+| `src/indexes/snapshot.ty` | Write / load snapshot (binary vectors + JSON metadata) |
+| `src/transport/api.ty` | FastAPI control plane |
 | `src/main.ty` | Wires everything together |
 
 ## Features exercised

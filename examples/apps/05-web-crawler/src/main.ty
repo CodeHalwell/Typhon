@@ -2,10 +2,10 @@ import argparse
 import asyncio
 import sys
 
-from config import CrawlConfig, default_config
-from crawler import run_crawl
-from ids import Url
-from report import CrawlReport
+from runtime import CrawlConfig, default_config
+from crawl import run_crawl
+from domain import Url
+from content import CrawlReport
 
 
 def parse_args(argv: list[str]) -> tuple[list[Url], CrawlConfig]:

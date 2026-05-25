@@ -158,11 +158,16 @@ declaration is treated as the canonical definition.
 
 - `pub *` is honoured **only** in `__init__.ty`. The marker is
   parsed and stripped in every `.ty` file, but outside `__init__.ty`
-  it has no effect and the build pipeline emits a warning that points
-  at the wrong-place use.
-- Aggregation is **direct siblings only** — sub-packages contribute
-  through their own `__init__.ty` if they opt in there too, so the
-  cascade is intentional rather than transitive.
+  it has no effect and the build pipeline emits
+  `tyc::pub_star_outside_init` pointing at the wrong-place use.
+- Aggregation is **transitive across sub-packages**. Direct-sibling
+  `.ty` modules contribute their top-level `pub` names. A direct
+  sub-directory with its own `__init__.ty` contributes its effective
+  public surface — its own `pub` names plus, recursively, whatever
+  its own `pub *` aggregates one level deeper. The recursion is
+  cycle-safe via a `visited` set keyed on each package directory, so
+  pathological repository layouts (a sub-package whose `__init__.ty`
+  somehow re-enters the parent) cannot loop.
 - The marker is **opt-in**. Packages without `pub *` keep the
   previous (explicit) behaviour: `__init__.ty` is emitted unchanged
   and only re-exports what the author wrote.

@@ -16,7 +16,17 @@ against **tyc 0.6.1** to push areas the first two rounds didn't
 exercise — async middleware, multi-stage heterogeneous-error pipelines,
 generic stream operators, an HNSW vector index, and an async
 multiplayer game server. The consolidated findings live in
-[`TYPHON_FEEDBACK.md`](TYPHON_FEEDBACK.md).
+[`TYPHON_FEEDBACK.md`](TYPHON_FEEDBACK.md); every gap that round
+surfaced is closed in tyc 0.7.0.
+
+Every app's `src/` is grouped into subdirectories along domain lines
+(`domain/`, `runtime/`, `storage/`, `transport/`, …) with each
+package opting into `pub *` re-export aggregation in its
+`__init__.ty`. The package facades keep import sites short (`from
+domain import EntityId` instead of `from domain.ids import EntityId`)
+while letting each package's internals stay intra-package relative
+(`from .ids import EntityId`). Run `ls examples/apps/07-game-ecs/src/`
+for the smallest worked example.
 
 | # | Project | What it is | Key features exercised |
 |---|---|---|---|

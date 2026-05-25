@@ -1,0 +1,43 @@
+from domain import WatermarkTs
+
+
+# Bounded-out-of-orderness watermark generator. Tracks the max event-time seen
+# and emits `max_seen - lateness_ms` as the watermark.
+pub class WatermarkGenerator:
+    lateness_ms: int
+    max_seen_ms: int
+    has_seen: bool
+
+
+impl WatermarkGenerator:
+    def observe(self, event_ts_ms: int) -> None:
+        if not self.has_seen or event_ts_ms > self.max_seen_ms:
+            self.max_seen_ms = event_ts_ms
+            self.has_seen = True
+
+    def current(self) -> WatermarkTs:
+        if not self.has_seen:
+            return WatermarkTs(0)
+        let raw: int = self.max_seen_ms - self.lateness_ms
+        if raw < 0:
+            return WatermarkTs(0)
+        return WatermarkTs(raw)
+
+    # Check whether the given event-time has been passed by the watermark — i.e.
+    # whether windows ending at `boundary_ms` should now fire.
+    def passes(self, boundary_ms: int) -> bool:
+        return int(self.current()) >= boundary_ms
+
+
+pub def new_watermark_generator(lateness_ms: int) -> WatermarkGenerator:
+    return WatermarkGenerator(
+        lateness_ms=lateness_ms,
+        max_seen_ms=0,
+        has_seen=False,
+    )
+
+
+# Is `event_ts_ms` late relative to `watermark`? Late events are routed to a
+# side-output sink rather than to the windowing operator.
+pub def is_late(event_ts_ms: int, watermark: WatermarkTs) -> bool:
+    return event_ts_ms < int(watermark)

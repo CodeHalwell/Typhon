@@ -330,6 +330,24 @@ Deep immutability for class instances is an emit-time concern: pass `frozen=True
 
 `let (a: int, b: str) = func(x, y)` is sugar for "bind the result of `func(x, y)` to a hidden temp, then introduce `a: int` and `b: str` from the temp's first and second elements." Compound annotations survive the top-level-comma split (`let (xs: list[int], m: dict[str, int]) = …`), and mixed forms emit the un-annotated leg without a type so the checker fills it in (`let (a: int, b) = pair()`). The un-annotated tuple form (`let (a, b) = pair()`) continues to flow through unchanged with no synthetic temp.
 
+### Declare-only `let NAME: T` with arm assignment
+
+A `let NAME: T` declaration without an initialiser is legal when the binding is initialised on every non-diverging branch of a subsequent `if`/`elif`/`else` or `match` block. The first assignment on each path is treated as the initialiser; the resolver tracks each uninitialised `let`-declaration's span and silently accepts the first assignment, while any second assignment (or any read on a path that didn't assign) fires `tyc::immutable_assign` or `tyc::use_of_uninitialised` respectively.
+
+```ty
+let loaded: Cfg
+match _load():
+    case Ok(v):
+        loaded = v
+    case Err(e):
+        return Err(e)
+loaded.use()        # OK — every non-diverging arm assigned `loaded`
+```
+
+`match` over a sealed union or `Result[T, E]` is treated as exhaustive for definite-assignment purposes when every variant is covered by a class pattern; the canonical `case Ok(v): / case Err(e): return Err(e)` shape works without a `case _:` wildcard. `return` / `raise` / `continue` / `break` mark a branch as diverging — the branch is excluded from the intersection of "definitely-assigned" paths. Loop bodies do not propagate assignments out (the body may execute zero times).
+
+`mut NAME: T` without an initialiser is also accepted and follows the usual `mut` semantics — any number of subsequent assignments are legal.
+
 ## Lazy loading
 
 - `lazy import np = numpy` → defers module loading until first attribute access via a generated `__TyphonLazy_<alias>_` proxy class (thread-safe, double-checked locking).

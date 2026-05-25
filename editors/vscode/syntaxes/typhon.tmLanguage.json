@@ -11,6 +11,7 @@
   "repository": {
     "statement": {
       "patterns": [
+        { "include": "#pub-star-reexport" },
         { "include": "#import" },
         { "include": "#class-declaration" },
         { "include": "#newtype-declaration" },
@@ -23,6 +24,15 @@
         { "include": "#field-declaration" },
         { "include": "#expression" }
       ]
+    },
+
+    "pub-star-reexport": {
+      "comment": "`pub *` wildcard re-export marker. Only meaningful at module level inside an `__init__.ty`; the build orchestrator aggregates every direct-sibling module's `pub` names at this marker. Outside `__init__.ty` the marker is a no-op and `tyc::pub_star_outside_init` fires. Recognised at the start of a logical line (after any indent) followed by end-of-line or comment.",
+      "match": "^[ \\t]*(pub)[ \\t]+(\\*)(?=[ \\t]*(?:#.*)?$)",
+      "captures": {
+        "1": { "name": "storage.modifier.pub.typhon" },
+        "2": { "name": "keyword.operator.wildcard.typhon" }
+      }
     },
     "expression": {
       "comment": "Top-level expression context. Tries type-annotation first so `:` after a word is treated as `name: Type` before `expression-inner` falls back to a plain colon. Inside subscripts (`xs[1:4]`), dict literals (`{k: v}`), and lambda bodies (`lambda x: x+1`) we deliberately switch to `expression-inner`, which omits type-annotation so the colon keeps its real meaning.",
@@ -321,11 +331,13 @@
     },
 
     "function-declaration": {
-      "begin": "\\b(?:(async)\\s+)?(def)\\s+([\\p{L}_][\\p{L}\\p{N}_]*)",
+      "comment": "Matches every supported function-definition head: bare `def f`, `async def f`, `pub def f`, `pub async def f`. Capture group 1 is the optional `pub` visibility modifier; group 2 is the optional `async` marker; group 3 is `def`; group 4 is the function name. The `pub` slot does not nest with other modifiers — `def`, unlike `let`, only takes a `pub` prefix today.",
+      "begin": "\\b(?:(pub)\\s+)?(?:(async)\\s+)?(def)\\s+([\\p{L}_][\\p{L}\\p{N}_]*)",
       "beginCaptures": {
-        "1": { "name": "storage.type.function.async.typhon" },
-        "2": { "name": "storage.type.function.typhon" },
-        "3": { "name": "entity.name.function.typhon" }
+        "1": { "name": "storage.modifier.pub.typhon" },
+        "2": { "name": "storage.type.function.async.typhon" },
+        "3": { "name": "storage.type.function.typhon" },
+        "4": { "name": "entity.name.function.typhon" }
       },
       "end": "(:)|$",
       "endCaptures": {

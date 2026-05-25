@@ -1,0 +1,24 @@
+from .log import CmdDelete, CmdNoop, CmdSet, Command
+
+
+pub class KVStore:
+    data: dict[str, str]
+
+
+impl KVStore:
+    def get(self, key: str) -> str?:
+        return self.data.get(key)
+
+    def apply(self, cmd: Command) -> None:
+        match cmd:
+            case CmdSet(k, v):
+                self.data[k] = v
+            case CmdDelete(k):
+                if k in self.data:
+                    del self.data[k]
+            case CmdNoop(_):
+                pass
+
+
+pub def new_store() -> KVStore:
+    return KVStore(data={})

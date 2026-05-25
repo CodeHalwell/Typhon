@@ -1,0 +1,69 @@
+from indexer import Document
+from indexer import normalize, stem, tokenize
+
+
+pub def truncate_around(text: str, center: int, half: int) -> str:
+    let n: int = len(text)
+    let start: int = center - half if center - half > 0 else 0
+    let end: int = center + half if center + half < n else n
+    let prefix: str = "..." if start > 0 else ""
+    let suffix: str = "..." if end < n else ""
+    return f"{prefix}{text[start:end]}{suffix}"
+
+
+def _stemmed_matches(token: str, matched_stems: dict[str, bool]) -> bool:
+    let norm: str = normalize(token)
+    if len(norm) == 0:
+        return False
+    let st: str = stem(norm)
+    return matched_stems.get(st) is True
+
+
+pub def render_snippet(doc: Document, matched_terms: list[str], window: int) -> str:
+    let raw_tokens: list[str] = tokenize(doc.body)
+    let n: int = len(raw_tokens)
+    if n == 0:
+        return ""
+    mut matched_stems: dict[str, bool] = {}
+    for m in matched_terms:
+        matched_stems[m] = True
+    if window <= 0 or window >= n:
+        return _render_marked(raw_tokens, 0, n, matched_stems)
+    # Find best window: max count of tokens whose stem is in matched_stems.
+    mut best_start: int = 0
+    mut best_score: int = -1
+    mut i: int = 0
+    while i + window <= n:
+        mut score: int = 0
+        mut j: int = i
+        while j < i + window:
+            if _stemmed_matches(raw_tokens[j], matched_stems):
+                score = score + 1
+            j = j + 1
+        if score > best_score:
+            best_score = score
+            best_start = i
+        i = i + 1
+    let end_ix: int = best_start + window
+    let snippet: str = _render_marked(raw_tokens, best_start, end_ix, matched_stems)
+    let prefix: str = "..." if best_start > 0 else ""
+    let suffix: str = "..." if end_ix < n else ""
+    return f"{prefix}{snippet}{suffix}"
+
+
+def _render_marked(
+    tokens: list[str],
+    start: int,
+    end: int,
+    matched_stems: dict[str, bool],
+) -> str:
+    mut parts: list[str] = []
+    mut k: int = start
+    while k < end:
+        let tok: str = tokens[k]
+        if _stemmed_matches(tok, matched_stems):
+            parts.append(f"*{tok}*")
+        else:
+            parts.append(tok)
+        k = k + 1
+    return " ".join(parts)

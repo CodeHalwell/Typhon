@@ -25,13 +25,13 @@ the algorithms.
 
 | File | Responsibility |
 |---|---|
-| `src/ids.ty` | `newtype` IDs for datasets, runs, jobs, models |
-| `src/datatypes.ty` | Generic typed samples and batch wrappers |
-| `src/stages.ty` | `interface Stage[I, O]` + several `impl` stages (scale, split, train, evaluate) |
-| `src/pipeline.ty` | `Pipeline[I, O]` composition with `Result`-returning execution |
-| `src/registry.ty` | Dataset + model + run registries |
-| `src/tracker.ty` | JSONL experiment tracker |
-| `src/sweep.ty` | Grid and random sweep runners |
+| `src/domain/ids.ty` | `newtype` IDs for datasets, runs, jobs, models |
+| `src/domain/datatypes.ty` | Generic typed samples and batch wrappers |
+| `src/pipeline/stages.ty` | `interface Stage[I, O]` + several `impl` stages (scale, split, train, evaluate) |
+| `src/pipeline/pipeline.ty` | `Pipeline[I, O]` composition with `Result`-returning execution |
+| `src/registry/registry.ty` | Dataset + model + run registries |
+| `src/registry/tracker.ty` | JSONL experiment tracker |
+| `src/pipeline/sweep.ty` | Grid and random sweep runners |
 | `src/main.ty` | Worked end-to-end example training a tiny linear model |
 
 ## Features exercised

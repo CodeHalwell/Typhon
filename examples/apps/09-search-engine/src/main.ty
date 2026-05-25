@@ -1,9 +1,9 @@
-from highlight import render_snippet
-from ids import DocId
-from index import Document, InvertedIndex, new_document, new_index
-from query import Query, QueryParseError, parse_query
-from scoring import BM25Params, ScoredHit, default_bm25
-from search import search
+from searcher import render_snippet
+from domain import DocId
+from indexer import Document, InvertedIndex, new_document, new_index
+from searcher import Query, QueryParseError, parse_query
+from searcher import BM25Params, ScoredHit, default_bm25
+from searcher import search
 
 
 def seed_corpus(idx: InvertedIndex) -> None:

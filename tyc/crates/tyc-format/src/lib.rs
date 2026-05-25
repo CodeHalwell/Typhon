@@ -503,8 +503,20 @@ fn apply_simple_style_rules(line: &str) -> String {
                 // / number / `)` / `]` AND next is an identifier /
                 // number / `(` / `[`. Otherwise leave alone (unary
                 // `-x`, `[-1]`, `f(-1)` etc.).
+                //
+                // Carve-out: scientific notation. `1e-12` lexes as a
+                // single float literal in Python; the `e`/`E` is the
+                // exponent marker and the trailing `-` is its sign,
+                // not a binary subtraction. `is_binary_operand_lhs`
+                // would otherwise see `e` as alphanumeric and insert
+                // PEP 8 spaces, producing `1e - 12` — a syntax error.
                 let prev = out.chars().last();
                 let next = chars.peek().copied();
+                if is_scientific_exponent_sign(&out, next) {
+                    out.push('-');
+                    just_opened_bracket = false;
+                    continue;
+                }
                 if is_binary_operand_lhs(prev) && is_binary_operand_rhs(next) {
                     if !matches!(prev, Some(' ') | Some('\t')) {
                         out.push(' ');
@@ -524,8 +536,15 @@ fn apply_simple_style_rules(line: &str) -> String {
                 // but legal Python) and `+=` (compound assignment, the
                 // `=` is consumed by its own handler so we never see
                 // both characters together here) leave the `+` tight.
+                // Scientific-notation carve-out: `1e+12` is one float
+                // literal, see the `-` arm above.
                 let prev = out.chars().last();
                 let next = chars.peek().copied();
+                if is_scientific_exponent_sign(&out, next) {
+                    out.push('+');
+                    just_opened_bracket = false;
+                    continue;
+                }
                 if is_binary_operand_lhs(prev) && is_binary_operand_rhs(next) {
                     if !matches!(prev, Some(' ') | Some('\t')) {
                         out.push(' ');
@@ -634,6 +653,58 @@ fn is_binary_operand_rhs(next: Option<char>) -> bool {
         Some(c)
             if c.is_ascii_alphanumeric() || c == '_' || c == '(' || c == '['
     )
+}
+
+/// True when a `+` / `-` at the current cursor is the sign of a
+/// scientific-notation exponent (`1e-12`, `2.5E+7`) rather than a
+/// binary or unary arithmetic operator. The previously-emitted run
+/// must end with `<digit>e` or `<digit>E` and the next character must
+/// be an ASCII digit. We deliberately do NOT count an `e`/`E`
+/// preceded by `.` (`.e-1` is not valid Python) but we DO accept the
+/// `<digit>.<digit>e` and `.<digit>e` forms by looking past a single
+/// `.` when scanning the trailing digit-run.
+fn is_scientific_exponent_sign(out: &str, next: Option<char>) -> bool {
+    let Some(n) = next else {
+        return false;
+    };
+    if !n.is_ascii_digit() {
+        return false;
+    }
+    let bytes = out.as_bytes();
+    let len = bytes.len();
+    if len < 2 {
+        return false;
+    }
+    let last = bytes[len - 1];
+    if last != b'e' && last != b'E' {
+        return false;
+    }
+    // Look back over a run of digits / dots that would form the
+    // mantissa. At least one digit must immediately precede the `e`.
+    let mut i = len - 1;
+    let mut saw_digit = false;
+    let mut saw_dot = false;
+    while i > 0 {
+        i -= 1;
+        let c = bytes[i];
+        if c.is_ascii_digit() {
+            saw_digit = true;
+            continue;
+        }
+        if c == b'.' {
+            if saw_dot {
+                break;
+            }
+            saw_dot = true;
+            continue;
+        }
+        if c == b'_' {
+            // `1_000e-3` — PEP 515 numeric separators.
+            continue;
+        }
+        break;
+    }
+    saw_digit
 }
 
 /// Returns the quote character that opens an *unterminated* triple-quoted
@@ -1403,6 +1474,53 @@ def run() -> Result[int, str]:
             result.output.contains("y = x - 1"),
             "binary minus must gain spaces, got: {:?}",
             result.output
+        );
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("TYC_FMT_DISABLE_RUFF", v),
+                None => std::env::remove_var("TYC_FMT_DISABLE_RUFF"),
+            }
+        }
+    }
+
+    #[test]
+    fn format_keeps_scientific_notation_tight() {
+        // R3 carry-over: `1e-12` / `2.5E+7` / `1.0e-12` must stay as a
+        // single float literal — the in-process formatter previously
+        // saw `e` as alphanumeric and inserted PEP 8 spaces around the
+        // sign, producing `1e - 12` (a syntax error). Same fix covers
+        // `+` exponents.
+        let _guard = lock_env();
+        let prior = std::env::var_os("TYC_FMT_DISABLE_RUFF");
+        unsafe {
+            std::env::set_var("TYC_FMT_DISABLE_RUFF", "1");
+        }
+        let src = "u = 1e-12\nv = 2.5E+7\nw = 1.0e-12\nz = 1_000e-3\n";
+        let result = format_source(src, "<test>").unwrap();
+        for needle in ["1e-12", "2.5E+7", "1.0e-12", "1_000e-3"] {
+            assert!(
+                result.output.contains(needle),
+                "expected scientific literal `{}` to round-trip, got: {:?}",
+                needle,
+                result.output
+            );
+        }
+        for spurious in ["1e -", "1e +", "2.5E +", "1.0e -"] {
+            assert!(
+                !result.output.contains(spurious),
+                "exponent sign must stay tight; saw spurious `{}` in: {:?}",
+                spurious,
+                result.output
+            );
+        }
+        // Sanity: binary minus on a non-scientific identifier still
+        // gains spaces.
+        let src2 = "let x = e-1\n";
+        let r2 = format_source(src2, "<test>").unwrap();
+        assert!(
+            r2.output.contains("e - 1"),
+            "binary minus after a bare identifier must space, got: {:?}",
+            r2.output
         );
         unsafe {
             match prior {

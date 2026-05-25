@@ -1,0 +1,91 @@
+from domain import ClientReqId, LogIndex, Term
+
+
+pub type Command = CmdSet | CmdDelete | CmdNoop
+
+
+pub class CmdSet frozen:
+    key: str
+    value: str
+
+
+pub class CmdDelete frozen:
+    key: str
+
+
+pub class CmdNoop frozen:
+    placeholder: int
+
+
+pub def cmd_label(c: Command) -> str:
+    match c:
+        case CmdSet(k, v):    return f"set {k}={v}"
+        case CmdDelete(k):    return f"del {k}"
+        case CmdNoop(_):      return "noop"
+    raise RuntimeError("unreachable")
+
+
+pub class LogEntry frozen:
+    index: LogIndex
+    term: Term
+    command: Command
+    client_req: ClientReqId
+
+
+pub class ReplicatedLog:
+    entries: list[LogEntry]
+
+
+impl ReplicatedLog:
+    def append(self, entry: LogEntry) -> None:
+        self.entries.append(entry)
+
+    def last_index(self) -> LogIndex:
+        let n: int = len(self.entries)
+        return LogIndex(n - 1)
+
+    def last_term(self) -> Term:
+        let n: int = len(self.entries)
+        if n == 0:
+            return Term(0)
+        let last: LogEntry = self.entries[n - 1]
+        return last.term
+
+    def entry_at(self, idx: LogIndex) -> LogEntry?:
+        let i: int = int(idx)
+        if i < 0 or i >= len(self.entries):
+            return None
+        return self.entries[i]
+
+    def term_at(self, idx: LogIndex) -> Term?:
+        let i: int = int(idx)
+        if i < 0 or i >= len(self.entries):
+            return None
+        let entry: LogEntry = self.entries[i]
+        return entry.term
+
+    def truncate_from(self, idx: LogIndex) -> None:
+        let i: int = int(idx)
+        if i < 0:
+            return
+        if i >= len(self.entries):
+            return
+        self.entries = self.entries[:i]
+
+    def entries_from(self, idx: LogIndex) -> list[LogEntry]:
+        let i: int = int(idx)
+        if i < 0:
+            return list(self.entries)
+        if i >= len(self.entries):
+            return []
+        return self.entries[i:]
+
+
+pub def new_log() -> ReplicatedLog:
+    let dummy: LogEntry = LogEntry(
+        index=LogIndex(0),
+        term=Term(0),
+        command=CmdNoop(placeholder=0),
+        client_req=ClientReqId(0),
+    )
+    return ReplicatedLog(entries=[dummy])

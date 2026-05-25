@@ -1,0 +1,68 @@
+from boot import ELO_K_FACTOR, RATING_CEILING, RATING_FLOOR
+from .ids import PlayerId, Rating
+
+
+pub class RatingChange frozen:
+    player: PlayerId
+    before: Rating
+    after: Rating
+    delta: int
+
+
+def _expected(a: int, b: int) -> float:
+    let diff: float = float(b - a) / 400.0
+    return 1.0 / (1.0 + (10.0 ** diff))
+
+
+pub def expected_score(a: Rating, b: Rating) -> float:
+    return _expected(int(a), int(b))
+
+
+def _clamp(v: int) -> int:
+    if v < RATING_FLOOR:
+        return RATING_FLOOR
+    if v > RATING_CEILING:
+        return RATING_CEILING
+    return v
+
+
+# `score` is in [0.0, 1.0]; 1.0 = winner, 0.0 = loser, 0.5 = draw.
+pub def update_rating(current: Rating, opponent: Rating, score: float) -> Rating:
+    let exp: float = _expected(int(current), int(opponent))
+    let delta_f: float = ELO_K_FACTOR * (score - exp)
+    let new_raw: int = int(current) + int(round(delta_f))
+    return Rating(_clamp(new_raw))
+
+
+pub def rating_change(player: PlayerId, before: Rating, after: Rating) -> RatingChange:
+    let delta: int = int(after) - int(before)
+    return RatingChange(player=player, before=before, after=after, delta=delta)
+
+
+# Distribute placement deltas for an N-player free-for-all. `placements`
+# is a list[(PlayerId, Rating, rank)] where rank=1 is best.
+pub def update_free_for_all(
+    placements: list[tuple[PlayerId, Rating, int]],
+) -> list[RatingChange]:
+    mut out: list[RatingChange] = []
+    let n: int = len(placements)
+    if n < 2:
+        return out
+    let mean_other: float = _mean_others(placements)
+    for entry in placements:
+        let pid: PlayerId = entry[0]
+        let cur: Rating = entry[1]
+        let rank: int = entry[2]
+        # Normalised score in [0, 1]: best=1.0, worst=0.0.
+        let score: float = float(n - rank) / float(n - 1) if n > 1 else 0.5
+        let opp: Rating = Rating(int(round(mean_other)))
+        let nxt: Rating = update_rating(cur, opp, score)
+        out.append(rating_change(pid, cur, nxt))
+    return out
+
+
+def _mean_others(placements: list[tuple[PlayerId, Rating, int]]) -> float:
+    mut total: int = 0
+    for p in placements:
+        total = total + int(p[1])
+    return float(total) / float(len(placements))

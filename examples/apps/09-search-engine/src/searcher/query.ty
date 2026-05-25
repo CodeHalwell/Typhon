@@ -1,0 +1,231 @@
+from indexer import stem, normalize, is_stopword, tokenize
+
+
+pub type Query = QTerm | QPhrase | QAnd | QOr | QNot
+
+
+pub class QTerm:
+    term: str
+
+
+pub class QPhrase:
+    terms: list[str]
+
+
+pub class QAnd:
+    parts: list[Query]
+
+
+pub class QOr:
+    parts: list[Query]
+
+
+pub class QNot:
+    inner: Query
+
+pub class QueryParseError:
+    message: str
+    pos: int
+
+
+# --- Lexer ---------------------------------------------------------------
+
+
+pub class QToken:
+    kind: str  # "word" | "phrase" | "and" | "or" | "not" | "lparen" | "rparen"
+    value: str
+    pos: int
+
+
+def _is_space(ch: str) -> bool:
+    return ch == " " or ch == "\t" or ch == "\n" or ch == "\r"
+
+
+def _lex(raw: str) -> Result[list[QToken], QueryParseError]:
+    mut out: list[QToken] = []
+    let n: int = len(raw)
+    mut i: int = 0
+    while i < n:
+        let ch: str = raw[i]
+        if _is_space(ch):
+            i = i + 1
+            continue
+        if ch == "(":
+            out.append(QToken(kind="lparen", value="(", pos=i))
+            i = i + 1
+            continue
+        if ch == ")":
+            out.append(QToken(kind="rparen", value=")", pos=i))
+            i = i + 1
+            continue
+        if ch == "\"":
+            let start_pos: int = i
+            i = i + 1
+            mut j: int = i
+            while j < n and raw[j] != "\"":
+                j = j + 1
+            if j >= n:
+                return Err(QueryParseError(
+                    message="unterminated quoted phrase",
+                    pos=start_pos,
+                ))
+            let phrase: str = raw[i:j]
+            out.append(QToken(kind="phrase", value=phrase, pos=start_pos))
+            i = j + 1
+            continue
+        # Word run
+        let word_start: int = i
+        mut k: int = i
+        while k < n and not _is_space(raw[k]) and raw[k] != "(" and raw[k] != ")" and raw[k] != "\"":
+            k = k + 1
+        let word: str = raw[word_start:k]
+        if word == "AND":
+            out.append(QToken(kind="and", value=word, pos=word_start))
+        elif word == "OR":
+            out.append(QToken(kind="or", value=word, pos=word_start))
+        elif word == "NOT":
+            out.append(QToken(kind="not", value=word, pos=word_start))
+        else:
+            out.append(QToken(kind="word", value=word, pos=word_start))
+        i = k
+    return Ok(out)
+
+
+# --- Parser --------------------------------------------------------------
+
+
+pub class QParser:
+    tokens: list[QToken]
+    pos: int
+
+
+impl QParser:
+    def peek(self) -> QToken?:
+        if self.pos < len(self.tokens):
+            return self.tokens[self.pos]
+        return None
+
+    def advance(self) -> QToken?:
+        let t: QToken? = self.peek()
+        if t is not None:
+            self.pos = self.pos + 1
+        return t
+
+    def parse_or(self) -> Result[Query, QueryParseError]:
+        let first: Query = self.parse_and()?
+        mut parts: list[Query] = [first]
+        while True:
+            let nxt: QToken? = self.peek()
+            if nxt is None:
+                break
+            let nx: QToken = nxt
+            if nx.kind != "or":
+                break
+            self.pos = self.pos + 1
+            let part: Query = self.parse_and()?
+            parts.append(part)
+        if len(parts) == 1:
+            return Ok(parts[0])
+        return Ok(QOr(parts))
+
+    def parse_and(self) -> Result[Query, QueryParseError]:
+        let first: Query = self.parse_not()?
+        mut parts: list[Query] = [first]
+        while True:
+            let nxt: QToken? = self.peek()
+            if nxt is None:
+                break
+            let nx: QToken = nxt
+            if nx.kind == "or" or nx.kind == "rparen":
+                break
+            if nx.kind == "and":
+                self.pos = self.pos + 1
+                let after: QToken? = self.peek()
+                if after is None:
+                    return Err(QueryParseError(
+                        message="expected term after AND",
+                        pos=nx.pos,
+                    ))
+            let part: Query = self.parse_not()?
+            parts.append(part)
+        if len(parts) == 1:
+            return Ok(parts[0])
+        return Ok(QAnd(parts))
+
+    def parse_not(self) -> Result[Query, QueryParseError]:
+        let nxt: QToken? = self.peek()
+        if nxt is None:
+            return Err(QueryParseError(message="unexpected end of query", pos=0))
+        let nx: QToken = nxt
+        if nx.kind == "not":
+            self.pos = self.pos + 1
+            let inner: Query = self.parse_atom()?
+            return Ok(QNot(inner))
+        return self.parse_atom()
+
+    def parse_atom(self) -> Result[Query, QueryParseError]:
+        let nxt: QToken? = self.advance()
+        if nxt is None:
+            return Err(QueryParseError(message="unexpected end of query", pos=0))
+        let nx: QToken = nxt
+        if nx.kind == "lparen":
+            let inner: Query = self.parse_or()?
+            let close_opt: QToken? = self.advance()
+            if close_opt is None:
+                return Err(QueryParseError(
+                    message="expected ')'",
+                    pos=nx.pos,
+                ))
+            let close: QToken = close_opt
+            if close.kind != "rparen":
+                return Err(QueryParseError(
+                    message=f"expected ')', got {close.kind} '{close.value}'",
+                    pos=close.pos,
+                ))
+            return Ok(inner)
+        if nx.kind == "phrase":
+            let phrase_toks: list[str] = _phrase_terms(nx.value)
+            return Ok(QPhrase(phrase_toks))
+        if nx.kind == "word":
+            let normed: str = normalize(nx.value)
+            if len(normed) == 0:
+                return Err(QueryParseError(
+                    message=f"empty term at position {nx.pos}",
+                    pos=nx.pos,
+                ))
+            let stemmed: str = stem(normed)
+            return Ok(QTerm(stemmed))
+        return Err(QueryParseError(
+            message=f"unexpected token: {nx.kind} '{nx.value}'",
+            pos=nx.pos,
+        ))
+
+
+def _phrase_terms(raw: str) -> list[str]:
+    let raw_tokens: list[str] = tokenize(raw)
+    mut out: list[str] = []
+    for tok in raw_tokens:
+        if is_stopword(tok):
+            # Keep stopwords inside phrases? Drop them — index drops them too.
+            continue
+        let st: str = stem(tok)
+        if len(st) > 0:
+            out.append(st)
+    return out
+
+
+pub def parse_query(raw: str) -> Result[Query, QueryParseError]:
+    let tokens_result: Result[list[QToken], QueryParseError] = _lex(raw)
+    let tokens: list[QToken] = tokens_result?
+    if len(tokens) == 0:
+        return Err(QueryParseError(message="empty query", pos=0))
+    let parser: QParser = QParser(tokens=tokens, pos=0)
+    let root: Query = parser.parse_or()?
+    let trailing: QToken? = parser.peek()
+    if trailing is not None:
+        let t: QToken = trailing
+        return Err(QueryParseError(
+            message=f"unexpected trailing token: {t.kind} '{t.value}'",
+            pos=t.pos,
+        ))
+    return Ok(root)
