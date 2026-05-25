@@ -98,6 +98,7 @@ fn catalog_codes() -> &'static [&'static str] {
         "resource_not_managed",
         "result_error_mismatch",
         "self_outside_impl",
+        "stdlib_module_shadow",
         "stub_mismatch",
         "tuple_index_out_of_range",
         "type_mismatch",
@@ -216,6 +217,9 @@ fn catalog_entry(short_code: &str) -> Option<&'static str> {
             include_str!("../../../../../docs/diagnostics/result_error_mismatch.md")
         }
         "self_outside_impl" => include_str!("../../../../../docs/diagnostics/self_outside_impl.md"),
+        "stdlib_module_shadow" => {
+            include_str!("../../../../../docs/diagnostics/stdlib_module_shadow.md")
+        }
         "stub_mismatch" => include_str!("../../../../../docs/diagnostics/stub_mismatch.md"),
         "tuple_index_out_of_range" => {
             include_str!("../../../../../docs/diagnostics/tuple_index_out_of_range.md")
