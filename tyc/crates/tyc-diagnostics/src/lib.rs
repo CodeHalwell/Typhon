@@ -1119,6 +1119,55 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// Two sibling modules aggregated by a `pub *` re-export in
+    /// `__init__.ty` both expose the same name. The synthesised
+    /// `from .a import X` + `from .b import X` would silently shadow
+    /// one with the other depending on import order — almost certainly
+    /// a refactoring slip, not the intended behaviour. The diagnostic
+    /// names both sibling files so the user can decide which one to
+    /// rename (or drop from the re-export).
+    #[error("`pub *` collision: `{name}` is exported by both `{first}` and `{second}`")]
+    #[diagnostic(
+        code(tyc::pub_name_collision),
+        url("https://typhon.dev/lang/diagnostics/pub_name_collision"),
+        help(
+            "rename one of the conflicting `pub` declarations, or replace `pub *` \
+             with an explicit `from .module import name` list that resolves the \
+             ambiguity"
+        )
+    )]
+    PubNameCollision {
+        name: String,
+        first: String,
+        second: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("`pub *` re-export here")]
+        span: SourceSpan,
+    },
+
+    /// A `pub *` statement appears in a regular `.ty` module rather
+    /// than the package's `__init__.ty`. The wildcard re-export only
+    /// has meaning at a package boundary — anywhere else it's a no-op
+    /// with confusing intent. Surfaced as advice so the user can move
+    /// it (or drop it) without the build failing.
+    #[error("`pub *` is only meaningful inside `__init__.ty`")]
+    #[diagnostic(
+        severity(Advice),
+        code(tyc::pub_star_outside_init),
+        url("https://typhon.dev/lang/diagnostics/pub_star_outside_init"),
+        help(
+            "move the `pub *` statement to the package's `__init__.ty`, or remove \
+             it if the module isn't acting as a package facade"
+        )
+    )]
+    PubStarOutsideInit {
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("`pub *` outside `__init__.ty`")]
+        span: SourceSpan,
+    },
+
     /// An `async def` function body never `await`s. The function still
     /// returns a coroutine, but the `async` keyword is functionally a
     /// no-op — usually a sign of a half-finished refactor or a missing
@@ -2134,6 +2183,41 @@ impl TycError {
     ) -> Self {
         Self::AsyncWithoutAwait {
             name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::PubNameCollision`] diagnostic for a
+    /// name aggregated by `pub *` and exported by two distinct
+    /// sibling modules.
+    pub fn pub_name_collision(
+        name: impl Into<String>,
+        first: impl Into<String>,
+        second: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::PubNameCollision {
+            name: name.into(),
+            first: first.into(),
+            second: second.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::PubStarOutsideInit`] advice for a
+    /// `pub *` line in a non-`__init__.ty` module.
+    pub fn pub_star_outside_init(
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::PubStarOutsideInit {
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

@@ -323,7 +323,147 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 &expand_multiline_guards(&expand_lazy_imports(&expand_typed_let_unpack(source))),
             ))),
         )));
-        let prep = preprocess(&expanded);
+        let mut prep = preprocess(&expanded);
+
+        // `pub *` wildcard re-export aggregation.
+        //
+        // The preprocessor records each `pub *` marker's line index in
+        // `prep.pub_star_lines` and strips the line text. Here we:
+        //   - For `__init__.ty`: aggregate sibling modules' `pub` names,
+        //     detect cross-sibling collisions (advice-level diagnostic
+        //     `tyc::pub_name_collision`), and inject the synthesised
+        //     `from .sibling import name1, name2` block at the marker
+        //     line so the rest of the pipeline emits the imports.
+        //   - For any other file: emit `tyc::pub_star_outside_init`
+        //     advice — the wildcard re-export only has meaning at a
+        //     package boundary.
+        //
+        // Aggregation is direct-siblings only by design; transitive
+        // aggregation through sub-packages is an intentional non-goal
+        // (every `__init__.ty` only re-exports its immediate children).
+        if !prep.pub_star_lines.is_empty() {
+            let is_init = path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .map(|s| s == "__init__.ty")
+                .unwrap_or(false);
+            if !is_init {
+                for &line_idx in &prep.pub_star_lines {
+                    let offset = line_offset(&expanded, line_idx);
+                    let advice = TycError::pub_star_outside_init(
+                        path.display().to_string(),
+                        expanded.clone(),
+                        offset,
+                        5,
+                    );
+                    eprintln!("{:?}", miette::Report::new_boxed(Box::new(advice)));
+                }
+            } else if let Some(parent_dir) = path.parent() {
+                // Walk every loaded source that lives in this package
+                // directory and collect its top-level `pub` names. We
+                // do this with a fast textual scan instead of a full
+                // preprocess so the orchestrator stays a single-pass
+                // loop; the cost is one re-scan per `pub *`-bearing
+                // `__init__.ty`, which is bounded by package size.
+                let mut sibling_pubs: Vec<(String, Vec<String>)> = Vec::new();
+                for (sib_path, sib_source) in &sources {
+                    if sib_path == path {
+                        continue;
+                    }
+                    if sib_path.parent() != Some(parent_dir) {
+                        continue;
+                    }
+                    if sib_path
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .map(|s| s == "__init__.ty")
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    let stem = match sib_path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                    {
+                        Some(s) => s.to_owned(),
+                        None => continue,
+                    };
+                    let names = extract_top_level_pub_names(sib_source);
+                    if !names.is_empty() {
+                        sibling_pubs.push((stem, names));
+                    }
+                }
+                // Detect collisions: any name that appears in two
+                // different siblings fires `tyc::pub_name_collision`.
+                let mut name_origin: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
+                let mut collision_lines: Vec<usize> = Vec::new();
+                for (sibling, names) in &sibling_pubs {
+                    for name in names {
+                        if let Some(prev) = name_origin.get(name) {
+                            // Use the FIRST marker line as the span
+                            // anchor; in practice `__init__.ty` will
+                            // have a single `pub *` and the span is
+                            // unambiguous.
+                            collision_lines.push(0);
+                            let marker_line = *prep
+                                .pub_star_lines
+                                .first()
+                                .unwrap_or(&0);
+                            let offset = line_offset(&expanded, marker_line);
+                            let err = TycError::pub_name_collision(
+                                name.clone(),
+                                prev.clone(),
+                                sibling.clone(),
+                                path.display().to_string(),
+                                expanded.clone(),
+                                offset,
+                                5,
+                            );
+                            eprintln!(
+                                "{:?}",
+                                miette::Report::new_boxed(Box::new(err))
+                            );
+                        } else {
+                            name_origin.insert(name.clone(), sibling.clone());
+                        }
+                    }
+                }
+                // Build the import block. We emit one `from .sibling
+                // import name1, name2` per sibling that contributed
+                // names, joined by `; ` so the whole block stays on a
+                // single line (preserves source-map line alignment with
+                // the original `pub *` marker).
+                let import_pieces: Vec<String> = sibling_pubs
+                    .iter()
+                    .filter(|(_, names)| !names.is_empty())
+                    .map(|(sib, names)| {
+                        format!("from .{} import {}", sib, names.join(", "))
+                    })
+                    .collect();
+                if !import_pieces.is_empty() {
+                    let import_line = import_pieces.join("; ");
+                    // Replace the first marker line with the synthesised
+                    // import block. The preprocess left it as a blank
+                    // line; inject the imports at the same line so
+                    // source-map line numbers stay stable.
+                    let marker_line = *prep.pub_star_lines.first().unwrap_or(&0);
+                    prep.python_source =
+                        replace_line(&prep.python_source, marker_line, &import_line);
+                    // Also re-parse: any aggregated names should land in
+                    // the synthesised `__all__`. Append them to
+                    // `prep.pub_names` so the desugar pass picks them
+                    // up.
+                    for (_, names) in &sibling_pubs {
+                        for name in names {
+                            if !prep.pub_names.contains(name) {
+                                prep.pub_names.push(name.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         let module = tyc_syntax::parse_module(&prep.python_source)
             .map(|p| p.into_syntax())
@@ -930,6 +1070,94 @@ fn find_env_key_for_comptime_binding(source: &str, binding_name: &str) -> Option
         return Some(rest[..end].to_owned());
     }
     None
+}
+
+/// Byte offset of the start of the 0-based `line_idx` line in `source`.
+/// Used by the `pub *` aggregation pass to anchor `tyc::pub_star_*`
+/// diagnostic spans at the original marker line. Returns `source.len()`
+/// when the line index is out of range so the diagnostic still renders.
+fn line_offset(source: &str, line_idx: usize) -> usize {
+    let mut offset = 0usize;
+    let mut current = 0usize;
+    for (i, b) in source.bytes().enumerate() {
+        if current == line_idx {
+            offset = i;
+            break;
+        }
+        if b == b'\n' {
+            current += 1;
+            offset = i + 1;
+        }
+    }
+    if current < line_idx {
+        return source.len();
+    }
+    offset
+}
+
+/// Replace the 0-based `line_idx` line of `source` with `replacement`
+/// (the newline terminator is preserved). Used by the `pub *`
+/// aggregation pass to inject `from .sibling import …` blocks at the
+/// original `pub *` marker so the rest of the pipeline emits the
+/// imports as normal.
+fn replace_line(source: &str, line_idx: usize, replacement: &str) -> String {
+    let mut out = String::with_capacity(source.len() + replacement.len());
+    let mut current = 0usize;
+    for line in source.split_inclusive('\n') {
+        if current == line_idx {
+            out.push_str(replacement);
+            if line.ends_with('\n') {
+                out.push('\n');
+            }
+        } else {
+            out.push_str(line);
+        }
+        current += 1;
+    }
+    out
+}
+
+/// Fast textual extractor for top-level (zero-indent) `pub <kw> NAME`
+/// declarations in a Typhon source file. Used by the `pub *`
+/// aggregation pre-pass so the orchestrator can know each sibling
+/// module's public surface without paying for a full preprocess of
+/// every sibling. Mirrors the logic
+/// [`tyc_syntax::preprocess::pub_decl_name`] applies, but operates
+/// directly on the raw text.
+fn extract_top_level_pub_names(source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_triple_string = false;
+    for line in source.split_inclusive('\n') {
+        // Skip the content of triple-quoted strings (docstrings,
+        // multi-line literals) so a `"""... pub class ... """` block
+        // doesn't masquerade as a real declaration.
+        let triple_count = line.matches("\"\"\"").count() + line.matches("'''").count();
+        if in_triple_string {
+            if triple_count % 2 == 1 {
+                in_triple_string = false;
+            }
+            continue;
+        }
+        if triple_count % 2 == 1 {
+            in_triple_string = true;
+            continue;
+        }
+        // Only zero-indent lines start a top-level declaration.
+        let indent_len = line
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(line.len());
+        if indent_len != 0 {
+            continue;
+        }
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        let Some(after_pub) = trimmed.strip_prefix("pub ") else {
+            continue;
+        };
+        if let Some(name) = tyc_syntax::preprocess::pub_decl_name(after_pub) {
+            out.push(name);
+        }
+    }
+    out
 }
 
 /// Derive the dotted Python module name that the runtime profiler

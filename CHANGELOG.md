@@ -9,6 +9,37 @@ canonical phase-by-phase status lives in `docs/roadmap.md`.
 Carry-over sweep from the Round-3 apps-feedback campaign. Targets the
 remaining ergonomics gaps that survived v0.6.0 / v0.6.1.
 
+### Added — language & runtime
+
+- **`pub *` wildcard re-export aggregation in `__init__.ty`.** A
+  package facade can now write a single `pub *` statement at the top
+  of its `__init__.ty` to re-export every direct-sibling module's
+  `pub`-marked surface. The build orchestrator collects each
+  sibling's top-level `pub` declarations, synthesises a `from
+  .sibling import name1, name2; …` block at the `pub *` marker, and
+  appends every aggregated name to the synthesised `__all__` —
+  matching the surface a hand-written `__init__.ty` would produce
+  without the user having to maintain the re-export list as siblings
+  evolve.
+
+  Aggregation is **direct-siblings only** by design; transitive
+  aggregation through sub-packages is intentionally out of scope (a
+  `pub *` at level N only sees level-N siblings, not level-N+1
+  grandchildren). The marker is preserved on a single line so source
+  maps stay byte-aligned.
+
+  Two diagnostics back the feature:
+
+  - **`tyc::pub_name_collision`.** If two siblings both `pub`-export
+    the same name, the aggregation would silently shadow one with the
+    other in import order. The diagnostic names both sibling modules
+    and the colliding name so the user can rename, drop the `pub`, or
+    replace `pub *` with an explicit `from .module import …` list.
+  - **`tyc::pub_star_outside_init`.** (Advice.) A `pub *` statement
+    in a non-`__init__.ty` module is a no-op with confusing intent;
+    the diagnostic fires from both `tyc check` and `tyc build` so CI
+    surfaces the dead marker.
+
 ### Fixed — compiler
 
 - **`tyc-resolve`: declare-only `let NAME: T` (no initialiser) is now
