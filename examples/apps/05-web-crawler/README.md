@@ -18,16 +18,16 @@ stress async/await, `gather`, and `go` patterns.
 
 | File | Responsibility |
 |---|---|
-| `src/ids.ty` | `newtype` IDs (`Url`, `Host`, `DocumentId`) |
-| `src/config.ty` | `freeze let` crawl config + `comptime let` user-agent |
-| `src/frontier.ty` | Async-safe priority frontier + seen-set |
-| `src/ratelimit.ty` | Token-bucket rate limiter per host |
-| `src/robots.ty` | robots.txt fetcher + matcher with caching |
-| `src/fetcher.ty` | HTTP fetch with retry/backoff |
-| `src/extract.ty` | HTML → title/text/links |
-| `src/dedup.ty` | Content-hash deduplication |
-| `src/crawler.ty` | Worker loop tying it all together |
-| `src/report.ty` | Final stats projection |
+| `src/domain/ids.ty` | `newtype` IDs (`Url`, `Host`, `DocumentId`) |
+| `src/runtime/config.ty` | `freeze let` crawl config + `comptime let` user-agent |
+| `src/crawl/frontier.ty` | Async-safe priority frontier + seen-set |
+| `src/net/ratelimit.ty` | Token-bucket rate limiter per host |
+| `src/net/robots.ty` | robots.txt fetcher + matcher with caching |
+| `src/net/fetcher.ty` | HTTP fetch with retry/backoff |
+| `src/content/extract.ty` | HTML → title/text/links |
+| `src/crawl/dedup.ty` | Content-hash deduplication |
+| `src/crawl/crawler.ty` | Worker loop tying it all together |
+| `src/content/report.ty` | Final stats projection |
 | `src/main.ty` | CLI entry point |
 
 ## Features exercised

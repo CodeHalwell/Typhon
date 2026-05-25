@@ -1,0 +1,67 @@
+from domain import Token, UserId
+from domain import User
+from storage import Store
+
+
+pub type AuthError = TokenInvalid | TokenExpired | InsufficientRole
+
+
+pub class TokenInvalid:
+    reason: str
+
+
+pub class TokenExpired:
+    token: str
+
+
+pub class InsufficientRole:
+    have: str
+    need: str
+
+pub class AuthContext:
+    user_id: UserId
+    role: str
+
+
+pub def validate_token(token: Token, store: Store) -> Result[AuthContext, AuthError]:
+    let raw: str = str(token)
+    if not raw.startswith("tok-"):
+        return Err(TokenInvalid("missing tok- prefix"))
+    let body: str = raw[4:]
+    if body == "expired":
+        return Err(TokenExpired(raw))
+    let parts: list[str] = body.split("-")
+    if len(parts) != 2:
+        return Err(TokenInvalid("malformed token body"))
+    let uid_raw: str = parts[0]
+    let role: str = parts[1]
+    try:
+        let uid_int: int = int(uid_raw)
+        let user: User? = store.find_user(UserId(uid_int))
+        if user is None:
+            return Err(TokenInvalid(f"unknown user id {uid_int}"))
+        let resolved: User = user
+        if resolved.role != role:
+            return Err(TokenInvalid(f"role mismatch for user {uid_int}"))
+        return Ok(AuthContext(user_id=resolved.id, role=resolved.role))
+    except ValueError:
+        return Err(TokenInvalid(f"non-numeric user id {uid_raw}"))
+
+
+pub def require_role(ctx: AuthContext, required: str) -> Result[None, AuthError]:
+    if ctx.role == required:
+        return Ok(None)
+    if ctx.role == "admin":
+        return Ok(None)
+    return Err(InsufficientRole(ctx.role, required))
+
+
+pub def auth_error_msg(e: AuthError) -> str:
+    match e:
+        case TokenInvalid(reason):
+            return f"auth: invalid token ({reason})"
+        case TokenExpired(token):
+            return f"auth: token expired ({token})"
+        case InsufficientRole(have, need):
+            return f"auth: role '{have}' insufficient, need '{need}'"
+    raise RuntimeError("unreachable")

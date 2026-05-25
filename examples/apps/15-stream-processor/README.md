@@ -17,20 +17,20 @@ A production-shaped real-time stream processing engine with:
 
 | File | Responsibility |
 |---|---|
-| `src/ids.ty` | `newtype` wrappers (`OperatorId`, `JobId`, `WatermarkTs`, `Offset`, `WindowId`, `StreamKey`) |
-| `src/models.ty` | Shared classes (`StockTick`, `AggregateRow`, `JoinedRow`) and the `StreamError` sealed union with factory helpers |
-| `src/config.ty` | `freeze let` + `comptime let` constants; `validate_config()` returning `Result[JobConfig, StreamError]` |
-| `src/event.ty` | `Event[T]` generic record + `Envelope` wire frame + `EnvelopeKind` sealed union (Record/Watermark/Barrier/EndOfStream) with factory functions |
-| `src/watermark.ty` | Bounded-out-of-orderness `WatermarkGenerator`; `is_late(...)` predicate |
-| `src/source.ty` | `Source` concrete carrier with `ListSource[T]` and `GeneratorSource[T]` builders |
-| `src/keyed_state.ty` | `KeyedAggState` per-operator dict with snapshot/restore |
-| `src/window.ty` | `WindowKind` sealed union (Tumbling/Sliding/Session), `Pane` + `pane_to_row` |
-| `src/stream_op.ty` | `OperatorKind` sealed union, `Stream[T]`, `Operator[I, O]`, and `make_map_op`/`make_filter_op`/`make_key_by_op`/`make_reduce_op`/`make_join_op` builders |
-| `src/sink.ty` | `Sink` carrier with `PrintSink` / `BufferSink` / `CallbackSink` builders + `LateSideOutput` for late records |
-| `src/topology.ty` | `Topology` DAG (sources/operators/sinks/nodes), with `add_source`, `add_operator`, `add_sink`, `add_join` |
-| `src/runner.ty` | Async job `Runner` — coroutines per operator over `asyncio.Queue`s, watermark-driven window flush, in-memory `Journal` |
-| `src/demo_job.ty` | Builds + runs the stock-price moving-average demo using `gather:` and `go ... -> task` |
-| `src/cli.ty` | Sub-command dispatcher (`demo` / `collect` / `describe` / `help`); exercises `Result`-based config loading with `match` |
+| `src/domain/ids.ty` | `newtype` wrappers (`OperatorId`, `JobId`, `WatermarkTs`, `Offset`, `WindowId`, `StreamKey`) |
+| `src/domain/models.ty` | Shared classes (`StockTick`, `AggregateRow`, `JoinedRow`) and the `StreamError` sealed union with factory helpers |
+| `src/conf/config.ty` | `freeze let` + `comptime let` constants; `validate_config()` returning `Result[JobConfig, StreamError]` |
+| `src/domain/event.ty` | `Event[T]` generic record + `Envelope` wire frame + `EnvelopeKind` sealed union (Record/Watermark/Barrier/EndOfStream) with factory functions |
+| `src/state/watermark.ty` | Bounded-out-of-orderness `WatermarkGenerator`; `is_late(...)` predicate |
+| `src/connectors/source.ty` | `Source` concrete carrier with `ListSource[T]` and `GeneratorSource[T]` builders |
+| `src/state/keyed_state.ty` | `KeyedAggState` per-operator dict with snapshot/restore |
+| `src/state/window.ty` | `WindowKind` sealed union (Tumbling/Sliding/Session), `Pane` + `pane_to_row` |
+| `src/topology/stream_op.ty` | `OperatorKind` sealed union, `Stream[T]`, `Operator[I, O]`, and `make_map_op`/`make_filter_op`/`make_key_by_op`/`make_reduce_op`/`make_join_op` builders |
+| `src/connectors/sink.ty` | `Sink` carrier with `PrintSink` / `BufferSink` / `CallbackSink` builders + `LateSideOutput` for late records |
+| `src/topology/topology.ty` | `Topology` DAG (sources/operators/sinks/nodes), with `add_source`, `add_operator`, `add_sink`, `add_join` |
+| `src/runtime/runner.ty` | Async job `Runner` — coroutines per operator over `asyncio.Queue`s, watermark-driven window flush, in-memory `Journal` |
+| `src/boot/demo_job.ty` | Builds + runs the stock-price moving-average demo using `gather:` and `go ... -> task` |
+| `src/boot/cli.ty` | Sub-command dispatcher (`demo` / `collect` / `describe` / `help`); exercises `Result`-based config loading with `match` |
 | `src/main.ty` | Entry point — calls `dispatch(sys.argv)` |
 
 ## Features exercised

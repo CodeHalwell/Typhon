@@ -1,0 +1,49 @@
+import os
+
+from domain import WorkerId
+
+
+comptime let BUILD_TAG: str = env("BUILD_TAG", "dev")
+comptime let DEFAULT_PORT: int = 8000
+comptime let DEFAULT_DB_PATH: str = "/tmp/typhon-scheduler.db"
+
+
+pub class RetryPolicy frozen:
+    max_attempts: int
+    base_delay_seconds: float
+    max_delay_seconds: float
+    jitter_ratio: float
+
+
+pub class SchedulerConfig frozen:
+    worker_count: int
+    poll_interval_seconds: float
+    shutdown_grace_seconds: float
+    retry: RetryPolicy
+    db_path: str
+    http_port: int
+
+
+freeze let DEFAULT_RETRY: RetryPolicy = RetryPolicy(
+    max_attempts=5,
+    base_delay_seconds=1.0,
+    max_delay_seconds=60.0,
+    jitter_ratio=0.2,
+)
+
+
+pub def load_config() -> SchedulerConfig:
+    let workers_raw: str = os.environ.get("SCHED_WORKERS", "4")
+    let port_raw: str = os.environ.get("SCHED_PORT", str(DEFAULT_PORT))
+    return SchedulerConfig(
+        worker_count=int(workers_raw),
+        poll_interval_seconds=0.25,
+        shutdown_grace_seconds=10.0,
+        retry=DEFAULT_RETRY,
+        db_path=os.environ.get("SCHED_DB", DEFAULT_DB_PATH),
+        http_port=int(port_raw),
+    )
+
+
+pub def worker_id_for(slot: int) -> WorkerId:
+    return WorkerId(f"worker-{BUILD_TAG}-{slot:02d}")

@@ -1,12 +1,12 @@
 import random
 from pathlib import Path
 
-from datatypes import Dataset, Sample
-from ids import DatasetId, DatasetVersion, ModelName
+from domain import Dataset, Sample
+from domain import DatasetId, DatasetVersion, ModelName
 from pipeline import JobFailed, JobPending, JobRunning, JobSucceeded, Orchestrator
 from registry import new_dataset_registry, new_model_registry
-from sweep import SweepGrid, best_by_metric, run_grid_sweep
-from tracker import new_tracker
+from pipeline import SweepGrid, best_by_metric, run_grid_sweep
+from registry import new_tracker
 
 
 def make_synthetic_dataset(n: int, seed: int = 13) -> Dataset[list[float]]:

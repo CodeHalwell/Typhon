@@ -26,23 +26,23 @@ A production-shaped L7 reverse proxy / API gateway with:
 
 | File | Responsibility |
 |---|---|
-| `src/ids.ty` | `newtype` wrappers (`RouteId`, `UpstreamId`, `ClientId`, `RequestId`, `TraceId`) |
-| `src/models.ty` | Internal `HttpRequest` / `HttpResponse`, sealed-union `GwError`, factories |
-| `src/config.ty` | `freeze let` policy constants, `comptime let` build version, `load_config` |
-| `src/upstream.ty` | `Upstream` struct + healthy-pool filter |
-| `src/balancer.ty` | Sealed-union `BalanceStrategy` + concrete `Balancer` (Callable field) |
-| `src/routes.ty` | `Route`, `RouteTable`, sealed-union `MatchResult`, glob match |
-| `src/breaker.ty` | Circuit breaker (sealed-union `BreakerState` + per-upstream state) |
-| `src/limiter.ty` | Token-bucket rate limiter (per route × client) |
-| `src/retry.ty` | Sealed-union `RetryOutcome`, backoff, retryable-error predicates |
-| `src/health.ty` | Periodic async probes via `go` + `gather:` |
-| `src/forward.ty` | Upstream forwarder (httpx) with breaker + retry integration |
-| `src/middleware.ty` | `Middleware` chain (pre/post hooks), unified `handle_request` |
-| `src/metrics.ty` | `MetricsRegistry`, reservoir sampling, Prometheus render |
-| `src/auth.ty` | In-memory token store |
-| `src/wire.ty` | Pydantic `model`s at the FastAPI boundary |
-| `src/loader.ty` | Read + validate `routes.json` → `RouteTable` |
-| `src/server.ty` | FastAPI app, lifecycle, control-plane endpoints |
+| `src/domain/ids.ty` | `newtype` wrappers (`RouteId`, `UpstreamId`, `ClientId`, `RequestId`, `TraceId`) |
+| `src/domain/models.ty` | Internal `HttpRequest` / `HttpResponse`, sealed-union `GwError`, factories |
+| `src/runtime/config.ty` | `freeze let` policy constants, `comptime let` build version, `load_config` |
+| `src/balance/upstream.ty` | `Upstream` struct + healthy-pool filter |
+| `src/balance/balancer.ty` | Sealed-union `BalanceStrategy` + concrete `Balancer` (Callable field) |
+| `src/routing/routes.ty` | `Route`, `RouteTable`, sealed-union `MatchResult`, glob match |
+| `src/policies/breaker.ty` | Circuit breaker (sealed-union `BreakerState` + per-upstream state) |
+| `src/policies/limiter.ty` | Token-bucket rate limiter (per route × client) |
+| `src/policies/retry.ty` | Sealed-union `RetryOutcome`, backoff, retryable-error predicates |
+| `src/balance/health.ty` | Periodic async probes via `go` + `gather:` |
+| `src/gateway/forward.ty` | Upstream forwarder (httpx) with breaker + retry integration |
+| `src/gateway/middleware.ty` | `Middleware` chain (pre/post hooks), unified `handle_request` |
+| `src/runtime/metrics.ty` | `MetricsRegistry`, reservoir sampling, Prometheus render |
+| `src/policies/auth.ty` | In-memory token store |
+| `src/domain/wire.ty` | Pydantic `model`s at the FastAPI boundary |
+| `src/routing/loader.ty` | Read + validate `routes.json` → `RouteTable` |
+| `src/gateway/server.ty` | FastAPI app, lifecycle, control-plane endpoints |
 | `src/main.ty` | Entry point (`asyncio.run`, signal handling, uvicorn) |
 
 ## Features exercised

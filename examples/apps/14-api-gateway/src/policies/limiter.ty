@@ -1,0 +1,72 @@
+import asyncio
+import time
+
+from runtime import RateLimitPolicy
+from domain import ClientId, RouteId
+
+
+# Token bucket keyed by (route, client). Each call to `try_acquire` refills
+# based on monotonic-clock elapsed time then either consumes a token and
+# allows the request, or returns the wait time in ms.
+
+
+pub class Bucket:
+    tokens: float
+    last_refill: float
+
+
+pub class RateLimiter:
+    policy: RateLimitPolicy
+    buckets: dict[str, Bucket]
+    lock: asyncio.Lock
+
+
+pub def new_limiter(policy: RateLimitPolicy) -> RateLimiter:
+    return RateLimiter(policy=policy, buckets={}, lock=asyncio.Lock())
+
+
+def _bucket_key(route: RouteId, client: ClientId) -> str:
+    return f"{str(route)}\x00{str(client)}"
+
+
+def _refill(bucket: Bucket, capacity: int, refill_per_second: float) -> None:
+    let now: float = time.monotonic()
+    let elapsed: float = now - bucket.last_refill
+    if elapsed <= 0.0:
+        return
+    let added: float = elapsed * refill_per_second
+    let cap: float = float(capacity)
+    let fresh: float = bucket.tokens + added
+    bucket.tokens = fresh if fresh < cap else cap
+    bucket.last_refill = now
+
+
+impl RateLimiter:
+    async def try_acquire(self, route: RouteId, client: ClientId) -> int?:
+        let key: str = _bucket_key(route, client)
+        async with self.lock:
+            let existing: Bucket? = self.buckets.get(key)
+            mut bucket: Bucket = (
+                existing
+                if existing is not None
+                else Bucket(
+                    tokens=float(self.policy.capacity),
+                    last_refill=time.monotonic(),
+                )
+            )
+            if existing is None:
+                self.buckets[key] = bucket
+            _refill(bucket, self.policy.capacity, self.policy.refill_per_second)
+            if bucket.tokens >= 1.0:
+                bucket.tokens = bucket.tokens - 1.0
+                return None
+            let deficit: float = 1.0 - bucket.tokens
+            let rate: float = self.policy.refill_per_second if self.policy.refill_per_second > 0.0 else 1.0
+            let wait_seconds: float = deficit / rate
+            return int(wait_seconds * 1000.0) + 1
+
+    def snapshot(self) -> dict[str, float]:
+        mut out: dict[str, float] = {}
+        for (k, b) in self.buckets.items():
+            out[k] = b.tokens
+        return out

@@ -1,6 +1,6 @@
 from aggregate import Account, replay, state_label
-from aml import AmlContext, empty_context, large_amount_rule, sanctions_rule, daily_outflow_rule
-from commands import (
+from aggregate import AmlContext, empty_context, large_amount_rule, sanctions_rule, daily_outflow_rule
+from domain import (
     Command,
     Deposit,
     FreezeAccount,
@@ -10,11 +10,11 @@ from commands import (
     Withdraw,
     rejection_message,
 )
-from events import EventEnvelope, event_kind
-from handlers import Handlers
-from ids import AccountId, CustomerId, Currency, TransactionId
-from money import Money, format_money
-from projections import (
+from domain import EventEnvelope, event_kind
+from application import Handlers
+from domain import AccountId, CustomerId, Currency, TransactionId
+from domain import Money, format_money
+from application import (
     apply_to_audit,
     apply_to_balances,
     apply_to_ledger,
@@ -22,7 +22,7 @@ from projections import (
     new_balances,
     new_ledger,
 )
-from store import EventStore, new_event_store
+from storage import EventStore, new_event_store
 
 
 def _run(handlers: Handlers, cmd: Command, label: str) -> list[EventEnvelope]:

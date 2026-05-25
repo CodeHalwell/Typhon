@@ -1,0 +1,141 @@
+from datetime import datetime
+
+from domain import (
+    AccountClosed,
+    AccountFrozen,
+    AccountOpened,
+    AccountUnfrozen,
+    Event,
+    InterestAccrued,
+    MoneyDeposited,
+    MoneyWithdrawn,
+    TransferRecorded,
+)
+from domain import AccountId, CustomerId, Currency
+from domain import Money, add_money, sub_money
+
+
+pub type AccountState = Open | Frozen | Closed | Uninitialised
+
+
+pub class Open:
+    pass
+
+
+pub class Frozen:
+    reason: str
+
+
+pub class Closed:
+    closed_at: datetime
+
+
+pub class Uninitialised:
+    pass
+
+
+pub class Account:
+    id: AccountId
+    customer_id: CustomerId
+    currency: Currency
+    balance: Money
+    state: AccountState
+    opened_at: datetime?
+    last_event_at: datetime?
+
+
+def _empty(id: AccountId) -> Account:
+    return Account(
+        id=id,
+        customer_id=CustomerId(""),
+        currency=Currency(""),
+        balance=Money(0),
+        state=Uninitialised(),
+        opened_at=None,
+        last_event_at=None,
+    )
+
+
+pub def fold(account: Account, event: Event) -> Account:
+    match event:
+        case AccountOpened(aid, cid, ccy, at):
+            return Account(
+                id=aid,
+                customer_id=cid,
+                currency=ccy,
+                balance=Money(0),
+                state=Open(),
+                opened_at=at,
+                last_event_at=at,
+            )
+        case MoneyDeposited(_, amount, _, _, at):
+            return _with(
+                account,
+                balance=add_money(account.balance, amount),
+                last_event_at=at,
+            )
+        case MoneyWithdrawn(_, amount, _, _, at):
+            return _with(
+                account,
+                balance=sub_money(account.balance, amount),
+                last_event_at=at,
+            )
+        case TransferRecorded(from_acc, to_acc, amount_from, amount_to, _, _, at):
+            if str(from_acc) == str(account.id):
+                return _with(
+                    account,
+                    balance=sub_money(account.balance, amount_from),
+                    last_event_at=at,
+                )
+            if str(to_acc) == str(account.id):
+                return _with(
+                    account,
+                    balance=add_money(account.balance, amount_to),
+                    last_event_at=at,
+                )
+            return account
+        case AccountFrozen(_, reason, at):
+            return _with(account, state=Frozen(reason=reason), last_event_at=at)
+        case AccountUnfrozen(_, at):
+            return _with(account, state=Open(), last_event_at=at)
+        case AccountClosed(_, at):
+            return _with(account, state=Closed(closed_at=at), last_event_at=at)
+        case InterestAccrued(_, amount, _, at):
+            return _with(
+                account,
+                balance=add_money(account.balance, amount),
+                last_event_at=at,
+            )
+    raise RuntimeError("unreachable")
+
+
+def _with(
+    account: Account,
+    balance: Money? = None,
+    state: AccountState? = None,
+    last_event_at: datetime? = None,
+) -> Account:
+    return Account(
+        id=account.id,
+        customer_id=account.customer_id,
+        currency=account.currency,
+        balance=balance if balance is not None else account.balance,
+        state=state if state is not None else account.state,
+        opened_at=account.opened_at,
+        last_event_at=last_event_at if last_event_at is not None else account.last_event_at,
+    )
+
+
+pub def replay(id: AccountId, events: list[Event]) -> Account:
+    mut acc: Account = _empty(id)
+    for e in events:
+        acc = fold(acc, e)
+    return acc
+
+
+pub def state_label(state: AccountState) -> str:
+    match state:
+        case Open():           return "open"
+        case Frozen(reason):   return f"frozen({reason})"
+        case Closed(_):        return "closed"
+        case Uninitialised():  return "uninitialised"

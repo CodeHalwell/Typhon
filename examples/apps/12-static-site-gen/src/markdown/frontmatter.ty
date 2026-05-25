@@ -1,0 +1,115 @@
+from datetime import datetime
+
+from domain import FrontMatter, FrontMatterError
+
+
+pub class FrontMatterRaw:
+    body_start: int
+    fields: dict[str, str]
+
+
+def _strip(s: str) -> str:
+    return s.strip()
+
+
+def _unquote(s: str) -> str:
+    let t: str = s.strip()
+    let n: int = len(t)
+    if n >= 2 and ((t[0] == "\"" and t[n - 1] == "\"") or (t[0] == "'" and t[n - 1] == "'")):
+        return t[1:n - 1]
+    return t
+
+
+def _split_list(raw: str) -> list[str]:
+    let stripped: str = raw.strip()
+    let n: int = len(stripped)
+    mut inner: str = stripped
+    if n >= 2 and stripped[0] == "[" and stripped[n - 1] == "]":
+        inner = stripped[1:n - 1]
+    mut parts: list[str] = []
+    for token in inner.split(","):
+        let cleaned: str = _unquote(token.strip())
+        if len(cleaned) > 0:
+            parts.append(cleaned)
+    return parts
+
+
+def _parse_date(raw: str) -> datetime?:
+    let v: str = _unquote(raw)
+    try:
+        if len(v) == 10:
+            return datetime.fromisoformat(v + "T00:00:00")
+        return datetime.fromisoformat(v)
+    except ValueError:
+        return None
+
+
+pub def split_frontmatter(text: str) -> Result[FrontMatterRaw, FrontMatterError]:
+    let lines: list[str] = text.split("\n")
+    let total: int = len(lines)
+    if total == 0:
+        return Err(FrontMatterError(line=1, detail="empty file"))
+    if lines[0].strip() != "---":
+        return Err(FrontMatterError(line=1, detail="missing opening '---' delimiter"))
+    mut fields: dict[str, str] = {}
+    mut i: int = 1
+    mut closed: bool = False
+    while i < total:
+        let raw_line: str = lines[i]
+        let line: str = raw_line.rstrip()
+        if line.strip() == "---":
+            closed = True
+            i = i + 1
+            break
+        if len(line.strip()) == 0:
+            i = i + 1
+            continue
+        let colon: int = line.find(":")
+        if colon < 0:
+            return Err(FrontMatterError(line=i + 1, detail=f"expected 'key: value', got {line!r}"))
+        let key: str = line[0:colon].strip()
+        let value: str = line[colon + 1:len(line)].strip()
+        if len(key) == 0:
+            return Err(FrontMatterError(line=i + 1, detail="empty key"))
+        fields[key] = value
+        i = i + 1
+    if not closed:
+        return Err(FrontMatterError(line=total, detail="missing closing '---' delimiter"))
+    return Ok(FrontMatterRaw(body_start=i, fields=fields))
+
+
+pub def parse_frontmatter(text: str, default_layout: str) -> Result[tuple[FrontMatter, str], FrontMatterError]:
+    match split_frontmatter(text):
+        case Err(e):
+            return Err(e)
+        case Ok(raw):
+            let title_raw: str? = raw.fields.get("title")
+            let title: str = _unquote(title_raw) if title_raw is not None else "Untitled"
+            let date_raw: str? = raw.fields.get("date")
+            mut date_val: datetime = datetime(1970, 1, 1)
+            if date_raw is not None:
+                let parsed: datetime? = _parse_date(date_raw)
+                if parsed is None:
+                    return Err(FrontMatterError(line=0, detail=f"invalid date: {date_raw!r}"))
+                date_val = parsed
+            let tags_raw: str? = raw.fields.get("tags")
+            let tags: list[str] = _split_list(tags_raw) if tags_raw is not None else []
+            let layout_raw: str? = raw.fields.get("layout")
+            let layout: str = _unquote(layout_raw) if layout_raw is not None else default_layout
+            let draft_raw: str? = raw.fields.get("draft")
+            let draft: bool = _unquote(draft_raw).lower() == "true" if draft_raw is not None else False
+            let slug_raw: str? = raw.fields.get("slug")
+            let slug: str = _unquote(slug_raw) if slug_raw is not None else ""
+            let lines: list[str] = text.split("\n")
+            let body_lines: list[str] = lines[raw.body_start:len(lines)]
+            let body: str = "\n".join(body_lines)
+            let fm: FrontMatter = FrontMatter(
+                title=title,
+                date=date_val,
+                tags=tags,
+                layout=layout,
+                draft=draft,
+                slug=slug,
+            )
+            return Ok((fm, body))
+    raise RuntimeError("unreachable")

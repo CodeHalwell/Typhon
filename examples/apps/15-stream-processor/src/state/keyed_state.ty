@@ -1,0 +1,98 @@
+from domain import StreamKey
+
+
+# Per-key running aggregate cells. Stores count + sum + min + max so we can
+# compute sum / count / min / max / avg on demand.
+pub class AggregateCell:
+    count: int
+    sum_value: float
+    min_value: float
+    max_value: float
+    has_value: bool
+
+
+pub def empty_cell() -> AggregateCell:
+    return AggregateCell(
+        count=0,
+        sum_value=0.0,
+        min_value=0.0,
+        max_value=0.0,
+        has_value=False,
+    )
+
+
+impl AggregateCell:
+    def observe(self, value: float) -> None:
+        if not self.has_value:
+            self.min_value = value
+            self.max_value = value
+            self.has_value = True
+        else:
+            if value < self.min_value:
+                self.min_value = value
+            if value > self.max_value:
+                self.max_value = value
+        self.count = self.count + 1
+        self.sum_value = self.sum_value + value
+
+    def avg(self) -> float:
+        if self.count == 0:
+            return 0.0
+        return self.sum_value / float(self.count)
+
+
+# Keyed state backend — a per-operator dict[key, cell] with snapshot/restore.
+pub class KeyedAggState:
+    cells: dict[str, AggregateCell]
+
+
+pub def new_keyed_state() -> KeyedAggState:
+    return KeyedAggState(cells={})
+
+
+impl KeyedAggState:
+    def get_or_create(self, key: StreamKey) -> AggregateCell:
+        let raw: str = str(key)
+        let existing: AggregateCell? = self.cells.get(raw)
+        if existing is not None:
+            return existing
+        let fresh: AggregateCell = empty_cell()
+        self.cells[raw] = fresh
+        return fresh
+
+    def reset(self, key: StreamKey) -> None:
+        let raw: str = str(key)
+        if raw in self.cells:
+            self.cells.pop(raw, None)
+
+    def snapshot(self) -> dict[str, AggregateCell]:
+        mut out: dict[str, AggregateCell] = {}
+        for raw_key in self.cells:
+            let cell: AggregateCell = self.cells[raw_key]
+            out[raw_key] = AggregateCell(
+                count=cell.count,
+                sum_value=cell.sum_value,
+                min_value=cell.min_value,
+                max_value=cell.max_value,
+                has_value=cell.has_value,
+            )
+        return out
+
+    def restore(self, snap: dict[str, AggregateCell]) -> None:
+        mut fresh: dict[str, AggregateCell] = {}
+        for raw_key in snap:
+            let cell: AggregateCell = snap[raw_key]
+            fresh[raw_key] = AggregateCell(
+                count=cell.count,
+                sum_value=cell.sum_value,
+                min_value=cell.min_value,
+                max_value=cell.max_value,
+                has_value=cell.has_value,
+            )
+        self.cells = fresh
+
+    def keys(self) -> list[str]:
+        mut out: list[str] = []
+        for raw_key in self.cells:
+            out.append(raw_key)
+        return out

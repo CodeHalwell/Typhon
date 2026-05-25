@@ -16,17 +16,17 @@ A production-shaped multiplayer game server with:
 
 | File | Responsibility |
 |---|---|
-| `src/ids.ty` | `newtype` wrappers (`PlayerId`, `RoomId`, `LobbyId`, `Rating`, `SessionToken`, `MatchId`) |
-| `src/config.ty` | `freeze let` constants (tick rate, K-factor, room sizes) + `comptime let GAME_VERSION` |
-| `src/elo.ty` | ELO calculation; expected score, head-to-head update, free-for-all rank distribution |
-| `src/buffer.ty` | Generic `RingBuffer[T]` used for per-room event history |
-| `src/events.ty` | Sealed `GameEvent` union + factory functions + label/room/player accessors |
-| `src/profiles.ty` | SQLite-backed `ProfileStore` with `Result[T, ProfileError]` returns + match persistence |
-| `src/registry.ty` | `ConnectionRegistry` with `SessionToken` issuance, resume, and TTL eviction |
-| `src/modes.ty` | `Mode` strategy struct + `duel`/`battle_royale` concrete implementations |
-| `src/rooms.ty` | `Room` + sealed `RoomState` state machine + `room_tick_loop` async runner |
-| `src/lobby.ty` | Matchmaking by rating, room spawning, finalise queue, async loops |
-| `src/api.ty` | FastAPI endpoints (`/players/register`, `/lobby/queue`, `/rooms`, …) + Pydantic `model` types |
+| `src/domain/ids.ty` | `newtype` wrappers (`PlayerId`, `RoomId`, `LobbyId`, `Rating`, `SessionToken`, `MatchId`) |
+| `src/boot/config.ty` | `freeze let` constants (tick rate, K-factor, room sizes) + `comptime let GAME_VERSION` |
+| `src/domain/elo.ty` | ELO calculation; expected score, head-to-head update, free-for-all rank distribution |
+| `src/runtime/buffer.ty` | Generic `RingBuffer[T]` used for per-room event history |
+| `src/domain/events.ty` | Sealed `GameEvent` union + factory functions + label/room/player accessors |
+| `src/domain/profiles.ty` | SQLite-backed `ProfileStore` with `Result[T, ProfileError]` returns + match persistence |
+| `src/runtime/registry.ty` | `ConnectionRegistry` with `SessionToken` issuance, resume, and TTL eviction |
+| `src/domain/modes.ty` | `Mode` strategy struct + `duel`/`battle_royale` concrete implementations |
+| `src/runtime/rooms.ty` | `Room` + sealed `RoomState` state machine + `room_tick_loop` async runner |
+| `src/runtime/lobby.ty` | Matchmaking by rating, room spawning, finalise queue, async loops |
+| `src/transport/api.ty` | FastAPI endpoints (`/players/register`, `/lobby/queue`, `/rooms`, …) + Pydantic `model` types |
 | `src/main.ty` | Wires everything together, spawns lobby loops via `go`, runs uvicorn |
 
 ## Features exercised

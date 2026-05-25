@@ -1,6 +1,6 @@
 import sys
 
-from cli import dispatch
+from boot import dispatch
 
 
 def main() -> None:

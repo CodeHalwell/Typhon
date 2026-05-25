@@ -1,9 +1,9 @@
-from components import Collider, Damage, Health, Velocity
-from events import EvTickEnded, GameEvent, event_label
-from ids import EntityId
-from scheduler import Scheduler, default_scheduler
-from vec2 import Vec2
-from world import World, new_world
+from domain import Collider, Damage, Health, Velocity
+from domain import EvTickEnded, GameEvent, event_label
+from domain import EntityId
+from runtime import Scheduler, default_scheduler
+from domain import Vec2
+from runtime import World, new_world
 
 
 def deterministic_float(seed: int, mod: int) -> float:

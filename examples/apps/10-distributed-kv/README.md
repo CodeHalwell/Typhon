@@ -40,3 +40,27 @@ python build/main.py
   loop — no `asyncio`, no `gather:`, no `go`.
 - `mut` fields on `Node` mutated inside `impl` methods as the role
   machine transitions between follower / candidate / leader.
+
+## Layout
+
+```
+src/
+  main.ty                 # 3-node simulation driver
+  domain/
+    ids.ty                # NodeId / Term / LogIndex / ClientReqId newtypes
+    state.ty              # Role sealed union
+  consensus/
+    log.ty                # Command + LogEntry + ReplicatedLog
+    node.ty               # Node + role state machine
+    cluster.ty            # 3-node deterministic stepper
+    rpc.ty                # Message sealed union (7 variants)
+    store.ty              # KVStore — log-driven state machine
+```
+
+The `consensus/` package owns the Raft mechanics end-to-end (log,
+node, cluster, RPC messages, replicated store). RPC messages live
+inside `consensus` rather than a separate `transport/` package
+because the message types are the consensus protocol — splitting
+them across packages would force `pub *` to thread `LogEntry` across
+the cycle. Same logic applies to the store: it's the state machine
+being replicated, so it's part of the consensus layer.

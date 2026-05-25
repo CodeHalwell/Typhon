@@ -5,8 +5,8 @@ import sys
 import uvicorn
 from fastapi import FastAPI
 
-from config import GatewayConfig, load_config
-from server import build_app
+from runtime import GatewayConfig, load_config
+from gateway import build_app
 
 
 async def _serve(config: GatewayConfig, app: FastAPI) -> None:

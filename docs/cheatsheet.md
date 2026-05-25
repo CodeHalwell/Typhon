@@ -79,6 +79,13 @@ Modules with at least one `pub` declaration emit a synthesised
 `__all__ = [...]` listing every `pub` name in source order. Use to
 distinguish public surface from internal helpers.
 
+Place a single `pub *` line at the top of a package's `__init__.ty`
+and the build pipeline re-exports every direct-sibling module's `pub`
+names (and, transitively, every direct sub-package's effective
+public surface) from the package facade. Colliding sibling names
+fire `tyc::pub_name_collision`; `pub *` outside `__init__.ty` is a
+no-op and triggers `tyc::pub_star_outside_init`.
+
 ## Newtype (nominal alias)
 
     newtype UserId = int

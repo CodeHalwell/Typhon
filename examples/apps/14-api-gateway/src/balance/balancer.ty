@@ -1,0 +1,124 @@
+import random
+from typing import Callable
+
+from .upstream import Upstream, healthy_upstreams
+
+
+# ---------------------------------------------------------------------------
+# BalanceStrategy — sealed union over the four strategy variants. The variant
+# carries strategy-specific *state*; the concrete `Balancer` class below is
+# what actually gets passed around (per the Round-1 #2 workaround:
+# cross-module `interface` conformance is rejected, so we use a concrete
+# class with a `Callable` field instead).
+# ---------------------------------------------------------------------------
+
+
+pub type BalanceStrategy = StratRoundRobin | StratLeastConn | StratRandom | StratWeighted
+
+
+pub class StratRoundRobin:
+    cursor: int
+
+
+pub class StratLeastConn:
+    placeholder: int
+
+
+pub class StratRandom:
+    placeholder: int
+
+
+pub class StratWeighted:
+    placeholder: int
+
+
+pub def strategy_name(s: BalanceStrategy) -> str:
+    match s:
+        case StratRoundRobin(_): return "round_robin"
+        case StratLeastConn(_):  return "least_conn"
+        case StratRandom(_):     return "random"
+        case StratWeighted(_):   return "weighted"
+    raise RuntimeError("unreachable")
+
+
+# ---------------------------------------------------------------------------
+# Balancer — concrete class with a Callable field. This is the cross-module
+# workaround for the interface-conformance limitation (Round-1 #2). Every
+# strategy implementation lives in this module as a free function with the
+# `BalancePickFn` shape, and `new_balancer_*` wires them up.
+# ---------------------------------------------------------------------------
+
+
+pub type BalancePickFn = Callable[[list[Upstream]], Upstream?]
+
+
+pub class Balancer:
+    name: str
+    pick: BalancePickFn
+
+
+# A mutable cursor used by the round-robin picker. Stored on the balancer so
+# successive picks rotate without external state.
+pub class RoundRobinCursor:
+    next_idx: int
+
+
+def _pick_round_robin(cursor: RoundRobinCursor) -> BalancePickFn:
+    def picker(pool: list[Upstream]) -> Upstream?:
+        let pool_healthy: list[Upstream] = healthy_upstreams(pool)
+        if len(pool_healthy) == 0:
+            return None
+        let idx: int = cursor.next_idx % len(pool_healthy)
+        cursor.next_idx = (cursor.next_idx + 1) % max(1, len(pool_healthy))
+        return pool_healthy[idx]
+    return picker
+
+
+def _pick_least_conn(pool: list[Upstream]) -> Upstream?:
+    let pool_healthy: list[Upstream] = healthy_upstreams(pool)
+    if len(pool_healthy) == 0:
+        return None
+    mut best: Upstream = pool_healthy[0]
+    for u in pool_healthy:
+        if u.in_flight < best.in_flight:
+            best = u
+    return best
+
+
+def _pick_random(pool: list[Upstream]) -> Upstream?:
+    let pool_healthy: list[Upstream] = healthy_upstreams(pool)
+    if len(pool_healthy) == 0:
+        return None
+    let idx: int = random.randint(0, len(pool_healthy) - 1)
+    return pool_healthy[idx]
+
+
+def _pick_weighted(pool: list[Upstream]) -> Upstream?:
+    let pool_healthy: list[Upstream] = healthy_upstreams(pool)
+    if len(pool_healthy) == 0:
+        return None
+    mut total: int = 0
+    for u in pool_healthy:
+        total = total + u.weight
+    if total <= 0:
+        return pool_healthy[0]
+    mut r: int = random.randint(0, total - 1)
+    for u2 in pool_healthy:
+        if r < u2.weight:
+            return u2
+        r = r - u2.weight
+    return pool_healthy[len(pool_healthy) - 1]
+
+
+pub def new_balancer(strategy: BalanceStrategy) -> Balancer:
+    match strategy:
+        case StratRoundRobin(c):
+            let cursor: RoundRobinCursor = RoundRobinCursor(next_idx=c)
+            return Balancer(name="round_robin", pick=_pick_round_robin(cursor))
+        case StratLeastConn(_):
+            return Balancer(name="least_conn", pick=_pick_least_conn)
+        case StratRandom(_):
+            return Balancer(name="random", pick=_pick_random)
+        case StratWeighted(_):
+            return Balancer(name="weighted", pick=_pick_weighted)
+    raise RuntimeError("unreachable")

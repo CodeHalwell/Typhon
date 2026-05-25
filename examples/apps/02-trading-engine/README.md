@@ -15,14 +15,14 @@ type system, sealed unions, and pattern matching.
 
 | File | Responsibility |
 |---|---|
-| `src/ids.ty` | `newtype` wrappers — `Symbol`, `OrderId`, `TraderId` |
-| `src/money.ty` | `newtype Price = int`, `newtype Qty = int`, `newtype Notional = int` (all stored as integer ticks/cents) + arithmetic helpers |
-| `src/orders.ty` | Sealed-union order types, status, and side enums |
-| `src/book.ty` | Order-book data structure with `impl`-attached methods |
-| `src/risk.ty` | Pre-trade risk gates (`Result`-returning) |
-| `src/engine.ty` | Matching engine producing fills + sealed-union market events |
-| `src/portfolio.ty` | Trader accounts, cash + position bookkeeping |
-| `src/feed.ty` | Synthetic order-tape generator for backtests |
+| `src/domain/ids.ty` | `newtype` wrappers — `Symbol`, `OrderId`, `TraderId` |
+| `src/domain/money.ty` | `newtype Price = int`, `newtype Qty = int`, `newtype Notional = int` (all stored as integer ticks/cents) + arithmetic helpers |
+| `src/domain/orders.ty` | Sealed-union order types, status, and side enums |
+| `src/runtime/book.ty` | Order-book data structure with `impl`-attached methods |
+| `src/runtime/risk.ty` | Pre-trade risk gates (`Result`-returning) |
+| `src/runtime/engine.ty` | Matching engine producing fills + sealed-union market events |
+| `src/domain/portfolio.ty` | Trader accounts, cash + position bookkeeping |
+| `src/runtime/feed.ty` | Synthetic order-tape generator for backtests |
 | `src/main.ty` | CLI entry that runs a backtest and prints a summary |
 
 ## Features exercised

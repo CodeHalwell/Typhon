@@ -1,0 +1,42 @@
+from .vector_ops import cosine_distance, inner_product_distance, l2_distance
+
+
+pub type Metric = MCosine | MEuclidean | MInnerProduct
+
+
+pub class MCosine frozen:
+    pass
+
+
+pub class MEuclidean frozen:
+    pass
+
+
+pub class MInnerProduct frozen:
+    pass
+
+pub def metric_from_name(name: str) -> Metric?:
+    if name == "cosine":
+        return MCosine()
+    if name == "euclidean" or name == "l2":
+        return MEuclidean()
+    if name == "inner_product" or name == "ip" or name == "dot":
+        return MInnerProduct()
+    return None
+
+
+pub def metric_name(m: Metric) -> str:
+    match m:
+        case MCosine():       return "cosine"
+        case MEuclidean():    return "euclidean"
+        case MInnerProduct(): return "inner_product"
+    raise RuntimeError("unreachable")
+
+
+pub def score(m: Metric, a: list[float], b: list[float]) -> float:
+    # Lower is closer for every metric (we flip sign for inner product).
+    match m:
+        case MCosine():       return cosine_distance(a, b)
+        case MEuclidean():    return l2_distance(a, b)
+        case MInnerProduct(): return inner_product_distance(a, b)
+    raise RuntimeError("unreachable")

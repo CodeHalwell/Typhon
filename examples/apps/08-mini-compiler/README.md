@@ -64,18 +64,27 @@ with the offending span).
 
 ```
 src/
-  source.ty   # Span, Source, line/col helpers
-  tokens.ty   # Token sealed union (9 variants) + factories
-  lexer.ty    # Source -> Result[list[Token], LexError]
-  lang_ast.ty   # Expr sealed union (13 variants) + factories
-                # (renamed from ast.ty — `ast` is a stdlib module, see TYPHON_FEEDBACK R2-4)
-  parser.ty     # tokens -> Result[Expr, ParseError] via Pratt
-  lang_types.ty # Ty sealed union, TypeEnv, check()
-                # (renamed from types.ty — `types` is a stdlib module, see TYPHON_FEEDBACK R2-4)
-  values.ty   # Value sealed union, Env (recursive via VFn)
-  eval.ty     # eval_expr(): Expr × Env -> Result[Value, EvalError]
-  main.ty     # four sample programs, end-to-end
+  main.ty            # four sample programs, end-to-end
+  frontend/
+    source.ty        # Span, Source, line/col helpers
+    tokens.ty        # Token sealed union (9 variants) + factories
+    lexer.ty         # Source -> Result[list[Token], LexError]
+    lang_ast.ty      # Expr sealed union (13 variants) + factories
+                     # (renamed from ast.ty — `ast` shadows the stdlib, see TYPHON_FEEDBACK R2-4)
+    parser.ty        # tokens -> Result[Expr, ParseError] via Pratt
+  middle/
+    lang_types.ty    # Ty sealed union, TypeEnv, check()
+                     # (renamed from types.ty — same R2-4 reason)
+  runtime/
+    values.ty        # Value sealed union, Env (recursive via VFn)
+    eval.ty          # eval_expr(): Expr × Env -> Result[Value, EvalError]
 ```
+
+Each subpackage's `__init__.ty` is a single `pub *` marker so the
+build pipeline aggregates the package's surface automatically (`from
+frontend import Span, Expr, Token, …` resolves through the facade
+without the consumer having to know which sibling file holds each
+name).
 
 See `FRICTION.md` for any new Typhon friction this app turned up beyond
 the Round 1 findings in `../TYPHON_FEEDBACK.md`.

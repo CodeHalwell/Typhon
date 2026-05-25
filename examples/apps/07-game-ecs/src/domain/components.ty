@@ -1,0 +1,76 @@
+from .ids import EntityId
+from .vec2 import Vec2
+
+
+pub class Position frozen:
+    pos: Vec2
+
+
+pub class Velocity frozen:
+    vel: Vec2
+
+
+pub class Health:
+    hp: int
+    max_hp: int
+
+
+pub class Damage frozen:
+    amount: int
+    source: EntityId
+
+
+pub class Sprite frozen:
+    name: str
+    layer: int
+
+
+pub class Collider frozen:
+    radius: float
+
+
+pub class Tag frozen:
+    label: str
+
+
+pub class CompPosition:
+    data: Position
+
+
+pub class CompVelocity:
+    data: Velocity
+
+
+pub class CompHealth:
+    data: Health
+
+
+pub class CompDamage:
+    data: Damage
+
+
+pub class CompSprite:
+    data: Sprite
+
+
+pub class CompCollider:
+    data: Collider
+
+
+pub class CompTag:
+    data: Tag
+
+
+pub type Component = CompPosition | CompVelocity | CompHealth | CompDamage | CompSprite | CompCollider | CompTag
+
+
+pub def component_kind(c: Component) -> str:
+    match c:
+        case CompPosition(_):  return "position"
+        case CompVelocity(_):  return "velocity"
+        case CompHealth(_):    return "health"
+        case CompDamage(_):    return "damage"
+        case CompSprite(_):    return "sprite"
+        case CompCollider(_):  return "collider"
+        case CompTag(_):       return "tag"
+    raise RuntimeError("unreachable")

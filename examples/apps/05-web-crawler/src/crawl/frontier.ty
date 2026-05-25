@@ -1,0 +1,58 @@
+import asyncio
+import heapq
+
+from domain import Url
+
+
+pub class FrontierItem frozen:
+    priority: int
+    depth: int
+    url: Url
+
+
+pub class Frontier:
+    queue: list[tuple[int, int, int, str]]
+    seen: dict[str, bool]
+    counter: int
+    lock: asyncio.Lock
+
+
+impl Frontier:
+    async def submit(self, url: Url, depth: int, priority: int = 5) -> bool:
+        async with self.lock:
+            let key: str = str(url)
+            if self.seen.get(key) is True:
+                return False
+            self.seen[key] = True
+            self.counter = self.counter + 1
+            heapq.heappush(self.queue, (priority, self.counter, depth, key))
+            return True
+
+    async def requeue(self, url: Url, depth: int, priority: int = 5) -> None:
+        async with self.lock:
+            let key: str = str(url)
+            self.counter = self.counter + 1
+            heapq.heappush(self.queue, (priority, self.counter, depth, key))
+
+    async def claim(self) -> FrontierItem?:
+        async with self.lock:
+            if len(self.queue) == 0:
+                return None
+            let item = heapq.heappop(self.queue)
+            return FrontierItem(
+                priority=int(item[0]),
+                depth=int(item[2]),
+                url=Url(str(item[3])),
+            )
+
+    async def remaining(self) -> int:
+        async with self.lock:
+            return len(self.queue)
+
+    async def seen_count(self) -> int:
+        async with self.lock:
+            return len(self.seen)
+
+
+pub def new_frontier() -> Frontier:
+    return Frontier(queue=[], seen={}, counter=0, lock=asyncio.Lock())

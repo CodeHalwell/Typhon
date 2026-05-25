@@ -1,0 +1,124 @@
+from .ids import StreamKey, WatermarkTs
+
+
+# Event[T] — a record carrying an event-time timestamp, a routing key, and a
+# generic payload of type T.
+pub class Event[T]:
+    timestamp_ms: int
+    key: StreamKey
+    payload: T
+
+
+# EventEnvelope is the unit that flows on inter-operator queues. We attempted a
+# parametric sealed union `EventEnvelope[T]` (Record/Watermark/Barrier), but
+# variant-to-union upcasting is rejected cross-module even for non-parametric
+# unions (TYPHON_FEEDBACK round-1 #1). For parametric variants the per-variant
+# constructor likewise refuses to flow into a `EventEnvelope[T]` slot.
+#
+# So envelopes here carry the payload as `object`, with a tag indicating what
+# kind of frame this is. Operators downcast payloads with an annotated
+# `let typed: T = unsafe_cast(env.payload)` pattern (we use a typed accessor
+# helper rather than `unsafe:` because the resulting boundary is contained).
+pub type EnvelopeKind = EnvRecord | EnvWatermark | EnvBarrier | EnvEndOfStream
+
+
+pub class EnvRecord:
+    pass
+
+
+pub class EnvWatermark:
+    pass
+
+
+pub class EnvBarrier:
+    pass
+
+
+pub class EnvEndOfStream:
+    pass
+
+
+pub def envelope_kind_label(k: EnvelopeKind) -> str:
+    match k:
+        case EnvRecord():        return "record"
+        case EnvWatermark():     return "watermark"
+        case EnvBarrier():       return "barrier"
+        case EnvEndOfStream():   return "end-of-stream"
+    raise RuntimeError("unreachable")
+
+
+# A wire envelope. `record_payload` is only valid when `kind` is EnvRecord; the
+# operator consuming it must cast to its concrete record type.
+pub class Envelope:
+    kind: EnvelopeKind
+    timestamp_ms: int
+    key: StreamKey
+    record_payload: object
+    watermark: WatermarkTs
+
+
+pub def make_record(ts_ms: int, key: StreamKey, payload: object) -> Envelope:
+    return Envelope(
+        kind=EnvRecord(),
+        timestamp_ms=ts_ms,
+        key=key,
+        record_payload=payload,
+        watermark=WatermarkTs(0),
+    )
+
+
+pub def make_watermark(wm: WatermarkTs) -> Envelope:
+    return Envelope(
+        kind=EnvWatermark(),
+        timestamp_ms=int(wm),
+        key=StreamKey(""),
+        record_payload=0,
+        watermark=wm,
+    )
+
+
+pub def make_barrier(ts_ms: int) -> Envelope:
+    return Envelope(
+        kind=EnvBarrier(),
+        timestamp_ms=ts_ms,
+        key=StreamKey(""),
+        record_payload=0,
+        watermark=WatermarkTs(0),
+    )
+
+
+pub def make_end_of_stream() -> Envelope:
+    return Envelope(
+        kind=EnvEndOfStream(),
+        timestamp_ms=0,
+        key=StreamKey(""),
+        record_payload=0,
+        watermark=WatermarkTs(0),
+    )
+
+
+pub def is_record(env: Envelope) -> bool:
+    match env.kind:
+        case EnvRecord():       return True
+        case EnvWatermark():    return False
+        case EnvBarrier():      return False
+        case EnvEndOfStream():  return False
+    raise RuntimeError("unreachable")
+
+
+pub def is_watermark(env: Envelope) -> bool:
+    match env.kind:
+        case EnvRecord():       return False
+        case EnvWatermark():    return True
+        case EnvBarrier():      return False
+        case EnvEndOfStream():  return False
+    raise RuntimeError("unreachable")
+
+
+pub def is_end(env: Envelope) -> bool:
+    match env.kind:
+        case EnvRecord():       return False
+        case EnvWatermark():    return False
+        case EnvBarrier():      return False
+        case EnvEndOfStream():  return True
+    raise RuntimeError("unreachable")

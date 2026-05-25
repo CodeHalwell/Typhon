@@ -3,11 +3,11 @@ import shutil
 import sys
 from pathlib import Path
 
-from assets import copy_assets
-from config import SiteConfig, build_version, default_config
-from feed import render_robots, render_rss, render_sitemap
-from manifest import open_manifest
-from models import RenderedPage
+from pipeline import copy_assets
+from conf import SiteConfig, build_version, default_config
+from pipeline import render_robots, render_rss, render_sitemap
+from pipeline import open_manifest
+from domain import RenderedPage
 from pipeline import (
     PipelineReport,
     build_pages,
@@ -182,7 +182,10 @@ def _build_parser() -> argparse.ArgumentParser:
 pub def run_cli(argv: list[str]) -> int:
     let parser: argparse.ArgumentParser = _build_parser()
     let args = parser.parse_args(argv)
-    let cmd: str = str(args.cmd) if args.cmd is not None else "build"
+    if args.cmd is None:
+        parser.print_help()
+        return 0
+    let cmd: str = str(args.cmd)
     mut result: CliResult = CliResult(code=0, message="")
     if cmd == "build":
         result = _cmd_build(args)

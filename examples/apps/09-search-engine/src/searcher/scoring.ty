@@ -1,0 +1,69 @@
+import math
+
+from domain import DocId
+from indexer import Document, InvertedIndex, Posting
+
+
+pub class BM25Params frozen:
+    k1: float
+    b: float
+
+
+pub class ScoredHit:
+    doc_id: DocId
+    score: float
+    matched_terms: list[str]
+
+
+pub def default_bm25() -> BM25Params:
+    return BM25Params(k1=1.5, b=0.75)
+
+
+pub def score_idf(idx: InvertedIndex, term: str) -> float:
+    let n: float = float(idx.total_docs)
+    let df: float = float(idx.df(term))
+    # Standard BM25 IDF with +1 smoothing.
+    let numerator: float = n - df + 0.5
+    let denominator: float = df + 0.5
+    let ratio: float = (numerator / denominator) + 1.0
+    return math.log(ratio)
+
+
+def _posting_for_doc(postings: list[Posting], doc_id: DocId) -> Posting?:
+    let want: int = int(doc_id)
+    for p in postings:
+        if int(p.doc_id) == want:
+            return p
+    return None
+
+
+pub def bm25_score(
+    idx: InvertedIndex,
+    terms: list[str],
+    doc_id: DocId,
+    params: BM25Params,
+) -> float:
+    let doc_opt = idx.doc(doc_id)
+    if doc_opt is None:
+        return 0.0
+    let doc: Document = doc_opt
+    let doc_len: float = float(doc.length)
+    let avg: float = idx.avg_doc_len if idx.avg_doc_len > 0.0 else 1.0
+    let k1: float = params.k1
+    let b: float = params.b
+    let length_norm: float = 1.0 - b + b * (doc_len / avg)
+    mut score: float = 0.0
+    for term in terms:
+        let postings: list[Posting] = idx.postings_for(term)
+        let posting_opt = _posting_for_doc(postings, doc_id)
+        if posting_opt is None:
+            continue
+        let posting: Posting = posting_opt
+        let tf: float = float(posting.tf)
+        let idf: float = score_idf(idx, term)
+        let numerator: float = tf * (k1 + 1.0)
+        let denominator: float = tf + k1 * length_norm
+        if denominator <= 0.0:
+            continue
+        score = score + idf * (numerator / denominator)
+    return score

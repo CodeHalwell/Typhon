@@ -1,0 +1,27 @@
+from .ids import NodeId
+
+
+pub type Role = RoleFollower | RoleCandidate | RoleLeader
+
+
+pub class RoleFollower:
+    leader: NodeId?
+    election_deadline: float
+
+
+pub class RoleCandidate:
+    votes: dict[int, bool]
+    election_deadline: float
+
+
+pub class RoleLeader:
+    next_index: dict[int, int]
+    match_index: dict[int, int]
+    heartbeat_deadline: float
+
+pub def role_label(r: Role) -> str:
+    match r:
+        case RoleFollower(_, _):     return "follower"
+        case RoleCandidate(_, _):    return "candidate"
+        case RoleLeader(_, _, _):    return "leader"
+    raise RuntimeError("unreachable")

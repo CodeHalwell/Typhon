@@ -1,0 +1,63 @@
+from .ids import OperatorId, StreamKey
+
+
+# Demo payload type — a stock-price tick.
+pub class StockTick frozen:
+    symbol: str
+    price_cents: int
+    venue: str
+
+
+# Aggregated window output produced by the windowed aggregate operator.
+pub class AggregateRow frozen:
+    key: StreamKey
+    window_start_ms: int
+    window_end_ms: int
+    count: int
+    sum_value: float
+    min_value: float
+    max_value: float
+    avg_value: float
+
+
+# Joined output emitted by the windowed-join operator.
+pub class JoinedRow frozen:
+    key: StreamKey
+    window_start_ms: int
+    window_end_ms: int
+    left_count: int
+    right_count: int
+
+
+# Sealed-union of pipeline error kinds. Three distinct error types per the
+# brief.
+pub type StreamError = ConfigError | OperatorError | SinkError
+
+
+pub class ConfigError:
+    field: str
+    reason: str
+
+
+pub class OperatorError:
+    op: OperatorId
+    reason: str
+
+
+pub class SinkError:
+    sink_name: str
+    reason: str
+pub def error_label(err: StreamError) -> str:
+    match err:
+        case ConfigError(_, _):    return "config"
+        case OperatorError(_, _):  return "operator"
+        case SinkError(_, _):      return "sink"
+    raise RuntimeError("unreachable")
+
+
+pub def error_message(err: StreamError) -> str:
+    match err:
+        case ConfigError(f, r):   return f"config[{f}]: {r}"
+        case OperatorError(o, r): return f"op[{o}]: {r}"
+        case SinkError(n, r):     return f"sink[{n}]: {r}"
+    raise RuntimeError("unreachable")

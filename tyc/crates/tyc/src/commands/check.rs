@@ -165,6 +165,15 @@ pub fn run(args: CheckArgs) -> Result<()> {
         .to_owned();
     let mut shape_map = collect_project_shapes(&args.paths, &src_root_name);
 
+    // Resolved source directory for the `tyc::stdlib_module_shadow`
+    // gating below. We canonicalise once here so the per-file check
+    // does one syscall (the file's parent) instead of two.
+    // Canonicalisation fails when the path doesn't exist; in that case
+    // we fall back to the joined-but-unresolved path so the check
+    // degrades gracefully (it'll just under-match rather than panic).
+    let src_dir = project_root.join(&config.project.src);
+    let src_dir_canon = src_dir.canonicalize().unwrap_or(src_dir);
+
     // Venv-introspection enrichment: shell to the project's
     // `.venv/bin/python` and ask `inspect.signature` for the real
     // parameter list of every third-party class / free function the
@@ -215,9 +224,13 @@ pub fn run(args: CheckArgs) -> Result<()> {
             // R2-4: warn if the module name collides with a Python
             // stdlib module. Only fires when a `typhon.toml` is present —
             // standalone-file checks skip the warning (no `build/` will
-            // be emitted, so the runtime collision can't happen).
+            // be emitted, so the runtime collision can't happen). The
+            // check also only fires for files at the top of the source
+            // tree — nested files lower into a sub-package whose
+            // emitted `.py` is not on `sys.path` and so cannot
+            // intercept stdlib imports.
             if has_project_config {
-                if let Some(warning) = check_stdlib_module_shadow(&path, &source) {
+                if let Some(warning) = check_stdlib_module_shadow(&path, &source, &src_dir_canon) {
                     diags.push_warning(warning);
                 }
             }
@@ -266,7 +279,9 @@ pub fn run(args: CheckArgs) -> Result<()> {
                 // project context emits no `build/` so the runtime
                 // collision can't happen. PR #129 copilot review.
                 if has_project_config {
-                    if let Some(warning) = check_stdlib_module_shadow(&path, &source) {
+                    if let Some(warning) =
+                        check_stdlib_module_shadow(&path, &source, &src_dir_canon)
+                    {
                         diags.push_warning(warning);
                     }
                 }
@@ -745,19 +760,43 @@ fn pub_star_line_offset(source: &str, line_idx: usize) -> usize {
     offset
 }
 
-fn check_stdlib_module_shadow(path: &std::path::Path, source: &str) -> Option<TycError> {
+fn check_stdlib_module_shadow(
+    path: &std::path::Path,
+    source: &str,
+    src_dir: &std::path::Path,
+) -> Option<TycError> {
     let stem = path.file_stem()?.to_str()?;
-    if stdlib_top_level_contains(stem) {
-        Some(TycError::stdlib_module_shadow(
-            stem.to_owned(),
-            path.display().to_string(),
-            source.to_owned(),
-            0,
-            0,
-        ))
-    } else {
-        None
+    if !stdlib_top_level_contains(stem) {
+        return None;
     }
+    // Only fire when the file sits AT the top of the configured
+    // source tree — a nested `src/indexer/tokenize.ty` lowers to
+    // `build/indexer/tokenize.py`, which is not on `sys.path` and so
+    // cannot intercept `import tokenize` from stdlib callers. The
+    // shadow risk is real only when the emitted `build/<stem>.py`
+    // would sit alongside `build/main.py`.
+    //
+    // We compare canonicalised paths (rather than basenames) so that
+    // (a) `[project] src = "."` projects still get the warning for
+    // their top-level `.ty` files, where `parent.file_name()` would
+    // resolve to the project directory name and never literally
+    // equal `"."`, and (b) a nested `src/sub/src/tokenize.ty`
+    // doesn't false-positive just because its parent dir is also
+    // named "src".
+    let parent = path.parent()?;
+    let parent_canon = parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf());
+    if parent_canon != src_dir {
+        return None;
+    }
+    Some(TycError::stdlib_module_shadow(
+        stem.to_owned(),
+        path.display().to_string(),
+        source.to_owned(),
+        0,
+        0,
+    ))
 }
 
 /// Run the secondary check passes — comptime evaluation, purity
@@ -1166,20 +1205,86 @@ mod tests {
     #[test]
     fn stdlib_module_shadow_emits_warning_on_colliding_filename() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = write_ty(tmp.path(), "types.ty", "pub class Foo:\n    x: int\n");
-        let diag = check_stdlib_module_shadow(&path, "pub class Foo:\n    x: int\n");
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        let src_canon = src.canonicalize().unwrap();
+        let path = write_ty(&src, "types.ty", "pub class Foo:\n    x: int\n");
+        let diag = check_stdlib_module_shadow(&path, "pub class Foo:\n    x: int\n", &src_canon);
         assert!(
             diag.is_some(),
-            "expected a warning for a project module named `types`"
+            "expected a warning for a project module named `types` at the top of src/"
         );
     }
 
     #[test]
     fn stdlib_module_shadow_skips_disjoint_filename() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = write_ty(tmp.path(), "lang_types.ty", "");
-        let diag = check_stdlib_module_shadow(&path, "");
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        let src_canon = src.canonicalize().unwrap();
+        let path = write_ty(&src, "lang_types.ty", "");
+        let diag = check_stdlib_module_shadow(&path, "", &src_canon);
         assert!(diag.is_none());
+    }
+
+    #[test]
+    fn stdlib_module_shadow_skips_nested_subpackage_file() {
+        // `src/indexer/tokenize.ty` lowers to
+        // `build/indexer/tokenize.py`, which is NOT on `sys.path` —
+        // so it cannot intercept `import tokenize` from stdlib
+        // callers. The shadow risk is real only for top-level files.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let sub = src.join("indexer");
+        std::fs::create_dir_all(&sub).unwrap();
+        let src_canon = src.canonicalize().unwrap();
+        let path = write_ty(&sub, "tokenize.ty", "");
+        let diag = check_stdlib_module_shadow(&path, "", &src_canon);
+        assert!(
+            diag.is_none(),
+            "nested file's emitted .py is not on sys.path; no shadow risk"
+        );
+    }
+
+    #[test]
+    fn stdlib_module_shadow_fires_when_src_equals_project_root() {
+        // `[project] src = "."` puts every top-level `.ty` directly
+        // at the project root. The pre-PR-138-comments check
+        // compared `parent.file_name()` to the basename "."
+        // (which would be the project dir's name) and never fired —
+        // suppressing a real shadow case. Resolved-path comparison
+        // restores the warning.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().to_path_buf();
+        let project_canon = project.canonicalize().unwrap();
+        let path = write_ty(&project, "types.ty", "pub class Foo:\n    x: int\n");
+        let diag =
+            check_stdlib_module_shadow(&path, "pub class Foo:\n    x: int\n", &project_canon);
+        assert!(
+            diag.is_some(),
+            "expected a warning for `types.ty` at the project root when `src = \".\"`"
+        );
+    }
+
+    #[test]
+    fn stdlib_module_shadow_skips_false_positive_same_named_nested_dir() {
+        // `src/indexer/src/tokenize.ty` — the parent dir's basename
+        // is "src" and so is the configured src root. The
+        // pre-PR-138-comments basename comparison would have
+        // fired here. The resolved-path comparison correctly
+        // suppresses, because the file isn't actually under the
+        // configured source root.
+        let tmp = tempfile::tempdir().unwrap();
+        let real_src = tmp.path().join("src");
+        let nested_src = real_src.join("indexer").join("src");
+        std::fs::create_dir_all(&nested_src).unwrap();
+        let real_src_canon = real_src.canonicalize().unwrap();
+        let path = write_ty(&nested_src, "tokenize.ty", "");
+        let diag = check_stdlib_module_shadow(&path, "", &real_src_canon);
+        assert!(
+            diag.is_none(),
+            "a nested `src/` directory must not false-positive against the configured src root"
+        );
     }
 
     #[test]

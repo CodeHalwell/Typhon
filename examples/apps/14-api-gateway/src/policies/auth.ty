@@ -1,0 +1,27 @@
+from domain import ClientId
+
+
+# Tiny in-memory token store. Production would call a real auth service or
+# verify a JWT — here we just look up the bearer token in a dict.
+
+
+pub class TokenStore:
+    tokens: dict[str, ClientId]
+
+
+pub def new_token_store() -> TokenStore:
+    return TokenStore(tokens={})
+
+
+impl TokenStore:
+    def register(self, token: str, client: ClientId) -> None:
+        self.tokens[token] = client
+
+    def resolve(self, header_value: str?) -> ClientId?:
+        if header_value is None:
+            return None
+        let trimmed: str = header_value.strip()
+        if not trimmed.lower().startswith("bearer "):
+            return None
+        let bare: str = trimmed[7:].strip()
+        return self.tokens.get(bare)
