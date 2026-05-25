@@ -2565,9 +2565,17 @@ fn collect_union_variant_names(expr: &Expr) -> Option<Vec<String>> {
     while let Some(current) = stack.pop() {
         match current {
             Expr::Name(n) => names.push(n.id.as_str().to_owned()),
+            // Push `right` first so the stack pops left-to-right: a
+            // `BinOp` reads `A | B | C` as
+            // `BinOp(BinOp(A, B), C)` — pushing left last makes the
+            // visitor descend leftmost first and preserves source
+            // order in `names`. Without this the variants end up in
+            // reverse order, contradicting the docstring on the
+            // caller (`collect_sealed_union_aliases`). PR #129
+            // gemini review.
             Expr::BinOp(b) if matches!(b.op, Operator::BitOr) => {
-                stack.push(&b.left);
                 stack.push(&b.right);
+                stack.push(&b.left);
             }
             _ => return None,
         }
@@ -3580,6 +3588,31 @@ mod tests {
     }
 
     // ── impl block desugaring ─────────────────────────────────────────────────
+
+    #[test]
+    fn collect_sealed_union_aliases_preserves_source_order() {
+        // PR #129 gemini review: variants must come out left-to-right,
+        // matching the source `type T = A | B | C` ordering. The
+        // earlier stack-push order yielded `[C, B, A]`, which silently
+        // worked because downstream consumers used the set, not the
+        // order — but contradicted the docstring.
+        let src = "\
+class A:
+    pass
+class B:
+    pass
+class C:
+    pass
+type T = A | B | C
+";
+        // Parse via the desugar entry point so we get a real Stmt list.
+        let module = tyc_syntax::parse_module(src)
+            .expect("parse failed")
+            .into_syntax();
+        let aliases = collect_sealed_union_aliases(&module.body);
+        let order = aliases.get("T").expect("T alias should be collected");
+        assert_eq!(order, &["A".to_owned(), "B".to_owned(), "C".to_owned()]);
+    }
 
     #[test]
     fn impl_block_on_sealed_union_distributes_methods() {

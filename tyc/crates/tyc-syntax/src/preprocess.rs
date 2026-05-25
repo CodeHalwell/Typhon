@@ -2241,8 +2241,11 @@ pub fn validate_question_ops(source: &str) -> Vec<QuestionOpError> {
             //
             // `pub` is a visibility modifier that stacks with `def` / `async def`;
             // strip it so `pub def f() -> Result[..]: ... x?` is recognised as
-            // being inside a function (R2-1).
-            let after_pub = trimmed.strip_prefix("pub ").unwrap_or(trimmed);
+            // being inside a function (R2-1). `trim_start` absorbs any extra
+            // whitespace between the modifier and the keyword (`pub  def`)
+            // so the detector doesn't depend on exact single-space spelling
+            // (PR #129 gemini review).
+            let after_pub = trimmed.strip_prefix("pub ").unwrap_or(trimmed).trim_start();
             if after_pub.starts_with("def ") || after_pub.starts_with("async def ") {
                 let ret_type = extract_return_type_text(code);
                 fn_stack.push((indent_len, ret_type));
@@ -7288,6 +7291,24 @@ mod tests {
         let src = "val x: str? = None\n";
         let errs = validate_question_ops(src);
         assert!(errs.is_empty(), "nullable sugar must not be flagged");
+    }
+
+    #[test]
+    fn question_op_pub_def_tolerates_double_space() {
+        // PR #129 gemini review: the `pub` strip uses
+        // `strip_prefix("pub ").unwrap_or(trimmed).trim_start()` so the
+        // detection is robust to `pub  def` (double space). Without
+        // `.trim_start()` the second space would be consumed as part of
+        // the keyword check (`"def "` vs `" def "`) and the function
+        // would not register on `fn_stack`.
+        let src =
+            "pub  def parse(s: str) -> Result[int, str]:\n    val n = int(s)?\n    return Ok(n)\n";
+        let errs = validate_question_ops(src);
+        assert!(
+            errs.is_empty(),
+            "pub def with extra whitespace must accept `?`: {:?}",
+            errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -4294,6 +4294,28 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                                 .entry(m.clone())
                                 .or_insert_with(|| sig.clone());
                         }
+                        // Mirror the concrete-class branch: fields
+                        // declared inside `impl Union:` (or
+                        // `extend Union:`) must also be merged into
+                        // every variant's shape, otherwise the desugar
+                        // injects field statements that the checker
+                        // believes don't exist. Constructor and
+                        // field-access call sites would then be
+                        // misdiagnosed. PR #129 codex review.
+                        for f in &impl_shape.field_order {
+                            if !target_shape.fields.contains_key(f) {
+                                target_shape.field_order.push(f.clone());
+                                if impl_shape.field_defaults.contains(f) {
+                                    target_shape.field_defaults.insert(f.clone());
+                                }
+                            }
+                        }
+                        for (f, ty) in &impl_shape.fields {
+                            target_shape
+                                .fields
+                                .entry(f.clone())
+                                .or_insert_with(|| ty.clone());
+                        }
                     }
                 } else {
                     // FINDINGS #78: `impl UnknownClass:` silently produced
@@ -7123,6 +7145,95 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
                 variadic: true,
             })
         }
+        // Result / Ok / Err combinators — emitted on the runtime classes
+        // by the build step (R2-6). The receiver narrows the return type
+        // as far as static information allows:
+        //
+        //   Ok[T].map(f)        → Ok[Unknown]       (preserves "Ok-ness")
+        //   Ok[T].map_err(f)    → Ok[T]             (identity)
+        //   Err[E].map(f)       → Err[E]            (identity)
+        //   Err[E].map_err(f)   → Err[Unknown]      (preserves "Err-ness")
+        //   Result[T, E].map(f) → Result[Unknown, E]
+        //   Result[T, E].map_err(f) → Result[T, Unknown]
+        //   .and_then / .or_else collapse to Result[Unknown, Unknown]
+        //   because the callee returns an arbitrary Result.
+        //
+        // Without these arms `recv.map_err(f)` falls through to
+        // `Type::Unknown` and the result silently passes any
+        // assignability check (`Unknown` flows freely). The new types
+        // at least preserve enough shape that assigning the chain
+        // output to `int` (or any non-Result) trips type_mismatch.
+        // PR #129 copilot review.
+        ("Ok", "map", [_t]) => Some(Type::Function {
+            params: vec![Type::Unknown],
+            ret: Box::new(Type::Generic("Ok".into(), vec![Type::Unknown])),
+            variadic: false,
+        }),
+        ("Ok", "map_err", [t]) => Some(Type::Function {
+            params: vec![Type::Unknown],
+            ret: Box::new(Type::Generic("Ok".into(), vec![t.clone()])),
+            variadic: false,
+        }),
+        ("Ok", "and_then", [_t]) => Some(Type::Function {
+            params: vec![Type::Unknown],
+            ret: Box::new(Type::Generic(
+                "Result".into(),
+                vec![Type::Unknown, Type::Unknown],
+            )),
+            variadic: false,
+        }),
+        ("Ok", "or_else", [t]) => Some(Type::Function {
+            params: vec![Type::Unknown],
+            ret: Box::new(Type::Generic("Ok".into(), vec![t.clone()])),
+            variadic: false,
+        }),
+        ("Err", "map", [e]) => Some(Type::Function {
+            params: vec![Type::Unknown],
+            ret: Box::new(Type::Generic("Err".into(), vec![e.clone()])),
+            variadic: false,
+        }),
+        ("Err", "map_err", [_e]) => Some(Type::Function {
+            params: vec![Type::Unknown],
+            ret: Box::new(Type::Generic("Err".into(), vec![Type::Unknown])),
+            variadic: false,
+        }),
+        ("Err", "and_then", [e]) => Some(Type::Function {
+            params: vec![Type::Unknown],
+            ret: Box::new(Type::Generic("Err".into(), vec![e.clone()])),
+            variadic: false,
+        }),
+        ("Err", "or_else", [_e]) => Some(Type::Function {
+            params: vec![Type::Unknown],
+            ret: Box::new(Type::Generic(
+                "Result".into(),
+                vec![Type::Unknown, Type::Unknown],
+            )),
+            variadic: false,
+        }),
+        ("Result", "map", [_t, e]) => Some(Type::Function {
+            params: vec![Type::Unknown],
+            ret: Box::new(Type::Generic(
+                "Result".into(),
+                vec![Type::Unknown, e.clone()],
+            )),
+            variadic: false,
+        }),
+        ("Result", "map_err", [t, _e]) => Some(Type::Function {
+            params: vec![Type::Unknown],
+            ret: Box::new(Type::Generic(
+                "Result".into(),
+                vec![t.clone(), Type::Unknown],
+            )),
+            variadic: false,
+        }),
+        ("Result", "and_then", _) | ("Result", "or_else", _) => Some(Type::Function {
+            params: vec![Type::Unknown],
+            ret: Box::new(Type::Generic(
+                "Result".into(),
+                vec![Type::Unknown, Type::Unknown],
+            )),
+            variadic: false,
+        }),
         _ => None,
     }
 }
@@ -8793,9 +8904,16 @@ fn extract_sealed_union_variants(expr: &Expr) -> Option<Vec<String>> {
     while let Some(current) = stack.pop() {
         match current {
             Expr::Name(n) => names.push(n.id.as_str().to_owned()),
+            // Push `right` first so the stack pops left-to-right and
+            // preserves source order in `names`. `A | B | C` parses as
+            // `BinOp(BinOp(A, B), C)`, so popping leftmost first walks
+            // A, B, C in spec order. Reverse order silently worked for
+            // downstream consumers (they use the set, not the order)
+            // but would surface as wrong if a future feature surfaces
+            // the variant list. PR #129 gemini review.
             Expr::BinOp(b) if matches!(b.op, Operator::BitOr) => {
-                stack.push(&b.left);
                 stack.push(&b.right);
+                stack.push(&b.left);
             }
             _ => return None,
         }
@@ -11494,6 +11612,71 @@ match s:
         assert!(
             msg.contains("Triangle"),
             "error should name missing variant Triangle, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn result_map_err_preserves_ok_payload_type() {
+        // R2-6 follow-up (PR #129 copilot review): `Result[T, E].map_err(f)`
+        // must type as `Result[T, ?]` — the Ok payload `T` is preserved
+        // and only the error slot collapses to Unknown. Assigning the
+        // chain result to a non-Result type then trips type_mismatch.
+        let src = "\
+def report(e: str) -> int:
+    return -1
+
+def stage() -> Result[int, str]:
+    return Ok(42)
+
+let r: Result[int, int] = stage().map_err(report)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "Result[T, E].map_err must produce Result[T, ?]: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn result_map_err_chain_type_checks_against_unrelated_target() {
+        // The chain result must NOT silently flow into an unrelated
+        // type (the failure mode the reviewer warned about: Unknown
+        // is assignable to anything, so without this fix the line
+        // below would pass clean instead of tripping type_mismatch).
+        let src = "\
+def report(e: str) -> int:
+    return -1
+
+def stage() -> Result[int, str]:
+    return Ok(42)
+
+let bad: int = stage().map_err(report)
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "assigning a Result chain to int must fire type_mismatch: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn ok_map_returns_ok_shape() {
+        // `Ok[T].map(f)` returns Ok[?] — assignable to Result[U, E].
+        let src = "\
+def double(x: int) -> int:
+    return x * 2
+
+let r: Result[int, str] = Ok(1).map(double)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "Ok[T].map(f) must produce something assignable to Result[U, E]: {:?}",
+            d.errors()
         );
     }
 

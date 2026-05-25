@@ -260,9 +260,15 @@ pub fn run(args: CheckArgs) -> Result<()> {
 
                 // R2-4: same stdlib-name shadow check for `.dty` stubs
                 // (the implementation module they describe is emitted
-                // under the same stem).
-                if let Some(warning) = check_stdlib_module_shadow(&path, &source) {
-                    diags.push_warning(warning);
+                // under the same stem). Gated on `has_project_config`
+                // to match the `.ty` branch above — a standalone
+                // `tyc check --stubs path/to/types.dty` outside a
+                // project context emits no `build/` so the runtime
+                // collision can't happen. PR #129 copilot review.
+                if has_project_config {
+                    if let Some(warning) = check_stdlib_module_shadow(&path, &source) {
+                        diags.push_warning(warning);
+                    }
                 }
 
                 // Find the implementation module by stem.  Prefer a sibling

@@ -1,0 +1,95 @@
+from cluster import Cluster, new_cluster
+from ids import ClientReqId, NodeId
+from node import Node
+from rpc import (
+    Message,
+    make_client_get,
+    make_client_put,
+)
+
+
+def _await_leader(cluster: Cluster, max_steps: int, dt: float) -> NodeId?:
+    mut step: int = 0
+    while step < max_steps:
+        cluster.step(dt)
+        let leader_opt: NodeId? = cluster.find_leader()
+        if leader_opt is not None:
+            return leader_opt
+        step = step + 1
+    return None
+
+
+def _drain(cluster: Cluster, steps: int, dt: float) -> None:
+    mut i: int = 0
+    while i < steps:
+        cluster.step(dt)
+        i = i + 1
+
+
+def main() -> None:
+    print("=== Typhon Raft-lite KV ===")
+    let start: float = 0.0
+    let cluster: Cluster = new_cluster(3, start)
+    print("initial:")
+    print(cluster.snapshot())
+
+    let leader_opt: NodeId? = _await_leader(cluster, 200, 0.020)
+    if leader_opt is None:
+        print("no leader elected within budget")
+        print(cluster.snapshot())
+        return
+
+    let leader: NodeId = leader_opt
+    print(f"\nleader elected: node {int(leader)}")
+    print(cluster.snapshot())
+
+    # Submit a batch of client puts and one delete.
+    let puts: list[tuple[int, str, str]] = [
+        (1, "k1", "v1"),
+        (2, "k2", "v2"),
+        (3, "k1", "v3"),
+        (4, "k4", "v4"),
+    ]
+    for p in puts:
+        let (rid, put_key, put_val) = p
+        let msg: Message = make_client_put(ClientReqId(rid), put_key, put_val)
+        cluster.submit(msg)
+
+    # Let entries replicate + commit.
+    _drain(cluster, 80, 0.020)
+
+    print("\nafter client puts:")
+    print(cluster.snapshot())
+
+    # Read back via the leader.
+    let current_leader_opt: NodeId? = cluster.find_leader()
+    if current_leader_opt is not None:
+        let get_msg: Message = make_client_get(ClientReqId(101), "k1")
+        cluster.submit(get_msg)
+        let get_msg_2: Message = make_client_get(ClientReqId(102), "k2")
+        cluster.submit(get_msg_2)
+
+    _drain(cluster, 40, 0.020)
+
+    print("\nclient replies:")
+    print(cluster.dump_client_replies())
+
+    # Show leader's store contents
+    let leader_now_opt: NodeId? = cluster.find_leader()
+    if leader_now_opt is not None:
+        let leader_now: NodeId = leader_now_opt
+        let leader_node: Node = cluster.nodes[int(leader_now)]
+        print(f"\nleader (node {int(leader_now)}) store contents:")
+        mut keys: list[str] = []
+        for store_key in leader_node.store.data:
+            keys.append(store_key)
+        keys.sort()
+        for sk in keys:
+            let sv: str = leader_node.store.data[sk]
+            print(f"  {sk} = {sv}")
+
+    print("\nfinal:")
+    print(cluster.snapshot())
+
+
+main()

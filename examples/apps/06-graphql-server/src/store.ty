@@ -1,0 +1,107 @@
+from ids import CommentId, PostId, UserId
+from schema import Comment, Post, User
+
+
+pub class Store:
+    users: dict[int, User]
+    posts: dict[int, Post]
+    comments: dict[int, Comment]
+
+
+impl Store:
+    def find_user(self, uid: UserId) -> User?:
+        return self.users.get(int(uid))
+
+    def find_users_by_role(self, role: str) -> list[User]:
+        mut out: list[User] = []
+        for (_, u) in self.users.items():
+            if u.role == role:
+                out.append(u)
+        return out
+
+    def all_users(self) -> list[User]:
+        mut out: list[User] = []
+        for (_, u) in self.users.items():
+            out.append(u)
+        return out
+
+    def find_post(self, pid: PostId) -> Post?:
+        return self.posts.get(int(pid))
+
+    def find_posts_by_author(self, uid: UserId) -> list[Post]:
+        mut out: list[Post] = []
+        let target: int = int(uid)
+        for (_, p) in self.posts.items():
+            if int(p.author) == target:
+                out.append(p)
+        return out
+
+    def all_posts(self) -> list[Post]:
+        mut out: list[Post] = []
+        for (_, p) in self.posts.items():
+            out.append(p)
+        return out
+
+    def find_comments_by_post(self, pid: PostId) -> list[Comment]:
+        mut out: list[Comment] = []
+        let target: int = int(pid)
+        for (_, c) in self.comments.items():
+            if int(c.post) == target:
+                out.append(c)
+        return out
+
+    def batch_load_users(self, ids: list[int]) -> dict[int, User]:
+        mut out: dict[int, User] = {}
+        for i in ids:
+            let u: User? = self.users.get(i)
+            if u is not None:
+                out[i] = u
+        return out
+
+    def batch_load_posts(self, ids: list[int]) -> dict[int, Post]:
+        mut out: dict[int, Post] = {}
+        for i in ids:
+            let p: Post? = self.posts.get(i)
+            if p is not None:
+                out[i] = p
+        return out
+
+
+pub def seed_store() -> Store:
+    let users: dict[int, User] = {
+        1: User(id=UserId(1), name="Ada Lovelace",   email="ada@example.com",   role="admin"),
+        2: User(id=UserId(2), name="Alan Turing",    email="alan@example.com",  role="admin"),
+        3: User(id=UserId(3), name="Grace Hopper",   email="grace@example.com", role="user"),
+        4: User(id=UserId(4), name="Linus Torvalds", email="linus@example.com", role="user"),
+        5: User(id=UserId(5), name="Margaret Hamilton", email="meg@example.com", role="user"),
+    }
+    let posts: dict[int, Post] = {
+        101: Post(id=PostId(101), author=UserId(1), title="On the Analytical Engine", body="A note on Babbage's design."),
+        102: Post(id=PostId(102), author=UserId(1), title="Notes G",                   body="The first algorithm."),
+        103: Post(id=PostId(103), author=UserId(2), title="Computable Numbers",        body="On computable real numbers."),
+        104: Post(id=PostId(104), author=UserId(2), title="The Imitation Game",        body="Can machines think?"),
+        105: Post(id=PostId(105), author=UserId(3), title="A-0 Compiler",              body="Translating math to machine code."),
+        106: Post(id=PostId(106), author=UserId(3), title="COBOL Origins",             body="Business-oriented language."),
+        107: Post(id=PostId(107), author=UserId(4), title="Linux 0.01",                body="Just a hobby, won't be big."),
+        108: Post(id=PostId(108), author=UserId(4), title="Git Internals",             body="Content-addressable storage."),
+        109: Post(id=PostId(109), author=UserId(5), title="Apollo Guidance",           body="Software for the moon."),
+        110: Post(id=PostId(110), author=UserId(5), title="Software Engineering",      body="Coining the term."),
+    }
+    let comments: dict[int, Comment] = {
+        1001: Comment(id=CommentId(1001), post=PostId(101), author=UserId(2), body="Brilliant analysis."),
+        1002: Comment(id=CommentId(1002), post=PostId(101), author=UserId(3), body="A foundational read."),
+        1003: Comment(id=CommentId(1003), post=PostId(102), author=UserId(2), body="The first program!"),
+        1004: Comment(id=CommentId(1004), post=PostId(103), author=UserId(1), body="Inspired my work."),
+        1005: Comment(id=CommentId(1005), post=PostId(104), author=UserId(5), body="A profound question."),
+        1006: Comment(id=CommentId(1006), post=PostId(105), author=UserId(4), body="Compilers everywhere."),
+        1007: Comment(id=CommentId(1007), post=PostId(106), author=UserId(1), body="Business needs structure."),
+        1008: Comment(id=CommentId(1008), post=PostId(107), author=UserId(3), body="Hobbies become history."),
+        1009: Comment(id=CommentId(1009), post=PostId(108), author=UserId(2), body="Elegant model."),
+        1010: Comment(id=CommentId(1010), post=PostId(109), author=UserId(1), body="Heroic effort."),
+        1011: Comment(id=CommentId(1011), post=PostId(109), author=UserId(2), body="The math is beautiful."),
+        1012: Comment(id=CommentId(1012), post=PostId(110), author=UserId(4), body="Defined a discipline."),
+        1013: Comment(id=CommentId(1013), post=PostId(110), author=UserId(3), body="A career-defining term."),
+        1014: Comment(id=CommentId(1014), post=PostId(102), author=UserId(5), body="Stunning for 1843."),
+        1015: Comment(id=CommentId(1015), post=PostId(108), author=UserId(5), body="Snapshots all the way down."),
+    }
+    return Store(users=users, posts=posts, comments=comments)

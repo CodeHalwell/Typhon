@@ -1,0 +1,109 @@
+from highlight import render_snippet
+from ids import DocId
+from index import Document, InvertedIndex, new_document, new_index
+from query import Query, QueryParseError, parse_query
+from scoring import BM25Params, ScoredHit, default_bm25
+from search import search
+
+
+def seed_corpus(idx: InvertedIndex) -> None:
+    let docs: list[Document] = [
+        new_document(
+            DocId(1),
+            "Typhon: a stricter Python",
+            "Typhon is a statically typed superset of Python that compiles to clean CPython. "
+            "Bindings are immutable by default and sealed unions enable exhaustive matching.",
+        ),
+        new_document(
+            DocId(2),
+            "Python data structures",
+            "Python dictionaries, lists and sets are the workhorses of everyday Python programming. "
+            "Dict comprehensions make transformation pleasant and readable.",
+        ),
+        new_document(
+            DocId(3),
+            "Rust ownership model",
+            "Rust uses an ownership and borrowing model to guarantee memory safety without garbage collection. "
+            "The borrow checker prevents data races at compile time.",
+        ),
+        new_document(
+            DocId(4),
+            "Async programming in Python",
+            "Async programming with asyncio in Python allows concurrent IO without threads. "
+            "Coroutines are scheduled by an event loop and can await other coroutines.",
+        ),
+        new_document(
+            DocId(5),
+            "Inverted indexes for search",
+            "An inverted index maps terms to the documents in which they appear. "
+            "Together with BM25 scoring it forms the backbone of classical full text search engines.",
+        ),
+        new_document(
+            DocId(6),
+            "BM25 ranking explained",
+            "BM25 extends TF-IDF with document length normalization and a saturation parameter k1. "
+            "It is the de facto baseline for ranked retrieval in modern search systems.",
+        ),
+        new_document(
+            DocId(7),
+            "Hash maps and tries",
+            "Hash maps offer average constant time lookup while tries enable prefix queries. "
+            "Both are foundational data structures for search and indexing.",
+        ),
+        new_document(
+            DocId(8),
+            "Static typing benefits",
+            "Static type systems catch entire categories of bugs before code runs. "
+            "Typhon brings this discipline to Python developers without sacrificing readability.",
+        ),
+    ]
+    for d in docs:
+        idx.add(d)
+
+
+def format_hit(idx: InvertedIndex, hit: ScoredHit) -> str:
+    let doc_opt = idx.doc(hit.doc_id)
+    if doc_opt is None:
+        return f"  [missing doc #{int(hit.doc_id)}]"
+    let doc: Document = doc_opt
+    let snippet: str = render_snippet(doc, hit.matched_terms, 18)
+    return f"  #{int(hit.doc_id)} score={hit.score:.4f} title=\"{doc.title}\"\n     {snippet}"
+
+
+def run_query(idx: InvertedIndex, params: BM25Params, raw: str) -> None:
+    print(f"\n>>> query: {raw}")
+    let parsed_result: Result[Query, QueryParseError] = parse_query(raw)
+    match parsed_result:
+        case Ok(q):
+            let hits: list[ScoredHit] = search(idx, q, params, 3)
+            if len(hits) == 0:
+                print("  (no results)")
+                return
+            for h in hits:
+                print(format_hit(idx, h))
+        case Err(e):
+            print(f"  parse error @ pos {e.pos}: {e.message}")
+
+
+def main() -> None:
+    let idx: InvertedIndex = new_index()
+    seed_corpus(idx)
+    idx.finalize()
+    print(
+        f"Indexed {idx.total_docs} documents, "
+        f"avg_doc_len={idx.avg_doc_len:.2f}, "
+        f"vocabulary={len(idx.postings)} terms"
+    )
+
+    let params: BM25Params = default_bm25()
+
+    run_query(idx, params, "python")
+    run_query(idx, params, "python AND search")
+    run_query(idx, params, "python OR rust")
+    run_query(idx, params, "search NOT bm25")
+    run_query(idx, params, "\"inverted index\"")
+    run_query(idx, params, "(python OR rust) AND typing")
+
+
+if __name__ == "__main__":
+    main()

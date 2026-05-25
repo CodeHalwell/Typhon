@@ -1,0 +1,4 @@
+pub newtype NodeId = int
+pub newtype Term = int
+pub newtype LogIndex = int
+pub newtype ClientReqId = int

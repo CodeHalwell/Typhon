@@ -1,0 +1,111 @@
+from ids import CommentId, PostId, UserId
+
+
+pub class User:
+    id: UserId
+    name: str
+    email: str
+    role: str
+
+
+pub class Post:
+    id: PostId
+    author: UserId
+    title: str
+    body: str
+
+
+pub class Comment:
+    id: CommentId
+    post: PostId
+    author: UserId
+    body: str
+
+
+pub type ResolvedField = FieldUser | FieldPost | FieldComment | FieldUserList | FieldPostList | FieldCommentList | FieldNull | FieldScalar | FieldObject
+
+
+pub class FieldUser:
+    user: User
+
+
+pub class FieldPost:
+    post: Post
+
+
+pub class FieldComment:
+    comment: Comment
+
+
+pub class FieldUserList:
+    items: list[User]
+
+
+pub class FieldPostList:
+    items: list[Post]
+
+
+pub class FieldCommentList:
+    items: list[Comment]
+
+
+pub class FieldNull:
+    placeholder: int
+
+
+pub class FieldScalar:
+    value: str
+
+
+pub class FieldObject:
+    fields: dict[str, ResolvedField]
+
+
+pub def make_field_user(u: User) -> ResolvedField:
+    return FieldUser(user=u)
+
+
+pub def make_field_post(p: Post) -> ResolvedField:
+    return FieldPost(post=p)
+
+
+pub def make_field_comment(c: Comment) -> ResolvedField:
+    return FieldComment(comment=c)
+
+
+pub def make_field_user_list(items: list[User]) -> ResolvedField:
+    return FieldUserList(items=items)
+
+
+pub def make_field_post_list(items: list[Post]) -> ResolvedField:
+    return FieldPostList(items=items)
+
+
+pub def make_field_comment_list(items: list[Comment]) -> ResolvedField:
+    return FieldCommentList(items=items)
+
+
+pub def make_field_null() -> ResolvedField:
+    return FieldNull(placeholder=0)
+
+
+pub def make_field_scalar(value: str) -> ResolvedField:
+    return FieldScalar(value=value)
+
+
+pub def make_field_object(fields: dict[str, ResolvedField]) -> ResolvedField:
+    return FieldObject(fields=fields)
+
+
+pub def field_kind(f: ResolvedField) -> str:
+    match f:
+        case FieldUser(_):         return "user"
+        case FieldPost(_):         return "post"
+        case FieldComment(_):      return "comment"
+        case FieldUserList(_):     return "user_list"
+        case FieldPostList(_):     return "post_list"
+        case FieldCommentList(_):  return "comment_list"
+        case FieldNull(_):         return "null"
+        case FieldScalar(_):       return "scalar"
+        case FieldObject(_):       return "object"
+    raise RuntimeError("unreachable")

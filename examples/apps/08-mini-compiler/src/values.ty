@@ -1,0 +1,108 @@
+from lang_ast import Expr, Param
+
+
+pub type Value = VInt | VFloat | VStr | VBool | VUnit | VFn
+
+
+pub class VInt frozen:
+    value: int
+
+
+pub class VFloat frozen:
+    value: float
+
+
+pub class VStr frozen:
+    value: str
+
+
+pub class VBool frozen:
+    value: bool
+
+
+pub class VUnit frozen:
+    placeholder: int = 0
+
+
+# Env and VFn form a recursive cycle (VFn holds an Env, Env's bindings
+# map to Value which includes VFn). Defining both in this file keeps the
+# cycle inside one module so Typhon's resolver doesn't have to break it.
+
+pub class Env:
+    bindings: dict[str, Value]
+    parent: Env?
+
+
+pub class VFn:
+    params: list[Param]
+    body: Expr
+    closure: Env
+
+
+impl Env:
+    def lookup(self, name: str) -> Value?:
+        let here: Value? = self.bindings.get(name)
+        if here is not None:
+            return here
+        let par: Env? = self.parent
+        if par is None:
+            return None
+        return par.lookup(name)
+
+    def with_binding(self, name: str, v: Value) -> Env:
+        let child_bindings: dict[str, Value] = {name: v}
+        return Env(bindings=child_bindings, parent=self)
+
+
+pub def empty_env() -> Env:
+    let bs: dict[str, Value] = {}
+    return Env(bindings=bs, parent=None)
+
+
+# Factories — variant→union upcast across modules.
+
+pub def make_v_int(value: int) -> Value:
+    return VInt(value=value)
+
+
+pub def make_v_float(value: float) -> Value:
+    return VFloat(value=value)
+
+
+pub def make_v_str(value: str) -> Value:
+    return VStr(value=value)
+
+
+pub def make_v_bool(value: bool) -> Value:
+    return VBool(value=value)
+
+
+pub def make_v_unit() -> Value:
+    return VUnit()
+
+
+pub def make_v_fn(params: list[Param], body: Expr, closure: Env) -> Value:
+    return VFn(params=params, body=body, closure=closure)
+
+
+pub def value_label(v: Value) -> str:
+    match v:
+        case VInt(_):     return "int"
+        case VFloat(_):   return "float"
+        case VStr(_):     return "str"
+        case VBool(_):    return "bool"
+        case VUnit(_):    return "unit"
+        case VFn(_, _, _): return "fn"
+    raise RuntimeError("unreachable")
+
+
+pub def value_to_str(v: Value) -> str:
+    match v:
+        case VInt(iv):       return str(iv)
+        case VFloat(fv):     return str(fv)
+        case VStr(sv):       return sv
+        case VBool(bv):
+            return "true" if bv else "false"
+        case VUnit(_):       return "()"
+        case VFn(ps, _, _):  return f"<fn/{len(ps)}>"
+    raise RuntimeError("unreachable")
