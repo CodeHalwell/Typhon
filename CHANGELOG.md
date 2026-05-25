@@ -4,6 +4,53 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased — Round-3 frontier follow-up
+
+Extends the round-3 sweep with the three pieces originally deferred:
+
+### Fixed — checker
+
+- **R3-15: cross-module generic method dispatch propagates class
+  TypeVars.** `s: Stream[int].map(f)` now records
+  `Callable[[int], U]` as the expected parameter (not
+  `Callable[[T], U]`) and returns `Stream[U]` bound at the call
+  site via the existing PEP 695 inference. Two root causes:
+  (1) the attribute-access path had no `Type::Generic(head, args)`
+  arm and fell through to `Type::Unknown`; (2) `collect_class_shape`
+  only passed the *method's* type-params to the annotation walker,
+  so `T` in a method signature was captured as `Type::Class("T")`
+  instead of `Type::TypeVar("T")` and substitution was a no-op.
+  Same fix benefits field access — `let r: RecordEnv[int]; r.payload`
+  is now `int`, not the bare `T`.
+
+### Feature — `pub`
+
+- **`pub *` aggregates sibling `pub` names through `__init__.ty`.**
+  Opt-in package-level marker: a single `pub *` in `__init__.ty`
+  tells the build pipeline to walk every sibling `.ty` submodule's
+  `pub` declarations, synthesise `from .submodule import …` lines
+  into the emitted `__init__.py`, and extend `__all__`. Deterministic
+  alphabetical order by submodule basename; same-name collisions
+  emit a `pub_name_collision` warning (first sibling wins; package-
+  level `pub` always overrides). Outside `__init__.ty` the marker
+  is a no-op with a stderr advice pointing at the wrong-place use.
+  Opt-in only — packages without `pub *` keep the existing explicit
+  behaviour, so no project changes shape unsolicited.
+
+### Docs
+
+- **R3-10: parametric sealed unions are documented.** New section in
+  `docs/guides/07-sealed-unions-and-match.md` walks
+  `type EventEnvelope[T] = RecordEnv[T] | WatermarkEnv | BarrierEnv`
+  end-to-end — already supported by the checker, just unknown to
+  users avoiding the pattern.
+- **R3-7: argparse-with-typed-dataclass-adapter pattern documented.**
+  New section in `docs/guides/10-advanced-features.md` shows how to
+  cross the `argparse.Namespace` Any boundary exactly once by
+  building a typed `class Args:` from the parsed namespace, plus the
+  subcommand variant via sealed unions. Pure docs — no new compiler
+  feature.
+
 ## Unreleased — Round-3 sweep
 
 Apps-feedback round-3 fix batch. Each item below has a one-line

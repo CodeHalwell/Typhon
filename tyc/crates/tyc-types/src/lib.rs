@@ -4487,6 +4487,17 @@ fn has_contextmanager_decorator(decorators: &[ruff_python_ast::Decorator]) -> bo
 /// rather than landing as `Type::Unknown`.
 fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -> InterfaceShape {
     let mut shape = InterfaceShape::default();
+    // R3-15 (2026-05-25): the enclosing class's PEP 695 type
+    // parameters are in scope for every method body, so a method
+    // signature like `def map[U](self, f: Callable[[T], U])` needs
+    // to see `T` (from `class Stream[T]:` / `impl[T] Stream[T]:`)
+    // as a TypeVar — not as `Type::Class("T")`. Previously only the
+    // method's own `[U]` was passed to `type_from_annotation_*`,
+    // so unsubstituted `T` survived in the recorded signature and
+    // the new `Type::Generic` attribute-access arm had nothing to
+    // substitute against, leaving `Stream[int].map(f)` typed as
+    // `Stream[U]` (effectively `Stream[object]`).
+    let class_tps = type_param_names_from(cd.type_params.as_deref());
     for stmt in &cd.body {
         match stmt {
             // Ruff folds `async def` into `Stmt::FunctionDef` with `is_async = true`.
@@ -4504,8 +4515,20 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
                 } else {
                     method_arity_excluding_receiver(f.parameters.as_ref())
                 };
+                // Combine the class's type params with the method's
+                // own — both are in scope for the method's signature
+                // (R3-15). Class tps come first so they shadow a
+                // method-local tp of the same name only when one
+                // exists, which matches PEP 695's scope nesting.
+                let method_tps = type_param_names_from(f.type_params.as_deref());
+                let mut tps: Vec<String> = class_tps.clone();
+                for t in &method_tps {
+                    if !tps.contains(t) {
+                        tps.push(t.clone());
+                    }
+                }
                 let return_type = match f.returns.as_deref() {
-                    Some(r) => type_from_annotation(r, classes),
+                    Some(r) => type_from_annotation_with_params(r, classes, &tps),
                     None => Type::Unknown,
                 };
                 let is_property = f.decorator_list.iter().any(|d| match &d.expression {
@@ -4516,7 +4539,6 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
                     Expr::Attribute(a) => matches!(a.attr.as_str(), "property" | "cached_property"),
                     _ => false,
                 });
-                let tps = type_param_names_from(f.type_params.as_deref());
                 let full_arity = arity_info_from_parameters(f.parameters.as_ref(), classes, &tps);
                 // Drop the implicit receiver (`self` / `cls`) from the
                 // method's arity surface so call sites can match argument
@@ -4560,7 +4582,14 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
             }
             Stmt::AnnAssign(a) => {
                 if let Expr::Name(n) = a.target.as_ref() {
-                    let ty = type_from_annotation(&a.annotation, classes);
+                    // R3-15: same scope rule — `class RecordEnv[T]:
+                    // payload: T` needs `T` recognised as the
+                    // class's TypeVar so the field's recorded type
+                    // is `TypeVar("T")` and downstream attribute
+                    // access on `RecordEnv[int]` can substitute it
+                    // to `Int`. Without `class_tps`, the annotation
+                    // walker would coerce `T` to `Type::Class("T")`.
+                    let ty = type_from_annotation_with_params(&a.annotation, classes, &class_tps);
                     let name = n.id.as_str().to_owned();
                     if !shape.fields.contains_key(&name) {
                         shape.field_order.push(name.clone());
@@ -8522,6 +8551,76 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // Not found — class may have dynamic attrs; no error.
                     Type::Unknown
                 }
+                // R3-15 (2026-05-25): `s: Stream[int]` calling
+                // `.map(f)` needs the recorded `T` substituted with
+                // `int` before the call-site inference engine
+                // unifies the method's own TypeVars (e.g. `U`). Look
+                // up the method on the head class, build a binding
+                // map from the class's declared type-params to the
+                // receiver's actual type arguments, then substitute
+                // through both `param_types` and `return_type` so the
+                // returned `Type::Function` carries `Callable[[int],
+                // U]` rather than `Callable[[T], U]`. Without this
+                // path, the attribute access fell through to the
+                // `_ => Type::Unknown` arm and `Stream[T].map[U](f)`
+                // dispatch silently produced `Type::Unknown`,
+                // accepting both same- and cross-module wrong
+                // annotations.
+                Type::Generic(head, args) => {
+                    let class_name = head.clone();
+                    let actual_args = args.clone();
+                    if let Some(sig) = c.find_method(class_name.as_str(), attr_name).cloned() {
+                        // Build T → actual binding from the class's
+                        // declared parameter names. Mismatched arity
+                        // (declared `[T, U]` but called as `Foo[int]`)
+                        // is silently ignored — the missing slots just
+                        // leave the corresponding TypeVar free, which
+                        // the call-site inference can still bind from
+                        // the actual argument types.
+                        let bindings: std::collections::HashMap<String, Type> = c
+                            .class_type_params
+                            .get(class_name.as_str())
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .zip(actual_args.into_iter())
+                            .collect();
+                        if sig.is_property {
+                            return substitute_typevars(&sig.return_type, &bindings);
+                        }
+                        let params: Vec<Type> = sig
+                            .param_types
+                            .iter()
+                            .map(|p| substitute_typevars(p, &bindings))
+                            .collect();
+                        let mut params = params;
+                        if params.len() < sig.arity {
+                            params.resize(sig.arity, Type::Unknown);
+                        }
+                        let ret = substitute_typevars(&sig.return_type, &bindings);
+                        return Type::Function {
+                            params,
+                            ret: Box::new(ret),
+                            variadic: false,
+                        };
+                    }
+                    if let Some(field_type) = c.find_field(class_name.as_str(), attr_name) {
+                        // Field types can mention the class's
+                        // TypeVars too — `payload: T` on
+                        // `RecordEnv[T]` resolves to whatever the
+                        // receiver's `T` was instantiated with.
+                        let bindings: std::collections::HashMap<String, Type> = c
+                            .class_type_params
+                            .get(class_name.as_str())
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .zip(args.iter().cloned())
+                            .collect();
+                        return substitute_typevars(field_type, &bindings);
+                    }
+                    Type::Unknown
+                }
                 Type::TypeVar(tv_name) => {
                     // TypeVar with a declared bound — look up the attribute in
                     // the bound's class/interface hierarchy.
@@ -11363,6 +11462,75 @@ async def with_match() -> int:
                 .iter()
                 .any(|e| matches!(e, TycError::MissingReturn { .. })),
             "async with exhaustive match tail must satisfy missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn generic_method_dispatch_substitutes_class_typevars() {
+        // R3-15: `s: Stream[int].map(to_str)` needs `T` substituted
+        // with `int` in the recorded method signature before the
+        // call-site inference engine binds the method's own `U` from
+        // the actual `to_str` callable type. Without the substitution
+        // path the method's return type stayed `Stream[U]` /
+        // effectively `Stream[object]`, accepting wrong annotations.
+        let src = "\
+from typing import Callable
+
+class Stream[T]:
+    items: list[T]
+
+impl[T] Stream[T]:
+    def map[U](self, f: Callable[[T], U]) -> Stream[U]:
+        return Stream(items=[f(x) for x in self.items])
+    def collect(self) -> list[T]:
+        return self.items
+
+def to_str(x: int) -> str:
+    return str(x)
+
+def consume_int_list(xs: list[int]) -> None:
+    pass
+
+def main() -> None:
+    let s: Stream[int] = Stream(items=[1, 2, 3])
+    let mapped = s.map(to_str)
+    let result = mapped.collect()
+    consume_int_list(result)
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "generic method dispatch must propagate U: list[str] should fail to assign to list[int]: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn generic_field_access_substitutes_class_typevars() {
+        // R3-15 follow-on: field access on a generic instance must
+        // also substitute the class's TypeVars. `let r: RecordEnv[int]`
+        // calling `.payload` should resolve to `int`, not the bare
+        // `T`.
+        let src = "\
+class RecordEnv[T]:
+    payload: T
+
+def consume_str(s: str) -> None:
+    pass
+
+def main() -> None:
+    let r: RecordEnv[int] = RecordEnv(payload=42)
+    consume_str(r.payload)
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "generic field access must propagate T: int field should fail to assign to str: {:?}",
             d.errors()
         );
     }

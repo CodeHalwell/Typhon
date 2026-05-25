@@ -204,6 +204,56 @@ def display(t: Token) -> str:
 
 Add a `Star` variant for multiplication and every `match` on `Token` fails to compile until you handle it. The compiler becomes your TODO list.
 
+## Parametric sealed unions (R3-10)
+
+A sealed union can be parametric — useful for stream / reactive engines
+where a wrapper carries a payload type that's stable across every
+`Record` envelope but absent on control envelopes:
+
+```python
+class RecordEnv[T]:
+    payload: T
+
+class WatermarkEnv:
+    timestamp: int
+
+class BarrierEnv:
+    id: int
+
+type EventEnvelope[T] = RecordEnv[T] | WatermarkEnv | BarrierEnv
+
+def extract_payload[T](e: EventEnvelope[T]) -> T?:
+    match e:
+        case RecordEnv(payload):
+            return payload
+        case WatermarkEnv(_):
+            return None
+        case BarrierEnv(_):
+            return None
+```
+
+`extract_payload(env)` where `env: EventEnvelope[int]` returns `int?`
+— the type parameter flows through the alias to the binding, through
+the match's `case RecordEnv(payload)`, and out as the function's
+return type. The non-parametric variants (`WatermarkEnv`,
+`BarrierEnv`) don't reference `T` at all, so they coexist with
+`RecordEnv[T]` without infecting them.
+
+Build, check, and `match`-exhaustiveness all work the same way as for
+the non-parametric `type Shape = Circle | Rectangle | Triangle` form.
+
+When using a parametric variant directly as a return type from a
+generic function, write the annotation at the call site:
+
+```python
+def make_record[T](v: T) -> EventEnvelope[T]:
+    return RecordEnv(payload=v)
+```
+
+The constructor call `RecordEnv(payload=v)` is treated as
+`RecordEnv[T]`, which is structurally assignable to `EventEnvelope[T]`
+because the alias is just `RecordEnv[T] | …`.
+
 ## Sealed unions vs inheritance
 
 You can model "shape" with inheritance — `class Shape:` plus `class Circle(Shape): ...`. Two reasons to prefer a sealed union:
