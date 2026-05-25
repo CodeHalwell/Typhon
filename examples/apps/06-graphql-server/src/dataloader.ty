@@ -39,14 +39,8 @@ impl[K, V] DataLoader[K, V]:
         self.cache[key] = value
 
     def clear(self, key: K) -> None:
-        # Rebuild the cache without the key. Avoids `del` (rarely exercised
-        # by Round 1 code) and avoids `dict.pop`-with-default whose generic
-        # return type is tricky to annotate when V is a type parameter.
-        mut next_cache: dict[K, V] = {}
-        for (k, v) in self.cache.items():
-            if k != key:
-                next_cache[k] = v
-        self.cache = next_cache
+        if key in self.cache:
+            del self.cache[key]
 
     def clear_all(self) -> None:
         self.cache = {}

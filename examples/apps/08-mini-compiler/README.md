@@ -43,8 +43,8 @@ with the offending span).
 
 - **Recursive sealed unions**: `Expr` has 13 variants (8 self-recursive).
   Every match arm carries the right number of positional patterns.
-- **Cross-module sealed unions**: `Expr` (ast.ty), `Token` (tokens.ty),
-  `Ty` (types.ty), `Value` (values.ty) are all consumed across modules,
+- **Cross-module sealed unions**: `Expr` (lang_ast.ty), `Token` (tokens.ty),
+  `Ty` (lang_types.ty), `Value` (values.ty) are all consumed across modules,
   so every variant has a factory in its defining module to bridge the
   variant→union upcast gap.
 - **Recursive class graph**: `Env` holds `dict[str, Value]`, and `VFn`
@@ -67,9 +67,11 @@ src/
   source.ty   # Span, Source, line/col helpers
   tokens.ty   # Token sealed union (9 variants) + factories
   lexer.ty    # Source -> Result[list[Token], LexError]
-  ast.ty      # Expr sealed union (13 variants) + factories
-  parser.ty   # tokens -> Result[Expr, ParseError] via Pratt
-  types.ty    # Ty sealed union, TypeEnv, check()
+  lang_ast.ty   # Expr sealed union (13 variants) + factories
+                # (renamed from ast.ty — `ast` is a stdlib module, see TYPHON_FEEDBACK R2-4)
+  parser.ty     # tokens -> Result[Expr, ParseError] via Pratt
+  lang_types.ty # Ty sealed union, TypeEnv, check()
+                # (renamed from types.ty — `types` is a stdlib module, see TYPHON_FEEDBACK R2-4)
   values.ty   # Value sealed union, Env (recursive via VFn)
   eval.ty     # eval_expr(): Expr × Env -> Result[Value, EvalError]
   main.ty     # four sample programs, end-to-end
