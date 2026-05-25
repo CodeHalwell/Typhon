@@ -806,7 +806,13 @@ pub enum TycError {
     #[diagnostic(
         code(tyc::class_attr_shadows_slot),
         url("https://typhon.dev/lang/diagnostics/class_attr_shadows_slot"),
-        help("annotate each field as `ClassVar[T]` (from `typing`) so `@dataclass(slots=True)` excludes them from `__slots__`")
+        help(
+            "annotate each field as `ClassVar[T]` (from `typing`) so \
+             `@dataclass(slots=True)` excludes them from `__slots__`, OR \
+             — if this class is a nullary variant of a sealed union — drop \
+             the placeholder field entirely and use `class {class} frozen: \
+             pass` (R2-2)"
+        )
     )]
     ClassAttrShadowsSlot {
         class: String,
