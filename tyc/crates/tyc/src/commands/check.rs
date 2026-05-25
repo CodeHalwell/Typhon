@@ -212,6 +212,16 @@ pub fn run(args: CheckArgs) -> Result<()> {
             );
             diags.extend(file_diags);
 
+            // R2-4: warn if the module name collides with a Python
+            // stdlib module. Only fires when a `typhon.toml` is present —
+            // standalone-file checks skip the warning (no `build/` will
+            // be emitted, so the runtime collision can't happen).
+            if has_project_config {
+                if let Some(warning) = check_stdlib_module_shadow(&path, &source) {
+                    diags.push_warning(warning);
+                }
+            }
+
             // Run comptime + purity + (optionally) unknown-module
             // diagnostics in one pass so the preprocess+parse cycle is
             // only done once per file instead of once per analysis. On
@@ -247,6 +257,19 @@ pub fn run(args: CheckArgs) -> Result<()> {
                     &project_shapes,
                 );
                 diags.extend(file_diags);
+
+                // R2-4: same stdlib-name shadow check for `.dty` stubs
+                // (the implementation module they describe is emitted
+                // under the same stem). Gated on `has_project_config`
+                // to match the `.ty` branch above — a standalone
+                // `tyc check --stubs path/to/types.dty` outside a
+                // project context emits no `build/` so the runtime
+                // collision can't happen. PR #129 copilot review.
+                if has_project_config {
+                    if let Some(warning) = check_stdlib_module_shadow(&path, &source) {
+                        diags.push_warning(warning);
+                    }
+                }
 
                 // Find the implementation module by stem.  Prefer a sibling
                 // `.ty` (Typhon source) over a `.py` (raw Python) so users
@@ -489,6 +512,224 @@ fn unique_code_count(items: &[TycError]) -> usize {
         codes.insert(code);
     }
     codes.len()
+}
+
+/// Python 3.13 stdlib top-level module names. A project `.ty` file
+/// whose stem matches one of these will be emitted as `build/<name>.py`,
+/// and when `build/` is on `sys.path` (the default for `python
+/// build/main.py`) any transitive stdlib `import <name>` will resolve
+/// to the user module instead of the stdlib — leading to mystifying
+/// `ImportError`s blamed on innocent stdlib packages. R2-4.
+///
+/// The list is intentionally restricted to top-level modules whose
+/// names collide with names users naturally pick for application
+/// modules. Subpackages (`urllib.parse`, `xml.etree`) are excluded
+/// because a top-level `.ty` file with that name is impossible.
+const STDLIB_TOP_LEVEL: &[&str] = &[
+    "abc",
+    "argparse",
+    "array",
+    "ast",
+    "asyncio",
+    "atexit",
+    "audioop",
+    "base64",
+    "bdb",
+    "bisect",
+    "builtins",
+    "bz2",
+    "calendar",
+    "cmath",
+    "cmd",
+    "code",
+    "codecs",
+    "codeop",
+    "collections",
+    "colorsys",
+    "compileall",
+    "concurrent",
+    "configparser",
+    "contextlib",
+    "contextvars",
+    "copy",
+    "copyreg",
+    "cProfile",
+    "csv",
+    "ctypes",
+    "curses",
+    "dataclasses",
+    "datetime",
+    "dbm",
+    "decimal",
+    "difflib",
+    "dis",
+    "doctest",
+    "email",
+    "encodings",
+    "enum",
+    "errno",
+    "faulthandler",
+    "fcntl",
+    "filecmp",
+    "fileinput",
+    "fnmatch",
+    "fractions",
+    "ftplib",
+    "functools",
+    "gc",
+    "getopt",
+    "getpass",
+    "gettext",
+    "glob",
+    "graphlib",
+    "gzip",
+    "hashlib",
+    "heapq",
+    "hmac",
+    "html",
+    "http",
+    "imaplib",
+    "importlib",
+    "inspect",
+    "io",
+    "ipaddress",
+    "itertools",
+    "json",
+    "keyword",
+    "linecache",
+    "locale",
+    "logging",
+    "lzma",
+    "mailbox",
+    "marshal",
+    "math",
+    "mimetypes",
+    "mmap",
+    "modulefinder",
+    "multiprocessing",
+    "netrc",
+    "numbers",
+    "operator",
+    "optparse",
+    "os",
+    "pathlib",
+    "pdb",
+    "pickle",
+    "pickletools",
+    "pkgutil",
+    "platform",
+    "plistlib",
+    "poplib",
+    "posix",
+    "posixpath",
+    "pprint",
+    "profile",
+    "pstats",
+    "pty",
+    "pwd",
+    "py_compile",
+    "pyclbr",
+    "pydoc",
+    "queue",
+    "quopri",
+    "random",
+    "re",
+    "readline",
+    "reprlib",
+    "resource",
+    "rlcompleter",
+    "runpy",
+    "sched",
+    "secrets",
+    "select",
+    "selectors",
+    "shelve",
+    "shlex",
+    "shutil",
+    "signal",
+    "site",
+    "smtplib",
+    "socket",
+    "socketserver",
+    "sqlite3",
+    "ssl",
+    "stat",
+    "statistics",
+    "string",
+    "stringprep",
+    "struct",
+    "subprocess",
+    "symtable",
+    "sys",
+    "sysconfig",
+    "syslog",
+    "tabnanny",
+    "tarfile",
+    "telnetlib",
+    "tempfile",
+    "termios",
+    "test",
+    "textwrap",
+    "threading",
+    "time",
+    "timeit",
+    "tkinter",
+    "token",
+    "tokenize",
+    "tomllib",
+    "trace",
+    "traceback",
+    "tracemalloc",
+    "tty",
+    "turtle",
+    "types",
+    "typing",
+    "unicodedata",
+    "unittest",
+    "urllib",
+    "uu",
+    "uuid",
+    "venv",
+    "warnings",
+    "wave",
+    "weakref",
+    "webbrowser",
+    "winreg",
+    "winsound",
+    "wsgiref",
+    "xdrlib",
+    "xml",
+    "xmlrpc",
+    "zipapp",
+    "zipfile",
+    "zipimport",
+    "zlib",
+    "zoneinfo",
+];
+
+/// True when `name` is the top-level name of a Python stdlib module
+/// that would be shadowed by an emitted `build/<name>.py`.
+pub(crate) fn stdlib_top_level_contains(name: &str) -> bool {
+    STDLIB_TOP_LEVEL.contains(&name)
+}
+
+/// Emit a `stdlib_module_shadow` warning if `path`'s stem collides
+/// with a stdlib module name. The warning points at byte offset 0 of
+/// the file — the filename itself is the offending token, and the
+/// help text tells the user how to rename. R2-4.
+fn check_stdlib_module_shadow(path: &std::path::Path, source: &str) -> Option<TycError> {
+    let stem = path.file_stem()?.to_str()?;
+    if stdlib_top_level_contains(stem) {
+        Some(TycError::stdlib_module_shadow(
+            stem.to_owned(),
+            path.display().to_string(),
+            source.to_owned(),
+            0,
+            0,
+        ))
+    } else {
+        None
+    }
 }
 
 /// Run the secondary check passes — comptime evaluation, purity
@@ -845,6 +1086,46 @@ mod tests {
         let path = dir.join(name);
         std::fs::write(&path, content).unwrap();
         path
+    }
+
+    #[test]
+    fn stdlib_module_shadow_detects_collision() {
+        // R2-4: project module named `types`, `ast`, `string` etc. must
+        // be flagged because `build/<name>.py` will shadow the stdlib.
+        assert!(stdlib_top_level_contains("types"));
+        assert!(stdlib_top_level_contains("ast"));
+        assert!(stdlib_top_level_contains("string"));
+        assert!(stdlib_top_level_contains("io"));
+        assert!(stdlib_top_level_contains("json"));
+        assert!(stdlib_top_level_contains("dataclasses"));
+    }
+
+    #[test]
+    fn stdlib_module_shadow_accepts_safe_names() {
+        // Names that don't collide with stdlib must not fire.
+        assert!(!stdlib_top_level_contains("lang_types"));
+        assert!(!stdlib_top_level_contains("models"));
+        assert!(!stdlib_top_level_contains("app"));
+        assert!(!stdlib_top_level_contains("scheduler"));
+    }
+
+    #[test]
+    fn stdlib_module_shadow_emits_warning_on_colliding_filename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_ty(tmp.path(), "types.ty", "pub class Foo:\n    x: int\n");
+        let diag = check_stdlib_module_shadow(&path, "pub class Foo:\n    x: int\n");
+        assert!(
+            diag.is_some(),
+            "expected a warning for a project module named `types`"
+        );
+    }
+
+    #[test]
+    fn stdlib_module_shadow_skips_disjoint_filename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_ty(tmp.path(), "lang_types.ty", "");
+        let diag = check_stdlib_module_shadow(&path, "");
+        assert!(diag.is_none());
     }
 
     #[test]

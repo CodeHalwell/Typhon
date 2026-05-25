@@ -33,4 +33,26 @@ class Limits:
     MAX_RETRIES: ClassVar[int] = 3
 ```
 
+## Alternative: nullary sealed-union variants
+
+If you're declaring nullary variants of a sealed union (R2-2 in
+apps-feedback), you do not need the `placeholder: int = 0` workaround any
+more — `pass` is accepted on a `frozen` class body:
+
+```ty
+pub class TyInt frozen:
+    pass
+
+pub class TyFloat frozen:
+    pass
+
+pub class TyStr frozen:
+    pass
+
+pub type Ty = TyInt | TyFloat | TyStr
+```
+
+Drop the placeholder fields and the warning disappears. Construction stays
+nullary: `TyInt()`, `TyFloat()`, `TyStr()`.
+
 See https://typhon.dev/lang/diagnostics/class_attr_shadows_slot

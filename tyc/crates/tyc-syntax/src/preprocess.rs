@@ -2238,9 +2238,14 @@ pub fn validate_question_ops(source: &str) -> Vec<QuestionOpError> {
             }
 
             // Detect a function definition and push its return type onto the stack.
-            // `pub` is a Typhon visibility modifier that may precede `def` /
-            // `async def`; strip it before pattern-matching the keyword.
-            let after_pub = trimmed.strip_prefix("pub ").unwrap_or(trimmed);
+            //
+            // `pub` is a visibility modifier that stacks with `def` / `async def`;
+            // strip it so `pub def f() -> Result[..]: ... x?` is recognised as
+            // being inside a function (R2-1). `trim_start` absorbs any extra
+            // whitespace between the modifier and the keyword (`pub  def`)
+            // so the detector doesn't depend on exact single-space spelling
+            // (PR #129 gemini review).
+            let after_pub = trimmed.strip_prefix("pub ").unwrap_or(trimmed).trim_start();
             if after_pub.starts_with("def ") || after_pub.starts_with("async def ") {
                 let ret_type = extract_return_type_text(code);
                 fn_stack.push((indent_len, ret_type));
@@ -7239,6 +7244,47 @@ mod tests {
     }
 
     #[test]
+    fn question_op_in_pub_def_result_function_is_valid() {
+        // R2-1: `pub def f() -> Result[T, E]: ... x?` must not be flagged
+        // as "? operator used at module level". The `pub` modifier stacks
+        // with `def` and the validator must see through it.
+        let src =
+            "pub def parse(s: str) -> Result[int, str]:\n    val n = int(s)?\n    return Ok(n)\n";
+        let errs = validate_question_ops(src);
+        assert!(
+            errs.is_empty(),
+            "pub def with Result return must accept `?`: {:?}",
+            errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn question_op_in_pub_async_def_result_function_is_valid() {
+        // R2-1: same fix must apply to `pub async def`.
+        let src =
+            "pub async def fetch() -> Result[int, str]:\n    val n = io()?\n    return Ok(n)\n";
+        let errs = validate_question_ops(src);
+        assert!(
+            errs.is_empty(),
+            "pub async def with Result return must accept `?`: {:?}",
+            errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn question_op_in_pub_def_none_function_is_error() {
+        // R2-1: the `pub` strip must not also lose the return-type check.
+        let src = "pub def run() -> None:\n    val x = load()?\n";
+        let errs = validate_question_ops(src);
+        assert_eq!(
+            errs.len(),
+            1,
+            "pub def returning None must still reject `?`: {:?}",
+            errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn question_op_nullable_sugar_not_flagged() {
         // `str?` ends with `?` but the char before is `r`, not `)`, so it is
         // type-sugar, not the propagation operator.
@@ -7248,46 +7294,21 @@ mod tests {
     }
 
     #[test]
-    fn question_op_valid_in_pub_def_result_function() {
-        // Regression: `pub def` was previously invisible to the function-scope
-        // tracker because the prefix-match only saw `def ` / `async def `.
-        // Every public, cross-module `?`-using function (the natural shape for
-        // resolver / parser / handler helpers) tripped a misleading
-        // `?` operator used at module level diagnostic. See PR #128, R2-1.
+    fn question_op_pub_def_tolerates_double_space() {
+        // PR #129 gemini review: the `pub` strip uses
+        // `strip_prefix("pub ").unwrap_or(trimmed).trim_start()` so the
+        // detection is robust to `pub  def` (double space). Without
+        // `.trim_start()` the second space would be consumed as part of
+        // the keyword check (`"def "` vs `" def "`) and the function
+        // would not register on `fn_stack`.
         let src =
-            "pub def parse(s: str) -> Result[int, str]:\n    val n = int(s)?\n    return Ok(n)\n";
+            "pub  def parse(s: str) -> Result[int, str]:\n    val n = int(s)?\n    return Ok(n)\n";
         let errs = validate_question_ops(src);
         assert!(
             errs.is_empty(),
-            "expected no errors, got: {:?}",
+            "pub def with extra whitespace must accept `?`: {:?}",
             errs.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
-    }
-
-    #[test]
-    fn question_op_valid_in_pub_async_def_result_function() {
-        let src = "pub async def load(s: str) -> Result[int, str]:\n    val n = await fetch(s)?\n    return Ok(n)\n";
-        let errs = validate_question_ops(src);
-        assert!(
-            errs.is_empty(),
-            "expected no errors, got: {:?}",
-            errs.iter().map(|e| &e.message).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn question_op_in_pub_def_none_returning_function_is_error() {
-        // The `pub`-prefix carve-out must still surface the wrong-return-type
-        // error: a `pub def f() -> None:` containing `?` is invalid.
-        let src = "pub def process() -> None:\n    val x = load()?\n";
-        let errs = validate_question_ops(src);
-        assert_eq!(
-            errs.len(),
-            1,
-            "expected one error, got: {:?}",
-            errs.iter().map(|e| &e.message).collect::<Vec<_>>()
-        );
-        assert!(errs[0].message.contains("None"), "got: {}", errs[0].message);
     }
 
     #[test]
