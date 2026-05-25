@@ -8583,7 +8583,7 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                             .cloned()
                             .unwrap_or_default()
                             .into_iter()
-                            .zip(actual_args.into_iter())
+                            .zip(actual_args)
                             .collect();
                         if sig.is_property {
                             return substitute_typevars(&sig.return_type, &bindings);
