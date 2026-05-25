@@ -4270,8 +4270,7 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                         // concrete-class arm above so a user can't
                         // declare `def kind` on both `impl Union:` and
                         // `impl Variant:` and have one silently win.
-                        let target_shape =
-                            c.class_shapes.get(variant).expect("checked above");
+                        let target_shape = c.class_shapes.get(variant).expect("checked above");
                         for s in &cd.body {
                             if let Stmt::FunctionDef(f) = s {
                                 let method = f.name.as_str();
@@ -4288,8 +4287,7 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                                 }
                             }
                         }
-                        let target_shape =
-                            c.class_shapes.get_mut(variant).expect("checked above");
+                        let target_shape = c.class_shapes.get_mut(variant).expect("checked above");
                         for (m, sig) in &impl_shape.methods {
                             target_shape
                                 .methods

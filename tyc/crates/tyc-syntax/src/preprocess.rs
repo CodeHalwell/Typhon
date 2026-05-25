@@ -7245,7 +7245,8 @@ mod tests {
         // R2-1: `pub def f() -> Result[T, E]: ... x?` must not be flagged
         // as "? operator used at module level". The `pub` modifier stacks
         // with `def` and the validator must see through it.
-        let src = "pub def parse(s: str) -> Result[int, str]:\n    val n = int(s)?\n    return Ok(n)\n";
+        let src =
+            "pub def parse(s: str) -> Result[int, str]:\n    val n = int(s)?\n    return Ok(n)\n";
         let errs = validate_question_ops(src);
         assert!(
             errs.is_empty(),
@@ -7257,7 +7258,8 @@ mod tests {
     #[test]
     fn question_op_in_pub_async_def_result_function_is_valid() {
         // R2-1: same fix must apply to `pub async def`.
-        let src = "pub async def fetch() -> Result[int, str]:\n    val n = io()?\n    return Ok(n)\n";
+        let src =
+            "pub async def fetch() -> Result[int, str]:\n    val n = io()?\n    return Ok(n)\n";
         let errs = validate_question_ops(src);
         assert!(
             errs.is_empty(),
