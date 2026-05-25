@@ -2,12 +2,12 @@ from ids import TemplateName
 from models import (
     Template,
     TplNode,
-    make_tn_block,
-    make_tn_expr,
-    make_tn_extends,
-    make_tn_for,
-    make_tn_if,
-    make_tn_text,
+    TnBlock,
+    TnExpr,
+    TnExtends,
+    TnFor,
+    TnIf,
+    TnText,
 )
 from tpl_lex import TplTok, TtExpr, TtTag, TtText, lex_template
 
@@ -69,10 +69,10 @@ def _parse_nodes(parser: TplParser, terminators: list[str]) -> Result[tuple[list
         match tok:
             case TtText(text, _):
                 parser.advance()
-                nodes.append(make_tn_text(text))
+                nodes.append(TnText(text))
             case TtExpr(body, _):
                 parser.advance()
-                nodes.append(make_tn_expr(body))
+                nodes.append(TnExpr(body))
             case TtTag(body, line):
                 let kind: str = _tag_kind(body)
                 for term in terminators:
@@ -97,7 +97,7 @@ def _parse_nodes(parser: TplParser, terminators: list[str]) -> Result[tuple[list
                                         else_body = pair_else[0]
                             elif term_then != "endif":
                                 return Err(TplParseError(line=line, detail="unterminated {% if %}"))
-                            nodes.append(make_tn_if(cond, then_body, else_body))
+                            nodes.append(TnIf(cond, then_body, else_body))
                 elif kind == "for":
                     parser.advance()
                     let args: str = _tag_args(body)
@@ -110,7 +110,7 @@ def _parse_nodes(parser: TplParser, terminators: list[str]) -> Result[tuple[list
                         case Err(e3):
                             return Err(e3)
                         case Ok(pair_for):
-                            nodes.append(make_tn_for(var_name, iter_name, pair_for[0]))
+                            nodes.append(TnFor(var_name, iter_name, pair_for[0]))
                 elif kind == "block":
                     parser.advance()
                     let block_name: str = _tag_args(body)
@@ -118,11 +118,11 @@ def _parse_nodes(parser: TplParser, terminators: list[str]) -> Result[tuple[list
                         case Err(e4):
                             return Err(e4)
                         case Ok(pair_blk):
-                            nodes.append(make_tn_block(block_name, pair_blk[0]))
+                            nodes.append(TnBlock(block_name, pair_blk[0]))
                 elif kind == "extends":
                     parser.advance()
                     let parent: str = _unquote_tpl(_tag_args(body))
-                    nodes.append(make_tn_extends(parent))
+                    nodes.append(TnExtends(parent))
                 else:
                     return Err(TplParseError(line=line, detail=f"unknown tag {kind!r}"))
     raise RuntimeError("unreachable")

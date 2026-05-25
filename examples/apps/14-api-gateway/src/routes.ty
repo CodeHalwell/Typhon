@@ -1,4 +1,4 @@
-from balancer import BalanceStrategy, make_round_robin
+from balancer import BalanceStrategy, StratRoundRobin
 from ids import RouteId, UpstreamId
 from upstream import Upstream
 
@@ -34,19 +34,6 @@ pub class MatchMethodMismatch:
     method: str
     allowed: list[str]
 
-
-pub def make_hit(route: Route) -> MatchResult:
-    return MatchHit(route=route)
-
-
-pub def make_miss(path: str) -> MatchResult:
-    return MatchMiss(path=path)
-
-
-pub def make_method_mismatch(route_id: RouteId, method: str, allowed: list[str]) -> MatchResult:
-    return MatchMethodMismatch(route_id=route_id, method=method, allowed=allowed)
-
-
 # Very small path glob: `/foo/*` matches a single segment, `/foo/**` matches
 # any suffix, otherwise exact-string match. No regex, no captures.
 pub def path_matches(glob: str, path: str) -> bool:
@@ -77,13 +64,13 @@ impl RouteTable:
         for r in self.routes:
             if path_matches(r.path_glob, path):
                 if method in r.methods:
-                    return make_hit(r)
+                    return MatchHit(r)
                 if method_mismatch_for is None:
                     method_mismatch_for = r
         let mm: Route? = method_mismatch_for
         if mm is not None:
-            return make_method_mismatch(mm.id, method, mm.methods)
-        return make_miss(path)
+            return MatchMethodMismatch(mm.id, method, mm.methods)
+        return MatchMiss(path)
 
 
 pub def new_route(
@@ -99,7 +86,7 @@ pub def new_route(
         methods=methods,
         path_glob=path_glob,
         upstreams=upstreams,
-        strategy=make_round_robin(),
+        strategy=StratRoundRobin(cursor=0),
         requires_auth=requires_auth,
         timeout_seconds=timeout_seconds,
     )

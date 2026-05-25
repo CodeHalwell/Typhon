@@ -42,15 +42,6 @@ pub class NotFound:
 pub class Backend:
     inner: StoreError
 
-
-pub def make_not_found(player: PlayerId) -> ProfileError:
-    return NotFound(player=player)
-
-
-pub def make_backend_err(inner: StoreError) -> ProfileError:
-    return Backend(inner=inner)
-
-
 pub class ProfileStore:
     db_path: Path
 
@@ -148,10 +139,10 @@ impl ProfileStore:
                     (int(pid),),
                 ).fetchone()
             if row is None:
-                return Err(make_not_found(pid))
+                return Err(NotFound(pid))
             return Ok(_row_to_profile(row, override_last_seen=None))
         except sqlite3.Error as e:
-            return Err(make_backend_err(StoreError(op="fetch", reason=str(e))))
+            return Err(Backend(StoreError(op="fetch", reason=str(e))))
 
     def save_match_result(
         self,

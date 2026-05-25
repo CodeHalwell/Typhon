@@ -12,15 +12,6 @@ pub class NodeList:
     args: dict[str, str]
     selections: list[QueryNode]
 
-
-pub def make_node_field(name: str, args: dict[str, str], selections: list[QueryNode]) -> QueryNode:
-    return NodeField(name=name, args=args, selections=selections)
-
-
-pub def make_node_list(name: str, args: dict[str, str], selections: list[QueryNode]) -> QueryNode:
-    return NodeList(name=name, args=args, selections=selections)
-
-
 pub def node_name(node: QueryNode) -> str:
     match node:
         case NodeField(name, _, _): return name
@@ -198,8 +189,8 @@ impl Parser:
         let args: dict[str, str] = self.parse_args()?
         let sels: list[QueryNode] = self.parse_selection_set()?
         if name in LIST_FIELDS:
-            return Ok(make_node_list(name, args, sels))
-        return Ok(make_node_field(name, args, sels))
+            return Ok(NodeList(name, args, sels))
+        return Ok(NodeField(name, args, sels))
 
 
 pub def parse_query(raw: str) -> Result[QueryNode, str]:

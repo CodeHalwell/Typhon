@@ -776,6 +776,66 @@ fn build_external_shapes(
             external.sealed_unions.insert(b.name.clone(), mapped);
         }
     }
+    // R1-#1 follow-up: variant→union upcasts need the union's variant
+    // table at the consumer site even when the union NAME wasn't
+    // imported. The factory-cleanup sweep over the apps removed the
+    // `make_event` factories that previously wrapped construction in
+    // a `-> SchedulerEvent` return type, exposing call sites that
+    // pass a bare variant constructor (`emit(WorkerStarted(...))`)
+    // into a function whose formal parameter is `SchedulerEvent`.
+    // Without this seeding, `c.sealed_unions["SchedulerEvent"]` is
+    // empty and the upcast fails — even though the formal's union
+    // name is visible to the consumer's checker via the function's
+    // imported signature.
+    //
+    // Walk every sealed union declared in every imported module: if
+    // ANY of its variants is imported into the consumer scope,
+    // populate `external.sealed_unions[union_name]` with the union's
+    // variant list (re-keyed through the per-module local-name map
+    // for the imported variants, source names as fallback). The
+    // union name itself is the source-module name (e.g.
+    // `SchedulerEvent`), matching the formal parameter type the
+    // checker sees on the cross-module function signature.
+    let mut modules_touched: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for b in bindings {
+        let Some(info) = &b.import_info else { continue };
+        if info.member.is_none() {
+            continue;
+        }
+        if !modules_touched.insert(info.module.clone()) {
+            continue;
+        }
+        let Some(module_shapes) = shapes_by_module.get(&info.module) else {
+            continue;
+        };
+        let remap = local_by_module.get(&info.module);
+        for (union_name, variants) in &module_shapes.sealed_unions {
+            // Skip if already populated (handled above when the union
+            // name itself was imported).
+            if external.sealed_unions.contains_key(union_name) {
+                continue;
+            }
+            // Only seed when at least one variant is imported here —
+            // otherwise the variant→union upcast wouldn't be reachable
+            // anyway and the extra entry would be dead weight.
+            let any_variant_imported = variants
+                .iter()
+                .any(|v| remap.map(|m| m.contains_key(v)).unwrap_or(false));
+            if !any_variant_imported {
+                continue;
+            }
+            let mapped: Vec<String> = variants
+                .iter()
+                .map(|v| {
+                    remap
+                        .and_then(|m| m.get(v))
+                        .cloned()
+                        .unwrap_or_else(|| v.clone())
+                })
+                .collect();
+            external.sealed_unions.insert(union_name.clone(), mapped);
+        }
+    }
     external
 }
 

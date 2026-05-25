@@ -4,118 +4,204 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## Unreleased — Round-3 frontier follow-up
+<<<<<<< HEAD
+## Unreleased
 
-Extends the round-3 sweep with the three pieces originally deferred:
+Carry-over sweep from the Round-3 apps-feedback campaign. Targets the
+remaining ergonomics gaps that survived v0.6.0 / v0.6.1.
 
-### Fixed — checker
+### Added — language & runtime
 
-- **R3-15: cross-module generic method dispatch propagates class
-  TypeVars.** `s: Stream[int].map(f)` now records
-  `Callable[[int], U]` as the expected parameter (not
-  `Callable[[T], U]`) and returns `Stream[U]` bound at the call
-  site via the existing PEP 695 inference. Two root causes:
-  (1) the attribute-access path had no `Type::Generic(head, args)`
-  arm and fell through to `Type::Unknown`; (2) `collect_class_shape`
-  only passed the *method's* type-params to the annotation walker,
-  so `T` in a method signature was captured as `Type::Class("T")`
-  instead of `Type::TypeVar("T")` and substitution was a no-op.
-  Same fix benefits field access — `let r: RecordEnv[int]; r.payload`
-  is now `int`, not the bare `T`.
+- **`pub *` wildcard re-export aggregation in `__init__.ty`,
+  including transitive aggregation through sub-packages.** A package
+  facade can now write a single `pub *` statement at the top of its
+  `__init__.ty` to re-export every direct-sibling module's
+  `pub`-marked surface. The build orchestrator collects each
+  sibling's top-level `pub` declarations, synthesises a `from
+  .sibling import name1, name2; …` block at the `pub *` marker, and
+  appends every aggregated name to the synthesised `__all__` —
+  matching the surface a hand-written `__init__.ty` would produce
+  without the user having to maintain the re-export list as siblings
+  evolve.
 
-### Feature — `pub`
+  Sub-packages are included transitively: when a direct
+  sub-directory contains its own `__init__.ty`, the sub-package's
+  effective public surface (its own `pub`-marked names, plus
+  whatever its own `pub *` aggregates one level deeper) is
+  re-exported here. The recursion is cycle-safe via a `visited` set
+  keyed on each package directory.
 
-- **`pub *` aggregates sibling `pub` names through `__init__.ty`.**
-  Opt-in package-level marker: a single `pub *` in `__init__.ty`
-  tells the build pipeline to walk every sibling `.ty` submodule's
-  `pub` declarations, synthesise `from .submodule import …` lines
-  into the emitted `__init__.py`, and extend `__all__`. Deterministic
-  alphabetical order by submodule basename; same-name collisions
-  emit a `pub_name_collision` warning (first sibling wins; package-
-  level `pub` always overrides). Outside `__init__.ty` the marker
-  is a no-op with a stderr advice pointing at the wrong-place use.
-  Opt-in only — packages without `pub *` keep the existing explicit
-  behaviour, so no project changes shape unsolicited.
+  The marker is preserved on a single line so source maps stay
+  byte-aligned.
 
-### Docs
+  Two diagnostics back the feature:
 
-- **R3-10: parametric sealed unions are documented.** New section in
-  `docs/guides/07-sealed-unions-and-match.md` walks
-  `type EventEnvelope[T] = RecordEnv[T] | WatermarkEnv | BarrierEnv`
-  end-to-end — already supported by the checker, just unknown to
-  users avoiding the pattern.
-- **R3-7: argparse-with-typed-dataclass-adapter pattern documented.**
-  New section in `docs/guides/10-advanced-features.md` shows how to
-  cross the `argparse.Namespace` Any boundary exactly once by
-  building a typed `class Args:` from the parsed namespace, plus the
-  subcommand variant via sealed unions. Pure docs — no new compiler
-  feature.
+  - **`tyc::pub_name_collision`.** If two siblings both `pub`-export
+    the same name, the aggregation would silently shadow one with the
+    other in import order. The diagnostic names both sibling modules
+    and the colliding name so the user can rename, drop the `pub`, or
+    replace `pub *` with an explicit `from .module import …` list.
+  - **`tyc::pub_star_outside_init`.** (Advice.) A `pub *` statement
+    in a non-`__init__.ty` module is a no-op with confusing intent;
+    the diagnostic fires from both `tyc check` and `tyc build` so CI
+    surfaces the dead marker.
 
-## Unreleased — Round-3 sweep
+### Fixed — compiler
 
-Apps-feedback round-3 fix batch. Each item below has a one-line
-reproducer that fires the diagnostic on v0.6.1 and passes on this
-build.
+- **`tyc-resolve`: declare-only `let NAME: T` (no initialiser) is now
+  allowed and integrates with sibling-arm assignment (R3-8 /
+  supersedes FINDINGS #91 for the `let` shape).** The
+  declare-then-assign-in-arms idiom — `let loaded: Cfg; match _load():
+  case Ok(v): loaded = v; case Err(e): return Err(e); …` — previously
+  fired `tyc::missing_initialiser`, forcing the user to either
+  declare-as-`mut` (losing immutability) or extract a `_load_or_default`
+  helper purely to give the binding an initialiser at the declaration
+  site. The resolver now tracks each uninitialised `let`-declaration's
+  span; the FIRST subsequent assignment to that name silently succeeds
+  (it IS the initialiser), and the standard `tyc::immutable_assign`
+  fires on any SECOND assignment.
+  Sibling `match` arms and sibling `if` / `elif` / `else` bodies each
+  count as a separate first-assignment path — the resolver snapshots
+  the uninit-span set per arm and unions the initialisations
+  afterwards, so the natural `case Ok(v): loaded = v / case Err(_):
+  loaded = default()` and `if cond: x = a / else: x = b` shapes check
+  clean while retaining `let` immutability outside the branching
+  region.
+  `mut NAME: T` without an initialiser is also accepted, and follows
+  the usual `mut` semantics (any number of subsequent assignments are
+  legal).
+- **`tyc-types`: definite-assignment analysis for `let NAME: T`
+  declare-only bindings (`tyc::use_of_uninitialised`).** Companion to
+  the resolver relaxation above. The DA pass walks each function body
+  once, tracking the "definitely-assigned" set at every control-flow
+  point: `if` / `match` branches intersect (only assignments that
+  happen on EVERY non-diverging arm propagate out), `return` /
+  `raise` / `continue` / `break` mark a branch as diverging (excluded
+  from the intersection), and loops do not propagate assignments out
+  (the body may execute zero times). `match` over a sealed union or
+  `Result[T, E]` is treated as exhaustive when every variant is
+  covered by a class pattern; the canonical
+  `case Ok(v): loaded = v / case Err(e): return Err(e)` shape works
+  without a `case _:` wildcard. Reads on a path where the binding
+  hasn't been assigned fire `tyc::use_of_uninitialised` with labels
+  on both the use site and the declaration.
+- **`tyc-types`: `with cm() as r:` yield-local resolution (R3-3
+  follow-up).** The earlier landing only resolved literal /
+  `Class(...)` / `None` yield payloads. The pre-scan now also
+  collects every annotated-local declaration in the contextmanager
+  factory's body (`let s: Session = …`) and consults that map when
+  the yield is a bare name. The canonical "open into a local then
+  yield" shape (`let s: Session = …; yield s`) now types `r` as
+  `Session` instead of falling through to `Unknown`. Bareword-bound
+  locals without annotations still leave `r` as Unknown (a full fix
+  would need to thread the inner env through the consumer site;
+  authors can add an explicit annotation as the durable workaround).
+- **`tyc-types`: `with cm() as r:` / `async with cm() as r:` now types
+  `r` from `__enter__` / `__aenter__` methods and from
+  `@contextmanager` / `@asynccontextmanager`-decorated generator
+  factories (R3-3).** Previously `r` was bound to `Type::Unknown` in
+  every shape, so `r.no_such_attr` and `r` flowing into a typed slot
+  both slipped past the checker (Unknown is assignable to anything).
+  Three lookup paths in priority order:
+  1. **Decorator-aware yield-type inference** — a function decorated
+     with `@contextmanager` or `@asynccontextmanager` is pre-scanned
+     for its first `yield` expression; calling that function in a
+     `with` / `async with` head binds the as-target to the yield
+     type. Covers the canonical
+     `@asynccontextmanager async def session() -> AsyncIterator[Session]:
+     yield Session(...)` factory shape that all five Round-3 apps
+     wanted to use but had to type-erase to keep checking.
+  2. **Concrete-class `__enter__` / `__aenter__`** — a user-defined
+     `class Lock:` with `def __enter__(self) -> Lock: return self`
+     now propagates the method's return type to `r`.
+  3. **Fall-through to `Unknown`** when neither path resolves, so the
+     stdlib `with open(p) as f:` shape (whose `__enter__` lives behind
+     a stub layer that doesn't carry annotations today) keeps its
+     permissive behaviour. No regressions in the apps.
 
-### Fixed — checker
+  The decorator pre-scan only resolves literal / `Class(...)`
+  constructor / `None` yield payloads — yielding a local binding
+  (`s = Session(); yield s`) still leaves `r` as Unknown because the
+  pre-scan runs before the body's local-typing pass. Authors can work
+  around with a re-annotation inside the body
+  (`let typed: Session = r`); a full fix would re-infer the yield at
+  the consumer site with the factory's local env.
+- **`tyc-types`: `await` on a `Callable[..., Awaitable[T]]` /
+  `Callable[..., Coroutine[Y, S, T]]` call now unwraps to `T`
+  (R3-1).** The canonical async-middleware shape across
+  FastAPI / Starlette / aiohttp is `next: Callable[[Req],
+  Awaitable[Resp]]`; calling `next(req)` infers to `Awaitable[Resp]`
+  from the `Callable` return position, and `await next(req)` should
+  consume the awaitable and produce `Resp`. Without the unwrap, the
+  natural shape `let r: Resp = await next(req)` failed with a spurious
+  `tyc::type_mismatch: expected Resp, found Awaitable[Resp]` even
+  though the runtime behaviour is correct — and the 14-api-gateway
+  app had to abandon the recursive `next`-style middleware chain in
+  favour of a sync `pre_hook` / `post_hook` pipeline, losing the
+  ability to wrap async sections around inner handlers. The single
+  biggest Round-3 finding. The canonical `async def f() -> T:` path
+  is unaffected: the checker already tracks async functions as
+  returning `T` directly (not `Awaitable[T]`), so the new
+  unwrap-on-await arms only fire when the wrapper actually appears.
+- **`tyc-types`: same-newtype arithmetic preserves the newtype, and
+  one-sided literal arithmetic likewise (R2-12).** `newtype LogIndex
+  = int` previously inferred `last_idx + 1` and `LogIndex + LogIndex`
+  to `Type::Unknown` because the conservative numeric arm of `BinOp`
+  inference only matched `(Int, Int)` / `(Float, Float)` — every
+  newtype operand fell through and the result silently widened away
+  the nominal tag. Raft commit-index advance, ELO updates, watermark
+  math, byte offsets, and log indices all paid the same 5–10% LoC tax
+  in `int(...) → Wrap(...)` round-trips just to get the types back.
+  The new carve-out preserves `LogIndex` across `+ - * // % **` for
+  `LogIndex + LogIndex` and `LogIndex + <literal of base>`; `/` keeps
+  the existing widening to `float` because Python's `/` is always true
+  division. Two **distinct** newtypes with the same numeric base
+  (`LogIndex + Term`) fire the existing `tyc::operator_type_mismatch`
+  diagnostic — the whole point of `newtype` is that cross-axis math
+  must be opted in to. Six new `newtype_arith_*` regression tests
+  guard the rule.
 
-- **R3-1: `await f(x)` on `Callable[..., Awaitable[T]]` now unwraps to
-  `T`.** The previous shape returned `Awaitable[T]` and every
-  async-middleware framework pattern hit a `type_mismatch`. Also
-  handles `Callable[..., Coroutine[Y, S, T]]` and the one-arg
-  `Coroutine[T]` shorthand.
-- **R3-3: `async with X() as r:` now type-binds `r` from `__aenter__`.**
-  Without this, the downstream `match r:` couldn't prove its subject
-  was a sealed union and `missing_return` falsely fired on the
-  enclosing function. Sync `with` + `__enter__` is handled by the same
-  helper. (Cases where `r` is bound from `@asynccontextmanager`-decorated
-  generators still rely on an explicit annotation.)
+### Fixed — checker (also from main's Round-3 sweep)
+
 - **R3-9: ternary `body if test else orelse` now narrows just like
-  `if`/`else`.** `isinstance(x, T)` and `x is not None` refine `x` on
-  the truthy side (and the negated form on the falsy side) inside the
-  expression form, matching the statement-level behaviour.
+  `if`/`else`.** `isinstance(x, T)` and `x is not None` refine `x`
+  on the truthy side (and the negated form on the falsy side) inside
+  the expression form, matching the statement-level behaviour.
 - **R3-11: class field defaults must order non-default fields before
   defaulted ones.** The synthesised `__init__` follows declaration
   order, and Python rejects a non-default parameter after a default
-  one — left unchecked, the class definition blew up at *import* time
-  with a misleading `TypeError`. New diagnostic
-  `tyc::field_default_ordering` catches this at check time. Mirrors
-  the parser's existing rule on free-function parameters.
+  one — left unchecked, the class definition blew up at *import*
+  time with a misleading `TypeError`. New diagnostic
+  `tyc::field_default_ordering` catches this at check time.
+- **R3-15: cross-module generic method dispatch propagates class
+  TypeVars.** `s: Stream[int].map(f)` now records
+  `Callable[[int], U]` as the expected parameter and returns
+  `Stream[U]` bound at the call site via the existing PEP 695
+  inference. Same fix benefits field access — `let r:
+  RecordEnv[int]; r.payload` is now `int`, not the bare `T`.
 
-### Fixed — resolver
+### Fixed — resolver (from main's Round-3 sweep)
 
-- **R3-4: `from X import Y` inside `if`/`for`/`while`/`with`/`try`/`match`
-  arms now binds.** The parser already accepted it; the resolver
-  silently skipped nested imports and the failure surfaced as a
-  confusing "cannot find Y in scope" at the use site. The
-  typing-import diagnostics (`TypeVar`, deprecated `List`/`Dict`/…)
-  fire for nested imports too.
+- **R3-4: `from X import Y` inside `if`/`for`/`while`/`with`/`try`/
+  `match` arms now binds.** The parser already accepted it; the
+  resolver silently skipped nested imports.
 - **R3-5: sibling `if` / `elif` branches no longer trip
-  `no_block_shadow` for same-named `let` bindings.** Sibling
-  `case` arms already had this relaxation (apps-feedback 2026-05);
-  the same per-branch drain/restore is now applied to `if` clauses.
-- **R3-8: `let x: T;` (declare-then-assign) is now accepted.** The
-  binding is declared as `mut` so subsequent assignments in `match` /
-  `if` arms bind cleanly. The earlier `tyc::missing_initialiser`
-  rejection is gone. Definite-assignment isn't formally checked; an
-  un-set use is caught at runtime by Python's `UnboundLocalError`.
+  `no_block_shadow` for same-named `let` bindings.** The
+  per-branch drain/restore that already worked for `case` arms now
+  applies to `if` clauses too.
 
-### Fixed — syntax
+### Fixed — syntax (from main's Round-3 sweep)
 
 - **R3-2: multi-line `go expr(...)` calls now parse.** Implicit line
-  continuation inside parens works everywhere else in Typhon — `go`
-  is no longer the exception. The preprocessor pre-joins continuation
-  lines before the lowering pass runs.
+  continuation inside parens works everywhere else in Typhon.
 
-### Docs
+### Docs (from main's Round-3 sweep)
 
-- **R3-12: nested `def` and nested `from X import Y` are now
-  explicitly sanctioned.** `docs/guides/03-functions.md` shows both
-  forms with a short note on when to reach for each.
-- **R3-13: nullary sealed-union variants are documented as
+- **R3-7: argparse-with-typed-dataclass-adapter pattern documented.**
+- **R3-10: parametric sealed unions documented.**
+- **R3-12: nested `def` and nested `from X import Y` sanctioned.**
+- **R3-13: nullary sealed-union variants documented as
   `class Foo frozen: pass` with `case Foo():` matching.**
-  `docs/guides/07-sealed-unions-and-match.md` calls out the
-  zero-subpattern form (not `case Foo(_):`, which fails to match).
 
 ## 0.6.1 — 2026-05-25
 

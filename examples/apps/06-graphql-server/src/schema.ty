@@ -61,42 +61,6 @@ pub class FieldObject:
     fields: dict[str, ResolvedField]
 
 
-pub def make_field_user(u: User) -> ResolvedField:
-    return FieldUser(user=u)
-
-
-pub def make_field_post(p: Post) -> ResolvedField:
-    return FieldPost(post=p)
-
-
-pub def make_field_comment(c: Comment) -> ResolvedField:
-    return FieldComment(comment=c)
-
-
-pub def make_field_user_list(items: list[User]) -> ResolvedField:
-    return FieldUserList(items=items)
-
-
-pub def make_field_post_list(items: list[Post]) -> ResolvedField:
-    return FieldPostList(items=items)
-
-
-pub def make_field_comment_list(items: list[Comment]) -> ResolvedField:
-    return FieldCommentList(items=items)
-
-
-pub def make_field_null() -> ResolvedField:
-    return FieldNull(placeholder=0)
-
-
-pub def make_field_scalar(value: str) -> ResolvedField:
-    return FieldScalar(value=value)
-
-
-pub def make_field_object(fields: dict[str, ResolvedField]) -> ResolvedField:
-    return FieldObject(fields=fields)
-
-
 pub def field_kind(f: ResolvedField) -> str:
     match f:
         case FieldUser(_):         return "user"

@@ -134,17 +134,15 @@ pub struct PreprocessResult {
     /// top; modules with none are left alone, preserving the current
     /// `from foo import *` semantics for legacy `.ty` files.
     pub pub_names: Vec<String>,
-    /// `true` when the source contained a top-level `pub *` marker.
-    /// Only meaningful for `__init__.ty` files: when set, the build
-    /// pipeline aggregates every sibling `.ty` module's `pub` names
-    /// into the package's emitted `__init__.py` (synthesised
-    /// `from .submodule import …` lines + extended `__all__`).
-    /// Outside `__init__.ty` the marker is allowed but has no effect
-    /// — the build pipeline emits an advice diagnostic so users know
-    /// it's a no-op there. The preprocessor strips the line either
-    /// way so the Python parser never sees the `*` token at module
-    /// level.
-    pub pub_star: bool,
+    /// 0-based line indices where the source contained a `pub *`
+    /// wildcard-re-export statement. Only legal in `__init__.ty`; the
+    /// build orchestrator aggregates each direct-sibling module's
+    /// `pub_names` (and direct sub-packages' aggregated surfaces) into
+    /// a synthesised `from .sibling import …` block at this position.
+    /// Outside `__init__.ty` the build emits an advice-level
+    /// `tyc::pub_star_outside_init` diagnostic. (Carries line indices
+    /// rather than a bool so the diagnostic spans the exact marker.)
+    pub pub_star_lines: Vec<usize>,
 }
 
 /// Convert a list of 0-based line indices into byte offsets pointing at
@@ -189,8 +187,9 @@ pub fn preprocess(source: &str) -> PreprocessResult {
     // emitted so `postprocess` restores `pub ` for `tyc fmt`.
     let mut pub_names: Vec<String> = Vec::new();
     let mut pub_lines: Vec<usize> = Vec::new();
-    let mut pub_star = false;
-    let source_owned = strip_pub_prefixes(source, &mut pub_names, &mut pub_lines, &mut pub_star);
+    let mut pub_star_lines: Vec<usize> = Vec::new();
+    let source_owned =
+        strip_pub_prefixes(source, &mut pub_names, &mut pub_lines, &mut pub_star_lines);
     let source = source_owned.as_str();
 
     let mut python_source = String::with_capacity(source.len());
@@ -738,7 +737,7 @@ pub fn preprocess(source: &str) -> PreprocessResult {
         frozen_class_lines,
         plain_class_lines,
         pub_names,
-        pub_star,
+        pub_star_lines,
     }
 }
 
@@ -773,7 +772,7 @@ fn strip_pub_prefixes(
     source: &str,
     pub_names: &mut Vec<String>,
     pub_lines: &mut Vec<usize>,
-    pub_star: &mut bool,
+    pub_star_lines: &mut Vec<usize>,
 ) -> String {
     let mut out = String::with_capacity(source.len());
     let mut in_string: Option<StringMode> = None;
@@ -793,25 +792,21 @@ fn strip_pub_prefixes(
             continue;
         }
         let rest = &line[indent_len..];
-        // `pub *` — the opt-in marker that asks the build pipeline to
-        // re-export every sibling `.ty` module's `pub` names through
-        // this file's emitted `__init__.py`. Recognised only on
-        // module-level lines whose code portion is exactly `pub *`
-        // (an optional trailing `#` comment is fine). The line is
-        // dropped from the emitted Python — `*` isn't a valid bare
-        // statement — and `pub_star` is flipped to let the build
-        // pass know to do the aggregation. See `commands::build::run`.
-        let code_end = rest
-            .find('#')
-            .unwrap_or_else(|| rest.trim_end_matches(['\n', '\r']).len());
-        let code = rest[..code_end].trim_end();
-        if code == "pub *" {
-            *pub_star = true;
-            // Preserve the line terminator so downstream line indices
-            // stay aligned with the original source — emit an empty
-            // line in place of `pub *`.
-            let terminator = &line[indent_len + rest.trim_end_matches(['\n', '\r']).len()..];
-            out.push_str(terminator);
+        // R3 frontier: `pub *` (with optional comment / trailing
+        // whitespace) is a wildcard re-export marker. Strip the line
+        // entirely so the Python parser doesn't see it, and record the
+        // line index so the build orchestrator can:
+        //   - In `__init__.ty`: synthesise `from .sibling import …`
+        //     for each direct-sibling module's `pub` names (and direct
+        //     sub-packages' aggregated surfaces).
+        //   - In any other file: emit `tyc::pub_star_outside_init`.
+        if is_pub_star_line(rest) {
+            pub_star_lines.push(line_index);
+            // Replace with a blank line so line numbers stay aligned
+            // and the rest of the pipeline ignores it.
+            if line.ends_with('\n') {
+                out.push('\n');
+            }
             continue;
         }
         if let Some(after_pub) = rest.strip_prefix("pub ") {
@@ -830,10 +825,25 @@ fn strip_pub_prefixes(
     out
 }
 
+/// Recognise a `pub *` wildcard-re-export marker line. Accepts:
+///   `pub *`, `pub *  ` (trailing whitespace), `pub *  # comment`
+/// Rejects any non-comment text after the `*`.
+fn is_pub_star_line(rest: &str) -> bool {
+    let Some(after) = rest.strip_prefix("pub *") else {
+        return false;
+    };
+    let trimmed = after.trim_start_matches([' ', '\t']);
+    let body = trimmed.trim_end_matches(['\n', '\r']);
+    body.is_empty() || body.starts_with('#')
+}
+
 /// Given a line that originally followed `pub ` (so `def foo(...)`,
 /// `class Foo:`, `let X = ...`, etc.), return the declared name. Used
 /// by [`strip_pub_prefixes`] to populate the `pub_names` registry.
-fn pub_decl_name(body: &str) -> Option<String> {
+/// Exposed for the build orchestrator's `pub *` aggregation pre-pass,
+/// which needs to extract sibling-module pub names without paying for
+/// a full preprocess.
+pub fn pub_decl_name(body: &str) -> Option<String> {
     let body = body.trim_end_matches(['\n', '\r']);
     // Skip a leading `async ` for `pub async def f(...)`.
     let body = body.strip_prefix("async ").unwrap_or(body);
@@ -6916,17 +6926,22 @@ mod tests {
     }
 
     #[test]
-    fn pub_star_marker_sets_flag_and_drops_line() {
-        // R3 follow-up: `pub *` is the opt-in marker that asks the
-        // build pipeline to re-export every sibling `.ty` module's
-        // `pub` names through this file's emitted `__init__.py`. The
-        // preprocessor strips the line (`*` isn't valid at module
-        // level) and flips `pub_star` so the build phase can act on
-        // it. Line index alignment is preserved by emitting just the
-        // terminator in place of the original line.
-        let result = preprocess("pub *\npub class Widget:\n    name: str\n");
-        assert!(result.pub_star, "pub_star marker must be set");
-        assert_eq!(result.pub_names, vec!["Widget".to_owned()]);
+    fn pub_star_records_line_and_strips_text() {
+        // `pub *` is the wildcard re-export marker. The preprocessor
+        // must record its line index (so the build pass can anchor
+        // diagnostics) and leave a blank line behind so line numbers
+        // stay aligned for downstream source maps.
+        let src = "pub *\npub def greet() -> str:\n    return \"hi\"\n";
+        let result = preprocess(src);
+        assert_eq!(result.pub_star_lines, vec![0]);
+        assert_eq!(result.pub_names, vec!["greet".to_owned()]);
+        // The first line should be blank (the marker was stripped).
+        let first_line = result.python_source.lines().next().unwrap_or("");
+        assert!(
+            first_line.trim().is_empty(),
+            "pub * line should be blanked; got {:?}",
+            first_line
+        );
         assert!(
             !result.python_source.contains("pub *"),
             "`pub *` line must be stripped from the python source: {}",
@@ -6935,27 +6950,39 @@ mod tests {
     }
 
     #[test]
-    fn pub_star_with_trailing_comment_still_recognised() {
-        let result = preprocess("pub *  # re-export submodule pub names\n");
+    fn pub_star_with_trailing_comment_is_recognised() {
+        let src = "pub *  # re-export everything\n";
+        let result = preprocess(src);
+        assert_eq!(result.pub_star_lines, vec![0]);
+    }
+
+    #[test]
+    fn pub_star_with_extra_text_is_not_recognised() {
+        // `pub * from foo` (or any other operand after `*`) is NOT a
+        // wildcard marker — keep the existing `pub` machinery unhappy
+        // about the form so the user gets a real parse error rather
+        // than a silent no-op.
+        let src = "pub * from foo\n";
+        let result = preprocess(src);
         assert!(
-            result.pub_star,
-            "marker must be recognised even with a trailing comment"
+            result.pub_star_lines.is_empty(),
+            "`pub * from foo` should not be treated as `pub *`"
         );
     }
 
     #[test]
-    fn pub_star_indented_is_ignored() {
-        // Only the module-level form is the aggregation marker.
-        // An indented occurrence falls through to the Python parser
-        // which will reject it.
-        let result = preprocess("def f() -> None:\n    pub *\n");
-        assert!(!result.pub_star);
+    fn indented_pub_star_is_left_alone() {
+        // `pub *` only applies at module level; an indented occurrence
+        // is not a re-export marker.
+        let src = "def f() -> None:\n    pub *\n";
+        let result = preprocess(src);
+        assert!(result.pub_star_lines.is_empty());
     }
 
     #[test]
-    fn no_pub_star_means_flag_off() {
+    fn no_pub_star_means_empty_lines_vec() {
         let result = preprocess("pub class Widget:\n    name: str\n");
-        assert!(!result.pub_star);
+        assert!(result.pub_star_lines.is_empty());
     }
 
     #[test]

@@ -721,6 +721,30 @@ pub(crate) fn stdlib_top_level_contains(name: &str) -> bool {
 /// with a stdlib module name. The warning points at byte offset 0 of
 /// the file — the filename itself is the offending token, and the
 /// help text tells the user how to rename. R2-4.
+/// Byte offset of the start of the 0-based `line_idx` line in
+/// `source`. Mirrors the `line_offset` helper in `build.rs` so the
+/// `pub_star_outside_init` advice anchors at the same column on both
+/// commands. Returns `source.len()` when the line index falls past the
+/// end so the rendered diagnostic still has a valid span.
+fn pub_star_line_offset(source: &str, line_idx: usize) -> usize {
+    let mut offset = 0usize;
+    let mut current = 0usize;
+    for (i, b) in source.bytes().enumerate() {
+        if current == line_idx {
+            offset = i;
+            break;
+        }
+        if b == b'\n' {
+            current += 1;
+            offset = i + 1;
+        }
+    }
+    if current < line_idx {
+        return source.len();
+    }
+    offset
+}
+
 fn check_stdlib_module_shadow(path: &std::path::Path, source: &str) -> Option<TycError> {
     let stem = path.file_stem()?.to_str()?;
     if stdlib_top_level_contains(stem) {
@@ -759,6 +783,32 @@ fn run_secondary_passes(
     let mut diags = Diagnostics::new();
     let expanded = expand_for_check(source);
     let prep = preprocess(&expanded);
+
+    // `pub *` outside `__init__.ty` is a no-op with confusing intent.
+    // Surface the advice in `tyc check` (mirroring `tyc build`) so CI
+    // gates on the same shape regardless of which command runs first.
+    // The diagnostic carries `severity(Advice)`; push it onto the
+    // warnings vec rather than errors so the build doesn't fail and
+    // the summary reads "n warning(s): tyc::pub_star_outside_init".
+    if !prep.pub_star_lines.is_empty() {
+        let is_init = std::path::Path::new(path)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .map(|s| s == "__init__.ty")
+            .unwrap_or(false);
+        if !is_init {
+            for &line_idx in &prep.pub_star_lines {
+                let offset = pub_star_line_offset(&expanded, line_idx);
+                diags.push_warning(TycError::pub_star_outside_init(
+                    path.to_owned(),
+                    expanded.clone(),
+                    offset,
+                    5,
+                ));
+            }
+        }
+    }
+
     let module = match tyc_syntax::parse_module(&prep.python_source) {
         Ok(p) => p.into_syntax(),
         Err(_) => return diags,

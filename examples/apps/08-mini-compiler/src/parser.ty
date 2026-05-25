@@ -4,22 +4,19 @@ from lang_ast import (
     Expr,
     Param,
     expr_span,
-    make_ex_binop,
-    make_ex_block,
-    make_ex_bool,
-    make_ex_call,
-    make_ex_float,
-    make_ex_fn,
-    make_ex_ident,
-    make_ex_if,
-    make_ex_int,
-    make_ex_let,
-    make_ex_print,
-    make_ex_str,
-    make_ex_unary,
-    make_param,
+    ExBinOp,
+    ExBool,
+    ExCall,
+    ExFloat,
+    ExFn,
+    ExIdent,
+    ExIf,
+    ExInt,
+    ExPrint,
+    ExStr,
+    ExUnary,
 )
-from source import Span, make_span
+from source import Span
 from tokens import (
     Token,
     TkArrow,
@@ -50,7 +47,7 @@ def _err(message: str, span: Span) -> ParseError:
 
 
 def _join_span(a: Span, b: Span) -> Span:
-    return make_span(a.start, b.end, a.line, a.col)
+    return Span(a.start, b.end, a.line, a.col)
 
 
 impl Parser:
@@ -201,7 +198,7 @@ def _parse_expr_bp(p: Parser, min_bp: int) -> Result[Expr, ParseError]:
         p.advance()
         let rhs: Expr = _parse_expr_bp(p, bp[1])?
         let sp: Span = _join_span(expr_span(lhs), expr_span(rhs))
-        lhs = make_ex_binop(op, lhs, rhs, sp)
+        lhs = ExBinOp(op, lhs, rhs, sp)
     return Ok(value=lhs)
 
 
@@ -212,7 +209,7 @@ def _parse_prefix(p: Parser) -> Result[Expr, ParseError]:
         p.advance()
         let operand: Expr = _parse_prefix(p)?
         let sp_u: Span = _join_span(sp_minus, expr_span(operand))
-        return Ok(value=make_ex_unary("-", operand, sp_u))
+        return Ok(value=ExUnary("-", operand, sp_u))
     return _parse_postfix(p)
 
 
@@ -238,7 +235,7 @@ def _parse_call_tail(p: Parser, callee: Expr) -> Result[Expr, ParseError]:
             break
     let sp_close: Span = _expect_punct(p, ")")?
     let sp: Span = _join_span(expr_span(callee), sp_close)
-    return Ok(value=make_ex_call(callee, args, sp))
+    return Ok(value=ExCall(callee, args, sp))
 
 
 def _parse_primary(p: Parser) -> Result[Expr, ParseError]:
@@ -246,23 +243,23 @@ def _parse_primary(p: Parser) -> Result[Expr, ParseError]:
     match t:
         case TkInt(iv, sp_int):
             p.advance()
-            return Ok(value=make_ex_int(iv, sp_int))
+            return Ok(value=ExInt(iv, sp_int))
         case TkFloat(fv, sp_flt):
             p.advance()
-            return Ok(value=make_ex_float(fv, sp_flt))
+            return Ok(value=ExFloat(fv, sp_flt))
         case TkStr(sv, sp_str):
             p.advance()
-            return Ok(value=make_ex_str(sv, sp_str))
+            return Ok(value=ExStr(sv, sp_str))
         case TkIdent(nv, sp_id):
             p.advance()
-            return Ok(value=make_ex_ident(nv, sp_id))
+            return Ok(value=ExIdent(nv, sp_id))
         case TkKeyword(wv, sp_kw):
             if wv == "true":
                 p.advance()
-                return Ok(value=make_ex_bool(True, sp_kw))
+                return Ok(value=ExBool(True, sp_kw))
             if wv == "false":
                 p.advance()
-                return Ok(value=make_ex_bool(False, sp_kw))
+                return Ok(value=ExBool(False, sp_kw))
             if wv == "if":
                 return _parse_if(p)
             if wv == "fun":
@@ -298,7 +295,7 @@ def _parse_if(p: Parser) -> Result[Expr, ParseError]:
     let _e: Span = _expect_keyword(p, "else")?
     let else_expr: Expr = _parse_expr_bp(p, 0)?
     let sp: Span = _join_span(sp_if, expr_span(else_expr))
-    return Ok(value=make_ex_if(cond, then_expr, else_expr, sp))
+    return Ok(value=ExIf(cond, then_expr, else_expr, sp))
 
 
 def _parse_fn(p: Parser) -> Result[Expr, ParseError]:
@@ -310,7 +307,7 @@ def _parse_fn(p: Parser) -> Result[Expr, ParseError]:
             let id_pair: tuple[str, Span] = _expect_ident(p)?
             let _colon: Span = _expect_punct(p, ":")?
             let ty_pair: tuple[str, Span] = _expect_ident(p)?
-            params.append(make_param(id_pair[0], ty_pair[0]))
+            params.append(Param(id_pair[0], ty_pair[0]))
             if _is_punct(p.peek(), ","):
                 p.advance()
                 continue
@@ -320,7 +317,7 @@ def _parse_fn(p: Parser) -> Result[Expr, ParseError]:
     let ret_pair: tuple[str, Span] = _expect_ident(p)?
     let body: Expr = _parse_block(p)?
     let sp: Span = _join_span(sp_fn, expr_span(body))
-    return Ok(value=make_ex_fn(params, ret_pair[0], body, sp))
+    return Ok(value=ExFn(params, ret_pair[0], body, sp))
 
 
 def _parse_block(p: Parser) -> Result[Expr, ParseError]:
@@ -332,7 +329,7 @@ def _parse_block(p: Parser) -> Result[Expr, ParseError]:
         if _is_punct(p.peek(), ";"):
             p.advance()
     let sp_close: Span = _expect_punct(p, "}")?
-    return Ok(value=make_ex_block(exprs, _join_span(sp_open, sp_close)))
+    return Ok(value=ExBlock(exprs, _join_span(sp_open, sp_close)))
 
 
 def _parse_print(p: Parser) -> Result[Expr, ParseError]:
@@ -340,7 +337,7 @@ def _parse_print(p: Parser) -> Result[Expr, ParseError]:
     let _lp: Span = _expect_punct(p, "(")?
     let arg: Expr = _parse_expr_bp(p, 0)?
     let sp_rp: Span = _expect_punct(p, ")")?
-    return Ok(value=make_ex_print(arg, _join_span(sp_pr, sp_rp)))
+    return Ok(value=ExPrint(arg, _join_span(sp_pr, sp_rp)))
 
 
 def _parse_let_expr(p: Parser) -> Result[Expr, ParseError]:
@@ -353,8 +350,8 @@ def _parse_let_expr(p: Parser) -> Result[Expr, ParseError]:
         return Err(error=_err("expected '=' in let binding", token_span(p.peek())))
     let value: Expr = _parse_expr_bp(p, 0)?
     let empty_body: list[Expr] = []
-    let placeholder_body: Expr = make_ex_block(empty_body, expr_span(value))
-    return Ok(value=make_ex_let(id_pair[0], value, placeholder_body, _join_span(sp_let, expr_span(value))))
+    let placeholder_body: Expr = ExBlock(empty_body, expr_span(value))
+    return Ok(value=ExLet(id_pair[0], value, placeholder_body, _join_span(sp_let, expr_span(value))))
 
 
 def _parse_statement(p: Parser) -> Result[Expr, ParseError]:
@@ -378,12 +375,12 @@ pub def parse(tokens: list[Token]) -> Result[Expr, ParseError]:
 def _thread_lets(stmts: list[Expr], idx: int) -> Expr:
     if idx >= len(stmts):
         let empty_stmts: list[Expr] = []
-        return make_ex_block(empty_stmts, make_span(0, 0, 1, 1))
+        return ExBlock(empty_stmts, Span(0, 0, 1, 1))
     let here: Expr = stmts[idx]
     match here:
         case ExLet(lname, lvalue, _body_unused, sp_let_n):
             let rest: Expr = _thread_lets(stmts, idx + 1)
-            return make_ex_let(lname, lvalue, rest, sp_let_n)
+            return ExLet(lname, lvalue, rest, sp_let_n)
         case _:
             if idx == len(stmts) - 1:
                 return here
@@ -393,9 +390,9 @@ def _thread_lets(stmts: list[Expr], idx: int) -> Expr:
                     mut combined: list[Expr] = [here]
                     for ie in inner_exprs:
                         combined.append(ie)
-                    return make_ex_block(combined, _join_span(expr_span(here), sp_blk_b))
+                    return ExBlock(combined, _join_span(expr_span(here), sp_blk_b))
                 case _:
                     let pair_list: list[Expr] = [here, rest_b]
-                    return make_ex_block(pair_list, _join_span(expr_span(here), expr_span(rest_b)))
+                    return ExBlock(pair_list, _join_span(expr_span(here), expr_span(rest_b)))
             raise RuntimeError("unreachable")
     raise RuntimeError("unreachable")

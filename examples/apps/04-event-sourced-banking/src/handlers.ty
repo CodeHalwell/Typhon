@@ -31,14 +31,14 @@ from commands import (
 from events import (
     Event,
     EventEnvelope,
-    make_account_closed,
-    make_account_frozen,
-    make_account_opened,
-    make_account_unfrozen,
-    make_interest_accrued,
-    make_money_deposited,
-    make_money_withdrawn,
-    make_transfer_recorded,
+    AccountClosed,
+    AccountFrozen,
+    AccountOpened,
+    AccountUnfrozen,
+    InterestAccrued,
+    MoneyDeposited,
+    MoneyWithdrawn,
+    TransferRecorded,
 )
 from ids import AccountId
 from money import Money, convert, is_positive
@@ -104,7 +104,7 @@ impl Handlers:
                 let existing: Account? = _load_account(self.store, aid)
                 if existing is not None:
                     return Err(reject_account_exists(aid))
-                let event: Event = make_account_opened(
+                let event: Event = AccountOpened(
                     account_id=aid,
                     customer_id=cid,
                     currency=ccy,
@@ -126,7 +126,7 @@ impl Handlers:
                 match _ensure_open(account):
                     case Err(r): return Err(r)
                     case Ok(_):  pass
-                let event: Event = make_money_deposited(
+                let event: Event = MoneyDeposited(
                     account_id=aid,
                     amount=amount,
                     source=source,
@@ -151,7 +151,7 @@ impl Handlers:
                     case Ok(_):  pass
                 if int(account.balance) < int(amount):
                     return Err(reject_insufficient(aid, account.balance, amount))
-                let event: Event = make_money_withdrawn(
+                let event: Event = MoneyWithdrawn(
                     account_id=aid,
                     amount=amount,
                     destination=dest,
@@ -199,7 +199,7 @@ impl Handlers:
                                 from_a.currency, to_a.currency,
                             ))
 
-                let event: Event = make_transfer_recorded(
+                let event: Event = TransferRecorded(
                     from_account=from_acc,
                     to_account=to_acc,
                     amount_from=amount,
@@ -221,7 +221,7 @@ impl Handlers:
                 let account: Account? = _load_account(self.store, aid)
                 if account is None:
                     return Err(reject_no_such_account(aid))
-                let event: Event = make_account_frozen(
+                let event: Event = AccountFrozen(
                     account_id=aid,
                     reason=reason,
                     at=datetime.now(timezone.utc),
@@ -237,7 +237,7 @@ impl Handlers:
                 let account: Account? = _load_account(self.store, aid)
                 if account is None:
                     return Err(reject_no_such_account(aid))
-                let event: Event = make_account_unfrozen(
+                let event: Event = AccountUnfrozen(
                     account_id=aid,
                     at=datetime.now(timezone.utc),
                 )
@@ -257,7 +257,7 @@ impl Handlers:
                         return Err(reject_closed(aid))
                     case _:
                         pass
-                let event: Event = make_account_closed(
+                let event: Event = AccountClosed(
                     account_id=aid,
                     at=datetime.now(timezone.utc),
                 )
@@ -278,7 +278,7 @@ impl Handlers:
                 let earned: int = int(float(int(account.balance)) * rate)
                 if earned <= 0:
                     return Ok([])
-                let event: Event = make_interest_accrued(
+                let event: Event = InterestAccrued(
                     account_id=aid,
                     amount=Money(earned),
                     rate=rate,

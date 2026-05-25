@@ -1,6 +1,6 @@
 from typing import Callable
 
-from event import Envelope, make_record_envelope, make_end_envelope, make_watermark_envelope
+from event import Envelope, make_record, make_watermark, make_end_of_stream
 from ids import OperatorId, StreamKey, WatermarkTs
 from models import StockTick
 
@@ -31,7 +31,7 @@ impl[T] ListSource[T]:
         while self.cursor < len(self.items):
             out.append(self.items[self.cursor])
             self.cursor = self.cursor + 1
-        out.append(make_end_envelope())
+        out.append(make_end_of_stream())
         self.finished = True
         return out
 
@@ -44,7 +44,7 @@ pub def list_source_for_ticks(
         let ts_ms: int = triple[0]
         let symbol: str = triple[1]
         let price: int = triple[2]
-        envs.append(make_record_envelope(
+        envs.append(make_record(
             ts_ms, StreamKey(symbol), StockTick(symbol=symbol, price_cents=price, venue="L"),
         ))
     let inner: ListSource[StockTick] = ListSource(
@@ -92,7 +92,7 @@ impl[T] GeneratorSource[T]:
             # Price walks in cents around 10000 ± up to ~500
             let drift: int = (state % 1001) - 500
             let price: int = 10000 + drift
-            out.append(make_record_envelope(
+            out.append(make_record(
                 t, StreamKey(symbol),
                 StockTick(symbol=symbol, price_cents=price, venue="G"),
             ))
@@ -100,11 +100,11 @@ impl[T] GeneratorSource[T]:
             produced = produced + 1
         # Emit a watermark for the latest event-time we produced.
         if produced > 0:
-            out.append(make_watermark_envelope(WatermarkTs(t - self.step_ms)))
+            out.append(make_watermark(WatermarkTs(t - self.step_ms)))
         self.cursor_ms = t
         self.rng_state = state
         if t >= end_t:
-            out.append(make_end_envelope())
+            out.append(make_end_of_stream())
             self.finished = True
         return out
 

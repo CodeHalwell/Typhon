@@ -334,6 +334,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // Phase 2: desugar and emit using the already-loaded source text.
     let mut emitted = 0usize;
     let mut needs_runtime = false;
+    // R3 frontier: `pub *` name collisions are accumulated per-file
+    // and surfaced as `tyc::pub_name_collision` diagnostics. Track the
+    // total so the build can fail after the per-file loop instead of
+    // silently emitting bad re-exports.
+    let mut pub_star_collision_count: usize = 0;
 
     for (path, source) in &sources {
         // Expand Typhon syntactic sugar in order:
@@ -359,96 +364,159 @@ pub fn run(args: BuildArgs) -> Result<()> {
         )));
         let mut prep = preprocess(&expanded);
 
-        // `pub *` aggregation: when an `__init__.ty` opted in (via
-        // the marker stripped by the preprocessor), append synthesised
-        // `from .submodule import Name1, Name2` lines to the parsed
-        // source and extend `prep.pub_names` so the desugar pass
-        // includes every sibling's public names in the package's
-        // emitted `__all__`. Outside `__init__.ty` the marker is a
-        // silent no-op today — an advice diagnostic would be the
-        // ergonomic next step.
+        // `pub *` wildcard re-export aggregation.
         //
-        // Siblings are sorted by basename so the emitted re-export
-        // order is deterministic across runs and across platforms
-        // (where filesystem ordering varies). Name collisions
-        // between sibling submodules are skipped (first occurrence
-        // wins) and reported via a `pub_name_collision` warning so
-        // the user picks an explicit winner.
-        let stem_for_init = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-        if prep.pub_star && stem_for_init != "__init__" {
-            eprintln!(
-                "warning: `pub *` in `{}` has no effect — the aggregation marker is only \
-                 honoured in `__init__.ty` (the package-level entry point). Move `pub *` \
-                 into the package's `__init__.ty`, or drop it here.",
-                path.display()
-            );
-        }
-        if prep.pub_star && stem_for_init == "__init__" {
-            if let Some(dir) = path.parent() {
-                if let Some(siblings_unsorted) = pkg_pub_aggregation.get(dir) {
-                    let mut siblings = siblings_unsorted.clone();
-                    siblings.sort_by(|a, b| a.0.cmp(&b.0));
-                    let mut buf = String::new();
-                    // `seen` starts with the __init__'s own pub names
-                    // so a same-named sibling export is treated as a
-                    // collision against the package-local definition
-                    // and skipped — never overrides the explicit one.
-                    let mut seen: std::collections::HashMap<String, String> = prep
-                        .pub_names
-                        .iter()
-                        .map(|n| (n.clone(), "<package>".to_owned()))
-                        .collect();
-                    for (mod_name, names) in &siblings {
-                        let mut new_names: Vec<&String> = Vec::new();
-                        for n in names {
-                            if let Some(first_owner) = seen.get(n.as_str()) {
-                                eprintln!(
-                                    "warning: pub_name_collision in package `{}`: \
-                                     `{}` is exported by `{}` and `{}` — keeping the {} \
-                                     definition. Rename one of them or remove `pub *` and \
-                                     write explicit re-exports.",
-                                    dir.file_name().and_then(|n| n.to_str()).unwrap_or("<pkg>"),
-                                    n,
-                                    first_owner,
-                                    mod_name,
-                                    if first_owner == "<package>" {
-                                        "__init__.ty"
-                                    } else {
-                                        "first sibling"
-                                    }
-                                );
-                                continue;
-                            }
-                            new_names.push(n);
-                        }
-                        if new_names.is_empty() {
+        // The preprocessor records each `pub *` marker's line index in
+        // `prep.pub_star_lines` and strips the line text. Here we:
+        //   - For `__init__.ty`: aggregate sibling modules' `pub` names,
+        //     detect cross-sibling collisions (`tyc::pub_name_collision`,
+        //     which fails the build), and inject the synthesised
+        //     `from .sibling import name1, name2` block at the marker
+        //     line so the rest of the pipeline emits the imports.
+        //   - For any other file: emit `tyc::pub_star_outside_init`
+        //     advice — the wildcard re-export only has meaning at a
+        //     package boundary.
+        //
+        // Aggregation includes BOTH direct .ty siblings AND direct
+        // sub-packages (sub-directories containing their own
+        // `__init__.ty`). When a sub-package's own `__init__.ty` uses
+        // `pub *`, the recursion picks up its aggregated names too via
+        // `effective_package_surface` (cycle-safe via a `visited` set
+        // keyed on each package directory).
+        //
+        // Siblings are sorted by basename for deterministic re-export
+        // ordering across runs and platforms (where filesystem
+        // ordering varies).
+        if !prep.pub_star_lines.is_empty() {
+            let is_init = path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .map(|s| s == "__init__.ty")
+                .unwrap_or(false);
+            if !is_init {
+                for &line_idx in &prep.pub_star_lines {
+                    let offset = line_offset(&expanded, line_idx);
+                    let advice = TycError::pub_star_outside_init(
+                        path.display().to_string(),
+                        expanded.clone(),
+                        offset,
+                        5,
+                    );
+                    eprintln!("{:?}", miette::Report::new_boxed(Box::new(advice)));
+                }
+            } else if let Some(parent_dir) = path.parent() {
+                // Collect direct .ty siblings (from the pre-computed
+                // `pkg_pub_aggregation` map) and direct sub-packages
+                // (walked separately for transitive expansion).
+                let mut sibling_pubs: Vec<(String, Vec<String>)> = pkg_pub_aggregation
+                    .get(parent_dir)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut subpackages_seen: std::collections::HashSet<PathBuf> =
+                    std::collections::HashSet::new();
+                let mut visited: std::collections::HashSet<PathBuf> =
+                    std::collections::HashSet::new();
+                visited.insert(parent_dir.to_path_buf());
+                for (sib_path, _) in &sources {
+                    let sib_parent = match sib_path.parent() {
+                        Some(p) => p,
+                        None => continue,
+                    };
+                    // Direct sub-package: a file whose grandparent is
+                    // `parent_dir` and whose immediate parent has an
+                    // `__init__.ty`. The sub-package name is the
+                    // immediate parent's directory name.
+                    if sib_parent.parent() == Some(parent_dir)
+                        && subpackages_seen.insert(sib_parent.to_path_buf())
+                    {
+                        let sub_init = sib_parent.join("__init__.ty");
+                        let has_init = sources.iter().any(|(p, _)| p == &sub_init);
+                        if !has_init {
                             continue;
                         }
-                        // Append at the END of the source so existing
-                        // line numbers stay stable — diagnostics on
-                        // the user's original code still report
-                        // accurate locations. Python evaluates these
-                        // re-exports at import time regardless of
-                        // their position.
-                        let names_str = new_names
-                            .iter()
-                            .map(|s| s.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        buf.push_str(&format!("from .{} import {}\n", mod_name, names_str));
-                        for n in new_names {
-                            seen.insert(n.clone(), mod_name.clone());
-                            prep.pub_names.push(n.clone());
+                        let sub_name = match sib_parent.file_name().and_then(|s| s.to_str()) {
+                            Some(s) => s.to_owned(),
+                            None => continue,
+                        };
+                        let names = effective_package_surface(sib_parent, &sources, &mut visited);
+                        if !names.is_empty() {
+                            sibling_pubs.push((sub_name, names));
                         }
                     }
-                    if !buf.is_empty() {
-                        // Ensure a trailing newline before appending so
-                        // we don't accidentally glue onto an existing
-                        // final statement that lacks one.
-                        if !prep.python_source.ends_with('\n') {
-                            prep.python_source.push('\n');
+                }
+                // Deterministic re-export order by sibling basename.
+                sibling_pubs.sort_by(|a, b| a.0.cmp(&b.0));
+                // Detect collisions. Each collision bumps
+                // `pub_star_collision_count` so the build fails after
+                // the per-file loop instead of silently emitting bad
+                // re-exports. `name_origin` starts with `__init__.ty`'s
+                // own `pub` names so a same-named sibling export is
+                // also reported (the package-local definition wins,
+                // but the user gets told).
+                let mut name_origin: std::collections::HashMap<String, String> = prep
+                    .pub_names
+                    .iter()
+                    .map(|n| (n.clone(), "<package>".to_owned()))
+                    .collect();
+                let marker_line = *prep.pub_star_lines.first().unwrap_or(&0);
+                let marker_offset = line_offset(&expanded, marker_line);
+                let mut accepted_names: std::collections::HashSet<String> =
+                    name_origin.keys().cloned().collect();
+                for (sibling, names) in &sibling_pubs {
+                    for name in names {
+                        if let Some(prev) = name_origin.get(name) {
+                            let err = TycError::pub_name_collision(
+                                name.clone(),
+                                prev.clone(),
+                                sibling.clone(),
+                                path.display().to_string(),
+                                expanded.clone(),
+                                marker_offset,
+                                5,
+                            );
+                            eprintln!("{:?}", miette::Report::new_boxed(Box::new(err)));
+                            pub_star_collision_count += 1;
+                        } else {
+                            name_origin.insert(name.clone(), sibling.clone());
+                            accepted_names.insert(name.clone());
                         }
-                        prep.python_source.push_str(&buf);
+                    }
+                }
+                // Build the import block. One `from .sibling import
+                // names` per sibling that contributed at least one
+                // non-colliding name, joined by `; ` so the whole
+                // block stays on a single line (preserves source-map
+                // line alignment with the original `pub *` marker).
+                let import_pieces: Vec<String> = sibling_pubs
+                    .iter()
+                    .filter_map(|(sib, names)| {
+                        let kept: Vec<&str> = names
+                            .iter()
+                            .filter(|n| {
+                                // Only emit names actually accepted —
+                                // those that didn't collide with a
+                                // previous sibling or with __init__.ty.
+                                name_origin.get(n.as_str()) == Some(&sib.clone())
+                            })
+                            .map(|s| s.as_str())
+                            .collect();
+                        if kept.is_empty() {
+                            None
+                        } else {
+                            Some(format!("from .{} import {}", sib, kept.join(", ")))
+                        }
+                    })
+                    .collect();
+                if !import_pieces.is_empty() {
+                    let import_line = import_pieces.join("; ");
+                    prep.python_source =
+                        replace_line(&prep.python_source, marker_line, &import_line);
+                    // Append aggregated names to `prep.pub_names` so
+                    // the desugar pass picks them up for `__all__`.
+                    for name in &accepted_names {
+                        if !prep.pub_names.contains(name) && name != "<package>" {
+                            prep.pub_names.push(name.clone());
+                        }
                     }
                 }
             }
@@ -935,6 +1003,17 @@ pub fn run(args: BuildArgs) -> Result<()> {
     } else {
         println!("built {} file(s) → '{}'", emitted, out_dir.display());
     }
+    // R3 frontier: fail the build when `pub *` aggregated colliding
+    // re-exports. The diagnostics were already printed to stderr in
+    // the per-file loop; returning Err here ensures CI gates on them
+    // instead of silently shipping the (order-dependent) shadow.
+    if pub_star_collision_count > 0 {
+        return Err(miette!(
+            "{} `pub *` re-export collision(s) — \
+             see the `tyc::pub_name_collision` advice above for details",
+            pub_star_collision_count
+        ));
+    }
     Ok(())
 }
 
@@ -1059,6 +1138,206 @@ fn find_env_key_for_comptime_binding(source: &str, binding_name: &str) -> Option
         return Some(rest[..end].to_owned());
     }
     None
+}
+
+/// Byte offset of the start of the 0-based `line_idx` line in `source`.
+/// Used by the `pub *` aggregation pass to anchor `tyc::pub_star_*`
+/// diagnostic spans at the original marker line. Returns `source.len()`
+/// when the line index is out of range so the diagnostic still renders.
+fn line_offset(source: &str, line_idx: usize) -> usize {
+    let mut offset = 0usize;
+    let mut current = 0usize;
+    for (i, b) in source.bytes().enumerate() {
+        if current == line_idx {
+            offset = i;
+            break;
+        }
+        if b == b'\n' {
+            current += 1;
+            offset = i + 1;
+        }
+    }
+    if current < line_idx {
+        return source.len();
+    }
+    offset
+}
+
+/// Replace the 0-based `line_idx` line of `source` with `replacement`
+/// (the newline terminator is preserved). Used by the `pub *`
+/// aggregation pass to inject `from .sibling import …` blocks at the
+/// original `pub *` marker so the rest of the pipeline emits the
+/// imports as normal.
+fn replace_line(source: &str, line_idx: usize, replacement: &str) -> String {
+    let mut out = String::with_capacity(source.len() + replacement.len());
+    for (current, line) in source.split_inclusive('\n').enumerate() {
+        if current == line_idx {
+            out.push_str(replacement);
+            if line.ends_with('\n') {
+                out.push('\n');
+            }
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+/// Compute the effective public surface of a package directory.
+/// Walks `__init__.ty`'s top-level `pub` names, then — if that
+/// `__init__.ty` itself contains a `pub *` marker — recurses into
+/// every direct sub-package and direct .ty sibling at one level
+/// deeper, mirroring the aggregation the build-time `pub *` rewrite
+/// does in place. The result is the set of names a hypothetical
+/// `from <pkg> import *` would receive.
+///
+/// `visited` carries every package directory that's already been
+/// expanded along the current chain, breaking cycles that arise from
+/// pathological repository layouts (e.g. a sub-package whose
+/// `__init__.ty` re-points at its own grandparent). The walk is
+/// loaded-source-only — it never touches the filesystem, so an
+/// unloaded sub-tree is silently skipped.
+fn effective_package_surface(
+    pkg_dir: &std::path::Path,
+    sources: &[(PathBuf, String)],
+    visited: &mut std::collections::HashSet<PathBuf>,
+) -> Vec<String> {
+    let pkg_owned = pkg_dir.to_path_buf();
+    if !visited.insert(pkg_owned.clone()) {
+        return Vec::new();
+    }
+    let init_path = pkg_dir.join("__init__.ty");
+    let init_source = match sources.iter().find(|(p, _)| p == &init_path) {
+        Some((_, s)) => s,
+        None => return Vec::new(),
+    };
+    let mut out: Vec<String> = extract_top_level_pub_names(init_source);
+    if !source_has_pub_star_marker(init_source) {
+        return out;
+    }
+    // Aggregate one level deeper: direct .ty siblings of this
+    // __init__.ty + direct sub-packages.
+    let mut sub_packages_seen: std::collections::HashSet<PathBuf> =
+        std::collections::HashSet::new();
+    for (sib_path, sib_source) in sources {
+        let sib_parent = match sib_path.parent() {
+            Some(p) => p,
+            None => continue,
+        };
+        if sib_parent == pkg_dir {
+            let is_init = sib_path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .map(|s| s == "__init__.ty")
+                .unwrap_or(false);
+            if is_init {
+                continue;
+            }
+            for name in extract_top_level_pub_names(sib_source) {
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+            continue;
+        }
+        if sib_parent.parent() == Some(pkg_dir)
+            && sub_packages_seen.insert(sib_parent.to_path_buf())
+        {
+            let sub_init = sib_parent.join("__init__.ty");
+            if !sources.iter().any(|(p, _)| p == &sub_init) {
+                continue;
+            }
+            for name in effective_package_surface(sib_parent, sources, visited) {
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Fast textual extractor for top-level (zero-indent) `pub <kw> NAME`
+/// declarations in a Typhon source file. Used by the `pub *`
+/// aggregation pre-pass so the orchestrator can know each sibling
+/// module's public surface without paying for a full preprocess of
+/// every sibling. Mirrors the logic
+/// [`tyc_syntax::preprocess::pub_decl_name`] applies, but operates
+/// directly on the raw text.
+/// True when `source` contains a `pub *` marker at module level (zero
+/// indent) that the preprocessor would recognise. Mirrors
+/// `tyc_syntax::preprocess::is_pub_star_line`'s acceptance rules so
+/// invalid forms like `pub * from foo` and occurrences inside
+/// triple-quoted strings / comments don't falsely trigger transitive
+/// aggregation. Used by `effective_package_surface` to gate recursion
+/// into sub-packages.
+fn source_has_pub_star_marker(source: &str) -> bool {
+    let mut in_triple_string = false;
+    for line in source.split_inclusive('\n') {
+        let triple_count = line.matches("\"\"\"").count() + line.matches("'''").count();
+        if in_triple_string {
+            if triple_count % 2 == 1 {
+                in_triple_string = false;
+            }
+            continue;
+        }
+        if triple_count % 2 == 1 {
+            in_triple_string = true;
+            continue;
+        }
+        let indent_len = line
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(line.len());
+        if indent_len != 0 {
+            continue;
+        }
+        let rest = &line[indent_len..];
+        let Some(after) = rest.strip_prefix("pub *") else {
+            continue;
+        };
+        let trimmed = after.trim_start_matches([' ', '\t']);
+        let body = trimmed.trim_end_matches(['\n', '\r']);
+        if body.is_empty() || body.starts_with('#') {
+            return true;
+        }
+    }
+    false
+}
+
+fn extract_top_level_pub_names(source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_triple_string = false;
+    for line in source.split_inclusive('\n') {
+        // Skip the content of triple-quoted strings (docstrings,
+        // multi-line literals) so a `"""... pub class ... """` block
+        // doesn't masquerade as a real declaration.
+        let triple_count = line.matches("\"\"\"").count() + line.matches("'''").count();
+        if in_triple_string {
+            if triple_count % 2 == 1 {
+                in_triple_string = false;
+            }
+            continue;
+        }
+        if triple_count % 2 == 1 {
+            in_triple_string = true;
+            continue;
+        }
+        // Only zero-indent lines start a top-level declaration.
+        let indent_len = line
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(line.len());
+        if indent_len != 0 {
+            continue;
+        }
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        let Some(after_pub) = trimmed.strip_prefix("pub ") else {
+            continue;
+        };
+        if let Some(name) = tyc_syntax::preprocess::pub_decl_name(after_pub) {
+            out.push(name);
+        }
+    }
+    out
 }
 
 /// Derive the dotted Python module name that the runtime profiler

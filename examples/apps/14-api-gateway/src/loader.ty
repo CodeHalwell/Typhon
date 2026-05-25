@@ -2,12 +2,12 @@ import json
 
 from balancer import (
     BalanceStrategy,
-    make_least_conn,
-    make_random_strategy,
-    make_round_robin,
-    make_weighted,
-    new_balancer,
     Balancer,
+    StratLeastConn,
+    StratRandom,
+    StratRoundRobin,
+    StratWeighted,
+    new_balancer,
 )
 from ids import RouteId, UpstreamId
 from routes import Route, RouteTable, new_route
@@ -33,14 +33,14 @@ pub def err_load(path: str, reason: str) -> LoadError:
 def _strategy_for(name: str) -> BalanceStrategy:
     let lower: str = name.lower()
     if lower == "round_robin":
-        return make_round_robin()
+        return StratRoundRobin(cursor=0)
     if lower == "least_conn":
-        return make_least_conn()
+        return StratLeastConn(placeholder=0)
     if lower == "random":
-        return make_random_strategy()
+        return StratRandom(placeholder=0)
     if lower == "weighted":
-        return make_weighted()
-    return make_round_robin()
+        return StratWeighted(placeholder=0)
+    return StratRoundRobin(cursor=0)
 
 
 def _upstreams_for(specs: list[UpstreamSpec]) -> list[Upstream]:
@@ -80,7 +80,7 @@ pub def load_routes_from_text(raw_path: str, raw_text: str) -> Result[tuple[Rout
                     timeout_seconds=spec.timeout_seconds,
                     requires_auth=spec.requires_auth,
                 )
-                # The desugared `new_route` defaults `strategy=make_round_robin()`;
+                # The desugared `new_route` defaults `strategy=StratRoundRobin(cursor=0)`;
                 # overwrite with the actual chosen strategy.
                 r.strategy = strategy
                 routes.append(r)
@@ -117,5 +117,5 @@ pub def default_routes() -> tuple[RouteTable, dict[str, Balancer]]:
         timeout_seconds=5.0,
         requires_auth=False,
     )
-    let balancers: dict[str, Balancer] = {"default": new_balancer(make_round_robin())}
+    let balancers: dict[str, Balancer] = {"default": new_balancer(StratRoundRobin(cursor=0))}
     return (RouteTable(routes=[r]), balancers)

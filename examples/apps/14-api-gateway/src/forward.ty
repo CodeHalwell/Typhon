@@ -4,8 +4,8 @@ import httpx
 
 from breaker import (
     CircuitBreaker,
+    StateClosed,
     gate as breaker_gate,
-    make_closed,
     record_failure as breaker_record_failure,
     record_success as breaker_record_success,
 )
@@ -18,7 +18,6 @@ from models import (
     err_breaker_open,
     err_no_upstream,
     err_upstream_failure,
-    make_response,
 )
 from retry import (
     backoff_delay_ms,
@@ -57,7 +56,7 @@ def _breaker_for(ctx: ForwardContext, upstream: UpstreamId) -> CircuitBreaker:
     let fresh: CircuitBreaker = CircuitBreaker(
         upstream=upstream,
         policy=ctx.config.breaker,
-        state=make_closed(0),
+        state=StateClosed(consecutive_failures=0),
     )
     ctx.breakers[key] = fresh
     return fresh
@@ -90,7 +89,7 @@ async def _call_once(
         let resp_headers: dict[str, str] = {}
         for (hk, hv) in resp.headers.items():
             resp_headers[hk] = hv
-        return Ok(make_response(
+        return Ok(HttpResponse(
             status=int(resp.status_code),
             body=resp.content,
             headers=resp_headers,

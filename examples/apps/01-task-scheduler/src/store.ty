@@ -20,12 +20,6 @@ from models import (
     event_message,
     event_task_id,
     event_worker_id,
-    make_status_cancelled,
-    make_status_failed,
-    make_status_pending,
-    make_status_ready,
-    make_status_running,
-    make_status_succeeded,
 )
 
 
@@ -94,9 +88,9 @@ impl Store:
     ) -> Result[Task, StoreError]:
         let now: datetime = datetime.now(timezone.utc)
         let initial: TaskStatus = (
-            make_status_ready(now)
+            StatusReady(now)
             if len(depends_on) == 0
-            else make_status_pending(list(depends_on))
+            else StatusPending(list(depends_on))
         )
         let status_label: str = "ready" if len(depends_on) == 0 else "pending"
         try:
@@ -178,7 +172,7 @@ impl Store:
         not_before: datetime,
     ) -> Result[None, StoreError]:
         let now: datetime = datetime.now(timezone.utc)
-        let status: TaskStatus = make_status_ready(enqueued_at=not_before)
+        let status: TaskStatus = StatusReady(enqueued_at=not_before)
         try:
             with self._connect() as conn:
                 conn.execute(
@@ -240,7 +234,7 @@ impl Store:
                     return Ok(None)
                 let task: Task = _row_to_task(row)
                 let run_id: RunId = RunId(task.attempts + 1)
-                let running: TaskStatus = make_status_running(
+                let running: TaskStatus = StatusRunning(
                     worker=worker, started_at=now, run_id=run_id
                 )
                 conn.execute(
@@ -296,7 +290,7 @@ impl Store:
                             " WHERE id = ?",
                             (
                                 "ready",
-                                json.dumps(_status_to_json(make_status_ready(now))),
+                                json.dumps(_status_to_json(StatusReady(now))),
                                 now.isoformat(),
                                 now.isoformat(),
                                 tid,
@@ -391,27 +385,27 @@ def _json_to_status(blob: dict[str, object]) -> TaskStatus:
     let kind: str = str(blob["kind"])
     if kind == "pending":
         let waiting_raw: list[object] = list(blob.get("waiting_on") or [])
-        return make_status_pending([TaskId(int(x)) for x in waiting_raw])
+        return StatusPending([TaskId(int(x)) for x in waiting_raw])
     if kind == "ready":
-        return make_status_ready(datetime.fromisoformat(str(blob["enqueued_at"])))
+        return StatusReady(datetime.fromisoformat(str(blob["enqueued_at"])))
     if kind == "running":
-        return make_status_running(
+        return StatusRunning(
             worker=WorkerId(str(blob["worker"])),
             started_at=datetime.fromisoformat(str(blob["started_at"])),
             run_id=RunId(int(blob.get("run_id") or 0)),
         )
     if kind == "succeeded":
-        return make_status_succeeded(
+        return StatusSucceeded(
             finished_at=datetime.fromisoformat(str(blob["finished_at"])),
             result_summary=str(blob.get("summary") or ""),
         )
     if kind == "failed":
-        return make_status_failed(
+        return StatusFailed(
             finished_at=datetime.fromisoformat(str(blob["finished_at"])),
             last_error=str(blob.get("error") or ""),
             attempts=int(blob.get("attempts") or 0),
         )
-    return make_status_cancelled(
+    return StatusCancelled(
         cancelled_at=datetime.fromisoformat(str(blob["cancelled_at"])),
         reason=str(blob.get("reason") or ""),
     )

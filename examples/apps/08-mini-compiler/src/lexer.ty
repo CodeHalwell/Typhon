@@ -1,16 +1,16 @@
-from source import Source, Span, line_col_at, make_span
+from source import Source, Span, line_col_at
 from tokens import (
     Token,
     is_keyword,
-    make_tk_arrow,
-    make_tk_eof,
-    make_tk_float,
-    make_tk_ident,
-    make_tk_int,
-    make_tk_keyword,
-    make_tk_op,
-    make_tk_punct,
-    make_tk_str,
+    TkArrow,
+    TkEof,
+    TkFloat,
+    TkIdent,
+    TkInt,
+    TkKeyword,
+    TkOp,
+    TkPunct,
+    TkStr,
 )
 
 
@@ -33,7 +33,7 @@ def _is_alnum(ch: str) -> bool:
 
 def _span(text: str, start: int, end: int) -> Span:
     let lc: tuple[int, int] = line_col_at(text, start)
-    return make_span(start, end, lc[0], lc[1])
+    return Span(start, end, lc[0], lc[1])
 
 
 pub def tokenize(source: Source) -> Result[list[Token], LexError]:
@@ -66,10 +66,10 @@ pub def tokenize(source: Source) -> Result[list[Token], LexError]:
                 while i < n and _is_digit(text[i]):
                     i = i + 1
                 let raw_f: str = text[start_n:i]
-                tokens.append(make_tk_float(float(raw_f), _span(text, start_n, i)))
+                tokens.append(TkFloat(float(raw_f), _span(text, start_n, i)))
             else:
                 let raw_i: str = text[start_n:i]
-                tokens.append(make_tk_int(int(raw_i), _span(text, start_n, i)))
+                tokens.append(TkInt(int(raw_i), _span(text, start_n, i)))
             continue
 
         # Identifier / keyword
@@ -80,9 +80,9 @@ pub def tokenize(source: Source) -> Result[list[Token], LexError]:
             let word: str = text[start_id:i]
             let sp_id: Span = _span(text, start_id, i)
             if is_keyword(word):
-                tokens.append(make_tk_keyword(word, sp_id))
+                tokens.append(TkKeyword(word, sp_id))
             else:
-                tokens.append(make_tk_ident(word, sp_id))
+                tokens.append(TkIdent(word, sp_id))
             continue
 
         # String literal
@@ -104,30 +104,30 @@ pub def tokenize(source: Source) -> Result[list[Token], LexError]:
                     message="unterminated string literal",
                     span=_span(text, start_s, i),
                 ))
-            tokens.append(make_tk_str(buf, _span(text, start_s, i)))
+            tokens.append(TkStr(buf, _span(text, start_s, i)))
             continue
 
         # Two-char operators
         if i + 1 < n:
             let two: str = text[i:i + 2]
             if two == "<=" or two == ">=" or two == "==" or two == "!=":
-                tokens.append(make_tk_op(two, _span(text, i, i + 2)))
+                tokens.append(TkOp(two, _span(text, i, i + 2)))
                 i = i + 2
                 continue
             if two == "->":
-                tokens.append(make_tk_arrow(_span(text, i, i + 2)))
+                tokens.append(TkArrow(_span(text, i, i + 2)))
                 i = i + 2
                 continue
 
         # Single-char operators (and `=` used by `let` bindings)
         if ch == "+" or ch == "-" or ch == "*" or ch == "/" or ch == "<" or ch == ">" or ch == "=":
-            tokens.append(make_tk_op(ch, _span(text, i, i + 1)))
+            tokens.append(TkOp(ch, _span(text, i, i + 1)))
             i = i + 1
             continue
 
         # Punctuation
         if ch == "(" or ch == ")" or ch == "{" or ch == "}" or ch == "," or ch == ":" or ch == ";":
-            tokens.append(make_tk_punct(ch, _span(text, i, i + 1)))
+            tokens.append(TkPunct(ch, _span(text, i, i + 1)))
             i = i + 1
             continue
 
@@ -136,5 +136,5 @@ pub def tokenize(source: Source) -> Result[list[Token], LexError]:
             span=_span(text, i, i + 1),
         ))
 
-    tokens.append(make_tk_eof(_span(text, n, n)))
+    tokens.append(TkEof(_span(text, n, n)))
     return Ok(value=tokens)

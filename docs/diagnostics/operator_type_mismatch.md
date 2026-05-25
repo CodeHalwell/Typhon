@@ -28,4 +28,32 @@ def main() -> None:
     let result: str = "x" + str(1)
 ```
 
+## Cross-newtype arithmetic
+
+The same code also fires when two distinct `newtype`s with a shared
+numeric base are combined arithmetically:
+
+```ty
+newtype LogIndex = int
+newtype Term = int
+
+def main() -> None:
+    let idx: LogIndex = LogIndex(1)
+    let t: Term = Term(5)
+    let bad: LogIndex = idx + t   # ❌ operator `+` does not apply to `LogIndex` and `Term`
+```
+
+`LogIndex` and `Term` deliberately live on different axes — the runtime
+values are both ints, but at the type level they should not be silently
+interchangeable just because they share a base. Same-newtype arithmetic
+(`LogIndex + LogIndex`) and one-sided arithmetic with a literal of the
+newtype's base (`LogIndex + 1`) preserve the newtype; cross-newtype use
+fires this diagnostic.
+
+Wrap explicitly at the boundary if the cross is intentional:
+
+```ty
+let bumped: LogIndex = idx + LogIndex(int(t))
+```
+
 See https://typhon.dev/lang/diagnostics/operator_type_mismatch

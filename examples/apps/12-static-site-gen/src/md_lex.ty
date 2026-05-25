@@ -39,39 +39,6 @@ pub class LnText:
     text: str
     line: int
 
-
-pub def make_ln_heading(level: int, text: str, line: int) -> MdLine:
-    return LnHeading(level=level, text=text, line=line)
-
-
-pub def make_ln_list(text: str, line: int) -> MdLine:
-    return LnList(text=text, line=line)
-
-
-pub def make_ln_olist(text: str, line: int) -> MdLine:
-    return LnOList(text=text, line=line)
-
-
-pub def make_ln_fence(lang: str, line: int) -> MdLine:
-    return LnFence(lang=lang, line=line)
-
-
-pub def make_ln_quote(text: str, line: int) -> MdLine:
-    return LnQuote(text=text, line=line)
-
-
-pub def make_ln_rule() -> MdLine:
-    return LnRule()
-
-
-pub def make_ln_blank() -> MdLine:
-    return LnBlank()
-
-
-pub def make_ln_text(text: str, line: int) -> MdLine:
-    return LnText(text=text, line=line)
-
-
 def _count_leading(text: str, ch: str) -> int:
     mut i: int = 0
     let n: int = len(text)
@@ -124,32 +91,32 @@ pub def lex_lines(source: str) -> list[MdLine]:
         idx = idx + 1
         let stripped: str = raw.rstrip()
         if len(stripped.strip()) == 0:
-            out.append(make_ln_blank())
+            out.append(LnBlank())
             continue
         if stripped.startswith("```") or stripped.startswith("~~~"):
             let lang: str = stripped[3:len(stripped)].strip()
-            out.append(make_ln_fence(lang, line_num))
+            out.append(LnFence(lang, line_num))
             continue
         if stripped.startswith("#"):
             let level: int = _count_leading(stripped, "#")
             if level >= 1 and level <= 6 and level < len(stripped) and stripped[level] == " ":
                 let text: str = stripped[level + 1:len(stripped)].strip()
-                out.append(make_ln_heading(level, text, line_num))
+                out.append(LnHeading(level, text, line_num))
                 continue
         if _is_rule(stripped):
-            out.append(make_ln_rule())
+            out.append(LnRule())
             continue
         if stripped.startswith("- ") or stripped.startswith("* ") or stripped.startswith("+ "):
-            out.append(make_ln_list(stripped[2:len(stripped)], line_num))
+            out.append(LnList(stripped[2:len(stripped)], line_num))
             continue
         if _starts_with_olist(stripped):
-            out.append(make_ln_olist(_olist_rest(stripped), line_num))
+            out.append(LnOList(_olist_rest(stripped), line_num))
             continue
         if stripped.startswith("> "):
-            out.append(make_ln_quote(stripped[2:len(stripped)], line_num))
+            out.append(LnQuote(stripped[2:len(stripped)], line_num))
             continue
         if stripped.startswith(">"):
-            out.append(make_ln_quote(stripped[1:len(stripped)].lstrip(), line_num))
+            out.append(LnQuote(stripped[1:len(stripped)].lstrip(), line_num))
             continue
-        out.append(make_ln_text(stripped, line_num))
+        out.append(LnText(stripped, line_num))
     return out

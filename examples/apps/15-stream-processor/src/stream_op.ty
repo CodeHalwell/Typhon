@@ -101,11 +101,11 @@ pub def make_map_op[I, O](
     fn: Callable[[object], object],
 ) -> Operator[I, O]:
     def step(env: Envelope) -> list[Envelope]:
-        from event import is_record, make_record_envelope
+        from event import is_record, make_record
         if not is_record(env):
             return [env]
         let new_payload: object = fn(env.record_payload)
-        return [make_record_envelope(env.timestamp_ms, env.key, new_payload)]
+        return [make_record(env.timestamp_ms, env.key, new_payload)]
 
     def on_end() -> list[Envelope]:
         return []
@@ -136,11 +136,11 @@ pub def make_key_by_op[T](
     keyer: Callable[[object], str],
 ) -> Operator[T, T]:
     def step(env: Envelope) -> list[Envelope]:
-        from event import is_record, make_record_envelope
+        from event import is_record, make_record
         if not is_record(env):
             return [env]
         let new_key: str = keyer(env.record_payload)
-        return [make_record_envelope(
+        return [make_record(
             env.timestamp_ms, StreamKey(new_key), env.record_payload,
         )]
 
@@ -166,11 +166,11 @@ pub def make_reduce_op[T](
     let state: ReduceState = ReduceState(has_seed=True, acc=seed)
 
     def step(env: Envelope) -> list[Envelope]:
-        from event import is_record, make_record_envelope
+        from event import is_record, make_record
         if not is_record(env):
             return [env]
         state.acc = reducer(state.acc, env.record_payload)
-        return [make_record_envelope(env.timestamp_ms, env.key, state.acc)]
+        return [make_record(env.timestamp_ms, env.key, state.acc)]
 
     def on_end() -> list[Envelope]:
         return []
@@ -205,7 +205,7 @@ pub def make_join_op[L, R, O](
     let state: JoinOpState = new_join_op_state(window_ms)
 
     def step(env: Envelope) -> list[Envelope]:
-        from event import is_record, make_record_envelope
+        from event import is_record, make_record
         if not is_record(env):
             return [env]
         # Treat all records as "left side" for this demo entry-point; a real
@@ -226,7 +226,7 @@ pub def make_join_op[L, R, O](
         for e in state.buffered:
             if str(e.key) == str(env.key) and e.ts_ms != env.timestamp_ms:
                 let joined: object = combiner(e.payload, env.record_payload)
-                out.append(make_record_envelope(env.timestamp_ms, env.key, joined))
+                out.append(make_record(env.timestamp_ms, env.key, joined))
         return out
 
     def on_end() -> list[Envelope]:

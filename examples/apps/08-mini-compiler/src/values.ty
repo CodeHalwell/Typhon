@@ -60,31 +60,6 @@ pub def empty_env() -> Env:
 
 
 # Factories — variant→union upcast across modules.
-
-pub def make_v_int(value: int) -> Value:
-    return VInt(value=value)
-
-
-pub def make_v_float(value: float) -> Value:
-    return VFloat(value=value)
-
-
-pub def make_v_str(value: str) -> Value:
-    return VStr(value=value)
-
-
-pub def make_v_bool(value: bool) -> Value:
-    return VBool(value=value)
-
-
-pub def make_v_unit() -> Value:
-    return VUnit()
-
-
-pub def make_v_fn(params: list[Param], body: Expr, closure: Env) -> Value:
-    return VFn(params=params, body=body, closure=closure)
-
-
 pub def value_label(v: Value) -> str:
     match v:
         case VInt(_):     return "int"

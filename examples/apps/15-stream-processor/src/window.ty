@@ -21,19 +21,6 @@ pub class WSliding:
 pub class WSession:
     gap_ms: int
 
-
-pub def make_tumbling(size_ms: int) -> WindowKind:
-    return WTumbling(size_ms=size_ms)
-
-
-pub def make_sliding(size_ms: int, slide_ms: int) -> WindowKind:
-    return WSliding(size_ms=size_ms, slide_ms=slide_ms)
-
-
-pub def make_session(gap_ms: int) -> WindowKind:
-    return WSession(gap_ms=gap_ms)
-
-
 pub def window_kind_label(k: WindowKind) -> str:
     match k:
         case WTumbling(_):     return "tumbling"

@@ -1,5 +1,5 @@
 from components import Collider, Damage, Health, Position, Sprite, Tag, Velocity
-from events import GameEvent, make_ev_despawned, make_ev_spawned
+from events import GameEvent, EvDespawned, EvSpawned
 from ids import EntityId
 from vec2 import Vec2
 
@@ -25,7 +25,7 @@ impl World:
         let eid: EntityId = EntityId(raw)
         self.alive[raw] = True
         self.positions[raw] = Position(pos=at)
-        self.event_queue.append(make_ev_spawned(eid, at))
+        self.event_queue.append(EvSpawned(eid, at))
         return eid
 
     def despawn(self, eid: EntityId, reason: str) -> None:
@@ -40,7 +40,7 @@ impl World:
         self.sprites.pop(raw, None)
         self.colliders.pop(raw, None)
         self.tags.pop(raw, None)
-        self.event_queue.append(make_ev_despawned(eid, reason))
+        self.event_queue.append(EvDespawned(eid, reason))
 
     def is_alive(self, eid: EntityId) -> bool:
         let raw: int = int(eid)

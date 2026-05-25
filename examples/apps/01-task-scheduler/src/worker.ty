@@ -7,9 +7,9 @@ from ids import WorkerId
 from models import (
     StatusRunning,
     Task,
-    make_task_started,
-    make_worker_started,
-    make_worker_stopped,
+    TaskStarted,
+    WorkerStarted,
+    WorkerStopped,
 )
 from scheduler import HandlerFailure, HandlerOk, Registry, Scheduler
 
@@ -23,13 +23,13 @@ pub class Worker:
 impl Worker:
     async def loop(self) -> None:
         let now: datetime = datetime.now(timezone.utc)
-        self.scheduler.emit(make_worker_started(worker=self.id, at=now))
+        self.scheduler.emit(WorkerStarted(worker=self.id, at=now))
         try:
             while not self.scheduler.shutdown.is_set():
                 await self._tick()
         finally:
             let stopped_at: datetime = datetime.now(timezone.utc)
-            self.scheduler.emit(make_worker_stopped(worker=self.id, at=stopped_at))
+            self.scheduler.emit(WorkerStopped(worker=self.id, at=stopped_at))
 
     async def _tick(self) -> None:
         let cfg: SchedulerConfig = self.scheduler.config
@@ -53,7 +53,7 @@ impl Worker:
         let attempt: int = task.attempts + 1
         match task.status:
             case StatusRunning(_, _, _):
-                self.scheduler.emit(make_task_started(
+                self.scheduler.emit(TaskStarted(
                     task_id=task.id,
                     worker=self.id,
                     attempt=attempt,

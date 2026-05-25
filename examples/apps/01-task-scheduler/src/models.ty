@@ -188,63 +188,6 @@ pub def event_worker_id(event: SchedulerEvent) -> WorkerId?:
         case WorkerStarted(w, _):            return w
         case WorkerStopped(w, _):            return w
 
-
-pub def make_task_submitted(task_id: TaskId, job: JobName, at: datetime) -> SchedulerEvent:
-    return TaskSubmitted(task_id=task_id, job=job, at=at)
-
-
-pub def make_task_ready(task_id: TaskId, at: datetime) -> SchedulerEvent:
-    return TaskBecameReady(task_id=task_id, at=at)
-
-
-pub def make_task_started(task_id: TaskId, worker: WorkerId, attempt: int, at: datetime) -> SchedulerEvent:
-    return TaskStarted(task_id=task_id, worker=worker, attempt=attempt, at=at)
-
-
-pub def make_task_completed(task_id: TaskId, worker: WorkerId, duration_ms: int, at: datetime) -> SchedulerEvent:
-    return TaskCompleted(task_id=task_id, worker=worker, duration_ms=duration_ms, at=at)
-
-
-pub def make_task_failed(task_id: TaskId, worker: WorkerId, error: str, attempt: int, at: datetime) -> SchedulerEvent:
-    return TaskFailed(task_id=task_id, worker=worker, error=error, attempt=attempt, at=at)
-
-
-pub def make_task_retry(task_id: TaskId, delay_seconds: float, next_attempt: int, at: datetime) -> SchedulerEvent:
-    return TaskRetryScheduled(task_id=task_id, delay_seconds=delay_seconds, next_attempt=next_attempt, at=at)
-
-
-pub def make_worker_started(worker: WorkerId, at: datetime) -> SchedulerEvent:
-    return WorkerStarted(worker=worker, at=at)
-
-
-pub def make_worker_stopped(worker: WorkerId, at: datetime) -> SchedulerEvent:
-    return WorkerStopped(worker=worker, at=at)
-
-
-pub def make_status_pending(waiting_on: list[TaskId]) -> TaskStatus:
-    return StatusPending(waiting_on=waiting_on)
-
-
-pub def make_status_ready(enqueued_at: datetime) -> TaskStatus:
-    return StatusReady(enqueued_at=enqueued_at)
-
-
-pub def make_status_running(worker: WorkerId, started_at: datetime, run_id: RunId) -> TaskStatus:
-    return StatusRunning(worker=worker, started_at=started_at, run_id=run_id)
-
-
-pub def make_status_succeeded(finished_at: datetime, result_summary: str) -> TaskStatus:
-    return StatusSucceeded(finished_at=finished_at, result_summary=result_summary)
-
-
-pub def make_status_failed(finished_at: datetime, last_error: str, attempts: int) -> TaskStatus:
-    return StatusFailed(finished_at=finished_at, last_error=last_error, attempts=attempts)
-
-
-pub def make_status_cancelled(cancelled_at: datetime, reason: str) -> TaskStatus:
-    return StatusCancelled(cancelled_at=cancelled_at, reason=reason)
-
-
 pub def event_message(event: SchedulerEvent) -> str:
     match event:
         case TaskSubmitted(_, job, _):           return f"submitted job={job}"

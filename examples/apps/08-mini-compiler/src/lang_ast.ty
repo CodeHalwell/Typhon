@@ -86,63 +86,6 @@ pub class ExPrint:
 
 # Factories — variant→union cross-module upcast fails. Every Expr
 # construction outside this module routes through one of these.
-
-pub def make_ex_int(value: int, span: Span) -> Expr:
-    return ExInt(value=value, span=span)
-
-
-pub def make_ex_float(value: float, span: Span) -> Expr:
-    return ExFloat(value=value, span=span)
-
-
-pub def make_ex_str(value: str, span: Span) -> Expr:
-    return ExStr(value=value, span=span)
-
-
-pub def make_ex_bool(value: bool, span: Span) -> Expr:
-    return ExBool(value=value, span=span)
-
-
-pub def make_ex_ident(name: str, span: Span) -> Expr:
-    return ExIdent(name=name, span=span)
-
-
-pub def make_ex_binop(op: str, left: Expr, right: Expr, span: Span) -> Expr:
-    return ExBinOp(op=op, left=left, right=right, span=span)
-
-
-pub def make_ex_unary(op: str, operand: Expr, span: Span) -> Expr:
-    return ExUnary(op=op, operand=operand, span=span)
-
-
-pub def make_ex_call(callee: Expr, args: list[Expr], span: Span) -> Expr:
-    return ExCall(callee=callee, args=args, span=span)
-
-
-pub def make_ex_if(cond: Expr, then_branch: Expr, else_branch: Expr, span: Span) -> Expr:
-    return ExIf(cond=cond, then_branch=then_branch, else_branch=else_branch, span=span)
-
-
-pub def make_ex_let(name: str, value: Expr, body: Expr, span: Span) -> Expr:
-    return ExLet(name=name, value=value, body=body, span=span)
-
-
-pub def make_param(name: str, type_annot: str) -> Param:
-    return Param(name=name, type_annot=type_annot)
-
-
-pub def make_ex_fn(params: list[Param], ret_type: str, body: Expr, span: Span) -> Expr:
-    return ExFn(params=params, ret_type=ret_type, body=body, span=span)
-
-
-pub def make_ex_block(exprs: list[Expr], span: Span) -> Expr:
-    return ExBlock(exprs=exprs, span=span)
-
-
-pub def make_ex_print(arg: Expr, span: Span) -> Expr:
-    return ExPrint(arg=arg, span=span)
-
-
 pub def expr_span(e: Expr) -> Span:
     match e:
         case ExInt(_, sp_int):              return sp_int
