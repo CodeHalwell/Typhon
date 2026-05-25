@@ -3355,9 +3355,7 @@ def foo():
     fn let_without_initialiser_rejects_second_assignment() {
         // R3-8: only the FIRST assignment is the initialiser. A second
         // assignment to the same `let` binding still fires immutable_assign.
-        let (_m, d) = resolve(
-            "def f() -> None:\n    let x: int\n    x = 5\n    x = 6\n",
-        );
+        let (_m, d) = resolve("def f() -> None:\n    let x: int\n    x = 5\n    x = 6\n");
         assert!(
             d.errors()
                 .iter()
@@ -3415,9 +3413,8 @@ def foo():
     fn mut_without_initialiser_allows_repeated_assignment() {
         // R3-8: `mut x: T` without an initialiser declares a mutable
         // binding; any number of subsequent assignments are legal.
-        let (_m, d) = resolve(
-            "def f() -> None:\n    mut x: int\n    x = 5\n    x = 6\n    x = 7\n",
-        );
+        let (_m, d) =
+            resolve("def f() -> None:\n    mut x: int\n    x = 5\n    x = 6\n    x = 7\n");
         assert!(
             !d.has_errors(),
             "`mut x: int` followed by repeated `x = N` must check clean; got {:?}",

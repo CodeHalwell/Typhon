@@ -6812,11 +6812,7 @@ mod tests {
         let result = preprocess(src);
         assert_eq!(result.pub_star_lines, vec![0]);
         // The first line should be blank (the marker was stripped).
-        let first_line = result
-            .python_source
-            .lines()
-            .next()
-            .unwrap_or("");
+        let first_line = result.python_source.lines().next().unwrap_or("");
         assert!(
             first_line.trim().is_empty(),
             "pub * line should be blanked; got {:?}",

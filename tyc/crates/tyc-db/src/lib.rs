@@ -796,8 +796,7 @@ fn build_external_shapes(
     // union name itself is the source-module name (e.g.
     // `SchedulerEvent`), matching the formal parameter type the
     // checker sees on the cross-module function signature.
-    let mut modules_touched: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut modules_touched: std::collections::HashSet<String> = std::collections::HashSet::new();
     for b in bindings {
         let Some(info) = &b.import_info else { continue };
         if info.member.is_none() {

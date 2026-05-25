@@ -4590,11 +4590,7 @@ fn extract_first_yield_type(body: &[Stmt], classes: &[String]) -> Option<Type> {
 /// control-flow statements so a `let s: Session` inside an `if` /
 /// `try` / `with` is still visible at the matching yield site. Does
 /// not descend into nested function definitions.
-fn collect_local_annotations(
-    body: &[Stmt],
-    classes: &[String],
-    out: &mut HashMap<String, Type>,
-) {
+fn collect_local_annotations(body: &[Stmt], classes: &[String], out: &mut HashMap<String, Type>) {
     for stmt in body {
         collect_local_annotations_stmt(stmt, classes, out);
     }
@@ -6294,11 +6290,11 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 //      permissive flow doesn't break user code.
                 if let Some(target) = item.optional_vars.as_deref() {
                     if let Expr::Name(target_name) = target {
-                        let target_ty = with_target_type(c, &item.context_expr, &ctx_ty, w.is_async);
+                        let target_ty =
+                            with_target_type(c, &item.context_expr, &ctx_ty, w.is_async);
                         let span = (
                             target_name.range.start().to_usize(),
-                            target_name.range.start().to_usize()
-                                + target_name.id.as_str().len(),
+                            target_name.range.start().to_usize() + target_name.id.as_str().len(),
                         );
                         c.env.declare(TypeBinding {
                             name: target_name.id.as_str().to_owned(),
@@ -7049,16 +7045,15 @@ fn da_check_expr(
                 if !state.assigned.contains(name) && c.unsafe_depth == 0 {
                     let use_offset = n.range.start().to_usize();
                     let use_len = name.len();
-                    c.diagnostics
-                        .push_error(TycError::use_of_uninitialised(
-                            name,
-                            c.path.clone(),
-                            c.source,
-                            use_offset,
-                            use_len,
-                            decl_offset,
-                            decl_len,
-                        ));
+                    c.diagnostics.push_error(TycError::use_of_uninitialised(
+                        name,
+                        c.path.clone(),
+                        c.source,
+                        use_offset,
+                        use_len,
+                        decl_offset,
+                        decl_len,
+                    ));
                 }
             }
         }
@@ -7150,7 +7145,10 @@ fn da_check_expr(
             }
         }
         Expr::YieldFrom(y) => da_check_expr(c, &y.value, tracked, state),
-        Expr::Lambda(_) | Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_)
+        Expr::Lambda(_)
+        | Expr::ListComp(_)
+        | Expr::SetComp(_)
+        | Expr::DictComp(_)
         | Expr::Generator(_) => {
             // Comprehensions and lambdas introduce their own scope;
             // a tracked-uninit name used inside is fine as long as it
@@ -7274,8 +7272,7 @@ fn intersect_branches(pre: &DaState, branches: &[DaState]) -> DaState {
             diverges: true,
         };
     }
-    let mut intersection: std::collections::HashSet<String> =
-        non_diverging[0].assigned.clone();
+    let mut intersection: std::collections::HashSet<String> = non_diverging[0].assigned.clone();
     for branch in &non_diverging[1..] {
         intersection.retain(|name| branch.assigned.contains(name));
     }
@@ -8582,14 +8579,8 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // Different newtypes, both numeric-based — explicit reject.
                     (Some((_, lb)), Some((_, rb))) if is_numeric(lb) && is_numeric(rb) => {
                         if let Some(op_str) = arithmetic_op_str(b.op) {
-                            let span =
-                                (b.range.start().to_usize(), b.range.end().to_usize());
-                            c.operator_type_mismatch(
-                                op_str,
-                                &l_stripped,
-                                &r_stripped,
-                                span,
-                            );
+                            let span = (b.range.start().to_usize(), b.range.end().to_usize());
+                            c.operator_type_mismatch(op_str, &l_stripped, &r_stripped, span);
                         }
                         return Type::Unknown;
                     }
@@ -13864,10 +13855,7 @@ let s: str = id(3)
              \x20   let t: Term = Term(2)\n\
              \x20   let bad: LogIndex = a + t\n",
         );
-        assert!(
-            d.has_errors(),
-            "cross-newtype arithmetic must be rejected",
-        );
+        assert!(d.has_errors(), "cross-newtype arithmetic must be rejected",);
         assert!(
             d.errors()
                 .iter()

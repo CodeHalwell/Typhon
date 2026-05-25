@@ -398,10 +398,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                         {
                             continue;
                         }
-                        let stem = match sib_path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                        {
+                        let stem = match sib_path.file_stem().and_then(|s| s.to_str()) {
                             Some(s) => s.to_owned(),
                             None => continue,
                         };
@@ -423,18 +420,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
                         if !has_init {
                             continue;
                         }
-                        let sub_name = match sib_parent
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                        {
+                        let sub_name = match sib_parent.file_name().and_then(|s| s.to_str()) {
                             Some(s) => s.to_owned(),
                             None => continue,
                         };
-                        let names = effective_package_surface(
-                            sib_parent,
-                            &sources,
-                            &mut visited,
-                        );
+                        let names = effective_package_surface(sib_parent, &sources, &mut visited);
                         if !names.is_empty() {
                             sibling_pubs.push((sub_name, names));
                         }
@@ -454,10 +444,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                             // have a single `pub *` and the span is
                             // unambiguous.
                             collision_lines.push(0);
-                            let marker_line = *prep
-                                .pub_star_lines
-                                .first()
-                                .unwrap_or(&0);
+                            let marker_line = *prep.pub_star_lines.first().unwrap_or(&0);
                             let offset = line_offset(&expanded, marker_line);
                             let err = TycError::pub_name_collision(
                                 name.clone(),
@@ -468,10 +455,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                                 offset,
                                 5,
                             );
-                            eprintln!(
-                                "{:?}",
-                                miette::Report::new_boxed(Box::new(err))
-                            );
+                            eprintln!("{:?}", miette::Report::new_boxed(Box::new(err)));
                         } else {
                             name_origin.insert(name.clone(), sibling.clone());
                         }
@@ -485,9 +469,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 let import_pieces: Vec<String> = sibling_pubs
                     .iter()
                     .filter(|(_, names)| !names.is_empty())
-                    .map(|(sib, names)| {
-                        format!("from .{} import {}", sib, names.join(", "))
-                    })
+                    .map(|(sib, names)| format!("from .{} import {}", sib, names.join(", ")))
                     .collect();
                 if !import_pieces.is_empty() {
                     let import_line = import_pieces.join("; ");
