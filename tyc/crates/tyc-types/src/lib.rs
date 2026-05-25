@@ -5693,6 +5693,46 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 _ => false,
             });
             if !is_pseudo && !is_protocol && !is_pydantic {
+                // R3-11 (2026-05-25): the synthesised `__init__`
+                // follows declaration order; Python rejects a
+                // non-default positional parameter after a default
+                // one (the parser already enforces this on free
+                // functions). Mirror that rule for class fields so
+                // the user sees the diagnostic at check time rather
+                // than at `import` time with a misleading
+                // `TypeError`. Pydantic models have separate field
+                // ordering semantics so the check is skipped for
+                // them; raw `class!` is checked too because its
+                // synthesised `__init__` follows the same rule.
+                let mut prior_default: Option<(String, &ruff_python_ast::StmtAnnAssign)> = None;
+                for s in &cd.body {
+                    if let Stmt::AnnAssign(a) = s {
+                        let Expr::Name(target) = a.target.as_ref() else {
+                            continue;
+                        };
+                        let name = target.id.as_str().to_owned();
+                        if a.value.is_some() {
+                            if prior_default.is_none() {
+                                prior_default = Some((name, a));
+                            }
+                        } else if let Some((prior, _)) = &prior_default {
+                            let span = (
+                                target.range.start().to_usize(),
+                                target.range.end().to_usize(),
+                            );
+                            let length = span.1.saturating_sub(span.0).max(1);
+                            c.diagnostics.push_error(TycError::field_default_ordering(
+                                class_name.to_owned(),
+                                name.clone(),
+                                prior.clone(),
+                                c.path.clone(),
+                                c.source,
+                                span.0,
+                                length,
+                            ));
+                        }
+                    }
+                }
                 let merged_methods_empty = c
                     .class_shapes
                     .get(class_name)
@@ -5983,7 +6023,35 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
         }
         Stmt::With(w) => {
             for item in &w.items {
-                let _ = infer_expr(c, &item.context_expr);
+                let ctx_type = infer_expr(c, &item.context_expr);
+                // R3-3 (2026-05-25): type-bind `as r` from
+                // `__enter__` / `__aenter__` so a downstream
+                // `match r:` inside the `with` body can prove
+                // exhaustiveness — without this, sealed-union
+                // dispatch inside `async with X() as r:` falls
+                // through `match_cases_cover_subject` and the
+                // function spuriously trips `missing_return`.
+                //
+                // Only a bare `as <name>` is handled today; tuple
+                // unpacking (`as (a, b)`) and attribute targets
+                // (`as self.field`) are left for a follow-up.
+                if let Some(var) = &item.optional_vars {
+                    if let Expr::Name(n) = var.as_ref() {
+                        let bound_type = with_item_bound_type(c, &ctx_type, w.is_async)
+                            .unwrap_or(Type::Unknown);
+                        let span = (
+                            n.range.start().to_usize(),
+                            n.range.start().to_usize() + n.id.as_str().len(),
+                        );
+                        c.env.declare(TypeBinding {
+                            name: n.id.as_str().to_owned(),
+                            declared: bound_type.clone(),
+                            narrowed: bound_type,
+                            span,
+                            from_unsafe: c.unsafe_depth > 0,
+                        });
+                    }
+                }
             }
             for s in &w.body {
                 check_stmt(c, s);
@@ -7324,6 +7392,67 @@ fn extract_generator_return_type(typ: &Type) -> Option<Type> {
     None
 }
 
+/// Type the `as r` binding of a `with` / `async with` item using the
+/// context-manager protocol. Returns `Some(t)` when the context
+/// expression's class declares `__enter__` (sync) or `__aenter__`
+/// (async) with a known return type, and `None` otherwise — in which
+/// case the caller binds `r` as `Unknown` and downstream uses fall
+/// through to the existing tolerant typing.
+///
+/// For `async with`, the return type of `__aenter__` may be either the
+/// payload `T` directly (Typhon convention when the method is declared
+/// as `async def __aenter__(self) -> T:`) or `Coroutine[..., T]` /
+/// `Awaitable[T]` (the structural shape). Both are unwrapped so the
+/// binding holds `T` either way.
+///
+/// Used by R3-3: without `as r` typing, an exhaustive `match r:` inside
+/// an `async with` body cannot prove the subject is a sealed union,
+/// so `match_cases_cover_subject` fails and the enclosing function
+/// trips `missing_return`.
+fn with_item_bound_type(c: &Checker, ctx_type: &Type, is_async: bool) -> Option<Type> {
+    let cls_name = match ctx_type {
+        Type::Class(name) => name.as_str(),
+        Type::Generic(name, _) => name.as_str(),
+        _ => return None,
+    };
+    let method = if is_async { "__aenter__" } else { "__enter__" };
+    let sig = c.find_method(cls_name, method)?;
+    let ret = sig.return_type.clone();
+    if is_async {
+        Some(unwrap_awaitable(&ret).unwrap_or(ret))
+    } else {
+        Some(ret)
+    }
+}
+
+/// Unwrap an awaitable surface type into the value it produces when
+/// `await`-ed. Used by the `Expr::Await` inference path so
+/// `await f(x)` where `f: Callable[..., Awaitable[T]]` types as `T`
+/// rather than `Awaitable[T]`. Recognises:
+///
+/// - `Awaitable[T]` → `T`
+/// - `Coroutine[Y, S, T]` → `T` (the third parameter is the send/return
+///   payload, matching `typing.Coroutine`'s shape)
+/// - `Coroutine[T]` (one-arg shorthand) → `T`
+///
+/// Returns `None` for anything else so the caller keeps the original
+/// inferred type. This is deliberately conservative — direct
+/// `async def`-typed call returns are already lowered upstream (the
+/// checker tracks them as the async function's declared return type,
+/// not as `Awaitable[T]`), so this path is the typed-callable hole that
+/// R3-1 documents.
+fn unwrap_awaitable(typ: &Type) -> Option<Type> {
+    let Type::Generic(name, args) = typ else {
+        return None;
+    };
+    match (name.as_str(), args.len()) {
+        ("Awaitable", 1) => Some(args[0].clone()),
+        ("Coroutine", 3) => Some(args[2].clone()),
+        ("Coroutine", 1) => Some(args[0].clone()),
+        _ => None,
+    }
+}
+
 fn refine_isinstance_target(current: &Type, narrowed_to: &Type) -> Type {
     let current_generic = match current {
         Type::Generic(name, args) if name == "Result" && args.len() == 2 => Some(args),
@@ -8651,16 +8780,46 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             }
             Type::Generic("set".into(), vec![Type::union_of(elts)])
         }
+        // R3-9 (2026-05-25): ternary `body if test else orelse`. The
+        // statement-level `if` already applies positive narrowings to
+        // its body and negated narrowings to its else branch; the
+        // ternary expression form previously fell through to
+        // `Type::Unknown`, so `isinstance(x, T)` (and other narrowing
+        // tests) didn't refine `x` inside the ternary. Apply the same
+        // snapshot/narrow/restore dance used by the statement-level
+        // checker so each side of the ternary sees the right type for
+        // `x`.
+        Expr::If(e) => {
+            let _ = infer_expr(c, &e.test);
+            let pos = collect_narrowings(c, &e.test, /*negate=*/ false);
+            let snap_pre = c.env.snapshot();
+            apply_narrowings(c, &pos);
+            let body_ty = infer_expr_ctx(c, &e.body, expected);
+            c.env.restore(snap_pre);
+            let neg = collect_narrowings(c, &e.test, /*negate=*/ true);
+            let snap_pre = c.env.snapshot();
+            apply_narrowings(c, &neg);
+            let orelse_ty = infer_expr_ctx(c, &e.orelse, expected);
+            c.env.restore(snap_pre);
+            Type::union_of(vec![body_ty, orelse_ty])
+        }
         // `await EXPR` — bump the `inside_await` counter while inferring
         // EXPR so a `Call` to an async function inside it does not
         // trip the `tyc::missing_await` check (FINDINGS #49). The
         // inferred type is the inner call's return type (`async def f()
         // -> int` → `await f()` is `int`).
+        //
+        // R3-1 (2026-05-25): unwrap `Awaitable[T]` / `Coroutine[X, Y, T]`
+        // surface types so that `await f(x)` where
+        // `f: Callable[..., Awaitable[T]]` infers as `T`, not as
+        // `Awaitable[T]`. Without this, every async-middleware pattern
+        // (where the callee is a typed callable field, not a directly
+        // declared `async def`) is rejected.
         Expr::Await(a) => {
             c.inside_await = c.inside_await.saturating_add(1);
             let inner = infer_expr_ctx(c, &a.value, expected);
             c.inside_await = c.inside_await.saturating_sub(1);
-            inner
+            unwrap_awaitable(&inner).unwrap_or(inner)
         }
         _ => Type::Unknown,
     }
@@ -11074,6 +11233,175 @@ def f() -> int:
                 .iter()
                 .any(|e| matches!(e, TycError::MissingReturn { .. })),
             "with+raise must still fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn await_on_callable_returning_awaitable_unwraps_payload() {
+        // R3-1: `f: Callable[..., Awaitable[T]]` is the natural
+        // surface for async middleware handlers — `await f(x)` must
+        // type as `T`, not as `Awaitable[T]`.
+        let src = "\
+from typing import Callable, Awaitable
+
+async def use(f: Callable[[int], Awaitable[str]]) -> str:
+    let r: str = await f(1)
+    return r
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "await on Callable[..., Awaitable[T]] must unwrap to T: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn await_on_callable_returning_coroutine_unwraps_payload() {
+        // R3-1: same shape with `Coroutine[Y, S, T]` — the third
+        // parameter is the awaited payload, per `typing.Coroutine`.
+        let src = "\
+from typing import Callable, Coroutine
+
+async def use(f: Callable[[int], Coroutine[object, object, int]]) -> int:
+    let n: int = await f(2)
+    return n
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "await on Callable[..., Coroutine[X, Y, T]] must unwrap to T: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn ternary_isinstance_narrowing_fires_like_if_else() {
+        // R3-9: ternary `body if test else orelse` previously
+        // skipped narrowing entirely (the expression form fell
+        // through to Type::Unknown). The fix makes ternary narrow
+        // the same way `if/else` does — both directions.
+        let src = "\
+def consume_int(n: int) -> None:
+    pass
+
+def use(x: int | str) -> None:
+    let _ = consume_int(x) if isinstance(x, int) else None
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "ternary isinstance narrowing must apply to truthy branch: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn ternary_nullable_narrowing_fires_like_if_else() {
+        // R3-9: ternary `x if x is not None else default` narrows
+        // `x` to the non-None branch on the truthy side.
+        let src = "\
+def consume_int(n: int) -> None:
+    pass
+
+def use(x: int | None) -> int:
+    return x if x is not None else 0
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "ternary `is not None` narrowing must strip None on truthy: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn async_with_as_binding_typed_from_aenter() {
+        // R3-3: `as r` binds `__aenter__`'s return type so a
+        // downstream `match r:` inside the body proves
+        // exhaustiveness and `missing_return` doesn't spuriously
+        // fire on the enclosing function. The fix lives in
+        // `Stmt::With` check via `with_item_bound_type`.
+        let src = "\
+type Result = Ok | Err
+
+class Ok:
+    value: int
+
+class Err:
+    msg: str
+
+class AsyncCtx:
+    pass
+
+impl AsyncCtx:
+    async def __aenter__(self) -> Result:
+        return Ok(value=1)
+    async def __aexit__(self, *a: object) -> None:
+        return None
+
+async def with_match() -> int:
+    async with AsyncCtx() as r:
+        match r:
+            case Ok(value):
+                return value
+            case Err(msg):
+                return -1
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "async with exhaustive match tail must satisfy missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn class_field_default_ordering_rejected() {
+        // R3-11: non-default field after defaulted field would
+        // blow up the synthesised `__init__` at import time. The
+        // checker now flags the ordering violation at compile time.
+        let src = "\
+class A:
+    x: int
+    y: int = 0
+    z: int
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::FieldDefaultOrdering { .. })),
+            "mixed-default class field ordering must fire field_default_ordering: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn class_fields_in_correct_order_is_clean() {
+        let src = "\
+class A:
+    x: int
+    y: int
+    z: int = 0
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::FieldDefaultOrdering { .. })),
+            "non-default-before-default order must not fire: {:?}",
             d.errors()
         );
     }

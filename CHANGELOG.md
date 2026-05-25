@@ -4,6 +4,72 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## Unreleased — Round-3 sweep
+
+Apps-feedback round-3 fix batch. Each item below has a one-line
+reproducer that fires the diagnostic on v0.6.1 and passes on this
+build.
+
+### Fixed — checker
+
+- **R3-1: `await f(x)` on `Callable[..., Awaitable[T]]` now unwraps to
+  `T`.** The previous shape returned `Awaitable[T]` and every
+  async-middleware framework pattern hit a `type_mismatch`. Also
+  handles `Callable[..., Coroutine[Y, S, T]]` and the one-arg
+  `Coroutine[T]` shorthand.
+- **R3-3: `async with X() as r:` now type-binds `r` from `__aenter__`.**
+  Without this, the downstream `match r:` couldn't prove its subject
+  was a sealed union and `missing_return` falsely fired on the
+  enclosing function. Sync `with` + `__enter__` is handled by the same
+  helper. (Cases where `r` is bound from `@asynccontextmanager`-decorated
+  generators still rely on an explicit annotation.)
+- **R3-9: ternary `body if test else orelse` now narrows just like
+  `if`/`else`.** `isinstance(x, T)` and `x is not None` refine `x` on
+  the truthy side (and the negated form on the falsy side) inside the
+  expression form, matching the statement-level behaviour.
+- **R3-11: class field defaults must order non-default fields before
+  defaulted ones.** The synthesised `__init__` follows declaration
+  order, and Python rejects a non-default parameter after a default
+  one — left unchecked, the class definition blew up at *import* time
+  with a misleading `TypeError`. New diagnostic
+  `tyc::field_default_ordering` catches this at check time. Mirrors
+  the parser's existing rule on free-function parameters.
+
+### Fixed — resolver
+
+- **R3-4: `from X import Y` inside `if`/`for`/`while`/`with`/`try`/`match`
+  arms now binds.** The parser already accepted it; the resolver
+  silently skipped nested imports and the failure surfaced as a
+  confusing "cannot find Y in scope" at the use site. The
+  typing-import diagnostics (`TypeVar`, deprecated `List`/`Dict`/…)
+  fire for nested imports too.
+- **R3-5: sibling `if` / `elif` branches no longer trip
+  `no_block_shadow` for same-named `let` bindings.** Sibling
+  `case` arms already had this relaxation (apps-feedback 2026-05);
+  the same per-branch drain/restore is now applied to `if` clauses.
+- **R3-8: `let x: T;` (declare-then-assign) is now accepted.** The
+  binding is declared as `mut` so subsequent assignments in `match` /
+  `if` arms bind cleanly. The earlier `tyc::missing_initialiser`
+  rejection is gone. Definite-assignment isn't formally checked; an
+  un-set use is caught at runtime by Python's `UnboundLocalError`.
+
+### Fixed — syntax
+
+- **R3-2: multi-line `go expr(...)` calls now parse.** Implicit line
+  continuation inside parens works everywhere else in Typhon — `go`
+  is no longer the exception. The preprocessor pre-joins continuation
+  lines before the lowering pass runs.
+
+### Docs
+
+- **R3-12: nested `def` and nested `from X import Y` are now
+  explicitly sanctioned.** `docs/guides/03-functions.md` shows both
+  forms with a short note on when to reach for each.
+- **R3-13: nullary sealed-union variants are documented as
+  `class Foo frozen: pass` with `case Foo():` matching.**
+  `docs/guides/07-sealed-unions-and-match.md` calls out the
+  zero-subpattern form (not `case Foo(_):`, which fails to match).
+
 ## 0.6.1 — 2026-05-25
 
 Polish release on top of v0.6.0. Tightens the VS Code TextMate grammar

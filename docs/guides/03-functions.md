@@ -240,6 +240,39 @@ python build/main.py Alice 3
 # Hello, Alice
 ```
 
+## Nested helpers and nested imports (R3-12)
+
+Both Python features survive into Typhon — declare a helper inside the
+function that uses it, or pull in a dependency on demand:
+
+```python
+def cluster(rows: list[Row]) -> list[Group]:
+    def key(r: Row) -> int:          # local helper, only visible here
+        return r.bucket
+
+    let sorted_rows: list[Row] = sorted(rows, key=key)
+    # …
+```
+
+```python
+def fast_path() -> int:
+    from math import floor          # only imported when this branch runs
+    return floor(3.7)
+```
+
+Nested `from X import Y` works inside `if`, `for`, `while`, `try`,
+`with`, and `match` arms too — the import binds into the enclosing
+function scope just like a top-level import would. Use this when an
+import is expensive and the function is rarely called, or when you want
+to keep the import next to its (single) use site rather than scrolling
+back to the file header. Nested `def` follows the same scoping rules as
+in Python: the helper is recreated every call, captures the enclosing
+function's locals, and isn't visible outside.
+
+> Nested `lazy from X import Y` is **not** supported — `lazy import` is
+> module-level only. Reach for `lazy import np = numpy` at module level
+> plus `np.array(...)` at the use site.
+
 ## What you've learned
 
 - Every parameter and return type is annotated; the checker enforces both.
@@ -247,5 +280,8 @@ python build/main.py Alice 3
 - `Callable[[...], R]` types first-class functions.
 - Generic functions use `def f[T](...)` (PEP 695 syntax).
 - Mismatched arities, returns, and missing awaits are all compile errors.
+- Nested `def` and nested `from X import Y` (inside `if` / `for` / `while`
+  / `try` / `with` / `match`) both work — use them when the helper or
+  import only matters on a specific path.
 
 Next: [Control flow and collections](04-control-flow-and-collections.md) — `if`/`while`/`for`, lists, dicts, sets, tuples, comprehensions, and the `guard` statement.

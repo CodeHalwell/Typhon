@@ -14,7 +14,7 @@
 //! expressions remain stable; we use them directly.
 
 use ruff_python_ast::{self as ast, Expr, ModModule, Stmt};
-use ruff_text_size::{Ranged, TextRange};
+use ruff_text_size::TextRange;
 use tyc_diagnostics::{Diagnostics, TycError};
 
 /// Mutability of a binding.
@@ -1288,6 +1288,123 @@ fn find_def_name_span(
     (stmt_start, stmt_start + name.len())
 }
 
+/// Bind every alias of an `import …` statement into `scope`. Pulled
+/// out of `collect_top_level` so the walk pass can re-use it for
+/// imports nested inside an `if`/`for`/`while`/`with`/`try`/`match`
+/// body (R3-4) — `declare_full` is idempotent on same-span re-entry
+/// so calling this twice for the same top-level import is a silent
+/// no-op.
+fn declare_import_aliases(r: &mut Resolver, scope: ScopeId, i: &ruff_python_ast::StmtImport) {
+    for alias in &i.names {
+        // `import pkg.sub` binds the top-level name `pkg` in
+        // Python; only the explicit `as` form binds the dotted
+        // path under a new name.
+        let bound_name = match &alias.asname {
+            Some(as_name) => as_name.as_str().to_owned(),
+            None => alias
+                .name
+                .as_str()
+                .split('.')
+                .next()
+                .unwrap_or(alias.name.as_str())
+                .to_owned(),
+        };
+        let span = (
+            alias.range.start().to_usize(),
+            alias.range.start().to_usize() + bound_name.len(),
+        );
+        let module = if alias.asname.is_some() {
+            alias.name.as_str().to_owned()
+        } else {
+            // Bare `import pkg.sub` binds `pkg`; the import target
+            // is still the leaf-most module that name brings into
+            // scope — encode `pkg` so the LSP jumps to
+            // `pkg/__init__.ty`.
+            bound_name.clone()
+        };
+        r.declare_with(
+            scope,
+            &bound_name,
+            BindingKind::Import,
+            Mutability::Mut,
+            span,
+            Some(ImportInfo {
+                module,
+                member: None,
+            }),
+        );
+    }
+}
+
+/// Bind every alias of a `from X import Y` statement into `scope`,
+/// including the Typhon-specific rejections for `from typing import
+/// TypeVar` / `List` / `Dict` / `Tuple` / `Set` / `FrozenSet` /
+/// `Type`. Pulled out of `collect_top_level` so the walk pass can
+/// re-use it for nested-block imports (R3-4). The typing diagnostics
+/// are emitted at declaration time — `declare_full`'s same-span
+/// short-circuit suppresses the re-declaration but not the
+/// diagnostic, so the helper guards the typing checks with a
+/// `lookup_local` so they don't fire twice for the top-level path.
+fn declare_import_from_aliases(
+    r: &mut Resolver,
+    scope: ScopeId,
+    i: &ruff_python_ast::StmtImportFrom,
+) {
+    let module = i.module.as_ref().map(|m| m.as_str().to_owned());
+    for alias in &i.names {
+        let name = alias.asname.as_ref().unwrap_or(&alias.name);
+        let span = (
+            alias.range.start().to_usize(),
+            alias.range.start().to_usize() + name.as_str().len(),
+        );
+        // Skip the typing diagnostics entirely when this exact alias
+        // is already in scope — collect_top_level will have emitted
+        // them on the first visit. Without this guard the walk pass
+        // would re-emit the warning for every top-level import.
+        let already_declared = r
+            .lookup_local(scope, name.as_str())
+            .map(|b| b.span == span)
+            .unwrap_or(false);
+        if !already_declared && module.as_deref() == Some("typing") {
+            let imported = alias.name.as_str();
+            let imported_span = (
+                alias.range.start().to_usize(),
+                alias.range.start().to_usize() + imported.len(),
+            );
+            let length = imported_span.1.saturating_sub(imported_span.0).max(1);
+            if imported == "TypeVar" {
+                r.diagnostics.push_error(TycError::typevar_import_rejected(
+                    &r.path,
+                    r.source,
+                    imported_span.0,
+                    length,
+                ));
+            } else if let Some(lower) = lowercase_typing_alias(imported) {
+                r.diagnostics
+                    .push_warning(TycError::typing_alias_deprecated(
+                        imported,
+                        lower,
+                        &r.path,
+                        r.source,
+                        imported_span.0,
+                        length,
+                    ));
+            }
+        }
+        r.declare_with(
+            scope,
+            name.as_str(),
+            BindingKind::Import,
+            Mutability::Mut,
+            span,
+            module.as_ref().map(|m| ImportInfo {
+                module: m.clone(),
+                member: Some(alias.name.as_str().to_owned()),
+            }),
+        );
+    }
+}
+
 /// Pre-declare names that should be visible across the whole body. Runs in
 /// two sub-passes so that `val` values are registered *before* function /
 /// class / import names — this lets the val-immutability check fire when a
@@ -1324,14 +1441,27 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt]) {
                 }
             }
             Stmt::AnnAssign(a) => {
-                // FINDINGS #91: an annotated declaration without an
-                // initialiser is a user error — skip the declaration
-                // so the second pass can emit `tyc::missing_initialiser`
-                // without also tripping `tyc::immutable_assign` on the
-                // user's subsequent `x = <expr>` reassignment.
-                if !(a.value.is_none() && a.mutability.is_some()) {
-                    declare_target(r, scope, &a.target, default_val, a.mutability);
-                }
+                // R3-8 (2026-05-25): `let x: T` (or `mut x: T`)
+                // without an initialiser is the declare-then-assign
+                // idiom used in match/if validate-and-bind patterns.
+                // Declare the binding here so subsequent
+                // `x = <expr>` assignments in arm bodies don't fire
+                // `tyc::missing_binding_kind`. Override the
+                // mutability to `Mut` for the declare-only case so
+                // the assignment isn't blocked by
+                // `tyc::immutable_assign` either — definite-
+                // assignment isn't formally checked, so the binding
+                // behaves like `mut` after the declaration. The
+                // (rare) earlier FINDINGS #91 "missing initialiser"
+                // rejection is now relaxed at the resolver level;
+                // see `walk_stmt` for the same drop on the second
+                // pass.
+                let mutability_override = if a.value.is_none() && a.mutability.is_some() {
+                    Some(ast::Mutability::Mut)
+                } else {
+                    a.mutability
+                };
+                declare_target(r, scope, &a.target, default_val, mutability_override);
             }
             _ => {}
         }
@@ -1366,96 +1496,10 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt]) {
                 r.declare_class(scope, c.name.as_str(), span, kind);
             }
             Stmt::Import(i) => {
-                for alias in &i.names {
-                    // `import pkg.sub` binds the top-level name `pkg` in
-                    // Python; only the explicit `as` form binds the dotted
-                    // path under a new name.
-                    let bound_name = match &alias.asname {
-                        Some(as_name) => as_name.as_str().to_owned(),
-                        None => alias
-                            .name
-                            .as_str()
-                            .split('.')
-                            .next()
-                            .unwrap_or(alias.name.as_str())
-                            .to_owned(),
-                    };
-                    let span = (
-                        alias.range.start().to_usize(),
-                        alias.range.start().to_usize() + bound_name.len(),
-                    );
-                    let module = if alias.asname.is_some() {
-                        alias.name.as_str().to_owned()
-                    } else {
-                        // Bare `import pkg.sub` binds `pkg`; the import
-                        // target is still the leaf-most module that name
-                        // brings into scope — encode `pkg` so the LSP
-                        // jumps to `pkg/__init__.ty`.
-                        bound_name.clone()
-                    };
-                    r.declare_with(
-                        scope,
-                        &bound_name,
-                        BindingKind::Import,
-                        Mutability::Mut,
-                        span,
-                        Some(ImportInfo {
-                            module,
-                            member: None,
-                        }),
-                    );
-                }
+                declare_import_aliases(r, scope, i);
             }
             Stmt::ImportFrom(i) => {
-                let module = i.module.as_ref().map(|m| m.as_str().to_owned());
-                for alias in &i.names {
-                    let name = alias.asname.as_ref().unwrap_or(&alias.name);
-                    let span = (
-                        alias.range.start().to_usize(),
-                        alias.range.start().to_usize() + name.as_str().len(),
-                    );
-                    // Typhon-specific rejections for `from typing import X`:
-                    //   - TypeVar: use PEP 695 `[T]` syntax instead (FINDINGS #73).
-                    //   - List/Dict/Tuple/Set/FrozenSet/Type: use the
-                    //     lowercase built-in form (FINDINGS #74).
-                    if module.as_deref() == Some("typing") {
-                        let imported = alias.name.as_str();
-                        let imported_span = (
-                            alias.range.start().to_usize(),
-                            alias.range.start().to_usize() + imported.len(),
-                        );
-                        let length = imported_span.1.saturating_sub(imported_span.0).max(1);
-                        if imported == "TypeVar" {
-                            r.diagnostics.push_error(TycError::typevar_import_rejected(
-                                &r.path,
-                                r.source,
-                                imported_span.0,
-                                length,
-                            ));
-                        } else if let Some(lower) = lowercase_typing_alias(imported) {
-                            r.diagnostics
-                                .push_warning(TycError::typing_alias_deprecated(
-                                    imported,
-                                    lower,
-                                    &r.path,
-                                    r.source,
-                                    imported_span.0,
-                                    length,
-                                ));
-                        }
-                    }
-                    r.declare_with(
-                        scope,
-                        name.as_str(),
-                        BindingKind::Import,
-                        Mutability::Mut,
-                        span,
-                        module.as_ref().map(|m| ImportInfo {
-                            module: m.clone(),
-                            member: Some(alias.name.as_str().to_owned()),
-                        }),
-                    );
-                }
+                declare_import_from_aliases(r, scope, i);
             }
             // PEP 695 type alias — `type Vector[T] = list[T]`. The alias name
             // becomes a value-class binding in the enclosing scope.
@@ -1477,18 +1521,6 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt]) {
             _ => {}
         }
     }
-}
-
-/// Slice `source` against a `TextRange`, returning `None` if the range
-/// falls outside the source's byte bounds. Used to recover the surface
-/// text of a node for inclusion in diagnostic messages.
-fn source_slice(source: &str, range: TextRange) -> Option<&str> {
-    let start = range.start().to_usize();
-    let end = range.end().to_usize();
-    if end > source.len() || start > end {
-        return None;
-    }
-    source.get(start..end)
 }
 
 /// Map a capitalised `typing.<Name>` alias to its lowercase built-in
@@ -1803,53 +1835,25 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
                 walk_expr(r, scope, v);
             }
             walk_expr(r, scope, &a.annotation);
-            // FINDINGS #91: `let NAME: T` (or `mut NAME: T`) without an
-            // initialiser produces a confusing immutable-assign error
-            // when the user later writes `NAME = <expr>`. Reject the
-            // declare-only form up front with a clear message that
-            // tells the user to inline the initialiser. Bare AnnAssign
-            // (no explicit `let`/`mut` keyword) is left alone because
-            // class-body field declarations (`name: str`) and dataclass
-            // attribute annotations legitimately omit initialisers.
-            let missing_init = a.value.is_none() && a.mutability.is_some();
-            if missing_init {
-                if let Expr::Name(n) = a.target.as_ref() {
-                    let keyword = match a.mutability {
-                        Some(ast::Mutability::Let) => "let",
-                        Some(ast::Mutability::Mut) => "mut",
-                        None => unreachable!(),
-                    };
-                    let annotation = source_slice(r.source, a.annotation.range())
-                        .unwrap_or("<type>")
-                        .to_owned();
-                    let span = (a.range.start().to_usize(), a.range.end().to_usize());
-                    let length = span.1.saturating_sub(span.0).max(1);
-                    r.diagnostics.push_error(TycError::missing_initialiser(
-                        keyword,
-                        n.id.as_str(),
-                        annotation,
-                        &r.path,
-                        r.source,
-                        span.0,
-                        length,
-                    ));
-                }
-            }
+            // R3-8 (2026-05-25): `let NAME: T` (or `mut NAME: T`)
+            // without an initialiser is the declare-then-assign idiom
+            // used by `match`/`if` "validate and bind" patterns. The
+            // earlier FINDINGS #91 rejection has been relaxed — the
+            // binding is declared as `Mut` (see `collect_top_level`
+            // for the matching override) so subsequent
+            // `NAME = <expr>` assignments bind cleanly without
+            // tripping `tyc::missing_binding_kind` or
+            // `tyc::immutable_assign`. Definite assignment is not
+            // formally checked; an un-set use is caught at runtime
+            // by Python's `UnboundLocalError`.
             if let Expr::Name(_) = a.target.as_ref() {
                 let default_val = r.scopes[scope].kind == ScopeKind::Module;
-                // When the initialiser is missing (FINDINGS #91), suppress
-                // the declaration entirely. Otherwise a later `x = 5`
-                // would either fire a redundant `tyc::immutable_assign`
-                // (the misleading cascade the finding is about) or — for
-                // `mut` — pretend the assignment was the first
-                // initialiser, masking the original mistake. The
-                // missing_initialiser error already tells the user what
-                // to do; downstream references to the un-declared name
-                // (`x` on subsequent lines) will produce the standard
-                // unknown-name flow.
-                if !missing_init {
-                    declare_target(r, scope, &a.target, default_val, a.mutability);
-                }
+                let mutability_override = if a.value.is_none() && a.mutability.is_some() {
+                    Some(ast::Mutability::Mut)
+                } else {
+                    a.mutability
+                };
+                declare_target(r, scope, &a.target, default_val, mutability_override);
             }
         }
         Stmt::AugAssign(a) => {
@@ -1863,10 +1867,26 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
         }
         Stmt::Expr(e) => walk_expr(r, scope, &e.value),
         Stmt::If(i) => {
+            // R3-5 (2026-05-25): mirror the per-arm scope behaviour
+            // already applied to `Stmt::Match` below. Sibling
+            // `if` / `elif` / `else` branches are mutually
+            // exclusive at runtime, so a `let key: ...` in the
+            // `if` body must not shadow a `let key: ...` in the
+            // `elif` body. The drain/restore dance moves each
+            // branch's new bindings into a side buffer so the next
+            // branch starts from the pre-if snapshot; after all
+            // branches walk, the drained bindings are spliced back
+            // in so downstream `report_unknown_names` still finds
+            // them.
             walk_expr(r, scope, &i.test);
+            let pre_if_len = r.scopes[scope].bindings.len();
+            let mut branch_local_bindings: Vec<Binding> = Vec::new();
             for s in &i.body {
                 walk_stmt(r, scope, s);
             }
+            let drained: Vec<Binding> =
+                r.scopes[scope].bindings.drain(pre_if_len..).collect();
+            branch_local_bindings.extend(drained);
             for clause in &i.elif_else_clauses {
                 if let Some(test) = &clause.test {
                     walk_expr(r, scope, test);
@@ -1874,7 +1894,11 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
                 for s in &clause.body {
                     walk_stmt(r, scope, s);
                 }
+                let drained: Vec<Binding> =
+                    r.scopes[scope].bindings.drain(pre_if_len..).collect();
+                branch_local_bindings.extend(drained);
             }
+            r.scopes[scope].bindings.extend(branch_local_bindings);
         }
         Stmt::While(w) => {
             walk_expr(r, scope, &w.test);
@@ -1951,8 +1975,26 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
                 walk_expr(r, scope, cause);
             }
         }
-        Stmt::Import(_) | Stmt::ImportFrom(_) => {
-            // Already declared in collect_top_level.
+        Stmt::Import(i) => {
+            // R3-4 (2026-05-25): collect_top_level only pre-declares
+            // imports at the body's top level — when an `import` lands
+            // inside an `if`/`for`/`with`/`try`/`match` arm it would
+            // previously be silently skipped here and the user only
+            // saw a confusing "cannot find X in scope" at the use
+            // site. Declare nested imports too. `declare_full` is
+            // idempotent on same-span re-entries so the top-level case
+            // (already declared by collect_top_level) is a silent
+            // no-op.
+            declare_import_aliases(r, scope, i);
+        }
+        Stmt::ImportFrom(i) => {
+            // R3-4 (2026-05-25): same shape as `Stmt::Import` above.
+            // For nested `from typing import X` the typing-specific
+            // diagnostics (TypeVar, lowercase aliases) need to fire
+            // too — `declare_import_from_aliases` re-runs the same
+            // checks `collect_top_level` does for the module-level
+            // case, but only when the binding is genuinely new.
+            declare_import_from_aliases(r, scope, i);
         }
         Stmt::Pass(_) | Stmt::Break(_) | Stmt::Continue(_) => {}
         Stmt::Global(g) => {
@@ -3272,33 +3314,76 @@ def foo():
     }
 
     #[test]
-    fn let_without_initialiser_errors() {
-        // FINDINGS #91: `let x: int` (no `=`) must surface
-        // tyc::missing_initialiser rather than silently accepting the
-        // declaration and then complaining about the user's first
-        // `x = …` assignment as an immutable-assign error.
+    fn let_without_initialiser_now_allowed() {
+        // R3-8 (2026-05-25): `let x: T;` is the declare-then-assign
+        // idiom used by `match`/`if` "validate and bind" patterns.
+        // The earlier FINDINGS #91 rejection has been relaxed — the
+        // binding is declared as `Mut` so a subsequent `x = <expr>`
+        // assignment binds cleanly without firing either
+        // `tyc::missing_binding_kind` or `tyc::immutable_assign`.
         let (_m, d) = resolve("def f() -> None:\n    let x: int\n    x = 5\n");
         assert!(
-            d.errors()
+            !d.errors()
                 .iter()
                 .any(|e| matches!(e, TycError::MissingInitialiser { .. })),
-            "expected MissingInitialiser variant; got {:?}",
+            "missing_initialiser should no longer fire for declare-only `let`: {:?}",
+            d.errors()
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingBindingKind { .. })),
+            "subsequent assignment must NOT fire missing_binding_kind: {:?}",
+            d.errors()
+        );
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ImmutableAssign { .. })),
+            "subsequent assignment must NOT fire immutable_assign: {:?}",
             d.errors()
         );
     }
 
     #[test]
-    fn mut_without_initialiser_errors() {
-        // Same rule applies to `mut x: int` — the binding has nothing
-        // to bind to. Subsequent `x = 5` would otherwise pass because
-        // `mut` allows re-assignment, but the type-checker treats the
-        // value-less form inconsistently.
+    fn mut_without_initialiser_now_allowed() {
+        // Same relaxation applies to `mut x: int` — see R3-8 note
+        // above. The `mut` form was already a no-op redundancy on top
+        // of the relaxation but is preserved for surface consistency.
         let (_m, d) = resolve("def f() -> None:\n    mut x: int\n    x = 5\n");
         assert!(
-            d.errors()
+            !d.errors()
                 .iter()
                 .any(|e| matches!(e, TycError::MissingInitialiser { .. })),
-            "expected MissingInitialiser for mut; got {:?}",
+            "missing_initialiser should no longer fire for declare-only `mut`: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn let_without_initialiser_with_match_arms() {
+        // The motivating case for R3-8: declare `x: int` then bind
+        // it in every `match` arm. No diagnostics should fire — the
+        // binding is declared by the AnnAssign and refreshed by each
+        // arm's assignment.
+        let (_m, d) = resolve(
+            "def parse(s: str) -> int:\n    let x: int\n    match s:\n        case \"a\":\n            x = 1\n        case _:\n            x = 0\n    return x\n",
+        );
+        assert!(
+            d.errors().is_empty(),
+            "match/if validate-and-bind must be clean: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn let_without_initialiser_with_if_arms() {
+        let (_m, d) = resolve(
+            "def use(b: bool) -> int:\n    let x: int\n    if b:\n        x = 1\n    else:\n        x = 0\n    return x\n",
+        );
+        assert!(
+            d.errors().is_empty(),
+            "if validate-and-bind must be clean: {:?}",
             d.errors()
         );
     }

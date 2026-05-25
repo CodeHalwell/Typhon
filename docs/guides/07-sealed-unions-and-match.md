@@ -168,11 +168,11 @@ class Number:
     value: float
 class Ident:
     name: str
-class Plus: pass
-class Minus: pass
-class LParen: pass
-class RParen: pass
-class EOF: pass
+class Plus frozen: pass
+class Minus frozen: pass
+class LParen frozen: pass
+class RParen frozen: pass
+class EOF frozen: pass
 
 def display(t: Token) -> str:
     match t:
@@ -191,6 +191,16 @@ def display(t: Token) -> str:
         case EOF():
             return "<eof>"
 ```
+
+> **Nullary variant idiom (R3-13):** the `class Foo frozen: pass` form is
+> the recommended shape for nullary sealed-union variants — it emits as
+> `@dataclass(slots=True, frozen=True)` so each instance is hashable,
+> comparable, and immutable. Match these variants with `case Foo():` —
+> two empty parens, no subpatterns — and Typhon's exhaustiveness check
+> recognises the arm. **Do not write `case Foo(_):`** — the single
+> underscore is a *positional capture* and the dataclass has no positional
+> fields, so the arm never matches and the union's `Foo` variant looks
+> uncovered.
 
 Add a `Star` variant for multiplication and every `match` on `Token` fails to compile until you handle it. The compiler becomes your TODO list.
 
