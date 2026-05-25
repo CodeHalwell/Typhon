@@ -5,16 +5,16 @@ from filter_ast import (
     fv_float,
     fv_int,
     fv_str,
-    make_and,
-    make_eq,
-    make_ge,
-    make_gt,
-    make_in,
-    make_le,
-    make_lt,
-    make_ne,
-    make_not,
-    make_or,
+    FAnd,
+    FEq,
+    FGe,
+    FGt,
+    FIn,
+    FLe,
+    FLt,
+    FNe,
+    FNot,
+    FOr,
 )
 
 
@@ -213,7 +213,7 @@ impl FParser:
             parts.append(part)
         if len(parts) == 1:
             return Ok(parts[0])
-        return Ok(make_or(parts))
+        return Ok(FOr(parts))
 
     def parse_and(self) -> Result[FilterExpr, ParseError]:
         let first: FilterExpr = self.parse_not()?
@@ -230,7 +230,7 @@ impl FParser:
             parts.append(part)
         if len(parts) == 1:
             return Ok(parts[0])
-        return Ok(make_and(parts))
+        return Ok(FAnd(parts))
 
     def parse_not(self) -> Result[FilterExpr, ParseError]:
         let nxt: FToken? = self.peek()
@@ -240,7 +240,7 @@ impl FParser:
         if nx.kind == "not":
             self.pos = self.pos + 1
             let inner: FilterExpr = self.parse_not()?
-            return Ok(make_not(inner))
+            return Ok(FNot(inner))
         return self.parse_atom()
 
     def parse_atom(self) -> Result[FilterExpr, ParseError]:
@@ -289,17 +289,17 @@ impl FParser:
         let val_res: Result[FilterValue, ParseError] = self._parse_value()
         let val: FilterValue = val_res?
         if op.text == "=":
-            return Ok(make_eq(field, val))
+            return Ok(FEq(field, val))
         if op.text == "!=":
-            return Ok(make_ne(field, val))
+            return Ok(FNe(field, val))
         if op.text == ">":
-            return Ok(make_gt(field, val))
+            return Ok(FGt(field, val))
         if op.text == "<":
-            return Ok(make_lt(field, val))
+            return Ok(FLt(field, val))
         if op.text == ">=":
-            return Ok(make_ge(field, val))
+            return Ok(FGe(field, val))
         if op.text == "<=":
-            return Ok(make_le(field, val))
+            return Ok(FLe(field, val))
         return Err(ParseError(message=f"unknown operator '{op.text}'", pos=op.pos))
 
     def _parse_in_list(self, field: str, in_tok: FToken) -> Result[FilterExpr, ParseError]:
@@ -336,7 +336,7 @@ impl FParser:
                 message=f"expected ',' or ']' in IN list, got '{after.text}'",
                 pos=after.pos,
             ))
-        return Ok(make_in(field, vals))
+        return Ok(FIn(field, vals))
 
     def _parse_value(self) -> Result[FilterValue, ParseError]:
         let nxt: FToken? = self.advance()

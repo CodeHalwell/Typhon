@@ -6,7 +6,7 @@ from event import (
     is_end,
     is_record,
     is_watermark,
-    make_record_envelope,
+    make_record,
 )
 from ids import JobId, OperatorId, Offset, StreamKey, WatermarkTs, WindowId
 from keyed_state import KeyedAggState, new_keyed_state
@@ -333,7 +333,7 @@ impl Runner:
             self.stats.aggregate_rows = self.stats.aggregate_rows + 1
             self.stats.panes_closed = self.stats.panes_closed + 1
             self.captured_rows.append(row)
-            await out_q.put(make_record_envelope(
+            await out_q.put(make_record(
                 row.window_end_ms, row.key, row,
             ))
 

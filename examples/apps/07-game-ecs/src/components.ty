@@ -64,31 +64,31 @@ pub class CompTag:
 pub type Component = CompPosition | CompVelocity | CompHealth | CompDamage | CompSprite | CompCollider | CompTag
 
 
-pub def make_comp_position(p: Position) -> Component:
+pub def CompPosition(p: Position) -> Component:
     return CompPosition(data=p)
 
 
-pub def make_comp_velocity(v: Velocity) -> Component:
+pub def CompVelocity(v: Velocity) -> Component:
     return CompVelocity(data=v)
 
 
-pub def make_comp_health(h: Health) -> Component:
+pub def CompHealth(h: Health) -> Component:
     return CompHealth(data=h)
 
 
-pub def make_comp_damage(d: Damage) -> Component:
+pub def CompDamage(d: Damage) -> Component:
     return CompDamage(data=d)
 
 
-pub def make_comp_sprite(s: Sprite) -> Component:
+pub def CompSprite(s: Sprite) -> Component:
     return CompSprite(data=s)
 
 
-pub def make_comp_collider(c: Collider) -> Component:
+pub def CompCollider(c: Collider) -> Component:
     return CompCollider(data=c)
 
 
-pub def make_comp_tag(t: Tag) -> Component:
+pub def CompTag(t: Tag) -> Component:
     return CompTag(data=t)
 
 

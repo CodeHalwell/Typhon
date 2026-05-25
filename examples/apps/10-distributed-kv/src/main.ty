@@ -3,8 +3,8 @@ from ids import ClientReqId, NodeId
 from node import Node
 from rpc import (
     Message,
-    make_client_get,
-    make_client_put,
+    MsgClientGet,
+    MsgClientPut,
 )
 
 
@@ -52,7 +52,7 @@ def main() -> None:
     ]
     for p in puts:
         let (rid, put_key, put_val) = p
-        let msg: Message = make_client_put(ClientReqId(rid), put_key, put_val)
+        let msg: Message = MsgClientPut(ClientReqId(rid), put_key, put_val)
         cluster.submit(msg)
 
     # Let entries replicate + commit.
@@ -64,9 +64,9 @@ def main() -> None:
     # Read back via the leader.
     let current_leader_opt: NodeId? = cluster.find_leader()
     if current_leader_opt is not None:
-        let get_msg: Message = make_client_get(ClientReqId(101), "k1")
+        let get_msg: Message = MsgClientGet(ClientReqId(101), "k1")
         cluster.submit(get_msg)
-        let get_msg_2: Message = make_client_get(ClientReqId(102), "k2")
+        let get_msg_2: Message = MsgClientGet(ClientReqId(102), "k2")
         cluster.submit(get_msg_2)
 
     _drain(cluster, 40, 0.020)

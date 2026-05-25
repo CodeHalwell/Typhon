@@ -23,27 +23,6 @@ pub class QOr:
 pub class QNot:
     inner: Query
 
-
-pub def make_term(term: str) -> Query:
-    return QTerm(term=term)
-
-
-pub def make_phrase(terms: list[str]) -> Query:
-    return QPhrase(terms=terms)
-
-
-pub def make_and(parts: list[Query]) -> Query:
-    return QAnd(parts=parts)
-
-
-pub def make_or(parts: list[Query]) -> Query:
-    return QOr(parts=parts)
-
-
-pub def make_not(inner: Query) -> Query:
-    return QNot(inner=inner)
-
-
 pub class QueryParseError:
     message: str
     pos: int
@@ -147,7 +126,7 @@ impl QParser:
             parts.append(part)
         if len(parts) == 1:
             return Ok(parts[0])
-        return Ok(make_or(parts))
+        return Ok(QOr(parts))
 
     def parse_and(self) -> Result[Query, QueryParseError]:
         let first: Query = self.parse_not()?
@@ -171,7 +150,7 @@ impl QParser:
             parts.append(part)
         if len(parts) == 1:
             return Ok(parts[0])
-        return Ok(make_and(parts))
+        return Ok(QAnd(parts))
 
     def parse_not(self) -> Result[Query, QueryParseError]:
         let nxt: QToken? = self.peek()
@@ -181,7 +160,7 @@ impl QParser:
         if nx.kind == "not":
             self.pos = self.pos + 1
             let inner: Query = self.parse_atom()?
-            return Ok(make_not(inner))
+            return Ok(QNot(inner))
         return self.parse_atom()
 
     def parse_atom(self) -> Result[Query, QueryParseError]:
@@ -206,7 +185,7 @@ impl QParser:
             return Ok(inner)
         if nx.kind == "phrase":
             let phrase_toks: list[str] = _phrase_terms(nx.value)
-            return Ok(make_phrase(phrase_toks))
+            return Ok(QPhrase(phrase_toks))
         if nx.kind == "word":
             let normed: str = normalize(nx.value)
             if len(normed) == 0:
@@ -215,7 +194,7 @@ impl QParser:
                     pos=nx.pos,
                 ))
             let stemmed: str = stem(normed)
-            return Ok(make_term(stemmed))
+            return Ok(QTerm(stemmed))
         return Err(QueryParseError(
             message=f"unexpected token: {nx.kind} '{nx.value}'",
             pos=nx.pos,

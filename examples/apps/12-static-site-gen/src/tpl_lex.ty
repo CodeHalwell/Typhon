@@ -15,19 +15,6 @@ pub class TtTag:
     body: str
     line: int
 
-
-pub def make_tt_text(text: str, line: int) -> TplTok:
-    return TtText(text=text, line=line)
-
-
-pub def make_tt_expr(body: str, line: int) -> TplTok:
-    return TtExpr(body=body, line=line)
-
-
-pub def make_tt_tag(body: str, line: int) -> TplTok:
-    return TtTag(body=body, line=line)
-
-
 def _count_newlines(text: str) -> int:
     mut n: int = 0
     for ch in text:
@@ -47,7 +34,7 @@ pub def lex_template(source: str) -> list[TplTok]:
         let two: str = source[i:i + 2] if i + 1 < n else ""
         if two == "{{":
             if len(buf) > 0:
-                out.append(make_tt_text(buf, buf_line))
+                out.append(TtText(buf, buf_line))
                 buf = ""
             let end: int = source.find("}}", i + 2)
             if end < 0:
@@ -55,14 +42,14 @@ pub def lex_template(source: str) -> list[TplTok]:
                 i = n
                 break
             let body: str = source[i + 2:end].strip()
-            out.append(make_tt_expr(body, line))
+            out.append(TtExpr(body, line))
             line = line + _count_newlines(source[i:end + 2])
             i = end + 2
             buf_line = line
             continue
         if two == "{%":
             if len(buf) > 0:
-                out.append(make_tt_text(buf, buf_line))
+                out.append(TtText(buf, buf_line))
                 buf = ""
             let end_t: int = source.find("%}", i + 2)
             if end_t < 0:
@@ -70,7 +57,7 @@ pub def lex_template(source: str) -> list[TplTok]:
                 i = n
                 break
             let body_t: str = source[i + 2:end_t].strip()
-            out.append(make_tt_tag(body_t, line))
+            out.append(TtTag(body_t, line))
             line = line + _count_newlines(source[i:end_t + 2])
             i = end_t + 2
             buf_line = line
@@ -80,5 +67,5 @@ pub def lex_template(source: str) -> list[TplTok]:
         buf = buf + source[i]
         i = i + 1
     if len(buf) > 0:
-        out.append(make_tt_text(buf, buf_line))
+        out.append(TtText(buf, buf_line))
     return out

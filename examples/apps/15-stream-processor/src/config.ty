@@ -1,6 +1,6 @@
 import os
 
-from models import StreamError, make_config_error
+from models import StreamError, ConfigError
 
 
 comptime let BUILD_TAG: str = env("BUILD_TAG", "dev")
@@ -54,15 +54,15 @@ pub def build_tag() -> str:
 # Validate a JobConfig — returns a Result so callers can short-circuit with `?`.
 pub def validate_config(cfg: JobConfig) -> Result[JobConfig, StreamError]:
     if cfg.queue_capacity <= 0:
-        return Err(make_config_error("queue_capacity", "must be positive"))
+        return Err(ConfigError("queue_capacity", "must be positive"))
     if cfg.window_ms <= 0:
-        return Err(make_config_error("window_ms", "must be positive"))
+        return Err(ConfigError("window_ms", "must be positive"))
     if cfg.slide_ms <= 0:
-        return Err(make_config_error("slide_ms", "must be positive"))
+        return Err(ConfigError("slide_ms", "must be positive"))
     if cfg.slide_ms > cfg.window_ms:
-        return Err(make_config_error("slide_ms", "must be <= window_ms"))
+        return Err(ConfigError("slide_ms", "must be <= window_ms"))
     if cfg.lateness_ms < 0:
-        return Err(make_config_error("lateness_ms", "must be non-negative"))
+        return Err(ConfigError("lateness_ms", "must be non-negative"))
     return Ok(cfg)
 
 

@@ -90,39 +90,6 @@ pub class AmlRejection:
     rule: str
     detail: str
 
-
-pub def make_open_account(account_id: AccountId, customer_id: CustomerId, currency: Currency) -> Command:
-    return OpenAccount(account_id=account_id, customer_id=customer_id, currency=currency)
-
-
-pub def make_deposit(account_id: AccountId, amount: Money, source: str, transaction_id: TransactionId) -> Command:
-    return Deposit(account_id=account_id, amount=amount, source=source, transaction_id=transaction_id)
-
-
-pub def make_withdraw(account_id: AccountId, amount: Money, destination: str, transaction_id: TransactionId) -> Command:
-    return Withdraw(account_id=account_id, amount=amount, destination=destination, transaction_id=transaction_id)
-
-
-pub def make_transfer(from_account: AccountId, to_account: AccountId, amount: Money, transaction_id: TransactionId) -> Command:
-    return Transfer(from_account=from_account, to_account=to_account, amount=amount, transaction_id=transaction_id)
-
-
-pub def make_freeze_account(account_id: AccountId, reason: str) -> Command:
-    return FreezeAccount(account_id=account_id, reason=reason)
-
-
-pub def make_unfreeze_account(account_id: AccountId) -> Command:
-    return UnfreezeAccount(account_id=account_id)
-
-
-pub def make_close_account(account_id: AccountId) -> Command:
-    return CloseAccount(account_id=account_id)
-
-
-pub def make_accrue_interest(account_id: AccountId, rate: float) -> Command:
-    return AccrueInterest(account_id=account_id, rate=rate)
-
-
 pub def reject_no_such_account(account_id: AccountId) -> RejectionReason:
     return NoSuchAccount(account_id=account_id)
 

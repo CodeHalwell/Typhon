@@ -8,11 +8,6 @@ pub class Span frozen:
 pub class Source:
     text: str
 
-
-pub def make_span(start: int, end: int, line: int, col: int) -> Span:
-    return Span(start=start, end=end, line=line, col=col)
-
-
 pub def line_col_at(text: str, offset: int) -> tuple[int, int]:
     mut line: int = 1
     mut col: int = 1

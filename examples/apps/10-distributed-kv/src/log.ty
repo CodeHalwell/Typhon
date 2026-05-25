@@ -16,16 +16,7 @@ pub class CmdDelete frozen:
 pub class CmdNoop frozen:
     placeholder: int
 
-
-pub def make_cmd_set(key: str, value: str) -> Command:
-    return CmdSet(key=key, value=value)
-
-
-pub def make_cmd_delete(key: str) -> Command:
-    return CmdDelete(key=key)
-
-
-pub def make_cmd_noop() -> Command:
+pub def CmdNoop() -> Command:
     return CmdNoop(placeholder=0)
 
 
@@ -97,7 +88,7 @@ pub def new_log() -> ReplicatedLog:
     let dummy: LogEntry = LogEntry(
         index=LogIndex(0),
         term=Term(0),
-        command=make_cmd_noop(),
+        command=CmdNoop(),
         client_req=ClientReqId(0),
     )
     return ReplicatedLog(entries=[dummy])

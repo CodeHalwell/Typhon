@@ -26,25 +26,6 @@ pub class HttpResponse:
     route_id: RouteId?
     elapsed_ms: int
 
-
-pub def make_response(
-    status: int,
-    body: bytes,
-    headers: dict[str, str],
-    upstream: UpstreamId?,
-    route_id: RouteId?,
-    elapsed_ms: int,
-) -> HttpResponse:
-    return HttpResponse(
-        status=status,
-        headers=headers,
-        body=body,
-        upstream=upstream,
-        route_id=route_id,
-        elapsed_ms=elapsed_ms,
-    )
-
-
 pub def text_response(status: int, body: str) -> HttpResponse:
     return HttpResponse(
         status=status,

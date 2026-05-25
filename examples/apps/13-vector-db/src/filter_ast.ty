@@ -152,47 +152,6 @@ pub class FOr:
 pub class FNot:
     child: FilterExpr
 
-
-pub def make_eq(field: str, value: FilterValue) -> FilterExpr:
-    return FEq(field=field, value=value)
-
-
-pub def make_ne(field: str, value: FilterValue) -> FilterExpr:
-    return FNe(field=field, value=value)
-
-
-pub def make_gt(field: str, value: FilterValue) -> FilterExpr:
-    return FGt(field=field, value=value)
-
-
-pub def make_lt(field: str, value: FilterValue) -> FilterExpr:
-    return FLt(field=field, value=value)
-
-
-pub def make_ge(field: str, value: FilterValue) -> FilterExpr:
-    return FGe(field=field, value=value)
-
-
-pub def make_le(field: str, value: FilterValue) -> FilterExpr:
-    return FLe(field=field, value=value)
-
-
-pub def make_in(field: str, values: list[FilterValue]) -> FilterExpr:
-    return FIn(field=field, values=values)
-
-
-pub def make_and(children: list[FilterExpr]) -> FilterExpr:
-    return FAnd(children=children)
-
-
-pub def make_or(children: list[FilterExpr]) -> FilterExpr:
-    return FOr(children=children)
-
-
-pub def make_not(child: FilterExpr) -> FilterExpr:
-    return FNot(child=child)
-
-
 # ---------------------------------------------------------------------------
 # Evaluator
 

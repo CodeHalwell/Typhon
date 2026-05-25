@@ -67,39 +67,6 @@ pub class EventEnvelope frozen:
     seq: EventId
     payload: Event
 
-
-pub def make_account_opened(account_id: AccountId, customer_id: CustomerId, currency: Currency, opened_at: datetime) -> Event:
-    return AccountOpened(account_id=account_id, customer_id=customer_id, currency=currency, opened_at=opened_at)
-
-
-pub def make_money_deposited(account_id: AccountId, amount: Money, source: str, transaction_id: TransactionId, at: datetime) -> Event:
-    return MoneyDeposited(account_id=account_id, amount=amount, source=source, transaction_id=transaction_id, at=at)
-
-
-pub def make_money_withdrawn(account_id: AccountId, amount: Money, destination: str, transaction_id: TransactionId, at: datetime) -> Event:
-    return MoneyWithdrawn(account_id=account_id, amount=amount, destination=destination, transaction_id=transaction_id, at=at)
-
-
-pub def make_transfer_recorded(from_account: AccountId, to_account: AccountId, amount_from: Money, amount_to: Money, fx_rate: float, transaction_id: TransactionId, at: datetime) -> Event:
-    return TransferRecorded(from_account=from_account, to_account=to_account, amount_from=amount_from, amount_to=amount_to, fx_rate=fx_rate, transaction_id=transaction_id, at=at)
-
-
-pub def make_account_frozen(account_id: AccountId, reason: str, at: datetime) -> Event:
-    return AccountFrozen(account_id=account_id, reason=reason, at=at)
-
-
-pub def make_account_unfrozen(account_id: AccountId, at: datetime) -> Event:
-    return AccountUnfrozen(account_id=account_id, at=at)
-
-
-pub def make_account_closed(account_id: AccountId, at: datetime) -> Event:
-    return AccountClosed(account_id=account_id, at=at)
-
-
-pub def make_interest_accrued(account_id: AccountId, amount: Money, rate: float, at: datetime) -> Event:
-    return InterestAccrued(account_id=account_id, amount=amount, rate=rate, at=at)
-
-
 pub def event_account_id(event: Event) -> AccountId?:
     match event:
         case AccountOpened(aid, _, _, _):       return aid

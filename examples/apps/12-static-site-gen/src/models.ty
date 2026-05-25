@@ -56,35 +56,6 @@ pub class InBreak frozen:
 
 
 # Inline factories — see TYPHON_FEEDBACK R1-#1.
-
-pub def make_in_text(text: str) -> Inline:
-    return InText(text=text)
-
-
-pub def make_in_emph(children: list[Inline]) -> Inline:
-    return InEmph(children=children)
-
-
-pub def make_in_strong(children: list[Inline]) -> Inline:
-    return InStrong(children=children)
-
-
-pub def make_in_code(code: str) -> Inline:
-    return InCode(code=code)
-
-
-pub def make_in_link(href: str, children: list[Inline]) -> Inline:
-    return InLink(href=href, children=children)
-
-
-pub def make_in_image(src: str, alt: str) -> Inline:
-    return InImage(src=src, alt=alt)
-
-
-pub def make_in_break() -> Inline:
-    return InBreak()
-
-
 # Block nodes.
 
 pub type Block = BkHeading | BkParagraph | BkList | BkCode | BkQuote | BkRule | BkHtml
@@ -122,34 +93,6 @@ pub class BkHtml:
 
 
 # Block factories.
-
-pub def make_bk_heading(level: int, children: list[Inline]) -> Block:
-    return BkHeading(level=level, children=children)
-
-
-pub def make_bk_paragraph(children: list[Inline]) -> Block:
-    return BkParagraph(children=children)
-
-
-pub def make_bk_list(ordered: bool, items: list[list[Inline]]) -> Block:
-    return BkList(ordered=ordered, items=items)
-
-
-pub def make_bk_code(lang: str, code: str) -> Block:
-    return BkCode(lang=lang, code=code)
-
-
-pub def make_bk_quote(children: list[Inline]) -> Block:
-    return BkQuote(children=children)
-
-
-pub def make_bk_rule() -> Block:
-    return BkRule()
-
-
-pub def make_bk_html(raw: str) -> Block:
-    return BkHtml(raw=raw)
-
 
 # ----- Document -----
 
@@ -208,30 +151,6 @@ pub class TnExtends:
 
 # Template factories.
 
-pub def make_tn_text(text: str) -> TplNode:
-    return TnText(text=text)
-
-
-pub def make_tn_expr(name: str) -> TplNode:
-    return TnExpr(name=name)
-
-
-pub def make_tn_if(cond: str, then_body: list[TplNode], else_body: list[TplNode]) -> TplNode:
-    return TnIf(cond=cond, then_body=then_body, else_body=else_body)
-
-
-pub def make_tn_for(var_name: str, iter_name: str, body: list[TplNode]) -> TplNode:
-    return TnFor(var_name=var_name, iter_name=iter_name, body=body)
-
-
-pub def make_tn_block(block_name: str, body: list[TplNode]) -> TplNode:
-    return TnBlock(block_name=block_name, body=body)
-
-
-pub def make_tn_extends(parent: str) -> TplNode:
-    return TnExtends(parent=parent)
-
-
 pub class Template:
     name: TemplateName
     nodes: list[TplNode]
@@ -273,30 +192,6 @@ pub class SeRender:
 pub class SeWrite:
     path: str
     detail: str
-
-
-pub def make_se_read(path: str, detail: str) -> StageError:
-    return SeRead(path=path, detail=detail)
-
-
-pub def make_se_front(path: str, line: int, detail: str) -> StageError:
-    return SeFront(path=path, line=line, detail=detail)
-
-
-pub def make_se_markdown(path: str, line: int, detail: str) -> StageError:
-    return SeMarkdown(path=path, line=line, detail=detail)
-
-
-pub def make_se_template(name: str, line: int, detail: str) -> StageError:
-    return SeTemplate(name=name, line=line, detail=detail)
-
-
-pub def make_se_render(page: str, detail: str) -> StageError:
-    return SeRender(page=page, detail=detail)
-
-
-pub def make_se_write(path: str, detail: str) -> StageError:
-    return SeWrite(path=path, detail=detail)
 
 
 pub def stage_error_label(e: StageError) -> str:

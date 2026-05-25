@@ -50,43 +50,6 @@ pub class TkEof:
 # Factories — required because variant→union upcast fails across module
 # boundaries (TYPHON_FEEDBACK.md #1). Every call site outside this module
 # constructs Tokens via these helpers and gets back a `Token`.
-
-pub def make_tk_int(value: int, span: Span) -> Token:
-    return TkInt(value=value, span=span)
-
-
-pub def make_tk_float(value: float, span: Span) -> Token:
-    return TkFloat(value=value, span=span)
-
-
-pub def make_tk_str(value: str, span: Span) -> Token:
-    return TkStr(value=value, span=span)
-
-
-pub def make_tk_ident(name: str, span: Span) -> Token:
-    return TkIdent(name=name, span=span)
-
-
-pub def make_tk_keyword(word: str, span: Span) -> Token:
-    return TkKeyword(word=word, span=span)
-
-
-pub def make_tk_op(op: str, span: Span) -> Token:
-    return TkOp(op=op, span=span)
-
-
-pub def make_tk_punct(ch: str, span: Span) -> Token:
-    return TkPunct(ch=ch, span=span)
-
-
-pub def make_tk_arrow(span: Span) -> Token:
-    return TkArrow(span=span)
-
-
-pub def make_tk_eof(span: Span) -> Token:
-    return TkEof(span=span)
-
-
 pub def token_label(t: Token) -> str:
     match t:
         case TkInt(v, _):     return f"int({v})"

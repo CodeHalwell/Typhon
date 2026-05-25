@@ -57,7 +57,7 @@ pub class Envelope:
     watermark: WatermarkTs
 
 
-pub def make_record_envelope(ts_ms: int, key: StreamKey, payload: object) -> Envelope:
+pub def make_record(ts_ms: int, key: StreamKey, payload: object) -> Envelope:
     return Envelope(
         kind=EnvRecord(),
         timestamp_ms=ts_ms,
@@ -67,7 +67,7 @@ pub def make_record_envelope(ts_ms: int, key: StreamKey, payload: object) -> Env
     )
 
 
-pub def make_watermark_envelope(wm: WatermarkTs) -> Envelope:
+pub def make_watermark(wm: WatermarkTs) -> Envelope:
     return Envelope(
         kind=EnvWatermark(),
         timestamp_ms=int(wm),
@@ -77,7 +77,7 @@ pub def make_watermark_envelope(wm: WatermarkTs) -> Envelope:
     )
 
 
-pub def make_barrier_envelope(ts_ms: int) -> Envelope:
+pub def make_barrier(ts_ms: int) -> Envelope:
     return Envelope(
         kind=EnvBarrier(),
         timestamp_ms=ts_ms,
@@ -87,7 +87,7 @@ pub def make_barrier_envelope(ts_ms: int) -> Envelope:
     )
 
 
-pub def make_end_envelope() -> Envelope:
+pub def make_end_of_stream() -> Envelope:
     return Envelope(
         kind=EnvEndOfStream(),
         timestamp_ms=0,

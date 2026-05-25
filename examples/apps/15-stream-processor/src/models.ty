@@ -47,20 +47,6 @@ pub class OperatorError:
 pub class SinkError:
     sink_name: str
     reason: str
-
-
-pub def make_config_error(field: str, reason: str) -> StreamError:
-    return ConfigError(field=field, reason=reason)
-
-
-pub def make_operator_error(op: OperatorId, reason: str) -> StreamError:
-    return OperatorError(op=op, reason=reason)
-
-
-pub def make_sink_error(sink_name: str, reason: str) -> StreamError:
-    return SinkError(sink_name=sink_name, reason=reason)
-
-
 pub def error_label(err: StreamError) -> str:
     match err:
         case ConfigError(_, _):    return "config"

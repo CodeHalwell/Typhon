@@ -29,19 +29,6 @@ pub class RetryGiveUp:
     attempts: int
     last_reason: str
 
-
-pub def make_retry_ok(attempt: int, status: int) -> RetryOutcome:
-    return RetryOk(attempt=attempt, status=status)
-
-
-pub def make_retry_again(attempt: int, reason: str, delay_ms: int) -> RetryOutcome:
-    return RetryAgain(attempt=attempt, reason=reason, delay_ms=delay_ms)
-
-
-pub def make_retry_giveup(attempts: int, last_reason: str) -> RetryOutcome:
-    return RetryGiveUp(attempts=attempts, last_reason=last_reason)
-
-
 pub def outcome_label(o: RetryOutcome) -> str:
     match o:
         case RetryOk(_, _):    return "ok"

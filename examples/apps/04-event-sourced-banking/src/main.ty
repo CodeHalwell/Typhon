@@ -2,12 +2,12 @@ from aggregate import Account, replay, state_label
 from aml import AmlContext, empty_context, large_amount_rule, sanctions_rule, daily_outflow_rule
 from commands import (
     Command,
-    make_deposit,
-    make_freeze_account,
-    make_open_account,
-    make_transfer,
-    make_unfreeze_account,
-    make_withdraw,
+    Deposit,
+    FreezeAccount,
+    OpenAccount,
+    Transfer,
+    UnfreezeAccount,
+    Withdraw,
     rejection_message,
 )
 from events import EventEnvelope, event_kind
@@ -57,81 +57,81 @@ def main() -> None:
     let bob: AccountId = AccountId("acct-bob-eur")
     let carol: AccountId = AccountId("acct-carol-usd")
 
-    _run(handlers, make_open_account(
+    _run(handlers, OpenAccount(
         account_id=alice,
         customer_id=CustomerId("cust-001"),
         currency=Currency("USD"),
     ), "Open Alice (USD)")
 
-    _run(handlers, make_open_account(
+    _run(handlers, OpenAccount(
         account_id=bob,
         customer_id=CustomerId("cust-002"),
         currency=Currency("EUR"),
     ), "Open Bob (EUR)")
 
-    _run(handlers, make_open_account(
+    _run(handlers, OpenAccount(
         account_id=carol,
         customer_id=CustomerId("cust-003"),
         currency=Currency("USD"),
     ), "Open Carol (USD)")
 
-    _run(handlers, make_deposit(
+    _run(handlers, Deposit(
         account_id=alice,
         amount=Money(100_000_00),
         source="payroll",
         transaction_id=TransactionId("tx-001"),
     ), "Deposit $100k to Alice")
 
-    _run(handlers, make_deposit(
+    _run(handlers, Deposit(
         account_id=bob,
         amount=Money(50_000_00),
         source="payroll",
         transaction_id=TransactionId("tx-002"),
     ), "Deposit EUR50k to Bob")
 
-    _run(handlers, make_transfer(
+    _run(handlers, Transfer(
         from_account=alice,
         to_account=bob,
         amount=Money(10_000_00),
         transaction_id=TransactionId("tx-003"),
     ), "Transfer $10k Alice -> Bob (USD->EUR)")
 
-    _run(handlers, make_deposit(
+    _run(handlers, Deposit(
         account_id=carol,
         amount=Money(2_000_000_00),
         source="unknown",
         transaction_id=TransactionId("tx-004"),
     ), "Deposit $2M to Carol (expect AML hit)")
 
-    _run(handlers, make_deposit(
+    _run(handlers, Deposit(
         account_id=carol,
         amount=Money(20_000_00),
         source="Sanctioned Bank Ltd",
         transaction_id=TransactionId("tx-005"),
     ), "Deposit from sanctioned source (expect AML hit)")
 
-    _run(handlers, make_freeze_account(
+    _run(handlers, FreezeAccount(
         account_id=carol,
         reason="suspicious activity",
     ), "Freeze Carol")
 
-    _run(handlers, make_deposit(
+    _run(handlers, Deposit(
         account_id=carol,
         amount=Money(100_00),
         source="payroll",
         transaction_id=TransactionId("tx-006"),
     ), "Deposit to frozen Carol (expect rejection)")
 
-    _run(handlers, make_unfreeze_account(account_id=carol), "Unfreeze Carol")
+    _run(handlers, UnfreezeAccount(account_id=carol), "Unfreeze Carol")
 
-    _run(handlers, make_deposit(
+    _run(handlers, Deposit(
         account_id=carol,
         amount=Money(5_000_00),
         source="payroll",
         transaction_id=TransactionId("tx-007"),
     ), "Deposit $5k to Carol")
 
-    _run(handlers, make_withdraw(
+    _run(handlers, Withdraw(
         account_id=alice,
         amount=Money(200_000_00),
         destination="cash",

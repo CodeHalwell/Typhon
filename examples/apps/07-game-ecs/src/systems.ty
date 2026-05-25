@@ -1,5 +1,5 @@
 from components import Collider, Damage, Health, Position, Velocity
-from events import make_ev_collision, make_ev_damage_dealt, make_ev_health_changed, make_ev_tick_ended
+from events import EvCollision, EvDamageDealt, EvHealthChanged, EvTickEnded
 from ids import EntityId
 from vec2 import Vec2, vec_add, vec_distance, vec_scale
 from world import World
@@ -28,7 +28,7 @@ pub def system_collision(world: World, dt: float) -> None:
                 let mid_x: float = (pos_a.pos.x + pos_b.pos.x) / 2.0
                 let mid_y: float = (pos_a.pos.y + pos_b.pos.y) / 2.0
                 let mid: Vec2 = Vec2(x=mid_x, y=mid_y)
-                world.emit(make_ev_collision(eid_a, eid_b, mid))
+                world.emit(EvCollision(eid_a, eid_b, mid))
                 world.add_damage(eid_a, Damage(amount=1, source=eid_b))
                 world.add_damage(eid_b, Damage(amount=1, source=eid_a))
             j = j + 1
@@ -49,10 +49,10 @@ pub def system_damage(world: World, dt: float) -> None:
         let old_hp: int = hp
         for dmg in pending:
             hp = hp - dmg.amount
-            world.emit(make_ev_damage_dealt(eid, dmg.source, dmg.amount))
+            world.emit(EvDamageDealt(eid, dmg.source, dmg.amount))
         if hp != old_hp:
             world.set_health(eid, Health(hp=hp, max_hp=cur.max_hp))
-            world.emit(make_ev_health_changed(eid, old_hp, hp))
+            world.emit(EvHealthChanged(eid, old_hp, hp))
 
 
 pub def system_despawn_dead(world: World, dt: float) -> None:
@@ -65,5 +65,5 @@ pub def system_despawn_dead(world: World, dt: float) -> None:
 
 
 pub def system_tick_end(world: World, dt: float) -> None:
-    world.emit(make_ev_tick_ended(world.tick, world.alive_count()))
+    world.emit(EvTickEnded(world.tick, world.alive_count()))
     world.tick = world.tick + 1

@@ -13,19 +13,19 @@ from md_lex import (
 from models import (
     Block,
     Inline,
-    make_bk_code,
-    make_bk_heading,
-    make_bk_list,
-    make_bk_paragraph,
-    make_bk_quote,
-    make_bk_rule,
-    make_in_break,
-    make_in_code,
-    make_in_emph,
-    make_in_image,
-    make_in_link,
-    make_in_strong,
-    make_in_text,
+    BkCode,
+    BkHeading,
+    BkList,
+    BkParagraph,
+    BkQuote,
+    BkRule,
+    InBreak,
+    InCode,
+    InEmph,
+    InImage,
+    InLink,
+    InStrong,
+    InText,
 )
 
 
@@ -67,7 +67,7 @@ def _find_marker(text: str, marker: str, start: int) -> int:
 
 def _emit_text(buf: str, out: list[Inline]) -> None:
     if len(buf) > 0:
-        out.append(make_in_text(buf))
+        out.append(InText(buf))
 
 
 pub def parse_inline(text: str) -> list[Inline]:
@@ -87,7 +87,7 @@ pub def parse_inline(text: str) -> list[Inline]:
             if close > i:
                 _emit_text(buf, out)
                 buf = ""
-                out.append(make_in_code(text[i + 1:close]))
+                out.append(InCode(text[i + 1:close]))
                 i = close + 1
                 continue
         # Image: ![alt](src)
@@ -98,7 +98,7 @@ pub def parse_inline(text: str) -> list[Inline]:
                 if close_p > 0:
                     _emit_text(buf, out)
                     buf = ""
-                    out.append(make_in_image(text[close_b + 2:close_p], text[i + 2:close_b]))
+                    out.append(InImage(text[close_b + 2:close_p], text[i + 2:close_b]))
                     i = close_p + 1
                     continue
         # Link: [child](href)
@@ -111,7 +111,7 @@ pub def parse_inline(text: str) -> list[Inline]:
                     buf = ""
                     let inner_text: str = text[i + 1:close_b2]
                     let href: str = text[close_b2 + 2:close_p2]
-                    out.append(make_in_link(href, parse_inline(inner_text)))
+                    out.append(InLink(href, parse_inline(inner_text)))
                     i = close_p2 + 1
                     continue
         # Strong: ** ... **
@@ -120,7 +120,7 @@ pub def parse_inline(text: str) -> list[Inline]:
             if close_s > 0:
                 _emit_text(buf, out)
                 buf = ""
-                out.append(make_in_strong(parse_inline(text[i + 2:close_s])))
+                out.append(InStrong(parse_inline(text[i + 2:close_s])))
                 i = close_s + 2
                 continue
         # Emphasis: * ... * or _ ... _
@@ -129,7 +129,7 @@ pub def parse_inline(text: str) -> list[Inline]:
             if close_e > i:
                 _emit_text(buf, out)
                 buf = ""
-                out.append(make_in_emph(parse_inline(text[i + 1:close_e])))
+                out.append(InEmph(parse_inline(text[i + 1:close_e])))
                 i = close_e + 1
                 continue
         buf = buf + ch
@@ -149,7 +149,7 @@ def _join_inline(strs: list[str]) -> list[Inline]:
         for inl in parsed:
             out.append(inl)
         if i + 1 < n:
-            out.append(make_in_break())
+            out.append(InBreak())
         i = i + 1
     return out
 
@@ -165,10 +165,10 @@ pub def parse_blocks(source: str) -> list[Block]:
             case LnBlank():
                 i = i + 1
             case LnRule():
-                blocks.append(make_bk_rule())
+                blocks.append(BkRule())
                 i = i + 1
             case LnHeading(level, text, _):
-                blocks.append(make_bk_heading(level, parse_inline(text)))
+                blocks.append(BkHeading(level, parse_inline(text)))
                 i = i + 1
             case LnFence(lang, _):
                 mut code_buf: list[str] = []
@@ -203,7 +203,7 @@ pub def parse_blocks(source: str) -> list[Block]:
                             i = i + 1
                     if closed:
                         break
-                blocks.append(make_bk_code(lang, "\n".join(code_buf)))
+                blocks.append(BkCode(lang, "\n".join(code_buf)))
             case LnList(text, _):
                 mut items: list[list[Inline]] = []
                 items.append(parse_inline(text))
@@ -216,7 +216,7 @@ pub def parse_blocks(source: str) -> list[Block]:
                             i = i + 1
                         case _:
                             break
-                blocks.append(make_bk_list(False, items))
+                blocks.append(BkList(False, items))
             case LnOList(text, _):
                 mut o_items: list[list[Inline]] = []
                 o_items.append(parse_inline(text))
@@ -229,7 +229,7 @@ pub def parse_blocks(source: str) -> list[Block]:
                             i = i + 1
                         case _:
                             break
-                blocks.append(make_bk_list(True, o_items))
+                blocks.append(BkList(True, o_items))
             case LnQuote(text, _):
                 mut q_lines: list[str] = [text]
                 i = i + 1
@@ -241,7 +241,7 @@ pub def parse_blocks(source: str) -> list[Block]:
                             i = i + 1
                         case _:
                             break
-                blocks.append(make_bk_quote(_join_inline(q_lines)))
+                blocks.append(BkQuote(_join_inline(q_lines)))
             case LnText(text, _):
                 mut p_lines: list[str] = [text]
                 i = i + 1
@@ -253,7 +253,7 @@ pub def parse_blocks(source: str) -> list[Block]:
                             i = i + 1
                         case _:
                             break
-                blocks.append(make_bk_paragraph(_join_inline(p_lines)))
+                blocks.append(BkParagraph(_join_inline(p_lines)))
     return blocks
 
 

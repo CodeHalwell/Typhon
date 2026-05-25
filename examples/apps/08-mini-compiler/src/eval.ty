@@ -25,12 +25,7 @@ from values import (
     VStr,
     Value,
     empty_env,
-    make_v_bool,
-    make_v_float,
-    make_v_fn,
-    make_v_int,
-    make_v_str,
-    make_v_unit,
+    VUnit,
     value_label,
     value_to_str,
 )
@@ -75,7 +70,7 @@ def _eval_binop(op: str, lv: Value, rv: Value, span: Span) -> Result[Value, Eval
         if ls_opt is not None and rs_opt is not None:
             let ls: str = ls_opt
             let rs: str = rs_opt
-            return Ok(value=make_v_str(ls + rs))
+            return Ok(value=VStr(ls + rs))
         if ls_opt is not None or rs_opt is not None:
             return Err(error=_eerr(
                 f"cannot add {value_label(lv)} and {value_label(rv)}", span,
@@ -95,20 +90,20 @@ def _eval_binop(op: str, lv: Value, rv: Value, span: Span) -> Result[Value, Eval
         if op == "/":
             if rn == 0.0:
                 return Err(error=_eerr("division by zero", span))
-            return Ok(value=make_v_float(ln / rn))
+            return Ok(value=VFloat(ln / rn))
         let both_int: bool = _is_int(lv) and _is_int(rv)
         if op == "+":
             if both_int:
-                return Ok(value=make_v_int(int(ln) + int(rn)))
-            return Ok(value=make_v_float(ln + rn))
+                return Ok(value=VInt(int(ln) + int(rn)))
+            return Ok(value=VFloat(ln + rn))
         if op == "-":
             if both_int:
-                return Ok(value=make_v_int(int(ln) - int(rn)))
-            return Ok(value=make_v_float(ln - rn))
+                return Ok(value=VInt(int(ln) - int(rn)))
+            return Ok(value=VFloat(ln - rn))
         # op == "*"
         if both_int:
-            return Ok(value=make_v_int(int(ln) * int(rn)))
-        return Ok(value=make_v_float(ln * rn))
+            return Ok(value=VInt(int(ln) * int(rn)))
+        return Ok(value=VFloat(ln * rn))
 
     if op == "<" or op == ">" or op == "<=" or op == ">=":
         if ln_opt is None or rn_opt is None:
@@ -118,16 +113,16 @@ def _eval_binop(op: str, lv: Value, rv: Value, span: Span) -> Result[Value, Eval
             ))
         let ln_c: float = ln_opt
         let rn_c: float = rn_opt
-        if op == "<":  return Ok(value=make_v_bool(ln_c < rn_c))
-        if op == ">":  return Ok(value=make_v_bool(ln_c > rn_c))
-        if op == "<=": return Ok(value=make_v_bool(ln_c <= rn_c))
-        return Ok(value=make_v_bool(ln_c >= rn_c))
+        if op == "<":  return Ok(value=VBool(ln_c < rn_c))
+        if op == ">":  return Ok(value=VBool(ln_c > rn_c))
+        if op == "<=": return Ok(value=VBool(ln_c <= rn_c))
+        return Ok(value=VBool(ln_c >= rn_c))
 
     if op == "==" or op == "!=":
         let eq: bool = _values_equal(lv, rv)
         if op == "==":
-            return Ok(value=make_v_bool(eq))
-        return Ok(value=make_v_bool(not eq))
+            return Ok(value=VBool(eq))
+        return Ok(value=VBool(not eq))
 
     return Err(error=_eerr(f"unknown operator '{op}'", span))
 
@@ -175,13 +170,13 @@ def _truthy_as_bool(v: Value, span: Span) -> Result[bool, EvalError]:
 pub def eval_expr(expr: Expr, env: Env) -> Result[Value, EvalError]:
     match expr:
         case ExInt(iv, _):
-            return Ok(value=make_v_int(iv))
+            return Ok(value=VInt(iv))
         case ExFloat(fv, _):
-            return Ok(value=make_v_float(fv))
+            return Ok(value=VFloat(fv))
         case ExStr(sv, _):
-            return Ok(value=make_v_str(sv))
+            return Ok(value=VStr(sv))
         case ExBool(bv, _):
-            return Ok(value=make_v_bool(bv))
+            return Ok(value=VBool(bv))
         case ExIdent(nm, sp_id):
             let found: Value? = env.lookup(nm)
             if found is None:
@@ -195,8 +190,8 @@ pub def eval_expr(expr: Expr, env: Env) -> Result[Value, EvalError]:
             let ov: Value = eval_expr(operand, env)?
             if uop == "-":
                 match ov:
-                    case VInt(iv):   return Ok(value=make_v_int(-iv))
-                    case VFloat(fv): return Ok(value=make_v_float(-fv))
+                    case VInt(iv):   return Ok(value=VInt(-iv))
+                    case VFloat(fv): return Ok(value=VFloat(-fv))
                     case _:
                         return Err(error=_eerr(
                             f"unary '-' requires number, got {value_label(ov)}", sp_un,
@@ -236,12 +231,12 @@ pub def eval_expr(expr: Expr, env: Env) -> Result[Value, EvalError]:
             let child: Env = env.with_binding(name, bound)
             return eval_expr(body, child)
         case ExFn(params, _ret, body, _sp_fn):
-            return Ok(value=make_v_fn(params, body, env))
+            return Ok(value=VFn(params, body, env))
         case ExBlock(exprs, _sp_blk):
             if len(exprs) == 0:
-                return Ok(value=make_v_unit())
+                return Ok(value=VUnit())
             mut block_env: Env = env
-            mut last_v: Value = make_v_unit()
+            mut last_v: Value = VUnit()
             mut idx_b: int = 0
             while idx_b < len(exprs):
                 let sub: Expr = exprs[idx_b]
@@ -249,7 +244,7 @@ pub def eval_expr(expr: Expr, env: Env) -> Result[Value, EvalError]:
                     case ExLet(ln, lv, _lb, _lsp):
                         let bound_b: Value = eval_expr(lv, block_env)?
                         block_env = block_env.with_binding(ln, bound_b)
-                        last_v = make_v_unit()
+                        last_v = VUnit()
                     case _:
                         last_v = eval_expr(sub, block_env)?
                 idx_b = idx_b + 1
@@ -257,7 +252,7 @@ pub def eval_expr(expr: Expr, env: Env) -> Result[Value, EvalError]:
         case ExPrint(arg, _sp_pr):
             let av: Value = eval_expr(arg, env)?
             print(value_to_str(av))
-            return Ok(value=make_v_unit())
+            return Ok(value=VUnit())
     raise RuntimeError("unreachable")
 
 

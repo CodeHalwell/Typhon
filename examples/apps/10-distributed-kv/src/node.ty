@@ -15,20 +15,12 @@ from rpc import (
     MsgClientReply,
     MsgRequestVote,
     MsgRequestVoteReply,
-    make_append_entries,
-    make_append_entries_reply,
-    make_client_reply,
-    make_request_vote,
-    make_request_vote_reply,
 )
 from state import (
     Role,
     RoleCandidate,
     RoleFollower,
     RoleLeader,
-    make_candidate,
-    make_follower,
-    make_leader,
 )
 from store import KVStore, new_store
 
@@ -68,7 +60,7 @@ pub class Node:
 
 
 pub def new_node(id: NodeId, peers: list[NodeId], now: float) -> Node:
-    let init_role: Role = make_follower(None, _election_deadline(id, now))
+    let init_role: Role = RoleFollower(None, _election_deadline(id, now))
     return Node(
         id=id,
         peers=peers,
@@ -90,7 +82,7 @@ impl Node:
     def become_follower(self, term: Term, leader: NodeId?, now: float) -> None:
         self.current_term = term
         self.voted_for = None
-        self.role = make_follower(leader, _election_deadline(self.id, now))
+        self.role = RoleFollower(leader, _election_deadline(self.id, now))
         if leader is not None:
             self.last_known_leader = leader
 
@@ -100,7 +92,7 @@ impl Node:
         self.voted_for = self.id
         mut votes: dict[int, bool] = {}
         votes[int(self.id)] = True
-        self.role = make_candidate(votes, _election_deadline(self.id, now))
+        self.role = RoleCandidate(votes, _election_deadline(self.id, now))
         self.last_known_leader = None
 
         mut out: list[tuple[int, Message]] = []
@@ -109,7 +101,7 @@ impl Node:
         for peer in self.peers:
             if int(peer) == int(self.id):
                 continue
-            let rv: Message = make_request_vote(
+            let rv: Message = MsgRequestVote(
                 term=new_term,
                 candidate=self.id,
                 last_log_index=last_idx,
@@ -127,7 +119,7 @@ impl Node:
                 continue
             next_index[int(peer)] = last + 1
             match_index[int(peer)] = 0
-        self.role = make_leader(next_index, match_index, now + HEARTBEAT_INTERVAL)
+        self.role = RoleLeader(next_index, match_index, now + HEARTBEAT_INTERVAL)
         self.last_known_leader = self.id
         return self._broadcast_append(now)
 
@@ -174,7 +166,7 @@ impl Node:
     ) -> list[tuple[int, Message]]:
         mut out: list[tuple[int, Message]] = []
         if int(term) < int(self.current_term):
-            let reply_stale: Message = make_append_entries_reply(
+            let reply_stale: Message = MsgAppendEntriesReply(
                 term=self.current_term,
                 from_node=self.id,
                 success=False,
@@ -186,13 +178,13 @@ impl Node:
         if int(term) > int(self.current_term):
             self.become_follower(term, leader, now)
         else:
-            self.role = make_follower(leader, _election_deadline(self.id, now))
+            self.role = RoleFollower(leader, _election_deadline(self.id, now))
             self.last_known_leader = leader
 
         # Log consistency check.
         let our_prev_term_opt: Term? = self.log.term_at(prev_idx)
         if our_prev_term_opt is None:
-            let reply_missing: Message = make_append_entries_reply(
+            let reply_missing: Message = MsgAppendEntriesReply(
                 term=self.current_term,
                 from_node=self.id,
                 success=False,
@@ -204,7 +196,7 @@ impl Node:
         let our_prev_term: Term = our_prev_term_opt
         if int(our_prev_term) != int(prev_term):
             self.log.truncate_from(prev_idx)
-            let reply_conflict: Message = make_append_entries_reply(
+            let reply_conflict: Message = MsgAppendEntriesReply(
                 term=self.current_term,
                 from_node=self.id,
                 success=False,
@@ -236,7 +228,7 @@ impl Node:
             )
             self.commit_index = LogIndex(new_commit)
 
-        let reply_ok: Message = make_append_entries_reply(
+        let reply_ok: Message = MsgAppendEntriesReply(
             term=self.current_term,
             from_node=self.id,
             success=True,
@@ -296,7 +288,7 @@ impl Node:
     ) -> list[tuple[int, Message]]:
         mut out: list[tuple[int, Message]] = []
         if int(term) < int(self.current_term):
-            let reply_no: Message = make_request_vote_reply(
+            let reply_no: Message = MsgRequestVoteReply(
                 term=self.current_term, from_node=self.id, granted=False,
             )
             out.append((int(candidate), reply_no))
@@ -324,14 +316,14 @@ impl Node:
 
         if cand_up_to_date and not already_voted_other:
             self.voted_for = candidate
-            self.role = make_follower(None, _election_deadline(self.id, now))
-            let reply_yes: Message = make_request_vote_reply(
+            self.role = RoleFollower(None, _election_deadline(self.id, now))
+            let reply_yes: Message = MsgRequestVoteReply(
                 term=self.current_term, from_node=self.id, granted=True,
             )
             out.append((int(candidate), reply_yes))
             return out
 
-        let reply_deny: Message = make_request_vote_reply(
+        let reply_deny: Message = MsgRequestVoteReply(
             term=self.current_term, from_node=self.id, granted=False,
         )
         out.append((int(candidate), reply_deny))
@@ -390,7 +382,7 @@ impl Node:
                     out.append(b)
                 return out
             case RoleFollower(leader, _):
-                let reply_redir: Message = make_client_reply(
+                let reply_redir: Message = MsgClientReply(
                     req_id=req_id,
                     ok=False,
                     value=None,
@@ -400,7 +392,7 @@ impl Node:
                 out.append((CLIENT_RECIPIENT, reply_redir))
                 return out
             case RoleCandidate(_, _):
-                let reply_busy: Message = make_client_reply(
+                let reply_busy: Message = MsgClientReply(
                     req_id=req_id,
                     ok=False,
                     value=None,
@@ -418,7 +410,7 @@ impl Node:
         match self.role:
             case RoleLeader(_, _, _):
                 let v: str? = self.store.get(key)
-                let reply_ok: Message = make_client_reply(
+                let reply_ok: Message = MsgClientReply(
                     req_id=req_id,
                     ok=True,
                     value=v,
@@ -428,7 +420,7 @@ impl Node:
                 out.append((CLIENT_RECIPIENT, reply_ok))
                 return out
             case RoleFollower(leader, _):
-                let reply_redir: Message = make_client_reply(
+                let reply_redir: Message = MsgClientReply(
                     req_id=req_id,
                     ok=False,
                     value=None,
@@ -438,7 +430,7 @@ impl Node:
                 out.append((CLIENT_RECIPIENT, reply_redir))
                 return out
             case RoleCandidate(_, _):
-                let reply_busy: Message = make_client_reply(
+                let reply_busy: Message = MsgClientReply(
                     req_id=req_id,
                     ok=False,
                     value=None,
@@ -482,7 +474,7 @@ impl Node:
             if next_idx in self.pending_client:
                 let req: ClientReqId = self.pending_client[next_idx]
                 del self.pending_client[next_idx]
-                let reply: Message = make_client_reply(
+                let reply: Message = MsgClientReply(
                     req_id=req,
                     ok=True,
                     value=None,
@@ -497,7 +489,7 @@ impl Node:
     def _update_heartbeat_deadline(self, new_deadline: float) -> None:
         match self.role:
             case RoleLeader(ni, mi, _):
-                self.role = make_leader(ni, mi, new_deadline)
+                self.role = RoleLeader(ni, mi, new_deadline)
             case RoleFollower(_, _):
                 pass
             case RoleCandidate(_, _):
@@ -527,7 +519,7 @@ impl Node:
                 if prev_term_opt is not None:
                     prev_term = prev_term_opt
                 let to_send: list[LogEntry] = self.log.entries_from(LogIndex(ni))
-                let ae: Message = make_append_entries(
+                let ae: Message = MsgAppendEntries(
                     term=self.current_term,
                     leader=self.id,
                     prev_log_index=LogIndex(prev_idx),

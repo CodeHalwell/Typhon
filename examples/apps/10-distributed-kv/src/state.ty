@@ -19,27 +19,6 @@ pub class RoleLeader:
     match_index: dict[int, int]
     heartbeat_deadline: float
 
-
-pub def make_follower(leader: NodeId?, election_deadline: float) -> Role:
-    return RoleFollower(leader=leader, election_deadline=election_deadline)
-
-
-pub def make_candidate(votes: dict[int, bool], election_deadline: float) -> Role:
-    return RoleCandidate(votes=votes, election_deadline=election_deadline)
-
-
-pub def make_leader(
-    next_index: dict[int, int],
-    match_index: dict[int, int],
-    heartbeat_deadline: float,
-) -> Role:
-    return RoleLeader(
-        next_index=next_index,
-        match_index=match_index,
-        heartbeat_deadline=heartbeat_deadline,
-    )
-
-
 pub def role_label(r: Role) -> str:
     match r:
         case RoleFollower(_, _):     return "follower"

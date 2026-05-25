@@ -15,26 +15,13 @@ pub class MEuclidean frozen:
 pub class MInnerProduct frozen:
     pass
 
-
-pub def make_cosine() -> Metric:
-    return MCosine()
-
-
-pub def make_euclidean() -> Metric:
-    return MEuclidean()
-
-
-pub def make_inner_product() -> Metric:
-    return MInnerProduct()
-
-
 pub def metric_from_name(name: str) -> Metric?:
     if name == "cosine":
-        return make_cosine()
+        return MCosine()
     if name == "euclidean" or name == "l2":
-        return make_euclidean()
+        return MEuclidean()
     if name == "inner_product" or name == "ip" or name == "dot":
-        return make_inner_product()
+        return MInnerProduct()
     return None
 
 

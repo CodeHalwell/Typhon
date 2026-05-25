@@ -11,13 +11,13 @@ from models import (
     StatusRunning,
     Task,
     TaskStatus,
-    make_status_failed,
-    make_status_succeeded,
-    make_task_completed,
-    make_task_failed,
-    make_task_ready,
-    make_task_retry,
-    make_task_submitted,
+    StatusFailed,
+    StatusSucceeded,
+    TaskCompleted,
+    TaskFailed,
+    TaskBecameReady,
+    TaskRetryScheduled,
+    TaskSubmitted,
 )
 from store import Store, StoreError
 
@@ -88,12 +88,12 @@ impl Scheduler:
     ) -> Result[Task, StoreError]:
         match self.store.insert_task(job, args, priority, depends_on):
             case Ok(task):
-                self.emit(make_task_submitted(
+                self.emit(TaskSubmitted(
                     task_id=task.id, job=task.job, at=task.created_at
                 ))
                 match task.status:
                     case StatusReady(_):
-                        self.emit(make_task_ready(task_id=task.id, at=task.updated_at))
+                        self.emit(TaskBecameReady(task_id=task.id, at=task.updated_at))
                     case _:
                         pass
                 return Ok(task)
@@ -126,7 +126,7 @@ impl Scheduler:
 
     def record_success(self, task: Task, summary: str, duration_ms: int) -> None:
         let now: datetime = datetime.now(timezone.utc)
-        let status: TaskStatus = make_status_succeeded(
+        let status: TaskStatus = StatusSucceeded(
             finished_at=now, result_summary=summary
         )
         match self.store.update_status(task.id, status, task.attempts + 1, None):
@@ -136,7 +136,7 @@ impl Scheduler:
                 print(f"[scheduler] failed to record success: {e.reason}")
         match task.status:
             case StatusRunning(worker, _, _):
-                self.emit(make_task_completed(
+                self.emit(TaskCompleted(
                     task_id=task.id, worker=worker, duration_ms=duration_ms, at=now
                 ))
             case _:
@@ -155,7 +155,7 @@ impl Scheduler:
 
         match task.status:
             case StatusRunning(worker, _, _):
-                self.emit(make_task_failed(
+                self.emit(TaskFailed(
                     task_id=task.id,
                     worker=worker,
                     error=message,
@@ -173,7 +173,7 @@ impl Scheduler:
                     pass
                 case Err(e):
                     print(f"[scheduler] could not requeue: {e.reason}")
-            self.emit(make_task_retry(
+            self.emit(TaskRetryScheduled(
                 task_id=task.id,
                 delay_seconds=delay,
                 next_attempt=attempt + 1,
@@ -181,7 +181,7 @@ impl Scheduler:
             ))
             return
 
-        let terminal: TaskStatus = make_status_failed(
+        let terminal: TaskStatus = StatusFailed(
             finished_at=now, last_error=message, attempts=attempt
         )
         match self.store.update_status(task.id, terminal, attempt, message):

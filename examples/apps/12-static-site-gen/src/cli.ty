@@ -4,10 +4,10 @@ import sys
 from pathlib import Path
 
 from assets import copy_assets
-from config import build_version, default_config
+from config import SiteConfig, build_version, default_config
 from feed import render_robots, render_rss, render_sitemap
 from manifest import open_manifest
-from models import RenderedPage, SiteConfig
+from models import RenderedPage
 from pipeline import (
     PipelineReport,
     build_pages,

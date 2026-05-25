@@ -32,22 +32,6 @@ pub class StratWeighted:
     placeholder: int
 
 
-pub def make_round_robin() -> BalanceStrategy:
-    return StratRoundRobin(cursor=0)
-
-
-pub def make_least_conn() -> BalanceStrategy:
-    return StratLeastConn(placeholder=0)
-
-
-pub def make_random_strategy() -> BalanceStrategy:
-    return StratRandom(placeholder=0)
-
-
-pub def make_weighted() -> BalanceStrategy:
-    return StratWeighted(placeholder=0)
-
-
 pub def strategy_name(s: BalanceStrategy) -> str:
     match s:
         case StratRoundRobin(_): return "round_robin"

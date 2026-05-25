@@ -9,17 +9,17 @@ from query import (
 )
 from schema import (
     Comment,
+    FieldCommentList,
+    FieldNull,
+    FieldObject,
+    FieldPost,
+    FieldPostList,
+    FieldScalar,
+    FieldUser,
+    FieldUserList,
     Post,
     ResolvedField,
     User,
-    make_field_comment_list,
-    make_field_null,
-    make_field_object,
-    make_field_post,
-    make_field_post_list,
-    make_field_scalar,
-    make_field_user,
-    make_field_user_list,
 )
 from store import Store
 
@@ -38,37 +38,37 @@ pub class ResolverContext:
 
 def _user_scalar(u: User, field_name: str) -> ResolvedField?:
     if field_name == "id":
-        return make_field_scalar(str(int(u.id)))
+        return FieldScalar(str(int(u.id)))
     if field_name == "name":
-        return make_field_scalar(u.name)
+        return FieldScalar(u.name)
     if field_name == "email":
-        return make_field_scalar(u.email)
+        return FieldScalar(u.email)
     if field_name == "role":
-        return make_field_scalar(u.role)
+        return FieldScalar(u.role)
     return None
 
 
 def _post_scalar(p: Post, field_name: str) -> ResolvedField?:
     if field_name == "id":
-        return make_field_scalar(str(int(p.id)))
+        return FieldScalar(str(int(p.id)))
     if field_name == "title":
-        return make_field_scalar(p.title)
+        return FieldScalar(p.title)
     if field_name == "body":
-        return make_field_scalar(p.body)
+        return FieldScalar(p.body)
     if field_name == "author_id":
-        return make_field_scalar(str(int(p.author)))
+        return FieldScalar(str(int(p.author)))
     return None
 
 
 def _comment_scalar(c: Comment, field_name: str) -> ResolvedField?:
     if field_name == "id":
-        return make_field_scalar(str(int(c.id)))
+        return FieldScalar(str(int(c.id)))
     if field_name == "body":
-        return make_field_scalar(c.body)
+        return FieldScalar(c.body)
     if field_name == "author_id":
-        return make_field_scalar(str(int(c.author)))
+        return FieldScalar(str(int(c.author)))
     if field_name == "post_id":
-        return make_field_scalar(str(int(c.post)))
+        return FieldScalar(str(int(c.post)))
     return None
 
 
@@ -82,7 +82,7 @@ pub def resolve_user_selections(
     selections: list[QueryNode],
 ) -> Result[ResolvedField, str]:
     if len(selections) == 0:
-        return Ok(make_field_user(user))
+        return Ok(FieldUser(user))
     mut fields: dict[str, ResolvedField] = {}
     for sel in selections:
         let name: str = node_name(sel)
@@ -97,7 +97,7 @@ pub def resolve_user_selections(
             fields[name] = resolved
             continue
         return Err(f"unknown field '{name}' on User")
-    return Ok(make_field_object(fields))
+    return Ok(FieldObject(fields))
 
 
 pub def resolve_post_selections(
@@ -106,7 +106,7 @@ pub def resolve_post_selections(
     selections: list[QueryNode],
 ) -> Result[ResolvedField, str]:
     if len(selections) == 0:
-        return Ok(make_field_post(post))
+        return Ok(FieldPost(post))
     mut fields: dict[str, ResolvedField] = {}
     for sel in selections:
         let name: str = node_name(sel)
@@ -118,7 +118,7 @@ pub def resolve_post_selections(
         if name == "author":
             let loaded: User? = ctx.user_loader.load(int(post.author))
             if loaded is None:
-                fields[name] = make_field_null()
+                fields[name] = FieldNull(placeholder=0)
                 continue
             let author: User = loaded
             let resolved: ResolvedField = resolve_user_selections(ctx, author, sub_sels)?
@@ -130,7 +130,7 @@ pub def resolve_post_selections(
             fields[name] = resolved2
             continue
         return Err(f"unknown field '{name}' on Post")
-    return Ok(make_field_object(fields))
+    return Ok(FieldObject(fields))
 
 
 pub def resolve_comment_selections(
@@ -139,7 +139,7 @@ pub def resolve_comment_selections(
     selections: list[QueryNode],
 ) -> Result[ResolvedField, str]:
     if len(selections) == 0:
-        return Ok(make_field_object({"body": make_field_scalar(comment.body)}))
+        return Ok(FieldObject({"body": FieldScalar(comment.body)}))
     mut fields: dict[str, ResolvedField] = {}
     for sel in selections:
         let name: str = node_name(sel)
@@ -151,7 +151,7 @@ pub def resolve_comment_selections(
         if name == "author":
             let loaded: User? = ctx.user_loader.load(int(comment.author))
             if loaded is None:
-                fields[name] = make_field_null()
+                fields[name] = FieldNull(placeholder=0)
                 continue
             let author: User = loaded
             let resolved: ResolvedField = resolve_user_selections(ctx, author, sub_sels)?
@@ -160,14 +160,14 @@ pub def resolve_comment_selections(
         if name == "post":
             let lp: Post? = ctx.post_loader.load(int(comment.post))
             if lp is None:
-                fields[name] = make_field_null()
+                fields[name] = FieldNull(placeholder=0)
                 continue
             let post: Post = lp
             let resolved2: ResolvedField = resolve_post_selections(ctx, post, sub_sels)?
             fields[name] = resolved2
             continue
         return Err(f"unknown field '{name}' on Comment")
-    return Ok(make_field_object(fields))
+    return Ok(FieldObject(fields))
 
 
 pub def resolve_post_list_selections(
@@ -176,14 +176,14 @@ pub def resolve_post_list_selections(
     selections: list[QueryNode],
 ) -> Result[ResolvedField, str]:
     if len(selections) == 0:
-        return Ok(make_field_post_list(posts))
+        return Ok(FieldPostList(posts))
     mut out: dict[str, ResolvedField] = {}
     mut idx: int = 0
     for p in posts:
         let resolved: ResolvedField = resolve_post_selections(ctx, p, selections)?
         out[f"[{idx}]"] = resolved
         idx = idx + 1
-    return Ok(make_field_object(out))
+    return Ok(FieldObject(out))
 
 
 pub def resolve_comment_list_selections(
@@ -192,14 +192,14 @@ pub def resolve_comment_list_selections(
     selections: list[QueryNode],
 ) -> Result[ResolvedField, str]:
     if len(selections) == 0:
-        return Ok(make_field_comment_list(comments))
+        return Ok(FieldCommentList(comments))
     mut out: dict[str, ResolvedField] = {}
     mut idx: int = 0
     for c in comments:
         let resolved: ResolvedField = resolve_comment_selections(ctx, c, selections)?
         out[f"[{idx}]"] = resolved
         idx = idx + 1
-    return Ok(make_field_object(out))
+    return Ok(FieldObject(out))
 
 
 pub def resolve_user_list_selections(
@@ -208,14 +208,14 @@ pub def resolve_user_list_selections(
     selections: list[QueryNode],
 ) -> Result[ResolvedField, str]:
     if len(selections) == 0:
-        return Ok(make_field_user_list(users))
+        return Ok(FieldUserList(users))
     mut out: dict[str, ResolvedField] = {}
     mut idx: int = 0
     for u in users:
         let resolved: ResolvedField = resolve_user_selections(ctx, u, selections)?
         out[f"[{idx}]"] = resolved
         idx = idx + 1
-    return Ok(make_field_object(out))
+    return Ok(FieldObject(out))
 
 
 # ---------------------------------------------------------------------------
