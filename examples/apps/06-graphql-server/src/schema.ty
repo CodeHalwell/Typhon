@@ -61,14 +61,6 @@ pub class FieldObject:
     fields: dict[str, ResolvedField]
 
 
-pub def FieldUser(u: User) -> ResolvedField:
-    return FieldUser(user=u)
-
-
-pub def FieldPost(p: Post) -> ResolvedField:
-    return FieldPost(post=p)
-
-
 pub def field_kind(f: ResolvedField) -> str:
     match f:
         case FieldUser(_):         return "user"

@@ -300,6 +300,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
     // Phase 2: desugar and emit using the already-loaded source text.
     let mut emitted = 0usize;
     let mut needs_runtime = false;
+    // R3 frontier: `pub *` name collisions are accumulated per-file
+    // and surfaced as `tyc::pub_name_collision` diagnostics. Track the
+    // total so the build can fail after the per-file loop instead of
+    // silently emitting bad re-exports.
+    let mut pub_star_collision_count: usize = 0;
 
     for (path, source) in &sources {
         // Expand Typhon syntactic sugar in order:
@@ -338,9 +343,12 @@ pub fn run(args: BuildArgs) -> Result<()> {
         //     advice — the wildcard re-export only has meaning at a
         //     package boundary.
         //
-        // Aggregation is direct-siblings only by design; transitive
-        // aggregation through sub-packages is an intentional non-goal
-        // (every `__init__.ty` only re-exports its immediate children).
+        // Aggregation includes BOTH direct .ty siblings AND direct
+        // sub-packages (sub-directories containing their own
+        // `__init__.ty`). When a sub-package's own `__init__.ty` uses
+        // `pub *`, the recursion picks up its aggregated names too.
+        // Cycle-safe via a `visited` set keyed on each package
+        // directory; see `effective_package_surface`.
         if !prep.pub_star_lines.is_empty() {
             let is_init = path
                 .file_name()
@@ -433,9 +441,11 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 }
                 // Detect collisions: any name that appears in two
                 // different siblings fires `tyc::pub_name_collision`.
+                // Each collision bumps `pub_star_collision_count` so
+                // the build fails after the per-file loop instead of
+                // silently emitting bad re-exports.
                 let mut name_origin: std::collections::HashMap<String, String> =
                     std::collections::HashMap::new();
-                let mut collision_lines: Vec<usize> = Vec::new();
                 for (sibling, names) in &sibling_pubs {
                     for name in names {
                         if let Some(prev) = name_origin.get(name) {
@@ -443,7 +453,6 @@ pub fn run(args: BuildArgs) -> Result<()> {
                             // anchor; in practice `__init__.ty` will
                             // have a single `pub *` and the span is
                             // unambiguous.
-                            collision_lines.push(0);
                             let marker_line = *prep.pub_star_lines.first().unwrap_or(&0);
                             let offset = line_offset(&expanded, marker_line);
                             let err = TycError::pub_name_collision(
@@ -456,6 +465,7 @@ pub fn run(args: BuildArgs) -> Result<()> {
                                 5,
                             );
                             eprintln!("{:?}", miette::Report::new_boxed(Box::new(err)));
+                            pub_star_collision_count += 1;
                         } else {
                             name_origin.insert(name.clone(), sibling.clone());
                         }
@@ -976,6 +986,17 @@ pub fn run(args: BuildArgs) -> Result<()> {
     } else {
         println!("built {} file(s) → '{}'", emitted, out_dir.display());
     }
+    // R3 frontier: fail the build when `pub *` aggregated colliding
+    // re-exports. The diagnostics were already printed to stderr in
+    // the per-file loop; returning Err here ensures CI gates on them
+    // instead of silently shipping the (order-dependent) shadow.
+    if pub_star_collision_count > 0 {
+        return Err(miette!(
+            "{} `pub *` re-export collision(s) — \
+             see the `tyc::pub_name_collision` advice above for details",
+            pub_star_collision_count
+        ));
+    }
     Ok(())
 }
 
@@ -1176,10 +1197,7 @@ fn effective_package_surface(
         None => return Vec::new(),
     };
     let mut out: Vec<String> = extract_top_level_pub_names(init_source);
-    let has_pub_star = init_source
-        .lines()
-        .any(|l| l.trim() == "pub *" || l.trim_start().starts_with("pub *"));
-    if !has_pub_star {
+    if !source_has_pub_star_marker(init_source) {
         return out;
     }
     // Aggregate one level deeper: direct .ty siblings of this
@@ -1231,6 +1249,46 @@ fn effective_package_surface(
 /// every sibling. Mirrors the logic
 /// [`tyc_syntax::preprocess::pub_decl_name`] applies, but operates
 /// directly on the raw text.
+/// True when `source` contains a `pub *` marker at module level (zero
+/// indent) that the preprocessor would recognise. Mirrors
+/// `tyc_syntax::preprocess::is_pub_star_line`'s acceptance rules so
+/// invalid forms like `pub * from foo` and occurrences inside
+/// triple-quoted strings / comments don't falsely trigger transitive
+/// aggregation. Used by `effective_package_surface` to gate recursion
+/// into sub-packages.
+fn source_has_pub_star_marker(source: &str) -> bool {
+    let mut in_triple_string = false;
+    for line in source.split_inclusive('\n') {
+        let triple_count = line.matches("\"\"\"").count() + line.matches("'''").count();
+        if in_triple_string {
+            if triple_count % 2 == 1 {
+                in_triple_string = false;
+            }
+            continue;
+        }
+        if triple_count % 2 == 1 {
+            in_triple_string = true;
+            continue;
+        }
+        let indent_len = line
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(line.len());
+        if indent_len != 0 {
+            continue;
+        }
+        let rest = &line[indent_len..];
+        let Some(after) = rest.strip_prefix("pub *") else {
+            continue;
+        };
+        let trimmed = after.trim_start_matches([' ', '\t']);
+        let body = trimmed.trim_end_matches(['\n', '\r']);
+        if body.is_empty() || body.starts_with('#') {
+            return true;
+        }
+    }
+    false
+}
+
 fn extract_top_level_pub_names(source: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut in_triple_string = false;

@@ -82,7 +82,7 @@ pub def resolve_user_selections(
     selections: list[QueryNode],
 ) -> Result[ResolvedField, str]:
     if len(selections) == 0:
-        return Ok(FieldUser(user))
+        return Ok(FieldUser(user=user))
     mut fields: dict[str, ResolvedField] = {}
     for sel in selections:
         let name: str = node_name(sel)
@@ -106,7 +106,7 @@ pub def resolve_post_selections(
     selections: list[QueryNode],
 ) -> Result[ResolvedField, str]:
     if len(selections) == 0:
-        return Ok(FieldPost(post))
+        return Ok(FieldPost(post=post))
     mut fields: dict[str, ResolvedField] = {}
     for sel in selections:
         let name: str = node_name(sel)

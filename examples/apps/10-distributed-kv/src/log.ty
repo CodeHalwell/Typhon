@@ -16,9 +16,6 @@ pub class CmdDelete frozen:
 pub class CmdNoop frozen:
     placeholder: int
 
-pub def CmdNoop() -> Command:
-    return CmdNoop(placeholder=0)
-
 
 pub def cmd_label(c: Command) -> str:
     match c:
@@ -88,7 +85,7 @@ pub def new_log() -> ReplicatedLog:
     let dummy: LogEntry = LogEntry(
         index=LogIndex(0),
         term=Term(0),
-        command=CmdNoop(),
+        command=CmdNoop(placeholder=0),
         client_req=ClientReqId(0),
     )
     return ReplicatedLog(entries=[dummy])

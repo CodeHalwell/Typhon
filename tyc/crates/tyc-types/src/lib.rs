@@ -4416,6 +4416,26 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
             }
         }
     }
+    // R3-3 review follow-up: method-form context-manager factories
+    // (`impl Pool: @contextmanager def acquire(self): yield Conn()`)
+    // live inside a `ClassDef` body and aren't visited by the
+    // top-level FunctionDef pass above. Walk every class body and
+    // record the same yield type under the METHOD name, matching
+    // `with_target_type`'s attribute-callee lookup key.
+    for stmt in body {
+        if let Stmt::ClassDef(cd) = stmt {
+            for item in &cd.body {
+                if let Stmt::FunctionDef(f) = item {
+                    if has_contextmanager_decorator(&f.decorator_list) {
+                        if let Some(yield_ty) = extract_first_yield_type(&f.body, &classes) {
+                            c.contextmanager_yields
+                                .insert(f.name.as_str().to_owned(), yield_ty);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Walk a function body looking for the first `yield expr` (or `yield`
@@ -4730,10 +4750,19 @@ fn has_runtime_checkable_decorator(decorators: &[ruff_python_ast::Decorator]) ->
 ///    stub layer (which doesn't carry `__enter__` annotations today)
 ///    and stays Unknown rather than misfiring downstream.
 fn with_target_type(c: &Checker, ctx_expr: &Expr, ctx_ty: &Type, is_async: bool) -> Type {
-    // (1) Factory call.
+    // (1) Factory call. Both bare-name (`acquire()`) and
+    // attribute-style (`self.acquire()`, `pool.session()`) callees
+    // resolve through the contextmanager_yields registry — we key on
+    // the method/function name in both cases, which matches how the
+    // pre-scan populates the registry.
     if let Expr::Call(call) = ctx_expr {
-        if let Expr::Name(fn_name) = call.func.as_ref() {
-            if let Some(yield_ty) = c.contextmanager_yields.get(fn_name.id.as_str()) {
+        let name_opt = match call.func.as_ref() {
+            Expr::Name(n) => Some(n.id.as_str()),
+            Expr::Attribute(a) => Some(a.attr.as_str()),
+            _ => None,
+        };
+        if let Some(name) = name_opt {
+            if let Some(yield_ty) = c.contextmanager_yields.get(name) {
                 return yield_ty.clone();
             }
         }
@@ -7030,14 +7059,15 @@ fn da_check_expr(
     c: &mut Checker,
     expr: &Expr,
     tracked: &HashMap<String, (usize, usize)>,
-    state: &DaState,
+    state: &mut DaState,
 ) {
-    // Pre-order walk so a `(x := …)` walrus on the LHS of an
-    // expression initialises before the rest of the expression
-    // reads. We don't model the walrus explicitly here — `Expr::Named`
-    // adds the target to the env via the resolver pass; here we just
-    // treat the binding side as a read because the inner value is
-    // what matters.
+    // Pre-order walk. `Expr::Named` (walrus `x := expr`) checks its
+    // RHS for reads and then marks the target as assigned in the
+    // surrounding state so subsequent uses in the same statement (or
+    // in the if/while body where the walrus lived in the test) see the
+    // binding as initialised. This matches Python's scoping rules,
+    // where the walrus' binding effect persists outside the
+    // expression.
     match expr {
         Expr::Name(n) => {
             let name = n.id.as_str();
@@ -7145,6 +7175,15 @@ fn da_check_expr(
             }
         }
         Expr::YieldFrom(y) => da_check_expr(c, &y.value, tracked, state),
+        Expr::Named(n) => {
+            // `(x := expr)` — check expr for uses first, then mark
+            // the target as assigned so the surrounding statement
+            // sees the binding initialised.
+            da_check_expr(c, &n.value, tracked, state);
+            if let Expr::Name(target) = n.target.as_ref() {
+                state.assign(target.id.as_str());
+            }
+        }
         Expr::Lambda(_)
         | Expr::ListComp(_)
         | Expr::SetComp(_)
@@ -13624,6 +13663,37 @@ let s: str = id(3)
     }
 
     #[test]
+    fn with_target_typed_from_attribute_contextmanager_call() {
+        // R3-3 review: `pool.session()` (attribute-style callee) must
+        // resolve the same way `session()` (bare name) does — both go
+        // through `contextmanager_yields`, which is keyed by the
+        // function/method name. Without `Expr::Attribute` support the
+        // method-based factory shape (the canonical
+        // `with self.acquire() as conn:` form) silently left `r` as
+        // Unknown.
+        let d = check(
+            "from contextlib import contextmanager\n\
+             from typing import Iterator\n\
+             class Conn:\n\
+             \x20   id: int\n\
+             class Pool:\n\
+             \x20   name: str\n\
+             impl Pool:\n\
+             \x20   @contextmanager\n\
+             \x20   def acquire(self) -> Iterator[Conn]:\n\
+             \x20       yield Conn(id=1)\n\
+             def takes_str(s: str) -> str: return s\n\
+             def main(p: Pool) -> None:\n\
+             \x20   with p.acquire() as r:\n\
+             \x20       let bad: str = takes_str(r)\n",
+        );
+        assert!(
+            d.has_errors(),
+            "attribute-form contextmanager call must propagate yield type to `r`"
+        );
+    }
+
+    #[test]
     fn await_unwraps_awaitable_in_callable_return() {
         // R3-1: `Callable[..., Awaitable[T]]` is the canonical async-
         // middleware shape (FastAPI/Starlette/aiohttp). Calling the
@@ -13795,6 +13865,48 @@ let s: str = id(3)
                 .iter()
                 .any(|e| matches!(e, TycError::UseOfUninitialised { .. })),
             "loop-body-only assignment must NOT count as init; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn da_pass_walrus_in_if_test_initialises_binding() {
+        // R3-8 review (codex P2): the walrus operator `(x := expr)` in
+        // an `if`-test must mark `x` as assigned in the surrounding
+        // state so the body and post-if reads don't fire
+        // `use_of_uninitialised`. Without `Expr::Named` handling the
+        // walrus assignment was invisible to the DA pass.
+        let d = check(
+            "def f() -> int:\n\
+             \x20   let x: int\n\
+             \x20   if (x := 5) > 0:\n\
+             \x20       return x\n\
+             \x20   return x\n",
+        );
+        assert!(
+            !d.has_errors(),
+            "walrus in if-test must initialise the binding for the body and \
+             post-if read; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn da_pass_walrus_rhs_checks_for_uses() {
+        // R3-8 review: the walrus' RHS is a normal expression that
+        // must itself be checked for uses of uninitialised bindings —
+        // `(x := y + 1)` with `y` uninit must fire on `y`.
+        let d = check(
+            "def f() -> int:\n\
+             \x20   let y: int\n\
+             \x20   let z: int = (y + 1)\n\
+             \x20   return z\n",
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UseOfUninitialised { name, .. } if name == "y")),
+            "RHS of an expression must still be checked for uninit reads; got {:?}",
             d.errors()
         );
     }

@@ -28,18 +28,6 @@ pub class SessionConflict:
     player: PlayerId
 
 
-pub def SessionExpired(t: SessionToken) -> SessionError:
-    return SessionExpired(token=t)
-
-
-pub def SessionUnknown(t: SessionToken) -> SessionError:
-    return SessionUnknown(token=t)
-
-
-pub def SessionConflict(p: PlayerId) -> SessionError:
-    return SessionConflict(player=p)
-
-
 pub class ConnectionRegistry:
     by_token: dict[str, Session]
     by_player: dict[int, str]
@@ -59,7 +47,7 @@ impl ConnectionRegistry:
             if existing_tok in self.by_token:
                 let existing: Session = self.by_token[existing_tok]
                 if not _is_expired(existing):
-                    return Err(SessionConflict(player))
+                    return Err(SessionConflict(player=player))
         let now: datetime = datetime.now(timezone.utc)
         let token_raw: str = secrets.token_hex(16)
         let tok: SessionToken = SessionToken(token_raw)
@@ -77,12 +65,12 @@ impl ConnectionRegistry:
     def resume(self, token: SessionToken) -> Result[Session, SessionError]:
         let tok_raw: str = str(token)
         if tok_raw not in self.by_token:
-            return Err(SessionUnknown(token))
+            return Err(SessionUnknown(token=token))
         let s: Session = self.by_token[tok_raw]
         if _is_expired(s):
             del self.by_token[tok_raw]
             self.by_player.pop(int(s.player), None)
-            return Err(SessionExpired(token))
+            return Err(SessionExpired(token=token))
         # Renew on touch.
         let now: datetime = datetime.now(timezone.utc)
         s.expires_at = now + timedelta(seconds=SESSION_TTL_SECONDS)

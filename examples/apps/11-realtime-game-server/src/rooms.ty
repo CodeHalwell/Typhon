@@ -49,9 +49,6 @@ pub class Closed:
     reason: str
 
 
-pub def Waiting(opened_at: datetime) -> RoomState:
-    return Waiting(opened_at=opened_at, last_join_at=opened_at)
-
 pub def room_state_label(s: RoomState) -> str:
     match s:
         case Waiting(_, _):     return "waiting"
@@ -119,7 +116,7 @@ pub def new_room(rid: RoomId, mode: Mode) -> Room:
     return Room(
         id=rid,
         mode=mode,
-        state=Waiting(now),
+        state=Waiting(opened_at=now, last_join_at=now),
         players=[],
         starting_ratings=StartingRatings(by_player={}),
         subscribers=[],
