@@ -6818,20 +6818,24 @@ fn pattern_covers_class(c: &Checker, pattern: &Pattern, class_name: &str) -> boo
                 }
                 return mc.arguments.patterns.iter().all(is_capture_or_underscore);
             }
-            // Keyword-only class pattern — every field must be bound by
-            // a pattern that is itself a capture / wildcard.
-            if mc.arguments.keywords.len() != shape.fields.len() {
-                return false;
-            }
-            let bound: HashSet<&str> = mc
-                .arguments
-                .keywords
-                .iter()
-                .map(|kw| kw.attr.as_str())
-                .collect();
-            if !shape.fields.keys().all(|f| bound.contains(f.as_str())) {
-                return false;
-            }
+            // Keyword-only class pattern — `case TaskStarted(task_id=tid):`.
+            // Python's runtime match dispatches on the class first, then
+            // binds the named fields; *omitted* keyword fields are
+            // unconstrained, exactly like omitted positionals. A keyword
+            // pattern with every supplied capture being a bare capture /
+            // wildcard therefore totally covers `class_name` regardless
+            // of how many of the class's fields the user actually named.
+            // R1#9: a pattern like `case TaskStarted(task_id=tid):` on a
+            // 3-field class used to demand all three field names be
+            // listed before exhaustiveness fired, which forced
+            // `missing_return` on every otherwise-exhaustive match.
+            //
+            // Each named keyword must still actually exist on the class
+            // (verified by `check_pattern_class_fields` upstream — the
+            // class-shape lookup above guards us when the class is
+            // known). The capture-or-wildcard check stays so a
+            // `case X(a=Literal[1]):` arm — which adds an inner value
+            // filter — does NOT count as total.
             mc.arguments
                 .keywords
                 .iter()
@@ -11400,6 +11404,72 @@ match s:
         assert!(
             msg.contains("Triangle"),
             "error should name missing variant Triangle, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn partial_keyword_pattern_satisfies_exhaustiveness() {
+        // R1#9: `case TaskStarted(task_id=tid):` names only one of the
+        // class's three fields, but Python's runtime match dispatches
+        // on the class first and binds named fields — omitted
+        // keywords are unconstrained, exactly like omitted positionals.
+        // The exhaustiveness pass must accept this as totally covering
+        // the variant so the surrounding match isn't flagged as
+        // non-exhaustive (and the user isn't forced to pad the pattern
+        // with `case TaskStarted(task_id=tid, worker=_, attempt=_):`).
+        let src = "\
+class TaskStarted:
+    task_id: int
+    worker: int
+    attempt: int
+
+class TaskFinished:
+    task_id: int
+
+type Event = TaskStarted | TaskFinished
+
+let e: Event = TaskFinished(task_id=1)
+
+match e:
+    case TaskStarted(task_id=tid):
+        print(tid)
+    case TaskFinished(task_id=tid):
+        print(tid)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "partial keyword pattern must satisfy exhaustiveness: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn keyword_pattern_with_value_filter_does_not_satisfy_exhaustiveness() {
+        // Negative: `case TaskStarted(task_id=1):` adds an inner value
+        // filter and does NOT totally cover the variant — the runtime
+        // match would fall through to the next arm when task_id != 1.
+        // (Today this is a no-op because the parser doesn't accept the
+        // shape, but the rule must hold once it does.)
+        let src = "\
+class TaskStarted:
+    task_id: int
+
+class TaskFinished:
+    task_id: int
+
+type Event = TaskStarted | TaskFinished
+
+let e: Event = TaskFinished(task_id=1)
+
+match e:
+    case TaskStarted(task_id=tid):
+        print(tid)
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "missing TaskFinished arm should still fire non_exhaustive_match"
         );
     }
 
