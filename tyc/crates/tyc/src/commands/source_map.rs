@@ -237,4 +237,28 @@ mod tests {
         let loaded = load_map_for(py.to_str().unwrap(), None).expect("legacy map should be found");
         assert!(loaded.contains("foo.ty"));
     }
+
+    #[test]
+    fn load_map_for_prefers_sourcemaps_over_legacy_adjacent() {
+        // After upgrading from a pre-`.sourcemaps/` `tyc`, a stale
+        // adjacent `<rel>.py.map` will sit alongside the freshly
+        // written `.sourcemaps/<rel>.py.map`. The resolver must
+        // pick the new one so debugger / trace output reflects the
+        // current build, not the stale sidecar.
+        let tmp = tempfile::tempdir().unwrap();
+        let build = tmp.path().join("build");
+        let sourcemaps = build.join(".sourcemaps");
+        std::fs::create_dir_all(&sourcemaps).unwrap();
+        let py = build.join("foo.py");
+        std::fs::write(&py, "").unwrap();
+        let fresh = r#"{"version":2,"source":"fresh.ty","line_strategy":"table","lines":[1]}"#;
+        let stale = r#"{"version":1,"source":"stale.ty","line_strategy":"identity"}"#;
+        std::fs::write(sourcemaps.join("foo.py.map"), fresh).unwrap();
+        std::fs::write(build.join("foo.py.map"), stale).unwrap();
+        let loaded = load_map_for(py.to_str().unwrap(), None).expect("map should be found");
+        assert!(
+            loaded.contains("fresh.ty"),
+            ".sourcemaps/ must win over legacy; got: {loaded}"
+        );
+    }
 }

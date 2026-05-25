@@ -4,6 +4,46 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.6.1 — 2026-05-25
+
+Polish release on top of v0.6.0. Tightens the VS Code TextMate grammar
+around `let`-binding annotations and reorganises the build output
+directory so emitted `.py` artefacts no longer interleave with their
+`.py.map` sidecars.
+
+No previously-accepted program changes behaviour. Existing build dirs
+written by v0.6.0 keep working — every map-consumer (`tyc trace`,
+`tyc debug`, `tyc ty`) falls back to the legacy adjacent layout when
+no `.sourcemaps/` subtree is present.
+
+### Fixed — vscode (`editors/vscode` 0.1.8 → 0.1.9)
+
+- **`let name: lowercase_type = …` now highlights as a type annotation.**
+  The standalone `binding-declaration` rule was a one-shot `match` that
+  stopped at the binding name, leaving the `:` and the type to fall
+  through to the shared `type-annotation` rule. That rule rejects bare
+  lowercase identifiers on purpose (to avoid mis-scoping `if cond:`
+  and `case Foo(x):`), so `let now: datetime = datetime.now()` painted
+  the colon as a generic separator and `datetime` as `variable.other`
+  — visibly inconsistent with `let cfg: SchedulerConfig` (uppercase →
+  correct), `let n: int` (builtin → correct), and `let c:
+  sqlite3.Connection` (dotted → correct). `binding-declaration` is now
+  a `begin`/`end` rule that owns the `: Type` slot, routing the
+  right-hand side through `type-expression`. A new Unicode-aware
+  lowercase fallback in `type-expression` paints `datetime`, `asyncio`,
+  and user-defined aliases as `entity.name.type.typhon`.
+
+### Changed — build output layout
+
+- **`.py.map` sidecars now live under `<out>/.sourcemaps/`.** Mirrors
+  the emitted Python tree (`build/foo.py` → `build/.sourcemaps/foo.py.map`,
+  `build/pkg/bar.py` → `build/.sourcemaps/pkg/bar.py.map`), so the
+  build directory is no longer cluttered by interleaved map files.
+  Map resolvers in `tyc trace`, `tyc debug`, and `tyc ty` discover the
+  new location by walking up from the `.py` and explicitly prefer
+  `.sourcemaps/` over the legacy adjacent layout so a stale sidecar
+  left over from an upgrade can't shadow a fresh map.
+
 ## 0.6.0 — 2026-05-25
 
 Apps-feedback minor release. A two-round stress campaign that built

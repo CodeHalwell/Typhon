@@ -197,9 +197,10 @@ pub(crate) fn translate_breakpoint(
         legacy_map_path
     } else {
         return Err(format!(
-            "no .py.map sidecar for '{}' (expected '{}')",
+            "no .py.map sidecar for '{}' (checked '{}' and legacy '{}')",
             spec.ty_file.display(),
-            primary_map_path.display()
+            primary_map_path.display(),
+            legacy_map_path.display()
         ));
     };
     let map_body = std::fs::read_to_string(&map_path)
@@ -395,11 +396,17 @@ def _load_maps(build_dir):
     adjacent layout (`<build_dir>/<rel>.py.map` next to `<rel>.py`)
     is also accepted for builds emitted by older `tyc` versions.
 
+    A stale legacy map left behind after an upgrade points at the
+    same `.py` as the fresh `.sourcemaps/` entry, so we apply
+    explicit precedence — the new layout always wins, regardless
+    of `os.walk` visitation order (which is filesystem-dependent).
+
     Malformed sidecars are skipped silently — the worst case is that
     a frame's `[ty]` annotation is missing, not that the debugger
     fails to launch.
     """
-    out = {{}}
+    new_entries = {{}}
+    legacy_entries = {{}}
     sourcemaps_dir = os.path.join(build_dir, ".sourcemaps")
     abs_sourcemaps = os.path.abspath(sourcemaps_dir)
     for root, _dirs, files in os.walk(build_dir):
@@ -424,11 +431,16 @@ def _load_maps(build_dir):
                 # to `<build>/<rel>.py`.
                 rel = os.path.relpath(abs_map, abs_sourcemaps)
                 py_path = os.path.join(build_dir, rel[:-4])
+                target = new_entries
             else:
                 # Legacy layout: map sits next to its `.py` sibling.
                 py_path = map_path[:-4]
-            out[os.path.abspath(py_path)] = (source, [int(x) for x in lines])
-    return out
+                target = legacy_entries
+            target[os.path.abspath(py_path)] = (source, [int(x) for x in lines])
+    # Start from legacy entries, then overwrite with new-layout entries
+    # so `.sourcemaps/` wins on every collision.
+    legacy_entries.update(new_entries)
+    return legacy_entries
 
 
 _MAPS = _load_maps(_BUILD_DIR)
