@@ -4,85 +4,186 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## Unreleased
+## 0.6.0 — 2026-05-25
 
-Apps-feedback pass: a batch of correctness + ergonomics fixes informed
-by a stress campaign that built five multi-file production-shaped apps
-on top of v0.5.2 (banking-style event sourcing, task scheduler, ML
-orchestrator, web crawler, trading engine). Every issue surfaced by
-that campaign is addressed below.
+Apps-feedback minor release. A two-round stress campaign that built
+ten multi-file production-shaped apps on top of v0.5.2 (event-sourced
+banking, distributed key-value store, mini-compiler, search engine,
+GraphQL server, game ECS, trading engine, ML orchestrator, web
+crawler, task scheduler — under `examples/apps/`) surfaced a batch of
+correctness and ergonomics gaps. This release closes every issue from
+that campaign, adds three additive features (Result method API on
+`Ok` / `Err`, `impl` distribution on sealed-union aliases, and a new
+`tyc::stdlib_module_shadow` warning), and ships the apps themselves
+as canonical multi-file reference programs.
+
+No previously-accepted program changes behaviour. The new features
+are strictly additive: existing free-function `result.map(...)` calls
+keep working alongside the new `ok.map(...)` method form, and the
+new warning is non-fatal.
+
+### Added — language & runtime
+
+- **`Ok` / `Err` expose the standard Result combinators as methods
+  (R2-6).** `map`, `map_err`, `and_then`, `or_else` are now bound on
+  the runtime classes, not just the free functions in
+  `typhon_runtime/result.py`. Heterogeneous-error pipelines that
+  previously had to materialise a 4-deep `match` tower with `raise
+  RuntimeError("unreachable")` trailers can now normalise per stage in
+  chain form:
+
+  ```ty
+  let toks = tokenize(src).map_err(_lex_to_pipeline)?
+  let ast  = parse(toks).map_err(_parse_to_pipeline)?
+  let ty   = check(ast).map_err(_type_to_pipeline)?
+  ```
+
+  Semantics match the standard algebra: `Ok.map` transforms the value
+  while `Ok.map_err` is identity (and vice versa for `Err`);
+  `and_then` chains a `Result`-returning op on `Ok`; `or_else`
+  recovers from `Err`. A `build_features` integration test verifies
+  the methods land in the emitted runtime and the full algebra
+  round-trips through Python.
+- **`impl` on a sealed-union alias distributes to every variant
+  (R2-3).** `impl Event:` where `Event = A | B | …` used to fire
+  `tyc::impl_unknown_class` because the impl-merger only looked for a
+  single target class. The desugar pass now collects sealed-union
+  type aliases and replicates the impl block's methods on every
+  variant class, and the type checker mirrors the same fold so method
+  lookup resolves without dropping to free functions. Replicated
+  bodies retain any `match self:` patterns; per-variant dispatch is
+  automatic because the runtime class on `self` only matches its own
+  arm. The duplicate-method check from the concrete-class branch is
+  mirrored into the union branch, so a method declared on both `impl
+  Union:` and `impl Variant:` still fires `tyc::duplicate_method`.
+- **`tyc::stdlib_module_shadow` warning (R2-4).** A project `.ty` file
+  whose stem matches a Python 3.13 stdlib top-level module (`types`,
+  `ast`, `string`, `io`, `json`, `dataclasses`, `logging`, `random`,
+  `time`, …) emits `build/<name>.py`, which the default `python
+  build/main.py` entry point puts on `sys.path` ahead of the stdlib.
+  Transitive imports (e.g. `dataclasses` → `types`) then resolve to
+  the project module instead of the standard library, producing
+  baffling `ImportError`s blamed on innocent stdlib packages. The new
+  warning fires per-file in `tyc check`, points at the rename pattern
+  (`lang_types.ty`, `records.ty`, …), and is gated on
+  `typhon.toml` — standalone-file checks skip it. Severity is `warn`
+  (non-fatal); `tyc explain stdlib_module_shadow` and
+  `docs/diagnostics/stdlib_module_shadow.md` are wired up.
 
 ### Fixed — compiler
 
-- **`tyc-types`: variant→sealed-union flow now works across module boundaries.**
-  A `pub type Event = A | B` declared in `lib.ty` would let a variant
-  `A(...)` flow into an `Event`-typed slot within `lib.ty`, but a
-  consumer module that imported both the variants and the alias hit
-  `tyc::type_mismatch` on the same construction. Sealed-union variant
-  tables, like interface declarations, weren't included in the
-  cross-module shape extractor. Both `ModuleShapes` and
-  `ExternalShapes` now carry `sealed_unions` and `interfaces` maps;
-  the CLI / LSP re-key them under each local import name (including
-  alias renames) so the consumer's checker sees the same
+- **`tyc-types`: variant→sealed-union flow now works across module
+  boundaries.** A `pub type Event = A | B` declared in `lib.ty` would
+  let a variant `A(...)` flow into an `Event`-typed slot within
+  `lib.ty`, but a consumer module that imported both the variants and
+  the alias hit `tyc::type_mismatch` on the same construction.
+  Sealed-union variant tables, like interface declarations, weren't
+  included in the cross-module shape extractor. Both `ModuleShapes`
+  and `ExternalShapes` now carry `sealed_unions` and `interfaces`
+  maps; the CLI / LSP re-key them under each local import name
+  (including alias renames) so the consumer's checker sees the same
   union→variant relationship the source module sees.
-- **`tyc-types`: cross-module function signatures preserve parameter and return types.**
-  Functions imported via `from foo import f` were registered with
-  `Type::Unknown` placeholders for every parameter and the return
-  type — the `ArityInfo` sidecar carried names + counts but no types.
-  A nullable parameter `def takes(p: Price?) -> int:` consumed from
-  another module would render in `tyc::nullable_use` diagnostics as
-  the literal placeholder `?` ("value is `? | None`, where `?` is
-  required"), and silently accept any value the caller passed.
-  `ArityInfo` now records `param_types`, `kwonly_types`, and
-  `return_type`; the cross-module binding seed reads them so an
-  imported function looks identical to a local `def` at call sites.
-- **`tyc-types`: exhaustive `match` on a sealed union now satisfies missing-return analysis for any subject expression.**
-  `match get_state(): case A(): ...; case B(): ...` against a sealed
-  union returned by a function fired a false-positive
-  `tyc::missing_return` because the analyser only inferred match
-  subject types for bare names and attribute access. It now falls
-  back to expression inference for any subject shape, so function
-  calls, subscript expressions, and arbitrary expressions all flow
-  through the exhaustiveness path.
-- **`tyc-resolve`: `let` declarations in sibling `case` arms no longer shadow each other.**
-  `case A(): let key = ...; case B(): let key = ...` fired
-  `tyc::no_block_shadow` even though at most one arm runs at runtime.
-  The resolver now drains arm-local bindings into a side buffer
-  between cases (and splices them back after the match for
-  `report_unknown_names`), mirroring the per-arm `env.enter()` /
+- **`tyc-types`: cross-module function signatures preserve parameter
+  and return types.** Functions imported via `from foo import f` were
+  registered with `Type::Unknown` placeholders for every parameter
+  and the return type — the `ArityInfo` sidecar carried names +
+  counts but no types. A nullable parameter `def takes(p: Price?) ->
+  int:` consumed from another module would render in
+  `tyc::nullable_use` diagnostics as the literal placeholder `?`
+  ("value is `? | None`, where `?` is required"), and silently accept
+  any value the caller passed. `ArityInfo` now records `param_types`,
+  `kwonly_types`, and `return_type`; the cross-module binding seed
+  reads them so an imported function looks identical to a local `def`
+  at call sites.
+- **`tyc-types`: nullable-use diagnostic no longer renders `?` as the
+  expected type (R1#11).** A companion fix to the cross-module
+  signature seed: where the bound was still `Type::Unknown`, the
+  formatter used to print a bare `?` for the expected type, producing
+  the surreal "value is `? | None`, where `?` is required". The
+  formatter now substitutes the resolved bound or, if still unknown,
+  falls back to a clearer phrasing.
+- **`tyc-types`: exhaustive `match` on a sealed union now satisfies
+  missing-return analysis for any subject expression.** `match
+  get_state(): case A(): ...; case B(): ...` against a sealed union
+  returned by a function fired a false-positive `tyc::missing_return`
+  because the analyser only inferred match subject types for bare
+  names and attribute access. It now falls back to expression
+  inference for any subject shape, so function calls, subscript
+  expressions, and arbitrary expressions all flow through the
+  exhaustiveness path.
+- **`tyc-types`: partial keyword pattern satisfies match exhaustiveness
+  (R1#9).** `case Foo(field=x):` (which binds only `field` and ignores
+  the rest) was treated as non-exhaustive against the variant even
+  though Python's `match` accepts it as a structural match on the
+  class. Keyword patterns are now folded into the per-variant
+  coverage tally the same way positional patterns are.
+- **`tyc-resolve`: `let` declarations in sibling `case` arms no longer
+  shadow each other.** `case A(): let key = ...; case B(): let key
+  = ...` fired `tyc::no_block_shadow` even though at most one arm
+  runs at runtime. The resolver now drains arm-local bindings into a
+  side buffer between cases (and splices them back after the match
+  for `report_unknown_names`), mirroring the per-arm `env.enter()` /
   `env.leave()` the type checker already does.
-- **`tyc-syntax`: `pub freeze let X = …` now parses.**
-  `pub` stacks with every other module-level binding modifier per the
-  diagnostic docs, but the `pub`-prefix stripper didn't recognise
-  `freeze let` as a multi-word keyword form. `pub freeze let
-  DEFAULT: dict[str, int] = {...}` now lowers correctly and
-  round-trips through `tyc fmt`.
-- **`tyc-types`: `loop.run_until_complete(coro())` no longer fires `tyc::missing_await`.**
-  The asyncio event-loop method is a legitimate consumer of
-  coroutines — same family as `asyncio.run(...)`, which the analyser
-  already excluded. Added to the coro-acceptor whitelist; the receiver
-  shape is unconstrained because the method name itself is the
-  carve-out.
-- **`tyc-types`: `@contextmanager` factory bodies are exempt from `tyc::resource_not_managed`.**
-  A `@contextmanager`-decorated function whose body opens a file or
-  socket *is* the resource manager — flagging `let f = open(path)`
-  inside is a false positive. The check now skips function bodies
-  carrying `@contextmanager` or `@asynccontextmanager` (bare or
-  dotted-module form).
+- **`tyc-resolve`: for-target no longer silently rebinds prior `let`
+  bindings (R2-17).** Python's for-target is an assignment, not a
+  fresh declaration, so the iteration value overwrites whatever was
+  previously bound. The resolver used to trip `tyc::immutable_assign`
+  against a prior `let` in the enclosing scope, even when the prior
+  let was inside an unrelated sibling for-loop body. The
+  sibling-for-loop case was already silenced; this release extends
+  the same silencing to any prior binding when the *new* binding is a
+  for / with / except / comprehension target. Manual body-level
+  assignment (`i = i + 1`) is unaffected — that path goes through
+  bareword-assignment resolution, not the loop-target declaration
+  path.
+- **`tyc-syntax`: `pub freeze let X = …` now parses.** `pub` stacks
+  with every other module-level binding modifier per the diagnostic
+  docs, but the `pub`-prefix stripper didn't recognise `freeze let`
+  as a multi-word keyword form. `pub freeze let DEFAULT: dict[str,
+  int] = {...}` now lowers correctly and round-trips through `tyc
+  fmt`.
+- **`tyc-syntax`: `pub def` is now visible to the `?` operator
+  validator (R2-1).** The `?` propagation pass walked function
+  declarations to check that the enclosing return type accepted
+  `Result`, but the `pub`-prefix stripper ran after the walk so
+  `pub def f() -> Result[T, E]:` looked like a bare `def` with no
+  return type and the validator gave up. The stripper now runs
+  upstream of the validator.
+- **`tyc-types`: `loop.run_until_complete(coro())` no longer fires
+  `tyc::missing_await`.** The asyncio event-loop method is a
+  legitimate consumer of coroutines — same family as `asyncio.run(...)`,
+  which the analyser already excluded. Added to the coro-acceptor
+  whitelist; the receiver shape is unconstrained because the method
+  name itself is the carve-out.
+- **`tyc-types`: `@contextmanager` factory bodies are exempt from
+  `tyc::resource_not_managed`.** A `@contextmanager`-decorated
+  function whose body opens a file or socket *is* the resource
+  manager — flagging `let f = open(path)` inside is a false
+  positive. The check now skips function bodies carrying
+  `@contextmanager` or `@asynccontextmanager` (bare or dotted-module
+  form).
 
 ### Improved — diagnostics
 
-- **`tyc::type_mismatch` help text now suggests widening the annotation, not narrowing it to the found type.**
-  The previous help text — "change the value, or update the
-  annotation to `<found>`" — implicitly suggested dropping the
-  expected type, which is almost never what the user wants. Now reads
-  "change the value so it produces `<expected>`, or widen the
-  annotation to `<expected> | <found>` if both are intended", which
-  matches typed Python's culture and the way users actually fix the
-  error.
+- **`tyc::type_mismatch` help text now suggests widening the
+  annotation, not narrowing it to the found type.** The previous help
+  text — "change the value, or update the annotation to `<found>`" —
+  implicitly suggested dropping the expected type, which is almost
+  never what the user wants. Now reads "change the value so it
+  produces `<expected>`, or widen the annotation to `<expected> |
+  <found>` if both are intended", which matches typed Python's
+  culture and the way users actually fix the error.
 
 ### Improved — docs
 
+- **`docs/diagnostics/stdlib_module_shadow.md`** ships as a new
+  catalog page covering the rationale, the `ImportError` cascade it
+  prevents, and a rename table for the most common collisions
+  (`types.ty → lang_types.ty`, `dataclasses.ty → records.ty`, etc.).
+- **`docs/diagnostics/class_attr_shadows_slot.md`** gains a new
+  "Alternative: nullary sealed-union variants" section pointing at
+  the `pub class TyInt frozen: pass` idiom instead of the
+  `placeholder: int = 0` workaround.
 - **`docs/guides/07-sealed-unions-and-match.md`** now documents
   keyword patterns (`case TaskStarted(task_id=tid):`) as the
   recommended form for variants with more than two or three fields —
@@ -91,6 +192,51 @@ that campaign is addressed below.
 - **`docs/cli.md`** documents `tyc explain --list` (which the
   diagnostic hint footers have always advertised but the command
   table never mentioned).
+
+### Added — examples
+
+- **`examples/apps/` — ten production-shaped multi-file apps** built
+  on top of v0.5.2 as a stress harness: task scheduler, trading
+  engine, ML orchestrator, event-sourced banking, web crawler,
+  GraphQL server, game ECS, mini-compiler, search engine, distributed
+  KV. Each ships under a `typhon.toml`, `tyc check`s clean, `tyc
+  build`s, and runs through CPython. Every app carries a
+  `FRICTION.md` or per-app README noting which compiler / ergonomics
+  gaps the build surfaced — those gaps are the source list for the
+  fixes and features above. `examples/apps/TYPHON_FEEDBACK.md`
+  aggregates the campaign findings.
+
+### Changed — VS Code extension
+
+- **Version `0.1.7 → 0.1.8`.** No new keywords or grammar surface in
+  this batch (the deep grammar audit in v0.5.1 already covers
+  `pub freeze let`, sealed-union impls, the `?` operator, and the
+  `lazy_let` runtime helper). The bump tracks the new tyc release.
+
+### Fixed — LSP semantic tokens
+
+- **`newtype` declarations now paint as `class` everywhere.** `newtype
+  DocId = int` desugars to `DocId = NewType("DocId", int)`, which the
+  resolver registers as a `BindingKind::Value` — same kind a plain
+  `let x = 1` gets. Every reference site (`def f(id: DocId) -> DocId:`)
+  was therefore emitted as the generic `variable` semantic-token type
+  and rendered as the local-variable colour (light blue in Dark+,
+  plain text in most user themes) while real classes like `Document`
+  defined right next to them rendered as `class`. The user's
+  screenshot of `examples/apps/09-search-engine/src/index.ty`
+  surfaced exactly this asymmetry. `tyc-lsp::semantic` now walks the
+  module for `NAME = NewType("NAME", BASE)` shapes and promotes both
+  the declaration and every reference to the `class` token, matching
+  how `pub class X:` declarations already paint.
+- **Class-body field declarations now paint as `property` instead of
+  `variable`.** `pub class Document: id: int` used to emit `id` as a
+  local-variable token even though it's a dataclass slot, which made
+  field names render with the local-binding colour rather than the
+  property colour Pylance gives Python `@dataclass` fields. The token
+  type now derives from the binding's enclosing scope kind so
+  class-body Value bindings emit as `property` and function/module
+  Value bindings stay as `variable`. Keeps the in-class declaration
+  consistent with the `obj.field` access elsewhere in the file.
 
 ## 0.5.2
 
