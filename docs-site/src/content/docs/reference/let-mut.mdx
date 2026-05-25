@@ -110,7 +110,42 @@ def f() -> None:
 Pick a fresh name (`x2`, `result`, …) or declare the original as `mut`
 and reassign it if the type stays the same. This is the conservative
 default — Rust-style block-scoped shadowing may return once the
-language has block scopes of its own, but it is not in v0.5.1.
+language has block scopes of its own, but it is not in v0.7.0.
+
+Sibling `if`/`elif` branches are not affected: from v0.7.0 the resolver
+no longer fires `tyc::no_block_shadow` for same-named `let` bindings
+declared in sibling arms (the bindings are independent and never both
+in scope at the same point). See [Project Status](/Typhon/introduction/status/) for the full v0.7.0 changelog.
+
+### Declare-only `let NAME: T`
+
+From v0.7.0 a `let` binding may be declared without an initialiser
+when every subsequent control-flow path assigns to it exactly once
+before it is read. The classic motivating shape is splitting a
+`Result`-returning load across `match` arms:
+
+```python
+let loaded: Cfg
+match _load():
+    case Ok(v):
+        loaded = v
+    case Err(e):
+        return Err(e)
+print(loaded.host)        # ✅ definitely assigned on the only non-diverging arm
+```
+
+Sibling `match` arms and sibling `if` / `elif` / `else` bodies each
+count as a separate first-assignment path; the resolver snapshots the
+uninit-span set per arm and unions the initialisations afterwards.
+`return` / `raise` / `continue` / `break` mark a branch as diverging
+and the analysis excludes it from the intersection. Loops do not
+propagate assignments out (the body may execute zero times).
+
+Reads on a path that didn't assign fire `tyc::use_of_uninitialised`
+with labels on both the use site and the declaration. Any second
+assignment to a declared-only `let` still fires
+`tyc::immutable_assign` — the first assignment IS the initialiser,
+not a free reassignment.
 
 ## Emit
 

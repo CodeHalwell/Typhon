@@ -2,8 +2,10 @@
 
 This guide covers installing the `tyc` compiler binary on **macOS,
 Linux, and Windows**. Pre-built binaries ship on every GitHub Release
-as of v0.3.0. If your platform isn't listed (FreeBSD, Linux MUSL,
-Windows ARM64), build from source — see the
+since v0.3.0; the current release is
+[v0.7.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.7.0).
+If your platform isn't listed (FreeBSD, Linux MUSL, Windows ARM64),
+build from source — see the
 [Quick start](../README.md#quick-start) section of the README.
 
 ## Supported platforms
@@ -92,27 +94,27 @@ Re-running the script upgrades to the latest release in place.
 macOS / Linux:
 
 ```bash
-TYPHON_VERSION=v0.3.0 \
+TYPHON_VERSION=v0.7.0 \
   curl -sSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh | sh
 ```
 
 Or with the script saved locally:
 
 ```bash
-sh install.sh --version=v0.3.0
+sh install.sh --version=v0.7.0
 ```
 
 Windows (PowerShell):
 
 ```powershell
-$env:TYPHON_VERSION = 'v0.3.0'
+$env:TYPHON_VERSION = 'v0.7.0'
 iwr -useb https://raw.githubusercontent.com/codehalwell/typhon/main/install.ps1 | iex
 ```
 
 Or with the script saved locally:
 
 ```powershell
-.\install.ps1 -Version v0.3.0
+.\install.ps1 -Version v0.7.0
 ```
 
 ### Custom install directory

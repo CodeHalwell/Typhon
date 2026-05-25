@@ -444,12 +444,56 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 > `impl` methods; cross-module shape propagation arity-checks
 > `from foo import Cls` and `import foo as f; f.Cls(…)` alike (both `.ty`
 > source and `.dty` stubs); `tyc::missing_field_init` audits
-> `X.__new__(X)` bypass construction patterns. Phase 4+ work is also
-> landed: auto-gather, auto-parallel, PGO, LSP completions and code
-> actions, cross-file go-to-definition, the package-manager surface,
-> REPL, debugger, the `tyc-vm` tree-walking interpreter (default for
-> `tyc run`), and `tyc migrate`. See [docs/roadmap.md](roadmap.md) for
-> the canonical per-feature status.
+> `X.__new__(X)` bypass construction patterns. Phase 6 — Python-annoyances
+> surface — shipped in [v0.3.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.0):
+> `newtype`, `freeze let`, `pub`, three new effect/safety diagnostics
+> (`blocking_in_async`, `resource_not_managed`, `div_by_zero_literal`),
+> and pre-built install artifacts for Linux + Windows alongside macOS.
+> Correctness sweeps and additive features have layered in through
+> [v0.3.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.1) (2026-05-22 stress round),
+> [v0.4.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.4.0) (type-checker correctness),
+> [v0.5.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.5.0) (post-v0.4 roadmap sweep —
+> Salsa-cached LSP check path, `tyc debug` reads in Typhon coordinates,
+> dict-comp parallelisation, `Type::TypeConstructor` HKT foundation,
+> `comptime` types-as-values, three new `tyc migrate` rewrites, opt-in
+> PyPI corpus sweep harness),
+> [v0.5.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.5.1) (three emit-correctness fixes,
+> deep VS Code grammar audit, 22 new stdlib-only examples),
+> [v0.5.2](https://github.com/CodeHalwell/Typhon/releases/tag/v0.5.2) (`<ident>?` propagation in
+> value position, `set - set` / `frozenset - frozenset` arithmetic,
+> docs-site Typhon/Emitted-Python tabs sweep),
+> [v0.6.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.6.0) (apps-feedback minor release
+> — ten multi-file production-shaped reference apps under `examples/apps/`,
+> `Ok` / `Err` Result-combinator methods, `impl` on a sealed-union alias,
+> `tyc::stdlib_module_shadow`),
+> [v0.6.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.6.1) (VS Code annotation-colour
+> fix, `.py.map` sidecars under `<out>/.sourcemaps/`), and
+> **[v0.7.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.7.0)** — the Round-3 apps-feedback
+> carry-over and current release: `pub *` wildcard re-export aggregation
+> in `__init__.ty` (transitive through sub-packages, with
+> `tyc::pub_name_collision` / `tyc::pub_star_outside_init` diagnostics);
+> declare-only `let NAME: T` with arm-assignment integrated with a new
+> `tyc::use_of_uninitialised` definite-assignment analysis; `with cm()
+> as r:` types `r` from `__enter__` / `__aenter__` and from
+> `@contextmanager` / `@asynccontextmanager` factories; `await` on
+> `Callable[..., Awaitable[T]]` / `Coroutine[Y, S, T]` unwraps to `T`;
+> same-newtype arithmetic preserves the newtype across `+ - * // % **`;
+> cross-module generic method dispatch propagates class TypeVars; nested
+> `from X import Y` inside `if`/`for`/`while`/`with`/`try`/`match` arms
+> binds; sibling `if`/`elif` no longer trips `no_block_shadow` for
+> same-named bindings; multi-line `go expr(...)` parses; ternary
+> `body if test else orelse` narrows; `tyc::field_default_ordering`
+> catches non-default-after-default class fields. Five additional
+> production-shaped apps (real-time game server, static site generator,
+> vector DB, API gateway, stream processor) join the original ten under
+> `examples/apps/`, and all fifteen are re-organised into grouped
+> subdirectories with `pub *` `__init__.ty` facades. Strictly additive on
+> the language surface. Phase 4+ work is also landed: auto-gather,
+> auto-parallel, PGO, LSP completions and code actions, cross-file
+> go-to-definition, the package-manager surface, REPL, debugger, the
+> `tyc-vm` tree-walking interpreter (default for `tyc run`), and `tyc
+> migrate`. See [docs/roadmap.md](roadmap.md) for the canonical
+> per-feature status.
 
 ### Phase 0 — Foundation (months 1–2) ✅ complete
 
@@ -503,6 +547,7 @@ At the end of Phase 3 — roughly month twelve — Typhon is useful for a real b
 - ✅ `tyc run` defaults to the in-process `tyc-vm` tree-walking interpreter — no `build/`, no CPython spawn. `--compile` (alias `--no-vm`) falls back to the legacy build-then-exec path for programs that import CPython libraries the VM doesn't speak natively. See [docs/vm.md](vm.md).
 - ✅ Phase 5 interop + DX bundle (v0.1.6): `plain class`, `[emit] skip-decoration-bases`, `class-default` validation, `or`/`and` truthy-union typing, generator→`Iterable` conformance, `tyc explain` / `tyc cheatsheet`, `tyc build --check`, `.py`-in-`src/` copy-through with `tyc::orphan_py_import`, `tyc::contains_secret_literal`, miette `url(...)` deep-links on every diagnostic, `tyc fmt` wrapping `ruff format`. See [docs/roadmap.md](roadmap.md#phase-5--interop-and-developer-experience--complete-v016).
 - ✅ Phase 5.5 constructor / method arity safety (v0.2.0): `tyc::arg_count` now fires on auto-generated `__init__` of `class` / `model` declarations and on `impl` methods; cross-module shape propagation arity-checks `from foo import Cls` and `import foo as f; f.Cls(…)` alike; `.ty` source and `.dty` stubs participate on equal footing through a project-wide `ExternalShapes` registry; the LSP caches per-file extraction via a Salsa-tracked `module_shapes_query`; a new `tyc::missing_field_init` post-construction audit catches `X.__new__(X)` bypass patterns where the instance escapes without required fields assigned. See [docs/roadmap.md](roadmap.md#phase-55--constructor--method-arity-safety--complete-v020).
+- ✅ Phase 6 Python-annoyances surface (v0.3.0 — correctness sweeps in v0.3.1 / v0.4.0; additive features and polish through v0.5.0 / v0.5.1 / v0.5.2 / v0.6.0 / v0.6.1 / **v0.7.0** (current release)). v0.3.0 introduced `newtype` (nominal aliases over primitives), `freeze let` (deep-frozen module-level bindings), `pub` (`__all__`-synthesising visibility marker), three new effect / safety diagnostics (`blocking_in_async`, `resource_not_managed`, `div_by_zero_literal`), and pre-built install artifacts for Linux + Windows. v0.5.0 added the `Type::TypeConstructor` HKT foundation, `comptime` types-as-values, dict-comp parallelisation, and three new `tyc migrate` rewrites (frozen-`@dataclass` → `class X frozen:`, `Protocol` → `interface`, `NewType` → `newtype`). v0.6.0 shipped ten production-shaped reference apps under `examples/apps/` and three additive features (`Ok` / `Err` Result-combinator methods, `impl` on a sealed-union alias distributing to every variant, `tyc::stdlib_module_shadow`). v0.7.0 (the carry-over release on top of v0.6.1) adds `pub *` wildcard re-export aggregation in `__init__.ty` with transitive sub-package coverage, declare-only `let NAME: T` with arm-assignment integrated with `tyc::use_of_uninitialised` definite-assignment analysis, `with cm() as r:` inference from `__enter__` / `__aenter__` and from `@contextmanager` / `@asynccontextmanager` factories, `await` on `Callable[..., Awaitable[T]]` / `Coroutine[Y, S, T]` unwrapping to `T`, same-newtype-preserving arithmetic, cross-module generic method dispatch propagating class TypeVars, and a polish sweep (nested arm-imports binding, ternary narrowing, multi-line `go expr(...)` parsing, `tyc::field_default_ordering`). Five additional production-shaped apps (real-time game server, static site generator, vector DB, API gateway, stream processor) join the original ten under `examples/apps/`, and all fifteen are re-organised into grouped subdirectories with `pub *` `__init__.ty` facades.
 - ✅ Runtime `stubtest` probe via `tyc stubtest` (shells out to `python -m mypy.stubtest`) — complements the AST-level `tyc check --stubs` diff.
 - `ty` integration as a complementary second-stage checker over the desugared Python — see [docs/ty-integration.md](ty-integration.md). (Subprocess form landed as `tyc ty`; the embedded-library form is deferred.)
 
