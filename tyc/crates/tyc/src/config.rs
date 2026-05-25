@@ -80,6 +80,13 @@ pub struct EmitConfig {
     /// Matched by last segment.
     #[serde(default, rename = "skip-decoration-bases")]
     pub skip_decoration_bases: Vec<String>,
+    /// Value passed to Pydantic's `ConfigDict(extra=…)` for every `model`
+    /// class.  Accepted values are `"forbid"` (default — reject unexpected
+    /// fields at runtime), `"ignore"` (silently drop them), and `"allow"`
+    /// (pass them through as extra attributes).  Unknown values are rejected
+    /// by [`TyphonConfig::validate`] with `ConfigError::InvalidModelExtra`.
+    #[serde(default = "default_model_extra", rename = "model-extra")]
+    pub model_extra: String,
 }
 
 impl Default for EmitConfig {
@@ -88,6 +95,7 @@ impl Default for EmitConfig {
             class_default: "dataclass".into(),
             format: true,
             skip_decoration_bases: Vec::new(),
+            model_extra: "forbid".into(),
         }
     }
 }
@@ -97,6 +105,18 @@ impl Default for EmitConfig {
 /// aliases like `"struct"` / `"regular"` / `"none"` which were never wired
 /// through the emitter.
 pub const ALLOWED_CLASS_DEFAULTS: &[&str] = &["dataclass", "pydantic"];
+
+/// Accepted values for `[emit] model-extra`. Anything else is rejected by
+/// [`TyphonConfig::validate`].
+pub const ALLOWED_MODEL_EXTRAS: &[&str] = &["forbid", "ignore", "allow"];
+
+fn default_model_extra() -> String {
+    "forbid".into()
+}
+
+fn default_stub_check() -> String {
+    "error".into()
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
@@ -166,6 +186,17 @@ pub struct StrictnessConfig {
     /// instead of `requests`, `aiofiles` instead of bare `open`,
     /// `asyncio.sleep` instead of `time.sleep`); `"off"` suppresses.
     pub blocking_in_async: String,
+    /// Severity for `tyc::stub_mismatch` produced by `tyc check --stubs`.
+    /// When a `.dty` stub's surface API diverges from its sibling `.ty`/`.py`
+    /// implementation, this diagnostic is emitted.
+    /// - `"error"` (default) — stub drift fails the check; suitable for
+    ///   projects that version-control their stubs alongside their code.
+    /// - `"warn"` — drift is surfaced but does not break CI; useful while
+    ///   a migration is in progress.
+    /// - `"off"` — stubs are checked but mismatches are silently dropped;
+    ///   use only when `--stubs` is run opportunistically.
+    #[serde(default = "default_stub_check")]
+    pub stub_check: String,
 }
 
 impl Default for StrictnessConfig {
@@ -183,6 +214,7 @@ impl Default for StrictnessConfig {
             parallel_min_size: 64,
             require_with: "warn".into(),
             blocking_in_async: "warn".into(),
+            stub_check: "error".into(),
         }
     }
 }
@@ -278,6 +310,15 @@ impl TyphonConfig {
                 allowed: ALLOWED_CLASS_DEFAULTS.join(", "),
             });
         }
+        // Reject `[emit] model-extra = "..."` outside the allow-list.
+        let me = self.emit.model_extra.trim();
+        if !ALLOWED_MODEL_EXTRAS.contains(&me) {
+            return Err(ConfigError::InvalidModelExtra {
+                path: source_path.display().to_string(),
+                value: self.emit.model_extra.clone(),
+                allowed: ALLOWED_MODEL_EXTRAS.join(", "),
+            });
+        }
         Ok(())
     }
 }
@@ -328,6 +369,13 @@ pub enum ConfigError {
         value: String,
         allowed: String,
     },
+    /// `[emit] model-extra` is set to a value outside
+    /// [`ALLOWED_MODEL_EXTRAS`]. Emitted by [`TyphonConfig::validate`].
+    InvalidModelExtra {
+        path: String,
+        value: String,
+        allowed: String,
+    },
 }
 
 impl std::fmt::Display for ConfigError {
@@ -357,6 +405,16 @@ impl std::fmt::Display for ConfigError {
                 write!(
                     f,
                     "invalid `[emit] class-default = \"{value}\"` in '{path}': allowed values are {allowed}",
+                )
+            }
+            ConfigError::InvalidModelExtra {
+                path,
+                value,
+                allowed,
+            } => {
+                write!(
+                    f,
+                    "invalid `[emit] model-extra = \"{value}\"` in '{path}': allowed values are {allowed}",
                 )
             }
         }
@@ -512,5 +570,98 @@ skip-decoration-bases = [\"BaseModel\", \"Enum\"]
         assert_eq!(parse_python_target(""), None);
         assert_eq!(parse_python_target("3"), None);
         assert_eq!(parse_python_target("abc"), None);
+    }
+
+    // ── model-extra tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn model_extra_defaults_to_forbid() {
+        let cfg = TyphonConfig::default();
+        assert_eq!(
+            cfg.emit.model_extra, "forbid",
+            "default model-extra must be \"forbid\", got {:?}",
+            cfg.emit.model_extra
+        );
+    }
+
+    #[test]
+    fn validate_accepts_all_model_extra_values() {
+        let path = Path::new("typhon.toml");
+        for v in ALLOWED_MODEL_EXTRAS {
+            let mut cfg = cfg_with_target("3.13");
+            cfg.emit.model_extra = (*v).into();
+            cfg.validate(path)
+                .unwrap_or_else(|e| panic!("model-extra {v:?} should be accepted, got {e}"));
+        }
+    }
+
+    #[test]
+    fn validate_rejects_unknown_model_extra() {
+        let path = Path::new("typhon.toml");
+        for v in &["strict", "error", "", "FORBID", "yes"] {
+            let mut cfg = cfg_with_target("3.13");
+            cfg.emit.model_extra = (*v).into();
+            let err = cfg
+                .validate(path)
+                .expect_err(&format!("model-extra {v:?} should be rejected"));
+            match err {
+                ConfigError::InvalidModelExtra { value, allowed, .. } => {
+                    assert_eq!(value, *v);
+                    assert!(
+                        allowed.contains("forbid")
+                            && allowed.contains("ignore")
+                            && allowed.contains("allow"),
+                        "expected allowed list to mention all three values, got {allowed}"
+                    );
+                }
+                other => panic!("expected InvalidModelExtra for {v:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn model_extra_round_trips_through_toml() {
+        let toml_src = "\
+[project]
+name = \"demo\"
+
+[emit]
+model-extra = \"allow\"
+";
+        let parsed: TyphonConfig = toml::from_str(toml_src).expect("parse");
+        assert_eq!(
+            parsed.emit.model_extra, "allow",
+            "model-extra should be \"allow\", got {:?}",
+            parsed.emit.model_extra
+        );
+    }
+
+    // ── stub-check tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn stub_check_defaults_to_error() {
+        let cfg = TyphonConfig::default();
+        assert_eq!(
+            cfg.strictness.stub_check, "error",
+            "default stub-check must be \"error\", got {:?}",
+            cfg.strictness.stub_check
+        );
+    }
+
+    #[test]
+    fn stub_check_round_trips_through_toml() {
+        let toml_src = "\
+[project]
+name = \"demo\"
+
+[strictness]
+stub-check = \"warn\"
+";
+        let parsed: TyphonConfig = toml::from_str(toml_src).expect("parse");
+        assert_eq!(
+            parsed.strictness.stub_check, "warn",
+            "stub-check should be \"warn\", got {:?}",
+            parsed.strictness.stub_check
+        );
     }
 }
