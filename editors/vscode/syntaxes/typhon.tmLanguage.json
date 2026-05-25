@@ -403,16 +403,29 @@
     },
 
     "binding-declaration": {
-      "comment": "Supports the v0.3.0 surface: `pub let X`, `freeze let X`, `pub freeze let X`, `comptime let X`, `lazy let X`, and any pair-wise combo. The leading-modifier slot accepts up to three modifiers so users don't see grammar fall-through on stacked keywords like `pub comptime let`. The name uses `\\p{L}` so Unicode identifiers like `let π` and `let греет` are recognised.",
-      "match": "\\b(?:(pub|freeze|comptime|lazy)\\s+)?(?:(pub|freeze|comptime|lazy)\\s+)?(?:(pub|freeze|comptime|lazy)\\s+)?(let|mut|val|var)\\s+(?:(mut)\\s+)?([\\p{L}_][\\p{L}\\p{N}_]*)",
-      "captures": {
+      "comment": "Supports the v0.3.0 surface: `pub let X`, `freeze let X`, `pub freeze let X`, `comptime let X`, `lazy let X`, and any pair-wise combo. The leading-modifier slot accepts up to three modifiers so users don't see grammar fall-through on stacked keywords like `pub comptime let`. The name uses `\\p{L}` so Unicode identifiers like `let π` and `let греет` are recognised.\n\nUses begin/end (rather than a plain `match`) so the rule owns the optional `: Type` annotation that follows the name. After `let name`, the `:` is unambiguously a type-annotation separator (no statement-colon collision possible here), so the colon scopes as `punctuation.separator.annotation` and the type runs through `type-expression`. Without this, lowercase non-builtin types like `let now: datetime = ...` fell back to a generic `punctuation.separator.colon` + `variable.other` because the standalone `type-annotation` rule rejects bare lowercase identifiers (to avoid mis-coloring `if cond:` and `case Foo(x):`).",
+      "begin": "\\b(?:(pub|freeze|comptime|lazy)\\s+)?(?:(pub|freeze|comptime|lazy)\\s+)?(?:(pub|freeze|comptime|lazy)\\s+)?(let|mut|val|var)\\s+(?:(mut)\\s+)?([\\p{L}_][\\p{L}\\p{N}_]*)",
+      "beginCaptures": {
         "1": { "name": "storage.modifier.typhon" },
         "2": { "name": "storage.modifier.typhon" },
         "3": { "name": "storage.modifier.typhon" },
         "4": { "name": "storage.type.binding.typhon" },
         "5": { "name": "storage.modifier.mut.typhon" },
         "6": { "name": "variable.other.declaration.typhon" }
-      }
+      },
+      "end": "(?==|$)",
+      "patterns": [
+        {
+          "begin": "(:)",
+          "beginCaptures": {
+            "1": { "name": "punctuation.separator.annotation.typhon" }
+          },
+          "end": "(?==|$)",
+          "patterns": [
+            { "include": "#type-expression" }
+          ]
+        }
+      ]
     },
 
     "type-alias": {
@@ -662,7 +675,11 @@
             { "include": "#type-expression" }
           ]
         },
-        { "include": "#identifiers" }
+        {
+          "comment": "Lowercase identifiers in type position — module-qualified stdlib types (`datetime`, `time`, `asyncio`) and user-defined type aliases (`my_alias`). In a type-expression context we know the name is naming a type, so paint it as one instead of falling through to `#identifiers` and getting a plain `variable.other` colour. Builtins (`int`, `str`, `Callable`, …) and uppercase names (`Foo`, `Result`) are caught by earlier patterns and don't reach here.",
+          "name": "entity.name.type.typhon",
+          "match": "\\b[\\p{L}_][\\p{L}\\p{N}_]*\\b"
+        }
       ]
     },
 
