@@ -4237,6 +4237,51 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                         }
                         target_shape.fields.entry(f).or_insert(ty);
                     }
+                } else if let Some(variants) = c.sealed_unions.get(target).cloned() {
+                    // R2-3: `impl Union:` where `Union = A | B | …` is
+                    // distributed across every variant class so the
+                    // user can write "the method-on-the-union" once
+                    // and have `event.kind()` resolve regardless of the
+                    // concrete variant at the call site. The impl
+                    // pseudo-class itself isn't a real class — drop it
+                    // from `class_shapes` after the fold so it doesn't
+                    // pollute downstream lookups.
+                    let impl_shape = collect_class_shape(cd, &classes);
+                    for variant in &variants {
+                        if !c.class_shapes.contains_key(variant) {
+                            continue;
+                        }
+                        // Mirror the duplicate-method check from the
+                        // concrete-class arm above so a user can't
+                        // declare `def kind` on both `impl Union:` and
+                        // `impl Variant:` and have one silently win.
+                        let target_shape =
+                            c.class_shapes.get(variant).expect("checked above");
+                        for s in &cd.body {
+                            if let Stmt::FunctionDef(f) = s {
+                                let method = f.name.as_str();
+                                if target_shape.methods.contains_key(method) {
+                                    let span_start = f.name.range.start().to_usize();
+                                    c.diagnostics.push_error(TycError::duplicate_method(
+                                        variant.clone(),
+                                        method.to_owned(),
+                                        c.path.clone(),
+                                        c.source,
+                                        span_start,
+                                        method.len().max(1),
+                                    ));
+                                }
+                            }
+                        }
+                        let target_shape =
+                            c.class_shapes.get_mut(variant).expect("checked above");
+                        for (m, sig) in &impl_shape.methods {
+                            target_shape
+                                .methods
+                                .entry(m.clone())
+                                .or_insert_with(|| sig.clone());
+                        }
+                    }
                 } else {
                     // FINDINGS #78: `impl UnknownClass:` silently produced
                     // dead code. Anchor the diagnostic on the class-name
@@ -11404,6 +11449,39 @@ match s:
         assert!(
             msg.contains("Triangle"),
             "error should name missing variant Triangle, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn impl_on_sealed_union_alias_resolves_methods() {
+        // R2-3: `impl Event:` distributes its methods across every
+        // variant class so a call site `e.kind()` resolves regardless
+        // of the runtime variant. The checker must NOT fire
+        // impl_unknown_class on the union name and must register the
+        // method on every variant's shape.
+        let src = "\
+class A:
+    x: int
+
+class B:
+    y: str
+
+type Event = A | B
+
+impl Event:
+    def kind(self) -> str:
+        match self:
+            case A(_): return \"a\"
+            case B(_): return \"b\"
+
+let e: Event = A(x=1)
+let k: str = e.kind()
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "impl on a sealed-union alias must type-check: {:?}",
+            d.errors()
         );
     }
 

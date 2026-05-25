@@ -24,8 +24,8 @@ use ruff_python_ast::name::Name;
 use ruff_python_ast::{
     self as ast, Alias, Arguments, AtomicNodeIndex, Decorator, ExceptHandler, Expr, ExprAttribute,
     ExprBooleanLiteral, ExprCall, ExprContext, ExprName, ExprStringLiteral, Identifier, Keyword,
-    ModModule, Parameter, ParameterWithDefault, Parameters, Pattern, Stmt, StmtAssign, StmtImport,
-    StmtImportFrom, StringLiteral, StringLiteralFlags, StringLiteralValue, WithItem,
+    ModModule, Operator, Parameter, ParameterWithDefault, Parameters, Pattern, Stmt, StmtAssign,
+    StmtImport, StmtImportFrom, StringLiteral, StringLiteralFlags, StringLiteralValue, WithItem,
 };
 use ruff_text_size::TextRange;
 
@@ -2553,6 +2553,50 @@ fn make_string_literal_expr(text: &str) -> Expr {
 /// Name prefix the preprocessor gives every `impl` pseudo-class.
 const IMPL_PREFIX: &str = "__typhon_impl_";
 
+/// Walk `expr` collecting every bare `Name` operand of a flat `A | B | …`
+/// union expression. Returns `None` for any other shape so `type X = A`
+/// (single name, no union) and `type X = list[A]` (generic) don't get
+/// mistaken for sealed unions. Mirrors
+/// `tyc_types::extract_sealed_union_variants` so the desugar doesn't need
+/// a cross-crate dep. R2-3.
+fn collect_union_variant_names(expr: &Expr) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    let mut stack = vec![expr];
+    while let Some(current) = stack.pop() {
+        match current {
+            Expr::Name(n) => names.push(n.id.as_str().to_owned()),
+            Expr::BinOp(b) if matches!(b.op, Operator::BitOr) => {
+                stack.push(&b.left);
+                stack.push(&b.right);
+            }
+            _ => return None,
+        }
+    }
+    if names.len() >= 2 {
+        Some(names)
+    } else {
+        None
+    }
+}
+
+/// Collect every sealed-union type alias declared at module scope so
+/// `impl Union:` can distribute its methods across every variant.
+/// Keyed by the alias name; values are the ordered variant class names
+/// as they appear in `type Union = A | B | C`. R2-3.
+fn collect_sealed_union_aliases(body: &[Stmt]) -> HashMap<String, Vec<String>> {
+    let mut out = HashMap::new();
+    for stmt in body {
+        if let Stmt::TypeAlias(ta) = stmt {
+            if let Expr::Name(n) = ta.name.as_ref() {
+                if let Some(variants) = collect_union_variant_names(&ta.value) {
+                    out.insert(n.id.as_str().to_owned(), variants);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Merge Typhon `impl` pseudo-classes into their target classes.
 ///
 /// The preprocessor rewrites `impl ClassName:` to `class __typhon_impl_ClassName(object):`.
@@ -2566,6 +2610,12 @@ const IMPL_PREFIX: &str = "__typhon_impl_";
 /// was found.  Missing target classes are silently skipped (the type checker
 /// surfaces a better diagnostic for that case).
 fn merge_impl_blocks(body: Vec<Stmt>) -> (Vec<Stmt>, bool) {
+    // R2-3: collect sealed-union aliases first so an `impl Union:` block
+    // (where `Union` is `type Union = A | B | …`) distributes its methods
+    // across every variant class instead of failing to find a single
+    // target class.
+    let union_aliases = collect_sealed_union_aliases(&body);
+
     // Phase 1: identify impl pseudo-class indices and their target names.
     let impl_indices: Vec<(usize, String)> = body
         .iter()
@@ -2586,15 +2636,31 @@ fn merge_impl_blocks(body: Vec<Stmt>) -> (Vec<Stmt>, bool) {
 
     // Phase 2: collect methods (with `self` injected) into a map keyed by
     // target class name.  Multiple impl blocks for the same class accumulate.
+    //
+    // R2-3: if the impl target is a sealed-union alias, replicate the
+    // methods under each variant's class name. Each variant ends up with
+    // an identical copy of the method body; `match self:` patterns
+    // inside the body still dispatch correctly because the runtime
+    // class on `self` only matches its own arm. The duplication is a
+    // small constant factor in emitted code size for the convenience
+    // of writing "the method-on-the-union" once.
     let impl_index_set: HashSet<usize> = impl_indices.iter().map(|(i, _)| *i).collect();
     let mut impl_methods_map: HashMap<String, Vec<Stmt>> = HashMap::new();
     for (impl_idx, target_name) in &impl_indices {
         if let Stmt::ClassDef(c) = &body[*impl_idx] {
             let methods: Vec<Stmt> = c.body.iter().map(insert_self_param).collect();
-            impl_methods_map
-                .entry(target_name.clone())
-                .or_default()
-                .extend(methods);
+            // Determine the actual target class(es). A union alias expands
+            // to every variant; a concrete class is its own target.
+            let targets: Vec<String> = match union_aliases.get(target_name) {
+                Some(variants) => variants.clone(),
+                None => vec![target_name.clone()],
+            };
+            for target in targets {
+                impl_methods_map
+                    .entry(target)
+                    .or_default()
+                    .extend(methods.iter().cloned());
+            }
         }
     }
 
@@ -3514,6 +3580,36 @@ mod tests {
     }
 
     // ── impl block desugaring ─────────────────────────────────────────────────
+
+    #[test]
+    fn impl_block_on_sealed_union_distributes_methods() {
+        // R2-3: `impl Event:` where `Event = A | B` must replicate the
+        // methods on each variant class so `event.kind()` resolves at
+        // every call site regardless of the runtime variant.
+        let src = "\
+class A:
+    x: int
+
+class B:
+    y: str
+
+type Event = A | B
+
+class __typhon_impl_Event(object):
+    def kind():
+        return 'a'
+";
+        let out = parse_and_desugar(src);
+        assert_eq!(
+            out.matches("def kind(self):").count(),
+            2,
+            "kind must be replicated on both A and B; output:\n{out}"
+        );
+        assert!(
+            !out.contains("__typhon_impl_"),
+            "impl stub must be removed even for union impls; output:\n{out}"
+        );
+    }
 
     #[test]
     fn impl_block_methods_merged_into_target_class() {
