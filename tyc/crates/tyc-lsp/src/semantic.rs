@@ -198,28 +198,60 @@ pub fn compute(
 }
 
 /// Walk the module's top-level statements and collect every name
-/// declared as `NAME = NewType("NAME", BASE)`. This matches what the
-/// preprocess pass emits for `newtype NAME = BASE`; bare `NewType(...)`
-/// calls authored by hand in Python style match the same shape and are
-/// included by design.
-fn collect_newtype_names(module: &ModModule) -> std::collections::HashSet<String> {
-    let mut out = std::collections::HashSet::new();
+/// declared as `NAME = NewType("NAME", BASE)` — the canonical shape the
+/// preprocess pass emits for `newtype NAME = BASE`, and the same shape
+/// `tyc-types::extract_newtype_decl` recognises during type checking.
+///
+/// The match is intentionally strict to mirror the compiler:
+///
+/// - exactly one target, a bare `Name`
+/// - RHS is a `Call` whose callee is either bare `NewType` or
+///   `typing.NewType` (the latter caters to users authoring raw Python-
+///   style declarations rather than the `newtype` keyword)
+/// - exactly two positional args, no keywords
+/// - the first arg is a string literal equal to the LHS identifier
+///
+/// A loose check (e.g. "callee name is `NewType`") would
+/// over-promote unrelated `NewType(...)` assignments and diverge from
+/// the compiler's own newtype recognition — PR #130 copilot review.
+fn collect_newtype_names(module: &ModModule) -> HashSet<String> {
+    let mut out = HashSet::new();
     for stmt in &module.body {
-        if let Stmt::Assign(a) = stmt {
-            if a.targets.len() != 1 {
-                continue;
-            }
-            let Expr::Name(target) = &a.targets[0] else {
-                continue;
-            };
-            if let Expr::Call(call) = a.value.as_ref() {
-                if let Expr::Name(func) = call.func.as_ref() {
-                    if func.id.as_str() == "NewType" {
-                        out.insert(target.id.as_str().to_owned());
-                    }
-                }
-            }
+        let Stmt::Assign(a) = stmt else { continue };
+        if a.targets.len() != 1 {
+            continue;
         }
+        let Expr::Name(target) = &a.targets[0] else {
+            continue;
+        };
+        let Expr::Call(call) = a.value.as_ref() else {
+            continue;
+        };
+        // Callee must be bare `NewType` or dotted `typing.NewType`.
+        let callee_ok = match call.func.as_ref() {
+            Expr::Name(n) => n.id.as_str() == "NewType",
+            Expr::Attribute(attr) => {
+                attr.attr.as_str() == "NewType"
+                    && matches!(
+                        attr.value.as_ref(),
+                        Expr::Name(n) if n.id.as_str() == "typing"
+                    )
+            }
+            _ => false,
+        };
+        if !callee_ok {
+            continue;
+        }
+        if call.arguments.args.len() != 2 || !call.arguments.keywords.is_empty() {
+            continue;
+        }
+        let Some(Expr::StringLiteral(s)) = call.arguments.args.first() else {
+            continue;
+        };
+        if s.value.to_str() != target.id.as_str() {
+            continue;
+        }
+        out.insert(target.id.as_str().to_owned());
     }
     out
 }
@@ -254,7 +286,7 @@ fn emit_binding_tokens(
     source: &str,
     resolved: &ResolvedModule,
     stdlib_modules: &[&str],
-    newtype_names: &std::collections::HashSet<String>,
+    newtype_names: &HashSet<String>,
 ) {
     for scope in &resolved.scopes {
         let in_class_body = scope.kind == tyc_resolve::ScopeKind::Class;
@@ -288,7 +320,7 @@ fn emit_reference_tokens(
     source: &str,
     resolved: &ResolvedModule,
     stdlib_modules: &[&str],
-    newtype_names: &std::collections::HashSet<String>,
+    newtype_names: &HashSet<String>,
 ) {
     for reference in &resolved.references {
         let Some(binding) = lookup_binding(resolved, &reference.name, reference.scope) else {
@@ -1556,6 +1588,103 @@ mod tests {
             collect_token_types_for(&source, "title", &result.data),
             vec![TOKEN_PROPERTY],
             "class-body field `title` should paint as property, not variable"
+        );
+    }
+
+    /// The newtype overlay mirrors `tyc-types::extract_newtype_decl`:
+    /// look-alike `NewType(...)` calls that don't match the canonical
+    /// shape must NOT be promoted, otherwise we diverge from how the
+    /// compiler treats the same source. PR #130 copilot review.
+    #[test]
+    fn newtype_overlay_rejects_look_alike_shapes() {
+        // Wrong string-literal name → not a newtype declaration.
+        let src = "X = NewType(\"Y\", int)\n\
+                   pub def f(v: X) -> int:\n\
+                  \x20    return 0\n";
+        let (source, resolved, module) = parse_and_resolve(src);
+        let stdlib_list = stdlib();
+        let stdlib_refs: Vec<&str> = stdlib_list.to_vec();
+        let result = compute(
+            &source,
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &CalleeSignatures::new(),
+            &AttributeKinds::new(),
+        );
+        // The two `X` sites (declaration + parameter type) must paint
+        // as `variable`, not `class` — a mismatched string-literal arg
+        // means this isn't a real newtype declaration.
+        let types = collect_token_types_for(&source, "X", &result.data);
+        assert_eq!(
+            types,
+            vec![TOKEN_VARIABLE, TOKEN_VARIABLE],
+            "mismatched string-literal name must not promote to class; got {:?}",
+            types
+        );
+
+        // Wrong arg count (only one positional) → not a newtype.
+        let src = "X = NewType(\"X\")\nlet v: int = 0\n";
+        let (source, resolved, module) = parse_and_resolve(src);
+        let result = compute(
+            &source,
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &CalleeSignatures::new(),
+            &AttributeKinds::new(),
+        );
+        assert_eq!(
+            collect_token_types_for(&source, "X", &result.data),
+            vec![TOKEN_VARIABLE],
+            "1-arg NewType call must not promote to class"
+        );
+
+        // Keyword argument present → not a newtype.
+        let src = "X = NewType(\"X\", int, tp=1)\nlet v: int = 0\n";
+        let (source, resolved, module) = parse_and_resolve(src);
+        let result = compute(
+            &source,
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &CalleeSignatures::new(),
+            &AttributeKinds::new(),
+        );
+        assert_eq!(
+            collect_token_types_for(&source, "X", &result.data),
+            vec![TOKEN_VARIABLE],
+            "NewType call with keyword arg must not promote to class"
+        );
+    }
+
+    /// Users writing raw Python-style `import typing; X =
+    /// typing.NewType("X", int)` should get the same class-painting
+    /// treatment the `newtype` keyword gets. Mirrors the dotted-callee
+    /// extension on `collect_newtype_names`.
+    #[test]
+    fn newtype_overlay_accepts_dotted_typing_newtype() {
+        let src = "import typing\n\
+                   X = typing.NewType(\"X\", int)\n\
+                   pub def f(v: X) -> X:\n\
+                  \x20    return v\n";
+        let (source, resolved, module) = parse_and_resolve(src);
+        let stdlib_list = stdlib();
+        let stdlib_refs: Vec<&str> = stdlib_list.to_vec();
+        let result = compute(
+            &source,
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &CalleeSignatures::new(),
+            &AttributeKinds::new(),
+        );
+        let types = collect_token_types_for(&source, "X", &result.data);
+        assert_eq!(
+            types,
+            vec![TOKEN_CLASS, TOKEN_CLASS, TOKEN_CLASS],
+            "`typing.NewType(...)` should promote every `X` site to class; got {:?}",
+            types
         );
     }
 }
