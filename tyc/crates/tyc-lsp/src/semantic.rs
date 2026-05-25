@@ -161,8 +161,20 @@ pub fn compute(
     // `class`, matching how `pub class X:` already paints.
     let newtype_names = collect_newtype_names(module);
     let mut tokens: Vec<AbsoluteToken> = Vec::new();
-    emit_binding_tokens(&mut tokens, source, resolved, stdlib_modules, &newtype_names);
-    emit_reference_tokens(&mut tokens, source, resolved, stdlib_modules, &newtype_names);
+    emit_binding_tokens(
+        &mut tokens,
+        source,
+        resolved,
+        stdlib_modules,
+        &newtype_names,
+    );
+    emit_reference_tokens(
+        &mut tokens,
+        source,
+        resolved,
+        stdlib_modules,
+        &newtype_names,
+    );
     emit_module_path_tokens(&mut tokens, source, module, stdlib_modules);
     emit_ast_tokens(
         &mut tokens,
