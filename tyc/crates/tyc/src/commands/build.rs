@@ -345,24 +345,23 @@ pub fn run(args: BuildArgs) -> Result<()> {
         // build output to a repository leaks the secret.
         //
         // Suppression knob: a `[strictness] allow-secret-comptime = true`
-        // toggle in `typhon.toml` should silence this warning. The
-        // current TyphonConfig is owned by another agent and does not yet
-        // expose the field, so this implementation always prints the
-        // warning. Once the field exists, gate the `eprintln!` on
-        // `!config.strictness.allow_secret_comptime`.
-        for name in comptime_values.keys() {
-            if secret_suffix(name).is_none() {
-                continue;
-            }
-            // Only fire when the RHS actually pulls from `env(...)` — a
-            // hard-coded `comptime let API_KEY = "test"` isn't reading a
-            // secret, just labelling a literal. Pull the actual env-var
-            // key out of the source so the help text points at the right
-            // identifier (the binding name and the env key often differ:
-            // `comptime let API_KEY = env("MY_SERVICE_API_KEY")`).
-            if let Some(env_key) = find_env_key_for_comptime_binding(source, name) {
-                let warn = TycError::contains_secret_literal(name.clone(), env_key);
-                eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn)));
+        // toggle in `typhon.toml` should silence this warning.
+        // It is checked using `!config.strictness.allow_secret_comptime` below.
+        if !config.strictness.allow_secret_comptime {
+            for name in comptime_values.keys() {
+                if secret_suffix(name).is_none() {
+                    continue;
+                }
+                // Only fire when the RHS actually pulls from `env(...)` — a
+                // hard-coded `comptime let API_KEY = "test"` isn't reading a
+                // secret, just labelling a literal. Pull the actual env-var
+                // key out of the source so the help text points at the right
+                // identifier (the binding name and the env key often differ:
+                // `comptime let API_KEY = env("MY_SERVICE_API_KEY")`).
+                if let Some(env_key) = find_env_key_for_comptime_binding(source, name) {
+                    let warn = TycError::contains_secret_literal(name.clone(), env_key);
+                    eprintln!("{:?}", miette::Report::new_boxed(Box::new(warn)));
+                }
             }
         }
 

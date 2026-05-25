@@ -186,6 +186,10 @@ pub struct StrictnessConfig {
     /// instead of `requests`, `aiofiles` instead of bare `open`,
     /// `asyncio.sleep` instead of `time.sleep`); `"off"` suppresses.
     pub blocking_in_async: String,
+    /// When true, silence the warning for `tyc::contains_secret_literal`
+    /// which checks for sensitive environmental variables mapped using
+    /// `comptime let API_KEY = env("API_KEY")`.
+    pub allow_secret_comptime: bool,
     /// Severity for `tyc::stub_mismatch` produced by `tyc check --stubs`.
     /// When a `.dty` stub's surface API diverges from its sibling `.ty`/`.py`
     /// implementation, this diagnostic is emitted.
@@ -214,6 +218,7 @@ impl Default for StrictnessConfig {
             parallel_min_size: 64,
             require_with: "warn".into(),
             blocking_in_async: "warn".into(),
+            allow_secret_comptime: false,
             stub_check: "error".into(),
         }
     }
