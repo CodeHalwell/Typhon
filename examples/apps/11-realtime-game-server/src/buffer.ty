@@ -1,0 +1,40 @@
+# Generic ring buffer used for per-room tick/event history.
+
+pub class RingBuffer[T]:
+    capacity: int
+    items: list[T]
+    cursor: int
+
+
+impl[T] RingBuffer[T]:
+    def push(self, value: T) -> None:
+        if len(self.items) < self.capacity:
+            self.items.append(value)
+            return
+        self.items[self.cursor] = value
+        self.cursor = (self.cursor + 1) % self.capacity
+
+    def snapshot(self) -> list[T]:
+        mut out: list[T] = []
+        if len(self.items) < self.capacity:
+            for v in self.items:
+                out.append(v)
+            return out
+        mut idx: int = self.cursor
+        mut count: int = 0
+        while count < self.capacity:
+            out.append(self.items[idx])
+            idx = (idx + 1) % self.capacity
+            count = count + 1
+        return out
+
+    def size(self) -> int:
+        return len(self.items)
+
+    def clear(self) -> None:
+        self.items = []
+        self.cursor = 0
+
+
+pub def new_ring[T](capacity: int) -> RingBuffer[T]:
+    return RingBuffer(capacity=capacity, items=[], cursor=0)

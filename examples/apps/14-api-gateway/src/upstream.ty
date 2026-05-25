@@ -1,0 +1,34 @@
+from ids import UpstreamId
+
+
+# Each upstream is a single backend host. Health, in-flight counters, and the
+# weight used by the weighted load balancer live on the same struct so the
+# balancers only need to traverse a list.
+pub class Upstream:
+    id: UpstreamId
+    base_url: str
+    weight: int
+    healthy: bool
+    in_flight: int
+    consecutive_successes: int
+    consecutive_failures: int
+
+
+pub def new_upstream(id: UpstreamId, base_url: str, weight: int) -> Upstream:
+    return Upstream(
+        id=id,
+        base_url=base_url,
+        weight=weight if weight > 0 else 1,
+        healthy=True,
+        in_flight=0,
+        consecutive_successes=0,
+        consecutive_failures=0,
+    )
+
+
+pub def healthy_upstreams(pool: list[Upstream]) -> list[Upstream]:
+    mut out: list[Upstream] = []
+    for u in pool:
+        if u.healthy:
+            out.append(u)
+    return out

@@ -1,0 +1,36 @@
+import asyncio
+import sys
+
+import uvicorn
+
+from api import STATE, app
+from config import build_tag
+
+
+async def _serve() -> None:
+    let cfg = uvicorn.Config(
+        app,
+        host="127.0.0.1",
+        port=STATE.config.http_port,
+        log_level="info",
+    )
+    let server: uvicorn.Server = uvicorn.Server(cfg)
+    await server.serve()
+
+
+async def _amain() -> None:
+    print(f"[vdb] starting build={build_tag()} port={STATE.config.http_port}")
+    print(f"[vdb] snapshot_dir={STATE.config.snapshot_dir}")
+    await _serve()
+
+
+def main() -> None:
+    try:
+        asyncio.run(_amain())
+    except KeyboardInterrupt:
+        print("[vdb] shutting down")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

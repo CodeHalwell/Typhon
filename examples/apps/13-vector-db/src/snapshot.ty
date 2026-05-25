@@ -1,0 +1,175 @@
+import json
+import struct
+from pathlib import Path
+
+from collection import Collection
+from config import HnswParams
+from ids import CollectionId, Dim, SnapshotSeq
+from metric import metric_from_name, metric_name
+
+
+pub class SnapshotError:
+    op: str
+    message: str
+
+
+pub class SnapshotInfo frozen:
+    seq: int
+    path: str
+    vector_count: int
+
+
+# Per-collection on-disk layout:
+#   <dir>/<name>.meta.json   — JSON manifest (dim, metric, ids, metadata)
+#   <dir>/<name>.vec.bin     — packed float64 vectors
+
+
+def _meta_path(snapshot_dir: str, name: str) -> Path:
+    return Path(snapshot_dir) / f"{name}.meta.json"
+
+
+def _vec_path(snapshot_dir: str, name: str) -> Path:
+    return Path(snapshot_dir) / f"{name}.vec.bin"
+
+
+pub def ensure_dir(snapshot_dir: str) -> Result[None, SnapshotError]:
+    try:
+        Path(snapshot_dir).mkdir(parents=True, exist_ok=True)
+        return Ok(None)
+    except OSError as e:
+        return Err(SnapshotError(op="ensure_dir", message=str(e)))
+
+
+pub def write_snapshot[D](
+    col: Collection[D], snapshot_dir: str, seq: SnapshotSeq,
+) -> Result[SnapshotInfo, SnapshotError]:
+    let mk: Result[None, SnapshotError] = ensure_dir(snapshot_dir)
+    let _checked: None = mk?
+    let meta_p: Path = _meta_path(snapshot_dir, col.name)
+    let vec_p: Path = _vec_path(snapshot_dir, col.name)
+    let dim: int = int(col.dim)
+    mut ids: list[int] = []
+    mut metas: list[dict[str, object]] = []
+    try:
+        with open(str(vec_p), "wb") as fout:
+            for (vid, sv) in col.storage.items():
+                if len(sv.vector) != dim:
+                    return Err(SnapshotError(
+                        op="write_snapshot",
+                        message=f"vector {vid} has wrong dim {len(sv.vector)}",
+                    ))
+                ids.append(vid)
+                metas.append(sv.metadata)
+                let packed: bytes = struct.pack(f"{dim}d", *sv.vector)
+                fout.write(packed)
+        let manifest: dict[str, object] = {
+            "seq": int(seq),
+            "name": col.name,
+            "dim": dim,
+            "metric": metric_name(col.metric),
+            "vector_count": len(ids),
+            "ids": ids,
+            "metadata": metas,
+        }
+        with open(str(meta_p), "w") as f2:
+            f2.write(json.dumps(manifest))
+        return Ok(SnapshotInfo(
+            seq=int(seq), path=str(meta_p), vector_count=len(ids),
+        ))
+    except OSError as e:
+        return Err(SnapshotError(op="write_snapshot", message=str(e)))
+    except struct.error as e:
+        return Err(SnapshotError(op="write_snapshot", message=str(e)))
+
+
+pub class LoadedCollection:
+    name: str
+    dim: int
+    metric_label: str
+    seq: int
+    vectors: list[tuple[int, list[float], dict[str, object]]]
+
+
+pub def load_snapshot(
+    snapshot_dir: str, name: str,
+) -> Result[LoadedCollection, SnapshotError]:
+    let meta_p: Path = _meta_path(snapshot_dir, name)
+    let vec_p: Path = _vec_path(snapshot_dir, name)
+    if not meta_p.exists():
+        return Err(SnapshotError(
+            op="load_snapshot", message=f"no manifest at {meta_p}",
+        ))
+    try:
+        with open(str(meta_p), "r") as fm:
+            let raw_text: str = fm.read()
+        let manifest: dict[str, object] = dict(json.loads(raw_text))
+        let dim: int = int(manifest.get("dim") or 0)
+        let metric_label: str = str(manifest.get("metric") or "cosine")
+        let seq: int = int(manifest.get("seq") or 0)
+        let raw_ids_obj: object? = manifest.get("ids")
+        let raw_metas_obj: object? = manifest.get("metadata")
+        let raw_ids: list[object] = list(raw_ids_obj) if raw_ids_obj is not None else []
+        let raw_metas: list[object] = list(raw_metas_obj) if raw_metas_obj is not None else []
+        mut vectors: list[tuple[int, list[float], dict[str, object]]] = []
+        with open(str(vec_p), "rb") as fb:
+            let blob: bytes = fb.read()
+        let per_vec: int = dim * 8
+        mut i: int = 0
+        while i < len(raw_ids):
+            let off: int = i * per_vec
+            if off + per_vec > len(blob):
+                return Err(SnapshotError(
+                    op="load_snapshot",
+                    message=f"vector blob truncated at offset {off}",
+                ))
+            let chunk: bytes = blob[off:off + per_vec]
+            let unpacked: tuple[float, ...] = struct.unpack(f"{dim}d", chunk)
+            let vec: list[float] = [float(x) for x in unpacked]
+            let id_here: int = int(raw_ids[i])
+            let meta_here: dict[str, object] = (
+                dict(raw_metas[i]) if i < len(raw_metas) else {}
+            )
+            vectors.append((id_here, vec, meta_here))
+            i = i + 1
+        return Ok(LoadedCollection(
+            name=name,
+            dim=dim,
+            metric_label=metric_label,
+            seq=seq,
+            vectors=vectors,
+        ))
+    except OSError as e:
+        return Err(SnapshotError(op="load_snapshot", message=str(e)))
+    except struct.error as e:
+        return Err(SnapshotError(op="load_snapshot", message=str(e)))
+    except ValueError as e:
+        return Err(SnapshotError(op="load_snapshot", message=str(e)))
+
+
+pub def hydrate_collection[D](
+    loaded: LoadedCollection,
+    cid: CollectionId,
+    params: HnswParams,
+) -> Result[Collection[D], SnapshotError]:
+    let metric_opt = metric_from_name(loaded.metric_label)
+    if metric_opt is None:
+        return Err(SnapshotError(
+            op="hydrate", message=f"unknown metric '{loaded.metric_label}'",
+        ))
+    let m = metric_opt
+    let dim_wrapped: Dim = Dim(loaded.dim)
+    # Build storage + index. Cannot call new_collection here without a
+    # circular dependency (collection imports nothing snapshot-related —
+    # we instantiate directly).
+    from collection import new_collection
+    from ids import VectorId as VId
+    let col: Collection[D] = new_collection[D](cid, loaded.name, dim_wrapped, m, params)
+    for (vid_raw, vec, meta) in loaded.vectors:
+        match col.insert(VId(vid_raw), vec, meta):
+            case Ok(_):
+                pass
+            case Err(e):
+                return Err(SnapshotError(
+                    op="hydrate", message=f"{e.op}: {e.message}",
+                ))
+    return Ok(col)

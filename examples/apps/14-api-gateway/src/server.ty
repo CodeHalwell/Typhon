@@ -1,0 +1,207 @@
+import asyncio
+import uuid
+
+import httpx
+from fastapi import FastAPI, Request, Response
+
+from auth import TokenStore, new_token_store
+from balancer import Balancer
+from config import GatewayConfig
+from forward import ForwardContext, new_forward_context
+from health import HealthRegistry, new_health_registry, run_health_loop
+from ids import ClientId, RequestId, TraceId
+from limiter import RateLimiter, new_limiter
+from loader import default_routes, load_routes_file
+from metrics import MetricsRegistry, new_metrics_registry
+from middleware import GatewayCore, handle_request, new_gateway_core
+from models import HttpRequest, HttpResponse
+from routes import RouteTable
+from upstream import Upstream
+from wire import HealthResponse, ReloadResponse
+
+
+# ---------------------------------------------------------------------------
+# AppState — owns every long-lived service. Constructed once in `build_app`.
+# The route table and balancers are stored mutably so SIGHUP / a /reload
+# call can swap them atomically.
+# ---------------------------------------------------------------------------
+
+
+pub class AppState:
+    config: GatewayConfig
+    http_client: httpx.AsyncClient
+    core: GatewayCore
+    metrics: MetricsRegistry
+    tokens: TokenStore
+    rate_limiter: RateLimiter
+    forward_ctx: ForwardContext
+    health: HealthRegistry?
+    health_task: asyncio.Task[None]?
+    shutdown: asyncio.Event
+
+
+def _load_or_default(path: str) -> tuple[RouteTable, dict[str, Balancer]]:
+    match load_routes_file(path):
+        case Ok(pair):
+            return pair
+        case Err(_):
+            return default_routes()
+    raise RuntimeError("unreachable")
+
+
+pub def build_state(config: GatewayConfig) -> AppState:
+    let client: httpx.AsyncClient = httpx.AsyncClient(
+        timeout=config.upstream_timeout_seconds,
+    )
+    let forward_ctx: ForwardContext = new_forward_context(config, client)
+    let rate_limiter: RateLimiter = new_limiter(config.rate_limit)
+    let metrics: MetricsRegistry = new_metrics_registry()
+    let tokens: TokenStore = new_token_store()
+
+    # Seed a tiny default token so the example is browsable.
+    tokens.register("dev-token", ClientId("local-dev"))
+
+    let loaded: tuple[RouteTable, dict[str, Balancer]] = _load_or_default(config.routes_path)
+    let (table, balancers) = loaded
+    let core: GatewayCore = new_gateway_core(
+        table=table,
+        forward=forward_ctx,
+        rate_limiter=rate_limiter,
+        metrics=metrics,
+        tokens=tokens,
+        balancers=balancers,
+    )
+    return AppState(
+        config=config,
+        http_client=client,
+        core=core,
+        metrics=metrics,
+        tokens=tokens,
+        rate_limiter=rate_limiter,
+        forward_ctx=forward_ctx,
+        health=None,
+        health_task=None,
+        shutdown=asyncio.Event(),
+    )
+
+
+def _collect_upstreams(state: AppState) -> list[Upstream]:
+    mut seen: dict[str, Upstream] = {}
+    for route in state.core.table.routes:
+        for u in route.upstreams:
+            seen[str(u.id)] = u
+    mut out: list[Upstream] = []
+    for (_k, v) in seen.items():
+        out.append(v)
+    return out
+
+
+pub def reload_routes(state: AppState) -> Result[int, str]:
+    match load_routes_file(state.config.routes_path):
+        case Ok(pair):
+            let (table, balancers) = pair
+            state.core.table = table
+            state.core.balancers = balancers
+            return Ok(len(table.routes))
+        case Err(le):
+            return Err(f"{le.path}: {le.reason}")
+    raise RuntimeError("unreachable")
+
+
+# ---------------------------------------------------------------------------
+# FastAPI wiring. A single catch-all route forwards every incoming request
+# through the gateway pipeline; a few control-plane endpoints sit under
+# `/_gateway/*` for health / metrics / reload.
+# ---------------------------------------------------------------------------
+
+
+def _new_request_id() -> RequestId:
+    return RequestId(uuid.uuid4().hex)
+
+
+def _new_trace_id(headers: dict[str, str]) -> TraceId:
+    let existing: str? = headers.get("x-trace-id")
+    if existing is not None:
+        return TraceId(existing)
+    return TraceId(uuid.uuid4().hex)
+
+
+def _client_id_from(headers: dict[str, str]) -> ClientId:
+    let xff: str? = headers.get("x-forwarded-for")
+    if xff is not None:
+        let first: str = xff.split(",")[0].strip()
+        if len(first) > 0:
+            return ClientId(first)
+    return ClientId("anonymous")
+
+
+pub def build_app(config: GatewayConfig) -> FastAPI:
+    let state: AppState = build_state(config)
+    let app: FastAPI = FastAPI(title=f"Typhon API Gateway {config.build_version}")
+
+    @app.get("/_gateway/health")
+    def health_check() -> HealthResponse:
+        mut up_map: dict[str, bool] = {}
+        for u in _collect_upstreams(state):
+            up_map[str(u.id)] = u.healthy
+        return HealthResponse(
+            ok=True,
+            upstreams=up_map,
+            build_version=state.config.build_version,
+        )
+
+    @app.get("/_gateway/metrics")
+    def metrics_endpoint() -> Response:
+        let body: str = state.metrics.render_prometheus()
+        return Response(content=body, media_type="text/plain; version=0.0.4")
+
+    @app.post("/_gateway/reload")
+    def reload_endpoint() -> ReloadResponse:
+        match reload_routes(state):
+            case Ok(n):
+                return ReloadResponse(ok=True, routes_loaded=n, error=None)
+            case Err(msg):
+                return ReloadResponse(ok=False, routes_loaded=0, error=msg)
+        raise RuntimeError("unreachable")
+
+    @app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"])
+    async def proxy(full_path: str, request: Request) -> Response:
+        let raw_body: bytes = await request.body()
+        mut headers: dict[str, str] = {}
+        for (k, v) in request.headers.items():
+            headers[str(k).lower()] = str(v)
+        let req: HttpRequest = HttpRequest(
+            request_id=_new_request_id(),
+            trace_id=_new_trace_id(headers),
+            client_id=_client_id_from(headers),
+            method=request.method,
+            path="/" + full_path,
+            headers=headers,
+            body=raw_body,
+        )
+        let resp: HttpResponse = await handle_request(state.core, req)
+        return Response(
+            content=resp.body,
+            status_code=resp.status,
+            headers=resp.headers,
+        )
+
+    @app.on_event("startup")
+    def _on_start() -> None:
+        let upstreams: list[Upstream] = _collect_upstreams(state)
+        let registry: HealthRegistry = new_health_registry(
+            upstreams=upstreams,
+            policy=state.config.health,
+            client=state.http_client,
+            shutdown=state.shutdown,
+        )
+        state.health = registry
+        go run_health_loop(registry) -> task
+        state.health_task = task
+
+    @app.on_event("shutdown")
+    async def _on_stop() -> None:
+        state.shutdown.set()
+        await state.http_client.aclose()
+
+    return app

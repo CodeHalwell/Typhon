@@ -1,0 +1,156 @@
+import time
+
+import httpx
+
+from breaker import (
+    CircuitBreaker,
+    gate as breaker_gate,
+    make_closed,
+    record_failure as breaker_record_failure,
+    record_success as breaker_record_success,
+)
+from config import GatewayConfig
+from ids import UpstreamId
+from models import (
+    GwError,
+    HttpRequest,
+    HttpResponse,
+    err_breaker_open,
+    err_no_upstream,
+    err_upstream_failure,
+    make_response,
+)
+from retry import (
+    backoff_delay_ms,
+    is_retryable_exception,
+    is_retryable_status,
+    sleep_ms,
+)
+from routes import Route
+from upstream import Upstream
+
+
+# ---------------------------------------------------------------------------
+# Final hop: actually call the upstream over httpx, with retry + breaker. The
+# middleware chain stops here.
+# ---------------------------------------------------------------------------
+
+
+pub class ForwardContext:
+    config: GatewayConfig
+    client: httpx.AsyncClient
+    breakers: dict[str, CircuitBreaker]
+
+
+pub def new_forward_context(
+    config: GatewayConfig,
+    client: httpx.AsyncClient,
+) -> ForwardContext:
+    return ForwardContext(config=config, client=client, breakers={})
+
+
+def _breaker_for(ctx: ForwardContext, upstream: UpstreamId) -> CircuitBreaker:
+    let key: str = str(upstream)
+    let existing: CircuitBreaker? = ctx.breakers.get(key)
+    if existing is not None:
+        return existing
+    let fresh: CircuitBreaker = CircuitBreaker(
+        upstream=upstream,
+        policy=ctx.config.breaker,
+        state=make_closed(0),
+    )
+    ctx.breakers[key] = fresh
+    return fresh
+
+
+async def _call_once(
+    ctx: ForwardContext,
+    upstream: Upstream,
+    route: Route,
+    request: HttpRequest,
+) -> Result[HttpResponse, str]:
+    let url: str = upstream.base_url.rstrip("/") + request.path
+    let started: float = time.monotonic()
+    upstream.in_flight = upstream.in_flight + 1
+    try:
+        let req_headers: dict[str, str] = {}
+        for (k, v) in request.headers.items():
+            req_headers[k] = v
+        req_headers["x-request-id"] = str(request.request_id)
+        req_headers["x-trace-id"] = str(request.trace_id)
+        req_headers["x-forwarded-by"] = "typhon-gateway"
+        let resp: httpx.Response = await ctx.client.request(
+            request.method,
+            url,
+            content=request.body,
+            headers=req_headers,
+            timeout=route.timeout_seconds,
+        )
+        let elapsed_ms: int = int((time.monotonic() - started) * 1000.0)
+        let resp_headers: dict[str, str] = {}
+        for (hk, hv) in resp.headers.items():
+            resp_headers[hk] = hv
+        return Ok(make_response(
+            status=int(resp.status_code),
+            body=resp.content,
+            headers=resp_headers,
+            upstream=upstream.id,
+            route_id=route.id,
+            elapsed_ms=elapsed_ms,
+        ))
+    except httpx.HTTPError as e:
+        return Err(f"{type(e).__name__}: {e}")
+    except Exception as e2:
+        return Err(f"unexpected {type(e2).__name__}: {e2}")
+    finally:
+        upstream.in_flight = upstream.in_flight - 1
+
+
+pub async def forward_with_retry(
+    ctx: ForwardContext,
+    route: Route,
+    upstream: Upstream,
+    request: HttpRequest,
+) -> Result[HttpResponse, GwError]:
+    let breaker: CircuitBreaker = _breaker_for(ctx, upstream.id)
+    let gate_remaining: int? = breaker_gate(breaker)
+    if gate_remaining is not None:
+        return Err(err_breaker_open(upstream.id, gate_remaining))
+
+    let policy = ctx.config.retry
+    mut attempt: int = 0
+    mut last_reason: str = "no attempts made"
+    while attempt < policy.max_attempts:
+        attempt = attempt + 1
+        match await _call_once(ctx, upstream, route, request):
+            case Ok(resp):
+                if is_retryable_status(resp.status) and attempt < policy.max_attempts:
+                    last_reason = f"upstream status {resp.status}"
+                    breaker_record_failure(breaker)
+                    await sleep_ms(backoff_delay_ms(policy, attempt))
+                    continue
+                if resp.status >= 500:
+                    breaker_record_failure(breaker)
+                    return Err(err_upstream_failure(upstream.id, resp.status, "upstream 5xx"))
+                breaker_record_success(breaker)
+                return Ok(resp)
+            case Err(msg):
+                last_reason = msg
+                let exc_name: str = msg.split(":")[0] if ":" in msg else msg
+                if not is_retryable_exception(exc_name):
+                    breaker_record_failure(breaker)
+                    return Err(err_upstream_failure(upstream.id, 502, msg))
+                breaker_record_failure(breaker)
+                if attempt < policy.max_attempts:
+                    await sleep_ms(backoff_delay_ms(policy, attempt))
+                    continue
+    return Err(err_upstream_failure(upstream.id, 504, last_reason))
+
+
+pub def pick_upstream_or_error(
+    route: Route,
+    chosen: Upstream?,
+) -> Result[Upstream, GwError]:
+    if chosen is None:
+        return Err(err_no_upstream(route.id, "no healthy upstream"))
+    return Ok(chosen)

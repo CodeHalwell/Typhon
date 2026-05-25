@@ -1,0 +1,309 @@
+from md_lex import (
+    LnBlank,
+    LnFence,
+    LnHeading,
+    LnList,
+    LnOList,
+    LnQuote,
+    LnRule,
+    LnText,
+    MdLine,
+    lex_lines,
+)
+from models import (
+    Block,
+    Inline,
+    make_bk_code,
+    make_bk_heading,
+    make_bk_list,
+    make_bk_paragraph,
+    make_bk_quote,
+    make_bk_rule,
+    make_in_break,
+    make_in_code,
+    make_in_emph,
+    make_in_image,
+    make_in_link,
+    make_in_strong,
+    make_in_text,
+)
+
+
+# ----- Inline parser -----
+
+def _find_unescaped(text: str, ch: str, start: int) -> int:
+    mut i: int = start
+    let n: int = len(text)
+    while i < n:
+        if text[i] == "\\" and i + 1 < n:
+            i = i + 2
+            continue
+        if text[i] == ch:
+            return i
+        i = i + 1
+    return -1
+
+
+def _find_marker(text: str, marker: str, start: int) -> int:
+    let mlen: int = len(marker)
+    mut i: int = start
+    let n: int = len(text)
+    while i + mlen <= n:
+        if text[i] == "\\" and i + 1 < n:
+            i = i + 2
+            continue
+        mut ok: bool = True
+        mut j: int = 0
+        while j < mlen:
+            if text[i + j] != marker[j]:
+                ok = False
+                break
+            j = j + 1
+        if ok:
+            return i
+        i = i + 1
+    return -1
+
+
+def _emit_text(buf: str, out: list[Inline]) -> None:
+    if len(buf) > 0:
+        out.append(make_in_text(buf))
+
+
+pub def parse_inline(text: str) -> list[Inline]:
+    mut out: list[Inline] = []
+    mut buf: str = ""
+    mut i: int = 0
+    let n: int = len(text)
+    while i < n:
+        let ch: str = text[i]
+        if ch == "\\" and i + 1 < n:
+            buf = buf + text[i + 1]
+            i = i + 2
+            continue
+        # Inline code
+        if ch == "`":
+            let close: int = _find_unescaped(text, "`", i + 1)
+            if close > i:
+                _emit_text(buf, out)
+                buf = ""
+                out.append(make_in_code(text[i + 1:close]))
+                i = close + 1
+                continue
+        # Image: ![alt](src)
+        if ch == "!" and i + 1 < n and text[i + 1] == "[":
+            let close_b: int = _find_unescaped(text, "]", i + 2)
+            if close_b > 0 and close_b + 1 < n and text[close_b + 1] == "(":
+                let close_p: int = _find_unescaped(text, ")", close_b + 2)
+                if close_p > 0:
+                    _emit_text(buf, out)
+                    buf = ""
+                    out.append(make_in_image(text[close_b + 2:close_p], text[i + 2:close_b]))
+                    i = close_p + 1
+                    continue
+        # Link: [child](href)
+        if ch == "[":
+            let close_b2: int = _find_unescaped(text, "]", i + 1)
+            if close_b2 > 0 and close_b2 + 1 < n and text[close_b2 + 1] == "(":
+                let close_p2: int = _find_unescaped(text, ")", close_b2 + 2)
+                if close_p2 > 0:
+                    _emit_text(buf, out)
+                    buf = ""
+                    let inner_text: str = text[i + 1:close_b2]
+                    let href: str = text[close_b2 + 2:close_p2]
+                    out.append(make_in_link(href, parse_inline(inner_text)))
+                    i = close_p2 + 1
+                    continue
+        # Strong: ** ... **
+        if ch == "*" and i + 1 < n and text[i + 1] == "*":
+            let close_s: int = _find_marker(text, "**", i + 2)
+            if close_s > 0:
+                _emit_text(buf, out)
+                buf = ""
+                out.append(make_in_strong(parse_inline(text[i + 2:close_s])))
+                i = close_s + 2
+                continue
+        # Emphasis: * ... * or _ ... _
+        if ch == "*" or ch == "_":
+            let close_e: int = _find_unescaped(text, ch, i + 1)
+            if close_e > i:
+                _emit_text(buf, out)
+                buf = ""
+                out.append(make_in_emph(parse_inline(text[i + 1:close_e])))
+                i = close_e + 1
+                continue
+        buf = buf + ch
+        i = i + 1
+    _emit_text(buf, out)
+    return out
+
+
+# ----- Block parser -----
+
+def _join_inline(strs: list[str]) -> list[Inline]:
+    mut out: list[Inline] = []
+    mut i: int = 0
+    let n: int = len(strs)
+    while i < n:
+        let parsed: list[Inline] = parse_inline(strs[i])
+        for inl in parsed:
+            out.append(inl)
+        if i + 1 < n:
+            out.append(make_in_break())
+        i = i + 1
+    return out
+
+
+pub def parse_blocks(source: str) -> list[Block]:
+    let lines: list[MdLine] = lex_lines(source)
+    mut blocks: list[Block] = []
+    mut i: int = 0
+    let n: int = len(lines)
+    while i < n:
+        let ln: MdLine = lines[i]
+        match ln:
+            case LnBlank():
+                i = i + 1
+            case LnRule():
+                blocks.append(make_bk_rule())
+                i = i + 1
+            case LnHeading(level, text, _):
+                blocks.append(make_bk_heading(level, parse_inline(text)))
+                i = i + 1
+            case LnFence(lang, _):
+                mut code_buf: list[str] = []
+                i = i + 1
+                mut closed: bool = False
+                while i < n:
+                    let cur: MdLine = lines[i]
+                    match cur:
+                        case LnFence(_, _):
+                            closed = True
+                            i = i + 1
+                        case LnBlank():
+                            code_buf.append("")
+                            i = i + 1
+                        case LnHeading(lvl_h, ht, _):
+                            code_buf.append(("#" * lvl_h) + " " + ht)
+                            i = i + 1
+                        case LnList(lt, _):
+                            code_buf.append("- " + lt)
+                            i = i + 1
+                        case LnOList(ot, _):
+                            code_buf.append("1. " + ot)
+                            i = i + 1
+                        case LnQuote(qt, _):
+                            code_buf.append("> " + qt)
+                            i = i + 1
+                        case LnRule():
+                            code_buf.append("---")
+                            i = i + 1
+                        case LnText(tx, _):
+                            code_buf.append(tx)
+                            i = i + 1
+                    if closed:
+                        break
+                blocks.append(make_bk_code(lang, "\n".join(code_buf)))
+            case LnList(text, _):
+                mut items: list[list[Inline]] = []
+                items.append(parse_inline(text))
+                i = i + 1
+                while i < n:
+                    let nxt: MdLine = lines[i]
+                    match nxt:
+                        case LnList(t_l, _):
+                            items.append(parse_inline(t_l))
+                            i = i + 1
+                        case _:
+                            break
+                blocks.append(make_bk_list(False, items))
+            case LnOList(text, _):
+                mut o_items: list[list[Inline]] = []
+                o_items.append(parse_inline(text))
+                i = i + 1
+                while i < n:
+                    let nxt_o: MdLine = lines[i]
+                    match nxt_o:
+                        case LnOList(t_o, _):
+                            o_items.append(parse_inline(t_o))
+                            i = i + 1
+                        case _:
+                            break
+                blocks.append(make_bk_list(True, o_items))
+            case LnQuote(text, _):
+                mut q_lines: list[str] = [text]
+                i = i + 1
+                while i < n:
+                    let nxt_q: MdLine = lines[i]
+                    match nxt_q:
+                        case LnQuote(qt2, _):
+                            q_lines.append(qt2)
+                            i = i + 1
+                        case _:
+                            break
+                blocks.append(make_bk_quote(_join_inline(q_lines)))
+            case LnText(text, _):
+                mut p_lines: list[str] = [text]
+                i = i + 1
+                while i < n:
+                    let nxt_p: MdLine = lines[i]
+                    match nxt_p:
+                        case LnText(pt, _):
+                            p_lines.append(pt)
+                            i = i + 1
+                        case _:
+                            break
+                blocks.append(make_bk_paragraph(_join_inline(p_lines)))
+    return blocks
+
+
+pub def render_inline_html(items: list[Inline]) -> str:
+    from models import InBreak, InCode, InEmph, InImage, InLink, InStrong, InText
+    from config import attr_escape, html_escape
+    mut out: str = ""
+    for inl in items:
+        match inl:
+            case InText(text):
+                out = out + html_escape(text)
+            case InEmph(children):
+                out = out + "<em>" + render_inline_html(children) + "</em>"
+            case InStrong(children):
+                out = out + "<strong>" + render_inline_html(children) + "</strong>"
+            case InCode(code):
+                out = out + "<code>" + html_escape(code) + "</code>"
+            case InLink(href, children):
+                out = out + f"<a href=\"{attr_escape(href)}\">" + render_inline_html(children) + "</a>"
+            case InImage(src, alt):
+                out = out + f"<img src=\"{attr_escape(src)}\" alt=\"{attr_escape(alt)}\" />"
+            case InBreak():
+                out = out + "<br />\n"
+    return out
+
+
+pub def render_blocks_html(blocks: list[Block]) -> str:
+    from models import BkCode, BkHeading, BkHtml, BkList, BkParagraph, BkQuote, BkRule
+    from config import html_escape
+    mut out: str = ""
+    for block in blocks:
+        match block:
+            case BkHeading(level, children):
+                let tag: str = f"h{level}"
+                out = out + f"<{tag}>" + render_inline_html(children) + f"</{tag}>\n"
+            case BkParagraph(children):
+                out = out + "<p>" + render_inline_html(children) + "</p>\n"
+            case BkList(ordered, items):
+                let lst_tag: str = "ol" if ordered else "ul"
+                out = out + f"<{lst_tag}>\n"
+                for it in items:
+                    out = out + "  <li>" + render_inline_html(it) + "</li>\n"
+                out = out + f"</{lst_tag}>\n"
+            case BkCode(lang, code):
+                let class_attr: str = f" class=\"language-{lang}\"" if len(lang) > 0 else ""
+                out = out + f"<pre><code{class_attr}>" + html_escape(code) + "</code></pre>\n"
+            case BkQuote(children):
+                out = out + "<blockquote>" + render_inline_html(children) + "</blockquote>\n"
+            case BkRule():
+                out = out + "<hr />\n"
+            case BkHtml(raw):
+                out = out + raw + "\n"
+    return out

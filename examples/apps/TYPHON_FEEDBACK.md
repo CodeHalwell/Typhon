@@ -718,3 +718,327 @@ workaround vocabulary. Round 2's new findings (R2-1 through R2-20) are
 about the next layer — what breaks when you push to recursive ASTs,
 heterogeneous error pipelines, deep sealed unions, and stdlib-shaped
 module names.
+
+---
+---
+
+# Round 3 — five more apps (11-realtime-game-server through 15-stream-processor)
+
+A third batch of five large multi-file apps was built to push areas the
+first two rounds didn't exercise: an async **multiplayer game server**
+with lobby + per-room tick loops, a **static site generator** with full
+Markdown + template-inheritance pipelines, an **in-memory vector
+database** with HNSW + a filter DSL, an **API gateway** with circuit
+breakers + middleware composition + retries, and a **Flink-lite stream
+processing engine** with windowing + watermarks. The five apps total
+~9,800 lines of Typhon across 72 `.ty` files. Tested against **tyc 0.6.1**.
+
+All five `tyc check src/` clean (0 errors, 0 warnings) and the demo
+entrypoints run end-to-end under CPython 3.13. The findings below are
+**new** issues that only appeared in Round 3 — Round 1 / Round 2
+patterns that bit again are summarised in the table at the end.
+
+## R3-1. `await` on a `Callable[..., Awaitable[T]]` does NOT unwrap to `T` (severity: HIGH — biggest Round-3 finding)
+
+The natural shape of an async middleware chain is
+
+```ty
+type NextFn = Callable[[Req], Awaitable[Resp]]
+
+async def caller(nxt: NextFn) -> int:
+    let r: int = await nxt(req)   # ❌ tyc::type_mismatch — expected Resp, found Awaitable[Resp]
+    return r
+```
+
+The checker accepts the alias but rejects the `await`. Same failure
+with `Coroutine[object, object, T]`. Every async-middleware design
+pattern from FastAPI / Starlette / aiohttp transliterates poorly into
+Typhon today.
+
+The `14-api-gateway` workaround was to abandon the `next`-style
+recursive chain entirely and rewrite middleware as a concrete class
+with **sync** `pre_hook` / `post_hook` `Callable` fields composed as a
+straight-line pipeline inside one `async def handle_request(...)`.
+This loses the "any layer can wrap an async section around its inner"
+power that real middleware frameworks expose — the canonical
+"`@asynccontextmanager`-style middleware" can't be expressed.
+
+This is the **single biggest Round-3 finding** and the area where the
+language most directly limits idiomatic async Python ports.
+
+## R3-2. Multi-line `go expr(...)` invocations are a hard parse error (severity: MEDIUM — real bug)
+
+```ty
+async def f(a: int, b: int) -> None: ...
+async def g() -> None:
+    go f(
+        a,
+        b,
+    )                 # ❌ tyc::parse — "Simple statements must be separated by newlines or semicolons"
+    go f(a, b)        # ✅ same call on a single line
+```
+
+`go` appears to be lexed as a special statement head and the inner
+call's open-paren is not honoured for line continuation. The error
+cursor lands on the *callee identifier*, not the trailing comma, which
+makes the cause non-obvious. Found in `11-realtime-game-server/lobby.ty`
+when spawning a long-argument-list room tick loop.
+
+This is asymmetric — every other call form in Typhon respects implicit
+continuation by parens.
+
+## R3-3. `async with` block does not satisfy `missing_return` analysis (severity: MEDIUM)
+
+The async twin of Round-1 #5:
+
+```ty
+async def f() -> int:
+    async with lock:
+        match thing:
+            case Ok(v): return v
+            case Err(e): raise HTTPException(400, str(e))
+        # putting the unreachable trailer here does NOT satisfy the checker
+    raise RuntimeError("unreachable")   # ✅ must live OUTSIDE the with-block
+```
+
+Found in `13-vector-db/api.ty`. The trailing `raise` has to be hoisted
+out of every `async with` block, even when every reachable arm
+terminates. This is *almost* R1-5 but with the additional twist that
+the in-block position is rejected.
+
+## R3-4. `from X import Y` inside an `if` / `for` body silently breaks name resolution (severity: MEDIUM)
+
+```ty
+if condition:
+    from event import make_record_envelope     # parses OK
+    let env: Envelope = make_record_envelope(...)   # ❌ tyc::unknown_name
+```
+
+The parser accepts the local import (no `parse` diagnostic) but the
+resolver doesn't treat the import as binding a name in the surrounding
+scope. The error then points at the *call site*, not the import,
+making the root cause invisible. Workaround: hoist all imports to
+module scope.
+
+Found in `15-stream-processor/runner.ty`. Cost about 30 minutes to
+diagnose because the error message is misleading.
+
+## R3-5. Per-arm `let` shadow rule extends to sibling `if` branches (severity: MEDIUM — extension of R1-6)
+
+Round-1 #6 noted the rule for `match` arms; Round-3 confirms it also
+fires across adjacent `if` blocks in the same function:
+
+```ty
+if is_watermark(env):
+    let wm: WatermarkTs = ...           # ✅
+    ...
+if is_record(env):
+    let wm: WatermarkTs = ...           # ❌ tyc::no_block_shadow
+    ...
+```
+
+Even though only one branch is reachable per call, sibling `if`
+branches "see each other's bindings" the same way sibling `case` arms
+do. Forced per-branch suffixing (`wm_after_wm`, `wm_after_rec`).
+
+Same underlying fix as R1-6: relax the no-shadow rule for sibling
+branches whose control flow proves they're mutually exclusive.
+
+## R3-6. `asyncio.Queue[T]` field annotations require a forward-reference string (severity: LOW)
+
+```ty
+class Lobby:
+    finalise_queue: asyncio.Queue[FinalisedMatch]            # ❌ rejected — subscripted runtime-only generic
+    finalise_queue: "asyncio.Queue[FinalisedMatch]"          # ✅ quoted string works
+```
+
+Technically correct Python semantics (`asyncio.Queue` doesn't support
+`__class_getitem__` at runtime in older spots), but `dict[K, V]` /
+`list[T]` are silently accepted as field annotations even though the
+same rule applies. Friendlier behaviour would be to auto-quote the
+annotation at desugar.
+
+Found in `11-realtime-game-server/lobby.ty`.
+
+## R3-7. `argparse.Namespace` is the only typeable shape for command-handler `args` (severity: MEDIUM)
+
+```ty
+def cmd_build(args: argparse.Namespace) -> int:
+    let url: str = str(args.url) if args.url is not None else DEFAULT_URL  # args.url is Any
+```
+
+Every CLI command handler that takes `args = parser.parse_args(...)`
+must annotate it as `argparse.Namespace`, but the resulting `args.foo`
+accesses are typed `Any` (Namespace has no static schema). Each field
+read needs an explicit cast, and `model`-style argparse integration
+isn't possible today. Found in `12-static-site-gen/cli.ty` — argparse
+is the single largest no-static-typing surface in the suite.
+
+## R3-8. `let x: T` declare-without-initialiser is still rejected in `match`/`if` arms (severity: MEDIUM — R2-7 echo)
+
+The "declare-then-assign-in-arms" idiom remains unavailable in Round 3:
+
+```ty
+let loaded: tuple[RouteTable, dict[str, Balancer]]    # ❌ no initialiser
+match _load(...):
+    case Ok(v): loaded = v
+    case Err(e): ...
+```
+
+`14-api-gateway/state.ty` hit this in `build_state` and had to extract
+a `_load_or_default(...)` helper purely to give the binding an
+initialiser at declaration. R2-7 covered the same finding from Round 2;
+recording the second occurrence as additional evidence.
+
+## R3-9. Ternary `isinstance` narrowing is asymmetric on the `else` branch (severity: LOW)
+
+```ty
+let acc_int: int = int(acc) if isinstance(acc, int) else 0   # ✅
+let acc_int: int = acc if isinstance(acc, int) else 0        # ❌ acc is still object on the then-branch (inference too weak)
+```
+
+The check that narrows `acc` to `int` on the truthy branch of a
+ternary doesn't quite carry the same information the equivalent
+`if`/`else` block carries. Workaround is a trivial `int(acc)` wrap.
+Found in `15-stream-processor/stream_op.ty`.
+
+## R3-10. Parametric sealed unions were avoided pre-emptively (severity: open question)
+
+`15-stream-processor` was the obvious candidate for `EventEnvelope[T] =
+RecordEnv[T] | WatermarkEnv | BarrierEnv`. Based on R1-#1
+(cross-module variant→union upcast rejected even for *non*-parametric
+unions), the agent did not even attempt the parametric form. The
+envelope ended up as a concrete `Envelope` class with an `EnvelopeKind`
+tag (non-parametric union) and an `object`-typed `record_payload` —
+trading payload-type safety for compileability. Real stream / reactive
+engines lean hard on parametric sealed unions; the language story for
+them needs to be documented (either "supported, here's how" or "not
+yet").
+
+## R3-11. `class` field defaults: all-or-none (severity: LOW)
+
+`new_route(..., timeout_seconds: float = 5.0, requires_auth: bool = False)`
+works on a free function, but the same defaulting on a `class` field
+list is rejected — constructors need every-or-no default, not mixed.
+Documenting the rule (or relaxing it) would help; surfaced from
+`14-api-gateway/routes.ty`.
+
+## R3-12. Nested `from X import Y` and nested `def` work — undocumented sanctioned patterns (severity: POSITIVE / docs gap)
+
+Two patterns work cleanly in Round 3 but aren't called out in the
+guides:
+
+1. **Function-local `from X import Y`** consumed only inside `match` arms
+   (used in `12-static-site-gen/md_parse.render_inline_html` to dodge
+   the unused-import diagnostic for type-only references).
+2. **Nested `def _helper(p: ArgT) -> None:`** inside another function,
+   mutating its argument — used by `12-static-site-gen/cli._build_parser`.
+
+Both are useful idioms and the docs should sanction them so users
+don't avoid them out of caution.
+
+## R3-13. `class X frozen: pass` (R2-2) now parses cleanly in 0.6.1 — positive resolution
+
+`13-vector-db/metric.ty` and `12-static-site-gen/models.ty` both
+declare nullary sealed-union variants as `pub class MCosine frozen: pass`
+and the older `placeholder: int = 0` warning is gone. R2-2's prior
+workaround is no longer needed. Pattern shape changes accordingly:
+`case MCosine():` (zero patterns) instead of `case MCosine(_):`.
+
+## R3-14. `gather:` accepts `asyncio.to_thread(...)` and bound-method coroutines cleanly (positive)
+
+```ty
+gather:
+    leaderboard = asyncio.to_thread(store.leaderboard, 5)
+    recent = asyncio.to_thread(store.recent_matches, 5)
+```
+
+Lowers to a clean `async with asyncio.TaskGroup()`. Bound-method
+coroutines also bind cleanly to `Callable[..., Awaitable[T]]` fields
+(modulo R3-1's await-unwrap bug — for fields that are *called*, not
+awaited-with-`await x()`, this works). Recording as a regression test
+target so it doesn't quietly break in a future release.
+
+## R3-15. Generic class + `impl[T]` works inside a single module; cross-module method dispatch is brittle (severity: MEDIUM)
+
+`13-vector-db` and `15-stream-processor` both wrote
+`class Collection[D]: ...` + `impl[D] Collection[D]: ...` and
+`class Operator[I, O]: ...` + `impl[I, O] Operator[I, O]: ...`. **Inside
+one module** this works first try and the emitted PEP 695 is clean.
+**Across modules** — when one module exports `Stream[T]` and another
+calls `stream.map[U](f)` — the `[U]` argument doesn't always flow
+through cleanly, and the agents both fell back to `Stream[object]` to
+avoid the friction. Recorded as an open spec question rather than a
+hard bug: needs either a focused repro suite or a documentation page.
+
+---
+
+## Round 3 summary by app
+
+| app | initial errors | root cause | workaround |
+|---|---|---|---|
+| 11-realtime-game-server | ~12 | R3-2 (multi-line `go`), R3-6 (Queue[T] forward-ref), R1-#1 factories | one-line `go`, quoted annotation, ~14 factories |
+| 12-static-site-gen | ~6 | R2-6 (heterogeneous-error pipeline), R3-7 (argparse Namespace) | StageError envelope + per-stage match towers; explicit args casts |
+| 13-vector-db | ~8 | R3-3 (async with + missing_return), R2-12 (newtype arithmetic) | hoist `raise` out of `async with`, `int(x)` wraps everywhere |
+| 14-api-gateway | ~14 | **R3-1 (await on Callable[…, Awaitable[T]])**, R1-#2 (interface cross-module) | sync pre/post middleware (no recursive `next`), concrete `Balancer` class |
+| 15-stream-processor | ~10 | R3-4 (import-in-block silent fail), R3-5 (sibling-`if` shadow), R2-12 | hoist imports, rename loop/branch locals, bare-int internals + wrap at boundary |
+
+After fixes all five `tyc check src/` clean (0 errors, 0 warnings),
+`tyc build` clean, and the demo entrypoints run end-to-end on CPython 3.13.
+
+## Round 3 — biggest blockers, in order
+
+1. **R3-1** — `await` on `Callable[..., Awaitable[T]]` rejected. Single
+   biggest finding: blocks idiomatic async middleware composition.
+2. **R3-4** — `from X import Y` inside an `if`/`for` block silently
+   breaks resolution with a misleading error site.
+3. **R3-2** — multi-line `go expr(...)` is a hard parse error.
+4. **R3-3** — `async with` + match doesn't satisfy `missing_return` for
+   the trailing-raise position.
+5. **R3-5** — per-arm `let` shadow extends to sibling `if` branches
+   (extension of R1-6).
+6. **R3-15** — cross-module generic-class method dispatch (`Stream[T].map[U]`)
+   is brittle enough that agents both fell back to `Stream[object]`.
+7. **R3-10** — parametric sealed unions: no docs, agents avoided them.
+
+## Round 1 + Round 2 issues that still hit Round 3
+
+| prior finding | hits in Round 3 |
+|---|---|
+| R1-#1 variant→union upcast | every sealed union — ≈100 factory functions across the 5 apps. The vocabulary is now muscle memory, but it's still ~5% of the LoC. |
+| R1-#2 cross-module interface conformance | 14-api-gateway adopted concrete-class-with-`Callable` shape for both `Balancer` and `Middleware`. Discovery: combined with R3-1 the cost is *higher* than R1 suggested because the natural async-middleware shape is rejected twice. |
+| R1-#3 `pub freeze let` rejected | each app left its `freeze let` constants module-private; export went via a `pub def get_default_x()` or via the consumer's import path. |
+| R1-#5 exhaustive match + missing_return | ~60 `raise RuntimeError("unreachable")` trailers across the 5 apps. Plus R3-3's async twin. |
+| R1-#6 per-arm `let` shadow | renamed sibling-arm captures everywhere. R3-5 extends to sibling `if` branches. |
+| R1-#9 positional pattern arity | every `case X(...)` padded to the dataclass's full field count. |
+| R2-2 nullary frozen variants | **closed in 0.6.1** — `class X frozen: pass` parses cleanly now (R3-13). |
+| R2-4 stdlib module name collisions | all five apps proactively avoided `types.ty`, `parser.ty`, `ast.ty`, `tokens.ty`, `string.ty`, `email.ty`, `operator.ty`, etc. 15-stream-processor renamed `operator.ty` → `stream_op.ty` to dodge it. |
+| R2-6 heterogeneous-error `with`-chains | 12-static-site-gen hit this hardest; defined a single `StageError` envelope sealed union and converted at each stage call site. ~60 lines of match-tower where a 6-line `with`-chain would have sufficed. |
+| R2-7 declare-then-assign-in-arms | recurred (R3-8). |
+| R2-9 variant re-emission needs per-field forwarding | 14-api-gateway breaker `gate()` would have wanted `case StateHalfOpen() as s: s.probe_in_flight = True` — had to reconstruct via factory. |
+| R2-11 `dict[Newtype, V]` awkward | every app defaulted to `dict[int, V]` or `dict[str, V]` and wrapped at API boundary. |
+| R2-12 newtype-int arithmetic | hit hardest in 11-realtime-game-server (ELO math, ~25 wrap/unwrap pairs) and 15-stream-processor (watermark math). |
+| R2-13 `dict.setdefault(k, []).append(v)` | dodged proactively — the long form is now reflex. |
+| R2-17 `for k in d` re-declare outer `let k` | dodged proactively by naming loop vars uniquely from the start. |
+
+## What worked really well in Round 3
+
+- **`freeze let` policy/config constants** — every app's `config.ty`
+  reads like a spec. Deep-freeze semantics + module-level placement is
+  the killer pattern.
+- **`newtype` IDs caught real bugs** — `11-realtime-game-server` caught
+  two `ClientId`/`RouteId` swaps and a `RouteId`/`UpstreamId` swap
+  during construction; `13-vector-db` caught a `VectorId`/`CollectionId`
+  confusion.
+- **`gather:` blocks** — uniformly clean across all five apps,
+  including with `asyncio.to_thread(...)` and bound-method coroutines.
+- **`go expr() -> task`** for fire-and-forget worker spawns —
+  modulo R3-2's multi-line restriction, the strong-ref task registry
+  just works.
+- **PEP 695 generic classes + `impl[T]` blocks** — first-try clean
+  inside a single module across all four apps that needed them.
+- **`Result[T, E]` with `?` propagation when errors unify** — the cleanest
+  sequenced-error-handling pattern available. R2-6 only bites when error
+  types diverge.
+- **The R2-2 fix in 0.6.1** — quality-of-life improvement, removes the
+  ugliest of the workarounds.

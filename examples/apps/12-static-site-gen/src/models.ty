@@ -1,0 +1,321 @@
+from datetime import datetime
+
+from ids import PageId, SlugStr, TemplateName
+
+
+# ----- Frontmatter -----
+
+pub class FrontMatter:
+    title: str
+    date: datetime
+    tags: list[str]
+    layout: str
+    draft: bool
+    slug: str
+
+
+pub class FrontMatterError:
+    line: int
+    detail: str
+
+
+# ----- Markdown AST -----
+# Inline nodes.
+
+pub type Inline = InText | InEmph | InStrong | InCode | InLink | InImage | InBreak
+
+
+pub class InText:
+    text: str
+
+
+pub class InEmph:
+    children: list[Inline]
+
+
+pub class InStrong:
+    children: list[Inline]
+
+
+pub class InCode:
+    code: str
+
+
+pub class InLink:
+    href: str
+    children: list[Inline]
+
+
+pub class InImage:
+    src: str
+    alt: str
+
+
+pub class InBreak frozen:
+    pass
+
+
+# Inline factories — see TYPHON_FEEDBACK R1-#1.
+
+pub def make_in_text(text: str) -> Inline:
+    return InText(text=text)
+
+
+pub def make_in_emph(children: list[Inline]) -> Inline:
+    return InEmph(children=children)
+
+
+pub def make_in_strong(children: list[Inline]) -> Inline:
+    return InStrong(children=children)
+
+
+pub def make_in_code(code: str) -> Inline:
+    return InCode(code=code)
+
+
+pub def make_in_link(href: str, children: list[Inline]) -> Inline:
+    return InLink(href=href, children=children)
+
+
+pub def make_in_image(src: str, alt: str) -> Inline:
+    return InImage(src=src, alt=alt)
+
+
+pub def make_in_break() -> Inline:
+    return InBreak()
+
+
+# Block nodes.
+
+pub type Block = BkHeading | BkParagraph | BkList | BkCode | BkQuote | BkRule | BkHtml
+
+
+pub class BkHeading:
+    level: int
+    children: list[Inline]
+
+
+pub class BkParagraph:
+    children: list[Inline]
+
+
+pub class BkList:
+    ordered: bool
+    items: list[list[Inline]]
+
+
+pub class BkCode:
+    lang: str
+    code: str
+
+
+pub class BkQuote:
+    children: list[Inline]
+
+
+pub class BkRule frozen:
+    pass
+
+
+pub class BkHtml:
+    raw: str
+
+
+# Block factories.
+
+pub def make_bk_heading(level: int, children: list[Inline]) -> Block:
+    return BkHeading(level=level, children=children)
+
+
+pub def make_bk_paragraph(children: list[Inline]) -> Block:
+    return BkParagraph(children=children)
+
+
+pub def make_bk_list(ordered: bool, items: list[list[Inline]]) -> Block:
+    return BkList(ordered=ordered, items=items)
+
+
+pub def make_bk_code(lang: str, code: str) -> Block:
+    return BkCode(lang=lang, code=code)
+
+
+pub def make_bk_quote(children: list[Inline]) -> Block:
+    return BkQuote(children=children)
+
+
+pub def make_bk_rule() -> Block:
+    return BkRule()
+
+
+pub def make_bk_html(raw: str) -> Block:
+    return BkHtml(raw=raw)
+
+
+# ----- Document -----
+
+pub class Document:
+    id: PageId
+    source_path: str
+    front: FrontMatter
+    blocks: list[Block]
+    body_text: str
+
+
+pub class RenderedPage:
+    id: PageId
+    slug: SlugStr
+    layout: TemplateName
+    title: str
+    date: datetime
+    tags: list[str]
+    html: str
+    out_path: str
+
+
+# ----- Template AST -----
+
+pub type TplNode = TnText | TnExpr | TnIf | TnFor | TnBlock | TnExtends
+
+
+pub class TnText:
+    text: str
+
+
+pub class TnExpr:
+    name: str
+
+
+pub class TnIf:
+    cond: str
+    then_body: list[TplNode]
+    else_body: list[TplNode]
+
+
+pub class TnFor:
+    var_name: str
+    iter_name: str
+    body: list[TplNode]
+
+
+pub class TnBlock:
+    block_name: str
+    body: list[TplNode]
+
+
+pub class TnExtends:
+    parent: str
+
+
+# Template factories.
+
+pub def make_tn_text(text: str) -> TplNode:
+    return TnText(text=text)
+
+
+pub def make_tn_expr(name: str) -> TplNode:
+    return TnExpr(name=name)
+
+
+pub def make_tn_if(cond: str, then_body: list[TplNode], else_body: list[TplNode]) -> TplNode:
+    return TnIf(cond=cond, then_body=then_body, else_body=else_body)
+
+
+pub def make_tn_for(var_name: str, iter_name: str, body: list[TplNode]) -> TplNode:
+    return TnFor(var_name=var_name, iter_name=iter_name, body=body)
+
+
+pub def make_tn_block(block_name: str, body: list[TplNode]) -> TplNode:
+    return TnBlock(block_name=block_name, body=body)
+
+
+pub def make_tn_extends(parent: str) -> TplNode:
+    return TnExtends(parent=parent)
+
+
+pub class Template:
+    name: TemplateName
+    nodes: list[TplNode]
+
+
+# ----- Pipeline error envelope (heterogeneous) -----
+
+pub type StageError = SeRead | SeFront | SeMarkdown | SeTemplate | SeRender | SeWrite
+
+
+pub class SeRead:
+    path: str
+    detail: str
+
+
+pub class SeFront:
+    path: str
+    line: int
+    detail: str
+
+
+pub class SeMarkdown:
+    path: str
+    line: int
+    detail: str
+
+
+pub class SeTemplate:
+    name: str
+    line: int
+    detail: str
+
+
+pub class SeRender:
+    page: str
+    detail: str
+
+
+pub class SeWrite:
+    path: str
+    detail: str
+
+
+pub def make_se_read(path: str, detail: str) -> StageError:
+    return SeRead(path=path, detail=detail)
+
+
+pub def make_se_front(path: str, line: int, detail: str) -> StageError:
+    return SeFront(path=path, line=line, detail=detail)
+
+
+pub def make_se_markdown(path: str, line: int, detail: str) -> StageError:
+    return SeMarkdown(path=path, line=line, detail=detail)
+
+
+pub def make_se_template(name: str, line: int, detail: str) -> StageError:
+    return SeTemplate(name=name, line=line, detail=detail)
+
+
+pub def make_se_render(page: str, detail: str) -> StageError:
+    return SeRender(page=page, detail=detail)
+
+
+pub def make_se_write(path: str, detail: str) -> StageError:
+    return SeWrite(path=path, detail=detail)
+
+
+pub def stage_error_label(e: StageError) -> str:
+    match e:
+        case SeRead(_, _):       return "read"
+        case SeFront(_, _, _):   return "frontmatter"
+        case SeMarkdown(_, _, _): return "markdown"
+        case SeTemplate(_, _, _): return "template"
+        case SeRender(_, _):     return "render"
+        case SeWrite(_, _):      return "write"
+    raise RuntimeError("unreachable")
+
+
+pub def stage_error_detail(e: StageError) -> str:
+    match e:
+        case SeRead(p, d):       return f"{p}: {d}"
+        case SeFront(p, line, d): return f"{p}:{line}: {d}"
+        case SeMarkdown(p, line, d): return f"{p}:{line}: {d}"
+        case SeTemplate(n, line, d): return f"<{n}>:{line}: {d}"
+        case SeRender(pg, d):    return f"page {pg}: {d}"
+        case SeWrite(p, d):      return f"{p}: {d}"
+    raise RuntimeError("unreachable")

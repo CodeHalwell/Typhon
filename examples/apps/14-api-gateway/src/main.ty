@@ -1,0 +1,52 @@
+import asyncio
+import signal
+import sys
+
+import uvicorn
+from fastapi import FastAPI
+
+from config import GatewayConfig, load_config
+from server import build_app
+
+
+async def _serve(config: GatewayConfig, app: FastAPI) -> None:
+    let cfg: uvicorn.Config = uvicorn.Config(
+        app,
+        host=config.bind_host,
+        port=config.bind_port,
+        log_level="info",
+    )
+    let server: uvicorn.Server = uvicorn.Server(cfg)
+    await server.serve()
+
+
+async def _amain() -> None:
+    let config: GatewayConfig = load_config()
+    let app: FastAPI = build_app(config)
+    print(
+        f"typhon-api-gateway {config.build_version} "
+        f"listening on http://{config.bind_host}:{config.bind_port}"
+    )
+
+    try:
+        let loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGHUP, lambda: print("SIGHUP received — POST /_gateway/reload to reload routes"))
+    except NotImplementedError:
+        # Windows etc. — no SIGHUP. Reload is still available via HTTP.
+        pass
+    except RuntimeError:
+        pass
+
+    await _serve(config, app)
+
+
+def main() -> None:
+    try:
+        asyncio.run(_amain())
+    except KeyboardInterrupt:
+        pass
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,201 @@
+import asyncio
+
+from config import DEMO_HORIZON_MS, JobConfig, default_config
+from ids import JobId, OperatorId
+from models import AggregateRow, StockTick
+from runner import Runner, new_runner
+from sink import (
+    BufferSink,
+    Sink,
+    new_buffer_sink,
+    new_callback_sink,
+    new_print_sink,
+)
+from source import Source, new_generator_source
+from stream_op import (
+    Operator,
+    Stream,
+    extend_stream,
+    make_filter_op,
+    make_join_op,
+    make_key_by_op,
+    make_map_op,
+    make_reduce_op,
+    new_stream,
+)
+from topology import Topology, new_topology
+
+
+# Map function used in the demo: identity on payload (could be enriched).
+def _tick_identity(payload: object) -> object:
+    return payload
+
+
+# Filter: keep ticks priced above 9500 cents to demonstrate filtering.
+def _tick_above_floor(payload: object) -> bool:
+    if isinstance(payload, StockTick):
+        return payload.price_cents > 9500
+    return True
+
+
+# KeyBy: re-key by symbol (already keyed, but we exercise the operator).
+def _tick_key(payload: object) -> str:
+    if isinstance(payload, StockTick):
+        return payload.symbol
+    return "unknown"
+
+
+# Reducer: running max price.
+def _reduce_max_price(acc: object, x: object) -> object:
+    let acc_int: int = int(acc) if isinstance(acc, int) else 0
+    if isinstance(x, StockTick):
+        if x.price_cents > acc_int:
+            return x.price_cents
+        return acc_int
+    return acc_int
+
+
+# Join combiner: build a tuple of the two ticks' prices.
+def _self_join_combine(left: object, right: object) -> object:
+    let lp: int = left.price_cents if isinstance(left, StockTick) else 0
+    let rp: int = right.price_cents if isinstance(right, StockTick) else 0
+    return (lp, rp)
+
+
+# Build the moving-average demo topology end to end.
+pub def build_demo_topology(cfg: JobConfig) -> Topology:
+    let topo: Topology = new_topology(JobId("demo-mav"), "late-side")
+
+    let src: Source = new_generator_source(
+        OperatorId("src-stocks"),
+        ["AAPL", "MSFT", "GOOG", "AMZN"],
+        0,
+        50,
+        DEMO_HORIZON_MS if cfg.window_ms * 60 > DEMO_HORIZON_MS else cfg.window_ms * 60,
+        12345,
+    )
+    topo.add_source(src)
+
+    # Build the logical Stream[T] chain alongside the topology. The Stream is
+    # informational — it records the chain of operator ids that produced its
+    # values, which the topology describer prints.
+    mut stream: Stream[object] = new_stream(src.id)
+
+    let map_op: Operator[object, object] = make_map_op(
+        OperatorId("map-identity"), _tick_identity,
+    )
+    topo.add_operator(map_op, src.id)
+    stream = extend_stream(stream, map_op.id)
+
+    let flt_op: Operator[object, object] = make_filter_op(
+        OperatorId("filter-floor"), _tick_above_floor,
+    )
+    topo.add_operator(flt_op, map_op.id)
+    stream = extend_stream(stream, flt_op.id)
+
+    let key_op: Operator[object, object] = make_key_by_op(
+        OperatorId("key-symbol"), _tick_key,
+    )
+    topo.add_operator(key_op, flt_op.id)
+    stream = extend_stream(stream, key_op.id)
+    # Stream is now fully wired. Use it to annotate the printer below.
+    let _chain_len: int = len(stream.op_chain)
+
+    # A reduce operator (running max price). Wired into the topology to
+    # exercise the builder; not used in the runner's serial execution path.
+    let reduce_op: Operator[object, object] = make_reduce_op(
+        OperatorId("reduce-max"), 0, _reduce_max_price,
+    )
+    topo.add_operator(reduce_op, key_op.id)
+
+    # A windowed-join operator (self-join). Exercised purely as a builder
+    # call — the demo runs a single linear chain at execution time.
+    let join_op: Operator[object, object] = make_join_op(
+        OperatorId("join-self"), cfg.window_ms, _self_join_combine,
+    )
+    topo.add_join(join_op, reduce_op.id, key_op.id)
+
+    # The window-aggregate is handled directly by the Runner (it owns the
+    # keyed state and pane bookkeeping) — we don't need a stream_op node here.
+
+    let printer: Sink = new_print_sink(
+        OperatorId("sink-print"), "agg", "MAV",
+    )
+    topo.add_sink(printer, key_op.id)
+
+    return topo
+
+
+def _agg_row_callback(row: object) -> None:
+    if isinstance(row, AggregateRow):
+        if False:
+            print(f"  callback: key={row.key} avg={row.avg_value:.2f}")
+
+
+# Run the demo end to end. Returns the captured aggregate rows so the CLI can
+# print a summary.
+pub async def run_demo(cfg: JobConfig) -> list[AggregateRow]:
+    let topo: Topology = build_demo_topology(cfg)
+    let runner: Runner = new_runner(JobId("demo-mav"), topo, cfg)
+
+    # Build inter-operator queues. For this simplified demo the runner drives
+    # the chain serially via a single queue between source → window → sink,
+    # bypassing the map/filter/keyBy operators (which are still constructed
+    # and registered in the topology, exercising those builders).
+    let q_in: asyncio.Queue = asyncio.Queue(maxsize=cfg.queue_capacity)
+    let q_after_window: asyncio.Queue = asyncio.Queue(maxsize=cfg.queue_capacity)
+
+    let src: Source = topo.sources[0]
+    let print_sink: Sink = topo.sinks[0]
+
+    # Spawn coroutines for the source, window-aggregate, and sink. `gather:`
+    # awaits the source and window concurrently so envelopes can flow.
+    gather:
+        s_task = runner.run_source(src, q_in)
+        w_task = runner.run_window_aggregate(q_in, q_after_window)
+        sink_task = runner.run_sink(print_sink, q_after_window)
+
+    if cfg.print_events:
+        print("demo: " + runner.stats_summary())
+
+    return runner.captured()
+
+
+pub def default_demo_config() -> JobConfig:
+    return default_config()
+
+
+# A second small demo using a callback sink + buffer sink, exercising both
+# Sink builders.
+pub async def run_collecting_demo(cfg: JobConfig) -> tuple[list[object], int]:
+    let topo: Topology = build_demo_topology(cfg)
+    let buf_pair: tuple[Sink, BufferSink] = new_buffer_sink(
+        OperatorId("sink-buf"), "buf",
+    )
+    let buf_sink: Sink = buf_pair[0]
+    let buf_handle: BufferSink = buf_pair[1]
+    topo.add_sink(buf_sink, OperatorId("key-symbol"))
+
+    let cb_sink: Sink = new_callback_sink(
+        OperatorId("sink-cb"), "cb", _agg_row_callback,
+    )
+    topo.add_sink(cb_sink, OperatorId("key-symbol"))
+
+    let runner: Runner = new_runner(JobId("demo-collect"), topo, cfg)
+
+    let q_in: asyncio.Queue = asyncio.Queue(maxsize=cfg.queue_capacity)
+    let q_after_window: asyncio.Queue = asyncio.Queue(maxsize=cfg.queue_capacity)
+
+    let src: Source = topo.sources[0]
+
+    # Exercise both `go` (fire-and-forget with strong-ref registry) and an
+    # `await` of an explicit task handle. The source and window run as
+    # background tasks; the sink is awaited inline so we know when the demo
+    # finishes.
+    go runner.run_source(src, q_in) -> src_task
+    go runner.run_window_aggregate(q_in, q_after_window) -> win_task
+    await runner.run_sink(buf_sink, q_after_window)
+    await src_task
+    await win_task
+
+    return (buf_handle.items(), runner.stats.aggregate_rows)

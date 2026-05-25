@@ -1,0 +1,58 @@
+comptime let BUILD_VERSION: str = env("SSG_BUILD_VERSION", "0.1.0-dev")
+comptime let DEFAULT_SITE_URL: str = env("SSG_SITE_URL", "https://example.com")
+comptime let DEFAULT_SITE_TITLE: str = env("SSG_SITE_TITLE", "Typhon Site")
+
+
+pub class SiteConfig frozen:
+    site_url: str
+    site_title: str
+    site_description: str
+    author: str
+    content_dir: str
+    template_dir: str
+    asset_dir: str
+    output_dir: str
+    manifest_path: str
+    rss_count: int
+    incremental: bool
+
+
+freeze let HTML_ESCAPE_KEYS: tuple[str, ...] = ("&", "<", ">", "\"", "'")
+freeze let HTML_ESCAPE_VALS: tuple[str, ...] = ("&amp;", "&lt;", "&gt;", "&quot;", "&#39;")
+
+pub freeze let RSS_NS: str = "http://www.w3.org/2005/Atom"
+pub freeze let MAX_INCREMENTAL_CACHE_SIZE: int = 10000
+
+
+pub def html_escape(text: str) -> str:
+    mut out: str = text
+    mut i: int = 0
+    let n: int = len(HTML_ESCAPE_KEYS)
+    while i < n:
+        out = out.replace(HTML_ESCAPE_KEYS[i], HTML_ESCAPE_VALS[i])
+        i = i + 1
+    return out
+
+
+pub def attr_escape(text: str) -> str:
+    return html_escape(text)
+
+
+pub def default_config() -> SiteConfig:
+    return SiteConfig(
+        site_url=DEFAULT_SITE_URL,
+        site_title=DEFAULT_SITE_TITLE,
+        site_description="A static site rendered with Typhon",
+        author="Typhon Authors",
+        content_dir="content",
+        template_dir="templates",
+        asset_dir="assets",
+        output_dir="public",
+        manifest_path=".ssg-manifest.sqlite",
+        rss_count=20,
+        incremental=True,
+    )
+
+
+pub def build_version() -> str:
+    return BUILD_VERSION

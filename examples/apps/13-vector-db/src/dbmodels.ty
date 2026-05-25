@@ -1,0 +1,59 @@
+pub model CreateCollectionRequest:
+    name: str
+    dim: int
+    metric: str
+
+
+pub model CreateCollectionResponse:
+    name: str
+    dim: int
+    metric: str
+
+
+pub model UpsertRequest:
+    id: int
+    vector: list[float]
+    metadata: dict[str, object]
+
+
+pub model UpsertResponse:
+    id: int
+    inserted: bool
+
+
+pub model SearchRequest:
+    vector: list[float]
+    k: int
+    filter: str?
+
+
+pub model SearchHit:
+    id: int
+    distance: float
+    metadata: dict[str, object]
+
+
+pub model SearchResponse:
+    hits: list[SearchHit]
+
+
+pub model GetResponse:
+    id: int
+    vector: list[float]
+    metadata: dict[str, object]
+
+
+pub model DeleteResponse:
+    id: int
+    deleted: bool
+
+
+pub model SnapshotResponse:
+    seq: int
+    path: str
+    vector_count: int
+
+
+pub model ErrorResponse:
+    code: str
+    detail: str

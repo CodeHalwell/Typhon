@@ -1,0 +1,139 @@
+from ids import TemplateName
+from models import (
+    Template,
+    TplNode,
+    make_tn_block,
+    make_tn_expr,
+    make_tn_extends,
+    make_tn_for,
+    make_tn_if,
+    make_tn_text,
+)
+from tpl_lex import TplTok, TtExpr, TtTag, TtText, lex_template
+
+
+pub class TplParseError:
+    line: int
+    detail: str
+
+
+pub class TplParser:
+    toks: list[TplTok]
+    pos: int
+
+
+def _unquote_tpl(s: str) -> str:
+    let t: str = s.strip()
+    let n: int = len(t)
+    if n >= 2 and ((t[0] == "\"" and t[n - 1] == "\"") or (t[0] == "'" and t[n - 1] == "'")):
+        return t[1:n - 1]
+    return t
+
+
+impl TplParser:
+    def peek(self) -> TplTok?:
+        if self.pos >= len(self.toks):
+            return None
+        return self.toks[self.pos]
+
+    def advance(self) -> TplTok?:
+        let t: TplTok? = self.peek()
+        if t is not None:
+            self.pos = self.pos + 1
+        return t
+
+
+def _tag_kind(body: str) -> str:
+    let trimmed: str = body.strip()
+    let space: int = trimmed.find(" ")
+    if space < 0:
+        return trimmed
+    return trimmed[0:space]
+
+
+def _tag_args(body: str) -> str:
+    let trimmed: str = body.strip()
+    let space: int = trimmed.find(" ")
+    if space < 0:
+        return ""
+    return trimmed[space + 1:len(trimmed)].strip()
+
+
+# Parse a node-list until one of the terminators occurs as a tag kind.
+def _parse_nodes(parser: TplParser, terminators: list[str]) -> Result[tuple[list[TplNode], str], TplParseError]:
+    mut nodes: list[TplNode] = []
+    while True:
+        let tok: TplTok? = parser.peek()
+        if tok is None:
+            return Ok((nodes, ""))
+        match tok:
+            case TtText(text, _):
+                parser.advance()
+                nodes.append(make_tn_text(text))
+            case TtExpr(body, _):
+                parser.advance()
+                nodes.append(make_tn_expr(body))
+            case TtTag(body, line):
+                let kind: str = _tag_kind(body)
+                for term in terminators:
+                    if kind == term:
+                        parser.advance()
+                        return Ok((nodes, kind))
+                if kind == "if":
+                    parser.advance()
+                    let cond: str = _tag_args(body)
+                    match _parse_nodes(parser, ["else", "endif"]):
+                        case Err(e):
+                            return Err(e)
+                        case Ok(pair_then):
+                            let then_body: list[TplNode] = pair_then[0]
+                            let term_then: str = pair_then[1]
+                            mut else_body: list[TplNode] = []
+                            if term_then == "else":
+                                match _parse_nodes(parser, ["endif"]):
+                                    case Err(e2):
+                                        return Err(e2)
+                                    case Ok(pair_else):
+                                        else_body = pair_else[0]
+                            elif term_then != "endif":
+                                return Err(TplParseError(line=line, detail="unterminated {% if %}"))
+                            nodes.append(make_tn_if(cond, then_body, else_body))
+                elif kind == "for":
+                    parser.advance()
+                    let args: str = _tag_args(body)
+                    let in_idx: int = args.find(" in ")
+                    if in_idx < 0:
+                        return Err(TplParseError(line=line, detail=f"expected 'x in xs', got {args!r}"))
+                    let var_name: str = args[0:in_idx].strip()
+                    let iter_name: str = args[in_idx + 4:len(args)].strip()
+                    match _parse_nodes(parser, ["endfor"]):
+                        case Err(e3):
+                            return Err(e3)
+                        case Ok(pair_for):
+                            nodes.append(make_tn_for(var_name, iter_name, pair_for[0]))
+                elif kind == "block":
+                    parser.advance()
+                    let block_name: str = _tag_args(body)
+                    match _parse_nodes(parser, ["endblock"]):
+                        case Err(e4):
+                            return Err(e4)
+                        case Ok(pair_blk):
+                            nodes.append(make_tn_block(block_name, pair_blk[0]))
+                elif kind == "extends":
+                    parser.advance()
+                    let parent: str = _unquote_tpl(_tag_args(body))
+                    nodes.append(make_tn_extends(parent))
+                else:
+                    return Err(TplParseError(line=line, detail=f"unknown tag {kind!r}"))
+    raise RuntimeError("unreachable")
+
+
+pub def parse_template(name: TemplateName, source: str) -> Result[Template, TplParseError]:
+    let toks: list[TplTok] = lex_template(source)
+    let parser: TplParser = TplParser(toks=toks, pos=0)
+    match _parse_nodes(parser, []):
+        case Err(e):
+            return Err(e)
+        case Ok(pair):
+            return Ok(Template(name=name, nodes=pair[0]))
+    raise RuntimeError("unreachable")

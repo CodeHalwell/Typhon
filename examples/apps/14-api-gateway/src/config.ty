@@ -1,0 +1,90 @@
+import os
+
+
+comptime let BUILD_VERSION: str = env("BUILD_VERSION", "0.1.0-dev")
+comptime let DEFAULT_PORT: int = 8080
+comptime let DEFAULT_ROUTES_PATH: str = "/tmp/typhon-gateway-routes.json"
+
+
+pub class RetryPolicy frozen:
+    max_attempts: int
+    base_delay_ms: int
+    max_delay_ms: int
+    jitter_ratio: float
+
+
+pub class BreakerPolicy frozen:
+    failure_threshold: int
+    success_threshold: int
+    cooldown_ms: int
+
+
+pub class RateLimitPolicy frozen:
+    capacity: int
+    refill_per_second: float
+
+
+pub class HealthPolicy frozen:
+    interval_seconds: float
+    timeout_seconds: float
+    healthy_threshold: int
+    unhealthy_threshold: int
+
+
+pub class GatewayConfig frozen:
+    bind_host: str
+    bind_port: int
+    routes_path: str
+    upstream_timeout_seconds: float
+    retry: RetryPolicy
+    breaker: BreakerPolicy
+    rate_limit: RateLimitPolicy
+    health: HealthPolicy
+    build_version: str
+
+
+freeze let DEFAULT_RETRY: RetryPolicy = RetryPolicy(
+    max_attempts=3,
+    base_delay_ms=50,
+    max_delay_ms=2000,
+    jitter_ratio=0.2,
+)
+
+
+freeze let DEFAULT_BREAKER: BreakerPolicy = BreakerPolicy(
+    failure_threshold=5,
+    success_threshold=2,
+    cooldown_ms=10_000,
+)
+
+
+freeze let DEFAULT_RATE_LIMIT: RateLimitPolicy = RateLimitPolicy(
+    capacity=100,
+    refill_per_second=20.0,
+)
+
+
+freeze let DEFAULT_HEALTH: HealthPolicy = HealthPolicy(
+    interval_seconds=5.0,
+    timeout_seconds=2.0,
+    healthy_threshold=2,
+    unhealthy_threshold=3,
+)
+
+
+pub def load_config() -> GatewayConfig:
+    let port_raw: str = os.environ.get("GW_PORT", str(DEFAULT_PORT))
+    let host_raw: str = os.environ.get("GW_HOST", "127.0.0.1")
+    let routes_raw: str = os.environ.get("GW_ROUTES", DEFAULT_ROUTES_PATH)
+    let upstream_timeout_raw: str = os.environ.get("GW_UPSTREAM_TIMEOUT", "5.0")
+    return GatewayConfig(
+        bind_host=host_raw,
+        bind_port=int(port_raw),
+        routes_path=routes_raw,
+        upstream_timeout_seconds=float(upstream_timeout_raw),
+        retry=DEFAULT_RETRY,
+        breaker=DEFAULT_BREAKER,
+        rate_limit=DEFAULT_RATE_LIMIT,
+        health=DEFAULT_HEALTH,
+        build_version=BUILD_VERSION,
+    )

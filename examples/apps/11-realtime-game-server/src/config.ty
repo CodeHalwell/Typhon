@@ -1,0 +1,45 @@
+import os
+
+
+# Game-version is build-time via comptime, so it's bakeable from CI envs.
+comptime let GAME_VERSION: str = env("GAME_VERSION", "0.1.0-dev")
+comptime let BUILD_TAG: str = env("BUILD_TAG", "dev")
+comptime let DEFAULT_HTTP_PORT: int = 8000
+comptime let DEFAULT_DB_PATH: str = "/tmp/typhon-game.db"
+
+# Tick rate: 30 Hz simulation -> a fixed interval is the right shape for `freeze let`.
+pub freeze let TICK_HZ: int = 30
+pub freeze let TICK_INTERVAL_SECONDS: float = 1.0 / 30.0
+pub freeze let ELO_K_FACTOR: float = 24.0
+pub freeze let MAX_ROOM_PLAYERS: int = 8
+pub freeze let MIN_DUEL_PLAYERS: int = 2
+pub freeze let MIN_BR_PLAYERS: int = 3
+pub freeze let ROOM_IDLE_TIMEOUT_SECONDS: float = 60.0
+pub freeze let MATCH_MAX_TICKS: int = 600
+pub freeze let MATCHMAKE_INTERVAL_SECONDS: float = 1.0
+pub freeze let RATING_DEFAULT: int = 1000
+pub freeze let RATING_FLOOR: int = 100
+pub freeze let RATING_CEILING: int = 4000
+pub freeze let SESSION_TTL_SECONDS: float = 3600.0
+
+
+pub class ServerConfig frozen:
+    http_port: int
+    db_path: str
+    duel_max_players: int
+    br_max_players: int
+
+
+pub def load_config() -> ServerConfig:
+    let port_raw: str = os.environ.get("GAME_PORT", str(DEFAULT_HTTP_PORT))
+    let db_raw: str = os.environ.get("GAME_DB", DEFAULT_DB_PATH)
+    return ServerConfig(
+        http_port=int(port_raw),
+        db_path=db_raw,
+        duel_max_players=2,
+        br_max_players=MAX_ROOM_PLAYERS,
+    )
+
+
+pub def game_version() -> str:
+    return f"{GAME_VERSION}+{BUILD_TAG}"

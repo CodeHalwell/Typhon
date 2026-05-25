@@ -1,0 +1,207 @@
+from typing import Callable
+
+import random
+
+from config import MIN_BR_PLAYERS, MIN_DUEL_PLAYERS
+from ids import PlayerId
+
+
+# An in-progress per-room match state mirror. The mode strategies advance
+# this every tick.
+pub class MatchSnapshot:
+    tick: int
+    alive: dict[int, int]   # player_id -> hp
+    eliminated: list[PlayerId]
+    finished: bool
+    winner: PlayerId?
+
+
+pub def new_snapshot(players: list[PlayerId]) -> MatchSnapshot:
+    mut alive: dict[int, int] = {}
+    for p in players:
+        alive[int(p)] = 100
+    return MatchSnapshot(
+        tick=0,
+        alive=alive,
+        eliminated=[],
+        finished=False,
+        winner=None,
+    )
+
+
+# A `Mode` is a concrete struct holding callbacks rather than an interface,
+# because cross-module interface conformance is unreliable today (R1-2).
+pub class Mode:
+    name: str
+    min_players: int
+    max_players: int
+    init: Callable[[list[PlayerId]], MatchSnapshot]
+    advance: Callable[[MatchSnapshot, int], MatchSnapshot]
+    placements: Callable[[MatchSnapshot], list[tuple[PlayerId, int]]]
+
+
+# Snapshot mutator helpers - shared by both mode tick functions.
+def _eliminate(snap: MatchSnapshot, victim: PlayerId) -> None:
+    let key: int = int(victim)
+    if key in snap.alive:
+        del snap.alive[key]
+        snap.eliminated.append(victim)
+
+
+def _alive_ids(snap: MatchSnapshot) -> list[PlayerId]:
+    mut out: list[PlayerId] = []
+    for raw in snap.alive:
+        out.append(PlayerId(raw))
+    return out
+
+
+# ---- Duel mode -------------------------------------------------------------
+
+def _duel_init(players: list[PlayerId]) -> MatchSnapshot:
+    return new_snapshot(players)
+
+
+def _duel_advance(snap: MatchSnapshot, tick_seed: int) -> MatchSnapshot:
+    snap.tick = snap.tick + 1
+    let alive_ids: list[PlayerId] = _alive_ids(snap)
+    if len(alive_ids) <= 1:
+        snap.finished = True
+        snap.winner = alive_ids[0] if len(alive_ids) == 1 else None
+        return snap
+    # Both duellists trade damage every tick. Use the tick_seed as deterministic
+    # randomness to avoid wall-time non-determinism inside the loop.
+    let rng: random.Random = random.Random(tick_seed)
+    mut updated: dict[int, int] = {}
+    for (raw, hp) in snap.alive.items():
+        let dmg: int = rng.randint(5, 15)
+        let new_hp: int = hp - dmg
+        if new_hp <= 0:
+            updated[raw] = 0
+        else:
+            updated[raw] = new_hp
+    mut survivors: list[int] = []
+    for (raw, hp) in updated.items():
+        if hp > 0:
+            survivors.append(raw)
+        else:
+            _eliminate(snap, PlayerId(raw))
+    for raw in survivors:
+        snap.alive[raw] = updated[raw]
+    let still: list[PlayerId] = _alive_ids(snap)
+    if len(still) <= 1:
+        snap.finished = True
+        snap.winner = still[0] if len(still) == 1 else None
+    return snap
+
+
+def _duel_placements(snap: MatchSnapshot) -> list[tuple[PlayerId, int]]:
+    mut out: list[tuple[PlayerId, int]] = []
+    if snap.winner is not None:
+        out.append((snap.winner, 1))
+        for p in snap.eliminated:
+            out.append((p, 2))
+        return out
+    # No winner -> everyone is rank 1 (a draw); fall back to elimination order.
+    mut rank: int = 1
+    for p in snap.eliminated:
+        out.append((p, rank))
+        rank = rank + 1
+    return out
+
+
+pub def duel_mode() -> Mode:
+    return Mode(
+        name="duel",
+        min_players=MIN_DUEL_PLAYERS,
+        max_players=2,
+        init=_duel_init,
+        advance=_duel_advance,
+        placements=_duel_placements,
+    )
+
+
+# ---- Battle royale mode ----------------------------------------------------
+
+def _br_init(players: list[PlayerId]) -> MatchSnapshot:
+    return new_snapshot(players)
+
+
+def _br_advance(snap: MatchSnapshot, tick_seed: int) -> MatchSnapshot:
+    snap.tick = snap.tick + 1
+    let alive_now: list[PlayerId] = _alive_ids(snap)
+    if len(alive_now) <= 1:
+        snap.finished = True
+        snap.winner = alive_now[0] if len(alive_now) == 1 else None
+        return snap
+    let rng: random.Random = random.Random(tick_seed)
+    # In a battle royale, a "storm" plus PvP — apply storm damage to all,
+    # and roll random duels between pairs.
+    mut updated: dict[int, int] = {}
+    let storm_dmg: int = 1 + (snap.tick // 30)
+    for (raw, hp) in snap.alive.items():
+        updated[raw] = hp - storm_dmg
+    # PvP: shuffle alive ids and pair them.
+    mut order: list[int] = []
+    for raw in snap.alive:
+        order.append(raw)
+    rng.shuffle(order)
+    mut i: int = 0
+    while i + 1 < len(order):
+        let a_raw: int = order[i]
+        let b_raw: int = order[i + 1]
+        let damage_a: int = rng.randint(0, 12)
+        let damage_b: int = rng.randint(0, 12)
+        updated[a_raw] = updated[a_raw] - damage_b
+        updated[b_raw] = updated[b_raw] - damage_a
+        i = i + 2
+    # Apply updates.
+    mut survivors: list[int] = []
+    for (raw, hp) in updated.items():
+        if hp <= 0:
+            _eliminate(snap, PlayerId(raw))
+        else:
+            survivors.append(raw)
+    for raw in survivors:
+        snap.alive[raw] = updated[raw]
+    let still: list[PlayerId] = _alive_ids(snap)
+    if len(still) <= 1:
+        snap.finished = True
+        snap.winner = still[0] if len(still) == 1 else None
+    return snap
+
+
+def _br_placements(snap: MatchSnapshot) -> list[tuple[PlayerId, int]]:
+    mut out: list[tuple[PlayerId, int]] = []
+    if snap.winner is not None:
+        out.append((snap.winner, 1))
+    # The last-eliminated finished higher than the first-eliminated.
+    let elim_count: int = len(snap.eliminated)
+    mut idx: int = elim_count - 1
+    mut rank: int = 2 if snap.winner is not None else 1
+    while idx >= 0:
+        out.append((snap.eliminated[idx], rank))
+        rank = rank + 1
+        idx = idx - 1
+    return out
+
+
+pub def battle_royale_mode() -> Mode:
+    return Mode(
+        name="battle_royale",
+        min_players=MIN_BR_PLAYERS,
+        max_players=8,
+        init=_br_init,
+        advance=_br_advance,
+        placements=_br_placements,
+    )
+
+
+pub def all_modes() -> list[Mode]:
+    return [duel_mode(), battle_royale_mode()]
+
+
+pub def find_mode(modes: list[Mode], name: str) -> Mode?:
+    for m in modes:
+        if m.name == name:
+            return m
+    return None

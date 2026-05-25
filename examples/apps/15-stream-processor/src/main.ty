@@ -1,0 +1,12 @@
+import sys
+
+from cli import dispatch
+
+
+def main() -> None:
+    let code: int = dispatch(sys.argv)
+    sys.exit(code)
+
+
+if __name__ == "__main__":
+    main()

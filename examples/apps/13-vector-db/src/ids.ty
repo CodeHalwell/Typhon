@@ -1,0 +1,4 @@
+pub newtype VectorId = int
+pub newtype CollectionId = int
+pub newtype Dim = int
+pub newtype SnapshotSeq = int

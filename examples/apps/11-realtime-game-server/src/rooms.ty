@@ -1,0 +1,381 @@
+import asyncio
+from datetime import datetime, timezone
+
+from buffer import RingBuffer, new_ring
+from config import (
+    MATCH_MAX_TICKS,
+    MAX_ROOM_PLAYERS,
+    ROOM_IDLE_TIMEOUT_SECONDS,
+    TICK_INTERVAL_SECONDS,
+)
+from elo import RatingChange, update_free_for_all
+from events import (
+    GameEvent,
+    make_match_ended,
+    make_match_started,
+    make_match_tick,
+    make_player_joined,
+    make_player_left,
+    make_rating_updated,
+    make_room_closed,
+)
+from ids import MatchId, PlayerId, Rating, RoomId
+from modes import MatchSnapshot, Mode
+
+
+# Room lifecycle modelled as a sealed union (closed state machine).
+pub type RoomState = Waiting | Playing | Resolving | Closed
+
+
+pub class Waiting:
+    opened_at: datetime
+    last_join_at: datetime
+
+
+pub class Playing:
+    match_id: MatchId
+    started_at: datetime
+    snapshot: MatchSnapshot
+
+
+pub class Resolving:
+    match_id: MatchId
+    final_snapshot: MatchSnapshot
+    ended_at: datetime
+
+
+pub class Closed:
+    closed_at: datetime
+    reason: str
+
+
+pub def make_waiting(opened_at: datetime) -> RoomState:
+    return Waiting(opened_at=opened_at, last_join_at=opened_at)
+
+
+pub def make_playing(
+    match_id: MatchId, started_at: datetime, snapshot: MatchSnapshot
+) -> RoomState:
+    return Playing(match_id=match_id, started_at=started_at, snapshot=snapshot)
+
+
+pub def make_resolving(
+    match_id: MatchId, final_snapshot: MatchSnapshot, ended_at: datetime
+) -> RoomState:
+    return Resolving(
+        match_id=match_id, final_snapshot=final_snapshot, ended_at=ended_at,
+    )
+
+
+pub def make_closed(closed_at: datetime, reason: str) -> RoomState:
+    return Closed(closed_at=closed_at, reason=reason)
+
+
+pub def room_state_label(s: RoomState) -> str:
+    match s:
+        case Waiting(_, _):     return "waiting"
+        case Playing(_, _, _):  return "playing"
+        case Resolving(_, _, _): return "resolving"
+        case Closed(_, _):      return "closed"
+    raise RuntimeError("unreachable")
+
+
+pub type RoomError = RoomFull | RoomNotOpen | RoomGone | DuplicatePlayer
+
+
+pub class RoomFull:
+    room: RoomId
+    capacity: int
+
+
+pub class RoomNotOpen:
+    room: RoomId
+    label: str
+
+
+pub class RoomGone:
+    room: RoomId
+
+
+pub class DuplicatePlayer:
+    room: RoomId
+    player: PlayerId
+
+
+pub def make_room_full(room: RoomId, capacity: int) -> RoomError:
+    return RoomFull(room=room, capacity=capacity)
+
+
+pub def make_room_not_open(room: RoomId, label: str) -> RoomError:
+    return RoomNotOpen(room=room, label=label)
+
+
+pub def make_room_gone(room: RoomId) -> RoomError:
+    return RoomGone(room=room)
+
+
+pub def make_duplicate_player(room: RoomId, player: PlayerId) -> RoomError:
+    return DuplicatePlayer(room=room, player=player)
+
+
+# A subscriber drain queue — broadcasts emit to all subscribers' queues.
+pub class RoomSubscriber:
+    player: PlayerId?
+    queue: asyncio.Queue[GameEvent]
+
+
+# Per-room ratings snapshot the room takes when starting a match.
+pub class StartingRatings:
+    by_player: dict[int, Rating]
+
+
+# Carrier for the finalise queue so the lobby can persist match results
+# in a typed way (avoids passing tuples with `object` slots).
+pub class FinalisedMatch:
+    room: RoomId
+    match_id: MatchId
+    snapshot: MatchSnapshot
+    ratings: StartingRatings
+
+
+pub class Room:
+    id: RoomId
+    mode: Mode
+    state: RoomState
+    players: list[PlayerId]
+    starting_ratings: StartingRatings
+    subscribers: list[RoomSubscriber]
+    history: RingBuffer[GameEvent]
+    next_match_id: int
+
+
+pub def new_room(rid: RoomId, mode: Mode) -> Room:
+    let now: datetime = datetime.now(timezone.utc)
+    return Room(
+        id=rid,
+        mode=mode,
+        state=make_waiting(now),
+        players=[],
+        starting_ratings=StartingRatings(by_player={}),
+        subscribers=[],
+        history=new_ring(64),
+        next_match_id=1,
+    )
+
+
+impl Room:
+    def capacity(self) -> int:
+        let cap: int = self.mode.max_players
+        return cap if cap < MAX_ROOM_PLAYERS else MAX_ROOM_PLAYERS
+
+    def can_join(self) -> bool:
+        match self.state:
+            case Waiting(_, _):     return True
+            case Playing(_, _, _):  return False
+            case Resolving(_, _, _): return False
+            case Closed(_, _):      return False
+        raise RuntimeError("unreachable")
+
+    def add_player(self, player: PlayerId) -> Result[None, RoomError]:
+        if not self.can_join():
+            return Err(make_room_not_open(self.id, room_state_label(self.state)))
+        let pid_key: int = int(player)
+        for existing in self.players:
+            if int(existing) == pid_key:
+                return Err(make_duplicate_player(self.id, player))
+        if len(self.players) >= self.capacity():
+            return Err(make_room_full(self.id, self.capacity()))
+        self.players.append(player)
+        let now: datetime = datetime.now(timezone.utc)
+        match self.state:
+            case Waiting(opened, _):
+                self.state = Waiting(opened_at=opened, last_join_at=now)
+            case Playing(_, _, _): pass
+            case Resolving(_, _, _): pass
+            case Closed(_, _): pass
+        let ev: GameEvent = make_player_joined(self.id, player, now)
+        self.broadcast(ev)
+        return Ok(None)
+
+    def remove_player(self, player: PlayerId, reason: str) -> None:
+        let pid_key: int = int(player)
+        mut filtered: list[PlayerId] = []
+        mut found: bool = False
+        for existing in self.players:
+            if int(existing) == pid_key:
+                found = True
+            else:
+                filtered.append(existing)
+        if not found:
+            return
+        self.players = filtered
+        let now: datetime = datetime.now(timezone.utc)
+        let ev: GameEvent = make_player_left(self.id, player, reason, now)
+        self.broadcast(ev)
+
+    def subscribe(self, player: PlayerId?) -> RoomSubscriber:
+        let sub: RoomSubscriber = RoomSubscriber(
+            player=player, queue=asyncio.Queue(),
+        )
+        self.subscribers.append(sub)
+        return sub
+
+    def unsubscribe(self, sub: RoomSubscriber) -> None:
+        mut kept: list[RoomSubscriber] = []
+        for s in self.subscribers:
+            if s is not sub:
+                kept.append(s)
+        self.subscribers = kept
+
+    def broadcast(self, ev: GameEvent) -> None:
+        self.history.push(ev)
+        for sub in self.subscribers:
+            sub.queue.put_nowait(ev)
+
+    def is_terminal(self) -> bool:
+        match self.state:
+            case Waiting(_, _):     return False
+            case Playing(_, _, _):  return False
+            case Resolving(_, _, _): return False
+            case Closed(_, _):      return True
+        raise RuntimeError("unreachable")
+
+    def begin_match(self, current_ratings: dict[int, Rating]) -> Result[MatchId, RoomError]:
+        if not self.can_join():
+            return Err(make_room_not_open(self.id, room_state_label(self.state)))
+        if len(self.players) < self.mode.min_players:
+            return Err(make_room_not_open(self.id, "not_enough_players"))
+        let mid: MatchId = MatchId(self.next_match_id)
+        self.next_match_id = self.next_match_id + 1
+        let snap: MatchSnapshot = (self.mode.init)(self.players)
+        let now: datetime = datetime.now(timezone.utc)
+        # Snapshot the players' starting ratings for the post-match Elo update.
+        mut ratings_snap: dict[int, Rating] = {}
+        for p in self.players:
+            let key: int = int(p)
+            if key in current_ratings:
+                ratings_snap[key] = current_ratings[key]
+        self.starting_ratings = StartingRatings(by_player=ratings_snap)
+        self.state = make_playing(mid, now, snap)
+        self.broadcast(make_match_started(
+            mid, self.id, self.mode.name, len(self.players), now,
+        ))
+        return Ok(mid)
+
+    def advance_tick(self) -> None:
+        match self.state:
+            case Playing(mid, started, snap):
+                let tick_seed: int = (int(mid) * 1009) + snap.tick + 1
+                let next_snap: MatchSnapshot = (self.mode.advance)(snap, tick_seed)
+                let now: datetime = datetime.now(timezone.utc)
+                self.broadcast(make_match_tick(
+                    mid, self.id, next_snap.tick, len(next_snap.alive), now,
+                ))
+                if next_snap.finished or next_snap.tick >= MATCH_MAX_TICKS:
+                    # Promote to resolving — actual rating update is applied by
+                    # the room runner so it can hit the profile store.
+                    self.state = make_resolving(mid, next_snap, now)
+                    return
+                self.state = make_playing(mid, started, next_snap)
+            case Waiting(_, _): pass
+            case Resolving(_, _, _): pass
+            case Closed(_, _): pass
+
+    def finalise_match(
+        self, rating_updates: list[RatingChange]
+    ) -> tuple[MatchId, MatchSnapshot]?:
+        match self.state:
+            case Resolving(mid, snap, ended):
+                let duration: int = snap.tick
+                self.broadcast(make_match_ended(
+                    mid, self.id, snap.winner, duration, ended,
+                ))
+                for ru in rating_updates:
+                    self.broadcast(make_rating_updated(
+                        mid, ru.player, ru.before, ru.after, ended,
+                    ))
+                # Reset to Waiting so the room can host another match.
+                let now: datetime = datetime.now(timezone.utc)
+                self.state = make_waiting(now)
+                # Players stay in the room — they can opt out via leave.
+                return (mid, snap)
+            case Waiting(_, _):     return None
+            case Playing(_, _, _):  return None
+            case Closed(_, _):      return None
+        raise RuntimeError("unreachable")
+
+    def close(self, reason: str) -> None:
+        let now: datetime = datetime.now(timezone.utc)
+        let final_match: MatchId? = self._current_match_id()
+        self.state = make_closed(now, reason)
+        self.broadcast(make_room_closed(self.id, final_match, now))
+
+    def _current_match_id(self) -> MatchId?:
+        match self.state:
+            case Playing(mid, _, _):     return mid
+            case Resolving(mid, _, _):   return mid
+            case Waiting(_, _):          return None
+            case Closed(_, _):           return None
+        raise RuntimeError("unreachable")
+
+    def idle_for_seconds(self, now: datetime) -> float:
+        match self.state:
+            case Waiting(_, last_join):
+                let delta = now - last_join
+                return delta.total_seconds()
+            case Playing(_, _, _):  return 0.0
+            case Resolving(_, _, _): return 0.0
+            case Closed(_, _):      return 0.0
+        raise RuntimeError("unreachable")
+
+
+# The per-room tick loop runner. Kept here as a free function so callers can
+# `go room_tick_loop(...)` from anywhere with the right collaborators.
+pub async def room_tick_loop(
+    room: Room,
+    ratings_lookup: dict[int, Rating],
+    on_finalise: "asyncio.Queue[FinalisedMatch]",
+    shutdown: asyncio.Event,
+) -> None:
+    while not shutdown.is_set():
+        if room.is_terminal():
+            return
+        # Drive the simulation.
+        match room.state:
+            case Playing(_, _, _):
+                room.advance_tick()
+            case Resolving(mid_r, snap_r, _):
+                let placements: list[tuple[PlayerId, int]] = (room.mode.placements)(snap_r)
+                mut ranked: list[tuple[PlayerId, Rating, int]] = []
+                for entry in placements:
+                    let pid: PlayerId = entry[0]
+                    let rank: int = entry[1]
+                    let key: int = int(pid)
+                    mut cur: Rating = Rating(1000)
+                    if key in room.starting_ratings.by_player:
+                        cur = room.starting_ratings.by_player[key]
+                    elif key in ratings_lookup:
+                        cur = ratings_lookup[key]
+                    ranked.append((pid, cur, rank))
+                let changes: list[RatingChange] = update_free_for_all(ranked)
+                room.finalise_match(changes)
+                let parcel: FinalisedMatch = FinalisedMatch(
+                    room=room.id,
+                    match_id=mid_r,
+                    snapshot=snap_r,
+                    ratings=room.starting_ratings,
+                )
+                await on_finalise.put(parcel)
+            case Waiting(_, _):
+                let now: datetime = datetime.now(timezone.utc)
+                if room.idle_for_seconds(now) > ROOM_IDLE_TIMEOUT_SECONDS:
+                    room.close("idle_timeout")
+                    return
+            case Closed(_, _):
+                return
+        try:
+            await asyncio.wait_for(
+                shutdown.wait(), timeout=TICK_INTERVAL_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            pass

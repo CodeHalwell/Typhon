@@ -1,0 +1,121 @@
+import json
+
+from balancer import (
+    BalanceStrategy,
+    make_least_conn,
+    make_random_strategy,
+    make_round_robin,
+    make_weighted,
+    new_balancer,
+    Balancer,
+)
+from ids import RouteId, UpstreamId
+from routes import Route, RouteTable, new_route
+from upstream import Upstream, new_upstream
+from wire import RoutesFile, UpstreamSpec
+
+
+# ---------------------------------------------------------------------------
+# Read `routes.json` from disk, validate via the pydantic wire model, then
+# produce a `RouteTable` plus a (route_id → balancer) map.
+# ---------------------------------------------------------------------------
+
+
+pub class LoadError:
+    path: str
+    reason: str
+
+
+pub def err_load(path: str, reason: str) -> LoadError:
+    return LoadError(path=path, reason=reason)
+
+
+def _strategy_for(name: str) -> BalanceStrategy:
+    let lower: str = name.lower()
+    if lower == "round_robin":
+        return make_round_robin()
+    if lower == "least_conn":
+        return make_least_conn()
+    if lower == "random":
+        return make_random_strategy()
+    if lower == "weighted":
+        return make_weighted()
+    return make_round_robin()
+
+
+def _upstreams_for(specs: list[UpstreamSpec]) -> list[Upstream]:
+    mut out: list[Upstream] = []
+    for spec in specs:
+        out.append(new_upstream(UpstreamId(spec.id), spec.base_url, spec.weight))
+    return out
+
+
+pub def parse_routes_text(raw_path: str, raw_text: str) -> Result[RoutesFile, LoadError]:
+    try:
+        let parsed: object = json.loads(raw_text)
+    except json.JSONDecodeError as e:
+        return Err(err_load(raw_path, f"invalid JSON: {e}"))
+    try:
+        let model: RoutesFile = RoutesFile.model_validate(parsed)
+    except Exception as e2:
+        return Err(err_load(raw_path, f"schema mismatch: {e2}"))
+    return Ok(model)
+
+
+pub def load_routes_from_text(raw_path: str, raw_text: str) -> Result[tuple[RouteTable, dict[str, Balancer]], LoadError]:
+    match parse_routes_text(raw_path, raw_text):
+        case Err(le):
+            return Err(le)
+        case Ok(file):
+            mut routes: list[Route] = []
+            mut balancers: dict[str, Balancer] = {}
+            for spec in file.routes:
+                let pool: list[Upstream] = _upstreams_for(spec.upstreams)
+                let strategy: BalanceStrategy = _strategy_for(spec.strategy)
+                let r: Route = new_route(
+                    id=RouteId(spec.id),
+                    methods=spec.methods,
+                    path_glob=spec.path_glob,
+                    upstreams=pool,
+                    timeout_seconds=spec.timeout_seconds,
+                    requires_auth=spec.requires_auth,
+                )
+                # The desugared `new_route` defaults `strategy=make_round_robin()`;
+                # overwrite with the actual chosen strategy.
+                r.strategy = strategy
+                routes.append(r)
+                balancers[spec.id] = new_balancer(strategy)
+            let table: RouteTable = RouteTable(routes=routes)
+            return Ok((table, balancers))
+    raise RuntimeError("unreachable")
+
+
+pub def load_routes_file(path: str) -> Result[tuple[RouteTable, dict[str, Balancer]], LoadError]:
+    try:
+        with open(path, "r") as f:
+            let raw_text: str = f.read()
+    except FileNotFoundError:
+        return Err(err_load(path, "file not found"))
+    except OSError as e:
+        return Err(err_load(path, f"read error: {e}"))
+    return load_routes_from_text(path, raw_text)
+
+
+# A small built-in default route table — used when no routes.json is found,
+# so the gateway boots in a sensible default state instead of refusing to
+# start.
+pub def default_routes() -> tuple[RouteTable, dict[str, Balancer]]:
+    let example: list[Upstream] = [
+        new_upstream(UpstreamId("example-1"), "http://127.0.0.1:9001", 1),
+        new_upstream(UpstreamId("example-2"), "http://127.0.0.1:9002", 1),
+    ]
+    let r: Route = new_route(
+        id=RouteId("default"),
+        methods=["GET", "POST"],
+        path_glob="/**",
+        upstreams=example,
+        timeout_seconds=5.0,
+        requires_auth=False,
+    )
+    let balancers: dict[str, Balancer] = {"default": new_balancer(make_round_robin())}
+    return (RouteTable(routes=[r]), balancers)

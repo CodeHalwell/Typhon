@@ -1,0 +1,40 @@
+import asyncio
+import sys
+
+import uvicorn
+
+from api import STATE, app, warm_state
+from config import game_version
+
+
+async def _serve() -> None:
+    let cfg = uvicorn.Config(
+        app,
+        host="127.0.0.1",
+        port=STATE.config.http_port,
+        log_level="info",
+    )
+    let server: uvicorn.Server = uvicorn.Server(cfg)
+    await server.serve()
+
+
+async def _amain() -> None:
+    print(f"[main] Typhon Realtime Game Server starting; version {game_version()}")
+    let warm = await warm_state()
+    print(f"[main] warm: {warm}")
+    # Spawn lobby coroutines under the runtime registry so they survive.
+    go STATE.lobby.matchmake_loop()
+    go STATE.lobby.finaliser_loop()
+    await _serve()
+
+
+def main() -> None:
+    try:
+        asyncio.run(_amain())
+    except KeyboardInterrupt:
+        STATE.lobby.shutdown.set()
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

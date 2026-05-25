@@ -1,0 +1,89 @@
+from datetime import datetime, timezone
+
+from config import RSS_NS, html_escape
+from models import RenderedPage
+
+
+pub def sort_by_date(pages: list[RenderedPage]) -> list[RenderedPage]:
+    mut copy: list[RenderedPage] = []
+    for p in pages:
+        copy.append(p)
+    copy.sort(key=_sort_key, reverse=True)
+    return copy
+
+
+def _sort_key(p: RenderedPage) -> str:
+    return p.date.isoformat()
+
+
+def _format_rfc3339(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc).isoformat()
+    return dt.isoformat()
+
+
+pub def render_rss(
+    site_title: str,
+    site_url: str,
+    site_description: str,
+    pages: list[RenderedPage],
+    max_count: int,
+) -> str:
+    let sorted_pages: list[RenderedPage] = sort_by_date(pages)
+    let limit: int = max_count if max_count < len(sorted_pages) else len(sorted_pages)
+    let updated: str = (
+        _format_rfc3339(sorted_pages[0].date) if limit > 0
+        else _format_rfc3339(datetime.now(timezone.utc))
+    )
+    mut entries: str = ""
+    mut i: int = 0
+    while i < limit:
+        let pg: RenderedPage = sorted_pages[i]
+        let abs_url: str = site_url.rstrip("/") + "/" + str(pg.slug)
+        entries = entries + (
+            "  <entry>\n"
+            f"    <title>{html_escape(pg.title)}</title>\n"
+            f"    <id>{html_escape(abs_url)}</id>\n"
+            f"    <link href=\"{html_escape(abs_url)}\"/>\n"
+            f"    <updated>{_format_rfc3339(pg.date)}</updated>\n"
+            f"    <summary>{html_escape(pg.title)}</summary>\n"
+            "  </entry>\n"
+        )
+        i = i + 1
+    return (
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+        f"<feed xmlns=\"{RSS_NS}\">\n"
+        f"  <title>{html_escape(site_title)}</title>\n"
+        f"  <link href=\"{html_escape(site_url)}\"/>\n"
+        f"  <updated>{updated}</updated>\n"
+        f"  <subtitle>{html_escape(site_description)}</subtitle>\n"
+        f"  <id>{html_escape(site_url)}</id>\n"
+        + entries +
+        "</feed>\n"
+    )
+
+
+pub def render_sitemap(site_url: str, pages: list[RenderedPage]) -> str:
+    mut entries: str = ""
+    for pg in pages:
+        let abs_url: str = site_url.rstrip("/") + "/" + str(pg.slug)
+        entries = entries + (
+            "  <url>\n"
+            f"    <loc>{html_escape(abs_url)}</loc>\n"
+            f"    <lastmod>{pg.date.date().isoformat()}</lastmod>\n"
+            "  </url>\n"
+        )
+    return (
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+        "<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n"
+        + entries +
+        "</urlset>\n"
+    )
+
+
+pub def render_robots(site_url: str) -> str:
+    return (
+        "User-agent: *\n"
+        "Allow: /\n"
+        f"Sitemap: {site_url.rstrip('/')}/sitemap.xml\n"
+    )

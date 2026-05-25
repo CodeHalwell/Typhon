@@ -1,0 +1,115 @@
+import asyncio
+
+import httpx
+
+from config import HealthPolicy
+from upstream import Upstream
+
+
+# Per-upstream periodic health probe. The `run_health_loop` background task
+# runs forever (until shutdown), gather:-probing every upstream in the
+# registry in parallel each tick.
+
+
+pub class HealthRegistry:
+    upstreams: list[Upstream]
+    policy: HealthPolicy
+    client: httpx.AsyncClient
+    shutdown: asyncio.Event
+
+
+pub def new_health_registry(
+    upstreams: list[Upstream],
+    policy: HealthPolicy,
+    client: httpx.AsyncClient,
+    shutdown: asyncio.Event,
+) -> HealthRegistry:
+    return HealthRegistry(
+        upstreams=upstreams,
+        policy=policy,
+        client=client,
+        shutdown=shutdown,
+    )
+
+
+pub async def probe_upstream(
+    client: httpx.AsyncClient,
+    upstream: Upstream,
+    timeout_seconds: float,
+) -> bool:
+    let url: str = upstream.base_url.rstrip("/") + "/health"
+    try:
+        let resp: httpx.Response = await client.get(url, timeout=timeout_seconds)
+        let code: int = int(resp.status_code)
+        return code >= 200 and code < 400
+    except httpx.HTTPError:
+        return False
+    except Exception:
+        return False
+
+
+def _apply_result(upstream: Upstream, ok: bool, policy: HealthPolicy) -> None:
+    if ok:
+        upstream.consecutive_successes = upstream.consecutive_successes + 1
+        upstream.consecutive_failures = 0
+        if not upstream.healthy and upstream.consecutive_successes >= policy.healthy_threshold:
+            upstream.healthy = True
+    else:
+        upstream.consecutive_failures = upstream.consecutive_failures + 1
+        upstream.consecutive_successes = 0
+        if upstream.healthy and upstream.consecutive_failures >= policy.unhealthy_threshold:
+            upstream.healthy = False
+
+
+pub async def probe_all(registry: HealthRegistry) -> None:
+    # Run all probes in parallel via best-effort gather so a single failure
+    # doesn't poison the rest of the round.
+    if len(registry.upstreams) == 0:
+        return
+    mut tasks: list[asyncio.Task[bool]] = []
+    for u in registry.upstreams:
+        go probe_upstream(registry.client, u, registry.policy.timeout_seconds) -> t
+        tasks.append(t)
+    let results: list[object] = await asyncio.gather(*tasks, return_exceptions=True)
+    mut idx: int = 0
+    for raw in results:
+        if idx >= len(registry.upstreams):
+            break
+        let upstream: Upstream = registry.upstreams[idx]
+        let ok: bool = isinstance(raw, bool) and raw == True
+        _apply_result(upstream, ok, registry.policy)
+        idx = idx + 1
+
+
+pub async def warmup_probes(registry: HealthRegistry) -> tuple[bool, int]:
+    # Used at boot to wait for the first round of probes — uses Typhon's
+    # `gather:` block to run two correlated checks in parallel without
+    # building a TaskGroup by hand.
+    if len(registry.upstreams) < 2:
+        await probe_all(registry)
+        let single: int = len(registry.upstreams)
+        return (True, single)
+    let first: Upstream = registry.upstreams[0]
+    let second: Upstream = registry.upstreams[1]
+    gather:
+        first_ok = probe_upstream(registry.client, first, registry.policy.timeout_seconds)
+        second_ok = probe_upstream(registry.client, second, registry.policy.timeout_seconds)
+    _apply_result(first, first_ok, registry.policy)
+    _apply_result(second, second_ok, registry.policy)
+    let total: int = len(registry.upstreams)
+    return (first_ok or second_ok, total)
+
+
+pub async def run_health_loop(registry: HealthRegistry) -> None:
+    while not registry.shutdown.is_set():
+        try:
+            await probe_all(registry)
+        except Exception as e:
+            print(f"[health] probe round failed: {type(e).__name__}: {e}")
+        try:
+            await asyncio.wait_for(
+                registry.shutdown.wait(),
+                timeout=registry.policy.interval_seconds,
+            )
+        except asyncio.TimeoutError:
+            pass
