@@ -1,0 +1,351 @@
+from lang_ast import (
+    ExBinOp,
+    ExBlock,
+    ExBool,
+    ExCall,
+    ExFloat,
+    ExFn,
+    ExIdent,
+    ExIf,
+    ExInt,
+    ExLet,
+    ExPrint,
+    ExStr,
+    ExUnary,
+    Expr,
+    expr_span,
+)
+from source import Span
+
+
+pub type Ty = TyInt | TyFloat | TyStr | TyBool | TyUnit | TyFn
+
+
+pub class TyInt frozen:
+    placeholder: int = 0
+
+
+pub class TyFloat frozen:
+    placeholder: int = 0
+
+
+pub class TyStr frozen:
+    placeholder: int = 0
+
+
+pub class TyBool frozen:
+    placeholder: int = 0
+
+
+pub class TyUnit frozen:
+    placeholder: int = 0
+
+
+pub class TyFn frozen:
+    params: tuple[Ty, ...]
+    ret: Ty
+
+
+# Factories — cross-module variant→union upcast.
+
+pub def make_ty_int() -> Ty:
+    return TyInt()
+
+
+pub def make_ty_float() -> Ty:
+    return TyFloat()
+
+
+pub def make_ty_str() -> Ty:
+    return TyStr()
+
+
+pub def make_ty_bool() -> Ty:
+    return TyBool()
+
+
+pub def make_ty_unit() -> Ty:
+    return TyUnit()
+
+
+pub def make_ty_fn(params: tuple[Ty, ...], ret: Ty) -> Ty:
+    return TyFn(params=params, ret=ret)
+
+
+pub def ty_label(t: Ty) -> str:
+    match t:
+        case TyInt(_):              return "int"
+        case TyFloat(_):            return "float"
+        case TyStr(_):              return "str"
+        case TyBool(_):             return "bool"
+        case TyUnit(_):             return "unit"
+        case TyFn(params, ret):
+            mut parts: list[str] = []
+            for p in params:
+                parts.append(ty_label(p))
+            return "fn(" + ", ".join(parts) + ") -> " + ty_label(ret)
+    raise RuntimeError("unreachable")
+
+
+pub def ty_equal(a: Ty, b: Ty) -> bool:
+    match a:
+        case TyInt(_):
+            match b:
+                case TyInt(_): return True
+                case _:        return False
+            raise RuntimeError("unreachable")
+        case TyFloat(_):
+            match b:
+                case TyFloat(_): return True
+                case _:          return False
+            raise RuntimeError("unreachable")
+        case TyStr(_):
+            match b:
+                case TyStr(_): return True
+                case _:        return False
+            raise RuntimeError("unreachable")
+        case TyBool(_):
+            match b:
+                case TyBool(_): return True
+                case _:         return False
+            raise RuntimeError("unreachable")
+        case TyUnit(_):
+            match b:
+                case TyUnit(_): return True
+                case _:         return False
+            raise RuntimeError("unreachable")
+        case TyFn(ap, ar):
+            match b:
+                case TyFn(bp, br):
+                    if len(ap) != len(bp):
+                        return False
+                    mut i: int = 0
+                    while i < len(ap):
+                        if not ty_equal(ap[i], bp[i]):
+                            return False
+                        i = i + 1
+                    return ty_equal(ar, br)
+                case _:
+                    return False
+            raise RuntimeError("unreachable")
+    raise RuntimeError("unreachable")
+
+
+pub class TypeEnv:
+    bindings: dict[str, Ty]
+    parent: TypeEnv?
+
+
+impl TypeEnv:
+    def lookup(self, name: str) -> Ty?:
+        let here: Ty? = self.bindings.get(name)
+        if here is not None:
+            return here
+        let par: TypeEnv? = self.parent
+        if par is None:
+            return None
+        return par.lookup(name)
+
+    def with_binding(self, name: str, t: Ty) -> TypeEnv:
+        let child_bindings: dict[str, Ty] = {name: t}
+        return TypeEnv(bindings=child_bindings, parent=self)
+
+
+pub def empty_type_env() -> TypeEnv:
+    let bs: dict[str, Ty] = {}
+    return TypeEnv(bindings=bs, parent=None)
+
+
+pub class TypeError:
+    message: str
+    span: Span
+
+
+pub def parse_ty_annotation(raw: str) -> Result[Ty, str]:
+    if raw == "int":   return Ok(value=make_ty_int())
+    if raw == "float": return Ok(value=make_ty_float())
+    if raw == "str":   return Ok(value=make_ty_str())
+    if raw == "bool":  return Ok(value=make_ty_bool())
+    if raw == "unit":  return Ok(value=make_ty_unit())
+    return Err(error=f"unknown type annotation '{raw}'")
+
+
+def _terr(message: str, span: Span) -> TypeError:
+    return TypeError(message=message, span=span)
+
+
+def _is_numeric(t: Ty) -> bool:
+    match t:
+        case TyInt(_):   return True
+        case TyFloat(_): return True
+        case _:          return False
+    raise RuntimeError("unreachable")
+
+
+def _numeric_join(a: Ty, b: Ty) -> Ty:
+    # int + int = int; anything with float = float
+    match a:
+        case TyFloat(_): return make_ty_float()
+        case _:
+            match b:
+                case TyFloat(_): return make_ty_float()
+                case _:          return make_ty_int()
+            raise RuntimeError("unreachable")
+    raise RuntimeError("unreachable")
+
+
+def _is_str(t: Ty) -> bool:
+    match t:
+        case TyStr(_): return True
+        case _:        return False
+    raise RuntimeError("unreachable")
+
+
+def _check_binop(op: str, lt: Ty, rt: Ty, span: Span) -> Result[Ty, TypeError]:
+    if op == "+" or op == "-" or op == "*" or op == "/":
+        if op == "+" and _is_str(lt) and _is_str(rt):
+            return Ok(value=make_ty_str())
+        if _is_numeric(lt) and _is_numeric(rt):
+            if op == "/":
+                return Ok(value=make_ty_float())
+            return Ok(value=_numeric_join(lt, rt))
+        return Err(error=_terr(
+            f"operator '{op}' expected numeric operands, got {ty_label(lt)} and {ty_label(rt)}",
+            span,
+        ))
+    if op == "<" or op == ">" or op == "<=" or op == ">=":
+        if _is_numeric(lt) and _is_numeric(rt):
+            return Ok(value=make_ty_bool())
+        return Err(error=_terr(
+            f"operator '{op}' expected numeric operands, got {ty_label(lt)} and {ty_label(rt)}",
+            span,
+        ))
+    if op == "==" or op == "!=":
+        if ty_equal(lt, rt):
+            return Ok(value=make_ty_bool())
+        return Err(error=_terr(
+            f"operator '{op}' expected matching operand types, got {ty_label(lt)} and {ty_label(rt)}",
+            span,
+        ))
+    return Err(error=_terr(f"unknown operator '{op}'", span))
+
+
+pub def check(expr: Expr, env: TypeEnv) -> Result[Ty, TypeError]:
+    match expr:
+        case ExInt(_, _):
+            return Ok(value=make_ty_int())
+        case ExFloat(_, _):
+            return Ok(value=make_ty_float())
+        case ExStr(_, _):
+            return Ok(value=make_ty_str())
+        case ExBool(_, _):
+            return Ok(value=make_ty_bool())
+        case ExIdent(nm, sp_id):
+            let found: Ty? = env.lookup(nm)
+            if found is None:
+                return Err(error=_terr(f"unbound identifier '{nm}'", sp_id))
+            return Ok(value=found)
+        case ExBinOp(op, left, right, sp_bin):
+            let lt: Ty = check(left, env)?
+            let rt: Ty = check(right, env)?
+            return _check_binop(op, lt, rt, sp_bin)
+        case ExUnary(uop, operand, sp_un):
+            let ot: Ty = check(operand, env)?
+            if uop == "-":
+                if _is_numeric(ot):
+                    return Ok(value=ot)
+                return Err(error=_terr(f"unary '-' expects numeric, got {ty_label(ot)}", sp_un))
+            return Err(error=_terr(f"unknown unary operator '{uop}'", sp_un))
+        case ExCall(callee, args, sp_call):
+            let callee_ty: Ty = check(callee, env)?
+            match callee_ty:
+                case TyFn(ptypes, ret_ty):
+                    if len(args) != len(ptypes):
+                        return Err(error=_terr(
+                            f"arity mismatch: expected {len(ptypes)} args, got {len(args)}",
+                            sp_call,
+                        ))
+                    mut idx_c: int = 0
+                    while idx_c < len(args):
+                        let arg_ty: Ty = check(args[idx_c], env)?
+                        if not ty_equal(arg_ty, ptypes[idx_c]):
+                            return Err(error=_terr(
+                                f"arg {idx_c} type mismatch: expected {ty_label(ptypes[idx_c])}, got {ty_label(arg_ty)}",
+                                expr_span(args[idx_c]),
+                            ))
+                        idx_c = idx_c + 1
+                    return Ok(value=ret_ty)
+                case _:
+                    return Err(error=_terr(
+                        f"cannot call non-function value of type {ty_label(callee_ty)}",
+                        sp_call,
+                    ))
+            raise RuntimeError("unreachable")
+        case ExIf(cond, then_branch, else_branch, sp_if):
+            let ct: Ty = check(cond, env)?
+            match ct:
+                case TyBool(_):
+                    pass
+                case _:
+                    return Err(error=_terr(
+                        f"if condition must be bool, got {ty_label(ct)}", sp_if,
+                    ))
+            let tt: Ty = check(then_branch, env)?
+            let et: Ty = check(else_branch, env)?
+            if not ty_equal(tt, et):
+                return Err(error=_terr(
+                    f"if branches have different types: {ty_label(tt)} vs {ty_label(et)}",
+                    sp_if,
+                ))
+            return Ok(value=tt)
+        case ExLet(name, value, body, _sp_let):
+            let vt: Ty = check(value, env)?
+            let child: TypeEnv = env.with_binding(name, vt)
+            return check(body, child)
+        case ExFn(params, ret_type, body, sp_fn):
+            mut child2: TypeEnv = env
+            mut ptypes_list: list[Ty] = []
+            for p in params:
+                let pt_res: Result[Ty, str] = parse_ty_annotation(p.type_annot)
+                match pt_res:
+                    case Err(msg):
+                        return Err(error=_terr(f"bad param type for '{p.name}': {msg}", sp_fn))
+                    case Ok(pt):
+                        ptypes_list.append(pt)
+                        child2 = child2.with_binding(p.name, pt)
+            let body_ty: Ty = check(body, child2)?
+            let declared_ret_res: Result[Ty, str] = parse_ty_annotation(ret_type)
+            match declared_ret_res:
+                case Err(msg2):
+                    return Err(error=_terr(f"bad return type '{ret_type}': {msg2}", sp_fn))
+                case Ok(declared_ret):
+                    if not ty_equal(declared_ret, body_ty):
+                        return Err(error=_terr(
+                            f"function body type {ty_label(body_ty)} does not match declared return {ty_label(declared_ret)}",
+                            sp_fn,
+                        ))
+                    return Ok(value=make_ty_fn(tuple(ptypes_list), declared_ret))
+            raise RuntimeError("unreachable")
+        case ExBlock(exprs, _sp_blk):
+            if len(exprs) == 0:
+                return Ok(value=make_ty_unit())
+            mut last_ty: Ty = make_ty_unit()
+            mut block_env: TypeEnv = env
+            mut idx_b: int = 0
+            while idx_b < len(exprs):
+                let sub: Expr = exprs[idx_b]
+                # Allow `let` inside a block to extend the env for subsequent
+                # exprs without nesting.
+                match sub:
+                    case ExLet(ln, lv, _lb, _lsp):
+                        let lvt: Ty = check(lv, block_env)?
+                        block_env = block_env.with_binding(ln, lvt)
+                        last_ty = make_ty_unit()
+                    case _:
+                        last_ty = check(sub, block_env)?
+                idx_b = idx_b + 1
+            return Ok(value=last_ty)
+        case ExPrint(arg, _sp_pr):
+            let _at: Ty = check(arg, env)?
+            return Ok(value=make_ty_unit())
+    raise RuntimeError("unreachable")

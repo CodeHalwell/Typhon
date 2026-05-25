@@ -1,0 +1,4 @@
+pub newtype UserId = int
+pub newtype PostId = int
+pub newtype CommentId = int
+pub newtype Token = str

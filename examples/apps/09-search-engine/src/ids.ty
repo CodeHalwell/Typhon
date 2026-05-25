@@ -1,0 +1,2 @@
+pub newtype DocId = int
+pub newtype TermId = int

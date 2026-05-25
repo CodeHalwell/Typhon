@@ -2238,7 +2238,10 @@ pub fn validate_question_ops(source: &str) -> Vec<QuestionOpError> {
             }
 
             // Detect a function definition and push its return type onto the stack.
-            if trimmed.starts_with("def ") || trimmed.starts_with("async def ") {
+            // `pub` is a Typhon visibility modifier that may precede `def` /
+            // `async def`; strip it before pattern-matching the keyword.
+            let after_pub = trimmed.strip_prefix("pub ").unwrap_or(trimmed);
+            if after_pub.starts_with("def ") || after_pub.starts_with("async def ") {
                 let ret_type = extract_return_type_text(code);
                 fn_stack.push((indent_len, ret_type));
             }
@@ -7242,6 +7245,49 @@ mod tests {
         let src = "val x: str? = None\n";
         let errs = validate_question_ops(src);
         assert!(errs.is_empty(), "nullable sugar must not be flagged");
+    }
+
+    #[test]
+    fn question_op_valid_in_pub_def_result_function() {
+        // Regression: `pub def` was previously invisible to the function-scope
+        // tracker because the prefix-match only saw `def ` / `async def `.
+        // Every public, cross-module `?`-using function (the natural shape for
+        // resolver / parser / handler helpers) tripped a misleading
+        // `?` operator used at module level diagnostic. See PR #128, R2-1.
+        let src =
+            "pub def parse(s: str) -> Result[int, str]:\n    val n = int(s)?\n    return Ok(n)\n";
+        let errs = validate_question_ops(src);
+        assert!(
+            errs.is_empty(),
+            "expected no errors, got: {:?}",
+            errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn question_op_valid_in_pub_async_def_result_function() {
+        let src = "pub async def load(s: str) -> Result[int, str]:\n    val n = await fetch(s)?\n    return Ok(n)\n";
+        let errs = validate_question_ops(src);
+        assert!(
+            errs.is_empty(),
+            "expected no errors, got: {:?}",
+            errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn question_op_in_pub_def_none_returning_function_is_error() {
+        // The `pub`-prefix carve-out must still surface the wrong-return-type
+        // error: a `pub def f() -> None:` containing `?` is invalid.
+        let src = "pub def process() -> None:\n    val x = load()?\n";
+        let errs = validate_question_ops(src);
+        assert_eq!(
+            errs.len(),
+            1,
+            "expected one error, got: {:?}",
+            errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        assert!(errs[0].message.contains("None"), "got: {}", errs[0].message);
     }
 
     #[test]

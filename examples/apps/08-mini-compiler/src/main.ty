@@ -1,0 +1,127 @@
+from eval import EvalError, eval_program
+from lexer import LexError, tokenize
+from parser import ParseError, parse
+from source import Source, span_label
+from tokens import Token, token_label
+from lang_types import TypeError, check, empty_type_env, ty_label
+from values import value_to_str
+
+
+pub class StageReport:
+    stage: str
+    detail: str
+
+
+def _report_lex_err(e: LexError) -> StageReport:
+    return StageReport(stage="lex", detail=f"{e.message} at {span_label(e.span)}")
+
+
+def _report_parse_err(e: ParseError) -> StageReport:
+    return StageReport(stage="parse", detail=f"{e.message} at {span_label(e.span)}")
+
+
+def _report_type_err(e: TypeError) -> StageReport:
+    return StageReport(stage="type", detail=f"{e.message} at {span_label(e.span)}")
+
+
+def _report_eval_err(e: EvalError) -> StageReport:
+    return StageReport(stage="eval", detail=f"{e.message} at {span_label(e.span)}")
+
+
+def _summarise_tokens(toks: list[Token]) -> str:
+    mut parts: list[str] = []
+    let limit: int = 8 if len(toks) > 8 else len(toks)
+    mut i: int = 0
+    while i < limit:
+        parts.append(token_label(toks[i]))
+        i = i + 1
+    let suffix: str = f" ... (+{len(toks) - limit} more)" if len(toks) > limit else ""
+    return ", ".join(parts) + suffix
+
+
+def _do_run(src: Source) -> Result[tuple[str, str], StageReport]:
+    # Stage 1: tokenize.
+    match tokenize(src):
+        case Err(le):
+            return Err(error=_report_lex_err(le))
+        case Ok(tokens):
+            print(f"  tokens: {_summarise_tokens(tokens)}")
+            # Stage 2: parse.
+            match parse(tokens):
+                case Err(pe):
+                    return Err(error=_report_parse_err(pe))
+                case Ok(ast):
+                    print("  parsed ok")
+                    # Stage 3: type-check.
+                    match check(ast, empty_type_env()):
+                        case Err(te):
+                            return Err(error=_report_type_err(te))
+                        case Ok(prog_ty):
+                            let ty_str: str = ty_label(prog_ty)
+                            print(f"  type: {ty_str}")
+                            # Stage 4: evaluate.
+                            match eval_program(ast):
+                                case Err(ee):
+                                    return Err(error=_report_eval_err(ee))
+                                case Ok(v):
+                                    let v_str: str = value_to_str(v)
+                                    return Ok(value=(ty_str, v_str))
+                            raise RuntimeError("unreachable")
+                    raise RuntimeError("unreachable")
+            raise RuntimeError("unreachable")
+    raise RuntimeError("unreachable")
+
+
+def run_program(label: str, source_text: str) -> None:
+    print(f"=== {label} ===")
+    let src: Source = Source(text=source_text)
+    match _do_run(src):
+        case Err(report):
+            print(f"  [{report.stage}] {report.detail}")
+        case Ok(pair):
+            print(f"  value: {pair[1]}")
+
+
+pub let PROGRAM_ARITHMETIC: str = """
+let x = 1 + 2 * 3
+let y = (x - 1) * 2
+y
+"""
+
+
+pub let PROGRAM_FUNCTION: str = """
+let add = fun(a: int, b: int) -> int { a + b }
+let r = add(10, 5)
+print(r)
+r
+"""
+
+
+pub let PROGRAM_IF: str = """
+let n = 7
+if n > 0 then "positive" else "non-positive"
+"""
+
+
+pub let PROGRAM_COMPARE: str = """
+let x = 10
+let y = 4
+if x > y then x - y else y - x
+"""
+
+
+pub let PROGRAM_TYPE_ERROR: str = """
+let bad = 1 + "oops"
+bad
+"""
+
+
+def main() -> None:
+    run_program("arithmetic", PROGRAM_ARITHMETIC)
+    run_program("function", PROGRAM_FUNCTION)
+    run_program("if-expression", PROGRAM_IF)
+    run_program("compare", PROGRAM_COMPARE)
+    run_program("type error (expected)", PROGRAM_TYPE_ERROR)
+
+
+main()

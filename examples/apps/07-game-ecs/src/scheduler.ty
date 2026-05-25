@@ -1,0 +1,66 @@
+from typing import Callable
+
+from events import EvTickEnded, GameEvent, event_label
+from ids import SystemName
+from systems import (
+    system_collision,
+    system_damage,
+    system_despawn_dead,
+    system_movement,
+    system_tick_end,
+)
+from world import World
+
+
+pub class ScheduledSystem:
+    name: SystemName
+    priority: int
+    run: Callable[[World, float], None]
+
+
+def _system_priority(s: ScheduledSystem) -> int:
+    return s.priority
+
+
+pub class Scheduler:
+    items: list[ScheduledSystem]
+    sorted: bool
+    print_events: bool
+
+
+impl Scheduler:
+    def add(self, name: SystemName, priority: int, run: Callable[[World, float], None]) -> None:
+        self.items.append(ScheduledSystem(name=name, priority=priority, run=run))
+        self.sorted = False
+
+    def ensure_sorted(self) -> None:
+        if self.sorted:
+            return
+        self.items.sort(key=_system_priority)
+        self.sorted = True
+
+    def tick(self, world: World, dt: float) -> None:
+        self.ensure_sorted()
+        for sys in self.items:
+            sys.run(world, dt)
+        let evs: list[GameEvent] = world.drain_events()
+        if self.print_events:
+            for ev in evs:
+                if not isinstance(ev, EvTickEnded):
+                    print(f"  event: {event_label(ev)}")
+
+    def tick_collect(self, world: World, dt: float) -> list[GameEvent]:
+        self.ensure_sorted()
+        for sys in self.items:
+            sys.run(world, dt)
+        return world.drain_events()
+
+
+pub def default_scheduler() -> Scheduler:
+    let s: Scheduler = Scheduler(items=[], sorted=False, print_events=False)
+    s.add(SystemName("movement"), 10, system_movement)
+    s.add(SystemName("collision"), 20, system_collision)
+    s.add(SystemName("damage"), 30, system_damage)
+    s.add(SystemName("despawn"), 40, system_despawn_dead)
+    s.add(SystemName("tick_end"), 99, system_tick_end)
+    return s
