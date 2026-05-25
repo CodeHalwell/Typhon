@@ -2238,7 +2238,10 @@ pub fn validate_question_ops(source: &str) -> Vec<QuestionOpError> {
             }
 
             // Detect a function definition and push its return type onto the stack.
-            if trimmed.starts_with("def ") || trimmed.starts_with("async def ") {
+            // `pub` is a Typhon visibility modifier that may precede `def` /
+            // `async def`; strip it before pattern-matching the keyword.
+            let after_pub = trimmed.strip_prefix("pub ").unwrap_or(trimmed);
+            if after_pub.starts_with("def ") || after_pub.starts_with("async def ") {
                 let ret_type = extract_return_type_text(code);
                 fn_stack.push((indent_len, ret_type));
             }

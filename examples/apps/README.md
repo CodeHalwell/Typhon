@@ -17,6 +17,11 @@ run it and which language features it leans on.
 | 3 | [`03-ml-orchestrator`](03-ml-orchestrator/) | ML pipeline orchestrator: datasets, training jobs, sweeps, model registry | `lazy import` numpy/torch, generics with PEP 695 over pipeline stages, `with`-chain `Result` plumbing, sealed-union job states |
 | 4 | [`04-event-sourced-banking`](04-event-sourced-banking/) | Event-sourced double-entry ledger with projections, snapshots, FX, AML | sealed-union events and commands, `newtype` for money/account IDs, pattern matching projections, `freeze let` rate cards |
 | 5 | [`05-web-crawler`](05-web-crawler/) | Concurrent crawler + content extractor + summariser with politeness/robots | `gather(strategy="best-effort")`, `go`, `lazy import`, retry/backoff, `Result[T, E]` everywhere, rate limits |
+| 6 | [`06-graphql-server`](06-graphql-server/) | Typed GraphQL-style query engine: schema, recursive resolvers, batched `DataLoader[K, V]`, role-based auth | generic `class[K, V]` + `impl[K, V]`, recursive query AST, `Result` chains, `Callable` fields, `?` propagation in `pub def` |
+| 7 | [`07-game-ecs`](07-game-ecs/) | In-process entity-component-system game engine with system scheduler and event queue | frozen value components, sealed-union `Component` / `GameEvent`, `Callable`-typed system functions, dense exhaustive `match` |
+| 8 | [`08-mini-compiler`](08-mini-compiler/) | Lexer + Pratt parser + type checker + tree-walking interpreter for a tiny expression language | 13-variant recursive `Expr`, cross-module recursive `Env` ↔ `VFn`, four-stage `Result` pipeline with heterogeneous error types |
+| 9 | [`09-search-engine`](09-search-engine/) | Full-text search engine: tokenizer, inverted index, BM25 ranking, AND/OR/NOT/phrase query parser, snippet highlighting | recursive `Query` AST, `freeze let` constants, frozen `Posting` with `tuple[int, ...]`, BM25 math over `newtype` IDs |
+| 10 | [`10-distributed-kv`](10-distributed-kv/) | Simulated 3-node Raft-lite KV store: leader election, log replication, majority commit, client put/get | 7-variant `Message` union, role state machine, deterministic simulated message bus, log-index / term arithmetic |
 
 Each app has its own README with the run recipe. None of them require a
 network or third-party services to *type-check* — `tyc check` runs end

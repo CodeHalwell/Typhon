@@ -1,0 +1,57 @@
+from typing import Callable
+
+
+pub class DataLoader[K, V]:
+    batch_fn: Callable[[list[K]], dict[K, V]]
+    cache: dict[K, V]
+    pending: list[K]
+
+
+impl[K, V] DataLoader[K, V]:
+    def load(self, key: K) -> V?:
+        let cached: V? = self.cache.get(key)
+        if cached is not None:
+            return cached
+        let loaded: dict[K, V] = self.batch_fn([key])
+        let fresh: V? = loaded.get(key)
+        if fresh is None:
+            return None
+        self.cache[key] = fresh
+        return fresh
+
+    def load_many(self, keys: list[K]) -> dict[K, V]:
+        mut out: dict[K, V] = {}
+        mut missing: list[K] = []
+        for k in keys:
+            let hit: V? = self.cache.get(k)
+            if hit is not None:
+                out[k] = hit
+            else:
+                missing.append(k)
+        if len(missing) > 0:
+            let loaded: dict[K, V] = self.batch_fn(missing)
+            for (k2, v) in loaded.items():
+                self.cache[k2] = v
+                out[k2] = v
+        return out
+
+    def prime(self, key: K, value: V) -> None:
+        self.cache[key] = value
+
+    def clear(self, key: K) -> None:
+        # Rebuild the cache without the key. Avoids `del` (rarely exercised
+        # by Round 1 code) and avoids `dict.pop`-with-default whose generic
+        # return type is tricky to annotate when V is a type parameter.
+        mut next_cache: dict[K, V] = {}
+        for (k, v) in self.cache.items():
+            if k != key:
+                next_cache[k] = v
+        self.cache = next_cache
+
+    def clear_all(self) -> None:
+        self.cache = {}
+        self.pending = []
+
+
+pub def new_loader[K, V](batch_fn: Callable[[list[K]], dict[K, V]]) -> DataLoader[K, V]:
+    return DataLoader(batch_fn=batch_fn, cache={}, pending=[])

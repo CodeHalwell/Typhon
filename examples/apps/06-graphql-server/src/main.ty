@@ -1,0 +1,146 @@
+from executor import execute
+from ids import Token
+from schema import (
+    Comment,
+    FieldComment,
+    FieldCommentList,
+    FieldNull,
+    FieldObject,
+    FieldPost,
+    FieldPostList,
+    FieldScalar,
+    FieldUser,
+    FieldUserList,
+    Post,
+    ResolvedField,
+    User,
+)
+from store import Store, seed_store
+
+
+def _indent(level: int) -> str:
+    mut s: str = ""
+    mut i: int = 0
+    while i < level:
+        s = s + "  "
+        i = i + 1
+    return s
+
+
+def _render_user(u: User, level: int) -> str:
+    let pad: str = _indent(level)
+    return f"{pad}User #{int(u.id)} {u.name} <{u.email}> [{u.role}]"
+
+
+def _render_post(p: Post, level: int) -> str:
+    let pad: str = _indent(level)
+    return f"{pad}Post #{int(p.id)} by user#{int(p.author)}: {p.title}"
+
+
+def _render_comment(c: Comment, level: int) -> str:
+    let pad: str = _indent(level)
+    return f"{pad}Comment #{int(c.id)} on post#{int(c.post)} by user#{int(c.author)}: {c.body}"
+
+
+def render(field: ResolvedField, level: int) -> str:
+    let pad: str = _indent(level)
+    match field:
+        case FieldScalar(value):
+            return f"{pad}{value}"
+        case FieldNull(_):
+            return f"{pad}<null>"
+        case FieldUser(u):
+            return _render_user(u, level)
+        case FieldPost(p):
+            return _render_post(p, level)
+        case FieldComment(c):
+            return _render_comment(c, level)
+        case FieldUserList(items):
+            mut lines: list[str] = [f"{pad}users ({len(items)}):"]
+            for u in items:
+                lines.append(_render_user(u, level + 1))
+            return "\n".join(lines)
+        case FieldPostList(items):
+            mut plines: list[str] = [f"{pad}posts ({len(items)}):"]
+            for p in items:
+                plines.append(_render_post(p, level + 1))
+            return "\n".join(plines)
+        case FieldCommentList(items):
+            mut clines: list[str] = [f"{pad}comments ({len(items)}):"]
+            for c in items:
+                clines.append(_render_comment(c, level + 1))
+            return "\n".join(clines)
+        case FieldObject(fields):
+            mut olines: list[str] = []
+            for (k, v) in fields.items():
+                olines.append(f"{pad}{k}:")
+                olines.append(render(v, level + 1))
+            return "\n".join(olines)
+    raise RuntimeError("unreachable")
+
+
+def _run(label: str, raw: str, token: Token, store: Store) -> None:
+    print("=" * 72)
+    print(f"QUERY: {label}")
+    print(f"  token = {str(token)}")
+    print(f"  raw   = {raw}")
+    print("-" * 72)
+    match execute(raw, token, store):
+        case Ok(field):
+            print(render(field, 0))
+        case Err(msg):
+            print(f"ERROR: {msg}")
+    print()
+
+
+def main() -> None:
+    let store: Store = seed_store()
+    let admin_tok: Token = Token("tok-1-admin")
+    let user_tok: Token  = Token("tok-3-user")
+    let bad_tok: Token   = Token("tok-9-admin")
+    let expired_tok: Token = Token("tok-expired")
+
+    _run(
+        "single user, shallow",
+        "user(id:1) { id name email role }",
+        admin_tok, store,
+    )
+    _run(
+        "users with role filter + nested posts + nested author",
+        "users(role:admin) { id name posts { title author { name email } } }",
+        admin_tok, store,
+    )
+    _run(
+        "post with comments and author of each comment (DataLoader stress)",
+        "post(id:109) { title body author { name } comments { body author { name role } } }",
+        admin_tok, store,
+    )
+    _run(
+        "role-gated: non-admin asks for 'users' list (must be rejected)",
+        "users(role:user) { name }",
+        user_tok, store,
+    )
+    _run(
+        "non-admin reads their own user (allowed)",
+        "user(id:3) { id name }",
+        user_tok, store,
+    )
+    _run(
+        "unknown user behind a valid-looking token",
+        "user(id:1) { name }",
+        bad_tok, store,
+    )
+    _run(
+        "expired token",
+        "user(id:1) { name }",
+        expired_tok, store,
+    )
+    _run(
+        "parse error",
+        "user(id:1 { name }",
+        admin_tok, store,
+    )
+
+
+if __name__ == "__main__":
+    main()

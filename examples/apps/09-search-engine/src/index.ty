@@ -1,0 +1,103 @@
+from ids import DocId
+from tokenize import tokenize_for_index
+
+
+pub class Posting frozen:
+    doc_id: DocId
+    tf: int
+    positions: tuple[int, ...]
+
+
+pub class Document:
+    id: DocId
+    title: str
+    body: str
+    length: int
+
+
+pub class InvertedIndex:
+    postings: dict[str, list[Posting]]
+    docs: dict[int, Document]
+    total_docs: int
+    total_length: int
+    avg_doc_len: float
+
+
+pub def new_index() -> InvertedIndex:
+    return InvertedIndex(
+        postings={},
+        docs={},
+        total_docs=0,
+        total_length=0,
+        avg_doc_len=0.0,
+    )
+
+
+pub def new_document(id: DocId, title: str, body: str) -> Document:
+    let tokens: list[str] = tokenize_for_index(body)
+    return Document(id=id, title=title, body=body, length=len(tokens))
+
+
+impl InvertedIndex:
+    def add(self, doc: Document) -> None:
+        let tokens: list[str] = tokenize_for_index(doc.body)
+        mut per_term_positions: dict[str, list[int]] = {}
+        mut pos: int = 0
+        for tok in tokens:
+            let existing: list[int]? = per_term_positions.get(tok)
+            if existing is None:
+                per_term_positions[tok] = [pos]
+            else:
+                let lst: list[int] = existing
+                lst.append(pos)
+                per_term_positions[tok] = lst
+            pos = pos + 1
+        # Append a posting per term for this doc.
+        for (term, positions) in per_term_positions.items():
+            let frozen_positions: tuple[int, ...] = tuple(positions)
+            let posting: Posting = Posting(
+                doc_id=doc.id,
+                tf=len(positions),
+                positions=frozen_positions,
+            )
+            let bucket: list[Posting]? = self.postings.get(term)
+            if bucket is None:
+                self.postings[term] = [posting]
+            else:
+                let b: list[Posting] = bucket
+                b.append(posting)
+                self.postings[term] = b
+        self.docs[int(doc.id)] = doc
+        self.total_docs = self.total_docs + 1
+        self.total_length = self.total_length + len(tokens)
+
+    def finalize(self) -> None:
+        if self.total_docs == 0:
+            self.avg_doc_len = 0.0
+            return
+        self.avg_doc_len = float(self.total_length) / float(self.total_docs)
+
+    def postings_for(self, term: str) -> list[Posting]:
+        let bucket: list[Posting]? = self.postings.get(term)
+        if bucket is None:
+            return []
+        return bucket
+
+    def doc(self, did: DocId) -> Document?:
+        let found: Document? = self.docs.get(int(did))
+        if found is None:
+            return None
+        return found
+
+    def df(self, term: str) -> int:
+        let bucket: list[Posting]? = self.postings.get(term)
+        if bucket is None:
+            return 0
+        let b: list[Posting] = bucket
+        return len(b)
+
+    def all_doc_ids(self) -> list[DocId]:
+        mut out: list[DocId] = []
+        for (raw, _doc) in self.docs.items():
+            out.append(DocId(raw))
+        return out

@@ -1,0 +1,133 @@
+from components import Collider, Damage, Health, Velocity
+from events import EvTickEnded, GameEvent, event_label
+from ids import EntityId
+from scheduler import Scheduler, default_scheduler
+from vec2 import Vec2
+from world import World, new_world
+
+
+def deterministic_float(seed: int, mod: int) -> float:
+    # Tiny linear-congruential-ish hash so we don't depend on random.seed
+    let mixed: int = (seed * 2654435761 + 12345) % 1000003
+    return float(mixed % mod)
+
+
+def spawn_initial(world: World, count: int) -> list[EntityId]:
+    mut ids: list[EntityId] = []
+    mut i: int = 0
+    while i < count:
+        let px: float = deterministic_float(i + 1, 40) - 20.0
+        let py: float = deterministic_float(i * 7 + 3, 40) - 20.0
+        let pos: Vec2 = Vec2(x=px, y=py)
+        let eid: EntityId = world.spawn(pos)
+
+        let vx: float = (deterministic_float(i * 11 + 5, 20) - 10.0) * 0.3
+        let vy: float = (deterministic_float(i * 13 + 7, 20) - 10.0) * 0.3
+        world.set_velocity(eid, Velocity(vel=Vec2(x=vx, y=vy)))
+
+        let max_hp: int = 5 + (i % 4) * 2
+        world.set_health(eid, Health(hp=max_hp, max_hp=max_hp))
+
+        let radius: float = 1.5 + float(i % 3) * 0.5
+        world.set_collider(eid, Collider(radius=radius))
+
+        ids.append(eid)
+        i = i + 1
+    return ids
+
+
+def seed_hostility(world: World, ids: list[EntityId]) -> None:
+    # A couple of "aggressors" deal pre-tick damage to a victim each.
+    let n: int = len(ids)
+    if n < 4:
+        return
+    let attacker_a: EntityId = ids[0]
+    let attacker_b: EntityId = ids[1]
+    let victim_a: EntityId = ids[2]
+    let victim_b: EntityId = ids[3]
+    world.add_damage(victim_a, Damage(amount=2, source=attacker_a))
+    world.add_damage(victim_b, Damage(amount=2, source=attacker_b))
+    if n >= 6:
+        world.add_damage(ids[4], Damage(amount=1, source=ids[5]))
+
+
+def format_pos(p: Vec2) -> str:
+    return f"({p.x:+.2f}, {p.y:+.2f})"
+
+
+def main() -> None:
+    let world: World = new_world()
+    let ids: list[EntityId] = spawn_initial(world, 10)
+    seed_hostility(world, ids)
+
+    let scheduler: Scheduler = default_scheduler()
+    # Drain the spawn events so they don't pollute tick-1 output.
+    let _bootstrap: list[GameEvent] = world.drain_events()
+
+    print(f"Starting simulation: {world.alive_count()} entities, 40 ticks @ dt=0.1")
+    print()
+
+    let total_ticks: int = 40
+    let dt: float = 0.1
+    mut total_events: int = 0
+    mut total_collisions: int = 0
+    mut total_damage_events: int = 0
+
+    mut t: int = 0
+    while t < total_ticks:
+        let evs: list[GameEvent] = scheduler.tick_collect(world, dt)
+        total_events = total_events + len(evs)
+
+        mut tick_collisions: int = 0
+        mut tick_damage: int = 0
+        mut interesting: list[str] = []
+        for ev in evs:
+            if isinstance(ev, EvTickEnded):
+                continue
+            let label: str = event_label(ev)
+            if label.startswith("collision"):
+                tick_collisions = tick_collisions + 1
+            elif label.startswith("damage"):
+                tick_damage = tick_damage + 1
+            interesting.append(label)
+        total_collisions = total_collisions + tick_collisions
+        total_damage_events = total_damage_events + tick_damage
+
+        if (t + 1) % 5 == 0:
+            print(
+                f"tick {t + 1:>3}  alive={world.alive_count():>2}  "
+                f"collisions={tick_collisions:>2}  damage_events={tick_damage:>2}  "
+                f"total_events={len(evs):>2}"
+            )
+            if len(interesting) > 0 and len(interesting) <= 6:
+                for s in interesting:
+                    print(f"     - {s}")
+            elif len(interesting) > 6:
+                mut k: int = 0
+                while k < 6:
+                    print(f"     - {interesting[k]}")
+                    k = k + 1
+                let rest: int = len(interesting) - 6
+                print(f"     ... and {rest} more")
+
+        t = t + 1
+
+    print()
+    print("=== final report ===")
+    print(f"survivors: {world.alive_count()}")
+    print(f"total events processed: {total_events}")
+    print(f"  collisions: {total_collisions}")
+    print(f"  damage:     {total_damage_events}")
+    print()
+    print("surviving entities:")
+    for (raw, pos) in world.positions.items():
+        let eid: EntityId = EntityId(raw)
+        let h: Health? = world.get_health(eid)
+        mut hp_str: str = "?"
+        if h is not None:
+            hp_str = f"{h.hp}/{h.max_hp}"
+        print(f"  #{raw:>2}  pos={format_pos(pos.pos)}  hp={hp_str}")
+
+
+if __name__ == "__main__":
+    main()

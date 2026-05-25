@@ -1,0 +1,2 @@
+pub newtype EntityId = int
+pub newtype SystemName = str

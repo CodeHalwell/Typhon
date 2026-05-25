@@ -1,0 +1,80 @@
+from ids import Token, UserId
+from schema import User
+from store import Store
+
+
+pub type AuthError = TokenInvalid | TokenExpired | InsufficientRole
+
+
+pub class TokenInvalid:
+    reason: str
+
+
+pub class TokenExpired:
+    token: str
+
+
+pub class InsufficientRole:
+    have: str
+    need: str
+
+
+pub def make_token_invalid(reason: str) -> AuthError:
+    return TokenInvalid(reason=reason)
+
+
+pub def make_token_expired(token: str) -> AuthError:
+    return TokenExpired(token=token)
+
+
+pub def make_insufficient_role(have: str, need: str) -> AuthError:
+    return InsufficientRole(have=have, need=need)
+
+
+pub class AuthContext:
+    user_id: UserId
+    role: str
+
+
+pub def validate_token(token: Token, store: Store) -> Result[AuthContext, AuthError]:
+    let raw: str = str(token)
+    if not raw.startswith("tok-"):
+        return Err(make_token_invalid("missing tok- prefix"))
+    let body: str = raw[4:]
+    if body == "expired":
+        return Err(make_token_expired(raw))
+    let parts: list[str] = body.split("-")
+    if len(parts) != 2:
+        return Err(make_token_invalid("malformed token body"))
+    let uid_raw: str = parts[0]
+    let role: str = parts[1]
+    try:
+        let uid_int: int = int(uid_raw)
+        let user: User? = store.find_user(UserId(uid_int))
+        if user is None:
+            return Err(make_token_invalid(f"unknown user id {uid_int}"))
+        let resolved: User = user
+        if resolved.role != role:
+            return Err(make_token_invalid(f"role mismatch for user {uid_int}"))
+        return Ok(AuthContext(user_id=resolved.id, role=resolved.role))
+    except ValueError:
+        return Err(make_token_invalid(f"non-numeric user id {uid_raw}"))
+
+
+pub def require_role(ctx: AuthContext, required: str) -> Result[None, AuthError]:
+    if ctx.role == required:
+        return Ok(None)
+    if ctx.role == "admin":
+        return Ok(None)
+    return Err(make_insufficient_role(ctx.role, required))
+
+
+pub def auth_error_msg(e: AuthError) -> str:
+    match e:
+        case TokenInvalid(reason):
+            return f"auth: invalid token ({reason})"
+        case TokenExpired(token):
+            return f"auth: token expired ({token})"
+        case InsufficientRole(have, need):
+            return f"auth: role '{have}' insufficient, need '{need}'"
+    raise RuntimeError("unreachable")

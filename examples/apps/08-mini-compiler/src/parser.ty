@@ -1,0 +1,401 @@
+from lang_ast import (
+    ExBlock,
+    ExLet,
+    Expr,
+    Param,
+    expr_span,
+    make_ex_binop,
+    make_ex_block,
+    make_ex_bool,
+    make_ex_call,
+    make_ex_float,
+    make_ex_fn,
+    make_ex_ident,
+    make_ex_if,
+    make_ex_int,
+    make_ex_let,
+    make_ex_print,
+    make_ex_str,
+    make_ex_unary,
+    make_param,
+)
+from source import Span, make_span
+from tokens import (
+    Token,
+    TkArrow,
+    TkEof,
+    TkFloat,
+    TkIdent,
+    TkInt,
+    TkKeyword,
+    TkOp,
+    TkPunct,
+    TkStr,
+    token_span,
+)
+
+
+pub class ParseError:
+    message: str
+    span: Span
+
+
+pub class Parser:
+    tokens: list[Token]
+    pos: int
+
+
+def _err(message: str, span: Span) -> ParseError:
+    return ParseError(message=message, span=span)
+
+
+def _join_span(a: Span, b: Span) -> Span:
+    return make_span(a.start, b.end, a.line, a.col)
+
+
+impl Parser:
+    def peek(self) -> Token:
+        return self.tokens[self.pos]
+
+    def advance(self) -> Token:
+        let t: Token = self.tokens[self.pos]
+        if self.pos < len(self.tokens) - 1:
+            self.pos = self.pos + 1
+        return t
+
+    def at_end(self) -> bool:
+        let t: Token = self.tokens[self.pos]
+        match t:
+            case TkEof(_):
+                return True
+            case _:
+                return False
+        raise RuntimeError("unreachable")
+
+
+def _is_punct(t: Token, ch: str) -> bool:
+    match t:
+        case TkPunct(c_p, _):
+            return c_p == ch
+        case _:
+            return False
+    raise RuntimeError("unreachable")
+
+
+def _is_keyword(t: Token, word: str) -> bool:
+    match t:
+        case TkKeyword(w_k, _):
+            return w_k == word
+        case _:
+            return False
+    raise RuntimeError("unreachable")
+
+
+def _is_op(t: Token, op: str) -> bool:
+    match t:
+        case TkOp(o_x, _):
+            return o_x == op
+        case _:
+            return False
+    raise RuntimeError("unreachable")
+
+
+def _op_of(t: Token) -> str?:
+    match t:
+        case TkOp(o_v, _):
+            return o_v
+        case _:
+            return None
+    raise RuntimeError("unreachable")
+
+
+def _expect_punct(p: Parser, ch: str) -> Result[Span, ParseError]:
+    let t: Token = p.peek()
+    match t:
+        case TkPunct(c_e, sp_p):
+            if c_e == ch:
+                p.advance()
+                return Ok(value=sp_p)
+            return Err(error=_err(f"expected '{ch}', got '{c_e}'", sp_p))
+        case _:
+            return Err(error=_err(f"expected '{ch}'", token_span(t)))
+    raise RuntimeError("unreachable")
+
+
+def _expect_keyword(p: Parser, word: str) -> Result[Span, ParseError]:
+    let t: Token = p.peek()
+    match t:
+        case TkKeyword(w_e, sp_kw):
+            if w_e == word:
+                p.advance()
+                return Ok(value=sp_kw)
+            return Err(error=_err(f"expected '{word}', got '{w_e}'", sp_kw))
+        case _:
+            return Err(error=_err(f"expected keyword '{word}'", token_span(t)))
+    raise RuntimeError("unreachable")
+
+
+def _expect_arrow(p: Parser) -> Result[Span, ParseError]:
+    let t: Token = p.peek()
+    match t:
+        case TkArrow(sp_arr):
+            p.advance()
+            return Ok(value=sp_arr)
+        case _:
+            return Err(error=_err("expected '->'", token_span(t)))
+    raise RuntimeError("unreachable")
+
+
+def _expect_ident(p: Parser) -> Result[tuple[str, Span], ParseError]:
+    let t: Token = p.peek()
+    match t:
+        case TkIdent(nm_x, sp_id):
+            p.advance()
+            return Ok(value=(nm_x, sp_id))
+        case _:
+            return Err(error=_err("expected identifier", token_span(t)))
+    raise RuntimeError("unreachable")
+
+
+def _consume_eq(p: Parser) -> bool:
+    let t: Token = p.peek()
+    match t:
+        case TkOp(o_eq, _):
+            if o_eq == "=":
+                p.advance()
+                return True
+            return False
+        case _:
+            return False
+    raise RuntimeError("unreachable")
+
+
+# Pratt precedence table.
+def _infix_bp(op: str) -> tuple[int, int]?:
+    if op == "==" or op == "!=":
+        return (1, 2)
+    if op == "<" or op == ">" or op == "<=" or op == ">=":
+        return (3, 4)
+    if op == "+" or op == "-":
+        return (5, 6)
+    if op == "*" or op == "/":
+        return (7, 8)
+    return None
+
+
+def _parse_expr_bp(p: Parser, min_bp: int) -> Result[Expr, ParseError]:
+    let lhs_init: Expr = _parse_prefix(p)?
+    mut lhs: Expr = lhs_init
+    while True:
+        let t: Token = p.peek()
+        let op_opt: str? = _op_of(t)
+        if op_opt is None:
+            break
+        let op: str = op_opt
+        let bp_opt: tuple[int, int]? = _infix_bp(op)
+        if bp_opt is None:
+            break
+        let bp: tuple[int, int] = bp_opt
+        if bp[0] < min_bp:
+            break
+        p.advance()
+        let rhs: Expr = _parse_expr_bp(p, bp[1])?
+        let sp: Span = _join_span(expr_span(lhs), expr_span(rhs))
+        lhs = make_ex_binop(op, lhs, rhs, sp)
+    return Ok(value=lhs)
+
+
+def _parse_prefix(p: Parser) -> Result[Expr, ParseError]:
+    let t: Token = p.peek()
+    if _is_op(t, "-"):
+        let sp_minus: Span = token_span(t)
+        p.advance()
+        let operand: Expr = _parse_prefix(p)?
+        let sp_u: Span = _join_span(sp_minus, expr_span(operand))
+        return Ok(value=make_ex_unary("-", operand, sp_u))
+    return _parse_postfix(p)
+
+
+def _parse_postfix(p: Parser) -> Result[Expr, ParseError]:
+    let prim: Expr = _parse_primary(p)?
+    mut current: Expr = prim
+    while _is_punct(p.peek(), "("):
+        let next_call: Expr = _parse_call_tail(p, current)?
+        current = next_call
+    return Ok(value=current)
+
+
+def _parse_call_tail(p: Parser, callee: Expr) -> Result[Expr, ParseError]:
+    let _lp: Span = _expect_punct(p, "(")?
+    mut args: list[Expr] = []
+    if not _is_punct(p.peek(), ")"):
+        while True:
+            let arg: Expr = _parse_expr_bp(p, 0)?
+            args.append(arg)
+            if _is_punct(p.peek(), ","):
+                p.advance()
+                continue
+            break
+    let sp_close: Span = _expect_punct(p, ")")?
+    let sp: Span = _join_span(expr_span(callee), sp_close)
+    return Ok(value=make_ex_call(callee, args, sp))
+
+
+def _parse_primary(p: Parser) -> Result[Expr, ParseError]:
+    let t: Token = p.peek()
+    match t:
+        case TkInt(iv, sp_int):
+            p.advance()
+            return Ok(value=make_ex_int(iv, sp_int))
+        case TkFloat(fv, sp_flt):
+            p.advance()
+            return Ok(value=make_ex_float(fv, sp_flt))
+        case TkStr(sv, sp_str):
+            p.advance()
+            return Ok(value=make_ex_str(sv, sp_str))
+        case TkIdent(nv, sp_id):
+            p.advance()
+            return Ok(value=make_ex_ident(nv, sp_id))
+        case TkKeyword(wv, sp_kw):
+            if wv == "true":
+                p.advance()
+                return Ok(value=make_ex_bool(True, sp_kw))
+            if wv == "false":
+                p.advance()
+                return Ok(value=make_ex_bool(False, sp_kw))
+            if wv == "if":
+                return _parse_if(p)
+            if wv == "fun":
+                return _parse_fn(p)
+            if wv == "print":
+                return _parse_print(p)
+            if wv == "let":
+                return _parse_let_expr(p)
+            return Err(error=_err(f"unexpected keyword '{wv}'", sp_kw))
+        case TkPunct(cv, sp_pn):
+            if cv == "(":
+                p.advance()
+                let inner: Expr = _parse_expr_bp(p, 0)?
+                let _close: Span = _expect_punct(p, ")")?
+                return Ok(value=inner)
+            if cv == "{":
+                return _parse_block(p)
+            return Err(error=_err(f"unexpected punctuation '{cv}'", sp_pn))
+        case TkOp(ov, sp_op):
+            return Err(error=_err(f"unexpected operator '{ov}'", sp_op))
+        case TkArrow(sp_arr):
+            return Err(error=_err("unexpected '->'", sp_arr))
+        case TkEof(sp_eof):
+            return Err(error=_err("unexpected end of input", sp_eof))
+    raise RuntimeError("unreachable")
+
+
+def _parse_if(p: Parser) -> Result[Expr, ParseError]:
+    let sp_if: Span = _expect_keyword(p, "if")?
+    let cond: Expr = _parse_expr_bp(p, 0)?
+    let _t: Span = _expect_keyword(p, "then")?
+    let then_expr: Expr = _parse_expr_bp(p, 0)?
+    let _e: Span = _expect_keyword(p, "else")?
+    let else_expr: Expr = _parse_expr_bp(p, 0)?
+    let sp: Span = _join_span(sp_if, expr_span(else_expr))
+    return Ok(value=make_ex_if(cond, then_expr, else_expr, sp))
+
+
+def _parse_fn(p: Parser) -> Result[Expr, ParseError]:
+    let sp_fn: Span = _expect_keyword(p, "fun")?
+    let _lp: Span = _expect_punct(p, "(")?
+    mut params: list[Param] = []
+    if not _is_punct(p.peek(), ")"):
+        while True:
+            let id_pair: tuple[str, Span] = _expect_ident(p)?
+            let _colon: Span = _expect_punct(p, ":")?
+            let ty_pair: tuple[str, Span] = _expect_ident(p)?
+            params.append(make_param(id_pair[0], ty_pair[0]))
+            if _is_punct(p.peek(), ","):
+                p.advance()
+                continue
+            break
+    let _rp: Span = _expect_punct(p, ")")?
+    let _arr: Span = _expect_arrow(p)?
+    let ret_pair: tuple[str, Span] = _expect_ident(p)?
+    let body: Expr = _parse_block(p)?
+    let sp: Span = _join_span(sp_fn, expr_span(body))
+    return Ok(value=make_ex_fn(params, ret_pair[0], body, sp))
+
+
+def _parse_block(p: Parser) -> Result[Expr, ParseError]:
+    let sp_open: Span = _expect_punct(p, "{")?
+    mut exprs: list[Expr] = []
+    while not _is_punct(p.peek(), "}"):
+        let stmt: Expr = _parse_statement(p)?
+        exprs.append(stmt)
+        if _is_punct(p.peek(), ";"):
+            p.advance()
+    let sp_close: Span = _expect_punct(p, "}")?
+    return Ok(value=make_ex_block(exprs, _join_span(sp_open, sp_close)))
+
+
+def _parse_print(p: Parser) -> Result[Expr, ParseError]:
+    let sp_pr: Span = _expect_keyword(p, "print")?
+    let _lp: Span = _expect_punct(p, "(")?
+    let arg: Expr = _parse_expr_bp(p, 0)?
+    let sp_rp: Span = _expect_punct(p, ")")?
+    return Ok(value=make_ex_print(arg, _join_span(sp_pr, sp_rp)))
+
+
+def _parse_let_expr(p: Parser) -> Result[Expr, ParseError]:
+    # `let name = value` — body is patched by `parse()` to be the rest of the
+    # top-level (or block) statement stream.
+    let sp_let: Span = _expect_keyword(p, "let")?
+    let id_pair: tuple[str, Span] = _expect_ident(p)?
+    let saw_eq: bool = _consume_eq(p)
+    if not saw_eq:
+        return Err(error=_err("expected '=' in let binding", token_span(p.peek())))
+    let value: Expr = _parse_expr_bp(p, 0)?
+    let empty_body: list[Expr] = []
+    let placeholder_body: Expr = make_ex_block(empty_body, expr_span(value))
+    return Ok(value=make_ex_let(id_pair[0], value, placeholder_body, _join_span(sp_let, expr_span(value))))
+
+
+def _parse_statement(p: Parser) -> Result[Expr, ParseError]:
+    if _is_keyword(p.peek(), "let"):
+        return _parse_let_expr(p)
+    return _parse_expr_bp(p, 0)
+
+
+pub def parse(tokens: list[Token]) -> Result[Expr, ParseError]:
+    let p: Parser = Parser(tokens=tokens, pos=0)
+    mut stmts: list[Expr] = []
+    while not p.at_end():
+        let stmt: Expr = _parse_statement(p)?
+        stmts.append(stmt)
+        if _is_punct(p.peek(), ";"):
+            p.advance()
+    let body: Expr = _thread_lets(stmts, 0)
+    return Ok(value=body)
+
+
+def _thread_lets(stmts: list[Expr], idx: int) -> Expr:
+    if idx >= len(stmts):
+        let empty_stmts: list[Expr] = []
+        return make_ex_block(empty_stmts, make_span(0, 0, 1, 1))
+    let here: Expr = stmts[idx]
+    match here:
+        case ExLet(lname, lvalue, _body_unused, sp_let_n):
+            let rest: Expr = _thread_lets(stmts, idx + 1)
+            return make_ex_let(lname, lvalue, rest, sp_let_n)
+        case _:
+            if idx == len(stmts) - 1:
+                return here
+            let rest_b: Expr = _thread_lets(stmts, idx + 1)
+            match rest_b:
+                case ExBlock(inner_exprs, sp_blk_b):
+                    mut combined: list[Expr] = [here]
+                    for ie in inner_exprs:
+                        combined.append(ie)
+                    return make_ex_block(combined, _join_span(expr_span(here), sp_blk_b))
+                case _:
+                    let pair_list: list[Expr] = [here, rest_b]
+                    return make_ex_block(pair_list, _join_span(expr_span(here), expr_span(rest_b)))
+            raise RuntimeError("unreachable")
+    raise RuntimeError("unreachable")

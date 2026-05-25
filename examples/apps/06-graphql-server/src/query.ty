@@ -1,0 +1,215 @@
+pub type QueryNode = NodeField | NodeList
+
+
+pub class NodeField:
+    name: str
+    args: dict[str, str]
+    selections: list[QueryNode]
+
+
+pub class NodeList:
+    name: str
+    args: dict[str, str]
+    selections: list[QueryNode]
+
+
+pub def make_node_field(name: str, args: dict[str, str], selections: list[QueryNode]) -> QueryNode:
+    return NodeField(name=name, args=args, selections=selections)
+
+
+pub def make_node_list(name: str, args: dict[str, str], selections: list[QueryNode]) -> QueryNode:
+    return NodeList(name=name, args=args, selections=selections)
+
+
+pub def node_name(node: QueryNode) -> str:
+    match node:
+        case NodeField(name, _, _): return name
+        case NodeList(name, _, _):  return name
+    raise RuntimeError("unreachable")
+
+
+pub def node_args(node: QueryNode) -> dict[str, str]:
+    match node:
+        case NodeField(_, args, _): return args
+        case NodeList(_, args, _):  return args
+    raise RuntimeError("unreachable")
+
+
+pub def node_selections(node: QueryNode) -> list[QueryNode]:
+    match node:
+        case NodeField(_, _, sels): return sels
+        case NodeList(_, _, sels):  return sels
+    raise RuntimeError("unreachable")
+
+
+# Known list-yielding field names. Used to decide NodeField vs NodeList
+# without relying on a brittle trailing-s heuristic.
+let LIST_FIELDS: list[str] = ["users", "posts", "comments"]
+
+
+pub class Lexeme:
+    kind: str
+    value: str
+
+
+def _tokenise(raw: str) -> list[Lexeme]:
+    mut out: list[Lexeme] = []
+    mut i: int = 0
+    let n: int = len(raw)
+    while i < n:
+        let ch: str = raw[i]
+        if ch == " " or ch == "\t" or ch == "\n" or ch == "\r":
+            i = i + 1
+            continue
+        if ch == "{":
+            out.append(Lexeme(kind="lbrace", value="{"))
+            i = i + 1
+            continue
+        if ch == "}":
+            out.append(Lexeme(kind="rbrace", value="}"))
+            i = i + 1
+            continue
+        if ch == "(":
+            out.append(Lexeme(kind="lparen", value="("))
+            i = i + 1
+            continue
+        if ch == ")":
+            out.append(Lexeme(kind="rparen", value=")"))
+            i = i + 1
+            continue
+        if ch == ",":
+            out.append(Lexeme(kind="comma", value=","))
+            i = i + 1
+            continue
+        if ch == ":":
+            out.append(Lexeme(kind="colon", value=":"))
+            i = i + 1
+            continue
+        # ident or value: run of non-delimiter characters
+        mut j: int = i
+        while j < n:
+            let cj: str = raw[j]
+            if cj == " " or cj == "\t" or cj == "\n" or cj == "\r":
+                break
+            if cj == "{" or cj == "}" or cj == "(" or cj == ")" or cj == "," or cj == ":":
+                break
+            j = j + 1
+        if j == i:
+            # Defensive: should not happen, but advance to avoid loop.
+            i = i + 1
+            continue
+        out.append(Lexeme(kind="ident", value=raw[i:j]))
+        i = j
+    return out
+
+
+pub class Parser:
+    tokens: list[Lexeme]
+    pos: int
+
+
+impl Parser:
+    def peek(self) -> Lexeme?:
+        if self.pos < len(self.tokens):
+            return self.tokens[self.pos]
+        return None
+
+    def advance(self) -> Lexeme?:
+        let t: Lexeme? = self.peek()
+        if t is not None:
+            self.pos = self.pos + 1
+        return t
+
+    def expect_kind(self, kind: str) -> Result[Lexeme, str]:
+        let t: Lexeme? = self.advance()
+        if t is None:
+            return Err(f"expected {kind}, got end of input")
+        let tt: Lexeme = t
+        if tt.kind != kind:
+            return Err(f"expected {kind}, got {tt.kind} '{tt.value}'")
+        return Ok(tt)
+
+    def parse_args(self) -> Result[dict[str, str], str]:
+        mut args: dict[str, str] = {}
+        let head: Lexeme? = self.peek()
+        if head is None:
+            return Ok(args)
+        let h: Lexeme = head
+        if h.kind != "lparen":
+            return Ok(args)
+        self.pos = self.pos + 1  # consume '('
+        # Allow empty arg list "()"
+        let after_open: Lexeme? = self.peek()
+        if after_open is not None:
+            let ao: Lexeme = after_open
+            if ao.kind == "rparen":
+                self.pos = self.pos + 1
+                return Ok(args)
+        mut first: bool = True
+        while True:
+            if not first:
+                let sep: Lexeme? = self.peek()
+                if sep is None:
+                    return Err("unexpected end of input in arg list")
+                let s: Lexeme = sep
+                if s.kind == "rparen":
+                    break
+                if s.kind != "comma":
+                    return Err(f"expected ',' or ')' in arg list, got {s.kind} '{s.value}'")
+                self.pos = self.pos + 1
+            first = False
+            let key_t: Lexeme = self.expect_kind("ident")?
+            let _colon: Lexeme = self.expect_kind("colon")?
+            let val_t: Lexeme = self.expect_kind("ident")?
+            args[key_t.value] = val_t.value
+            let nxt: Lexeme? = self.peek()
+            if nxt is None:
+                return Err("unexpected end of input in arg list")
+            let nx: Lexeme = nxt
+            if nx.kind == "rparen":
+                break
+        let _close: Lexeme = self.expect_kind("rparen")?
+        return Ok(args)
+
+    def parse_selection_set(self) -> Result[list[QueryNode], str]:
+        mut out: list[QueryNode] = []
+        let head: Lexeme? = self.peek()
+        if head is None:
+            return Ok(out)
+        let h: Lexeme = head
+        if h.kind != "lbrace":
+            return Ok(out)
+        self.pos = self.pos + 1  # consume '{'
+        while True:
+            let nxt: Lexeme? = self.peek()
+            if nxt is None:
+                return Err("unexpected end of input in selection set")
+            let n: Lexeme = nxt
+            if n.kind == "rbrace":
+                self.pos = self.pos + 1
+                break
+            let node: QueryNode = self.parse_field()?
+            out.append(node)
+        return Ok(out)
+
+    def parse_field(self) -> Result[QueryNode, str]:
+        let name_t: Lexeme = self.expect_kind("ident")?
+        let name: str = name_t.value
+        let args: dict[str, str] = self.parse_args()?
+        let sels: list[QueryNode] = self.parse_selection_set()?
+        if name in LIST_FIELDS:
+            return Ok(make_node_list(name, args, sels))
+        return Ok(make_node_field(name, args, sels))
+
+
+pub def parse_query(raw: str) -> Result[QueryNode, str]:
+    let tokens: list[Lexeme] = _tokenise(raw)
+    if len(tokens) == 0:
+        return Err("empty query")
+    let parser: Parser = Parser(tokens=tokens, pos=0)
+    let root: QueryNode = parser.parse_field()?
+    let trailing: Lexeme? = parser.peek()
+    if trailing is not None:
+        let t: Lexeme = trailing
+        return Err(f"unexpected trailing token: {t.kind} '{t.value}'")
+    return Ok(root)
