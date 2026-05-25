@@ -4431,52 +4431,83 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
 /// inside a nested helper belongs to that helper, not the outer
 /// context-manager factory.
 fn extract_first_yield_type(body: &[Stmt], classes: &[String]) -> Option<Type> {
-    fn walk_stmts(stmts: &[Stmt], classes: &[String]) -> Option<Type> {
+    // R3-3 follow-up: pre-collect annotation-side types of local
+    // bindings inside this function body so a `yield s` whose `s` was
+    // declared as `let s: Session = …` resolves to `Session` instead
+    // of `Unknown`. The walk only looks at AnnAssign forms — bareword
+    // `s = make_session()` still leaves `s` as Unknown because the
+    // pre-scan runs before full type inference. Authors who need the
+    // tighter bind can add an explicit annotation (`let s: Session =
+    // make_session()`), which is the same advice the rest of Typhon's
+    // type-clean idiom encourages.
+    //
+    // The map covers `let NAME: T = …`, `mut NAME: T = …`, and plain
+    // `NAME: T = …` (class-body-style annotations Python allows in
+    // function bodies). Last writer wins inside any straight-line
+    // body; sibling-branch shadowing is intentionally not modelled
+    // because the FIRST yield wins anyway.
+    let mut annotations: HashMap<String, Type> = HashMap::new();
+    collect_local_annotations(body, classes, &mut annotations);
+    fn walk_stmts(
+        stmts: &[Stmt],
+        classes: &[String],
+        annotations: &HashMap<String, Type>,
+    ) -> Option<Type> {
         for stmt in stmts {
-            if let Some(t) = walk_stmt(stmt, classes) {
+            if let Some(t) = walk_stmt(stmt, classes, annotations) {
                 return Some(t);
             }
         }
         None
     }
-    fn walk_stmt(stmt: &Stmt, classes: &[String]) -> Option<Type> {
+    fn walk_stmt(
+        stmt: &Stmt,
+        classes: &[String],
+        annotations: &HashMap<String, Type>,
+    ) -> Option<Type> {
         match stmt {
-            Stmt::Expr(e) => walk_expr(&e.value, classes),
-            Stmt::Assign(a) => walk_expr(&a.value, classes),
-            Stmt::AnnAssign(a) => a.value.as_deref().and_then(|v| walk_expr(v, classes)),
-            Stmt::AugAssign(a) => walk_expr(&a.value, classes),
-            Stmt::Return(r) => r.value.as_deref().and_then(|v| walk_expr(v, classes)),
+            Stmt::Expr(e) => walk_expr(&e.value, classes, annotations),
+            Stmt::Assign(a) => walk_expr(&a.value, classes, annotations),
+            Stmt::AnnAssign(a) => a
+                .value
+                .as_deref()
+                .and_then(|v| walk_expr(v, classes, annotations)),
+            Stmt::AugAssign(a) => walk_expr(&a.value, classes, annotations),
+            Stmt::Return(r) => r
+                .value
+                .as_deref()
+                .and_then(|v| walk_expr(v, classes, annotations)),
             Stmt::If(s) => {
-                if let Some(t) = walk_stmts(&s.body, classes) {
+                if let Some(t) = walk_stmts(&s.body, classes, annotations) {
                     return Some(t);
                 }
                 for clause in &s.elif_else_clauses {
-                    if let Some(t) = walk_stmts(&clause.body, classes) {
+                    if let Some(t) = walk_stmts(&clause.body, classes, annotations) {
                         return Some(t);
                     }
                 }
                 None
             }
-            Stmt::For(f) => walk_stmts(&f.body, classes).or_else(|| walk_stmts(&f.orelse, classes)),
-            Stmt::While(w) => {
-                walk_stmts(&w.body, classes).or_else(|| walk_stmts(&w.orelse, classes))
-            }
-            Stmt::With(w) => walk_stmts(&w.body, classes),
-            Stmt::Try(t) => walk_stmts(&t.body, classes)
+            Stmt::For(f) => walk_stmts(&f.body, classes, annotations)
+                .or_else(|| walk_stmts(&f.orelse, classes, annotations)),
+            Stmt::While(w) => walk_stmts(&w.body, classes, annotations)
+                .or_else(|| walk_stmts(&w.orelse, classes, annotations)),
+            Stmt::With(w) => walk_stmts(&w.body, classes, annotations),
+            Stmt::Try(t) => walk_stmts(&t.body, classes, annotations)
                 .or_else(|| {
                     for h in &t.handlers {
                         let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
-                        if let Some(t) = walk_stmts(&h.body, classes) {
+                        if let Some(t) = walk_stmts(&h.body, classes, annotations) {
                             return Some(t);
                         }
                     }
                     None
                 })
-                .or_else(|| walk_stmts(&t.orelse, classes))
-                .or_else(|| walk_stmts(&t.finalbody, classes)),
+                .or_else(|| walk_stmts(&t.orelse, classes, annotations))
+                .or_else(|| walk_stmts(&t.finalbody, classes, annotations)),
             Stmt::Match(m) => {
                 for case in &m.cases {
-                    if let Some(t) = walk_stmts(&case.body, classes) {
+                    if let Some(t) = walk_stmts(&case.body, classes, annotations) {
                         return Some(t);
                     }
                 }
@@ -4487,12 +4518,16 @@ fn extract_first_yield_type(body: &[Stmt], classes: &[String]) -> Option<Type> {
             _ => None,
         }
     }
-    fn walk_expr(expr: &Expr, classes: &[String]) -> Option<Type> {
+    fn walk_expr(
+        expr: &Expr,
+        classes: &[String],
+        annotations: &HashMap<String, Type>,
+    ) -> Option<Type> {
         match expr {
             Expr::Yield(y) => {
                 let v = y.value.as_deref();
                 match v {
-                    Some(e) => Some(yield_payload_type(e, classes)),
+                    Some(e) => Some(yield_payload_type(e, classes, annotations)),
                     None => Some(Type::None),
                 }
             }
@@ -4507,10 +4542,13 @@ fn extract_first_yield_type(body: &[Stmt], classes: &[String]) -> Option<Type> {
     /// Best-effort literal-shape inference for the yielded expression
     /// without firing the full `infer_expr` (which requires a Checker).
     /// Covers the patterns context-manager factories actually use:
-    /// bare names (resolved through `classes`), class-constructor calls,
-    /// `None`, literals, and `Result`-constructor calls. Anything else
-    /// falls back to `Type::Unknown`.
-    fn yield_payload_type(expr: &Expr, classes: &[String]) -> Type {
+    /// bare names (resolved through `classes` or local annotations),
+    /// class-constructor calls, `None`, literals.
+    fn yield_payload_type(
+        expr: &Expr,
+        classes: &[String],
+        annotations: &HashMap<String, Type>,
+    ) -> Type {
         match expr {
             Expr::NoneLiteral(_) => Type::None,
             Expr::BooleanLiteral(_) => Type::Bool,
@@ -4527,26 +4565,89 @@ fn extract_first_yield_type(body: &[Stmt], classes: &[String]) -> Option<Type> {
                     if classes.iter().any(|c| c == head) {
                         Type::Class(head.to_owned())
                     } else {
-                        // Free-function calls — we don't have the return
-                        // type without a Checker. Annotation-side users
-                        // can still infer correctly from the caller's
-                        // declared `as r:` type if they need to.
                         Type::Unknown
                     }
                 }
                 _ => Type::Unknown,
             },
             Expr::Name(n) => {
-                // `yield x` where `x` is a local. We don't have the env
-                // pre-scan-time, so leave as Unknown — the body-walk
-                // will infer correctly when consumers re-enter.
-                let _ = n;
-                Type::Unknown
+                // R3-3: `yield s` where `s` is a local. Consult the
+                // pre-collected annotation map; falls back to Unknown
+                // for bareword-bound locals (no explicit annotation).
+                annotations
+                    .get(n.id.as_str())
+                    .cloned()
+                    .unwrap_or(Type::Unknown)
             }
             _ => Type::Unknown,
         }
     }
-    walk_stmts(body, classes)
+    walk_stmts(body, classes, &annotations)
+}
+
+/// Walk a function body and record every annotated local binding's
+/// declared type. Mirrors `extract_first_yield_type`'s descent through
+/// control-flow statements so a `let s: Session` inside an `if` /
+/// `try` / `with` is still visible at the matching yield site. Does
+/// not descend into nested function definitions.
+fn collect_local_annotations(
+    body: &[Stmt],
+    classes: &[String],
+    out: &mut HashMap<String, Type>,
+) {
+    for stmt in body {
+        collect_local_annotations_stmt(stmt, classes, out);
+    }
+}
+
+fn collect_local_annotations_stmt(
+    stmt: &Stmt,
+    classes: &[String],
+    out: &mut HashMap<String, Type>,
+) {
+    match stmt {
+        Stmt::AnnAssign(a) => {
+            if let Expr::Name(n) = a.target.as_ref() {
+                let ty = type_from_annotation(a.annotation.as_ref(), classes);
+                if !matches!(ty, Type::Unknown) {
+                    out.insert(n.id.as_str().to_owned(), ty);
+                }
+            }
+        }
+        Stmt::If(s) => {
+            collect_local_annotations(&s.body, classes, out);
+            for clause in &s.elif_else_clauses {
+                collect_local_annotations(&clause.body, classes, out);
+            }
+        }
+        Stmt::For(f) => {
+            collect_local_annotations(&f.body, classes, out);
+            collect_local_annotations(&f.orelse, classes, out);
+        }
+        Stmt::While(w) => {
+            collect_local_annotations(&w.body, classes, out);
+            collect_local_annotations(&w.orelse, classes, out);
+        }
+        Stmt::With(w) => {
+            collect_local_annotations(&w.body, classes, out);
+        }
+        Stmt::Try(t) => {
+            collect_local_annotations(&t.body, classes, out);
+            for h in &t.handlers {
+                let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                collect_local_annotations(&h.body, classes, out);
+            }
+            collect_local_annotations(&t.orelse, classes, out);
+            collect_local_annotations(&t.finalbody, classes, out);
+        }
+        Stmt::Match(m) => {
+            for case in &m.cases {
+                collect_local_annotations(&case.body, classes, out);
+            }
+        }
+        // Nested function defs are intentionally NOT descended into.
+        _ => {}
+    }
 }
 
 /// Extract the names of PEP 695 type parameters from the `Option<Box<TypeParams>>`
@@ -6526,6 +6627,23 @@ fn check_function(
         check_stmt(c, stmt);
     }
 
+    // R3-8 definite-assignment analysis. Walk the function body once,
+    // tracking the "definitely-assigned" set at every control-flow
+    // point. Any READ of a name declared by `let NAME: T` (no
+    // initialiser) on a path where the name hasn't been assigned yet
+    // is `tyc::use_of_uninitialised`. The set is intersected across
+    // `if` / `match` branches (only assignments that happen on EVERY
+    // branch propagate out) and ignored across `for` / `while` bodies
+    // (the loop body may not execute). Closed-form assignments
+    // (`let x: T = …`, `mut x: T = …`, `x = …` against a tracked
+    // declare-only name) all add the name to the set.
+    //
+    // Compiler-synthesised helpers (`__typhon_*`) and stub bodies are
+    // exempted for the same reasons Rule 1 / missing-return are.
+    if !name.starts_with("__typhon_") && !body_is_stub(body) {
+        run_definite_assignment_pass(c, body);
+    }
+
     // Missing-return analysis (FINDINGS #82): when the declared return
     // type cannot accommodate `None` and the body is not a generator
     // (yield → iterator), every path through the function must end in
@@ -6558,6 +6676,613 @@ fn check_function(
     c.in_sync_function = saved_in_sync;
     c.in_async_function = saved_in_async;
     c.in_generator = saved_in_generator;
+}
+
+/// R3-8 definite-assignment pass. Walks a function body looking for
+/// reads of `let NAME: T` (no initialiser) bindings on a path where
+/// the name has not yet been assigned, and emits
+/// `tyc::use_of_uninitialised` for each.
+///
+/// The analysis is structural-recursive — no explicit CFG. Branch
+/// constructs (`if` / `match`) snapshot the "definitely-assigned"
+/// set, walk each arm fresh, and intersect the results so only
+/// assignments that happen on EVERY arm propagate out. Loops
+/// (`for` / `while`) discard the body's assignments because the loop
+/// may execute zero times. `try` joins body + handlers + orelse with
+/// intersection; `finally` extends unconditionally.
+///
+/// `return` / `raise` / `continue` / `break` in a branch mark the
+/// branch as "diverges" — the intersection step skips diverging
+/// branches so `let x: T; if cond: x = a else: return` still reads
+/// `x` cleanly after the if (the else-branch never reaches the join).
+fn run_definite_assignment_pass(c: &mut Checker, body: &[Stmt]) {
+    // First, scan the body for `let NAME: T` / `mut NAME: T` (no
+    // initialiser) declarations. These are the names we track. Each
+    // entry remembers (name → declaration-span) so the diagnostic can
+    // label both ends of the bug. Lookups by name use HashMap; the
+    // span is for the diagnostic only.
+    let mut tracked: HashMap<String, (usize, usize)> = HashMap::new();
+    collect_uninit_let_decls(body, &mut tracked);
+    if tracked.is_empty() {
+        return;
+    }
+    let mut state = DaState::new();
+    da_walk_stmts(c, body, &tracked, &mut state);
+}
+
+#[derive(Clone, Debug)]
+struct DaState {
+    /// Names that have been assigned on every path reaching the
+    /// current point.
+    assigned: std::collections::HashSet<String>,
+    /// True when control flow definitely cannot fall through (a
+    /// `return` / `raise` / unconditional terminator has been seen).
+    /// A diverging branch is ignored by the intersection step.
+    diverges: bool,
+}
+
+impl DaState {
+    fn new() -> Self {
+        Self {
+            assigned: std::collections::HashSet::new(),
+            diverges: false,
+        }
+    }
+    fn assign(&mut self, name: &str) {
+        self.assigned.insert(name.to_owned());
+    }
+}
+
+fn collect_uninit_let_decls(body: &[Stmt], out: &mut HashMap<String, (usize, usize)>) {
+    for stmt in body {
+        collect_uninit_let_decls_stmt(stmt, out);
+    }
+}
+
+fn collect_uninit_let_decls_stmt(stmt: &Stmt, out: &mut HashMap<String, (usize, usize)>) {
+    match stmt {
+        Stmt::AnnAssign(a) => {
+            // R3-8 declare-only: `let NAME: T` / `mut NAME: T` with no
+            // value. `let` is the case we care about; `mut` allows
+            // re-assignment and so the DA discipline doesn't add
+            // anything (the resolver already permits any number of
+            // assignments).
+            if a.value.is_none() && matches!(a.mutability, Some(ruff_python_ast::Mutability::Let)) {
+                if let Expr::Name(n) = a.target.as_ref() {
+                    let start = n.range.start().to_usize();
+                    let len = n.id.as_str().len();
+                    out.insert(n.id.as_str().to_owned(), (start, len));
+                }
+            }
+        }
+        Stmt::If(s) => {
+            collect_uninit_let_decls(&s.body, out);
+            for clause in &s.elif_else_clauses {
+                collect_uninit_let_decls(&clause.body, out);
+            }
+        }
+        Stmt::For(f) => {
+            collect_uninit_let_decls(&f.body, out);
+            collect_uninit_let_decls(&f.orelse, out);
+        }
+        Stmt::While(w) => {
+            collect_uninit_let_decls(&w.body, out);
+            collect_uninit_let_decls(&w.orelse, out);
+        }
+        Stmt::With(w) => collect_uninit_let_decls(&w.body, out),
+        Stmt::Try(t) => {
+            collect_uninit_let_decls(&t.body, out);
+            for h in &t.handlers {
+                let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                collect_uninit_let_decls(&h.body, out);
+            }
+            collect_uninit_let_decls(&t.orelse, out);
+            collect_uninit_let_decls(&t.finalbody, out);
+        }
+        Stmt::Match(m) => {
+            for case in &m.cases {
+                collect_uninit_let_decls(&case.body, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn da_walk_stmts(
+    c: &mut Checker,
+    stmts: &[Stmt],
+    tracked: &HashMap<String, (usize, usize)>,
+    state: &mut DaState,
+) {
+    for stmt in stmts {
+        if state.diverges {
+            // Unreachable after divergence — still walk to satisfy
+            // checker invariants, but uses here can't produce
+            // surprising user-facing diagnostics.
+            return;
+        }
+        da_walk_stmt(c, stmt, tracked, state);
+    }
+}
+
+fn da_walk_stmt(
+    c: &mut Checker,
+    stmt: &Stmt,
+    tracked: &HashMap<String, (usize, usize)>,
+    state: &mut DaState,
+) {
+    match stmt {
+        Stmt::AnnAssign(a) => {
+            // Check the annotation and the RHS for uses first
+            // (`let x: T = use_of_x_would_fire_here`).
+            da_check_expr(c, &a.annotation, tracked, state);
+            if let Some(v) = a.value.as_deref() {
+                da_check_expr(c, v, tracked, state);
+            }
+            // Then mark the target as assigned (the binding becomes
+            // initialised from this point forward).
+            if let Expr::Name(n) = a.target.as_ref() {
+                if a.value.is_some() {
+                    state.assign(n.id.as_str());
+                }
+            }
+        }
+        Stmt::Assign(a) => {
+            da_check_expr(c, &a.value, tracked, state);
+            for t in &a.targets {
+                da_collect_assign_targets(t, state);
+            }
+        }
+        Stmt::AugAssign(a) => {
+            // Augmented assignment reads first (`x += 1` requires x to
+            // be initialised), then writes.
+            da_check_expr(c, &a.target, tracked, state);
+            da_check_expr(c, &a.value, tracked, state);
+            if let Expr::Name(n) = a.target.as_ref() {
+                state.assign(n.id.as_str());
+            }
+        }
+        Stmt::Expr(e) => da_check_expr(c, &e.value, tracked, state),
+        Stmt::Return(r) => {
+            if let Some(v) = r.value.as_deref() {
+                da_check_expr(c, v, tracked, state);
+            }
+            state.diverges = true;
+        }
+        Stmt::Raise(r) => {
+            if let Some(exc) = &r.exc {
+                da_check_expr(c, exc, tracked, state);
+            }
+            if let Some(cause) = &r.cause {
+                da_check_expr(c, cause, tracked, state);
+            }
+            state.diverges = true;
+        }
+        Stmt::If(s) => {
+            da_check_expr(c, &s.test, tracked, state);
+            // Snapshot, walk each branch fresh, intersect non-diverging
+            // branches afterwards.
+            let pre = state.clone();
+            let mut branch_states: Vec<DaState> = Vec::new();
+            let mut after_then = pre.clone();
+            da_walk_stmts(c, &s.body, tracked, &mut after_then);
+            branch_states.push(after_then);
+            let mut had_else = false;
+            for clause in &s.elif_else_clauses {
+                if let Some(test) = &clause.test {
+                    da_check_expr(c, test, tracked, state);
+                } else {
+                    had_else = true;
+                }
+                let mut arm_state = pre.clone();
+                da_walk_stmts(c, &clause.body, tracked, &mut arm_state);
+                branch_states.push(arm_state);
+            }
+            // Without an `else`, the implicit fall-through path adds a
+            // synthesised branch with no new assignments — so anything
+            // assigned in only the `then` arm does NOT propagate out.
+            if !had_else {
+                branch_states.push(pre.clone());
+            }
+            *state = intersect_branches(&pre, &branch_states);
+        }
+        Stmt::Match(m) => {
+            da_check_expr(c, &m.subject, tracked, state);
+            let pre = state.clone();
+            let mut branch_states: Vec<DaState> = Vec::new();
+            for case in &m.cases {
+                if let Some(g) = &case.guard {
+                    da_check_expr(c, g, tracked, state);
+                }
+                let mut arm_state = pre.clone();
+                da_walk_stmts(c, &case.body, tracked, &mut arm_state);
+                branch_states.push(arm_state);
+            }
+            // R3-8: `match` is exhaustive (no implicit fall-through
+            // branch needed) when either (a) the match has a wildcard
+            // arm, or (b) the subject is a sealed union and every
+            // declared variant is covered. The Result idiom
+            // `case Ok(v): loaded = v; case Err(e): return Err(e)`
+            // hits case (b) — without this, the DA pass would
+            // pessimistically add an implicit fall-through that
+            // pretends `loaded` might be uninit afterwards, defeating
+            // the whole declare-then-assign pattern. Non-exhaustive
+            // matches (covered by the separate
+            // `tyc::non_exhaustive_match` diagnostic) keep the
+            // implicit fall-through so DA remains sound.
+            if !match_is_exhaustive_for_da(c, &m.subject, &m.cases) {
+                branch_states.push(pre.clone());
+            }
+            *state = intersect_branches(&pre, &branch_states);
+        }
+        Stmt::For(f) => {
+            da_check_expr(c, &f.iter, tracked, state);
+            // Loop body may execute zero times; assignments inside do
+            // not propagate out. Mark the loop variable as assigned
+            // for the body walk so a `for k in d:` body can read `k`.
+            let mut body_state = state.clone();
+            da_collect_for_target(&f.target, &mut body_state);
+            da_walk_stmts(c, &f.body, tracked, &mut body_state);
+            // orelse runs after the loop completes naturally — same
+            // pre-state as the surrounding code.
+            da_walk_stmts(c, &f.orelse, tracked, state);
+        }
+        Stmt::While(w) => {
+            da_check_expr(c, &w.test, tracked, state);
+            let mut body_state = state.clone();
+            da_walk_stmts(c, &w.body, tracked, &mut body_state);
+            da_walk_stmts(c, &w.orelse, tracked, state);
+        }
+        Stmt::With(w) => {
+            for item in &w.items {
+                da_check_expr(c, &item.context_expr, tracked, state);
+                if let Some(target) = item.optional_vars.as_deref() {
+                    da_collect_assign_targets(target, state);
+                }
+            }
+            da_walk_stmts(c, &w.body, tracked, state);
+        }
+        Stmt::Try(t) => {
+            // Body may raise at any point, so handlers see the
+            // pre-state, not the post-body state.
+            let pre = state.clone();
+            let mut body_state = pre.clone();
+            da_walk_stmts(c, &t.body, tracked, &mut body_state);
+            let mut branch_states: Vec<DaState> = Vec::new();
+            // The body path is one branch — assignments from there
+            // are only valid if no handler caught an early
+            // exception. Conservatively include it.
+            branch_states.push(body_state);
+            for h in &t.handlers {
+                let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                let mut h_state = pre.clone();
+                if let Some(name) = &h.name {
+                    h_state.assign(name.as_str());
+                }
+                da_walk_stmts(c, &h.body, tracked, &mut h_state);
+                branch_states.push(h_state);
+            }
+            *state = intersect_branches(&pre, &branch_states);
+            // orelse runs only after a clean body (no exception);
+            // walk it from the joined state.
+            da_walk_stmts(c, &t.orelse, tracked, state);
+            // finally always runs; walk it unconditionally.
+            da_walk_stmts(c, &t.finalbody, tracked, state);
+        }
+        Stmt::FunctionDef(_) | Stmt::ClassDef(_) | Stmt::TypeAlias(_) => {
+            // Nested defs / classes / type aliases are local-bound
+            // names but their body's flow doesn't affect the outer
+            // DA state.
+            if let Stmt::FunctionDef(f) = stmt {
+                state.assign(f.name.as_str());
+            }
+            if let Stmt::ClassDef(cd) = stmt {
+                state.assign(cd.name.as_str());
+            }
+        }
+        Stmt::Import(i) => {
+            for alias in &i.names {
+                let bound = alias
+                    .asname
+                    .as_ref()
+                    .map(|n| n.as_str().to_owned())
+                    .unwrap_or_else(|| {
+                        alias
+                            .name
+                            .as_str()
+                            .split('.')
+                            .next()
+                            .unwrap_or(alias.name.as_str())
+                            .to_owned()
+                    });
+                state.assign(&bound);
+            }
+        }
+        Stmt::ImportFrom(i) => {
+            for alias in &i.names {
+                let bound = alias
+                    .asname
+                    .as_ref()
+                    .map(|n| n.as_str().to_owned())
+                    .unwrap_or_else(|| alias.name.as_str().to_owned());
+                state.assign(&bound);
+            }
+        }
+        Stmt::Global(g) => {
+            for name in &g.names {
+                state.assign(name.as_str());
+            }
+        }
+        Stmt::Nonlocal(g) => {
+            for name in &g.names {
+                state.assign(name.as_str());
+            }
+        }
+        Stmt::Delete(d) => {
+            for tgt in &d.targets {
+                da_check_expr(c, tgt, tracked, state);
+            }
+        }
+        Stmt::Continue(_) | Stmt::Break(_) => {
+            state.diverges = true;
+        }
+        _ => {}
+    }
+}
+
+fn da_check_expr(
+    c: &mut Checker,
+    expr: &Expr,
+    tracked: &HashMap<String, (usize, usize)>,
+    state: &DaState,
+) {
+    // Pre-order walk so a `(x := …)` walrus on the LHS of an
+    // expression initialises before the rest of the expression
+    // reads. We don't model the walrus explicitly here — `Expr::Named`
+    // adds the target to the env via the resolver pass; here we just
+    // treat the binding side as a read because the inner value is
+    // what matters.
+    match expr {
+        Expr::Name(n) => {
+            let name = n.id.as_str();
+            if let Some(&(decl_offset, decl_len)) = tracked.get(name) {
+                if !state.assigned.contains(name) && c.unsafe_depth == 0 {
+                    let use_offset = n.range.start().to_usize();
+                    let use_len = name.len();
+                    c.diagnostics
+                        .push_error(TycError::use_of_uninitialised(
+                            name,
+                            c.path.clone(),
+                            c.source,
+                            use_offset,
+                            use_len,
+                            decl_offset,
+                            decl_len,
+                        ));
+                }
+            }
+        }
+        Expr::Attribute(a) => da_check_expr(c, &a.value, tracked, state),
+        Expr::Subscript(s) => {
+            da_check_expr(c, &s.value, tracked, state);
+            da_check_expr(c, &s.slice, tracked, state);
+        }
+        Expr::Call(call) => {
+            da_check_expr(c, &call.func, tracked, state);
+            for a in &call.arguments.args {
+                da_check_expr(c, a, tracked, state);
+            }
+            for kw in &call.arguments.keywords {
+                da_check_expr(c, &kw.value, tracked, state);
+            }
+        }
+        Expr::BinOp(b) => {
+            da_check_expr(c, &b.left, tracked, state);
+            da_check_expr(c, &b.right, tracked, state);
+        }
+        Expr::UnaryOp(u) => da_check_expr(c, &u.operand, tracked, state),
+        Expr::BoolOp(b) => {
+            for v in &b.values {
+                da_check_expr(c, v, tracked, state);
+            }
+        }
+        Expr::Compare(cmp) => {
+            da_check_expr(c, &cmp.left, tracked, state);
+            for v in &cmp.comparators {
+                da_check_expr(c, v, tracked, state);
+            }
+        }
+        Expr::If(i) => {
+            da_check_expr(c, &i.test, tracked, state);
+            da_check_expr(c, &i.body, tracked, state);
+            da_check_expr(c, &i.orelse, tracked, state);
+        }
+        Expr::Tuple(t) => {
+            for v in &t.elts {
+                da_check_expr(c, v, tracked, state);
+            }
+        }
+        Expr::List(l) => {
+            for v in &l.elts {
+                da_check_expr(c, v, tracked, state);
+            }
+        }
+        Expr::Set(s) => {
+            for v in &s.elts {
+                da_check_expr(c, v, tracked, state);
+            }
+        }
+        Expr::Dict(d) => {
+            for item in &d.items {
+                if let Some(k) = &item.key {
+                    da_check_expr(c, k, tracked, state);
+                }
+                da_check_expr(c, &item.value, tracked, state);
+            }
+        }
+        Expr::FString(fs) => {
+            for part in &fs.value {
+                if let ruff_python_ast::FStringPart::FString(f) = part {
+                    for el in &f.elements {
+                        if let ruff_python_ast::InterpolatedStringElement::Interpolation(e) = el {
+                            da_check_expr(c, &e.expression, tracked, state);
+                        }
+                    }
+                }
+            }
+        }
+        Expr::Slice(s) => {
+            if let Some(lower) = &s.lower {
+                da_check_expr(c, lower, tracked, state);
+            }
+            if let Some(upper) = &s.upper {
+                da_check_expr(c, upper, tracked, state);
+            }
+            if let Some(step) = &s.step {
+                da_check_expr(c, step, tracked, state);
+            }
+        }
+        Expr::Starred(s) => da_check_expr(c, &s.value, tracked, state),
+        Expr::Await(a) => da_check_expr(c, &a.value, tracked, state),
+        Expr::Yield(y) => {
+            if let Some(v) = &y.value {
+                da_check_expr(c, v, tracked, state);
+            }
+        }
+        Expr::YieldFrom(y) => da_check_expr(c, &y.value, tracked, state),
+        Expr::Lambda(_) | Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_)
+        | Expr::Generator(_) => {
+            // Comprehensions and lambdas introduce their own scope;
+            // a tracked-uninit name used inside is fine as long as it
+            // would be initialised by the time the comprehension
+            // actually runs. The body's uses are checked by the
+            // resolver / type-checker through their own mechanisms.
+        }
+        _ => {}
+    }
+}
+
+fn da_collect_assign_targets(target: &Expr, state: &mut DaState) {
+    match target {
+        Expr::Name(n) => state.assign(n.id.as_str()),
+        Expr::Tuple(t) => {
+            for elt in &t.elts {
+                da_collect_assign_targets(elt, state);
+            }
+        }
+        Expr::List(l) => {
+            for elt in &l.elts {
+                da_collect_assign_targets(elt, state);
+            }
+        }
+        Expr::Starred(s) => da_collect_assign_targets(&s.value, state),
+        _ => {}
+    }
+}
+
+fn da_collect_for_target(target: &Expr, state: &mut DaState) {
+    da_collect_assign_targets(target, state);
+}
+
+/// True when a `match` is exhaustive enough for the DA pass to skip
+/// the implicit fall-through branch. Three cases:
+///   - The match has a wildcard arm (`case _:` or `case x:`).
+///   - The match subject is a sealed union (or the `Result` alias)
+///     and every declared variant is covered by a class pattern.
+///   - The case arms' class patterns *structurally* cover a known
+///     sealed-union — useful when the subject's type couldn't be
+///     inferred (e.g. an imported function whose stub is missing) but
+///     the user clearly wrote `case Ok(...)/case Err(...)` arms.
+/// Sound under-approximation: returns `false` for any shape we can't
+/// classify, so the DA pass stays conservative when in doubt.
+fn match_is_exhaustive_for_da(c: &Checker, subject: &Expr, cases: &[MatchCase]) -> bool {
+    // (a) wildcard arm.
+    for case in cases {
+        if case.guard.is_some() {
+            continue;
+        }
+        if is_wildcard_pattern(&case.pattern) {
+            return true;
+        }
+    }
+    // (b) sealed-union subject with full variant coverage.
+    let subject_ty = infer_expr_readonly(c, subject);
+    let union_variants: Vec<String> = match &subject_ty {
+        Type::Class(name) => c
+            .sealed_unions
+            .get(name.as_str())
+            .cloned()
+            .unwrap_or_default(),
+        // `Result[T, E]` is `Ok | Err` for DA purposes.
+        Type::Generic(name, _) if name == "Result" => {
+            vec!["Ok".to_owned(), "Err".to_owned()]
+        }
+        _ => Vec::new(),
+    };
+    if !union_variants.is_empty() {
+        let mut covered: HashSet<String> = HashSet::new();
+        for case in cases {
+            if case.guard.is_some() {
+                continue;
+            }
+            for variant in &union_variants {
+                if pattern_covers_class(c, &case.pattern, variant) {
+                    covered.insert(variant.clone());
+                }
+            }
+            collect_matched_class_names(&case.pattern, &mut covered);
+        }
+        if union_variants.iter().all(|v| covered.contains(v)) {
+            return true;
+        }
+    }
+    // (c) structural coverage. Collect every class name the case arms
+    // mention; if that set covers some known sealed-union (or the
+    // hard-coded Ok/Err pair for Result), trust the user. Lets the DA
+    // pass succeed for cross-module Result idioms where the call's
+    // return type didn't carry through.
+    let mut pattern_classes: HashSet<String> = HashSet::new();
+    for case in cases {
+        if case.guard.is_some() {
+            continue;
+        }
+        collect_matched_class_names(&case.pattern, &mut pattern_classes);
+    }
+    if pattern_classes.is_empty() {
+        return false;
+    }
+    if pattern_classes.contains("Ok") && pattern_classes.contains("Err") {
+        return true;
+    }
+    for variants in c.sealed_unions.values() {
+        if !variants.is_empty() && variants.iter().all(|v| pattern_classes.contains(v)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Intersect the post-branch DaStates: a name is in the result iff it
+/// is in every NON-diverging branch's assigned set. The result's
+/// `diverges` flag is true iff EVERY branch diverges (which makes the
+/// surrounding code unreachable).
+fn intersect_branches(pre: &DaState, branches: &[DaState]) -> DaState {
+    let non_diverging: Vec<&DaState> = branches.iter().filter(|b| !b.diverges).collect();
+    if non_diverging.is_empty() {
+        return DaState {
+            assigned: pre.assigned.clone(),
+            diverges: true,
+        };
+    }
+    let mut intersection: std::collections::HashSet<String> =
+        non_diverging[0].assigned.clone();
+    for branch in &non_diverging[1..] {
+        intersection.retain(|name| branch.assigned.contains(name));
+    }
+    DaState {
+        assigned: intersection,
+        diverges: false,
+    }
 }
 
 /// True when `body` is a stub — `...`, `pass`, or a single docstring
@@ -12861,6 +13586,34 @@ let s: str = id(3)
     }
 
     #[test]
+    fn contextmanager_yield_local_with_annotation_resolves() {
+        // R3-3 follow-up: `yield s` where `s = let s: Session = …`
+        // resolves to `Session` via the pre-collected local-annotation
+        // map, not just literal / constructor / None payloads. This
+        // closes the carry-over case where the canonical "open, then
+        // yield" shape (open into a local, yield the local) still
+        // left `r` as Unknown.
+        let d = check(
+            "from contextlib import contextmanager\n\
+             from typing import Iterator\n\
+             class Conn:\n\
+             \x20   id: int\n\
+             @contextmanager\n\
+             def acquire() -> Iterator[Conn]:\n\
+             \x20   let c: Conn = Conn(id=42)\n\
+             \x20   yield c\n\
+             def takes_str(s: str) -> str: return s\n\
+             def main() -> None:\n\
+             \x20   with acquire() as r:\n\
+             \x20       let bad: str = takes_str(r)\n",
+        );
+        assert!(
+            d.has_errors(),
+            "yield <local-with-annotation> must propagate the local's type to the as-target"
+        );
+    }
+
+    #[test]
     fn with_target_unknown_when_unresolvable_falls_back_silently() {
         // Regression: when neither the factory pre-scan nor the
         // __enter__ lookup gives us a type, `r` stays Unknown so the
@@ -12938,6 +13691,119 @@ let s: str = id(3)
         assert!(
             !d.has_errors(),
             "regression: await on async def f() -> int must still be int; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn da_pass_clean_when_every_branch_assigns() {
+        // R3-8: `let x: int; if cond: x = a else: x = b; return x` is
+        // legal — the DA pass intersects the post-branch assigned
+        // sets and finds `x` in both, so the post-if read is fine.
+        let d = check(
+            "def f(cond: bool) -> int:\n\
+             \x20   let x: int\n\
+             \x20   if cond:\n\
+             \x20       x = 5\n\
+             \x20   else:\n\
+             \x20       x = 10\n\
+             \x20   return x\n",
+        );
+        assert!(
+            !d.has_errors(),
+            "every-branch-assigns must check clean; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn da_pass_flags_missing_else_branch() {
+        // R3-8: dropping the `else` clause leaves an implicit
+        // fall-through where `x` was never assigned — the
+        // post-if read must fire `tyc::use_of_uninitialised`.
+        let d = check(
+            "def f(cond: bool) -> int:\n\
+             \x20   let x: int\n\
+             \x20   if cond:\n\
+             \x20       x = 5\n\
+             \x20   return x\n",
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UseOfUninitialised { .. })),
+            "missing else branch must fire use_of_uninitialised; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn da_pass_clean_when_else_branch_diverges() {
+        // R3-8: a diverging branch (`return`/`raise`) is excluded from
+        // the intersection. `if cond: x = a else: return -1; use x`
+        // is therefore fine.
+        let d = check(
+            "def f(cond: bool) -> int:\n\
+             \x20   let x: int\n\
+             \x20   if cond:\n\
+             \x20       x = 5\n\
+             \x20   else:\n\
+             \x20       return -1\n\
+             \x20   return x\n",
+        );
+        assert!(
+            !d.has_errors(),
+            "diverging else branch must satisfy DA; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn da_pass_clean_for_exhaustive_result_match() {
+        // R3-8: the canonical declare-then-assign-in-arms shape over
+        // Result — both `Ok` and `Err` arms covered, even when the
+        // subject's call return type can't be inferred (the
+        // structural-coverage path in `match_is_exhaustive_for_da`
+        // recognises the Ok/Err pattern pair).
+        let d = check(
+            "def _load(success: bool) -> Result[int, str]:\n\
+             \x20   if success:\n\
+             \x20       return Ok(42)\n\
+             \x20   return Err(\"nope\")\n\
+             def use(s: bool) -> Result[int, str]:\n\
+             \x20   let loaded: int\n\
+             \x20   match _load(s):\n\
+             \x20       case Ok(v):\n\
+             \x20           loaded = v\n\
+             \x20       case Err(e):\n\
+             \x20           return Err(e)\n\
+             \x20   return Ok(loaded)\n",
+        );
+        assert!(
+            !d.has_errors(),
+            "exhaustive Result match must satisfy DA; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn da_pass_clean_when_loop_does_not_initialise() {
+        // R3-8: assignments inside a `for` body don't propagate out
+        // because the loop body may execute zero times. Reading the
+        // tracked binding AFTER the loop without a pre-loop assign
+        // must fire.
+        let d = check(
+            "def f(xs: list[int]) -> int:\n\
+             \x20   let total: int\n\
+             \x20   for x in xs:\n\
+             \x20       total = x\n\
+             \x20   return total\n",
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::UseOfUninitialised { .. })),
+            "loop-body-only assignment must NOT count as init; got {:?}",
             d.errors()
         );
     }

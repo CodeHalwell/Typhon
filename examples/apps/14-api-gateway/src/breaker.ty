@@ -6,8 +6,9 @@ from ids import UpstreamId
 
 # ---------------------------------------------------------------------------
 # Circuit breaker — sealed-union state machine (Closed → Open → HalfOpen).
-# Round-1 #1 workaround applied: cross-module variant→union upcast is rejected,
-# so every transition goes through a factory in this module.
+# The cross-module variant→union upcast works directly in 0.6.1+, so
+# `breaker.state = StateClosed(...)` flows into a `BreakerState`-typed slot
+# without needing a per-variant factory wrapper.
 # ---------------------------------------------------------------------------
 
 
@@ -26,18 +27,6 @@ pub class StateOpen:
 pub class StateHalfOpen:
     consecutive_successes: int
     probe_in_flight: bool
-
-
-pub def make_closed(consecutive_failures: int = 0) -> BreakerState:
-    return StateClosed(consecutive_failures=consecutive_failures)
-
-
-pub def make_open(opened_at_ms: int, cooldown_ms: int) -> BreakerState:
-    return StateOpen(opened_at_ms=opened_at_ms, cooldown_ms=cooldown_ms)
-
-
-pub def make_half_open() -> BreakerState:
-    return StateHalfOpen(consecutive_successes=0, probe_in_flight=False)
 
 
 pub def state_label(s: BreakerState) -> str:
@@ -63,7 +52,7 @@ pub def new_breaker(upstream: UpstreamId, policy: BreakerPolicy) -> CircuitBreak
     return CircuitBreaker(
         upstream=upstream,
         policy=policy,
-        state=make_closed(0),
+        state=StateClosed(consecutive_failures=0),
     )
 
 
@@ -82,7 +71,7 @@ pub def gate(breaker: CircuitBreaker) -> int?:
             let elapsed: int = now - opened_at
             if elapsed >= cooldown:
                 # Cool-down elapsed — promote to half-open and let one probe through.
-                breaker.state = make_half_open()
+                breaker.state = StateHalfOpen(consecutive_successes=0, probe_in_flight=False)
                 return None
             return cooldown - elapsed
         case StateHalfOpen(_, probe_in_flight):
@@ -104,14 +93,14 @@ pub def record_success(breaker: CircuitBreaker) -> None:
     let policy: BreakerPolicy = breaker.policy
     match breaker.state:
         case StateClosed(_):
-            breaker.state = make_closed(0)
+            breaker.state = StateClosed(consecutive_failures=0)
         case StateOpen(_, _):
             # Should never see success while open — pretend we're half-open now.
-            breaker.state = make_closed(0)
+            breaker.state = StateClosed(consecutive_failures=0)
         case StateHalfOpen(succ, _):
             let new_succ: int = succ + 1
             if new_succ >= policy.success_threshold:
-                breaker.state = make_closed(0)
+                breaker.state = StateClosed(consecutive_failures=0)
             else:
                 breaker.state = StateHalfOpen(
                     consecutive_successes=new_succ,
@@ -125,10 +114,10 @@ pub def record_failure(breaker: CircuitBreaker) -> None:
         case StateClosed(fails):
             let new_fails: int = fails + 1
             if new_fails >= policy.failure_threshold:
-                breaker.state = make_open(_now_ms(), policy.cooldown_ms)
+                breaker.state = StateOpen(opened_at_ms=_now_ms(), cooldown_ms=policy.cooldown_ms)
             else:
-                breaker.state = make_closed(new_fails)
+                breaker.state = StateClosed(consecutive_failures=new_fails)
         case StateOpen(_, _):
             pass
         case StateHalfOpen(_, _):
-            breaker.state = make_open(_now_ms(), policy.cooldown_ms)
+            breaker.state = StateOpen(opened_at_ms=_now_ms(), cooldown_ms=policy.cooldown_ms)

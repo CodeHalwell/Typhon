@@ -4,8 +4,8 @@ import httpx
 
 from breaker import (
     CircuitBreaker,
+    StateClosed,
     gate as breaker_gate,
-    make_closed,
     record_failure as breaker_record_failure,
     record_success as breaker_record_success,
 )
@@ -57,7 +57,7 @@ def _breaker_for(ctx: ForwardContext, upstream: UpstreamId) -> CircuitBreaker:
     let fresh: CircuitBreaker = CircuitBreaker(
         upstream=upstream,
         policy=ctx.config.breaker,
-        state=make_closed(0),
+        state=StateClosed(consecutive_failures=0),
     )
     ctx.breakers[key] = fresh
     return fresh

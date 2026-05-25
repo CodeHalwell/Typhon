@@ -365,33 +365,81 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 // preprocess so the orchestrator stays a single-pass
                 // loop; the cost is one re-scan per `pub *`-bearing
                 // `__init__.ty`, which is bounded by package size.
+                //
+                // Transitive aggregation: direct sub-packages (a
+                // sub-directory containing an `__init__.ty`) are also
+                // included — the sub-package's effective public surface
+                // (its own `pub`-marked names, plus whatever its own
+                // `pub *` aggregates one level deeper) is re-exported
+                // here as `from .subpackage import names`. The
+                // recursion is cycle-safe via a `visited` set keyed on
+                // each package directory.
                 let mut sibling_pubs: Vec<(String, Vec<String>)> = Vec::new();
+                let mut subpackages_seen: std::collections::HashSet<PathBuf> =
+                    std::collections::HashSet::new();
+                let mut visited: std::collections::HashSet<PathBuf> =
+                    std::collections::HashSet::new();
+                visited.insert(parent_dir.to_path_buf());
                 for (sib_path, sib_source) in &sources {
                     if sib_path == path {
                         continue;
                     }
-                    if sib_path.parent() != Some(parent_dir) {
-                        continue;
-                    }
-                    if sib_path
-                        .file_name()
-                        .and_then(|f| f.to_str())
-                        .map(|s| s == "__init__.ty")
-                        .unwrap_or(false)
-                    {
-                        continue;
-                    }
-                    let stem = match sib_path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                    {
-                        Some(s) => s.to_owned(),
+                    let sib_parent = match sib_path.parent() {
+                        Some(p) => p,
                         None => continue,
                     };
-                    let names = extract_top_level_pub_names(sib_source);
-                    if !names.is_empty() {
-                        sibling_pubs.push((stem, names));
+                    // Direct sibling .ty file (not __init__.ty).
+                    if sib_parent == parent_dir {
+                        if sib_path
+                            .file_name()
+                            .and_then(|f| f.to_str())
+                            .map(|s| s == "__init__.ty")
+                            .unwrap_or(false)
+                        {
+                            continue;
+                        }
+                        let stem = match sib_path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                        {
+                            Some(s) => s.to_owned(),
+                            None => continue,
+                        };
+                        let names = extract_top_level_pub_names(sib_source);
+                        if !names.is_empty() {
+                            sibling_pubs.push((stem, names));
+                        }
+                        continue;
                     }
+                    // Direct sub-package: a file whose grandparent is
+                    // `parent_dir` and whose immediate parent has an
+                    // `__init__.ty`. The sub-package name is the
+                    // immediate parent's directory name.
+                    if sib_parent.parent() == Some(parent_dir)
+                        && subpackages_seen.insert(sib_parent.to_path_buf())
+                    {
+                        let sub_init = sib_parent.join("__init__.ty");
+                        let has_init = sources.iter().any(|(p, _)| p == &sub_init);
+                        if !has_init {
+                            continue;
+                        }
+                        let sub_name = match sib_parent
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                        {
+                            Some(s) => s.to_owned(),
+                            None => continue,
+                        };
+                        let names = effective_package_surface(
+                            sib_parent,
+                            &sources,
+                            &mut visited,
+                        );
+                        if !names.is_empty() {
+                            sibling_pubs.push((sub_name, names));
+                        }
+                    }
+                    let _ = sib_source;
                 }
                 // Detect collisions: any name that appears in two
                 // different siblings fires `tyc::pub_name_collision`.
@@ -1113,6 +1161,83 @@ fn replace_line(source: &str, line_idx: usize, replacement: &str) -> String {
             out.push_str(line);
         }
         current += 1;
+    }
+    out
+}
+
+/// Compute the effective public surface of a package directory.
+/// Walks `__init__.ty`'s top-level `pub` names, then — if that
+/// `__init__.ty` itself contains a `pub *` marker — recurses into
+/// every direct sub-package and direct .ty sibling at one level
+/// deeper, mirroring the aggregation the build-time `pub *` rewrite
+/// does in place. The result is the set of names a hypothetical
+/// `from <pkg> import *` would receive.
+///
+/// `visited` carries every package directory that's already been
+/// expanded along the current chain, breaking cycles that arise from
+/// pathological repository layouts (e.g. a sub-package whose
+/// `__init__.ty` re-points at its own grandparent). The walk is
+/// loaded-source-only — it never touches the filesystem, so an
+/// unloaded sub-tree is silently skipped.
+fn effective_package_surface(
+    pkg_dir: &std::path::Path,
+    sources: &[(PathBuf, String)],
+    visited: &mut std::collections::HashSet<PathBuf>,
+) -> Vec<String> {
+    let pkg_owned = pkg_dir.to_path_buf();
+    if !visited.insert(pkg_owned.clone()) {
+        return Vec::new();
+    }
+    let init_path = pkg_dir.join("__init__.ty");
+    let init_source = match sources.iter().find(|(p, _)| p == &init_path) {
+        Some((_, s)) => s,
+        None => return Vec::new(),
+    };
+    let mut out: Vec<String> = extract_top_level_pub_names(init_source);
+    let has_pub_star = init_source
+        .lines()
+        .any(|l| l.trim() == "pub *" || l.trim_start().starts_with("pub *"));
+    if !has_pub_star {
+        return out;
+    }
+    // Aggregate one level deeper: direct .ty siblings of this
+    // __init__.ty + direct sub-packages.
+    let mut sub_packages_seen: std::collections::HashSet<PathBuf> =
+        std::collections::HashSet::new();
+    for (sib_path, sib_source) in sources {
+        let sib_parent = match sib_path.parent() {
+            Some(p) => p,
+            None => continue,
+        };
+        if sib_parent == pkg_dir {
+            let is_init = sib_path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .map(|s| s == "__init__.ty")
+                .unwrap_or(false);
+            if is_init {
+                continue;
+            }
+            for name in extract_top_level_pub_names(sib_source) {
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+            continue;
+        }
+        if sib_parent.parent() == Some(pkg_dir)
+            && sub_packages_seen.insert(sib_parent.to_path_buf())
+        {
+            let sub_init = sib_parent.join("__init__.ty");
+            if !sources.iter().any(|(p, _)| p == &sub_init) {
+                continue;
+            }
+            for name in effective_package_surface(sib_parent, sources, visited) {
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        }
     }
     out
 }

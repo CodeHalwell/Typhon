@@ -1119,6 +1119,31 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A `let NAME: T` binding declared without an initialiser is
+    /// read on a control-flow path where no preceding statement
+    /// assigned it. R3-8's definite-assignment pass surfaces the
+    /// use-before-init bug before runtime — without the check, a
+    /// declare-then-assign-in-arms idiom that forgets the `Err` arm
+    /// would silently return whatever Python's `NameError` produces.
+    #[error("`{name}` may be used before it is initialised")]
+    #[diagnostic(
+        code(tyc::use_of_uninitialised),
+        url("https://typhon.dev/lang/diagnostics/use_of_uninitialised"),
+        help(
+            "ensure every branch that reaches this point assigns to `{name}` \
+             first, or initialise it at the declaration site (`let {name}: T = …`)"
+        )
+    )]
+    UseOfUninitialised {
+        name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("`{name}` is not assigned on every path that reaches here")]
+        span: SourceSpan,
+        #[label("declared here without an initialiser")]
+        decl_span: SourceSpan,
+    },
+
     /// Two sibling modules aggregated by a `pub *` re-export in
     /// `__init__.ty` both expose the same name. The synthesised
     /// `from .a import X` + `from .b import X` would silently shadow
@@ -2185,6 +2210,26 @@ impl TycError {
             name: name.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::UseOfUninitialised`] diagnostic for a
+    /// read of a declare-only `let NAME: T` binding on a path where
+    /// no preceding statement assigned it.
+    pub fn use_of_uninitialised(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        use_offset: usize,
+        use_length: usize,
+        decl_offset: usize,
+        decl_length: usize,
+    ) -> Self {
+        Self::UseOfUninitialised {
+            name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(use_offset), use_length),
+            decl_span: SourceSpan::new(SourceOffset::from(decl_offset), decl_length),
         }
     }
 

@@ -11,9 +11,10 @@ remaining ergonomics gaps that survived v0.6.0 / v0.6.1.
 
 ### Added — language & runtime
 
-- **`pub *` wildcard re-export aggregation in `__init__.ty`.** A
-  package facade can now write a single `pub *` statement at the top
-  of its `__init__.ty` to re-export every direct-sibling module's
+- **`pub *` wildcard re-export aggregation in `__init__.ty`,
+  including transitive aggregation through sub-packages.** A package
+  facade can now write a single `pub *` statement at the top of its
+  `__init__.ty` to re-export every direct-sibling module's
   `pub`-marked surface. The build orchestrator collects each
   sibling's top-level `pub` declarations, synthesises a `from
   .sibling import name1, name2; …` block at the `pub *` marker, and
@@ -22,11 +23,15 @@ remaining ergonomics gaps that survived v0.6.0 / v0.6.1.
   without the user having to maintain the re-export list as siblings
   evolve.
 
-  Aggregation is **direct-siblings only** by design; transitive
-  aggregation through sub-packages is intentionally out of scope (a
-  `pub *` at level N only sees level-N siblings, not level-N+1
-  grandchildren). The marker is preserved on a single line so source
-  maps stay byte-aligned.
+  Sub-packages are included transitively: when a direct
+  sub-directory contains its own `__init__.ty`, the sub-package's
+  effective public surface (its own `pub`-marked names, plus
+  whatever its own `pub *` aggregates one level deeper) is
+  re-exported here. The recursion is cycle-safe via a `visited` set
+  keyed on each package directory.
+
+  The marker is preserved on a single line so source maps stay
+  byte-aligned.
 
   Two diagnostics back the feature:
 
@@ -63,9 +68,33 @@ remaining ergonomics gaps that survived v0.6.0 / v0.6.1.
   region.
   `mut NAME: T` without an initialiser is also accepted, and follows
   the usual `mut` semantics (any number of subsequent assignments are
-  legal). Full definite-assignment analysis (every reachable read is
-  preceded by an assignment on all CFG paths) is a follow-up; the
-  minimal form here unblocks the workaround R2-7 / R3-8 documented.
+  legal).
+- **`tyc-types`: definite-assignment analysis for `let NAME: T`
+  declare-only bindings (`tyc::use_of_uninitialised`).** Companion to
+  the resolver relaxation above. The DA pass walks each function body
+  once, tracking the "definitely-assigned" set at every control-flow
+  point: `if` / `match` branches intersect (only assignments that
+  happen on EVERY non-diverging arm propagate out), `return` /
+  `raise` / `continue` / `break` mark a branch as diverging (excluded
+  from the intersection), and loops do not propagate assignments out
+  (the body may execute zero times). `match` over a sealed union or
+  `Result[T, E]` is treated as exhaustive when every variant is
+  covered by a class pattern; the canonical
+  `case Ok(v): loaded = v / case Err(e): return Err(e)` shape works
+  without a `case _:` wildcard. Reads on a path where the binding
+  hasn't been assigned fire `tyc::use_of_uninitialised` with labels
+  on both the use site and the declaration.
+- **`tyc-types`: `with cm() as r:` yield-local resolution (R3-3
+  follow-up).** The earlier landing only resolved literal /
+  `Class(...)` / `None` yield payloads. The pre-scan now also
+  collects every annotated-local declaration in the contextmanager
+  factory's body (`let s: Session = …`) and consults that map when
+  the yield is a bare name. The canonical "open into a local then
+  yield" shape (`let s: Session = …; yield s`) now types `r` as
+  `Session` instead of falling through to `Unknown`. Bareword-bound
+  locals without annotations still leave `r` as Unknown (a full fix
+  would need to thread the inner env through the consumer site;
+  authors can add an explicit annotation as the durable workaround).
 - **`tyc-types`: `with cm() as r:` / `async with cm() as r:` now types
   `r` from `__enter__` / `__aenter__` methods and from
   `@contextmanager` / `@asynccontextmanager`-decorated generator
