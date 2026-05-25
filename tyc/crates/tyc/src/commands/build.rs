@@ -568,14 +568,26 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 .map_err(|e| miette!("cannot write '{}': {e}", out_file.display()))?;
         }
 
-        // Emit a v2 `.py.map` sidecar alongside the emitted `.py`.
+        // Emit a v2 `.py.map` sidecar under `<out>/.sourcemaps/<rel>.py.map`.
+        //
+        // Map files live in a dedicated `.sourcemaps/` subtree (mirroring
+        // the emitted Python layout) so the build output stays tidy —
+        // `ls build/` no longer interleaves every `foo.py` with its
+        // sidecar. Consumers (`tyc trace`, `tyc debug`, `tyc ty`) resolve
+        // maps via [`crate::commands::source_map::load_map_for`], which
+        // checks `<out>/.sourcemaps/<rel>.py.map` first and falls back to
+        // the legacy adjacent `<out>/<rel>.py.map` location for builds
+        // emitted by older `tyc` versions.
         //
         // The `lines` array maps each Python output line (0-indexed) to a
         // 1-indexed line number in the preprocessed Typhon source.  For most
         // constructs the mapping is identity; sugar that emits multiple Python
         // lines from one Typhon line (e.g. `?`, `gather:`, `with`-chains)
         // correctly maps those lines back to the single originating line.
-        let map_path = out_file.with_extension("py.map");
+        let map_path = out_dir
+            .join(".sourcemaps")
+            .join(rel)
+            .with_extension("py.map");
         let source_rel = escape_json_path(
             &path
                 .strip_prefix(&src_dir)
@@ -589,6 +601,10 @@ pub fn run(args: BuildArgs) -> Result<()> {
             would_write_count += 1;
             let _ = map_body;
         } else {
+            if let Some(parent) = map_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| miette!("cannot create '{}': {e}", parent.display()))?;
+            }
             std::fs::write(&map_path, map_body)
                 .map_err(|e| miette!("cannot write '{}': {e}", map_path.display()))?;
         }
@@ -2592,8 +2608,11 @@ async def load() -> int:
             no_sync: false,
         })
         .unwrap();
-        let map_path = out_dir.join("main.py.map");
-        assert!(map_path.exists(), "main.py.map sidecar should be emitted");
+        let map_path = out_dir.join(".sourcemaps").join("main.py.map");
+        assert!(
+            map_path.exists(),
+            "main.py.map sidecar should be emitted under .sourcemaps/"
+        );
         let map = std::fs::read_to_string(&map_path).unwrap();
         assert!(
             map.contains("\"version\":2"),
@@ -2727,7 +2746,7 @@ let pet: Animal = Dog(name=\"Rex\")
             "--check must not write main.py"
         );
         assert!(
-            !out_dir.join("main.py.map").exists(),
+            !out_dir.join(".sourcemaps").join("main.py.map").exists(),
             "--check must not write .py.map sidecar"
         );
     }

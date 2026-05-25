@@ -180,16 +180,28 @@ pub(crate) fn translate_breakpoint(
     } else {
         spec.ty_file.clone()
     };
-    // The emitter writes `<src>/foo.ty` to `<out>/foo.py` + `<out>/foo.py.map`.
+    // The emitter writes `<src>/foo.ty` to `<out>/foo.py` and
+    // `<out>/.sourcemaps/foo.py.map`. The legacy adjacent layout
+    // (`<out>/foo.py.map`) is still honoured for builds emitted by
+    // older `tyc` versions so step-by-source debugging keeps working
+    // across upgrades.
     let py_path = out_dir.join(&rel).with_extension("py");
-    let map_path = out_dir.join(&rel).with_extension("py.map");
-    if !map_path.exists() {
+    let primary_map_path = out_dir
+        .join(".sourcemaps")
+        .join(&rel)
+        .with_extension("py.map");
+    let legacy_map_path = out_dir.join(&rel).with_extension("py.map");
+    let map_path = if primary_map_path.exists() {
+        primary_map_path
+    } else if legacy_map_path.exists() {
+        legacy_map_path
+    } else {
         return Err(format!(
             "no .py.map sidecar for '{}' (expected '{}')",
             spec.ty_file.display(),
-            map_path.display()
+            primary_map_path.display()
         ));
-    }
+    };
     let map_body = std::fs::read_to_string(&map_path)
         .map_err(|e| format!("cannot read '{}': {e}", map_path.display()))?;
     let py_line = lookup_py_line_in_map(&map_body, spec.line).ok_or_else(|| {
@@ -378,11 +390,18 @@ def _load_maps(build_dir):
     """Return dict[py_path -> (ty_source, lines_table)].
 
     Loads every `*.py.map` JSON sidecar under `build_dir` recursively.
+    Map files live in `<build_dir>/.sourcemaps/<rel>.py.map`; the
+    corresponding `.py` is at `<build_dir>/<rel>.py`. The legacy
+    adjacent layout (`<build_dir>/<rel>.py.map` next to `<rel>.py`)
+    is also accepted for builds emitted by older `tyc` versions.
+
     Malformed sidecars are skipped silently — the worst case is that
     a frame's `[ty]` annotation is missing, not that the debugger
     fails to launch.
     """
     out = {{}}
+    sourcemaps_dir = os.path.join(build_dir, ".sourcemaps")
+    abs_sourcemaps = os.path.abspath(sourcemaps_dir)
     for root, _dirs, files in os.walk(build_dir):
         for name in files:
             if not name.endswith(".py.map"):
@@ -399,7 +418,15 @@ def _load_maps(build_dir):
             lines = body.get("lines")
             if not isinstance(lines, list):
                 lines = []
-            py_path = map_path[:-4]  # strip ".map" → "foo.py"
+            abs_map = os.path.abspath(map_path)
+            if abs_map.startswith(abs_sourcemaps + os.sep):
+                # New layout: rewrite `<build>/.sourcemaps/<rel>.py.map`
+                # to `<build>/<rel>.py`.
+                rel = os.path.relpath(abs_map, abs_sourcemaps)
+                py_path = os.path.join(build_dir, rel[:-4])
+            else:
+                # Legacy layout: map sits next to its `.py` sibling.
+                py_path = map_path[:-4]
             out[os.path.abspath(py_path)] = (source, [int(x) for x in lines])
     return out
 
@@ -703,10 +730,36 @@ mod tests {
 
     #[test]
     fn translate_breakpoint_via_pymap_returns_python_line() {
-        // Set up a synthetic project layout:
-        //   tmp/src/foo.ty             (just for path realism)
+        // Set up a synthetic project layout that matches what `tyc build`
+        // actually emits today:
+        //   tmp/src/foo.ty
         //   tmp/build/foo.py
-        //   tmp/build/foo.py.map       (lines=[1,1,5,5,5])
+        //   tmp/build/.sourcemaps/foo.py.map   (lines=[1,1,5,5,5])
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let out = tmp.path().join("build");
+        let sourcemaps = out.join(".sourcemaps");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&sourcemaps).unwrap();
+        std::fs::write(src.join("foo.ty"), "let x = 1\n").unwrap();
+        std::fs::write(out.join("foo.py"), "x = 1\n").unwrap();
+        std::fs::write(
+            sourcemaps.join("foo.py.map"),
+            r#"{"version":2,"source":"foo.ty","line_strategy":"table","lines":[1,1,5,5,5]}"#,
+        )
+        .unwrap();
+        let spec = parse_breakpoint_spec("src/foo.ty:5").unwrap();
+        let (py_path, py_line) = translate_breakpoint(&spec, &src, &out).unwrap();
+        // The `src/` prefix is stripped to match the emitter's layout.
+        assert_eq!(py_path, out.join("foo.py"));
+        assert_eq!(py_line, 3);
+    }
+
+    #[test]
+    fn translate_breakpoint_falls_back_to_legacy_adjacent_pymap() {
+        // Builds emitted by older `tyc` versions wrote the map next to
+        // the `.py`. Confirm the new resolver still picks those up so
+        // existing build dirs keep working across upgrades.
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src");
         let out = tmp.path().join("build");
@@ -721,7 +774,6 @@ mod tests {
         .unwrap();
         let spec = parse_breakpoint_spec("src/foo.ty:5").unwrap();
         let (py_path, py_line) = translate_breakpoint(&spec, &src, &out).unwrap();
-        // The `src/` prefix is stripped to match the emitter's layout.
         assert_eq!(py_path, out.join("foo.py"));
         assert_eq!(py_line, 3);
     }

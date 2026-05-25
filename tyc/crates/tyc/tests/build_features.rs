@@ -283,8 +283,15 @@ fn build_writes_py_map_sidecar() {
     let tmp = tempfile::tempdir().unwrap();
     scaffold(tmp.path(), "let x: int = 1\n");
     build(tmp.path());
-    let map = tmp.path().join("build").join("main.py.map");
-    assert!(map.exists(), "main.py.map sidecar should be written");
+    let map = tmp
+        .path()
+        .join("build")
+        .join(".sourcemaps")
+        .join("main.py.map");
+    assert!(
+        map.exists(),
+        "main.py.map sidecar should be written under .sourcemaps/"
+    );
     let body = std::fs::read_to_string(&map).unwrap();
     assert!(body.contains("\"source\""), "map should include source key");
     assert!(body.contains("\"lines\""), "v2 map should include lines");

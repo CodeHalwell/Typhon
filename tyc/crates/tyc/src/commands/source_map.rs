@@ -59,13 +59,44 @@ pub fn parse_map(body: &str) -> Option<SourceMap> {
 /// Find and read the `.py.map` sidecar for `py_path`.
 ///
 /// Search order:
-///   1. `<py_path>.map` adjacent to the `.py` file.
-///   2. `<map_dir>/<filename>.map` when `--map-dir` was given.
+///   1. `<out>/.sourcemaps/<rel>.py.map` — the layout `tyc build` emits.
+///      `<out>` is discovered by walking up from `py_path` to the
+///      directory that contains a `.sourcemaps/` sibling.
+///   2. `<py_path>.map` adjacent to the `.py` file — legacy layout for
+///      builds emitted by older `tyc` versions (pre-`.sourcemaps/`).
+///   3. `<map_dir>/<filename>.map` when `--map-dir` was given.
 pub fn load_map_for(py_path: &str, map_dir: Option<&Path>) -> Option<String> {
+    let py = Path::new(py_path);
+    // 1. Walk up from the `.py` looking for a directory that contains a
+    //    `.sourcemaps/` sibling. The path inside `.sourcemaps/` mirrors
+    //    the relative path from that directory to the `.py`, with `.map`
+    //    appended — so `build/foo/bar.py` → `build/.sourcemaps/foo/bar.py.map`.
+    let mut anchor = py.parent();
+    let mut rel_segments: Vec<&std::ffi::OsStr> =
+        py.file_name().map(|n| vec![n]).unwrap_or_default();
+    while let Some(dir) = anchor {
+        let candidate_dir = dir.join(".sourcemaps");
+        if candidate_dir.is_dir() {
+            let mut candidate = candidate_dir;
+            for seg in rel_segments.iter().rev() {
+                candidate.push(seg);
+            }
+            candidate.set_extension("py.map");
+            if candidate.exists() {
+                return std::fs::read_to_string(&candidate).ok();
+            }
+        }
+        if let Some(name) = dir.file_name() {
+            rel_segments.push(name);
+        }
+        anchor = dir.parent();
+    }
+    // 2. Legacy adjacent layout.
     let adjacent = PathBuf::from(format!("{py_path}.map"));
     if adjacent.exists() {
         return std::fs::read_to_string(&adjacent).ok();
     }
+    // 3. Explicit --map-dir override.
     if let Some(dir) = map_dir {
         if let Some(base) = Path::new(py_path).file_name() {
             let candidate = dir.join(format!("{}.map", base.to_string_lossy()));
@@ -157,5 +188,53 @@ mod tests {
             lines: vec![],
         };
         assert_eq!(map_py_line(&map, 42), 42);
+    }
+
+    #[test]
+    fn load_map_for_finds_sourcemaps_subdir() {
+        // The layout `tyc build` writes today: maps live under a
+        // dedicated `.sourcemaps/` subtree mirroring the `.py` files
+        // so the build output dir stays uncluttered.
+        let tmp = tempfile::tempdir().unwrap();
+        let build = tmp.path().join("build");
+        let sourcemaps = build.join(".sourcemaps");
+        std::fs::create_dir_all(&sourcemaps).unwrap();
+        let py = build.join("foo.py");
+        std::fs::write(&py, "").unwrap();
+        let body = r#"{"version":1,"source":"foo.ty","line_strategy":"identity"}"#;
+        std::fs::write(sourcemaps.join("foo.py.map"), body).unwrap();
+        let loaded = load_map_for(py.to_str().unwrap(), None).expect("map should be found");
+        assert!(loaded.contains("foo.ty"));
+    }
+
+    #[test]
+    fn load_map_for_handles_nested_sourcemaps() {
+        // Nested module: `build/sub/foo.py` → `build/.sourcemaps/sub/foo.py.map`.
+        let tmp = tempfile::tempdir().unwrap();
+        let build = tmp.path().join("build");
+        let nested_py_dir = build.join("sub");
+        let nested_map_dir = build.join(".sourcemaps").join("sub");
+        std::fs::create_dir_all(&nested_py_dir).unwrap();
+        std::fs::create_dir_all(&nested_map_dir).unwrap();
+        let py = nested_py_dir.join("foo.py");
+        std::fs::write(&py, "").unwrap();
+        let body = r#"{"version":2,"source":"sub/foo.ty","line_strategy":"table","lines":[1,2]}"#;
+        std::fs::write(nested_map_dir.join("foo.py.map"), body).unwrap();
+        let loaded = load_map_for(py.to_str().unwrap(), None).expect("nested map should be found");
+        assert!(loaded.contains("sub/foo.ty"));
+    }
+
+    #[test]
+    fn load_map_for_falls_back_to_adjacent_legacy_layout() {
+        // Builds emitted by older `tyc` versions wrote the map next to
+        // the `.py`. The resolver must still pick those up so existing
+        // build dirs work across upgrades.
+        let tmp = tempfile::tempdir().unwrap();
+        let py = tmp.path().join("foo.py");
+        std::fs::write(&py, "").unwrap();
+        let body = r#"{"version":1,"source":"foo.ty","line_strategy":"identity"}"#;
+        std::fs::write(tmp.path().join("foo.py.map"), body).unwrap();
+        let loaded = load_map_for(py.to_str().unwrap(), None).expect("legacy map should be found");
+        assert!(loaded.contains("foo.ty"));
     }
 }

@@ -477,7 +477,11 @@ fn trace_rewrites_frame_with_map_file() {
     );
 
     let py_path = tmp.path().join("build").join("main.py");
-    let map_path = tmp.path().join("build").join("main.py.map");
+    let map_path = tmp
+        .path()
+        .join("build")
+        .join(".sourcemaps")
+        .join("main.py.map");
     assert!(py_path.exists(), "main.py should exist after build");
     assert!(map_path.exists(), "main.py.map should exist after build");
 
@@ -873,7 +877,11 @@ def parse(s: str) -> Result[int, str]:
     let status = tyc().arg("build").arg(tmp.path()).status().unwrap();
     assert!(status.success(), "build should succeed for ? operator test");
 
-    let map_path = tmp.path().join("build").join("main.py.map");
+    let map_path = tmp
+        .path()
+        .join("build")
+        .join(".sourcemaps")
+        .join("main.py.map");
     assert!(map_path.exists(), "main.py.map should be emitted");
 
     let map_body = std::fs::read_to_string(&map_path).unwrap();
@@ -931,7 +939,11 @@ def parse(s: str) -> Result[int, str]:
     assert!(build_status.success(), "build should succeed");
 
     let py_path = tmp.path().join("build").join("main.py");
-    let map_path = tmp.path().join("build").join("main.py.map");
+    let map_path = tmp
+        .path()
+        .join("build")
+        .join(".sourcemaps")
+        .join("main.py.map");
     assert!(py_path.exists(), "main.py should exist");
     assert!(map_path.exists(), "main.py.map should exist");
 
@@ -999,7 +1011,11 @@ async def load() -> int:
     let status = tyc().arg("build").arg(tmp.path()).status().unwrap();
     assert!(status.success(), "build should succeed for gather: test");
 
-    let map_path = tmp.path().join("build").join("main.py.map");
+    let map_path = tmp
+        .path()
+        .join("build")
+        .join(".sourcemaps")
+        .join("main.py.map");
     let map_body = std::fs::read_to_string(&map_path).unwrap();
     let lines = parse_map_lines(&map_body);
 
