@@ -297,6 +297,40 @@ pub fn run(args: BuildArgs) -> Result<()> {
         HashMap::new()
     };
 
+    // Phase 1.5: pre-collect every submodule's `pub`-marked names so
+    // package `__init__.ty` files that opt in with `pub *` can have
+    // those names re-exported through their emitted `__init__.py`.
+    //
+    // The map is keyed by package directory and holds `(submodule
+    // basename, ordered pub names)` per non-`__init__` `.ty` file
+    // that declared at least one `pub` symbol. Empty modules (no
+    // `pub` markers) are skipped — there's nothing to re-export.
+    // Sub-packages contribute via their own `__init__.ty` if the
+    // user opts in there too, so aggregation cascades naturally.
+    let mut pkg_pub_aggregation: std::collections::HashMap<PathBuf, Vec<(String, Vec<String>)>> =
+        std::collections::HashMap::new();
+    for (path, source) in &sources {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if stem == "__init__" {
+            continue;
+        }
+        let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
+            &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
+                &expand_multiline_guards(&expand_lazy_imports(&expand_typed_let_unpack(source))),
+            ))),
+        )));
+        let prep = preprocess(&expanded);
+        if prep.pub_names.is_empty() {
+            continue;
+        }
+        if let Some(dir) = path.parent() {
+            pkg_pub_aggregation
+                .entry(dir.to_path_buf())
+                .or_default()
+                .push((stem.to_owned(), prep.pub_names));
+        }
+    }
+
     // Phase 2: desugar and emit using the already-loaded source text.
     let mut emitted = 0usize;
     let mut needs_runtime = false;
@@ -323,7 +357,102 @@ pub fn run(args: BuildArgs) -> Result<()> {
                 &expand_multiline_guards(&expand_lazy_imports(&expand_typed_let_unpack(source))),
             ))),
         )));
-        let prep = preprocess(&expanded);
+        let mut prep = preprocess(&expanded);
+
+        // `pub *` aggregation: when an `__init__.ty` opted in (via
+        // the marker stripped by the preprocessor), append synthesised
+        // `from .submodule import Name1, Name2` lines to the parsed
+        // source and extend `prep.pub_names` so the desugar pass
+        // includes every sibling's public names in the package's
+        // emitted `__all__`. Outside `__init__.ty` the marker is a
+        // silent no-op today — an advice diagnostic would be the
+        // ergonomic next step.
+        //
+        // Siblings are sorted by basename so the emitted re-export
+        // order is deterministic across runs and across platforms
+        // (where filesystem ordering varies). Name collisions
+        // between sibling submodules are skipped (first occurrence
+        // wins) and reported via a `pub_name_collision` warning so
+        // the user picks an explicit winner.
+        let stem_for_init = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if prep.pub_star && stem_for_init != "__init__" {
+            eprintln!(
+                "warning: `pub *` in `{}` has no effect — the aggregation marker is only \
+                 honoured in `__init__.ty` (the package-level entry point). Move `pub *` \
+                 into the package's `__init__.ty`, or drop it here.",
+                path.display()
+            );
+        }
+        if prep.pub_star && stem_for_init == "__init__" {
+            if let Some(dir) = path.parent() {
+                if let Some(siblings_unsorted) = pkg_pub_aggregation.get(dir) {
+                    let mut siblings = siblings_unsorted.clone();
+                    siblings.sort_by(|a, b| a.0.cmp(&b.0));
+                    let mut buf = String::new();
+                    // `seen` starts with the __init__'s own pub names
+                    // so a same-named sibling export is treated as a
+                    // collision against the package-local definition
+                    // and skipped — never overrides the explicit one.
+                    let mut seen: std::collections::HashMap<String, String> = prep
+                        .pub_names
+                        .iter()
+                        .map(|n| (n.clone(), "<package>".to_owned()))
+                        .collect();
+                    for (mod_name, names) in &siblings {
+                        let mut new_names: Vec<&String> = Vec::new();
+                        for n in names {
+                            if let Some(first_owner) = seen.get(n.as_str()) {
+                                eprintln!(
+                                    "warning: pub_name_collision in package `{}`: \
+                                     `{}` is exported by `{}` and `{}` — keeping the {} \
+                                     definition. Rename one of them or remove `pub *` and \
+                                     write explicit re-exports.",
+                                    dir.file_name().and_then(|n| n.to_str()).unwrap_or("<pkg>"),
+                                    n,
+                                    first_owner,
+                                    mod_name,
+                                    if first_owner == "<package>" {
+                                        "__init__.ty"
+                                    } else {
+                                        "first sibling"
+                                    }
+                                );
+                                continue;
+                            }
+                            new_names.push(n);
+                        }
+                        if new_names.is_empty() {
+                            continue;
+                        }
+                        // Append at the END of the source so existing
+                        // line numbers stay stable — diagnostics on
+                        // the user's original code still report
+                        // accurate locations. Python evaluates these
+                        // re-exports at import time regardless of
+                        // their position.
+                        let names_str = new_names
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        buf.push_str(&format!("from .{} import {}\n", mod_name, names_str));
+                        for n in new_names {
+                            seen.insert(n.clone(), mod_name.clone());
+                            prep.pub_names.push(n.clone());
+                        }
+                    }
+                    if !buf.is_empty() {
+                        // Ensure a trailing newline before appending so
+                        // we don't accidentally glue onto an existing
+                        // final statement that lacks one.
+                        if !prep.python_source.ends_with('\n') {
+                            prep.python_source.push('\n');
+                        }
+                        prep.python_source.push_str(&buf);
+                    }
+                }
+            }
+        }
 
         let module = tyc_syntax::parse_module(&prep.python_source)
             .map(|p| p.into_syntax())
@@ -1970,6 +2099,102 @@ mod tests {
             no_sync: false,
         });
         assert!(result.is_err(), "build should fail on type mismatch");
+    }
+
+    #[test]
+    fn build_pub_star_aggregates_sibling_pub_names_through_init() {
+        // R3 follow-up: `pub *` in `__init__.ty` re-exports every
+        // sibling `.ty` module's `pub` names through the emitted
+        // `__init__.py`. The package's `__all__` is the union of
+        // every submodule's `pub` markers, deterministically ordered
+        // by submodule basename, and synthesised
+        // `from .submodule import …` lines drive runtime resolution.
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        let pkg_dir = src_dir.join("mypkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        std::fs::write(
+            tmp.path().join("typhon.toml"),
+            "[project]\nname = \"pubstar_test\"\nsrc = \"src\"\nout = \"build\"\n\
+             [python]\ntarget = \"3.13\"\n[emit]\nformat = false\n\
+             [strictness]\nauto-gather = false\n[env]\n",
+        )
+        .unwrap();
+        std::fs::write(src_dir.join("main.ty"), "let x: int = 1\n").unwrap();
+        std::fs::write(pkg_dir.join("__init__.ty"), "pub *\n").unwrap();
+        std::fs::write(
+            pkg_dir.join("widget.ty"),
+            "pub class Widget:\n    name: str\n\npub def make_widget(n: str) -> Widget:\n    return Widget(name=n)\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pkg_dir.join("util.ty"),
+            "pub def shout(s: str) -> str:\n    return s.upper()\n",
+        )
+        .unwrap();
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+            check: false,
+            no_sync: false,
+        })
+        .unwrap();
+        let init_py =
+            std::fs::read_to_string(tmp.path().join("build").join("mypkg").join("__init__.py"))
+                .unwrap();
+        assert!(
+            init_py.contains("from .util import shout"),
+            "expected sibling re-export `from .util import shout`; got:\n{init_py}"
+        );
+        assert!(
+            init_py.contains("from .widget import Widget, make_widget"),
+            "expected sibling re-export `from .widget import Widget, make_widget`; got:\n{init_py}"
+        );
+        assert!(
+            init_py.contains("__all__"),
+            "expected __all__ to be synthesised; got:\n{init_py}"
+        );
+        // Deterministic ordering: util sorts before widget.
+        let util_at = init_py
+            .find(".util import")
+            .expect("util re-export present");
+        let widget_at = init_py
+            .find(".widget import")
+            .expect("widget re-export present");
+        assert!(
+            util_at < widget_at,
+            "siblings must be sorted by basename (util before widget); got:\n{init_py}"
+        );
+    }
+
+    #[test]
+    fn build_pub_star_outside_init_is_a_silent_passthrough() {
+        // Outside `__init__.ty`, `pub *` has no effect — the marker
+        // is stripped by the preprocessor and the build proceeds as
+        // if it weren't there. A warning is emitted via stderr so
+        // the user knows the marker is in the wrong place (the
+        // warning text isn't asserted here — the integration tests
+        // don't capture stderr).
+        let tmp = tempfile::tempdir().unwrap();
+        let (_, out_dir) = scaffold(tmp.path(), "pub *\n\npub def f() -> int:\n    return 1\n");
+        run(BuildArgs {
+            path: tmp.path().to_path_buf(),
+            out: None,
+            no_format: true,
+            check: false,
+            no_sync: false,
+        })
+        .unwrap();
+        let py = std::fs::read_to_string(out_dir.join("main.py")).unwrap();
+        assert!(
+            !py.contains("pub *"),
+            "`pub *` line must not appear in the emitted Python: {py}"
+        );
+        assert!(
+            py.contains("def f()"),
+            "function definition must still emit cleanly: {py}"
+        );
     }
 
     #[test]

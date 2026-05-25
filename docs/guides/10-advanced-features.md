@@ -551,6 +551,76 @@ pub model WebhookEvent:     # public Pydantic model
 
 ---
 
+## Typing argparse with a dataclass adapter (R3-7)
+
+`argparse.Namespace` is opaque — every `args.foo` reads as `Any`, which
+makes the parsed CLI surface a static-typing hole. Typhon doesn't
+extend `argparse` directly; instead, declare a Typhon `class Args:`
+that describes the parsed shape and write a small adapter that
+populates an instance from the namespace.
+
+```python
+import argparse
+
+class Args:
+    name: str
+    count: int = 1
+    verbose: bool = False
+
+def parse_cli() -> Args:
+    let parser: argparse.ArgumentParser = argparse.ArgumentParser()
+    parser.add_argument("--name", type=str, required=True)
+    parser.add_argument("--count", type=int, default=1)
+    parser.add_argument("--verbose", action="store_true")
+    let ns: argparse.Namespace = parser.parse_args()
+    return Args(name=ns.name, count=ns.count, verbose=ns.verbose)
+
+def main() -> None:
+    let args: Args = parse_cli()
+    if args.verbose:
+        print(f"name={args.name} count={args.count}")
+```
+
+The boundary is the `Args(name=ns.name, ...)` line — every field
+crosses from `Any` into the declared type exactly once, and the rest
+of the program operates on typed `args`. Combined with `class Args
+frozen:` for immutability, this gives you the same static guarantees
+you'd get from a hand-written CLI dataclass without pulling in a
+third-party library like `pydantic-argparse`.
+
+For a project with multiple subcommands, model each one as a
+sealed-union variant:
+
+```python
+class BuildArgs:
+    out: str
+    no_format: bool = False
+
+class CheckArgs:
+    paths: list[str]
+    stubs: bool = False
+
+type Command = BuildArgs | CheckArgs
+
+def parse_cli() -> Command:
+    # … set up subparsers …
+    let ns: argparse.Namespace = parser.parse_args()
+    if ns.subcommand == "build":
+        return BuildArgs(out=ns.out, no_format=ns.no_format)
+    return CheckArgs(paths=ns.paths, stubs=ns.stubs)
+
+def main() -> None:
+    let cmd: Command = parse_cli()
+    match cmd:
+        case BuildArgs(out, no_format):
+            print(f"building to {out}")
+        case CheckArgs(paths, stubs):
+            print(f"checking {paths}")
+```
+
+The match becomes an exhaustive dispatch over subcommands, with every
+field on each variant statically typed.
+
 ## What you've learned
 
 - **Pipes** thread a value into the next call's first positional slot.

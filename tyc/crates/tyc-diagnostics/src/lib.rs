@@ -507,6 +507,32 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A `class` body declared a field without a default value after
+    /// one that has a default. The emitted `@dataclass(slots=True)`
+    /// generates `__init__` in declaration order, and Python's
+    /// signature rules forbid a positional parameter without a
+    /// default following one with a default — without this check, the
+    /// class definition would blow up at *import* time with a
+    /// `TypeError: non-default argument 'X' follows default argument
+    /// 'Y'`. Mirrors how the parser already rejects the same shape on
+    /// free functions, so the rule is consistent across both surface
+    /// forms (R3-11).
+    #[error("class `{class_name}` field `{non_default}` (no default) is declared after `{prior_default}` (has a default)")]
+    #[diagnostic(
+        code(tyc::field_default_ordering),
+        url("https://typhon.dev/lang/diagnostics/field_default_ordering"),
+        help("move every field without a default above every field with one — the generated `__init__` follows Python's rule that non-default parameters precede default ones, otherwise the class fails to construct at import time")
+    )]
+    FieldDefaultOrdering {
+        class_name: String,
+        non_default: String,
+        prior_default: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("non-default field declared after a defaulted field")]
+        span: SourceSpan,
+    },
+
     /// A sync function called an `async def` without awaiting it. The
     /// expression's value is a coroutine, not the function's declared
     /// return type — and Python's runtime emits "coroutine was never
@@ -1592,6 +1618,25 @@ impl TycError {
     ) -> Self {
         Self::ManualInit {
             class_name: class_name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::FieldDefaultOrdering`] diagnostic (R3-11).
+    pub fn field_default_ordering(
+        class_name: impl Into<String>,
+        non_default: impl Into<String>,
+        prior_default: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::FieldDefaultOrdering {
+            class_name: class_name.into(),
+            non_default: non_default.into(),
+            prior_default: prior_default.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

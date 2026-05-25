@@ -134,6 +134,17 @@ pub struct PreprocessResult {
     /// top; modules with none are left alone, preserving the current
     /// `from foo import *` semantics for legacy `.ty` files.
     pub pub_names: Vec<String>,
+    /// `true` when the source contained a top-level `pub *` marker.
+    /// Only meaningful for `__init__.ty` files: when set, the build
+    /// pipeline aggregates every sibling `.ty` module's `pub` names
+    /// into the package's emitted `__init__.py` (synthesised
+    /// `from .submodule import …` lines + extended `__all__`).
+    /// Outside `__init__.ty` the marker is allowed but has no effect
+    /// — the build pipeline emits an advice diagnostic so users know
+    /// it's a no-op there. The preprocessor strips the line either
+    /// way so the Python parser never sees the `*` token at module
+    /// level.
+    pub pub_star: bool,
 }
 
 /// Convert a list of 0-based line indices into byte offsets pointing at
@@ -178,7 +189,8 @@ pub fn preprocess(source: &str) -> PreprocessResult {
     // emitted so `postprocess` restores `pub ` for `tyc fmt`.
     let mut pub_names: Vec<String> = Vec::new();
     let mut pub_lines: Vec<usize> = Vec::new();
-    let source_owned = strip_pub_prefixes(source, &mut pub_names, &mut pub_lines);
+    let mut pub_star = false;
+    let source_owned = strip_pub_prefixes(source, &mut pub_names, &mut pub_lines, &mut pub_star);
     let source = source_owned.as_str();
 
     let mut python_source = String::with_capacity(source.len());
@@ -726,6 +738,7 @@ pub fn preprocess(source: &str) -> PreprocessResult {
         frozen_class_lines,
         plain_class_lines,
         pub_names,
+        pub_star,
     }
 }
 
@@ -760,6 +773,7 @@ fn strip_pub_prefixes(
     source: &str,
     pub_names: &mut Vec<String>,
     pub_lines: &mut Vec<usize>,
+    pub_star: &mut bool,
 ) -> String {
     let mut out = String::with_capacity(source.len());
     let mut in_string: Option<StringMode> = None;
@@ -779,6 +793,27 @@ fn strip_pub_prefixes(
             continue;
         }
         let rest = &line[indent_len..];
+        // `pub *` — the opt-in marker that asks the build pipeline to
+        // re-export every sibling `.ty` module's `pub` names through
+        // this file's emitted `__init__.py`. Recognised only on
+        // module-level lines whose code portion is exactly `pub *`
+        // (an optional trailing `#` comment is fine). The line is
+        // dropped from the emitted Python — `*` isn't a valid bare
+        // statement — and `pub_star` is flipped to let the build
+        // pass know to do the aggregation. See `commands::build::run`.
+        let code_end = rest
+            .find('#')
+            .unwrap_or_else(|| rest.trim_end_matches(['\n', '\r']).len());
+        let code = rest[..code_end].trim_end();
+        if code == "pub *" {
+            *pub_star = true;
+            // Preserve the line terminator so downstream line indices
+            // stay aligned with the original source — emit an empty
+            // line in place of `pub *`.
+            let terminator = &line[indent_len + rest.trim_end_matches(['\n', '\r']).len()..];
+            out.push_str(terminator);
+            continue;
+        }
         if let Some(after_pub) = rest.strip_prefix("pub ") {
             if let Some(name) = pub_decl_name(after_pub) {
                 pub_names.push(name);
@@ -5226,6 +5261,18 @@ fn render_gather_block(
 /// The pass leaves any other `go`-prefixed line alone so identifiers like
 /// `goto` aren't accidentally rewritten.
 pub fn expand_go_calls(source: &str) -> String {
+    // R3-2 (2026-05-25): fold multi-line `go fn(...)` calls onto a
+    // single line before the line-oriented expansion runs. Python
+    // permits implicit continuation across newlines inside any
+    // parenthesised expression — `go` is a Typhon-only surface form
+    // but reuses Python's expression grammar for the call, so multi-
+    // line argument lists should work the same as for a bare call.
+    // Without this pre-pass `expand_go_calls` sees only the opening
+    // `go fn(` half-line, `parse_go_call` rejects it (no trailing
+    // `)`), and the parser later surfaces a confusing error at the
+    // callee identifier rather than at the unterminated paren.
+    let joined = join_go_continuations(source);
+    let source = joined.as_str();
     let mut out = String::with_capacity(source.len());
     let mut in_string: Option<StringMode> = None;
     for line in source.split_inclusive('\n') {
@@ -5331,6 +5378,113 @@ fn parse_go_call(rest: &str) -> Option<(String, Option<String>)> {
         None => None,
     };
     Some((call_part.to_owned(), handle))
+}
+
+/// Fold continuation lines that belong to a multi-line `go fn(...)`
+/// call onto the line that opens the call, so the line-oriented
+/// `expand_go_calls` pass can match the whole expression in one go.
+///
+/// We start buffering when a line's first non-whitespace token is
+/// `go ` and the line ends with `paren_depth > 0`. Every subsequent
+/// line is glued onto the buffered prefix until parenthesis balance
+/// returns to zero. The original line terminator is preserved on the
+/// joined line so source maps still resolve to the opening line.
+///
+/// Lines that aren't part of a `go ...` continuation are emitted
+/// verbatim, leaving every other parser invariant intact.
+fn join_go_continuations(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut buffered: Option<(String, String)> = None; // (line, original terminator)
+    let mut paren_depth: i32 = 0;
+    let mut in_string: Option<StringMode> = None;
+
+    let flush = |buffered: &mut Option<(String, String)>, out: &mut String| {
+        if let Some((line, term)) = buffered.take() {
+            out.push_str(&line);
+            out.push_str(&term);
+        }
+    };
+
+    for line in source.split_inclusive('\n') {
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let terminator = &line[raw.len()..];
+
+        let pre_string = in_string;
+        let _ = scan_line_code_end(raw, &mut in_string);
+
+        // Inside a triple-quoted string — flush and emit verbatim.
+        if pre_string.is_some() {
+            flush(&mut buffered, &mut out);
+            out.push_str(line);
+            // Recompute paren_depth update for this line — but since
+            // we're inside a string literal, parens don't count. The
+            // post-line scan below handles it correctly because the
+            // `local_str` tracking mirrors `in_string`'s update.
+            continue;
+        }
+
+        if buffered.is_some() && paren_depth > 0 {
+            // Continuation of the buffered `go` line — glue the trimmed
+            // text on with a single space so existing tokenisation keeps
+            // working.
+            let trimmed = raw.trim_start();
+            if let Some((prev_line, prev_term)) = buffered.take() {
+                let joined = if trimmed.is_empty() {
+                    prev_line
+                } else {
+                    format!("{} {}", prev_line, trimmed)
+                };
+                buffered = Some((joined, prev_term));
+            }
+        } else {
+            // Flush any prior buffered line (its parens balanced — emit
+            // as-is so the existing `go` pass sees the joined form), and
+            // start a fresh buffer for this line.
+            flush(&mut buffered, &mut out);
+            buffered = Some((raw.to_owned(), terminator.to_owned()));
+        }
+
+        // Update paren_depth based on this line's raw bytes, skipping
+        // bytes inside string literals and after `#` comments.
+        let bytes = raw.as_bytes();
+        let mut local_str: Option<u8> = None;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if let Some(quote) = local_str {
+                if b == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if b == quote {
+                    local_str = None;
+                }
+                i += 1;
+                continue;
+            }
+            match b {
+                b'#' => break,
+                b'"' | b'\'' => local_str = Some(b),
+                b'(' | b'[' | b'{' => paren_depth += 1,
+                b')' | b']' | b'}' => paren_depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+
+        // Only keep buffering when the line we just consumed is itself
+        // a `go ...` opener (or a continuation of one). A buffered
+        // ordinary line that happens to be unterminated would not be a
+        // `go`, so flush it now and reset.
+        if let Some((line, _)) = buffered.as_ref() {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with("go ") || paren_depth <= 0 {
+                flush(&mut buffered, &mut out);
+            }
+        }
+    }
+    flush(&mut buffered, &mut out);
+    out
 }
 
 // ── `|>` pipe operator expansion ──────────────────────────────────────────────
@@ -6759,6 +6913,49 @@ mod tests {
     fn pub_with_async_def_records_name() {
         let result = preprocess("pub async def fetch() -> int:\n    return 0\n");
         assert_eq!(result.pub_names, vec!["fetch".to_owned()]);
+    }
+
+    #[test]
+    fn pub_star_marker_sets_flag_and_drops_line() {
+        // R3 follow-up: `pub *` is the opt-in marker that asks the
+        // build pipeline to re-export every sibling `.ty` module's
+        // `pub` names through this file's emitted `__init__.py`. The
+        // preprocessor strips the line (`*` isn't valid at module
+        // level) and flips `pub_star` so the build phase can act on
+        // it. Line index alignment is preserved by emitting just the
+        // terminator in place of the original line.
+        let result = preprocess("pub *\npub class Widget:\n    name: str\n");
+        assert!(result.pub_star, "pub_star marker must be set");
+        assert_eq!(result.pub_names, vec!["Widget".to_owned()]);
+        assert!(
+            !result.python_source.contains("pub *"),
+            "`pub *` line must be stripped from the python source: {}",
+            result.python_source
+        );
+    }
+
+    #[test]
+    fn pub_star_with_trailing_comment_still_recognised() {
+        let result = preprocess("pub *  # re-export submodule pub names\n");
+        assert!(
+            result.pub_star,
+            "marker must be recognised even with a trailing comment"
+        );
+    }
+
+    #[test]
+    fn pub_star_indented_is_ignored() {
+        // Only the module-level form is the aggregation marker.
+        // An indented occurrence falls through to the Python parser
+        // which will reject it.
+        let result = preprocess("def f() -> None:\n    pub *\n");
+        assert!(!result.pub_star);
+    }
+
+    #[test]
+    fn no_pub_star_means_flag_off() {
+        let result = preprocess("pub class Widget:\n    name: str\n");
+        assert!(!result.pub_star);
     }
 
     #[test]
@@ -8360,6 +8557,41 @@ def run() -> Result[str, str]:
         // `goto` (no space) must not trigger the rewrite.
         let out = expand_go_calls("goto = 1\n");
         assert_eq!(out, "goto = 1\n");
+    }
+
+    #[test]
+    fn go_multiline_call_lowers_to_spawn() {
+        // R3-2: implicit line continuation inside the call parens
+        // works for every other Python expression — `go` should not
+        // be an exception. The preprocessor folds the continuation
+        // lines onto the opener before the lowering pass runs.
+        let src = "async def f():\n    go fetch(\n        1,\n        2,\n        3,\n    )\n";
+        let out = expand_go_calls(src);
+        assert!(
+            out.contains("typhon_runtime.tasks.spawn(fetch(") && out.contains("1, 2, 3,"),
+            "multi-line spawn missing or args dropped: {out}"
+        );
+    }
+
+    #[test]
+    fn go_multiline_call_with_handle() {
+        let src = "async def f():\n    go fetch(\n        x,\n    ) -> fut\n";
+        let out = expand_go_calls(src);
+        assert!(
+            out.contains("let fut = typhon_runtime.tasks.spawn(fetch(") && out.contains("x,"),
+            "multi-line spawn with handle missing: {out}"
+        );
+    }
+
+    #[test]
+    fn go_join_leaves_unrelated_continuations_alone() {
+        // A non-`go` line with unbalanced parens must not be folded
+        // — only `go ...` openers trigger the join. The buffered
+        // line is flushed as-is when the depth-check decides it isn't
+        // a `go` continuation candidate.
+        let src = "let xs = [\n    1,\n    2,\n]\n";
+        let out = expand_go_calls(src);
+        assert_eq!(out, src);
     }
 
     // ── #2: multi-line guard ────────────────────────────────────────────
