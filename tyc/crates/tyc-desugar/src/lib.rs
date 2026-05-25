@@ -42,7 +42,7 @@ pub struct DesugarOutput {
 }
 
 /// Options that customise the desugar pass for a single module.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct DesugarOptions {
     /// Names of top-level functions to wrap in `@functools.cache`. Populated
     /// from the purity analyser when the user opts into `@memo` /
@@ -84,6 +84,12 @@ pub struct DesugarOptions {
     /// `pub_names` is intentionally a no-op so legacy `.ty` files
     /// that pre-date the `pub` keyword keep their current behaviour.
     pub pub_names: Vec<String>,
+    /// Value for the `extra` keyword argument in the auto-injected
+    /// `model_config = ConfigDict(extra=…)` statement for Pydantic
+    /// `model` classes.  Defaults to `"forbid"` (reject unexpected
+    /// fields).  Accepted values: `"forbid"`, `"ignore"`, `"allow"`.
+    /// Plumbed from `[emit] model-extra` in `typhon.toml`.
+    pub model_extra: String,
 }
 
 /// Desugar a Typhon module AST into a plain Python AST.
@@ -104,6 +110,20 @@ pub struct DesugarOptions {
 ///    `Result` anywhere, `from typhon_runtime import Ok, Err, Result` is
 ///    injected after any leading docstring and future-imports so the generated
 ///    Python can use those names.
+impl Default for DesugarOptions {
+    fn default() -> Self {
+        Self {
+            memoise_functions: Vec::new(),
+            raw_class_line_starts: Vec::new(),
+            frozen_class_line_starts: Vec::new(),
+            plain_class_line_starts: Vec::new(),
+            skip_decoration_bases: Vec::new(),
+            pub_names: Vec::new(),
+            model_extra: "forbid".into(),
+        }
+    }
+}
+
 pub fn desugar_module(module: &ModModule) -> DesugarOutput {
     desugar_module_with(module, DesugarOptions::default())
 }
@@ -1031,6 +1051,7 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
         plain_starts: &options.plain_class_line_starts,
         multi_base_parents: &multi_base_parents,
         skip_decoration_bases: &options.skip_decoration_bases,
+        model_extra: &options.model_extra,
     };
     let (new_body, transformed_classes) = desugar_stmts(&m.body, markers);
 
@@ -1274,6 +1295,11 @@ struct ClassMarkers<'a> {
     /// auto `@dataclass` decoration. Matched by last identifier segment
     /// against each base in the class header.
     skip_decoration_bases: &'a [String],
+    /// Value for the `extra` argument in the synthesised
+    /// `model_config = ConfigDict(extra=…)` statement for Pydantic `model`
+    /// classes. Sourced from `[emit] model-extra` in `typhon.toml` via
+    /// [`DesugarOptions::model_extra`].
+    model_extra: &'a str,
 }
 
 impl ClassMarkers<'_> {
@@ -1418,7 +1444,9 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
                 } else {
                     0
                 };
-                new_class.body.insert(insert_at, make_model_config_stmt());
+                new_class
+                    .body
+                    .insert(insert_at, make_model_config_stmt(markers.model_extra));
             }
             // `class!` classes whose body lacks an explicit `__init__` AND
             // which have at least one positional base get a synthesised
@@ -2095,9 +2123,14 @@ fn has_model_config_stmt(body: &[Stmt]) -> bool {
     })
 }
 
-/// Build `model_config = ConfigDict(extra="forbid")`.
-fn make_model_config_stmt() -> Stmt {
-    let forbid_lit = make_string_literal_expr("forbid");
+/// Build `model_config = ConfigDict(extra="…")`.
+///
+/// The `extra` argument is the string literal value passed to
+/// `ConfigDict(extra=…)` — one of `"forbid"`, `"ignore"`, or `"allow"`.
+/// Any validated value from `[emit] model-extra` in `typhon.toml` is
+/// accepted; callers are responsible for passing a valid value.
+fn make_model_config_stmt(extra: &str) -> Stmt {
+    let forbid_lit = make_string_literal_expr(extra);
 
     let config_dict_call = Expr::Call(ExprCall {
         range: TextRange::default(),
@@ -3889,6 +3922,87 @@ class __typhon_impl_Event(object):
             // "ConfigDict" appears in the import and in the model_config assignment
             2,
             "ConfigDict must not be imported a second time\noutput:\n{out}"
+        );
+    }
+
+    // ── [emit] model-extra tests ──────────────────────────────────────────
+
+    fn parse_and_desugar_with_model_extra(src: &str, extra: &str) -> String {
+        let module = tyc_syntax::parse_module(src)
+            .expect("parse failed")
+            .into_syntax();
+        let out = desugar_module_with(
+            &module,
+            DesugarOptions {
+                model_extra: extra.into(),
+                ..Default::default()
+            },
+        );
+        emit(&out.module)
+    }
+
+    #[test]
+    fn model_extra_forbid_is_default() {
+        // model-extra defaults to "forbid"; the existing test already covers
+        // this via parse_and_desugar; verify via explicit option too.
+        let src = "class ApiUser(BaseModel):\n    id: int\n";
+        let out = parse_and_desugar_with_model_extra(src, "forbid");
+        assert!(
+            out.contains("model_config = ConfigDict(extra=\"forbid\")"),
+            "model-extra=\"forbid\" must emit extra=\"forbid\"\noutput:\n{out}"
+        );
+    }
+
+    #[test]
+    fn model_extra_allow_emits_allow() {
+        let src = "class ApiUser(BaseModel):\n    id: int\n";
+        let out = parse_and_desugar_with_model_extra(src, "allow");
+        assert!(
+            out.contains("model_config = ConfigDict(extra=\"allow\")"),
+            "model-extra=\"allow\" must emit extra=\"allow\"\noutput:\n{out}"
+        );
+        assert!(
+            !out.contains("extra=\"forbid\""),
+            "must not emit \"forbid\" when model-extra=\"allow\"\noutput:\n{out}"
+        );
+    }
+
+    #[test]
+    fn model_extra_ignore_emits_ignore() {
+        let src = "class ApiUser(BaseModel):\n    id: int\n";
+        let out = parse_and_desugar_with_model_extra(src, "ignore");
+        assert!(
+            out.contains("model_config = ConfigDict(extra=\"ignore\")"),
+            "model-extra=\"ignore\" must emit extra=\"ignore\"\noutput:\n{out}"
+        );
+    }
+
+    #[test]
+    fn model_extra_does_not_affect_non_model_classes() {
+        // Plain dataclass must not get a model_config stmt regardless of model-extra.
+        let src = "class Point:\n    x: float\n    y: float\n";
+        let out = parse_and_desugar_with_model_extra(src, "allow");
+        assert!(
+            !out.contains("model_config"),
+            "non-model class must not get model_config with model-extra=\"allow\"\noutput:\n{out}"
+        );
+    }
+
+    #[test]
+    fn model_extra_respects_existing_user_model_config() {
+        // If the user already wrote model_config, the desugar pass must NOT
+        // inject a second one — even if model-extra differs.
+        let src =
+            "class ApiUser(BaseModel):\n    model_config = ConfigDict(extra=\"allow\")\n    id: int\n";
+        let out = parse_and_desugar_with_model_extra(src, "ignore");
+        assert_eq!(
+            out.matches("model_config").count(),
+            1,
+            "existing model_config must not be duplicated\noutput:\n{out}"
+        );
+        assert!(
+            out.contains("extra=\"allow\""),
+            "user-defined model_config value must be preserved\noutput:\n{out}"
         );
     }
 

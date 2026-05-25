@@ -62,10 +62,11 @@ See [Recommended Presets](/Typhon/configuration/presets/) for opinionated starti
 
 ## Always-on behaviour
 
-Two emit policies are no longer configurable and run unconditionally:
+One emit policy is no longer configurable and runs unconditionally:
 
 - **PEP 561 `.pyi` stubs** are emitted for every `.dty` file next to the project, so mypy / pyright / Pyrefly / `ty` can consume Typhon-authored libraries without an interop tax. The previously-documented `[emit] pyi-stubs` toggle has been removed.
-- **Pydantic `model` classes** are always emitted with `model_config = ConfigDict(extra="forbid")` — the safety pitch forbids silently dropping unexpected input. A configurable `model-extra` knob is on the roadmap but not yet wired in.
+
+**Pydantic `model` classes** now use `[emit] model-extra` (default `"forbid"`) to control the `ConfigDict(extra=…)` value. See the [`[emit]` reference](/Typhon/configuration/emit/) for details.
 
 ## Conventions
 

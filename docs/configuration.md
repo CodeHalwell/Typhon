@@ -23,6 +23,7 @@ free-threaded = false       # opt-in; requires 3.13t/3.14t
 class-default = "dataclass" # or "pydantic"
 format = true               # post-process through ruff format
 skip-decoration-bases = []  # extra base classes that suppress @dataclass injection
+model-extra = "forbid"      # ConfigDict(extra=…) for model classes: "forbid" | "ignore" | "allow"
 
 [strictness]
 no-implicit-any = true
@@ -35,6 +36,7 @@ auto-parallel = false       # opt-in: rewrite pure list comprehensions to a thre
 parallel-min-size = 64      # minimum iterable size for auto-parallel to fire
 pgo-memoise = false         # opt-in: promote hot pure fns to @functools.cache from typhon-profile.json
 pgo-min-calls = 100         # minimum profile-recorded call count for pgo-memoise to fire
+stub-check = "error"        # severity for tyc::stub_mismatch from `tyc check --stubs`
 
 [env]
 required = ["DATABASE_URL"]  # comptime env() lookups must resolve at build time
@@ -74,6 +76,7 @@ pytest = "8.2"              # bare version → ==8.2
 | `class-default` | `"dataclass"` \| `"pydantic"` | Default emit target for `class` declarations. Overridable per-class via the `model` keyword. Unknown values (`"struct"`, `"plain"`, `"none"`, the empty string, …) are rejected at config load with `tyc::invalid_config_value` rather than silently treated as `"dataclass"`. |
 | `format` | bool | Post-process emitted `.py` through `ruff format`. |
 | `skip-decoration-bases` | list of strings | Extra base-class names that suppress the automatic `@dataclasses.dataclass(slots=True)` decorator and trigger plain-class emission with a synthesised `__init__` calling `super().__init__()`. Matched by *last segment*, so `["BaseModel", "MyCustomBase"]` catches `pydantic.BaseModel` and `mylib.frameworks.MyCustomBase` regardless of how they're imported. Built-in entries (`Protocol`, `Enum`, `IntEnum`, `Flag`, `IntFlag`, `StrEnum`, `ABC`, `NamedTuple`, `BaseModel`, `App`) are auto-skipped without needing to be listed. |
+| `model-extra` | `"forbid"` \| `"ignore"` \| `"allow"` | Value for `ConfigDict(extra=…)` injected into every `model` class. Default `"forbid"` rejects unexpected fields at runtime. `"ignore"` silently drops them; `"allow"` passes them through as extra attributes. Unknown values are rejected at config load. |
 
 > **Always-on behaviour.** Two emit policies that used to be exposed in
 > `typhon.toml` are no longer configurable and run unconditionally:
@@ -82,10 +85,9 @@ pytest = "8.2"              # bare version → ==8.2
 >   project, so mypy / pyright / Pyrefly / `ty` can consume Typhon-authored
 >   libraries without an interop tax. The previously-documented
 >   `[emit] pyi-stubs` toggle has been removed.
-> - **Pydantic `model` classes** are always emitted with
->   `model_config = ConfigDict(extra="forbid")` — the safety pitch
->   forbids silently dropping unexpected input. A configurable
->   `model-extra` knob is on the roadmap but not yet wired in.
+> - **Pydantic `model` classes** inject `model_config = ConfigDict(extra=…)`
+>   where the `extra` value is controlled by `[emit] model-extra`
+>   (default `"forbid"`). Accepted values: `"forbid"`, `"ignore"`, `"allow"`.
 
 ### `[strictness]`
 
@@ -101,6 +103,7 @@ pytest = "8.2"              # bare version → ==8.2
 | `parallel-min-size` | int | Minimum statically-detectable iterable length for a comprehension to qualify for `auto-parallel`. Default `64`. When the iterable size cannot be inferred, the threshold is treated as zero — users opting in accept that contract. |
 | `pgo-memoise` | bool | When `true`, `tyc build` reads `typhon-profile.json` (produced by a prior `tyc profile` run) and promotes every pure function whose observed call count meets `pgo-min-calls` to `@functools.cache`, even if the user did not write `@memo`. Complements `auto-memoise` (which caches every pure function regardless of profile data). Missing profile file is not an error — PGO is best-effort. Default `false`. |
 | `pgo-min-calls` | int | Minimum observed call count for a function to be promoted by `pgo-memoise`. Default `100` — high enough that one-off entry points stay un-cached, low enough that an inner-loop helper qualifies after a single representative run. |
+| `stub-check` | `"error"` \| `"warn"` \| `"off"` | Severity for `tyc::stub_mismatch` produced by `tyc check --stubs`. `"error"` (default) breaks CI on stub drift. `"warn"` surfaces drift without blocking merges. `"off"` silently drops stub mismatches — useful when running `--stubs` opportunistically. |
 
 ### `[env]`
 
