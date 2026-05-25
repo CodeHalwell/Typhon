@@ -1,0 +1,157 @@
+from datatypes import Batch, Dataset, SplitDataset
+from ids import JobId, ModelName, ModelVersion, RunId
+from model import (
+    EvalMetrics,
+    TrainConfig,
+    TrainResult,
+    evaluate,
+    train_linear,
+)
+from registry import DatasetRegistry, ModelRegistry
+from stages import PipelineError, Stage, make_split, standardise
+from tracker import JsonlTracker
+
+
+pub type JobState = JobPending | JobRunning | JobSucceeded | JobFailed
+
+
+pub class JobPending:
+    pass
+
+
+pub class JobRunning:
+    started_at_iso: str
+
+
+pub class JobSucceeded:
+    model_name: ModelName
+    model_version: ModelVersion
+    metrics: dict[str, float]
+
+
+pub class JobFailed:
+    stage: str
+    message: str
+
+
+pub class JobSpec frozen:
+    job_id: JobId
+    run_id: RunId
+    model_name: ModelName
+    model_version: ModelVersion
+    train_cfg: TrainConfig
+
+
+pub class TrainedArtifact:
+    train_result: TrainResult
+    metrics: EvalMetrics
+
+
+pub class Orchestrator:
+    datasets: DatasetRegistry
+    models: ModelRegistry
+    tracker: JsonlTracker
+
+
+def _normalise(
+    ds: Dataset[list[float]],
+) -> Result[Dataset[list[float]], PipelineError]:
+    let std_stage: Stage[list[float], list[float]] = standardise()
+    match std_stage.fn(Batch(samples=ds.samples)):
+        case Ok(batch):
+            return Ok(Dataset(id=ds.id, version=ds.version, samples=batch.samples))
+        case Err(err):
+            return Err(err)
+    raise RuntimeError("unreachable")
+
+
+def _split(
+    ds: Dataset[list[float]],
+    train_frac: float,
+) -> Result[SplitDataset[list[float]], PipelineError]:
+    let splitter = make_split(train_frac=train_frac)
+    return splitter(ds)
+
+
+def _train_and_evaluate(
+    spec: JobSpec,
+    split: SplitDataset[list[float]],
+) -> Result[TrainedArtifact, PipelineError]:
+    let train_result: TrainResult = train_linear(
+        spec.model_name, spec.model_version, split.train, spec.train_cfg,
+    )
+    let metrics: EvalMetrics = evaluate(train_result.model, split.test)
+    return Ok(TrainedArtifact(train_result=train_result, metrics=metrics))
+
+
+def _build_pipeline(
+    ds: Dataset[list[float]],
+    spec: JobSpec,
+) -> Result[TrainedArtifact, PipelineError]:
+    with normalised = _normalise(ds)?,
+         split      = _split(normalised, 0.8)?,
+         artifact   = _train_and_evaluate(spec, split)?:
+        return Ok(artifact)
+
+
+impl Orchestrator:
+    def run(
+        self,
+        ds: Dataset[list[float]],
+        spec: JobSpec,
+    ) -> JobState:
+        self.tracker.record_job_start(
+            spec.run_id,
+            spec.job_id,
+            {
+                "lr": spec.train_cfg.learning_rate,
+                "epochs": spec.train_cfg.epochs,
+                "l2": spec.train_cfg.l2,
+            },
+        )
+
+        self.datasets.register(ds)
+
+        match _build_pipeline(ds, spec):
+            case Err(err):
+                self.tracker.record_job_finish(
+                    spec.run_id, spec.job_id, None, None, "failed"
+                )
+                return JobFailed(stage=err.stage, message=err.message)
+            case Ok(artifact):
+                for (i, loss) in enumerate(artifact.train_result.epoch_losses):
+                    self.tracker.emit(spec.run_id, i, {"train_loss": loss})
+
+                let metrics_dict: dict[str, float] = {
+                    "mse": artifact.metrics.mse,
+                    "mae": artifact.metrics.mae,
+                    "r2": artifact.metrics.r2,
+                    "final_train_loss": artifact.train_result.final_loss,
+                }
+                self.tracker.emit(spec.run_id, spec.train_cfg.epochs, metrics_dict)
+                self.models.register(
+                    artifact.train_result.model,
+                    metrics_dict,
+                    parent_run=spec.run_id,
+                )
+                self.tracker.record_job_finish(
+                    spec.run_id,
+                    spec.job_id,
+                    spec.model_name,
+                    spec.model_version,
+                    "succeeded",
+                )
+                return JobSucceeded(
+                    model_name=spec.model_name,
+                    model_version=spec.model_version,
+                    metrics=metrics_dict,
+                )
+        raise RuntimeError("unreachable")
+
+
+pub def state_label(state: JobState) -> str:
+    match state:
+        case JobPending():           return "pending"
+        case JobRunning(_):          return "running"
+        case JobSucceeded(_, _, _):  return "succeeded"
+        case JobFailed(_, _):        return "failed"

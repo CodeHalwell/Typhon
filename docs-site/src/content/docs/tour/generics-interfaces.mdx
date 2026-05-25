@@ -5,7 +5,7 @@ sidebar:
   order: 8
 ---
 
-import { Aside } from '@astrojs/starlight/components';
+import { Aside, TabItem, Tabs } from '@astrojs/starlight/components';
 
 Two tools for writing code that works across many types: **generics** (one definition, many parameter types) and **interfaces** (structural contracts — anything with the right shape satisfies them). Both erase at emit time — Python's duck typing carries the runtime; Typhon checks at compile time.
 
@@ -108,21 +108,26 @@ The checker verifies, at the call site, that `Button` provides `draw`, `width`, 
 
 ### Interfaces emit as `typing.Protocol`
 
-```python
-# Typhon
-interface Drawable:
-    def draw(self) -> None
-    def width(self) -> float
-    def height(self) -> float
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    interface Drawable:
+        def draw(self) -> None
+        def width(self) -> float
+        def height(self) -> float
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    from typing import Protocol
 
-# Emitted Python
-from typing import Protocol
-
-class Drawable(Protocol):
-    def draw(self) -> None: ...
-    def width(self) -> float: ...
-    def height(self) -> float: ...
-```
+    class Drawable(Protocol):
+        def draw(self) -> None: ...
+        def width(self) -> float: ...
+        def height(self) -> float: ...
+    ```
+  </TabItem>
+</Tabs>
 
 Mypy, pyright, and IDEs all understand `Protocol` the same way Typhon does.
 
@@ -177,19 +182,24 @@ def smallest[T: Ordered](xs: list[T]) -> T?:
 
 Typhon erases generics at emit time. The runtime sees plain `list`, `dict`, and untyped classes; type safety is a compile-time property only.
 
-```python
-# Typhon
-def first[T](xs: list[T]) -> T?:
-    if len(xs) == 0:
-        return None
-    return xs[0]
-
-# Emitted Python (PEP 695 preserved on the 3.13+ target)
-def first[T](xs: list[T]) -> T | None:
-    if len(xs) == 0:
-        return None
-    return xs[0]
-```
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    def first[T](xs: list[T]) -> T?:
+        if len(xs) == 0:
+            return None
+        return xs[0]
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    def first[T](xs: list[T]) -> T | None:
+        if len(xs) == 0:
+            return None
+        return xs[0]
+    ```
+  </TabItem>
+</Tabs>
 
 PEP 695 syntax is preserved (Python 3.12+ supports it natively). Older targets would need a `TypeVar` rewrite — for 3.13+ (Typhon's default), the syntax goes through unchanged.
 
@@ -197,40 +207,88 @@ PEP 695 syntax is preserved (Python 3.12+ supports it natively). Older targets w
 
 A small worked example: a generic in-memory cache with a structural "serialisable" interface.
 
-```python
-interface Serialisable:
-    def to_dict(self) -> dict[str, str]
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    interface Serialisable:
+        def to_dict(self) -> dict[str, str]
 
-class Cache[K, V]:
-    store: dict[K, V]
+    class Cache[K, V]:
+        store: dict[K, V]
 
-impl[K, V] Cache[K, V]:
-    def get(self, k: K) -> V?:
-        return self.store.get(k)
+    impl[K, V] Cache[K, V]:
+        def get(self, k: K) -> V?:
+            return self.store.get(k)
 
-    def put(self, k: K, v: V) -> None:
-        self.store[k] = v
+        def put(self, k: K, v: V) -> None:
+            self.store[k] = v
 
-def snapshot[T: Serialisable](items: list[T]) -> list[dict[str, str]]:
-    return [item.to_dict() for item in items]
+    def snapshot[T: Serialisable](items: list[T]) -> list[dict[str, str]]:
+        return [item.to_dict() for item in items]
 
-class User:
-    id: int
-    name: str
+    class User:
+        id: int
+        name: str
 
-impl User:
-    def to_dict(self) -> dict[str, str]:
-        return {"id": str(self.id), "name": self.name}
+    impl User:
+        def to_dict(self) -> dict[str, str]:
+            return {"id": str(self.id), "name": self.name}
 
-def main() -> None:
-    let users: Cache[int, User] = Cache(store={})
-    users.put(1, User(id=1, name="Alice"))
-    users.put(2, User(id=2, name="Bob"))
+    def main() -> None:
+        let users: Cache[int, User] = Cache(store={})
+        users.put(1, User(id=1, name="Alice"))
+        users.put(2, User(id=2, name="Bob"))
 
-    let all_users: list[User] = list(users.store.values())
-    let dump: list[dict[str, str]] = snapshot(all_users)
-    print(dump)
-```
+        let all_users: list[User] = list(users.store.values())
+        let dump: list[dict[str, str]] = snapshot(all_users)
+        print(dump)
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    from __future__ import annotations
+    from typing import Protocol
+    import dataclasses
+
+
+    class Serialisable(Protocol):
+        def to_dict(self) -> dict[str, str]: ...
+
+
+    @dataclasses.dataclass(slots=True)
+    class Cache[K, V]:
+        store: dict[K, V]
+
+        def get(self, k: K) -> V | None:
+            return self.store.get(k)
+
+        def put(self, k: K, v: V) -> None:
+            self.store[k] = v
+
+
+    def snapshot[T: Serialisable](items: list[T]) -> list[dict[str, str]]:
+        return [item.to_dict() for item in items]
+
+
+    @dataclasses.dataclass(slots=True)
+    class User:
+        id: int
+        name: str
+
+        def to_dict(self) -> dict[str, str]:
+            return {"id": str(self.id), "name": self.name}
+
+
+    def main() -> None:
+        users: Cache[int, User] = Cache(store={})
+        users.put(1, User(id=1, name="Alice"))
+        users.put(2, User(id=2, name="Bob"))
+        all_users: list[User] = list(users.store.values())
+        dump: list[dict[str, str]] = snapshot(all_users)
+        print(dump)
+    ```
+  </TabItem>
+</Tabs>
 
 What's going on:
 

@@ -1,0 +1,59 @@
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+from ids import JobId, ModelName, ModelVersion, RunId
+
+
+pub class JsonlTracker:
+    path: Path
+
+
+impl JsonlTracker:
+    def emit(self, run: RunId, step: int, metrics: dict[str, float]) -> None:
+        let payload: dict[str, object] = {
+            "run": str(run),
+            "step": step,
+            "metrics": dict(metrics),
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+        with open(self.path, "a") as f:
+            f.write(json.dumps(payload) + "\n")
+
+    def record_job_start(self, run: RunId, job: JobId, params: dict[str, object]) -> None:
+        let payload: dict[str, object] = {
+            "run": str(run),
+            "job": str(job),
+            "event": "start",
+            "params": dict(params),
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+        with open(self.path, "a") as f:
+            f.write(json.dumps(payload) + "\n")
+
+    def record_job_finish(
+        self,
+        run: RunId,
+        job: JobId,
+        model: ModelName?,
+        version: ModelVersion?,
+        status: str,
+    ) -> None:
+        let payload: dict[str, object] = {
+            "run": str(run),
+            "job": str(job),
+            "event": "finish",
+            "model_name": str(model) if model is not None else None,
+            "model_version": str(version) if version is not None else None,
+            "status": status,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+        with open(self.path, "a") as f:
+            f.write(json.dumps(payload) + "\n")
+
+
+pub def new_tracker(path: Path) -> JsonlTracker:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text("")
+    return JsonlTracker(path=path)

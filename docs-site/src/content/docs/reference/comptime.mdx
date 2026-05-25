@@ -5,25 +5,35 @@ sidebar:
   order: 14
 ---
 
-import { Aside } from '@astrojs/starlight/components';
+import { Aside, Tabs, TabItem } from '@astrojs/starlight/components';
 
 `comptime` bindings and functions are evaluated by `tyc` at build time inside a sandboxed interpreter. Results are inlined as literals into the emitted Python.
 
 ## `comptime let`
 
-```python
-comptime let PORT: int = int(env("PORT", "8080"))
-comptime let DB_URL: str = env("DATABASE_URL")        # build fails if unset
-comptime let IS_PROD: bool = env("BUILD_TAG", "dev") == "prod"
-```
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    comptime let PORT: int = int(env("PORT", "8080"))
+    comptime let IS_PROD: bool = env("BUILD_TAG", "dev") == "prod"
 
-Emits:
+    def main() -> None:
+        print(PORT)
+        print(IS_PROD)
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    PORT: int = 8080
+    IS_PROD: bool = False
 
-```python
-PORT: int = 8080
-DB_URL: str = "postgresql://..."
-IS_PROD: bool = False
-```
+
+    def main() -> None:
+        print(PORT)
+        print(IS_PROD)
+    ```
+  </TabItem>
+</Tabs>
 
 The runtime sees only the literal — there is no runtime call to `env()`.
 
@@ -31,25 +41,44 @@ The runtime sees only the literal — there is no runtime call to `env()`.
 
 User-defined functions usable from `comptime let` initialisers:
 
-```python
-comptime def double(n: int) -> int:
-    return n * 2
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    comptime def double(n: int) -> int:
+        return n * 2
 
-comptime def grade(score: int) -> str:
-    if score >= 90:
-        return "A"
-    elif score >= 80:
-        return "B"
-    elif score >= 70:
-        return "C"
-    else:
-        return "F"
+    comptime def grade(score: int) -> str:
+        if score >= 90:
+            return "A"
+        elif score >= 80:
+            return "B"
+        elif score >= 70:
+            return "C"
+        else:
+            return "F"
 
-comptime let PORT:     int = double(4000)        # → 8000
-comptime let MY_GRADE: str = grade(82)            # → "B"
-```
+    comptime let PORT:     int = double(4000)        # → 8000
+    comptime let MY_GRADE: str = grade(82)            # → "B"
 
-The `def`s remain in the emitted output (they're ordinary Python functions; `comptime` is a build-time marker). The call sites become literals.
+    def main() -> None:
+        print(PORT)
+        print(MY_GRADE)
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    PORT: int = 8000
+    MY_GRADE: str = "B"
+
+
+    def main() -> None:
+        print(PORT)
+        print(MY_GRADE)
+    ```
+  </TabItem>
+</Tabs>
+
+Both the `comptime def` definitions and their call sites are erased; only the resulting literal values reach the emitted output.
 
 ## What the sandbox supports
 

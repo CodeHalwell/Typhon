@@ -8,6 +8,10 @@ examples/*/build/
 examples/*/pyproject.toml
 examples/*/uv.lock
 examples/*/.venv/
+examples/apps/*/build/
+examples/apps/*/pyproject.toml
+examples/apps/*/uv.lock
+examples/apps/*/.venv/
 
 # stress/ build artefacts (created by stress harnesses, regenerated on demand)
 stress/round-*/build/

@@ -1,0 +1,122 @@
+from ids import Symbol, TraderId
+from money import Notional, Price, Qty, notional_for
+from orders import Buy, Limit, Market, Order
+
+
+pub class RiskError:
+    reason: str
+    detail: str
+
+
+pub class RiskLimits frozen:
+    max_order_qty: Qty
+    max_position_qty: Qty
+    max_order_notional: Notional
+
+
+pub class TraderPosition:
+    trader: TraderId
+    symbol: Symbol
+    qty: int
+    average_price: int
+
+
+pub class RiskGate:
+    limits: dict[str, RiskLimits]
+    positions: dict[str, TraderPosition]
+
+
+def _position_key(trader: TraderId, symbol: Symbol) -> str:
+    return f"{str(trader)}::{str(symbol)}"
+
+
+impl RiskGate:
+    def limits_for(self, symbol: Symbol) -> RiskLimits?:
+        return self.limits.get(str(symbol))
+
+    def position(self, trader: TraderId, symbol: Symbol) -> TraderPosition:
+        let key: str = _position_key(trader, symbol)
+        let existing: TraderPosition? = self.positions.get(key)
+        if existing is not None:
+            return existing
+        let fresh: TraderPosition = TraderPosition(
+            trader=trader,
+            symbol=symbol,
+            qty=0,
+            average_price=0,
+        )
+        self.positions[key] = fresh
+        return fresh
+
+    def check(self, order: Order) -> Result[None, RiskError]:
+        let limits: RiskLimits? = self.limits_for(order.symbol)
+        if limits is None:
+            return Err(RiskError(
+                reason="unknown_symbol",
+                detail=f"no risk limits configured for {order.symbol}",
+            ))
+
+        if int(order.qty) <= 0:
+            return Err(RiskError(reason="bad_qty", detail="qty must be positive"))
+
+        if int(order.qty) > int(limits.max_order_qty):
+            return Err(RiskError(
+                reason="qty_above_limit",
+                detail=f"qty {int(order.qty)} > max {int(limits.max_order_qty)}",
+            ))
+
+        let signed_delta: int = (
+            int(order.qty) if isinstance(order.side, Buy) else -int(order.qty)
+        )
+        let pos: TraderPosition = self.position(order.trader, order.symbol)
+        let projected: int = pos.qty + signed_delta
+        if abs(projected) > int(limits.max_position_qty):
+            return Err(RiskError(
+                reason="position_above_limit",
+                detail=(
+                    f"projected qty {projected} exceeds max "
+                    f"{int(limits.max_position_qty)}"
+                ),
+            ))
+
+        match order.kind:
+            case Limit(price):
+                let n: Notional = notional_for(price, order.qty)
+                if int(n) > int(limits.max_order_notional):
+                    return Err(RiskError(
+                        reason="notional_above_limit",
+                        detail=f"notional {int(n)} > max {int(limits.max_order_notional)}",
+                    ))
+            case Market():
+                pass
+
+        return Ok(None)
+
+    def apply_fill(
+        self,
+        trader: TraderId,
+        symbol: Symbol,
+        side_buys: bool,
+        fill_qty: Qty,
+        fill_price: Price,
+    ) -> None:
+        let pos: TraderPosition = self.position(trader, symbol)
+        let signed: int = int(fill_qty) if side_buys else -int(fill_qty)
+        let new_qty: int = pos.qty + signed
+
+        # Reset cost basis when crossing zero
+        if (pos.qty > 0 and new_qty <= 0) or (pos.qty < 0 and new_qty >= 0):
+            pos.qty = new_qty
+            pos.average_price = int(fill_price) if new_qty != 0 else 0
+            return
+
+        if new_qty == 0:
+            pos.qty = 0
+            pos.average_price = 0
+            return
+
+        # Same-sign accumulation — weighted average
+        let prior_notional: int = pos.qty * pos.average_price
+        let added_notional: int = signed * int(fill_price)
+        pos.qty = new_qty
+        pos.average_price = (prior_notional + added_notional) // new_qty

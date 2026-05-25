@@ -949,13 +949,19 @@ impl<'a> Resolver<'a> {
             // via `def`, `class`, a for-loop target, or another assignment
             // all violate immutability.
             //
-            // Exception: two sibling `for x in ...:` loops in the same
-            // scope are idiomatic Python — each loop "rebinds" the
-            // target, but neither was an authored `let`. Allow the
-            // second loop to silently reuse the same name when both
-            // bindings are `Loop` (for / with / except / comprehension
-            // targets).
-            if existing.kind == BindingKind::Loop && kind == BindingKind::Loop {
+            // Exception: a for / with / except / comprehension target
+            // silently rebinds whatever is already in scope. Python's
+            // for-loop variable is just an assignment — the iteration
+            // overwrites whatever was bound before — and forbidding
+            // the rebind produces noisy false positives when a `let`
+            // declared inside one for-body shadows a later `for x in …`
+            // in the enclosing function. R2-17 + the original sibling
+            // for-loop F1 case (Loop + Loop) which this strictly
+            // subsumes. A `let x = …` AFTER the for-loop still goes
+            // through the normal `let` path and would fire
+            // immutable_assign on a value still in scope — only the
+            // loop-target-as-new direction is silenced here.
+            if kind == BindingKind::Loop {
                 return;
             }
             let _ = kind;
@@ -1974,6 +1980,25 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
         }
         Stmt::Match(m) => {
             walk_expr(r, scope, &m.subject);
+            // Apps-feedback 2026-05: at most one case arm runs at
+            // runtime, so a `let key: ...` in arm A must not shadow a
+            // `let key: ...` in arm B. The type checker already enters
+            // a fresh `env` scope per arm (tyc-types `Stmt::Match`
+            // handler), but the resolver was sharing one scope across
+            // every arm, so sibling-arm `let`s fired
+            // `tyc::no_block_shadow` (and same-named pattern captures
+            // fired `tyc::pattern_shadows_outer`).
+            //
+            // Drain bindings added during each arm into a side buffer
+            // so the next arm starts from the pre-match snapshot.
+            // After every arm has walked, splice the drained bindings
+            // back into the scope so downstream reference resolution
+            // (`report_unknown_names`) still finds them. Each arm
+            // declares its own names — they coexist in the final
+            // bindings vec, but the shadow check only sees the
+            // pre-match snapshot while a given arm is walking.
+            let pre_match_len = r.scopes[scope].bindings.len();
+            let mut arm_local_bindings: Vec<Binding> = Vec::new();
             for case in &m.cases {
                 // Mark the case pattern so the declare path knows
                 // shadowing trips `pattern_shadows_outer`, not the
@@ -1987,7 +2012,11 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
                 for s in &case.body {
                     walk_stmt(r, scope, s);
                 }
+                let drained: Vec<Binding> =
+                    r.scopes[scope].bindings.drain(pre_match_len..).collect();
+                arm_local_bindings.extend(drained);
             }
+            r.scopes[scope].bindings.extend(arm_local_bindings);
         }
         _ => {}
     }
@@ -3180,6 +3209,69 @@ def foo():
     }
 
     #[test]
+    fn for_loop_target_silently_rebinds_let_from_sibling_body() {
+        // R2-17: a `let k = …` introduced inside one for-loop body must
+        // not block a subsequent `for k in …:` in the enclosing scope.
+        // Python's for-target is just an assignment; the iteration
+        // value is what survives, and the previously-let-bound k is
+        // logically gone the moment the second loop iterates.
+        let src = "def main() -> None:\n\
+                   \x20   let puts: list[tuple[int, str, int]] = [(1, \"a\", 10)]\n\
+                   \x20   for p in puts:\n\
+                   \x20       let (rid, k, v) = p\n\
+                   \x20       print(k, v, rid)\n\
+                   \x20   let store: dict[str, int] = {\"a\": 1}\n\
+                   \x20   for k in store:\n\
+                   \x20       print(k)\n";
+        let (_m, d) = resolve(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ImmutableAssign { .. })),
+            "for-target rebinding sibling-body let must not fire immutable_assign: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn for_loop_target_silently_rebinds_outer_let() {
+        // R2-17 follow-on: the same rule applies to a flat `let k = 1;
+        // for k in xs:` pattern — Python users write this every day.
+        let src = "def main() -> None:\n\
+                   \x20   let k: int = 0\n\
+                   \x20   let xs: list[int] = [1, 2, 3]\n\
+                   \x20   for k in xs:\n\
+                   \x20       print(k)\n";
+        let (_m, d) = resolve(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ImmutableAssign { .. })),
+            "outer `let k` plus `for k in xs:` must not fire immutable_assign: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn manual_assignment_to_for_target_still_rejected() {
+        // R2-17 negative: silencing the for-target *declaration* path
+        // must not silence the body-level `i = …` rebinding path,
+        // which is the original FINDINGS #75 case.
+        let src = "def main() -> None:\n\
+                   \x20   let xs: list[int] = [1, 2, 3]\n\
+                   \x20   for i in xs:\n\
+                   \x20       i = i + 1\n";
+        let (_m, d) = resolve(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ImmutableAssign { name, .. } if name == "i")),
+            "manual `i = i + 1` inside loop body must still error: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
     fn let_without_initialiser_errors() {
         // FINDINGS #91: `let x: int` (no `=`) must surface
         // tyc::missing_initialiser rather than silently accepting the
@@ -3396,10 +3488,24 @@ def foo():
     }
 
     #[test]
-    fn for_loop_target_cannot_rebind_let() {
+    fn for_loop_target_rebinding_outer_let_is_allowed() {
+        // R2-17 superseded the original "for-loop target cannot rebind a
+        // let" rule: Python's for-target is just an assignment, and
+        // forbidding the rebind produced false positives in any function
+        // that iterated over multiple sibling collections. The expected
+        // behaviour is now silent rebind — the iteration value is what
+        // the body sees, the prior binding is logically gone. Body-level
+        // manual assignment (`items = …`) is still rejected; see
+        // `manual_assignment_to_for_target_still_rejected`.
         let src = "let items: list = []\nfor items in [[1]]:\n    pass\n";
         let (_m, d) = resolve(src);
-        assert!(d.has_errors(), "expected for-loop rebinding to error");
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ImmutableAssign { .. })),
+            "for-target rebinding outer let must not fire immutable_assign: {:?}",
+            d.errors()
+        );
     }
 
     #[test]

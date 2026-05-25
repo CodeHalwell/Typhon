@@ -1,0 +1,36 @@
+import asyncio
+import hashlib
+
+from extract import Document
+from ids import ContentHash
+
+
+pub class Deduper:
+    seen_hashes: dict[str, str]
+    lock: asyncio.Lock
+
+
+pub def content_hash(text: str) -> ContentHash:
+    let h = hashlib.sha256()
+    h.update(text.encode())
+    return ContentHash(h.hexdigest()[:24])
+
+
+impl Deduper:
+    async def check_and_record(self, doc: Document) -> bool:
+        let hash: ContentHash = content_hash(doc.text)
+        let key: str = str(hash)
+        async with self.lock:
+            let prior: str? = self.seen_hashes.get(key)
+            if prior is not None:
+                return False
+            self.seen_hashes[key] = str(doc.url)
+            return True
+
+    async def unique_count(self) -> int:
+        async with self.lock:
+            return len(self.seen_hashes)
+
+
+pub def new_deduper() -> Deduper:
+    return Deduper(seen_hashes={}, lock=asyncio.Lock())

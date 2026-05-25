@@ -43,7 +43,7 @@ See [Architecture Overview](/Typhon/internals/architecture/) for the compiler in
     `go f(x)` lowers to `typhon_runtime.tasks.spawn(f(x))` — strong-ref registry prevents GC mid-flight. [Details →](/Typhon/lowering/go/)
   </Card>
   <Card title="lazy → proxies" icon="setting">
-    `lazy import np = numpy` → bespoke `__TyphonLazy_np_` proxy class. `lazy let X` → sentinel-cached `lazy_val`. `lazy[T]` return → generator. [Details →](/Typhon/lowering/lazy/)
+    `lazy import np = numpy` → bespoke `__TyphonLazy_np_` proxy class. `lazy let X` → sentinel-cached `lazy_let` (imported as `__typhon_lazy_let`) at module scope; `@cached_property` at class scope. The `lazy[T]` return-type form is roadmapped. [Details →](/Typhon/lowering/lazy/)
   </Card>
   <Card title="comptime → inlined literals" icon="document">
     `comptime let PORT = int(env("PORT", "8080"))` → `PORT: int = 8080` after sandbox evaluation. [Details →](/Typhon/lowering/comptime/)
@@ -73,7 +73,7 @@ When you `tyc build`, the emitted tree contains:
 - **`build/typhon_runtime/`** — only when you use features that need it:
   - `result.py` — `Ok`, `Err`, `Result` aliases.
   - `tasks.py` — `spawn(coro)` with the strong-ref `_BACKGROUND` set.
-  - `lazy.py` — `lazy_val(lambda: ...)`.
+  - `lazy.py` — `lazy_let(lambda: ...)` + the `_LazyValue` proxy.
 - **`build/<your modules>.pyi`** — for every `.dty` you wrote.
 
 Nothing else. No `__pycache__/` (Python creates that at runtime), no Cargo artefacts, no Typhon-marker files.

@@ -24,8 +24,8 @@ use ruff_python_ast::name::Name;
 use ruff_python_ast::{
     self as ast, Alias, Arguments, AtomicNodeIndex, Decorator, ExceptHandler, Expr, ExprAttribute,
     ExprBooleanLiteral, ExprCall, ExprContext, ExprName, ExprStringLiteral, Identifier, Keyword,
-    ModModule, Parameter, ParameterWithDefault, Parameters, Pattern, Stmt, StmtAssign, StmtImport,
-    StmtImportFrom, StringLiteral, StringLiteralFlags, StringLiteralValue, WithItem,
+    ModModule, Operator, Parameter, ParameterWithDefault, Parameters, Pattern, Stmt, StmtAssign,
+    StmtImport, StmtImportFrom, StringLiteral, StringLiteralFlags, StringLiteralValue, WithItem,
 };
 use ruff_text_size::TextRange;
 
@@ -42,7 +42,7 @@ pub struct DesugarOutput {
 }
 
 /// Options that customise the desugar pass for a single module.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct DesugarOptions {
     /// Names of top-level functions to wrap in `@functools.cache`. Populated
     /// from the purity analyser when the user opts into `@memo` /
@@ -84,6 +84,12 @@ pub struct DesugarOptions {
     /// `pub_names` is intentionally a no-op so legacy `.ty` files
     /// that pre-date the `pub` keyword keep their current behaviour.
     pub pub_names: Vec<String>,
+    /// Value for the `extra` keyword argument in the auto-injected
+    /// `model_config = ConfigDict(extra=…)` statement for Pydantic
+    /// `model` classes.  Defaults to `"forbid"` (reject unexpected
+    /// fields).  Accepted values: `"forbid"`, `"ignore"`, `"allow"`.
+    /// Plumbed from `[emit] model-extra` in `typhon.toml`.
+    pub model_extra: String,
 }
 
 /// Desugar a Typhon module AST into a plain Python AST.
@@ -104,6 +110,20 @@ pub struct DesugarOptions {
 ///    `Result` anywhere, `from typhon_runtime import Ok, Err, Result` is
 ///    injected after any leading docstring and future-imports so the generated
 ///    Python can use those names.
+impl Default for DesugarOptions {
+    fn default() -> Self {
+        Self {
+            memoise_functions: Vec::new(),
+            raw_class_line_starts: Vec::new(),
+            frozen_class_line_starts: Vec::new(),
+            plain_class_line_starts: Vec::new(),
+            skip_decoration_bases: Vec::new(),
+            pub_names: Vec::new(),
+            model_extra: "forbid".into(),
+        }
+    }
+}
+
 pub fn desugar_module(module: &ModModule) -> DesugarOutput {
     desugar_module_with(module, DesugarOptions::default())
 }
@@ -1031,6 +1051,7 @@ fn desugar_mod_module_with(m: &ModModule, options: &DesugarOptions) -> ModModule
         plain_starts: &options.plain_class_line_starts,
         multi_base_parents: &multi_base_parents,
         skip_decoration_bases: &options.skip_decoration_bases,
+        model_extra: &options.model_extra,
     };
     let (new_body, transformed_classes) = desugar_stmts(&m.body, markers);
 
@@ -1274,6 +1295,11 @@ struct ClassMarkers<'a> {
     /// auto `@dataclass` decoration. Matched by last identifier segment
     /// against each base in the class header.
     skip_decoration_bases: &'a [String],
+    /// Value for the `extra` argument in the synthesised
+    /// `model_config = ConfigDict(extra=…)` statement for Pydantic `model`
+    /// classes. Sourced from `[emit] model-extra` in `typhon.toml` via
+    /// [`DesugarOptions::model_extra`].
+    model_extra: &'a str,
 }
 
 impl ClassMarkers<'_> {
@@ -1418,7 +1444,9 @@ fn desugar_stmt(stmt: &Stmt, markers: ClassMarkers<'_>) -> (Stmt, bool) {
                 } else {
                     0
                 };
-                new_class.body.insert(insert_at, make_model_config_stmt());
+                new_class
+                    .body
+                    .insert(insert_at, make_model_config_stmt(markers.model_extra));
             }
             // `class!` classes whose body lacks an explicit `__init__` AND
             // which have at least one positional base get a synthesised
@@ -2095,9 +2123,14 @@ fn has_model_config_stmt(body: &[Stmt]) -> bool {
     })
 }
 
-/// Build `model_config = ConfigDict(extra="forbid")`.
-fn make_model_config_stmt() -> Stmt {
-    let forbid_lit = make_string_literal_expr("forbid");
+/// Build `model_config = ConfigDict(extra="…")`.
+///
+/// The `extra` argument is the string literal value passed to
+/// `ConfigDict(extra=…)` — one of `"forbid"`, `"ignore"`, or `"allow"`.
+/// Any validated value from `[emit] model-extra` in `typhon.toml` is
+/// accepted; callers are responsible for passing a valid value.
+fn make_model_config_stmt(extra: &str) -> Stmt {
+    let forbid_lit = make_string_literal_expr(extra);
 
     let config_dict_call = Expr::Call(ExprCall {
         range: TextRange::default(),
@@ -2553,6 +2586,58 @@ fn make_string_literal_expr(text: &str) -> Expr {
 /// Name prefix the preprocessor gives every `impl` pseudo-class.
 const IMPL_PREFIX: &str = "__typhon_impl_";
 
+/// Walk `expr` collecting every bare `Name` operand of a flat `A | B | …`
+/// union expression. Returns `None` for any other shape so `type X = A`
+/// (single name, no union) and `type X = list[A]` (generic) don't get
+/// mistaken for sealed unions. Mirrors
+/// `tyc_types::extract_sealed_union_variants` so the desugar doesn't need
+/// a cross-crate dep. R2-3.
+fn collect_union_variant_names(expr: &Expr) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    let mut stack = vec![expr];
+    while let Some(current) = stack.pop() {
+        match current {
+            Expr::Name(n) => names.push(n.id.as_str().to_owned()),
+            // Push `right` first so the stack pops left-to-right: a
+            // `BinOp` reads `A | B | C` as
+            // `BinOp(BinOp(A, B), C)` — pushing left last makes the
+            // visitor descend leftmost first and preserves source
+            // order in `names`. Without this the variants end up in
+            // reverse order, contradicting the docstring on the
+            // caller (`collect_sealed_union_aliases`). PR #129
+            // gemini review.
+            Expr::BinOp(b) if matches!(b.op, Operator::BitOr) => {
+                stack.push(&b.right);
+                stack.push(&b.left);
+            }
+            _ => return None,
+        }
+    }
+    if names.len() >= 2 {
+        Some(names)
+    } else {
+        None
+    }
+}
+
+/// Collect every sealed-union type alias declared at module scope so
+/// `impl Union:` can distribute its methods across every variant.
+/// Keyed by the alias name; values are the ordered variant class names
+/// as they appear in `type Union = A | B | C`. R2-3.
+fn collect_sealed_union_aliases(body: &[Stmt]) -> HashMap<String, Vec<String>> {
+    let mut out = HashMap::new();
+    for stmt in body {
+        if let Stmt::TypeAlias(ta) = stmt {
+            if let Expr::Name(n) = ta.name.as_ref() {
+                if let Some(variants) = collect_union_variant_names(&ta.value) {
+                    out.insert(n.id.as_str().to_owned(), variants);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Merge Typhon `impl` pseudo-classes into their target classes.
 ///
 /// The preprocessor rewrites `impl ClassName:` to `class __typhon_impl_ClassName(object):`.
@@ -2566,6 +2651,12 @@ const IMPL_PREFIX: &str = "__typhon_impl_";
 /// was found.  Missing target classes are silently skipped (the type checker
 /// surfaces a better diagnostic for that case).
 fn merge_impl_blocks(body: Vec<Stmt>) -> (Vec<Stmt>, bool) {
+    // R2-3: collect sealed-union aliases first so an `impl Union:` block
+    // (where `Union` is `type Union = A | B | …`) distributes its methods
+    // across every variant class instead of failing to find a single
+    // target class.
+    let union_aliases = collect_sealed_union_aliases(&body);
+
     // Phase 1: identify impl pseudo-class indices and their target names.
     let impl_indices: Vec<(usize, String)> = body
         .iter()
@@ -2586,15 +2677,31 @@ fn merge_impl_blocks(body: Vec<Stmt>) -> (Vec<Stmt>, bool) {
 
     // Phase 2: collect methods (with `self` injected) into a map keyed by
     // target class name.  Multiple impl blocks for the same class accumulate.
+    //
+    // R2-3: if the impl target is a sealed-union alias, replicate the
+    // methods under each variant's class name. Each variant ends up with
+    // an identical copy of the method body; `match self:` patterns
+    // inside the body still dispatch correctly because the runtime
+    // class on `self` only matches its own arm. The duplication is a
+    // small constant factor in emitted code size for the convenience
+    // of writing "the method-on-the-union" once.
     let impl_index_set: HashSet<usize> = impl_indices.iter().map(|(i, _)| *i).collect();
     let mut impl_methods_map: HashMap<String, Vec<Stmt>> = HashMap::new();
     for (impl_idx, target_name) in &impl_indices {
         if let Stmt::ClassDef(c) = &body[*impl_idx] {
             let methods: Vec<Stmt> = c.body.iter().map(insert_self_param).collect();
-            impl_methods_map
-                .entry(target_name.clone())
-                .or_default()
-                .extend(methods);
+            // Determine the actual target class(es). A union alias expands
+            // to every variant; a concrete class is its own target.
+            let targets: Vec<String> = match union_aliases.get(target_name) {
+                Some(variants) => variants.clone(),
+                None => vec![target_name.clone()],
+            };
+            for target in targets {
+                impl_methods_map
+                    .entry(target)
+                    .or_default()
+                    .extend(methods.iter().cloned());
+            }
         }
     }
 
@@ -3516,6 +3623,61 @@ mod tests {
     // ── impl block desugaring ─────────────────────────────────────────────────
 
     #[test]
+    fn collect_sealed_union_aliases_preserves_source_order() {
+        // PR #129 gemini review: variants must come out left-to-right,
+        // matching the source `type T = A | B | C` ordering. The
+        // earlier stack-push order yielded `[C, B, A]`, which silently
+        // worked because downstream consumers used the set, not the
+        // order — but contradicted the docstring.
+        let src = "\
+class A:
+    pass
+class B:
+    pass
+class C:
+    pass
+type T = A | B | C
+";
+        // Parse via the desugar entry point so we get a real Stmt list.
+        let module = tyc_syntax::parse_module(src)
+            .expect("parse failed")
+            .into_syntax();
+        let aliases = collect_sealed_union_aliases(&module.body);
+        let order = aliases.get("T").expect("T alias should be collected");
+        assert_eq!(order, &["A".to_owned(), "B".to_owned(), "C".to_owned()]);
+    }
+
+    #[test]
+    fn impl_block_on_sealed_union_distributes_methods() {
+        // R2-3: `impl Event:` where `Event = A | B` must replicate the
+        // methods on each variant class so `event.kind()` resolves at
+        // every call site regardless of the runtime variant.
+        let src = "\
+class A:
+    x: int
+
+class B:
+    y: str
+
+type Event = A | B
+
+class __typhon_impl_Event(object):
+    def kind():
+        return 'a'
+";
+        let out = parse_and_desugar(src);
+        assert_eq!(
+            out.matches("def kind(self):").count(),
+            2,
+            "kind must be replicated on both A and B; output:\n{out}"
+        );
+        assert!(
+            !out.contains("__typhon_impl_"),
+            "impl stub must be removed even for union impls; output:\n{out}"
+        );
+    }
+
+    #[test]
     fn impl_block_methods_merged_into_target_class() {
         // Simulates what the preprocessor produces from `impl User:`.
         let src = "class User:\n    name: str\n\nclass __typhon_impl_User(object):\n    def greet():\n        return 'Hello'\n";
@@ -3760,6 +3922,87 @@ mod tests {
             // "ConfigDict" appears in the import and in the model_config assignment
             2,
             "ConfigDict must not be imported a second time\noutput:\n{out}"
+        );
+    }
+
+    // ── [emit] model-extra tests ──────────────────────────────────────────
+
+    fn parse_and_desugar_with_model_extra(src: &str, extra: &str) -> String {
+        let module = tyc_syntax::parse_module(src)
+            .expect("parse failed")
+            .into_syntax();
+        let out = desugar_module_with(
+            &module,
+            DesugarOptions {
+                model_extra: extra.into(),
+                ..Default::default()
+            },
+        );
+        emit(&out.module)
+    }
+
+    #[test]
+    fn model_extra_forbid_is_default() {
+        // model-extra defaults to "forbid"; the existing test already covers
+        // this via parse_and_desugar; verify via explicit option too.
+        let src = "class ApiUser(BaseModel):\n    id: int\n";
+        let out = parse_and_desugar_with_model_extra(src, "forbid");
+        assert!(
+            out.contains("model_config = ConfigDict(extra=\"forbid\")"),
+            "model-extra=\"forbid\" must emit extra=\"forbid\"\noutput:\n{out}"
+        );
+    }
+
+    #[test]
+    fn model_extra_allow_emits_allow() {
+        let src = "class ApiUser(BaseModel):\n    id: int\n";
+        let out = parse_and_desugar_with_model_extra(src, "allow");
+        assert!(
+            out.contains("model_config = ConfigDict(extra=\"allow\")"),
+            "model-extra=\"allow\" must emit extra=\"allow\"\noutput:\n{out}"
+        );
+        assert!(
+            !out.contains("extra=\"forbid\""),
+            "must not emit \"forbid\" when model-extra=\"allow\"\noutput:\n{out}"
+        );
+    }
+
+    #[test]
+    fn model_extra_ignore_emits_ignore() {
+        let src = "class ApiUser(BaseModel):\n    id: int\n";
+        let out = parse_and_desugar_with_model_extra(src, "ignore");
+        assert!(
+            out.contains("model_config = ConfigDict(extra=\"ignore\")"),
+            "model-extra=\"ignore\" must emit extra=\"ignore\"\noutput:\n{out}"
+        );
+    }
+
+    #[test]
+    fn model_extra_does_not_affect_non_model_classes() {
+        // Plain dataclass must not get a model_config stmt regardless of model-extra.
+        let src = "class Point:\n    x: float\n    y: float\n";
+        let out = parse_and_desugar_with_model_extra(src, "allow");
+        assert!(
+            !out.contains("model_config"),
+            "non-model class must not get model_config with model-extra=\"allow\"\noutput:\n{out}"
+        );
+    }
+
+    #[test]
+    fn model_extra_respects_existing_user_model_config() {
+        // If the user already wrote model_config, the desugar pass must NOT
+        // inject a second one — even if model-extra differs.
+        let src =
+            "class ApiUser(BaseModel):\n    model_config = ConfigDict(extra=\"allow\")\n    id: int\n";
+        let out = parse_and_desugar_with_model_extra(src, "ignore");
+        assert_eq!(
+            out.matches("model_config").count(),
+            1,
+            "existing model_config must not be duplicated\noutput:\n{out}"
+        );
+        assert!(
+            out.contains("extra=\"allow\""),
+            "user-defined model_config value must be preserved\noutput:\n{out}"
         );
     }
 

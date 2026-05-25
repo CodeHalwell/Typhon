@@ -67,7 +67,7 @@ Per construct:
 - Lowers `gather:` to `asyncio.TaskGroup` (or `asyncio.gather`).
 - Lowers `go f(x)` to `typhon_runtime.tasks.spawn(f(x))`.
 - Lowers `lazy import np = numpy` to the proxy class.
-- Lowers `lazy let X` to `lazy_val(lambda: ...)`.
+- Lowers `lazy let X` to `lazy_let(lambda: ...)`.
 - Inlines `comptime let` results as literals.
 - Rewrites `extend BUILTIN:` methods to free functions and call-site rewrites.
 

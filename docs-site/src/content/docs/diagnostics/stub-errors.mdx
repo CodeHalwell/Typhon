@@ -48,7 +48,20 @@ If the runtime method exists with a different signature, update the stub to matc
 
 ## Severity
 
-Default severity is the standard error level. A `[strictness] stub-check` knob is on the roadmap but not yet wired in — for now drift uses the default diagnostic severity.
+Severity is controlled by `[strictness] stub-check` in `typhon.toml`:
+
+| Value | Behaviour |
+|-------|-----------|
+| `"error"` (default) | Stub drift breaks `tyc check --stubs`; CI fails. |
+| `"warn"` | Drift is surfaced as a warning but does not break CI. |
+| `"off"` | Mismatches are silently dropped; stubs are still diffed but no diagnostic is emitted. |
+
+```toml
+[strictness]
+stub-check = "warn"   # surface drift without blocking merges
+```
+
+`"error"` is the default because drift left unnoticed tends to accumulate. Use `"warn"` while a migration is in progress; revert to `"error"` once stubs are stable.
 
 ## Where next
 

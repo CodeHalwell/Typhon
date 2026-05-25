@@ -1,0 +1,204 @@
+import asyncio
+
+import httpx
+
+from config import CrawlConfig
+from dedup import Deduper
+from extract import Document, extract
+from fetcher import (
+    Fetched,
+    FetchOutcome,
+    NotModified,
+    PermanentError,
+    RateLimited,
+    RobotsBlocked,
+    TransientError,
+    fetch,
+)
+from frontier import Frontier, FrontierItem
+from ids import Host, Url
+from ratelimit import RateLimiter
+from report import CrawlReport
+from robots import RobotsCache, host_of
+
+
+pub class CrawlerState:
+    config: CrawlConfig
+    client: httpx.AsyncClient
+    frontier: Frontier
+    limiter: RateLimiter
+    robots: RobotsCache
+    deduper: Deduper
+    report: CrawlReport
+    seed_host: Host
+    shutdown: asyncio.Event
+    processed: int
+    processed_lock: asyncio.Lock
+    in_flight: int
+    in_flight_lock: asyncio.Lock
+    idle_cv: asyncio.Condition
+
+
+async def _process_item(state: CrawlerState, item: FrontierItem) -> None:
+    let host: Host = host_of(item.url)
+
+    let rules = await state.robots.rules_for(state.client, host, state.config)
+    if not state.robots.is_allowed(rules, item.url):
+        await state.report.record_robots_blocked()
+        return
+
+    await state.limiter.acquire(host)
+    let outcome: FetchOutcome = await fetch(state.client, item.url, state.config)
+    await state.report.record(outcome)
+
+    match outcome:
+        case Fetched(url, _, body, ctype, _):
+            if "html" not in ctype.lower():
+                return
+            match extract(body, url):
+                case Ok(doc):
+                    await _ingest_document(state, doc, item.depth)
+                case Err(_):
+                    pass
+        case NotModified(_):
+            pass
+        case RobotsBlocked(_):
+            pass
+        case RateLimited(_, retry_after):
+            # Re-enqueue after the rate-limit delay. `submit` would no-op
+            # because the URL is already in `seen`; use `requeue` to bypass
+            # the dedup gate for this retry.
+            await asyncio.sleep(retry_after if retry_after < 5.0 else 5.0)
+            await state.frontier.requeue(item.url, item.depth, priority=item.priority + 1)
+        case TransientError(_, _, _):
+            pass
+        case PermanentError(_, _, _):
+            pass
+
+
+async def _ingest_document(state: CrawlerState, doc: Document, depth: int) -> None:
+    let unique: bool = await state.deduper.check_and_record(doc)
+    if unique:
+        await state.report.record_unique()
+    else:
+        await state.report.record_duplicate()
+        return
+
+    if not state.config.follow_external:
+        let target: str = str(state.seed_host)
+        for link in doc.links:
+            if str(host_of(link)) == target:
+                await state.frontier.submit(link, depth + 1, priority=5 + depth)
+        return
+
+    for link in doc.links:
+        await state.frontier.submit(link, depth + 1, priority=5 + depth)
+
+
+pub async def worker_loop(state: CrawlerState, worker_idx: int) -> None:
+    while not state.shutdown.is_set():
+        async with state.processed_lock:
+            if state.processed >= state.config.max_pages:
+                async with state.idle_cv:
+                    state.idle_cv.notify_all()
+                return
+        let item: FrontierItem? = await state.frontier.claim()
+        if item is None:
+            # Nothing to claim. If no peer worker is mid-process and the
+            # frontier is still empty, the crawl is genuinely done.
+            async with state.idle_cv:
+                while True:
+                    let remaining: int = await state.frontier.remaining()
+                    async with state.in_flight_lock:
+                        let busy: int = state.in_flight
+                    if remaining == 0 and busy == 0:
+                        state.idle_cv.notify_all()
+                        return
+                    if remaining > 0:
+                        break
+                    # Some peer is still working — wait for them to finish
+                    # and either feed the frontier or signal idle.
+                    try:
+                        await asyncio.wait_for(state.idle_cv.wait(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        pass
+            continue
+        async with state.processed_lock:
+            if state.processed >= state.config.max_pages:
+                async with state.idle_cv:
+                    state.idle_cv.notify_all()
+                return
+            state.processed = state.processed + 1
+        async with state.in_flight_lock:
+            state.in_flight = state.in_flight + 1
+        try:
+            await _process_item(state, item)
+        except Exception as e:
+            print(f"[worker-{worker_idx}] uncaught: {type(e).__name__}: {e}")
+        finally:
+            async with state.in_flight_lock:
+                state.in_flight = state.in_flight - 1
+            async with state.idle_cv:
+                state.idle_cv.notify_all()
+
+
+pub async def run_crawl(
+    seeds: list[Url],
+    config: CrawlConfig,
+) -> CrawlReport:
+    let client: httpx.AsyncClient = httpx.AsyncClient(timeout=config.fetch_timeout_seconds)
+    let frontier: Frontier = Frontier(queue=[], seen={}, counter=0, lock=asyncio.Lock())
+    let limiter: RateLimiter = RateLimiter(
+        buckets={},
+        capacity=config.per_host_burst,
+        refill_rate=config.requests_per_host_per_second,
+        lock=asyncio.Lock(),
+    )
+    let robots: RobotsCache = RobotsCache(rules={}, lock=asyncio.Lock())
+    let deduper: Deduper = Deduper(seen_hashes={}, lock=asyncio.Lock())
+    let report: CrawlReport = CrawlReport(
+        fetched_ok=0,
+        not_modified=0,
+        robots_blocked=0,
+        rate_limited=0,
+        transient_errors=0,
+        permanent_errors=0,
+        total_bytes=0,
+        documents_unique=0,
+        documents_duplicate=0,
+        samples=[],
+        lock=asyncio.Lock(),
+    )
+
+    let seed_host: Host = host_of(seeds[0]) if len(seeds) > 0 else Host("")
+    let state: CrawlerState = CrawlerState(
+        config=config,
+        client=client,
+        frontier=frontier,
+        limiter=limiter,
+        robots=robots,
+        deduper=deduper,
+        report=report,
+        seed_host=seed_host,
+        shutdown=asyncio.Event(),
+        processed=0,
+        processed_lock=asyncio.Lock(),
+        in_flight=0,
+        in_flight_lock=asyncio.Lock(),
+        idle_cv=asyncio.Condition(),
+    )
+
+    for seed in seeds:
+        await state.frontier.submit(seed, depth=0, priority=0)
+
+    mut tasks: list[asyncio.Task[None]] = []
+    for i in range(config.concurrent_workers):
+        go worker_loop(state, i) -> t
+        tasks.append(t)
+
+    try:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    finally:
+        await client.aclose()
+
+    return report

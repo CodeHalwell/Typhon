@@ -1,0 +1,28 @@
+import math
+
+
+pub class Vec2 frozen:
+    x: float
+    y: float
+
+
+pub def vec_add(a: Vec2, b: Vec2) -> Vec2:
+    return Vec2(x=a.x + b.x, y=a.y + b.y)
+
+
+pub def vec_sub(a: Vec2, b: Vec2) -> Vec2:
+    return Vec2(x=a.x - b.x, y=a.y - b.y)
+
+
+pub def vec_scale(v: Vec2, s: float) -> Vec2:
+    return Vec2(x=v.x * s, y=v.y * s)
+
+
+pub def vec_length(v: Vec2) -> float:
+    return math.sqrt(v.x * v.x + v.y * v.y)
+
+
+pub def vec_distance(a: Vec2, b: Vec2) -> float:
+    let dx: float = a.x - b.x
+    let dy: float = a.y - b.y
+    return math.sqrt(dx * dx + dy * dy)

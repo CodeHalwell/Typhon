@@ -1,0 +1,44 @@
+import random
+from datetime import datetime, timezone
+
+from ids import OrderId, Symbol, TraderId
+from money import Price, Qty
+from orders import Buy, GoodTillCancel, ImmediateOrCancel, Limit, Order, Sell, Side, TimeInForce
+
+
+pub class TapeEvent:
+    order: Order
+    tif: TimeInForce
+
+
+pub def generate_tape(
+    symbol: Symbol,
+    traders: list[TraderId],
+    n: int,
+    base_price: int,
+    seed: int = 42,
+) -> list[TapeEvent]:
+    let rng: random.Random = random.Random(seed)
+    mut out: list[TapeEvent] = []
+    mut next_id: int = 1
+    for _ in range(n):
+        let trader: TraderId = traders[rng.randrange(0, len(traders))]
+        let is_buy: bool = rng.random() < 0.5
+        let side: Side = Buy() if is_buy else Sell()
+        let drift: int = rng.randrange(-200, 201)
+        let price: Price = Price(base_price + drift)
+        let qty: Qty = Qty(rng.randrange(1, 50))
+        let aggressive: bool = rng.random() < 0.25
+        let tif: TimeInForce = ImmediateOrCancel() if aggressive else GoodTillCancel()
+        let order: Order = Order(
+            id=OrderId(next_id),
+            trader=trader,
+            symbol=symbol,
+            side=side,
+            kind=Limit(price=price),
+            qty=qty,
+            submitted_at=datetime.now(timezone.utc),
+        )
+        next_id = next_id + 1
+        out.append(TapeEvent(order=order, tif=tif))
+    return out

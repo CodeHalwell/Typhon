@@ -5,6 +5,8 @@ sidebar:
   order: 10
 ---
 
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
 `guard` binds a value and short-circuits the falsy / `None` case to the `else:` block. After the `guard`, the bound name is narrowed to its non-null form.
 
 ## Syntax
@@ -24,18 +26,23 @@ def shipping(weight: float?) -> float:
 
 ## How it desugars
 
-```python
-# Typhon
-guard w = weight else:
-    return 0.0
-return w * 1.25
-
-# Emitted Python
-if weight is None:
-    return 0.0
-w: float = weight
-return w * 1.25
-```
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    guard w = weight else:
+        return 0.0
+    return w * 1.25
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    if weight is None:
+        return 0.0
+    w: float = weight
+    return w * 1.25
+    ```
+  </TabItem>
+</Tabs>
 
 The narrowed binding (`w`) sticks for the rest of the enclosing scope.
 

@@ -5,7 +5,7 @@ sidebar:
   order: 7
 ---
 
-import { Aside } from '@astrojs/starlight/components';
+import { Aside, TabItem, Tabs } from '@astrojs/starlight/components';
 
 A sealed union is a *closed* set of variants — exactly the cases listed, no more. When you match on one, the checker forces you to handle every case. Adding a new variant lights up every match site that doesn't cover it. This is, in plain code-correctness terms, the single biggest static-safety win Typhon offers over typed Python.
 
@@ -194,29 +194,34 @@ When in doubt: if the set of variants is fixed and known at design time, reach f
 
 Each variant is emitted as a dataclass; the union itself emits as a Python `|` alias:
 
-```python
-# Typhon
-type Shape = Circle | Rectangle | Triangle
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    type Shape = Circle | Rectangle | Triangle
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    from dataclasses import dataclass
 
-# Emitted Python
-from dataclasses import dataclass
+    @dataclass(slots=True)
+    class Circle:
+        radius: float
 
-@dataclass(slots=True)
-class Circle:
-    radius: float
+    @dataclass(slots=True)
+    class Rectangle:
+        width: float
+        height: float
 
-@dataclass(slots=True)
-class Rectangle:
-    width: float
-    height: float
+    @dataclass(slots=True)
+    class Triangle:
+        base: float
+        height: float
 
-@dataclass(slots=True)
-class Triangle:
-    base: float
-    height: float
-
-Shape = Circle | Rectangle | Triangle
-```
+    Shape = Circle | Rectangle | Triangle
+    ```
+  </TabItem>
+</Tabs>
 
 `match` lowers to a Python 3.10+ `match` statement essentially unchanged — Typhon's check is at compile time; runtime semantics are vanilla Python `match`.
 
@@ -224,53 +229,140 @@ Shape = Circle | Rectangle | Triangle
 
 A small expression evaluator using sealed unions throughout — both for the AST and for evaluation errors:
 
-```python
-type Expr = Lit | Add | Sub | Mul | Div
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    type Expr = Lit | Add | Sub | Mul | Div
 
-class Lit:
-    value: float
-class Add:
-    lhs: Expr
-    rhs: Expr
-class Sub:
-    lhs: Expr
-    rhs: Expr
-class Mul:
-    lhs: Expr
-    rhs: Expr
-class Div:
-    lhs: Expr
-    rhs: Expr
+    class Lit:
+        value: float
+    class Add:
+        lhs: Expr
+        rhs: Expr
+    class Sub:
+        lhs: Expr
+        rhs: Expr
+    class Mul:
+        lhs: Expr
+        rhs: Expr
+    class Div:
+        lhs: Expr
+        rhs: Expr
 
-type EvalError = DivByZero | Overflow
+    type EvalError = DivByZero | Overflow
 
-class DivByZero: pass
-class Overflow:
-    value: float
+    class DivByZero: pass
+    class Overflow:
+        value: float
 
-def eval(e: Expr) -> Result[float, EvalError]:
-    match e:
-        case Lit(v):
-            return Ok(v)
-        case Add(l, r):
-            let a: float = eval(l)?
-            let b: float = eval(r)?
-            return Ok(a + b)
-        case Sub(l, r):
-            let a: float = eval(l)?
-            let b: float = eval(r)?
-            return Ok(a - b)
-        case Mul(l, r):
-            let a: float = eval(l)?
-            let b: float = eval(r)?
-            return Ok(a * b)
-        case Div(l, r):
-            let a: float = eval(l)?
-            let b: float = eval(r)?
-            if b == 0.0:
-                return Err(DivByZero())
-            return Ok(a / b)
-```
+    def eval(e: Expr) -> Result[float, EvalError]:
+        match e:
+            case Lit(v):
+                return Ok(v)
+            case Add(l, r):
+                let a1: float = eval(l)?
+                let b1: float = eval(r)?
+                return Ok(a1 + b1)
+            case Sub(l, r):
+                let a2: float = eval(l)?
+                let b2: float = eval(r)?
+                return Ok(a2 - b2)
+            case Mul(l, r):
+                let a3: float = eval(l)?
+                let b3: float = eval(r)?
+                return Ok(a3 * b3)
+            case Div(l, r):
+                let a4: float = eval(l)?
+                let b4: float = eval(r)?
+                if b4 == 0.0:
+                    return Err(DivByZero())
+                return Ok(a4 / b4)
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    from __future__ import annotations
+    from typhon_runtime import Ok, Err, Result
+    import dataclasses
+    from typhon_runtime import Err as __typhon_Err__
+
+    type Expr = Lit | Add | Sub | Mul | Div
+
+
+    @dataclasses.dataclass(slots=True)
+    class Lit:
+        value: float
+
+    @dataclasses.dataclass(slots=True)
+    class Add:
+        lhs: Expr
+        rhs: Expr
+
+    @dataclasses.dataclass(slots=True)
+    class Sub:
+        lhs: Expr
+        rhs: Expr
+
+    @dataclasses.dataclass(slots=True)
+    class Mul:
+        lhs: Expr
+        rhs: Expr
+
+    @dataclasses.dataclass(slots=True)
+    class Div:
+        lhs: Expr
+        rhs: Expr
+
+
+    type EvalError = DivByZero | Overflow
+
+
+    @dataclasses.dataclass(slots=True)
+    class DivByZero:
+        pass
+
+    @dataclasses.dataclass(slots=True)
+    class Overflow:
+        value: float
+
+
+    def eval(e: Expr) -> Result[float, EvalError]:
+        match e:
+            case Lit(v):
+                return Ok(v)
+            case Add(l, r):
+                __typhon_q_0__ = eval(l)
+                if isinstance(__typhon_q_0__, __typhon_Err__):
+                    return __typhon_q_0__
+                a1: float = __typhon_q_0__.value
+                __typhon_q_1__ = eval(r)
+                if isinstance(__typhon_q_1__, __typhon_Err__):
+                    return __typhon_q_1__
+                b1: float = __typhon_q_1__.value
+                return Ok(a1 + b1)
+            case Sub(l, r):
+                # ...mirror of Add: two `?` expansions, then `Ok(a2 - b2)`...
+                ...
+            case Mul(l, r):
+                # ...mirror of Add: two `?` expansions, then `Ok(a3 * b3)`...
+                ...
+            case Div(l, r):
+                __typhon_q_6__ = eval(l)
+                if isinstance(__typhon_q_6__, __typhon_Err__):
+                    return __typhon_q_6__
+                a4: float = __typhon_q_6__.value
+                __typhon_q_7__ = eval(r)
+                if isinstance(__typhon_q_7__, __typhon_Err__):
+                    return __typhon_q_7__
+                b4: float = __typhon_q_7__.value
+                if b4 == 0.0:
+                    return Err(DivByZero())
+                return Ok(a4 / b4)
+    ```
+  </TabItem>
+</Tabs>
+
+(The `Sub` and `Mul` arms are elided in the emitted view — each expands to the same `?` ladder shown for `Add` and `Div`. The bindings are renamed per arm (`a1/b1` … `a4/b4`) because Typhon is function-scoped: a second `let a` inside another `case` would shadow the outer `a`, which `tyc::no_block_shadow` rejects.)
 
 What this shows:
 

@@ -285,7 +285,7 @@ pub enum TycError {
     #[diagnostic(
         code(tyc::type_mismatch),
         url("https://typhon.dev/lang/diagnostics/type_mismatch"),
-        help("change the value, or update the annotation to `{actual}`")
+        help("change the value so it produces `{expected}`, or widen the annotation to `{expected} | {actual}` if both are intended")
     )]
     TypeMismatch {
         expected: String,
@@ -617,6 +617,37 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A project `.ty` module's filename matches a Python stdlib module name
+    /// (`types`, `ast`, `string`, `io`, `json`, …). When the build output
+    /// directory is on `sys.path` (as it is for the default `python
+    /// build/main.py` entry point), a transitive stdlib import will resolve
+    /// to the project module instead of the standard library and the user
+    /// will see a baffling `ImportError` or `AttributeError` blamed on an
+    /// innocent stdlib package. R2-4 in apps-feedback.
+    ///
+    /// Default severity is **warn** — the file still compiles; the user
+    /// just needs to know that running the emitted Python may break. Rename
+    /// the file (e.g. `lang_types.ty`, `lang_ast.ty`) to silence.
+    #[error("module name `{name}` shadows the Python stdlib module of the same name")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::stdlib_module_shadow),
+        url("https://typhon.dev/lang/diagnostics/stdlib_module_shadow"),
+        help(
+            "the emitted `build/{name}.py` will be on `sys.path` and \
+             intercept transitive `import {name}` from other stdlib modules, \
+             producing surprising `ImportError`s — rename the file to \
+             something stdlib-disjoint (e.g. `lang_{name}.ty`)"
+        )
+    )]
+    StdlibModuleShadow {
+        name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("module name shadows the stdlib")]
+        span: SourceSpan,
+    },
+
     /// A binding declared inside an `unsafe:` block flows into a
     /// concretely-typed `return` site without being re-asserted (cast
     /// or re-annotated). Rule 5 in the Typhon language spec: an unsafe
@@ -775,7 +806,13 @@ pub enum TycError {
     #[diagnostic(
         code(tyc::class_attr_shadows_slot),
         url("https://typhon.dev/lang/diagnostics/class_attr_shadows_slot"),
-        help("annotate each field as `ClassVar[T]` (from `typing`) so `@dataclass(slots=True)` excludes them from `__slots__`")
+        help(
+            "annotate each field as `ClassVar[T]` (from `typing`) so \
+             `@dataclass(slots=True)` excludes them from `__slots__`, OR \
+             — if this class is a nullary variant of a sealed union — drop \
+             the placeholder field entirely and use `class {class} frozen: \
+             pass` (R2-2)"
+        )
     )]
     ClassAttrShadowsSlot {
         class: String,
@@ -1655,6 +1692,21 @@ impl TycError {
     ) -> Self {
         Self::StubMismatch {
             message: message.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::StdlibModuleShadow`] warning. R2-4.
+    pub fn stdlib_module_shadow(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::StdlibModuleShadow {
+            name: name.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }

@@ -1,0 +1,97 @@
+freeze let STOPWORDS: tuple[str, ...] = (
+    "a", "an", "the", "and", "or", "of", "to", "in", "is", "it",
+    "for", "with", "on", "as", "at", "by", "from", "this", "that",
+    "be", "are", "was", "were",
+)
+
+
+pub def is_stopword(token: str) -> bool:
+    for sw in STOPWORDS:
+        if sw == token:
+            return True
+    return False
+
+
+def _is_alnum(ch: str) -> bool:
+    if len(ch) == 0:
+        return False
+    let code: int = ord(ch)
+    if code >= ord("a") and code <= ord("z"):
+        return True
+    if code >= ord("A") and code <= ord("Z"):
+        return True
+    if code >= ord("0") and code <= ord("9"):
+        return True
+    return False
+
+
+pub def normalize(token: str) -> str:
+    let lowered: str = token.lower()
+    let n: int = len(lowered)
+    mut start: int = 0
+    while start < n and not _is_alnum(lowered[start]):
+        start = start + 1
+    mut end: int = n
+    while end > start and not _is_alnum(lowered[end - 1]):
+        end = end - 1
+    if start >= end:
+        return ""
+    return lowered[start:end]
+
+
+pub def stem(token: str) -> str:
+    let n: int = len(token)
+    if n <= 3:
+        return token
+    if n > 4 and token.endswith("ing"):
+        return token[:n - 3]
+    if n > 3 and token.endswith("ed"):
+        return token[:n - 2]
+    if n > 3 and token.endswith("ly"):
+        return token[:n - 2]
+    if n > 3 and token.endswith("s") and not token.endswith("ss"):
+        return token[:n - 1]
+    return token
+
+
+def _is_delim(ch: str) -> bool:
+    if _is_alnum(ch):
+        return False
+    return True
+
+
+pub def tokenize(text: str) -> list[str]:
+    mut out: list[str] = []
+    let n: int = len(text)
+    mut i: int = 0
+    while i < n:
+        let ch: str = text[i]
+        if _is_delim(ch):
+            i = i + 1
+            continue
+        mut j: int = i
+        while j < n and not _is_delim(text[j]):
+            j = j + 1
+        let raw: str = text[i:j]
+        let norm: str = normalize(raw)
+        if len(norm) > 0:
+            out.append(norm)
+        i = j
+    return out
+
+
+pub def tokenize_for_index(text: str) -> list[str]:
+    let raw_tokens: list[str] = tokenize(text)
+    mut out: list[str] = []
+    for tok in raw_tokens:
+        if is_stopword(tok):
+            continue
+        let stemmed: str = stem(tok)
+        if len(stemmed) > 0:
+            out.append(stemmed)
+    return out
+
+
+pub def tokenize_for_query(text: str) -> list[str]:
+    # Same pipeline as indexing — queries must match how docs were stored.
+    return tokenize_for_index(text)

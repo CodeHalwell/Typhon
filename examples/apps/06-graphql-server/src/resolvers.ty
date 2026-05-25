@@ -1,0 +1,323 @@
+from auth import AuthContext
+from dataloader import DataLoader
+from ids import PostId, UserId
+from query import (
+    QueryNode,
+    node_args,
+    node_name,
+    node_selections,
+)
+from schema import (
+    Comment,
+    Post,
+    ResolvedField,
+    User,
+    make_field_comment_list,
+    make_field_null,
+    make_field_object,
+    make_field_post,
+    make_field_post_list,
+    make_field_scalar,
+    make_field_user,
+    make_field_user_list,
+)
+from store import Store
+
+
+pub class ResolverContext:
+    store: Store
+    auth: AuthContext
+    user_loader: DataLoader[int, User]
+    post_loader: DataLoader[int, Post]
+
+
+# ---------------------------------------------------------------------------
+# Per-field selection of scalar attributes on a domain object. Used when the
+# query asks for a specific subset like `{ id name }` of a User/Post/Comment.
+# ---------------------------------------------------------------------------
+
+def _user_scalar(u: User, field_name: str) -> ResolvedField?:
+    if field_name == "id":
+        return make_field_scalar(str(int(u.id)))
+    if field_name == "name":
+        return make_field_scalar(u.name)
+    if field_name == "email":
+        return make_field_scalar(u.email)
+    if field_name == "role":
+        return make_field_scalar(u.role)
+    return None
+
+
+def _post_scalar(p: Post, field_name: str) -> ResolvedField?:
+    if field_name == "id":
+        return make_field_scalar(str(int(p.id)))
+    if field_name == "title":
+        return make_field_scalar(p.title)
+    if field_name == "body":
+        return make_field_scalar(p.body)
+    if field_name == "author_id":
+        return make_field_scalar(str(int(p.author)))
+    return None
+
+
+def _comment_scalar(c: Comment, field_name: str) -> ResolvedField?:
+    if field_name == "id":
+        return make_field_scalar(str(int(c.id)))
+    if field_name == "body":
+        return make_field_scalar(c.body)
+    if field_name == "author_id":
+        return make_field_scalar(str(int(c.author)))
+    if field_name == "post_id":
+        return make_field_scalar(str(int(c.post)))
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Resolvers for nested selections on a single domain object.
+# ---------------------------------------------------------------------------
+
+pub def resolve_user_selections(
+    ctx: ResolverContext,
+    user: User,
+    selections: list[QueryNode],
+) -> Result[ResolvedField, str]:
+    if len(selections) == 0:
+        return Ok(make_field_user(user))
+    mut fields: dict[str, ResolvedField] = {}
+    for sel in selections:
+        let name: str = node_name(sel)
+        let sub_sels: list[QueryNode] = node_selections(sel)
+        let scalar: ResolvedField? = _user_scalar(user, name)
+        if scalar is not None:
+            fields[name] = scalar
+            continue
+        if name == "posts":
+            let posts: list[Post] = ctx.store.find_posts_by_author(user.id)
+            let resolved: ResolvedField = resolve_post_list_selections(ctx, posts, sub_sels)?
+            fields[name] = resolved
+            continue
+        return Err(f"unknown field '{name}' on User")
+    return Ok(make_field_object(fields))
+
+
+pub def resolve_post_selections(
+    ctx: ResolverContext,
+    post: Post,
+    selections: list[QueryNode],
+) -> Result[ResolvedField, str]:
+    if len(selections) == 0:
+        return Ok(make_field_post(post))
+    mut fields: dict[str, ResolvedField] = {}
+    for sel in selections:
+        let name: str = node_name(sel)
+        let sub_sels: list[QueryNode] = node_selections(sel)
+        let scalar: ResolvedField? = _post_scalar(post, name)
+        if scalar is not None:
+            fields[name] = scalar
+            continue
+        if name == "author":
+            let loaded: User? = ctx.user_loader.load(int(post.author))
+            if loaded is None:
+                fields[name] = make_field_null()
+                continue
+            let author: User = loaded
+            let resolved: ResolvedField = resolve_user_selections(ctx, author, sub_sels)?
+            fields[name] = resolved
+            continue
+        if name == "comments":
+            let comments: list[Comment] = ctx.store.find_comments_by_post(post.id)
+            let resolved2: ResolvedField = resolve_comment_list_selections(ctx, comments, sub_sels)?
+            fields[name] = resolved2
+            continue
+        return Err(f"unknown field '{name}' on Post")
+    return Ok(make_field_object(fields))
+
+
+pub def resolve_comment_selections(
+    ctx: ResolverContext,
+    comment: Comment,
+    selections: list[QueryNode],
+) -> Result[ResolvedField, str]:
+    if len(selections) == 0:
+        return Ok(make_field_object({"body": make_field_scalar(comment.body)}))
+    mut fields: dict[str, ResolvedField] = {}
+    for sel in selections:
+        let name: str = node_name(sel)
+        let sub_sels: list[QueryNode] = node_selections(sel)
+        let scalar: ResolvedField? = _comment_scalar(comment, name)
+        if scalar is not None:
+            fields[name] = scalar
+            continue
+        if name == "author":
+            let loaded: User? = ctx.user_loader.load(int(comment.author))
+            if loaded is None:
+                fields[name] = make_field_null()
+                continue
+            let author: User = loaded
+            let resolved: ResolvedField = resolve_user_selections(ctx, author, sub_sels)?
+            fields[name] = resolved
+            continue
+        if name == "post":
+            let lp: Post? = ctx.post_loader.load(int(comment.post))
+            if lp is None:
+                fields[name] = make_field_null()
+                continue
+            let post: Post = lp
+            let resolved2: ResolvedField = resolve_post_selections(ctx, post, sub_sels)?
+            fields[name] = resolved2
+            continue
+        return Err(f"unknown field '{name}' on Comment")
+    return Ok(make_field_object(fields))
+
+
+pub def resolve_post_list_selections(
+    ctx: ResolverContext,
+    posts: list[Post],
+    selections: list[QueryNode],
+) -> Result[ResolvedField, str]:
+    if len(selections) == 0:
+        return Ok(make_field_post_list(posts))
+    mut out: dict[str, ResolvedField] = {}
+    mut idx: int = 0
+    for p in posts:
+        let resolved: ResolvedField = resolve_post_selections(ctx, p, selections)?
+        out[f"[{idx}]"] = resolved
+        idx = idx + 1
+    return Ok(make_field_object(out))
+
+
+pub def resolve_comment_list_selections(
+    ctx: ResolverContext,
+    comments: list[Comment],
+    selections: list[QueryNode],
+) -> Result[ResolvedField, str]:
+    if len(selections) == 0:
+        return Ok(make_field_comment_list(comments))
+    mut out: dict[str, ResolvedField] = {}
+    mut idx: int = 0
+    for c in comments:
+        let resolved: ResolvedField = resolve_comment_selections(ctx, c, selections)?
+        out[f"[{idx}]"] = resolved
+        idx = idx + 1
+    return Ok(make_field_object(out))
+
+
+pub def resolve_user_list_selections(
+    ctx: ResolverContext,
+    users: list[User],
+    selections: list[QueryNode],
+) -> Result[ResolvedField, str]:
+    if len(selections) == 0:
+        return Ok(make_field_user_list(users))
+    mut out: dict[str, ResolvedField] = {}
+    mut idx: int = 0
+    for u in users:
+        let resolved: ResolvedField = resolve_user_selections(ctx, u, selections)?
+        out[f"[{idx}]"] = resolved
+        idx = idx + 1
+    return Ok(make_field_object(out))
+
+
+# ---------------------------------------------------------------------------
+# Top-level entry resolvers (`user(id:1)`, `users(role:admin)`, `post(id:101)`).
+# ---------------------------------------------------------------------------
+
+pub def resolve_user(
+    ctx: ResolverContext,
+    uid: UserId,
+    selections: list[QueryNode],
+) -> Result[ResolvedField, str]:
+    let loaded: User? = ctx.user_loader.load(int(uid))
+    if loaded is None:
+        return Err(f"user {int(uid)} not found")
+    let user: User = loaded
+    return resolve_user_selections(ctx, user, selections)
+
+
+pub def resolve_users(
+    ctx: ResolverContext,
+    role: str?,
+    selections: list[QueryNode],
+) -> Result[ResolvedField, str]:
+    let resolved_role: str? = role
+    let users: list[User] = (
+        ctx.store.find_users_by_role(resolved_role)
+        if resolved_role is not None
+        else ctx.store.all_users()
+    )
+    for u in users:
+        ctx.user_loader.prime(int(u.id), u)
+    return resolve_user_list_selections(ctx, users, selections)
+
+
+pub def resolve_post(
+    ctx: ResolverContext,
+    pid: PostId,
+    selections: list[QueryNode],
+) -> Result[ResolvedField, str]:
+    let loaded: Post? = ctx.post_loader.load(int(pid))
+    if loaded is None:
+        return Err(f"post {int(pid)} not found")
+    let post: Post = loaded
+    return resolve_post_selections(ctx, post, selections)
+
+
+pub def resolve_posts_by_author(
+    ctx: ResolverContext,
+    uid: UserId,
+    selections: list[QueryNode],
+) -> Result[ResolvedField, str]:
+    let posts: list[Post] = ctx.store.find_posts_by_author(uid)
+    for p in posts:
+        ctx.post_loader.prime(int(p.id), p)
+    return resolve_post_list_selections(ctx, posts, selections)
+
+
+pub def resolve_comments_for_post(
+    ctx: ResolverContext,
+    pid: PostId,
+    selections: list[QueryNode],
+) -> Result[ResolvedField, str]:
+    let comments: list[Comment] = ctx.store.find_comments_by_post(pid)
+    return resolve_comment_list_selections(ctx, comments, selections)
+
+
+# ---------------------------------------------------------------------------
+# Top-level dispatcher: looks at the root node name and routes accordingly.
+# ---------------------------------------------------------------------------
+
+def _parse_int_arg(args: dict[str, str], key: str) -> Result[int, str]:
+    let raw: str? = args.get(key)
+    if raw is None:
+        return Err(f"missing required arg '{key}'")
+    let raw_str: str = raw
+    try:
+        return Ok(int(raw_str))
+    except ValueError:
+        return Err(f"arg '{key}' is not an int: {raw_str}")
+
+
+pub def resolve_node(
+    ctx: ResolverContext,
+    node: QueryNode,
+) -> Result[ResolvedField, str]:
+    let name: str = node_name(node)
+    let args: dict[str, str] = node_args(node)
+    let sels: list[QueryNode] = node_selections(node)
+
+    if name == "user":
+        let uid_int: int = _parse_int_arg(args, "id")?
+        return resolve_user(ctx, UserId(uid_int), sels)
+    if name == "users":
+        let role_raw: str? = args.get("role")
+        return resolve_users(ctx, role_raw, sels)
+    if name == "post":
+        let pid_int: int = _parse_int_arg(args, "id")?
+        return resolve_post(ctx, PostId(pid_int), sels)
+    if name == "posts":
+        let author_int: int = _parse_int_arg(args, "author")?
+        return resolve_posts_by_author(ctx, UserId(author_int), sels)
+    if name == "comments":
+        let post_int: int = _parse_int_arg(args, "post")?
+        return resolve_comments_for_post(ctx, PostId(post_int), sels)
+    return Err(f"unknown root field '{name}'")

@@ -1,0 +1,6 @@
+pub newtype DatasetId = str
+pub newtype DatasetVersion = str
+pub newtype JobId = str
+pub newtype RunId = str
+pub newtype ModelName = str
+pub newtype ModelVersion = str

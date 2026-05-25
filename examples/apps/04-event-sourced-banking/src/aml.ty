@@ -1,0 +1,117 @@
+from typing import Callable
+
+from commands import (
+    AmlRejection,
+    Command,
+    Deposit,
+    Transfer,
+    Withdraw,
+)
+
+
+pub class AmlContext:
+    daily_outflow_by_account: dict[str, int]
+    sanctions_list: list[str]
+
+
+pub def empty_context() -> AmlContext:
+    return AmlContext(daily_outflow_by_account={}, sanctions_list=[])
+
+
+pub type AmlRule = Callable[[Command, AmlContext], Result[None, AmlRejection]]
+
+
+pub def large_amount_rule(threshold_cents: int) -> AmlRule:
+    def go(cmd: Command, ctx: AmlContext) -> Result[None, AmlRejection]:
+        match cmd:
+            case Deposit(_, amount, _, _):
+                if int(amount) >= threshold_cents:
+                    return Err(AmlRejection(
+                        rule="large_amount",
+                        detail=f"deposit of {int(amount)} >= {threshold_cents}",
+                    ))
+            case Withdraw(_, amount, _, _):
+                if int(amount) >= threshold_cents:
+                    return Err(AmlRejection(
+                        rule="large_amount",
+                        detail=f"withdrawal of {int(amount)} >= {threshold_cents}",
+                    ))
+            case Transfer(_, _, amount, _):
+                if int(amount) >= threshold_cents:
+                    return Err(AmlRejection(
+                        rule="large_amount",
+                        detail=f"transfer of {int(amount)} >= {threshold_cents}",
+                    ))
+            case _:
+                pass
+        return Ok(None)
+    return go
+
+
+pub def sanctions_rule() -> AmlRule:
+    def go(cmd: Command, ctx: AmlContext) -> Result[None, AmlRejection]:
+        match cmd:
+            case Deposit(_, _, source, _):
+                if source in ctx.sanctions_list:
+                    return Err(AmlRejection(
+                        rule="sanctions",
+                        detail=f"source `{source}` is sanctioned",
+                    ))
+            case Withdraw(_, _, dest, _):
+                if dest in ctx.sanctions_list:
+                    return Err(AmlRejection(
+                        rule="sanctions",
+                        detail=f"destination `{dest}` is sanctioned",
+                    ))
+            case _:
+                pass
+        return Ok(None)
+    return go
+
+
+def _outflow_key_and_amount(cmd: Command) -> tuple[str, int]?:
+    match cmd:
+        case Withdraw(aid, amt, _, _):
+            return (str(aid), int(amt))
+        case Transfer(from_acc, _, amt, _):
+            return (str(from_acc), int(amt))
+        case _:
+            return None
+
+
+pub def daily_outflow_rule(daily_cap_cents: int) -> AmlRule:
+    def go(cmd: Command, ctx: AmlContext) -> Result[None, AmlRejection]:
+        let pair: tuple[str, int]? = _outflow_key_and_amount(cmd)
+        if pair is None:
+            return Ok(None)
+        let key: str = pair[0]
+        let amount: int = pair[1]
+        let current_opt: int? = ctx.daily_outflow_by_account.get(key)
+        let current: int = current_opt if current_opt is not None else 0
+        if current + amount > daily_cap_cents:
+            return Err(AmlRejection(
+                rule="daily_outflow_cap",
+                detail=f"account {key} would exceed daily cap {daily_cap_cents}",
+            ))
+        return Ok(None)
+    return go
+
+
+pub def evaluate(
+    rules: list[AmlRule],
+    cmd: Command,
+    ctx: AmlContext,
+) -> Result[None, AmlRejection]:
+    for rule in rules:
+        match rule(cmd, ctx):
+            case Err(e):
+                return Err(e)
+            case Ok(_):
+                continue
+    return Ok(None)
+
+
+pub def record_outflow(ctx: AmlContext, account_key: str, amount: int) -> None:
+    let current_opt: int? = ctx.daily_outflow_by_account.get(account_key)
+    let current: int = current_opt if current_opt is not None else 0
+    ctx.daily_outflow_by_account[account_key] = current + amount

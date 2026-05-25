@@ -10,6 +10,7 @@ sidebar:
 class-default = "dataclass"
 format = true
 skip-decoration-bases = []
+model-extra = "forbid"
 ```
 
 | Key | Type | Default | Description |
@@ -17,6 +18,7 @@ skip-decoration-bases = []
 | `class-default` | `"dataclass"` \| `"pydantic"` | `"dataclass"` | Default emission target for `class` declarations. Overridable per-class via the `model` keyword. |
 | `format` | bool | `true` | Post-process emitted `.py` through `ruff format`. |
 | `skip-decoration-bases` | list of strings | `[]` | Extra base-class names that suppress the automatic `@dataclass(slots=True)` decorator. |
+| `model-extra` | `"forbid"` \| `"ignore"` \| `"allow"` | `"forbid"` | Value for `ConfigDict(extra=…)` injected into every `model` class. |
 
 ## `class-default`
 
@@ -44,12 +46,28 @@ The match is on the **last identifier segment**, so `"App"` catches both `class 
 
 Auto-skip drops only the decorator — it does *not* synthesise an `__init__`. Reach for `class! Foo(Base):` when you also want a synthesised constructor calling `super().__init__()`, or `plain class Foo:` for "no decorator, no synthesised init, body emits verbatim."
 
+## `model-extra`
+
+Controls the `extra` argument in the auto-injected `model_config = ConfigDict(extra=…)` for every `model` class.
+
+| Value | Runtime behaviour |
+|-------|-------------------|
+| `"forbid"` (default) | Unknown fields raise `ValidationError`. Recommended for public APIs. |
+| `"ignore"` | Unknown fields are silently dropped. |
+| `"allow"` | Unknown fields are accepted and surfaced as extra attributes on the model instance. |
+
+```toml
+[emit]
+model-extra = "allow"   # trust all incoming JSON
+```
+
+The value affects every `model` class in the project. To override for a single class, write `model_config = ConfigDict(extra="…")` directly in the class body — the desugarer skips injection when a `model_config` statement is already present.
+
 ## Always-on behaviour
 
-Two emit policies that were previously documented are no longer configurable:
+One emit policy that was previously documented is no longer configurable:
 
 - **PEP 561 `.pyi` stubs** are always emitted for every `.dty` file.
-- **Pydantic `model` classes** are always emitted with `extra="forbid"`. A `model-extra` knob is on the roadmap but not yet wired in.
 
 ## Where next
 

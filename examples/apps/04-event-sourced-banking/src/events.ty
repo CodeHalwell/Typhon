@@ -1,0 +1,138 @@
+from datetime import datetime
+
+from ids import AccountId, CustomerId, Currency, EventId, TransactionId
+from money import Money
+
+
+pub type Event = AccountOpened | MoneyDeposited | MoneyWithdrawn | TransferRecorded | AccountFrozen | AccountUnfrozen | AccountClosed | InterestAccrued
+
+
+pub class AccountOpened frozen:
+    account_id: AccountId
+    customer_id: CustomerId
+    currency: Currency
+    opened_at: datetime
+
+
+pub class MoneyDeposited frozen:
+    account_id: AccountId
+    amount: Money
+    source: str
+    transaction_id: TransactionId
+    at: datetime
+
+
+pub class MoneyWithdrawn frozen:
+    account_id: AccountId
+    amount: Money
+    destination: str
+    transaction_id: TransactionId
+    at: datetime
+
+
+pub class TransferRecorded frozen:
+    from_account: AccountId
+    to_account: AccountId
+    amount_from: Money
+    amount_to: Money
+    fx_rate: float
+    transaction_id: TransactionId
+    at: datetime
+
+
+pub class AccountFrozen frozen:
+    account_id: AccountId
+    reason: str
+    at: datetime
+
+
+pub class AccountUnfrozen frozen:
+    account_id: AccountId
+    at: datetime
+
+
+pub class AccountClosed frozen:
+    account_id: AccountId
+    at: datetime
+
+
+pub class InterestAccrued frozen:
+    account_id: AccountId
+    amount: Money
+    rate: float
+    at: datetime
+
+
+pub class EventEnvelope frozen:
+    seq: EventId
+    payload: Event
+
+
+pub def make_account_opened(account_id: AccountId, customer_id: CustomerId, currency: Currency, opened_at: datetime) -> Event:
+    return AccountOpened(account_id=account_id, customer_id=customer_id, currency=currency, opened_at=opened_at)
+
+
+pub def make_money_deposited(account_id: AccountId, amount: Money, source: str, transaction_id: TransactionId, at: datetime) -> Event:
+    return MoneyDeposited(account_id=account_id, amount=amount, source=source, transaction_id=transaction_id, at=at)
+
+
+pub def make_money_withdrawn(account_id: AccountId, amount: Money, destination: str, transaction_id: TransactionId, at: datetime) -> Event:
+    return MoneyWithdrawn(account_id=account_id, amount=amount, destination=destination, transaction_id=transaction_id, at=at)
+
+
+pub def make_transfer_recorded(from_account: AccountId, to_account: AccountId, amount_from: Money, amount_to: Money, fx_rate: float, transaction_id: TransactionId, at: datetime) -> Event:
+    return TransferRecorded(from_account=from_account, to_account=to_account, amount_from=amount_from, amount_to=amount_to, fx_rate=fx_rate, transaction_id=transaction_id, at=at)
+
+
+pub def make_account_frozen(account_id: AccountId, reason: str, at: datetime) -> Event:
+    return AccountFrozen(account_id=account_id, reason=reason, at=at)
+
+
+pub def make_account_unfrozen(account_id: AccountId, at: datetime) -> Event:
+    return AccountUnfrozen(account_id=account_id, at=at)
+
+
+pub def make_account_closed(account_id: AccountId, at: datetime) -> Event:
+    return AccountClosed(account_id=account_id, at=at)
+
+
+pub def make_interest_accrued(account_id: AccountId, amount: Money, rate: float, at: datetime) -> Event:
+    return InterestAccrued(account_id=account_id, amount=amount, rate=rate, at=at)
+
+
+pub def event_account_id(event: Event) -> AccountId?:
+    match event:
+        case AccountOpened(aid, _, _, _):       return aid
+        case MoneyDeposited(aid, _, _, _, _):   return aid
+        case MoneyWithdrawn(aid, _, _, _, _):   return aid
+        case TransferRecorded(aid, _, _, _, _, _, _): return aid
+        case AccountFrozen(aid, _, _):          return aid
+        case AccountUnfrozen(aid, _):           return aid
+        case AccountClosed(aid, _):             return aid
+        case InterestAccrued(aid, _, _, _):     return aid
+    raise RuntimeError("unreachable")
+
+
+pub def event_account_ids(event: Event) -> list[AccountId]:
+    match event:
+        case AccountOpened(aid, _, _, _):       return [aid]
+        case MoneyDeposited(aid, _, _, _, _):   return [aid]
+        case MoneyWithdrawn(aid, _, _, _, _):   return [aid]
+        case TransferRecorded(from_acc, to_acc, _, _, _, _, _): return [from_acc, to_acc]
+        case AccountFrozen(aid, _, _):          return [aid]
+        case AccountUnfrozen(aid, _):           return [aid]
+        case AccountClosed(aid, _):             return [aid]
+        case InterestAccrued(aid, _, _, _):     return [aid]
+    raise RuntimeError("unreachable")
+
+
+pub def event_kind(event: Event) -> str:
+    match event:
+        case AccountOpened(_, _, _, _):        return "AccountOpened"
+        case MoneyDeposited(_, _, _, _, _):    return "MoneyDeposited"
+        case MoneyWithdrawn(_, _, _, _, _):    return "MoneyWithdrawn"
+        case TransferRecorded(_, _, _, _, _, _, _): return "TransferRecorded"
+        case AccountFrozen(_, _, _):           return "AccountFrozen"
+        case AccountUnfrozen(_, _):            return "AccountUnfrozen"
+        case AccountClosed(_, _):              return "AccountClosed"
+        case InterestAccrued(_, _, _, _):      return "InterestAccrued"

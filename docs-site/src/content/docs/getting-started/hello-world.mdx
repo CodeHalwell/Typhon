@@ -129,16 +129,35 @@ For Hello, world the input and output are byte-identical (formatting aside). Tha
 
 Take a name from `argv` and greet it:
 
-```python
-import sys
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    import sys
 
-def main() -> None:
-    let name: str = sys.argv[1] if len(sys.argv) > 1 else "world"
-    print(f"Hello, {name}")
+    def main() -> None:
+        let name: str = sys.argv[1] if len(sys.argv) > 1 else "world"
+        print(f"Hello, {name}")
 
-if __name__ == "__main__":
-    main()
-```
+    if __name__ == "__main__":
+        main()
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    from __future__ import annotations
+    import sys
+
+
+    def main() -> None:
+        name: str = sys.argv[1] if len(sys.argv) > 1 else "world"
+        print(f"Hello, {name}")
+
+
+    if __name__ == "__main__":
+        main()
+    ```
+  </TabItem>
+</Tabs>
 
 New things:
 

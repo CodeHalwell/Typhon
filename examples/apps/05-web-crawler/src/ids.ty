@@ -1,0 +1,4 @@
+pub newtype Url = str
+pub newtype Host = str
+pub newtype DocumentId = str
+pub newtype ContentHash = str

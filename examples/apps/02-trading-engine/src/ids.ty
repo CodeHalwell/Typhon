@@ -1,0 +1,4 @@
+pub newtype Symbol = str
+pub newtype OrderId = int
+pub newtype TraderId = str
+pub newtype FillId = int

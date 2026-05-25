@@ -5,6 +5,8 @@ sidebar:
   order: 8
 ---
 
+import { Tabs, TabItem } from '@astrojs/starlight/components';
+
 The `?` suffix is sugar for "unwrap the `Ok` or short-circuit the `Err` to the enclosing function." It is the only way to propagate `Result` errors compactly.
 
 ## Syntax
@@ -78,16 +80,21 @@ def g() -> Result[int, AppError]:
 
 `?` does **not** lower to `try/except`. It's a plain inline check:
 
-```python
-# Typhon
-let n: int = parse(raw)?
-
-# Emitted Python
-_tmp_0 = parse(raw)
-if isinstance(_tmp_0, Err):
-    return _tmp_0
-n: int = _tmp_0.value
-```
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    let n: int = parse(raw)?
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    _tmp_0 = parse(raw)
+    if isinstance(_tmp_0, Err):
+        return _tmp_0
+    n: int = _tmp_0.value
+    ```
+  </TabItem>
+</Tabs>
 
 No hidden exception flow. Every short-circuit is visible in the emitted source. Stack traces remain meaningful.
 

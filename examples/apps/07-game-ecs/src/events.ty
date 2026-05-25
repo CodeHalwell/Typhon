@@ -1,0 +1,79 @@
+from ids import EntityId
+from vec2 import Vec2
+
+
+pub class EvSpawned:
+    entity: EntityId
+    at: Vec2
+
+
+pub class EvDespawned:
+    entity: EntityId
+    reason: str
+
+
+pub class EvCollision:
+    a: EntityId
+    b: EntityId
+    at: Vec2
+
+
+pub class EvDamageDealt:
+    target: EntityId
+    source: EntityId
+    amount: int
+
+
+pub class EvHealthChanged:
+    entity: EntityId
+    old: int
+    new: int
+
+
+pub class EvTickEnded:
+    tick: int
+    entities_alive: int
+
+
+pub type GameEvent = EvSpawned | EvDespawned | EvCollision | EvDamageDealt | EvHealthChanged | EvTickEnded
+
+
+pub def make_ev_spawned(entity: EntityId, at: Vec2) -> GameEvent:
+    return EvSpawned(entity=entity, at=at)
+
+
+pub def make_ev_despawned(entity: EntityId, reason: str) -> GameEvent:
+    return EvDespawned(entity=entity, reason=reason)
+
+
+pub def make_ev_collision(a: EntityId, b: EntityId, at: Vec2) -> GameEvent:
+    return EvCollision(a=a, b=b, at=at)
+
+
+pub def make_ev_damage_dealt(target: EntityId, source: EntityId, amount: int) -> GameEvent:
+    return EvDamageDealt(target=target, source=source, amount=amount)
+
+
+pub def make_ev_health_changed(entity: EntityId, old: int, new: int) -> GameEvent:
+    return EvHealthChanged(entity=entity, old=old, new=new)
+
+
+pub def make_ev_tick_ended(tick: int, entities_alive: int) -> GameEvent:
+    return EvTickEnded(tick=tick, entities_alive=entities_alive)
+
+
+pub def event_label(ev: GameEvent) -> str:
+    match ev:
+        case EvSpawned(eid, _):
+            return f"spawned#{int(eid)}"
+        case EvDespawned(eid, reason):
+            return f"despawned#{int(eid)}({reason})"
+        case EvCollision(a, b, _):
+            return f"collision({int(a)}<->{int(b)})"
+        case EvDamageDealt(target, source, amount):
+            return f"damage({int(source)}->{int(target)}={amount})"
+        case EvHealthChanged(eid, old, new):
+            return f"hp#{int(eid)}:{old}->{new}"
+        case EvTickEnded(tick, alive):
+            return f"tick{tick}({alive}alive)"
+    raise RuntimeError("unreachable")

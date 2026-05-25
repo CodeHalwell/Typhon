@@ -1,0 +1,87 @@
+from typing import Callable
+
+from datatypes import Batch, Dataset, Sample, SplitDataset
+from ids import DatasetId, DatasetVersion
+
+
+pub class PipelineError:
+    stage: str
+    message: str
+
+
+pub class Stage[I, O]:
+    name: str
+    fn: Callable[[Batch[I]], Result[Batch[O], PipelineError]]
+
+
+pub class DatasetStage[I, O]:
+    name: str
+    fn: Callable[[Dataset[I]], Result[Dataset[O], PipelineError]]
+
+
+pub def standardise() -> Stage[list[float], list[float]]:
+    def go(batch: Batch[list[float]]) -> Result[Batch[list[float]], PipelineError]:
+        if len(batch.samples) == 0:
+            return Err(PipelineError(stage="standardise", message="empty batch"))
+        let n_features: int = len(batch.samples[0].features)
+        mut sums: list[float] = [0.0] * n_features
+        mut sq_sums: list[float] = [0.0] * n_features
+        let count: int = len(batch.samples)
+        for sample in batch.samples:
+            for i in range(n_features):
+                sums[i] = sums[i] + sample.features[i]
+                sq_sums[i] = sq_sums[i] + sample.features[i] * sample.features[i]
+        let means: list[float] = [s / count for s in sums]
+        mut stds: list[float] = []
+        for i in range(n_features):
+            let var: float = (sq_sums[i] / count) - means[i] * means[i]
+            stds.append(var ** 0.5 if var > 0.0 else 1.0)
+        let normalised: list[Sample[list[float]]] = [
+            Sample(
+                features=[
+                    (s.features[i] - means[i]) / stds[i] for i in range(n_features)
+                ],
+                label=s.label,
+            )
+            for s in batch.samples
+        ]
+        return Ok(Batch(samples=normalised))
+
+    return Stage(name="standardise", fn=go)
+
+
+pub def train_test_split(
+    train_frac: float = 0.8,
+    new_id: DatasetId = DatasetId("split"),
+    version: DatasetVersion = DatasetVersion("v1"),
+) -> DatasetStage[list[float], list[float]]:
+    def go(ds: Dataset[list[float]]) -> Result[Dataset[list[float]], PipelineError]:
+        if ds.size() < 2:
+            return Err(PipelineError(stage="split", message="need at least 2 samples"))
+        let cutoff: int = int(float(ds.size()) * train_frac)
+        let train: Dataset[list[float]] = Dataset(
+            id=new_id,
+            version=version,
+            samples=ds.samples[:cutoff],
+        )
+        return Ok(train)
+
+    return DatasetStage(name="train_test_split", fn=go)
+
+
+pub def make_split(
+    train_frac: float = 0.8,
+) -> Callable[[Dataset[list[float]]], Result[SplitDataset[list[float]], PipelineError]]:
+    def go(ds: Dataset[list[float]]) -> Result[SplitDataset[list[float]], PipelineError]:
+        if ds.size() < 2:
+            return Err(PipelineError(stage="make_split", message="need at least 2 samples"))
+        let cutoff: int = int(float(ds.size()) * train_frac)
+        let train: Dataset[list[float]] = Dataset(
+            id=ds.id, version=ds.version, samples=ds.samples[:cutoff]
+        )
+        let test: Dataset[list[float]] = Dataset(
+            id=ds.id, version=ds.version, samples=ds.samples[cutoff:]
+        )
+        return Ok(SplitDataset(train=train, test=test))
+
+    return go

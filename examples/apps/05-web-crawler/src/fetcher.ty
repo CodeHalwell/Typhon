@@ -1,0 +1,112 @@
+import asyncio
+import random
+import time
+
+import httpx
+
+from config import CrawlConfig, RetryPolicy
+from ids import Url
+
+
+pub type FetchOutcome = Fetched | NotModified | RobotsBlocked | RateLimited | TransientError | PermanentError
+
+
+pub class Fetched:
+    url: Url
+    status: int
+    body: str
+    content_type: str
+    elapsed_ms: int
+
+
+pub class NotModified:
+    url: Url
+
+
+pub class RobotsBlocked:
+    url: Url
+
+
+pub class RateLimited:
+    url: Url
+    retry_after_seconds: float
+
+
+pub class TransientError:
+    url: Url
+    message: str
+    attempts: int
+
+
+pub class PermanentError:
+    url: Url
+    status: int
+    message: str
+
+
+def _backoff(policy: RetryPolicy, attempt: int) -> float:
+    let raw: float = policy.base_delay_seconds * float(2 ** (attempt - 1))
+    let bounded: float = raw if raw < policy.max_delay_seconds else policy.max_delay_seconds
+    let jitter: float = bounded * (random.random() - 0.5) * 0.4
+    let total: float = bounded + jitter
+    return total if total > 0.0 else 0.05
+
+
+pub async def fetch(
+    client: httpx.AsyncClient,
+    url: Url,
+    config: CrawlConfig,
+) -> FetchOutcome:
+    let policy: RetryPolicy = config.retry
+    mut attempt: int = 0
+    mut last_message: str = "no attempts made"
+    while attempt < policy.max_attempts:
+        attempt = attempt + 1
+        try:
+            let started: float = time.monotonic()
+            let resp: httpx.Response = await client.get(
+                str(url),
+                headers={"User-Agent": config.user_agent},
+                timeout=config.fetch_timeout_seconds,
+                follow_redirects=True,
+            )
+            let elapsed_ms: int = int((time.monotonic() - started) * 1000.0)
+            let code: int = int(resp.status_code)
+
+            if code == 200:
+                let ctype_opt: str? = resp.headers.get("content-type")
+                let ctype: str = ctype_opt if ctype_opt is not None else ""
+                return Fetched(
+                    url=url,
+                    status=code,
+                    body=resp.text,
+                    content_type=ctype,
+                    elapsed_ms=elapsed_ms,
+                )
+            if code == 304:
+                return NotModified(url=url)
+            if code == 429:
+                let header_opt: str? = resp.headers.get("retry-after")
+                let header_val: str = header_opt if header_opt is not None else "30"
+                let retry_after: float = float(header_val) if header_val.replace(".", "").isdigit() else 30.0
+                return RateLimited(url=url, retry_after_seconds=retry_after)
+            if code >= 500:
+                last_message = f"status {code}"
+                await asyncio.sleep(_backoff(policy, attempt))
+                continue
+            return PermanentError(
+                url=url,
+                status=code,
+                message=f"non-retryable {code}",
+            )
+        except httpx.TimeoutException as e:
+            last_message = f"timeout: {e}"
+            await asyncio.sleep(_backoff(policy, attempt))
+        except httpx.RequestError as e:
+            last_message = f"request error: {e}"
+            await asyncio.sleep(_backoff(policy, attempt))
+        except Exception as e:
+            last_message = f"unexpected {type(e).__name__}: {e}"
+            await asyncio.sleep(_backoff(policy, attempt))
+
+    return TransientError(url=url, message=last_message, attempts=attempt)

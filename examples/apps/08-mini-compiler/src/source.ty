@@ -1,0 +1,33 @@
+pub class Span frozen:
+    start: int
+    end: int
+    line: int
+    col: int
+
+
+pub class Source:
+    text: str
+
+
+pub def make_span(start: int, end: int, line: int, col: int) -> Span:
+    return Span(start=start, end=end, line=line, col=col)
+
+
+pub def line_col_at(text: str, offset: int) -> tuple[int, int]:
+    mut line: int = 1
+    mut col: int = 1
+    mut i: int = 0
+    let limit: int = offset if offset < len(text) else len(text)
+    while i < limit:
+        let ch: str = text[i]
+        if ch == "\n":
+            line = line + 1
+            col = 1
+        else:
+            col = col + 1
+        i = i + 1
+    return (line, col)
+
+
+pub def span_label(s: Span) -> str:
+    return f"line {s.line}, col {s.col} (offset {s.start}..{s.end})"

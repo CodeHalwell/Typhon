@@ -810,6 +810,9 @@ fn pub_decl_name(body: &str) -> Option<String> {
     if let Some(rest) = body.strip_prefix("class! ") {
         return ident_prefix(rest);
     }
+    if let Some(rest) = body.strip_prefix("freeze let ") {
+        return ident_prefix(rest);
+    }
     // Single-word keywords.
     let single_keyword_forms = [
         "def ",
@@ -2235,7 +2238,15 @@ pub fn validate_question_ops(source: &str) -> Vec<QuestionOpError> {
             }
 
             // Detect a function definition and push its return type onto the stack.
-            if trimmed.starts_with("def ") || trimmed.starts_with("async def ") {
+            //
+            // `pub` is a visibility modifier that stacks with `def` / `async def`;
+            // strip it so `pub def f() -> Result[..]: ... x?` is recognised as
+            // being inside a function (R2-1). `trim_start` absorbs any extra
+            // whitespace between the modifier and the keyword (`pub  def`)
+            // so the detector doesn't depend on exact single-space spelling
+            // (PR #129 gemini review).
+            let after_pub = trimmed.strip_prefix("pub ").unwrap_or(trimmed).trim_start();
+            if after_pub.starts_with("def ") || after_pub.starts_with("async def ") {
                 let ret_type = extract_return_type_text(code);
                 fn_stack.push((indent_len, ret_type));
             }
@@ -3409,15 +3420,6 @@ pub fn expand_question_ops(source: &str) -> String {
             continue;
         }
 
-        // The character before the `?` must be `)` for it to be the propagation
-        // operator.  `T?` (nullable sugar) follows an alphanumeric/`_`/`]` char
-        // and is left alone.
-        let before_q = &content[..content.len() - 1];
-        if !matches!(before_q.chars().last(), Some(')')) {
-            result.push_str(line);
-            continue;
-        }
-
         // Compute indentation to reproduce the correct nesting.
         let indent_len = content.find(|c: char| !c.is_whitespace()).unwrap_or(0);
         let indent = &content[..indent_len];
@@ -3434,6 +3436,59 @@ pub fn expand_question_ops(source: &str) -> String {
             }
             None => (None, expr_part.to_owned()),
         };
+
+        // The character before the `?` must be `)` for it to be unambiguously
+        // the propagation operator (`f()?`). `T?` (nullable type sugar)
+        // follows an alphanumeric / `_` / `]` char. Disambiguate the
+        // alphanumeric / `]` case by RHS context:
+        //
+        // - `let x: int = a?`     — `a?` is in value-position (after `=`),
+        //                           so the trailing `?` is propagation.
+        // - `let x: int? = a`     — `int?` is in the annotation (before `=`),
+        //                           so the trailing `?` would never reach here
+        //                           (it's not at end of line in that shape).
+        // - `let x: list[int]?`   — no `=`, ends with `]?`, treated as nullable.
+        // - `type X = T?`         — `T?` is type-position despite the `=`;
+        //                           the keyword introduces a type alias, not
+        //                           a value binding. Same for `newtype X = T?`.
+        // - `return f()?` / `Ok(f()?)` — handled by the inline-`?` pass
+        //                           (expand_inline_question_ops) running
+        //                           earlier in the pipeline; this pass only
+        //                           processes the end-of-line statement form.
+        //
+        // Keep `T?` annotations as a no-op when there is no assignment, or
+        // when the assignment is a type-alias declaration.
+        let before_q = &content[..content.len() - 1];
+        let last_ch = before_q.chars().last();
+        let trailing_is_close_paren = matches!(last_ch, Some(')'));
+        if !trailing_is_close_paren {
+            // We're at `<expr>?` where <expr> ends with an identifier, `]`,
+            // or `_`. Decide whether this is value-position propagation or
+            // type-position nullable sugar.
+            let first_word = |s: &str| s.split_whitespace().next().map(|w| w.to_owned());
+            let is_value_position = match &lhs {
+                // assignment: `a = X?` → X is value position, EXCEPT when the
+                // LHS starts with `type` or `newtype` — those introduce a
+                // type alias / nominal alias and the RHS is a type expression
+                // where `?` is nullable-type sugar (`type Maybe = int?` ⇒
+                // `type Maybe = int | None`).
+                Some(l) => {
+                    let first = first_word(l);
+                    first.as_deref() != Some("type") && first.as_deref() != Some("newtype")
+                }
+                // No assignment → either a type annotation (`let x: T?`) on
+                // its own line, or a bare statement form the inline-`?` pass
+                // should have handled. Leave the line untouched.
+                None => false,
+            };
+            if !is_value_position {
+                // No assignment AND no value-position keyword → leave alone
+                // (annotation form like `let x: list[int]?` or a bare type
+                // alias position).
+                result.push_str(line);
+                continue;
+            }
+        }
 
         // Generate a unique temporary variable name.
         let tmp = format!("__typhon_q_{counter}__");
@@ -6847,6 +6902,54 @@ mod tests {
         assert_eq!(out, src, "triple-string content must not be expanded");
     }
 
+    #[test]
+    fn question_op_preserves_value_position_bare_identifier() {
+        // `let x: T = a?` is value-position propagation: the trailing `?`
+        // applies to the value `a` and must lower to the standard
+        // `__typhon_q_N__` ladder. The old behaviour silently rewrote it
+        // to `x: T = a | None` via the nullable-type pass, which crashed
+        // at runtime with `TypeError`.
+        let src = "    let av: int = a?\n";
+        let out = expand_question_ops(src);
+        assert!(out.contains("__typhon_q_0__ = a"), "out: {out}");
+        assert!(
+            out.contains("if isinstance(__typhon_q_0__, __typhon_Err__):"),
+            "out: {out}"
+        );
+        assert!(
+            out.contains("let av: int = __typhon_q_0__.value"),
+            "out: {out}"
+        );
+    }
+
+    #[test]
+    fn question_op_preserves_type_alias_nullable() {
+        // `type X = T?` is a type alias; the trailing `?` is nullable
+        // type sugar, not the propagation operator. Must not be rewritten
+        // into a `__typhon_q_N__` ladder.
+        let src = "type Maybe = int?\n";
+        let out = expand_question_ops(src);
+        assert_eq!(out, src, "type alias must be copied verbatim");
+    }
+
+    #[test]
+    fn question_op_preserves_generic_type_alias_nullable() {
+        // `type X[T] = T?` is also a type alias even though the RHS is a
+        // bare identifier.
+        let src = "type Maybe[T] = T?\n";
+        let out = expand_question_ops(src);
+        assert_eq!(out, src, "generic type alias must be copied verbatim");
+    }
+
+    #[test]
+    fn question_op_preserves_newtype_nullable() {
+        // `newtype X = T?` is a nominal alias; the trailing `?` is
+        // nullable type sugar and the RHS is a type expression.
+        let src = "newtype MyOpt = int?\n";
+        let out = expand_question_ops(src);
+        assert_eq!(out, src, "newtype declaration must be copied verbatim");
+    }
+
     // ── inline `?` propagation in sub-expressions (O17) ─────────────────────
 
     #[test]
@@ -7141,12 +7244,71 @@ mod tests {
     }
 
     #[test]
+    fn question_op_in_pub_def_result_function_is_valid() {
+        // R2-1: `pub def f() -> Result[T, E]: ... x?` must not be flagged
+        // as "? operator used at module level". The `pub` modifier stacks
+        // with `def` and the validator must see through it.
+        let src =
+            "pub def parse(s: str) -> Result[int, str]:\n    val n = int(s)?\n    return Ok(n)\n";
+        let errs = validate_question_ops(src);
+        assert!(
+            errs.is_empty(),
+            "pub def with Result return must accept `?`: {:?}",
+            errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn question_op_in_pub_async_def_result_function_is_valid() {
+        // R2-1: same fix must apply to `pub async def`.
+        let src =
+            "pub async def fetch() -> Result[int, str]:\n    val n = io()?\n    return Ok(n)\n";
+        let errs = validate_question_ops(src);
+        assert!(
+            errs.is_empty(),
+            "pub async def with Result return must accept `?`: {:?}",
+            errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn question_op_in_pub_def_none_function_is_error() {
+        // R2-1: the `pub` strip must not also lose the return-type check.
+        let src = "pub def run() -> None:\n    val x = load()?\n";
+        let errs = validate_question_ops(src);
+        assert_eq!(
+            errs.len(),
+            1,
+            "pub def returning None must still reject `?`: {:?}",
+            errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn question_op_nullable_sugar_not_flagged() {
         // `str?` ends with `?` but the char before is `r`, not `)`, so it is
         // type-sugar, not the propagation operator.
         let src = "val x: str? = None\n";
         let errs = validate_question_ops(src);
         assert!(errs.is_empty(), "nullable sugar must not be flagged");
+    }
+
+    #[test]
+    fn question_op_pub_def_tolerates_double_space() {
+        // PR #129 gemini review: the `pub` strip uses
+        // `strip_prefix("pub ").unwrap_or(trimmed).trim_start()` so the
+        // detection is robust to `pub  def` (double space). Without
+        // `.trim_start()` the second space would be consumed as part of
+        // the keyword check (`"def "` vs `" def "`) and the function
+        // would not register on `fn_stack`.
+        let src =
+            "pub  def parse(s: str) -> Result[int, str]:\n    val n = int(s)?\n    return Ok(n)\n";
+        let errs = validate_question_ops(src);
+        assert!(
+            errs.is_empty(),
+            "pub def with extra whitespace must accept `?`: {:?}",
+            errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]

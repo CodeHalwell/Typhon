@@ -5,26 +5,32 @@ sidebar:
   order: 6
 ---
 
-import { Aside } from '@astrojs/starlight/components';
+import { Aside, TabItem, Tabs } from '@astrojs/starlight/components';
 
 `model Foo:` emits a Pydantic `BaseModel(extra="forbid")`. Use it for data crossing a trust boundary — HTTP requests, JSON files, env-derived structures, message-queue payloads — where you want runtime validation in addition to compile-time types.
 
 ## A worked example
 
-```python
-model UserInput:
-    email: str
-    name: str = "anon"
-    age: int? = None
+<Tabs>
+  <TabItem label="Typhon">
+    ```python
+    model UserInput:
+        email: str
+        name: str = "anon"
+        age: int? = None
+    ```
+  </TabItem>
+  <TabItem label="Emitted Python">
+    ```python
+    class UserInput(BaseModel):
+        model_config = ConfigDict(extra="forbid")
 
-# Emitted Python
-class UserInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    email: str
-    name: str = "anon"
-    age: int | None = None
-```
+        email: str
+        name: str = "anon"
+        age: int | None = None
+    ```
+  </TabItem>
+</Tabs>
 
 ## What you get
 
@@ -83,25 +89,31 @@ async def create_user(input: CreateUser) -> UserResponse:
 
 Pydantic's stock setting is `extra="ignore"`, which **silently drops unexpected fields**. Typhon's safety pitch forbids quiet failures: if a client sends `{"email": "a@b", "extra": "boom"}`, you want a 422 response, not a silent drop.
 
-If you genuinely need permissive mode, the configurable `[emit] model-extra` knob is roadmapped. For now, override per-class by hand if you need:
-
-```python
-model OldApi:
-    # ...
-
-# Override the Pydantic config by adding model_config explicitly (rare):
-# (not supported via Typhon syntax today; edit the emitted .py or wait for the config knob)
-```
+If you genuinely need permissive mode, the configurable `[emit] model-extra` knob is roadmapped. There is no Typhon syntax for overriding the per-class `model_config` today — edit the emitted `.py` by hand, write the model as a plain Pydantic class in a `.py` file alongside your `.ty` sources (the build pipeline copies plain `.py` through untouched), or wait for the config knob to land.
 
 ## Frozen models
 
+The `frozen` modifier currently only applies to `class` (see [Classes &
+Models](/Typhon/tour/classes/)) — `model Foo frozen:` is not parsed
+today. To make a Pydantic model immutable at runtime, drop into a
+plain `.py` file alongside your `.ty` sources (the build pipeline
+copies plain `.py` through):
+
 ```python
-model Coordinate frozen:
+# src/models_immutable.py
+from pydantic import BaseModel, ConfigDict
+
+
+class Coordinate(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
     x: float
     y: float
 ```
 
-Emits `model_config = ConfigDict(extra="forbid", frozen=True)`. Pydantic's `frozen=True` blocks field reassignment (faux immutability — nested mutables can still be mutated).
+Pydantic's `frozen=True` blocks field reassignment (faux immutability —
+nested mutables can still be mutated). A `model` modifier for `frozen`
+is on the roadmap.
 
 ## Where next
 
