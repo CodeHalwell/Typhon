@@ -7591,6 +7591,93 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     }
                 }
             }
+            // Newtype arithmetic carve-out. R2-12: `newtype LogIndex = int`
+            // is structurally identical to `int` at runtime but the
+            // checker treats it as `Class("LogIndex")`. Without this
+            // section, `last_idx + 1` and `commit_idx + offset` both
+            // infer to `Type::Unknown` (the `(Class, _)` arm of the
+            // conservative numeric match below falls through) — which
+            // silently slips past `is_assignable` for any annotation,
+            // erasing the nominal distinction across the entire
+            // arithmetic surface of the function. Raft commit-index
+            // math, ELO updates, watermark advances, byte offsets, and
+            // log indices all live on this path.
+            //
+            // The rule preserves the newtype across `+ - * // % **`
+            // when the other operand is the same newtype or a literal
+            // of the newtype's base; `/` is always Python true division
+            // and widens to `float` so it's exempt; two distinct
+            // newtypes with the same numeric base fire
+            // `operator_type_mismatch` so accidental cross-axis math
+            // (e.g. `LogIndex + Term`) is visible at the use site.
+            if matches!(
+                b.op,
+                Operator::Add
+                    | Operator::Sub
+                    | Operator::Mult
+                    | Operator::Div
+                    | Operator::FloorDiv
+                    | Operator::Mod
+                    | Operator::Pow
+            ) {
+                let l_nt = newtype_with_base(c, &l_stripped);
+                let r_nt = newtype_with_base(c, &r_stripped);
+                match (&l_nt, &r_nt) {
+                    // Same newtype on both sides.
+                    (Some((ln, lb)), Some((rn, _))) if ln == rn && is_numeric(lb) => {
+                        if matches!(b.op, Operator::Div) {
+                            return Type::Float;
+                        }
+                        return Type::Class(ln.clone());
+                    }
+                    // Different newtypes, both numeric-based — explicit reject.
+                    (Some((_, lb)), Some((_, rb))) if is_numeric(lb) && is_numeric(rb) => {
+                        if let Some(op_str) = arithmetic_op_str(b.op) {
+                            let span =
+                                (b.range.start().to_usize(), b.range.end().to_usize());
+                            c.operator_type_mismatch(
+                                op_str,
+                                &l_stripped,
+                                &r_stripped,
+                                span,
+                            );
+                        }
+                        return Type::Unknown;
+                    }
+                    // Newtype LHS + bare numeric RHS that matches the base.
+                    (Some((ln, lb)), None)
+                        if is_numeric(lb) && base_accepts_operand(lb, &r_stripped) =>
+                    {
+                        if matches!(b.op, Operator::Div) {
+                            return Type::Float;
+                        }
+                        // int-based newtype + float RHS widens to float
+                        // (Python's `1 + 1.0` → float). The nominal
+                        // newtype tag is lost when the base type widens.
+                        if matches!(lb, Type::Int | Type::Bool)
+                            && matches!(&r_stripped, Type::Float)
+                        {
+                            return Type::Float;
+                        }
+                        return Type::Class(ln.clone());
+                    }
+                    // Symmetric: bare numeric LHS + newtype RHS.
+                    (None, Some((rn, rb)))
+                        if is_numeric(rb) && base_accepts_operand(rb, &l_stripped) =>
+                    {
+                        if matches!(b.op, Operator::Div) {
+                            return Type::Float;
+                        }
+                        if matches!(rb, Type::Int | Type::Bool)
+                            && matches!(&l_stripped, Type::Float)
+                        {
+                            return Type::Float;
+                        }
+                        return Type::Class(rn.clone());
+                    }
+                    _ => {}
+                }
+            }
             // Conservative numeric arithmetic inference.
             match (&l_stripped, &r_stripped) {
                 _ if matches!(b.op, Operator::Div)
@@ -8767,6 +8854,37 @@ fn operand_is_unflaggable(t: &Type) -> bool {
 
 fn is_numeric(t: &Type) -> bool {
     matches!(t, Type::Int | Type::Float | Type::Bool)
+}
+
+/// If `t` is a `Type::Class("X")` and `X` is a declared `newtype`,
+/// return `(X, underlying_base)` where `underlying_base` is the result
+/// of unwrapping the newtype chain (`newtype A = B; newtype B = int`
+/// resolves to `int`). Returns `None` for non-newtype classes and
+/// non-class types. Used by the arithmetic carve-out so
+/// `LogIndex + LogIndex` and `LogIndex + 1` preserve the nominal
+/// newtype across operations.
+fn newtype_with_base(c: &Checker, t: &Type) -> Option<(String, Type)> {
+    if let Type::Class(name) = t {
+        if c.newtypes.contains_key(name.as_str()) {
+            let base = c.unwrap_newtype_base(name.as_str())?;
+            return Some((name.clone(), base));
+        }
+    }
+    None
+}
+
+/// True when the newtype's underlying numeric `base` accepts `other`
+/// as a same-axis arithmetic operand (i.e. a bare literal of the base
+/// type, or a subtype of it). int-based newtypes accept `int`, `bool`,
+/// and `float`; float-based newtypes accept `int`, `bool`, and `float`.
+/// Mixed-axis cases (int-based + float) are handled by the caller so
+/// the result type can widen out of the newtype where appropriate.
+fn base_accepts_operand(base: &Type, other: &Type) -> bool {
+    match (base, other) {
+        (Type::Int | Type::Bool, Type::Int | Type::Bool | Type::Float) => true,
+        (Type::Float, Type::Int | Type::Bool | Type::Float) => true,
+        _ => false,
+    }
 }
 
 /// Conservative compatibility check for the arithmetic / concat
@@ -12380,6 +12498,133 @@ let s: str = id(3)
         assert!(
             !d.has_errors(),
             "binop with a foreign class operand must not over-promote to float; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn newtype_arith_same_newtype_preserved() {
+        // R2-12: `LogIndex + LogIndex` must stay `LogIndex` so the
+        // result can flow into a `LogIndex`-typed slot without an
+        // explicit `int(...)`/`LogIndex(...)` round-trip.
+        let d = check(
+            "newtype LogIndex = int\n\
+             def main() -> None:\n\
+             \x20   let a: LogIndex = LogIndex(1)\n\
+             \x20   let b: LogIndex = LogIndex(2)\n\
+             \x20   let sum: LogIndex = a + b\n\
+             \x20   let diff: LogIndex = a - b\n\
+             \x20   let prod: LogIndex = a * b\n",
+        );
+        assert!(
+            !d.has_errors(),
+            "same-newtype arithmetic must preserve the newtype; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn newtype_arith_literal_rhs_preserved() {
+        // R2-12: `LogIndex + 1` must stay `LogIndex` — one-sided
+        // arithmetic with a literal of the newtype's base type is
+        // the canonical "advance by one" shape (commit index, log
+        // index, watermark, byte offset).
+        let d = check(
+            "newtype LogIndex = int\n\
+             def main() -> None:\n\
+             \x20   let a: LogIndex = LogIndex(1)\n\
+             \x20   let next: LogIndex = a + 1\n\
+             \x20   let prev: LogIndex = a - 1\n\
+             \x20   let scaled: LogIndex = 2 * a\n",
+        );
+        assert!(
+            !d.has_errors(),
+            "newtype + literal must preserve the newtype; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn newtype_arith_cross_newtype_rejected() {
+        // R2-12: `LogIndex + Term` must fire `operator_type_mismatch`
+        // — the whole point of the nominal alias is that LogIndex and
+        // Term are not silently interchangeable just because they share
+        // an int base.
+        let d = check(
+            "newtype LogIndex = int\n\
+             newtype Term = int\n\
+             def main() -> None:\n\
+             \x20   let a: LogIndex = LogIndex(1)\n\
+             \x20   let t: Term = Term(2)\n\
+             \x20   let bad: LogIndex = a + t\n",
+        );
+        assert!(
+            d.has_errors(),
+            "cross-newtype arithmetic must be rejected",
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::OperatorTypeMismatch { .. })),
+            "expected OperatorTypeMismatch; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn newtype_arith_division_widens_to_float() {
+        // R2-12: Python's `/` is always true division, so even
+        // `LogIndex / LogIndex` yields `float` — the newtype tag is
+        // intentionally lost on `/` so the user sees the type widen at
+        // the call site. Floor-division `//` keeps the newtype.
+        let d = check(
+            "newtype LogIndex = int\n\
+             def main() -> None:\n\
+             \x20   let a: LogIndex = LogIndex(10)\n\
+             \x20   let b: LogIndex = LogIndex(3)\n\
+             \x20   let quot: float = a / b\n\
+             \x20   let floor: LogIndex = a // b\n",
+        );
+        assert!(
+            !d.has_errors(),
+            "division on newtype operands must widen to float; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn newtype_arith_float_newtype_with_int_literal() {
+        // R2-12: float-based newtypes accept int/bool literals on the
+        // same axis — `Money + 0` stays `Money` (Python's `1.0 + 1 → 1.0`).
+        let d = check(
+            "newtype Money = float\n\
+             def main() -> None:\n\
+             \x20   let a: Money = Money(1.5)\n\
+             \x20   let plus_zero: Money = a + 0\n\
+             \x20   let scaled: Money = a * 2\n",
+        );
+        assert!(
+            !d.has_errors(),
+            "float-newtype + int literal must preserve the newtype; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn newtype_arith_chain_preserves_newtype() {
+        // R2-12: `newtype A = B; newtype B = int` must still resolve
+        // through `unwrap_newtype_base` so chained newtypes behave the
+        // same way as direct ones.
+        let d = check(
+            "newtype Inner = int\n\
+             newtype Outer = Inner\n\
+             def main() -> None:\n\
+             \x20   let a: Outer = Outer(Inner(1))\n\
+             \x20   let b: Outer = a + 1\n",
+        );
+        assert!(
+            !d.has_errors(),
+            "newtype chain arithmetic must preserve the outermost newtype; got {:?}",
             d.errors()
         );
     }

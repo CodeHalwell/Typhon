@@ -4,7 +4,30 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
-## 0.6.1 — 2026-05-25
+## Unreleased
+
+Carry-over sweep from the Round-3 apps-feedback campaign. Targets the
+remaining ergonomics gaps that survived v0.6.0 / v0.6.1.
+
+### Fixed — compiler
+
+- **`tyc-types`: same-newtype arithmetic preserves the newtype, and
+  one-sided literal arithmetic likewise (R2-12).** `newtype LogIndex
+  = int` previously inferred `last_idx + 1` and `LogIndex + LogIndex`
+  to `Type::Unknown` because the conservative numeric arm of `BinOp`
+  inference only matched `(Int, Int)` / `(Float, Float)` — every
+  newtype operand fell through and the result silently widened away
+  the nominal tag. Raft commit-index advance, ELO updates, watermark
+  math, byte offsets, and log indices all paid the same 5–10% LoC tax
+  in `int(...) → Wrap(...)` round-trips just to get the types back.
+  The new carve-out preserves `LogIndex` across `+ - * // % **` for
+  `LogIndex + LogIndex` and `LogIndex + <literal of base>`; `/` keeps
+  the existing widening to `float` because Python's `/` is always true
+  division. Two **distinct** newtypes with the same numeric base
+  (`LogIndex + Term`) fire the existing `tyc::operator_type_mismatch`
+  diagnostic — the whole point of `newtype` is that cross-axis math
+  must be opted in to. Six new `newtype_arith_*` regression tests
+  guard the rule.
 
 Polish release on top of v0.6.0. Tightens the VS Code TextMate grammar
 around `let`-binding annotations and reorganises the build output
