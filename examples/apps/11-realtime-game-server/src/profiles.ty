@@ -1,0 +1,300 @@
+import sqlite3
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterator
+
+from config import RATING_DEFAULT
+from ids import PlayerId, Rating
+
+
+pub class PlayerProfile:
+    id: PlayerId
+    name: str
+    rating: Rating
+    wins: int
+    losses: int
+    draws: int
+    matches_played: int
+    last_seen: datetime
+
+
+pub class LeaderboardEntry:
+    id: PlayerId
+    name: str
+    rating: Rating
+    wins: int
+    losses: int
+
+
+pub class StoreError:
+    op: str
+    reason: str
+
+
+pub type ProfileError = NotFound | Backend
+
+
+pub class NotFound:
+    player: PlayerId
+
+
+pub class Backend:
+    inner: StoreError
+
+
+pub def make_not_found(player: PlayerId) -> ProfileError:
+    return NotFound(player=player)
+
+
+pub def make_backend_err(inner: StoreError) -> ProfileError:
+    return Backend(inner=inner)
+
+
+pub class ProfileStore:
+    db_path: Path
+
+
+impl ProfileStore:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        let conn: sqlite3.Connection = sqlite3.connect(str(self.db_path))
+        conn.execute("PRAGMA foreign_keys = ON")
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+    def init_schema(self) -> Result[None, StoreError]:
+        try:
+            with self._connect() as conn:
+                conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS players (
+                        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name        TEXT NOT NULL UNIQUE,
+                        rating      INTEGER NOT NULL,
+                        wins        INTEGER NOT NULL DEFAULT 0,
+                        losses      INTEGER NOT NULL DEFAULT 0,
+                        draws       INTEGER NOT NULL DEFAULT 0,
+                        matches     INTEGER NOT NULL DEFAULT 0,
+                        last_seen   TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_players_rating ON players(rating DESC);
+
+                    CREATE TABLE IF NOT EXISTS matches (
+                        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                        mode        TEXT NOT NULL,
+                        room_id     INTEGER NOT NULL,
+                        winner_id   INTEGER,
+                        duration    INTEGER NOT NULL,
+                        ended_at    TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_matches_ended ON matches(ended_at DESC);
+
+                    CREATE TABLE IF NOT EXISTS match_players (
+                        match_id    INTEGER NOT NULL,
+                        player_id   INTEGER NOT NULL,
+                        placement   INTEGER NOT NULL,
+                        before      INTEGER NOT NULL,
+                        after       INTEGER NOT NULL,
+                        PRIMARY KEY (match_id, player_id)
+                    );
+                """)
+            return Ok(None)
+        except sqlite3.Error as e:
+            return Err(StoreError(op="init", reason=str(e)))
+
+    def upsert(self, name: str) -> Result[PlayerProfile, StoreError]:
+        let now: datetime = datetime.now(timezone.utc)
+        try:
+            with self._connect() as conn:
+                let existing = conn.execute(
+                    "SELECT id, name, rating, wins, losses, draws, matches, last_seen"
+                    " FROM players WHERE name = ?",
+                    (name,),
+                ).fetchone()
+                if existing is not None:
+                    conn.execute(
+                        "UPDATE players SET last_seen = ? WHERE id = ?",
+                        (now.isoformat(), int(existing[0])),
+                    )
+                    return Ok(_row_to_profile(existing, override_last_seen=now))
+                let cur = conn.execute(
+                    "INSERT INTO players (name, rating, wins, losses, draws, matches, last_seen)"
+                    " VALUES (?, ?, 0, 0, 0, 0, ?)",
+                    (name, RATING_DEFAULT, now.isoformat()),
+                )
+                let new_id: int = int(cur.lastrowid or 0)
+            return Ok(PlayerProfile(
+                id=PlayerId(new_id),
+                name=name,
+                rating=Rating(RATING_DEFAULT),
+                wins=0,
+                losses=0,
+                draws=0,
+                matches_played=0,
+                last_seen=now,
+            ))
+        except sqlite3.Error as e:
+            return Err(StoreError(op="upsert", reason=str(e)))
+
+    def fetch(self, pid: PlayerId) -> Result[PlayerProfile, ProfileError]:
+        try:
+            with self._connect() as conn:
+                let row = conn.execute(
+                    "SELECT id, name, rating, wins, losses, draws, matches, last_seen"
+                    " FROM players WHERE id = ?",
+                    (int(pid),),
+                ).fetchone()
+            if row is None:
+                return Err(make_not_found(pid))
+            return Ok(_row_to_profile(row, override_last_seen=None))
+        except sqlite3.Error as e:
+            return Err(make_backend_err(StoreError(op="fetch", reason=str(e))))
+
+    def save_match_result(
+        self,
+        room_id: int,
+        mode: str,
+        winner: PlayerId?,
+        duration_ticks: int,
+        placements: list[tuple[PlayerId, int, Rating, Rating]],
+    ) -> Result[int, StoreError]:
+        # placements = (player, rank, rating_before, rating_after)
+        let now: datetime = datetime.now(timezone.utc)
+        try:
+            with self._connect() as conn:
+                let cur = conn.execute(
+                    "INSERT INTO matches (mode, room_id, winner_id, duration, ended_at)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (
+                        mode,
+                        room_id,
+                        int(winner) if winner is not None else None,
+                        duration_ticks,
+                        now.isoformat(),
+                    ),
+                )
+                let match_id: int = int(cur.lastrowid or 0)
+                for entry in placements:
+                    let pid: PlayerId = entry[0]
+                    let rank: int = entry[1]
+                    let before: Rating = entry[2]
+                    let after: Rating = entry[3]
+                    conn.execute(
+                        "INSERT INTO match_players (match_id, player_id, placement, before, after)"
+                        " VALUES (?, ?, ?, ?, ?)",
+                        (match_id, int(pid), rank, int(before), int(after)),
+                    )
+                    let is_winner: bool = winner is not None and int(pid) == int(winner)
+                    let is_loser: bool = winner is not None and int(pid) != int(winner)
+                    let win_inc: int = 1 if is_winner else 0
+                    let loss_inc: int = 1 if is_loser else 0
+                    let draw_inc: int = 1 if winner is None else 0
+                    conn.execute(
+                        "UPDATE players SET rating = ?, wins = wins + ?, losses = losses + ?,"
+                        " draws = draws + ?, matches = matches + 1, last_seen = ?"
+                        " WHERE id = ?",
+                        (
+                            int(after),
+                            win_inc,
+                            loss_inc,
+                            draw_inc,
+                            now.isoformat(),
+                            int(pid),
+                        ),
+                    )
+            return Ok(match_id)
+        except sqlite3.Error as e:
+            return Err(StoreError(op="save_match_result", reason=str(e)))
+
+    def recent_matches(self, limit: int = 20) -> list[tuple[int, str, int, int?, int, str]]:
+        mut out: list[tuple[int, str, int, int?, int, str]] = []
+        with self._connect() as conn:
+            let cur = conn.execute(
+                "SELECT id, mode, room_id, winner_id, duration, ended_at"
+                " FROM matches ORDER BY id DESC LIMIT ?",
+                (limit,),
+            )
+            for row in cur.fetchall():
+                let w: int? = int(row[3]) if row[3] is not None else None
+                out.append((
+                    int(row[0]),
+                    str(row[1]),
+                    int(row[2]),
+                    w,
+                    int(row[4]),
+                    str(row[5]),
+                ))
+        return out
+
+    def leaderboard(self, limit: int = 10) -> list[LeaderboardEntry]:
+        mut out: list[LeaderboardEntry] = []
+        with self._connect() as conn:
+            let cur = conn.execute(
+                "SELECT id, name, rating, wins, losses FROM players"
+                " ORDER BY rating DESC, wins DESC LIMIT ?",
+                (limit,),
+            )
+            for row in cur.fetchall():
+                out.append(LeaderboardEntry(
+                    id=PlayerId(int(row[0])),
+                    name=str(row[1]),
+                    rating=Rating(int(row[2])),
+                    wins=int(row[3]),
+                    losses=int(row[4]),
+                ))
+        return out
+
+    def player_match_history(
+        self, pid: PlayerId, limit: int = 20
+    ) -> list[tuple[int, str, int, int, int, str]]:
+        mut out: list[tuple[int, str, int, int, int, str]] = []
+        with self._connect() as conn:
+            let cur = conn.execute(
+                "SELECT m.id, m.mode, mp.placement, mp.before, mp.after, m.ended_at"
+                " FROM matches m JOIN match_players mp ON m.id = mp.match_id"
+                " WHERE mp.player_id = ? ORDER BY m.id DESC LIMIT ?",
+                (int(pid), limit),
+            )
+            for row in cur.fetchall():
+                out.append((
+                    int(row[0]),
+                    str(row[1]),
+                    int(row[2]),
+                    int(row[3]),
+                    int(row[4]),
+                    str(row[5]),
+                ))
+        return out
+
+
+def _row_to_profile(
+    row: tuple[object, ...], override_last_seen: datetime?
+) -> PlayerProfile:
+    let last_seen: datetime = (
+        override_last_seen
+        if override_last_seen is not None
+        else datetime.fromisoformat(str(row[7]))
+    )
+    return PlayerProfile(
+        id=PlayerId(int(row[0])),
+        name=str(row[1]),
+        rating=Rating(int(row[2])),
+        wins=int(row[3]),
+        losses=int(row[4]),
+        draws=int(row[5]),
+        matches_played=int(row[6]),
+        last_seen=last_seen,
+    )
+
+
+pub def open_store(path: Path) -> Result[ProfileStore, StoreError]:
+    let store: ProfileStore = ProfileStore(db_path=path)
+    match store.init_schema():
+        case Ok(_):
+            return Ok(store)
+        case Err(e):
+            return Err(e)
+    raise RuntimeError("unreachable")

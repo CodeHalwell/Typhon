@@ -1,0 +1,307 @@
+pub type FilterValue = FvStr | FvInt | FvFloat | FvBool
+
+
+pub class FvStr:
+    value: str
+
+
+pub class FvInt:
+    value: int
+
+
+pub class FvFloat:
+    value: float
+
+
+pub class FvBool:
+    value: bool
+
+
+pub def fv_str(v: str) -> FilterValue:
+    return FvStr(value=v)
+
+
+pub def fv_int(v: int) -> FilterValue:
+    return FvInt(value=v)
+
+
+pub def fv_float(v: float) -> FilterValue:
+    return FvFloat(value=v)
+
+
+pub def fv_bool(v: bool) -> FilterValue:
+    return FvBool(value=v)
+
+
+pub def fv_label(v: FilterValue) -> str:
+    match v:
+        case FvStr(_):   return "str"
+        case FvInt(_):   return "int"
+        case FvFloat(_): return "float"
+        case FvBool(_):  return "bool"
+    raise RuntimeError("unreachable")
+
+
+pub def fv_to_float(v: FilterValue) -> float?:
+    match v:
+        case FvInt(n):   return float(n)
+        case FvFloat(f): return f
+        case FvStr(_):   return None
+        case FvBool(_):  return None
+    raise RuntimeError("unreachable")
+
+
+pub def fv_equals(a: FilterValue, b: FilterValue) -> bool:
+    match a:
+        case FvStr(sa):
+            match b:
+                case FvStr(sb):   return sa == sb
+                case FvInt(_):    return False
+                case FvFloat(_):  return False
+                case FvBool(_):   return False
+            raise RuntimeError("unreachable")
+        case FvInt(ia):
+            match b:
+                case FvInt(ib):   return ia == ib
+                case FvFloat(fb): return float(ia) == fb
+                case FvStr(_):    return False
+                case FvBool(_):   return False
+            raise RuntimeError("unreachable")
+        case FvFloat(fa):
+            match b:
+                case FvFloat(fb): return fa == fb
+                case FvInt(ib):   return fa == float(ib)
+                case FvStr(_):    return False
+                case FvBool(_):   return False
+            raise RuntimeError("unreachable")
+        case FvBool(ba):
+            match b:
+                case FvBool(bb):  return ba == bb
+                case FvStr(_):    return False
+                case FvInt(_):    return False
+                case FvFloat(_):  return False
+            raise RuntimeError("unreachable")
+    raise RuntimeError("unreachable")
+
+
+# Wrap raw Python "object" metadata values into FilterValue for evaluation.
+pub def coerce_metadata_value(raw: object) -> FilterValue?:
+    if isinstance(raw, bool):
+        return fv_bool(bool(raw))
+    if isinstance(raw, int):
+        return fv_int(int(raw))
+    if isinstance(raw, float):
+        return fv_float(float(raw))
+    if isinstance(raw, str):
+        return fv_str(str(raw))
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Sealed-union FilterExpr — 8 variants:
+#   FEq, FNe, FGt, FLt, FGe, FLe, FIn, FAnd, FOr, FNot
+# (10 actually — exercises the union extensively.)
+
+
+pub type FilterExpr = FEq | FNe | FGt | FLt | FGe | FLe | FIn | FAnd | FOr | FNot
+
+
+pub class FEq:
+    field: str
+    value: FilterValue
+
+
+pub class FNe:
+    field: str
+    value: FilterValue
+
+
+pub class FGt:
+    field: str
+    value: FilterValue
+
+
+pub class FLt:
+    field: str
+    value: FilterValue
+
+
+pub class FGe:
+    field: str
+    value: FilterValue
+
+
+pub class FLe:
+    field: str
+    value: FilterValue
+
+
+pub class FIn:
+    field: str
+    values: list[FilterValue]
+
+
+pub class FAnd:
+    children: list[FilterExpr]
+
+
+pub class FOr:
+    children: list[FilterExpr]
+
+
+pub class FNot:
+    child: FilterExpr
+
+
+pub def make_eq(field: str, value: FilterValue) -> FilterExpr:
+    return FEq(field=field, value=value)
+
+
+pub def make_ne(field: str, value: FilterValue) -> FilterExpr:
+    return FNe(field=field, value=value)
+
+
+pub def make_gt(field: str, value: FilterValue) -> FilterExpr:
+    return FGt(field=field, value=value)
+
+
+pub def make_lt(field: str, value: FilterValue) -> FilterExpr:
+    return FLt(field=field, value=value)
+
+
+pub def make_ge(field: str, value: FilterValue) -> FilterExpr:
+    return FGe(field=field, value=value)
+
+
+pub def make_le(field: str, value: FilterValue) -> FilterExpr:
+    return FLe(field=field, value=value)
+
+
+pub def make_in(field: str, values: list[FilterValue]) -> FilterExpr:
+    return FIn(field=field, values=values)
+
+
+pub def make_and(children: list[FilterExpr]) -> FilterExpr:
+    return FAnd(children=children)
+
+
+pub def make_or(children: list[FilterExpr]) -> FilterExpr:
+    return FOr(children=children)
+
+
+pub def make_not(child: FilterExpr) -> FilterExpr:
+    return FNot(child=child)
+
+
+# ---------------------------------------------------------------------------
+# Evaluator
+
+
+def _get_field(metadata: dict[str, object], field: str) -> FilterValue?:
+    let raw_opt: object? = metadata.get(field)
+    if raw_opt is None:
+        return None
+    return coerce_metadata_value(raw_opt)
+
+
+def _compare_lt(a: FilterValue, b: FilterValue) -> bool:
+    let af_opt: float? = fv_to_float(a)
+    let bf_opt: float? = fv_to_float(b)
+    if af_opt is None or bf_opt is None:
+        # Fall back to string compare for str/str.
+        match a:
+            case FvStr(sa):
+                match b:
+                    case FvStr(sb):   return sa < sb
+                    case FvInt(_):    return False
+                    case FvFloat(_):  return False
+                    case FvBool(_):   return False
+                raise RuntimeError("unreachable")
+            case FvInt(_):   return False
+            case FvFloat(_): return False
+            case FvBool(_):  return False
+        raise RuntimeError("unreachable")
+    return af_opt < bf_opt
+
+
+def _compare_le(a: FilterValue, b: FilterValue) -> bool:
+    return _compare_lt(a, b) or fv_equals(a, b)
+
+
+def _compare_gt(a: FilterValue, b: FilterValue) -> bool:
+    return _compare_lt(b, a)
+
+
+def _compare_ge(a: FilterValue, b: FilterValue) -> bool:
+    return _compare_le(b, a)
+
+
+pub def evaluate_filter(expr: FilterExpr, metadata: dict[str, object]) -> bool:
+    match expr:
+        case FEq(field_eq, val_eq):
+            let f_eq: FilterValue? = _get_field(metadata, field_eq)
+            if f_eq is None:
+                return False
+            return fv_equals(f_eq, val_eq)
+        case FNe(field_ne, val_ne):
+            let f_ne: FilterValue? = _get_field(metadata, field_ne)
+            if f_ne is None:
+                return True
+            return not fv_equals(f_ne, val_ne)
+        case FGt(field_gt, val_gt):
+            let f_gt: FilterValue? = _get_field(metadata, field_gt)
+            if f_gt is None:
+                return False
+            return _compare_gt(f_gt, val_gt)
+        case FLt(field_lt, val_lt):
+            let f_lt: FilterValue? = _get_field(metadata, field_lt)
+            if f_lt is None:
+                return False
+            return _compare_lt(f_lt, val_lt)
+        case FGe(field_ge, val_ge):
+            let f_ge: FilterValue? = _get_field(metadata, field_ge)
+            if f_ge is None:
+                return False
+            return _compare_ge(f_ge, val_ge)
+        case FLe(field_le, val_le):
+            let f_le: FilterValue? = _get_field(metadata, field_le)
+            if f_le is None:
+                return False
+            return _compare_le(f_le, val_le)
+        case FIn(field_in, vals_in):
+            let f_in: FilterValue? = _get_field(metadata, field_in)
+            if f_in is None:
+                return False
+            let here: FilterValue = f_in
+            for cand in vals_in:
+                if fv_equals(here, cand):
+                    return True
+            return False
+        case FAnd(children_and):
+            for c in children_and:
+                if not evaluate_filter(c, metadata):
+                    return False
+            return True
+        case FOr(children_or):
+            for c in children_or:
+                if evaluate_filter(c, metadata):
+                    return True
+            return False
+        case FNot(child_not):
+            return not evaluate_filter(child_not, metadata)
+    raise RuntimeError("unreachable")
+
+
+pub def describe_filter(expr: FilterExpr) -> str:
+    match expr:
+        case FEq(f, _):    return f"{f} = ?"
+        case FNe(f, _):    return f"{f} != ?"
+        case FGt(f, _):    return f"{f} > ?"
+        case FLt(f, _):    return f"{f} < ?"
+        case FGe(f, _):    return f"{f} >= ?"
+        case FLe(f, _):    return f"{f} <= ?"
+        case FIn(f, vs):   return f"{f} IN (...{len(vs)})"
+        case FAnd(cs):     return f"AND[{len(cs)}]"
+        case FOr(cs):      return f"OR[{len(cs)}]"
+        case FNot(_):      return "NOT(...)"
+    raise RuntimeError("unreachable")

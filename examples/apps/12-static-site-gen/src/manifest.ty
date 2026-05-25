@@ -1,0 +1,139 @@
+import sqlite3
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterator
+
+from ids import PageId, SourceHash
+
+
+pub class ManifestError:
+    op: str
+    detail: str
+
+
+pub class Manifest:
+    db_path: str
+
+
+impl Manifest:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        let conn: sqlite3.Connection = sqlite3.connect(self.db_path)
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+    def init_schema(self) -> Result[None, ManifestError]:
+        try:
+            with self._connect() as conn:
+                conn.executescript("""
+                    CREATE TABLE IF NOT EXISTS pages (
+                        page_id     TEXT PRIMARY KEY,
+                        source_hash TEXT NOT NULL,
+                        out_path    TEXT NOT NULL,
+                        rendered_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS assets (
+                        original    TEXT PRIMARY KEY,
+                        hashed_name TEXT NOT NULL,
+                        copied_at   TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_pages_out ON pages(out_path);
+                """)
+            return Ok(None)
+        except sqlite3.Error as e:
+            return Err(ManifestError(op="init", detail=str(e)))
+
+    def hash_for(self, page_id: PageId) -> Result[SourceHash?, ManifestError]:
+        try:
+            with self._connect() as conn:
+                let cur = conn.execute(
+                    "SELECT source_hash FROM pages WHERE page_id = ?",
+                    (str(page_id),),
+                )
+                let row = cur.fetchone()
+            if row is None:
+                return Ok(None)
+            return Ok(SourceHash(str(row[0])))
+        except sqlite3.Error as e:
+            return Err(ManifestError(op="hash_for", detail=str(e)))
+
+    def record_page(
+        self,
+        page_id: PageId,
+        source_hash: SourceHash,
+        out_path: str,
+        rendered_at: str,
+    ) -> Result[None, ManifestError]:
+        try:
+            with self._connect() as conn:
+                # Transaction: upsert + bookkeeping row count.
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "INSERT INTO pages (page_id, source_hash, out_path, rendered_at)"
+                    " VALUES (?, ?, ?, ?)"
+                    " ON CONFLICT(page_id) DO UPDATE SET"
+                    "   source_hash = excluded.source_hash,"
+                    "   out_path    = excluded.out_path,"
+                    "   rendered_at = excluded.rendered_at",
+                    (str(page_id), str(source_hash), out_path, rendered_at),
+                )
+            return Ok(None)
+        except sqlite3.Error as e:
+            return Err(ManifestError(op="record_page", detail=str(e)))
+
+    def record_asset(
+        self, original: str, hashed: str, copied_at: str
+    ) -> Result[None, ManifestError]:
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO assets (original, hashed_name, copied_at)"
+                    " VALUES (?, ?, ?)"
+                    " ON CONFLICT(original) DO UPDATE SET"
+                    "   hashed_name = excluded.hashed_name,"
+                    "   copied_at   = excluded.copied_at",
+                    (original, hashed, copied_at),
+                )
+            return Ok(None)
+        except sqlite3.Error as e:
+            return Err(ManifestError(op="record_asset", detail=str(e)))
+
+    def all_pages(self) -> Result[list[tuple[str, str, str]], ManifestError]:
+        try:
+            with self._connect() as conn:
+                let cur = conn.execute(
+                    "SELECT page_id, source_hash, out_path FROM pages"
+                )
+                let rows = cur.fetchall()
+            mut out: list[tuple[str, str, str]] = []
+            for row in rows:
+                out.append((str(row[0]), str(row[1]), str(row[2])))
+            return Ok(out)
+        except sqlite3.Error as e:
+            return Err(ManifestError(op="all_pages", detail=str(e)))
+
+    def clear(self) -> Result[None, ManifestError]:
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("DELETE FROM pages")
+                conn.execute("DELETE FROM assets")
+            return Ok(None)
+        except sqlite3.Error as e:
+            return Err(ManifestError(op="clear", detail=str(e)))
+
+
+pub def open_manifest(path: str) -> Result[Manifest, ManifestError]:
+    let parent: Path = Path(path).parent
+    if str(parent) != "" and str(parent) != ".":
+        parent.mkdir(parents=True, exist_ok=True)
+    let m: Manifest = Manifest(db_path=path)
+    match m.init_schema():
+        case Ok(_):
+            return Ok(m)
+        case Err(e):
+            return Err(e)
+    raise RuntimeError("unreachable")

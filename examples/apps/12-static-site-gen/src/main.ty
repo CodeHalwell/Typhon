@@ -1,0 +1,12 @@
+import sys
+
+from cli import run_cli
+
+
+def main() -> None:
+    let code: int = run_cli(sys.argv[1:])
+    sys.exit(code)
+
+
+if __name__ == "__main__":
+    main()

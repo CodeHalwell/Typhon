@@ -1,0 +1,136 @@
+import secrets
+from datetime import datetime, timedelta, timezone
+
+from config import SESSION_TTL_SECONDS
+from ids import PlayerId, RoomId, SessionToken
+
+
+pub class Session:
+    token: SessionToken
+    player: PlayerId
+    created_at: datetime
+    expires_at: datetime
+    current_room: RoomId?
+
+
+pub type SessionError = SessionExpired | SessionUnknown | SessionConflict
+
+
+pub class SessionExpired:
+    token: SessionToken
+
+
+pub class SessionUnknown:
+    token: SessionToken
+
+
+pub class SessionConflict:
+    player: PlayerId
+
+
+pub def make_session_expired(t: SessionToken) -> SessionError:
+    return SessionExpired(token=t)
+
+
+pub def make_session_unknown(t: SessionToken) -> SessionError:
+    return SessionUnknown(token=t)
+
+
+pub def make_session_conflict(p: PlayerId) -> SessionError:
+    return SessionConflict(player=p)
+
+
+pub class ConnectionRegistry:
+    by_token: dict[str, Session]
+    by_player: dict[int, str]
+
+
+pub def new_registry() -> ConnectionRegistry:
+    return ConnectionRegistry(by_token={}, by_player={})
+
+
+impl ConnectionRegistry:
+    def open(self, player: PlayerId) -> Result[Session, SessionError]:
+        # If a player has a live session, reject — they should reconnect with
+        # the existing token instead.
+        let pid_key: int = int(player)
+        if pid_key in self.by_player:
+            let existing_tok: str = self.by_player[pid_key]
+            if existing_tok in self.by_token:
+                let existing: Session = self.by_token[existing_tok]
+                if not _is_expired(existing):
+                    return Err(make_session_conflict(player))
+        let now: datetime = datetime.now(timezone.utc)
+        let token_raw: str = secrets.token_hex(16)
+        let tok: SessionToken = SessionToken(token_raw)
+        let session: Session = Session(
+            token=tok,
+            player=player,
+            created_at=now,
+            expires_at=now + timedelta(seconds=SESSION_TTL_SECONDS),
+            current_room=None,
+        )
+        self.by_token[token_raw] = session
+        self.by_player[pid_key] = token_raw
+        return Ok(session)
+
+    def resume(self, token: SessionToken) -> Result[Session, SessionError]:
+        let tok_raw: str = str(token)
+        if tok_raw not in self.by_token:
+            return Err(make_session_unknown(token))
+        let s: Session = self.by_token[tok_raw]
+        if _is_expired(s):
+            del self.by_token[tok_raw]
+            self.by_player.pop(int(s.player), None)
+            return Err(make_session_expired(token))
+        # Renew on touch.
+        let now: datetime = datetime.now(timezone.utc)
+        s.expires_at = now + timedelta(seconds=SESSION_TTL_SECONDS)
+        return Ok(s)
+
+    def attach_room(self, token: SessionToken, room: RoomId) -> Result[None, SessionError]:
+        match self.resume(token):
+            case Ok(session):
+                session.current_room = room
+                return Ok(None)
+            case Err(e):
+                return Err(e)
+        raise RuntimeError("unreachable")
+
+    def detach_room(self, token: SessionToken) -> Result[None, SessionError]:
+        match self.resume(token):
+            case Ok(session):
+                session.current_room = None
+                return Ok(None)
+            case Err(e):
+                return Err(e)
+        raise RuntimeError("unreachable")
+
+    def close(self, token: SessionToken) -> None:
+        let tok_raw: str = str(token)
+        if tok_raw not in self.by_token:
+            return
+        let s: Session = self.by_token[tok_raw]
+        del self.by_token[tok_raw]
+        self.by_player.pop(int(s.player), None)
+
+    def session_for_player(self, player: PlayerId) -> Session?:
+        let pid_key: int = int(player)
+        if pid_key not in self.by_player:
+            return None
+        let tok: str = self.by_player[pid_key]
+        if tok not in self.by_token:
+            return None
+        return self.by_token[tok]
+
+    def active_sessions(self) -> list[Session]:
+        mut out: list[Session] = []
+        for s in self.by_token.values():
+            if not _is_expired(s):
+                out.append(s)
+        return out
+
+
+def _is_expired(s: Session) -> bool:
+    let now: datetime = datetime.now(timezone.utc)
+    return now >= s.expires_at

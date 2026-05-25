@@ -1,0 +1,335 @@
+import asyncio
+from datetime import datetime, timezone
+
+from config import MATCHMAKE_INTERVAL_SECONDS
+from elo import update_free_for_all
+from events import (
+    GameEvent,
+    LobbyStreamEntry,
+)
+from ids import LobbyId, PlayerId, Rating, RoomId
+from modes import MatchSnapshot, Mode, find_mode
+from profiles import PlayerProfile, ProfileError, ProfileStore
+from rooms import (
+    FinalisedMatch,
+    Room,
+    StartingRatings,
+    new_room,
+    room_tick_loop,
+)
+
+
+# A "waiting bucket" is a queued player who hasn't been matchmade yet.
+pub class WaitingPlayer:
+    id: PlayerId
+    rating: Rating
+    name: str
+    queued_at: datetime
+
+
+pub class Lobby:
+    id: LobbyId
+    modes: list[Mode]
+    waiting: dict[str, list[WaitingPlayer]]  # mode_name -> queue
+    rooms: dict[int, Room]
+    next_room_id: int
+    profile_store: ProfileStore
+    stream: list[LobbyStreamEntry]
+    next_seq: int
+    finalise_queue: "asyncio.Queue[FinalisedMatch]"
+    shutdown: asyncio.Event
+
+
+pub def new_lobby(
+    id: LobbyId, modes: list[Mode], profile_store: ProfileStore,
+) -> Lobby:
+    mut waiting: dict[str, list[WaitingPlayer]] = {}
+    for m in modes:
+        waiting[m.name] = []
+    return Lobby(
+        id=id,
+        modes=modes,
+        waiting=waiting,
+        rooms={},
+        next_room_id=1,
+        profile_store=profile_store,
+        stream=[],
+        next_seq=1,
+        finalise_queue=asyncio.Queue(),
+        shutdown=asyncio.Event(),
+    )
+
+
+impl Lobby:
+    def queue_for(self, mode_name: str) -> list[WaitingPlayer]?:
+        if mode_name not in self.waiting:
+            return None
+        return self.waiting[mode_name]
+
+    def enqueue(
+        self, mode_name: str, profile: PlayerProfile,
+    ) -> Result[None, str]:
+        let mode_opt: Mode? = find_mode(self.modes, mode_name)
+        if mode_opt is None:
+            return Err(f"unknown mode: {mode_name}")
+        if mode_name not in self.waiting:
+            self.waiting[mode_name] = []
+        # Reject duplicate queue entries.
+        for existing_w in self.waiting[mode_name]:
+            if int(existing_w.id) == int(profile.id):
+                return Err("already queued")
+        let now: datetime = datetime.now(timezone.utc)
+        self.waiting[mode_name].append(WaitingPlayer(
+            id=profile.id,
+            rating=profile.rating,
+            name=profile.name,
+            queued_at=now,
+        ))
+        return Ok(None)
+
+    def dequeue(self, player: PlayerId) -> bool:
+        mut removed: bool = False
+        for mode_name in self.waiting:
+            let q: list[WaitingPlayer] = self.waiting[mode_name]
+            mut filtered: list[WaitingPlayer] = []
+            for wp in q:
+                if int(wp.id) == int(player):
+                    removed = True
+                else:
+                    filtered.append(wp)
+            self.waiting[mode_name] = filtered
+        return removed
+
+    def matchmake_tick(self) -> list[RoomId]:
+        mut started: list[RoomId] = []
+        for mode_name in self.waiting:
+            let m_opt: Mode? = find_mode(self.modes, mode_name)
+            if m_opt is None:
+                continue
+            let m: Mode = m_opt
+            # Sort the queue by rating so similarly-skilled players land
+            # in the same room.
+            let sorted_q: list[WaitingPlayer] = _sort_by_rating(
+                self.waiting[mode_name]
+            )
+            mut leftover: list[WaitingPlayer] = []
+            mut idx: int = 0
+            while idx < len(sorted_q):
+                let take: int = (
+                    m.max_players
+                    if idx + m.max_players <= len(sorted_q)
+                    else len(sorted_q) - idx
+                )
+                if take < m.min_players:
+                    # Park the rest for the next tick.
+                    while idx < len(sorted_q):
+                        leftover.append(sorted_q[idx])
+                        idx = idx + 1
+                    break
+                mut group: list[WaitingPlayer] = []
+                mut g: int = 0
+                while g < take:
+                    group.append(sorted_q[idx + g])
+                    g = g + 1
+                idx = idx + take
+                let rid: RoomId = self._open_room(m, group)
+                started.append(rid)
+            self.waiting[mode_name] = leftover
+        return started
+
+    def _open_room(self, m: Mode, players: list[WaitingPlayer]) -> RoomId:
+        let rid: RoomId = RoomId(self.next_room_id)
+        self.next_room_id = self.next_room_id + 1
+        let room: Room = new_room(rid, m)
+        self.rooms[int(rid)] = room
+        mut ratings_map: dict[int, Rating] = {}
+        for wp in players:
+            match room.add_player(wp.id):
+                case Ok(_):
+                    ratings_map[int(wp.id)] = wp.rating
+                case Err(_):
+                    pass
+        # Drain the room's accumulated events into the lobby stream.
+        for ev in room.history.snapshot():
+            self._emit(ev)
+        # Start the match immediately if the mode allows.
+        match room.begin_match(ratings_map):
+            case Ok(_):
+                pass
+            case Err(_):
+                pass
+        for ev2 in room.history.snapshot():
+            self._emit(ev2)
+        # Spawn the per-room loop.
+        go room_tick_loop(room, ratings_map, self.finalise_queue, self.shutdown)
+        return rid
+
+    def get_room(self, rid: RoomId) -> Room?:
+        let key: int = int(rid)
+        if key not in self.rooms:
+            return None
+        return self.rooms[key]
+
+    def list_rooms(self) -> list[Room]:
+        mut out: list[Room] = []
+        for room in self.rooms.values():
+            out.append(room)
+        return out
+
+    def stream_since(self, since: int, limit: int = 100) -> list[LobbyStreamEntry]:
+        mut out: list[LobbyStreamEntry] = []
+        for entry in self.stream:
+            if entry.seq > since:
+                out.append(entry)
+                if len(out) >= limit:
+                    break
+        return out
+
+    def _emit(self, ev: GameEvent) -> None:
+        let entry: LobbyStreamEntry = LobbyStreamEntry(
+            lobby=self.id, seq=self.next_seq, event=ev,
+        )
+        self.next_seq = self.next_seq + 1
+        self.stream.append(entry)
+        # Cap stream length to keep memory bounded.
+        if len(self.stream) > 1024:
+            self.stream = self.stream[len(self.stream) - 1024:]
+
+    def queue_size(self, mode_name: str) -> int:
+        if mode_name not in self.waiting:
+            return 0
+        return len(self.waiting[mode_name])
+
+    def queue_summary(self) -> dict[str, int]:
+        mut out: dict[str, int] = {}
+        for mode_name in self.waiting:
+            out[mode_name] = len(self.waiting[mode_name])
+        return out
+
+    async def matchmake_loop(self) -> None:
+        while not self.shutdown.is_set():
+            self.matchmake_tick()
+            try:
+                await asyncio.wait_for(
+                    self.shutdown.wait(), timeout=MATCHMAKE_INTERVAL_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                pass
+
+    async def finaliser_loop(self) -> None:
+        while not self.shutdown.is_set():
+            try:
+                let item: FinalisedMatch = await asyncio.wait_for(
+                    self.finalise_queue.get(), timeout=0.5,
+                )
+            except asyncio.TimeoutError:
+                continue
+            await self._persist_match(item)
+            # Drain any newly-broadcast events into the lobby stream.
+            let room_opt: Room? = self.get_room(item.room)
+            if room_opt is not None:
+                for ev3 in room_opt.history.snapshot():
+                    self._emit(ev3)
+
+    async def _persist_match(self, item: FinalisedMatch) -> None:
+        let room_opt: Room? = self.get_room(item.room)
+        if room_opt is None:
+            return
+        let room: Room = room_opt
+        let snap: MatchSnapshot = item.snapshot
+        let ratings: StartingRatings = item.ratings
+        let placements_pairs: list[tuple[PlayerId, int]] = (room.mode.placements)(snap)
+        mut ranked: list[tuple[PlayerId, Rating, int]] = []
+        for pp in placements_pairs:
+            let pid: PlayerId = pp[0]
+            let rank: int = pp[1]
+            let key: int = int(pid)
+            mut cur: Rating = Rating(1000)
+            if key in ratings.by_player:
+                cur = ratings.by_player[key]
+            ranked.append((pid, cur, rank))
+        let changes = update_free_for_all(ranked)
+        # Build the placements list expected by the store: (player, rank, before, after).
+        mut full: list[tuple[PlayerId, int, Rating, Rating]] = []
+        mut after_map: dict[int, Rating] = {}
+        for ch in changes:
+            after_map[int(ch.player)] = ch.after
+        for pp2 in placements_pairs:
+            let pid2: PlayerId = pp2[0]
+            let rank2: int = pp2[1]
+            let key2: int = int(pid2)
+            mut before2: Rating = Rating(1000)
+            if key2 in ratings.by_player:
+                before2 = ratings.by_player[key2]
+            mut after2: Rating = before2
+            if key2 in after_map:
+                after2 = after_map[key2]
+            full.append((pid2, rank2, before2, after2))
+        let winner_pid: PlayerId? = _winner_of_placements(placements_pairs)
+        let duration: int = snap.tick
+        # Wrap the sync sqlite call in to_thread so we don't block the event loop.
+        let result = await asyncio.to_thread(
+            self.profile_store.save_match_result,
+            int(item.room),
+            room.mode.name,
+            winner_pid,
+            duration,
+            full,
+        )
+        match result:
+            case Ok(_):
+                pass
+            case Err(e):
+                print(f"[lobby] persist failure: {e.op}: {e.reason}")
+
+    async def warm_profiles(self, names: list[str]) -> list[PlayerProfile]:
+        # Parallel I/O example using gather — each profile upsert is independent.
+        # Today the profile store is sync sqlite, so we wrap with to_thread().
+        mut results: list[PlayerProfile] = []
+        for name in names:
+            let r = await asyncio.to_thread(self.profile_store.upsert, name)
+            match r:
+                case Ok(p):
+                    results.append(p)
+                case Err(_):
+                    pass
+        return results
+
+
+def _sort_by_rating(items: list[WaitingPlayer]) -> list[WaitingPlayer]:
+    mut out: list[WaitingPlayer] = []
+    for x in items:
+        out.append(x)
+    out.sort(key=_waiter_rating_key)
+    return out
+
+
+def _waiter_rating_key(w: WaitingPlayer) -> int:
+    return int(w.rating)
+
+
+def _winner_of_placements(
+    placements: list[tuple[PlayerId, int]],
+) -> PlayerId?:
+    for p in placements:
+        if p[1] == 1:
+            return p[0]
+    return None
+
+
+pub async def load_profiles_parallel(
+    store: ProfileStore, ids: list[PlayerId],
+) -> list[PlayerProfile?]:
+    # `gather:` over independent I/O, one entry per player.
+    # The sqlite layer is sync — push each into a thread for true parallelism.
+    mut out: list[PlayerProfile?] = []
+    for pid in ids:
+        let r: Result[PlayerProfile, ProfileError] = await asyncio.to_thread(
+            store.fetch, pid,
+        )
+        match r:
+            case Ok(p):
+                out.append(p)
+            case Err(_):
+                out.append(None)
+    return out

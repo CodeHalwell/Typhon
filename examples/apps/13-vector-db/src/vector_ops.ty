@@ -1,0 +1,50 @@
+import math
+
+
+pub def dot(a: list[float], b: list[float]) -> float:
+    let n: int = len(a)
+    mut acc: float = 0.0
+    for i in range(n):
+        acc = acc + a[i] * b[i]
+    return acc
+
+
+pub def norm(a: list[float]) -> float:
+    mut acc: float = 0.0
+    for x in a:
+        acc = acc + x * x
+    return math.sqrt(acc)
+
+
+pub def l2_distance(a: list[float], b: list[float]) -> float:
+    let n: int = len(a)
+    mut acc: float = 0.0
+    for i in range(n):
+        let d: float = a[i] - b[i]
+        acc = acc + d * d
+    return math.sqrt(acc)
+
+
+pub def cosine_distance(a: list[float], b: list[float]) -> float:
+    let na: float = norm(a)
+    let nb: float = norm(b)
+    if na == 0.0 or nb == 0.0:
+        return 1.0
+    let cos: float = dot(a, b) / (na * nb)
+    return 1.0 - cos
+
+
+pub def inner_product_distance(a: list[float], b: list[float]) -> float:
+    # Higher dot product is "closer"; flip sign so smaller is better.
+    return -dot(a, b)
+
+
+pub def normalise(a: list[float]) -> list[float]:
+    let n: float = norm(a)
+    if n == 0.0:
+        return [0.0 for _ in a]
+    return [x / n for x in a]
+
+
+pub def same_dim(a: list[float], b: list[float]) -> bool:
+    return len(a) == len(b)

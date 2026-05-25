@@ -1,0 +1,70 @@
+import hashlib
+from datetime import datetime, timezone
+from pathlib import Path
+
+from ids import AssetHash
+from manifest import Manifest
+from models import StageError, make_se_read, make_se_write
+
+
+pub class AssetEntry frozen:
+    original: str
+    hashed_name: str
+    size_bytes: int
+
+
+def _hash_bytes(data: bytes) -> AssetHash:
+    let h = hashlib.sha256(data)
+    return AssetHash(h.hexdigest()[0:16])
+
+
+def _hashed_filename(name: str, h: AssetHash) -> str:
+    let dot: int = name.rfind(".")
+    if dot < 0:
+        return f"{name}.{str(h)}"
+    let stem: str = name[0:dot]
+    let ext: str = name[dot:len(name)]
+    return f"{stem}.{str(h)}{ext}"
+
+
+pub def copy_assets(
+    asset_dir: str,
+    output_dir: str,
+    manifest: Manifest,
+) -> Result[list[AssetEntry], StageError]:
+    let src_root: Path = Path(asset_dir)
+    if not src_root.exists():
+        return Ok([])
+    let out_root: Path = Path(output_dir) / "assets"
+    try:
+        out_root.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return Err(make_se_write(str(out_root), str(e)))
+    mut entries: list[AssetEntry] = []
+    let files: list[Path] = sorted(src_root.rglob("*"))
+    for path in files:
+        if not path.is_file():
+            continue
+        try:
+            with open(str(path), "rb") as fh:
+                let data: bytes = fh.read()
+        except OSError as e:
+            return Err(make_se_read(str(path), str(e)))
+        let h: AssetHash = _hash_bytes(data)
+        let rel: str = str(path.relative_to(src_root))
+        let hashed_name: str = _hashed_filename(rel, h)
+        let dest: Path = out_root / hashed_name
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with open(str(dest), "wb") as outh:
+                outh.write(data)
+        except OSError as ew:
+            return Err(make_se_write(str(dest), str(ew)))
+        let now: str = datetime.now(timezone.utc).isoformat()
+        match manifest.record_asset(rel, hashed_name, now):
+            case Err(me):
+                return Err(make_se_write(str(dest), me.detail))
+            case Ok(_):
+                pass
+        entries.append(AssetEntry(original=rel, hashed_name=hashed_name, size_bytes=len(data)))
+    return Ok(entries)

@@ -1,0 +1,6 @@
+pub newtype PlayerId = int
+pub newtype RoomId = int
+pub newtype LobbyId = int
+pub newtype Rating = int
+pub newtype SessionToken = str
+pub newtype MatchId = int

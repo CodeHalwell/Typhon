@@ -1,0 +1,47 @@
+import os
+
+
+comptime let BUILD_TAG: str = env("BUILD_TAG", "dev")
+comptime let DEFAULT_PORT: int = 8001
+comptime let DEFAULT_SNAPSHOT_DIR: str = "/tmp/typhon-vector-db"
+
+
+pub class HnswParams frozen:
+    m: int
+    m_max0: int
+    ef_construction: int
+    ef_search: int
+    max_level: int
+    level_mult: float
+
+
+pub class ServerConfig frozen:
+    http_port: int
+    snapshot_dir: str
+    snapshot_interval_seconds: float
+    hnsw: HnswParams
+
+
+freeze let DEFAULT_HNSW: HnswParams = HnswParams(
+    m=16,
+    m_max0=32,
+    ef_construction=200,
+    ef_search=64,
+    max_level=8,
+    level_mult=0.43,
+)
+
+
+pub def load_config() -> ServerConfig:
+    let port_raw: str = os.environ.get("VDB_PORT", str(DEFAULT_PORT))
+    let snap_dir: str = os.environ.get("VDB_SNAPSHOT_DIR", DEFAULT_SNAPSHOT_DIR)
+    return ServerConfig(
+        http_port=int(port_raw),
+        snapshot_dir=snap_dir,
+        snapshot_interval_seconds=30.0,
+        hnsw=DEFAULT_HNSW,
+    )
+
+
+pub def build_tag() -> str:
+    return BUILD_TAG

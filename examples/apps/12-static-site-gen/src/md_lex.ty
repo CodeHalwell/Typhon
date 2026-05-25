@@ -1,0 +1,155 @@
+pub type MdLine = LnHeading | LnList | LnOList | LnFence | LnQuote | LnRule | LnBlank | LnText
+
+
+pub class LnHeading:
+    level: int
+    text: str
+    line: int
+
+
+pub class LnList:
+    text: str
+    line: int
+
+
+pub class LnOList:
+    text: str
+    line: int
+
+
+pub class LnFence:
+    lang: str
+    line: int
+
+
+pub class LnQuote:
+    text: str
+    line: int
+
+
+pub class LnRule frozen:
+    pass
+
+
+pub class LnBlank frozen:
+    pass
+
+
+pub class LnText:
+    text: str
+    line: int
+
+
+pub def make_ln_heading(level: int, text: str, line: int) -> MdLine:
+    return LnHeading(level=level, text=text, line=line)
+
+
+pub def make_ln_list(text: str, line: int) -> MdLine:
+    return LnList(text=text, line=line)
+
+
+pub def make_ln_olist(text: str, line: int) -> MdLine:
+    return LnOList(text=text, line=line)
+
+
+pub def make_ln_fence(lang: str, line: int) -> MdLine:
+    return LnFence(lang=lang, line=line)
+
+
+pub def make_ln_quote(text: str, line: int) -> MdLine:
+    return LnQuote(text=text, line=line)
+
+
+pub def make_ln_rule() -> MdLine:
+    return LnRule()
+
+
+pub def make_ln_blank() -> MdLine:
+    return LnBlank()
+
+
+pub def make_ln_text(text: str, line: int) -> MdLine:
+    return LnText(text=text, line=line)
+
+
+def _count_leading(text: str, ch: str) -> int:
+    mut i: int = 0
+    let n: int = len(text)
+    while i < n and text[i] == ch:
+        i = i + 1
+    return i
+
+
+def _is_rule(text: str) -> bool:
+    let t: str = text.strip()
+    if len(t) < 3:
+        return False
+    let c0: str = t[0]
+    if c0 != "-" and c0 != "*" and c0 != "_":
+        return False
+    for ch in t:
+        if ch != c0:
+            return False
+    return True
+
+
+def _starts_with_olist(text: str) -> bool:
+    mut i: int = 0
+    let n: int = len(text)
+    while i < n and text[i] >= "0" and text[i] <= "9":
+        i = i + 1
+    if i == 0 or i >= n:
+        return False
+    return text[i] == "."
+
+
+def _olist_rest(text: str) -> str:
+    mut i: int = 0
+    let n: int = len(text)
+    while i < n and text[i] >= "0" and text[i] <= "9":
+        i = i + 1
+    if i < n and text[i] == ".":
+        i = i + 1
+    if i < n and text[i] == " ":
+        i = i + 1
+    return text[i:n]
+
+
+pub def lex_lines(source: str) -> list[MdLine]:
+    let raw_lines: list[str] = source.split("\n")
+    mut out: list[MdLine] = []
+    mut idx: int = 0
+    for raw in raw_lines:
+        let line_num: int = idx + 1
+        idx = idx + 1
+        let stripped: str = raw.rstrip()
+        if len(stripped.strip()) == 0:
+            out.append(make_ln_blank())
+            continue
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            let lang: str = stripped[3:len(stripped)].strip()
+            out.append(make_ln_fence(lang, line_num))
+            continue
+        if stripped.startswith("#"):
+            let level: int = _count_leading(stripped, "#")
+            if level >= 1 and level <= 6 and level < len(stripped) and stripped[level] == " ":
+                let text: str = stripped[level + 1:len(stripped)].strip()
+                out.append(make_ln_heading(level, text, line_num))
+                continue
+        if _is_rule(stripped):
+            out.append(make_ln_rule())
+            continue
+        if stripped.startswith("- ") or stripped.startswith("* ") or stripped.startswith("+ "):
+            out.append(make_ln_list(stripped[2:len(stripped)], line_num))
+            continue
+        if _starts_with_olist(stripped):
+            out.append(make_ln_olist(_olist_rest(stripped), line_num))
+            continue
+        if stripped.startswith("> "):
+            out.append(make_ln_quote(stripped[2:len(stripped)], line_num))
+            continue
+        if stripped.startswith(">"):
+            out.append(make_ln_quote(stripped[1:len(stripped)].lstrip(), line_num))
+            continue
+        out.append(make_ln_text(stripped, line_num))
+    return out

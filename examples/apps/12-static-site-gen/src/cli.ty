@@ -1,0 +1,197 @@
+import argparse
+import shutil
+import sys
+from pathlib import Path
+
+from assets import copy_assets
+from config import build_version, default_config
+from feed import render_robots, render_rss, render_sitemap
+from manifest import open_manifest
+from models import RenderedPage, SiteConfig
+from pipeline import (
+    PipelineReport,
+    build_pages,
+    load_all_templates,
+)
+
+
+pub class CliResult:
+    code: int
+    message: str
+
+
+def _list_template_names(template_dir: str) -> list[str]:
+    let root: Path = Path(template_dir)
+    if not root.exists():
+        return []
+    mut out: list[str] = []
+    for path in sorted(root.glob("*.html")):
+        out.append(path.stem)
+    return out
+
+
+def _build_config(args: argparse.Namespace) -> SiteConfig:
+    let cfg: SiteConfig = default_config()
+    return SiteConfig(
+        site_url=str(args.site_url) if args.site_url is not None else cfg.site_url,
+        site_title=str(args.site_title) if args.site_title is not None else cfg.site_title,
+        site_description=cfg.site_description,
+        author=cfg.author,
+        content_dir=str(args.content) if args.content is not None else cfg.content_dir,
+        template_dir=str(args.templates) if args.templates is not None else cfg.template_dir,
+        asset_dir=str(args.assets) if args.assets is not None else cfg.asset_dir,
+        output_dir=str(args.output) if args.output is not None else cfg.output_dir,
+        manifest_path=str(args.manifest) if args.manifest is not None else cfg.manifest_path,
+        rss_count=int(args.rss_count) if args.rss_count is not None else cfg.rss_count,
+        incremental=not bool(args.full),
+    )
+
+
+def _format_report(report: PipelineReport, asset_count: int) -> str:
+    mut lines: list[str] = []
+    lines.append(f"  pages rendered: {report.pages_rendered}")
+    lines.append(f"  pages skipped:  {report.pages_skipped}")
+    lines.append(f"  assets copied:  {asset_count}")
+    if len(report.errors) > 0:
+        lines.append(f"  errors ({len(report.errors)}):")
+        for e in report.errors:
+            lines.append(f"    - {e}")
+    return "\n".join(lines)
+
+
+def _cmd_build(args: argparse.Namespace) -> CliResult:
+    let cfg: SiteConfig = _build_config(args)
+    print(f"ssg build v{build_version()}")
+    print(f"  content : {cfg.content_dir}")
+    print(f"  layouts : {cfg.template_dir}")
+    print(f"  output  : {cfg.output_dir}")
+    match open_manifest(cfg.manifest_path):
+        case Err(me):
+            return CliResult(code=1, message=f"manifest error: {me.detail}")
+        case Ok(manifest):
+            let tpl_names: list[str] = _list_template_names(cfg.template_dir)
+            if len(tpl_names) == 0:
+                return CliResult(
+                    code=2,
+                    message=f"no templates found in {cfg.template_dir}",
+                )
+            match load_all_templates(tpl_names, cfg.template_dir):
+                case Err(te):
+                    return CliResult(code=3, message=f"template load: {te}")
+                case Ok(templates):
+                    let pair = build_pages(cfg, templates, manifest)
+                    let rendered: list[RenderedPage] = pair[0]
+                    let report: PipelineReport = pair[1]
+                    print(_format_report(report, 0))
+                    # Sitemap.
+                    let sitemap: str = render_sitemap(cfg.site_url, rendered)
+                    let sm_path: Path = Path(cfg.output_dir) / "sitemap.xml"
+                    sm_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(str(sm_path), "w", encoding="utf-8") as fh:
+                        fh.write(sitemap)
+                    # robots.txt
+                    let robots: str = render_robots(cfg.site_url)
+                    with open(str(Path(cfg.output_dir) / "robots.txt"), "w", encoding="utf-8") as rh:
+                        rh.write(robots)
+                    # RSS
+                    let rss: str = render_rss(
+                        cfg.site_title,
+                        cfg.site_url,
+                        cfg.site_description,
+                        rendered,
+                        cfg.rss_count,
+                    )
+                    with open(str(Path(cfg.output_dir) / "feed.xml"), "w", encoding="utf-8") as ff:
+                        ff.write(rss)
+                    # Assets
+                    mut asset_count: int = 0
+                    match copy_assets(cfg.asset_dir, cfg.output_dir, manifest):
+                        case Err(ae):
+                            return CliResult(code=4, message=f"asset copy: {ae}")
+                        case Ok(entries):
+                            asset_count = len(entries)
+                    return CliResult(
+                        code=0,
+                        message=f"build complete ({len(rendered)} pages, {asset_count} assets)",
+                    )
+    raise RuntimeError("unreachable")
+
+
+def _cmd_clean(args: argparse.Namespace) -> CliResult:
+    let cfg: SiteConfig = _build_config(args)
+    let out: Path = Path(cfg.output_dir)
+    if out.exists():
+        try:
+            shutil.rmtree(str(out))
+        except OSError as e:
+            return CliResult(code=1, message=f"failed to remove {out}: {e}")
+    let mf: Path = Path(cfg.manifest_path)
+    if mf.exists():
+        try:
+            mf.unlink()
+        except OSError as e2:
+            return CliResult(code=1, message=f"failed to remove {mf}: {e2}")
+    return CliResult(code=0, message=f"cleaned {cfg.output_dir} and manifest")
+
+
+def _cmd_serve(args: argparse.Namespace) -> CliResult:
+    let cfg: SiteConfig = _build_config(args)
+    let port: int = int(args.port) if args.port is not None else 8000
+    let out: Path = Path(cfg.output_dir)
+    if not out.exists():
+        return CliResult(
+            code=2,
+            message=f"output directory {out} does not exist — run 'build' first",
+        )
+    print(f"Would serve {out} on http://127.0.0.1:{port}")
+    print("(serve subcommand is a stub — wire up http.server in your runtime)")
+    return CliResult(code=0, message="serve stub OK")
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    let parser: argparse.ArgumentParser = argparse.ArgumentParser(
+        prog="ssg",
+        description=f"Typhon static site generator (v{build_version()})",
+    )
+    let sub = parser.add_subparsers(dest="cmd")
+
+    def _add_common(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--content")
+        p.add_argument("--templates")
+        p.add_argument("--assets")
+        p.add_argument("--output")
+        p.add_argument("--manifest")
+        p.add_argument("--site-url", dest="site_url")
+        p.add_argument("--site-title", dest="site_title")
+        p.add_argument("--rss-count", dest="rss_count", type=int)
+        p.add_argument("--full", action="store_true", help="force full rebuild")
+
+    let build_p: argparse.ArgumentParser = sub.add_parser("build", help="render site")
+    _add_common(build_p)
+
+    let clean_p: argparse.ArgumentParser = sub.add_parser("clean", help="remove output + manifest")
+    _add_common(clean_p)
+
+    let serve_p: argparse.ArgumentParser = sub.add_parser("serve", help="serve output")
+    _add_common(serve_p)
+    serve_p.add_argument("--port", type=int)
+
+    return parser
+
+
+pub def run_cli(argv: list[str]) -> int:
+    let parser: argparse.ArgumentParser = _build_parser()
+    let args = parser.parse_args(argv)
+    let cmd: str = str(args.cmd) if args.cmd is not None else "build"
+    mut result: CliResult = CliResult(code=0, message="")
+    if cmd == "build":
+        result = _cmd_build(args)
+    elif cmd == "clean":
+        result = _cmd_clean(args)
+    elif cmd == "serve":
+        result = _cmd_serve(args)
+    else:
+        print(f"unknown command: {cmd}", file=sys.stderr)
+        return 64
+    print(result.message)
+    return result.code
