@@ -66,53 +66,38 @@ def _derive_slug(path: str, declared: str) -> SlugStr:
     return SlugStr(_slugify(stem) + ".html")
 
 
-# R2-6 workaround note:
-# Each stage has a stage-specific error type. We cannot use a single
-# `with`-chain because `?` requires a uniform error. Instead, the pipeline
-# is a tower of `match` blocks, each converting the stage's `Err` to a
-# shared `StageError`. This is the practical shape today; a `.map_err(...)`
-# adapter would collapse this back into ~6 lines.
+# R2-6 — heterogeneous-error pipelines via `.map_err` (v0.6.0+).
+# Each stage returns a different `Err` type; `.map_err(lambda e: ...)` is
+# the per-stage converter that funnels everything into `StageError`, and
+# `?` propagates the unified error. The shape collapses what was
+# previously a multi-level `match` tower (~25 lines per pipeline function)
+# back to the canonical 6-line straight-line form.
 
 pub def load_document(path: str, default_layout: str) -> Result[Document, StageError]:
-    match _read_file(path):
-        case Err(re):
-            return Err(re)
-        case Ok(text):
-            match parse_frontmatter(text, default_layout):
-                case Err(fe):
-                    return Err(make_se_front(path, fe.line, fe.detail))
-                case Ok(pair):
-                    let fm: FrontMatter = pair[0]
-                    let body: str = pair[1]
-                    # Markdown parsing is total in our implementation (no error),
-                    # but we still scope it through a Result to keep the shape consistent.
-                    let blocks = parse_blocks(body)
-                    let stem: str = Path(path).stem
-                    let pid: PageId = PageId(stem)
-                    return Ok(Document(
-                        id=pid,
-                        source_path=path,
-                        front=fm,
-                        blocks=blocks,
-                        body_text=body,
-                    ))
-    raise RuntimeError("unreachable")
+    let text: str = _read_file(path)?
+    let pair = parse_frontmatter(text, default_layout).map_err(lambda fe: make_se_front(path, fe.line, fe.detail))?
+    let fm: FrontMatter = pair[0]
+    let body: str = pair[1]
+    # Markdown parsing is total in our implementation (no Result), so
+    # `parse_blocks` is called directly without `?`.
+    let blocks = parse_blocks(body)
+    let pid: PageId = PageId(Path(path).stem)
+    return Ok(Document(
+        id=pid,
+        source_path=path,
+        front=fm,
+        blocks=blocks,
+        body_text=body,
+    ))
 
 
 pub def load_template(
     name: TemplateName, template_dir: str
 ) -> Result[Template, StageError]:
     let path: str = str(Path(template_dir) / (str(name) + ".html"))
-    match _read_file(path):
-        case Err(re):
-            return Err(re)
-        case Ok(text):
-            match parse_template(name, text):
-                case Err(pe):
-                    return Err(make_se_template(str(name), pe.line, pe.detail))
-                case Ok(tpl):
-                    return Ok(tpl)
-    raise RuntimeError("unreachable")
+    let text: str = _read_file(path)?
+    let tpl: Template = parse_template(name, text).map_err(lambda pe: make_se_template(str(name), pe.line, pe.detail))?
+    return Ok(tpl)
 
 
 pub def load_all_templates(
@@ -161,23 +146,19 @@ pub def render_document(
     let layout: str = doc.front.layout
     if layout not in templates:
         return Err(make_se_template(layout, 0, f"template {layout!r} not loaded"))
-    match render_template(layout, ctx):
-        case Err(re):
-            return Err(make_se_render(str(doc.id), re.detail))
-        case Ok(html):
-            let slug: SlugStr = _derive_slug(doc.source_path, doc.front.slug)
-            let out_rel: str = str(slug)
-            return Ok(RenderedPage(
-                id=doc.id,
-                slug=slug,
-                layout=TemplateName(layout),
-                title=doc.front.title,
-                date=doc.front.date,
-                tags=doc.front.tags,
-                html=html,
-                out_path=out_rel,
-            ))
-    raise RuntimeError("unreachable")
+    let doc_id: str = str(doc.id)
+    let html: str = render_template(layout, ctx).map_err(lambda re: make_se_render(doc_id, re.detail))?
+    let slug: SlugStr = _derive_slug(doc.source_path, doc.front.slug)
+    return Ok(RenderedPage(
+        id=doc.id,
+        slug=slug,
+        layout=TemplateName(layout),
+        title=doc.front.title,
+        date=doc.front.date,
+        tags=doc.front.tags,
+        html=html,
+        out_path=str(slug),
+    ))
 
 
 pub def write_page(
@@ -208,12 +189,7 @@ pub def record_render(
 ) -> Result[None, StageError]:
     let new_hash: SourceHash = _hash_text(text)
     let now: str = datetime.now(timezone.utc).isoformat()
-    match manifest.record_page(page_id, new_hash, out_path, now):
-        case Err(me):
-            return Err(make_se_write(path, me.detail))
-        case Ok(_):
-            return Ok(None)
-    raise RuntimeError("unreachable")
+    return manifest.record_page(page_id, new_hash, out_path, now).map_err(lambda me: make_se_write(path, me.detail))
 
 
 # End-to-end build pass: discover, parse, render, write, sitemap, rss.
