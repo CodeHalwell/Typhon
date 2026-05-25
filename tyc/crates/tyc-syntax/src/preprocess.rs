@@ -2238,7 +2238,12 @@ pub fn validate_question_ops(source: &str) -> Vec<QuestionOpError> {
             }
 
             // Detect a function definition and push its return type onto the stack.
-            if trimmed.starts_with("def ") || trimmed.starts_with("async def ") {
+            //
+            // `pub` is a visibility modifier that stacks with `def` / `async def`;
+            // strip it so `pub def f() -> Result[..]: ... x?` is recognised as
+            // being inside a function (R2-1).
+            let after_pub = trimmed.strip_prefix("pub ").unwrap_or(trimmed);
+            if after_pub.starts_with("def ") || after_pub.starts_with("async def ") {
                 let ret_type = extract_return_type_text(code);
                 fn_stack.push((indent_len, ret_type));
             }
@@ -7231,6 +7236,45 @@ mod tests {
         assert!(
             errs.is_empty(),
             "multi-line sig with Result return must not error: {:?}",
+            errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn question_op_in_pub_def_result_function_is_valid() {
+        // R2-1: `pub def f() -> Result[T, E]: ... x?` must not be flagged
+        // as "? operator used at module level". The `pub` modifier stacks
+        // with `def` and the validator must see through it.
+        let src = "pub def parse(s: str) -> Result[int, str]:\n    val n = int(s)?\n    return Ok(n)\n";
+        let errs = validate_question_ops(src);
+        assert!(
+            errs.is_empty(),
+            "pub def with Result return must accept `?`: {:?}",
+            errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn question_op_in_pub_async_def_result_function_is_valid() {
+        // R2-1: same fix must apply to `pub async def`.
+        let src = "pub async def fetch() -> Result[int, str]:\n    val n = io()?\n    return Ok(n)\n";
+        let errs = validate_question_ops(src);
+        assert!(
+            errs.is_empty(),
+            "pub async def with Result return must accept `?`: {:?}",
+            errs.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn question_op_in_pub_def_none_function_is_error() {
+        // R2-1: the `pub` strip must not also lose the return-type check.
+        let src = "pub def run() -> None:\n    val x = load()?\n";
+        let errs = validate_question_ops(src);
+        assert_eq!(
+            errs.len(),
+            1,
+            "pub def returning None must still reject `?`: {:?}",
             errs.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
     }
