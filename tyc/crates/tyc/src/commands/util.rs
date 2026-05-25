@@ -20,6 +20,10 @@ use crate::config::TyphonConfig;
 ///     class body).
 ///   - `"off"`: `MethodInClassBody` is dropped entirely — useful for
 ///     codebases still mid-migration to the `impl`-only form.
+/// - `stub-check`:
+///   - `"error"` (default): `StubMismatch` diagnostics are promoted to errors.
+///   - `"warn"`: `StubMismatch` diagnostics remain warnings.
+///   - `"off"`: `StubMismatch` diagnostics are dropped entirely.
 ///
 /// All other warnings are passed through unchanged. The function consumes the
 /// input `Diagnostics` to avoid cloning individual diagnostics.
@@ -30,10 +34,15 @@ pub fn apply_strictness(diags: Diagnostics, config: &TyphonConfig) -> Diagnostic
     let require_with_default = require_with == "warn" || require_with.is_empty();
     let blocking_in_async = config.strictness.blocking_in_async.as_str();
     let blocking_in_async_default = blocking_in_async == "warn" || blocking_in_async.is_empty();
+    let stub_check = config.strictness.stub_check.as_str();
+    // Default is "error" — stub drift is promoted to error by default.
+    // Only skip reclassification when the setting is explicitly "warn" or empty.
+    let stub_check_default = stub_check == "warn" || stub_check.is_empty();
     if !promote_unused_import
         && (methods_in_class_body == "warn" || methods_in_class_body.is_empty())
         && require_with_default
         && blocking_in_async_default
+        && stub_check_default
     {
         return diags;
     }
@@ -62,6 +71,13 @@ pub fn apply_strictness(diags: Diagnostics, config: &TyphonConfig) -> Diagnostic
                 "off" => {} // drop the diagnostic entirely
                 "error" => new_diags.push_error(warn),
                 _ => new_diags.push_warning(warn),
+            }
+        } else if matches!(warn, TycError::StubMismatch { .. }) {
+            match stub_check {
+                "off" => {} // drop the diagnostic entirely
+                "warn" => new_diags.push_warning(warn),
+                // "error" (default) and any other value → promote to error
+                _ => new_diags.push_error(warn),
             }
         } else {
             new_diags.push_warning(warn);
@@ -309,5 +325,74 @@ mod tests {
             out.errors()[0],
             TycError::MethodInClassBody { .. }
         ));
+    }
+
+    // ── stub-check tests ──────────────────────────────────────────────────
+
+    fn stub_mismatch_warning() -> TycError {
+        TycError::stub_mismatch(
+            "missing in implementation: foo",
+            "<test>",
+            "stub content",
+            0,
+            1,
+        )
+    }
+
+    #[test]
+    fn stub_check_error_promotes_stub_mismatch_to_error() {
+        // Default: stub-check = "error" → StubMismatch promoted to error.
+        let mut diags = Diagnostics::new();
+        diags.push_warning(stub_mismatch_warning());
+        let config = TyphonConfig::default(); // stub_check defaults to "error"
+        let out = apply_strictness(diags, &config);
+        assert_eq!(out.errors().len(), 1, "StubMismatch must be an error with stub-check=error");
+        assert_eq!(out.warning_count(), 0);
+        assert!(matches!(out.errors()[0], TycError::StubMismatch { .. }));
+    }
+
+    #[test]
+    fn stub_check_warn_keeps_stub_mismatch_as_warning() {
+        let mut diags = Diagnostics::new();
+        diags.push_warning(stub_mismatch_warning());
+        let mut config = TyphonConfig::default();
+        config.strictness.stub_check = "warn".into();
+        let out = apply_strictness(diags, &config);
+        assert_eq!(out.errors().len(), 0, "StubMismatch must stay warning with stub-check=warn");
+        assert_eq!(out.warning_count(), 1);
+        assert!(matches!(out.warnings()[0], TycError::StubMismatch { .. }));
+    }
+
+    #[test]
+    fn stub_check_off_drops_stub_mismatch() {
+        let mut diags = Diagnostics::new();
+        diags.push_warning(stub_mismatch_warning());
+        let mut config = TyphonConfig::default();
+        config.strictness.stub_check = "off".into();
+        let out = apply_strictness(diags, &config);
+        assert_eq!(out.errors().len(), 0, "StubMismatch must be dropped with stub-check=off");
+        assert_eq!(out.warning_count(), 0);
+    }
+
+    #[test]
+    fn stub_check_does_not_affect_other_warnings() {
+        // stub-check = "off" must not drop unrelated warnings.
+        let mut diags = Diagnostics::new();
+        diags.push_warning(stub_mismatch_warning());
+        diags.push_warning(method_in_class_body_warning());
+        let mut config = TyphonConfig::default();
+        config.strictness.stub_check = "off".into();
+        let out = apply_strictness(diags, &config);
+        // StubMismatch dropped; MethodInClassBody is warn by default → kept
+        // (stub-check=error is the default so we also need to neutralise the
+        // normal stub promotion; with stub-check=off the stub is gone; the
+        // method warning stays as warning because methods-in-class-body="warn").
+        assert_eq!(out.errors().len(), 0);
+        assert_eq!(
+            out.warning_count(),
+            1,
+            "MethodInClassBody warning must survive stub-check=off"
+        );
+        assert!(matches!(out.warnings()[0], TycError::MethodInClassBody { .. }));
     }
 }

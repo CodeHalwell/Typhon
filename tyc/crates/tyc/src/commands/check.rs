@@ -304,7 +304,11 @@ pub fn run(args: CheckArgs) -> Result<()> {
                                 StubTestKind::MissingInStub => "missing in stub",
                                 StubTestKind::SignatureMismatch => "signature mismatch",
                             };
-                            diags.push_error(TycError::stub_mismatch(
+                            // Push as a warning so that `apply_strictness`
+                            // can promote it to an error (`stub-check =
+                            // "error"`, the default), keep it as a warning
+                            // (`"warn"`), or drop it (`"off"`).
+                            diags.push_warning(TycError::stub_mismatch(
                                 format!("{label}: {}", finding.message),
                                 path.display().to_string(),
                                 source.clone(),
@@ -314,7 +318,7 @@ pub fn run(args: CheckArgs) -> Result<()> {
                         }
                     }
                     Err(e) => {
-                        diags.push_error(TycError::stub_mismatch(
+                        diags.push_warning(TycError::stub_mismatch(
                             format!("could not diff stub against implementation: {e}"),
                             path.display().to_string(),
                             source.clone(),
