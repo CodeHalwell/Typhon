@@ -1320,12 +1320,36 @@ fn substitute_typevars(ty: &Type, bindings: &std::collections::HashMap<String, T
                 .map(|x| substitute_typevars(x, bindings))
                 .collect(),
         ),
-        Type::Generic(h, args) => Type::Generic(
-            h.clone(),
-            args.iter()
-                .map(|x| substitute_typevars(x, bindings))
-                .collect(),
-        ),
+        // When a TypeConstructor was bound (e.g. `F → list` from a prior
+        // `bind_typevars(TypeConstructor("F", 1), Generic("list", …))` call),
+        // the return type `F[B]` is represented as `Generic("F", [TypeVar("B")])`.
+        // Without head substitution, the `Generic("F", …)` node would survive
+        // the substitution pass unchanged, producing invalid Python like `F[int]`
+        // instead of `list[int]`.
+        //
+        // When `h` is found in bindings as a `Class(c)` we replace the head
+        // with `c` and recursively substitute the arguments.  Any other binding
+        // kind (TypeVar, Generic, …) is deliberately ignored — binding a head to
+        // a non-class would require a more complex type application that isn't
+        // representable in the current Type enum.
+        Type::Generic(h, args) => {
+            let resolved_head = match bindings.get(h.as_str()) {
+                Some(Type::Class(new_head)) => new_head.clone(),
+                _ => h.clone(),
+            };
+            Type::Generic(
+                resolved_head,
+                args.iter()
+                    .map(|x| substitute_typevars(x, bindings))
+                    .collect(),
+            )
+        }
+        // Bare TypeConstructor in return position (e.g. `def f[F[_]](x: F) -> F`):
+        // substitute it with the bound class when available.
+        Type::TypeConstructor(name, arity) => match bindings.get(name.as_str()) {
+            Some(Type::Class(c)) => Type::Class(c.clone()),
+            _ => Type::TypeConstructor(name.clone(), *arity),
+        },
         Type::Function {
             params,
             ret,
@@ -14047,5 +14071,122 @@ def f() -> int:
 
         // After binding, F should be bound to "list"
         assert_eq!(bindings.get("F"), Some(&Type::Class("list".to_string())));
+    }
+
+    // ── HKT substitute_typevars head-substitution tests ──────────────────
+    //
+    // These tests verify the `substitute_typevars` fix for HKT: when a
+    // TypeConstructor name (e.g. "F") is bound to a Class via `bind_typevars`
+    // (e.g. `F → list` from matching `TypeConstructor("F", 1)` against
+    // `Generic("list", [Int])`), the return type `F[B]` (which is
+    // `Generic("F", [TypeVar("B")])`) must be rewritten to `list[B]`
+    // (and further to `list[int]` if B is also bound).
+    //
+    // All tests use the public `bind_typevars_and_substitute` API so they
+    // don't depend on the visibility of the internal `substitute_typevars`
+    // helper.
+
+    #[test]
+    fn hkt_substitute_bound_constructor_head_in_return_generic() {
+        // `def f[F[_]](fa: F[int]) -> F[str]` with actual `list[int]`.
+        // Formal TypeConstructor("F",1) against Generic("list",[Int]) → F→list.
+        // Return Generic("F",[Str]) should resolve to Generic("list",[Str]).
+        use crate::{bind_typevars_and_substitute, Type};
+
+        let formal_params = vec![Type::TypeConstructor("F".to_string(), 1)];
+        let actual_args = vec![Type::Generic("list".to_string(), vec![Type::Int])];
+        let return_type = Type::Generic("F".to_string(), vec![Type::Str]);
+
+        let result = bind_typevars_and_substitute(&formal_params, &actual_args, &return_type);
+        assert_eq!(
+            result,
+            Type::Generic("list".to_string(), vec![Type::Str]),
+            "return Generic(F,[Str]) must resolve to Generic(list,[Str]) when F→list; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn hkt_substitute_replaces_head_and_arg_typevar() {
+        // `def f[F[_]](fa: F[_], a: A) -> F[A]` with actuals `list[int]`, `str`.
+        // Two separate formal/actual pairs: TypeConstructor("F",1)→list and
+        // TypeVar("A")→Str.  Return Generic("F",[TypeVar("A")]) must become
+        // Generic("list",[Str]).
+        use crate::{bind_typevars_and_substitute, Type};
+
+        let formal_params = vec![
+            Type::TypeConstructor("F".to_string(), 1),
+            Type::TypeVar("A".to_string()),
+        ];
+        let actual_args = vec![
+            Type::Generic("list".to_string(), vec![Type::Int]),
+            Type::Str,
+        ];
+        let return_type = Type::Generic("F".to_string(), vec![Type::TypeVar("A".to_string())]);
+
+        let result = bind_typevars_and_substitute(&formal_params, &actual_args, &return_type);
+        assert_eq!(
+            result,
+            Type::Generic("list".to_string(), vec![Type::Str]),
+            "return Generic(F,[A]) must become Generic(list,[Str]); got {result:?}"
+        );
+    }
+
+    #[test]
+    fn hkt_bare_type_constructor_in_return_resolves_to_class() {
+        // `def f[F[_]](fa: F) -> F` with actual `list[int]`.
+        // The return type is a bare TypeConstructor (not applied); it should
+        // resolve to Class("list") after substitution.
+        use crate::{bind_typevars_and_substitute, Type};
+
+        let formal_params = vec![Type::TypeConstructor("F".to_string(), 1)];
+        let actual_args = vec![Type::Generic("list".to_string(), vec![Type::Int])];
+        let return_type = Type::TypeConstructor("F".to_string(), 1);
+
+        let result = bind_typevars_and_substitute(&formal_params, &actual_args, &return_type);
+        assert_eq!(
+            result,
+            Type::Class("list".to_string()),
+            "bare TypeConstructor return must resolve to Class(list); got {result:?}"
+        );
+    }
+
+    #[test]
+    fn hkt_concrete_generic_head_unchanged_without_binding() {
+        // A concrete `list[int]` in the return type must NOT be modified when
+        // there are no TypeConstructor bindings — the common case.
+        use crate::{bind_typevars_and_substitute, Type};
+
+        let formal_params = vec![Type::TypeVar("T".to_string())];
+        let actual_args = vec![Type::Int];
+        let return_type = Type::Generic("list".to_string(), vec![Type::Int]);
+
+        let result = bind_typevars_and_substitute(&formal_params, &actual_args, &return_type);
+        assert_eq!(
+            result,
+            Type::Generic("list".to_string(), vec![Type::Int]),
+            "concrete Generic head must survive unchanged; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn hkt_non_class_binding_does_not_replace_generic_head() {
+        // When the binding for the head name is NOT a Class (e.g. TypeVar → Int),
+        // the Generic head must NOT be replaced.  In practice this means a
+        // TypeVar "T" bound to Int cannot clobber a Generic head "T".
+        use crate::{bind_typevars_and_substitute, Type};
+
+        // Force `T → Int` by matching TypeVar("T") against Int.
+        let formal_params = vec![Type::TypeVar("T".to_string())];
+        let actual_args = vec![Type::Int];
+        // Return type has Generic("T", [Str]) — T is Int not a Class, so head stays.
+        let return_type = Type::Generic("T".to_string(), vec![Type::Str]);
+
+        let result = bind_typevars_and_substitute(&formal_params, &actual_args, &return_type);
+        // T was bound to Int (not a Class), so the Generic head "T" must survive.
+        assert_eq!(
+            result,
+            Type::Generic("T".to_string(), vec![Type::Str]),
+            "non-Class binding must not replace Generic head; got {result:?}"
+        );
     }
 }
