@@ -11,6 +11,36 @@ remaining ergonomics gaps that survived v0.6.0 / v0.6.1.
 
 ### Fixed — compiler
 
+- **`tyc-types`: `with cm() as r:` / `async with cm() as r:` now types
+  `r` from `__enter__` / `__aenter__` methods and from
+  `@contextmanager` / `@asynccontextmanager`-decorated generator
+  factories (R3-3).** Previously `r` was bound to `Type::Unknown` in
+  every shape, so `r.no_such_attr` and `r` flowing into a typed slot
+  both slipped past the checker (Unknown is assignable to anything).
+  Three lookup paths in priority order:
+  1. **Decorator-aware yield-type inference** — a function decorated
+     with `@contextmanager` or `@asynccontextmanager` is pre-scanned
+     for its first `yield` expression; calling that function in a
+     `with` / `async with` head binds the as-target to the yield
+     type. Covers the canonical
+     `@asynccontextmanager async def session() -> AsyncIterator[Session]:
+     yield Session(...)` factory shape that all five Round-3 apps
+     wanted to use but had to type-erase to keep checking.
+  2. **Concrete-class `__enter__` / `__aenter__`** — a user-defined
+     `class Lock:` with `def __enter__(self) -> Lock: return self`
+     now propagates the method's return type to `r`.
+  3. **Fall-through to `Unknown`** when neither path resolves, so the
+     stdlib `with open(p) as f:` shape (whose `__enter__` lives behind
+     a stub layer that doesn't carry annotations today) keeps its
+     permissive behaviour. No regressions in the apps.
+
+  The decorator pre-scan only resolves literal / `Class(...)`
+  constructor / `None` yield payloads — yielding a local binding
+  (`s = Session(); yield s`) still leaves `r` as Unknown because the
+  pre-scan runs before the body's local-typing pass. Authors can work
+  around with a re-annotation inside the body
+  (`let typed: Session = r`); a full fix would re-infer the yield at
+  the consumer site with the factory's local env.
 - **`tyc-types`: `await` on a `Callable[..., Awaitable[T]]` /
   `Callable[..., Coroutine[Y, S, T]]` call now unwraps to `T`
   (R3-1).** The canonical async-middleware shape across

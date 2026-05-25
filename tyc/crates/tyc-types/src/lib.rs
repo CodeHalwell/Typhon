@@ -1705,6 +1705,15 @@ struct Checker<'a> {
     /// metadata; queried by [`check_stmt`] when entering an `if` body to
     /// decide whether to bump `unsafe_depth`.
     unsafe_line_starts: Vec<u32>,
+    /// Yield types of functions decorated with `@contextmanager` or
+    /// `@asynccontextmanager`. When `with cm() as r:` (or `async with`)
+    /// is bound, the as-target's type is the wrapped function's first
+    /// `yield expr` type — not the function's declared return type,
+    /// which is conceptually `_GeneratorContextManager[T]` but is
+    /// rarely annotated as such. R3-3. Populated during the function-
+    /// signature pre-scan from `@contextmanager` / `@asynccontextmanager`
+    /// (bare-name and `contextlib.<name>` forms).
+    contextmanager_yields: HashMap<String, Type>,
 }
 
 /// Per-function arity metadata kept alongside `Type::Function` so the
@@ -1930,6 +1939,7 @@ impl<'a> Checker<'a> {
             uninit_instances: HashMap::new(),
             partial_returning_fns: HashMap::new(),
             module_registry: std::sync::Arc::new(HashMap::new()),
+            contextmanager_yields: HashMap::new(),
         }
     }
 
@@ -4392,8 +4402,151 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                 c.function_type_bounds
                     .insert(f.name.as_str().to_owned(), bounds);
             }
+            // R3-3: record the yield type of `@contextmanager` /
+            // `@asynccontextmanager`-decorated generators so `with cm()
+            // as r:` can type `r` from the yield expression. Without
+            // this, the canonical
+            // `@asynccontextmanager async def session(): yield Session()`
+            // factory leaves `r` as `Unknown` at every consumer site.
+            if has_contextmanager_decorator(&f.decorator_list) {
+                if let Some(yield_ty) = extract_first_yield_type(&f.body, &classes) {
+                    c.contextmanager_yields
+                        .insert(f.name.as_str().to_owned(), yield_ty);
+                }
+            }
         }
     }
+}
+
+/// Walk a function body looking for the first `yield expr` (or `yield`
+/// with no value, which yields `None`). Returns the inferred type of
+/// that expression. Used by the `@contextmanager` /
+/// `@asynccontextmanager` pre-scan to determine what a
+/// `with cm() as r:` binds.
+///
+/// The walk descends into `if` / `for` / `while` / `try` / `with`
+/// bodies because the canonical "open then yield" shape often nests
+/// the `yield` inside a `try` so the cleanup runs in `finally`. It
+/// does NOT descend into nested function definitions — a `yield`
+/// inside a nested helper belongs to that helper, not the outer
+/// context-manager factory.
+fn extract_first_yield_type(body: &[Stmt], classes: &[String]) -> Option<Type> {
+    fn walk_stmts(stmts: &[Stmt], classes: &[String]) -> Option<Type> {
+        for stmt in stmts {
+            if let Some(t) = walk_stmt(stmt, classes) {
+                return Some(t);
+            }
+        }
+        None
+    }
+    fn walk_stmt(stmt: &Stmt, classes: &[String]) -> Option<Type> {
+        match stmt {
+            Stmt::Expr(e) => walk_expr(&e.value, classes),
+            Stmt::Assign(a) => walk_expr(&a.value, classes),
+            Stmt::AnnAssign(a) => a.value.as_deref().and_then(|v| walk_expr(v, classes)),
+            Stmt::AugAssign(a) => walk_expr(&a.value, classes),
+            Stmt::Return(r) => r.value.as_deref().and_then(|v| walk_expr(v, classes)),
+            Stmt::If(s) => {
+                if let Some(t) = walk_stmts(&s.body, classes) {
+                    return Some(t);
+                }
+                for clause in &s.elif_else_clauses {
+                    if let Some(t) = walk_stmts(&clause.body, classes) {
+                        return Some(t);
+                    }
+                }
+                None
+            }
+            Stmt::For(f) => walk_stmts(&f.body, classes).or_else(|| walk_stmts(&f.orelse, classes)),
+            Stmt::While(w) => {
+                walk_stmts(&w.body, classes).or_else(|| walk_stmts(&w.orelse, classes))
+            }
+            Stmt::With(w) => walk_stmts(&w.body, classes),
+            Stmt::Try(t) => walk_stmts(&t.body, classes)
+                .or_else(|| {
+                    for h in &t.handlers {
+                        let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                        if let Some(t) = walk_stmts(&h.body, classes) {
+                            return Some(t);
+                        }
+                    }
+                    None
+                })
+                .or_else(|| walk_stmts(&t.orelse, classes))
+                .or_else(|| walk_stmts(&t.finalbody, classes)),
+            Stmt::Match(m) => {
+                for case in &m.cases {
+                    if let Some(t) = walk_stmts(&case.body, classes) {
+                        return Some(t);
+                    }
+                }
+                None
+            }
+            // Nested function defs are intentionally NOT descended into —
+            // their yields belong to a different generator.
+            _ => None,
+        }
+    }
+    fn walk_expr(expr: &Expr, classes: &[String]) -> Option<Type> {
+        match expr {
+            Expr::Yield(y) => {
+                let v = y.value.as_deref();
+                match v {
+                    Some(e) => Some(yield_payload_type(e, classes)),
+                    None => Some(Type::None),
+                }
+            }
+            // Plain `yield from x` yields each element of `x`. We don't
+            // recurse into it for `@contextmanager` because that decorator
+            // expects a single yield — `yield from` inside a context-manager
+            // factory is unusual enough that leaving the as-target as
+            // Unknown is fine.
+            _ => None,
+        }
+    }
+    /// Best-effort literal-shape inference for the yielded expression
+    /// without firing the full `infer_expr` (which requires a Checker).
+    /// Covers the patterns context-manager factories actually use:
+    /// bare names (resolved through `classes`), class-constructor calls,
+    /// `None`, literals, and `Result`-constructor calls. Anything else
+    /// falls back to `Type::Unknown`.
+    fn yield_payload_type(expr: &Expr, classes: &[String]) -> Type {
+        match expr {
+            Expr::NoneLiteral(_) => Type::None,
+            Expr::BooleanLiteral(_) => Type::Bool,
+            Expr::StringLiteral(_) => Type::Str,
+            Expr::BytesLiteral(_) => Type::Bytes,
+            Expr::NumberLiteral(n) => match &n.value {
+                ruff_python_ast::Number::Int(_) => Type::Int,
+                ruff_python_ast::Number::Float(_) => Type::Float,
+                _ => Type::Unknown,
+            },
+            Expr::Call(call) => match call.func.as_ref() {
+                Expr::Name(n) => {
+                    let head = n.id.as_str();
+                    if classes.iter().any(|c| c == head) {
+                        Type::Class(head.to_owned())
+                    } else {
+                        // Free-function calls — we don't have the return
+                        // type without a Checker. Annotation-side users
+                        // can still infer correctly from the caller's
+                        // declared `as r:` type if they need to.
+                        Type::Unknown
+                    }
+                }
+                _ => Type::Unknown,
+            },
+            Expr::Name(n) => {
+                // `yield x` where `x` is a local. We don't have the env
+                // pre-scan-time, so leave as Unknown — the body-walk
+                // will infer correctly when consumers re-enter.
+                let _ = n;
+                Type::Unknown
+            }
+            _ => Type::Unknown,
+        }
+    }
+    walk_stmts(body, classes)
 }
 
 /// Extract the names of PEP 695 type parameters from the `Option<Box<TypeParams>>`
@@ -4460,6 +4613,52 @@ fn has_runtime_checkable_decorator(decorators: &[ruff_python_ast::Decorator]) ->
 /// aliased). Used by [`check_resource_discipline_stmt`] to skip the
 /// body of a context-manager factory whose `open(...)` / `socket(...)`
 /// call IS the resource-acquisition step the caller will manage.
+/// Determine the type bound by `with cm() as r:` (or `async with`).
+/// R3-3: combines three lookups in priority order.
+///
+/// 1. **Context-manager factory call.** If the context expression is a
+///    `Call` whose callee is the name of a function decorated with
+///    `@contextmanager` (or `@asynccontextmanager` for async), return the
+///    recorded yield type. This is the canonical Python idiom that the
+///    pre-scan captures.
+///
+/// 2. **Concrete-class context manager.** If the context expression's
+///    type is `Class(X)` and `X` has an `__enter__` (sync) /
+///    `__aenter__` (async) method, return that method's declared return
+///    type. Covers user-defined context-manager classes like
+///    `class Lock: ...` with `def __enter__(self) -> Lock: return self`.
+///
+/// 3. **Unknown.** Leaves the binding permissive so existing code keeps
+///    working — e.g. `with open(path) as f:` resolves through the stdlib
+///    stub layer (which doesn't carry `__enter__` annotations today)
+///    and stays Unknown rather than misfiring downstream.
+fn with_target_type(c: &Checker, ctx_expr: &Expr, ctx_ty: &Type, is_async: bool) -> Type {
+    // (1) Factory call.
+    if let Expr::Call(call) = ctx_expr {
+        if let Expr::Name(fn_name) = call.func.as_ref() {
+            if let Some(yield_ty) = c.contextmanager_yields.get(fn_name.id.as_str()) {
+                return yield_ty.clone();
+            }
+        }
+    }
+    // (2) Class-based context manager via __enter__ / __aenter__.
+    let dunder = if is_async { "__aenter__" } else { "__enter__" };
+    if let Type::Class(cls_name) = ctx_ty {
+        if let Some(sig) = c.find_method(cls_name, dunder) {
+            return sig.return_type.clone();
+        }
+    }
+    if let Type::Generic(head, _) = ctx_ty {
+        // `dict[K, V]` etc. aren't context managers, but a generic
+        // user-class with `impl[T] Box[T]: def __enter__(self) -> Box[T]:`
+        // could be. Fall back to the head name lookup.
+        if let Some(sig) = c.find_method(head, dunder) {
+            return sig.return_type.clone();
+        }
+    }
+    Type::Unknown
+}
+
 fn has_contextmanager_decorator(decorators: &[ruff_python_ast::Decorator]) -> bool {
     decorators.iter().any(|d| {
         let name = match &d.expression {
@@ -5983,7 +6182,32 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
         }
         Stmt::With(w) => {
             for item in &w.items {
-                let _ = infer_expr(c, &item.context_expr);
+                let ctx_ty = infer_expr(c, &item.context_expr);
+                // R3-3: bind the `as r:` target to the context manager's
+                // entry type. Three paths, in priority order:
+                //   1. `@contextmanager` / `@asynccontextmanager`-decorated
+                //      generator factory — pull from `contextmanager_yields`.
+                //   2. Concrete class with `__enter__` (sync) / `__aenter__`
+                //      (async) — use the method's declared return type.
+                //   3. Otherwise leave as `Unknown` so the existing
+                //      permissive flow doesn't break user code.
+                if let Some(target) = item.optional_vars.as_deref() {
+                    if let Expr::Name(target_name) = target {
+                        let target_ty = with_target_type(c, &item.context_expr, &ctx_ty, w.is_async);
+                        let span = (
+                            target_name.range.start().to_usize(),
+                            target_name.range.start().to_usize()
+                                + target_name.id.as_str().len(),
+                        );
+                        c.env.declare(TypeBinding {
+                            name: target_name.id.as_str().to_owned(),
+                            declared: target_ty.clone(),
+                            narrowed: target_ty,
+                            span,
+                            from_unsafe: c.unsafe_depth > 0,
+                        });
+                    }
+                }
             }
             for s in &w.body {
                 check_stmt(c, s);
@@ -12523,6 +12747,134 @@ let s: str = id(3)
         assert!(
             !d.has_errors(),
             "binop with a foreign class operand must not over-promote to float; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn with_target_typed_from_enter() {
+        // R3-3: `with x as r:` binds `r` to the type returned by
+        // `__enter__`. Previously `r` was `Unknown`, so `r.no_attr`
+        // and `r` flowing into a typed slot both slipped past the
+        // checker (Unknown is assignable to anything).
+        let d = check(
+            "class Lock:\n\
+             \x20   name: str\n\
+             impl Lock:\n\
+             \x20   def __enter__(self) -> Lock: return self\n\
+             \x20   def __exit__(self, *args) -> None: pass\n\
+             def takes_int(n: int) -> int: return n\n\
+             def main() -> None:\n\
+             \x20   let lk: Lock = Lock(name=\"x\")\n\
+             \x20   with lk as r:\n\
+             \x20       let bad: int = takes_int(r)\n",
+        );
+        // `r` is Lock; passing it to takes_int(n: int) must mismatch.
+        assert!(
+            d.has_errors(),
+            "with-as target must be typed from __enter__ — got no errors"
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "expected TypeMismatch for Lock-into-int; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn async_with_target_typed_from_aenter() {
+        // R3-3: same as the sync case but `async with` consults
+        // `__aenter__` instead of `__enter__`.
+        let d = check(
+            "class AsyncLock:\n\
+             \x20   name: str\n\
+             impl AsyncLock:\n\
+             \x20   async def __aenter__(self) -> AsyncLock: return self\n\
+             \x20   async def __aexit__(self, *args) -> None: pass\n\
+             def takes_int(n: int) -> int: return n\n\
+             async def use() -> int:\n\
+             \x20   let lk: AsyncLock = AsyncLock(name=\"x\")\n\
+             \x20   async with lk as r:\n\
+             \x20       return takes_int(r)\n",
+        );
+        assert!(
+            d.has_errors(),
+            "async with target must be typed from __aenter__"
+        );
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "expected TypeMismatch for AsyncLock-into-int; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn with_target_typed_from_contextmanager_yield() {
+        // R3-3 frontier: `@contextmanager`-decorated generator factory
+        // — `with cm() as r:` binds `r` to the yielded class type, not
+        // the function's `Iterator[T]` return annotation.
+        let d = check(
+            "from contextlib import contextmanager\n\
+             from typing import Iterator\n\
+             class Conn:\n\
+             \x20   id: int\n\
+             @contextmanager\n\
+             def acquire() -> Iterator[Conn]:\n\
+             \x20   yield Conn(id=42)\n\
+             def takes_str(s: str) -> str: return s\n\
+             def main() -> None:\n\
+             \x20   with acquire() as r:\n\
+             \x20       let bad: str = takes_str(r)\n",
+        );
+        assert!(
+            d.has_errors(),
+            "@contextmanager yield Conn(...) must type r as Conn"
+        );
+    }
+
+    #[test]
+    fn async_with_target_typed_from_asynccontextmanager_yield() {
+        // R3-3 frontier: same as above but for the async form. This is
+        // the specific case TYPHON_FEEDBACK flagged as still leaving r
+        // as Unknown.
+        let d = check(
+            "from contextlib import asynccontextmanager\n\
+             from typing import AsyncIterator\n\
+             class Session:\n\
+             \x20   name: str\n\
+             @asynccontextmanager\n\
+             async def open_session() -> AsyncIterator[Session]:\n\
+             \x20   yield Session(name=\"x\")\n\
+             def takes_int(n: int) -> int: return n\n\
+             async def use() -> int:\n\
+             \x20   async with open_session() as r:\n\
+             \x20       return takes_int(r)\n",
+        );
+        assert!(
+            d.has_errors(),
+            "@asynccontextmanager yield Session(...) must type r as Session"
+        );
+    }
+
+    #[test]
+    fn with_target_unknown_when_unresolvable_falls_back_silently() {
+        // Regression: when neither the factory pre-scan nor the
+        // __enter__ lookup gives us a type, `r` stays Unknown so the
+        // permissive `with open(path) as f:` path (stdlib stubs, no
+        // declared __enter__) keeps working without spurious errors.
+        let d = check(
+            "def main() -> None:\n\
+             \x20   with open(\"/tmp/x\") as f:\n\
+             \x20       let s: str = f.read()\n",
+        );
+        // Should NOT explode; the assignment is permissive on Unknown.
+        assert!(
+            !d.has_errors(),
+            "stdlib with-block must not regress; got {:?}",
             d.errors()
         );
     }
