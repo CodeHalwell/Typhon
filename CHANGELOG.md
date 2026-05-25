@@ -4,6 +4,7 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+<<<<<<< HEAD
 ## Unreleased
 
 Carry-over sweep from the Round-3 apps-feedback campaign. Targets the
@@ -159,6 +160,50 @@ remaining ergonomics gaps that survived v0.6.0 / v0.6.1.
   diagnostic — the whole point of `newtype` is that cross-axis math
   must be opted in to. Six new `newtype_arith_*` regression tests
   guard the rule.
+
+### Fixed — checker (also from main's Round-3 sweep)
+
+- **R3-9: ternary `body if test else orelse` now narrows just like
+  `if`/`else`.** `isinstance(x, T)` and `x is not None` refine `x`
+  on the truthy side (and the negated form on the falsy side) inside
+  the expression form, matching the statement-level behaviour.
+- **R3-11: class field defaults must order non-default fields before
+  defaulted ones.** The synthesised `__init__` follows declaration
+  order, and Python rejects a non-default parameter after a default
+  one — left unchecked, the class definition blew up at *import*
+  time with a misleading `TypeError`. New diagnostic
+  `tyc::field_default_ordering` catches this at check time.
+- **R3-15: cross-module generic method dispatch propagates class
+  TypeVars.** `s: Stream[int].map(f)` now records
+  `Callable[[int], U]` as the expected parameter and returns
+  `Stream[U]` bound at the call site via the existing PEP 695
+  inference. Same fix benefits field access — `let r:
+  RecordEnv[int]; r.payload` is now `int`, not the bare `T`.
+
+### Fixed — resolver (from main's Round-3 sweep)
+
+- **R3-4: `from X import Y` inside `if`/`for`/`while`/`with`/`try`/
+  `match` arms now binds.** The parser already accepted it; the
+  resolver silently skipped nested imports.
+- **R3-5: sibling `if` / `elif` branches no longer trip
+  `no_block_shadow` for same-named `let` bindings.** The
+  per-branch drain/restore that already worked for `case` arms now
+  applies to `if` clauses too.
+
+### Fixed — syntax (from main's Round-3 sweep)
+
+- **R3-2: multi-line `go expr(...)` calls now parse.** Implicit line
+  continuation inside parens works everywhere else in Typhon.
+
+### Docs (from main's Round-3 sweep)
+
+- **R3-7: argparse-with-typed-dataclass-adapter pattern documented.**
+- **R3-10: parametric sealed unions documented.**
+- **R3-12: nested `def` and nested `from X import Y` sanctioned.**
+- **R3-13: nullary sealed-union variants documented as
+  `class Foo frozen: pass` with `case Foo():` matching.**
+
+## 0.6.1 — 2026-05-25
 
 Polish release on top of v0.6.0. Tightens the VS Code TextMate grammar
 around `let`-binding annotations and reorganises the build output

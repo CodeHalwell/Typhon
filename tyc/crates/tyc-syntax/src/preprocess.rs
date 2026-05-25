@@ -137,9 +137,11 @@ pub struct PreprocessResult {
     /// 0-based line indices where the source contained a `pub *`
     /// wildcard-re-export statement. Only legal in `__init__.ty`; the
     /// build orchestrator aggregates each direct-sibling module's
-    /// `pub_names` into a synthesised `from .sibling import …` block
-    /// at this position. Outside `__init__.ty` the build emits an
-    /// advice-level `tyc::pub_star_outside_init` diagnostic.
+    /// `pub_names` (and direct sub-packages' aggregated surfaces) into
+    /// a synthesised `from .sibling import …` block at this position.
+    /// Outside `__init__.ty` the build emits an advice-level
+    /// `tyc::pub_star_outside_init` diagnostic. (Carries line indices
+    /// rather than a bool so the diagnostic spans the exact marker.)
     pub pub_star_lines: Vec<usize>,
 }
 
@@ -795,7 +797,8 @@ fn strip_pub_prefixes(
         // entirely so the Python parser doesn't see it, and record the
         // line index so the build orchestrator can:
         //   - In `__init__.ty`: synthesise `from .sibling import …`
-        //     for each direct-sibling module's `pub` names.
+        //     for each direct-sibling module's `pub` names (and direct
+        //     sub-packages' aggregated surfaces).
         //   - In any other file: emit `tyc::pub_star_outside_init`.
         if is_pub_star_line(rest) {
             pub_star_lines.push(line_index);
@@ -5268,6 +5271,18 @@ fn render_gather_block(
 /// The pass leaves any other `go`-prefixed line alone so identifiers like
 /// `goto` aren't accidentally rewritten.
 pub fn expand_go_calls(source: &str) -> String {
+    // R3-2 (2026-05-25): fold multi-line `go fn(...)` calls onto a
+    // single line before the line-oriented expansion runs. Python
+    // permits implicit continuation across newlines inside any
+    // parenthesised expression — `go` is a Typhon-only surface form
+    // but reuses Python's expression grammar for the call, so multi-
+    // line argument lists should work the same as for a bare call.
+    // Without this pre-pass `expand_go_calls` sees only the opening
+    // `go fn(` half-line, `parse_go_call` rejects it (no trailing
+    // `)`), and the parser later surfaces a confusing error at the
+    // callee identifier rather than at the unterminated paren.
+    let joined = join_go_continuations(source);
+    let source = joined.as_str();
     let mut out = String::with_capacity(source.len());
     let mut in_string: Option<StringMode> = None;
     for line in source.split_inclusive('\n') {
@@ -5373,6 +5388,113 @@ fn parse_go_call(rest: &str) -> Option<(String, Option<String>)> {
         None => None,
     };
     Some((call_part.to_owned(), handle))
+}
+
+/// Fold continuation lines that belong to a multi-line `go fn(...)`
+/// call onto the line that opens the call, so the line-oriented
+/// `expand_go_calls` pass can match the whole expression in one go.
+///
+/// We start buffering when a line's first non-whitespace token is
+/// `go ` and the line ends with `paren_depth > 0`. Every subsequent
+/// line is glued onto the buffered prefix until parenthesis balance
+/// returns to zero. The original line terminator is preserved on the
+/// joined line so source maps still resolve to the opening line.
+///
+/// Lines that aren't part of a `go ...` continuation are emitted
+/// verbatim, leaving every other parser invariant intact.
+fn join_go_continuations(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut buffered: Option<(String, String)> = None; // (line, original terminator)
+    let mut paren_depth: i32 = 0;
+    let mut in_string: Option<StringMode> = None;
+
+    let flush = |buffered: &mut Option<(String, String)>, out: &mut String| {
+        if let Some((line, term)) = buffered.take() {
+            out.push_str(&line);
+            out.push_str(&term);
+        }
+    };
+
+    for line in source.split_inclusive('\n') {
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let terminator = &line[raw.len()..];
+
+        let pre_string = in_string;
+        let _ = scan_line_code_end(raw, &mut in_string);
+
+        // Inside a triple-quoted string — flush and emit verbatim.
+        if pre_string.is_some() {
+            flush(&mut buffered, &mut out);
+            out.push_str(line);
+            // Recompute paren_depth update for this line — but since
+            // we're inside a string literal, parens don't count. The
+            // post-line scan below handles it correctly because the
+            // `local_str` tracking mirrors `in_string`'s update.
+            continue;
+        }
+
+        if buffered.is_some() && paren_depth > 0 {
+            // Continuation of the buffered `go` line — glue the trimmed
+            // text on with a single space so existing tokenisation keeps
+            // working.
+            let trimmed = raw.trim_start();
+            if let Some((prev_line, prev_term)) = buffered.take() {
+                let joined = if trimmed.is_empty() {
+                    prev_line
+                } else {
+                    format!("{} {}", prev_line, trimmed)
+                };
+                buffered = Some((joined, prev_term));
+            }
+        } else {
+            // Flush any prior buffered line (its parens balanced — emit
+            // as-is so the existing `go` pass sees the joined form), and
+            // start a fresh buffer for this line.
+            flush(&mut buffered, &mut out);
+            buffered = Some((raw.to_owned(), terminator.to_owned()));
+        }
+
+        // Update paren_depth based on this line's raw bytes, skipping
+        // bytes inside string literals and after `#` comments.
+        let bytes = raw.as_bytes();
+        let mut local_str: Option<u8> = None;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if let Some(quote) = local_str {
+                if b == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                    continue;
+                }
+                if b == quote {
+                    local_str = None;
+                }
+                i += 1;
+                continue;
+            }
+            match b {
+                b'#' => break,
+                b'"' | b'\'' => local_str = Some(b),
+                b'(' | b'[' | b'{' => paren_depth += 1,
+                b')' | b']' | b'}' => paren_depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+
+        // Only keep buffering when the line we just consumed is itself
+        // a `go ...` opener (or a continuation of one). A buffered
+        // ordinary line that happens to be unterminated would not be a
+        // `go`, so flush it now and reset.
+        if let Some((line, _)) = buffered.as_ref() {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with("go ") || paren_depth <= 0 {
+                flush(&mut buffered, &mut out);
+            }
+        }
+    }
+    flush(&mut buffered, &mut out);
+    out
 }
 
 // ── `|>` pipe operator expansion ──────────────────────────────────────────────
@@ -6806,17 +6928,24 @@ mod tests {
     #[test]
     fn pub_star_records_line_and_strips_text() {
         // `pub *` is the wildcard re-export marker. The preprocessor
-        // must record its line index and leave a blank line behind so
-        // line numbers stay aligned for downstream source maps.
+        // must record its line index (so the build pass can anchor
+        // diagnostics) and leave a blank line behind so line numbers
+        // stay aligned for downstream source maps.
         let src = "pub *\npub def greet() -> str:\n    return \"hi\"\n";
         let result = preprocess(src);
         assert_eq!(result.pub_star_lines, vec![0]);
+        assert_eq!(result.pub_names, vec!["greet".to_owned()]);
         // The first line should be blank (the marker was stripped).
         let first_line = result.python_source.lines().next().unwrap_or("");
         assert!(
             first_line.trim().is_empty(),
             "pub * line should be blanked; got {:?}",
             first_line
+        );
+        assert!(
+            !result.python_source.contains("pub *"),
+            "`pub *` line must be stripped from the python source: {}",
+            result.python_source
         );
     }
 
@@ -6847,6 +6976,12 @@ mod tests {
         // is not a re-export marker.
         let src = "def f() -> None:\n    pub *\n";
         let result = preprocess(src);
+        assert!(result.pub_star_lines.is_empty());
+    }
+
+    #[test]
+    fn no_pub_star_means_empty_lines_vec() {
+        let result = preprocess("pub class Widget:\n    name: str\n");
         assert!(result.pub_star_lines.is_empty());
     }
 
@@ -8449,6 +8584,41 @@ def run() -> Result[str, str]:
         // `goto` (no space) must not trigger the rewrite.
         let out = expand_go_calls("goto = 1\n");
         assert_eq!(out, "goto = 1\n");
+    }
+
+    #[test]
+    fn go_multiline_call_lowers_to_spawn() {
+        // R3-2: implicit line continuation inside the call parens
+        // works for every other Python expression — `go` should not
+        // be an exception. The preprocessor folds the continuation
+        // lines onto the opener before the lowering pass runs.
+        let src = "async def f():\n    go fetch(\n        1,\n        2,\n        3,\n    )\n";
+        let out = expand_go_calls(src);
+        assert!(
+            out.contains("typhon_runtime.tasks.spawn(fetch(") && out.contains("1, 2, 3,"),
+            "multi-line spawn missing or args dropped: {out}"
+        );
+    }
+
+    #[test]
+    fn go_multiline_call_with_handle() {
+        let src = "async def f():\n    go fetch(\n        x,\n    ) -> fut\n";
+        let out = expand_go_calls(src);
+        assert!(
+            out.contains("let fut = typhon_runtime.tasks.spawn(fetch(") && out.contains("x,"),
+            "multi-line spawn with handle missing: {out}"
+        );
+    }
+
+    #[test]
+    fn go_join_leaves_unrelated_continuations_alone() {
+        // A non-`go` line with unbalanced parens must not be folded
+        // — only `go ...` openers trigger the join. The buffered
+        // line is flushed as-is when the depth-check decides it isn't
+        // a `go` continuation candidate.
+        let src = "let xs = [\n    1,\n    2,\n]\n";
+        let out = expand_go_calls(src);
+        assert_eq!(out, src);
     }
 
     // ── #2: multi-line guard ────────────────────────────────────────────

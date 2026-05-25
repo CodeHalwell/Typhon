@@ -87,4 +87,84 @@ written. The postprocessor restores `pub` last so it ends up at the
 front of any other modifier (`pub let`, `pub mut`, `pub model`,
 `pub frozen class`, …) on the same line.
 
+## Package-level re-export — `pub *` in `__init__.ty`
+
+By default, `pub` only affects the file it appears in: `pub class
+Widget:` in `mypkg/widget.ty` is reachable as `mypkg.widget.Widget`
+but not as `mypkg.Widget`. Multi-module packages typically hand-write
+`mypkg/__init__.ty` with the re-exports they want.
+
+Place a single `pub *` line in `mypkg/__init__.ty` and the build
+pipeline aggregates every sibling module's `pub` names into the
+package's emitted `__init__.py`:
+
+```ty
+# src/mypkg/__init__.ty
+pub *
+
+# Optional: package-level pub names live alongside the aggregated ones.
+pub let PACKAGE_VERSION: str = "0.1"
+```
+
+```ty
+# src/mypkg/widget.ty
+pub class Widget:
+    name: str
+
+pub def make_widget(n: str) -> Widget:
+    return Widget(name=n)
+```
+
+```ty
+# src/mypkg/util.ty
+pub def shout(s: str) -> str:
+    return s.upper()
+```
+
+Emitted `build/mypkg/__init__.py`:
+
+```python
+__all__ = ["PACKAGE_VERSION", "shout", "Widget", "make_widget"]
+
+PACKAGE_VERSION: str = "0.1"
+
+from .util import shout
+from .widget import Widget, make_widget
+```
+
+Downstream callers can now write `from mypkg import Widget, shout`
+without touching `__init__.ty` every time a sibling adds a new `pub`
+name.
+
+### Ordering
+
+Sibling submodules are aggregated in alphabetical order by basename so
+the emitted `__init__.py` is deterministic across runs and across
+platforms (where filesystem ordering varies).
+
+### Name collisions
+
+When two siblings export the same name, the first sibling (in
+alphabetical order) wins and the build pipeline emits a
+`pub_name_collision` warning telling the user which definition was
+kept. To pick the other one explicitly, remove `pub *` and write the
+re-exports by hand, or rename one of the colliding declarations.
+
+A name explicitly `pub`-declared in `__init__.ty` itself always
+overrides any sibling export of the same name — the package-level
+declaration is treated as the canonical definition.
+
+### Scope
+
+- `pub *` is honoured **only** in `__init__.ty`. The marker is
+  parsed and stripped in every `.ty` file, but outside `__init__.ty`
+  it has no effect and the build pipeline emits a warning that points
+  at the wrong-place use.
+- Aggregation is **direct siblings only** — sub-packages contribute
+  through their own `__init__.ty` if they opt in there too, so the
+  cascade is intentional rather than transitive.
+- The marker is **opt-in**. Packages without `pub *` keep the
+  previous (explicit) behaviour: `__init__.ty` is emitted unchanged
+  and only re-exports what the author wrote.
+
 See https://typhon.dev/lang/diagnostics/pub

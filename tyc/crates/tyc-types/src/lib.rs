@@ -4768,18 +4768,28 @@ fn with_target_type(c: &Checker, ctx_expr: &Expr, ctx_ty: &Type, is_async: bool)
         }
     }
     // (2) Class-based context manager via __enter__ / __aenter__.
+    // For `async with`, the return type of `__aenter__` may be either
+    // the payload `T` directly (Typhon convention when the method is
+    // declared as `async def __aenter__(self) -> T:`, which the
+    // checker tracks as `T`) or `Coroutine[..., T]` / `Awaitable[T]`
+    // (the structural shape some stubs use). Unwrap awaitable so the
+    // binding holds `T` either way.
     let dunder = if is_async { "__aenter__" } else { "__enter__" };
-    if let Type::Class(cls_name) = ctx_ty {
-        if let Some(sig) = c.find_method(cls_name, dunder) {
-            return sig.return_type.clone();
-        }
-    }
-    if let Type::Generic(head, _) = ctx_ty {
+    let cls_name = match ctx_ty {
+        Type::Class(name) => Some(name.as_str()),
         // `dict[K, V]` etc. aren't context managers, but a generic
         // user-class with `impl[T] Box[T]: def __enter__(self) -> Box[T]:`
         // could be. Fall back to the head name lookup.
-        if let Some(sig) = c.find_method(head, dunder) {
-            return sig.return_type.clone();
+        Type::Generic(head, _) => Some(head.as_str()),
+        _ => None,
+    };
+    if let Some(cls) = cls_name {
+        if let Some(sig) = c.find_method(cls, dunder) {
+            let ret = sig.return_type.clone();
+            if is_async {
+                return unwrap_awaitable(&ret).unwrap_or(ret);
+            }
+            return ret;
         }
     }
     Type::Unknown
@@ -4812,6 +4822,17 @@ fn has_contextmanager_decorator(decorators: &[ruff_python_ast::Decorator]) -> bo
 /// rather than landing as `Type::Unknown`.
 fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -> InterfaceShape {
     let mut shape = InterfaceShape::default();
+    // R3-15 (2026-05-25): the enclosing class's PEP 695 type
+    // parameters are in scope for every method body, so a method
+    // signature like `def map[U](self, f: Callable[[T], U])` needs
+    // to see `T` (from `class Stream[T]:` / `impl[T] Stream[T]:`)
+    // as a TypeVar — not as `Type::Class("T")`. Previously only the
+    // method's own `[U]` was passed to `type_from_annotation_*`,
+    // so unsubstituted `T` survived in the recorded signature and
+    // the new `Type::Generic` attribute-access arm had nothing to
+    // substitute against, leaving `Stream[int].map(f)` typed as
+    // `Stream[U]` (effectively `Stream[object]`).
+    let class_tps = type_param_names_from(cd.type_params.as_deref());
     for stmt in &cd.body {
         match stmt {
             // Ruff folds `async def` into `Stmt::FunctionDef` with `is_async = true`.
@@ -4829,8 +4850,20 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
                 } else {
                     method_arity_excluding_receiver(f.parameters.as_ref())
                 };
+                // Combine the class's type params with the method's
+                // own — both are in scope for the method's signature
+                // (R3-15). Class tps come first so they shadow a
+                // method-local tp of the same name only when one
+                // exists, which matches PEP 695's scope nesting.
+                let method_tps = type_param_names_from(f.type_params.as_deref());
+                let mut tps: Vec<String> = class_tps.clone();
+                for t in &method_tps {
+                    if !tps.contains(t) {
+                        tps.push(t.clone());
+                    }
+                }
                 let return_type = match f.returns.as_deref() {
-                    Some(r) => type_from_annotation(r, classes),
+                    Some(r) => type_from_annotation_with_params(r, classes, &tps),
                     None => Type::Unknown,
                 };
                 let is_property = f.decorator_list.iter().any(|d| match &d.expression {
@@ -4841,7 +4874,6 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
                     Expr::Attribute(a) => matches!(a.attr.as_str(), "property" | "cached_property"),
                     _ => false,
                 });
-                let tps = type_param_names_from(f.type_params.as_deref());
                 let full_arity = arity_info_from_parameters(f.parameters.as_ref(), classes, &tps);
                 // Drop the implicit receiver (`self` / `cls`) from the
                 // method's arity surface so call sites can match argument
@@ -4885,7 +4917,14 @@ fn collect_class_shape(cd: &ruff_python_ast::StmtClassDef, classes: &[String]) -
             }
             Stmt::AnnAssign(a) => {
                 if let Expr::Name(n) = a.target.as_ref() {
-                    let ty = type_from_annotation(&a.annotation, classes);
+                    // R3-15: same scope rule — `class RecordEnv[T]:
+                    // payload: T` needs `T` recognised as the
+                    // class's TypeVar so the field's recorded type
+                    // is `TypeVar("T")` and downstream attribute
+                    // access on `RecordEnv[int]` can substitute it
+                    // to `Int`. Without `class_tps`, the annotation
+                    // walker would coerce `T` to `Type::Class("T")`.
+                    let ty = type_from_annotation_with_params(&a.annotation, classes, &class_tps);
                     let name = n.id.as_str().to_owned();
                     if !shape.fields.contains_key(&name) {
                         shape.field_order.push(name.clone());
@@ -6018,6 +6057,46 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 _ => false,
             });
             if !is_pseudo && !is_protocol && !is_pydantic {
+                // R3-11 (2026-05-25): the synthesised `__init__`
+                // follows declaration order; Python rejects a
+                // non-default positional parameter after a default
+                // one (the parser already enforces this on free
+                // functions). Mirror that rule for class fields so
+                // the user sees the diagnostic at check time rather
+                // than at `import` time with a misleading
+                // `TypeError`. Pydantic models have separate field
+                // ordering semantics so the check is skipped for
+                // them; raw `class!` is checked too because its
+                // synthesised `__init__` follows the same rule.
+                let mut prior_default: Option<(String, &ruff_python_ast::StmtAnnAssign)> = None;
+                for s in &cd.body {
+                    if let Stmt::AnnAssign(a) = s {
+                        let Expr::Name(target) = a.target.as_ref() else {
+                            continue;
+                        };
+                        let name = target.id.as_str().to_owned();
+                        if a.value.is_some() {
+                            if prior_default.is_none() {
+                                prior_default = Some((name, a));
+                            }
+                        } else if let Some((prior, _)) = &prior_default {
+                            let span = (
+                                target.range.start().to_usize(),
+                                target.range.end().to_usize(),
+                            );
+                            let length = span.1.saturating_sub(span.0).max(1);
+                            c.diagnostics.push_error(TycError::field_default_ordering(
+                                class_name.to_owned(),
+                                name.clone(),
+                                prior.clone(),
+                                c.path.clone(),
+                                c.source,
+                                span.0,
+                                length,
+                            ));
+                        }
+                    }
+                }
                 let merged_methods_empty = c
                     .class_shapes
                     .get(class_name)
@@ -6312,14 +6391,17 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 // R3-3: bind the `as r:` target to the context manager's
                 // entry type. Three paths, in priority order:
                 //   1. `@contextmanager` / `@asynccontextmanager`-decorated
-                //      generator factory — pull from `contextmanager_yields`.
+                //      generator factory — pull from `contextmanager_yields`
+                //      (covers method-form factories too).
                 //   2. Concrete class with `__enter__` (sync) / `__aenter__`
                 //      (async) — use the method's declared return type.
                 //   3. Otherwise leave as `Unknown` so the existing
                 //      permissive flow doesn't break user code.
+                //
+                // Supersedes main's `with_item_bound_type` which only
+                // handled the `__enter__`/`__aenter__` cases.
                 if let Some(Expr::Name(target_name)) = item.optional_vars.as_deref() {
-                    let target_ty =
-                        with_target_type(c, &item.context_expr, &ctx_ty, w.is_async);
+                    let target_ty = with_target_type(c, &item.context_expr, &ctx_ty, w.is_async);
                     let span = (
                         target_name.range.start().to_usize(),
                         target_name.range.start().to_usize() + target_name.id.as_str().len(),
@@ -8308,6 +8390,39 @@ fn extract_generator_return_type(typ: &Type) -> Option<Type> {
     None
 }
 
+// `with_item_bound_type` (the previous main-side helper for `with`-as
+// typing) is superseded by `with_target_type`, which also handles the
+// `@contextmanager` / `@asynccontextmanager` generator-factory path.
+// See `Stmt::With` in `check_stmt`.
+
+/// Unwrap an awaitable surface type into the value it produces when
+/// `await`-ed. Used by the `Expr::Await` inference path so
+/// `await f(x)` where `f: Callable[..., Awaitable[T]]` types as `T`
+/// rather than `Awaitable[T]`. Recognises:
+///
+/// - `Awaitable[T]` → `T`
+/// - `Coroutine[Y, S, T]` → `T` (the third parameter is the send/return
+///   payload, matching `typing.Coroutine`'s shape)
+/// - `Coroutine[T]` (one-arg shorthand) → `T`
+///
+/// Returns `None` for anything else so the caller keeps the original
+/// inferred type. This is deliberately conservative — direct
+/// `async def`-typed call returns are already lowered upstream (the
+/// checker tracks them as the async function's declared return type,
+/// not as `Awaitable[T]`), so this path is the typed-callable hole that
+/// R3-1 documents.
+fn unwrap_awaitable(typ: &Type) -> Option<Type> {
+    let Type::Generic(name, args) = typ else {
+        return None;
+    };
+    match (name.as_str(), args.len()) {
+        ("Awaitable", 1) => Some(args[0].clone()),
+        ("Coroutine", 3) => Some(args[2].clone()),
+        ("Coroutine", 1) => Some(args[0].clone()),
+        _ => None,
+    }
+}
+
 fn refine_isinstance_target(current: &Type, narrowed_to: &Type) -> Type {
     let current_generic = match current {
         Type::Generic(name, args) if name == "Result" && args.len() == 2 => Some(args),
@@ -9458,6 +9573,76 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // Not found — class may have dynamic attrs; no error.
                     Type::Unknown
                 }
+                // R3-15 (2026-05-25): `s: Stream[int]` calling
+                // `.map(f)` needs the recorded `T` substituted with
+                // `int` before the call-site inference engine
+                // unifies the method's own TypeVars (e.g. `U`). Look
+                // up the method on the head class, build a binding
+                // map from the class's declared type-params to the
+                // receiver's actual type arguments, then substitute
+                // through both `param_types` and `return_type` so the
+                // returned `Type::Function` carries `Callable[[int],
+                // U]` rather than `Callable[[T], U]`. Without this
+                // path, the attribute access fell through to the
+                // `_ => Type::Unknown` arm and `Stream[T].map[U](f)`
+                // dispatch silently produced `Type::Unknown`,
+                // accepting both same- and cross-module wrong
+                // annotations.
+                Type::Generic(head, args) => {
+                    let class_name = head.clone();
+                    let actual_args = args.clone();
+                    if let Some(sig) = c.find_method(class_name.as_str(), attr_name).cloned() {
+                        // Build T → actual binding from the class's
+                        // declared parameter names. Mismatched arity
+                        // (declared `[T, U]` but called as `Foo[int]`)
+                        // is silently ignored — the missing slots just
+                        // leave the corresponding TypeVar free, which
+                        // the call-site inference can still bind from
+                        // the actual argument types.
+                        let bindings: std::collections::HashMap<String, Type> = c
+                            .class_type_params
+                            .get(class_name.as_str())
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .zip(actual_args)
+                            .collect();
+                        if sig.is_property {
+                            return substitute_typevars(&sig.return_type, &bindings);
+                        }
+                        let params: Vec<Type> = sig
+                            .param_types
+                            .iter()
+                            .map(|p| substitute_typevars(p, &bindings))
+                            .collect();
+                        let mut params = params;
+                        if params.len() < sig.arity {
+                            params.resize(sig.arity, Type::Unknown);
+                        }
+                        let ret = substitute_typevars(&sig.return_type, &bindings);
+                        return Type::Function {
+                            params,
+                            ret: Box::new(ret),
+                            variadic: false,
+                        };
+                    }
+                    if let Some(field_type) = c.find_field(class_name.as_str(), attr_name) {
+                        // Field types can mention the class's
+                        // TypeVars too — `payload: T` on
+                        // `RecordEnv[T]` resolves to whatever the
+                        // receiver's `T` was instantiated with.
+                        let bindings: std::collections::HashMap<String, Type> = c
+                            .class_type_params
+                            .get(class_name.as_str())
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .zip(args.iter().cloned())
+                            .collect();
+                        return substitute_typevars(field_type, &bindings);
+                    }
+                    Type::Unknown
+                }
                 Type::TypeVar(tv_name) => {
                     // TypeVar with a declared bound — look up the attribute in
                     // the bound's class/interface hierarchy.
@@ -9716,41 +9901,60 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             }
             Type::Generic("set".into(), vec![Type::union_of(elts)])
         }
+        // R3-9 (2026-05-25): ternary `body if test else orelse`. The
+        // statement-level `if` already applies positive narrowings to
+        // its body and negated narrowings to its else branch; the
+        // ternary expression form previously fell through to
+        // `Type::Unknown`, so `isinstance(x, T)` (and other narrowing
+        // tests) didn't refine `x` inside the ternary. Apply the same
+        // snapshot/narrow/restore dance used by the statement-level
+        // checker so each side of the ternary sees the right type for
+        // `x`.
+        Expr::If(e) => {
+            let _ = infer_expr(c, &e.test);
+            let pos = collect_narrowings(c, &e.test, /*negate=*/ false);
+            let snap_pre = c.env.snapshot();
+            apply_narrowings(c, &pos);
+            let body_ty = infer_expr_ctx(c, &e.body, expected);
+            c.env.restore(snap_pre);
+            let neg = collect_narrowings(c, &e.test, /*negate=*/ true);
+            let snap_pre = c.env.snapshot();
+            apply_narrowings(c, &neg);
+            let orelse_ty = infer_expr_ctx(c, &e.orelse, expected);
+            c.env.restore(snap_pre);
+            Type::union_of(vec![body_ty, orelse_ty])
+        }
         // `await EXPR` — bump the `inside_await` counter while inferring
         // EXPR so a `Call` to an async function inside it does not
         // trip the `tyc::missing_await` check (FINDINGS #49). The
         // inferred type is the inner call's return type (`async def f()
         // -> int` → `await f()` is `int`).
+        //
+        // R3-1 (2026-05-25): unwrap `Awaitable[T]` / `Coroutine[X, Y, T]`
+        // surface types so that `await f(x)` where
+        // `f: Callable[..., Awaitable[T]]` infers as `T`, not as
+        // `Awaitable[T]`. Without this, every async-middleware pattern
+        // (where the callee is a typed callable field, not a directly
+        // declared `async def`) is rejected.
         Expr::Await(a) => {
             c.inside_await = c.inside_await.saturating_add(1);
             let inner = infer_expr_ctx(c, &a.value, expected);
             c.inside_await = c.inside_await.saturating_sub(1);
-            // Unwrap `typing.Awaitable[T]` and `typing.Coroutine[Y, S, T]`
-            // R3-1: a `Callable[..., Awaitable[T]]` call site infers to
-            // `Awaitable[T]` from the Callable's return position, but
-            // `await` consumes the awaitable and produces the inner
-            // value — so the await expression's type must be `T`, not
-            // the wrapper. Without this unwrap, the natural async-
-            // middleware shape (`async def call(nxt: Callable[[Req],
-            // Awaitable[Resp]]) -> Resp: let r = await nxt(req); …`)
-            // fails with `tyc::type_mismatch: expected Resp, found
-            // Awaitable[Resp]` even though the runtime behaviour is
-            // perfectly valid. `Coroutine[Y, S, T]` carries the result
-            // in its third position per the typing-spec — mypy /
-            // pyright unwrap the same way. The canonical `async def f()
+            // R3-1: a `Callable[..., Awaitable[T]]` call site infers
+            // to `Awaitable[T]` from the Callable's return position,
+            // but `await` consumes the awaitable and produces the
+            // inner value — so the await expression's type must be
+            // `T`, not the wrapper. Without this unwrap, the natural
+            // async-middleware shape (`async def call(nxt:
+            // Callable[[Req], Awaitable[Resp]]) -> Resp: let r =
+            // await nxt(req); …`) fails with
+            // `tyc::type_mismatch: expected Resp, found
+            // Awaitable[Resp]`. `unwrap_awaitable` handles
+            // `Awaitable[T]`, `Coroutine[Y, S, T]`, and the one-arg
+            // `Coroutine[T]` shorthand. The canonical `async def f()
             // -> T:` path is unaffected because the checker already
-            // tracks async functions as returning `T` directly
-            // (the call site sees `T`, not `Awaitable[T]`), so the
-            // fall-through arm preserves today's behaviour.
-            match &inner {
-                Type::Generic(head, args) if head == "Awaitable" && args.len() == 1 => {
-                    args[0].clone()
-                }
-                Type::Generic(head, args) if head == "Coroutine" && args.len() == 3 => {
-                    args[2].clone()
-                }
-                _ => inner,
-            }
+            // tracks async functions as returning `T` directly.
+            unwrap_awaitable(&inner).unwrap_or(inner)
         }
         _ => Type::Unknown,
     }
@@ -9885,13 +10089,8 @@ fn newtype_with_base(c: &Checker, t: &Type) -> Option<(String, Type)> {
 fn base_accepts_operand(base: &Type, other: &Type) -> bool {
     matches!(
         (base, other),
-        (
-            Type::Int | Type::Bool,
-            Type::Int | Type::Bool | Type::Float,
-        ) | (
-            Type::Float,
-            Type::Int | Type::Bool | Type::Float,
-        )
+        (Type::Int | Type::Bool, Type::Int | Type::Bool | Type::Float,)
+            | (Type::Float, Type::Int | Type::Bool | Type::Float,)
     )
 }
 
@@ -12200,6 +12399,244 @@ def f() -> int:
                 .iter()
                 .any(|e| matches!(e, TycError::MissingReturn { .. })),
             "with+raise must still fire missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn await_on_callable_returning_awaitable_unwraps_payload() {
+        // R3-1: `f: Callable[..., Awaitable[T]]` is the natural
+        // surface for async middleware handlers — `await f(x)` must
+        // type as `T`, not as `Awaitable[T]`.
+        let src = "\
+from typing import Callable, Awaitable
+
+async def use(f: Callable[[int], Awaitable[str]]) -> str:
+    let r: str = await f(1)
+    return r
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "await on Callable[..., Awaitable[T]] must unwrap to T: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn await_on_callable_returning_coroutine_unwraps_payload() {
+        // R3-1: same shape with `Coroutine[Y, S, T]` — the third
+        // parameter is the awaited payload, per `typing.Coroutine`.
+        let src = "\
+from typing import Callable, Coroutine
+
+async def use(f: Callable[[int], Coroutine[object, object, int]]) -> int:
+    let n: int = await f(2)
+    return n
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "await on Callable[..., Coroutine[X, Y, T]] must unwrap to T: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn ternary_isinstance_narrowing_fires_like_if_else() {
+        // R3-9: ternary `body if test else orelse` previously
+        // skipped narrowing entirely (the expression form fell
+        // through to Type::Unknown). The fix makes ternary narrow
+        // the same way `if/else` does — both directions.
+        let src = "\
+def consume_int(n: int) -> None:
+    pass
+
+def use(x: int | str) -> None:
+    let _ = consume_int(x) if isinstance(x, int) else None
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "ternary isinstance narrowing must apply to truthy branch: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn ternary_nullable_narrowing_fires_like_if_else() {
+        // R3-9: ternary `x if x is not None else default` narrows
+        // `x` to the non-None branch on the truthy side.
+        let src = "\
+def consume_int(n: int) -> None:
+    pass
+
+def use(x: int | None) -> int:
+    return x if x is not None else 0
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NullableUse { .. })),
+            "ternary `is not None` narrowing must strip None on truthy: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn async_with_as_binding_typed_from_aenter() {
+        // R3-3: `as r` binds `__aenter__`'s return type so a
+        // downstream `match r:` inside the body proves
+        // exhaustiveness and `missing_return` doesn't spuriously
+        // fire on the enclosing function. The fix lives in
+        // `Stmt::With` check via `with_item_bound_type`.
+        let src = "\
+type Result = Ok | Err
+
+class Ok:
+    value: int
+
+class Err:
+    msg: str
+
+class AsyncCtx:
+    pass
+
+impl AsyncCtx:
+    async def __aenter__(self) -> Result:
+        return Ok(value=1)
+    async def __aexit__(self, *a: object) -> None:
+        return None
+
+async def with_match() -> int:
+    async with AsyncCtx() as r:
+        match r:
+            case Ok(value):
+                return value
+            case Err(msg):
+                return -1
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "async with exhaustive match tail must satisfy missing_return: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn generic_method_dispatch_substitutes_class_typevars() {
+        // R3-15: `s: Stream[int].map(to_str)` needs `T` substituted
+        // with `int` in the recorded method signature before the
+        // call-site inference engine binds the method's own `U` from
+        // the actual `to_str` callable type. Without the substitution
+        // path the method's return type stayed `Stream[U]` /
+        // effectively `Stream[object]`, accepting wrong annotations.
+        let src = "\
+from typing import Callable
+
+class Stream[T]:
+    items: list[T]
+
+impl[T] Stream[T]:
+    def map[U](self, f: Callable[[T], U]) -> Stream[U]:
+        return Stream(items=[f(x) for x in self.items])
+    def collect(self) -> list[T]:
+        return self.items
+
+def to_str(x: int) -> str:
+    return str(x)
+
+def consume_int_list(xs: list[int]) -> None:
+    pass
+
+def main() -> None:
+    let s: Stream[int] = Stream(items=[1, 2, 3])
+    let mapped = s.map(to_str)
+    let result = mapped.collect()
+    consume_int_list(result)
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "generic method dispatch must propagate U: list[str] should fail to assign to list[int]: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn generic_field_access_substitutes_class_typevars() {
+        // R3-15 follow-on: field access on a generic instance must
+        // also substitute the class's TypeVars. `let r: RecordEnv[int]`
+        // calling `.payload` should resolve to `int`, not the bare
+        // `T`.
+        let src = "\
+class RecordEnv[T]:
+    payload: T
+
+def consume_str(s: str) -> None:
+    pass
+
+def main() -> None:
+    let r: RecordEnv[int] = RecordEnv(payload=42)
+    consume_str(r.payload)
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::TypeMismatch { .. })),
+            "generic field access must propagate T: int field should fail to assign to str: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn class_field_default_ordering_rejected() {
+        // R3-11: non-default field after defaulted field would
+        // blow up the synthesised `__init__` at import time. The
+        // checker now flags the ordering violation at compile time.
+        let src = "\
+class A:
+    x: int
+    y: int = 0
+    z: int
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::FieldDefaultOrdering { .. })),
+            "mixed-default class field ordering must fire field_default_ordering: {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn class_fields_in_correct_order_is_clean() {
+        let src = "\
+class A:
+    x: int
+    y: int
+    z: int = 0
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::FieldDefaultOrdering { .. })),
+            "non-default-before-default order must not fire: {:?}",
             d.errors()
         );
     }
