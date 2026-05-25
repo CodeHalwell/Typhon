@@ -2536,9 +2536,24 @@ impl<'a> Checker<'a> {
             return;
         }
         let length = span.1.saturating_sub(span.0).max(1);
+        // R1#11: `Type::Unknown.display()` renders as the literal
+        // character `?`, which leaks into the diagnostic as
+        // "value is `?` | None here" / "where `?` is required" — an
+        // accidental clash with the nullable-sugar token. Prefer the
+        // unstripped `expected` (or fall back to "non-None") when the
+        // strip ends up Unknown so the user sees a real type name
+        // instead of a meaningless punctuation mark.
+        let stripped = expected.strip_none();
+        let display = match stripped {
+            Type::Unknown => match expected {
+                Type::Unknown => "non-None value".to_owned(),
+                other => other.display(),
+            },
+            other => other.display(),
+        };
         self.diagnostics.push_error(TycError::nullable_use(
             name,
-            expected.strip_none().display(),
+            display,
             &self.path,
             self.source,
             span.0,
@@ -9233,6 +9248,38 @@ def f(x: int | None) -> int:
 ";
         let d = check(src);
         assert!(d.has_errors(), "expected nullable-use error");
+    }
+
+    #[test]
+    fn nullable_use_renders_real_type_not_question_placeholder() {
+        // R1#11: the diagnostic message would leak an internal
+        // `Type::Unknown` (whose `display()` is the literal `?`) into
+        // the user-visible text ("value is `?` | None", "where `?` is
+        // required") when the strip_none collapsed to Unknown. Verify
+        // that the actual type name flows through instead.
+        let src = "\
+def use_int(x: int) -> None:
+    print(x)
+
+def f(p: int | None) -> None:
+    use_int(p)
+";
+        let d = check(src);
+        assert!(d.has_errors(), "expected nullable-use error");
+        let rendered = d
+            .errors()
+            .iter()
+            .find(|e| matches!(e, TycError::NullableUse { .. }))
+            .map(|e| format!("{e}"))
+            .unwrap_or_default();
+        assert!(
+            !rendered.contains("`?`"),
+            "diagnostic must not render `?` placeholder; got: {rendered}"
+        );
+        assert!(
+            rendered.contains("int"),
+            "diagnostic should name the actual expected type; got: {rendered}"
+        );
     }
 
     #[test]
