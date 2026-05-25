@@ -1,0 +1,134 @@
+import time
+
+from config import BreakerPolicy
+from ids import UpstreamId
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker — sealed-union state machine (Closed → Open → HalfOpen).
+# Round-1 #1 workaround applied: cross-module variant→union upcast is rejected,
+# so every transition goes through a factory in this module.
+# ---------------------------------------------------------------------------
+
+
+pub type BreakerState = StateClosed | StateOpen | StateHalfOpen
+
+
+pub class StateClosed:
+    consecutive_failures: int
+
+
+pub class StateOpen:
+    opened_at_ms: int
+    cooldown_ms: int
+
+
+pub class StateHalfOpen:
+    consecutive_successes: int
+    probe_in_flight: bool
+
+
+pub def make_closed(consecutive_failures: int = 0) -> BreakerState:
+    return StateClosed(consecutive_failures=consecutive_failures)
+
+
+pub def make_open(opened_at_ms: int, cooldown_ms: int) -> BreakerState:
+    return StateOpen(opened_at_ms=opened_at_ms, cooldown_ms=cooldown_ms)
+
+
+pub def make_half_open() -> BreakerState:
+    return StateHalfOpen(consecutive_successes=0, probe_in_flight=False)
+
+
+pub def state_label(s: BreakerState) -> str:
+    match s:
+        case StateClosed(_):     return "closed"
+        case StateOpen(_, _):    return "open"
+        case StateHalfOpen(_, _): return "half_open"
+    raise RuntimeError("unreachable")
+
+
+# ---------------------------------------------------------------------------
+# CircuitBreaker — one per upstream. Holds policy + current state.
+# ---------------------------------------------------------------------------
+
+
+pub class CircuitBreaker:
+    upstream: UpstreamId
+    policy: BreakerPolicy
+    state: BreakerState
+
+
+pub def new_breaker(upstream: UpstreamId, policy: BreakerPolicy) -> CircuitBreaker:
+    return CircuitBreaker(
+        upstream=upstream,
+        policy=policy,
+        state=make_closed(0),
+    )
+
+
+def _now_ms() -> int:
+    return int(time.monotonic() * 1000.0)
+
+
+# Returns the cooldown remaining if the breaker is currently rejecting requests.
+# `None` means "allow the request".
+pub def gate(breaker: CircuitBreaker) -> int?:
+    match breaker.state:
+        case StateClosed(_):
+            return None
+        case StateOpen(opened_at, cooldown):
+            let now: int = _now_ms()
+            let elapsed: int = now - opened_at
+            if elapsed >= cooldown:
+                # Cool-down elapsed — promote to half-open and let one probe through.
+                breaker.state = make_half_open()
+                return None
+            return cooldown - elapsed
+        case StateHalfOpen(_, probe_in_flight):
+            if probe_in_flight:
+                return 0
+            match breaker.state:
+                case StateHalfOpen(succ, _):
+                    breaker.state = StateHalfOpen(
+                        consecutive_successes=succ,
+                        probe_in_flight=True,
+                    )
+                case _:
+                    pass
+            return None
+    raise RuntimeError("unreachable")
+
+
+pub def record_success(breaker: CircuitBreaker) -> None:
+    let policy: BreakerPolicy = breaker.policy
+    match breaker.state:
+        case StateClosed(_):
+            breaker.state = make_closed(0)
+        case StateOpen(_, _):
+            # Should never see success while open — pretend we're half-open now.
+            breaker.state = make_closed(0)
+        case StateHalfOpen(succ, _):
+            let new_succ: int = succ + 1
+            if new_succ >= policy.success_threshold:
+                breaker.state = make_closed(0)
+            else:
+                breaker.state = StateHalfOpen(
+                    consecutive_successes=new_succ,
+                    probe_in_flight=False,
+                )
+
+
+pub def record_failure(breaker: CircuitBreaker) -> None:
+    let policy: BreakerPolicy = breaker.policy
+    match breaker.state:
+        case StateClosed(fails):
+            let new_fails: int = fails + 1
+            if new_fails >= policy.failure_threshold:
+                breaker.state = make_open(_now_ms(), policy.cooldown_ms)
+            else:
+                breaker.state = make_closed(new_fails)
+        case StateOpen(_, _):
+            pass
+        case StateHalfOpen(_, _):
+            breaker.state = make_open(_now_ms(), policy.cooldown_ms)

@@ -1,0 +1,36 @@
+# Pydantic models that live at the FastAPI HTTP boundary. These describe the
+# control-plane payloads (route definitions on disk, the /metrics envelope,
+# the /reload command) — NOT the proxied traffic, which uses raw byte
+# requests / responses.
+
+
+pub model UpstreamSpec:
+    id: str
+    base_url: str
+    weight: int = 1
+
+
+pub model RouteSpec:
+    id: str
+    methods: list[str]
+    path_glob: str
+    upstreams: list[UpstreamSpec]
+    strategy: str = "round_robin"
+    requires_auth: bool = False
+    timeout_seconds: float = 5.0
+
+
+pub model RoutesFile:
+    routes: list[RouteSpec]
+
+
+pub model HealthResponse:
+    ok: bool
+    upstreams: dict[str, bool]
+    build_version: str
+
+
+pub model ReloadResponse:
+    ok: bool
+    routes_loaded: int
+    error: str?

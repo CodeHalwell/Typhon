@@ -1,0 +1,117 @@
+from balancer import BalanceStrategy, make_round_robin
+from ids import RouteId, UpstreamId
+from upstream import Upstream
+
+
+# A single forwarding rule: methods + path glob → list of upstreams.
+pub class Route:
+    id: RouteId
+    methods: list[str]
+    path_glob: str
+    upstreams: list[Upstream]
+    strategy: BalanceStrategy
+    requires_auth: bool
+    timeout_seconds: float
+
+
+pub class RouteTable:
+    routes: list[Route]
+
+
+pub type MatchResult = MatchHit | MatchMiss | MatchMethodMismatch
+
+
+pub class MatchHit:
+    route: Route
+
+
+pub class MatchMiss:
+    path: str
+
+
+pub class MatchMethodMismatch:
+    route_id: RouteId
+    method: str
+    allowed: list[str]
+
+
+pub def make_hit(route: Route) -> MatchResult:
+    return MatchHit(route=route)
+
+
+pub def make_miss(path: str) -> MatchResult:
+    return MatchMiss(path=path)
+
+
+pub def make_method_mismatch(route_id: RouteId, method: str, allowed: list[str]) -> MatchResult:
+    return MatchMethodMismatch(route_id=route_id, method=method, allowed=allowed)
+
+
+# Very small path glob: `/foo/*` matches a single segment, `/foo/**` matches
+# any suffix, otherwise exact-string match. No regex, no captures.
+pub def path_matches(glob: str, path: str) -> bool:
+    if glob == path:
+        return True
+    if glob.endswith("/**"):
+        let prefix: str = glob[: len(glob) - 3]
+        return path == prefix or path.startswith(prefix + "/") or path.startswith(prefix)
+    if "/*" in glob:
+        let glob_parts: list[str] = glob.split("/")
+        let path_parts: list[str] = path.split("/")
+        if len(glob_parts) != len(path_parts):
+            return False
+        mut idx: int = 0
+        while idx < len(glob_parts):
+            let g: str = glob_parts[idx]
+            let p: str = path_parts[idx]
+            if g != "*" and g != p:
+                return False
+            idx = idx + 1
+        return True
+    return False
+
+
+impl RouteTable:
+    def match_request(self, method: str, path: str) -> MatchResult:
+        mut method_mismatch_for: Route? = None
+        for r in self.routes:
+            if path_matches(r.path_glob, path):
+                if method in r.methods:
+                    return make_hit(r)
+                if method_mismatch_for is None:
+                    method_mismatch_for = r
+        let mm: Route? = method_mismatch_for
+        if mm is not None:
+            return make_method_mismatch(mm.id, method, mm.methods)
+        return make_miss(path)
+
+
+pub def new_route(
+    id: RouteId,
+    methods: list[str],
+    path_glob: str,
+    upstreams: list[Upstream],
+    timeout_seconds: float = 5.0,
+    requires_auth: bool = False,
+) -> Route:
+    return Route(
+        id=id,
+        methods=methods,
+        path_glob=path_glob,
+        upstreams=upstreams,
+        strategy=make_round_robin(),
+        requires_auth=requires_auth,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+pub def replace_table(current: RouteTable, fresh: list[Route]) -> RouteTable:
+    return RouteTable(routes=fresh)
+
+
+# Convenience accessor: pull the upstream by ID out of a route's pool.
+pub def find_upstream(route: Route, upstream_id: UpstreamId) -> Upstream?:
+    for u in route.upstreams:
+        if u.id == upstream_id:
+            return u
+    return None
