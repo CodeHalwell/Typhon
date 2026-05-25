@@ -6317,22 +6317,20 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                 //      (async) — use the method's declared return type.
                 //   3. Otherwise leave as `Unknown` so the existing
                 //      permissive flow doesn't break user code.
-                if let Some(target) = item.optional_vars.as_deref() {
-                    if let Expr::Name(target_name) = target {
-                        let target_ty =
-                            with_target_type(c, &item.context_expr, &ctx_ty, w.is_async);
-                        let span = (
-                            target_name.range.start().to_usize(),
-                            target_name.range.start().to_usize() + target_name.id.as_str().len(),
-                        );
-                        c.env.declare(TypeBinding {
-                            name: target_name.id.as_str().to_owned(),
-                            declared: target_ty.clone(),
-                            narrowed: target_ty,
-                            span,
-                            from_unsafe: c.unsafe_depth > 0,
-                        });
-                    }
+                if let Some(Expr::Name(target_name)) = item.optional_vars.as_deref() {
+                    let target_ty =
+                        with_target_type(c, &item.context_expr, &ctx_ty, w.is_async);
+                    let span = (
+                        target_name.range.start().to_usize(),
+                        target_name.range.start().to_usize() + target_name.id.as_str().len(),
+                    );
+                    c.env.declare(TypeBinding {
+                        name: target_name.id.as_str().to_owned(),
+                        declared: target_ty.clone(),
+                        narrowed: target_ty,
+                        span,
+                        from_unsafe: c.unsafe_depth > 0,
+                    });
                 }
             }
             for s in &w.body {
@@ -7230,6 +7228,7 @@ fn da_collect_for_target(target: &Expr, state: &mut DaState) {
 ///     sealed-union — useful when the subject's type couldn't be
 ///     inferred (e.g. an imported function whose stub is missing) but
 ///     the user clearly wrote `case Ok(...)/case Err(...)` arms.
+///
 /// Sound under-approximation: returns `false` for any shape we can't
 /// classify, so the DA pass stays conservative when in doubt.
 fn match_is_exhaustive_for_da(c: &Checker, subject: &Expr, cases: &[MatchCase]) -> bool {
@@ -9884,11 +9883,16 @@ fn newtype_with_base(c: &Checker, t: &Type) -> Option<(String, Type)> {
 /// Mixed-axis cases (int-based + float) are handled by the caller so
 /// the result type can widen out of the newtype where appropriate.
 fn base_accepts_operand(base: &Type, other: &Type) -> bool {
-    match (base, other) {
-        (Type::Int | Type::Bool, Type::Int | Type::Bool | Type::Float) => true,
-        (Type::Float, Type::Int | Type::Bool | Type::Float) => true,
-        _ => false,
-    }
+    matches!(
+        (base, other),
+        (
+            Type::Int | Type::Bool,
+            Type::Int | Type::Bool | Type::Float,
+        ) | (
+            Type::Float,
+            Type::Int | Type::Bool | Type::Float,
+        )
+    )
 }
 
 /// Conservative compatibility check for the arithmetic / concat

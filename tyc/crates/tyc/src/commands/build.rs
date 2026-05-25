@@ -1153,8 +1153,7 @@ fn line_offset(source: &str, line_idx: usize) -> usize {
 /// imports as normal.
 fn replace_line(source: &str, line_idx: usize, replacement: &str) -> String {
     let mut out = String::with_capacity(source.len() + replacement.len());
-    let mut current = 0usize;
-    for line in source.split_inclusive('\n') {
+    for (current, line) in source.split_inclusive('\n').enumerate() {
         if current == line_idx {
             out.push_str(replacement);
             if line.ends_with('\n') {
@@ -1163,7 +1162,6 @@ fn replace_line(source: &str, line_idx: usize, replacement: &str) -> String {
         } else {
             out.push_str(line);
         }
-        current += 1;
     }
     out
 }
