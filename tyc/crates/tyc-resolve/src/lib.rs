@@ -14,7 +14,7 @@
 //! expressions remain stable; we use them directly.
 
 use ruff_python_ast::{self as ast, Expr, ModModule, Stmt};
-use ruff_text_size::{Ranged, TextRange};
+use ruff_text_size::TextRange;
 use tyc_diagnostics::{Diagnostics, TycError};
 
 /// Mutability of a binding.
@@ -812,6 +812,22 @@ struct Resolver<'a> {
     /// flag is set, the declare path emits the pattern-aware
     /// `tyc::pattern_shadows_outer` instead (FINDINGS O10).
     in_pattern: u32,
+    /// Declaration spans of `let NAME: T` bindings that haven't been
+    /// initialised yet. R3-8: the declare-then-assign idiom — `let
+    /// loaded: Cfg` followed by `match _load(): case Ok(v): loaded = v`
+    /// — requires the FIRST subsequent assignment to silently succeed
+    /// (it IS the initialiser), while SUBSEQUENT assignments fire
+    /// `tyc::immutable_assign` as usual. We track each uninitialised
+    /// declaration's span here; when the first assignment to the same
+    /// name lands on the binding, [`Resolver::declare_full`] removes
+    /// the span and lets the assignment through. Anything after that
+    /// follows the standard let-immutability rule.
+    ///
+    /// Full definite-assignment analysis (every reachable read is
+    /// preceded by an assignment on all CFG paths) is a follow-up. The
+    /// minimal form here unblocks the heterogeneous-error /
+    /// `_load_or_default(...)` workaround R2-7 / R3-8 documented.
+    uninit_let_spans: std::collections::HashSet<(usize, usize)>,
 }
 
 impl<'a> Resolver<'a> {
@@ -837,6 +853,7 @@ impl<'a> Resolver<'a> {
             original_source: options.original_source,
             preprocessed_line_starts: std::cell::OnceCell::new(),
             in_pattern: 0,
+            uninit_let_spans: std::collections::HashSet::new(),
         }
     }
 
@@ -967,6 +984,14 @@ impl<'a> Resolver<'a> {
             let _ = kind;
             if existing.mutability == Mutability::Let || mutability == Mutability::Let {
                 let decl_span = existing.span;
+                // R3-8: the FIRST assignment to an uninitialised `let
+                // NAME: T` is the initialiser — silently accept it and
+                // mark the binding initialised. Subsequent assignments
+                // hit the standard immutable-assign path below because
+                // the span is no longer in the uninit set.
+                if self.uninit_let_spans.remove(&decl_span) {
+                    return;
+                }
                 if self.seen_immutable_redecl.insert((decl_span, span)) {
                     // Pattern captures (`case Wrap(value):`) take a
                     // dedicated diagnostic because the actionable advice
@@ -1324,14 +1349,23 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt]) {
                 }
             }
             Stmt::AnnAssign(a) => {
-                // FINDINGS #91: an annotated declaration without an
-                // initialiser is a user error — skip the declaration
-                // so the second pass can emit `tyc::missing_initialiser`
-                // without also tripping `tyc::immutable_assign` on the
-                // user's subsequent `x = <expr>` reassignment.
-                if !(a.value.is_none() && a.mutability.is_some()) {
-                    declare_target(r, scope, &a.target, default_val, a.mutability);
+                // R3-8: declare-only `let NAME: T` (no initialiser) is
+                // now allowed — pre-declare it here so the subsequent
+                // `NAME = <expr>` body assignment lands on the same
+                // binding instead of being mis-counted as a fresh
+                // bareword declaration. The first such body assignment
+                // is the initialiser (handled in
+                // [`Resolver::declare_full`] via `uninit_let_spans`).
+                if a.value.is_none() && a.mutability.is_some() {
+                    if let Expr::Name(n) = a.target.as_ref() {
+                        let name_span = (
+                            n.range.start().to_usize(),
+                            n.range.start().to_usize() + n.id.as_str().len(),
+                        );
+                        r.uninit_let_spans.insert(name_span);
+                    }
                 }
+                declare_target(r, scope, &a.target, default_val, a.mutability);
             }
             _ => {}
         }
@@ -1480,8 +1514,12 @@ fn collect_top_level(r: &mut Resolver, scope: ScopeId, body: &[Stmt]) {
 }
 
 /// Slice `source` against a `TextRange`, returning `None` if the range
-/// falls outside the source's byte bounds. Used to recover the surface
-/// text of a node for inclusion in diagnostic messages.
+/// falls outside the source's byte bounds. Retained for diagnostics
+/// helpers that may need to recover surface text in future work
+/// (e.g. a definite-assignment pass that surfaces the declaration
+/// site's annotation text). Currently unused after R3-8 relaxed the
+/// `missing_initialiser` error.
+#[allow(dead_code)]
 fn source_slice(source: &str, range: TextRange) -> Option<&str> {
     let start = range.start().to_usize();
     let end = range.end().to_usize();
@@ -1803,53 +1841,42 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
                 walk_expr(r, scope, v);
             }
             walk_expr(r, scope, &a.annotation);
-            // FINDINGS #91: `let NAME: T` (or `mut NAME: T`) without an
-            // initialiser produces a confusing immutable-assign error
-            // when the user later writes `NAME = <expr>`. Reject the
-            // declare-only form up front with a clear message that
-            // tells the user to inline the initialiser. Bare AnnAssign
-            // (no explicit `let`/`mut` keyword) is left alone because
-            // class-body field declarations (`name: str`) and dataclass
-            // attribute annotations legitimately omit initialisers.
+            // R3-8: `let NAME: T` (or `mut NAME: T`) without an
+            // initialiser is now allowed for the declare-then-assign
+            // idiom:
+            //
+            //   let loaded: Cfg
+            //   match _load():
+            //       case Ok(v): loaded = v
+            //       case Err(e): return Err(e)
+            //   use(loaded)
+            //
+            // The first subsequent assignment to the same name is
+            // treated as the initialiser; subsequent assignments still
+            // fire `tyc::immutable_assign` (for `let`) or are accepted
+            // (for `mut`). `declare_full` checks the
+            // `uninit_let_spans` set to decide.
+            //
+            // Bare AnnAssign (no explicit `let`/`mut` keyword) is left
+            // alone — class-body field declarations (`name: str`) and
+            // dataclass attribute annotations legitimately omit
+            // initialisers and go through a different code path.
+            //
+            // Full definite-assignment analysis (every reachable read
+            // is preceded by an assignment on all CFG paths) is a
+            // follow-up. This change unblocks the workaround R2-7 /
+            // R3-8 documented.
             let missing_init = a.value.is_none() && a.mutability.is_some();
-            if missing_init {
-                if let Expr::Name(n) = a.target.as_ref() {
-                    let keyword = match a.mutability {
-                        Some(ast::Mutability::Let) => "let",
-                        Some(ast::Mutability::Mut) => "mut",
-                        None => unreachable!(),
-                    };
-                    let annotation = source_slice(r.source, a.annotation.range())
-                        .unwrap_or("<type>")
-                        .to_owned();
-                    let span = (a.range.start().to_usize(), a.range.end().to_usize());
-                    let length = span.1.saturating_sub(span.0).max(1);
-                    r.diagnostics.push_error(TycError::missing_initialiser(
-                        keyword,
-                        n.id.as_str(),
-                        annotation,
-                        &r.path,
-                        r.source,
-                        span.0,
-                        length,
-                    ));
+            if let Expr::Name(n) = a.target.as_ref() {
+                if missing_init {
+                    let name_span = (
+                        n.range.start().to_usize(),
+                        n.range.start().to_usize() + n.id.as_str().len(),
+                    );
+                    r.uninit_let_spans.insert(name_span);
                 }
-            }
-            if let Expr::Name(_) = a.target.as_ref() {
                 let default_val = r.scopes[scope].kind == ScopeKind::Module;
-                // When the initialiser is missing (FINDINGS #91), suppress
-                // the declaration entirely. Otherwise a later `x = 5`
-                // would either fire a redundant `tyc::immutable_assign`
-                // (the misleading cascade the finding is about) or — for
-                // `mut` — pretend the assignment was the first
-                // initialiser, masking the original mistake. The
-                // missing_initialiser error already tells the user what
-                // to do; downstream references to the un-declared name
-                // (`x` on subsequent lines) will produce the standard
-                // unknown-name flow.
-                if !missing_init {
-                    declare_target(r, scope, &a.target, default_val, a.mutability);
-                }
+                declare_target(r, scope, &a.target, default_val, a.mutability);
             }
         }
         Stmt::AugAssign(a) => {
@@ -1864,16 +1891,34 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
         Stmt::Expr(e) => walk_expr(r, scope, &e.value),
         Stmt::If(i) => {
             walk_expr(r, scope, &i.test);
+            // R3-8: snapshot the uninit set per branch and union the
+            // initialisations afterwards, mirroring the `Stmt::Match`
+            // arm-restore logic. Lets `if cond: x = a / else: x = b`
+            // act as the initialiser for `let x: T` declared above.
+            let initial_uninit = r.uninit_let_spans.clone();
+            let mut union_initialised: std::collections::HashSet<(usize, usize)> =
+                std::collections::HashSet::new();
             for s in &i.body {
                 walk_stmt(r, scope, s);
             }
+            for span in initial_uninit.difference(&r.uninit_let_spans) {
+                union_initialised.insert(*span);
+            }
             for clause in &i.elif_else_clauses {
+                r.uninit_let_spans = initial_uninit.clone();
                 if let Some(test) = &clause.test {
                     walk_expr(r, scope, test);
                 }
                 for s in &clause.body {
                     walk_stmt(r, scope, s);
                 }
+                for span in initial_uninit.difference(&r.uninit_let_spans) {
+                    union_initialised.insert(*span);
+                }
+            }
+            r.uninit_let_spans = initial_uninit;
+            for span in &union_initialised {
+                r.uninit_let_spans.remove(span);
             }
         }
         Stmt::While(w) => {
@@ -1997,9 +2042,21 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
             // declares its own names — they coexist in the final
             // bindings vec, but the shadow check only sees the
             // pre-match snapshot while a given arm is walking.
+            //
+            // R3-8: also snapshot/restore `uninit_let_spans` per arm so
+            // sibling-arm assignments to the same declare-only `let`
+            // are each treated as the initialiser. After all arms have
+            // walked, any span removed by AT LEAST one arm is
+            // considered initialised post-match; spans still present in
+            // every arm's leftover stay uninit (the match didn't touch
+            // them).
             let pre_match_len = r.scopes[scope].bindings.len();
+            let initial_uninit = r.uninit_let_spans.clone();
+            let mut union_initialised: std::collections::HashSet<(usize, usize)> =
+                std::collections::HashSet::new();
             let mut arm_local_bindings: Vec<Binding> = Vec::new();
             for case in &m.cases {
+                r.uninit_let_spans = initial_uninit.clone();
                 // Mark the case pattern so the declare path knows
                 // shadowing trips `pattern_shadows_outer`, not the
                 // misleading `immutable_assign` (FINDINGS O10).
@@ -2012,9 +2069,18 @@ fn walk_stmt(r: &mut Resolver, scope: ScopeId, stmt: &Stmt) {
                 for s in &case.body {
                     walk_stmt(r, scope, s);
                 }
+                for span in initial_uninit.difference(&r.uninit_let_spans) {
+                    union_initialised.insert(*span);
+                }
                 let drained: Vec<Binding> =
                     r.scopes[scope].bindings.drain(pre_match_len..).collect();
                 arm_local_bindings.extend(drained);
+            }
+            // Restore the pre-match uninit snapshot, then remove the
+            // spans that any arm consumed as the initialiser.
+            r.uninit_let_spans = initial_uninit;
+            for span in &union_initialised {
+                r.uninit_let_spans.remove(span);
             }
             r.scopes[scope].bindings.extend(arm_local_bindings);
         }
@@ -3272,33 +3338,89 @@ def foo():
     }
 
     #[test]
-    fn let_without_initialiser_errors() {
-        // FINDINGS #91: `let x: int` (no `=`) must surface
-        // tyc::missing_initialiser rather than silently accepting the
-        // declaration and then complaining about the user's first
-        // `x = …` assignment as an immutable-assign error.
+    fn let_without_initialiser_is_clean_when_followed_by_assignment() {
+        // R3-8 (supersedes FINDINGS #91 for the `let NAME: T` shape):
+        // the declare-then-assign idiom is now legal. The first
+        // bareword assignment to the name initialises the binding;
+        // subsequent assignments fire `tyc::immutable_assign`.
         let (_m, d) = resolve("def f() -> None:\n    let x: int\n    x = 5\n");
         assert!(
-            d.errors()
-                .iter()
-                .any(|e| matches!(e, TycError::MissingInitialiser { .. })),
-            "expected MissingInitialiser variant; got {:?}",
+            !d.has_errors(),
+            "`let x: int` followed by `x = 5` must check clean; got {:?}",
             d.errors()
         );
     }
 
     #[test]
-    fn mut_without_initialiser_errors() {
-        // Same rule applies to `mut x: int` — the binding has nothing
-        // to bind to. Subsequent `x = 5` would otherwise pass because
-        // `mut` allows re-assignment, but the type-checker treats the
-        // value-less form inconsistently.
-        let (_m, d) = resolve("def f() -> None:\n    mut x: int\n    x = 5\n");
+    fn let_without_initialiser_rejects_second_assignment() {
+        // R3-8: only the FIRST assignment is the initialiser. A second
+        // assignment to the same `let` binding still fires immutable_assign.
+        let (_m, d) = resolve(
+            "def f() -> None:\n    let x: int\n    x = 5\n    x = 6\n",
+        );
         assert!(
             d.errors()
                 .iter()
-                .any(|e| matches!(e, TycError::MissingInitialiser { .. })),
-            "expected MissingInitialiser for mut; got {:?}",
+                .any(|e| matches!(e, TycError::ImmutableAssign { name, .. } if name == "x")),
+            "second assignment to declare-only let must fire immutable_assign; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn let_without_initialiser_match_arms_each_initialise() {
+        // R3-8: sibling `case` arms each assign exactly once at
+        // runtime; the resolver snapshots `uninit_let_spans` between
+        // arms so each arm's first assignment is treated as the
+        // initialiser. The match-tower idiom from 14-api-gateway
+        // (`let loaded: T; match _: case Ok(v): loaded = v; case Err(e):
+        // return Err(e)`) check clean.
+        let src = "def f() -> int:\n\
+                   \x20   let x: int\n\
+                   \x20   match 1:\n\
+                   \x20       case 0:\n\
+                   \x20           x = 10\n\
+                   \x20       case _:\n\
+                   \x20           x = 20\n\
+                   \x20   return x\n";
+        let (_m, d) = resolve(src);
+        assert!(
+            !d.has_errors(),
+            "sibling-arm assignments to declare-only let must check clean; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn let_without_initialiser_if_else_arms_each_initialise() {
+        // R3-8: same as the match case, but for sibling `if` / `else`
+        // bodies. The natural `let x: int; if cond: x = a else: x = b`
+        // shape is now legal.
+        let src = "def pick(cond: bool) -> int:\n\
+                   \x20   let result: int\n\
+                   \x20   if cond:\n\
+                   \x20       result = 1\n\
+                   \x20   else:\n\
+                   \x20       result = 2\n\
+                   \x20   return result\n";
+        let (_m, d) = resolve(src);
+        assert!(
+            !d.has_errors(),
+            "if/else assignments to declare-only let must check clean; got {:?}",
+            d.errors()
+        );
+    }
+
+    #[test]
+    fn mut_without_initialiser_allows_repeated_assignment() {
+        // R3-8: `mut x: T` without an initialiser declares a mutable
+        // binding; any number of subsequent assignments are legal.
+        let (_m, d) = resolve(
+            "def f() -> None:\n    mut x: int\n    x = 5\n    x = 6\n    x = 7\n",
+        );
+        assert!(
+            !d.has_errors(),
+            "`mut x: int` followed by repeated `x = N` must check clean; got {:?}",
             d.errors()
         );
     }

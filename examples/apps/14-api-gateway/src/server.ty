@@ -40,15 +40,6 @@ pub class AppState:
     shutdown: asyncio.Event
 
 
-def _load_or_default(path: str) -> tuple[RouteTable, dict[str, Balancer]]:
-    match load_routes_file(path):
-        case Ok(pair):
-            return pair
-        case Err(_):
-            return default_routes()
-    raise RuntimeError("unreachable")
-
-
 pub def build_state(config: GatewayConfig) -> AppState:
     let client: httpx.AsyncClient = httpx.AsyncClient(
         timeout=config.upstream_timeout_seconds,
@@ -61,7 +52,15 @@ pub def build_state(config: GatewayConfig) -> AppState:
     # Seed a tiny default token so the example is browsable.
     tokens.register("dev-token", ClientId("local-dev"))
 
-    let loaded: tuple[RouteTable, dict[str, Balancer]] = _load_or_default(config.routes_path)
+    # R3-8: declare-then-assign-in-arms — first assignment to `loaded`
+    # is the initialiser; subsequent assignments would fire
+    # `tyc::immutable_assign` because the binding stays a `let`.
+    let loaded: tuple[RouteTable, dict[str, Balancer]]
+    match load_routes_file(config.routes_path):
+        case Ok(pair):
+            loaded = pair
+        case Err(_):
+            loaded = default_routes()
     let (table, balancers) = loaded
     let core: GatewayCore = new_gateway_core(
         table=table,

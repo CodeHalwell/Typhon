@@ -11,6 +11,30 @@ remaining ergonomics gaps that survived v0.6.0 / v0.6.1.
 
 ### Fixed — compiler
 
+- **`tyc-resolve`: declare-only `let NAME: T` (no initialiser) is now
+  allowed and integrates with sibling-arm assignment (R3-8 /
+  supersedes FINDINGS #91 for the `let` shape).** The
+  declare-then-assign-in-arms idiom — `let loaded: Cfg; match _load():
+  case Ok(v): loaded = v; case Err(e): return Err(e); …` — previously
+  fired `tyc::missing_initialiser`, forcing the user to either
+  declare-as-`mut` (losing immutability) or extract a `_load_or_default`
+  helper purely to give the binding an initialiser at the declaration
+  site. The resolver now tracks each uninitialised `let`-declaration's
+  span; the FIRST subsequent assignment to that name silently succeeds
+  (it IS the initialiser), and the standard `tyc::immutable_assign`
+  fires on any SECOND assignment.
+  Sibling `match` arms and sibling `if` / `elif` / `else` bodies each
+  count as a separate first-assignment path — the resolver snapshots
+  the uninit-span set per arm and unions the initialisations
+  afterwards, so the natural `case Ok(v): loaded = v / case Err(_):
+  loaded = default()` and `if cond: x = a / else: x = b` shapes check
+  clean while retaining `let` immutability outside the branching
+  region.
+  `mut NAME: T` without an initialiser is also accepted, and follows
+  the usual `mut` semantics (any number of subsequent assignments are
+  legal). Full definite-assignment analysis (every reachable read is
+  preceded by an assignment on all CFG paths) is a follow-up; the
+  minimal form here unblocks the workaround R2-7 / R3-8 documented.
 - **`tyc-types`: `with cm() as r:` / `async with cm() as r:` now types
   `r` from `__enter__` / `__aenter__` methods and from
   `@contextmanager` / `@asynccontextmanager`-decorated generator
