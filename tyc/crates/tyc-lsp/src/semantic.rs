@@ -151,9 +151,18 @@ pub fn compute(
     callee_signatures: &CalleeSignatures,
     attribute_kinds: &AttributeKinds,
 ) -> SemanticTokens {
+    // Names declared via `newtype Name = Base` desugar to the regular
+    // assignment `Name = NewType("Name", Base)` before the resolver
+    // sees them, so the resolver registers them as `BindingKind::Value`
+    // (which would render as a generic `variable` token, the same kind
+    // a `let x = 1` gets — light blue / plain in most themes). Walk
+    // the AST for the unmistakable `NAME = NewType(...)` shape so we
+    // can promote both the declaration site and every reference to
+    // `class`, matching how `pub class X:` already paints.
+    let newtype_names = collect_newtype_names(module);
     let mut tokens: Vec<AbsoluteToken> = Vec::new();
-    emit_binding_tokens(&mut tokens, source, resolved, stdlib_modules);
-    emit_reference_tokens(&mut tokens, source, resolved, stdlib_modules);
+    emit_binding_tokens(&mut tokens, source, resolved, stdlib_modules, &newtype_names);
+    emit_reference_tokens(&mut tokens, source, resolved, stdlib_modules, &newtype_names);
     emit_module_path_tokens(&mut tokens, source, module, stdlib_modules);
     emit_ast_tokens(
         &mut tokens,
@@ -174,6 +183,33 @@ pub fn compute(
         result_id: None,
         data: encode(&tokens),
     }
+}
+
+/// Walk the module's top-level statements and collect every name
+/// declared as `NAME = NewType("NAME", BASE)`. This matches what the
+/// preprocess pass emits for `newtype NAME = BASE`; bare `NewType(...)`
+/// calls authored by hand in Python style match the same shape and are
+/// included by design.
+fn collect_newtype_names(module: &ModModule) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    for stmt in &module.body {
+        if let Stmt::Assign(a) = stmt {
+            if a.targets.len() != 1 {
+                continue;
+            }
+            let Expr::Name(target) = &a.targets[0] else {
+                continue;
+            };
+            if let Expr::Call(call) = a.value.as_ref() {
+                if let Expr::Name(func) = call.func.as_ref() {
+                    if func.id.as_str() == "NewType" {
+                        out.insert(target.id.as_str().to_owned());
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Convert absolute-positioned tokens into the LSP delta stream.
@@ -206,10 +242,29 @@ fn emit_binding_tokens(
     source: &str,
     resolved: &ResolvedModule,
     stdlib_modules: &[&str],
+    newtype_names: &std::collections::HashSet<String>,
 ) {
     for scope in &resolved.scopes {
+        let in_class_body = scope.kind == tyc_resolve::ScopeKind::Class;
         for binding in &scope.bindings {
-            if let Some(tok) = token_for_binding(binding, source, stdlib_modules, true) {
+            if let Some(mut tok) = token_for_binding(binding, source, stdlib_modules, true) {
+                if binding.kind == BindingKind::Value {
+                    if newtype_names.contains(&binding.name) {
+                        // `NAME = NewType("NAME", BASE)` — nominal type
+                        // alias. Paint as `class` so it matches `pub
+                        // class X:` declarations rather than rendering
+                        // as a generic local variable.
+                        tok.token_type = TOKEN_CLASS;
+                    } else if in_class_body {
+                        // Class-body field declarations (`name: T = ...`
+                        // / `name: T`) are dataclass slots, not locals.
+                        // `property` is the same kind Pylance emits for
+                        // Python `@dataclass` fields and matches what
+                        // users get for `obj.field` access elsewhere in
+                        // the file.
+                        tok.token_type = TOKEN_PROPERTY;
+                    }
+                }
                 tokens.push(tok);
             }
         }
@@ -221,6 +276,7 @@ fn emit_reference_tokens(
     source: &str,
     resolved: &ResolvedModule,
     stdlib_modules: &[&str],
+    newtype_names: &std::collections::HashSet<String>,
 ) {
     for reference in &resolved.references {
         let Some(binding) = lookup_binding(resolved, &reference.name, reference.scope) else {
@@ -233,6 +289,9 @@ fn emit_reference_tokens(
                 tok.col = col;
                 tok.length = length;
                 tok.modifiers &= !MOD_DECLARATION;
+                if binding.kind == BindingKind::Value && newtype_names.contains(&binding.name) {
+                    tok.token_type = TOKEN_CLASS;
+                }
                 tokens.push(tok);
             }
         }
@@ -1416,5 +1475,75 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Regression: `newtype DocId = int` desugars to
+    /// `DocId = NewType("DocId", int)`, which the resolver registers
+    /// as `BindingKind::Value`. Without the newtype-name overlay in
+    /// `compute`, every reference to `DocId` would render as a
+    /// generic `variable` token — light blue in Dark+, plain text in
+    /// most user themes — instead of the `class` colour every other
+    /// type reference uses. The user's screenshot of
+    /// `examples/apps/09-search-engine/src/index.ty` flagged exactly
+    /// this asymmetry: `Document` (a real class) painted as a class,
+    /// but `DocId` (a newtype) painted as a local variable.
+    #[test]
+    fn newtype_decl_and_refs_paint_as_class() {
+        let src = "pub newtype DocId = int\n\
+                   pub def first(id: DocId) -> DocId:\n\
+                  \x20    return id\n";
+        let (source, resolved, module) = parse_and_resolve(src);
+        let stdlib_list = stdlib();
+        let stdlib_refs: Vec<&str> = stdlib_list.to_vec();
+        let result = compute(
+            &source,
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &CalleeSignatures::new(),
+            &AttributeKinds::new(),
+        );
+        // Three `DocId` occurrences: declaration, parameter type,
+        // return type. All three should be `class` tokens.
+        let types = collect_token_types_for(&source, "DocId", &result.data);
+        assert_eq!(
+            types,
+            vec![TOKEN_CLASS, TOKEN_CLASS, TOKEN_CLASS],
+            "expected every DocId site to render as class, got {:?}",
+            types
+        );
+    }
+
+    /// Class-body field declarations (`name: T = ...` inside a
+    /// `class` block) emit as `dataclass` slots at runtime, not as
+    /// locals. Pylance / TS / TypeScript-style themes paint
+    /// `obj.field` access as `property`; matching the declaration
+    /// site keeps the in-class and out-of-class colour consistent.
+    #[test]
+    fn class_body_fields_paint_as_property() {
+        let src = "pub class Document:\n\
+                   \x20   id: int\n\
+                   \x20   title: str\n";
+        let (source, resolved, module) = parse_and_resolve(src);
+        let stdlib_list = stdlib();
+        let stdlib_refs: Vec<&str> = stdlib_list.to_vec();
+        let result = compute(
+            &source,
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &CalleeSignatures::new(),
+            &AttributeKinds::new(),
+        );
+        assert_eq!(
+            collect_token_types_for(&source, "id", &result.data),
+            vec![TOKEN_PROPERTY],
+            "class-body field `id` should paint as property, not variable"
+        );
+        assert_eq!(
+            collect_token_types_for(&source, "title", &result.data),
+            vec![TOKEN_PROPERTY],
+            "class-body field `title` should paint as property, not variable"
+        );
     }
 }

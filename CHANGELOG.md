@@ -213,6 +213,31 @@ new warning is non-fatal.
   `pub freeze let`, sealed-union impls, the `?` operator, and the
   `lazy_let` runtime helper). The bump tracks the new tyc release.
 
+### Fixed — LSP semantic tokens
+
+- **`newtype` declarations now paint as `class` everywhere.** `newtype
+  DocId = int` desugars to `DocId = NewType("DocId", int)`, which the
+  resolver registers as a `BindingKind::Value` — same kind a plain
+  `let x = 1` gets. Every reference site (`def f(id: DocId) -> DocId:`)
+  was therefore emitted as the generic `variable` semantic-token type
+  and rendered as the local-variable colour (light blue in Dark+,
+  plain text in most user themes) while real classes like `Document`
+  defined right next to them rendered as `class`. The user's
+  screenshot of `examples/apps/09-search-engine/src/index.ty`
+  surfaced exactly this asymmetry. `tyc-lsp::semantic` now walks the
+  module for `NAME = NewType("NAME", BASE)` shapes and promotes both
+  the declaration and every reference to the `class` token, matching
+  how `pub class X:` declarations already paint.
+- **Class-body field declarations now paint as `property` instead of
+  `variable`.** `pub class Document: id: int` used to emit `id` as a
+  local-variable token even though it's a dataclass slot, which made
+  field names render with the local-binding colour rather than the
+  property colour Pylance gives Python `@dataclass` fields. The token
+  type now derives from the binding's enclosing scope kind so
+  class-body Value bindings emit as `property` and function/module
+  Value bindings stay as `variable`. Keeps the in-class declaration
+  consistent with the `obj.field` access elsewhere in the file.
+
 ## 0.5.2
 
 A correctness + documentation point release on top of v0.5.1. Two
