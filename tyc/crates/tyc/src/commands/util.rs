@@ -346,7 +346,11 @@ mod tests {
         diags.push_warning(stub_mismatch_warning());
         let config = TyphonConfig::default(); // stub_check defaults to "error"
         let out = apply_strictness(diags, &config);
-        assert_eq!(out.errors().len(), 1, "StubMismatch must be an error with stub-check=error");
+        assert_eq!(
+            out.errors().len(),
+            1,
+            "StubMismatch must be an error with stub-check=error"
+        );
         assert_eq!(out.warning_count(), 0);
         assert!(matches!(out.errors()[0], TycError::StubMismatch { .. }));
     }
@@ -358,7 +362,11 @@ mod tests {
         let mut config = TyphonConfig::default();
         config.strictness.stub_check = "warn".into();
         let out = apply_strictness(diags, &config);
-        assert_eq!(out.errors().len(), 0, "StubMismatch must stay warning with stub-check=warn");
+        assert_eq!(
+            out.errors().len(),
+            0,
+            "StubMismatch must stay warning with stub-check=warn"
+        );
         assert_eq!(out.warning_count(), 1);
         assert!(matches!(out.warnings()[0], TycError::StubMismatch { .. }));
     }
@@ -370,7 +378,11 @@ mod tests {
         let mut config = TyphonConfig::default();
         config.strictness.stub_check = "off".into();
         let out = apply_strictness(diags, &config);
-        assert_eq!(out.errors().len(), 0, "StubMismatch must be dropped with stub-check=off");
+        assert_eq!(
+            out.errors().len(),
+            0,
+            "StubMismatch must be dropped with stub-check=off"
+        );
         assert_eq!(out.warning_count(), 0);
     }
 
@@ -393,6 +405,9 @@ mod tests {
             1,
             "MethodInClassBody warning must survive stub-check=off"
         );
-        assert!(matches!(out.warnings()[0], TycError::MethodInClassBody { .. }));
+        assert!(matches!(
+            out.warnings()[0],
+            TycError::MethodInClassBody { .. }
+        ));
     }
 }
