@@ -1,0 +1,367 @@
+import asyncio
+
+from config import JobConfig
+from event import (
+    Envelope,
+    is_end,
+    is_record,
+    is_watermark,
+    make_record_envelope,
+)
+from ids import JobId, OperatorId, Offset, StreamKey, WatermarkTs, WindowId
+from keyed_state import KeyedAggState, new_keyed_state
+from models import AggregateRow, StockTick
+from sink import LateSideOutput, Sink
+from source import Source
+from stream_op import Operator
+from topology import Topology
+from watermark import WatermarkGenerator, is_late, new_watermark_generator
+from window import Pane, new_pane, pane_to_row
+
+
+# An in-memory durable journal entry. The runner appends one entry per consumed
+# envelope; on restart the runner reads from the last committed offset. For
+# this demo "durable" = lives in a list in memory.
+pub class JournalEntry:
+    offset: Offset
+    operator_id: OperatorId
+    envelope_kind: str
+    timestamp_ms: int
+
+
+pub class Journal:
+    entries: list[JournalEntry]
+    next_offset: int
+    committed_offset: int
+
+
+pub def new_journal() -> Journal:
+    return Journal(entries=[], next_offset=0, committed_offset=-1)
+
+
+impl Journal:
+    def append(self, operator_id: OperatorId, env: Envelope) -> Offset:
+        let off: Offset = Offset(self.next_offset)
+        let kind: str = "record"
+        if is_record(env):
+            self.next_offset = self.next_offset + 1
+        elif is_watermark(env):
+            self.next_offset = self.next_offset + 1
+        elif is_end(env):
+            self.next_offset = self.next_offset + 1
+        else:
+            self.next_offset = self.next_offset + 1
+        let kind_label: str = self._envelope_label(env)
+        self.entries.append(JournalEntry(
+            offset=off,
+            operator_id=operator_id,
+            envelope_kind=kind_label,
+            timestamp_ms=env.timestamp_ms,
+        ))
+        return off
+
+    def _envelope_label(self, env: Envelope) -> str:
+        if is_record(env):
+            return "record"
+        if is_watermark(env):
+            return "watermark"
+        if is_end(env):
+            return "end"
+        return "barrier"
+
+    def ack(self, off: Offset) -> None:
+        let raw: int = int(off)
+        if raw > self.committed_offset:
+            self.committed_offset = raw
+
+    def replay_from(self, off: Offset) -> list[JournalEntry]:
+        mut out: list[JournalEntry] = []
+        let raw: int = int(off)
+        for e in self.entries:
+            if int(e.offset) >= raw:
+                out.append(e)
+        return out
+
+    def last_committed(self) -> Offset:
+        return Offset(self.committed_offset)
+
+
+# Stats collected during a job run.
+pub class JobStats:
+    records_produced: int
+    records_emitted: int
+    watermarks_emitted: int
+    aggregate_rows: int
+    late_drops: int
+    panes_closed: int
+
+
+pub def new_job_stats() -> JobStats:
+    return JobStats(
+        records_produced=0,
+        records_emitted=0,
+        watermarks_emitted=0,
+        aggregate_rows=0,
+        late_drops=0,
+        panes_closed=0,
+    )
+
+
+# A window-operator state lives inside the runner — it tracks open panes per
+# key for tumbling/sliding windows and flushes them when the watermark advances
+# past each pane's end.
+pub class WindowOpState:
+    op_id: OperatorId
+    size_ms: int
+    slide_ms: int
+    kind_label: str
+    keyed: KeyedAggState
+    open_panes: dict[int, Pane]
+    next_pane_id: int
+
+
+pub def new_window_op_state(
+    op_id: OperatorId, size_ms: int, slide_ms: int, kind_label: str,
+) -> WindowOpState:
+    return WindowOpState(
+        op_id=op_id,
+        size_ms=size_ms,
+        slide_ms=slide_ms,
+        kind_label=kind_label,
+        keyed=new_keyed_state(),
+        open_panes={},
+        next_pane_id=0,
+    )
+
+
+def _pane_dict_key(key: StreamKey, start_ms: int) -> int:
+    # Combine key + start_ms into a stable int hash. Python `hash(...)` works
+    # for tuples of (str, int).
+    let raw: tuple[str, int] = (str(key), start_ms)
+    return hash(raw)
+
+
+impl WindowOpState:
+    def assign_for(self, ts_ms: int) -> list[tuple[int, int]]:
+        if self.kind_label == "tumbling":
+            let start: int = (ts_ms // self.size_ms) * self.size_ms
+            return [(start, start + self.size_ms)]
+        if self.kind_label == "sliding":
+            mut out: list[tuple[int, int]] = []
+            let last_start: int = (ts_ms // self.slide_ms) * self.slide_ms
+            mut s: int = last_start
+            while s > ts_ms - self.size_ms and s >= 0:
+                out.append((s, s + self.size_ms))
+                s = s - self.slide_ms
+            return out
+        # session windows: produce a window of [ts_ms, ts_ms + gap)
+        return [(ts_ms, ts_ms + self.size_ms)]
+
+    def observe_record(self, env: Envelope, value: float) -> None:
+        let assignments: list[tuple[int, int]] = self.assign_for(env.timestamp_ms)
+        for assign in assignments:
+            let start_ms: int = assign[0]
+            let end_ms: int = assign[1]
+            let pkey: int = _pane_dict_key(env.key, start_ms)
+            let existing: Pane? = self.open_panes.get(pkey)
+            if existing is None:
+                self.next_pane_id = self.next_pane_id + 1
+                let pane: Pane = new_pane(
+                    WindowId(self.next_pane_id), env.key, start_ms, end_ms,
+                )
+                pane.cell.observe(value)
+                self.open_panes[pkey] = pane
+            else:
+                existing.cell.observe(value)
+
+    def flush_closed(self, wm: WatermarkTs) -> list[AggregateRow]:
+        mut out: list[AggregateRow] = []
+        mut keys_to_remove: list[int] = []
+        let wm_ms: int = int(wm)
+        for pkey in self.open_panes:
+            let pane: Pane = self.open_panes[pkey]
+            if pane.end_ms <= wm_ms:
+                out.append(pane_to_row(pane))
+                keys_to_remove.append(pkey)
+        for k in keys_to_remove:
+            self.open_panes.pop(k, None)
+        return out
+
+    def force_flush_all(self) -> list[AggregateRow]:
+        mut out: list[AggregateRow] = []
+        for pkey in self.open_panes:
+            let pane: Pane = self.open_panes[pkey]
+            out.append(pane_to_row(pane))
+        self.open_panes = {}
+        return out
+
+
+# The main runner. Holds a list of asyncio.Queues — one per topology edge — and
+# spawns one coroutine per operator with `go`. Watermarks propagate by being
+# forwarded as envelopes alongside records.
+pub class Runner:
+    job_id: JobId
+    topology: Topology
+    config: JobConfig
+    stats: JobStats
+    journal: Journal
+    wm_gen: WatermarkGenerator
+    window_state: WindowOpState
+    late_output: LateSideOutput
+    captured_rows: list[AggregateRow]
+
+
+pub def new_runner(
+    job_id: JobId, topo: Topology, cfg: JobConfig,
+) -> Runner:
+    let window_state: WindowOpState = new_window_op_state(
+        OperatorId("window-agg"),
+        cfg.window_ms,
+        cfg.slide_ms,
+        "tumbling",
+    )
+    return Runner(
+        job_id=job_id,
+        topology=topo,
+        config=cfg,
+        stats=new_job_stats(),
+        journal=new_journal(),
+        wm_gen=new_watermark_generator(cfg.lateness_ms),
+        window_state=window_state,
+        late_output=topo.late_side_output,
+        captured_rows=[],
+    )
+
+
+# Dispatch helpers — applied by run_operator to forwarded envelopes.
+
+def _extract_price(env: Envelope) -> float:
+    let payload: object = env.record_payload
+    if isinstance(payload, StockTick):
+        return float(payload.price_cents) / 100.0
+    return 0.0
+
+
+impl Runner:
+    async def run_source(self, src: Source, out_q: asyncio.Queue) -> None:
+        # Drive the source until it yields an EndOfStream marker.
+        while True:
+            let batch: list[Envelope] = src.produce()
+            mut saw_end: bool = False
+            for env in batch:
+                self.journal.append(src.id, env)
+                if is_record(env):
+                    self.stats.records_produced = self.stats.records_produced + 1
+                if is_watermark(env):
+                    self.stats.watermarks_emitted = self.stats.watermarks_emitted + 1
+                if is_end(env):
+                    saw_end = True
+                await out_q.put(env)
+            if saw_end:
+                return
+            if len(batch) == 0:
+                await asyncio.sleep(0)
+
+    async def run_operator(
+        self,
+        op: Operator[object, object],
+        in_q: asyncio.Queue,
+        out_q: asyncio.Queue,
+    ) -> None:
+        while True:
+            let env: Envelope = await in_q.get()
+            let off: Offset = self.journal.append(op.id, env)
+            if is_end(env):
+                let tail: list[Envelope] = op.on_end()
+                for t_env in tail:
+                    await out_q.put(t_env)
+                await out_q.put(env)
+                self.journal.ack(off)
+                return
+            let produced: list[Envelope] = op.step(env)
+            for produced_env in produced:
+                await out_q.put(produced_env)
+            self.journal.ack(off)
+
+    async def run_window_aggregate(
+        self,
+        in_q: asyncio.Queue,
+        out_q: asyncio.Queue,
+    ) -> None:
+        while True:
+            let env: Envelope = await in_q.get()
+            let off: Offset = self.journal.append(self.window_state.op_id, env)
+            if is_end(env):
+                # Flush any still-open panes before terminating.
+                let trailing: list[AggregateRow] = self.window_state.force_flush_all()
+                await self._emit_rows(out_q, trailing)
+                await out_q.put(env)
+                self.journal.ack(off)
+                return
+            if is_watermark(env):
+                self.wm_gen.observe(env.timestamp_ms)
+                let wm_after_wm: WatermarkTs = self.wm_gen.current()
+                let closed_after_wm: list[AggregateRow] = self.window_state.flush_closed(wm_after_wm)
+                await self._emit_rows(out_q, closed_after_wm)
+                await out_q.put(env)
+                self.journal.ack(off)
+                continue
+            if is_record(env):
+                self.wm_gen.observe(env.timestamp_ms)
+                let wm_after_rec: WatermarkTs = self.wm_gen.current()
+                if is_late(env.timestamp_ms, wm_after_rec):
+                    self.late_output.push(env)
+                    self.stats.late_drops = self.stats.late_drops + 1
+                    self.journal.ack(off)
+                    continue
+                let value: float = _extract_price(env)
+                self.window_state.observe_record(env, value)
+                # Periodically flush panes that have closed under the new
+                # watermark.
+                let closed_after_rec: list[AggregateRow] = self.window_state.flush_closed(wm_after_rec)
+                await self._emit_rows(out_q, closed_after_rec)
+                self.journal.ack(off)
+                continue
+            # Barrier or unknown — forward as-is.
+            await out_q.put(env)
+            self.journal.ack(off)
+
+    async def _emit_rows(
+        self, out_q: asyncio.Queue, rows: list[AggregateRow],
+    ) -> None:
+        for row in rows:
+            self.stats.aggregate_rows = self.stats.aggregate_rows + 1
+            self.stats.panes_closed = self.stats.panes_closed + 1
+            self.captured_rows.append(row)
+            await out_q.put(make_record_envelope(
+                row.window_end_ms, row.key, row,
+            ))
+
+    async def run_sink(self, sink: Sink, in_q: asyncio.Queue) -> None:
+        while True:
+            let env: Envelope = await in_q.get()
+            let off: Offset = self.journal.append(sink.id, env)
+            if is_record(env):
+                self.stats.records_emitted = self.stats.records_emitted + 1
+            sink.accept(env)
+            self.journal.ack(off)
+            if is_end(env):
+                return
+
+    def captured(self) -> list[AggregateRow]:
+        mut out: list[AggregateRow] = []
+        for row in self.captured_rows:
+            out.append(row)
+        return out
+
+    def stats_summary(self) -> str:
+        let s: JobStats = self.stats
+        return (
+            f"records_produced={s.records_produced} "
+            f"records_emitted={s.records_emitted} "
+            f"watermarks={s.watermarks_emitted} "
+            f"aggregate_rows={s.aggregate_rows} "
+            f"late_drops={s.late_drops} "
+            f"panes_closed={s.panes_closed} "
+            f"journal_committed={int(self.journal.last_committed())}"
+        )

@@ -1,0 +1,6 @@
+pub newtype OperatorId = str
+pub newtype JobId = str
+pub newtype WatermarkTs = int
+pub newtype Offset = int
+pub newtype WindowId = int
+pub newtype StreamKey = str
