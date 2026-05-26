@@ -156,7 +156,7 @@ format = true                   # post-process emitted Python through ruff forma
 
 [strictness]
 no-implicit-any = true          # require explicit element types on list/dict/tuple/set
-unused-import = "error"         # "warn" downgrades to a warning
+unused-import = "warn"          # "error" promotes to a build break
 exhaustive-match = "error"      # require `match` on sealed unions to cover every variant
 methods-in-class-body = "warn"  # "error" promotes Rule 4 to a build break
 auto-memoise = false            # cache every pure function via @functools.cache

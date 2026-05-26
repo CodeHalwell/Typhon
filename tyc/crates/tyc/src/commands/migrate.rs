@@ -39,7 +39,7 @@
 //! Output is written next to the input with the `.ty` extension; `--check`
 //! emits to stdout without touching the disk so the user can preview.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use clap::Args;
@@ -94,9 +94,30 @@ pub fn run(args: MigrateArgs) -> Result<()> {
 /// rewrites incrementally on a buffer.
 pub fn migrate_source(source: &str) -> String {
     let reassigned = collect_reassigned_names(source);
-    let bang_class_lines = collect_bang_class_lines(source);
+    let mut bang_class_lines = collect_bang_class_lines(source);
     let frozen_class_lines = collect_frozen_class_lines(source);
     let frozen_decorator_lines = collect_frozen_decorator_lines(source);
+
+    // FINDINGS #33: identify classes whose hand-rolled `__init__` body is
+    // exactly `self.field = field` for each parameter. The migrator can
+    // safely strip such an `__init__` and let Typhon's auto-`__init__`
+    // synthesis take over — the result is a plain `class` (NOT `class!`)
+    // with field declarations matching the parameter types. Without this
+    // pass the textual rewriter promotes any class with an `__init__`
+    // to `class!`, which then fails `tyc check` with `manual_init` if the
+    // user re-runs the migrated file. The function returns:
+    //   1. `trivial`: line indices of class headers whose init is trivial.
+    //   2. `skip`: line indices to drop verbatim (the `__init__` body).
+    //   3. `inject`: per-class-header field declarations to append at the
+    //      end of the (otherwise unchanged) class body.
+    let (trivial_init_classes, skip_lines, injected_fields) =
+        collect_trivial_init_classes(source);
+    // Pull these classes out of `bang_class_lines` so the textual
+    // rewriter leaves them as plain `class …:` instead of bumping them
+    // to `class! …:` (the dataclass-style default is what we want).
+    for line in &trivial_init_classes {
+        bang_class_lines.remove(line);
+    }
 
     // Scope stack so the line rewriter knows whether we're currently
     // inside a `class` body (skip `let`/`mut` prepending — those are
@@ -118,6 +139,14 @@ pub fn migrate_source(source: &str) -> String {
     for (line_index, line) in source.split_inclusive('\n').enumerate() {
         let raw = line.trim_end_matches(['\n', '\r']);
         let terminator = &line[raw.len()..];
+
+        // FINDINGS #33: drop lines belonging to a stripped trivial `__init__`.
+        // Skipping the whole line (including its trailing newline) keeps
+        // the byte-level output tidy — no blank-line clusters where the
+        // method used to live.
+        if skip_lines.contains(&line_index) {
+            continue;
+        }
 
         let trimmed = raw.trim_start();
         let indent = raw.len() - trimmed.len();
@@ -197,6 +226,22 @@ pub fn migrate_source(source: &str) -> String {
 
         out.push_str(&rewritten);
         out.push_str(terminator);
+
+        // FINDINGS #33: when this line opened a trivial-init class,
+        // emit the synthesised field declarations immediately after it
+        // so the rewritten output reads like a normal dataclass-style
+        // body. Indent matches the class header (header indent + 4),
+        // covering both top-level and nested class declarations.
+        if let Some(fields) = injected_fields.get(&line_index) {
+            let body_indent = " ".repeat(indent + 4);
+            for (name, ty) in fields {
+                out.push_str(&body_indent);
+                out.push_str(name);
+                out.push_str(": ");
+                out.push_str(ty);
+                out.push_str(terminator);
+            }
+        }
     }
 
     out
@@ -557,6 +602,297 @@ fn rewrite_generic_class_base(line: &str) -> Option<String> {
         "{}{}{}{}",
         keyword, new_name_part, new_bases, trailer
     ))
+}
+
+/// FINDINGS #33: identify classes whose `__init__` body is just the
+/// canonical `self.field = field` mirror of its parameter list — those
+/// can be safely stripped because Typhon's auto-`__init__` synthesis
+/// will produce the same constructor (and the resulting class stays
+/// plain `class`, not `class!`). Returns:
+///   - the set of *class header* line indices to demote out of
+///     `bang_class_lines`,
+///   - the set of *line indices to drop* verbatim (everything from the
+///     `def __init__` header through the last assignment in its body),
+///   - a per-class map of field declarations `(name, type)` to inject
+///     into the body, in declaration order.
+///
+/// "Trivial" is intentionally narrow:
+///   - body lines are exclusively `self.NAME = NAME` assignments,
+///   - one assignment per init parameter (excluding `self`),
+///   - the assignment name matches the parameter name exactly,
+///   - every parameter carries a type annotation,
+///   - no `super().__init__(...)`, no defaults, no `*args` / `**kwargs`,
+///   - no `@dataclass` decorator on the class (handled elsewhere).
+///
+/// Anything more exotic stays on the `class!` path so the user keeps
+/// their custom constructor — strip-and-synthesise would silently drop
+/// real logic. False-negatives are preferred over false-positives.
+fn collect_trivial_init_classes(
+    source: &str,
+) -> (
+    HashSet<usize>,
+    HashSet<usize>,
+    HashMap<usize, Vec<(String, String)>>,
+) {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut trivial: HashSet<usize> = HashSet::new();
+    let mut skip: HashSet<usize> = HashSet::new();
+    let mut inject: HashMap<usize, Vec<(String, String)>> = HashMap::new();
+
+    for (idx, raw) in lines.iter().enumerate() {
+        let trimmed = raw.trim_start();
+        let is_class = trimmed.starts_with("class ") || trimmed == "class";
+        if !is_class {
+            continue;
+        }
+        let class_indent = raw.len() - trimmed.len();
+
+        // Skip classes with a `@dataclass[(...)]` decorator on the
+        // contiguous decorator stack — those already use synthesised
+        // init via Python's dataclass machinery, and the migrator drops
+        // the decorator while leaving the class header alone.
+        let mut probe = idx;
+        let mut had_dataclass_decorator = false;
+        while probe > 0 {
+            probe -= 1;
+            let prev = lines[probe];
+            let prev_trim = prev.trim_start();
+            if prev_trim.is_empty() {
+                continue;
+            }
+            let prev_indent = prev.len() - prev_trim.len();
+            if prev_indent != class_indent || !prev_trim.starts_with('@') {
+                break;
+            }
+            if let Some(after) = prev_trim.strip_prefix("@dataclass") {
+                let after = after.trim();
+                if after.is_empty() || after.starts_with('(') {
+                    had_dataclass_decorator = true;
+                    break;
+                }
+            }
+        }
+        if had_dataclass_decorator {
+            continue;
+        }
+
+        // Locate the class body indent. Anything at indent <= class_indent
+        // ends the class body. Search for `def __init__` at the body
+        // indent only — nested `__init__`s on inner classes belong to
+        // those inner classes and are handled in their own iteration.
+        let mut body_indent: Option<usize> = None;
+        let mut init_header: Option<usize> = None;
+        let mut look = idx + 1;
+        while look < lines.len() {
+            let cand = lines[look];
+            let cand_trim = cand.trim_start();
+            if cand_trim.is_empty() || cand_trim.starts_with('#') {
+                look += 1;
+                continue;
+            }
+            let cand_indent = cand.len() - cand_trim.len();
+            if cand_indent <= class_indent {
+                break;
+            }
+            let bi = *body_indent.get_or_insert(cand_indent);
+            if cand_indent == bi
+                && cand_trim.starts_with("def __init__")
+                && cand_trim
+                    .as_bytes()
+                    .get("def __init__".len())
+                    .is_some_and(|&b| b == b'(' || b == b' ' || b == b'\t')
+            {
+                init_header = Some(look);
+                break;
+            }
+            look += 1;
+        }
+        let (Some(init_line), Some(body_indent)) = (init_header, body_indent) else {
+            continue;
+        };
+
+        // The `def __init__(...)` header may span multiple lines. Walk
+        // forward joining lines until paren depth balances. Stop at a
+        // `:` followed by EOL or a comment.
+        let mut header_end = init_line;
+        let mut header_buf = String::new();
+        let mut depth: i32 = 0;
+        let mut found_colon = false;
+        while header_end < lines.len() && !found_colon {
+            let l = lines[header_end];
+            // Strip trailing comment for the colon scan.
+            let scan = l.split('#').next().unwrap_or("");
+            for b in scan.bytes() {
+                match b {
+                    b'(' | b'[' | b'{' => depth += 1,
+                    b')' | b']' | b'}' => depth -= 1,
+                    b':' if depth == 0 => {
+                        found_colon = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            header_buf.push_str(l);
+            header_buf.push(' ');
+            if found_colon {
+                break;
+            }
+            header_end += 1;
+        }
+        if !found_colon {
+            continue;
+        }
+
+        // Parse `def __init__(self, name: T, age: int) -> ...:`
+        let header = header_buf.trim();
+        let after_def = match header.strip_prefix(|c: char| c.is_whitespace()).unwrap_or(header)
+            .strip_prefix("def __init__")
+        {
+            Some(s) => s.trim(),
+            None => continue,
+        };
+        let paren_open = match after_def.find('(') {
+            Some(i) => i,
+            None => continue,
+        };
+        // Find the matching `)` at depth 0.
+        let bytes = after_def.as_bytes();
+        let mut d: i32 = 0;
+        let mut paren_close: Option<usize> = None;
+        for (i, b) in bytes.iter().enumerate().skip(paren_open) {
+            match *b {
+                b'(' | b'[' | b'{' => d += 1,
+                b')' | b']' | b'}' => {
+                    d -= 1;
+                    if d == 0 && *b == b')' {
+                        paren_close = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(paren_close) = paren_close else {
+            continue;
+        };
+        let params_src = &after_def[paren_open + 1..paren_close];
+        let params: Vec<&str> = split_top_level_commas(params_src)
+            .into_iter()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        // Drop `self`; everything else must have a type annotation and
+        // no default. Bail if `*args` / `**kwargs` appears anywhere.
+        if params.first().copied() != Some("self") {
+            continue;
+        }
+        let mut typed_params: Vec<(String, String)> = Vec::new();
+        let mut malformed = false;
+        for p in &params[1..] {
+            if p.starts_with('*') || p.contains('=') {
+                malformed = true;
+                break;
+            }
+            let Some(colon) = p.find(':') else {
+                malformed = true;
+                break;
+            };
+            let name = p[..colon].trim().to_owned();
+            let ty = p[colon + 1..].trim().to_owned();
+            if name.is_empty() || ty.is_empty() {
+                malformed = true;
+                break;
+            }
+            typed_params.push((name, ty));
+        }
+        if malformed || typed_params.is_empty() {
+            // Empty-param `__init__(self)` is a no-op constructor; it's
+            // safe to drop too, but we already special-case that below
+            // by requiring at least one parameter to keep the diagnostic
+            // narrow. Falling through is fine — class stays on the
+            // `class!` path with an explicit empty init.
+            continue;
+        }
+
+        // Walk the body. Body extends from header_end+1 up to the next
+        // line whose indent is <= class_indent (or EOF).
+        let mut body_lines: Vec<usize> = Vec::new();
+        let mut i = header_end + 1;
+        while i < lines.len() {
+            let l = lines[i];
+            let lt = l.trim_start();
+            if lt.is_empty() || lt.starts_with('#') {
+                body_lines.push(i);
+                i += 1;
+                continue;
+            }
+            let ind = l.len() - lt.len();
+            if ind <= body_indent {
+                break;
+            }
+            body_lines.push(i);
+            i += 1;
+        }
+        // Inside the body, ignore blank/comment lines for the pattern
+        // match. Every remaining line must be `self.NAME = NAME` at
+        // body_indent + 4 (one level deeper than the def header).
+        let mut assignments: Vec<String> = Vec::new();
+        let mut trivial_body = true;
+        for li in &body_lines {
+            let l = lines[*li];
+            let lt = l.trim_start();
+            if lt.is_empty() || lt.starts_with('#') {
+                continue;
+            }
+            // The body must consist only of `self.NAME = NAME` lines.
+            let Some(rhs) = lt.strip_prefix("self.") else {
+                trivial_body = false;
+                break;
+            };
+            let Some(eq) = rhs.find('=') else {
+                trivial_body = false;
+                break;
+            };
+            let field = rhs[..eq].trim().to_owned();
+            let value = rhs[eq + 1..].trim().trim_end_matches(['\r', '\n']).to_owned();
+            // Strip a possible trailing comment.
+            let value = value.split('#').next().unwrap_or(&value).trim().to_owned();
+            if field != value {
+                trivial_body = false;
+                break;
+            }
+            assignments.push(field);
+        }
+        if !trivial_body {
+            continue;
+        }
+        // Every parameter must have a matching assignment in declaration
+        // order. Allowing extra fields would silently lose information;
+        // allowing fewer would mean some param goes unused.
+        let param_names: Vec<&String> = typed_params.iter().map(|(n, _)| n).collect();
+        let assigned_names: Vec<&String> = assignments.iter().collect();
+        if param_names != assigned_names {
+            continue;
+        }
+
+        trivial.insert(idx);
+        // Drop the entire __init__ method (header + body).
+        for li in init_line..=header_end {
+            skip.insert(li);
+        }
+        for li in body_lines {
+            skip.insert(li);
+        }
+        // Inject `name: type` per param into the class body.
+        // The fields are appended after the class header, BEFORE any
+        // other class-body content the user wrote, by tracking them
+        // against the class header's line index in `inject`. We attach
+        // to header line idx so the rewriter sees them paired up.
+        inject.insert(idx, typed_params);
+    }
+
+    (trivial, skip, inject)
 }
 
 fn collect_bang_class_lines(source: &str) -> HashSet<usize> {
@@ -1686,6 +2022,62 @@ mod tests {
         let out = migrate_source("# header comment\nx: int = 1\n");
         assert!(out.contains("# header comment"), "got: {out}");
         assert!(out.contains("let x: int = 1"), "got: {out}");
+    }
+
+    #[test]
+    fn trivial_init_class_loses_init_and_stays_plain_class() {
+        // FINDINGS #33: `class Box(Generic[T]): def __init__(self, value: T) -> None: self.value = value`
+        // is a textbook trivial init — strip it so Typhon's
+        // auto-`__init__` synthesis takes over, and keep the header
+        // as plain `class`, not `class!`.
+        let src = "\
+from typing import Generic, TypeVar
+T = TypeVar(\"T\")
+
+class Box(Generic[T]):
+    def __init__(self, value: T) -> None:
+        self.value = value
+";
+        let out = migrate_source(src);
+        // No `class!` and no `__init__` left over.
+        assert!(
+            !out.contains("class!"),
+            "trivial init should NOT promote to class!, got:\n{out}"
+        );
+        assert!(
+            !out.contains("def __init__"),
+            "trivial __init__ should be stripped, got:\n{out}"
+        );
+        // Field declaration injected from the parameter type.
+        assert!(
+            out.contains("value: T"),
+            "must inject `value: T` field, got:\n{out}"
+        );
+        // PEP 695 generic rewrite still fires.
+        assert!(
+            out.contains("class Box[T]:"),
+            "header should be `class Box[T]:`, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn nontrivial_init_still_becomes_class_bang() {
+        // The dropped-init shortcut must NOT fire when the body does
+        // anything beyond `self.field = field` — `super().__init__()`,
+        // computed values, side effects must keep their hand-rolled
+        // constructor (and hence `class!`).
+        let src = "\
+class MyModel(nn.Module):
+    def __init__(self, layers: int) -> None:
+        super().__init__()
+        self.layers = layers
+";
+        let out = migrate_source(src);
+        assert!(
+            out.contains("class! MyModel(nn.Module):"),
+            "non-trivial init must stay on class!, got:\n{out}"
+        );
+        assert!(out.contains("def __init__"), "init body must survive, got:\n{out}");
     }
 
     #[test]
