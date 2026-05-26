@@ -6151,6 +6151,18 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         let Expr::Name(target) = a.target.as_ref() else {
                             continue;
                         };
+                        // FINDINGS v0.7.1 #12: `ClassVar[...]` fields are
+                        // class-level constants, never participate in the
+                        // synthesised `__init__`, and therefore do not
+                        // contribute to positional argument ordering. Skip
+                        // them entirely — both as the "prior defaulted"
+                        // field that sets up the ordering rule and as the
+                        // "later non-defaulted" field that trips it. Detect
+                        // by inspecting the annotation for `ClassVar` /
+                        // `ClassVar[...]` shapes.
+                        if is_classvar_annotation(a.annotation.as_ref()) {
+                            continue;
+                        }
                         let name = target.id.as_str().to_owned();
                         if a.value.is_some() {
                             if prior_default.is_none() {
@@ -8295,6 +8307,19 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
 /// `dict.get(k)` which must return `V?`, not `V` — and is the right
 /// place to grow other built-in method types (`list.pop`, `str.find`,
 /// `re.match`, …) without scattering them across the inference engine.
+/// Return `true` when `ann` is the bare name `ClassVar` or a subscripted
+/// `ClassVar[...]` annotation. Used to skip the
+/// `tyc::field_default_ordering` check on class-level constants: they're
+/// excluded from the synthesised `__init__` and therefore have no impact
+/// on positional argument ordering. FINDINGS v0.7.1 #12.
+fn is_classvar_annotation(ann: &Expr) -> bool {
+    match ann {
+        Expr::Name(n) => n.id.as_str() == "ClassVar",
+        Expr::Subscript(s) => matches!(s.value.as_ref(), Expr::Name(n) if n.id.as_str() == "ClassVar"),
+        _ => false,
+    }
+}
+
 /// Return `true` when `head` is the name of a builtin generic container that
 /// the checker treats as having a closed attribute set (so an unknown attribute
 /// on `xs: list[int]` is a legitimate `tyc::attribute_not_found` site rather
@@ -16737,6 +16762,56 @@ def main() -> None:
         assert!(
             !d.has_errors(),
             "list.append must still resolve; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #12: `ClassVar` fields are excluded from the
+    /// synthesised `__init__`, so they must not trigger
+    /// `tyc::field_default_ordering`.
+    #[test]
+    fn v071_field_default_ordering_skips_classvar() {
+        let src = "\
+class Config:
+    DEFAULT_PORT: ClassVar[int] = 8080
+    host: str
+";
+        let d = check(src);
+        assert!(
+            !d.errors().iter().any(|e| matches!(e, TycError::FieldDefaultOrdering { .. })),
+            "ClassVar must not trip field_default_ordering; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #12: bare `ClassVar` (no subscript) also skipped.
+    #[test]
+    fn v071_field_default_ordering_skips_bare_classvar() {
+        let src = "\
+class Config:
+    flag: ClassVar = True
+    host: str
+";
+        let d = check(src);
+        assert!(
+            !d.errors().iter().any(|e| matches!(e, TycError::FieldDefaultOrdering { .. })),
+            "bare ClassVar must not trip field_default_ordering; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #12: the rule still fires for ordinary fields.
+    #[test]
+    fn v071_field_default_ordering_still_fires_on_regular_fields() {
+        let src = "\
+class Config:
+    port: int = 8080
+    host: str
+";
+        let d = check(src);
+        assert!(
+            d.errors().iter().any(|e| matches!(e, TycError::FieldDefaultOrdering { .. })),
+            "regular non-default-after-default must still fire; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
     }
