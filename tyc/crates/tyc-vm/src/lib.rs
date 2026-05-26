@@ -370,6 +370,30 @@ print(s.slug())
     }
 
     #[test]
+    fn lazy_let_inside_class_resolves() {
+        // FINDINGS #26: `lazy let` inside a class body lowers (in the
+        // preprocessor) to a `@cached_property` method, with a hidden
+        // `from functools import cached_property as _typhon_cached_property`
+        // import injected at module top. The functools shim now exposes
+        // `cached_property` as an identity decorator so the import
+        // resolves and the method is registered as a regular method on
+        // the class. Limitation: callers must invoke as `obj.name()`
+        // rather than `obj.name` because the VM has no descriptor
+        // protocol — documented at the cached_property registration
+        // site in builtins.rs.
+        let src = r#"
+class Counter:
+    n: int
+
+    lazy let doubled: int = self.n * 2
+
+let c = Counter(n=21)
+print(c.doubled())
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
     fn itertools_chain_and_accumulate() {
         // FINDINGS #27: `itertools.chain` and `accumulate` smoke test.
         let src = r#"
