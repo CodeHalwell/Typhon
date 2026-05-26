@@ -19,7 +19,7 @@ use ruff_python_ast::{
 use crate::env::{Env, EnvRef};
 use crate::error::{
     attribute_error, index_error, key_error, name_error, not_implemented, type_error, value_error,
-    zero_division, Unwind, VmException,
+    vm_unsupported_use_compile, zero_division, Unwind, VmException,
 };
 use crate::value::{
     Class, ClassField, DictMap, Function, HashKey, Instance, IterState, NativeFn, Value,
@@ -166,7 +166,7 @@ impl Interpreter {
             }
             Stmt::For(s) => {
                 if s.is_async {
-                    return Err(not_implemented("async for"));
+                    return Err(vm_unsupported_use_compile("async for"));
                 }
                 let iterable = self.eval_expr(&s.iter, env)?;
                 let iter = self.make_iter(iterable)?;
@@ -192,9 +192,7 @@ impl Interpreter {
             }
             Stmt::FunctionDef(f) => {
                 if f.is_async {
-                    return Err(not_implemented(
-                        "async functions (tyc-vm v1 runs synchronous Typhon only)",
-                    ));
+                    return Err(vm_unsupported_use_compile("async functions"));
                 }
                 let func = self.build_function(f, env)?;
                 // Run decorators in reverse order (innermost first), matching Python.
@@ -662,8 +660,9 @@ impl Interpreter {
                 };
                 self.eval_listcomp(&listy, env)
             }
-            Expr::Await(_) | Expr::Yield(_) | Expr::YieldFrom(_) => {
-                Err(not_implemented("async / generators"))
+            Expr::Await(_) => Err(vm_unsupported_use_compile("await expressions")),
+            Expr::Yield(_) | Expr::YieldFrom(_) => {
+                Err(vm_unsupported_use_compile("generators (`yield` / `yield from`)"))
             }
             Expr::TString(_) => Err(not_implemented("template strings")),
             Expr::IpyEscapeCommand(_) => Err(not_implemented("IPython escape commands")),
@@ -1999,7 +1998,7 @@ impl Interpreter {
 
     fn exec_with(&mut self, w: &ast::StmtWith, env: &EnvRef) -> Result<(), Unwind> {
         if w.is_async {
-            return Err(not_implemented("async with"));
+            return Err(vm_unsupported_use_compile("async with"));
         }
         // Each context-manager value must support .__enter__ / .__exit__.
         // For v1 we only handle plain values that implement these as native
@@ -2598,6 +2597,41 @@ mod vm_tests {
         // Default formatting still works.
         assert_eq!(format_with_spec(&v, "42", "5").unwrap(), "   42");
         assert_eq!(format_with_spec(&v, "42", "<5").unwrap(), "42   ");
+    }
+
+    /// FINDINGS #28 / #29 — VM doesn't support generators or async, but
+    /// the error message must point users at the `tyc build && python`
+    /// workaround.
+    #[test]
+    fn yield_error_mentions_tyc_build_fallback() {
+        let src = r#"
+def gen():
+    yield 1
+gen()
+"#;
+        let (_interp, res) = parse_and_run(src);
+        let err = res.expect_err("yield should error");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("tyc build") && msg.contains("python"),
+            "yield error should mention `tyc build` + `python` fallback, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn async_def_error_mentions_tyc_build_fallback() {
+        let src = r#"
+async def fetch():
+    return 1
+fetch()
+"#;
+        let (_interp, res) = parse_and_run(src);
+        let err = res.expect_err("async should error");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("tyc build") && msg.contains("python"),
+            "async error should mention `tyc build` + `python` fallback, got: {msg}"
+        );
     }
 
     /// FINDINGS #18 — `IndexMap` preserves insertion order so `tyc run`

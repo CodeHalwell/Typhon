@@ -101,6 +101,21 @@ pub fn not_implemented(feature: &str) -> Unwind {
         format!("tyc-vm v1 does not yet support: {feature}"),
     ))
 }
+
+/// Error for features that the tree-walking VM can't run yet but that
+/// the compile-to-Python path handles. Surfaces the documented
+/// `tyc build && python build/main.py` workaround so users aren't
+/// stuck guessing why `tyc run` fails on otherwise-valid programs
+/// (FINDINGS #28, #29).
+pub fn vm_unsupported_use_compile(feature: &str) -> Unwind {
+    Unwind::Exception(VmException::new(
+        "NotImplementedError",
+        format!(
+            "{feature} is not yet supported in the tree-walking VM; \
+             use `tyc build` then `python build/main.py` to run this program"
+        ),
+    ))
+}
 pub fn stop_iteration() -> Unwind {
     Unwind::Exception(VmException::new("StopIteration", ""))
 }
