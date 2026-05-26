@@ -1304,6 +1304,29 @@ pub enum TycError {
         help("Replace `comptime let {name} = env(...)` with a runtime lookup such as `os.environ[\"{env_key}\"]`.")
     )]
     ContainsSecretLiteral { name: String, env_key: String },
+
+    /// A `let` or `mut` binding whose RHS is an empty collection literal
+    /// (`[]`, `{}`, `set()`) has no type annotation, so its element type
+    /// defaults to `Unknown` (effectively `Any`) and silences any later
+    /// element-type mismatch.
+    #[error("empty {literal} without a type annotation defaults to `Unknown` and disables element-type checking")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::empty_collection_no_annotation),
+        url("https://typhon.dev/lang/diagnostics/empty_collection_no_annotation"),
+        help("Add an explicit annotation, e.g. `let {name}: list[int] = []`, so the element type is checked.")
+    )]
+    EmptyCollectionNoAnnotation {
+        name: String,
+        /// Human-readable name of the literal: "list literal `[]`",
+        /// "dict literal `{}`", or "set literal `set()`". Used in the
+        /// error message so users immediately recognise the offending form.
+        literal: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("annotate this binding to fix")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -2409,6 +2432,24 @@ impl TycError {
         Self::ContainsSecretLiteral {
             name: name.into(),
             env_key: env_key.into(),
+        }
+    }
+
+    /// Construct a [`TycError::EmptyCollectionNoAnnotation`] warning for
+    /// an empty collection literal bound without an explicit annotation.
+    pub fn empty_collection_no_annotation(
+        name: impl Into<String>,
+        literal: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::EmptyCollectionNoAnnotation {
+            name: name.into(),
+            literal: literal.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
         }
     }
 }

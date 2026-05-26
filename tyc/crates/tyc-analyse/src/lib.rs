@@ -2822,7 +2822,184 @@ pub fn purity_diagnostics(findings: &[PurityFinding], path: &str, source: &str) 
     diags
 }
 
+// ── Lint passes ───────────────────────────────────────────────────────────────
+//
+// Lightweight syntactic warnings that supplement the main type-checker.  All
+// of these emit `severity(Warning)` diagnostics; they never block a build on
+// their own.  Each pass walks the parsed module once and collects findings
+// into a [`Diagnostics`] bundle.
+
+/// Walk every `let` / `mut` / `AnnAssign` binding statement in `module`
+/// and warn when the RHS is an empty collection literal (`[]`, `{}`,
+/// `set()`) AND the binding carries no explicit type annotation.
+///
+/// Without an annotation the type checker falls back to `list[Unknown]` /
+/// `dict[Unknown, Unknown]` / `set[Unknown]`, which behaves like `Any` and
+/// silences later element-type mismatches. Annotated bindings (`let
+/// xs: list[int] = []`) are fine because the annotation pins the element
+/// type — they are NOT warned about. This pass deliberately does not
+/// touch inference; it just surfaces the silent-`Any` case so the user
+/// can opt into stricter typing by annotating.
+pub fn analyse_empty_collection_bindings(
+    module: &ModModule,
+    path: &str,
+    source: &str,
+) -> Diagnostics {
+    let mut diags = Diagnostics::new();
+    walk_empty_collection_stmts(&module.body, path, source, &mut diags);
+    diags
+}
+
+fn walk_empty_collection_stmts(body: &[Stmt], path: &str, source: &str, diags: &mut Diagnostics) {
+    for stmt in body {
+        match stmt {
+            Stmt::Assign(a) => {
+                // Unannotated `X = []` / `X = {}` / `X = set()`.
+                let Some(literal) = empty_collection_kind(&a.value) else {
+                    continue;
+                };
+                for target in &a.targets {
+                    if let Expr::Name(n) = target {
+                        let span_start = n.range.start().to_usize();
+                        let length = n.id.as_str().len();
+                        diags.push_warning(TycError::empty_collection_no_annotation(
+                            n.id.as_str().to_owned(),
+                            literal,
+                            path,
+                            source.to_owned(),
+                            span_start,
+                            length,
+                        ));
+                    }
+                }
+            }
+            // `AnnAssign` carries an explicit annotation — never warns.
+            Stmt::FunctionDef(f) => walk_empty_collection_stmts(&f.body, path, source, diags),
+            Stmt::ClassDef(c) => walk_empty_collection_stmts(&c.body, path, source, diags),
+            Stmt::If(i) => {
+                walk_empty_collection_stmts(&i.body, path, source, diags);
+                for clause in &i.elif_else_clauses {
+                    walk_empty_collection_stmts(&clause.body, path, source, diags);
+                }
+            }
+            Stmt::While(w) => {
+                walk_empty_collection_stmts(&w.body, path, source, diags);
+                walk_empty_collection_stmts(&w.orelse, path, source, diags);
+            }
+            Stmt::For(f) => {
+                walk_empty_collection_stmts(&f.body, path, source, diags);
+                walk_empty_collection_stmts(&f.orelse, path, source, diags);
+            }
+            Stmt::With(w) => walk_empty_collection_stmts(&w.body, path, source, diags),
+            Stmt::Try(t) => {
+                walk_empty_collection_stmts(&t.body, path, source, diags);
+                walk_empty_collection_stmts(&t.orelse, path, source, diags);
+                walk_empty_collection_stmts(&t.finalbody, path, source, diags);
+                for h in &t.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    walk_empty_collection_stmts(&h.body, path, source, diags);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Classify `expr` as one of the recognised empty-collection literal
+/// forms. Returns the human-readable label used in the diagnostic
+/// message, or `None` when `expr` isn't an empty literal.
+///
+/// Recognised forms:
+///   - `[]` — empty list literal.
+///   - `{}` — empty dict literal (note: there is no empty-set literal in
+///     Python; `{}` is always a dict).
+///   - `set()` — bare call to `set` with no arguments.
+fn empty_collection_kind(expr: &Expr) -> Option<&'static str> {
+    match expr {
+        Expr::List(l) if l.elts.is_empty() => Some("list literal `[]`"),
+        Expr::Dict(d) if d.items.is_empty() => Some("dict literal `{}`"),
+        Expr::Call(c) if c.arguments.args.is_empty() && c.arguments.keywords.is_empty() => {
+            if let Expr::Name(n) = c.func.as_ref() {
+                if n.id.as_str() == "set" {
+                    return Some("set literal `set()`");
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod lint_tests {
+    use super::*;
+    use tyc_syntax::preprocess::preprocess;
+
+    // ── Finding #3: empty_collection_no_annotation ──────────────────────────
+
+    #[test]
+    fn empty_list_no_annotation_warns() {
+        // `let xs = []` — must warn.
+        let prep = preprocess("let xs = []\n");
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .expect("parse failed")
+            .into_syntax();
+        let diags = analyse_empty_collection_bindings(&module, "x.ty", &prep.python_source);
+        assert_eq!(
+            diags.warnings().len(),
+            1,
+            "let xs = [] must warn; got {:?}",
+            diags.warnings()
+        );
+    }
+
+    #[test]
+    fn empty_dict_no_annotation_warns() {
+        let prep = preprocess("let d = {}\n");
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .expect("parse failed")
+            .into_syntax();
+        let diags = analyse_empty_collection_bindings(&module, "x.ty", &prep.python_source);
+        assert_eq!(diags.warnings().len(), 1);
+    }
+
+    #[test]
+    fn empty_set_call_no_annotation_warns() {
+        let prep = preprocess("let s = set()\n");
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .expect("parse failed")
+            .into_syntax();
+        let diags = analyse_empty_collection_bindings(&module, "x.ty", &prep.python_source);
+        assert_eq!(diags.warnings().len(), 1);
+    }
+
+    #[test]
+    fn empty_list_with_annotation_silent() {
+        // `let xs: list[int] = []` — annotation pins the element type, no warn.
+        let prep = preprocess("let xs: list[int] = []\n");
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .expect("parse failed")
+            .into_syntax();
+        let diags = analyse_empty_collection_bindings(&module, "x.ty", &prep.python_source);
+        assert!(
+            diags.warnings().is_empty(),
+            "annotated empty literal must NOT warn; got {:?}",
+            diags.warnings()
+        );
+    }
+
+    #[test]
+    fn nonempty_list_silent() {
+        let prep = preprocess("let xs = [1, 2, 3]\n");
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .expect("parse failed")
+            .into_syntax();
+        let diags = analyse_empty_collection_bindings(&module, "x.ty", &prep.python_source);
+        assert!(diags.warnings().is_empty());
+    }
+}
 
 #[cfg(test)]
 mod purity_tests {
