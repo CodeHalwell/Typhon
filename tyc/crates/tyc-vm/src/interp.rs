@@ -10,6 +10,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use indexmap::IndexMap;
 use ruff_python_ast::{
     self as ast, BoolOp, CmpOp, ExceptHandler, Expr, FStringPart, InterpolatedStringElement,
     ModModule, Mutability, Number, Operator, Parameters, Pattern, Stmt, UnaryOp,
@@ -20,7 +21,9 @@ use crate::error::{
     attribute_error, index_error, key_error, name_error, not_implemented, type_error, value_error,
     zero_division, Unwind, VmException,
 };
-use crate::value::{Class, ClassField, Function, HashKey, Instance, IterState, NativeFn, Value};
+use crate::value::{
+    Class, ClassField, DictMap, Function, HashKey, Instance, IterState, NativeFn, Value,
+};
 
 pub struct Interpreter {
     pub root: EnvRef,
@@ -579,7 +582,7 @@ impl Interpreter {
                 Ok(Value::Set(Rc::new(RefCell::new(set))))
             }
             Expr::Dict(d) => {
-                let mut map = HashMap::new();
+                let mut map: DictMap = IndexMap::new();
                 for item in &d.items {
                     match (&item.key, &item.value) {
                         (Some(k), v) => {
@@ -1030,7 +1033,7 @@ impl Interpreter {
         }
 
         if let Some(kw) = &params.kwarg {
-            let mut map = HashMap::new();
+            let mut map: DictMap = IndexMap::new();
             for (k, v) in kwargs_left.drain() {
                 map.insert(HashKey::Str(Rc::new(k)), v);
             }
@@ -1421,8 +1424,10 @@ impl Interpreter {
             }
             Value::Dict(d) => {
                 let k = key.to_hash_key()?;
+                // `shift_remove` preserves insertion order (matches Python's
+                // `del d[k]` on an insertion-ordered dict).
                 d.borrow_mut()
-                    .remove(&k)
+                    .shift_remove(&k)
                     .map(|_| ())
                     .ok_or_else(|| key_error(key.py_repr()))
             }
@@ -1865,7 +1870,7 @@ impl Interpreter {
     }
 
     fn eval_dictcomp(&mut self, c: &ast::ExprDictComp, env: &EnvRef) -> Result<Value, Unwind> {
-        let out = Rc::new(RefCell::new(HashMap::new()));
+        let out: Rc<RefCell<DictMap>> = Rc::new(RefCell::new(IndexMap::new()));
         let key_expr = c
             .key
             .clone()
@@ -2454,4 +2459,46 @@ fn format_with_commas(i: i64) -> String {
         out.push('-');
     }
     out.chars().rev().collect()
+}
+
+#[cfg(test)]
+mod vm_tests {
+    use super::*;
+    use ruff_python_ast::ModModule;
+    use tyc_syntax::parse_module;
+
+    fn parse_and_run(src: &str) -> (Interpreter, Result<(), Unwind>) {
+        let parsed = parse_module(src).expect("parse ok");
+        let module: ModModule = parsed.into_syntax();
+        let mut interp = Interpreter::new();
+        let res = interp.run_module(&module);
+        (interp, res)
+    }
+
+    /// FINDINGS #18 — `IndexMap` preserves insertion order so `tyc run`
+    /// and `tyc build && python` produce identical output for any
+    /// dict-printing program.
+    #[test]
+    fn dict_preserves_insertion_order() {
+        let src = r#"
+d = {"a": 1, "b": 2, "c": 3, "d": 4, "e": 5}
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        let v = interp.root.get("d").expect("d defined");
+        let Value::Dict(d) = v else {
+            panic!("expected dict, got {:?}", v);
+        };
+        let keys: Vec<String> = d
+            .borrow()
+            .keys()
+            .map(|k| k.clone().into_value().py_str())
+            .collect();
+        assert_eq!(keys, vec!["a", "b", "c", "d", "e"]);
+        // py_str on the dict must match Python's output.
+        assert_eq!(
+            Value::Dict(d).py_str(),
+            "{'a': 1, 'b': 2, 'c': 3, 'd': 4, 'e': 5}"
+        );
+    }
 }

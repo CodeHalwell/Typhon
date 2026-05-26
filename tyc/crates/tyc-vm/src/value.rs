@@ -13,13 +13,21 @@ use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 
+use indexmap::IndexMap;
+
 use crate::error::{type_error, value_error, Unwind};
 use ruff_python_ast::{Parameters, Stmt};
 
 /// Reference-counted, interior-mutable list. Cloning a `Value::List` aliases
 /// the same storage.
 pub type RcList = Rc<RefCell<Vec<Value>>>;
-pub type RcDict = Rc<RefCell<HashMap<HashKey, Value>>>;
+/// Dicts use `IndexMap` so insertion order is preserved on iteration —
+/// matching CPython 3.7+ semantics (FINDINGS #18). Previously a `HashMap`
+/// gave non-deterministic iteration order, which made `tyc run` and
+/// `tyc build && python build/main.py` produce different stdout for any
+/// program that prints a dict literal.
+pub type DictMap = IndexMap<HashKey, Value>;
+pub type RcDict = Rc<RefCell<DictMap>>;
 pub type RcSet = Rc<RefCell<std::collections::HashSet<HashKey>>>;
 pub type RcStr = Rc<String>;
 

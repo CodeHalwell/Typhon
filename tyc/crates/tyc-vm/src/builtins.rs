@@ -8,12 +8,14 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::rc::Rc;
 
+use indexmap::IndexMap;
+
 use crate::error::{
     attribute_error, index_error, key_error, not_implemented, stop_iteration, type_error,
     value_error, Unwind,
 };
 use crate::interp::{normalize_index, Interpreter};
-use crate::value::{HashKey, IterState, Module, NativeFn, Value};
+use crate::value::{DictMap, HashKey, IterState, Module, NativeFn, Value};
 
 pub fn install(interp: &mut Interpreter) {
     let root = interp.root.clone();
@@ -123,7 +125,7 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("dict", |i, args| {
-        let mut map = HashMap::new();
+        let mut map: DictMap = IndexMap::new();
         if let Some(v) = args.into_iter().next() {
             let it = i.make_iter(v)?;
             while let Some(pair) = i.iter_next(&it)? {
@@ -832,7 +834,7 @@ fn make_os_module() -> Value {
     let environ = nf("environ", |_i, _args| Ok(Value::None));
     let _ = environ;
     let env_dict = {
-        let mut m = HashMap::new();
+        let mut m: DictMap = IndexMap::new();
         for (k, v) in std::env::vars() {
             m.insert(HashKey::Str(Rc::new(k)), Value::Str(Rc::new(v)));
         }
@@ -1263,7 +1265,7 @@ fn list_method(
 
 fn dict_method(
     interp: &mut Interpreter,
-    d: &Rc<RefCell<HashMap<HashKey, Value>>>,
+    d: &Rc<RefCell<DictMap>>,
     name: &str,
     args: &[Value],
 ) -> Result<Value, Unwind> {
@@ -1292,7 +1294,9 @@ fn dict_method(
         "pop" => {
             let k = single(args, "pop")?.to_hash_key()?;
             let default = args.get(1).cloned();
-            match d.borrow_mut().remove(&k) {
+            // `shift_remove` preserves the insertion order of remaining
+            // keys (matches CPython `dict.pop` semantics).
+            match d.borrow_mut().shift_remove(&k) {
                 Some(v) => Ok(v),
                 None => default.ok_or_else(|| key_error(format!("{:?}", k))),
             }
@@ -1486,7 +1490,7 @@ impl<'a> JsonParser<'a> {
     }
     fn parse_object(&mut self) -> Result<Value, Unwind> {
         self.pos += 1; // {
-        let mut map = HashMap::new();
+        let mut map: DictMap = IndexMap::new();
         self.skip_ws();
         if self.peek() == Some(b'}') {
             self.pos += 1;
