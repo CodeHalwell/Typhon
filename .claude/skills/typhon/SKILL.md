@@ -1,94 +1,167 @@
 ---
 name: typhon
-description: Write, check, build, and migrate code in the Typhon language — a statically-typed, stricter superset of Python that compiles to clean CPython 3.13+ via the `tyc` binary. Use this skill whenever you are editing `.ty` or `.dty` source, modifying `typhon.toml`, invoking any `tyc` subcommand (`build`, `check`, `fmt`, `lsp`, `init`, `migrate`, `repl`, `run`, `debug`, `trace`, `profile`, `explain`, `cheatsheet`, `stubtest`, `add`, `remove`, `sync`, `ty`), translating Python to Typhon, debugging Typhon-specific diagnostics, or answering questions about the language, the compiler pipeline, or the project's docs/architecture. Triggers include: any file with a `.ty` / `.dty` / `typhon.toml` extension, the words "Typhon", "tyc", "let/mut binding", "freeze let", "newtype", "pub", "Result[T, E]", "sealed union", "gather:" / "go f(x)", "comptime", "interface", "impl block", "extend", `T?`, `plain class`, `class!`, `.py.map`, `typhon_runtime`, `tyc-vm`, and any error code matching `tyc::...`.
+description: Write, check, build, debug, and migrate code in the Typhon language — a statically-typed, stricter superset of Python that compiles to clean CPython 3.13+ via the `tyc` binary. Use this skill whenever you are editing `.ty` / `.dty` / `typhon.toml` files, invoking any `tyc` subcommand (`build`, `check`, `fmt`, `lsp`, `init`, `run`, `repl`, `debug`, `trace`, `profile`, `explain`, `cheatsheet`, `stubtest`, `migrate`, `ty`, `add`, `remove`, `sync`), translating Python to Typhon, debugging Typhon-specific diagnostics, working on the Rust compiler crates under `tyc/crates/`, or answering any question about the language, the compiler pipeline, the in-process VM, the generated `typhon_runtime`, or the project's docs. Triggers include: file extensions `.ty` / `.dty` / `.py.map` / `typhon.toml`, the words "Typhon" / "tyc" / "let binding" / "mut binding" / "freeze let" / "newtype" / "pub" / "pub *" / "Result[T, E]" / "sealed union" / "interface" / "impl block" / "extend block" / "gather:" / "go f(x)" / "comptime" / "@gatherable" / "@pure" / "@memo" / "T?" / "plain class" / "class!" / "model class" / "lazy import" / "lazy let" / "unsafe:" / "guard" / "|>" / "typhon_runtime" / "tyc-vm" / "tyc-syntax" / "tyc-resolve" / "tyc-types" / "tyc-analyse" / "tyc-desugar" / "tyc-emit" / "tyc-format" / "tyc-db" / "tyc-diagnostics" / "tyc-lsp", and any error code matching `tyc::...`.
 ---
 
-# Typhon — Language, Compiler, and Project Skill
+# Typhon — Language, Compiler, Runtime, and VM Skill
 
-Typhon is **a statically-typed, stricter superset of Python that emits clean CPython 3.13+** with zero runtime dependency on the toolchain. The compiler and language server are a single Rust binary called `tyc`. Every `.ty` file emits valid, idiomatic `.py`. Not all `.py` is valid Typhon.
+Typhon is **a statically-typed, stricter superset of Python that emits clean CPython 3.13+** with zero runtime dependency on the toolchain. The compiler, language server, formatter, debugger wrapper, REPL, and tree-walking interpreter are all a single Rust binary called `tyc`. Every `.ty` file emits valid, idiomatic `.py`. Not all `.py` is valid Typhon.
 
-The current release is **v0.3.0** (Phase 6 — Python-annoyances surface). New since 0.2.5: `newtype`, `freeze let`, `pub`, three new safety/effect diagnostics (`blocking_in_async`, `resource_not_managed`, `div_by_zero_literal`), and pre-built install artifacts for **Linux** and **Windows** alongside macOS. Every finding from the May 2026 stress campaigns (O2–O29) is closed.
+**Current release: v0.7.0** (2026-05-25). The language is **strictly additive across the v0.3.0 → v0.7.0 line** — every previously-accepted program continues to compile to identical Python. Headline frontier work (full HKT unification, general inter-procedural field-init audit) is tracked in `TYPE_SYSTEM_FRONTIER.md`.
 
-This skill is the on-the-ground reference for working in this repo: how to write `.ty` correctly, how to read/extend the compiler crates under `tyc/crates/`, how to invoke `tyc`, and how to debug the diagnostics users will hit.
+LLMs have no prior knowledge of Typhon. This skill is the field reference. **Trust the docs and the compiler over assumptions from Python or any superset.** When this skill and a doc disagree, the doc wins. When the docs and the compiler disagree, the compiler wins — verify with `tyc check`.
 
-The repo's canonical sources are:
+The canonical sources are:
 
-- **`README.md`** — high-level pitch, project status (Phases 0–3 + Phase 5 complete, Phase 4+ landing), workspace layout.
-- **`docs/long-term-plan.md`** — the source of truth for the design. The narrower docs are excerpts.
-- **`docs/language.md`** — type system, error handling, async, `let`/`mut`, comptime.
+- **`README.md`** — pitch, release table, workspace layout, top-level project status.
+- **`CHANGELOG.md`** — every release back to v0.1.0. v0.3.0–v0.7.0 are the live window.
+- **`docs/long-term-plan.md`** — source of truth for design decisions.
+- **`docs/language.md`** — the type system, error handling, async, `let`/`mut`, comptime.
 - **`docs/cheatsheet.md`** — 30-second syntax refresher (also `tyc cheatsheet`).
 - **`docs/cli.md`** — every `tyc` subcommand.
 - **`docs/configuration.md`** — every key in `typhon.toml`.
 - **`docs/vm.md`** — the in-process tree-walking VM (default execution mode for `tyc run`).
 - **`docs/architecture.md`** — pipeline + crate layout.
-- **`docs/diagnostics/`** — one page per `tyc::` code (also surfaced via `tyc explain`).
+- **`docs/diagnostics/*.md`** — one page per `tyc::` code; also surfaced via `tyc explain <code>`.
 - **`docs/guides/01..10-*.md`** — the teaching surface; read in order the first time.
-- **`docs/roadmap.md`**, **`docs/risks.md`**, **`docs/prior-art.md`**, **`docs/findings.md`** — context for *why* design calls were made, plus the consolidated stress-test findings.
+- **`docs/install.md`** — pre-built binaries (Linux x86_64/aarch64, macOS Apple Silicon/Intel, Windows x86_64) plus source build.
+- **`docs/ty-integration.md`** — how `tyc ty` cooperates with Astral's checker.
+- **`docs/performance-baseline.md`** — measured numbers we don't want to regress.
+- **`docs/roadmap.md`** / **`docs/risks.md`** / **`docs/prior-art.md`** / **`docs/findings.md`** — context.
+- **`examples/01..68-*/`** — 68 stdlib-only exercises.
+- **`examples/apps/01..15-*/`** — 15 production-shaped multi-file projects (event-sourced banking, distributed KV, mini-compiler, search engine, GraphQL server, game ECS, trading engine, ML orchestrator, web crawler, task scheduler, real-time game server, static site generator, vector DB, API gateway, stream processor).
+- **`tyc/vendor/README.md`** — Ruff fork rationale.
+- **`editors/vscode/README.md`** — reference VS Code extension (v0.2.0).
 
-Whenever this skill and a doc disagree, **the doc wins.** When the docs and an unrelated `.py.map`/emitted-Python detail disagree, the compiler wins — verify with `tyc check`.
+This skill ships sibling files for the long-tail detail:
+
+- **[REFERENCE.md](REFERENCE.md)** — every Typhon syntactic form, side-by-side with its emitted Python.
+- **[CLI.md](CLI.md)** — verbose subcommand reference with every flag, exit code, and example.
+- **[PITFALLS.md](PITFALLS.md)** — extended catalogue of the surprises every newcomer hits.
+- **[DIAGNOSTICS.md](DIAGNOSTICS.md)** — exhaustive `tyc::` code reference, grouped by category.
+- **[COOKBOOK.md](COOKBOOK.md)** — canonical patterns extracted from `examples/`.
+- **[RUNTIME.md](RUNTIME.md)** — the generated `typhon_runtime` package and the in-process VM.
+- **[PACKAGING.md](PACKAGING.md)** — multi-file projects, `__init__.ty`, `pub *` aggregation.
 
 ---
 
-## When to invoke this skill
+## 1. When to invoke this skill
 
-Trigger automatically when the working session involves any of:
+Trigger automatically when the session involves any of:
 
-1. **Authoring or editing `.ty` source.** Always re-read the relevant guide section before writing significant code — the syntax is *close* to Python but five rules quietly diverge (return types are mandatory, `let`/`mut` is mandatory for locals, `T` cannot hold `None`, methods live in `impl`, no implicit `Any`).
-2. **Editing `.dty` stubs.** These are the Typhon source of truth for third-party Python APIs; they emit `.pyi` for interop. Drift is caught by `tyc check --stubs`.
-3. **Editing `typhon.toml`.** Each strictness flag has subtle defaults — see the [configuration reference](#typhontoml-reference) below.
-4. **Working inside the Rust compiler** (`tyc/crates/`). The pipeline is `syntax → resolve → types → analyse → desugar → emit → format`, all backed by a Salsa DB. Each crate has a tight responsibility — see [Compiler architecture](#compiler-architecture).
-5. **Migrating `.py` → `.ty`.** Use `tyc migrate` first; it rewrites `Optional[T]` → `T?`, adds `let`/`mut`, drops `@dataclass`. Then resolve diagnostics manually.
-6. **Debugging a `tyc::...` diagnostic.** The [diagnostics catalog](#diagnostics-catalog) is the fastest lookup.
-7. **Onboarding someone to Typhon.** Walk them through the [Cheat sheet](#cheat-sheet) first, then the guides.
+1. **Authoring or editing `.ty` source.** Re-read the relevant guide section before writing significant code — Typhon's surface looks Python-like but at least eight rules diverge silently (Section 4).
+2. **Editing `.dty` stubs.** These are Typhon's source of truth for third-party Python APIs; they emit `.pyi` for interop. Drift is caught by `tyc check --stubs` and `tyc stubtest`.
+3. **Editing `typhon.toml`.** Every strictness flag and emit knob has subtle defaults — see [§13 configuration reference](#13-typhontoml-reference).
+4. **Working inside the Rust compiler** (`tyc/crates/`). The pipeline is `syntax → resolve → types → analyse → desugar → emit → format`, backed by a Salsa DB. See [§16 compiler architecture](#16-compiler-architecture).
+5. **Migrating `.py` → `.ty`.** Use `tyc migrate` first — it rewrites `Optional[T]` → `T?`, `Generic[T]` → PEP 695, drops `@dataclass`, rewrites `NewType` and `Protocol`. Then resolve diagnostics manually.
+6. **Debugging a `tyc::...` diagnostic.** The [DIAGNOSTICS.md](DIAGNOSTICS.md) catalog is the fastest lookup; `tyc explain <code>` works offline.
+7. **Onboarding someone to Typhon.** Walk them through the [§3 cheat sheet](#3-cheat-sheet) first, then the guides.
 
 ---
 
-## Cheat sheet
+## 2. Hello, Typhon — the shortest realistic flow
 
-The 30-second mental model. Everything else in this skill is detail under one of these bullets.
+```bash
+# 1a. Install a pre-built binary (macOS / Linux):
+curl -sSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh | sh
+
+# 1b. Windows (PowerShell):
+iwr -useb https://raw.githubusercontent.com/codehalwell/typhon/main/install.ps1 | iex
+
+# 1c. Or build from source (from repo root):
+cd tyc && cargo build --release && cd ..
+alias tyc="$PWD/tyc/target/release/tyc"
+
+# 2. Scaffold a new project
+tyc init hello && cd hello
+# → typhon.toml, src/main.ty, tests/
+
+# 3. Edit src/main.ty (see below)
+# 4. Iterate
+tyc fmt src/         # whitespace-normalise + ruff format wrap
+tyc check src/       # parse + resolve + type-check, no output artifacts
+tyc run              # default: execute via the in-process tree-walking VM
+tyc build            # full pipeline → build/main.py + build/.sourcemaps/*.py.map
+python build/main.py
+```
+
+A canonical `src/main.ty`:
+
+```python
+import sys
+
+def main() -> None:
+    let name: str = sys.argv[1] if len(sys.argv) > 1 else "world"
+    print(f"Hello, {name}")
+
+if __name__ == "__main__":
+    main()
+```
+
+The emitted `build/main.py` is byte-similar (formatting aside). **Production never installs anything Typhon-specific** — only a small generated `typhon_runtime/` package when you actually use `Result`, `go`, `lazy let`, `freeze let`, or auto-parallel comprehensions.
+
+---
+
+## 3. Cheat sheet
+
+The 30-second mental model. Every later section in this skill is detail under one of these bullets.
 
 | Topic | Typhon | Emitted Python |
 |---|---|---|
 | Local binding | `let x: int = 1` / `mut x: int = 1` | `x: int = 1` |
 | Module binding | `X: int = 1` (implicit `let`) or `mut X: int = 1` | `X: int = 1` |
-| Deep-immutable binding (0.3.0) | `freeze let CFG = {"port": 8080, "hosts": ["a", "b"]}` | `CFG = __typhon_freeze__({"port": 8080, "hosts": ["a", "b"]})` (deep-freezes value, not just name) |
-| Public name (0.3.0) | `pub let API_VERSION: str = "v1"` / `pub class Foo: ...` | adds `Foo` to a synthesised `__all__ = [...]` at top of module |
-| Nominal alias (0.3.0) | `newtype UserId = int` | `UserId = NewType("UserId", int)` — asymmetric: `UserId → int` flows, `int → UserId` needs `UserId(x)` |
+| Declare-then-assign (v0.7.0) | `let loaded: Cfg` then assign on every non-diverging arm | `loaded: Cfg` then `loaded = …` |
+| Typed tuple unpack (v0.3.1) | `let (a: int, b: str) = pair()` | hidden temp + per-element typed assigns |
+| Deep-immutable binding | `freeze let CFG = {"port": 8080, "hosts": ["a", "b"]}` | `CFG = __typhon_freeze__({...})` (deep-freezes value) |
+| Public name | `pub let API_VERSION: str = "v1"` / `pub class Foo: ...` | synthesised `__all__ = [...]` at top of module |
+| Package re-export (v0.7.0) | `pub *` in `__init__.ty` | aggregates sibling modules + sub-packages |
+| Nominal alias | `newtype UserId = int` | `UserId = NewType("UserId", int)` — asymmetric |
+| Same-newtype arithmetic (v0.7.0) | `let x: Index = a + b` | preserved across `+ - * // % **`; `/` still widens to `float` |
 | Nullable | `name: str?` | `name: str \| None` |
 | Optional default | `name: str? = None` (no auto-default) | `name: str \| None = None` |
 | Class | `class User: id: int` | `@dataclass(slots=True) class User: id: int` |
 | Pydantic model | `model ApiUser: id: int` | `class ApiUser(BaseModel): model_config = ConfigDict(extra="forbid"); id: int` |
 | Frozen class | `class P frozen: x: float` | `@dataclass(slots=True, frozen=True)` |
-| Plain class (no decorator) | `plain class Bag: items: list[str]` | bare `class Bag: items: list[str]` (no `@dataclass`, no synthesised `__init__`) |
-| Raw class (framework base) | `class! MyModel(nn.Module): layer: nn.Linear` | bare `class MyModel(nn.Module):` with synthesised `__init__` calling `super().__init__()` |
-| Methods | `impl User: def display(self) -> str: ...` (explicit `self`, then `self.NAME`) | merged into the class body |
-| Extend foreign class | `extend User: def x() -> int: ...` | merged at desugar |
-| Extend built-in | `extend str: def slug() -> str: ...` | extracted to `__typhon_ext_str__slug` free fn + receiver-typed call rewrites |
+| Plain class (no decorator) | `plain class Bag: items: list[str]` | bare `class Bag:` (no `@dataclass`, no synthesised `__init__`) |
+| Raw class (framework base) | `class! M(nn.Module): layer: nn.Linear` | bare `class M(nn.Module):` with synthesised `__init__` calling `super().__init__()` |
+| Methods | `impl User: def display(self) -> str: ...` | merged into the class body |
+| Extend foreign class | `extend User: def x(self) -> int: ...` | merged at desugar |
+| Extend built-in | `extend str: def slug(self) -> str: ...` | extracted to `__typhon_ext_str__slug` free fn + call-site rewrites |
+| Sealed union | `type Shape = Circle \| Rectangle` | `Shape = Circle \| Rectangle` (just a type alias) |
+| `impl` on sealed union (v0.6.0) | `impl Shape: def area(self) -> float: ...` | distributes the method to every variant |
+| Exhaustive match | `match s: case Circle(r): ...` (no `_` needed) | vanilla Python `match` |
 | Result type | `Result[T, E]`, `Ok(v)`, `Err(e)` | generated `typhon_runtime.Ok/Err` dataclasses |
+| Result combinators (v0.6.0) | `r.map(f) / r.map_err(g) / r.and_then(h) / r.or_else(k)` | method calls on the runtime classes |
 | Error propagation | `let n: int = f()?` | inline `isinstance(_t, Err): return _t; n = _t.value` |
 | Result chain | `with a = f()?, b = g()?: ...  else err: ...` | sequenced if-isinstance ladder |
-| Sealed union | `type Shape = Circle \| Rectangle` | `Shape = Circle \| Rectangle` (just a type alias) |
-| Exhaustive match | `match s: case Circle(r): ...` (no `_` needed) | vanilla Python `match` |
 | Generic fn | `def first[T](xs: list[T]) -> T?:` | same (PEP 695) |
-| Interface | `interface Drawable: def draw() -> None` | `class Drawable(Protocol): ...` |
+| Generic class | `class Box[T]: value: T` / `impl[T] Box[T]:` | preserved (PEP 695) |
+| HKT scaffold (v0.5.0) | `class Functor[F[_]]:` | parsed; staged for unification |
+| Interface | `interface Drawable: def draw(self) -> None` | `class Drawable(Protocol): ...` |
 | Pipe | `a \|> f() \|> g(arg)` | `g(f(a), arg)` |
+| Guard | `guard x = expr else: return ...` | `if expr is None: return ...; x = expr` |
 | Parallel awaits | `gather: a = f(); b = g()` | `async with asyncio.TaskGroup() as _tg: ...` |
 | Best-effort gather | `gather(strategy="best-effort"):` | `asyncio.gather(..., return_exceptions=True)` |
 | Spawn | `go f(x)` / `go f(x) -> task` | `typhon_runtime.tasks.spawn(...)` (strong-ref registry) |
-| Lazy module | `lazy import np = numpy` | bespoke `__TyphonLazy_np_` proxy class with double-checked locking |
+| `await` middleware-callable (v0.7.0) | `let r: Resp = await next(req)` where `next: Callable[[Req], Awaitable[Resp]]` | unwraps to `Resp` |
+| Lazy module | `lazy import np = numpy` | bespoke `__TyphonLazy_np_` proxy with double-checked locking |
 | Lazy module-level let | `lazy let CFG: Config = load()` | sentinel-cached `lazy_let(lambda: load())` |
 | Lazy class-level let | `lazy let cfg: Config = ...` inside class | `@cached_property` |
 | Comptime constant | `comptime let PORT: int = int(env("PORT", "8080"))` | inlined literal at build time |
+| Comptime type-value (v0.5.0) | `comptime let T: type = int` | inlined; supports 8 primitive heads |
 | Pure assertion | `@pure def f(...) -> T:` | nothing emitted unless `@memo` too |
 | Memoised | `@memo def fib(n: int) -> int:` | `@functools.cache` |
+| Auto-gather opt-in | `@gatherable async def fetch_x(...) -> X:` | enables auto-gather rewrite |
 | Unsafe boundary | `unsafe: let x = mystery_lib()` | `if True:` (scope-preserving) |
-| Guard | `guard x = expr else: return ...` | `if expr is None: return ...; x = expr` |
+| `with` as-target typing (v0.7.0) | `with conn() as c:` types `c` from `__enter__` / `@contextmanager` factory's yield | works for async too |
+
+Run `tyc cheatsheet` for the same table at the terminal.
 
 ---
 
-## Five rules every Typhon program follows
+## 4. The eight rules every Typhon program follows
 
-These are the rules behind every "but the same code works in Python" surprise.
+These are the rules behind every "but the same code works in Python" surprise. The first five are the foundational ones; the last three landed in v0.3.0 → v0.7.0.
 
 ### Rule 1 — Every parameter and return type is annotated
 
@@ -96,11 +169,11 @@ These are the rules behind every "but the same code works in Python" surprise.
 def add(a: int, b: int) -> int:    # ✅
     return a + b
 
-def add(a, b):                     # ❌ tyc::missing_return_type / implicit Any
+def add(a, b):                     # ❌ tyc::missing_annotation
     return a + b
 ```
 
-`-> None` is mandatory for sync functions that return nothing. There is no inference fallback. This is `[strictness] no-implicit-any = true`, which defaults on and you almost never want to turn off.
+`-> None` is mandatory for sync functions that return nothing. There is no inference fallback. This is `[strictness] no-implicit-any = true` (default on, the implicit-any escape is parsed for forward-compat but currently has no effect — the check is always on).
 
 ### Rule 2 — Local bindings declare `let` or `mut`
 
@@ -118,6 +191,7 @@ Carve-outs (no keyword required):
 - `global NAME` / `nonlocal NAME` declarations bind the outer-scope variable; the bareword assignment that follows refers to that binding.
 - `gather:` block bindings (`gather: a = fetch_a(); b = fetch_b()`) — the keyword itself introduces immutable single-assignment names.
 - Walrus operator: `if (n := len(xs)) > 3:` introduces `n` as an implicit `let` binding; rebinding `n` later requires `mut`.
+- `for` / `with` / `case` / `except` targets are bindings, not assignments — they don't take `let`/`mut` and don't collide with outer `let` bindings of the same name (v0.6.0+).
 
 ### Rule 3 — `T` cannot hold `None`
 
@@ -135,7 +209,9 @@ guard f = found else: return     # ✅ same effect, prettier
 greet(f)
 ```
 
-Narrowing forms the checker understands: `is None`, `is not None`, `isinstance(x, T)`, `guard`, early-return `if x is None: return`. `T?` emits as `T | None`.
+Narrowing forms the checker understands: `is None`, `is not None`, `isinstance(x, T)`, `guard`, early-return `if x is None: return`, exhaustive `match`, **ternary** `body if test else orelse` (v0.7.0), the truthy-falsy union picks of `or` / `and` (Python semantics). De Morgan narrowing (`if not (A or B): return` refines both operands afterwards) lands in v0.4.0.
+
+`T?` emits as `T | None`.
 
 ### Rule 4 — Methods live in `impl`, not in `class`
 
@@ -145,92 +221,103 @@ class User:
     name: str
 
 impl User:
-    def display(self) -> str:    # take an explicit `self`; use `self.NAME`
+    def display(self) -> str:    # explicit `self`; use `self.NAME`
         return f"{self.name} (#{self.id})"
 ```
 
-Earlier drafts of this guide suggested an implicit-`self` form where bare `name` resolved to `self.name`. That form was never implemented (the resolver can't see the enclosing class's fields by the time it walks the method body), so the explicit `self.NAME` access shown above is what works today. The bare-identifier sugar may come back later; explicit `self` is the durable form.
+Writing `__init__` inside `class` is rejected (`tyc::manual_init`) — the constructor is generated. Methods in the class body fire `tyc::method_in_class_body` (severity `warn` by default; configurable via `[strictness] methods-in-class-body`). The bare-identifier sugar where `name` resolves to `self.name` is **not** implemented; write `self.NAME` explicitly.
 
-Writing `__init__` inside `class` is rejected — the constructor is generated. `self` on impl-block methods is currently optional (it's inserted at desugar if omitted, but you can't reach class fields from a no-`self` method), so writing it explicitly is the recommended style.
+`impl` blocks can span multiple files via `impl ClassName:` (same project) and `extend ClassName:` (cross-module, identical merge semantics). `impl` on a **sealed-union alias** distributes the methods to every variant automatically (v0.6.0):
+
+```python
+type Event = TaskStarted | TaskFinished | TaskFailed
+
+impl Event:
+    def is_terminal(self) -> bool:
+        match self:
+            case TaskStarted(_): return False
+            case TaskFinished(_) | TaskFailed(_): return True
+```
 
 ### Rule 5 — `Any` only enters through `unsafe:` or `.dty` stubs
 
 ```python
 import messy
 
-let data = messy.fetch()         # ❌ tyc::implicit_any
+let data = messy.fetch()         # ❌ tyc::missing_annotation / implicit Any
 
 unsafe:
     let data = messy.fetch()     # ✅ inside the region
 let parsed: dict[str, int] = ... # re-assert at the boundary
 ```
 
-`unsafe:` is a *lexical region*, not a per-value annotation. Values inside acquire a hidden `Unsafe[T]` marker that cannot cross out into a concrete-typed context without a re-assertion (annotation, narrowing, or cast). The block lowers to `if True:` so scope rules are unchanged.
+`unsafe:` is a *lexical region*, not a per-value annotation. Values inside acquire a hidden `Unsafe[T]` marker that cannot cross out into a concrete-typed context without a re-assertion (annotation, narrowing, or cast). The block lowers to `if True:` so scope rules are unchanged. Smuggling an `Unsafe[T]` outward fires `tyc::unsafe_value_leak`.
 
----
+For long-lived dependencies, write a `.dty` stub instead.
 
-## Writing a Typhon program end-to-end
-
-The shortest realistic flow. Pair with `docs/guides/01-hello-world.md`.
-
-```bash
-# 1a. Install a pre-built binary (macOS / Linux):
-#     curl -sSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh | sh
-# 1b. Windows (PowerShell):
-#     iwr -useb https://raw.githubusercontent.com/codehalwell/typhon/main/install.ps1 | iex
-# 1c. Or build from source (from repo root)
-cd tyc && cargo build --release && cd ..
-alias tyc="$PWD/tyc/target/release/tyc"
-
-# 2. Scaffold a new project
-tyc init hello && cd hello
-# → typhon.toml, src/main.ty, tests/
-
-# 3. Edit src/main.ty
-# 4. Check + build + run
-tyc fmt src/        # format in place
-tyc check src/      # parse + resolve + type-check, no output artifacts
-tyc build           # full pipeline → build/main.py + build/*.py.map
-python build/main.py
-```
-
-A canonical `src/main.ty`:
+### Rule 6 — Exhaustive `match` on sealed unions
 
 ```python
-import sys
+type Shape = Circle | Rectangle | Triangle
 
-def main() -> None:
-    let name: str = sys.argv[1] if len(sys.argv) > 1 else "world"
-    print(f"Hello, {name}")
-
-if __name__ == "__main__":
-    main()
+def area(s: Shape) -> float:
+    match s:
+        case Circle(radius):       return 3.14159 * radius * radius
+        case Rectangle(w, h):      return w * h
+        # ❌ tyc::non_exhaustive_match — Triangle uncovered
 ```
 
-The emitted `build/main.py` is byte-similar (formatting aside). **Production never installs anything Typhon-specific** — only a small generated `typhon_runtime.py` when you actually use `Result`, `go`, or `lazy let`.
+Severity controlled by `[strictness] exhaustive-match` (default `"error"`). Use `case _:` only when a catch-all is genuinely the intent (it disables exhaustiveness for the remaining variants). Keyword patterns (`case TaskStarted(task_id=tid):`) also satisfy exhaustiveness (v0.6.0).
+
+### Rule 7 — Errors flow as `Result[T, E]`, not exceptions
+
+```python
+def parse_port(raw: str) -> Result[int, str]:
+    if not raw.isdigit():
+        return Err(f"not a number: {raw}")
+    let n: int = int(raw)
+    if n < 1 or n > 65535:
+        return Err(f"out of range: {n}")
+    return Ok(n)
+```
+
+`?` propagates `Err` cleanly inside any `Result`-returning function. Bridging to exceptions happens at library boundaries via a small `try` shim. See [§9 error handling](#9-error-handling).
+
+### Rule 8 — Definite assignment for declare-only `let` (v0.7.0)
+
+```python
+def parse(raw: str) -> Result[Cfg, str]:
+    let loaded: Cfg                          # declare-only; OK in v0.7.0+
+    match _load(raw):
+        case Ok(v):  loaded = v
+        case Err(e): return Err(e)
+    return Ok(loaded)                        # ✅ both arms either assign or diverge
+```
+
+The resolver tracks each uninitialised `let` declaration's span; the first subsequent assignment **is** the initialiser. The second assignment to a `let` still fires `tyc::immutable_assign`. `mut NAME: T` without initialiser is also accepted (any number of subsequent assignments legal). Reads on a path where the binding hasn't been assigned fire `tyc::use_of_uninitialised`; `if`/`elif`/`else` and `match` arms each count as separate first-assignment paths; `return` / `raise` / `continue` / `break` arms are excluded from the intersection.
 
 ---
 
-## Type system at depth
+## 5. Type system
 
-### Primitives and widening
+### 5.1 Primitives and widening
 
 | Type | Notes |
 |---|---|
-| `int` | Arbitrary precision (matches Python). |
+| `int` | Arbitrary precision (matches CPython). VM today uses `i64`. |
 | `float` | 64-bit IEEE 754. |
-| `bool` | **Not** a subtype of `int` for the checker. |
+| `bool` | **Subtype of `int`** (v0.4.0). `let x: int = True` type-checks; `let b: bool = 1` does not — assignability is one-way. |
 | `str`, `bytes` | Identical to Python. |
 | `None` | Inhabitant of unit; only assignable where `T?` allows. |
 
-`int` widens to `float` (`let y: float = 3` ✅). `float` does **not** narrow to `int` — write `int(x)` / `round(x)`.
+`int` widens to `float` (`let y: float = 3` ✅). `float` does **not** narrow to `int` — write `int(x)` / `round(x)`. `bool` flows into `int` for arithmetic: `1 + True` types as `int`; `-True` types as `int`.
 
-### Collections
+### 5.2 Collections
 
 Element types are required:
 
 ```python
-let xs: list = [1, 2, 3]         # ❌ implicit Any element
+let xs: list = [1, 2, 3]         # ❌ implicit Any element / missing_annotation
 let xs: list[int] = [1, 2, 3]    # ✅
 let cs: dict[str, int] = {"a": 1}
 let pts: tuple[float, float] = (1.0, 2.0)
@@ -239,7 +326,13 @@ let nums: tuple[float, ...] = (1.0, 2.0, 3.0)
 
 `dict.get(k)` returns `V?`, not `V`. Either narrow or use `d[k]` (typed `V`, may raise `KeyError`).
 
-### `T?` and flow narrowing
+**Fixed-arity tuple covariance** (v0.4.0): `tuple[int, int]` widens both slots to `float` at the assignment site. Mutable containers (`list`, `dict`, `set`) remain invariant.
+
+TypedDict-style dict literals match field shapes (v0.3.0): `let alice: User = {"id": 1, "name": "Alice"}` matches a `model User` declaration field-by-field.
+
+Set difference: `set - set` and `frozenset - frozenset` type-check (v0.5.2).
+
+### 5.3 `T?` and flow narrowing
 
 ```python
 def find_user(id: int) -> str?: ...
@@ -253,9 +346,9 @@ guard r = find_user(1) else: return   # equivalent, prettier
 greet(r)
 ```
 
-`isinstance(x, T)` also narrows. Internally `T?` is `Nullable[T]`; emission is `T | None`.
+`isinstance(x, T)` also narrows. Internally `T?` is `Nullable[T]`; emission is `T | None`. `while`-condition narrowing applies test-implied narrowings to the body (v0.3.0). Ternary narrowing (v0.7.0): `let r: int = x if x is not None else 0` types `x` as the non-null form inside the `x` arm.
 
-### Generics — PEP 695 only
+### 5.4 Generics — PEP 695 only
 
 ```python
 def first[T](xs: list[T]) -> T?:
@@ -267,29 +360,34 @@ class Box[T]:
     value: T
 
 impl[T] Box[T]:
-    def map[U](f: Callable[[T], U]) -> Box[U]:
-        return Box(value=f(value))
+    def map[U](self, f: Callable[[T], U]) -> Box[U]:
+        return Box(value=f(self.value))
 
 type Vec[T] = list[T]            # transparent alias
+type Pair[A, B] = tuple[A, B]
 ```
 
-Inference is bidirectional and recursive; `pair(1, "two")` for `pair[T](a: T, b: T)` widens `T` to `int | str`. **Never import `TypeVar` from `typing`** — that path is rejected.
+Inference is bidirectional and recursive; `pair(1, "two")` for `pair[T](a: T, b: T)` widens `T` to `int | str`. **Never import `TypeVar` from `typing`** — that path is rejected with `tyc::typevar_import_rejected`. Same for the deprecated capitalised aliases (`List`, `Dict`, `Tuple`, `Set`, `FrozenSet`, `Type`) → `tyc::typing_alias_deprecated`.
+
+**HKT scaffold (v0.5.0):** the parser accepts `F[_]` as a type-constructor parameter (`class Functor[F[_]]:`); full unification is partial. Use it conservatively until the frontier work in `TYPE_SYSTEM_FRONTIER.md` lands.
+
+**Cross-module generic method dispatch propagates class TypeVars (v0.7.0):** `s: Stream[int]; s.map(f)` records `Callable[[int], U]` as the expected parameter and returns `Stream[U]`. Same for field access on a generic — `r: RecordEnv[int]; r.payload` is `int`, not bare `T`.
 
 Generics erase at emit time (PEP 695 syntax is preserved on the 3.13+ default).
 
-### Interfaces (structural)
+### 5.5 Interfaces (structural)
 
 ```python
 interface Drawable:
-    def draw() -> None
-    def width() -> float
+    def draw(self) -> None
+    def width(self) -> float
 
 class Button:
     label: str
 
 impl Button:
-    def draw() -> None: print(label)
-    def width() -> float: return 10.0
+    def draw(self) -> None: print(self.label)
+    def width(self) -> float: return float(len(self.label) + 4)
 
 def render(d: Drawable) -> None:
     d.draw()
@@ -297,71 +395,86 @@ def render(d: Drawable) -> None:
 render(Button(label="x"))        # ✅ structurally matches
 ```
 
-Emits as `class Drawable(Protocol): ...`. **`isinstance(x, Drawable)` is rejected** (`tyc::interface_isinstance`) because Python's `@runtime_checkable` only checks attribute *presence*, not signatures. Refactor to a sealed union or write an explicit predicate.
+Emits as `class Drawable(Protocol): ...`. **`isinstance(x, Drawable)` is rejected** (`tyc::interface_isinstance`) because Python's `@runtime_checkable` only checks attribute *presence*, not signatures. Refactor to a sealed union or write an explicit predicate. Interface methods match against methods in the candidate, not against fields of callable type — mixing is rejected (`tyc::interface_not_conforming`).
 
-### Sealed unions
+### 5.6 Sealed unions
 
 ```python
 type Shape = Circle | Rectangle | Triangle
 
-class Circle:
-    radius: float
-class Rectangle:
-    width: float
-    height: float
-class Triangle:
-    base: float
-    height: float
-
-def area(s: Shape) -> float:
-    match s:
-        case Circle(radius):       return 3.14159 * radius * radius
-        case Rectangle(w, h):      return w * h
-        case Triangle(b, h):       return 0.5 * b * h
+class Circle:    radius: float
+class Rectangle: width: float; height: float
+class Triangle:  base: float;  height: float
 ```
 
-The match is statically verified exhaustive. Add `Square` to the alias → every match becomes `tyc::non_exhaustive_match` until handled. Use `case _:` only when you genuinely want a catch-all — it disables exhaustiveness for the rest of the union.
+The cheat-sheet form `sealed union Shape: Circle(radius: float); Square(side: float)` is also accepted. Variants can be parametric (`type EventEnvelope[T] = RecordEnv[T] | WatermarkEnv | BarrierEnv` — some refer to `T`, others don't). For nullary variants, write `class Nil frozen: pass` and match with `case Nil():` (two empty parens, not `case Nil(_):`).
 
-`type X = A | B` without classes is just a Python alias; the *sealed* part is the rule that nothing outside the source file can extend `X` — that's checked at the type level, not at runtime.
+The match is statically verified exhaustive. Add `Square` to the alias → every match becomes `tyc::non_exhaustive_match` until handled. Cross-module variant flow works (v0.6.0) — variant `A(...)` flows into an `Event`-typed slot in a consumer module even when the alias is declared in another package.
 
-### `class` vs `model`
+### 5.7 `class` vs `model` vs `plain class` vs `class!`
 
-| `class` | `model` |
-|---|---|
-| Emits `@dataclass(slots=True)` | Emits `class X(BaseModel)` with `model_config = ConfigDict(extra="forbid")` |
-| For internal types | For data crossing trust boundaries (HTTP, JSON, env, queues) |
-| No runtime validation | Runtime validation via Pydantic |
-| Add `frozen` modifier for `frozen=True` | Pydantic's `frozen=True` is *faux* immutability — only blocks field reassignment, not nested mutation |
+| Form | Emits | Use when |
+|---|---|---|
+| `class Foo:` | `@dataclass(slots=True)` | Plain value type (default). |
+| `class Foo frozen:` | `@dataclass(slots=True, frozen=True)` | Immutable value type. Field reassignment → `tyc::frozen_assign`. |
+| `model Foo:` | `class Foo(BaseModel):` + `model_config = ConfigDict(extra="forbid")` | Validated input at a system boundary. Pydantic dep required. |
+| `interface Foo:` | `class Foo(Protocol):` (bodies `...`) | Structural contract. |
+| `plain class Foo:` | bare `class Foo:` (no decorator, no `__init__`) | Metaclass-driven libs, descriptor-based models (Textual, Django ORM, SQLAlchemy declarative). |
+| `class! Foo(Base):` | bare `class Foo(Base):` + synthesised `__init__` calling `super().__init__()` and assigning fields | Subclassing a framework base that owns its own `__init__` (torch.nn.Module, custom exceptions). |
 
-Override `extra` globally with `[emit] model-extra = "allow" | "ignore"`. Do not write `__init__` — the constructor is generated.
+#### Mutable-default rewrite
 
-### `impl` and `extend`
+Bare mutable literals (`tags: list[str] = []`) are rewritten at desugar to `dataclasses.field(default_factory=list)`. Applies to `class` and `class … frozen`; **skipped** for `model`, `interface`, and `class!`.
 
-- `impl ClassName:` attaches methods to a class declared in the same project. Multiple `impl` blocks for the same class are merged at desugar; they can live in different files.
+#### Auto-skip for framework bases
+
+A `class Foo(Base):` whose `Base`'s last identifier segment is `Enum`, `IntEnum`, `StrEnum`, `Flag`, `IntFlag`, `ABC`, `ABCMeta`, `Protocol`, `TypedDict`, `NamedTuple`, `BaseModel`, or `App` emits without `@dataclass`. Project bases can be added via `[emit] skip-decoration-bases = ["MyBase", ...]`. Auto-skip drops only the decorator; it does not synthesise `__init__`. Use `class!` when you need both.
+
+#### Field default ordering (v0.7.0)
+
+`@dataclass` rejects a non-default field after a defaulted one (would raise `TypeError` at import). `tyc::field_default_ordering` catches it at check time. Move every non-defaulted field above defaulted ones, or use a factory.
+
+#### `class!` constructor synthesis rules
+
+- No `@dataclass` decorator.
+- `__init__` auto-synthesised when the body has no user `def __init__` and ≥1 base is present:
+  - Calls `super().__init__()` first (no positional/keyword args — pass them via the body if needed).
+  - Assigns each annotated field through `self`, in source order. Non-defaulted fields are positional; defaulted fields follow.
+- **Class-level field defaults are stripped from the body** when `__init__` is synthesised (prevents PyTorch-style double evaluation as a class attribute then per-instance).
+- Annotations remain visible to type checkers.
+- A hand-written `__init__` is preserved verbatim.
+
+#### Inheritance
+
+Single inheritance is the supported form (`class Dog(Animal):`). Subclass constructors accept inherited fields (v0.4.0): `Dog(name="Rex", breed="Husky")` works against `class Dog(Animal):` where `name` lives on `Animal`. Dataclass inheritance ordering rules still apply across the MRO — non-defaults before defaults all the way up.
+
+### 5.8 `impl` and `extend`
+
+- `impl ClassName:` attaches methods to a class declared in the same project. Multiple `impl` blocks for the same class merge at desugar; they can live in different files.
+- `impl[T] ClassName[T]:` introduces type parameters scoped over the methods; methods may add their own (`def map[U](...)`).
+- `impl OtherType:` on an **alias** of a sealed union distributes the methods to every variant (v0.6.0). Duplicate-method check fires when the same method exists on both `impl Union:` and `impl Variant:`.
 - `extend ClassName:` is `impl`'s twin for cross-module method addition. Same merge semantics.
-- `extend BUILTIN:` (`str`, `list`, `int`, `dict`, …) extracts each method to a module-level free function `__typhon_ext_<TYPE>__<METHOD>`, and rewrites `x.method(...)` to `__typhon_ext_<TYPE>__method(x, ...)` **whenever the receiver `x` is statically annotated as that builtin**. No monkey-patching — un-annotated receivers still raise `AttributeError` at runtime.
+- `extend BUILTIN:` (`str`, `list`, `int`, `dict`, …) extracts each method to a module-level free function `__typhon_ext_<TYPE>__<METHOD>`, and rewrites `x.method(...)` to the free-function call **whenever the receiver `x` is statically annotated as that built-in**. No monkey-patching — un-annotated receivers still raise `AttributeError` at runtime. `extend list[int]:` (parametric target) fires `tyc::extend_builtin` — drop the brackets.
 
-### `unsafe:` boundary
+### 5.9 `unsafe:` boundary
 
 ```python
 def parse() -> int:
     unsafe:
-        let v = mystery_lib.get_int()    # would be tyc::implicit_any outside
+        let v = mystery_lib.get_int()    # would be tyc::missing_annotation outside
         let checked: int = int(v)        # re-assert before crossing out
     return checked
 ```
 
-Inside `unsafe:`, expressions that would otherwise infer `Any` bind freely. Values acquire a hidden `Unsafe[T]` marker that cannot flow into a concrete `T` context outside the block. Block lowers to `if True:` for scope preservation; the checker tracks an `unsafe_depth` counter.
+Inside `unsafe:`, expressions that would otherwise infer `Any` bind freely. Values acquire a hidden `Unsafe[T]` marker that cannot flow into a concrete `T` context outside the block. Block lowers to `if True:` for scope preservation; the checker tracks an `unsafe_depth` counter. Smuggling `Unsafe[T]` outward fires `tyc::unsafe_value_leak`.
 
-For long-lived dependencies, write a `.dty` stub instead.
+For long-lived dependencies, write a `.dty` stub instead. Common idiom: an `unsafe:` block always ends in `return checked` or `raise RuntimeError("unreachable")` — never let the block be the last thing in a non-`-> None` function.
 
 ---
 
-## v0.3.0 — annoyance-killing language features
+## 6. v0.3.0 — annoyance-killing language features
 
 ### `newtype Name = Base` — nominal aliases over primitives
-
-Lifts a primitive into its own nominal type so two same-shaped values cannot be silently swapped:
 
 ```python
 newtype UserId = int
@@ -376,9 +489,11 @@ fetch_user(42)                   # ❌ tyc::newtype_violation — wrap as UserId
 let raw: int = uid               # ✅ asymmetric: UserId flows freely into int
 ```
 
-Compiles to a zero-cost `typing.NewType` call (`UserId = NewType("UserId", int)`). The relationship is deliberately asymmetric so the wrapper doesn't infect every downstream consumer that legitimately treats the value as the base. The constructor (`UserId(x)`) type-checks its argument against the base.
+Compiles to a zero-cost `typing.NewType` call. The relationship is asymmetric: `Newtype → Base` is free, `Base → Newtype` requires explicit construction.
 
-Use it for ID kinds, currency tags, internal-vs-external markers — anywhere "an `int` is an `int`" loses you minutes of debugging.
+**Same-newtype arithmetic preserves the newtype across `+ - * // % **`** (v0.7.0). `LogIndex(a) + LogIndex(b)` is `LogIndex`. `LogIndex(a) + 1` (literal of base) is also `LogIndex`. Two distinct newtypes with the same base (`LogIndex + Term`) fire `tyc::operator_type_mismatch`. `/` always widens to `float` (Python's true division).
+
+Use newtypes for ID kinds, currency tags, internal-vs-external markers — anywhere "an `int` is an `int`" loses you minutes of debugging.
 
 ### `freeze let X = expr` — deep-immutable bindings
 
@@ -394,25 +509,155 @@ freeze let CONFIG = {"port": 8080, "hosts": ["a", "b"]}
 
 Module-level only in v1. Lowers to a `__typhon_freeze__(...)` call against `typhon_runtime.freeze.deep_freeze`, which recursively converts `list → tuple`, `dict → MappingProxyType`, `set → frozenset`, descends into nested values, and raises `TypeError` at startup on anything without a clean immutable equivalent (file handles, sockets, generators, non-frozen dataclasses). Frozen dataclasses pass through unchanged.
 
+Stacks with `pub` (v0.6.0): `pub freeze let X = …` parses.
+
 ### `pub` — module visibility marker
 
 ```python
 pub let API_VERSION: str = "v1"
-pub class Client: ...
+pub class Client: host: str
 pub def connect(host: str) -> Client: ...
 
 let _internal_default_port: int = 8080   # not exported
 ```
 
-When a module declares at least one `pub` name, desugar synthesises a top-of-file `__all__ = [...]` so `from foo import *`, Sphinx autoapi, IDE re-export filters, and the type checker's re-export inference all see the public surface. No hand-maintained `__all__` lists required.
+When a module declares at least one `pub` name, desugar synthesises a top-of-file `__all__ = [...]` so `from foo import *`, Sphinx autoapi, IDE re-export filters, and the type checker's re-export inference all see the public surface. A hand-written `__all__` wins.
 
-Stacks with the other keyword modifiers — `pub frozen class`, `pub model`, `pub let`, etc.
+Stacks with every modifier: `pub frozen class`, `pub model`, `pub let`, `pub mut`, `pub freeze let`, `pub newtype`, `pub interface`, `pub type`, `pub def`, `pub async def`.
+
+### `pub *` — package-level re-export aggregation (v0.7.0)
+
+```python
+# src/mypkg/__init__.ty
+pub *
+```
+
+In an `__init__.ty`, `pub *` aggregates every direct-sibling module's `pub` names and (transitively) every direct sub-package's effective public surface. The desugar pass synthesises `from .sibling import name1, name2, ...; from .subpkg import name3, ...` at the marker and appends every aggregated name to `__all__`.
+
+Colliding sibling names → `tyc::pub_name_collision` (names both modules and the colliding name). `pub *` outside `__init__.ty` is a no-op + `tyc::pub_star_outside_init` (advice).
+
+See [PACKAGING.md](PACKAGING.md) for the full multi-file packaging surface.
+
+### Three new safety/effect diagnostics
+
+- **`tyc::blocking_in_async`** (warn) — direct call to a known-blocking stdlib (`time.sleep`, `requests.{get,post,...}`, `urllib.request.urlopen`, `subprocess.{run,call,check_call,check_output}`, `input`, `socket.recv`) inside `async def`. Suppressed inside `unsafe:`. Wrap in `asyncio.to_thread(...)` or use an async-native client.
+- **`tyc::resource_not_managed`** (warn) — bare assignment of `open` / `socket.socket` / `sqlite3.connect` / `tempfile.{NamedTemporaryFile,TemporaryDirectory,TemporaryFile}` not wrapped in `with`. Severity controlled by `[strictness] require-with`. `@contextmanager` / `@asynccontextmanager` factory bodies are exempt (v0.6.0).
+- **`tyc::div_by_zero_literal`** — literal divisor zero (`/ 0`, `// 0`, `% 0`, including `-0.0` and unary-negated zero) always raises `ZeroDivisionError`. Pure constant-fold; no flow analysis.
+
+Plus `tyc::unsafe_value_leak`, `tyc::pattern_shadows_outer`, and `tyc::extend_builtin` (all from the same release).
 
 ---
 
-## Error handling with `Result[T, E]`
+## 7. v0.7.0 highlights
 
-`Result[T, E]` is a sealed sum with `Ok(value: T)` and `Err(error: E)`. Emits as frozen dataclasses in a generated `typhon_runtime.py` — no PyPI dep.
+The v0.3.0 → v0.7.0 line is **strictly additive**. Every previously-accepted program continues to compile to identical Python. Highlights since v0.3.0:
+
+### Type-system relaxations
+
+- **`bool ⊆ int`** (v0.4.0) — `let x: int = True`, `1 + True`, `-True` all check.
+- **De Morgan narrowing** (v0.4.0) — `if not (A or B): return` narrows both operands afterwards.
+- **Fixed-arity tuple covariance** (v0.4.0) — `tuple[int, int]` widens both slots to `float`.
+- **Subclass constructors accept inherited fields** (v0.4.0).
+- **Dotted-attribute annotations** resolve to foreign class shapes (v0.4.0).
+- **Variance table** expanded with `AsyncContextManager`, `KeysView`, `ValuesView`, `ItemsView`, `Type`, `Counter` (v0.5.0).
+- **`set - set` / `frozenset - frozenset`** type-check (v0.5.2).
+- **`Ok` / `Err` Result combinators** as methods (v0.6.0): `.map`, `.map_err`, `.and_then`, `.or_else`.
+- **`impl` on a sealed-union alias** distributes to every variant (v0.6.0).
+- **Cross-module variant → sealed-union flow** (v0.6.0).
+- **Cross-module function signatures preserve param/return types** (v0.6.0).
+- **`pub freeze let X = …`** parses (v0.6.0).
+- **`pub def` visible to `?` validator** (v0.6.0).
+- **For-target doesn't rebind prior `let` bindings** (v0.6.0).
+- **Sibling `case` arms: `let` declarations don't shadow each other** (v0.6.0).
+- **`pub *` wildcard re-export aggregation** in `__init__.ty` (v0.7.0).
+- **Declare-only `let NAME: T`** with definite-assignment analysis (v0.7.0).
+- **`with cm() as r:` / `async with cm() as r:`** types `r` from `__enter__` / `@contextmanager`-decorated factories (v0.7.0).
+- **`await Callable[..., Awaitable[T]]`** unwraps to `T` (v0.7.0) — canonical async-middleware `let r: Resp = await next(req)` works.
+- **Same-newtype arithmetic preserves the newtype** (v0.7.0).
+- **Ternary narrowing** (v0.7.0) — `body if test else orelse` narrows like `if`/`else`.
+- **Cross-module generic method dispatch** propagates class TypeVars (v0.7.0).
+- **`from X import Y`** inside `if`/`for`/`while`/`with`/`try`/`match` arms binds (v0.7.0).
+- **Sibling `if`/`elif` branches** don't trip `no_block_shadow` (v0.7.0).
+- **Multi-line `go expr(...)`** parses (v0.7.0).
+
+### Diagnostics added
+
+- `tyc::duplicate_method` (v0.3.1).
+- `tyc::stdlib_module_shadow` (v0.6.0, refined v0.7.0) — `.ty` file shadowing Python 3.13 stdlib top-level module names.
+- `tyc::pub_name_collision` (v0.7.0).
+- `tyc::pub_star_outside_init` (v0.7.0, advice).
+- `tyc::use_of_uninitialised` (v0.7.0).
+- `tyc::field_default_ordering` (v0.7.0).
+
+### CLI additions
+
+- **`tyc run` gates the VM behind a static `tyc check`** (v0.3.1). Set `TYC_SKIP_CHECK=1` to bypass; `--compile` always gates on the full build.
+- **`tyc migrate` rewrites `Generic[T]` → PEP 695** (v0.3.1).
+- **`tyc migrate @dataclass(frozen=True)` → `class X frozen:`** (v0.5.0).
+- **`tyc migrate class X(Protocol[T]):` → `interface X[T]:`** (v0.5.0).
+- **`tyc migrate NAME = NewType("NAME", BASE)` → `newtype NAME = BASE`** (v0.5.0).
+- **`tyc ty` diagnostic attribution** via `.py.map` (v0.5.0) — rewrites `path.py:LINE:COL` to `.ty` coordinates. `--raw` opts out.
+- **`tyc debug` Typhon-aware pdb wrapper** (v0.5.0) — surfaces `[ty] <src>:<line>` after every pause; loads all `.py.map` at startup. `--raw-pdb` opts out.
+- **`tyc debug --break ty-file:line`** translates `.ty` coordinates through `.py.map` (v0.5.0).
+- **Grouped `tyc check` diagnostics by source file** (v0.3.1) plus per-code summary tally.
+- **`tyc explain --list`** prints every diagnostic code (v0.6.0 docs).
+- **`.py.map` sidecars move to `<out>/.sourcemaps/`** (v0.6.1); resolvers prefer the new location, legacy adjacent layout still readable.
+
+### "Designed but NOT yet supported" — avoid these forms
+
+- **`lazy let X: T:` colon-block form** does NOT parse. Use `lazy let X: T = expr`.
+- **`lazy[T]` return-type form** is designed but unimplemented.
+- **Multi-line `|>` pipes require wrapping parens.**
+- **`model X frozen:` does NOT parse** — `frozen` is on `class` only.
+- **`let`-shadowing is rejected** — use `mut` or a fresh name; never re-bind with `let`.
+- **`from typing import TypeVar`** is rejected — use PEP 695.
+- **`from typing import List` / `Dict` / `Tuple` etc.** is rejected — use lowercase builtins.
+- **Bounded TypeVars** parse; multi-argument constraint solving is partial.
+- **PEP 612 `ParamSpec`** is not modelled — annotate decorator layers with `Callable[..., Any]`.
+- **Full HKT unification** is in progress; the parser accepts `F[_]` but checker treatment is staged.
+
+---
+
+## 8. `let`, `mut`, and what immutability means
+
+`let`/`mut` govern **binding immutability**, not deep value immutability — same as Rust's `let`/`let mut` or TypeScript's `const`/`let`. `let u: User` cannot be reassigned, but `u.name = "x"` is still legal if `User` has a mutable `name` field.
+
+For deep immutability on instances, use `class P frozen:` (emits `frozen=True` on the underlying dataclass / Pydantic config). Note: dataclass `frozen=True` only blocks field reassignment — nested mutable containers can still be mutated. Use `tuple` / `frozenset` inside frozen classes for stronger guarantees.
+
+For deep immutability on module-level bindings, use `freeze let CONFIG = {...}` (v0.3.0) — the value is recursively frozen via `typhon_runtime.freeze.deep_freeze` at startup.
+
+Parallelisation passes refuse to touch any binding captured as `mut` by a spawned task without explicit sync.
+
+Top-level module bindings default to `let` unless declared `mut`. Inside functions, the keyword is always explicit.
+
+### Typed tuple unpacking (v0.3.1)
+
+```python
+let (a: int, b: str) = func(x, y)
+let (a: int, b)      = pair()       # mixed; un-annotated leg uses inference
+let (xs: list[int], ys: list[int]) = split()  # compound annotations OK
+```
+
+Desugars to a hidden `__typhon_unpack_N__` temp plus per-element typed assigns. The top-level-comma split inside the annotation pair survives compound annotations like `list[int]`, `dict[str, int]`, `tuple[float, ...]`.
+
+### Declare-then-assign `let NAME: T` (v0.7.0)
+
+```python
+def parse(raw: str) -> Result[Cfg, str]:
+    let loaded: Cfg
+    match _load(raw):
+        case Ok(v):  loaded = v
+        case Err(e): return Err(e)
+    return Ok(loaded)
+```
+
+The resolver tracks each uninitialised `let` declaration's span; the FIRST subsequent assignment silently succeeds (it IS the initialiser). The standard `tyc::immutable_assign` fires on any SECOND assignment. Sibling `match` arms and sibling `if` / `elif` / `else` bodies each count as a separate first-assignment path. `mut NAME: T` without initialiser is also accepted (any number of subsequent assignments legal). Reads on a path that hasn't assigned fire `tyc::use_of_uninitialised` with labels on both use site and declaration.
+
+---
+
+## 9. Error handling with `Result[T, E]`
+
+`Result[T, E]` is a sealed sum with `Ok(value: T)` and `Err(error: E)`. Emits as frozen dataclasses in a generated `typhon_runtime/result.py` — no PyPI dep.
 
 ```python
 def parse_port(raw: str) -> Result[int, str]:
@@ -443,8 +688,10 @@ port: int = _tmp_0.value
 
 Stack traces stay clean. The checker enforces:
 
-- `?` only appears inside a function whose return type is a compatible `Result`.
-- Error types must match (or unify under generics). Mismatches → `tyc::result_error_mismatch`.
+- `?` only appears inside a function whose return type is a compatible `Result`. `?` in a non-`Result` fn → `tyc::invalid_question_op`.
+- Error types must match (or unify under generics). Mismatches → `tyc::result_error_mismatch`. Convert at the boundary via `match`.
+- `?` inside a comprehension is rejected (cannot hoist out of the comp's scope; v0.3.1).
+- Inline `?` is supported (v0.3.0): `Ok(add(parse(s)?, parse(t)?))` works.
 
 ### `with`-chains
 
@@ -462,6 +709,18 @@ def make_report(uid: int) -> Result[Report, AppError]:
 ```
 
 The `else err:` block is optional — without it, the first `Err` short-circuits via the enclosing function (which must return a compatible `Result`).
+
+### Combinators (v0.6.0)
+
+`Ok` and `Err` carry `.map`, `.map_err`, `.and_then`, `.or_else` methods. For heterogeneous error pipelines:
+
+```python
+let toks: Tokens   = tokenize(src).map_err(_lex_to_pipeline)?
+let ast:  Ast      = parse(toks).map_err(_parse_to_pipeline)?
+let ty:   TypedAst = check(ast).map_err(_type_to_pipeline)?
+```
+
+Semantics: `Ok.map(f)` transforms value, `Ok.map_err(g)` is identity (vice versa for `Err`); `and_then` chains a `Result`-returning op on `Ok`; `or_else` recovers from `Err`.
 
 ### Bridging exceptions
 
@@ -484,12 +743,14 @@ After the shim, downstream code uses `?` and `with`-chains without ever writing 
 
 ---
 
-## Async and concurrency
+## 10. Async and concurrency
 
 ### Explicit `async`, not inferred
 
 - A sync function calling an `async` one without `await` is a **hard error** (`tyc::missing_await`).
 - An `async` function with no `await` is a **warning** (`tyc::async_without_await`).
+- Direct call to known-blocking stdlib (`time.sleep`, `requests.*`, `subprocess.run`, …) inside `async def` → **`tyc::blocking_in_async`** (warn).
+- `loop.run_until_complete(coro())` does NOT fire `tyc::missing_await` (v0.6.0).
 
 ### `gather:` — parallel awaits
 
@@ -502,7 +763,21 @@ async def load(uid: int) -> Dashboard:
     return Dashboard(user=user, posts=posts, notifs=notifs)
 ```
 
-Lowers to `asyncio.TaskGroup` (cancel-on-failure). Bindings inside the `gather:` block are an intentional exception to Rule 2 — they don't need `let`/`mut` because the keyword itself introduces them as immutable single-assignment names (the desugarer wraps the whole block as a fresh scope). For best-effort semantics where each binding becomes `T | Exception`:
+Lowers to `asyncio.TaskGroup` (cancel-on-failure):
+
+```python
+async with asyncio.TaskGroup() as _tg:
+    _t_user   = _tg.create_task(fetch_user(uid))
+    _t_posts  = _tg.create_task(fetch_posts(uid))
+    _t_notifs = _tg.create_task(fetch_notifs(uid))
+user   = _t_user.result()
+posts  = _t_posts.result()
+notifs = _t_notifs.result()
+```
+
+Bindings inside the `gather:` block are an intentional exception to Rule 2 — they don't need `let`/`mut` because the keyword itself introduces them as immutable single-assignment names. Dependent bindings (one references an earlier binding) gracefully degrade to sequential `await` in source order.
+
+For best-effort semantics where each binding becomes `T | Exception`:
 
 ```python
 gather(strategy="best-effort"):
@@ -514,24 +789,22 @@ Lowers to `asyncio.gather(..., return_exceptions=True)`.
 
 ### Automatic `gather` (opt-in)
 
-`[strictness] auto-gather = true` rewrites straight-line runs of independent `name = await callee(...)` into a `TaskGroup`, **but only when every callee is a same-module `async def` carrying `@gatherable`** and the LHS bindings don't alias. Imported async callees are left untouched so you cannot surprise upstream callers.
-
-The `@gatherable` decorator is the gate — without it, auto-gather is a no-op for that callee:
+`[strictness] auto-gather = true` rewrites straight-line runs of independent `name = await callee(...)` into a `TaskGroup`, **but only when every callee is a same-module `async def` carrying `@gatherable`** and the LHS bindings don't alias. Imported async callees are left untouched so flipping the flag doesn't surprise upstream callers.
 
 ```python
-@gatherable                          # opts this function in to auto-gather
+@gatherable
 async def fetch_user(uid: int) -> User: ...
 
 @gatherable
 async def fetch_posts(uid: int) -> list[Post]: ...
 
 async def load(uid: int) -> Dashboard:
-    let user = await fetch_user(uid)     # rewritten into a TaskGroup …
-    let posts = await fetch_posts(uid)   # … because both callees are @gatherable
+    let user  = await fetch_user(uid)     # rewritten into a TaskGroup …
+    let posts = await fetch_posts(uid)    # … because both callees are @gatherable
     return Dashboard(user=user, posts=posts)
 ```
 
-When a run of 2+ adjacent independent awaits would have been gathered but at least one callee lacks `@gatherable`, `tyc build` surfaces a `tyc::auto_gather_missed` advice-level diagnostic naming the missing callee. (Only fires with `[strictness] auto-gather = true`; the nudge is silent when you haven't opted in.) Imported async callees are deliberately excluded — you can't decorate code you don't own — so the diagnostic only flags missed opportunities you could actually fix.
+When a run of 2+ adjacent independent awaits would have been gathered but at least one callee lacks `@gatherable`, `tyc build` surfaces a `tyc::auto_gather_missed` advice-level diagnostic naming the missing callee. (Only fires with `[strictness] auto-gather = true`; the nudge is silent otherwise.)
 
 ### `go` — fire-and-forget
 
@@ -551,35 +824,35 @@ await task                          # later
 
 `go` lowers through `typhon_runtime.tasks.spawn`, **never** to a bare `asyncio.create_task` — Python's event loop holds only weak refs, so fire-and-forget can be GC'd mid-flight. The runtime registry holds strong refs and clears entries from a done-callback.
 
+Multi-line `go expr(...)` parses (v0.7.0).
+
+### Async-callable awaits (v0.7.0)
+
+```python
+async def middleware(next: Callable[[Req], Awaitable[Resp]], req: Req) -> Resp:
+    let resp: Resp = await next(req)        # ✅ unwraps Awaitable[Resp] to Resp
+    return resp
+```
+
+`await` on a `Callable[..., Awaitable[T]]` / `Coroutine[Y, S, T]` call unwraps to `T`. This unblocks canonical async-middleware shapes.
+
 ### Free-threaded mode
 
 `[python] free-threaded = true` (requires 3.13t / 3.14t):
 
 - `go` on CPU-bound functions lowers to `ThreadPoolExecutor.submit`.
-- The analyser may parallelise pure-function comprehensions via `ThreadPoolExecutor.map`, gated by `[strictness] auto-parallel` and `[strictness] parallel-min-size` (default 64).
+- The analyser may parallelise pure-function comprehensions via `typhon_runtime.parallel.map_pure(...)`, gated by `[strictness] auto-parallel` and `[strictness] parallel-min-size` (default 64). Set, dict, and list comprehensions are all eligible (v0.5.0).
 - Every parallel block runtime-checks `sys._is_gil_enabled()` and falls back to sequential if a GIL build is detected.
 
 Default off until 3.14 is the default Python.
 
 ---
 
-## `let`, `mut`, and what immutability means
-
-`let`/`mut` govern **binding immutability**, not deep value immutability — same as Rust's `let`/`let mut` or TypeScript's `const`/`let`. `let u: User` cannot be reassigned, but `u.name = "x"` is still legal if `User` has a mutable `name` field.
-
-For deep immutability on instances, use `class P frozen:` (emits `frozen=True` on the underlying dataclass / Pydantic config). Note: dataclass `frozen=True` only blocks field reassignment — nested mutable containers can still be mutated. Use `tuple` / `frozenset` inside frozen classes for stronger guarantees.
-
-Parallelisation passes refuse to touch any binding captured as `mut` by a spawned task without explicit sync.
-
-Top-level module bindings default to `let` unless declared `mut`. Inside functions, the keyword is always explicit.
-
----
-
-## Lazy loading
+## 11. Lazy loading
 
 ```python
 lazy import np = numpy           # ✅ deferred via bespoke `__TyphonLazy_np_` proxy class
-lazy from numpy import array     # ❌ rejected at parse time (PEP 690)
+lazy from numpy import array     # ❌ rejected at parse time (PEP 690 reasoning)
 ```
 
 `lazy from ... import` defeats deferral (it eagerly touches attributes on the source module) and is a hard parse error. Redirect to `lazy import` + dotted access.
@@ -589,14 +862,18 @@ Other lazy forms:
 | Form | Lowers to |
 |---|---|
 | `lazy let CFG: Config = load()` (module-level) | sentinel-cached `lazy_let(lambda: load())` in `typhon_runtime` (thread-safe, one-shot) |
-| `lazy let cfg: Config = load()` (class body) | `@cached_property` (per-instance is the intended scope) |
-| `def primes(n: int) -> lazy[list[int]]:` | generator function, not materialised list |
+| `lazy let cfg: Config = load()` inside class body | `@cached_property` (per-instance is the intended scope) |
+| `def primes(n: int) -> lazy[list[int]]:` | designed but **unimplemented today** — use `Iterator[int]` directly |
 
 Module-level lazy bindings use the runtime helper rather than `functools.cached_property` because the latter is instance-scoped, race-prone, and writable after first eval.
 
+**Doc-confirmed non-working forms** (avoid these):
+- `lazy let X: T:` colon-block form does NOT parse.
+- `lazy[T]` return type form is designed but unimplemented.
+
 ---
 
-## Compile-time evaluation (`comptime`)
+## 12. Compile-time evaluation (`comptime`)
 
 `comptime` bindings are evaluated **at build time** in a sandboxed interpreter; results are inlined as literals.
 
@@ -604,13 +881,14 @@ Module-level lazy bindings use the runtime helper rather than `functools.cached_
 comptime let PORT: int = int(env("PORT", "8080"))
 comptime let DB_URL: str = env("DATABASE_URL")   # build fails if unset
 comptime let IS_PROD: bool = env("BUILD_TAG", "dev") == "prod"
-comptime let TAGS: list[str] = ["alpha", "beta"].split(",") if False else ["alpha", "beta"]
 comptime let HOST: str = env("HOST", "localhost").lower()
 
 comptime def feature(name: str) -> bool:
     return env("FEATURE_" + name.upper(), "0") == "1"
 
 comptime let SHIPS_AUTH: bool = feature("auth")
+
+comptime let T: type = int        # v0.5.0 — types-as-comptime-values
 ```
 
 Declare required env vars in `typhon.toml`:
@@ -620,111 +898,37 @@ Declare required env vars in `typhon.toml`:
 required = ["DATABASE_URL"]
 ```
 
-The sandbox is intentionally tight, but covers a useful surface. Today it supports: integer / float / string / boolean literals, container literals (`[1, 2, 3]`, `{"a": 1}`, `(1, "x")`, including empty containers and the trailing-comma single-element tuple form), basic arithmetic (`+ - * / //` and the comparable comparison ops), boolean ops (`and` / `or`), ternaries (`x if cond else y`), `env("NAME")` / `env("NAME", "default")`, the `int()` / `str()` / `float()` / `len()` casts, a small pure-only set of string methods (`upper`, `lower`, `strip`, `lstrip`, `rstrip`, `replace`, `startswith`, `endswith`, `split`), and calls to user-defined `comptime def` functions. Anything else — I/O, subprocess, network, `random` / `time`, arbitrary imports, mutation — is permanently out of scope.
+### Allowed in the sandbox
 
-Emitted Python sees only the inlined literal:
+- **Statements (in `comptime def` body):** `return`, local bindings (`x = …`, `let x: T = …`, `mut x: T = …`), `if`/`elif`/`else`.
+- **Expressions:** literals (`int`, `float`, `str`, `bool`), container literals (`[1, 2]`, `{"a": 1}`, `(1, "x")`, including empty containers and the trailing-comma single-element tuple form), arithmetic (`+ - * / // % **`), comparisons (`== != < <= > >=`), boolean ops (`and or not`), ternaries (`x if cond else y`), `env(name, default?)`, the `int()` / `str()` / `float()` / `len()` casts, a small pure-only set of string methods (`upper`, `lower`, `strip`, `lstrip`, `rstrip`, `replace`, `startswith`, `endswith`, `split`, `join` (v0.3.1)), subscript with Python negative indexing, calls to user-defined `comptime def` functions.
+- **Types-as-values (v0.5.0):** `int`, `str`, `bool`, `float`, `bytes`, `None`, `type`, `object`. Stored as `ComptimeValue::Type(...)`.
+
+### Forbidden
+
+- Loops, exceptions (`raise`, `try`/`except`), `with`-blocks, `class` declarations, nested `def` (other than the outer `comptime def`), arbitrary imports.
+- I/O, network, subprocess, random, time, uuid, `os.urandom`.
+- Free variables (module-level names that aren't parameters or local bindings) — comptime is **hermetic**; pass everything in as arguments.
+- `*args`, `**kwargs`, defaults, keyword-only parameters on a `comptime def`.
+- Recursion depth capped at **64**.
+
+### Emitted Python
 
 ```python
 PORT: int = 8080
 DB_URL: str = "postgresql://..."
+SHIPS_AUTH: bool = True
 ```
+
+`comptime def` functions are **also preserved** in the emitted `.py` so they remain callable at runtime.
+
+### Secret-shape literal warning
+
+`tyc::contains_secret_literal` (warn) fires when a `comptime let` binding's name matches `*KEY`, `*TOKEN`, `*PASSWORD`, `*SECRET`, `*PASS`, `*PWD` — the build artifact would contain the resolved env-var value as a string literal. Read at runtime via `os.environ[...]` instead.
 
 ---
 
-## Purity, `@pure`, `@memo`
-
-A function is **inferable as pure** only if all six conditions hold:
-
-1. Synchronous (no coroutines/generators).
-2. Hashable parameters (primitives, frozen dataclasses, tuples thereof).
-3. No I/O in transitive call graph (`open`, `socket`, `subprocess`, `print`, logger, DB drivers). `unsafe` + stubbed calls count as impure unless the stub is `@pure`.
-4. No non-determinism (`time.*`, `random.*`, `secrets.*`, `uuid.*`, `os.urandom`).
-5. No reads/writes of mutable module-level state. `comptime let` reads are fine.
-6. No exceptions raised — pure functions express failure via `Result[T, E]`.
-
-```python
-@pure                            # asserts purity; compiler enforces all 6 conditions
-def normalise(s: str) -> str:
-    return s.strip().lower()
-
-@memo                            # implies pure-eligibility, inserts @functools.cache
-def fib(n: int) -> int:
-    if n < 2: return n
-    return fib(n - 1) + fib(n - 2)
-
-@pure(memo=True)                 # combined form
-def hash_pw(salt: str, pw: str) -> str: ...
-```
-
-Bounded caches: `@memo(max=128)` → `@functools.lru_cache(maxsize=128)`.
-
-Project-wide:
-
-```toml
-[strictness]
-auto-memoise = true              # off by default — caches extend lifetimes
-pgo-memoise = true               # also opt-in; reads typhon-profile.json
-pgo-min-calls = 100              # threshold; default 100
-```
-
-Manually marking a function `@pure` that fails any of the six conditions is a hard error (`tyc::impure_pure_fn`).
-
----
-
-## Readability features
-
-### Pipes — left-to-right composition
-
-```python
-let cleaned: str = "  Hello, World!  " |> str.strip() |> str.lower() |> str.replace(",", "")
-```
-
-`a |> f(arg)` is exactly `f(a, arg)`. Left-associative, fills *first* positional slot. No partial application, no curry.
-
-### Guards
-
-```python
-def shipping(weight: float?) -> float:
-    guard w = weight else:
-        return 0.0
-    return w * 1.25
-```
-
-Sugar for early-return on falsy/`None` plus narrowing. The `else:` block must return / raise / otherwise exit the enclosing function.
-
-Chain guards naturally:
-
-```python
-guard t = token else: return "anon"
-guard u = user_id else: return "anon"
-return f"({t}, {u})"
-```
-
----
-
-## Python interop and `.dty` stubs
-
-`.dty` is the Typhon stub format — strictly typed in the Typhon dialect (`T?`, `Result`, sealed unions, interfaces, `unsafe`). The compiler emits a PEP 561 `.pyi` companion so mypy / pyright / Pyrefly / `ty` understand it too.
-
-A `.pyi` consumed *by* Typhon is treated as an `unsafe` boundary unless overridden by an authored `.dty`.
-
-```python
-# src/stubs/redis.dty
-class Redis:
-    host: str
-    port: int
-
-impl Redis:
-    def get(key: str) -> str?
-    def set(key: str, value: str) -> bool
-    def delete(*keys: str) -> int
-```
-
-`tyc check --stubs` runs a Typhon port of mypy's `stubtest`: it diffs each `.dty`'s surface API against the runtime symbols of the module it describes and emits `tyc::stub_mismatch` for missing-in-impl / missing-in-stub / signature-mismatch findings. Runtime-introspection (full stubtest-proper) is a follow-up.
-
----
-
-## `typhon.toml` reference
+## 13. `typhon.toml` reference
 
 Default scaffold (`tyc init`):
 
@@ -740,19 +944,23 @@ target = "3.13"                  # **required: 3.13+ only**. Valid: "3.13" / "3.
 free-threaded = false            # requires 3.13t/3.14t; off by default
 
 [emit]
-class-default = "dataclass"      # or "pydantic"
+class-default = "dataclass"      # or "pydantic". Unknown values → tyc::invalid_config_value
 format = true                    # post-process through ruff format
-# model-extra is on the roadmap; today Pydantic emissions are always extra="forbid"
+model-extra = "forbid"           # "forbid" | "allow" | "ignore"
+skip-decoration-bases = []       # extra base-class names suppressing the auto @dataclass decoration. Matched by last segment.
 # pyi-stubs is always on — every .dty emits a .pyi
 
 [strictness]
-no-implicit-any = true
+no-implicit-any = true           # reserved for forward compat; today the check is always on
 unused-import = "error"          # or "warn" | "off"
 exhaustive-match = "error"
 methods-in-class-body = "warn"   # or "error" (break CI) | "off"
+require-with = "warn"            # severity for tyc::resource_not_managed
+blocking-in-async = "warn"       # severity for tyc::blocking_in_async
+stub-check = "error"             # severity for tyc::stub_mismatch
 auto-memoise = false             # opt-in; inserts @functools.cache on inferred pure fns
 auto-gather = false              # opt-in; folds independent awaits into TaskGroup (needs @gatherable)
-auto-parallel = false            # opt-in; pure list comprehensions → thread-pool map
+auto-parallel = false            # opt-in; pure list/set/dict comprehensions → thread-pool map
 parallel-min-size = 64
 pgo-memoise = false              # opt-in; promotes hot pure fns from typhon-profile.json
 pgo-min-calls = 100
@@ -768,10 +976,11 @@ rich = "*"                       # bare name → any version
 pytest = "8.2"                   # bare version → ==8.2
 ```
 
-Notes on always-on behaviour (no longer toggles):
+Notes on always-on behaviour:
 
 - **PEP 561 `.pyi` stubs are always emitted** alongside every `.dty`.
-- **Pydantic emissions are always `extra="forbid"`** — `[emit] model-extra` is on the roadmap, not wired today.
+- **Pydantic emissions inject `model_config = ConfigDict(extra=…)`**, controlled by `model-extra`.
+- **`tyc::stdlib_module_shadow`** is gated on the presence of `typhon.toml` (standalone-file checks skip it).
 
 `auto-gather` independence rules:
 
@@ -779,30 +988,28 @@ Notes on always-on behaviour (no longer toggles):
 - LHS bindings must not alias.
 - The statements must form a straight-line block.
 
-Externally-imported async callees and undecorated locals are deliberately left alone so flipping the flag doesn't surprise callers that aren't ready for concurrency.
-
 ---
 
-## `tyc` subcommand reference
+## 14. `tyc` subcommand reference
 
-See `docs/cli.md` for the full surface. The most-used commands:
+See [CLI.md](CLI.md) and `docs/cli.md` for the full surface. The most-used commands:
 
 | Command | What it runs | When |
 |---|---|---|
 | `tyc check src/` | parse → resolve → type → analyse (no emit) | CI; daily editing |
-| `tyc build` | full pipeline through emit + ruff format; `--check` for dry-run | local run; produces `build/*.py` + `build/*.py.map` |
+| `tyc build` | full pipeline through emit + ruff format; `--check` for dry-run | local run; produces `build/*.py` + `build/.sourcemaps/*.py.map` |
 | `tyc fmt src/` | in-process whitespace pass + `ruff format` wrap (when on PATH) | pre-commit |
 | `tyc run` | execute a Typhon program in the in-process VM by default; `--compile` (alias `--no-vm`) falls back to build-then-exec for CPython library interop | iterating on pure-Typhon code |
 | `tyc lsp` | LSP on stdio (diagnostics, hover, go-to-def, member completions via venv introspection, from-import members from sibling files, "Remove unused import") | editor |
 | `tyc init NAME` | scaffold `typhon.toml`, `src/`, `tests/` with a worked `main.ty` (frozen dataclass + `impl` + `Result`/`?`/`match`) | new project |
-| `tyc trace traceback.txt` | map Python frames back to `.ty` via `.py.map` | debugging emitted code |
+| `tyc trace traceback.txt` | map Python frames back to `.ty` via `.py.map` v2 | debugging emitted code |
 | `tyc profile` | instrument top-level fns with call-count + wall-clock; writes `typhon-profile.json` on interpreter exit | feeds `pgo-memoise` |
-| `tyc migrate src/app.py` | typed Python → Typhon: rewrites `Optional[T]`/`T \| None` → `T?`, adds `let`/`mut` to module-level annotated assigns, drops `@dataclass` decorators + import | `--check` for CI |
-| `tyc ty` | builds, then runs Astral's `ty` checker over emitted Python | second-opinion type-checking; needs `pip install ty` |
+| `tyc migrate src/app.py` | typed Python → Typhon: rewrites `Optional[T]`/`T \| None` → `T?`, `Generic[T]` → PEP 695, `NewType` → `newtype`, `Protocol` → `interface`, drops `@dataclass`/`@dataclass(frozen=True)`, adds `let`/`mut` to module-level annotated assigns | `--check` for CI |
+| `tyc ty` | builds, then runs Astral's `ty` checker over emitted Python with `.ty` path attribution via `.py.map` (v0.5.0) | second-opinion type-checking; needs `pip install ty` |
 | `tyc stubtest` | builds, then runs `python -m mypy.stubtest` against every emitted `.pyi` | runtime probe complementing `tyc check --stubs` |
 | `tyc repl` | interactive evaluator; compiles each block through the full pipeline | quick experiments; `:quit` / `:reset` / `:show` |
-| `tyc debug` | builds + execs `python -m pdb build/main.py`; `--break <ty-file>:<line>` translates `.ty` coordinates through `.py.map` into the debugger session | step through emitted code; pair with `tyc trace` |
-| `tyc explain <code>` | prints the catalog entry for a `tyc::` diagnostic (short or fully-qualified code) | when a diagnostic needs more context |
+| `tyc debug` | builds + execs `python -m pdb build/main.py` with a source-mapping wrapper (v0.5.0) that surfaces `[ty]` paths; `--break <ty-file>:<line>` translates `.ty` coordinates through `.py.map` | step through emitted code; pair with `tyc trace` |
+| `tyc explain <code>` | prints the catalog entry for a `tyc::` diagnostic (short or fully-qualified code); `tyc explain --list` prints every code | when a diagnostic needs more context |
 | `tyc cheatsheet` | prints the 30-second Typhon cheat sheet to stdout | offline syntax refresher |
 | `tyc add` / `tyc remove` / `tyc sync` | manage `[dependencies]` / `[dev-dependencies]`, shell to `uv` | package management |
 
@@ -810,21 +1017,47 @@ Notable flags:
 
 - `tyc check --stubs` — also diff every `.dty` against the runtime module it describes.
 - `tyc build --check` — dry-run, lists every file that would be written without touching disk.
+- `tyc build --no-sync` (or `TYC_NO_SYNC=1`) — skip `uv sync` but still merge `pyproject.toml`.
 - `tyc run --compile` (alias `--no-vm`) — fall back to build-then-exec when the program imports CPython-only libraries.
-- `tyc ty --watch` / `tyc ty --out DIR` / `tyc ty -- --strict`
+- `tyc run --temp` — compile mode only; build into a tempdir deleted on exit.
+- `tyc ty --watch` / `tyc ty --out DIR` / `tyc ty -- --strict` / `tyc ty --raw`
 - `tyc repl --load src/lib.ty` / `tyc repl --python python3.13`
-- `tyc debug --entry api.py --debugger pudb --break src/main.ty:42`
+- `tyc debug --entry api.py --debugger pudb --break src/main.ty:42` / `tyc debug --raw-pdb`
 - `tyc add --dev pytest@8.2` / `tyc add --no-sync` / `tyc sync --dry-run`
 
-`tyc repl` quirks: each prompt re-executes the entire accumulated session (pure-scratch semantics, side effects fire once per prompt), multi-line blocks end on the first blank line, no readline/arrow-key support yet. Bare single-line expressions auto-print their `repr(...)` — `>>> 1 + 1` prints `2` — matching the universal REPL convention.
+`tyc repl` quirks: each prompt re-executes the entire accumulated session (pure-scratch semantics, side effects fire once per prompt), multi-line blocks end on the first blank line, no readline/arrow-key support yet. Bare single-line expressions auto-print their `repr(...)` — `>>> 1 + 1` prints `2`.
 
-`tyc debug` frames in the debugger session still surface as `build/*.py` paths. `--break <ty-file>:<line>` translates Typhon source locations through the v2 `.py.map` and forwards them to the chosen debugger via `-c "break …"`. Pair with `tyc trace` to remap captured tracebacks back to `.ty`. A full Typhon-native source-mapping debugger UI is still a follow-up.
+`tyc debug` v0.5.0 wraps `pdb.Pdb` so the **entire debugger UI reads `.ty` coordinates** — `list`, `where`, stack frames, and the prompt all display `.ty` paths and source slices. `--raw-pdb` opts out. `--break <ty-file>:<line>` translates Typhon source locations through `.py.map` and forwards them to the chosen debugger as `-c "break …"`.
 
-`tyc run` defaults to the in-process `tyc-vm` tree-walking interpreter — no `.py` written, no CPython spawn. See `docs/vm.md` for the supported feature surface. Programs that import CPython-only libraries fall back via `tyc run --compile`.
+`tyc run` defaults to the in-process `tyc-vm` tree-walking interpreter — no `.py` written, no CPython spawn. As of v0.3.1 it gates on `tyc check` first (set `TYC_SKIP_CHECK=1` to bypass). See [RUNTIME.md](RUNTIME.md) for the supported feature surface. Programs that import CPython-only libraries fall back via `tyc run --compile`.
 
 ---
 
-## Compiler architecture
+## 15. Python interop and `.dty` stubs
+
+`.dty` is the Typhon stub format — strictly typed in the Typhon dialect (`T?`, `Result`, sealed unions, interfaces, `unsafe`). The compiler emits a PEP 561 `.pyi` companion so mypy / pyright / Pyrefly / `ty` understand it too.
+
+A `.pyi` consumed *by* Typhon is treated as an `unsafe` boundary unless overridden by an authored `.dty`.
+
+```python
+# src/stubs/redis.dty
+class Redis:
+    host: str
+    port: int
+
+impl Redis:
+    def get(self, key: str) -> str?
+    def set(self, key: str, value: str) -> bool
+    def delete(self, *keys: str) -> int
+```
+
+`tyc check --stubs` runs a Typhon port of mypy's `stubtest`: it diffs each `.dty`'s surface API against the runtime symbols of the module it describes and emits `tyc::stub_mismatch` for missing-in-impl / missing-in-stub / signature-mismatch findings. `tyc stubtest` runs the real `python -m mypy.stubtest` against every emitted `.pyi` (catches dynamically-created members the AST can't see — `__init_subclass__`, metaclass-driven member registration, Pydantic auto-generated fields).
+
+**Cross-module shape extraction consumes both `.ty` and `.dty` on equal footing.** When both define the same name, stubs win.
+
+---
+
+## 16. Compiler architecture
 
 The whole pipeline lives in `tyc/crates/`, backed by a Salsa incremental DB.
 
@@ -832,22 +1065,30 @@ The whole pipeline lives in `tyc/crates/`, backed by a Salsa incremental DB.
 .ty / .dty
     │
     ▼ tyc-syntax       lexer + parser (vendored Ruff fork — see tyc/vendor/)
-    │                  let/mut soft-keywords, Mutability AST field
-    ▼ tyc-db           Salsa queries: preprocessed_text, module_decl_names, resolved_module
-    ▼ tyc-resolve      name resolution + scope construction; enforces let/mut; declaration sites
-    ▼ tyc-types        nominal types + non-null narrowing + structural conformance + bidirectional generic inference
-    ▼ tyc-analyse      purity (6 conditions), async checks, comptime sandbox, auto-gather data-flow
-    ▼ tyc-desugar      Typhon AST → Python AST (merge impl/extend, insert self, expand `?`, with-chains, gather:, go, pipes, lazy let)
-    ▼ tyc-emit         Python codegen + `.py.map` v2 (per-statement out_line → ty_line)
-    ▼ tyc-format       formatter (`tyc fmt`) — Typhon-aware printer wrapped in `ruff format`
+    │                  let/mut soft-keywords with Mutability AST field
+    │                  preprocess.rs expands T?, ?, |>, gather:, go, lazy, with-chains
+    ▼ tyc-db           Salsa queries: preprocessed_text/full, module_decl_names,
+    │                  resolved_module, check_diagnostics, module_shapes_query
+    ▼ tyc-resolve      name resolution + scope construction; enforces let/mut;
+    │                  declaration sites; per-arm uninit tracking for v0.7.0 DA
+    ▼ tyc-types        nominal types + non-null narrowing + structural conformance +
+    │                  bidirectional generic inference; HKT scaffold (TypeConstructor)
+    ▼ tyc-analyse      purity (6 conditions), async checks, comptime sandbox,
+    │                  auto-gather data-flow, auto-parallel comprehension rewriter
+    ▼ tyc-desugar      Typhon AST → Python AST (merge impl/extend, insert self,
+    │                  expand ?, with-chains, gather:, go, pipes, lazy let, newtype,
+    │                  freeze, pub, pub * aggregation)
+    ▼ tyc-emit         Python codegen + .py.map v2 (per-statement out_line → ty_line)
+    ▼ tyc-format       in-process whitespace pass + ruff format wrap
     ▼
-    .py + .py.map (+ generated typhon_runtime.py if used)
+    .py + .sourcemaps/*.py.map (+ generated typhon_runtime/ if used)
 ```
 
-- **`tyc-diagnostics`** uses miette for the human-friendly format you see.
-- **`tyc-lsp`** is a `tower-lsp-server` backend reusing the same Salsa DB.
-- **`tyc/`** is the CLI binary that wires it all together with clap v4.
-- **`tyc/vendor/`** holds the Ruff fork — `ruff_text_size`, `ruff_source_file`, `ruff_python_trivia`, `ruff_python_ast` (with the `Mutability` extension on assignment nodes), `ruff_python_parser`. See `tyc/vendor/README.md` for the fork rationale (it's complete; `rustpython-parser` migration is finished).
+- **`tyc-diagnostics`** uses miette/thiserror for the human-friendly format you see; every code carries a `url(https://typhon.dev/lang/diagnostics/<code>)` deep-link.
+- **`tyc-lsp`** is a `tower-lsp-server` backend reusing the same Salsa DB; serves diagnostics, hover, go-to-definition (cross-file via `resolved_module`), completion (including venv-driven member-access introspection cached per session), semantic tokens, "Remove unused import" code action.
+- **`tyc-vm`** is the in-process tree-walking interpreter that powers `tyc run`. See [RUNTIME.md](RUNTIME.md).
+- **`tyc/`** is the CLI binary that wires it all together with clap v4; subcommands live under `tyc/src/commands/`.
+- **`tyc/vendor/`** holds the Ruff fork — `ruff_text_size`, `ruff_source_file`, `ruff_python_trivia`, `ruff_python_ast` (with the `Mutability` extension on assignment nodes), `ruff_python_parser`. See `tyc/vendor/README.md`.
 
 When investigating a bug, the rule of thumb is:
 
@@ -861,123 +1102,198 @@ When investigating a bug, the rule of thumb is:
 | Wrong Python output / source-map wrong line | `tyc-emit` |
 | Diagnostic text / span wrong | `tyc-diagnostics` (and the call site that emitted it) |
 | LSP hover / go-to-def / completion misbehaving | `tyc-lsp` |
-| CLI flag, exit code, watch loop | `tyc/crates/tyc` |
+| VM produces wrong answer | `tyc-vm` |
+| CLI flag, exit code, watch loop | `tyc/src/commands/*.rs` |
+
+The pipeline is **strict** — every crate only depends on its upstream neighbours plus `tyc-diagnostics` and `tyc-db`. There are no skip-level dependencies.
 
 ---
 
-## Diagnostics catalog
+## 17. The `typhon_runtime` package
 
-The recurring diagnostic codes and what they actually mean. All are documented in source under `tyc-diagnostics`; this is the field guide.
+`typhon_runtime/` is a **generated package** the build owns. It's written into the project's output dir on every `tyc build` whenever the desugar pass sets `needs_typhon_runtime = true` (i.e. the emitted code references `Ok`/`Err`/`Result`, `typhon_runtime.tasks.spawn`, `typhon_runtime.lazy.lazy_let`, `typhon_runtime.parallel.map_pure`, or `typhon_runtime.freeze.deep_freeze`).
+
+| File | Surface |
+|---|---|
+| `__init__.py` | Re-exports `Ok`, `Err`, `Result` |
+| `result.py` | `Ok`, `Err`, `Result` dataclasses + `.map`/`.map_err`/`.and_then`/`.or_else` methods (v0.6.0) |
+| `tasks.py` | `spawn(coro)` with strong-ref `_BACKGROUND` set + done-callback `discard` |
+| `lazy.py` | `_LazyModule` / `lazy_import(name)`; `_LazyValue` / `lazy_let(factory)` |
+| `parallel.py` | `map_pure(fn, iterable)` — `concurrent.futures.ThreadPoolExecutor`-backed parallel map; degrades to sequential on GIL-locked CPython |
+| `freeze.py` | `deep_freeze(obj)` — recursively replaces `list → tuple`, `dict → MappingProxyType`, `set → frozenset`; raises `TypeError` on un-freezable values at startup |
+| `stdlib.py` | Internal helpers used by lowering passes |
+
+**The runtime is generated; users do not edit it and do not `pip install` it.** Regenerated on every `tyc build`. There is no PyPI package — every project ships its own copy alongside the emitted `.py`.
+
+The VM exposes the same surface natively, so `from typhon_runtime import Ok, Err` and `typhon_runtime.tasks.spawn` work in `tyc run`.
+
+See [RUNTIME.md](RUNTIME.md) for the VM's full feature surface and the runtime helper internals.
+
+---
+
+## 18. `.py.map` v2 and source-mapped debugging
+
+Sidecar source map written alongside every emitted `.py` under `<out>/.sourcemaps/` (v0.6.1; legacy adjacent layout still readable). The hand-written `tyc-emit` printer records a `(out_line → ty_line)` mapping at line granularity.
+
+Consumers:
+
+- **`tyc trace`** — rewrites Python tracebacks to point at `.ty` source. Paths with spaces use a longest-candidate walk-left lookup (v0.5.0).
+- **`tyc debug --break <ty-file>:<line>`** — translates the Typhon source location through `.py.map` and injects `-c "break build/main.py:N"` into the debugger session.
+- **`tyc debug` source-mapping wrapper** — loads every `.py.map` at startup and overrides pdb's `do_list`, `do_where`, `format_stack_entry`, and `prompt` so the **entire** debugger UI reads `.ty` (v0.5.0).
+- **`tyc ty`** — same loader as `tyc trace`; rewrites `ty`'s `*.py:LINE[:COL]` diagnostics to point at `.ty` (v0.5.0). `--raw` opts out.
+- **`tyc lsp`** — cross-file go-to-definition across the `.ty` / `.py` boundary.
+
+---
+
+## 19. Diagnostics catalog (top tier)
+
+The recurring diagnostic codes and what they actually mean. **See [DIAGNOSTICS.md](DIAGNOSTICS.md) for the exhaustive 67-code reference** — what follows is the daily-driver subset.
 
 | Code | Meaning | Fix |
 |---|---|---|
-| `tyc::missing_return_type` | Function has no `-> T` | Add an explicit return type — `-> None` if it returns nothing |
-| `tyc::implicit_any` | RHS infers to `Any` outside `unsafe` | Annotate, wrap in `unsafe:`, or stub the source via `.dty` |
+| `tyc::missing_annotation` | Function has no `-> T` or param lacks annotation | Add an explicit type (`-> None` if it returns nothing) |
 | `tyc::missing_binding_kind` | Local `=` without `let`/`mut` | Add `let` (default) or `mut` (if rebound) |
 | `tyc::immutable_assign` | Reassigning a `let` binding | Change to `mut`, or extract a new `let` |
+| `tyc::missing_initialiser` | `let NAME: T` written that is never assigned | Initialise inline, or assign on every non-diverging path |
+| `tyc::use_of_uninitialised` | (v0.7.0) Read of `let NAME: T` on a path that didn't assign | Initialise inline, or assign in every non-diverging arm |
+| `tyc::no_block_shadow` | Inner `let`/`mut` would shadow an outer binding | Rename inner binding (no block scope in Python) |
+| `tyc::pattern_shadows_outer` | `case Wrap(value):` against outer `let value` | Rename the capture (`case Wrap(inner):`) |
 | `tyc::nullable_use` | Passing `T?` where `T` required | Narrow with `is None` / `guard` / early-return |
 | `tyc::missing_await` | Sync context calling `async def` | Add `await` and make caller `async` |
 | `tyc::async_without_await` (warn) | `async def` with no `await` inside | Drop `async` or await something |
+| `tyc::blocking_in_async` (warn) | Direct call to known-blocking stdlib inside `async def` | `asyncio.to_thread(...)` or async-native client. Suppressed inside `unsafe:` |
 | `tyc::manual_init` | `class` defines `__init__` | Remove it — constructor is generated |
+| `tyc::method_in_class_body` (warn) | A `def` inside `class Name:` instead of `impl Name:` | Move into an `impl` block |
+| `tyc::field_default_ordering` | (v0.7.0) Non-default field after defaulted one in `class` | Reorder, or use a factory |
 | `tyc::frozen_assign` | Writing a field on a `frozen` class | Build a new instance |
+| `tyc::missing_field_init` | `X.__new__(X)` escape without every required field assigned | Use the regular constructor |
 | `tyc::non_exhaustive_match` | `match` on a sealed union misses a variant | Add the missing `case` or use `case _:` |
 | `tyc::invalid_question_op` | `?` inside a non-`Result` function | Change the signature or `match` explicitly |
-| `tyc::result_error_mismatch` | `?` returns an `Err[E1]` into `Result[T, E2]` | Convert at the boundary |
+| `tyc::result_error_mismatch` | `?` returns `Err[E1]` into `Result[T, E2]` | Convert at the boundary with `match` or `.map_err` |
 | `tyc::impure_pure_fn` | `@pure` function fails one of the 6 conditions | Refactor or drop `@pure` |
 | `tyc::interface_isinstance` | `isinstance(x, SomeInterface)` | Use static narrowing or refactor to a sealed union |
-| `tyc::stub_mismatch` | `.dty` vs `.py` drift detected by `tyc check --stubs` | Update the stub or implementation |
-| `tyc::unused_import` | Severity controlled by `[strictness] unused-import` | Remove the import (LSP "Remove unused import" code-action exists) |
-| `tyc::method_in_class_body` (warn by default) | A `def` inside `class Name:` instead of `impl Name:` (Rule 4) | Move into an `impl Name:` block. Severity controlled by `[strictness] methods-in-class-body` (`warn` / `error` / `off`). |
-| `tyc::auto_gather_missed` (advice) | Adjacent awaits look gather-able but a callee lacks `@gatherable` | Decorate the named callee. Fires from `tyc build` only when `[strictness] auto-gather = true`. |
-| `tyc::newtype_violation` (0.3.0) | Bare base-type value flowing into a `newtype` slot | Wrap with the constructor: `UserId(raw_int)` |
-| `tyc::blocking_in_async` (0.3.0, warn) | Direct call to a known-blocking stdlib (`time.sleep`, `requests.get`, `subprocess.run`, `input`, …) inside `async def` | Wrap in `asyncio.to_thread(...)` / `loop.run_in_executor(...)`, or use an async-native client. Suppressed inside `unsafe:`. |
-| `tyc::resource_not_managed` (0.3.0, warn) | Bare assignment of `open` / `socket.socket` / `sqlite3.connect` / `tempfile.*` without a `with` | Wrap in `with` or move into an explicit `try/finally`. Severity controlled by `[strictness] resource-not-managed`. |
-| `tyc::div_by_zero_literal` (0.3.0) | Literal-divisor `/ 0`, `// 0`, `% 0` (including `-0.0` and unary-negated zero) | The expression always raises `ZeroDivisionError` — fix the divisor or guard the call site. |
-| `tyc::unsafe_value_leak` (0.3.0) | A `return x` outside the `unsafe:` block where `x` was declared, against a function whose return type is concrete | Re-assert inside (`let x: T = …`) or re-bind at the boundary (`let typed: T = x`). |
-| `tyc::pattern_shadows_outer` (0.3.0) | `case Wrap(value):` against an outer `let value` binding | Rename the capture (the bare name in a class pattern is always a fresh binding in Python's `match`). |
-| `tyc::extend_builtin` (0.3.0) | `extend list[int]:` (parametric target) | Drop the `[…]`; `extend list:` is the supported form. |
+| `tyc::interface_not_conforming` | Type missing/incompatible interface members | Add the method or fix the signature |
+| `tyc::stub_mismatch` | `.dty` vs runtime drift detected by `tyc check --stubs` | Update the stub or implementation |
+| `tyc::unused_import` (error) | Severity controlled by `[strictness] unused-import` | Remove the import (LSP "Remove unused import" code-action exists) |
+| `tyc::orphan_py_import` (warn) | `.py` outside `src/` referenced from a relative import | Move under `src/` or use an absolute import |
+| `tyc::stdlib_module_shadow` (warn) | (v0.6.0) `.ty` filename matches a Python 3.13 stdlib top-level module | Rename (e.g. `lang_types.ty`, `records.ty`) |
+| `tyc::auto_gather_missed` (advice) | Adjacent awaits look gather-able but a callee lacks `@gatherable` | Decorate the named callee |
+| `tyc::newtype_violation` | Bare base-type value flowing into a `newtype` slot or wrong-typed constructor arg | Wrap with the constructor: `UserId(raw_int)` |
+| `tyc::resource_not_managed` (warn) | Bare assignment of `open` / `socket.socket` / `sqlite3.connect` / `tempfile.*` without `with` | Wrap in `with` or move into an explicit `try/finally`. Severity controlled by `[strictness] require-with` |
+| `tyc::div_by_zero_literal` | Literal-divisor `/ 0`, `// 0`, `% 0` (including `-0.0` and unary-negated zero) | Fix the divisor or guard the call site |
+| `tyc::unsafe_value_leak` | A `return x` outside the `unsafe:` block where `x` was declared | Re-assert inside (`let x: T = …`) or re-bind at the boundary (`let typed: T = x`) |
+| `tyc::extend_builtin` | `extend list[int]:` (parametric target) | Drop the `[…]`; `extend list:` is the supported form |
+| `tyc::duplicate_method` | Two `impl`/`extend` blocks define the same method | Rename, delete, or merge |
+| `tyc::pub_name_collision` | (v0.7.0) Two siblings both `pub`-export the same name under `pub *` | Rename one, drop `pub` on one, or use explicit re-exports |
+| `tyc::pub_star_outside_init` (advice) | (v0.7.0) `pub *` outside `__init__.ty` is a no-op | Move to `__init__.ty` or remove |
+| `tyc::typevar_import_rejected` | `from typing import TypeVar` | Use PEP 695 (`def f[T](...)`) |
+| `tyc::typing_alias_deprecated` | `from typing import List/Dict/...` | Use lowercase built-ins |
+| `tyc::contains_secret_literal` (warn) | `comptime let *KEY/TOKEN/PASSWORD/SECRET = env(...)` would inline a secret | Read at runtime via `os.environ[...]` |
+| `tyc::comptime_env_missing` (or via `tyc::comptime`) | Required env var unset at build time | Set the env var or remove from `[env] required` |
+| `tyc::cyclic_type_alias` | `type A = B; type B = A` | Anchor one alias to a concrete type |
+| `tyc::class_attr_shadows_slot` (warn) | `class` body with only annotated defaults reads like a constants namespace but emits slot descriptors | Use `ClassVar[T]`, or `pass` body for nullary variants |
+| `tyc::tuple_index_out_of_range` | Constant index out of range for fixed-arity tuple | Use an in-range index or change to homogeneous tuple |
 
-When in doubt about a diagnostic, `rg "TYC_CODE_NAME" tyc/crates` — every code is registered once in source.
+`tyc explain <code>` and `tyc explain --list` work offline.
 
 ---
 
-## Common pitfalls (the ones every newcomer hits)
+## 20. Common pitfalls (the ones every newcomer hits)
+
+See [PITFALLS.md](PITFALLS.md) for the extended ranked list. The top tier:
 
 1. **Forgetting `-> None`.** Sync functions returning nothing still need the annotation.
 2. **Writing `x = 1` at function scope.** Locals require `let` or `mut`. (Module top-level is fine — defaults to `let`.)
 3. **Calling `find_user(1)` and passing the result somewhere expecting `str`.** It's `str?`. Narrow first.
-4. **Putting `def display(self) -> str` inside `class`.** Move to `impl ClassName:` and drop `self`.
+4. **Putting `def display(self) -> str` inside `class`.** Move to `impl ClassName:` and use `self.NAME` for fields.
 5. **Writing `__init__`.** Don't. Use field defaults or a free function.
 6. **`from typing import TypeVar`.** Use PEP 695: `def f[T](xs: list[T]) -> T?:`.
 7. **`isinstance(x, MyInterface)`.** Rejected — use static narrowing or a sealed union.
 8. **`asyncio.create_task(...)` for fire-and-forget.** Use `go f(x)`; the runtime registry holds a strong ref.
 9. **`lazy from numpy import array`.** Rejected. Use `lazy import np = numpy` + `np.array(...)`.
 10. **`comptime let NOW: float = time.time()`.** Sandbox forbids `time.*`. Compute at runtime with `lazy let`.
-11. **Returning early from a `with`-chain without an `else err:`.** Fine — but only if the enclosing function returns a compatible `Result`.
-12. **`dict.get(k)` typed as `V`.** It's `V?`. Either narrow or use `d[k]`.
-13. **Empty list with no annotation.** `let xs: list = []` is `tyc::implicit_any`. Write `list[int]` or similar.
-14. **Putting blocking I/O inside `async def`.** As of v0.3.0 the checker catches the common cases (`time.sleep`, `requests.get`, `subprocess.run`, `input`, `urllib.request.urlopen`, …) via `tyc::blocking_in_async`. Wrap in `asyncio.to_thread(...)` or use an async-native client.
-15. **Expecting `bool` to be `int`.** The checker treats them as distinct. Cast explicitly with `int(b)` / `bool(n)`.
-16. **`f = open("x")` without `with`.** As of v0.3.0, `tyc::resource_not_managed` flags bare assignments of `open` / `socket.socket` / `sqlite3.connect` / `tempfile.*`. Wrap in `with` or accept the warning if you're managing cleanup elsewhere.
-17. **`x / 0` literal divisor.** Always raises `ZeroDivisionError`; v0.3.0 catches it with `tyc::div_by_zero_literal`.
-18. **`fetch_user(42)` against `def fetch_user(id: UserId)` where `newtype UserId = int`.** v0.3.0's `tyc::newtype_violation` requires explicit `UserId(42)` wrapping at the boundary. The reverse direction (`let raw: int = uid`) is allowed.
-19. **`case value:` shadowing an outer `let value`.** v0.3.0's `tyc::pattern_shadows_outer` flags this with the right hint — rename the capture, not the binding.
+11. **`dict.get(k)` typed as `V`.** It's `V?`. Either narrow or use `d[k]`.
+12. **Empty list with no annotation.** `let xs: list = []` is a missing-annotation error. Write `list[int]` or similar.
+13. **Blocking I/O inside `async def`.** `tyc::blocking_in_async` catches `time.sleep`, `requests.*`, `subprocess.run`, etc.
+14. **Expecting `bool` to NOT be `int`.** Since v0.4.0, `bool ⊆ int` — `let x: int = True` works. Reverse is still rejected.
+15. **`f = open("x")` without `with`.** `tyc::resource_not_managed` flags this.
+16. **`x / 0` literal divisor.** `tyc::div_by_zero_literal`.
+17. **`fetch_user(42)` against `def fetch_user(id: UserId)` where `newtype UserId = int`.** Wrap explicitly: `UserId(42)`.
+18. **`case value:` shadowing an outer `let value`.** `tyc::pattern_shadows_outer` — rename the capture.
+19. **Filename matching a stdlib module (`types.ty`, `json.ty`, `io.ty`).** `tyc::stdlib_module_shadow` — rename.
+20. **`pub *` in a non-`__init__.ty` module.** No-op + advice. Move to `__init__.ty`.
+21. **Two siblings exporting the same `pub` name.** `tyc::pub_name_collision` under `pub *` aggregation.
+22. **`let loaded: Cfg` then reading `loaded` on a path that didn't assign.** `tyc::use_of_uninitialised` (v0.7.0). Initialise inline or assign in every non-diverging arm.
+23. **`class P: x: int = 0; y: int` (defaulted before non-defaulted field).** `tyc::field_default_ordering` (v0.7.0). Reorder.
+24. **Nullary sealed-union variants written as `case Foo(_):`.** `_` is a positional capture for a class with no positional fields — never matches. Write `case Foo():` (two empty parens) and declare as `class Foo frozen: pass`.
+25. **`model X frozen:`.** Doesn't parse — `frozen` is on `class` only.
+26. **`let`-shadowing.** Rejected. Use `mut` or a fresh name; never re-bind with `let`.
+27. **`lazy let X: T:` colon-block form.** Doesn't parse. Use `lazy let X: T = expr`.
+28. **`lazy[list[T]]` return type.** Designed but not yet implemented — use `Iterator[T]`.
+29. **Multi-line `|>` pipes without wrapping parens.** Wrap the whole chain in parens.
 
 ---
 
-## Recipes — minimum-viable patterns for common tasks
+## 21. Recipes — minimum-viable patterns for common tasks
 
-### Add a runtime dependency
+See [COOKBOOK.md](COOKBOOK.md) for canonical patterns extracted from the 68 example exercises and 15 production-shaped apps. Quick pointers:
 
-```bash
-tyc add requests              # rewrites typhon.toml [dependencies], runs `uv sync`
-tyc add --dev pytest@8.2      # dev dep
-tyc add --no-sync foo         # batch edits; finish with `tyc sync`
-```
+| Task | Example |
+|---|---|
+| Hello world / argv | `examples/01-hello-world/` |
+| `let` vs `mut` / `T?` narrowing | `examples/02-variables-and-types/` |
+| Control flow / comprehensions | `examples/03-control-flow/` |
+| Collections / dict.get / tuple destructure | `examples/04-collections/` |
+| PEP 695 generics / `Callable` / closures | `examples/05-functions-and-generics/` |
+| `class` / `class frozen` / `model` / `impl` / `extend` | `examples/06-classes-and-models/` |
+| `Result` / `?` / `with`-chain | `examples/07-error-handling/` |
+| Sealed unions + exhaustive match | `examples/08-sealed-unions-match/` |
+| Structural interfaces | `examples/09-interfaces/` |
+| Pipes + guards | `examples/10-pipes-and-guards/` |
+| `comptime let` config from env | `examples/15-comptime-config/` |
+| `model` + JSON load via `model_validate` | `examples/17-file-io-json/` |
+| Subclassing stdlib (`logging.Formatter`) | `examples/20-logging/` |
+| Argparse + sealed-union command + match dispatch | `examples/21-cli-tool/` |
+| Async + Result | `examples/23-async-basics/` |
+| `gather:` + `@gatherable` + `go` | `examples/24-async-gather-and-go/` |
+| FastAPI server with `model` + DI | `examples/28-fastapi-server/` |
+| `lazy import np = numpy` | `examples/29-numpy-arrays/` |
+| `lazy import torch = torch` + `torch.Tensor` annotations | `examples/33-pytorch-tensors/` |
+| Anthropic client (Result-wrapped) | `examples/38-llm-anthropic/` |
+| Tool-use loop with `unsafe:` AST walker | `examples/40-llm-tool-use/` |
+| Generic agent framework with `Callable` fields | `examples/43-agent-framework/` |
+| Multi-file mini app (FastAPI + SQLite + Anthropic) | `examples/47-mini-app/` |
+| `newtype` IDs across boundaries | `examples/48-newtype-ids/` |
+| Generic sealed-union linked list | `examples/50-linked-list/` |
+| `@contextmanager` factories | `examples/58-context-managers/` |
+| JSON-RPC with newtype IDs + `unsafe:` boundary coercion | `examples/68-json-rpc-builder/` |
+| Pytest + match on Result | `examples/testing/` |
+| Production-shaped apps (15) | `examples/apps/01..15-*/` |
 
-### Migrate a typed-Python file
+---
 
-```bash
-tyc migrate --check src/app.py    # preview to stdout
-tyc migrate src/app.py            # write src/app.ty alongside
-tyc check src/                    # fix the diagnostics that remain
-```
+## 22. CI integration
 
-`tyc migrate` handles the mechanical rewrites; it cannot infer `let`/`mut` inside function bodies (those are added as `let` by default and need manual review for accumulators / counters).
-
-### Debug an emitted-Python traceback back to `.ty`
-
-```bash
-python build/main.py 2>err.log
-tyc trace err.log                 # remaps frames via build/*.py.map
-```
-
-### Run Astral's `ty` over your emitted Python
-
-```bash
-pip install ty                    # or: uv tool install ty
-tyc ty                            # one-shot
-tyc ty --watch                    # re-runs on .ty/.dty change
-tyc ty -- --strict                # forward flags to `ty check`
-```
-
-### Wire up VS Code
-
-`editors/vscode/` ships a reference extension that runs `tyc lsp` on stdio. See `editors/vscode/README.md`. Any LSP-aware editor can wire `tyc lsp` directly.
-
-### Set up CI
-
-`tyc check` is the CI-recommended command — runs everything up to the analyser without emitting `.py`. Failure cases:
+`tyc check` is the CI-recommended primary gate — runs everything up to the analyser without emitting `.py`. Failure cases:
 
 - Any `tyc::*` diagnostic at `"error"` severity.
 - Required env var missing (`comptime let` fails when `DATABASE_URL` etc. is unset, if listed in `[env] required`).
 - `tyc check --stubs` drift if you ship `.dty` stubs.
 
-Optional second-opinion gate: `tyc ty` after `tyc check`.
+Recommended pipeline:
+
+```yaml
+- run: tyc check src/                  # primary gate
+- run: tyc check --stubs               # if you ship .dty stubs
+- run: tyc ty                          # second-opinion (needs `pip install ty`)
+- run: tyc stubtest                    # runtime probe (needs mypy in the venv)
+```
+
+`tyc ty` runs Astral's `ty` checker against the emitted Python with `.ty` path attribution. `tyc stubtest` runs mypy's stubtest against the emitted `.pyi`.
 
 ---
 
-## Authoring Typhon code as Claude
+## 23. Authoring Typhon code as Claude
 
 When you edit `.ty` files in this repo or a downstream project:
 
@@ -986,41 +1302,102 @@ When you edit `.ty` files in this repo or a downstream project:
 3. **Reach for `let` before `mut`.** Only switch to `mut` when you actually need to rebind.
 4. **Prefer `Result[T, E]` over `try/except`** anywhere errors are expected (parsing, lookups, validation). Use `try` only at the boundary into untyped libraries.
 5. **Prefer sealed unions over inheritance** for closed sets of variants. They give you exhaustive `match`; subclassing doesn't.
-6. **Methods go in `impl` blocks**, never inside the `class`. No `self` parameter — the desugarer inserts it.
+6. **Methods go in `impl` blocks**, never inside the `class`. Explicit `self`; access fields via `self.NAME`.
 7. **`extend` for cross-module method addition**, `extend BUILTIN:` for static-only built-in extensions.
 8. **`gather:` only for genuinely independent awaits.** If one depends on another's value, leave them sequential.
 9. **`go` for fire-and-forget**, never `asyncio.create_task` directly.
 10. **`lazy import name = module`** for expensive optional deps; never `lazy from ... import ...`.
-11. **`comptime let` for build-time constants** (especially required env vars).
+11. **`comptime let` for build-time constants** (especially required env vars). Don't put secrets there — use `os.environ[...]` at runtime.
 12. **`@pure` only when the six conditions hold.** Mark `@memo` separately or use `@pure(memo=True)`. Never silently rely on `auto-memoise` for code others read.
-13. **`unsafe:` is a *lexical* region.** Re-assert types at the boundary, don't smuggle `Unsafe[T]` outward.
-14. **After significant edits, run `tyc fmt src/ && tyc check src/`** and read the diagnostics. The checker is the source of truth.
-15. **Read the emitted Python** for any non-trivial feature you haven't seen lower before (`tyc build` then look at `build/*.py`). The lowering is the spec.
+13. **`unsafe:` is a *lexical* region.** Re-assert types at the boundary, don't smuggle `Unsafe[T]` outward. Always end the block with a re-assertion or an unreachable raise.
+14. **For multi-file projects, lean on `pub` + `pub *`.** See [PACKAGING.md](PACKAGING.md).
+15. **After significant edits, run `tyc fmt src/ && tyc check src/`** and read the diagnostics. The checker is the source of truth.
+16. **Read the emitted Python** for any non-trivial feature you haven't seen lower before (`tyc build` then look at `build/*.py`). The lowering is the spec.
 
 When you edit the Rust compiler:
 
-1. **Each diagnostic is registered once** in `tyc-diagnostics`. Search for the code to find every site that emits it.
+1. **Each diagnostic is registered once** in `tyc-diagnostics`. Search for the code (`rg "TYC_CODE_NAME" tyc/crates`) to find every site that emits it.
 2. **Salsa queries** in `tyc-db` are the cache boundary; if a value should be incrementally tracked, it goes through a query.
 3. **The vendored Ruff fork** under `tyc/vendor/` is on a clean branch and tracks upstream loosely; do not edit it without a clear note in `tyc/vendor/README.md`.
 4. **Run `cargo test --workspace`** before pushing; the LSP tests use `tower-lsp-server`'s harness and the parser tests round-trip a corpus.
 
 ---
 
-## Further reading inside this repo
+## 24. Quick reference — Typhon-specific syntax
 
-- **`docs/long-term-plan.md`** — the canonical design doc (everything narrower is excerpted from here).
+| Feature | Syntax |
+|---|---|
+| Immutable local | `let x: int = 5` |
+| Mutable local | `mut x: int = 0` |
+| Declare-only let (v0.7.0) | `let loaded: Cfg` (assigned later on every non-diverging path) |
+| Deep-immutable module binding | `freeze let CFG = {...}` |
+| Public modifier | `pub def f(...) -> T: ...` |
+| Package wildcard re-export | `pub *` in `__init__.ty` |
+| Newtype | `newtype UserId = int` |
+| Nullable type | `T?` (sugar for `Optional[T]`) |
+| Generic fn (PEP 695) | `def f[T, U](x: T) -> U:` |
+| Generic class (PEP 695) | `class Box[T]:` |
+| HKT scaffold (v0.5.0) | `class Functor[F[_]]:` |
+| Frozen class | `class Point frozen:` |
+| Plain class (no decorator) | `plain class Bag:` |
+| Raw class (framework base) | `class! MyModel(nn.Module):` |
+| Methods | `impl Foo:` block separate from `class Foo:` |
+| Cross-module method add | `extend Foo:` |
+| Built-in extension | `extend str: def slug(self) -> str: ...` |
+| Boundary type | `model X:` (Pydantic-backed) |
+| Interface (structural) | `interface Drawable: def draw(self) -> None` |
+| Sealed union | `type Shape = Circle \| Rectangle` |
+| Distributed impl | `impl Shape: def area(self) -> float: ...` |
+| Pattern match | `match s: case Circle(radius): ...` |
+| Result success | `Ok(value)` |
+| Result failure | `Err(error)` |
+| Result propagate | `let x: int = parse()?` |
+| Multi-Result chain | `with a = r1?, b = r2?: ... else err: ...` |
+| Result combinators | `r.map(f) / r.map_err(g) / r.and_then(h) / r.or_else(k)` |
+| Guard / early return | `guard u = maybe else: return default` |
+| Pipe | `value \|> f() \|> g()` |
+| Compile-time const | `comptime let PORT: int = int(env("PORT", "8080"))` |
+| Compile-time fn | `comptime def feature(name: str) -> bool: ...` |
+| Compile-time type | `comptime let T: type = int` |
+| Deferred import | `lazy import np = numpy` |
+| Deferred module-level | `lazy let CFG: Config = load()` |
+| Concurrent await | `gather: a = f1(); b = f2()` |
+| Best-effort gather | `gather(strategy="best-effort"): ...` |
+| Fire-and-forget | `go background_task(x)` |
+| Capture handle | `go background_task(x) -> task` |
+| Gather marker | `@gatherable async def ...` |
+| Pure assertion | `@pure def f(...) -> T:` |
+| Memoised | `@memo def fib(n: int) -> int:` |
+| Type-check escape | `unsafe: ...` (followed by re-assertion or unreachable raise) |
+| Entry guard | `if __name__ == "__main__": main()` |
+
+---
+
+## 25. Further reading
+
+Inside this repo:
+
+- **`docs/long-term-plan.md`** — the canonical design doc.
 - **`docs/architecture.md`** — pipeline + crate-by-crate breakdown.
+- **`docs/vm.md`** — VM feature surface and design rationale.
 - **`docs/prior-art.md`** — TypeScript, rust-analyzer, ty, Pyrefly, oxc, Ruff influence.
 - **`docs/risks.md`** — what we expect to bite us.
-- **`docs/roadmap.md`** — phased delivery; Phase 0–3 complete, Phase 4+ in progress.
-- **`docs/findings.md`** — consolidated stress-test findings and open follow-ups.
+- **`docs/roadmap.md`** — phased delivery (Phase 6 — Python-annoyances surface complete).
+- **`docs/findings.md`** — consolidated stress-test findings.
 - **`docs/ty-integration.md`** — how `tyc ty` cooperates with Astral's checker.
-- **`docs/performance-baseline.md`** — measured numbers we don't want to regress.
+- **`docs/performance-baseline.md`** — measured numbers.
+- **`TYPE_SYSTEM_FRONTIER.md`** — open frontier work (full HKT unification, general inter-procedural field-init audit).
+- **`CHANGELOG.md`** — every release.
+- **`stress/`** — stress-test corpora (multi-round campaigns).
 - **`tyc/vendor/README.md`** — Ruff fork rationale.
 - **`editors/vscode/README.md`** — reference VS Code extension.
 
-For deeper reference material specific to this skill, see the sibling files:
+Sibling files in this skill:
 
-- **[REFERENCE.md](REFERENCE.md)** — every syntactic form, side by side with its emitted Python.
-- **[CLI.md](CLI.md)** — verbose subcommand cheat sheet with flags and exit codes.
-- **[PITFALLS.md](PITFALLS.md)** — extended pitfalls catalogue, ranked by frequency.
+- **[REFERENCE.md](REFERENCE.md)** — every syntactic form with emitted Python.
+- **[CLI.md](CLI.md)** — verbose subcommand reference.
+- **[PITFALLS.md](PITFALLS.md)** — extended pitfalls catalogue.
+- **[DIAGNOSTICS.md](DIAGNOSTICS.md)** — exhaustive `tyc::` code catalog.
+- **[COOKBOOK.md](COOKBOOK.md)** — canonical patterns from `examples/`.
+- **[RUNTIME.md](RUNTIME.md)** — the generated `typhon_runtime` package and the in-process VM.
+- **[PACKAGING.md](PACKAGING.md)** — multi-file projects, `__init__.ty`, `pub *` aggregation.
