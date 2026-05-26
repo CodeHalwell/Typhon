@@ -10,7 +10,10 @@ use std::path::PathBuf;
 use clap::Args;
 use miette::{miette, Result};
 
-use tyc_analyse::{analyse_purity, evaluate_comptime_with_functions, purity_diagnostics};
+use tyc_analyse::{
+    analyse_empty_collection_bindings, analyse_purity, analyse_secret_literal_bindings,
+    analyse_typing_alias_annotations, evaluate_comptime_with_functions, purity_diagnostics,
+};
 use tyc_db::{check_file_with_imports, extract_shapes_for_path, TycDatabase};
 use tyc_diagnostics::{Diagnostics, TycError};
 use tyc_emit::{compare_modules, StubTestKind};
@@ -865,6 +868,38 @@ fn run_secondary_passes(
     let purity_findings = analyse_purity(&module, false);
     let purity_diags = purity_diagnostics(&purity_findings, path, source);
     diags.extend(purity_diags);
+
+    // Empty-literal binding lint (`tyc::empty_collection_no_annotation`):
+    // a `let xs = []` with no annotation defaults to `list[Unknown]` and
+    // silently swallows later element-type mismatches. The pass walks the
+    // already-preprocessed module, so spans line up with `prep.python_source`.
+    diags.extend(analyse_empty_collection_bindings(
+        &module,
+        path,
+        &prep.python_source,
+    ));
+
+    // Typing-alias-in-annotation lint (`tyc::typing_alias_in_annotation`):
+    // the `typing.List` / `typing.Dict` / `Optional` / `Union` aliases are
+    // rejected on import but were silently accepted inside annotations as
+    // forward-reference names. Walk every annotation and surface the same
+    // migration advice.
+    diags.extend(analyse_typing_alias_annotations(
+        &module,
+        path,
+        &prep.python_source,
+    ));
+
+    // Secret-literal lint (`tyc::contains_secret_literal`, inline form):
+    // a `let API_TOKEN = "abc"` hard-codes a credential into the source.
+    // The existing comptime path inside `tyc build` only caught
+    // `comptime let X = env(...)`; this pass catches the plain-`let`
+    // form so the check fires in `tyc check` too.
+    diags.extend(analyse_secret_literal_bindings(
+        &module,
+        path,
+        &prep.python_source,
+    ));
 
     if let Some(ctx) = vetting_ctx {
         // AST node ranges are offsets into the *preprocessed* Python

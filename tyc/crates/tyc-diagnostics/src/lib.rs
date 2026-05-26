@@ -1327,6 +1327,71 @@ pub enum TycError {
         help("Replace `comptime let {name} = env(...)` with a runtime lookup such as `os.environ[\"{env_key}\"]`.")
     )]
     ContainsSecretLiteral { name: String, env_key: String },
+
+    /// A plain `let` / module-level binding whose name matches the
+    /// secret-suffix heuristic (`*KEY`, `*TOKEN`, `*PASSWORD`, `*SECRET`,
+    /// `*PWD`, `*API_KEY`) is initialised from a raw string literal
+    /// instead of an environment lookup. Committing such a literal hard-
+    /// codes a credential into the source tree.
+    #[error("binding `{name}` looks like a credential but is initialised from a string literal")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::contains_secret_literal),
+        url("https://typhon.dev/lang/diagnostics/contains_secret_literal"),
+        help("Read the value at runtime via `os.environ[\"{name}\"]` or `os.getenv(\"{name}\")` instead of hard-coding a literal.")
+    )]
+    SecretLiteralInline {
+        name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("hard-coded secret-shaped value")]
+        span: SourceSpan,
+    },
+
+    /// A `let` or `mut` binding whose RHS is an empty collection literal
+    /// (`[]`, `{}`, `set()`) has no type annotation, so its element type
+    /// defaults to `Unknown` (effectively `Any`) and silences any later
+    /// element-type mismatch.
+    #[error("empty {literal} without a type annotation defaults to `Unknown` and disables element-type checking")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::empty_collection_no_annotation),
+        url("https://typhon.dev/lang/diagnostics/empty_collection_no_annotation"),
+        help("Add an explicit annotation, e.g. `let {name}: list[int] = []`, so the element type is checked.")
+    )]
+    EmptyCollectionNoAnnotation {
+        name: String,
+        /// Human-readable name of the literal: "list literal `[]`",
+        /// "dict literal `{}`", or "set literal `set()`". Used in the
+        /// error message so users immediately recognise the offending form.
+        literal: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("annotate this binding to fix")]
+        span: SourceSpan,
+    },
+
+    /// A type annotation references a deprecated `typing.<Name>` alias by
+    /// name (`List[int]`, `Dict[str, int]`, `Optional[int]`,
+    /// `Union[int, str]`, …) even though the import is rejected. The
+    /// reference is silently accepted as a forward-reference name; this
+    /// warning surfaces the inconsistency so users migrate to the
+    /// built-in lowercase forms (`list`, `dict`, `T?`, `A | B`).
+    #[error("`{name}` in an annotation is the deprecated `typing.{name}` alias")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::typing_alias_in_annotation),
+        url("https://typhon.dev/lang/diagnostics/typing_alias_in_annotation"),
+        help("Use `{suggestion}` instead — the deprecated `typing.{name}` alias is rejected on import and should not be used in annotations either.")
+    )]
+    TypingAliasInAnnotation {
+        name: String,
+        suggestion: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("prefer `{suggestion}` here")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -2450,6 +2515,59 @@ impl TycError {
         Self::ContainsSecretLiteral {
             name: name.into(),
             env_key: env_key.into(),
+        }
+    }
+
+    /// Construct a [`TycError::SecretLiteralInline`] warning for a plain
+    /// `let` / `mut` / module-level binding whose name matches the secret
+    /// suffix heuristic AND whose RHS is a raw string literal.
+    pub fn secret_literal_inline(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::SecretLiteralInline {
+            name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::EmptyCollectionNoAnnotation`] warning for
+    /// an empty collection literal bound without an explicit annotation.
+    pub fn empty_collection_no_annotation(
+        name: impl Into<String>,
+        literal: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::EmptyCollectionNoAnnotation {
+            name: name.into(),
+            literal: literal.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::TypingAliasInAnnotation`] warning for a
+    /// deprecated `typing.<Name>` alias referenced from an annotation.
+    pub fn typing_alias_in_annotation(
+        name: impl Into<String>,
+        suggestion: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::TypingAliasInAnnotation {
+            name: name.into(),
+            suggestion: suggestion.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
         }
     }
 }
