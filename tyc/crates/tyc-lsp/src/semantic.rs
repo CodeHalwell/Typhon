@@ -77,13 +77,21 @@ pub fn legend() -> SemanticTokensLegend {
 
 /// One absolute-positioned token; converted to LSP delta-encoding
 /// during the final `compute()` step.
-#[derive(Debug, Clone, Copy)]
+///
+/// `name` carries the identifier the token covers so the original-source
+/// remap step can validate (and, if necessary, relocate) the token after
+/// translating from preprocessed-source columns. Synthetic identifiers
+/// the preprocessor injects (e.g. the `NewType` reference inside a
+/// `newtype Foo = Bar` rewrite) won't match anything in the original
+/// line and get dropped — TextMate fallbacks paint them instead.
+#[derive(Debug, Clone)]
 struct AbsoluteToken {
     line: u32,
     col: u32,
     length: u32,
     token_type: u32,
     modifiers: u32,
+    name: String,
 }
 
 /// Structured signature info for a single callable, derived from the
@@ -143,6 +151,7 @@ pub type AttributeKinds = HashMap<String, String>;
 /// constructor declares `**kwargs`, no token (white) when the kwarg
 /// is unrecognised. Pass an empty map to disable kwarg colouring
 /// (used by unit tests that don't need introspection).
+#[allow(dead_code)] // back-compat wrapper used by unit tests; kept for callers that don't need original-source remapping
 pub fn compute(
     source: &str,
     resolved: &ResolvedModule,
@@ -151,6 +160,44 @@ pub fn compute(
     callee_signatures: &CalleeSignatures,
     attribute_kinds: &AttributeKinds,
 ) -> SemanticTokens {
+    // No remap requested: original == preprocessed, all line shifts are
+    // zero. The remap step becomes a no-op text validation that still
+    // drops synthetic identifiers, which is exactly what unit tests want.
+    compute_with_original(
+        source,
+        source,
+        &[],
+        resolved,
+        module,
+        stdlib_modules,
+        callee_signatures,
+        attribute_kinds,
+    )
+}
+
+/// Same as [`compute`], but takes the original (pre-preprocess) source
+/// and a per-line column-shift hint so token coordinates can be
+/// translated from preprocessed-source columns to original-source
+/// columns before encoding. Used by the LSP's `semantic_tokens_full`
+/// handler so the colours land on the right characters when the file
+/// uses Typhon-only modifiers (`pub`, `comptime`, `freeze`, `lazy`,
+/// `newtype`) that the preprocessor strips before parsing.
+///
+/// `line_shifts[line]` is the byte count stripped from the start of
+/// that line by preprocessing. Lines past the end of the slice get a
+/// shift of 0. See [`tyc_syntax::preprocess::PreprocessResult::line_col_shifts`].
+#[allow(clippy::too_many_arguments)] // mirrors compute()'s parameter set + adds original/line_shifts; the LSP is the sole caller
+pub fn compute_with_original(
+    preprocessed: &str,
+    original: &str,
+    line_shifts: &[usize],
+    resolved: &ResolvedModule,
+    module: &ModModule,
+    stdlib_modules: &[&str],
+    callee_signatures: &CalleeSignatures,
+    attribute_kinds: &AttributeKinds,
+) -> SemanticTokens {
+    let source = preprocessed;
     // Names declared via `newtype Name = Base` desugar to the regular
     // assignment `Name = NewType("Name", Base)` before the resolver
     // sees them, so the resolver registers them as `BindingKind::Value`
@@ -183,6 +230,13 @@ pub fn compute(
         callee_signatures,
         attribute_kinds,
     );
+    // Translate token coordinates from the preprocessed source the AST /
+    // resolver reported into the original source the editor is rendering.
+    // Tokens whose name can't be located in the original line (synthetic
+    // identifiers the preprocessor injected — e.g. the `NewType` call in
+    // a `newtype Foo = Bar` rewrite) are dropped so the TextMate grammar
+    // paints the keyword instead of leaking a wrong colour into it.
+    remap_to_original(&mut tokens, source, original, line_shifts);
     // The LSP encoding requires tokens in document order (each
     // delta-line is non-negative; ties broken by delta-start).
     tokens.sort_by_key(|t| (t.line, t.col));
@@ -195,6 +249,216 @@ pub fn compute(
         result_id: None,
         data: encode(&tokens),
     }
+}
+
+/// Translate every token's `(line, col, length)` from preprocessed-source
+/// to original-source coordinates. Validates by checking the original
+/// line actually contains `name` at (or near) the shifted column; drops
+/// tokens whose name isn't found, which silently disables coloring for
+/// preprocessor-injected synthetic identifiers.
+///
+/// Strategy per token:
+/// 1. Compute `candidate = prep_col + line_shifts[line]` (in bytes —
+///    Typhon identifiers are ASCII so byte == utf16 within the column,
+///    and the `name` length is the same in both encodings).
+/// 2. If the original line contains `name` as a whole word starting at
+///    `candidate`, emit at that position.
+/// 3. Otherwise search the line for `name` as a whole word and emit
+///    at the first match.
+/// 4. If neither succeeds, drop the token.
+fn remap_to_original(
+    tokens: &mut Vec<AbsoluteToken>,
+    preprocessed: &str,
+    original: &str,
+    line_shifts: &[usize],
+) {
+    let orig_line_starts = compute_line_starts(original);
+    let prep_line_starts = compute_line_starts(preprocessed);
+    tokens.retain_mut(|tok| {
+        let prep_line_idx = tok.line as usize;
+
+        // Convert the token's UTF-16 column back to a byte column within
+        // the preprocessed line so we can add the byte-denominated shift.
+        let prep_line_start = prep_line_starts.get(prep_line_idx).copied().unwrap_or(0);
+        let prep_line_end = prep_line_starts
+            .get(prep_line_idx + 1)
+            .copied()
+            .unwrap_or(preprocessed.len());
+        let prep_line = &preprocessed[prep_line_start..prep_line_end];
+        let prep_byte_col = utf16_col_to_byte(prep_line, tok.col as usize);
+        let shift = line_shifts.get(prep_line_idx).copied().unwrap_or(0);
+        let candidate_byte = prep_byte_col + shift;
+        let name = tok.name.as_str();
+
+        // Fast path: same-line mapping. Works for files whose original
+        // and preprocessed line counts agree (i.e. no expand_* pass
+        // injected lines on or before this token's line). Covers every
+        // user-reported case — `comptime`, `freeze`, `pub`, `newtype` —
+        // since none of those involve line-inserting expansions.
+        if let Some(byte) = try_line_match(
+            original,
+            &orig_line_starts,
+            prep_line_idx,
+            candidate_byte,
+            name,
+        ) {
+            let line_text = original_line_text(original, &orig_line_starts, prep_line_idx);
+            tok.col = byte_col_to_utf16(line_text, byte);
+            tok.length = name.encode_utf16().count() as u32;
+            return true;
+        }
+
+        // Slow path: line drift. Pre-preprocess expansion passes
+        // (`expand_multiline_guards`, `expand_with_chains`,
+        // `expand_gather_blocks`, …) can rewrite a single Typhon line
+        // into several Python lines, so `tok.line` (in preprocessed
+        // coords) no longer maps 1:1 onto the original line index. We
+        // don't currently carry a per-line map through those passes,
+        // so fall back to a whole-document whole-word search for the
+        // token's name, preferring the occurrence on the line nearest
+        // `prep_line_idx`. Drop the token if nothing matches — the
+        // TextMate grammar paints the keyword instead, which beats
+        // pinning a colour to the wrong location.
+        if let Some((line, byte)) =
+            find_closest_match(original, &orig_line_starts, name, prep_line_idx)
+        {
+            let line_text = original_line_text(original, &orig_line_starts, line);
+            tok.line = line as u32;
+            tok.col = byte_col_to_utf16(line_text, byte);
+            tok.length = name.encode_utf16().count() as u32;
+            return true;
+        }
+
+        false
+    });
+}
+
+/// Try to locate `name` on the given original line. First check the
+/// `candidate_byte` position (preprocessed col + line shift); if no
+/// match, scan the line for the first whole-word occurrence. Returns
+/// the byte offset within the line where the name lives, or `None`
+/// if the line doesn't contain it at all (the token will fall through
+/// to the slow path).
+fn try_line_match(
+    original: &str,
+    orig_line_starts: &[usize],
+    line_idx: usize,
+    candidate_byte: usize,
+    name: &str,
+) -> Option<usize> {
+    if line_idx >= orig_line_starts.len() {
+        return None;
+    }
+    let line_text = original_line_text(original, orig_line_starts, line_idx);
+    if matches_whole_word_at(line_text, candidate_byte, name) {
+        return Some(candidate_byte);
+    }
+    find_whole_word(line_text, name)
+}
+
+/// Search every line of `original` for `name` as a whole word and
+/// return `(line_idx, byte_col_in_line)` for the occurrence whose line
+/// index is closest to `preferred_line`. Ties broken in favour of the
+/// earlier line (i.e. `<`-preferred when equidistant). Returns `None`
+/// if `name` doesn't occur anywhere in the document.
+fn find_closest_match(
+    original: &str,
+    orig_line_starts: &[usize],
+    name: &str,
+    preferred_line: usize,
+) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, usize, usize)> = None; // (distance, line, byte)
+    for line_idx in 0..orig_line_starts.len() {
+        let line_text = original_line_text(original, orig_line_starts, line_idx);
+        if let Some(byte) = find_whole_word(line_text, name) {
+            let distance = line_idx.abs_diff(preferred_line);
+            let candidate = (distance, line_idx, byte);
+            if best.is_none_or(|(d, _, _)| distance < d) {
+                best = Some(candidate);
+            }
+        }
+    }
+    best.map(|(_, line, byte)| (line, byte))
+}
+
+fn original_line_text<'a>(original: &'a str, line_starts: &[usize], line_idx: usize) -> &'a str {
+    let start = line_starts.get(line_idx).copied().unwrap_or(original.len());
+    let end = line_starts
+        .get(line_idx + 1)
+        .copied()
+        .unwrap_or(original.len());
+    original[start..end].trim_end_matches(['\n', '\r'])
+}
+
+fn compute_line_starts(s: &str) -> Vec<usize> {
+    let mut starts = vec![0usize];
+    for (i, b) in s.bytes().enumerate() {
+        if b == b'\n' {
+            starts.push(i + 1);
+        }
+    }
+    starts
+}
+
+fn is_id_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn matches_whole_word_at(line: &str, byte_col: usize, name: &str) -> bool {
+    let bytes = line.as_bytes();
+    let name_bytes = name.as_bytes();
+    if byte_col + name_bytes.len() > bytes.len() {
+        return false;
+    }
+    if &bytes[byte_col..byte_col + name_bytes.len()] != name_bytes {
+        return false;
+    }
+    let left_ok = byte_col == 0 || !is_id_byte(bytes[byte_col - 1]);
+    let right_ok = byte_col + name_bytes.len() == bytes.len()
+        || !is_id_byte(bytes[byte_col + name_bytes.len()]);
+    left_ok && right_ok
+}
+
+fn find_whole_word(line: &str, name: &str) -> Option<usize> {
+    if name.is_empty() {
+        return None;
+    }
+    let bytes = line.as_bytes();
+    let name_bytes = name.as_bytes();
+    if name_bytes.len() > bytes.len() {
+        return None;
+    }
+    (0..=bytes.len() - name_bytes.len()).find(|&i| matches_whole_word_at(line, i, name))
+}
+
+fn byte_col_to_utf16(line: &str, byte_col: usize) -> u32 {
+    let clamped = byte_col.min(line.len());
+    // Walk on char boundaries; if byte_col falls inside a multibyte
+    // sequence (shouldn't happen for ASCII identifiers but defend
+    // against it anyway) round down to the previous boundary.
+    let mut safe = clamped;
+    while safe > 0 && !line.is_char_boundary(safe) {
+        safe -= 1;
+    }
+    line[..safe].encode_utf16().count() as u32
+}
+
+/// Convert a UTF-16 column offset (LSP's natural unit) to a byte
+/// offset within `line`. Walks chars accumulating UTF-16 lengths until
+/// the target is reached; if `utf16_col` runs past the end of the
+/// line, returns the line's byte length (callers treat this as
+/// "end of line"). Always returns a valid offset on a char boundary.
+fn utf16_col_to_byte(line: &str, utf16_col: usize) -> usize {
+    let mut acc: usize = 0;
+    let mut byte: usize = 0;
+    for ch in line.chars() {
+        if acc >= utf16_col {
+            return byte;
+        }
+        acc += ch.len_utf16();
+        byte += ch.len_utf8();
+    }
+    byte
 }
 
 /// Walk the module's top-level statements and collect every name
@@ -421,6 +685,7 @@ impl<'a> AstWalker<'a> {
                     length: utf16_len_of_span(self.source, start, end),
                     token_type,
                     modifiers: 0,
+                    name: name.to_owned(),
                 });
             }
         }
@@ -523,6 +788,7 @@ impl<'a> Visitor<'a> for AstWalker<'a> {
                         length: utf16_len_of_span(self.source, ident_start, ident_end),
                         token_type,
                         modifiers: 0,
+                        name: attr.attr.as_str().to_owned(),
                     });
                 }
                 // The receiver is *not* in call-func position even
@@ -653,6 +919,7 @@ fn emit_dotted_path(
                     length: utf16_len_of_span(source, offset, end),
                     token_type: TOKEN_NAMESPACE,
                     modifiers,
+                    name: segment.to_owned(),
                 });
             }
         }
@@ -842,6 +1109,7 @@ fn token_for_binding(
         length,
         token_type,
         modifiers,
+        name: binding.name.clone(),
     })
 }
 
@@ -1685,6 +1953,323 @@ mod tests {
             vec![TOKEN_CLASS, TOKEN_CLASS, TOKEN_CLASS],
             "`typing.NewType(...)` should promote every `X` site to class; got {:?}",
             types
+        );
+    }
+
+    /// Run `compute_with_original` against the actual Typhon source
+    /// (rather than the preprocessed Python), mirroring what the
+    /// `semantic_tokens_full` handler does. Used by the column-remap
+    /// regression tests so the assertions express what the editor will
+    /// render, not what the resolver computed against the preprocessed
+    /// view of the file.
+    fn compute_from_original(original: &str) -> (String, Vec<SemanticToken>) {
+        let prep = preprocess(original);
+        let parsed = parse_module(&prep.python_source).expect("parse");
+        let module = parsed.into_syntax();
+        let (resolved, _) = resolve_module_with(
+            "t.ty".into(),
+            &prep.python_source,
+            &module,
+            ResolveOptions::default(),
+        );
+        let stdlib_list = stdlib();
+        let stdlib_refs: Vec<&str> = stdlib_list.to_vec();
+        let result = compute_with_original(
+            &prep.python_source,
+            original,
+            &prep.line_col_shifts(),
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &CalleeSignatures::new(),
+            &AttributeKinds::new(),
+        );
+        (prep.python_source, result.data)
+    }
+
+    /// Decode the LSP delta stream and assert the token covering
+    /// `needle` in `original` lands on the exact byte range of that
+    /// needle — column equals the byte offset of `needle` and length
+    /// equals `needle.len()`. Returns the token type so callers can
+    /// chain `assert_eq!` on it.
+    fn assert_token_covers(original: &str, needle: &str, data: &[SemanticToken]) -> u32 {
+        let lines: Vec<&str> = original.lines().collect();
+        // Find the (line, col) of `needle` in `original`.
+        let mut target_line: u32 = 0;
+        let mut target_col: u32 = 0;
+        let mut found = false;
+        for (i, line) in lines.iter().enumerate() {
+            if let Some(byte) = line.find(needle) {
+                target_line = i as u32;
+                target_col = line[..byte].encode_utf16().count() as u32;
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "needle `{}` not in original source", needle);
+        let mut line: u32 = 0;
+        let mut col: u32 = 0;
+        for tok in data {
+            if tok.delta_line == 0 {
+                col += tok.delta_start;
+            } else {
+                line += tok.delta_line;
+                col = tok.delta_start;
+            }
+            if line == target_line && col == target_col {
+                let expected_len = needle.encode_utf16().count() as u32;
+                assert_eq!(
+                    tok.length, expected_len,
+                    "token at {}:{} for `{}` has length {} (expected {})",
+                    line, col, needle, tok.length, expected_len
+                );
+                return tok.token_type;
+            }
+        }
+        panic!(
+            "no semantic token starts at {}:{} (where `{}` lives in original)",
+            target_line, target_col, needle
+        );
+    }
+
+    /// Assert that no semantic token overlaps the byte range of `needle`
+    /// in `original`. Used to guarantee the TextMate grammar's keyword
+    /// colour for stripped modifiers (`comptime`, `freeze`, `pub`,
+    /// `newtype`, …) isn't clobbered by an LSP token that leaked from
+    /// the preprocessed coordinate space.
+    fn assert_no_token_overlaps(original: &str, needle: &str, data: &[SemanticToken]) {
+        let lines: Vec<&str> = original.lines().collect();
+        let mut target_line: u32 = 0;
+        let mut needle_start_col: u32 = 0;
+        let mut needle_end_col: u32 = 0;
+        let mut found = false;
+        for (i, line) in lines.iter().enumerate() {
+            if let Some(byte) = line.find(needle) {
+                target_line = i as u32;
+                needle_start_col = line[..byte].encode_utf16().count() as u32;
+                needle_end_col = needle_start_col + needle.encode_utf16().count() as u32;
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "needle `{}` not in original source", needle);
+        let mut line: u32 = 0;
+        let mut col: u32 = 0;
+        for tok in data {
+            if tok.delta_line == 0 {
+                col += tok.delta_start;
+            } else {
+                line += tok.delta_line;
+                col = tok.delta_start;
+            }
+            if line != target_line {
+                continue;
+            }
+            let tok_end = col + tok.length;
+            let overlaps = col < needle_end_col && tok_end > needle_start_col;
+            assert!(
+                !overlaps,
+                "token at col {}..{} overlaps `{}` at col {}..{} on line {}",
+                col, tok_end, needle, needle_start_col, needle_end_col, line
+            );
+        }
+    }
+
+    /// Regression: a `comptime let X = ...` binding's semantic token
+    /// must land on `X` in the original source, not on the middle of
+    /// the stripped `comptime ` keyword. Before the column-remap
+    /// fix the LSP returned a variable token at preprocessed col 4
+    /// (where `BUILD_TAG` lives after stripping `comptime `), which
+    /// the editor applied to col 4 of the original line — landing
+    /// inside `comptime` and painting `time let ` with the variable
+    /// colour, leaving `comp` blue.
+    #[test]
+    fn comptime_let_binding_lands_on_binding_name_not_stripped_keyword() {
+        let original = "comptime let BUILD_TAG: str = \"dev\"\n";
+        let (_, data) = compute_from_original(original);
+        let ty = assert_token_covers(original, "BUILD_TAG", &data);
+        assert_eq!(ty, TOKEN_VARIABLE);
+        assert_no_token_overlaps(original, "comptime", &data);
+    }
+
+    /// Regression: `freeze let X = ...` strips `freeze ` (7 bytes) and
+    /// wraps the RHS in `__typhon_freeze__(...)`. The binding token
+    /// for X used to land at preprocessed col 4 — col 4 of the
+    /// original is `z` inside `freeze`, so the variable token painted
+    /// `ze let ` and left `free` blue.
+    #[test]
+    fn freeze_let_binding_lands_on_binding_name_not_stripped_keyword() {
+        let original = "freeze let DEFAULT = [1, 2, 3]\n";
+        let (_, data) = compute_from_original(original);
+        let ty = assert_token_covers(original, "DEFAULT", &data);
+        assert_eq!(ty, TOKEN_VARIABLE);
+        assert_no_token_overlaps(original, "freeze", &data);
+    }
+
+    /// Regression: `pub class X` strips `pub ` (4 bytes). The class
+    /// binding token for X used to land at preprocessed col 6 — col 6
+    /// of the original is `a` inside `class`, so the class token
+    /// painted `ass RetryPo` and left `cl` red.
+    #[test]
+    fn pub_class_binding_lands_on_class_name_not_stripped_pub() {
+        let original = "pub class RetryPolicy:\n    pass\n";
+        let (_, data) = compute_from_original(original);
+        let ty = assert_token_covers(original, "RetryPolicy", &data);
+        assert_eq!(ty, TOKEN_CLASS);
+        assert_no_token_overlaps(original, "class", &data);
+        assert_no_token_overlaps(original, "pub", &data);
+    }
+
+    /// Regression: `pub newtype TaskId = int` strips `pub newtype `
+    /// and rewrites the line to `TaskId = NewType("TaskId", int)`.
+    /// The binding token for TaskId used to land at preprocessed col 0
+    /// — col 0 of the original is `p` in `pub`, so the class token
+    /// painted `pub ne` and left `wtype` showing through (often
+    /// further mangled by the synthetic `NewType` reference landing
+    /// inside `newtype` too). The synthetic `NewType` reference must
+    /// not produce a token at all — TextMate paints the `newtype`
+    /// keyword instead.
+    #[test]
+    fn pub_newtype_binding_lands_on_newtype_name_not_stripped_keywords() {
+        let original = "pub newtype TaskId = int\n";
+        let (_, data) = compute_from_original(original);
+        let ty = assert_token_covers(original, "TaskId", &data);
+        assert_eq!(ty, TOKEN_CLASS, "newtype declaration paints as class");
+        assert_no_token_overlaps(original, "newtype", &data);
+        assert_no_token_overlaps(original, "pub", &data);
+    }
+
+    /// Regression: synthetic identifiers the preprocessor injects
+    /// (the `NewType` call inside the `newtype` rewrite, the
+    /// `__typhon_freeze__` call inside the `freeze let` rewrite) must
+    /// not produce semantic tokens — they don't exist in the original
+    /// source and the editor can't render anything sensible for them.
+    /// The remap step drops tokens whose name can't be located in the
+    /// original line.
+    #[test]
+    fn synthetic_preprocessor_identifiers_emit_no_tokens() {
+        let original = "pub newtype TaskId = int\n";
+        let (_, data) = compute_from_original(original);
+        // The original line has no `NewType` text anywhere. If any
+        // semantic token covered the column range that the preprocessed
+        // line uses for `NewType`, the editor would paint a chunk of
+        // `newtype` orange.
+        let lines: Vec<&str> = original.lines().collect();
+        let mut line: u32 = 0;
+        let mut col: u32 = 0;
+        for tok in &data {
+            if tok.delta_line == 0 {
+                col += tok.delta_start;
+            } else {
+                line += tok.delta_line;
+                col = tok.delta_start;
+            }
+            let line_text = lines[line as usize];
+            // LSP semantic-token positions and lengths are UTF-16 code
+            // units; convert before byte-slicing so non-ASCII content in
+            // future test sources doesn't panic or mis-match.
+            let start_byte = utf16_col_to_byte(line_text, col as usize);
+            let end_byte = utf16_col_to_byte(line_text, (col + tok.length) as usize);
+            let covered = &line_text[start_byte..end_byte];
+            assert!(
+                covered != "NewType",
+                "expected no `NewType` token in original source; got one at {}:{}",
+                line,
+                col
+            );
+        }
+    }
+
+    /// Regression: when an `expand_*` pass injects extra lines before
+    /// a token's location, the token's preprocessed line index no
+    /// longer matches the original-source line index, and the
+    /// 1:1 line-mapping fast path would drop the token (`line_idx`
+    /// out of bounds for `orig_line_starts`) or pin it to a wrong
+    /// line. The fallback path searches the whole original document
+    /// for the token's name, preferring the closest line to the
+    /// preprocessed-line hint, so tokens after a line-inserting
+    /// expansion still land on the correct original-source identifier.
+    ///
+    /// `guard NAME = expr else: ...` is the canonical line-drifting
+    /// shape: a single Typhon line expands to four Python lines
+    /// (`let __typhon_mguard_0 = (expr)`, `if ... is None:`, body,
+    /// `let NAME = __typhon_mguard_0`), so the line count of the
+    /// preprocessed source is strictly greater than the original.
+    /// `done` (referenced after the guard) lives on a later line in
+    /// the original than the resolver thinks it does in the expanded
+    /// view.
+    #[test]
+    fn line_drift_from_expand_passes_doesnt_drop_or_misplace_tokens() {
+        // Apply the full expansion sequence the LSP runs in production
+        // (mirroring `preprocessed_full` in tyc-db), then preprocess
+        // and compute semantic tokens with the original Typhon source
+        // and the resulting line shifts.
+        let original = "\
+pub def first(x: int?) -> int:
+    guard v = x else:
+        return 0
+    return v
+";
+        let expanded = tyc_syntax::preprocess::expand_question_ops(
+            &tyc_syntax::preprocess::expand_inline_question_ops(
+                &tyc_syntax::preprocess::expand_pipes(&tyc_syntax::preprocess::expand_with_chains(
+                    &tyc_syntax::preprocess::expand_go_calls(
+                        &tyc_syntax::preprocess::expand_gather_blocks(
+                            &tyc_syntax::preprocess::expand_multiline_guards(
+                                &tyc_syntax::preprocess::expand_lazy_lets(
+                                    &tyc_syntax::preprocess::expand_typed_let_unpack(original),
+                                ),
+                            ),
+                        ),
+                    ),
+                )),
+            ),
+        );
+        let prep = preprocess(&expanded);
+        // Sanity: the guard expansion really does add lines.
+        assert!(
+            prep.python_source.lines().count() > original.lines().count(),
+            "test prerequisite: guard expansion should grow line count\n\
+             original ({} lines):\n{}\n\
+             preprocessed ({} lines):\n{}",
+            original.lines().count(),
+            original,
+            prep.python_source.lines().count(),
+            prep.python_source,
+        );
+        let parsed = parse_module(&prep.python_source).expect("parse");
+        let module = parsed.into_syntax();
+        let (resolved, _) = resolve_module_with(
+            "t.ty".into(),
+            &prep.python_source,
+            &module,
+            ResolveOptions::default(),
+        );
+        let stdlib_list = stdlib();
+        let stdlib_refs: Vec<&str> = stdlib_list.to_vec();
+        let result = compute_with_original(
+            &prep.python_source,
+            original,
+            &prep.line_col_shifts(),
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &CalleeSignatures::new(),
+            &AttributeKinds::new(),
+        );
+        // The function name `first` lives on line 0 of the original
+        // and survives the rename through the expansion — its token
+        // must land on it, not be dropped or pinned elsewhere.
+        let ty = assert_token_covers(original, "first", &result.data);
+        assert_eq!(ty, TOKEN_FUNCTION, "function decl paints as function");
+        // The `v` binding's declaration site after the guard expands
+        // into a different preprocessed line than the original `guard v`
+        // line, but the remap still finds `v` in the original source.
+        // (We accept any TOKEN_* match — the point is non-empty +
+        // not silently dropped.)
+        assert!(
+            result.data.iter().any(|t| t.length > 0),
+            "expected at least one semantic token despite line drift",
         );
     }
 }

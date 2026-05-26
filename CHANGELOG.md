@@ -4,6 +4,36 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.7.1 — 2026-05-26
+
+Point release: fixes a long-standing semantic-tokens misalignment in
+the VS Code language server. Strictly a bugfix; no language, runtime,
+or stdlib changes.
+
+### Fixed — LSP
+
+- **Semantic-token positions now line up with the original `.ty`
+  source instead of the preprocessed Python view.** The LSP computed
+  token coordinates against the post-preprocess source (with `pub`,
+  `comptime`, `freeze`, `lazy`, `newtype` line-prefix modifiers
+  stripped) but the editor applied those coordinates to the original
+  file, so every identifier landed a few characters early — inside
+  the stripped keyword instead of on the binding name. Visible
+  symptom: `comptime let X` painted `comp` blue + `time let `
+  variable-coloured, `pub class Foo` painted `cl` red + `ass Foo`
+  class-coloured, `pub newtype TaskId = int` split `newtype` into a
+  `TaskId`-coloured prefix and a synthetic-`NewType`-coloured suffix.
+  The remap pass now translates token spans into original-source
+  coordinates and validates each one by string match, dropping
+  synthetic identifiers the preprocessor injects (the `NewType` call
+  inside the `newtype` rewrite, the `__typhon_freeze__` wrapper
+  around `freeze let` RHS) so the TextMate grammar paints the
+  keyword instead of leaking a wrong colour into it. Tokens whose
+  preprocessed line index drifted past the original line count
+  (from `expand_with_chains`, `expand_gather_blocks`,
+  `expand_multiline_guards`) are recovered via a whole-document
+  whole-word search, preferring the closest-line occurrence.
+
 ## 0.7.0 — 2026-05-25
 
 Carry-over sweep from the Round-3 apps-feedback campaign. Closes the

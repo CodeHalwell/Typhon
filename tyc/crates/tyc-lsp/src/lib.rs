@@ -26,8 +26,8 @@ use tower_lsp_server::ls_types::{
 };
 use tower_lsp_server::{jsonrpc, Client, LanguageServer, LspService, Server};
 use tyc_db::{
-    check_source_file, check_source_file_with_imports, module_shapes_query, preprocessed_text,
-    resolved_module_arc, ModuleShapes, SourceFile, TycDatabase,
+    check_source_file, check_source_file_with_imports, module_shapes_query, preprocessed_full,
+    preprocessed_text, resolved_module_arc, ModuleShapes, SourceFile, TycDatabase,
 };
 use tyc_diagnostics::TycError;
 use tyc_resolve::{
@@ -557,13 +557,34 @@ impl LanguageServer for Backend {
         let Some(sf) = self.source_file_for(&uri).await else {
             return Ok(None);
         };
-        // Pull the preprocessed source + resolved bindings out of
-        // Salsa — both are tracked queries, so the second call on an
-        // unchanged file is a cache hit. Cloning the `Arc` is cheap.
-        let (preprocessed, resolved) = {
+        // Pull the preprocessed source + resolved bindings + full
+        // preprocess result + raw on-disk text out of Salsa — all
+        // tracked queries, so the second call on an unchanged file is
+        // a cache hit. Cloning the `Arc` is cheap. The full result
+        // carries the per-line strip metadata the semantic-tokens
+        // remap pass needs to translate preprocessed-source columns
+        // back to original-source columns so colours land on the right
+        // characters when `pub` / `comptime` / `freeze` / `lazy`
+        // modifiers shifted them. `salsa_text` is the SourceFile's
+        // stored text — used as a fallback when the editor buffer
+        // entry has gone away (e.g. concurrent close); falling back to
+        // the *preprocessed* text would defeat the remap, since the
+        // whole point is to translate into the original Typhon source.
+        let (preprocessed, resolved, prep_full, salsa_text) = {
             let db = self.db.lock().await;
-            (preprocessed_text(&*db, sf), resolved_module_arc(&*db, sf))
+            (
+                preprocessed_text(&*db, sf),
+                resolved_module_arc(&*db, sf),
+                preprocessed_full(&*db, sf),
+                sf.text(&*db).clone(),
+            )
         };
+        // Original (pre-preprocess) source: read from the editor's open
+        // buffer when we have it, fall back to the SourceFile's stored
+        // Typhon text. The semantic-tokens client uses this to render
+        // colours, so we want the freshest version of the buffer.
+        let original = self.document_text(&uri).await.unwrap_or(salsa_text);
+        let line_shifts = prep_full.0.line_col_shifts();
         // Parse the preprocessed source for the AST walk
         // (attribute-access tokens). `parse_module` is fast — the
         // type checker already does it on every check pass — but the
@@ -594,8 +615,10 @@ impl LanguageServer for Backend {
         // affecting the rest of the file.
         let (callee_signatures, attribute_kinds) =
             self.build_callee_signatures(&uri, &resolved).await;
-        let tokens = semantic::compute(
+        let tokens = semantic::compute_with_original(
             &preprocessed,
+            &original,
+            &line_shifts,
             &resolved,
             &module,
             stdlib,
