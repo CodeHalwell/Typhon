@@ -2111,8 +2111,55 @@ impl Interpreter {
                 _ => Ok(false),
             },
             MatchClass(c) => self.pattern_match_class(c, subject, env),
-            MatchStar(_) | MatchMapping(_) => Err(not_implemented("complex match patterns")),
+            MatchMapping(m) => self.pattern_match_mapping(m, subject, env),
+            // `MatchStar` only appears *inside* a sequence pattern (we
+            // dispatch it there); seeing it here means a star pattern at
+            // top level, which Python rejects with a SyntaxError. Treat
+            // as a non-match rather than crashing.
+            MatchStar(_) => Ok(false),
         }
+    }
+
+    /// FINDINGS #30 — mapping pattern (`case {"k": v, **rest}`). Matches
+    /// against a dict subject, binds nested patterns for each named key,
+    /// and (if present) captures the remaining keys into `rest`.
+    fn pattern_match_mapping(
+        &mut self,
+        m: &ast::PatternMatchMapping,
+        subject: &Value,
+        env: &EnvRef,
+    ) -> Result<bool, Unwind> {
+        let Value::Dict(d) = subject else {
+            return Ok(false);
+        };
+        // Evaluate the key expressions, then look each up in the dict.
+        let mut matched_keys: Vec<HashKey> = Vec::with_capacity(m.keys.len());
+        for (key_expr, pat) in m.keys.iter().zip(m.patterns.iter()) {
+            let key_val = self.eval_expr(key_expr, env)?;
+            let key = key_val.to_hash_key()?;
+            let value = match d.borrow().get(&key) {
+                Some(v) => v.clone(),
+                None => return Ok(false),
+            };
+            if !self.pattern_matches(pat, &value, env)? {
+                return Ok(false);
+            }
+            matched_keys.push(key);
+        }
+        if let Some(rest_name) = &m.rest {
+            // Build a new dict of the keys we *didn't* consume.
+            let mut rest_map: DictMap = IndexMap::new();
+            for (k, v) in d.borrow().iter() {
+                if !matched_keys.iter().any(|seen| seen == k) {
+                    rest_map.insert(k.clone(), v.clone());
+                }
+            }
+            env.set(
+                rest_name.as_str(),
+                Value::Dict(Rc::new(RefCell::new(rest_map))),
+            );
+        }
+        Ok(true)
     }
 
     fn pattern_match_seq(
@@ -2606,6 +2653,67 @@ mod vm_tests {
         // Default formatting still works.
         assert_eq!(format_with_spec(&v, "42", "5").unwrap(), "   42");
         assert_eq!(format_with_spec(&v, "42", "<5").unwrap(), "42   ");
+    }
+
+    /// FINDINGS #30 — mapping patterns `case {"k": v}` must match
+    /// against dicts and bind nested patterns.
+    #[test]
+    fn match_mapping_pattern_binds_value() {
+        let src = r#"
+shape = {"type": "circle", "radius": 7}
+def kind(s):
+    match s:
+        case {"type": "circle", "radius": r}:
+            return ("circle", r)
+        case {"type": t}:
+            return ("other", t)
+        case _:
+            return ("unknown", 0)
+result = kind(shape)
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        let v = interp.root.get("result").expect("defined");
+        assert_eq!(v.py_str(), "('circle', 7)");
+    }
+
+    #[test]
+    fn match_mapping_pattern_with_rest() {
+        let src = r#"
+d = {"a": 1, "b": 2, "c": 3}
+def f(x):
+    match x:
+        case {"a": a, **rest}:
+            return (a, rest)
+        case _:
+            return (0, {})
+result = f(d)
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        let v = interp.root.get("result").expect("defined");
+        // The remaining dict should include "b" and "c" in insertion order.
+        assert_eq!(v.py_str(), "(1, {'b': 2, 'c': 3})");
+    }
+
+    /// FINDINGS #30 — sequence pattern with star: `case [x, *rest, y]`.
+    /// Already worked in v1; this is a regression-guard test.
+    #[test]
+    fn match_sequence_pattern_with_star() {
+        let src = r#"
+xs = [1, 2, 3, 4, 5]
+def f(s):
+    match s:
+        case [first, *middle, last]:
+            return (first, middle, last)
+        case _:
+            return (0, [], 0)
+result = f(xs)
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        let v = interp.root.get("result").expect("defined");
+        assert_eq!(v.py_str(), "(1, [2, 3, 4], 5)");
     }
 
     /// FINDINGS #31 — recursion limit raised to match Python's default
