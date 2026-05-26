@@ -2121,6 +2121,7 @@ dependencies = [
 name = "tyc-vm"
 version = "0.7.1"
 dependencies = [
+ "regex",
  "ruff_python_ast",
  "ruff_python_parser",
  "tempfile",

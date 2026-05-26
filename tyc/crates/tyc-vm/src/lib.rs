@@ -254,4 +254,72 @@ print(Foo(42))
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
+
+    #[test]
+    fn typing_import_resolves() {
+        // FINDINGS #25: `from typing import Callable` (and friends) used to
+        // crash with ImportError. The VM exposes a typing shim with
+        // identity callables for every name the static checker emits.
+        let src = r#"
+from typing import Callable, Optional, List, Dict, Any, TypeVar
+let T = TypeVar("T")
+print("ok")
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn re_basic_match_search_sub() {
+        // FINDINGS #27: `re` was missing. Smoke-test the most-used
+        // surface: `re.search`, `re.sub`, `re.findall`.
+        let src = r#"
+import re
+let m = re.search("[a-z]+", "Hello world")
+print(m.group())
+print(re.sub("[aeiou]", "*", "Hello"))
+print(re.findall("[0-9]+", "a1 b22 c333"))
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn collections_counter_and_namedtuple() {
+        // FINDINGS #27: `collections.Counter` and `namedtuple` smoke test.
+        let src = r#"
+from collections import Counter, namedtuple
+let c = Counter(["a", "b", "a", "c", "a"])
+print(c)
+let Point = namedtuple("Point", ["x", "y"])
+print(Point(1, 2))
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn functools_reduce_and_cache() {
+        // FINDINGS #27: `functools.reduce` and `cache` smoke test.
+        let src = r#"
+from functools import reduce, cache
+print(reduce(lambda a, b: a + b, [1, 2, 3, 4, 5]))
+
+def slow(n: int) -> int:
+    return n * 2
+
+let fast = cache(slow)
+print(fast(7))
+print(fast(7))
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn itertools_chain_and_accumulate() {
+        // FINDINGS #27: `itertools.chain` and `accumulate` smoke test.
+        let src = r#"
+from itertools import chain, accumulate
+print(list(chain([1, 2], [3, 4])))
+print(list(accumulate([1, 2, 3, 4])))
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
 }
