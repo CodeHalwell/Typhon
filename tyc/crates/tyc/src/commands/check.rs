@@ -15,7 +15,7 @@ use tyc_analyse::{
     analyse_typing_alias_annotations, evaluate_comptime_with_functions, purity_diagnostics,
 };
 use tyc_db::{check_file_with_imports, extract_shapes_for_path, TycDatabase};
-use tyc_diagnostics::{Diagnostics, SanitisedDiagnostic, TycError};
+use tyc_diagnostics::{sanitised_named_source_for, Diagnostics, SanitisedDiagnostic, TycError};
 use tyc_emit::{compare_modules, StubTestKind};
 #[cfg(test)]
 use tyc_resolve::check_unknown_modules;
@@ -405,11 +405,8 @@ pub fn run(args: CheckArgs) -> Result<()> {
             // and at the `--stubs` flag (the recursive stub-discovery
             // path), so the user sees that a directory of `.dty` files
             // without any `.ty` siblings isn't picked up by default.
-            let display_paths: Vec<String> = args
-                .paths
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect();
+            let display_paths: Vec<String> =
+                args.paths.iter().map(|p| p.display().to_string()).collect();
             let joined = if display_paths.is_empty() {
                 ".".to_owned()
             } else {
@@ -455,20 +452,26 @@ fn render_diagnostics(diags: &Diagnostics) {
     // user-facing source listing. The wrapper preserves every other
     // miette field — code, severity, labels, help — so the diagnostic
     // reads identically apart from the cleaned source pane.
-    for (file, items) in &warnings_by_file {
-        eprintln!("── warnings in {} ──", file);
-        for w in items {
-            let wrapped = SanitisedDiagnostic::wrap((*w).clone());
-            eprintln!("{:?}", miette::Report::new_boxed(Box::new(wrapped)));
+    //
+    // Sanitise once per file: every diagnostic in `items` carries the
+    // same embedded source, so computing it per-diagnostic is
+    // O(n_diags × file_size) work. Compute once for the file group and
+    // clone the cleaned `NamedSource` into each wrapper.
+    let render_group = |label: &str, groups: &[(String, Vec<&TycError>)]| {
+        for (file, items) in groups {
+            eprintln!("── {} in {} ──", label, file);
+            let cached = items.first().and_then(|d| sanitised_named_source_for(d));
+            for d in items {
+                let wrapped = match cached.clone() {
+                    Some(src) => SanitisedDiagnostic::wrap_with_source((*d).clone(), src),
+                    None => SanitisedDiagnostic::wrap((*d).clone()),
+                };
+                eprintln!("{:?}", miette::Report::new_boxed(Box::new(wrapped)));
+            }
         }
-    }
-    for (file, items) in &errors_by_file {
-        eprintln!("── errors in {} ──", file);
-        for e in items {
-            let wrapped = SanitisedDiagnostic::wrap((*e).clone());
-            eprintln!("{:?}", miette::Report::new_boxed(Box::new(wrapped)));
-        }
-    }
+    };
+    render_group("warnings", &warnings_by_file);
+    render_group("errors", &errors_by_file);
 
     // Per-code tally + `tyc explain` hint. Only emitted when the file
     // produced at least one diagnostic — silence on clean runs.

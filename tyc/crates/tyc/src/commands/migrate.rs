@@ -110,8 +110,7 @@ pub fn migrate_source(source: &str) -> String {
     //   2. `skip`: line indices to drop verbatim (the `__init__` body).
     //   3. `inject`: per-class-header field declarations to append at the
     //      end of the (otherwise unchanged) class body.
-    let (trivial_init_classes, skip_lines, injected_fields) =
-        collect_trivial_init_classes(source);
+    let (trivial_init_classes, skip_lines, injected_fields) = collect_trivial_init_classes(source);
     // Pull these classes out of `bang_class_lines` so the textual
     // rewriter leaves them as plain `class …:` instead of bumping them
     // to `class! …:` (the dataclass-style default is what we want).
@@ -746,7 +745,9 @@ fn collect_trivial_init_classes(
 
         // Parse `def __init__(self, name: T, age: int) -> ...:`
         let header = header_buf.trim();
-        let after_def = match header.strip_prefix(|c: char| c.is_whitespace()).unwrap_or(header)
+        let after_def = match header
+            .strip_prefix(|c: char| c.is_whitespace())
+            .unwrap_or(header)
             .strip_prefix("def __init__")
         {
             Some(s) => s.trim(),
@@ -855,7 +856,10 @@ fn collect_trivial_init_classes(
                 break;
             };
             let field = rhs[..eq].trim().to_owned();
-            let value = rhs[eq + 1..].trim().trim_end_matches(['\r', '\n']).to_owned();
+            let value = rhs[eq + 1..]
+                .trim()
+                .trim_end_matches(['\r', '\n'])
+                .to_owned();
             // Strip a possible trailing comment.
             let value = value.split('#').next().unwrap_or(&value).trim().to_owned();
             if field != value {
@@ -884,15 +888,78 @@ fn collect_trivial_init_classes(
         for li in body_lines {
             skip.insert(li);
         }
-        // Inject `name: type` per param into the class body.
-        // The fields are appended after the class header, BEFORE any
-        // other class-body content the user wrote, by tracking them
-        // against the class header's line index in `inject`. We attach
-        // to header line idx so the rewriter sees them paired up.
-        inject.insert(idx, typed_params);
+        // Inject `name: type` per param into the class body. By default
+        // the fields land immediately after the class header so the
+        // rewritten output reads like a normal dataclass-style body.
+        //
+        // Edge case: if the original class body's first statement is a
+        // docstring, injecting after the header would push the string
+        // literal out of first-statement position and CPython would no
+        // longer set `__doc__` for the class. Detect a leading docstring
+        // at `body_indent` and anchor the injection after its last line
+        // so `__doc__` is preserved.
+        let anchor = leading_docstring_end(&lines, idx, body_indent).unwrap_or(idx);
+        inject.insert(anchor, typed_params);
     }
 
     (trivial, skip, inject)
+}
+
+/// If the class body's first statement (skipping blank lines and
+/// comments) is a single- or triple-quoted string literal at the
+/// expected `body_indent`, return its last line index so callers can
+/// anchor field injection after it instead of immediately after the
+/// class header. Preserves CPython's `__doc__` for the migrated class.
+fn leading_docstring_end(
+    lines: &[&str],
+    class_header_idx: usize,
+    body_indent: usize,
+) -> Option<usize> {
+    let mut i = class_header_idx + 1;
+    while i < lines.len() {
+        let raw = lines[i];
+        let trim = raw.trim_start();
+        if trim.is_empty() || trim.starts_with('#') {
+            i += 1;
+            continue;
+        }
+        let indent = raw.len() - trim.len();
+        if indent != body_indent {
+            return None;
+        }
+        // Triple-quoted first — match either `"""` or `'''`. Walk forward
+        // until the closing delimiter (possibly on the same line for a
+        // one-line docstring).
+        for triple in ["\"\"\"", "'''"] {
+            if let Some(after_open) = trim.strip_prefix(triple) {
+                if let Some(_) = after_open.find(triple) {
+                    return Some(i);
+                }
+                let mut j = i + 1;
+                while j < lines.len() {
+                    if lines[j].contains(triple) {
+                        return Some(j);
+                    }
+                    j += 1;
+                }
+                return None;
+            }
+        }
+        // Single-line `"..."` or `'...'` docstring on one line.
+        let bytes = trim.as_bytes();
+        if let Some(&q) = bytes.first() {
+            if q == b'"' || q == b'\'' {
+                if let Some(end) = trim[1..].find(q as char) {
+                    let rest = trim[1 + end + 1..].trim_start();
+                    if rest.is_empty() || rest.starts_with('#') {
+                        return Some(i);
+                    }
+                }
+            }
+        }
+        return None;
+    }
+    None
 }
 
 fn collect_bang_class_lines(source: &str) -> HashSet<usize> {
@@ -2077,7 +2144,10 @@ class MyModel(nn.Module):
             out.contains("class! MyModel(nn.Module):"),
             "non-trivial init must stay on class!, got:\n{out}"
         );
-        assert!(out.contains("def __init__"), "init body must survive, got:\n{out}");
+        assert!(
+            out.contains("def __init__"),
+            "init body must survive, got:\n{out}"
+        );
     }
 
     #[test]

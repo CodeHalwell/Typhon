@@ -67,9 +67,12 @@ impl PartialEq for HashKey {
         match (self, other) {
             (HashKey::None, HashKey::None) => true,
             (HashKey::Bool(a), HashKey::Bool(b)) => a == b,
-            // Python: bool ↔ int comparison shares hash slot.
+            // Python: bool ↔ int comparison shares hash slot. A bool is
+            // 0 or 1, so any BigInt that doesn't fit in i64 can't equal
+            // it — fold through `to_i64()` to avoid allocating a BigInt
+            // on every lookup.
             (HashKey::Bool(a), HashKey::Int(b)) | (HashKey::Int(b), HashKey::Bool(a)) => {
-                &BigInt::from(*a as i64) == b
+                b.to_i64().is_some_and(|v| v == *a as i64)
             }
             (HashKey::Int(a), HashKey::Int(b)) => a == b,
             (HashKey::Float(a), HashKey::Float(b)) => a == b,
@@ -86,8 +89,9 @@ impl std::hash::Hash for HashKey {
         match self {
             HashKey::None => 0u8.hash(state),
             // bool/int collide intentionally — Python's `hash(True) == hash(1)`.
-            // Reduce ints to i64 modulo for hashing parity with bool — values
-            // outside i64 still get a stable hash via the full BigInt.
+            // A bool widens to a BigInt before hashing so it produces the
+            // same hash as the equivalent `Int(BigInt::from(b))`. Large
+            // ints just hash through their full BigInt representation.
             HashKey::Bool(b) => BigInt::from(*b as i64).hash(state),
             HashKey::Int(i) => i.hash(state),
             HashKey::Float(bits) => bits.hash(state),
@@ -674,13 +678,36 @@ pub fn bigint_to_f64(i: &BigInt) -> f64 {
     }
 }
 
-/// Compare a `BigInt` to an `f64`. Returns `None` if the float is NaN.
+/// Compare a `BigInt` to an `f64` without precision loss for large
+/// integers. Converting `a` through `f64` would round any value outside
+/// the 53-bit float mantissa and cause `a == b` (or wrong-direction
+/// ordering) for very large operands. Instead, handle infinities
+/// directly, lift `b` to a `BigInt` via its floor/ceil, and compare
+/// against those exact integers.
 pub fn bigint_cmp_f64(a: &BigInt, b: f64) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
     if b.is_nan() {
         return None;
     }
-    let a_f = bigint_to_f64(a);
-    a_f.partial_cmp(&b)
+    if b == f64::INFINITY {
+        return Some(Ordering::Less);
+    }
+    if b == f64::NEG_INFINITY {
+        return Some(Ordering::Greater);
+    }
+    // When `b` is itself an exact integer in f64, lift it directly.
+    if b.trunc() == b {
+        if let Some(bi) = BigInt::from_f64(b) {
+            return Some(a.cmp(&bi));
+        }
+    }
+    // Otherwise compare against the floor: a ≤ ⌊b⌋ → Less, else Greater.
+    let bi_floor = BigInt::from_f64(b.floor())?;
+    if *a <= bi_floor {
+        Some(Ordering::Less)
+    } else {
+        Some(Ordering::Greater)
+    }
 }
 
 /// `int == float` modelled after CPython: equal only when the float

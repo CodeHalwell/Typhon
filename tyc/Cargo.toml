@@ -57,6 +57,14 @@ notify = { version = "8", default-features = false, features = ["macos_kqueue"] 
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 
+# VM runtime — pinned here so every crate that grows VM-facing deps
+# (interp, builtins, value) stays version-aligned.
+indexmap    = "2"
+num-bigint  = "0.4"
+num-integer = "0.1"
+num-traits  = "0.2"
+regex       = "1"
+
 # Internal crates
 tyc-syntax      = { path = "crates/tyc-syntax" }
 tyc-diagnostics = { path = "crates/tyc-diagnostics" }

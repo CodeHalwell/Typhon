@@ -1570,9 +1570,7 @@ fn expand_impl_sealed_unions(source: &str) -> String {
             idx += 1;
             continue;
         }
-        let indent_len = raw
-            .find(|c: char| !c.is_whitespace())
-            .unwrap_or(raw.len());
+        let indent_len = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
         let indent = &raw[..indent_len];
         let rest = &raw[indent_len..];
         // Recognise both `impl Name…:` and `impl[T,…] Name…:`.
@@ -1589,14 +1587,17 @@ fn expand_impl_sealed_unions(source: &str) -> String {
             .and_then(|info| aliases.get(&info.target_name));
         if let (Some(info), Some(variants)) = (target_info.as_ref(), variants) {
             // Capture the indented body. A "body line" is any non-blank
-            // line whose indent exceeds the header's indent; blank lines
-            // mixed in are part of the body. We stop at the first
-            // dedented non-blank line.
+            // line whose indent exceeds the header's indent. Blank lines
+            // sitting *between* body lines are kept; trailing blank lines
+            // (those followed only by dedented content or EOF) belong to
+            // the file, not the impl block — don't duplicate them.
             let mut body_end = idx + 1;
-            while body_end < lines.len() {
-                let candidate = lines[body_end].trim_end_matches(['\n', '\r']);
+            let mut last_body_line: Option<usize> = None;
+            let mut probe = idx + 1;
+            while probe < lines.len() {
+                let candidate = lines[probe].trim_end_matches(['\n', '\r']);
                 if candidate.chars().all(|c| c.is_whitespace()) {
-                    body_end += 1;
+                    probe += 1;
                     continue;
                 }
                 let cand_indent = candidate
@@ -1605,12 +1606,15 @@ fn expand_impl_sealed_unions(source: &str) -> String {
                 if cand_indent <= indent_len {
                     break;
                 }
-                body_end += 1;
+                last_body_line = Some(probe);
+                probe += 1;
             }
+            body_end = last_body_line.map(|i| i + 1).unwrap_or(body_end);
             let body_slice: String = lines[idx + 1..body_end].concat();
             // Detect the line's terminator (LF / CRLF / none) so we can
             // emit identical separators between duplicated blocks.
             let term = &line[raw.len()..];
+            let block_sep = if term.contains('\r') { "\r\n" } else { "\n" };
             for (i, variant) in variants.iter().enumerate() {
                 let header = format!(
                     "{indent}impl{tp} {variant}{args}:{term}",
@@ -1622,14 +1626,21 @@ fn expand_impl_sealed_unions(source: &str) -> String {
                 );
                 out.push_str(&header);
                 out.push_str(&body_slice);
-                // Separate consecutive duplicated blocks by a blank
-                // line so downstream parsers (which use blank lines as
-                // a visual break) stay happy. The original block had
-                // none, so we only add separation between duplicates.
-                if i + 1 < variants.len() && !body_slice.ends_with('\n') {
-                    out.push('\n');
+                // Separate consecutive duplicated blocks by a blank line.
+                // `body_slice` from `split_inclusive('\n')` always ends in
+                // a newline when non-empty, so we need an *extra* newline
+                // to produce the visual blank line downstream parsers use
+                // as a block boundary.
+                if i + 1 < variants.len() {
+                    if !body_slice.ends_with('\n') {
+                        out.push_str(block_sep);
+                    }
+                    out.push_str(block_sep);
                 }
             }
+            // Resume after the last body line (or just after the header
+            // if there was no body). Trailing blank lines we skipped are
+            // re-emitted naturally on the next iteration.
             idx = body_end;
             continue;
         }
@@ -1657,9 +1668,7 @@ fn collect_sealed_union_aliases_from_text(
         if pre_string.is_some() {
             continue;
         }
-        let indent_len = raw
-            .find(|c: char| !c.is_whitespace())
-            .unwrap_or(raw.len());
+        let indent_len = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
         // Only module-level `type` aliases participate; nested ones
         // can't legally exist in Typhon and would muddy the rewrite.
         if indent_len != 0 {
@@ -1882,9 +1891,7 @@ fn strip_hkt_markers_in_class_headers(source: &str) -> String {
             out.push_str(line);
             continue;
         }
-        let indent_len = raw
-            .find(|c: char| !c.is_whitespace())
-            .unwrap_or(raw.len());
+        let indent_len = raw.find(|c: char| !c.is_whitespace()).unwrap_or(raw.len());
         let rest = &raw[indent_len..];
         if !rest.starts_with("class ") {
             out.push_str(line);
@@ -1934,8 +1941,8 @@ fn strip_hkt_markers_in_class_headers(source: &str) -> String {
             }
         };
         let inside = &after_name[1..close]; // exclusive of outer `[`/`]`
-        // Quick exit: no `[_]` marker at all — leave the line alone so
-        // round-tripping stays exact for the common case.
+                                            // Quick exit: no `[_]` marker at all — leave the line alone so
+                                            // round-tripping stays exact for the common case.
         if !inside.contains("[_]") {
             out.push_str(line);
             continue;
@@ -3515,7 +3522,10 @@ fn parse_typed_let_unpack(body: &str) -> Option<TypedLetUnpack> {
         }
         let (name, annotation) = if let Some(colon) = find_top_level_colon(cap) {
             saw_annotation = true;
-            (cap[..colon].trim(), Some(cap[colon + 1..].trim().to_owned()))
+            (
+                cap[..colon].trim(),
+                Some(cap[colon + 1..].trim().to_owned()),
+            )
         } else {
             (cap, None)
         };
@@ -3556,10 +3566,7 @@ fn parse_typed_let_unpack(body: &str) -> Option<TypedLetUnpack> {
         // it so we don't introduce gratuitous temps.
         return None;
     }
-    Some(TypedLetUnpack {
-        captures,
-        rhs,
-    })
+    Some(TypedLetUnpack { captures, rhs })
 }
 
 /// Parse a `tuple[T1, T2, …]` outer annotation into its per-slot types.
@@ -9531,9 +9538,7 @@ string content
         let src = "class Box[T: int] frozen(Base):\n    value: T\n";
         let result = preprocess(src);
         assert!(
-            result
-                .python_source
-                .starts_with("class Box[T: int](Base):"),
+            result.python_source.starts_with("class Box[T: int](Base):"),
             "expected `class Box[T: int](Base):`; got:\n{}",
             result.python_source
         );

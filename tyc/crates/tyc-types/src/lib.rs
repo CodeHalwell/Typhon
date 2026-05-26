@@ -8434,7 +8434,9 @@ fn non_type_expr_kind(expr: &Expr) -> Option<&'static str> {
 fn is_classvar_annotation(ann: &Expr) -> bool {
     match ann {
         Expr::Name(n) => n.id.as_str() == "ClassVar",
-        Expr::Subscript(s) => matches!(s.value.as_ref(), Expr::Name(n) if n.id.as_str() == "ClassVar"),
+        Expr::Subscript(s) => {
+            matches!(s.value.as_ref(), Expr::Name(n) if n.id.as_str() == "ClassVar")
+        }
         _ => false,
     }
 }
@@ -8474,7 +8476,8 @@ fn is_known_builtin_generic_attr(head: &str, attr: &str) -> bool {
         ),
         "dict" => matches!(
             attr,
-            "get" | "keys"
+            "get"
+                | "keys"
                 | "values"
                 | "items"
                 | "pop"
@@ -16884,7 +16887,9 @@ def main() -> None:
 ";
         let d = check(src);
         assert!(
-            d.errors().iter().any(|e| e.to_string().contains("fake_method")),
+            d.errors()
+                .iter()
+                .any(|e| e.to_string().contains("fake_method")),
             "expected attribute_not_found for `xs.fake_method()` on list[int]; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
@@ -16919,7 +16924,9 @@ def f(x: int) -> int:
 ";
         let d = check_with_resolver(src);
         assert!(
-            d.errors().iter().any(|e| matches!(e, TycError::ImmutableAssign { .. })),
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ImmutableAssign { .. })),
             "parameter rebind without mut must fire immutable_assign; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
@@ -16936,7 +16943,9 @@ def f(x: int) -> int:
 ";
         let d = check_with_resolver(src);
         assert!(
-            !d.errors().iter().any(|e| matches!(e, TycError::ImmutableAssign { .. })),
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ImmutableAssign { .. })),
             "parameter rebind with explicit mut must not fire; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
@@ -17003,7 +17012,9 @@ def main() -> None:
         let src = "newtype Bogus = \"any string literal\"\n";
         let d = check(src);
         assert!(
-            d.errors().iter().any(|e| matches!(e, TycError::NewtypeInvalidBase { .. })),
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NewtypeInvalidBase { .. })),
             "newtype with string-literal RHS must fire newtype_invalid_base; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
@@ -17015,7 +17026,9 @@ def main() -> None:
         let src = "newtype UserId = int\n";
         let d = check(src);
         assert!(
-            !d.errors().iter().any(|e| matches!(e, TycError::NewtypeInvalidBase { .. })),
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NewtypeInvalidBase { .. })),
             "newtype with valid type RHS must not fire; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
@@ -17033,7 +17046,9 @@ class Config:
 ";
         let d = check(src);
         assert!(
-            !d.errors().iter().any(|e| matches!(e, TycError::FieldDefaultOrdering { .. })),
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::FieldDefaultOrdering { .. })),
             "ClassVar must not trip field_default_ordering; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
@@ -17049,7 +17064,9 @@ class Config:
 ";
         let d = check(src);
         assert!(
-            !d.errors().iter().any(|e| matches!(e, TycError::FieldDefaultOrdering { .. })),
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::FieldDefaultOrdering { .. })),
             "bare ClassVar must not trip field_default_ordering; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
@@ -17065,7 +17082,9 @@ class Config:
 ";
         let d = check(src);
         assert!(
-            d.errors().iter().any(|e| matches!(e, TycError::FieldDefaultOrdering { .. })),
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::FieldDefaultOrdering { .. })),
             "regular non-default-after-default must still fire; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );

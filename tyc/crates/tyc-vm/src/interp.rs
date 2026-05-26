@@ -247,21 +247,26 @@ impl Interpreter {
             }
             Stmt::Import(im) => {
                 for alias in &im.names {
-                    let module = self.import_module(alias.name.as_str())?;
-                    let bind = alias
-                        .asname
-                        .as_ref()
-                        .map(|i| i.as_str().to_owned())
-                        .unwrap_or_else(|| {
-                            // For `import a.b.c`, bind `a` (Python semantics).
-                            alias
+                    // Python: `import a.b.c` binds the *root* name `a` to
+                    // the root package; later `a.b.c.x` accesses traverse
+                    // through attribute lookups. `import a.b as foo`
+                    // binds `foo` to the submodule. Mirror that — when
+                    // an `as` clause is present, load and bind the
+                    // dotted name; otherwise resolve to the root module.
+                    let (target, bind) = match &alias.asname {
+                        Some(i) => (alias.name.as_str().to_owned(), i.as_str().to_owned()),
+                        None => {
+                            let root = alias
                                 .name
                                 .as_str()
                                 .split('.')
                                 .next()
                                 .unwrap_or("")
-                                .to_owned()
-                        });
+                                .to_owned();
+                            (root.clone(), root)
+                        }
+                    };
+                    let module = self.import_module(&target)?;
                     env.set(&bind, module);
                 }
                 Ok(())
@@ -674,9 +679,9 @@ impl Interpreter {
                 self.eval_listcomp(&listy, env)
             }
             Expr::Await(_) => Err(vm_unsupported_use_compile("await expressions")),
-            Expr::Yield(_) | Expr::YieldFrom(_) => {
-                Err(vm_unsupported_use_compile("generators (`yield` / `yield from`)"))
-            }
+            Expr::Yield(_) | Expr::YieldFrom(_) => Err(vm_unsupported_use_compile(
+                "generators (`yield` / `yield from`)",
+            )),
             Expr::TString(_) => Err(not_implemented("template strings")),
             Expr::IpyEscapeCommand(_) => Err(not_implemented("IPython escape commands")),
         }
@@ -2589,7 +2594,8 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
 
     // Apply width: combine sign + prefix + body, then pad.
     if let Some(w) = width {
-        let total_len = explicit_sign.chars().count() + prefix.chars().count() + buf.chars().count();
+        let total_len =
+            explicit_sign.chars().count() + prefix.chars().count() + buf.chars().count();
         if total_len < w {
             let pad = w - total_len;
             // Default alignment: numeric → right, string → left.
@@ -2605,9 +2611,7 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
                     let hi = pad - lo;
                     let lo_s: String = std::iter::repeat(fill).take(lo).collect();
                     let hi_s: String = std::iter::repeat(fill).take(hi).collect();
-                    return Ok(format!(
-                        "{lo_s}{explicit_sign}{prefix}{buf}{hi_s}"
-                    ));
+                    return Ok(format!("{lo_s}{explicit_sign}{prefix}{buf}{hi_s}"));
                 }
                 '=' => {
                     // Pad between sign/prefix and the digits — used by
@@ -2704,7 +2708,10 @@ result = fib(99)
         assert_eq!(format_with_spec(&pi, "3.14", "08.3f").unwrap(), "0003.140");
         // Test a value where the third decimal is meaningful.
         let e = Value::Float(2.71828);
-        assert_eq!(format_with_spec(&e, "2.71828", "08.3f").unwrap(), "0002.718");
+        assert_eq!(
+            format_with_spec(&e, "2.71828", "08.3f").unwrap(),
+            "0002.718"
+        );
         // Combined: alternate-form hex with zero-pad and width.
         assert_eq!(format_with_spec(&v, "42", "#06x").unwrap(), "0x002a");
         // Negative numbers respect sign position with zero-pad.

@@ -2816,8 +2816,7 @@ fn inherit_parent_fields(body: Vec<Stmt>) -> Vec<Stmt> {
                                             if own_field_names.contains(nf.id.as_str()) {
                                                 continue;
                                             }
-                                            own_field_names
-                                                .insert(nf.id.as_str().to_owned());
+                                            own_field_names.insert(nf.id.as_str().to_owned());
                                             inherited.push(pf.clone());
                                         }
                                     }

@@ -1192,7 +1192,7 @@ fn make_typing_module() -> Value {
         "Never",
         "NoReturn",
     ] {
-        entries.push((name, identity_native(Box::leak(name.to_owned().into_boxed_str()))));
+        entries.push((name, identity_native(name)));
     }
     // `NewType("Foo", base)` returns an identity callable. Mirrors the
     // root-level `NewType` builtin for users who import it explicitly.
@@ -1257,11 +1257,11 @@ fn make_typing_module() -> Value {
 fn make_re_module() -> Value {
     use crate::value::Class;
     // Compile a Python-shaped pattern into a Rust regex by rewriting
-    // `(?P<name>` to `(?<name>` and `(?P=name)` to a (non-functional)
-    // placeholder that the engine will reject — keeping the failure
-    // mode legible.
+    // `(?P<name>` to `(?<name>`. The `(?P=name)` back-reference form is
+    // left as-is so the Rust engine rejects it with a legible error —
+    // there's no equivalent in `regex` (a finite-automaton engine).
     fn to_rust_pattern(p: &str) -> String {
-        p.replace("(?P<", "(?<").replace("(?P=", "(?P=")
+        p.replace("(?P<", "(?<")
     }
     fn compile_one(p: &str) -> Result<regex::Regex, Unwind> {
         regex::Regex::new(&to_rust_pattern(p))
@@ -1359,7 +1359,9 @@ fn make_re_module() -> Value {
         attrs.insert(
             "groups".into(),
             Value::Native(Rc::new(NativeFn::new("groups", move |_i, _args| {
-                Ok(Value::Tuple(Rc::new(vec![Value::Str(Rc::new(cap2.clone()))])))
+                Ok(Value::Tuple(Rc::new(vec![Value::Str(Rc::new(
+                    cap2.clone(),
+                ))])))
             }))),
         );
         attrs.insert(
@@ -1418,7 +1420,12 @@ fn make_re_module() -> Value {
                         .ok_or_else(|| type_error("match() needs string"))?
                         .py_str();
                     let r = compile_one(&p)?;
-                    Ok(match_to_value(r.find(&s), &s))
+                    // Python's `re.match` only matches at the start of the
+                    // string (unlike `re.search`). The Rust `regex` crate
+                    // returns the leftmost match anywhere, so anchor by
+                    // requiring `start() == 0`.
+                    let m = r.find(&s).filter(|m| m.start() == 0);
+                    Ok(match_to_value(m, &s))
                 }),
             ),
             (
@@ -1593,7 +1600,10 @@ fn make_collections_module() -> Value {
         let ctor = NativeFn::new("namedtuple_ctor", move |_i, mut call_args| {
             // Pull field count from the captured `fields` argument.
             let count = match &fields {
-                Value::Str(s) => s.split(|c: char| c.is_whitespace() || c == ',').filter(|p| !p.is_empty()).count(),
+                Value::Str(s) => s
+                    .split(|c: char| c.is_whitespace() || c == ',')
+                    .filter(|p| !p.is_empty())
+                    .count(),
                 Value::List(l) => l.borrow().len(),
                 Value::Tuple(t) => t.len(),
                 _ => 0,
@@ -1630,8 +1640,7 @@ fn make_collections_module() -> Value {
 fn make_functools_module() -> Value {
     fn make_cache(_i: &mut Interpreter, args: Vec<Value>) -> Result<Value, Unwind> {
         let inner = args.into_iter().next().unwrap_or(Value::None);
-        let cache: Rc<RefCell<HashMap<HashKey, Value>>> =
-            Rc::new(RefCell::new(HashMap::new()));
+        let cache: Rc<RefCell<HashMap<HashKey, Value>>> = Rc::new(RefCell::new(HashMap::new()));
         Ok(Value::Native(Rc::new(NativeFn::new(
             "memo",
             move |interp, call_args| {
@@ -1707,9 +1716,10 @@ fn make_functools_module() -> Value {
     });
     let wraps = nf("wraps", |_i, _args| {
         // Returns a decorator that's an identity function.
-        Ok(Value::Native(Rc::new(NativeFn::new("wraps_inner", |_i, args| {
-            Ok(args.into_iter().next().unwrap_or(Value::None))
-        }))))
+        Ok(Value::Native(Rc::new(NativeFn::new(
+            "wraps_inner",
+            |_i, args| Ok(args.into_iter().next().unwrap_or(Value::None)),
+        ))))
     });
     make_module(
         "functools",
@@ -1956,10 +1966,7 @@ fn make_itertools_module() -> Value {
             }
             out = next;
         }
-        let tuples: Vec<Value> = out
-            .into_iter()
-            .map(|v| Value::Tuple(Rc::new(v)))
-            .collect();
+        let tuples: Vec<Value> = out.into_iter().map(|v| Value::Tuple(Rc::new(v))).collect();
         Ok(Value::List(Rc::new(RefCell::new(tuples))))
     });
     let groupby = nf("groupby", |i, mut args| {
@@ -2034,9 +2041,10 @@ fn make_dataclasses_module() -> Value {
                 return Ok(v.clone());
             }
         }
-        Ok(Value::Native(Rc::new(NativeFn::new("dataclass_inner", |_i, args| {
-            Ok(args.into_iter().next().unwrap_or(Value::None))
-        }))))
+        Ok(Value::Native(Rc::new(NativeFn::new(
+            "dataclass_inner",
+            |_i, args| Ok(args.into_iter().next().unwrap_or(Value::None)),
+        ))))
     });
     let field = nf("field", |_i, args| {
         // Approximate signature: `field(default=…, default_factory=…)`.
@@ -2060,7 +2068,11 @@ fn make_dataclasses_module() -> Value {
     });
     make_module(
         "dataclasses",
-        vec![("dataclass", dataclass), ("field", field), ("asdict", asdict)],
+        vec![
+            ("dataclass", dataclass),
+            ("field", field),
+            ("asdict", asdict),
+        ],
     )
 }
 
@@ -2104,11 +2116,7 @@ fn make_pathlib_module() -> Value {
             .and_then(|e| e.to_str())
             .map(|e| format!(".{e}"))
             .unwrap_or_default();
-        let parent = p
-            .parent()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_owned();
+        let parent = p.parent().and_then(|n| n.to_str()).unwrap_or("").to_owned();
         fields.insert("name".into(), Value::Str(Rc::new(name)));
         fields.insert("stem".into(), Value::Str(Rc::new(stem)));
         fields.insert("suffix".into(), Value::Str(Rc::new(suffix)));
@@ -2124,9 +2132,12 @@ fn make_pathlib_module() -> Value {
             Value::Native(Rc::new(NativeFn::new("read_text", move |_i, _args| {
                 std::fs::read_to_string(&s_for_read)
                     .map(|t| Value::Str(Rc::new(t)))
-                    .map_err(|e| crate::error::Unwind::Exception(
-                        crate::error::VmException::new("OSError", format!("{e}")),
-                    ))
+                    .map_err(|e| {
+                        crate::error::Unwind::Exception(crate::error::VmException::new(
+                            "OSError",
+                            format!("{e}"),
+                        ))
+                    })
             }))),
         );
         let s_for_write = s.clone();
@@ -2136,9 +2147,12 @@ fn make_pathlib_module() -> Value {
                 let text = single(&args, "write_text")?.py_str();
                 std::fs::write(&s_for_write, text.as_bytes())
                     .map(|_| Value::Int(num_bigint::BigInt::from(text.len() as i64)))
-                    .map_err(|e| crate::error::Unwind::Exception(
-                        crate::error::VmException::new("OSError", format!("{e}")),
-                    ))
+                    .map_err(|e| {
+                        crate::error::Unwind::Exception(crate::error::VmException::new(
+                            "OSError",
+                            format!("{e}"),
+                        ))
+                    })
             }))),
         );
         let s_for_exists = s.clone();

@@ -3117,6 +3117,27 @@ impl SanitisedDiagnostic {
         });
         Self { inner, sanitised }
     }
+
+    /// Build a wrapper that reuses a pre-sanitised `NamedSource`. Callers
+    /// rendering many diagnostics for the same file should sanitise once
+    /// and pass the result here to avoid the O(n_diags × file_size)
+    /// rework that [`wrap`](Self::wrap) does on a hot loop.
+    pub fn wrap_with_source(inner: TycError, sanitised: NamedSource<String>) -> Self {
+        Self {
+            inner,
+            sanitised: Some(sanitised),
+        }
+    }
+}
+
+/// Compute the sanitised `NamedSource` for a single diagnostic. Returns
+/// `None` for variants that don't carry source text (`TycError::Io`).
+/// Renderers grouping diagnostics by file should call this once per
+/// file and reuse the result via [`SanitisedDiagnostic::wrap_with_source`].
+pub fn sanitised_named_source_for(err: &TycError) -> Option<NamedSource<String>> {
+    let src = err.embedded_source()?;
+    let cleaned = sanitize_synthetic_source(src.inner());
+    Some(NamedSource::new(src.name(), cleaned))
 }
 
 impl std::fmt::Debug for SanitisedDiagnostic {
@@ -3332,7 +3353,11 @@ mod tests {
         // the user at parenthesising the chain rather than the raw
         // "Unexpected indentation" message from the Python parser.
         let source = "let result = value |>\n    f()\n";
-        let hint = parse_error_hint("Unexpected indentation", source, source.find("    f").unwrap());
+        let hint = parse_error_hint(
+            "Unexpected indentation",
+            source,
+            source.find("    f").unwrap(),
+        );
         let hint = hint.expect("pipe-chain hint must fire when prev line ends with |>");
         assert!(
             hint.contains("pipe chain") && hint.contains("parentheses"),
@@ -3412,7 +3437,10 @@ mod tests {
         // miette skips the help block instead of printing nonsense.
         let source = "let x: int = \n";
         let hint = parse_error_hint("unexpected token", source, 0);
-        assert!(hint.is_none(), "unrelated message should not produce a hint");
+        assert!(
+            hint.is_none(),
+            "unrelated message should not produce a hint"
+        );
     }
 
     #[test]
