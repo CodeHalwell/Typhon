@@ -526,6 +526,39 @@ pub fn install(interp: &mut Interpreter) {
         });
         root.set(name, Value::Native(Rc::new(ctor)));
     }
+
+    // `freeze let X = expr` lowers to `X = __typhon_freeze__(expr)`. The
+    // compile path resolves this via `from typhon_runtime.freeze import
+    // deep_freeze as __typhon_freeze__`; the VM has no `typhon_runtime`
+    // package on disk, so we register the helper as a builtin instead.
+    // Acceptable VM-mode limitation: returns the value as-is (identity).
+    // The static checker still enforces immutability of `freeze let`
+    // bindings at the type level, so the runtime degradation is silent
+    // and only affects users who attempt to mutate the value through an
+    // aliased reference at runtime — a pattern the type system already
+    // rejects.
+    root.set(
+        "__typhon_freeze__",
+        Value::Native(Rc::new(NativeFn::new("__typhon_freeze__", |_i, args| {
+            Ok(args.into_iter().next().unwrap_or(Value::None))
+        }))),
+    );
+
+    // `newtype Foo = int` lowers to `Foo = NewType("Foo", int)`. CPython's
+    // `NewType` at runtime is effectively `lambda x: x`, so we mirror that:
+    // a two-argument callable that returns a callable identity function.
+    // VM-mode coverage of #24.
+    root.set(
+        "NewType",
+        Value::Native(Rc::new(NativeFn::new("NewType", |_i, _args| {
+            // Discard `(name, base)`; return an identity callable that
+            // accepts any single argument and returns it unchanged.
+            Ok(Value::Native(Rc::new(NativeFn::new(
+                "NewTypeAlias",
+                |_i, args| Ok(args.into_iter().next().unwrap_or(Value::None)),
+            ))))
+        }))),
+    );
 }
 
 fn single<'a>(args: &'a [Value], name: &str) -> Result<&'a Value, Unwind> {
@@ -657,8 +690,23 @@ pub fn resolve_module(interp: &mut Interpreter, name: &str) -> Result<Value, Unw
         "json" => Ok(make_json_module()),
         "time" => Ok(make_time_module()),
         "random" => Ok(make_random_module()),
-        // Typhon-runtime submodules — same content reachable as attributes.
-        n if n.starts_with("typhon_runtime.") => Ok(make_typhon_runtime_module(interp)),
+        // Typhon-runtime submodules — return the matching submodule so
+        // `from typhon_runtime.freeze import deep_freeze` and friends
+        // resolve their member directly. Falls back to the root module
+        // for unrecognised submodule names so legacy code paths keep
+        // working.
+        n if n.starts_with("typhon_runtime.") => {
+            let root = make_typhon_runtime_module(interp);
+            let sub = n.strip_prefix("typhon_runtime.").unwrap_or("");
+            if let Value::Module(m) = &root {
+                if let Some(v) = m.members.borrow().get(sub) {
+                    if matches!(v, Value::Module(_)) {
+                        return Ok(v.clone());
+                    }
+                }
+            }
+            Ok(root)
+        }
         _ => Err(crate::error::Unwind::Exception(
             crate::error::VmException::new(
                 "ImportError",
@@ -720,9 +768,30 @@ fn make_typhon_runtime_module(interp: &Interpreter) -> Value {
             ),
         ],
     );
+    // `freeze let X = expr` lowers to a call to `deep_freeze` imported from
+    // `typhon_runtime.freeze`. We expose the same name here so the
+    // existing desugar-injected import (`from typhon_runtime.freeze import
+    // deep_freeze as __typhon_freeze__`) resolves in VM mode. The shim is
+    // an identity function — see the `__typhon_freeze__` root binding in
+    // `install()` for the rationale.
+    let freeze = make_module(
+        "typhon_runtime.freeze",
+        vec![(
+            "deep_freeze",
+            nf("deep_freeze", |_i, args| {
+                Ok(args.into_iter().next().unwrap_or(Value::None))
+            }),
+        )],
+    );
     make_module(
         "typhon_runtime",
-        vec![("Ok", ok), ("Err", err), ("tasks", tasks), ("lazy", lazy)],
+        vec![
+            ("Ok", ok),
+            ("Err", err),
+            ("tasks", tasks),
+            ("lazy", lazy),
+            ("freeze", freeze),
+        ],
     )
 }
 

@@ -218,4 +218,40 @@ main()
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
+
+    #[test]
+    fn freeze_builtin_is_identity() {
+        // FINDINGS #23: `freeze let` lowers to a `__typhon_freeze__(...)`
+        // call. The VM exposes the helper as an identity shim so the
+        // lowered code runs without a NameError.
+        let src = r#"
+let xs = __typhon_freeze__([1, 2, 3])
+print(xs)
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn freeze_runtime_import_resolves() {
+        // The compile path injects `from typhon_runtime.freeze import
+        // deep_freeze as __typhon_freeze__`; the VM must serve it too.
+        let src = r#"
+from typhon_runtime.freeze import deep_freeze as __typhon_freeze__
+let xs = __typhon_freeze__([1, 2, 3])
+print(xs)
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn newtype_is_identity_callable() {
+        // FINDINGS #24: `newtype Foo = int` lowers to `Foo = NewType("Foo",
+        // int)`. The VM exposes `NewType` as a builtin that returns an
+        // identity wrapper, matching CPython's runtime semantics.
+        let src = r#"
+let Foo = NewType("Foo", int)
+print(Foo(42))
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
 }
