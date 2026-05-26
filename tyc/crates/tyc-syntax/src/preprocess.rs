@@ -1518,10 +1518,37 @@ fn strip_frozen_modifier(rest: &str) -> Option<String> {
     }
     let name = &after_class[..name_end];
     let after_name = &after_class[name_end..];
+    // Optionally consume a PEP-695 type-parameter list — `class X[T] frozen:`
+    // is a legal Typhon header even though the `frozen` modifier sits to the
+    // right of the `[T]`. We track bracket depth so `[T: Bound, U]` keeps the
+    // inner commas grouped. Without this the bracket-list ends up in `tail`
+    // and Ruff later complains about `class X[T] frozen:`.
+    let (type_params, after_tps) = if after_name.starts_with('[') {
+        let bytes = after_name.as_bytes();
+        let mut depth = 0i32;
+        let mut end = None;
+        for (i, &b) in bytes.iter().enumerate() {
+            match b {
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end?;
+        (&after_name[..end], &after_name[end..])
+    } else {
+        ("", after_name)
+    };
     // The modifier must follow whitespace and be the bare token `frozen`,
     // terminated by `:` or `(` (with whatever whitespace sits between).
-    let trimmed = after_name.trim_start();
-    let leading_ws = after_name.len() - trimmed.len();
+    let trimmed = after_tps.trim_start();
+    let leading_ws = after_tps.len() - trimmed.len();
     if leading_ws == 0 {
         return None;
     }
@@ -1536,7 +1563,7 @@ fn strip_frozen_modifier(rest: &str) -> Option<String> {
     // Anything after the modifier (bases list, colon, trailing newline) is
     // preserved verbatim — the Python parser handles `(Base):` natively.
     let tail = rest_after_mod.trim_start();
-    Some(format!("class {}{}", name, tail))
+    Some(format!("class {}{}{}", name, type_params, tail))
 }
 
 /// Same as [`make_impl_class_line`] but uses the `__typhon_builtin_ext_`
@@ -8845,5 +8872,42 @@ string content
             out.contains(r#"create_task(get("""a#b"""))"#),
             "triple-quoted # must not be stripped: {out}"
         );
+    }
+
+    // ── #8: generic + frozen combo ─────────────────────────────────────────
+    #[test]
+    fn class_generic_then_frozen_strips_modifier_and_preserves_type_params() {
+        // `class Box[T] frozen:` must parse: strip the `frozen` modifier
+        // while preserving the `[T]` PEP-695 type-parameter list so Ruff
+        // sees a legal `class Box[T]:` header. The line is recorded so
+        // desugar emits the `@dataclass(slots=True, frozen=True)`.
+        let src = "class Box[T] frozen:\n    value: T\n";
+        let result = preprocess(src);
+        assert!(
+            result.python_source.starts_with("class Box[T]:"),
+            "expected `class Box[T]:` header; got:\n{}",
+            result.python_source
+        );
+        assert!(
+            result.frozen_class_lines.contains(&0),
+            "frozen_class_lines should record line 0; got: {:?}",
+            result.frozen_class_lines
+        );
+    }
+
+    #[test]
+    fn class_generic_then_frozen_with_bound_and_bases() {
+        // `[T: Bound]` keeps the bracket-list intact across the inner colon,
+        // and the bases tail after `frozen(Base):` is preserved verbatim.
+        let src = "class Box[T: int] frozen(Base):\n    value: T\n";
+        let result = preprocess(src);
+        assert!(
+            result
+                .python_source
+                .starts_with("class Box[T: int](Base):"),
+            "expected `class Box[T: int](Base):`; got:\n{}",
+            result.python_source
+        );
+        assert!(result.frozen_class_lines.contains(&0));
     }
 }
