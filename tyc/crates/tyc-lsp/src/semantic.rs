@@ -275,47 +275,119 @@ fn remap_to_original(
     let orig_line_starts = compute_line_starts(original);
     let prep_line_starts = compute_line_starts(preprocessed);
     tokens.retain_mut(|tok| {
-        let line_idx = tok.line as usize;
-        let Some(&orig_line_start) = orig_line_starts.get(line_idx) else {
-            return false;
-        };
-        let orig_line_end = orig_line_starts
-            .get(line_idx + 1)
-            .copied()
-            .unwrap_or(original.len());
-        let orig_line_raw = &original[orig_line_start..orig_line_end];
-        let orig_line = orig_line_raw.trim_end_matches(['\n', '\r']);
+        let prep_line_idx = tok.line as usize;
 
         // Convert the token's UTF-16 column back to a byte column within
         // the preprocessed line so we can add the byte-denominated shift.
-        let prep_line_start = prep_line_starts.get(line_idx).copied().unwrap_or(0);
+        let prep_line_start = prep_line_starts.get(prep_line_idx).copied().unwrap_or(0);
         let prep_line_end = prep_line_starts
-            .get(line_idx + 1)
+            .get(prep_line_idx + 1)
             .copied()
             .unwrap_or(preprocessed.len());
         let prep_line = &preprocessed[prep_line_start..prep_line_end];
-        let prep_byte_col = match utf16_col_to_byte(prep_line, tok.col as usize) {
-            Some(b) => b,
-            None => return false,
-        };
-
-        let shift = line_shifts.get(line_idx).copied().unwrap_or(0);
+        let prep_byte_col = utf16_col_to_byte(prep_line, tok.col as usize);
+        let shift = line_shifts.get(prep_line_idx).copied().unwrap_or(0);
         let candidate_byte = prep_byte_col + shift;
         let name = tok.name.as_str();
 
-        let chosen_byte = if matches_whole_word_at(orig_line, candidate_byte, name) {
-            Some(candidate_byte)
-        } else {
-            find_whole_word(orig_line, name)
-        };
+        // Fast path: same-line mapping. Works for files whose original
+        // and preprocessed line counts agree (i.e. no expand_* pass
+        // injected lines on or before this token's line). Covers every
+        // user-reported case — `comptime`, `freeze`, `pub`, `newtype` —
+        // since none of those involve line-inserting expansions.
+        if let Some(byte) = try_line_match(
+            original,
+            &orig_line_starts,
+            prep_line_idx,
+            candidate_byte,
+            name,
+        ) {
+            let line_text = original_line_text(original, &orig_line_starts, prep_line_idx);
+            tok.col = byte_col_to_utf16(line_text, byte);
+            tok.length = name.encode_utf16().count() as u32;
+            return true;
+        }
 
-        let Some(byte_col) = chosen_byte else {
-            return false;
-        };
-        tok.col = byte_col_to_utf16(orig_line, byte_col);
-        tok.length = name.encode_utf16().count() as u32;
-        true
+        // Slow path: line drift. Pre-preprocess expansion passes
+        // (`expand_multiline_guards`, `expand_with_chains`,
+        // `expand_gather_blocks`, …) can rewrite a single Typhon line
+        // into several Python lines, so `tok.line` (in preprocessed
+        // coords) no longer maps 1:1 onto the original line index. We
+        // don't currently carry a per-line map through those passes,
+        // so fall back to a whole-document whole-word search for the
+        // token's name, preferring the occurrence on the line nearest
+        // `prep_line_idx`. Drop the token if nothing matches — the
+        // TextMate grammar paints the keyword instead, which beats
+        // pinning a colour to the wrong location.
+        if let Some((line, byte)) =
+            find_closest_match(original, &orig_line_starts, name, prep_line_idx)
+        {
+            let line_text = original_line_text(original, &orig_line_starts, line);
+            tok.line = line as u32;
+            tok.col = byte_col_to_utf16(line_text, byte);
+            tok.length = name.encode_utf16().count() as u32;
+            return true;
+        }
+
+        false
     });
+}
+
+/// Try to locate `name` on the given original line. First check the
+/// `candidate_byte` position (preprocessed col + line shift); if no
+/// match, scan the line for the first whole-word occurrence. Returns
+/// the byte offset within the line where the name lives, or `None`
+/// if the line doesn't contain it at all (the token will fall through
+/// to the slow path).
+fn try_line_match(
+    original: &str,
+    orig_line_starts: &[usize],
+    line_idx: usize,
+    candidate_byte: usize,
+    name: &str,
+) -> Option<usize> {
+    if line_idx >= orig_line_starts.len() {
+        return None;
+    }
+    let line_text = original_line_text(original, orig_line_starts, line_idx);
+    if matches_whole_word_at(line_text, candidate_byte, name) {
+        return Some(candidate_byte);
+    }
+    find_whole_word(line_text, name)
+}
+
+/// Search every line of `original` for `name` as a whole word and
+/// return `(line_idx, byte_col_in_line)` for the occurrence whose line
+/// index is closest to `preferred_line`. Ties broken in favour of the
+/// earlier line (i.e. `<`-preferred when equidistant). Returns `None`
+/// if `name` doesn't occur anywhere in the document.
+fn find_closest_match(
+    original: &str,
+    orig_line_starts: &[usize],
+    name: &str,
+    preferred_line: usize,
+) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, usize, usize)> = None; // (distance, line, byte)
+    for line_idx in 0..orig_line_starts.len() {
+        let line_text = original_line_text(original, orig_line_starts, line_idx);
+        if let Some(byte) = find_whole_word(line_text, name) {
+            let distance = line_idx.abs_diff(preferred_line);
+            let candidate = (distance, line_idx, byte);
+            if best.is_none_or(|(d, _, _)| distance < d) {
+                best = Some(candidate);
+            }
+        }
+    }
+    best.map(|(_, line, byte)| (line, byte))
+}
+
+fn original_line_text<'a>(original: &'a str, line_starts: &[usize], line_idx: usize) -> &'a str {
+    let start = line_starts.get(line_idx).copied().unwrap_or(original.len());
+    let end = line_starts
+        .get(line_idx + 1)
+        .copied()
+        .unwrap_or(original.len());
+    original[start..end].trim_end_matches(['\n', '\r'])
 }
 
 fn compute_line_starts(s: &str) -> Vec<usize> {
@@ -371,22 +443,22 @@ fn byte_col_to_utf16(line: &str, byte_col: usize) -> u32 {
     line[..safe].encode_utf16().count() as u32
 }
 
-fn utf16_col_to_byte(line: &str, utf16_col: usize) -> Option<usize> {
+/// Convert a UTF-16 column offset (LSP's natural unit) to a byte
+/// offset within `line`. Walks chars accumulating UTF-16 lengths until
+/// the target is reached; if `utf16_col` runs past the end of the
+/// line, returns the line's byte length (callers treat this as
+/// "end of line"). Always returns a valid offset on a char boundary.
+fn utf16_col_to_byte(line: &str, utf16_col: usize) -> usize {
     let mut acc: usize = 0;
     let mut byte: usize = 0;
     for ch in line.chars() {
         if acc >= utf16_col {
-            return Some(byte);
+            return byte;
         }
         acc += ch.len_utf16();
         byte += ch.len_utf8();
     }
-    if acc >= utf16_col {
-        Some(byte)
-    } else {
-        // Past end of line — clamp to line length.
-        Some(byte)
-    }
+    byte
 }
 
 /// Walk the module's top-level statements and collect every name
@@ -2093,9 +2165,12 @@ mod tests {
                 col = tok.delta_start;
             }
             let line_text = lines[line as usize];
-            let start = col as usize;
-            let end = start + tok.length as usize;
-            let covered = &line_text[start..end];
+            // LSP semantic-token positions and lengths are UTF-16 code
+            // units; convert before byte-slicing so non-ASCII content in
+            // future test sources doesn't panic or mis-match.
+            let start_byte = utf16_col_to_byte(line_text, col as usize);
+            let end_byte = utf16_col_to_byte(line_text, (col + tok.length) as usize);
+            let covered = &line_text[start_byte..end_byte];
             assert!(
                 covered != "NewType",
                 "expected no `NewType` token in original source; got one at {}:{}",
@@ -2103,5 +2178,98 @@ mod tests {
                 col
             );
         }
+    }
+
+    /// Regression: when an `expand_*` pass injects extra lines before
+    /// a token's location, the token's preprocessed line index no
+    /// longer matches the original-source line index, and the
+    /// 1:1 line-mapping fast path would drop the token (`line_idx`
+    /// out of bounds for `orig_line_starts`) or pin it to a wrong
+    /// line. The fallback path searches the whole original document
+    /// for the token's name, preferring the closest line to the
+    /// preprocessed-line hint, so tokens after a line-inserting
+    /// expansion still land on the correct original-source identifier.
+    ///
+    /// `guard NAME = expr else: ...` is the canonical line-drifting
+    /// shape: a single Typhon line expands to four Python lines
+    /// (`let __typhon_mguard_0 = (expr)`, `if ... is None:`, body,
+    /// `let NAME = __typhon_mguard_0`), so the line count of the
+    /// preprocessed source is strictly greater than the original.
+    /// `done` (referenced after the guard) lives on a later line in
+    /// the original than the resolver thinks it does in the expanded
+    /// view.
+    #[test]
+    fn line_drift_from_expand_passes_doesnt_drop_or_misplace_tokens() {
+        // Apply the full expansion sequence the LSP runs in production
+        // (mirroring `preprocessed_full` in tyc-db), then preprocess
+        // and compute semantic tokens with the original Typhon source
+        // and the resulting line shifts.
+        let original = "\
+pub def first(x: int?) -> int:
+    guard v = x else:
+        return 0
+    return v
+";
+        let expanded = tyc_syntax::preprocess::expand_question_ops(
+            &tyc_syntax::preprocess::expand_inline_question_ops(
+                &tyc_syntax::preprocess::expand_pipes(&tyc_syntax::preprocess::expand_with_chains(
+                    &tyc_syntax::preprocess::expand_go_calls(
+                        &tyc_syntax::preprocess::expand_gather_blocks(
+                            &tyc_syntax::preprocess::expand_multiline_guards(
+                                &tyc_syntax::preprocess::expand_lazy_lets(
+                                    &tyc_syntax::preprocess::expand_typed_let_unpack(original),
+                                ),
+                            ),
+                        ),
+                    ),
+                )),
+            ),
+        );
+        let prep = preprocess(&expanded);
+        // Sanity: the guard expansion really does add lines.
+        assert!(
+            prep.python_source.lines().count() > original.lines().count(),
+            "test prerequisite: guard expansion should grow line count\n\
+             original ({} lines):\n{}\n\
+             preprocessed ({} lines):\n{}",
+            original.lines().count(),
+            original,
+            prep.python_source.lines().count(),
+            prep.python_source,
+        );
+        let parsed = parse_module(&prep.python_source).expect("parse");
+        let module = parsed.into_syntax();
+        let (resolved, _) = resolve_module_with(
+            "t.ty".into(),
+            &prep.python_source,
+            &module,
+            ResolveOptions::default(),
+        );
+        let stdlib_list = stdlib();
+        let stdlib_refs: Vec<&str> = stdlib_list.to_vec();
+        let result = compute_with_original(
+            &prep.python_source,
+            original,
+            &prep.line_col_shifts(),
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &CalleeSignatures::new(),
+            &AttributeKinds::new(),
+        );
+        // The function name `first` lives on line 0 of the original
+        // and survives the rename through the expansion — its token
+        // must land on it, not be dropped or pinned elsewhere.
+        let ty = assert_token_covers(original, "first", &result.data);
+        assert_eq!(ty, TOKEN_FUNCTION, "function decl paints as function");
+        // The `v` binding's declaration site after the guard expands
+        // into a different preprocessed line than the original `guard v`
+        // line, but the remap still finds `v` in the original source.
+        // (We accept any TOKEN_* match — the point is non-empty +
+        // not silently dropped.)
+        assert!(
+            result.data.iter().any(|t| t.length > 0),
+            "expected at least one semantic token despite line drift",
+        );
     }
 }

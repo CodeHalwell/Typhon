@@ -558,29 +558,32 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         // Pull the preprocessed source + resolved bindings + full
-        // preprocess result out of Salsa — all tracked queries, so the
-        // second call on an unchanged file is a cache hit. Cloning the
-        // `Arc` is cheap. The full result carries the per-line strip
-        // metadata the semantic-tokens remap pass needs to translate
-        // preprocessed-source columns back to original-source columns
-        // so colours land on the right characters when `pub` /
-        // `comptime` / `freeze` / `lazy` modifiers shifted them.
-        let (preprocessed, resolved, prep_full) = {
+        // preprocess result + raw on-disk text out of Salsa — all
+        // tracked queries, so the second call on an unchanged file is
+        // a cache hit. Cloning the `Arc` is cheap. The full result
+        // carries the per-line strip metadata the semantic-tokens
+        // remap pass needs to translate preprocessed-source columns
+        // back to original-source columns so colours land on the right
+        // characters when `pub` / `comptime` / `freeze` / `lazy`
+        // modifiers shifted them. `salsa_text` is the SourceFile's
+        // stored text — used as a fallback when the editor buffer
+        // entry has gone away (e.g. concurrent close); falling back to
+        // the *preprocessed* text would defeat the remap, since the
+        // whole point is to translate into the original Typhon source.
+        let (preprocessed, resolved, prep_full, salsa_text) = {
             let db = self.db.lock().await;
             (
                 preprocessed_text(&*db, sf),
                 resolved_module_arc(&*db, sf),
                 preprocessed_full(&*db, sf),
+                sf.text(&*db).clone(),
             )
         };
         // Original (pre-preprocess) source: read from the editor's open
         // buffer when we have it, fall back to the SourceFile's stored
-        // text. The semantic-tokens client uses this to render colours,
-        // so we want the freshest version of the buffer.
-        let original = self
-            .document_text(&uri)
-            .await
-            .unwrap_or_else(|| preprocessed.clone());
+        // Typhon text. The semantic-tokens client uses this to render
+        // colours, so we want the freshest version of the buffer.
+        let original = self.document_text(&uri).await.unwrap_or(salsa_text);
         let line_shifts = prep_full.0.line_col_shifts();
         // Parse the preprocessed source for the AST walk
         // (attribute-access tokens). `parse_module` is fast — the
