@@ -4,9 +4,11 @@
 //! deep-copy containers — matching Python semantics where `a = b` aliases
 //! mutable containers.
 //!
-//! Numeric ints use `i64` for v1. Overflow falls through to `i64::checked_*`
-//! and surfaces as an `OverflowError`. A future `num-bigint` upgrade is
-//! straightforward — most call sites already go through `Value::int_add` etc.
+//! Numeric ints use `num_bigint::BigInt` to match Python's arbitrary-precision
+//! semantics (FINDINGS #19). Before this, the VM stored ints as `i64` and
+//! tripped `OverflowError` on programs like `2 ** 100` that worked fine
+//! under CPython — making `tyc run` diverge from `tyc build && python`
+//! for any program that does big-number arithmetic.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -14,6 +16,8 @@ use std::fmt;
 use std::rc::Rc;
 
 use indexmap::IndexMap;
+use num_bigint::BigInt;
+use num_traits::{FromPrimitive, Signed, ToPrimitive, Zero};
 
 use crate::error::{type_error, value_error, Unwind};
 use ruff_python_ast::{Parameters, Stmt};
@@ -37,7 +41,7 @@ pub type RcStr = Rc<String>;
 pub enum HashKey {
     None,
     Bool(bool),
-    Int(i64),
+    Int(BigInt),
     Float(u64),
     Str(RcStr),
     Tuple(Rc<Vec<HashKey>>),
@@ -65,7 +69,7 @@ impl PartialEq for HashKey {
             (HashKey::Bool(a), HashKey::Bool(b)) => a == b,
             // Python: bool ↔ int comparison shares hash slot.
             (HashKey::Bool(a), HashKey::Int(b)) | (HashKey::Int(b), HashKey::Bool(a)) => {
-                (*a as i64) == *b
+                &BigInt::from(*a as i64) == b
             }
             (HashKey::Int(a), HashKey::Int(b)) => a == b,
             (HashKey::Float(a), HashKey::Float(b)) => a == b,
@@ -82,7 +86,9 @@ impl std::hash::Hash for HashKey {
         match self {
             HashKey::None => 0u8.hash(state),
             // bool/int collide intentionally — Python's `hash(True) == hash(1)`.
-            HashKey::Bool(b) => (*b as i64).hash(state),
+            // Reduce ints to i64 modulo for hashing parity with bool — values
+            // outside i64 still get a stable hash via the full BigInt.
+            HashKey::Bool(b) => BigInt::from(*b as i64).hash(state),
             HashKey::Int(i) => i.hash(state),
             HashKey::Float(bits) => bits.hash(state),
             HashKey::Str(s) => s.hash(state),
@@ -95,7 +101,7 @@ impl std::hash::Hash for HashKey {
 pub enum Value {
     None,
     Bool(bool),
-    Int(i64),
+    Int(BigInt),
     Float(f64),
     Str(RcStr),
     Bytes(Rc<Vec<u8>>),
@@ -245,7 +251,7 @@ impl fmt::Debug for Value {
         match self {
             Value::None => write!(f, "None"),
             Value::Bool(b) => write!(f, "{b:?}"),
-            Value::Int(i) => write!(f, "{i}"),
+            Value::Int(i) => write!(f, "{}", i.to_str_radix(10)),
             Value::Float(x) => write!(f, "{x:?}"),
             Value::Str(s) => write!(f, "{:?}", s.as_str()),
             Value::Bytes(b) => write!(f, "b{:?}", &b[..]),
@@ -331,7 +337,7 @@ impl Value {
         match self {
             Value::None => false,
             Value::Bool(b) => *b,
-            Value::Int(i) => *i != 0,
+            Value::Int(i) => !i.is_zero(),
             Value::Float(x) => *x != 0.0,
             Value::Str(s) => !s.is_empty(),
             Value::Bytes(b) => !b.is_empty(),
@@ -358,7 +364,7 @@ impl Value {
         match self {
             Value::None => Ok(HashKey::None),
             Value::Bool(b) => Ok(HashKey::Bool(*b)),
-            Value::Int(i) => Ok(HashKey::Int(*i)),
+            Value::Int(i) => Ok(HashKey::Int(i.clone())),
             Value::Float(x) => Ok(HashKey::Float(x.to_bits())),
             Value::Str(s) => Ok(HashKey::Str(s.clone())),
             Value::Tuple(items) => {
@@ -382,11 +388,11 @@ impl Value {
         match (self, other) {
             (None, None) => true,
             (Bool(a), Bool(b)) => a == b,
-            (Bool(a), Int(b)) | (Int(b), Bool(a)) => (*a as i64) == *b,
+            (Bool(a), Int(b)) | (Int(b), Bool(a)) => &BigInt::from(*a as i64) == b,
             (Bool(a), Float(b)) | (Float(b), Bool(a)) => (*a as i64 as f64) == *b,
             (Int(a), Int(b)) => a == b,
             (Float(a), Float(b)) => a == b,
-            (Int(a), Float(b)) | (Float(b), Int(a)) => (*a as f64) == *b,
+            (Int(a), Float(b)) | (Float(b), Int(a)) => bigint_eq_f64(a, *b),
             (Str(a), Str(b)) => a == b,
             (Bytes(a), Bytes(b)) => a == b,
             (List(a), List(b)) => {
@@ -418,11 +424,11 @@ impl Value {
         match (self, other) {
             (Int(a), Int(b)) => a.partial_cmp(b),
             (Float(a), Float(b)) => a.partial_cmp(b),
-            (Int(a), Float(b)) => (*a as f64).partial_cmp(b),
-            (Float(a), Int(b)) => a.partial_cmp(&(*b as f64)),
+            (Int(a), Float(b)) => bigint_cmp_f64(a, *b),
+            (Float(a), Int(b)) => bigint_cmp_f64(b, *a).map(|o| o.reverse()),
             (Bool(a), Bool(b)) => a.partial_cmp(b),
-            (Bool(a), Int(b)) => (*a as i64).partial_cmp(b),
-            (Int(a), Bool(b)) => a.partial_cmp(&(*b as i64)),
+            (Bool(a), Int(b)) => BigInt::from(*a as i64).partial_cmp(b),
+            (Int(a), Bool(b)) => a.partial_cmp(&BigInt::from(*b as i64)),
             (Str(a), Str(b)) => a.partial_cmp(b),
             (Tuple(a), Tuple(b)) => {
                 for (x, y) in a.iter().zip(b.iter()) {
@@ -448,9 +454,19 @@ impl Value {
         }
     }
 
+    /// Convert to a signed 64-bit integer. Used as the bridge between
+    /// Python-style arbitrary-precision ints and Rust APIs that need a
+    /// machine-sized integer (slicing, indexing, FFI). Values that
+    /// don't fit in `i64` produce an `OverflowError` rather than
+    /// silently truncating.
     pub fn to_int(&self) -> Result<i64, Unwind> {
         match self {
-            Value::Int(i) => Ok(*i),
+            Value::Int(i) => i.to_i64().ok_or_else(|| {
+                Unwind::Exception(crate::error::VmException::new(
+                    "OverflowError",
+                    "Python int too large to convert to C int",
+                ))
+            }),
             Value::Bool(b) => Ok(*b as i64),
             Value::Float(x) => Ok(*x as i64),
             Value::Str(s) => s
@@ -464,10 +480,28 @@ impl Value {
         }
     }
 
+    /// Convert to a `BigInt`. Use this when arithmetic should preserve
+    /// arbitrary precision (FINDINGS #19).
+    pub fn to_bigint(&self) -> Result<BigInt, Unwind> {
+        match self {
+            Value::Int(i) => Ok(i.clone()),
+            Value::Bool(b) => Ok(BigInt::from(*b as i64)),
+            Value::Float(x) => Ok(BigInt::from(*x as i64)),
+            Value::Str(s) => s
+                .trim()
+                .parse::<BigInt>()
+                .map_err(|_| value_error(format!("invalid literal for int(): {:?}", s.as_str()))),
+            _ => Err(type_error(format!(
+                "int() argument must be a string or a number, not '{}'",
+                self.type_name()
+            ))),
+        }
+    }
+
     pub fn to_float(&self) -> Result<f64, Unwind> {
         match self {
             Value::Float(x) => Ok(*x),
-            Value::Int(i) => Ok(*i as f64),
+            Value::Int(i) => Ok(bigint_to_f64(i)),
             Value::Bool(b) => Ok(*b as i64 as f64),
             Value::Str(s) => s.trim().parse::<f64>().map_err(|_| {
                 value_error(format!(
@@ -488,7 +522,7 @@ impl Value {
             Value::None => "None".into(),
             Value::Bool(true) => "True".into(),
             Value::Bool(false) => "False".into(),
-            Value::Int(i) => i.to_string(),
+            Value::Int(i) => i.to_str_radix(10),
             Value::Float(x) => format_float(*x),
             Value::Str(s) => (**s).clone(),
             Value::Bytes(b) => format!("b{:?}", String::from_utf8_lossy(b)),
@@ -625,6 +659,47 @@ fn python_repr_str(s: &str) -> String {
     out
 }
 
+/// Convert a `BigInt` to `f64`, losing precision for very large values
+/// the same way CPython does (`int → float` is a quiet "down-cast").
+pub fn bigint_to_f64(i: &BigInt) -> f64 {
+    if let Some(v) = i.to_f64() {
+        return v;
+    }
+    // Fallback for values too large for `to_f64` (shouldn't happen with
+    // num-bigint's impl, but stay defensive).
+    if i.is_negative() {
+        f64::NEG_INFINITY
+    } else {
+        f64::INFINITY
+    }
+}
+
+/// Compare a `BigInt` to an `f64`. Returns `None` if the float is NaN.
+pub fn bigint_cmp_f64(a: &BigInt, b: f64) -> Option<std::cmp::Ordering> {
+    if b.is_nan() {
+        return None;
+    }
+    let a_f = bigint_to_f64(a);
+    a_f.partial_cmp(&b)
+}
+
+/// `int == float` modelled after CPython: equal only when the float
+/// represents the same integer value exactly.
+pub fn bigint_eq_f64(a: &BigInt, b: f64) -> bool {
+    if !b.is_finite() {
+        return false;
+    }
+    if b.trunc() != b {
+        return false;
+    }
+    // Convert b to BigInt via the integral part.
+    let bi = match BigInt::from_f64(b) {
+        Some(v) => v,
+        None => return false,
+    };
+    a == &bi
+}
+
 fn format_float(x: f64) -> String {
     if x.is_nan() {
         return "nan".into();
@@ -673,7 +748,7 @@ mod tests {
         // CPython dataclass default `Ok(value=20)`. The two must match
         // so `tyc run` and `tyc run --compile` produce byte-identical
         // stdout for documented Result programs.
-        let v = Value::ResultOk(Box::new(Value::Int(20)));
+        let v = Value::ResultOk(Box::new(Value::Int(BigInt::from(20))));
         assert_eq!(v.py_repr(), "Ok(value=20)");
         let e = Value::ResultErr(Box::new(Value::Str(Rc::new("oops".to_owned()))));
         assert_eq!(e.py_repr(), "Err(error='oops')");

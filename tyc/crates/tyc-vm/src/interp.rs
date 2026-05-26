@@ -11,6 +11,9 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use indexmap::IndexMap;
+use num_bigint::BigInt;
+use num_integer::Integer;
+use num_traits::{Signed, ToPrimitive, Zero};
 use ruff_python_ast::{
     self as ast, BoolOp, CmpOp, ExceptHandler, Expr, FStringPart, InterpolatedStringElement,
     ModModule, Mutability, Number, Operator, Parameters, Pattern, Stmt, UnaryOp,
@@ -22,7 +25,8 @@ use crate::error::{
     vm_unsupported_use_compile, zero_division, Unwind, VmException,
 };
 use crate::value::{
-    Class, ClassField, DictMap, Function, HashKey, Instance, IterState, NativeFn, Value,
+    bigint_to_f64, Class, ClassField, DictMap, Function, HashKey, Instance, IterState, NativeFn,
+    Value,
 };
 
 pub struct Interpreter {
@@ -842,10 +846,17 @@ impl Interpreter {
             }
             Value::Range { start, stop, step } => match item {
                 Value::Int(i) => {
+                    let Some(i_small) = i.to_i64() else {
+                        return Ok(false);
+                    };
                     if *step > 0 {
-                        Ok(i >= start && i < stop && (i - start).rem_euclid(*step) == 0)
+                        Ok(i_small >= *start
+                            && i_small < *stop
+                            && (i_small - start).rem_euclid(*step) == 0)
                     } else if *step < 0 {
-                        Ok(i <= start && i > stop && (start - i).rem_euclid(-*step) == 0)
+                        Ok(i_small <= *start
+                            && i_small > *stop
+                            && (start - i_small).rem_euclid(-*step) == 0)
                     } else {
                         Ok(false)
                     }
@@ -1130,44 +1141,46 @@ impl Interpreter {
     pub fn binop(&mut self, l: &Value, op: Operator, r: &Value) -> Result<Value, Unwind> {
         use Operator::*;
         use Value::*;
-        // Fast-path numeric combinations.
+        // Fast-path numeric combinations. Integer ops now use `BigInt`
+        // (FINDINGS #19) so `2 ** 100`, `fib(99)`, and friends no longer
+        // overflow — matching Python's arbitrary-precision semantics.
         match (l, op, r) {
-            (Int(a), Add, Int(b)) => return a.checked_add(*b).map(Int).ok_or_else(overflow),
-            (Int(a), Sub, Int(b)) => return a.checked_sub(*b).map(Int).ok_or_else(overflow),
-            (Int(a), Mult, Int(b)) => return a.checked_mul(*b).map(Int).ok_or_else(overflow),
-            (Int(_), Div, Int(b)) if *b == 0 => return Err(zero_division()),
-            (Int(a), Div, Int(b)) => return Ok(Float(*a as f64 / *b as f64)),
-            (Int(_), FloorDiv, Int(b)) if *b == 0 => return Err(zero_division()),
-            (Int(a), FloorDiv, Int(b)) => return Ok(Int(a.div_euclid(*b))),
-            (Int(_), Mod, Int(b)) if *b == 0 => return Err(zero_division()),
-            (Int(a), Mod, Int(b)) => return Ok(Int(a.rem_euclid(*b))),
+            (Int(a), Add, Int(b)) => return Ok(Int(a + b)),
+            (Int(a), Sub, Int(b)) => return Ok(Int(a - b)),
+            (Int(a), Mult, Int(b)) => return Ok(Int(a * b)),
+            (Int(_), Div, Int(b)) if b.is_zero() => return Err(zero_division()),
+            (Int(a), Div, Int(b)) => return Ok(Float(bigint_to_f64(a) / bigint_to_f64(b))),
+            (Int(_), FloorDiv, Int(b)) if b.is_zero() => return Err(zero_division()),
+            (Int(a), FloorDiv, Int(b)) => return Ok(Int(a.div_floor(b))),
+            (Int(_), Mod, Int(b)) if b.is_zero() => return Err(zero_division()),
+            (Int(a), Mod, Int(b)) => return Ok(Int(a.mod_floor(b))),
             (Int(a), Pow, Int(b)) => {
-                if *b < 0 {
-                    return Ok(Float((*a as f64).powf(*b as f64)));
+                if b.is_negative() {
+                    return Ok(Float(bigint_to_f64(a).powf(bigint_to_f64(b))));
                 }
-                let exp = u32::try_from(*b).map_err(|_| overflow())?;
-                return a.checked_pow(exp).map(Int).ok_or_else(overflow);
+                // BigInt::pow takes a `u32`; for ridiculous exponents
+                // (10**million) we'd happily eat all the RAM, so cap at
+                // u32::MAX which is already astronomically more than
+                // Python tolerates before timing out.
+                let exp = b.to_u32().ok_or_else(overflow)?;
+                return Ok(Int(a.pow(exp)));
             }
             (Int(a), BitOr, Int(b)) => return Ok(Int(a | b)),
             (Int(a), BitAnd, Int(b)) => return Ok(Int(a & b)),
             (Int(a), BitXor, Int(b)) => return Ok(Int(a ^ b)),
             (Int(a), LShift, Int(b)) => {
-                if *b < 0 {
+                if b.is_negative() {
                     return Err(value_error("negative shift count"));
                 }
-                let shift = u32::try_from(*b).map_err(|_| overflow())?;
-                return a.checked_shl(shift).map(Int).ok_or_else(overflow);
+                let shift = b.to_usize().ok_or_else(overflow)?;
+                return Ok(Int(a << shift));
             }
             (Int(a), RShift, Int(b)) => {
-                if *b < 0 {
+                if b.is_negative() {
                     return Err(value_error("negative shift count"));
                 }
-                // Python's int >> N for very large N saturates toward 0 (or
-                // -1 for negatives). i64 only has 64 bits, so anything >= 64
-                // is equivalent to a full sign-extension.
-                let shift = u32::try_from(*b).unwrap_or(64);
-                let sat = if *a >= 0 { 0 } else { -1 };
-                return Ok(Int(a.checked_shr(shift).unwrap_or(sat)));
+                let shift = b.to_usize().unwrap_or(usize::MAX);
+                return Ok(Int(a >> shift));
             }
 
             (Float(a), Add, Float(b)) => return Ok(Float(a + b)),
@@ -1196,8 +1209,8 @@ impl Interpreter {
         }
         // Bool ↔ Int.
         if matches!((l, r), (Bool(_), Int(_) | Bool(_)) | (Int(_), Bool(_))) {
-            let a = l.to_int()?;
-            let b = r.to_int()?;
+            let a = l.to_bigint()?;
+            let b = r.to_bigint()?;
             return self.binop(&Int(a), op, &Int(b));
         }
 
@@ -1206,11 +1219,11 @@ impl Interpreter {
             return Ok(Str(Rc::new(format!("{}{}", a, b))));
         }
         if let (Str(a), Mult, Int(n)) = (l, op, r) {
-            let n = (*n).max(0) as usize;
+            let n = n.to_usize().unwrap_or(0);
             return Ok(Str(Rc::new(a.repeat(n))));
         }
         if let (Int(n), Mult, Str(a)) = (l, op, r) {
-            let n = (*n).max(0) as usize;
+            let n = n.to_usize().unwrap_or(0);
             return Ok(Str(Rc::new(a.repeat(n))));
         }
 
@@ -1226,7 +1239,7 @@ impl Interpreter {
             return Ok(Tuple(Rc::new(out)));
         }
         if let (List(a), Mult, Int(n)) = (l, op, r) {
-            let n = (*n).max(0) as usize;
+            let n = n.to_usize().unwrap_or(0);
             let mut out = Vec::with_capacity(a.borrow().len() * n);
             for _ in 0..n {
                 out.extend(a.borrow().iter().cloned());
@@ -1234,7 +1247,7 @@ impl Interpreter {
             return Ok(List(Rc::new(RefCell::new(out))));
         }
         if let (Tuple(a), Mult, Int(n)) = (l, op, r) {
-            let n = (*n).max(0) as usize;
+            let n = n.to_usize().unwrap_or(0);
             let mut out = Vec::with_capacity(a.len() * n);
             for _ in 0..n {
                 out.extend(a.iter().cloned());
@@ -1268,9 +1281,9 @@ impl Interpreter {
         match op {
             UnaryOp::Not => Ok(Value::Bool(!v.truthy())),
             UnaryOp::USub => match v {
-                Value::Int(i) => Ok(Value::Int(-*i)),
+                Value::Int(i) => Ok(Value::Int(-i)),
                 Value::Float(x) => Ok(Value::Float(-*x)),
-                Value::Bool(b) => Ok(Value::Int(-(*b as i64))),
+                Value::Bool(b) => Ok(Value::Int(BigInt::from(-(*b as i64)))),
                 _ => Err(type_error(format!(
                     "bad operand for unary -: '{}'",
                     v.type_name()
@@ -1278,12 +1291,12 @@ impl Interpreter {
             },
             UnaryOp::UAdd => match v {
                 Value::Int(_) | Value::Float(_) => Ok(v.clone()),
-                Value::Bool(b) => Ok(Value::Int(*b as i64)),
+                Value::Bool(b) => Ok(Value::Int(BigInt::from(*b as i64))),
                 _ => Err(type_error("bad operand for unary +")),
             },
             UnaryOp::Invert => match v {
-                Value::Int(i) => Ok(Value::Int(!*i)),
-                Value::Bool(b) => Ok(Value::Int(!(*b as i64))),
+                Value::Int(i) => Ok(Value::Int(!i)),
+                Value::Bool(b) => Ok(Value::Int(!BigInt::from(*b as i64))),
                 _ => Err(type_error("bad operand for unary ~")),
             },
         }
@@ -1334,7 +1347,7 @@ impl Interpreter {
                 let i = key.to_int()?;
                 let idx = normalize_index(i, b.len())
                     .ok_or_else(|| index_error("bytes index out of range"))?;
-                Ok(Value::Int(b[idx] as i64))
+                Ok(Value::Int(BigInt::from(b[idx] as i64)))
             }
             other => Err(type_error(format!(
                 "'{}' object is not subscriptable",
@@ -1691,7 +1704,7 @@ impl Interpreter {
                 if done {
                     Ok(None)
                 } else {
-                    let v = Value::Int(*current);
+                    let v = Value::Int(BigInt::from(*current));
                     *current += *step;
                     Ok(Some(v))
                 }
@@ -1756,7 +1769,10 @@ impl Interpreter {
                             _ => unreachable!(),
                         };
                         let _ = index; // appease the borrow checker — value above is correct
-                        return Ok(Some(Value::Tuple(Rc::new(vec![Value::Int(idx), v]))));
+                        return Ok(Some(Value::Tuple(Rc::new(vec![
+                            Value::Int(BigInt::from(idx)),
+                            v,
+                        ]))));
                     }
                     None => return Ok(None),
                 }
@@ -2286,7 +2302,17 @@ impl Interpreter {
 
 fn number_to_value(n: &Number) -> Value {
     match n {
-        Number::Int(i) => Value::Int(i.as_i64().unwrap_or(0)),
+        // Ruff exposes the source-spelled int via `as_str`, which is the
+        // safe path for values too big for `i64` (FINDINGS #19). Fall back
+        // to `as_i64` for the common small-literal case.
+        Number::Int(i) => {
+            if let Some(small) = i.as_i64() {
+                Value::Int(BigInt::from(small))
+            } else {
+                let s = format!("{i}");
+                Value::Int(s.parse::<BigInt>().unwrap_or_else(|_| BigInt::from(0)))
+            }
+        }
         Number::Float(x) => Value::Float(*x),
         Number::Complex { .. } => Value::None, // not supported
     }
@@ -2486,7 +2512,7 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
         fill = '0';
     }
 
-    let mut buf: String;
+    let buf: String;
     let mut prefix = String::new();
     let mut explicit_sign = String::new();
     match value {
@@ -2512,37 +2538,38 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
             }
         }
         Value::Int(i_val) => {
-            let (abs, neg) = (i_val.abs(), *i_val < 0);
+            let abs = i_val.abs();
+            let neg = i_val.is_negative();
             match typ {
                 Some('x') => {
-                    buf = format!("{:x}", abs);
+                    buf = abs.to_str_radix(16);
                     if alternate {
                         prefix.push_str("0x");
                     }
                 }
                 Some('X') => {
-                    buf = format!("{:X}", abs);
+                    buf = abs.to_str_radix(16).to_uppercase();
                     if alternate {
                         prefix.push_str("0X");
                     }
                 }
                 Some('b') => {
-                    buf = format!("{:b}", abs);
+                    buf = abs.to_str_radix(2);
                     if alternate {
                         prefix.push_str("0b");
                     }
                 }
                 Some('o') => {
-                    buf = format!("{:o}", abs);
+                    buf = abs.to_str_radix(8);
                     if alternate {
                         prefix.push_str("0o");
                     }
                 }
                 _ => {
                     buf = if comma {
-                        format_with_commas(abs)
+                        format_bigint_with_commas(&abs)
                     } else {
-                        abs.to_string()
+                        abs.to_str_radix(10)
                     };
                 }
             }
@@ -2599,17 +2626,16 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
     Ok(format!("{explicit_sign}{prefix}{buf}"))
 }
 
-fn format_with_commas(i: i64) -> String {
-    let s = i.abs().to_string();
+/// Comma-separate every third digit of a non-negative `BigInt`. Caller
+/// is responsible for prepending the sign — the body is sign-free.
+fn format_bigint_with_commas(i: &BigInt) -> String {
+    let s = i.to_str_radix(10);
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (k, c) in s.chars().rev().enumerate() {
         if k > 0 && k % 3 == 0 {
             out.push(',');
         }
         out.push(c);
-    }
-    if i < 0 {
-        out.push('-');
     }
     out.chars().rev().collect()
 }
@@ -2628,11 +2654,45 @@ mod vm_tests {
         (interp, res)
     }
 
+    /// FINDINGS #19 — `2 ** 100` and other big-integer arithmetic must
+    /// not overflow now that ints are `BigInt`-backed.
+    #[test]
+    fn bigint_pow_no_overflow() {
+        let src = r#"
+result = 2 ** 100
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        let v = interp.root.get("result").expect("defined");
+        assert_eq!(v.py_str(), "1267650600228229401496703205376");
+    }
+
+    #[test]
+    fn bigint_fib_99_no_overflow() {
+        let src = r#"
+def fib(n):
+    if n < 2:
+        return n
+    a = 0
+    b = 1
+    for _ in range(n - 1):
+        a, b = b, a + b
+    return b
+
+result = fib(99)
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        let v = interp.root.get("result").expect("defined");
+        // fib(99) = 218922995834555169026
+        assert_eq!(v.py_str(), "218922995834555169026");
+    }
+
     /// FINDINGS #20 — zero-pad, alternate-form, and width+precision for
     /// f-string format specs must match Python.
     #[test]
     fn fstring_zero_pad_and_alternate_form() {
-        let v = Value::Int(42);
+        let v = Value::Int(BigInt::from(42));
         assert_eq!(format_with_spec(&v, "42", "04d").unwrap(), "0042");
         assert_eq!(format_with_spec(&v, "42", "06").unwrap(), "000042");
         assert_eq!(format_with_spec(&v, "42", "#x").unwrap(), "0x2a");
@@ -2648,7 +2708,7 @@ mod vm_tests {
         // Combined: alternate-form hex with zero-pad and width.
         assert_eq!(format_with_spec(&v, "42", "#06x").unwrap(), "0x002a");
         // Negative numbers respect sign position with zero-pad.
-        let n = Value::Int(-7);
+        let n = Value::Int(BigInt::from(-7));
         assert_eq!(format_with_spec(&n, "-7", "04d").unwrap(), "-007");
         // Default formatting still works.
         assert_eq!(format_with_spec(&v, "42", "5").unwrap(), "   42");

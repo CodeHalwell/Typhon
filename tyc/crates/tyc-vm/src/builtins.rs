@@ -41,7 +41,7 @@ pub fn install(interp: &mut Interpreter) {
 
     native!("len", |_i, args| {
         let v = single(&args, "len")?;
-        Ok(Value::Int(value_len(v)? as i64))
+        Ok(Value::Int(num_bigint::BigInt::from(value_len(v)? as i64)))
     });
 
     native!("range", |_i, args| match args.len() {
@@ -78,7 +78,7 @@ pub fn install(interp: &mut Interpreter) {
 
     native!("int", |_i, args| {
         let v = single(&args, "int")?;
-        Ok(Value::Int(v.to_int()?))
+        Ok(Value::Int(v.to_bigint()?))
     });
 
     native!("float", |_i, args| {
@@ -170,9 +170,9 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("abs", |_i, args| match single(&args, "abs")? {
-        Value::Int(i) => Ok(Value::Int(i.abs())),
+        Value::Int(i) => Ok(Value::Int(num_traits::Signed::abs(i))),
         Value::Float(x) => Ok(Value::Float(x.abs())),
-        Value::Bool(b) => Ok(Value::Int(*b as i64)),
+        Value::Bool(b) => Ok(Value::Int(num_bigint::BigInt::from(*b as i64))),
         _ => Err(type_error("bad operand type for abs()")),
     });
 
@@ -185,7 +185,7 @@ pub fn install(interp: &mut Interpreter) {
                 .next()
                 .ok_or_else(|| type_error("sum() requires an iterable"))?,
         )?;
-        let mut acc = Value::Int(0);
+        let mut acc = Value::Int(num_bigint::BigInt::from(0));
         while let Some(v) = i.iter_next(&it)? {
             acc = i.binop(&acc, ruff_python_ast::Operator::Add, &v)?;
         }
@@ -352,7 +352,7 @@ pub fn install(interp: &mut Interpreter) {
             Value::Str(s) => {
                 let mut it = s.chars();
                 match (it.next(), it.next()) {
-                    (Some(c), None) => Ok(Value::Int(c as i64)),
+                    (Some(c), None) => Ok(Value::Int(num_bigint::BigInt::from(c as i64))),
                     _ => Err(type_error("ord() expected a single-character string")),
                 }
             }
@@ -361,14 +361,14 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("round", |_i, args| match args.first() {
-        Some(Value::Int(i)) => Ok(Value::Int(*i)),
+        Some(Value::Int(i)) => Ok(Value::Int(i.clone())),
         Some(Value::Float(x)) => match args.get(1) {
             Some(n) => {
                 let n = n.to_int()? as i32;
                 let p = 10f64.powi(n);
                 Ok(Value::Float((x * p).round() / p))
             }
-            None => Ok(Value::Int(x.round() as i64)),
+            None => Ok(Value::Int(num_bigint::BigInt::from(x.round() as i64))),
         },
         _ => Err(type_error("round() expected a number")),
     });
@@ -402,7 +402,7 @@ pub fn install(interp: &mut Interpreter) {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         key.hash(&mut h);
-        Ok(Value::Int(h.finish() as i64))
+        Ok(Value::Int(num_bigint::BigInt::from(h.finish() as i64)))
     });
 
     native!("id", |_i, args| {
@@ -428,7 +428,7 @@ pub fn install(interp: &mut Interpreter) {
             Value::Iter(it) => Rc::as_ptr(it) as usize,
             other => other as *const _ as usize,
         };
-        Ok(Value::Int(addr as i64))
+        Ok(Value::Int(num_bigint::BigInt::from(addr as i64)))
     });
 
     native!("callable", |_i, args| {
@@ -745,15 +745,17 @@ fn make_math_module() -> Value {
             (
                 "floor",
                 nf("floor", |_i, args| {
-                    Ok(Value::Int(
-                        single(&args, "floor")?.to_float()?.floor() as i64
-                    ))
+                    Ok(Value::Int(num_bigint::BigInt::from(
+                        single(&args, "floor")?.to_float()?.floor() as i64,
+                    )))
                 }),
             ),
             (
                 "ceil",
                 nf("ceil", |_i, args| {
-                    Ok(Value::Int(single(&args, "ceil")?.to_float()?.ceil() as i64))
+                    Ok(Value::Int(num_bigint::BigInt::from(
+                        single(&args, "ceil")?.to_float()?.ceil() as i64,
+                    )))
                 }),
             ),
             (
@@ -1014,7 +1016,9 @@ fn make_random_module() -> Value {
                         return Err(value_error("randint(a, b): b must be >= a"));
                     }
                     let span = (b - a + 1) as u64;
-                    Ok(Value::Int(a + (next_u64() % span) as i64))
+                    Ok(Value::Int(num_bigint::BigInt::from(
+                        a + (next_u64() % span) as i64,
+                    )))
                 }),
             ),
             (
@@ -1130,18 +1134,22 @@ fn str_method(
         "endswith" => Value::Bool(s.ends_with(&single(args, "endswith")?.py_str())),
         "find" => {
             let needle = single(args, "find")?.py_str();
-            Value::Int(s.find(&needle).map(|i| i as i64).unwrap_or(-1))
+            Value::Int(num_bigint::BigInt::from(
+                s.find(&needle).map(|i| i as i64).unwrap_or(-1),
+            ))
         }
         "rfind" => {
             let needle = single(args, "rfind")?.py_str();
-            Value::Int(s.rfind(&needle).map(|i| i as i64).unwrap_or(-1))
+            Value::Int(num_bigint::BigInt::from(
+                s.rfind(&needle).map(|i| i as i64).unwrap_or(-1),
+            ))
         }
         "count" => {
             let needle = single(args, "count")?.py_str();
             if needle.is_empty() {
-                Value::Int(s.chars().count() as i64 + 1)
+                Value::Int(num_bigint::BigInt::from(s.chars().count() as i64 + 1))
             } else {
-                Value::Int(s.matches(&needle).count() as i64)
+                Value::Int(num_bigint::BigInt::from(s.matches(&needle).count() as i64))
             }
         }
         "isdigit" => Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_digit())),
@@ -1236,14 +1244,14 @@ fn list_method(
                 .iter()
                 .position(|v| v.py_eq(&target))
                 .ok_or_else(|| value_error("list.index(x): x not in list"))?;
-            Ok(Value::Int(pos as i64))
+            Ok(Value::Int(num_bigint::BigInt::from(pos as i64)))
         }
         "count" => {
             let target = single(args, "count")?.clone();
             let l = l.borrow();
-            Ok(Value::Int(
-                l.iter().filter(|v| v.py_eq(&target)).count() as i64
-            ))
+            Ok(Value::Int(num_bigint::BigInt::from(
+                l.iter().filter(|v| v.py_eq(&target)).count() as i64,
+            )))
         }
         "clear" => {
             l.borrow_mut().clear();
@@ -1371,15 +1379,15 @@ fn tuple_method(t: &Rc<Vec<Value>>, name: &str, args: &[Value]) -> Result<Value,
     match name {
         "count" => {
             let target = single(args, "count")?;
-            Ok(Value::Int(
-                t.iter().filter(|v| v.py_eq(target)).count() as i64
-            ))
+            Ok(Value::Int(num_bigint::BigInt::from(
+                t.iter().filter(|v| v.py_eq(target)).count() as i64,
+            )))
         }
         "index" => {
             let target = single(args, "index")?;
             t.iter()
                 .position(|v| v.py_eq(target))
-                .map(|p| Value::Int(p as i64))
+                .map(|p| Value::Int(num_bigint::BigInt::from(p as i64)))
                 .ok_or_else(|| value_error("tuple.index(x): x not in tuple"))
         }
         _ => Err(attribute_error(format!("tuple has no method '{}'", name))),
@@ -1389,7 +1397,7 @@ fn tuple_method(t: &Rc<Vec<Value>>, name: &str, args: &[Value]) -> Result<Value,
 fn num_method(v: &Value, name: &str, _args: &[Value]) -> Result<Value, Unwind> {
     match (v, name) {
         (Value::Float(x), "is_integer") => Ok(Value::Bool(x.fract() == 0.0 && x.is_finite())),
-        (Value::Int(i), "bit_length") => Ok(Value::Int(64 - i.leading_zeros() as i64)),
+        (Value::Int(i), "bit_length") => Ok(Value::Int(num_bigint::BigInt::from(i.bits() as i64))),
         _ => Err(attribute_error(format!(
             "'{}' object has no method '{}'",
             v.type_name(),
@@ -1616,7 +1624,9 @@ impl<'a> JsonParser<'a> {
             ))
         } else {
             Ok(Value::Int(
-                slice.parse().map_err(|_| value_error("bad number"))?,
+                slice
+                    .parse::<num_bigint::BigInt>()
+                    .map_err(|_| value_error("bad number"))?,
             ))
         }
     }

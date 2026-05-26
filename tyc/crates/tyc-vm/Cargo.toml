@@ -11,6 +11,9 @@ ruff_python_parser = { workspace = true }
 tyc-syntax         = { workspace = true }
 thiserror          = { workspace = true }
 indexmap           = "2"
+num-bigint         = "0.4"
+num-traits         = "0.2"
+num-integer        = "0.1"
 
 [dev-dependencies]
 tempfile = { workspace = true }
