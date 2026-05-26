@@ -10,9 +10,12 @@ use std::path::PathBuf;
 use clap::Args;
 use miette::{miette, Result};
 
-use tyc_analyse::{analyse_purity, evaluate_comptime_with_functions, purity_diagnostics};
+use tyc_analyse::{
+    analyse_empty_collection_bindings, analyse_purity, analyse_secret_literal_bindings,
+    analyse_typing_alias_annotations, evaluate_comptime_with_functions, purity_diagnostics,
+};
 use tyc_db::{check_file_with_imports, extract_shapes_for_path, TycDatabase};
-use tyc_diagnostics::{Diagnostics, TycError};
+use tyc_diagnostics::{sanitised_named_source_for, Diagnostics, SanitisedDiagnostic, TycError};
 use tyc_emit::{compare_modules, StubTestKind};
 #[cfg(test)]
 use tyc_resolve::check_unknown_modules;
@@ -202,7 +205,26 @@ pub fn run(args: CheckArgs) -> Result<()> {
     let project_shapes = std::sync::Arc::new(shape_map);
 
     for root in &args.paths {
-        for path in collect_ty_files(root)? {
+        let ty_files = collect_ty_files(root)?;
+
+        // FINDINGS #39: when the user points `tyc check` at a single
+        // `.dty` stub file (e.g. `tyc check lib.dty`), the
+        // `.ty`-only collector silently returns an empty list and the
+        // run reports "checked 0 file(s)" with no explanation. Detect
+        // that case here and check the stub directly — this is the
+        // sensible default for a single-file invocation, even without
+        // `--stubs` (the flag scopes to *recursive stub discovery*
+        // inside a directory tree).
+        let direct_dty: Vec<PathBuf> = if ty_files.is_empty()
+            && root.is_file()
+            && root.extension().is_some_and(|e| e == "dty")
+        {
+            vec![root.clone()]
+        } else {
+            Vec::new()
+        };
+
+        for path in ty_files.into_iter().chain(direct_dty.into_iter()) {
             file_count += 1;
 
             let source = match std::fs::read_to_string(&path) {
@@ -376,7 +398,26 @@ pub fn run(args: CheckArgs) -> Result<()> {
     }
 
     if !args.quiet_success {
-        if diags.warning_count() > 0 {
+        if file_count == 0 {
+            // FINDINGS #39: a silent "checked 0 file(s)" leaves the
+            // user wondering whether the run actually did anything.
+            // Print an actionable hint pointing at what we looked for
+            // and at the `--stubs` flag (the recursive stub-discovery
+            // path), so the user sees that a directory of `.dty` files
+            // without any `.ty` siblings isn't picked up by default.
+            let display_paths: Vec<String> =
+                args.paths.iter().map(|p| p.display().to_string()).collect();
+            let joined = if display_paths.is_empty() {
+                ".".to_owned()
+            } else {
+                display_paths.join(", ")
+            };
+            println!(
+                "no checkable files in {joined}: looked for `.ty` source files. \
+                 To check stubs recursively, run `tyc check --stubs {joined}`; \
+                 to check a single `.dty` stub pass it directly."
+            );
+        } else if diags.warning_count() > 0 {
             println!(
                 "checked {} file(s) — {} warning(s)",
                 file_count,
@@ -404,18 +445,33 @@ fn render_diagnostics(diags: &Diagnostics) {
     let warnings_by_file = group_by_file(diags.warnings());
     let errors_by_file = group_by_file(diags.errors());
 
-    for (file, items) in &warnings_by_file {
-        eprintln!("── warnings in {} ──", file);
-        for w in items {
-            eprintln!("{:?}", miette::Report::new_boxed(Box::new((*w).clone())));
+    // FINDINGS #32: hand each diagnostic to a `SanitisedDiagnostic`
+    // wrapper before rendering so synthetic preprocess output
+    // (`class __typhon_impl_Foo(object):`, `from typhon_runtime
+    // import …`, the `?`-operator scaffolding) doesn't leak into the
+    // user-facing source listing. The wrapper preserves every other
+    // miette field — code, severity, labels, help — so the diagnostic
+    // reads identically apart from the cleaned source pane.
+    //
+    // Sanitise once per file: every diagnostic in `items` carries the
+    // same embedded source, so computing it per-diagnostic is
+    // O(n_diags × file_size) work. Compute once for the file group and
+    // clone the cleaned `NamedSource` into each wrapper.
+    let render_group = |label: &str, groups: &[(String, Vec<&TycError>)]| {
+        for (file, items) in groups {
+            eprintln!("── {} in {} ──", label, file);
+            let cached = items.first().and_then(|d| sanitised_named_source_for(d));
+            for d in items {
+                let wrapped = match cached.clone() {
+                    Some(src) => SanitisedDiagnostic::wrap_with_source((*d).clone(), src),
+                    None => SanitisedDiagnostic::wrap((*d).clone()),
+                };
+                eprintln!("{:?}", miette::Report::new_boxed(Box::new(wrapped)));
+            }
         }
-    }
-    for (file, items) in &errors_by_file {
-        eprintln!("── errors in {} ──", file);
-        for e in items {
-            eprintln!("{:?}", miette::Report::new_boxed(Box::new((*e).clone())));
-        }
-    }
+    };
+    render_group("warnings", &warnings_by_file);
+    render_group("errors", &errors_by_file);
 
     // Per-code tally + `tyc explain` hint. Only emitted when the file
     // produced at least one diagnostic — silence on clean runs.
@@ -865,6 +921,38 @@ fn run_secondary_passes(
     let purity_findings = analyse_purity(&module, false);
     let purity_diags = purity_diagnostics(&purity_findings, path, source);
     diags.extend(purity_diags);
+
+    // Empty-literal binding lint (`tyc::empty_collection_no_annotation`):
+    // a `let xs = []` with no annotation defaults to `list[Unknown]` and
+    // silently swallows later element-type mismatches. The pass walks the
+    // already-preprocessed module, so spans line up with `prep.python_source`.
+    diags.extend(analyse_empty_collection_bindings(
+        &module,
+        path,
+        &prep.python_source,
+    ));
+
+    // Typing-alias-in-annotation lint (`tyc::typing_alias_in_annotation`):
+    // the `typing.List` / `typing.Dict` / `Optional` / `Union` aliases are
+    // rejected on import but were silently accepted inside annotations as
+    // forward-reference names. Walk every annotation and surface the same
+    // migration advice.
+    diags.extend(analyse_typing_alias_annotations(
+        &module,
+        path,
+        &prep.python_source,
+    ));
+
+    // Secret-literal lint (`tyc::contains_secret_literal`, inline form):
+    // a `let API_TOKEN = "abc"` hard-codes a credential into the source.
+    // The existing comptime path inside `tyc build` only caught
+    // `comptime let X = env(...)`; this pass catches the plain-`let`
+    // form so the check fires in `tyc check` too.
+    diags.extend(analyse_secret_literal_bindings(
+        &module,
+        path,
+        &prep.python_source,
+    ));
 
     if let Some(ctx) = vetting_ctx {
         // AST node ranges are offsets into the *preprocessed* Python
@@ -1337,6 +1425,23 @@ mod tests {
             quiet_success: false,
         };
         assert!(run(args).is_err(), "type mismatch should be an error");
+    }
+
+    #[test]
+    fn check_accepts_direct_dty_file_without_stubs_flag() {
+        // FINDINGS #39: `tyc check lib.dty` used to silently report
+        // "checked 0 file(s)" because the `.ty`-only collector skipped
+        // the stub file. A single-file `.dty` invocation now resolves
+        // to a direct stub check.
+        let tmp = tempfile::tempdir().unwrap();
+        let dty = tmp.path().join("lib.dty");
+        std::fs::write(&dty, "def f(x: int) -> int: ...\n").unwrap();
+        let args = CheckArgs {
+            paths: vec![dty.clone()],
+            stubs: false,
+            quiet_success: false,
+        };
+        run(args).expect("direct .dty check should succeed");
     }
 
     #[test]

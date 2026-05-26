@@ -9,7 +9,14 @@ description = "Typhon tree-walking interpreter — runs .ty source directly with
 ruff_python_ast    = { workspace = true }
 ruff_python_parser = { workspace = true }
 tyc-syntax         = { workspace = true }
+tyc-desugar        = { workspace = true }
+tyc-analyse        = { workspace = true }
 thiserror          = { workspace = true }
+regex              = { workspace = true }
+indexmap           = { workspace = true }
+num-bigint         = { workspace = true }
+num-traits         = { workspace = true }
+num-integer        = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

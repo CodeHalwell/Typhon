@@ -828,6 +828,11 @@ struct Resolver<'a> {
     /// minimal form here unblocks the heterogeneous-error /
     /// `_load_or_default(...)` workaround R2-7 / R3-8 documented.
     uninit_let_spans: std::collections::HashSet<(usize, usize)>,
+    /// `(scope, name)` pairs where a `mut NAME = ...` / `let NAME = ...`
+    /// statement has been seen against an existing Parameter binding.
+    /// Subsequent bareword assignments to the same name in the same
+    /// scope are silenced from the v0.7.1 #16 parameter-rebinding check.
+    params_with_explicit_rebind: std::collections::HashSet<(ScopeId, String)>,
 }
 
 impl<'a> Resolver<'a> {
@@ -854,6 +859,7 @@ impl<'a> Resolver<'a> {
             preprocessed_line_starts: std::cell::OnceCell::new(),
             in_pattern: 0,
             uninit_let_spans: std::collections::HashSet::new(),
+            params_with_explicit_rebind: std::collections::HashSet::new(),
         }
     }
 
@@ -979,6 +985,29 @@ impl<'a> Resolver<'a> {
             // immutable_assign on a value still in scope — only the
             // loop-target-as-new direction is silenced here.
             if kind == BindingKind::Loop {
+                // FINDINGS v0.7.1 #11: a match-case pattern capture
+                // (`case Ok(value):`) reaches `declare` with
+                // `BindingKind::Loop` because patterns share the
+                // for/with/except path. The existing Loop early-return
+                // therefore swallowed the shadow check for these
+                // captures, even though shadowing an outer `let` is
+                // exactly the case the `tyc::pattern_shadows_outer`
+                // warning was designed for. Fire the diagnostic when we
+                // see this combination, *before* the silent return.
+                if self.in_pattern > 0 && existing.mutability == Mutability::Let {
+                    let decl_span = existing.span;
+                    if decl_span != span && self.seen_immutable_redecl.insert((decl_span, span)) {
+                        self.diagnostics.push_error(TycError::pattern_shadows_outer(
+                            name,
+                            &self.path,
+                            self.source,
+                            decl_span.0,
+                            decl_span.1.saturating_sub(decl_span.0).max(1),
+                            span.0,
+                            span.1.saturating_sub(span.0).max(1),
+                        ));
+                    }
+                }
                 return;
             }
             let _ = kind;
@@ -1652,6 +1681,52 @@ fn declare_target(
                             ));
                         }
                         return;
+                    }
+                }
+            }
+            // FINDINGS v0.7.1 #16: bareword reassignment to a function
+            // parameter must require `mut`. Parameters enter the function
+            // scope as Mutability::Mut (declare_arguments) so the existing
+            // immutable_assign path — which is gated on
+            // `existing.mutability == Let` — never fires. But Typhon's
+            // "rebinding needs an explicit kind" rule is supposed to apply
+            // here just as it does for `let` declarations. Emit
+            // immutable_assign when the user writes `x = ...` against an
+            // existing Parameter that hasn't already been re-declared with
+            // an explicit `let`/`mut` keyword inside the function body.
+            // `params_with_explicit_rebind` is updated below whenever a
+            // `mut x = ...` / `let x = ...` flows past a parameter; once
+            // recorded, subsequent bareword `x = ...` lines stay silent.
+            if ast_mutability.is_none() {
+                if let Some(existing) = r.lookup_local(scope, n.id.as_str()) {
+                    if existing.kind == BindingKind::Parameter
+                        && !r
+                            .params_with_explicit_rebind
+                            .contains(&(scope, n.id.as_str().to_owned()))
+                    {
+                        let decl_span = existing.span;
+                        if r.seen_immutable_redecl.insert((decl_span, span)) {
+                            r.diagnostics.push_error(TycError::immutable_assign(
+                                n.id.as_str(),
+                                &r.path,
+                                r.source,
+                                decl_span.0,
+                                decl_span.1.saturating_sub(decl_span.0).max(1),
+                                span.0,
+                                span.1.saturating_sub(span.0).max(1),
+                            ));
+                        }
+                        return;
+                    }
+                }
+            } else {
+                // FINDINGS v0.7.1 #16: record that this parameter has been
+                // explicitly re-declared so subsequent bareword
+                // assignments to the same name silence the check above.
+                if let Some(existing) = r.lookup_local(scope, n.id.as_str()) {
+                    if existing.kind == BindingKind::Parameter {
+                        r.params_with_explicit_rebind
+                            .insert((scope, n.id.as_str().to_owned()));
                     }
                 }
             }

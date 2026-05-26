@@ -4,6 +4,191 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.8.0 — 2026-05-26
+
+Stress-test sweep: closes 41 findings from a multi-file v0.7.1 stress
+report (`stress/v0.7.1-findings.md`) spanning the type checker, VM,
+parser, lowering passes, diagnostics, and CLI. The static surface picks
+up several long-missing guarantees (attribute access on class instances,
+interface parameter conformance, string-literal singleton types), the
+tree-walking VM gains arbitrary-precision integers + insertion-ordered
+dicts + a much larger native stdlib, and the parser learns five
+language-feature scaffolds the docs already advertised.
+
+### Added — type system
+
+- **`tyc::attribute_not_found` now fires on class instances and generic
+  classes**, not just `TypeVar`-bounded parameters. Was a documented
+  diagnostic with no firing site for the most common case. Foreign
+  base classes (any base not in the project shape registry) keep the
+  permissive degrade-to-`Unknown` behaviour so adapters around external
+  libraries don't get false positives. Skipped in `unsafe:` regions and
+  for `__dunder__` / leading-underscore names.
+- **Interface parameter type conformance.** `interface_missing_members`
+  now compares parameter types position-by-position (contravariant on
+  params) in addition to arity, so a `class BadRepo` claiming to
+  implement `interface Repo: def save(self, item: str) -> bool` with a
+  `def save(self, item: int) -> bool` impl is rejected at conformance
+  time.
+- **`Type::LitStr(String)` — string-literal singleton types.**
+  `type Color = "red" | "green" | "blue"` and `Literal["a", "b"]`
+  produce `LitStr` slots in the resulting `Union`, and assignability
+  rejects `paint("orange")` against `Color`. Bidirectional inference at
+  the call site widens string literals to `LitStr` only when the
+  expected type carries one, so unannotated `let s = "hi"` still
+  infers plain `str`.
+- **`?` propagation inside `with`-chains.** `result_error_mismatch`
+  now fires when the implicit return form of `with x = f()?: …`
+  routes a mismatching error type through the chain.
+- **`tyc::pattern_shadows_outer` fires** when a `match` capture binds
+  a name that already exists in the outer scope.
+- **`field_default_ordering` skips `ClassVar` fields.** `ClassVar` is
+  excluded from the synthesised `__init__`, so the
+  "non-default-after-default" rule shouldn't have penalised it.
+- **`newtype Foo = "literal"` is rejected** with the new
+  `tyc::newtype_invalid_base` diagnostic.
+- **Exhaustive-match-with-guards no longer fires `missing_return`**
+  when every variant has at least one (possibly-guarded) case. Pragmatic
+  heuristic — pathologically-incomplete guard cascades will no longer
+  be flagged.
+- **Function parameter rebinding requires `mut`**, matching the
+  `let`/`mut` rule everywhere else.
+
+### Added — parser & lowering
+
+- **HKT scaffold `class Functor[F[_]]:`** parses (the `[_]` marker
+  declares `F` as a 1-arg type constructor; the VM doesn't enforce
+  kind structure but the surface compiles).
+- **`impl[T] SealedUnionAlias[T]:` distributes the methods** across
+  every variant of the sealed-union alias. The synthetic
+  `__typhon_impl_*` class name no longer leaks into diagnostics.
+- **`class X[T] frozen:`** (generic + frozen) parses cleanly.
+- **`async def` in `interface`** bodies auto-completes the `: ...`
+  body (sync `def` already did).
+- **Outer-annotation tuple unpack** `let (a, b): tuple[int, str] = …`
+  is accepted (the per-element form `let (a: int, b: str) = …` was
+  the only form previously).
+
+### Added — VM (tree-walking interpreter)
+
+- **Arbitrary-precision integers.** `Value::Int` is now backed by
+  `num_bigint::BigInt` everywhere. `2 ** 100` and `fib(99)` no longer
+  overflow. **Behaviour change:** programs that relied on the VM's
+  silent i64 wrap-around will now produce mathematically-correct
+  results.
+- **Dict insertion order is preserved.** `RcDict` is now an
+  `indexmap::IndexMap`; `del d[k]` / `dict.pop` use `shift_remove`
+  to keep ordering stable. **Behaviour change:** the same `.ty` file
+  no longer prints dicts in a different order under `tyc run` vs
+  `tyc build && python build/main.py`.
+- **f-string format flags fully wired.** `0` zero-pad, `#`
+  alternate-form (`0x` / `0o` / `0b`), `[fill]align`, sign, width,
+  comma, precision, and type all match CPython output.
+- **Mapping match patterns** (`case {"type": "circle"}`, `case {…,
+  **rest}`) and sequence-with-star patterns (`case [x, *rest, y]`)
+  are implemented.
+- **Recursion limit raised to 1000** (was 256) to match CPython's
+  default.
+- **`yield` and `async def`** now emit a clear
+  `NotImplementedError` pointing at `tyc build && python` as the
+  fallback instead of crashing the interpreter.
+- **Extend-builtin rewrites apply in VM mode.** The VM pipeline now
+  runs the desugar pass + `rewrite_builtin_extension_calls` before
+  interpretation, so `extend str: def slug(...)` works under
+  `tyc run`.
+- **Subclass constructors inherit fields.** `class Dog(Animal):
+  breed: str` accepts `Dog(name=…, age=…, breed=…)`. Implemented in
+  desugar so the parent fields are propagated into the subclass body
+  before the synthesised `__init__` is generated.
+- **`freeze let` and `newtype` shims** (`__typhon_freeze__`,
+  `NewType`) are now native builtins so VM mode no longer crashes
+  with `NameError` on the lowered call.
+- **Larger native stdlib.** Adds `re`, `typing`, `collections`
+  (`OrderedDict`, `defaultdict`, `Counter`, `namedtuple`),
+  `functools` (`lru_cache`, `cache`, `cached_property`, `reduce`,
+  `partial`), `itertools` (`chain`, `count`, `cycle`, `accumulate`,
+  `combinations`, `permutations`, `product`, `islice`,
+  `takewhile`, `dropwhile`, `groupby`), `dataclasses`, and
+  `pathlib`. Caveats documented inline (some `re` flags accepted
+  but ignored; `defaultdict` has no auto-default; `count`/`cycle`
+  materialise bounded prefixes).
+- **`from typing import Callable`** no longer crashes — VM-mode
+  lowering strips pure-type imports.
+
+### Added — diagnostics & CLI
+
+- **Synthetic preprocess lines no longer leak into source listings.**
+  `SanitisedDiagnostic` wraps every emitted diagnostic and hides the
+  `class __typhon_impl_Foo(object):` / `from typhon_runtime import …`
+  / `?`-scaffolding lines, restoring the original text for the user.
+  Sanitisation is performed once per file, not once per diagnostic.
+- **Dedicated parse-error hints** for multi-line `|>` chains (wrap
+  in parens) and `freeze let` at non-module scope.
+- **`wrong_arg_count` rephrasing** for kw-only mismatches — the
+  self-contradictory "expected 2, got 2" message is replaced with
+  a "pass them by name" help block.
+- **Collection variance hint** suggests `Sequence[Animal]` /
+  `Mapping[K, V]` / `frozenset[T]` instead of the previously-unhelpful
+  "widen to `list[Animal] | list[Dog]`".
+- **Dict-to-model mismatch** points users at the constructor form
+  (`UserCreate(name=…, age=…, email=…)`).
+- **`tyc check lib.dty`** now accepts a single `.dty` file
+  directly and emits a meaningful "no checkable files" message.
+- **`tyc run --compile`** rejects single-file inputs up-front with
+  an actionable error.
+- **`tyc migrate`** strips trivial `__init__` methods and emits the
+  resulting class as plain `class` (not `class!`), preserving any
+  leading class docstring so CPython still sets `__doc__`.
+- **New lint warnings:**
+  - `tyc::empty_collection_no_annotation` for `let xs = []`,
+    `{}`, `set()` without an annotation or expected type.
+  - `tyc::typing_alias_in_annotation` for bare `List[…]`,
+    `Optional[…]`, `Dict[…]`, `Union[…]` in annotations
+    (consistent with the existing
+    `typing_alias_deprecated` import-level diagnostic).
+  - `tyc::contains_secret_literal` fires on inline string
+    literals named `*_(TOKEN|SECRET|PASSWORD|PWD|KEY|API_KEY)`.
+
+### Changed
+
+- **`unused_import` default severity is now `warn`** (was `error`).
+  Most linters treat unused imports as warnings; the previous default
+  required a cleanup pass on virtually every test. Set
+  `[strictness] unused-import = "error"` in `typhon.toml` to restore
+  the old default.
+- **`tyc-vm` external dependencies** (`indexmap`, `num-bigint`,
+  `num-integer`, `num-traits`, `regex`) are now declared in
+  `[workspace.dependencies]` to keep versions aligned across crates.
+
+### Fixed
+
+- **`re.match`** now anchors at the start of the string (was using
+  `Regex::find`, which matched anywhere).
+- **`bigint_cmp_f64`** compares `BigInt ↔ f64` without precision
+  loss for very large operands — previously routed through `f64`
+  and could return wrong-direction orderings near the f64 mantissa
+  boundary.
+- **`import typhon_runtime.freeze` binds the root module** to
+  `typhon_runtime` (per Python semantics), restoring access to
+  `typhon_runtime.Ok` / `.Err` after dotted imports.
+- **`HashKey` equality for `bool ↔ int`** no longer allocates a
+  fresh `BigInt` per lookup.
+- **`expand_impl_sealed_unions`** correctly emits a blank-line
+  separator between duplicated `impl` blocks and stops capturing
+  trailing top-level blank lines into the body.
+
+### Known limitations
+
+- **Numeric / bool literal singleton types** (`Literal[1, 2]`,
+  `Literal[True]`) still widen to `int` / `bool`. The `Type::LitStr`
+  variant covers strings only — numeric singletons are tracked
+  separately for a future round.
+- **VM `lazy let` inside a class** uses an identity decorator;
+  callers must use the method-call form `obj.x()`.
+- **Generators (`yield`) and `async def`** are still not executable
+  in the VM; the error message now points at `tyc build` as the
+  fallback.
+
 ## 0.7.1 — 2026-05-26
 
 Point release: fixes a long-standing semantic-tokens misalignment in

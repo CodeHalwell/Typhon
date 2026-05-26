@@ -11,8 +11,12 @@ use crate::config::TyphonConfig;
 ///
 /// Currently handles:
 /// - `unused-import`:
-///   - `"warn"`: `UnusedImport` diagnostics remain warnings.
-///   - `"error"` (default): `UnusedImport` diagnostics are promoted to errors.
+///   - `"warn"` (default): `UnusedImport` diagnostics remain warnings.
+///     (FINDINGS v0.7.1 #41 — was promoted to error by default in pre-0.7.1
+///     builds; almost every test required a cleanup pass, so the default
+///     was relaxed.)
+///   - `"error"`: `UnusedImport` diagnostics are promoted to errors so CI
+///     breaks on stale imports.
 /// - `methods-in-class-body`:
 ///   - `"warn"` (default): `MethodInClassBody` stays a warning.
 ///   - `"error"`: `MethodInClassBody` is promoted to an error so CI breaks

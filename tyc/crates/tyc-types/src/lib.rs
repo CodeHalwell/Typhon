@@ -85,6 +85,12 @@ pub enum Type {
     /// expects. A `TypeConstructor("List", 1)` represents a type constructor
     /// that takes one type argument (like `list` in `list[int]`).
     TypeConstructor(String, usize),
+    /// A string-literal singleton type. `type Color = "red" | "green"`
+    /// produces a `Union(LitStr("red"), LitStr("green"))`. Used to enforce
+    /// finite string-enum unions at call sites (FINDINGS v0.7.1 #13).
+    /// Assignability rules: `LitStr(s) → LitStr(s)` (equal), `LitStr(_) →
+    /// Str` (widens), and `Str → LitStr(_)` is REJECTED.
+    LitStr(String),
 }
 
 impl Type {
@@ -182,6 +188,7 @@ impl Type {
                 let placeholders = (0..*arity).map(|_| "_").collect::<Vec<_>>().join(", ");
                 format!("{}[{}]", name, placeholders)
             }
+            Type::LitStr(s) => format!("{:?}", s),
         }
     }
 }
@@ -225,6 +232,13 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
         // to flag.
         (Type::Int, Type::Bool) => true,
         (Type::Float, Type::Bool) => true,
+        // String-literal singletons (FINDINGS v0.7.1 #13). `LitStr(s)` is
+        // assignable to itself, to plain `Str` (widening), and (via the
+        // Union arms below) to any `Union` that contains the same literal.
+        // The reverse — `Str` flowing into `LitStr` — is REJECTED so that
+        // `paint("orange")` against `Color = "red" | "green"` fails.
+        (Type::LitStr(a), Type::LitStr(b)) => a == b,
+        (Type::Str, Type::LitStr(_)) => true,
         // Union/Union must come before the single-Union arms: every actual
         // variant has to be assignable to *some* expected variant. Falling
         // through to `(Union, other)` then `(other, Union)` recursively
@@ -919,6 +933,12 @@ pub fn type_from_annotation_with_params(
     type_params: &[String],
 ) -> Type {
     match expr {
+        // String-literal singletons in type position — e.g.
+        // `type Color = "red" | "green" | "blue"`. The BitOr arm below
+        // recurses through this case for each disjunct, so each literal
+        // becomes a `Type::LitStr` slot in the resulting `Type::Union`.
+        // FINDINGS v0.7.1 #13.
+        Expr::StringLiteral(s) => Type::LitStr(s.value.to_str().to_owned()),
         Expr::Name(n) => match n.id.as_str() {
             "int" => Type::Int,
             "str" => Type::Str,
@@ -987,19 +1007,27 @@ pub fn type_from_annotation_with_params(
                 };
                 return type_from_annotation_with_params(real, classes, type_params);
             }
-            // Literal["a", "b"] / Literal[1, 2] — narrow to the
-            // widened literal type (str / int / bool / bytes / None).
-            // FINDINGS #98.
+            // Literal["a", "b"] / Literal[1, 2] — string variants narrow
+            // to `Type::LitStr` singletons (FINDINGS v0.7.1 #13); other
+            // primitive literals widen to their base type (FINDINGS #98 —
+            // `Type::Literal` for ints / bools / bytes / None is tracked
+            // for the same v0.7.1 round but out of scope for #13).
             if head == "Literal" {
                 let variants: Vec<&Expr> = match s.slice.as_ref() {
                     Expr::Tuple(t) => t.elts.iter().collect(),
                     other => vec![other],
                 };
-                let widened: Vec<Type> = variants.into_iter().map(literal_widened_type).collect();
-                if widened.is_empty() {
+                let mapped: Vec<Type> = variants
+                    .into_iter()
+                    .map(|e| match e {
+                        Expr::StringLiteral(s) => Type::LitStr(s.value.to_str().to_owned()),
+                        other => literal_widened_type(other),
+                    })
+                    .collect();
+                if mapped.is_empty() {
                     return Type::Unknown;
                 }
-                return Type::union_of(widened);
+                return Type::union_of(mapped);
             }
             // Union[A, B, ...] / typing.Union[...]
             if head == "Union" {
@@ -2263,6 +2291,28 @@ impl<'a> Checker<'a> {
                     {
                         return false;
                     }
+                    // FINDINGS v0.7.1 #2: parameter-type conformance. The
+                    // implementer must accept at least every value the
+                    // interface promises, so each class parameter must be a
+                    // supertype of the corresponding interface parameter.
+                    // Unknown on either side is permissive (matches the
+                    // return-type rule). Self-referential interface params
+                    // are skipped to avoid recursion, mirroring the
+                    // return-type carve-out.
+                    let cmp_len = iface_sig.param_types.len().min(cls_sig.param_types.len());
+                    for i in 0..cmp_len {
+                        let ip = &iface_sig.param_types[i];
+                        let cp = &cls_sig.param_types[i];
+                        if matches!(ip, Type::Unknown) || matches!(cp, Type::Unknown) {
+                            continue;
+                        }
+                        if *ip == iface_class_type {
+                            continue;
+                        }
+                        if !self.is_assignable(cp, ip) {
+                            return false;
+                        }
+                    }
                 }
                 _ => return false,
             }
@@ -2344,6 +2394,28 @@ impl<'a> Checker<'a> {
         None
     }
 
+    /// Return `true` when every class in `cls_name`'s inheritance chain has a
+    /// recorded shape in `class_shapes`. Used by `attribute_not_found` emit
+    /// sites to stay lenient when a base class is foreign / unknown: if any
+    /// ancestor's members are not visible to the checker, we can't be
+    /// confident the attribute is truly missing.
+    fn class_hierarchy_fully_known(&self, cls_name: &str) -> bool {
+        let mut stack: Vec<&str> = vec![cls_name];
+        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        while let Some(name) = stack.pop() {
+            if !visited.insert(name) {
+                continue;
+            }
+            if !self.class_shapes.contains_key(name) {
+                return false;
+            }
+            if let Some(parents) = self.class_parents.get(name) {
+                stack.extend(parents.iter().map(String::as_str));
+            }
+        }
+        true
+    }
+
     /// Return the missing-member text for a failed interface conformance check.
     /// Returns `None` when the class actually conforms (caller should use
     /// `class_conforms_to_interface` to gate this call).
@@ -2368,6 +2440,31 @@ impl<'a> Checker<'a> {
                             iface_sig.return_type.display(),
                             cls_sig.return_type.display()
                         ));
+                    }
+                    // FINDINGS v0.7.1 #2: parameter-type mismatches were
+                    // silent before. Compare each position contravariantly
+                    // (class param must accept the interface param's type)
+                    // and surface the first mismatching index. Unknowns and
+                    // self-typed interface params are skipped.
+                    let cmp_len = iface_sig.param_types.len().min(cls_sig.param_types.len());
+                    for i in 0..cmp_len {
+                        let ip = &iface_sig.param_types[i];
+                        let cp = &cls_sig.param_types[i];
+                        if matches!(ip, Type::Unknown) || matches!(cp, Type::Unknown) {
+                            continue;
+                        }
+                        if *ip == iface_class_type {
+                            continue;
+                        }
+                        if !self.is_assignable(cp, ip) {
+                            missing.push(format!(
+                                "{m}(param {} type mismatch: expected `{}`, got `{}`)",
+                                i,
+                                ip.display(),
+                                cp.display(),
+                            ));
+                            break;
+                        }
                     }
                 }
                 Some(cls_sig) => missing.push(format!(
@@ -4116,19 +4213,27 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                 // Handle both plain `Name` bases and `Subscript` bases like
                 // `list[int]` — in the latter case the base name is the subscript
                 // value (e.g. `list`).
+                // Capture every base shape, including dotted attribute bases
+                // like `logging.Formatter` and other complex forms. The
+                // attribute / fallback cases stash a synthetic name that is
+                // guaranteed NOT to appear in `class_shapes`, so the
+                // hierarchy-known check used by `attribute_not_found` (and any
+                // other consumer) treats this class as having a foreign /
+                // unknown base — a key v0.7.1 #1 guard rail.
                 let parents: Vec<String> = cd
                     .bases()
                     .iter()
-                    .filter_map(|b| match b {
-                        Expr::Name(n) => Some(n.id.as_str().to_owned()),
+                    .map(|b| match b {
+                        Expr::Name(n) => n.id.as_str().to_owned(),
                         Expr::Subscript(s) => {
                             if let Expr::Name(n) = s.value.as_ref() {
-                                Some(n.id.as_str().to_owned())
+                                n.id.as_str().to_owned()
                             } else {
-                                None
+                                "__typhon_unknown_base__".to_owned()
                             }
                         }
-                        _ => None,
+                        Expr::Attribute(_) => "__typhon_unknown_base__".to_owned(),
+                        _ => "__typhon_unknown_base__".to_owned(),
                     })
                     .collect();
                 if !parents.is_empty() {
@@ -4169,6 +4274,30 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
     for stmt in body {
         if let Stmt::Assign(a) = stmt {
             if let Some((name, base_expr)) = extract_newtype_decl(a) {
+                // FINDINGS v0.7.1 #14: reject a newtype RHS that isn't a
+                // type expression. `newtype Bogus = "string literal"` and
+                // `newtype X = 42` (etc.) used to be silently accepted —
+                // the base just resolved to `Type::Unknown` and every
+                // downstream check then accepted any value. Detect the
+                // common non-type shapes (literal forms, lambda, call
+                // expressions other than `Result[...]`-style subscripts)
+                // and surface a dedicated diagnostic.
+                if let Some(kind) = non_type_expr_kind(&base_expr) {
+                    let span_start = base_expr.range().start().to_usize();
+                    let span_end = base_expr.range().end().to_usize();
+                    let span_len = span_end.saturating_sub(span_start).max(1);
+                    c.diagnostics.push_error(TycError::newtype_invalid_base(
+                        name.clone(),
+                        kind,
+                        &c.path,
+                        c.source,
+                        span_start,
+                        span_len,
+                    ));
+                    // Still register so downstream lookups don't panic.
+                    c.newtypes.insert(name, Type::Unknown);
+                    continue;
+                }
                 let base_ty = type_from_annotation_with_params(&base_expr, &classes, &[]);
                 c.newtypes.insert(name, base_ty);
             }
@@ -6074,6 +6203,18 @@ fn check_stmt(c: &mut Checker, stmt: &Stmt) {
                         let Expr::Name(target) = a.target.as_ref() else {
                             continue;
                         };
+                        // FINDINGS v0.7.1 #12: `ClassVar[...]` fields are
+                        // class-level constants, never participate in the
+                        // synthesised `__init__`, and therefore do not
+                        // contribute to positional argument ordering. Skip
+                        // them entirely — both as the "prior defaulted"
+                        // field that sets up the ordering rule and as the
+                        // "later non-defaulted" field that trips it. Detect
+                        // by inspecting the annotation for `ClassVar` /
+                        // `ClassVar[...]` shapes.
+                        if is_classvar_annotation(a.annotation.as_ref()) {
+                            continue;
+                        }
                         let name = target.id.as_str().to_owned();
                         if a.value.is_some() {
                             if prior_default.is_none() {
@@ -7860,16 +8001,49 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
     };
     if let Some(variants) = c.sealed_unions.get(class_name.as_str()).cloned() {
         let mut covered: HashSet<String> = HashSet::new();
+        let mut covered_with_guards: HashSet<String> = HashSet::new();
+        let mut has_guarded_wildcard = false;
         for case in cases {
-            if case.guard.is_some() {
-                continue;
+            if case.guard.is_none() {
+                if pattern_covers_class(c, &case.pattern, &class_name) {
+                    return true;
+                }
+                collect_matched_class_names(&case.pattern, &mut covered);
             }
-            if pattern_covers_class(c, &case.pattern, &class_name) {
-                return true;
+            // Also collect guarded coverage for the pragmatic
+            // exhaustive-with-guards relaxation below. FINDINGS v0.7.1 #15.
+            collect_matched_class_names(&case.pattern, &mut covered_with_guards);
+            // A guarded `case _:` / capture also signals intent to handle
+            // every leftover variant (e.g. `case other if cond: ...`).
+            if case.guard.is_some()
+                && matches!(
+                    &case.pattern,
+                    ruff_python_ast::Pattern::MatchAs(p) if p.pattern.is_none()
+                )
+            {
+                has_guarded_wildcard = true;
             }
-            collect_matched_class_names(&case.pattern, &mut covered);
         }
-        return variants.iter().all(|v| covered.contains(v));
+        if variants.iter().all(|v| covered.contains(v)) {
+            return true;
+        }
+        // FINDINGS v0.7.1 #15: when every sealed-union variant has at least
+        // one case in the match (even if guarded) AND/OR a guarded wildcard
+        // catches the remainder, the user's intent is clearly to handle
+        // every value. Guard predicates are arbitrary expressions so we
+        // cannot prove they're exhaustive in general — be pragmatic and
+        // trust the user. The tradeoff: a guard cascade with an unreachable
+        // gap (e.g. `case IntTok(0) if False: …`) will no longer surface
+        // `missing_return`. We accept that cost to eliminate the much
+        // louder false-positive on every guard-driven sealed-union match.
+        if (has_guarded_wildcard || variants.iter().all(|v| covered_with_guards.contains(v)))
+            && variants
+                .iter()
+                .any(|v| covered_with_guards.contains(v) && !covered.contains(v))
+        {
+            return true;
+        }
+        return false;
     }
     if cases
         .iter()
@@ -8218,6 +8392,222 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
 /// `dict.get(k)` which must return `V?`, not `V` — and is the right
 /// place to grow other built-in method types (`list.pop`, `str.find`,
 /// `re.match`, …) without scattering them across the inference engine.
+/// If `expr` is clearly not a type expression, return a short
+/// human-readable label for the offending shape. Returns `None` for
+/// anything that *could* be a type — bare `Name`s, `Subscript` of a
+/// name, `Attribute` (dotted), `BinOp(|)` unions, tuple-of-types — so
+/// the calling code stays conservative and only rejects obvious
+/// literal-as-base mistakes. FINDINGS v0.7.1 #14.
+fn non_type_expr_kind(expr: &Expr) -> Option<&'static str> {
+    match expr {
+        // Bare names (and forward-reference strings handled by the
+        // annotation lowering elsewhere) are always type-shaped.
+        Expr::Name(_)
+        | Expr::Subscript(_)
+        | Expr::Attribute(_)
+        | Expr::BinOp(_)
+        | Expr::Tuple(_)
+        | Expr::NoneLiteral(_) => None,
+        // String literal — only acceptable here if it's a forward
+        // reference to a type. Treat it as an invalid base; the existing
+        // `type_from_annotation_with_params` does NOT resolve string
+        // forward refs for `newtype` so accepting it would silently
+        // give `Type::Unknown` anyway.
+        Expr::StringLiteral(_) => Some("string literal"),
+        Expr::NumberLiteral(_) => Some("number literal"),
+        Expr::BooleanLiteral(_) => Some("boolean literal"),
+        Expr::BytesLiteral(_) => Some("bytes literal"),
+        Expr::List(_) => Some("list literal"),
+        Expr::Dict(_) => Some("dict literal"),
+        Expr::Set(_) => Some("set literal"),
+        Expr::Lambda(_) => Some("lambda expression"),
+        Expr::Call(_) => Some("call expression"),
+        _ => Some("expression"),
+    }
+}
+
+/// Return `true` when `ann` is the bare name `ClassVar` or a subscripted
+/// `ClassVar[...]` annotation. Used to skip the
+/// `tyc::field_default_ordering` check on class-level constants: they're
+/// excluded from the synthesised `__init__` and therefore have no impact
+/// on positional argument ordering. FINDINGS v0.7.1 #12.
+fn is_classvar_annotation(ann: &Expr) -> bool {
+    match ann {
+        Expr::Name(n) => n.id.as_str() == "ClassVar",
+        Expr::Subscript(s) => {
+            matches!(s.value.as_ref(), Expr::Name(n) if n.id.as_str() == "ClassVar")
+        }
+        _ => false,
+    }
+}
+
+/// Return `true` when `head` is the name of a builtin generic container that
+/// the checker treats as having a closed attribute set (so an unknown attribute
+/// on `xs: list[int]` is a legitimate `tyc::attribute_not_found` site rather
+/// than a "may have dynamic attrs" pass-through). FINDINGS v0.7.1 #1.
+fn is_builtin_generic_head(head: &str) -> bool {
+    matches!(
+        head,
+        "list" | "dict" | "set" | "tuple" | "str" | "bytes" | "frozenset"
+    )
+}
+
+/// Return `true` when `attr` is a known method on the CPython builtin
+/// container named `head`. The list is intentionally conservative — only
+/// public, stable methods are listed; new entries can be added as needed.
+/// Used by the `attribute_not_found` emit so `xs.append(...)` on
+/// `list[int]` still passes while `xs.fake_method()` is rejected.
+/// FINDINGS v0.7.1 #1.
+fn is_known_builtin_generic_attr(head: &str, attr: &str) -> bool {
+    match head {
+        "list" => matches!(
+            attr,
+            "append"
+                | "extend"
+                | "insert"
+                | "remove"
+                | "pop"
+                | "clear"
+                | "index"
+                | "count"
+                | "sort"
+                | "reverse"
+                | "copy"
+        ),
+        "dict" => matches!(
+            attr,
+            "get"
+                | "keys"
+                | "values"
+                | "items"
+                | "pop"
+                | "popitem"
+                | "update"
+                | "setdefault"
+                | "clear"
+                | "copy"
+                | "fromkeys"
+        ),
+        "set" | "frozenset" => matches!(
+            attr,
+            "add"
+                | "remove"
+                | "discard"
+                | "pop"
+                | "clear"
+                | "copy"
+                | "union"
+                | "intersection"
+                | "difference"
+                | "symmetric_difference"
+                | "update"
+                | "intersection_update"
+                | "difference_update"
+                | "symmetric_difference_update"
+                | "issubset"
+                | "issuperset"
+                | "isdisjoint"
+        ),
+        "tuple" => matches!(attr, "count" | "index"),
+        "str" => matches!(
+            attr,
+            "lower"
+                | "upper"
+                | "title"
+                | "capitalize"
+                | "casefold"
+                | "swapcase"
+                | "strip"
+                | "lstrip"
+                | "rstrip"
+                | "split"
+                | "rsplit"
+                | "splitlines"
+                | "join"
+                | "replace"
+                | "find"
+                | "rfind"
+                | "index"
+                | "rindex"
+                | "count"
+                | "startswith"
+                | "endswith"
+                | "format"
+                | "format_map"
+                | "encode"
+                | "isalpha"
+                | "isalnum"
+                | "isdigit"
+                | "isdecimal"
+                | "isnumeric"
+                | "isspace"
+                | "isupper"
+                | "islower"
+                | "istitle"
+                | "isidentifier"
+                | "isprintable"
+                | "isascii"
+                | "center"
+                | "ljust"
+                | "rjust"
+                | "zfill"
+                | "expandtabs"
+                | "partition"
+                | "rpartition"
+                | "removeprefix"
+                | "removesuffix"
+                | "translate"
+                | "maketrans"
+        ),
+        "bytes" => matches!(
+            attr,
+            "decode"
+                | "find"
+                | "rfind"
+                | "index"
+                | "rindex"
+                | "count"
+                | "startswith"
+                | "endswith"
+                | "replace"
+                | "split"
+                | "rsplit"
+                | "splitlines"
+                | "strip"
+                | "lstrip"
+                | "rstrip"
+                | "lower"
+                | "upper"
+                | "title"
+                | "capitalize"
+                | "swapcase"
+                | "translate"
+                | "maketrans"
+                | "isalpha"
+                | "isalnum"
+                | "isdigit"
+                | "isspace"
+                | "isupper"
+                | "islower"
+                | "istitle"
+                | "isascii"
+                | "hex"
+                | "fromhex"
+                | "join"
+                | "partition"
+                | "rpartition"
+                | "removeprefix"
+                | "removesuffix"
+                | "center"
+                | "ljust"
+                | "rjust"
+                | "zfill"
+                | "expandtabs"
+        ),
+        _ => false,
+    }
+}
+
 fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
     let Type::Generic(head, args) = recv else {
         return None;
@@ -8336,14 +8726,23 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
 /// `result_error_mismatch` check wouldn't see `Err[E]` vs
 /// `Result[T, E_outer]`.
 /// `true` when `expr` is a bare reference to a `?`-operator temporary
-/// (`__typhon_q_N__`). These names are synthesised by the preprocessor's
-/// [`tyc_syntax::expand_question_ops`] pass; a `return __typhon_q_N__`
-/// statement is therefore guaranteed to come from a `?` lowering, never
-/// from user-written code (the leading double underscore is reserved).
+/// (`__typhon_q_N__`) or a default-propagating `with`-chain temporary
+/// (`__typhon_with_N__`). Both names are synthesised by the preprocessor
+/// — `expand_question_ops` emits the former and `expand_with_chains`
+/// emits the latter — and a `return <name>` statement on either is the
+/// lowered shape of the user's `?` propagation. The reserved
+/// `__typhon_…__` prefix is never produced by user code.
+///
+/// FINDINGS v0.7.1 #5: previously this helper only matched the `?`
+/// operator's temporaries, so `result_error_mismatch` never fired when
+/// the same propagation was written inside a `with`-chain
+/// (`with x = fetch(id)?: return Ok(x)` on a function returning a
+/// different `Result` error type).
 fn is_question_op_temp(expr: &Expr) -> bool {
     if let Expr::Name(n) = expr {
         let s = n.id.as_str();
-        return s.starts_with("__typhon_q_") && s.ends_with("__");
+        return (s.starts_with("__typhon_q_") || s.starts_with("__typhon_with_"))
+            && s.ends_with("__");
     }
     false
 }
@@ -8588,7 +8987,25 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             Number::Float(_) => Type::Float,
             Number::Complex { .. } => Type::Unknown,
         },
-        Expr::StringLiteral(_) => Type::Str,
+        // Bidirectional inference for string literals (FINDINGS v0.7.1 #13).
+        // When the expected type is — or contains — a `LitStr`, infer the
+        // expression as `LitStr` so `paint("red")` against
+        // `Color = "red" | "green"` matches the union slot. Otherwise stay
+        // `Str` to avoid surprising the user with literal types in
+        // unannotated bindings (`let s = "hi"` should still be `str`).
+        Expr::StringLiteral(s) => {
+            let value = s.value.to_str().to_owned();
+            let wants_literal = match expected.map(|t| c.unwrap_alias(t)) {
+                Some(Type::LitStr(_)) => true,
+                Some(Type::Union(vs)) => vs.iter().any(|v| matches!(v, Type::LitStr(_))),
+                _ => false,
+            };
+            if wants_literal {
+                Type::LitStr(value)
+            } else {
+                Type::Str
+            }
+        }
         Expr::BytesLiteral(_) => Type::Bytes,
         Expr::NoneLiteral(_) => Type::None,
         Expr::Name(n) => {
@@ -9482,6 +9899,41 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             if let Some(method_type) = builtin_generic_method(&recv, attr_name) {
                 return method_type;
             }
+            // Builtin generic heads (list / dict / set / tuple / str / bytes /
+            // frozenset) that hit `builtin_generic_method` and got `None` are a
+            // legitimate `attribute_not_found` site — e.g. `xs.fake_method()` on
+            // `xs: list[int]`. We consult an allowlist of well-known builtin
+            // methods first because `builtin_generic_method` only specialises
+            // a handful (`dict.get`, the Result combinators, …) — every other
+            // real method (`list.append`, `str.lower`) would otherwise be
+            // mis-flagged. Underscore-prefixed attrs and `unsafe:` blocks are
+            // skipped, matching the conservative class-instance behaviour
+            // below. FINDINGS v0.7.1 #1.
+            if let Type::Generic(head, _) = &recv {
+                if is_builtin_generic_head(head)
+                    && c.unsafe_depth == 0
+                    && !attr_name.starts_with('_')
+                    && !is_known_builtin_generic_attr(head, attr_name)
+                {
+                    let attr_start = a.attr.range.start().to_usize();
+                    let attr_len = a
+                        .attr
+                        .range
+                        .end()
+                        .to_usize()
+                        .saturating_sub(attr_start)
+                        .max(1);
+                    c.diagnostics.push_error(TycError::attribute_not_found(
+                        attr_name,
+                        head.as_str(),
+                        &c.path,
+                        c.source,
+                        attr_start,
+                        attr_len,
+                    ));
+                    return Type::Unknown;
+                }
+            }
             // Bare-import dotted access: when the receiver resolves
             // to `Type::Module(name)`, look the attribute up in the
             // project shape registry. A matching class returns
@@ -9570,7 +10022,38 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     if let Some(field_type) = c.find_field(class_name.as_str(), attr_name) {
                         return field_type.clone();
                     }
-                    // Not found — class may have dynamic attrs; no error.
+                    // FINDINGS v0.7.1 #1: attribute is genuinely missing. Emit
+                    // `tyc::attribute_not_found` when (a) we're not inside an
+                    // `unsafe:` block, (b) the attribute name doesn't start
+                    // with an underscore (private convention — too noisy and
+                    // dunder/`__init__` style names are often emitted by the
+                    // desugar pass), and (c) every base in the class's
+                    // hierarchy is in `class_shapes` so we're confident the
+                    // attribute is truly absent rather than hidden behind a
+                    // foreign / unknown base. Span the attribute-name token
+                    // (not the whole expression) to match the TypeVar arm's
+                    // existing style.
+                    if c.unsafe_depth == 0
+                        && !attr_name.starts_with('_')
+                        && c.class_hierarchy_fully_known(class_name.as_str())
+                    {
+                        let attr_start = a.attr.range.start().to_usize();
+                        let attr_len = a
+                            .attr
+                            .range
+                            .end()
+                            .to_usize()
+                            .saturating_sub(attr_start)
+                            .max(1);
+                        c.diagnostics.push_error(TycError::attribute_not_found(
+                            attr_name,
+                            class_name.as_str(),
+                            &c.path,
+                            c.source,
+                            attr_start,
+                            attr_len,
+                        ));
+                    }
                     Type::Unknown
                 }
                 // R3-15 (2026-05-25): `s: Stream[int]` calling
@@ -9640,6 +10123,35 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                             .zip(args.iter().cloned())
                             .collect();
                         return substitute_typevars(field_type, &bindings);
+                    }
+                    // FINDINGS v0.7.1 #1: same emit logic as the `Type::Class`
+                    // arm, but skip when the head is a builtin generic
+                    // (`list`/`dict`/…) — that path is handled by the
+                    // dedicated builtin emit above. For user-defined generic
+                    // classes (`Box[int]`, `Stream[T]`), apply the same
+                    // safety rails: skip in `unsafe:`, skip underscored attrs,
+                    // skip when any base in the hierarchy is unknown.
+                    if !is_builtin_generic_head(class_name.as_str())
+                        && c.unsafe_depth == 0
+                        && !attr_name.starts_with('_')
+                        && c.class_hierarchy_fully_known(class_name.as_str())
+                    {
+                        let attr_start = a.attr.range.start().to_usize();
+                        let attr_len = a
+                            .attr
+                            .range
+                            .end()
+                            .to_usize()
+                            .saturating_sub(attr_start)
+                            .max(1);
+                        c.diagnostics.push_error(TycError::attribute_not_found(
+                            attr_name,
+                            class_name.as_str(),
+                            &c.path,
+                            c.source,
+                            attr_start,
+                            attr_len,
+                        ));
                     }
                     Type::Unknown
                 }
@@ -10049,6 +10561,9 @@ fn operand_is_unflaggable(t: &Type) -> bool {
         Type::Union(_) => true,
         Type::Generic(_, args) => args.iter().any(operand_is_unflaggable),
         Type::Int | Type::Str | Type::Bool | Type::Float | Type::Bytes | Type::None => false,
+        // `Type::LitStr` is a string-singleton — same operand semantics as
+        // `Type::Str` for arithmetic / comparison flagging purposes.
+        Type::LitStr(_) => false,
         // Module references can't be operands of arithmetic / comparison.
         // Producing the diagnostic here would surprise users; downstream
         // arithmetic on a `Type::Module` value is already nonsense and
@@ -10513,6 +11028,60 @@ mod tests {
             &prep.unsafe_lines,
             &prep.frozen_class_lines,
         )
+    }
+
+    /// Like `check`, but merges the resolver's diagnostics into the
+    /// returned bundle so tests can assert on resolver-level codes
+    /// (e.g. `tyc::pattern_shadows_outer`, `tyc::immutable_assign`).
+    /// Note: the resolver may surface its own unrelated noise
+    /// (`unknown_name`, `unused_import`) so callers using this helper
+    /// should target their assertions to the specific code under test
+    /// or sanitise the source up front.
+    fn check_with_resolver(src: &str) -> Diagnostics {
+        let prep = preprocess(src);
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .unwrap()
+            .into_syntax();
+        let (resolved, resolver_diags) =
+            resolve_module("<test>".to_owned(), &prep.python_source, &module);
+        let mut diags = check_module_with(
+            "<test>",
+            &prep.python_source,
+            &resolved,
+            &module,
+            &prep.unsafe_lines,
+            &prep.frozen_class_lines,
+        );
+        diags.extend(resolver_diags);
+        diags
+    }
+
+    /// Like `check`, but also runs the upstream sugar passes the real CLI
+    /// chains (`with`-chain, `gather`, `go`, multi-line guards, lazy
+    /// imports, typed-let-unpack, `?` operator). Tests that need a feature
+    /// outside the plain `preprocess` slice — e.g. `with name = f()?:`
+    /// — use this helper instead. Mirrors `expand_for_check` in
+    /// `tyc/src/commands/check.rs`.
+    fn check_full(src: &str) -> Diagnostics {
+        check(&expand_for_test(src))
+    }
+
+    /// Combination of `check_full` and `check_with_resolver`.
+    fn check_full_with_resolver(src: &str) -> Diagnostics {
+        check_with_resolver(&expand_for_test(src))
+    }
+
+    fn expand_for_test(src: &str) -> String {
+        use tyc_syntax::preprocess::{
+            expand_gather_blocks, expand_go_calls, expand_inline_question_ops, expand_lazy_imports,
+            expand_multiline_guards, expand_pipes, expand_question_ops, expand_typed_let_unpack,
+            expand_with_chains,
+        };
+        expand_question_ops(&expand_inline_question_ops(&expand_pipes(
+            &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
+                &expand_multiline_guards(&expand_lazy_imports(&expand_typed_let_unpack(src))),
+            ))),
+        )))
     }
 
     #[test]
@@ -16279,6 +16848,350 @@ def f() -> int:
             result,
             Type::Generic("T".to_string(), vec![Type::Str]),
             "non-Class binding must not replace Generic head; got {result:?}"
+        );
+    }
+
+    // ── v0.7.1 stress-test findings ───────────────────────────────────────────
+
+    /// FINDINGS v0.7.1 #1: attribute access on a `Type::Class` instance.
+    /// `f.y` on a known class must fire `attribute_not_found`.
+    #[test]
+    fn v071_attribute_not_found_on_class_instance() {
+        let src = "\
+class Foo:
+    x: int
+
+def main() -> None:
+    let f: Foo = Foo(x=1)
+    print(f.y)
+";
+        let d = check(src);
+        assert!(
+            d.errors().iter().any(|e| {
+                let m = e.to_string();
+                m.contains("attribute_not_found") || m.contains("'y'") || m.contains("`y`")
+            }),
+            "expected attribute_not_found for `f.y`; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #1: builtin generics — `xs.fake_method()` on
+    /// `xs: list[int]` must fire `attribute_not_found`.
+    #[test]
+    fn v071_attribute_not_found_on_builtin_generic() {
+        let src = "\
+def main() -> None:
+    let xs: list[int] = [1, 2, 3]
+    print(xs.fake_method())
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| e.to_string().contains("fake_method")),
+            "expected attribute_not_found for `xs.fake_method()` on list[int]; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #1: real methods on builtin generics must still work.
+    #[test]
+    fn v071_real_builtin_generic_method_unaffected() {
+        let src = "\
+def main() -> None:
+    let xs: list[int] = [1, 2, 3]
+    xs.append(4)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "list.append must still resolve; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #16: assignment to a function parameter without a
+    /// `mut` keyword must fire `tyc::immutable_assign`. Parameters are
+    /// implicitly immutable bindings — the same rule that applies to
+    /// `let x = ...` must apply to `def f(x: int): x = ...`.
+    #[test]
+    fn v071_parameter_rebind_without_mut_fires() {
+        let src = "\
+def f(x: int) -> int:
+    x = x + 1
+    return x
+";
+        let d = check_with_resolver(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ImmutableAssign { .. })),
+            "parameter rebind without mut must fire immutable_assign; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #16: `mut x = ...` against a parameter is allowed
+    /// (the user is opting in to rebinding).
+    #[test]
+    fn v071_parameter_rebind_with_mut_accepted() {
+        let src = "\
+def f(x: int) -> int:
+    mut x = x + 1
+    return x
+";
+        let d = check_with_resolver(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::ImmutableAssign { .. })),
+            "parameter rebind with explicit mut must not fire; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #15: exhaustive guards on a sealed union must not
+    /// fire `missing_return`. Reasoning about guards is hard so we settle
+    /// for the pragmatic "every variant has at least one case + a guarded
+    /// wildcard for the remainder" rule.
+    #[test]
+    fn v071_exhaustive_guards_no_missing_return() {
+        let src = "\
+class IntTok:
+    v: int
+
+type Token = IntTok
+
+def classify(t: Token) -> str:
+    match t:
+        case IntTok(v=0):
+            return \"zero\"
+        case IntTok() if True:
+            return \"non-zero\"
+        case _:
+            return \"unreachable\"
+";
+        let d = check(src);
+        assert!(
+            !d.errors().iter().any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "guarded sealed-union match with a wildcard tail must not fire missing_return; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #13: string-literal union types (`"red" | "green"
+    /// | "blue"`) reject string values that aren't one of the literals.
+    /// Backed by the `Type::LitStr` variant and a bidirectional
+    /// inference rule in `infer_expr_ctx`: a string-literal expression
+    /// is inferred as `LitStr(value)` only when the expected type contains
+    /// at least one `LitStr` slot (so `let s = "hi"` still infers `str`).
+    #[test]
+    fn v071_string_literal_union_rejects_non_member() {
+        let src = "\
+type Color = \"red\" | \"green\" | \"blue\"
+
+def paint(c: Color) -> None:
+    pass
+
+def main() -> None:
+    paint(\"orange\")
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "string-literal union must reject non-member; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #14: `newtype Foo = "any string literal"` must be
+    /// rejected — `newtype`'s RHS must be a type, not a value.
+    #[test]
+    fn v071_newtype_string_literal_rejected() {
+        let src = "newtype Bogus = \"any string literal\"\n";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NewtypeInvalidBase { .. })),
+            "newtype with string-literal RHS must fire newtype_invalid_base; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #14: a valid `newtype X = int` is still accepted.
+    #[test]
+    fn v071_newtype_valid_base_still_accepted() {
+        let src = "newtype UserId = int\n";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::NewtypeInvalidBase { .. })),
+            "newtype with valid type RHS must not fire; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #12: `ClassVar` fields are excluded from the
+    /// synthesised `__init__`, so they must not trigger
+    /// `tyc::field_default_ordering`.
+    #[test]
+    fn v071_field_default_ordering_skips_classvar() {
+        let src = "\
+class Config:
+    DEFAULT_PORT: ClassVar[int] = 8080
+    host: str
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::FieldDefaultOrdering { .. })),
+            "ClassVar must not trip field_default_ordering; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #12: bare `ClassVar` (no subscript) also skipped.
+    #[test]
+    fn v071_field_default_ordering_skips_bare_classvar() {
+        let src = "\
+class Config:
+    flag: ClassVar = True
+    host: str
+";
+        let d = check(src);
+        assert!(
+            !d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::FieldDefaultOrdering { .. })),
+            "bare ClassVar must not trip field_default_ordering; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #12: the rule still fires for ordinary fields.
+    #[test]
+    fn v071_field_default_ordering_still_fires_on_regular_fields() {
+        let src = "\
+class Config:
+    port: int = 8080
+    host: str
+";
+        let d = check(src);
+        assert!(
+            d.errors()
+                .iter()
+                .any(|e| matches!(e, TycError::FieldDefaultOrdering { .. })),
+            "regular non-default-after-default must still fire; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #11: a match-case pattern capture that shadows an
+    /// outer `let` must fire `tyc::pattern_shadows_outer`.
+    #[test]
+    fn v071_pattern_shadows_outer_fires() {
+        let src = "\
+def main() -> None:
+    let value: int = 42
+    let r: Result[int, str] = Ok(1)
+    match r:
+        case Ok(value):
+            print(value)
+        case Err(_):
+            pass
+";
+        let d = check_full_with_resolver(src);
+        assert!(
+            d.errors().iter().any(|e| {
+                let m = e.to_string();
+                m.contains("pattern_shadows_outer") || m.contains("shadow")
+            }),
+            "expected pattern_shadows_outer; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #5: `?` error-type mismatch inside a default-
+    /// propagating `with`-chain. `fetch` returns `Result[str, int]` so the
+    /// implicit `return Err(...)` would violate the outer `Result[str, str]`.
+    #[test]
+    fn v071_with_chain_error_mismatch_fires() {
+        let src = "\
+def fetch(id: int) -> Result[str, int]:
+    return Ok(\"data\")
+
+def combine(id: int) -> Result[str, str]:
+    with name = fetch(id)?:
+        return Ok(name)
+";
+        let d = check_full(src);
+        assert!(
+            d.has_errors(),
+            "with-chain `?` error mismatch must fire; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #2: interface parameter-type mismatches were silent.
+    /// A class whose method has the right name and arity but wrong param
+    /// type must NOT satisfy the interface.
+    #[test]
+    fn v071_interface_param_type_mismatch_rejected() {
+        let src = "\
+interface Repo:
+    def save(self, item: str) -> bool: ...
+
+class BadRepo:
+    pass
+
+impl BadRepo:
+    def save(self, item: int) -> bool:
+        return True
+
+def use(r: Repo) -> None:
+    pass
+
+def main() -> None:
+    use(BadRepo())
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "interface param-type mismatch must be flagged; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+        assert!(
+            d.errors().iter().any(|e| {
+                let m = e.to_string();
+                m.contains("save") || m.contains("Repo")
+            }),
+            "diagnostic should reference the interface or method; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #1: foreign / unknown base classes suppress the check
+    /// (we can't see the base's attribute set). Subclassing `Exception` is the
+    /// canonical foreign-base case.
+    #[test]
+    fn v071_attribute_not_found_skipped_on_unknown_base() {
+        let src = "\
+class MyError(Exception):
+    pass
+
+def main() -> None:
+    let e: MyError = MyError()
+    print(e.args)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "attribute access on a class with a foreign base must be lenient; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
     }
 }

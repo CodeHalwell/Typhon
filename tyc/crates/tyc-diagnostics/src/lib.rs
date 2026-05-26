@@ -20,11 +20,23 @@ pub enum TycError {
     Io { path: String, cause: String },
 
     /// The source file could not be parsed as a valid Typhon/Python program.
+    ///
+    /// The optional `suggestion` field is populated by [`TycError::parse`]
+    /// when the underlying Python parser message matches a known
+    /// Typhon-specific construct (multi-line `|>` chain without parens,
+    /// `freeze let` inside a function, …). Those constructs go through
+    /// the preprocess pipeline before the parser sees them, so the raw
+    /// parser message ("Unexpected indentation", "Simple statements must
+    /// be separated by newlines or semicolons") is meaningless to a
+    /// Typhon user. The hint redirects them to the correct form.
+    /// FINDINGS #34, #35.
     #[error("parse error in '{path}'")]
     #[diagnostic(code(tyc::parse), url("https://typhon.dev/lang/diagnostics/parse"))]
     Parse {
         path: String,
         message: String,
+        #[help]
+        suggestion: Option<String>,
         #[source_code]
         src: NamedSource<String>,
         #[label("{message}")]
@@ -281,15 +293,26 @@ pub enum TycError {
     },
 
     /// A value of one type was used where another type was expected.
+    ///
+    /// The `#[help]` slot carries the suggestion, computed at construction
+    /// time so it can adapt to the concrete shape of `expected` /
+    /// `actual`. The default phrasing ("change the value or widen the
+    /// annotation to `T | U`") is sound but unhelpful for the common
+    /// invariant-collection case — `list[Dog]` flowing into a
+    /// `list[Animal]` parameter shouldn't suggest `list[Animal] |
+    /// list[Dog]`, it should suggest `Sequence[Animal]` (the covariant
+    /// read-only view) or rebinding the source as `list[Animal]`.
+    /// FINDINGS #37.
     #[error("type mismatch: expected `{expected}`, found `{actual}`")]
     #[diagnostic(
         code(tyc::type_mismatch),
-        url("https://typhon.dev/lang/diagnostics/type_mismatch"),
-        help("change the value so it produces `{expected}`, or widen the annotation to `{expected} | {actual}` if both are intended")
+        url("https://typhon.dev/lang/diagnostics/type_mismatch")
     )]
     TypeMismatch {
         expected: String,
         actual: String,
+        #[help]
+        suggestion: String,
         #[source_code]
         src: NamedSource<String>,
         #[label("expected `{expected}`")]
@@ -406,6 +429,15 @@ pub enum TycError {
     },
 
     /// A function was called with the wrong number of positional arguments.
+    ///
+    /// Special-case: when `expected == actual` the literal "expected N,
+    /// got N" reads as a self-contradiction. This shape appears when the
+    /// upstream type-checker bumps `expected` to include keyword-only
+    /// parameters (so the count comparison passes if you sum
+    /// positional + kw-only) but the user passed every argument
+    /// positionally. The diagnostic rephrases for that case via the
+    /// `#[help]` slot so the user sees "pass them by name" instead of
+    /// "expected 2, got 2". FINDINGS #36.
     #[error("wrong number of arguments to `{name}`: expected {expected}, got {actual}")]
     #[diagnostic(
         code(tyc::arg_count),
@@ -415,6 +447,13 @@ pub enum TycError {
         name: String,
         expected: usize,
         actual: usize,
+        /// Optional help string populated by the constructor when the
+        /// count-equal case fires. `Some("function `f` declares some
+        /// parameters as keyword-only; pass them by name (e.g.
+        /// `f(a=1, b=2)`)")` for kw-only mismatch; `None` otherwise so
+        /// miette skips the help block.
+        #[help]
+        suggestion: Option<String>,
         #[source_code]
         src: NamedSource<String>,
         #[label("called with {actual} argument(s) here")]
@@ -599,8 +638,17 @@ pub enum TycError {
     },
 
     /// An imported name is never used in the module.
+    ///
+    /// Default severity is **warn** — almost every linter treats unused
+    /// imports as a stylistic nit rather than a hard error, and bare
+    /// `tyc check` should match that expectation. Codebases that want to
+    /// keep their imports rigorously pruned can flip `[strictness]
+    /// unused-import = "error"` in `typhon.toml` to promote the
+    /// diagnostic back into an error via
+    /// [`crate::commands::util::apply_strictness`]. FINDINGS #41.
     #[error("imported name '{name}' is never used")]
     #[diagnostic(
+        severity(Warning),
         code(tyc::unused_import),
         url("https://typhon.dev/lang/diagnostics/unused_import"),
         help("remove the import, or prefix it with `_` if it is intentionally unused")
@@ -1145,6 +1193,29 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A `newtype Foo = <expr>` whose RHS isn't a recognised type
+    /// expression (it's a string literal, number, function call, …).
+    /// `newtype` is a nominal alias of an existing type, so the RHS
+    /// must name a type — not a value. FINDINGS v0.7.1 #14.
+    #[error("`newtype {name}` base must be a type, not `{base_kind}`")]
+    #[diagnostic(
+        code(tyc::newtype_invalid_base),
+        url("https://typhon.dev/lang/diagnostics/newtype_invalid_base"),
+        help(
+            "the right-hand side of `newtype {name} = …` must be a type \
+             (e.g. `int`, `str`, `list[int]`, `MyClass`); replace the \
+             literal/expression with an actual type name"
+        )
+    )]
+    NewtypeInvalidBase {
+        name: String,
+        base_kind: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("not a valid type")]
+        span: SourceSpan,
+    },
+
     /// A `let NAME: T` binding declared without an initialiser is
     /// read on a control-flow path where no preceding statement
     /// assigned it. R3-8's definite-assignment pass surfaces the
@@ -1304,6 +1375,71 @@ pub enum TycError {
         help("Replace `comptime let {name} = env(...)` with a runtime lookup such as `os.environ[\"{env_key}\"]`.")
     )]
     ContainsSecretLiteral { name: String, env_key: String },
+
+    /// A plain `let` / module-level binding whose name matches the
+    /// secret-suffix heuristic (`*KEY`, `*TOKEN`, `*PASSWORD`, `*SECRET`,
+    /// `*PWD`, `*API_KEY`) is initialised from a raw string literal
+    /// instead of an environment lookup. Committing such a literal hard-
+    /// codes a credential into the source tree.
+    #[error("binding `{name}` looks like a credential but is initialised from a string literal")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::contains_secret_literal),
+        url("https://typhon.dev/lang/diagnostics/contains_secret_literal"),
+        help("Read the value at runtime via `os.environ[\"{name}\"]` or `os.getenv(\"{name}\")` instead of hard-coding a literal.")
+    )]
+    SecretLiteralInline {
+        name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("hard-coded secret-shaped value")]
+        span: SourceSpan,
+    },
+
+    /// A `let` or `mut` binding whose RHS is an empty collection literal
+    /// (`[]`, `{}`, `set()`) has no type annotation, so its element type
+    /// defaults to `Unknown` (effectively `Any`) and silences any later
+    /// element-type mismatch.
+    #[error("empty {literal} without a type annotation defaults to `Unknown` and disables element-type checking")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::empty_collection_no_annotation),
+        url("https://typhon.dev/lang/diagnostics/empty_collection_no_annotation"),
+        help("Add an explicit annotation, e.g. `let {name}: list[int] = []`, so the element type is checked.")
+    )]
+    EmptyCollectionNoAnnotation {
+        name: String,
+        /// Human-readable name of the literal: "list literal `[]`",
+        /// "dict literal `{}`", or "set literal `set()`". Used in the
+        /// error message so users immediately recognise the offending form.
+        literal: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("annotate this binding to fix")]
+        span: SourceSpan,
+    },
+
+    /// A type annotation references a deprecated `typing.<Name>` alias by
+    /// name (`List[int]`, `Dict[str, int]`, `Optional[int]`,
+    /// `Union[int, str]`, …) even though the import is rejected. The
+    /// reference is silently accepted as a forward-reference name; this
+    /// warning surfaces the inconsistency so users migrate to the
+    /// built-in lowercase forms (`list`, `dict`, `T?`, `A | B`).
+    #[error("`{name}` in an annotation is the deprecated `typing.{name}` alias")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::typing_alias_in_annotation),
+        url("https://typhon.dev/lang/diagnostics/typing_alias_in_annotation"),
+        help("Use `{suggestion}` instead — the deprecated `typing.{name}` alias is rejected on import and should not be used in annotations either.")
+    )]
+    TypingAliasInAnnotation {
+        name: String,
+        suggestion: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("prefer `{suggestion}` here")]
+        span: SourceSpan,
+    },
 }
 
 impl TycError {
@@ -1323,6 +1459,14 @@ impl TycError {
     }
 
     /// Construct a [`TycError::Parse`] from a parser error.
+    ///
+    /// The raw `message` from the Python parser is fed verbatim into
+    /// the label, but [`parse_error_hint`] inspects it (plus the
+    /// surrounding source) to recover a Typhon-specific suggestion
+    /// for known shapes: multi-line `|>` chains without parens
+    /// (FINDINGS #34) and `freeze let` inside a function
+    /// (FINDINGS #35). Anything unrecognised falls through with
+    /// `suggestion = None` so miette omits the help block.
     pub fn parse(
         path: impl Into<String>,
         source: impl Into<String>,
@@ -1332,11 +1476,13 @@ impl TycError {
         let path = path.into();
         let source = source.into();
         let message = message.into();
+        let suggestion = parse_error_hint(&message, &source, offset);
         let span = SourceSpan::new(SourceOffset::from(offset), 0usize);
         Self::Parse {
             src: NamedSource::new(path.clone(), source),
             path,
             message,
+            suggestion,
             span,
         }
     }
@@ -1493,6 +1639,13 @@ impl TycError {
     }
 
     /// Construct a [`TycError::TypeMismatch`] diagnostic.
+    ///
+    /// The help text is computed at construction time. For the common
+    /// invariant-collection case (`list[Sub]` flowing into `list[Super]`,
+    /// likewise `dict`/`set`) the suggestion points at the covariant
+    /// read-only view (`Sequence[Super]` / `Mapping[K, V]`) instead of
+    /// the unhelpful "widen to `list[Super] | list[Sub]`" union which is
+    /// never what the user wants. FINDINGS #37.
     pub fn type_mismatch(
         expected: impl Into<String>,
         actual: impl Into<String>,
@@ -1501,9 +1654,13 @@ impl TycError {
         offset: usize,
         length: usize,
     ) -> Self {
+        let expected: String = expected.into();
+        let actual: String = actual.into();
+        let suggestion = type_mismatch_help(&expected, &actual);
         Self::TypeMismatch {
-            expected: expected.into(),
-            actual: actual.into(),
+            expected,
+            actual,
+            suggestion,
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }
@@ -1605,6 +1762,15 @@ impl TycError {
     }
 
     /// Construct a [`TycError::WrongArgCount`] diagnostic.
+    ///
+    /// When `expected == actual` the rendered message reads "expected N,
+    /// got N", which is self-contradictory at the headline level. The
+    /// upstream checker produces this shape when the call site passed
+    /// every argument positionally but some of the parameters are
+    /// keyword-only — the count comparison sums positional + kw-only,
+    /// so it passes if you ignore the calling-convention mismatch.
+    /// In that case the constructor populates the `#[help]` field with
+    /// "pass them by name" so the user gets actionable advice. FINDINGS #36.
     pub fn wrong_arg_count(
         name: impl Into<String>,
         expected: usize,
@@ -1614,10 +1780,20 @@ impl TycError {
         offset: usize,
         length: usize,
     ) -> Self {
+        let name_s: String = name.into();
+        let suggestion = if expected == actual {
+            Some(format!(
+                "`{name_s}` declares some parameters as keyword-only; \
+                 pass them by name (e.g. `{name_s}(a=1, b=2)`)"
+            ))
+        } else {
+            None
+        };
         Self::WrongArgCount {
-            name: name.into(),
+            name: name_s,
             expected,
             actual,
+            suggestion,
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }
@@ -2243,6 +2419,24 @@ impl TycError {
         }
     }
 
+    /// Construct a [`TycError::NewtypeInvalidBase`] diagnostic.
+    /// FINDINGS v0.7.1 #14.
+    pub fn newtype_invalid_base(
+        name: impl Into<String>,
+        base_kind: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::NewtypeInvalidBase {
+            name: name.into(),
+            base_kind: base_kind.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
     /// Construct a [`TycError::AsyncWithoutAwait`] diagnostic.
     pub fn async_without_await(
         name: impl Into<String>,
@@ -2411,6 +2605,59 @@ impl TycError {
             env_key: env_key.into(),
         }
     }
+
+    /// Construct a [`TycError::SecretLiteralInline`] warning for a plain
+    /// `let` / `mut` / module-level binding whose name matches the secret
+    /// suffix heuristic AND whose RHS is a raw string literal.
+    pub fn secret_literal_inline(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::SecretLiteralInline {
+            name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::EmptyCollectionNoAnnotation`] warning for
+    /// an empty collection literal bound without an explicit annotation.
+    pub fn empty_collection_no_annotation(
+        name: impl Into<String>,
+        literal: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::EmptyCollectionNoAnnotation {
+            name: name.into(),
+            literal: literal.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
+
+    /// Construct a [`TycError::TypingAliasInAnnotation`] warning for a
+    /// deprecated `typing.<Name>` alias referenced from an annotation.
+    pub fn typing_alias_in_annotation(
+        name: impl Into<String>,
+        suggestion: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::TypingAliasInAnnotation {
+            name: name.into(),
+            suggestion: suggestion.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
+        }
+    }
 }
 
 /// A list of diagnostics collected during a compiler phase.
@@ -2470,6 +2717,527 @@ impl Diagnostics {
     pub fn dedup(&mut self) {
         dedup_vec(&mut self.errors);
         dedup_vec(&mut self.warnings);
+    }
+}
+
+/// Compute the user-facing help suggestion for a [`TycError::TypeMismatch`]
+/// diagnostic. The default phrasing is the "widen to `expected | actual`"
+/// hint that was previously baked into the `#[diagnostic(help(...))]`
+/// attribute; this helper now sits in front of it so collection-shape
+/// mismatches get a targeted suggestion instead.
+///
+/// Detection is purely textual (the diagnostics layer only sees the
+/// already-rendered type display strings, not a `Type` enum); it keys on
+/// the `list[`, `dict[`, `set[` head and only suggests covariant
+/// alternatives when both sides share the same head. Anything else
+/// falls back to the original "widen the annotation to `T | U`" hint.
+/// FINDINGS #37.
+fn type_mismatch_help(expected: &str, actual: &str) -> String {
+    if let Some(hint) = collection_variance_hint(expected, actual) {
+        return hint;
+    }
+    if let Some(hint) = dict_literal_to_model_hint(expected, actual) {
+        return hint;
+    }
+    format!(
+        "change the value so it produces `{expected}`, or widen the annotation to \
+         `{expected} | {actual}` if both are intended"
+    )
+}
+
+/// When a dict literal flows into a `model` / `class` / `class!` binding,
+/// the headline ("expected `UserCreate`, found `dict[str, str]`") gives
+/// the user no clue that the fix is to use the constructor call form
+/// (`UserCreate(name=…, age=…, email=…)`). FINDINGS #38.
+///
+/// TODO(#38): this textual hint cannot enumerate the *specific* fields
+/// that are missing from the literal — the diagnostics layer only sees
+/// the rendered display strings of `expected` / `actual`, not the
+/// underlying `Type`s or `ModuleShapes`. To produce "missing fields:
+/// age, email", the call site in `tyc-types` that builds the
+/// dict-literal-vs-model mismatch needs to:
+///
+///   1. detect the shape (expected is a model/plain/class!, actual is a
+///      `dict` literal whose key set is a strict subset of the model's
+///      field names),
+///   2. compute the missing-field list from the model's `InterfaceShape`,
+///   3. emit a dedicated `TycError::ModelLiteralMissingFields` variant
+///      (or thread the list into `type_mismatch` via a new constructor)
+///      so this layer can render it verbatim.
+///
+/// Until that plumbing lands, the textual hint below at least redirects
+/// the user to the constructor form, which is the right escape hatch.
+fn dict_literal_to_model_hint(expected: &str, actual: &str) -> Option<String> {
+    // Cheap recogniser: actual is a `dict[..]` generic, expected is a
+    // bare identifier (no generic brackets, no union pipes). Anything
+    // else is some other shape of mismatch.
+    if !actual.starts_with("dict[") {
+        return None;
+    }
+    if expected.contains('[') || expected.contains('|') {
+        return None;
+    }
+    let first = expected.chars().next()?;
+    if !first.is_ascii_uppercase() {
+        return None;
+    }
+    Some(format!(
+        "dict literals don't auto-coerce to `{expected}`. Construct the value via \
+         `{expected}(field1=…, field2=…, …)` so every required field is named and \
+         type-checked. (Run `tyc explain type_mismatch` for the full list of fields \
+         the model declares — naming the specific missing keys is tracked in \
+         FINDINGS #38.)"
+    ))
+}
+
+/// Inspect the rendered expected/actual type display strings and, when
+/// both name the same invariant generic head (`list`, `dict`, `set`)
+/// with different parameters, return a covariant-alternative
+/// suggestion. Returns `None` for any other shape so the caller can
+/// fall back to the default "widen to T | U" hint.
+fn collection_variance_hint(expected: &str, actual: &str) -> Option<String> {
+    // Helper: split `head[args]` into `(head, args)`. Returns `None`
+    // when the input doesn't end in `]` so non-generic display strings
+    // (`int`, `str`, …) take the default branch above.
+    fn split_generic(s: &str) -> Option<(&str, &str)> {
+        let stripped = s.strip_suffix(']')?;
+        let open = stripped.find('[')?;
+        Some((&stripped[..open], &stripped[open + 1..]))
+    }
+    let (exp_head, exp_args) = split_generic(expected)?;
+    let (act_head, _act_args) = split_generic(actual)?;
+    if exp_head != act_head || exp_args.is_empty() {
+        return None;
+    }
+    match exp_head {
+        "list" => Some(format!(
+            "`list[T]` is invariant — `{actual}` is not assignable to `{expected}`. \
+             Use `Sequence[{exp_args}]` (covariant, read-only) on the parameter, or rebind \
+             the source as `{expected}` so the element type matches."
+        )),
+        "set" => Some(format!(
+            "`set[T]` is invariant — `{actual}` is not assignable to `{expected}`. \
+             Use `frozenset[{exp_args}]` (immutable) or `AbstractSet[{exp_args}]` \
+             (covariant, read-only) on the parameter, or rebind the source as `{expected}`."
+        )),
+        "dict" => Some(format!(
+            "`dict[K, V]` is invariant — `{actual}` is not assignable to `{expected}`. \
+             Use `Mapping[{exp_args}]` (covariant in V, read-only) on the parameter, or \
+             rebind the source as `{expected}`."
+        )),
+        _ => None,
+    }
+}
+
+/// FINDINGS #32: rewrite known preprocess-synthesised lines in `source`
+/// back to their original Typhon form so the rendered source listing
+/// in a miette diagnostic doesn't leak compiler internals. The output
+/// has the SAME byte length as the input — each substitution is
+/// padded with trailing spaces inside the line — so every `SourceSpan`
+/// constructed against the preprocessed source still indexes correctly.
+///
+/// Currently recognises:
+///   - `class __typhon_impl_X(...)(object):` → `impl X(...):`
+///   - `class __typhon_builtin_ext_X(...)(object):` → `extend X(...):`
+///   - `if True:  # __typhon_unsafe__` → `unsafe:`
+///   - `__typhon_freeze__(EXPR)` wrappers (RHS-only) → `EXPR`
+///   - synthesised `if isinstance(__typhon_q_N__, __typhon_Err__):` etc.
+///     `?`-operator scaffolding lines are replaced with all-spaces so
+///     the listing skips past them without confusing the user.
+///   - synthesised `from typhon_runtime import …` headers are blanked.
+///
+/// Anything that doesn't match is returned verbatim. The pass is
+/// purely textual, line-oriented, and runs in O(source.len()).
+///
+/// **MVP scope**: this is the "hide synthetic line" minimum described
+/// in FINDINGS #32. The longer-term fix is a full source map produced
+/// by `preprocess` and consulted at diagnostic construction time —
+/// see the `TODO(#32)` block in [`sanitize_synthetic_source`].
+pub fn sanitize_synthetic_source(source: &str) -> String {
+    if !source.contains("__typhon_") && !source.contains("typhon_runtime") {
+        return source.to_owned();
+    }
+    // TODO(#32): the current pass is length-preserving but lossy — a
+    // span that originally pointed at the `__typhon_q_0__` variable on
+    // a synthesised `if isinstance(...)` line now lands on padding
+    // spaces, which still surprises the user (the source listing
+    // shows a blank line with the span underline at a column that
+    // doesn't correspond to anything they wrote). The proper fix is:
+    //
+    //   1. extend [`tyc_syntax::preprocess::PreprocessResult`] with a
+    //      `source_map: Vec<SpanMap>` field that records, for every
+    //      synthesised byte range, the `(original_offset, original_length)`
+    //      it should re-map to (or `None` if the synthesis is purely
+    //      compiler-internal and should be hidden);
+    //   2. plumb that map through `tyc_db::check_*` to the diagnostic
+    //      construction sites in `tyc-types` / `tyc-resolve` /
+    //      `tyc-analyse`. The map travels in `ExternalShapes` /
+    //      a new analogue so no signature on tyc-types is widened
+    //      gratuitously;
+    //   3. at every `TycError::*` constructor call, look up the
+    //      synthesised span and substitute the original span before
+    //      `NamedSource::new(path, source).span()` builds the label.
+    //
+    // That plumbing is invasive enough to want its own dedicated PR;
+    // until then the MVP below at least removes the worst of the
+    // confusion (no `class __typhon_impl_Foo(object):` in user-facing
+    // diagnostics, no `from typhon_runtime import Err as __typhon_Err__`).
+    let mut out = String::with_capacity(source.len());
+    for line in source.split_inclusive('\n') {
+        let raw = line.trim_end_matches(['\r', '\n']);
+        let terminator = &line[raw.len()..];
+        if let Some(restored) = restore_synthetic_line(raw) {
+            out.push_str(&restored);
+        } else {
+            out.push_str(raw);
+        }
+        out.push_str(terminator);
+    }
+    debug_assert_eq!(
+        out.len(),
+        source.len(),
+        "sanitize_synthetic_source must preserve byte length so spans stay aligned"
+    );
+    out
+}
+
+/// Per-line worker for [`sanitize_synthetic_source`]. Returns `Some`
+/// when the line matched a known synthetic pattern (the result has the
+/// same byte length as the input, padded with trailing spaces inside
+/// the line), `None` to leave the line untouched. Splitting this out
+/// makes the pattern table easy to extend per future findings.
+fn restore_synthetic_line(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let indent_len = line.len() - trimmed.len();
+    let indent = &line[..indent_len];
+
+    // Helper: build a result string of the same byte length as `line`,
+    // with `replacement` substituted into the body. Pad with trailing
+    // spaces (inside the line) so downstream byte offsets stay valid.
+    let pad_to_length = |replacement: &str| -> String {
+        let total = line.len();
+        let body_len = total.saturating_sub(indent_len);
+        let mut s = String::with_capacity(total);
+        s.push_str(indent);
+        let take = replacement.len().min(body_len);
+        s.push_str(&replacement[..take]);
+        // Pad with spaces to match original line length.
+        for _ in s.len()..total {
+            s.push(' ');
+        }
+        s
+    };
+
+    // 1. `class __typhon_impl_X(...)(object):` → `impl X(...):`
+    if let Some(tail) = trimmed.strip_prefix("class __typhon_impl_") {
+        // tail looks like `Name(object):` or `Name(Base)(object):`.
+        let restored = tail.replacen("(object)", "", 1);
+        return Some(pad_to_length(&format!("impl {}", restored)));
+    }
+
+    // 2. `class __typhon_builtin_ext_X(...)(object):` → `extend X(...):`
+    if let Some(tail) = trimmed.strip_prefix("class __typhon_builtin_ext_") {
+        let restored = tail.replacen("(object)", "", 1);
+        return Some(pad_to_length(&format!("extend {}", restored)));
+    }
+
+    // 3. `if True:  # __typhon_unsafe__` → `unsafe:`
+    if trimmed.starts_with("if True:") && trimmed.contains("__typhon_unsafe__") {
+        return Some(pad_to_length("unsafe:"));
+    }
+
+    // 4. Synthesised `?`-operator scaffolding: blanks out the entire
+    //    `if isinstance(__typhon_q_N__, __typhon_Err__):` line plus its
+    //    paired `return __typhon_q_N__` / `let X = __typhon_q_N__.value`
+    //    lines. The user wrote `let x = f()?`; the listing should not
+    //    show the desugaring.
+    if trimmed.contains("__typhon_q_") || trimmed.contains("__typhon_Err__") {
+        return Some(pad_to_length(""));
+    }
+
+    // 5. `from typhon_runtime import …` and the bare `import
+    //    typhon_runtime` are compiler-emitted and never present in the
+    //    user's `.ty` source. Blank them out.
+    if trimmed.starts_with("from typhon_runtime") || trimmed.starts_with("import typhon_runtime") {
+        return Some(pad_to_length(""));
+    }
+
+    // 6. `__typhon_freeze__(EXPR)` wrappers — replace the wrapper with
+    //    spaces, leaving the inner EXPR intact. Conservative scan: we
+    //    only touch lines that contain the literal call form.
+    if trimmed.contains("__typhon_freeze__(") {
+        // Rewrite by replacing `__typhon_freeze__(` with the same
+        // number of spaces; the matching `)` is harder to locate
+        // unambiguously, so leave it (it renders as a stray paren but
+        // is far less alarming than the synthetic call name).
+        let needle = "__typhon_freeze__(";
+        let space = " ".repeat(needle.len());
+        let restored = line.replacen(needle, &space, 1);
+        // The above replacement preserves byte length already.
+        debug_assert_eq!(restored.len(), line.len());
+        return Some(restored);
+    }
+
+    None
+}
+
+/// FINDINGS #34, #35: inspect a raw Python-parser error message and the
+/// surrounding source to recover a Typhon-specific hint. Returns
+/// `None` when the message doesn't match a known shape so callers can
+/// pass through with no help block.
+///
+/// Cases handled:
+///   - **#34** Multi-line `|>` chain without parens: the previous
+///     non-blank line ends with `|>` and the parser bailed with an
+///     indentation message. The fix is to wrap the entire chain in
+///     parentheses so Python treats the continuation as part of the
+///     same expression.
+///   - **#35** `freeze let` inside a function body: `freeze let` is a
+///     module-level-only declaration that the preprocessor leaves
+///     unmodified at non-zero indent, so the Python parser sees two
+///     statements on one line and complains about statement
+///     separators. The hint says so explicitly.
+pub(crate) fn parse_error_hint(message: &str, source: &str, offset: usize) -> Option<String> {
+    let line_starts = line_start_offsets(source);
+    let line_idx = line_for_offset(&line_starts, offset);
+
+    // #35: `freeze let` at non-module scope. The preprocessor strips the
+    // `freeze` keyword only at indent 0, so an indented `freeze let`
+    // confuses the parser. Detect this by scanning the offending line
+    // for a leading `freeze let` after some whitespace.
+    if let Some(line) = source_line(source, &line_starts, line_idx) {
+        let trimmed = line.trim_start();
+        let indent_len = line.len() - trimmed.len();
+        if indent_len > 0 && trimmed.starts_with("freeze let ") {
+            return Some(
+                "`freeze let` is a module-level-only declaration (it wraps the RHS in \
+                 `__typhon_freeze__(...)` so the value is deep-immutable at runtime). \
+                 Move the binding to the top level, or use a plain `let` if the binding \
+                 only needs to be lexically immutable."
+                    .to_owned(),
+            );
+        }
+    }
+
+    // #34: previous non-blank line ends with `|>` and current message
+    // mentions indentation. Wrapping the chain in parens flips the
+    // continuation from a statement boundary into a sub-expression.
+    let lower = message.to_ascii_lowercase();
+    let mentions_indent = lower.contains("indentation")
+        || lower.contains("indent")
+        || lower.contains("unexpected indent");
+    if mentions_indent {
+        // Walk back from the current line looking for the closest
+        // non-blank/non-comment line — that's where the chain
+        // started.
+        let mut probe = line_idx;
+        while probe > 0 {
+            probe -= 1;
+            let prev = source_line(source, &line_starts, probe);
+            let Some(prev) = prev else { break };
+            let trimmed = prev.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            // Strip a trailing inline comment then check for the `|>`
+            // suffix.
+            let code = trimmed.split('#').next().unwrap_or(trimmed).trim_end();
+            if code.ends_with("|>") {
+                return Some(
+                    "multi-line pipe chains (`|>`) must be wrapped in parentheses, \
+                     otherwise Python's indentation rules treat the continuation as a \
+                     new statement. Wrap the whole chain: `let result = (value |> f \
+                     |> g |> h)`."
+                        .to_owned(),
+                );
+            }
+            break;
+        }
+    }
+
+    None
+}
+
+/// Cached newline offsets for [`source_line`] / [`line_for_offset`].
+/// Walks the source once; downstream lookups are O(log n) binary
+/// search.
+fn line_start_offsets(source: &str) -> Vec<usize> {
+    let mut starts = vec![0usize];
+    for (i, b) in source.bytes().enumerate() {
+        if b == b'\n' {
+            starts.push(i + 1);
+        }
+    }
+    starts
+}
+
+fn line_for_offset(starts: &[usize], offset: usize) -> usize {
+    match starts.binary_search(&offset) {
+        Ok(i) => i,
+        Err(i) => i.saturating_sub(1),
+    }
+}
+
+fn source_line<'a>(source: &'a str, starts: &[usize], line_idx: usize) -> Option<&'a str> {
+    let begin = *starts.get(line_idx)?;
+    let end = starts.get(line_idx + 1).copied().unwrap_or(source.len());
+    let slice = source.get(begin..end)?;
+    Some(slice.trim_end_matches(['\r', '\n']))
+}
+
+/// FINDINGS #32: an owning wrapper around a [`TycError`] that overrides
+/// `Diagnostic::source_code` to return a sanitised view (synthetic
+/// `__typhon_*` lines blanked out / restored). Every other trait
+/// method delegates straight through, so codes, labels, help, severity
+/// and so on read identically to the inner diagnostic.
+///
+/// Construct via [`SanitisedDiagnostic::wrap`]; render with miette as
+/// usual:
+/// ```ignore
+/// eprintln!(
+///     "{:?}",
+///     miette::Report::new_boxed(Box::new(SanitisedDiagnostic::wrap(err.clone())))
+/// );
+/// ```
+#[derive(Clone)]
+pub struct SanitisedDiagnostic {
+    inner: TycError,
+    sanitised: Option<NamedSource<String>>,
+}
+
+impl SanitisedDiagnostic {
+    /// Build a wrapper that masks synthetic preprocess output from the
+    /// rendered source listing. When the inner diagnostic doesn't carry
+    /// a `NamedSource` (e.g. `TycError::Io`) the wrapper is a no-op
+    /// pass-through.
+    pub fn wrap(inner: TycError) -> Self {
+        let sanitised = inner.embedded_source().map(|src| {
+            let cleaned = sanitize_synthetic_source(src.inner());
+            NamedSource::new(src.name(), cleaned)
+        });
+        Self { inner, sanitised }
+    }
+
+    /// Build a wrapper that reuses a pre-sanitised `NamedSource`. Callers
+    /// rendering many diagnostics for the same file should sanitise once
+    /// and pass the result here to avoid the O(n_diags × file_size)
+    /// rework that [`wrap`](Self::wrap) does on a hot loop.
+    pub fn wrap_with_source(inner: TycError, sanitised: NamedSource<String>) -> Self {
+        Self {
+            inner,
+            sanitised: Some(sanitised),
+        }
+    }
+}
+
+/// Compute the sanitised `NamedSource` for a single diagnostic. Returns
+/// `None` for variants that don't carry source text (`TycError::Io`).
+/// Renderers grouping diagnostics by file should call this once per
+/// file and reuse the result via [`SanitisedDiagnostic::wrap_with_source`].
+pub fn sanitised_named_source_for(err: &TycError) -> Option<NamedSource<String>> {
+    let src = err.embedded_source()?;
+    let cleaned = sanitize_synthetic_source(src.inner());
+    Some(NamedSource::new(src.name(), cleaned))
+}
+
+impl std::fmt::Debug for SanitisedDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.inner, f)
+    }
+}
+
+impl std::fmt::Display for SanitisedDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.inner, f)
+    }
+}
+
+impl std::error::Error for SanitisedDiagnostic {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.inner.source()
+    }
+}
+
+impl miette::Diagnostic for SanitisedDiagnostic {
+    fn code<'b>(&'b self) -> Option<Box<dyn std::fmt::Display + 'b>> {
+        self.inner.code()
+    }
+    fn severity(&self) -> Option<miette::Severity> {
+        self.inner.severity()
+    }
+    fn help<'b>(&'b self) -> Option<Box<dyn std::fmt::Display + 'b>> {
+        self.inner.help()
+    }
+    fn url<'b>(&'b self) -> Option<Box<dyn std::fmt::Display + 'b>> {
+        self.inner.url()
+    }
+    fn labels(&self) -> Option<Box<dyn Iterator<Item = miette::LabeledSpan> + '_>> {
+        self.inner.labels()
+    }
+    fn related<'b>(&'b self) -> Option<Box<dyn Iterator<Item = &'b dyn miette::Diagnostic> + 'b>> {
+        self.inner.related()
+    }
+    fn diagnostic_source(&self) -> Option<&dyn miette::Diagnostic> {
+        self.inner.diagnostic_source()
+    }
+    fn source_code(&self) -> Option<&dyn miette::SourceCode> {
+        if let Some(src) = &self.sanitised {
+            return Some(src);
+        }
+        self.inner.source_code()
+    }
+}
+
+impl TycError {
+    /// FINDINGS #32: best-effort accessor that returns the `NamedSource`
+    /// embedded in the variant, if any, so the renderer wrapper can
+    /// substitute a sanitised copy. Only the labels read from the same
+    /// source; the diagnostic message itself doesn't include the
+    /// preprocessed text.
+    ///
+    /// Implemented via Debug + miette's `SourceCode` indirection so we
+    /// don't have to enumerate every variant by hand — `source_code()`
+    /// is part of the `Diagnostic` trait and downcasts cleanly to
+    /// `NamedSource<String>` for every variant that uses one.
+    fn embedded_source(&self) -> Option<NamedSourceView<'_>> {
+        use miette::Diagnostic;
+        let any = self.source_code()?;
+        // miette's `SourceCode` trait doesn't expose a `len()`, but
+        // [`SourceCode::read_span`] returns the document slice that
+        // covers `span` plus `context_lines_before` / `_after` of
+        // context. Asking for a 1-byte span at offset 0 with a
+        // ridiculously large `context_lines_after` returns the full
+        // document because miette walks the source until it has that
+        // many trailing newlines (which exhausts the iterator long
+        // before it reaches the cap).
+        let span = miette::SourceSpan::new(miette::SourceOffset::from(0), 1);
+        let full = any.read_span(&span, 0, usize::MAX).ok()?;
+        let bytes = full.data();
+        let text = std::str::from_utf8(bytes).ok()?;
+        let name = full.name().map(|s| s.to_owned()).unwrap_or_default();
+        Some(NamedSourceView {
+            name,
+            text: text.to_owned(),
+            _marker: std::marker::PhantomData,
+        })
+    }
+}
+
+/// Owned snapshot of a [`miette::NamedSource`] view extracted from a
+/// [`TycError`]'s `source_code()`. Holds owned strings so the caller
+/// can rewrite the text without aliasing the diagnostic's interior.
+struct NamedSourceView<'a> {
+    name: String,
+    text: String,
+    _marker: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> NamedSourceView<'a> {
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+    fn inner(&self) -> &str {
+        &self.text
     }
 }
 
@@ -2536,6 +3304,184 @@ mod tests {
     }
 
     #[test]
+    fn type_mismatch_list_variance_suggests_sequence() {
+        // FINDINGS #37: invariant collection mismatch should point at
+        // the covariant read-only view, not "widen to T | U".
+        let e = TycError::type_mismatch(
+            "list[Animal]",
+            "list[Dog]",
+            "a.ty",
+            "let xs: list[Animal] = dogs",
+            0,
+            3,
+        );
+        let TycError::TypeMismatch { suggestion, .. } = &e else {
+            panic!("expected TypeMismatch variant");
+        };
+        assert!(
+            suggestion.contains("Sequence[Animal]"),
+            "list-variance hint must mention Sequence, got: {suggestion}"
+        );
+        assert!(
+            !suggestion.contains("list[Animal] | list[Dog]"),
+            "should not suggest a union widening: {suggestion}"
+        );
+    }
+
+    #[test]
+    fn type_mismatch_dict_variance_suggests_mapping() {
+        let e = TycError::type_mismatch(
+            "dict[str, Animal]",
+            "dict[str, Dog]",
+            "a.ty",
+            "let xs: dict[str, Animal] = dogs",
+            0,
+            3,
+        );
+        let TycError::TypeMismatch { suggestion, .. } = &e else {
+            panic!("expected TypeMismatch variant");
+        };
+        assert!(
+            suggestion.contains("Mapping[str, Animal]"),
+            "dict-variance hint must mention Mapping, got: {suggestion}"
+        );
+    }
+
+    #[test]
+    fn parse_error_hint_pipe_chain_without_parens() {
+        // FINDINGS #34: multi-line `|>` without parens should redirect
+        // the user at parenthesising the chain rather than the raw
+        // "Unexpected indentation" message from the Python parser.
+        let source = "let result = value |>\n    f()\n";
+        let hint = parse_error_hint(
+            "Unexpected indentation",
+            source,
+            source.find("    f").unwrap(),
+        );
+        let hint = hint.expect("pipe-chain hint must fire when prev line ends with |>");
+        assert!(
+            hint.contains("pipe chain") && hint.contains("parentheses"),
+            "hint should mention pipe and parens, got: {hint}"
+        );
+    }
+
+    #[test]
+    fn parse_error_hint_freeze_let_inside_function() {
+        // FINDINGS #35: `freeze let` at non-zero indent is module-level
+        // only — fire a dedicated hint instead of the generic
+        // "Simple statements must be separated …".
+        let source = "def f() -> None:\n    freeze let x: int = 1\n";
+        let offset = source.find("    freeze").unwrap();
+        let hint = parse_error_hint(
+            "Simple statements must be separated by newlines or semicolons",
+            source,
+            offset,
+        );
+        let hint = hint.expect("freeze-let hint must fire when the offending line is indented");
+        assert!(
+            hint.contains("module-level"),
+            "hint should mention module-level only, got: {hint}"
+        );
+    }
+
+    #[test]
+    fn sanitize_synthetic_source_strips_impl_class_wrapper() {
+        // FINDINGS #32 MVP: the rendered source listing for a span
+        // pointing at `class __typhon_impl_Foo(object):` should show
+        // `impl Foo:` instead, with the rest of the line padded to
+        // preserve byte offsets for the label.
+        let raw = "class __typhon_impl_Foo(object):\n    def m(self) -> int:\n";
+        let out = sanitize_synthetic_source(raw);
+        assert_eq!(out.len(), raw.len(), "must preserve byte length");
+        assert!(
+            out.starts_with("impl Foo:"),
+            "first line should be restored to `impl Foo:`, got: {out}"
+        );
+        assert!(
+            !out.contains("__typhon_impl_"),
+            "synthetic wrapper must be hidden, got: {out}"
+        );
+    }
+
+    #[test]
+    fn sanitize_synthetic_source_blanks_q_scaffolding() {
+        // Synthesised `?`-operator scaffolding becomes whitespace so
+        // the user sees a clean listing — better than the compiler
+        // internals leaking into a `result_error_mismatch` error.
+        let raw =
+            "def f() -> Result[int, str]:\n    if isinstance(__typhon_q_0__, __typhon_Err__):\n        return __typhon_q_0__\n";
+        let out = sanitize_synthetic_source(raw);
+        assert_eq!(out.len(), raw.len(), "byte length preserved");
+        assert!(
+            !out.contains("__typhon_q_"),
+            "`?` scaffolding must be hidden, got:\n{out}"
+        );
+        assert!(
+            out.contains("def f() -> Result[int, str]:"),
+            "user-authored lines must survive, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn sanitize_synthetic_source_short_circuits_clean_text() {
+        // A source with no `__typhon_*` markers is returned unchanged
+        // (the function early-exits on the substring probe so we don't
+        // pay a per-line walk on every diagnostic in clean projects).
+        let raw = "let x: int = 1\nprint(x)\n";
+        assert_eq!(sanitize_synthetic_source(raw), raw);
+    }
+
+    #[test]
+    fn parse_error_hint_returns_none_for_unrelated_message() {
+        // Unrecognised messages must leave the help slot empty so
+        // miette skips the help block instead of printing nonsense.
+        let source = "let x: int = \n";
+        let hint = parse_error_hint("unexpected token", source, 0);
+        assert!(
+            hint.is_none(),
+            "unrelated message should not produce a hint"
+        );
+    }
+
+    #[test]
+    fn type_mismatch_dict_literal_to_model_suggests_constructor() {
+        // FINDINGS #38: assigning a dict literal to a model-typed binding
+        // should redirect the user to the constructor form. The full
+        // "missing fields: age, email" enumeration requires plumbing
+        // from tyc-types and is tracked as a TODO in dict_literal_to_model_hint.
+        let e = TycError::type_mismatch(
+            "UserCreate",
+            "dict[str, str]",
+            "a.ty",
+            "let u: UserCreate = {\"name\": \"Bob\"}",
+            0,
+            3,
+        );
+        let TycError::TypeMismatch { suggestion, .. } = &e else {
+            panic!("expected TypeMismatch variant");
+        };
+        assert!(
+            suggestion.contains("UserCreate(field1"),
+            "model-literal hint must point at the constructor form, got: {suggestion}"
+        );
+    }
+
+    #[test]
+    fn type_mismatch_scalar_keeps_default_hint() {
+        // Non-collection mismatches retain the original "widen to T | U"
+        // help so we don't regress the documented suggestion for the
+        // bulk of TypeMismatch sites.
+        let e = TycError::type_mismatch("int", "str", "a.ty", "x", 0, 1);
+        let TycError::TypeMismatch { suggestion, .. } = &e else {
+            panic!("expected TypeMismatch variant");
+        };
+        assert!(
+            suggestion.contains("int | str"),
+            "default help should keep the union-widening suggestion, got: {suggestion}"
+        );
+    }
+
+    #[test]
     fn nullable_use_contains_expected_type() {
         let e = TycError::nullable_use("x", "str", "a.ty", "val x: str? = None", 0, 1);
         assert!(matches!(e, TycError::NullableUse { .. }));
@@ -2552,6 +3498,41 @@ mod tests {
         assert!(msg.contains("f"));
         assert!(msg.contains('2'), "expected count should appear");
         assert!(msg.contains('3'), "actual count should appear");
+    }
+
+    #[test]
+    fn wrong_arg_count_equal_counts_gets_kw_only_help() {
+        // FINDINGS #36: when expected == actual, the headline alone is
+        // self-contradictory ("expected 2, got 2"). The constructor
+        // populates the help slot with a kw-only nudge so the message
+        // makes sense.
+        let e = TycError::wrong_arg_count("f", 2, 2, "a.ty", "f(1, 2)", 0, 7);
+        let TycError::WrongArgCount { suggestion, .. } = &e else {
+            panic!("expected WrongArgCount variant");
+        };
+        let help = suggestion
+            .as_deref()
+            .expect("equal-counts case must populate the help slot");
+        assert!(
+            help.contains("keyword-only"),
+            "help should mention keyword-only, got: {help}"
+        );
+        assert!(help.contains("pass them by name"));
+    }
+
+    #[test]
+    fn wrong_arg_count_unequal_counts_no_help() {
+        // The kw-only hint must NOT fire on a genuine count mismatch
+        // (otherwise users would see "pass them by name" for the
+        // unrelated forgot-an-argument case).
+        let e = TycError::wrong_arg_count("f", 2, 3, "a.ty", "f(1, 2, 3)", 0, 9);
+        let TycError::WrongArgCount { suggestion, .. } = &e else {
+            panic!("expected WrongArgCount variant");
+        };
+        assert!(
+            suggestion.is_none(),
+            "unequal-counts must NOT carry the kw-only hint; got: {suggestion:?}"
+        );
     }
 
     #[test]

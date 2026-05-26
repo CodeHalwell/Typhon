@@ -2822,7 +2822,694 @@ pub fn purity_diagnostics(findings: &[PurityFinding], path: &str, source: &str) 
     diags
 }
 
+// ── Lint passes ───────────────────────────────────────────────────────────────
+//
+// Lightweight syntactic warnings that supplement the main type-checker.  All
+// of these emit `severity(Warning)` diagnostics; they never block a build on
+// their own.  Each pass walks the parsed module once and collects findings
+// into a [`Diagnostics`] bundle.
+
+/// Walk every top-level / nested binding statement in `module` and warn when
+/// a `let` / module-level assignment whose name matches the secret-suffix
+/// heuristic is initialised from a raw string literal.
+///
+/// Pattern (case-insensitive on the name): the binding identifier ends in
+/// `_TOKEN`, `_SECRET`, `_PASSWORD`, `_PWD`, `_KEY`, or `_API_KEY` (or the
+/// suffix _is_ the whole name — `KEY`, `TOKEN`, …). The RHS must be a bare
+/// string literal; any non-literal RHS (function call, attribute access,
+/// `os.getenv("…")`) is fine because it's likely runtime-driven.
+///
+/// Only fires for plain assignments — `comptime let X = env("…")` already
+/// has its own `contains_secret_literal` path inside `tyc build`, so this
+/// pass deliberately skips comptime bindings (their RHS is substituted out
+/// at build time anyway).
+pub fn analyse_secret_literal_bindings(
+    module: &ModModule,
+    path: &str,
+    source: &str,
+) -> Diagnostics {
+    let mut diags = Diagnostics::new();
+    walk_secret_literal_stmts(&module.body, path, source, &mut diags);
+    diags
+}
+
+fn walk_secret_literal_stmts(body: &[Stmt], path: &str, source: &str, diags: &mut Diagnostics) {
+    for stmt in body {
+        match stmt {
+            Stmt::Assign(a) => {
+                // `X = "literal"` — every name target on the LHS counts as a
+                // candidate, including tuple-unpacks like `(API_KEY, b) = …`.
+                if !is_string_literal(&a.value) {
+                    continue;
+                }
+                for target in &a.targets {
+                    record_secret_targets(target, source, path, diags);
+                }
+            }
+            Stmt::AnnAssign(a) => {
+                let Some(rhs) = a.value.as_deref() else {
+                    continue;
+                };
+                if !is_string_literal(rhs) {
+                    continue;
+                }
+                if let Expr::Name(n) = a.target.as_ref() {
+                    if is_secret_name(n.id.as_str()) {
+                        let span_start = n.range.start().to_usize();
+                        let length = n.id.as_str().len();
+                        diags.push_warning(TycError::secret_literal_inline(
+                            n.id.as_str().to_owned(),
+                            path,
+                            source.to_owned(),
+                            span_start,
+                            length,
+                        ));
+                    }
+                }
+            }
+            Stmt::FunctionDef(f) => walk_secret_literal_stmts(&f.body, path, source, diags),
+            Stmt::ClassDef(c) => walk_secret_literal_stmts(&c.body, path, source, diags),
+            Stmt::If(i) => {
+                walk_secret_literal_stmts(&i.body, path, source, diags);
+                for clause in &i.elif_else_clauses {
+                    walk_secret_literal_stmts(&clause.body, path, source, diags);
+                }
+            }
+            Stmt::While(w) => {
+                walk_secret_literal_stmts(&w.body, path, source, diags);
+                walk_secret_literal_stmts(&w.orelse, path, source, diags);
+            }
+            Stmt::For(f) => {
+                walk_secret_literal_stmts(&f.body, path, source, diags);
+                walk_secret_literal_stmts(&f.orelse, path, source, diags);
+            }
+            Stmt::With(w) => walk_secret_literal_stmts(&w.body, path, source, diags),
+            Stmt::Try(t) => {
+                walk_secret_literal_stmts(&t.body, path, source, diags);
+                walk_secret_literal_stmts(&t.orelse, path, source, diags);
+                walk_secret_literal_stmts(&t.finalbody, path, source, diags);
+                for h in &t.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    walk_secret_literal_stmts(&h.body, path, source, diags);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn record_secret_targets(target: &Expr, source: &str, path: &str, diags: &mut Diagnostics) {
+    match target {
+        Expr::Name(n) if is_secret_name(n.id.as_str()) => {
+            let span_start = n.range.start().to_usize();
+            let length = n.id.as_str().len();
+            diags.push_warning(TycError::secret_literal_inline(
+                n.id.as_str().to_owned(),
+                path,
+                source.to_owned(),
+                span_start,
+                length,
+            ));
+        }
+        Expr::Tuple(t) => {
+            for elt in &t.elts {
+                record_secret_targets(elt, source, path, diags);
+            }
+        }
+        Expr::List(l) => {
+            for elt in &l.elts {
+                record_secret_targets(elt, source, path, diags);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// True when `expr` is a bare string literal (`"foo"`, `'bar'`,
+/// `"""…"""`). Concatenations (`"a" + "b"`) and f-strings are intentionally
+/// NOT treated as literals — those forms suggest the user is composing the
+/// value programmatically, even if the result is statically constant.
+fn is_string_literal(expr: &Expr) -> bool {
+    matches!(expr, Expr::StringLiteral(_))
+}
+
+/// True when `name` ends with one of the recognised secret-shaped
+/// suffixes. Match is case-insensitive on the suffix; the suffix may
+/// either form the whole name (e.g. `TOKEN`) or follow an underscore
+/// (e.g. `MY_TOKEN`). The expected callers feed module-level binding
+/// names; passing a function or method name through is harmless because
+/// the caller already gated on `Stmt::Assign` / `Stmt::AnnAssign`.
+fn is_secret_name(name: &str) -> bool {
+    // Recognised suffixes. Longest-first matters because of
+    // `API_KEY` overlapping `KEY` — both fire, but the help text
+    // remains the same so the order is purely defensive.
+    const SUFFIXES: &[&str] = &["API_KEY", "PASSWORD", "TOKEN", "SECRET", "PWD", "KEY"];
+    let upper = name.to_ascii_uppercase();
+    for suffix in SUFFIXES {
+        if upper == *suffix {
+            return true;
+        }
+        if upper.ends_with(suffix) {
+            // Ensure the suffix is preceded by `_` so `MONKEY` doesn't
+            // match `KEY` and `PASSPORT` doesn't match nothing useful.
+            let prefix_len = upper.len() - suffix.len();
+            if upper.as_bytes()[prefix_len - 1] == b'_' {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Walk every `let` / `mut` / `AnnAssign` binding statement in `module`
+/// and warn when the RHS is an empty collection literal (`[]`, `{}`,
+/// `set()`) AND the binding carries no explicit type annotation.
+///
+/// Without an annotation the type checker falls back to `list[Unknown]` /
+/// `dict[Unknown, Unknown]` / `set[Unknown]`, which behaves like `Any` and
+/// silences later element-type mismatches. Annotated bindings (`let
+/// xs: list[int] = []`) are fine because the annotation pins the element
+/// type — they are NOT warned about. This pass deliberately does not
+/// touch inference; it just surfaces the silent-`Any` case so the user
+/// can opt into stricter typing by annotating.
+pub fn analyse_empty_collection_bindings(
+    module: &ModModule,
+    path: &str,
+    source: &str,
+) -> Diagnostics {
+    let mut diags = Diagnostics::new();
+    walk_empty_collection_stmts(&module.body, path, source, &mut diags);
+    diags
+}
+
+fn walk_empty_collection_stmts(body: &[Stmt], path: &str, source: &str, diags: &mut Diagnostics) {
+    for stmt in body {
+        match stmt {
+            Stmt::Assign(a) => {
+                // Unannotated `X = []` / `X = {}` / `X = set()`.
+                let Some(literal) = empty_collection_kind(&a.value) else {
+                    continue;
+                };
+                for target in &a.targets {
+                    if let Expr::Name(n) = target {
+                        let span_start = n.range.start().to_usize();
+                        let length = n.id.as_str().len();
+                        diags.push_warning(TycError::empty_collection_no_annotation(
+                            n.id.as_str().to_owned(),
+                            literal,
+                            path,
+                            source.to_owned(),
+                            span_start,
+                            length,
+                        ));
+                    }
+                }
+            }
+            // `AnnAssign` carries an explicit annotation — never warns.
+            Stmt::FunctionDef(f) => walk_empty_collection_stmts(&f.body, path, source, diags),
+            Stmt::ClassDef(c) => walk_empty_collection_stmts(&c.body, path, source, diags),
+            Stmt::If(i) => {
+                walk_empty_collection_stmts(&i.body, path, source, diags);
+                for clause in &i.elif_else_clauses {
+                    walk_empty_collection_stmts(&clause.body, path, source, diags);
+                }
+            }
+            Stmt::While(w) => {
+                walk_empty_collection_stmts(&w.body, path, source, diags);
+                walk_empty_collection_stmts(&w.orelse, path, source, diags);
+            }
+            Stmt::For(f) => {
+                walk_empty_collection_stmts(&f.body, path, source, diags);
+                walk_empty_collection_stmts(&f.orelse, path, source, diags);
+            }
+            Stmt::With(w) => walk_empty_collection_stmts(&w.body, path, source, diags),
+            Stmt::Try(t) => {
+                walk_empty_collection_stmts(&t.body, path, source, diags);
+                walk_empty_collection_stmts(&t.orelse, path, source, diags);
+                walk_empty_collection_stmts(&t.finalbody, path, source, diags);
+                for h in &t.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    walk_empty_collection_stmts(&h.body, path, source, diags);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Classify `expr` as one of the recognised empty-collection literal
+/// forms. Returns the human-readable label used in the diagnostic
+/// message, or `None` when `expr` isn't an empty literal.
+///
+/// Recognised forms:
+///   - `[]` — empty list literal.
+///   - `{}` — empty dict literal (note: there is no empty-set literal in
+///     Python; `{}` is always a dict).
+///   - `set()` — bare call to `set` with no arguments.
+fn empty_collection_kind(expr: &Expr) -> Option<&'static str> {
+    match expr {
+        Expr::List(l) if l.elts.is_empty() => Some("list literal `[]`"),
+        Expr::Dict(d) if d.items.is_empty() => Some("dict literal `{}`"),
+        Expr::Call(c) if c.arguments.args.is_empty() && c.arguments.keywords.is_empty() => {
+            if let Expr::Name(n) = c.func.as_ref() {
+                if n.id.as_str() == "set" {
+                    return Some("set literal `set()`");
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Names that, when referenced inside a type annotation, indicate the
+/// user is reaching for a deprecated `typing.<Name>` alias even though
+/// the import would have been rejected by `tyc::typing_alias_deprecated`.
+/// The returned suggestion mirrors the migration target.
+fn typing_alias_suggestion(name: &str) -> Option<&'static str> {
+    match name {
+        "List" => Some("list"),
+        "Dict" => Some("dict"),
+        "Tuple" => Some("tuple"),
+        "Set" => Some("set"),
+        "FrozenSet" => Some("frozenset"),
+        "Type" => Some("type"),
+        // Optional[T] -> T? (Typhon's nullable sugar). The suggestion is
+        // a single concrete sigil rather than a generic spelling because
+        // the migration is mechanical.
+        "Optional" => Some("T?"),
+        // Union[A, B] -> A | B.
+        "Union" => Some("A | B"),
+        _ => None,
+    }
+}
+
+/// Walk every annotation expression in `module` and warn when it
+/// references a deprecated `typing.<Name>` alias by bare name (`List`,
+/// `Dict`, `Tuple`, `Set`, `FrozenSet`, `Type`, `Optional`, `Union`).
+/// The annotation is silently accepted as a forward-reference name; the
+/// warning surfaces the inconsistency so users migrate to the built-in
+/// lowercase / sugar forms.
+pub fn analyse_typing_alias_annotations(
+    module: &ModModule,
+    path: &str,
+    source: &str,
+) -> Diagnostics {
+    let mut diags = Diagnostics::new();
+    walk_annotation_stmts(&module.body, path, source, &mut diags);
+    diags
+}
+
+fn walk_annotation_stmts(body: &[Stmt], path: &str, source: &str, diags: &mut Diagnostics) {
+    for stmt in body {
+        match stmt {
+            Stmt::AnnAssign(a) => {
+                walk_annotation_expr(&a.annotation, path, source, diags);
+            }
+            Stmt::FunctionDef(f) => {
+                if let Some(ret) = f.returns.as_deref() {
+                    walk_annotation_expr(ret, path, source, diags);
+                }
+                for param in f.parameters.posonlyargs.iter() {
+                    if let Some(ann) = param.parameter.annotation.as_deref() {
+                        walk_annotation_expr(ann, path, source, diags);
+                    }
+                }
+                for param in f.parameters.args.iter() {
+                    if let Some(ann) = param.parameter.annotation.as_deref() {
+                        walk_annotation_expr(ann, path, source, diags);
+                    }
+                }
+                for param in f.parameters.kwonlyargs.iter() {
+                    if let Some(ann) = param.parameter.annotation.as_deref() {
+                        walk_annotation_expr(ann, path, source, diags);
+                    }
+                }
+                if let Some(va) = f.parameters.vararg.as_deref() {
+                    if let Some(ann) = va.annotation.as_deref() {
+                        walk_annotation_expr(ann, path, source, diags);
+                    }
+                }
+                if let Some(kw) = f.parameters.kwarg.as_deref() {
+                    if let Some(ann) = kw.annotation.as_deref() {
+                        walk_annotation_expr(ann, path, source, diags);
+                    }
+                }
+                walk_annotation_stmts(&f.body, path, source, diags);
+            }
+            Stmt::ClassDef(c) => walk_annotation_stmts(&c.body, path, source, diags),
+            Stmt::If(i) => {
+                walk_annotation_stmts(&i.body, path, source, diags);
+                for clause in &i.elif_else_clauses {
+                    walk_annotation_stmts(&clause.body, path, source, diags);
+                }
+            }
+            Stmt::While(w) => {
+                walk_annotation_stmts(&w.body, path, source, diags);
+                walk_annotation_stmts(&w.orelse, path, source, diags);
+            }
+            Stmt::For(f) => {
+                walk_annotation_stmts(&f.body, path, source, diags);
+                walk_annotation_stmts(&f.orelse, path, source, diags);
+            }
+            Stmt::With(w) => walk_annotation_stmts(&w.body, path, source, diags),
+            Stmt::Try(t) => {
+                walk_annotation_stmts(&t.body, path, source, diags);
+                walk_annotation_stmts(&t.orelse, path, source, diags);
+                walk_annotation_stmts(&t.finalbody, path, source, diags);
+                for h in &t.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    walk_annotation_stmts(&h.body, path, source, diags);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Recurse into an annotation expression and report every name reference
+/// that looks like a `typing.<Name>` alias. Walks subscripts (`List[int]`),
+/// unions, tuples, and `Optional[T]` recursively so nested usages like
+/// `dict[str, Optional[int]]` are flagged on the inner `Optional`, not
+/// silently passed through.
+fn walk_annotation_expr(expr: &Expr, path: &str, source: &str, diags: &mut Diagnostics) {
+    match expr {
+        Expr::Name(n) => {
+            if let Some(suggestion) = typing_alias_suggestion(n.id.as_str()) {
+                let span_start = n.range.start().to_usize();
+                let length = n.id.as_str().len();
+                diags.push_warning(TycError::typing_alias_in_annotation(
+                    n.id.as_str().to_owned(),
+                    suggestion,
+                    path,
+                    source.to_owned(),
+                    span_start,
+                    length,
+                ));
+            }
+        }
+        Expr::Subscript(s) => {
+            // `List[int]` / `Optional[int]` / `Union[int, str]` / nested
+            // forms. Visit both the head (which produces the warning when
+            // it's a typing alias) and the slice (so inner annotations
+            // like `list[Optional[int]]` still surface).
+            walk_annotation_expr(&s.value, path, source, diags);
+            walk_annotation_expr(&s.slice, path, source, diags);
+        }
+        Expr::Tuple(t) => {
+            for e in &t.elts {
+                walk_annotation_expr(e, path, source, diags);
+            }
+        }
+        Expr::BinOp(b) => {
+            // `A | B` union sugar — recurse so a `List | None` still
+            // warns on the deprecated `List`.
+            walk_annotation_expr(&b.left, path, source, diags);
+            walk_annotation_expr(&b.right, path, source, diags);
+        }
+        Expr::Attribute(a) => {
+            // `typing.List[int]` — only warn when the head is exactly
+            // `typing`; any other `foo.List` is the user's own attribute.
+            if let Expr::Name(head) = a.value.as_ref() {
+                if head.id.as_str() == "typing" {
+                    if let Some(suggestion) = typing_alias_suggestion(a.attr.as_str()) {
+                        let span_start = a.range.start().to_usize();
+                        let length = a.range.len().to_usize().max(1);
+                        diags.push_warning(TycError::typing_alias_in_annotation(
+                            a.attr.as_str().to_owned(),
+                            suggestion,
+                            path,
+                            source.to_owned(),
+                            span_start,
+                            length,
+                        ));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod lint_tests {
+    use super::*;
+    use tyc_syntax::preprocess::preprocess;
+
+    fn parse(src: &str) -> ModModule {
+        let prep = preprocess(src);
+        tyc_syntax::parse_module(&prep.python_source)
+            .expect("parse failed")
+            .into_syntax()
+    }
+
+    // ── Finding #3: empty_collection_no_annotation ──────────────────────────
+
+    #[test]
+    fn empty_list_no_annotation_warns() {
+        // `let xs = []` — must warn.
+        let prep = preprocess("let xs = []\n");
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .expect("parse failed")
+            .into_syntax();
+        let diags = analyse_empty_collection_bindings(&module, "x.ty", &prep.python_source);
+        assert_eq!(
+            diags.warnings().len(),
+            1,
+            "let xs = [] must warn; got {:?}",
+            diags.warnings()
+        );
+    }
+
+    #[test]
+    fn empty_dict_no_annotation_warns() {
+        let prep = preprocess("let d = {}\n");
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .expect("parse failed")
+            .into_syntax();
+        let diags = analyse_empty_collection_bindings(&module, "x.ty", &prep.python_source);
+        assert_eq!(diags.warnings().len(), 1);
+    }
+
+    #[test]
+    fn empty_set_call_no_annotation_warns() {
+        let prep = preprocess("let s = set()\n");
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .expect("parse failed")
+            .into_syntax();
+        let diags = analyse_empty_collection_bindings(&module, "x.ty", &prep.python_source);
+        assert_eq!(diags.warnings().len(), 1);
+    }
+
+    #[test]
+    fn empty_list_with_annotation_silent() {
+        // `let xs: list[int] = []` — annotation pins the element type, no warn.
+        let prep = preprocess("let xs: list[int] = []\n");
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .expect("parse failed")
+            .into_syntax();
+        let diags = analyse_empty_collection_bindings(&module, "x.ty", &prep.python_source);
+        assert!(
+            diags.warnings().is_empty(),
+            "annotated empty literal must NOT warn; got {:?}",
+            diags.warnings()
+        );
+    }
+
+    #[test]
+    fn nonempty_list_silent() {
+        let prep = preprocess("let xs = [1, 2, 3]\n");
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .expect("parse failed")
+            .into_syntax();
+        let diags = analyse_empty_collection_bindings(&module, "x.ty", &prep.python_source);
+        assert!(diags.warnings().is_empty());
+    }
+
+    // ── Finding #4: typing_alias_in_annotation ──────────────────────────────
+
+    #[test]
+    fn list_in_annotation_warns() {
+        let src = "def f(xs: List[int]) -> None:\n    pass\n";
+        let module = parse(src);
+        let diags =
+            analyse_typing_alias_annotations(&module, "x.ty", &preprocess(src).python_source);
+        assert_eq!(
+            diags.warnings().len(),
+            1,
+            "`List[int]` annotation must warn; got {:?}",
+            diags.warnings()
+        );
+    }
+
+    #[test]
+    fn optional_in_annotation_warns() {
+        let src = "def f(x: Optional[int]) -> None:\n    pass\n";
+        let module = parse(src);
+        let diags =
+            analyse_typing_alias_annotations(&module, "x.ty", &preprocess(src).python_source);
+        assert_eq!(diags.warnings().len(), 1);
+    }
+
+    #[test]
+    fn dict_in_annotation_warns() {
+        let src = "def f(x: Dict[str, int]) -> None:\n    pass\n";
+        let module = parse(src);
+        let diags =
+            analyse_typing_alias_annotations(&module, "x.ty", &preprocess(src).python_source);
+        assert_eq!(diags.warnings().len(), 1);
+    }
+
+    #[test]
+    fn union_in_annotation_warns() {
+        let src = "def f(x: Union[int, str]) -> None:\n    pass\n";
+        let module = parse(src);
+        let diags =
+            analyse_typing_alias_annotations(&module, "x.ty", &preprocess(src).python_source);
+        assert_eq!(diags.warnings().len(), 1);
+    }
+
+    #[test]
+    fn nested_optional_in_annotation_warns() {
+        let src = "def f(x: list[Optional[int]]) -> None:\n    pass\n";
+        let module = parse(src);
+        let diags =
+            analyse_typing_alias_annotations(&module, "x.ty", &preprocess(src).python_source);
+        assert_eq!(
+            diags.warnings().len(),
+            1,
+            "nested Optional must still warn; got {:?}",
+            diags.warnings()
+        );
+    }
+
+    #[test]
+    fn return_type_alias_warns() {
+        let src = "def f() -> List[int]:\n    return []\n";
+        let module = parse(src);
+        let diags =
+            analyse_typing_alias_annotations(&module, "x.ty", &preprocess(src).python_source);
+        assert_eq!(diags.warnings().len(), 1);
+    }
+
+    #[test]
+    fn ann_assign_with_typing_alias_warns() {
+        let src = "let xs: List[int] = [1, 2]\n";
+        let prep = preprocess(src);
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .expect("parse failed")
+            .into_syntax();
+        let diags = analyse_typing_alias_annotations(&module, "x.ty", &prep.python_source);
+        assert_eq!(diags.warnings().len(), 1);
+    }
+
+    #[test]
+    fn lowercase_annotation_silent() {
+        // The recommended form must not warn — it's exactly what we want.
+        let src = "def f(xs: list[int]) -> None:\n    pass\n";
+        let module = parse(src);
+        let diags =
+            analyse_typing_alias_annotations(&module, "x.ty", &preprocess(src).python_source);
+        assert!(
+            diags.warnings().is_empty(),
+            "lowercase annotation must be silent; got {:?}",
+            diags.warnings()
+        );
+    }
+
+    #[test]
+    fn typing_dot_alias_in_annotation_warns() {
+        // `typing.List[int]` — fully-qualified form must also warn.
+        let src = "def f(xs: typing.List[int]) -> None:\n    pass\n";
+        let module = parse(src);
+        let diags =
+            analyse_typing_alias_annotations(&module, "x.ty", &preprocess(src).python_source);
+        assert_eq!(diags.warnings().len(), 1);
+    }
+
+    // ── Finding #10: contains_secret_literal (inline string form) ───────────
+
+    #[test]
+    fn secret_literal_fires_on_string_assign() {
+        let module = parse("API_TOKEN = \"abc\"\n");
+        let diags = analyse_secret_literal_bindings(&module, "x.ty", "API_TOKEN = \"abc\"\n");
+        assert_eq!(
+            diags.warnings().len(),
+            1,
+            "API_TOKEN = string literal must warn; got {:?}",
+            diags.warnings()
+        );
+    }
+
+    #[test]
+    fn secret_literal_fires_on_password_and_pwd() {
+        let src = "DB_PASSWORD = \"secret\"\nDB_PWD = \"abc\"\n";
+        let module = parse(src);
+        let diags = analyse_secret_literal_bindings(&module, "x.ty", src);
+        assert_eq!(diags.warnings().len(), 2);
+    }
+
+    #[test]
+    fn secret_literal_fires_on_openai_api_key() {
+        let src = "OPENAI_API_KEY = \"sk-foo\"\n";
+        let module = parse(src);
+        let diags = analyse_secret_literal_bindings(&module, "x.ty", src);
+        assert_eq!(diags.warnings().len(), 1);
+    }
+
+    #[test]
+    fn secret_literal_fires_on_my_secret() {
+        let src = "MY_SECRET = \"abc\"\n";
+        let module = parse(src);
+        let diags = analyse_secret_literal_bindings(&module, "x.ty", src);
+        assert_eq!(diags.warnings().len(), 1);
+    }
+
+    #[test]
+    fn secret_literal_silent_on_env_lookup() {
+        // The whole point of the lint: env-driven RHS should NOT warn.
+        let src = "import os\nAPI_TOKEN = os.getenv(\"API_TOKEN\")\n";
+        let module = parse(src);
+        let diags = analyse_secret_literal_bindings(&module, "x.ty", src);
+        assert!(
+            diags.warnings().is_empty(),
+            "env-driven RHS must not warn; got {:?}",
+            diags.warnings()
+        );
+    }
+
+    #[test]
+    fn secret_literal_silent_on_unrelated_string_name() {
+        // A regular `let username = "x"` must stay silent.
+        let src = "username = \"alice\"\nMONKEY = \"chimp\"\n";
+        let module = parse(src);
+        let diags = analyse_secret_literal_bindings(&module, "x.ty", src);
+        assert!(
+            diags.warnings().is_empty(),
+            "unrelated binding name must not warn; got {:?}",
+            diags.warnings()
+        );
+    }
+
+    #[test]
+    fn secret_literal_fires_on_annassign_let() {
+        // `let TOKEN: str = "abc"` — AnnAssign path.
+        let src = "let TOKEN: str = \"abc\"\n";
+        let prep = preprocess(src);
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .expect("parse failed")
+            .into_syntax();
+        let diags = analyse_secret_literal_bindings(&module, "x.ty", &prep.python_source);
+        assert_eq!(
+            diags.warnings().len(),
+            1,
+            "annotated let TOKEN must warn; got {:?}",
+            diags.warnings()
+        );
+    }
+}
 
 #[cfg(test)]
 mod purity_tests {
