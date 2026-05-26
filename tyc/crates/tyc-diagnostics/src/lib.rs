@@ -2670,6 +2670,158 @@ fn collection_variance_hint(expected: &str, actual: &str) -> Option<String> {
     }
 }
 
+/// FINDINGS #32: rewrite known preprocess-synthesised lines in `source`
+/// back to their original Typhon form so the rendered source listing
+/// in a miette diagnostic doesn't leak compiler internals. The output
+/// has the SAME byte length as the input — each substitution is
+/// padded with trailing spaces inside the line — so every `SourceSpan`
+/// constructed against the preprocessed source still indexes correctly.
+///
+/// Currently recognises:
+///   - `class __typhon_impl_X(...)(object):` → `impl X(...):`
+///   - `class __typhon_builtin_ext_X(...)(object):` → `extend X(...):`
+///   - `if True:  # __typhon_unsafe__` → `unsafe:`
+///   - `__typhon_freeze__(EXPR)` wrappers (RHS-only) → `EXPR`
+///   - synthesised `if isinstance(__typhon_q_N__, __typhon_Err__):` etc.
+///     `?`-operator scaffolding lines are replaced with all-spaces so
+///     the listing skips past them without confusing the user.
+///   - synthesised `from typhon_runtime import …` headers are blanked.
+///
+/// Anything that doesn't match is returned verbatim. The pass is
+/// purely textual, line-oriented, and runs in O(source.len()).
+///
+/// **MVP scope**: this is the "hide synthetic line" minimum described
+/// in FINDINGS #32. The longer-term fix is a full source map produced
+/// by `preprocess` and consulted at diagnostic construction time —
+/// see the `TODO(#32)` block in [`sanitize_synthetic_source`].
+pub fn sanitize_synthetic_source(source: &str) -> String {
+    if !source.contains("__typhon_") && !source.contains("typhon_runtime") {
+        return source.to_owned();
+    }
+    // TODO(#32): the current pass is length-preserving but lossy — a
+    // span that originally pointed at the `__typhon_q_0__` variable on
+    // a synthesised `if isinstance(...)` line now lands on padding
+    // spaces, which still surprises the user (the source listing
+    // shows a blank line with the span underline at a column that
+    // doesn't correspond to anything they wrote). The proper fix is:
+    //
+    //   1. extend [`tyc_syntax::preprocess::PreprocessResult`] with a
+    //      `source_map: Vec<SpanMap>` field that records, for every
+    //      synthesised byte range, the `(original_offset, original_length)`
+    //      it should re-map to (or `None` if the synthesis is purely
+    //      compiler-internal and should be hidden);
+    //   2. plumb that map through `tyc_db::check_*` to the diagnostic
+    //      construction sites in `tyc-types` / `tyc-resolve` /
+    //      `tyc-analyse`. The map travels in `ExternalShapes` /
+    //      a new analogue so no signature on tyc-types is widened
+    //      gratuitously;
+    //   3. at every `TycError::*` constructor call, look up the
+    //      synthesised span and substitute the original span before
+    //      `NamedSource::new(path, source).span()` builds the label.
+    //
+    // That plumbing is invasive enough to want its own dedicated PR;
+    // until then the MVP below at least removes the worst of the
+    // confusion (no `class __typhon_impl_Foo(object):` in user-facing
+    // diagnostics, no `from typhon_runtime import Err as __typhon_Err__`).
+    let mut out = String::with_capacity(source.len());
+    for line in source.split_inclusive('\n') {
+        let raw = line.trim_end_matches(['\r', '\n']);
+        let terminator = &line[raw.len()..];
+        if let Some(restored) = restore_synthetic_line(raw) {
+            out.push_str(&restored);
+        } else {
+            out.push_str(raw);
+        }
+        out.push_str(terminator);
+    }
+    debug_assert_eq!(
+        out.len(),
+        source.len(),
+        "sanitize_synthetic_source must preserve byte length so spans stay aligned"
+    );
+    out
+}
+
+/// Per-line worker for [`sanitize_synthetic_source`]. Returns `Some`
+/// when the line matched a known synthetic pattern (the result has the
+/// same byte length as the input, padded with trailing spaces inside
+/// the line), `None` to leave the line untouched. Splitting this out
+/// makes the pattern table easy to extend per future findings.
+fn restore_synthetic_line(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let indent_len = line.len() - trimmed.len();
+    let indent = &line[..indent_len];
+
+    // Helper: build a result string of the same byte length as `line`,
+    // with `replacement` substituted into the body. Pad with trailing
+    // spaces (inside the line) so downstream byte offsets stay valid.
+    let pad_to_length = |replacement: &str| -> String {
+        let total = line.len();
+        let body_len = total.saturating_sub(indent_len);
+        let mut s = String::with_capacity(total);
+        s.push_str(indent);
+        let take = replacement.len().min(body_len);
+        s.push_str(&replacement[..take]);
+        // Pad with spaces to match original line length.
+        for _ in s.len()..total {
+            s.push(' ');
+        }
+        s
+    };
+
+    // 1. `class __typhon_impl_X(...)(object):` → `impl X(...):`
+    if let Some(tail) = trimmed.strip_prefix("class __typhon_impl_") {
+        // tail looks like `Name(object):` or `Name(Base)(object):`.
+        let restored = tail.replacen("(object)", "", 1);
+        return Some(pad_to_length(&format!("impl {}", restored)));
+    }
+
+    // 2. `class __typhon_builtin_ext_X(...)(object):` → `extend X(...):`
+    if let Some(tail) = trimmed.strip_prefix("class __typhon_builtin_ext_") {
+        let restored = tail.replacen("(object)", "", 1);
+        return Some(pad_to_length(&format!("extend {}", restored)));
+    }
+
+    // 3. `if True:  # __typhon_unsafe__` → `unsafe:`
+    if trimmed.starts_with("if True:") && trimmed.contains("__typhon_unsafe__") {
+        return Some(pad_to_length("unsafe:"));
+    }
+
+    // 4. Synthesised `?`-operator scaffolding: blanks out the entire
+    //    `if isinstance(__typhon_q_N__, __typhon_Err__):` line plus its
+    //    paired `return __typhon_q_N__` / `let X = __typhon_q_N__.value`
+    //    lines. The user wrote `let x = f()?`; the listing should not
+    //    show the desugaring.
+    if trimmed.contains("__typhon_q_") || trimmed.contains("__typhon_Err__") {
+        return Some(pad_to_length(""));
+    }
+
+    // 5. `from typhon_runtime import …` and the bare `import
+    //    typhon_runtime` are compiler-emitted and never present in the
+    //    user's `.ty` source. Blank them out.
+    if trimmed.starts_with("from typhon_runtime") || trimmed.starts_with("import typhon_runtime") {
+        return Some(pad_to_length(""));
+    }
+
+    // 6. `__typhon_freeze__(EXPR)` wrappers — replace the wrapper with
+    //    spaces, leaving the inner EXPR intact. Conservative scan: we
+    //    only touch lines that contain the literal call form.
+    if trimmed.contains("__typhon_freeze__(") {
+        // Rewrite by replacing `__typhon_freeze__(` with the same
+        // number of spaces; the matching `)` is harder to locate
+        // unambiguously, so leave it (it renders as a stray paren but
+        // is far less alarming than the synthetic call name).
+        let needle = "__typhon_freeze__(";
+        let space = " ".repeat(needle.len());
+        let restored = line.replacen(needle, &space, 1);
+        // The above replacement preserves byte length already.
+        debug_assert_eq!(restored.len(), line.len());
+        return Some(restored);
+    }
+
+    None
+}
+
 /// FINDINGS #34, #35: inspect a raw Python-parser error message and the
 /// surrounding source to recover a Typhon-specific hint. Returns
 /// `None` when the message doesn't match a known shape so callers can
@@ -2772,6 +2924,141 @@ fn source_line<'a>(source: &'a str, starts: &[usize], line_idx: usize) -> Option
     let end = starts.get(line_idx + 1).copied().unwrap_or(source.len());
     let slice = source.get(begin..end)?;
     Some(slice.trim_end_matches(['\r', '\n']))
+}
+
+/// FINDINGS #32: an owning wrapper around a [`TycError`] that overrides
+/// `Diagnostic::source_code` to return a sanitised view (synthetic
+/// `__typhon_*` lines blanked out / restored). Every other trait
+/// method delegates straight through, so codes, labels, help, severity
+/// and so on read identically to the inner diagnostic.
+///
+/// Construct via [`SanitisedDiagnostic::wrap`]; render with miette as
+/// usual:
+/// ```ignore
+/// eprintln!(
+///     "{:?}",
+///     miette::Report::new_boxed(Box::new(SanitisedDiagnostic::wrap(err.clone())))
+/// );
+/// ```
+#[derive(Clone)]
+pub struct SanitisedDiagnostic {
+    inner: TycError,
+    sanitised: Option<NamedSource<String>>,
+}
+
+impl SanitisedDiagnostic {
+    /// Build a wrapper that masks synthetic preprocess output from the
+    /// rendered source listing. When the inner diagnostic doesn't carry
+    /// a `NamedSource` (e.g. `TycError::Io`) the wrapper is a no-op
+    /// pass-through.
+    pub fn wrap(inner: TycError) -> Self {
+        let sanitised = inner.embedded_source().map(|src| {
+            let cleaned = sanitize_synthetic_source(src.inner());
+            NamedSource::new(src.name(), cleaned)
+        });
+        Self { inner, sanitised }
+    }
+}
+
+impl std::fmt::Debug for SanitisedDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.inner, f)
+    }
+}
+
+impl std::fmt::Display for SanitisedDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.inner, f)
+    }
+}
+
+impl std::error::Error for SanitisedDiagnostic {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.inner.source()
+    }
+}
+
+impl miette::Diagnostic for SanitisedDiagnostic {
+    fn code<'b>(&'b self) -> Option<Box<dyn std::fmt::Display + 'b>> {
+        self.inner.code()
+    }
+    fn severity(&self) -> Option<miette::Severity> {
+        self.inner.severity()
+    }
+    fn help<'b>(&'b self) -> Option<Box<dyn std::fmt::Display + 'b>> {
+        self.inner.help()
+    }
+    fn url<'b>(&'b self) -> Option<Box<dyn std::fmt::Display + 'b>> {
+        self.inner.url()
+    }
+    fn labels(&self) -> Option<Box<dyn Iterator<Item = miette::LabeledSpan> + '_>> {
+        self.inner.labels()
+    }
+    fn related<'b>(&'b self) -> Option<Box<dyn Iterator<Item = &'b dyn miette::Diagnostic> + 'b>> {
+        self.inner.related()
+    }
+    fn diagnostic_source(&self) -> Option<&dyn miette::Diagnostic> {
+        self.inner.diagnostic_source()
+    }
+    fn source_code(&self) -> Option<&dyn miette::SourceCode> {
+        if let Some(src) = &self.sanitised {
+            return Some(src);
+        }
+        self.inner.source_code()
+    }
+}
+
+impl TycError {
+    /// FINDINGS #32: best-effort accessor that returns the `NamedSource`
+    /// embedded in the variant, if any, so the renderer wrapper can
+    /// substitute a sanitised copy. Only the labels read from the same
+    /// source; the diagnostic message itself doesn't include the
+    /// preprocessed text.
+    ///
+    /// Implemented via Debug + miette's `SourceCode` indirection so we
+    /// don't have to enumerate every variant by hand — `source_code()`
+    /// is part of the `Diagnostic` trait and downcasts cleanly to
+    /// `NamedSource<String>` for every variant that uses one.
+    fn embedded_source(&self) -> Option<NamedSourceView<'_>> {
+        use miette::Diagnostic;
+        let any = self.source_code()?;
+        // miette's `SourceCode` trait doesn't expose a `len()`, but
+        // [`SourceCode::read_span`] returns the document slice that
+        // covers `span` plus `context_lines_before` / `_after` of
+        // context. Asking for a 1-byte span at offset 0 with a
+        // ridiculously large `context_lines_after` returns the full
+        // document because miette walks the source until it has that
+        // many trailing newlines (which exhausts the iterator long
+        // before it reaches the cap).
+        let span = miette::SourceSpan::new(miette::SourceOffset::from(0), 1);
+        let full = any.read_span(&span, 0, usize::MAX).ok()?;
+        let bytes = full.data();
+        let text = std::str::from_utf8(bytes).ok()?;
+        let name = full.name().map(|s| s.to_owned()).unwrap_or_default();
+        Some(NamedSourceView {
+            name,
+            text: text.to_owned(),
+            _marker: std::marker::PhantomData,
+        })
+    }
+}
+
+/// Owned snapshot of a [`miette::NamedSource`] view extracted from a
+/// [`TycError`]'s `source_code()`. Holds owned strings so the caller
+/// can rewrite the text without aliasing the diagnostic's interior.
+struct NamedSourceView<'a> {
+    name: String,
+    text: String,
+    _marker: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> NamedSourceView<'a> {
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+    fn inner(&self) -> &str {
+        &self.text
+    }
 }
 
 fn dedup_vec(v: &mut Vec<TycError>) {
@@ -2911,6 +3198,53 @@ mod tests {
             hint.contains("module-level"),
             "hint should mention module-level only, got: {hint}"
         );
+    }
+
+    #[test]
+    fn sanitize_synthetic_source_strips_impl_class_wrapper() {
+        // FINDINGS #32 MVP: the rendered source listing for a span
+        // pointing at `class __typhon_impl_Foo(object):` should show
+        // `impl Foo:` instead, with the rest of the line padded to
+        // preserve byte offsets for the label.
+        let raw = "class __typhon_impl_Foo(object):\n    def m(self) -> int:\n";
+        let out = sanitize_synthetic_source(raw);
+        assert_eq!(out.len(), raw.len(), "must preserve byte length");
+        assert!(
+            out.starts_with("impl Foo:"),
+            "first line should be restored to `impl Foo:`, got: {out}"
+        );
+        assert!(
+            !out.contains("__typhon_impl_"),
+            "synthetic wrapper must be hidden, got: {out}"
+        );
+    }
+
+    #[test]
+    fn sanitize_synthetic_source_blanks_q_scaffolding() {
+        // Synthesised `?`-operator scaffolding becomes whitespace so
+        // the user sees a clean listing — better than the compiler
+        // internals leaking into a `result_error_mismatch` error.
+        let raw =
+            "def f() -> Result[int, str]:\n    if isinstance(__typhon_q_0__, __typhon_Err__):\n        return __typhon_q_0__\n";
+        let out = sanitize_synthetic_source(raw);
+        assert_eq!(out.len(), raw.len(), "byte length preserved");
+        assert!(
+            !out.contains("__typhon_q_"),
+            "`?` scaffolding must be hidden, got:\n{out}"
+        );
+        assert!(
+            out.contains("def f() -> Result[int, str]:"),
+            "user-authored lines must survive, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn sanitize_synthetic_source_short_circuits_clean_text() {
+        // A source with no `__typhon_*` markers is returned unchanged
+        // (the function early-exits on the substring probe so we don't
+        // pay a per-line walk on every diagnostic in clean projects).
+        let raw = "let x: int = 1\nprint(x)\n";
+        assert_eq!(sanitize_synthetic_source(raw), raw);
     }
 
     #[test]

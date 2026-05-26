@@ -12,7 +12,7 @@ use miette::{miette, Result};
 
 use tyc_analyse::{analyse_purity, evaluate_comptime_with_functions, purity_diagnostics};
 use tyc_db::{check_file_with_imports, extract_shapes_for_path, TycDatabase};
-use tyc_diagnostics::{Diagnostics, TycError};
+use tyc_diagnostics::{Diagnostics, SanitisedDiagnostic, TycError};
 use tyc_emit::{compare_modules, StubTestKind};
 #[cfg(test)]
 use tyc_resolve::check_unknown_modules;
@@ -445,16 +445,25 @@ fn render_diagnostics(diags: &Diagnostics) {
     let warnings_by_file = group_by_file(diags.warnings());
     let errors_by_file = group_by_file(diags.errors());
 
+    // FINDINGS #32: hand each diagnostic to a `SanitisedDiagnostic`
+    // wrapper before rendering so synthetic preprocess output
+    // (`class __typhon_impl_Foo(object):`, `from typhon_runtime
+    // import …`, the `?`-operator scaffolding) doesn't leak into the
+    // user-facing source listing. The wrapper preserves every other
+    // miette field — code, severity, labels, help — so the diagnostic
+    // reads identically apart from the cleaned source pane.
     for (file, items) in &warnings_by_file {
         eprintln!("── warnings in {} ──", file);
         for w in items {
-            eprintln!("{:?}", miette::Report::new_boxed(Box::new((*w).clone())));
+            let wrapped = SanitisedDiagnostic::wrap((*w).clone());
+            eprintln!("{:?}", miette::Report::new_boxed(Box::new(wrapped)));
         }
     }
     for (file, items) in &errors_by_file {
         eprintln!("── errors in {} ──", file);
         for e in items {
-            eprintln!("{:?}", miette::Report::new_boxed(Box::new((*e).clone())));
+            let wrapped = SanitisedDiagnostic::wrap((*e).clone());
+            eprintln!("{:?}", miette::Report::new_boxed(Box::new(wrapped)));
         }
     }
 
