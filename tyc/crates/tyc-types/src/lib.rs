@@ -85,6 +85,12 @@ pub enum Type {
     /// expects. A `TypeConstructor("List", 1)` represents a type constructor
     /// that takes one type argument (like `list` in `list[int]`).
     TypeConstructor(String, usize),
+    /// A string-literal singleton type. `type Color = "red" | "green"`
+    /// produces a `Union(LitStr("red"), LitStr("green"))`. Used to enforce
+    /// finite string-enum unions at call sites (FINDINGS v0.7.1 #13).
+    /// Assignability rules: `LitStr(s) → LitStr(s)` (equal), `LitStr(_) →
+    /// Str` (widens), and `Str → LitStr(_)` is REJECTED.
+    LitStr(String),
 }
 
 impl Type {
@@ -182,6 +188,7 @@ impl Type {
                 let placeholders = (0..*arity).map(|_| "_").collect::<Vec<_>>().join(", ");
                 format!("{}[{}]", name, placeholders)
             }
+            Type::LitStr(s) => format!("{:?}", s),
         }
     }
 }
@@ -225,6 +232,13 @@ pub fn assignable(expected: &Type, actual: &Type) -> bool {
         // to flag.
         (Type::Int, Type::Bool) => true,
         (Type::Float, Type::Bool) => true,
+        // String-literal singletons (FINDINGS v0.7.1 #13). `LitStr(s)` is
+        // assignable to itself, to plain `Str` (widening), and (via the
+        // Union arms below) to any `Union` that contains the same literal.
+        // The reverse — `Str` flowing into `LitStr` — is REJECTED so that
+        // `paint("orange")` against `Color = "red" | "green"` fails.
+        (Type::LitStr(a), Type::LitStr(b)) => a == b,
+        (Type::Str, Type::LitStr(_)) => true,
         // Union/Union must come before the single-Union arms: every actual
         // variant has to be assignable to *some* expected variant. Falling
         // through to `(Union, other)` then `(other, Union)` recursively
@@ -919,6 +933,12 @@ pub fn type_from_annotation_with_params(
     type_params: &[String],
 ) -> Type {
     match expr {
+        // String-literal singletons in type position — e.g.
+        // `type Color = "red" | "green" | "blue"`. The BitOr arm below
+        // recurses through this case for each disjunct, so each literal
+        // becomes a `Type::LitStr` slot in the resulting `Type::Union`.
+        // FINDINGS v0.7.1 #13.
+        Expr::StringLiteral(s) => Type::LitStr(s.value.to_str().to_owned()),
         Expr::Name(n) => match n.id.as_str() {
             "int" => Type::Int,
             "str" => Type::Str,
@@ -987,28 +1007,27 @@ pub fn type_from_annotation_with_params(
                 };
                 return type_from_annotation_with_params(real, classes, type_params);
             }
-            // Literal["a", "b"] / Literal[1, 2] — narrow to the
-            // widened literal type (str / int / bool / bytes / None).
-            // FINDINGS #98.
-            //
-            // TODO FINDINGS v0.7.1 #13: a string-literal union
-            // (`"red" | "green" | "blue"`) currently widens here to the
-            // plain `str` type, so `paint("orange")` is silently accepted.
-            // A proper fix requires adding a `Type::Literal(LiteralValue)`
-            // variant to the `Type` enum, threading it through
-            // `is_assignable`, `Display`, and every Union normaliser, then
-            // rejecting non-member strings at the call-site check. That's
-            // a multi-day cross-cutting change tracked separately.
+            // Literal["a", "b"] / Literal[1, 2] — string variants narrow
+            // to `Type::LitStr` singletons (FINDINGS v0.7.1 #13); other
+            // primitive literals widen to their base type (FINDINGS #98 —
+            // `Type::Literal` for ints / bools / bytes / None is tracked
+            // for the same v0.7.1 round but out of scope for #13).
             if head == "Literal" {
                 let variants: Vec<&Expr> = match s.slice.as_ref() {
                     Expr::Tuple(t) => t.elts.iter().collect(),
                     other => vec![other],
                 };
-                let widened: Vec<Type> = variants.into_iter().map(literal_widened_type).collect();
-                if widened.is_empty() {
+                let mapped: Vec<Type> = variants
+                    .into_iter()
+                    .map(|e| match e {
+                        Expr::StringLiteral(s) => Type::LitStr(s.value.to_str().to_owned()),
+                        other => literal_widened_type(other),
+                    })
+                    .collect();
+                if mapped.is_empty() {
                     return Type::Unknown;
                 }
-                return Type::union_of(widened);
+                return Type::union_of(mapped);
             }
             // Union[A, B, ...] / typing.Union[...]
             if head == "Union" {
@@ -8965,7 +8984,25 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             Number::Float(_) => Type::Float,
             Number::Complex { .. } => Type::Unknown,
         },
-        Expr::StringLiteral(_) => Type::Str,
+        // Bidirectional inference for string literals (FINDINGS v0.7.1 #13).
+        // When the expected type is — or contains — a `LitStr`, infer the
+        // expression as `LitStr` so `paint("red")` against
+        // `Color = "red" | "green"` matches the union slot. Otherwise stay
+        // `Str` to avoid surprising the user with literal types in
+        // unannotated bindings (`let s = "hi"` should still be `str`).
+        Expr::StringLiteral(s) => {
+            let value = s.value.to_str().to_owned();
+            let wants_literal = match expected.map(|t| c.unwrap_alias(t)) {
+                Some(Type::LitStr(_)) => true,
+                Some(Type::Union(vs)) => vs.iter().any(|v| matches!(v, Type::LitStr(_))),
+                _ => false,
+            };
+            if wants_literal {
+                Type::LitStr(value)
+            } else {
+                Type::Str
+            }
+        }
         Expr::BytesLiteral(_) => Type::Bytes,
         Expr::NoneLiteral(_) => Type::None,
         Expr::Name(n) => {
@@ -10521,6 +10558,9 @@ fn operand_is_unflaggable(t: &Type) -> bool {
         Type::Union(_) => true,
         Type::Generic(_, args) => args.iter().any(operand_is_unflaggable),
         Type::Int | Type::Str | Type::Bool | Type::Float | Type::Bytes | Type::None => false,
+        // `Type::LitStr` is a string-singleton — same operand semantics as
+        // `Type::Str` for arithmetic / comparison flagging purposes.
+        Type::LitStr(_) => false,
         // Module references can't be operands of arithmetic / comparison.
         // Producing the diagnostic here would surprise users; downstream
         // arithmetic on a `Type::Module` value is already nonsense and
@@ -16932,21 +16972,12 @@ def classify(t: Token) -> str:
     }
 
     /// FINDINGS v0.7.1 #13: string-literal union types (`"red" | "green"
-    /// | "blue"`) must reject string values that aren't one of the
-    /// literals. Blocked: tyc-types' `Type` enum has no `Literal`
-    /// variant — every `"red"` annotation lowers to `Type::Str`, which
-    /// is then unified with any other `Type::Str` value and the union
-    /// collapses to plain `str`. Wiring this would require:
-    ///   1. Adding `Type::Literal(LiteralValue)` to the type model,
-    ///   2. Teaching `type_from_annotation_with_params` to produce it
-    ///      for `Expr::StringLiteral` / number / bool literal nodes,
-    ///   3. Updating `is_assignable` to enforce equality (and value
-    ///      narrowing) instead of falling back to base-type rules,
-    ///   4. Updating the `Display` impl and every Union normaliser.
-    /// That is a multi-day cross-cutting change; out of scope for this
-    /// findings round. Tracked via this ignored test.
+    /// | "blue"`) reject string values that aren't one of the literals.
+    /// Backed by the `Type::LitStr` variant and a bidirectional
+    /// inference rule in `infer_expr_ctx`: a string-literal expression
+    /// is inferred as `LitStr(value)` only when the expected type contains
+    /// at least one `LitStr` slot (so `let s = "hi"` still infers `str`).
     #[test]
-    #[ignore = "v0.7.1 #13: Type::Literal variant doesn't exist yet"]
     fn v071_string_literal_union_rejects_non_member() {
         let src = "\
 type Color = \"red\" | \"green\" | \"blue\"
