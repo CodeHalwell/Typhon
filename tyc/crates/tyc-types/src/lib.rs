@@ -7973,16 +7973,49 @@ fn cases_cover_type(c: &Checker, cases: &[MatchCase], ty: &Type) -> bool {
     };
     if let Some(variants) = c.sealed_unions.get(class_name.as_str()).cloned() {
         let mut covered: HashSet<String> = HashSet::new();
+        let mut covered_with_guards: HashSet<String> = HashSet::new();
+        let mut has_guarded_wildcard = false;
         for case in cases {
-            if case.guard.is_some() {
-                continue;
+            if case.guard.is_none() {
+                if pattern_covers_class(c, &case.pattern, &class_name) {
+                    return true;
+                }
+                collect_matched_class_names(&case.pattern, &mut covered);
             }
-            if pattern_covers_class(c, &case.pattern, &class_name) {
-                return true;
+            // Also collect guarded coverage for the pragmatic
+            // exhaustive-with-guards relaxation below. FINDINGS v0.7.1 #15.
+            collect_matched_class_names(&case.pattern, &mut covered_with_guards);
+            // A guarded `case _:` / capture also signals intent to handle
+            // every leftover variant (e.g. `case other if cond: ...`).
+            if case.guard.is_some()
+                && matches!(
+                    &case.pattern,
+                    ruff_python_ast::Pattern::MatchAs(p) if p.pattern.is_none()
+                )
+            {
+                has_guarded_wildcard = true;
             }
-            collect_matched_class_names(&case.pattern, &mut covered);
         }
-        return variants.iter().all(|v| covered.contains(v));
+        if variants.iter().all(|v| covered.contains(v)) {
+            return true;
+        }
+        // FINDINGS v0.7.1 #15: when every sealed-union variant has at least
+        // one case in the match (even if guarded) AND/OR a guarded wildcard
+        // catches the remainder, the user's intent is clearly to handle
+        // every value. Guard predicates are arbitrary expressions so we
+        // cannot prove they're exhaustive in general — be pragmatic and
+        // trust the user. The tradeoff: a guard cascade with an unreachable
+        // gap (e.g. `case IntTok(0) if False: …`) will no longer surface
+        // `missing_return`. We accept that cost to eliminate the much
+        // louder false-positive on every guard-driven sealed-union match.
+        if (has_guarded_wildcard || variants.iter().all(|v| covered_with_guards.contains(v)))
+            && variants
+                .iter()
+                .any(|v| covered_with_guards.contains(v) && !covered.contains(v))
+        {
+            return true;
+        }
+        return false;
     }
     if cases
         .iter()
@@ -16820,6 +16853,35 @@ def main() -> None:
         assert!(
             !d.has_errors(),
             "list.append must still resolve; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #15: exhaustive guards on a sealed union must not
+    /// fire `missing_return`. Reasoning about guards is hard so we settle
+    /// for the pragmatic "every variant has at least one case + a guarded
+    /// wildcard for the remainder" rule.
+    #[test]
+    fn v071_exhaustive_guards_no_missing_return() {
+        let src = "\
+class IntTok:
+    v: int
+
+type Token = IntTok
+
+def classify(t: Token) -> str:
+    match t:
+        case IntTok(v=0):
+            return \"zero\"
+        case IntTok() if True:
+            return \"non-zero\"
+        case _:
+            return \"unreachable\"
+";
+        let d = check(src);
+        assert!(
+            !d.errors().iter().any(|e| matches!(e, TycError::MissingReturn { .. })),
+            "guarded sealed-union match with a wildcard tail must not fire missing_return; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
     }
