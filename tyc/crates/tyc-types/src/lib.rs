@@ -8579,14 +8579,23 @@ fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
 /// `result_error_mismatch` check wouldn't see `Err[E]` vs
 /// `Result[T, E_outer]`.
 /// `true` when `expr` is a bare reference to a `?`-operator temporary
-/// (`__typhon_q_N__`). These names are synthesised by the preprocessor's
-/// [`tyc_syntax::expand_question_ops`] pass; a `return __typhon_q_N__`
-/// statement is therefore guaranteed to come from a `?` lowering, never
-/// from user-written code (the leading double underscore is reserved).
+/// (`__typhon_q_N__`) or a default-propagating `with`-chain temporary
+/// (`__typhon_with_N__`). Both names are synthesised by the preprocessor
+/// — `expand_question_ops` emits the former and `expand_with_chains`
+/// emits the latter — and a `return <name>` statement on either is the
+/// lowered shape of the user's `?` propagation. The reserved
+/// `__typhon_…__` prefix is never produced by user code.
+///
+/// FINDINGS v0.7.1 #5: previously this helper only matched the `?`
+/// operator's temporaries, so `result_error_mismatch` never fired when
+/// the same propagation was written inside a `with`-chain
+/// (`with x = fetch(id)?: return Ok(x)` on a function returning a
+/// different `Result` error type).
 fn is_question_op_temp(expr: &Expr) -> bool {
     if let Expr::Name(n) = expr {
         let s = n.id.as_str();
-        return s.starts_with("__typhon_q_") && s.ends_with("__");
+        return (s.starts_with("__typhon_q_") || s.starts_with("__typhon_with_"))
+            && s.ends_with("__");
     }
     false
 }
@@ -10851,6 +10860,26 @@ mod tests {
             &prep.unsafe_lines,
             &prep.frozen_class_lines,
         )
+    }
+
+    /// Like `check`, but also runs the upstream sugar passes the real CLI
+    /// chains (`with`-chain, `gather`, `go`, multi-line guards, lazy
+    /// imports, typed-let-unpack, `?` operator). Tests that need a feature
+    /// outside the plain `preprocess` slice — e.g. `with name = f()?:`
+    /// — use this helper instead. Mirrors `expand_for_check` in
+    /// `tyc/src/commands/check.rs`.
+    fn check_full(src: &str) -> Diagnostics {
+        use tyc_syntax::preprocess::{
+            expand_gather_blocks, expand_go_calls, expand_inline_question_ops, expand_lazy_imports,
+            expand_multiline_guards, expand_pipes, expand_question_ops, expand_typed_let_unpack,
+            expand_with_chains,
+        };
+        let expanded = expand_question_ops(&expand_inline_question_ops(&expand_pipes(
+            &expand_with_chains(&expand_go_calls(&expand_gather_blocks(
+                &expand_multiline_guards(&expand_lazy_imports(&expand_typed_let_unpack(src))),
+            ))),
+        )));
+        check(&expanded)
     }
 
     #[test]
@@ -16674,6 +16703,27 @@ def main() -> None:
         assert!(
             !d.has_errors(),
             "list.append must still resolve; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #5: `?` error-type mismatch inside a default-
+    /// propagating `with`-chain. `fetch` returns `Result[str, int]` so the
+    /// implicit `return Err(...)` would violate the outer `Result[str, str]`.
+    #[test]
+    fn v071_with_chain_error_mismatch_fires() {
+        let src = "\
+def fetch(id: int) -> Result[str, int]:
+    return Ok(\"data\")
+
+def combine(id: int) -> Result[str, str]:
+    with name = fetch(id)?:
+        return Ok(name)
+";
+        let d = check_full(src);
+        assert!(
+            d.has_errors(),
+            "with-chain `?` error mismatch must fire; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
     }
