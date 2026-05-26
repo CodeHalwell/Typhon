@@ -93,6 +93,21 @@ pub fn run(args: RunArgs) -> Result<()> {
     if !args.compile {
         return run_vm(args);
     }
+    // FINDINGS #40: `tyc run --compile foo.ty` used to fall through to
+    // `tyc build foo.ty`, which would join the path with `src/` and
+    // emit a baffling "source directory 'foo.ty/src' does not exist".
+    // `--compile` mode requires a project layout (it needs to find
+    // `main.py` after the build), so reject a single-file invocation
+    // up-front with a message that points the user at `tyc init` or
+    // the bare-VM mode.
+    if args.path.is_file() {
+        return Err(miette!(
+            "tyc run --compile requires a project layout, not a single file. \
+             Use `tyc init` to scaffold one (or pass a directory), or drop \
+             `--compile` to execute `{}` directly in the in-process VM.",
+            args.path.display()
+        ));
+    }
     // 1. Decide where build outputs go.  In `--temp` mode we own a
     //    TempDir guard whose Drop removes the directory; we keep it
     //    alive across the child process by binding it to a local.
@@ -295,6 +310,36 @@ mod tests {
         assert!(
             msg.contains("cannot be used with") || msg.contains("conflicts"),
             "expected a conflict error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn compile_mode_rejects_single_file_with_actionable_error() {
+        // FINDINGS #40: `tyc run --compile foo.ty` previously cascaded
+        // into the build command which then complained that
+        // 'foo.ty/src' didn't exist. Verify the new pre-flight check
+        // surfaces an actionable message instead.
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("foo.ty");
+        std::fs::write(&file, "let x: int = 1\n").unwrap();
+        let args = RunArgs {
+            path: file,
+            compile: true,
+            entry: PathBuf::from("main.py"),
+            python: "python3".into(),
+            temp: false,
+            no_build: true,
+            script_args: vec![],
+        };
+        let err = run(args).expect_err("--compile on a single file must fail");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("project layout"),
+            "error should mention 'project layout', got: {msg}"
+        );
+        assert!(
+            !msg.contains("source directory"),
+            "old build-side message should no longer appear: {msg}"
         );
     }
 
