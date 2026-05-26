@@ -207,7 +207,7 @@ impl Default for StrictnessConfig {
     fn default() -> Self {
         Self {
             no_implicit_any: true,
-            unused_import: "error".into(),
+            unused_import: "warn".into(),
             exhaustive_match: "error".into(),
             methods_in_class_body: "warn".into(),
             auto_memoise: false,

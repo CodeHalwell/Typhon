@@ -599,8 +599,17 @@ pub enum TycError {
     },
 
     /// An imported name is never used in the module.
+    ///
+    /// Default severity is **warn** — almost every linter treats unused
+    /// imports as a stylistic nit rather than a hard error, and bare
+    /// `tyc check` should match that expectation. Codebases that want to
+    /// keep their imports rigorously pruned can flip `[strictness]
+    /// unused-import = "error"` in `typhon.toml` to promote the
+    /// diagnostic back into an error via
+    /// [`crate::commands::util::apply_strictness`]. FINDINGS #41.
     #[error("imported name '{name}' is never used")]
     #[diagnostic(
+        severity(Warning),
         code(tyc::unused_import),
         url("https://typhon.dev/lang/diagnostics/unused_import"),
         help("remove the import, or prefix it with `_` if it is intentionally unused")
