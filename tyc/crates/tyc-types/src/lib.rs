@@ -1902,6 +1902,16 @@ pub struct InterfaceShape {
     /// `class`es structurally), for sealed-union variants without
     /// explicit bases, and for any class declared with no bases.
     pub bases: Vec<String>,
+    /// When `true`, the shape was synthesised from runtime venv
+    /// introspection (or another partial source) and only carries the
+    /// constructor field surface — methods, inheritance, and field
+    /// types are not reflected. `class_hierarchy_fully_known` treats
+    /// such classes as foreign, so the v0.8.0 `attribute_not_found`
+    /// diagnostic stays lenient on `obj.method(...)` calls against
+    /// third-party Python classes whose methods we don't see (e.g.
+    /// `uvicorn.Server.serve`, `httpx.AsyncClient.aclose`,
+    /// `fastapi.Request.body`). v0.8.0 carry-over.
+    pub partial: bool,
 }
 
 /// Tracking state for a binding constructed via `X.__new__(X)` or
@@ -2395,10 +2405,12 @@ impl<'a> Checker<'a> {
     }
 
     /// Return `true` when every class in `cls_name`'s inheritance chain has a
-    /// recorded shape in `class_shapes`. Used by `attribute_not_found` emit
-    /// sites to stay lenient when a base class is foreign / unknown: if any
-    /// ancestor's members are not visible to the checker, we can't be
-    /// confident the attribute is truly missing.
+    /// recorded shape in `class_shapes` and none of those shapes carry the
+    /// `partial` marker. Used by `attribute_not_found` emit sites to stay
+    /// lenient when a base class is foreign / unknown or only partially
+    /// reflected (venv introspection records constructor fields but not
+    /// methods, so attribute access on the resulting shape can't be checked
+    /// soundly).
     fn class_hierarchy_fully_known(&self, cls_name: &str) -> bool {
         let mut stack: Vec<&str> = vec![cls_name];
         let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -2406,8 +2418,10 @@ impl<'a> Checker<'a> {
             if !visited.insert(name) {
                 continue;
             }
-            if !self.class_shapes.contains_key(name) {
-                return false;
+            match self.class_shapes.get(name) {
+                None => return false,
+                Some(shape) if shape.partial => return false,
+                Some(_) => {}
             }
             if let Some(parents) = self.class_parents.get(name) {
                 stack.extend(parents.iter().map(String::as_str));
@@ -10028,11 +10042,12 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // with an underscore (private convention — too noisy and
                     // dunder/`__init__` style names are often emitted by the
                     // desugar pass), and (c) every base in the class's
-                    // hierarchy is in `class_shapes` so we're confident the
-                    // attribute is truly absent rather than hidden behind a
-                    // foreign / unknown base. Span the attribute-name token
-                    // (not the whole expression) to match the TypeVar arm's
-                    // existing style.
+                    // hierarchy has a fully-known shape — venv-introspected
+                    // / partial shapes (third-party Python classes whose
+                    // method surface we don't have access to) are treated as
+                    // foreign by `class_hierarchy_fully_known` so this stays
+                    // quiet on `fastapi.Request.body(...)` etc. v0.8.0
+                    // carry-over.
                     if c.unsafe_depth == 0
                         && !attr_name.starts_with('_')
                         && c.class_hierarchy_fully_known(class_name.as_str())
@@ -10129,8 +10144,10 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     // (`list`/`dict`/…) — that path is handled by the
                     // dedicated builtin emit above. For user-defined generic
                     // classes (`Box[int]`, `Stream[T]`), apply the same
-                    // safety rails: skip in `unsafe:`, skip underscored attrs,
-                    // skip when any base in the hierarchy is unknown.
+                    // safety rails: skip in `unsafe:`, skip underscored
+                    // attrs, skip when any base in the hierarchy is unknown
+                    // or partial (venv-introspected third-party generic
+                    // heads land here).
                     if !is_builtin_generic_head(class_name.as_str())
                         && c.unsafe_depth == 0
                         && !attr_name.starts_with('_')

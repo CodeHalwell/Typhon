@@ -7,7 +7,7 @@ sidebar:
 
 import { Aside } from '@astrojs/starlight/components';
 
-Typhon is in **active development**. The minimum-viable language — non-null types, sealed unions, `Result[T, E]`, dataclass-emit classes — is shippable today. Phase 5 (interop and developer experience) shipped in [v0.1.6](https://github.com/CodeHalwell/Typhon/releases/tag/v0.1.6); Phase 5.5 (constructor / method arity safety) shipped in [v0.2.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.2.0); Phase 6 (Python-annoyances surface) shipped in [v0.3.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.0) with `newtype`, `freeze let`, `pub`, three new effect/safety diagnostics (`blocking_in_async`, `resource_not_managed`, `div_by_zero_literal`), every open finding from the May 2026 stress campaigns closed, and pre-built install artifacts for **Linux** and **Windows** alongside the existing **macOS** binaries. [v0.3.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.1) is a correctness point release that closes the 2026-05-22 stress round (N1–N13: three CRITICAL silent-wrong-output bugs in emit / VM, five HIGH, two MEDIUM, three LOW). [v0.4.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.4.0) is a type-checker correctness sweep (bool ⊆ int, subclass-constructor inheritance, dotted-attribute annotations, missing_field_init escapes, De Morgan narrowing, triple-quoted round-trip) on top of a third stress round. [v0.5.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.5.0) is the post-v0.4 roadmap-sweep release that closes seven Phase 4+ items plus four follow-up epics: Salsa cache shared across the LSP check path, `tyc debug` reads in full Typhon coordinates, dict-comp parallelisation, the `Type::TypeConstructor` foundation for higher-kinded types, comptime types-as-values, three new `tyc migrate` rewrites (frozen dataclasses → `class X frozen:`, Protocol → `interface`, `NewType` → `newtype`), and an opt-in PyPI corpus sweep harness. [v0.5.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.5.1) is a correctness + tooling point release on top of v0.5.0: three emit-correctness fixes (triple-quote whitespace tracker desync, `case Ok(...)` pattern walk for the `typhon_runtime` auto-import, duplicate `__typhon_Err__` alias dedupe), a deep VS Code TextMate grammar audit closing ~18 miscolorings, and 22 new stdlib-only examples (47–68) with emitted `.py` companions for examples 01–46 alongside. [v0.5.2](https://github.com/CodeHalwell/Typhon/releases/tag/v0.5.2) is a correctness + documentation point release: two compiler fixes that broaden the accepted surface (`<ident>?` propagation in value position lowered to a `__typhon_q__` ladder instead of being smashed into `<ident> | None`, and `set - set` / `frozenset - frozenset` now type-check as Python set-difference), a ~40-file docs-site sweep adding side-by-side Typhon / Emitted-Python tabs to every complete-program example in the tour, types, reference, recipes, getting-started, and lowering sections, and a re-runnable audit harness under `docs-site/scripts/verify_examples.py` so the same sweep can run in CI. [v0.6.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.6.0) is the apps-feedback minor release on top of v0.5.2 — a two-round stress campaign built ten multi-file production-shaped apps (event-sourced banking, distributed KV, mini-compiler, search engine, GraphQL server, game ECS, trading engine, ML orchestrator, web crawler, task scheduler — under `examples/apps/`) and the release closes every issue from that campaign. Three additive features: `Ok` / `Err` expose the standard `Result` combinators as methods (`.map`, `.map_err`, `.and_then`, `.or_else`); `impl` on a sealed-union alias distributes to every variant; and a new `tyc::stdlib_module_shadow` warning prevents the `ImportError` cascade when a `.ty` stem collides with a Python stdlib top-level module. Compiler fixes cover cross-module sealed-union and interface flow, full param / return types on cross-module function signatures, exhaustive `match` over any subject expression, partial keyword patterns, sibling-`case` `let` shadowing, for-target rebinding of outer lets, `pub freeze let` / `pub def` parsing, and the `loop.run_until_complete` / `@contextmanager` carve-outs. [v0.6.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.6.1) is a polish release on top of v0.6.0 — VS Code annotation-colour fix for `let name: lowercase_type = …` and a `.py.map` sidecar move under `<out>/.sourcemaps/` mirroring the emitted Python tree. **The current release is [v0.7.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.7.0)** — the carry-over minor release that closes the Round-3 apps-feedback campaign on top of v0.6.1. A third stress round built five additional production-shaped apps on top of the original ten (real-time game server, static site generator, vector DB, API gateway, stream processor under `examples/apps/11–15`) and every remaining ergonomics gap is turned into a compiler feature: `pub *` wildcard re-export aggregation in `__init__.ty` (transitive through sub-packages, cycle-safe, with `tyc::pub_name_collision` / `tyc::pub_star_outside_init` diagnostics); declare-only `let NAME: T` with arm-assignment in `match`/`if`/`elif`/`else` and the companion `tyc::use_of_uninitialised` definite-assignment analysis; `with cm() as r:` types `r` from `__enter__` / `__aenter__` and from `@contextmanager` / `@asynccontextmanager` factories; `await` on `Callable[..., Awaitable[T]]` / `Coroutine[Y, S, T]` unwraps to `T`; same-newtype arithmetic preserves the newtype across `+ - * // % **`; cross-module generic method dispatch propagates class TypeVars; nested `from X import Y` in `if`/`for`/`while`/`with`/`try`/`match` arms binds; sibling `if`/`elif` no longer trips `no_block_shadow`; multi-line `go expr(...)` parses; ternary `body if test else orelse` narrows; `tyc::field_default_ordering` catches non-default-after-default class fields. All fifteen apps re-organised into grouped subdirectories under `src/` with `pub *` `__init__.ty` facades. VS Code extension bumped to `0.2.0`. v0.7.0 is strictly additive on the language surface — every previously-accepted program continues to compile to identical Python. Most of the more advanced features (interfaces, comptime, lazy loading, automatic gather, free-threaded parallelism, the package-manager surface, the REPL, the debugger launcher, the migrator) are also landed; what remains is polish.
+Typhon is in **active development**. The minimum-viable language — non-null types, sealed unions, `Result[T, E]`, dataclass-emit classes — is shippable today. Phase 5 (interop and developer experience) shipped in [v0.1.6](https://github.com/CodeHalwell/Typhon/releases/tag/v0.1.6); Phase 5.5 (constructor / method arity safety) shipped in [v0.2.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.2.0); Phase 6 (Python-annoyances surface) shipped in [v0.3.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.0) with `newtype`, `freeze let`, `pub`, three new effect/safety diagnostics (`blocking_in_async`, `resource_not_managed`, `div_by_zero_literal`), every open finding from the May 2026 stress campaigns closed, and pre-built install artifacts for **Linux** and **Windows** alongside the existing **macOS** binaries. [v0.3.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.3.1) is a correctness point release that closes the 2026-05-22 stress round (N1–N13: three CRITICAL silent-wrong-output bugs in emit / VM, five HIGH, two MEDIUM, three LOW). [v0.4.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.4.0) is a type-checker correctness sweep (bool ⊆ int, subclass-constructor inheritance, dotted-attribute annotations, missing_field_init escapes, De Morgan narrowing, triple-quoted round-trip) on top of a third stress round. [v0.5.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.5.0) is the post-v0.4 roadmap-sweep release that closes seven Phase 4+ items plus four follow-up epics: Salsa cache shared across the LSP check path, `tyc debug` reads in full Typhon coordinates, dict-comp parallelisation, the `Type::TypeConstructor` foundation for higher-kinded types, comptime types-as-values, three new `tyc migrate` rewrites (frozen dataclasses → `class X frozen:`, Protocol → `interface`, `NewType` → `newtype`), and an opt-in PyPI corpus sweep harness. [v0.5.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.5.1) is a correctness + tooling point release on top of v0.5.0: three emit-correctness fixes (triple-quote whitespace tracker desync, `case Ok(...)` pattern walk for the `typhon_runtime` auto-import, duplicate `__typhon_Err__` alias dedupe), a deep VS Code TextMate grammar audit closing ~18 miscolorings, and 22 new stdlib-only examples (47–68) with emitted `.py` companions for examples 01–46 alongside. [v0.5.2](https://github.com/CodeHalwell/Typhon/releases/tag/v0.5.2) is a correctness + documentation point release: two compiler fixes that broaden the accepted surface (`<ident>?` propagation in value position lowered to a `__typhon_q__` ladder instead of being smashed into `<ident> | None`, and `set - set` / `frozenset - frozenset` now type-check as Python set-difference), a ~40-file docs-site sweep adding side-by-side Typhon / Emitted-Python tabs to every complete-program example in the tour, types, reference, recipes, getting-started, and lowering sections, and a re-runnable audit harness under `docs-site/scripts/verify_examples.py` so the same sweep can run in CI. [v0.6.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.6.0) is the apps-feedback minor release on top of v0.5.2 — a two-round stress campaign built ten multi-file production-shaped apps (event-sourced banking, distributed KV, mini-compiler, search engine, GraphQL server, game ECS, trading engine, ML orchestrator, web crawler, task scheduler — under `examples/apps/`) and the release closes every issue from that campaign. Three additive features: `Ok` / `Err` expose the standard `Result` combinators as methods (`.map`, `.map_err`, `.and_then`, `.or_else`); `impl` on a sealed-union alias distributes to every variant; and a new `tyc::stdlib_module_shadow` warning prevents the `ImportError` cascade when a `.ty` stem collides with a Python stdlib top-level module. Compiler fixes cover cross-module sealed-union and interface flow, full param / return types on cross-module function signatures, exhaustive `match` over any subject expression, partial keyword patterns, sibling-`case` `let` shadowing, for-target rebinding of outer lets, `pub freeze let` / `pub def` parsing, and the `loop.run_until_complete` / `@contextmanager` carve-outs. [v0.6.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.6.1) is a polish release on top of v0.6.0 — VS Code annotation-colour fix for `let name: lowercase_type = …` and a `.py.map` sidecar move under `<out>/.sourcemaps/` mirroring the emitted Python tree. [v0.7.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.7.0) is the Round-3 apps-feedback carry-over: `pub *` wildcard re-export aggregation in `__init__.ty`, declare-only `let NAME: T` with arm-assignment, `with cm() as r:` inference from `__enter__` / `@contextmanager`, `await Callable[..., Awaitable[T]]` unwrapping, same-newtype-preserving arithmetic, cross-module generic method dispatch, ternary narrowing, `tyc::field_default_ordering`, and five new production-shaped apps under `examples/apps/11–15`. [v0.7.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.7.1) is a strict LSP bugfix point release that aligns semantic-token positions with the original `.ty` source. **The current release is [v0.8.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.8.0)** — the stress-test sweep release that closes **41 findings** from a multi-file v0.7.1 stress report spanning the type checker, VM, parser, lowering passes, diagnostics, and CLI. The static surface picks up `tyc::attribute_not_found` on class instances and generic classes (with foreign / venv-introspected classes tracked by a new `partial` shape marker so the diagnostic stays lenient on third-party APIs), interface parameter type conformance, string-literal singleton types (`Type::LitStr` for `type Color = "red" | "green" | "blue"`), `?` propagation in `with`-chains, and `tyc::pattern_shadows_outer`. The tree-walking VM gains arbitrary-precision integers (`num_bigint::BigInt`), insertion-ordered dicts (`indexmap::IndexMap`), full f-string format flags, mapping match patterns, sequence-with-star patterns, recursion limit raised to 1000, and a much larger native stdlib (`re`, `typing`, `collections`, `functools`, `itertools`, `dataclasses`, `pathlib`). The parser learns five language-feature scaffolds the docs already advertised: HKT `class Functor[F[_]]:`, `impl[T] SealedUnionAlias[T]:` distributing methods across every variant, generic-plus-frozen `class X[T] frozen:`, `async def` in `interface` bodies auto-completing the body, outer-annotation tuple unpack. Diagnostics polish: synthetic preprocess lines no longer leak into source listings (`SanitisedDiagnostic` wrapper); three new lint warnings (`tyc::empty_collection_no_annotation`, `tyc::typing_alias_in_annotation`, `tyc::contains_secret_literal`); better hints on `wrong_arg_count` / collection variance / dict-to-model mismatch. CLI: `tyc check lib.dty` accepts a single `.dty` file directly; `tyc run --compile` rejects single-file inputs up-front; `tyc migrate` strips trivial `__init__` methods. Default change: `unused_import` is now `warn` (was `error`). v0.8.0 is mostly additive on the accepted surface; the BigInt switch in the VM means programs that relied on silent i64 wrap-around now compute different (correct) results. Most of the more advanced features (interfaces, comptime, lazy loading, automatic gather, free-threaded parallelism, the package-manager surface, the REPL, the debugger launcher, the migrator) are also landed; what remains is polish.
 
 The canonical per-feature status lives in the [Roadmap](/Typhon/project/roadmap/). This page is a quick summary.
 
@@ -55,6 +55,146 @@ The canonical per-feature status lives in the [Roadmap](/Typhon/project/roadmap/
 
 - ✅ CI (`cargo fmt`, `clippy -D warnings`, `cargo test --workspace`, `cargo-deny`).
 - ✅ Generated `typhon_runtime/` ships as local source — no PyPI dependency.
+
+## Landed in v0.8.0 (stress-test sweep)
+
+The stress-test sweep release on top of v0.7.1. Closes **41 findings**
+from a multi-file v0.7.1 stress report spanning the type checker, VM,
+parser, lowering passes, diagnostics, and CLI.
+
+The release is mostly additive on the accepted surface; the BigInt
+switch in the VM means programs that relied on silent i64
+wrap-around now compute different (correct) results.
+
+### Added — type system
+
+- ✅ **`tyc::attribute_not_found` now fires on class instances and
+  generic classes**, not just `TypeVar`-bounded parameters. The
+  diagnostic was already documented but had no firing site for the
+  most common case. Foreign / venv-introspected classes are tracked
+  with a new `partial` shape marker and keep the permissive
+  degrade-to-`Unknown` behaviour so adapters around external libraries
+  don't get false positives. Skipped in `unsafe:` regions and for
+  dunder / leading-underscore names.
+- ✅ **Interface parameter type conformance.**
+  `interface_missing_members` now compares parameter types
+  position-by-position (contravariant on params) in addition to
+  arity, so a `class BadRepo` claiming to implement
+  `interface Repo: def save(self, item: str) -> bool` with a
+  `def save(self, item: int) -> bool` impl is rejected at conformance
+  time.
+- ✅ **`Type::LitStr(String)` — string-literal singleton types.**
+  `type Color = "red" | "green" | "blue"` and `Literal["a", "b"]`
+  produce `LitStr` slots in the resulting `Union`; assignability
+  rejects `paint("orange")` against `Color`. Bidirectional inference
+  widens string literals to `LitStr` only when the expected type
+  carries one, so unannotated `let s = "hi"` still infers plain
+  `str`.
+- ✅ **`?` propagation inside `with`-chains.**
+  `result_error_mismatch` fires when the implicit return form of
+  `with x = f()?: …` routes a mismatching error type through the
+  chain.
+- ✅ **`tyc::pattern_shadows_outer`** fires when a `match` capture
+  binds a name that already exists in the outer scope.
+- ✅ **`field_default_ordering` skips `ClassVar` fields.**
+- ✅ **`newtype Foo = "literal"` is rejected** with the new
+  `tyc::newtype_invalid_base` diagnostic.
+- ✅ **Exhaustive-match-with-guards no longer fires `missing_return`**
+  when every variant has at least one (possibly-guarded) case.
+- ✅ **Function parameter rebinding requires `mut`**, matching the
+  `let`/`mut` rule everywhere else.
+
+### Added — parser & lowering
+
+- ✅ **HKT scaffold** `class Functor[F[_]]:` parses.
+- ✅ **`impl[T] SealedUnionAlias[T]:` distributes the methods** across
+  every variant of the sealed-union alias.
+- ✅ **`class X[T] frozen:`** (generic + frozen) parses cleanly.
+- ✅ **`async def` in `interface` bodies** auto-completes the
+  `: ...` body (sync `def` already did).
+- ✅ **Outer-annotation tuple unpack** `let (a, b): tuple[int, str] = …`
+  is accepted.
+
+### Added — VM (tree-walking interpreter)
+
+- ✅ **Arbitrary-precision integers.** `Value::Int` is now backed by
+  `num_bigint::BigInt` everywhere. `2 ** 100` and `fib(99)` no longer
+  overflow. **Behaviour change:** programs that relied on the VM's
+  silent i64 wrap-around now produce mathematically-correct results.
+- ✅ **Dict insertion order preserved.** `RcDict` is now an
+  `indexmap::IndexMap`; the same `.ty` file no longer prints dicts
+  in different orders under `tyc run` vs
+  `tyc build && python build/main.py`.
+- ✅ **f-string format flags fully wired.** Zero-pad, alternate-form,
+  `[fill]align`, sign, width, comma, precision, and type all match
+  CPython output.
+- ✅ **Mapping match patterns** (`case {"type": "circle"}`,
+  `case {…, **rest}`) **and sequence-with-star patterns**
+  (`case [x, *rest, y]`) implemented.
+- ✅ **Recursion limit raised to 1000** (was 256) to match CPython.
+- ✅ **`yield` and `async def`** emit a clear `NotImplementedError`
+  pointing at `tyc build && python` as the fallback instead of
+  crashing the interpreter.
+- ✅ **Extend-builtin rewrites apply in VM mode.**
+- ✅ **Subclass constructors inherit fields.** `class Dog(Animal):
+  breed: str` accepts `Dog(name=…, age=…, breed=…)` under `tyc run`.
+- ✅ **`freeze let` and `newtype` shims** are now native builtins
+  so VM mode no longer crashes with `NameError` on the lowered
+  call.
+- ✅ **Larger native stdlib.** Adds `re`, `typing`, `collections`
+  (`OrderedDict`, `defaultdict`, `Counter`, `namedtuple`),
+  `functools` (`lru_cache`, `cache`, `cached_property`, `reduce`,
+  `partial`), `itertools` (`chain`, `count`, `cycle`, `accumulate`,
+  `combinations`, `permutations`, `product`, `islice`, `takewhile`,
+  `dropwhile`, `groupby`), `dataclasses`, `pathlib`.
+- ✅ **`from typing import Callable`** no longer crashes — VM-mode
+  lowering strips pure-type imports.
+
+### Added — diagnostics & CLI
+
+- ✅ **Synthetic preprocess lines no longer leak into source listings.**
+  `SanitisedDiagnostic` wraps every emitted diagnostic and hides the
+  `class __typhon_impl_Foo(object):` / `from typhon_runtime import …`
+  / `?`-scaffolding lines, restoring the original text for the user.
+- ✅ **Dedicated parse-error hints** for multi-line `|>` chains
+  (wrap in parens) and `freeze let` at non-module scope.
+- ✅ **`wrong_arg_count` rephrasing** for kw-only mismatches —
+  the self-contradictory "expected 2, got 2" message is replaced
+  with a "pass them by name" help block.
+- ✅ **Collection variance hint** suggests `Sequence[Animal]` /
+  `Mapping[K, V]` / `frozenset[T]` instead of the previously-unhelpful
+  "widen to `list[Animal] | list[Dog]`".
+- ✅ **Dict-to-model mismatch** points users at the constructor form
+  (`UserCreate(name=…, age=…, email=…)`).
+- ✅ **`tyc check lib.dty`** now accepts a single `.dty` file directly.
+- ✅ **`tyc run --compile`** rejects single-file inputs up-front.
+- ✅ **`tyc migrate`** strips trivial `__init__` methods and emits
+  the resulting class as plain `class` (not `class!`), preserving
+  any leading class docstring.
+- ✅ **New lint warnings:**
+  `tyc::empty_collection_no_annotation`,
+  `tyc::typing_alias_in_annotation`,
+  `tyc::contains_secret_literal`.
+
+### Changed
+
+- ✅ **`unused_import` default severity is now `warn`** (was
+  `error`). Set `[strictness] unused-import = "error"` in
+  `typhon.toml` to restore the old default.
+
+## Landed in v0.7.1 (LSP bugfix)
+
+A strict bugfix point release on top of v0.7.0. No language, runtime,
+or stdlib changes.
+
+- ✅ **Semantic-token positions now line up with the original `.ty`
+  source instead of the preprocessed Python view.** The LSP
+  computed token coordinates against the post-preprocess source
+  (with `pub`, `comptime`, `freeze`, `lazy`, `newtype` line-prefix
+  modifiers stripped) but the editor applied those coordinates to
+  the original file. The remap pass now translates token spans into
+  original-source coordinates and validates each one by string
+  match, dropping synthetic identifiers the preprocessor injects.
 
 ## Landed in v0.7.0 (Round-3 carry-over)
 

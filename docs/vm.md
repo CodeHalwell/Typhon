@@ -43,7 +43,8 @@ tyc run --compile --temp      # legacy with ephemeral build dir
   `return`, `pass`, `match` (literal / capture / wildcard / sequence /
   class patterns including the native `Ok(x)` / `Err(e)` cases).
 - Functions: positional, keyword, default, `*args`, `**kwargs`, closures,
-  recursion (256-frame default depth, configurable on the `Interpreter`).
+  recursion (1000-frame default depth since v0.8.0 to match CPython,
+  configurable on the `Interpreter`).
 - Classes: annotated fields (constructor synthesised at instantiation),
   explicit `__init__`, methods declared inside `class` body, methods
   declared in a sibling `impl Foo:` block (merged on the fly), single
@@ -82,6 +83,13 @@ Plus the result constructors `Ok` and `Err`, the singletons `True`,
 | `json` | `dumps`, `loads` (full JSON 7159 surface) |
 | `time` | `time()`, `sleep()`, `monotonic()` |
 | `random` | `random()`, `randint(a, b)`, `seed(n)` — xorshift PRNG, NOT cryptographic |
+| `re` (v0.8.0) | `match`, `search`, `findall`, `sub`, `split`, `compile`. `match` is anchored at the start of the string. Some flag arguments (`re.MULTILINE`, etc.) are accepted but ignored — `tyc::python_semantic_drift` warns when the impact would change behaviour |
+| `typing` (v0.8.0) | Generic constructors used at runtime are no-ops; `Callable`, `List`, etc. are accepted in import position and ignored at runtime. Type-only imports are stripped by the desugar pre-pass |
+| `collections` (v0.8.0) | `OrderedDict`, `defaultdict` (no auto-default — explicit `default_factory` argument is recorded but not invoked), `Counter`, `namedtuple` |
+| `functools` (v0.8.0) | `lru_cache`, `cache`, `cached_property`, `reduce`, `partial` |
+| `itertools` (v0.8.0) | `chain`, `count`, `cycle` (materialise a bounded prefix), `accumulate`, `combinations`, `permutations`, `product`, `islice`, `takewhile`, `dropwhile`, `groupby` |
+| `dataclasses` (v0.8.0) | `dataclass`, `field`, `fields`, `asdict`, `astuple` |
+| `pathlib` (v0.8.0) | `Path` with `exists`, `read_text`, `write_text`, `parent`, `name`, `stem`, `suffix`, `with_suffix`, `joinpath` / `/` |
 | `typhon_runtime` | `Ok`, `Err`, `tasks.spawn`, `lazy.lazy_let`, `lazy.lazy_import` — the `spawn` shim runs synchronously |
 
 Any other module raises `ImportError` with a pointer to `--compile`.
@@ -107,15 +115,36 @@ Surface as `NotImplementedError` at runtime, with the feature name in the
 message:
 
 - `async def` / `await` / `gather:` / `go` — synchronous execution only.
+  v0.8.0 surfaces a clear `NotImplementedError` pointing at `tyc build &&
+  python build/main.py` as the fallback (previously crashed the
+  interpreter).
 - Real generator functions with `yield` (generator *expressions* and the
-  list-comp-shaped form work, but they're materialised eagerly).
+  list-comp-shaped form work, but they're materialised eagerly). v0.8.0:
+  the same `NotImplementedError` shape applies.
 - Template strings (`t"…"`).
 - IPython escape commands.
 - `with` statements other than `open()` (basic context-manager protocol).
-- Mapping / class-keyword patterns in `match`.
-- Bigint arithmetic — ints are `i64`; overflow raises `OverflowError`.
+- `lazy let` inside a class body uses an identity decorator; callers must
+  use the method-call form `obj.x()`.
 
 If your program needs any of these, run with `--compile` for now.
+
+**Behaviour changes in v0.8.0** (vs v0.7.x):
+
+- `Value::Int` is now backed by `num_bigint::BigInt`. `2 ** 100` and
+  `fib(99)` compute mathematically-correct results. Programs that
+  *relied* on the previous silent i64 wrap-around will now compute
+  different results.
+- `RcDict` is now an `indexmap::IndexMap`. Dict insertion order is
+  preserved across `dict.update`, `del d[k]` (via `shift_remove`),
+  and `dict.pop` — so the same `.ty` no longer prints dicts in different
+  orders under `tyc run` vs `tyc build && python build/main.py`.
+- f-string format flags are fully wired (`{x:0>5}`, `{n:#x}`,
+  `{f:.3f}`, `{v:,}`, `{w:>{width}.{prec}f}` etc.) and match CPython
+  byte-for-byte.
+- Mapping match patterns (`case {"type": "circle"}`,
+  `case {…, **rest}`) and sequence-with-star patterns
+  (`case [x, *rest, y]`) are implemented.
 
 ## Architecture
 

@@ -177,6 +177,22 @@ language-feature scaffolds the docs already advertised.
   separator between duplicated `impl` blocks and stops capturing
   trailing top-level blank lines into the body.
 
+### Fixed — type system (v0.8.0 carry-over)
+
+- **`tyc::attribute_not_found` no longer fires on venv-introspected
+  third-party classes.** The v0.8.0 firing-site widening incorrectly
+  trusted shapes built by runtime introspection (`inspect.signature`)
+  to be method-complete, so `obj.method(...)` against any
+  third-party Python class with a known `__init__` flagged the call
+  as missing the attribute (`uvicorn.Server.serve(...)`,
+  `httpx.AsyncClient.aclose(...)`, `fastapi.Request.body(...)`, …).
+  `InterfaceShape` now carries a `partial` flag that
+  `class_shape_from_params` sets on every venv-derived shape;
+  `class_hierarchy_fully_known` returns `false` whenever any class
+  in the inheritance chain is partial, so attribute access stays
+  permissive on third-party APIs whose method surface we can't see.
+  All fifteen apps under `examples/apps/` build clean again.
+
 ### Known limitations
 
 - **Numeric / bool literal singleton types** (`Literal[1, 2]`,

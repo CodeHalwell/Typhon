@@ -71,7 +71,7 @@ from typing import Callable
 Constraints:
 
 - `tyc::unknown_module` fires when `import X` names a module not in: Python stdlib, the project tree, `typhon_runtime`, or `[dependencies]` declared in `typhon.toml`.
-- `tyc::unused_import` fires (severity `error` by default) when an imported name is never referenced. Suppress by removing or by giving the binding a leading underscore (side-effect-only imports). The LSP's "Remove unused import" code action handles it.
+- `tyc::unused_import` fires (severity `warn` by default since v0.8.0; was `error` previously) when an imported name is never referenced. Suppress by removing or by giving the binding a leading underscore (side-effect-only imports). The LSP's "Remove unused import" code action handles it. Set `[strictness] unused-import = "error"` in `typhon.toml` to restore the pre-v0.8.0 behaviour.
 - `tyc::orphan_py_import` (warn) fires when a relative `.py` import resolves outside `src/`. `tyc build` only copies files under `src/` into the output, so the emitted Python would crash with `ModuleNotFoundError`. Move under `src/` or use an absolute import.
 - `tyc::stdlib_module_shadow` (warn, v0.6.0 + v0.7.0 refinement) fires when a top-level `.ty` file's stem matches a Python 3.13 stdlib top-level module name. The emitted `build/<name>.py` would land on `sys.path` and intercept transitive stdlib imports. **Only fires for files at the top of the configured source directory** (v0.7.0); nested files like `src/indexer/tokenize.ty` are exempt because they lower to `build/indexer/tokenize.py` which is NOT on `sys.path`. Rename top-level files (e.g. `lang_types.ty`, `records.ty`).
 - `tyc::typevar_import_rejected` blocks `from typing import TypeVar` — use PEP 695 (`def f[T](...)`).
