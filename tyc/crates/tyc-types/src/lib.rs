@@ -2344,6 +2344,28 @@ impl<'a> Checker<'a> {
         None
     }
 
+    /// Return `true` when every class in `cls_name`'s inheritance chain has a
+    /// recorded shape in `class_shapes`. Used by `attribute_not_found` emit
+    /// sites to stay lenient when a base class is foreign / unknown: if any
+    /// ancestor's members are not visible to the checker, we can't be
+    /// confident the attribute is truly missing.
+    fn class_hierarchy_fully_known(&self, cls_name: &str) -> bool {
+        let mut stack: Vec<&str> = vec![cls_name];
+        let mut visited: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        while let Some(name) = stack.pop() {
+            if !visited.insert(name) {
+                continue;
+            }
+            if !self.class_shapes.contains_key(name) {
+                return false;
+            }
+            if let Some(parents) = self.class_parents.get(name) {
+                stack.extend(parents.iter().map(String::as_str));
+            }
+        }
+        true
+    }
+
     /// Return the missing-member text for a failed interface conformance check.
     /// Returns `None` when the class actually conforms (caller should use
     /// `class_conforms_to_interface` to gate this call).
@@ -4116,19 +4138,27 @@ fn collect_classes_and_functions(c: &mut Checker, body: &[Stmt]) {
                 // Handle both plain `Name` bases and `Subscript` bases like
                 // `list[int]` — in the latter case the base name is the subscript
                 // value (e.g. `list`).
+                // Capture every base shape, including dotted attribute bases
+                // like `logging.Formatter` and other complex forms. The
+                // attribute / fallback cases stash a synthetic name that is
+                // guaranteed NOT to appear in `class_shapes`, so the
+                // hierarchy-known check used by `attribute_not_found` (and any
+                // other consumer) treats this class as having a foreign /
+                // unknown base — a key v0.7.1 #1 guard rail.
                 let parents: Vec<String> = cd
                     .bases()
                     .iter()
-                    .filter_map(|b| match b {
-                        Expr::Name(n) => Some(n.id.as_str().to_owned()),
+                    .map(|b| match b {
+                        Expr::Name(n) => n.id.as_str().to_owned(),
                         Expr::Subscript(s) => {
                             if let Expr::Name(n) = s.value.as_ref() {
-                                Some(n.id.as_str().to_owned())
+                                n.id.as_str().to_owned()
                             } else {
-                                None
+                                "__typhon_unknown_base__".to_owned()
                             }
                         }
-                        _ => None,
+                        Expr::Attribute(_) => "__typhon_unknown_base__".to_owned(),
+                        _ => "__typhon_unknown_base__".to_owned(),
                     })
                     .collect();
                 if !parents.is_empty() {
@@ -8218,6 +8248,172 @@ fn collect_narrowings_inner(c: &Checker, test: &Expr, negate: bool, out: &mut Ve
 /// `dict.get(k)` which must return `V?`, not `V` — and is the right
 /// place to grow other built-in method types (`list.pop`, `str.find`,
 /// `re.match`, …) without scattering them across the inference engine.
+/// Return `true` when `head` is the name of a builtin generic container that
+/// the checker treats as having a closed attribute set (so an unknown attribute
+/// on `xs: list[int]` is a legitimate `tyc::attribute_not_found` site rather
+/// than a "may have dynamic attrs" pass-through). FINDINGS v0.7.1 #1.
+fn is_builtin_generic_head(head: &str) -> bool {
+    matches!(
+        head,
+        "list" | "dict" | "set" | "tuple" | "str" | "bytes" | "frozenset"
+    )
+}
+
+/// Return `true` when `attr` is a known method on the CPython builtin
+/// container named `head`. The list is intentionally conservative — only
+/// public, stable methods are listed; new entries can be added as needed.
+/// Used by the `attribute_not_found` emit so `xs.append(...)` on
+/// `list[int]` still passes while `xs.fake_method()` is rejected.
+/// FINDINGS v0.7.1 #1.
+fn is_known_builtin_generic_attr(head: &str, attr: &str) -> bool {
+    match head {
+        "list" => matches!(
+            attr,
+            "append"
+                | "extend"
+                | "insert"
+                | "remove"
+                | "pop"
+                | "clear"
+                | "index"
+                | "count"
+                | "sort"
+                | "reverse"
+                | "copy"
+        ),
+        "dict" => matches!(
+            attr,
+            "get" | "keys"
+                | "values"
+                | "items"
+                | "pop"
+                | "popitem"
+                | "update"
+                | "setdefault"
+                | "clear"
+                | "copy"
+                | "fromkeys"
+        ),
+        "set" | "frozenset" => matches!(
+            attr,
+            "add"
+                | "remove"
+                | "discard"
+                | "pop"
+                | "clear"
+                | "copy"
+                | "union"
+                | "intersection"
+                | "difference"
+                | "symmetric_difference"
+                | "update"
+                | "intersection_update"
+                | "difference_update"
+                | "symmetric_difference_update"
+                | "issubset"
+                | "issuperset"
+                | "isdisjoint"
+        ),
+        "tuple" => matches!(attr, "count" | "index"),
+        "str" => matches!(
+            attr,
+            "lower"
+                | "upper"
+                | "title"
+                | "capitalize"
+                | "casefold"
+                | "swapcase"
+                | "strip"
+                | "lstrip"
+                | "rstrip"
+                | "split"
+                | "rsplit"
+                | "splitlines"
+                | "join"
+                | "replace"
+                | "find"
+                | "rfind"
+                | "index"
+                | "rindex"
+                | "count"
+                | "startswith"
+                | "endswith"
+                | "format"
+                | "format_map"
+                | "encode"
+                | "isalpha"
+                | "isalnum"
+                | "isdigit"
+                | "isdecimal"
+                | "isnumeric"
+                | "isspace"
+                | "isupper"
+                | "islower"
+                | "istitle"
+                | "isidentifier"
+                | "isprintable"
+                | "isascii"
+                | "center"
+                | "ljust"
+                | "rjust"
+                | "zfill"
+                | "expandtabs"
+                | "partition"
+                | "rpartition"
+                | "removeprefix"
+                | "removesuffix"
+                | "translate"
+                | "maketrans"
+        ),
+        "bytes" => matches!(
+            attr,
+            "decode"
+                | "find"
+                | "rfind"
+                | "index"
+                | "rindex"
+                | "count"
+                | "startswith"
+                | "endswith"
+                | "replace"
+                | "split"
+                | "rsplit"
+                | "splitlines"
+                | "strip"
+                | "lstrip"
+                | "rstrip"
+                | "lower"
+                | "upper"
+                | "title"
+                | "capitalize"
+                | "swapcase"
+                | "translate"
+                | "maketrans"
+                | "isalpha"
+                | "isalnum"
+                | "isdigit"
+                | "isspace"
+                | "isupper"
+                | "islower"
+                | "istitle"
+                | "isascii"
+                | "hex"
+                | "fromhex"
+                | "join"
+                | "partition"
+                | "rpartition"
+                | "removeprefix"
+                | "removesuffix"
+                | "center"
+                | "ljust"
+                | "rjust"
+                | "zfill"
+                | "expandtabs"
+        ),
+        _ => false,
+    }
+}
+
 fn builtin_generic_method(recv: &Type, attr: &str) -> Option<Type> {
     let Type::Generic(head, args) = recv else {
         return None;
@@ -9482,6 +9678,41 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
             if let Some(method_type) = builtin_generic_method(&recv, attr_name) {
                 return method_type;
             }
+            // Builtin generic heads (list / dict / set / tuple / str / bytes /
+            // frozenset) that hit `builtin_generic_method` and got `None` are a
+            // legitimate `attribute_not_found` site — e.g. `xs.fake_method()` on
+            // `xs: list[int]`. We consult an allowlist of well-known builtin
+            // methods first because `builtin_generic_method` only specialises
+            // a handful (`dict.get`, the Result combinators, …) — every other
+            // real method (`list.append`, `str.lower`) would otherwise be
+            // mis-flagged. Underscore-prefixed attrs and `unsafe:` blocks are
+            // skipped, matching the conservative class-instance behaviour
+            // below. FINDINGS v0.7.1 #1.
+            if let Type::Generic(head, _) = &recv {
+                if is_builtin_generic_head(head)
+                    && c.unsafe_depth == 0
+                    && !attr_name.starts_with('_')
+                    && !is_known_builtin_generic_attr(head, attr_name)
+                {
+                    let attr_start = a.attr.range.start().to_usize();
+                    let attr_len = a
+                        .attr
+                        .range
+                        .end()
+                        .to_usize()
+                        .saturating_sub(attr_start)
+                        .max(1);
+                    c.diagnostics.push_error(TycError::attribute_not_found(
+                        attr_name,
+                        head.as_str(),
+                        &c.path,
+                        c.source,
+                        attr_start,
+                        attr_len,
+                    ));
+                    return Type::Unknown;
+                }
+            }
             // Bare-import dotted access: when the receiver resolves
             // to `Type::Module(name)`, look the attribute up in the
             // project shape registry. A matching class returns
@@ -9570,7 +9801,38 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                     if let Some(field_type) = c.find_field(class_name.as_str(), attr_name) {
                         return field_type.clone();
                     }
-                    // Not found — class may have dynamic attrs; no error.
+                    // FINDINGS v0.7.1 #1: attribute is genuinely missing. Emit
+                    // `tyc::attribute_not_found` when (a) we're not inside an
+                    // `unsafe:` block, (b) the attribute name doesn't start
+                    // with an underscore (private convention — too noisy and
+                    // dunder/`__init__` style names are often emitted by the
+                    // desugar pass), and (c) every base in the class's
+                    // hierarchy is in `class_shapes` so we're confident the
+                    // attribute is truly absent rather than hidden behind a
+                    // foreign / unknown base. Span the attribute-name token
+                    // (not the whole expression) to match the TypeVar arm's
+                    // existing style.
+                    if c.unsafe_depth == 0
+                        && !attr_name.starts_with('_')
+                        && c.class_hierarchy_fully_known(class_name.as_str())
+                    {
+                        let attr_start = a.attr.range.start().to_usize();
+                        let attr_len = a
+                            .attr
+                            .range
+                            .end()
+                            .to_usize()
+                            .saturating_sub(attr_start)
+                            .max(1);
+                        c.diagnostics.push_error(TycError::attribute_not_found(
+                            attr_name,
+                            class_name.as_str(),
+                            &c.path,
+                            c.source,
+                            attr_start,
+                            attr_len,
+                        ));
+                    }
                     Type::Unknown
                 }
                 // R3-15 (2026-05-25): `s: Stream[int]` calling
@@ -9640,6 +9902,35 @@ fn infer_expr_ctx(c: &mut Checker, expr: &Expr, expected: Option<&Type>) -> Type
                             .zip(args.iter().cloned())
                             .collect();
                         return substitute_typevars(field_type, &bindings);
+                    }
+                    // FINDINGS v0.7.1 #1: same emit logic as the `Type::Class`
+                    // arm, but skip when the head is a builtin generic
+                    // (`list`/`dict`/…) — that path is handled by the
+                    // dedicated builtin emit above. For user-defined generic
+                    // classes (`Box[int]`, `Stream[T]`), apply the same
+                    // safety rails: skip in `unsafe:`, skip underscored attrs,
+                    // skip when any base in the hierarchy is unknown.
+                    if !is_builtin_generic_head(class_name.as_str())
+                        && c.unsafe_depth == 0
+                        && !attr_name.starts_with('_')
+                        && c.class_hierarchy_fully_known(class_name.as_str())
+                    {
+                        let attr_start = a.attr.range.start().to_usize();
+                        let attr_len = a
+                            .attr
+                            .range
+                            .end()
+                            .to_usize()
+                            .saturating_sub(attr_start)
+                            .max(1);
+                        c.diagnostics.push_error(TycError::attribute_not_found(
+                            attr_name,
+                            class_name.as_str(),
+                            &c.path,
+                            c.source,
+                            attr_start,
+                            attr_len,
+                        ));
                     }
                     Type::Unknown
                 }
@@ -16279,6 +16570,85 @@ def f() -> int:
             result,
             Type::Generic("T".to_string(), vec![Type::Str]),
             "non-Class binding must not replace Generic head; got {result:?}"
+        );
+    }
+
+    // ── v0.7.1 stress-test findings ───────────────────────────────────────────
+
+    /// FINDINGS v0.7.1 #1: attribute access on a `Type::Class` instance.
+    /// `f.y` on a known class must fire `attribute_not_found`.
+    #[test]
+    fn v071_attribute_not_found_on_class_instance() {
+        let src = "\
+class Foo:
+    x: int
+
+def main() -> None:
+    let f: Foo = Foo(x=1)
+    print(f.y)
+";
+        let d = check(src);
+        assert!(
+            d.errors().iter().any(|e| {
+                let m = e.to_string();
+                m.contains("attribute_not_found") || m.contains("'y'") || m.contains("`y`")
+            }),
+            "expected attribute_not_found for `f.y`; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #1: builtin generics — `xs.fake_method()` on
+    /// `xs: list[int]` must fire `attribute_not_found`.
+    #[test]
+    fn v071_attribute_not_found_on_builtin_generic() {
+        let src = "\
+def main() -> None:
+    let xs: list[int] = [1, 2, 3]
+    print(xs.fake_method())
+";
+        let d = check(src);
+        assert!(
+            d.errors().iter().any(|e| e.to_string().contains("fake_method")),
+            "expected attribute_not_found for `xs.fake_method()` on list[int]; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #1: real methods on builtin generics must still work.
+    #[test]
+    fn v071_real_builtin_generic_method_unaffected() {
+        let src = "\
+def main() -> None:
+    let xs: list[int] = [1, 2, 3]
+    xs.append(4)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "list.append must still resolve; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #1: foreign / unknown base classes suppress the check
+    /// (we can't see the base's attribute set). Subclassing `Exception` is the
+    /// canonical foreign-base case.
+    #[test]
+    fn v071_attribute_not_found_skipped_on_unknown_base() {
+        let src = "\
+class MyError(Exception):
+    pass
+
+def main() -> None:
+    let e: MyError = MyError()
+    print(e.args)
+";
+        let d = check(src);
+        assert!(
+            !d.has_errors(),
+            "attribute access on a class with a foreign base must be lenient; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
     }
 }
