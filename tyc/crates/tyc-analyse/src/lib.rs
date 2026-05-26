@@ -2829,6 +2829,158 @@ pub fn purity_diagnostics(findings: &[PurityFinding], path: &str, source: &str) 
 // their own.  Each pass walks the parsed module once and collects findings
 // into a [`Diagnostics`] bundle.
 
+/// Walk every top-level / nested binding statement in `module` and warn when
+/// a `let` / module-level assignment whose name matches the secret-suffix
+/// heuristic is initialised from a raw string literal.
+///
+/// Pattern (case-insensitive on the name): the binding identifier ends in
+/// `_TOKEN`, `_SECRET`, `_PASSWORD`, `_PWD`, `_KEY`, or `_API_KEY` (or the
+/// suffix _is_ the whole name — `KEY`, `TOKEN`, …). The RHS must be a bare
+/// string literal; any non-literal RHS (function call, attribute access,
+/// `os.getenv("…")`) is fine because it's likely runtime-driven.
+///
+/// Only fires for plain assignments — `comptime let X = env("…")` already
+/// has its own `contains_secret_literal` path inside `tyc build`, so this
+/// pass deliberately skips comptime bindings (their RHS is substituted out
+/// at build time anyway).
+pub fn analyse_secret_literal_bindings(
+    module: &ModModule,
+    path: &str,
+    source: &str,
+) -> Diagnostics {
+    let mut diags = Diagnostics::new();
+    walk_secret_literal_stmts(&module.body, path, source, &mut diags);
+    diags
+}
+
+fn walk_secret_literal_stmts(body: &[Stmt], path: &str, source: &str, diags: &mut Diagnostics) {
+    for stmt in body {
+        match stmt {
+            Stmt::Assign(a) => {
+                // `X = "literal"` — every name target on the LHS counts as a
+                // candidate, including tuple-unpacks like `(API_KEY, b) = …`.
+                if !is_string_literal(&a.value) {
+                    continue;
+                }
+                for target in &a.targets {
+                    record_secret_targets(target, source, path, diags);
+                }
+            }
+            Stmt::AnnAssign(a) => {
+                let Some(rhs) = a.value.as_deref() else {
+                    continue;
+                };
+                if !is_string_literal(rhs) {
+                    continue;
+                }
+                if let Expr::Name(n) = a.target.as_ref() {
+                    if is_secret_name(n.id.as_str()) {
+                        let span_start = n.range.start().to_usize();
+                        let length = n.id.as_str().len();
+                        diags.push_warning(TycError::secret_literal_inline(
+                            n.id.as_str().to_owned(),
+                            path,
+                            source.to_owned(),
+                            span_start,
+                            length,
+                        ));
+                    }
+                }
+            }
+            Stmt::FunctionDef(f) => walk_secret_literal_stmts(&f.body, path, source, diags),
+            Stmt::ClassDef(c) => walk_secret_literal_stmts(&c.body, path, source, diags),
+            Stmt::If(i) => {
+                walk_secret_literal_stmts(&i.body, path, source, diags);
+                for clause in &i.elif_else_clauses {
+                    walk_secret_literal_stmts(&clause.body, path, source, diags);
+                }
+            }
+            Stmt::While(w) => {
+                walk_secret_literal_stmts(&w.body, path, source, diags);
+                walk_secret_literal_stmts(&w.orelse, path, source, diags);
+            }
+            Stmt::For(f) => {
+                walk_secret_literal_stmts(&f.body, path, source, diags);
+                walk_secret_literal_stmts(&f.orelse, path, source, diags);
+            }
+            Stmt::With(w) => walk_secret_literal_stmts(&w.body, path, source, diags),
+            Stmt::Try(t) => {
+                walk_secret_literal_stmts(&t.body, path, source, diags);
+                walk_secret_literal_stmts(&t.orelse, path, source, diags);
+                walk_secret_literal_stmts(&t.finalbody, path, source, diags);
+                for h in &t.handlers {
+                    let ruff_python_ast::ExceptHandler::ExceptHandler(h) = h;
+                    walk_secret_literal_stmts(&h.body, path, source, diags);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn record_secret_targets(target: &Expr, source: &str, path: &str, diags: &mut Diagnostics) {
+    match target {
+        Expr::Name(n) if is_secret_name(n.id.as_str()) => {
+            let span_start = n.range.start().to_usize();
+            let length = n.id.as_str().len();
+            diags.push_warning(TycError::secret_literal_inline(
+                n.id.as_str().to_owned(),
+                path,
+                source.to_owned(),
+                span_start,
+                length,
+            ));
+        }
+        Expr::Tuple(t) => {
+            for elt in &t.elts {
+                record_secret_targets(elt, source, path, diags);
+            }
+        }
+        Expr::List(l) => {
+            for elt in &l.elts {
+                record_secret_targets(elt, source, path, diags);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// True when `expr` is a bare string literal (`"foo"`, `'bar'`,
+/// `"""…"""`). Concatenations (`"a" + "b"`) and f-strings are intentionally
+/// NOT treated as literals — those forms suggest the user is composing the
+/// value programmatically, even if the result is statically constant.
+fn is_string_literal(expr: &Expr) -> bool {
+    matches!(expr, Expr::StringLiteral(_))
+}
+
+/// True when `name` ends with one of the recognised secret-shaped
+/// suffixes. Match is case-insensitive on the suffix; the suffix may
+/// either form the whole name (e.g. `TOKEN`) or follow an underscore
+/// (e.g. `MY_TOKEN`). The expected callers feed module-level binding
+/// names; passing a function or method name through is harmless because
+/// the caller already gated on `Stmt::Assign` / `Stmt::AnnAssign`.
+fn is_secret_name(name: &str) -> bool {
+    // Recognised suffixes. Longest-first matters because of
+    // `API_KEY` overlapping `KEY` — both fire, but the help text
+    // remains the same so the order is purely defensive.
+    const SUFFIXES: &[&str] = &["API_KEY", "PASSWORD", "TOKEN", "SECRET", "PWD", "KEY"];
+    let upper = name.to_ascii_uppercase();
+    for suffix in SUFFIXES {
+        if upper == *suffix {
+            return true;
+        }
+        if upper.ends_with(suffix) {
+            // Ensure the suffix is preceded by `_` so `MONKEY` doesn't
+            // match `KEY` and `PASSPORT` doesn't match nothing useful.
+            let prefix_len = upper.len() - suffix.len();
+            if upper.as_bytes()[prefix_len - 1] == b'_' {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Walk every `let` / `mut` / `AnnAssign` binding statement in `module`
 /// and warn when the RHS is an empty collection literal (`[]`, `{}`,
 /// `set()`) AND the binding carries no explicit type annotation.
@@ -3275,6 +3427,87 @@ mod lint_tests {
         let diags =
             analyse_typing_alias_annotations(&module, "x.ty", &preprocess(src).python_source);
         assert_eq!(diags.warnings().len(), 1);
+    }
+
+    // ── Finding #10: contains_secret_literal (inline string form) ───────────
+
+    #[test]
+    fn secret_literal_fires_on_string_assign() {
+        let module = parse("API_TOKEN = \"abc\"\n");
+        let diags = analyse_secret_literal_bindings(&module, "x.ty", "API_TOKEN = \"abc\"\n");
+        assert_eq!(
+            diags.warnings().len(),
+            1,
+            "API_TOKEN = string literal must warn; got {:?}",
+            diags.warnings()
+        );
+    }
+
+    #[test]
+    fn secret_literal_fires_on_password_and_pwd() {
+        let src = "DB_PASSWORD = \"secret\"\nDB_PWD = \"abc\"\n";
+        let module = parse(src);
+        let diags = analyse_secret_literal_bindings(&module, "x.ty", src);
+        assert_eq!(diags.warnings().len(), 2);
+    }
+
+    #[test]
+    fn secret_literal_fires_on_openai_api_key() {
+        let src = "OPENAI_API_KEY = \"sk-foo\"\n";
+        let module = parse(src);
+        let diags = analyse_secret_literal_bindings(&module, "x.ty", src);
+        assert_eq!(diags.warnings().len(), 1);
+    }
+
+    #[test]
+    fn secret_literal_fires_on_my_secret() {
+        let src = "MY_SECRET = \"abc\"\n";
+        let module = parse(src);
+        let diags = analyse_secret_literal_bindings(&module, "x.ty", src);
+        assert_eq!(diags.warnings().len(), 1);
+    }
+
+    #[test]
+    fn secret_literal_silent_on_env_lookup() {
+        // The whole point of the lint: env-driven RHS should NOT warn.
+        let src = "import os\nAPI_TOKEN = os.getenv(\"API_TOKEN\")\n";
+        let module = parse(src);
+        let diags = analyse_secret_literal_bindings(&module, "x.ty", src);
+        assert!(
+            diags.warnings().is_empty(),
+            "env-driven RHS must not warn; got {:?}",
+            diags.warnings()
+        );
+    }
+
+    #[test]
+    fn secret_literal_silent_on_unrelated_string_name() {
+        // A regular `let username = "x"` must stay silent.
+        let src = "username = \"alice\"\nMONKEY = \"chimp\"\n";
+        let module = parse(src);
+        let diags = analyse_secret_literal_bindings(&module, "x.ty", src);
+        assert!(
+            diags.warnings().is_empty(),
+            "unrelated binding name must not warn; got {:?}",
+            diags.warnings()
+        );
+    }
+
+    #[test]
+    fn secret_literal_fires_on_annassign_let() {
+        // `let TOKEN: str = "abc"` — AnnAssign path.
+        let src = "let TOKEN: str = \"abc\"\n";
+        let prep = preprocess(src);
+        let module = tyc_syntax::parse_module(&prep.python_source)
+            .expect("parse failed")
+            .into_syntax();
+        let diags = analyse_secret_literal_bindings(&module, "x.ty", &prep.python_source);
+        assert_eq!(
+            diags.warnings().len(),
+            1,
+            "annotated let TOKEN must warn; got {:?}",
+            diags.warnings()
+        );
     }
 }
 

@@ -11,8 +11,8 @@ use clap::Args;
 use miette::{miette, Result};
 
 use tyc_analyse::{
-    analyse_empty_collection_bindings, analyse_purity, analyse_typing_alias_annotations,
-    evaluate_comptime_with_functions, purity_diagnostics,
+    analyse_empty_collection_bindings, analyse_purity, analyse_secret_literal_bindings,
+    analyse_typing_alias_annotations, evaluate_comptime_with_functions, purity_diagnostics,
 };
 use tyc_db::{check_file_with_imports, extract_shapes_for_path, TycDatabase};
 use tyc_diagnostics::{Diagnostics, TycError};
@@ -885,6 +885,17 @@ fn run_secondary_passes(
     // forward-reference names. Walk every annotation and surface the same
     // migration advice.
     diags.extend(analyse_typing_alias_annotations(
+        &module,
+        path,
+        &prep.python_source,
+    ));
+
+    // Secret-literal lint (`tyc::contains_secret_literal`, inline form):
+    // a `let API_TOKEN = "abc"` hard-codes a credential into the source.
+    // The existing comptime path inside `tyc build` only caught
+    // `comptime let X = env(...)`; this pass catches the plain-`let`
+    // form so the check fires in `tyc check` too.
+    diags.extend(analyse_secret_literal_bindings(
         &module,
         path,
         &prep.python_source,

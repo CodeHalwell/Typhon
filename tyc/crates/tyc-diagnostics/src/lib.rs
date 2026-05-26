@@ -1305,6 +1305,26 @@ pub enum TycError {
     )]
     ContainsSecretLiteral { name: String, env_key: String },
 
+    /// A plain `let` / module-level binding whose name matches the
+    /// secret-suffix heuristic (`*KEY`, `*TOKEN`, `*PASSWORD`, `*SECRET`,
+    /// `*PWD`, `*API_KEY`) is initialised from a raw string literal
+    /// instead of an environment lookup. Committing such a literal hard-
+    /// codes a credential into the source tree.
+    #[error("binding `{name}` looks like a credential but is initialised from a string literal")]
+    #[diagnostic(
+        severity(Warning),
+        code(tyc::contains_secret_literal),
+        url("https://typhon.dev/lang/diagnostics/contains_secret_literal"),
+        help("Read the value at runtime via `os.environ[\"{name}\"]` or `os.getenv(\"{name}\")` instead of hard-coding a literal.")
+    )]
+    SecretLiteralInline {
+        name: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("hard-coded secret-shaped value")]
+        span: SourceSpan,
+    },
+
     /// A `let` or `mut` binding whose RHS is an empty collection literal
     /// (`[]`, `{}`, `set()`) has no type annotation, so its element type
     /// defaults to `Unknown` (effectively `Any`) and silences any later
@@ -2454,6 +2474,23 @@ impl TycError {
         Self::ContainsSecretLiteral {
             name: name.into(),
             env_key: env_key.into(),
+        }
+    }
+
+    /// Construct a [`TycError::SecretLiteralInline`] warning for a plain
+    /// `let` / `mut` / module-level binding whose name matches the secret
+    /// suffix heuristic AND whose RHS is a raw string literal.
+    pub fn secret_literal_inline(
+        name: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::SecretLiteralInline {
+            name: name.into(),
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length.max(1)),
         }
     }
 
