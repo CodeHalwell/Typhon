@@ -47,7 +47,16 @@ impl Interpreter {
         let mut interp = Interpreter {
             root: root.clone(),
             stack_depth: 0,
-            max_stack_depth: 256,
+            // Match CPython's default `sys.getrecursionlimit()` of 1000
+            // (FINDINGS #31). The tree-walking interpreter still pays a
+            // real Rust stack frame for each Typhon frame, so values much
+            // beyond this risk overflowing the OS thread stack rather
+            // than hitting our explicit guard. If the host process has a
+            // smaller stack, `tyc run` should be invoked with
+            // `RUST_MIN_STACK` set or a dedicated thread with a larger
+            // stack; a true fix would use `stacker::maybe_grow` but
+            // `stacker` isn't a workspace dep yet — TODO.
+            max_stack_depth: 1000,
             script_argv: Vec::new(),
         };
         crate::builtins::install(&mut interp);
@@ -2597,6 +2606,18 @@ mod vm_tests {
         // Default formatting still works.
         assert_eq!(format_with_spec(&v, "42", "5").unwrap(), "   42");
         assert_eq!(format_with_spec(&v, "42", "<5").unwrap(), "42   ");
+    }
+
+    /// FINDINGS #31 — recursion limit raised to match Python's default
+    /// of 1000.
+    #[test]
+    fn recursion_limit_matches_python_default() {
+        let interp = Interpreter::new();
+        assert!(
+            interp.max_stack_depth >= 1000,
+            "max_stack_depth should be >= 1000 (Python default), got {}",
+            interp.max_stack_depth
+        );
     }
 
     /// FINDINGS #28 / #29 — VM doesn't support generators or async, but
