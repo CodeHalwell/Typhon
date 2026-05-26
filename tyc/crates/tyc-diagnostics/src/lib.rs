@@ -20,11 +20,23 @@ pub enum TycError {
     Io { path: String, cause: String },
 
     /// The source file could not be parsed as a valid Typhon/Python program.
+    ///
+    /// The optional `suggestion` field is populated by [`TycError::parse`]
+    /// when the underlying Python parser message matches a known
+    /// Typhon-specific construct (multi-line `|>` chain without parens,
+    /// `freeze let` inside a function, …). Those constructs go through
+    /// the preprocess pipeline before the parser sees them, so the raw
+    /// parser message ("Unexpected indentation", "Simple statements must
+    /// be separated by newlines or semicolons") is meaningless to a
+    /// Typhon user. The hint redirects them to the correct form.
+    /// FINDINGS #34, #35.
     #[error("parse error in '{path}'")]
     #[diagnostic(code(tyc::parse), url("https://typhon.dev/lang/diagnostics/parse"))]
     Parse {
         path: String,
         message: String,
+        #[help]
+        suggestion: Option<String>,
         #[source_code]
         src: NamedSource<String>,
         #[label("{message}")]
@@ -1359,6 +1371,14 @@ impl TycError {
     }
 
     /// Construct a [`TycError::Parse`] from a parser error.
+    ///
+    /// The raw `message` from the Python parser is fed verbatim into
+    /// the label, but [`parse_error_hint`] inspects it (plus the
+    /// surrounding source) to recover a Typhon-specific suggestion
+    /// for known shapes: multi-line `|>` chains without parens
+    /// (FINDINGS #34) and `freeze let` inside a function
+    /// (FINDINGS #35). Anything unrecognised falls through with
+    /// `suggestion = None` so miette omits the help block.
     pub fn parse(
         path: impl Into<String>,
         source: impl Into<String>,
@@ -1368,11 +1388,13 @@ impl TycError {
         let path = path.into();
         let source = source.into();
         let message = message.into();
+        let suggestion = parse_error_hint(&message, &source, offset);
         let span = SourceSpan::new(SourceOffset::from(offset), 0usize);
         Self::Parse {
             src: NamedSource::new(path.clone(), source),
             path,
             message,
+            suggestion,
             span,
         }
     }
@@ -2648,6 +2670,110 @@ fn collection_variance_hint(expected: &str, actual: &str) -> Option<String> {
     }
 }
 
+/// FINDINGS #34, #35: inspect a raw Python-parser error message and the
+/// surrounding source to recover a Typhon-specific hint. Returns
+/// `None` when the message doesn't match a known shape so callers can
+/// pass through with no help block.
+///
+/// Cases handled:
+///   - **#34** Multi-line `|>` chain without parens: the previous
+///     non-blank line ends with `|>` and the parser bailed with an
+///     indentation message. The fix is to wrap the entire chain in
+///     parentheses so Python treats the continuation as part of the
+///     same expression.
+///   - **#35** `freeze let` inside a function body: `freeze let` is a
+///     module-level-only declaration that the preprocessor leaves
+///     unmodified at non-zero indent, so the Python parser sees two
+///     statements on one line and complains about statement
+///     separators. The hint says so explicitly.
+pub(crate) fn parse_error_hint(message: &str, source: &str, offset: usize) -> Option<String> {
+    let line_starts = line_start_offsets(source);
+    let line_idx = line_for_offset(&line_starts, offset);
+
+    // #35: `freeze let` at non-module scope. The preprocessor strips the
+    // `freeze` keyword only at indent 0, so an indented `freeze let`
+    // confuses the parser. Detect this by scanning the offending line
+    // for a leading `freeze let` after some whitespace.
+    if let Some(line) = source_line(source, &line_starts, line_idx) {
+        let trimmed = line.trim_start();
+        let indent_len = line.len() - trimmed.len();
+        if indent_len > 0 && trimmed.starts_with("freeze let ") {
+            return Some(
+                "`freeze let` is a module-level-only declaration (it wraps the RHS in \
+                 `__typhon_freeze__(...)` so the value is deep-immutable at runtime). \
+                 Move the binding to the top level, or use a plain `let` if the binding \
+                 only needs to be lexically immutable."
+                    .to_owned(),
+            );
+        }
+    }
+
+    // #34: previous non-blank line ends with `|>` and current message
+    // mentions indentation. Wrapping the chain in parens flips the
+    // continuation from a statement boundary into a sub-expression.
+    let lower = message.to_ascii_lowercase();
+    let mentions_indent = lower.contains("indentation")
+        || lower.contains("indent")
+        || lower.contains("unexpected indent");
+    if mentions_indent {
+        // Walk back from the current line looking for the closest
+        // non-blank/non-comment line — that's where the chain
+        // started.
+        let mut probe = line_idx;
+        while probe > 0 {
+            probe -= 1;
+            let prev = source_line(source, &line_starts, probe);
+            let Some(prev) = prev else { break };
+            let trimmed = prev.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            // Strip a trailing inline comment then check for the `|>`
+            // suffix.
+            let code = trimmed.split('#').next().unwrap_or(trimmed).trim_end();
+            if code.ends_with("|>") {
+                return Some(
+                    "multi-line pipe chains (`|>`) must be wrapped in parentheses, \
+                     otherwise Python's indentation rules treat the continuation as a \
+                     new statement. Wrap the whole chain: `let result = (value |> f \
+                     |> g |> h)`."
+                        .to_owned(),
+                );
+            }
+            break;
+        }
+    }
+
+    None
+}
+
+/// Cached newline offsets for [`source_line`] / [`line_for_offset`].
+/// Walks the source once; downstream lookups are O(log n) binary
+/// search.
+fn line_start_offsets(source: &str) -> Vec<usize> {
+    let mut starts = vec![0usize];
+    for (i, b) in source.bytes().enumerate() {
+        if b == b'\n' {
+            starts.push(i + 1);
+        }
+    }
+    starts
+}
+
+fn line_for_offset(starts: &[usize], offset: usize) -> usize {
+    match starts.binary_search(&offset) {
+        Ok(i) => i,
+        Err(i) => i.saturating_sub(1),
+    }
+}
+
+fn source_line<'a>(source: &'a str, starts: &[usize], line_idx: usize) -> Option<&'a str> {
+    let begin = *starts.get(line_idx)?;
+    let end = starts.get(line_idx + 1).copied().unwrap_or(source.len());
+    let slice = source.get(begin..end)?;
+    Some(slice.trim_end_matches(['\r', '\n']))
+}
+
 fn dedup_vec(v: &mut Vec<TycError>) {
     use miette::Diagnostic;
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2752,6 +2878,48 @@ mod tests {
             suggestion.contains("Mapping[str, Animal]"),
             "dict-variance hint must mention Mapping, got: {suggestion}"
         );
+    }
+
+    #[test]
+    fn parse_error_hint_pipe_chain_without_parens() {
+        // FINDINGS #34: multi-line `|>` without parens should redirect
+        // the user at parenthesising the chain rather than the raw
+        // "Unexpected indentation" message from the Python parser.
+        let source = "let result = value |>\n    f()\n";
+        let hint = parse_error_hint("Unexpected indentation", source, source.find("    f").unwrap());
+        let hint = hint.expect("pipe-chain hint must fire when prev line ends with |>");
+        assert!(
+            hint.contains("pipe chain") && hint.contains("parentheses"),
+            "hint should mention pipe and parens, got: {hint}"
+        );
+    }
+
+    #[test]
+    fn parse_error_hint_freeze_let_inside_function() {
+        // FINDINGS #35: `freeze let` at non-zero indent is module-level
+        // only — fire a dedicated hint instead of the generic
+        // "Simple statements must be separated …".
+        let source = "def f() -> None:\n    freeze let x: int = 1\n";
+        let offset = source.find("    freeze").unwrap();
+        let hint = parse_error_hint(
+            "Simple statements must be separated by newlines or semicolons",
+            source,
+            offset,
+        );
+        let hint = hint.expect("freeze-let hint must fire when the offending line is indented");
+        assert!(
+            hint.contains("module-level"),
+            "hint should mention module-level only, got: {hint}"
+        );
+    }
+
+    #[test]
+    fn parse_error_hint_returns_none_for_unrelated_message() {
+        // Unrecognised messages must leave the help slot empty so
+        // miette skips the help block instead of printing nonsense.
+        let source = "let x: int = \n";
+        let hint = parse_error_hint("unexpected token", source, 0);
+        assert!(hint.is_none(), "unrelated message should not produce a hint");
     }
 
     #[test]
