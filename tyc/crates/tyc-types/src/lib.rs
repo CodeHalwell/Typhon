@@ -16857,6 +16857,42 @@ def main() -> None:
         );
     }
 
+    /// FINDINGS v0.7.1 #16: assignment to a function parameter without a
+    /// `mut` keyword must fire `tyc::immutable_assign`. Parameters are
+    /// implicitly immutable bindings — the same rule that applies to
+    /// `let x = ...` must apply to `def f(x: int): x = ...`.
+    #[test]
+    fn v071_parameter_rebind_without_mut_fires() {
+        let src = "\
+def f(x: int) -> int:
+    x = x + 1
+    return x
+";
+        let d = check_with_resolver(src);
+        assert!(
+            d.errors().iter().any(|e| matches!(e, TycError::ImmutableAssign { .. })),
+            "parameter rebind without mut must fire immutable_assign; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #16: `mut x = ...` against a parameter is allowed
+    /// (the user is opting in to rebinding).
+    #[test]
+    fn v071_parameter_rebind_with_mut_accepted() {
+        let src = "\
+def f(x: int) -> int:
+    mut x = x + 1
+    return x
+";
+        let d = check_with_resolver(src);
+        assert!(
+            !d.errors().iter().any(|e| matches!(e, TycError::ImmutableAssign { .. })),
+            "parameter rebind with explicit mut must not fire; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
     /// FINDINGS v0.7.1 #15: exhaustive guards on a sealed union must not
     /// fire `missing_return`. Reasoning about guards is hard so we settle
     /// for the pragmatic "every variant has at least one case + a guarded
