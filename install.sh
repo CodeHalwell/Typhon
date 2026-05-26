@@ -57,7 +57,7 @@ Examples:
   curl -sSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh | sh
 
   # Install a specific version into a custom directory
-  TYPHON_VERSION=v0.8.0 TYPHON_INSTALL_DIR=/opt/typhon/bin sh install.sh
+  TYPHON_VERSION=v0.8.1 TYPHON_INSTALL_DIR=/opt/typhon/bin sh install.sh
 EOF
 }
 

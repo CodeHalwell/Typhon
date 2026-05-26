@@ -327,7 +327,7 @@ curl -sSL https://raw.githubusercontent.com/codehalwell/typhon/main/install.sh |
 
 The script detects OS+arch, resolves the latest tag via the GitHub API, downloads the tarball + `SHA256SUMS`, verifies with `shasum -a 256 -c` or `sha256sum -c`, extracts, installs `tyc` to `$HOME/.local/bin` (no `sudo`). On macOS it clears `com.apple.quarantine` so Gatekeeper doesn't prompt. Re-running upgrades in place.
 
-Env vars / flags: `TYPHON_VERSION=v0.8.0`, `TYPHON_INSTALL_DIR=/opt/typhon/bin`, or `sh install.sh --version=v0.8.0 --dir=/opt/typhon/bin`.
+Env vars / flags: `TYPHON_VERSION=v0.8.1`, `TYPHON_INSTALL_DIR=/opt/typhon/bin`, or `sh install.sh --version=v0.8.1 --dir=/opt/typhon/bin`.
 
 ### Windows (PowerShell)
 
@@ -335,7 +335,7 @@ Env vars / flags: `TYPHON_VERSION=v0.8.0`, `TYPHON_INSTALL_DIR=/opt/typhon/bin`,
 iwr -useb https://raw.githubusercontent.com/codehalwell/typhon/main/install.ps1 | iex
 ```
 
-Detects arch, downloads zip + `SHA256SUMS`, verifies with `Get-FileHash`, extracts to `%LOCALAPPDATA%\Programs\Typhon\` (no admin), adds the dir to user-level `PATH`. Env vars / flags: `$env:TYPHON_VERSION = 'v0.8.0'`, `$env:TYPHON_INSTALL_DIR = 'C:\Tools\Typhon'`, or `.\install.ps1 -Version v0.8.0 -InstallDir C:\Tools\Typhon -NoPath`.
+Detects arch, downloads zip + `SHA256SUMS`, verifies with `Get-FileHash`, extracts to `%LOCALAPPDATA%\Programs\Typhon\` (no admin), adds the dir to user-level `PATH`. Env vars / flags: `$env:TYPHON_VERSION = 'v0.8.1'`, `$env:TYPHON_INSTALL_DIR = 'C:\Tools\Typhon'`, or `.\install.ps1 -Version v0.8.1 -InstallDir C:\Tools\Typhon -NoPath`.
 
 ### Build from source
 

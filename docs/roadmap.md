@@ -6,13 +6,24 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Current release
 
-**[v0.8.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.8.0) — 2026-05-26.**
-The stress-test sweep release on top of v0.7.0 / v0.7.1, closing
-**41 findings** from a multi-file v0.7.1 stress report spanning the
-type checker, VM, parser, lowering passes, diagnostics, and CLI.
-Phases 0–3 + Phase 5 / 5.5 / 6 are complete; v0.8.0 lands several
-long-missing diagnostic firing sites, a meaningfully larger native
-VM stdlib, and five parser scaffolds the docs already advertised.
+**[v0.8.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.8.1) — 2026-05-26.**
+Point release on top of v0.8.0 that fixes a regression where the
+widened `tyc::attribute_not_found` rule false-positived on
+venv-introspected third-party Python classes
+(`uvicorn.Server.serve(...)`, `httpx.AsyncClient.aclose(...)`,
+`fastapi.Request.body(...)`). `InterfaceShape` now carries a
+`partial` flag set on every venv-derived shape;
+`class_hierarchy_fully_known` returns `false` whenever any class in
+the chain is partial. Strictly a bugfix; no language, runtime, or
+stdlib changes beyond the carve-out.
+
+The feature surface comes from **v0.8.0** (the stress-test sweep
+release on top of v0.7.0 / v0.7.1, closing **41 findings** from a
+multi-file v0.7.1 stress report spanning the type checker, VM,
+parser, lowering passes, diagnostics, and CLI). Phases 0–3 + Phase
+5 / 5.5 / 6 are complete; v0.8.0 lands several long-missing
+diagnostic firing sites, a meaningfully larger native VM stdlib,
+and five parser scaffolds the docs already advertised.
 
 Headline changes vs. v0.7.1:
 

@@ -4,7 +4,7 @@ The errors and surprises that bite people who try to write Typhon as if it were 
 
 For each entry: **trigger → diagnostic → fix**.
 
-Current release: **v0.8.0**. Pitfalls tagged with a version annotation landed in that release; older pitfalls predate v0.3.0.
+Current release: **v0.8.1**. Pitfalls tagged with a version annotation landed in that release; older pitfalls predate v0.3.0.
 
 ---
 
@@ -1015,7 +1015,7 @@ def demo(r: Repo) -> None:
     r.dleete()              # ❌ tyc::attribute_not_found
 ```
 
-v0.8.0 widened `tyc::attribute_not_found` to fire on class-instance / generic-class receivers, not just `TypeVar`-bounded ones. Foreign / venv-introspected classes (`uvicorn.Server`, `httpx.AsyncClient`, `fastapi.Request`) are tracked with a `partial` shape marker and stay lenient.
+v0.8.0 widened `tyc::attribute_not_found` to fire on class-instance / generic-class receivers, not just `TypeVar`-bounded ones. v0.8.1 added the `partial` shape marker on `InterfaceShape` so foreign / venv-introspected classes (`uvicorn.Server`, `httpx.AsyncClient`, `fastapi.Request`) stay lenient.
 
 **Fix:** correct the spelling, or wrap an intentional dynamic call in `unsafe:`.
 

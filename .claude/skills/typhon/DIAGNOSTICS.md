@@ -169,7 +169,7 @@ let result: str = "x" + 1   # error: unsupported operand types for `+`
 
 ### `tyc::attribute_not_found` — error
 
-Attribute access on a value whose static type doesn't declare that attribute (and isn't `Any`). v0.8.0 widened the firing site from `TypeVar`-bounded parameters to also include direct class instances (`p: Point`) and generic-class receivers (`s: Stream[int]`). Foreign / venv-introspected classes carry a `partial` shape marker and stay lenient — calls like `uvicorn.Server.serve(...)`, `httpx.AsyncClient.aclose(...)`, `fastapi.Request.body(...)` against third-party libraries do not false-positive. Skipped in `unsafe:` regions and on dunder / leading-underscore names.
+Attribute access on a value whose static type doesn't declare that attribute (and isn't `Any`). v0.8.0 widened the firing site from `TypeVar`-bounded parameters to also include direct class instances (`p: Point`) and generic-class receivers (`s: Stream[int]`). v0.8.1 narrowed it again: venv-introspected third-party classes now carry a `partial` shape marker on `InterfaceShape`, and `class_hierarchy_fully_known` returns `false` whenever any class in the chain is partial. The net effect: calls like `uvicorn.Server.serve(...)`, `httpx.AsyncClient.aclose(...)`, `fastapi.Request.body(...)` against third-party libraries do not false-positive. Skipped in `unsafe:` regions and on dunder / leading-underscore names.
 
 ```ty
 let p: Point = Point(x=1, y=2)

@@ -2,7 +2,7 @@
 
 The full `tyc` surface. For background and design rationale, see `docs/cli.md` and `docs/long-term-plan.md`.
 
-`tyc` is a single Rust binary built from `tyc/Cargo.toml`. Each subcommand reuses the same Salsa-backed pipeline (`tyc-syntax → tyc-resolve → tyc-types → tyc-analyse → tyc-desugar → tyc-emit → tyc-format`). The current release is **v0.8.0**.
+`tyc` is a single Rust binary built from `tyc/Cargo.toml`. Each subcommand reuses the same Salsa-backed pipeline (`tyc-syntax → tyc-resolve → tyc-types → tyc-analyse → tyc-desugar → tyc-emit → tyc-format`). The current release is **v0.8.1**.
 
 ```bash
 # One-time: build the compiler
@@ -78,7 +78,7 @@ Run on stdio as a Language Server. Features today (verify against current code i
 - Semantic tokens: `newtype` paints as `class` at declaration and references (v0.6.0); class-body fields paint as `property` (v0.6.0).
 - "Remove unused import" code action.
 
-Editor wiring: `editors/vscode/` ships a reference extension (v0.2.0 as of v0.8.0). Any LSP-aware editor can attach `tyc lsp` directly.
+Editor wiring: `editors/vscode/` ships a reference extension (v0.2.0 as of v0.8.1). Any LSP-aware editor can attach `tyc lsp` directly.
 
 ### `tyc init NAME`
 

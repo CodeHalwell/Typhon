@@ -4,6 +4,30 @@ All notable changes to Typhon are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) loosely; the
 canonical phase-by-phase status lives in `docs/roadmap.md`.
 
+## 0.8.1 — 2026-05-26
+
+Point release: fixes a v0.8.0 regression where the widened
+`tyc::attribute_not_found` rule false-positived on venv-introspected
+third-party Python classes. Strictly a bugfix; no language, runtime,
+or stdlib changes beyond the diagnostic carve-out.
+
+### Fixed — type system
+
+- **`tyc::attribute_not_found` no longer fires on venv-introspected
+  third-party classes.** The v0.8.0 firing-site widening incorrectly
+  trusted shapes built by runtime introspection
+  (`inspect.signature(Cls)`) to be method-complete, so
+  `obj.method(...)` against any third-party Python class with a known
+  `__init__` flagged the call as missing the attribute
+  (`uvicorn.Server.serve(...)`, `httpx.AsyncClient.aclose(...)`,
+  `fastapi.Request.body(...)`, …). `InterfaceShape` now carries a
+  `partial` flag that `class_shape_from_params` sets on every
+  venv-derived shape; `class_hierarchy_fully_known` returns `false`
+  whenever any class in the inheritance chain is partial, so
+  attribute access stays permissive on third-party APIs whose method
+  surface we can't see. All fifteen apps under `examples/apps/`
+  build clean again.
+
 ## 0.8.0 — 2026-05-26
 
 Stress-test sweep: closes 41 findings from a multi-file v0.7.1 stress
@@ -176,22 +200,6 @@ language-feature scaffolds the docs already advertised.
 - **`expand_impl_sealed_unions`** correctly emits a blank-line
   separator between duplicated `impl` blocks and stops capturing
   trailing top-level blank lines into the body.
-
-### Fixed — type system (v0.8.0 carry-over)
-
-- **`tyc::attribute_not_found` no longer fires on venv-introspected
-  third-party classes.** The v0.8.0 firing-site widening incorrectly
-  trusted shapes built by runtime introspection (`inspect.signature`)
-  to be method-complete, so `obj.method(...)` against any
-  third-party Python class with a known `__init__` flagged the call
-  as missing the attribute (`uvicorn.Server.serve(...)`,
-  `httpx.AsyncClient.aclose(...)`, `fastapi.Request.body(...)`, …).
-  `InterfaceShape` now carries a `partial` flag that
-  `class_shape_from_params` sets on every venv-derived shape;
-  `class_hierarchy_fully_known` returns `false` whenever any class
-  in the inheritance chain is partial, so attribute access stays
-  permissive on third-party APIs whose method surface we can't see.
-  All fifteen apps under `examples/apps/` build clean again.
 
 ### Known limitations
 
