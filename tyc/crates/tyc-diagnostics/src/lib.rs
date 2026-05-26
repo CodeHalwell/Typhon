@@ -2555,10 +2555,58 @@ fn type_mismatch_help(expected: &str, actual: &str) -> String {
     if let Some(hint) = collection_variance_hint(expected, actual) {
         return hint;
     }
+    if let Some(hint) = dict_literal_to_model_hint(expected, actual) {
+        return hint;
+    }
     format!(
         "change the value so it produces `{expected}`, or widen the annotation to \
          `{expected} | {actual}` if both are intended"
     )
+}
+
+/// When a dict literal flows into a `model` / `class` / `class!` binding,
+/// the headline ("expected `UserCreate`, found `dict[str, str]`") gives
+/// the user no clue that the fix is to use the constructor call form
+/// (`UserCreate(name=…, age=…, email=…)`). FINDINGS #38.
+///
+/// TODO(#38): this textual hint cannot enumerate the *specific* fields
+/// that are missing from the literal — the diagnostics layer only sees
+/// the rendered display strings of `expected` / `actual`, not the
+/// underlying `Type`s or `ModuleShapes`. To produce "missing fields:
+/// age, email", the call site in `tyc-types` that builds the
+/// dict-literal-vs-model mismatch needs to:
+///
+///   1. detect the shape (expected is a model/plain/class!, actual is a
+///      `dict` literal whose key set is a strict subset of the model's
+///      field names),
+///   2. compute the missing-field list from the model's `InterfaceShape`,
+///   3. emit a dedicated `TycError::ModelLiteralMissingFields` variant
+///      (or thread the list into `type_mismatch` via a new constructor)
+///      so this layer can render it verbatim.
+///
+/// Until that plumbing lands, the textual hint below at least redirects
+/// the user to the constructor form, which is the right escape hatch.
+fn dict_literal_to_model_hint(expected: &str, actual: &str) -> Option<String> {
+    // Cheap recogniser: actual is a `dict[..]` generic, expected is a
+    // bare identifier (no generic brackets, no union pipes). Anything
+    // else is some other shape of mismatch.
+    if !actual.starts_with("dict[") {
+        return None;
+    }
+    if expected.contains('[') || expected.contains('|') {
+        return None;
+    }
+    let first = expected.chars().next()?;
+    if !first.is_ascii_uppercase() {
+        return None;
+    }
+    Some(format!(
+        "dict literals don't auto-coerce to `{expected}`. Construct the value via \
+         `{expected}(field1=…, field2=…, …)` so every required field is named and \
+         type-checked. (Run `tyc explain type_mismatch` for the full list of fields \
+         the model declares — naming the specific missing keys is tracked in \
+         FINDINGS #38.)"
+    ))
 }
 
 /// Inspect the rendered expected/actual type display strings and, when
@@ -2703,6 +2751,29 @@ mod tests {
         assert!(
             suggestion.contains("Mapping[str, Animal]"),
             "dict-variance hint must mention Mapping, got: {suggestion}"
+        );
+    }
+
+    #[test]
+    fn type_mismatch_dict_literal_to_model_suggests_constructor() {
+        // FINDINGS #38: assigning a dict literal to a model-typed binding
+        // should redirect the user to the constructor form. The full
+        // "missing fields: age, email" enumeration requires plumbing
+        // from tyc-types and is tracked as a TODO in dict_literal_to_model_hint.
+        let e = TycError::type_mismatch(
+            "UserCreate",
+            "dict[str, str]",
+            "a.ty",
+            "let u: UserCreate = {\"name\": \"Bob\"}",
+            0,
+            3,
+        );
+        let TycError::TypeMismatch { suggestion, .. } = &e else {
+            panic!("expected TypeMismatch variant");
+        };
+        assert!(
+            suggestion.contains("UserCreate(field1"),
+            "model-literal hint must point at the constructor form, got: {suggestion}"
         );
     }
 
