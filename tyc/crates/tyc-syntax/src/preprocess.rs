@@ -145,6 +145,46 @@ pub struct PreprocessResult {
     pub pub_star_lines: Vec<usize>,
 }
 
+impl PreprocessResult {
+    /// Per-line byte count stripped from the start of each line during
+    /// preprocessing. The vector is indexed by 0-based line index; lines
+    /// past the end of the vector have a shift of 0. Sums contributions
+    /// from every `stripped` entry whose keyword removes a leading
+    /// prefix from the line — `pub `, `comptime `, `freeze `, `lazy `,
+    /// `newtype `. Mid-line strips like `frozen` and full-line rewrites
+    /// that don't simply trim a prefix are intentionally not included —
+    /// downstream callers that need to map preprocessed columns back to
+    /// original columns should pair this hint with a textual validation
+    /// step (i.e. confirm the expected identifier text appears at the
+    /// mapped position) and fall back to a per-line search otherwise.
+    pub fn line_col_shifts(&self) -> Vec<usize> {
+        let line_count = self
+            .stripped
+            .iter()
+            .map(|s| s.line_index)
+            .max()
+            .map(|m| m + 1)
+            .unwrap_or(0);
+        let mut shifts = vec![0usize; line_count];
+        for s in &self.stripped {
+            let bytes = match s.keyword {
+                crate::lexer::TyphonKeyword::Pub => "pub ".len(),
+                crate::lexer::TyphonKeyword::Comptime => "comptime ".len(),
+                crate::lexer::TyphonKeyword::Freeze => "freeze ".len(),
+                crate::lexer::TyphonKeyword::Lazy => "lazy ".len(),
+                crate::lexer::TyphonKeyword::Newtype => "newtype ".len(),
+                _ => 0,
+            };
+            if bytes > 0 {
+                if let Some(slot) = shifts.get_mut(s.line_index) {
+                    *slot += bytes;
+                }
+            }
+        }
+        shifts
+    }
+}
+
 /// Convert a list of 0-based line indices into byte offsets pointing at
 /// the first non-whitespace character on each line of `source`.  The
 /// returned vector is sorted so callers can binary-search it.  Mirrors

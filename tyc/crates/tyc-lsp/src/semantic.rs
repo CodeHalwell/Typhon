@@ -77,13 +77,21 @@ pub fn legend() -> SemanticTokensLegend {
 
 /// One absolute-positioned token; converted to LSP delta-encoding
 /// during the final `compute()` step.
-#[derive(Debug, Clone, Copy)]
+///
+/// `name` carries the identifier the token covers so the original-source
+/// remap step can validate (and, if necessary, relocate) the token after
+/// translating from preprocessed-source columns. Synthetic identifiers
+/// the preprocessor injects (e.g. the `NewType` reference inside a
+/// `newtype Foo = Bar` rewrite) won't match anything in the original
+/// line and get dropped — TextMate fallbacks paint them instead.
+#[derive(Debug, Clone)]
 struct AbsoluteToken {
     line: u32,
     col: u32,
     length: u32,
     token_type: u32,
     modifiers: u32,
+    name: String,
 }
 
 /// Structured signature info for a single callable, derived from the
@@ -143,6 +151,7 @@ pub type AttributeKinds = HashMap<String, String>;
 /// constructor declares `**kwargs`, no token (white) when the kwarg
 /// is unrecognised. Pass an empty map to disable kwarg colouring
 /// (used by unit tests that don't need introspection).
+#[allow(dead_code)] // back-compat wrapper used by unit tests; kept for callers that don't need original-source remapping
 pub fn compute(
     source: &str,
     resolved: &ResolvedModule,
@@ -151,6 +160,43 @@ pub fn compute(
     callee_signatures: &CalleeSignatures,
     attribute_kinds: &AttributeKinds,
 ) -> SemanticTokens {
+    // No remap requested: original == preprocessed, all line shifts are
+    // zero. The remap step becomes a no-op text validation that still
+    // drops synthetic identifiers, which is exactly what unit tests want.
+    compute_with_original(
+        source,
+        source,
+        &[],
+        resolved,
+        module,
+        stdlib_modules,
+        callee_signatures,
+        attribute_kinds,
+    )
+}
+
+/// Same as [`compute`], but takes the original (pre-preprocess) source
+/// and a per-line column-shift hint so token coordinates can be
+/// translated from preprocessed-source columns to original-source
+/// columns before encoding. Used by the LSP's `semantic_tokens_full`
+/// handler so the colours land on the right characters when the file
+/// uses Typhon-only modifiers (`pub`, `comptime`, `freeze`, `lazy`,
+/// `newtype`) that the preprocessor strips before parsing.
+///
+/// `line_shifts[line]` is the byte count stripped from the start of
+/// that line by preprocessing. Lines past the end of the slice get a
+/// shift of 0. See [`tyc_syntax::preprocess::PreprocessResult::line_col_shifts`].
+pub fn compute_with_original(
+    preprocessed: &str,
+    original: &str,
+    line_shifts: &[usize],
+    resolved: &ResolvedModule,
+    module: &ModModule,
+    stdlib_modules: &[&str],
+    callee_signatures: &CalleeSignatures,
+    attribute_kinds: &AttributeKinds,
+) -> SemanticTokens {
+    let source = preprocessed;
     // Names declared via `newtype Name = Base` desugar to the regular
     // assignment `Name = NewType("Name", Base)` before the resolver
     // sees them, so the resolver registers them as `BindingKind::Value`
@@ -183,6 +229,13 @@ pub fn compute(
         callee_signatures,
         attribute_kinds,
     );
+    // Translate token coordinates from the preprocessed source the AST /
+    // resolver reported into the original source the editor is rendering.
+    // Tokens whose name can't be located in the original line (synthetic
+    // identifiers the preprocessor injected — e.g. the `NewType` call in
+    // a `newtype Foo = Bar` rewrite) are dropped so the TextMate grammar
+    // paints the keyword instead of leaking a wrong colour into it.
+    remap_to_original(&mut tokens, source, original, line_shifts);
     // The LSP encoding requires tokens in document order (each
     // delta-line is non-negative; ties broken by delta-start).
     tokens.sort_by_key(|t| (t.line, t.col));
@@ -194,6 +247,149 @@ pub fn compute(
     SemanticTokens {
         result_id: None,
         data: encode(&tokens),
+    }
+}
+
+/// Translate every token's `(line, col, length)` from preprocessed-source
+/// to original-source coordinates. Validates by checking the original
+/// line actually contains `name` at (or near) the shifted column; drops
+/// tokens whose name isn't found, which silently disables coloring for
+/// preprocessor-injected synthetic identifiers.
+///
+/// Strategy per token:
+/// 1. Compute `candidate = prep_col + line_shifts[line]` (in bytes —
+///    Typhon identifiers are ASCII so byte == utf16 within the column,
+///    and the `name` length is the same in both encodings).
+/// 2. If the original line contains `name` as a whole word starting at
+///    `candidate`, emit at that position.
+/// 3. Otherwise search the line for `name` as a whole word and emit
+///    at the first match.
+/// 4. If neither succeeds, drop the token.
+fn remap_to_original(
+    tokens: &mut Vec<AbsoluteToken>,
+    preprocessed: &str,
+    original: &str,
+    line_shifts: &[usize],
+) {
+    let orig_line_starts = compute_line_starts(original);
+    let prep_line_starts = compute_line_starts(preprocessed);
+    tokens.retain_mut(|tok| {
+        let line_idx = tok.line as usize;
+        let Some(&orig_line_start) = orig_line_starts.get(line_idx) else {
+            return false;
+        };
+        let orig_line_end = orig_line_starts
+            .get(line_idx + 1)
+            .copied()
+            .unwrap_or(original.len());
+        let orig_line_raw = &original[orig_line_start..orig_line_end];
+        let orig_line = orig_line_raw.trim_end_matches(['\n', '\r']);
+
+        // Convert the token's UTF-16 column back to a byte column within
+        // the preprocessed line so we can add the byte-denominated shift.
+        let prep_line_start = prep_line_starts.get(line_idx).copied().unwrap_or(0);
+        let prep_line_end = prep_line_starts
+            .get(line_idx + 1)
+            .copied()
+            .unwrap_or(preprocessed.len());
+        let prep_line = &preprocessed[prep_line_start..prep_line_end];
+        let prep_byte_col = match utf16_col_to_byte(prep_line, tok.col as usize) {
+            Some(b) => b,
+            None => return false,
+        };
+
+        let shift = line_shifts.get(line_idx).copied().unwrap_or(0);
+        let candidate_byte = prep_byte_col + shift;
+        let name = tok.name.as_str();
+
+        let chosen_byte = if matches_whole_word_at(orig_line, candidate_byte, name) {
+            Some(candidate_byte)
+        } else {
+            find_whole_word(orig_line, name)
+        };
+
+        let Some(byte_col) = chosen_byte else {
+            return false;
+        };
+        tok.col = byte_col_to_utf16(orig_line, byte_col);
+        tok.length = name.encode_utf16().count() as u32;
+        true
+    });
+}
+
+fn compute_line_starts(s: &str) -> Vec<usize> {
+    let mut starts = vec![0usize];
+    for (i, b) in s.bytes().enumerate() {
+        if b == b'\n' {
+            starts.push(i + 1);
+        }
+    }
+    starts
+}
+
+fn is_id_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn matches_whole_word_at(line: &str, byte_col: usize, name: &str) -> bool {
+    let bytes = line.as_bytes();
+    let name_bytes = name.as_bytes();
+    if byte_col + name_bytes.len() > bytes.len() {
+        return false;
+    }
+    if &bytes[byte_col..byte_col + name_bytes.len()] != name_bytes {
+        return false;
+    }
+    let left_ok = byte_col == 0 || !is_id_byte(bytes[byte_col - 1]);
+    let right_ok = byte_col + name_bytes.len() == bytes.len()
+        || !is_id_byte(bytes[byte_col + name_bytes.len()]);
+    left_ok && right_ok
+}
+
+fn find_whole_word(line: &str, name: &str) -> Option<usize> {
+    if name.is_empty() {
+        return None;
+    }
+    let bytes = line.as_bytes();
+    let name_bytes = name.as_bytes();
+    if name_bytes.len() > bytes.len() {
+        return None;
+    }
+    for i in 0..=bytes.len() - name_bytes.len() {
+        if matches_whole_word_at(line, i, name) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn byte_col_to_utf16(line: &str, byte_col: usize) -> u32 {
+    let clamped = byte_col.min(line.len());
+    // Walk on char boundaries; if byte_col falls inside a multibyte
+    // sequence (shouldn't happen for ASCII identifiers but defend
+    // against it anyway) round down to the previous boundary.
+    let mut safe = clamped;
+    while safe > 0 && !line.is_char_boundary(safe) {
+        safe -= 1;
+    }
+    line[..safe].encode_utf16().count() as u32
+}
+
+fn utf16_col_to_byte(line: &str, utf16_col: usize) -> Option<usize> {
+    let mut acc: usize = 0;
+    let mut byte: usize = 0;
+    for ch in line.chars() {
+        if acc >= utf16_col {
+            return Some(byte);
+        }
+        acc += ch.len_utf16();
+        byte += ch.len_utf8();
+    }
+    if acc >= utf16_col {
+        Some(byte)
+    } else {
+        // Past end of line — clamp to line length.
+        Some(byte)
     }
 }
 
@@ -421,6 +617,7 @@ impl<'a> AstWalker<'a> {
                     length: utf16_len_of_span(self.source, start, end),
                     token_type,
                     modifiers: 0,
+                    name: name.to_owned(),
                 });
             }
         }
@@ -523,6 +720,7 @@ impl<'a> Visitor<'a> for AstWalker<'a> {
                         length: utf16_len_of_span(self.source, ident_start, ident_end),
                         token_type,
                         modifiers: 0,
+                        name: attr.attr.as_str().to_owned(),
                     });
                 }
                 // The receiver is *not* in call-func position even
@@ -653,6 +851,7 @@ fn emit_dotted_path(
                     length: utf16_len_of_span(source, offset, end),
                     token_type: TOKEN_NAMESPACE,
                     modifiers,
+                    name: segment.to_owned(),
                 });
             }
         }
@@ -842,6 +1041,7 @@ fn token_for_binding(
         length,
         token_type,
         modifiers,
+        name: binding.name.clone(),
     })
 }
 
@@ -1686,5 +1886,232 @@ mod tests {
             "`typing.NewType(...)` should promote every `X` site to class; got {:?}",
             types
         );
+    }
+
+    /// Run `compute_with_original` against the actual Typhon source
+    /// (rather than the preprocessed Python), mirroring what the
+    /// `semantic_tokens_full` handler does. Used by the column-remap
+    /// regression tests so the assertions express what the editor will
+    /// render, not what the resolver computed against the preprocessed
+    /// view of the file.
+    fn compute_from_original(
+        original: &str,
+    ) -> (String, Vec<SemanticToken>) {
+        let prep = preprocess(original);
+        let parsed = parse_module(&prep.python_source).expect("parse");
+        let module = parsed.into_syntax();
+        let (resolved, _) = resolve_module_with(
+            "t.ty".into(),
+            &prep.python_source,
+            &module,
+            ResolveOptions::default(),
+        );
+        let stdlib_list = stdlib();
+        let stdlib_refs: Vec<&str> = stdlib_list.to_vec();
+        let result = compute_with_original(
+            &prep.python_source,
+            original,
+            &prep.line_col_shifts(),
+            &resolved,
+            &module,
+            &stdlib_refs,
+            &CalleeSignatures::new(),
+            &AttributeKinds::new(),
+        );
+        (prep.python_source, result.data)
+    }
+
+    /// Decode the LSP delta stream and assert the token covering
+    /// `needle` in `original` lands on the exact byte range of that
+    /// needle — column equals the byte offset of `needle` and length
+    /// equals `needle.len()`. Returns the token type so callers can
+    /// chain `assert_eq!` on it.
+    fn assert_token_covers(
+        original: &str,
+        needle: &str,
+        data: &[SemanticToken],
+    ) -> u32 {
+        let lines: Vec<&str> = original.lines().collect();
+        // Find the (line, col) of `needle` in `original`.
+        let mut target_line: u32 = 0;
+        let mut target_col: u32 = 0;
+        let mut found = false;
+        for (i, line) in lines.iter().enumerate() {
+            if let Some(byte) = line.find(needle) {
+                target_line = i as u32;
+                target_col = line[..byte].encode_utf16().count() as u32;
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "needle `{}` not in original source", needle);
+        let mut line: u32 = 0;
+        let mut col: u32 = 0;
+        for tok in data {
+            if tok.delta_line == 0 {
+                col += tok.delta_start;
+            } else {
+                line += tok.delta_line;
+                col = tok.delta_start;
+            }
+            if line == target_line && col == target_col {
+                let expected_len = needle.encode_utf16().count() as u32;
+                assert_eq!(
+                    tok.length, expected_len,
+                    "token at {}:{} for `{}` has length {} (expected {})",
+                    line, col, needle, tok.length, expected_len
+                );
+                return tok.token_type;
+            }
+        }
+        panic!(
+            "no semantic token starts at {}:{} (where `{}` lives in original)",
+            target_line, target_col, needle
+        );
+    }
+
+    /// Assert that no semantic token overlaps the byte range of `needle`
+    /// in `original`. Used to guarantee the TextMate grammar's keyword
+    /// colour for stripped modifiers (`comptime`, `freeze`, `pub`,
+    /// `newtype`, …) isn't clobbered by an LSP token that leaked from
+    /// the preprocessed coordinate space.
+    fn assert_no_token_overlaps(original: &str, needle: &str, data: &[SemanticToken]) {
+        let lines: Vec<&str> = original.lines().collect();
+        let mut target_line: u32 = 0;
+        let mut needle_start_col: u32 = 0;
+        let mut needle_end_col: u32 = 0;
+        let mut found = false;
+        for (i, line) in lines.iter().enumerate() {
+            if let Some(byte) = line.find(needle) {
+                target_line = i as u32;
+                needle_start_col = line[..byte].encode_utf16().count() as u32;
+                needle_end_col = needle_start_col + needle.encode_utf16().count() as u32;
+                found = true;
+                break;
+            }
+        }
+        assert!(found, "needle `{}` not in original source", needle);
+        let mut line: u32 = 0;
+        let mut col: u32 = 0;
+        for tok in data {
+            if tok.delta_line == 0 {
+                col += tok.delta_start;
+            } else {
+                line += tok.delta_line;
+                col = tok.delta_start;
+            }
+            if line != target_line {
+                continue;
+            }
+            let tok_end = col + tok.length;
+            let overlaps = col < needle_end_col && tok_end > needle_start_col;
+            assert!(
+                !overlaps,
+                "token at col {}..{} overlaps `{}` at col {}..{} on line {}",
+                col, tok_end, needle, needle_start_col, needle_end_col, line
+            );
+        }
+    }
+
+    /// Regression: a `comptime let X = ...` binding's semantic token
+    /// must land on `X` in the original source, not on the middle of
+    /// the stripped `comptime ` keyword. Before the column-remap
+    /// fix the LSP returned a variable token at preprocessed col 4
+    /// (where `BUILD_TAG` lives after stripping `comptime `), which
+    /// the editor applied to col 4 of the original line — landing
+    /// inside `comptime` and painting `time let ` with the variable
+    /// colour, leaving `comp` blue.
+    #[test]
+    fn comptime_let_binding_lands_on_binding_name_not_stripped_keyword() {
+        let original = "comptime let BUILD_TAG: str = \"dev\"\n";
+        let (_, data) = compute_from_original(original);
+        let ty = assert_token_covers(original, "BUILD_TAG", &data);
+        assert_eq!(ty, TOKEN_VARIABLE);
+        assert_no_token_overlaps(original, "comptime", &data);
+    }
+
+    /// Regression: `freeze let X = ...` strips `freeze ` (7 bytes) and
+    /// wraps the RHS in `__typhon_freeze__(...)`. The binding token
+    /// for X used to land at preprocessed col 4 — col 4 of the
+    /// original is `z` inside `freeze`, so the variable token painted
+    /// `ze let ` and left `free` blue.
+    #[test]
+    fn freeze_let_binding_lands_on_binding_name_not_stripped_keyword() {
+        let original = "freeze let DEFAULT = [1, 2, 3]\n";
+        let (_, data) = compute_from_original(original);
+        let ty = assert_token_covers(original, "DEFAULT", &data);
+        assert_eq!(ty, TOKEN_VARIABLE);
+        assert_no_token_overlaps(original, "freeze", &data);
+    }
+
+    /// Regression: `pub class X` strips `pub ` (4 bytes). The class
+    /// binding token for X used to land at preprocessed col 6 — col 6
+    /// of the original is `a` inside `class`, so the class token
+    /// painted `ass RetryPo` and left `cl` red.
+    #[test]
+    fn pub_class_binding_lands_on_class_name_not_stripped_pub() {
+        let original = "pub class RetryPolicy:\n    pass\n";
+        let (_, data) = compute_from_original(original);
+        let ty = assert_token_covers(original, "RetryPolicy", &data);
+        assert_eq!(ty, TOKEN_CLASS);
+        assert_no_token_overlaps(original, "class", &data);
+        assert_no_token_overlaps(original, "pub", &data);
+    }
+
+    /// Regression: `pub newtype TaskId = int` strips `pub newtype `
+    /// and rewrites the line to `TaskId = NewType("TaskId", int)`.
+    /// The binding token for TaskId used to land at preprocessed col 0
+    /// — col 0 of the original is `p` in `pub`, so the class token
+    /// painted `pub ne` and left `wtype` showing through (often
+    /// further mangled by the synthetic `NewType` reference landing
+    /// inside `newtype` too). The synthetic `NewType` reference must
+    /// not produce a token at all — TextMate paints the `newtype`
+    /// keyword instead.
+    #[test]
+    fn pub_newtype_binding_lands_on_newtype_name_not_stripped_keywords() {
+        let original = "pub newtype TaskId = int\n";
+        let (_, data) = compute_from_original(original);
+        let ty = assert_token_covers(original, "TaskId", &data);
+        assert_eq!(ty, TOKEN_CLASS, "newtype declaration paints as class");
+        assert_no_token_overlaps(original, "newtype", &data);
+        assert_no_token_overlaps(original, "pub", &data);
+    }
+
+    /// Regression: synthetic identifiers the preprocessor injects
+    /// (the `NewType` call inside the `newtype` rewrite, the
+    /// `__typhon_freeze__` call inside the `freeze let` rewrite) must
+    /// not produce semantic tokens — they don't exist in the original
+    /// source and the editor can't render anything sensible for them.
+    /// The remap step drops tokens whose name can't be located in the
+    /// original line.
+    #[test]
+    fn synthetic_preprocessor_identifiers_emit_no_tokens() {
+        let original = "pub newtype TaskId = int\n";
+        let (_, data) = compute_from_original(original);
+        // The original line has no `NewType` text anywhere. If any
+        // semantic token covered the column range that the preprocessed
+        // line uses for `NewType`, the editor would paint a chunk of
+        // `newtype` orange.
+        let lines: Vec<&str> = original.lines().collect();
+        let mut line: u32 = 0;
+        let mut col: u32 = 0;
+        for tok in &data {
+            if tok.delta_line == 0 {
+                col += tok.delta_start;
+            } else {
+                line += tok.delta_line;
+                col = tok.delta_start;
+            }
+            let line_text = lines[line as usize];
+            let start = col as usize;
+            let end = start + tok.length as usize;
+            let covered = &line_text[start..end];
+            assert!(
+                covered != "NewType",
+                "expected no `NewType` token in original source; got one at {}:{}",
+                line,
+                col
+            );
+        }
     }
 }
