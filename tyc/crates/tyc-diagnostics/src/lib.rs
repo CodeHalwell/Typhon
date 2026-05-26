@@ -1145,6 +1145,29 @@ pub enum TycError {
         span: SourceSpan,
     },
 
+    /// A `newtype Foo = <expr>` whose RHS isn't a recognised type
+    /// expression (it's a string literal, number, function call, …).
+    /// `newtype` is a nominal alias of an existing type, so the RHS
+    /// must name a type — not a value. FINDINGS v0.7.1 #14.
+    #[error("`newtype {name}` base must be a type, not `{base_kind}`")]
+    #[diagnostic(
+        code(tyc::newtype_invalid_base),
+        url("https://typhon.dev/lang/diagnostics/newtype_invalid_base"),
+        help(
+            "the right-hand side of `newtype {name} = …` must be a type \
+             (e.g. `int`, `str`, `list[int]`, `MyClass`); replace the \
+             literal/expression with an actual type name"
+        )
+    )]
+    NewtypeInvalidBase {
+        name: String,
+        base_kind: String,
+        #[source_code]
+        src: NamedSource<String>,
+        #[label("not a valid type")]
+        span: SourceSpan,
+    },
+
     /// A `let NAME: T` binding declared without an initialiser is
     /// read on a control-flow path where no preceding statement
     /// assigned it. R3-8's definite-assignment pass surfaces the
@@ -2238,6 +2261,24 @@ impl TycError {
             base: base.into(),
             arg_type,
             arg_type_short,
+            src: NamedSource::new(path.into(), source.into()),
+            span: SourceSpan::new(SourceOffset::from(offset), length),
+        }
+    }
+
+    /// Construct a [`TycError::NewtypeInvalidBase`] diagnostic.
+    /// FINDINGS v0.7.1 #14.
+    pub fn newtype_invalid_base(
+        name: impl Into<String>,
+        base_kind: impl Into<String>,
+        path: impl Into<String>,
+        source: impl Into<String>,
+        offset: usize,
+        length: usize,
+    ) -> Self {
+        Self::NewtypeInvalidBase {
+            name: name.into(),
+            base_kind: base_kind.into(),
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }
