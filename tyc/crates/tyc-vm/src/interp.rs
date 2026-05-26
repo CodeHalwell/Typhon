@@ -10,6 +10,10 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use indexmap::IndexMap;
+use num_bigint::BigInt;
+use num_integer::Integer;
+use num_traits::{Signed, ToPrimitive, Zero};
 use ruff_python_ast::{
     self as ast, BoolOp, CmpOp, ExceptHandler, Expr, FStringPart, InterpolatedStringElement,
     ModModule, Mutability, Number, Operator, Parameters, Pattern, Stmt, UnaryOp,
@@ -18,9 +22,12 @@ use ruff_python_ast::{
 use crate::env::{Env, EnvRef};
 use crate::error::{
     attribute_error, index_error, key_error, name_error, not_implemented, type_error, value_error,
-    zero_division, Unwind, VmException,
+    vm_unsupported_use_compile, zero_division, Unwind, VmException,
 };
-use crate::value::{Class, ClassField, Function, HashKey, Instance, IterState, NativeFn, Value};
+use crate::value::{
+    bigint_to_f64, Class, ClassField, DictMap, Function, HashKey, Instance, IterState, NativeFn,
+    Value,
+};
 
 pub struct Interpreter {
     pub root: EnvRef,
@@ -44,7 +51,16 @@ impl Interpreter {
         let mut interp = Interpreter {
             root: root.clone(),
             stack_depth: 0,
-            max_stack_depth: 256,
+            // Match CPython's default `sys.getrecursionlimit()` of 1000
+            // (FINDINGS #31). The tree-walking interpreter still pays a
+            // real Rust stack frame for each Typhon frame, so values much
+            // beyond this risk overflowing the OS thread stack rather
+            // than hitting our explicit guard. If the host process has a
+            // smaller stack, `tyc run` should be invoked with
+            // `RUST_MIN_STACK` set or a dedicated thread with a larger
+            // stack; a true fix would use `stacker::maybe_grow` but
+            // `stacker` isn't a workspace dep yet — TODO.
+            max_stack_depth: 1000,
             script_argv: Vec::new(),
         };
         crate::builtins::install(&mut interp);
@@ -163,7 +179,7 @@ impl Interpreter {
             }
             Stmt::For(s) => {
                 if s.is_async {
-                    return Err(not_implemented("async for"));
+                    return Err(vm_unsupported_use_compile("async for"));
                 }
                 let iterable = self.eval_expr(&s.iter, env)?;
                 let iter = self.make_iter(iterable)?;
@@ -189,9 +205,7 @@ impl Interpreter {
             }
             Stmt::FunctionDef(f) => {
                 if f.is_async {
-                    return Err(not_implemented(
-                        "async functions (tyc-vm v1 runs synchronous Typhon only)",
-                    ));
+                    return Err(vm_unsupported_use_compile("async functions"));
                 }
                 let func = self.build_function(f, env)?;
                 // Run decorators in reverse order (innermost first), matching Python.
@@ -579,7 +593,7 @@ impl Interpreter {
                 Ok(Value::Set(Rc::new(RefCell::new(set))))
             }
             Expr::Dict(d) => {
-                let mut map = HashMap::new();
+                let mut map: DictMap = IndexMap::new();
                 for item in &d.items {
                     match (&item.key, &item.value) {
                         (Some(k), v) => {
@@ -659,8 +673,9 @@ impl Interpreter {
                 };
                 self.eval_listcomp(&listy, env)
             }
-            Expr::Await(_) | Expr::Yield(_) | Expr::YieldFrom(_) => {
-                Err(not_implemented("async / generators"))
+            Expr::Await(_) => Err(vm_unsupported_use_compile("await expressions")),
+            Expr::Yield(_) | Expr::YieldFrom(_) => {
+                Err(vm_unsupported_use_compile("generators (`yield` / `yield from`)"))
             }
             Expr::TString(_) => Err(not_implemented("template strings")),
             Expr::IpyEscapeCommand(_) => Err(not_implemented("IPython escape commands")),
@@ -831,10 +846,17 @@ impl Interpreter {
             }
             Value::Range { start, stop, step } => match item {
                 Value::Int(i) => {
+                    let Some(i_small) = i.to_i64() else {
+                        return Ok(false);
+                    };
                     if *step > 0 {
-                        Ok(i >= start && i < stop && (i - start).rem_euclid(*step) == 0)
+                        Ok(i_small >= *start
+                            && i_small < *stop
+                            && (i_small - start).rem_euclid(*step) == 0)
                     } else if *step < 0 {
-                        Ok(i <= start && i > stop && (start - i).rem_euclid(-*step) == 0)
+                        Ok(i_small <= *start
+                            && i_small > *stop
+                            && (start - i_small).rem_euclid(-*step) == 0)
                     } else {
                         Ok(false)
                     }
@@ -1030,7 +1052,7 @@ impl Interpreter {
         }
 
         if let Some(kw) = &params.kwarg {
-            let mut map = HashMap::new();
+            let mut map: DictMap = IndexMap::new();
             for (k, v) in kwargs_left.drain() {
                 map.insert(HashKey::Str(Rc::new(k)), v);
             }
@@ -1119,44 +1141,46 @@ impl Interpreter {
     pub fn binop(&mut self, l: &Value, op: Operator, r: &Value) -> Result<Value, Unwind> {
         use Operator::*;
         use Value::*;
-        // Fast-path numeric combinations.
+        // Fast-path numeric combinations. Integer ops now use `BigInt`
+        // (FINDINGS #19) so `2 ** 100`, `fib(99)`, and friends no longer
+        // overflow — matching Python's arbitrary-precision semantics.
         match (l, op, r) {
-            (Int(a), Add, Int(b)) => return a.checked_add(*b).map(Int).ok_or_else(overflow),
-            (Int(a), Sub, Int(b)) => return a.checked_sub(*b).map(Int).ok_or_else(overflow),
-            (Int(a), Mult, Int(b)) => return a.checked_mul(*b).map(Int).ok_or_else(overflow),
-            (Int(_), Div, Int(b)) if *b == 0 => return Err(zero_division()),
-            (Int(a), Div, Int(b)) => return Ok(Float(*a as f64 / *b as f64)),
-            (Int(_), FloorDiv, Int(b)) if *b == 0 => return Err(zero_division()),
-            (Int(a), FloorDiv, Int(b)) => return Ok(Int(a.div_euclid(*b))),
-            (Int(_), Mod, Int(b)) if *b == 0 => return Err(zero_division()),
-            (Int(a), Mod, Int(b)) => return Ok(Int(a.rem_euclid(*b))),
+            (Int(a), Add, Int(b)) => return Ok(Int(a + b)),
+            (Int(a), Sub, Int(b)) => return Ok(Int(a - b)),
+            (Int(a), Mult, Int(b)) => return Ok(Int(a * b)),
+            (Int(_), Div, Int(b)) if b.is_zero() => return Err(zero_division()),
+            (Int(a), Div, Int(b)) => return Ok(Float(bigint_to_f64(a) / bigint_to_f64(b))),
+            (Int(_), FloorDiv, Int(b)) if b.is_zero() => return Err(zero_division()),
+            (Int(a), FloorDiv, Int(b)) => return Ok(Int(a.div_floor(b))),
+            (Int(_), Mod, Int(b)) if b.is_zero() => return Err(zero_division()),
+            (Int(a), Mod, Int(b)) => return Ok(Int(a.mod_floor(b))),
             (Int(a), Pow, Int(b)) => {
-                if *b < 0 {
-                    return Ok(Float((*a as f64).powf(*b as f64)));
+                if b.is_negative() {
+                    return Ok(Float(bigint_to_f64(a).powf(bigint_to_f64(b))));
                 }
-                let exp = u32::try_from(*b).map_err(|_| overflow())?;
-                return a.checked_pow(exp).map(Int).ok_or_else(overflow);
+                // BigInt::pow takes a `u32`; for ridiculous exponents
+                // (10**million) we'd happily eat all the RAM, so cap at
+                // u32::MAX which is already astronomically more than
+                // Python tolerates before timing out.
+                let exp = b.to_u32().ok_or_else(overflow)?;
+                return Ok(Int(a.pow(exp)));
             }
             (Int(a), BitOr, Int(b)) => return Ok(Int(a | b)),
             (Int(a), BitAnd, Int(b)) => return Ok(Int(a & b)),
             (Int(a), BitXor, Int(b)) => return Ok(Int(a ^ b)),
             (Int(a), LShift, Int(b)) => {
-                if *b < 0 {
+                if b.is_negative() {
                     return Err(value_error("negative shift count"));
                 }
-                let shift = u32::try_from(*b).map_err(|_| overflow())?;
-                return a.checked_shl(shift).map(Int).ok_or_else(overflow);
+                let shift = b.to_usize().ok_or_else(overflow)?;
+                return Ok(Int(a << shift));
             }
             (Int(a), RShift, Int(b)) => {
-                if *b < 0 {
+                if b.is_negative() {
                     return Err(value_error("negative shift count"));
                 }
-                // Python's int >> N for very large N saturates toward 0 (or
-                // -1 for negatives). i64 only has 64 bits, so anything >= 64
-                // is equivalent to a full sign-extension.
-                let shift = u32::try_from(*b).unwrap_or(64);
-                let sat = if *a >= 0 { 0 } else { -1 };
-                return Ok(Int(a.checked_shr(shift).unwrap_or(sat)));
+                let shift = b.to_usize().unwrap_or(usize::MAX);
+                return Ok(Int(a >> shift));
             }
 
             (Float(a), Add, Float(b)) => return Ok(Float(a + b)),
@@ -1185,8 +1209,8 @@ impl Interpreter {
         }
         // Bool ↔ Int.
         if matches!((l, r), (Bool(_), Int(_) | Bool(_)) | (Int(_), Bool(_))) {
-            let a = l.to_int()?;
-            let b = r.to_int()?;
+            let a = l.to_bigint()?;
+            let b = r.to_bigint()?;
             return self.binop(&Int(a), op, &Int(b));
         }
 
@@ -1195,11 +1219,11 @@ impl Interpreter {
             return Ok(Str(Rc::new(format!("{}{}", a, b))));
         }
         if let (Str(a), Mult, Int(n)) = (l, op, r) {
-            let n = (*n).max(0) as usize;
+            let n = n.to_usize().unwrap_or(0);
             return Ok(Str(Rc::new(a.repeat(n))));
         }
         if let (Int(n), Mult, Str(a)) = (l, op, r) {
-            let n = (*n).max(0) as usize;
+            let n = n.to_usize().unwrap_or(0);
             return Ok(Str(Rc::new(a.repeat(n))));
         }
 
@@ -1215,7 +1239,7 @@ impl Interpreter {
             return Ok(Tuple(Rc::new(out)));
         }
         if let (List(a), Mult, Int(n)) = (l, op, r) {
-            let n = (*n).max(0) as usize;
+            let n = n.to_usize().unwrap_or(0);
             let mut out = Vec::with_capacity(a.borrow().len() * n);
             for _ in 0..n {
                 out.extend(a.borrow().iter().cloned());
@@ -1223,7 +1247,7 @@ impl Interpreter {
             return Ok(List(Rc::new(RefCell::new(out))));
         }
         if let (Tuple(a), Mult, Int(n)) = (l, op, r) {
-            let n = (*n).max(0) as usize;
+            let n = n.to_usize().unwrap_or(0);
             let mut out = Vec::with_capacity(a.len() * n);
             for _ in 0..n {
                 out.extend(a.iter().cloned());
@@ -1257,9 +1281,9 @@ impl Interpreter {
         match op {
             UnaryOp::Not => Ok(Value::Bool(!v.truthy())),
             UnaryOp::USub => match v {
-                Value::Int(i) => Ok(Value::Int(-*i)),
+                Value::Int(i) => Ok(Value::Int(-i)),
                 Value::Float(x) => Ok(Value::Float(-*x)),
-                Value::Bool(b) => Ok(Value::Int(-(*b as i64))),
+                Value::Bool(b) => Ok(Value::Int(BigInt::from(-(*b as i64)))),
                 _ => Err(type_error(format!(
                     "bad operand for unary -: '{}'",
                     v.type_name()
@@ -1267,12 +1291,12 @@ impl Interpreter {
             },
             UnaryOp::UAdd => match v {
                 Value::Int(_) | Value::Float(_) => Ok(v.clone()),
-                Value::Bool(b) => Ok(Value::Int(*b as i64)),
+                Value::Bool(b) => Ok(Value::Int(BigInt::from(*b as i64))),
                 _ => Err(type_error("bad operand for unary +")),
             },
             UnaryOp::Invert => match v {
-                Value::Int(i) => Ok(Value::Int(!*i)),
-                Value::Bool(b) => Ok(Value::Int(!(*b as i64))),
+                Value::Int(i) => Ok(Value::Int(!i)),
+                Value::Bool(b) => Ok(Value::Int(!BigInt::from(*b as i64))),
                 _ => Err(type_error("bad operand for unary ~")),
             },
         }
@@ -1323,7 +1347,7 @@ impl Interpreter {
                 let i = key.to_int()?;
                 let idx = normalize_index(i, b.len())
                     .ok_or_else(|| index_error("bytes index out of range"))?;
-                Ok(Value::Int(b[idx] as i64))
+                Ok(Value::Int(BigInt::from(b[idx] as i64)))
             }
             other => Err(type_error(format!(
                 "'{}' object is not subscriptable",
@@ -1421,8 +1445,10 @@ impl Interpreter {
             }
             Value::Dict(d) => {
                 let k = key.to_hash_key()?;
+                // `shift_remove` preserves insertion order (matches Python's
+                // `del d[k]` on an insertion-ordered dict).
                 d.borrow_mut()
-                    .remove(&k)
+                    .shift_remove(&k)
                     .map(|_| ())
                     .ok_or_else(|| key_error(key.py_repr()))
             }
@@ -1678,7 +1704,7 @@ impl Interpreter {
                 if done {
                     Ok(None)
                 } else {
-                    let v = Value::Int(*current);
+                    let v = Value::Int(BigInt::from(*current));
                     *current += *step;
                     Ok(Some(v))
                 }
@@ -1743,7 +1769,10 @@ impl Interpreter {
                             _ => unreachable!(),
                         };
                         let _ = index; // appease the borrow checker — value above is correct
-                        return Ok(Some(Value::Tuple(Rc::new(vec![Value::Int(idx), v]))));
+                        return Ok(Some(Value::Tuple(Rc::new(vec![
+                            Value::Int(BigInt::from(idx)),
+                            v,
+                        ]))));
                     }
                     None => return Ok(None),
                 }
@@ -1865,7 +1894,7 @@ impl Interpreter {
     }
 
     fn eval_dictcomp(&mut self, c: &ast::ExprDictComp, env: &EnvRef) -> Result<Value, Unwind> {
-        let out = Rc::new(RefCell::new(HashMap::new()));
+        let out: Rc<RefCell<DictMap>> = Rc::new(RefCell::new(IndexMap::new()));
         let key_expr = c
             .key
             .clone()
@@ -1994,7 +2023,7 @@ impl Interpreter {
 
     fn exec_with(&mut self, w: &ast::StmtWith, env: &EnvRef) -> Result<(), Unwind> {
         if w.is_async {
-            return Err(not_implemented("async with"));
+            return Err(vm_unsupported_use_compile("async with"));
         }
         // Each context-manager value must support .__enter__ / .__exit__.
         // For v1 we only handle plain values that implement these as native
@@ -2098,8 +2127,55 @@ impl Interpreter {
                 _ => Ok(false),
             },
             MatchClass(c) => self.pattern_match_class(c, subject, env),
-            MatchStar(_) | MatchMapping(_) => Err(not_implemented("complex match patterns")),
+            MatchMapping(m) => self.pattern_match_mapping(m, subject, env),
+            // `MatchStar` only appears *inside* a sequence pattern (we
+            // dispatch it there); seeing it here means a star pattern at
+            // top level, which Python rejects with a SyntaxError. Treat
+            // as a non-match rather than crashing.
+            MatchStar(_) => Ok(false),
         }
+    }
+
+    /// FINDINGS #30 — mapping pattern (`case {"k": v, **rest}`). Matches
+    /// against a dict subject, binds nested patterns for each named key,
+    /// and (if present) captures the remaining keys into `rest`.
+    fn pattern_match_mapping(
+        &mut self,
+        m: &ast::PatternMatchMapping,
+        subject: &Value,
+        env: &EnvRef,
+    ) -> Result<bool, Unwind> {
+        let Value::Dict(d) = subject else {
+            return Ok(false);
+        };
+        // Evaluate the key expressions, then look each up in the dict.
+        let mut matched_keys: Vec<HashKey> = Vec::with_capacity(m.keys.len());
+        for (key_expr, pat) in m.keys.iter().zip(m.patterns.iter()) {
+            let key_val = self.eval_expr(key_expr, env)?;
+            let key = key_val.to_hash_key()?;
+            let value = match d.borrow().get(&key) {
+                Some(v) => v.clone(),
+                None => return Ok(false),
+            };
+            if !self.pattern_matches(pat, &value, env)? {
+                return Ok(false);
+            }
+            matched_keys.push(key);
+        }
+        if let Some(rest_name) = &m.rest {
+            // Build a new dict of the keys we *didn't* consume.
+            let mut rest_map: DictMap = IndexMap::new();
+            for (k, v) in d.borrow().iter() {
+                if !matched_keys.iter().any(|seen| seen == k) {
+                    rest_map.insert(k.clone(), v.clone());
+                }
+            }
+            env.set(
+                rest_name.as_str(),
+                Value::Dict(Rc::new(RefCell::new(rest_map))),
+            );
+        }
+        Ok(true)
     }
 
     fn pattern_match_seq(
@@ -2226,7 +2302,17 @@ impl Interpreter {
 
 fn number_to_value(n: &Number) -> Value {
     match n {
-        Number::Int(i) => Value::Int(i.as_i64().unwrap_or(0)),
+        // Ruff exposes the source-spelled int via `as_str`, which is the
+        // safe path for values too big for `i64` (FINDINGS #19). Fall back
+        // to `as_i64` for the common small-literal case.
+        Number::Int(i) => {
+            if let Some(small) = i.as_i64() {
+                Value::Int(BigInt::from(small))
+            } else {
+                let s = format!("{i}");
+                Value::Int(s.parse::<BigInt>().unwrap_or_else(|_| BigInt::from(0)))
+            }
+        }
         Number::Float(x) => Value::Float(*x),
         Number::Complex { .. } => Value::None, // not supported
     }
@@ -2335,114 +2421,215 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
     if spec.is_empty() {
         return Ok(default.to_owned());
     }
-    // Very small subset: `.Nf`, `,d`, `>N`, `<N`, `^N`, plus combined width+precision.
-    // Anything else falls through to the default string repr.
-    let mut chars = spec.chars().peekable();
-    let _fill = ' ';
+    // Implements a useful subset of Python's PEP 3101 format mini-language:
+    //   [[fill]align][sign][#][0][width][,][.precision][type]
+    // Notable for FINDINGS #20: zero-pad (`0`) and alternate-form (`#`,
+    // adds `0x`/`0o`/`0b` for hex/oct/bin) are now handled. Anything not
+    // recognised falls through to the default string repr.
+    let raw: Vec<char> = spec.chars().collect();
+    let mut i = 0usize;
+    let mut fill: char = ' ';
     let mut align: Option<char> = None;
     let mut sign: Option<char> = None;
+    let mut alternate = false;
+    let mut zero_pad = false;
     let mut width: Option<usize> = None;
     let mut precision: Option<usize> = None;
     let mut typ: Option<char> = None;
     let mut comma = false;
-    let mut buf: String;
 
-    while let Some(&c) = chars.peek() {
-        if c == '<' || c == '>' || c == '^' {
+    // Optional `[fill]align` — fill is any char *immediately followed by*
+    // an alignment specifier; otherwise the first char is treated as the
+    // alignment itself.
+    if raw.len() >= 2 && matches!(raw[1], '<' | '>' | '^' | '=') {
+        fill = raw[0];
+        align = Some(raw[1]);
+        i = 2;
+    } else if let Some(&c) = raw.first() {
+        if matches!(c, '<' | '>' | '^' | '=') {
             align = Some(c);
-            chars.next();
-            continue;
+            i = 1;
         }
-        if c == '+' || c == '-' {
-            sign = Some(c);
-            chars.next();
-            continue;
-        }
-        if c.is_ascii_digit() {
-            let mut n = 0usize;
-            while let Some(&c) = chars.peek() {
-                if let Some(d) = c.to_digit(10) {
-                    n = n * 10 + d as usize;
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            width = Some(n);
-            continue;
-        }
-        if c == '.' {
-            chars.next();
-            let mut n = 0usize;
-            while let Some(&c) = chars.peek() {
-                if let Some(d) = c.to_digit(10) {
-                    n = n * 10 + d as usize;
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            precision = Some(n);
-            continue;
-        }
-        if c == ',' {
-            comma = true;
-            chars.next();
-            continue;
-        }
-        typ = Some(c);
-        chars.next();
     }
 
+    while i < raw.len() {
+        let c = raw[i];
+        match c {
+            '+' | '-' | ' ' if sign.is_none() => {
+                sign = Some(c);
+                i += 1;
+            }
+            '#' => {
+                alternate = true;
+                i += 1;
+            }
+            '0' if width.is_none() => {
+                zero_pad = true;
+                i += 1;
+            }
+            d if d.is_ascii_digit() => {
+                let mut n = 0usize;
+                while i < raw.len() {
+                    if let Some(k) = raw[i].to_digit(10) {
+                        n = n * 10 + k as usize;
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                width = Some(n);
+            }
+            ',' => {
+                comma = true;
+                i += 1;
+            }
+            '.' => {
+                i += 1;
+                let mut n = 0usize;
+                while i < raw.len() {
+                    if let Some(k) = raw[i].to_digit(10) {
+                        n = n * 10 + k as usize;
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                precision = Some(n);
+            }
+            _ => {
+                typ = Some(c);
+                i += 1;
+            }
+        }
+    }
+
+    // The conversion type implies a *numeric* default alignment (right);
+    // zero-pad implies fill='0' and align='=' (sign before pad). Strings
+    // default to left-aligned. We approximate by tracking `is_numeric`.
+    let is_numeric = matches!(value, Value::Int(_) | Value::Float(_) | Value::Bool(_));
+    if zero_pad && align.is_none() {
+        align = Some('=');
+        fill = '0';
+    }
+
+    let buf: String;
+    let mut prefix = String::new();
+    let mut explicit_sign = String::new();
     match value {
         Value::Float(x) => {
             let p = precision.unwrap_or(6);
-            buf = format!("{:.*}", p, x);
-        }
-        Value::Int(i) => {
-            if comma {
-                buf = format_with_commas(*i);
-            } else if let Some('x') = typ {
-                buf = format!("{:x}", i);
-            } else if let Some('X') = typ {
-                buf = format!("{:X}", i);
-            } else if let Some('b') = typ {
-                buf = format!("{:b}", i);
-            } else if let Some('o') = typ {
-                buf = format!("{:o}", i);
-            } else {
-                buf = i.to_string();
+            let (abs, neg) = (x.abs(), *x < 0.0 || x.is_sign_negative());
+            match typ {
+                Some('e') => buf = format!("{:.*e}", p, abs),
+                Some('E') => buf = format!("{:.*E}", p, abs),
+                Some('g') | Some('G') => {
+                    // Python's `g` uses precision as significant digits.
+                    let sig = if p == 0 { 1 } else { p };
+                    buf = format!("{:.*e}", sig.saturating_sub(1), abs);
+                }
+                _ => buf = format!("{:.*}", p, abs),
             }
-            if let Some('+') = sign {
-                if *i >= 0 {
-                    buf.insert(0, '+');
+            if neg {
+                explicit_sign.push('-');
+            } else if let Some('+') = sign {
+                explicit_sign.push('+');
+            } else if let Some(' ') = sign {
+                explicit_sign.push(' ');
+            }
+        }
+        Value::Int(i_val) => {
+            let abs = i_val.abs();
+            let neg = i_val.is_negative();
+            match typ {
+                Some('x') => {
+                    buf = abs.to_str_radix(16);
+                    if alternate {
+                        prefix.push_str("0x");
+                    }
+                }
+                Some('X') => {
+                    buf = abs.to_str_radix(16).to_uppercase();
+                    if alternate {
+                        prefix.push_str("0X");
+                    }
+                }
+                Some('b') => {
+                    buf = abs.to_str_radix(2);
+                    if alternate {
+                        prefix.push_str("0b");
+                    }
+                }
+                Some('o') => {
+                    buf = abs.to_str_radix(8);
+                    if alternate {
+                        prefix.push_str("0o");
+                    }
+                }
+                _ => {
+                    buf = if comma {
+                        format_bigint_with_commas(&abs)
+                    } else {
+                        abs.to_str_radix(10)
+                    };
                 }
             }
+            if neg {
+                explicit_sign.push('-');
+            } else if let Some('+') = sign {
+                explicit_sign.push('+');
+            } else if let Some(' ') = sign {
+                explicit_sign.push(' ');
+            }
+        }
+        Value::Bool(b) => {
+            buf = (*b as i64).to_string();
         }
         _ => buf = default.to_owned(),
     }
 
+    // Apply width: combine sign + prefix + body, then pad.
     if let Some(w) = width {
-        if buf.len() < w {
-            let pad = w - buf.len();
-            let p = " ".repeat(pad);
-            buf = match align.unwrap_or('>') {
-                '<' => format!("{buf}{p}"),
+        let total_len = explicit_sign.chars().count() + prefix.chars().count() + buf.chars().count();
+        if total_len < w {
+            let pad = w - total_len;
+            // Default alignment: numeric → right, string → left.
+            let eff_align = align.unwrap_or(if is_numeric { '>' } else { '<' });
+            match eff_align {
+                '<' => {
+                    let core = format!("{explicit_sign}{prefix}{buf}");
+                    let p: String = std::iter::repeat(fill).take(pad).collect();
+                    return Ok(format!("{core}{p}"));
+                }
                 '^' => {
                     let lo = pad / 2;
                     let hi = pad - lo;
-                    format!("{}{}{}", " ".repeat(lo), buf, " ".repeat(hi))
+                    let lo_s: String = std::iter::repeat(fill).take(lo).collect();
+                    let hi_s: String = std::iter::repeat(fill).take(hi).collect();
+                    return Ok(format!(
+                        "{lo_s}{explicit_sign}{prefix}{buf}{hi_s}"
+                    ));
                 }
-                _ => format!("{p}{buf}"),
-            };
+                '=' => {
+                    // Pad between sign/prefix and the digits — used by
+                    // zero-pad on numbers.
+                    let p: String = std::iter::repeat(fill).take(pad).collect();
+                    return Ok(format!("{explicit_sign}{prefix}{p}{buf}"));
+                }
+                _ => {
+                    // '>' (default for numbers)
+                    let p: String = std::iter::repeat(fill).take(pad).collect();
+                    return Ok(format!("{p}{explicit_sign}{prefix}{buf}"));
+                }
+            }
         }
     }
-    let _ = typ;
-    Ok(buf)
+    Ok(format!("{explicit_sign}{prefix}{buf}"))
 }
 
-fn format_with_commas(i: i64) -> String {
-    let s = i.abs().to_string();
+/// Comma-separate every third digit of a non-negative `BigInt`. Caller
+/// is responsible for prepending the sign — the body is sign-free.
+fn format_bigint_with_commas(i: &BigInt) -> String {
+    let s = i.to_str_radix(10);
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (k, c) in s.chars().rev().enumerate() {
         if k > 0 && k % 3 == 0 {
@@ -2450,8 +2637,216 @@ fn format_with_commas(i: i64) -> String {
         }
         out.push(c);
     }
-    if i < 0 {
-        out.push('-');
-    }
     out.chars().rev().collect()
+}
+
+#[cfg(test)]
+mod vm_tests {
+    use super::*;
+    use ruff_python_ast::ModModule;
+    use tyc_syntax::parse_module;
+
+    fn parse_and_run(src: &str) -> (Interpreter, Result<(), Unwind>) {
+        let parsed = parse_module(src).expect("parse ok");
+        let module: ModModule = parsed.into_syntax();
+        let mut interp = Interpreter::new();
+        let res = interp.run_module(&module);
+        (interp, res)
+    }
+
+    /// FINDINGS #19 — `2 ** 100` and other big-integer arithmetic must
+    /// not overflow now that ints are `BigInt`-backed.
+    #[test]
+    fn bigint_pow_no_overflow() {
+        let src = r#"
+result = 2 ** 100
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        let v = interp.root.get("result").expect("defined");
+        assert_eq!(v.py_str(), "1267650600228229401496703205376");
+    }
+
+    #[test]
+    fn bigint_fib_99_no_overflow() {
+        let src = r#"
+def fib(n):
+    if n < 2:
+        return n
+    a = 0
+    b = 1
+    for _ in range(n - 1):
+        a, b = b, a + b
+    return b
+
+result = fib(99)
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        let v = interp.root.get("result").expect("defined");
+        // fib(99) = 218922995834555169026
+        assert_eq!(v.py_str(), "218922995834555169026");
+    }
+
+    /// FINDINGS #20 — zero-pad, alternate-form, and width+precision for
+    /// f-string format specs must match Python.
+    #[test]
+    fn fstring_zero_pad_and_alternate_form() {
+        let v = Value::Int(BigInt::from(42));
+        assert_eq!(format_with_spec(&v, "42", "04d").unwrap(), "0042");
+        assert_eq!(format_with_spec(&v, "42", "06").unwrap(), "000042");
+        assert_eq!(format_with_spec(&v, "42", "#x").unwrap(), "0x2a");
+        assert_eq!(format_with_spec(&v, "42", "#o").unwrap(), "0o52");
+        assert_eq!(format_with_spec(&v, "42", "#b").unwrap(), "0b101010");
+        // The findings note used `0003.142`, but CPython actually rounds
+        // `3.14` at precision 3 to `3.140`; matching Python's true output.
+        let pi = Value::Float(3.14);
+        assert_eq!(format_with_spec(&pi, "3.14", "08.3f").unwrap(), "0003.140");
+        // Test a value where the third decimal is meaningful.
+        let e = Value::Float(2.71828);
+        assert_eq!(format_with_spec(&e, "2.71828", "08.3f").unwrap(), "0002.718");
+        // Combined: alternate-form hex with zero-pad and width.
+        assert_eq!(format_with_spec(&v, "42", "#06x").unwrap(), "0x002a");
+        // Negative numbers respect sign position with zero-pad.
+        let n = Value::Int(BigInt::from(-7));
+        assert_eq!(format_with_spec(&n, "-7", "04d").unwrap(), "-007");
+        // Default formatting still works.
+        assert_eq!(format_with_spec(&v, "42", "5").unwrap(), "   42");
+        assert_eq!(format_with_spec(&v, "42", "<5").unwrap(), "42   ");
+    }
+
+    /// FINDINGS #30 — mapping patterns `case {"k": v}` must match
+    /// against dicts and bind nested patterns.
+    #[test]
+    fn match_mapping_pattern_binds_value() {
+        let src = r#"
+shape = {"type": "circle", "radius": 7}
+def kind(s):
+    match s:
+        case {"type": "circle", "radius": r}:
+            return ("circle", r)
+        case {"type": t}:
+            return ("other", t)
+        case _:
+            return ("unknown", 0)
+result = kind(shape)
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        let v = interp.root.get("result").expect("defined");
+        assert_eq!(v.py_str(), "('circle', 7)");
+    }
+
+    #[test]
+    fn match_mapping_pattern_with_rest() {
+        let src = r#"
+d = {"a": 1, "b": 2, "c": 3}
+def f(x):
+    match x:
+        case {"a": a, **rest}:
+            return (a, rest)
+        case _:
+            return (0, {})
+result = f(d)
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        let v = interp.root.get("result").expect("defined");
+        // The remaining dict should include "b" and "c" in insertion order.
+        assert_eq!(v.py_str(), "(1, {'b': 2, 'c': 3})");
+    }
+
+    /// FINDINGS #30 — sequence pattern with star: `case [x, *rest, y]`.
+    /// Already worked in v1; this is a regression-guard test.
+    #[test]
+    fn match_sequence_pattern_with_star() {
+        let src = r#"
+xs = [1, 2, 3, 4, 5]
+def f(s):
+    match s:
+        case [first, *middle, last]:
+            return (first, middle, last)
+        case _:
+            return (0, [], 0)
+result = f(xs)
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        let v = interp.root.get("result").expect("defined");
+        assert_eq!(v.py_str(), "(1, [2, 3, 4], 5)");
+    }
+
+    /// FINDINGS #31 — recursion limit raised to match Python's default
+    /// of 1000.
+    #[test]
+    fn recursion_limit_matches_python_default() {
+        let interp = Interpreter::new();
+        assert!(
+            interp.max_stack_depth >= 1000,
+            "max_stack_depth should be >= 1000 (Python default), got {}",
+            interp.max_stack_depth
+        );
+    }
+
+    /// FINDINGS #28 / #29 — VM doesn't support generators or async, but
+    /// the error message must point users at the `tyc build && python`
+    /// workaround.
+    #[test]
+    fn yield_error_mentions_tyc_build_fallback() {
+        let src = r#"
+def gen():
+    yield 1
+gen()
+"#;
+        let (_interp, res) = parse_and_run(src);
+        let err = res.expect_err("yield should error");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("tyc build") && msg.contains("python"),
+            "yield error should mention `tyc build` + `python` fallback, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn async_def_error_mentions_tyc_build_fallback() {
+        let src = r#"
+async def fetch():
+    return 1
+fetch()
+"#;
+        let (_interp, res) = parse_and_run(src);
+        let err = res.expect_err("async should error");
+        let msg = format!("{:?}", err);
+        assert!(
+            msg.contains("tyc build") && msg.contains("python"),
+            "async error should mention `tyc build` + `python` fallback, got: {msg}"
+        );
+    }
+
+    /// FINDINGS #18 — `IndexMap` preserves insertion order so `tyc run`
+    /// and `tyc build && python` produce identical output for any
+    /// dict-printing program.
+    #[test]
+    fn dict_preserves_insertion_order() {
+        let src = r#"
+d = {"a": 1, "b": 2, "c": 3, "d": 4, "e": 5}
+"#;
+        let (interp, res) = parse_and_run(src);
+        res.unwrap();
+        let v = interp.root.get("d").expect("d defined");
+        let Value::Dict(d) = v else {
+            panic!("expected dict, got {:?}", v);
+        };
+        let keys: Vec<String> = d
+            .borrow()
+            .keys()
+            .map(|k| k.clone().into_value().py_str())
+            .collect();
+        assert_eq!(keys, vec!["a", "b", "c", "d", "e"]);
+        // py_str on the dict must match Python's output.
+        assert_eq!(
+            Value::Dict(d).py_str(),
+            "{'a': 1, 'b': 2, 'c': 3, 'd': 4, 'e': 5}"
+        );
+    }
 }

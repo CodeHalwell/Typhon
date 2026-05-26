@@ -8,12 +8,14 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::rc::Rc;
 
+use indexmap::IndexMap;
+
 use crate::error::{
     attribute_error, index_error, key_error, not_implemented, stop_iteration, type_error,
     value_error, Unwind,
 };
 use crate::interp::{normalize_index, Interpreter};
-use crate::value::{HashKey, IterState, Module, NativeFn, Value};
+use crate::value::{DictMap, HashKey, IterState, Module, NativeFn, Value};
 
 pub fn install(interp: &mut Interpreter) {
     let root = interp.root.clone();
@@ -39,7 +41,7 @@ pub fn install(interp: &mut Interpreter) {
 
     native!("len", |_i, args| {
         let v = single(&args, "len")?;
-        Ok(Value::Int(value_len(v)? as i64))
+        Ok(Value::Int(num_bigint::BigInt::from(value_len(v)? as i64)))
     });
 
     native!("range", |_i, args| match args.len() {
@@ -76,7 +78,7 @@ pub fn install(interp: &mut Interpreter) {
 
     native!("int", |_i, args| {
         let v = single(&args, "int")?;
-        Ok(Value::Int(v.to_int()?))
+        Ok(Value::Int(v.to_bigint()?))
     });
 
     native!("float", |_i, args| {
@@ -123,7 +125,7 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("dict", |i, args| {
-        let mut map = HashMap::new();
+        let mut map: DictMap = IndexMap::new();
         if let Some(v) = args.into_iter().next() {
             let it = i.make_iter(v)?;
             while let Some(pair) = i.iter_next(&it)? {
@@ -168,9 +170,9 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("abs", |_i, args| match single(&args, "abs")? {
-        Value::Int(i) => Ok(Value::Int(i.abs())),
+        Value::Int(i) => Ok(Value::Int(num_traits::Signed::abs(i))),
         Value::Float(x) => Ok(Value::Float(x.abs())),
-        Value::Bool(b) => Ok(Value::Int(*b as i64)),
+        Value::Bool(b) => Ok(Value::Int(num_bigint::BigInt::from(*b as i64))),
         _ => Err(type_error("bad operand type for abs()")),
     });
 
@@ -183,7 +185,7 @@ pub fn install(interp: &mut Interpreter) {
                 .next()
                 .ok_or_else(|| type_error("sum() requires an iterable"))?,
         )?;
-        let mut acc = Value::Int(0);
+        let mut acc = Value::Int(num_bigint::BigInt::from(0));
         while let Some(v) = i.iter_next(&it)? {
             acc = i.binop(&acc, ruff_python_ast::Operator::Add, &v)?;
         }
@@ -350,7 +352,7 @@ pub fn install(interp: &mut Interpreter) {
             Value::Str(s) => {
                 let mut it = s.chars();
                 match (it.next(), it.next()) {
-                    (Some(c), None) => Ok(Value::Int(c as i64)),
+                    (Some(c), None) => Ok(Value::Int(num_bigint::BigInt::from(c as i64))),
                     _ => Err(type_error("ord() expected a single-character string")),
                 }
             }
@@ -359,14 +361,14 @@ pub fn install(interp: &mut Interpreter) {
     });
 
     native!("round", |_i, args| match args.first() {
-        Some(Value::Int(i)) => Ok(Value::Int(*i)),
+        Some(Value::Int(i)) => Ok(Value::Int(i.clone())),
         Some(Value::Float(x)) => match args.get(1) {
             Some(n) => {
                 let n = n.to_int()? as i32;
                 let p = 10f64.powi(n);
                 Ok(Value::Float((x * p).round() / p))
             }
-            None => Ok(Value::Int(x.round() as i64)),
+            None => Ok(Value::Int(num_bigint::BigInt::from(x.round() as i64))),
         },
         _ => Err(type_error("round() expected a number")),
     });
@@ -400,7 +402,7 @@ pub fn install(interp: &mut Interpreter) {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         key.hash(&mut h);
-        Ok(Value::Int(h.finish() as i64))
+        Ok(Value::Int(num_bigint::BigInt::from(h.finish() as i64)))
     });
 
     native!("id", |_i, args| {
@@ -426,7 +428,7 @@ pub fn install(interp: &mut Interpreter) {
             Value::Iter(it) => Rc::as_ptr(it) as usize,
             other => other as *const _ as usize,
         };
-        Ok(Value::Int(addr as i64))
+        Ok(Value::Int(num_bigint::BigInt::from(addr as i64)))
     });
 
     native!("callable", |_i, args| {
@@ -827,15 +829,17 @@ fn make_math_module() -> Value {
             (
                 "floor",
                 nf("floor", |_i, args| {
-                    Ok(Value::Int(
-                        single(&args, "floor")?.to_float()?.floor() as i64
-                    ))
+                    Ok(Value::Int(num_bigint::BigInt::from(
+                        single(&args, "floor")?.to_float()?.floor() as i64,
+                    )))
                 }),
             ),
             (
                 "ceil",
                 nf("ceil", |_i, args| {
-                    Ok(Value::Int(single(&args, "ceil")?.to_float()?.ceil() as i64))
+                    Ok(Value::Int(num_bigint::BigInt::from(
+                        single(&args, "ceil")?.to_float()?.ceil() as i64,
+                    )))
                 }),
             ),
             (
@@ -916,7 +920,7 @@ fn make_os_module() -> Value {
     let environ = nf("environ", |_i, _args| Ok(Value::None));
     let _ = environ;
     let env_dict = {
-        let mut m = HashMap::new();
+        let mut m: DictMap = IndexMap::new();
         for (k, v) in std::env::vars() {
             m.insert(HashKey::Str(Rc::new(k)), Value::Str(Rc::new(v)));
         }
@@ -1096,7 +1100,9 @@ fn make_random_module() -> Value {
                         return Err(value_error("randint(a, b): b must be >= a"));
                     }
                     let span = (b - a + 1) as u64;
-                    Ok(Value::Int(a + (next_u64() % span) as i64))
+                    Ok(Value::Int(num_bigint::BigInt::from(
+                        a + (next_u64() % span) as i64,
+                    )))
                 }),
             ),
             (
@@ -1359,21 +1365,21 @@ fn make_re_module() -> Value {
         attrs.insert(
             "start".into(),
             Value::Native(Rc::new(NativeFn::new("start", move |_i, _args| {
-                Ok(Value::Int(start))
+                Ok(Value::Int(num_bigint::BigInt::from(start)))
             }))),
         );
         attrs.insert(
             "end".into(),
             Value::Native(Rc::new(NativeFn::new("end", move |_i, _args| {
-                Ok(Value::Int(end))
+                Ok(Value::Int(num_bigint::BigInt::from(end)))
             }))),
         );
         attrs.insert(
             "span".into(),
             Value::Native(Rc::new(NativeFn::new("span", move |_i, _args| {
                 Ok(Value::Tuple(Rc::new(vec![
-                    Value::Int(start),
-                    Value::Int(end),
+                    Value::Int(num_bigint::BigInt::from(start)),
+                    Value::Int(num_bigint::BigInt::from(end)),
                 ])))
             }))),
         );
@@ -1514,11 +1520,11 @@ fn make_re_module() -> Value {
             // engine has no flag plumbing; users that rely on
             // IGNORECASE/MULTILINE will see incorrect behaviour and
             // should fall back to `tyc run --compile`.
-            ("IGNORECASE", Value::Int(2)),
-            ("MULTILINE", Value::Int(8)),
-            ("DOTALL", Value::Int(16)),
-            ("VERBOSE", Value::Int(64)),
-            ("ASCII", Value::Int(256)),
+            ("IGNORECASE", Value::Int(num_bigint::BigInt::from(2))),
+            ("MULTILINE", Value::Int(num_bigint::BigInt::from(8))),
+            ("DOTALL", Value::Int(num_bigint::BigInt::from(16))),
+            ("VERBOSE", Value::Int(num_bigint::BigInt::from(64))),
+            ("ASCII", Value::Int(num_bigint::BigInt::from(256))),
         ],
     )
 }
@@ -1532,15 +1538,17 @@ fn make_re_module() -> Value {
 /// to `tyc run --compile`.
 fn make_collections_module() -> Value {
     let counter = nf("Counter", |i, args| {
-        let mut counts: HashMap<HashKey, Value> = HashMap::new();
+        let mut counts: DictMap = IndexMap::new();
         if let Some(v) = args.into_iter().next() {
             let it = i.make_iter(v)?;
             while let Some(x) = i.iter_next(&it)? {
                 let key = x.to_hash_key()?;
-                let entry = counts.entry(key).or_insert(Value::Int(0));
+                let entry = counts
+                    .entry(key)
+                    .or_insert(Value::Int(num_bigint::BigInt::from(0)));
                 *entry = match entry {
-                    Value::Int(n) => Value::Int(*n + 1),
-                    _ => Value::Int(1),
+                    Value::Int(n) => Value::Int(&*n + 1),
+                    _ => Value::Int(num_bigint::BigInt::from(1)),
                 };
             }
         }
@@ -1551,14 +1559,13 @@ fn make_collections_module() -> Value {
         // raises KeyError just like a plain dict in this shim. Users
         // that need the auto-default behaviour should fall back to
         // compile mode.
-        Ok(Value::Dict(Rc::new(RefCell::new(HashMap::new()))))
+        Ok(Value::Dict(Rc::new(RefCell::new(IndexMap::new()))))
     });
     let ordered_dict = nf("OrderedDict", |i, args| {
         // CPython's `dict` preserves insertion order since 3.7, so this
-        // is a true alias for the v1 shim. (The VM itself does not yet
-        // preserve insertion order on display — FINDINGS #18 — but the
-        // surface API matches CPython's `OrderedDict`.)
-        let mut m: HashMap<HashKey, Value> = HashMap::new();
+        // is a true alias for the v1 shim (FINDINGS #18 — the VM itself
+        // now backs dicts with IndexMap so iteration order matches).
+        let mut m: DictMap = IndexMap::new();
         if let Some(v) = args.into_iter().next() {
             let it = i.make_iter(v)?;
             while let Some(pair) = i.iter_next(&it)? {
@@ -1759,7 +1766,7 @@ fn make_itertools_module() -> Value {
         let start = args.first().and_then(|x| x.to_int().ok()).unwrap_or(0);
         let step = args.get(1).and_then(|x| x.to_int().ok()).unwrap_or(1);
         let out: Vec<Value> = (0..1024)
-            .map(|n| Value::Int(start + n * step))
+            .map(|n| Value::Int(num_bigint::BigInt::from(start + n * step)))
             .collect();
         Ok(Value::List(Rc::new(RefCell::new(out))))
     });
@@ -2042,7 +2049,7 @@ fn make_dataclasses_module() -> Value {
     let asdict = nf("asdict", |_i, args| {
         let v = single(&args, "asdict")?;
         if let Value::Instance(inst) = v {
-            let mut map: HashMap<HashKey, Value> = HashMap::new();
+            let mut map: DictMap = IndexMap::new();
             for (k, val) in inst.fields.borrow().iter() {
                 map.insert(HashKey::Str(Rc::new(k.clone())), val.clone());
             }
@@ -2128,7 +2135,7 @@ fn make_pathlib_module() -> Value {
             Value::Native(Rc::new(NativeFn::new("write_text", move |_i, args| {
                 let text = single(&args, "write_text")?.py_str();
                 std::fs::write(&s_for_write, text.as_bytes())
-                    .map(|_| Value::Int(text.len() as i64))
+                    .map(|_| Value::Int(num_bigint::BigInt::from(text.len() as i64)))
                     .map_err(|e| crate::error::Unwind::Exception(
                         crate::error::VmException::new("OSError", format!("{e}")),
                     ))
@@ -2271,18 +2278,22 @@ fn str_method(
         "endswith" => Value::Bool(s.ends_with(&single(args, "endswith")?.py_str())),
         "find" => {
             let needle = single(args, "find")?.py_str();
-            Value::Int(s.find(&needle).map(|i| i as i64).unwrap_or(-1))
+            Value::Int(num_bigint::BigInt::from(
+                s.find(&needle).map(|i| i as i64).unwrap_or(-1),
+            ))
         }
         "rfind" => {
             let needle = single(args, "rfind")?.py_str();
-            Value::Int(s.rfind(&needle).map(|i| i as i64).unwrap_or(-1))
+            Value::Int(num_bigint::BigInt::from(
+                s.rfind(&needle).map(|i| i as i64).unwrap_or(-1),
+            ))
         }
         "count" => {
             let needle = single(args, "count")?.py_str();
             if needle.is_empty() {
-                Value::Int(s.chars().count() as i64 + 1)
+                Value::Int(num_bigint::BigInt::from(s.chars().count() as i64 + 1))
             } else {
-                Value::Int(s.matches(&needle).count() as i64)
+                Value::Int(num_bigint::BigInt::from(s.matches(&needle).count() as i64))
             }
         }
         "isdigit" => Value::Bool(!s.is_empty() && s.chars().all(|c| c.is_ascii_digit())),
@@ -2377,14 +2388,14 @@ fn list_method(
                 .iter()
                 .position(|v| v.py_eq(&target))
                 .ok_or_else(|| value_error("list.index(x): x not in list"))?;
-            Ok(Value::Int(pos as i64))
+            Ok(Value::Int(num_bigint::BigInt::from(pos as i64)))
         }
         "count" => {
             let target = single(args, "count")?.clone();
             let l = l.borrow();
-            Ok(Value::Int(
-                l.iter().filter(|v| v.py_eq(&target)).count() as i64
-            ))
+            Ok(Value::Int(num_bigint::BigInt::from(
+                l.iter().filter(|v| v.py_eq(&target)).count() as i64,
+            )))
         }
         "clear" => {
             l.borrow_mut().clear();
@@ -2406,7 +2417,7 @@ fn list_method(
 
 fn dict_method(
     interp: &mut Interpreter,
-    d: &Rc<RefCell<HashMap<HashKey, Value>>>,
+    d: &Rc<RefCell<DictMap>>,
     name: &str,
     args: &[Value],
 ) -> Result<Value, Unwind> {
@@ -2435,7 +2446,9 @@ fn dict_method(
         "pop" => {
             let k = single(args, "pop")?.to_hash_key()?;
             let default = args.get(1).cloned();
-            match d.borrow_mut().remove(&k) {
+            // `shift_remove` preserves the insertion order of remaining
+            // keys (matches CPython `dict.pop` semantics).
+            match d.borrow_mut().shift_remove(&k) {
                 Some(v) => Ok(v),
                 None => default.ok_or_else(|| key_error(format!("{:?}", k))),
             }
@@ -2510,15 +2523,15 @@ fn tuple_method(t: &Rc<Vec<Value>>, name: &str, args: &[Value]) -> Result<Value,
     match name {
         "count" => {
             let target = single(args, "count")?;
-            Ok(Value::Int(
-                t.iter().filter(|v| v.py_eq(target)).count() as i64
-            ))
+            Ok(Value::Int(num_bigint::BigInt::from(
+                t.iter().filter(|v| v.py_eq(target)).count() as i64,
+            )))
         }
         "index" => {
             let target = single(args, "index")?;
             t.iter()
                 .position(|v| v.py_eq(target))
-                .map(|p| Value::Int(p as i64))
+                .map(|p| Value::Int(num_bigint::BigInt::from(p as i64)))
                 .ok_or_else(|| value_error("tuple.index(x): x not in tuple"))
         }
         _ => Err(attribute_error(format!("tuple has no method '{}'", name))),
@@ -2528,7 +2541,7 @@ fn tuple_method(t: &Rc<Vec<Value>>, name: &str, args: &[Value]) -> Result<Value,
 fn num_method(v: &Value, name: &str, _args: &[Value]) -> Result<Value, Unwind> {
     match (v, name) {
         (Value::Float(x), "is_integer") => Ok(Value::Bool(x.fract() == 0.0 && x.is_finite())),
-        (Value::Int(i), "bit_length") => Ok(Value::Int(64 - i.leading_zeros() as i64)),
+        (Value::Int(i), "bit_length") => Ok(Value::Int(num_bigint::BigInt::from(i.bits() as i64))),
         _ => Err(attribute_error(format!(
             "'{}' object has no method '{}'",
             v.type_name(),
@@ -2629,7 +2642,7 @@ impl<'a> JsonParser<'a> {
     }
     fn parse_object(&mut self) -> Result<Value, Unwind> {
         self.pos += 1; // {
-        let mut map = HashMap::new();
+        let mut map: DictMap = IndexMap::new();
         self.skip_ws();
         if self.peek() == Some(b'}') {
             self.pos += 1;
@@ -2755,7 +2768,9 @@ impl<'a> JsonParser<'a> {
             ))
         } else {
             Ok(Value::Int(
-                slice.parse().map_err(|_| value_error("bad number"))?,
+                slice
+                    .parse::<num_bigint::BigInt>()
+                    .map_err(|_| value_error("bad number"))?,
             ))
         }
     }
