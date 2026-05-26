@@ -186,6 +186,7 @@ pub fn compute(
 /// `line_shifts[line]` is the byte count stripped from the start of
 /// that line by preprocessing. Lines past the end of the slice get a
 /// shift of 0. See [`tyc_syntax::preprocess::PreprocessResult::line_col_shifts`].
+#[allow(clippy::too_many_arguments)] // mirrors compute()'s parameter set + adds original/line_shifts; the LSP is the sole caller
 pub fn compute_with_original(
     preprocessed: &str,
     original: &str,
@@ -355,12 +356,7 @@ fn find_whole_word(line: &str, name: &str) -> Option<usize> {
     if name_bytes.len() > bytes.len() {
         return None;
     }
-    for i in 0..=bytes.len() - name_bytes.len() {
-        if matches_whole_word_at(line, i, name) {
-            return Some(i);
-        }
-    }
-    None
+    (0..=bytes.len() - name_bytes.len()).find(|&i| matches_whole_word_at(line, i, name))
 }
 
 fn byte_col_to_utf16(line: &str, byte_col: usize) -> u32 {
@@ -1894,9 +1890,7 @@ mod tests {
     /// regression tests so the assertions express what the editor will
     /// render, not what the resolver computed against the preprocessed
     /// view of the file.
-    fn compute_from_original(
-        original: &str,
-    ) -> (String, Vec<SemanticToken>) {
+    fn compute_from_original(original: &str) -> (String, Vec<SemanticToken>) {
         let prep = preprocess(original);
         let parsed = parse_module(&prep.python_source).expect("parse");
         let module = parsed.into_syntax();
@@ -1926,11 +1920,7 @@ mod tests {
     /// needle — column equals the byte offset of `needle` and length
     /// equals `needle.len()`. Returns the token type so callers can
     /// chain `assert_eq!` on it.
-    fn assert_token_covers(
-        original: &str,
-        needle: &str,
-        data: &[SemanticToken],
-    ) -> u32 {
+    fn assert_token_covers(original: &str, needle: &str, data: &[SemanticToken]) -> u32 {
         let lines: Vec<&str> = original.lines().collect();
         // Find the (line, col) of `needle` in `original`.
         let mut target_line: u32 = 0;
