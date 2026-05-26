@@ -990,6 +990,15 @@ pub fn type_from_annotation_with_params(
             // Literal["a", "b"] / Literal[1, 2] — narrow to the
             // widened literal type (str / int / bool / bytes / None).
             // FINDINGS #98.
+            //
+            // TODO FINDINGS v0.7.1 #13: a string-literal union
+            // (`"red" | "green" | "blue"`) currently widens here to the
+            // plain `str` type, so `paint("orange")` is silently accepted.
+            // A proper fix requires adding a `Type::Literal(LiteralValue)`
+            // variant to the `Type` enum, threading it through
+            // `is_assignable`, `Display`, and every Union normaliser, then
+            // rejecting non-member strings at the call-site check. That's
+            // a multi-day cross-cutting change tracked separately.
             if head == "Literal" {
                 let variants: Vec<&Expr> = match s.slice.as_ref() {
                     Expr::Tuple(t) => t.elts.iter().collect(),
@@ -16918,6 +16927,40 @@ def classify(t: Token) -> str:
         assert!(
             !d.errors().iter().any(|e| matches!(e, TycError::MissingReturn { .. })),
             "guarded sealed-union match with a wildcard tail must not fire missing_return; got: {:?}",
+            d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
+        );
+    }
+
+    /// FINDINGS v0.7.1 #13: string-literal union types (`"red" | "green"
+    /// | "blue"`) must reject string values that aren't one of the
+    /// literals. Blocked: tyc-types' `Type` enum has no `Literal`
+    /// variant — every `"red"` annotation lowers to `Type::Str`, which
+    /// is then unified with any other `Type::Str` value and the union
+    /// collapses to plain `str`. Wiring this would require:
+    ///   1. Adding `Type::Literal(LiteralValue)` to the type model,
+    ///   2. Teaching `type_from_annotation_with_params` to produce it
+    ///      for `Expr::StringLiteral` / number / bool literal nodes,
+    ///   3. Updating `is_assignable` to enforce equality (and value
+    ///      narrowing) instead of falling back to base-type rules,
+    ///   4. Updating the `Display` impl and every Union normaliser.
+    /// That is a multi-day cross-cutting change; out of scope for this
+    /// findings round. Tracked via this ignored test.
+    #[test]
+    #[ignore = "v0.7.1 #13: Type::Literal variant doesn't exist yet"]
+    fn v071_string_literal_union_rejects_non_member() {
+        let src = "\
+type Color = \"red\" | \"green\" | \"blue\"
+
+def paint(c: Color) -> None:
+    pass
+
+def main() -> None:
+    paint(\"orange\")
+";
+        let d = check(src);
+        assert!(
+            d.has_errors(),
+            "string-literal union must reject non-member; got: {:?}",
             d.errors().iter().map(|e| e.to_string()).collect::<Vec<_>>()
         );
     }
