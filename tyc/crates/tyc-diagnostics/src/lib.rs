@@ -281,15 +281,26 @@ pub enum TycError {
     },
 
     /// A value of one type was used where another type was expected.
+    ///
+    /// The `#[help]` slot carries the suggestion, computed at construction
+    /// time so it can adapt to the concrete shape of `expected` /
+    /// `actual`. The default phrasing ("change the value or widen the
+    /// annotation to `T | U`") is sound but unhelpful for the common
+    /// invariant-collection case — `list[Dog]` flowing into a
+    /// `list[Animal]` parameter shouldn't suggest `list[Animal] |
+    /// list[Dog]`, it should suggest `Sequence[Animal]` (the covariant
+    /// read-only view) or rebinding the source as `list[Animal]`.
+    /// FINDINGS #37.
     #[error("type mismatch: expected `{expected}`, found `{actual}`")]
     #[diagnostic(
         code(tyc::type_mismatch),
-        url("https://typhon.dev/lang/diagnostics/type_mismatch"),
-        help("change the value so it produces `{expected}`, or widen the annotation to `{expected} | {actual}` if both are intended")
+        url("https://typhon.dev/lang/diagnostics/type_mismatch")
     )]
     TypeMismatch {
         expected: String,
         actual: String,
+        #[help]
+        suggestion: String,
         #[source_code]
         src: NamedSource<String>,
         #[label("expected `{expected}`")]
@@ -1518,6 +1529,13 @@ impl TycError {
     }
 
     /// Construct a [`TycError::TypeMismatch`] diagnostic.
+    ///
+    /// The help text is computed at construction time. For the common
+    /// invariant-collection case (`list[Sub]` flowing into `list[Super]`,
+    /// likewise `dict`/`set`) the suggestion points at the covariant
+    /// read-only view (`Sequence[Super]` / `Mapping[K, V]`) instead of
+    /// the unhelpful "widen to `list[Super] | list[Sub]`" union which is
+    /// never what the user wants. FINDINGS #37.
     pub fn type_mismatch(
         expected: impl Into<String>,
         actual: impl Into<String>,
@@ -1526,9 +1544,13 @@ impl TycError {
         offset: usize,
         length: usize,
     ) -> Self {
+        let expected: String = expected.into();
+        let actual: String = actual.into();
+        let suggestion = type_mismatch_help(&expected, &actual);
         Self::TypeMismatch {
-            expected: expected.into(),
-            actual: actual.into(),
+            expected,
+            actual,
+            suggestion,
             src: NamedSource::new(path.into(), source.into()),
             span: SourceSpan::new(SourceOffset::from(offset), length),
         }
@@ -2517,6 +2539,67 @@ impl Diagnostics {
     }
 }
 
+/// Compute the user-facing help suggestion for a [`TycError::TypeMismatch`]
+/// diagnostic. The default phrasing is the "widen to `expected | actual`"
+/// hint that was previously baked into the `#[diagnostic(help(...))]`
+/// attribute; this helper now sits in front of it so collection-shape
+/// mismatches get a targeted suggestion instead.
+///
+/// Detection is purely textual (the diagnostics layer only sees the
+/// already-rendered type display strings, not a `Type` enum); it keys on
+/// the `list[`, `dict[`, `set[` head and only suggests covariant
+/// alternatives when both sides share the same head. Anything else
+/// falls back to the original "widen the annotation to `T | U`" hint.
+/// FINDINGS #37.
+fn type_mismatch_help(expected: &str, actual: &str) -> String {
+    if let Some(hint) = collection_variance_hint(expected, actual) {
+        return hint;
+    }
+    format!(
+        "change the value so it produces `{expected}`, or widen the annotation to \
+         `{expected} | {actual}` if both are intended"
+    )
+}
+
+/// Inspect the rendered expected/actual type display strings and, when
+/// both name the same invariant generic head (`list`, `dict`, `set`)
+/// with different parameters, return a covariant-alternative
+/// suggestion. Returns `None` for any other shape so the caller can
+/// fall back to the default "widen to T | U" hint.
+fn collection_variance_hint(expected: &str, actual: &str) -> Option<String> {
+    // Helper: split `head[args]` into `(head, args)`. Returns `None`
+    // when the input doesn't end in `]` so non-generic display strings
+    // (`int`, `str`, …) take the default branch above.
+    fn split_generic(s: &str) -> Option<(&str, &str)> {
+        let stripped = s.strip_suffix(']')?;
+        let open = stripped.find('[')?;
+        Some((&stripped[..open], &stripped[open + 1..]))
+    }
+    let (exp_head, exp_args) = split_generic(expected)?;
+    let (act_head, _act_args) = split_generic(actual)?;
+    if exp_head != act_head || exp_args.is_empty() {
+        return None;
+    }
+    match exp_head {
+        "list" => Some(format!(
+            "`list[T]` is invariant — `{actual}` is not assignable to `{expected}`. \
+             Use `Sequence[{exp_args}]` (covariant, read-only) on the parameter, or rebind \
+             the source as `{expected}` so the element type matches."
+        )),
+        "set" => Some(format!(
+            "`set[T]` is invariant — `{actual}` is not assignable to `{expected}`. \
+             Use `frozenset[{exp_args}]` (immutable) or `AbstractSet[{exp_args}]` \
+             (covariant, read-only) on the parameter, or rebind the source as `{expected}`."
+        )),
+        "dict" => Some(format!(
+            "`dict[K, V]` is invariant — `{actual}` is not assignable to `{expected}`. \
+             Use `Mapping[{exp_args}]` (covariant in V, read-only) on the parameter, or \
+             rebind the source as `{expected}`."
+        )),
+        _ => None,
+    }
+}
+
 fn dedup_vec(v: &mut Vec<TycError>) {
     use miette::Diagnostic;
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -2577,6 +2660,65 @@ mod tests {
         let msg = e.to_string();
         assert!(msg.contains("int"), "expected type should appear");
         assert!(msg.contains("str"), "actual type should appear");
+    }
+
+    #[test]
+    fn type_mismatch_list_variance_suggests_sequence() {
+        // FINDINGS #37: invariant collection mismatch should point at
+        // the covariant read-only view, not "widen to T | U".
+        let e = TycError::type_mismatch(
+            "list[Animal]",
+            "list[Dog]",
+            "a.ty",
+            "let xs: list[Animal] = dogs",
+            0,
+            3,
+        );
+        let TycError::TypeMismatch { suggestion, .. } = &e else {
+            panic!("expected TypeMismatch variant");
+        };
+        assert!(
+            suggestion.contains("Sequence[Animal]"),
+            "list-variance hint must mention Sequence, got: {suggestion}"
+        );
+        assert!(
+            !suggestion.contains("list[Animal] | list[Dog]"),
+            "should not suggest a union widening: {suggestion}"
+        );
+    }
+
+    #[test]
+    fn type_mismatch_dict_variance_suggests_mapping() {
+        let e = TycError::type_mismatch(
+            "dict[str, Animal]",
+            "dict[str, Dog]",
+            "a.ty",
+            "let xs: dict[str, Animal] = dogs",
+            0,
+            3,
+        );
+        let TycError::TypeMismatch { suggestion, .. } = &e else {
+            panic!("expected TypeMismatch variant");
+        };
+        assert!(
+            suggestion.contains("Mapping[str, Animal]"),
+            "dict-variance hint must mention Mapping, got: {suggestion}"
+        );
+    }
+
+    #[test]
+    fn type_mismatch_scalar_keeps_default_hint() {
+        // Non-collection mismatches retain the original "widen to T | U"
+        // help so we don't regress the documented suggestion for the
+        // bulk of TypeMismatch sites.
+        let e = TycError::type_mismatch("int", "str", "a.ty", "x", 0, 1);
+        let TycError::TypeMismatch { suggestion, .. } = &e else {
+            panic!("expected TypeMismatch variant");
+        };
+        assert!(
+            suggestion.contains("int | str"),
+            "default help should keep the union-widening suggestion, got: {suggestion}"
+        );
     }
 
     #[test]
