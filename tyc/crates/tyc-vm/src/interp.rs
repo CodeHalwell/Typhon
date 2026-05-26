@@ -2603,25 +2603,25 @@ fn format_with_spec(value: &Value, default: &str, spec: &str) -> Result<String, 
             match eff_align {
                 '<' => {
                     let core = format!("{explicit_sign}{prefix}{buf}");
-                    let p: String = std::iter::repeat(fill).take(pad).collect();
+                    let p: String = std::iter::repeat_n(fill, pad).collect();
                     return Ok(format!("{core}{p}"));
                 }
                 '^' => {
                     let lo = pad / 2;
                     let hi = pad - lo;
-                    let lo_s: String = std::iter::repeat(fill).take(lo).collect();
-                    let hi_s: String = std::iter::repeat(fill).take(hi).collect();
+                    let lo_s: String = std::iter::repeat_n(fill, lo).collect();
+                    let hi_s: String = std::iter::repeat_n(fill, hi).collect();
                     return Ok(format!("{lo_s}{explicit_sign}{prefix}{buf}{hi_s}"));
                 }
                 '=' => {
                     // Pad between sign/prefix and the digits — used by
                     // zero-pad on numbers.
-                    let p: String = std::iter::repeat(fill).take(pad).collect();
+                    let p: String = std::iter::repeat_n(fill, pad).collect();
                     return Ok(format!("{explicit_sign}{prefix}{p}{buf}"));
                 }
                 _ => {
                     // '>' (default for numbers)
-                    let p: String = std::iter::repeat(fill).take(pad).collect();
+                    let p: String = std::iter::repeat_n(fill, pad).collect();
                     return Ok(format!("{p}{explicit_sign}{prefix}{buf}"));
                 }
             }
@@ -2704,12 +2704,19 @@ result = fib(99)
         assert_eq!(format_with_spec(&v, "42", "#b").unwrap(), "0b101010");
         // The findings note used `0003.142`, but CPython actually rounds
         // `3.14` at precision 3 to `3.140`; matching Python's true output.
-        let pi = Value::Float(3.14);
-        assert_eq!(format_with_spec(&pi, "3.14", "08.3f").unwrap(), "0003.140");
-        // Test a value where the third decimal is meaningful.
-        let e = Value::Float(2.71828);
+        // Use literals that aren't approximations of well-known math
+        // constants — clippy::approx_constant fires on `3.14` / `2.71828`
+        // even in test code. The format-spec parser doesn't care about
+        // the value's identity, only its digits.
+        let approx_pi = Value::Float(3.140_001);
         assert_eq!(
-            format_with_spec(&e, "2.71828", "08.3f").unwrap(),
+            format_with_spec(&approx_pi, "3.14", "08.3f").unwrap(),
+            "0003.140"
+        );
+        // Test a value where the third decimal is meaningful.
+        let approx_e = Value::Float(2.718_25);
+        assert_eq!(
+            format_with_spec(&approx_e, "2.71828", "08.3f").unwrap(),
             "0002.718"
         );
         // Combined: alternate-form hex with zero-pad and width.

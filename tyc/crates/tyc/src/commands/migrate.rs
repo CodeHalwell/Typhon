@@ -626,13 +626,13 @@ fn rewrite_generic_class_base(line: &str) -> Option<String> {
 /// Anything more exotic stays on the `class!` path so the user keeps
 /// their custom constructor — strip-and-synthesise would silently drop
 /// real logic. False-negatives are preferred over false-positives.
-fn collect_trivial_init_classes(
-    source: &str,
-) -> (
+type TrivialInitClasses = (
     HashSet<usize>,
     HashSet<usize>,
     HashMap<usize, Vec<(String, String)>>,
-) {
+);
+
+fn collect_trivial_init_classes(source: &str) -> TrivialInitClasses {
     let lines: Vec<&str> = source.lines().collect();
     let mut trivial: HashSet<usize> = HashSet::new();
     let mut skip: HashSet<usize> = HashSet::new();
@@ -932,7 +932,7 @@ fn leading_docstring_end(
         // one-line docstring).
         for triple in ["\"\"\"", "'''"] {
             if let Some(after_open) = trim.strip_prefix(triple) {
-                if let Some(_) = after_open.find(triple) {
+                if after_open.contains(triple) {
                     return Some(i);
                 }
                 let mut j = i + 1;

@@ -1672,7 +1672,7 @@ fn make_functools_module() -> Value {
         // Otherwise return a decorator that captures the configuration.
         Ok(Value::Native(Rc::new(NativeFn::new(
             "lru_cache_inner",
-            |i, args| make_cache(i, args),
+            make_cache,
         ))))
     });
     let reduce = nf("reduce", |i, mut args| {
