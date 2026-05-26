@@ -1441,9 +1441,19 @@ fn append_ellipsis_to_bodiless_def(line: &str) -> Option<String> {
     };
     let indent_len = body.find(|c: char| !c.is_whitespace())?;
     let rest = &body[indent_len..];
-    if !rest.starts_with("def ") {
+    // Accept both `def …` and `async def …` interface declarations so
+    // `async def execute(self, args: dict) -> Result` gets the same
+    // auto-completion treatment as its sync counterpart.
+    let rest = if let Some(after_async) = rest.strip_prefix("async ") {
+        if !after_async.starts_with("def ") {
+            return None;
+        }
+        after_async
+    } else if rest.starts_with("def ") {
+        rest
+    } else {
         return None;
-    }
+    };
     // Confirm balanced parens before checking for the bodiless tail. Track
     // bracket depth so `[T, U]`-style annotations in the return type don't
     // throw the scanner off.
@@ -8909,5 +8919,25 @@ string content
             result.python_source
         );
         assert!(result.frozen_class_lines.contains(&0));
+    }
+
+    // ── #9: interface async-def auto-ellipsis ─────────────────────────────
+    #[test]
+    fn interface_async_def_gets_auto_ellipsis() {
+        // Sync `def name(self) -> str` is already auto-completed inside
+        // interface blocks. The same must apply to `async def …` so users
+        // don't have to write the trailing `: ...` explicitly.
+        let src = "interface Tool:\n    async def execute(self, args: dict) -> str\n";
+        let result = preprocess(src);
+        assert!(
+            result
+                .python_source
+                .contains("async def execute(self, args: dict) -> str: ..."),
+            "expected async def auto-completed with `: ...`; got:\n{}",
+            result.python_source
+        );
+        // The synthesised source must parse cleanly through Ruff.
+        let parse = crate::parse_module(&result.python_source);
+        assert!(parse.is_ok(), "interface with async def must parse");
     }
 }
