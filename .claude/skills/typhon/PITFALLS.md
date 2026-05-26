@@ -4,7 +4,7 @@ The errors and surprises that bite people who try to write Typhon as if it were 
 
 For each entry: **trigger → diagnostic → fix**.
 
-Current release: **v0.7.0**. Pitfalls tagged with a version annotation landed in that release; older pitfalls predate v0.3.0.
+Current release: **v0.8.1**. Pitfalls tagged with a version annotation landed in that release; older pitfalls predate v0.3.0.
 
 ---
 
@@ -1002,6 +1002,152 @@ class P frozen:
     y: int
     x: int = 0
 ```
+
+---
+
+## 51. Calling a non-existent method on a class instance (v0.8.0)
+
+```python
+class Repo:
+    items: list[str]
+
+def demo(r: Repo) -> None:
+    r.dleete()              # ❌ tyc::attribute_not_found
+```
+
+v0.8.0 widened `tyc::attribute_not_found` to fire on class-instance / generic-class receivers, not just `TypeVar`-bounded ones. v0.8.1 added the `partial` shape marker on `InterfaceShape` so foreign / venv-introspected classes (`uvicorn.Server`, `httpx.AsyncClient`, `fastapi.Request`) stay lenient.
+
+**Fix:** correct the spelling, or wrap an intentional dynamic call in `unsafe:`.
+
+---
+
+## 52. Mismatched parameter type when implementing an interface (v0.8.0)
+
+```python
+interface Repo:
+    def save(self, item: str) -> bool
+
+class BadRepo:
+    def save(self, item: int) -> bool:        # ❌ tyc::interface_not_conforming
+        ...
+```
+
+v0.8.0 added param-type position-by-position contravariant checking to `interface_missing_members`. Arity matched before but param-type mismatches went silently.
+
+**Fix:** align the impl's parameter types with the interface's (or generalise the interface).
+
+---
+
+## 53. Passing a non-singleton literal to a string-literal type (v0.8.0)
+
+```python
+type Color = "red" | "green" | "blue"
+
+def paint(c: Color) -> None: ...
+paint("orange")                                # ❌ tyc::type_mismatch
+```
+
+v0.8.0 added `Type::LitStr` — string-literal singleton types. `type Color = "red" | "green" | "blue"` and `Literal["a", "b"]` produce `LitStr` slots; assignability rejects non-matching literals. Bidirectional inference widens string literals to `LitStr` only when the expected type carries one, so unannotated `let s = "hi"` still infers plain `str`.
+
+---
+
+## 54. `?` in a `with`-chain routing the wrong error type (v0.8.0)
+
+```python
+def load() -> Result[Cfg, IoErr]:
+    with raw = read_text("c.toml")?:           # parse_err is ParseErr, not IoErr — ❌
+        return Ok(parse_cfg(raw)?)
+```
+
+v0.8.0 added `?` propagation inside `with`-chains. `result_error_mismatch` now fires when the implicit return form routes a mismatching error type through the chain.
+
+**Fix:** normalise the inner error to the outer one via `.map_err(_to_io_err)?`.
+
+---
+
+## 55. Match capture shadowing an outer name (v0.8.0)
+
+```python
+let key = "incoming"
+match e:
+    case Click(key):                           # ❌ tyc::pattern_shadows_outer
+        ...
+```
+
+The pattern `Click(key)` binds a *new* `key` that shadows the outer `let key = "incoming"`. Subtle bug: the pattern matches anything (rather than checking `e.key == "incoming"`).
+
+**Fix:** rename the pattern binding (`Click(target_key)`) or use a guard if you wanted equality (`case Click(k) if k == key: ...`).
+
+---
+
+## 56. `newtype Foo = "literal"` (v0.8.0)
+
+```python
+newtype Bogus = "string literal"               # ❌ tyc::newtype_invalid_base
+newtype X = 42                                 # ❌ tyc::newtype_invalid_base
+```
+
+A newtype base must be a type expression — literal RHS used to be silently accepted and resolve to `Unknown`. v0.8.0 rejects with a dedicated diagnostic.
+
+**Fix:** use a proper type expression — `newtype UserId = int`, `newtype Color = str`.
+
+---
+
+## 57. Programs relying on the VM's silent integer overflow (v0.8.0)
+
+```python
+def big() -> int:
+    return 2 ** 100        # Now returns the actual 31-digit number, not a wrapped i64
+```
+
+v0.8.0 switched the VM's `Value::Int` to `num_bigint::BigInt`. Programs that **relied** on the previous silent i64 wrap-around (rare, but a few cryptographic / hashing exercises did) will now compute different (correct) results.
+
+**Fix:** if you actually want modular arithmetic, do it explicitly — `(2 ** 100) & 0xFFFFFFFFFFFFFFFF`.
+
+---
+
+## 58. `let xs = []` — empty collection without annotation (v0.8.0)
+
+```python
+let xs = []        # ⚠️ tyc::empty_collection_no_annotation
+```
+
+v0.8.0 added a lint warning when an empty `[]` / `{}` / `set()` is written without an annotation or expected type. The element type can't be inferred and downstream operations will all see `list[Unknown]`.
+
+**Fix:** annotate or seed with one element of the target type:
+
+```python
+let xs: list[str] = []
+mut xs = [first_value]
+```
+
+---
+
+## 59. Bare `List[…]` / `Optional[…]` / `Dict[…]` / `Union[…]` in annotations (v0.8.0)
+
+```python
+def f(items: List[str]) -> None: ...           # ⚠️ tyc::typing_alias_in_annotation
+def g(x: Optional[int]) -> None: ...           # ⚠️ tyc::typing_alias_in_annotation
+```
+
+v0.8.0 added a lint warning matching the existing import-level `typing_alias_deprecated`. Use lowercase built-ins / Typhon sugar instead:
+
+```python
+def f(items: list[str]) -> None: ...
+def g(x: int?) -> None: ...
+```
+
+---
+
+## 60. Hard-coded secret in a `*_TOKEN` / `*_SECRET` / `*_KEY` binding (v0.8.0)
+
+```python
+let API_KEY = "sk-live-abc123def456"           # ⚠️ tyc::contains_secret_literal
+```
+
+v0.8.0 added a heuristic lint for inline string literals named `*_(TOKEN|SECRET|PASSWORD|PWD|KEY|API_KEY)`. The warning is suppressed when the project's `[strictness] allow-secret-comptime = true`, or when the binding is comptime-loaded from `env(...)`.
+
+**Fix:** read from the environment via `comptime let API_KEY = env("API_KEY")`.
 
 ---
 

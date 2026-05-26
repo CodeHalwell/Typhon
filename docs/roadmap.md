@@ -6,40 +6,64 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 
 ## Current release
 
-**[v0.7.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.7.0) — 2026-05-25.**
-The carry-over minor release that closes the Round-3 apps-feedback
-campaign on top of v0.6.0 / v0.6.1. Phases 0–3 + Phase 5 / 5.5 /
-6 are complete; v0.7.0 ships the third stress round's findings as
-compiler features rather than open issues. Strictly additive — every
-previously-accepted program continues to compile to identical Python.
+**[v0.8.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.8.1) — 2026-05-26.**
+Point release on top of v0.8.0 that fixes a regression where the
+widened `tyc::attribute_not_found` rule false-positived on
+venv-introspected third-party Python classes
+(`uvicorn.Server.serve(...)`, `httpx.AsyncClient.aclose(...)`,
+`fastapi.Request.body(...)`). `InterfaceShape` now carries a
+`partial` flag set on every venv-derived shape;
+`class_hierarchy_fully_known` returns `false` whenever any class in
+the chain is partial. Strictly a bugfix; no language, runtime, or
+stdlib changes beyond the carve-out.
 
-Headline changes vs. v0.6.1:
+The feature surface comes from **v0.8.0** (the stress-test sweep
+release on top of v0.7.0 / v0.7.1, closing **41 findings** from a
+multi-file v0.7.1 stress report spanning the type checker, VM,
+parser, lowering passes, diagnostics, and CLI). Phases 0–3 + Phase
+5 / 5.5 / 6 are complete; v0.8.0 lands several long-missing
+diagnostic firing sites, a meaningfully larger native VM stdlib,
+and five parser scaffolds the docs already advertised.
 
-- `pub *` wildcard re-export aggregation in `__init__.ty`, transitive
-  through sub-packages (cycle-safe via a `visited` set), backed by
-  `tyc::pub_name_collision` and `tyc::pub_star_outside_init`.
-- Declare-only `let NAME: T` with arm-assignment in `match` / `if` /
-  `elif` / `else`. Companion `tyc::use_of_uninitialised` definite-
-  assignment analysis fires on reads from paths that didn't assign.
-- `with cm() as r:` types `r` from `__enter__` / `__aenter__` and
-  from `@contextmanager` / `@asynccontextmanager` factories.
-- `await` on `Callable[..., Awaitable[T]]` / `Coroutine[Y, S, T]`
-  unwraps to `T` — the biggest single Round-3 finding.
-- Same-newtype arithmetic preserves the newtype across
-  `+ - * // % **`. Cross-module generic method dispatch propagates
-  class TypeVars.
-- Resolver / syntax polish: nested arm-import binding, sibling
-  `if`/`elif` no longer trips `no_block_shadow`, multi-line `go
-  expr(...)` parses, ternary narrowing, `tyc::field_default_ordering`.
-- Five new production-shaped reference apps under `examples/apps/`
-  (real-time game server, static site generator, vector DB, API
-  gateway, stream processor) on top of the original ten. All fifteen
-  re-organised into grouped subdirectories with `pub *` `__init__.ty`
-  facades. VS Code extension bumped to `0.2.0`.
+Headline changes vs. v0.7.1:
+
+- `tyc::attribute_not_found` now fires on class instances and generic
+  classes, not just `TypeVar`-bounded parameters. Foreign /
+  venv-introspected classes are tracked with a `partial` shape flag
+  and keep the permissive degrade-to-`Unknown` behaviour.
+- Interface parameter type conformance — `interface_missing_members`
+  compares params position-by-position (contravariant) in addition to
+  arity.
+- `Type::LitStr(String)` — string-literal singleton types via
+  `type Color = "red" | "green" | "blue"` and `Literal["a", "b"]`.
+- VM upgrades: arbitrary-precision integers (`num_bigint::BigInt`),
+  insertion-ordered dicts (`indexmap::IndexMap`), full f-string format
+  flags, mapping match patterns, sequence-with-star patterns,
+  recursion limit raised to 1000 to match CPython.
+- Larger native VM stdlib: `re`, `typing`, `collections`
+  (`OrderedDict`, `defaultdict`, `Counter`, `namedtuple`), `functools`
+  (`lru_cache`, `cache`, `cached_property`, `reduce`, `partial`),
+  `itertools` (`chain`, `count`, `cycle`, `accumulate`, `combinations`,
+  `permutations`, `product`, `islice`, `takewhile`, `dropwhile`,
+  `groupby`), `dataclasses`, `pathlib`.
+- Parser scaffolds: HKT `class Functor[F[_]]:`, `impl[T]
+  SealedUnionAlias[T]:` distributing across every variant,
+  `class X[T] frozen:`, `async def` in `interface` bodies
+  auto-completing the body, outer-annotation tuple unpack.
+- Diagnostics polish: synthetic preprocess lines no longer leak into
+  source listings; new lint warnings
+  (`tyc::empty_collection_no_annotation`,
+  `tyc::typing_alias_in_annotation`,
+  `tyc::contains_secret_literal`); `tyc::pattern_shadows_outer`.
+- CLI polish: `tyc check lib.dty` accepts a single `.dty` file
+  directly; `tyc run --compile` rejects single-file inputs up-front;
+  `tyc migrate` strips trivial `__init__` methods.
+- Default change: `unused_import` is now `warn` (was `error`); restore
+  via `[strictness] unused-import = "error"`.
 
 For the per-release breakdown of the v0.3.x / v0.4.x / v0.5.x /
-v0.6.x line — and the canonical phase-by-phase status below — see
-[CHANGELOG.md](../CHANGELOG.md) and the [Project
+v0.6.x / v0.7.x line — and the canonical phase-by-phase status below
+— see [CHANGELOG.md](../CHANGELOG.md) and the [Project
 Status](https://codehalwell.github.io/Typhon/introduction/status/)
 docs-site page.
 

@@ -471,6 +471,13 @@ fn class_shape_from_params(params: &[IntrospectedParam]) -> Option<InterfaceShap
         // the pre-effective-shape behaviour. Foreign-class inheritance
         // chains land via the typeshed stub path.
         bases: Vec::new(),
+        // v0.8.0 carry-over: mark the shape partial so the v0.8.0
+        // `tyc::attribute_not_found` diagnostic stays lenient on
+        // attribute access against venv-introspected classes —
+        // `inspect.signature(Cls)` reflects the constructor but not
+        // the method surface, so we can't soundly claim a method is
+        // missing.
+        partial: true,
     })
 }
 

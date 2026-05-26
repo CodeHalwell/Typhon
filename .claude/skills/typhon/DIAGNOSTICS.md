@@ -66,7 +66,7 @@ if True:
 
 **Fix:** Rename the inner binding. **Do not** use `let` again on the same name — re-bind with `mut` or pick a fresh name.
 
-### `tyc::pattern_shadows_outer` — error
+### `tyc::pattern_shadows_outer` — error (firing site added in v0.8.0)
 
 A `case` pattern captures a name that already exists as an immutable `let` in an enclosing scope. Python `case` captures are rebindings that outlive the `match`, so this would clash with Rule 2.
 
@@ -116,6 +116,26 @@ def keys(d: dict) -> list:   # error
 
 **Fix:** Spell parameters: `dict[str, int] -> list[str]`.
 
+### `tyc::empty_collection_no_annotation` — warning (v0.8.0)
+
+An empty collection literal (`let xs = []`, `let d = {}`, `let s = set()`) without an annotation or expected type. The element type can't be inferred from the literal alone; downstream operations all see `list[Unknown]` and lose type safety.
+
+```ty
+let xs = []                 # warning
+```
+
+**Fix:** Annotate (`let xs: list[str] = []`) or seed with one element of the target type (`mut xs = [first_value]`).
+
+### `tyc::typing_alias_in_annotation` — warning (v0.8.0)
+
+A bare `typing` alias (`List[T]`, `Optional[T]`, `Dict[K, V]`, `Union[A, B]`, `Tuple[A, B]`, `Set[T]`, `FrozenSet[T]`) used in an annotation. Consistent with the existing import-level `tyc::typing_alias_deprecated`; this catches in-place uses that may have arrived via wildcard imports or `typing.*` qualified access.
+
+```ty
+def f(items: List[str]) -> Optional[int]: ...   # warning
+```
+
+**Fix:** Use lowercase built-ins / Typhon sugar: `list[str]`, `int?`, `dict[K, V]`, `A | B`.
+
 ### `tyc::type_mismatch` — error
 
 An expression of one type used where another was expected (arguments, returns, assignments, container elements, `mut` rebinds). Also fires on cross-newtype assignment (`PostId` into `UserId` slot) and bare-base-to-newtype flow in some cases. Help text reads "change the value so it produces `<expected>`, or widen the annotation to `<expected> | <found>` if both are intended" (v0.6.0).
@@ -149,14 +169,14 @@ let result: str = "x" + 1   # error: unsupported operand types for `+`
 
 ### `tyc::attribute_not_found` — error
 
-Attribute access on a value whose static type doesn't declare that attribute (and isn't `Any`).
+Attribute access on a value whose static type doesn't declare that attribute (and isn't `Any`). v0.8.0 widened the firing site from `TypeVar`-bounded parameters to also include direct class instances (`p: Point`) and generic-class receivers (`s: Stream[int]`). v0.8.1 narrowed it again: venv-introspected third-party classes now carry a `partial` shape marker on `InterfaceShape`, and `class_hierarchy_fully_known` returns `false` whenever any class in the chain is partial. The net effect: calls like `uvicorn.Server.serve(...)`, `httpx.AsyncClient.aclose(...)`, `fastapi.Request.body(...)` against third-party libraries do not false-positive. Skipped in `unsafe:` regions and on dunder / leading-underscore names.
 
 ```ty
 let p: Point = Point(x=1, y=2)
 print(p.z)            # error: attribute `z` not defined on `Point`
 ```
 
-**Fix:** Correct the name, or add the missing field.
+**Fix:** Correct the name, add the missing field, or wrap a genuinely dynamic call in `unsafe:`.
 
 ### `tyc::tuple_index_out_of_range` — error
 
@@ -191,6 +211,18 @@ fetch_user(42)                       # error if fetch_user expects UserId
 ```
 
 **Fix:** Pass the right base value, or wrap explicitly at the boundary.
+
+### `tyc::newtype_invalid_base` — error (v0.8.0)
+
+A `newtype` RHS that isn't a type expression. Before v0.8.0 the base silently resolved to `Type::Unknown` and every downstream check accepted any value. Now the common non-type shapes (string / numeric / boolean / `None` literals, lambdas, generic call expressions other than `Result[…]`-style subscripts) are rejected at the declaration site.
+
+```ty
+newtype Bogus = "string literal"     # error
+newtype X = 42                       # error
+newtype Maker = lambda x: x          # error
+```
+
+**Fix:** Use a proper type expression — `newtype UserId = int`, `newtype Email = str`, `newtype Result = Result[T, E]`.
 
 ### `tyc::div_by_zero_literal` — error (v0.3.0)
 
@@ -630,7 +662,7 @@ import flask          # error if not declared
 
 **Fix:** Spell correctly, add the dep and run `tyc sync`, or create the file.
 
-### `tyc::unused_import` — error (controlled by `[strictness] unused-import`, default `"error"`)
+### `tyc::unused_import` — warning (controlled by `[strictness] unused-import`, default `"warn"` since v0.8.0)
 
 An import is never referenced in the module.
 

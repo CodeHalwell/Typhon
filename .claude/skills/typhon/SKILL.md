@@ -7,14 +7,14 @@ description: Write, check, build, debug, and migrate code in the Typhon language
 
 Typhon is **a statically-typed, stricter superset of Python that emits clean CPython 3.13+** with zero runtime dependency on the toolchain. The compiler, language server, formatter, debugger wrapper, REPL, and tree-walking interpreter are all a single Rust binary called `tyc`. Every `.ty` file emits valid, idiomatic `.py`. Not all `.py` is valid Typhon.
 
-**Current release: v0.7.0** (2026-05-25). The language is **strictly additive across the v0.3.0 → v0.7.0 line** — every previously-accepted program continues to compile to identical Python. Headline frontier work (full HKT unification, general inter-procedural field-init audit) is tracked in `TYPE_SYSTEM_FRONTIER.md`.
+**Current release: v0.8.1** (2026-05-26). The language is **mostly additive across the v0.3.0 → v0.8.1 line** — every previously-accepted program continues to type-check identically. v0.8.0 introduces one runtime behaviour change: the VM now uses arbitrary-precision integers (`num_bigint::BigInt`), so programs that relied on silent i64 wrap-around now compute mathematically-correct results. v0.8.0 also widens several diagnostic firing sites (`tyc::attribute_not_found` on class instances, interface parameter conformance, `?` in `with`-chains, `tyc::pattern_shadows_outer`); see §7. **v0.8.1 is a bugfix point release** that narrows `tyc::attribute_not_found` to skip venv-introspected third-party classes via a new `partial` shape marker — so calls like `uvicorn.Server.serve(...)`, `httpx.AsyncClient.aclose(...)`, `fastapi.Request.body(...)` no longer false-positive. Headline frontier work (full HKT unification, general inter-procedural field-init audit) is tracked in `TYPE_SYSTEM_FRONTIER.md`.
 
 LLMs have no prior knowledge of Typhon. This skill is the field reference. **Trust the docs and the compiler over assumptions from Python or any superset.** When this skill and a doc disagree, the doc wins. When the docs and the compiler disagree, the compiler wins — verify with `tyc check`.
 
 The canonical sources are:
 
 - **`README.md`** — pitch, release table, workspace layout, top-level project status.
-- **`CHANGELOG.md`** — every release back to v0.1.0. v0.3.0–v0.7.0 are the live window.
+- **`CHANGELOG.md`** — every release back to v0.1.0. v0.3.0–v0.8.1 are the live window.
 - **`docs/long-term-plan.md`** — source of truth for design decisions.
 - **`docs/language.md`** — the type system, error handling, async, `let`/`mut`, comptime.
 - **`docs/cheatsheet.md`** — 30-second syntax refresher (also `tyc cheatsheet`).
@@ -548,9 +548,45 @@ Plus `tyc::unsafe_value_leak`, `tyc::pattern_shadows_outer`, and `tyc::extend_bu
 
 ---
 
-## 7. v0.7.0 highlights
+## 7. v0.8.1 highlights
 
-The v0.3.0 → v0.7.0 line is **strictly additive**. Every previously-accepted program continues to compile to identical Python. Highlights since v0.3.0:
+The v0.3.0 → v0.8.1 line is **mostly additive**. Every previously-accepted program continues to type-check identically; the one runtime behaviour change is the VM's switch to arbitrary-precision integers in v0.8.0 (programs that relied on silent i64 wrap-around now compute different (correct) results). Highlights since v0.3.0:
+
+### v0.8.1 — bugfix point release
+
+- **`tyc::attribute_not_found` no longer fires on venv-introspected third-party classes** (v0.8.1). The v0.8.0 firing-site widening trusted shapes built by `inspect.signature(Cls)` to be method-complete, so `obj.method(...)` against any third-party class with a known `__init__` flagged the call as missing the attribute (`uvicorn.Server.serve(...)`, `httpx.AsyncClient.aclose(...)`, `fastapi.Request.body(...)`). `InterfaceShape` now carries a `partial` flag set on every venv-derived shape; `class_hierarchy_fully_known` returns `false` whenever any class in the chain is partial. Strictly a narrowing of the diagnostic; no language, runtime, or stdlib changes.
+
+### v0.8.0 — stress-test sweep
+
+- **`tyc::attribute_not_found` fires on class instances and generic classes** (v0.8.0) — not just `TypeVar`-bounded parameters. Foreign / venv-introspected classes carry a `partial` shape marker and stay lenient (so `uvicorn.Server.serve(...)`, `httpx.AsyncClient.aclose(...)`, `fastapi.Request.body(...)` don't false-positive). Skipped in `unsafe:` and on dunder / underscore names.
+- **Interface parameter type conformance** (v0.8.0) — `interface_missing_members` compares param types position-by-position (contravariant) in addition to arity.
+- **`Type::LitStr(String)` — string-literal singleton types** (v0.8.0) — `type Color = "red" | "green" | "blue"` and `Literal["a", "b"]` produce `LitStr` slots. Bidirectional inference widens string literals to `LitStr` only when the expected type carries one.
+- **`?` propagation inside `with`-chains** (v0.8.0) — `result_error_mismatch` fires when the implicit return form of `with x = f()?: …` routes a mismatching error type.
+- **`tyc::pattern_shadows_outer`** (v0.8.0) — fires when a `match` capture binds a name already in the outer scope.
+- **`newtype Foo = "literal"` is rejected** (v0.8.0) — new `tyc::newtype_invalid_base` diagnostic.
+- **`field_default_ordering` skips `ClassVar` fields** (v0.8.0).
+- **Exhaustive-match-with-guards no longer fires `missing_return`** (v0.8.0) when every variant has at least one (possibly-guarded) case.
+- **Function parameter rebinding requires `mut`** (v0.8.0) — matching the `let`/`mut` rule everywhere else.
+- **VM: arbitrary-precision integers** (v0.8.0) — `Value::Int` is now `num_bigint::BigInt`. `2 ** 100` and `fib(99)` no longer overflow. **Behaviour change.**
+- **VM: insertion-ordered dicts** (v0.8.0) — `RcDict` is now `indexmap::IndexMap`. Same `.ty` no longer prints dicts in different orders under `tyc run` vs `tyc build && python build/main.py`.
+- **VM: f-string format flags fully wired** (v0.8.0) — zero-pad, alternate-form, `[fill]align`, sign, width, comma, precision, type all match CPython.
+- **VM: mapping match patterns + sequence-with-star patterns** (v0.8.0) — `case {"k": v}`, `case {…, **rest}`, `case [x, *rest, y]`.
+- **VM: recursion limit raised to 1000** (v0.8.0) to match CPython.
+- **VM: larger native stdlib** (v0.8.0) — `re`, `typing`, `collections` (`OrderedDict`, `defaultdict`, `Counter`, `namedtuple`), `functools` (`lru_cache`, `cache`, `cached_property`, `reduce`, `partial`), `itertools` (`chain`, `count`, `cycle`, `accumulate`, `combinations`, `permutations`, `product`, `islice`, `takewhile`, `dropwhile`, `groupby`), `dataclasses`, `pathlib`.
+- **VM: subclass constructors inherit fields** (v0.8.0) — `class Dog(Animal): breed: str` accepts `Dog(name=…, age=…, breed=…)` under `tyc run`.
+- **VM: `yield` / `async def` emit a clear `NotImplementedError`** (v0.8.0) pointing at `tyc build && python` as the fallback (instead of crashing the interpreter).
+- **Parser scaffolds for advertised forms** (v0.8.0): HKT `class Functor[F[_]]:`, `impl[T] SealedUnionAlias[T]:` distributing methods across every variant, generic-plus-frozen `class X[T] frozen:`, `async def` in `interface` bodies auto-completing the body, outer-annotation tuple unpack (`let (a, b): tuple[int, str] = …`).
+- **Synthetic preprocess lines no longer leak into diagnostics** (v0.8.0) — `SanitisedDiagnostic` wraps every emitted diagnostic.
+- **Diagnostic hints polished** (v0.8.0): multi-line `|>` chains, `freeze let` at non-module scope, `wrong_arg_count` kw-only rephrasing, collection variance suggesting `Sequence[Animal]` / `Mapping[K, V]` / `frozenset[T]`, dict-to-model mismatch pointing at the constructor form.
+- **New lint warnings** (v0.8.0): `tyc::empty_collection_no_annotation`, `tyc::typing_alias_in_annotation`, `tyc::contains_secret_literal`.
+- **CLI polish** (v0.8.0): `tyc check lib.dty` accepts a single `.dty` file directly; `tyc run --compile` rejects single-file inputs up-front; `tyc migrate` strips trivial `__init__` methods.
+- **Default change** (v0.8.0): `unused_import` is now `warn` (was `error`). Restore via `[strictness] unused-import = "error"`.
+
+### v0.7.1 — LSP bugfix
+
+- **LSP semantic-tokens positions** now align with the original `.ty` source instead of the preprocessed Python view. Pure bugfix; no language or runtime changes.
+
+### Earlier highlights since v0.3.0
 
 ### Type-system relaxations
 

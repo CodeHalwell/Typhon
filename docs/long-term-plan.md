@@ -467,33 +467,58 @@ Realistic milestones for one person plus AI assistance. The headline target is a
 > `Ok` / `Err` Result-combinator methods, `impl` on a sealed-union alias,
 > `tyc::stdlib_module_shadow`),
 > [v0.6.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.6.1) (VS Code annotation-colour
-> fix, `.py.map` sidecars under `<out>/.sourcemaps/`), and
-> **[v0.7.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.7.0)** — the Round-3 apps-feedback
-> carry-over and current release: `pub *` wildcard re-export aggregation
-> in `__init__.ty` (transitive through sub-packages, with
-> `tyc::pub_name_collision` / `tyc::pub_star_outside_init` diagnostics);
-> declare-only `let NAME: T` with arm-assignment integrated with a new
-> `tyc::use_of_uninitialised` definite-assignment analysis; `with cm()
-> as r:` types `r` from `__enter__` / `__aenter__` and from
-> `@contextmanager` / `@asynccontextmanager` factories; `await` on
-> `Callable[..., Awaitable[T]]` / `Coroutine[Y, S, T]` unwraps to `T`;
-> same-newtype arithmetic preserves the newtype across `+ - * // % **`;
-> cross-module generic method dispatch propagates class TypeVars; nested
-> `from X import Y` inside `if`/`for`/`while`/`with`/`try`/`match` arms
-> binds; sibling `if`/`elif` no longer trips `no_block_shadow` for
-> same-named bindings; multi-line `go expr(...)` parses; ternary
-> `body if test else orelse` narrows; `tyc::field_default_ordering`
-> catches non-default-after-default class fields. Five additional
-> production-shaped apps (real-time game server, static site generator,
-> vector DB, API gateway, stream processor) join the original ten under
-> `examples/apps/`, and all fifteen are re-organised into grouped
-> subdirectories with `pub *` `__init__.ty` facades. Strictly additive on
-> the language surface. Phase 4+ work is also landed: auto-gather,
-> auto-parallel, PGO, LSP completions and code actions, cross-file
-> go-to-definition, the package-manager surface, REPL, debugger, the
-> `tyc-vm` tree-walking interpreter (default for `tyc run`), and `tyc
-> migrate`. See [docs/roadmap.md](roadmap.md) for the canonical
-> per-feature status.
+> fix, `.py.map` sidecars under `<out>/.sourcemaps/`),
+> [v0.7.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.7.0) (Round-3 apps-feedback
+> carry-over: `pub *`, declare-only `let NAME: T`, `with cm() as r:`
+> inference, `await Callable[..., Awaitable[T]]`,
+> same-newtype-preserving arithmetic, cross-module generic method
+> dispatch, ternary narrowing, `tyc::field_default_ordering`, five new
+> apps under `examples/apps/`),
+> [v0.7.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.7.1) (LSP
+> semantic-tokens position alignment bugfix),
+> [v0.8.0](https://github.com/CodeHalwell/Typhon/releases/tag/v0.8.0) (the
+> stress-test sweep release), and
+> **[v0.8.1](https://github.com/CodeHalwell/Typhon/releases/tag/v0.8.1)** — a
+> point release and current release fixing a v0.8.0 regression where the
+> widened `tyc::attribute_not_found` rule false-positived on
+> venv-introspected third-party Python classes
+> (`uvicorn.Server.serve(...)`, `httpx.AsyncClient.aclose(...)`,
+> `fastapi.Request.body(...)`). `InterfaceShape` now carries a
+> `partial` flag set on every venv-derived shape;
+> `class_hierarchy_fully_known` returns `false` whenever any class in
+> the chain is partial. Strictly a bugfix; no language, runtime, or
+> stdlib changes beyond the carve-out. The v0.8.0 feature surface
+> closes 41 findings
+> from a multi-file v0.7.1 stress report spanning the type checker, VM,
+> parser, lowering passes, diagnostics, and CLI. Highlights:
+> `tyc::attribute_not_found` now fires on class instances and generic
+> classes (with foreign / venv-introspected classes tracked by a new
+> `partial` shape marker that keeps the diagnostic lenient on
+> third-party APIs); interface parameter type conformance; string-literal
+> singleton types (`Type::LitStr`); arbitrary-precision integers in the
+> VM (`num_bigint::BigInt`); insertion-ordered dicts
+> (`indexmap::IndexMap`); full f-string format flags wired in the VM;
+> mapping match patterns and sequence-with-star patterns; recursion
+> limit raised to 1000; a much larger native VM stdlib (`re`, `typing`,
+> `collections`, `functools`, `itertools`, `dataclasses`, `pathlib`);
+> five parser scaffolds the docs already advertised
+> (HKT `class Functor[F[_]]:`, `impl[T] SealedUnionAlias[T]:`,
+> generic-plus-frozen `class X[T] frozen:`, `async def` in `interface`
+> bodies, outer-annotation tuple unpack); `?` propagation in
+> `with`-chains; `tyc::pattern_shadows_outer`; three new lint warnings
+> (`empty_collection_no_annotation`, `typing_alias_in_annotation`,
+> `contains_secret_literal`); synthetic-line sanitisation across every
+> diagnostic; `tyc check lib.dty` single-file support; `tyc migrate`
+> strips trivial `__init__` methods. Default change:
+> `unused_import` is now `warn` (was `error`). Mostly additive on the
+> accepted surface; the BigInt switch in the VM means programs that
+> relied on silent i64 wrap-around now compute different (correct)
+> results. Phase 4+ work is also landed: auto-gather, auto-parallel,
+> PGO, LSP completions and code actions, cross-file go-to-definition,
+> the package-manager surface, REPL, debugger, the `tyc-vm`
+> tree-walking interpreter (default for `tyc run`), and `tyc migrate`.
+> See [docs/roadmap.md](roadmap.md) for the canonical per-feature
+> status.
 
 ### Phase 0 — Foundation (months 1–2) ✅ complete
 
@@ -547,7 +572,7 @@ At the end of Phase 3 — roughly month twelve — Typhon is useful for a real b
 - ✅ `tyc run` defaults to the in-process `tyc-vm` tree-walking interpreter — no `build/`, no CPython spawn. `--compile` (alias `--no-vm`) falls back to the legacy build-then-exec path for programs that import CPython libraries the VM doesn't speak natively. See [docs/vm.md](vm.md).
 - ✅ Phase 5 interop + DX bundle (v0.1.6): `plain class`, `[emit] skip-decoration-bases`, `class-default` validation, `or`/`and` truthy-union typing, generator→`Iterable` conformance, `tyc explain` / `tyc cheatsheet`, `tyc build --check`, `.py`-in-`src/` copy-through with `tyc::orphan_py_import`, `tyc::contains_secret_literal`, miette `url(...)` deep-links on every diagnostic, `tyc fmt` wrapping `ruff format`. See [docs/roadmap.md](roadmap.md#phase-5--interop-and-developer-experience--complete-v016).
 - ✅ Phase 5.5 constructor / method arity safety (v0.2.0): `tyc::arg_count` now fires on auto-generated `__init__` of `class` / `model` declarations and on `impl` methods; cross-module shape propagation arity-checks `from foo import Cls` and `import foo as f; f.Cls(…)` alike; `.ty` source and `.dty` stubs participate on equal footing through a project-wide `ExternalShapes` registry; the LSP caches per-file extraction via a Salsa-tracked `module_shapes_query`; a new `tyc::missing_field_init` post-construction audit catches `X.__new__(X)` bypass patterns where the instance escapes without required fields assigned. See [docs/roadmap.md](roadmap.md#phase-55--constructor--method-arity-safety--complete-v020).
-- ✅ Phase 6 Python-annoyances surface (v0.3.0 — correctness sweeps in v0.3.1 / v0.4.0; additive features and polish through v0.5.0 / v0.5.1 / v0.5.2 / v0.6.0 / v0.6.1 / **v0.7.0** (current release)). v0.3.0 introduced `newtype` (nominal aliases over primitives), `freeze let` (deep-frozen module-level bindings), `pub` (`__all__`-synthesising visibility marker), three new effect / safety diagnostics (`blocking_in_async`, `resource_not_managed`, `div_by_zero_literal`), and pre-built install artifacts for Linux + Windows. v0.5.0 added the `Type::TypeConstructor` HKT foundation, `comptime` types-as-values, dict-comp parallelisation, and three new `tyc migrate` rewrites (frozen-`@dataclass` → `class X frozen:`, `Protocol` → `interface`, `NewType` → `newtype`). v0.6.0 shipped ten production-shaped reference apps under `examples/apps/` and three additive features (`Ok` / `Err` Result-combinator methods, `impl` on a sealed-union alias distributing to every variant, `tyc::stdlib_module_shadow`). v0.7.0 (the carry-over release on top of v0.6.1) adds `pub *` wildcard re-export aggregation in `__init__.ty` with transitive sub-package coverage, declare-only `let NAME: T` with arm-assignment integrated with `tyc::use_of_uninitialised` definite-assignment analysis, `with cm() as r:` inference from `__enter__` / `__aenter__` and from `@contextmanager` / `@asynccontextmanager` factories, `await` on `Callable[..., Awaitable[T]]` / `Coroutine[Y, S, T]` unwrapping to `T`, same-newtype-preserving arithmetic, cross-module generic method dispatch propagating class TypeVars, and a polish sweep (nested arm-imports binding, ternary narrowing, multi-line `go expr(...)` parsing, `tyc::field_default_ordering`). Five additional production-shaped apps (real-time game server, static site generator, vector DB, API gateway, stream processor) join the original ten under `examples/apps/`, and all fifteen are re-organised into grouped subdirectories with `pub *` `__init__.ty` facades.
+- ✅ Phase 6 Python-annoyances surface (v0.3.0 — correctness sweeps in v0.3.1 / v0.4.0; additive features and polish through v0.5.0 / v0.5.1 / v0.5.2 / v0.6.0 / v0.6.1 / v0.7.0 / v0.7.1 / v0.8.0 / **v0.8.1** (current release)). v0.3.0 introduced `newtype` (nominal aliases over primitives), `freeze let` (deep-frozen module-level bindings), `pub` (`__all__`-synthesising visibility marker), three new effect / safety diagnostics (`blocking_in_async`, `resource_not_managed`, `div_by_zero_literal`), and pre-built install artifacts for Linux + Windows. v0.5.0 added the `Type::TypeConstructor` HKT foundation, `comptime` types-as-values, dict-comp parallelisation, and three new `tyc migrate` rewrites (frozen-`@dataclass` → `class X frozen:`, `Protocol` → `interface`, `NewType` → `newtype`). v0.6.0 shipped ten production-shaped reference apps under `examples/apps/` and three additive features (`Ok` / `Err` Result-combinator methods, `impl` on a sealed-union alias distributing to every variant, `tyc::stdlib_module_shadow`). v0.7.0 (the Round-3 apps-feedback carry-over) added `pub *` wildcard re-export aggregation in `__init__.ty`, declare-only `let NAME: T` with arm-assignment, `with cm() as r:` inference, `await Callable[..., Awaitable[T]]` unwrapping, same-newtype-preserving arithmetic, and cross-module generic method dispatch. v0.7.1 is a strict LSP bugfix point release. v0.8.0 (the stress-test sweep release on top of v0.7.1) closes 41 findings from a multi-file stress report. Type-system widening: `tyc::attribute_not_found` fires on class instances and generic classes (with foreign / venv-introspected classes tracked by a new `partial` shape marker), interface parameter type conformance, string-literal singleton types (`Type::LitStr`), `?` propagation in `with`-chains, `tyc::pattern_shadows_outer`, `newtype`-invalid-base rejection. VM upgrades: `num_bigint::BigInt` arbitrary-precision integers, `indexmap::IndexMap` insertion-ordered dicts, full f-string format flags, mapping match patterns, sequence-with-star patterns, recursion limit raised to 1000, larger native stdlib (`re`, `typing`, `collections`, `functools`, `itertools`, `dataclasses`, `pathlib`). Parser scaffolds: HKT `class Functor[F[_]]:`, `impl[T] SealedUnionAlias[T]:`, generic-plus-frozen `class X[T] frozen:`, `async def` in `interface` bodies, outer-annotation tuple unpack. Diagnostics: synthetic-line sanitisation across every diagnostic, three new lint warnings (`empty_collection_no_annotation`, `typing_alias_in_annotation`, `contains_secret_literal`), better hints on `wrong_arg_count` / collection variance / dict-to-model mismatch. CLI: `tyc check lib.dty` single-file support, `tyc migrate` strips trivial `__init__`. Default change: `unused_import` is now `warn` (was `error`).
 - ✅ Runtime `stubtest` probe via `tyc stubtest` (shells out to `python -m mypy.stubtest`) — complements the AST-level `tyc check --stubs` diff.
 - `ty` integration as a complementary second-stage checker over the desugared Python — see [docs/ty-integration.md](ty-integration.md). (Subprocess form landed as `tyc ty`; the embedded-library form is deferred.)
 
