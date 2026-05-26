@@ -230,6 +230,13 @@ pub fn preprocess(source: &str) -> PreprocessResult {
     let mut pub_star_lines: Vec<usize> = Vec::new();
     let source_owned =
         strip_pub_prefixes(source, &mut pub_names, &mut pub_lines, &mut pub_star_lines);
+    // Pre-pass: rewrite higher-kinded-type markers (`Name[_]`) inside
+    // PEP-695 class type-parameter lists down to plain TypeVars. The
+    // VM doesn't enforce kind structure; the underscore is informational
+    // for the type-checker and would otherwise crash Ruff. Operates
+    // line-by-line so any class header is normalised before the main
+    // keyword-aware loop sees it. Finding #6.
+    let source_owned = strip_hkt_markers_in_class_headers(&source_owned);
     let source = source_owned.as_str();
 
     let mut python_source = String::with_capacity(source.len());
@@ -1507,6 +1514,152 @@ fn append_ellipsis_to_bodiless_def(line: &str) -> Option<String> {
         return None;
     }
     Some(format!("{}: ...{}", body.trim_end(), terminator))
+}
+
+/// Rewrite higher-kinded-type markers in PEP-695 class type-parameter
+/// lists, turning `class Name[F[_], …]:` into `class Name[F, …]:` so the
+/// vendored Ruff parser accepts the header. The `[_]` is purely a marker
+/// that `F` is a 1-arg type constructor — the VM/runtime does not enforce
+/// kind structure, and the type-checker handles `F` as a regular
+/// TypeVar. Finding #6.
+///
+/// Scope-limited to the bracket-list that follows the class name. Any
+/// `_` inside default values or bases is preserved verbatim.
+fn strip_hkt_markers_in_class_headers(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut in_string: Option<StringMode> = None;
+    for line in source.split_inclusive('\n') {
+        let pre_string = in_string;
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let _code_end = scan_line_code_end(raw, &mut in_string);
+        if pre_string.is_some() {
+            out.push_str(line);
+            continue;
+        }
+        let indent_len = raw
+            .find(|c: char| !c.is_whitespace())
+            .unwrap_or(raw.len());
+        let rest = &raw[indent_len..];
+        if !rest.starts_with("class ") {
+            out.push_str(line);
+            continue;
+        }
+        // Find the first `[` after `class NAME`. Walk past the name
+        // (identifier characters only) to land on the optional
+        // type-parameter bracket.
+        let after_class = &rest["class ".len()..];
+        let name_end = match after_class
+            .bytes()
+            .position(|b| !(b.is_ascii_alphanumeric() || b == b'_'))
+        {
+            Some(p) if p > 0 => p,
+            _ => {
+                out.push_str(line);
+                continue;
+            }
+        };
+        let after_name = &after_class[name_end..];
+        if !after_name.starts_with('[') {
+            out.push_str(line);
+            continue;
+        }
+        // Match the closing `]` at depth 0.
+        let bytes = after_name.as_bytes();
+        let mut depth = 0i32;
+        let mut close = None;
+        for (i, &b) in bytes.iter().enumerate() {
+            match b {
+                b'[' => depth += 1,
+                b']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close = match close {
+            Some(p) => p,
+            None => {
+                out.push_str(line);
+                continue;
+            }
+        };
+        let inside = &after_name[1..close]; // exclusive of outer `[`/`]`
+        // Quick exit: no `[_]` marker at all — leave the line alone so
+        // round-tripping stays exact for the common case.
+        if !inside.contains("[_]") {
+            out.push_str(line);
+            continue;
+        }
+        let rewritten_inside = strip_hkt_markers_in_param_list(inside);
+        if rewritten_inside == inside {
+            out.push_str(line);
+            continue;
+        }
+        // Reassemble: indent + `class NAME` + `[REWRITTEN]` + tail.
+        // `after_name` starts at the `[`, so `close` is the byte index of
+        // the matching `]` within `after_name`. The absolute position of
+        // that `]` in `raw` is `head_end + close`.
+        let head_end = indent_len + "class ".len() + name_end; // points at `[`
+        let close_byte = head_end + close; // absolute index of `]`
+        out.push_str(&raw[..head_end]);
+        out.push('[');
+        out.push_str(&rewritten_inside);
+        out.push(']');
+        out.push_str(&raw[close_byte + 1..]);
+        // Preserve the original terminator (CRLF or LF or none).
+        let term = &line[raw.len()..];
+        out.push_str(term);
+    }
+    out
+}
+
+/// Walk a comma-separated PEP-695 type-parameter list and drop any `[_]`
+/// kind-marker that immediately follows a parameter name. Bound
+/// annotations (`T: Bound`) and bare names pass through unchanged.
+fn strip_hkt_markers_in_param_list(inside: &str) -> String {
+    // Bracket-aware top-level comma split. Whitespace inside each piece
+    // is preserved so the output reads naturally.
+    let mut out = String::with_capacity(inside.len());
+    let parts = split_top_level_commas_lite(inside);
+    for (i, raw_part) in parts.iter().enumerate() {
+        let part = raw_part.trim();
+        // Match `Name[_]` (optionally followed by `: Bound` / `= Default`).
+        // We only strip the `[_]` token; everything before/after is kept.
+        let stripped = strip_one_hkt_marker(part);
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&stripped);
+    }
+    out
+}
+
+/// For a single parameter slot, drop a trailing `[_]` kind marker that
+/// follows the parameter's identifier. Returns the slot unchanged if no
+/// marker is present.
+fn strip_one_hkt_marker(slot: &str) -> String {
+    // Find the identifier end (first non-id char).
+    let id_end = slot
+        .bytes()
+        .position(|b| !(b.is_ascii_alphanumeric() || b == b'_'))
+        .unwrap_or(slot.len());
+    if id_end == 0 {
+        return slot.to_owned();
+    }
+    let head = &slot[..id_end];
+    let tail = &slot[id_end..];
+    // Optional whitespace, then `[_]`, then whatever follows.
+    let after_ws = tail.trim_start();
+    let ws_len = tail.len() - after_ws.len();
+    if let Some(after_marker) = after_ws.strip_prefix("[_]") {
+        format!("{}{}{}", head, &tail[..ws_len], after_marker)
+    } else {
+        slot.to_owned()
+    }
 }
 
 /// Strip the `frozen` modifier from a `class NAME frozen:` or
@@ -9039,6 +9192,51 @@ string content
             result.python_source
         );
         assert!(result.frozen_class_lines.contains(&0));
+    }
+
+    // ── #6: HKT scaffold `class Functor[F[_]]:` ────────────────────────────
+    #[test]
+    fn class_with_hkt_wildcard_param_parses() {
+        // `class Functor[F[_]]:` is the documented scaffold for higher-kinded
+        // type parameters. Python's PEP-695 parser doesn't accept `F[_]` in a
+        // type-param list, so preprocess rewrites the nested `[_]` away,
+        // leaving a plain TypeVar `F`. The full body — including a method
+        // with its own type params — must parse.
+        let src = "class Functor[F[_]]:\n    def fmap[T, U](self, f, fa): ...\n";
+        let result = preprocess(src);
+        assert!(
+            result.python_source.starts_with("class Functor[F]:"),
+            "expected `class Functor[F]:` header; got:\n{}",
+            result.python_source
+        );
+        // Sanity: Ruff must accept the rewritten source.
+        let parse = crate::parse_module(&result.python_source);
+        assert!(parse.is_ok(), "rewritten HKT class must parse cleanly");
+    }
+
+    #[test]
+    fn class_with_hkt_multiple_params() {
+        // Two HKT parameters in the same header — `Bifunctor[F[_], G[_]]`.
+        let src = "class Bifunctor[F[_], G[_]]:\n    pass\n";
+        let result = preprocess(src);
+        assert!(
+            result.python_source.starts_with("class Bifunctor[F, G]:"),
+            "expected `class Bifunctor[F, G]:`; got:\n{}",
+            result.python_source
+        );
+    }
+
+    #[test]
+    fn class_with_mixed_hkt_and_plain_params() {
+        // Mixing kinded and unkinded type parameters: the kind marker
+        // disappears, plain params survive.
+        let src = "class M[F[_], A]:\n    pass\n";
+        let result = preprocess(src);
+        assert!(
+            result.python_source.starts_with("class M[F, A]:"),
+            "expected `class M[F, A]:`; got:\n{}",
+            result.python_source
+        );
     }
 
     // ── #17: outer-annotation tuple unpack ────────────────────────────────
