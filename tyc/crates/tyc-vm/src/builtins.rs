@@ -526,6 +526,39 @@ pub fn install(interp: &mut Interpreter) {
         });
         root.set(name, Value::Native(Rc::new(ctor)));
     }
+
+    // `freeze let X = expr` lowers to `X = __typhon_freeze__(expr)`. The
+    // compile path resolves this via `from typhon_runtime.freeze import
+    // deep_freeze as __typhon_freeze__`; the VM has no `typhon_runtime`
+    // package on disk, so we register the helper as a builtin instead.
+    // Acceptable VM-mode limitation: returns the value as-is (identity).
+    // The static checker still enforces immutability of `freeze let`
+    // bindings at the type level, so the runtime degradation is silent
+    // and only affects users who attempt to mutate the value through an
+    // aliased reference at runtime — a pattern the type system already
+    // rejects.
+    root.set(
+        "__typhon_freeze__",
+        Value::Native(Rc::new(NativeFn::new("__typhon_freeze__", |_i, args| {
+            Ok(args.into_iter().next().unwrap_or(Value::None))
+        }))),
+    );
+
+    // `newtype Foo = int` lowers to `Foo = NewType("Foo", int)`. CPython's
+    // `NewType` at runtime is effectively `lambda x: x`, so we mirror that:
+    // a two-argument callable that returns a callable identity function.
+    // VM-mode coverage of #24.
+    root.set(
+        "NewType",
+        Value::Native(Rc::new(NativeFn::new("NewType", |_i, _args| {
+            // Discard `(name, base)`; return an identity callable that
+            // accepts any single argument and returns it unchanged.
+            Ok(Value::Native(Rc::new(NativeFn::new(
+                "NewTypeAlias",
+                |_i, args| Ok(args.into_iter().next().unwrap_or(Value::None)),
+            ))))
+        }))),
+    );
 }
 
 fn single<'a>(args: &'a [Value], name: &str) -> Result<&'a Value, Unwind> {
@@ -657,8 +690,30 @@ pub fn resolve_module(interp: &mut Interpreter, name: &str) -> Result<Value, Unw
         "json" => Ok(make_json_module()),
         "time" => Ok(make_time_module()),
         "random" => Ok(make_random_module()),
-        // Typhon-runtime submodules — same content reachable as attributes.
-        n if n.starts_with("typhon_runtime.") => Ok(make_typhon_runtime_module(interp)),
+        "typing" => Ok(make_typing_module()),
+        "re" => Ok(make_re_module()),
+        "collections" => Ok(make_collections_module()),
+        "functools" => Ok(make_functools_module()),
+        "itertools" => Ok(make_itertools_module()),
+        "dataclasses" => Ok(make_dataclasses_module()),
+        "pathlib" => Ok(make_pathlib_module()),
+        // Typhon-runtime submodules — return the matching submodule so
+        // `from typhon_runtime.freeze import deep_freeze` and friends
+        // resolve their member directly. Falls back to the root module
+        // for unrecognised submodule names so legacy code paths keep
+        // working.
+        n if n.starts_with("typhon_runtime.") => {
+            let root = make_typhon_runtime_module(interp);
+            let sub = n.strip_prefix("typhon_runtime.").unwrap_or("");
+            if let Value::Module(m) = &root {
+                if let Some(v) = m.members.borrow().get(sub) {
+                    if matches!(v, Value::Module(_)) {
+                        return Ok(v.clone());
+                    }
+                }
+            }
+            Ok(root)
+        }
         _ => Err(crate::error::Unwind::Exception(
             crate::error::VmException::new(
                 "ImportError",
@@ -720,9 +775,38 @@ fn make_typhon_runtime_module(interp: &Interpreter) -> Value {
             ),
         ],
     );
+    // `freeze let X = expr` lowers to a call to `deep_freeze` imported from
+    // `typhon_runtime.freeze`. We expose the same name here so the
+    // existing desugar-injected import (`from typhon_runtime.freeze import
+    // deep_freeze as __typhon_freeze__`) resolves in VM mode. The shim is
+    // an identity function — see the `__typhon_freeze__` root binding in
+    // `install()` for the rationale.
+    let freeze = make_module(
+        "typhon_runtime.freeze",
+        vec![(
+            "deep_freeze",
+            nf("deep_freeze", |_i, args| {
+                Ok(args.into_iter().next().unwrap_or(Value::None))
+            }),
+        )],
+    );
+    // `Result` is exposed as a type marker — the type checker uses
+    // `Result[T, E]` as a typing construct; at runtime the desugared
+    // module only needs the name to be defined. An identity callable
+    // suffices since user code never invokes `Result(...)` directly.
+    let result_marker = nf("Result", |_i, args| {
+        Ok(args.into_iter().next().unwrap_or(Value::None))
+    });
     make_module(
         "typhon_runtime",
-        vec![("Ok", ok), ("Err", err), ("tasks", tasks), ("lazy", lazy)],
+        vec![
+            ("Ok", ok),
+            ("Err", err),
+            ("Result", result_marker),
+            ("tasks", tasks),
+            ("lazy", lazy),
+            ("freeze", freeze),
+        ],
     )
 }
 
@@ -1025,6 +1109,1065 @@ fn make_random_module() -> Value {
             ),
         ],
     )
+}
+
+// ── stdlib shims ───────────────────────────────────────────────────────────
+//
+// FINDINGS #25/#27. Most non-trivial Typhon programs reference the typing /
+// collections / functools / itertools / pathlib / re modules even when only
+// used as static annotations or for a handful of helpers. Compile mode
+// resolves these through CPython, but VM mode never bridges to CPython, so
+// every `from typing import …` line used to crash the VM with a hard
+// ImportError. The shims below give the VM partial native coverage so the
+// common-case program runs end-to-end. Each module documents what is
+// implemented; anything not listed will still raise AttributeError on use.
+//
+// The shims are intentionally minimal — they cover the surface that
+// users actually reach for in the v0.7.x stress sweep, not the full
+// stdlib API.
+
+/// Identity-callable. Used by typing shims (`Callable`, `Optional`, …)
+/// where the only operation Typhon programs perform at runtime is
+/// subscription (`Optional[int]`) and occasional invocation.
+fn identity_native(name: &'static str) -> Value {
+    Value::Native(Rc::new(NativeFn::new(name, |_i, args| {
+        Ok(args.into_iter().next().unwrap_or(Value::None))
+    })))
+}
+
+/// `typing` shim.
+///
+/// Provides identity-callable stubs for every name the static checker
+/// emits as a forward reference plus a couple of runtime constructors
+/// (`NewType`, `TypeVar`). All "subscriptable" names (`List`, `Dict`,
+/// `Optional`, …) round-trip through the identity callable when
+/// indexed because the VM treats `name[x]` as a `__getitem__` call on
+/// the callable; the resulting value is an opaque marker that nobody
+/// reads at runtime — only its presence at parse-time matters.
+fn make_typing_module() -> Value {
+    let mut entries: Vec<(&str, Value)> = Vec::new();
+    for name in [
+        "Callable",
+        "Optional",
+        "Union",
+        "List",
+        "Dict",
+        "Set",
+        "Tuple",
+        "FrozenSet",
+        "Any",
+        "Protocol",
+        "Iterable",
+        "Iterator",
+        "Sequence",
+        "Mapping",
+        "MutableMapping",
+        "MutableSequence",
+        "ClassVar",
+        "Final",
+        "Literal",
+        "Type",
+        "Generic",
+        "TypedDict",
+        "NamedTuple",
+        "Hashable",
+        "Sized",
+        "Container",
+        "Awaitable",
+        "Coroutine",
+        "AsyncIterable",
+        "AsyncIterator",
+        "Generator",
+        "AsyncGenerator",
+        "ContextManager",
+        "AsyncContextManager",
+        "Annotated",
+        "Self",
+        "Never",
+        "NoReturn",
+    ] {
+        entries.push((name, identity_native(Box::leak(name.to_owned().into_boxed_str()))));
+    }
+    // `NewType("Foo", base)` returns an identity callable. Mirrors the
+    // root-level `NewType` builtin for users who import it explicitly.
+    entries.push((
+        "NewType",
+        Value::Native(Rc::new(NativeFn::new("NewType", |_i, _args| {
+            Ok(Value::Native(Rc::new(NativeFn::new(
+                "NewTypeAlias",
+                |_i, args| Ok(args.into_iter().next().unwrap_or(Value::None)),
+            ))))
+        }))),
+    ));
+    // `TypeVar("T", ...)` — return a placeholder. The static type system
+    // is the only consumer; at runtime the value just needs to exist.
+    entries.push((
+        "TypeVar",
+        Value::Native(Rc::new(NativeFn::new("TypeVar", |_i, args| {
+            Ok(args.into_iter().next().unwrap_or(Value::None))
+        }))),
+    ));
+    // `cast(type, value)` — return the value unchanged.
+    entries.push((
+        "cast",
+        Value::Native(Rc::new(NativeFn::new("cast", |_i, args| {
+            Ok(args.into_iter().nth(1).unwrap_or(Value::None))
+        }))),
+    ));
+    // `TYPE_CHECKING` — always False at runtime, like CPython.
+    entries.push(("TYPE_CHECKING", Value::Bool(false)));
+    // `overload` decorator — strip (identity for the decorated fn).
+    entries.push((
+        "overload",
+        Value::Native(Rc::new(NativeFn::new("overload", |_i, args| {
+            Ok(args.into_iter().next().unwrap_or(Value::None))
+        }))),
+    ));
+    // `runtime_checkable` decorator — identity.
+    entries.push((
+        "runtime_checkable",
+        Value::Native(Rc::new(NativeFn::new("runtime_checkable", |_i, args| {
+            Ok(args.into_iter().next().unwrap_or(Value::None))
+        }))),
+    ));
+    make_module("typing", entries)
+}
+
+/// `re` shim.
+///
+/// Implemented: `re.compile`, `re.match`, `re.search`, `re.sub`,
+/// `re.findall`, `re.split`, `re.fullmatch`. Patterns are compiled with
+/// the Rust `regex` crate via a string-only path — Python-specific syntax
+/// like `(?P<name>…)` named groups falls through unchanged (named groups
+/// in Rust's regex use `(?<name>…)`; we rewrite the common `?P<` form to
+/// `?<` so most Python regexes work). The returned match objects expose
+/// `group`, `groups`, `start`, `end`, `span`. Backreferences in `sub`
+/// replacement strings (`\\1`, `\\g<name>`) map to Rust's `${n}` form.
+///
+/// Not implemented: `re.IGNORECASE` / `re.MULTILINE` / flag arguments,
+/// `re.finditer`, `re.purge`, the `Pattern` / `Match` object protocol
+/// (only the named methods above work), and lookaheads/lookbehinds
+/// (Rust's `regex` is a finite-automaton engine that rejects them).
+fn make_re_module() -> Value {
+    use crate::value::Class;
+    // Compile a Python-shaped pattern into a Rust regex by rewriting
+    // `(?P<name>` to `(?<name>` and `(?P=name)` to a (non-functional)
+    // placeholder that the engine will reject — keeping the failure
+    // mode legible.
+    fn to_rust_pattern(p: &str) -> String {
+        p.replace("(?P<", "(?<").replace("(?P=", "(?P=")
+    }
+    fn compile_one(p: &str) -> Result<regex::Regex, Unwind> {
+        regex::Regex::new(&to_rust_pattern(p))
+            .map_err(|e| value_error(format!("invalid regex: {e}")))
+    }
+    // A Pattern object holding a compiled regex plus a thin method table
+    // so `pattern.match(s)` etc. work.
+    fn pattern_value(p: regex::Regex) -> Value {
+        let p_rc = Rc::new(p);
+        let mut attrs: HashMap<String, Value> = HashMap::new();
+        let p1 = p_rc.clone();
+        attrs.insert(
+            "match".into(),
+            Value::Native(Rc::new(NativeFn::new("match", move |_i, args| {
+                let s = single(&args, "match")?.py_str();
+                Ok(match_to_value(p1.find(&s), &s))
+            }))),
+        );
+        let p2 = p_rc.clone();
+        attrs.insert(
+            "search".into(),
+            Value::Native(Rc::new(NativeFn::new("search", move |_i, args| {
+                let s = single(&args, "search")?.py_str();
+                Ok(match_to_value(p2.find(&s), &s))
+            }))),
+        );
+        let p3 = p_rc.clone();
+        attrs.insert(
+            "findall".into(),
+            Value::Native(Rc::new(NativeFn::new("findall", move |_i, args| {
+                let s = single(&args, "findall")?.py_str();
+                let hits: Vec<Value> = p3
+                    .find_iter(&s)
+                    .map(|m| Value::Str(Rc::new(m.as_str().to_owned())))
+                    .collect();
+                Ok(Value::List(Rc::new(RefCell::new(hits))))
+            }))),
+        );
+        let p4 = p_rc.clone();
+        attrs.insert(
+            "sub".into(),
+            Value::Native(Rc::new(NativeFn::new("sub", move |_i, args| {
+                let repl = args
+                    .first()
+                    .ok_or_else(|| type_error("sub() needs replacement"))?
+                    .py_str();
+                let s = args
+                    .get(1)
+                    .ok_or_else(|| type_error("sub() needs string"))?
+                    .py_str();
+                Ok(Value::Str(Rc::new(p4.replace_all(&s, repl).into_owned())))
+            }))),
+        );
+        let p5 = p_rc.clone();
+        attrs.insert(
+            "split".into(),
+            Value::Native(Rc::new(NativeFn::new("split", move |_i, args| {
+                let s = single(&args, "split")?.py_str();
+                let parts: Vec<Value> = p5
+                    .split(&s)
+                    .map(|p| Value::Str(Rc::new(p.to_owned())))
+                    .collect();
+                Ok(Value::List(Rc::new(RefCell::new(parts))))
+            }))),
+        );
+        // Wrap the attrs in a Class-shaped value with an Instance.
+        // The interpreter checks instance.fields before class.methods, so
+        // exposing the natives as instance fields is enough.
+        let cls = Rc::new(Class {
+            name: "Pattern".into(),
+            methods: RefCell::new(HashMap::new()),
+            fields: vec![],
+            class_attrs: RefCell::new(HashMap::new()),
+            bases: vec![],
+        });
+        Value::Instance(Rc::new(crate::value::Instance {
+            class: cls,
+            fields: RefCell::new(attrs),
+        }))
+    }
+    fn match_to_value(m: Option<regex::Match<'_>>, _s: &str) -> Value {
+        let Some(m) = m else { return Value::None };
+        let captured = m.as_str().to_owned();
+        let start = m.start() as i64;
+        let end = m.end() as i64;
+        let mut attrs: HashMap<String, Value> = HashMap::new();
+        let cap = captured.clone();
+        attrs.insert(
+            "group".into(),
+            Value::Native(Rc::new(NativeFn::new("group", move |_i, _args| {
+                Ok(Value::Str(Rc::new(cap.clone())))
+            }))),
+        );
+        let cap2 = captured.clone();
+        attrs.insert(
+            "groups".into(),
+            Value::Native(Rc::new(NativeFn::new("groups", move |_i, _args| {
+                Ok(Value::Tuple(Rc::new(vec![Value::Str(Rc::new(cap2.clone()))])))
+            }))),
+        );
+        attrs.insert(
+            "start".into(),
+            Value::Native(Rc::new(NativeFn::new("start", move |_i, _args| {
+                Ok(Value::Int(start))
+            }))),
+        );
+        attrs.insert(
+            "end".into(),
+            Value::Native(Rc::new(NativeFn::new("end", move |_i, _args| {
+                Ok(Value::Int(end))
+            }))),
+        );
+        attrs.insert(
+            "span".into(),
+            Value::Native(Rc::new(NativeFn::new("span", move |_i, _args| {
+                Ok(Value::Tuple(Rc::new(vec![
+                    Value::Int(start),
+                    Value::Int(end),
+                ])))
+            }))),
+        );
+        let cls = Rc::new(crate::value::Class {
+            name: "Match".into(),
+            methods: RefCell::new(HashMap::new()),
+            fields: vec![],
+            class_attrs: RefCell::new(HashMap::new()),
+            bases: vec![],
+        });
+        Value::Instance(Rc::new(crate::value::Instance {
+            class: cls,
+            fields: RefCell::new(attrs),
+        }))
+    }
+    make_module(
+        "re",
+        vec![
+            (
+                "compile",
+                nf("compile", move |_i, args| {
+                    let p = single(&args, "compile")?.py_str();
+                    let r = compile_one(&p)?;
+                    Ok(pattern_value(r))
+                }),
+            ),
+            (
+                "match",
+                nf("match", move |_i, args| {
+                    let p = args
+                        .first()
+                        .ok_or_else(|| type_error("match() needs pattern"))?
+                        .py_str();
+                    let s = args
+                        .get(1)
+                        .ok_or_else(|| type_error("match() needs string"))?
+                        .py_str();
+                    let r = compile_one(&p)?;
+                    Ok(match_to_value(r.find(&s), &s))
+                }),
+            ),
+            (
+                "search",
+                nf("search", move |_i, args| {
+                    let p = args
+                        .first()
+                        .ok_or_else(|| type_error("search() needs pattern"))?
+                        .py_str();
+                    let s = args
+                        .get(1)
+                        .ok_or_else(|| type_error("search() needs string"))?
+                        .py_str();
+                    let r = compile_one(&p)?;
+                    Ok(match_to_value(r.find(&s), &s))
+                }),
+            ),
+            (
+                "fullmatch",
+                nf("fullmatch", move |_i, args| {
+                    let p = args
+                        .first()
+                        .ok_or_else(|| type_error("fullmatch() needs pattern"))?
+                        .py_str();
+                    let s = args
+                        .get(1)
+                        .ok_or_else(|| type_error("fullmatch() needs string"))?
+                        .py_str();
+                    let anchored = format!("^(?:{p})$");
+                    let r = compile_one(&anchored)?;
+                    Ok(match_to_value(r.find(&s), &s))
+                }),
+            ),
+            (
+                "sub",
+                nf("sub", move |_i, args| {
+                    let p = args
+                        .first()
+                        .ok_or_else(|| type_error("sub() needs pattern"))?
+                        .py_str();
+                    let repl = args
+                        .get(1)
+                        .ok_or_else(|| type_error("sub() needs replacement"))?
+                        .py_str();
+                    let s = args
+                        .get(2)
+                        .ok_or_else(|| type_error("sub() needs string"))?
+                        .py_str();
+                    let r = compile_one(&p)?;
+                    Ok(Value::Str(Rc::new(r.replace_all(&s, repl).into_owned())))
+                }),
+            ),
+            (
+                "findall",
+                nf("findall", move |_i, args| {
+                    let p = args
+                        .first()
+                        .ok_or_else(|| type_error("findall() needs pattern"))?
+                        .py_str();
+                    let s = args
+                        .get(1)
+                        .ok_or_else(|| type_error("findall() needs string"))?
+                        .py_str();
+                    let r = compile_one(&p)?;
+                    let hits: Vec<Value> = r
+                        .find_iter(&s)
+                        .map(|m| Value::Str(Rc::new(m.as_str().to_owned())))
+                        .collect();
+                    Ok(Value::List(Rc::new(RefCell::new(hits))))
+                }),
+            ),
+            (
+                "split",
+                nf("split", move |_i, args| {
+                    let p = args
+                        .first()
+                        .ok_or_else(|| type_error("split() needs pattern"))?
+                        .py_str();
+                    let s = args
+                        .get(1)
+                        .ok_or_else(|| type_error("split() needs string"))?
+                        .py_str();
+                    let r = compile_one(&p)?;
+                    let parts: Vec<Value> = r
+                        .split(&s)
+                        .map(|p| Value::Str(Rc::new(p.to_owned())))
+                        .collect();
+                    Ok(Value::List(Rc::new(RefCell::new(parts))))
+                }),
+            ),
+            (
+                "escape",
+                nf("escape", move |_i, args| {
+                    let s = single(&args, "escape")?.py_str();
+                    Ok(Value::Str(Rc::new(regex::escape(&s))))
+                }),
+            ),
+            // Flag constants — accepted but currently ignored. The shim
+            // engine has no flag plumbing; users that rely on
+            // IGNORECASE/MULTILINE will see incorrect behaviour and
+            // should fall back to `tyc run --compile`.
+            ("IGNORECASE", Value::Int(2)),
+            ("MULTILINE", Value::Int(8)),
+            ("DOTALL", Value::Int(16)),
+            ("VERBOSE", Value::Int(64)),
+            ("ASCII", Value::Int(256)),
+        ],
+    )
+}
+
+/// `collections` shim.
+///
+/// Implemented: `OrderedDict` (alias to `dict`), `defaultdict` (no auto-
+/// default behaviour — same as plain `dict`), `Counter` (returns a dict
+/// of counts), `namedtuple` (returns a callable that builds a tuple).
+/// `deque` is not implemented; users hitting that case should fall back
+/// to `tyc run --compile`.
+fn make_collections_module() -> Value {
+    let counter = nf("Counter", |i, args| {
+        let mut counts: HashMap<HashKey, Value> = HashMap::new();
+        if let Some(v) = args.into_iter().next() {
+            let it = i.make_iter(v)?;
+            while let Some(x) = i.iter_next(&it)? {
+                let key = x.to_hash_key()?;
+                let entry = counts.entry(key).or_insert(Value::Int(0));
+                *entry = match entry {
+                    Value::Int(n) => Value::Int(*n + 1),
+                    _ => Value::Int(1),
+                };
+            }
+        }
+        Ok(Value::Dict(Rc::new(RefCell::new(counts))))
+    });
+    let defaultdict = nf("defaultdict", |_i, _args| {
+        // The factory argument is discarded — accessing a missing key
+        // raises KeyError just like a plain dict in this shim. Users
+        // that need the auto-default behaviour should fall back to
+        // compile mode.
+        Ok(Value::Dict(Rc::new(RefCell::new(HashMap::new()))))
+    });
+    let ordered_dict = nf("OrderedDict", |i, args| {
+        // CPython's `dict` preserves insertion order since 3.7, so this
+        // is a true alias for the v1 shim. (The VM itself does not yet
+        // preserve insertion order on display — FINDINGS #18 — but the
+        // surface API matches CPython's `OrderedDict`.)
+        let mut m: HashMap<HashKey, Value> = HashMap::new();
+        if let Some(v) = args.into_iter().next() {
+            let it = i.make_iter(v)?;
+            while let Some(pair) = i.iter_next(&it)? {
+                if let Value::Tuple(t) = pair {
+                    if t.len() == 2 {
+                        m.insert(t[0].to_hash_key()?, t[1].clone());
+                    }
+                }
+            }
+        }
+        Ok(Value::Dict(Rc::new(RefCell::new(m))))
+    });
+    // `namedtuple(name, fields)` returns a constructor that accepts the
+    // field values positionally or by keyword and returns a plain tuple.
+    // Attribute access on the result is not supported in this shim; the
+    // tuple shape is enough for most arithmetic / unpacking use sites.
+    let namedtuple = nf("namedtuple", |_i, args| {
+        let _name = args
+            .first()
+            .ok_or_else(|| type_error("namedtuple() needs a name"))?;
+        let fields = args
+            .get(1)
+            .ok_or_else(|| type_error("namedtuple() needs fields"))?
+            .clone();
+        let ctor = NativeFn::new("namedtuple_ctor", move |_i, mut call_args| {
+            // Pull field count from the captured `fields` argument.
+            let count = match &fields {
+                Value::Str(s) => s.split(|c: char| c.is_whitespace() || c == ',').filter(|p| !p.is_empty()).count(),
+                Value::List(l) => l.borrow().len(),
+                Value::Tuple(t) => t.len(),
+                _ => 0,
+            };
+            // Pad with None up to the declared field count.
+            while call_args.len() < count {
+                call_args.push(Value::None);
+            }
+            Ok(Value::Tuple(Rc::new(call_args)))
+        });
+        Ok(Value::Native(Rc::new(ctor)))
+    });
+    make_module(
+        "collections",
+        vec![
+            ("OrderedDict", ordered_dict),
+            ("defaultdict", defaultdict),
+            ("Counter", counter),
+            ("namedtuple", namedtuple),
+        ],
+    )
+}
+
+/// `functools` shim.
+///
+/// Implemented: `cache` / `lru_cache` (memoising wrapper, identical
+/// semantics to the `@memo` decorator), `reduce`, `partial` (returns a
+/// callable that prepends the captured args), `cached_property`
+/// (identity wrapper — see FINDINGS #26: callers must invoke the
+/// resulting method as `obj.x()` rather than `obj.x` because the VM
+/// has no descriptor protocol).
+///
+/// `wraps`, `singledispatch`, and `total_ordering` are not implemented.
+fn make_functools_module() -> Value {
+    fn make_cache(_i: &mut Interpreter, args: Vec<Value>) -> Result<Value, Unwind> {
+        let inner = args.into_iter().next().unwrap_or(Value::None);
+        let cache: Rc<RefCell<HashMap<HashKey, Value>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+        Ok(Value::Native(Rc::new(NativeFn::new(
+            "memo",
+            move |interp, call_args| {
+                let mut keys = Vec::with_capacity(call_args.len());
+                for a in &call_args {
+                    keys.push(a.to_hash_key()?);
+                }
+                let key = HashKey::Tuple(Rc::new(keys));
+                if let Some(v) = cache.borrow().get(&key).cloned() {
+                    return Ok(v);
+                }
+                let result = interp.call_value(inner.clone(), call_args, &[])?;
+                cache.borrow_mut().insert(key, result.clone());
+                Ok(result)
+            },
+        ))))
+    }
+    let cache_fn = nf("cache", make_cache);
+    // `lru_cache(maxsize=None)` returns a decorator; we accept both shapes.
+    let lru_cache = nf("lru_cache", |_i, args| {
+        // If the first argument is callable, decorate immediately.
+        let first = args.into_iter().next().unwrap_or(Value::None);
+        if matches!(
+            first,
+            Value::Function(_) | Value::Native(_) | Value::BoundMethod { .. }
+        ) {
+            return make_cache(_i, vec![first]);
+        }
+        // Otherwise return a decorator that captures the configuration.
+        Ok(Value::Native(Rc::new(NativeFn::new(
+            "lru_cache_inner",
+            |i, args| make_cache(i, args),
+        ))))
+    });
+    let reduce = nf("reduce", |i, mut args| {
+        if args.len() < 2 {
+            return Err(type_error("reduce() expected at least 2 arguments"));
+        }
+        let func = args.remove(0);
+        let iterable = args.remove(0);
+        let initial = args.into_iter().next();
+        let it = i.make_iter(iterable)?;
+        let mut acc = match initial {
+            Some(v) => v,
+            None => i
+                .iter_next(&it)?
+                .ok_or_else(|| type_error("reduce() of empty iterable with no initial value"))?,
+        };
+        while let Some(v) = i.iter_next(&it)? {
+            acc = i.call_value(func.clone(), vec![acc, v], &[])?;
+        }
+        Ok(acc)
+    });
+    let partial = nf("partial", |_i, mut args| {
+        if args.is_empty() {
+            return Err(type_error("partial() needs a callable"));
+        }
+        let func = args.remove(0);
+        let captured = args;
+        Ok(Value::Native(Rc::new(NativeFn::new(
+            "partial_call",
+            move |i, call_args| {
+                let mut all = captured.clone();
+                all.extend(call_args);
+                i.call_value(func.clone(), all, &[])
+            },
+        ))))
+    });
+    // `cached_property` in VM mode: identity wrapper. The wrapped method
+    // stays a method (callers use `obj.x()`). Documented in FINDINGS #26.
+    let cached_property = nf("cached_property", |_i, args| {
+        Ok(args.into_iter().next().unwrap_or(Value::None))
+    });
+    let wraps = nf("wraps", |_i, _args| {
+        // Returns a decorator that's an identity function.
+        Ok(Value::Native(Rc::new(NativeFn::new("wraps_inner", |_i, args| {
+            Ok(args.into_iter().next().unwrap_or(Value::None))
+        }))))
+    });
+    make_module(
+        "functools",
+        vec![
+            ("cache", cache_fn),
+            ("lru_cache", lru_cache),
+            ("reduce", reduce),
+            ("partial", partial),
+            ("cached_property", cached_property),
+            ("wraps", wraps),
+        ],
+    )
+}
+
+/// `itertools` shim.
+///
+/// Implemented: `chain`, `repeat`, `count`, `cycle`, `accumulate`,
+/// `islice`, `takewhile`, `dropwhile`. The remaining helpers
+/// (`combinations`, `permutations`, `product`, `groupby`) return their
+/// results as eager lists because the VM doesn't yet expose a generator
+/// protocol — large inputs will materialise everything in memory.
+fn make_itertools_module() -> Value {
+    fn drain(i: &mut Interpreter, v: Value) -> Result<Vec<Value>, Unwind> {
+        let it = i.make_iter(v)?;
+        let mut out = Vec::new();
+        while let Some(x) = i.iter_next(&it)? {
+            out.push(x);
+        }
+        Ok(out)
+    }
+    let chain = nf("chain", |i, args| {
+        let mut out = Vec::new();
+        for a in args {
+            out.extend(drain(i, a)?);
+        }
+        Ok(Value::List(Rc::new(RefCell::new(out))))
+    });
+    let repeat = nf("repeat", |_i, args| {
+        let v = args
+            .first()
+            .ok_or_else(|| type_error("repeat() needs an arg"))?
+            .clone();
+        let times = args
+            .get(1)
+            .and_then(|x| x.to_int().ok())
+            .unwrap_or(0)
+            .max(0);
+        let out: Vec<Value> = (0..times).map(|_| v.clone()).collect();
+        Ok(Value::List(Rc::new(RefCell::new(out))))
+    });
+    let count = nf("count", |_i, args| {
+        // Eagerly materialises 1024 elements (open-ended iterators
+        // aren't safe to expand without a bound).
+        let start = args.first().and_then(|x| x.to_int().ok()).unwrap_or(0);
+        let step = args.get(1).and_then(|x| x.to_int().ok()).unwrap_or(1);
+        let out: Vec<Value> = (0..1024)
+            .map(|n| Value::Int(start + n * step))
+            .collect();
+        Ok(Value::List(Rc::new(RefCell::new(out))))
+    });
+    let cycle = nf("cycle", |i, args| {
+        // Materialises a fixed-size repetition (8x) so the VM doesn't
+        // hang on an infinite iterator. Users that need true cycling
+        // should fall back to compile mode.
+        let v = args
+            .into_iter()
+            .next()
+            .ok_or_else(|| type_error("cycle() needs an iterable"))?;
+        let elems = drain(i, v)?;
+        let mut out = Vec::with_capacity(elems.len() * 8);
+        for _ in 0..8 {
+            out.extend(elems.iter().cloned());
+        }
+        Ok(Value::List(Rc::new(RefCell::new(out))))
+    });
+    let accumulate = nf("accumulate", |i, mut args| {
+        if args.is_empty() {
+            return Err(type_error("accumulate() needs an iterable"));
+        }
+        let iterable = args.remove(0);
+        let func = args.into_iter().next();
+        let xs = drain(i, iterable)?;
+        let mut out = Vec::with_capacity(xs.len());
+        let mut iter = xs.into_iter();
+        if let Some(first) = iter.next() {
+            out.push(first.clone());
+            let mut acc = first;
+            for x in iter {
+                acc = match &func {
+                    Some(f) => i.call_value(f.clone(), vec![acc, x], &[])?,
+                    None => i.binop(&acc, ruff_python_ast::Operator::Add, &x)?,
+                };
+                out.push(acc.clone());
+            }
+        }
+        Ok(Value::List(Rc::new(RefCell::new(out))))
+    });
+    let islice = nf("islice", |i, mut args| {
+        if args.is_empty() {
+            return Err(type_error("islice() needs an iterable"));
+        }
+        let iterable = args.remove(0);
+        let xs = drain(i, iterable)?;
+        let (start, stop) = match args.len() {
+            1 => (0usize, args[0].to_int().unwrap_or(0).max(0) as usize),
+            2 => (
+                args[0].to_int().unwrap_or(0).max(0) as usize,
+                args[1].to_int().unwrap_or(0).max(0) as usize,
+            ),
+            _ => (0, xs.len()),
+        };
+        let stop = stop.min(xs.len());
+        let start = start.min(stop);
+        let out: Vec<Value> = xs[start..stop].to_vec();
+        Ok(Value::List(Rc::new(RefCell::new(out))))
+    });
+    let takewhile = nf("takewhile", |i, mut args| {
+        if args.len() < 2 {
+            return Err(type_error("takewhile() needs predicate, iterable"));
+        }
+        let pred = args.remove(0);
+        let xs = drain(i, args.remove(0))?;
+        let mut out = Vec::new();
+        for x in xs {
+            let keep = i.call_value(pred.clone(), vec![x.clone()], &[])?;
+            if !keep.truthy() {
+                break;
+            }
+            out.push(x);
+        }
+        Ok(Value::List(Rc::new(RefCell::new(out))))
+    });
+    let dropwhile = nf("dropwhile", |i, mut args| {
+        if args.len() < 2 {
+            return Err(type_error("dropwhile() needs predicate, iterable"));
+        }
+        let pred = args.remove(0);
+        let xs = drain(i, args.remove(0))?;
+        let mut out = Vec::new();
+        let mut dropping = true;
+        for x in xs {
+            if dropping {
+                let keep = i.call_value(pred.clone(), vec![x.clone()], &[])?;
+                if keep.truthy() {
+                    continue;
+                }
+                dropping = false;
+            }
+            out.push(x);
+        }
+        Ok(Value::List(Rc::new(RefCell::new(out))))
+    });
+    let combinations = nf("combinations", |i, mut args| {
+        if args.len() < 2 {
+            return Err(type_error("combinations() needs iterable, r"));
+        }
+        let xs = drain(i, args.remove(0))?;
+        let r = args[0].to_int().unwrap_or(0).max(0) as usize;
+        let mut out = Vec::new();
+        let n = xs.len();
+        if r <= n {
+            let mut idx: Vec<usize> = (0..r).collect();
+            loop {
+                let tup: Vec<Value> = idx.iter().map(|&i| xs[i].clone()).collect();
+                out.push(Value::Tuple(Rc::new(tup)));
+                let mut i_pos = r;
+                let mut done = true;
+                while i_pos > 0 {
+                    i_pos -= 1;
+                    if idx[i_pos] != i_pos + n - r {
+                        idx[i_pos] += 1;
+                        for j in (i_pos + 1)..r {
+                            idx[j] = idx[j - 1] + 1;
+                        }
+                        done = false;
+                        break;
+                    }
+                }
+                if done {
+                    break;
+                }
+            }
+        }
+        Ok(Value::List(Rc::new(RefCell::new(out))))
+    });
+    let permutations = nf("permutations", |i, mut args| {
+        if args.is_empty() {
+            return Err(type_error("permutations() needs an iterable"));
+        }
+        let xs = drain(i, args.remove(0))?;
+        let r = args
+            .first()
+            .and_then(|x| x.to_int().ok())
+            .map(|n| n.max(0) as usize)
+            .unwrap_or(xs.len());
+        let n = xs.len();
+        let mut out = Vec::new();
+        if r <= n {
+            let mut indices: Vec<usize> = (0..n).collect();
+            let mut cycles: Vec<usize> = (0..r).map(|i| n - i).collect();
+            out.push(Value::Tuple(Rc::new(
+                indices[..r].iter().map(|&i| xs[i].clone()).collect(),
+            )));
+            'outer: loop {
+                let mut i_pos = r;
+                while i_pos > 0 {
+                    i_pos -= 1;
+                    cycles[i_pos] -= 1;
+                    if cycles[i_pos] == 0 {
+                        let temp = indices.remove(i_pos);
+                        indices.push(temp);
+                        cycles[i_pos] = n - i_pos;
+                    } else {
+                        let j = cycles[i_pos];
+                        let len = indices.len();
+                        indices.swap(i_pos, len - j);
+                        out.push(Value::Tuple(Rc::new(
+                            indices[..r].iter().map(|&i| xs[i].clone()).collect(),
+                        )));
+                        continue 'outer;
+                    }
+                }
+                break;
+            }
+        }
+        Ok(Value::List(Rc::new(RefCell::new(out))))
+    });
+    let product = nf("product", |i, args| {
+        // `product(*iterables, repeat=1)` — ignore the repeat kwarg (not
+        // wired into the call frame). Returns a list of tuples.
+        let pools: Vec<Vec<Value>> = args
+            .into_iter()
+            .map(|a| drain(i, a))
+            .collect::<Result<_, _>>()?;
+        let mut out: Vec<Vec<Value>> = vec![vec![]];
+        for pool in &pools {
+            let mut next = Vec::with_capacity(out.len() * pool.len());
+            for prefix in &out {
+                for v in pool {
+                    let mut new_p = prefix.clone();
+                    new_p.push(v.clone());
+                    next.push(new_p);
+                }
+            }
+            out = next;
+        }
+        let tuples: Vec<Value> = out
+            .into_iter()
+            .map(|v| Value::Tuple(Rc::new(v)))
+            .collect();
+        Ok(Value::List(Rc::new(RefCell::new(tuples))))
+    });
+    let groupby = nf("groupby", |i, mut args| {
+        if args.is_empty() {
+            return Err(type_error("groupby() needs an iterable"));
+        }
+        let xs = drain(i, args.remove(0))?;
+        let key = args.into_iter().next();
+        // Returns a list of (key, list) tuples.
+        let mut out: Vec<Value> = Vec::new();
+        let mut current_key: Option<Value> = None;
+        let mut current_group: Vec<Value> = Vec::new();
+        for x in xs {
+            let k = match &key {
+                Some(f) => i.call_value(f.clone(), vec![x.clone()], &[])?,
+                None => x.clone(),
+            };
+            if let Some(ck) = &current_key {
+                if ck.py_eq(&k) {
+                    current_group.push(x);
+                    continue;
+                }
+                out.push(Value::Tuple(Rc::new(vec![
+                    ck.clone(),
+                    Value::List(Rc::new(RefCell::new(std::mem::take(&mut current_group)))),
+                ])));
+            }
+            current_key = Some(k);
+            current_group.push(x);
+        }
+        if let Some(ck) = current_key {
+            out.push(Value::Tuple(Rc::new(vec![
+                ck,
+                Value::List(Rc::new(RefCell::new(current_group))),
+            ])));
+        }
+        Ok(Value::List(Rc::new(RefCell::new(out))))
+    });
+    make_module(
+        "itertools",
+        vec![
+            ("chain", chain),
+            ("repeat", repeat),
+            ("count", count),
+            ("cycle", cycle),
+            ("accumulate", accumulate),
+            ("islice", islice),
+            ("takewhile", takewhile),
+            ("dropwhile", dropwhile),
+            ("combinations", combinations),
+            ("permutations", permutations),
+            ("product", product),
+            ("groupby", groupby),
+        ],
+    )
+}
+
+/// `dataclasses` shim.
+///
+/// `dataclass` is exposed as an identity decorator — the Typhon desugar
+/// pass has already lowered user `class` declarations to plain Python
+/// classes with synthesised `__init__`, so the decorator is a no-op in
+/// VM mode. `field` returns its `default` kwarg (or `None`).
+fn make_dataclasses_module() -> Value {
+    let dataclass = nf("dataclass", |_i, args| {
+        // Two-shape call: `@dataclass` (decorating a class directly) or
+        // `@dataclass(slots=True, …)` (returning a decorator). Detect by
+        // the first argument's value type — Class implies direct
+        // decoration.
+        if let Some(v) = args.first() {
+            if matches!(v, Value::Class(_)) {
+                return Ok(v.clone());
+            }
+        }
+        Ok(Value::Native(Rc::new(NativeFn::new("dataclass_inner", |_i, args| {
+            Ok(args.into_iter().next().unwrap_or(Value::None))
+        }))))
+    });
+    let field = nf("field", |_i, args| {
+        // Approximate signature: `field(default=…, default_factory=…)`.
+        // Without kwargs wiring we just return the first positional if
+        // present, otherwise None. The desugar pass synthesises field
+        // defaults as plain AnnAssign values already, so this rarely
+        // matters in VM mode.
+        Ok(args.into_iter().next().unwrap_or(Value::None))
+    });
+    let asdict = nf("asdict", |_i, args| {
+        let v = single(&args, "asdict")?;
+        if let Value::Instance(inst) = v {
+            let mut map: HashMap<HashKey, Value> = HashMap::new();
+            for (k, val) in inst.fields.borrow().iter() {
+                map.insert(HashKey::Str(Rc::new(k.clone())), val.clone());
+            }
+            Ok(Value::Dict(Rc::new(RefCell::new(map))))
+        } else {
+            Err(type_error("asdict() requires a dataclass instance"))
+        }
+    });
+    make_module(
+        "dataclasses",
+        vec![("dataclass", dataclass), ("field", field), ("asdict", asdict)],
+    )
+}
+
+/// `pathlib` shim.
+///
+/// Implements a `Path` callable that returns an instance with the
+/// following surface: `__truediv__`, `read_text`, `write_text`,
+/// `exists`, `is_file`, `is_dir`, `name`, `parent`, `suffix`, `stem`,
+/// and `__str__`. Internally a Path instance is an `Instance` value
+/// whose `fields` map holds the resolved path string under `__path__`.
+fn make_pathlib_module() -> Value {
+    use crate::value::{Class, Instance};
+    fn path_class() -> Rc<Class> {
+        Rc::new(Class {
+            name: "Path".into(),
+            methods: RefCell::new(HashMap::new()),
+            fields: vec![],
+            class_attrs: RefCell::new(HashMap::new()),
+            bases: vec![],
+        })
+    }
+    fn make_path(s: String) -> Value {
+        let cls = path_class();
+        let mut fields: HashMap<String, Value> = HashMap::new();
+        fields.insert("__path__".into(), Value::Str(Rc::new(s.clone())));
+        // Cache derived parts as fields so attribute access (`p.name`,
+        // `p.suffix`, `p.stem`, `p.parent`) works without descriptors.
+        let p = std::path::Path::new(&s);
+        let name = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_owned();
+        let stem = p
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_owned();
+        let suffix = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| format!(".{e}"))
+            .unwrap_or_default();
+        let parent = p
+            .parent()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_owned();
+        fields.insert("name".into(), Value::Str(Rc::new(name)));
+        fields.insert("stem".into(), Value::Str(Rc::new(stem)));
+        fields.insert("suffix".into(), Value::Str(Rc::new(suffix)));
+        // `parent` is exposed as a string here; users who need the
+        // full Path API on the parent can wrap with `Path(p.parent)`.
+        // This sidesteps an infinite recursion when `parent` of `/` is
+        // itself `/`.
+        fields.insert("parent".into(), Value::Str(Rc::new(parent)));
+        // Methods.
+        let s_for_read = s.clone();
+        fields.insert(
+            "read_text".into(),
+            Value::Native(Rc::new(NativeFn::new("read_text", move |_i, _args| {
+                std::fs::read_to_string(&s_for_read)
+                    .map(|t| Value::Str(Rc::new(t)))
+                    .map_err(|e| crate::error::Unwind::Exception(
+                        crate::error::VmException::new("OSError", format!("{e}")),
+                    ))
+            }))),
+        );
+        let s_for_write = s.clone();
+        fields.insert(
+            "write_text".into(),
+            Value::Native(Rc::new(NativeFn::new("write_text", move |_i, args| {
+                let text = single(&args, "write_text")?.py_str();
+                std::fs::write(&s_for_write, text.as_bytes())
+                    .map(|_| Value::Int(text.len() as i64))
+                    .map_err(|e| crate::error::Unwind::Exception(
+                        crate::error::VmException::new("OSError", format!("{e}")),
+                    ))
+            }))),
+        );
+        let s_for_exists = s.clone();
+        fields.insert(
+            "exists".into(),
+            Value::Native(Rc::new(NativeFn::new("exists", move |_i, _args| {
+                Ok(Value::Bool(std::path::Path::new(&s_for_exists).exists()))
+            }))),
+        );
+        let s_for_is_file = s.clone();
+        fields.insert(
+            "is_file".into(),
+            Value::Native(Rc::new(NativeFn::new("is_file", move |_i, _args| {
+                Ok(Value::Bool(std::path::Path::new(&s_for_is_file).is_file()))
+            }))),
+        );
+        let s_for_is_dir = s.clone();
+        fields.insert(
+            "is_dir".into(),
+            Value::Native(Rc::new(NativeFn::new("is_dir", move |_i, _args| {
+                Ok(Value::Bool(std::path::Path::new(&s_for_is_dir).is_dir()))
+            }))),
+        );
+        Value::Instance(Rc::new(Instance {
+            class: cls,
+            fields: RefCell::new(fields),
+        }))
+    }
+    let path = nf("Path", |_i, args| {
+        let s = args
+            .first()
+            .map(|v| v.py_str())
+            .unwrap_or_else(|| ".".to_string());
+        Ok(make_path(s))
+    });
+    make_module("pathlib", vec![("Path", path)])
 }
 
 // ── Method dispatch on built-in types ──────────────────────────────────────

@@ -62,7 +62,24 @@ pub fn run_source(
             .unwrap_or_default();
         VmError::Parse(format!("{where_}{e}"))
     })?;
-    let module = parsed.into_syntax();
+    let mut module = parsed.into_syntax();
+
+    // Hand the VM the desugared module so it sees the same shape as the
+    // compile path: dataclass-decorated user classes, merged impl blocks,
+    // injected runtime imports, and so on. FINDINGS #21 follow-up.
+    // Running the full desugar pass also rewrites \`extend\` user-classes
+    // into method merges; the builtin-extension rewrite below handles the
+    // \`extend str:\` / \`extend list:\` shape that desugar leaves alone.
+    let desugar_out = tyc_desugar::desugar_module(&module);
+    module = desugar_out.module;
+
+    // FINDINGS #21: rewrite \`x.method(args)\` to \`__typhon_ext_TYPE__method
+    // (x, args)\` for every receiver statically annotated as a built-in
+    // type that the source extended with \`extend BUILTIN:\`. Without this
+    // step, calls on extended built-ins fail at runtime with
+    // \`AttributeError: 'str' object has no attribute 'slug'\`.
+    let (registry, _stats) = tyc_analyse::extract_builtin_extensions(&mut module);
+    let _ = tyc_analyse::rewrite_builtin_extension_calls(&mut module, &registry);
 
     let mut interp = Interpreter::new();
     // Seed sys.argv before any user code (or import sys) can observe it.
@@ -215,6 +232,174 @@ def main() -> None:
     print(total)
 
 main()
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn freeze_builtin_is_identity() {
+        // FINDINGS #23: `freeze let` lowers to a `__typhon_freeze__(...)`
+        // call. The VM exposes the helper as an identity shim so the
+        // lowered code runs without a NameError.
+        let src = r#"
+let xs = __typhon_freeze__([1, 2, 3])
+print(xs)
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn freeze_runtime_import_resolves() {
+        // The compile path injects `from typhon_runtime.freeze import
+        // deep_freeze as __typhon_freeze__`; the VM must serve it too.
+        let src = r#"
+from typhon_runtime.freeze import deep_freeze as __typhon_freeze__
+let xs = __typhon_freeze__([1, 2, 3])
+print(xs)
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn newtype_is_identity_callable() {
+        // FINDINGS #24: `newtype Foo = int` lowers to `Foo = NewType("Foo",
+        // int)`. The VM exposes `NewType` as a builtin that returns an
+        // identity wrapper, matching CPython's runtime semantics.
+        let src = r#"
+let Foo = NewType("Foo", int)
+print(Foo(42))
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn typing_import_resolves() {
+        // FINDINGS #25: `from typing import Callable` (and friends) used to
+        // crash with ImportError. The VM exposes a typing shim with
+        // identity callables for every name the static checker emits.
+        let src = r#"
+from typing import Callable, Optional, List, Dict, Any, TypeVar
+let T = TypeVar("T")
+print("ok")
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn re_basic_match_search_sub() {
+        // FINDINGS #27: `re` was missing. Smoke-test the most-used
+        // surface: `re.search`, `re.sub`, `re.findall`.
+        let src = r#"
+import re
+let m = re.search("[a-z]+", "Hello world")
+print(m.group())
+print(re.sub("[aeiou]", "*", "Hello"))
+print(re.findall("[0-9]+", "a1 b22 c333"))
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn collections_counter_and_namedtuple() {
+        // FINDINGS #27: `collections.Counter` and `namedtuple` smoke test.
+        let src = r#"
+from collections import Counter, namedtuple
+let c = Counter(["a", "b", "a", "c", "a"])
+print(c)
+let Point = namedtuple("Point", ["x", "y"])
+print(Point(1, 2))
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn functools_reduce_and_cache() {
+        // FINDINGS #27: `functools.reduce` and `cache` smoke test.
+        let src = r#"
+from functools import reduce, cache
+print(reduce(lambda a, b: a + b, [1, 2, 3, 4, 5]))
+
+def slow(n: int) -> int:
+    return n * 2
+
+let fast = cache(slow)
+print(fast(7))
+print(fast(7))
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn subclass_constructor_inherits_parent_fields() {
+        // FINDINGS #22: `class Dog(Animal):` should accept the parent's
+        // `name`/`age` kwargs in addition to its own `breed`. The desugar
+        // pass now prepends the parent's field annotations to the
+        // subclass body so the VM's auto-`__init__` collects all three.
+        let src = r#"
+class Animal:
+    name: str
+    age: int
+
+class Dog(Animal):
+    breed: str
+
+let d = Dog(name="Rex", age=5, breed="Husky")
+print(d.name)
+print(d.age)
+print(d.breed)
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn extend_builtin_str_method_dispatches() {
+        // FINDINGS #21: `extend str: def slug(self) -> str: …` used to
+        // fail at runtime with AttributeError. The VM now runs the same
+        // desugar + extend-builtin extraction passes as `tyc build`, so
+        // call sites like `"Hello".slug()` rewrite to the lifted free
+        // function `__typhon_ext_str__slug("Hello")`.
+        let src = r#"
+extend str:
+    def slug(self) -> str:
+        return self.lower().replace(" ", "-")
+
+let s: str = "Hello World"
+print(s.slug())
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn lazy_let_inside_class_resolves() {
+        // FINDINGS #26: `lazy let` inside a class body lowers (in the
+        // preprocessor) to a `@cached_property` method, with a hidden
+        // `from functools import cached_property as _typhon_cached_property`
+        // import injected at module top. The functools shim now exposes
+        // `cached_property` as an identity decorator so the import
+        // resolves and the method is registered as a regular method on
+        // the class. Limitation: callers must invoke as `obj.name()`
+        // rather than `obj.name` because the VM has no descriptor
+        // protocol — documented at the cached_property registration
+        // site in builtins.rs.
+        let src = r#"
+class Counter:
+    n: int
+
+    lazy let doubled: int = self.n * 2
+
+let c = Counter(n=21)
+print(c.doubled())
+"#;
+        assert_eq!(run_capturing(src).unwrap(), 0);
+    }
+
+    #[test]
+    fn itertools_chain_and_accumulate() {
+        // FINDINGS #27: `itertools.chain` and `accumulate` smoke test.
+        let src = r#"
+from itertools import chain, accumulate
+print(list(chain([1, 2], [3, 4])))
+print(list(accumulate([1, 2, 3, 4])))
 "#;
         assert_eq!(run_capturing(src).unwrap(), 0);
     }
